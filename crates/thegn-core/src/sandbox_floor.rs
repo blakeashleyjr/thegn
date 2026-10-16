@@ -320,6 +320,45 @@ pub fn agent_task_gate(
     }
 }
 
+/// Gate an opted-in queue agent against both its queue floor and the `[sandbox]`
+/// floor in force. The stricter decision wins (ties keep the queue decision), so
+/// queue policy can raise the boundary but cannot weaken the sandbox default.
+/// Disabling the sandbox, selecting backend `none`, or explicitly setting the
+/// sandbox floor to `off` opts out of the inherited floor.
+pub fn queue_agent_gate(
+    sb: &SandboxConfig,
+    floor: IsolationFloor,
+    on_miss: OnFloorMiss,
+    resolved: Option<IsolationClass>,
+    best_available: IsolationClass,
+) -> AgentGate {
+    let queue_gate = agent_task_gate(true, floor, on_miss, resolved, best_available);
+    let sandbox_gate = agent_task_gate(
+        true,
+        floor_in_force(sb, false),
+        miss_policy_in_force(sb),
+        resolved,
+        best_available,
+    );
+    let severity = |gate: &AgentGate| match gate {
+        AgentGate::Run => 0,
+        AgentGate::RunDegraded(_) => 1,
+        AgentGate::InfraHold(_) => 2,
+    };
+    if severity(&sandbox_gate) > severity(&queue_gate) {
+        match sandbox_gate {
+            AgentGate::InfraHold(reason) => AgentGate::InfraHold(format!(
+                "{reason}; inherited from the [sandbox] isolation floor in force — set \
+                 [sandbox] isolation_floor = \"off\" or the queue's agent_sandbox = false \
+                 to run the agent uncontained"
+            )),
+            other => other,
+        }
+    } else {
+        queue_gate
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -672,5 +711,135 @@ mod tests {
             ..base
         };
         assert_eq!(floor_in_force(&explicit_off, false), IsolationFloor::Off);
+    }
+
+    #[test]
+    fn queue_agent_inherits_default_floor_when_sandbox_unresolvable() {
+        let sb = SandboxConfig::default();
+        match queue_agent_gate(
+            &sb,
+            IsolationFloor::Off,
+            OnFloorMiss::Degrade,
+            None,
+            IsolationClass::HostProcess,
+        ) {
+            AgentGate::InfraHold(reason) => {
+                assert!(reason.to_lowercase().contains("infrastructure"));
+                assert!(reason.contains("isolation_floor"));
+            }
+            other => panic!("expected infra hold, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn queue_agent_inherits_default_floor_on_host_process_class() {
+        let sb = SandboxConfig::default();
+        assert!(matches!(
+            queue_agent_gate(
+                &sb,
+                IsolationFloor::Off,
+                OnFloorMiss::Degrade,
+                Some(IsolationClass::HostProcess),
+                IsolationClass::HostProcess,
+            ),
+            AgentGate::InfraHold(_)
+        ));
+    }
+
+    #[test]
+    fn queue_agent_degrade_cannot_weaken_default_floor() {
+        let sb = SandboxConfig::default();
+        assert!(matches!(
+            queue_agent_gate(
+                &sb,
+                IsolationFloor::SharedKernel,
+                OnFloorMiss::Degrade,
+                None,
+                IsolationClass::HostProcess,
+            ),
+            AgentGate::InfraHold(_)
+        ));
+    }
+
+    #[test]
+    fn queue_agent_stricter_queue_floor_wins() {
+        let sb = SandboxConfig::default();
+        match queue_agent_gate(
+            &sb,
+            IsolationFloor::GuestKernel,
+            OnFloorMiss::Fail,
+            Some(IsolationClass::SharedKernel),
+            IsolationClass::SharedKernel,
+        ) {
+            AgentGate::InfraHold(reason) => assert!(reason.contains("guest-kernel")),
+            other => panic!("expected guest-kernel hold, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn queue_agent_explicit_sandbox_off_and_disabled_opt_out() {
+        let base = SandboxConfig::default();
+        let explicit_off = SandboxConfig {
+            isolation_floor: Some(IsolationFloor::Off),
+            ..base.clone()
+        };
+        assert_eq!(
+            queue_agent_gate(
+                &explicit_off,
+                IsolationFloor::Off,
+                OnFloorMiss::Degrade,
+                None,
+                IsolationClass::HostProcess,
+            ),
+            AgentGate::Run
+        );
+        let disabled = SandboxConfig {
+            enabled: false,
+            ..base
+        };
+        assert_eq!(
+            queue_agent_gate(
+                &disabled,
+                IsolationFloor::Off,
+                OnFloorMiss::Degrade,
+                None,
+                IsolationClass::HostProcess,
+            ),
+            AgentGate::Run
+        );
+    }
+
+    #[test]
+    fn queue_agent_explicit_sandbox_degrade_degrades() {
+        let sb = SandboxConfig {
+            isolation_floor: Some(IsolationFloor::SharedKernel),
+            on_floor_miss: OnFloorMiss::Degrade,
+            ..SandboxConfig::default()
+        };
+        assert!(matches!(
+            queue_agent_gate(
+                &sb,
+                IsolationFloor::Off,
+                OnFloorMiss::Degrade,
+                None,
+                IsolationClass::HostProcess,
+            ),
+            AgentGate::RunDegraded(_)
+        ));
+    }
+
+    #[test]
+    fn queue_agent_met_floor_runs() {
+        let sb = SandboxConfig::default();
+        assert_eq!(
+            queue_agent_gate(
+                &sb,
+                IsolationFloor::Off,
+                OnFloorMiss::Degrade,
+                Some(IsolationClass::SharedKernel),
+                IsolationClass::SharedKernel,
+            ),
+            AgentGate::Run
+        );
     }
 }

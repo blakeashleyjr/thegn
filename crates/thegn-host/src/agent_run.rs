@@ -178,7 +178,9 @@ fn provision_dispatch(
 /// Resolve a queue agent task's sandbox + floor into a dispatch decision. With
 /// the opt-in off this is always `Run(None)` (host + slice, unchanged). With it
 /// on, the worktree's sandbox is resolved and its honest class compared against
-/// the demanded floor via the pure [`thegn_core::sandbox_floor::agent_task_gate`].
+/// at least the `[sandbox]` floor in force (default: shared-kernel, refusing on
+/// a miss), via the pure [`thegn_core::sandbox_floor::queue_agent_gate`]. The
+/// queue floor can raise that boundary but cannot weaken it.
 /// Before returning a runnable dispatch, this gate ensures the sandbox and
 /// proves it can execute a noninteractive preflight command.
 pub(crate) fn agent_floor_gate(
@@ -189,7 +191,7 @@ pub(crate) fn agent_floor_gate(
     on_miss: thegn_core::config::OnFloorMiss,
 ) -> AgentDispatch {
     use thegn_core::capabilities::IsolationClass;
-    use thegn_core::sandbox_floor::{AgentGate, agent_task_gate};
+    use thegn_core::sandbox_floor::{AgentGate, queue_agent_gate};
     if !sandbox_on {
         return AgentDispatch::Run(None);
     }
@@ -218,7 +220,7 @@ pub(crate) fn agent_floor_gate(
     }
     let resolved = spec.as_ref().map(|s| s.capabilities().isolation);
     let best = resolved.unwrap_or(IsolationClass::HostProcess);
-    let dispatch = match agent_task_gate(true, floor, on_miss, resolved, best) {
+    let dispatch = match queue_agent_gate(&full.sandbox, floor, on_miss, resolved, best) {
         AgentGate::Run => AgentDispatch::Run(spec),
         AgentGate::RunDegraded(w) => AgentDispatch::RunDegraded(spec, w),
         AgentGate::InfraHold(r) => AgentDispatch::InfraHold(r),
