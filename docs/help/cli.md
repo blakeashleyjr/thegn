@@ -33,8 +33,10 @@ worktree):
 Global flags everywhere: `--config`, `--log-level`, `--set key=value`
 (repeatable), and `--profile <name>`.
 
-`thegn db vacuum` reclaims unused state-database pages; `--dry-run` previews
-the work without writing, and `--json` emits one report.
+Before reclaiming pages, `thegn db vacuum` removes semantic-index rows for
+deleted files and cache keys left by removed worktrees, and reports both
+counts. `--json` emits one report (including `pruned_semantic_rows` and
+`pruned_cache_keys`); `--dry-run` removes nothing.
 
 Some of these are dev-channel only — see [[release-channels]].
 

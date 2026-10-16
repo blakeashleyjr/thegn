@@ -596,20 +596,13 @@ fn tracker_in_progress_note(
     let note = if !router.is_configured() {
         Some(format!("no tracker route for autopilot account {account}"))
     } else {
-        match tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-        {
-            Ok(runtime) => {
-                let patch = IssuePatch {
-                    status: Some(thegn_core::issue::IssueStatus::InProgress),
-                    ..Default::default()
-                };
-                match runtime.block_on(router.update_issue(issue_id, &patch)) {
-                    Ok(_) => None,
-                    Err(error) => Some(format!("tracker in-progress update failed: {error}")),
-                }
-            }
+        let patch = IssuePatch {
+            status: Some(thegn_core::issue::IssueStatus::InProgress),
+            ..Default::default()
+        };
+        match thegn_svc::issue::block_on_tracker(router.update_issue(issue_id, &patch)) {
+            Ok(Ok(_)) => None,
+            Ok(Err(error)) => Some(format!("tracker in-progress update failed: {error}")),
             Err(error) => Some(format!("issue runtime build failed: {error}")),
         }
     };
@@ -815,11 +808,22 @@ pub(crate) fn on_pr_merged(cfg: &Config, repo_root: &Path, number: u64) {
             );
             return;
         }
-        let rt = match tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-        {
-            Ok(rt) => rt,
+        let patch = IssuePatch {
+            status: Some(thegn_core::issue::IssueStatus::Done),
+            ..Default::default()
+        };
+        match thegn_svc::issue::block_on_tracker(router.update_issue(&run.key.issue_id, &patch)) {
+            Ok(Ok(_)) => {}
+            Ok(Err(error)) => {
+                mark_needs_human(
+                    &db,
+                    run.id,
+                    run.state,
+                    run.dispatch_id,
+                    &format!("done sync failed: {error}"),
+                );
+                return;
+            }
             Err(error) => {
                 mark_needs_human(
                     &db,
@@ -830,20 +834,6 @@ pub(crate) fn on_pr_merged(cfg: &Config, repo_root: &Path, number: u64) {
                 );
                 return;
             }
-        };
-        let patch = IssuePatch {
-            status: Some(thegn_core::issue::IssueStatus::Done),
-            ..Default::default()
-        };
-        if let Err(e) = rt.block_on(router.update_issue(&run.key.issue_id, &patch)) {
-            mark_needs_human(
-                &db,
-                run.id,
-                run.state,
-                run.dispatch_id,
-                &format!("done sync failed: {e}"),
-            );
-            return;
         }
     }
     let next = match run.state {
@@ -884,6 +874,18 @@ mod tests {
     use thegn_core::issue::IssueFilter;
     use thegn_core::sandbox::Backend;
     use thegn_svc::issue::{IssueBackend, IssueCaps, IssueError};
+
+    #[test]
+    fn autopilot_tracker_updates_use_shared_tracker_runtime() {
+        let source = include_str!("autopilot_driver.rs");
+        // The count includes this test's search string as well as both call sites.
+        assert_eq!(
+            source
+                .matches("thegn_svc::issue::block_on_tracker(router.update_issue")
+                .count(),
+            3
+        );
+    }
 
     #[test]
     fn worker_validation_reason_is_bounded_and_actionable() {

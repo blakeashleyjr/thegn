@@ -170,7 +170,11 @@ impl ProcSampler {
         self.sys.refresh_processes_specifics(
             ProcessesToUpdate::All,
             true,
-            ProcessRefreshKind::nothing().with_cpu().with_memory(),
+            // nothing() keeps tasks on; we never read them.
+            ProcessRefreshKind::nothing()
+                .with_cpu()
+                .with_memory()
+                .without_tasks(),
         );
 
         // Pass 1: fold every process into reused scratch — no allocation.
@@ -361,5 +365,33 @@ mod tests {
     fn an_unprimed_snapshot_is_labelled_as_such() {
         let d = ProcSnapshot::default();
         assert!(!d.primed && !d.enabled && d.procs.is_empty());
+    }
+
+    #[test]
+    fn a_tracked_sample_does_not_enumerate_threads() {
+        if !std::path::Path::new("/proc/self/task").exists() {
+            return;
+        }
+
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+        let helper = std::thread::spawn(move || {
+            ready_tx.send(()).unwrap();
+            std::thread::park();
+        });
+        ready_rx.recv().unwrap();
+
+        let mut sampler = ProcSampler::new(20);
+        sampler.sample();
+        helper.thread().unpark();
+        helper.join().unwrap();
+
+        assert!(
+            sampler
+                .sys
+                .processes()
+                .values()
+                .all(|process| process.thread_kind().is_none()),
+            "process enumeration retained thread entries"
+        );
     }
 }

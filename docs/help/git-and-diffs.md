@@ -63,6 +63,9 @@ drill view is open, when it does nothing.
 With a rebase base marked, `r` rebases the commits after the mark onto the
 selected branch. In staging and patch, dragging across lines selects a range
 like `v`; narrow Half keeps the stacked behaviour.
+In the fused two-column view, dragging past the top or bottom of the main
+column moves the cursor by up to three lines per pointer movement; a still
+pointer does not scroll.
 
 ### stash
 
@@ -139,7 +142,8 @@ every _stageable_ diff (inline hunks, line staging) keeps the sanitized
 flags regardless of this setting. Acquire/inspect `difft` via
 `[managed_tools.difft]` and `thegn doctor` (its **Source-control
 workflow posture** section also reports the git version against the
-merge-queue fold's floor, jj colocation, and any custom merge drivers).
+merge-queue fold's floor, jj colocation, and custom merge drivers, which folds
+refuse to run).
 
 ## Coexisting with jujutsu
 
@@ -168,6 +172,11 @@ id in `[keybinds]`:
 
 Because each worktree is its own checkout, these never touch a branch you
 are not looking at — which is what makes running several at once safe.
+Push and fetch run outside the git lock, so a slow transfer does not block
+other git actions. A current-branch fast-forward uses a locked
+`merge --ff-only`; a local fast-forward of a non-current branch downloads
+unlocked and locks only the branch update. Pull and fast-forwards on remote
+worktrees stay locked.
 
 ## Rollback
 

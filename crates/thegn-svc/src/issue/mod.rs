@@ -38,6 +38,7 @@ const MAX_CONCURRENT_ACCOUNTS: usize = 4;
 const FANOUT_DEADLINE: Duration = Duration::from_secs(30);
 
 pub use capabilities::IssueCaps;
+pub use http::block_on_tracker;
 
 /// Errors from any issue backend.
 pub enum IssueError {

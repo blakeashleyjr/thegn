@@ -49,10 +49,13 @@ the other verbs take:
 `thegn session record <id>` starts a server-side asciicast recording of one
 session's output. Because the **daemon** owns it (not the UI), it keeps
 recording while every client is detached — exactly when an unattended agent
-session is most worth capturing. `--stop` finalizes the file; with neither flag
-it reports status. The control verb is `sessions.record` (HTTP/gRPC/CLI only —
-never MCP or plugins, so an agent can't silently bug another session), and it
-needs a **write**-scoped token.
+session is most worth capturing. `--stop` reports `stopping` until the writer
+confirms; run status again. A finish taking over 2 seconds reports truncated
+with `recording finalization timed out; writer may still be flushing`. If the
+writer completes late while the session lives, status is updated with the real
+result. With neither flag the command reports status. The control verb is
+`sessions.record` (HTTP/gRPC/CLI only — never MCP or plugins, so an agent
+can't silently bug another session), and it needs a **write**-scoped token.
 
 Recordings are terminal output and can contain whatever secrets a tool printed,
 so files are written `0600` under a `0700` directory (`[recording] dir`, default

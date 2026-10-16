@@ -57,7 +57,7 @@ use thegn_core::store::{
 #[path = "run_palette_db.rs"]
 mod run_palette_db;
 #[path = "run_pending_db.rs"]
-mod run_pending_db;
+pub(crate) mod run_pending_db;
 #[path = "run_test_cache.rs"]
 mod run_test_cache;
 
@@ -480,7 +480,7 @@ pub async fn main(
     // /`Utility` classes on the off-loop workers their meaning — without a
     // stated top, "lower than the loop" is just a guess. On Apple silicon this
     // is also what keeps the loop eligible for the performance cores while the
-    // samplers and hydration move off them. A no-op off macOS.
+    // samplers and hydration move off them. Linux applies per-thread nice hints.
     crate::platform::qos::set_self(crate::platform::qos::Qos::Interactive);
 
     // Lift the open-fd ceiling before any PTY/git work: as its own multiplexer,
@@ -1479,6 +1479,10 @@ impl SidebarState {
             &model.sidebar_db_terminals,
         );
         drop(rows_span);
+        crate::handlers::worktree_delete::hide_pending_deletes(
+            &mut model.sidebar_rows,
+            &self.deleting,
+        );
         // Drop marks whose row is gone (deleted worktree/workspace). Keep marks
         // whose row exists but is hidden by a collapsed parent, so re-expanding
         // restores the selection.
@@ -2052,11 +2056,12 @@ pub(crate) fn delete_groups_with_mode(
     keep_files: bool,
     mode: thegn_core::hooks::HookExecutionMode,
     waker: Option<termwiz::terminal::TerminalWaker>,
-) -> String {
+) -> (String, Vec<String>) {
     targets.sort_unstable_by(|a, b| b.cmp(a));
     targets.dedup();
     let (mut deleted, mut skipped, mut already_deleting) = (0usize, 0usize, 0usize);
     let mut spawn_errors = Vec::new();
+    let mut scheduled_paths = Vec::new();
     for gi in targets {
         if gi >= session.worktrees.len() {
             continue;
@@ -2083,6 +2088,7 @@ pub(crate) fn delete_groups_with_mode(
                 spawn_errors.push(format!("{path}: {error}"));
                 continue;
             }
+            scheduled_paths.push(path.clone());
         }
         // The group and its cache rows remain available until the worker reports
         // that pre_destroy and the requested disk operation both succeeded.
@@ -2098,7 +2104,7 @@ pub(crate) fn delete_groups_with_mode(
     if !spawn_errors.is_empty() {
         status.push_str(&format!(" (failed to start: {})", spawn_errors.join("; ")));
     }
-    status
+    (status, scheduled_paths)
 }
 
 /// Remove group `gi` from the session (its dir vanished from disk — deleted
@@ -10690,6 +10696,10 @@ async fn event_loop<T: Terminal>(
                         dirty = true;
                     }
                 }
+                run_pending_db::PendingDbResult::WriteFailed { status } => {
+                    model.status = status;
+                    dirty = true;
+                }
             }
         }
         let active_tests_wt = active_tab_path(&session).to_string_lossy().into_owned();
@@ -10924,8 +10934,13 @@ async fn event_loop<T: Terminal>(
         // Off-loop worktree-rename completions (audit run.rs:12131/12147).
         while let Ok(done) = rename_rx.try_recv() {
             loop_perf.tick(crate::perf::WakeSource::Other);
-            model.status =
-                crate::handlers::worktree_rename::apply(&mut session, &mut region_last_w, done);
+            model.status = crate::handlers::worktree_rename::apply(
+                &mut session,
+                &mut region_last_w,
+                done,
+                &pending_db_tx,
+                &waker,
+            );
             persist_session_layout(&mut session, &panes);
             refresh_tab_model(&mut model, &session, &mut sb);
             sb.focus_active_row(&mut model);
@@ -16052,11 +16067,19 @@ async fn event_loop<T: Terminal>(
                 if occluded_now && !corner_occluded {
                     pending_corner_oob.require_delete();
                 }
-                let draw = if corner_gfx.is_empty() {
-                    Vec::new()
-                } else {
-                    crate::kitty_relay::coalesce_gfx(std::mem::take(&mut corner_gfx))
-                };
+                let queued_bytes = corner_gfx.iter().map(Vec::len).sum::<usize>();
+                let (draw, truncated) = crate::kitty_relay::coalesce_gfx_within(
+                    std::mem::take(&mut corner_gfx),
+                    crate::frame_writer::OOB_QUEUE_BYTES,
+                );
+                if truncated {
+                    pending_corner_oob.require_delete();
+                    tracing::debug!(
+                        target: "thegn::frame",
+                        dropped_bytes = queued_bytes - draw.len(),
+                        "truncated corner kitty graphics batch"
+                    );
+                }
                 corner_occluded = occluded_now;
                 if draw.is_empty() {
                     pending_corner_oob.retry(!occluded_now, |bytes| writer.try_submit_oob(bytes));
@@ -18572,15 +18595,9 @@ async fn event_loop<T: Terminal>(
                                 let taken = thegn_core::worktree::BranchSet::from_names(names);
                                 choice.name = thegn_core::worktree::dedupe(&choice.name, &taken);
                             }
-                            // The tiny upsert stays synchronous (sanctioned
-                            // best-effort-persist family); the live spawn reads
-                            // the in-process choice registry, so a failed write
-                            // only loses restart persistence — surface it.
-                            if !crate::handlers::terminal::persist(&choice) {
-                                model.status =
-                                    "terminal not saved — it won't be remembered across restarts"
-                                        .into();
-                            }
+                            // The live spawn reads the in-process choice registry;
+                            // persistence runs on the FIFO writer and reports failures asynchronously.
+                            crate::handlers::terminal::persist(&choice, &pending_db_tx, &waker);
                             // Creating a terminal crosses into the terminals
                             // region without going through `activate_row!`, so
                             // bookmark the worktree being left here — otherwise

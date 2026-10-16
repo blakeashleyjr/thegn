@@ -114,11 +114,21 @@ Threads that do not serve the render/input loop SHALL declare a QoS class via
   `Utility`, and the samplers, refresh ticker and fs-watch builder declare
   `Background`
 
-#### Scenario: A no-op elsewhere
+#### Scenario: Linux applies per-thread scheduling hints
 
-- **WHEN** the same code runs off macOS
-- **THEN** the call compiles to nothing, because Linux's analogues are process-
-  or cgroup-scoped rather than per-thread
+- **WHEN** a dedicated Linux thread declares `Utility` or `Background`
+- **THEN** its target nice value is 5 or 10 above the main thread's value,
+  respectively, and `Background` requests best-effort I/O priority level 7
+- **AND** nice is clamped to 19 and never lowered, so a thread already above
+  its target is left alone
+- **AND** runtime-pool threads are left unchanged because Linux nice increases
+  cannot be undone by an unprivileged thread
+- **AND** failures are logged without failing the work
+
+#### Scenario: A no-op on other platforms
+
+- **WHEN** the same code runs on Windows or another unsupported platform
+- **THEN** the call is a no-op
 
 ### Requirement: Capability enforcement is reported as observed, not as probed
 

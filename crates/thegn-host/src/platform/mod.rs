@@ -173,6 +173,9 @@ pub(crate) mod proc;
 /// steers a thread to the efficiency cores on Apple silicon); a no-op elsewhere.
 pub(crate) mod qos;
 
+/// Per-thread, process, and reaped-child CPU clocks.
+pub(crate) mod cpu_clock;
+
 pub(crate) mod sound;
 pub(crate) mod sound_process;
 
@@ -311,6 +314,8 @@ pub(crate) fn write_state_file(path: &std::path::Path, value: &str) {
     let Some(parent) = path.parent() else {
         return;
     };
+    #[cfg(test)]
+    crate::testenv::refuse_real_state_write(path, "state file");
     if std::fs::create_dir_all(parent).is_err() {
         return;
     }

@@ -21,6 +21,7 @@ mod custom;
 mod native_diff;
 mod patch;
 mod plumbing;
+mod read_budget;
 mod rebase;
 mod stage;
 mod stash;
@@ -40,6 +41,7 @@ pub use custom::{
 };
 pub use patch::PatchOps;
 pub use plumbing::{CasOutcome, MergeTreeOutcome, PlumbingOps};
+pub use read_budget::{ReadPriority, current_read_priority, with_read_priority};
 pub use rebase::{PauseReason, RebaseOps, RebaseOpts, RebaseOutcome, RebaseStatus};
 pub use stage::StageOps;
 pub use stash::StashOps;
@@ -831,38 +833,15 @@ fn probe_file(path: &Path) -> Result<bool> {
 }
 
 /// Run an in-process (gix) read under the same budget as the CLI reads
-/// ([`git_read_timeout`]). `f` gets a cooperative interrupt flag that a parked
-/// watchdog thread raises when the deadline passes; the watchdog wakes with no
-/// polling (it blocks on a channel and exits as soon as `f` returns). A read
-/// that honours the flag returns promptly so the shared scan-pool slot is
-/// released and the row degrades to last-known. `None` disables the deadline.
+/// ([`git_read_timeout`]). `f` gets a cooperative interrupt flag that the shared
+/// watchdog raises when the deadline passes. A read that honours the flag
+/// returns promptly so the shared scan-pool slot is released and the row
+/// degrades to last-known. `None` disables the deadline.
 fn with_read_deadline<T>(
     timeout: Option<std::time::Duration>,
     f: impl FnOnce(&std::sync::Arc<std::sync::atomic::AtomicBool>) -> T,
 ) -> T {
-    let flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let Some(timeout) = timeout else {
-        return f(&flag);
-    };
-    let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
-    let watch = flag.clone();
-    let spawned = std::thread::Builder::new()
-        .name("git-read-deadline".into())
-        .spawn(move || {
-            // Only a genuine timeout raises the flag; the sender dropping
-            // (read finished) is `Disconnected`.
-            if matches!(
-                done_rx.recv_timeout(timeout),
-                Err(std::sync::mpsc::RecvTimeoutError::Timeout)
-            ) {
-                watch.store(true, std::sync::atomic::Ordering::SeqCst);
-            }
-        });
-    let out = f(&flag);
-    drop(done_tx);
-    // best-effort: the watchdog exits on its own once the sender is gone
-    drop(spawned);
-    out
+    read_budget::with_read_deadline(timeout, f)
 }
 
 /// Map an interruptible status probe's result: an expired deadline is an error
@@ -2309,13 +2288,13 @@ impl GitBackend for GixGit {
         if loc.is_remote() {
             return self.fallback.is_dirty(loc);
         }
-        let repo = gix::discover(loc.path()).context("gix discover")?;
+        let repo = native_diff::discover_for_status(loc.path())?;
         // The full status iterator (HEAD↔index, index↔worktree, untracked
         // dirwalk), early-exiting on the first entry. Deliberately NOT gix's
         // `Repository::is_dirty()`: that disables the dirwalk and would miss
         // untracked-only worktrees that the CLI fallback (`git status
         // --porcelain`) reports — a silent sidebar-glyph semantics change.
-        let status = repo.status(gix::progress::Discard).context("gix status")?;
+        let status = read_budget::budgeted_status(&repo).context("gix status")?;
         with_read_deadline(git_read_timeout(), |interrupt| {
             let mut iter = status
                 .should_interrupt_owned(interrupt.clone())
@@ -2676,30 +2655,6 @@ mod tests {
         );
         drop(held);
         worker.join().unwrap();
-    }
-
-    #[test]
-    fn read_deadline_raises_flag_for_a_blocked_read() {
-        use std::sync::atomic::Ordering;
-        let raised = super::with_read_deadline(Some(std::time::Duration::from_millis(30)), |f| {
-            let start = std::time::Instant::now();
-            while !f.load(Ordering::SeqCst) && start.elapsed() < std::time::Duration::from_secs(5) {
-                std::thread::sleep(std::time::Duration::from_millis(5));
-            }
-            f.load(Ordering::SeqCst)
-        });
-        assert!(raised, "deadline must interrupt a read that never finishes");
-    }
-
-    #[test]
-    fn read_deadline_stays_down_for_a_fast_read_or_no_budget() {
-        use std::sync::atomic::Ordering;
-        let fast = super::with_read_deadline(Some(std::time::Duration::from_secs(30)), |f| {
-            f.load(Ordering::SeqCst)
-        });
-        assert!(!fast);
-        let off = super::with_read_deadline(None, |f| f.load(Ordering::SeqCst));
-        assert!(!off);
     }
 
     #[test]

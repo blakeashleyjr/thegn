@@ -17,6 +17,7 @@ use crate::config::DataMode;
 use crate::env::Environment;
 use crate::placement::{Placement, SshPlacement};
 use sha2::{Digest, Sha256};
+use std::collections::BTreeSet;
 
 /// A resolved plan for projecting one worktree into its execution environment.
 /// Pure data; the bring-up/teardown lives in `thegn-svc::projection`.
@@ -202,6 +203,49 @@ pub fn is_legacy_mount_component(name: &str) -> bool {
         && name
             .bytes()
             .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
+}
+
+/// Mountpoints currently mounted from the `fuse.sshfs` filesystem, parsed from
+/// `/proc/self/mountinfo`. Malformed lines are ignored.
+pub fn sshfs_mountpoints_from_mountinfo(text: &str) -> BTreeSet<String> {
+    text.lines()
+        .filter_map(|line| {
+            let (before_separator, after_separator) = line.split_once(" - ")?;
+            let fields = before_separator.split_whitespace().collect::<Vec<_>>();
+            let filesystem_fields = after_separator.split_whitespace().collect::<Vec<_>>();
+            if fields.len() < 6 || filesystem_fields.len() < 3 {
+                return None;
+            }
+            (filesystem_fields[0] == "fuse.sshfs").then(|| unescape_mountinfo(fields[4]))
+        })
+        .collect()
+}
+
+fn unescape_mountinfo(mountpoint: &str) -> String {
+    mountpoint
+        .replace("\\040", " ")
+        .replace("\\011", "\t")
+        .replace("\\012", "\n")
+        .replace("\\134", "\\")
+}
+
+/// Action to take for a legacy mount directory, given mountinfo knowledge and
+/// whether lstat found a real directory and that directory is empty.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LegacyReap {
+    Unmount,
+    RemoveOnly,
+    Skip,
+}
+
+pub fn legacy_reap_action(mounted: Option<bool>, is_real_dir: bool, is_empty: bool) -> LegacyReap {
+    match mounted {
+        Some(true) => LegacyReap::Unmount,
+        Some(false) if is_real_dir && is_empty => LegacyReap::RemoveOnly,
+        Some(false) => LegacyReap::Skip,
+        None if is_real_dir => LegacyReap::Unmount,
+        None => LegacyReap::Skip,
+    }
 }
 
 /// Build the projection plan for a resolved environment, or `None` when the data
@@ -456,6 +500,37 @@ mod tests {
             ("é", false),
         ] {
             assert_eq!(is_legacy_mount_component(name), expected, "{name:?}");
+        }
+    }
+
+    #[test]
+    fn mountinfo_parser_keeps_only_sshfs_and_unescapes_mountpoints() {
+        let mountinfo = concat!(
+            "31 22 0:28 / /m/a\\040b rw,nosuid - fuse.sshfs host:/a rw\n",
+            "32 22 8:1 / /mnt/disk rw - ext4 /dev/sda1 rw\n",
+            "33 22 0:45 / /mnt/cloud rw - fuse.rclone remote: rw\n",
+            "34 22 0:46 / truncated rw\n",
+            "35 22 0:47 / /mnt/no-separator rw\n",
+            "36 22 0:48 / - fuse.sshfs\n",
+        );
+
+        assert_eq!(
+            sshfs_mountpoints_from_mountinfo(mountinfo),
+            BTreeSet::from(["/m/a b".to_string()])
+        );
+    }
+
+    #[test]
+    fn legacy_reap_action_covers_known_unknown_and_directory_states() {
+        for (mounted, is_real_dir, is_empty, expected) in [
+            (Some(true), false, false, LegacyReap::Unmount),
+            (Some(false), true, true, LegacyReap::RemoveOnly),
+            (Some(false), true, false, LegacyReap::Skip),
+            (Some(false), false, true, LegacyReap::Skip),
+            (None, true, false, LegacyReap::Unmount),
+            (None, false, true, LegacyReap::Skip),
+        ] {
+            assert_eq!(legacy_reap_action(mounted, is_real_dir, is_empty), expected);
         }
     }
 }

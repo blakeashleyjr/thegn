@@ -1,8 +1,9 @@
 //! Background-work admission for the shared Tokio blocking pool.
 //!
 //! The eight permits bound admitted background closures, including closures
-//! waiting in Tokio's blocking queue. They do not reserve pool threads: direct
-//! `spawn_blocking` calls and `std::thread` workers are outside this budget.
+//! waiting in Tokio's blocking queue. Measurement runs on its own named
+//! `Background` lanes outside these permits. Other direct `spawn_blocking`
+//! calls and `std::thread` workers are also outside this budget.
 //! Admission is non-blocking, so interactive callers never wait for a permit.
 //!
 //! Caller policy matrix (all ordinary refresh callers use a periodic or
@@ -17,8 +18,6 @@
 //! | `hydrate::spawn_my_work_refresh` | replaceable cache refresh; no latch | cache + waker | skip; periodic trigger retries |
 //! | `remote_poll::poll` | replaceable remote refresh; no latch | model refresh + waker | skip; poll tick retries |
 //! | `ci_refresh::spawn_ci_cache_refresh` | single-flight cache refresh; newest request queued, stale generation cancelled | cache + waker | clear latch; ticker/switch retries |
-//! | `measure::disk::spawn_scan` | replaceable cache scan; worker-owned round flag | cache + waker | skip; planner/ticker retries |
-//! | `measure::loc::spawn_scan` | replaceable cache scan; worker-owned round flag | cache + waker | skip; planner/ticker retries |
 //! | `hydrate_calendar::spawn_month_fetch` | user-visible cache read; popup awaits payload | month result channel | send typed unavailable payload |
 //! | `hydrate_calendar::spawn_periodic_sync` | replaceable cache refresh; generation fence only | refresh channel | skip; periodic trigger retries |
 //! | `hydrate_calendar::spawn_reminder_check` | required reminder evaluation; cursor window | typed acknowledgment | abandon window; ticker retries |
