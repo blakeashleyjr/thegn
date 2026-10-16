@@ -570,22 +570,24 @@ impl Recorder {
                         return;
                     }
                 };
-                match self.result.try_recv() {
-                    Ok(finished) => {
-                        drop(late);
-                        send_completion(&completed, self.settle(finished));
-                    }
+                let finished = match self.result.try_recv() {
+                    Ok(finished) => Some(finished),
                     Err(mpsc::TryRecvError::Empty) => {
                         // Publish timeout first while holding the slot lock. The
                         // worker cannot select the late route until this send.
                         send_completion(&completed, self.timeout_finished());
                         *late = Some(completed.downgrade());
+                        None
                     }
                     Err(mpsc::TryRecvError::Disconnected) => {
                         send_completion(&completed, self.worker_stopped_finished());
+                        None
                     }
-                }
+                };
                 drop(late);
+                if let Some(finished) = finished {
+                    send_completion(&completed, self.settle(finished));
+                }
                 drop(self.worker.take());
             }
             Err(mpsc::RecvTimeoutError::Disconnected) => {
@@ -1489,7 +1491,7 @@ mod tests {
         );
         assert!(matches!(
             completed_rx.try_recv(),
-            Err(mpsc::error::TryRecvError::Disconnected)
+            Err(tokio::sync::mpsc::error::TryRecvError::Disconnected)
         ));
         assert!(matches!(
             result_rx.try_recv(),
