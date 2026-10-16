@@ -21,6 +21,9 @@ pub struct PanelFrame {
     /// X-spans (panel-relative) for rows that pack two hit targets side by
     /// side, as in the git two-column zone. A listed row resolves by x only.
     pub col_hits: Vec<ColHit>,
+    /// The frame rows and x spans occupied by a side-by-side content zone.
+    /// `None` when the frame has no side-by-side zone.
+    pub col_zone: Option<ColZone>,
     /// X-spans for the tab bar (always row 0): `(col_range, tab)`.
     /// Used by `chrome::panel_tab_hit` for x-based click resolution.
     /// Empty for the git-family full view which omits the tab bar.
@@ -42,6 +45,21 @@ pub struct ColHit {
     pub row: usize,
     pub cols: std::ops::Range<usize>,
     pub hit: crate::panel::PanelHit,
+}
+
+/// The two panel columns available within a side-by-side content zone.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PanelColumn {
+    Side,
+    Main,
+}
+
+/// Panel-relative rows and x spans for a two-column content zone.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ColZone {
+    pub rows: std::ops::Range<usize>,
+    pub side: std::ops::Range<usize>,
+    pub main: std::ops::Range<usize>,
 }
 
 fn hue(h: Hue) -> Tok {
@@ -538,6 +556,7 @@ pub fn build_panel(
         rows: out,
         rail: Vec::new(),
         col_hits: Vec::new(),
+        col_zone: None,
         tab_spans,
     }
 }
@@ -709,6 +728,7 @@ fn build_full(
         rows: out,
         rail: spans,
         col_hits: Vec::new(),
+        col_zone: None,
         tab_spans,
     }
 }

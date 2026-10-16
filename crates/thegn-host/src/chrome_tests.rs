@@ -3366,3 +3366,172 @@ fn panel_hit_at_resolves_main_column_drill_click() {
     assert_eq!(panel_hit_at(&model, &ui, rect, side_x, click_y), side_hit);
     assert_eq!(panel_hit_at(&model, &ui, rect, divider_x, click_y), None);
 }
+
+#[test]
+fn panel_column_at_splits_the_zone() {
+    use crate::layout::PanelWidth;
+    use crate::panel::frame::PanelColumn;
+    use crate::panel::gitui::GitView;
+    use crate::panel::{CommitRow, PanelHit, PanelTab, PanelUi, Section};
+
+    let rect = Rect {
+        x: 7,
+        y: 4,
+        cols: 120,
+        rows: 40,
+    };
+    let mut model = panel_model();
+    model.panel.commits = vec![CommitRow {
+        sha: "abcdef0123456789".into(),
+        short: "abcdef0".into(),
+        subject: "feat: column zone".into(),
+        author: "Author".into(),
+        date: 1_700_000_000,
+        refs: String::new(),
+        parents: vec![],
+    }];
+    let mut ui = PanelUi {
+        width: PanelWidth::Full,
+        open: Section::Commits,
+        tab: PanelTab::Git,
+        ..Default::default()
+    };
+    ui.git.focus = GitView::CommitFiles;
+    ui.git.drilled_commit = Some(model.panel.commits[0].sha.clone());
+    ui.git.commit_files_load = crate::panel::gitui::DocLoad::Ready;
+    ui.git.commit_files = vec![("src/a.rs".into(), 2, 1)];
+    let frame = crate::panel::frame::build_panel(&model, &ui, rect.cols, rect.rows, true);
+    let zone = frame
+        .col_zone
+        .expect("Full git panel has a two-column zone");
+    let drill = frame
+        .col_hits
+        .iter()
+        .find(|span| span.hit == PanelHit::GitDrill(0))
+        .expect("commit files row is in the main column");
+
+    assert_eq!(
+        panel_column_at(
+            &model,
+            &ui,
+            rect,
+            rect.x + zone.side.start,
+            rect.y + drill.row
+        ),
+        Some(PanelColumn::Side)
+    );
+    assert_eq!(
+        panel_column_at(
+            &model,
+            &ui,
+            rect,
+            rect.x + zone.main.start,
+            rect.y + drill.row
+        ),
+        Some(PanelColumn::Main)
+    );
+    assert_eq!(
+        panel_column_at(
+            &model,
+            &ui,
+            rect,
+            rect.x + zone.side.end,
+            rect.y + drill.row
+        ),
+        None
+    );
+    assert_eq!(panel_column_at(&model, &ui, rect, rect.x, rect.y), None);
+}
+
+#[test]
+fn panel_drill_drag_hit_clamps_into_main_column() {
+    use crate::layout::PanelWidth;
+    use crate::panel::gitui::GitView;
+    use crate::panel::{BlameRow, CommitRow, PanelHit, PanelTab, PanelUi, Section};
+
+    let rect = Rect {
+        x: 7,
+        y: 4,
+        cols: 120,
+        rows: 40,
+    };
+    let mut model = panel_model();
+    model.panel.commits = vec![CommitRow {
+        sha: "abcdef0123456789".into(),
+        short: "abcdef0".into(),
+        subject: "feat: drag zone".into(),
+        author: "Author".into(),
+        date: 1_700_000_000,
+        refs: String::new(),
+        parents: vec![],
+    }];
+    let mut ui = PanelUi {
+        width: PanelWidth::Full,
+        open: Section::Commits,
+        tab: PanelTab::Git,
+        ..Default::default()
+    };
+    ui.git.focus = GitView::CommitFiles;
+    ui.git.drilled_commit = Some(model.panel.commits[0].sha.clone());
+    ui.git.commit_files_load = crate::panel::gitui::DocLoad::Ready;
+    ui.git.commit_files = vec![("src/a.rs".into(), 2, 1)];
+    let frame = crate::panel::frame::build_panel(&model, &ui, rect.cols, rect.rows, true);
+    let drill = frame
+        .col_hits
+        .iter()
+        .find(|span| span.hit == PanelHit::GitDrill(0))
+        .expect("commit files row is in the main column");
+    assert_eq!(
+        panel_drill_drag_hit(&model, &ui, rect, rect.x, rect.y + drill.row),
+        Some(0),
+        "a side-column drag sample clamps horizontally into the main drill"
+    );
+
+    ui.git.focus = GitView::Blame;
+    ui.git.blame_rows = (0..100)
+        .map(|index| BlameRow {
+            sha: "abcdef0".into(),
+            author: "Author".into(),
+            date: 1_700_000_000,
+            lineno: index + 1,
+            content: format!("line {index}"),
+        })
+        .collect();
+    let frame = crate::panel::frame::build_panel(&model, &ui, rect.cols, rect.rows, true);
+    let zone = frame.col_zone.expect("Blame frame has a fused zone");
+    let last = frame
+        .col_hits
+        .iter()
+        .find(|span| span.row == zone.rows.end - 1)
+        .expect("last visible blame row is draggable");
+    assert_eq!(
+        panel_drill_drag_hit(&model, &ui, rect, rect.x, rect.y + zone.rows.end + 10),
+        match last.hit {
+            PanelHit::GitDrill(index) => Some(index),
+            _ => None,
+        }
+    );
+
+    ui.width = PanelWidth::Half;
+    let narrow = crate::panel::frame::build_panel(&model, &ui, 60, rect.rows, true);
+    assert!(narrow.col_zone.is_none());
+    let narrow_drill = narrow
+        .rows
+        .iter()
+        .enumerate()
+        .find_map(|(row, panel_row)| match panel_row.hit {
+            Some(PanelHit::GitDrill(index)) => Some((row, index)),
+            _ => None,
+        })
+        .expect("stacked Half frame has a drill row");
+    assert_eq!(
+        panel_drill_drag_hit(
+            &model,
+            &ui,
+            Rect { cols: 60, ..rect },
+            rect.x,
+            rect.y + narrow_drill.0,
+        ),
+        Some(narrow_drill.1)
+    );
+}

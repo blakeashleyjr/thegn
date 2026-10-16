@@ -2346,6 +2346,78 @@ pub fn panel_hit_at(
     frame.rows.get(row).and_then(|panel_row| panel_row.hit)
 }
 
+/// Return the side or main column under a point in the panel's two-column zone.
+pub fn panel_column_at(
+    model: &FrameModel,
+    ui: &crate::panel::PanelUi,
+    rect: Rect,
+    x: usize,
+    y: usize,
+) -> Option<crate::panel::frame::PanelColumn> {
+    let frame =
+        crate::panel::frame::build_panel(model, ui, rect.cols, rect.rows, model.panel_focused);
+    let zone = frame.col_zone?;
+    let row = y.checked_sub(rect.y)?;
+    let col = x.checked_sub(rect.x)?;
+    if !zone.rows.contains(&row) {
+        return None;
+    }
+    if zone.side.contains(&col) {
+        Some(crate::panel::frame::PanelColumn::Side)
+    } else if zone.main.contains(&col) {
+        Some(crate::panel::frame::PanelColumn::Main)
+    } else {
+        None
+    }
+}
+
+/// Resolve a drill row for a drag, clamping samples to the visible content.
+pub fn panel_drill_drag_hit(
+    model: &FrameModel,
+    ui: &crate::panel::PanelUi,
+    rect: Rect,
+    x: usize,
+    y: usize,
+) -> Option<usize> {
+    let frame =
+        crate::panel::frame::build_panel(model, ui, rect.cols, rect.rows, model.panel_focused);
+    let (row, col) = if let Some(zone) = frame.col_zone {
+        if zone.rows.is_empty() || zone.main.is_empty() {
+            return None;
+        }
+        let row = y
+            .saturating_sub(rect.y)
+            .clamp(zone.rows.start, zone.rows.end - 1);
+        let col = x
+            .saturating_sub(rect.x)
+            .clamp(zone.main.start, zone.main.end - 1);
+        (row, Some(col))
+    } else {
+        let row = y
+            .saturating_sub(rect.y)
+            .min(frame.rows.len().saturating_sub(1));
+        (row, None)
+    };
+    if let Some(col) = col {
+        frame
+            .col_hits
+            .iter()
+            .find(|span| span.row == row && span.cols.contains(&col))
+            .and_then(|span| match span.hit {
+                crate::panel::PanelHit::GitDrill(index) => Some(index),
+                _ => None,
+            })
+    } else {
+        frame
+            .rows
+            .get(row)
+            .and_then(|panel_row| match panel_row.hit {
+                Some(crate::panel::PanelHit::GitDrill(index)) => Some(index),
+                _ => None,
+            })
+    }
+}
+
 /// Resolve a click against the Full view's slim rail (`1 changes · 2 git · …`).
 /// `panel_hit_at` resolves rows with `col_hits` by x, while the rail packs
 /// several sections onto one row, so the Full view needs this x+y test.
