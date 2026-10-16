@@ -320,6 +320,58 @@ fn prefer_oneshot_filters(cache: &mut gix::diff::blob::Platform) {
     }
 }
 
+/// Reroute required filters with both `clean` and `process` configured in the
+/// repository snapshot. This runs on every `discover_for_status`/`open()`, so
+/// machines with a global `filter.lfs` from `git lfs install` clone and
+/// re-resolve the config snapshot on every scan. The status pipeline is built
+/// internally by gix, so it cannot use [`prefer_oneshot_filters`]; updating the
+/// snapshot makes that pipeline choose the waited one-shot `clean` path too.
+/// Sections gix would ignore as untrusted are rerouted as well, which is
+/// harmless.
+fn reroute_persistent_filters(repo: &mut gix::Repository) {
+    let matching_sections: Vec<_> = repo
+        .config_snapshot()
+        .sections_and_ids_by_name("filter")
+        .into_iter()
+        .flatten()
+        .filter_map(|(section, id)| {
+            section.header().subsection_name()?;
+            let required = section
+                .value("required")
+                .map(|value| gix::config::Boolean::try_from(value.as_ref()))
+                .transpose()
+                .is_ok_and(|value| value.unwrap_or_default().into());
+            (required && section.value("clean").is_some() && section.value("process").is_some())
+                .then_some(id)
+        })
+        .collect();
+    if matching_sections.is_empty() {
+        return;
+    }
+
+    let mut snapshot = repo.config_snapshot_mut();
+    for id in matching_sections {
+        if let Some(mut section) = snapshot.section_mut_by_id(id) {
+            while section.remove("process").is_some() {}
+        }
+    }
+    if let Err(error) = snapshot.commit() {
+        tracing::debug!(
+            target: "thegn::git",
+            %error,
+            "could not reroute persistent status filters"
+        );
+    }
+}
+
+/// Discover a repository with required persistent filters routed through
+/// one-shot clean programs, which gix waits for in status walks.
+pub(super) fn discover_for_status(path: impl AsRef<std::path::Path>) -> Result<gix::Repository> {
+    let mut repo = gix::discover(path).context("gix discover")?;
+    reroute_persistent_filters(&mut repo);
+    Ok(repo)
+}
+
 impl std::ops::Deref for ReapingCache {
     type Target = gix::diff::blob::Platform;
     fn deref(&self) -> &Self::Target {
@@ -373,11 +425,11 @@ fn tree_of<'r>(repo: &'r gix::Repository, rev: &str) -> Result<gix::Tree<'r>> {
         .context("gix commit tree")
 }
 
-/// Open the repo at `path` with an object cache sized for repeated commit
-/// lookups — gix's `merge_base` docs call this out specifically, and the glyph
-/// scan calls it on every refresh.
+/// Open the repo at `path` with status-safe filters and an object cache sized
+/// for repeated commit lookups — gix's `merge_base` docs call this out
+/// specifically, and the glyph scan calls it on every refresh.
 fn open(path: impl AsRef<std::path::Path>) -> Result<gix::Repository> {
-    let mut repo = gix::discover(path).context("gix discover")?;
+    let mut repo = discover_for_status(path)?;
     repo.object_cache_size_if_unset(4 * 1024 * 1024);
     Ok(repo)
 }
@@ -1535,6 +1587,159 @@ mod tests {
                 super::super::DiffCount::Binary,
                 super::super::DiffCount::Binary
             )
+        );
+    }
+
+    /// A filtered repository whose tracked files are rewritten with the same
+    /// byte length, forcing gix's status walk to clean the worktree contents.
+    fn filtered_same_size_repo(name: &str, paths: &[&str]) -> TestRepo {
+        let repo = TestRepo::new(name);
+        repo.commit_file(".gitattributes", "*.txt filter=tgtest\n", "attributes");
+        for path in paths {
+            repo.commit_file(path, "one\ntwo\n", "seed");
+        }
+
+        let marker = repo.dir.join(".git").join("clean-ran");
+        repo.out(&[
+            "config",
+            "filter.tgtest.clean",
+            &format!("tee -a {}", marker.display()),
+        ]);
+        repo.out(&["config", "filter.tgtest.smudge", "cat"]);
+        repo.out(&["config", "filter.tgtest.process", "cat"]);
+        repo.out(&["config", "filter.tgtest.required", "true"]);
+        for path in paths {
+            std::fs::write(repo.dir.join(path), "one\ntwx\n").unwrap();
+        }
+        // Start the assertion marker after setup so it proves the status walk
+        // ran the filter. Keeping it in .git prevents status from reporting it.
+        std::fs::write(marker, "").unwrap();
+        repo
+    }
+
+    fn wait_for_children_at_most(count: usize) -> Vec<(String, String)> {
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        loop {
+            let children = own_children();
+            if children.len() <= count || std::time::Instant::now() >= deadline {
+                return children;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    #[test]
+    fn a_same_size_status_walk_leaves_no_unreaped_filter_process() {
+        if !std::path::Path::new("/proc/self/stat").exists() {
+            return;
+        }
+
+        let repo = filtered_same_size_repo("reap-same-size-status", &["tracked.txt"]);
+        let before = own_children().len();
+        let mut found = false;
+        for _ in 0..5 {
+            let gr = discover_for_status(&repo.dir).unwrap();
+            let iter = gr
+                .status(gix::progress::Discard)
+                .unwrap()
+                .untracked_files(gix::status::UntrackedFiles::None)
+                .into_iter(None)
+                .unwrap();
+            for item in iter {
+                let item = item.unwrap();
+                found |= item.location().to_vec() == b"tracked.txt";
+            }
+        }
+        assert!(found, "status must report the same-size filtered edit");
+        assert!(
+            std::fs::metadata(repo.dir.join(".git").join("clean-ran"))
+                .is_ok_and(|metadata| metadata.len() > 0),
+            "the clean filter must run during the status walk"
+        );
+        let after = wait_for_children_at_most(before);
+        assert!(
+            after.len() <= before,
+            "status walks left unreaped child process(es) behind (before={before}, after={after:?})"
+        );
+    }
+
+    #[test]
+    fn gix_is_dirty_on_same_size_filtered_edits_reaps_and_reports_dirty() {
+        if !std::path::Path::new("/proc/self/stat").exists() {
+            return;
+        }
+
+        let repo = filtered_same_size_repo(
+            "reap-same-size-is-dirty",
+            &["a.txt", "b.txt", "c.txt", "d.txt", "e.txt"],
+        );
+        let before = own_children().len();
+        for _ in 0..5 {
+            assert!(
+                crate::git::GitBackend::is_dirty(&crate::git::GixGit::new(), &repo.loc()).unwrap(),
+                "the first same-size filtered edit must make the worktree dirty"
+            );
+        }
+        assert!(
+            std::fs::metadata(repo.dir.join(".git").join("clean-ran"))
+                .is_ok_and(|metadata| metadata.len() > 0),
+            "the clean filter must run in GixGit::is_dirty"
+        );
+        let after = wait_for_children_at_most(before);
+        assert!(
+            after.len() <= before,
+            "is_dirty left unreaped child process(es) behind (before={before}, after={after:?})"
+        );
+    }
+
+    #[test]
+    fn reroute_keeps_non_required_and_clean_less_process_drivers() {
+        let repo = TestRepo::new("reroute-filter-sections");
+        repo.out(&["config", "filter.a.clean", "cat"]);
+        repo.out(&["config", "filter.a.process", "cat"]);
+        repo.out(&["config", "filter.a.required", "true"]);
+        repo.out(&["config", "filter.b.clean", "cat"]);
+        repo.out(&["config", "filter.b.process", "cat"]);
+        repo.out(&["config", "filter.c.process", "cat"]);
+        repo.out(&["config", "filter.c.required", "true"]);
+
+        let gr = discover_for_status(&repo.dir).unwrap();
+        assert_eq!(
+            gr.config_snapshot()
+                .string("filter.a.process")
+                .map(|v| v.to_string()),
+            None
+        );
+        assert_eq!(
+            gr.config_snapshot()
+                .string("filter.b.process")
+                .map(|v| v.to_string()),
+            Some("cat".to_string())
+        );
+        assert_eq!(
+            gr.config_snapshot()
+                .string("filter.c.process")
+                .map(|v| v.to_string()),
+            Some("cat".to_string())
+        );
+
+        let unrelated_filter = TestRepo::new("reroute-unrelated-filter");
+        unrelated_filter.out(&["config", "filter.d.process", "cat"]);
+        let before = gix::discover(&unrelated_filter.dir).unwrap();
+        assert_eq!(
+            before
+                .config_snapshot()
+                .string("filter.d.process")
+                .map(|v| v.to_string()),
+            Some("cat".to_string())
+        );
+        let after = discover_for_status(&unrelated_filter.dir).unwrap();
+        assert_eq!(
+            after
+                .config_snapshot()
+                .string("filter.d.process")
+                .map(|v| v.to_string()),
+            Some("cat".to_string())
         );
     }
 }
