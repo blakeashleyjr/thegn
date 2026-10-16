@@ -97,6 +97,9 @@ mod tests {
 
     #[test]
     fn write_state_file_refuses_the_real_state_root() {
+        if thegn_core::sandbox_backend::host_os() == thegn_core::sandbox_backend::HostOs::Windows {
+            return;
+        }
         let root = tempfile::tempdir().expect("state root");
         let _env = isolated_state_env(root.path());
         let refused_path = root.path().join(".local/state/thegn/probe/x");
@@ -126,6 +129,9 @@ mod tests {
 
     #[test]
     fn task_output_dir_refuses_the_real_state_root() {
+        if thegn_core::sandbox_backend::host_os() == thegn_core::sandbox_backend::HostOs::Windows {
+            return;
+        }
         let root = tempfile::tempdir().expect("state root");
         let _env = isolated_state_env(root.path());
         let refused = std::panic::catch_unwind(crate::handlers::task_output::task_output_dir);
@@ -137,6 +143,9 @@ mod tests {
 
     #[test]
     fn write_handoff_refuses_the_real_state_root() {
+        if thegn_core::sandbox_backend::host_os() == thegn_core::sandbox_backend::HostOs::Windows {
+            return;
+        }
         let root = tempfile::tempdir().expect("state root");
         let _env = isolated_state_env(root.path());
         let refused = std::panic::catch_unwind(|| crate::daemon::fork::write_handoff("c", "t"));
