@@ -87,9 +87,9 @@ thegn SHALL surgically strip a stray `core.worktree` from a main checkout's shar
 ### Requirement: Serialize concurrent git mutations with a cross-process lock
 
 Mutating git operations SHALL take an advisory `flock` on `<git-common>/thegn-git.lock` so concurrent thegn/agent processes on the same repo serialize their writes, while reads remain lock-free.
-Network transfers (push, fetch, remote branch delete, and tag push) SHALL run
+The push, fetch-all, remote branch delete and tag push operations SHALL run
 outside the lock. A non-current local fast-forward SHALL take the lock only
-for the local ref update.
+for the local ref update. Pull SHALL remain a single locked operation.
 
 #### Scenario: Two writers serialize
 

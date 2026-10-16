@@ -35,8 +35,8 @@ Global flags everywhere: `--config`, `--log-level`, `--set key=value`
 
 Before reclaiming pages, `thegn db vacuum` removes semantic-index rows for
 deleted files and cache keys left by removed worktrees, and reports both
-counts (`pruned_semantic_rows` and `pruned_cache_keys` in `--json`).
-`--dry-run` removes nothing.
+counts. `--json` emits one report (including `pruned_semantic_rows` and
+`pruned_cache_keys`); `--dry-run` removes nothing.
 
 Some of these are dev-channel only — see [[release-channels]].
 
