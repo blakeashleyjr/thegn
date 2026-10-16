@@ -102,6 +102,12 @@ unresolved.
 - **THEN** the result is `gate_error`, the target does not advance, and the
   command is never classified as a red candidate gate
 
+#### Scenario: Cancellation records an active gate error and leaves later rows queued
+
+- **WHEN** cancellation stops a gate already running for a queued row
+- **THEN** the active row is recorded as `gate_error` with class `cancelled`,
+  later rows remain queued, and no candidate is blamed
+
 #### Scenario: A descendant retains a reused gate pipe
 
 - **WHEN** a command's direct child exits but a descendant retains stdout or

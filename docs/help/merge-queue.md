@@ -266,8 +266,9 @@ keep its quarantined lease held. The matching environment overrides are
 `THEGN_MERGE_QUEUE_GATE_TIMEOUT_SECS`.
 
 Pressing Ctrl-C or sending SIGTERM during `thegn integrate`, `thegn land`, or
-`thegn merge drain` cancels the fold without blaming a branch; a cancelled drain
-leaves its in-flight row queued.
+`thegn merge drain` cancels the fold without blaming a branch. If cancellation
+stops a gate already running for a row, that row is recorded as `gate_error`;
+rows not yet started remain queued.
 
 When a red union is being localized, `diagnosis_max_gates` (default `8`) caps
 the total gate attempts and `diagnosis_timeout_secs` (default `3600`) bounds
@@ -290,7 +291,8 @@ one of them is about your branch:
   on the next drain, since the environment may be fixed by then. The human
   footer and `thegn merge drain --json` report each gate error's `phase`
   (preparation, setup, or gate) and `class` (timeout, spawn, killed,
-  setup_failed, capture, poisoned, preparation, signing, or source_moved). The JSON
+  setup_failed, capture, poisoned, preparation, signing, source_moved, or
+  cancelled). The JSON
   `gate_verdicts` entries carry both fields.
 
 ## Driving it from an agent pane
