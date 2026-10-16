@@ -80,22 +80,11 @@ pub struct StatsSampler {
     /// `None` until the first sample — a monotonic counter cannot yield a rate
     /// without a predecessor, and reporting the raw total would be meaningless.
     prev_reclaim: Option<(u64, Instant)>,
+    vmstat: crate::vmstat::VmstatReader,
     /// Cached slow-tier results, reused between refreshes.
     last_disks: Vec<DiskInfo>,
     last_temps: Vec<(String, f32)>,
     last_net_medium: NetMedium,
-}
-
-/// `pgsteal_direct` from `/proc/vmstat` — pages reclaimed synchronously since
-/// boot. `None` off Linux, or if the field is absent (it has moved between
-/// kernel versions, so a missing field degrades to "not observed" rather than
-/// to zero).
-#[cfg(target_os = "linux")]
-fn read_pgsteal_direct() -> Option<u64> {
-    let s = std::fs::read_to_string("/proc/vmstat").ok()?;
-    s.lines()
-        .find_map(|l| l.strip_prefix("pgsteal_direct "))
-        .and_then(|v| v.trim().parse().ok())
 }
 
 /// Parse Linux `/proc/net/route`, returning every interface tied for the
@@ -176,12 +165,6 @@ pub fn probe_net_path() -> crate::MediumSelection {
     crate::MediumSelection::probe_unavailable()
 }
 
-/// No `/proc/vmstat` here; the metric is reported as unobserved.
-#[cfg(not(target_os = "linux"))]
-fn read_pgsteal_direct() -> Option<u64> {
-    None
-}
-
 impl StatsSampler {
     /// `disk_path` is any path on the filesystem whose free-space % feeds the
     /// `disk` masthead widget (the worktrees dir).
@@ -210,6 +193,7 @@ impl StatsSampler {
             prev_net: now,
             prev_disk: now,
             prev_reclaim: None,
+            vmstat: crate::vmstat::VmstatReader::new(),
             last_disks: Vec::new(),
             last_temps: Vec::new(),
             last_net_medium: NetMedium::Unknown,
@@ -282,6 +266,7 @@ impl StatsSampler {
         let total = self.sys.total_memory();
         if total > 0 {
             snap.mem_gib = Some((gib(self.sys.used_memory()), gib(total)));
+            snap.mem_free_gib = Some(gib(self.sys.free_memory()));
         }
         let swap_total = self.sys.total_swap();
         if swap_total > 0 {
@@ -294,7 +279,7 @@ impl StatsSampler {
         // monotonic since boot. The first sample only primes: no predecessor
         // means no rate, and an absent signal must stay absent rather than
         // become a comfortable zero.
-        if let Some(cur) = read_pgsteal_direct() {
+        if let Some(cur) = self.vmstat.pgsteal_direct() {
             if let Some((prev, at)) = self.prev_reclaim {
                 let dt = now.duration_since(at).as_secs_f32().max(0.001);
                 snap.reclaim_per_s = Some(cur.saturating_sub(prev) as f32 / dt);
