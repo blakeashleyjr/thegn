@@ -20,9 +20,16 @@
 //! | Output/resize admitted | Actor timestamps and queues it; worker writes FIFO order. |
 //! | Queue/budget full | Actor accumulates a gap; recording stays active and status counts dropped bytes. |
 //! | Close | Actor closes admission and hands a pending gap to the worker as its final event. |
-//! | Sink error/disconnect/panic | Worker completion is truncated; the session remains alive. |
+//! | Disk full/final-flush failure | Worker completion is truncated; the session remains alive. |
+//! | Worker panic | Worker reports a distinct truncated completion; the session remains alive. |
+//! | Sink disconnect | Worker completion is truncated; the session remains alive. |
 //! | Size cap | Worker stops at the cap and reports `capped`; no later output is claimed. |
 //! | Finish deadline | Caller reports timeout; the worker retains file ownership and may complete late. |
+//! | Repeated Stop | Stop is idempotent; it returns the same stopping or final status. |
+//! | Stop then Start | Start creates a new generation; an old completion is logged and cannot change its status. |
+//! | Stopping | Admission is closed; status remains `stopping` through a timeout classification until the worker reports its actual result. |
+//! | Late completion | While the actor lives, its real outcome replaces the timeout classification; after actor exit it is only logged. |
+//! | Actor exit | The shutdown tail performs its bounded synchronous finish and records the path in the tombstone. |
 
 use std::io::{self, BufWriter, Write};
 use std::path::{Path, PathBuf};
@@ -40,6 +47,13 @@ pub(super) const FINISH_TIMEOUT: Duration = Duration::from_secs(2);
 const GLOBAL_INFLIGHT_BYTES: usize = 8 * 1024 * 1024;
 
 static RECORDING_INFLIGHT: OnceLock<Arc<AtomicUsize>> = OnceLock::new();
+static NEXT_RECORDING_GENERATION: AtomicU64 = AtomicU64::new(1);
+
+fn next_generation() -> u64 {
+    NEXT_RECORDING_GENERATION.fetch_add(1, Ordering::Relaxed)
+}
+
+type LateCompletion = Arc<Mutex<Option<tokio::sync::mpsc::UnboundedSender<Finished>>>>;
 
 fn global_inflight() -> Arc<AtomicUsize> {
     Arc::clone(RECORDING_INFLIGHT.get_or_init(|| Arc::new(AtomicUsize::new(0))))
@@ -183,6 +197,8 @@ pub(crate) struct Recorder {
     path: PathBuf,
     start: Instant,
     pending_gap: Option<PendingGap>,
+    generation: u64,
+    late: LateCompletion,
 }
 
 /// What [`Recorder::finish`] leaves behind: where the recording was written,
@@ -196,6 +212,8 @@ pub(crate) struct Finished {
     pub(crate) truncated: Option<String>,
     /// Raw PTY bytes omitted under overload, including UTF-8 carry discarded at gaps.
     pub(crate) dropped_bytes: u64,
+    pub(crate) generation: u64,
+    pub(crate) late: bool,
 }
 
 impl Recorder {
@@ -218,26 +236,35 @@ impl Recorder {
         let max_bytes = cfg.recording.max_bytes;
         let (tx, rx) = mpsc::sync_channel(QUEUE_COMMANDS);
         let (result_tx, result) = mpsc::channel();
+        let generation = next_generation();
+        let late = Arc::new(Mutex::new(None));
         let state = Arc::new(WorkerState::new());
         let inflight = global_inflight();
         let worker_state = Arc::clone(&state);
+        let worker_late = Arc::clone(&late);
         let worker_path = path.clone();
         let worker = thread::Builder::new()
             .name(format!("record-{safe}"))
             .spawn(move || {
                 crate::platform::qos::set_self(crate::platform::qos::Qos::Background);
-                let finished = run_worker(
-                    rx,
-                    &worker_path,
-                    cols,
-                    rows,
-                    max_bytes,
-                    stamp,
-                    worker_state.as_ref(),
-                );
-                if let Err(error) = result_tx.send(finished) {
-                    tracing::debug!(target: "thegn::daemon", "recording completion receiver dropped: {error}");
-                }
+                let finished = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    run_worker(
+                        rx,
+                        WorkerStart {
+                            path: &worker_path,
+                            cols,
+                            rows,
+                            max_bytes,
+                            stamp,
+                            generation,
+                        },
+                        worker_state.as_ref(),
+                    )
+                }))
+                .unwrap_or_else(|_| {
+                    worker_panic_finished(&worker_path, generation, worker_state.as_ref())
+                });
+                dispatch_finished(finished, &result_tx, &worker_late);
                 worker_state.completion_wake.notify_one();
             })?;
         Ok(Self {
@@ -250,6 +277,8 @@ impl Recorder {
             path,
             start: Instant::now(),
             pending_gap: None,
+            generation,
+            late,
         })
     }
 
@@ -438,6 +467,10 @@ impl Recorder {
             .and_then(|failure| failure.clone())
     }
 
+    pub(crate) fn generation(&self) -> u64 {
+        self.generation
+    }
+
     /// Close admission and wait at most two seconds for queued writes and flush.
     /// On timeout, the still-running worker retains file ownership; status says
     /// truncated even though the detached worker may finish flushing later.
@@ -491,6 +524,8 @@ impl Recorder {
                     capped: self.state.capped(),
                     truncated: Some(reason.to_string()),
                     dropped_bytes: self.state.dropped_bytes.load(Ordering::Acquire),
+                    generation: self.generation,
+                    late: false,
                 }
             }
         }
@@ -498,17 +533,107 @@ impl Recorder {
 
     /// Close admission immediately and perform the bounded wait away from the
     /// session actor. The actor receives completion through its own mailbox.
-    pub(crate) fn finish_background(
+    pub(crate) fn finish_background(self, completed: tokio::sync::mpsc::UnboundedSender<Finished>) {
+        self.finish_background_with_timeout(completed, FINISH_TIMEOUT);
+    }
+
+    fn finish_background_with_timeout(
         mut self,
         completed: tokio::sync::mpsc::UnboundedSender<Finished>,
+        timeout: Duration,
     ) {
         self.close_admission();
         drop(tokio::task::spawn_blocking(move || {
-            let finished = self.wait_finished(FINISH_TIMEOUT);
-            if let Err(error) = completed.send(finished) {
-                tracing::debug!(target: "thegn::daemon", "recording completion receiver dropped: {error}");
-            }
+            self.wait_finished_background(completed, timeout);
         }));
+    }
+
+    fn wait_finished_background(
+        mut self,
+        completed: tokio::sync::mpsc::UnboundedSender<Finished>,
+        timeout: Duration,
+    ) {
+        match self.result.recv_timeout(timeout) {
+            Ok(mut finished) => {
+                if self
+                    .worker
+                    .take()
+                    .is_some_and(|worker| worker.join().is_err())
+                    && finished.truncated.is_none()
+                {
+                    finished.truncated = Some("recording writer panicked".to_string());
+                }
+                finished.dropped_bytes = finished
+                    .dropped_bytes
+                    .max(self.state.dropped_bytes.load(Ordering::Acquire));
+                send_completion(&completed, finished);
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                let timeout_result = self.timeout_finished();
+                let mut late = match self.late.lock() {
+                    Ok(slot) => slot,
+                    Err(error) => {
+                        tracing::debug!(target: "thegn::daemon", "recording late-completion slot poisoned: {error}");
+                        send_completion(&completed, timeout_result);
+                        return;
+                    }
+                };
+                match self.result.try_recv() {
+                    Ok(mut finished) => {
+                        if self
+                            .worker
+                            .take()
+                            .is_some_and(|worker| worker.join().is_err())
+                            && finished.truncated.is_none()
+                        {
+                            finished.truncated = Some("recording writer panicked".to_string());
+                        }
+                        finished.dropped_bytes = finished
+                            .dropped_bytes
+                            .max(self.state.dropped_bytes.load(Ordering::Acquire));
+                        send_completion(&completed, finished);
+                    }
+                    Err(mpsc::TryRecvError::Empty) => {
+                        // Publish timeout first while holding the slot lock. The
+                        // worker cannot select the late route until this send.
+                        send_completion(&completed, timeout_result);
+                        *late = Some(completed);
+                    }
+                    Err(mpsc::TryRecvError::Disconnected) => {
+                        send_completion(&completed, timeout_result);
+                    }
+                }
+                drop(late);
+                drop(self.worker.take());
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                send_completion(&completed, self.worker_stopped_finished());
+            }
+        }
+    }
+
+    fn timeout_finished(&self) -> Finished {
+        Finished {
+            path: self.path.clone(),
+            capped: self.state.capped(),
+            truncated: Some(
+                "recording finalization timed out; writer may still be flushing".to_string(),
+            ),
+            dropped_bytes: self.state.dropped_bytes.load(Ordering::Acquire),
+            generation: self.generation,
+            late: false,
+        }
+    }
+
+    fn worker_stopped_finished(&self) -> Finished {
+        Finished {
+            path: self.path.clone(),
+            capped: self.state.capped(),
+            truncated: Some("recording writer stopped without a completion result".to_string()),
+            dropped_bytes: self.state.dropped_bytes.load(Ordering::Acquire),
+            generation: self.generation,
+            late: false,
+        }
     }
 
     fn elapsed(&self) -> f64 {
@@ -516,29 +641,85 @@ impl Recorder {
     }
 }
 
-fn run_worker(
-    rx: mpsc::Receiver<Command>,
-    path: &Path,
+struct WorkerStart<'a> {
+    path: &'a Path,
     cols: u16,
     rows: u16,
     max_bytes: u64,
     stamp: i64,
+    generation: u64,
+}
+
+fn dispatch_finished(
+    mut finished: Finished,
+    result_tx: &mpsc::Sender<Finished>,
+    late: &LateCompletion,
+) {
+    let slot = match late.lock() {
+        Ok(slot) => slot,
+        Err(error) => {
+            tracing::debug!(target: "thegn::daemon", "recording late-completion slot poisoned: {error}");
+            if let Err(error) = result_tx.send(finished) {
+                tracing::debug!(target: "thegn::daemon", "recording completion receiver dropped: {error}");
+            }
+            return;
+        }
+    };
+    if let Some(completed) = slot.as_ref() {
+        finished.late = true;
+        if let Err(error) = completed.send(finished) {
+            tracing::debug!(target: "thegn::daemon", "recording late-completion receiver dropped: {error}");
+        }
+    } else if let Err(error) = result_tx.send(finished) {
+        tracing::debug!(target: "thegn::daemon", "recording completion receiver dropped: {error}");
+    }
+}
+
+fn send_completion(completed: &tokio::sync::mpsc::UnboundedSender<Finished>, finished: Finished) {
+    if let Err(error) = completed.send(finished) {
+        tracing::debug!(target: "thegn::daemon", "recording completion receiver dropped: {error}");
+    }
+}
+
+fn worker_panic_finished(path: &Path, generation: u64, state: &WorkerState) -> Finished {
+    Finished {
+        path: path.to_path_buf(),
+        capped: state.capped(),
+        truncated: Some("recording writer panicked".to_string()),
+        dropped_bytes: state.dropped_bytes.load(Ordering::Acquire),
+        generation,
+        late: false,
+    }
+}
+
+fn run_worker(
+    rx: mpsc::Receiver<Command>,
+    start: WorkerStart<'_>,
     state: &WorkerState,
 ) -> Finished {
-    let initialized = open_cast_writer(path, cols, rows, stamp);
+    let initialized = open_cast_writer(start.path, start.cols, start.rows, start.stamp);
     let writer = match initialized {
         Ok(writer) => writer,
         Err(error) => {
             state.fail(format!("recording start failed: {error}"));
             return Finished {
-                path: path.to_path_buf(),
+                path: start.path.to_path_buf(),
                 capped: false,
                 truncated: Some(format!("recording start failed: {error}")),
                 dropped_bytes: state.dropped_bytes.load(Ordering::Acquire),
+                generation: start.generation,
+                late: false,
             };
         }
     };
-    run_writer(rx, path, max_bytes, state, writer)
+    run_writer(
+        rx,
+        start.path,
+        start.max_bytes,
+        state,
+        writer,
+        start.generation,
+    )
 }
 
 fn open_cast_writer(
@@ -570,15 +751,19 @@ fn start_with_writer_budget<W: Write + Send + 'static>(
 ) -> Recorder {
     let (tx, rx) = mpsc::sync_channel(QUEUE_COMMANDS);
     let (result_tx, result) = mpsc::channel();
+    let generation = next_generation();
+    let late = Arc::new(Mutex::new(None));
     let state = Arc::new(WorkerState::new());
     let worker_state = Arc::clone(&state);
+    let worker_late = Arc::clone(&late);
     let path = PathBuf::from("injected.cast");
     let worker_path = path.clone();
     let worker = thread::spawn(move || {
-        let finished = run_writer(rx, &worker_path, 0, &worker_state, writer);
-        if let Err(error) = result_tx.send(finished) {
-            tracing::debug!(target: "thegn::daemon", "recording completion receiver dropped: {error}");
-        }
+        let finished = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            run_writer(rx, &worker_path, 0, &worker_state, writer, generation)
+        }))
+        .unwrap_or_else(|_| worker_panic_finished(&worker_path, generation, &worker_state));
+        dispatch_finished(finished, &result_tx, &worker_late);
         worker_state.completion_wake.notify_one();
     });
     Recorder {
@@ -591,6 +776,8 @@ fn start_with_writer_budget<W: Write + Send + 'static>(
         path,
         start: Instant::now(),
         pending_gap: None,
+        generation,
+        late,
     }
 }
 
@@ -600,6 +787,7 @@ fn run_writer<W: Write>(
     max_bytes: u64,
     state: &WorkerState,
     mut writer: CastWriter<W>,
+    generation: u64,
 ) -> Finished {
     let mut carry = Utf8Carry::default();
     let mut carry_raw = Vec::with_capacity(3);
@@ -711,6 +899,8 @@ fn run_writer<W: Write>(
             failure
         },
         dropped_bytes: state.dropped_bytes.load(Ordering::Acquire),
+        generation,
+        late: false,
     }
 }
 
@@ -1116,6 +1306,71 @@ mod tests {
         release_tx.send(()).unwrap();
     }
 
+    #[tokio::test]
+    async fn late_completion_after_finish_timeout_reaches_the_mailbox() {
+        struct StalledWriter(mpsc::Receiver<()>);
+        impl Write for StalledWriter {
+            fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+                self.0
+                    .recv()
+                    .map_err(|_| io::Error::other("stall released"))?;
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                self.0
+                    .recv()
+                    .map_err(|_| io::Error::other("stall released"))
+            }
+        }
+
+        let mut header = Header::new(80, 24);
+        header.timestamp = Some(0);
+        let (release_tx, release_rx) = mpsc::channel();
+        let writer = CastWriter::new(BufWriter::new(StalledWriter(release_rx)), &header)
+            .expect("buffered header");
+        let mut recorder = start_with_writer(writer);
+        recorder.feed(b"block on final flush");
+        let generation = recorder.generation();
+        let (completed_tx, mut completed_rx) = tokio::sync::mpsc::unbounded_channel();
+        recorder.finish_background_with_timeout(completed_tx, Duration::from_millis(20));
+
+        let timed_out = tokio::time::timeout(Duration::from_secs(2), completed_rx.recv())
+            .await
+            .expect("timeout result arrives")
+            .expect("timeout result is sent");
+        assert_eq!(timed_out.generation, generation);
+        assert!(!timed_out.late);
+        assert!(
+            timed_out
+                .truncated
+                .as_deref()
+                .is_some_and(|reason| reason.contains("timed out"))
+        );
+
+        release_tx.send(()).unwrap();
+        release_tx.send(()).unwrap();
+        let finished = tokio::time::timeout(Duration::from_secs(2), completed_rx.recv())
+            .await
+            .expect("late result arrives")
+            .expect("late result is sent");
+        assert_eq!(finished.generation, generation);
+        assert!(finished.late);
+        assert!(finished.truncated.is_none());
+    }
+
+    #[test]
+    fn generations_are_unique_per_recorder() {
+        let (first, _) = captured_recorder();
+        let (second, _) = captured_recorder();
+        let first_generation = first.generation();
+        let second_generation = second.generation();
+        let first_finished = first.finish();
+        let second_finished = second.finish();
+        assert_ne!(first_generation, second_generation);
+        assert_eq!(first_finished.generation, first_generation);
+        assert_eq!(second_finished.generation, second_generation);
+    }
+
     #[test]
     fn failed_sink_is_reported_by_worker() {
         struct FailingWriter;
@@ -1146,7 +1401,7 @@ mod tests {
         }
         assert_eq!(budget.load(Ordering::Acquire), 10);
         drop(tx);
-        let fin = run_writer(rx, &path, 0, &state, writer);
+        let fin = run_writer(rx, &path, 0, &state, writer, 1);
         assert!(
             fin.truncated.is_some(),
             "sink failure must not report a clean save"
