@@ -2062,15 +2062,32 @@ impl LspClient {
 
     /// Document symbols (the outline) for an opened document.
     pub fn document_symbols(&self, uri: &str) -> Result<Vec<SymbolInfo>, LspError> {
+        self.document_symbols_inner(uri, None)
+    }
+
+    pub fn document_symbols_with(
+        &self,
+        uri: &str,
+        cancel: &CancelToken,
+    ) -> Result<Vec<SymbolInfo>, LspError> {
+        self.document_symbols_inner(uri, Some(cancel))
+    }
+
+    fn document_symbols_inner(
+        &self,
+        uri: &str,
+        cancel: Option<&CancelToken>,
+    ) -> Result<Vec<SymbolInfo>, LspError> {
         if !self.supports(LspMethod::DocumentSymbol) {
             return Err(LspError::NotAvailable);
         }
         ensure_identity_uri(uri)?;
         let fallback = bounded_uri_to_path(uri)
             .ok_or_else(|| LspError::Bounded("document identity path limit".into()))?;
-        let res = self.request(
+        let res = self.request_cancellable(
             "textDocument/documentSymbol",
             json!({ "textDocument": { "uri": uri } }),
+            cancel,
         )?;
         let mut health = ProjectionHealth::default();
         let symbols = project_symbols(&res, &fallback, &mut health);
@@ -2127,17 +2144,36 @@ impl LspClient {
 
     /// Reference location(s) for a position.
     pub fn references(&self, uri: &str, pos: Position) -> Result<Vec<Location>, LspError> {
+        self.references_inner(uri, pos, None)
+    }
+
+    pub fn references_with(
+        &self,
+        uri: &str,
+        pos: Position,
+        cancel: &CancelToken,
+    ) -> Result<Vec<Location>, LspError> {
+        self.references_inner(uri, pos, Some(cancel))
+    }
+
+    fn references_inner(
+        &self,
+        uri: &str,
+        pos: Position,
+        cancel: Option<&CancelToken>,
+    ) -> Result<Vec<Location>, LspError> {
         if !self.supports(LspMethod::References) {
             return Err(LspError::NotAvailable);
         }
         ensure_identity_uri(uri)?;
-        let res = self.request(
+        let res = self.request_cancellable(
             "textDocument/references",
             json!({
                 "textDocument": { "uri": uri },
                 "position": { "line": pos.line, "character": pos.character },
                 "context": { "includeDeclaration": false },
             }),
+            cancel,
         )?;
         let mut health = ProjectionHealth::default();
         let locations = parse_locations_limited(&res, &mut health);
@@ -2147,11 +2183,30 @@ impl LspClient {
 
     /// Hover content for a position.
     pub fn hover(&self, uri: &str, pos: Position) -> Result<Option<HoverInfo>, LspError> {
+        self.hover_inner(uri, pos, None)
+    }
+
+    pub fn hover_with(
+        &self,
+        uri: &str,
+        pos: Position,
+        cancel: &CancelToken,
+    ) -> Result<Option<HoverInfo>, LspError> {
+        self.hover_inner(uri, pos, Some(cancel))
+    }
+
+    fn hover_inner(
+        &self,
+        uri: &str,
+        pos: Position,
+        cancel: Option<&CancelToken>,
+    ) -> Result<Option<HoverInfo>, LspError> {
         if !self.supports(LspMethod::Hover) {
             return Err(LspError::NotAvailable);
         }
         ensure_identity_uri(uri)?;
-        let res = self.request("textDocument/hover", self.pos_params(uri, pos))?;
+        let res =
+            self.request_cancellable("textDocument/hover", self.pos_params(uri, pos), cancel)?;
         let mut health = ProjectionHealth::default();
         let hover = parse_hover_limited(&res, &mut health);
         health.record(&self.diagnostics);
@@ -2160,11 +2215,33 @@ impl LspClient {
 
     /// Signature help for a position.
     pub fn signature_help(&self, uri: &str, pos: Position) -> Result<Vec<SignatureInfo>, LspError> {
+        self.signature_help_inner(uri, pos, None)
+    }
+
+    pub fn signature_help_with(
+        &self,
+        uri: &str,
+        pos: Position,
+        cancel: &CancelToken,
+    ) -> Result<Vec<SignatureInfo>, LspError> {
+        self.signature_help_inner(uri, pos, Some(cancel))
+    }
+
+    fn signature_help_inner(
+        &self,
+        uri: &str,
+        pos: Position,
+        cancel: Option<&CancelToken>,
+    ) -> Result<Vec<SignatureInfo>, LspError> {
         if !self.supports(LspMethod::SignatureHelp) {
             return Err(LspError::NotAvailable);
         }
         ensure_identity_uri(uri)?;
-        let res = self.request("textDocument/signatureHelp", self.pos_params(uri, pos))?;
+        let res = self.request_cancellable(
+            "textDocument/signatureHelp",
+            self.pos_params(uri, pos),
+            cancel,
+        )?;
         let mut health = ProjectionHealth::default();
         let signatures = parse_signatures_limited(&res, &mut health);
         health.record(&self.diagnostics);
@@ -2173,11 +2250,29 @@ impl LspClient {
 
     /// Code actions offered for a range.
     pub fn code_actions(&self, uri: &str, range: Range) -> Result<Vec<CodeActionInfo>, LspError> {
+        self.code_actions_inner(uri, range, None)
+    }
+
+    pub fn code_actions_with(
+        &self,
+        uri: &str,
+        range: Range,
+        cancel: &CancelToken,
+    ) -> Result<Vec<CodeActionInfo>, LspError> {
+        self.code_actions_inner(uri, range, Some(cancel))
+    }
+
+    fn code_actions_inner(
+        &self,
+        uri: &str,
+        range: Range,
+        cancel: Option<&CancelToken>,
+    ) -> Result<Vec<CodeActionInfo>, LspError> {
         if !self.supports(LspMethod::CodeAction) {
             return Err(LspError::NotAvailable);
         }
         ensure_identity_uri(uri)?;
-        let res = self.request(
+        let res = self.request_cancellable(
             "textDocument/codeAction",
             json!({
                 "textDocument": { "uri": uri },
@@ -2187,6 +2282,7 @@ impl LspClient {
                 },
                 "context": { "diagnostics": [] },
             }),
+            cancel,
         )?;
         let mut health = ProjectionHealth::default();
         let actions = parse_code_actions_limited(&res, &mut health);
@@ -2203,8 +2299,17 @@ impl LspClient {
 
     /// Send a request and block (up to `timeout`) for its correlated response.
     fn request(&self, method: &str, params: Value) -> Result<Value, LspError> {
+        self.request_cancellable(method, params, None)
+    }
+
+    fn request_cancellable(
+        &self,
+        method: &str,
+        params: Value,
+        cancel: Option<&CancelToken>,
+    ) -> Result<Value, LspError> {
         let deadline = std::time::Instant::now() + self.timeout;
-        self.request_until(method, params, deadline, None)
+        self.request_until(method, params, deadline, cancel)
     }
 
     fn request_until(
@@ -4623,5 +4728,117 @@ mod tests {
         assert_eq!(client.queued_bytes.load(Ordering::SeqCst), 0);
         assert!(client.pending.lock().unwrap().is_empty());
         release.send(()).unwrap();
+    }
+
+    #[test]
+    fn references_with_cancel_completes_pending_and_sends_cancel_request() {
+        let (reader, server_writer) = std::io::pipe().unwrap();
+        let captured = Arc::new(Mutex::new(Vec::new()));
+        let (diag_tx, _) = diagnostics_channel();
+        let client = Arc::new(
+            LspClient::from_io_with_identity(
+                Box::new(reader),
+                Box::new(CapturingWriter(captured.clone())),
+                "fixture",
+                Path::new("/fixture"),
+                diag_tx,
+                "fixture-server".to_string(),
+                1,
+            )
+            .unwrap(),
+        );
+        client
+            .caps
+            .set(ServerCapabilities {
+                references: true,
+                ..Default::default()
+            })
+            .unwrap();
+        let cancel = CancelToken::new();
+        let request_client = client.clone();
+        let request_cancel = cancel.clone();
+        let (result_tx, result_rx) = mpsc::channel();
+        let request_thread = thread::spawn(move || {
+            result_tx
+                .send(request_client.references_with(
+                    "file:///fixture/a.rs",
+                    Position::default(),
+                    &request_cancel,
+                ))
+                .unwrap();
+        });
+        let deadline = std::time::Instant::now() + Duration::from_secs(1);
+        while !String::from_utf8_lossy(&captured.lock().unwrap())
+            .contains("textDocument/references")
+        {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "references request was written"
+            );
+            thread::yield_now();
+        }
+        cancel.cancel();
+        assert!(matches!(
+            result_rx.recv_timeout(Duration::from_millis(500)).unwrap(),
+            Err(LspError::Cancelled)
+        ));
+        request_thread.join().unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(1);
+        while !String::from_utf8_lossy(&captured.lock().unwrap()).contains("$/cancelRequest") {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "cancel request was written"
+            );
+            thread::yield_now();
+        }
+        let bytes = captured.lock().unwrap().clone();
+        let mut decoder = framing::FrameDecoder::new();
+        decoder.push(&bytes).unwrap();
+        let mut cancel_id = None;
+        while let Some(message) = decoder.next_message().unwrap() {
+            let value: Value = serde_json::from_str(&message).unwrap();
+            if value["method"] == "$/cancelRequest" {
+                cancel_id = value["params"]["id"].as_i64();
+            }
+        }
+        assert_eq!(cancel_id, Some(1));
+        drop(server_writer);
+    }
+
+    #[test]
+    fn document_symbols_and_hover_with_a_cancelled_token_write_nothing() {
+        let (reader, _server_writer) = std::io::pipe().unwrap();
+        let captured = Arc::new(Mutex::new(Vec::new()));
+        let (diag_tx, _) = diagnostics_channel();
+        let client = LspClient::from_io_with_identity(
+            Box::new(reader),
+            Box::new(CapturingWriter(captured.clone())),
+            "fixture",
+            Path::new("/fixture"),
+            diag_tx,
+            "fixture-server".to_string(),
+            1,
+        )
+        .unwrap();
+        client
+            .caps
+            .set(ServerCapabilities {
+                document_symbol: true,
+                hover: true,
+                ..Default::default()
+            })
+            .unwrap();
+        let cancel = CancelToken::new();
+        cancel.cancel();
+        assert!(matches!(
+            client.document_symbols_with("file:///fixture/a.rs", &cancel),
+            Err(LspError::Cancelled)
+        ));
+        assert!(matches!(
+            client.hover_with("file:///fixture/a.rs", Position::default(), &cancel),
+            Err(LspError::Cancelled)
+        ));
+        thread::sleep(Duration::from_millis(20));
+        assert!(captured.lock().unwrap().is_empty());
     }
 }
