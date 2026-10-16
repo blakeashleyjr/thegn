@@ -164,7 +164,7 @@ pub fn trim_if_idle(last_activity: Instant) {
         TrimLimiter {
             last: &LAST_TRIM_MS,
             now_ms: epoch_ms(),
-            min_ms: TRIM_MIN_INTERVAL.as_millis() as u64,
+            min_ms: TRIM_MIN_INTERVAL,
         },
         &TRIMS,
         trim_now,
@@ -188,7 +188,7 @@ pub(crate) fn trim_after_scan_burst() {
         TrimLimiter {
             last: &LAST_TRIM_MS,
             now_ms: epoch_ms(),
-            min_ms: TRIM_MIN_INTERVAL.as_millis() as u64,
+            min_ms: TRIM_MIN_INTERVAL,
         },
         &TRIMS,
         trim_now,
@@ -252,7 +252,7 @@ pub(crate) fn record_test_idle_trim() {
         TrimLimiter {
             last: &limiter,
             now_ms: 30_000,
-            min_ms: TRIM_MIN_INTERVAL.as_millis() as u64,
+            min_ms: TRIM_MIN_INTERVAL,
         },
         &TRIMS,
         || {
