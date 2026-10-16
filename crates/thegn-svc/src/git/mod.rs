@@ -1969,6 +1969,19 @@ fn run_w_unlocked(loc: &GitLoc, envs: &[(&str, &str)], args: &[&str]) -> Result<
     Ok(String::from_utf8_lossy(&out.stdout).into_owned())
 }
 
+/// Run a network write without holding the local mutation lock. This is for
+/// commands whose local writes are protected by Git's own ref/config locks
+/// (remote-tracking refs, `FETCH_HEAD`, and upstream config); commands that
+/// update a local branch must use the locked runner for that update.
+pub(crate) fn run_w_network(loc: &GitLoc, envs: &[(&str, &str)], args: &[&str]) -> Result<String> {
+    if let Some(b) = crate::bridge::for_loc(loc) {
+        let mut env: Vec<(String, String)> = vec![("GIT_TERMINAL_PROMPT".into(), "0".into())];
+        env.extend(envs.iter().map(|(k, v)| (k.to_string(), v.to_string())));
+        return run_bridge(&b, loc, args, &env, false);
+    }
+    run_w_unlocked(loc, envs, args)
+}
+
 /// [`run_w`] for a local mutation whose caller already holds the repository
 /// mutation lock. The guard is required as proof and must outlive this call.
 pub(crate) fn run_w_locked(

@@ -1,7 +1,7 @@
 //! Commit-level writes: commit/amend (message via stdin — multiline and
 //! remote safe), revert, tags, and reset-to-commit.
 
-use super::{GitBackend, gpg_args, run_stdin, run_w};
+use super::{GitBackend, gpg_args, run_stdin, run_w, run_w_network};
 use anyhow::Result;
 use thegn_core::git_operand as op;
 use thegn_core::remote::GitLoc;
@@ -111,7 +111,7 @@ pub trait CommitOps: GitBackend {
 
     fn push_tag(&self, loc: &GitLoc, remote: &str, name: &str) -> Result<()> {
         let (remote, name) = (op::remote_name(remote)?, op::tag_name(name)?);
-        run_w(loc, &[], &["push", remote, name]).map(|_| ())
+        run_w_network(loc, &[], &["push", remote, name]).map(|_| ())
     }
 
     /// `git reset --soft|--mixed|--hard <sha>`. Hard is destructive —
