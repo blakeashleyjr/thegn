@@ -1352,6 +1352,11 @@
           "description": "Whether a recording is currently active.",
           "type": "boolean"
         },
+        "stopping": {
+          "default": false,
+          "description": "Admission is closed and the worker has not reported completion; the file is not yet final.",
+          "type": "boolean"
+        },
         "truncated": {
           "description": "`Some(reason)` when the recording could NOT be finalized cleanly (the final write or flush failed — a full disk, a quota). The `.cast` at `path` is short of the session's last output, so a client must report it as truncated rather than saved. `None` on every healthy path.",
           "type": [
