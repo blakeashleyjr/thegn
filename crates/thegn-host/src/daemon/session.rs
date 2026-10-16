@@ -1262,7 +1262,7 @@ impl SessionActor {
             && fin
                 .truncated
                 .as_deref()
-                .is_some_and(|reason| reason.contains("finalization timed out"));
+                .is_some_and(|reason| reason == super::record::LATE_TIMEOUT_REASON);
         self.record_truncated = fin.truncated;
         self.record_stopping = awaiting_late_result;
         self.record_last_path = Some(fin.path);
@@ -2716,10 +2716,16 @@ mod tests {
         actor.on_record(RecordSpec::Start).expect("second starts");
         assert_ne!(actor.record_generation, first_generation);
         let current_path = actor.record_last_path.clone().expect("second path");
+        let current_generation = actor
+            .recorder
+            .as_ref()
+            .expect("second recorder is live")
+            .generation();
+        let current_truncated = actor.record_truncated.clone();
         actor.recording_completed(crate::daemon::record::Finished {
             path: current_path,
-            capped: old_finished.capped,
-            truncated: old_finished.truncated,
+            capped: true,
+            truncated: Some("old recording failed".to_string()),
             dropped_bytes: old_finished.dropped_bytes,
             generation: first_generation,
             late: true,
@@ -2727,6 +2733,15 @@ mod tests {
         assert!(
             actor.recorder.is_some(),
             "stale completion keeps live recorder"
+        );
+        assert_eq!(actor.record_truncated, current_truncated);
+        assert_eq!(
+            actor
+                .recorder
+                .as_ref()
+                .map(crate::daemon::record::Recorder::generation),
+            Some(current_generation),
+            "stale completion preserves the current recorder generation"
         );
         assert!(actor.record_status().recording);
 
@@ -2818,7 +2833,7 @@ mod tests {
         actor.recording_completed(crate::daemon::record::Finished {
             path: path.clone(),
             capped: false,
-            truncated: Some("recording finalization timed out".into()),
+            truncated: Some(crate::daemon::record::LATE_TIMEOUT_REASON.into()),
             dropped_bytes: 0,
             generation,
             late: false,
