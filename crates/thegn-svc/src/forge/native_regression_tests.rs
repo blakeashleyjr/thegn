@@ -985,7 +985,7 @@ fn poll_backoff_only_passes_final_api_errors() {
 fn open_circuit_gates_github_cli_poll_ladder() {
     let token = "poll-gate-regression-token-unique";
     let circuit = circuit_for(token);
-    circuit.record_backoff(Duration::from_secs(30), ForgeError::RateLimited);
+    circuit.record_backoff(Duration::from_secs(1), ForgeError::RateLimited);
     let dir = tempfile::tempdir().unwrap();
     assert!(
         thegn_core::util::git_cmd(dir.path())

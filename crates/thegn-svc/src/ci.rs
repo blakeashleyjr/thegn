@@ -1169,33 +1169,33 @@ impl thegn_core::seam::Probe for GithubCi {
     }
 }
 
+fn ci_backoff_gate(
+    remote_loc: bool,
+    host: &str,
+    held: Option<crate::forge::ForgeError>,
+) -> Option<CiError> {
+    if remote_loc || !host.eq_ignore_ascii_case("github.com") {
+        return None;
+    }
+    match held {
+        Some(crate::forge::ForgeError::RateLimited) => Some(CiError::RateLimited),
+        Some(crate::forge::ForgeError::Other(message)) => Some(CiError::Other(message)),
+        _ => None,
+    }
+}
+
 impl CiProvider for GithubCi {
     fn system(&self) -> CiSystem {
         CiSystem::GithubActions
     }
     fn runs(&self, loc: &GitLoc, branch: Option<&str>, limit: usize) -> Result<CiRunList, CiError> {
-        fn ci_backoff_gate(
-            local_loc: bool,
-            host: &str,
-            held: Option<crate::forge::ForgeError>,
-        ) -> Option<CiError> {
-            if !local_loc || !host.eq_ignore_ascii_case("github.com") {
-                return None;
+        if !loc.is_remote()
+            && let Some(held) = crate::forge::native::poll_backoff_error()
+        {
+            let remote = self.remote(loc)?;
+            if let Some(error) = ci_backoff_gate(true, &remote.host, Some(held)) {
+                return Err(error);
             }
-            match held {
-                Some(crate::forge::ForgeError::RateLimited) => Some(CiError::RateLimited),
-                Some(crate::forge::ForgeError::Other(message)) => Some(CiError::Other(message)),
-                _ => None,
-            }
-        }
-
-        let remote = self.remote(loc)?;
-        if let Some(error) = ci_backoff_gate(
-            !loc.is_remote(),
-            &remote.host,
-            crate::forge::native::poll_backoff_error(),
-        ) {
-            return Err(error);
         }
         let limit_s = limit.max(1).to_string();
         let mut args = vec!["run", "list", "--limit", &limit_s, "--json", GH_RUN_FIELDS];
@@ -3526,6 +3526,47 @@ esac
             .rerun_failed
         );
         assert!(!GitlabCi::default().caps().rerun_failed);
+    }
+
+    #[test]
+    fn ci_backoff_gate_maps_only_local_github_api_failures() {
+        let cases = [
+            (
+                false,
+                "github.com",
+                Some(crate::forge::ForgeError::RateLimited),
+                Some(CiError::RateLimited),
+            ),
+            (
+                false,
+                "GitHub.com",
+                Some(crate::forge::ForgeError::Other("bad response".into())),
+                Some(CiError::Other("bad response".into())),
+            ),
+            (
+                true,
+                "github.com",
+                Some(crate::forge::ForgeError::RateLimited),
+                None,
+            ),
+            (
+                false,
+                "ghe.example.com",
+                Some(crate::forge::ForgeError::RateLimited),
+                None,
+            ),
+            (false, "github.com", None, None),
+            (
+                false,
+                "github.com",
+                Some(crate::forge::ForgeError::NotAuthenticated),
+                None,
+            ),
+        ];
+
+        for (remote_loc, host, held, expected) in cases {
+            assert_eq!(ci_backoff_gate(remote_loc, host, held), expected);
+        }
     }
 }
 
