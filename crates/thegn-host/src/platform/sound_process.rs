@@ -37,8 +37,7 @@ pub(crate) fn run(
     run_bounded(program, args, cancellation, SOUND_HELPER_DEADLINE)
 }
 
-/// Shared bounded subprocess implementation. The monitor-action caller keeps
-/// its existing `Option<bool>` projection while sound maps every outcome.
+/// Shared bounded subprocess implementation used by sound notification actions.
 pub(crate) fn run_bounded(
     program: &str,
     args: &[String],
