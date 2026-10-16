@@ -7443,6 +7443,7 @@ async fn event_loop<T: Terminal>(
     // grid selection). Drags highlight within ONE pane only and auto-copy
     // (OSC 52) on release, zellij-style.
     let mut mouse_left_down = false;
+    let mut panel_drill_drag: Option<usize> = None;
     // Panel-separator drag: press on the separator BAND (the separator column
     // plus the center column's frame cell beside it — `crate::drag_hit`) grabs
     // `(press column, separator column, moved yet?, width to restore on Esc)`;
@@ -16545,6 +16546,87 @@ async fn event_loop<T: Terminal>(
                             dirty = true;
                             continue;
                         }
+                        if !model.panel_pending
+                            && panel_ui.open.is_git_family()
+                            && let Some(rect) = chrome.panel
+                        {
+                            let col =
+                                crate::chrome::panel_column_at(&model, &panel_ui, rect, mx, my);
+                            let (pc, pr) = panel_geom(&chrome);
+                            let has_detail_scroll = crate::panel::sections::scroll_extent(
+                                panel_ui.open,
+                                &model,
+                                &panel_ui,
+                                pc,
+                                pr,
+                            )
+                            .is_some_and(|ext| !ext.owns_nav);
+                            match panel_ui.git.wheel_route(col, has_detail_scroll) {
+                                gitui::GitWheel::DrillStep => {
+                                    let (ticks, leftover) = drain_wheel_ticks(up, || {
+                                        pending_input.pop_front().or_else(|| {
+                                            buf.terminal()
+                                                .poll_input(Some(std::time::Duration::ZERO))
+                                                .ok()
+                                                .flatten()
+                                        })
+                                    });
+                                    if let Some(ev) = leftover {
+                                        pending_input.push_front(ev);
+                                    }
+                                    for _ in 0..ticks {
+                                        panel_ui.git.step_view_cursor(!up);
+                                    }
+                                    dirty = true;
+                                    continue;
+                                }
+                                gitui::GitWheel::DetailScroll => {
+                                    let (ticks, leftover) = drain_wheel_ticks(up, || {
+                                        pending_input.pop_front().or_else(|| {
+                                            buf.terminal()
+                                                .poll_input(Some(std::time::Duration::ZERO))
+                                                .ok()
+                                                .flatten()
+                                        })
+                                    });
+                                    if let Some(ev) = leftover {
+                                        pending_input.push_front(ev);
+                                    }
+                                    if let Some(ext) = crate::panel::sections::scroll_extent(
+                                        panel_ui.open,
+                                        &model,
+                                        &panel_ui,
+                                        pc,
+                                        pr,
+                                    ) {
+                                        let delta = ticks.saturating_mul(3);
+                                        panel_ui.scroll = if up {
+                                            panel_ui.scroll.min(ext.max).saturating_sub(delta)
+                                        } else {
+                                            panel_ui.scroll.saturating_add(delta).min(ext.max)
+                                        };
+                                    }
+                                    dirty = true;
+                                    continue;
+                                }
+                                gitui::GitWheel::Ignore => {
+                                    let (_, leftover) = drain_wheel_ticks(up, || {
+                                        pending_input.pop_front().or_else(|| {
+                                            buf.terminal()
+                                                .poll_input(Some(std::time::Duration::ZERO))
+                                                .ok()
+                                                .flatten()
+                                        })
+                                    });
+                                    if let Some(ev) = leftover {
+                                        pending_input.push_front(ev);
+                                    }
+                                    dirty = true;
+                                    continue;
+                                }
+                                gitui::GitWheel::Legacy => {}
+                            }
+                        }
                         let (pc, pr) = panel_geom(&chrome);
                         if let Some(ext) = crate::panel::sections::scroll_extent(
                             panel_ui.open,
@@ -17259,6 +17341,9 @@ async fn event_loop<T: Terminal>(
                                     .get(panel_ui.git.cur.commit_files)
                                     .map(|(path, _, _)| path.clone());
                                 panel_ui.git.click_drill_row(i);
+                                if gitui::GitUi::is_drill(panel_ui.git.focus) {
+                                    panel_drill_drag = Some(i);
+                                }
                                 let current_path = panel_ui
                                     .git
                                     .commit_files
@@ -17308,6 +17393,44 @@ async fn event_loop<T: Terminal>(
                     {
                         sidebar_dirty = true;
                         bars_dirty = true;
+                        dirty = true;
+                    }
+                } else if left
+                    && mouse_left_down
+                    && let Some(anchor) = panel_drill_drag
+                {
+                    let (m, leftover) = drain_drag_events(m, || {
+                        pending_input.pop_front().or_else(|| {
+                            buf.terminal()
+                                .poll_input(Some(std::time::Duration::ZERO))
+                                .ok()
+                                .flatten()
+                        })
+                    });
+                    if let Some(ev) = leftover {
+                        pending_input.push_front(ev);
+                    }
+                    let mx = (m.x as usize).saturating_sub(1);
+                    let my = (m.y as usize).saturating_sub(1);
+                    if let Some(rect) = chrome.panel
+                        && !model.panel_pending
+                        && let Some(index) =
+                            crate::chrome::panel_drill_drag_hit(&model, &panel_ui, rect, mx, my)
+                    {
+                        let previous_path = panel_ui
+                            .git
+                            .commit_files
+                            .get(panel_ui.git.cur.commit_files)
+                            .map(|(path, _, _)| path.clone());
+                        panel_ui.git.drag_drill_to(anchor, index);
+                        let current_path = panel_ui
+                            .git
+                            .commit_files
+                            .get(panel_ui.git.cur.commit_files)
+                            .map(|(path, _, _)| path.clone());
+                        if current_path != previous_path {
+                            panel_ui.scroll = 0;
+                        }
                         dirty = true;
                     }
                 } else if left && mouse_left_down && mouse_selecting {
@@ -17378,6 +17501,7 @@ async fn event_loop<T: Terminal>(
                         selection_only = true;
                     }
                 } else if !left && mouse_left_down {
+                    panel_drill_drag = None;
                     // A sidebar press/drag ends here: perform the drop (or
                     // finish the click) and consume the release.
                     match crate::handlers::sidebar_mouse::on_release(

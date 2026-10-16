@@ -11,6 +11,7 @@
 //! the event loop turns [`GitMsg`]s into svc calls.
 
 use crate::layout::PanelWidth;
+use crate::panel::frame::PanelColumn;
 use crate::panel::staging::{self, StageDoc};
 use termwiz::input::{KeyCode, Modifiers};
 use thegn_core::rebase_todo::{TodoAction, TodoEntry};
@@ -34,6 +35,15 @@ pub enum GitView {
     RebaseTodo,
     /// Annotated blame for a specific file.
     Blame,
+}
+
+/// How a wheel tick over a panel column should affect git panel state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GitWheel {
+    Legacy,
+    DrillStep,
+    DetailScroll,
+    Ignore,
 }
 
 impl GitView {
@@ -813,6 +823,43 @@ impl GitUi {
                     staging.anchor = None;
                 }
             }
+            _ => {}
+        }
+    }
+
+    pub fn wheel_route(&self, col: Option<PanelColumn>, has_detail_scroll: bool) -> GitWheel {
+        let Some(col) = col else {
+            return GitWheel::Legacy;
+        };
+        match (col, Self::is_drill(self.focus), has_detail_scroll) {
+            (PanelColumn::Main, true, _) => GitWheel::DrillStep,
+            (PanelColumn::Main, false, true) => GitWheel::DetailScroll,
+            (PanelColumn::Main, false, false) => GitWheel::Ignore,
+            (PanelColumn::Side, true, _) => GitWheel::Ignore,
+            (PanelColumn::Side, false, _) => GitWheel::Legacy,
+        }
+    }
+
+    pub fn drag_drill_to(&mut self, anchor: usize, index: usize) {
+        match self.focus {
+            GitView::Staging | GitView::PatchBuilding => {
+                if let Some(staging) = self.staging.as_mut() {
+                    let doc = match self.focus {
+                        GitView::Staging => self.stage_doc.as_ref(),
+                        GitView::PatchBuilding => self.patch_doc.as_ref(),
+                        _ => None,
+                    };
+                    let cursor = doc
+                        .map(|state| staging::clamp_cursor(&state.doc, index))
+                        .unwrap_or(0);
+                    let anchor = doc
+                        .map(|state| staging::clamp_cursor(&state.doc, anchor))
+                        .unwrap_or(0);
+                    staging.cursor = cursor;
+                    staging.anchor = (anchor != cursor).then_some(anchor);
+                }
+            }
+            GitView::CommitFiles | GitView::Blame => self.click_drill_row(index),
             _ => {}
         }
     }
@@ -2139,6 +2186,71 @@ mod tests {
         git.patch_doc = Some(StageDocState::default());
         git.click_drill_row(99);
         assert_eq!(git.staging.as_ref().map(|st| st.cursor), Some(0));
+    }
+
+    #[test]
+    fn wheel_route_follows_the_column() {
+        let mut git = GitUi {
+            focus: GitView::Blame,
+            ..Default::default()
+        };
+        assert_eq!(
+            git.wheel_route(Some(PanelColumn::Main), false),
+            GitWheel::DrillStep
+        );
+        assert_eq!(
+            git.wheel_route(Some(PanelColumn::Side), false),
+            GitWheel::Ignore
+        );
+        git.focus = GitView::Commits;
+        assert_eq!(
+            git.wheel_route(Some(PanelColumn::Main), true),
+            GitWheel::DetailScroll
+        );
+        assert_eq!(
+            git.wheel_route(Some(PanelColumn::Main), false),
+            GitWheel::Ignore
+        );
+        assert_eq!(
+            git.wheel_route(Some(PanelColumn::Side), true),
+            GitWheel::Legacy
+        );
+        assert_eq!(git.wheel_route(None, true), GitWheel::Legacy);
+    }
+
+    #[test]
+    fn drag_drill_to_sets_staging_range() {
+        let path = "src/a.rs";
+        let diff = concat!(
+            "diff --git a/src/a.rs b/src/a.rs\n",
+            "index 1111111..2222222 100644\n",
+            "--- a/src/a.rs\n",
+            "+++ b/src/a.rs\n",
+            "@@ -1,1 +1,4 @@\n old\n+one\n+two\n+three\n",
+        );
+        let doc = staging::build(path, diff);
+        let mut git = GitUi {
+            focus: GitView::Staging,
+            staging: Some(StagingUi::new(path)),
+            stage_doc: Some(StageDocState {
+                path: path.into(),
+                pane: StagePane::Unstaged,
+                doc,
+                diff: diff.into(),
+            }),
+            ..Default::default()
+        };
+        git.drag_drill_to(1, 4);
+        assert_eq!(git.staging.as_ref().and_then(|st| st.anchor), Some(1));
+        assert_eq!(git.staging.as_ref().map(|st| st.cursor), Some(4));
+        git.drag_drill_to(3, 3);
+        assert_eq!(git.staging.as_ref().and_then(|st| st.anchor), None);
+
+        git.focus = GitView::CommitFiles;
+        git.commit_files = vec![("a.rs".into(), 1, 0), ("b.rs".into(), 0, 1)];
+        git.drag_drill_to(0, 1);
+        assert_eq!(git.cur.commit_files, 1);
+        assert_eq!(git.staging.as_ref().and_then(|st| st.anchor), None);
     }
 
     #[test]
