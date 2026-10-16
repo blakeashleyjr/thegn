@@ -8,6 +8,8 @@ How thegn _runs_ plugins: discovery (`[[plugins]]` + `plugins/*/plugin.toml`), v
 
 ### Requirement: Plugins load from config and plugin directories
 
+The host SHALL discover plugins from `[[plugins]]` config entries and from `<config_dir>/plugins/<dir>/plugin.toml` files (directory plugins defaulting `cwd` to their own directory), skip disabled entries, and validate each spec against the host contract (`HostContract::negotiate`): api compatibility, command presence, and contribution acceptance. `thegn plugin list` SHALL print the discovered set with mode/enabled/negotiation status, and `thegn plugin check` SHALL exit non-zero when any enabled spec fails validation, naming the problems.
+
 An enabled plugin is capability-gated when its manifest declares any
 non-surface capability or any scope. The host SHALL refuse to run an enabled
 gated plugin unless its user-config `[[plugins]]` entry sets
