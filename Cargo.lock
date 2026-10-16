@@ -7867,6 +7867,7 @@ dependencies = [
  "thegn-core",
  "thegn-media",
  "thegn-metrics",
+ "thegn-proc",
  "thegn-svc",
  "tokei",
  "tokio",
@@ -7906,6 +7907,16 @@ dependencies = [
  "nix 0.31.3",
  "starship-battery",
  "sysinfo",
+ "tempfile",
+ "thegn-proc",
+]
+
+[[package]]
+name = "thegn-proc"
+version = "0.1.0-alpha.2"
+dependencies = [
+ "libc",
+ "nix 0.31.3",
  "tempfile",
 ]
 
@@ -7958,6 +7969,7 @@ dependencies = [
  "sha2 0.10.9",
  "tempfile",
  "thegn-core",
+ "thegn-proc",
  "tokio",
  "tokio-tungstenite",
  "toml 0.8.23",
