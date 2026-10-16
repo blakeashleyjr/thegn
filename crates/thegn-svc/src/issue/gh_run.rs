@@ -26,8 +26,9 @@ pub struct Limits {
     pub timeout: Duration,
     /// Cap on captured stdout bytes.
     pub max_stdout: usize,
-    /// Cap on captured stderr bytes (stderr beyond it is read and discarded,
-    /// not an error).
+    /// Cap on captured stderr bytes. Non-streaming runs keep the newest bytes;
+    /// the streaming log runner keeps the first. In either case, excess bytes
+    /// are drained and discarded and do not cause an error.
     pub max_stderr: usize,
 }
 
