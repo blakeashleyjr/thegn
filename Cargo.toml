@@ -237,7 +237,7 @@ thegn-metrics = { path = "crates/thegn-metrics" }
 thegn-media = { path = "crates/thegn-media" }
 thegn-proc = { path = "crates/thegn-proc" }
 # --- dev/bench tooling ---
-criterion = { version = "0.5", features = ["html_reports"] }
+criterion = { version = "0.8", features = ["html_reports"] }
 tempfile = "3"
 
 # Workspace-wide lints; every crate opts in with `[lints] workspace = true`.
