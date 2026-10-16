@@ -1498,7 +1498,7 @@ mod tests {
     #[test]
     fn flooded_request_gets_rate_limited_response() {
         let mut state = state_with(vec![seg_spec("p")]);
-        let original = statusbar_views(&state)[0].1.text_content();
+        let original = statusbar_views(&state);
         let mut model = FrameModel::default();
         let (tx, mut rx) = crate::plugins::plugin_channel();
         for index in 0..crate::plugins::inbox::MAX_QUEUED_EVENTS_PER_PLUGIN {
@@ -1541,7 +1541,7 @@ mod tests {
                 RpcError::new(RpcErrorCode::RateLimited, "host plugin queue full")
             )]
         );
-        assert_eq!(statusbar_views(&state)[0].1.text_content(), original);
+        assert_eq!(statusbar_views(&state), original);
         assert!(state.plugins.contains_key("p"));
     }
 
