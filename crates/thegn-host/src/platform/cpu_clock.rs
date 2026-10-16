@@ -20,6 +20,10 @@ pub(crate) fn thread_cpu_ns() -> u64 {
 }
 
 #[cfg(unix)]
+#[allow(
+    clippy::useless_conversion,
+    reason = "time_t and suseconds_t widths vary by target"
+)]
 fn usage_cpu_ns(who: libc::c_int) -> u64 {
     let mut usage = std::mem::MaybeUninit::<libc::rusage>::zeroed();
     // SAFETY: `usage` points to writable storage for `rusage`; getrusage fills
