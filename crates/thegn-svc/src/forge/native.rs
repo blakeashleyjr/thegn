@@ -19,7 +19,7 @@ use std::hash::{Hash, Hasher};
 use std::sync::{Arc, Mutex, OnceLock};
 use thegn_core::forge::checkout::{ForgeCheckoutScope, checkout_scope};
 use thegn_core::forge::model::*;
-use thegn_core::forge::{Forge, ForgeCaps, ForgeError, PrRef, RepoRef};
+use thegn_core::forge::{Forge, ForgeCaps, ForgeError, PrRef, PrRole, RepoRef};
 use thegn_core::remote::GitLoc;
 use thegn_core::seam::{Availability, Probe, ProbeReport};
 
