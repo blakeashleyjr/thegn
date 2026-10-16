@@ -229,18 +229,33 @@ pub trait PlumbingOps: GitBackend {
     /// conflicted-file section a NUL-delimited path list (robust to spaces).
     /// Exit 0 = clean, 1 = conflicts, >1 = genuine failure.
     fn merge_tree(&self, loc: &GitLoc, ours: &str, theirs: &str) -> Result<MergeTreeOutcome> {
+        self.merge_tree_with_config(loc, &[], ours, theirs)
+    }
+
+    /// Fold with explicit Git config overrides placed before the command.
+    fn merge_tree_with_config(
+        &self,
+        loc: &GitLoc,
+        config: &[String],
+        ours: &str,
+        theirs: &str,
+    ) -> Result<MergeTreeOutcome> {
         let (ours, theirs) = (op::revision(ours)?, op::revision(theirs)?);
-        let (code, stdout, stderr) = run_status(
-            loc,
-            &[
-                "merge-tree",
-                "--write-tree",
-                "--name-only",
-                "-z",
-                ours,
-                theirs,
-            ],
-        )?;
+        let mut args = Vec::with_capacity(config.len() * 2 + 6);
+        for item in config {
+            args.push("-c".to_string());
+            args.push(item.clone());
+        }
+        args.extend([
+            "merge-tree".into(),
+            "--write-tree".into(),
+            "--name-only".into(),
+            "-z".into(),
+            ours.into(),
+            theirs.into(),
+        ]);
+        let refs: Vec<&str> = args.iter().map(String::as_str).collect();
+        let (code, stdout, stderr) = run_status(loc, &refs)?;
         parse_merge_tree(code, &stdout, &stderr)
     }
 
@@ -324,24 +339,39 @@ pub trait PlumbingOps: GitBackend {
         ours: &str,
         theirs: &str,
     ) -> Result<MergeTreeOutcome> {
+        self.merge_tree_base_with_config(loc, &[], base, ours, theirs)
+    }
+
+    fn merge_tree_base_with_config(
+        &self,
+        loc: &GitLoc,
+        config: &[String],
+        base: &str,
+        ours: &str,
+        theirs: &str,
+    ) -> Result<MergeTreeOutcome> {
         let (base, ours, theirs) = (
             op::revision(base)?,
             op::revision(ours)?,
             op::revision(theirs)?,
         );
-        let (code, stdout, stderr) = run_status(
-            loc,
-            &[
-                "merge-tree",
-                "--write-tree",
-                "--merge-base",
-                base,
-                "--name-only",
-                "-z",
-                ours,
-                theirs,
-            ],
-        )?;
+        let mut args = Vec::with_capacity(config.len() * 2 + 8);
+        for item in config {
+            args.push("-c".to_string());
+            args.push(item.clone());
+        }
+        args.extend([
+            "merge-tree".into(),
+            "--write-tree".into(),
+            "--merge-base".into(),
+            base.into(),
+            "--name-only".into(),
+            "-z".into(),
+            ours.into(),
+            theirs.into(),
+        ]);
+        let refs: Vec<&str> = args.iter().map(String::as_str).collect();
+        let (code, stdout, stderr) = run_status(loc, &refs)?;
         parse_merge_tree(code, &stdout, &stderr)
     }
 
@@ -542,6 +572,48 @@ mod tests {
         assert!(CliGit.commit_tree(&loc, bad, &[], "m").is_err());
         assert!(CliGit.commit_tree(&loc, "HEAD", &[bad], "m").is_err());
         assert!(!std::path::Path::new("/tmp/thegn-injected").exists());
+    }
+
+    #[test]
+    fn merge_tree_with_config_passes_driver_refusal_overrides() {
+        let repo = TestRepo::new("pl-merge-driver-refusal");
+        ident(&repo.dir);
+        repo.commit_file(".gitattributes", "data.txt merge=counter\n", "attrs");
+        repo.commit_file("data.txt", "base\n", "seed");
+        git_in(&repo.dir, &["checkout", "-q", "-b", "feature"]);
+        repo.commit_file("data.txt", "feature\n", "feature edit");
+        let theirs = repo.head();
+        git_in(&repo.dir, &["checkout", "-q", "main"]);
+        repo.commit_file("data.txt", "main\n", "main edit");
+        let ours = repo.head();
+        let counter = repo.dir.join("driver-count");
+        git_in(
+            &repo.dir,
+            &[
+                "config",
+                "merge.counter.driver",
+                &format!(
+                    "printf x >> {}; true %O %A %B %L %P",
+                    thegn_core::util::sh_quote(&counter.to_string_lossy())
+                ),
+            ],
+        );
+        let result = CliGit
+            .merge_tree_with_config(
+                &repo.loc(),
+                &["merge.counter.driver=false".into()],
+                &ours,
+                &theirs,
+            )
+            .unwrap();
+        assert!(
+            matches!(result, MergeTreeOutcome::Conflict { .. }),
+            "{result:?}"
+        );
+        assert!(
+            !counter.exists(),
+            "configured custom driver ran despite override"
+        );
     }
 
     #[test]

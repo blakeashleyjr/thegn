@@ -15,8 +15,9 @@
 use crate::canonical_history::CanonicalHistory;
 use crate::platform::gate_path::ScratchDirectory;
 use anyhow::{Context, Result};
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::sync::{Mutex, atomic::AtomicBool};
 use std::time::{Duration, Instant};
 use thegn_core::config::MergeQueueConfig;
 use thegn_core::db::Db;
@@ -30,6 +31,88 @@ use thegn_core::util;
 use thegn_svc::git::{CasOutcome, CliGit, GitBackend, MergeTreeOutcome, PlumbingOps};
 
 const DRIVER_SUBPROCESS_TIMEOUT: Duration = Duration::from_secs(600);
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct RefusedDrivers {
+    names: HashSet<String>,
+    default: Option<String>,
+}
+impl RefusedDrivers {
+    fn overrides(&self) -> Vec<String> {
+        let mut names = self.names.clone();
+        if let Some(default) = &self.default {
+            names.insert(default.clone());
+        }
+        let mut overrides: Vec<String> = names
+            .iter()
+            .map(|name| format!("merge.{name}.driver=false"))
+            .collect();
+        overrides.sort();
+        overrides
+    }
+    fn is_empty(&self) -> bool {
+        self.names.is_empty() && self.default.is_none()
+    }
+}
+
+fn parse_merge_config(bytes: &[u8]) -> Result<RefusedDrivers> {
+    let mut out = RefusedDrivers::default();
+    if bytes.is_empty() {
+        return Ok(out);
+    }
+    anyhow::ensure!(
+        bytes.last() == Some(&0),
+        "truncated git merge config output"
+    );
+    for record in bytes[..bytes.len() - 1].split(|byte| *byte == 0) {
+        let Some(split) = record.iter().position(|byte| *byte == b'\n') else {
+            anyhow::bail!("invalid git merge config record");
+        };
+        let key = std::str::from_utf8(&record[..split])?;
+        let value = std::str::from_utf8(&record[split + 1..])?;
+        if let Some(name) = key
+            .strip_prefix("merge.")
+            .and_then(|key| key.strip_suffix(".driver"))
+        {
+            validate_driver_name(name)?;
+            out.names.insert(name.to_owned());
+        } else if key == "merge.default" {
+            validate_driver_name(value)?;
+            out.default = Some(value.to_owned());
+        }
+    }
+    Ok(out)
+}
+fn validate_driver_name(name: &str) -> Result<()> {
+    anyhow::ensure!(
+        !name.is_empty() && !name.contains('=') && !name.chars().any(char::is_control),
+        "unsafe merge driver name"
+    );
+    Ok(())
+}
+
+fn configured_merge_drivers(dir: &Path) -> Result<RefusedDrivers> {
+    use thegn_proc::{End, Leader, Limits, Stream};
+    let mut command = util::git_cmd(dir);
+    command.args(["config", "--null", "--get-regexp", r"^merge\."]);
+    let limits = Limits {
+        stdout: Stream::HeadOrFail { cap: 64 * 1024 },
+        stderr: Stream::Tail { cap: 4096 },
+        ..Limits::silent(Duration::from_secs(30))
+    };
+    let result = thegn_proc::run(&mut command, &limits, &AtomicBool::new(false));
+    match (&result.end, &result.leader) {
+        (End::LeaderExited, Leader::Reaped(status)) if status.success() => {
+            parse_merge_config(&result.stdout.bytes)
+        }
+        (End::LeaderExited, Leader::Reaped(status))
+            if status.code() == Some(1) && result.stdout.bytes.is_empty() =>
+        {
+            Ok(RefusedDrivers::default())
+        }
+        _ => anyhow::bail!("git merge driver configuration probe failed"),
+    }
+}
 
 #[path = "integrate_candidates.rs"]
 mod candidates;
@@ -257,6 +340,8 @@ struct PlumbingAdapter {
     sign: bool,
     /// Enable git rerere in the driver-merge worktree (`[merge_queue] rerere`).
     rerere: bool,
+    refused: RefusedDrivers,
+    refusals: Mutex<BTreeMap<String, String>>,
 }
 
 impl PlumbingAdapter {
@@ -273,14 +358,20 @@ impl PlumbingAdapter {
 
 impl FoldGit for PlumbingAdapter {
     fn merge_tree(&self, ours: &str, theirs: &str) -> Result<MergeOutcome> {
-        self.history
-            .checked(|| match CliGit.merge_tree(&self.loc, ours, theirs)? {
+        self.history.checked(|| {
+            match CliGit.merge_tree_with_config(
+                &self.loc,
+                &self.refused.overrides(),
+                ours,
+                theirs,
+            )? {
                 MergeTreeOutcome::Clean { tree } => Ok(MergeOutcome::Clean { tree }),
                 MergeTreeOutcome::Conflict { tree, paths } => {
                     let base = CliGit.merge_base(&self.loc, ours, theirs)?;
                     Ok(self.resolve_conflict(base.as_deref(), ours, theirs, tree, paths))
                 }
-            })
+            }
+        })
     }
     fn commit_tree(&self, tree: &str, parents: &[&str], msg: &str) -> Result<String> {
         self.history.checked(|| {
@@ -290,12 +381,35 @@ impl FoldGit for PlumbingAdapter {
         })
     }
     fn merge_tree_base(&self, base: &str, ours: &str, theirs: &str) -> Result<MergeOutcome> {
-        self.history.checked(
-            || match CliGit.merge_tree_base(&self.loc, base, ours, theirs)? {
+        self.history.checked(|| {
+            match CliGit.merge_tree_base_with_config(
+                &self.loc,
+                &self.refused.overrides(),
+                base,
+                ours,
+                theirs,
+            )? {
                 MergeTreeOutcome::Clean { tree } => Ok(MergeOutcome::Clean { tree }),
                 // A per-commit replay conflict is never a lockfile-regeneration
                 // case (that only makes sense for a whole-branch merge), so defer.
                 MergeTreeOutcome::Conflict { paths, .. } => {
+                    if !self.refused.is_empty() {
+                        match configured_conflict_drivers(&self.repo_root, &paths, &self.refused) {
+                            Ok(matches) if !matches.is_empty() => {
+                                if let Ok(mut refusals) = self.refusals.lock() {
+                                    refusals.extend(matches);
+                                }
+                            }
+                            Err(_) => {
+                                if let Ok(mut refusals) = self.refusals.lock() {
+                                    refusals.extend(paths.iter().map(|path| {
+                                        (path.clone(), "configuration unreadable".into())
+                                    }));
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
                     match self.submodule_conflicts(Some(base), ours, theirs, &paths) {
                         Ok(conflicts) if !conflicts.is_empty() => {
                             Ok(MergeOutcome::SubmoduleConflict { paths, conflicts })
@@ -306,8 +420,8 @@ impl FoldGit for PlumbingAdapter {
                         Ok(_) | Err(_) => Ok(MergeOutcome::Conflict { paths }),
                     }
                 }
-            },
-        )
+            }
+        })
     }
     fn commit_tree_author(
         &self,
@@ -346,11 +460,8 @@ impl PlumbingAdapter {
     ///
     /// 1. A conflict confined to regenerable artifacts (e.g. `Cargo.lock`) is
     ///    rebuilt via the throwaway-worktree path and landed.
-    /// 2. When the plumbing merge reports a conflict on a path governed by a
-    ///    custom `.gitattributes merge=<driver>`, or when `rerere` is on, the
-    ///    branch is merged in a throwaway worktree where a real `git merge` runs
-    ///    the driver and rerere can auto-apply a recorded resolution. A clean
-    ///    result feeds the fold; anything else defers.
+    /// 2. Configured custom-driver paths are refused before any regeneration or
+    ///    worktree merge can execute repository-controlled commands.
     ///
     /// Clean folds never reach here, so they pay none of this cost.
     fn resolve_conflict(
@@ -374,6 +485,27 @@ impl PlumbingAdapter {
             // generic conflict is the fail-closed result.
             Err(_) => return MergeOutcome::Conflict { paths },
         }
+        if !self.refused.is_empty() {
+            match configured_conflict_drivers(&self.repo_root, &paths, &self.refused) {
+                Ok(matches) if !matches.is_empty() => {
+                    if let Ok(mut refusals) = self.refusals.lock() {
+                        refusals.extend(matches);
+                    }
+                    return MergeOutcome::Conflict { paths };
+                }
+                Err(_) => {
+                    if let Ok(mut refusals) = self.refusals.lock() {
+                        refusals.extend(
+                            paths
+                                .iter()
+                                .map(|path| (path.clone(), "configuration unreadable".into())),
+                        );
+                    }
+                    return MergeOutcome::Conflict { paths };
+                }
+                _ => {}
+            }
+        }
         if !self.regenerate_command.is_empty()
             && fold::classify(&paths, &self.regenerate_paths) == fold::ConflictKind::Regenerable
             && let Some(tree) = regenerate_merge(
@@ -383,23 +515,24 @@ impl PlumbingAdapter {
                 &paths,
                 &self.regenerate_command,
                 DRIVER_SUBPROCESS_TIMEOUT,
+                &self.refused.overrides(),
             )
         {
             return MergeOutcome::Clean { tree };
         }
-        // A real merge in a throwaway worktree is worth attempting when a custom
-        // driver governs a conflicted path (the driver may resolve it) or rerere
-        // is enabled (a recorded resolution may auto-apply). The check-attr probe
-        // is skipped when rerere alone already warrants the worktree.
-        if (self.rerere || has_custom_driver(&self.repo_root, &paths))
+        // Rerere alone still uses the isolated worktree with built-in merge.
+        if self.rerere
             && let Some(tree) = driver_merge(
                 &self.repo_root,
                 ours,
                 theirs,
                 &conflict_tree,
                 &paths,
-                self.rerere,
-                DRIVER_SUBPROCESS_TIMEOUT,
+                DriverMergeOpts {
+                    rerere: self.rerere,
+                    timeout: DRIVER_SUBPROCESS_TIMEOUT,
+                    overrides: Some(&self.refused.overrides()),
+                },
             )
         {
             return MergeOutcome::Clean { tree };
@@ -408,32 +541,73 @@ impl PlumbingAdapter {
     }
 }
 
-/// Whether any of `paths` is governed by a custom `.gitattributes merge=<driver>`
-/// declaration (`git check-attr merge`, batched, `-z` so paths with spaces
-/// parse). Built-in values (`unspecified`/`unset`/`set`) are not custom drivers.
-// off-loop: runs inside the fold (CLI / spawn_blocking), never on the loop.
-fn has_custom_driver(repo_root: &Path, paths: &[String]) -> bool {
+fn configured_conflict_drivers(
+    repo_root: &Path,
+    paths: &[String],
+    refused: &RefusedDrivers,
+) -> Result<BTreeMap<String, String>> {
+    use thegn_proc::{End, Leader, Limits, Stream};
     if paths.is_empty() {
-        return false;
+        return Ok(BTreeMap::new());
     }
-    let mut args: Vec<&str> = vec!["check-attr", "-z", "merge", "--"];
-    args.extend(paths.iter().map(|s| s.as_str()));
-    let Some(out) = util::git_out(repo_root, &args) else {
-        return false;
+    let mut command = util::git_cmd(repo_root);
+    command
+        .args(["check-attr", "-z", "merge", "--"])
+        .args(paths);
+    let limits = Limits {
+        stdout: Stream::HeadOrFail { cap: 64 * 1024 },
+        stderr: Stream::Tail { cap: 4096 },
+        ..Limits::silent(Duration::from_secs(30))
     };
-    // `-z` output is a flat NUL-separated stream of (path, attr, value) triples.
-    let mut it = out.split('\0');
-    while let (Some(_path), Some(_attr), Some(value)) = (it.next(), it.next(), it.next()) {
-        if !matches!(value, "unspecified" | "unset" | "set" | "") {
-            return true;
+    let result = thegn_proc::run(&mut command, &limits, &AtomicBool::new(false));
+    anyhow::ensure!(
+        matches!((&result.end, &result.leader), (End::LeaderExited, Leader::Reaped(status)) if status.success()),
+        "git check-attr failed"
+    );
+    let fields: Vec<&[u8]> = result
+        .stdout
+        .bytes
+        .split(|byte| *byte == 0)
+        .filter(|field| !field.is_empty())
+        .collect();
+    anyhow::ensure!(
+        fields.len().is_multiple_of(3),
+        "invalid git check-attr output"
+    );
+    let mut matches = BTreeMap::new();
+    for item in fields.chunks_exact(3) {
+        let path = std::str::from_utf8(item[0])?.to_owned();
+        let value = std::str::from_utf8(item[2])?;
+        if refused.names.contains(value) || (value == "unspecified" && refused.default.is_some()) {
+            matches.insert(
+                path,
+                refused
+                    .names
+                    .contains(value)
+                    .then(|| value.to_owned())
+                    .or_else(|| refused.default.clone())
+                    .unwrap_or_default(),
+            );
         }
     }
-    false
+    Ok(matches)
+}
+
+struct DriverMergeOpts<'a> {
+    rerere: bool,
+    timeout: Duration,
+    overrides: Option<&'a [String]>,
+}
+fn scratch_driver_overrides(dir: &Path, base: &[String]) -> Option<Vec<String>> {
+    let scratch = configured_merge_drivers(dir).ok()?.overrides();
+    let mut all: std::collections::BTreeSet<String> = base.iter().cloned().collect();
+    all.extend(scratch);
+    Some(all.into_iter().collect())
 }
 
 /// Merge `theirs` onto `ours` in a throwaway detached worktree with a real
-/// `git merge`, so custom `.gitattributes` merge drivers run and (when `rerere`)
-/// a recorded resolution auto-applies against the shared `rr-cache`. Returns the
+/// `git merge`, with configured custom drivers refused, and (when `rerere`) a
+/// recorded resolution may auto-apply against the shared `rr-cache`. Returns the
 /// written tree oid only if the merge ends with NO unmerged paths; otherwise
 /// `None` (caller defers). Never leaves a worktree behind.
 // off-loop: the fold runs from the CLI / spawn_blocking (see the module doc).
@@ -443,8 +617,7 @@ fn driver_merge(
     theirs: &str,
     conflict_tree: &str,
     approved_paths: &[String],
-    rerere: bool,
-    timeout: Duration,
+    opts: DriverMergeOpts<'_>,
 ) -> Option<String> {
     // Operands sit in option-parsing positions; refuse dash-led ones before spawn.
     thegn_core::git_operand::revision(ours).ok()?;
@@ -463,7 +636,14 @@ fn driver_merge(
         scratch.verify().ok()?;
         // rerere on: apply recorded resolutions and stage them (autoUpdate).
         let mut args: Vec<&str> = Vec::new();
-        if rerere {
+        if let Some(base) = opts.overrides {
+            let overrides = scratch_driver_overrides(&tmp, base)?;
+            for item in &overrides {
+                args.push("-c");
+                args.push(item);
+            }
+        }
+        if opts.rerere {
             args.extend_from_slice(&["-c", "rerere.enabled=true", "-c", "rerere.autoUpdate=true"]);
         }
         // A background merge must never sign or prompt.
@@ -478,7 +658,7 @@ fn driver_merge(
         // Git uses exit 1 for a merge with conflicts. That is the sole
         // nonzero result that can proceed to index inspection; other failures
         // (including an already-active merge) are infrastructure errors.
-        let (status, log) = match run_driver_merge(&tmp, &args, timeout) {
+        let (status, log) = match run_driver_merge(&tmp, &args, opts.timeout) {
             DriverRun::Completed { status, log } => (status, log),
             DriverRun::Failed { reason, log } => {
                 warn_driver_merge_failure(&reason, &log);
@@ -623,6 +803,7 @@ fn regenerate_merge(
     conflict_paths: &[String],
     regenerate_command: &str,
     timeout: Duration,
+    overrides: &[String],
 ) -> Option<String> {
     thegn_core::git_operand::revision(ours).ok()?;
     thegn_core::git_operand::revision(theirs).ok()?;
@@ -641,7 +822,7 @@ fn regenerate_merge(
         // Regeneration only applies to an actual conflicted merge. A clean
         // merge or an infrastructure failure must not be mistaken for a
         // regenerated result based on ours.
-        let args = [
+        let mut args = vec![
             "-c",
             "commit.gpgSign=false",
             "merge",
@@ -649,6 +830,11 @@ fn regenerate_merge(
             "--no-ff",
             theirs,
         ];
+        let overrides = scratch_driver_overrides(&tmp, overrides)?;
+        for item in &overrides {
+            args.push("-c");
+            args.push(item);
+        }
         let (status, log) = match run_driver_merge(&tmp, &args, timeout) {
             DriverRun::Completed { status, log } => (status, log),
             DriverRun::Failed { reason, log } => {
@@ -870,6 +1056,7 @@ pub struct DeferredReport {
     /// True when this branch was deferred by the test-gate (bisected offender),
     /// not by a textual merge conflict.
     pub gate_failed: bool,
+    pub driver_refusal: Option<String>,
 }
 
 /// The outcome of one batch fold.
@@ -1651,6 +1838,7 @@ fn build_report(
             kind: d.kind,
             submodule_conflicts: d.submodule_conflicts.clone(),
             gate_failed: false,
+            driver_refusal: None,
         })
         .collect();
     for off in gate_offenders {
@@ -1660,6 +1848,7 @@ fn build_report(
             kind: ConflictKind::Textual,
             submodule_conflicts: Vec::new(),
             gate_failed: true,
+            driver_refusal: None,
         });
     }
     let prepared: Vec<LandedReport> = plan
@@ -1784,6 +1973,69 @@ fn history_failure_report(
     report
 }
 
+fn driver_probe_failure_report(
+    target: &str,
+    original: &str,
+    candidates: &[Branch],
+    error: anyhow::Error,
+) -> FoldReport {
+    let reason = "merge driver configuration unreadable".to_string();
+    let mut diagnostics = String::new();
+    record_gate(
+        &mut diagnostics,
+        "merge driver configuration",
+        &GateVerdict::Error {
+            reason: reason.clone(),
+            log: tail(&format!("{error:#}"), 4000),
+            phase: GatePhase::Preparation,
+            class: GateErrorClass::Preparation,
+        },
+    );
+    let mut report = build_report(
+        target,
+        original,
+        &empty_plan(original),
+        &[],
+        GateOutcome::Errored {
+            reason,
+            phase: Some(GatePhase::Preparation),
+            class: Some(GateErrorClass::Preparation),
+        },
+        0,
+        &diagnostics,
+    );
+    report.unprepared = candidates
+        .iter()
+        .map(|branch| branch.name.clone())
+        .collect();
+    report
+}
+
+fn refusal_summary(paths: &[String], refusals: &BTreeMap<String, String>) -> Option<String> {
+    let details: Vec<String> = paths
+        .iter()
+        .filter_map(|path| {
+            refusals
+                .get(path)
+                .map(|name| format!("{path} (merge={name})"))
+        })
+        .collect();
+    (!details.is_empty()).then(|| {
+        format!(
+            "custom merge driver not run by folds: {}; resolve by hand",
+            details.join(", ")
+        )
+    })
+}
+
+fn attach_driver_refusals(report: &mut FoldReport, refusals: &Mutex<BTreeMap<String, String>>) {
+    if let Ok(refusals) = refusals.lock() {
+        for deferred in &mut report.deferred {
+            deferred.driver_refusal = refusal_summary(&deferred.paths, &refusals);
+        }
+    }
+}
+
 /// Fold `candidates` onto the repo's target branch: merge clean branches in the
 /// object DB, gate the union, and CAS-advance the target ref. Clean branches
 /// land; conflicts and gate-offenders are deferred. No working tree is touched
@@ -1866,6 +2118,20 @@ fn run_fold_admitted(
     mut advance: impl FnMut(&GitLoc, &str, &str, &str, &[Branch]) -> Result<bool>,
 ) -> Result<FoldReport> {
     history.revalidate()?;
+    let target_branch = resolve_target(cfg, repo_root);
+    let target_ref = format!("refs/heads/{target_branch}");
+    let original = CliGit.rev_parse(&loc, &target_ref)?;
+    let refused = match configured_merge_drivers(repo_root) {
+        Ok(refused) => refused,
+        Err(error) => {
+            return Ok(driver_probe_failure_report(
+                &target_branch,
+                &original,
+                &candidates,
+                error,
+            ));
+        }
+    };
     let adapter = PlumbingAdapter {
         history,
         loc: loc.clone(),
@@ -1874,10 +2140,9 @@ fn run_fold_admitted(
         regenerate_command: cfg.regenerate_command.clone(),
         sign: cfg.sign_commits,
         rerere: cfg.rerere,
+        refused,
+        refusals: Mutex::new(BTreeMap::new()),
     };
-    let target_branch = resolve_target(cfg, repo_root);
-    let target_ref = format!("refs/heads/{target_branch}");
-    let original = CliGit.rev_parse(&loc, &target_ref)?;
     let opts = land_opts(cfg, &target_branch);
 
     let gate_on = cfg.gate_on && !cfg.gate_command.is_empty();
@@ -1997,7 +2262,7 @@ fn run_fold_admitted(
             } else {
                 GateOutcome::Failed { offender: None }
             };
-            return Ok(build_report(
+            let mut report = build_report(
                 &target_branch,
                 &original,
                 &plan,
@@ -2005,7 +2270,9 @@ fn run_fold_admitted(
                 gate,
                 cas_attempts,
                 &diagnostics,
-            ));
+            );
+            attach_driver_refusals(&mut report, &adapter.refusals);
+            return Ok(report);
         }
 
         // Test-gate the union before blessing it.
@@ -2260,6 +2527,7 @@ fn run_fold_admitted(
                 cas_attempts,
                 &diagnostics,
             );
+            attach_driver_refusals(&mut report, &adapter.refusals);
             report.advanced = true;
             tracing::info!(
                 target: "thegn::integrate",
@@ -2339,6 +2607,7 @@ pub(crate) enum AttemptOutcome {
     Conflict {
         paths: Vec<String>,
         submodule_conflicts: Vec<thegn_core::submodule::SubmoduleConflict>,
+        driver_refusal: Option<String>,
     },
     /// Merged clean but the gate went red. `log` is the tail of the gate output.
     /// A verdict about the *branch* — this is the one a fixing agent can act on.
@@ -2407,6 +2676,17 @@ fn attempt_land_admitted(
             });
         }
     };
+    let refused = match configured_merge_drivers(repo_root) {
+        Ok(refused) => refused,
+        Err(error) => {
+            return Ok(AttemptOutcome::GateError {
+                reason: format!("merge driver configuration unreadable: {error:#}"),
+                log: String::new(),
+                phase: GatePhase::Preparation,
+                class: GateErrorClass::Preparation,
+            });
+        }
+    };
     let adapter = PlumbingAdapter {
         history,
         loc: loc.clone(),
@@ -2415,6 +2695,8 @@ fn attempt_land_admitted(
         regenerate_command: cfg.regenerate_command.clone(),
         sign: cfg.sign_commits,
         rerere: cfg.rerere,
+        refused,
+        refusals: Mutex::new(BTreeMap::new()),
     };
     let opts = land_opts(cfg, &target_branch);
     let gate_on = cfg.gate_on && !cfg.gate_command.is_empty();
@@ -2483,9 +2765,15 @@ fn attempt_land_admitted(
             let submodule_conflicts = deferred
                 .map(|d| d.submodule_conflicts.clone())
                 .unwrap_or_default();
+            let driver_refusal = adapter
+                .refusals
+                .lock()
+                .ok()
+                .and_then(|refusals| refusal_summary(&paths, &refusals));
             return Ok(AttemptOutcome::Conflict {
                 paths,
                 submodule_conflicts,
+                driver_refusal,
             });
         }
         let folded_tip = plan.final_tip.clone();
@@ -2678,6 +2966,19 @@ mod enqueue_guard_tests {
 mod tests {
     use super::*;
     use std::path::PathBuf;
+
+    #[test]
+    fn parse_merge_config_collects_driver_names_and_default() {
+        let parsed = parse_merge_config(b"merge.foo.driver\ncommand\0merge.dotted.name.driver\nother\0merge.default\nfallback\0").unwrap();
+        assert_eq!(
+            parsed.names,
+            HashSet::from(["foo".into(), "dotted.name".into()])
+        );
+        assert_eq!(parsed.default.as_deref(), Some("fallback"));
+        assert!(parse_merge_config(b"").unwrap().is_empty());
+        assert!(parse_merge_config(b"merge.bad=name.driver\ncmd\0").is_err());
+        assert!(parse_merge_config(b"merge.bad.driver\ncmd\0merge.bad.driver\ncmd=evil\0").is_ok());
+    }
 
     /// Minimal real-git fixture: a repo with `main` plus N branches each adding
     /// one file, created via the worktree-less `git branch` + index plumbing so
@@ -3320,7 +3621,7 @@ mod tests {
     }
 
     #[test]
-    fn custom_merge_driver_resolves_a_conflict_through_a_worktree_merge() {
+    fn custom_merge_driver_is_refused_and_never_runs() {
         let repo = Repo::new("driver");
         if !repo.history_supported_or_refused() {
             return;
@@ -3350,21 +3651,92 @@ mod tests {
         ));
         git(&repo.dir, &["config", "merge.takeours.driver", &driver]);
 
-        // The fold routes the conflict through a throwaway-worktree real merge,
-        // where the custom driver runs and the branch lands instead of deferring.
+        let original = repo.out(&["rev-parse", "main"]);
         let report = run_fold(&cfg(""), &repo.dir, repo.branch_set()).unwrap();
-        assert!(report.advanced, "{report:?}");
-        assert_eq!(report.landed.len(), 1, "driver-resolved branch should land");
-        assert!(report.deferred.is_empty(), "{report:?}");
-        // The `true` driver kept "ours" (main's content).
-        assert_eq!(repo.out(&["show", "main:data.txt"]), "main");
-        assert_eq!(std::fs::read_to_string(counter).unwrap(), "x");
+        assert!(!report.advanced, "{report:?}");
+        assert!(report.landed.is_empty(), "{report:?}");
+        assert_eq!(report.deferred.len(), 1, "{report:?}");
+        assert!(
+            report.deferred[0]
+                .driver_refusal
+                .as_deref()
+                .is_some_and(|why| why.contains("data.txt") && why.contains("takeours")),
+            "{report:?}"
+        );
+        assert_eq!(repo.out(&["rev-parse", "main"]), original);
+        assert!(!counter.exists(), "refused custom driver ran");
+        assert!(
+            !repo.dir.join("stray.txt").exists(),
+            "driver side effect escaped"
+        );
         assert!(
             !repo
-                .out(&["ls-tree", "-r", "--name-only", "main"])
-                .lines()
-                .any(|path| path == "stray.txt")
+                .out(&["worktree", "list", "--porcelain"])
+                .contains("tg-drivermerge-")
         );
+    }
+
+    #[test]
+    fn attempt_land_reports_driver_refusal() {
+        let repo = Repo::new("driver-land-refusal");
+        if !repo.history_supported_or_refused() {
+            return;
+        }
+        let counter = repo.dir.join("driver-count");
+        let driver = format!(
+            "printf x >> {}; true %O %A %B %L %P",
+            thegn_core::util::sh_quote(&counter.to_string_lossy())
+        );
+        repo.commit(".gitattributes", "data.txt merge=takeours\n", "attrs");
+        repo.commit("data.txt", "base\n", "seed");
+        git(&repo.dir, &["checkout", "-q", "-b", "feat"]);
+        repo.commit("data.txt", "feature\n", "feature edit");
+        git(&repo.dir, &["checkout", "-q", "main"]);
+        repo.commit("data.txt", "main\n", "main edit");
+        git(&repo.dir, &["config", "merge.takeours.driver", &driver]);
+        let outcome = attempt_land(
+            &cfg(""),
+            &repo.dir,
+            "feat",
+            &GitLoc::Local(repo.dir.clone()),
+        )
+        .unwrap();
+        assert!(
+            matches!(outcome, AttemptOutcome::Conflict { driver_refusal: Some(ref reason), .. } if reason.contains("data.txt") && reason.contains("takeours")),
+            "{outcome:?}"
+        );
+        assert!(!counter.exists(), "refused custom driver ran");
+    }
+
+    #[test]
+    fn configured_driver_is_refused_even_when_builtin_merge_is_clean() {
+        let repo = Repo::new("driver-clean-refusal");
+        if !repo.history_supported_or_refused() {
+            return;
+        }
+        let counter = repo.dir.join("driver-count");
+        let driver = format!(
+            "printf x >> {}; printf driver > %A",
+            thegn_core::util::sh_quote(&counter.to_string_lossy())
+        );
+        repo.commit(".gitattributes", "data.txt merge=takeours\n", "attrs");
+        repo.commit("data.txt", "one\ntwo\nthree\n", "seed");
+        git(&repo.dir, &["checkout", "-q", "-b", "feat"]);
+        repo.commit("data.txt", "ONE\ntwo\nthree\n", "feature edit");
+        git(&repo.dir, &["checkout", "-q", "main"]);
+        repo.commit("data.txt", "one\ntwo\nTHREE\n", "main edit");
+        git(&repo.dir, &["config", "merge.takeours.driver", &driver]);
+        let report = run_fold(&cfg(""), &repo.dir, repo.branch_set()).unwrap();
+        assert!(
+            report.advanced,
+            "built-in clean merge should still land: {report:?}"
+        );
+        assert_eq!(report.landed.len(), 1);
+        assert!(
+            !counter.exists(),
+            "configured custom driver ran during merge-tree"
+        );
+        assert_eq!(repo.out(&["show", "main:data.txt"]), "ONE\ntwo\nTHREE");
     }
 
     #[test]
@@ -3413,8 +3785,11 @@ mod tests {
                 &ancestor,
                 &ours_tree,
                 &[],
-                false,
-                Duration::from_secs(3),
+                DriverMergeOpts {
+                    rerere: false,
+                    timeout: Duration::from_secs(3),
+                    overrides: None
+                },
             )
             .is_none()
         );
@@ -3436,8 +3811,11 @@ mod tests {
                 &theirs,
                 &tree,
                 &paths,
-                true,
-                Duration::from_secs(3),
+                DriverMergeOpts {
+                    rerere: true,
+                    timeout: Duration::from_secs(3),
+                    overrides: None
+                },
             )
             .is_none()
         );
@@ -3491,8 +3869,11 @@ mod tests {
                 &theirs,
                 &tree,
                 &paths,
-                false,
-                Duration::from_secs(3),
+                DriverMergeOpts {
+                    rerere: false,
+                    timeout: Duration::from_secs(3),
+                    overrides: None
+                },
             )
             .is_some(),
             "the driver should resolve the approved conflict path",
@@ -3504,8 +3885,11 @@ mod tests {
                 &theirs,
                 &tree,
                 &[],
-                false,
-                Duration::from_secs(3),
+                DriverMergeOpts {
+                    rerere: false,
+                    timeout: Duration::from_secs(3),
+                    overrides: None
+                },
             )
             .is_none(),
             "the resolved data.txt change must be rejected when no paths are approved",
@@ -3535,10 +3919,12 @@ mod tests {
                 .unwrap(),
             MergeTreeOutcome::Conflict { .. }
         ));
-        git(
-            &repo.dir,
-            &["config", "merge.fail.driver", "false %O %A %B %L %P"],
+        let counter = repo.dir.join("driver-count");
+        let failing_driver = format!(
+            "printf x >> {}; false %O %A %B %L %P",
+            thegn_core::util::sh_quote(&counter.to_string_lossy())
         );
+        git(&repo.dir, &["config", "merge.fail.driver", &failing_driver]);
 
         let report = run_fold(&cfg(""), &repo.dir, repo.branch_set()).unwrap();
         assert_eq!(
@@ -3547,6 +3933,8 @@ mod tests {
             "a failed driver must not resolve: {report:?}"
         );
         assert_eq!(report.deferred.len(), 1, "failed driver branch must defer");
+        assert!(report.deferred[0].driver_refusal.is_some(), "{report:?}");
+        assert!(!counter.exists(), "refused custom driver ran");
         let worktrees = repo.out(&["worktree", "list", "--porcelain"]);
         assert!(
             !worktrees.contains("tg-drivermerge-"),
@@ -3602,8 +3990,11 @@ mod tests {
                 &theirs,
                 &tree,
                 &paths,
-                false,
-                Duration::from_secs(1),
+                DriverMergeOpts {
+                    rerere: false,
+                    timeout: Duration::from_secs(1),
+                    overrides: None
+                },
             )
             .is_none()
         );
@@ -4287,6 +4678,8 @@ mod tests {
             regenerate_command: String::new(),
             sign: true,
             rerere: false,
+            refused: RefusedDrivers::default(),
+            refusals: Mutex::new(BTreeMap::new()),
         };
         let mut diagnostics = String::new();
         let error = bisect_offender(
@@ -4335,6 +4728,8 @@ mod tests {
             regenerate_command: String::new(),
             sign: false,
             rerere: false,
+            refused: RefusedDrivers::default(),
+            refusals: Mutex::new(BTreeMap::new()),
         };
         let mut diagnostics = String::new();
         let mut budget = DiagnosisBudget::new(2, Duration::from_secs(3600));
@@ -4384,6 +4779,8 @@ mod tests {
             regenerate_command: String::new(),
             sign: false,
             rerere: false,
+            refused: RefusedDrivers::default(),
+            refusals: Mutex::new(BTreeMap::new()),
         };
         let count_path = counter.clone();
         let _scope = crate::fold_cancel::scope(move || {
@@ -4435,6 +4832,8 @@ mod tests {
             regenerate_command: String::new(),
             sign: false,
             rerere: false,
+            refused: RefusedDrivers::default(),
+            refusals: Mutex::new(BTreeMap::new()),
         };
         let config = MergeQueueConfig {
             gate_timeout_secs: 0,
@@ -4695,6 +5094,7 @@ mod tests {
             &["Cargo.lock".into()],
             "true",
             DRIVER_SUBPROCESS_TIMEOUT,
+            &[],
         );
         assert!(
             tree.is_none(),
@@ -4723,6 +5123,7 @@ mod tests {
             &["Cargo.lock".into()],
             "sleep 30",
             Duration::from_secs(1),
+            &[],
         );
         assert!(tree.is_none());
         assert!(started.elapsed() < Duration::from_secs(10));
@@ -5373,8 +5774,11 @@ mod tests {
                 &theirs,
                 &tree,
                 &[],
-                false,
-                Duration::from_secs(3),
+                DriverMergeOpts {
+                    rerere: false,
+                    timeout: Duration::from_secs(3),
+                    overrides: None
+                },
             )
             .is_none()
         );

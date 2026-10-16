@@ -3398,7 +3398,10 @@ fn source_control_report(cfg: &Config) {
     if drivers.is_empty() {
         outln!("  merge drivers none declared");
     } else {
-        outln!("  merge drivers {}", drivers.join(", "));
+        outln!(
+            "  merge drivers {} (refused by merge-queue folds; conflicts defer to a human)",
+            drivers.join(", ")
+        );
     }
     outln!("  sign commits  {}", yn(mq.sign_commits));
     if mq.sign_commits {
