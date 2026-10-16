@@ -117,7 +117,7 @@ check-cross:
     # carry most of the per-OS code (sysinfo metrics; MPRIS/SMTC/AppleScript
     # media). thegn-core/-svc/-host + gtui-query are NOT here — ring, bundled
     # sqlite and libgit2 make them need a real cross cc.
-    leaves="thegn-metrics thegn-media tg-kit gtui-core gtui-render gtui-app"
+    leaves="thegn-metrics thegn-media thegn-proc tg-kit gtui-core gtui-render gtui-app"
     if [ -d "$rustlib/aarch64-apple-darwin" ]; then
       for crate in $leaves; do
         cargo check -p "$crate" --target aarch64-apple-darwin
@@ -700,6 +700,7 @@ ratchets-all: ratchets
     cargo nextest run -p thegn-host -E 'test(/ratchet/)'
     cargo nextest run -p thegn-media -E 'test(/ratchet/)'
     cargo nextest run -p thegn-metrics -E 'test(/ratchet/)'
+    cargo nextest run -p thegn-proc -E 'test(/ratchet/)'
 
 lint: ratchets
     @for t in treefmt shellcheck yamllint taplo; do command -v "$t" >/dev/null 2>&1 || { echo "lint: '$t' not found — run inside 'nix develop' (or 'direnv allow'); 'just doctor' for details"; exit 1; }; done
