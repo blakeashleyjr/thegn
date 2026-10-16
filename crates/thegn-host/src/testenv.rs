@@ -67,3 +67,17 @@ impl Drop for EnvVarGuard {
         }
     }
 }
+
+/// Panic before a test writes into the live or caller-provided state root.
+#[cfg(test)]
+pub(crate) fn refuse_real_state_write(path: &std::path::Path, what: &str) {
+    assert!(
+        !thegn_core::testenv::is_real_state_path(
+            path,
+            &thegn_core::util::home(),
+            thegn_core::testenv::ambient_state_roots(),
+        ),
+        "THE-744: refusing {what} write to real state path {}",
+        path.display()
+    );
+}
