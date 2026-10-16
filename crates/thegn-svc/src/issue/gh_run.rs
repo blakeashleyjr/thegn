@@ -26,8 +26,9 @@ pub struct Limits {
     pub timeout: Duration,
     /// Cap on captured stdout bytes.
     pub max_stdout: usize,
-    /// Cap on captured stderr bytes (stderr beyond it is read and discarded,
-    /// not an error).
+    /// Cap on captured stderr bytes. Non-streaming runs keep the newest bytes;
+    /// the streaming log runner keeps the first. In either case, excess bytes
+    /// are drained and discarded and do not cause an error.
     pub max_stderr: usize,
 }
 
@@ -70,6 +71,11 @@ pub enum RunError {
 
 /// Run `cmd` to completion under `limits`; returns captured stdout.
 pub async fn run(cmd: Command, limits: Limits) -> Result<String, RunError> {
+    if !bounded_group_termination_supported() {
+        return Err(RunError::Io(
+            "bounded subprocess execution is not supported on this platform".into(),
+        ));
+    }
     let _permit = permits()
         .clone()
         .acquire_owned()
@@ -94,27 +100,6 @@ pub async fn run(cmd: Command, limits: Limits) -> Result<String, RunError> {
     .map_err(|e| RunError::Io(e.to_string()))?
 }
 
-/// Read to EOF, keeping at most `cap` bytes. Bytes past the cap are still
-/// read and discarded so the child never sees a closed pipe (EPIPE/SIGPIPE);
-/// `over` is set when anything was dropped.
-fn read_capped(mut r: impl Read, cap: usize, over: &AtomicBool) -> Vec<u8> {
-    let mut buf = Vec::new();
-    let mut chunk = [0u8; 8192];
-    loop {
-        match r.read(&mut chunk) {
-            Ok(0) | Err(_) => break,
-            Ok(n) => {
-                let room = cap.saturating_sub(buf.len());
-                if n > room {
-                    over.store(true, Ordering::Relaxed);
-                }
-                buf.extend_from_slice(&chunk[..n.min(room)]);
-            }
-        }
-    }
-    buf
-}
-
 /// How long the readers get to hit EOF once the process group is dead.
 const READER_GRACE: Duration = Duration::from_millis(500);
 
@@ -129,18 +114,70 @@ pub(crate) fn run_blocking(
     limits: Limits,
     cancel: &AtomicBool,
 ) -> Result<String, RunError> {
-    let out_over = Arc::new(AtomicBool::new(false));
-    let reader_over = out_over.clone();
-    let (stdout, _) =
-        run_blocking_core(cmd, limits, cancel, Some(out_over), false, move |reader| {
-            read_capped(reader, limits.max_stdout, &reader_over)
-        })?;
-    Ok(String::from_utf8_lossy(&stdout).into_owned())
+    if cancel.load(Ordering::Relaxed) {
+        return Err(RunError::Cancelled);
+    }
+    let mut cmd = cmd;
+    let limits = thegn_proc::Limits {
+        quiesce_after_leader: Some(Duration::ZERO),
+        reader_grace: READER_GRACE,
+        stdout: thegn_proc::Stream::HeadOrFail {
+            cap: limits.max_stdout,
+        },
+        stderr: thegn_proc::Stream::Tail {
+            cap: limits.max_stderr,
+        },
+        ..thegn_proc::Limits::silent(limits.timeout)
+    };
+    map_run(thegn_proc::run(&mut cmd, &limits, cancel))
+}
+
+fn map_run(run: thegn_proc::Run) -> Result<String, RunError> {
+    use thegn_proc::{End, GroupState, Leader};
+
+    if run.group == GroupState::Survivors {
+        tracing::debug!("gh subprocess group had survivors after termination");
+    }
+    match run.end {
+        End::Spawn(error) => {
+            if error.kind() == std::io::ErrorKind::NotFound {
+                Err(RunError::NotInstalled)
+            } else {
+                Err(RunError::Io(error.to_string()))
+            }
+        }
+        End::Supervise(error) => Err(RunError::Io(error.to_string())),
+        End::Cancelled => Err(RunError::Cancelled),
+        End::OutputLimit(_) => Err(RunError::Truncated),
+        End::TimedOut => Err(RunError::Timeout),
+        End::LeaderExited => {
+            let status = match run.leader {
+                Leader::Reaped(status) => status,
+                Leader::ReapFailed(error) => return Err(RunError::Io(error.to_string())),
+                Leader::Detached | Leader::NotSpawned => {
+                    return Err(RunError::Io("could not reap child".into()));
+                }
+            };
+            if !run.stdout.eof || !run.stderr.eof {
+                return Err(RunError::Timeout);
+            }
+            if run.stdout.truncated {
+                return Err(RunError::Truncated);
+            }
+            if status.success() {
+                Ok(String::from_utf8_lossy(&run.stdout.bytes).into_owned())
+            } else {
+                Err(RunError::Exit {
+                    code: status.code(),
+                    stderr: String::from_utf8_lossy(&run.stderr.bytes).into_owned(),
+                })
+            }
+        }
+    }
 }
 
 /// Consume stdout on its reader thread. The consumer owns retention; after it
 /// returns, the runner drains and discards the remaining pipe bytes.
-#[allow(dead_code)] // The batch-21 ci.rs caller is deferred until that lane lands.
 pub(crate) fn run_blocking_streaming<T, F>(
     cmd: Command,
     limits: Limits,
@@ -151,7 +188,7 @@ where
     F: FnOnce(&mut dyn Read) -> T + Send + 'static,
     T: Send + 'static,
 {
-    run_blocking_core(cmd, limits, cancel, None, true, consume)
+    run_blocking_core(cmd, limits, cancel, consume)
 }
 
 enum ReaderMessage<T> {
@@ -163,8 +200,6 @@ fn run_blocking_core<T, F>(
     mut cmd: Command,
     limits: Limits,
     cancel: &AtomicBool,
-    out_over: Option<Arc<AtomicBool>>,
-    strict_reader_errors: bool,
     consume: F,
 ) -> Result<(T, std::process::ExitStatus), RunError>
 where
@@ -199,11 +234,9 @@ where
         let result = match stdout {
             Some(mut stream) => {
                 let value = consume(&mut stream);
-                match std::io::copy(&mut stream, &mut std::io::sink()) {
-                    Ok(_) => Ok(value),
-                    Err(error) if strict_reader_errors => Err(error.to_string()),
-                    Err(_) => Ok(value),
-                }
+                std::io::copy(&mut stream, &mut std::io::sink())
+                    .map(|_| value)
+                    .map_err(|error| error.to_string())
             }
             None => Err("stdout pipe was not available".to_owned()),
         };
@@ -213,12 +246,7 @@ where
     });
     std::thread::spawn(move || {
         let result = match stderr {
-            Some(stream) if strict_reader_errors => read_capped_result(stream, limits.max_stderr),
-            Some(stream) => Ok(read_capped(
-                stream,
-                limits.max_stderr,
-                &AtomicBool::new(false),
-            )),
+            Some(stream) => read_capped_result(stream, limits.max_stderr),
             None => Err("stderr pipe was not available".to_owned()),
         };
         if tx.send(ReaderMessage::Stderr(result)).is_err() {
@@ -243,13 +271,6 @@ where
         }
         if cancel.load(Ordering::Relaxed) {
             failure = Some(RunError::Cancelled);
-            break;
-        }
-        if out_over
-            .as_ref()
-            .is_some_and(|over| over.load(Ordering::Relaxed))
-        {
-            failure = Some(RunError::Truncated);
             break;
         }
         if Instant::now() >= deadline {
@@ -301,12 +322,6 @@ where
     let stderr = stderr
         .expect("stderr reader completed")
         .map_err(RunError::Io)?;
-    if out_over
-        .as_ref()
-        .is_some_and(|over| over.load(Ordering::Relaxed))
-    {
-        return Err(RunError::Truncated);
-    }
     match status {
         Some(status) if status.success() => Ok((stdout, status)),
         Some(status) => Err(RunError::Exit {
