@@ -480,7 +480,7 @@ pub async fn main(
     // /`Utility` classes on the off-loop workers their meaning — without a
     // stated top, "lower than the loop" is just a guess. On Apple silicon this
     // is also what keeps the loop eligible for the performance cores while the
-    // samplers and hydration move off them. A no-op off macOS.
+    // samplers and hydration move off them. Linux applies per-thread nice hints.
     crate::platform::qos::set_self(crate::platform::qos::Qos::Interactive);
 
     // Lift the open-fd ceiling before any PTY/git work: as its own multiplexer,
