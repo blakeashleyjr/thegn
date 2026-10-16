@@ -837,7 +837,9 @@ fn scan_proc(targets: &[(PathBuf, String)]) -> BTreeMap<String, BTreeMap<u32, u6
         true,
         ProcessRefreshKind::nothing()
             .with_cwd(UpdateKind::Always)
-            .with_cpu(),
+            .with_cpu()
+            // sysinfo enumerates tasks only on linux/android.
+            .without_tasks(),
     );
     for proc in sys.processes().values() {
         // Elevated/protected processes (and, on macOS, other users') hide their
