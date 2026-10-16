@@ -556,7 +556,7 @@ impl Resolved {
     pub fn git_ssh_command(&self) -> Option<String> {
         self.git_ssh_key
             .as_ref()
-            .map(|k| format!("ssh -i {k} -o IdentitiesOnly=yes"))
+            .map(|k| format!("ssh -i {} -o IdentitiesOnly=yes", crate::util::sh_quote(k)))
     }
 
     /// Build the `git -c …` overrides that would bind this identity's signing
@@ -804,5 +804,18 @@ mod tests {
     fn display_label_stops_before_rendering_unbounded_input() {
         let label = display_label(&[b'/'; MAX_DISPLAY_LABEL_BYTES * 100]);
         assert!(label.as_str().len() <= MAX_DISPLAY_LABEL_BYTES);
+    }
+
+    #[test]
+    fn git_ssh_command_quotes_spaced_key() {
+        let _env = crate::testenv::EnvGuard::unset(&["GIT_SSH_COMMAND"]);
+        let r = Resolved {
+            git_ssh_key: Some("/keys/work identity/id".into()),
+            ..Default::default()
+        };
+        assert_eq!(
+            r.git_ssh_command().as_deref(),
+            Some("ssh -i '/keys/work identity/id' -o IdentitiesOnly=yes")
+        );
     }
 }

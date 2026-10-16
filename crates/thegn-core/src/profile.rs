@@ -81,6 +81,91 @@ impl ProfilePaths {
 
 static ACTIVE: OnceLock<ProfilePaths> = OnceLock::new();
 static DEFAULT_STATE_HOME: OnceLock<PathBuf> = OnceLock::new();
+static CREDENTIAL_SHARES: OnceLock<Vec<String>> = OnceLock::new();
+
+/// Process-environment policy for sandbox/provider passthroughs. The legacy
+/// default profile keeps its historical passthrough behavior; named profiles
+/// admit only infrastructure names and explicitly shared variables.
+#[derive(Debug, Clone)]
+pub struct CredentialFirewall {
+    named: bool,
+    shares: Vec<String>,
+}
+
+impl CredentialFirewall {
+    /// Build the legacy, unrestricted policy. Used by the default profile.
+    #[cfg(test)]
+    pub fn inactive() -> Self {
+        Self {
+            named: false,
+            shares: Vec::new(),
+        }
+    }
+
+    /// Build a named-profile policy with its explicit per-profile shares.
+    #[cfg(test)]
+    pub fn named(shares: Vec<String>) -> Self {
+        Self {
+            named: true,
+            shares,
+        }
+    }
+
+    /// Whether this policy applies the named-profile deny-by-default rule.
+    pub fn is_named(&self) -> bool {
+        self.named
+    }
+
+    /// Whether a variable name may be passed to a sandbox/provider.
+    pub fn admits(&self, var: &str) -> bool {
+        !self.named
+            || util::HOST_ENV_ALLOW_EXACT.contains(&var)
+            || var.starts_with("LC_")
+            || var.starts_with("THEGN_")
+            || self.shares.iter().any(|share| share == var)
+    }
+
+    /// Return denied variable names, never their values.
+    pub fn denied<'a>(&self, names: &'a [String]) -> Vec<&'a str> {
+        names
+            .iter()
+            .filter(|name| !self.admits(name))
+            .map(String::as_str)
+            .collect()
+    }
+
+    /// Current process policy. A missing startup installation fails closed
+    /// for a named profile by using an empty share list.
+    pub fn active() -> Self {
+        if active().is_default() {
+            Self {
+                named: false,
+                shares: Vec::new(),
+            }
+        } else {
+            Self {
+                named: true,
+                shares: CREDENTIAL_SHARES.get().cloned().unwrap_or_default(),
+            }
+        }
+    }
+}
+
+/// Read the existing per-profile sandbox passthrough grant.
+pub fn profile_shares(cfg: &crate::config::Config, name: &str) -> Vec<String> {
+    cfg.profiles
+        .get(name)
+        .and_then(|profile| profile.sandbox.env_passthrough.clone())
+        .unwrap_or_default()
+}
+
+/// Install the profile's explicit passthrough grants once after config load.
+/// `OnceLock` preserves the first startup policy if called more than once.
+pub fn install_credential_shares(shares: Vec<String>) {
+    if CREDENTIAL_SHARES.set(shares).is_err() {
+        tracing::debug!(target: "thegn::profile", "credential shares already installed; keeping first policy");
+    }
+}
 
 /// Normalize a raw selector to a profile name: empty / `"default"` (any case) →
 /// `"default"`; otherwise the slugified name (so it is a safe path component).
@@ -336,7 +421,7 @@ pub fn credential_env(root: &std::path::Path) -> Vec<(&'static str, Option<Strin
             "GIT_SSH_COMMAND",
             Some(format!(
                 "ssh -i {} -o IdentitiesOnly=yes",
-                key.to_string_lossy()
+                util::sh_quote(&key.to_string_lossy())
             )),
         ));
     }
@@ -981,6 +1066,139 @@ mod tests {
         assert_eq!(find("GITHUB_TOKEN"), Some(None));
         // No ssh/id on this synthetic root ⇒ GIT_SSH_COMMAND is not forced.
         assert!(find("GIT_SSH_COMMAND").is_none());
+    }
+
+    #[test]
+    fn named_firewall_denies_unshared_credentials() {
+        let _env = crate::testenv::EnvGuard::unset(&[
+            "ANTHROPIC_API_KEY",
+            "SSH_AUTH_SOCK",
+            "GPG_AGENT_INFO",
+            "GH_TOKEN",
+            "FOO_TOKEN",
+            "DBUS_SESSION_BUS_ADDRESS",
+            "XDG_RUNTIME_DIR",
+            "TERM",
+            "GIT_CONFIG_GLOBAL",
+            "GH_CONFIG_DIR",
+            "GIT_SSH_COMMAND",
+            "LC_ALL",
+            "THEGN_PROFILE",
+        ]);
+        let firewall = CredentialFirewall::named(Vec::new());
+        for denied in [
+            "ANTHROPIC_API_KEY",
+            "SSH_AUTH_SOCK",
+            "GPG_AGENT_INFO",
+            "GH_TOKEN",
+            "FOO_TOKEN",
+            "DBUS_SESSION_BUS_ADDRESS",
+            "XDG_RUNTIME_DIR",
+        ] {
+            assert!(!firewall.admits(denied), "{denied}");
+        }
+        for admitted in [
+            "TERM",
+            "GIT_CONFIG_GLOBAL",
+            "GH_CONFIG_DIR",
+            "GIT_SSH_COMMAND",
+            "LC_ALL",
+            "THEGN_PROFILE",
+        ] {
+            assert!(firewall.admits(admitted), "{admitted}");
+        }
+    }
+
+    #[test]
+    fn named_firewall_admits_shared_names_only() {
+        let _env = crate::testenv::EnvGuard::unset(&["SSH_AUTH_SOCK", "ANTHROPIC_API_KEY"]);
+        let firewall = CredentialFirewall::named(vec!["SSH_AUTH_SOCK".to_owned()]);
+        assert!(firewall.admits("SSH_AUTH_SOCK"));
+        assert!(!firewall.admits("ANTHROPIC_API_KEY"));
+    }
+
+    #[test]
+    fn inactive_firewall_admits_everything() {
+        let _env = crate::testenv::EnvGuard::unset(&["ARBITRARY_UNKNOWN_NAME"]);
+        assert!(CredentialFirewall::inactive().admits("ARBITRARY_UNKNOWN_NAME"));
+    }
+
+    #[test]
+    fn active_firewall_is_inactive_on_default_profile() {
+        let _env = crate::testenv::EnvGuard::unset(&["THEGN_PROFILE"]);
+        assert!(!CredentialFirewall::active().is_named());
+    }
+
+    #[test]
+    fn denied_lists_names_only() {
+        let _env = crate::testenv::EnvGuard::unset(&["SECRET_NAME"]);
+        let firewall = CredentialFirewall::named(Vec::new());
+        let names = vec!["SECRET_NAME".to_owned(), "TERM".to_owned()];
+        assert_eq!(firewall.denied(&names), vec!["SECRET_NAME"]);
+    }
+
+    #[test]
+    fn profile_shares_reads_profile_sandbox_overlay() {
+        let _env = crate::testenv::EnvGuard::unset(&["THEGN_PROFILE"]);
+        let mut cfg = crate::config::Config::default();
+        cfg.profiles.insert(
+            "work".to_owned(),
+            crate::config::ProfileConfig {
+                sandbox: crate::config::SandboxOverlay {
+                    env_passthrough: Some(vec!["SSH_AUTH_SOCK".to_owned()]),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        );
+        assert_eq!(profile_shares(&cfg, "work"), vec!["SSH_AUTH_SOCK"]);
+        assert!(profile_shares(&cfg, "missing").is_empty());
+    }
+
+    #[test]
+    fn passthrough_env_for_named_profile_drops_ambient_key() {
+        let _env = crate::testenv::EnvGuard::set(&[
+            ("ANTHROPIC_API_KEY", "ambient-secret"),
+            ("TERM", "xterm-test"),
+        ]);
+        let sandbox = crate::config::SandboxConfig::default();
+        let denied = sandbox.passthrough_env_for(&CredentialFirewall::named(Vec::new()));
+        assert!(
+            denied
+                .iter()
+                .any(|(key, value)| key == "TERM" && value == "xterm-test")
+        );
+        assert!(!denied.iter().any(|(key, _)| key == "ANTHROPIC_API_KEY"));
+        let shared = sandbox.passthrough_env_for(&CredentialFirewall::named(vec![
+            "ANTHROPIC_API_KEY".to_owned(),
+        ]));
+        assert!(
+            shared
+                .iter()
+                .any(|(key, value)| { key == "ANTHROPIC_API_KEY" && value == "ambient-secret" })
+        );
+        assert!(
+            sandbox
+                .passthrough_env_for(&CredentialFirewall::inactive())
+                .iter()
+                .any(|(key, _)| key == "ANTHROPIC_API_KEY")
+        );
+    }
+
+    #[test]
+    fn credential_env_quotes_ssh_key_path() {
+        let _env = crate::testenv::EnvGuard::unset(&["GIT_SSH_COMMAND"]);
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("profile with spaces");
+        std::fs::create_dir_all(root.join("ssh")).unwrap();
+        std::fs::write(root.join("ssh/id"), "key").unwrap();
+        let command = credential_env(&root)
+            .into_iter()
+            .find(|(name, _)| *name == "GIT_SSH_COMMAND")
+            .and_then(|(_, value)| value)
+            .unwrap();
+        assert!(command.starts_with("ssh -i '") && command.contains("profile with spaces/ssh/id'"));
+        assert!(command.ends_with(" -o IdentitiesOnly=yes"));
     }
 
     #[test]

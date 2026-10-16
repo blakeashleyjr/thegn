@@ -336,14 +336,14 @@ fn devcontainer_json(cfg: &Config) -> serde_json::Value {
         });
     };
     let allowed = sandbox.env_passthrough.clone();
+    let firewall = thegn_core::profile::CredentialFirewall::active();
     let local_env = |key: &str| {
-        allowed
-            .iter()
-            .any(|allowed_key| allowed_key == key)
+        (allowed.iter().any(|allowed_key| allowed_key == key) && firewall.admits(key))
             .then(|| std::env::var(key).ok())
             .flatten()
     };
-    let allow_local_env = |key: &str| allowed.iter().any(|allowed_key| allowed_key == key);
+    let allow_local_env =
+        |key: &str| allowed.iter().any(|allowed_key| allowed_key == key) && firewall.admits(key);
     let ctx = thegn_core::devcontainer::SubstCtx {
         local_workspace_folder: worktree.to_string_lossy().into_owned(),
         container_workspace_folder: worktree.to_string_lossy().into_owned(),
@@ -894,6 +894,26 @@ fn exposure_report(cfg: &Config) {
             Some(m) => outln!("    gpg home    {m}"),
             None => outln!("    gpg home    (not mounted)"),
         }
+    }
+    let firewall = thegn_core::profile::CredentialFirewall::active();
+    if firewall.is_named() {
+        let profile_name = thegn_core::profile::name();
+        let denied = firewall.denied(pass);
+        let shares = thegn_core::profile::profile_shares(cfg, &profile_name);
+        outln!("  profile firewall ({profile_name}): ambient credentials denied by default");
+        let denied_names = if denied.is_empty() {
+            "(none)".to_owned()
+        } else {
+            denied.join(", ")
+        };
+        let shared_names = if shares.is_empty() {
+            "(none)".to_owned()
+        } else {
+            shares.join(", ")
+        };
+        outln!("    denied  {denied_names}");
+        outln!("    shared  {shared_names}");
+        outln!("    share one with [profiles.{profile_name}.sandbox] env_passthrough = [...]");
     }
     outln!("  note: `/run/user` is not a default mount (keyring/agent unreachable);");
     outln!("        add it to [sandbox] mounts only if a pane needs the session bus.");
