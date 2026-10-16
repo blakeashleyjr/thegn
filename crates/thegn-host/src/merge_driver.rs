@@ -557,23 +557,6 @@ fn drive_queue_with(
                     phase,
                     class,
                 } => {
-                    if class == integrate::GateErrorClass::Cancelled {
-                        let untouched = total_items - index;
-                        let detail = "integration cancelled; row left queued";
-                        let fields = set(db, MqStatus::Queued, None, Some(detail));
-                        stop_on_write_error!();
-                        progress(&DriveStep {
-                            fields: &fields,
-                            worktree: &item.worktree,
-                            branch: &item.branch,
-                            status: MqStatus::Queued.as_str(),
-                            detail,
-                        });
-                        out.warnings.push(format!(
-                            "merge drain cancelled; {untouched} queued row(s) left untouched"
-                        ));
-                        break 'items;
-                    }
                     // The gate could not RUN. This is a fact about the
                     // environment, not a verdict about the branch, so it must
                     // NOT become a `Failure`: handing it to the fixing agent
@@ -1484,7 +1467,7 @@ mod tests {
         }
 
         #[test]
-        fn cancelled_drain_during_gate_keeps_in_flight_row_queued() {
+        fn cancelled_drain_during_gate_records_gate_error_and_leaves_later_rows_queued() {
             if thegn_core::sandbox_backend::host_os()
                 == thegn_core::sandbox_backend::HostOs::Windows
             {
@@ -1493,31 +1476,79 @@ mod tests {
             let (_fixture, root, feat_wt) = clean_repo("cancelled-drain-gate");
             let db = Db::open_memory().unwrap();
             let queued = item(&db, &feat_wt);
+            db.enqueue_merge("/queued/second", "second", "main")
+                .unwrap();
+            let later = QueueItem {
+                worktree: "/queued/second".into(),
+                branch: "second".into(),
+                location: String::new(),
+                agent_attempts: 0,
+            };
             let counter = root.join("gate-count");
             std::fs::write(&counter, "").unwrap();
             let command = format!(
-                "printf x >> {} ; true",
+                "printf x >> {} ; exec sleep 30",
                 thegn_core::util::sh_quote(&counter.to_string_lossy()),
             );
             let mut mq = cfg("", 1);
             mq.gate_on = true;
             mq.gate_command = command;
-            let count_path = counter.clone();
-            let _scope = crate::fold_cancel::scope(move || {
-                std::fs::metadata(&count_path).is_ok_and(|metadata| metadata.len() > 0)
+            let cancelled = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let probe = std::sync::Arc::clone(&cancelled);
+            let _scope =
+                crate::fold_cancel::scope(move || probe.load(std::sync::atomic::Ordering::Acquire));
+            let gate_marker = counter.clone();
+            let cancel_signal = std::sync::Arc::clone(&cancelled);
+            let waiter = std::thread::spawn(move || {
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+                while std::time::Instant::now() < deadline {
+                    if std::fs::metadata(&gate_marker).is_ok_and(|metadata| metadata.len() > 0) {
+                        cancel_signal.store(true, std::sync::atomic::Ordering::Release);
+                        return true;
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+                cancel_signal.store(true, std::sync::atomic::Ordering::Release);
+                false
             });
-            let outcome = drive_queue(&mq, &Config::default(), &root, &db, vec![queued], |_| {});
+            let outcome = drive_queue(
+                &mq,
+                &Config::default(),
+                &root,
+                &db,
+                vec![queued, later],
+                |_| {},
+            );
+            assert!(
+                waiter.join().unwrap(),
+                "the gate must start before cancellation"
+            );
             assert!(
                 std::fs::metadata(counter).is_ok_and(|metadata| metadata.len() > 0),
                 "the gate probe must have fired during the in-flight attempt"
             );
             let rows = db.list_merge_queue().unwrap();
-            assert_eq!(rows.len(), 1);
+            assert_eq!(rows.len(), 2);
+            let feat_worktree = feat_wt.to_string_lossy().into_owned();
             assert_eq!(
-                rows[0].status, "queued",
-                "cancelled row must not be gate_error"
+                rows.iter()
+                    .find(|row| row.worktree == feat_worktree)
+                    .unwrap()
+                    .status,
+                "gate_error",
+                "an in-flight cancelled gate is an infrastructure error"
             );
-            assert!(outcome.gate_error.is_empty());
+            assert_eq!(
+                rows.iter()
+                    .find(|row| row.worktree == "/queued/second")
+                    .unwrap()
+                    .status,
+                "queued",
+                "rows not yet started remain queued"
+            );
+            assert_eq!(outcome.gate_error, ["feat"]);
+            assert_eq!(outcome.gate_verdicts.len(), 1);
+            assert_eq!(outcome.gate_verdicts[0].class, "cancelled");
             assert_eq!(outcome.warnings.len(), 1);
             assert!(outcome.warnings[0].contains("1 queued row(s) left untouched"));
         }
