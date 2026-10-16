@@ -9,6 +9,45 @@ use std::io::Write;
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum PrivateWriteFault {
+    Fchmod,
+    Write,
+}
+
+#[cfg(test)]
+thread_local! {
+    static PRIVATE_WRITE_FAULT: std::cell::Cell<Option<PrivateWriteFault>> = const { std::cell::Cell::new(None) };
+}
+
+#[cfg(test)]
+struct PrivateWriteFaultGuard;
+
+#[cfg(test)]
+impl Drop for PrivateWriteFaultGuard {
+    fn drop(&mut self) {
+        PRIVATE_WRITE_FAULT.set(None);
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn with_private_write_fault<T>(fault: PrivateWriteFault, f: impl FnOnce() -> T) -> T {
+    PRIVATE_WRITE_FAULT.set(Some(fault));
+    let _guard = PrivateWriteFaultGuard;
+    f()
+}
+
+#[cfg(all(test, unix))]
+fn take_private_write_fault(expected: PrivateWriteFault) -> bool {
+    if PRIVATE_WRITE_FAULT.get() == Some(expected) {
+        PRIVATE_WRITE_FAULT.set(None);
+        true
+    } else {
+        false
+    }
+}
+
 /// Create a file or directory symlink using the platform's native API.
 /// Callers that use this for optional capabilities can treat `Unsupported` or
 /// `PermissionDenied` as an unavailable platform feature.
@@ -512,16 +551,34 @@ impl PrivateDir {
                 Mode::from_bits_truncate(0o600),
             )
             .map_err(nix_io_error)?;
-            if let Err(error) = fchmod(&fd, Mode::from_bits_truncate(0o600)) {
+            let chmod_result = fchmod(&fd, Mode::from_bits_truncate(0o600))
+                .map_err(nix_io_error)
+                .and_then(|()| {
+                    #[cfg(test)]
+                    if take_private_write_fault(PrivateWriteFault::Fchmod) {
+                        return Err(std::io::Error::other("injected fault"));
+                    }
+                    Ok(())
+                });
+            if let Err(error) = chmod_result {
                 if let Err(cleanup_error) =
                     unlinkat(&self.fd, temporary.as_str(), UnlinkatFlags::NoRemoveDir)
                 {
                     tracing::debug!(%cleanup_error, "failed to remove unprotected private file");
                 }
-                return Err(nix_io_error(error));
+                return Err(error);
             }
             let mut file = std::fs::File::from(fd);
-            let write_result = file.write_all(bytes).and_then(|()| file.sync_all());
+            let write_result = {
+                #[cfg(test)]
+                if take_private_write_fault(PrivateWriteFault::Write) {
+                    Err(std::io::Error::other("injected fault"))
+                } else {
+                    file.write_all(bytes).and_then(|()| file.sync_all())
+                }
+                #[cfg(not(test))]
+                file.write_all(bytes).and_then(|()| file.sync_all())
+            };
             if let Err(error) = write_result {
                 if let Err(cleanup_error) =
                     unlinkat(&self.fd, temporary.as_str(), UnlinkatFlags::NoRemoveDir)
@@ -574,6 +631,16 @@ impl PrivateDir {
             write_owner_only_atomic(&path, bytes)?;
             Ok(path)
         }
+    }
+}
+
+#[cfg(all(test, not(unix)))]
+mod private_write_fault_tests {
+    use super::{PrivateWriteFault, with_private_write_fault};
+
+    #[test]
+    fn fault_helper_is_available_on_non_unix_test_builds() {
+        with_private_write_fault(PrivateWriteFault::Write, || ());
     }
 }
 
@@ -885,6 +952,66 @@ Set-Acl -LiteralPath $path -AclObject $acl"#
 mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
+
+    #[test]
+    fn private_write_fchmod_failure_unlinks_the_temporary() {
+        let anchor = tempfile::tempdir().unwrap();
+        let dir = ensure_private_dir_beneath(anchor.path(), Path::new("secrets")).unwrap();
+
+        let result = with_private_write_fault(PrivateWriteFault::Fchmod, || {
+            dir.write_owner_only_atomic("secret.env", b"CANARY")
+        });
+
+        assert!(result.is_err());
+        assert!(!anchor.path().join("secrets/secret.env").exists());
+        let entries = std::fs::read_dir(anchor.path().join("secrets"))
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        assert!(
+            entries
+                .iter()
+                .all(|name| !name.starts_with(PRIVATE_TEMP_PREFIX))
+        );
+        for entry in entries {
+            assert!(
+                !std::fs::read(anchor.path().join("secrets").join(entry))
+                    .unwrap()
+                    .windows(b"CANARY".len())
+                    .any(|window| window == b"CANARY")
+            );
+        }
+    }
+
+    #[test]
+    fn private_write_write_failure_unlinks_the_temporary() {
+        let anchor = tempfile::tempdir().unwrap();
+        let dir = ensure_private_dir_beneath(anchor.path(), Path::new("secrets")).unwrap();
+
+        let result = with_private_write_fault(PrivateWriteFault::Write, || {
+            dir.write_owner_only_atomic("secret.env", b"CANARY")
+        });
+
+        assert!(result.is_err());
+        assert!(!anchor.path().join("secrets/secret.env").exists());
+        let entries = std::fs::read_dir(anchor.path().join("secrets"))
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        assert!(
+            entries
+                .iter()
+                .all(|name| !name.starts_with(PRIVATE_TEMP_PREFIX))
+        );
+        for entry in entries {
+            assert!(
+                !std::fs::read(anchor.path().join("secrets").join(entry))
+                    .unwrap()
+                    .windows(b"CANARY".len())
+                    .any(|window| window == b"CANARY")
+            );
+        }
+    }
 
     #[test]
     fn extra_hard_links_counts_only_links_beyond_the_first() {
