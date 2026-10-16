@@ -3613,7 +3613,7 @@ mod runtime_quota_tests {
         ));
         assert!(
             runtime
-                .state_set(plugin, "limit", nested_arrays(MAX_PLUGIN_JSON_DEPTH),)
+                .state_set(plugin, "limit", nested_arrays(MAX_PLUGIN_JSON_DEPTH))
                 .is_ok()
         );
     }
@@ -3718,29 +3718,26 @@ mod runtime_quota_tests {
             .update(plugin.clone(), surface.clone(), first.clone())
             .unwrap();
         let too_many_rows = View::multi((0..MAX_VIEW_ROWS + 1).map(|_| vec![]));
-        assert!(quota(
-            runtime
-                .update(plugin.clone(), surface.clone(), too_many_rows)
-                .unwrap_err()
+        assert!(matches!(
+            runtime.update(plugin.clone(), surface.clone(), too_many_rows),
+            Err(error) if quota(error)
         ));
         assert_eq!(runtime.view(&surface), Some(&first));
 
         let too_many_spans =
             View::line((0..MAX_VIEW_SPANS + 1).map(|_| Span::styled("", StyleRole::Default)));
-        assert!(quota(
-            runtime
-                .update(plugin.clone(), surface.clone(), too_many_spans)
-                .unwrap_err()
+        assert!(matches!(
+            runtime.update(plugin.clone(), surface.clone(), too_many_spans),
+            Err(error) if quota(error)
         ));
         let too_much_text = View::line([Span::slotted(
             "x".repeat(MAX_VIEW_TEXT_BYTES),
             StyleRole::Default,
             "slot",
         )]);
-        assert!(quota(
-            runtime
-                .update(plugin, surface.clone(), too_much_text)
-                .unwrap_err()
+        assert!(matches!(
+            runtime.update(plugin, surface.clone(), too_much_text),
+            Err(error) if quota(error)
         ));
         assert_eq!(runtime.view(&surface), Some(&first));
     }
