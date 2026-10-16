@@ -141,30 +141,28 @@ fn watchdog() -> Option<&'static Arc<Watchdog>> {
 }
 
 fn run_watchdog(watchdog: Arc<Watchdog>) {
+    let mut registrations = watchdog.registrations.lock().unwrap();
     loop {
-        let mut registrations = watchdog.registrations.lock().unwrap();
-        loop {
-            let Some((&(deadline, _), _)) = registrations.first_key_value() else {
-                registrations = watchdog.changed.wait(registrations).unwrap();
-                continue;
-            };
-            let now = Instant::now();
-            if deadline <= now {
-                let expired: Vec<_> = registrations
-                    .range(..=(now, u64::MAX))
-                    .map(|(key, _)| *key)
-                    .collect();
-                for key in expired {
-                    if let Some(flag) = registrations.remove(&key) {
-                        flag.store(true, Ordering::SeqCst);
-                    }
+        let Some((&(deadline, _), _)) = registrations.first_key_value() else {
+            registrations = watchdog.changed.wait(registrations).unwrap();
+            continue;
+        };
+        let now = Instant::now();
+        if deadline <= now {
+            let expired: Vec<_> = registrations
+                .range(..=(now, u64::MAX))
+                .map(|(key, _)| *key)
+                .collect();
+            for key in expired {
+                if let Some(flag) = registrations.remove(&key) {
+                    flag.store(true, Ordering::SeqCst);
                 }
-                continue;
             }
-            let wait = deadline.saturating_duration_since(now);
-            let (next, _) = watchdog.changed.wait_timeout(registrations, wait).unwrap();
-            registrations = next;
+            continue;
         }
+        let wait = deadline.saturating_duration_since(now);
+        let (next, _) = watchdog.changed.wait_timeout(registrations, wait).unwrap();
+        registrations = next;
     }
 }
 
