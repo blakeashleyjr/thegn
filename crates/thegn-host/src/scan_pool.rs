@@ -41,6 +41,7 @@ pub(crate) struct ScanPool {
 }
 
 impl ScanPool {
+    #[cfg(test)]
     pub(crate) fn new(cap: usize) -> Arc<Self> {
         Arc::new(Self {
             cap: cap.max(1),
