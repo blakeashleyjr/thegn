@@ -79,7 +79,10 @@ binds thegn state, its runtime/control socket dir, credential dirs under `$HOME`
 directory, bind-backed named volumes, and file secrets/configs; there is no
 per-repo opt-out. If the config cannot be inspected, launch proceeds with a
 warning and is reported as host-process isolation. Remote placements are not
-checked. On backends that store the label, a kept container is reused only if its
+checked. Queue-agent sandboxes get the same protected-bind check, including the
+daemon control-socket directory. If their Compose config cannot be inspected,
+the agent runs degraded with a warning. On backends that store the label, a
+kept container is reused only if its
 `thegn.policy` label matches a fingerprint of the whole resolved policy and,
 when sealed, it binds exactly the required mounts; otherwise it is recreated.
 On these backends, a policy change recreates it once, and a container made by
@@ -204,6 +207,15 @@ substitution is clamped: `${localEnv:NAME}` is available only when `NAME` is in
 the effective `[sandbox] env_passthrough` list. A blocked name becomes empty
 and is reported without exposing its value.
 
+Under a named profile (`--profile <name>`), ambient credentials are denied
+by default for sandboxes, devcontainer `${localEnv:}` substitutions and
+provider placements. Only infrastructure names such as `PATH`, `HOME`,
+`TERM` and `LANG`, `LC_*`, `THEGN_*`, and names in
+`[profiles.<name>.sandbox] env_passthrough` are shared; that profile list
+replaces `[sandbox] env_passthrough`. The default profile is unchanged.
+`thegn doctor` lists denied and shared names, never values. The share list is
+read at startup.
+
 Some repo requests are never eligible for approval. `privileged`, `capAdd`,
 `securityOpt`, `runArgs`, and `init` could weaken the trusted sandbox, so thegn
 always refuses them and names the reason. Recognized fields that thegn does not
@@ -320,9 +332,10 @@ labelled degraded. Explicit `host`/`none`/empty backend choices and ssh/mosh
 terminals are unchanged. A managed provider
 placement is out of scope (reported `provider-managed`, never counted as a
 tier). A repo-root `.thegn.toml` may only **raise** the floor, never lower it.
-The two queues' agent handoff (`[merge_queue]` / `[pr_queue]`) can demand the same floor
-with `agent_sandbox` + `agent_isolation_floor`; a fail-closed miss there is an
-**infrastructure** failure that holds the entry and never blames the branch.
+With `agent_sandbox` on, a queue agent is held to at least the `[sandbox]`
+isolation floor in force (default: shared-kernel, refusing on a miss). The
+queue floor can raise that requirement, but `degrade` cannot weaken it. Opt
+out with `[sandbox] isolation_floor = "off"` or `agent_sandbox = false`.
 
 ## Choosing per worktree
 
@@ -466,7 +479,12 @@ Cleanup is always explicit — thegn never prunes on a schedule.
   so gc can reclaim services from a dead worktree. Remote and profile-gated
   compose services stay unlabelled and are kept as unverified. Unlabelled
   containers and containers owned by another profile are listed but never
-  removed. It also removes VPN secret staging directories for sidecars it
+  removed. Compose project names include a short hash of the worktree path, so
+  similarly slugged paths do not share a project. An older project name is
+  adopted only when its Compose working directory is inside the worktree; a
+  legacy project with a working directory outside it is never adopted and
+  starts under the new name. It also removes VPN secret staging directories
+  for sidecars it
   removes, plus staging directories older than an hour whose sidecar is gone
   when at least one runtime could be listed; symlinks are never followed.
   Safe to run any time.

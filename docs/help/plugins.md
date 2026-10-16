@@ -54,6 +54,9 @@ notification center; a `PaletteAction` contribution appears as a row in the
 (the most common mistake is a stray `echo`) — `thegn plugin check` and the
 log surface them.
 
+A view over 256 rows, 4096 spans or 128 KiB of text is rejected, and the
+previous view stays in place.
+
 Resident plugin messages use a bounded queue of 1024 per plugin and 8192 total.
 Repeated `update` and `invalidate` notifications for one surface, and `state.set`
 for one key, coalesce to the latest value. At the limit, notifications are

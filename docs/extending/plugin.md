@@ -79,6 +79,12 @@ ambient OS access it would have when launched directly.
 Capability-gated plugins require `trusted_native = true` in the user's
 `[[plugins]]` entry.
 
+`state.set` keys are limited to 256 bytes, values to 64 KiB and depth 32;
+each plugin can keep 256 keys and 1 MiB total state. `emit` payloads have the
+same 64 KiB and depth limits, and the newest 256 events are retained. A
+rejected call keeps the previous value, and the request receives an `invalid`
+error such as `plugin quota exceeded: <what> (<size> > <limit>)`.
+
 **Gates:** `docs/api/plugin-api-<version>.json` (a wire change without an
 `API_VERSION` bump fails `plugin_api_wire`), `plugin_host_calls_cover_catalog`
 (a host verb must exist in the capability catalog), `config_example` if you
