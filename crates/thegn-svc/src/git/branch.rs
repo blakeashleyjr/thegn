@@ -168,20 +168,37 @@ fn fast_forward_local(
     );
     let fetch_spec = format!("+refs/heads/{branch}:{scratch}");
     let update_spec = format!("{scratch}:refs/heads/{branch}");
-    let lock_args = ["fetch", "--no-tags", ".", &update_spec];
+    let lock_args = [
+        "fetch",
+        "--no-tags",
+        "--no-recurse-submodules",
+        ".",
+        &update_spec,
+    ];
 
-    let result = (|| {
-        run_w_network(loc, &[], &["fetch", remote, &fetch_spec])?;
-        let lock =
-            super::require_mutation_lock_within(std::path::Path::new(&loc.path()), &lock_args, lock_wait)?;
-        run_w_locked(loc, &[], &lock_args, &lock)?;
-        Ok(())
-    })();
+    let result = fast_forward_local_phases(loc, remote, &fetch_spec, &lock_args, lock_wait);
 
     if let Err(error) = run_w_network(loc, &[], &["update-ref", "-d", &scratch]) {
         tracing::debug!(target: "thegn::git", %error, scratch_ref = %scratch, "could not remove fast-forward scratch ref");
     }
     result.map(|()| after_ref_mutation(loc))
+}
+
+fn fast_forward_local_phases(
+    loc: &GitLoc,
+    remote: &str,
+    fetch_spec: &str,
+    lock_args: &[&str],
+    lock_wait: std::time::Duration,
+) -> Result<()> {
+    run_w_network(loc, &[], &["fetch", remote, fetch_spec])?;
+    let lock = super::require_mutation_lock_within(
+        std::path::Path::new(&loc.path()),
+        lock_args,
+        lock_wait,
+    )?;
+    run_w_locked(loc, &[], lock_args, &lock)?;
+    Ok(())
 }
 
 #[cfg(test)]
@@ -726,6 +743,7 @@ mod tests {
             &["-c", "commit.gpgsign=false", "commit", "-q", "-m", "c0"],
         );
         let clone = with_remote(&repo);
+        git_in(&clone, &["checkout", "-q", "-b", "work"]);
         let loc = GitLoc::for_worktree(&clone);
         git_in(
             &repo.dir,
@@ -831,6 +849,7 @@ mod tests {
             &["-c", "commit.gpgsign=false", "commit", "-q", "-m", "c0"],
         );
         let clone = with_remote(&repo);
+        git_in(&clone, &["checkout", "-q", "-b", "work"]);
         let loc = GitLoc::for_worktree(&clone);
         git_in(
             &repo.dir,
