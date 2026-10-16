@@ -74,7 +74,10 @@ impl Watchdog {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let key = (deadline, id);
         let notify = {
-            let mut registrations = self.registrations.lock().unwrap();
+            let mut registrations = self
+                .registrations
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
             let was_earliest = registrations
                 .first_key_value()
                 .is_none_or(|(earliest, _)| key < *earliest);
@@ -101,7 +104,11 @@ struct Registration {
 impl Drop for Registration {
     fn drop(&mut self) {
         let removed_earliest = {
-            let mut registrations = self.watchdog.registrations.lock().unwrap();
+            let mut registrations = self
+                .watchdog
+                .registrations
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
             let was_earliest = registrations
                 .first_key_value()
                 .is_some_and(|(key, _)| *key == self.key);
@@ -141,10 +148,16 @@ fn watchdog() -> Option<&'static Arc<Watchdog>> {
 }
 
 fn run_watchdog(watchdog: Arc<Watchdog>) {
-    let mut registrations = watchdog.registrations.lock().unwrap();
+    let mut registrations = watchdog
+        .registrations
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
     loop {
         let Some((&(deadline, _), _)) = registrations.first_key_value() else {
-            registrations = watchdog.changed.wait(registrations).unwrap();
+            registrations = watchdog
+                .changed
+                .wait(registrations)
+                .unwrap_or_else(|error| error.into_inner());
             continue;
         };
         let now = Instant::now();
@@ -161,7 +174,10 @@ fn run_watchdog(watchdog: Arc<Watchdog>) {
             continue;
         }
         let wait = deadline.saturating_duration_since(now);
-        let (next, _) = watchdog.changed.wait_timeout(registrations, wait).unwrap();
+        let (next, _) = watchdog
+            .changed
+            .wait_timeout(registrations, wait)
+            .unwrap_or_else(|error| error.into_inner());
         registrations = next;
     }
 }
@@ -188,7 +204,13 @@ static WATCHDOG_SPAWN_COUNT: AtomicU64 = AtomicU64::new(0);
 #[cfg(test)]
 fn registration_count() -> usize {
     watchdog()
-        .map(|watchdog| watchdog.registrations.lock().unwrap().len())
+        .map(|watchdog| {
+            watchdog
+                .registrations
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .len()
+        })
         .unwrap_or(0)
 }
 
@@ -235,7 +257,9 @@ mod tests {
 
     #[test]
     fn many_deadline_reads_share_one_watchdog_thread() {
-        let _lock = DEADLINE_TEST_LOCK.lock().unwrap();
+        let _lock = DEADLINE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
         let initial = WATCHDOG_SPAWN_COUNT.load(Ordering::SeqCst);
         for _ in 0..50 {
             with_read_deadline(Some(Duration::from_secs(30)), |flag| {
@@ -259,12 +283,16 @@ mod tests {
             worker.join().unwrap();
         }
         assert!(WATCHDOG_SPAWN_COUNT.load(Ordering::SeqCst) - initial <= 1);
+        // This process-wide registry is also used by GixGit tests in mod.rs;
+        // the zero-count assertion relies on nextest's one-process-per-test isolation.
         assert_eq!(registration_count(), 0);
     }
 
     #[test]
     fn overlapping_deadlines_raise_only_the_expired_one() {
-        let _lock = DEADLINE_TEST_LOCK.lock().unwrap();
+        let _lock = DEADLINE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
         let (long_ready_tx, long_ready_rx) = std::sync::mpsc::channel();
         let (short_expired_tx, short_expired_rx) = std::sync::mpsc::channel();
         let long = std::thread::spawn(move || {
@@ -290,12 +318,16 @@ mod tests {
         });
         assert!(short.join().unwrap());
         assert_eq!(long.join().unwrap(), (true, true));
+        // This process-wide registry is also used by GixGit tests in mod.rs;
+        // the zero-count assertion relies on nextest's one-process-per-test isolation.
         assert_eq!(registration_count(), 0);
     }
 
     #[test]
     fn read_deadline_raises_flag_for_a_blocked_read() {
-        let _lock = DEADLINE_TEST_LOCK.lock().unwrap();
+        let _lock = DEADLINE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
         let raised = with_read_deadline(Some(Duration::from_millis(30)), |flag| {
             let start = Instant::now();
             while !flag.load(Ordering::SeqCst) && start.elapsed() < Duration::from_secs(5) {
@@ -304,33 +336,64 @@ mod tests {
             flag.load(Ordering::SeqCst)
         });
         assert!(raised, "deadline must interrupt a read that never finishes");
+        // This process-wide registry is also used by GixGit tests in mod.rs;
+        // the zero-count assertion relies on nextest's one-process-per-test isolation.
         assert_eq!(registration_count(), 0);
     }
 
     #[test]
     fn read_deadline_stays_down_for_a_fast_read_or_no_budget() {
-        let _lock = DEADLINE_TEST_LOCK.lock().unwrap();
+        let _lock = DEADLINE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
         let fast = with_read_deadline(Some(Duration::from_secs(30)), |flag| {
             flag.load(Ordering::SeqCst)
         });
         assert!(!fast);
         let off = with_read_deadline(None, |flag| flag.load(Ordering::SeqCst));
         assert!(!off);
+        // This process-wide registry is also used by GixGit tests in mod.rs;
+        // the zero-count assertion relies on nextest's one-process-per-test isolation.
         assert_eq!(registration_count(), 0);
     }
 
     #[test]
     fn every_status_walk_goes_through_the_budget() {
+        fn production_slice(source: &str) -> &str {
+            let marker = "#[cfg(test)]\nmod tests";
+            let test_start = source.find(marker);
+            assert!(test_start.is_some(), "test module marker must be present");
+            let test_start = test_start.unwrap_or(source.len());
+            &source[..test_start]
+        }
+
         let mod_source = include_str!("mod.rs");
         let native_source = include_str!("native_diff.rs");
-        for source in [mod_source, native_source] {
-            let production = source.split("#[cfg(test)]").next().unwrap_or(source);
-            assert_eq!(
-                production
-                    .matches(".status(gix::progress::Discard)")
-                    .count(),
-                0
-            );
-        }
+        let budget_source = include_str!("read_budget.rs");
+
+        let mod_production = production_slice(mod_source);
+        let native_production = production_slice(native_source);
+        let budget_production = production_slice(budget_source);
+
+        assert!(mod_production.contains("budgeted_status("));
+        assert!(native_production.contains("budgeted_status("));
+        assert_eq!(
+            mod_production
+                .matches(".status(gix::progress::Discard)")
+                .count(),
+            0
+        );
+        assert_eq!(
+            native_production
+                .matches(".status(gix::progress::Discard)")
+                .count(),
+            0
+        );
+        assert_eq!(
+            budget_production
+                .matches(".status(gix::progress::Discard)")
+                .count(),
+            1
+        );
     }
 }
