@@ -93,14 +93,15 @@ impl std::error::Error for ComposeError {}
 pub struct ComposeBindRefusal {
     pub service: String,
     pub source: String,
+    pub class: String,
 }
 
 impl fmt::Display for ComposeBindRefusal {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,
-            "Compose service '{}' binds protected host path '{}' (thegn state, runtime, credentials, or control socket); remove that bind. No per-repo opt-out exists.",
-            self.service, self.source
+            "Compose service '{}' binds protected host path '{}' ({}); remove that bind. No per-repo opt-out exists.",
+            self.service, self.source, self.class
         )
     }
 }
@@ -127,45 +128,58 @@ pub fn compose_reported_isolation(
 #[derive(Debug, Clone, Default)]
 pub struct ComposeGuard {
     pub protected: Vec<PathBuf>,
+    classes: Vec<String>,
 }
 
 impl ComposeGuard {
     /// Local host paths Compose must not make reachable to a sandbox service.
     pub fn for_host(extra: &[PathBuf]) -> Self {
         let mut protected = Vec::new();
-        protected.push(crate::util::xdg_state_home().join("thegn"));
-        if let Some(runtime) = std::env::var_os("XDG_RUNTIME_DIR") {
-            protected.push(PathBuf::from(runtime).join("thegn"));
-        }
-        if let Some(home) = std::env::var_os("HOME") {
-            let home = PathBuf::from(home);
-            for path in [
-                ".ssh",
-                ".aws",
-                ".gnupg",
-                ".config/gh",
-                ".kube",
-                ".docker",
-                ".netrc",
-                ".git-credentials",
-            ] {
-                protected.push(home.join(path));
+        let mut classes = Vec::new();
+        {
+            let mut add = |path: PathBuf, class: &str| {
+                protected.push(path);
+                classes.push(class.to_owned());
+            };
+            add(crate::util::xdg_state_home().join("thegn"), "thegn state");
+            if let Some(runtime) = std::env::var_os("XDG_RUNTIME_DIR") {
+                add(PathBuf::from(runtime).join("thegn"), "thegn runtime");
             }
-            protected.push(home.join(".docker/run/docker.sock"));
+            if let Some(home) = std::env::var_os("HOME") {
+                let home = PathBuf::from(home);
+                for path in [
+                    ".ssh",
+                    ".aws",
+                    ".gnupg",
+                    ".config/gh",
+                    ".kube",
+                    ".docker",
+                    ".netrc",
+                    ".git-credentials",
+                ] {
+                    add(home.join(path), "credential");
+                }
+                add(home.join(".docker/run/docker.sock"), "engine socket");
+            }
+            for path in [
+                "/var/run/docker.sock",
+                "/run/docker.sock",
+                "/run/podman/podman.sock",
+                "/run/containerd/containerd.sock",
+            ] {
+                add(PathBuf::from(path), "engine socket");
+            }
+            if let Some(runtime) = std::env::var_os("XDG_RUNTIME_DIR") {
+                add(
+                    PathBuf::from(runtime).join("podman/podman.sock"),
+                    "engine socket",
+                );
+            }
+            for path in extra {
+                add(path.clone(), "control socket");
+            }
         }
-        for path in [
-            "/var/run/docker.sock",
-            "/run/docker.sock",
-            "/run/podman/podman.sock",
-            "/run/containerd/containerd.sock",
-        ] {
-            protected.push(PathBuf::from(path));
-        }
-        if let Some(runtime) = std::env::var_os("XDG_RUNTIME_DIR") {
-            protected.push(PathBuf::from(runtime).join("podman/podman.sock"));
-        }
-        protected.extend_from_slice(extra);
-        Self { protected }
+        Self { protected, classes }
     }
 }
 
@@ -184,6 +198,14 @@ impl std::error::Error for ConfigParseError {}
 pub fn protected_binds(
     config_json: &str,
     protected: &[PathBuf],
+) -> Result<Option<ComposeBindRefusal>, ConfigParseError> {
+    protected_binds_with_classes(config_json, protected, &[])
+}
+
+fn protected_binds_with_classes(
+    config_json: &str,
+    protected: &[PathBuf],
+    classes: &[String],
 ) -> Result<Option<ComposeBindRefusal>, ConfigParseError> {
     let root: serde_json::Value =
         serde_json::from_str(config_json).map_err(|error| ConfigParseError(error.to_string()))?;
@@ -239,7 +261,12 @@ pub fn protected_binds(
                 .and_then(|volume| volume.get("driver_opts"))
                 .and_then(|opts| opts.get("o"))
                 .and_then(serde_json::Value::as_str)
-                .is_some_and(|options| options.split(',').any(|option| option == "bind"))
+                .is_some_and(|options| {
+                    options
+                        .split(',')
+                        .map(str::trim)
+                        .any(|option| matches!(option, "bind" | "rbind"))
+                })
         {
             service_refs.push((service, device.to_owned()));
         }
@@ -274,13 +301,68 @@ pub fn protected_binds(
             .file_name()
             .and_then(|name| name.to_str())
             .is_some_and(|name| ["docker.sock", "podman.sock", "containerd.sock"].contains(&name));
-        if socket_name
-            || crate::sandbox_mounts::path_reaches_protected(Path::new(&source), protected)
-        {
-            return Ok(Some(ComposeBindRefusal { service, source }));
+        if socket_name {
+            return Ok(Some(ComposeBindRefusal {
+                service,
+                source,
+                class: "engine socket".into(),
+            }));
+        }
+        if crate::sandbox_mounts::path_reaches_protected(Path::new(&source), protected) {
+            let class = protected
+                .iter()
+                .position(|entry| {
+                    crate::sandbox_mounts::path_reaches_protected(
+                        Path::new(&source),
+                        std::slice::from_ref(entry),
+                    )
+                })
+                .and_then(|index| classes.get(index))
+                .cloned()
+                .unwrap_or_else(|| protected_path_class(protected));
+            return Ok(Some(ComposeBindRefusal {
+                service,
+                source,
+                class,
+            }));
         }
     }
     Ok(None)
+}
+
+fn protected_path_class(protected: &[PathBuf]) -> String {
+    for path in protected {
+        let name = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("");
+        if ["docker.sock", "podman.sock", "containerd.sock"].contains(&name) {
+            return "engine socket".into();
+        }
+        if [
+            ".ssh",
+            ".aws",
+            ".gnupg",
+            "gh",
+            ".kube",
+            ".docker",
+            ".netrc",
+            ".git-credentials",
+        ]
+        .contains(&name)
+        {
+            return "credential".into();
+        }
+        if path.ends_with("thegn") {
+            if let Some(runtime) = std::env::var_os("XDG_RUNTIME_DIR")
+                && path == &PathBuf::from(runtime).join("thegn")
+            {
+                return "thegn runtime".into();
+            }
+            return "thegn state".into();
+        }
+    }
+    "control socket".into()
 }
 
 fn short_mount_source(short: &str) -> Option<String> {
@@ -428,6 +510,8 @@ pub(crate) fn config_json_argv(
 ) -> Vec<String> {
     let mut argv = project_prefix(target, project, c);
     argv.extend(["config".into(), "--format".into(), "json".into()]);
+    argv.extend(c.service.iter().cloned());
+    argv.extend(c.run_services.iter().cloned());
     argv
 }
 
@@ -640,8 +724,8 @@ pub(crate) fn run_up_checked(
     Ok(())
 }
 
-/// Inspect effective config before starting it. Inspection failures deliberately
-/// permit launch but are returned as a weaker attestation report.
+/// Inspect effective config before starting it. Tool availability failures permit
+/// launch with a weaker attestation report; malformed successful output refuses.
 fn up_attested(
     config: &[String],
     up: &[String],
@@ -665,12 +749,22 @@ fn up_attested(
     };
     let verified = match status {
         Some((true, _)) => match inspection.into_stdout() {
-            Some((true, output)) => match protected_binds(&output, &guard.protected) {
-                Ok(Some(refusal)) => return Err(anyhow::Error::new(refusal)),
-                Ok(None) => None,
-                Err(error) => Some(error.to_string()),
-            },
-            Some((false, _)) | None => Some("Compose config output exceeded its size limit".into()),
+            Some((true, output)) => {
+                match protected_binds_with_classes(&output, &guard.protected, &guard.classes) {
+                    Ok(Some(refusal)) => return Err(anyhow::Error::new(refusal)),
+                    Ok(None) => None,
+                    Err(error) => {
+                        return Err(anyhow::anyhow!(
+                            "effective Compose config could not be verified: {error}"
+                        ));
+                    }
+                }
+            }
+            Some((false, _)) | None => {
+                return Err(anyhow::anyhow!(
+                    "effective Compose config could not be verified: output exceeded its size limit"
+                ));
+            }
         },
         Some((false, code)) => Some(format!("Compose config exited with status {code:?}")),
         None => match inspection {
@@ -922,6 +1016,8 @@ mod tests {
         };
         let compose = ComposeSpec {
             files: vec!["base.yml".into(), "labels.json".into()],
+            service: Some("web".into()),
+            run_services: vec!["db".into()],
             ..Default::default()
         };
         assert_eq!(
@@ -937,7 +1033,9 @@ mod tests {
                 "proj",
                 "config",
                 "--format",
-                "json"
+                "json",
+                "web",
+                "db"
             ]
         );
     }
@@ -1295,6 +1393,14 @@ mod tests {
             "volumes":{"hostdata":{"driver":"local","driver_opts":{"type":"none","o":"bind","device":state.to_string_lossy().into_owned()}}}
         }).to_string();
         assert!(check(volume).is_some(), "driver_opts bind must be refused");
+        let rbind_volume = serde_json::json!({
+            "services":{"worker":{"volumes":[{"type":"volume","source":"hostdata","target":"/x"}]}},
+            "volumes":{"hostdata":{"driver":"local","driver_opts":{"type":"none","o":"  rbind , rw ","device":state.to_string_lossy().into_owned()}}}
+        }).to_string();
+        assert!(
+            check(rbind_volume).is_some(),
+            "driver_opts rbind must be refused"
+        );
         for section in ["secrets", "configs"] {
             let mut config = serde_json::json!({"services":{"worker":{}}});
             config[section] =
@@ -1385,6 +1491,7 @@ mod tests {
         let ps = shell("printf 'container-id\\n'");
         let guard = ComposeGuard {
             protected: vec![PathBuf::from("/protected/state")],
+            classes: vec!["thegn state".into()],
         };
         let result = up_attested(
             &shell(&config_script),
@@ -1397,12 +1504,11 @@ mod tests {
                 Duration::from_secs(2),
             ),
         );
-        assert!(
-            result
-                .unwrap_err()
-                .downcast_ref::<ComposeBindRefusal>()
-                .is_some()
-        );
+        let refusal = result.unwrap_err();
+        let refusal = refusal
+            .downcast_ref::<ComposeBindRefusal>()
+            .expect("protected bind refusal type");
+        assert!(refusal.to_string().contains("thegn state"));
         assert!(!marker.exists(), "up must not run after refusal");
         let failed = up_attested(
             &shell("exit 1"),
@@ -1434,6 +1540,43 @@ mod tests {
         .unwrap();
         assert!(timed.compose_unverified.is_some());
         assert!(started.elapsed() < Duration::from_secs(3));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn successful_but_unverifiable_config_refuses_before_up() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let root = tempfile::tempdir().expect("private tempdir");
+        std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let marker = root.path().join("up-ran");
+        let up_script = format!("touch '{}'", marker.display());
+        let ps = shell("printf 'container-id\\n'");
+        let guard = ComposeGuard {
+            protected: Vec::new(),
+            ..Default::default()
+        };
+        for (config_script, expected) in [
+            ("printf 'not-json'".to_owned(), "could not be verified"),
+            ("head -c 1048577 /dev/zero".to_owned(), "size limit"),
+        ] {
+            let error = up_attested(
+                &shell(&config_script),
+                &shell(&up_script),
+                &ps,
+                &guard,
+                (
+                    Duration::from_secs(2),
+                    Duration::from_secs(2),
+                    Duration::from_secs(2),
+                ),
+            )
+            .expect_err("successful config output that cannot be checked must refuse");
+            assert!(error.to_string().contains(expected), "{error:#}");
+            assert!(
+                !marker.exists(),
+                "up must not run after verification failure"
+            );
+        }
     }
 
     #[test]

@@ -845,6 +845,9 @@ pub fn prepare_sandbox_env(
                         if explicit_choice {
                             anyhow::bail!("{message} for {worktree}");
                         }
+                        thegn_core::msg::warn(&format!(
+                            "{message} for {worktree}; trying next backend"
+                        ));
                         compose_miss = Some(message);
                         continue;
                     }
