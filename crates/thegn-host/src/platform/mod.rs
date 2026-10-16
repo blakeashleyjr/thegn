@@ -311,6 +311,8 @@ pub(crate) fn write_state_file(path: &std::path::Path, value: &str) {
     let Some(parent) = path.parent() else {
         return;
     };
+    #[cfg(test)]
+    crate::testenv::refuse_real_state_write(path, "state file");
     if std::fs::create_dir_all(parent).is_err() {
         return;
     }

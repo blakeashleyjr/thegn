@@ -1,12 +1,29 @@
 //! Durable lifecycle notes for PTY crash diagnosis. These records are never
 //! loaded as signal targets; a stale pid is diagnostic data only.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
-fn path(daemon: &str, session: &str) -> PathBuf {
-    thegn_core::util::xdg_state_home()
-        .join("thegn/pty-shutdown")
+fn path_in(root: &Path, daemon: &str, session: &str) -> PathBuf {
+    root.join("thegn/pty-shutdown")
         .join(format!("{daemon}-{session}.json"))
+}
+
+#[cfg(not(test))]
+fn state_root() -> PathBuf {
+    thegn_core::util::xdg_state_home()
+}
+
+#[cfg(test)]
+fn state_root() -> PathBuf {
+    static ROOT: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+    ROOT.get_or_init(|| {
+        tempfile::Builder::new()
+            .prefix("thegn-test-pty-diag-")
+            .tempdir()
+            .expect("create private PTY diagnostics test root")
+            .keep()
+    })
+    .clone()
 }
 
 pub(crate) fn record(
@@ -27,7 +44,105 @@ pub(crate) fn record(
         "updated_at_ms": super::now_ms(),
     });
     crate::platform::write_state_file(
-        &path(daemon, session),
+        &path_in(&state_root(), daemon, session),
         &serde_json::to_string(&value).unwrap_or_default(),
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{path_in, record, state_root};
+    use std::path::Path;
+
+    fn panic_message(payload: &(dyn std::any::Any + Send)) -> Option<&str> {
+        payload
+            .downcast_ref::<String>()
+            .map(String::as_str)
+            .or_else(|| payload.downcast_ref::<&str>().copied())
+    }
+
+    fn isolated_state_env(root: &Path) -> crate::testenv::EnvVarGuard {
+        crate::testenv::EnvVarGuard::set(&[
+            ("HOME", root.to_str().expect("home path")),
+            (
+                "XDG_STATE_HOME",
+                root.join(".local/state").to_str().expect("state path"),
+            ),
+        ])
+    }
+
+    #[test]
+    fn record_never_writes_the_callers_xdg_state() {
+        let caller_state = tempfile::tempdir().expect("caller state");
+        let _env = crate::testenv::EnvVarGuard::set(&[(
+            "XDG_STATE_HOME",
+            caller_state.path().to_str().expect("caller state path"),
+        )]);
+
+        record("d0-guard", "s1", None, "teardown_complete", Some("x"));
+
+        assert!(!caller_state.path().join("thegn/pty-shutdown").exists());
+        let record_path = path_in(&state_root(), "d0-guard", "s1");
+        let contents = std::fs::read_to_string(record_path).expect("private record");
+        assert!(contents.contains("teardown_complete"));
+    }
+
+    #[test]
+    fn path_in_layout() {
+        assert_eq!(
+            path_in(Path::new("/r"), "d", "s"),
+            Path::new("/r/thegn/pty-shutdown/d-s.json")
+        );
+    }
+
+    #[test]
+    fn write_state_file_refuses_the_real_state_root() {
+        let root = tempfile::tempdir().expect("state root");
+        let _env = isolated_state_env(root.path());
+        let refused_path = root.path().join(".local/state/thegn/probe/x");
+        let refused = std::panic::catch_unwind(|| {
+            crate::platform::write_state_file(&refused_path, "v");
+        });
+        let message = refused
+            .as_ref()
+            .err()
+            .and_then(|payload| panic_message(payload.as_ref()))
+            .expect("guard panic");
+        assert!(message.contains("THE-744"), "{message}");
+        assert!(message.contains("state file"), "{message}");
+        assert!(
+            message.contains(&refused_path.display().to_string()),
+            "{message}"
+        );
+        assert!(!root.path().join(".local/state/thegn/probe").exists());
+
+        let elsewhere = root.path().join("elsewhere/x");
+        crate::platform::write_state_file(&elsewhere, "v");
+        assert_eq!(
+            std::fs::read_to_string(elsewhere).expect("written file"),
+            "v"
+        );
+    }
+
+    #[test]
+    fn task_output_dir_refuses_the_real_state_root() {
+        let root = tempfile::tempdir().expect("state root");
+        let _env = isolated_state_env(root.path());
+        let refused = std::panic::catch_unwind(crate::handlers::task_output::task_output_dir);
+        assert!(
+            matches!(refused, Err(payload) if panic_message(payload.as_ref()).is_some_and(|message| message.contains("THE-744")))
+        );
+        assert!(!root.path().join(".local/state/thegn/task-output").exists());
+    }
+
+    #[test]
+    fn write_handoff_refuses_the_real_state_root() {
+        let root = tempfile::tempdir().expect("state root");
+        let _env = isolated_state_env(root.path());
+        let refused = std::panic::catch_unwind(|| crate::daemon::fork::write_handoff("c", "t"));
+        assert!(
+            matches!(refused, Err(payload) if panic_message(payload.as_ref()).is_some_and(|message| message.contains("THE-744")))
+        );
+        assert!(!root.path().join(".local/state/thegn/forks").exists());
+    }
 }
