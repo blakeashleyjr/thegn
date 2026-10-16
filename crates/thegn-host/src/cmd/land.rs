@@ -69,6 +69,8 @@ pub(crate) fn land_branch(
     // `thegn land` lands the branch checked out in `worktree`; its loc tells
     // attempt_land whether that worktree is on this host (no ingest) or remote.
     let branch_loc = thegn_core::remote::GitLoc::for_worktree(worktree);
+    let guard = crate::platform::InterruptGuard::install();
+    let _scope = crate::fold_cancel::scope(move || guard.fired());
     let outcome = integrate::attempt_land(&mq, &root, &branch, &branch_loc)?;
     Ok((branch, target, outcome))
 }

@@ -810,8 +810,8 @@ fn sandbox_profile_defaults_and_env_overlay() {
 fn merge_gate_deadlines_default_and_accept_config_and_env_overlays() {
     let defaults = MergeQueueConfig::default();
     assert_eq!(
-        defaults.gate_setup_timeout_secs, 0,
-        "zero disables setup deadline"
+        defaults.gate_setup_timeout_secs, 1800,
+        "setup has a finite 30 minute deadline by default"
     );
     assert_eq!(defaults.gate_timeout_secs, 3600, "one hour gate deadline");
 

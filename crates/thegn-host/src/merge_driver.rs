@@ -387,7 +387,15 @@ fn drive_queue_with(
     let use_agent = wants_agent && agent_cmd.is_some();
     let target = integrate::resolve_target(cfg, repo_root);
 
-    'items: for item in items {
+    let total_items = items.len();
+    'items: for (index, item) in items.into_iter().enumerate() {
+        if crate::fold_cancel::requested() {
+            let untouched = total_items - index;
+            out.warnings.push(format!(
+                "merge drain cancelled; {untouched} queued row(s) left untouched"
+            ));
+            break 'items;
+        }
         let write_error = std::cell::RefCell::new(None::<String>);
         let set = |db: &Db, status: MqStatus, oid: Option<&str>, detail: Option<&str>| {
             let fields = MergeStatusFields {
@@ -1426,6 +1434,36 @@ mod tests {
                 location: String::new(),
                 agent_attempts: 0,
             }
+        }
+
+        #[test]
+        fn cancelled_drain_leaves_rows_queued() {
+            let (_fixture, root, feat_wt) = clean_repo("cancelled-drain");
+            let db = Db::open_memory().unwrap();
+            let first = item(&db, &feat_wt);
+            db.enqueue_merge("/queued/second", "second", "main")
+                .unwrap();
+            let second = QueueItem {
+                worktree: "/queued/second".into(),
+                branch: "second".into(),
+                location: String::new(),
+                agent_attempts: 0,
+            };
+            let _scope = crate::fold_cancel::scope(|| true);
+            let outcome = drive_queue(
+                &cfg("", 1),
+                &Config::default(),
+                &root,
+                &db,
+                vec![first, second],
+                |_| {},
+            );
+            let rows = db.list_merge_queue().unwrap();
+            assert_eq!(rows.len(), 2);
+            assert!(rows.iter().all(|row| row.status == "queued"));
+            assert_eq!(outcome.warnings.len(), 1);
+            assert!(outcome.warnings[0].contains("2 queued row(s) left untouched"));
+            assert!(outcome.landed.is_empty());
         }
 
         #[test]
