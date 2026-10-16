@@ -294,6 +294,7 @@ impl LspInner {
 
     /// Get the warm client for `(root, key)`, lazily spawning+initializing it on
     /// first use. **Blocks** (spawn + initialize) — call off the event loop.
+    #[cfg(test)]
     pub fn client(&self, root: &Path, key: &str) -> Result<AdmittedClient, LspError> {
         self.client_with_cancel(root, key, None)
     }
