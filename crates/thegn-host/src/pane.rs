@@ -2680,6 +2680,7 @@ mod tests {
             "a SIGHUP-ignoring child must not outlive its pane (pid {pid} still alive)"
         );
     }
+
     #[test]
     fn reconnect_backoff_grows_and_caps() {
         // Exponential in `dead`, from the 250ms base, capped at 5s.
