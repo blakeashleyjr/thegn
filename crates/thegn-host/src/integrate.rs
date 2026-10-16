@@ -6041,4 +6041,164 @@ mod tests {
             ]
         );
     }
+
+    #[test]
+    fn driver_refusal_survives_a_red_gate() {
+        let repo = Repo::new("driver-refusal-red-gate");
+        if !repo.history_supported_or_refused() {
+            return;
+        }
+        let counter = repo.dir.join("driver-count");
+        let driver = format!(
+            "printf x >> {}; printf driver > %A",
+            thegn_core::util::sh_quote(&counter.to_string_lossy())
+        );
+        repo.commit(".gitattributes", "data.txt merge=takeours\n", "attrs");
+        repo.commit("data.txt", "one\ntwo\nthree\n", "seed");
+        git(&repo.dir, &["checkout", "-q", "-b", "feat"]);
+        repo.commit("data.txt", "ONE\ntwo\nthree\n", "feature edit");
+        git(&repo.dir, &["checkout", "-q", "main"]);
+        repo.commit("data.txt", "one\ntwo\nTHREE\n", "main edit");
+        git(&repo.dir, &["config", "merge.takeours.driver", &driver]);
+        repo.feature("clean", "c.txt", "c\n");
+        let original = repo.out(&["rev-parse", "main"]);
+        let mut config = cfg("exit 1");
+        config.bisect_on_red = false;
+        if !repo.gate_supported_or_refused(&cfg("true")) {
+            return;
+        }
+
+        let report = run_fold(&config, &repo.dir, repo.branch_set()).unwrap();
+
+        assert!(
+            !report.advanced,
+            "red gate must keep main unchanged: {report:?}"
+        );
+        assert!(
+            matches!(&report.gate, GateOutcome::Failed { .. }),
+            "{report:?}"
+        );
+        assert_eq!(repo.out(&["rev-parse", "main"]), original);
+        let feat = report
+            .deferred
+            .iter()
+            .find(|entry| entry.branch == "feat")
+            .expect("refused feature branch must be deferred");
+        assert!(
+            feat.driver_refusal.as_deref().is_some_and(|reason| {
+                reason.contains("data.txt") && reason.contains("takeours")
+            })
+        );
+        assert!(!counter.exists(), "refused custom driver ran");
+    }
+
+    #[test]
+    fn driver_refusal_survives_a_cas_error() {
+        let repo = Repo::new("driver-refusal-cas-error");
+        if !repo.history_supported_or_refused() {
+            return;
+        }
+        let counter = repo.dir.join("driver-count");
+        let driver = format!(
+            "printf x >> {}; printf driver > %A",
+            thegn_core::util::sh_quote(&counter.to_string_lossy())
+        );
+        repo.commit(".gitattributes", "data.txt merge=takeours\n", "attrs");
+        repo.commit("data.txt", "one\ntwo\nthree\n", "seed");
+        git(&repo.dir, &["checkout", "-q", "-b", "feat"]);
+        repo.commit("data.txt", "ONE\ntwo\nthree\n", "feature edit");
+        git(&repo.dir, &["checkout", "-q", "main"]);
+        repo.commit("data.txt", "one\ntwo\nTHREE\n", "main edit");
+        git(&repo.dir, &["config", "merge.takeours.driver", &driver]);
+        repo.feature("clean", "c.txt", "c\n");
+        let original = repo.out(&["rev-parse", "main"]);
+        let config = cfg("");
+        let report = run_fold_with_cas(&config, &repo.dir, repo.branch_set(), |_, _, _, _, _| {
+            Err(anyhow::anyhow!("cas boom"))
+        })
+        .unwrap();
+
+        assert!(matches!(
+            &report.gate,
+            GateOutcome::Errored {
+                class: Some(GateErrorClass::Preparation),
+                ..
+            }
+        ));
+        assert!(
+            !report.advanced,
+            "CAS error must not advance main: {report:?}"
+        );
+        assert_eq!(repo.out(&["rev-parse", "main"]), original);
+        let feat = report
+            .deferred
+            .iter()
+            .find(|entry| entry.branch == "feat")
+            .expect("refused feature branch must be deferred");
+        assert!(
+            feat.driver_refusal.as_deref().is_some_and(|reason| {
+                reason.contains("data.txt") && reason.contains("takeours")
+            })
+        );
+        assert!(!counter.exists(), "refused custom driver ran");
+    }
+
+    #[test]
+    fn cancellation_during_driver_merge_leaves_no_merge_state() {
+        if thegn_core::sandbox_backend::host_os() == thegn_core::sandbox_backend::HostOs::Windows {
+            return;
+        }
+        let repo = Repo::new("driver-cancel-cleanup");
+        repo.commit(".gitattributes", "data.txt merge=slow\n", "attrs");
+        repo.commit("data.txt", "base\n", "seed");
+        git(&repo.dir, &["checkout", "-q", "-b", "feat"]);
+        repo.commit("data.txt", "feat\n", "feature edit");
+        git(&repo.dir, &["checkout", "-q", "main"]);
+        repo.commit("data.txt", "main\n", "main edit");
+        let ours = repo.out(&["rev-parse", "main"]);
+        let theirs = repo.out(&["rev-parse", "feat"]);
+        let MergeTreeOutcome::Conflict { tree, paths } = CliGit
+            .merge_tree(&GitLoc::Local(repo.dir.clone()), &ours, &theirs)
+            .unwrap()
+        else {
+            panic!("fixture must produce a merge-tree conflict");
+        };
+        let marker = repo.dir.join("driver-started");
+        let driver = format!(
+            "printf x >> {}; sleep 30; true %O %A %B %L %P",
+            thegn_core::util::sh_quote(&marker.to_string_lossy())
+        );
+        git(&repo.dir, &["config", "merge.slow.driver", &driver]);
+        let marker_path = marker.clone();
+        let _scope = crate::fold_cancel::scope(move || {
+            std::fs::metadata(&marker_path).is_ok_and(|metadata| metadata.len() > 0)
+        });
+        let started = Instant::now();
+
+        let result = driver_merge(
+            &repo.dir,
+            &ours,
+            &theirs,
+            &tree,
+            &paths,
+            DriverMergeOpts {
+                rerere: false,
+                timeout: Duration::from_secs(600),
+                overrides: None,
+            },
+        );
+
+        assert!(result.is_none(), "cancelled driver merge must defer");
+        assert!(started.elapsed() < Duration::from_secs(10));
+        assert_eq!(std::fs::metadata(&marker).unwrap().len(), 1);
+        assert!(
+            !repo
+                .out(&["worktree", "list", "--porcelain"])
+                .contains("tg-drivermerge-")
+        );
+        assert!(
+            repo.out(&["rev-parse", "-q", "--verify", "MERGE_HEAD"])
+                .is_empty()
+        );
+    }
 }
