@@ -1367,7 +1367,11 @@ fn land_ready(cfg: &thegn_core::config::Config, wt: &str) -> DriveMsg {
                 .map(|reason| format!("{reason}\n{detail}"))
                 .unwrap_or_else(|| detail.clone());
             let write = record(
-                MqStatus::Deferred,
+                if driver_refusal.is_some() {
+                    MqStatus::NeedsHuman
+                } else {
+                    MqStatus::Deferred
+                },
                 None,
                 Some(&detail),
                 driver_refusal.as_deref(),
