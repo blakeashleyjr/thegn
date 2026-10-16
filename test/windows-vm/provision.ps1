@@ -47,6 +47,13 @@ New-Item -ItemType Directory -Force -Path 'C:\ProgramData\ssh' | Out-Null
 Copy-Item -Force $keySrc $keyDst
 icacls.exe $keyDst /inheritance:r /grant 'Administrators:F' /grant 'SYSTEM:F' | Out-Null
 Set-Service -Name sshd -StartupType Automatic
+# Keep the inbound rule disabled while the service starts with its generated
+# config. This is also safe when rerunning provisioning on an existing guest.
+if (-not (Get-NetFirewallRule -Name 'OpenSSH-Server-In-TCP' -ErrorAction SilentlyContinue)) {
+  New-NetFirewallRule -Name 'OpenSSH-Server-In-TCP' -DisplayName 'OpenSSH Server (sshd)' -Enabled False -Direction Inbound -Protocol TCP -Action Allow -LocalPort 22 | Out-Null
+} else {
+  Set-NetFirewallRule -Name 'OpenSSH-Server-In-TCP' -Enabled False
+}
 Start-Service sshd # first start generates host keys and the default sshd_config
 # Key-only. quickemu forwards the guest's port 22 on every host interface, and
 # the unattended install's admin password is the well-known `quickemu`, so a
@@ -55,9 +62,7 @@ $cfg = 'C:\ProgramData\ssh\sshd_config'
 $lines = Get-Content $cfg | Where-Object { $_ -notmatch '^\s*#?\s*(PasswordAuthentication|KbdInteractiveAuthentication)\b' }
 Set-Content -Path $cfg -Value (@('PasswordAuthentication no', 'KbdInteractiveAuthentication no') + $lines)
 Restart-Service sshd
-if (-not (Get-NetFirewallRule -Name 'OpenSSH-Server-In-TCP' -ErrorAction SilentlyContinue)) {
-  New-NetFirewallRule -Name 'OpenSSH-Server-In-TCP' -DisplayName 'OpenSSH Server (sshd)' -Enabled True -Direction Inbound -Protocol TCP -Action Allow -LocalPort 22 | Out-Null
-}
+Set-NetFirewallRule -Name 'OpenSSH-Server-In-TCP' -Enabled True
 
 # --- 2. Visual Studio Build Tools (MSVC) ---------------------------------------
 $vsArgs = '--quiet --wait --norestart --nocache --add Microsoft.VisualStudio.Workload.VCTools --includeRecommended'

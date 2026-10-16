@@ -64,7 +64,7 @@ repo=$(git rev-parse --show-toplevel)
 cd "$repo"
 
 ssh_bin=${THEGN_REMOTE_SSH:-ssh}
-tmp=$(mktemp -d "${TMPDIR:-/tmp}/thegn-remote.XXXXXX")
+tmp=$(mktemp -d /tmp/tgr.XXXXXX)
 
 # One authenticated connection for every step (sync, run, cleanup): a
 # hardware-key or password login would otherwise prompt four times. The socket
@@ -130,6 +130,21 @@ case "$remote_dir" in
   exit 2
   ;;
 esac
+case "$remote_dir" in
+/* | [A-Za-z]:*)
+  echo "test-remote: THEGN_REMOTE_DIR must be relative to the remote login directory, got '$remote_dir'" >&2
+  exit 2
+  ;;
+esac
+IFS=/ read -r -a remote_dir_parts <<<"$remote_dir"
+for part in "${remote_dir_parts[@]}"; do
+  case "$part" in
+  . | ..)
+    echo "test-remote: THEGN_REMOTE_DIR must not contain '.' or '..' path segments, got '$remote_dir'" >&2
+    exit 2
+    ;;
+  esac
+done
 
 # --- 1. pack ----------------------------------------------------------------
 # `ls-files --cached` still lists a tracked file deleted in the working tree;

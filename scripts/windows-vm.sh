@@ -206,6 +206,14 @@ cmd_test() {
 }
 
 cmd_destroy() {
+  if [ -d "$state" ]; then
+    local state_real home_real
+    state_real=$(realpath -m -- "$state")
+    home_real=$(realpath -m -- "$HOME")
+    [ "$state_real" != / ] || die "refusing to destroy filesystem root"
+    [ "$state_real" != "$home_real" ] || die "refusing to destroy your home directory"
+    [ -f "$conf" ] || die "refusing to destroy $state: no VM state marker ($conf)"
+  fi
   cmd_down
   [ -d "$state" ] || return 0
   echo "windows-vm: deleting $state ($(du -sh "$state" | cut -f1))" >&2
