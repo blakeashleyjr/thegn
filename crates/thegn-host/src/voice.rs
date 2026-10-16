@@ -470,11 +470,12 @@ fn spawn_capture(
             let stdout = child.stdout.take().expect("capture stdout was piped");
             let stderr = child.stderr.take().expect("capture stderr was piped");
             let (output_tx, output_rx) = mpsc::channel();
-            let output_thread = thread::spawn(move || {
-                let _ = output_tx.send(read_capped(stdout, MAX_CAPTURE_BYTES));
-            });
+            let output_thread =
+                thegn_core::thread_name::spawn_named("thegn-voice-out", move || {
+                    let _ = output_tx.send(read_capped(stdout, MAX_CAPTURE_BYTES));
+                });
             let (error_tx, error_rx) = mpsc::channel();
-            let error_thread = thread::spawn(move || {
+            let error_thread = thegn_core::thread_name::spawn_named("thegn-voice-err", move || {
                 let _ = error_tx.send(read_capped(stderr, MAX_CAPTURE_BYTES));
             });
             let mut requested_stop = false;

@@ -139,18 +139,24 @@ fn pull_streaming(argv: &[String], timeout: Duration) -> bool {
     let mut readers = Vec::new();
     if let Some(out) = child.stdout.take() {
         let tx = tx.clone();
-        readers.push(std::thread::spawn(move || {
-            for line in BufReader::new(out).lines().map_while(Result::ok) {
-                let _ = tx.send(line); // best-effort: send to the main thread, which may have hit its deadline and stopped draining
-            }
-        }));
+        readers.push(crate::thread_name::spawn_named(
+            "thegn-pull-out",
+            move || {
+                for line in BufReader::new(out).lines().map_while(Result::ok) {
+                    let _ = tx.send(line); // best-effort: send to the main thread, which may have hit its deadline and stopped draining
+                }
+            },
+        ));
     }
     if let Some(err) = child.stderr.take() {
-        readers.push(std::thread::spawn(move || {
-            for line in BufReader::new(err).lines().map_while(Result::ok) {
-                let _ = tx.send(line); // best-effort: send to the main thread, which may have hit its deadline and stopped draining
-            }
-        }));
+        readers.push(crate::thread_name::spawn_named(
+            "thegn-pull-err",
+            move || {
+                for line in BufReader::new(err).lines().map_while(Result::ok) {
+                    let _ = tx.send(line); // best-effort: send to the main thread, which may have hit its deadline and stopped draining
+                }
+            },
+        ));
     }
     let deadline = Instant::now() + timeout;
     let mut parser = PullParser::new();

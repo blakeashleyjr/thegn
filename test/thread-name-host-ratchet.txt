@@ -1,0 +1,17 @@
+# Files in crates/thegn-host/src that still contain a bare production thread
+# spawn and need a naming plus QoS decision (THE-80). Shrink-only: each entry
+# is debt; name it and declare its scheduler class, then delete the line.
+# `spawn_named` counts as a named thread for the thread-QoS ratchet.
+# SHRINK-ONLY. Enforced by `threads_are_named_ratchet` in
+# crates/thegn-host/src/platform_ratchet_tests.rs.
+# proc_workload_alloc.rs is compiled only through main.rs's cfg(test) module.
+cmd/attach.rs
+env_ui.rs
+env_wizard.rs
+handlers/provision.rs
+hibernator.rs
+hook_run.rs
+lifecycle.rs
+placement_flow.rs
+secret.rs
+structural_diff.rs

@@ -2534,7 +2534,7 @@ pub fn run_prepare(worktree: &std::path::Path, cmds: &[String]) {
         return;
     }
     let wt = worktree.to_path_buf();
-    std::thread::spawn(move || {
+    crate::thread_name::spawn_named("thegn-sbx-hooks", move || {
         for c in &cmds {
             // `detached`: null stdio + own group so a hook can't steal the tty.
             // best-effort: prepare hook: advisory; a failing hook doesn't block the launch
