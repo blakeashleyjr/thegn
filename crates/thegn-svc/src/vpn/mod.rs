@@ -1111,7 +1111,7 @@ fn spawn_bounded_reader<R: Read + Send + 'static>(
     cap: usize,
 ) -> Receiver<ReaderOutcome> {
     let (sender, receiver) = mpsc::sync_channel(1);
-    thread::spawn(move || {
+    thegn_core::thread_name::spawn_named("thegn-vpn-read", move || {
         let mut bytes = Vec::with_capacity(cap.min(4096));
         let mut truncated = false;
         let mut buffer = [0_u8; 8192];

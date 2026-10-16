@@ -1,5 +1,5 @@
 # Files in crates/thegn-host/src that spawn a named long-lived thread
-# (`thread::Builder::new()`) without declaring its scheduler class
+# (`thread::Builder::new()` or `spawn_named(`) without declaring its scheduler class
 # (`crate::platform::qos::set_self(...)`).
 #
 # A thread that says nothing runs at the default (interactive) class. On Apple

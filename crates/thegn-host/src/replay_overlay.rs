@@ -733,7 +733,7 @@ impl PlaybackClock {
             Condvar::new(),
         ));
         let t = inner.clone();
-        std::thread::spawn(move || {
+        thegn_core::thread_name::spawn_named("thegn-replay", move || {
             let (lock, cv) = &*t;
             loop {
                 let dt = {

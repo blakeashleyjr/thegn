@@ -47,3 +47,18 @@ fn state_env_ratchet_tracks_direct_test_environment_writes() {
          testenv::IsolatedState and state_env_for so isolation works on every OS.",
     );
 }
+
+#[test]
+fn threads_are_named_ratchet() {
+    file_ratchet(
+        env!("CARGO_MANIFEST_DIR"),
+        "thread-name-svc-ratchet.txt",
+        &[],
+        |key, body| {
+            !thegn_core::test_support::thread_spawn::is_test_module_file(key)
+                && thegn_core::test_support::thread_spawn::spawns_unnamed_thread(body)
+        },
+        "Name production threads with `thegn_core::thread_name::spawn_named` so \
+         their task comm identifies their role. Keep the allowlist empty.",
+    );
+}

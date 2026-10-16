@@ -404,7 +404,8 @@ fn run_capped_argv(
         let done = done.clone();
         let timed_out = timed_out.clone();
         let group = group.clone();
-        std::thread::spawn(move || {
+        thegn_core::thread_name::spawn_named("thegn-task-wdog", move || {
+            crate::platform::qos::set_self(crate::platform::qos::Qos::Background);
             let end = Instant::now() + deadline;
             while Instant::now() < end {
                 if done.load(Ordering::Relaxed) {
@@ -546,7 +547,8 @@ fn spawn_output_reader(
     stdout: bool,
     label: &'static str,
 ) -> std::thread::JoinHandle<()> {
-    std::thread::spawn(move || {
+    thegn_core::thread_name::spawn_named("thegn-task-pipe", move || {
+        crate::platform::qos::set_self(crate::platform::qos::Qos::Utility);
         let Some(mut stream) = stream else { return };
         let mut bytes = [0_u8; 8 * 1024];
         loop {

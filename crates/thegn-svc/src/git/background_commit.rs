@@ -220,7 +220,7 @@ pub(crate) fn run_with_timeout(
     let mut input = child.stdin.take().expect("piped stdin");
     let bytes = stdin.to_vec();
     let (input_tx, input_rx) = std::sync::mpsc::sync_channel(1);
-    let input_h = std::thread::spawn(move || {
+    let input_h = thegn_core::thread_name::spawn_named("thegn-commit-in", move || {
         let result = input.write_all(&bytes);
         drop(input); // EOF tells `-F -` that the commit message is complete.
         // A closed receiver means the deadline path already owns cleanup.
@@ -374,12 +374,15 @@ fn spawn_capture_reader(
     name: &'static str,
 ) -> std::sync::mpsc::Receiver<(Vec<u8>, bool)> {
     let (sender, receiver) = std::sync::mpsc::channel();
-    drop(std::thread::spawn(move || {
-        let capture = read_capped(reader, MAX_STREAM_CAPTURE_BYTES);
-        if let Err(error) = sender.send(capture) {
-            tracing::debug!(target: "thegn::git", worker = name, %error, "background git output receiver was dropped");
-        }
-    }));
+    drop(thegn_core::thread_name::spawn_named(
+        "thegn-commit-rd",
+        move || {
+            let capture = read_capped(reader, MAX_STREAM_CAPTURE_BYTES);
+            if let Err(error) = sender.send(capture) {
+                tracing::debug!(target: "thegn::git", worker = name, %error, "background git output receiver was dropped");
+            }
+        },
+    ));
     receiver
 }
 
