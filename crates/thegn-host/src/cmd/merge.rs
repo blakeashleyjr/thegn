@@ -953,6 +953,8 @@ fn land(cfg: &Config, worktree: Option<String>) -> Result<()> {
         // Guard refusal: bail so the exit code is non-zero for scripting/CI.
         anyhow::bail!("{msg}");
     }
+    let guard = crate::platform::InterruptGuard::install();
+    let _scope = crate::fold_cancel::scope(move || guard.fired());
     // Share the fold/gate/CAS core with `thegn land`; this queue-aware path
     // additionally records the outcome on the worktree's merge-queue row.
     let (branch, target, outcome) = super::land::land_branch(cfg, &wt)?;

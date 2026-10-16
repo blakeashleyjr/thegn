@@ -557,6 +557,23 @@ fn drive_queue_with(
                     phase,
                     class,
                 } => {
+                    if class == integrate::GateErrorClass::Cancelled {
+                        let untouched = total_items - index;
+                        let detail = "integration cancelled; row left queued";
+                        let fields = set(db, MqStatus::Queued, None, Some(detail));
+                        stop_on_write_error!();
+                        progress(&DriveStep {
+                            fields: &fields,
+                            worktree: &item.worktree,
+                            branch: &item.branch,
+                            status: MqStatus::Queued.as_str(),
+                            detail,
+                        });
+                        out.warnings.push(format!(
+                            "merge drain cancelled; {untouched} queued row(s) left untouched"
+                        ));
+                        break 'items;
+                    }
                     // The gate could not RUN. This is a fact about the
                     // environment, not a verdict about the branch, so it must
                     // NOT become a `Failure`: handing it to the fixing agent
@@ -1464,6 +1481,45 @@ mod tests {
             assert_eq!(outcome.warnings.len(), 1);
             assert!(outcome.warnings[0].contains("2 queued row(s) left untouched"));
             assert!(outcome.landed.is_empty());
+        }
+
+        #[test]
+        fn cancelled_drain_during_gate_keeps_in_flight_row_queued() {
+            if thegn_core::sandbox_backend::host_os()
+                == thegn_core::sandbox_backend::HostOs::Windows
+            {
+                return;
+            }
+            let (_fixture, root, feat_wt) = clean_repo("cancelled-drain-gate");
+            let db = Db::open_memory().unwrap();
+            let queued = item(&db, &feat_wt);
+            let counter = root.join("gate-count");
+            std::fs::write(&counter, "").unwrap();
+            let command = format!(
+                "printf x >> {} ; true",
+                thegn_core::util::sh_quote(&counter.to_string_lossy()),
+            );
+            let mut mq = cfg("", 1);
+            mq.gate_on = true;
+            mq.gate_command = command;
+            let count_path = counter.clone();
+            let _scope = crate::fold_cancel::scope(move || {
+                std::fs::metadata(&count_path).is_ok_and(|metadata| metadata.len() > 0)
+            });
+            let outcome = drive_queue(&mq, &Config::default(), &root, &db, vec![queued], |_| {});
+            assert!(
+                std::fs::metadata(counter).is_ok_and(|metadata| metadata.len() > 0),
+                "the gate probe must have fired during the in-flight attempt"
+            );
+            let rows = db.list_merge_queue().unwrap();
+            assert_eq!(rows.len(), 1);
+            assert_eq!(
+                rows[0].status, "queued",
+                "cancelled row must not be gate_error"
+            );
+            assert!(outcome.gate_error.is_empty());
+            assert_eq!(outcome.warnings.len(), 1);
+            assert!(outcome.warnings[0].contains("1 queued row(s) left untouched"));
         }
 
         #[test]
