@@ -10,6 +10,10 @@ use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 #[cfg(test)]
+#[cfg_attr(
+    not(unix),
+    expect(dead_code, reason = "fault points live in the unix branch")
+)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum PrivateWriteFault {
     Fchmod,
@@ -46,6 +50,36 @@ fn take_private_write_fault(expected: PrivateWriteFault) -> bool {
     } else {
         false
     }
+}
+
+#[cfg(all(test, unix))]
+fn inject_fchmod() -> std::io::Result<()> {
+    if take_private_write_fault(PrivateWriteFault::Fchmod) {
+        Err(std::io::Error::other("injected fault"))
+    } else {
+        Ok(())
+    }
+}
+
+#[cfg(all(not(test), unix))]
+#[inline(always)]
+fn inject_fchmod() -> std::io::Result<()> {
+    Ok(())
+}
+
+#[cfg(all(test, unix))]
+fn inject_write() -> std::io::Result<()> {
+    if take_private_write_fault(PrivateWriteFault::Write) {
+        Err(std::io::Error::other("injected fault"))
+    } else {
+        Ok(())
+    }
+}
+
+#[cfg(all(not(test), unix))]
+#[inline(always)]
+fn inject_write() -> std::io::Result<()> {
+    Ok(())
 }
 
 /// Create a file or directory symlink using the platform's native API.
@@ -553,13 +587,7 @@ impl PrivateDir {
             .map_err(nix_io_error)?;
             let chmod_result = fchmod(&fd, Mode::from_bits_truncate(0o600))
                 .map_err(nix_io_error)
-                .and_then(|()| {
-                    #[cfg(test)]
-                    if take_private_write_fault(PrivateWriteFault::Fchmod) {
-                        return Err(std::io::Error::other("injected fault"));
-                    }
-                    Ok(())
-                });
+                .and_then(|()| inject_fchmod());
             if let Err(error) = chmod_result {
                 if let Err(cleanup_error) =
                     unlinkat(&self.fd, temporary.as_str(), UnlinkatFlags::NoRemoveDir)
@@ -569,16 +597,10 @@ impl PrivateDir {
                 return Err(error);
             }
             let mut file = std::fs::File::from(fd);
-            let write_result = {
-                #[cfg(test)]
-                if take_private_write_fault(PrivateWriteFault::Write) {
-                    Err(std::io::Error::other("injected fault"))
-                } else {
-                    file.write_all(bytes).and_then(|()| file.sync_all())
-                }
-                #[cfg(not(test))]
-                file.write_all(bytes).and_then(|()| file.sync_all())
-            };
+            let write_result = file
+                .write_all(bytes)
+                .and_then(|()| inject_write())
+                .and_then(|()| file.sync_all());
             if let Err(error) = write_result {
                 if let Err(cleanup_error) =
                     unlinkat(&self.fd, temporary.as_str(), UnlinkatFlags::NoRemoveDir)
@@ -957,13 +979,15 @@ mod tests {
     fn private_write_fchmod_failure_unlinks_the_temporary() {
         let anchor = tempfile::tempdir().unwrap();
         let dir = ensure_private_dir_beneath(anchor.path(), Path::new("secrets")).unwrap();
+        let destination = anchor.path().join("secrets/secret.env");
+        std::fs::write(&destination, b"OLD").unwrap();
 
         let result = with_private_write_fault(PrivateWriteFault::Fchmod, || {
             dir.write_owner_only_atomic("secret.env", b"CANARY")
         });
 
         assert!(result.is_err());
-        assert!(!anchor.path().join("secrets/secret.env").exists());
+        assert_eq!(std::fs::read(&destination).unwrap(), b"OLD");
         let entries = std::fs::read_dir(anchor.path().join("secrets"))
             .unwrap()
             .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
@@ -987,13 +1011,15 @@ mod tests {
     fn private_write_write_failure_unlinks_the_temporary() {
         let anchor = tempfile::tempdir().unwrap();
         let dir = ensure_private_dir_beneath(anchor.path(), Path::new("secrets")).unwrap();
+        let destination = anchor.path().join("secrets/secret.env");
+        std::fs::write(&destination, b"OLD").unwrap();
 
         let result = with_private_write_fault(PrivateWriteFault::Write, || {
             dir.write_owner_only_atomic("secret.env", b"CANARY")
         });
 
         assert!(result.is_err());
-        assert!(!anchor.path().join("secrets/secret.env").exists());
+        assert_eq!(std::fs::read(&destination).unwrap(), b"OLD");
         let entries = std::fs::read_dir(anchor.path().join("secrets"))
             .unwrap()
             .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
