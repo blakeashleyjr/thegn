@@ -194,8 +194,14 @@ fn glyph_partition_keeps_suspended_cache_skips_uncached_and_scans_active() {
             active_path: Some(&active),
             gate_remote_scans: true,
             now,
-            ttl: Duration::from_secs(60),
-            active_floor: Duration::from_secs(1),
+            ttls: &crate::hydrate_tuning::glyph_ttls_from(
+                Some(60_000),
+                Some(120_000),
+                Duration::from_secs(1),
+                Duration::from_secs(5),
+            ),
+            since_active: &HashMap::new(),
+            since_ref_move: None,
         },
     );
     assert_eq!(to_scan, vec![active.clone()], "active path live-scans");
@@ -326,56 +332,72 @@ fn neighbor_paths_single_visible_worktree_warms_nothing() {
 
 #[test]
 fn glyph_rescan_tiering() {
-    let ttl = Duration::from_secs(5);
     let floor = Duration::from_millis(300);
+    let ttls = crate::hydrate_tuning::glyph_ttls_from(
+        Some(10_000),
+        Some(120_000),
+        floor,
+        Duration::from_secs(5),
+    );
     // The active worktree scans on a FLOOR, not an exemption: a row younger than
     // the floor is served from cache. This is what stops a watcher storm from
     // spending a git fan-out (including a three-dot diff) per debounce window.
-    assert!(!should_rescan_glyphs(
+    let active_window = crate::hydrate_tuning::glyph_window(
         true,
+        false,
+        std::path::Path::new("/worktrees/active"),
+        &ttls,
+    );
+    assert!(!should_rescan_glyphs(
         Some(Duration::from_millis(50)),
-        ttl,
-        floor
+        active_window
     ));
     // Past the floor it rescans — well inside the TTL a background row would use.
     assert!(should_rescan_glyphs(
-        true,
         Some(Duration::from_millis(400)),
-        ttl,
-        floor
+        active_window
     ));
     // No cached row: scan, active or not.
-    assert!(should_rescan_glyphs(true, None, ttl, floor));
-    assert!(should_rescan_glyphs(false, None, ttl, floor));
-    // A background worktree with a fresh cached row is served from cache — and
-    // its window is the TTL, not the (much shorter) active floor.
-    assert!(!should_rescan_glyphs(
-        false,
-        Some(Duration::from_secs(2)),
-        ttl,
-        floor
-    ));
-    // ...and rescans once the cached row ages past the TTL.
+    assert!(should_rescan_glyphs(None, active_window));
     assert!(should_rescan_glyphs(
-        false,
-        Some(Duration::from_secs(6)),
-        ttl,
-        floor
-    ));
-    // TTL of 0 (the env opt-out) reverts to always-rescan for background too.
-    assert!(should_rescan_glyphs(
-        false,
-        Some(Duration::from_millis(1)),
-        Duration::ZERO,
-        floor
+        None,
+        crate::hydrate_tuning::glyph_window(
+            false,
+            false,
+            std::path::Path::new("/worktrees/quiet"),
+            &ttls,
+        )
     ));
     // Floor of 0 (`THEGN_ACTIVE_GLYPH_FLOOR_MS=0`) restores the old
     // always-rescan behavior for the active row.
     assert!(should_rescan_glyphs(
-        true,
         Some(Duration::from_millis(1)),
-        ttl,
-        Duration::ZERO
+        crate::hydrate_tuning::glyph_window(
+            true,
+            false,
+            std::path::Path::new("/worktrees/active"),
+            &crate::hydrate_tuning::glyph_ttls_from(
+                Some(10_000),
+                Some(120_000),
+                Duration::ZERO,
+                Duration::from_secs(5),
+            ),
+        )
+    ));
+    let no_background_ttl = crate::hydrate_tuning::glyph_ttls_from(
+        Some(0),
+        Some(120_000),
+        floor,
+        Duration::from_secs(5),
+    );
+    assert!(should_rescan_glyphs(
+        Some(Duration::from_millis(1)),
+        crate::hydrate_tuning::glyph_window(
+            false,
+            false,
+            std::path::Path::new("/worktrees/quiet"),
+            &no_background_ttl,
+        )
     ));
 }
 
@@ -2499,5 +2521,83 @@ fn glyph_scan_preserves_binary_diff_counts() {
             thegn_svc::git::DiffCount::Binary,
             thegn_svc::git::DiffCount::Binary
         ))
+    );
+}
+
+#[test]
+fn an_idle_tick_with_no_event_rescans_nothing() {
+    use std::collections::HashMap;
+    use std::time::{Duration, Instant};
+
+    let tick = Duration::from_secs(5);
+    let ttls = crate::hydrate_tuning::glyph_ttls_from(None, None, Duration::from_millis(300), tick);
+    let started = Instant::now();
+    let paths: Vec<String> = (0..35)
+        .map(|index| format!("/worktrees/row-{index}"))
+        .collect();
+    let row = glyph_row(true, 0, 0, Some("main"), "/repo", 0, 0, None);
+    let cache: HashMap<String, (GlyphRow, Instant)> = paths
+        .iter()
+        .cloned()
+        .map(|path| (path, (row.clone(), started)))
+        .collect();
+    let no_locations = HashMap::new();
+    let no_activity = HashMap::new();
+
+    for elapsed in (5..=115).step_by(5) {
+        let (to_scan, _, _) = partition_glyph_paths(
+            &paths,
+            &cache,
+            &no_locations,
+            GlyphPartitionConfig {
+                active_path: None,
+                gate_remote_scans: false,
+                now: started + Duration::from_secs(elapsed),
+                ttls: &ttls,
+                since_active: &no_activity,
+                since_ref_move: None,
+            },
+        );
+        assert!(
+            to_scan.is_empty(),
+            "unexpected scans at {elapsed}s: {to_scan:?}"
+        );
+    }
+}
+
+#[test]
+fn rows_never_all_expire_in_the_same_tick() {
+    use std::collections::HashMap;
+    use std::time::Duration;
+
+    let ttls = crate::hydrate_tuning::glyph_ttls_from(
+        None,
+        None,
+        Duration::from_millis(300),
+        Duration::from_secs(5),
+    );
+    let paths: Vec<String> = (0..35)
+        .map(|index| format!("/worktrees/row-{index}"))
+        .collect();
+    let mut idle_buckets = HashMap::new();
+    let mut busy_buckets = HashMap::new();
+    for path in paths {
+        let path_ref = std::path::Path::new(&path);
+        let idle_window = crate::hydrate_tuning::glyph_window(false, false, path_ref, &ttls);
+        let busy_window = crate::hydrate_tuning::glyph_window(false, true, path_ref, &ttls);
+        let idle_tick = idle_window.as_secs().div_ceil(5);
+        let busy_tick = busy_window.as_secs().div_ceil(5);
+        *idle_buckets.entry(idle_tick).or_insert(0usize) += 1;
+        *busy_buckets.entry(busy_tick).or_insert(0usize) += 1;
+    }
+
+    assert!(idle_buckets.len() >= 6, "idle due ticks: {idle_buckets:?}");
+    assert!(
+        idle_buckets.values().all(|count| *count <= 9),
+        "idle due ticks: {idle_buckets:?}"
+    );
+    assert!(
+        busy_buckets.values().all(|count| *count < 35),
+        "busy due ticks: {busy_buckets:?}"
     );
 }
