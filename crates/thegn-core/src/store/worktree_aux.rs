@@ -6,6 +6,92 @@ use crate::db::{ForwardRow, MergeQueueRow, PrQueueRow, ShareRow};
 use crate::models::ContainerEvent;
 use anyhow::Result;
 
+pub const MERGE_CLAIM_MAX_LEASE_MS: i64 = 5 * 60 * 1000;
+pub const MERGE_CLAIM_OWNER_HINT_MAX: usize = 64;
+pub const MERGE_CLAIM_LOST: &str = "merge claim lost";
+pub const MERGE_CLAIM_ACTIVE: &str = "merge row is claimed by an active drain";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MergeClaimPhase {
+    ClaimedNoChild,
+    Settled,
+}
+
+impl MergeClaimPhase {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::ClaimedNoChild => "claimed_no_child",
+            Self::Settled => "settled",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "claimed_no_child" => Some(Self::ClaimedNoChild),
+            "settled" => Some(Self::Settled),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct MergeClaimRequest {
+    pub worktree: String,
+    pub branch: String,
+    pub repo_root: String,
+    pub target_branch: String,
+    pub location: String,
+    pub expected_status: String,
+    pub lease_until_ms: i64,
+    pub owner_hint: Option<String>,
+}
+
+pub struct MergeClaim {
+    pub worktree: String,
+    pub branch: String,
+    pub repo_root: String,
+    pub target_branch: String,
+    pub location: String,
+    pub generation: i64,
+    pub phase: MergeClaimPhase,
+    pub lease_until_ms: i64,
+    pub owner_hint: Option<String>,
+    pub(crate) owner_token: String,
+}
+
+impl std::fmt::Debug for MergeClaim {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MergeClaim")
+            .field("worktree", &self.worktree)
+            .field("branch", &self.branch)
+            .field("repo_root", &self.repo_root)
+            .field("target_branch", &self.target_branch)
+            .field("location", &self.location)
+            .field("generation", &self.generation)
+            .field("phase", &self.phase)
+            .field("lease_until_ms", &self.lease_until_ms)
+            .field("owner_hint", &self.owner_hint)
+            .field("owner_token", &"[redacted]")
+            .finish()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MergeClaimView {
+    pub worktree: String,
+    pub generation: i64,
+    pub phase: String,
+    pub lease_until_ms: Option<i64>,
+    pub owner_hint: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MergeAttemptResult {
+    Consumed,
+    BudgetExhausted,
+    ClaimLost,
+}
+
 /// Exact replacement of a queue transition's nullable metadata. `None` clears
 /// the column; these values confer no ownership or concurrency authority.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
@@ -233,6 +319,36 @@ pub trait WorktreeAuxStore {
 
     /// The whole queue, oldest-queued first (the fold order + UI feed).
     fn list_merge_queue(&self) -> Result<Vec<MergeQueueRow>>;
+
+    /// Atomically acquire one eligible queue row and its fencing generation.
+    fn admit_merge_claim(&self, request: &MergeClaimRequest) -> Result<Option<MergeClaim>>;
+
+    /// Observe durable claim state without exposing its owner token.
+    fn observe_merge_claim(&self, worktree: &str) -> Result<Option<MergeClaimView>>;
+
+    /// Extend a live claim's lease while retaining its generation.
+    fn renew_merge_claim(&self, claim: &MergeClaim, lease_until_ms: i64) -> Result<MergeClaim>;
+
+    /// Mark a no-child claim settled before releasing it.
+    fn settle_merge_claim_no_child(&self, claim: &MergeClaim) -> Result<MergeClaim>;
+
+    /// Release a settled claim exactly once; the generation is retained.
+    fn release_merge_claim(&self, claim: &MergeClaim) -> Result<()>;
+
+    /// Atomically consume one agent attempt owned by a live claim.
+    fn consume_merge_agent_attempt(
+        &self,
+        claim: &MergeClaim,
+        max: u32,
+    ) -> Result<MergeAttemptResult>;
+
+    /// Replace status fields only while this claim still owns the live row.
+    fn replace_merge_status_claimed(
+        &self,
+        claim: &MergeClaim,
+        status: &str,
+        fields: &MergeStatusFields,
+    ) -> Result<MergeClaim>;
 
     // --- PR queue (v50) ---------------------------------------------------
     //
