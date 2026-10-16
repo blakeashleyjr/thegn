@@ -230,14 +230,14 @@ fn protected_binds_with_classes(
                     .get("type")
                     .and_then(serde_json::Value::as_str)
                     .unwrap_or("");
-                if kind == "bind" {
-                    if let Some(source) = volume.get("source").and_then(serde_json::Value::as_str) {
-                        service_refs.push((service.clone(), source.to_owned()));
-                    }
-                } else if kind == "volume" {
-                    if let Some(name) = volume.get("source").and_then(serde_json::Value::as_str) {
-                        refs.push((service.clone(), format!("@volume:{name}")));
-                    }
+                if kind == "bind"
+                    && let Some(source) = volume.get("source").and_then(serde_json::Value::as_str)
+                {
+                    service_refs.push((service.clone(), source.to_owned()));
+                } else if kind == "volume"
+                    && let Some(name) = volume.get("source").and_then(serde_json::Value::as_str)
+                {
+                    refs.push((service.clone(), format!("@volume:{name}")));
                 }
             } else if let Some(short) = volume.as_str() {
                 if let Some(source) = short_mount_source(short) {
@@ -1018,7 +1018,6 @@ mod tests {
             files: vec!["base.yml".into(), "labels.json".into()],
             service: Some("web".into()),
             run_services: vec!["db".into()],
-            ..Default::default()
         };
         assert_eq!(
             config_json_argv(&target, "proj", &compose),
