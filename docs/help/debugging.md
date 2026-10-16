@@ -70,7 +70,11 @@ The bundle treats those as separate log sinks.
 
 Set `THEGN_PERF=1` before launching the compositor to enable the runtime
 `thegn::perf` rollup. It reports wake/render rates, latency, idle and busy
-ratios, the hot wake source, PTY throughput, and per-subsystem CPU timing.
+ratios, the hot wake source, PTY throughput, and per-subsystem CPU timing. It
+also reports whole-process (`cpu_process_ms`), loop-thread (`cpu_loop_ms`),
+scan-pool (`cpu_scan_ms`), reaped-child (`cpu_children_reaped_ms`) and
+unattributed (`cpu_unattributed_ms`) CPU. Child CPU is counted when the child
+is reaped.
 The existing tuning variables are `THEGN_PERF_INTERVAL_MS` and
 `THEGN_PERF_WAKE_LIMIT`; `THEGN_PERF_PTY_LIMIT`, `THEGN_FRAME_BUDGET_US`, and
 `THEGN_INPUT_BUDGET_US` adjust the related guards. A `THEGN_LOG` filter that

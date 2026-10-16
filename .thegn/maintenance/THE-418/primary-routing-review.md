@@ -1,7 +1,0 @@
-# Follow-up review of 505 F01/F03
-
-Review a80ec1af plus primary393a0f91 against 505 and primary-revision-3.md. Narrow the follow-up to actual changes and prior unresolved findings; unchanged direnv removal was already positively reviewed. Stable target_leaves now travel with every SpecBatch, guard runs before effects, and stale results settle a uniquely identified shifted target reservation while preserving the replacement index. Look carefully at close/shift, split/moved/deleted leaves, older/newer request bookkeeping and materialize as well as prewarm. No unsupported claim that this solves the broader pre-existing provider-worker supervision (F02/THE-251).
-
-The actual run.rs worker and test now use handlers::prewarm::resolve_automatic_with containing both rejection points around remembered-agent replacement. Primary moved impossible post-helper Ok assertions into the relaunch closure (helper correctly returns Err), made the remembered-agent fixture actually select that command, added executable fake shell/direnv/nix positive controls, and removed contradictory post-helper host assertion. Check test semantics and the real call route, no source-grep substitute.
-
-Source-only, no Cargo/builds/full suites. Commit source-review-clear or concrete revisions-needed with narrowly justified regression tests. Primary will run focused and full combined gates after the ongoing frozen config capture build. Do not merge, push, close or spawn.

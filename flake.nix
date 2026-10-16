@@ -311,11 +311,23 @@
       # what CI runs (`nix develop --command just check-cross`), so the gate broke
       # the moment it moved to a runner without devenv (`704eee77`). There is now
       # one shell, so there is nothing left to keep in sync.
+      #
+      # The last two lines are what LINKING (not checking) for windows-gnu
+      # needs, i.e. `cargo test --target x86_64-pc-windows-gnu` /
+      # `just test-windows-wine`; `cargo check` never reaches either step:
+      #   - the `windows-*` crates use raw-dylib, and rustc builds those import
+      #     libs by running `x86_64-w64-mingw32-dlltool` from PATH. The prefixed
+      #     binutils live beside the cross cc; every name there is target-
+      #     prefixed, so PATH-prepending them shadows nothing native.
+      #   - Rust's windows-gnu std links `-l:libpthread.a` (winpthreads), which
+      #     the nixpkgs mingw cc does not put on its search path.
       mingwCrossEnv = pkgs.lib.optionalString pkgs.stdenv.isLinux ''
         export CC_x86_64_pc_windows_gnu="${pkgs.pkgsCross.mingwW64.stdenv.cc}/bin/x86_64-w64-mingw32-cc"
         export CXX_x86_64_pc_windows_gnu="${pkgs.pkgsCross.mingwW64.stdenv.cc}/bin/x86_64-w64-mingw32-c++"
         export AR_x86_64_pc_windows_gnu="${pkgs.pkgsCross.mingwW64.stdenv.cc}/bin/x86_64-w64-mingw32-ar"
         export CARGO_TARGET_X86_64_PC_WINDOWS_GNU_LINKER="${pkgs.pkgsCross.mingwW64.stdenv.cc}/bin/x86_64-w64-mingw32-cc"
+        export PATH="${pkgs.pkgsCross.mingwW64.stdenv.cc}/bin:$PATH"
+        export CARGO_TARGET_X86_64_PC_WINDOWS_GNU_RUSTFLAGS="-L native=${pkgs.pkgsCross.mingwW64.windows.pthreads}/lib"
       '';
 
       # ── git hooks ────────────────────────────────────────────────────────────
@@ -636,6 +648,23 @@
           # Fly.io boot image: sshd entrypoint + baked toolchain, so a Fly machine
           # boots straight into a reachable shell (`template = "image:<ref>"`).
           fly-sandbox-image = import ./nix/fly-sandbox-image.nix {inherit pkgs rustToolchain;};
+        }
+        # Wine for `just test-windows-wine` (test/wine-runner.sh), which RUNS the
+        # x86_64-pc-windows-gnu test binaries rather than only typechecking them.
+        #
+        # A package the recipe builds on demand, NOT a dev-shell member: the
+        # closure is ~790 MB (wineWow64Packages.minimal; the default `wine64` is
+        # ~1.9 GB, mostly samba/gstreamer/sane a console test never loads), and
+        # putting it in devShells.default would make every `nix develop` and
+        # every CI job pay that download for a gate almost nobody runs. CLAUDE.md
+        # forbids a second dev shell, and this is not one: it is one pinned
+        # tool, locked by flake.lock like everything else.
+        #
+        # `minimal` drops the optional media/network/printing deps; WoW64 is the
+        # upstream 64-bit mode since wine 9 (one `wine` loader, no wine32 tree).
+        # x86_64-linux only: Wine executes x86_64 PE natively, not on aarch64.
+        // pkgs.lib.optionalAttrs (system == "x86_64-linux") {
+          wine = pkgs.wineWow64Packages.minimal;
         };
 
       # `nix fmt` formats every tracked file via treefmt.toml.

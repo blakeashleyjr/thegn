@@ -13,13 +13,18 @@
 
 mod battery;
 mod coverage;
+mod cpu_freq;
+mod disk_aggregate;
 mod gpu;
 mod gpu_exec;
 mod gpu_monitor;
+mod gpu_sysfs;
+mod net_kind;
 mod net_medium;
 mod procs;
 mod sample;
 mod thermal;
+mod vmstat;
 
 /// Run a helper under the shared bounded runner (deadline, stdout cap, process
 /// group kill, guaranteed reap). Errors are human-readable.
@@ -34,6 +39,7 @@ pub fn run_command_bounded(
 
 pub use battery::{read_battery, read_battery_power};
 pub use coverage::{AbsentReason, Coverage, FamilyReport, MetricFamily, coverage};
+pub use net_kind::{IfaceKind, NetIface};
 pub use net_medium::{
     IfaceFact, MediumReason, MediumSelection, NetMedium, select_medium, select_medium_explained,
 };
@@ -56,8 +62,10 @@ pub struct StatsSnapshot {
     pub cpu_freq_mhz: Option<u64>,
     /// CPU/package temperature in °C (the hottest CPU-ish sensor).
     pub cpu_temp_c: Option<f32>,
-    /// Memory as (used GiB, total GiB).
+    /// Memory as (used GiB, total GiB); used is total minus available.
     pub mem_gib: Option<(f32, f32)>,
+    /// Truly free memory in GiB (MemFree on Linux; excludes reclaimable cache).
+    pub mem_free_gib: Option<f32>,
     /// Swap as (used GiB, total GiB). Absent when there is no swap.
     pub swap_gib: Option<(f32, f32)>,
     /// Pages reclaimed **synchronously** (`pgsteal_direct`), per second.
@@ -74,17 +82,22 @@ pub struct StatsSnapshot {
     pub reclaim_per_s: Option<f32>,
     /// GPU utilization 0–100 (Linux sysfs / NVIDIA only; absent otherwise).
     pub gpu_pct: Option<u8>,
-    /// GPU memory as (used MiB, total MiB). NVIDIA (`nvidia-smi`) and AMD/Intel
-    /// sysfs (`mem_info_vram_*`) where exposed; absent otherwise.
+    /// GPU memory as (used MiB, total MiB). NVIDIA (`nvidia-smi`) and AMD
+    /// sysfs (`mem_info_vram_*`); APUs include GTT when available.
     pub gpu_mem_mib: Option<(u64, u64)>,
-    /// GPU temperature in °C (NVIDIA only today; absent otherwise).
+    /// True when `gpu_mem_mib` is VRAM+GTT on an APU.
+    pub gpu_mem_shared: bool,
+    /// GPU temperature in °C (absent when unavailable).
     pub gpu_temp_c: Option<f32>,
-    /// GPU board power draw in watts (NVIDIA only today; absent otherwise).
+    /// GPU board power draw in watts (absent when unavailable).
     pub gpu_power_w: Option<f32>,
-    /// Network as (rx, tx) bytes/sec summed across non-loopback interfaces.
+    /// Network as (rx, tx) bytes/sec summed over physical links; tunnels and
+    /// virtual links are excluded to avoid counting VPN traffic twice.
     pub net_bps: Option<(u64, u64)>,
-    /// Per-interface (name, rx bytes/sec, tx bytes/sec), non-loopback.
-    pub net_ifaces: Vec<(String, u64, u64)>,
+    /// Network as (rx, tx) bytes/sec summed across all non-loopback links.
+    pub net_bps_all: Option<(u64, u64)>,
+    /// Every non-loopback interface, including idle and down links.
+    pub net_ifaces: Vec<NetIface>,
     /// Selected medium for the system network path. Unknown means the path
     /// could not be identified without guessing.
     pub net_medium: NetMedium,
@@ -104,8 +117,10 @@ pub struct StatsSnapshot {
     /// Worktrees' filesystem capacity as (total bytes, available bytes). Absent
     /// on non-unix targets or a `statvfs` error, exactly like `disk_free_pct`.
     pub disk_bytes: Option<(u64, u64)>,
-    /// All mounted physical disks (name, mount, free %, IO rates, kind).
-    pub disks: Vec<DiskInfo>,
+    /// Physical disk read/write bytes per second. None means unobserved, never zero.
+    pub disk_io: Option<(u64, u64)>,
+    /// One row per filesystem, shared between fast samples.
+    pub disks: std::sync::Arc<[DiskInfo]>,
     /// Temperature sensors as (label, °C). Drives the telemetry thermal row.
     pub temps: Vec<(String, f32)>,
     /// Load average (1, 5, 15 min). `None` on platforms without it (Windows).
@@ -188,6 +203,8 @@ pub struct DiskInfo {
     pub read_bps: u64,
     pub write_bps: u64,
     pub kind: DiskKind,
+    /// Other mounts of the same filesystem/device.
+    pub extra_mounts: u32,
 }
 
 /// Storage medium, mirrored from sysinfo so consumers needn't depend on it.
@@ -361,6 +378,9 @@ mod tests {
         if let Some((u, t)) = snap.mem_gib {
             assert!(t >= 0.0 && u <= t + 0.001, "mem {u}/{t}");
         }
+        if let (Some(free), Some((_, total))) = (snap.mem_free_gib, snap.mem_gib) {
+            assert!(free <= total + 0.001, "free mem {free}/{total}");
+        }
         if let Some((u, t)) = snap.swap_gib {
             assert!(t >= 0.0 && u <= t + 0.001, "swap {u}/{t}");
         }
@@ -377,7 +397,7 @@ mod tests {
             assert!(total > 0, "disk total {total}");
             assert!(avail <= total, "disk avail {avail} > total {total}");
         }
-        for d in &snap.disks {
+        for d in snap.disks.iter() {
             assert!(d.free_pct <= 100, "disk {} free {}", d.name, d.free_pct);
         }
         for (label, c) in &snap.temps {

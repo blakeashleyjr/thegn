@@ -160,7 +160,7 @@ fn active_cwd(_cfg: &Config) -> Option<&std::path::Path> {
 /// Run a lifecycle argv on a background thread with a bounded wait, and queue
 /// the outcome for the loop.
 fn spawn_control(argv: Vec<String>, label: String, waker: TerminalWaker) {
-    std::thread::spawn(move || {
+    thegn_core::thread_name::spawn_named("thegn-mon-ctl", move || {
         crate::platform::qos::set_self(crate::platform::qos::Qos::Background);
         let outcome = run_control(&argv, CONTROL_TIMEOUT - Duration::from_millis(250), &label);
         if !outcome.ok {

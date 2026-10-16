@@ -143,6 +143,68 @@ check-cross:
       done
     fi
 
+# RUN the test suite as Windows binaries: cross-compile the tests for
+# x86_64-pc-windows-gnu and execute every test process under Wine
+# (test/wine-runner.sh, wired as the cargo target runner). `check-cross` only
+# proves the Windows code TYPECHECKS; this is the cheapest way to see it run
+# without a Windows machine. Not part of `just ci`: it is a fourth full-
+# workspace compile, plus a ~790 MB Wine download on first use.
+#
+#   just test-windows-wine                       # whole workspace
+#   just test-windows-wine -p thegn-core         # one crate
+#   just test-windows-wine -p thegn-proc fallback  # nextest filter args
+#
+# Wine is NOT a Windows truth gate: it has no ConPTY parity, partial job-object
+# and named-pipe semantics, and its own filesystem quirks. The `wine` nextest
+# profile (.config/nextest.toml) lists the tests skipped for that reason, each
+# with its cause; the msvc truth gate stays the opt-in `windows` CI job.
+#
+# Wine comes from the flake (`.#wine`, pinned by flake.lock), not the dev
+# shell — see the comment on that package for why.
+[positional-arguments]
+test-windows-wine *args:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    if [ "$(uname -s)-$(uname -m)" != "Linux-x86_64" ]; then
+      echo "test-windows-wine: x86_64 Linux only (Wine runs x86_64 PE natively)." >&2
+      exit 1
+    fi
+    if [ -z "${CC_x86_64_pc_windows_gnu:-}" ] || [ -z "${CARGO_TARGET_X86_64_PC_WINDOWS_GNU_RUSTFLAGS:-}" ]; then
+      echo "test-windows-wine: no mingw-w64 cross env; run inside 'nix develop'." >&2
+      exit 1
+    fi
+    wine_out="$(nix build --no-link --print-out-paths .#wine)"
+    # Link through test/mingw-link.sh, which stubs the one dependency DLL
+    # (iroh-relay's cdylib) that exceeds the PE export table; see that file.
+    # Only the linker path changes, so this costs a relink, not a rebuild.
+    export THEGN_MINGW_CC="${CARGO_TARGET_X86_64_PC_WINDOWS_GNU_LINKER:?}"
+    export CARGO_TARGET_X86_64_PC_WINDOWS_GNU_LINKER="{{ justfile_directory() }}/test/mingw-link.sh"
+    export THEGN_WINE="$wine_out/bin/wine"
+    export CARGO_TARGET_X86_64_PC_WINDOWS_GNU_RUNNER="{{ justfile_directory() }}/test/wine-runner.sh"
+    # One persistent wineserver for the whole run, against the prefix the
+    # runner will use. Without it every test process (nextest runs one per
+    # test, thousands per crate) starts a wineserver and waits out its
+    # shutdown timer, which roughly doubles the per-test cost.
+    "$CARGO_TARGET_X86_64_PC_WINDOWS_GNU_RUNNER" --init-only
+    prefix="$("$CARGO_TARGET_X86_64_PC_WINDOWS_GNU_RUNNER" --print-prefix)"
+    #
+    # It also prevents a HANG: the first wine process of a server session starts
+    # Wine's resident services (services.exe, winedevice.exe, rpcss.exe, ...)
+    # and they inherit that process's stdout/stderr. Under nextest those are
+    # the capture pipes, so nextest waits forever for an EOF the services never
+    # send. Booting the services here, with stdio on /dev/null, means no test
+    # process is ever their parent.
+    # Exit 2 = a server already holds this prefix (a concurrent run or a stale
+    # persistent one): reuse it instead of aborting under `set -e`.
+    WINEPREFIX="$prefix" "$wine_out/bin/wineserver" --persistent </dev/null >/dev/null 2>&1 || [ $? -eq 2 ]
+    trap 'WINEPREFIX="$prefix" "$wine_out/bin/wineserver" --kill 2>/dev/null || true' EXIT
+    WINEPREFIX="$prefix" WINEDEBUG=-all "$THEGN_WINE" wineboot </dev/null >/dev/null 2>&1
+    export THEGN_WINE_WARM=1
+    if [ "$#" -eq 0 ]; then
+      set -- --workspace
+    fi
+    cargo nextest run --profile wine --target x86_64-pc-windows-gnu "$@"
+
 # A convenience for hand-installing on a non-packaged install and for eyeballing
 # the generator's output — deliberately NOT part of `just ci`: it is not a gate.
 # Real installs get their scripts from the packager (nix/package.nix installs
@@ -646,6 +708,7 @@ ratchets:
     # Guardrail: stale architecture claims (old emulator name, never-landed ssh crate,
     # removed per-file size limit, "e2e runs every push") must not come back.
     bash test/stale-docs-guard.sh
+    bash test/tracked-ignored-guard.sh
     # Guardrail: the hand-run Muse recipe must keep the same config and D-Bus
     # isolation as the hermetic e2e environment.
     bash test/muse-docs-guard.sh
@@ -796,6 +859,54 @@ test: contract-ratchets test-live test-heredoc-guard test-build-metadata test-th
 # doctest added later is still compiled and run before a release.
 test-doc:
     cargo test --doc --workspace
+
+# Run the test gate on another machine over ssh (a Mac with nix, a Windows box,
+# any ssh host). Ships this worktree as git sees it (tracked + untracked, never
+# target/), runs `nix develop --command just test` there (or, with a crate,
+# `cargo nextest run -p <crate> [filter...]`; on Windows, `cargo test`), streams
+# the output and exits with the remote status. The remote target/ is kept warm
+# between runs. Auth is your ssh config; nothing machine-specific lives here.
+# Env knobs (THEGN_REMOTE_DIR, THEGN_REMOTE_CMD, ...) are documented at the top
+# of scripts/test-remote.sh. Usage: `just test-remote host=mymac [crate [filter]]`.
+[positional-arguments]
+test-remote host *args:
+    scripts/test-remote.sh "$@"
+
+# Hermetic check of the runner itself: a local ssh shim stands in for the host,
+# so packing, layout, exit-status propagation and cleanup are exercised with no
+# network and no compile. Seconds; safe to run anywhere.
+test-remote-selftest:
+    bash test/remote-runner-selftest.sh
+
+# Opt-in local Windows 11 VM (KVM + quickemu from the flake's nixpkgs, state
+# under $XDG_DATA_HOME/thegn-dev/windows-vm, never in the repo). `setup`
+# downloads Microsoft's ISO and prepares an unattended install that comes up
+# with OpenSSH, VS Build Tools, git and rustup; it needs
+# THEGN_WINVM_ACCEPT_LICENSES=1 because that is a licence decision. See
+# scripts/windows-vm.sh and CONTRIBUTING "Testing on other platforms".
+windows-vm-setup:
+    scripts/windows-vm.sh setup
+
+# Boot the VM headless and wait until it is provisioned and reachable over ssh.
+windows-vm-up:
+    scripts/windows-vm.sh up
+
+# Clean guest shutdown (falls back to killing qemu after two minutes).
+windows-vm-down:
+    scripts/windows-vm.sh down
+
+windows-vm-status:
+    scripts/windows-vm.sh status
+
+# Delete the VM and everything under its state dir (ISO, disk, keys).
+windows-vm-destroy:
+    scripts/windows-vm.sh destroy
+
+# up + test-remote against the VM. With no args, runs the same msvc check and
+# test groups as the CI `windows` job; with args, `cargo test -p <crate> [filter]`.
+[positional-arguments]
+test-windows-vm *args:
+    scripts/windows-vm.sh test "$@"
 
 # Formal verification (bounded model checking, CBMC via Kani) of the pure
 # color-quantization math in `thegn-core::termcaps` (the `#[cfg(kani)]`

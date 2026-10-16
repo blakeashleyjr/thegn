@@ -1,3 +1,0 @@
-# Independent adversarial review of THE-454
-
-Review implementation a7e5c6df against main 0be575ce and the captured issue, approved primary-plan.md, and code artifact 474.md. Independently inspect all changed source and tests. Focus on actual HTTP routing (literals, DNS, proxies, redirects), bounded allocations/deadlines, secret isolation, and backend use; identify concrete bypasses and missing required regressions. No production edits and no Cargo/builds. Record source-review-clear or revisions-needed, never PASS/done/full-gate claims. Primary centrally schedules Rust verification. Missing tests listed by coder are outstanding implementation requirements, not merely optional commands. Report exact locations and practical fixes.

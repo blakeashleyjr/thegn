@@ -290,7 +290,7 @@ fn run_timed(argv: &[&str]) -> Result<Captured, DiscoveryError> {
         })?;
 
     let drain = |pipe: Option<Box<dyn Read + Send>>| {
-        std::thread::spawn(move || {
+        thegn_core::thread_name::spawn_named("thegn-disc-pipe", move || {
             let mut s = String::new();
             if let Some(mut p) = pipe {
                 // best-effort: whatever was read is still returned, and a

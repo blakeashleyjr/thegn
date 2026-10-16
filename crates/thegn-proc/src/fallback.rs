@@ -11,7 +11,7 @@ use std::{
         mpsc::{self, Receiver, SyncSender},
     },
     thread,
-    time::{Duration, Instant},
+    time::Instant,
 };
 
 enum Message {
@@ -202,7 +202,7 @@ pub(super) fn run(cmd: &mut Command, limits: &Limits, cancel: &AtomicBool) -> Ru
         containment: Containment::DirectChildOnly,
     };
     let mut status = None;
-    let mut leader_exit_at = None;
+    let mut leader_exit_at: Option<Instant> = None;
     loop {
         if let Some(which) = drain(&rx, &mut run, limits) {
             run.end = End::OutputLimit(which);
@@ -333,6 +333,7 @@ pub(super) fn run(cmd: &mut Command, limits: &Limits, cancel: &AtomicBool) -> Ru
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Duration;
 
     #[test]
     fn head_append_keeps_first_bytes_and_drains_without_limiting() {

@@ -21,10 +21,9 @@ use std::path::PathBuf;
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
-use crate::gpu::{
-    GpuReading, IOREG_ARGS, NVIDIA_QUERY_ARGS, find_sysfs, parse_ioaccel, parse_nvidia, read_sysfs,
-};
+use crate::gpu::{GpuReading, IOREG_ARGS, NVIDIA_QUERY_ARGS, parse_ioaccel, parse_nvidia};
 use crate::gpu_exec::{ExecFailure, run_bounded};
+use crate::gpu_sysfs::{GpuSysfs, RealFs, SysRead};
 
 /// Observable state of the helper backend.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -71,6 +70,8 @@ impl HelperCmd {
 #[derive(Clone)]
 pub(crate) struct HelperSpec {
     pub nvidia: HelperCmd,
+    pub nvidia_proc: PathBuf,
+    pub pci_devices: PathBuf,
     pub ioreg: HelperCmd,
     pub try_ioreg: bool,
     pub discovery_deadline: Duration,
@@ -86,6 +87,8 @@ impl Default for HelperSpec {
     fn default() -> Self {
         Self {
             nvidia: HelperCmd::named("nvidia-smi"),
+            nvidia_proc: "/proc/driver/nvidia/gpus".into(),
+            pci_devices: "/sys/bus/pci/devices".into(),
             ioreg: HelperCmd::named("ioreg"),
             try_ioreg: cfg!(target_os = "macos"),
             discovery_deadline: Duration::from_secs(3),
@@ -152,19 +155,19 @@ enum Probe {
 }
 
 pub(crate) struct GpuMonitor {
-    sysfs: Option<PathBuf>,
+    sysfs: Option<GpuSysfs>,
     shared: Arc<Shared>,
     spec: Arc<HelperSpec>,
 }
 
 impl GpuMonitor {
     pub(crate) fn new() -> Self {
-        Self::with_spec(find_sysfs(), HelperSpec::default())
+        Self::with_spec(Some("/sys/class/drm".into()), HelperSpec::default())
     }
 
     pub(crate) fn with_spec(sysfs: Option<PathBuf>, spec: HelperSpec) -> Self {
         Self {
-            sysfs,
+            sysfs: sysfs.map(|root| GpuSysfs::new(&root)),
             shared: Arc::new(Shared {
                 state: Mutex::new(State {
                     backend: Backend::Unresolved,
@@ -185,10 +188,12 @@ impl GpuMonitor {
     /// One sample. Never blocks on a helper: on the slow tier it may start a
     /// background probe, and always returns the latest good reading.
     pub(crate) fn sample(&self, slow: bool) -> GpuReading {
-        if let Some(p) = &self.sysfs {
-            return read_sysfs(p);
+        if let Some(sysfs) = &self.sysfs
+            && sysfs.has_cards()
+        {
+            return sysfs.sample(slow);
         }
-        if slow {
+        if slow && !nvidia_suspended(&self.spec) {
             self.kick();
         }
         self.latest()
@@ -255,6 +260,15 @@ impl GpuMonitor {
         drop(st);
         !res.timed_out()
     }
+}
+
+fn nvidia_suspended(spec: &HelperSpec) -> bool {
+    let fs = RealFs;
+    fs.list(&spec.nvidia_proc).into_iter().any(|slot| {
+        let status = spec.pci_devices.join(slot).join("power/runtime_status");
+        fs.read_to_string(&status)
+            .is_some_and(|value| value.trim() == "suspended")
+    })
 }
 
 fn nvidia_sample(spec: &HelperSpec) -> Probe {
@@ -357,6 +371,8 @@ mod tests {
                 program: "sh".into(),
                 prefix: vec![s.into_os_string()],
             },
+            nvidia_proc: dir.join("nvidia-missing"),
+            pci_devices: dir.join("pci-devices"),
             try_ioreg: false,
             discovery_deadline: Duration::from_secs(3),
             sample_deadline: Duration::from_secs(3),
@@ -556,6 +572,8 @@ mod tests {
         let s = script(dir, "ioreg.sh", body);
         HelperSpec {
             nvidia: HelperCmd::named("/nonexistent/thegn-nvidia-smi"),
+            nvidia_proc: dir.join("nvidia-missing"),
+            pci_devices: dir.join("pci-devices"),
             ioreg: HelperCmd {
                 program: "sh".into(),
                 prefix: vec![s.into_os_string()],
@@ -604,5 +622,37 @@ mod tests {
         let m = GpuMonitor::with_spec(None, hang(ioreg_spec(d.path(), "sleep 300\n")));
         probe_once(&m);
         assert_eq!(m.health(), GpuHealth::Failing(ExecFailure::Timeout));
+    }
+
+    #[test]
+    fn suspended_nvidia_slot_suppresses_probe_until_it_wakes() {
+        let d = tempfile::tempdir().unwrap();
+        let proc = d.path().join("proc-gpus");
+        let pci = d.path().join("pci");
+        let slot = "0000:01:00.0";
+        std::fs::create_dir_all(proc.join(slot)).unwrap();
+        std::fs::create_dir_all(pci.join(slot).join("power")).unwrap();
+        std::fs::write(pci.join(slot).join("power/runtime_status"), "suspended\n").unwrap();
+        let mut spec = spec_for(d.path(), GOOD);
+        spec.nvidia_proc = proc;
+        spec.pci_devices = pci.clone();
+        let monitor = GpuMonitor::with_spec(None, spec);
+        for _ in 0..20 {
+            monitor.sample(true);
+        }
+        assert_eq!(monitor.probes_started(), 0);
+        std::fs::write(pci.join(slot).join("power/runtime_status"), "active\n").unwrap();
+        monitor.sample(true);
+        assert_eq!(monitor.probes_started(), 1);
+        assert!(monitor.wait_idle(Duration::from_secs(10)));
+    }
+
+    #[test]
+    fn missing_nvidia_proc_directory_keeps_probe_enabled() {
+        let d = tempfile::tempdir().unwrap();
+        let monitor = GpuMonitor::with_spec(None, spec_for(d.path(), GOOD));
+        monitor.sample(true);
+        assert_eq!(monitor.probes_started(), 1);
+        assert!(monitor.wait_idle(Duration::from_secs(10)));
     }
 }

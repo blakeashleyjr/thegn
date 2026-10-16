@@ -2120,9 +2120,10 @@ fn oci_local_secrets_go_to_env_file_not_argv() {
         .position(|a| a == "--env-file")
         .expect("env-file");
     let path = std::path::PathBuf::from(&opts[i + 1]);
-    use std::os::unix::fs::PermissionsExt;
-    let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
-    assert_eq!(mode, 0o600, "env-file must be 0600");
+    let mode = crate::fsperm::mode_bits(&path).unwrap();
+    if cfg!(unix) {
+        assert_eq!(mode, Some(0o600), "env-file must be 0600");
+    }
     let body = std::fs::read_to_string(&path).unwrap();
     assert!(
         body.contains("GH_TOKEN=ghp_secret"),
@@ -3921,4 +3922,75 @@ fn compose_teardown_projects_add_legacy_only_for_adopted_worktree() {
         crate::sandbox_compose::teardown_projects_in(state_home.path(), &worktree),
         vec![hashed, legacy]
     );
+}
+
+const PODMAN5_STATS: &str = r#"[
+  {"id":"a1b2c3d4e5f6","name":"gamehost-mailpit-1","cpu_time":"0.00s","cpu_percent":"0.02%","avg_cpu":"0.02%","mem_usage":"10.19MB / 100.5GB","mem_percent":"0.01%","net_io":"22.22kB / 7.348kB","block_io":"0B / 0B","pids":"3"},
+  {"id":"f6e5d4c3b2a1","name":"gamehost-db-1","cpu_time":"0.01s","cpu_percent":"0.80%","avg_cpu":"0.80%","mem_usage":"51.13MB / 100.5GB","mem_percent":"0.05%","net_io":"21.7kB / 7.348kB","block_io":"0B / 0B","pids":"12"}
+]"#;
+
+#[test]
+fn parse_stats_rows_reads_podman5_json() {
+    let rows = parse_stats_rows(PODMAN5_STATS);
+    assert_eq!(rows.len(), 2);
+    assert_eq!(
+        rows[0],
+        (
+            "gamehost-mailpit-1".into(),
+            ContainerStat {
+                cpu: "0.02%".into(),
+                mem: "10.19MB".into(),
+                net: "22.22kB / 7.348kB".into(),
+            }
+        )
+    );
+    assert_eq!(
+        rows[1],
+        (
+            "gamehost-db-1".into(),
+            ContainerStat {
+                cpu: "0.80%".into(),
+                mem: "51.13MB".into(),
+                net: "21.7kB / 7.348kB".into(),
+            }
+        )
+    );
+}
+
+#[test]
+fn parse_stats_rows_reads_docker_ndjson() {
+    let rows = parse_stats_rows(
+        r#"{"BlockIO":"4kB / 0B","CPUPerc":"1.25%","Container":"abc","ID":"abc","MemPerc":"0.1%","MemUsage":"15.5MiB / 7.6GiB","Name":"web","NetIO":"1.2kB / 648B","PIDs":"2"}
+{"BlockIO":"0B / 0B","CPUPerc":"0.50%","Container":"def","ID":"def","MemPerc":"0.2%","MemUsage":"20MiB / 7.6GiB","Name":"worker","NetIO":"2kB / 1kB","PIDs":"1"}"#,
+    );
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0].0, "web");
+    assert_eq!(rows[0].1.cpu, "1.25%");
+    assert_eq!(rows[0].1.mem, "15.5MiB");
+    assert_eq!(rows[0].1.net, "1.2kB / 648B");
+}
+
+#[test]
+fn container_listing_with_stats_joins_podman5_stats_by_name() {
+    let containers = running_containers_with(
+        true,
+        |backend| match backend {
+            Backend::Podman => RuntimeProbe::Present,
+            _ => RuntimeProbe::Absent,
+        },
+        |backend, _| {
+            assert_eq!(backend, Backend::Podman);
+            Some(r#"[{"Names":["gamehost-db-1"],"Image":"postgres","Status":"Up"}]"#.into())
+        },
+        |_| parse_stats_rows(PODMAN5_STATS).into_iter().collect(),
+    );
+    assert_eq!(containers.len(), 1);
+    assert_eq!(containers[0].name, "gamehost-db-1");
+    assert_eq!(containers[0].cpu, "0.80%");
+    assert_eq!(containers[0].mem, "51.13MB");
+}
+
+#[test]
+fn parse_stats_rows_drops_rows_without_a_name() {
+    assert!(parse_stats_rows(r#"[{"cpu_percent":"0.80%","mem_usage":"1MB / 2GB"}]"#).is_empty());
 }

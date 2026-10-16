@@ -2,3 +2,4 @@
 //! crate's own tests).
 
 pub mod ratchet;
+pub mod thread_spawn;

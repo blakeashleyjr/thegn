@@ -580,6 +580,11 @@ impl MonitorOverlay {
         self.tab == MonitorTab::Containers && !self.paused
     }
 
+    /// True while the monitor is showing the per-container rows.
+    pub fn shows_containers(&self) -> bool {
+        self.tab == MonitorTab::Containers
+    }
+
     pub fn prefs(&self) -> &MonitorPrefs {
         &self.prefs
     }
@@ -1314,14 +1319,21 @@ impl MonitorOverlay {
             crate::platform::ProcSignal::Terminate => "SIGTERM",
             crate::platform::ProcSignal::Kill => "SIGKILL",
         };
-        match crate::platform::signal_pid(pid, stage) {
+        match crate::platform::signal_identity(pid, start_time, stage) {
             Ok(()) => {
                 self.status = Some(format!("sent {name} to {label}"));
                 if stage == crate::platform::ProcSignal::Terminate {
                     self.last_termed = Some((pid, start_time));
                 }
             }
-            Err(e) => self.status = Some(format!("{label}: {e}")),
+            Err(crate::platform::SignalError::Changed) => {
+                self.status = Some(format!(
+                    "{label}: process changed or left the sampled list; select it again"
+                ));
+            }
+            Err(crate::platform::SignalError::Failed(error)) => {
+                self.status = Some(format!("{label}: {error}"));
+            }
         }
     }
 

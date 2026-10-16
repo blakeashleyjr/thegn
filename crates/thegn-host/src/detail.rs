@@ -1606,15 +1606,19 @@ fn widget_detail_inner(
                 },
             ];
             if let Some((u, t)) = s.mem_gib {
-                secs.push(Section::KeyVal(vec![
+                let mut breakdown = vec![
                     ("used".into(), format!("{u:.1}G"), Tok::Slot(S::Text)),
                     ("total".into(), format!("{t:.0}G"), Tok::Slot(S::Dim)),
                     (
-                        "free".into(),
+                        "available".into(),
                         format!("{:.1}G", (t - u).max(0.0)),
                         Tok::Slot(S::Dim),
                     ),
-                ]));
+                ];
+                if let Some(free) = s.mem_free_gib {
+                    breakdown.push(("free".into(), format!("{free:.1}G"), Tok::Slot(S::Dim)));
+                }
+                secs.push(Section::KeyVal(breakdown));
             }
             if let Some((u, t)) = s.swap_gib {
                 secs.push(Section::Sparkrow {
@@ -1690,11 +1694,11 @@ fn widget_detail_inner(
                 let rows: Vec<Vec<Cell>> = s
                     .net_ifaces
                     .iter()
-                    .map(|(name, r, t)| {
+                    .map(|iface| {
                         vec![
-                            Cell::Text(trunc(name.clone(), 14), Tok::Slot(S::Text)),
-                            Cell::Text(format!("↓{}", rate(*r)), Tok::Hue(Hue::Green)),
-                            Cell::Text(format!("↑{}", rate(*t)), Tok::Hue(Hue::Blue)),
+                            Cell::Text(trunc(iface.name.clone(), 14), Tok::Slot(S::Text)),
+                            Cell::Text(format!("↓{}", rate(iface.rx_bps)), Tok::Hue(Hue::Green)),
+                            Cell::Text(format!("↑{}", rate(iface.tx_bps)), Tok::Hue(Hue::Blue)),
                         ]
                     })
                     .collect();
@@ -1730,7 +1734,12 @@ fn widget_detail_inner(
             );
             let mut kv = vec![("utilization".into(), format!("{p}%"), Tok::Hue(Hue::Teal))];
             if let Some((u, t)) = s.gpu_mem_mib {
-                kv.push(("vram".into(), format!("{u}/{t} MiB"), Tok::Slot(S::Text)));
+                let label = if s.gpu_mem_shared {
+                    "gpu mem (shared)"
+                } else {
+                    "vram"
+                };
+                kv.push((label.into(), format!("{u}/{t} MiB"), Tok::Slot(S::Text)));
             }
             if let Some(c) = s.gpu_temp_c {
                 kv.push(("temp".into(), format!("{c:.0}°C"), Tok::Slot(S::Dim)));

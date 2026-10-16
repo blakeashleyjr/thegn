@@ -89,6 +89,18 @@ and `snap`/`send`/`wait` it. [`docs/testing-with-muse.md`](docs/testing-with-mus
 is the full guide (environment, spec anatomy, the traps, artifacts, baselines,
 macOS); the `tui-check` skill under `extensions/skills/` is the agent recipe.
 
+### Cross-platform path semantics
+
+Core path tests can exercise Linux, macOS, Windows, and fallback conventions
+on one host through `util::{home_for, xdg_config_home_for, xdg_state_home_for}`.
+Use `testenv::state_env_for` when checking one OS's environment mapping, and
+`testenv::IsolatedState` for tests that mutate process environment or write
+state; it sets both Unix/XDG and Windows variables and restores them on drop.
+`testenv::symlinked_tempdir` supplies a link spelling and its canonical path
+for tests where the OS resolves paths through a symlink. The per-crate
+`state-env-*-ratchet.txt` allowlists track existing tests that still set these
+variables directly; the ratchet is shrink-only as tests migrate to the helper.
+
 `just` with no arguments lists every recipe. Commits follow conventional
 style (`feat(scope):`, `fix(scope):`); branch off `main`.
 
@@ -223,6 +235,150 @@ don't apply:
   the full `windows-latest` MSVC job (check + IPC/Job-Object kernel tests,
   release build, and downloaded-artifact smoke) runs only when `ci.yml` is
   dispatched with `extras: true`.
+
+### Running the tests under Wine (from Linux)
+
+`just test-windows-wine [nextest args]` cross-compiles the test binaries for
+`x86_64-pc-windows-gnu` and **runs** them under Wine, so a Windows regression
+shows up as a failing test on a Linux box instead of only as a compile check.
+With no arguments it runs the whole workspace; pass `-p <crate>` and/or a
+nextest filter to narrow it (`just test-windows-wine -p thegn-proc fallback`).
+It is x86_64 Linux only, a heavy gate (a separate full compile; the agent
+heavy-guard treats it like `just test`), and not part of `just ci`.
+
+How it is wired:
+
+- **Wine** is the flake package `.#wine` (`wineWow64Packages.minimal`, ~790 MB
+  closure), built on first use by the recipe. It is deliberately not in the dev
+  shell, so nobody else downloads it.
+- **`test/wine-runner.sh`** is the cargo target runner. It uses a private,
+  headless prefix under `$XDG_CACHE_HOME/thegn/` (created once, ~30 s), with
+  Mono/Gecko disabled and no display, and exits with the test's status. It
+  exports `THEGN_UNDER_WINE=1`.
+- **`test/mingw-link.sh`** wraps the mingw linker for this recipe only: the
+  cdylib that `iroh-relay` declares exceeds the 65,535-entry PE export table
+  in a debug build, so that one unused DLL is replaced by an empty stub.
+- **Skips** live in the `wine` profile in `.config/nextest.toml`, each with
+  its cause. That list is only for Wine artefacts. A test that fails because
+  thegn is wrong on Windows, or because the test assumes Linux, is a bug to
+  fix, not a skip.
+
+What it covers: pure logic, the `cfg(windows)` code paths in the leaf crates
+(`thegn-proc`, `thegn-metrics`, `thegn-media`, `tg-kit`, `gtui-*`), process
+spawning through Win32 `CreateProcess`, and Windows path handling. What it does
+NOT cover, so a green run here proves nothing about these: ConPTY behaviour
+(Wine's is incomplete), Job Object kill-on-close and nested jobs, named-pipe
+reservation timing (the `bind_exclusive` race above), NTFS ACLs, symlink
+privilege rules, and anything MSVC-specific. The MSVC CI job is still the gate
+for those.
+
+Wine also exposes the host's Unix root as drive `Z:`, so a test that checks
+`Path::new("/bin/sh").exists()` before spawning `sh` sees `true` under Wine and
+`false` on real Windows. Prefer `cfg!(unix)` for that kind of guard.
+
+Known gap: the test targets of `thegn-core`, `thegn-svc` and `thegn-host` do
+not yet compile for Windows (test code uses `std::os::unix` without a gate),
+so today the recipe runs only the leaf crates in practice.
+
+## Testing on other platforms
+
+Linux is the only platform the local gates run on. `just check-cross` proves
+that macOS and Windows code compiles; only running it there proves it works.
+Two opt-in recipes do that without paying for CI runners.
+
+### Any ssh host: `just test-remote`
+
+```sh
+just test-remote host=mymac                      # nix develop --command just test, on mymac
+just test-remote host=mymac thegn-core config::  # cargo nextest run -p thegn-core config::
+```
+
+`scripts/test-remote.sh` packs the worktree as git sees it (tracked files plus
+untracked, non-ignored ones, so uncommitted edits are included and `target/` is
+not). It unpacks the files into `<remote-dir>/src` on the host and commits a
+throwaway snapshot there, because `build.rs` and some tests expect a `HEAD`.
+It then runs the gate with `CARGO_TARGET_DIR=<remote-dir>/target`, streams
+the output, and exits with the remote gate's status. Afterwards it deletes
+`src/` and keeps `target/`, so the next run is a warm rebuild.
+`THEGN_REMOTE_CLEAN=1` deletes the whole remote dir.
+
+- **Auth** comes from your ssh config (`Host mymac` in `~/.ssh/config`). The
+  repo stores no hosts, users or keys. The runner opens one multiplexed
+  connection, so a hardware key prompts once per run, not once per step.
+- **Remote OS** is detected (`echo %OS%` returns `Windows_NT` from cmd.exe,
+  the Windows OpenSSH default shell). If the Windows default shell is
+  PowerShell, set `THEGN_REMOTE_OS=windows`.
+- **Knobs:** `THEGN_REMOTE_DIR` (default `.cache/thegn-remote/<worktree>` on
+  unix, `tgr/<worktree>` on Windows, relative to the remote home directory),
+  `THEGN_REMOTE_CMD` (replaces the gate: a sh snippet on unix, PowerShell on
+  Windows), and `THEGN_REMOTE_SSH_CONFIG` (`ssh -F`). Each is described at the
+  top of the script.
+- `just test-remote-selftest` checks the runner itself against a local ssh
+  shim. It needs no network and compiles nothing.
+
+**Using a Mac (Apple silicon).** Do this once on the Mac. Install Nix with the
+[Determinate installer](https://install.determinate.systems/), which enables
+flakes by default. Turn on Remote Login (System Settings → General → Sharing).
+Check that `ssh mymac nix --version` works from the Linux box. The flake
+supports `aarch64-darwin`, so the remote `nix develop` builds the same dev
+shell CI uses, and nothing else needs installing. The first run fetches that
+shell and does a cold build, which takes a while. Later runs reuse the remote
+`target/`. Intel Macs can't take the nix path (see Prerequisites). For an
+Intel Mac, set `THEGN_REMOTE_CMD='cargo nextest run --workspace'` after
+installing rustup and `cargo-nextest` there.
+
+**Windows host.** Install OpenSSH Server, Git for Windows, the Visual Studio
+Build Tools (C++ workload) and rustup's `x86_64-pc-windows-msvc` toolchain.
+`test/windows-vm/provision.ps1` installs all four and also runs on a real
+machine. The default gate is `cargo test --workspace --locked`, or
+`cargo test -p <crate> --locked [filter]` when you pass a crate.
+
+### Local Windows VM: `just test-windows-vm`
+
+A real Windows 11 guest under KVM, managed with
+[quickemu](https://github.com/quickemu-project/quickemu). quickemu and qemu
+come from the flake's pinned nixpkgs through `nix shell --inputs-from .`
+rather than the dev shell, because qemu is a ~1 GiB closure that only this
+recipe uses. The recipe is Linux-only. Your user needs read/write access to
+`/dev/kvm` (on NixOS, the `kvm` group). Neither step needs sudo or libvirt.
+
+```sh
+THEGN_WINVM_ACCEPT_LICENSES=1 just windows-vm-setup  # download ISO, prepare unattended install
+just windows-vm-up        # first boot: unattended install + provisioning, ~30-60 min
+just test-windows-vm      # up + the CI `windows` job's msvc check and test groups
+just test-windows-vm thegn-svc ipc                   # or one crate/filter
+just windows-vm-down      # clean shutdown;  windows-vm-status / windows-vm-destroy
+```
+
+- **State** is kept in `$XDG_DATA_HOME/thegn-dev/windows-vm`, never in the
+  repo. It holds the ISO (~6 GiB), a sparse qcow2 disk that grows to roughly
+  40–60 GiB once the toolchain and a `target/` are on it, a VM-only ssh key,
+  and the generated `ssh_config` for host `thegn-winvm`. To reach the VM by
+  name yourself, add `Include <state>/ssh_config` to `~/.ssh/config`. `setup`
+  refuses to start with less than 80 GiB free (`THEGN_WINVM_MIN_FREE_GB`).
+- **Provisioning** needs no clicks. quickget's unattended install creates a
+  local admin `Quickemu`, and `setup` adds a first-logon step that runs
+  `test/windows-vm/provision.ps1`. That script installs OpenSSH Server (key
+  only, using the VM key, password login disabled), VS Build Tools, Git and
+  rustup (stable msvc), then
+  writes `C:\thegn-provision.done`, which `up` waits for. Its log is
+  `C:\thegn-provision.log` in the guest.
+- **Media and licences.** `quickget windows 11` downloads Microsoft's
+  consumer Windows 11 ISO from Microsoft's own download API, not evaluation
+  media. It runs unactivated, which is fine for testing, and it doesn't expire
+  the way the 90-day Enterprise evaluation does. Using Windows still needs a
+  licence, and the provisioning accepts the Build Tools licence unattended.
+  Both are your decision, which is why `setup` requires
+  `THEGN_WINVM_ACCEPT_LICENSES=1`. If you use a time-limited evaluation image
+  instead, rebuild it when it expires with `just windows-vm-destroy`, then
+  `setup` and `up` again. Rebuilding takes about an hour, unattended.
+- **Exposure:** quickemu forwards the guest's ssh port on every host
+  interface, not just loopback. That is why provisioning turns password login
+  off: the unattended admin password is the well-known `quickemu`. Firewall
+  port 22220 if this machine is on an untrusted network.
+- **Tuning:** `THEGN_WINVM_CPUS` (8), `THEGN_WINVM_RAM` (16G),
+  `THEGN_WINVM_DISK` (96G, sparse), `THEGN_WINVM_SSH_PORT` (22220), and
+  `THEGN_WINVM_BOOT_TIMEOUT`.
 
 ## Where things live
 

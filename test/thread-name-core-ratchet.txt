@@ -1,0 +1,5 @@
+# Files in crates/thegn-core/src that still contain a bare production thread
+# spawn. Every long-lived thread needs a stable task comm attribution key.
+# SHRINK-ONLY. Enforced by `threads_are_named_ratchet` in
+# crates/thegn-core/src/platform_ratchet_tests.rs.
+# RATCHET-EMPTY

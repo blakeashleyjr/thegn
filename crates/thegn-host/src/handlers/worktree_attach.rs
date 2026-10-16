@@ -400,15 +400,7 @@ mod tests {
                 // system temp directory is shared.
                 let socket_dir = tempfile::Builder::new().prefix("wta").tempdir().unwrap();
                 let path = socket_dir.path().join("daemon.sock");
-                let l = std::os::unix::net::UnixListener::bind(&path).unwrap();
-                std::thread::spawn(move || {
-                    for stream in l.incoming() {
-                        // Not an ignored Result: the decoy's whole job is to
-                        // hold the connection open and never respond.
-                        let _ = stream; // hold it open; never respond
-                        std::thread::sleep(std::time::Duration::from_secs(30));
-                    }
-                });
+                crate::platform::test_spawn_silent_socket(&path).unwrap();
                 dcfg.socket = path.to_string_lossy().into_owned();
                 Some(socket_dir)
             }
@@ -452,6 +444,9 @@ mod tests {
 
     #[test]
     fn silent_daemon_hits_the_probe_timeout_instead_of_hanging_the_worker() {
+        if !crate::platform::test_unix_socket_supported() {
+            return;
+        }
         // The workers block on the probe: a daemon that accepts but never
         // replies (wedged loop, locked DB) must degrade to shells within
         // PROBE_TIMEOUT — the tab-open path has no other fallback once the

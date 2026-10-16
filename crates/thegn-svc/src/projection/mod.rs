@@ -720,10 +720,9 @@ mod tests {
     #[test]
     fn reaper_unmounts_and_removes_legacy_dirs_only() {
         let mounts = tempfile::tempdir().unwrap();
-        let legacy = mounts.path().join("dev-box-srv-work");
-        let current = mounts
-            .path()
-            .join("dev-box-srv-work--0123456789abcdef0123456789abcdef");
+        let mounts_path = std::fs::canonicalize(mounts.path()).unwrap();
+        let legacy = mounts_path.join("dev-box-srv-work");
+        let current = mounts_path.join("dev-box-srv-work--0123456789abcdef0123456789abcdef");
         std::fs::create_dir(&legacy).unwrap();
         std::fs::create_dir(&current).unwrap();
         let mut calls = Vec::new();
@@ -748,7 +747,12 @@ mod tests {
             .join("target--0123456789abcdef0123456789abcdef");
         let link = mounts.path().join("legacy-name");
         std::fs::create_dir(&target).unwrap();
-        std::os::unix::fs::symlink(&target, &link).unwrap();
+        if let Err(error) = thegn_core::fsperm::create_symlink(&target, &link, true) {
+            if cfg!(unix) {
+                panic!("symlink fixture: {error}");
+            }
+            return;
+        }
         let mut calls = Vec::new();
         let reaped = reap_legacy_mounts_with(mounts.path(), None, |argv| {
             calls.push(argv.to_vec());
@@ -811,7 +815,8 @@ mod tests {
     #[test]
     fn reaper_unmounts_a_mountinfo_legacy_path() {
         let mounts = tempfile::tempdir().unwrap();
-        let legacy = mounts.path().join("dev-box-srv-work");
+        let mounts_path = std::fs::canonicalize(mounts.path()).unwrap();
+        let legacy = mounts_path.join("dev-box-srv-work");
         std::fs::create_dir(&legacy).unwrap();
         let mounted = std::collections::BTreeSet::from([legacy.to_string_lossy().into_owned()]);
         let mut calls = Vec::new();
@@ -835,7 +840,12 @@ mod tests {
         let real_mounts = temp.path().join("real-mounts");
         let linked_mounts = temp.path().join("linked-mounts");
         std::fs::create_dir(&real_mounts).unwrap();
-        std::os::unix::fs::symlink(&real_mounts, &linked_mounts).unwrap();
+        if let Err(error) = thegn_core::fsperm::create_symlink(&real_mounts, &linked_mounts, true) {
+            if cfg!(unix) {
+                panic!("symlink fixture: {error}");
+            }
+            return;
+        }
         let legacy = real_mounts.join("dev-box-srv-work");
         std::fs::create_dir(&legacy).unwrap();
         let resolved_legacy = std::fs::canonicalize(&legacy).unwrap();

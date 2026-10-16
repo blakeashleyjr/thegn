@@ -54,48 +54,47 @@ the `$HOME` spelling) covers `~/.ssh`, `~/.aws`, `~/.azure`, `~/.gnupg`,
 keyrings, browser profiles, `~/.claude*`, `~/.codex`, thegn's state dir,
 `/run/agenix`, `/run/secrets`, `/run/user` and `/root`.
 
-**One chokepoint enforces it.** Every launcher (panes, agents, queue
-agents, autopilot, cache probes) builds its command through
-`sandbox::enter_argv` (and `ensure` for containers; queue agents only when
-the queue's sandbox opt-in is on), which — for a sealed
-spec — drops every mount whose host path or destination lies inside the
-deny list, whoever added it: `[sandbox] mounts`, a bound identity's git ssh
-key / `GH_CONFIG_DIR` / `GNUPGHOME`, the profile credential mounts, or an
-agent provider home. There is no default `~/.gnupg` grant; add
-`"~/.gnupg:rw"` to `[sandbox] mounts` yourself if a pane must sign. Mount
-entries accept `path`, `path:rw`, `host:dest`, or `host:dest:rw`; malformed
-entries are ignored with a warning and listed by `thegn config validate`. A
-mount whose host path is, or contains, a protected path (the worktree being
-`$HOME` itself, a `~` mount) refuses the launch. Compose on OCI backends is
-refused whenever the resolved spec requests `read_only_root`, `no_new_privileges`, a
-PID limit, dropped capabilities, sealed home, network-none or network filters,
-an OCI runtime, per-pane CPU/memory limits, or a VPN; Compose cannot enforce
-those restrictions. This applies under every profile, including `open`.
-Compose remains available when none of those restrictions is requested. Before
-`up`, thegn inspects the effective Compose config and refuses a service that
-binds thegn state, its runtime/control socket dir, credential dirs under `$HOME`
-(`.ssh`, `.aws`, `.gnupg`, `.config/gh`, `.kube`, `.docker`, `.netrc`,
-`.git-credentials`) or a container-engine socket. This includes binds of a parent
-directory, bind-backed named volumes, and file secrets/configs; there is no
-per-repo opt-out. If the config cannot be inspected, launch proceeds with a
-warning and is reported as host-process isolation. Remote placements are not
-checked. Queue-agent sandboxes get the same protected-bind check, including the
-daemon control-socket directory; a protected bind is refused and the queue
-dispatch is held. If their Compose config cannot be inspected, the agent runs
-degraded with a warning. On backends that store the label, a kept container is
-reused only if its `thegn.policy` label matches a fingerprint of the whole
-resolved policy and, when sealed, it binds exactly the required mounts;
-otherwise it is recreated.
-On these backends, a policy change recreates it once, and a container made by
-an older thegn is recreated once after upgrade. The one tolerated extra
-is the devenv `/nix` bind, and only while devenv is still on: turn devenv off and
-the container is recreated. Apple containers carry no seal label, so reuse there
-is judged on mounts alone, and a sealed Apple container whose inspect output has
-no mounts list at all is recreated rather than trusted. Dropped `[sandbox] mounts` are
-listed by `thegn doctor`; a user-authored one also warns once per path.
-The ssh identity-key mounts and shell-state XDG write carve-outs are not
-applied to sealed profiles. Extend the allowlist with `[sandbox] mounts`
-(paths outside the deny list only).
+**One chokepoint enforces it.** Every launcher (panes, agents, queue agents,
+autopilot, cache probes) builds its command through `sandbox::enter_argv` (and
+`ensure` for containers; queue agents only when the queue's sandbox opt-in is
+on), which — for a sealed spec — drops every mount whose host path or
+destination lies inside the deny list, whoever added it: `[sandbox] mounts`, a
+bound identity's git ssh key / `GH_CONFIG_DIR` / `GNUPGHOME`, the profile
+credential mounts, or an agent provider home. There is no default `~/.gnupg`
+grant; add `"~/.gnupg:rw"` to `[sandbox] mounts` yourself if a pane must sign.
+Mount entries accept `path`, `path:rw`, `host:dest`, or `host:dest:rw`;
+malformed entries are ignored with a warning and listed by
+`thegn config validate`. A mount whose host path is, or contains, a protected
+path (the worktree being `$HOME` itself, a `~` mount) refuses the launch.
+Compose on OCI backends is refused whenever the resolved spec requests
+`read_only_root`, `no_new_privileges`, a PID limit, dropped capabilities,
+sealed home, network-none or network filters, an OCI runtime, per-pane
+CPU/memory limits, or a VPN; Compose cannot enforce those restrictions. This
+applies under every profile, including `open`. Compose remains available when
+none of those restrictions is requested. Before `up`, thegn inspects the
+effective Compose config and refuses a service that binds thegn state, its
+runtime/control socket dir, credential dirs under `$HOME` (`.ssh`, `.aws`,
+`.gnupg`, `.config/gh`, `.kube`, `.docker`, `.netrc`, `.git-credentials`) or a
+container-engine socket. This includes binds of a parent directory,
+bind-backed named volumes, and file secrets/configs; there is no per-repo
+opt-out. If the config cannot be inspected, launch proceeds with a warning and
+is reported as host-process isolation. Remote placements are not checked.
+Queue-agent sandboxes get the same protected-bind check, including the daemon
+control-socket directory; a protected bind is refused and the queue dispatch is
+held. If their Compose config cannot be inspected, the agent runs degraded with
+a warning. On backends that store the label, a kept container is reused only if
+its `thegn.policy` label matches a fingerprint of the whole resolved policy
+and, when sealed, it binds exactly the required mounts; otherwise it is
+recreated. On these backends, a policy change recreates it once, and a
+container made by an older thegn is recreated once after upgrade. The one
+tolerated extra is the devenv `/nix` bind, and only while devenv is still on:
+turn devenv off and the container is recreated. Apple containers carry no seal
+label, so reuse there is judged on mounts alone, and a sealed Apple container
+whose inspect output has no mounts list at all is recreated rather than
+trusted. Dropped `[sandbox] mounts` are listed by `thegn doctor`; a
+user-authored one also warns once per path. The ssh identity-key mounts and
+shell-state XDG write carve-outs are not applied to sealed profiles. Extend the
+allowlist with `[sandbox] mounts` (paths outside the deny list only).
 
 **Sealed agent panes need a managed account.** The only exception to the
 deny list is the _managed_ per-account credential dir thegn creates under
