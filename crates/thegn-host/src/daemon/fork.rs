@@ -408,6 +408,8 @@ pub(crate) fn handoff_path(child_id: &str) -> PathBuf {
 /// Write a plain-text handoff before the child is spawned.
 pub(crate) fn write_handoff(child_id: &str, text: &str) -> Result<PathBuf> {
     let path = handoff_path(child_id);
+    #[cfg(test)]
+    crate::testenv::refuse_real_state_write(&path, "fork handoff");
     let dir = path.parent().context("fork handoff has no parent")?;
 
     // Do not follow an attacker-controlled `forks` symlink. The final file is

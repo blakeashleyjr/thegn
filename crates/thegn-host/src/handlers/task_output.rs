@@ -33,6 +33,8 @@ pub(crate) fn safe_task_filename(name: &str) -> String {
 /// user can't pre-plant a symlink at our target path.
 pub(crate) fn task_output_dir() -> std::path::PathBuf {
     let dir = thegn_core::util::xdg_state_home().join("thegn/task-output");
+    #[cfg(test)]
+    crate::testenv::refuse_real_state_write(&dir, "task output dir");
     // best-effort: create the private dir; the caller's write surfaces failures.
     let _ = std::fs::create_dir_all(&dir);
     #[cfg(unix)]
