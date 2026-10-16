@@ -1443,7 +1443,9 @@ fn driver_refusal_goes_to_needs_human_without_the_agent() {
         },
     );
     assert_eq!(out.needs_human, ["refused"]);
-    assert_eq!(fixture.row("next").result_oid.as_deref(), Some(READY_OID));
+    let untouched = fixture.row("next");
+    assert_eq!(untouched.status, "deferred");
+    assert_eq!(untouched.result_oid.as_deref(), Some("stale-oid"));
     let saved = fixture.row("refused");
     assert_eq!(saved.status, "needs_human");
     assert_eq!(saved.agent_attempts, 0);
