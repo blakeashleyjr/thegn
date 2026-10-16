@@ -10,7 +10,7 @@
 battery.rs
 # gpu.rs — Linux sysfs (amdgpu/i915) + nvidia-smi vs macOS ioreg accelerator stats.
 gpu.rs
-# gpu_exec.rs — unix process-group kill (killpg) vs direct-child kill elsewhere.
+# gpu_exec.rs — unix-only fake-helper tests and Linux /proc test helpers.
 gpu_exec.rs
 # gpu_monitor.rs — unix-only fake-helper lifecycle tests.
 gpu_monitor.rs
