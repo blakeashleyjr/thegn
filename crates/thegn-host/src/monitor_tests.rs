@@ -2033,3 +2033,54 @@ fn network_tab_keeps_and_ghosts_idle_and_down_interfaces() {
         Section::KeyVal(values) if values.iter().any(|(key, _, _)| key == "all links")
     )));
 }
+
+#[test]
+fn gpu_monitor_labels_shared_memory_and_preserves_vram_for_discrete_cards() {
+    fn labels(shared: bool) -> Vec<String> {
+        let hist = history(10, NOW_MS);
+        let mut stats = full_snap();
+        stats.gpu_mem_shared = shared;
+        let model = model_with(stats);
+        let tab = super::build::tab(super::build::TabInput {
+            tab: MonitorTab::Gpu,
+            model: &model,
+            hist: &hist,
+            prefs: TabPrefs::default(),
+            cols: 120,
+            now_ms: NOW_MS,
+            sel: 0,
+            filter: "",
+            filtering: false,
+            tree: false,
+            proc_sort: ProcSort::default(),
+            proc_desc: false,
+            proc_rows: &[],
+            disk_rows: &[],
+            disk_eta: None,
+        });
+        tab.sections
+            .into_iter()
+            .flat_map(|section| match section {
+                crate::sections::Section::Grid { cells, .. } => cells
+                    .into_iter()
+                    .map(|(label, _, _)| label)
+                    .collect::<Vec<_>>(),
+                crate::sections::Section::Sparkrow { label, .. } => vec![label],
+                _ => Vec::new(),
+            })
+            .collect()
+    }
+
+    let shared = labels(true);
+    assert!(shared.contains(&"gpu mem (shared)".to_owned()));
+    assert!(shared.contains(&"gpu mem used".to_owned()));
+    assert!(shared.contains(&"gpu mem".to_owned()));
+    assert!(
+        !shared
+            .iter()
+            .any(|label| label == "vram" || label == "vram used")
+    );
+    let discrete = labels(false);
+    assert!(discrete.contains(&"vram".to_owned()));
+    assert!(discrete.contains(&"vram used".to_owned()));
+}

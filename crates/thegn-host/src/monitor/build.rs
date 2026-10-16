@@ -815,10 +815,20 @@ fn gpu(cx: &Ctx) -> Vec<Section> {
         cells.push(kv("utilization", format!("{p}%"), Tok::Hue(Hue::Teal)));
     }
     if let Some((u, t)) = s.gpu_mem_mib {
-        cells.push(kv("vram", format!("{u} / {t} MiB"), Tok::Slot(S::Text)));
+        let label = if s.gpu_mem_shared {
+            "gpu mem (shared)"
+        } else {
+            "vram"
+        };
+        let used_label = if s.gpu_mem_shared {
+            "gpu mem used"
+        } else {
+            "vram used"
+        };
+        cells.push(kv(label, format!("{u} / {t} MiB"), Tok::Slot(S::Text)));
         if t > 0 {
             cells.push(kv(
-                "vram used",
+                used_label,
                 format!("{:.0}%", u as f32 / t as f32 * 100.0),
                 Tok::Slot(S::Dim),
             ));
@@ -832,7 +842,8 @@ fn gpu(cx: &Ctx) -> Vec<Section> {
     }
     out.push(Section::Grid { cols: 2, cells });
     if s.gpu_mem_mib.is_some() {
-        out.push(cx.sparkrow(Metric::GpuMem, "vram", Tok::Hue(Hue::Purple)));
+        let label = if s.gpu_mem_shared { "gpu mem" } else { "vram" };
+        out.push(cx.sparkrow(Metric::GpuMem, label, Tok::Hue(Hue::Purple)));
     }
     if s.gpu_power_w.is_some() {
         out.push(cx.sparkrow(Metric::GpuPower, "power", Tok::Hue(Hue::Amber)));

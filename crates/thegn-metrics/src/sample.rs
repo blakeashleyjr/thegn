@@ -341,6 +341,7 @@ impl StatsSampler {
         let gpu = self.gpu.sample(slow);
         snap.gpu_pct = gpu.util_pct;
         snap.gpu_mem_mib = gpu.mem_mib;
+        snap.gpu_mem_shared = gpu.mem_shared;
         snap.gpu_temp_c = gpu.temp_c;
         snap.gpu_power_w = gpu.power_w;
         if let Some((total, avail, pct)) = disk_space(&self.disk_path) {
