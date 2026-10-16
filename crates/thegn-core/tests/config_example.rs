@@ -392,9 +392,7 @@ fn plugin_example_block_agrees_with_the_schema() {
                 "required marker for {table}.{key} must match schema"
             );
             let illustrative = ILLUSTRATIVE_PLUGIN_VALUES.contains(&(table, *key));
-            if let Some(default) = properties[*key].get("default")
-                && illustrative
-            {
+            if illustrative && properties[*key].get("default").is_some() {
                 assert!(
                     comment.contains("default") || comment.contains("Optional"),
                     "illustrative {table}.{key} comment must identify its value as default or Optional"
