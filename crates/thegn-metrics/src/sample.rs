@@ -143,6 +143,7 @@ fn probe_net_links(
 ) {
     match std::fs::read_to_string("/proc/net/route") {
         Ok(routes) => {
+            let routes = parse_default_route(&routes);
             crate::net_kind::probe_links_at(std::path::Path::new("/sys/class/net"), &routes, cache)
         }
         Err(_) => (
@@ -302,6 +303,12 @@ impl StatsSampler {
         self.nets.refresh(false);
         let dt_net = now.duration_since(self.prev_net).as_secs_f64().max(0.001);
         self.prev_net = now;
+        #[cfg(target_os = "linux")]
+        if self.net_classes.is_empty() {
+            let (network, up) = probe_net_links(&mut self.net_classes);
+            self.last_net_medium = network.medium;
+            self.net_up = up;
+        }
         let (ifaces, physical, all) = crate::net_kind::aggregate(
             self.nets.iter().map(|(name, data)| {
                 (

@@ -15,6 +15,8 @@ gpu_exec.rs
 # gpu_monitor.rs — unix-only fake-helper lifecycle tests.
 gpu_monitor.rs
 lib.rs
+# net_kind.rs — Linux sysfs link classification; aggregate() is cfg-free.
+net_kind.rs
 sample.rs
 # thermal.rs — macOS Apple-silicon HID temperature sensors (IOHIDEventSystemClient,
 # dlsym'd) vs sysinfo Components, which is correct on Linux and Intel Macs.
