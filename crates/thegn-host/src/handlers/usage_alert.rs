@@ -154,5 +154,25 @@ mod tests {
 
         lock.execute_batch("ROLLBACK").unwrap();
         assert!(crate::db_task::flush(std::time::Duration::from_secs(10)));
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        crate::db_task::persist(move |db| {
+            use thegn_core::store::NotificationStore;
+            if tx.send(db.get_all_notifications(10)).is_err() {
+                tracing::debug!(target: "thegn::usage_alert", "usage alert read-back receiver closed");
+            }
+        });
+        let notifications = rx
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            notifications
+                .iter()
+                .filter(|notification| notification.kind == NotificationKind::UsageLimit.as_str())
+                .count(),
+            1,
+            "the queued usage alert is persisted after the write lock is released",
+        );
     }
 }
