@@ -169,7 +169,7 @@ mod tests {
         assert_eq!(
             notifications
                 .iter()
-                .filter(|notification| notification.kind == NotificationKind::UsageLimit.as_str())
+                .filter(|notification| matches!(notification.kind, NotificationKind::UsageLimit))
                 .count(),
             1,
             "the queued usage alert is persisted after the write lock is released",
