@@ -206,11 +206,21 @@ fn sshfs_unmount_plan(spec: &ProjectionSpec, legacy_paths: &[String]) -> Vec<Vec
 /// Reap old slug-only SSHFS projection directories once at startup. Unmount is
 /// non-lazy and removal only succeeds for an empty directory.
 pub fn reap_legacy_mounts(mounts_dir: &std::path::Path) -> usize {
-    reap_legacy_mounts_with(mounts_dir, run)
+    let mounted = match std::fs::read_to_string("/proc/self/mountinfo") {
+        Ok(text) => Some(thegn_core::projection::sshfs_mountpoints_from_mountinfo(
+            &text,
+        )),
+        Err(error) => {
+            tracing::debug!(%error, "could not read process mountinfo for legacy projection reaper");
+            None
+        }
+    };
+    reap_legacy_mounts_with(mounts_dir, mounted.as_ref(), run_unmount_bounded)
 }
 
 fn reap_legacy_mounts_with(
     mounts_dir: &std::path::Path,
+    mounted: Option<&std::collections::BTreeSet<String>>,
     mut run_unmount: impl FnMut(&[String]) -> Result<()>,
 ) -> usize {
     let entries = match std::fs::read_dir(mounts_dir) {
@@ -236,28 +246,95 @@ fn reap_legacy_mounts_with(
             continue;
         }
         let path = entry.path();
-        match std::fs::symlink_metadata(&path) {
-            Ok(metadata) if metadata.is_dir() => {}
-            Ok(_) => continue,
-            Err(error) => {
-                tracing::debug!(%error, path = %path.display(), "could not inspect legacy projection mount");
-                continue;
-            }
-        }
         let path_string = path.to_string_lossy().into_owned();
-        match run_unmount(&SshPlacement::sshfs_unmount_argv(&path_string)) {
-            Ok(()) => match std::fs::remove_dir(&path) {
+        let is_mounted = mounted.map(|mounts| mounts.contains(&path_string));
+        let (is_real_dir, is_empty) = if is_mounted == Some(true) {
+            // lstat on a dead FUSE root can block; mountinfo is sufficient to
+            // identify this path for a non-lazy unmount attempt.
+            (false, false)
+        } else {
+            let is_real_dir = match std::fs::symlink_metadata(&path) {
+                Ok(metadata) => metadata.is_dir(),
+                Err(error) => {
+                    tracing::debug!(%error, path = %path.display(), "could not inspect legacy projection mount");
+                    continue;
+                }
+            };
+            let is_empty = if is_real_dir {
+                match std::fs::read_dir(&path) {
+                    Ok(mut entries) => match entries.next() {
+                        None => true,
+                        Some(Ok(_)) => false,
+                        Some(Err(error)) => {
+                            tracing::debug!(%error, path = %path.display(), "could not inspect legacy projection contents");
+                            false
+                        }
+                    },
+                    Err(error) => {
+                        tracing::debug!(%error, path = %path.display(), "could not inspect legacy projection contents");
+                        false
+                    }
+                }
+            } else {
+                false
+            };
+            (is_real_dir, is_empty)
+        };
+        match thegn_core::projection::legacy_reap_action(is_mounted, is_real_dir, is_empty) {
+            thegn_core::projection::LegacyReap::Skip => continue,
+            thegn_core::projection::LegacyReap::RemoveOnly => match std::fs::remove_dir(&path) {
                 Ok(()) => reaped += 1,
                 Err(error) => {
                     tracing::debug!(%error, path = %path.display(), "could not remove empty legacy projection mountpoint")
                 }
             },
-            Err(error) => {
-                tracing::debug!(%error, path = %path.display(), "could not unmount legacy projection mountpoint")
+            thegn_core::projection::LegacyReap::Unmount => {
+                match run_unmount(&SshPlacement::sshfs_unmount_argv(&path_string)) {
+                    Ok(()) => match std::fs::remove_dir(&path) {
+                        Ok(()) => reaped += 1,
+                        Err(error) => {
+                            tracing::debug!(%error, path = %path.display(), "could not remove empty legacy projection mountpoint")
+                        }
+                    },
+                    Err(error) => {
+                        tracing::debug!(%error, path = %path.display(), "could not unmount legacy projection mountpoint")
+                    }
+                }
             }
         }
     }
     reaped
+}
+
+const UNMOUNT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+fn run_unmount_bounded(argv: &[String]) -> Result<()> {
+    run_unmount_with_timeout(argv, UNMOUNT_TIMEOUT)
+}
+
+fn run_unmount_with_timeout(argv: &[String], timeout: std::time::Duration) -> Result<()> {
+    use std::sync::atomic::AtomicBool;
+
+    if argv.is_empty() {
+        bail!("empty projection unmount argv");
+    }
+    let mut command = std::process::Command::new(&argv[0]);
+    command.args(&argv[1..]);
+    let cancelled = AtomicBool::new(false);
+    let run = thegn_proc::run(
+        &mut command,
+        &thegn_proc::Limits::silent(timeout),
+        &cancelled,
+    );
+    if !run.success() {
+        bail!(
+            "{} failed: end={:?}, leader={:?}",
+            argv[0],
+            run.end,
+            run.leader
+        );
+    }
+    Ok(())
 }
 
 /// `rsync -e` transport flag carrying the placement's ssh knobs.
@@ -643,7 +720,7 @@ mod tests {
         std::fs::create_dir(&legacy).unwrap();
         std::fs::create_dir(&current).unwrap();
         let mut calls = Vec::new();
-        let reaped = reap_legacy_mounts_with(mounts.path(), |argv| {
+        let reaped = reap_legacy_mounts_with(mounts.path(), None, |argv| {
             calls.push(argv.to_vec());
             Ok(())
         });
@@ -666,7 +743,7 @@ mod tests {
         std::fs::create_dir(&target).unwrap();
         std::os::unix::fs::symlink(&target, &link).unwrap();
         let mut calls = Vec::new();
-        let reaped = reap_legacy_mounts_with(mounts.path(), |argv| {
+        let reaped = reap_legacy_mounts_with(mounts.path(), None, |argv| {
             calls.push(argv.to_vec());
             Ok(())
         });
@@ -679,5 +756,83 @@ mod tests {
                 .is_symlink()
         );
         assert!(target.is_dir());
+    }
+
+    #[test]
+    fn reaper_removes_known_unmounted_empty_legacy_directory_without_unmount() {
+        let mounts = tempfile::tempdir().unwrap();
+        let legacy = mounts.path().join("dev-box-srv-work");
+        std::fs::create_dir(&legacy).unwrap();
+        let mut calls = Vec::new();
+
+        let reaped = reap_legacy_mounts_with(
+            mounts.path(),
+            Some(&std::collections::BTreeSet::new()),
+            |argv| {
+                calls.push(argv.to_vec());
+                Ok(())
+            },
+        );
+
+        assert_eq!(reaped, 1);
+        assert!(calls.is_empty());
+        assert!(!legacy.exists());
+    }
+
+    #[test]
+    fn reaper_leaves_known_unmounted_nonempty_legacy_directory_alone() {
+        let mounts = tempfile::tempdir().unwrap();
+        let legacy = mounts.path().join("dev-box-srv-work");
+        std::fs::create_dir(&legacy).unwrap();
+        std::fs::write(legacy.join("working-copy-file"), "data").unwrap();
+        let mut calls = Vec::new();
+
+        let reaped = reap_legacy_mounts_with(
+            mounts.path(),
+            Some(&std::collections::BTreeSet::new()),
+            |argv| {
+                calls.push(argv.to_vec());
+                Ok(())
+            },
+        );
+
+        assert_eq!(reaped, 0);
+        assert!(calls.is_empty());
+        assert!(legacy.join("working-copy-file").exists());
+    }
+
+    #[test]
+    fn reaper_unmounts_a_mountinfo_legacy_path() {
+        let mounts = tempfile::tempdir().unwrap();
+        let legacy = mounts.path().join("dev-box-srv-work");
+        let mounted = std::collections::BTreeSet::from([legacy.to_string_lossy().into_owned()]);
+        let mut calls = Vec::new();
+
+        let reaped = reap_legacy_mounts_with(mounts.path(), Some(&mounted), |argv| {
+            calls.push(argv.to_vec());
+            Ok(())
+        });
+
+        assert_eq!(reaped, 0);
+        assert_eq!(
+            calls,
+            vec![SshPlacement::sshfs_unmount_argv(legacy.to_str().unwrap())]
+        );
+        assert!(!legacy.exists());
+    }
+
+    #[test]
+    fn bounded_unmount_runner_times_out_and_accepts_success() {
+        let started = std::time::Instant::now();
+        let timeout_result = run_unmount_with_timeout(
+            &["sleep".into(), "5".into()],
+            std::time::Duration::from_millis(200),
+        );
+        assert!(timeout_result.is_err());
+        assert!(started.elapsed() < std::time::Duration::from_secs(3));
+
+        assert!(
+            run_unmount_with_timeout(&["true".into()], std::time::Duration::from_secs(2)).is_ok()
+        );
     }
 }
