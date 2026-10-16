@@ -985,6 +985,8 @@ pub struct PerfSnapshot {
     pub cpu_children_reaped_ms: f64,
     /// Process CPU not attributed to the loop thread or measured off-loop spans.
     pub cpu_unattributed_ms: f64,
+    /// Cumulative allocator trim and arena-cap observability since process start.
+    pub malloc: crate::mem::AllocStats,
 }
 
 impl LoopPerf {
@@ -1071,6 +1073,7 @@ impl LoopPerf {
             cpu_scan_ms: cpu_totals.scan_ms,
             cpu_children_reaped_ms: cpu_totals.children_ms,
             cpu_unattributed_ms: cpu_totals.unattributed_ms,
+            malloc: crate::mem::alloc_stats(),
         };
 
         // Cumulative since process start, not per-interval: the worst open is a
@@ -1152,6 +1155,16 @@ impl LoopPerf {
             git_spawns_per_s = thegn_svc::git::git_spawn_count()
                 .saturating_sub(self.git_spawns_t0) as f64
                 / secs,
+            // Allocator counters are cumulative since process start, like db_open.
+            malloc_arena_max = snap.malloc.arena_cap.max,
+            malloc_arena_cap_applied = snap.malloc.arena_cap.applied,
+            malloc_trims_idle = snap.malloc.trims_idle,
+            malloc_trims_scan = snap.malloc.trims_scan,
+            malloc_scan_drains = snap.malloc.scan_drains,
+            malloc_trims_released = snap.malloc.trims_released,
+            malloc_trim_bytes = snap.malloc.trim_bytes,
+            malloc_trim_total_us = snap.malloc.trim_total_us,
+            malloc_trim_max_us = snap.malloc.trim_max_us,
             "perf rollup"
         );
 
@@ -1547,5 +1560,18 @@ mod tests {
         let b = thread_cpu_ns();
         std::hint::black_box(acc);
         assert!(b >= a);
+    }
+
+    #[test]
+    fn rollup_carries_allocator_stats() {
+        let _g = TEST_GUARD.lock().unwrap_or_else(|e| e.into_inner());
+        let _env = crate::testenv::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        crate::mem::record_test_idle_trim();
+        let mut lp = LoopPerf::new();
+        let snap = lp.rollup(Instant::now(), 0, 0, 0);
+        assert!(snap.malloc.trims_idle >= 1);
+        assert_eq!(snap.malloc, crate::mem::alloc_stats());
     }
 }

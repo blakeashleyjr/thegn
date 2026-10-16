@@ -37,6 +37,7 @@ struct State {
 pub(crate) struct ScanPool {
     cap: usize,
     state: Mutex<State>,
+    on_drain: Option<fn()>,
 }
 
 impl ScanPool {
@@ -48,13 +49,28 @@ impl ScanPool {
                 workers: 0,
                 busy: 0,
             }),
+            on_drain: None,
+        })
+    }
+
+    fn with_drain_hook(cap: usize, hook: fn()) -> Arc<Self> {
+        Arc::new(Self {
+            cap: cap.max(1),
+            state: Mutex::new(State {
+                queue: VecDeque::new(),
+                workers: 0,
+                busy: 0,
+            }),
+            on_drain: Some(hook),
         })
     }
 
     /// The shared pool every hydration invocation submits to.
     pub(crate) fn global() -> &'static Arc<ScanPool> {
         static POOL: std::sync::OnceLock<Arc<ScanPool>> = std::sync::OnceLock::new();
-        POOL.get_or_init(|| ScanPool::new(default_cap()))
+        POOL.get_or_init(|| {
+            ScanPool::with_drain_hook(default_cap(), crate::mem::trim_after_scan_burst)
+        })
     }
 
     /// Run every job on the pool and return one outcome per job, in input
@@ -153,18 +169,25 @@ impl ScanPool {
     fn worker_loop(self: Arc<Self>) {
         crate::platform::qos::set_self(crate::platform::qos::Qos::Utility);
         loop {
-            let task = {
+            let (task, drained) = {
                 let mut st = self.state.lock().unwrap();
                 match st.queue.pop_front() {
                     Some(t) => {
                         st.busy += 1;
-                        t
+                        (Some(t), false)
                     }
                     None => {
                         st.workers -= 1;
-                        return;
+                        (None, st.workers == 0)
                     }
                 }
+            };
+            let Some(task) = task else {
+                if drained && let Some(hook) = self.on_drain {
+                    crate::platform::qos::set_self(crate::platform::qos::Qos::Background);
+                    hook();
+                }
+                return;
             };
             {
                 let _cpu = crate::perf::measure(crate::perf::Subsys::Scan);
@@ -366,5 +389,55 @@ mod tests {
         let ledger = crate::perf::CPU.take();
         assert_eq!(ledger[crate::perf::Subsys::Scan as usize].1, 3);
         crate::perf::set_enabled(false);
+    }
+
+    static DRAIN_HOOK_CALLS: AtomicUsize = AtomicUsize::new(0);
+
+    fn count_drain() {
+        DRAIN_HOOK_CALLS.fetch_add(1, Ordering::SeqCst);
+    }
+
+    fn wait_for_drain_calls(expected: usize) {
+        for _ in 0..200 {
+            if DRAIN_HOOK_CALLS.load(Ordering::SeqCst) >= expected {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+    }
+
+    #[test]
+    fn drain_hook_fires_once_per_drained_burst() {
+        DRAIN_HOOK_CALLS.store(0, Ordering::SeqCst);
+        let pool = ScanPool::with_drain_hook(3, count_drain);
+        let first: Vec<(bool, ScanJob<()>)> = (0..8)
+            .map(|_| {
+                (
+                    false,
+                    Box::new(|| std::thread::sleep(std::time::Duration::from_millis(5)))
+                        as ScanJob<()>,
+                )
+            })
+            .collect();
+        assert_eq!(pool.run(first), vec![Some(()); 8]);
+        wait_for_drain_calls(1);
+        assert_eq!(DRAIN_HOOK_CALLS.load(Ordering::SeqCst), 1);
+        let second: Vec<(bool, ScanJob<()>)> = (0..8)
+            .map(|_| {
+                (
+                    false,
+                    Box::new(|| std::thread::sleep(std::time::Duration::from_millis(5)))
+                        as ScanJob<()>,
+                )
+            })
+            .collect();
+        assert_eq!(pool.run(second), vec![Some(()); 8]);
+        wait_for_drain_calls(2);
+        assert_eq!(DRAIN_HOOK_CALLS.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn global_pool_wires_the_trim_hook() {
+        assert!(ScanPool::global().on_drain.is_some());
     }
 }
