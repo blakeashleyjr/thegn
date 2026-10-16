@@ -10,6 +10,12 @@ How thegn _runs_ plugins: discovery (`[[plugins]]` + `plugins/*/plugin.toml`), v
 
 The host SHALL discover plugins from `[[plugins]]` config entries and from `<config_dir>/plugins/<dir>/plugin.toml` files (directory plugins defaulting `cwd` to their own directory), skip disabled entries, and validate each spec against the host contract (`HostContract::negotiate`): api compatibility, command presence, and contribution acceptance. `thegn plugin list` SHALL print the discovered set with mode/enabled/negotiation status, and `thegn plugin check` SHALL exit non-zero when any enabled spec fails validation, naming the problems.
 
+An enabled plugin is capability-gated when its manifest declares any
+non-surface capability or any scope. The host SHALL refuse to run an enabled
+gated plugin unless its user-config `[[plugins]]` entry sets
+`trusted_native = true`; a directory plugin's own `plugin.toml` SHALL NOT
+grant that trust.
+
 #### Scenario: A directory plugin is discovered
 
 - **WHEN** `<config_dir>/plugins/hello/plugin.toml` declares a valid v0.3 spec and the config declares none
@@ -19,6 +25,12 @@ The host SHALL discover plugins from `[[plugins]]` config entries and from `<con
 
 - **WHEN** a spec declares `api = "9.0.0"`
 - **THEN** `thegn plugin check` reports the incompatibility and exits non-zero
+
+#### Scenario: A gated directory plugin cannot trust itself
+
+- **WHEN** an enabled directory plugin declares a non-surface capability or
+  scope and sets `trusted_native = true` only in its `plugin.toml`
+- **THEN** the loader ignores that value and refuses the plugin as untrusted
 
 ### Requirement: Both plugin modes run without touching the idle loop
 

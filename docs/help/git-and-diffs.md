@@ -54,6 +54,9 @@ each row. At Normal width, `↵` widens to Half. The selected branch's recent
 commits appear at Half and Full width. `p` pulls and `P` pushes HEAD only;
 both refuse when another row is selected. `n` opens the new-branch name input.
 The menu's pull and push actions also operate on HEAD only.
+If reading a branch log fails, its block says `log unavailable` and shows the
+first error line. In the fused two-column view at Full and wide Half widths,
+clicking a row in either column moves the cursor to that row.
 With a rebase base marked, `r` rebases the commits after the mark onto the
 selected branch.
 

@@ -76,6 +76,8 @@ call, while the CLI-first `launch.preset` is excluded.
 Plugin scopes constrain calls made through the host. They do not sandbox the
 plugin subprocess itself; installing a plugin grants that executable the same
 ambient OS access it would have when launched directly.
+Capability-gated plugins require `trusted_native = true` in the user's
+`[[plugins]]` entry.
 
 **Gates:** `docs/api/plugin-api-<version>.json` (a wire change without an
 `API_VERSION` bump fails `plugin_api_wire`), `plugin_host_calls_cover_catalog`
