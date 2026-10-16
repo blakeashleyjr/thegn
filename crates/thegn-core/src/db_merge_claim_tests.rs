@@ -76,22 +76,18 @@ fn admission_rechecks_a_lease_after_waiting_for_the_write_lock() {
     let lease_until_ms = util::now_ms() + 100;
     let mut request = request();
     request.lease_until_ms = lease_until_ms;
-    let (notify, notified) = std::sync::mpsc::channel();
-    let mut sent = false;
-    waiter
-        .conn()
-        .busy_handler(Some(move |_| {
-            if !sent {
-                sent = true;
-                if notify.send(()).is_err() {
-                    return false;
-                }
-            }
-            true
-        }))
-        .unwrap();
+    // rusqlite's busy handler is a plain `fn` pointer, so the "the waiter is now
+    // blocked on the write lock" signal goes through a static.
+    static BUSY_SEEN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    fn note_busy(_: i32) -> bool {
+        BUSY_SEEN.store(true, std::sync::atomic::Ordering::Release);
+        true
+    }
+    waiter.conn().busy_handler(Some(note_busy)).unwrap();
     let admission = std::thread::spawn(move || waiter.admit_merge_claim(&request).unwrap());
-    notified.recv().unwrap();
+    while !BUSY_SEEN.load(std::sync::atomic::Ordering::Acquire) {
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
     while util::now_ms() < lease_until_ms {
         std::hint::spin_loop();
     }
