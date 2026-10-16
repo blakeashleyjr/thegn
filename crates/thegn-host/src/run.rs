@@ -57,7 +57,7 @@ use thegn_core::store::{
 #[path = "run_palette_db.rs"]
 mod run_palette_db;
 #[path = "run_pending_db.rs"]
-mod run_pending_db;
+pub(crate) mod run_pending_db;
 #[path = "run_test_cache.rs"]
 mod run_test_cache;
 
@@ -10690,6 +10690,10 @@ async fn event_loop<T: Terminal>(
                         dirty = true;
                     }
                 }
+                run_pending_db::PendingDbResult::WriteFailed { status } => {
+                    model.status = status;
+                    dirty = true;
+                }
             }
         }
         let active_tests_wt = active_tab_path(&session).to_string_lossy().into_owned();
@@ -10924,8 +10928,13 @@ async fn event_loop<T: Terminal>(
         // Off-loop worktree-rename completions (audit run.rs:12131/12147).
         while let Ok(done) = rename_rx.try_recv() {
             loop_perf.tick(crate::perf::WakeSource::Other);
-            model.status =
-                crate::handlers::worktree_rename::apply(&mut session, &mut region_last_w, done);
+            model.status = crate::handlers::worktree_rename::apply(
+                &mut session,
+                &mut region_last_w,
+                done,
+                &pending_db_tx,
+                &waker,
+            );
             persist_session_layout(&mut session, &panes);
             refresh_tab_model(&mut model, &session, &mut sb);
             sb.focus_active_row(&mut model);
@@ -18572,15 +18581,9 @@ async fn event_loop<T: Terminal>(
                                 let taken = thegn_core::worktree::BranchSet::from_names(names);
                                 choice.name = thegn_core::worktree::dedupe(&choice.name, &taken);
                             }
-                            // The tiny upsert stays synchronous (sanctioned
-                            // best-effort-persist family); the live spawn reads
-                            // the in-process choice registry, so a failed write
-                            // only loses restart persistence — surface it.
-                            if !crate::handlers::terminal::persist(&choice) {
-                                model.status =
-                                    "terminal not saved — it won't be remembered across restarts"
-                                        .into();
-                            }
+                            // The live spawn reads the in-process choice registry;
+                            // persistence runs on the FIFO writer and reports failures asynchronously.
+                            crate::handlers::terminal::persist(&choice, &pending_db_tx, &waker);
                             // Creating a terminal crosses into the terminals
                             // region without going through `activate_row!`, so
                             // bookmark the worktree being left here — otherwise
