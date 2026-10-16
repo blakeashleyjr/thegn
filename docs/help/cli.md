@@ -28,10 +28,13 @@ worktree):
 | Environments  | `env` · `zone` · `host` · `placement` · `debug` · `mcp` · `plugin`                                             |
 | Session       | `notify` · `logs` · `share` · `forward`                                                                        |
 | Control plane | `serve` · `session` · `events` · `attach` · `pair` · `api`                                                     |
-| Meta          | `config` · `keys` · `theme` · `doctor` · `setup` · `completions`                                               |
+| Meta          | `config` · `keys` · `theme` · `doctor` · `db` · `setup` · `completions`                                        |
 
 Global flags everywhere: `--config`, `--log-level`, `--set key=value`
 (repeatable), and `--profile <name>`.
+
+`thegn db vacuum` reclaims unused state-database pages; `--dry-run` previews
+the work without writing, and `--json` emits one report.
 
 Some of these are dev-channel only — see [[release-channels]].
 
