@@ -74,6 +74,7 @@ impl OnboardingUi {
 pub(crate) fn startup(
     cfg: &mut Config,
     active_menu: &mut Option<crate::menu::MenuOverlay>,
+    db: Option<&thegn_core::db::Db>,
 ) -> (OnboardingUi, bool) {
     // Headless/e2e launches set THEGN_SKIP_ONBOARDING to start straight in the
     // normal UI: a first-run wizard (or the keymap-preset picker below) is modal
@@ -88,23 +89,11 @@ pub(crate) fn startup(
         );
     }
     let requested = crate::onboarding::setup_requested();
-    // Only a healthy DB with no marker counts as first run — a broken DB must
-    // not re-open the wizard on every launch.
-    let first_run = thegn_core::db::Db::open()
-        .map(|db| {
-            db.get_ui_state("", crate::onboarding::UI_STATE_KEY)
-                .ok()
-                .flatten()
-                .is_none()
-        })
-        .unwrap_or(false);
+    let (first_run, remembered_preset) = startup_db_state(db);
     let wizard = (requested || first_run).then(|| OnboardingWizard::new(cfg));
     let mut rebuild = false;
     if cfg.keymap_preset.is_empty() || cfg.keymap_preset == "default" {
-        match thegn_core::db::Db::open()
-            .ok()
-            .and_then(|db| db.get_ui_state("", "keymap_preset").ok().flatten())
-        {
+        match remembered_preset {
             Some(remembered) if remembered != "default" => {
                 cfg.keymap_preset = remembered;
                 rebuild = true;
@@ -121,6 +110,20 @@ pub(crate) fn startup(
         },
         rebuild,
     )
+}
+
+/// Read startup markers from the already-open handle. A missing DB or a failed
+/// marker read is not treated as first run, matching the broken-DB fallback.
+fn startup_db_state(db: Option<&thegn_core::db::Db>) -> (bool, Option<String>) {
+    let Some(db) = db else {
+        return (false, None);
+    };
+    let first_run = matches!(
+        db.get_ui_state("", crate::onboarding::UI_STATE_KEY),
+        Ok(None)
+    );
+    let remembered_preset = db.get_ui_state("", "keymap_preset").ok().flatten();
+    (first_run, remembered_preset)
 }
 
 /// Feed one key to the wizard and apply its [`Outcome`] on the event loop:
@@ -210,10 +213,11 @@ fn resolve_token(secret_name: &str, token: &str, is_ref: bool) -> anyhow::Result
 
 /// Mark the wizard as seen so it stops auto-opening.
 fn persist_done() {
-    if let Ok(db) = thegn_core::db::Db::open() {
-        // best-effort: a failed persist just re-offers the wizard next launch.
-        let _ = db.set_ui_state("", crate::onboarding::UI_STATE_KEY, "1");
-    }
+    crate::db_task::persist(|db| {
+        if let Err(error) = db.set_ui_state("", crate::onboarding::UI_STATE_KEY, "1") {
+            tracing::debug!(target: "thegn::onboarding", %error, "could not persist onboarding completion");
+        }
+    });
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -489,5 +493,18 @@ mod tests {
         assert_eq!(restored.bg0, expected.bg0);
         assert_eq!(restored.text, expected.text);
         assert_ne!(restored.bg0, cfg.palette().bg0);
+    }
+
+    #[test]
+    fn startup_db_state_reads_the_passed_handle() {
+        let db = thegn_core::db::Db::open_memory().unwrap();
+        db.set_ui_state("", crate::onboarding::UI_STATE_KEY, "1")
+            .unwrap();
+        db.set_ui_state("", "keymap_preset", "vim").unwrap();
+        assert_eq!(startup_db_state(Some(&db)), (false, Some("vim".into())));
+
+        let empty = thegn_core::db::Db::open_memory().unwrap();
+        assert_eq!(startup_db_state(Some(&empty)), (true, None));
+        assert_eq!(startup_db_state(None), (false, None));
     }
 }

@@ -181,26 +181,29 @@ impl SidebarState {
 
     /// Persist a single `ui_state` key in the global [`SIDEBAR_SCOPE`].
     ///
-    /// Kept synchronous: a view-preference toggle is rare and the write is tiny,
-    /// and callers (+ tests) rely on read-after-write within the same session
-    /// (re-loading a fresh `SidebarState` immediately reflects the change). The
-    /// off-loop background writer would break that ordering for negligible gain.
+    /// Queue this best-effort cache write on the FIFO DB writer. The startup
+    /// loader is the only production reader, and queued writes preserve the
+    /// user's set/delete order against other ordered DB jobs.
     pub(crate) fn persist(&self, key: &str, value: &str) {
-        if let Ok(db) = thegn_core::db::Db::open() {
-            // best-effort: the DB is a cache; a failed persist only loses a
-            // view preference, never sidebar correctness
-            let _ = db.set_ui_state(SIDEBAR_SCOPE, key, value); // best-effort: cache write: the DB is a cache; git/forge stays the source of truth
-        }
+        let key = key.to_string();
+        let value = value.to_string();
+        crate::db_task::persist(move |db| {
+            if let Err(error) = db.set_ui_state(SIDEBAR_SCOPE, &key, &value) {
+                tracing::debug!(target: "thegn::sidebar", %error, "could not persist sidebar state");
+            }
+        });
     }
 
     /// Delete a single `ui_state` key in the global [`SIDEBAR_SCOPE`] — the
     /// counterpart of [`Self::persist`] for boolean keys returning to their
     /// default (unpinned / expanded), which are removed rather than tombstoned.
     pub(crate) fn unpersist(&self, key: &str) {
-        if let Ok(db) = thegn_core::db::Db::open() {
-            // best-effort: same cache rule as `persist`
-            let _ = db.del_ui_state(SIDEBAR_SCOPE, key);
-        }
+        let key = key.to_string();
+        crate::db_task::persist(move |db| {
+            if let Err(error) = db.del_ui_state(SIDEBAR_SCOPE, &key) {
+                tracing::debug!(target: "thegn::sidebar", %error, "could not delete sidebar state");
+            }
+        });
     }
 
     /// The currently-selected visible row, if any.
@@ -221,9 +224,73 @@ impl SidebarState {
     }
 }
 
+/// FIFO barrier/read-back on the writer's own connection, so tests observe
+/// queued sidebar mutations without opening a second DB connection.
+#[cfg(test)]
+pub(crate) fn read_ui_state_from_writer(scope: String) -> anyhow::Result<Vec<(String, String)>> {
+    let (tx, rx) = std::sync::mpsc::channel();
+    crate::db_task::persist(move |db| {
+        if tx.send(db.ui_state_in_scope(&scope)).is_err() {
+            tracing::debug!(target: "thegn::sidebar", "sidebar read-back receiver closed");
+        }
+    });
+    rx.recv_timeout(std::time::Duration::from_secs(10))?
+}
+
+#[cfg(test)]
+pub(crate) fn read_sidebar_state_from_writer() -> anyhow::Result<Vec<(String, String)>> {
+    read_ui_state_from_writer(SIDEBAR_SCOPE.to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn persist_does_not_block_on_a_held_write_lock() {
+        let state_home = tempfile::Builder::new()
+            .prefix("tg-sidebar-lock-")
+            .tempdir()
+            .unwrap();
+        let state_path = state_home.path().to_string_lossy().into_owned();
+        let _env = crate::testenv::EnvVarGuard::set(&[("XDG_STATE_HOME", &state_path)]);
+        let db = thegn_core::db::Db::open().unwrap();
+        drop(db);
+        let db_path = state_home.path().join("thegn/thegn.db");
+        let lock = rusqlite::Connection::open(db_path).unwrap();
+        lock.execute_batch("BEGIN IMMEDIATE").unwrap();
+
+        let started = std::time::Instant::now();
+        SidebarState::default().persist("sidebar_cols", "42");
+        assert!(started.elapsed() < std::time::Duration::from_millis(500));
+
+        lock.execute_batch("ROLLBACK").unwrap();
+        drop(lock);
+        let rows = read_sidebar_state_from_writer().unwrap();
+        assert!(
+            rows.iter()
+                .any(|(key, value)| key == "sidebar_cols" && value == "42")
+        );
+    }
+
+    #[test]
+    fn persist_then_unpersist_keeps_order() {
+        let state_home = tempfile::Builder::new()
+            .prefix("tg-sidebar-order-")
+            .tempdir()
+            .unwrap();
+        let state_path = state_home.path().to_string_lossy().into_owned();
+        let _env = crate::testenv::EnvVarGuard::set(&[("XDG_STATE_HOME", &state_path)]);
+        let db = thegn_core::db::Db::open().unwrap();
+        drop(db);
+
+        let sidebar = SidebarState::default();
+        sidebar.persist("pin:ordered", "1");
+        sidebar.unpersist("pin:ordered");
+
+        let rows = read_sidebar_state_from_writer().unwrap();
+        assert!(!rows.iter().any(|(key, _)| key == "pin:ordered"));
+    }
 
     #[test]
     fn load_reads_sidebar_flat() {

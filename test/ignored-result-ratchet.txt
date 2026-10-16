@@ -214,7 +214,6 @@ crates/thegn-host/src/handlers/host.rs
 crates/thegn-host/src/handlers/launch.rs
 crates/thegn-host/src/handlers/materialize.rs
 crates/thegn-host/src/handlers/merge_queue.rs
-crates/thegn-host/src/handlers/mod.rs
 crates/thegn-host/src/handlers/onboarding.rs
 crates/thegn-host/src/handlers/overlay.rs
 crates/thegn-host/src/handlers/paste_image.rs
