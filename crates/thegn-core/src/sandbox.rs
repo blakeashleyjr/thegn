@@ -2258,16 +2258,30 @@ fn container_status(spec: &SandboxSpec) -> (bool, bool) {
 /// Ensure any persistent state exists (OCI: a keep-alive container we `exec`
 /// into). No-op for host-toolchain backends and `none`.
 pub fn ensure(spec: &SandboxSpec) -> anyhow::Result<()> {
-    let spec = &*launchable(spec).map_err(anyhow::Error::new)?;
-    if !spec.backend.is_oci() {
-        return Ok(());
+    let report = ensure_attested(spec, &crate::sandbox_compose::ComposeGuard::for_host(&[]))?;
+    if let Some(reason) = report.compose_unverified {
+        msg::warn(&format!(
+            "Compose config could not be inspected ({reason}); protected host binds were not checked; isolation reported as host-process"
+        ));
     }
+    Ok(())
+}
 
-    if let Some(compose) = spec.compose_spec() {
-        // `docker compose -f … -p <name> up -d [service runServices…]`. The
-        // project name is the sandbox name, so the pane's `compose exec` (see
-        // `enter_argv`) targets the same project.
-        crate::sandbox_compose::up_and_verify(spec, &compose)?;
+/// Ensure sandbox state and report whether Compose's effective config was checked.
+pub fn ensure_attested(
+    spec: &SandboxSpec,
+    guard: &crate::sandbox_compose::ComposeGuard,
+) -> anyhow::Result<crate::sandbox_compose::EnsureReport> {
+    let launchable = &*launchable(spec).map_err(anyhow::Error::new)?;
+    if let Some(compose) = launchable.compose_spec() {
+        return crate::sandbox_compose::up_and_verify(launchable, &compose, guard);
+    }
+    ensure_noncompose(launchable)?;
+    Ok(crate::sandbox_compose::EnsureReport::default())
+}
+
+fn ensure_noncompose(spec: &SandboxSpec) -> anyhow::Result<()> {
+    if !spec.backend.is_oci() {
         return Ok(());
     }
 
