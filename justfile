@@ -194,7 +194,7 @@ test-windows-wine *args:
     # the capture pipes, so nextest waits forever for an EOF the services never
     # send. Booting the services here, with stdio on /dev/null, means no test
     # process is ever their parent.
-    WINEPREFIX="$prefix" "$wine_out/bin/wineserver" --persistent </dev/null >/dev/null 2>&1 &
+    WINEPREFIX="$prefix" "$wine_out/bin/wineserver" --persistent </dev/null >/dev/null 2>&1
     trap 'WINEPREFIX="$prefix" "$wine_out/bin/wineserver" --kill 2>/dev/null || true' EXIT
     WINEPREFIX="$prefix" WINEDEBUG=-all "$THEGN_WINE" wineboot </dev/null >/dev/null 2>&1
     export THEGN_WINE_WARM=1
