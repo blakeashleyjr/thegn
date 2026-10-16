@@ -127,8 +127,12 @@ new-worktree wizard offers.
   preset never changes the remembered agent — it only launches panes.
 
 Presets are declared in `[[presets]]` (name, description, `commands`, `mode`,
-worktree-relative `cwd`, an `env` overlay, and an optional saved-`layout` ref);
-put secrets behind `env:`/`file:` refs, never raw. A `[[worktree_templates]]`
+worktree-relative `cwd`, an `env` overlay, and an optional saved-`layout` ref).
+A saved layout loads off the UI thread with status `Loading preset <name>…`,
+then opens in a new tab; a missing layout falls back
+to the commands. If you switch worktree while it loads, the preset is not
+applied. Put secrets behind `env:`/`file:` refs, never raw. A
+`[[worktree_templates]]`
 entry can carry `preset = "<name>"` to open with that shape at creation, and
 `thegn open <repo> --preset <name>` applies one on arrival (see [[cli]]).
 

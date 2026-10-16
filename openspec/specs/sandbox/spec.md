@@ -113,7 +113,10 @@ regardless of who added it (`[sandbox] mounts` including the defaults, bound
 identities, profile credential mounts, agent provider homes, cache injectors),
 and a mount whose host path is or contains a protected path SHALL refuse the
 launch. A sealed compose-backed spec SHALL be refused (compose volumes cannot be
-verified). A kept OCI container SHALL be reused for a sealed spec only when it
+verified). A non-sealed local compose spec SHALL be refused before `up` when its
+effective config binds a protected host path; an uninspectable config SHALL
+launch with a warning and report host-process isolation. A kept OCI container
+SHALL be reused for a sealed spec only when it
 carries `thegn.seal_home=1` and binds exactly the required mounts, and a
 non-sealed spec SHALL NOT reuse a sealed container. The devenv `/nix` bind SHALL
 be tolerated only when the current spec would itself emit it. Apple containers
