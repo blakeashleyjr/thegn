@@ -1596,6 +1596,48 @@ impl Db {
         self.prune_missing_semantic_files(after_rowid, limit.clamp(1, 4096))
     }
 
+    /// Drain stale semantic rows and orphan worktree caches to completion.
+    ///
+    /// This performs filesystem checks and database writes, so callers must
+    /// invoke it from background or CLI work, never from the UI event loop.
+    /// The semantic count is a net figure and may be skewed by concurrent
+    /// writers. A running UI instance may prune concurrently; both paths use
+    /// idempotent bounded transactions.
+    pub fn prune_stale_caches_to_end(
+        &self,
+        slice_rows: usize,
+        progress: &mut dyn FnMut(usize),
+    ) -> Result<(u64, usize)> {
+        let before: u64 = self
+            .conn()
+            .query_row("SELECT COUNT(*) FROM sem_entity", [], |row| row.get(0))?;
+        let limit = slice_rows.clamp(1, 4096);
+        let mut after_rowid = 0;
+        let mut total_scanned = 0;
+        loop {
+            let (scanned, next_rowid) = self.prune_missing_semantic_files(after_rowid, limit)?;
+            if scanned == 0 {
+                break;
+            }
+            after_rowid = next_rowid;
+            total_scanned += scanned;
+            progress(total_scanned);
+        }
+
+        let mut removed_cache_keys = 0;
+        for _ in 0..64 {
+            let removed = self.prune_orphan_worktree_caches(ORPHAN_CACHE_SWEEP_MAX_KEYS)?;
+            removed_cache_keys += removed;
+            if removed < ORPHAN_CACHE_SWEEP_MAX_KEYS {
+                break;
+            }
+        }
+        let after: u64 = self
+            .conn()
+            .query_row("SELECT COUNT(*) FROM sem_entity", [], |row| row.get(0))?;
+        Ok((before.saturating_sub(after), removed_cache_keys))
+    }
+
     /// Renumber every workspace to a contiguous, distinct `position` (0..n) in
     /// its current display order, healing NULL/duplicate positions (from insert
     /// paths that bypass `put_workspace`, or backfill ties). Uses the same
@@ -1691,6 +1733,107 @@ impl Db {
 #[cfg(test)]
 mod tests {
     use super::ORPHAN_CACHE_SWEEP_MAX_KEYS;
+
+    #[test]
+    fn prune_stale_caches_to_end_removes_orphans_and_counts() {
+        use crate::store::{CacheStore, SemanticStore, WorkspaceStore};
+
+        let db = Db::open_memory().unwrap();
+        let remote = r#"{"path":"/remote/repo/wt","host":"builder"}"#;
+        db.put_worktree(
+            "tab",
+            "/remote/repo",
+            "/remote/repo/wt",
+            "remote",
+            Some(remote),
+            None,
+        )
+        .unwrap();
+        let gone_entities = (0..3)
+            .map(|index| crate::store::SemEntityRow {
+                id: format!("gone-{index}"),
+                file: "/gone/wt/a.rs".into(),
+                name: format!("gone-{index}"),
+                kind: crate::semantic::EntityKind::Function,
+                start_line: index + 1,
+                end_line: index + 1,
+                source_hash: "hash".into(),
+            })
+            .collect::<Vec<_>>();
+        db.replace_file_entities("/gone/wt/a.rs", &gone_entities)
+            .unwrap();
+        db.replace_file_entities(
+            "/remote/repo/wt/a.rs",
+            &[crate::store::SemEntityRow {
+                id: "remote-entity".into(),
+                file: "/remote/repo/wt/a.rs".into(),
+                name: "remote".into(),
+                kind: crate::semantic::EntityKind::Function,
+                start_line: 1,
+                end_line: 1,
+                source_hash: "hash".into(),
+            }],
+        )
+        .unwrap();
+        db.put_pr_cache("/gone/wt", "main", "[]").unwrap();
+
+        let mut progress = Vec::new();
+        let removed = db
+            .prune_stale_caches_to_end(1, &mut |scanned| progress.push(scanned))
+            .unwrap();
+
+        assert_eq!(removed, (3, 1));
+        assert!(db.entities_under("/gone/wt").unwrap().is_empty());
+        assert_eq!(db.entities_under("/remote/repo/wt").unwrap().len(), 1);
+        assert!(progress.len() >= 3);
+        assert!(progress.windows(2).all(|counts| counts[0] <= counts[1]));
+    }
+
+    #[test]
+    fn prune_stale_caches_to_end_drains_more_than_one_key_budget() {
+        let db = Db::open_memory().unwrap();
+        db.put_worktree("tab", "/live", "/live", "main", None, None)
+            .unwrap();
+        let tx = db.conn().unchecked_transaction().unwrap();
+        for index in 0..(ORPHAN_CACHE_SWEEP_MAX_KEYS + 2) {
+            tx.execute(
+                "INSERT INTO worktree_titles(worktree,last_title,updated_at) VALUES(?1,'title',1)",
+                [format!("/gone/k{index}")],
+            )
+            .unwrap();
+        }
+        tx.execute(
+            "INSERT INTO worktree_titles(worktree,last_title,updated_at) VALUES('/live','title',1)",
+            [],
+        )
+        .unwrap();
+        tx.commit().unwrap();
+
+        let removed = db.prune_stale_caches_to_end(1, &mut |_| {}).unwrap();
+
+        assert_eq!(removed.1, ORPHAN_CACHE_SWEEP_MAX_KEYS + 2);
+        assert!(db.all_worktree_titles().unwrap().contains_key("/live"));
+    }
+
+    #[test]
+    fn prune_stale_caches_to_end_caps_extra_cache_sweeps() {
+        let db = Db::open_memory().unwrap();
+        let tx = db.conn().unchecked_transaction().unwrap();
+        let total_keys = ORPHAN_CACHE_SWEEP_MAX_KEYS * 65 + 1;
+        for index in 0..total_keys {
+            tx.execute(
+                "INSERT INTO worktree_titles(worktree,last_title,updated_at) VALUES(?1,'title',1)",
+                [format!("/gone/k{index:05}")],
+            )
+            .unwrap();
+        }
+        tx.commit().unwrap();
+
+        let removed = db.prune_stale_caches_to_end(1, &mut |_| {}).unwrap();
+
+        assert_eq!(removed.1, ORPHAN_CACHE_SWEEP_MAX_KEYS * 65);
+        assert_eq!(db.all_worktree_titles().unwrap().len(), 1);
+    }
 
     #[test]
     fn worktree_record_preserves_absence_nullable_fields_and_decode_errors() {
