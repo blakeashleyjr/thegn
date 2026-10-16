@@ -3924,8 +3924,8 @@ fn compose_teardown_projects_add_legacy_only_for_adopted_worktree() {
 }
 
 const PODMAN5_STATS: &str = r#"[
-  {"id":"","name":"gamehost-mailpit-1","cpu_time":"","cpu_percent":"0.02%","avg_cpu":"","mem_usage":"10.19MB","mem_percent":"","net_io":"22.22kB / 7.348kB","block_io":"","pids":""},
-  {"id":"","name":"gamehost-db-1","cpu_time":"","cpu_percent":"0.80%","avg_cpu":"","mem_usage":"51.13MB / 100.5GB","mem_percent":"","net_io":"21.7kB / 7.348kB","block_io":"","pids":""}
+  {"id":"a1b2c3d4e5f6","name":"gamehost-mailpit-1","cpu_time":"0.00s","cpu_percent":"0.02%","avg_cpu":"0.02%","mem_usage":"10.19MB / 100.5GB","mem_percent":"0.01%","net_io":"22.22kB / 7.348kB","block_io":"0B / 0B","pids":"3"},
+  {"id":"f6e5d4c3b2a1","name":"gamehost-db-1","cpu_time":"0.01s","cpu_percent":"0.80%","avg_cpu":"0.80%","mem_usage":"51.13MB / 100.5GB","mem_percent":"0.05%","net_io":"21.7kB / 7.348kB","block_io":"0B / 0B","pids":"12"}
 ]"#;
 
 #[test]
