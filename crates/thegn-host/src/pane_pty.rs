@@ -114,6 +114,31 @@ impl PtyProcessOwner {
             }
         }
     }
+
+    /// Start the bounded teardown away from the calling thread. The cloned
+    /// owner preserves serialization with the PTY reader's teardown path.
+    pub(crate) fn terminate_and_reap_detached(&self) {
+        let owner = self.clone();
+        {
+            let (in_flight, _) = &DETACHED_REAPERS;
+            let mut in_flight = in_flight
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner());
+            *in_flight += 1;
+        }
+        let guard = DetachedReaperGuard;
+        let spawn = std::thread::Builder::new()
+            .name("thegn-pty-reap".into())
+            .spawn(move || {
+                let _guard = guard;
+                crate::platform::qos::set_self(crate::platform::qos::Qos::Background);
+                owner.terminate_and_reap();
+            });
+        if let Err(error) = spawn {
+            tracing::debug!(target: "thegn::pty", %error, "unable to spawn detached PTY reaper; reaping inline");
+            self.terminate_and_reap();
+        }
+    }
 }
 
 impl Drop for PtyProcessState {
@@ -184,6 +209,46 @@ fn terminate_and_reap_parts(
 /// which is `src/platform/`'s business, not this call site's.
 fn force_kill_group(group: &crate::platform::GroupHandle) {
     group.kill();
+}
+
+static DETACHED_REAPERS: (Mutex<usize>, std::sync::Condvar) =
+    (Mutex::new(0), std::sync::Condvar::new());
+
+struct DetachedReaperGuard;
+
+impl Drop for DetachedReaperGuard {
+    fn drop(&mut self) {
+        let (in_flight, settled) = &DETACHED_REAPERS;
+        let mut in_flight = in_flight
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        *in_flight -= 1;
+        settled.notify_all();
+    }
+}
+
+/// Wait for detached pane reapers to finish, bounded by `timeout`.
+pub(crate) fn drain_detached_reapers(timeout: std::time::Duration) -> bool {
+    let (in_flight, settled) = &DETACHED_REAPERS;
+    let in_flight = in_flight
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner());
+    let started = std::time::Instant::now();
+    let mut in_flight = in_flight;
+    while *in_flight > 0 {
+        let remaining = timeout.saturating_sub(started.elapsed());
+        if remaining.is_zero() {
+            return false;
+        }
+        let (next, result) = settled
+            .wait_timeout(in_flight, remaining)
+            .unwrap_or_else(|poison| poison.into_inner());
+        in_flight = next;
+        if result.timed_out() && *in_flight > 0 {
+            return false;
+        }
+    }
+    true
 }
 
 /// Spawn `argv` (already composed by `sandbox::enter_argv`) in `cwd` on a fresh
@@ -489,6 +554,46 @@ mod tests {
         assert!(
             after.len() <= before,
             "background PTY reaper left a child behind (before={before}, after={}): {after:?}",
+            after.len()
+        );
+    }
+
+    #[test]
+    fn drain_detached_reapers_waits_for_inflight_reaps() {
+        if !std::path::Path::new("/proc/self/stat").exists()
+            || crate::platform::pty_term_grace().is_zero()
+        {
+            return;
+        }
+        let before = own_children().len();
+        let pty = portable_pty::native_pty_system();
+        let pair = pty
+            .openpty(PtySize {
+                rows: 24,
+                cols: 80,
+                pixel_width: 0,
+                pixel_height: 0,
+            })
+            .expect("open test PTY");
+        let mut command = CommandBuilder::new("sh");
+        command.args(["-c", "exec sleep 10"]);
+        let child = pair.slave.spawn_command(command).expect("spawn test child");
+        drop(pair.slave);
+        drop(pair.master);
+        let owner = PtyProcessOwner::new(child, None);
+
+        owner.terminate_and_reap_detached();
+        let drained = drain_detached_reapers(std::time::Duration::from_secs(3));
+        if !drained {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+            while own_children().len() > before && std::time::Instant::now() < deadline {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+        }
+        let after = own_children();
+        assert!(
+            after.len() <= before,
+            "drained detached reapers left a child behind (before={before}, after={}): {after:?}",
             after.len()
         );
     }

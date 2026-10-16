@@ -177,7 +177,6 @@ pub(crate) fn request_registered_adoption(
 }
 
 pub(crate) fn request_connect_root(
-    root: Option<std::path::PathBuf>,
     cwd: Option<std::path::PathBuf>,
     group_paths: Vec<String>,
     session_id: &str,
@@ -194,22 +193,37 @@ pub(crate) fn request_connect_root(
     let session_id = session_id.to_string();
     let tx = tx.clone();
     let wake = waker.clone();
-    crate::db_task::persist_critical(move |db| {
-        let result = read_connect_registry(db);
-        if let Err(error) = tx.send(SwitchResult::ConnectRoot {
-            seq,
-            session_id,
-            root,
-            cwd,
-            group_paths,
-            result,
-        }) {
-            tracing::debug!(target: "thegn::workspace_switch", %error, "connect-root result receiver is gone");
-        }
-        if let Err(error) = wake.wake() {
-            tracing::debug!(target: "thegn::workspace_switch", %error, "connect-root result wake failed");
-        }
+    tokio::spawn(async move {
+        let root_cwd = cwd.clone();
+        let root = match tokio::task::spawn_blocking(move || resolve_connect_root(root_cwd)).await {
+            Ok(root) => root,
+            Err(error) => {
+                tracing::debug!(target: "thegn::workspace_switch", %error, "connect-root root lookup worker failed");
+                None
+            }
+        };
+        crate::db_task::persist_critical(move |db| {
+            let result = read_connect_registry(db);
+            if let Err(error) = tx.send(SwitchResult::ConnectRoot {
+                seq,
+                session_id,
+                root,
+                cwd,
+                group_paths,
+                result,
+            }) {
+                tracing::debug!(target: "thegn::workspace_switch", %error, "connect-root result receiver is gone");
+            }
+            if let Err(error) = wake.wake() {
+                tracing::debug!(target: "thegn::workspace_switch", %error, "connect-root result wake failed");
+            }
+        });
     });
+}
+
+fn resolve_connect_root(cwd: Option<std::path::PathBuf>) -> Option<std::path::PathBuf> {
+    cwd.as_deref()
+        .and_then(thegn_core::repo::worktree_root_for_cwd)
 }
 
 fn read_connect_registry(db: &thegn_core::db::Db) -> anyhow::Result<ConnectRegistry> {
@@ -333,6 +347,29 @@ pub(crate) fn seed_deferred_preset(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "creates an isolated Git fixture for root resolution"
+    )]
+    fn connect_root_resolves_canonical_git_root_from_cwd() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().join("repo");
+        std::fs::create_dir(&repo).unwrap();
+        let initialized = thegn_core::util::git_cmd(&repo)
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .args(["-c", "commit.gpgsign=false", "init", "--quiet"])
+            .output()
+            .unwrap();
+        assert!(initialized.status.success());
+        let nested = repo.join("nested");
+        std::fs::create_dir(&nested).unwrap();
+        assert_eq!(
+            resolve_connect_root(Some(nested)),
+            Some(repo.canonicalize().unwrap())
+        );
+    }
 
     #[test]
     fn superseded_cold_result_is_dropped() {

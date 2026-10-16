@@ -4297,8 +4297,9 @@ gate_setup_command = ""       # run in the gate worktree BEFORE gate_command, to
                               # so a broken setup can neither blame a branch nor wake the agent.
                               # Runs on every gate invocation (including an in-place refresh of a
                               # reused worktree), so keep it idempotent and cheap when warm.
-gate_setup_timeout_secs = 0   # maximum setup duration; 0 disables the deadline. A timeout is
-                              # an infrastructure hold, never a red result attributed to a branch.
+gate_setup_timeout_secs = 1800 # maximum setup duration; defaults to 30 minutes. 0 disables
+                              # the deadline. A timeout is an infrastructure hold, never a
+                              # red result attributed to a branch.
 gate_timeout_secs = 3600      # maximum gate duration; defaults to one hour. 0 disables the
                               # deadline. A timeout is an infrastructure hold, never a red build.
 gate_on = true                # run gate_command before advancing main

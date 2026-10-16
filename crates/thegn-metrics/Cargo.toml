@@ -15,6 +15,7 @@ description = "Cross-platform system metrics substrate for the thegn masthead + 
 workspace = true
 [dependencies]
 sysinfo.workspace = true
+thegn-proc.workspace = true
 
 # statvfs for the unix disk-free fast path.
 [target.'cfg(unix)'.dependencies]

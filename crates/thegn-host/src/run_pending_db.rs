@@ -21,6 +21,13 @@ pub(crate) enum PendingDbResult {
         name: String,
         spec: Option<crate::layout_spec::LayoutSpec>,
     },
+    Preset {
+        seq: u64,
+        group: String,
+        worktree: String,
+        preset: thegn_core::config::Preset,
+        spec: Option<crate::layout_spec::LayoutSpec>,
+    },
     Template {
         tab: String,
         fallback_commands: Vec<String>,
@@ -60,6 +67,49 @@ pub(crate) enum ApplyLayoutPlan {
     ChangedTab,
     Missing,
     Apply(crate::layout_spec::LayoutSpec),
+}
+
+#[derive(Debug, Clone)]
+pub(crate) enum PresetDrainPlan {
+    Stale,
+    ChangedWorktree,
+    Apply(crate::layout_spec::LayoutSpec),
+    FallBackToCommands,
+    NothingToLaunch,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PresetApplyOutcome {
+    Applied,
+    NothingSpawned,
+}
+
+pub(crate) fn plan_preset_apply(spawned: bool) -> PresetApplyOutcome {
+    if spawned {
+        PresetApplyOutcome::Applied
+    } else {
+        PresetApplyOutcome::NothingSpawned
+    }
+}
+
+pub(crate) fn plan_preset_drain(
+    accepts: bool,
+    active_worktree: Option<&str>,
+    worktree: &str,
+    spec: Option<crate::layout_spec::LayoutSpec>,
+    has_commands: bool,
+) -> PresetDrainPlan {
+    if !accepts {
+        PresetDrainPlan::Stale
+    } else if active_worktree != Some(worktree) {
+        PresetDrainPlan::ChangedWorktree
+    } else if let Some(spec) = spec {
+        PresetDrainPlan::Apply(spec)
+    } else if has_commands {
+        PresetDrainPlan::FallBackToCommands
+    } else {
+        PresetDrainPlan::NothingToLaunch
+    }
 }
 
 pub(crate) fn plan_apply_layout(
@@ -153,6 +203,23 @@ fn spec_from_db(db: &thegn_core::db::Db, name: &str) -> Option<crate::layout_spe
         .and_then(|json| crate::layout_spec::LayoutSpec::from_json(&json).ok())
 }
 
+fn preset_result_from_db(
+    db: &thegn_core::db::Db,
+    seq: u64,
+    group: String,
+    worktree: String,
+    preset: thegn_core::config::Preset,
+) -> PendingDbResult {
+    let spec = preset.layout_name().and_then(|name| spec_from_db(db, name));
+    PendingDbResult::Preset {
+        seq,
+        group,
+        worktree,
+        preset,
+        spec,
+    }
+}
+
 fn send_result(
     tx: &tokio::sync::mpsc::UnboundedSender<PendingDbResult>,
     waker: &termwiz::terminal::TerminalWaker,
@@ -206,6 +273,38 @@ pub(crate) fn queue_apply_layout(
         );
         if done_tx.send(()).is_err() {
             tracing::debug!(target: "thegn::db", "layout completion receiver is gone");
+        }
+    });
+    tokio::spawn(async move {
+        if send_dropped_result(done_rx, seq, &fallback_tx).await
+            && let Err(error) = fallback_wake.wake()
+        {
+            tracing::debug!(target: "thegn::db", %error, "pending DB result wake failed");
+        }
+    });
+}
+
+pub(crate) fn queue_preset_layout(
+    seq: u64,
+    group: String,
+    worktree: String,
+    preset: thegn_core::config::Preset,
+    tx: &tokio::sync::mpsc::UnboundedSender<PendingDbResult>,
+    waker: &termwiz::terminal::TerminalWaker,
+) {
+    let job_tx = tx.clone();
+    let job_wake = waker.clone();
+    let fallback_tx = tx.clone();
+    let fallback_wake = waker.clone();
+    let (done_tx, done_rx) = tokio::sync::oneshot::channel();
+    crate::db_task::persist(move |db| {
+        send_result(
+            &job_tx,
+            &job_wake,
+            preset_result_from_db(db, seq, group, worktree, preset),
+        );
+        if done_tx.send(()).is_err() {
+            tracing::debug!(target: "thegn::db", "preset completion receiver is gone");
         }
     });
     tokio::spawn(async move {
@@ -424,6 +523,64 @@ mod tests {
         assert!(matches!(
             plan_apply_layout(true, Some("repo/other"), "repo/main", Some(sample_spec())),
             ApplyLayoutPlan::ChangedTab
+        ));
+    }
+
+    #[test]
+    fn preset_drain_plan_covers_fence_worktree_layout_and_fallback() {
+        let worktree = "/repo/main";
+        let spec = sample_spec();
+        let cases = [
+            (false, Some(worktree), Some(spec.clone()), true, "stale"),
+            (
+                true,
+                Some("/repo/other"),
+                Some(spec.clone()),
+                true,
+                "changed",
+            ),
+            (true, Some(worktree), Some(spec.clone()), false, "apply"),
+            (true, Some(worktree), None, true, "commands"),
+            (true, Some(worktree), None, false, "nothing"),
+        ];
+        for (accepts, active, candidate, commands, expected) in cases {
+            let actual = plan_preset_drain(accepts, active, worktree, candidate, commands);
+            match expected {
+                "stale" => assert!(matches!(actual, PresetDrainPlan::Stale)),
+                "changed" => assert!(matches!(actual, PresetDrainPlan::ChangedWorktree)),
+                "apply" => assert!(matches!(actual, PresetDrainPlan::Apply(_))),
+                "commands" => assert!(matches!(actual, PresetDrainPlan::FallBackToCommands)),
+                "nothing" => assert!(matches!(actual, PresetDrainPlan::NothingToLaunch)),
+                _ => unreachable!(),
+            }
+        }
+    }
+
+    #[test]
+    fn preset_apply_plan_only_marks_spawned_layouts_as_applied() {
+        assert_eq!(plan_preset_apply(true), PresetApplyOutcome::Applied);
+        assert_eq!(plan_preset_apply(false), PresetApplyOutcome::NothingSpawned);
+    }
+
+    #[test]
+    fn preset_result_reads_saved_layout_and_keeps_request_sequence() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = thegn_core::db::Db::open_at(&dir.path().join("thegn.db")).unwrap();
+        let expected = sample_spec();
+        db.put_layout("saved", &expected.to_json().unwrap())
+            .unwrap();
+        let preset = thegn_core::config::Preset {
+            name: "test".into(),
+            layout: Some("saved".into()),
+            ..Default::default()
+        };
+        assert!(matches!(
+            preset_result_from_db(&db, 17, "repo/main".into(), "/repo/main".into(), preset),
+            PendingDbResult::Preset {
+                seq: 17,
+                spec: Some(spec),
+                ..
+            } if spec == expected
         ));
     }
 

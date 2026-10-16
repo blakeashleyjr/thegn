@@ -839,7 +839,8 @@ pub struct MergeQueueConfig {
     /// every real package manager's install command is. Running it only on
     /// worktree creation would silently rot the moment a lockfile changed.
     pub gate_setup_command: String,
-    /// Maximum time allowed for `gate_setup_command`; zero disables the deadline.
+    /// Maximum time allowed for `gate_setup_command`; defaults to 1800 seconds.
+    /// Zero disables the deadline.
     /// Filesystem calls and uninterruptible process I/O cannot be preempted.
     pub gate_setup_timeout_secs: u64,
     /// Maximum time allowed for `gate_command`; defaults to 3600 seconds.
@@ -1039,7 +1040,7 @@ impl Default for MergeQueueConfig {
             target_branch: "auto".to_string(),
             gate_command: String::new(),
             gate_setup_command: String::new(),
-            gate_setup_timeout_secs: 0,
+            gate_setup_timeout_secs: 1800,
             gate_timeout_secs: 3600,
             gate_on: true,
             gate_reuse_worktree: true,

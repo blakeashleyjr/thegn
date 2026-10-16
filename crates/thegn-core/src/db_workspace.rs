@@ -68,6 +68,8 @@ pub(crate) fn delete_worktree_cache_rows(db: &Db, wt: &str) -> Result<()> {
         "commit_cache",
         "worktree_titles",
         "test_cache",
+        "diff_cache",
+        "undo_marks",
     ] {
         let column = if matches!(table, "attention_acks" | "session_attention") {
             "worktree_path"
@@ -126,6 +128,8 @@ impl Db {
             "SELECT worktree FROM commit_cache",
             "SELECT worktree FROM worktree_titles",
             "SELECT worktree FROM test_cache",
+            "SELECT worktree FROM diff_cache",
+            "SELECT worktree FROM undo_marks",
         ];
         if table_exists(conn, "glyph_cache")? {
             cache_queries.push("SELECT worktree FROM glyph_cache");
@@ -163,23 +167,32 @@ impl Db {
             delete_worktree_cache_rows(self, key)?;
         }
 
-        // Issue tracker rows are keyed by repo root rather than worktree, but
-        // use the same registrations, ancestor, and on-disk protections. Share
-        // the sweep's key budget so this pass cannot make one terminal slice
-        // unbounded. The return value remains the number of worktree-cache keys
-        // removed, preserving the existing caller contract.
+        // Repo-keyed cache rows use the same registrations, ancestor, and
+        // on-disk protections. Share the sweep's key budget so this pass
+        // cannot make one terminal slice unbounded. The return value remains
+        // the number of worktree-cache keys removed, preserving its contract.
         let remaining_budget = max_keys.saturating_sub(orphan_keys.len());
         if remaining_budget > 0 {
-            let issue_roots = {
-                let mut stmt = conn.prepare(
-                    "SELECT DISTINCT repo_root FROM issue_cache \
-                     WHERE repo_root IS NOT NULL AND repo_root != '' \
-                     ORDER BY repo_root",
-                )?;
+            let repo_cache_tables = [
+                ("issue_cache", "repo_root"),
+                ("pr_branch_cache", "repo_root"),
+                ("issue_projects", "repo_root"),
+            ];
+            let repo_cache_queries: Vec<String> = repo_cache_tables
+                .iter()
+                .map(|(table, column)| format!("SELECT {column} FROM {table}"))
+                .collect();
+            let repo_query = format!(
+                "SELECT DISTINCT repo_root FROM ({}) \
+                 WHERE repo_root IS NOT NULL AND repo_root != '' ORDER BY repo_root",
+                repo_cache_queries.join(" UNION ALL ")
+            );
+            let repo_roots = {
+                let mut stmt = conn.prepare(&repo_query)?;
                 let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
                 rows.collect::<rusqlite::Result<Vec<_>>>()?
             };
-            let orphan_issue_roots: Vec<String> = issue_roots
+            let orphan_repo_roots: Vec<String> = repo_roots
                 .into_iter()
                 .filter(|key| {
                     !registered.contains(key)
@@ -190,11 +203,13 @@ impl Db {
                 })
                 .take(remaining_budget)
                 .collect();
-            for repo_root in orphan_issue_roots {
-                conn.execute(
-                    "DELETE FROM issue_cache WHERE repo_root=?1",
-                    params![repo_root],
-                )?;
+            for repo_root in orphan_repo_roots {
+                for (table, column) in repo_cache_tables {
+                    conn.execute(
+                        &format!("DELETE FROM {table} WHERE {column}=?1"),
+                        params![repo_root],
+                    )?;
+                }
             }
         }
         Ok(orphan_keys.len())
@@ -1572,6 +1587,15 @@ impl WorkspaceStore for Db {
 /// `Db` methods (not on the `WorkspaceStore` seam) — they're an implementation
 /// detail of `swap_*_positions`, not part of the store contract.
 impl Db {
+    /// Prune one bounded slice of stale semantic and cache rows.
+    ///
+    /// This performs filesystem checks and database writes, so callers must
+    /// invoke it from background work, never from the UI event loop. The
+    /// terminal slice also runs the bounded orphan-cache sweep.
+    pub fn prune_stale_cache_slice(&self, after_rowid: i64, limit: usize) -> Result<(usize, i64)> {
+        self.prune_missing_semantic_files(after_rowid, limit.clamp(1, 4096))
+    }
+
     /// Renumber every workspace to a contiguous, distinct `position` (0..n) in
     /// its current display order, healing NULL/duplicate positions (from insert
     /// paths that bypass `put_workspace`, or backfill ties). Uses the same
@@ -2233,6 +2257,209 @@ mod tests {
             1,
             "one issue-cache root must remain after a one-key sweep"
         );
+    }
+
+    #[test]
+    fn orphan_cache_sweep_prunes_diff_cache_and_undo_marks() {
+        use crate::store::{CacheStore, WorkspaceStore, WorktreeAuxStore};
+
+        let db = Db::open_memory().unwrap();
+        let existing = tempfile::tempdir().unwrap();
+        let existing_path = existing.path().to_string_lossy().into_owned();
+        let remote = r#"{"path":"/remote/wt","host":"builder"}"#;
+        db.put_worktree("tab", "/repo", "/live", "main", None, None)
+            .unwrap();
+        db.put_worktree("tab", "/repo", "/remote/wt", "remote", Some(remote), None)
+            .unwrap();
+        for key in ["/gone/wt", "/live", "/remote/wt", existing_path.as_str()] {
+            db.put_diff_cache(key, "[]").unwrap();
+            db.add_undo_mark(key, "sha").unwrap();
+        }
+
+        db.prune_orphan_worktree_caches(ORPHAN_CACHE_SWEEP_MAX_KEYS)
+            .unwrap();
+
+        assert!(db.get_diff_cache("/gone/wt").unwrap().is_none());
+        for key in ["/live", "/remote/wt", existing_path.as_str()] {
+            assert!(db.get_diff_cache(key).unwrap().is_some());
+        }
+        let gone_marks: i64 = db
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM undo_marks WHERE worktree='/gone/wt'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(gone_marks, 0);
+        for key in ["/live", "/remote/wt", existing_path.as_str()] {
+            let count: i64 = db
+                .conn()
+                .query_row(
+                    "SELECT COUNT(*) FROM undo_marks WHERE worktree=?1",
+                    params![key],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(count, 1, "undo marks for protected {key} were pruned");
+        }
+    }
+
+    #[test]
+    fn orphan_cache_sweep_prunes_repo_keyed_caches() {
+        use crate::store::{CacheStore, WorkspaceStore};
+
+        let db = Db::open_memory().unwrap();
+        let existing = tempfile::tempdir().unwrap();
+        let existing_path = existing.path().to_string_lossy().into_owned();
+        db.put_worktree("tab", "/repo", "/live", "main", None, None)
+            .unwrap();
+        for repo_root in ["/gone/repo", "/repo", existing_path.as_str()] {
+            db.put_pr_branch_cache(repo_root, "[]").unwrap();
+            db.put_issue_cache(repo_root, "linear", "default", "{}")
+                .unwrap();
+            db.conn()
+                .execute(
+                    "INSERT INTO issue_projects(repo_root,provider,account,json,fetched_at) VALUES(?1,'linear','default','{}',1)",
+                    params![repo_root],
+                )
+                .unwrap();
+        }
+
+        assert_eq!(
+            db.prune_orphan_worktree_caches(ORPHAN_CACHE_SWEEP_MAX_KEYS)
+                .unwrap(),
+            0
+        );
+        for table in ["pr_branch_cache", "issue_cache", "issue_projects"] {
+            let stale_count: i64 = db
+                .conn()
+                .query_row(
+                    &format!("SELECT COUNT(*) FROM {table} WHERE repo_root='/gone/repo'"),
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(stale_count, 0, "{table} retained a stale repo cache");
+            let protected_count: i64 = db
+                .conn()
+                .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+                    row.get(0)
+                })
+                .unwrap();
+            assert_eq!(
+                protected_count, 2,
+                "{table} lost a registered or existing root"
+            );
+        }
+
+        for repo_root in ["/gone/repo-a", "/gone/repo-b"] {
+            db.put_pr_branch_cache(repo_root, "[]").unwrap();
+            db.conn()
+                .execute(
+                    "INSERT INTO issue_projects(repo_root,provider,account,json,fetched_at) VALUES(?1,'linear','default','{}',1)",
+                    params![repo_root],
+                )
+                .unwrap();
+        }
+        assert_eq!(db.prune_orphan_worktree_caches(1).unwrap(), 0);
+        let remaining: i64 = db
+            .conn()
+            .query_row(
+                "SELECT COUNT(DISTINCT repo_root) FROM (
+                   SELECT repo_root FROM pr_branch_cache WHERE repo_root LIKE '/gone/repo-%'
+                   UNION ALL
+                   SELECT repo_root FROM issue_projects WHERE repo_root LIKE '/gone/repo-%'
+                 )",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            remaining, 1,
+            "one repo-root key must remain under a one-key budget"
+        );
+    }
+
+    #[test]
+    fn delete_worktree_cache_rows_covers_diff_cache_and_undo_marks() {
+        use crate::store::{CacheStore, WorkspaceStore, WorktreeAuxStore};
+
+        let db = Db::open_memory().unwrap();
+        db.put_worktree("tab", "/repo", "/wt", "main", None, None)
+            .unwrap();
+        db.put_diff_cache("/wt", "[]").unwrap();
+        db.add_undo_mark("/wt", "sha").unwrap();
+
+        db.del_worktree("/wt").unwrap();
+
+        assert!(db.get_diff_cache("/wt").unwrap().is_none());
+        let marks: i64 = db
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM undo_marks WHERE worktree='/wt'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(marks, 0);
+    }
+
+    #[test]
+    fn prune_stale_cache_slice_walks_to_terminal() {
+        use crate::store::{CacheStore, SemanticStore, WorkspaceStore};
+
+        let db = Db::open_memory().unwrap();
+        let remote = r#"{"path":"/remote/repo/wt","host":"builder"}"#;
+        db.put_worktree(
+            "tab",
+            "/remote/repo",
+            "/remote/repo/wt",
+            "remote",
+            Some(remote),
+            None,
+        )
+        .unwrap();
+        db.replace_file_entities(
+            "/gone/wt/a.rs",
+            &[crate::store::SemEntityRow {
+                id: "gone-entity".into(),
+                file: "/gone/wt/a.rs".into(),
+                name: "gone".into(),
+                kind: crate::semantic::EntityKind::Function,
+                start_line: 1,
+                end_line: 1,
+                source_hash: "hash".into(),
+            }],
+        )
+        .unwrap();
+        db.replace_file_entities(
+            "/remote/repo/wt/a.rs",
+            &[crate::store::SemEntityRow {
+                id: "remote-entity".into(),
+                file: "/remote/repo/wt/a.rs".into(),
+                name: "remote".into(),
+                kind: crate::semantic::EntityKind::Function,
+                start_line: 1,
+                end_line: 1,
+                source_hash: "hash".into(),
+            }],
+        )
+        .unwrap();
+        db.put_pr_cache("/gone/wt", "main", "[]").unwrap();
+
+        let mut after_rowid = 0;
+        loop {
+            let (scanned, next_rowid) = db.prune_stale_cache_slice(after_rowid, 1).unwrap();
+            after_rowid = next_rowid;
+            if scanned == 0 {
+                break;
+            }
+        }
+
+        assert!(db.entities_under("/gone/wt").unwrap().is_empty());
+        assert_eq!(db.entities_under("/remote/repo/wt").unwrap().len(), 1);
+        assert!(db.get_pr_cache("/gone/wt").unwrap().is_none());
     }
 
     #[test]
