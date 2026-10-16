@@ -13,7 +13,7 @@
 //! `Config::workspace` directly. Today the key is still the legacy lossy
 //! basename slug; the canonical binding to THE-516's `RepositoryId` (and the
 //! admitted-config revision from THE-505) replaces the key input here without
-//! touching the consumers. See `.thegn/maintenance/THE-515/plan.md`.
+//! touching the consumers. See THE-515.
 //!
 //! What this module refuses now, independent of repository identity:
 //!
