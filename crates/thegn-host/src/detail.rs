@@ -1690,11 +1690,11 @@ fn widget_detail_inner(
                 let rows: Vec<Vec<Cell>> = s
                     .net_ifaces
                     .iter()
-                    .map(|(name, r, t)| {
+                    .map(|iface| {
                         vec![
-                            Cell::Text(trunc(name.clone(), 14), Tok::Slot(S::Text)),
-                            Cell::Text(format!("↓{}", rate(*r)), Tok::Hue(Hue::Green)),
-                            Cell::Text(format!("↑{}", rate(*t)), Tok::Hue(Hue::Blue)),
+                            Cell::Text(trunc(iface.name.clone(), 14), Tok::Slot(S::Text)),
+                            Cell::Text(format!("↓{}", rate(iface.rx_bps)), Tok::Hue(Hue::Green)),
+                            Cell::Text(format!("↑{}", rate(iface.tx_bps)), Tok::Hue(Hue::Blue)),
                         ]
                     })
                     .collect();
