@@ -64,15 +64,29 @@ impl ScanPool {
         self: &Arc<Self>,
         jobs: Vec<(bool, ScanJob<R>)>,
     ) -> Vec<Option<R>> {
+        use thegn_svc::git::{ReadPriority, with_read_priority};
+
         let n = jobs.len();
         let (tx, rx) = mpsc::channel::<(usize, Option<R>)>();
         for (i, (urgent, job)) in jobs.into_iter().enumerate() {
             let tx = tx.clone();
+            let priority = if urgent {
+                ReadPriority::Foreground
+            } else {
+                ReadPriority::Background
+            };
             let task: Task = Box::new(move || {
                 // A panicking job yields `None`; the caller degrades that row.
                 // (`Result::ok(..)` form: the value is used, not ignored; the
                 // text-based ignored-result ratchet matches a trailing `.ok();`.)
-                let out = Result::ok(catch_unwind(AssertUnwindSafe(job)));
+                let out = Result::ok(catch_unwind(AssertUnwindSafe(|| {
+                    with_read_priority(priority, job)
+                })));
+                #[cfg(test)]
+                assert_eq!(
+                    thegn_svc::git::current_read_priority(),
+                    ReadPriority::Foreground
+                );
                 if tx.send((i, out)).is_err() {
                     // caller gone: nothing is waiting for this outcome.
                 }
@@ -314,5 +328,22 @@ mod tests {
         // Urgent was submitted last but ahead of every queued background job;
         // the background rows still all ran (eventual progress).
         assert_eq!(*order.lock().unwrap(), vec![3, 1, 2]);
+    }
+
+    #[test]
+    fn non_urgent_jobs_run_at_background_priority() {
+        let pool = ScanPool::new(1);
+        let urgent: ScanJob<thegn_svc::git::ReadPriority> =
+            Box::new(thegn_svc::git::current_read_priority);
+        let background: ScanJob<thegn_svc::git::ReadPriority> =
+            Box::new(thegn_svc::git::current_read_priority);
+        assert_eq!(
+            pool.run(vec![(true, urgent), (false, background)]),
+            vec![
+                Some(thegn_svc::git::ReadPriority::Foreground),
+                Some(thegn_svc::git::ReadPriority::Background)
+            ]
+        );
+        assert!(drained(&pool));
     }
 }

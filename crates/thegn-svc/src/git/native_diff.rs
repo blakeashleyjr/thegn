@@ -586,8 +586,7 @@ fn tree_to_worktree(repo: &gix::Repository, rev: &str) -> Result<Vec<DiffEntry>>
     // which together are exactly what `git diff HEAD` reports.
     // A path appears once per staged and once per unstaged change; dedup is
     // order-preserving and O(1) per item (a linear `contains` was O(N^2)).
-    let iter = repo
-        .status(gix::progress::Discard)
+    let iter = super::read_budget::budgeted_status(repo)
         .context("gix status")?
         .untracked_files(gix::status::UntrackedFiles::None)
         .into_iter(None)
