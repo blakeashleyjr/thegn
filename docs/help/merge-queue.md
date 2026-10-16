@@ -75,17 +75,18 @@ for a branch already merged. Within that, `[merge_queue]` lets you shape it:
   (shared `rr-cache`), so a conflict resolved once auto-resolves next
   time. A rerere-resolved merge still runs the gate before landing.
 
-When a conflicted path is governed by a custom `.gitattributes
-merge=<driver>` the object-DB fold cannot honor, that branch is folded
-through a throwaway-worktree real `git merge` so the driver runs, then
-the result is gated and landed normally. Clean folds pay none of this.
+Folds never run a repository-configured custom merge driver. A conflict on a
+path governed by one defers the branch to `needs_human` with
+`custom merge driver not run by folds: <path> (merge=<name>); resolve by hand`;
+no agent is dispatched. If thegn cannot read the merge configuration, the
+fold holds as an infrastructure error.
 
 A mode-160000 conflict is different: the queue defers it as a **submodule
 pointer conflict**, naming the path and both ours/theirs object IDs. It never
 chooses a pointer automatically and never sends that path through lockfile
-regeneration, a custom merge driver, rerere, or the throwaway merge's blanket
-stage step. The same structured message is available to the conflict handoff;
-ordinary text conflicts retain the behavior above.
+regeneration, rerere, or the throwaway merge's blanket stage step. The same
+structured message is available to the conflict handoff; ordinary text
+conflicts retain the usual fold behavior.
 
 ## After it lands
 

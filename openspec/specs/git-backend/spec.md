@@ -87,6 +87,9 @@ thegn SHALL surgically strip a stray `core.worktree` from a main checkout's shar
 ### Requirement: Serialize concurrent git mutations with a cross-process lock
 
 Mutating git operations SHALL take an advisory `flock` on `<git-common>/thegn-git.lock` so concurrent thegn/agent processes on the same repo serialize their writes, while reads remain lock-free.
+Network transfers (push, fetch, remote branch delete, and tag push) SHALL run
+outside the lock. A non-current local fast-forward SHALL take the lock only
+for the local ref update.
 
 #### Scenario: Two writers serialize
 
@@ -98,6 +101,12 @@ Mutating git operations SHALL take an advisory `flock` on `<git-common>/thegn-gi
 
 - **WHEN** a git read runs concurrently with a mutation
 - **THEN** the read proceeds without taking the lock
+
+#### Scenario: A slow push does not block local mutations
+
+- **WHEN** a push is in progress while another local git mutation runs
+- **THEN** the mutation can acquire the lock and proceed during the network
+  transfer
 
 ### Requirement: Submodule state is a bounded provider read
 
