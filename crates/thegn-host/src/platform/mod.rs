@@ -173,6 +173,9 @@ pub(crate) mod proc;
 /// steers a thread to the efficiency cores on Apple silicon); a no-op elsewhere.
 pub(crate) mod qos;
 
+/// Per-thread, process, and reaped-child CPU clocks.
+pub(crate) mod cpu_clock;
+
 pub(crate) mod sound;
 pub(crate) mod sound_process;
 

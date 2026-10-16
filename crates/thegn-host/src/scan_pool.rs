@@ -152,7 +152,10 @@ impl ScanPool {
                     }
                 }
             };
-            task();
+            {
+                let _cpu = crate::perf::measure(crate::perf::Subsys::Scan);
+                task();
+            }
             self.state.lock().unwrap().busy -= 1;
         }
     }
@@ -314,5 +317,20 @@ mod tests {
         // Urgent was submitted last but ahead of every queued background job;
         // the background rows still all ran (eventual progress).
         assert_eq!(*order.lock().unwrap(), vec![3, 1, 2]);
+    }
+
+    #[test]
+    fn scan_jobs_are_charged_to_the_scan_subsystem() {
+        crate::perf::set_enabled(true);
+        crate::perf::CPU.take();
+        let pool = ScanPool::new(2);
+        let jobs: Vec<(bool, ScanJob<()>)> = (0..3)
+            .map(|_| (false, Box::new(|| ()) as ScanJob<()>))
+            .collect();
+        let outcomes = pool.run(jobs);
+        assert_eq!(outcomes, vec![Some(()), Some(()), Some(())]);
+        let ledger = crate::perf::CPU.take();
+        assert_eq!(ledger[crate::perf::Subsys::Scan as usize].1, 3);
+        crate::perf::set_enabled(false);
     }
 }
