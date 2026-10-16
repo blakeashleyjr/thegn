@@ -3482,7 +3482,7 @@ fn panel_drill_drag_hit_clamps_into_main_column() {
         .find(|span| span.hit == PanelHit::GitDrill(0))
         .expect("commit files row is in the main column");
     assert_eq!(
-        panel_drill_drag_hit(&model, &ui, rect, rect.x, rect.y + drill.row),
+        panel_drill_drag_hit(&model, &ui, rect, rect.x, rect.y + drill.row).map(|d| d.0),
         Some(0),
         "a side-column drag sample clamps horizontally into the main drill"
     );
@@ -3505,7 +3505,7 @@ fn panel_drill_drag_hit_clamps_into_main_column() {
         .find(|span| span.row == zone.rows.end - 1)
         .expect("last visible blame row is draggable");
     assert_eq!(
-        panel_drill_drag_hit(&model, &ui, rect, rect.x, rect.y + zone.rows.end + 10),
+        panel_drill_drag_hit(&model, &ui, rect, rect.x, rect.y + zone.rows.end + 10).map(|d| d.0),
         match last.hit {
             PanelHit::GitDrill(index) => Some(index),
             _ => None,
@@ -3531,7 +3531,126 @@ fn panel_drill_drag_hit_clamps_into_main_column() {
             Rect { cols: 60, ..rect },
             rect.x,
             rect.y + narrow_drill.0,
-        ),
+        )
+        .map(|d| d.0),
         Some(narrow_drill.1)
+    );
+}
+
+#[test]
+fn panel_drill_drag_hit_reports_overflow() {
+    use crate::layout::PanelWidth;
+    use crate::panel::gitui::GitView;
+    use crate::panel::{BlameRow, CommitRow, PanelHit, PanelTab, PanelUi, Section};
+
+    let rect = Rect {
+        x: 7,
+        y: 4,
+        cols: 120,
+        rows: 40,
+    };
+    let mut model = panel_model();
+    model.panel.commits = vec![CommitRow {
+        sha: "abcdef0123456789".into(),
+        short: "abcdef0".into(),
+        subject: "feat: drag zone".into(),
+        author: "Author".into(),
+        date: 1_700_000_000,
+        refs: String::new(),
+        parents: vec![],
+    }];
+    let mut ui = PanelUi {
+        width: PanelWidth::Full,
+        open: Section::Commits,
+        tab: PanelTab::Git,
+        ..Default::default()
+    };
+    ui.git.focus = GitView::Blame;
+    ui.git.blame_rows = (0..100)
+        .map(|index| BlameRow {
+            sha: "abcdef0".into(),
+            author: "Author".into(),
+            date: 1_700_000_000,
+            lineno: index + 1,
+            content: format!("line {index}"),
+        })
+        .collect();
+    let frame = crate::panel::frame::build_panel(&model, &ui, rect.cols, rect.rows, true);
+    let zone = frame.col_zone.expect("Blame frame has a fused zone");
+    assert!(zone.rows.start > 0);
+    let drills: Vec<_> = frame
+        .col_hits
+        .iter()
+        .filter_map(|span| match span.hit {
+            PanelHit::GitDrill(index) if zone.rows.contains(&span.row) => Some((span.row, index)),
+            _ => None,
+        })
+        .collect();
+    let (top_row, top_index) = drills.first().copied().expect("visible top drill row");
+    let (bottom_row, bottom_index) = drills.last().copied().expect("visible bottom drill row");
+    assert_eq!(
+        panel_drill_drag_hit(&model, &ui, rect, rect.x, rect.y + zone.rows.end + 1),
+        Some((bottom_index, crate::panel::gitui::DragOverflow::Below(2)))
+    );
+    assert_eq!(
+        panel_drill_drag_hit(&model, &ui, rect, rect.x, rect.y),
+        Some((
+            top_index,
+            crate::panel::gitui::DragOverflow::Above(zone.rows.start)
+        ))
+    );
+    assert_eq!(
+        panel_drill_drag_hit(&model, &ui, rect, rect.x, rect.y + top_row),
+        Some((top_index, crate::panel::gitui::DragOverflow::Inside))
+    );
+    assert!(zone.rows.contains(&bottom_row));
+
+    let path = "src/a.rs";
+    let diff = concat!(
+        "diff --git a/src/a.rs b/src/a.rs\n",
+        "index 1111111..2222222 100644\n",
+        "--- a/src/a.rs\n",
+        "+++ b/src/a.rs\n",
+        "@@ -1,1 +1,2 @@\n old\n+new\n",
+    );
+    let doc = crate::panel::staging::build(path, diff);
+    let mut stage_ui = PanelUi {
+        width: PanelWidth::Full,
+        open: Section::Changes,
+        tab: PanelTab::Git,
+        ..Default::default()
+    };
+    stage_ui.git.focus = GitView::Staging;
+    stage_ui.git.staging = Some(crate::panel::gitui::StagingUi::new(path));
+    stage_ui.git.stage_doc = Some(crate::panel::gitui::StageDocState {
+        path: path.into(),
+        pane: crate::panel::gitui::StagePane::Unstaged,
+        doc,
+        diff: diff.into(),
+    });
+    let stage_frame =
+        crate::panel::frame::build_panel(&model, &stage_ui, rect.cols, rect.rows, true);
+    let stage_zone = stage_frame
+        .col_zone
+        .expect("Staging frame has a fused zone");
+    let first_drill = stage_frame
+        .col_hits
+        .iter()
+        .filter(|span| {
+            stage_zone.rows.contains(&span.row) && matches!(span.hit, PanelHit::GitDrill(_))
+        })
+        .min_by_key(|span| span.row)
+        .expect("staging has a visible drill row after its path header");
+    let first_index = match first_drill.hit {
+        PanelHit::GitDrill(index) => index,
+        _ => unreachable!("filtered to git drill hits"),
+    };
+    assert_eq!(
+        panel_drill_drag_hit(&model, &stage_ui, rect, rect.x, rect.y),
+        Some((
+            first_index,
+            crate::panel::gitui::DragOverflow::Above(stage_zone.rows.start)
+        )),
+        "an above-zone drag finds the first drill line past the staging path header"
     );
 }
