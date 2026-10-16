@@ -753,7 +753,7 @@ mod tests {
         let original_labels = rows
             .iter()
             .filter(|row| row.visible)
-            .map(|row| row.label.as_str())
+            .map(|row| row.label.clone())
             .collect::<Vec<_>>();
 
         super::hide_pending_deletes(&mut rows, &deleting);
@@ -767,7 +767,7 @@ mod tests {
             rebuilt_rows
                 .iter()
                 .filter(|row| row.visible)
-                .map(|row| row.label.as_str())
+                .map(|row| row.label.clone())
                 .collect::<Vec<_>>(),
             original_labels
         );
