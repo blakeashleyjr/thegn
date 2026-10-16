@@ -70,6 +70,9 @@ impl PluginTx {
 
 impl PluginRx {
     pub(crate) fn try_recv(&mut self) -> Result<PluginMsg, tokio_mpsc::error::TryRecvError> {
+        if let Some((plugin, event)) = self.inbox.pop_exit() {
+            return Ok(PluginMsg::Event { plugin, event });
+        }
         match self.lifecycle.try_recv() {
             Ok(message) => Ok(message),
             Err(tokio_mpsc::error::TryRecvError::Disconnected) => self

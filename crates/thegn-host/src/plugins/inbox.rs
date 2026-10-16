@@ -162,6 +162,25 @@ impl PluginInbox {
         Some((queued.plugin, queued.event))
     }
 
+    /// Exits participate in session lifecycle ordering even though ordinary
+    /// session events use the bounded inbox. Drain them before lifecycle
+    /// control messages such as `Respawned` from the separate channel.
+    pub(crate) fn pop_exit(&self) -> Option<(String, SessionEvent)> {
+        let mut state = lock(&self.state);
+        let position = state
+            .queue
+            .iter()
+            .position(|queued| matches!(&queued.event, SessionEvent::Exit { .. }))?;
+        let queued = state.queue.remove(position)?;
+        decrement(&mut state.plugin_counts, &queued.plugin);
+        if let Some(key) = queued.key
+            && state.coalesced.get(&key) == Some(&queued.sequence)
+        {
+            state.coalesced.remove(&key);
+        }
+        Some((queued.plugin, queued.event))
+    }
+
     pub(crate) fn pop_rejected(&self) -> Option<RejectedRequest> {
         let mut state = lock(&self.state);
         let rejected = state.rejected.pop_front()?;
