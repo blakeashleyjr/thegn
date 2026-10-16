@@ -472,7 +472,7 @@ pub(crate) fn drain(
     let mut damage = PluginDamage::None;
     let mut applied = 0;
     while applied < MAX_PLUGIN_MESSAGES_PER_DRAIN {
-        if let Some(rejected) = rx.pop_rejected() {
+        if let Some(rejected) = rx.pop_rejected_if_lifecycle_empty() {
             applied = applied.saturating_add(1);
             answer_rejected(state, rejected);
             continue;
@@ -1511,13 +1511,54 @@ mod tests {
             drain(&mut rx, &mut state, &mut model, None);
         }
 
-        assert!(
-            rx.is_empty(),
-            "the rejected request was consumed by the drain"
-        );
         let diagnostics = state.inbox.as_ref().unwrap().take_diagnostics();
         assert_eq!(diagnostics["p"].rejected, 1);
+        // The response payload is not observable here without a SessionWriter seam.
         assert_eq!(statusbar_views(&state)[0].1.text_content(), original);
+    }
+
+    #[test]
+    fn respawn_lifecycle_is_processed_before_rejected_request() {
+        let (tx, mut rx) = crate::plugins::plugin_channel();
+        for _ in 0..crate::plugins::inbox::MAX_QUEUED_EVENTS_PER_PLUGIN {
+            rx.inbox().push(
+                "p".into(),
+                SessionEvent::Message(msg("emit", serde_json::json!({}))),
+            );
+        }
+        assert_eq!(
+            rx.inbox().push(
+                "p".into(),
+                SessionEvent::Message(RpcMessage {
+                    id: Some(77),
+                    method: "io".into(),
+                    params: serde_json::json!({}),
+                }),
+            ),
+            crate::plugins::inbox::PushOutcome::Rejected
+        );
+        tx.send(PluginMsg::Event {
+            plugin: "p".into(),
+            event: SessionEvent::Exit { code: None },
+        })
+        .unwrap();
+        tx.send(PluginMsg::Respawned {
+            plugin: "p".into(),
+            writer: None,
+        })
+        .unwrap();
+
+        assert!(rx.pop_rejected_if_lifecycle_empty().is_none());
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(PluginMsg::Event {
+                event: SessionEvent::Exit { .. },
+                ..
+            })
+        ));
+        assert!(rx.pop_rejected_if_lifecycle_empty().is_none());
+        assert!(matches!(rx.try_recv(), Ok(PluginMsg::Respawned { .. })));
+        assert_eq!(rx.pop_rejected_if_lifecycle_empty().unwrap().id, 77);
     }
 
     #[test]
