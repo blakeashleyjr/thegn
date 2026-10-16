@@ -56,6 +56,161 @@ pub(crate) fn down_argv_for(
     Some(argv)
 }
 
+/// Compose projects use a path-specific suffix while ordinary OCI container
+/// names retain their historic slug-only form.
+pub(crate) fn hashed_project_name(name: &str, worktree: &Path) -> String {
+    format!(
+        "{name}-{}",
+        crate::util::short_hash(&worktree.to_string_lossy(), 6)
+    )
+}
+
+fn adoption_record_path(state_home: &Path, name: &str, worktree: &Path) -> PathBuf {
+    state_home
+        .join("thegn/compose-projects")
+        .join(format!("{}.adopted", hashed_project_name(name, worktree)))
+}
+
+fn adoption_record_matches(path: &Path, legacy_name: &str) -> bool {
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_file() => {
+            std::fs::read_to_string(path).is_ok_and(|body| body.trim() == legacy_name)
+        }
+        _ => false,
+    }
+}
+
+fn adoption_record_exists(path: &Path) -> bool {
+    std::fs::symlink_metadata(path).is_ok()
+}
+
+pub(crate) fn project_for_in(state_home: &Path, spec: &SandboxSpec) -> String {
+    let path = adoption_record_path(state_home, &spec.name, &spec.worktree);
+    if adoption_record_matches(&path, &spec.name) {
+        spec.name.clone()
+    } else {
+        hashed_project_name(&spec.name, &spec.worktree)
+    }
+}
+
+pub(crate) fn project_for(spec: &SandboxSpec) -> String {
+    project_for_in(&crate::util::xdg_state_home(), spec)
+}
+
+/// True when a Compose working directory belongs to this worktree, using path
+/// components so similarly slugified sibling paths cannot adopt one another.
+pub(crate) fn legacy_owned_by(stdout: &str, worktree: &Path) -> bool {
+    stdout
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .any(|line| {
+            let path = Path::new(line);
+            path.is_absolute() && path.starts_with(worktree)
+        })
+}
+
+fn write_adoption_record(state_home: &Path, spec: &SandboxSpec) -> std::io::Result<()> {
+    let directory =
+        crate::fsperm::ensure_private_dir_beneath(state_home, Path::new("thegn/compose-projects"))?;
+    directory.write_owner_only_atomic(
+        &format!(
+            "{}.adopted",
+            hashed_project_name(&spec.name, &spec.worktree)
+        ),
+        spec.name.as_bytes(),
+    )?;
+    Ok(())
+}
+
+pub(crate) fn resolve_project_with(
+    state_home: &Path,
+    spec: &SandboxSpec,
+    target: &ComposeTarget,
+    runner: impl Fn(&[String]) -> Option<(bool, String)>,
+) -> String {
+    let hashed = hashed_project_name(&spec.name, &spec.worktree);
+    let record = adoption_record_path(state_home, &spec.name, &spec.worktree);
+    if adoption_record_exists(&record) {
+        return if adoption_record_matches(&record, &spec.name) {
+            spec.name.clone()
+        } else {
+            hashed
+        };
+    }
+
+    let mut ps = crate::sandbox::oci_prefix(spec);
+    ps.extend([
+        "ps".into(),
+        "-a".into(),
+        "--filter".into(),
+        format!("label=com.docker.compose.project={}", spec.name),
+        "--format".into(),
+        "{{.Names}}".into(),
+    ]);
+    let Some((true, names)) = runner(&target.control_argv(&ps)) else {
+        tracing::info!(target: "thegn::sandbox", "unable to probe legacy Compose project; using hashed project name");
+        return hashed;
+    };
+    let names = names
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .collect::<Vec<_>>();
+    if names.is_empty() {
+        return hashed;
+    }
+    let mut inspect = crate::sandbox::oci_prefix(spec);
+    inspect.extend([
+        "inspect".into(),
+        "--format".into(),
+        "{{index .Config.Labels \"com.docker.compose.project.working_dir\"}}".into(),
+    ]);
+    inspect.extend(names.into_iter().map(str::to_owned));
+    let Some((true, working_dirs)) = runner(&target.control_argv(&inspect)) else {
+        tracing::info!(target: "thegn::sandbox", "unable to inspect legacy Compose project; using hashed project name");
+        return hashed;
+    };
+    if legacy_owned_by(&working_dirs, &spec.worktree) {
+        match write_adoption_record(state_home, spec) {
+            Ok(()) => spec.name.clone(),
+            Err(error) => {
+                tracing::info!(target: "thegn::sandbox", %error, "unable to record adopted Compose project; using hashed project name");
+                hashed
+            }
+        }
+    } else {
+        hashed
+    }
+}
+
+fn probe_project(state_home: &Path, spec: &SandboxSpec, target: &ComposeTarget) -> String {
+    use crate::sandbox::proc::{Capture, run_bounded};
+
+    resolve_project_with(state_home, spec, target, |argv| {
+        run_bounded(
+            argv,
+            COMPOSE_PS_TIMEOUT,
+            Capture {
+                stdout: Some(16 * 1024),
+                stderr: Some(4096),
+            },
+        )
+        .into_stdout()
+    })
+}
+
+pub(crate) fn teardown_projects_in(state_home: &Path, worktree: &Path) -> Vec<String> {
+    let name = crate::sandbox::container_name(&worktree.to_string_lossy());
+    let hashed = hashed_project_name(&name, worktree);
+    let record = adoption_record_path(state_home, &name, worktree);
+    if adoption_record_matches(&record, &name) {
+        vec![hashed, name]
+    } else {
+        vec![hashed]
+    }
+}
+
 /// A bounded Compose startup or verification failure.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum ComposeError {
@@ -788,11 +943,12 @@ pub(crate) fn up_and_verify(
     guard: &ComposeGuard,
 ) -> anyhow::Result<EnsureReport> {
     let target = ComposeTarget::for_spec(spec)?;
+    let state_home = crate::util::xdg_state_home();
+    let project = probe_project(&state_home, spec, &target);
     let labelled = if matches!(&spec.placement, Placement::Local) {
-        let state_home = crate::util::xdg_state_home();
         let existing_path = state_home
             .join("thegn/compose-labels")
-            .join(format!("{}.json", spec.name));
+            .join(format!("{project}.json"));
         let existing = match std::fs::symlink_metadata(&existing_path) {
             Ok(metadata) if metadata.file_type().is_file() => Some(existing_path),
             Ok(_) => None,
@@ -802,7 +958,7 @@ pub(crate) fn up_and_verify(
                 None
             }
         };
-        let services = enumerate_services(&target, &services_argv(&target, &spec.name, compose));
+        let services = enumerate_services(&target, &services_argv(&target, &project, compose));
         labelled_compose(
             compose,
             services.as_deref(),
@@ -813,15 +969,15 @@ pub(crate) fn up_and_verify(
                     &state_home,
                     std::path::Path::new("thegn/compose-labels"),
                 )?;
-                directory.write_owner_only_atomic(&format!("{}.json", spec.name), body.as_bytes())
+                directory.write_owner_only_atomic(&format!("{project}.json"), body.as_bytes())
             },
         )
     } else {
         compose.clone()
     };
     if !matches!(&spec.placement, Placement::Local) {
-        let up = target.control_argv(&up_argv(&target, &spec.name, &labelled));
-        let ps = target.control_argv(&ps_argv(&target, &spec.name, &labelled));
+        let up = target.control_argv(&up_argv(&target, &project, &labelled));
+        let ps = target.control_argv(&ps_argv(&target, &project, &labelled));
         run_up_checked(&up, &ps, COMPOSE_UP_TIMEOUT, COMPOSE_PS_TIMEOUT)?;
         return Ok(EnsureReport {
             compose_unverified: Some(
@@ -829,9 +985,9 @@ pub(crate) fn up_and_verify(
             ),
         });
     }
-    let config = target.control_argv(&config_json_argv(&target, &spec.name, &labelled));
-    let up = target.control_argv(&up_argv(&target, &spec.name, &labelled));
-    let ps = target.control_argv(&ps_argv(&target, &spec.name, &labelled));
+    let config = target.control_argv(&config_json_argv(&target, &project, &labelled));
+    let up = target.control_argv(&up_argv(&target, &project, &labelled));
+    let ps = target.control_argv(&ps_argv(&target, &project, &labelled));
     up_attested(
         &config,
         &up,
@@ -1594,5 +1750,42 @@ mod tests {
             ),
             crate::capabilities::IsolationClass::HostProcess
         );
+    }
+
+    #[test]
+    fn hashed_project_name_is_path_specific_stable_and_keeps_prefix() {
+        let name = "thegn-w-my-repo";
+        let first = hashed_project_name(name, Path::new("/w/my.repo"));
+        let second = hashed_project_name(name, Path::new("/w/my-repo"));
+        assert_ne!(first, second);
+        assert_eq!(first, hashed_project_name(name, Path::new("/w/my.repo")));
+        assert!(first.starts_with("thegn-"));
+        assert!(
+            first
+                .chars()
+                .all(|ch| ch.is_ascii_lowercase() || ch.is_ascii_digit() || ch == '-')
+        );
+        assert!(first.rsplit('-').next().unwrap().len() == 6);
+        assert!(
+            first
+                .rsplit('-')
+                .next()
+                .unwrap()
+                .bytes()
+                .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit())
+        );
+    }
+
+    #[test]
+    fn legacy_working_directory_uses_component_prefixes() {
+        assert!(legacy_owned_by(
+            "/w/my.repo/.devcontainer\n",
+            Path::new("/w/my.repo")
+        ));
+        assert!(!legacy_owned_by(
+            "/w/my-repo/.devcontainer\n",
+            Path::new("/w/my.repo")
+        ));
+        assert!(!legacy_owned_by("relative/path\n", Path::new("/w/my.repo")));
     }
 }
