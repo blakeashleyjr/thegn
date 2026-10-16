@@ -352,6 +352,9 @@ mod lane_tests {
     fn lane_runs_jobs_on_one_named_thread() {
         static LANE: Lane = Lane::new("thegn-msr-one");
         let (tx, rx) = mpsc::channel();
+        let mut seen = Vec::new();
+        // One job at a time: the queue holds a single pending job, so a second
+        // submit before the lane takes the first is (correctly) `Saturated`.
         for _ in 0..2 {
             let tx = tx.clone();
             assert_eq!(
@@ -364,9 +367,9 @@ mod lane_tests {
                 })),
                 crate::sched::Admission::Admitted
             );
+            seen.push(rx.recv_timeout(Duration::from_secs(5)).unwrap());
         }
-        let first = rx.recv_timeout(Duration::from_secs(5)).unwrap();
-        let second = rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        let (first, second) = (seen[0].clone(), seen[1].clone());
         assert_eq!(first, second);
         assert_eq!(first.1.as_deref(), Some("thegn-msr-one"));
     }
@@ -405,10 +408,22 @@ mod lane_tests {
             crate::sched::Admission::Admitted
         );
         let (tx, rx) = mpsc::channel();
-        assert_eq!(
-            LANE.submit(Box::new(move || tx.send(()).unwrap())),
-            crate::sched::Admission::Admitted
-        );
+        // The panicking job may still sit in the single-slot queue: retry until
+        // the lane takes the follow-up, which proves it survived the panic.
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            let tx = tx.clone();
+            match LANE.submit(Box::new(move || tx.send(()).unwrap())) {
+                crate::sched::Admission::Admitted => break,
+                other => {
+                    assert!(
+                        std::time::Instant::now() < deadline,
+                        "lane never re-admitted: {other:?}"
+                    );
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+            }
+        }
         rx.recv_timeout(Duration::from_secs(5)).unwrap();
     }
 }
