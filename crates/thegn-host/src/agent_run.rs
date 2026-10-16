@@ -739,6 +739,17 @@ pub(crate) mod bounded {
         fn classify_preserves_the_agent_outcome_mapping() {
             use thegn_proc::{Containment, End, GroupState, Leader, Run, Which};
 
+            #[derive(Clone, Copy)]
+            enum Want {
+                Spawn,
+                Reap,
+                Unsettled,
+                Cancelled,
+                TimedOut,
+                Success,
+                Failure,
+            }
+
             fn run(end: End, group: GroupState, leader: Leader) -> Run {
                 Run {
                     end,
@@ -760,7 +771,7 @@ pub(crate) mod bounded {
                         GroupState::Unknown,
                         Leader::NotSpawned,
                     ),
-                    0,
+                    Want::Spawn,
                 ),
                 (
                     run(
@@ -768,15 +779,15 @@ pub(crate) mod bounded {
                         GroupState::Unknown,
                         Leader::Detached,
                     ),
-                    1,
+                    Want::Reap,
                 ),
                 (
                     run(End::LeaderExited, GroupState::Unknown, Leader::Detached),
-                    2,
+                    Want::Unsettled,
                 ),
                 (
                     run(End::LeaderExited, GroupState::Unknown, Leader::NotSpawned),
-                    2,
+                    Want::Unsettled,
                 ),
                 (
                     run(
@@ -784,63 +795,55 @@ pub(crate) mod bounded {
                         GroupState::Unknown,
                         Leader::ReapFailed(std::io::Error::other("reap")),
                     ),
-                    1,
+                    Want::Reap,
                 ),
                 (
                     run(
                         End::Cancelled,
                         GroupState::Terminated,
-                        Leader::Reaped(failure.clone()),
+                        Leader::Reaped(failure),
                     ),
-                    3,
+                    Want::Cancelled,
                 ),
                 (
                     run(
                         End::TimedOut,
                         GroupState::Terminated,
-                        Leader::Reaped(failure.clone()),
+                        Leader::Reaped(failure),
                     ),
-                    4,
+                    Want::TimedOut,
                 ),
                 (
-                    run(
-                        End::TimedOut,
-                        GroupState::Drained,
-                        Leader::Reaped(failure.clone()),
-                    ),
-                    4,
+                    run(End::TimedOut, GroupState::Drained, Leader::Reaped(failure)),
+                    Want::TimedOut,
                 ),
                 (
                     run(
                         End::TimedOut,
                         GroupState::Survivors,
-                        Leader::Reaped(failure.clone()),
+                        Leader::Reaped(failure),
                     ),
-                    2,
+                    Want::Unsettled,
                 ),
                 (
-                    run(
-                        End::TimedOut,
-                        GroupState::Unknown,
-                        Leader::Reaped(failure.clone()),
-                    ),
-                    2,
+                    run(End::TimedOut, GroupState::Unknown, Leader::Reaped(failure)),
+                    Want::Unsettled,
                 ),
                 (
                     run(
                         End::LeaderExited,
                         GroupState::Terminated,
-                        Leader::Reaped(success.clone()),
+                        Leader::Reaped(success),
                     ),
-                    5,
+                    Want::Success,
                 ),
                 (
                     run(
                         End::LeaderExited,
                         GroupState::Drained,
-                        Leader::Reaped(failure.clone()),
+                        Leader::Reaped(failure),
                     ),
-                    6,
+                    Want::Failure,
                 ),
                 (
                     run(
@@ -848,27 +851,26 @@ pub(crate) mod bounded {
                         GroupState::Terminated,
                         Leader::Reaped(failure),
                     ),
-                    2,
+                    Want::Unsettled,
                 ),
             ];
 
             for (run, expected) in cases {
                 let actual = classify(run).outcome;
                 match expected {
-                    0 => assert!(matches!(&actual, AgentRunOutcome::Spawn(_))),
-                    1 => assert!(matches!(&actual, AgentRunOutcome::Reap(_))),
-                    2 => assert!(matches!(&actual, AgentRunOutcome::Unsettled)),
-                    3 => assert!(matches!(&actual, AgentRunOutcome::Cancelled)),
-                    4 => assert!(matches!(&actual, AgentRunOutcome::TimedOut)),
-                    5 => assert!(
+                    Want::Spawn => assert!(matches!(&actual, AgentRunOutcome::Spawn(_))),
+                    Want::Reap => assert!(matches!(&actual, AgentRunOutcome::Reap(_))),
+                    Want::Unsettled => assert!(matches!(&actual, AgentRunOutcome::Unsettled)),
+                    Want::Cancelled => assert!(matches!(&actual, AgentRunOutcome::Cancelled)),
+                    Want::TimedOut => assert!(matches!(&actual, AgentRunOutcome::TimedOut)),
+                    Want::Success => assert!(
                         matches!(&actual, AgentRunOutcome::Exited(status) if status.success())
                     ),
-                    6 => assert!(
+                    Want::Failure => assert!(
                         matches!(&actual, AgentRunOutcome::Exited(status) if !status.success())
                     ),
-                    _ => unreachable!(),
                 }
-                if expected == 2 {
+                if matches!(expected, Want::Unsettled) {
                     assert!(actual.is_infrastructure());
                 }
             }
