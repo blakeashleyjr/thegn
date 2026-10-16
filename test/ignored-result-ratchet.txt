@@ -141,7 +141,6 @@ crates/thegn-host/src/actions.rs
 crates/thegn-host/src/agent_configs.rs
 crates/thegn-host/src/agent_home.rs
 crates/thegn-host/src/agent.rs
-crates/thegn-host/src/agent_run.rs
 crates/thegn-host/src/agent_tests.rs
 crates/thegn-host/src/apps/mod.rs
 crates/thegn-host/src/attention_status.rs
