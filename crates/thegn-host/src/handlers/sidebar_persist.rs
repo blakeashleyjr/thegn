@@ -104,6 +104,9 @@ pub(crate) struct SidebarState {
     /// `materialize_failed`/`prewarm_failed`); `rebuild` overlays a red error
     /// dot so the failure stays visible after the halt modal is dismissed.
     pub(crate) env_failed: std::collections::HashSet<String>,
+    /// Worktree paths whose destroy workers are in flight. Process-local only:
+    /// groups remain in the session (and persisted layout) until completion.
+    pub(crate) deleting: std::collections::HashSet<String>,
     /// Deadline for the post-navigation grace freeze — the window after an
     /// `Alt+↑/↓` / `Alt+<digit>` jump made from a **pane**, where the sidebar
     /// never takes focus so the focus-edge freeze can't cover it. `None` = no

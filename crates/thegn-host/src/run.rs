@@ -1479,6 +1479,10 @@ impl SidebarState {
             &model.sidebar_db_terminals,
         );
         drop(rows_span);
+        crate::handlers::worktree_delete::hide_pending_deletes(
+            &mut model.sidebar_rows,
+            &self.deleting,
+        );
         // Drop marks whose row is gone (deleted worktree/workspace). Keep marks
         // whose row exists but is hidden by a collapsed parent, so re-expanding
         // restores the selection.
@@ -2052,11 +2056,12 @@ pub(crate) fn delete_groups_with_mode(
     keep_files: bool,
     mode: thegn_core::hooks::HookExecutionMode,
     waker: Option<termwiz::terminal::TerminalWaker>,
-) -> String {
+) -> (String, Vec<String>) {
     targets.sort_unstable_by(|a, b| b.cmp(a));
     targets.dedup();
     let (mut deleted, mut skipped, mut already_deleting) = (0usize, 0usize, 0usize);
     let mut spawn_errors = Vec::new();
+    let mut scheduled_paths = Vec::new();
     for gi in targets {
         if gi >= session.worktrees.len() {
             continue;
@@ -2083,6 +2088,7 @@ pub(crate) fn delete_groups_with_mode(
                 spawn_errors.push(format!("{path}: {error}"));
                 continue;
             }
+            scheduled_paths.push(path.clone());
         }
         // The group and its cache rows remain available until the worker reports
         // that pre_destroy and the requested disk operation both succeeded.
@@ -2098,7 +2104,7 @@ pub(crate) fn delete_groups_with_mode(
     if !spawn_errors.is_empty() {
         status.push_str(&format!(" (failed to start: {})", spawn_errors.join("; ")));
     }
-    status
+    (status, scheduled_paths)
 }
 
 /// Remove group `gi` from the session (its dir vanished from disk — deleted

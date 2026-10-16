@@ -141,6 +141,7 @@ fn apply_completions_from(
                 success,
                 message,
             } => {
+                sb.deleting.remove(&path);
                 if success {
                     if let Some(gi) = session
                         .worktrees
@@ -148,6 +149,7 @@ fn apply_completions_from(
                         .position(|g| g.name == group_name || g.path == path)
                     {
                         let gone_path = session.worktrees[gi].path.clone();
+                        sb.deleting.remove(&gone_path);
                         if crate::handlers::worktree_delete::remove_group(session, panes, gi) {
                             landing.land(session);
                         }
@@ -158,8 +160,9 @@ fn apply_completions_from(
                             .sidebar_db_worktrees
                             .retain(|w| w.path != gone_path && w.path != path);
                         model.status = format!("Deleted worktree {path}");
-                        changed = true;
                     }
+                    // Also on a concurrent reap, so the cleared `deleting` marker is re-applied by the rebuild.
+                    changed = true;
                 } else {
                     model.status = format!("Worktree delete failed for {path}: {message}");
                     changed = true;
@@ -2752,6 +2755,158 @@ mod landing_tests {
         delete(&mut session, &mut model, &mut sb, "app/alpha");
         assert_eq!(active_name(&session), "app/home");
         assert_eq!(cursor_path(&model, &sb).as_deref(), Some("/tmp/app-zeta"));
+    }
+
+    #[test]
+    fn optimistic_delete_hides_the_row_and_lands_once() {
+        let (mut session, mut model, mut sb) = tree(1);
+        let scheduled = ["/tmp/app-alpha".to_string()];
+        assert!(crate::handlers::worktree_delete::begin_optimistic_delete(
+            &mut session,
+            &mut model,
+            &mut sb,
+            &scheduled,
+        ));
+        assert_eq!(
+            worktree_paths(&model),
+            ["/tmp/app", "/tmp/app-mid", "/tmp/app-zeta"]
+        );
+        assert_eq!(active_name(&session), "app/mid");
+        assert_eq!(session.worktrees.len(), 4);
+        delete(&mut session, &mut model, &mut sb, "app/alpha");
+        assert_eq!(active_name(&session), "app/mid");
+        assert!(sb.deleting.is_empty());
+    }
+
+    #[test]
+    fn failed_optimistic_delete_restores_the_row_in_place_without_moving_focus() {
+        let (mut session, mut model, mut sb) = tree(1);
+        assert!(crate::handlers::worktree_delete::begin_optimistic_delete(
+            &mut session,
+            &mut model,
+            &mut sb,
+            &["/tmp/app-alpha".to_string()],
+        ));
+        let (tx, _rx) = tokio::sync::mpsc::channel(1);
+        let mut panes = crate::panes::Panes::new(tx);
+        assert!(apply_completions_from(
+            vec![LifecycleCompletion::WorktreeDelete {
+                group_name: "app/alpha".into(),
+                path: "/tmp/app-alpha".into(),
+                success: false,
+                message: "could not remove worktree at /tmp/app-alpha: locked".into(),
+            }],
+            &mut session,
+            &mut panes,
+            &mut model,
+            &mut sb,
+        ));
+        assert_eq!(
+            worktree_paths(&model),
+            [
+                "/tmp/app",
+                "/tmp/app-alpha",
+                "/tmp/app-mid",
+                "/tmp/app-zeta"
+            ]
+        );
+        assert_eq!(active_name(&session), "app/mid");
+        assert!(model.status.contains("locked"));
+        assert!(sb.deleting.is_empty());
+    }
+
+    #[test]
+    fn partial_failure_restores_only_the_failed_row() {
+        let (mut session, mut model, mut sb) = tree(0);
+        assert!(!crate::handlers::worktree_delete::begin_optimistic_delete(
+            &mut session,
+            &mut model,
+            &mut sb,
+            &["/tmp/app-alpha".to_string(), "/tmp/app-zeta".to_string()],
+        ));
+        let (tx, _rx) = tokio::sync::mpsc::channel(1);
+        let mut panes = crate::panes::Panes::new(tx);
+        assert!(apply_completions_from(
+            vec![
+                LifecycleCompletion::WorktreeDelete {
+                    group_name: "app/alpha".into(),
+                    path: "/tmp/app-alpha".into(),
+                    success: true,
+                    message: String::new(),
+                },
+                LifecycleCompletion::WorktreeDelete {
+                    group_name: "app/zeta".into(),
+                    path: "/tmp/app-zeta".into(),
+                    success: false,
+                    message: "locked".into(),
+                },
+            ],
+            &mut session,
+            &mut panes,
+            &mut model,
+            &mut sb,
+        ));
+        assert_eq!(
+            worktree_paths(&model),
+            ["/tmp/app", "/tmp/app-mid", "/tmp/app-zeta"]
+        );
+        assert!(
+            !session
+                .worktrees
+                .iter()
+                .any(|group| group.path == "/tmp/app-alpha")
+        );
+        assert!(model.status.contains("locked"));
+    }
+
+    #[test]
+    fn reap_during_pending_window_clears_the_marker() {
+        let (mut session, mut model, mut sb) = tree(0);
+        assert!(!crate::handlers::worktree_delete::begin_optimistic_delete(
+            &mut session,
+            &mut model,
+            &mut sb,
+            &["/tmp/app-alpha".to_string()],
+        ));
+        let (tx, _rx) = tokio::sync::mpsc::channel(1);
+        let mut panes = crate::panes::Panes::new(tx);
+        let gi = session
+            .worktrees
+            .iter()
+            .position(|group| group.path == "/tmp/app-alpha")
+            .expect("alpha group");
+        assert!(!crate::handlers::worktree_delete::remove_group(
+            &mut session,
+            &mut panes,
+            gi,
+        ));
+        assert!(apply_completions_from(
+            vec![LifecycleCompletion::WorktreeDelete {
+                group_name: "app/alpha".into(),
+                path: "/tmp/app-alpha".into(),
+                success: true,
+                message: String::new(),
+            }],
+            &mut session,
+            &mut panes,
+            &mut model,
+            &mut sb,
+        ));
+        assert!(!worktree_paths(&model).contains(&"/tmp/app-alpha"));
+        assert!(sb.deleting.is_empty());
+    }
+
+    #[test]
+    fn focused_cursor_on_a_pending_row_moves_to_its_neighbour() {
+        let (mut session, mut model, mut sb) = tree(0);
+        focus_cursor_on(&mut model, &mut sb, "/tmp/app-alpha");
+        assert!(!crate::handlers::worktree_delete::begin_optimistic_delete(
+            &mut session,
+            &mut model,
+            &mut sb,
+            &["/tmp/app-alpha".to_string()],
+        ));
+        assert_eq!(cursor_path(&model, &sb).as_deref(), Some("/tmp/app-mid"));
     }
 }
 
