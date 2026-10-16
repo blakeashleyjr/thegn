@@ -227,7 +227,7 @@ fn run_inner(
 
 fn spawn_feeder(mut stdin: ChildStdin, input: Vec<u8>) -> Receiver<io::Result<()>> {
     let (sender, receiver) = mpsc::sync_channel(1);
-    thread::spawn(move || {
+    crate::thread_name::spawn_named("thegn-sbx-feed", move || {
         let result = stdin.write_all(&input);
         if let Err(error) = sender.send(result) {
             tracing::debug!(target: "thegn::sandbox", %error, "stdin feeder result receiver closed");
@@ -238,7 +238,7 @@ fn spawn_feeder(mut stdin: ChildStdin, input: Vec<u8>) -> Receiver<io::Result<()
 
 fn spawn_reader<R: Read + Send + 'static>(mut reader: R, cap: usize) -> Receiver<ReadOutcome> {
     let (sender, receiver) = mpsc::sync_channel(1);
-    thread::spawn(move || {
+    crate::thread_name::spawn_named("thegn-sbx-read", move || {
         let mut captured = Captured {
             bytes: Vec::with_capacity(cap.min(4096)),
             truncated: false,

@@ -33,3 +33,15 @@ fn host_key_literals_stay_in_the_chokepoint() {
          UserKnownHostsFile / HostKeyAlias literal at a call site.",
     );
 }
+
+#[test]
+fn threads_are_named_ratchet() {
+    file_ratchet(
+        env!("CARGO_MANIFEST_DIR"),
+        "thread-name-svc-ratchet.txt",
+        &[],
+        |_, body| thegn_core::test_support::thread_spawn::spawns_unnamed_thread(body),
+        "Name production threads with `thegn_core::thread_name::spawn_named` so \
+         their task comm identifies their role. Keep the allowlist empty.",
+    );
+}

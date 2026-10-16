@@ -940,7 +940,7 @@ pub async fn main(
         tokio_mpsc::unbounded_channel::<Result<thegn_core::config::Config, String>>();
 
     let config_waker = waker.clone();
-    std::thread::spawn(move || {
+    thegn_core::thread_name::spawn_named("thegn-cfg-watch", move || {
         if let Some(parent) = config_path.parent() {
             // TRAILING-edge debounce (audit run.rs:744): the notify callback only
             // *signals* an event arrived; a coalescing recv loop below waits for
@@ -1931,7 +1931,7 @@ pub(crate) fn forget_worktree_group(
     // is never blocked by a slow container runtime).
     if !group.path.is_empty() {
         let path = group.path.clone();
-        std::thread::spawn(move || {
+        thegn_core::thread_name::spawn_named("thegn-teardown", move || {
             // De-register the ephemeral VPN node (if any) before its sidecar is
             // removed, unmount any worktree projection (sshfs/sync), then tear
             // down the worktree's containers (which `rm -f`s the `-tgvpn`
@@ -13213,17 +13213,23 @@ async fn event_loop<T: Terminal>(
             loop_perf.tick(crate::perf::WakeSource::Watcher);
             if watched_worktree.as_deref() == Some(path.as_path()) {
                 if let Some(old) = diff_watcher.replace(nw) {
-                    drop(std::thread::spawn(move || {
-                        crate::platform::qos::set_self(crate::platform::qos::Qos::Background);
-                        drop(old);
-                    }));
+                    drop(thegn_core::thread_name::spawn_named(
+                        "thegn-wdrop",
+                        move || {
+                            crate::platform::qos::set_self(crate::platform::qos::Qos::Background);
+                            drop(old);
+                        },
+                    ));
                 }
             } else {
                 // A stale registration can also hold a large inotify set.
-                drop(std::thread::spawn(move || {
-                    crate::platform::qos::set_self(crate::platform::qos::Qos::Background);
-                    drop(nw);
-                }));
+                drop(thegn_core::thread_name::spawn_named(
+                    "thegn-wdrop",
+                    move || {
+                        crate::platform::qos::set_self(crate::platform::qos::Qos::Background);
+                        drop(nw);
+                    },
+                ));
             }
         }
 
@@ -14970,7 +14976,7 @@ async fn event_loop<T: Terminal>(
         {
             toast_wake_armed = Some(at);
             let wk = waker.clone();
-            std::thread::spawn(move || {
+            thegn_core::thread_name::spawn_named("thegn-toast", move || {
                 std::thread::sleep(
                     at.saturating_duration_since(std::time::Instant::now())
                         + std::time::Duration::from_millis(50),

@@ -225,7 +225,7 @@ fn remote_drop(
     // can't deadlock against reading the remote's stdout.
     let mut stdin = child.stdin.take().ok_or("no stdin pipe")?;
     let payload = bytes.to_vec();
-    let writer = std::thread::spawn(move || {
+    let writer = thegn_core::thread_name::spawn_named("thegn-paste-in", move || {
         // best-effort: a short write here is EPIPE — the remote died mid-stream
         // — and that already surfaces as a non-zero `child.wait()` status
         // below, which is what the caller reports. Failing here too would only

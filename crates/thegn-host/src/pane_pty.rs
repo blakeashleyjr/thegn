@@ -342,7 +342,7 @@ pub(crate) fn open_pty(
     // `wait()` for the child's exit status and report its code (item 524).
     // Blocking the *reader* thread on `wait()` is safe — it's about to end
     // anyway and never touches the event loop.
-    let reader = std::thread::spawn(move || {
+    let reader = thegn_core::thread_name::spawn_named("thegn-pty-read", move || {
         // Contain panics: an unwinding reader must still deliver an Exit
         // event, or the pane freezes silently and anything the thread
         // held is poisoned. A panic degrades into a normal pane exit.

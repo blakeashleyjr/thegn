@@ -167,18 +167,18 @@ impl CommandVoiceProvider {
         // writer is also off-thread: a command that never reads stdin must not
         // block the deadline loop.
         let (out_tx, out_rx) = mpsc::channel();
-        let out_thread = thread::spawn(move || {
+        let out_thread = thegn_core::thread_name::spawn_named("thegn-stt-out", move || {
             let mut stdout = stdout;
             let _ = out_tx.send(read_capped(&mut stdout, MAX_TRANSCRIPT_BYTES));
         });
         let (err_tx, err_rx) = mpsc::channel();
-        let err_thread = thread::spawn(move || {
+        let err_thread = thegn_core::thread_name::spawn_named("thegn-stt-err", move || {
             let mut stderr = stderr;
             let _ = err_tx.send(read_capped(&mut stderr, MAX_TRANSCRIPT_BYTES));
         });
         let (write_tx, write_rx) = mpsc::channel();
         let wav = wav.to_vec();
-        let write_thread = thread::spawn(move || {
+        let write_thread = thegn_core::thread_name::spawn_named("thegn-stt-wav", move || {
             let result = stdin.write_all(&wav).map_err(|e| format!("write WAV: {e}"));
             drop(stdin);
             let _ = write_tx.send(result);
