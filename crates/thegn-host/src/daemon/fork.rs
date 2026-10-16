@@ -82,6 +82,7 @@ pub(crate) async fn spawn_session(
     // shutdown-refusal diagnostic still needs to name the child. Diagnostics
     // only — nothing derives a signal target from a recorded pid.
     let pty_pid = pty.pid;
+    let process_owner = pty.process.clone();
     let live = Arc::new(Mutex::new(LiveMeta {
         rows: request.rows,
         cols: request.cols,
@@ -111,6 +112,14 @@ pub(crate) async fn spawn_session(
     // instantly-exiting child must never race registration and leave a phantom.
     let mut sessions = service.sessions.lock().await;
     if !service.accepting.load(std::sync::atomic::Ordering::Acquire) {
+        drop(sessions);
+        if process_owner
+            .terminate_and_reap_off_runtime()
+            .await
+            .is_none()
+        {
+            tracing::warn!(session_id = %request.id, "refused PTY child was not reaped");
+        }
         super::pty_diagnostics::record(
             &service.daemon_id,
             &request.id,
@@ -118,7 +127,6 @@ pub(crate) async fn spawn_session(
             "open_refused_during_shutdown",
             Some("process_owner_dropped_and_reaped"),
         );
-        drop(sessions);
         return Err(ControlError::Conflict("daemon is shutting down".into()));
     }
     sessions.insert(
@@ -128,6 +136,7 @@ pub(crate) async fn spawn_session(
             meta,
             live,
             recipe: request.recipe,
+            process: Some(process_owner),
         },
     );
     drop(sessions);
