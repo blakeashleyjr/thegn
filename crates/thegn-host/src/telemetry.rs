@@ -111,10 +111,12 @@ pub enum Metric {
     /// have a free-space trend to fit — see [`thegn_core::disk_fill`]. Appended
     /// last so the existing positional ring indices are undisturbed.
     DiskFree,
+    DiskRead,
+    DiskWrite,
 }
 
 impl Metric {
-    pub const ALL: [Metric; 19] = [
+    pub const ALL: [Metric; 21] = [
         Metric::Cpu,
         Metric::Mem,
         Metric::Swap,
@@ -134,6 +136,8 @@ impl Metric {
         Metric::BatteryPower,
         Metric::CpuFreq,
         Metric::DiskFree,
+        Metric::DiskRead,
+        Metric::DiskWrite,
     ];
 
     pub fn index(self) -> usize {
@@ -162,6 +166,8 @@ impl Metric {
             Metric::BatteryPower => "DRAW",
             Metric::CpuFreq => "FREQ",
             Metric::DiskFree => "DISK FREE",
+            Metric::DiskRead => "DISK READ",
+            Metric::DiskWrite => "DISK WRITE",
         }
     }
 
@@ -176,7 +182,11 @@ impl Metric {
             | Metric::DaemonCpu => Unit::Percent,
             Metric::Temp => Unit::Celsius,
             Metric::Load => Unit::Ratio,
-            Metric::NetRx | Metric::NetTx | Metric::DiskIo => Unit::BytesPerSec,
+            Metric::NetRx
+            | Metric::NetTx
+            | Metric::DiskIo
+            | Metric::DiskRead
+            | Metric::DiskWrite => Unit::BytesPerSec,
             Metric::SelfRss | Metric::DaemonRss | Metric::GpuMem | Metric::DiskFree => Unit::Bytes,
             Metric::GpuPower | Metric::BatteryPower => Unit::Watts,
             Metric::CpuFreq => Unit::Megahertz,
@@ -204,7 +214,11 @@ impl Metric {
     /// absolute zero because sampling paused.
     pub fn gap_policy(self) -> Gap {
         match self {
-            Metric::NetRx | Metric::NetTx | Metric::DiskIo => Gap::Zero,
+            Metric::NetRx
+            | Metric::NetTx
+            | Metric::DiskIo
+            | Metric::DiskRead
+            | Metric::DiskWrite => Gap::Zero,
             _ => Gap::Hold,
         }
     }
@@ -227,12 +241,9 @@ impl Metric {
             Metric::NetTx => or_nan(s.net_bps, |(_, tx)| tx as f32),
             // Absent only when no disk is enumerated at all; an idle disk is a
             // real zero, not a gap.
-            Metric::DiskIo if s.disks.is_empty() => f32::NAN,
-            Metric::DiskIo => s
-                .disks
-                .iter()
-                .map(|d| d.read_bps + d.write_bps)
-                .sum::<u64>() as f32,
+            Metric::DiskIo => or_nan(s.disk_io, |(r, w)| r.saturating_add(w) as f32),
+            Metric::DiskRead => or_nan(s.disk_io, |(r, _)| r as f32),
+            Metric::DiskWrite => or_nan(s.disk_io, |(_, w)| w as f32),
             Metric::SelfRss => or_nan(s.self_rss_bytes, |b| b as f32),
             Metric::SelfCpu => or_nan(s.self_cpu_pct, |p| p),
             Metric::DaemonRss => or_nan(s.daemon_rss_bytes, |b| b as f32),
@@ -897,6 +908,8 @@ mod tests {
             Metric::Battery,
             Metric::Gpu,
             Metric::DiskIo,
+            Metric::DiskRead,
+            Metric::DiskWrite,
         ] {
             assert!(h.last_raw(m).is_nan(), "{m:?} should be absent");
         }
@@ -913,23 +926,45 @@ mod tests {
         let mut h = TelemetryHistory::default();
         h.push(
             &StatsSnapshot {
-                disks: vec![thegn_metrics::DiskInfo {
-                    name: "sda".into(),
-                    mount: "/".into(),
-                    free_pct: 50,
-                    read_bps: 0,
-                    write_bps: 0,
-                    kind: thegn_metrics::DiskKind::Ssd,
-                }],
+                disk_io: Some((0, 0)),
                 ..Default::default()
             },
             SEC,
         );
         assert_eq!(h.last_raw(Metric::DiskIo), 0.0);
+        assert_eq!(h.last_raw(Metric::DiskRead), 0.0);
+        assert_eq!(h.last_raw(Metric::DiskWrite), 0.0);
         assert!(
             !h.series(&req(Metric::DiskIo, Window::from_secs(30), 4, SEC + 1))
                 .empty
         );
+    }
+
+    #[test]
+    fn disk_metrics_use_physical_disk_totals_not_volume_rows() {
+        let mut h = TelemetryHistory::default();
+        let duplicate_rows = (0..43)
+            .map(|n| thegn_metrics::DiskInfo {
+                name: format!("mount-{n}"),
+                mount: format!("/mnt/{n}"),
+                free_pct: 50,
+                read_bps: 1000,
+                write_bps: 1000,
+                kind: thegn_metrics::DiskKind::Ssd,
+                extra_mounts: 0,
+            })
+            .collect::<Vec<_>>();
+        h.push(
+            &StatsSnapshot {
+                disks: duplicate_rows.into(),
+                disk_io: Some((100, 50)),
+                ..Default::default()
+            },
+            SEC,
+        );
+        assert_eq!(h.last_raw(Metric::DiskIo), 150.0);
+        assert_eq!(h.last_raw(Metric::DiskRead), 100.0);
+        assert_eq!(h.last_raw(Metric::DiskWrite), 50.0);
     }
 
     #[test]
