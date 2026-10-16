@@ -21,3 +21,5 @@ sample.rs
 # thermal.rs — macOS Apple-silicon HID temperature sensors (IOHIDEventSystemClient,
 # dlsym'd) vs sysinfo Components, which is correct on Linux and Intel Macs.
 thermal.rs
+# cpu_freq.rs — Linux held sysfs CPU frequency reader; sysinfo frequency fallback elsewhere.
+cpu_freq.rs
