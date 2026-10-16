@@ -21,14 +21,22 @@ cat >"$tmp/ssh" <<'SHIM'
 #!/usr/bin/env bash
 set -u
 control=""
+control_path=""
 while [ $# -gt 0 ]; do
   case "$1" in
-  -o | -F) shift 2 ;;
+  -o)
+    case "$2" in ControlPath=*) control_path=${2#ControlPath=} ;; esac
+    shift 2
+    ;;
+  -F) shift 2 ;;
   -O) control=$2; shift 2 ;;
   -t | -tt) shift ;;
   *) break ;;
   esac
 done
+if [ -n "$control_path" ] && [ -n "${CONTROL_PATH_LOG:-}" ]; then
+  printf '%s\n' "$control_path" >>"$CONTROL_PATH_LOG"
+fi
 shift # host
 [ -n "$control" ] && exit 0
 cd "$FAKE_HOME" && exec sh -c "$*"
@@ -41,7 +49,7 @@ fail() {
 }
 
 run() {
-  FAKE_HOME=$fakehome THEGN_REMOTE_SSH="$tmp/ssh" THEGN_REMOTE_DIR=rt \
+  FAKE_HOME=$fakehome CONTROL_PATH_LOG="$tmp/control-paths" THEGN_REMOTE_SSH="$tmp/ssh" THEGN_REMOTE_DIR=rt \
     "$repo/scripts/test-remote.sh" host=fake
 }
 
@@ -57,6 +65,9 @@ set -e
   fail "expected the remote gate's exit 7, got $rc"
 }
 grep -q "TARGET=$fakehome/rt/target" "$tmp/out1" || fail "CARGO_TARGET_DIR was not <remote-dir>/target"
+control_path=$(head -n 1 "$tmp/control-paths")
+[ "${control_path#/tmp/tgr.}" != "$control_path" ] || fail "control socket did not use the short /tmp directory"
+[ "${#control_path}" -lt 104 ] || fail "control socket path exceeds the Unix socket path limit"
 [ -d "$fakehome/rt" ] || fail "remote dir missing after a default run"
 [ ! -e "$fakehome/rt/src" ] || fail "remote src/ not cleaned up"
 [ ! -e "$fakehome/rt/run.sh" ] || fail "remote run.sh not cleaned up"
@@ -70,11 +81,29 @@ THEGN_REMOTE_CLEAN=1 THEGN_REMOTE_CMD='exit 0' run >"$tmp/out3" 2>&1 || fail "cl
 [ ! -e "$fakehome/rt" ] || fail "THEGN_REMOTE_CLEAN=1 left the remote dir"
 
 # 4. an unsafe remote dir is refused before anything is shipped.
+for bad_dir in 'a b;rm' / /Users ../outside a/../outside a/./b; do
+  set +e
+  FAKE_HOME=$fakehome THEGN_REMOTE_SSH="$tmp/ssh" THEGN_REMOTE_DIR="$bad_dir" THEGN_REMOTE_OS=unix \
+    "$repo/scripts/test-remote.sh" fake >"$tmp/out4" 2>&1
+  rc=$?
+  set -e
+  [ "$rc" -eq 2 ] || fail "unsafe THEGN_REMOTE_DIR '$bad_dir' was not refused (rc=$rc)"
+done
+
+# 5. destroy refuses unmarked state and protected roots without deleting them.
+mkdir -p "$fakehome/unmarked-state"
 set +e
-FAKE_HOME=$fakehome THEGN_REMOTE_SSH="$tmp/ssh" THEGN_REMOTE_DIR='a b;rm' THEGN_REMOTE_OS=unix \
-  "$repo/scripts/test-remote.sh" fake >"$tmp/out4" 2>&1
+THEGN_WINVM_DIR="$fakehome/unmarked-state" HOME="$fakehome" "$repo/scripts/windows-vm.sh" destroy >"$tmp/out5" 2>&1
 rc=$?
 set -e
-[ "$rc" -eq 2 ] || fail "unsafe THEGN_REMOTE_DIR was not refused (rc=$rc)"
+[ "$rc" -ne 0 ] || fail "destroy accepted an unmarked state directory"
+mkdir -p "$fakehome/marked-home"
+touch "$fakehome/marked-home/windows-11.conf"
+set +e
+THEGN_WINVM_DIR="$fakehome/marked-home" HOME="$fakehome/marked-home" "$repo/scripts/windows-vm.sh" destroy >"$tmp/out6" 2>&1
+rc=$?
+set -e
+[ "$rc" -ne 0 ] || fail "destroy accepted HOME even with a VM marker"
+[ -f "$fakehome/marked-home/windows-11.conf" ] || fail "destroy removed the protected home marker"
 
 echo "remote-runner-selftest: ok ($(grep -o '[0-9]* files' "$tmp/out1"))"
