@@ -10,20 +10,22 @@ use std::collections::HashMap;
 use std::time::Instant;
 
 use crate::glyph_types::GlyphRow;
+use crate::hydrate_tuning::{glyph_ttls, warm_stamp};
 
 /// Load every persisted glyph row into a fresh cache map. Best-effort: a DB miss
-/// or an unparseable row is skipped. Rows are stamped `now`, so they serve
-/// immediately and revalidate at the normal TTL (stale-while-revalidate); the
-/// active worktree always live-scans regardless.
+/// or an unparseable row is skipped. Rows receive deterministic staggered
+/// stamps, so warm-cache validation does not create a lockstep scan burst.
 pub(crate) fn load_glyphs() -> HashMap<String, (GlyphRow, Instant)> {
     let mut m = HashMap::new();
     let Ok(db) = thegn_core::db::Db::open() else {
         return m;
     };
     let now = Instant::now();
+    let ttls = glyph_ttls();
     for (path, json) in db.all_glyph_cache() {
         if let Ok(row) = serde_json::from_str::<GlyphRow>(&json) {
-            m.insert(path, (row, now));
+            let stamp = warm_stamp(now, std::path::Path::new(&path), &ttls);
+            m.insert(path, (row, stamp));
         }
     }
     m

@@ -13,7 +13,10 @@ use termwiz::terminal::TerminalWaker;
 
 use crate::chrome::{FrameModel, LoadStep, StateDbAvailability};
 use crate::glyph_types::GlyphRow;
-use crate::hydrate_tuning::{bg_glyph_ttl, model_refresh_interval};
+use crate::hydrate_tuning::{
+    GlyphTtls, glyph_ttls, glyph_window, model_refresh_interval, observe_ref_generation,
+    touched_since_scan,
+};
 use crate::run::now_secs;
 use thegn_core::store::{
     CacheStore, IntentStore, NotificationStore, WorkspaceStore, WorktreeAuxStore,
@@ -94,15 +97,9 @@ pub(crate) fn glyph_keep_set(
 /// the watcher is what fires, and each rescan is a git fan-out including a
 /// `<base>...HEAD` three-dot diff. See [`crate::hydrate_tuning::active_glyph_floor`].
 ///
-/// A background worktree rescans only when it has no cached row yet or the
-/// cached row is older than `ttl`.
-pub(crate) fn should_rescan_glyphs(
-    is_active: bool,
-    cached_age: Option<Duration>,
-    ttl: Duration,
-    active_floor: Duration,
-) -> bool {
-    let window = if is_active { active_floor } else { ttl };
+/// A background worktree rescans when it has no cached row yet or the selected
+/// activity-sensitive window has elapsed.
+pub(crate) fn should_rescan_glyphs(cached_age: Option<Duration>, window: Duration) -> bool {
     match cached_age {
         None => true,
         Some(age) => age >= window,
@@ -115,8 +112,9 @@ struct GlyphPartitionConfig<'a> {
     active_path: Option<&'a str>,
     gate_remote_scans: bool,
     now: Instant,
-    ttl: Duration,
-    active_floor: Duration,
+    ttls: &'a GlyphTtls,
+    since_active: &'a std::collections::HashMap<String, Duration>,
+    since_ref_move: Option<Duration>,
 }
 
 fn may_live_scan_for_location<E: std::fmt::Display>(
@@ -161,7 +159,16 @@ fn partition_glyph_paths(
             continue;
         }
         let age = cached.map(|(_, ts)| config.now.saturating_duration_since(*ts));
-        if should_rescan_glyphs(is_active, age, config.ttl, config.active_floor) {
+        let touched = age.is_some_and(|cached_age| {
+            touched_since_scan(
+                cached_age,
+                config.since_active.get(p).copied(),
+                config.since_ref_move,
+                config.ttls.tick,
+            )
+        });
+        let window = glyph_window(is_active, touched, std::path::Path::new(p), config.ttls);
+        if should_rescan_glyphs(age, window) {
             if let Some((row, _)) = cached {
                 prior_for_scan.insert(p.clone(), row.clone());
             }
@@ -1626,9 +1633,31 @@ fn collect_sidebar_status(
             },
         );
     }
-    status.activity = thegn_core::activity::read_states()
+    let activity_entries = thegn_core::activity::read_entries();
+    let now_unix = now_secs() as f64;
+    let mut since_active = std::collections::HashMap::new();
+    status.activity = activity_entries
         .into_iter()
-        .map(|(tab, st)| (tab, crate::sidebar::ActivityState::from_str(&st)))
+        .map(|(path, entry)| {
+            let since = entry.last_active_at.and_then(|last_active_at| {
+                let age_seconds = now_unix - last_active_at;
+                if age_seconds.is_finite() && age_seconds >= 0.0 {
+                    match Duration::try_from_secs_f64(age_seconds) {
+                        Ok(age) => Some(age),
+                        Err(_) => None,
+                    }
+                } else {
+                    None
+                }
+            });
+            if let Some(age) = since {
+                since_active.insert(path, age);
+            }
+            (
+                entry.tab,
+                crate::sidebar::ActivityState::from_str(&entry.state),
+            )
+        })
         .collect();
 
     // Reconcile the warm set now (after fresh activity): drop resident bridges for
@@ -1727,9 +1756,12 @@ fn collect_sidebar_status(
 
     // Partition into paths that must be rescanned now vs. served from cache.
     let active_path: Option<String> = session.active_group().map(|g| g.path.clone());
-    let ttl = bg_glyph_ttl();
-    let active_floor = crate::hydrate_tuning::active_glyph_floor();
+    let ttls = glyph_ttls();
     let now = Instant::now();
+    let ref_path = active_tab_path(session);
+    let ref_generation = crate::diff_watch::current_ref_generation(&ref_path);
+    let since_ref_move = observe_ref_generation(&ref_path, ref_generation, now)
+        .map(|changed_at| now.saturating_duration_since(changed_at));
     // Resolve DB-backed location and bridge state before taking the UI-shared
     // glyph cache mutex. Reuse this hydration's Db instead of opening/querying
     // SQLite once per path while holding the cache lock.
@@ -1760,8 +1792,9 @@ fn collect_sidebar_status(
                 active_path: active_path.as_deref(),
                 gate_remote_scans,
                 now,
-                ttl,
-                active_floor,
+                ttls: &ttls,
+                since_active: &since_active,
+                since_ref_move,
             },
         )
     };
@@ -1816,6 +1849,7 @@ fn collect_sidebar_status(
     // degraded outcome: every read errored, so it keeps the last-known row (or
     // stays absent), never a fabricated clean one.
     let outcomes = crate::scan_pool::ScanPool::global().run(jobs);
+    let scan_completed_at = Instant::now();
     let scanned: Vec<(String, GlyphRow, bool)> = to_scan
         .iter()
         .zip(outcomes)
@@ -1856,7 +1890,7 @@ fn collect_sidebar_status(
         let mut persist = Vec::new();
         for (p, row, clean) in &scanned {
             if *clean {
-                cache.insert(p.clone(), (row.clone(), now));
+                cache.insert(p.clone(), (row.clone(), scan_completed_at));
                 persist.push(glyph_persist_entry(p, row));
             }
         }
