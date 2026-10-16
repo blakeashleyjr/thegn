@@ -299,7 +299,7 @@ fn isolated_sdk_connectivity_child() {
             );
             assert_eq!(
                 health.failures.load(Ordering::Relaxed),
-                if matches!(status, 401 | 403 | 429) {
+                if matches!(status, 401 | 403 | 429 | 500..=599) {
                     1
                 } else {
                     0
