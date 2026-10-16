@@ -2334,7 +2334,7 @@ mod tests {
             &forge,
             &checkout,
             &db,
-            vec![PrItem::from(&row)],
+            vec![row.clone()],
             |_| {},
         );
         assert!(
@@ -2373,7 +2373,7 @@ mod tests {
             &forge,
             &checkout,
             &db,
-            vec![PrItem::from(&row)],
+            vec![row.clone()],
             |_| {},
         );
         *forge.pr.lock().unwrap() = Some(failing_ci_pr("def"));
@@ -2433,7 +2433,7 @@ mod tests {
                         forge.as_ref(),
                         &checkout,
                         &db,
-                        vec![PrItem::from(&row)],
+                        vec![row.clone()],
                         |_| {},
                     );
                 })
@@ -2623,7 +2623,7 @@ mod tests {
             &forge,
             &checkout,
             &db,
-            vec![PrItem::from(&row)],
+            vec![row.clone()],
             |_| {},
         );
         drop(unsupported);
@@ -2655,7 +2655,7 @@ mod tests {
             &forge,
             &checkout,
             &db,
-            vec![PrItem::from(&row)],
+            vec![row.clone()],
             |_| {},
         );
         assert_eq!(out.blocked, vec![7]);
@@ -2722,7 +2722,7 @@ mod tests {
             &forge,
             &checkout,
             &db,
-            vec![PrItem::from(&row)],
+            vec![row.clone()],
             |_| {},
         );
         assert!(out.blocked.contains(&7));
