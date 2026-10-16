@@ -2715,6 +2715,7 @@ mod tests {
             FakeForge::new(Some(original.clone())).with_status_sequence(vec![original, moved]);
         let mut config = cfg();
         config.watch = vec![PrWatchKind::Ci];
+        config.own_prs_only = false;
         config.agent_command = "true {prompt}".into();
         let out = drive_queue(
             &config,
@@ -2743,6 +2744,7 @@ mod tests {
             .unwrap();
         let mut config = cfg();
         config.watch = vec![PrWatchKind::Ci];
+        config.own_prs_only = false;
         config.pause_on_foreign_push = false;
         let mut pending = failing_ci_pr("head-b");
         pending.status_check_rollup[0].status = "IN_PROGRESS".into();
