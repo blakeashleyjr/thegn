@@ -1,5 +1,5 @@
-//! Fake-helper lifecycle tests. They shell out to `sh`/`sleep`/`yes`, so they
-//! are a no-op where those don't exist (Windows).
+//! Fake-helper lifecycle tests. They shell out to `sh`/`sleep`/`yes` and use
+//! `/proc`, so a compile-time check keeps them Linux-only.
 
 use std::path::Path;
 use std::time::{Duration, Instant};
@@ -15,7 +15,7 @@ fn sh(script: &str) -> Command {
 }
 
 fn have_sh() -> bool {
-    Path::new("/bin/sh").exists() && Path::new("/proc/self/stat").exists()
+    cfg!(target_os = "linux")
 }
 
 fn lim(ms: u64, cap: usize) -> Limits {

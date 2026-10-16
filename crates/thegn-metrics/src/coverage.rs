@@ -193,7 +193,7 @@ mod tests {
             cpu_temp_c: Some(45.0),
             mem_gib: Some((8.0, 32.0)),
             swap_gib: Some((1.0, 8.0)),
-            reclaim_per_s: Some(0.0),
+            reclaim_per_s: cfg!(target_os = "linux").then_some(0.0),
             gpu_pct: Some(5),
             net_bps: Some((100, 200)),
             battery: Some((80, true)),
@@ -209,7 +209,7 @@ mod tests {
             }]
             .into(),
             temps: vec![("cpu".into(), 45.0)],
-            load_avg: Some((1.0, 1.0, 1.0)),
+            load_avg: cfg!(unix).then_some((1.0, 1.0, 1.0)),
             uptime_secs: Some(1000),
             ..Default::default()
         }
@@ -223,7 +223,7 @@ mod tests {
     fn a_full_snapshot_reports_every_family_available() {
         let reports = coverage(&full());
         assert_eq!(reports.len(), MetricFamily::ALL.len());
-        // Reclaim and load are OS-gated: available only where sampled.
+        // The fixture follows the sampler's per-OS output for reclaim and load.
         for r in &reports {
             match r.family {
                 MetricFamily::Reclaim if !cfg!(target_os = "linux") => {
@@ -235,6 +235,16 @@ mod tests {
                 _ => assert!(r.coverage.is_available(), "{:?} not available", r.family),
             }
         }
+    }
+
+    #[test]
+    fn a_present_family_is_available_even_where_the_os_does_not_sample_it() {
+        let mut s = full();
+        s.reclaim_per_s = Some(0.0);
+        s.load_avg = Some((1.0, 1.0, 1.0));
+        let reports = coverage(&s);
+        assert_eq!(cov(&reports, MetricFamily::Reclaim), Coverage::Available);
+        assert_eq!(cov(&reports, MetricFamily::Load), Coverage::Available);
     }
 
     #[test]
