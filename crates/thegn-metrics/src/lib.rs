@@ -13,6 +13,7 @@
 
 mod battery;
 mod coverage;
+mod cpu_freq;
 mod gpu;
 mod gpu_exec;
 mod gpu_monitor;
