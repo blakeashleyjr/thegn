@@ -4951,7 +4951,7 @@ heartbeat_secs = 10
 # version = "0.1.0"                     # Plugin version string (required).
 # api = "0.3.0"                         # Plugin API version (required).
 # capabilities = []                     # Requested capability grants; default is empty.
-# command = ["/path/to/reviewed-plugin"] # Executable argv; required, never a shell string.
+# command = ["/path/to/reviewed-plugin"] # Executable argv (required); never a shell string.
 # cwd = ""                              # Working directory; default is empty (plugin directory or host cwd).
 # env = { RUST_LOG = "info" }            # Optional child environment; entries are passed verbatim.
 #                                         # No env:/file: expansion is performed; do not put secrets here.
