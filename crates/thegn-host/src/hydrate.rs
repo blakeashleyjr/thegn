@@ -15,7 +15,7 @@ use crate::chrome::{FrameModel, LoadStep, StateDbAvailability};
 use crate::glyph_types::GlyphRow;
 use crate::hydrate_tuning::{
     GlyphTtls, glyph_ttls, glyph_window, model_refresh_interval, observe_ref_generation,
-    touched_since_scan,
+    since_active_age, touched_since_scan,
 };
 use crate::run::now_secs;
 use thegn_core::store::{
@@ -47,7 +47,8 @@ pub(crate) fn glyph_cache()
 }
 
 /// Drop the cached glyph rows for `paths`, so the next hydration rescans them
-/// instead of serving a row that is merely younger than [`bg_glyph_ttl`].
+/// instead of serving a row that is merely younger than its configured glyph
+/// window from [`crate::hydrate_tuning::glyph_ttls`].
 ///
 /// Background worktrees are TTL-cached (a rescan is a `git status` fan-out per
 /// row), which is right for ambient staleness but wrong right after an event
@@ -1639,17 +1640,9 @@ fn collect_sidebar_status(
     status.activity = activity_entries
         .into_iter()
         .map(|(path, entry)| {
-            let since = entry.last_active_at.and_then(|last_active_at| {
-                let age_seconds = now_unix - last_active_at;
-                if age_seconds.is_finite() && age_seconds >= 0.0 {
-                    match Duration::try_from_secs_f64(age_seconds) {
-                        Ok(age) => Some(age),
-                        Err(_) => None,
-                    }
-                } else {
-                    None
-                }
-            });
+            let since = entry
+                .last_active_at
+                .and_then(|last_active_at| since_active_age(now_unix, last_active_at));
             if let Some(age) = since {
                 since_active.insert(path, age);
             }
@@ -1849,7 +1842,6 @@ fn collect_sidebar_status(
     // degraded outcome: every read errored, so it keeps the last-known row (or
     // stays absent), never a fabricated clean one.
     let outcomes = crate::scan_pool::ScanPool::global().run(jobs);
-    let scan_completed_at = Instant::now();
     let scanned: Vec<(String, GlyphRow, bool)> = to_scan
         .iter()
         .zip(outcomes)
@@ -1888,6 +1880,7 @@ fn collect_sidebar_status(
     let to_persist: Vec<(String, String)> = {
         let mut cache = glyph_cache().lock().unwrap();
         let mut persist = Vec::new();
+        let scan_completed_at = Instant::now();
         for (p, row, clean) in &scanned {
             if *clean {
                 cache.insert(p.clone(), (row.clone(), scan_completed_at));

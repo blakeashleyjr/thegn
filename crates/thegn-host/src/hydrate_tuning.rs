@@ -102,6 +102,17 @@ pub(crate) fn touched_since_scan(
         || since_ref_move.is_some_and(|age| age < cached_age)
 }
 
+/// Convert an activity timestamp into its age, treating future timestamps as
+/// activity observed just now. Non-finite values cannot identify an age.
+pub(crate) fn since_active_age(now_unix: f64, last_active_at: f64) -> Option<Duration> {
+    let age_seconds = now_unix - last_active_at;
+    if age_seconds.is_finite() {
+        Duration::try_from_secs_f64(age_seconds.max(0.0)).ok()
+    } else {
+        None
+    }
+}
+
 /// Select the rescan window for one row from its activity hints.
 pub(crate) fn glyph_window(
     is_active: bool,
@@ -297,6 +308,17 @@ mod tests {
             Some(age + ttls.tick + Duration::from_millis(1)),
             None,
             ttls.tick
+        ));
+    }
+
+    #[test]
+    fn future_activity_timestamp_saturates_to_zero_and_touches_row() {
+        assert_eq!(since_active_age(1000.0, 1000.7), Some(Duration::ZERO));
+        assert!(touched_since_scan(
+            Duration::ZERO,
+            since_active_age(1000.0, 1000.7),
+            None,
+            Duration::from_secs(5),
         ));
     }
 
