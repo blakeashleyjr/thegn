@@ -103,6 +103,14 @@ SHALL fail with `Overloaded`.
 - **THEN** the admitted requests run in FIFO order and the additional request
   fails with `Overloaded`
 
+#### Scenario: An overloaded lookup is reported, and superseded lookups are cancelled
+
+- **WHEN** outline, references, or hover is requested while that worktree's
+  language server is overloaded, or an in-flight lookup is superseded by leaving
+  references or changing the active worktree
+- **THEN** outline and hover report `language server busy` on the status line,
+  references show it as the view note, and superseded lookups are cancelled
+
 ### Requirement: Requests are gated by negotiated server capabilities
 
 thegn SHALL retain the `capabilities` object from each server's
