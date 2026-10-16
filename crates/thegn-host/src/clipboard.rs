@@ -433,6 +433,7 @@ fn pipe_to(
     };
     let (write_tx, write_rx) = std::sync::mpsc::sync_channel(1);
     let writer = thegn_core::thread_name::spawn_named("thegn-clip-feed", move || {
+        crate::platform::qos::set_self(crate::platform::qos::Qos::Utility);
         let mut stdin = stdin;
         let result = stdin.write_all(&payload);
         drop(stdin);

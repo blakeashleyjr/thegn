@@ -44,7 +44,10 @@ fn threads_are_named_ratchet() {
         env!("CARGO_MANIFEST_DIR"),
         "thread-name-core-ratchet.txt",
         &[],
-        |_, body| crate::test_support::thread_spawn::spawns_unnamed_thread(body),
+        |key, body| {
+            !crate::test_support::thread_spawn::is_test_module_file(key)
+                && crate::test_support::thread_spawn::spawns_unnamed_thread(body)
+        },
         "Name production threads with `crate::thread_name::spawn_named` so their \
          task comm identifies their role. Keep the allowlist empty.",
     );
