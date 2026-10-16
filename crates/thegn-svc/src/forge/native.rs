@@ -445,6 +445,7 @@ struct GhCircuit {
 }
 
 impl GhCircuit {
+    #[cfg(test)]
     fn new() -> Self {
         Self::with_seed(0)
     }
