@@ -751,6 +751,7 @@ fn start_with_writer_budget<W: Write + Send + 'static>(
     let path = PathBuf::from("injected.cast");
     let worker_path = path.clone();
     let worker = thegn_core::thread_name::spawn_named("thegn-cast-test", move || {
+        crate::platform::qos::set_self(crate::platform::qos::Qos::Background);
         let finished = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             run_writer(rx, &worker_path, 0, &worker_state, writer, generation)
         }))

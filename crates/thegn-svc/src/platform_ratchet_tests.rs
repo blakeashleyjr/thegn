@@ -40,7 +40,10 @@ fn threads_are_named_ratchet() {
         env!("CARGO_MANIFEST_DIR"),
         "thread-name-svc-ratchet.txt",
         &[],
-        |_, body| thegn_core::test_support::thread_spawn::spawns_unnamed_thread(body),
+        |key, body| {
+            !thegn_core::test_support::thread_spawn::is_test_module_file(key)
+                && thegn_core::test_support::thread_spawn::spawns_unnamed_thread(body)
+        },
         "Name production threads with `thegn_core::thread_name::spawn_named` so \
          their task comm identifies their role. Keep the allowlist empty.",
     );

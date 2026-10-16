@@ -941,6 +941,7 @@ pub async fn main(
 
     let config_waker = waker.clone();
     thegn_core::thread_name::spawn_named("thegn-cfg-watch", move || {
+        crate::platform::qos::set_self(crate::platform::qos::Qos::Background);
         if let Some(parent) = config_path.parent() {
             // TRAILING-edge debounce (audit run.rs:744): the notify callback only
             // *signals* an event arrived; a coalescing recv loop below waits for
@@ -1932,6 +1933,7 @@ pub(crate) fn forget_worktree_group(
     if !group.path.is_empty() {
         let path = group.path.clone();
         thegn_core::thread_name::spawn_named("thegn-teardown", move || {
+            crate::platform::qos::set_self(crate::platform::qos::Qos::Background);
             // De-register the ephemeral VPN node (if any) before its sidecar is
             // removed, unmount any worktree projection (sshfs/sync), then tear
             // down the worktree's containers (which `rm -f`s the `-tgvpn`

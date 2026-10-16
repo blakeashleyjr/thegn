@@ -39,7 +39,14 @@ mod tests {
     #[cfg(debug_assertions)]
     #[test]
     #[should_panic]
-    fn spawn_named_rejects_invalid_names_in_debug_builds() {
-        let _thread = spawn_named("not-thegn-thread", || ());
+    fn spawn_named_rejects_overlong_names_in_debug_builds() {
+        let _thread = spawn_named("thegn-123456789a", || ());
+    }
+
+    #[cfg(debug_assertions)]
+    #[test]
+    #[should_panic]
+    fn spawn_named_rejects_wrong_prefixes_in_debug_builds() {
+        let _thread = spawn_named("invalid", || ());
     }
 }

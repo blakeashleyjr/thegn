@@ -118,7 +118,10 @@ fn threads_are_named_ratchet() {
         "thread-name-host-ratchet.txt",
         // proc_workload_alloc.rs is compiled only from main.rs's cfg(test) module (line 209).
         &["proc_workload_alloc.rs"],
-        |_, body| thegn_core::test_support::thread_spawn::spawns_unnamed_thread(body),
+        |key, body| {
+            !thegn_core::test_support::thread_spawn::is_test_module_file(key)
+                && thegn_core::test_support::thread_spawn::spawns_unnamed_thread(body)
+        },
         "Name production threads with `thegn_core::thread_name::spawn_named`. \
          Each allowlist entry needs a QoS decision alongside its name.",
     );

@@ -19,6 +19,13 @@ pub fn spawns_unnamed_thread(code: &str) -> bool {
         .is_match(&code)
 }
 
+/// Return whether a source file is a whole-file test module excluded from
+/// production thread scans.
+pub fn is_test_module_file(key: &str) -> bool {
+    let file_name = key.rsplit('/').next().unwrap_or(key);
+    file_name == "tests.rs" || file_name.ends_with("_tests.rs")
+}
+
 fn inline_test_module_start(code: &str) -> Option<usize> {
     let header = Regex::new(
         r"(?m)((?:^[ \t]*#[^\n]*\n)+)^[ \t]*(?:pub(?:\([^)]*\))?\s+)?mod\s+[A-Za-z_][A-Za-z0-9_]*\s*\{",
@@ -39,7 +46,22 @@ fn inline_test_module_start(code: &str) -> Option<usize> {
 
 #[cfg(test)]
 mod tests {
-    use super::spawns_unnamed_thread;
+    use super::{is_test_module_file, spawns_unnamed_thread};
+
+    #[test]
+    fn test_module_files_are_recognized_by_basename() {
+        let cases = [
+            ("db_tests.rs", true),
+            ("plugin/session/tests.rs", true),
+            ("issue/gh_run/unix_tests.rs", true),
+            ("tests_util.rs", false),
+            ("run.rs", false),
+        ];
+
+        for (key, expected) in cases {
+            assert_eq!(is_test_module_file(key), expected, "{key}");
+        }
+    }
 
     #[test]
     fn predicate_distinguishes_bare_and_named_spawn_calls() {
