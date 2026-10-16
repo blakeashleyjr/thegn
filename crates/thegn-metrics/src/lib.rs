@@ -18,6 +18,7 @@ mod disk_aggregate;
 mod gpu;
 mod gpu_exec;
 mod gpu_monitor;
+mod net_kind;
 mod net_medium;
 mod procs;
 mod sample;
@@ -37,6 +38,7 @@ pub fn run_command_bounded(
 
 pub use battery::{read_battery, read_battery_power};
 pub use coverage::{AbsentReason, Coverage, FamilyReport, MetricFamily, coverage};
+pub use net_kind::{IfaceKind, NetIface};
 pub use net_medium::{
     IfaceFact, MediumReason, MediumSelection, NetMedium, select_medium, select_medium_explained,
 };
@@ -86,10 +88,13 @@ pub struct StatsSnapshot {
     pub gpu_temp_c: Option<f32>,
     /// GPU board power draw in watts (NVIDIA only today; absent otherwise).
     pub gpu_power_w: Option<f32>,
-    /// Network as (rx, tx) bytes/sec summed across non-loopback interfaces.
+    /// Network as (rx, tx) bytes/sec summed over physical links; tunnels and
+    /// virtual links are excluded to avoid counting VPN traffic twice.
     pub net_bps: Option<(u64, u64)>,
-    /// Per-interface (name, rx bytes/sec, tx bytes/sec), non-loopback.
-    pub net_ifaces: Vec<(String, u64, u64)>,
+    /// Network as (rx, tx) bytes/sec summed across all non-loopback links.
+    pub net_bps_all: Option<(u64, u64)>,
+    /// Every non-loopback interface, including idle and down links.
+    pub net_ifaces: Vec<NetIface>,
     /// Selected medium for the system network path. Unknown means the path
     /// could not be identified without guessing.
     pub net_medium: NetMedium,
