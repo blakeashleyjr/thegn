@@ -346,8 +346,8 @@ Esc returns to the outline. With no language server, references say so;
 in that sits unused for 30 minutes is stopped and restarts on next use. When
 the worktree's language server is overloaded, outline and hover say
 `language server busy` on the status line and references say so in the view;
-try again. Leaving references or switching worktree cancels lookups still in
-flight.
+try again. Esc out of references cancels a references lookup still in flight;
+switching worktree cancels outline, references and hover lookups.
 
 {{keys:symbols}}
 

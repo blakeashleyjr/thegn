@@ -107,7 +107,7 @@ SHALL fail with `Overloaded`.
 
 - **WHEN** outline, references, or hover is requested while that worktree's
   language server is overloaded, or an in-flight lookup is superseded by leaving
-  references or changing the active worktree
+  references with Esc or changing the active worktree
 - **THEN** outline and hover report `language server busy` on the status line,
   references show it as the view note, and superseded lookups are cancelled
 

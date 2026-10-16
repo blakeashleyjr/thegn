@@ -30,13 +30,6 @@ rejected contribution with its rejection reason. Inspection never starts the
 plugin process.
 
 `plugin list` is an offline inspection and does not attach to the compositor.
-
-Resident plugin messages use a bounded queue of 1024 per plugin and 8192 total.
-Repeated `update` and `invalidate` notifications for one surface, and `state.set`
-for one key, coalesce to the latest value. At the limit, notifications are
-dropped; requests get a `rate_limited` reply with `host plugin queue full`.
-Saturation logs one `thegn::plugin` warning per plugin per flush. Exit is never
-dropped.
 Its stable `state` vocabulary is `disabled-by-config`, `starting`, `healthy`,
 `degraded`, `crash-disabled`, `stopped`, and `unknown`. A configured enabled
 plugin is therefore reported as `unknown` with `live_health = unavailable`;
@@ -60,6 +53,13 @@ notification center; a `PaletteAction` contribution appears as a row in the
 (`kind: Action`) if it is resident, or runs it once if it is one-shot. Lines that are not valid JSON are kept as diagnostics
 (the most common mistake is a stray `echo`) — `thegn plugin check` and the
 log surface them.
+
+Resident plugin messages use a bounded queue of 1024 per plugin and 8192 total.
+Repeated `update` and `invalidate` notifications for one surface, and `state.set`
+for one key, coalesce to the latest value. At the limit, notifications are
+dropped; requests get a `rate_limited` reply with `host plugin queue full`.
+Saturation logs one `thegn::plugin` warning per plugin per flush. Exit is never
+dropped.
 
 Those three rendering/event points plus `IssueProvider` are the extension
 points the general compositor host accepts. `PanelSection`, `SidebarTab`,
