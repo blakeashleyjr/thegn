@@ -24,7 +24,7 @@ use thegn_core::semantic_graph::{
     BlastRadius, CallerRef, ChangedEntity, compute_blast_radius, entity_id, is_test_entity,
 };
 use thegn_core::store::{SemEdgeRow, SemEntityRow, SemanticStore};
-use thegn_svc::lsp::{Position, path_to_uri};
+use thegn_svc::lsp::{CancelToken, LspError, Position, path_to_uri};
 
 use termwiz::terminal::TerminalWaker;
 
@@ -62,6 +62,41 @@ thread_local! {
 /// loop's per-tick trigger used to fork `git diff HEAD` every 5 s regardless
 /// (THE-718). A path with no live watcher never skips.
 static BUILT: crate::diff_watch::Seen = crate::diff_watch::Seen::new();
+static BUILD_CANCEL: std::sync::Mutex<Option<(std::path::PathBuf, CancelToken)>> =
+    std::sync::Mutex::new(None);
+static BUILD_GENERATION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+fn supersede_build(root: &Path) -> Option<(CancelToken, u64)> {
+    let mut current = BUILD_CANCEL
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if let Some((previous_root, previous)) = current.as_ref()
+        && previous_root == root
+        && !previous.is_cancelled()
+    {
+        return None;
+    }
+    if let Some((_, previous)) = current.as_ref() {
+        previous.cancel();
+    }
+    let token = CancelToken::new();
+    let generation = BUILD_GENERATION.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    *current = Some((root.to_path_buf(), token.clone()));
+    Some((token, generation))
+}
+
+fn finish_build(root: &Path, generation: u64) {
+    let mut current = BUILD_CANCEL
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if current.as_ref().is_some_and(|(current_root, _)| {
+        current_root == root
+            && BUILD_GENERATION.load(std::sync::atomic::Ordering::Relaxed)
+                == generation.wrapping_add(1)
+    }) {
+        *current = None;
+    }
+}
 
 /// Loop-side trigger: rebuild the active worktree's graph off the event loop
 /// when `should` (LSP enabled ∧ its diff refreshed), throttled. Kept out of
@@ -100,19 +135,43 @@ pub(crate) fn spawn_graph_build(
     waker: TerminalWaker,
     print: Option<crate::diff_watch::WatchPrint>,
 ) {
+    let Some((cancel, generation)) = supersede_build(&root) else {
+        return;
+    };
     tokio::task::spawn_blocking(move || {
-        let Ok(db) = Db::open() else {
-            return;
-        };
-        // `None` = the diff could not be read: not a completed pass, so it is
-        // not recorded and the next tick retries.
-        if let Some(changed) = build_graph(&root, &lsp, &db) {
-            BUILT.mark(&root, print);
-            if changed {
-                let _ = waker.wake(); // best-effort: waker pulse: an input nudge must never fail the calling path
+        if let Ok(db) = Db::open() {
+            // `None` = the diff could not be read: not a completed pass, so it is
+            // not recorded and the next tick retries.
+            if let Some(changed) = build_graph(&root, &lsp, &db, &cancel) {
+                BUILT.mark(&root, print);
+                if changed {
+                    let _ = waker.wake(); // best-effort: waker pulse: an input nudge must never fail the calling path
+                }
             }
         }
+        finish_build(&root, generation);
     });
+}
+
+fn invalidate_file_hash(db: &Db, root: &str, file: &str, entities: &[Entity]) {
+    let rows = entity_rows(root, file, entities, "");
+    if let Err(error) = db.replace_file_entities(file, &rows) {
+        tracing::debug!(target: "thegn::blast_radius", %error, file, "failed to invalidate cancelled blast-radius file hash");
+    }
+}
+
+fn invalidate_cancelled_file(
+    db: &Db,
+    cancel: &CancelToken,
+    root: &str,
+    file: &str,
+    entities: &[Entity],
+) -> bool {
+    if !cancel.is_cancelled() {
+        return false;
+    }
+    invalidate_file_hash(db, root, file, entities);
+    true
 }
 
 /// A parsed source file: its content hash + tree-sitter entities (full 1-based
@@ -125,7 +184,17 @@ struct FileParse {
 /// Build (incrementally) the worktree's blast-radius graph from `git diff HEAD`.
 /// Returns `Some(true)` if any edges were (re)written, `Some(false)` for a
 /// completed pass that wrote none, and `None` when the diff could not be read.
-fn build_graph(root: &Path, lsp: &LspInner, db: &Db) -> Option<bool> {
+fn build_graph(root: &Path, lsp: &LspInner, db: &Db, cancel: &CancelToken) -> Option<bool> {
+    build_graph_with_file_persist_hook(root, lsp, db, cancel, || {})
+}
+
+fn build_graph_with_file_persist_hook(
+    root: &Path,
+    lsp: &LspInner,
+    db: &Db,
+    cancel: &CancelToken,
+    mut after_file_persist: impl FnMut(),
+) -> Option<bool> {
     let loc = GitLoc::for_worktree(root);
     let root_s = root.to_string_lossy().into_owned();
     let diff = head_diff_text(&loc)?;
@@ -140,6 +209,9 @@ fn build_graph(root: &Path, lsp: &LspInner, db: &Db) -> Option<bool> {
     let mut changed_any = false;
 
     for f in &files {
+        if cancel.is_cancelled() {
+            return None;
+        }
         let Some(lang) = Lang::from_path(&f.new_path) else {
             continue;
         };
@@ -160,6 +232,10 @@ fn build_graph(root: &Path, lsp: &LspInner, db: &Db) -> Option<bool> {
         // Persist this file's entities (drops entities that vanished) + hash.
         let rows = entity_rows(&root_s, &abs_s, &file_entities, &hash);
         let _ = db.replace_file_entities(&abs_s, &rows); // best-effort: cache write: the symbol graph is derived state; the DB is a cache
+        after_file_persist();
+        if invalidate_cancelled_file(db, cancel, &root_s, &abs_s, &file_entities) {
+            return None;
+        }
         // Seed the cache with the just-parsed data (avoids a re-read below).
         cache.insert(
             abs_s.clone(),
@@ -180,17 +256,38 @@ fn build_graph(root: &Path, lsp: &LspInner, db: &Db) -> Option<bool> {
         let Some(key) = lsp.resolve_key(&f.new_path) else {
             continue;
         };
-        let Ok(client) = lsp.client(root, &key) else {
-            continue;
+        let client = match lsp.client_with_cancel(root, &key, Some(cancel)) {
+            Ok(client) => client,
+            Err(LspError::Cancelled) => {
+                invalidate_cancelled_file(db, cancel, &root_s, &abs_s, &file_entities);
+                return None;
+            }
+            Err(LspError::Overloaded) => {
+                tracing::debug!(target: "thegn::lsp", file = %f.new_path, "blast radius skipped an overloaded LSP file");
+                continue;
+            }
+            Err(_) => continue,
         };
         let uri = path_to_uri(&abs_s);
         let _ = client.did_open(&uri, &src); // best-effort: LSP did_open is advisory: a missed open just means the server discovers the file itself
         // Precise name (selectionRange) positions for the references query.
-        let symbols = client.document_symbols(&uri).unwrap_or_default();
+        let symbols = match client.document_symbols_with(&uri, cancel) {
+            Ok(symbols) => symbols,
+            Err(LspError::Cancelled) => {
+                invalidate_cancelled_file(db, cancel, &root_s, &abs_s, &file_entities);
+                return None;
+            }
+            Err(LspError::Overloaded) => {
+                tracing::debug!(target: "thegn::lsp", file = %f.new_path, "blast radius skipped an overloaded LSP file");
+                continue;
+            }
+            Err(_) => continue,
+        };
 
         let mut callee_ids: Vec<String> = Vec::new();
         let mut edges: Vec<SemEdgeRow> = Vec::new();
         let mut caller_upserts: Vec<SemEntityRow> = Vec::new();
+        let mut file_overloaded = false;
 
         for ch in &changed {
             // The full-span entity for this change (same (name, start_line) key).
@@ -207,8 +304,21 @@ fn build_graph(root: &Path, lsp: &LspInner, db: &Db) -> Option<bool> {
             let Some(pos) = symbol_pos(&symbols, &ent.name, ent.start_line, ent.end_line) else {
                 continue;
             };
-            let Ok(locs) = client.references(&uri, pos) else {
-                continue;
+            if cancel.is_cancelled() {
+                invalidate_cancelled_file(db, cancel, &root_s, &abs_s, &file_entities);
+                return None;
+            }
+            let locs = match client.references_with(&uri, pos, cancel) {
+                Ok(locs) => locs,
+                Err(LspError::Cancelled) => {
+                    invalidate_cancelled_file(db, cancel, &root_s, &abs_s, &file_entities);
+                    return None;
+                }
+                Err(LspError::Overloaded) => {
+                    file_overloaded = true;
+                    continue;
+                }
+                Err(_) => continue,
             };
             for l in locs {
                 let cfile = l.path.clone();
@@ -243,6 +353,10 @@ fn build_graph(root: &Path, lsp: &LspInner, db: &Db) -> Option<bool> {
                     kind: if is_test { "test" } else { "ref" }.to_string(),
                 });
             }
+        }
+
+        if file_overloaded {
+            tracing::debug!(target: "thegn::lsp", file = %f.new_path, "blast radius skipped overloaded references in an LSP file");
         }
 
         for c in &caller_upserts {
@@ -441,6 +555,94 @@ fn symbol_pos(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_same_root_build_does_not_cancel_an_in_flight_build() {
+        let root = Path::new("/wt/same-root");
+        let (previous, generation) = supersede_build(root).unwrap();
+        assert!(supersede_build(root).is_none());
+        assert!(!previous.is_cancelled());
+        finish_build(root, generation);
+    }
+
+    #[test]
+    fn a_different_root_build_cancels_the_previous_token() {
+        let previous_root = Path::new("/wt/previous-root");
+        let current_root = Path::new("/wt/current-root");
+        let (previous, _) = supersede_build(previous_root).unwrap();
+        let (current, generation) = supersede_build(current_root).unwrap();
+        assert!(previous.is_cancelled());
+        assert!(!current.is_cancelled());
+        finish_build(current_root, generation);
+    }
+
+    #[test]
+    fn build_graph_with_a_cancelled_token_returns_none() {
+        fn git(root: &Path, args: &[&str]) {
+            let mut command = thegn_core::util::git_cmd(root);
+            command
+                .args(args)
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .env("GIT_CONFIG_SYSTEM", "/dev/null");
+            crate::bounded_git_probe::capture(command, None, "blast-radius cancellation fixture")
+                .unwrap_or_else(|error| panic!("git {args:?} failed: {error}"));
+        }
+
+        let repo = tempfile::Builder::new()
+            .prefix("thegn-blast-cancel-")
+            .tempdir()
+            .unwrap();
+        git(repo.path(), &["init", "-q"]);
+        git(repo.path(), &["config", "user.name", "Test"]);
+        git(
+            repo.path(),
+            &["config", "user.email", "test@example.invalid"],
+        );
+        let source = repo.path().join("src/lib.rs");
+        std::fs::create_dir_all(source.parent().unwrap()).unwrap();
+        std::fs::write(&source, "pub fn target() {}\n").unwrap();
+        git(repo.path(), &["add", "src/lib.rs"]);
+        git(
+            repo.path(),
+            &["-c", "commit.gpgsign=false", "commit", "-qm", "seed"],
+        );
+        std::fs::write(&source, "pub fn target() { target_inner(); }\n").unwrap();
+
+        let config = thegn_core::config::Config {
+            lsp: thegn_core::config::LspConfig {
+                enabled: false,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let supervisor = crate::lsp::LspSupervisor::from_config(&config);
+        let lsp = supervisor.handle();
+        let db = Db::open_memory().unwrap();
+        let cancelled = CancelToken::new();
+        cancelled.cancel();
+        assert!(build_graph(repo.path(), &lsp, &db, &cancelled).is_none());
+
+        let cancelled_after_persist = CancelToken::new();
+        assert!(
+            build_graph_with_file_persist_hook(
+                repo.path(),
+                &lsp,
+                &db,
+                &cancelled_after_persist,
+                || cancelled_after_persist.cancel(),
+            )
+            .is_none()
+        );
+        let abs_source = source.to_string_lossy().into_owned();
+        let current_hash = source_hash(&std::fs::read_to_string(&source).unwrap());
+        assert_ne!(
+            db.file_source_hash(&abs_source).unwrap().as_deref(),
+            Some(current_hash.as_str())
+        );
+
+        let live = CancelToken::new();
+        assert!(build_graph(repo.path(), &lsp, &db, &live).is_some());
+    }
 
     #[test]
     fn source_hash_is_stable_and_sensitive() {
