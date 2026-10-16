@@ -3275,7 +3275,16 @@ mod tests {
         );
         let far = git.drag_autoscroll_target(edge, DragOverflow::Above(10));
         assert_eq!(far, *cursorable.first().expect("first hunk has body lines"));
-        assert!(edge - far <= 3);
+        let cursor = git.staging.as_ref().expect("staging state exists").cursor;
+        let cursor_position = cursorable
+            .iter()
+            .position(|line| *line == cursor)
+            .expect("current cursor is on a cursorable line");
+        let far_position = cursorable
+            .iter()
+            .position(|line| *line == far)
+            .expect("target is on a cursorable line");
+        assert_eq!(cursor_position - far_position, 3);
         let last = *cursorable.last().expect("body lines exist");
         assert_eq!(
             git.drag_autoscroll_target(last, DragOverflow::Below(1)),
