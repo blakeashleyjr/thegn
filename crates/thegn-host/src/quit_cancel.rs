@@ -114,18 +114,20 @@ mod tests {
     fn idle_wait_signal_and_guard_drop_are_observable() {
         let latch = Arc::new(QuitLatch::default());
         assert!(latch.wait_idle(Instant::now() + Duration::from_millis(50)));
-        let guard = latch.enter();
-        assert!(!latch.wait_idle(Instant::now() + Duration::from_millis(10)));
-        let other = Arc::clone(&latch);
-        let worker = thread::spawn(move || {
-            thread::sleep(Duration::from_millis(20));
-            drop(guard);
-            other
+        thread::scope(|scope| {
+            let guard = latch.enter();
+            assert!(!latch.wait_idle(Instant::now() + Duration::from_millis(10)));
+            let other = Arc::clone(&latch);
+            let worker = scope.spawn(move || {
+                thread::sleep(Duration::from_millis(20));
+                drop(guard);
+                other
+            });
+            assert!(latch.wait_idle(Instant::now() + Duration::from_secs(1)));
+            let returned = worker.join().expect("worker");
+            returned.signal();
+            assert!(returned.is_signalled());
+            assert!(returned.cancel_flag().load(Ordering::Relaxed));
         });
-        assert!(latch.wait_idle(Instant::now() + Duration::from_secs(1)));
-        let returned = worker.join().expect("worker");
-        returned.signal();
-        assert!(returned.is_signalled());
-        assert!(returned.cancel_flag().load(Ordering::Relaxed));
     }
 }
