@@ -21,6 +21,11 @@ diagnostics add no timer or wake.
 | idle_ratio                                | Loop wall-time idle fraction; active time includes synchronous dispatch. This is not process CPU utilization.                                                    |
 | cpu_hydrate_ms, hydrate_calls             | Calling-thread CPU for complete build_model invocations, including commit-list resends.                                                                          |
 | cpu_hydrate_child_ms, hydrate_child_calls | Separate scoped panel/Git/semantic worker CPU, including panel prefetch. Never child-process CPU.                                                                |
+| cpu_process_ms                            | Whole-process CPU across all threads.                                                                                                                            |
+| cpu_loop_ms                               | CPU used by the event-loop thread.                                                                                                                               |
+| cpu_scan_ms                               | CPU used by scan-pool jobs.                                                                                                                                      |
+| cpu_children_reaped_ms                    | Child-process CPU, counted only when each child is reaped; a long-lived child appears once, at exit.                                                             |
+| cpu_unattributed_ms                       | Process CPU outside the loop thread and measured off-loop spans, such as gix-internal and deadline threads; floored at 0.                                        |
 | resync_samples, resync_p99_us             | Count and cost of baseline reset/full-screen re-emission, independent of incremental/full composition classification.                                            |
 
 Writer aggregation is bounded and drained with try_lock: no success wake,

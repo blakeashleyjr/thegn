@@ -125,8 +125,13 @@ sandboxing — each with the gate that enforces it. Behavioural contracts are
   cores on Apple silicon.** The render/input loop declares `Interactive`; every
   worker off it declares `Utility` (user-visible, not blocking — model
   hydration) or `Background` (housekeeping — samplers, ticker, fs-watch
-  registration). A no-op off macOS. New long-lived threads should declare a
-  class; the default is `Interactive`, which for background work is wrong.
+  registration). On Linux, `Utility` raises the thread's nice by 5 and
+  `Background` by 10 over the main thread's nice, never lowering it and capped
+  at 19; `Background` also requests best-effort I/O priority 7. Those values
+  are inherited by later threads and child processes, so pooled runtime threads
+  (`thegn-rt`, `tokio-runtime-worker`) are left alone. This is a no-op on
+  Windows and other platforms. New long-lived threads should declare a class;
+  the default is `Interactive`, which for background work is wrong.
 
 ## Source map
 
