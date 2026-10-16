@@ -1860,5 +1860,50 @@ fn process_confirmation_keeps_its_identity_while_ranks_change() {
     // Do not confirm: the fixture validates the target, never sends a signal.
 }
 
+#[test]
+#[expect(
+    clippy::disallowed_methods,
+    reason = "the test reaps its harmless child process"
+)]
+fn process_confirmation_refuses_changed_live_process_identity() {
+    use std::process::Command;
+
+    let mut child = Command::new(std::env::current_exe().expect("test executable path"))
+        .args(["--exact", "monitor_tests::identity_sleep_fixture"])
+        .env("THEGN_SIGNAL_IDENTITY_FIXTURE", "1")
+        .spawn()
+        .expect("spawn identity fixture");
+    let pid = child.id();
+    let mut sampler = thegn_metrics::ProcSampler::new(usize::MAX);
+    let start_time = sampler
+        .sample()
+        .procs
+        .into_iter()
+        .find(|row| row.pid == pid)
+        .expect("fixture child appears in sample")
+        .start_time
+        .saturating_add(1);
+    let h = TelemetryHistory::default();
+    let screen = Rect::full(100, 24);
+    let mut m = model_with_n_procs(1);
+    m.procs.procs[0].pid = pid;
+    m.procs.procs[0].start_time = start_time;
+    let mut ov = open_tab(MonitorTab::Procs, &m, &h, screen);
+    ch(&mut ov, 'x');
+    ch(&mut ov, 'y');
+    assert!(ov.status.as_deref().unwrap().contains("process changed"));
+    assert!(ov.last_termed.is_none());
+    assert!(child.try_wait().expect("check child status").is_none());
+    child.kill().expect("kill fixture child after mismatch");
+    child.wait().expect("reap fixture child after mismatch");
+}
+
+#[test]
+fn identity_sleep_fixture() {
+    if std::env::var_os("THEGN_SIGNAL_IDENTITY_FIXTURE").is_some() {
+        std::thread::sleep(std::time::Duration::from_secs(30));
+    }
+}
+
 #[path = "monitor_cache_tests.rs"]
 mod invalidation_tests;
