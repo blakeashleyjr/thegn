@@ -6009,11 +6009,9 @@ fn apply_layout_to_active_tab(
     Some(focus)
 }
 
-/// Dispatch a preset launch into the active worktree. A preset that names a
-/// saved `layout` applies it on the loop into a new tab (like a template); an
-/// unknown layout warns and falls through to its `commands`. The `commands`
-/// path resolves its launch specs OFF the loop (the sandbox settle is slow),
-/// delivered to the `launch_rx` drain. `status` reports what happened.
+/// Dispatch a preset launch into the active worktree. Saved layouts are read
+/// on the DB writer and applied by the pending DB drain; command launches
+/// resolve off the loop and are delivered to the `launch_rx` drain.
 #[allow(clippy::too_many_arguments)]
 fn dispatch_preset_launch(
     preset: thegn_core::config::Preset,
@@ -6022,36 +6020,22 @@ fn dispatch_preset_launch(
     cfg: &thegn_core::config::Config,
     launch_tx: &crate::handlers::launch::LaunchTx,
     waker: &termwiz::terminal::TerminalWaker,
-    session: &mut crate::session::Session,
-    panes: &mut Panes,
-    center: Rect,
+    pending_db_tx: &tokio_mpsc::UnboundedSender<run_pending_db::PendingDbResult>,
+    pending_db_fence: &mut run_pending_db::RequestFence,
     status: &mut String,
 ) {
-    if let Some(layout_name) = preset.layout_name() {
-        let spec = thegn_core::db::Db::open()
-            .ok()
-            .and_then(|db| db.get_layout(layout_name).ok().flatten())
-            .and_then(|json| crate::layout_spec::LayoutSpec::from_json(&json).ok());
-        match spec {
-            Some(spec) => {
-                if let Some(g) = session.active_group_mut() {
-                    g.add_tab();
-                }
-                apply_layout_to_active_tab(&spec, session, panes, cfg, center);
-                *status = format!("Launched preset {}", preset.name);
-                return;
-            }
-            None => {
-                thegn_core::msg::warn(&format!(
-                    "preset {:?}: no saved layout {layout_name:?}; falling back to commands",
-                    preset.name
-                ));
-                if preset.commands.is_empty() {
-                    *status = format!("preset {}: layout missing and no commands", preset.name);
-                    return;
-                }
-            }
-        }
+    if preset.layout_name().is_some() {
+        let seq = pending_db_fence.begin_layout();
+        run_pending_db::queue_preset_layout(
+            seq,
+            group,
+            worktree,
+            preset.clone(),
+            pending_db_tx,
+            waker,
+        );
+        *status = format!("Loading preset {}…", preset.name);
+        return;
     }
     let name = preset.name.clone();
     crate::handlers::launch::spawn_resolve(
@@ -10520,6 +10504,78 @@ async fn event_loop<T: Terminal>(
                         dirty = true;
                     }
                 }
+                run_pending_db::PendingDbResult::Preset {
+                    seq,
+                    group,
+                    worktree,
+                    preset,
+                    spec,
+                } => {
+                    let name = preset.name.clone();
+                    let has_commands = !preset.commands.is_empty();
+                    let plan = run_pending_db::plan_preset_drain(
+                        pending_db_fence.accepts_layout(seq),
+                        session.active_group().map(|active| active.path.as_str()),
+                        &worktree,
+                        spec,
+                        has_commands,
+                    );
+                    match plan {
+                        run_pending_db::PresetDrainPlan::Stale => {}
+                        run_pending_db::PresetDrainPlan::ChangedWorktree => {
+                            model.status =
+                                format!("Preset {name} not applied: the worktree changed");
+                            dirty = true;
+                        }
+                        run_pending_db::PresetDrainPlan::Apply(spec) => {
+                            if let Some(active) = session.active_group_mut() {
+                                active.add_tab();
+                            }
+                            let outcome = run_pending_db::plan_preset_apply(
+                                apply_layout_to_active_tab(
+                                    &spec,
+                                    &mut session,
+                                    &mut panes,
+                                    keymap.config(),
+                                    chrome.center,
+                                )
+                                .is_some(),
+                            );
+                            match outcome {
+                                run_pending_db::PresetApplyOutcome::Applied => {
+                                    persist_session_layout(&mut session, &panes);
+                                    need_relayout = true;
+                                    model.status = format!("Launched preset {name}");
+                                }
+                                run_pending_db::PresetApplyOutcome::NothingSpawned => {
+                                    model.status = format!("preset {name}: nothing spawned");
+                                }
+                            }
+                            dirty = true;
+                        }
+                        run_pending_db::PresetDrainPlan::FallBackToCommands => {
+                            let layout_name = preset.layout_name().unwrap_or("");
+                            thegn_core::msg::warn(&format!(
+                                "preset {:?}: no saved layout {layout_name:?}; falling back to commands",
+                                preset.name
+                            ));
+                            crate::handlers::launch::spawn_resolve(
+                                launch_tx.clone(),
+                                waker.clone(),
+                                current_config.clone(),
+                                group,
+                                worktree,
+                                crate::handlers::launch::LaunchRequest::Preset(preset),
+                            );
+                            model.status = format!("Launching preset {name}…");
+                            dirty = true;
+                        }
+                        run_pending_db::PresetDrainPlan::NothingToLaunch => {
+                            model.status = format!("preset {name}: layout missing and no commands");
+                            dirty = true;
+                        }
+                    }
+                }
                 run_pending_db::PendingDbResult::Dropped { seq } => {
                     if pending_db_fence.accepts_layout(seq) {
                         model.status = run_pending_db::dropped_layout_status().into();
@@ -12060,9 +12116,8 @@ async fn event_loop<T: Terminal>(
                         &current_config,
                         &launch_tx,
                         &waker,
-                        &mut session,
-                        &mut panes,
-                        chrome.center,
+                        &pending_db_tx,
+                        &mut pending_db_fence,
                         &mut model.status,
                     );
                 }
@@ -19984,9 +20039,8 @@ async fn event_loop<T: Terminal>(
                                                 &current_config,
                                                 &launch_tx,
                                                 &waker,
-                                                &mut session,
-                                                &mut panes,
-                                                chrome.center,
+                                                &pending_db_tx,
+                                                &mut pending_db_fence,
                                                 &mut model.status,
                                             );
                                         }
@@ -25945,23 +25999,16 @@ async fn event_loop<T: Terminal>(
                                 ));
                             }
                             Action::ConnectRoot => {
-                                // Connect-to-root (the sesh `root` jump):
-                                // resolve the focused pane's cwd to its
-                                // owning worktree and reveal that tab. The
-                                // rev-parse is ms-scale on an explicit user
-                                // action (same stance as ConfirmInitGit).
+                                // Connect-to-root resolves the focused pane's cwd
+                                // on a blocking worker, then reads the registry.
                                 let cwd = panes
                                     .table
                                     .get(&focused)
                                     .and_then(|p| p.cwd())
                                     .or_else(|| active_cwd(&session));
-                                let root = cwd
-                                    .as_deref()
-                                    .and_then(thegn_core::repo::worktree_root_for_cwd);
                                 let group_paths: Vec<String> =
                                     session.worktrees.iter().map(|g| g.path.clone()).collect();
                                 crate::workspace_switch_prep::request_connect_root(
-                                    root,
                                     cwd,
                                     group_paths,
                                     &session.id,
