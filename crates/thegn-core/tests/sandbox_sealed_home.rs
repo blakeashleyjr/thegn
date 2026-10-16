@@ -5,6 +5,8 @@
 //! Everything here uses a **synthetic** `$HOME` in a tempdir with canary
 //! sentinels; no real credential file is ever read.
 
+#![cfg(unix)]
+
 use std::collections::HashMap;
 use std::os::unix::fs::symlink;
 use std::path::{Path, PathBuf};
