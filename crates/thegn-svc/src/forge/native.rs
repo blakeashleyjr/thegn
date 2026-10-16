@@ -1,15 +1,16 @@
 //! The native GitHub layer: bounded GraphQL HTTP for the two hot-path reads
 //! (`pr_status`, `pr_list`) on local worktrees with a resolvable token.
 //!
-//! Everything else answers `Unsupported`, and any "this layer can't" condition
-//! (remote location, no token, open circuit breaker, client build failure,
-//! GraphQL-level errors) answers `NotConfigured` — so the `Ladder` falls
-//! through to [`GithubCli`](thegn_core::github::GithubCli). Transport
+//! Everything else answers `Unsupported`, and "this layer can't" conditions
+//! on native PR reads (remote location, no token, open circuit breaker, client
+//! build failure, GraphQL-level errors) answer `NotConfigured` — so the
+//! `Ladder` falls through to [`GithubCli`](thegn_core::github::GithubCli). Transport
 //! failures and timeouts are `Offline` (final: retrying on `gh` would just
 //! repeat the failure), and feed a per-token circuit breaker plus the
 //! process-wide connectivity holder. The synchronous seam reuses one
 //! current-thread runtime and one reqwest connection pool; it does not sleep
-//! during backoff.
+//! during backoff. HTTP 5xx and undecodable responses also feed the circuit;
+//! while it is open, issue/search CLI poll operations return its held error.
 
 use crate::issue::http::{TrackerHttpBudget, TrackerHttpClient};
 use serde_json::Value;
@@ -412,7 +413,23 @@ const NATIVE_REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_se
 /// When open, skip native HTTP for `CIRCUIT_OPEN_SECS` and use the CLI fallback.
 const CIRCUIT_OPEN_AFTER: u32 = 3;
 const CIRCUIT_OPEN_SECS: u64 = 60;
+const CIRCUIT_MAX_OPEN_SECS: u64 = 900;
 const MAX_RETRY_AFTER_SECS: u64 = 86_400;
+
+fn failure_open_window(failures: u32, seed: u64) -> Option<std::time::Duration> {
+    if failures < CIRCUIT_OPEN_AFTER {
+        return None;
+    }
+    let exponent = failures.saturating_sub(CIRCUIT_OPEN_AFTER).min(5);
+    let base = CIRCUIT_OPEN_SECS
+        .checked_shl(exponent)
+        .unwrap_or(CIRCUIT_MAX_OPEN_SECS)
+        .min(CIRCUIT_MAX_OPEN_SECS);
+    let jitter = seed % (base / 5 + 1);
+    Some(std::time::Duration::from_secs(
+        base.saturating_add(jitter).min(MAX_RETRY_AFTER_SECS),
+    ))
+}
 
 /// One bounded circuit state per GitHub token, shared across native instances.
 const MAX_CIRCUITS: usize = 64;
@@ -421,6 +438,7 @@ static HTTP_CLIENT: OnceLock<Result<reqwest::Client, String>> = OnceLock::new();
 static HTTP_RUNTIME: OnceLock<Result<tokio::runtime::Runtime, String>> = OnceLock::new();
 
 struct GhCircuit {
+    seed: u64,
     failures: std::sync::atomic::AtomicU32,
     open_until: std::sync::Mutex<Option<std::time::Instant>>,
     open_error: std::sync::Mutex<Option<ForgeError>>,
@@ -428,7 +446,12 @@ struct GhCircuit {
 
 impl GhCircuit {
     fn new() -> Self {
+        Self::with_seed(0)
+    }
+
+    fn with_seed(seed: u64) -> Self {
         Self {
+            seed,
             failures: std::sync::atomic::AtomicU32::new(0),
             open_until: std::sync::Mutex::new(None),
             open_error: std::sync::Mutex::new(None),
@@ -500,8 +523,8 @@ impl GhCircuit {
             .failures
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
             + 1;
-        if failures >= CIRCUIT_OPEN_AFTER {
-            self.open_for(std::time::Duration::from_secs(CIRCUIT_OPEN_SECS), error);
+        if let Some(window) = failure_open_window(failures, self.seed) {
+            self.open_for(window, error);
         }
     }
 }
@@ -521,7 +544,7 @@ fn circuit_for(token: &str) -> Arc<GhCircuit> {
     {
         circuits.remove(&evicted);
     }
-    let circuit = Arc::new(GhCircuit::new());
+    let circuit = Arc::new(GhCircuit::with_seed(key));
     circuits.insert(key, Arc::clone(&circuit));
     circuit
 }
@@ -530,6 +553,21 @@ fn any_open_circuit_error() -> Option<ForgeError> {
     let circuits = CIRCUITS.get()?;
     let circuits = circuits.lock().unwrap_or_else(|error| error.into_inner());
     circuits.values().find_map(|circuit| circuit.active_error())
+}
+
+fn poll_backoff_from(held: Option<ForgeError>) -> Option<ForgeError> {
+    match held {
+        Some(error @ (ForgeError::RateLimited | ForgeError::Other(_))) => Some(error),
+        _ => None,
+    }
+}
+
+pub fn poll_backoff_error() -> Option<ForgeError> {
+    let circuits = CIRCUITS.get()?;
+    let circuits = circuits.lock().unwrap_or_else(|error| error.into_inner());
+    circuits
+        .values()
+        .find_map(|circuit| poll_backoff_from(circuit.active_error()))
 }
 
 fn shared_http_client() -> Result<&'static reqwest::Client, ForgeError> {
@@ -708,6 +746,12 @@ async fn graphql_request(
         }
         Err(error) => {
             let classified = ForgeError::Other(format!("GitHub HTTP request failed: {error:?}"));
+            if matches!(
+                error,
+                IssueError::Policy(_) | IssueError::BodyLimit(_) | IssueError::Parse(_)
+            ) {
+                health.record_http_failure(classified.clone());
+            }
             tracing::warn!(target: "thegn::forge", op = what, error = %classified,
                 "GitHub request failed");
             return Err(classified);
@@ -746,7 +790,7 @@ async fn graphql_request(
                 ForgeError::Other(format!("GitHub API HTTP {code}: {message}"))
             }
         };
-        if matches!(code, 401 | 403 | 429) {
+        if matches!(code, 401 | 403 | 429 | 500..=599) {
             if let Some(delay) =
                 retry_delay(&envelope.headers, matches!(&error, ForgeError::RateLimited))
             {
@@ -767,6 +811,7 @@ async fn graphql_request(
             } else {
                 ForgeError::Other(format!("GitHub API HTTP {code}: invalid JSON response"))
             };
+            health.record_http_failure(error.clone());
             tracing::warn!(target: "thegn::forge", op = what, error = %error,
                 "GitHub response could not be decoded");
             return Err(error);
@@ -901,6 +946,38 @@ impl Forge for GithubNative {
             // on-merge auto-clean) and overwrite the good cached row.
             self.graphql(token.clone(), body, "pr_list")
         })
+    }
+
+    fn issue_rows(&self, loc: &GitLoc, _limit: usize) -> Result<Vec<IssueRow>, ForgeError> {
+        const OP: &str = "issue_rows";
+        if loc.is_remote() {
+            return Err(ForgeError::Unsupported(OP));
+        }
+        if let Some(error) = poll_backoff_error()
+            && self.owner_repo(loc).is_some()
+        {
+            return Err(error);
+        }
+        Err(ForgeError::Unsupported(OP))
+    }
+
+    fn search_prs(
+        &self,
+        loc: &GitLoc,
+        _role: PrRole,
+        _repo: Option<&str>,
+        _limit: usize,
+    ) -> Result<Vec<PrSearchRow>, ForgeError> {
+        const OP: &str = "search_prs";
+        if loc.is_remote() {
+            return Err(ForgeError::Unsupported(OP));
+        }
+        if let Some(error) = poll_backoff_error()
+            && self.owner_repo(loc).is_some()
+        {
+            return Err(error);
+        }
+        Err(ForgeError::Unsupported(OP))
     }
 }
 

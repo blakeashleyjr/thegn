@@ -263,7 +263,7 @@ fn typed_http_answers_are_not_global_network_failures() {
             assert!(!error.falls_through());
             assert_eq!(
                 health.failures.load(Ordering::Relaxed),
-                if matches!(status, 401 | 403 | 429) {
+                if matches!(status, 401 | 403 | 429 | 500..=599) {
                     1
                 } else {
                     0
@@ -840,4 +840,181 @@ fn unknown_wait_ownership_is_reaped_without_group_signal() {
         dir.path().join("completed").exists(),
         "unknown ownership must never trigger a group signal"
     );
+}
+
+#[test]
+fn failure_windows_grow_with_deterministic_jitter_and_cap() {
+    for failures in 0..CIRCUIT_OPEN_AFTER {
+        assert_eq!(failure_open_window(failures, 7), None);
+    }
+    for (failures, base) in [(3, 60), (4, 120), (6, 480), (8, 900), (u32::MAX, 900)] {
+        assert_eq!(
+            failure_open_window(failures, 0),
+            Some(Duration::from_secs(base))
+        );
+        let first = failure_open_window(failures, 17).unwrap();
+        let second = failure_open_window(failures, 23).unwrap();
+        assert_ne!(first, second);
+        assert!(first.as_secs() <= MAX_RETRY_AFTER_SECS);
+        assert!(second.as_secs() <= MAX_RETRY_AFTER_SECS);
+    }
+}
+
+#[test]
+fn malformed_and_server_error_responses_open_the_circuit_and_suppress_requests() {
+    let rt = runtime();
+    rt.block_on(async {
+        let fixtures = [
+            (502, "<html>bad gateway</html>", None),
+            (200, "not json", Some("application/json")),
+            (200, "<html>proxy error</html>", Some("text/html")),
+        ];
+        let unused = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = unused.local_addr().unwrap();
+        drop(unused);
+        let unreachable = TrackerHttpClient::new_with_operation_timeout(
+            "github-test",
+            &format!("http://{address}"),
+            "Bearer fixture".into(),
+            Arc::new(TrackerHttpBudget::with_permits(8)),
+            Duration::from_millis(200),
+        )
+        .unwrap();
+        for (status, text, content_type) in fixtures {
+            let health = GhCircuit::new();
+            let client =
+                client_with_content_type(status, text, None, Duration::from_secs(2), content_type);
+            for _ in 0..3 {
+                let result = graphql_request(
+                    &client,
+                    &serde_json::json!({"query":"fixture"}),
+                    "fixture",
+                    &health,
+                )
+                .await;
+                assert!(result.is_err());
+            }
+            let held = health.active_error().expect("third failure opens circuit");
+            assert_eq!(health.failures.load(Ordering::Relaxed), 3);
+            assert_eq!(
+                graphql_request(
+                    &unreachable,
+                    &serde_json::json!({"query":"fixture"}),
+                    "fixture",
+                    &health,
+                )
+                .await,
+                Err(held)
+            );
+            assert_eq!(health.failures.load(Ordering::Relaxed), 3);
+        }
+    });
+}
+
+#[test]
+fn server_retry_after_opens_immediately_and_success_resets_failures() {
+    let rt = runtime();
+    rt.block_on(async {
+        let health = GhCircuit::new();
+        let server_error =
+            client_with_header(503, "<html>unavailable</html>", ("retry-after", "30"));
+        assert!(
+            graphql_request(
+                &server_error,
+                &serde_json::json!({"query":"fixture"}),
+                "fixture",
+                &health,
+            )
+            .await
+            .is_err()
+        );
+        assert!(health.active_error().is_some());
+        assert_eq!(health.failures.load(Ordering::Relaxed), 1);
+
+        health.record_success();
+        assert_eq!(health.active_error(), None);
+        assert_eq!(health.failures.load(Ordering::Relaxed), 0);
+        let retryable = client(503, "<html>unavailable</html>");
+        assert!(
+            graphql_request(
+                &retryable,
+                &serde_json::json!({"query":"fixture"}),
+                "fixture",
+                &health,
+            )
+            .await
+            .is_err()
+        );
+        assert_eq!(health.active_error(), None);
+        assert_eq!(health.failures.load(Ordering::Relaxed), 1);
+    });
+}
+
+#[test]
+fn http_failure_window_grows_after_expiration() {
+    let health = GhCircuit::new();
+    for _ in 0..3 {
+        health.record_http_failure(ForgeError::Other("failure".into()));
+    }
+    health.open_for(Duration::ZERO, ForgeError::Other("expired".into()));
+    health.record_http_failure(ForgeError::Other("failure".into()));
+    let guard = health.open_until.lock().unwrap();
+    let remaining = guard
+        .unwrap()
+        .saturating_duration_since(std::time::Instant::now());
+    assert!(remaining > Duration::from_secs(60));
+}
+
+#[test]
+fn poll_backoff_only_passes_final_api_errors() {
+    assert_eq!(
+        poll_backoff_from(Some(ForgeError::RateLimited)),
+        Some(ForgeError::RateLimited)
+    );
+    let other = ForgeError::Other("bad response".into());
+    assert_eq!(poll_backoff_from(Some(other.clone())), Some(other));
+    assert_eq!(poll_backoff_from(Some(ForgeError::NotAuthenticated)), None);
+    assert_eq!(
+        poll_backoff_from(Some(ForgeError::NotConfigured("offline".into()))),
+        None
+    );
+    assert_eq!(poll_backoff_from(None), None);
+}
+
+#[test]
+fn open_circuit_gates_github_cli_poll_ladder() {
+    let token = "poll-gate-regression-token-unique";
+    let circuit = circuit_for(token);
+    circuit.record_backoff(Duration::from_secs(30), ForgeError::RateLimited);
+    let dir = tempfile::tempdir().unwrap();
+    assert!(
+        thegn_core::util::git_cmd(dir.path())
+            .args(["init", "-q"])
+            .status()
+            .unwrap()
+            .success()
+    );
+    assert!(
+        thegn_core::util::git_cmd(dir.path())
+            .args(["remote", "add", "origin", "https://github.com/org/repo.git"])
+            .status()
+            .unwrap()
+            .success()
+    );
+    let loc = GitLoc::Local(dir.path().into());
+    let forge = super::super::github(false);
+    let issue_result = forge.issue_rows(&loc, 10);
+    let search_result = forge.search_prs(&loc, thegn_core::forge::PrRole::Author, None, 10);
+    circuit.record_success();
+    assert!(matches!(issue_result, Err(ForgeError::RateLimited)));
+    assert!(matches!(search_result, Err(ForgeError::RateLimited)));
+
+    let remote = GitLoc::Remote {
+        ssh: thegn_core::remote::SshTarget::plain("host".into(), 22, false),
+        path: "/repo".into(),
+    };
+    assert!(matches!(
+        GithubNative::new().issue_rows(&remote, 10),
+        Err(ForgeError::Unsupported(_))
+    ));
 }

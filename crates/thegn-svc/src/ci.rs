@@ -1174,6 +1174,29 @@ impl CiProvider for GithubCi {
         CiSystem::GithubActions
     }
     fn runs(&self, loc: &GitLoc, branch: Option<&str>, limit: usize) -> Result<CiRunList, CiError> {
+        fn ci_backoff_gate(
+            local_loc: bool,
+            host: &str,
+            held: Option<crate::forge::ForgeError>,
+        ) -> Option<CiError> {
+            if !local_loc || !host.eq_ignore_ascii_case("github.com") {
+                return None;
+            }
+            match held {
+                Some(crate::forge::ForgeError::RateLimited) => Some(CiError::RateLimited),
+                Some(crate::forge::ForgeError::Other(message)) => Some(CiError::Other(message)),
+                _ => None,
+            }
+        }
+
+        let remote = self.remote(loc)?;
+        if let Some(error) = ci_backoff_gate(
+            !loc.is_remote(),
+            &remote.host,
+            crate::forge::native::poll_backoff_error(),
+        ) {
+            return Err(error);
+        }
         let limit_s = limit.max(1).to_string();
         let mut args = vec!["run", "list", "--limit", &limit_s, "--json", GH_RUN_FIELDS];
         if let Some(b) = branch {
