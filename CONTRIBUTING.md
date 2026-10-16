@@ -224,6 +224,50 @@ don't apply:
   release build, and downloaded-artifact smoke) runs only when `ci.yml` is
   dispatched with `extras: true`.
 
+### Running the tests under Wine (from Linux)
+
+`just test-windows-wine [nextest args]` cross-compiles the test binaries for
+`x86_64-pc-windows-gnu` and **runs** them under Wine, so a Windows regression
+shows up as a failing test on a Linux box instead of only as a compile check.
+With no arguments it runs the whole workspace; pass `-p <crate>` and/or a
+nextest filter to narrow it (`just test-windows-wine -p thegn-proc fallback`).
+It is x86_64 Linux only, a heavy gate (a separate full compile; the agent
+heavy-guard treats it like `just test`), and not part of `just ci`.
+
+How it is wired:
+
+- **Wine** is the flake package `.#wine` (`wineWow64Packages.minimal`, ~790 MB
+  closure), built on first use by the recipe. It is deliberately not in the dev
+  shell, so nobody else downloads it.
+- **`test/wine-runner.sh`** is the cargo target runner. It uses a private,
+  headless prefix under `$XDG_CACHE_HOME/thegn/` (created once, ~30 s), with
+  Mono/Gecko disabled and no display, and exits with the test's status. It
+  exports `THEGN_UNDER_WINE=1`.
+- **`test/mingw-link.sh`** wraps the mingw linker for this recipe only: the
+  cdylib that `iroh-relay` declares exceeds the 65,535-entry PE export table
+  in a debug build, so that one unused DLL is replaced by an empty stub.
+- **Skips** live in the `wine` profile in `.config/nextest.toml`, each with
+  its cause. That list is only for Wine artefacts. A test that fails because
+  thegn is wrong on Windows, or because the test assumes Linux, is a bug to
+  fix, not a skip.
+
+What it covers: pure logic, the `cfg(windows)` code paths in the leaf crates
+(`thegn-proc`, `thegn-metrics`, `thegn-media`, `tg-kit`, `gtui-*`), process
+spawning through Win32 `CreateProcess`, and Windows path handling. What it does
+NOT cover, so a green run here proves nothing about these: ConPTY behaviour
+(Wine's is incomplete), Job Object kill-on-close and nested jobs, named-pipe
+reservation timing (the `bind_exclusive` race above), NTFS ACLs, symlink
+privilege rules, and anything MSVC-specific. The MSVC CI job is still the gate
+for those.
+
+Wine also exposes the host's Unix root as drive `Z:`, so a test that checks
+`Path::new("/bin/sh").exists()` before spawning `sh` sees `true` under Wine and
+`false` on real Windows. Prefer `cfg!(unix)` for that kind of guard.
+
+Known gap: the test targets of `thegn-core`, `thegn-svc` and `thegn-host` do
+not yet compile for Windows (test code uses `std::os::unix` without a gate),
+so today the recipe runs only the leaf crates in practice.
+
 ## Where things live
 
 The architecture (crates, invariants, and the gate behind each) is
