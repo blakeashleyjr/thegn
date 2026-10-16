@@ -57,13 +57,13 @@ impl PluginTx {
     pub(crate) fn send(
         &self,
         message: PluginMsg,
-    ) -> Result<(), tokio_mpsc::error::SendError<PluginMsg>> {
+    ) -> Result<(), Box<tokio_mpsc::error::SendError<PluginMsg>>> {
         match message {
             PluginMsg::Event { plugin, event } => {
                 self.inbox.push(plugin, event);
                 Ok(())
             }
-            message => self.lifecycle.send(message),
+            message => self.lifecycle.send(message).map_err(Box::new),
         }
     }
 }
@@ -735,6 +735,16 @@ fn initial_run_ids(loaded: &[LoadedState], sched: &[SchedEntry]) -> BTreeSet<Str
 mod tests {
     use super::*;
     use thegn_core::plugin_api::{ContributionId, MAX_PLUGIN_TIMEOUT_SECS, PluginId, PluginSpec};
+
+    #[test]
+    fn plugin_send_error_keeps_result_variant_small() {
+        let (tx, rx) = plugin_channel();
+        drop(rx);
+
+        let error = tx.send(PluginMsg::Loaded(Vec::new())).unwrap_err();
+
+        assert!(std::mem::size_of_val(&error) < 128);
+    }
 
     fn example_spec() -> PluginSpec {
         toml::from_str(include_str!("../../../examples/plugins/hello/plugin.toml")).unwrap()
