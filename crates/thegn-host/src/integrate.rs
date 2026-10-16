@@ -635,13 +635,14 @@ fn driver_merge(
     let tree = (|| -> Option<String> {
         scratch.verify().ok()?;
         // rerere on: apply recorded resolutions and stage them (autoUpdate).
+        let overrides = match opts.overrides {
+            Some(base) => scratch_driver_overrides(&tmp, base)?,
+            None => Vec::new(),
+        };
         let mut args: Vec<&str> = Vec::new();
-        if let Some(base) = opts.overrides {
-            let overrides = scratch_driver_overrides(&tmp, base)?;
-            for item in &overrides {
-                args.push("-c");
-                args.push(item);
-            }
+        for item in &overrides {
+            args.push("-c");
+            args.push(item);
         }
         if opts.rerere {
             args.extend_from_slice(&["-c", "rerere.enabled=true", "-c", "rerere.autoUpdate=true"]);
