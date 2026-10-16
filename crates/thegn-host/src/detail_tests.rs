@@ -1084,6 +1084,7 @@ fn model_full() -> FrameModel {
                     read_bps: 1_500_000,
                     write_bps: 200_000,
                     kind: thegn_metrics::DiskKind::Ssd,
+                    extra_mounts: 0,
                 },
                 thegn_metrics::DiskInfo {
                     name: "sda1".into(),
@@ -1092,8 +1093,10 @@ fn model_full() -> FrameModel {
                     read_bps: 0,
                     write_bps: 0,
                     kind: thegn_metrics::DiskKind::Hdd,
+                    extra_mounts: 0,
                 },
-            ],
+            ]
+            .into(),
             ..Default::default()
         },
         ..Default::default()

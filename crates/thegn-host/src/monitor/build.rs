@@ -599,7 +599,17 @@ fn disk(cx: &Ctx, wt_rows: &[DiskWtRow], sel: usize, eta: Option<DiskFillEta>) -
         .map(|d| {
             let tone = free_tone(d.free_pct);
             vec![
-                Cell::Text(trunc(&d.mount, 20), Tok::Slot(S::Text)),
+                Cell::Text(
+                    trunc(
+                        &if d.extra_mounts > 0 {
+                            format!("{} +{}", d.mount, d.extra_mounts)
+                        } else {
+                            d.mount.clone()
+                        },
+                        20,
+                    ),
+                    Tok::Slot(S::Text),
+                ),
                 Cell::Text(kind_str(d.kind).into(), Tok::Slot(S::Ghost)),
                 Cell::Bar(f32::from(d.free_pct) / 100.0, 8, tone),
                 Cell::Text(format!("{}% free", d.free_pct), tone),
