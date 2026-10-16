@@ -1538,11 +1538,13 @@ mod tests {
 
     #[test]
     fn resolver_prefers_known_dirs_then_falls_back_to_admitted_path_entries() {
-        use std::os::unix::fs::PermissionsExt;
+        if !crate::platform::test_mode_bits_supported() {
+            return;
+        }
         let mk = |dir: &Path, mode: u32| {
             let f = dir.join("fc-list");
             std::fs::write(&f, b"#!/bin/sh\n").unwrap();
-            std::fs::set_permissions(&f, std::fs::Permissions::from_mode(mode)).unwrap();
+            crate::platform::test_set_mode(&f, mode).unwrap();
             f
         };
         let known = tempfile::tempdir().unwrap();

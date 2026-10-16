@@ -1246,7 +1246,12 @@ mod tests {
             .unwrap();
         assert!(init.success());
         let link = dir.path().join(".git/dangling-marker");
-        std::os::unix::fs::symlink("missing-target", &link).unwrap();
+        if let Err(error) =
+            crate::fsperm::create_symlink(std::path::Path::new("missing-target"), &link, false)
+        {
+            assert!(!cfg!(unix), "symlink fixture: {error}");
+            return;
+        }
 
         let loc = GitLoc::Local(dir.path().to_path_buf());
         assert!(loc.read_git_path_checked("dangling-marker").is_err());
@@ -1279,10 +1284,8 @@ mod tests {
     }
 
     fn provider_repo() -> (tempfile::TempDir, GitLoc) {
-        use std::os::unix::fs::PermissionsExt;
-
         let dir = tempfile::tempdir().unwrap();
-        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        crate::fsperm::restrict_dir_to_owner(dir.path()).unwrap();
         let init = util::git_cmd(dir.path())
             .args(["init", "--quiet"])
             .status()
@@ -1485,10 +1488,8 @@ mod tests {
 
     #[test]
     fn oversized_tagged_reader_is_killed_and_reaped() {
-        use std::os::unix::fs::PermissionsExt;
-
         let dir = tempfile::tempdir().unwrap();
-        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        crate::fsperm::restrict_dir_to_owner(dir.path()).unwrap();
         let pid_path = dir.path().join("producer.pid");
         let script = format!(
             "printf '%s' \"$$\" > {}; printf P; exec yes x",

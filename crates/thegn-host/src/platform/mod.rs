@@ -433,6 +433,57 @@ pub(crate) fn test_make_unreadable(path: &std::path::Path) -> bool {
         false
     }
 }
+
+#[cfg(test)]
+pub(crate) fn test_mode_bits_supported() -> bool {
+    cfg!(unix)
+}
+
+#[cfg(test)]
+pub(crate) fn test_set_mode(path: &std::path::Path, mode: u32) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode))
+    }
+    #[cfg(not(unix))]
+    {
+        drop((path, mode));
+        Err(std::io::Error::other(
+            "mode bits are not supported by this test",
+        ))
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn test_unix_socket_supported() -> bool {
+    cfg!(unix)
+}
+
+#[cfg(test)]
+pub(crate) fn test_spawn_silent_socket(path: &std::path::Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        let listener = std::os::unix::net::UnixListener::bind(path)?;
+        drop(std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                // Hold each connection open without replying to the probe.
+                let _held = stream;
+                std::thread::sleep(std::time::Duration::from_secs(30));
+            }
+        }));
+        Ok(())
+    }
+    #[cfg(not(unix))]
+    {
+        drop(path);
+        Err(std::io::Error::other(
+            "Unix sockets are not supported by this test",
+        ))
+    }
+}
+
 #[cfg(windows)]
 mod windows;
 #[cfg(windows)]
