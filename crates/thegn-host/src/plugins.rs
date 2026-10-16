@@ -89,8 +89,12 @@ impl PluginRx {
         self.lifecycle.is_empty() && self.inbox.is_empty()
     }
 
-    pub(crate) fn pop_rejected(&self) -> Option<inbox::RejectedRequest> {
-        self.inbox.pop_rejected()
+    pub(crate) fn pop_rejected_if_lifecycle_empty(&self) -> Option<inbox::RejectedRequest> {
+        if self.lifecycle.is_empty() {
+            self.inbox.pop_rejected()
+        } else {
+            None
+        }
     }
 
     pub(crate) fn inbox(&self) -> Arc<PluginInbox> {
