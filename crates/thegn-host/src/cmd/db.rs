@@ -123,12 +123,12 @@ pub fn vacuum_report(db: &Db, dry_run: bool) -> Result<VacuumReport> {
     let (pruned_semantic_rows, pruned_cache_keys) = db
         .prune_stale_caches_to_end(4096, &mut |scanned| {
             progress_slices += 1;
-            if progress_slices % 64 == 0 {
+            if progress_slices.is_multiple_of(64) {
                 msg::info(&format!("scanned {scanned} semantic rows"));
             }
         })
-        .map_err(map_busy)
-        .context("pruning stale cache rows")?;
+        .context("pruning stale cache rows")
+        .map_err(map_busy)?;
 
     let (after, pruned_notifications) = if before.auto_vacuum != AutoVacuum::Incremental {
         msg::info(
