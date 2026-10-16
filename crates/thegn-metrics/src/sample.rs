@@ -6,16 +6,19 @@
 
 use std::time::Instant;
 
+#[cfg(not(target_os = "linux"))]
+use sysinfo::Disks;
 use sysinfo::{
-    Components, CpuRefreshKind, Disks, MemoryRefreshKind, Networks, Pid, ProcessRefreshKind,
+    Components, CpuRefreshKind, MemoryRefreshKind, Networks, Pid, ProcessRefreshKind,
     ProcessesToUpdate, RefreshKind, System,
 };
 
+#[cfg(not(target_os = "linux"))]
+use crate::DiskKind;
 use crate::gpu_monitor::GpuMonitor;
 use crate::thermal::ThermalProbe;
 use crate::{
-    ChildGroup, DiskInfo, DiskKind, NetMedium, StatsSnapshot, disk_space, read_battery,
-    read_battery_power,
+    ChildGroup, DiskInfo, NetMedium, StatsSnapshot, disk_space, read_battery, read_battery_power,
 };
 
 /// Refresh the slow tier (frequency / temperatures / disks) once every N
@@ -49,7 +52,10 @@ impl SystemInfo {
 pub struct StatsSampler {
     sys: System,
     nets: Networks,
+    #[cfg(not(target_os = "linux"))]
     disks: Disks,
+    #[cfg(target_os = "linux")]
+    disk_aggregate: crate::disk_aggregate::DiskAggregate,
     comps: Components,
     gpu: GpuMonitor,
     /// How temperatures are read. `Components` on Linux/Intel; the Apple-vendor
@@ -75,13 +81,16 @@ pub struct StatsSampler {
     /// When the network counters were last read (for bytes/sec).
     prev_net: Instant,
     /// When disk IO counters were last read (for bytes/sec).
+    #[cfg(not(target_os = "linux"))]
     prev_disk: Instant,
     /// Previous `pgsteal_direct` reading and when, for the direct-reclaim RATE.
     /// `None` until the first sample — a monotonic counter cannot yield a rate
     /// without a predecessor, and reporting the raw total would be meaningless.
     prev_reclaim: Option<(u64, Instant)>,
     /// Cached slow-tier results, reused between refreshes.
-    last_disks: Vec<DiskInfo>,
+    last_disks: std::sync::Arc<[DiskInfo]>,
+    #[cfg(not(target_os = "linux"))]
+    last_disk_io: Option<(u64, u64)>,
     last_temps: Vec<(String, f32)>,
     last_net_medium: NetMedium,
 }
@@ -196,7 +205,10 @@ impl StatsSampler {
         StatsSampler {
             sys,
             nets: Networks::new_with_refreshed_list(),
+            #[cfg(not(target_os = "linux"))]
             disks: Disks::new_with_refreshed_list(),
+            #[cfg(target_os = "linux")]
+            disk_aggregate: crate::disk_aggregate::DiskAggregate::new(),
             comps: Components::new_with_refreshed_list(),
             gpu: GpuMonitor::new(),
             thermal: ThermalProbe::probe(),
@@ -208,9 +220,12 @@ impl StatsSampler {
             proc_primed: false,
             tracked: Vec::new(),
             prev_net: now,
+            #[cfg(not(target_os = "linux"))]
             prev_disk: now,
             prev_reclaim: None,
-            last_disks: Vec::new(),
+            last_disks: std::sync::Arc::from([]),
+            #[cfg(not(target_os = "linux"))]
+            last_disk_io: None,
             last_temps: Vec::new(),
             last_net_medium: NetMedium::Unknown,
         }
@@ -367,36 +382,64 @@ impl StatsSampler {
                 }
             };
 
+            #[cfg(not(target_os = "linux"))]
             let dt_disk = now.duration_since(self.prev_disk).as_secs_f64().max(0.001);
-            self.prev_disk = now;
-            self.disks.refresh(false);
-            self.last_disks = self
-                .disks
-                .iter()
-                .map(|d| {
-                    let total = d.total_space();
-                    let free_pct = if total > 0 {
-                        ((d.available_space() as f64 / total as f64) * 100.0).round() as u8
-                    } else {
-                        0
-                    };
-                    let usage = d.usage();
-                    DiskInfo {
-                        name: d.name().to_string_lossy().into_owned(),
-                        mount: d.mount_point().to_string_lossy().into_owned(),
-                        free_pct: free_pct.min(100),
-                        read_bps: (usage.read_bytes as f64 / dt_disk) as u64,
-                        write_bps: (usage.written_bytes as f64 / dt_disk) as u64,
-                        kind: match d.kind() {
-                            sysinfo::DiskKind::HDD => DiskKind::Hdd,
-                            sysinfo::DiskKind::SSD => DiskKind::Ssd,
-                            _ => DiskKind::Unknown,
-                        },
-                    }
-                })
-                .collect();
+            #[cfg(not(target_os = "linux"))]
+            {
+                self.prev_disk = now;
+            }
+            #[cfg(not(target_os = "linux"))]
+            {
+                self.disks.refresh(false);
+                self.last_disks = crate::disk_aggregate::dedupe_by_name(
+                    self.disks
+                        .iter()
+                        .map(|d| {
+                            let total = d.total_space();
+                            let free_pct = if total > 0 {
+                                ((d.available_space() as f64 / total as f64) * 100.0).round() as u8
+                            } else {
+                                0
+                            };
+                            let usage = d.usage();
+                            DiskInfo {
+                                name: d.name().to_string_lossy().into_owned(),
+                                mount: d.mount_point().to_string_lossy().into_owned(),
+                                free_pct: free_pct.min(100),
+                                read_bps: (usage.read_bytes as f64 / dt_disk) as u64,
+                                write_bps: (usage.written_bytes as f64 / dt_disk) as u64,
+                                kind: match d.kind() {
+                                    sysinfo::DiskKind::HDD => DiskKind::Hdd,
+                                    sysinfo::DiskKind::SSD => DiskKind::Ssd,
+                                    _ => DiskKind::Unknown,
+                                },
+                                extra_mounts: 0,
+                            }
+                        })
+                        .collect(),
+                )
+                .into();
+            }
+            #[cfg(not(target_os = "linux"))]
+            {
+                self.last_disk_io = if self.last_disks.is_empty() {
+                    None
+                } else {
+                    Some(self.last_disks.iter().fold((0u64, 0u64), |(r, w), d| {
+                        (r.saturating_add(d.read_bps), w.saturating_add(d.write_bps))
+                    }))
+                };
+            }
         }
-        snap.disks = self.last_disks.clone();
+        #[cfg(target_os = "linux")]
+        {
+            (snap.disk_io, self.last_disks) = self.disk_aggregate.sample(slow, now);
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            snap.disk_io = self.last_disk_io;
+        }
+        snap.disks = std::sync::Arc::clone(&self.last_disks);
         snap.net_medium = self.last_net_medium;
         snap.temps = self.last_temps.clone();
         snap.cpu_temp_c = cpu_temp(&snap.temps);

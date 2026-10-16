@@ -205,7 +205,9 @@ mod tests {
                 read_bps: 0,
                 write_bps: 0,
                 kind: DiskKind::Ssd,
-            }],
+                extra_mounts: 0,
+            }]
+            .into(),
             temps: vec![("cpu".into(), 45.0)],
             load_avg: Some((1.0, 1.0, 1.0)),
             uptime_secs: Some(1000),

@@ -42,7 +42,9 @@ fn full_snap() -> StatsSnapshot {
             read_bps: 1024,
             write_bps: 2048,
             kind: thegn_metrics::DiskKind::Ssd,
-        }],
+            extra_mounts: 0,
+        }]
+        .into(),
         temps: vec![("coretemp".into(), 61.0), ("nvme".into(), 44.0)],
         load_avg: Some((1.5, 1.2, 0.9)),
         uptime_secs: Some(90_000),
@@ -1858,6 +1860,19 @@ fn process_confirmation_keeps_its_identity_while_ranks_change() {
         })
     ));
     // Do not confirm: the fixture validates the target, never sends a signal.
+}
+
+#[test]
+fn disk_volume_row_displays_collapsed_mount_count() {
+    let mut stats = full_snap();
+    let mut disks = stats.disks.to_vec();
+    disks[0].extra_mounts = 42;
+    disks[0].mount = "/var/lib/containers/storage".into();
+    stats.disks = disks.into();
+    let model = model_with(stats);
+    let hist = history(120, NOW_MS);
+    let overlay = open_tab(MonitorTab::Disk, &model, &hist, SHORT);
+    assert!(render_text(&overlay, 100, 30).contains("+42"));
 }
 
 #[path = "monitor_cache_tests.rs"]
