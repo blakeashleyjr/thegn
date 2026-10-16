@@ -216,7 +216,8 @@ fn outcome(
             }
             _ => CustomOutcome::Wait,
         },
-        End::Spawn(_) | End::Supervise(_) => unreachable!("handled above"),
+        End::Spawn(_) => CustomOutcome::Spawn,
+        End::Supervise(_) => CustomOutcome::Wait,
     }
 }
 
