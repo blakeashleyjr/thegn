@@ -64,11 +64,18 @@ config degrades instead of failing.
 thegn SHALL keep one server instance per `(worktree root, registry key)`.
 A server MUST NOT be started eagerly: the first request for a key spawns
 and initializes it off the event loop, and the instance stays warm across
-tab switches until shutdown. A spawn or initialize failure MUST be cached
-per key so a missing server is not respawned on every request, and clients
-MUST be shut down when the supervisor is dropped. The bridged stdio
-transport (in-sandbox / remote servers) MUST apply to registry entries the
-same as to built-ins.
+tab switches until shutdown or idle eviction. At its next idle sweep, the
+supervisor SHALL evict a server that has been unused for 30 minutes, whose
+root is not the active worktree, and that no request is holding; a later
+request SHALL start it lazily again. The sweep runs off-loop at most once a
+minute after a hydration apply. A spawn or initialize failure MUST be cached
+per key so a missing server is not
+respawned on every request, and clients MUST be shut down when the supervisor
+is dropped. The bridged stdio transport (in-sandbox / remote servers) MUST
+apply to registry entries the same as to built-ins. Requests SHALL be
+admitted FIFO per worktree root,
+with at most four in flight and sixteen queued. A request beyond those limits
+SHALL fail with `Overloaded`.
 
 #### Scenario: First use spawns off the loop
 
@@ -81,6 +88,20 @@ same as to built-ins.
 - **WHEN** a registry entry's command is not found at spawn
 - **THEN** the failure is cached for that `(root, key)` and later requests
   fail fast to their fallbacks without a new spawn attempt
+
+#### Scenario: An idle server for another worktree is evicted
+
+- **WHEN** a server has been unused for 30 minutes, its root is not the
+  active worktree, and no request is holding it
+- **THEN** the next idle sweep shuts it down and reaps it, and a later
+  request starts it lazily again
+
+#### Scenario: Requests are admitted per worktree root
+
+- **WHEN** four requests are in flight and sixteen more are queued for one
+  root, then another request for that root arrives
+- **THEN** the admitted requests run in FIFO order and the additional request
+  fails with `Overloaded`
 
 ### Requirement: Requests are gated by negotiated server capabilities
 

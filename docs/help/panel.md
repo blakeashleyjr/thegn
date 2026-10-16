@@ -318,7 +318,8 @@ projects' problems never bleed in. `↵` opens the editor at file:line.
 tests run in a separate slot. `↵` or `r` on a running job asks you to press
 again to restart it. `s` stops only the selected job, which is labelled
 `stopped`. A job killed after `[limits] test_timeout_secs` is labelled
-`timed out after Ns`.
+`timed out after Ns`. While a job is running, its Half and Full detail shows
+a `live output` tail of up to the last eight lines, bounded to 16 KiB.
 
 {{keys:jobs}}
 
@@ -337,7 +338,8 @@ The outline targets the focused editor pane's file when it was opened from
 thegn, otherwise a changed file you pick with `f`, otherwise the file
 picker. Language server first, tree-sitter fallback. `r` opens references;
 Esc returns to the outline. With no language server, references say so;
-`h` reports when hover is off.
+`h` reports when hover is off. A language server for a worktree you are not
+in that sits unused for 30 minutes is stopped and restarts on next use.
 
 {{keys:symbols}}
 
@@ -348,8 +350,9 @@ Esc returns to the outline. With no language server, references say so;
 The inbox. In row mode, `x` marks the row read and `d` **deletes** it. **/** searches
 every unread row; a committed filter stays visible. The header counts alert,
 unread, low-priority, and shown rows. The inbox retains every unread row and
-the newest 50 read rows. At Half width the highlighted row shows its whole
-message; Full width puts it in the detail column.
+the newest 50 read rows. Read rows older than 30 days are deleted from the
+state database; unread rows are never pruned. At Half width the highlighted
+row shows its whole message; Full width puts it in the detail column.
 
 {{keys:notifications}}
 
@@ -403,6 +406,9 @@ to the new placement while running panes stay where they are. A same-placement
 bind is immediate. `t` tests provider env tokens only, `n` adds, `x` removes
 (confirmed).
 The environment currently bound to the worktree carries a visible bound marker.
+At Half and Full width, the highlighted environment's detail shows its
+placement, host, target, data, sandbox, failover, and provider token variable
+with a present or missing status. It never shows the token value.
 
 At Full width, hosts shows the host list beside the highlighted host's
 details, including its SSH/reach target.
