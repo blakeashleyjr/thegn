@@ -57,7 +57,7 @@ use thegn_core::store::{
 #[path = "run_palette_db.rs"]
 mod run_palette_db;
 #[path = "run_pending_db.rs"]
-mod run_pending_db;
+pub(crate) mod run_pending_db;
 #[path = "run_test_cache.rs"]
 mod run_test_cache;
 

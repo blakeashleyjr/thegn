@@ -77,7 +77,7 @@ pub(crate) fn apply(
     session: &mut Session,
     region_last_w: &mut Option<String>,
     done: RenameDone,
-    tx: &tokio_mpsc::UnboundedSender<crate::run_pending_db::PendingDbResult>,
+    tx: &tokio_mpsc::UnboundedSender<crate::run::run_pending_db::PendingDbResult>,
     waker: &TerminalWaker,
 ) -> String {
     apply_with(session, region_last_w, done, |request| {
@@ -87,14 +87,14 @@ pub(crate) fn apply(
         let new_path = request.new_path;
         let tab = request.tab;
         use thegn_core::store::WorkspaceStore;
-        crate::run_pending_db::queue_reported_write(
+        crate::run::run_pending_db::queue_reported_write(
             tx,
             waker,
             move |db| {
                 db.rename_worktree(&old_path, &new_path, &tab, &want)
                     .map_err(|error| error.to_string())
             },
-            move |error| registry_failure_status(&status_want, &error),
+            move |error: String| registry_failure_status(&status_want, &error),
         );
     })
 }
