@@ -330,69 +330,65 @@ impl DiskAggregate {
             self.previous = None;
             None
         };
-        if slow {
-            if Self::read_file(&mut self.mountinfo, &mut self.mount_buf) {
-                let text = String::from_utf8_lossy(&self.mount_buf);
-                let groups =
-                    probe_mount_groups(group_mounts(parse_mountinfo(&text)), &mut self.probe);
-                let mut disks = Vec::with_capacity(groups.len());
-                let mut seen_volume_keys = std::collections::BTreeSet::new();
-                let mut seen_device_names = std::collections::BTreeSet::new();
-                for (row, extra_mounts, total, avail) in groups {
-                    let cache_key = (row.major_minor.clone(), row.source.clone());
-                    seen_volume_keys.insert(cache_key.clone());
-                    let (block, kind) = if let Some(cached) = self.volume_devices.get(&cache_key) {
-                        cached.clone()
-                    } else {
-                        let block = self.probe.block_name(&row.source);
-                        let kind = match block.as_deref().and_then(|b| self.probe.rotational(b)) {
-                            Some(true) => DiskKind::Hdd,
-                            Some(false) => DiskKind::Ssd,
-                            None => DiskKind::Unknown,
-                        };
-                        self.volume_devices.insert(cache_key, (block.clone(), kind));
-                        (block, kind)
+        if slow && Self::read_file(&mut self.mountinfo, &mut self.mount_buf) {
+            let text = String::from_utf8_lossy(&self.mount_buf);
+            let groups = probe_mount_groups(group_mounts(parse_mountinfo(&text)), &mut self.probe);
+            let mut disks = Vec::with_capacity(groups.len());
+            let mut seen_volume_keys = std::collections::BTreeSet::new();
+            let mut seen_device_names = std::collections::BTreeSet::new();
+            for (row, extra_mounts, total, avail) in groups {
+                let cache_key = (row.major_minor.clone(), row.source.clone());
+                seen_volume_keys.insert(cache_key.clone());
+                let (block, kind) = if let Some(cached) = self.volume_devices.get(&cache_key) {
+                    cached.clone()
+                } else {
+                    let block = self.probe.block_name(&row.source);
+                    let kind = match block.as_deref().and_then(|b| self.probe.rotational(b)) {
+                        Some(true) => DiskKind::Hdd,
+                        Some(false) => DiskKind::Ssd,
+                        None => DiskKind::Unknown,
                     };
-                    let block_io = block.as_ref().and_then(|name| {
-                        self.disk_buf.split(|b| *b == b'\n').find_map(|line| {
-                            parse_diskstats_line(line)
-                                .filter(|(disk, _, _)| *disk == name.as_bytes())
-                                .map(|(_, r, w)| (r.saturating_mul(512), w.saturating_mul(512)))
+                    self.volume_devices.insert(cache_key, (block.clone(), kind));
+                    (block, kind)
+                };
+                let block_io = block.as_ref().and_then(|name| {
+                    self.disk_buf.split(|b| *b == b'\n').find_map(|line| {
+                        parse_diskstats_line(line)
+                            .filter(|(disk, _, _)| *disk == name.as_bytes())
+                            .map(|(_, r, w)| (r.saturating_mul(512), w.saturating_mul(512)))
+                    })
+                });
+                let io_rate = block
+                    .as_ref()
+                    .and_then(|name| {
+                        seen_device_names.insert(name.clone());
+                        let current = block_io?;
+                        let previous = self.device_previous.insert(name.clone(), (current, now));
+                        previous.and_then(|(old, at)| {
+                            rate(old, current, now.duration_since(at).as_secs_f64())
                         })
-                    });
-                    let io_rate = block
-                        .as_ref()
-                        .and_then(|name| {
-                            seen_device_names.insert(name.clone());
-                            let current = block_io?;
-                            let previous =
-                                self.device_previous.insert(name.clone(), (current, now));
-                            previous.and_then(|(old, at)| {
-                                rate(old, current, now.duration_since(at).as_secs_f64())
-                            })
-                        })
-                        .unwrap_or((0, 0));
-                    disks.push(DiskInfo {
-                        name: row.source,
-                        mount: row.mount,
-                        free_pct: if total > 0 {
-                            ((avail as f64 / total as f64) * 100.0).round() as u8
-                        } else {
-                            0
-                        }
-                        .min(100),
-                        read_bps: io_rate.0,
-                        write_bps: io_rate.1,
-                        kind,
-                        extra_mounts,
-                    });
-                }
-                self.volume_devices
-                    .retain(|key, _| seen_volume_keys.contains(key));
-                self.device_previous
-                    .retain(|name, _| seen_device_names.contains(name));
-                self.disks = disks.into();
+                    })
+                    .unwrap_or((0, 0));
+                disks.push(DiskInfo {
+                    name: row.source,
+                    mount: row.mount,
+                    free_pct: if total > 0 {
+                        ((avail as f64 / total as f64) * 100.0).round() as u8
+                    } else {
+                        0
+                    }
+                    .min(100),
+                    read_bps: io_rate.0,
+                    write_bps: io_rate.1,
+                    kind,
+                    extra_mounts,
+                });
             }
+            self.volume_devices
+                .retain(|key, _| seen_volume_keys.contains(key));
+            self.device_previous
+                .retain(|name, _| seen_device_names.contains(name));
+            self.disks = disks.into();
         }
         (io, std::sync::Arc::clone(&self.disks))
     }
