@@ -120,6 +120,8 @@ tg-kit = { path = "../tg-kit", features = ["host-presets"] }
 # same `tg_kit::ratatui` Buffer as any other AppTile.
 gtui-embed = { path = "../gtui-embed" }
 tokei.workspace = true
+# Dedicated named rayon pool for background LOC scans.
+rayon.workspace = true
 # Symbol-declaration regex (search_everywhere symbol sweep) — extracts the
 # identifier from a definition line returned by fff grep.
 regex.workspace = true

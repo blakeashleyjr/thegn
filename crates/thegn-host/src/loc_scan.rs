@@ -5,8 +5,39 @@
 //! must never be called on the loop or on the interactive hydration lane.
 
 use std::path::Path;
+use std::sync::LazyLock;
 
+use rayon::ThreadPool;
 use thegn_core::loc::{LocLang, LocReport};
+
+static LOC_POOL: LazyLock<Option<ThreadPool>> = LazyLock::new(|| {
+    let cpus = std::thread::available_parallelism().map_or(1, usize::from);
+    match rayon::ThreadPoolBuilder::new()
+        .num_threads(loc_pool_threads(cpus))
+        .thread_name(|index| format!("thegn-loc-{index}"))
+        .start_handler(|_| {
+            crate::platform::qos::set_self(crate::platform::qos::Qos::Background);
+        })
+        .build()
+    {
+        Ok(pool) => Some(pool),
+        Err(error) => {
+            tracing::debug!(target: "thegn::measure", %error, "could not build LOC rayon pool; using caller thread");
+            None
+        }
+    }
+});
+
+pub(crate) fn loc_pool_threads(cpus: usize) -> usize {
+    (cpus / 4).clamp(1, 4)
+}
+
+fn run_in_loc_pool<R: Send>(f: impl FnOnce() -> R + Send) -> R {
+    match LOC_POOL.as_ref() {
+        Some(pool) => pool.install(f),
+        None => f(),
+    }
+}
 
 /// Result of one filesystem count. A partial report is useful for diagnostics,
 /// but must never be published as a fresh complete cache row.
@@ -64,7 +95,7 @@ pub(crate) fn scan_excluding(path: &Path, submodule_paths: &[String]) -> ScanOut
         treat_doc_strings_as_comments: Some(true),
         ..Default::default()
     };
-    languages.get_statistics(&[path.to_path_buf()], &exclude_refs, &config);
+    run_in_loc_pool(|| languages.get_statistics(&[path.to_path_buf()], &exclude_refs, &config));
     outcome_from_languages(&languages)
 }
 
@@ -97,6 +128,30 @@ fn outcome_from_languages(languages: &tokei::Languages) -> ScanOutcome {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rayon::prelude::*;
+
+    #[test]
+    fn loc_pool_is_small_and_never_zero() {
+        for (cpus, want) in [(1, 1), (4, 1), (8, 2), (16, 4), (24, 4), (128, 4)] {
+            assert_eq!(loc_pool_threads(cpus), want, "cpus={cpus}");
+        }
+    }
+
+    #[test]
+    fn loc_pool_work_runs_on_named_pool_threads() {
+        let names = run_in_loc_pool(|| {
+            (0..64)
+                .into_par_iter()
+                .map(|_| std::thread::current().name().map(str::to_owned))
+                .collect::<Vec<_>>()
+        });
+        assert!(
+            names.iter().all(|name| name
+                .as_deref()
+                .is_some_and(|name| name.starts_with("thegn-loc-"))),
+            "unexpected worker names: {names:?}"
+        );
+    }
 
     #[test]
     fn scans_this_crate_and_detects_rust() {
