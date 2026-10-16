@@ -1866,32 +1866,25 @@ fn oci_stats(backend: Backend) -> std::collections::HashMap<String, ContainerSta
     map
 }
 
+fn first_str<'a>(value: &'a serde_json::Value, keys: &[&str]) -> Option<&'a str> {
+    keys.iter()
+        .find_map(|key| value.get(*key).and_then(serde_json::Value::as_str))
+}
+
 pub fn parse_stats_rows(output: &str) -> Vec<(String, ContainerStat)> {
     let parse_one = |v: serde_json::Value| -> Option<(String, ContainerStat)> {
-        let name = v
-            .get("Name")
-            .or_else(|| v.get("Names"))?
-            .as_str()?
-            .to_string();
-        let cpu = v
-            .get("CPUPerc")
-            .or_else(|| v.get("CPU"))
-            .and_then(|v| v.as_str())
+        let name = first_str(&v, &["Name", "Names", "name"])?.to_string();
+        let cpu = first_str(&v, &["CPUPerc", "CPU", "cpu_percent"])
             .unwrap_or("")
             .to_string();
-        let mem = v
-            .get("MemUsage")
-            .or_else(|| v.get("Mem"))
-            .and_then(|v| v.as_str())
+        let mem = first_str(&v, &["MemUsage", "Mem", "mem_usage"])
             .unwrap_or("")
             .split('/')
             .next()
             .unwrap_or("")
             .trim()
             .to_string();
-        let net = v
-            .get("NetIO")
-            .and_then(|v| v.as_str())
+        let net = first_str(&v, &["NetIO", "net_io"])
             .unwrap_or("")
             .to_string();
         Some((name, ContainerStat { cpu, mem, net }))
