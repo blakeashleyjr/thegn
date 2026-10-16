@@ -173,7 +173,7 @@ fn fast_forward_local(
     let result = (|| {
         run_w_network(loc, &[], &["fetch", remote, &fetch_spec])?;
         let lock =
-            super::require_mutation_lock_within(Path::new(&loc.path()), &lock_args, lock_wait)?;
+            super::require_mutation_lock_within(std::path::Path::new(&loc.path()), &lock_args, lock_wait)?;
         run_w_locked(loc, &[], &lock_args, &lock)?;
         Ok(())
     })();
