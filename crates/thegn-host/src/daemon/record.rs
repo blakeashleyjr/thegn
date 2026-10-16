@@ -1291,7 +1291,7 @@ mod tests {
             finished
                 .truncated
                 .as_deref()
-                .is_some_and(|reason| reason.contains("timed out")),
+                .is_some_and(|reason| reason.contains("deadline elapsed")),
             "a stalled worker must report the finish timeout"
         );
         release_tx.send(()).unwrap();
@@ -1324,7 +1324,9 @@ mod tests {
         recorder.feed(b"block on final flush");
         let generation = recorder.generation();
         let (completed_tx, mut completed_rx) = tokio::sync::mpsc::unbounded_channel();
-        recorder.finish_background_with_timeout(completed_tx, Duration::from_millis(20));
+        // The session actor keeps its own sender for its lifetime; the late slot
+        // holds only a weak one, so the test must model that owner too.
+        recorder.finish_background_with_timeout(completed_tx.clone(), Duration::from_millis(20));
 
         let timed_out = tokio::time::timeout(Duration::from_secs(2), completed_rx.recv())
             .await
