@@ -56,10 +56,6 @@ impl VmstatReader {
         if self.file.is_none() {
             self.file = Some(File::open(&self.path).ok()?);
         }
-        if self.path.metadata().is_err() {
-            self.file = None;
-            return None;
-        }
         let file = self.file.as_ref()?;
         let mut filled = 0;
         let mut failed = false;
@@ -129,8 +125,13 @@ mod tests {
 
         let dir = tempfile::tempdir().expect("private fixture directory");
         let path = dir.path().join("vmstat");
-        fs::write(&path, b"pgsteal_direct_dma 7\npgsteal_direct 42\n").unwrap();
+        fs::create_dir(&path).unwrap();
         let mut reader = VmstatReader::at(path.clone());
+        assert_eq!(reader.pgsteal_direct(), None);
+        assert!(reader.file.is_none(), "read errors drop the held fd");
+
+        fs::remove_dir(&path).unwrap();
+        fs::write(&path, b"pgsteal_direct_dma 7\npgsteal_direct 42\n").unwrap();
         assert_eq!(reader.pgsteal_direct(), Some(42));
         let ptr = reader.buf.as_ptr();
         let capacity = reader.buf.capacity();
@@ -161,10 +162,5 @@ mod tests {
         assert_eq!(reader.pgsteal_direct(), Some(11));
         assert_eq!(reader.buf.as_ptr(), grown_ptr);
         assert_eq!(reader.buf.capacity(), grown_capacity);
-
-        fs::remove_file(&path).unwrap();
-        assert_eq!(reader.pgsteal_direct(), None);
-        fs::write(&path, b"pgsteal_direct 12\n").unwrap();
-        assert_eq!(reader.pgsteal_direct(), Some(12));
     }
 }
