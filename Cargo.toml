@@ -5,6 +5,7 @@ members = [
   "crates/thegn-svc",
   "crates/thegn-metrics",
   "crates/thegn-media",
+  "crates/thegn-proc",
   "crates/thegn-host",
   "crates/thegn-proxy",
   "crates/tg-kit",
@@ -234,6 +235,7 @@ thegn-core = { path = "crates/thegn-core" }
 thegn-svc = { path = "crates/thegn-svc" }
 thegn-metrics = { path = "crates/thegn-metrics" }
 thegn-media = { path = "crates/thegn-media" }
+thegn-proc = { path = "crates/thegn-proc" }
 # --- dev/bench tooling ---
 criterion = { version = "0.5", features = ["html_reports"] }
 tempfile = "3"

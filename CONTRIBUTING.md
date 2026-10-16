@@ -111,7 +111,7 @@ Roadmap and specs: `tasks.md` is the roadmap index; behavior specs live in
   panes just run directly on the host.
 - **Cross-checks are partial — mind the gap.** `just check-cross` type-checks
   every crate that builds without a darwin cross C toolchain
-  (`thegn-metrics`, `thegn-media`, `tg-kit`, `gtui-core`, `gtui-render`,
+  (`thegn-metrics`, `thegn-media`, `thegn-proc`, `tg-kit`, `gtui-core`, `gtui-render`,
   `gtui-app`) against `aarch64-apple-darwin`. It stops at `thegn-core`,
   `thegn-svc`, `thegn-host` and `gtui-query`, whose build scripts (`ring`,
   bundled sqlite, libgit2) compile C for the target — those **cannot** be
