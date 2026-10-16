@@ -351,16 +351,36 @@ fn plan_descend_capped(
     true
 }
 
+const TOOL_STATE_DIRS: &[&str] = &[".thegn"];
+
+/// True when the first path component below the canonical worktree root is a
+/// thegn-owned state directory.
+pub(crate) fn is_tool_state_path(p: &std::path::Path, root: &std::path::Path) -> bool {
+    p.strip_prefix(root)
+        .ok()
+        .and_then(|relative| relative.components().next())
+        .is_some_and(|component| {
+            matches!(
+                component,
+                std::path::Component::Normal(name)
+                    if TOOL_STATE_DIRS.contains(&name.to_str().unwrap_or(""))
+            )
+        })
+}
+
 /// Whether a single diff-watcher event path should drive a model re-hydration.
-/// Three cases, in precedence order:
+/// Four cases, in precedence order:
 /// 1. `.git`-internal paths (inside a `.git` component, or under the resolved
 ///    gitdir/common-dir `roots`) refresh ONLY for real git-state changes —
 ///    commits, checkouts, branch/tag moves, in-progress merge/rebase — gated by
 ///    [`is_git_state_path`] so index/object-store churn can't drive a loop.
-/// 2. Otherwise, gitignored worktree paths (build artifacts like `target/`)
+/// 2. Out-of-root paths still refresh, avoiding a panic in the ignore matcher.
+/// 3. Tool-state paths under `.thegn/` never trigger an immediate refresh; they
+///    still bump the change generation, so the next tick re-reads.
+/// 4. Otherwise, gitignored worktree paths (build artifacts like `target/`)
 ///    never refresh: they can't appear in `git diff HEAD`, so a rebuild would be
 ///    pure waste — and a cargo/agent running in the tree churns them constantly.
-/// 3. Everything else (real edits to tracked/untracked source files) refreshes.
+///    Everything else (real edits to tracked/untracked source files) refreshes.
 ///
 /// Pure (given a prebuilt matcher), so the precedence is unit-tested.
 pub(crate) fn watcher_path_triggers_refresh(
@@ -369,22 +389,24 @@ pub(crate) fn watcher_path_triggers_refresh(
     ignore: &crate::diff_watch::IgnoreRules,
 ) -> bool {
     if in_dot_git(p) || roots.iter().any(|r| p.starts_with(r)) {
-        is_git_state_path(p)
-    } else {
-        // `matched_path_or_any_parents` PANICS on a path outside its root (a
-        // documented precondition, asserted unless the matcher is empty) — and
-        // this runs on the notify callback thread, where a panic takes the
-        // watcher down and the panel silently stops updating. Callers give us a
-        // canonicalized root (see `watch_canonical`) so the precondition holds,
-        // but a filter is the wrong place to bet a thread on that: check it, and
-        // treat an out-of-root path as a plain edit — the pre-filter behavior.
-        if !p.starts_with(&ignore.root) {
-            return true;
-        }
-        // Case 2 vs 3: gitignored build churn is dropped; everything else (real
-        // source edits) refreshes.
-        !ignore.is_ignored(p)
+        return is_git_state_path(p);
     }
+    // `matched_path_or_any_parents` PANICS on a path outside its root (a
+    // documented precondition, asserted unless the matcher is empty) — and
+    // this runs on the notify callback thread, where a panic takes the
+    // watcher down and the panel silently stops updating. Callers give us a
+    // canonicalized root (see `watch_canonical`) so the precondition holds,
+    // but a filter is the wrong place to bet a thread on that: check it, and
+    // treat an out-of-root path as a plain edit — the pre-filter behavior.
+    if !p.starts_with(&ignore.root) {
+        return true;
+    }
+    if is_tool_state_path(p, &ignore.root) {
+        return false;
+    }
+    // Gitignored build churn is dropped; everything else (real source edits)
+    // refreshes.
+    !ignore.is_ignored(p)
 }
 
 /// Off-loop, guarded fast-forward of the canonical main checkout after its branch
@@ -792,5 +814,43 @@ mod tests {
             &roots,
             &ig
         ));
+    }
+
+    #[test]
+    fn tool_state_paths_never_trigger_an_immediate_refresh() {
+        use std::path::{Path, PathBuf};
+        let mut b = ignore::gitignore::GitignoreBuilder::new("/repo");
+        b.add_line(None, "/target").unwrap();
+        let ig = crate::diff_watch::IgnoreRules::new(Path::new("/repo"), b.build().unwrap());
+        let roots = vec![PathBuf::from("/repo/.git")];
+        let fires = |p: &str| watcher_path_triggers_refresh(Path::new(p), &roots, &ig);
+
+        assert!(!fires("/repo/.thegn/pipeline/THE-1/code/1.md"));
+        assert!(!fires("/repo/.thegn/maintenance/THE-2/plan.md"));
+        assert!(!fires("/repo/.thegn"));
+        assert!(fires("/repo/.thegn.toml"));
+        assert!(fires("/repo/src/.thegn/x.rs"));
+        assert!(fires("/repo/docs/thegn/x.md"));
+        assert!(fires("/elsewhere/.thegn/x"));
+    }
+
+    #[test]
+    fn is_tool_state_path_matches_only_the_root_component() {
+        use std::path::Path;
+        let tmp = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(tmp.path()).unwrap();
+        let cases = [
+            (root.join(".thegn/pipeline/x.md"), true),
+            (root.join(".thegn/maintenance/x.md"), true),
+            (root.join(".thegn"), true),
+            (root.join(".thegn.toml"), false),
+            (root.join("src/.thegn/x.rs"), false),
+            (root.join("docs/thegn/x.md"), false),
+            (root.join("../elsewhere/.thegn/x"), false),
+        ];
+        for (path, expected) in cases {
+            assert_eq!(is_tool_state_path(&path, &root), expected, "{path:?}");
+        }
+        assert!(!is_tool_state_path(Path::new("/repo/.thegn/x"), &root));
     }
 }
