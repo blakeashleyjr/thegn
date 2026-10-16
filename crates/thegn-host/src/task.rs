@@ -2634,7 +2634,8 @@ mod tests {
     fn head_and_end_omits_overlap_without_losing_the_end() {
         let head = b"head".to_vec();
         let tail = vec![b'x'; 100];
-        let output = String::from_utf8_lossy(&head_and_end(head.clone(), &tail, head.len() + 10));
+        let bytes = head_and_end(head.clone(), &tail, head.len() + 10);
+        let output = String::from_utf8_lossy(&bytes);
         assert_eq!(
             output,
             "head\n[output truncated: 0 bytes not shown; the end follows]\nxxxxxxxxxx"
