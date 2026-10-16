@@ -1513,6 +1513,44 @@ pub(crate) fn verify_v82_schema(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
+/// v83: persist merge queue ownership and fencing state.
+pub(crate) fn migrate_v83(conn: &Connection) -> Result<()> {
+    for (column, declaration) in [
+        ("claim_owner", "TEXT"),
+        ("claim_generation", "INTEGER NOT NULL DEFAULT 0"),
+        ("claim_phase", "TEXT NOT NULL DEFAULT 'unclaimed'"),
+        ("claim_lease_until_ms", "INTEGER"),
+        ("claim_owner_hint", "TEXT"),
+        ("claim_launch_nonce", "TEXT"),
+        ("claim_diagnostic", "TEXT"),
+    ] {
+        if !has_column(conn, "merge_queue", column) {
+            conn.execute(
+                &format!("ALTER TABLE merge_queue ADD COLUMN {column} {declaration}"),
+                [],
+            )?;
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn verify_v83_schema(conn: &Connection) -> Result<()> {
+    for column in [
+        "claim_owner",
+        "claim_generation",
+        "claim_phase",
+        "claim_lease_until_ms",
+        "claim_owner_hint",
+        "claim_launch_nonce",
+        "claim_diagnostic",
+    ] {
+        if !has_column(conn, "merge_queue", column) {
+            bail!("schema v83 migration did not add merge_queue.{column}");
+        }
+    }
+    Ok(())
+}
+
 /// Verify the v69 identity ledger before the schema version is stamped. A
 /// missing column/table must never look like a completed migration.
 pub(crate) fn verify_v69_schema(conn: &Connection) -> Result<()> {
@@ -3915,5 +3953,22 @@ mod tests {
             .unwrap();
         assert_eq!(mismatch.0, "needs_human");
         assert!(mismatch.1.contains("thegn pr queue rebind --pr 11"));
+    }
+
+    #[test]
+    fn v83_adds_claim_columns_once_and_keeps_rows_unclaimed() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch("CREATE TABLE merge_queue(worktree TEXT PRIMARY KEY,branch TEXT NOT NULL,target_branch TEXT NOT NULL,status TEXT NOT NULL,queued_at INTEGER NOT NULL,updated_at INTEGER NOT NULL,result_oid TEXT,conflict_paths TEXT,error_detail TEXT,location TEXT,agent_attempts INTEGER NOT NULL DEFAULT 0);
+            INSERT INTO merge_queue(worktree,branch,target_branch,status,queued_at,updated_at) VALUES('/wt','feature','main','queued',1,1);").unwrap();
+        assert!(super::verify_v83_schema(&conn).is_err());
+        super::migrate_v83(&conn).unwrap();
+        super::migrate_v83(&conn).unwrap();
+        super::verify_v83_schema(&conn).unwrap();
+        let claim: (Option<String>, i64, String) = conn.query_row(
+            "SELECT claim_owner,claim_generation,claim_phase FROM merge_queue WHERE worktree='/wt'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        ).unwrap();
+        assert_eq!(claim, (None, 0, "unclaimed".into()));
     }
 }
