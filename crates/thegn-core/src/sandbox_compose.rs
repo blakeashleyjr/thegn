@@ -239,10 +239,10 @@ fn protected_binds_with_classes(
                 {
                     refs.push((service.clone(), format!("@volume:{name}")));
                 }
-            } else if let Some(short) = volume.as_str() {
-                if let Some(source) = short_mount_source(short) {
-                    service_refs.push((service.clone(), source));
-                }
+            } else if let Some(short) = volume.as_str()
+                && let Some(source) = short_mount_source(short)
+            {
+                service_refs.push((service.clone(), source));
             }
         }
     }
