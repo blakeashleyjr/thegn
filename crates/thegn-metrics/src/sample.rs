@@ -9,8 +9,8 @@ use std::time::Instant;
 #[cfg(not(target_os = "linux"))]
 use sysinfo::Disks;
 use sysinfo::{
-    Components, CpuRefreshKind, MemoryRefreshKind, Networks, Pid, ProcessRefreshKind,
-    ProcessesToUpdate, RefreshKind, System,
+    Components, MemoryRefreshKind, Networks, Pid, ProcessRefreshKind, ProcessesToUpdate,
+    RefreshKind, System,
 };
 
 #[cfg(not(target_os = "linux"))]
@@ -65,6 +65,8 @@ pub struct StatsSampler {
     tick: u64,
     /// CPU usage needs a delta; the first sample only primes it.
     cpu_primed: bool,
+    cpu_freq: crate::cpu_freq::CpuFreqProbe,
+    last_cpu_freq: Option<u64>,
     /// This process's PID — always watched for the daemon/status modal.
     self_pid: Pid,
     /// The pane-daemon's PID once the host resolves it (`None` = unknown).
@@ -198,7 +200,7 @@ impl StatsSampler {
         // Only the subsystems we read; processes are deliberately excluded.
         let sys = System::new_with_specifics(
             RefreshKind::nothing()
-                .with_cpu(CpuRefreshKind::nothing().with_cpu_usage().with_frequency())
+                .with_cpu(crate::cpu_freq::cpu_refresh_kind())
                 .with_memory(MemoryRefreshKind::everything()),
         );
         let now = Instant::now();
@@ -215,6 +217,10 @@ impl StatsSampler {
             disk_path,
             tick: 0,
             cpu_primed: false,
+            cpu_freq: crate::cpu_freq::CpuFreqProbe::discover(std::path::Path::new(
+                "/sys/devices/system/cpu",
+            )),
+            last_cpu_freq: None,
             self_pid: Pid::from_u32(std::process::id()),
             daemon_pid: None,
             proc_primed: false,
@@ -268,6 +274,9 @@ impl StatsSampler {
         let slow = self.tick.is_multiple_of(SLOW_EVERY);
 
         // --- CPU (every tick; needs a delta, so the first sample primes it) ---
+        if slow {
+            self.last_cpu_freq = self.cpu_freq.read_mhz(&mut self.sys);
+        }
         self.sys.refresh_cpu_usage();
         if self.cpu_primed {
             snap.cpu_pct = Some(pct_u8(self.sys.global_cpu_usage()));
@@ -277,19 +286,10 @@ impl StatsSampler {
                 .iter()
                 .map(|c| pct_u8(c.cpu_usage()))
                 .collect();
-            let freqs: Vec<u64> = self
-                .sys
-                .cpus()
-                .iter()
-                .map(|c| c.frequency())
-                .filter(|f| *f > 0)
-                .collect();
-            if !freqs.is_empty() {
-                snap.cpu_freq_mhz = Some(freqs.iter().sum::<u64>() / freqs.len() as u64);
-            }
         } else {
             self.cpu_primed = true;
         }
+        snap.cpu_freq_mhz = self.last_cpu_freq;
 
         // --- Memory + swap (every tick) ---
         self.sys.refresh_memory();
