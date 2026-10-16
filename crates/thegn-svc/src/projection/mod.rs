@@ -749,7 +749,9 @@ mod tests {
         let link = mounts.path().join("legacy-name");
         std::fs::create_dir(&target).unwrap();
         if let Err(error) = thegn_core::fsperm::create_symlink(&target, &link, true) {
-            assert!(!cfg!(unix), "symlink fixture: {error}");
+            if cfg!(unix) {
+                panic!("symlink fixture: {error}");
+            }
             return;
         }
         let mut calls = Vec::new();
@@ -839,7 +841,9 @@ mod tests {
         let linked_mounts = temp.path().join("linked-mounts");
         std::fs::create_dir(&real_mounts).unwrap();
         if let Err(error) = thegn_core::fsperm::create_symlink(&real_mounts, &linked_mounts, true) {
-            assert!(!cfg!(unix), "symlink fixture: {error}");
+            if cfg!(unix) {
+                panic!("symlink fixture: {error}");
+            }
             return;
         }
         let legacy = real_mounts.join("dev-box-srv-work");
