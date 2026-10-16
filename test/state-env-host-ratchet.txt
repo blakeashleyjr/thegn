@@ -13,6 +13,7 @@ cmd/repos.rs
 daemon/agent_open.rs
 daemon/fork.rs
 daemon/mod.rs
+daemon/pty_diagnostics.rs
 daemon/service.rs
 diff_watch.rs
 handlers/merge_queue.rs
@@ -20,6 +21,7 @@ handlers/pr_queue.rs
 handlers/sidebar_mouse.rs
 handlers/sidebar_persist.rs
 handlers/sidebar_reorder.rs
+handlers/terminal.rs
 handlers/usage_alert.rs
 handlers/worktree_attach.rs
 handlers/worktree_launch.rs
