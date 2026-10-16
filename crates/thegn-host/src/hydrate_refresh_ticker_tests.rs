@@ -9,6 +9,7 @@ const LIMIT: Duration = Duration::from_secs(5);
 #[derive(Default)]
 struct Observations {
     priming: Vec<&'static str>,
+    qos_thread: Option<String>,
     daemon: Vec<u64>,
     containers: Vec<u64>,
     container_wakes: Vec<bool>,
@@ -31,7 +32,9 @@ impl Drop for FixtureIo {
 }
 impl TickerIo for FixtureIo {
     fn background_qos(&mut self) {
-        self.observed.lock().unwrap().priming.push("qos");
+        let mut observed = self.observed.lock().unwrap();
+        observed.priming.push("qos");
+        observed.qos_thread = std::thread::current().name().map(str::to_owned);
     }
     fn model_refresh_interval(&self) -> Duration {
         Duration::from_secs(1)
@@ -727,4 +730,15 @@ fn live_owner_reloads_every_ticker_class_through_the_event_envelope() {
     drop(permits);
     owner.shutdown();
     completion.recv_timeout(LIMIT).unwrap();
+}
+
+#[test]
+fn refresh_ticker_runs_on_its_named_thread() {
+    let mut fixture = Fixture::start(&configured());
+    fixture.advance_to(1);
+    assert_eq!(
+        fixture.observed.lock().unwrap().qos_thread.as_deref(),
+        Some(TICKER_THREAD_NAME)
+    );
+    fixture.finish();
 }
