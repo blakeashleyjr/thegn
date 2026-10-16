@@ -63,6 +63,8 @@ mod linux {
         counters: Counters,
         #[cfg(test)]
         fail_next_read: bool,
+        #[cfg(test)]
+        fail_next_power_read: bool,
     }
 
     impl BatteryReader {
@@ -74,6 +76,8 @@ mod linux {
                 counters: Counters::default(),
                 #[cfg(test)]
                 fail_next_read: false,
+                #[cfg(test)]
+                fail_next_power_read: false,
             }
         }
 
@@ -84,7 +88,7 @@ mod linux {
             if rediscovered {
                 self.discover(now);
             }
-            match self.read_sample() {
+            match self.read_sample(true) {
                 Ok(reading) => reading,
                 Err(()) => {
                     // A removed/replaced sysfs node invalidates all held fds.
@@ -92,7 +96,7 @@ mod linux {
                     if !rediscovered {
                         self.discover(now);
                     }
-                    match self.read_sample() {
+                    match self.read_sample(false) {
                         Ok(reading) => reading,
                         Err(()) => BatteryReading::default(),
                     }
@@ -108,6 +112,11 @@ mod linux {
         #[cfg(test)]
         pub(super) fn fail_next_read_for_test(&mut self) {
             self.fail_next_read = true;
+        }
+
+        #[cfg(test)]
+        pub(super) fn fail_next_power_read_for_test(&mut self) {
+            self.fail_next_power_read = true;
         }
 
         fn discover(&mut self, now: Instant) {
@@ -160,7 +169,7 @@ mod linux {
             parse_u64(&bytes)
         }
 
-        fn read_sample(&mut self) -> Result<BatteryReading, ()> {
+        fn read_sample(&mut self, signal_critical_errors: bool) -> Result<BatteryReading, ()> {
             #[cfg(test)]
             if self.fail_next_read {
                 self.fail_next_read = false;
@@ -169,17 +178,53 @@ mod linux {
             let mut buffer = [0_u8; 128];
             let mut rows = Vec::with_capacity(self.supplies.batteries.len());
             for battery in &self.supplies.batteries {
-                let status_bytes = read_attr(&battery.status, &mut buffer, &mut self.counters)?;
-                let status = trim_ascii(status_bytes);
+                let status_bytes = match read_file(&battery.status, &mut buffer, &mut self.counters)
+                {
+                    Ok(bytes) => bytes,
+                    Err(()) if signal_critical_errors => return Err(()),
+                    Err(()) => None,
+                };
+                let status = trim_ascii(status_bytes.unwrap_or(&[]));
                 let status_ac = matches!(status, b"Charging" | b"Full" | b"Not charging");
                 let charging = status == b"Charging";
-                let capacity = read_capacity(&battery.capacity, &mut buffer, &mut self.counters)?;
-                let energy_now = read_num(&battery.energy_now, &mut buffer, &mut self.counters)?;
-                let charge_now = read_num(&battery.charge_now, &mut buffer, &mut self.counters)?;
-                let power_now = read_num(&battery.power_now, &mut buffer, &mut self.counters)?;
-                let current_now =
-                    read_signed(&battery.current_now, &mut buffer, &mut self.counters)?;
-                let voltage_now = read_num(&battery.voltage_now, &mut buffer, &mut self.counters)?;
+                let capacity =
+                    match read_capacity(&battery.capacity, &mut buffer, &mut self.counters) {
+                        Ok(capacity) => capacity,
+                        Err(()) if signal_critical_errors => return Err(()),
+                        Err(()) => None,
+                    };
+                let energy_now =
+                    read_num_optional(&battery.energy_now, &mut buffer, &mut self.counters);
+                let charge_now = if energy_now.is_none() {
+                    read_num_optional(&battery.charge_now, &mut buffer, &mut self.counters)
+                } else {
+                    None
+                };
+                #[cfg(test)]
+                let power_result = if self.fail_next_power_read {
+                    self.fail_next_power_read = false;
+                    Err(())
+                } else {
+                    read_num(&battery.power_now, &mut buffer, &mut self.counters)
+                };
+                #[cfg(not(test))]
+                let power_result = read_num(&battery.power_now, &mut buffer, &mut self.counters);
+                let power_now = match power_result {
+                    Ok(value) => value,
+                    Err(()) => None,
+                };
+                let need_current_voltage =
+                    power_now.is_none() || (energy_now.is_none() && charge_now.is_some());
+                let current_now = if need_current_voltage {
+                    read_signed_optional(&battery.current_now, &mut buffer, &mut self.counters)
+                } else {
+                    None
+                };
+                let voltage_now = if need_current_voltage {
+                    read_num_optional(&battery.voltage_now, &mut buffer, &mut self.counters)
+                } else {
+                    None
+                };
                 rows.push(Row {
                     capacity,
                     status_ac,
@@ -198,21 +243,26 @@ mod linux {
             let status_ac = rows.iter().any(|row| row.status_ac);
             let on_ac = if status_ac {
                 true
-            } else {
+            } else if !rows.is_empty() {
                 let mut online = false;
                 for adapter in &self.supplies.adapters {
                     #[cfg(test)]
                     {
                         self.counters.adapter_reads += 1;
                     }
-                    if parse_u64(read_open(&adapter.online, &mut buffer, &mut self.counters)?)
-                        == Some(1)
-                    {
+                    let adapter_online =
+                        match read_open(&adapter.online, &mut buffer, &mut self.counters) {
+                            Ok(bytes) => parse_u64(bytes) == Some(1),
+                            Err(()) => false,
+                        };
+                    if adapter_online {
                         online = true;
                         break;
                     }
                 }
                 online
+            } else {
+                false
             };
 
             let battery = combine_percent(&rows).map(|pct| (pct, on_ac));
@@ -245,32 +295,31 @@ mod linux {
                         rate += power;
                         has_eta = true;
                     }
-                } else if let Some(charge) = row.charge_now {
-                    if let (Some(voltage), Some(current)) = (row.voltage_now, row.current_now) {
-                        let target = if row.charging {
-                            row.charge_full
-                                .map(|full| full.saturating_sub(charge) as f64)
-                        } else {
-                            Some(charge as f64)
-                        };
-                        if let (Some(target), Some(power)) =
-                            (target, battery_power.filter(|p| *p > 0.0))
-                        {
-                            let scale = voltage as f64 / 1_000_000.0;
-                            remaining += target * scale;
-                            rate += current.unsigned_abs() as f64 * scale;
-                            has_eta = true;
-                        }
+                } else if let Some(charge) = row.charge_now
+                    && let Some(current) = row.current_now
+                {
+                    let target = if row.charging {
+                        row.charge_full
+                            .map(|full| full.saturating_sub(charge) as f64)
+                    } else {
+                        Some(charge as f64)
+                    };
+                    let scale = if rows.len() > 1 {
+                        row.voltage_now.map(|voltage| voltage as f64 / 1_000_000.0)
+                    } else {
+                        Some(1.0)
+                    };
+                    if let Some(target) = target
+                        && let Some(scale) = scale
+                    {
+                        remaining += target * scale;
+                        rate += current.unsigned_abs() as f64 * scale;
+                        has_eta = true;
                     }
                 }
             }
             let power_w = has_power.then_some((watts / 1_000_000.0) as f32);
             let eta_secs = (has_eta && rate > 0.0).then_some((remaining / rate * 3600.0) as u64);
-            let (power_w, eta_secs) = if power_w == Some(0.0) || !has_power {
-                (None, None)
-            } else {
-                (power_w, eta_secs)
-            };
             Ok(BatteryReading {
                 battery,
                 power_w,
@@ -332,14 +381,6 @@ mod linux {
         })
     }
 
-    fn read_attr<'a>(
-        file: &Option<File>,
-        buffer: &'a mut [u8],
-        counters: &mut Counters,
-    ) -> Result<&'a [u8], ()> {
-        Ok(read_file(file, buffer, counters)?.unwrap_or(&[]))
-    }
-
     fn read_file<'a>(
         file: &Option<File>,
         buffer: &'a mut [u8],
@@ -371,6 +412,17 @@ mod linux {
         read_file(file, buffer, counters).map(|bytes| bytes.and_then(parse_u64))
     }
 
+    fn read_num_optional(
+        file: &Option<File>,
+        buffer: &mut [u8],
+        counters: &mut Counters,
+    ) -> Option<u64> {
+        match read_num(file, buffer, counters) {
+            Ok(value) => value,
+            Err(()) => None,
+        }
+    }
+
     fn read_capacity(
         file: &Option<File>,
         buffer: &mut [u8],
@@ -385,6 +437,17 @@ mod linux {
         counters: &mut Counters,
     ) -> Result<Option<i64>, ()> {
         read_file(file, buffer, counters).map(|bytes| bytes.and_then(parse_i64))
+    }
+
+    fn read_signed_optional(
+        file: &Option<File>,
+        buffer: &mut [u8],
+        counters: &mut Counters,
+    ) -> Option<i64> {
+        match read_signed(file, buffer, counters) {
+            Ok(value) => value,
+            Err(()) => None,
+        }
     }
 
     fn trim_ascii(mut bytes: &[u8]) -> &[u8] {
@@ -666,6 +729,8 @@ mod tests {
                 ("energy_now", "20000000\n"),
                 ("energy_full", "50000000\n"),
                 ("power_now", "10000000\n"),
+                ("current_now", "1000000\n"),
+                ("voltage_now", "12000000\n"),
             ],
         );
         supply(dir.path(), "AC", &[("type", "Mains"), ("online", "0\n")]);
@@ -793,6 +858,62 @@ mod tests {
             Some((81, false))
         );
         assert_eq!(reader.counters().scans, 2);
+    }
+
+    #[test]
+    fn optional_power_read_error_keeps_battery_percent() {
+        let dir = fixture("power-read-error");
+        supply(
+            dir.path(),
+            "BAT0",
+            &[
+                ("type", "Battery"),
+                ("status", "Discharging\n"),
+                ("capacity", "73\n"),
+                ("energy_now", "20000000\n"),
+                ("energy_full", "50000000\n"),
+                ("power_now", "10000000\n"),
+            ],
+        );
+        let mut reader = BatteryReader::new(dir.path().to_path_buf());
+        assert_eq!(reader.sample(Instant::now()).battery, Some((73, false)));
+        let scans = reader.counters().scans;
+        reader.fail_next_power_read_for_test();
+
+        assert_eq!(reader.sample(Instant::now()).battery, Some((73, false)));
+        assert_eq!(reader.counters().scans, scans);
+    }
+
+    #[test]
+    fn adapters_are_not_read_when_there_are_no_batteries() {
+        let dir = fixture("adapter-only");
+        supply(dir.path(), "AC", &[("type", "Mains"), ("online", "1\n")]);
+        let mut reader = BatteryReader::new(dir.path().to_path_buf());
+
+        assert_eq!(reader.sample(Instant::now()).battery, None);
+        assert_eq!(reader.counters().adapter_reads, 0);
+    }
+
+    #[test]
+    fn charge_eta_does_not_require_voltage_or_power() {
+        let dir = fixture("charge-eta-no-voltage");
+        supply(
+            dir.path(),
+            "BAT0",
+            &[
+                ("type", "Battery"),
+                ("status", "Discharging\n"),
+                ("capacity", "50\n"),
+                ("charge_now", "3000000\n"),
+                ("current_now", "1500000\n"),
+            ],
+        );
+        let mut reader = BatteryReader::new(dir.path().to_path_buf());
+
+        let reading = reader.sample(Instant::now());
+
+        assert_eq!(reading.power_w, None);
+        assert_eq!(reading.eta_secs, Some(7200));
     }
 
     #[test]
