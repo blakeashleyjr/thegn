@@ -685,6 +685,10 @@ pub async fn main(
         &cfg.theme.preset,
     );
     crate::forge_handle::install(&cfg);
+    thegn_core::profile::install_credential_shares(thegn_core::profile::profile_shares(
+        &cfg,
+        &thegn_core::profile::name(),
+    ));
     // Same install as `main.rs`'s subcommand path — the interactive launch does
     // not go through `run_subcommand`, and the tracker panel (`hydrate_tracker`)
     // is exactly where a `keyring:` issue token has to resolve (THE-72).

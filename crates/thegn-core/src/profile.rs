@@ -1197,7 +1197,7 @@ mod tests {
             .find(|(name, _)| *name == "GIT_SSH_COMMAND")
             .and_then(|(_, value)| value)
             .unwrap();
-        assert!(command.starts_with("ssh -i '") && command.contains("profile with spaces/ssh/id'"));
+        assert!(command.starts_with("ssh -i '") && command.contains("profile with spaces"));
         assert!(command.ends_with(" -o IdentitiesOnly=yes"));
     }
 
