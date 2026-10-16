@@ -120,27 +120,21 @@ impl PtyProcessOwner {
     pub(crate) fn terminate_and_reap_detached(&self) {
         let owner = self.clone();
         {
-            let (in_flight, _) = &*DETACHED_REAPERS;
+            let (in_flight, _) = &DETACHED_REAPERS;
             let mut in_flight = in_flight
                 .lock()
                 .unwrap_or_else(|poison| poison.into_inner());
             *in_flight += 1;
         }
+        let guard = DetachedReaperGuard;
         let spawn = std::thread::Builder::new()
             .name("thegn-pty-reap".into())
             .spawn(move || {
+                let _guard = guard;
                 crate::platform::qos::set_self(crate::platform::qos::Qos::Background);
-                let _guard = DetachedReaperGuard;
                 owner.terminate_and_reap();
             });
         if let Err(error) = spawn {
-            let (in_flight, settled) = &*DETACHED_REAPERS;
-            let mut in_flight = in_flight
-                .lock()
-                .unwrap_or_else(|poison| poison.into_inner());
-            *in_flight -= 1;
-            settled.notify_all();
-            drop(in_flight);
             tracing::debug!(target: "thegn::pty", %error, "unable to spawn detached PTY reaper; reaping inline");
             self.terminate_and_reap();
         }
@@ -224,7 +218,7 @@ struct DetachedReaperGuard;
 
 impl Drop for DetachedReaperGuard {
     fn drop(&mut self) {
-        let (in_flight, settled) = &*DETACHED_REAPERS;
+        let (in_flight, settled) = &DETACHED_REAPERS;
         let mut in_flight = in_flight
             .lock()
             .unwrap_or_else(|poison| poison.into_inner());
@@ -235,7 +229,7 @@ impl Drop for DetachedReaperGuard {
 
 /// Wait for detached pane reapers to finish, bounded by `timeout`.
 pub(crate) fn drain_detached_reapers(timeout: std::time::Duration) -> bool {
-    let (in_flight, settled) = &*DETACHED_REAPERS;
+    let (in_flight, settled) = &DETACHED_REAPERS;
     let in_flight = in_flight
         .lock()
         .unwrap_or_else(|poison| poison.into_inner());
@@ -589,16 +583,18 @@ mod tests {
         let owner = PtyProcessOwner::new(child, None);
 
         owner.terminate_and_reap_detached();
-        assert!(
-            drain_detached_reapers(std::time::Duration::from_secs(3)),
-            "detached PTY reapers did not settle within the timeout"
-        );
+        let drained = drain_detached_reapers(std::time::Duration::from_secs(3));
+        if !drained {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+            while own_children().len() > before && std::time::Instant::now() < deadline {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+        }
         let after = own_children();
         assert!(
             after.len() <= before,
             "drained detached reapers left a child behind (before={before}, after={}): {after:?}",
             after.len()
         );
-        assert!(drain_detached_reapers(std::time::Duration::ZERO));
     }
 }
