@@ -1177,6 +1177,8 @@ pub async fn main(
     )
     .await;
     clipboard.shutdown();
+    let quit_deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    crate::quit_cancel::signal_all();
     // Outside the UI loop, including every early/error return. All sessions
     // close together under one application deadline; reloads share this owner.
     let cleanup_deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(3);
@@ -1203,6 +1205,10 @@ pub async fn main(
             "process sampler cleanup did not settle successfully"
         )))
     };
+    let settlement = crate::quit_cancel::wait_or_detach(quit_deadline);
+    if !settlement.settled_custom || !settlement.settled_ci {
+        tracing::warn!(target: "thegn::shutdown", ?settlement, "detached custom git or CI work after the shutdown deadline");
+    }
     // Renderers run in their own process group, so nothing would signal them
     // when we exit: kill and reap the preview tree before the process goes.
     crate::preview_jobs::shutdown_global(std::time::Duration::from_millis(200));
