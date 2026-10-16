@@ -218,6 +218,8 @@ fn spawn_worker_with_commands(
     spawn_worker_inner(cadences, 1, Some(commands), Some(stop), tx, io, notify)
 }
 
+pub(super) const TICKER_THREAD_NAME: &str = "thegn-ticker";
+
 fn spawn_worker_inner(
     cadences: Cadences,
     generation: u64,
@@ -227,7 +229,9 @@ fn spawn_worker_inner(
     mut io: impl TickerIo,
     notify: impl Fn() + Send + 'static,
 ) -> std::thread::JoinHandle<()> {
-    std::thread::spawn(move || {
+    std::thread::Builder::new()
+        .name(TICKER_THREAD_NAME.into())
+        .spawn(move || {
         let _failure = crate::worker_failure::PanicNotify::new(|| {
             tracing::error!(target: "thegn::hydrate", "shared refresh ticker terminated by panic; periodic refresh is unavailable");
             notify();
@@ -619,7 +623,8 @@ fn spawn_worker_inner(
             }
             io.tick_complete(ticks);
         }
-    })
+        })
+        .expect("spawn the refresh ticker")
 }
 
 /// The live adapter owns exactly the sampler/channels formerly local to the

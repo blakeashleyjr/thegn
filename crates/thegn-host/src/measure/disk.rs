@@ -142,7 +142,7 @@ pub(crate) fn spawn_scan(
     active: Option<std::path::PathBuf>,
     waker: Option<TerminalWaker>,
 ) {
-    crate::sched::spawn_bg_replaceable(move || {
+    crate::sched::report_replaceable(super::DISK_LANE.submit(Box::new(move || {
         let Some(_round) = super::begin(&INFLIGHT, "disk") else {
             return;
         };
@@ -307,7 +307,7 @@ pub(crate) fn spawn_scan(
         {
             let _ = w.wake(); // best-effort: waker pulse: an input nudge must never fail the calling path
         }
-    });
+    })));
 }
 
 /// Every cached total, as owned paths for [`thegn_core::disk::net_root_bytes`].

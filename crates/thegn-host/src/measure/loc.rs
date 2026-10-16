@@ -43,7 +43,7 @@ pub(crate) fn spawn_scan_with_generation(
     waker: Option<TerminalWaker>,
     generation: Option<(std::sync::Arc<std::sync::atomic::AtomicU64>, u64)>,
 ) {
-    crate::sched::spawn_bg_replaceable(move || {
+    crate::sched::report_replaceable(super::LOC_LANE.submit(Box::new(move || {
         let Some(_round) = super::begin(&INFLIGHT, "loc") else {
             return;
         };
@@ -109,7 +109,7 @@ pub(crate) fn spawn_scan_with_generation(
         {
             let _ = w.wake(); // best-effort: waker pulse: an input nudge must never fail the calling path
         }
-    });
+    })));
 }
 
 /// Apply one scan without allowing an incomplete report to advance the cache's
