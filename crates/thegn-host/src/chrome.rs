@@ -2440,7 +2440,7 @@ pub fn panel_drill_drag_hit(
                 crate::panel::PanelHit::GitDrill(index) => Some(index),
                 _ => None,
             });
-        return index.map(|index| (index, overflow));
+        index.map(|index| (index, overflow))
     } else {
         let row = y
             .saturating_sub(rect.y)
