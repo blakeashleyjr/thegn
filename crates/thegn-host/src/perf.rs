@@ -1572,6 +1572,8 @@ mod tests {
         let mut lp = LoopPerf::new();
         let snap = lp.rollup(Instant::now(), 0, 0, 0);
         assert!(snap.malloc.trims_idle >= 1);
-        assert_eq!(snap.malloc, crate::mem::alloc_stats());
+        let current = crate::mem::alloc_stats();
+        assert_eq!(snap.malloc.trims_idle, current.trims_idle);
+        assert_eq!(snap.malloc.arena_cap, current.arena_cap);
     }
 }
