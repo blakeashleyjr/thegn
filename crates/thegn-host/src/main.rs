@@ -1314,6 +1314,11 @@ fn run_subcommand(cli: &Cli, command: Command) -> anyhow::Result<()> {
     }
     crate::forge_handle::install(&cfg);
     crate::provider_factory::install_managed_key_scope(cfg.credentials.ssh.managed_key_scope);
+    let profile_name = thegn_core::profile::name();
+    thegn_core::profile::install_credential_shares(thegn_core::profile::profile_shares(
+        &cfg,
+        &profile_name,
+    ));
     // Service-layer issue, CI, VPN, and snapshot consumers resolve typed refs
     // through the same host broker as provider tokens. Svc cannot link the OS
     // keyring itself, so install the process's single value-fetch chokepoint.
