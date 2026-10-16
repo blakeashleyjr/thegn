@@ -7,7 +7,10 @@
 use super::GitBackend;
 use std::io::Read;
 use std::process::{Child, Command, ExitStatus, Stdio};
-use std::sync::mpsc;
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    mpsc,
+};
 use std::time::{Duration, Instant};
 use thegn_core::remote::GitLoc;
 
@@ -23,6 +26,7 @@ pub const CUSTOM_OUTCOME_SPAWN: &str = "spawn";
 pub const CUSTOM_OUTCOME_WAIT: &str = "wait";
 pub const CUSTOM_OUTCOME_READ: &str = "read";
 pub const CUSTOM_OUTCOME_CLEANUP: &str = "cleanup";
+pub const CUSTOM_OUTCOME_CANCELLED: &str = "cancelled";
 
 /// Bounded result from a custom command. Stderr is retained only so the
 /// non-template command path can preserve its historical failure summary.
@@ -39,6 +43,7 @@ enum CustomOutcome {
     Wait,
     Read,
     IncompleteCleanup,
+    Cancelled,
 }
 
 impl CustomOutcome {
@@ -91,6 +96,13 @@ impl CustomOutcome {
                 false,
                 String::new(),
             ),
+            Self::Cancelled => (
+                CUSTOM_OUTCOME_CANCELLED,
+                None,
+                String::new(),
+                false,
+                String::new(),
+            ),
         }
     }
 }
@@ -102,6 +114,7 @@ pub trait CustomOps: GitBackend {
         loc: &GitLoc,
         command: &str,
         capture: bool,
+        cancel: &AtomicBool,
     ) -> (&'static str, Option<ExitStatus>, String, bool, String) {
         let mut command = loc.sh_command(command);
         command.stdin(Stdio::null()).env("GIT_TERMINAL_PROMPT", "0");
@@ -111,6 +124,7 @@ pub trait CustomOps: GitBackend {
             CUSTOM_COMMAND_TIMEOUT,
             STDOUT_LIMIT,
             STDERR_LIMIT,
+            cancel,
         )
         .into_parts()
     }
@@ -121,11 +135,20 @@ pub trait CustomOps: GitBackend {
         loc: &GitLoc,
         command: &thegn_core::custom_cmd::ExpandedCommand,
         capture: bool,
+        cancel: &AtomicBool,
     ) -> (&'static str, Option<ExitStatus>, String, bool, String) {
         let timeout = command.timeout();
         let mut command = command.command(loc);
         command.stdin(Stdio::null()).env("GIT_TERMINAL_PROMPT", "0");
-        run_bounded(command, capture, timeout, STDOUT_LIMIT, STDERR_LIMIT).into_parts()
+        run_bounded(
+            command,
+            capture,
+            timeout,
+            STDOUT_LIMIT,
+            STDERR_LIMIT,
+            cancel,
+        )
+        .into_parts()
     }
 }
 
@@ -137,7 +160,11 @@ fn run_bounded(
     timeout: Duration,
     stdout_limit: usize,
     stderr_limit: usize,
+    cancel: &AtomicBool,
 ) -> CustomOutcome {
+    if cancel.load(Ordering::Relaxed) {
+        return CustomOutcome::Cancelled;
+    }
     let mut command = command;
     if capture {
         command.stdout(Stdio::piped());
@@ -199,7 +226,13 @@ fn run_bounded(
 
     let deadline = Instant::now() + timeout;
     let mut timed_out = false;
+    let mut cancelled = false;
     let status = loop {
+        if cancel.load(Ordering::Relaxed) {
+            cancelled = true;
+            crate::plugin::proc::kill_group(pid);
+            break child.wait();
+        }
         match crate::plugin::proc::leader_exited_nowait(pid) {
             Ok(true) => {
                 // Keep the leader unreaped until its process group is gone:
@@ -265,6 +298,9 @@ fn run_bounded(
         && reader.join().is_err()
     {
         return CustomOutcome::IncompleteCleanup;
+    }
+    if cancelled {
+        return CustomOutcome::Cancelled;
     }
     if timed_out {
         return CustomOutcome::Timeout;
@@ -393,6 +429,7 @@ fn bounded_lossy_utf8(bytes: &[u8], limit: usize) -> (String, bool) {
 mod tests {
     use super::*;
     use crate::git::{CliGit, testutil::TestRepo};
+    use std::sync::Arc;
 
     fn supported() -> bool {
         crate::plugin::proc::bounded_group_termination_supported()
@@ -405,7 +442,12 @@ mod tests {
         }
         let repo = TestRepo::new("custom-descendant");
         let started = Instant::now();
-        let outcome = CliGit.run_custom(&repo.loc(), "(sleep 30; echo late) & echo done", true);
+        let outcome = CliGit.run_custom(
+            &repo.loc(),
+            "(sleep 30; echo late) & echo done",
+            true,
+            &AtomicBool::new(false),
+        );
         assert!(started.elapsed() < Duration::from_secs(5));
         let (kind, status, stdout, _, _) = outcome;
         assert_eq!(kind, CUSTOM_OUTCOME_EXITED);
@@ -425,6 +467,7 @@ mod tests {
             Duration::from_secs(5),
             1024 * 1024,
             STDERR_LIMIT,
+            &AtomicBool::new(false),
         ) {
             CustomOutcome::Exited {
                 stdout,
@@ -451,6 +494,7 @@ mod tests {
             Duration::from_secs(5),
             STDOUT_LIMIT,
             STDERR_LIMIT,
+            &AtomicBool::new(false),
         ) {
             CustomOutcome::Exited { stdout, .. } => assert!(stdout.is_empty()),
             other => panic!("expected command completion without output body, got {other:?}"),
@@ -471,15 +515,77 @@ mod tests {
             Duration::from_millis(300),
             STDOUT_LIMIT,
             STDERR_LIMIT,
+            &AtomicBool::new(false),
         ) {
             CustomOutcome::Timeout => {}
             other => panic!("expected timeout, got {other:?}"),
         }
         std::thread::sleep(Duration::from_secs(2));
         assert!(!marker.exists(), "descendant survived group termination");
-        let (kind, status, stdout, _, _) = CliGit.run_custom(&repo.loc(), "echo ok", true);
+        let (kind, status, stdout, _, _) =
+            CliGit.run_custom(&repo.loc(), "echo ok", true, &AtomicBool::new(false));
         assert_eq!(kind, CUSTOM_OUTCOME_EXITED);
         assert!(status.is_some_and(|status| status.success()));
         assert_eq!(stdout.trim(), "ok");
+    }
+
+    #[test]
+    fn cancellation_kills_descendant_and_next_command_runs() {
+        if !supported() {
+            return;
+        }
+        let repo = TestRepo::new("custom-cancel");
+        let marker = repo.dir.join("cancelled-descendant");
+        let script = format!("(sleep 1; touch '{}') & sleep 30", marker.display());
+        let command = repo.loc().sh_command(&script);
+        let cancel = Arc::new(AtomicBool::new(false));
+        let worker_cancel = Arc::clone(&cancel);
+        let worker = std::thread::spawn(move || {
+            run_bounded(
+                command,
+                true,
+                Duration::from_secs(20),
+                STDOUT_LIMIT,
+                STDERR_LIMIT,
+                &worker_cancel,
+            )
+        });
+        std::thread::sleep(Duration::from_millis(100));
+        cancel.store(true, Ordering::Relaxed);
+        assert!(matches!(
+            worker.join().expect("command worker"),
+            CustomOutcome::Cancelled
+        ));
+        std::thread::sleep(Duration::from_millis(1100));
+        assert!(
+            !marker.exists(),
+            "cancelled descendant survived group termination"
+        );
+        let (kind, status, stdout, _, _) =
+            CliGit.run_custom(&repo.loc(), "echo ok", true, &AtomicBool::new(false));
+        assert_eq!(kind, CUSTOM_OUTCOME_EXITED);
+        assert!(status.is_some_and(|status| status.success()));
+        assert_eq!(stdout.trim(), "ok");
+    }
+
+    #[test]
+    fn pre_cancelled_command_does_not_spawn() {
+        if !supported() {
+            return;
+        }
+        let repo = TestRepo::new("custom-pre-cancel");
+        let marker = repo.dir.join("must-not-exist");
+        let script = format!("touch '{}'", marker.display());
+        let cancel = AtomicBool::new(true);
+        let outcome = run_bounded(
+            repo.loc().sh_command(&script),
+            true,
+            Duration::from_secs(5),
+            STDOUT_LIMIT,
+            STDERR_LIMIT,
+            &cancel,
+        );
+        assert!(matches!(outcome, CustomOutcome::Cancelled));
+        assert!(!marker.exists());
     }
 }
