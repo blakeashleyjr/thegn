@@ -37,6 +37,7 @@ struct CapRun {
     generation: u64,
     timeout: Option<Duration>,
     live: Option<JobLiveSink>,
+    keep_end: bool,
     label: (String, String),
 }
 
@@ -91,6 +92,27 @@ impl ReaderState {
         }
         tail
     }
+}
+
+fn head_and_end(head: Vec<u8>, tail: &[u8], produced: usize) -> Vec<u8> {
+    if produced <= head.len() {
+        return head;
+    }
+
+    let missing = produced.saturating_sub(head.len());
+    let mut start = tail.len().saturating_sub(missing);
+    while start < tail.len() && tail[start] & 0xC0 == 0x80 {
+        start += 1;
+    }
+    let suffix = &tail[start..];
+    let omitted = produced
+        .saturating_sub(head.len())
+        .saturating_sub(suffix.len());
+    let marker = format!("\n[output truncated: {omitted} bytes not shown; the end follows]\n");
+    let mut text = head;
+    text.extend_from_slice(marker.as_bytes());
+    text.extend_from_slice(suffix);
+    text
 }
 
 /// How a capped child gets its CPU/mem ceiling. Resolved once from `PATH`;
@@ -353,6 +375,7 @@ fn run_capped_argv(
 ) -> CapOutput {
     // Supersede any older job in this slot.
     cancel_slot(&run.slot);
+    let keep_end = run.keep_end;
 
     let mut cmd = task_command(loc, inner, worktree, limits);
 
@@ -407,6 +430,7 @@ fn run_capped_argv(
         stdout,
         state.clone(),
         signal_tx.clone(),
+        run.live.is_some() || keep_end,
         run.live.is_some(),
         true,
         "stdout",
@@ -415,6 +439,7 @@ fn run_capped_argv(
         stderr,
         state.clone(),
         signal_tx,
+        run.live.is_some() || keep_end,
         run.live.is_some(),
         false,
         "stderr",
@@ -482,7 +507,12 @@ fn run_capped_argv(
                 &state.stderr_capture[..state.stderr_capture.len().min(remaining)],
             );
             let truncated = state.produced > capture.len();
-            (capture, truncated)
+            let text = if keep_end && truncated {
+                head_and_end(capture, &state.live_tail, state.produced)
+            } else {
+                capture
+            };
+            (text, truncated)
         }
         Err(error) => {
             tracing::debug!(target: "thegn::tasks", %error, "job output state lock poisoned");
@@ -511,6 +541,7 @@ fn spawn_output_reader(
     stream: Option<impl Read + Send + 'static>,
     state: Arc<Mutex<ReaderState>>,
     signal: std::sync::mpsc::SyncSender<()>,
+    with_tail: bool,
     live: bool,
     stdout: bool,
     label: &'static str,
@@ -523,7 +554,7 @@ fn spawn_output_reader(
                 Ok(0) => break,
                 Ok(count) => {
                     if let Ok(mut state) = state.lock() {
-                        state.push(&bytes[..count], live, stdout);
+                        state.push(&bytes[..count], with_tail, stdout);
                     }
                     if live {
                         match signal.try_send(()) {
@@ -998,6 +1029,7 @@ pub fn run_task(
             generation,
             timeout: secs_to_timeout(limits.test_timeout_secs),
             live: None,
+            keep_end: false,
             label,
         },
     );
@@ -1031,6 +1063,7 @@ pub(crate) fn run_job(
             generation,
             timeout: secs_to_timeout(limits.test_timeout_secs),
             live,
+            keep_end: true,
             label,
         },
     );
@@ -1336,6 +1369,7 @@ pub fn discover_tests(
                 generation,
                 timeout,
                 live: None,
+                keep_end: false,
                 label: (wt.clone(), task.name.clone()),
             },
         );
@@ -1387,6 +1421,7 @@ pub fn discover_tests(
             generation,
             timeout,
             live: None,
+            keep_end: false,
             label: (wt.clone(), task.name.clone()),
         },
     );
@@ -2221,6 +2256,7 @@ mod tests {
                     generation: 1,
                     timeout: None,
                     live: None,
+                    keep_end: false,
                     label: (String::new(), String::new()),
                 },
             )
@@ -2435,6 +2471,7 @@ mod tests {
                 generation: 1,
                 timeout: Some(Duration::from_millis(300)),
                 live: None,
+                keep_end: false,
                 label: (String::new(), String::new()),
             },
         );
@@ -2582,6 +2619,102 @@ mod tests {
         );
         assert!(tails.last().is_some_and(|msg| msg.tail.ends_with("END\n")));
         assert_eq!(outcome.exit_code, Some(0));
+    }
+
+    #[test]
+    fn head_and_end_returns_head_when_not_truncated() {
+        let head = b"complete output".to_vec();
+        assert_eq!(
+            head_and_end(head.clone(), b"ignored tail", head.len()),
+            head
+        );
+    }
+
+    #[test]
+    fn head_and_end_omits_overlap_without_losing_the_end() {
+        let head = b"head".to_vec();
+        let tail = vec![b'x'; 100];
+        let output = String::from_utf8_lossy(&head_and_end(head.clone(), &tail, head.len() + 10));
+        assert_eq!(
+            output,
+            "head\n[output truncated: 0 bytes not shown; the end follows]\nxxxxxxxxxx"
+        );
+    }
+
+    #[test]
+    fn head_and_end_starts_suffix_on_utf8_boundary() {
+        let head = b"h".to_vec();
+        let tail = "x€z".as_bytes();
+        let produced = head.len() + 3;
+        let output = String::from_utf8(head_and_end(head, tail, produced)).unwrap();
+        assert!(output.ends_with('z'));
+    }
+
+    #[test]
+    fn head_and_end_reports_a_large_gap() {
+        let output = String::from_utf8(head_and_end(b"head".to_vec(), b"xy", 20)).unwrap();
+        assert!(
+            output.starts_with("head\n[output truncated: 14 bytes not shown; the end follows]\n")
+        );
+        assert!(output.ends_with("xy"));
+    }
+
+    #[test]
+    fn truncated_job_record_keeps_the_true_end() {
+        let dir = private_temp_dir();
+        let wt = dir.path().to_path_buf();
+        let outcome = run_job(
+            wt.clone(),
+            &GitLoc::Local(wt),
+            96,
+            TestTask::new(
+                "tail",
+                "head -c 400000 /dev/zero | tr '\\000' x; echo TRUE_END",
+                "generic",
+            ),
+            &uncapped(),
+            None,
+        );
+
+        assert!(outcome.truncated);
+        assert!(outcome.stdout_stderr.ends_with("TRUE_END\n"));
+        assert!(outcome.stdout_stderr.contains("[output truncated:"));
+        assert!(outcome.stdout_stderr.len() <= MAX_CAPTURE_BYTES + LIVE_TAIL_BYTES + 128);
+    }
+
+    #[test]
+    fn untruncated_job_output_has_no_marker() {
+        let dir = private_temp_dir();
+        let wt = dir.path().to_path_buf();
+        let outcome = run_job(
+            wt.clone(),
+            &GitLoc::Local(wt),
+            97,
+            TestTask::new("small", "echo hi", "generic"),
+            &uncapped(),
+            None,
+        );
+        assert_eq!(outcome.stdout_stderr, "hi\n");
+    }
+
+    #[test]
+    fn truncated_test_run_text_stays_head_only() {
+        let dir = private_temp_dir();
+        let wt = dir.path().to_path_buf();
+        let outcome = run_task(
+            wt.clone(),
+            &GitLoc::Local(wt),
+            98,
+            TestTask::new(
+                "test-output",
+                "head -c 400000 /dev/zero | tr '\\000' x; echo TRUE_END",
+                "generic",
+            ),
+            &uncapped(),
+        );
+        assert!(outcome.truncated);
+        assert!(!outcome.stdout_stderr.contains("[output truncated:"));
+        assert!(!outcome.stdout_stderr.ends_with("TRUE_END\n"));
     }
 
     #[test]
