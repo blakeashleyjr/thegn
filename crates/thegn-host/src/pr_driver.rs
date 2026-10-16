@@ -2985,7 +2985,7 @@ mod tests {
                 .any(|call| call.contains("head=Some(\"abc\")"))
         );
 
-        let sentinel = _dir.path().join("agent-must-not-run-after-foreign-push");
+        let sentinel = dir.path().join("agent-must-not-run-after-foreign-push");
         let mut second_config = cfg();
         second_config.watch = vec![PrWatchKind::Ci];
         second_config.own_prs_only = false;
