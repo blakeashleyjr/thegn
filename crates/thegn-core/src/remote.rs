@@ -1249,7 +1249,9 @@ mod tests {
         if let Err(error) =
             crate::fsperm::create_symlink(std::path::Path::new("missing-target"), &link, false)
         {
-            assert!(!cfg!(unix), "symlink fixture: {error}");
+            if cfg!(unix) {
+                panic!("symlink fixture: {error}");
+            }
             return;
         }
 
