@@ -266,8 +266,8 @@ keep its quarantined lease held. The matching environment overrides are
 `THEGN_MERGE_QUEUE_GATE_TIMEOUT_SECS`.
 
 Pressing Ctrl-C or sending SIGTERM during `thegn integrate`, `thegn land`, or
-`thegn merge drain` stops and reaps the running gate process group; the fold is
-held without blaming a branch, and a drain leaves untouched rows queued.
+`thegn merge drain` cancels the fold without blaming a branch; a cancelled drain
+leaves its in-flight row queued.
 
 When a red union is being localized, `diagnosis_max_gates` (default `8`) caps
 the total gate attempts and `diagnosis_timeout_secs` (default `3600`) bounds

@@ -215,12 +215,16 @@ pub fn run(cfg: &Config, args: &IntegrateArgs) -> Result<()> {
             phase,
             class,
         } => {
-            // Not a verdict about any branch — say so, and say what to fix.
-            let line = gate_error_line(reason, *phase, *class);
-            outln!("{line}; {target} not advanced by this fold.");
-            outln!("  No branch was blamed. Check `[merge_queue] gate_command`");
-            outln!("  and `gate_setup_command` — the gate worktree is a bare");
-            outln!("  checkout with no dependencies installed.");
+            if *class == Some(integrate::GateErrorClass::Cancelled) {
+                outln!("Integration cancelled; {target} not advanced. No branch was blamed.");
+            } else {
+                // Not a verdict about any branch — say so, and say what to fix.
+                let line = gate_error_line(reason, *phase, *class);
+                outln!("{line}; {target} not advanced by this fold.");
+                outln!("  No branch was blamed. Check `[merge_queue] gate_command`");
+                outln!("  and `gate_setup_command` — the gate worktree is a bare");
+                outln!("  checkout with no dependencies installed.");
+            }
         }
         GateOutcome::Skipped => {}
     }

@@ -1715,6 +1715,35 @@ fn empty_plan(tip: &str) -> FoldPlan {
     }
 }
 
+fn cancelled_report(
+    target: &str,
+    original: &str,
+    candidates: &[Branch],
+    offenders: &[String],
+    phase: GatePhase,
+    attempts: u32,
+    diagnostics: &str,
+) -> FoldReport {
+    let mut report = build_report(
+        target,
+        original,
+        &empty_plan(original),
+        offenders,
+        GateOutcome::Errored {
+            reason: "integration cancelled".into(),
+            phase: Some(phase),
+            class: Some(GateErrorClass::Cancelled),
+        },
+        attempts,
+        diagnostics,
+    );
+    report.unprepared = candidates
+        .iter()
+        .map(|branch| branch.name.clone())
+        .collect();
+    report
+}
+
 fn history_failure_report(
     target: &str,
     original: &str,
@@ -1863,25 +1892,15 @@ fn run_fold_admitted(
 
     loop {
         if crate::fold_cancel::requested() {
-            let empty = empty_plan(&original);
-            let mut report = build_report(
+            return Ok(cancelled_report(
                 &target_branch,
                 &original,
-                &empty,
+                &candidates,
                 &gate_offenders,
-                GateOutcome::Errored {
-                    reason: "integration cancelled".into(),
-                    phase: Some(GatePhase::Preparation),
-                    class: Some(GateErrorClass::Cancelled),
-                },
+                GatePhase::Preparation,
                 cas_attempts,
                 &diagnostics,
-            );
-            report.unprepared = candidates
-                .iter()
-                .map(|branch| branch.name.clone())
-                .collect();
-            return Ok(report);
+            ));
         }
         if let Err(error) = adapter.history.revalidate() {
             return Ok(history_failure_report(
@@ -1948,16 +1967,12 @@ fn run_fold_admitted(
         };
 
         if crate::fold_cancel::requested() {
-            return Ok(build_report(
+            return Ok(cancelled_report(
                 &target_branch,
                 &original,
-                &plan,
+                &candidates,
                 &gate_offenders,
-                GateOutcome::Errored {
-                    reason: "integration cancelled".into(),
-                    phase: Some(GatePhase::Preparation),
-                    class: Some(GateErrorClass::Cancelled),
-                },
+                GatePhase::Preparation,
                 cas_attempts,
                 &diagnostics,
             ));
@@ -1996,16 +2011,12 @@ fn run_fold_admitted(
         // Test-gate the union before blessing it.
         let gate = if gate_on {
             if crate::fold_cancel::requested() {
-                return Ok(build_report(
+                return Ok(cancelled_report(
                     &target_branch,
                     &original,
-                    &plan,
+                    &candidates,
                     &gate_offenders,
-                    GateOutcome::Errored {
-                        reason: "integration cancelled".into(),
-                        phase: Some(GatePhase::Gate),
-                        class: Some(GateErrorClass::Cancelled),
-                    },
+                    GatePhase::Gate,
                     cas_attempts,
                     &diagnostics,
                 ));
@@ -2029,6 +2040,17 @@ fn run_fold_admitted(
                 ..
             } = &verdict
             {
+                if *class == GateErrorClass::Cancelled {
+                    return Ok(cancelled_report(
+                        &target_branch,
+                        &original,
+                        &candidates,
+                        &gate_offenders,
+                        *phase,
+                        cas_attempts,
+                        &diagnostics,
+                    ));
+                }
                 return Ok(build_report(
                     &target_branch,
                     &original,
@@ -2082,6 +2104,17 @@ fn run_fold_admitted(
                             }
                             None => return Err(e),
                         };
+                        if class == Some(GateErrorClass::Cancelled) {
+                            return Ok(cancelled_report(
+                                &target_branch,
+                                &original,
+                                &candidates,
+                                &gate_offenders,
+                                phase.unwrap_or(GatePhase::Gate),
+                                cas_attempts,
+                                &diagnostics,
+                            ));
+                        }
                         return Ok(build_report(
                             &target_branch,
                             &original,
@@ -2127,19 +2160,15 @@ fn run_fold_admitted(
         };
 
         if crate::fold_cancel::requested() {
-            return Ok(build_report(
+            return Ok(cancelled_report(
                 &target_branch,
                 &original,
-                &plan,
+                &candidates,
                 &gate_offenders,
-                GateOutcome::Errored {
-                    reason: "integration cancelled".into(),
-                    phase: Some(if gate_on {
-                        GatePhase::Gate
-                    } else {
-                        GatePhase::Preparation
-                    }),
-                    class: Some(GateErrorClass::Cancelled),
+                if gate_on {
+                    GatePhase::Gate
+                } else {
+                    GatePhase::Preparation
                 },
                 cas_attempts,
                 &diagnostics,
@@ -2846,6 +2875,40 @@ mod tests {
         ));
         assert_eq!(repo.out(&["rev-parse", "main"]), before);
         assert!(report.deferred.iter().all(|branch| !branch.gate_failed));
+    }
+
+    #[test]
+    fn cancellation_during_regeneration_reports_candidates_as_unprepared() {
+        if thegn_core::sandbox_backend::host_os() == thegn_core::sandbox_backend::HostOs::Windows {
+            return;
+        }
+        let repo = regen_repo("cancelled-regeneration");
+        if !repo.history_supported_or_refused() {
+            return;
+        }
+        let marker = repo.dir.join("regeneration-started");
+        let mut config = cfg("");
+        config.regenerate_command = format!(
+            "printf x >> {}; sleep 30",
+            thegn_core::util::sh_quote(&marker.to_string_lossy()),
+        );
+        let marker_path = marker.clone();
+        let _scope = crate::fold_cancel::scope(move || {
+            std::fs::metadata(&marker_path).is_ok_and(|metadata| metadata.len() > 0)
+        });
+
+        let report = run_fold(&config, &repo.dir, repo.branch_set()).unwrap();
+
+        assert_eq!(report.unprepared, ["b1"]);
+        assert!(report.prepared.is_empty());
+        assert!(report.deferred.is_empty());
+        assert!(matches!(
+            report.gate,
+            GateOutcome::Errored {
+                class: Some(GateErrorClass::Cancelled),
+                ..
+            }
+        ));
     }
 
     fn gate_that_moves_branch(repo: &Repo, branch: &str) -> String {
