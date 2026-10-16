@@ -3372,7 +3372,7 @@ fn panel_column_at_splits_the_zone() {
     use crate::layout::PanelWidth;
     use crate::panel::frame::PanelColumn;
     use crate::panel::gitui::GitView;
-    use crate::panel::{CommitRow, PanelTab, PanelUi, Section};
+    use crate::panel::{CommitRow, PanelHit, PanelTab, PanelUi, Section};
 
     let rect = Rect {
         x: 7,
