@@ -29,7 +29,14 @@ fn full_snap() -> StatsSnapshot {
         gpu_temp_c: Some(55.0),
         gpu_power_w: Some(80.0),
         net_bps: Some((5_000, 900)),
-        net_ifaces: vec![("eth0".into(), 5_000, 900)],
+        net_ifaces: vec![thegn_metrics::NetIface {
+            name: "eth0".into(),
+            rx_bps: 5_000,
+            tx_bps: 900,
+            kind: thegn_metrics::IfaceKind::Ethernet,
+            up: Some(true),
+            physical: true,
+        }],
         battery: Some((77, false)),
         battery_power_w: Some(12.5),
         battery_eta_secs: Some(7200),
@@ -1862,3 +1869,72 @@ fn process_confirmation_keeps_its_identity_while_ranks_change() {
 
 #[path = "monitor_cache_tests.rs"]
 mod invalidation_tests;
+
+#[test]
+fn network_tab_keeps_and_ghosts_idle_and_down_interfaces() {
+    let stats = StatsSnapshot {
+        net_bps: Some((250, 100)),
+        net_bps_all: Some((400, 150)),
+        net_ifaces: vec![
+            thegn_metrics::NetIface {
+                name: "enp95s0".into(),
+                rx_bps: 0,
+                tx_bps: 0,
+                kind: thegn_metrics::IfaceKind::Ethernet,
+                up: Some(false),
+                physical: true,
+            },
+            thegn_metrics::NetIface {
+                name: "wg0".into(),
+                rx_bps: 0,
+                tx_bps: 0,
+                kind: thegn_metrics::IfaceKind::Wireguard,
+                up: Some(true),
+                physical: false,
+            },
+            thegn_metrics::NetIface {
+                name: "wlan0".into(),
+                rx_bps: 250,
+                tx_bps: 100,
+                kind: thegn_metrics::IfaceKind::Wifi,
+                up: Some(true),
+                physical: true,
+            },
+        ],
+        ..Default::default()
+    };
+    let model = model_with(stats);
+    let history = TelemetryHistory::default();
+    let screen = Rect::full(100, 24);
+    let overlay = open_tab(MonitorTab::Network, &model, &history, screen);
+    let table = overlay
+        .body
+        .iter()
+        .find_map(|section| match section {
+            Section::Table(table) => Some(table),
+            _ => None,
+        })
+        .unwrap();
+    assert_eq!(
+        table.header.iter().map(String::as_str).collect::<Vec<_>>(),
+        ["iface", "kind", "state", "rx", "tx"]
+    );
+    assert_eq!(table.rows.len(), 3);
+    for row in &table.rows[..2] {
+        assert!(
+            row.iter()
+                .all(|cell| cell_tone(cell) == Tok::Slot(S::Ghost))
+        );
+    }
+    assert!(
+        table.rows[2]
+            .iter()
+            .any(|cell| cell_tone(cell) != Tok::Slot(S::Ghost))
+    );
+    assert!(overlay.body.iter().any(|section| matches!(section,
+        Section::Heading { note: Some(note), .. } if note == "3, 1 down"
+    )));
+    assert!(overlay.body.iter().any(|section| matches!(section,
+        Section::KeyVal(values) if values.iter().any(|(key, _, _)| key == "all links")
+    )));
+}
