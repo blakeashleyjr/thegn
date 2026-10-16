@@ -81,3 +81,31 @@ pub(crate) fn refuse_real_state_write(path: &std::path::Path, what: &str) {
         path.display()
     );
 }
+
+/// A private state root with the host crate's own environment guard. Keep this
+/// guard separate from core's EnvGuard to preserve the existing lock boundary.
+#[cfg(test)]
+pub(crate) struct IsolatedState {
+    _env: EnvVarGuard,
+    _temp: tempfile::TempDir,
+}
+
+#[cfg(test)]
+impl IsolatedState {
+    pub(crate) fn new() -> Self {
+        let temp = tempfile::tempdir().expect("private isolated state dir");
+        thegn_core::fsperm::restrict_dir_to_owner(temp.path())
+            .expect("restrict isolated state dir");
+        let mut vars = thegn_core::testenv::state_env_all(temp.path());
+        vars.push(("THEGN_DIR", temp.path().join(".thegn")));
+        let strings: Vec<_> = vars
+            .iter()
+            .map(|(key, value)| (*key, value.to_str().expect("state path is UTF-8")))
+            .collect();
+        let env = EnvVarGuard::set(&strings);
+        Self {
+            _env: env,
+            _temp: temp,
+        }
+    }
+}

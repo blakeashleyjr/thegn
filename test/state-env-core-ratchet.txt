@@ -1,0 +1,16 @@
+# Direct test mutations of HOME/XDG and Windows user-state env vars are pinned debt.
+# Use testenv::IsolatedState / state_env_for so overrides isolate on every OS.
+# SHRINK-ONLY: migrate tests and remove their entries. Seeded for cross-platform
+# state isolation (owner request 2026-10-16, cross-platform test layer piece 3).
+
+config_resolve.rs
+config_tests.rs
+db_tests.rs
+git_memo.rs
+log_trace.rs
+managed_ssh.rs
+migrate_brand.rs
+profile.rs
+sandbox_tests.rs
+startup.rs
+util.rs
