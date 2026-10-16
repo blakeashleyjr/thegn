@@ -1252,9 +1252,10 @@ mod tests {
             AgentDispatch::RunDegraded(Some(sandbox_spec()), "w".into()),
             &|_| Ok(Some("w2".into())),
         );
-        assert!(
-            matches!(dispatch, AgentDispatch::RunDegraded(Some(_), warning) if warning.contains("w") && warning.contains("w2"))
-        );
+        assert!(matches!(
+            dispatch,
+            AgentDispatch::RunDegraded(Some(_), warning) if warning == "w; w2"
+        ));
 
         let dispatch = provision_dispatch(AgentDispatch::Run(Some(sandbox_spec())), &|_| Ok(None));
         assert!(matches!(dispatch, AgentDispatch::Run(Some(_))));
