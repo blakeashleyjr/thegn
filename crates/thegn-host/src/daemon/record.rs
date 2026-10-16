@@ -55,7 +55,7 @@ fn next_generation() -> u64 {
     NEXT_RECORDING_GENERATION.fetch_add(1, Ordering::Relaxed)
 }
 
-type LateCompletion = Arc<Mutex<Option<tokio::sync::mpsc::WeakUnboundedSender<Finished>>>>;
+type LateCompletion = Arc<Mutex<Option<tokio::sync::mpsc::UnboundedSender<Finished>>>>;
 
 fn global_inflight() -> Arc<AtomicUsize> {
     Arc::clone(RECORDING_INFLIGHT.get_or_init(|| Arc::new(AtomicUsize::new(0))))
@@ -504,7 +504,7 @@ impl Recorder {
             Err(error) => {
                 drop(self.worker.take()); // worker keeps its file and finishes independently
                 let reason = if matches!(error, mpsc::RecvTimeoutError::Timeout) {
-                    "recording finish deadline elapsed; writer may still be flushing"
+                    LATE_TIMEOUT_REASON
                 } else {
                     "recording writer stopped without a completion result"
                 };
@@ -576,7 +576,7 @@ impl Recorder {
                         // Publish timeout first while holding the slot lock. The
                         // worker cannot select the late route until this send.
                         send_completion(&completed, self.timeout_finished());
-                        *late = Some(completed.downgrade());
+                        *late = Some(completed.clone());
                         None
                     }
                     Err(mpsc::TryRecvError::Disconnected) => {
@@ -649,16 +649,12 @@ fn dispatch_finished(
     };
     if let Some(completed) = slot.as_ref() {
         finished.late = true;
-        if let Some(completed) = completed.upgrade() {
-            if let Err(error) = completed.send(finished) {
-                tracing::debug!(target: "thegn::daemon", "recording late-completion receiver dropped: {error}");
-            }
-        } else {
+        if let Err(error) = completed.send(finished) {
             tracing::debug!(
                 target: "thegn::daemon",
-                generation = finished.generation,
-                path = %finished.path.display(),
-                truncated = ?finished.truncated,
+                generation = error.0.generation,
+                path = %error.0.path.display(),
+                truncated = ?error.0.truncated,
                 "recording actor is gone; late completion is logged only"
             );
         }
@@ -1460,16 +1456,9 @@ mod tests {
     }
 
     #[test]
-    fn late_completion_slot_does_not_keep_actor_mailbox_alive() {
+    fn late_completion_slot_keeps_the_mailbox_sender_until_dispatch() {
         let (completed_tx, mut completed_rx) = tokio::sync::mpsc::unbounded_channel();
-        let late: LateCompletion = Arc::new(Mutex::new(Some(completed_tx.downgrade())));
-        let weak = late
-            .lock()
-            .expect("late slot lock")
-            .as_ref()
-            .expect("late sender")
-            .clone();
-        drop(completed_tx);
+        let late: LateCompletion = Arc::new(Mutex::new(Some(completed_tx.clone())));
 
         let (result_tx, result_rx) = mpsc::channel();
         dispatch_finished(
@@ -1485,17 +1474,13 @@ mod tests {
             &late,
         );
 
-        assert!(
-            weak.upgrade().is_none(),
-            "the late slot must not own the actor mailbox"
-        );
-        assert!(matches!(
-            completed_rx.try_recv(),
-            Err(tokio::sync::mpsc::error::TryRecvError::Disconnected)
-        ));
+        let delivered = completed_rx.try_recv().expect("late completion delivered");
+        assert!(delivered.late);
+        assert_eq!(delivered.generation, 1);
         assert!(matches!(
             result_rx.try_recv(),
             Err(mpsc::TryRecvError::Empty)
         ));
+        drop(completed_tx);
     }
 }
