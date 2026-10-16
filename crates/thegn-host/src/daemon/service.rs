@@ -3368,13 +3368,8 @@ mod tests {
         }
     }
 
-    fn isolated_state() -> (tempfile::TempDir, crate::testenv::EnvVarGuard) {
-        let state = tempfile::tempdir().expect("private isolated state dir");
-        let env = crate::testenv::EnvVarGuard::set(&[(
-            "XDG_STATE_HOME",
-            state.path().to_str().expect("state path"),
-        )]);
-        (state, env)
+    fn isolated_state() -> crate::testenv::IsolatedState {
+        crate::testenv::IsolatedState::new()
     }
 
     fn staged_dispatch(db: &Db, stage: Option<&str>) -> i64 {
@@ -3414,7 +3409,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn terminal_pipeline_row_refuses_and_stops_a_late_open() {
-        let (_state, _env) = isolated_state();
+        let _state = isolated_state();
         let (svc, _) = service(0);
         let row = svc
             .with_db(move |db| {
@@ -3436,7 +3431,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn already_bound_pipeline_row_refuses_a_second_live_worker() {
-        let (_state, _env) = isolated_state();
+        let _state = isolated_state();
         let (svc, _) = service(0);
         let row = svc
             .with_db(|db| Ok(staged_dispatch(db, Some("code"))))
@@ -3463,7 +3458,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn terminal_tracker_row_keeps_its_best_effort_open_behavior() {
-        let (_state, _env) = isolated_state();
+        let _state = isolated_state();
         let (svc, _) = service(0);
         let row = svc
             .with_db(move |db| {

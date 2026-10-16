@@ -3,7 +3,9 @@
 //! `test/platform-cfg-svc-ratchet.txt`; `ipc.rs` (the unix-socket / named-pipe
 //! seam) is the intended home for per-OS code here.
 
-use thegn_core::test_support::ratchet::{file_ratchet, has_platform_cfg};
+use thegn_core::test_support::ratchet::{
+    file_ratchet, has_platform_cfg, sets_state_env_directly, state_env_test_body,
+};
 
 #[test]
 fn platform_cfgs_are_pinned() {
@@ -31,5 +33,17 @@ fn host_key_literals_stay_in_the_chokepoint() {
          (`thegn_core::hostkey::host_key_args`): name a connection class and let \
          it build the `-o` args. Do not write a StrictHostKeyChecking / \
          UserKnownHostsFile / HostKeyAlias literal at a call site.",
+    );
+}
+
+#[test]
+fn state_env_ratchet_tracks_direct_test_environment_writes() {
+    file_ratchet(
+        env!("CARGO_MANIFEST_DIR"),
+        "state-env-svc-ratchet.txt",
+        &["testenv.rs", "test_support/ratchet.rs"],
+        |key, body| state_env_test_body(key, body).is_some_and(sets_state_env_directly),
+        "Tests that mutate HOME/XDG or Windows user-state variables should use \
+         testenv::IsolatedState and state_env_for so isolation works on every OS.",
     );
 }

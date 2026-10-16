@@ -19,6 +19,9 @@ merge_guard.rs
 profile.rs
 ssh_creds.rs
 startup.rs
+# TEST-ONLY cfg: symlinked_tempdir uses the Unix symlink syscall; std has no
+# portable unprivileged directory-symlink API, and non-Unix tests degrade to a plain tempdir.
+testenv.rs
 util.rs
 # config_repo.rs: two symlink-only tests (#[cfg(unix)] on std::os::unix::fs::symlink); no runtime cfg.
 config_repo.rs

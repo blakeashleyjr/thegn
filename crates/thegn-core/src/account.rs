@@ -638,14 +638,11 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn a_symlinked_second_spelling_is_the_same_repo() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::testenv::symlinked_tempdir();
         let db = Db::open_memory().unwrap();
-        let real = checkout(dir.path(), "real/foo");
-        let alias = dir.path().join("alias");
-        std::fs::create_dir_all(&alias).unwrap();
-        std::os::unix::fs::symlink(&real, alias.join("foo")).unwrap();
-        db.slug_for_repo(&alias.join("foo").to_string_lossy(), "foo")
-            .unwrap();
+        let real = checkout(dir.real_path(), "foo");
+        let alias = dir.path().join("foo");
+        db.slug_for_repo(&alias.to_string_lossy(), "foo").unwrap();
         assert_eq!(db.slug_for_repo(&real, "foo").unwrap(), "foo-2");
         let cfg = foo_config();
         for slug in ["foo", "foo-2"] {

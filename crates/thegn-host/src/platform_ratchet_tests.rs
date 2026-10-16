@@ -3,7 +3,9 @@
 //! two render chokepoints. Each allowlist under `test/` is shrink-only and
 //! explains its rule in its header.
 
-use thegn_core::test_support::ratchet::{file_ratchet, has_platform_cfg};
+use thegn_core::test_support::ratchet::{
+    file_ratchet, has_platform_cfg, sets_state_env_directly, state_env_test_body,
+};
 
 const MANIFEST: &str = env!("CARGO_MANIFEST_DIR");
 
@@ -98,5 +100,17 @@ fn glyph_literals_go_through_active_glyphs() {
         "Box-drawing and block glyphs must come from `caps::active_glyphs()` so \
          the ASCII fallback (`[theme] glyphs = ascii`, non-UTF-8 locales) still \
          renders. Use the GlyphSet field instead of the literal.",
+    );
+}
+
+#[test]
+fn state_env_ratchet_tracks_direct_test_environment_writes() {
+    file_ratchet(
+        MANIFEST,
+        "state-env-host-ratchet.txt",
+        &["testenv.rs", "test_support/ratchet.rs"],
+        |key, body| state_env_test_body(key, body).is_some_and(sets_state_env_directly),
+        "Tests that mutate HOME/XDG or Windows user-state variables should use \
+         testenv::IsolatedState and state_env_for so isolation works on every OS.",
     );
 }
