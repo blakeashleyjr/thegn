@@ -3193,8 +3193,13 @@ fn write_secret_env_file_in(
         format!("{name}.env")
     };
     let body: String = secret.iter().map(|(k, v)| format!("{k}={v}\n")).collect();
-    dir.write_owner_only_atomic(&file_name, body.as_bytes())
-        .ok()
+    match dir.write_owner_only_atomic(&file_name, body.as_bytes()) {
+        Ok(path) => Some(path),
+        Err(error) => {
+            tracing::debug!(target: "thegn::sandbox", %error, file = %file_name, "secret env-file write failed");
+            None
+        }
+    }
 }
 
 /// State directories created under a user-private-group umask can be 0775.
