@@ -149,17 +149,23 @@ pub(crate) fn hidden(fstype: &str, mount: &str, source: &str) -> bool {
 
 #[cfg(any(target_os = "linux", test))]
 pub(crate) fn group_mounts(rows: Vec<MountRow>) -> Vec<(MountRow, u32)> {
-    let mut groups: std::collections::BTreeMap<String, Vec<MountRow>> =
-        std::collections::BTreeMap::new();
+    let mut groups: Vec<(String, Vec<MountRow>)> = Vec::new();
     for row in rows
         .into_iter()
         .filter(|r| !hidden(&r.fstype, &r.mount, &r.source))
     {
-        groups.entry(row.major_minor.clone()).or_default().push(row);
+        if let Some((_, rows)) = groups
+            .iter_mut()
+            .find(|(major_minor, _)| *major_minor == row.major_minor)
+        {
+            rows.push(row);
+        } else {
+            groups.push((row.major_minor.clone(), vec![row]));
+        }
     }
     groups
-        .into_values()
-        .filter_map(|mut rows| {
+        .into_iter()
+        .filter_map(|(_, mut rows)| {
             rows.sort_by_key(|r| r.mount.len());
             let primary = rows.first()?.clone();
             Some((primary, rows.len().saturating_sub(1) as u32))
@@ -256,7 +262,7 @@ pub(crate) struct DiskAggregate {
     physical: Vec<String>,
     previous: Option<((u64, u64), Instant)>,
     device_previous: std::collections::BTreeMap<String, ((u64, u64), Instant)>,
-    volume_devices: std::collections::BTreeMap<String, (Option<String>, DiskKind)>,
+    volume_devices: std::collections::BTreeMap<(String, String), (Option<String>, DiskKind)>,
     last_classify: Instant,
     probe: LinuxVolumeProbe,
     disks: std::sync::Arc<[DiskInfo]>,
@@ -330,10 +336,12 @@ impl DiskAggregate {
                 let groups =
                     probe_mount_groups(group_mounts(parse_mountinfo(&text)), &mut self.probe);
                 let mut disks = Vec::with_capacity(groups.len());
+                let mut seen_volume_keys = std::collections::BTreeSet::new();
+                let mut seen_device_names = std::collections::BTreeSet::new();
                 for (row, extra_mounts, total, avail) in groups {
-                    let (block, kind) = if let Some(cached) =
-                        self.volume_devices.get(&row.major_minor)
-                    {
+                    let cache_key = (row.major_minor.clone(), row.source.clone());
+                    seen_volume_keys.insert(cache_key.clone());
+                    let (block, kind) = if let Some(cached) = self.volume_devices.get(&cache_key) {
                         cached.clone()
                     } else {
                         let block = self.probe.block_name(&row.source);
@@ -342,8 +350,7 @@ impl DiskAggregate {
                             Some(false) => DiskKind::Ssd,
                             None => DiskKind::Unknown,
                         };
-                        self.volume_devices
-                            .insert(row.major_minor.clone(), (block.clone(), kind));
+                        self.volume_devices.insert(cache_key, (block.clone(), kind));
                         (block, kind)
                     };
                     let block_io = block.as_ref().and_then(|name| {
@@ -356,6 +363,7 @@ impl DiskAggregate {
                     let io_rate = block
                         .as_ref()
                         .and_then(|name| {
+                            seen_device_names.insert(name.clone());
                             let current = block_io?;
                             let previous =
                                 self.device_previous.insert(name.clone(), (current, now));
@@ -379,6 +387,10 @@ impl DiskAggregate {
                         extra_mounts,
                     });
                 }
+                self.volume_devices
+                    .retain(|key, _| seen_volume_keys.contains(key));
+                self.device_previous
+                    .retain(|name, _| seen_device_names.contains(name));
                 self.disks = disks.into();
             }
         }
@@ -411,18 +423,11 @@ mod tests {
     #[test]
     fn aggregate_counts_only_top_level_physical_disks() {
         let root = tempfile::tempdir().unwrap();
-        for name in [
-            "nvme0n1",
-            "nvme0n1p5",
-            "dm-0",
-            "zram0",
-            "loop0",
-            "md0",
-            "sda",
-            "sda1",
-        ] {
+        for name in ["nvme0n1", "dm-0", "zram0", "loop0", "md0", "sda", "sdb"] {
             std::fs::create_dir_all(root.path().join(name)).unwrap();
         }
+        std::fs::create_dir_all(root.path().join("nvme0n1/nvme0n1p5")).unwrap();
+        std::fs::create_dir_all(root.path().join("sda/sda1")).unwrap();
         for name in ["nvme0n1", "md0", "sda"] {
             std::fs::create_dir_all(root.path().join(name).join("device")).unwrap();
         }
@@ -449,6 +454,13 @@ mod tests {
         assert_eq!(groups[0].1, 1);
         let escaped = parse_mountinfo(r"3 0 8:1 / /a\040b\011c\012d\134e rw - ext4 /dev/sda1 rw");
         assert_eq!(escaped[0].mount, "/a b\tc\nd\\e");
+        let optional = parse_mountinfo(
+            "5 0 8:1 / /x rw shared:1 master:2 propagate_from:3 - ext4 /dev/sda1 rw",
+        );
+        assert_eq!(optional[0].major_minor, "8:1");
+        assert_eq!(optional[0].mount, "/x");
+        assert_eq!(optional[0].fstype, "ext4");
+        assert_eq!(optional[0].source, "/dev/sda1");
     }
 
     #[test]
@@ -477,9 +489,13 @@ mod tests {
                 "{i} 0 0:35 / {mount} rw - btrfs /dev/mapper/crypted rw\n"
             ));
         }
-        text.push_str("44 0 259:1 / /boot rw - vfat /dev/nvme0n1p1 rw\n45 0 8:1 / /mnt/data rw - ext4 /dev/sda1 rw\n46 0 0:99 / /proc rw - proc proc rw\n47 0 0:100 / /sys rw - sysfs sysfs rw\n48 0 0:101 / /run/user rw - tmpfs tmpfs rw\n49 0 0:102 / /sys/fs/cgroup rw - cgroup2 cgroup rw\n");
+        text.push_str("50 0 259:2 / / rw - ext4 /dev/nvme0n1p2 rw\n44 0 259:1 / /boot rw - vfat /dev/nvme0n1p1 rw\n45 0 8:1 / /mnt/data rw - ext4 /dev/sda1 rw\n46 0 0:99 / /proc rw - proc proc rw\n47 0 0:100 / /sys rw - sysfs sysfs rw\n48 0 0:101 / /run/user rw - tmpfs tmpfs rw\n49 0 0:102 / /sys/fs/cgroup rw - cgroup2 cgroup rw\n");
         let groups = group_mounts(parse_mountinfo(&text));
-        assert_eq!(groups.len(), 3);
+        assert_eq!(groups.len(), 4);
+        assert_eq!(groups[0].0.major_minor, "0:35");
+        assert_eq!(groups[1].0.major_minor, "259:2");
+        assert_eq!(groups[2].0.major_minor, "259:1");
+        assert_eq!(groups[3].0.major_minor, "8:1");
         let btrfs = groups
             .iter()
             .find(|(row, _)| row.major_minor == "0:35")
@@ -488,8 +504,8 @@ mod tests {
         assert_eq!(btrfs.1, 42);
         let mut probe = CountingProbe(0);
         let measured = probe_mount_groups(groups, &mut probe);
-        assert_eq!(measured.len(), 3);
-        assert_eq!(probe.0, 3);
+        assert_eq!(measured.len(), 4);
+        assert_eq!(probe.0, 4);
     }
 
     #[test]
