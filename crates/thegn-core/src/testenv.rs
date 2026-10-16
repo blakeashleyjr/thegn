@@ -168,11 +168,12 @@ pub fn symlinked_tempdir() -> SymlinkedTempDir {
     let link = if cfg!(unix) {
         let link = temp.path().join("link");
         symlink_directory(&real, &link).expect("create symlink fixture");
-        link
+        Some(link)
     } else {
-        real.clone()
+        None
     };
     let real = std::fs::canonicalize(real).expect("canonicalize fixture directory");
+    let link = link.unwrap_or_else(|| real.clone());
     SymlinkedTempDir {
         _temp: temp,
         link,
