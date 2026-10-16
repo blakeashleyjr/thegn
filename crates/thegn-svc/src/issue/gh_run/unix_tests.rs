@@ -2,6 +2,34 @@
 
 use super::*;
 use std::io::BufRead;
+use std::os::unix::process::ExitStatusExt;
+
+fn proc_run(
+    end: thegn_proc::End,
+    leader: thegn_proc::Leader,
+    stdout: thegn_proc::Capture,
+    stderr: thegn_proc::Capture,
+    group: thegn_proc::GroupState,
+) -> thegn_proc::Run {
+    thegn_proc::Run {
+        end,
+        group,
+        leader,
+        leader_exited_first: true,
+        stdout,
+        stderr,
+        containment: thegn_proc::Containment::ProcessGroup,
+    }
+}
+
+fn capture(bytes: &[u8], eof: bool, truncated: bool) -> thegn_proc::Capture {
+    thegn_proc::Capture {
+        bytes: bytes.to_vec(),
+        eof,
+        truncated,
+        ..Default::default()
+    }
+}
 
 fn sh(script: &str) -> Command {
     let mut c = Command::new("sh");
@@ -17,7 +45,181 @@ fn lim(ms: u64) -> Limits {
     }
 }
 
+#[test]
+fn map_run_covers_terminal_outcomes_and_precedence() {
+    use thegn_proc::{End, GroupState, Leader, Which};
+
+    assert!(matches!(
+        map_run(proc_run(
+            End::Spawn(std::io::Error::new(std::io::ErrorKind::NotFound, "missing")),
+            Leader::NotSpawned,
+            capture(b"", false, false),
+            capture(b"", false, false),
+            GroupState::Unknown,
+        )),
+        Err(RunError::NotInstalled)
+    ));
+    assert!(matches!(
+        map_run(proc_run(
+            End::Spawn(std::io::Error::other("spawn")),
+            Leader::NotSpawned,
+            capture(b"", false, false),
+            capture(b"", false, false),
+            GroupState::Unknown,
+        )),
+        Err(RunError::Io(message)) if message == "spawn"
+    ));
+    assert!(matches!(
+        map_run(proc_run(
+            End::Supervise(std::io::Error::other("supervise")),
+            Leader::NotSpawned,
+            capture(b"", false, false),
+            capture(b"", false, false),
+            GroupState::Unknown,
+        )),
+        Err(RunError::Io(message)) if message == "supervise"
+    ));
+    assert!(matches!(
+        map_run(proc_run(
+            End::Cancelled,
+            Leader::NotSpawned,
+            capture(b"", false, false),
+            capture(b"", false, false),
+            GroupState::Unknown,
+        )),
+        Err(RunError::Cancelled)
+    ));
+    assert!(matches!(
+        map_run(proc_run(
+            End::OutputLimit(Which::Stdout),
+            Leader::NotSpawned,
+            capture(b"", false, false),
+            capture(b"", false, false),
+            GroupState::Unknown,
+        )),
+        Err(RunError::Truncated)
+    ));
+    assert!(matches!(
+        map_run(proc_run(
+            End::TimedOut,
+            Leader::NotSpawned,
+            capture(b"", false, false),
+            capture(b"", false, false),
+            GroupState::Unknown,
+        )),
+        Err(RunError::Timeout)
+    ));
+    assert!(matches!(
+        map_run(proc_run(
+            End::LeaderExited,
+            Leader::ReapFailed(std::io::Error::other("reap")),
+            capture(b"", false, false),
+            capture(b"", false, false),
+            GroupState::Unknown,
+        )),
+        Err(RunError::Io(message)) if message == "reap"
+    ));
+    for leader in [Leader::Detached, Leader::NotSpawned] {
+        assert!(matches!(
+            map_run(proc_run(
+                End::LeaderExited,
+                leader,
+                capture(b"", true, false),
+                capture(b"", true, false),
+                GroupState::Unknown,
+            )),
+            Err(RunError::Io(message)) if message == "could not reap child"
+        ));
+    }
+    assert!(matches!(
+        map_run(proc_run(
+            End::LeaderExited,
+            Leader::Reaped(std::process::ExitStatus::from_raw(0)),
+            capture(b"ok", false, false),
+            capture(b"", true, false),
+            GroupState::Drained,
+        )),
+        Err(RunError::Timeout)
+    ));
+    assert!(matches!(
+        map_run(proc_run(
+            End::LeaderExited,
+            Leader::Reaped(std::process::ExitStatus::from_raw(0)),
+            capture(b"ok", true, false),
+            capture(b"", false, false),
+            GroupState::Drained,
+        )),
+        Err(RunError::Timeout)
+    ));
+    assert!(matches!(
+        map_run(proc_run(
+            End::LeaderExited,
+            Leader::Reaped(std::process::ExitStatus::from_raw(0)),
+            capture(b"over", true, true),
+            capture(b"", true, false),
+            GroupState::Drained,
+        )),
+        Err(RunError::Truncated)
+    ));
+    assert!(matches!(
+        map_run(proc_run(
+            End::LeaderExited,
+            Leader::Reaped(std::process::ExitStatus::from_raw(0)),
+            capture(b"ok", true, false),
+            capture(b"", true, false),
+            GroupState::Drained,
+        )),
+        Ok(output) if output == "ok"
+    ));
+    assert!(matches!(
+        map_run(proc_run(
+            End::LeaderExited,
+            Leader::Reaped(std::process::ExitStatus::from_raw(3 << 8)),
+            capture(b"", true, false),
+            capture(b"failure", true, false),
+            GroupState::Drained,
+        )),
+        Err(RunError::Exit { code: Some(3), stderr }) if stderr == "failure"
+    ));
+}
+
+#[test]
+fn nonzero_exit_keeps_the_newest_stderr() {
+    let mut limits = lim(5_000);
+    limits.max_stderr = 64;
+    let result = run_blocking(
+        sh("yes e | head -c 5000 >&2; printf LASTLINE >&2; exit 3"),
+        limits,
+        &AtomicBool::new(false),
+    );
+    match result {
+        Err(RunError::Exit { code, stderr }) => {
+            assert_eq!(code, Some(3));
+            assert!(stderr.len() <= 64);
+            assert!(stderr.ends_with("LASTLINE"), "{stderr:?}");
+        }
+        other => panic!("{other:?}"),
+    }
+}
+
+#[test]
+fn cancel_before_spawn_spawns_nothing() {
+    let directory = tempfile::tempdir().unwrap();
+    let marker = directory.path().join("spawned");
+    let script = format!("touch {}; printf unexpected", marker.display());
+    let cancel = AtomicBool::new(true);
+    assert!(matches!(
+        run_blocking(sh(&script), lim(5_000), &cancel),
+        Err(RunError::Cancelled)
+    ));
+    assert!(!marker.exists());
+}
+
 /// True when `pid` is gone or a zombie awaiting a subreaper.
+#[expect(
+    clippy::disallowed_methods,
+    reason = "ps is only used to verify test child cleanup"
+)]
 fn dead(pid: &str) -> bool {
     let out = Command::new("ps")
         .args(["-o", "stat=", "-p", pid])
@@ -83,6 +285,10 @@ async fn stderr_flood_past_cap_does_not_kill_the_child() {
 }
 
 #[tokio::test]
+#[expect(
+    clippy::disallowed_methods,
+    reason = "setsid availability is probed in this Unix-only test"
+)]
 async fn escaped_descendant_holding_the_pipe_cannot_pin_the_runner() {
     if Command::new("setsid").arg("--version").output().is_err() {
         return; // no setsid here (e.g. macOS)
