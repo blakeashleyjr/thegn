@@ -139,12 +139,12 @@ mod imp {
     use super::{Qos, is_pooled_thread, linux_sched, target_nice};
     use std::io;
 
-    pub(super) fn priority(which: libc::c_int, who: libc::id_t) -> Option<i32> {
+    pub(super) fn priority(who: libc::id_t) -> Option<i32> {
         // SAFETY: `__errno_location` returns this thread's errno slot.
         unsafe { *libc::__errno_location() = 0 };
         // SAFETY: getpriority reads the specified Linux thread's scheduling
         // priority; `who` is either this process's pid or a gettid result.
-        let value = unsafe { libc::getpriority(which, who) };
+        let value = unsafe { libc::getpriority(libc::PRIO_PROCESS, who) };
         // SAFETY: the errno pointer is valid for this thread.
         let error = unsafe { *libc::__errno_location() };
         if value == -1 && error != 0 {
@@ -167,10 +167,10 @@ mod imp {
             tracing::debug!(target: "thegn::qos", %error, "could not read Linux thread id");
             return;
         }
-        let Some(baseline) = priority(libc::PRIO_PROCESS, libc::getpid()) else {
+        let Some(baseline) = priority(std::process::id()) else {
             return;
         };
-        let Some(current) = priority(libc::PRIO_PROCESS, tid as libc::id_t) else {
+        let Some(current) = priority(tid as libc::id_t) else {
             return;
         };
 
@@ -310,29 +310,33 @@ mod tests {
                 // SAFETY: gettid reads the calling thread's Linux tid.
                 let tid = unsafe { libc::syscall(libc::SYS_gettid) };
                 assert!(tid >= 0);
-                let start = imp::priority(libc::PRIO_PROCESS, tid as libc::id_t).unwrap();
-                // getpid identifies the main thread, whose nice value is the
-                // baseline used by the implementation.
-                let baseline = libc::getpid();
-                let baseline = imp::priority(libc::PRIO_PROCESS, baseline as libc::id_t).unwrap();
+                let start = imp::priority(tid as libc::id_t).unwrap();
+                // The process ID identifies the main thread, whose nice value
+                // is the baseline used by the implementation.
+                let baseline = imp::priority(std::process::id()).unwrap();
+                // SAFETY: ioprio_get reads this thread's I/O priority.
+                let before_ioprio = unsafe { libc::syscall(libc::SYS_ioprio_get, 1, tid) };
                 set_self(Qos::Background);
-                let after = imp::priority(libc::PRIO_PROCESS, tid as libc::id_t).unwrap();
+                // SAFETY: ioprio_get reads this thread's I/O priority.
+                let after_ioprio = unsafe { libc::syscall(libc::SYS_ioprio_get, 1, tid) };
+                let after = imp::priority(tid as libc::id_t).unwrap();
                 assert_eq!(
                     after,
                     target_nice(baseline, start, Qos::Background).unwrap_or(start)
                 );
                 set_self(Qos::Utility);
                 assert_eq!(
-                    imp::priority(libc::PRIO_PROCESS, tid as libc::id_t).unwrap(),
+                    imp::priority(tid as libc::id_t).unwrap(),
                     after,
                     "a later class must not lower nice"
                 );
 
-                // SAFETY: ioprio_get reads this thread's I/O priority.
-                let result = unsafe { libc::syscall(libc::SYS_ioprio_get, 1, tid) };
-                if result >= 0 {
-                    assert_eq!((result as i32) & 0x1fff, 7);
-                    assert_eq!((result as i32) >> 13, 2);
+                // A sandbox may allow ioprio_get while denying ioprio_set.
+                // Assert the requested value only when the best-effort set
+                // changed the value; otherwise the syscall may be unavailable.
+                if before_ioprio >= 0 && after_ioprio >= 0 && before_ioprio != after_ioprio {
+                    assert_eq!((after_ioprio as i32) & 0x1fff, 7);
+                    assert_eq!((after_ioprio as i32) >> 13, 2);
                 }
             })
             .unwrap()
@@ -349,12 +353,9 @@ mod tests {
                 // SAFETY: gettid reads the calling thread's Linux tid.
                 let tid = unsafe { libc::syscall(libc::SYS_gettid) };
                 assert!(tid >= 0);
-                let before = imp::priority(libc::PRIO_PROCESS, tid as libc::id_t).unwrap();
+                let before = imp::priority(tid as libc::id_t).unwrap();
                 set_self(Qos::Background);
-                assert_eq!(
-                    imp::priority(libc::PRIO_PROCESS, tid as libc::id_t),
-                    Some(before)
-                );
+                assert_eq!(imp::priority(tid as libc::id_t), Some(before));
             })
             .unwrap()
             .join()
