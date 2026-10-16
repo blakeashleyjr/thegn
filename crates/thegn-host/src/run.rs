@@ -16053,20 +16053,6 @@ async fn event_loop<T: Terminal>(
                     pending_corner_oob.require_delete();
                 }
                 let queued_bytes = corner_gfx.iter().map(Vec::len).sum::<usize>();
-                let mut retained_bytes = 0usize;
-                let mut retained_start = corner_gfx.len();
-                for (index, unit) in corner_gfx.iter().enumerate().rev() {
-                    let Some(total) = retained_bytes.checked_add(unit.len()) else {
-                        break;
-                    };
-                    if unit.len() > crate::frame_writer::OOB_QUEUE_BYTES
-                        || total > crate::frame_writer::OOB_QUEUE_BYTES
-                    {
-                        break;
-                    }
-                    retained_bytes = total;
-                    retained_start = index;
-                }
                 let (draw, truncated) = crate::kitty_relay::coalesce_gfx_within(
                     std::mem::take(&mut corner_gfx),
                     crate::frame_writer::OOB_QUEUE_BYTES,
@@ -16075,8 +16061,7 @@ async fn event_loop<T: Terminal>(
                     pending_corner_oob.require_delete();
                     tracing::debug!(
                         target: "thegn::frame",
-                        dropped_units = retained_start,
-                        dropped_bytes = queued_bytes.saturating_sub(retained_bytes),
+                        dropped_bytes = queued_bytes - draw.len(),
                         "truncated corner kitty graphics batch"
                     );
                 }
