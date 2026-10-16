@@ -2675,3 +2675,42 @@ fn explicit_floor_beats_deliberate_host() {
         assert!(error.to_string().contains("isolation floor"), "{error:#}");
     });
 }
+
+#[test]
+fn compose_guard_protects_host_credentials_sockets_state_runtime_and_extra_paths() {
+    let root = tempfile::tempdir().expect("private tempdir");
+    let home = root.path().join("home");
+    let state = root.path().join("state");
+    let runtime = root.path().join("runtime");
+    let extra = root.path().join("control");
+    std::fs::create_dir_all(&home).unwrap();
+    std::fs::create_dir_all(&state).unwrap();
+    std::fs::create_dir_all(&runtime).unwrap();
+    std::fs::create_dir_all(&extra).unwrap();
+    let home_s = home.to_str().unwrap();
+    let state_s = state.to_str().unwrap();
+    let runtime_s = runtime.to_str().unwrap();
+    let _env = crate::testenv::EnvVarGuard::set(&[
+        ("HOME", home_s),
+        ("XDG_STATE_HOME", state_s),
+        ("XDG_RUNTIME_DIR", runtime_s),
+    ]);
+    let extra_paths = vec![extra.clone()];
+    let guard = thegn_core::sandbox_compose::ComposeGuard::for_host(&extra_paths);
+    let expected = [
+        home.join(".ssh"),
+        home.join(".config/gh"),
+        home.join(".git-credentials"),
+        std::path::PathBuf::from("/var/run/docker.sock"),
+        runtime.join("podman/podman.sock"),
+        state.join("thegn"),
+        runtime.join("thegn"),
+        extra,
+    ];
+    for path in expected {
+        assert!(
+            guard.protected.contains(&path),
+            "missing protected path {path:?}"
+        );
+    }
+}

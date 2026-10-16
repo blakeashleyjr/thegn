@@ -1177,6 +1177,8 @@ pub async fn main(
     )
     .await;
     clipboard.shutdown();
+    let quit_deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    crate::quit_cancel::signal_all();
     // Outside the UI loop, including every early/error return. All sessions
     // close together under one application deadline; reloads share this owner.
     let cleanup_deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(3);
@@ -1203,11 +1205,18 @@ pub async fn main(
             "process sampler cleanup did not settle successfully"
         )))
     };
+    let settlement = crate::quit_cancel::wait_or_detach(quit_deadline);
+    if !settlement.settled_custom || !settlement.settled_ci {
+        tracing::warn!(target: "thegn::shutdown", ?settlement, "detached custom git or CI work after the shutdown deadline");
+    }
     // Renderers run in their own process group, so nothing would signal them
     // when we exit: kill and reap the preview tree before the process goes.
     crate::preview_jobs::shutdown_global(std::time::Duration::from_millis(200));
     if !crate::workspace_create::shutdown_clones(std::time::Duration::from_secs(1)) {
         tracing::error!(target: "thegn::workspace", "workspace clone supervisor did not settle during shutdown");
+    }
+    if !crate::pane_pty::drain_detached_reapers(std::time::Duration::from_secs(1)) {
+        tracing::warn!(target: "thegn::pty", "pane reapers did not settle during shutdown");
     }
     for (plugin, outcome) in &resident_report.outcomes {
         tracing::debug!(target: "thegn::plugin", plugin = %plugin, ?outcome, "resident lifecycle receipt; descendant containment remains unproven");
@@ -2232,14 +2241,28 @@ enum SymbolsFetch {
     Outline {
         key: crate::panel::sections::symbols::OutlineKey,
         rows: Vec<crate::panel::SymbolRow>,
+        lsp_busy: bool,
     },
     Refs {
         root: PathBuf,
         label: String,
         file: String,
         server: bool,
+        overloaded: bool,
         rows: Vec<crate::panel::SymbolRow>,
     },
+}
+
+enum HoverFetch {
+    Popup(crate::hover::HoverPopup),
+    Busy,
+}
+
+struct LspFetchCtx {
+    lsp: std::sync::Arc<crate::lsp::LspInner>,
+    waker: TerminalWaker,
+    busy: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    cancel: thegn_svc::lsp::CancelToken,
 }
 
 /// Clears an off-loop fetch's in-flight flag when the task ends — normally,
@@ -2258,146 +2281,206 @@ impl Drop for InflightGuard {
 /// otherwise. Sends a `SymbolsFetch::Outline` and pulses the waker.
 fn spawn_outline_fetch(
     key: crate::panel::sections::symbols::OutlineKey,
-    lsp: std::sync::Arc<crate::lsp::LspInner>,
     tx: tokio_mpsc::Sender<SymbolsFetch>,
-    waker: TerminalWaker,
-    busy: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    ctx: LspFetchCtx,
 ) {
     use thegn_core::semantic::Lang;
     tokio::task::spawn_blocking(move || {
-        let _inflight = InflightGuard(busy);
+        let _inflight = InflightGuard(ctx.busy);
         let root = key.root.clone();
         let file = key.file.clone();
         // A provider exists if the file resolves to a registered server (LSP
         // tier) OR to a tree-sitter grammar. A registry-only language (no
         // grammar) still gets its LSP outline; a file that resolves to neither
         // is skipped without a read.
-        let has_provider = lsp.resolve_key(&file).is_some() || Lang::from_path(&file).is_some();
-        let rows = if has_provider {
+        let has_provider = ctx.lsp.resolve_key(&file).is_some() || Lang::from_path(&file).is_some();
+        let (rows, lsp_busy) = if has_provider {
             match std::fs::read_to_string(root.join(&file)) {
-                Ok(text) => outline_rows(&lsp, &root, &file, &text),
-                Err(_) => Vec::new(),
+                Ok(text) => match outline_rows(&ctx.lsp, &root, &file, &text, &ctx.cancel) {
+                    Some(result) => result,
+                    None => return,
+                },
+                Err(_) => (Vec::new(), false),
             }
         } else {
-            Vec::new()
+            (Vec::new(), false)
         };
-        let _ = tx.try_send(SymbolsFetch::Outline { key, rows }); // best-effort: bounded replaceable result; a full queue drops stale work
-        let _ = waker.wake(); // best-effort: waker pulse: an input nudge must never fail the calling path
+        if ctx.cancel.is_cancelled() {
+            return;
+        }
+        if let Err(error) = tx.try_send(SymbolsFetch::Outline {
+            key,
+            rows,
+            lsp_busy,
+        }) {
+            tracing::debug!(target: "thegn::lsp", %error, "outline result delivery failed");
+        }
+        if let Err(error) = ctx.waker.wake() {
+            tracing::debug!(target: "thegn::lsp", %error, "outline wake failed");
+        }
     });
 }
 
 /// Fetch references to the symbol at `(file, line, col)` off the loop. References
 /// require a language server (tree-sitter can't resolve them); the result is a
 /// list of reference sites. Sends a `SymbolsFetch::Refs` and pulses the waker.
-#[allow(clippy::too_many_arguments)]
 fn spawn_refs_fetch(
     file: String,
     line: u64,
     col: u32,
     label: String,
     root: std::path::PathBuf,
-    lsp: std::sync::Arc<crate::lsp::LspInner>,
     tx: tokio_mpsc::Sender<SymbolsFetch>,
-    waker: TerminalWaker,
-    busy: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    ctx: LspFetchCtx,
 ) {
     tokio::task::spawn_blocking(move || {
-        let _inflight = InflightGuard(busy);
+        let _inflight = InflightGuard(ctx.busy);
         let mut rows = Vec::new();
         let mut server = false;
-        if let Some(key) = lsp.resolve_key(&file)
-            && let Ok(client) = lsp.client(&root, &key)
-        {
-            server = true;
-            let uri = thegn_svc::lsp::path_to_uri(&root.join(&file).to_string_lossy());
-            if let Ok(text) = std::fs::read_to_string(root.join(&file)) {
-                let _ = client.did_open(&uri, &text); // best-effort: LSP did_open is advisory: a missed open just means the server discovers the file itself
-            }
-            let pos = thegn_svc::lsp::Position {
-                line: line.saturating_sub(1) as u32,
-                character: col,
+        let mut overloaded = false;
+        if let Some(key) = ctx.lsp.resolve_key(&file) {
+            let client = match ctx.lsp.client_with_cancel(&root, &key, Some(&ctx.cancel)) {
+                Ok(client) => Some(client),
+                Err(thegn_svc::lsp::LspError::Cancelled) => return,
+                Err(thegn_svc::lsp::LspError::Overloaded) => {
+                    overloaded = true;
+                    None
+                }
+                Err(_) => None,
             };
-            if let Ok(locs) = client.references(&uri, pos) {
-                rows = locs
-                    .into_iter()
-                    .map(|l| {
-                        let rel = std::path::Path::new(&l.path)
-                            .strip_prefix(&root)
-                            .map(|p| p.to_string_lossy().into_owned())
-                            .unwrap_or_else(|_| l.path.clone());
-                        let line = l.line_1based() as u64;
-                        crate::panel::SymbolRow {
-                            kind: "→".to_string(),
-                            name: format!("{rel}:{line}"),
-                            file: rel,
-                            line,
-                            col: 0,
-                            depth: 0,
-                        }
-                    })
-                    .collect();
+            if let Some(client) = client {
+                server = true;
+                let uri = thegn_svc::lsp::path_to_uri(&root.join(&file).to_string_lossy());
+                if let Ok(text) = std::fs::read_to_string(root.join(&file)) {
+                    let _ = client.did_open(&uri, &text); // best-effort: LSP did_open is advisory: a missed open just means the server discovers the file itself
+                }
+                let pos = thegn_svc::lsp::Position {
+                    line: line.saturating_sub(1) as u32,
+                    character: col,
+                };
+                match client.references_with(&uri, pos, &ctx.cancel) {
+                    Ok(locs) => {
+                        rows = locs
+                            .into_iter()
+                            .map(|l| {
+                                let rel = std::path::Path::new(&l.path)
+                                    .strip_prefix(&root)
+                                    .map(|p| p.to_string_lossy().into_owned())
+                                    .unwrap_or_else(|_| l.path.clone());
+                                let line = l.line_1based() as u64;
+                                crate::panel::SymbolRow {
+                                    kind: "→".to_string(),
+                                    name: format!("{rel}:{line}"),
+                                    file: rel,
+                                    line,
+                                    col: 0,
+                                    depth: 0,
+                                }
+                            })
+                            .collect()
+                    }
+                    Err(thegn_svc::lsp::LspError::Cancelled) => return,
+                    Err(thegn_svc::lsp::LspError::Overloaded) => overloaded = true,
+                    Err(_) => {}
+                }
             }
         }
-        let _ = tx.try_send(SymbolsFetch::Refs {
+        if ctx.cancel.is_cancelled() {
+            return;
+        }
+        if let Err(error) = tx.try_send(SymbolsFetch::Refs {
             root,
             label,
             file,
             server,
+            overloaded,
             rows,
-        }); // best-effort: bounded replaceable result; a full queue drops stale work
-        let _ = waker.wake(); // best-effort: waker pulse: an input nudge must never fail the calling path
+        }) {
+            tracing::debug!(target: "thegn::lsp", %error, "references result delivery failed");
+        }
+        if let Err(error) = ctx.waker.wake() {
+            tracing::debug!(target: "thegn::lsp", %error, "references wake failed");
+        }
     });
 }
 
 /// Fetch hover docs + signature help + code actions for the symbol at
 /// `(file, line, col)` off the loop, assembling the preview popup. Requires a
 /// language server. Sends the built `HoverPopup` and pulses the waker.
-#[allow(clippy::too_many_arguments)]
 fn spawn_hover_fetch(
     file: String,
     line: u64,
     col: u32,
     label: String,
     root: std::path::PathBuf,
-    lsp: std::sync::Arc<crate::lsp::LspInner>,
-    tx: tokio_mpsc::Sender<crate::hover::HoverPopup>,
-    waker: TerminalWaker,
-    busy: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    tx: tokio_mpsc::Sender<HoverFetch>,
+    ctx: LspFetchCtx,
 ) {
     tokio::task::spawn_blocking(move || {
-        let _inflight = InflightGuard(busy);
+        let _inflight = InflightGuard(ctx.busy);
         let mut hover_md: Option<String> = None;
         let mut signatures: Vec<String> = Vec::new();
         let mut actions: Vec<String> = Vec::new();
-        if let Some(key) = lsp.resolve_key(&file)
-            && let Ok(client) = lsp.client(&root, &key)
-        {
-            let uri = thegn_svc::lsp::path_to_uri(&root.join(&file).to_string_lossy());
-            if let Ok(text) = std::fs::read_to_string(root.join(&file)) {
-                let _ = client.did_open(&uri, &text); // best-effort: LSP did_open is advisory: a missed open just means the server discovers the file itself
-            }
-            let pos = thegn_svc::lsp::Position {
-                line: line.saturating_sub(1) as u32,
-                character: col,
+        let mut overloaded = false;
+        if let Some(key) = ctx.lsp.resolve_key(&file) {
+            let client = match ctx.lsp.client_with_cancel(&root, &key, Some(&ctx.cancel)) {
+                Ok(client) => Some(client),
+                Err(thegn_svc::lsp::LspError::Cancelled) => return,
+                Err(thegn_svc::lsp::LspError::Overloaded) => {
+                    overloaded = true;
+                    None
+                }
+                Err(_) => None,
             };
-            if let Ok(Some(h)) = client.hover(&uri, pos) {
-                hover_md = Some(h.markdown);
-            }
-            if let Ok(sigs) = client.signature_help(&uri, pos) {
-                signatures = sigs.into_iter().map(|s| s.label).collect();
-            }
-            let range = thegn_svc::lsp::Range {
-                start: pos,
-                end: pos,
-            };
-            if let Ok(acts) = client.code_actions(&uri, range) {
-                actions = acts.into_iter().map(|a| a.title).collect();
+            if let Some(client) = client {
+                let uri = thegn_svc::lsp::path_to_uri(&root.join(&file).to_string_lossy());
+                if let Ok(text) = std::fs::read_to_string(root.join(&file)) {
+                    let _ = client.did_open(&uri, &text); // best-effort: LSP did_open is advisory: a missed open just means the server discovers the file itself
+                }
+                let pos = thegn_svc::lsp::Position {
+                    line: line.saturating_sub(1) as u32,
+                    character: col,
+                };
+                match client.hover_with(&uri, pos, &ctx.cancel) {
+                    Ok(Some(h)) => hover_md = Some(h.markdown),
+                    Err(thegn_svc::lsp::LspError::Cancelled) => return,
+                    Err(thegn_svc::lsp::LspError::Overloaded) => overloaded = true,
+                    _ => {}
+                }
+                match client.signature_help_with(&uri, pos, &ctx.cancel) {
+                    Ok(sigs) => signatures = sigs.into_iter().map(|s| s.label).collect(),
+                    Err(thegn_svc::lsp::LspError::Cancelled) => return,
+                    Err(thegn_svc::lsp::LspError::Overloaded) => overloaded = true,
+                    _ => {}
+                }
+                let range = thegn_svc::lsp::Range {
+                    start: pos,
+                    end: pos,
+                };
+                match client.code_actions_with(&uri, range, &ctx.cancel) {
+                    Ok(acts) => actions = acts.into_iter().map(|a| a.title).collect(),
+                    Err(thegn_svc::lsp::LspError::Cancelled) => return,
+                    Err(thegn_svc::lsp::LspError::Overloaded) => overloaded = true,
+                    _ => {}
+                }
             }
         }
-        let popup =
-            crate::hover::HoverPopup::build(&label, hover_md.as_deref(), &signatures, &actions);
-        let _ = tx.try_send(popup); // best-effort: bounded replaceable result; a full queue drops stale work
-        let _ = waker.wake(); // best-effort: waker pulse: an input nudge must never fail the calling path
+        let result = if overloaded {
+            HoverFetch::Busy
+        } else {
+            let popup =
+                crate::hover::HoverPopup::build(&label, hover_md.as_deref(), &signatures, &actions);
+            HoverFetch::Popup(popup)
+        };
+        if ctx.cancel.is_cancelled() {
+            return;
+        }
+        if let Err(error) = tx.try_send(result) {
+            tracing::debug!(target: "thegn::lsp", %error, "hover result delivery failed");
+        }
+        if let Err(error) = ctx.waker.wake() {
+            tracing::debug!(target: "thegn::lsp", %error, "hover wake failed");
+        }
     });
 }
 
@@ -2411,32 +2494,53 @@ fn outline_rows(
     root: &std::path::Path,
     file: &str,
     text: &str,
-) -> Vec<crate::panel::SymbolRow> {
+    cancel: &thegn_svc::lsp::CancelToken,
+) -> Option<(Vec<crate::panel::SymbolRow>, bool)> {
+    if cancel.is_cancelled() {
+        return None;
+    }
+    let mut lsp_busy = false;
     // LSP tier: a registered server's document symbols.
-    if let Some(key) = lsp.resolve_key(file)
-        && let Ok(client) = lsp.client(root, &key)
-    {
-        let uri = thegn_svc::lsp::path_to_uri(&root.join(file).to_string_lossy());
-        let _ = client.did_open(&uri, text); // best-effort: LSP did_open is advisory: a missed open just means the server discovers the file itself
-        if let Ok(syms) = client.document_symbols(&uri)
-            && !syms.is_empty()
-        {
-            return syms
-                .into_iter()
-                .map(|s| crate::panel::SymbolRow {
-                    kind: s.kind.label().to_string(),
-                    name: s.name,
-                    file: file.to_string(),
-                    line: s.location.line_1based() as u64,
-                    col: s.location.range.start.character,
-                    depth: u16::from(s.container.is_some()),
-                })
-                .collect();
+    if let Some(key) = lsp.resolve_key(file) {
+        let client = match lsp.client_with_cancel(root, &key, Some(cancel)) {
+            Ok(client) => Some(client),
+            Err(thegn_svc::lsp::LspError::Cancelled) => return None,
+            Err(thegn_svc::lsp::LspError::Overloaded) => {
+                lsp_busy = true;
+                None
+            }
+            Err(_) => None,
+        };
+        if let Some(client) = client {
+            let uri = thegn_svc::lsp::path_to_uri(&root.join(file).to_string_lossy());
+            let _ = client.did_open(&uri, text); // best-effort: LSP did_open is advisory: a missed open just means the server discovers the file itself
+            match client.document_symbols_with(&uri, cancel) {
+                Ok(syms) if !syms.is_empty() => {
+                    let rows = syms
+                        .into_iter()
+                        .map(|s| crate::panel::SymbolRow {
+                            kind: s.kind.label().to_string(),
+                            name: s.name,
+                            file: file.to_string(),
+                            line: s.location.line_1based() as u64,
+                            col: s.location.range.start.character,
+                            depth: u16::from(s.container.is_some()),
+                        })
+                        .collect();
+                    return Some((rows, false));
+                }
+                Err(thegn_svc::lsp::LspError::Cancelled) => return None,
+                Err(thegn_svc::lsp::LspError::Overloaded) => lsp_busy = true,
+                _ => {}
+            }
         }
+    }
+    if cancel.is_cancelled() {
+        return None;
     }
     // Tree-sitter tier: only for a language with a grammar. A registry-only
     // language returns an empty outline (its empty-state), never a regex parse.
-    match thegn_core::semantic::Lang::from_path(file) {
+    let rows = match thegn_core::semantic::Lang::from_path(file) {
         Some(lang) => thegn_core::semantic::parse_entities(text, lang)
             .into_iter()
             .map(|e| crate::panel::SymbolRow {
@@ -2449,7 +2553,8 @@ fn outline_rows(
             })
             .collect(),
         None => Vec::new(),
-    }
+    };
+    Some((rows, lsp_busy))
 }
 
 /// How often the pipeline board re-reads the dispatch roster while it is the
@@ -6000,11 +6105,9 @@ fn apply_layout_to_active_tab(
     Some(focus)
 }
 
-/// Dispatch a preset launch into the active worktree. A preset that names a
-/// saved `layout` applies it on the loop into a new tab (like a template); an
-/// unknown layout warns and falls through to its `commands`. The `commands`
-/// path resolves its launch specs OFF the loop (the sandbox settle is slow),
-/// delivered to the `launch_rx` drain. `status` reports what happened.
+/// Dispatch a preset launch into the active worktree. Saved layouts are read
+/// on the DB writer and applied by the pending DB drain; command launches
+/// resolve off the loop and are delivered to the `launch_rx` drain.
 #[allow(clippy::too_many_arguments)]
 fn dispatch_preset_launch(
     preset: thegn_core::config::Preset,
@@ -6013,36 +6116,22 @@ fn dispatch_preset_launch(
     cfg: &thegn_core::config::Config,
     launch_tx: &crate::handlers::launch::LaunchTx,
     waker: &termwiz::terminal::TerminalWaker,
-    session: &mut crate::session::Session,
-    panes: &mut Panes,
-    center: Rect,
+    pending_db_tx: &tokio_mpsc::UnboundedSender<run_pending_db::PendingDbResult>,
+    pending_db_fence: &mut run_pending_db::RequestFence,
     status: &mut String,
 ) {
-    if let Some(layout_name) = preset.layout_name() {
-        let spec = thegn_core::db::Db::open()
-            .ok()
-            .and_then(|db| db.get_layout(layout_name).ok().flatten())
-            .and_then(|json| crate::layout_spec::LayoutSpec::from_json(&json).ok());
-        match spec {
-            Some(spec) => {
-                if let Some(g) = session.active_group_mut() {
-                    g.add_tab();
-                }
-                apply_layout_to_active_tab(&spec, session, panes, cfg, center);
-                *status = format!("Launched preset {}", preset.name);
-                return;
-            }
-            None => {
-                thegn_core::msg::warn(&format!(
-                    "preset {:?}: no saved layout {layout_name:?}; falling back to commands",
-                    preset.name
-                ));
-                if preset.commands.is_empty() {
-                    *status = format!("preset {}: layout missing and no commands", preset.name);
-                    return;
-                }
-            }
-        }
+    if preset.layout_name().is_some() {
+        let seq = pending_db_fence.begin_layout();
+        run_pending_db::queue_preset_layout(
+            seq,
+            group,
+            worktree,
+            preset.clone(),
+            pending_db_tx,
+            waker,
+        );
+        *status = format!("Loading preset {}…", preset.name);
+        return;
     }
     let name = preset.name.clone();
     crate::handlers::launch::spawn_resolve(
@@ -7275,17 +7364,17 @@ async fn event_loop<T: Terminal>(
     let mut outline_key: Option<crate::panel::sections::symbols::OutlineKey> = None;
     let mut outline_syms: Vec<crate::panel::SymbolRow> = Vec::new();
     let mut outline_inflight: Option<crate::panel::sections::symbols::OutlineKey> = None;
-    let outline_busy = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let mut outline_busy = crate::panel::sections::symbols::LspFetchSlot::default();
     let mut refs_label = String::new();
     let mut refs_rows: Vec<crate::panel::SymbolRow> = Vec::new();
     let mut refs_note = String::new();
     let mut refs_inflight = false;
-    let refs_busy = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let mut refs_busy = crate::panel::sections::symbols::LspFetchSlot::default();
     // The hover/signature/code-action preview overlay (item 532): built off-loop
     // from the language server, dismissed by any key.
-    let (hover_tx, mut hover_rx) = tokio_mpsc::channel::<crate::hover::HoverPopup>(32);
+    let (hover_tx, mut hover_rx) = tokio_mpsc::channel::<HoverFetch>(32);
     let mut hover_inflight = false;
-    let hover_busy = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let mut hover_busy = crate::panel::sections::symbols::LspFetchSlot::default();
 
     // Bounded drop-oldest ingress; overload is shown as a gap in the Logs panel.
     let logs_ingress = thegn_svc::log::ingress::LogIngress::new();
@@ -7443,6 +7532,7 @@ async fn event_loop<T: Terminal>(
     // grid selection). Drags highlight within ONE pane only and auto-copy
     // (OSC 52) on release, zellij-style.
     let mut mouse_left_down = false;
+    let mut panel_drill_drag: Option<usize> = None;
     // Panel-separator drag: press on the separator BAND (the separator column
     // plus the center column's frame cell beside it — `crate::drag_hit`) grabs
     // `(press column, separator column, moved yet?, width to restore on Esc)`;
@@ -7738,7 +7828,7 @@ async fn event_loop<T: Terminal>(
     // `first_frame_logged` block), alongside the other deferred warms, so it
     // never taxes launch→first-frame. Dropping `plugins_host` on any loop
     // exit best-effort-deactivates and kills every resident session.
-    let (plugin_tx, mut plugin_rx) = tokio_mpsc::unbounded_channel::<crate::plugins::PluginMsg>();
+    let (plugin_tx, mut plugin_rx) = crate::plugins::plugin_channel();
     let mut plugins_state = crate::handlers::plugins::PluginsState::new(current_config.clone());
     let mut plugins_host: Option<crate::plugins::PluginsHost> = None;
     // The embedded help registry (authored pages + the generated keybindings
@@ -9243,7 +9333,7 @@ async fn event_loop<T: Terminal>(
             outline_key = None;
             outline_syms.clear();
             outline_inflight = None;
-            outline_busy.store(false, std::sync::atomic::Ordering::Release);
+            outline_busy.reset();
             model.panel.symbols.clear();
             model.panel.symbols_file.clear();
             model.panel.symbols_note.clear();
@@ -9251,7 +9341,11 @@ async fn event_loop<T: Terminal>(
             refs_rows.clear();
             refs_note.clear();
             refs_inflight = false;
-            refs_busy.store(false, std::sync::atomic::Ordering::Release);
+            refs_busy.reset();
+            hover_busy.reset();
+            hover_inflight = false;
+            hover_popup = None;
+            while hover_rx.try_recv().is_ok() {}
             panel_ui.symbols_pick = None;
             panel_ui.symbols_picker = false;
             panel_ui.symbols_show_refs = false;
@@ -10509,6 +10603,78 @@ async fn event_loop<T: Terminal>(
                         refresh_tab_model(&mut model, &session, &mut sb);
                         persist_session_layout(&mut session, &panes);
                         dirty = true;
+                    }
+                }
+                run_pending_db::PendingDbResult::Preset {
+                    seq,
+                    group,
+                    worktree,
+                    preset,
+                    spec,
+                } => {
+                    let name = preset.name.clone();
+                    let has_commands = !preset.commands.is_empty();
+                    let plan = run_pending_db::plan_preset_drain(
+                        pending_db_fence.accepts_layout(seq),
+                        session.active_group().map(|active| active.path.as_str()),
+                        &worktree,
+                        spec,
+                        has_commands,
+                    );
+                    match plan {
+                        run_pending_db::PresetDrainPlan::Stale => {}
+                        run_pending_db::PresetDrainPlan::ChangedWorktree => {
+                            model.status =
+                                format!("Preset {name} not applied: the worktree changed");
+                            dirty = true;
+                        }
+                        run_pending_db::PresetDrainPlan::Apply(spec) => {
+                            if let Some(active) = session.active_group_mut() {
+                                active.add_tab();
+                            }
+                            let outcome = run_pending_db::plan_preset_apply(
+                                apply_layout_to_active_tab(
+                                    &spec,
+                                    &mut session,
+                                    &mut panes,
+                                    keymap.config(),
+                                    chrome.center,
+                                )
+                                .is_some(),
+                            );
+                            match outcome {
+                                run_pending_db::PresetApplyOutcome::Applied => {
+                                    persist_session_layout(&mut session, &panes);
+                                    need_relayout = true;
+                                    model.status = format!("Launched preset {name}");
+                                }
+                                run_pending_db::PresetApplyOutcome::NothingSpawned => {
+                                    model.status = format!("preset {name}: nothing spawned");
+                                }
+                            }
+                            dirty = true;
+                        }
+                        run_pending_db::PresetDrainPlan::FallBackToCommands => {
+                            let layout_name = preset.layout_name().unwrap_or("");
+                            thegn_core::msg::warn(&format!(
+                                "preset {:?}: no saved layout {layout_name:?}; falling back to commands",
+                                preset.name
+                            ));
+                            crate::handlers::launch::spawn_resolve(
+                                launch_tx.clone(),
+                                waker.clone(),
+                                current_config.clone(),
+                                group,
+                                worktree,
+                                crate::handlers::launch::LaunchRequest::Preset(preset),
+                            );
+                            model.status = format!("Launching preset {name}…");
+                            dirty = true;
+                        }
+                        run_pending_db::PresetDrainPlan::NothingToLaunch => {
+                            model.status = format!("preset {name}: layout missing and no commands");
+                            dirty = true;
+                        }
                     }
                 }
                 run_pending_db::PendingDbResult::Dropped { seq } => {
@@ -12051,9 +12217,8 @@ async fn event_loop<T: Terminal>(
                         &current_config,
                         &launch_tx,
                         &waker,
-                        &mut session,
-                        &mut panes,
-                        chrome.center,
+                        &pending_db_tx,
+                        &mut pending_db_fence,
                         &mut model.status,
                     );
                 }
@@ -14375,7 +14540,11 @@ async fn event_loop<T: Terminal>(
         while let Ok(msg) = outline_rx.try_recv() {
             loop_perf.tick(crate::perf::WakeSource::Outline);
             match msg {
-                SymbolsFetch::Outline { key, rows } => {
+                SymbolsFetch::Outline {
+                    key,
+                    rows,
+                    lsp_busy,
+                } => {
                     if outline_inflight.as_ref() == Some(&key) {
                         outline_inflight = None;
                     }
@@ -14387,6 +14556,10 @@ async fn event_loop<T: Terminal>(
                     }) {
                         outline_key = Some(key);
                         outline_syms = rows;
+                        if lsp_busy {
+                            model.status =
+                                crate::panel::sections::symbols::lsp_busy_note("Outline");
+                        }
                     }
                 }
                 SymbolsFetch::Refs {
@@ -14394,6 +14567,7 @@ async fn event_loop<T: Terminal>(
                     label,
                     file,
                     server,
+                    overloaded,
                     rows,
                 } => {
                     let current_root = session
@@ -14409,6 +14583,7 @@ async fn event_loop<T: Terminal>(
                             &file,
                             server,
                             rows.len(),
+                            overloaded,
                         );
                         model.status = refs_note.clone();
                         refs_rows = rows;
@@ -14418,11 +14593,15 @@ async fn event_loop<T: Terminal>(
             dirty = true;
         }
         // Hover preview: a completed fetch pops the overlay open.
-        while let Ok(popup) = hover_rx.try_recv() {
-            hover_busy.store(false, std::sync::atomic::Ordering::Release);
+        while let Ok(fetch) = hover_rx.try_recv() {
             hover_inflight = false;
             loop_perf.tick(crate::perf::WakeSource::Hover);
-            hover_popup = Some(popup);
+            match fetch {
+                HoverFetch::Popup(popup) => hover_popup = Some(popup),
+                HoverFetch::Busy => {
+                    model.status = crate::panel::sections::symbols::lsp_busy_note("Hover");
+                }
+            }
             dirty = true;
         }
         // Derive the displayed list each frame from the active view, (re)fetching
@@ -14461,7 +14640,7 @@ async fn event_loop<T: Terminal>(
                     target: key.as_ref(),
                     cached: outline_key.as_ref(),
                     inflight: outline_inflight.as_ref(),
-                    busy: outline_busy.load(std::sync::atomic::Ordering::Acquire),
+                    busy: outline_busy.busy(),
                 };
                 let cached_for_target =
                     crate::panel::sections::symbols::cached_outline_matches_target(
@@ -14472,13 +14651,16 @@ async fn event_loop<T: Terminal>(
                     && let Some(key) = key
                 {
                     outline_inflight = Some(key.clone());
-                    outline_busy.store(true, std::sync::atomic::Ordering::Release);
+                    let (cancel, busy) = outline_busy.begin();
                     spawn_outline_fetch(
                         key,
-                        lsp_supervisor.handle(),
                         outline_tx.clone(),
-                        waker.clone(),
-                        outline_busy.clone(),
+                        LspFetchCtx {
+                            lsp: lsp_supervisor.handle(),
+                            waker: waker.clone(),
+                            busy,
+                            cancel,
+                        },
                     );
                 }
                 let file = target.as_deref().unwrap_or_default();
@@ -16545,6 +16727,87 @@ async fn event_loop<T: Terminal>(
                             dirty = true;
                             continue;
                         }
+                        if !model.panel_pending
+                            && panel_ui.open.is_git_family()
+                            && let Some(rect) = chrome.panel
+                        {
+                            let col =
+                                crate::chrome::panel_column_at(&model, &panel_ui, rect, mx, my);
+                            let (pc, pr) = panel_geom(&chrome);
+                            let has_detail_scroll = crate::panel::sections::scroll_extent(
+                                panel_ui.open,
+                                &model,
+                                &panel_ui,
+                                pc,
+                                pr,
+                            )
+                            .is_some_and(|ext| !ext.owns_nav);
+                            match panel_ui.git.wheel_route(col, has_detail_scroll) {
+                                gitui::GitWheel::DrillStep => {
+                                    let (ticks, leftover) = drain_wheel_ticks(up, || {
+                                        pending_input.pop_front().or_else(|| {
+                                            buf.terminal()
+                                                .poll_input(Some(std::time::Duration::ZERO))
+                                                .ok()
+                                                .flatten()
+                                        })
+                                    });
+                                    if let Some(ev) = leftover {
+                                        pending_input.push_front(ev);
+                                    }
+                                    for _ in 0..ticks {
+                                        panel_ui.git.step_view_cursor(!up);
+                                    }
+                                    dirty = true;
+                                    continue;
+                                }
+                                gitui::GitWheel::DetailScroll => {
+                                    let (ticks, leftover) = drain_wheel_ticks(up, || {
+                                        pending_input.pop_front().or_else(|| {
+                                            buf.terminal()
+                                                .poll_input(Some(std::time::Duration::ZERO))
+                                                .ok()
+                                                .flatten()
+                                        })
+                                    });
+                                    if let Some(ev) = leftover {
+                                        pending_input.push_front(ev);
+                                    }
+                                    if let Some(ext) = crate::panel::sections::scroll_extent(
+                                        panel_ui.open,
+                                        &model,
+                                        &panel_ui,
+                                        pc,
+                                        pr,
+                                    ) {
+                                        let delta = ticks.saturating_mul(3);
+                                        panel_ui.scroll = if up {
+                                            panel_ui.scroll.min(ext.max).saturating_sub(delta)
+                                        } else {
+                                            panel_ui.scroll.saturating_add(delta).min(ext.max)
+                                        };
+                                    }
+                                    dirty = true;
+                                    continue;
+                                }
+                                gitui::GitWheel::Ignore => {
+                                    let (_, leftover) = drain_wheel_ticks(up, || {
+                                        pending_input.pop_front().or_else(|| {
+                                            buf.terminal()
+                                                .poll_input(Some(std::time::Duration::ZERO))
+                                                .ok()
+                                                .flatten()
+                                        })
+                                    });
+                                    if let Some(ev) = leftover {
+                                        pending_input.push_front(ev);
+                                    }
+                                    dirty = true;
+                                    continue;
+                                }
+                                gitui::GitWheel::Legacy => {}
+                            }
+                        }
                         let (pc, pr) = panel_geom(&chrome);
                         if let Some(ext) = crate::panel::sections::scroll_extent(
                             panel_ui.open,
@@ -17259,6 +17522,9 @@ async fn event_loop<T: Terminal>(
                                     .get(panel_ui.git.cur.commit_files)
                                     .map(|(path, _, _)| path.clone());
                                 panel_ui.git.click_drill_row(i);
+                                if gitui::GitUi::is_drill(panel_ui.git.focus) {
+                                    panel_drill_drag = Some(i);
+                                }
                                 let current_path = panel_ui
                                     .git
                                     .commit_files
@@ -17308,6 +17574,44 @@ async fn event_loop<T: Terminal>(
                     {
                         sidebar_dirty = true;
                         bars_dirty = true;
+                        dirty = true;
+                    }
+                } else if left
+                    && mouse_left_down
+                    && let Some(anchor) = panel_drill_drag
+                {
+                    let (m, leftover) = drain_drag_events(m, || {
+                        pending_input.pop_front().or_else(|| {
+                            buf.terminal()
+                                .poll_input(Some(std::time::Duration::ZERO))
+                                .ok()
+                                .flatten()
+                        })
+                    });
+                    if let Some(ev) = leftover {
+                        pending_input.push_front(ev);
+                    }
+                    let mx = (m.x as usize).saturating_sub(1);
+                    let my = (m.y as usize).saturating_sub(1);
+                    if let Some(rect) = chrome.panel
+                        && !model.panel_pending
+                        && let Some(index) =
+                            crate::chrome::panel_drill_drag_hit(&model, &panel_ui, rect, mx, my)
+                    {
+                        let previous_path = panel_ui
+                            .git
+                            .commit_files
+                            .get(panel_ui.git.cur.commit_files)
+                            .map(|(path, _, _)| path.clone());
+                        panel_ui.git.drag_drill_to(anchor, index);
+                        let current_path = panel_ui
+                            .git
+                            .commit_files
+                            .get(panel_ui.git.cur.commit_files)
+                            .map(|(path, _, _)| path.clone());
+                        if current_path != previous_path {
+                            panel_ui.scroll = 0;
+                        }
                         dirty = true;
                     }
                 } else if left && mouse_left_down && mouse_selecting {
@@ -17378,6 +17682,7 @@ async fn event_loop<T: Terminal>(
                         selection_only = true;
                     }
                 } else if !left && mouse_left_down {
+                    panel_drill_drag = None;
                     // A sidebar press/drag ends here: perform the drop (or
                     // finish the click) and consume the release.
                     match crate::handlers::sidebar_mouse::on_release(
@@ -19975,9 +20280,8 @@ async fn event_loop<T: Terminal>(
                                                 &current_config,
                                                 &launch_tx,
                                                 &waker,
-                                                &mut session,
-                                                &mut panes,
-                                                chrome.center,
+                                                &pending_db_tx,
+                                                &mut pending_db_fence,
                                                 &mut model.status,
                                             );
                                         }
@@ -21004,7 +21308,10 @@ async fn event_loop<T: Terminal>(
                                 if panel_ui.open == crate::panel::Section::Symbols
                                     && panel_ui.symbols_show_refs =>
                             {
-                                crate::panel::sections::symbols::leave_refs(&mut panel_ui);
+                                if crate::panel::sections::symbols::leave_refs(&mut panel_ui) {
+                                    refs_busy.reset();
+                                    refs_inflight = false;
+                                }
                             }
                             PanelMsg::LeaveRows => {
                                 // Esc peels one layer at a time: expanded change
@@ -23329,11 +23636,10 @@ async fn event_loop<T: Terminal>(
                             if !panel_ui.symbols_show_refs
                                 && let Some(s) =
                                     model.panel.symbols.get(panel_ui.symbols_cursor).cloned()
-                                && (!refs_inflight
-                                    || !refs_busy.load(std::sync::atomic::Ordering::Acquire))
+                                && (!refs_inflight || !refs_busy.busy())
                             {
                                 refs_inflight = true;
-                                refs_busy.store(true, std::sync::atomic::Ordering::Release);
+                                let (cancel, busy) = refs_busy.begin();
                                 refs_label = s.name.clone();
                                 refs_rows.clear();
                                 refs_note.clear();
@@ -23352,22 +23658,26 @@ async fn event_loop<T: Terminal>(
                                         s.col,
                                         s.name,
                                         root,
-                                        lsp_supervisor.handle(),
                                         outline_tx.clone(),
-                                        waker.clone(),
-                                        refs_busy.clone(),
+                                        LspFetchCtx {
+                                            lsp: lsp_supervisor.handle(),
+                                            waker: waker.clone(),
+                                            busy,
+                                            cancel,
+                                        },
                                     );
                                 }
-                            } else if !panel_ui.symbols_show_refs
-                                && refs_busy.load(std::sync::atomic::Ordering::Acquire)
-                            {
+                            } else if !panel_ui.symbols_show_refs && refs_busy.busy() {
                                 model.status =
                                     "References: still waiting for the language server…".into();
                             }
                             true
                         }
                         (Section::Symbols, KeyCode::Char('o')) => {
-                            crate::panel::sections::symbols::leave_refs(&mut panel_ui);
+                            if crate::panel::sections::symbols::leave_refs(&mut panel_ui) {
+                                refs_busy.reset();
+                                refs_inflight = false;
+                            }
                             true
                         }
                         (Section::Symbols, KeyCode::Char('f')) => {
@@ -23384,14 +23694,13 @@ async fn event_loop<T: Terminal>(
                             true
                         }
                         (Section::Symbols, KeyCode::Char('h')) => {
-                            if (!hover_inflight
-                                || !hover_busy.load(std::sync::atomic::Ordering::Acquire))
+                            if (!hover_inflight || !hover_busy.busy())
                                 && current_config.lsp.hover
                                 && let Some(s) =
                                     model.panel.symbols.get(panel_ui.symbols_cursor).cloned()
                             {
                                 hover_inflight = true;
-                                hover_busy.store(true, std::sync::atomic::Ordering::Release);
+                                let (cancel, busy) = hover_busy.begin();
                                 model.status = format!("Hover: {}…", s.name);
                                 spawn_hover_fetch(
                                     s.file,
@@ -23399,16 +23708,17 @@ async fn event_loop<T: Terminal>(
                                     s.col,
                                     s.name,
                                     active_tab_path(&session),
-                                    lsp_supervisor.handle(),
                                     hover_tx.clone(),
-                                    waker.clone(),
-                                    hover_busy.clone(),
+                                    LspFetchCtx {
+                                        lsp: lsp_supervisor.handle(),
+                                        waker: waker.clone(),
+                                        busy,
+                                        cancel,
+                                    },
                                 );
                             } else if !current_config.lsp.hover {
                                 model.status = "Hover is off: set [lsp] hover = true".into();
-                            } else if current_config.lsp.hover
-                                && hover_busy.load(std::sync::atomic::Ordering::Acquire)
-                            {
+                            } else if current_config.lsp.hover && hover_busy.busy() {
                                 model.status =
                                     "Hover: still waiting for the language server…".into();
                             }
@@ -23417,7 +23727,10 @@ async fn event_loop<T: Terminal>(
                         (Section::Symbols, key)
                             if crate::input::is_escape_key(&key) && panel_ui.symbols_show_refs =>
                         {
-                            crate::panel::sections::symbols::leave_refs(&mut panel_ui);
+                            if crate::panel::sections::symbols::leave_refs(&mut panel_ui) {
+                                refs_busy.reset();
+                                refs_inflight = false;
+                            }
                             true
                         }
                         // -- ci (AV group): drill in (v), open (o), re-run failed/all (r/R),
@@ -25936,23 +26249,16 @@ async fn event_loop<T: Terminal>(
                                 ));
                             }
                             Action::ConnectRoot => {
-                                // Connect-to-root (the sesh `root` jump):
-                                // resolve the focused pane's cwd to its
-                                // owning worktree and reveal that tab. The
-                                // rev-parse is ms-scale on an explicit user
-                                // action (same stance as ConfirmInitGit).
+                                // Connect-to-root resolves the focused pane's cwd
+                                // on a blocking worker, then reads the registry.
                                 let cwd = panes
                                     .table
                                     .get(&focused)
                                     .and_then(|p| p.cwd())
                                     .or_else(|| active_cwd(&session));
-                                let root = cwd
-                                    .as_deref()
-                                    .and_then(thegn_core::repo::worktree_root_for_cwd);
                                 let group_paths: Vec<String> =
                                     session.worktrees.iter().map(|g| g.path.clone()).collect();
                                 crate::workspace_switch_prep::request_connect_root(
-                                    root,
                                     cwd,
                                     group_paths,
                                     &session.id,

@@ -1,0 +1,4 @@
+# Pins per-platform cfgs in thegn-proc source files. The per-OS leaf is by design;
+# adding another per-OS file is a reasoned addition to this set.
+lib.rs
+unix.rs

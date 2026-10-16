@@ -47,7 +47,8 @@ fn gate_error_message(
 /// Fold `worktree`'s current branch onto the repo target via the fold-actor's
 /// CAS land, forcing the land regardless of the configured `auto_land`. Returns
 /// `(branch, target, outcome)`. Queue bookkeeping is intentionally left to the
-/// caller because this helper is also used by `thegn merge land`.
+/// caller because this helper is also used by `thegn merge land` and the TUI.
+/// This shared helper must not install process-wide signal handlers.
 pub(crate) fn land_branch(
     cfg: &Config,
     worktree: &Path,
@@ -109,6 +110,8 @@ pub fn run(cfg: &Config, worktree: Option<String>) -> Result<()> {
     } else {
         None
     };
+    let guard = crate::platform::InterruptGuard::install();
+    let _scope = crate::fold_cancel::scope(move || guard.fired());
     let (branch, target, outcome) = land_branch(cfg, &wt)?;
     // On a successful land, file the worktree into the Merged folder — the same
     // destination a queue land reaches under `move`/`expire`. `thegn land` shares

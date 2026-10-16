@@ -459,7 +459,10 @@ Cleanup is always explicit — thegn never prunes on a schedule.
   so gc can reclaim services from a dead worktree. Remote and profile-gated
   compose services stay unlabelled and are kept as unverified. Unlabelled
   containers and containers owned by another profile are listed but never
-  removed. Safe to run any time.
+  removed. It also removes VPN secret staging directories for sidecars it
+  removes, plus staging directories older than an hour whose sidecar is gone
+  when at least one runtime could be listed; symlinks are never followed.
+  Safe to run any time.
 - `thegn sandbox prune` reclaims **thegn-owned (`thegn-` name family) stopped
   containers**, and `thegn.managed` images and volumes. On a terminal it
   lists what it would remove and asks to confirm; `--yes` skips the prompt for

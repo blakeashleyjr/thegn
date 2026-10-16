@@ -18,7 +18,7 @@ thegn-host  ── compositor: tokio runtime, portable-pty, termwiz Surface, chr
    │                        keymap registry, theme, termcaps, sandbox tables,
    │                        seam vocabulary, capability catalog, plugin wire,
    │                        forge/CI models + parsers
-   ├─► thegn-media, thegn-metrics ── per-OS leaf crates (core-free)
+   ├─► thegn-media, thegn-metrics, thegn-proc ── per-OS leaf crates (core-free)
    └─► tg-kit + gtui-* ── the embedded-app contract (AppTile) and the Observe app
 
 thegn-proxy ── OPT-IN model-proxy daemon (binary `tgproxy`): the axum I/O shell

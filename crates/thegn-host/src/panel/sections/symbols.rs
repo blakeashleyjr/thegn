@@ -10,7 +10,10 @@
 //!   Full  (150): breadcrumb header + the same list
 
 use std::path::PathBuf;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use thegn_core::pipeline_report::{display_cell, display_clip};
+use thegn_svc::lsp::CancelToken;
 
 use crate::seg::{Line, seg};
 
@@ -105,12 +108,55 @@ pub(crate) fn leave_refs(ui: &mut super::super::PanelUi) -> bool {
     true
 }
 
+pub(crate) struct LspFetchSlot {
+    cancel: crate::search_everywhere::CancelOnDrop,
+    busy: Arc<AtomicBool>,
+}
+
+impl Default for LspFetchSlot {
+    fn default() -> Self {
+        Self {
+            cancel: crate::search_everywhere::CancelOnDrop(CancelToken::new()),
+            busy: Arc::new(AtomicBool::new(false)),
+        }
+    }
+}
+
+impl LspFetchSlot {
+    pub(crate) fn begin(&mut self) -> (CancelToken, Arc<AtomicBool>) {
+        let token = self.cancel.replace();
+        self.busy = Arc::new(AtomicBool::new(true));
+        (token, self.busy.clone())
+    }
+
+    pub(crate) fn busy(&self) -> bool {
+        self.busy.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn reset(&mut self) {
+        self.cancel.replace();
+        self.busy = Arc::new(AtomicBool::new(false));
+    }
+}
+
+pub(crate) fn lsp_busy_note(what: &str) -> String {
+    format!("{what}: language server busy (too many queued requests for this worktree); try again")
+}
+
 pub(crate) fn picker_open(ui: &super::super::PanelUi, panel: &super::super::PanelData) -> bool {
     ui.symbols_picker || panel.symbols_file.is_empty()
 }
 
-pub(crate) fn refs_note(label: &str, file: &str, server: bool, n: usize) -> String {
-    if n > 0 {
+pub(crate) fn refs_note(
+    label: &str,
+    file: &str,
+    server: bool,
+    n: usize,
+    overloaded: bool,
+) -> String {
+    if overloaded {
+        lsp_busy_note("References")
+    } else if n > 0 {
         format!("{n} references to {label}")
     } else if server {
         format!("no references to {label}")
@@ -456,7 +502,7 @@ mod tests {
 
     #[test]
     fn empty_refs_without_server_names_the_extension() {
-        let note = refs_note("Widget", "src/widget.rs", false, 0);
+        let note = refs_note("Widget", "src/widget.rs", false, 0, false);
         assert!(note.contains("no language server for .rs"));
         assert!(!note.contains("no symbols in this file"));
         let model = FrameModel {
@@ -474,6 +520,41 @@ mod tests {
         assert!(
             format!("{:?}", content(&make_ctx(&model, &ui))).contains("no language server for .rs")
         );
+    }
+
+    #[test]
+    fn refs_note_reports_a_busy_server_not_a_missing_one() {
+        let note = refs_note("f", "a.rs", false, 0, true);
+        assert!(note.contains("busy"));
+        assert!(!note.contains("no language server"));
+    }
+
+    #[test]
+    fn outline_slot_begin_cancels_previous_and_isolates_busy() {
+        struct Guard(Arc<AtomicBool>);
+        impl Drop for Guard {
+            fn drop(&mut self) {
+                self.0.store(false, Ordering::Release);
+            }
+        }
+
+        let mut slot = LspFetchSlot::default();
+        let (first, first_busy) = slot.begin();
+        let first_guard = Guard(first_busy);
+        let (second, _) = slot.begin();
+        assert!(first.is_cancelled());
+        drop(first_guard);
+        assert!(slot.busy());
+        assert!(!second.is_cancelled());
+    }
+
+    #[test]
+    fn outline_slot_reset_cancels_and_clears_busy() {
+        let mut slot = LspFetchSlot::default();
+        let (cancel, _) = slot.begin();
+        slot.reset();
+        assert!(cancel.is_cancelled());
+        assert!(!slot.busy());
     }
 
     #[test]

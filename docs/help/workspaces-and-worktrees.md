@@ -94,6 +94,10 @@ repo trust behavior.
   needs a terminal that reports modified keys — [[terminal-compatibility]]
   covers what to do when it does not, and `Alt-o` always works.
 
+Switching to a project that is not already warm shows an `Opening <name>…`
+spinner on the status line while its saved state loads off the UI thread; a
+warm project switches immediately.
+
 The canonical action ids above use `*-project`. Existing bindings using
 `new-workspace`, `delete-workspace`, `switch-workspace`, `next-workspace`,
 `prev-workspace`, or `summon-workspace` remain accepted as compatibility

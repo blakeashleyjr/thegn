@@ -183,7 +183,7 @@ pub struct PtyPane {
     last_input_at: Option<std::time::Instant>,
 }
 
-/// Reap a PTY pane's child when the pane goes away.
+/// Reap a PTY pane's child off the dropping thread when the pane goes away.
 ///
 /// Teardown used to be *implicit*: dropping the pane closes the PTY master,
 /// which SIGHUPs the child's foreground process group. That works for a shell,
@@ -213,7 +213,7 @@ impl Drop for PtyPane {
             // it can be blocked in bounded_channel::blocking_send waiting for
             // this loop to drain events. Joining here could deadlock the loop;
             // process teardown is serialized through the shared owner instead.
-            process.terminate_and_reap();
+            process.terminate_and_reap_detached();
         }
     }
 }
@@ -2889,6 +2889,42 @@ mod tests {
             pane.provider_session().map(|ps| ps.session),
             Some("live-sid".into()),
             "attach sid must be visible synchronously at spawn (no relay window)"
+        );
+    }
+
+    #[test]
+    fn dropping_a_pane_returns_without_the_grace_sleep() {
+        if !std::path::Path::new("/proc/self/stat").exists()
+            || crate::platform::pty_term_grace().is_zero()
+        {
+            return;
+        }
+        let (tx, _rx) = tokio_mpsc::channel::<PaneEvent>(64);
+        let pane =
+            PtyPane::spawn_with_env(0, &sh("trap '' HUP; sleep 30"), None, &[], 24, 80, tx, None)
+                .unwrap();
+        let pid = pane.pid.expect("a PTY pane knows its child pid");
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        assert!(
+            crate::platform::pid_alive(pid as i64),
+            "the child should be running before the pane is dropped"
+        );
+
+        let started = std::time::Instant::now();
+        drop(pane);
+        assert!(
+            started.elapsed() < std::time::Duration::from_millis(150),
+            "dropping a pane blocked for {:?}",
+            started.elapsed()
+        );
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while crate::platform::pid_alive(pid as i64) && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(25));
+        }
+        assert!(
+            !crate::platform::pid_alive(pid as i64),
+            "detached reaper left the SIGHUP-ignoring child alive (pid {pid})"
         );
     }
 }

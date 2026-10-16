@@ -3644,3 +3644,40 @@ fn vpn_staging_sweep_never_follows_a_symlinked_entry() {
     );
     assert_eq!(std::fs::read(canary).unwrap(), b"canary");
 }
+
+#[cfg(unix)]
+#[test]
+fn secret_env_file_write_failure_returns_none_and_leaves_nothing() {
+    let parent = private_tempdir();
+    let key = String::from("GH_TOKEN");
+    let value = String::from("canary-secret");
+
+    let path =
+        crate::fsperm::with_private_write_fault(crate::fsperm::PrivateWriteFault::Write, || {
+            write_secret_env_file_in(
+                parent.path(),
+                std::path::Path::new("sandbox-env"),
+                "launch",
+                &[(&key, &value)],
+                true,
+            )
+        });
+
+    assert!(path.is_none());
+    let env_dir = parent.path().join("sandbox-env");
+    for entry in std::fs::read_dir(&env_dir).unwrap() {
+        let entry = entry.unwrap();
+        let bytes = std::fs::read(entry.path()).unwrap();
+        assert!(
+            !bytes
+                .windows(value.len())
+                .any(|window| window == value.as_bytes())
+        );
+        assert!(
+            !entry
+                .file_name()
+                .to_string_lossy()
+                .starts_with(".secret.tmp-")
+        );
+    }
+}

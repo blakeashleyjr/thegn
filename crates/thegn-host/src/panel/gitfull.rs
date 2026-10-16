@@ -1419,6 +1419,7 @@ pub(super) fn build_git_full(
                 rows: out,
                 rail: Vec::new(),
                 col_hits: Vec::new(),
+                col_zone: None,
                 tab_spans: Vec::new(),
             };
         }
@@ -1431,10 +1432,16 @@ pub(super) fn build_git_full(
         out.extend(fused);
         out.push(help_row(ui.git.focus));
         out.truncate(rows);
+        let zone_rows = base..(base + body).min(out.len());
         return PanelFrame {
             rows: out,
             rail: Vec::new(),
             col_hits,
+            col_zone: Some(crate::panel::frame::ColZone {
+                rows: zone_rows,
+                side: 0..side_w,
+                main: side_w + 1..side_w + 1 + main_w,
+            }),
             tab_spans: Vec::new(),
         };
     }
@@ -1443,6 +1450,7 @@ pub(super) fn build_git_full(
         rows: out,
         rail: Vec::new(),
         col_hits: Vec::new(),
+        col_zone: None,
         tab_spans: Vec::new(),
     }
 }
@@ -2351,6 +2359,36 @@ mod tests {
     }
 
     #[test]
+    fn fused_frame_reports_column_zone() {
+        let m = model();
+        let mut files = ui(GitView::CommitFiles);
+        files.git.drilled_commit = Some(m.panel.commits[0].sha.clone());
+        files.git.commit_files_load = crate::panel::gitui::DocLoad::Ready;
+        files.git.commit_files = vec![("src/a.rs".into(), 2, 1)];
+        let full = build_git_full(&m, &files, 120, 40, true);
+        let zone = full
+            .col_zone
+            .as_ref()
+            .expect("Full git frame has a fused zone");
+        assert_eq!(zone.side, 0..SIDE_W - 1);
+        assert_eq!(zone.main.start, SIDE_W);
+        assert!(
+            full.col_hits
+                .iter()
+                .any(|span| span.hit == PanelHit::GitDrill(0))
+        );
+        assert!(
+            full.col_hits
+                .iter()
+                .filter(|span| matches!(span.hit, PanelHit::GitDrill(_)))
+                .all(|span| zone.rows.contains(&span.row))
+        );
+
+        files.width = PanelWidth::Half;
+        assert!(build_git_full(&m, &files, 60, 40, true).col_zone.is_none());
+    }
+
+    #[test]
     fn selected_branch_returns_name_and_tip() {
         let m = model();
         let selected = selected_branch(&ui(GitView::Branches), &m.panel);
@@ -2378,6 +2416,7 @@ mod tests {
             rail: Vec::new(),
             tab_spans: Vec::new(),
             col_hits: Vec::new(),
+            col_zone: None,
         });
 
         assert!(
@@ -2402,6 +2441,7 @@ mod tests {
             rail: Vec::new(),
             tab_spans: Vec::new(),
             col_hits: Vec::new(),
+            col_zone: None,
         });
 
         assert!(
