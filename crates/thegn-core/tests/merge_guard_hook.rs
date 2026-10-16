@@ -11,6 +11,8 @@
 //! the test hermetic (no prek on PATH, so it runs anywhere `git` does) — the
 //! real prek was verified by hand against this same arrangement.
 
+#![cfg(unix)]
+
 use std::path::Path;
 
 use thegn_core::merge_guard::{self, InstallAction, Placement};
