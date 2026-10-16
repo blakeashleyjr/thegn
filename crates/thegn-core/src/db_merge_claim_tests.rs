@@ -296,7 +296,9 @@ fn admission_validates_identity_status_and_lease_and_debug_redacts_token() {
     bad.lease_until_ms = util::now_ms() - 1;
     assert!(db.admit_merge_claim(&bad).unwrap().is_none());
     let mut bad = request();
-    bad.lease_until_ms = util::now_ms() + MERGE_CLAIM_MAX_LEASE_MS + 1;
+    // Well past the cap: admission samples its own clock after taking the write
+    // lock, so a 1 ms margin is erased by any scheduling delay under load.
+    bad.lease_until_ms = util::now_ms() + MERGE_CLAIM_MAX_LEASE_MS + 60_000;
     assert!(db.admit_merge_claim(&bad).unwrap().is_none());
     let mut bad = request();
     bad.owner_hint = Some("x".repeat(MERGE_CLAIM_OWNER_HINT_MAX + 1));
