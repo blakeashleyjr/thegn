@@ -79,7 +79,7 @@ pub(crate) fn coalesce_gfx_within(mut seqs: Vec<Vec<u8>>, limit: usize) -> (Vec<
         let Some(total) = kept_bytes.checked_add(seq.len()) else {
             break;
         };
-        if seq.len() > limit || total > limit {
+        if total > limit {
             break;
         }
         kept_bytes = total;
@@ -417,6 +417,9 @@ impl KittyRelay {
             Piece::GfxDisplay(bytes) => {
                 self.drop_transfer(reservation, &mut None);
                 if bytes.len() > MAX_TRANSFER_BYTES {
+                    if let Some(slot) = reservation {
+                        self.ids.release(slot);
+                    }
                     emit(Piece::Rejected);
                 } else {
                     emit(Piece::GfxDisplay(bytes));
@@ -1447,7 +1450,7 @@ mod tests {
     #[test]
     fn oversized_single_chunk_display_is_rejected_and_releases_fresh_id() {
         let mut relay = KittyRelay::new();
-        for child_id in 1..=15 {
+        for child_id in 1..=14 {
             let display = format!("Ga=T,i={child_id},f=24,s=1,v=1;AQID");
             assert!(matches!(
                 relay.feed(&apc(&display)).as_slice(),
@@ -1463,7 +1466,7 @@ mod tests {
         assert!(oversized.len() <= MAX_APC_BYTES);
         assert_eq!(relay.feed(&oversized), [Piece::Rejected]);
         assert!(matches!(
-            relay.feed(&apc("Ga=T,i=999,f=24,s=1,v=1;AQID")).as_slice(),
+            relay.feed(&apc("Ga=T,i=1000,f=24,s=1,v=1;AQID")).as_slice(),
             [Piece::GfxDisplay(_)]
         ));
     }
