@@ -169,7 +169,9 @@ impl FilterProcess {
             Ok(response) => response,
             Err(RecvTimeoutError::Timeout) => {
                 self.dead = true;
-                let reap = self.reap_or_terminate();
+                drop(self.jobs.take());
+                let reap = terminate_child(&mut self.child);
+                self.reap = Some(clone_reap(&reap));
                 return Err(FilterProcessError::TimedOut { reap });
             }
             Err(RecvTimeoutError::Disconnected) => {
@@ -230,7 +232,11 @@ fn terminate_child(child: &mut Child) -> Reap {
             Err(error) => Reap::Failed(error),
         },
         Err(kill_error) => {
-            tracing::debug!(target: "thegn::git", %kill_error, "filter child kill failed; waiting for exit");
+            tracing::debug!(
+                target: "thegn::git",
+                %kill_error,
+                "filter child kill failed; waiting for exit"
+            );
             match child.try_wait() {
                 Ok(Some(status)) => Reap::Exited(status),
                 Ok(None) => match child.wait() {
@@ -260,7 +266,11 @@ fn reap_child(child: &mut Child) -> Reap {
                     Err(error) => Reap::Failed(error),
                 },
                 Err(kill_error) => {
-                    tracing::debug!(target: "thegn::git", %kill_error, "filter child kill failed; waiting for exit");
+                    tracing::debug!(
+                        target: "thegn::git",
+                        %kill_error,
+                        "filter child kill failed; waiting for exit"
+                    );
                     match child.try_wait() {
                         Ok(Some(status)) => Reap::Exited(status),
                         Ok(None) => match child.wait() {
@@ -289,7 +299,11 @@ fn serve_filter(
         Ok(client) => client,
         Err(error) => {
             if let Err(send_error) = ready.send(Err(error)) {
-                tracing::debug!(target: "thegn::git", %send_error, "filter handshake result receiver closed");
+                tracing::debug!(
+                    target: "thegn::git",
+                    %send_error,
+                    "filter handshake result receiver closed"
+                );
             }
             return;
         }
