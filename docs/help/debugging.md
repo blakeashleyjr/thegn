@@ -23,6 +23,11 @@ local diagnostics. `--json` emits the same kind of report as one
 machine-readable object, which is useful when collecting a report in a
 script.
 
+The report's `db space` line shows the database size, reclaimable space, and
+vacuum mode. It names `thegn db vacuum` when manual conversion is needed;
+databases with more than 64 MiB of live data are never converted
+automatically.
+
 For a support archive, run:
 
 ```sh

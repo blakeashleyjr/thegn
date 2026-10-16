@@ -287,7 +287,9 @@ one of them is about your branch:
   footer and `thegn merge drain --json` report each gate error's `phase`
   (preparation, setup, or gate) and `class` (timeout, spawn, killed,
   setup_failed, capture, poisoned, preparation, signing, or source_moved). The JSON
-  `gate_verdicts` entries carry both fields.
+  `gate_verdicts` entries carry both fields. `thegn integrate` and
+  `thegn land` include the same `(phase/class)` pair in their gate-error
+  messages.
 
 ## Driving it from an agent pane
 

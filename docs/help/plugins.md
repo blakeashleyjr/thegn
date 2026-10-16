@@ -89,9 +89,9 @@ provider error. Re-invoking a running one-shot reports that the contribution
 is already running. `CiProvider`/`ForgeProvider`
 are reserved wire vocabulary for the same pattern.
 
-The standalone `thegn doctor` does not start resident plugins or inventory
-live plugin providers. Use `thegn plugin list` and `thegn plugin check` to
-inspect and validate plugin declarations.
+The standalone `thegn doctor` does not start resident plugins, but it lists
+the native-trust state of each enabled plugin. Use `thegn plugin list` and
+`thegn plugin check` to inspect and validate plugin declarations.
 
 ## Capabilities and host calls
 
@@ -105,6 +105,18 @@ independent; `admin` implies all scopes. Undeclared means denied, and every
 denial is audited. `tools.run` is the current exec-scoped plugin call;
 `launch.preset` remains CLI-first and is not advertised to plugins until its
 generic control route exists.
+
+A plugin is gated when it declares any non-surface capability or any scope.
+An enabled gated plugin is refused unless its user's `[[plugins]]` entry sets
+`trusted_native = true`. A directory plugin cannot trust itself: a
+`trusted_native` value in its `plugin.toml` is ignored and reported as
+`trusted_native in plugin.toml ignored`.
+`thegn plugin list` shows `ungated`, `trusted-native`, or
+`refused-untrusted` for each plugin's trust state. `thegn plugin check` prints
+`native: trusted_native=<bool>; gated by [...]; <verdict>`. The
+`Plugins (native code; capabilities are not a sandbox)` section in
+`thegn doctor` lists each enabled plugin's id, source, trust state, and
+`gated_by` capabilities; its JSON report includes the same rows.
 
 Crashed resident plugins restart with backoff (three attempts, then disabled
 until config reload). That crash/backoff state is process-lifetime supervisor

@@ -345,7 +345,8 @@ thegn config get ui.language          # any dotted key; --json for real types
 thegn config set merge_queue.regenerate_paths '["Cargo.lock", "pnpm-lock.yaml"]'
 thegn config explain merge_queue.gate_command   # value + which layer set it
 thegn config validate    # strict validation; reserved provider kinds are
-                          # reported by name
+                          # reported by name, malformed repo-overlay sandbox
+                          # mounts are warned about
 thegn doctor             # resolved terminal capabilities + every provider's probe
 thegn keys list          # every binding, grouped by zone (--json, --zone)
 thegn keys validate      # chord conflicts; exits non-zero, so it fits a hook

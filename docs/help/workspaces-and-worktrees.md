@@ -94,6 +94,10 @@ repo trust behavior.
   needs a terminal that reports modified keys — [[terminal-compatibility]]
   covers what to do when it does not, and `Alt-o` always works.
 
+The first switch to a project shows an `Opening <name>…` spinner on the
+status line while its saved state loads off the UI thread. Revisiting a
+project applies its saved state immediately.
+
 The canonical action ids above use `*-project`. Existing bindings using
 `new-workspace`, `delete-workspace`, `switch-workspace`, `next-workspace`,
 `prev-workspace`, or `summon-workspace` remain accepted as compatibility
