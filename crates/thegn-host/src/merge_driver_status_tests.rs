@@ -1410,7 +1410,7 @@ fn gate_error_never_admits_agent_and_next_item_still_reaches_ready() {
 
 #[test]
 fn driver_refusal_goes_to_needs_human_without_the_agent() {
-    let fixture = AuditFixture::new(&[("refused", 0)]);
+    let fixture = AuditFixture::new(&[("refused", 0), ("next", 0)]);
     let cfg = MergeQueueConfig {
         agent_max_attempts: 2,
         ..agent_config()
@@ -1425,18 +1425,25 @@ fn driver_refusal_goes_to_needs_human_without_the_agent() {
         vec![fixture.item("refused")],
         |step| fixture.progress(step, &mut panel, &mut observed),
         DriveActions {
-            attempt: |_branch: &str, _location: &thegn_core::remote::GitLoc| {
-                Ok(AttemptOutcome::Conflict {
-                    paths: vec!["data.txt".into()],
-                    submodule_conflicts: Vec::new(),
-                    driver_refusal: Some("custom merge driver not run by folds: data.txt (merge=takeours); resolve by hand".into()),
-                })
+            attempt: |branch: &str, _location: &thegn_core::remote::GitLoc| {
+                if branch == "refused" {
+                    Ok(AttemptOutcome::Conflict {
+                        paths: vec!["data.txt".into()],
+                        submodule_conflicts: Vec::new(),
+                        driver_refusal: Some("custom merge driver not run by folds: data.txt (merge=takeours); resolve by hand".into()),
+                    })
+                } else {
+                    Ok(AttemptOutcome::Ready {
+                        tip: READY_OID.into(),
+                    })
+                }
             },
             floor: |_worktree: &str| panic!("a driver refusal must not admit the agent"),
             runner: unexpected_runner,
         },
     );
     assert_eq!(out.needs_human, ["refused"]);
+    assert_eq!(fixture.row("next").result_oid.as_deref(), Some(READY_OID));
     let saved = fixture.row("refused");
     assert_eq!(saved.status, "needs_human");
     assert_eq!(saved.agent_attempts, 0);

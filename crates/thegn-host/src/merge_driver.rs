@@ -620,7 +620,7 @@ fn drive_queue_with(
                             detail: &reason,
                         });
                         out.needs_human.push(item.branch.clone());
-                        break 'items;
+                        break;
                     }
                     Failure::Conflict {
                         paths,

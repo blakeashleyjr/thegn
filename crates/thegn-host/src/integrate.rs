@@ -823,20 +823,22 @@ fn regenerate_merge(
         // Regeneration only applies to an actual conflicted merge. A clean
         // merge or an infrastructure failure must not be mistaken for a
         // regenerated result based on ours.
-        let mut args = vec![
-            "-c",
-            "commit.gpgSign=false",
-            "merge",
-            "--no-commit",
-            "--no-ff",
-            theirs,
-        ];
         let overrides = scratch_driver_overrides(&tmp, overrides)?;
+        let mut args: Vec<String> = Vec::new();
         for item in &overrides {
-            args.push("-c");
-            args.push(item);
+            args.push("-c".into());
+            args.push(item.clone());
         }
-        let (status, log) = match run_driver_merge(&tmp, &args, timeout) {
+        args.extend([
+            "-c".into(),
+            "commit.gpgSign=false".into(),
+            "merge".into(),
+            "--no-commit".into(),
+            "--no-ff".into(),
+            theirs.into(),
+        ]);
+        let refs: Vec<&str> = args.iter().map(String::as_str).collect();
+        let (status, log) = match run_driver_merge(&tmp, &refs, timeout) {
             DriverRun::Completed { status, log } => (status, log),
             DriverRun::Failed { reason, log } => {
                 warn_driver_merge_failure(&reason, &log);
@@ -1934,6 +1936,11 @@ fn cancelled_report(
     report
 }
 
+struct PreparationFailure<'a> {
+    reason: &'a str,
+    label: &'a str,
+}
+
 fn history_failure_report(
     target: &str,
     original: &str,
@@ -1941,12 +1948,13 @@ fn history_failure_report(
     attempts: u32,
     error: anyhow::Error,
     earlier_diagnostics: &str,
+    failure: PreparationFailure<'_>,
 ) -> FoldReport {
     let mut diagnostics = earlier_diagnostics.to_owned();
-    let reason = "canonical Git history unavailable".to_string();
+    let reason = failure.reason.to_string();
     record_gate(
         &mut diagnostics,
-        "history admission",
+        failure.label,
         &GateVerdict::Error {
             reason: reason.clone(),
             log: tail(&format!("{error:#}"), 4000),
@@ -1965,44 +1973,6 @@ fn history_failure_report(
             class: Some(GateErrorClass::Preparation),
         },
         attempts,
-        &diagnostics,
-    );
-    report.unprepared = candidates
-        .iter()
-        .map(|branch| branch.name.clone())
-        .collect();
-    report
-}
-
-fn driver_probe_failure_report(
-    target: &str,
-    original: &str,
-    candidates: &[Branch],
-    error: anyhow::Error,
-) -> FoldReport {
-    let reason = "merge driver configuration unreadable".to_string();
-    let mut diagnostics = String::new();
-    record_gate(
-        &mut diagnostics,
-        "merge driver configuration",
-        &GateVerdict::Error {
-            reason: reason.clone(),
-            log: tail(&format!("{error:#}"), 4000),
-            phase: GatePhase::Preparation,
-            class: GateErrorClass::Preparation,
-        },
-    );
-    let mut report = build_report(
-        target,
-        original,
-        &empty_plan(original),
-        &[],
-        GateOutcome::Errored {
-            reason,
-            phase: Some(GatePhase::Preparation),
-            class: Some(GateErrorClass::Preparation),
-        },
-        0,
         &diagnostics,
     );
     report.unprepared = candidates
@@ -2125,11 +2095,17 @@ fn run_fold_admitted(
     let refused = match configured_merge_drivers(repo_root) {
         Ok(refused) => refused,
         Err(error) => {
-            return Ok(driver_probe_failure_report(
+            return Ok(history_failure_report(
                 &target_branch,
                 &original,
                 &candidates,
+                0,
                 error,
+                "",
+                PreparationFailure {
+                    reason: "merge driver configuration unreadable",
+                    label: "merge driver configuration",
+                },
             ));
         }
     };
@@ -2176,6 +2152,10 @@ fn run_fold_admitted(
                 cas_attempts,
                 error,
                 &diagnostics,
+                PreparationFailure {
+                    reason: "canonical Git history unavailable",
+                    label: "history admission",
+                },
             ));
         }
         // Re-read the tip each round so a CAS retry folds onto the moved branch.
@@ -2252,6 +2232,10 @@ fn run_fold_admitted(
                 cas_attempts,
                 error,
                 &diagnostics,
+                PreparationFailure {
+                    reason: "canonical Git history unavailable",
+                    label: "history admission",
+                },
             ));
         }
 
@@ -2319,7 +2303,7 @@ fn run_fold_admitted(
                         &diagnostics,
                     ));
                 }
-                return Ok(build_report(
+                let mut report = build_report(
                     &target_branch,
                     &original,
                     &plan,
@@ -2331,7 +2315,9 @@ fn run_fold_admitted(
                     },
                     cas_attempts,
                     &diagnostics,
-                ));
+                );
+                attach_driver_refusals(&mut report, &adapter.refusals);
+                return Ok(report);
             }
             if verdict.passed() {
                 GateOutcome::Passed
@@ -2383,7 +2369,7 @@ fn run_fold_admitted(
                                 &diagnostics,
                             ));
                         }
-                        return Ok(build_report(
+                        let mut report = build_report(
                             &target_branch,
                             &original,
                             &plan,
@@ -2395,7 +2381,9 @@ fn run_fold_admitted(
                             },
                             cas_attempts,
                             &diagnostics,
-                        ));
+                        );
+                        attach_driver_refusals(&mut report, &adapter.refusals);
+                        return Ok(report);
                     }
                 };
                 if let Some(off) = bisected {
@@ -2403,7 +2391,7 @@ fn run_fold_admitted(
                     gate_offenders.push(off);
                     continue; // re-fold without the offender
                 }
-                return Ok(build_report(
+                let mut report = build_report(
                     &target_branch,
                     &original,
                     &plan,
@@ -2411,9 +2399,11 @@ fn run_fold_admitted(
                     GateOutcome::Failed { offender: None },
                     cas_attempts,
                     &diagnostics,
-                ));
+                );
+                attach_driver_refusals(&mut report, &adapter.refusals);
+                return Ok(report);
             } else {
-                return Ok(build_report(
+                let mut report = build_report(
                     &target_branch,
                     &original,
                     &plan,
@@ -2421,7 +2411,9 @@ fn run_fold_admitted(
                     GateOutcome::Failed { offender: None },
                     cas_attempts,
                     &diagnostics,
-                ));
+                );
+                attach_driver_refusals(&mut report, &adapter.refusals);
+                return Ok(report);
             }
         } else {
             GateOutcome::Skipped
@@ -2452,6 +2444,10 @@ fn run_fold_admitted(
                 cas_attempts,
                 error,
                 &diagnostics,
+                PreparationFailure {
+                    reason: "canonical Git history unavailable",
+                    label: "history admission",
+                },
             ));
         }
         cas_attempts += 1;
@@ -2474,7 +2470,7 @@ fn run_fold_admitted(
                         class: GateErrorClass::Preparation,
                     },
                 );
-                return Ok(build_report(
+                let mut report = build_report(
                     &target_branch,
                     &original,
                     &plan,
@@ -2486,7 +2482,9 @@ fn run_fold_admitted(
                     },
                     cas_attempts,
                     &diagnostics,
-                ));
+                );
+                attach_driver_refusals(&mut report, &adapter.refusals);
+                return Ok(report);
             }
         };
         if advanced {
@@ -2540,7 +2538,7 @@ fn run_fold_admitted(
             return Ok(report);
         }
         if cas_attempts >= 5 {
-            return Ok(build_report(
+            let mut report = build_report(
                 &target_branch,
                 &original,
                 &plan,
@@ -2554,7 +2552,9 @@ fn run_fold_admitted(
                 },
                 cas_attempts,
                 &diagnostics,
-            ));
+            );
+            attach_driver_refusals(&mut report, &adapter.refusals);
+            return Ok(report);
         }
         // Lost the race — loop, re-read, re-fold.
     }
@@ -3032,7 +3032,10 @@ mod tests {
         fn commit(&self, file: &str, body: &str, msg: &str) {
             std::fs::write(self.dir.join(file), body).unwrap();
             git(&self.dir, &["add", file]);
-            git(&self.dir, &["commit", "-q", "-m", msg]);
+            git(
+                &self.dir,
+                &["-c", "commit.gpgsign=false", "commit", "-q", "-m", msg],
+            );
         }
         /// Create `branch` off main with one extra commit touching `file`.
         fn feature(&self, branch: &str, file: &str, body: &str) {
@@ -3710,7 +3713,7 @@ mod tests {
     }
 
     #[test]
-    fn configured_driver_is_refused_even_when_builtin_merge_is_clean() {
+    fn refused_driver_also_blocks_a_clean_driver_merge() {
         let repo = Repo::new("driver-clean-refusal");
         if !repo.history_supported_or_refused() {
             return;
@@ -3727,17 +3730,25 @@ mod tests {
         git(&repo.dir, &["checkout", "-q", "main"]);
         repo.commit("data.txt", "one\ntwo\nTHREE\n", "main edit");
         git(&repo.dir, &["config", "merge.takeours.driver", &driver]);
+        let original = repo.out(&["rev-parse", "main"]);
         let report = run_fold(&cfg(""), &repo.dir, repo.branch_set()).unwrap();
         assert!(
-            report.advanced,
-            "built-in clean merge should still land: {report:?}"
+            !report.advanced,
+            "driver-governed path must defer: {report:?}"
         );
-        assert_eq!(report.landed.len(), 1);
+        assert!(report.landed.is_empty(), "{report:?}");
+        assert_eq!(report.deferred.len(), 1, "{report:?}");
+        assert!(
+            report.deferred[0]
+                .driver_refusal
+                .as_deref()
+                .is_some_and(|reason| reason.contains("data.txt") && reason.contains("takeours"))
+        );
         assert!(
             !counter.exists(),
             "configured custom driver ran during merge-tree"
         );
-        assert_eq!(repo.out(&["show", "main:data.txt"]), "ONE\ntwo\nTHREE");
+        assert_eq!(repo.out(&["rev-parse", "main"]), original);
     }
 
     #[test]
@@ -5156,6 +5167,149 @@ mod tests {
         assert_eq!(repo.out(&["show", "main:Cargo.lock"]), "regenerated");
         let files = repo.out(&["ls-tree", "-r", "--name-only", "main"]);
         assert!(files.contains("a.txt"), "{files}");
+    }
+
+    #[test]
+    fn configured_driver_on_unrelated_path_still_regenerates_lockfile_conflict() {
+        let repo = regen_repo("regen-unrelated-driver");
+        if !repo.history_supported_or_refused() {
+            return;
+        }
+        git(
+            &repo.dir,
+            &["config", "merge.unrelated.driver", "false %O %A %B %L %P"],
+        );
+        repo.commit(
+            ".gitattributes",
+            "unrelated.txt merge=unrelated\n",
+            "unrelated driver path",
+        );
+        let mut config = cfg("");
+        config.regenerate_command = "printf 'regenerated\\n' > Cargo.lock".into();
+
+        let report = run_fold(&config, &repo.dir, repo.branch_set()).unwrap();
+        assert!(
+            report.advanced,
+            "lockfile conflict should regenerate: {report:?}"
+        );
+        assert_eq!(repo.out(&["show", "main:Cargo.lock"]), "regenerated");
+        assert!(report.deferred.is_empty(), "{report:?}");
+    }
+
+    #[test]
+    fn driver_config_probe_failure_holds_every_candidate() {
+        let repo = Repo::new("driver-probe-failure");
+        if !repo.history_supported_or_refused() {
+            return;
+        }
+        repo.feature("feat", "feature.txt", "feature\n");
+        let original = repo.out(&["rev-parse", "main"]);
+        use std::io::Write;
+        let mut config_file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(repo.dir.join(".git/config"))
+            .unwrap();
+        writeln!(config_file, "\n[merge \"bad=name\"]\n\tdriver = false").unwrap();
+        let candidates = repo.branch_set();
+        let report = run_fold(&cfg(""), &repo.dir, candidates.clone()).unwrap();
+        assert!(
+            !report.advanced,
+            "probe failure must hold the fold: {report:?}"
+        );
+        assert_eq!(
+            report.unprepared,
+            candidates
+                .iter()
+                .map(|branch| branch.name.clone())
+                .collect::<Vec<_>>()
+        );
+        assert!(
+            matches!(
+                report.gate,
+                GateOutcome::Errored {
+                    class: Some(GateErrorClass::Preparation),
+                    ..
+                }
+            ),
+            "{report:?}"
+        );
+        assert_eq!(repo.out(&["rev-parse", "main"]), original);
+        assert!(matches!(
+            attempt_land(
+                &cfg(""),
+                &repo.dir,
+                "feat",
+                &GitLoc::Local(repo.dir.clone())
+            )
+            .unwrap(),
+            AttemptOutcome::GateError {
+                class: GateErrorClass::Preparation,
+                phase: GatePhase::Preparation,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "the fixture records a rerere resolution"
+    )]
+    fn rerere_without_drivers_still_uses_the_worktree_merge() {
+        let repo = Repo::new("rerere-no-drivers");
+        if !repo.history_supported_or_refused() {
+            return;
+        }
+        repo.commit("data.txt", "base\n", "seed data");
+        git(&repo.dir, &["checkout", "-q", "-b", "feat"]);
+        repo.commit("data.txt", "feature\n", "feature edit");
+        git(&repo.dir, &["checkout", "-q", "main"]);
+        repo.commit("data.txt", "main\n", "main edit");
+        git(&repo.dir, &["config", "rerere.enabled", "true"]);
+        let merge = util::git_cmd(&repo.dir)
+            .args(["merge", "--no-commit", "--no-ff", "feat"])
+            .output()
+            .unwrap();
+        assert_eq!(
+            merge.status.code(),
+            Some(1),
+            "fixture needs a recorded conflict"
+        );
+        std::fs::write(repo.dir.join("data.txt"), "rerere resolution\n").unwrap();
+        git(&repo.dir, &["add", "data.txt"]);
+        git(
+            &repo.dir,
+            &[
+                "-c",
+                "commit.gpgsign=false",
+                "commit",
+                "-q",
+                "-m",
+                "record resolution",
+            ],
+        );
+        git(&repo.dir, &["reset", "-q", "--hard", "HEAD^"]);
+        let mut config = cfg("");
+        config.rerere = true;
+        assert!(configured_merge_drivers(&repo.dir).unwrap().is_empty());
+        let report = run_fold(&config, &repo.dir, repo.branch_set()).unwrap();
+        assert!(
+            report
+                .deferred
+                .iter()
+                .all(|item| item.driver_refusal.is_none()),
+            "{report:?}"
+        );
+        assert!(
+            report.advanced,
+            "the recorded resolution should apply: {report:?}"
+        );
+        assert_eq!(repo.out(&["show", "main:data.txt"]), "rerere resolution");
+        assert!(
+            !repo
+                .out(&["worktree", "list", "--porcelain"])
+                .contains("tg-drivermerge-")
+        );
     }
 
     #[test]
