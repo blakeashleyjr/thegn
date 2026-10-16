@@ -20,6 +20,7 @@ mod net_medium;
 mod procs;
 mod sample;
 mod thermal;
+mod vmstat;
 
 /// Run a helper under the shared bounded runner (deadline, stdout cap, process
 /// group kill, guaranteed reap). Errors are human-readable.
@@ -56,8 +57,10 @@ pub struct StatsSnapshot {
     pub cpu_freq_mhz: Option<u64>,
     /// CPU/package temperature in °C (the hottest CPU-ish sensor).
     pub cpu_temp_c: Option<f32>,
-    /// Memory as (used GiB, total GiB).
+    /// Memory as (used GiB, total GiB); used is total minus available.
     pub mem_gib: Option<(f32, f32)>,
+    /// Truly free memory in GiB (MemFree on Linux; excludes reclaimable cache).
+    pub mem_free_gib: Option<f32>,
     /// Swap as (used GiB, total GiB). Absent when there is no swap.
     pub swap_gib: Option<(f32, f32)>,
     /// Pages reclaimed **synchronously** (`pgsteal_direct`), per second.
@@ -360,6 +363,9 @@ mod tests {
         }
         if let Some((u, t)) = snap.mem_gib {
             assert!(t >= 0.0 && u <= t + 0.001, "mem {u}/{t}");
+        }
+        if let (Some(free), Some((_, total))) = (snap.mem_free_gib, snap.mem_gib) {
+            assert!(free <= total + 0.001, "free mem {free}/{total}");
         }
         if let Some((u, t)) = snap.swap_gib {
             assert!(t >= 0.0 && u <= t + 0.001, "swap {u}/{t}");
