@@ -580,6 +580,11 @@ impl MonitorOverlay {
         self.tab == MonitorTab::Containers && !self.paused
     }
 
+    /// True while the monitor is showing the per-container rows.
+    pub fn shows_containers(&self) -> bool {
+        self.tab == MonitorTab::Containers
+    }
+
     pub fn prefs(&self) -> &MonitorPrefs {
         &self.prefs
     }
