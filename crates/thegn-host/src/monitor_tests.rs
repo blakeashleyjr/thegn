@@ -1962,6 +1962,67 @@ fn memory_tab_distinguishes_available_from_truly_free_memory() {
     );
 }
 
+#[test]
+#[expect(
+    clippy::disallowed_methods,
+    reason = "the test reaps its harmless child process"
+)]
+fn process_confirmation_refuses_changed_live_process_identity() {
+    use std::process::Command;
+
+    struct FixtureChild(std::process::Child);
+
+    impl Drop for FixtureChild {
+        fn drop(&mut self) {
+            match self.0.try_wait() {
+                Ok(Some(_)) => return,
+                Ok(None) => {}
+                Err(error) => {
+                    tracing::debug!(%error, "could not check monitor fixture before cleanup")
+                }
+            }
+            if let Err(error) = self.0.kill() {
+                tracing::debug!(%error, "could not kill monitor fixture during cleanup");
+            }
+            if let Err(error) = self.0.wait() {
+                tracing::debug!(%error, "could not reap monitor fixture during cleanup");
+            }
+        }
+    }
+
+    let mut child = FixtureChild(
+        Command::new(std::env::current_exe().expect("test executable path"))
+            .args(["--exact", "monitor::tests::identity_sleep_fixture"])
+            .arg("--nocapture")
+            .arg("--test-threads=1")
+            .env("THEGN_SIGNAL_IDENTITY_FIXTURE", "1")
+            .spawn()
+            .expect("spawn identity fixture"),
+    );
+    let pid = child.0.id();
+    let start_time = 1;
+    let h = TelemetryHistory::default();
+    let screen = Rect::full(100, 24);
+    let mut m = model_with_n_procs(1);
+    m.procs.procs[0].pid = pid;
+    m.procs.procs[0].start_time = start_time;
+    let mut ov = open_tab(MonitorTab::Procs, &m, &h, screen);
+    ch(&mut ov, 'x');
+    ch(&mut ov, 'y');
+    assert!(ov.status.as_deref().unwrap().contains("process changed"));
+    assert!(ov.last_termed.is_none());
+    assert!(child.0.try_wait().expect("check child status").is_none());
+    child.0.kill().expect("kill fixture child after mismatch");
+    child.0.wait().expect("reap fixture child after mismatch");
+}
+
+#[test]
+fn identity_sleep_fixture() {
+    if std::env::var_os("THEGN_SIGNAL_IDENTITY_FIXTURE").is_some() {
+        std::thread::sleep(std::time::Duration::from_secs(30));
+    }
+}
+
 #[path = "monitor_cache_tests.rs"]
 mod invalidation_tests;
 

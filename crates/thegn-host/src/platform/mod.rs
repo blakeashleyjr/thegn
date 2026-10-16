@@ -155,7 +155,7 @@ pub fn terminate_proxy_pid(_pid: u32, _expected_start_time: Option<u64>) -> bool
 /// Two rungs only — a graceful ask, then a hard stop — matching the tab's
 /// confirm flow (SIGTERM first, SIGKILL only on a second explicit confirmation).
 /// Windows has no signals, so both map to `TerminateProcess` (a hard kill) and
-/// the confirm text says so. See [`signal_pid`].
+/// the confirm text says so. See [`signal_identity()`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProcSignal {
     /// Graceful termination request (unix `SIGTERM`; Windows hard terminate).
@@ -163,6 +163,9 @@ pub enum ProcSignal {
     /// Forceful kill (unix `SIGKILL`; Windows hard terminate).
     Kill,
 }
+
+mod signal_identity;
+pub use signal_identity::{SignalError, signal_identity};
 
 /// Live per-process introspection (pane cwd / foreground job / argv). Unlike the
 /// rest of this module the split is Linux-vs-macOS-vs-other rather than
