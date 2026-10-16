@@ -501,7 +501,7 @@ impl Display for PluginApiError {
             }
             Self::UnsupportedIo(scheme) => write!(f, "I/O scheme is unsupported: {scheme}"),
             Self::QuotaExceeded { what, size, limit } => {
-                write!(f, "plugin quota exceeded: {what} ({size} > {limit} bytes)")
+                write!(f, "plugin quota exceeded: {what} ({size} > {limit})")
             }
         }
     }
@@ -978,7 +978,11 @@ impl PluginRuntime {
             return Err(quota_error("view spans", spans, MAX_VIEW_SPANS));
         }
         if text_bytes > MAX_VIEW_TEXT_BYTES {
-            return Err(quota_error("view text", text_bytes, MAX_VIEW_TEXT_BYTES));
+            return Err(quota_error(
+                "view text bytes",
+                text_bytes,
+                MAX_VIEW_TEXT_BYTES,
+            ));
         }
         Ok(self.views.update(surface, view))
     }
@@ -1016,7 +1020,11 @@ impl PluginRuntime {
                 ));
             }
             Ok(size) if size > MAX_EVENT_PAYLOAD_BYTES => {
-                return Err(quota_error("event payload", size, MAX_EVENT_PAYLOAD_BYTES));
+                return Err(quota_error(
+                    "event payload bytes",
+                    size,
+                    MAX_EVENT_PAYLOAD_BYTES,
+                ));
             }
             _ => {}
         }
@@ -1092,11 +1100,21 @@ impl PluginRuntime {
         let cap = Capability::new("state", plugin.as_str());
         self.audit(plugin, cap, "state.set")?;
         if key.len() > MAX_STATE_KEY_BYTES {
-            return Err(quota_error("state key", key.len(), MAX_STATE_KEY_BYTES));
+            return Err(quota_error(
+                "state key bytes",
+                key.len(),
+                MAX_STATE_KEY_BYTES,
+            ));
         }
         let value_bytes = match json_footprint(&val, MAX_PLUGIN_JSON_DEPTH) {
             Ok(size) if size <= MAX_STATE_VALUE_BYTES => size,
-            Ok(size) => return Err(quota_error("state value", size, MAX_STATE_VALUE_BYTES)),
+            Ok(size) => {
+                return Err(quota_error(
+                    "state value bytes",
+                    size,
+                    MAX_STATE_VALUE_BYTES,
+                ));
+            }
             Err(QuotaBreach::Depth) => {
                 return Err(quota_error(
                     "state value depth",
@@ -1119,7 +1137,11 @@ impl PluginRuntime {
             .saturating_sub(old_bytes)
             .saturating_add(entry_bytes);
         if new_total > MAX_STATE_TOTAL_BYTES {
-            return Err(quota_error("state total", new_total, MAX_STATE_TOTAL_BYTES));
+            return Err(quota_error(
+                "state total bytes",
+                new_total,
+                MAX_STATE_TOTAL_BYTES,
+            ));
         }
         self.state_bytes = new_total;
         self.state.insert(state_key, (val, entry_bytes));
@@ -3579,6 +3601,18 @@ mod runtime_quota_tests {
 
     fn quota(error: PluginApiError) -> bool {
         matches!(error, PluginApiError::QuotaExceeded { .. })
+    }
+
+    #[test]
+    fn quota_error_display_uses_units_only_for_byte_measurements() {
+        assert_eq!(
+            quota_error("view rows", 257, MAX_VIEW_ROWS).to_string(),
+            "plugin quota exceeded: view rows (257 > 256)"
+        );
+        assert_eq!(
+            quota_error("state value bytes", 70_000, MAX_STATE_VALUE_BYTES).to_string(),
+            "plugin quota exceeded: state value bytes (70000 > 65536)"
+        );
     }
 
     #[test]
