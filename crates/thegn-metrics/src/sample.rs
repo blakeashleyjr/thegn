@@ -389,36 +389,37 @@ impl StatsSampler {
                 self.prev_disk = now;
             }
             #[cfg(not(target_os = "linux"))]
-            self.disks.refresh(false);
-            #[cfg(not(target_os = "linux"))]
-            self.last_disks = crate::disk_aggregate::dedupe_by_name(
-                self.disks
-                    .iter()
-                    .map(|d| {
-                        let total = d.total_space();
-                        let free_pct = if total > 0 {
-                            ((d.available_space() as f64 / total as f64) * 100.0).round() as u8
-                        } else {
-                            0
-                        };
-                        let usage = d.usage();
-                        DiskInfo {
-                            name: d.name().to_string_lossy().into_owned(),
-                            mount: d.mount_point().to_string_lossy().into_owned(),
-                            free_pct: free_pct.min(100),
-                            read_bps: (usage.read_bytes as f64 / dt_disk) as u64,
-                            write_bps: (usage.written_bytes as f64 / dt_disk) as u64,
-                            kind: match d.kind() {
-                                sysinfo::DiskKind::HDD => DiskKind::Hdd,
-                                sysinfo::DiskKind::SSD => DiskKind::Ssd,
-                                _ => DiskKind::Unknown,
-                            },
-                            extra_mounts: 0,
-                        }
-                    })
-                    .collect(),
-            )
-            .into();
+            {
+                self.disks.refresh(false);
+                self.last_disks = crate::disk_aggregate::dedupe_by_name(
+                    self.disks
+                        .iter()
+                        .map(|d| {
+                            let total = d.total_space();
+                            let free_pct = if total > 0 {
+                                ((d.available_space() as f64 / total as f64) * 100.0).round() as u8
+                            } else {
+                                0
+                            };
+                            let usage = d.usage();
+                            DiskInfo {
+                                name: d.name().to_string_lossy().into_owned(),
+                                mount: d.mount_point().to_string_lossy().into_owned(),
+                                free_pct: free_pct.min(100),
+                                read_bps: (usage.read_bytes as f64 / dt_disk) as u64,
+                                write_bps: (usage.written_bytes as f64 / dt_disk) as u64,
+                                kind: match d.kind() {
+                                    sysinfo::DiskKind::HDD => DiskKind::Hdd,
+                                    sysinfo::DiskKind::SSD => DiskKind::Ssd,
+                                    _ => DiskKind::Unknown,
+                                },
+                                extra_mounts: 0,
+                            }
+                        })
+                        .collect(),
+                )
+                .into();
+            }
             #[cfg(not(target_os = "linux"))]
             {
                 self.last_disk_io = if self.last_disks.is_empty() {
