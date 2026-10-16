@@ -588,6 +588,7 @@ mod tests {
                 read_bps: 0,
                 write_bps: 0,
                 kind: thegn_metrics::DiskKind::Ssd,
+                extra_mounts: 0,
             },
             thegn_metrics::DiskInfo {
                 name: "device-a".into(),
@@ -596,8 +597,10 @@ mod tests {
                 read_bps: 0,
                 write_bps: 0,
                 kind: thegn_metrics::DiskKind::Ssd,
+                extra_mounts: 0,
             },
-        ];
+        ]
+        .into();
         let ctx = SectionCtx {
             model: &model,
             ui: &ui,
@@ -663,14 +666,17 @@ mod tests {
     #[test]
     fn disk_free_percentage_above_one_hundred_saturates_used_percentage() {
         let (mut model, ui) = fixture(0);
-        model.stats.disks.push(thegn_metrics::DiskInfo {
+        let mut disks = model.stats.disks.to_vec();
+        disks.push(thegn_metrics::DiskInfo {
             name: "device-a".into(),
             mount: "/".into(),
             free_pct: 120,
             read_bps: 0,
             write_bps: 0,
             kind: thegn_metrics::DiskKind::Ssd,
+            extra_mounts: 0,
         });
+        model.stats.disks = disks.into();
         let rendered = text(&content(&SectionCtx {
             model: &model,
             ui: &ui,

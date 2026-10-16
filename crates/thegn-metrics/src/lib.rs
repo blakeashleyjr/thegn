@@ -13,6 +13,7 @@
 
 mod battery;
 mod coverage;
+mod disk_aggregate;
 mod gpu;
 mod gpu_exec;
 mod gpu_monitor;
@@ -104,8 +105,10 @@ pub struct StatsSnapshot {
     /// Worktrees' filesystem capacity as (total bytes, available bytes). Absent
     /// on non-unix targets or a `statvfs` error, exactly like `disk_free_pct`.
     pub disk_bytes: Option<(u64, u64)>,
-    /// All mounted physical disks (name, mount, free %, IO rates, kind).
-    pub disks: Vec<DiskInfo>,
+    /// Physical disk read/write bytes per second. None means unobserved, never zero.
+    pub disk_io: Option<(u64, u64)>,
+    /// One row per filesystem, shared between fast samples.
+    pub disks: std::sync::Arc<[DiskInfo]>,
     /// Temperature sensors as (label, °C). Drives the telemetry thermal row.
     pub temps: Vec<(String, f32)>,
     /// Load average (1, 5, 15 min). `None` on platforms without it (Windows).
@@ -188,6 +191,8 @@ pub struct DiskInfo {
     pub read_bps: u64,
     pub write_bps: u64,
     pub kind: DiskKind,
+    /// Other mounts of the same filesystem/device.
+    pub extra_mounts: u32,
 }
 
 /// Storage medium, mirrored from sysinfo so consumers needn't depend on it.
@@ -377,7 +382,7 @@ mod tests {
             assert!(total > 0, "disk total {total}");
             assert!(avail <= total, "disk avail {avail} > total {total}");
         }
-        for d in &snap.disks {
+        for d in snap.disks.iter() {
             assert!(d.free_pct <= 100, "disk {} free {}", d.name, d.free_pct);
         }
         for (label, c) in &snap.temps {

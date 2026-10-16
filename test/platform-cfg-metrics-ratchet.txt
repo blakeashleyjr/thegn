@@ -8,6 +8,8 @@
 # crates/thegn-metrics/src/platform_ratchet_tests.rs.
 
 battery.rs
+# disk_aggregate.rs — Linux /proc/diskstats + mountinfo reader; sysinfo dedupe elsewhere.
+disk_aggregate.rs
 # gpu.rs — Linux sysfs (amdgpu/i915) + nvidia-smi vs macOS ioreg accelerator stats.
 gpu.rs
 # gpu_exec.rs — unix-only fake-helper tests and Linux /proc test helpers.
