@@ -105,7 +105,7 @@ fn drain(rx: &Receiver<Message>, run: &mut Run, limits: &Limits) -> Option<Which
     }
 }
 
-fn wait(child: Child) -> Leader {
+fn wait(mut child: Child) -> Leader {
     match child.wait() {
         Ok(status) => Leader::Reaped(status),
         Err(error) => Leader::ReapFailed(error),
@@ -119,7 +119,7 @@ fn detach(child: Child) -> Leader {
         .name("thegn-proc-reap".to_owned())
         .spawn(move || {
             if let Ok(mut slot) = worker_owner.lock()
-                && let Some(child) = slot.take()
+                && let Some(mut child) = slot.take()
             {
                 match child.wait() {
                     Ok(_status) => {}
@@ -214,7 +214,6 @@ pub(super) fn run(cmd: &mut Command, limits: &Limits, cancel: &AtomicBool) -> Ru
             }
             if (run.stdout.eof || matches!(limits.stdout, Stream::Null))
                 && (run.stderr.eof || matches!(limits.stderr, Stream::Null))
-                && limits.quiesce_after_leader.is_none()
             {
                 break;
             }
@@ -251,10 +250,10 @@ pub(super) fn run(cmd: &mut Command, limits: &Limits, cancel: &AtomicBool) -> Ru
         End::TimedOut | End::Cancelled | End::OutputLimit(_) | End::Supervise(_)
     ) {
         let kill_result = child.as_mut().expect("child retained until reap").kill();
-        if let Err(error) = kill_result {
-            if error.kind() != io::ErrorKind::InvalidInput {
-                run.leader = Leader::ReapFailed(error);
-            }
+        if let Err(error) = kill_result
+            && error.kind() != io::ErrorKind::InvalidInput
+        {
+            run.leader = Leader::ReapFailed(error);
         }
         let settle = Instant::now();
         loop {
@@ -313,4 +312,27 @@ pub(super) fn run(cmd: &mut Command, limits: &Limits, cancel: &AtomicBool) -> Ru
     }
     aggregate_fit(&mut run.stdout, &mut run.stderr, limits.aggregate_tail_cap);
     run
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn clean_exit_with_eof_does_not_wait_for_quiesce() {
+        let mut cmd = Command::new("cmd.exe");
+        cmd.args(["/C", "echo done"]);
+        let limits = Limits {
+            stdout: Stream::Tail { cap: 64 },
+            stderr: Stream::Tail { cap: 64 },
+            quiesce_after_leader: Some(Duration::from_secs(10)),
+            ..Limits::silent(Duration::from_secs(20))
+        };
+        let started = Instant::now();
+        let result = run(&mut cmd, &limits, &AtomicBool::new(false));
+        assert!(result.success());
+        assert!(result.stdout.eof);
+        assert!(result.stderr.eof);
+        assert!(started.elapsed() < Duration::from_secs(2));
+    }
 }

@@ -162,7 +162,7 @@ impl Run {
     /// The reaped leader status, if any.
     pub fn exit_status(&self) -> Option<ExitStatus> {
         match &self.leader {
-            Leader::Reaped(status) => Some(status.clone()),
+            Leader::Reaped(status) => Some(*status),
             _ => None,
         }
     }

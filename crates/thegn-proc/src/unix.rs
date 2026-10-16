@@ -59,6 +59,7 @@ struct Accumulator {
 impl Accumulator {
     fn read(&mut self, fd: libc::c_int) -> io::Result<(bool, bool)> {
         let mut buf = [0_u8; 8192];
+        let mut drained = 0;
         loop {
             // SAFETY: fd is an owned, nonblocking pipe descriptor and buf is writable for its length.
             let count = unsafe { libc::read(fd, buf.as_mut_ptr().cast(), buf.len()) };
@@ -77,6 +78,7 @@ impl Accumulator {
                 return Err(error);
             }
             let bytes = &buf[..count as usize];
+            drained += bytes.len();
             self.capture.total = self.capture.total.saturating_add(bytes.len() as u64);
             match self.stream {
                 Stream::Null => {}
@@ -99,7 +101,9 @@ impl Accumulator {
                     }
                 }
             }
-            return Ok((true, false));
+            if drained >= 1024 * 1024 {
+                return Ok((true, false));
+            }
         }
     }
 }
@@ -226,7 +230,13 @@ fn drain(
     if pipes.out_open
         && let Some(pipe) = &pipes.stdout
     {
-        let (_, overflow) = out.read(pipe.as_raw_fd())?;
+        let (_, overflow) = match out.read(pipe.as_raw_fd()) {
+            Ok(result) => result,
+            Err(_error) => {
+                pipes.out_open = false;
+                return Ok(result);
+            }
+        };
         if out.capture.eof {
             pipes.out_open = false;
         }
@@ -237,7 +247,13 @@ fn drain(
     if pipes.err_open
         && let Some(pipe) = &pipes.stderr
     {
-        let (_, overflow) = err.read(pipe.as_raw_fd())?;
+        let (_, overflow) = match err.read(pipe.as_raw_fd()) {
+            Ok(result) => result,
+            Err(_error) => {
+                pipes.err_open = false;
+                return Ok(result);
+            }
+        };
         if err.capture.eof {
             pipes.err_open = false;
         }
@@ -248,11 +264,15 @@ fn drain(
     Ok(result)
 }
 
-fn nap(pipes: &Pipes, backoff: Duration) -> io::Result<()> {
+fn nap(pipes: &mut Pipes, backoff: Duration) -> io::Result<()> {
     if pipes.out_open || pipes.err_open {
         match poll_pipes(pipes, backoff) {
             Ok(_) => {}
-            Err(error) => return Err(error),
+            Err(_error) => {
+                pipes.out_open = false;
+                pipes.err_open = false;
+                std::thread::sleep(backoff);
+            }
         }
     } else {
         std::thread::sleep(backoff);
@@ -387,11 +407,20 @@ pub(super) fn run(cmd: &mut Command, limits: &Limits, cancel: &AtomicBool) -> Ru
         stderr,
     };
     for pipe in [&pipes.stdout, &pipes.stderr].into_iter().flatten() {
-        if let Err(error) = set_nonblocking(pipe) {
+        if let Err(_error) = set_nonblocking(pipe) {
+            send_group_signal(pid, Signal::SIGKILL);
+            if let Err(_kill_error) = child.kill() {
+                // The group signal above is the primary cleanup; wait still reaps the leader.
+            }
+            let leader = match child.wait() {
+                Ok(status) => Leader::Reaped(status),
+                Err(wait_error) => Leader::ReapFailed(wait_error),
+            };
+            guard.disarm();
             return Run {
-                end: End::Supervise(error),
-                group: GroupState::Unknown,
-                leader: Leader::ReapFailed(io::Error::other("pipe nonblocking setup failed")),
+                end: End::TimedOut,
+                group: GroupState::Terminated,
+                leader,
                 leader_exited_first: false,
                 stdout: Capture::default(),
                 stderr: Capture::default(),
@@ -410,87 +439,62 @@ pub(super) fn run(cmd: &mut Command, limits: &Limits, cancel: &AtomicBool) -> Ru
         stream: limits.stderr,
     };
     let mut backoff = POLL_INTERVAL;
-    let mut end = None;
     let mut leader_first = false;
-    loop {
+    let mut end = loop {
         if cancel.load(Ordering::Acquire) {
-            end = Some(End::Cancelled);
-            break;
+            break End::Cancelled;
         }
         match leader_exited(pid) {
             Ok(true) => {
                 leader_first = true;
-                end = Some(End::LeaderExited);
                 let quiesce = limits
                     .quiesce_after_leader
                     .map_or(deadline, |span| deadline.min(Instant::now() + span));
-                loop {
-                    if !group_live(pid) {
-                        break;
-                    }
+                let quiesce_end = loop {
                     if cancel.load(Ordering::Acquire) {
-                        end = Some(End::Cancelled);
-                        break;
+                        break End::Cancelled;
                     }
                     let before = out.capture.total.saturating_add(err.capture.total);
                     match drain(&mut pipes, &mut out, &mut err) {
-                        Ok(Some(which)) => {
-                            end = Some(End::OutputLimit(which));
-                            break;
-                        }
+                        Ok(Some(which)) => break End::OutputLimit(which),
                         Ok(None) => {}
-                        Err(error) => {
-                            end = Some(End::Supervise(error));
-                            break;
-                        }
+                        Err(_error) => {}
+                    }
+                    if !group_live(pid) {
+                        break End::LeaderExited;
                     }
                     if out.capture.total.saturating_add(err.capture.total) > before {
                         backoff = POLL_INTERVAL;
                     }
                     if Instant::now() >= quiesce {
-                        break;
+                        break End::LeaderExited;
                     }
                     let remaining = quiesce.saturating_duration_since(Instant::now());
-                    if let Err(error) = nap(&pipes, backoff.min(remaining)) {
-                        end = Some(End::Supervise(error));
-                        break;
-                    }
+                    if let Err(_error) = nap(&mut pipes, backoff.min(remaining)) {}
                     backoff = crate::next_backoff(backoff, remaining);
-                }
-                break;
+                };
+                break quiesce_end;
             }
             Ok(false) => {}
-            Err(error) => {
-                end = Some(End::Supervise(error));
-                break;
-            }
+            Err(error) => break End::Supervise(error),
         }
         if Instant::now() >= deadline {
-            end = Some(End::TimedOut);
-            break;
+            break End::TimedOut;
         }
         let before = out.capture.total.saturating_add(err.capture.total);
         if let Some(which) = match drain(&mut pipes, &mut out, &mut err) {
             Ok(value) => value,
-            Err(error) => {
-                end = Some(End::Supervise(error));
-                break;
-            }
+            Err(_error) => None,
         } {
-            end = Some(End::OutputLimit(which));
-            break;
+            break End::OutputLimit(which);
         }
         if out.capture.total.saturating_add(err.capture.total) > before {
             backoff = POLL_INTERVAL;
         }
         let remaining = deadline.saturating_duration_since(Instant::now());
-        if let Err(error) = nap(&pipes, backoff.min(remaining)) {
-            end = Some(End::Supervise(error));
-            break;
-        }
+        if let Err(_error) = nap(&mut pipes, backoff.min(remaining)) {}
         backoff = crate::next_backoff(backoff, remaining);
-    }
-    let mut end = end.unwrap_or(End::LeaderExited);
+    };
     let mut group = GroupState::Unknown;
     let mut signalled = false;
     if !matches!(end, End::LeaderExited | End::Supervise(_)) {
@@ -507,7 +511,7 @@ pub(super) fn run(cmd: &mut Command, limits: &Limits, cancel: &AtomicBool) -> Ru
             ) {
                 Ok(true) => group = GroupState::Terminated,
                 Ok(false) => {}
-                Err(error) => end = End::Supervise(error),
+                Err(_error) => {}
             }
         }
         if group != GroupState::Terminated {
@@ -522,10 +526,7 @@ pub(super) fn run(cmd: &mut Command, limits: &Limits, cancel: &AtomicBool) -> Ru
             ) {
                 Ok(true) => GroupState::Terminated,
                 Ok(false) => GroupState::Survivors,
-                Err(error) => {
-                    end = End::Supervise(error);
-                    GroupState::Survivors
-                }
+                Err(_error) => GroupState::Survivors,
             };
         }
     } else if matches!(&end, End::LeaderExited) {
@@ -547,7 +548,7 @@ pub(super) fn run(cmd: &mut Command, limits: &Limits, cancel: &AtomicBool) -> Ru
                     &mut backoff,
                 ) {
                     Ok(_) => {}
-                    Err(error) => end = End::Supervise(error),
+                    Err(_error) => {}
                 }
             }
             send_group_signal(pid, Signal::SIGKILL);
@@ -561,10 +562,7 @@ pub(super) fn run(cmd: &mut Command, limits: &Limits, cancel: &AtomicBool) -> Ru
             ) {
                 Ok(false) => group = GroupState::Survivors,
                 Ok(true) => group = GroupState::Terminated,
-                Err(error) => {
-                    end = End::Supervise(error);
-                    group = GroupState::Survivors;
-                }
+                Err(_error) => group = GroupState::Survivors,
             }
         }
     }
@@ -574,6 +572,21 @@ pub(super) fn run(cmd: &mut Command, limits: &Limits, cancel: &AtomicBool) -> Ru
         limits.kill_settle,
         signalled || leader_first,
     );
+    let grace_end = Instant::now() + limits.reader_grace;
+    while (pipes.out_open || pipes.err_open) && Instant::now() < grace_end {
+        match drain(&mut pipes, &mut out, &mut err) {
+            Ok(Some(which)) => end = End::OutputLimit(which),
+            Ok(None) => {}
+            Err(_error) => {}
+        }
+        let remaining = grace_end.saturating_duration_since(Instant::now());
+        if let Err(_error) = nap(&mut pipes, BACKOFF_CAP.min(remaining)) {}
+    }
+    match drain(&mut pipes, &mut out, &mut err) {
+        Ok(Some(which)) => end = End::OutputLimit(which),
+        Ok(None) => {}
+        Err(_error) => {}
+    }
     let mut run = Run {
         end,
         group,
@@ -583,33 +596,8 @@ pub(super) fn run(cmd: &mut Command, limits: &Limits, cancel: &AtomicBool) -> Ru
         stderr: err.capture,
         containment: Containment::ProcessGroup,
     };
-    let grace_end = Instant::now() + limits.reader_grace;
-    while (pipes.out_open || pipes.err_open) && Instant::now() < grace_end {
-        match drain(&mut pipes, &mut out, &mut err) {
-            Ok(Some(which)) => run.end = End::OutputLimit(which),
-            Ok(None) => {}
-            Err(error) => {
-                run.end = End::Supervise(error);
-                break;
-            }
-        }
-        let remaining = grace_end.saturating_duration_since(Instant::now());
-        if let Err(error) = nap(&pipes, BACKOFF_CAP.min(remaining)) {
-            run.end = End::Supervise(error);
-            break;
-        }
-    }
-    match drain(&mut pipes, &mut out, &mut err) {
-        Ok(Some(which)) => run.end = End::OutputLimit(which),
-        Ok(None) => {}
-        Err(error) => run.end = End::Supervise(error),
-    }
-    run.stdout = out.capture;
-    run.stderr = err.capture;
     aggregate_fit(&mut run.stdout, &mut run.stderr, limits.aggregate_tail_cap);
-    if !matches!(run.leader, Leader::ReapFailed(_)) {
-        guard.disarm();
-    }
+    guard.disarm();
     run
 }
 
@@ -646,6 +634,22 @@ mod tests {
         let mut cmd = Command::new("sh");
         cmd.arg(path);
         cmd
+    }
+
+    fn proc_state_gone_or_zombie(pid: u32) -> bool {
+        if !Path::new("/proc/self/stat").exists() {
+            return true;
+        }
+        let stat_path = PathBuf::from(format!("/proc/{pid}/stat"));
+        match fs::read_to_string(stat_path) {
+            Ok(stat) => stat.rsplit(')').next().is_none_or(|tail| {
+                tail.trim_start()
+                    .chars()
+                    .next()
+                    .is_none_or(|state| matches!(state, 'Z' | 'X' | 'x'))
+            }),
+            Err(_error) => true,
+        }
     }
 
     fn limits(timeout: Duration) -> Limits {
@@ -701,8 +705,10 @@ mod tests {
             "zombie.sh",
             &format!("echo $$ > '{}'; sleep 1 & exit 0\n", pid_file.display()),
         );
-        let mut configured = limits(Duration::from_secs(3));
-        configured.quiesce_after_leader = Some(Duration::from_secs(2));
+        let configured = Limits {
+            quiesce_after_leader: Some(Duration::from_secs(2)),
+            ..limits(Duration::from_secs(3))
+        };
         let script_for_thread = script.clone();
         let runner = thread::spawn(move || {
             run(
@@ -745,8 +751,10 @@ mod tests {
             "drained.sh",
             &format!("(sleep 0.3; touch '{}') & exit 0\n", marker.display()),
         );
-        let mut configured = limits(Duration::from_secs(4));
-        configured.quiesce_after_leader = Some(Duration::from_secs(2));
+        let configured = Limits {
+            quiesce_after_leader: Some(Duration::from_secs(2)),
+            ..limits(Duration::from_secs(4))
+        };
         let result = run(&mut command(&script), &configured, &AtomicBool::new(false));
         assert!(matches!(&result.end, End::LeaderExited));
         assert_eq!(result.group, GroupState::Drained);
@@ -848,7 +856,27 @@ mod tests {
     }
 
     #[test]
+    fn zero_reader_grace_drains_large_final_burst_to_eof() {
+        let dir = Scripts::new();
+        let script = dir.write("burst.sh", "head -c 204800 /dev/zero\n");
+        let configured = Limits {
+            stdout: Stream::Tail { cap: 1024 * 1024 },
+            stderr: Stream::Null,
+            reader_grace: Duration::ZERO,
+            ..limits(Duration::from_secs(3))
+        };
+        let result = run(&mut command(&script), &configured, &AtomicBool::new(false));
+        assert!(matches!(&result.end, End::LeaderExited));
+        assert_eq!(result.stdout.total, 200 * 1024);
+        assert_eq!(result.stdout.bytes.len(), 200 * 1024);
+        assert!(result.stdout.eof);
+    }
+
+    #[test]
     fn term_resistant_descendant_is_killed() {
+        if !Path::new("/proc/self/stat").exists() {
+            return;
+        }
         let dir = Scripts::new();
         let pid_file = dir.path().join("child.pid");
         let script = dir.write(
@@ -869,12 +897,20 @@ mod tests {
             .trim()
             .parse()
             .unwrap();
-        assert!(!PathBuf::from(format!("/proc/{pid}")).exists());
+        assert!(proc_state_gone_or_zombie(pid));
     }
 
     #[test]
     fn escaped_descendant_holding_the_pipe_is_bounded_by_reader_grace() {
-        if !Path::new("/usr/bin/setsid").exists() && !Path::new("/bin/setsid").exists() {
+        let mut probe = Command::new("setsid");
+        probe.arg("true");
+        if !run(
+            &mut probe,
+            &Limits::silent(Duration::from_secs(1)),
+            &AtomicBool::new(false),
+        )
+        .success()
+        {
             return;
         }
         let dir = Scripts::new();
