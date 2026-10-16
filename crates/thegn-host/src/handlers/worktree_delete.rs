@@ -304,7 +304,8 @@ pub(crate) fn confirm_delete_worktrees(
     *cx.need_relayout = true;
 }
 
-/// Hide pending worktree rows without changing their session or sidebar index.
+/// Hide pending worktree rows and their pipeline mirrors without changing
+/// their session or sidebar index.
 pub(crate) fn hide_pending_deletes(
     rows: &mut [crate::sidebar::SidebarRow],
     deleting: &std::collections::HashSet<String>,
@@ -313,8 +314,10 @@ pub(crate) fn hide_pending_deletes(
         return;
     }
     for row in rows {
-        if row.kind == crate::sidebar::RowKind::Worktree
-            && let Some(path) = &row.worktree_path
+        if matches!(
+            row.kind,
+            crate::sidebar::RowKind::Worktree | crate::sidebar::RowKind::PipelineWorktree
+        ) && let Some(path) = &row.worktree_path
             && deleting.contains(path)
         {
             row.visible = false;
@@ -345,15 +348,14 @@ pub(crate) fn begin_optimistic_delete(
         if session
             .active_group()
             .is_some_and(|group| sb.deleting.contains(&group.path))
-        {
-            if let Some(index) = active_name.as_ref().and_then(|name| {
+            && let Some(index) = active_name.as_ref().and_then(|name| {
                 session
                     .worktrees
                     .iter()
                     .position(|group| &group.name == name)
-            }) {
-                session.switch_to(index);
-            }
+            })
+        {
+            session.switch_to(index);
         }
     }
     let active_moved = active_scheduled
@@ -729,6 +731,12 @@ mod tests {
         let mut rows = vec![
             crate::sidebar::SidebarRow::base(crate::sidebar::RowKind::Worktree, 1, "first", "app"),
             crate::sidebar::SidebarRow::base(
+                crate::sidebar::RowKind::PipelineWorktree,
+                1,
+                "pipeline mirror",
+                "app",
+            ),
+            crate::sidebar::SidebarRow::base(
                 crate::sidebar::RowKind::Workspace,
                 0,
                 "workspace",
@@ -738,18 +746,22 @@ mod tests {
         ];
         rows[0].worktree_path = Some("/tmp/app-alpha".into());
         rows[1].worktree_path = Some("/tmp/app-alpha".into());
-        rows[2].worktree_path = Some("/tmp/app-zeta".into());
+        rows[2].worktree_path = Some("/tmp/app-alpha".into());
+        rows[3].worktree_path = Some("/tmp/app-zeta".into());
         let deleting = HashSet::from(["/tmp/app-alpha".to_string()]);
+        let original_rows = rows.clone();
+        let original_labels = rows
+            .iter()
+            .filter(|row| row.visible)
+            .map(|row| row.label.as_str())
+            .collect::<Vec<_>>();
 
         super::hide_pending_deletes(&mut rows, &deleting);
         assert_eq!(
             rows.iter().map(|row| row.visible).collect::<Vec<_>>(),
-            [false, true, true]
+            [false, false, true, true]
         );
-        let mut rebuilt_rows = rows.clone();
-        for row in &mut rebuilt_rows {
-            row.visible = true;
-        }
+        let mut rebuilt_rows = original_rows;
         super::hide_pending_deletes(&mut rebuilt_rows, &HashSet::new());
         assert_eq!(
             rebuilt_rows
@@ -757,7 +769,7 @@ mod tests {
                 .filter(|row| row.visible)
                 .map(|row| row.label.as_str())
                 .collect::<Vec<_>>(),
-            ["first", "workspace", "second"]
+            original_labels
         );
     }
 }

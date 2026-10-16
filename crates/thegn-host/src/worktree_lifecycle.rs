@@ -160,8 +160,8 @@ fn apply_completions_from(
                             .sidebar_db_worktrees
                             .retain(|w| w.path != gone_path && w.path != path);
                         model.status = format!("Deleted worktree {path}");
-                        changed = true;
                     }
+                    // Also on a concurrent reap, so the cleared `deleting` marker is re-applied by the rebuild.
                     changed = true;
                 } else {
                     model.status = format!("Worktree delete failed for {path}: {message}");
