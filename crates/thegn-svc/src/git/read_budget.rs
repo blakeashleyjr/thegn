@@ -47,10 +47,11 @@ pub(super) fn budgeted_status<'repo>(
     let available = std::thread::available_parallelism()
         .map(usize::from)
         .unwrap_or(1);
-    let mut status = repo.status(gix::progress::Discard)?;
-    status.index_worktree_options_mut(|options| {
-        options.thread_limit = status_thread_limit(current_read_priority(), available);
-    });
+    let status = repo
+        .status(gix::progress::Discard)?
+        .index_worktree_options_mut(|options| {
+            options.thread_limit = status_thread_limit(current_read_priority(), available);
+        });
     Ok(status)
 }
 
