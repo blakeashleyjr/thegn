@@ -42,3 +42,8 @@ e2e-results/
 # Knowledge-graph tool scratch (present in every worktree; never committed).
 # Left untracked it makes `thegn integrate` classify clean branches as dirty.
 .understand-anything/
+
+# Maintenance-batch records are written by the out-of-repo skill and are not
+# product inputs. Keep them out of the index and diff watcher; pipeline handoff
+# artifacts stay tracked because dispatch verification requires them committed.
+/.thegn/maintenance/
