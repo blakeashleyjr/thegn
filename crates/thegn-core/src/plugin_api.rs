@@ -455,6 +455,11 @@ pub enum PluginApiError {
     },
     ContributionChanged(String),
     UnsupportedIo(String),
+    QuotaExceeded {
+        what: &'static str,
+        size: usize,
+        limit: usize,
+    },
 }
 
 impl Display for PluginApiError {
@@ -495,6 +500,9 @@ impl Display for PluginApiError {
                 )
             }
             Self::UnsupportedIo(scheme) => write!(f, "I/O scheme is unsupported: {scheme}"),
+            Self::QuotaExceeded { what, size, limit } => {
+                write!(f, "plugin quota exceeded: {what} ({size} > {limit} bytes)")
+            }
         }
     }
 }
@@ -732,6 +740,16 @@ pub enum AuditTargetClass {
 
 pub const MAX_AUDIT_ENTRIES: usize = 1024;
 pub const MAX_AUDIT_STRING_BYTES: usize = 256;
+pub const MAX_PLUGIN_JSON_DEPTH: usize = 32;
+pub const MAX_STATE_KEYS: usize = 256;
+pub const MAX_STATE_KEY_BYTES: usize = 256;
+pub const MAX_STATE_VALUE_BYTES: usize = 64 * 1024;
+pub const MAX_STATE_TOTAL_BYTES: usize = 1 << 20;
+pub const MAX_RETAINED_EVENTS: usize = 256;
+pub const MAX_EVENT_PAYLOAD_BYTES: usize = 64 * 1024;
+pub const MAX_VIEW_ROWS: usize = 256;
+pub const MAX_VIEW_SPANS: usize = 4096;
+pub const MAX_VIEW_TEXT_BYTES: usize = 128 * 1024;
 
 #[derive(Debug, Clone)]
 pub struct AuditLogEntry {
@@ -840,11 +858,13 @@ pub struct PluginRuntime {
     next_audit_seq: u64,
     audit_evicted: u64,
     generation: u64,
-    state: BTreeMap<String, serde_json::Value>,
+    state: BTreeMap<String, (serde_json::Value, usize)>,
+    state_bytes: usize,
     host_values: BTreeMap<String, serde_json::Value>,
     subscriptions: std::collections::HashSet<(PluginId, EventKind)>,
     registered_contributions: std::collections::HashSet<ContributionId>,
     events: Vec<Event>,
+    events_evicted: u64,
     surface_caps: BTreeMap<SurfaceId, Capability>,
     views: SurfaceCache,
 }
@@ -867,10 +887,12 @@ impl PluginRuntime {
             audit_evicted: 0,
             generation: 0,
             state: Default::default(),
+            state_bytes: 0,
             host_values: Default::default(),
             subscriptions: Default::default(),
             registered_contributions: Default::default(),
             events: Default::default(),
+            events_evicted: 0,
             surface_caps,
             views: SurfaceCache::default(),
         }
@@ -948,6 +970,16 @@ impl PluginRuntime {
             .cloned()
             .unwrap_or_else(|| Capability::new("surface", "unknown"));
         self.audit(plugin, cap, "update")?;
+        let (rows, spans, text_bytes) = view_footprint(&view);
+        if rows > MAX_VIEW_ROWS {
+            return Err(quota_error("view rows", rows, MAX_VIEW_ROWS));
+        }
+        if spans > MAX_VIEW_SPANS {
+            return Err(quota_error("view spans", spans, MAX_VIEW_SPANS));
+        }
+        if text_bytes > MAX_VIEW_TEXT_BYTES {
+            return Err(quota_error("view text", text_bytes, MAX_VIEW_TEXT_BYTES));
+        }
         Ok(self.views.update(surface, view))
     }
 
@@ -975,12 +1007,34 @@ impl PluginRuntime {
     }
 
     pub fn emit(&mut self, _plugin: PluginId, event: Event) -> Result<(), PluginApiError> {
+        match json_footprint(&event.payload, MAX_PLUGIN_JSON_DEPTH) {
+            Err(QuotaBreach::Depth) => {
+                return Err(quota_error(
+                    "event payload depth",
+                    MAX_PLUGIN_JSON_DEPTH + 1,
+                    MAX_PLUGIN_JSON_DEPTH,
+                ));
+            }
+            Ok(size) if size > MAX_EVENT_PAYLOAD_BYTES => {
+                return Err(quota_error("event payload", size, MAX_EVENT_PAYLOAD_BYTES));
+            }
+            _ => {}
+        }
+        if self.events.len() == MAX_RETAINED_EVENTS {
+            let evict_count = (MAX_RETAINED_EVENTS / 4).max(1);
+            self.events.drain(..evict_count);
+            self.events_evicted = self.events_evicted.saturating_add(evict_count as u64);
+        }
         self.events.push(event);
         Ok(())
     }
 
     pub fn events(&self) -> &[Event] {
         &self.events
+    }
+
+    pub fn events_evicted(&self) -> u64 {
+        self.events_evicted
     }
 
     pub fn host_value(
@@ -1037,7 +1091,38 @@ impl PluginRuntime {
         let state_key = format!("{}:{key}", plugin.as_str());
         let cap = Capability::new("state", plugin.as_str());
         self.audit(plugin, cap, "state.set")?;
-        self.state.insert(state_key, val);
+        if key.len() > MAX_STATE_KEY_BYTES {
+            return Err(quota_error("state key", key.len(), MAX_STATE_KEY_BYTES));
+        }
+        let value_bytes = match json_footprint(&val, MAX_PLUGIN_JSON_DEPTH) {
+            Ok(size) if size <= MAX_STATE_VALUE_BYTES => size,
+            Ok(size) => return Err(quota_error("state value", size, MAX_STATE_VALUE_BYTES)),
+            Err(QuotaBreach::Depth) => {
+                return Err(quota_error(
+                    "state value depth",
+                    MAX_PLUGIN_JSON_DEPTH + 1,
+                    MAX_PLUGIN_JSON_DEPTH,
+                ));
+            }
+        };
+        let entry_bytes = state_key.len().saturating_add(value_bytes);
+        let old_bytes = self.state.get(&state_key).map_or(0, |(_, bytes)| *bytes);
+        if old_bytes == 0 && self.state.len() >= MAX_STATE_KEYS {
+            return Err(quota_error(
+                "state keys",
+                self.state.len().saturating_add(1),
+                MAX_STATE_KEYS,
+            ));
+        }
+        let new_total = self
+            .state_bytes
+            .saturating_sub(old_bytes)
+            .saturating_add(entry_bytes);
+        if new_total > MAX_STATE_TOTAL_BYTES {
+            return Err(quota_error("state total", new_total, MAX_STATE_TOTAL_BYTES));
+        }
+        self.state_bytes = new_total;
+        self.state.insert(state_key, (val, entry_bytes));
         Ok(())
     }
 
@@ -1049,7 +1134,7 @@ impl PluginRuntime {
         let state_key = format!("{}:{key}", plugin.as_str());
         let cap = Capability::new("state", plugin.as_str());
         self.audit(plugin, cap, "state.get")?;
-        Ok(self.state.get(&state_key).cloned())
+        Ok(self.state.get(&state_key).map(|(value, _)| value.clone()))
     }
 
     pub fn audit_log(&self) -> &[AuditLogEntry] {
@@ -1129,6 +1214,80 @@ impl PluginRuntime {
             target,
         );
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum QuotaBreach {
+    Depth,
+}
+
+fn quota_error(what: &'static str, size: usize, limit: usize) -> PluginApiError {
+    PluginApiError::QuotaExceeded { what, size, limit }
+}
+
+/// Estimate decoded JSON storage without allocating. Each node reserves eight
+/// bytes in addition to UTF-8 string and object-key bytes.
+fn json_footprint(value: &serde_json::Value, max_depth: usize) -> Result<usize, QuotaBreach> {
+    fn add(total: &mut usize, amount: usize) {
+        *total = total.saturating_add(amount);
+    }
+
+    fn walk(
+        value: &serde_json::Value,
+        depth: usize,
+        max_depth: usize,
+        total: &mut usize,
+    ) -> Result<(), QuotaBreach> {
+        if depth > max_depth {
+            return Err(QuotaBreach::Depth);
+        }
+        add(total, 8);
+        match value {
+            serde_json::Value::Null | serde_json::Value::Bool(_) | serde_json::Value::Number(_) => {
+            }
+            serde_json::Value::String(text) => add(total, text.len()),
+            serde_json::Value::Array(items) => {
+                for item in items {
+                    walk(item, depth + 1, max_depth, total)?;
+                }
+            }
+            serde_json::Value::Object(fields) => {
+                for (key, item) in fields {
+                    add(total, key.len());
+                    walk(item, depth + 1, max_depth, total)?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    let mut total = 0;
+    walk(value, 0, max_depth, &mut total)?;
+    Ok(total)
+}
+
+fn view_footprint(view: &View) -> (usize, usize, usize) {
+    fn count_spans(spans: &[Span], count: &mut usize, text_bytes: &mut usize) {
+        for span in spans {
+            *count = count.saturating_add(1);
+            *text_bytes = text_bytes
+                .saturating_add(span.text.len())
+                .saturating_add(span.slot.as_ref().map_or(0, String::len));
+        }
+    }
+
+    let rows = if view.rows.is_empty() {
+        1
+    } else {
+        view.rows.len()
+    };
+    let mut spans = 0;
+    let mut text_bytes = 0;
+    count_spans(&view.spans, &mut spans, &mut text_bytes);
+    for row in &view.rows {
+        count_spans(row, &mut spans, &mut text_bytes);
+    }
+    (rows, spans, text_bytes)
 }
 
 // ----------------------------------------------------------------------------
@@ -3377,5 +3536,237 @@ command = ["true"]"#,
         )
         .unwrap();
         assert!(!spec.trusted_native);
+    }
+}
+
+#[cfg(test)]
+mod runtime_quota_tests {
+    use super::*;
+
+    fn runtime() -> (PluginRuntime, PluginId, SurfaceId) {
+        let plugin = PluginId::new("quota-test");
+        let surface = SurfaceId::new("quota-test.surface");
+        let contribution = Contribution {
+            id: ContributionId::new("quota-test.surface"),
+            extension_point: ExtensionPoint::StatusBarSegment,
+            label: "quota-test".into(),
+            surface: Some(surface.clone()),
+            cadence: CadenceHint::OnDemand,
+            metadata: Default::default(),
+            caps: serde_json::Value::Null,
+            chord: None,
+        };
+        let manifest = NegotiatedManifest {
+            api: API_VERSION,
+            granted: [
+                Capability::new("state", plugin.as_str()),
+                Capability::new("surface", "statusbar"),
+            ]
+            .into_iter()
+            .collect(),
+            accepted_contributions: vec![contribution],
+            supported_extension_points: [ExtensionPoint::StatusBarSegment].into_iter().collect(),
+            ..NegotiatedManifest::default()
+        };
+        (PluginRuntime::new(manifest), plugin, surface)
+    }
+
+    fn nested_arrays(count: usize) -> serde_json::Value {
+        (0..count).fold(serde_json::Value::Null, |value, _| {
+            serde_json::Value::Array(vec![value])
+        })
+    }
+
+    fn quota(error: PluginApiError) -> bool {
+        matches!(error, PluginApiError::QuotaExceeded { .. })
+    }
+
+    #[test]
+    fn state_set_rejects_oversized_value_and_keeps_previous() {
+        let (mut runtime, plugin, _) = runtime();
+        runtime
+            .state_set(plugin.clone(), "k", serde_json::json!(1))
+            .unwrap();
+        let oversized = serde_json::Value::String("x".repeat(MAX_STATE_VALUE_BYTES + 1));
+        assert!(quota(
+            runtime
+                .state_set(plugin.clone(), "k", oversized)
+                .unwrap_err()
+        ));
+        assert_eq!(
+            runtime.state_get(plugin, "k").unwrap(),
+            Some(serde_json::json!(1))
+        );
+    }
+
+    #[test]
+    fn state_set_rejects_deep_json_and_accepts_at_limit() {
+        let (mut runtime, plugin, _) = runtime();
+        assert!(quota(
+            runtime
+                .state_set(
+                    plugin.clone(),
+                    "deep",
+                    nested_arrays(MAX_PLUGIN_JSON_DEPTH + 1),
+                )
+                .unwrap_err()
+        ));
+        assert!(
+            runtime
+                .state_set(plugin, "limit", nested_arrays(MAX_PLUGIN_JSON_DEPTH),)
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn state_set_caps_key_count_but_allows_overwrite() {
+        let (mut runtime, plugin, _) = runtime();
+        for index in 0..MAX_STATE_KEYS {
+            runtime
+                .state_set(plugin.clone(), &index.to_string(), serde_json::Value::Null)
+                .unwrap();
+        }
+        assert!(quota(
+            runtime
+                .state_set(plugin.clone(), "extra", serde_json::Value::Null)
+                .unwrap_err()
+        ));
+        assert!(
+            runtime
+                .state_set(plugin, "0", serde_json::Value::Bool(true))
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn state_set_caps_total_bytes_and_replacement_releases_space() {
+        let (mut runtime, plugin, _) = runtime();
+        let large = serde_json::Value::String("x".repeat(60 * 1024));
+        for index in 0..17 {
+            runtime
+                .state_set(plugin.clone(), &index.to_string(), large.clone())
+                .unwrap();
+        }
+        assert!(quota(
+            runtime
+                .state_set(plugin.clone(), "crossing", large.clone())
+                .unwrap_err()
+        ));
+        runtime
+            .state_set(plugin.clone(), "0", serde_json::Value::Null)
+            .unwrap();
+        assert!(runtime.state_set(plugin, "after-replace", large).is_ok());
+    }
+
+    #[test]
+    fn state_set_rejects_long_key() {
+        let (mut runtime, plugin, _) = runtime();
+        let key = "k".repeat(MAX_STATE_KEY_BYTES + 1);
+        assert!(quota(
+            runtime
+                .state_set(plugin, &key, serde_json::Value::Null)
+                .unwrap_err()
+        ));
+    }
+
+    #[test]
+    fn emit_retention_is_bounded_and_counts_evictions() {
+        let (mut runtime, plugin, _) = runtime();
+        for index in 0..10_000 {
+            runtime
+                .emit(
+                    plugin.clone(),
+                    Event::new(EventKind::Timer, serde_json::json!(index)),
+                )
+                .unwrap();
+        }
+        assert!(runtime.events().len() <= MAX_RETAINED_EVENTS);
+        assert_eq!(
+            runtime.events().last().map(|event| &event.payload),
+            Some(&serde_json::json!(9_999))
+        );
+        assert_eq!(
+            runtime.events_evicted(),
+            10_000 - runtime.events().len() as u64
+        );
+    }
+
+    #[test]
+    fn emit_rejects_oversized_and_deep_payloads() {
+        let (mut runtime, plugin, _) = runtime();
+        let oversized = serde_json::Value::String("x".repeat(MAX_EVENT_PAYLOAD_BYTES));
+        assert!(quota(
+            runtime
+                .emit(plugin.clone(), Event::new(EventKind::Timer, oversized))
+                .unwrap_err()
+        ));
+        assert!(quota(
+            runtime
+                .emit(
+                    plugin,
+                    Event::new(EventKind::Timer, nested_arrays(MAX_PLUGIN_JSON_DEPTH + 1)),
+                )
+                .unwrap_err()
+        ));
+    }
+
+    #[test]
+    fn update_rejects_oversized_views_and_keeps_cached_view() {
+        let (mut runtime, plugin, surface) = runtime();
+        let first = View::line([Span::styled("first", StyleRole::Default)]);
+        runtime
+            .update(plugin.clone(), surface.clone(), first.clone())
+            .unwrap();
+        let too_many_rows = View::multi((0..MAX_VIEW_ROWS + 1).map(|_| vec![]));
+        assert!(quota(
+            runtime
+                .update(plugin.clone(), surface.clone(), too_many_rows)
+                .unwrap_err()
+        ));
+        assert_eq!(runtime.view(&surface), Some(&first));
+
+        let too_many_spans =
+            View::line((0..MAX_VIEW_SPANS + 1).map(|_| Span::styled("", StyleRole::Default)));
+        assert!(quota(
+            runtime
+                .update(plugin.clone(), surface.clone(), too_many_spans)
+                .unwrap_err()
+        ));
+        let too_much_text = View::line([Span::slotted(
+            "x".repeat(MAX_VIEW_TEXT_BYTES),
+            StyleRole::Default,
+            "slot",
+        )]);
+        assert!(quota(
+            runtime
+                .update(plugin, surface.clone(), too_much_text)
+                .unwrap_err()
+        ));
+        assert_eq!(runtime.view(&surface), Some(&first));
+    }
+
+    #[test]
+    fn json_footprint_obeys_depth_and_counts_string_bytes() {
+        assert!(
+            json_footprint(&nested_arrays(MAX_PLUGIN_JSON_DEPTH), MAX_PLUGIN_JSON_DEPTH).is_ok()
+        );
+        assert_eq!(
+            json_footprint(
+                &nested_arrays(MAX_PLUGIN_JSON_DEPTH + 1),
+                MAX_PLUGIN_JSON_DEPTH
+            ),
+            Err(QuotaBreach::Depth)
+        );
+        assert!(
+            json_footprint(&serde_json::json!("longer"), MAX_PLUGIN_JSON_DEPTH).unwrap()
+                > json_footprint(&serde_json::json!("x"), MAX_PLUGIN_JSON_DEPTH).unwrap()
+        );
+        assert!(
+            json_footprint(
+                &serde_json::json!({"key": [true, 1, null]}),
+                MAX_PLUGIN_JSON_DEPTH
+            )
+            .is_ok()
+        );
     }
 }
