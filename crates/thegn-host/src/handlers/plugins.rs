@@ -467,6 +467,16 @@ pub(crate) fn drain(
     model: &mut FrameModel,
     host: Option<&PluginsHost>,
 ) -> PluginDamage {
+    drain_with_responder(rx, state, model, host, &mut respond)
+}
+
+fn drain_with_responder(
+    rx: &mut PluginRx,
+    state: &mut PluginsState,
+    model: &mut FrameModel,
+    host: Option<&PluginsHost>,
+    responder: &mut impl FnMut(&PluginEntry, RpcResponse),
+) -> PluginDamage {
     state.inbox = Some(rx.inbox());
     let before_views = statusbar_views(state);
     let mut damage = PluginDamage::None;
@@ -474,7 +484,7 @@ pub(crate) fn drain(
     while applied < MAX_PLUGIN_MESSAGES_PER_DRAIN {
         if let Some(rejected) = rx.pop_rejected_if_lifecycle_empty() {
             applied = applied.saturating_add(1);
-            answer_rejected(state, rejected);
+            answer_rejected(state, rejected, responder);
             continue;
         }
         let Ok(msg) = rx.try_recv() else {
@@ -591,9 +601,13 @@ pub(crate) fn drain(
     damage
 }
 
-fn answer_rejected(state: &PluginsState, rejected: RejectedRequest) {
+fn answer_rejected(
+    state: &PluginsState,
+    rejected: RejectedRequest,
+    responder: &mut impl FnMut(&PluginEntry, RpcResponse),
+) {
     if let Some(entry) = state.plugins.get(&rejected.plugin) {
-        respond(
+        responder(
             entry,
             RpcResponse::err(
                 rejected.id,
@@ -1507,14 +1521,28 @@ mod tests {
         })
         .unwrap();
 
+        let mut responses = Vec::new();
         while !rx.is_empty() {
-            drain(&mut rx, &mut state, &mut model, None);
+            drain_with_responder(&mut rx, &mut state, &mut model, None, &mut |_, response| {
+                responses.push(response)
+            });
         }
 
         let diagnostics = state.inbox.as_ref().unwrap().take_diagnostics();
         assert_eq!(diagnostics["p"].rejected, 1);
-        // The response payload is not observable here without a SessionWriter seam.
+        assert!(
+            rx.is_empty(),
+            "the rejected request is consumed by the drain"
+        );
+        assert_eq!(
+            responses,
+            [RpcResponse::err(
+                77,
+                RpcError::new(RpcErrorCode::RateLimited, "host plugin queue full")
+            )]
+        );
         assert_eq!(statusbar_views(&state)[0].1.text_content(), original);
+        assert!(state.plugins.contains_key("p"));
     }
 
     #[test]
@@ -1548,7 +1576,6 @@ mod tests {
         })
         .unwrap();
 
-        assert!(rx.pop_rejected_if_lifecycle_empty().is_none());
         assert!(matches!(
             rx.try_recv(),
             Ok(PluginMsg::Event {
@@ -1556,7 +1583,6 @@ mod tests {
                 ..
             })
         ));
-        assert!(rx.pop_rejected_if_lifecycle_empty().is_none());
         assert!(matches!(rx.try_recv(), Ok(PluginMsg::Respawned { .. })));
         assert_eq!(rx.pop_rejected_if_lifecycle_empty().unwrap().id, 77);
     }
