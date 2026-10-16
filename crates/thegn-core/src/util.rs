@@ -2,7 +2,9 @@
 //! and thin subprocess wrappers (git / generic commands).
 
 use crate::msg;
+use crate::sandbox_backend::{HostOs, host_os};
 use std::collections::HashMap;
+use std::ffi::OsString;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -16,46 +18,53 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 #[cfg(unix)]
 use std::os::unix::process::CommandExt;
 
-#[cfg(not(windows))]
+fn env_os(key: &str) -> Option<OsString> {
+    std::env::var_os(key)
+}
+
+pub fn home_for(os: HostOs, env: &dyn Fn(&str) -> Option<OsString>) -> PathBuf {
+    match os {
+        HostOs::Windows => env("USERPROFILE")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from("C:\\")),
+        _ => env("HOME")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from("/")),
+    }
+}
+
+pub fn xdg_config_home_for(os: HostOs, env: &dyn Fn(&str) -> Option<OsString>) -> PathBuf {
+    match os {
+        HostOs::Windows => env("APPDATA")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| home_for(os, env).join("AppData").join("Roaming")),
+        _ => env("XDG_CONFIG_HOME")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| home_for(os, env).join(".config")),
+    }
+}
+
+pub fn xdg_state_home_for(os: HostOs, env: &dyn Fn(&str) -> Option<OsString>) -> PathBuf {
+    match os {
+        HostOs::Windows => env("LOCALAPPDATA")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| home_for(os, env).join("AppData").join("Local")),
+        _ => env("XDG_STATE_HOME")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| home_for(os, env).join(".local/state")),
+    }
+}
+
 pub fn home() -> PathBuf {
-    std::env::var_os("HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("/"))
+    home_for(host_os(), &env_os)
 }
 
-#[cfg(windows)]
-pub fn home() -> PathBuf {
-    std::env::var_os("USERPROFILE")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("C:\\"))
-}
-
-#[cfg(not(windows))]
 pub fn xdg_config_home() -> PathBuf {
-    std::env::var_os("XDG_CONFIG_HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| home().join(".config"))
+    xdg_config_home_for(host_os(), &env_os)
 }
 
-#[cfg(windows)]
-pub fn xdg_config_home() -> PathBuf {
-    std::env::var_os("APPDATA")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| home().join("AppData").join("Roaming"))
-}
-
-#[cfg(not(windows))]
 pub fn xdg_state_home() -> PathBuf {
-    std::env::var_os("XDG_STATE_HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| home().join(".local/state"))
-}
-
-#[cfg(windows)]
-pub fn xdg_state_home() -> PathBuf {
-    std::env::var_os("LOCALAPPDATA")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| home().join("AppData").join("Local"))
+    xdg_state_home_for(host_os(), &env_os)
 }
 
 /// thegn's own home — config, worktrees, cache, activity all live under here
@@ -1791,6 +1800,92 @@ fn platform_hostname() -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn path_resolvers_match_each_host_convention_and_fallback() {
+        let cases = [HostOs::Linux, HostOs::MacOs, HostOs::Windows, HostOs::Other];
+        for os in cases {
+            let values = HashMap::from([
+                ("HOME", OsString::from("/home/test")),
+                ("USERPROFILE", OsString::from("C:/Users/test")),
+                ("XDG_CONFIG_HOME", OsString::from("/cfg")),
+                ("XDG_STATE_HOME", OsString::from("/state")),
+                ("APPDATA", OsString::from("C:/roaming")),
+                ("LOCALAPPDATA", OsString::from("C:/local")),
+            ]);
+            let lookup = |key: &str| values.get(key).cloned();
+            let windows = os == HostOs::Windows;
+            assert_eq!(
+                home_for(os, &lookup),
+                PathBuf::from(if windows {
+                    "C:/Users/test"
+                } else {
+                    "/home/test"
+                })
+            );
+            assert_eq!(
+                xdg_config_home_for(os, &lookup),
+                PathBuf::from(if windows { "C:/roaming" } else { "/cfg" })
+            );
+            assert_eq!(
+                xdg_state_home_for(os, &lookup),
+                PathBuf::from(if windows { "C:/local" } else { "/state" })
+            );
+
+            let no_xdg = |key: &str| match key {
+                "XDG_CONFIG_HOME" | "XDG_STATE_HOME" | "APPDATA" | "LOCALAPPDATA" => None,
+                _ => lookup(key),
+            };
+            assert_eq!(
+                xdg_config_home_for(os, &no_xdg),
+                home_for(os, &no_xdg).join(if windows {
+                    "AppData/Roaming"
+                } else {
+                    ".config"
+                })
+            );
+            assert_eq!(
+                xdg_state_home_for(os, &no_xdg),
+                home_for(os, &no_xdg).join(if windows {
+                    "AppData/Local"
+                } else {
+                    ".local/state"
+                })
+            );
+
+            let no_home = |_: &str| None;
+            assert_eq!(
+                home_for(os, &no_home),
+                PathBuf::from(if windows { "C:\\" } else { "/" })
+            );
+            assert_eq!(
+                xdg_config_home_for(os, &no_home),
+                if windows {
+                    PathBuf::from("C:\\").join("AppData").join("Roaming")
+                } else {
+                    PathBuf::from("/.config")
+                }
+            );
+            assert_eq!(
+                xdg_state_home_for(os, &no_home),
+                if windows {
+                    PathBuf::from("C:\\").join("AppData").join("Local")
+                } else {
+                    PathBuf::from("/.local/state")
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn path_resolver_wrappers_match_the_real_environment() {
+        let _env = crate::testenv::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        assert_eq!(home(), home_for(host_os(), &env_os));
+        assert_eq!(xdg_config_home(), xdg_config_home_for(host_os(), &env_os));
+        assert_eq!(xdg_state_home(), xdg_state_home_for(host_os(), &env_os));
+    }
 
     #[test]
     fn xdg_state_home_resolves_without_panicking() {

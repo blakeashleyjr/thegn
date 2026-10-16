@@ -89,6 +89,18 @@ and `snap`/`send`/`wait` it. [`docs/testing-with-muse.md`](docs/testing-with-mus
 is the full guide (environment, spec anatomy, the traps, artifacts, baselines,
 macOS); the `tui-check` skill under `extensions/skills/` is the agent recipe.
 
+### Cross-platform path semantics
+
+Core path tests can exercise Linux, macOS, Windows, and fallback conventions
+on one host through `util::{home_for, xdg_config_home_for, xdg_state_home_for}`.
+Use `testenv::state_env_for` when checking one OS's environment mapping, and
+`testenv::IsolatedState` for tests that mutate process environment or write
+state; it sets both Unix/XDG and Windows variables and restores them on drop.
+`testenv::symlinked_tempdir` supplies a link spelling and its canonical path
+for tests where the OS resolves paths through a symlink. The per-crate
+`state-env-*-ratchet.txt` allowlists track existing tests that still set these
+variables directly; the ratchet is shrink-only as tests migrate to the helper.
+
 `just` with no arguments lists every recipe. Commits follow conventional
 style (`feat(scope):`, `fix(scope):`); branch off `main`.
 

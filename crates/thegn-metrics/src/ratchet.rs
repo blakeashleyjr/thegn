@@ -375,6 +375,40 @@ pub fn code_only(body: &str) -> String {
     output
 }
 
+/// Test-code portion of a source file for the state-env ratchet.
+pub fn state_env_test_body<'a>(key: &str, body: &'a str) -> Option<&'a str> {
+    if key.ends_with("_tests.rs") || key.starts_with("tests/") {
+        Some(body)
+    } else {
+        body.split_once("#[cfg(test)]").map(|(_, body)| body)
+    }
+}
+
+/// Whether code directly mutates a home/state environment variable.
+/// `body` is expected to have passed through [`code_only`].
+pub fn sets_state_env_directly(body: &str) -> bool {
+    const KEYS: [&str; 7] = [
+        "HOME",
+        "XDG_STATE_HOME",
+        "XDG_CONFIG_HOME",
+        "USERPROFILE",
+        "LOCALAPPDATA",
+        "APPDATA",
+        "THEGN_DIR",
+    ];
+    let key_pattern = KEYS
+        .iter()
+        .map(|key| regex::escape(key))
+        .collect::<Vec<_>>()
+        .join("|");
+    let pattern = format!(
+        r#"(?:\(\s*"(?:{key_pattern})"\s*,|\bset_var\s*\(\s*"(?:{key_pattern})"\s*,|\bremove_var\s*\(\s*"(?:{key_pattern})"\s*\)|\.env\s*\(\s*"(?:{key_pattern})"\s*,|\.env_remove\s*\(\s*"(?:{key_pattern})"\s*\))"#
+    );
+    regex::Regex::new(&pattern)
+        .expect("fixed state environment pattern")
+        .is_match(body)
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Token<'a> {
     Hash,
@@ -665,6 +699,31 @@ pub fn file_ratchet(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn state_environment_predicate_finds_only_test_mutations() {
+        for body in [
+            r#"let vars = [("HOME", "/tmp"), ("XDG_STATE_HOME", "/tmp/state")];"#,
+            r#"std::env::set_var("USERPROFILE", root);"#,
+            r#"std::env::remove_var("APPDATA");"#,
+            r#"command.env("THEGN_DIR", root);"#,
+            r#"command.env_remove("LOCALAPPDATA");"#,
+        ] {
+            assert!(sets_state_env_directly(body), "{body}");
+        }
+        assert!(!sets_state_env_directly(r#"std::env::var_os("HOME");"#));
+        assert!(sets_state_env_directly(r#"command.env("HOME", path);"#));
+        let cfg_test = "command.env(\"HOME\", path);\n#[cfg(test)]\nfn tests() { command.env(\"HOME\", path); }";
+        let code = code_only(cfg_test);
+        let test_body = state_env_test_body("platform/unix.rs", &code).unwrap();
+        assert!(sets_state_env_directly(test_body));
+        assert!(state_env_test_body("platform/unix.rs", "command.env(\"HOME\", path);").is_none());
+        assert!(state_env_test_body("fixture_tests.rs", "command.env(\"HOME\", path);").is_some());
+        assert!(state_env_test_body("tests/nested.rs", "command.env(\"HOME\", path);").is_some());
+        assert!(!sets_state_env_directly(&code_only(
+            "// std::env::set_var(\"HOME\", \"/tmp\");\nlet x = 1;"
+        )));
+    }
 
     #[test]
     fn discard_detection_separates_a_dropped_child_from_an_owned_one() {
