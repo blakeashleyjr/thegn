@@ -220,6 +220,7 @@ impl Db {
     ) -> Result<Option<MergeClaim>> {
         let tx = Transaction::new_unchecked(self.conn(), TransactionBehavior::Immediate)?;
         let now = util::now_ms();
+        let location = merge_location(Some(&request.location));
         if request.lease_until_ms <= now
             || request.lease_until_ms.saturating_sub(now) > MERGE_CLAIM_MAX_LEASE_MS
         {
@@ -228,12 +229,13 @@ impl Db {
         }
         let identity_matches: bool = tx.query_row(
             "SELECT EXISTS(SELECT 1 FROM worktrees WHERE worktree=?1 AND branch=?2 \
-               AND COALESCE(repo_path,'')=?3 AND COALESCE(location,'')=?4)",
+               AND COALESCE(repo_path,'')=?3 \
+               AND CASE WHEN COALESCE(location,'') IN ('','local') THEN '' ELSE location END=?4)",
             params![
                 request.worktree,
                 request.branch,
                 request.repo_root,
-                request.location
+                location
             ],
             |row| row.get(0),
         )?;
@@ -245,10 +247,11 @@ impl Db {
             "UPDATE merge_queue SET claim_owner=?1,claim_generation=claim_generation+1, \
                claim_phase='claimed_no_child',claim_lease_until_ms=?2,claim_owner_hint=?3, \
                claim_diagnostic=NULL,claim_launch_nonce=NULL WHERE worktree=?4 AND branch=?5 \
-               AND target_branch=?6 AND status=?7 AND COALESCE(location,'')=?8 \
-               AND claim_generation<9223372036854775807 \
-               AND (claim_phase='unclaimed' OR \
-                    (claim_phase IN ('claimed_no_child','settled') AND claim_lease_until_ms<?9))",
+               AND target_branch=?6 \
+               AND ((claim_phase='unclaimed' AND status=?7) OR \
+                    (claim_phase IN ('claimed_no_child','settled') AND claim_lease_until_ms<?9)) \
+               AND CASE WHEN COALESCE(location,'') IN ('','local') THEN '' ELSE location END=?8 \
+               AND claim_generation<9223372036854775807",
             params![
                 token,
                 request.lease_until_ms,
@@ -257,7 +260,7 @@ impl Db {
                 request.branch,
                 request.target_branch,
                 request.expected_status,
-                request.location,
+                location,
                 now
             ],
         )?;
@@ -297,7 +300,7 @@ impl Db {
                 return Ok(false);
             }
             let now = util::now();
-            conn.execute(
+            let changed = conn.execute(
                 r#"INSERT INTO merge_queue
                      (worktree,branch,target_branch,status,queued_at,updated_at,
                       result_oid,conflict_paths,error_detail,location)
@@ -309,9 +312,11 @@ impl Db {
                      agent_attempts=CASE WHEN merge_queue.status IN
                        ('queued','folding','verifying','agent_running')
                      THEN merge_queue.agent_attempts ELSE 0 END,
-                     location=?5"#,
+                     location=?5
+                   WHERE merge_queue.claim_owner IS NULL"#,
                 params![worktree, branch, target_branch, now, location],
             )?;
+            anyhow::ensure!(changed == 1, MERGE_CLAIM_ACTIVE);
             Ok(true)
         })();
         match &result {
@@ -942,8 +947,9 @@ impl WorktreeAuxStore for Db {
         let now = util::now_ms();
         let changed = tx.execute(
             "UPDATE merge_queue SET status=?1,updated_at=?2,result_oid=?3,conflict_paths=?4,error_detail=?5 \
-             WHERE worktree=?6 AND claim_owner=?7 AND claim_generation=?8 AND claim_phase='claimed_no_child' \
-             AND claim_lease_until_ms>=?9",
+             WHERE worktree=?6 AND claim_owner=?7 AND claim_generation=?8 \
+             AND (claim_phase='settled' OR \
+                  (claim_phase='claimed_no_child' AND claim_lease_until_ms>=?9))",
             params![status, util::now(), fields.result_oid, fields.conflict_paths, fields.error_detail,
                 claim.worktree, claim.owner_token, claim.generation, now],
         )?;

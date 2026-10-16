@@ -342,7 +342,7 @@ pub trait WorktreeAuxStore {
         max: u32,
     ) -> Result<MergeAttemptResult>;
 
-    /// Replace status fields only while this claim still owns the live row.
+    /// Replace status fields while this claim owns the row with a live lease, or is settled.
     fn replace_merge_status_claimed(
         &self,
         claim: &MergeClaim,
