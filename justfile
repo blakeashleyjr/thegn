@@ -646,6 +646,7 @@ ratchets:
     # Guardrail: stale architecture claims (old emulator name, never-landed ssh crate,
     # removed per-file size limit, "e2e runs every push") must not come back.
     bash test/stale-docs-guard.sh
+    bash test/tracked-ignored-guard.sh
     # Guardrail: the hand-run Muse recipe must keep the same config and D-Bus
     # isolation as the hermetic e2e environment.
     bash test/muse-docs-guard.sh
