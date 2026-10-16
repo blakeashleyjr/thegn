@@ -82,6 +82,15 @@ impl Accumulator {
             self.capture.total = self.capture.total.saturating_add(bytes.len() as u64);
             match self.stream {
                 Stream::Null => {}
+                Stream::Head { cap } => {
+                    let remaining = cap.saturating_sub(self.capture.bytes.len());
+                    self.capture
+                        .bytes
+                        .extend_from_slice(&bytes[..bytes.len().min(remaining)]);
+                    if bytes.len() > remaining {
+                        self.capture.truncated = true;
+                    }
+                }
                 Stream::HeadOrFail { cap } => {
                     let remaining = cap.saturating_sub(self.capture.bytes.len());
                     self.capture
@@ -593,7 +602,13 @@ pub(super) fn run(cmd: &mut Command, limits: &Limits, cancel: &AtomicBool) -> Ru
         stderr: err.capture,
         containment: Containment::ProcessGroup,
     };
-    aggregate_fit(&mut run.stdout, &mut run.stderr, limits.aggregate_tail_cap);
+    aggregate_fit(
+        &mut run.stdout,
+        &mut run.stderr,
+        limits.stdout,
+        limits.stderr,
+        limits.aggregate_tail_cap,
+    );
     guard.disarm();
     run
 }
@@ -815,6 +830,22 @@ mod tests {
     }
 
     #[test]
+    fn head_burst_keeps_prefix_and_drains_to_leader_exit() {
+        let dir = Scripts::new();
+        let script = dir.write("head-burst.sh", "head -c 3145728 /dev/zero\n");
+        let configured = Limits {
+            stdout: Stream::Head { cap: 1024 * 1024 },
+            stderr: Stream::Null,
+            ..limits(Duration::from_secs(5))
+        };
+        let result = run(&mut command(&script), &configured, &AtomicBool::new(false));
+        assert!(matches!(&result.end, End::LeaderExited));
+        assert_eq!(result.stdout.bytes, vec![0; 1024 * 1024]);
+        assert!(result.stdout.truncated);
+        assert_eq!(result.stdout.total, 3 * 1024 * 1024);
+    }
+
+    #[test]
     fn missing_program_is_spawn_not_found() {
         let mut cmd = Command::new("/no/such/thegn-proc-program");
         let result = run(
@@ -971,11 +1002,40 @@ mod tests {
             bytes: vec![2; 4],
             ..Capture::default()
         };
-        aggregate_fit(&mut stdout, &mut stderr, Some(8));
+        aggregate_fit(
+            &mut stdout,
+            &mut stderr,
+            Stream::Tail { cap: 8 },
+            Stream::Tail { cap: 4 },
+            Some(8),
+        );
         assert_eq!(stdout.bytes.len(), 4);
         assert_eq!(stderr.bytes.len(), 4);
         assert!(stdout.truncated);
         assert!(!stderr.truncated);
+    }
+
+    #[test]
+    fn aggregate_fit_preserves_head_and_trims_only_tail() {
+        let mut stdout = Capture {
+            bytes: vec![1; 8],
+            ..Capture::default()
+        };
+        let mut stderr = Capture {
+            bytes: vec![2; 4],
+            ..Capture::default()
+        };
+        aggregate_fit(
+            &mut stdout,
+            &mut stderr,
+            Stream::Head { cap: 8 },
+            Stream::Tail { cap: 4 },
+            Some(8),
+        );
+        assert_eq!(stdout.bytes, vec![1; 8]);
+        assert!(stderr.bytes.is_empty());
+        assert!(stderr.truncated);
+        assert!(!stdout.truncated);
     }
 
     #[test]

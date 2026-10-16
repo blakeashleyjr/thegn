@@ -59,6 +59,16 @@ fn append(capture: &mut Capture, stream: Stream, bytes: &[u8]) -> bool {
     capture.total = capture.total.saturating_add(bytes.len() as u64);
     match stream {
         Stream::Null => false,
+        Stream::Head { cap } => {
+            let remaining = cap.saturating_sub(capture.bytes.len());
+            capture
+                .bytes
+                .extend_from_slice(&bytes[..bytes.len().min(remaining)]);
+            if bytes.len() > remaining {
+                capture.truncated = true;
+            }
+            false
+        }
         Stream::HeadOrFail { cap } => {
             let remaining = cap.saturating_sub(capture.bytes.len());
             capture
@@ -310,13 +320,39 @@ pub(super) fn run(cmd: &mut Command, limits: &Limits, cancel: &AtomicBool) -> Ru
     if let Some(which) = drain(&rx, &mut run, limits) {
         run.end = End::OutputLimit(which);
     }
-    aggregate_fit(&mut run.stdout, &mut run.stderr, limits.aggregate_tail_cap);
+    aggregate_fit(
+        &mut run.stdout,
+        &mut run.stderr,
+        limits.stdout,
+        limits.stderr,
+        limits.aggregate_tail_cap,
+    );
     run
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn head_append_keeps_first_bytes_and_drains_without_limiting() {
+        let mut capture = Capture::default();
+        let first = vec![1; 1024 * 1024];
+        let next = vec![2; 2 * 1024 * 1024];
+        assert!(!append(
+            &mut capture,
+            Stream::Head { cap: first.len() },
+            &first
+        ));
+        assert!(!append(
+            &mut capture,
+            Stream::Head { cap: first.len() },
+            &next
+        ));
+        assert_eq!(capture.bytes, first);
+        assert!(capture.truncated);
+        assert_eq!(capture.total, 3 * 1024 * 1024);
+    }
 
     #[test]
     fn clean_exit_with_eof_does_not_wait_for_quiesce() {
