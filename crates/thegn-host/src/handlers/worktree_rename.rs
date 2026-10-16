@@ -16,6 +16,13 @@ use crate::session::Session;
 use termwiz::terminal::TerminalWaker;
 use tokio::sync::mpsc as tokio_mpsc;
 
+pub(crate) struct RegistryRename {
+    pub(crate) old_path: String,
+    pub(crate) new_path: String,
+    pub(crate) tab: String,
+    pub(crate) want: String,
+}
+
 /// One finished (or failed) worktree rename, tagged with the pre-rename
 /// identity so the loop can re-locate the group even if indices shifted.
 pub(crate) struct RenameDone {
@@ -64,40 +71,47 @@ pub(crate) fn request(
     });
 }
 
-/// Apply a finished rename to the live session. Re-keys the group found by
-/// `old_path` (identity, not index) and persists the rename to the DB cache.
-/// Returns the status line to show. Pure of I/O except the DB cache write
-/// (best-effort; git is the source of truth).
+/// Apply a finished rename optimistically to the live session. The registry
+/// write is queued on the FIFO DB writer; failures return asynchronously.
 pub(crate) fn apply(
     session: &mut Session,
     region_last_w: &mut Option<String>,
     done: RenameDone,
+    tx: &tokio_mpsc::UnboundedSender<crate::run_pending_db::PendingDbResult>,
+    waker: &TerminalWaker,
 ) -> String {
-    apply_with(
-        session,
-        region_last_w,
-        done,
-        |old_path, new_path, tab, want| {
-            use thegn_core::store::WorkspaceStore;
-            thegn_core::db::Db::open()
-                .and_then(|db| db.rename_worktree(old_path, new_path, tab, want))
-                .map_err(|e| e.to_string())
-        },
-    )
+    apply_with(session, region_last_w, done, |request| {
+        let status_want = request.want.clone();
+        let want = request.want;
+        let old_path = request.old_path;
+        let new_path = request.new_path;
+        let tab = request.tab;
+        use thegn_core::store::WorkspaceStore;
+        crate::run_pending_db::queue_reported_write(
+            tx,
+            waker,
+            move |db| {
+                db.rename_worktree(&old_path, &new_path, &tab, &want)
+                    .map_err(|error| error.to_string())
+            },
+            move |error| registry_failure_status(&status_want, &error),
+        );
+    })
 }
 
-/// `apply` with the registry write injected as a seam.
+pub(crate) fn registry_failure_status(want: &str, error: &str) -> String {
+    format!("Renamed to {want} (registry update failed: {error})")
+}
+
+/// `apply` with the registry queue injected as a seam.
 ///
 /// The session re-keying is pure; only the cache write touches the world. A
-/// unit test must never open the CANONICAL `$XDG_STATE_HOME/thegn/thegn.db` —
-/// doing so made these tests mutate the developer's live registry, and once the
-/// migration guard landed it made them fail outright whenever the on-disk
-/// schema trailed the build. Production passes the real DB; tests pass a stub.
+/// unit test must never open the CANONICAL `$XDG_STATE_HOME/thegn/thegn.db`.
 fn apply_with(
     session: &mut Session,
     region_last_w: &mut Option<String>,
     done: RenameDone,
-    cache_rename: impl FnOnce(&str, &str, &str, &str) -> Result<(), String>,
+    queue_rename: impl FnOnce(RegistryRename),
 ) -> String {
     let RenameDone {
         old_path,
@@ -124,14 +138,13 @@ fn apply_with(
     if region_last_w.as_deref() == Some(old_name.as_str()) {
         *region_last_w = Some(tab.clone());
     }
-    // Git already moved the worktree (it is the source of truth), so a cache
-    // failure does not undo the rename — but it is reported, never swallowed
-    // as success (THE-516): the registry still names the old path until the
-    // next reconcile.
-    match cache_rename(&old_path, &new_path_s, &tab, &want) {
-        Ok(()) => format!("Renamed to {want}"),
-        Err(e) => format!("Renamed to {want} (registry update failed: {e})"),
-    }
+    queue_rename(RegistryRename {
+        old_path,
+        new_path: new_path_s,
+        tab,
+        want: want.clone(),
+    });
+    format!("Renamed to {want}")
 }
 
 #[cfg(test)]
@@ -141,13 +154,6 @@ mod tests {
 
     fn group(name: &str, path: &str) -> WorktreeGroup {
         WorktreeGroup::new(name, GroupKind::Branch, path)
-    }
-
-    /// A registry write that succeeds without touching any database. Tests go
-    /// through `apply_with` rather than `apply` so they never open the
-    /// canonical state DB — see `apply_with`'s doc comment.
-    fn cache_ok(_old: &str, _new: &str, _tab: &str, _want: &str) -> Result<(), String> {
-        Ok(())
     }
 
     #[test]
@@ -169,7 +175,7 @@ mod tests {
             result: Ok(std::path::PathBuf::from("/wt/renamed")),
         };
         let mut bookmark = None;
-        let status = apply_with(&mut session, &mut bookmark, done, cache_ok);
+        let status = apply_with(&mut session, &mut bookmark, done, |_| {});
         assert_eq!(status, "Renamed to renamed");
         // The correct group (found by old_path) was re-keyed, not whatever now
         // sits at the stale index.
@@ -200,7 +206,7 @@ mod tests {
             result: Ok(std::path::PathBuf::from("/wt/x")),
         };
         let mut bookmark = None;
-        let status = apply(&mut session, &mut bookmark, done);
+        let status = apply_with(&mut session, &mut bookmark, done, |_| {});
         assert!(status.contains("no longer in session"), "got: {status}");
         assert_eq!(session.worktrees.len(), 1);
     }
@@ -214,7 +220,7 @@ mod tests {
             result: Err("boom".into()),
         };
         let mut bookmark = None;
-        let status = apply(&mut session, &mut bookmark, done);
+        let status = apply_with(&mut session, &mut bookmark, done, |_| {});
         assert_eq!(status, "rename failed: boom");
     }
 
@@ -231,18 +237,23 @@ mod tests {
             result: Ok(std::path::PathBuf::from("/wt/renamed")),
         };
         assert_eq!(
-            apply_with(&mut session, &mut bookmark, done, cache_ok),
+            apply_with(&mut session, &mut bookmark, done, |_| {}),
             "Renamed to renamed"
         );
         assert_eq!(bookmark.as_deref(), Some("repo/renamed"));
     }
 
-    /// THE-516: a registry write that fails must be reported in the status
-    /// line, never swallowed as a clean success — git already moved the
-    /// worktree, so the session is correct while the cache still names the old
-    /// path. The seam makes this path reachable without a real database.
+    /// The failure status remains THE-516's exact user-facing wording.
     #[test]
-    fn apply_reports_registry_failure_without_undoing_the_rename() {
+    fn registry_failure_status_preserves_the_the_516_text() {
+        assert_eq!(
+            registry_failure_status("renamed", "schema v68 → v69 refused"),
+            "Renamed to renamed (registry update failed: schema v68 → v69 refused)"
+        );
+    }
+
+    #[test]
+    fn apply_returns_optimistic_status_and_queues_the_registry_write() {
         let mut session = Session {
             worktrees: vec![group("repo/feature", "/wt/feature")],
             ..Default::default()
@@ -253,13 +264,16 @@ mod tests {
             result: Ok(std::path::PathBuf::from("/wt/renamed")),
         };
         let mut bookmark = None;
-        let status = apply_with(&mut session, &mut bookmark, done, |_, _, _, _| {
-            Err("schema v68 → v69 refused".into())
+        let mut queued = None;
+        let status = apply_with(&mut session, &mut bookmark, done, |request| {
+            queued = Some(request);
         });
-        assert_eq!(
-            status,
-            "Renamed to renamed (registry update failed: schema v68 → v69 refused)"
-        );
+        assert_eq!(status, "Renamed to renamed");
+        let request = queued.expect("registry write queued");
+        assert_eq!(request.old_path, "/wt/feature");
+        assert_eq!(request.new_path, "/wt/renamed");
+        assert_eq!(request.tab, "repo/renamed");
+        assert_eq!(request.want, "renamed");
         // The in-session re-key still happened: git is the source of truth and
         // the cache is only a cache.
         let g = &session.worktrees[0];
@@ -283,14 +297,13 @@ mod tests {
         };
         let mut seen = None;
         let mut bookmark = None;
-        apply_with(&mut session, &mut bookmark, done, |old, new, tab, want| {
+        apply_with(&mut session, &mut bookmark, done, |request| {
             seen = Some((
-                old.to_string(),
-                new.to_string(),
-                tab.to_string(),
-                want.to_string(),
+                request.old_path,
+                request.new_path,
+                request.tab,
+                request.want,
             ));
-            Ok(())
         });
         assert_eq!(
             seen,
