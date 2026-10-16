@@ -216,10 +216,6 @@ fn cancel_before_spawn_spawns_nothing() {
 }
 
 /// True when `pid` is gone or a zombie awaiting a subreaper.
-#[expect(
-    clippy::disallowed_methods,
-    reason = "ps is only used to verify test child cleanup"
-)]
 fn dead(pid: &str) -> bool {
     let out = Command::new("ps")
         .args(["-o", "stat=", "-p", pid])
@@ -285,10 +281,6 @@ async fn stderr_flood_past_cap_does_not_kill_the_child() {
 }
 
 #[tokio::test]
-#[expect(
-    clippy::disallowed_methods,
-    reason = "setsid availability is probed in this Unix-only test"
-)]
 async fn escaped_descendant_holding_the_pipe_cannot_pin_the_runner() {
     if Command::new("setsid").arg("--version").output().is_err() {
         return; // no setsid here (e.g. macOS)
