@@ -72,6 +72,7 @@ pub(crate) mod worktree_rename;
 pub(crate) fn apply_keymap_preset(preset: &str, cfg: &mut thegn_core::config::Config) -> String {
     let preset_to_store = preset.to_string();
     crate::db_task::persist(move |db| {
+        use thegn_core::store::WorkspaceStore;
         if let Err(error) = db.set_ui_state("", "keymap_preset", &preset_to_store) {
             tracing::debug!(target: "thegn::keymap", %error, "could not persist keymap preset");
         }
