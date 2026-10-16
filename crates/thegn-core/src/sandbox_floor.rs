@@ -346,7 +346,14 @@ pub fn queue_agent_gate(
         AgentGate::InfraHold(_) => 2,
     };
     if severity(&sandbox_gate) > severity(&queue_gate) {
-        sandbox_gate
+        match sandbox_gate {
+            AgentGate::InfraHold(reason) => AgentGate::InfraHold(format!(
+                "{reason}; inherited from the [sandbox] isolation floor in force — set \
+                 [sandbox] isolation_floor = \"off\" or the queue's agent_sandbox = false \
+                 to run the agent uncontained"
+            )),
+            other => other,
+        }
     } else {
         queue_gate
     }
@@ -718,6 +725,7 @@ mod tests {
         ) {
             AgentGate::InfraHold(reason) => {
                 assert!(reason.to_lowercase().contains("infrastructure"));
+                assert!(reason.contains("isolation_floor"));
             }
             other => panic!("expected infra hold, got {other:?}"),
         }
