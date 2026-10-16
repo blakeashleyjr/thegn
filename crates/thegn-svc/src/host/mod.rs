@@ -138,7 +138,7 @@ fn lower_iroh(i: &IrohReach) -> Result<(IrohTunnel, thegn_core::placement::SshPl
     // with a deadline (both streams — versions differ on where it lands).
     let (tx, rx) = std::sync::mpsc::channel::<u16>();
     let scan = |r: Box<dyn std::io::Read + Send>, tx: std::sync::mpsc::Sender<u16>| {
-        std::thread::spawn(move || {
+        thegn_core::thread_name::spawn_named("thegn-pipe-scan", move || {
             let reader = std::io::BufReader::new(r);
             for line in reader.lines().map_while(Result::ok) {
                 if let Some(idx) = line.find("127.0.0.1:") {
@@ -392,14 +392,14 @@ fn exec_argv(argv: &[String], timeout: Duration) -> Result<ExecOut, ExecFail> {
     // deadline kill is the only thing that ends it — losing all output.
     let mut stdout_pipe = child.stdout.take();
     let mut stderr_pipe = child.stderr.take();
-    let out_h = std::thread::spawn(move || {
+    let out_h = thegn_core::thread_name::spawn_named("thegn-host-out", move || {
         let mut s = String::new();
         if let Some(mut r) = stdout_pipe.take() {
             let _ = r.read_to_string(&mut s); // best-effort: read error just truncates captured output
         }
         s
     });
-    let err_h = std::thread::spawn(move || {
+    let err_h = thegn_core::thread_name::spawn_named("thegn-host-err", move || {
         let mut s = String::new();
         if let Some(mut r) = stderr_pipe.take() {
             let _ = r.read_to_string(&mut s); // best-effort: read error just truncates captured output

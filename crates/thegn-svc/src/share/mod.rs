@@ -1378,7 +1378,7 @@ fn start_inner(
         let url_tx = url_tx.clone();
         let endpoint_tracker = endpoint_tracker.clone();
         let url_rule = plan.url_rule.clone();
-        std::thread::spawn(move || {
+        thegn_core::thread_name::spawn_named("thegn-share-rd", move || {
             drain_stream(stream, tx, url_tx, url_rule, endpoint_tracker);
         });
     }

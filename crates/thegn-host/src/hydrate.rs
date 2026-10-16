@@ -5343,7 +5343,7 @@ pub(crate) fn retarget_diff_watcher(
     let wtx = watcher_tx.clone();
     let revive = crate::diff_watch::Reviver::new(wtx.clone());
     let w = waker.clone();
-    std::thread::spawn(move || {
+    thegn_core::thread_name::spawn_named("thegn-watch-reg", move || {
         // Watcher (re)registration + two `git rev-parse` calls. Off the render
         // path by construction — the 2s safety-net tick covers the gap until
         // this lands — so it has no claim on a performance core.

@@ -258,7 +258,7 @@ fn cat_append(
     let watchdog = {
         let sent = Arc::clone(&sent);
         let done = Arc::clone(&done);
-        std::thread::spawn(move || {
+        thegn_core::thread_name::spawn_named("thegn-dlv-wdog", move || {
             let mut last = sent.load(Ordering::Relaxed);
             let mut last_change = Instant::now();
             loop {

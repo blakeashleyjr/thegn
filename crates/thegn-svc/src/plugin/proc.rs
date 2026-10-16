@@ -336,7 +336,7 @@ pub fn spawn_ndjson_stream<S: NdjsonSink>(
     // while we read stdout would otherwise deadlock.
     let (stdout_tx, stdout_rx) = mpsc::channel();
     let (stderr_tx, stderr_rx) = mpsc::channel();
-    std::thread::spawn(move || {
+    thegn_core::thread_name::spawn_named("thegn-plug-out", move || {
         let mut sink = sink;
         let mut truncated = false;
         let mut accepting = true;
@@ -405,7 +405,7 @@ pub fn spawn_ndjson_stream<S: NdjsonSink>(
         }
     });
 
-    std::thread::spawn(move || {
+    thegn_core::thread_name::spawn_named("thegn-plug-err", move || {
         let mut s = String::new();
         if let Some(e) = stderr {
             // Drain to EOF, keeping only the first MAX_STDERR bytes. Stopping
@@ -531,7 +531,7 @@ pub(super) fn hand_off_unreaped_child(mut child: std::process::Child) {
     match child.try_wait() {
         Ok(Some(_)) => {}
         Ok(None) | Err(_) => {
-            std::thread::spawn(move || {
+            thegn_core::thread_name::spawn_named("thegn-plug-reap", move || {
                 if let Err(error) = child.wait() {
                     tracing::debug!(error = %error, "plugin reaper: wait failed");
                 }

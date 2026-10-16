@@ -156,7 +156,7 @@ pub(crate) fn add_host_from_input(
     // hydration (which reads the published snapshot) and later authority
     // checks see it. Off the loop: the reload re-reads the config file and
     // the state store.
-    std::thread::spawn(|| {
+    thegn_core::thread_name::spawn_named("thegn-cfg-load", || {
         crate::platform::qos::set_self(crate::platform::qos::Qos::Utility);
         if let crate::config_startup::ReloadOutcome::Failed(error) = crate::config_startup::reload()
         {

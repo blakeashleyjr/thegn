@@ -965,12 +965,12 @@ pub(super) fn output_bounded_with_input(
     }
     let mut so = child.stdout.take().expect("piped stdout");
     let mut se = child.stderr.take().expect("piped stderr");
-    let so_h = std::thread::spawn(move || {
+    let so_h = thegn_core::thread_name::spawn_named("thegn-git-out", move || {
         let mut b = Vec::new();
         let _ = so.read_to_end(&mut b); // best-effort: read error just truncates captured output
         b
     });
-    let se_h = std::thread::spawn(move || {
+    let se_h = thegn_core::thread_name::spawn_named("thegn-git-err", move || {
         let mut b = Vec::new();
         let _ = se.read_to_end(&mut b); // best-effort: read error just truncates captured output
         b
