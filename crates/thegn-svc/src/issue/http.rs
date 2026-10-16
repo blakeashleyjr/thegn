@@ -21,6 +21,7 @@ pub(crate) const MAX_IN_FLIGHT: usize = 8;
 pub(crate) const OPERATION_TIMEOUT: Duration = Duration::from_secs(20);
 pub(crate) const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 pub(crate) const READ_IDLE_TIMEOUT: Duration = Duration::from_secs(5);
+const POOL_IDLE_TIMEOUT: Duration = Duration::from_secs(50);
 pub(crate) const MAX_BODY_BYTES: usize = 1024 * 1024;
 pub(crate) const MAX_REQUEST_BYTES: usize = 512 * 1024;
 pub(crate) const MAX_DYNAMIC_INPUT_BYTES: usize = 64 * 1024;
@@ -91,9 +92,17 @@ impl TrackerHttpClient {
         authorization: String,
         budget: Arc<TrackerHttpBudget>,
     ) -> Result<Self, IssueError> {
-        Self::new_with_operation_timeout(provider, origin, authorization, budget, OPERATION_TIMEOUT)
+        Self::with_client(
+            provider,
+            origin,
+            authorization,
+            budget,
+            OPERATION_TIMEOUT,
+            shared_client()?,
+        )
     }
 
+    #[cfg(test)]
     pub(crate) fn new_with_operation_timeout(
         provider: &'static str,
         origin: &str,
@@ -179,6 +188,49 @@ impl TrackerHttpClient {
         }
         Ok(url)
     }
+}
+
+static TRACKER_CLIENT: OnceLock<Result<Client, String>> = OnceLock::new();
+
+fn shared_client() -> Result<Client, IssueError> {
+    TRACKER_CLIENT
+        .get_or_init(|| {
+            Client::builder()
+                .redirect(reqwest::redirect::Policy::none())
+                .no_gzip()
+                .no_brotli()
+                .no_deflate()
+                .no_zstd()
+                .connect_timeout(CONNECT_TIMEOUT)
+                .read_timeout(READ_IDLE_TIMEOUT)
+                .timeout(OPERATION_TIMEOUT)
+                .pool_idle_timeout(POOL_IDLE_TIMEOUT)
+                .build()
+                .map_err(|error| error.to_string())
+        })
+        .as_ref()
+        .cloned()
+        .map_err(|_| IssueError::Policy("tracker HTTP client configuration failed"))
+}
+
+static TRACKER_RUNTIME: OnceLock<Result<tokio::runtime::Runtime, String>> = OnceLock::new();
+
+fn tracker_runtime() -> Result<&'static tokio::runtime::Runtime, IssueError> {
+    TRACKER_RUNTIME
+        .get_or_init(|| {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .map_err(|error| error.to_string())
+        })
+        .as_ref()
+        .map_err(|_| IssueError::Policy("tracker runtime unavailable"))
+}
+
+/// Runs tracker work on the shared runtime so pooled connections survive
+/// between polls. Callers must be on a plain or `spawn_blocking` thread.
+pub fn block_on_tracker<F: std::future::Future>(future: F) -> Result<F::Output, IssueError> {
+    Ok(tracker_runtime()?.block_on(future))
 }
 
 pub(crate) struct TrackerHttpOperation<'a> {
@@ -534,6 +586,14 @@ mod tests {
     use axum::http::{HeaderValue, StatusCode};
     use axum::response::{IntoResponse, Response};
     use axum::routing::any;
+
+    #[test]
+    fn block_on_tracker_reuses_one_runtime() {
+        let first = tracker_runtime().unwrap();
+        let second = tracker_runtime().unwrap();
+        assert!(std::ptr::eq(first, second));
+        assert!(matches!(block_on_tracker(async { 7 }), Ok(7)));
+    }
 
     #[test]
     fn origin_policy_preserves_explicit_lan_http_and_rejects_authority_state() {

@@ -294,21 +294,6 @@ fn run_once(request: RefreshRequest) {
         }
         return;
     }
-    let Ok(rt) = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-    else {
-        record_tracker_failure(&cwd, "could not start tracker runtime", waker.as_ref());
-        if let Some(report) = report.as_ref() {
-            send_tracker_toast(
-                &report.tx,
-                &report.waker,
-                "Issue refresh failed — could not start the tracker runtime".to_owned(),
-                thegn_core::notification::Priority::Alert,
-            );
-        }
-        return;
-    };
     // Repo scope for GitHub (other providers scope by team/project and
     // ignore `repo`). Mirrors `spawn_my_work_refresh`.
     let loc = thegn_core::remote::GitLoc::for_worktree(&cwd);
@@ -324,7 +309,21 @@ fn run_once(request: RefreshRequest) {
     // Fetch every configured account; cache and diff each under its own
     // `(repo_root, provider, account)` key so trackers (and multiple
     // accounts of one provider) aggregate without clobbering.
-    let per_provider = rt.block_on(router.list_per_provider(&filter));
+    let per_provider = match thegn_svc::issue::block_on_tracker(router.list_per_provider(&filter)) {
+        Ok(per_provider) => per_provider,
+        Err(_) => {
+            record_tracker_failure(&cwd, "could not start tracker runtime", waker.as_ref());
+            if let Some(report) = report.as_ref() {
+                send_tracker_toast(
+                    &report.tx,
+                    &report.waker,
+                    "Issue refresh failed — could not start the tracker runtime".to_owned(),
+                    thegn_core::notification::Priority::Alert,
+                );
+            }
+            return;
+        }
+    };
     let mut failures = Vec::new();
     let mut any_success = false;
     let Ok(db) = thegn_core::db::Db::open() else {
