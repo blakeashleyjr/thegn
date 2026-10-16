@@ -2746,6 +2746,7 @@ mod tests {
         config.watch = vec![PrWatchKind::Ci];
         config.own_prs_only = false;
         config.pause_on_foreign_push = false;
+        config.agent_command = "true {prompt}".into();
         let mut pending = failing_ci_pr("head-b");
         pending.status_check_rollup[0].status = "IN_PROGRESS".into();
         pending.status_check_rollup[0].conclusion = None;
