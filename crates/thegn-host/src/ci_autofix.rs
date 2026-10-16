@@ -342,6 +342,22 @@ fn consider_candidate_with_forge(
         notify(reason.into());
         return;
     }
+    if let Err(reason) = crate::pr_driver::reattest(db, provider, &loc, &item, &fetched) {
+        let detail = reason.replace("before effect", "before agent dispatch");
+        let moved = detail.contains("head moved before agent dispatch");
+        let status = if moved {
+            PrqStatus::Watching
+        } else {
+            PrqStatus::NeedsHuman
+        };
+        if let Err(error) =
+            db.update_pr_status(&item.key, status.as_str(), None, Some(&detail), None)
+        {
+            tracing::debug!(target: "thegn::ci_autofix", %error, "could not persist pre-dispatch attestation hold");
+        }
+        notify(format!("CI autofix for PR #{} held: {detail}", item.number));
+        return;
+    }
     if !db.claim_ci_autofix(&candidate).unwrap_or(false) {
         return;
     }
@@ -637,6 +653,37 @@ mod authorship_tests {
             assert!(!handoff.sentinel.exists(), "duplicate ran for {mode:?}");
             assert_eq!(handoff.db.list_pr_queue().unwrap()[0].agent_attempts, 1);
         }
+    }
+
+    #[test]
+    fn reattest_failure_never_claims_or_spends() {
+        let fixture = Fixture::new();
+        let handoff = handoff(&fixture, CiAutofixMode::Auto, &fixture.pr.head_ref_oid);
+        assert!(
+            fixture
+                .loc
+                .git_out(&["checkout", "-b", "moved-checkout"])
+                .is_none()
+        );
+        assert_eq!(
+            fixture
+                .loc
+                .git_out(&["rev-parse", "--abbrev-ref", "HEAD"])
+                .as_deref(),
+            Some("moved-checkout")
+        );
+
+        consider(&handoff, false);
+
+        assert!(!handoff.sentinel.exists());
+        assert_eq!(handoff.db.list_pr_queue().unwrap()[0].agent_attempts, 0);
+        assert!(
+            handoff
+                .db
+                .claim_ci_autofix(&handoff.entry.candidate())
+                .unwrap(),
+            "reattest refusal must happen before the dedupe claim"
+        );
     }
 
     #[test]
