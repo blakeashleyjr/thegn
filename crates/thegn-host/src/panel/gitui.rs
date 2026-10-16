@@ -891,7 +891,9 @@ impl GitUi {
                 let Some(doc) = doc else {
                     return edge;
                 };
-                let mut target = edge;
+                let Some(mut target) = self.staging.as_ref().map(|staging| staging.cursor) else {
+                    return edge;
+                };
                 for _ in 0..steps {
                     let mut candidate = if down {
                         target.saturating_add(1)
@@ -924,19 +926,27 @@ impl GitUi {
             GitView::CommitFiles => {
                 if self.commit_files.is_empty() {
                     0
-                } else if down {
-                    edge.saturating_add(steps).min(self.commit_files.len() - 1)
                 } else {
-                    edge.min(self.commit_files.len() - 1).saturating_sub(steps)
+                    let cursor = self.cur.commit_files.min(self.commit_files.len() - 1);
+                    if down {
+                        cursor
+                            .saturating_add(steps)
+                            .min(self.commit_files.len() - 1)
+                    } else {
+                        cursor.saturating_sub(steps)
+                    }
                 }
             }
             GitView::Blame => {
                 if self.blame_rows.is_empty() {
                     0
-                } else if down {
-                    edge.saturating_add(steps).min(self.blame_rows.len() - 1)
                 } else {
-                    edge.min(self.blame_rows.len() - 1).saturating_sub(steps)
+                    let cursor = self.blame_cursor.min(self.blame_rows.len() - 1);
+                    if down {
+                        cursor.saturating_add(steps).min(self.blame_rows.len() - 1)
+                    } else {
+                        cursor.saturating_sub(steps)
+                    }
                 }
             }
             _ => edge,
@@ -3247,7 +3257,7 @@ mod tests {
             !staging::cursorable(&doc, edge - 1),
             "hunk header is skipped"
         );
-        let git = GitUi {
+        let mut git = GitUi {
             focus: GitView::Staging,
             staging: Some(StagingUi::new(path)),
             stage_doc: Some(StageDocState {
@@ -3258,6 +3268,7 @@ mod tests {
             }),
             ..Default::default()
         };
+        git.staging.as_mut().expect("staging state exists").cursor = edge;
         assert_eq!(
             git.drag_autoscroll_target(edge, DragOverflow::Above(1)),
             previous
@@ -3274,12 +3285,68 @@ mod tests {
     }
 
     #[test]
+    fn drag_autoscroll_above_samples_step_from_cursor() {
+        let path = "src/a.rs";
+        let diff = concat!(
+            "diff --git a/src/a.rs b/src/a.rs\n",
+            "index 1111111..2222222 100644\n",
+            "--- a/src/a.rs\n",
+            "+++ b/src/a.rs\n",
+            "@@ -1,0 +1,12 @@\n",
+            "+one\n+two\n+three\n+four\n+five\n+six\n",
+            "+seven\n+eight\n+nine\n+ten\n+eleven\n+twelve\n",
+        );
+        let doc = staging::build(path, diff);
+        let cursorable: Vec<_> = (0..doc.lines.len())
+            .filter(|index| staging::cursorable(&doc, *index))
+            .collect();
+        let cursor = *cursorable.get(9).expect("hunk has at least ten body lines");
+        let first_target = *cursorable.get(6).expect("first sample target exists");
+        let second_target = *cursorable.get(3).expect("second sample target exists");
+        let mut git = GitUi {
+            focus: GitView::Staging,
+            staging: Some(StagingUi::new(path)),
+            stage_doc: Some(StageDocState {
+                path: path.into(),
+                pane: StagePane::Unstaged,
+                doc,
+                diff: diff.into(),
+            }),
+            ..Default::default()
+        };
+        git.staging.as_mut().expect("staging state exists").cursor = cursor;
+
+        let first = git.drag_autoscroll_target(cursorable[2], DragOverflow::Above(3));
+        assert_eq!(first, first_target, "first sample steps from the cursor");
+        assert_eq!(
+            cursorable.iter().position(|line| *line == cursor).unwrap()
+                - cursorable.iter().position(|line| *line == first).unwrap(),
+            3,
+            "first sample moves three cursorable lines"
+        );
+
+        git.staging.as_mut().expect("staging state exists").cursor = first;
+        let second = git.drag_autoscroll_target(cursorable[0], DragOverflow::Above(3));
+        assert_eq!(
+            second, second_target,
+            "second sample steps from the updated cursor"
+        );
+        assert_eq!(
+            cursorable.iter().position(|line| *line == first).unwrap()
+                - cursorable.iter().position(|line| *line == second).unwrap(),
+            3,
+            "second sample also moves three cursorable lines"
+        );
+    }
+
+    #[test]
     fn drag_autoscroll_clamps_lists() {
         let mut git = GitUi {
             focus: GitView::CommitFiles,
             commit_files: (0..5).map(|index| (format!("{index}.rs"), 0, 0)).collect(),
             ..Default::default()
         };
+        git.cur.commit_files = 1;
         assert_eq!(git.drag_autoscroll_target(1, DragOverflow::Below(2)), 3);
         assert_eq!(git.drag_autoscroll_target(3, DragOverflow::Below(9)), 4);
         git.focus = GitView::Blame;

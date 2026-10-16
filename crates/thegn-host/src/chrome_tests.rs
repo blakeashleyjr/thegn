@@ -3577,6 +3577,7 @@ fn panel_drill_drag_hit_reports_overflow() {
         .collect();
     let frame = crate::panel::frame::build_panel(&model, &ui, rect.cols, rect.rows, true);
     let zone = frame.col_zone.expect("Blame frame has a fused zone");
+    assert!(zone.rows.start > 0);
     let drills: Vec<_> = frame
         .col_hits
         .iter()
