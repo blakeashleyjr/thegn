@@ -476,21 +476,21 @@ impl ContainerDemand {
         }
     }
 
-    /// The demand a set of visible surfaces implies. Detail: the monitor, or
-    /// the Sandbox section (its expanded per-container rows/stats). Summary:
-    /// the panel is open AND the active worktree is OCI-backed (the collapsed
-    /// summary chip only looks for the active worktree's own container; other
-    /// backends need no listing). The machine-global rows live in the Sandbox
-    /// section body, which is the Detail case. None: nothing consumes it.
+    /// The demand a set of visible surfaces implies. Detail: the monitor's
+    /// Containers tab or the Sandbox section (its expanded per-container
+    /// rows/stats). Other monitor tabs only need Summary to retain the
+    /// Containers tab's presence. Summary also serves the panel's collapsed
+    /// chip when the active worktree is OCI-backed. None: nothing consumes it.
     pub(crate) fn resolve(
         panel_open: bool,
         monitor_open: bool,
+        monitor_containers_visible: bool,
         sandbox_section_open: bool,
         active_oci: bool,
     ) -> Self {
-        if monitor_open || sandbox_section_open {
+        if monitor_containers_visible || sandbox_section_open {
             Self::Detail
-        } else if panel_open && active_oci {
+        } else if monitor_open || (panel_open && active_oci) {
             Self::Summary
         } else {
             Self::None

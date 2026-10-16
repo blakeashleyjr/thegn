@@ -428,6 +428,21 @@ fn pausing_reduces_the_sampling_gate_and_closing_clears_it() {
 }
 
 #[test]
+fn only_the_containers_tab_shows_containers() {
+    let model = model_with(full_snap());
+    let hist = history(120, NOW_MS);
+    let screen = Rect::full(120, 40);
+    let mut ov = open_tab(MonitorTab::Cpu, &model, &hist, screen);
+    assert!(!ov.shows_containers());
+
+    ov = open_tab(MonitorTab::Containers, &model, &hist, screen);
+    assert!(ov.shows_containers());
+    assert_eq!(ch(&mut ov, ' '), MonitorOutcome::PrefsChanged);
+    assert!(ov.is_paused());
+    assert!(ov.shows_containers());
+}
+
+#[test]
 fn a_wide_window_does_not_ask_for_fast_sampling() {
     // 500ms resolution buys nothing on an hour-wide plot, so it shouldn't cost
     // the wake rate either. Expressed against the ladder rather than a press
