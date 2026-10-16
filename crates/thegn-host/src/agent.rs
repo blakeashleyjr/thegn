@@ -796,7 +796,23 @@ pub fn prepare_sandbox_env(
                 // `ensure` proves the container RUNNING, but not that OCI `exec` works
                 // (broken keep-id/crun); probe so the real error surfaces, not a vanish.
                 Ok(run_with_vpn_rollback(spec, |spec| {
-                    sandbox::ensure(spec).and_then(|()| {
+                    let socket_path = crate::daemon::socket_path(&cfg.daemon);
+                    let socket_dir = socket_path.parent().map(Path::to_path_buf);
+                    let extra = socket_dir.into_iter().collect::<Vec<_>>();
+                    sandbox::ensure_attested(
+                        spec,
+                        &thegn_core::sandbox_compose::ComposeGuard::for_host(&extra),
+                    ).and_then(|report| {
+                        let isolation = thegn_core::sandbox_compose::compose_reported_isolation(
+                            spec.capabilities().isolation,
+                            &report,
+                        );
+                        if let Some(reason) = report.compose_unverified {
+                            warnings.push(format!(
+                                "sandbox {}: Compose config could not be inspected ({reason}); protected host binds were not checked; isolation reported as {}",
+                                spec.backend.label(), isolation.as_str()
+                            ));
+                        }
                         thegn_core::sandbox_preflight::preflight_exec(spec)
                             // No prefix here: `preflight_exec` now owns its own error
                             // classing — a generic runtime failure still reads "exec
@@ -822,6 +838,16 @@ pub fn prepare_sandbox_env(
                     });
                 }
                 Err(e) => {
+                    if let Some(refusal) =
+                        e.downcast_ref::<thegn_core::sandbox_compose::ComposeBindRefusal>()
+                    {
+                        let message = refusal.to_string();
+                        if explicit_choice {
+                            anyhow::bail!("{message} for {worktree}");
+                        }
+                        compose_miss = Some(message);
+                        continue;
+                    }
                     let m = format!("sandbox {} failed: {e}", spec.backend.label());
                     if explicit_choice {
                         anyhow::bail!("{m} for {worktree}")

@@ -1128,6 +1128,46 @@ fn spellings(p: &str) -> [PathBuf; 2] {
     [raw, resolved]
 }
 
+/// Whether a path reaches any protected host path, either by residing inside
+/// it or by naming an ancestor that would expose it. Compare both the supplied
+/// spelling and the lenient canonical spelling so dangling tails cannot hide a
+/// symlinked parent.
+pub(crate) fn path_reaches_protected(path: &Path, protected: &[PathBuf]) -> bool {
+    let normalize = |path: &Path| {
+        let mut normalized = PathBuf::new();
+        let mut rooted = false;
+        for component in path.components() {
+            match component {
+                std::path::Component::RootDir => {
+                    rooted = true;
+                    normalized.push(std::path::MAIN_SEPARATOR_STR);
+                }
+                std::path::Component::CurDir => {}
+                std::path::Component::ParentDir => {
+                    if !normalized.pop() && !rooted {
+                        normalized.push("..");
+                    }
+                }
+                std::path::Component::Prefix(prefix) => normalized.push(prefix.as_os_str()),
+                std::path::Component::Normal(part) => normalized.push(part),
+            }
+        }
+        normalized
+    };
+    let path = path.to_string_lossy();
+    let source_spellings = spellings(&path);
+    source_spellings.iter().any(|spelling| {
+        let spelling = normalize(spelling);
+        protected.iter().any(|entry| {
+            let entry_canonical = resolve_lenient(entry);
+            let entry_spellings = [normalize(entry), normalize(&entry_canonical)];
+            entry_spellings.iter().any(|candidate| {
+                spelling.starts_with(candidate) || candidate.starts_with(&spelling)
+            })
+        })
+    })
+}
+
 /// Whether a user/default `[sandbox] mounts` entry (host path AND destination,
 /// lexically and canonicalized) reaches the sealed deny list — inside it OR as
 /// an ancestor of it. Sealed panes drop such entries: `mounts` is the extension
