@@ -707,10 +707,10 @@ mod tests {
         // This exercises sysinfo's Linux /proc handle cache. Other platforms
         // have no /proc fd links to inspect, and the targeted refresh behavior
         // is already covered by the platform-independent sampler tests.
-        let fd_dir = std::path::Path::new("/proc/self/fd");
-        if !fd_dir.is_dir() {
+        if !cfg!(target_os = "linux") {
             return;
         }
+        let fd_dir = std::path::Path::new("/proc/self/fd");
 
         let mut child = ChildGuard(
             std::process::Command::new("sh")
@@ -810,7 +810,7 @@ mod tests {
 
     #[test]
     fn tracked_refresh_skips_tasks_but_keeps_cpu_and_memory() {
-        if !std::path::Path::new("/proc/self/task").exists() {
+        if !cfg!(target_os = "linux") {
             return;
         }
 
