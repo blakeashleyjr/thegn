@@ -1290,6 +1290,55 @@ mod tests {
         git(&["checkout", "-b", branch]);
     }
 
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "the test fixture runs a hermetic git remote command"
+    )]
+    fn enqueue_pr_with_checkout(
+        dir: &tempfile::TempDir,
+        db: &Db,
+        number: u64,
+        branch: &str,
+        pr_url: &str,
+    ) -> (std::path::PathBuf, PrItem) {
+        let checkout = dir.path().join(format!("checkout-{number}"));
+        std::fs::create_dir(&checkout).unwrap();
+        git_repo_on_branch(&checkout, branch);
+        let suffix = format!("/pull/{number}");
+        let repo_url = pr_url
+            .strip_suffix(suffix.as_str())
+            .expect("fixture PR URL ends with its number");
+        let git = thegn_core::util::git_cmd(&checkout)
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .args(["remote", "add", "origin", repo_url])
+            .status()
+            .unwrap();
+        assert!(
+            git.success(),
+            "could not set origin for {}",
+            checkout.display()
+        );
+        let checkout = checkout.canonicalize().unwrap();
+        let checkout_s = checkout.to_string_lossy().into_owned();
+        db.enqueue_bound_pr(
+            &checkout_s,
+            number,
+            Some(&checkout_s),
+            branch,
+            "main",
+            "github",
+            pr_url,
+        )
+        .unwrap();
+        let row = db
+            .list_pr_queue()
+            .unwrap()
+            .into_iter()
+            .find(|row| row.number == number)
+            .expect("fixture row was persisted with its bound identity");
+        (checkout, PrItem::from(&row))
+    }
+
     #[test]
     fn checkout_branch_mismatch_holds_before_spending_attempt_or_running_agent() {
         let (dir, db) = temp_db("prq-wrong-checkout");
@@ -1332,7 +1381,7 @@ mod tests {
         assert_eq!(row.status, PrqStatus::NeedsHuman.as_str());
         let detail = row.detail.unwrap();
         assert!(
-            detail.contains("other") && detail.contains("feat"),
+            detail.contains("queued checkout branch changed; run `thegn pr queue rebind --pr 7`"),
             "{detail}"
         );
     }
@@ -2270,29 +2319,20 @@ mod tests {
 
     #[test]
     fn ambiguous_rerun_response_keeps_allowance_spent() {
-        let (_dir, db) = temp_db("prq-rerun-ambiguous");
+        let (dir, db) = temp_db("prq-rerun-ambiguous");
         let mut cfg = cfg();
         cfg.watch = vec![PrWatchKind::Ci];
         cfg.pause_on_foreign_push = false;
         cfg.agent_command = "true {prompt}".into();
         cfg.own_prs_only = false;
-        db.enqueue_bound_pr(
-            "/repo",
-            7,
-            None,
-            "feat",
-            "main",
-            "github",
-            "https://github.com/me/repo/pull/7",
-        )
-        .unwrap();
-        let row = db.list_pr_queue().unwrap().remove(0);
+        let (checkout, row) =
+            enqueue_pr_with_checkout(&dir, &db, 7, "feat", "https://github.com/me/repo/pull/7");
         let forge = FakeForge::new(Some(failing_ci_pr("abc"))).with_rerun_error();
         let out = drive_queue(
             &cfg,
             &Config::default(),
             &forge,
-            Path::new("/repo"),
+            &checkout,
             &db,
             vec![PrItem::from(&row)],
             |_| {},
@@ -2318,29 +2358,20 @@ mod tests {
 
     #[test]
     fn a_new_pr_head_rearms_the_ci_rerun_allowance() {
-        let (_dir, db) = temp_db("prq-rerun-head-change");
+        let (dir, db) = temp_db("prq-rerun-head-change");
         let mut cfg = cfg();
         cfg.watch = vec![PrWatchKind::Ci];
         cfg.pause_on_foreign_push = false;
         cfg.agent_command = "true {prompt}".into();
         cfg.own_prs_only = false;
-        db.enqueue_bound_pr(
-            "/repo",
-            7,
-            None,
-            "feat",
-            "main",
-            "github",
-            "https://github.com/me/repo/pull/7",
-        )
-        .unwrap();
+        let (checkout, row) =
+            enqueue_pr_with_checkout(&dir, &db, 7, "feat", "https://github.com/me/repo/pull/7");
         let forge = FakeForge::new(Some(failing_ci_pr("abc"))).with_rerun_count(1);
-        let row = db.list_pr_queue().unwrap().remove(0);
         drive_queue(
             &cfg,
             &Config::default(),
             &forge,
-            Path::new("/repo"),
+            &checkout,
             &db,
             vec![PrItem::from(&row)],
             |_| {},
@@ -2351,7 +2382,7 @@ mod tests {
             &cfg,
             &Config::default(),
             &forge,
-            Path::new("/repo"),
+            &checkout,
             &db,
             vec![PrItem::from(&row)],
             |_| {},
@@ -2375,17 +2406,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("pr-rerun-race.db");
         let db = Db::open_at(&path).unwrap();
-        db.enqueue_bound_pr(
-            "/repo",
-            7,
-            None,
-            "feat",
-            "main",
-            "github",
-            "https://github.com/me/repo/pull/7",
-        )
-        .unwrap();
-        let row = db.list_pr_queue().unwrap().remove(0);
+        let (checkout, row) =
+            enqueue_pr_with_checkout(&dir, &db, 7, "feat", "https://github.com/me/repo/pull/7");
         drop(db);
 
         let forge =
@@ -2397,6 +2419,7 @@ mod tests {
                 let forge = forge.clone();
                 let barrier = barrier.clone();
                 let row = row.clone();
+                let checkout = checkout.clone();
                 std::thread::spawn(move || {
                     let db = Db::open_at(&path).unwrap();
                     let mut cfg = cfg();
@@ -2408,7 +2431,7 @@ mod tests {
                         &cfg,
                         &Config::default(),
                         forge.as_ref(),
-                        Path::new("/repo"),
+                        &checkout,
                         &db,
                         vec![PrItem::from(&row)],
                         |_| {},
@@ -2590,24 +2613,15 @@ mod tests {
         config.watch = vec![PrWatchKind::Ci];
         config.own_prs_only = false;
         config.agent_command = format!("touch {}", sentinel.display());
-        db.enqueue_bound_pr(
-            "/repo",
-            7,
-            None,
-            "feat",
-            "main",
-            "github",
-            "https://github.com/me/repo/pull/7",
-        )
-        .unwrap();
-        let row = db.list_pr_queue().unwrap().remove(0);
+        let (checkout, row) =
+            enqueue_pr_with_checkout(&dir, &db, 7, "feat", "https://github.com/me/repo/pull/7");
         let forge = FakeForge::new(Some(failing_ci_pr("abc"))).with_rerun_count(1);
         let unsupported = crate::agent_run::force_headless_unsupported();
         let out = drive_queue(
             &config,
             &Config::default(),
             &forge,
-            Path::new("/repo"),
+            &checkout,
             &db,
             vec![PrItem::from(&row)],
             |_| {},
@@ -2626,29 +2640,20 @@ mod tests {
 
     #[test]
     fn invalid_prompt_template_is_a_durable_pr_refusal_without_attempt_spend() {
-        let (_dir, db) = temp_db("prq-invalid-prompt");
+        let (dir, db) = temp_db("prq-invalid-prompt");
         let mut config = cfg();
         config.watch = vec![PrWatchKind::Ci];
         config.own_prs_only = false;
         config.prompts.ci_failure = "{nope}".into();
         config.agent_command = "true {prompt}".into();
-        db.enqueue_bound_pr(
-            "/repo",
-            7,
-            None,
-            "feat",
-            "main",
-            "github",
-            "https://github.com/me/repo/pull/7",
-        )
-        .unwrap();
-        let row = db.list_pr_queue().unwrap().remove(0);
+        let (checkout, row) =
+            enqueue_pr_with_checkout(&dir, &db, 7, "feat", "https://github.com/me/repo/pull/7");
         let forge = FakeForge::new(Some(failing_ci_pr("abc"))).with_rerun_count(0);
         let out = drive_queue(
             &config,
             &Config::default(),
             &forge,
-            Path::new("/repo"),
+            &checkout,
             &db,
             vec![PrItem::from(&row)],
             |_| {},
@@ -2700,18 +2705,9 @@ mod tests {
 
     #[test]
     fn moved_head_between_read_and_rerun_spends_no_allowance() {
-        let (_dir, db) = temp_db("prq-read-effect-head");
-        db.enqueue_bound_pr(
-            "/repo",
-            7,
-            None,
-            "feature",
-            "main",
-            "github",
-            "https://github.com/me/repo/pull/7",
-        )
-        .unwrap();
-        let row = db.list_pr_queue().unwrap().remove(0);
+        let (dir, db) = temp_db("prq-read-effect-head");
+        let (checkout, row) =
+            enqueue_pr_with_checkout(&dir, &db, 7, "feat", "https://github.com/me/repo/pull/7");
         let original = failing_ci_pr("head-a");
         let mut moved = original.clone();
         moved.head_ref_oid = "head-b".into();
@@ -2724,7 +2720,7 @@ mod tests {
             &config,
             &Config::default(),
             &forge,
-            Path::new("/repo"),
+            &checkout,
             &db,
             vec![PrItem::from(&row)],
             |_| {},
@@ -2738,18 +2734,10 @@ mod tests {
 
     #[test]
     fn foreign_push_during_wait_persists_budget_refill_for_later_ci_failure() {
-        let (_dir, db) = temp_db("prq-wait-push-budget");
-        db.enqueue_bound_pr(
-            "/repo",
-            7,
-            None,
-            "feature",
-            "main",
-            "github",
-            "https://github.com/me/repo/pull/7",
-        )
-        .unwrap();
-        let key = db.list_pr_queue().unwrap().remove(0).key;
+        let (dir, db) = temp_db("prq-wait-push-budget");
+        let (checkout, initial_row) =
+            enqueue_pr_with_checkout(&dir, &db, 7, "feat", "https://github.com/me/repo/pull/7");
+        let key = initial_row.key;
         db.set_pr_agent_attempts(&key, 3).unwrap();
         db.update_pr_status(&key, "blocked_ci", Some("ci"), None, Some("head-a"))
             .unwrap();
@@ -2765,7 +2753,7 @@ mod tests {
             &config,
             &Config::default(),
             &forge,
-            Path::new("/repo"),
+            &checkout,
             &db,
             vec![PrItem::from(&row)],
             |_| {},
@@ -2781,7 +2769,7 @@ mod tests {
             &config,
             &Config::default(),
             &forge,
-            Path::new("/repo"),
+            &checkout,
             &db,
             vec![PrItem::from(&row)],
             |_| {},
