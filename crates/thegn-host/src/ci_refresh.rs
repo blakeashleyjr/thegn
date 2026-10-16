@@ -230,6 +230,8 @@ struct CiRefreshCoordinator {
 }
 
 impl CiRefreshCoordinator {
+    /// Rejects submissions after shutdown; this latch check is authoritative.
+    /// Callers may precheck to log a refusal, but this guard remains authoritative.
     fn submit(&mut self, request: RefreshRequest) -> bool {
         if self.shut_down {
             return false;
@@ -1590,6 +1592,13 @@ mod tests {
                 token: flight_token("/later", None, false),
                 generation: None,
             }));
+            assert!(
+                coordinator
+                    .flight
+                    .running
+                    .as_ref()
+                    .is_some_and(|token| Arc::ptr_eq(&token.cancel, &running_cancel))
+            );
             assert!(coordinator.queued.is_none());
             assert!(coordinator.flight.queued.is_none());
         }
