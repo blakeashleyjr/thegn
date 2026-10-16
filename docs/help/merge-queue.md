@@ -255,7 +255,7 @@ gate_setup_timeout_secs = 1800
 gate_timeout_secs = 3600
 ```
 
-`gate_setup_timeout_secs` defaults to `0` (unbounded), while
+`gate_setup_timeout_secs` defaults to `1800` seconds (30 minutes), while
 `gate_timeout_secs` defaults to `3600` seconds. Set either to `0` to disable its
 deadline, or tune setup and gate separately. A timeout is an infrastructure hold
 (`gate_error`), never a red result attributed to the candidate branch. Filesystem
@@ -264,6 +264,11 @@ deadlines, and a process stuck in uninterruptible OS I/O can delay reaping and
 keep its quarantined lease held. The matching environment overrides are
 `THEGN_MERGE_QUEUE_GATE_SETUP_TIMEOUT_SECS` and
 `THEGN_MERGE_QUEUE_GATE_TIMEOUT_SECS`.
+
+Pressing Ctrl-C or sending SIGTERM during `thegn integrate`, `thegn land`, or
+`thegn merge drain` cancels the fold without blaming a branch. If cancellation
+stops a gate already running for a row, that row is recorded as `gate_error`;
+rows not yet started remain queued.
 
 When a red union is being localized, `diagnosis_max_gates` (default `8`) caps
 the total gate attempts and `diagnosis_timeout_secs` (default `3600`) bounds
@@ -286,7 +291,8 @@ one of them is about your branch:
   on the next drain, since the environment may be fixed by then. The human
   footer and `thegn merge drain --json` report each gate error's `phase`
   (preparation, setup, or gate) and `class` (timeout, spawn, killed,
-  setup_failed, capture, poisoned, preparation, signing, or source_moved). The JSON
+  setup_failed, capture, poisoned, preparation, signing, source_moved, or
+  cancelled). The JSON
   `gate_verdicts` entries carry both fields.
 
 ## Driving it from an agent pane

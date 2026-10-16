@@ -1200,6 +1200,24 @@ fn capture_verdict(
             },
             false,
         ),
+        Capture::Cancelled { log } => (
+            GateVerdict::Error {
+                reason: if setup {
+                    "gate_setup_command cancelled"
+                } else {
+                    "gate_command cancelled"
+                }
+                .into(),
+                log,
+                phase: if setup {
+                    GatePhase::Setup
+                } else {
+                    GatePhase::Gate
+                },
+                class: GateErrorClass::Cancelled,
+            },
+            false,
+        ),
         Capture::SpawnFailed { reason, log } => (
             GateVerdict::Error {
                 reason,

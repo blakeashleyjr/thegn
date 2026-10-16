@@ -28,6 +28,7 @@ static REAPER: OnceLock<Result<mpsc::Sender<ReapOwner>, String>> = OnceLock::new
 pub(super) enum CaptureResult {
     Completed { status: ExitStatus, log: String },
     Timeout { log: String },
+    Cancelled { log: String },
     SpawnFailed { reason: String, log: String },
     Infrastructure { reason: String, log: String },
     Poisoned { reason: String, log: String },
@@ -298,6 +299,7 @@ pub(super) fn run(mut command: Command, timeout: Duration) -> CaptureResult {
     let mut leader_exited = false;
     let mut wait_error = None;
     let mut timed_out = false;
+    let mut cancelled = false;
     let mut out_ready = None;
     let mut err_ready = None;
     loop {
@@ -327,11 +329,18 @@ pub(super) fn run(mut command: Command, timeout: Duration) -> CaptureResult {
             timed_out = true;
             break;
         }
+        if crate::fold_cancel::requested() {
+            cancelled = true;
+            break;
+        }
         std::thread::sleep(POLL);
+    }
+    if !cancelled && crate::fold_cancel::requested() {
+        cancelled = true;
     }
     let reader_failed = out_ready.as_ref().is_some_and(|result| result.is_err())
         || err_ready.as_ref().is_some_and(|result| result.is_err());
-    if timed_out || reader_failed || wait_error.is_some() {
+    if timed_out || cancelled || reader_failed || wait_error.is_some() {
         group.terminate();
         // Keep the direct child unreaped during the grace window. That pins
         // its identity while we may still force-kill its process group.
@@ -384,7 +393,11 @@ pub(super) fn run(mut command: Command, timeout: Duration) -> CaptureResult {
             return CaptureResult::Poisoned { reason, log };
         }
     }
-    let streams_deadline = deadline.map(|end| end.max(Instant::now() + TERM_GRACE));
+    let streams_deadline = if cancelled {
+        Some(Instant::now() + TERM_GRACE)
+    } else {
+        deadline.map(|end| end.max(Instant::now() + TERM_GRACE))
+    };
     let streams = match collect_streams(
         out_rx,
         err_rx,
@@ -476,7 +489,9 @@ pub(super) fn run(mut command: Command, timeout: Duration) -> CaptureResult {
             log,
         };
     }
-    if timed_out {
+    if cancelled {
+        CaptureResult::Cancelled { log }
+    } else if timed_out {
         CaptureResult::Timeout { log }
     } else {
         CaptureResult::Completed { status, log }
@@ -700,6 +715,26 @@ mod tests {
             Duration::from_millis(120),
         );
         assert!(matches!(output, CaptureResult::Timeout { .. }));
+    }
+
+    #[test]
+    fn cancel_probe_stops_an_unbounded_gate_and_reaps_it() {
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let signal = Arc::clone(&cancelled);
+        let signal_thread = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(150));
+            signal.store(true, Ordering::Release);
+        });
+        let probe = Arc::clone(&cancelled);
+        let _scope = crate::fold_cancel::scope(move || probe.load(Ordering::Acquire));
+        let started = Instant::now();
+        let output = run(shell!("exec sleep 30"), Duration::ZERO);
+        assert!(
+            matches!(output, CaptureResult::Cancelled { .. }),
+            "got {output:?}"
+        );
+        assert!(started.elapsed() < Duration::from_secs(5));
+        signal_thread.join().expect("cancellation signal thread");
     }
 
     #[test]
