@@ -1112,7 +1112,7 @@ mod tests {
                 crate::platform::publish_private_executable(
                     &base.join("fixture-shell.staged"),
                     &shell,
-                    b"#!/bin/sh\n[ \"$#\" -eq 2 ] && [ \"$1\" = -lc ] || exit 97\nexec /bin/sh -c \"$2\"\n",
+                    b"#!/bin/sh\n[ \"$#\" -eq 2 ] || exit 97\ncase \"$1\" in -lc|-c) ;; *) exit 97 ;; esac\nexec /bin/sh -c \"$2\"\n",
                 ).unwrap();
                 let env = crate::testenv::EnvVarGuard::set(&[
                     ("XDG_CONFIG_HOME", config.to_str().unwrap()),
