@@ -482,10 +482,7 @@ pub(super) fn run(cmd: &mut Command, limits: &Limits, cancel: &AtomicBool) -> Ru
             break End::TimedOut;
         }
         let before = out.capture.total.saturating_add(err.capture.total);
-        if let Some(which) = match drain(&mut pipes, &mut out, &mut err) {
-            Ok(value) => value,
-            Err(_error) => None,
-        } {
+        if let Some(which) = drain(&mut pipes, &mut out, &mut err).unwrap_or_default() {
             break End::OutputLimit(which);
         }
         if out.capture.total.saturating_add(err.capture.total) > before {
