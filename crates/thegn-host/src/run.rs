@@ -16067,11 +16067,19 @@ async fn event_loop<T: Terminal>(
                 if occluded_now && !corner_occluded {
                     pending_corner_oob.require_delete();
                 }
-                let draw = if corner_gfx.is_empty() {
-                    Vec::new()
-                } else {
-                    crate::kitty_relay::coalesce_gfx(std::mem::take(&mut corner_gfx))
-                };
+                let queued_bytes = corner_gfx.iter().map(Vec::len).sum::<usize>();
+                let (draw, truncated) = crate::kitty_relay::coalesce_gfx_within(
+                    std::mem::take(&mut corner_gfx),
+                    crate::frame_writer::OOB_QUEUE_BYTES,
+                );
+                if truncated {
+                    pending_corner_oob.require_delete();
+                    tracing::debug!(
+                        target: "thegn::frame",
+                        dropped_bytes = queued_bytes - draw.len(),
+                        "truncated corner kitty graphics batch"
+                    );
+                }
                 corner_occluded = occluded_now;
                 if draw.is_empty() {
                     pending_corner_oob.retry(!occluded_now, |bytes| writer.try_submit_oob(bytes));
