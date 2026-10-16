@@ -2392,11 +2392,21 @@ impl LspClient {
             self.send_cancel(id);
             return Err(LspError::Timeout);
         }
+        if let Err(error) = self.ensure_open() {
+            self.pending
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .remove(&id);
+            return Err(error);
+        }
         if let Err(error) = enqueue_body(&self.writer, &self.queued_bytes, &body, None) {
             self.pending
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .remove(&id);
+            if let Ok(result) = rx.try_recv() {
+                return result;
+            }
             return Err(error);
         }
 
