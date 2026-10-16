@@ -511,6 +511,7 @@ mod tests {
             "33 22 0:45 / /mnt/cloud rw - fuse.rclone remote: rw\n",
             "34 22 0:46 / truncated rw\n",
             "35 22 0:47 / /mnt/no-separator rw\n",
+            "36 22 0:48 / - fuse.sshfs\n",
         );
 
         assert_eq!(

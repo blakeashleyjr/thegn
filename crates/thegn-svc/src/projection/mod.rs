@@ -223,10 +223,17 @@ fn reap_legacy_mounts_with(
     mounted: Option<&std::collections::BTreeSet<String>>,
     mut run_unmount: impl FnMut(&[String]) -> Result<()>,
 ) -> usize {
-    let entries = match std::fs::read_dir(mounts_dir) {
+    let (scan_dir, mounted) = match std::fs::canonicalize(mounts_dir) {
+        Ok(canonical_dir) => (canonical_dir, mounted),
+        Err(error) => {
+            tracing::debug!(%error, path = %mounts_dir.display(), "could not resolve legacy projection mounts directory");
+            (mounts_dir.to_path_buf(), None)
+        }
+    };
+    let entries = match std::fs::read_dir(&scan_dir) {
         Ok(entries) => entries,
         Err(error) => {
-            tracing::debug!(%error, path = %mounts_dir.display(), "could not scan legacy projection mounts");
+            tracing::debug!(%error, path = %scan_dir.display(), "could not scan legacy projection mounts");
             return 0;
         }
     };
@@ -235,7 +242,7 @@ fn reap_legacy_mounts_with(
         let entry = match entry {
             Ok(entry) => entry,
             Err(error) => {
-                tracing::debug!(%error, path = %mounts_dir.display(), "could not read projection mount entry");
+                tracing::debug!(%error, path = %scan_dir.display(), "could not read projection mount entry");
                 continue;
             }
         };
@@ -805,6 +812,7 @@ mod tests {
     fn reaper_unmounts_a_mountinfo_legacy_path() {
         let mounts = tempfile::tempdir().unwrap();
         let legacy = mounts.path().join("dev-box-srv-work");
+        std::fs::create_dir(&legacy).unwrap();
         let mounted = std::collections::BTreeSet::from([legacy.to_string_lossy().into_owned()]);
         let mut calls = Vec::new();
 
@@ -813,10 +821,39 @@ mod tests {
             Ok(())
         });
 
-        assert_eq!(reaped, 0);
+        assert_eq!(reaped, 1);
         assert_eq!(
             calls,
             vec![SshPlacement::sshfs_unmount_argv(legacy.to_str().unwrap())]
+        );
+        assert!(!legacy.exists());
+    }
+
+    #[test]
+    fn reaper_matches_mountinfo_path_through_symlinked_mounts_directory() {
+        let temp = tempfile::tempdir().unwrap();
+        let real_mounts = temp.path().join("real-mounts");
+        let linked_mounts = temp.path().join("linked-mounts");
+        std::fs::create_dir(&real_mounts).unwrap();
+        std::os::unix::fs::symlink(&real_mounts, &linked_mounts).unwrap();
+        let legacy = real_mounts.join("dev-box-srv-work");
+        std::fs::create_dir(&legacy).unwrap();
+        let resolved_legacy = std::fs::canonicalize(&legacy).unwrap();
+        let mounted =
+            std::collections::BTreeSet::from([resolved_legacy.to_string_lossy().into_owned()]);
+        let mut calls = Vec::new();
+
+        let reaped = reap_legacy_mounts_with(&linked_mounts, Some(&mounted), |argv| {
+            calls.push(argv.to_vec());
+            Ok(())
+        });
+
+        assert_eq!(reaped, 1);
+        assert_eq!(
+            calls,
+            vec![SshPlacement::sshfs_unmount_argv(
+                resolved_legacy.to_str().unwrap()
+            )]
         );
         assert!(!legacy.exists());
     }
