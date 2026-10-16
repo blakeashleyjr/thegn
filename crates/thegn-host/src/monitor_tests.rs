@@ -1867,6 +1867,7 @@ fn disk_volume_row_displays_collapsed_mount_count() {
     let mut stats = full_snap();
     let mut disks = stats.disks.to_vec();
     disks[0].extra_mounts = 42;
+    disks[0].mount = "/var/lib/containers/storage".into();
     stats.disks = disks.into();
     let model = model_with(stats);
     let hist = history(120, NOW_MS);
