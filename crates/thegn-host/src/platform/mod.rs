@@ -155,7 +155,7 @@ pub fn terminate_proxy_pid(_pid: u32, _expected_start_time: Option<u64>) -> bool
 /// Two rungs only — a graceful ask, then a hard stop — matching the tab's
 /// confirm flow (SIGTERM first, SIGKILL only on a second explicit confirmation).
 /// Windows has no signals, so both map to `TerminateProcess` (a hard kill) and
-/// the confirm text says so. See [`signal_identity`].
+/// the confirm text says so. See [`signal_identity()`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProcSignal {
     /// Graceful termination request (unix `SIGTERM`; Windows hard terminate).

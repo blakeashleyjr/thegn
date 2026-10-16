@@ -26,6 +26,11 @@ fn signal_identity_inner(pid: u32, start_secs: u64, sig: ProcSignal) -> Result<(
         if error.raw_os_error() == Some(libc::ENOSYS) {
             return compare_then_signal(pid, start_secs, sig);
         }
+        if error.raw_os_error() == Some(libc::EPERM) {
+            return Err(SignalError::Failed(
+                "pidfd_open blocked (seccomp); process identity cannot be pinned".into(),
+            ));
+        }
         return Err(map_unix_error(error));
     }
     // SAFETY: successful pidfd_open returned a fresh fd owned by this scope.
@@ -78,14 +83,17 @@ fn map_unix_error(error: std::io::Error) -> SignalError {
 
 #[cfg(target_os = "linux")]
 fn read_start_secs(pid: u32) -> Option<u64> {
-    static BOOT_TIME: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
+    static BOOT_TIME: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
     let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
     let ticks = super::unix::parse_proc_start_time(&stat)?;
-    let btime = BOOT_TIME.get_or_init(|| {
-        std::fs::read_to_string("/proc/stat")
-            .ok()
-            .and_then(|contents| parse_btime(&contents))
-    })?;
+    let btime = match BOOT_TIME.get() {
+        Some(btime) => *btime,
+        None => {
+            let contents = std::fs::read_to_string("/proc/stat").ok()?;
+            let btime = parse_btime(&contents)?;
+            *BOOT_TIME.get_or_init(|| btime)
+        }
+    };
     // SAFETY: sysconf with _SC_CLK_TCK has no pointer arguments or side effects.
     let clk_tck = unsafe { libc::sysconf(libc::_SC_CLK_TCK) };
     start_secs_from_ticks(ticks, u64::try_from(clk_tck).ok()?, btime)
@@ -127,7 +135,7 @@ fn signal_identity_inner(pid: u32, start_secs: u64, sig: ProcSignal) -> Result<(
             want,
         )
     };
-    if got != want || u64::from(info.pbi_start_tvsec) != start_secs {
+    if got != want || info.pbi_start_tvsec != start_secs {
         return Err(SignalError::Changed);
     }
     super::signal_pid(pid, sig).map_err(SignalError::Failed)
@@ -275,6 +283,27 @@ mod linux_tests {
     use super::*;
     use std::os::unix::process::ExitStatusExt;
     use std::process::{Child, Command};
+    use sysinfo::{Pid, ProcessesToUpdate, System};
+
+    struct ChildGuard(Child);
+
+    impl Drop for ChildGuard {
+        fn drop(&mut self) {
+            match self.0.try_wait() {
+                Ok(Some(_)) => return,
+                Ok(None) => {}
+                Err(error) => {
+                    tracing::debug!(%error, "could not check fixture child before cleanup")
+                }
+            }
+            if let Err(error) = self.0.kill() {
+                tracing::debug!(%error, "could not kill fixture child during cleanup");
+            }
+            if let Err(error) = self.0.wait() {
+                tracing::debug!(%error, "could not reap fixture child during cleanup");
+            }
+        }
+    }
 
     fn spawn_sleep() -> Child {
         Command::new("sleep")
@@ -284,48 +313,47 @@ mod linux_tests {
     }
 
     fn sampled_start(pid: u32) -> u64 {
-        let mut sampler = thegn_metrics::ProcSampler::new(usize::MAX);
-        sampler
-            .sample()
-            .procs
-            .into_iter()
-            .find(|row| row.pid == pid)
-            .expect("sleep child appears in ProcSampler sample")
-            .start_time
+        let pid = Pid::from_u32(pid);
+        let mut system = System::new();
+        system.refresh_processes(ProcessesToUpdate::Some(&[pid]), true);
+        system
+            .process(pid)
+            .expect("targeted sysinfo refresh includes sleep child")
+            .start_time()
     }
 
     #[test]
     fn sampler_seconds_match_the_signal_identity_reader() {
-        let mut child = spawn_sleep();
-        let pid = child.id();
+        let mut child = ChildGuard(spawn_sleep());
+        let pid = child.0.id();
         let sampled = sampled_start(pid);
         assert_eq!(read_start_secs(pid), Some(sampled));
-        child.kill().expect("kill sleep child");
-        child.wait().expect("reap sleep child");
+        child.0.kill().expect("kill sleep child");
+        child.0.wait().expect("reap sleep child");
     }
 
     #[test]
     fn matching_identity_sends_sigterm_to_child() {
-        let mut child = spawn_sleep();
-        let sampled = sampled_start(child.id());
+        let mut child = ChildGuard(spawn_sleep());
+        let sampled = sampled_start(child.0.id());
         assert_eq!(
-            signal_identity(child.id(), sampled, ProcSignal::Terminate),
+            signal_identity(child.0.id(), sampled, ProcSignal::Terminate),
             Ok(())
         );
-        let status = child.wait().expect("reap signalled child");
+        let status = child.0.wait().expect("reap signalled child");
         assert_eq!(status.signal(), Some(libc::SIGTERM));
     }
 
     #[test]
     fn mismatched_identity_leaves_child_alive() {
-        let mut child = spawn_sleep();
-        let sampled = sampled_start(child.id());
+        let mut child = ChildGuard(spawn_sleep());
+        let sampled = read_start_secs(child.0.id()).expect("read sleep child start time");
         assert_eq!(
-            signal_identity(child.id(), sampled + 1, ProcSignal::Kill),
+            signal_identity(child.0.id(), sampled + 1, ProcSignal::Kill),
             Err(SignalError::Changed)
         );
-        assert!(child.try_wait().expect("check child status").is_none());
-        child.kill().expect("kill sleep child after mismatch");
-        child.wait().expect("reap sleep child after mismatch");
+        assert!(child.0.try_wait().expect("check child status").is_none());
+        child.0.kill().expect("kill sleep child after mismatch");
+        child.0.wait().expect("reap sleep child after mismatch");
     }
 }
