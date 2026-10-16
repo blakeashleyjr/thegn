@@ -23,6 +23,7 @@ use termwiz::terminal::TerminalWaker;
 use thegn_core::config::Config;
 use thegn_core::sandbox::{Backend, oci_runtime_prefix};
 use thegn_core::sandbox_manage::{ControlOp, OwnedContainer, mgmt_control_argv};
+use thegn_proc::{End, GroupState, Leader, Limits};
 
 /// Bounded wait for a lifecycle subprocess. A wedged runtime must not pin the
 /// worker thread forever.
@@ -161,24 +162,7 @@ fn active_cwd(_cfg: &Config) -> Option<&std::path::Path> {
 fn spawn_control(argv: Vec<String>, label: String, waker: TerminalWaker) {
     std::thread::spawn(move || {
         crate::platform::qos::set_self(crate::platform::qos::Qos::Background);
-        let outcome = run_bounded(&argv, CONTROL_TIMEOUT)
-            .map(|ok| {
-                if ok {
-                    ActionOutcome {
-                        ok: true,
-                        message: format!("{label} ✓"),
-                    }
-                } else {
-                    ActionOutcome {
-                        ok: false,
-                        message: format!("{label} failed"),
-                    }
-                }
-            })
-            .unwrap_or_else(|| ActionOutcome {
-                ok: false,
-                message: format!("{label} timed out"),
-            });
+        let outcome = run_control(&argv, CONTROL_TIMEOUT - Duration::from_millis(250), &label);
         if !outcome.ok {
             tracing::warn!(target: "thegn::sandbox", "container action: {}", outcome.message);
         }
@@ -190,24 +174,91 @@ fn spawn_control(argv: Vec<String>, label: String, waker: TerminalWaker) {
     });
 }
 
-/// Spawn `argv`, wait up to `timeout`, kill on deadline. `Some(success)` on a
-/// clean exit; `None` when it had to be killed.
-fn run_bounded(argv: &[String], timeout: Duration) -> Option<bool> {
-    let (bin, rest) = argv.split_first()?;
-    let outcome = crate::platform::sound_process::run_bounded(
-        bin,
-        rest,
-        &std::sync::atomic::AtomicBool::new(false),
-        timeout,
-    );
-    match outcome {
-        crate::platform::sound_process::SoundProcessOutcome::Exited(status) => {
-            Some(status.success())
+fn describe(run: &thegn_proc::Run, label: &str) -> ActionOutcome {
+    let message = match &run.end {
+        End::Spawn(error) => format!("{label} could not start: {error}"),
+        End::TimedOut => format!("{label} timed out"),
+        End::LeaderExited if run.group == GroupState::Survivors => {
+            format!("{label} did not settle")
         }
-        crate::platform::sound_process::SoundProcessOutcome::Timeout
-        | crate::platform::sound_process::SoundProcessOutcome::Cancelled
-        | crate::platform::sound_process::SoundProcessOutcome::Spawn(_)
-        | crate::platform::sound_process::SoundProcessOutcome::Reap(_)
-        | crate::platform::sound_process::SoundProcessOutcome::DescendantsRemain => None,
+        End::LeaderExited if run.success() && run.group != GroupState::Survivors => {
+            format!("{label} ✓")
+        }
+        End::LeaderExited if matches!(&run.leader, Leader::Reaped(_)) => {
+            format!("{label} failed")
+        }
+        _ => format!("{label} did not settle"),
+    };
+    ActionOutcome {
+        ok: run.success() && run.group != GroupState::Survivors,
+        message,
+    }
+}
+
+fn run_control(argv: &[String], timeout: Duration, label: &str) -> ActionOutcome {
+    let Some((bin, rest)) = argv.split_first() else {
+        return ActionOutcome {
+            ok: false,
+            message: format!("{label} could not start: empty command"),
+        };
+    };
+    let mut command = std::process::Command::new(bin);
+    command.args(rest);
+    let limits = Limits {
+        kill_settle: Duration::from_millis(250),
+        ..Limits::silent(timeout)
+    };
+    let run = thegn_proc::run(
+        &mut command,
+        &limits,
+        &std::sync::atomic::AtomicBool::new(false),
+    );
+    describe(&run, label)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::Path;
+
+    #[test]
+    fn missing_runtime_reports_could_not_start_not_timeout() {
+        let result = run_control(
+            &["/no/such/runtime".into()],
+            Duration::from_secs(1),
+            "stop x",
+        );
+        assert!(!result.ok);
+        assert!(result.message.contains("could not start"));
+        assert!(!result.message.contains("timed out"));
+    }
+
+    #[test]
+    fn control_reports_exit_and_timeout_outcomes() {
+        if !Path::new("/bin/sh").exists() {
+            return;
+        }
+        let failed = run_control(
+            &["/bin/sh".into(), "-c".into(), "exit 2".into()],
+            Duration::from_secs(1),
+            "stop x",
+        );
+        assert!(!failed.ok);
+        assert!(failed.message.contains("failed"));
+
+        let timed_out = run_control(
+            &["/bin/sh".into(), "-c".into(), "sleep 5".into()],
+            Duration::from_millis(200),
+            "stop x",
+        );
+        assert!(!timed_out.ok);
+        assert!(timed_out.message.contains("timed out"));
+
+        let succeeded = run_control(
+            &["/bin/sh".into(), "-c".into(), "exit 0".into()],
+            Duration::from_secs(1),
+            "stop x",
+        );
+        assert!(succeeded.ok);
     }
 }
