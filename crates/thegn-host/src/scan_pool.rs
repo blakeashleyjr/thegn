@@ -406,32 +406,57 @@ mod tests {
         }
     }
 
+    fn gated_burst(
+        pool: &Arc<ScanPool>,
+    ) -> (Vec<(bool, ScanJob<()>)>, std::thread::JoinHandle<()>) {
+        let gate = Arc::new((Mutex::new(false), Condvar::new()));
+        let release_gate = Arc::clone(&gate);
+        let submitter_pool = Arc::clone(pool);
+        let release = std::thread::spawn(move || {
+            loop {
+                let submitted = {
+                    let state = submitter_pool.state.lock().unwrap();
+                    state.queue.len() + state.busy
+                };
+                if submitted == 8 {
+                    break;
+                }
+                std::thread::yield_now();
+            }
+            let (lock, condition) = &*release_gate;
+            *lock.lock().unwrap() = true;
+            condition.notify_all();
+        });
+        let jobs = (0..8)
+            .map(|_| {
+                let gate = Arc::clone(&gate);
+                (
+                    false,
+                    Box::new(move || {
+                        let (lock, condition) = &*gate;
+                        let mut open = lock.lock().unwrap();
+                        while !*open {
+                            open = condition.wait(open).unwrap();
+                        }
+                    }) as ScanJob<()>,
+                )
+            })
+            .collect();
+        (jobs, release)
+    }
+
     #[test]
     fn drain_hook_fires_once_per_drained_burst() {
         DRAIN_HOOK_CALLS.store(0, Ordering::SeqCst);
         let pool = ScanPool::with_drain_hook(3, count_drain);
-        let first: Vec<(bool, ScanJob<()>)> = (0..8)
-            .map(|_| {
-                (
-                    false,
-                    Box::new(|| std::thread::sleep(std::time::Duration::from_millis(5)))
-                        as ScanJob<()>,
-                )
-            })
-            .collect();
+        let (first, release) = gated_burst(&pool);
         assert_eq!(pool.run(first), vec![Some(()); 8]);
+        release.join().unwrap();
         wait_for_drain_calls(1);
         assert_eq!(DRAIN_HOOK_CALLS.load(Ordering::SeqCst), 1);
-        let second: Vec<(bool, ScanJob<()>)> = (0..8)
-            .map(|_| {
-                (
-                    false,
-                    Box::new(|| std::thread::sleep(std::time::Duration::from_millis(5)))
-                        as ScanJob<()>,
-                )
-            })
-            .collect();
+        let (second, release) = gated_burst(&pool);
         assert_eq!(pool.run(second), vec![Some(()); 8]);
+        release.join().unwrap();
         wait_for_drain_calls(2);
         assert_eq!(DRAIN_HOOK_CALLS.load(Ordering::SeqCst), 2);
     }
