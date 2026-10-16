@@ -1209,6 +1209,9 @@ pub async fn main(
     if !crate::workspace_create::shutdown_clones(std::time::Duration::from_secs(1)) {
         tracing::error!(target: "thegn::workspace", "workspace clone supervisor did not settle during shutdown");
     }
+    if !crate::pane_pty::drain_detached_reapers(std::time::Duration::from_secs(1)) {
+        tracing::warn!(target: "thegn::pty", "pane reapers did not settle during shutdown");
+    }
     for (plugin, outcome) in &resident_report.outcomes {
         tracing::debug!(target: "thegn::plugin", plugin = %plugin, ?outcome, "resident lifecycle receipt; descendant containment remains unproven");
     }
