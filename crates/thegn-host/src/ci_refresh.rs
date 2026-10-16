@@ -8,7 +8,7 @@
 
 use std::collections::HashMap;
 use std::sync::{
-    Arc, Mutex,
+    Arc, Condvar, Mutex,
     atomic::{AtomicBool, Ordering},
 };
 use std::time::{Duration, Instant};
@@ -226,6 +226,28 @@ struct RefreshContext {
 struct CiRefreshCoordinator {
     flight: CiFlight,
     queued: Option<RefreshRequest>,
+    shut_down: bool,
+}
+
+impl CiRefreshCoordinator {
+    /// Rejects submissions after shutdown; this latch check is authoritative.
+    /// Callers may precheck to log a refusal, but this guard remains authoritative.
+    fn submit(&mut self, request: RefreshRequest) -> bool {
+        if self.shut_down {
+            return false;
+        }
+        let token = FlightToken {
+            key: request.token.key.clone(),
+            force: request.token.force,
+            cancel: Arc::clone(&request.token.cancel),
+        };
+        let start = self.flight.running.is_none();
+        self.flight.submit(token);
+        if !start {
+            self.queued = Some(request);
+        }
+        start
+    }
 }
 
 fn ci_refresh_coordinator() -> &'static Mutex<CiRefreshCoordinator> {
@@ -234,12 +256,66 @@ fn ci_refresh_coordinator() -> &'static Mutex<CiRefreshCoordinator> {
     COORDINATOR.get_or_init(|| Mutex::new(CiRefreshCoordinator::default()))
 }
 
+fn ci_refresh_idle() -> &'static Condvar {
+    static IDLE: Condvar = Condvar::new();
+    &IDLE
+}
+
+fn cancel_coordinator_for_shutdown(coordinator: &mut CiRefreshCoordinator) {
+    coordinator.shut_down = true;
+    if let Some(running) = coordinator.flight.running.as_ref() {
+        running.cancel.store(true, Ordering::Relaxed);
+    }
+    if let Some(queued) = coordinator.flight.queued.as_ref() {
+        queued.cancel.store(true, Ordering::Relaxed);
+    }
+    coordinator.flight.queued = None;
+    coordinator.queued = None;
+}
+
+fn wait_coordinator_idle(
+    lock: &Mutex<CiRefreshCoordinator>,
+    idle: &Condvar,
+    deadline: Instant,
+) -> bool {
+    let mut coordinator = lock
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    while coordinator.flight.running.is_some() {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return false;
+        }
+        let (next, result) = idle
+            .wait_timeout(coordinator, remaining)
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        coordinator = next;
+        if result.timed_out() && coordinator.flight.running.is_some() {
+            return false;
+        }
+    }
+    true
+}
+
+pub(crate) fn cancel_for_shutdown() {
+    let mut coordinator = ci_refresh_coordinator()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    cancel_coordinator_for_shutdown(&mut coordinator);
+}
+
+pub(crate) fn wait_ci_idle(deadline: Instant) -> bool {
+    wait_coordinator_idle(ci_refresh_coordinator(), ci_refresh_idle(), deadline)
+}
+
+#[cfg(test)]
 fn clear_ci_refresh_flight() {
     let mut coordinator = ci_refresh_coordinator()
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     coordinator.flight.clear();
     coordinator.queued = None;
+    ci_refresh_idle().notify_all();
 }
 
 struct FlightGuard {
@@ -260,6 +336,7 @@ impl Drop for FlightGuard {
             coordinator.flight.clear();
             coordinator.queued = None;
         }
+        ci_refresh_idle().notify_all();
     }
 }
 
@@ -417,28 +494,26 @@ pub(crate) fn spawn_ci_cache_refresh_with_generation(
         token,
         generation,
     };
-    let should_spawn = {
+    let admission = {
         let mut coordinator = ci_refresh_coordinator()
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let token = FlightToken {
-            key: request.token.key.clone(),
-            force: request.token.force,
-            cancel: Arc::clone(&request.token.cancel),
-        };
-        let start = coordinator.flight.running.is_none();
-        coordinator.flight.submit(token);
-        if !start {
-            coordinator.queued = Some(request.clone());
+        if coordinator.shut_down {
+            tracing::debug!(target: "thegn::ci", "CI cache refresh refused during shutdown");
+            return;
         }
-        start
+        if !coordinator.submit(request.clone()) {
+            return;
+        }
+        let admission = crate::sched::spawn_bg(move || run_ci_refresh_worker(request));
+        if admission != crate::sched::Admission::Admitted {
+            coordinator.flight.clear();
+            coordinator.queued = None;
+            ci_refresh_idle().notify_all();
+        }
+        admission
     };
-    if !should_spawn {
-        return;
-    }
-    let admission = crate::sched::spawn_bg(move || run_ci_refresh_worker(request));
     if admission != crate::sched::Admission::Admitted {
-        clear_ci_refresh_flight();
         tracing::debug!(target: "thegn::ci", ?admission, "CI cache refresh admission refused");
     }
 }
@@ -1485,6 +1560,66 @@ mod tests {
         assert!(flight.submit(second));
         assert!(flight.submit(flight_token("/wt-a", Some(5), false)));
         assert!(cancel.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn ci_shutdown_cancels_local_running_and_queued_flights_and_waits() {
+        let lock = Arc::new(Mutex::new(CiRefreshCoordinator::default()));
+        let idle = Arc::new(Condvar::new());
+        let running = flight_token("/running", None, false);
+        let running_cancel = Arc::clone(&running.cancel);
+        let queued = flight_token("/queued", None, true);
+        let queued_cancel = Arc::clone(&queued.cancel);
+        {
+            let mut coordinator = lock.lock().expect("local coordinator");
+            coordinator.flight.submit(running);
+            coordinator.flight.queued = Some(queued.clone());
+            coordinator.queued = Some(RefreshRequest {
+                session: crate::session::Session::default(),
+                full: thegn_core::config::Config::default(),
+                waker: None,
+                token: queued.clone(),
+                generation: None,
+            });
+            cancel_coordinator_for_shutdown(&mut coordinator);
+            assert!(coordinator.shut_down);
+            assert!(coordinator.queued.is_none());
+            assert!(coordinator.flight.queued.is_none());
+            assert!(!coordinator.submit(RefreshRequest {
+                session: crate::session::Session::default(),
+                full: thegn_core::config::Config::default(),
+                waker: None,
+                token: flight_token("/later", None, false),
+                generation: None,
+            }));
+            assert!(
+                coordinator
+                    .flight
+                    .running
+                    .as_ref()
+                    .is_some_and(|token| Arc::ptr_eq(&token.cancel, &running_cancel))
+            );
+            assert!(coordinator.queued.is_none());
+            assert!(coordinator.flight.queued.is_none());
+        }
+        assert!(running_cancel.load(Ordering::Relaxed));
+        assert!(queued_cancel.load(Ordering::Relaxed));
+        assert!(!wait_coordinator_idle(&lock, &idle, Instant::now()));
+
+        let worker_lock = Arc::clone(&lock);
+        let worker_idle = Arc::clone(&idle);
+        let worker = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(20));
+            let mut coordinator = worker_lock.lock().expect("local coordinator");
+            coordinator.flight.clear();
+            worker_idle.notify_all();
+        });
+        assert!(wait_coordinator_idle(
+            &lock,
+            &idle,
+            Instant::now() + Duration::from_secs(1),
+        ));
+        worker.join().expect("local flight completion");
     }
 
     #[test]

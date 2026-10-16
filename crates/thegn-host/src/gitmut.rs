@@ -16,10 +16,11 @@ use thegn_core::rebase_todo::{TodoAction, TodoEntry};
 use thegn_core::remote::GitLoc;
 use thegn_core::store::WorktreeAuxStore;
 use thegn_svc::git::{
-    BisectOps, BranchOps, CUSTOM_COMMAND_TIMEOUT_SECS, CUSTOM_OUTCOME_CLEANUP,
-    CUSTOM_OUTCOME_EXITED, CUSTOM_OUTCOME_READ, CUSTOM_OUTCOME_SPAWN, CUSTOM_OUTCOME_TIMEOUT,
-    CUSTOM_OUTCOME_WAIT, CherryOps, CliGit, CommitOps, CustomOps, ForceMode, GitBackend, PatchOps,
-    RebaseOps, RebaseOpts, RebaseOutcome, ResetMode, StageOps, StashOps, UndoOps,
+    BisectOps, BranchOps, CUSTOM_COMMAND_TIMEOUT_SECS, CUSTOM_OUTCOME_CANCELLED,
+    CUSTOM_OUTCOME_CLEANUP, CUSTOM_OUTCOME_EXITED, CUSTOM_OUTCOME_READ, CUSTOM_OUTCOME_SPAWN,
+    CUSTOM_OUTCOME_TIMEOUT, CUSTOM_OUTCOME_WAIT, CherryOps, CliGit, CommitOps, CustomOps,
+    ForceMode, GitBackend, PatchOps, RebaseOps, RebaseOpts, RebaseOutcome, ResetMode, StageOps,
+    StashOps, UndoOps,
 };
 
 /// Which pane a line-staging op targets.
@@ -692,16 +693,30 @@ pub fn execute(op: GitOp, loc: &GitLoc, override_gpg: bool) -> GitOpResult {
             }
             Err(e) => GitOpResult::Err(first_line(&e)),
         },
-        GitOp::Custom { command, capture } => custom_command_result(
-            g.run_custom(loc, &command, capture),
-            capture,
-            false,
-            CUSTOM_COMMAND_TIMEOUT_SECS,
-        ),
+        GitOp::Custom { command, capture } => {
+            let _in_flight = crate::quit_cancel::custom_git().enter();
+            custom_command_result(
+                g.run_custom(
+                    loc,
+                    &command,
+                    capture,
+                    crate::quit_cancel::custom_git().cancel_flag(),
+                ),
+                capture,
+                false,
+                CUSTOM_COMMAND_TIMEOUT_SECS,
+            )
+        }
         GitOp::CustomTemplate { command, capture } => {
+            let _in_flight = crate::quit_cancel::custom_git().enter();
             let timeout_secs = command.timeout().as_secs();
             custom_command_result(
-                g.run_custom_template(loc, &command, capture),
+                g.run_custom_template(
+                    loc,
+                    &command,
+                    capture,
+                    crate::quit_cancel::custom_git().cancel_flag(),
+                ),
                 capture,
                 true,
                 timeout_secs,
@@ -772,6 +787,9 @@ fn custom_command_result(
         CUSTOM_OUTCOME_TIMEOUT => GitOpResult::Err(format!(
             "custom command timed out after {timeout_secs}s and was killed"
         )),
+        CUSTOM_OUTCOME_CANCELLED => {
+            GitOpResult::Err("custom command cancelled (thegn is quitting)".into())
+        }
         CUSTOM_OUTCOME_SPAWN => GitOpResult::Err("could not start custom command".into()),
         CUSTOM_OUTCOME_WAIT => GitOpResult::Err("custom command could not be reaped".into()),
         CUSTOM_OUTCOME_READ => GitOpResult::Err("could not read custom command output".into()),
@@ -793,6 +811,27 @@ fn first_line_str(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cancelled_custom_outcome_has_quit_message() {
+        let result = custom_command_result(
+            (
+                CUSTOM_OUTCOME_CANCELLED,
+                None,
+                String::new(),
+                false,
+                String::new(),
+            ),
+            true,
+            false,
+            CUSTOM_COMMAND_TIMEOUT_SECS,
+        );
+        assert!(matches!(
+            result,
+            GitOpResult::Err(message)
+                if message == "custom command cancelled (thegn is quitting)"
+        ));
+    }
 
     // test code: fixture setup, never on the event loop.
     #[expect(clippy::disallowed_methods)]

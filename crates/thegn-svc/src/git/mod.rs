@@ -34,9 +34,9 @@ pub use branch::{BranchOps, ForceMode};
 pub use cherry::CherryOps;
 pub use commit::{CommitOps, ResetMode};
 pub use custom::{
-    CUSTOM_COMMAND_TIMEOUT_SECS, CUSTOM_OUTCOME_CLEANUP, CUSTOM_OUTCOME_EXITED,
-    CUSTOM_OUTCOME_READ, CUSTOM_OUTCOME_SPAWN, CUSTOM_OUTCOME_TIMEOUT, CUSTOM_OUTCOME_WAIT,
-    CustomOps,
+    CUSTOM_COMMAND_TIMEOUT_SECS, CUSTOM_OUTCOME_CANCELLED, CUSTOM_OUTCOME_CLEANUP,
+    CUSTOM_OUTCOME_EXITED, CUSTOM_OUTCOME_READ, CUSTOM_OUTCOME_SPAWN, CUSTOM_OUTCOME_TIMEOUT,
+    CUSTOM_OUTCOME_WAIT, CustomOps,
 };
 pub use patch::PatchOps;
 pub use plumbing::{CasOutcome, MergeTreeOutcome, PlumbingOps};
