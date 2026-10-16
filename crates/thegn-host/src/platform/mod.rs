@@ -375,6 +375,7 @@ pub(crate) fn test_symlink_supported() -> bool {
 }
 
 #[cfg(test)]
+#[cfg_attr(not(unix), allow(unused_variables))]
 pub(crate) fn test_symlink(
     original: &std::path::Path,
     link: &std::path::Path,
@@ -385,7 +386,6 @@ pub(crate) fn test_symlink(
     }
     #[cfg(not(unix))]
     {
-        drop((original, link));
         Err(std::io::Error::other(
             "symlinks are not supported by this test",
         ))
@@ -436,6 +436,61 @@ pub(crate) fn test_make_unreadable(path: &std::path::Path) -> bool {
         false
     }
 }
+
+#[cfg(test)]
+pub(crate) fn test_mode_bits_supported() -> bool {
+    cfg!(unix)
+}
+
+#[cfg(test)]
+#[cfg_attr(not(unix), allow(unused_variables))]
+pub(crate) fn test_set_mode(path: &std::path::Path, mode: u32) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode))
+    }
+    #[cfg(not(unix))]
+    {
+        Err(std::io::Error::other(
+            "mode bits are not supported by this test",
+        ))
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn test_unix_socket_supported() -> bool {
+    cfg!(unix)
+}
+
+#[cfg(test)]
+#[cfg_attr(not(unix), allow(unused_variables))]
+pub(crate) fn test_spawn_silent_socket(path: &std::path::Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        let listener = std::os::unix::net::UnixListener::bind(path)?;
+        let handle = std::thread::Builder::new()
+            .name("thegn-test-sock".to_owned())
+            .spawn(move || {
+                crate::platform::qos::set_self(crate::platform::qos::Qos::Background);
+                for stream in listener.incoming() {
+                    // Hold each connection open without replying to the probe.
+                    let _held = stream;
+                    std::thread::sleep(std::time::Duration::from_secs(30));
+                }
+            })?;
+        drop(handle);
+        Ok(())
+    }
+    #[cfg(not(unix))]
+    {
+        Err(std::io::Error::other(
+            "Unix sockets are not supported by this test",
+        ))
+    }
+}
+
 #[cfg(windows)]
 mod windows;
 #[cfg(windows)]

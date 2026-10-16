@@ -2169,11 +2169,14 @@ mod tests {
 
     #[test]
     fn destroy_guard_vetoes_a_session_latched_under_a_path_alias() {
+        if !crate::platform::test_symlink_supported() {
+            return;
+        }
         let (_td, base) = unique_tmp("alias");
         let real = base.join("real");
         std::fs::create_dir_all(&real).unwrap();
         let link = base.join("link");
-        std::os::unix::fs::symlink(&real, &link).unwrap();
+        crate::platform::test_symlink(&real, &link).unwrap();
         assert!(session_start_once(&Config::default(), &link, None).unwrap());
         assert!(automatic_cleanup_session_absent(&real).is_err());
         release_session_start(&link);

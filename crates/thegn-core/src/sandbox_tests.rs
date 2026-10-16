@@ -2120,9 +2120,10 @@ fn oci_local_secrets_go_to_env_file_not_argv() {
         .position(|a| a == "--env-file")
         .expect("env-file");
     let path = std::path::PathBuf::from(&opts[i + 1]);
-    use std::os::unix::fs::PermissionsExt;
-    let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
-    assert_eq!(mode, 0o600, "env-file must be 0600");
+    let mode = crate::fsperm::mode_bits(&path).unwrap();
+    if cfg!(unix) {
+        assert_eq!(mode, Some(0o600), "env-file must be 0600");
+    }
     let body = std::fs::read_to_string(&path).unwrap();
     assert!(
         body.contains("GH_TOKEN=ghp_secret"),
