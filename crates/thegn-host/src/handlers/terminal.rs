@@ -54,11 +54,11 @@ pub(crate) fn open_wizard(
 /// fails.
 pub(crate) fn persist(
     choice: &TerminalChoice,
-    tx: &tokio::sync::mpsc::UnboundedSender<crate::run_pending_db::PendingDbResult>,
+    tx: &tokio::sync::mpsc::UnboundedSender<crate::run::run_pending_db::PendingDbResult>,
     waker: &termwiz::terminal::TerminalWaker,
 ) {
     let choice = choice.clone();
-    crate::run_pending_db::queue_reported_write(
+    crate::run::run_pending_db::queue_reported_write(
         tx,
         waker,
         move |db| write_terminal_row(db, &choice),
