@@ -915,11 +915,15 @@ pub struct MergeQueueConfig {
     /// agent loses host credentials/keychains). See [`Self::agent_isolation_floor`].
     pub agent_sandbox: bool,
     /// Minimum honest isolation class the sandboxed agent task must enter (only
-    /// meaningful with `agent_sandbox = true`). A fail-closed miss is reported as
-    /// an INFRASTRUCTURE failure — the entry is held, never the branch blamed.
+    /// meaningful with `agent_sandbox = true`). The queue floor can raise, but
+    /// never weaken, the `[sandbox]` floor in force (default: shared-kernel,
+    /// refusing on a miss). Set `[sandbox].isolation_floor = "off"` or disable
+    /// `agent_sandbox` to run the agent uncontained. A fail-closed miss is an
+    /// INFRASTRUCTURE failure — the entry is held, never the branch blamed.
     pub agent_isolation_floor: crate::config::IsolationFloor,
     /// What happens when `agent_isolation_floor` can't be met: `degrade`
-    /// (default) or `fail` (hold the entry as an infrastructure failure).
+    /// (default) or `fail` (hold the entry as an infrastructure failure). This
+    /// cannot weaken the `[sandbox]` floor's miss policy.
     pub agent_on_floor_miss: crate::config::OnFloorMiss,
     /// Master switch for the merge-queue sidebar lifecycle — filing worktrees
     /// into folders as branches move through the queue, and removing a worktree
