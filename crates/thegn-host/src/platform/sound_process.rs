@@ -81,6 +81,10 @@ fn outcome(run: thegn_proc::Run) -> SoundProcessOutcome {
             // Null streams make OutputLimit impossible; preserve a bounded failure mapping.
             SoundProcessOutcome::Timeout
         }
+        (thegn_proc::End::LeaderExited, _, thegn_proc::Leader::NotSpawned, _) => {
+            // The crate never produces LeaderExited when the leader was not spawned.
+            SoundProcessOutcome::Reap(std::io::Error::other("leader not spawned"))
+        }
     }
 }
 
@@ -294,6 +298,41 @@ mod tests {
             false,
         );
         assert!(matches!(outcome(run), SoundProcessOutcome::Cancelled));
+    }
+
+    #[test]
+    fn outcome_timed_out_with_reaped_leader_maps_to_timeout() {
+        let run = make_run(
+            thegn_proc::End::TimedOut,
+            thegn_proc::GroupState::Drained,
+            thegn_proc::Leader::Reaped(success_status()),
+            false,
+        );
+        assert!(matches!(outcome(run), SoundProcessOutcome::Timeout));
+    }
+
+    #[test]
+    fn outcome_leader_exit_after_termination_maps_to_exited() {
+        let run = make_run(
+            thegn_proc::End::LeaderExited,
+            thegn_proc::GroupState::Terminated,
+            thegn_proc::Leader::Reaped(success_status()),
+            true,
+        );
+        assert!(matches!(outcome(run), SoundProcessOutcome::Exited(status) if status.success()));
+    }
+
+    #[test]
+    fn outcome_leader_exit_without_spawned_leader_maps_to_reap() {
+        let run = make_run(
+            thegn_proc::End::LeaderExited,
+            thegn_proc::GroupState::Unknown,
+            thegn_proc::Leader::NotSpawned,
+            false,
+        );
+        assert!(
+            matches!(outcome(run), SoundProcessOutcome::Reap(error) if error.to_string() == "leader not spawned")
+        );
     }
 }
 
