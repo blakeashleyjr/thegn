@@ -319,7 +319,11 @@ tests run in a separate slot. `↵` or `r` on a running job asks you to press
 again to restart it. `s` stops only the selected job, which is labelled
 `stopped`. A job killed after `[limits] test_timeout_secs` is labelled
 `timed out after Ns`. While a job is running, its Half and Full detail shows
-a `live output` tail of up to the last eight lines, bounded to 16 KiB.
+a `live output` tail of up to the last eight lines, bounded to 16 KiB. When a
+finished job exceeded the capture limit, its record keeps the start, a
+`[output truncated: N bytes not shown; the end follows]` marker, and the last
+16 KiB, so the detail, output pager, and Problems show the real end. Test runs
+keep the start only.
 
 {{keys:jobs}}
 
@@ -339,7 +343,11 @@ thegn, otherwise a changed file you pick with `f`, otherwise the file
 picker. Language server first, tree-sitter fallback. `r` opens references;
 Esc returns to the outline. With no language server, references say so;
 `h` reports when hover is off. A language server for a worktree you are not
-in that sits unused for 30 minutes is stopped and restarts on next use.
+in that sits unused for 30 minutes is stopped and restarts on next use. When
+the worktree's language server is overloaded, outline and hover say
+`language server busy` on the status line and references say so in the view;
+try again. Esc out of references cancels a references lookup still in flight;
+switching worktree cancels outline, references and hover lookups.
 
 {{keys:symbols}}
 

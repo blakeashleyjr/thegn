@@ -56,9 +56,13 @@ both refuse when another row is selected. `n` opens the new-branch name input.
 The menu's pull and push actions also operate on HEAD only.
 If reading a branch log fails, its block says `log unavailable` and shows the
 first error line. In the fused two-column view at Full and wide Half widths,
-clicking a row in either column moves the cursor to that row.
+clicking a row in either column moves the cursor to that row, and the wheel
+follows the column under the pointer: over the main column it steps the drill
+cursor or scrolls the detail; over the side list it walks the list unless a
+drill view is open, when it does nothing.
 With a rebase base marked, `r` rebases the commits after the mark onto the
-selected branch.
+selected branch. In staging and patch, dragging across lines selects a range
+like `v`; narrow Half keeps the stacked behaviour.
 
 ### stash
 

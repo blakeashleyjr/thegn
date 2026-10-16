@@ -21,6 +21,10 @@ not a replay.
 - **Quit and kill** ends the sessions too — the explicit "I'm done"
   option.
 
+When the UI exits, in-flight custom git commands and CI refreshes are cancelled.
+Thegn waits up to two seconds for them before exiting; work still running after
+that is logged.
+
 The status bar's daemon chip shows whether the focused pane is
 daemon-backed; select it for the full session rollup. See [[bars]].
 

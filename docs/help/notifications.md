@@ -135,8 +135,9 @@ lets the worker continue with later queued requests after a hung helper.
 Sound commands are bounded by that execution deadline, and their whole process
 group is killed after it (a command that backgrounds work keeps running until
 then).
-Windows currently retains direct-child helper behavior pending atomic Job
-Object containment. Providers report supported formats and
+On Windows the helper runs as a direct child under the same deadline: it is
+killed and reaped then, but processes it starts are not contained until Job
+Object support lands. Providers report supported formats and
 whether they honor volume. Use `thegn doctor` to see the provider id and
 availability, supported formats, volume capability, selected pack path, pack
 entry count, and any fallback reason. Optional players and packs are
