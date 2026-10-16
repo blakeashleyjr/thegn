@@ -1267,6 +1267,15 @@ fn add_all(cfg: &Config, any_path: &Path) -> String {
     }
 }
 
+/// Keep this aligned with `drive_queue_with` when classifying refused conflicts.
+fn conflict_row_status(driver_refusal: Option<&str>) -> MqStatus {
+    if driver_refusal.is_some() {
+        MqStatus::NeedsHuman
+    } else {
+        MqStatus::Deferred
+    }
+}
+
 /// Land a `ready` row (the section's `l`): the same fold/gate/CAS core as
 /// `thegn merge land`, recording the outcome on the queue row. Returns the
 /// terminal `DriveMsg` (a `Done` clears the inflight flag).
@@ -1367,11 +1376,7 @@ fn land_ready(cfg: &thegn_core::config::Config, wt: &str) -> DriveMsg {
                 .map(|reason| format!("{reason}\n{detail}"))
                 .unwrap_or_else(|| detail.clone());
             let write = record(
-                if driver_refusal.is_some() {
-                    MqStatus::NeedsHuman
-                } else {
-                    MqStatus::Deferred
-                },
+                conflict_row_status(driver_refusal.as_deref()),
                 None,
                 Some(&detail),
                 driver_refusal.as_deref(),
@@ -2108,5 +2113,11 @@ mod tests {
         );
         assert_eq!(r.status, "agent_running");
         assert_eq!(r.error_detail.as_deref(), Some("agent fixing (1/2)"));
+    }
+
+    #[test]
+    fn refused_conflict_rows_need_a_human() {
+        assert_eq!(conflict_row_status(Some("x")), MqStatus::NeedsHuman);
+        assert_eq!(conflict_row_status(None), MqStatus::Deferred);
     }
 }

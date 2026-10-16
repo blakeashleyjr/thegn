@@ -1998,4 +1998,23 @@ mod tests {
         assert_eq!(path, r);
         assert!(print(&r).is_some(), "claim re-established");
     }
+
+    #[test]
+    fn a_tool_state_edit_still_bumps_the_change_generation() {
+        use notify::EventKind::Modify;
+        use notify::event::{DataChange, ModifyKind::Data};
+
+        let base = scratch("cls-tool-state-generation");
+        let rules = rules_for(&base);
+        let c = live_cov();
+        let before = c.generation.load(Ordering::SeqCst);
+        let path = base.join("wt/.thegn/pipeline/x.md");
+        c.observe(&ev(Modify(Data(DataChange::Any)), &[&path]), &rules);
+
+        assert_ne!(before, c.generation.load(Ordering::SeqCst));
+        assert!(
+            c.vouches(),
+            "tool-state edits remain covered by the watcher"
+        );
+    }
 }

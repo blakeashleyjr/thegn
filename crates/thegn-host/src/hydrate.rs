@@ -13,7 +13,10 @@ use termwiz::terminal::TerminalWaker;
 
 use crate::chrome::{FrameModel, LoadStep, StateDbAvailability};
 use crate::glyph_types::GlyphRow;
-use crate::hydrate_tuning::{bg_glyph_ttl, model_refresh_interval};
+use crate::hydrate_tuning::{
+    GlyphTtls, glyph_ttls, glyph_window, model_refresh_interval, observe_ref_generation,
+    since_active_age, touched_since_scan,
+};
 use crate::run::now_secs;
 use thegn_core::store::{
     CacheStore, IntentStore, NotificationStore, WorkspaceStore, WorktreeAuxStore,
@@ -44,7 +47,8 @@ pub(crate) fn glyph_cache()
 }
 
 /// Drop the cached glyph rows for `paths`, so the next hydration rescans them
-/// instead of serving a row that is merely younger than [`bg_glyph_ttl`].
+/// instead of serving a row that is merely younger than its configured glyph
+/// window from [`crate::hydrate_tuning::glyph_ttls`].
 ///
 /// Background worktrees are TTL-cached (a rescan is a `git status` fan-out per
 /// row), which is right for ambient staleness but wrong right after an event
@@ -94,15 +98,9 @@ pub(crate) fn glyph_keep_set(
 /// the watcher is what fires, and each rescan is a git fan-out including a
 /// `<base>...HEAD` three-dot diff. See [`crate::hydrate_tuning::active_glyph_floor`].
 ///
-/// A background worktree rescans only when it has no cached row yet or the
-/// cached row is older than `ttl`.
-pub(crate) fn should_rescan_glyphs(
-    is_active: bool,
-    cached_age: Option<Duration>,
-    ttl: Duration,
-    active_floor: Duration,
-) -> bool {
-    let window = if is_active { active_floor } else { ttl };
+/// A background worktree rescans when it has no cached row yet or the selected
+/// activity-sensitive window has elapsed.
+pub(crate) fn should_rescan_glyphs(cached_age: Option<Duration>, window: Duration) -> bool {
     match cached_age {
         None => true,
         Some(age) => age >= window,
@@ -115,8 +113,9 @@ struct GlyphPartitionConfig<'a> {
     active_path: Option<&'a str>,
     gate_remote_scans: bool,
     now: Instant,
-    ttl: Duration,
-    active_floor: Duration,
+    ttls: &'a GlyphTtls,
+    since_active: &'a std::collections::HashMap<String, Duration>,
+    since_ref_move: Option<Duration>,
 }
 
 fn may_live_scan_for_location<E: std::fmt::Display>(
@@ -161,7 +160,16 @@ fn partition_glyph_paths(
             continue;
         }
         let age = cached.map(|(_, ts)| config.now.saturating_duration_since(*ts));
-        if should_rescan_glyphs(is_active, age, config.ttl, config.active_floor) {
+        let touched = age.is_some_and(|cached_age| {
+            touched_since_scan(
+                cached_age,
+                config.since_active.get(p).copied(),
+                config.since_ref_move,
+                config.ttls.tick,
+            )
+        });
+        let window = glyph_window(is_active, touched, std::path::Path::new(p), config.ttls);
+        if should_rescan_glyphs(age, window) {
             if let Some((row, _)) = cached {
                 prior_for_scan.insert(p.clone(), row.clone());
             }
@@ -1626,9 +1634,23 @@ fn collect_sidebar_status(
             },
         );
     }
-    status.activity = thegn_core::activity::read_states()
+    let activity_entries = thegn_core::activity::read_entries();
+    let now_unix = now_secs() as f64;
+    let mut since_active = std::collections::HashMap::new();
+    status.activity = activity_entries
         .into_iter()
-        .map(|(tab, st)| (tab, crate::sidebar::ActivityState::from_str(&st)))
+        .map(|(path, entry)| {
+            let since = entry
+                .last_active_at
+                .and_then(|last_active_at| since_active_age(now_unix, last_active_at));
+            if let Some(age) = since {
+                since_active.insert(path, age);
+            }
+            (
+                entry.tab,
+                crate::sidebar::ActivityState::from_str(&entry.state),
+            )
+        })
         .collect();
 
     // Reconcile the warm set now (after fresh activity): drop resident bridges for
@@ -1727,9 +1749,12 @@ fn collect_sidebar_status(
 
     // Partition into paths that must be rescanned now vs. served from cache.
     let active_path: Option<String> = session.active_group().map(|g| g.path.clone());
-    let ttl = bg_glyph_ttl();
-    let active_floor = crate::hydrate_tuning::active_glyph_floor();
+    let ttls = glyph_ttls();
     let now = Instant::now();
+    let ref_path = active_tab_path(session);
+    let ref_generation = crate::diff_watch::current_ref_generation(&ref_path);
+    let since_ref_move = observe_ref_generation(&ref_path, ref_generation, now)
+        .map(|changed_at| now.saturating_duration_since(changed_at));
     // Resolve DB-backed location and bridge state before taking the UI-shared
     // glyph cache mutex. Reuse this hydration's Db instead of opening/querying
     // SQLite once per path while holding the cache lock.
@@ -1760,8 +1785,9 @@ fn collect_sidebar_status(
                 active_path: active_path.as_deref(),
                 gate_remote_scans,
                 now,
-                ttl,
-                active_floor,
+                ttls: &ttls,
+                since_active: &since_active,
+                since_ref_move,
             },
         )
     };
@@ -1854,9 +1880,10 @@ fn collect_sidebar_status(
     let to_persist: Vec<(String, String)> = {
         let mut cache = glyph_cache().lock().unwrap();
         let mut persist = Vec::new();
+        let scan_completed_at = Instant::now();
         for (p, row, clean) in &scanned {
             if *clean {
-                cache.insert(p.clone(), (row.clone(), now));
+                cache.insert(p.clone(), (row.clone(), scan_completed_at));
                 persist.push(glyph_persist_entry(p, row));
             }
         }
@@ -4328,17 +4355,15 @@ pub(crate) fn spawn_pr_cache_refresh_with_generation(
                 let mut router = thegn_svc::issue::IssueRouter::from_config(&issues_cfg);
                 // Provider-as-plugin: append live plugin issue providers.
                 crate::plugin_providers::extend_issue_router(&mut router);
-                if router.is_configured()
-                    && let Ok(rt) = tokio::runtime::Builder::new_current_thread()
-                        .enable_all()
-                        .build()
-                {
+                if router.is_configured() {
                     let patch = thegn_core::issue::IssuePatch {
                         status: Some(thegn_core::issue::IssueStatus::Done),
                         ..Default::default()
                     };
                     for id in &linked {
-                        if let Err(e) = rt.block_on(router.update_issue(id, &patch)) {
+                        if let Ok(Err(e)) =
+                            thegn_svc::issue::block_on_tracker(router.update_issue(id, &patch))
+                        {
                             tracing::warn!(target: "thegn::issues", error = %e, "failed to move linked issue {id} to Done on merge");
                         }
                     }
@@ -4912,14 +4937,11 @@ pub(crate) fn spawn_my_work_refresh(
         let mut router = thegn_svc::issue::IssueRouter::from_config_at(&issues_cfg, Some(&cwd));
         // Provider-as-plugin: append live plugin issue providers.
         crate::plugin_providers::extend_issue_router(&mut router);
-        if router.is_configured()
-            && let Ok(rt) = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-        {
+        if router.is_configured() {
             let mut filter = thegn_core::issue::IssueFilter::my_open(issues_cfg.max_issues.max(1));
             filter.repo = nwo.clone(); // GitHub repo scope; other providers ignore it.
-            if let Ok(issues) = rt.block_on(router.list_issues(&filter)) {
+            if let Ok(Ok(issues)) = thegn_svc::issue::block_on_tracker(router.list_issues(&filter))
+            {
                 for i in issues {
                     // Tag GitHub issues with the repo for display; Linear/Jira
                     // scope by team/project, so leave their repo blank.

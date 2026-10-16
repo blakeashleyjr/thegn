@@ -11,19 +11,22 @@
 //! Three rules hold for everything in this module:
 //!
 //! 1. **Never on the loop.** A cold `du` is seconds; a tokei walk on a large
-//!    tree is longer. Both run on `spawn_blocking` behind a background-lane
-//!    permit ([`crate::sched::bg_permit`]).
+//!    tree is longer. Each runs on its own named `Background` lane, outside the
+//!    shared background permits.
 //! 2. **Never wake a sleeping sandbox.** Remote/provider worktrees are skipped
 //!    outright — measuring them on a timer would fight `[lifecycle]`
 //!    hibernation, and their host path is a stub whose size would be a lie.
 //! 3. **One round at a time.** A round outliving its pump used to mean
-//!    overlapping full scans double-measuring everything and holding several of
-//!    the eight background permits, starving the PR/issue/CI refreshes.
+//!    overlapping full scans double-measuring everything and queueing redundant
+//!    work in the dedicated measurement lane.
 
 pub(crate) mod disk;
 pub(crate) mod loc;
 
+use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{OnceLock, mpsc};
+use std::thread::JoinHandle;
 
 use thegn_core::db::Db;
 use thegn_core::scan_sched::ScanTarget;
@@ -32,6 +35,59 @@ use thegn_core::store::WorkspaceStore;
 /// Tracing target for both scanners — `THEGN_LOG=thegn::measure=debug` shows
 /// each round's plan, and every reason a round declined to run.
 pub(crate) const LOG: &str = "thegn::measure";
+
+type Job = Box<dyn FnOnce() + Send>;
+
+struct LaneHandle {
+    tx: mpsc::SyncSender<Job>,
+    _thread: JoinHandle<()>,
+}
+
+/// One long-lived, bounded measurement worker. Keeping the handle makes its
+/// ownership explicit; the worker parks in `recv` while its lane is idle.
+pub(crate) struct Lane {
+    name: &'static str,
+    slot: OnceLock<Option<LaneHandle>>,
+}
+
+impl Lane {
+    pub(crate) const fn new(name: &'static str) -> Self {
+        Self {
+            name,
+            slot: OnceLock::new(),
+        }
+    }
+
+    pub(crate) fn submit(&'static self, job: Job) -> crate::sched::Admission {
+        let Some(handle) = self.slot.get_or_init(|| {
+            let (tx, rx) = mpsc::sync_channel::<Job>(1);
+            let name = self.name;
+            let thread = match std::thread::Builder::new().name(name.to_owned()).spawn(move || {
+                crate::platform::qos::set_self(crate::platform::qos::Qos::Background);
+                while let Ok(job) = rx.recv() {
+                    if catch_unwind(AssertUnwindSafe(job)).is_err() {
+                        tracing::warn!(target: LOG, lane = name, "measurement job panicked");
+                    }
+                }
+            }) {
+                Ok(thread) => thread,
+                Err(error) => {
+                    tracing::debug!(target: LOG, lane = name, %error, "could not start measurement lane");
+                    return None;
+                }
+            };
+            Some(LaneHandle { tx, _thread: thread })
+        }) else {
+            return crate::sched::Admission::Unavailable;
+        };
+
+        match handle.tx.try_send(job) {
+            Ok(()) => crate::sched::Admission::Admitted,
+            Err(mpsc::TrySendError::Full(_)) => crate::sched::Admission::Saturated,
+            Err(mpsc::TrySendError::Disconnected(_)) => crate::sched::Admission::Unavailable,
+        }
+    }
+}
 
 /// RAII round guard. Process-global rather than a loop-side `bool` (contrast
 /// `run.rs`'s `prq_inflight`) because a scan is fire-and-forget: there is no
@@ -57,6 +113,9 @@ pub(crate) fn begin(flag: &'static AtomicBool, what: &'static str) -> Option<Rou
         }
     }
 }
+
+pub(crate) static DISK_LANE: Lane = Lane::new("thegn-msr-disk");
+pub(crate) static LOC_LANE: Lane = Lane::new("thegn-msr-loc");
 
 /// Kick both scans now: startup, a worktree created, a workspace added, a
 /// worktree switched to.
@@ -280,5 +339,91 @@ mod tests {
             Some("/wt/a")
         );
         assert!(active_key(None).is_none());
+    }
+}
+
+#[cfg(test)]
+mod lane_tests {
+    use super::*;
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    #[test]
+    fn lane_runs_jobs_on_one_named_thread() {
+        static LANE: Lane = Lane::new("thegn-msr-one");
+        let (tx, rx) = mpsc::channel();
+        let mut seen = Vec::new();
+        // One job at a time: the queue holds a single pending job, so a second
+        // submit before the lane takes the first is (correctly) `Saturated`.
+        for _ in 0..2 {
+            let tx = tx.clone();
+            assert_eq!(
+                LANE.submit(Box::new(move || {
+                    tx.send((
+                        std::thread::current().id(),
+                        std::thread::current().name().map(str::to_owned),
+                    ))
+                    .unwrap();
+                })),
+                crate::sched::Admission::Admitted
+            );
+            seen.push(rx.recv_timeout(Duration::from_secs(5)).unwrap());
+        }
+        let (first, second) = (seen[0].clone(), seen[1].clone());
+        assert_eq!(first, second);
+        assert_eq!(first.1.as_deref(), Some("thegn-msr-one"));
+    }
+
+    #[test]
+    fn lane_full_queue_refuses_without_blocking() {
+        static LANE: Lane = Lane::new("thegn-msr-full");
+        let (started_tx, started_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let (finished_tx, finished_rx) = mpsc::channel();
+        assert_eq!(
+            LANE.submit(Box::new(move || {
+                started_tx.send(()).unwrap();
+                release_rx.recv().unwrap();
+            })),
+            crate::sched::Admission::Admitted
+        );
+        started_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert_eq!(
+            LANE.submit(Box::new(move || finished_tx.send(()).unwrap())),
+            crate::sched::Admission::Admitted
+        );
+        assert_eq!(
+            LANE.submit(Box::new(|| {})),
+            crate::sched::Admission::Saturated
+        );
+        release_tx.send(()).unwrap();
+        finished_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+    }
+
+    #[test]
+    fn lane_survives_a_panicking_job() {
+        static LANE: Lane = Lane::new("thegn-msr-panic");
+        assert_eq!(
+            LANE.submit(Box::new(|| panic!("expected lane test panic"))),
+            crate::sched::Admission::Admitted
+        );
+        let (tx, rx) = mpsc::channel();
+        // The panicking job may still sit in the single-slot queue: retry until
+        // the lane takes the follow-up, which proves it survived the panic.
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            let tx = tx.clone();
+            match LANE.submit(Box::new(move || tx.send(()).unwrap())) {
+                crate::sched::Admission::Admitted => break,
+                other => {
+                    assert!(
+                        std::time::Instant::now() < deadline,
+                        "lane never re-admitted: {other:?}"
+                    );
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+            }
+        }
+        rx.recv_timeout(Duration::from_secs(5)).unwrap();
     }
 }

@@ -36,6 +36,9 @@ pub(crate) enum PendingDbResult {
     Dropped {
         seq: u64,
     },
+    WriteFailed {
+        status: String,
+    },
 }
 
 #[derive(Debug, Default)]
@@ -231,6 +234,31 @@ fn send_result(
     if let Err(error) = waker.wake() {
         tracing::debug!(target: "thegn::db", %error, "pending DB result wake failed");
     }
+}
+
+fn report_write_result(
+    result: Result<(), String>,
+    on_err: impl FnOnce(String) -> String,
+    notify: impl FnOnce(PendingDbResult),
+) {
+    if let Err(error) = result {
+        notify(PendingDbResult::WriteFailed {
+            status: on_err(error),
+        });
+    }
+}
+
+pub(crate) fn queue_reported_write(
+    tx: &tokio::sync::mpsc::UnboundedSender<PendingDbResult>,
+    waker: &termwiz::terminal::TerminalWaker,
+    job: impl FnOnce(&thegn_core::db::Db) -> Result<(), String> + Send + 'static,
+    on_err: impl FnOnce(String) -> String + Send + 'static,
+) {
+    let tx = tx.clone();
+    let waker = waker.clone();
+    crate::db_task::persist_critical(move |db| {
+        report_write_result(job(db), on_err, |result| send_result(&tx, &waker, result));
+    });
 }
 
 async fn send_dropped_result(
@@ -498,6 +526,25 @@ mod tests {
 
     fn sample_spec() -> crate::layout_spec::LayoutSpec {
         crate::layout_spec::LayoutSpec::even_split(&["one".to_string(), "two".to_string()])
+    }
+
+    #[test]
+    fn reported_write_sends_exactly_one_failure_and_nothing_on_success() {
+        let mut results = Vec::new();
+        report_write_result(
+            Err("locked".into()),
+            |error| format!("failed: {error}"),
+            |r| results.push(r),
+        );
+        report_write_result(
+            Ok(()),
+            |error| format!("failed: {error}"),
+            |r| results.push(r),
+        );
+        assert!(matches!(
+            results.as_slice(),
+            [PendingDbResult::WriteFailed { status }] if status == "failed: locked"
+        ));
     }
 
     #[test]

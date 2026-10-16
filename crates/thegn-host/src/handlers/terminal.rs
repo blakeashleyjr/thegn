@@ -48,25 +48,36 @@ pub(crate) fn open_wizard(
     TerminalWizard::new(cfg, &taken_names(session, db_terminals))
 }
 
-/// Persist a terminal from the wizard: upsert the row (keyed by unique name) and
-/// record its sandbox backend when local. Best-effort — the DB is a cache and
-/// the live spawn reads the in-process choice registry ([`live_choice`]) rather
-/// than this row, so a failed write only means the terminal isn't remembered
-/// across restarts. Returns `false` (open or upsert failed) so the caller can
-/// surface that on the status line instead of swallowing it.
-pub(crate) fn persist(choice: &TerminalChoice) -> bool {
-    let Ok(db) = thegn_core::db::Db::open() else {
-        return false;
-    };
-    let ok = db
-        .put_terminal(&choice.name, &choice.kind, &choice.connection, None)
-        .is_ok();
+/// Persist a terminal from the wizard on the FIFO DB writer. The live spawn
+/// reads the in-process choice registry ([`live_choice`]), so the loop can
+/// apply the choice immediately and only needs a result if restart persistence
+/// fails.
+pub(crate) fn persist(
+    choice: &TerminalChoice,
+    tx: &tokio::sync::mpsc::UnboundedSender<crate::run::run_pending_db::PendingDbResult>,
+    waker: &termwiz::terminal::TerminalWaker,
+) {
+    let choice = choice.clone();
+    crate::run::run_pending_db::queue_reported_write(
+        tx,
+        waker,
+        move |db| write_terminal_row(db, &choice),
+        |_| "terminal not saved — it won't be remembered across restarts".to_string(),
+    );
+}
+
+fn write_terminal_row(db: &thegn_core::db::Db, choice: &TerminalChoice) -> Result<(), String> {
+    use thegn_core::store::WorkspaceStore;
+    db.put_terminal(&choice.name, &choice.kind, &choice.connection, None)
+        .map_err(|error| error.to_string())?;
     if !choice.sandbox.is_empty() && choice.sandbox != "host" && choice.sandbox != "none" {
         // best-effort: the sandbox column only matters across restarts; the
         // live session spawns from the registry below.
-        let _ = db.set_terminal_sandbox(&choice.name, &choice.sandbox); // best-effort: cache write: the DB is a cache; git/forge stays the source of truth
+        if let Err(error) = db.set_terminal_sandbox(&choice.name, &choice.sandbox) {
+            tracing::debug!(target: "thegn::terminal", %error, "terminal sandbox choice persist failed");
+        }
     }
-    ok
+    Ok(())
 }
 
 /// Record the containment a terminal's launch ACTUALLY entered (argv-derived,
@@ -274,6 +285,66 @@ mod tests {
             )],
             active: 0,
         }
+    }
+
+    #[test]
+    fn write_terminal_row_records_sandbox_only_when_contained() {
+        use thegn_core::store::WorkspaceStore;
+
+        let db = thegn_core::db::Db::open_memory().unwrap();
+        write_terminal_row(&db, &choice("sandboxed", "", "bwrap")).unwrap();
+        write_terminal_row(&db, &choice("host", "", "host")).unwrap();
+        write_terminal_row(&db, &choice("none", "", "none")).unwrap();
+        write_terminal_row(&db, &choice("empty", "", "")).unwrap();
+        let rows = db.terminals().unwrap();
+        let sandboxed = rows.iter().find(|row| row.name == "sandboxed").unwrap();
+        let host = rows.iter().find(|row| row.name == "host").unwrap();
+        let none = rows.iter().find(|row| row.name == "none").unwrap();
+        let empty = rows.iter().find(|row| row.name == "empty").unwrap();
+        assert_eq!(sandboxed.sandbox_backend, "bwrap");
+        assert_eq!(host.sandbox_backend, "");
+        assert_eq!(none.sandbox_backend, "");
+        assert_eq!(empty.sandbox_backend, "");
+    }
+
+    #[test]
+    fn persist_does_not_block_on_a_held_write_lock() {
+        if !crate::platform::sound_process::test_support::UNIX {
+            return;
+        }
+        use thegn_core::store::WorkspaceStore;
+
+        let state_home = tempfile::Builder::new()
+            .prefix("tg-terminal-lock-")
+            .tempdir()
+            .unwrap();
+        let state_path = state_home.path().to_string_lossy().into_owned();
+        let _env = crate::testenv::EnvVarGuard::set(&[("XDG_STATE_HOME", &state_path)]);
+        drop(thegn_core::db::Db::open().unwrap());
+        let lock = rusqlite::Connection::open(state_home.path().join("thegn/thegn.db")).unwrap();
+        lock.execute_batch("BEGIN IMMEDIATE").unwrap();
+
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let (waker, _master, _terminal) =
+            crate::platform::sound_process::test_support::test_waker();
+        let started = std::time::Instant::now();
+        persist(&choice("queued-terminal", "", "bwrap"), &tx, &waker);
+        assert!(started.elapsed() < std::time::Duration::from_millis(500));
+
+        lock.execute_batch("ROLLBACK").unwrap();
+        drop(lock);
+        let (read_tx, read_rx) = std::sync::mpsc::channel();
+        crate::db_task::persist_critical(move |db| {
+            let rows = db.terminals();
+            if read_tx.send(rows).is_err() {
+                tracing::debug!(target: "thegn::terminal", "terminal read-back receiver closed");
+            }
+        });
+        let rows = read_rx
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .unwrap()
+            .unwrap();
+        assert!(rows.iter().any(|row| row.name == "queued-terminal"));
     }
 
     #[test]

@@ -26,7 +26,7 @@ exclude = ["apps", "vendor"]
 termwiz = { path = "vendor/termwiz" }
 
 [workspace.package]
-version = "0.1.0-alpha.2"
+version = "0.1.0-alpha.3"
 edition = "2024"
 license = "MIT OR Apache-2.0"
 # Resolves cargo-binstall's `{ repo }` template variable (thegn-host's
@@ -209,6 +209,7 @@ protox = "0.7"
 regex = "1"
 gix = "0.84"
 tokei = "15"
+rayon = "1"
 # Semantic git layer (item 309+): tree-sitter entity parsing across languages.
 tree-sitter = "0.26"
 tree-sitter-rust = "0.24"
@@ -217,15 +218,14 @@ tree-sitter-javascript = "0.25"
 tree-sitter-python = "0.25"
 tree-sitter-go = "0.25"
 # --- cross-platform system metrics (masthead + telemetry substrate) ---
-# Feature-gated to the subsystems we sample; processes live under `system` but
-# are never refreshed on the hot path. sysinfo does no background work — cost is
-# only paid on our ticker tick, preserving the ~0%-idle invariant.
+# Feature-gated to the subsystems we sample. Process refresh runs serially on
+# the ticker thread: `multithread` fans every 2 s sample across a CPU-count
+# rayon pool, waking all of its workers for a handful of PIDs.
 sysinfo = { version = "0.39", default-features = false, features = [
   "system",
   "disk",
   "network",
   "component",
-  "multithread",
 ] }
 # Battery is the one metric sysinfo does not cover. Linux keeps our native sysfs
 # reader (+ adapter `online` flag); other platforms use this cross-platform crate.

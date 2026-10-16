@@ -256,12 +256,6 @@ pub(crate) fn issues_key(key: char, ctx: &mut TrackerCtx) -> bool {
                     if !router.is_configured() {
                         return;
                     }
-                    let Ok(rt) = tokio::runtime::Builder::new_current_thread()
-                        .enable_all()
-                        .build()
-                    else {
-                        return;
-                    };
                     let patch = IssuePatch {
                         assignee_me: Some(true),
                         ..Default::default()
@@ -270,7 +264,9 @@ pub(crate) fn issues_key(key: char, ctx: &mut TrackerCtx) -> bool {
                     // optimistic "Assigning…" status was already set on the loop,
                     // so surface the error (matches dispatch_agent's off-thread
                     // reporting) instead of silently claiming success.
-                    if let Err(e) = rt.block_on(router.update_issue(&issue.id, &patch)) {
+                    if let Ok(Err(e)) =
+                        thegn_svc::issue::block_on_tracker(router.update_issue(&issue.id, &patch))
+                    {
                         crate::hydrate_tracker::send_tracker_toast(
                             &refresh_tx2,
                             &waker2,
