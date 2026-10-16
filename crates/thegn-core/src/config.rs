@@ -4464,13 +4464,20 @@ impl Default for SandboxConfig {
 }
 
 impl SandboxConfig {
-    /// Resolve `env_passthrough` into the present `(KEY, VALUE)` pairs from the
-    /// host environment. Shared by the OCI spec build and the provider/remote
-    /// native-exec env so the SAME secrets (GH_TOKEN, ANTHROPIC_API_KEY, …) reach
-    /// EVERY placement, not just containers.
+    /// Resolve admitted `env_passthrough` names into present `(KEY, VALUE)`
+    /// pairs. Shared by sandbox and provider/remote native-exec placements.
     pub fn passthrough_env(&self) -> Vec<(String, String)> {
+        self.passthrough_env_for(&crate::profile::CredentialFirewall::active())
+    }
+
+    /// Resolve admitted `env_passthrough` names into present host values.
+    pub fn passthrough_env_for(
+        &self,
+        firewall: &crate::profile::CredentialFirewall,
+    ) -> Vec<(String, String)> {
         self.env_passthrough
             .iter()
+            .filter(|key| firewall.admits(key))
             .filter_map(|k| std::env::var(k).ok().map(|v| (k.clone(), v)))
             .collect()
     }

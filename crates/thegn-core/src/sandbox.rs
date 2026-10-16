@@ -1333,12 +1333,15 @@ fn resolve_placed_with(
     // THE-66: sealed / sealed-tunnel tiers get a default-deny secret posture —
     // the SSH agent socket is dropped from the passthrough even if the config
     // still names it (a sealed pane with the user's agent contradicts the tier).
-    // Explicit `env_passthrough` on those tiers still re-adds it; doctor flags
-    // it. Hardened/open keep whatever the passthrough names.
+    // Explicit `env_passthrough` on those tiers still re-adds it subject to the
+    // profile credential firewall; doctor flags it. Hardened/open keep whatever
+    // the passthrough names admitted by that firewall.
     let seal_agent = profile.seals_agent_socket();
+    let firewall = crate::profile::CredentialFirewall::active();
     let mut env: Vec<(String, String)> = cfg
         .env_passthrough
         .iter()
+        .filter(|k| firewall.admits(k))
         .filter(|k| !(seal_agent && k.as_str() == "SSH_AUTH_SOCK"))
         .filter_map(|k| std::env::var(k).ok().map(|v| (k.clone(), v)))
         // A dead agent socket is worse than none: every in-sandbox ssh would

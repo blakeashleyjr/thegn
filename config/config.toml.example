@@ -2842,6 +2842,10 @@ mounts = ["~/.gitconfig:ro"]
 # the session bus) and the agent socket are unreachable from inside a pane unless
 # you add `/run/user` back to `mounts` explicitly. `thegn doctor` lists exactly
 # what each tier exposes.
+# Named profiles do not receive ambient credentials from this list. Share a
+# variable with `[profiles.<name>.sandbox] env_passthrough`; that list replaces
+# this one for the profile, while infrastructure names such as TERM always pass.
+# `thegn doctor` shows denied/shared names. The share list is read at startup.
 env_passthrough = [
   "SSH_AUTH_SOCK",      # agent socket (dropped on sealed tiers; needs /run/user mounted to work)
   "GH_TOKEN",           # GitHub CLI auth
