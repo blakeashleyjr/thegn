@@ -78,6 +78,20 @@ pub(crate) enum PresetDrainPlan {
     NothingToLaunch,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PresetApplyOutcome {
+    Applied,
+    NothingSpawned,
+}
+
+pub(crate) fn plan_preset_apply(spawned: bool) -> PresetApplyOutcome {
+    if spawned {
+        PresetApplyOutcome::Applied
+    } else {
+        PresetApplyOutcome::NothingSpawned
+    }
+}
+
 pub(crate) fn plan_preset_drain(
     accepts: bool,
     active_worktree: Option<&str>,
@@ -540,6 +554,12 @@ mod tests {
                 _ => unreachable!(),
             }
         }
+    }
+
+    #[test]
+    fn preset_apply_plan_only_marks_spawned_layouts_as_applied() {
+        assert_eq!(plan_preset_apply(true), PresetApplyOutcome::Applied);
+        assert_eq!(plan_preset_apply(false), PresetApplyOutcome::NothingSpawned);
     }
 
     #[test]

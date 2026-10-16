@@ -10522,16 +10522,26 @@ async fn event_loop<T: Terminal>(
                             if let Some(active) = session.active_group_mut() {
                                 active.add_tab();
                             }
-                            apply_layout_to_active_tab(
-                                &spec,
-                                &mut session,
-                                &mut panes,
-                                keymap.config(),
-                                chrome.center,
+                            let outcome = run_pending_db::plan_preset_apply(
+                                apply_layout_to_active_tab(
+                                    &spec,
+                                    &mut session,
+                                    &mut panes,
+                                    keymap.config(),
+                                    chrome.center,
+                                )
+                                .is_some(),
                             );
-                            persist_session_layout(&mut session, &panes);
-                            need_relayout = true;
-                            model.status = format!("Launched preset {name}");
+                            match outcome {
+                                run_pending_db::PresetApplyOutcome::Applied => {
+                                    persist_session_layout(&mut session, &panes);
+                                    need_relayout = true;
+                                    model.status = format!("Launched preset {name}");
+                                }
+                                run_pending_db::PresetApplyOutcome::NothingSpawned => {
+                                    model.status = format!("preset {name}: nothing spawned");
+                                }
+                            }
                             dirty = true;
                         }
                         run_pending_db::PresetDrainPlan::FallBackToCommands => {
