@@ -1643,7 +1643,7 @@ mod tests {
                 .unwrap();
             for item in iter {
                 let item = item.unwrap();
-                found |= item.location().as_ref() == b"tracked.txt";
+                found |= item.location().to_vec() == b"tracked.txt";
             }
         }
         assert!(found, "status must report the same-size filtered edit");
