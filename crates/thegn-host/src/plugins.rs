@@ -24,6 +24,103 @@ use thegn_svc::plugin::{
 };
 use tokio::sync::mpsc as tokio_mpsc;
 
+pub(crate) mod inbox;
+use inbox::PluginInbox;
+
+#[derive(Clone)]
+pub(crate) struct PluginTx {
+    lifecycle: tokio_mpsc::UnboundedSender<PluginMsg>,
+    inbox: Arc<PluginInbox>,
+}
+
+pub(crate) struct PluginRx {
+    lifecycle: tokio_mpsc::UnboundedReceiver<PluginMsg>,
+    inbox: Arc<PluginInbox>,
+}
+
+pub(crate) fn plugin_channel() -> (PluginTx, PluginRx) {
+    let (lifecycle_tx, lifecycle_rx) = tokio_mpsc::unbounded_channel();
+    let inbox = Arc::new(PluginInbox::default());
+    (
+        PluginTx {
+            lifecycle: lifecycle_tx,
+            inbox: inbox.clone(),
+        },
+        PluginRx {
+            lifecycle: lifecycle_rx,
+            inbox,
+        },
+    )
+}
+
+impl PluginTx {
+    pub(crate) fn send(
+        &self,
+        message: PluginMsg,
+    ) -> Result<(), Box<tokio_mpsc::error::SendError<PluginMsg>>> {
+        match message {
+            PluginMsg::Event { plugin, event } => {
+                self.inbox.push(plugin, event);
+                Ok(())
+            }
+            message => self.lifecycle.send(message).map_err(Box::new),
+        }
+    }
+}
+
+impl PluginRx {
+    pub(crate) fn try_recv(&mut self) -> Result<PluginMsg, tokio_mpsc::error::TryRecvError> {
+        if let Some((plugin, event)) = self.inbox.pop_exit() {
+            return Ok(PluginMsg::Event { plugin, event });
+        }
+        match self.lifecycle.try_recv() {
+            Ok(message) => Ok(message),
+            Err(tokio_mpsc::error::TryRecvError::Disconnected) => self
+                .inbox
+                .pop()
+                .map(|(plugin, event)| PluginMsg::Event { plugin, event })
+                .ok_or(tokio_mpsc::error::TryRecvError::Disconnected),
+            Err(tokio_mpsc::error::TryRecvError::Empty) => self
+                .inbox
+                .pop()
+                .map(|(plugin, event)| PluginMsg::Event { plugin, event })
+                .ok_or(tokio_mpsc::error::TryRecvError::Empty),
+        }
+    }
+
+    pub(crate) fn is_empty(&self) -> bool {
+        self.lifecycle.is_empty() && self.inbox.is_empty()
+    }
+
+    pub(crate) fn pop_rejected_if_lifecycle_empty(&self) -> Option<inbox::RejectedRequest> {
+        if self.lifecycle.is_empty() {
+            self.inbox.pop_rejected()
+        } else {
+            None
+        }
+    }
+
+    pub(crate) fn inbox(&self) -> Arc<PluginInbox> {
+        self.inbox.clone()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn len(&self) -> usize {
+        self.lifecycle.len() + self.inbox.len()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn blocking_recv(&mut self) -> Option<PluginMsg> {
+        match self.lifecycle.blocking_recv() {
+            Some(message) => Some(message),
+            None => self
+                .inbox
+                .pop()
+                .map(|(plugin, event)| PluginMsg::Event { plugin, event }),
+        }
+    }
+}
+
 /// What the off-loop plugin host reports back to the event loop.
 pub(crate) enum PluginMsg {
     /// Discovery finished: every enabled plugin that negotiated cleanly, in
@@ -129,7 +226,7 @@ pub(crate) struct PluginsHost {
     supervisor: ResidentSupervisor,
     sessions: Sessions,
     disabled: Disabled,
-    tx: tokio_mpsc::UnboundedSender<PluginMsg>,
+    tx: PluginTx,
     waker: TerminalWaker,
     one_shot_gate: OneShotGate,
 }
@@ -142,7 +239,7 @@ pub(crate) fn spawn_plugins_host(
     supervisor: ResidentSupervisor,
     specs: Vec<PluginSpec>,
     config_dir: PathBuf,
-    tx: tokio_mpsc::UnboundedSender<PluginMsg>,
+    tx: PluginTx,
     waker: TerminalWaker,
 ) -> PluginsHost {
     let stop = Arc::new(AtomicBool::new(false));
@@ -306,7 +403,7 @@ fn admitted_plugins(
 fn spawn_session(
     supervisor: &ResidentSupervisor,
     plugin: &LoadedPlugin,
-    tx: &tokio_mpsc::UnboundedSender<PluginMsg>,
+    tx: &PluginTx,
     waker: &TerminalWaker,
 ) -> Result<ResidentSession, PluginError> {
     let id = plugin.spec.manifest.id.as_str().to_string();
@@ -321,11 +418,10 @@ fn spawn_session(
         plugin.effective_cwd().as_deref(),
         move |event| {
             // best-effort: the loop may be gone during shutdown.
-            let _ = tx.send(PluginMsg::Event {
-                plugin: id.clone(),
-                event,
-            });
-            let _ = waker.wake(); // best-effort: waker pulse: an input nudge must never fail the calling path
+            let (_, should_wake) = tx.inbox.push_with_wake(id.clone(), event);
+            if should_wake && let Err(error) = waker.wake() {
+                tracing::debug!(target: "thegn::plugin", plugin = %id, %error, "session event waker pulse failed");
+            }
         },
     )
 }
@@ -393,7 +489,7 @@ fn setup_and_schedule(
     sessions: Sessions,
     disabled: Disabled,
     stop: Arc<AtomicBool>,
-    tx: tokio_mpsc::UnboundedSender<PluginMsg>,
+    tx: PluginTx,
     waker: TerminalWaker,
 ) {
     setup_and_schedule_with_waker(
@@ -416,7 +512,7 @@ fn setup_and_schedule_with_waker(
     sessions: Sessions,
     disabled: Disabled,
     stop: Arc<AtomicBool>,
-    tx: tokio_mpsc::UnboundedSender<PluginMsg>,
+    tx: PluginTx,
     waker: Option<TerminalWaker>,
 ) {
     // `discover` reads `cfg.plugins` + the plugins directory; hand it the
@@ -643,6 +739,16 @@ mod tests {
     use super::*;
     use thegn_core::plugin_api::{ContributionId, MAX_PLUGIN_TIMEOUT_SECS, PluginId, PluginSpec};
 
+    #[test]
+    fn plugin_send_error_keeps_result_variant_small() {
+        let (tx, rx) = plugin_channel();
+        drop(rx);
+
+        let error = tx.send(PluginMsg::Loaded(Vec::new())).unwrap_err();
+
+        assert!(std::mem::size_of_val(&error) < 128);
+    }
+
     fn example_spec() -> PluginSpec {
         toml::from_str(include_str!("../../../examples/plugins/hello/plugin.toml")).unwrap()
     }
@@ -759,7 +865,7 @@ mod tests {
             .build()
             .unwrap();
         let supervisor = ResidentSupervisor::new(runtime.handle().clone());
-        let (tx, mut rx) = tokio_mpsc::unbounded_channel();
+        let (tx, mut rx) = plugin_channel();
         let host = PluginsHost {
             stop: Arc::new(AtomicBool::new(false)),
             supervisor,
@@ -897,7 +1003,7 @@ mod tests {
         let sessions: Sessions = Arc::new(Mutex::new(BTreeMap::new()));
         let disabled: Disabled = Arc::new(Mutex::new(Default::default()));
         let stop = Arc::new(AtomicBool::new(false));
-        let (tx, mut rx) = tokio_mpsc::unbounded_channel();
+        let (tx, mut rx) = plugin_channel();
 
         setup_and_schedule_with_waker(
             supervisor,
@@ -939,7 +1045,7 @@ mod tests {
         let sessions: Sessions = Arc::new(Mutex::new(BTreeMap::new()));
         let disabled: Disabled = Arc::new(Mutex::new(Default::default()));
         let stop = Arc::new(AtomicBool::new(false));
-        let (tx, mut rx) = tokio_mpsc::unbounded_channel();
+        let (tx, mut rx) = plugin_channel();
 
         setup_and_schedule_with_waker(
             supervisor,

@@ -20,11 +20,11 @@ use thegn_core::plugin_api::{
 };
 use thegn_svc::issue::IssueCaps;
 use thegn_svc::plugin::{LoadedPlugin, SessionEvent, SessionWriter};
-use tokio::sync::mpsc as tokio_mpsc;
 
 use crate::chrome::FrameModel;
 use crate::plugin_damage::PluginDamage;
-use crate::plugins::{LoadedState, OneShotStart, PluginMsg, PluginsHost};
+use crate::plugins::inbox::{PluginInbox, RejectedRequest};
+use crate::plugins::{LoadedState, OneShotStart, PluginMsg, PluginRx, PluginsHost};
 
 const MAX_PENDING_ALERTS_PER_PLUGIN: usize = 16;
 const MAX_ALERT_MESSAGE_BYTES: usize = 1024;
@@ -69,6 +69,7 @@ pub(crate) struct PluginsState {
     pub pending_alerts: Vec<(String, Alert)>,
     /// Number of alerts dropped per plugin in the current outbox batch.
     pending_alert_drops: BTreeMap<String, usize>,
+    inbox: Option<Arc<PluginInbox>>,
     /// Lazily started `host.call` dispatcher (a thread is only spawned once a
     /// plugin actually calls).
     dispatcher: Option<Dispatcher>,
@@ -82,6 +83,7 @@ impl PluginsState {
             plugins: BTreeMap::new(),
             pending_alerts: Vec::new(),
             pending_alert_drops: BTreeMap::new(),
+            inbox: None,
             dispatcher: None,
             cfg,
         }
@@ -416,6 +418,15 @@ fn one_shot_status(plugin: &str, contribution: &str, start: OneShotStart) -> Str
 /// Record this drain's raised alerts to the notification inbox, off-loop.
 /// Call after [`drain`] from the event loop (requires a tokio runtime).
 pub(crate) fn flush_alerts(state: &mut PluginsState) {
+    if let Some(inbox) = &state.inbox {
+        for (plugin, counts) in inbox.take_diagnostics() {
+            if counts.dropped > 0 || counts.rejected > 0 {
+                tracing::warn!(target: "thegn::plugin", plugin = %plugin, coalesced = counts.coalesced, dropped = counts.dropped, rejected = counts.rejected, cap = crate::plugins::inbox::MAX_QUEUED_EVENTS_PER_PLUGIN, "plugin event queue saturated");
+            } else if counts.coalesced > 0 {
+                tracing::debug!(target: "thegn::plugin", plugin = %plugin, coalesced = counts.coalesced, "plugin event queue coalesced updates");
+            }
+        }
+    }
     let alerts = std::mem::take(&mut state.pending_alerts);
     for (plugin, dropped) in std::mem::take(&mut state.pending_alert_drops) {
         tracing::warn!(target: "thegn::plugin", plugin = %plugin, dropped, cap = MAX_PENDING_ALERTS_PER_PLUGIN, "plugin alerts dropped: per-drain outbox cap reached");
@@ -451,15 +462,31 @@ pub(crate) fn flush_alerts(state: &mut PluginsState) {
 /// `host` is the respawn/shutdown handle; `None` (tests) records restart
 /// decisions without spawning anything.
 pub(crate) fn drain(
-    rx: &mut tokio_mpsc::UnboundedReceiver<PluginMsg>,
+    rx: &mut PluginRx,
     state: &mut PluginsState,
     model: &mut FrameModel,
     host: Option<&PluginsHost>,
 ) -> PluginDamage {
+    drain_with_responder(rx, state, model, host, &mut respond)
+}
+
+fn drain_with_responder(
+    rx: &mut PluginRx,
+    state: &mut PluginsState,
+    model: &mut FrameModel,
+    host: Option<&PluginsHost>,
+    responder: &mut impl FnMut(&PluginEntry, RpcResponse),
+) -> PluginDamage {
+    state.inbox = Some(rx.inbox());
     let before_views = statusbar_views(state);
     let mut damage = PluginDamage::None;
     let mut applied = 0;
     while applied < MAX_PLUGIN_MESSAGES_PER_DRAIN {
+        if let Some(rejected) = rx.pop_rejected_if_lifecycle_empty() {
+            applied = applied.saturating_add(1);
+            answer_rejected(state, rejected, responder);
+            continue;
+        }
         let Ok(msg) = rx.try_recv() else {
             break;
         };
@@ -572,6 +599,24 @@ pub(crate) fn drain(
         ));
     }
     damage
+}
+
+fn answer_rejected(
+    state: &PluginsState,
+    rejected: RejectedRequest,
+    responder: &mut impl FnMut(&PluginEntry, RpcResponse),
+) {
+    if let Some(entry) = state.plugins.get(&rejected.plugin) {
+        responder(
+            entry,
+            RpcResponse::err(
+                rejected.id,
+                RpcError::new(RpcErrorCode::RateLimited, "host plugin queue full"),
+            ),
+        );
+    } else {
+        tracing::debug!(target: "thegn::plugin", plugin = %rejected.plugin, id = rejected.id, "rejected request has no live plugin entry");
+    }
 }
 
 /// A resident session died: decide restart (backoff, capped at 3) or mark the
@@ -1397,7 +1442,7 @@ mod tests {
         model: &mut FrameModel,
         messages: impl IntoIterator<Item = PluginMsg>,
     ) -> PluginDamage {
-        let (tx, mut rx) = tokio_mpsc::unbounded_channel();
+        let (tx, mut rx) = crate::plugins::plugin_channel();
         for message in messages {
             tx.send(message).unwrap();
         }
@@ -1422,10 +1467,22 @@ mod tests {
     fn plugin_drain_budget_preserves_fifo_backlog_for_the_next_call() {
         let mut state = state_with(vec![seg_spec("p")]);
         let mut model = FrameModel::default();
-        let (tx, mut rx) = tokio_mpsc::unbounded_channel();
-        for index in 0..MAX_PLUGIN_MESSAGES_PER_DRAIN + 5 {
-            tx.send(update_message(format!("update-{index}"))).unwrap();
+        let (tx, mut rx) = crate::plugins::plugin_channel();
+        for index in 0..MAX_PLUGIN_MESSAGES_PER_DRAIN + 4 {
+            tx.send(PluginMsg::Event {
+                plugin: "p".into(),
+                event: SessionEvent::Message(msg(
+                    "emit",
+                    serde_json::json!({"topic":"test","data":{"index":index}}),
+                )),
+            })
+            .unwrap();
         }
+        tx.send(update_message(format!(
+            "update-{}",
+            MAX_PLUGIN_MESSAGES_PER_DRAIN + 4
+        )))
+        .unwrap();
 
         drain(&mut rx, &mut state, &mut model, None);
         assert_eq!(rx.len(), 5, "the first drain stops at its message budget");
@@ -1436,6 +1493,113 @@ mod tests {
             statusbar_views(&state)[0].1.text_content(),
             format!("update-{}", MAX_PLUGIN_MESSAGES_PER_DRAIN + 4)
         );
+    }
+
+    #[test]
+    fn flooded_request_gets_rate_limited_response() {
+        let mut state = state_with(vec![seg_spec("p")]);
+        let original = statusbar_views(&state);
+        let mut model = FrameModel::default();
+        let (tx, mut rx) = crate::plugins::plugin_channel();
+        for index in 0..crate::plugins::inbox::MAX_QUEUED_EVENTS_PER_PLUGIN {
+            tx.send(PluginMsg::Event {
+                plugin: "p".into(),
+                event: SessionEvent::Message(msg(
+                    "emit",
+                    serde_json::json!({"topic":"flood","data":index}),
+                )),
+            })
+            .unwrap();
+        }
+        tx.send(PluginMsg::Event {
+            plugin: "p".into(),
+            event: SessionEvent::Message(RpcMessage {
+                id: Some(77),
+                method: "io".into(),
+                params: serde_json::json!({}),
+            }),
+        })
+        .unwrap();
+
+        let mut responses = Vec::new();
+        while !rx.is_empty() {
+            drain_with_responder(&mut rx, &mut state, &mut model, None, &mut |_, response| {
+                responses.push(response)
+            });
+        }
+
+        let diagnostics = state.inbox.as_ref().unwrap().take_diagnostics();
+        assert_eq!(diagnostics["p"].rejected, 1);
+        assert!(
+            rx.is_empty(),
+            "the rejected request is consumed by the drain"
+        );
+        assert_eq!(
+            responses,
+            [RpcResponse::err(
+                77,
+                RpcError::new(RpcErrorCode::RateLimited, "host plugin queue full")
+            )]
+        );
+        assert_eq!(statusbar_views(&state), original);
+        assert!(state.plugins.contains_key("p"));
+    }
+
+    #[test]
+    fn respawn_lifecycle_is_processed_before_rejected_request() {
+        let (tx, mut rx) = crate::plugins::plugin_channel();
+        for _ in 0..crate::plugins::inbox::MAX_QUEUED_EVENTS_PER_PLUGIN {
+            rx.inbox().push(
+                "p".into(),
+                SessionEvent::Message(msg("emit", serde_json::json!({}))),
+            );
+        }
+        assert_eq!(
+            rx.inbox().push(
+                "p".into(),
+                SessionEvent::Message(RpcMessage {
+                    id: Some(77),
+                    method: "io".into(),
+                    params: serde_json::json!({}),
+                }),
+            ),
+            crate::plugins::inbox::PushOutcome::Rejected
+        );
+        tx.send(PluginMsg::Event {
+            plugin: "p".into(),
+            event: SessionEvent::Exit { code: None },
+        })
+        .unwrap();
+        tx.send(PluginMsg::Respawned {
+            plugin: "p".into(),
+            writer: None,
+        })
+        .unwrap();
+
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(PluginMsg::Event {
+                event: SessionEvent::Exit { .. },
+                ..
+            })
+        ));
+        assert!(matches!(rx.try_recv(), Ok(PluginMsg::Respawned { .. })));
+        assert_eq!(rx.pop_rejected_if_lifecycle_empty().unwrap().id, 77);
+    }
+
+    #[test]
+    fn update_flood_from_session_keeps_memory_bounded() {
+        let mut state = state_with(vec![seg_spec("p")]);
+        let mut model = FrameModel::default();
+        let (tx, mut rx) = crate::plugins::plugin_channel();
+        for index in 0..100_000 {
+            tx.send(update_message(format!("flood-{index}"))).unwrap();
+        }
+        assert_eq!(rx.len(), 1);
+
+        drain(&mut rx, &mut state, &mut model, None);
+
+        assert_eq!(statusbar_views(&state)[0].1.text_content(), "flood-99999");
     }
 
     #[test]
@@ -1456,7 +1620,7 @@ mod tests {
                 .collect(),
             ..Default::default()
         };
-        let (tx, mut rx) = tokio_mpsc::unbounded_channel();
+        let (tx, mut rx) = crate::plugins::plugin_channel();
         tx.send(PluginMsg::OneShot {
             plugin: "p".into(),
             run: Ok(run),
