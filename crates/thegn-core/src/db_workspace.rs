@@ -1608,7 +1608,7 @@ impl Db {
         slice_rows: usize,
         progress: &mut dyn FnMut(usize),
     ) -> Result<(u64, usize)> {
-        let before: u64 = self
+        let before: i64 = self
             .conn()
             .query_row("SELECT COUNT(*) FROM sem_entity", [], |row| row.get(0))?;
         let limit = slice_rows.clamp(1, 4096);
@@ -1632,10 +1632,13 @@ impl Db {
                 break;
             }
         }
-        let after: u64 = self
+        let after: i64 = self
             .conn()
             .query_row("SELECT COUNT(*) FROM sem_entity", [], |row| row.get(0))?;
-        Ok((before.saturating_sub(after), removed_cache_keys))
+        Ok((
+            u64::try_from(before.saturating_sub(after)).unwrap_or(0),
+            removed_cache_keys,
+        ))
     }
 
     /// Renumber every workspace to a contiguous, distinct `position` (0..n) in
