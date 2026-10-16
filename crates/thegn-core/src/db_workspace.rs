@@ -1793,7 +1793,10 @@ mod tests {
         assert_eq!(removed, (3, 1));
         assert!(db.entities_under("/gone/wt").unwrap().is_empty());
         assert_eq!(db.entities_under("/remote/repo/wt").unwrap().len(), 1);
-        assert!(progress.len() >= 3);
+        // The initial orphan-cache sweep cascades the three gone semantic
+        // rows. The walk then scans only the protected remote row; its terminal
+        // empty slice does not report progress.
+        assert_eq!(progress, [1]);
         assert!(progress.windows(2).all(|counts| counts[0] <= counts[1]));
     }
 
