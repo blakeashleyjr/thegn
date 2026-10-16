@@ -7738,7 +7738,7 @@ async fn event_loop<T: Terminal>(
     // `first_frame_logged` block), alongside the other deferred warms, so it
     // never taxes launch→first-frame. Dropping `plugins_host` on any loop
     // exit best-effort-deactivates and kills every resident session.
-    let (plugin_tx, mut plugin_rx) = tokio_mpsc::unbounded_channel::<crate::plugins::PluginMsg>();
+    let (plugin_tx, mut plugin_rx) = crate::plugins::plugin_channel();
     let mut plugins_state = crate::handlers::plugins::PluginsState::new(current_config.clone());
     let mut plugins_host: Option<crate::plugins::PluginsHost> = None;
     // The embedded help registry (authored pages + the generated keybindings
