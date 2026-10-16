@@ -898,7 +898,12 @@ fn exposure_report(cfg: &Config) {
     let firewall = thegn_core::profile::CredentialFirewall::active();
     if firewall.is_named() {
         let profile_name = thegn_core::profile::name();
-        let denied = firewall.denied(pass);
+        let effective_pass = cfg
+            .profiles
+            .get(&profile_name)
+            .and_then(|profile| profile.sandbox.env_passthrough.clone())
+            .unwrap_or_else(|| pass.to_vec());
+        let denied = firewall.denied(&effective_pass);
         let shares = thegn_core::profile::profile_shares(cfg, &profile_name);
         outln!("  profile firewall ({profile_name}): ambient credentials denied by default");
         let denied_names = if denied.is_empty() {
