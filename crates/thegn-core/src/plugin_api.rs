@@ -3720,7 +3720,7 @@ mod runtime_quota_tests {
         let too_many_rows = View::multi((0..MAX_VIEW_ROWS + 1).map(|_| vec![]));
         assert!(matches!(
             runtime.update(plugin.clone(), surface.clone(), too_many_rows),
-            Err(error) if quota(error)
+            Err(PluginApiError::QuotaExceeded { .. })
         ));
         assert_eq!(runtime.view(&surface), Some(&first));
 
@@ -3728,7 +3728,7 @@ mod runtime_quota_tests {
             View::line((0..MAX_VIEW_SPANS + 1).map(|_| Span::styled("", StyleRole::Default)));
         assert!(matches!(
             runtime.update(plugin.clone(), surface.clone(), too_many_spans),
-            Err(error) if quota(error)
+            Err(PluginApiError::QuotaExceeded { .. })
         ));
         let too_much_text = View::line([Span::slotted(
             "x".repeat(MAX_VIEW_TEXT_BYTES),
@@ -3737,7 +3737,7 @@ mod runtime_quota_tests {
         )]);
         assert!(matches!(
             runtime.update(plugin, surface.clone(), too_much_text),
-            Err(error) if quota(error)
+            Err(PluginApiError::QuotaExceeded { .. })
         ));
         assert_eq!(runtime.view(&surface), Some(&first));
     }
