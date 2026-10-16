@@ -16052,11 +16052,34 @@ async fn event_loop<T: Terminal>(
                 if occluded_now && !corner_occluded {
                     pending_corner_oob.require_delete();
                 }
-                let draw = if corner_gfx.is_empty() {
-                    Vec::new()
-                } else {
-                    crate::kitty_relay::coalesce_gfx(std::mem::take(&mut corner_gfx))
-                };
+                let queued_bytes = corner_gfx.iter().map(Vec::len).sum::<usize>();
+                let mut retained_bytes = 0usize;
+                let mut retained_start = corner_gfx.len();
+                for (index, unit) in corner_gfx.iter().enumerate().rev() {
+                    let Some(total) = retained_bytes.checked_add(unit.len()) else {
+                        break;
+                    };
+                    if unit.len() > crate::frame_writer::OOB_QUEUE_BYTES
+                        || total > crate::frame_writer::OOB_QUEUE_BYTES
+                    {
+                        break;
+                    }
+                    retained_bytes = total;
+                    retained_start = index;
+                }
+                let (draw, truncated) = crate::kitty_relay::coalesce_gfx_within(
+                    std::mem::take(&mut corner_gfx),
+                    crate::frame_writer::OOB_QUEUE_BYTES,
+                );
+                if truncated {
+                    pending_corner_oob.require_delete();
+                    tracing::debug!(
+                        target: "thegn::frame",
+                        dropped_units = retained_start,
+                        dropped_bytes = queued_bytes.saturating_sub(retained_bytes),
+                        "truncated corner kitty graphics batch"
+                    );
+                }
                 corner_occluded = occluded_now;
                 if draw.is_empty() {
                     pending_corner_oob.retry(!occluded_now, |bytes| writer.try_submit_oob(bytes));
