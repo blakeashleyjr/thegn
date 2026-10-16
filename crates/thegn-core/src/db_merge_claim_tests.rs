@@ -110,6 +110,10 @@ fn expired_claim_is_recovered_with_attempts_and_fences_the_late_owner() {
             params![util::now_ms() - 1, WT],
         )
         .unwrap();
+    assert_eq!(
+        db.consume_merge_agent_attempt(&old, 3).unwrap(),
+        MergeAttemptResult::ClaimLost
+    );
     let new = db.admit_merge_claim(&request()).unwrap().unwrap();
     assert_eq!(new.generation, old.generation + 1);
     assert_eq!(db.list_merge_queue().unwrap()[0].agent_attempts, 1);
@@ -203,6 +207,12 @@ fn release_and_legacy_writers_obey_claim_state() {
             .contains(MERGE_CLAIM_ACTIVE)
     );
     assert!(
+        db.enqueue_merge_if_worktree_matches(WT, "feature", "/private/repo", "", "other")
+            .unwrap_err()
+            .to_string()
+            .contains(MERGE_CLAIM_ACTIVE)
+    );
+    assert!(
         db.update_merge_status(WT, "deferred", None, None, None)
             .unwrap_err()
             .to_string()
@@ -241,6 +251,8 @@ fn release_and_legacy_writers_obey_claim_state() {
             .contains(MERGE_CLAIM_LOST)
     );
     let settled = db.settle_merge_claim_no_child(&claim).unwrap();
+    db.replace_merge_status_claimed(&settled, "deferred", &MergeStatusFields::default())
+        .unwrap();
     db.release_merge_claim(&settled).unwrap();
     assert!(
         db.release_merge_claim(&settled)
@@ -295,7 +307,41 @@ fn admission_validates_identity_status_and_lease_and_debug_redacts_token() {
     let mut bad = request();
     bad.worktree = "bad\npath".into();
     assert!(db.admit_merge_claim(&bad).is_err());
+    db.put_worktree(
+        "feature",
+        "/private/repo",
+        WT,
+        "feature",
+        Some("local"),
+        None,
+    )
+    .unwrap();
+    db.conn()
+        .execute(
+            "UPDATE merge_queue SET location='local' WHERE worktree=?1",
+            [WT],
+        )
+        .unwrap();
     let claim = db.admit_merge_claim(&request()).unwrap().unwrap();
+    assert_eq!(claim.location, "local");
+    assert!(
+        db.renew_merge_claim(&claim, util::now_ms() - 1)
+            .unwrap_err()
+            .to_string()
+            .contains("invalid merge claim lease")
+    );
+    assert!(
+        db.renew_merge_claim(&claim, util::now_ms() + MERGE_CLAIM_MAX_LEASE_MS + 60_000)
+            .unwrap_err()
+            .to_string()
+            .contains("invalid merge claim lease")
+    );
+    assert!(
+        db.replace_merge_status_claimed(&claim, "landed", &MergeStatusFields::default())
+            .unwrap_err()
+            .to_string()
+            .contains("landed merge status requires a nonempty result OID")
+    );
     let debug = format!("{claim:?}");
     assert!(debug.contains("[redacted]"));
     assert!(!debug.contains(&claim.owner_token));
@@ -304,4 +350,22 @@ fn admission_validates_identity_status_and_lease_and_debug_redacts_token() {
         Some(MergeClaimPhase::ClaimedNoChild)
     );
     assert_eq!(MergeClaimPhase::parse("future_phase"), None);
+}
+
+#[test]
+fn expired_claim_recovers_after_owner_writes_active_status() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = fixture(&dir.path().join("claims.sqlite"));
+    let claim = db.admit_merge_claim(&request()).unwrap().unwrap();
+    db.replace_merge_status_claimed(&claim, "folding", &MergeStatusFields::default())
+        .unwrap();
+    db.conn()
+        .execute(
+            "UPDATE merge_queue SET claim_lease_until_ms=?1 WHERE worktree=?2",
+            params![util::now_ms() - 1, WT],
+        )
+        .unwrap();
+    let recovered = db.admit_merge_claim(&request()).unwrap().unwrap();
+    assert_eq!(recovered.generation, 2);
+    assert_eq!(db.list_merge_queue().unwrap()[0].status, "folding");
 }
