@@ -2288,7 +2288,7 @@ impl GitBackend for GixGit {
         if loc.is_remote() {
             return self.fallback.is_dirty(loc);
         }
-        let repo = gix::discover(loc.path()).context("gix discover")?;
+        let repo = native_diff::discover_for_status(loc.path())?;
         // The full status iterator (HEAD↔index, index↔worktree, untracked
         // dirwalk), early-exiting on the first entry. Deliberately NOT gix's
         // `Repository::is_dirty()`: that disables the dirwalk and would miss
