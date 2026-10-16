@@ -723,7 +723,7 @@ impl WorktreeAuxStore for Db {
             params![worktree, target_branch, util::now()],
         )?;
         if changed == 0 {
-            ensure_unclaimed(&conn, worktree)?;
+            ensure_unclaimed(conn, worktree)?;
         }
         Ok(())
     }
@@ -735,7 +735,7 @@ impl WorktreeAuxStore for Db {
             params![worktree, attempts, util::now()],
         )?;
         if changed == 0 {
-            ensure_unclaimed(&conn, worktree)?;
+            ensure_unclaimed(conn, worktree)?;
         }
         Ok(())
     }
@@ -760,7 +760,7 @@ impl WorktreeAuxStore for Db {
             params![worktree],
         )?;
         if changed == 0 {
-            ensure_unclaimed(&conn, worktree)?;
+            ensure_unclaimed(conn, worktree)?;
         }
         Ok(())
     }
