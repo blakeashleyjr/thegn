@@ -102,6 +102,7 @@ impl TrackerHttpClient {
         )
     }
 
+    #[cfg(test)]
     pub(crate) fn new_with_operation_timeout(
         provider: &'static str,
         origin: &str,
@@ -208,7 +209,7 @@ fn shared_client() -> Result<Client, IssueError> {
                 .map_err(|error| error.to_string())
         })
         .as_ref()
-        .map(Clone::clone)
+        .cloned()
         .map_err(|_| IssueError::Policy("tracker HTTP client configuration failed"))
 }
 
