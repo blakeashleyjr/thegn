@@ -577,9 +577,11 @@ mod tests {
         let new = c.intern(key(900), Class::C).unwrap();
         assert!(!c.push(middle, 3_000, 4.0));
         assert!(c.push(first, 3_000, 4.0));
+        // The live series still rejects out-of-order pushes.
         assert!(!c.push(first, 1_000, 4.0));
         let mut out = SeriesBuf::default();
-        assert!(!c.read(first, Tier::T0, 0, 1_000, &mut out));
+        assert!(!c.read(middle, Tier::T0, 0, 1_000, &mut out));
+        assert!(c.read(first, Tier::T0, 0, 3_000, &mut out));
         assert!(c.push(new, 1_000, 4.0));
         c.evict_stale(122_001);
         assert!(!c.push(new, 123_000, 1.0));
