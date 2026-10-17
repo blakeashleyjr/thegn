@@ -113,13 +113,11 @@ pub fn parse_stat(input: &[u8]) -> Option<Stat> {
             22 => starttime = Some(number_u64(token)?),
             23 => vsize = Some(number_u64(token)?),
             24 => rss_pages = Some(number_i64(token)?),
-            39 => processor = Some(u32::try_from(number_u64(token)?).ok()?),
-            40 => rt_priority = Some(u32::try_from(number_u64(token)?).ok()?),
-            41 => policy = Some(u32::try_from(number_u64(token)?).ok()?),
-            42 => delayacct_blkio_ticks = Some(number_u64(token)?),
-            _ => {
-                number_u64(token)?;
-            }
+            39 => processor = number_u64(token).and_then(|value| u32::try_from(value).ok()),
+            40 => rt_priority = number_u64(token).and_then(|value| u32::try_from(value).ok()),
+            41 => policy = number_u64(token).and_then(|value| u32::try_from(value).ok()),
+            42 => delayacct_blkio_ticks = number_u64(token),
+            _ => {}
         }
         count += 1;
     }
@@ -189,9 +187,9 @@ pub fn parse_status(input: &[u8]) -> Option<Status> {
             continue;
         };
         match key {
-            b"Tgid" => status.tgid = u32::try_from(number_u64(value)?).ok(),
-            b"Pid" => status.pid = u32::try_from(number_u64(value)?).ok(),
-            b"PPid" => status.ppid = u32::try_from(number_u64(value)?).ok(),
+            b"Tgid" => status.tgid = number_u64(value).and_then(|v| u32::try_from(v).ok()),
+            b"Pid" => status.pid = number_u64(value).and_then(|v| u32::try_from(v).ok()),
+            b"PPid" => status.ppid = number_u64(value).and_then(|v| u32::try_from(v).ok()),
             b"Uid" => status.uid = four_values(value),
             b"Gid" => status.gid = four_values(value),
             b"VmRSS" => status.vm_rss_kib = memory_value(value),
@@ -199,7 +197,7 @@ pub fn parse_status(input: &[u8]) -> Option<Status> {
             b"RssFile" => status.rss_file_kib = memory_value(value),
             b"RssShmem" => status.rss_shmem_kib = memory_value(value),
             b"VmSwap" => status.vm_swap_kib = memory_value(value),
-            b"Threads" => status.threads = u32::try_from(number_u64(value)?).ok(),
+            b"Threads" => status.threads = number_u64(value).and_then(|v| u32::try_from(v).ok()),
             b"voluntary_ctxt_switches" => status.voluntary_ctxt = number_u64(value),
             b"nonvoluntary_ctxt_switches" => status.nonvoluntary_ctxt = number_u64(value),
             _ => {}
@@ -390,6 +388,8 @@ mod tests {
         assert_eq!(spaces.starttime, 424242);
         let parens = parse_stat(STAT_PARENS).unwrap();
         assert_eq!(parens.comm.as_bytes(), b"(sd-pam)");
+        assert_eq!(parens.ppid, 1);
+        assert_eq!(parens.starttime, 424242);
         let parens_alt = parse_stat(STAT_PARENS_ALT).unwrap();
         assert_eq!(parens_alt.comm.as_bytes(), b"a) b) c");
         assert_eq!(parens_alt.ppid, 1);
@@ -410,6 +410,11 @@ mod tests {
         assert_eq!(old.starttime, 424242);
         assert_eq!(old.processor, None);
         assert_eq!(old.policy, None);
+        let simple = parse_stat(STAT_SIMPLE).unwrap();
+        assert_eq!(simple.processor, Some(2));
+        assert_eq!(simple.rt_priority, Some(0));
+        assert_eq!(simple.policy, Some(0));
+        assert_eq!(simple.delayacct_blkio_ticks, Some(0));
         let missing_f24 = STAT_OLD.strip_suffix(b"12\n").unwrap().to_vec();
         assert_eq!(parse_stat(&missing_f24), None);
         let mut extended = STAT_SIMPLE.strip_suffix(b"\n").unwrap().to_vec();
@@ -425,18 +430,64 @@ mod tests {
 
     #[test]
     fn stat_rejects_each_prefix_before_required_fields_finish() {
-        let f24_end = STAT_SIMPLE
+        let f24_start = STAT_SIMPLE
             .windows(4)
             .position(|window| window == b" 12 ")
-            .unwrap()
-            + 3;
-        for end in 0..f24_end {
+            .unwrap();
+        for end in 0..=f24_start {
             assert_eq!(
                 parse_stat(&STAT_SIMPLE[..end]),
                 None,
                 "prefix ended at {end}"
             );
         }
+        assert!(parse_stat(&STAT_SIMPLE[..f24_start + 2]).is_some());
+    }
+
+    #[test]
+    fn stat_ignores_unstored_fields_and_accepts_signed_exit_signal() {
+        let mut fields: Vec<Vec<u8>> = STAT_SIMPLE
+            .split(u8::is_ascii_whitespace)
+            .filter(|field| !field.is_empty())
+            .map(|field| field.to_vec())
+            .collect();
+        fields[10] = b"not-a-number".to_vec();
+        fields[37] = b"-1".to_vec();
+        let mut input = Vec::new();
+        for (index, field) in fields.iter().enumerate() {
+            if index > 0 {
+                input.push(b' ');
+            }
+            input.extend_from_slice(field);
+        }
+        let stat = parse_stat(&input).unwrap();
+        assert_eq!(stat.starttime, 424242);
+        assert_eq!(stat.processor, Some(2));
+
+        let mut invalid_processor_fields: Vec<Vec<u8>> = STAT_SIMPLE
+            .split(u8::is_ascii_whitespace)
+            .filter(|field| !field.is_empty())
+            .map(|field| field.to_vec())
+            .collect();
+        invalid_processor_fields[38] = b"invalid".to_vec();
+        let mut invalid_processor = Vec::new();
+        for (index, field) in invalid_processor_fields.iter().enumerate() {
+            if index > 0 {
+                invalid_processor.push(b' ');
+            }
+            invalid_processor.extend_from_slice(field);
+        }
+        assert_eq!(parse_stat(&invalid_processor).unwrap().processor, None);
+    }
+
+    #[test]
+    fn status_malformed_numeric_fields_remain_optional() {
+        let status =
+            parse_status(b"Tgid: invalid\nPid: 1234\nPPid: invalid\nThreads: invalid\n").unwrap();
+        assert_eq!(status.tgid, None);
+        assert_eq!(status.pid, Some(1234));
+        assert_eq!(status.ppid, None);
+        assert_eq!(status.threads, None);
     }
 
     #[test]
@@ -470,15 +521,13 @@ mod tests {
             unified_cgroup_path(CGROUP_THEGN),
             Some(&b"/user.slice/user-1000.slice/thegn.slice/run.scope"[..])
         );
-        assert!(
-            unified_cgroup_path(CGROUP_LIBPOD)
-                .unwrap()
-                .starts_with(b"/machine.slice/libpod-")
+        assert_eq!(
+            unified_cgroup_path(CGROUP_LIBPOD),
+            Some(&b"/machine.slice/libpod-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.scope/container"[..])
         );
-        assert!(
-            unified_cgroup_path(CGROUP_DOCKER)
-                .unwrap()
-                .starts_with(b"/system.slice/docker-")
+        assert_eq!(
+            unified_cgroup_path(CGROUP_DOCKER),
+            Some(&b"/system.slice/docker-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb.scope"[..])
         );
         assert_eq!(unified_cgroup_path(CGROUP_MIXED), Some(&b"/user.slice/user-1000.slice/user@1000.service/thegn.slice/run-p15278-i4595.scope"[..]));
         assert_eq!(
