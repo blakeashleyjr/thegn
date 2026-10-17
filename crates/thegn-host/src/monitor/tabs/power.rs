@@ -1,6 +1,7 @@
 //! Power tab renderer and tab-specific monitor actions.
 
 use super::super::build::*;
+use crate::chrome::S;
 use crate::sections::{Section, spacer};
 use crate::seg::Tok;
 use crate::telemetry::Metric;

@@ -2,7 +2,6 @@
 
 use super::*;
 use crate::seg::Seg;
-use crate::telemetry::StatsSnapshot;
 
 pub(super) mod containers;
 pub(super) mod cpu;
@@ -37,6 +36,8 @@ impl MonitorTab {
 }
 
 impl MonitorOverlay {
+    /// Whether the active tab is a row list (so the cursor, not the viewport, is
+    /// what the navigation keys move).
     pub(in crate::monitor) fn is_list_tab(&self) -> bool {
         matches!(
             self.tab,
@@ -44,6 +45,9 @@ impl MonitorOverlay {
         )
     }
 
+    /// How many rows the active LIST tab is showing — the single source the
+    /// cursor clamp and the navigation bound both measure against, so they can
+    /// never disagree about where the list ends.
     pub(in crate::monitor) fn row_len(&self) -> usize {
         match self.tab {
             MonitorTab::Procs => self.proc_rows.len(),
@@ -56,18 +60,24 @@ impl MonitorOverlay {
 
     pub(in crate::monitor) fn tab_key(&mut self, key: &KeyCode) -> MonitorOutcome {
         match key {
+            // --- Row actions (before the per-tab sort letters) ---
+            // `/` opens the incremental process filter.
             KeyCode::Char('/') if self.tab == MonitorTab::Procs => {
                 self.filtering = true;
                 self.status = None;
                 MonitorOutcome::Pending
             }
+            // `t` toggles process-tree grouping (persisted).
             KeyCode::Char('t') if self.tab == MonitorTab::Procs => {
                 self.prefs.proc_tree = !self.prefs.proc_tree;
                 self.sel = 0;
                 MonitorOutcome::PrefsChanged
             }
+            // `x` acts on the selected row: signal a process, or clean a
+            // worktree. Both open a confirmation rather than firing immediately.
             KeyCode::Char('x') if self.tab == MonitorTab::Procs => self.begin_signal(),
             KeyCode::Char('x') if self.tab == MonitorTab::Disk => self.begin_clean(),
+            // --- Per-tab (last, so it can never shadow the above) ---
             KeyCode::Char(c) if self.tab == MonitorTab::Procs => self.proc_key(*c),
             KeyCode::Enter if self.tab == MonitorTab::Containers => self.container_key('\r'),
             KeyCode::Char(c) if self.tab == MonitorTab::Containers => self.container_key(*c),

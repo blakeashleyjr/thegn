@@ -3,6 +3,7 @@
 use super::super::build::*;
 use super::super::procs_view::{self, ProcRow};
 use super::super::{Confirm, MonitorOutcome, MonitorOverlay, ProcSort};
+use crate::chrome::S;
 use crate::sections::{Cell, Section, TableSection};
 use crate::seg::Tok;
 use thegn_core::theme::Hue;
@@ -187,6 +188,8 @@ fn owner_tone(o: thegn_metrics::ProcOwner) -> Tok {
 }
 
 impl MonitorOverlay {
+    /// Processes-tab sort keys. Reached only after every global key has had its
+    /// chance.
     pub(in crate::monitor) fn proc_key(&mut self, c: char) -> MonitorOutcome {
         let sort = match c {
             'c' => ProcSort::Cpu,
@@ -205,7 +208,11 @@ impl MonitorOverlay {
         MonitorOutcome::PrefsChanged
     }
 
+    /// Open a signal confirmation for the selected process. A second signal on
+    /// the just-TERMed pid escalates to KILL (a distinct, explicit second step).
     pub(in crate::monitor) fn begin_signal(&mut self) -> MonitorOutcome {
+        // Copy out of the row first so the immutable borrow of `self.proc_rows`
+        // ends before `self.confirm`/`self.status` are written.
         let Some((pid, start_time, name, owner)) = self
             .proc_rows
             .get(self.sel)
@@ -235,6 +242,7 @@ impl MonitorOverlay {
         MonitorOutcome::Pending
     }
 
+    /// Deliver the confirmed signal, surfacing the outcome — never swallowed.
     pub(in crate::monitor) fn perform_signal(
         &mut self,
         pid: u32,
@@ -256,10 +264,10 @@ impl MonitorOverlay {
             Err(crate::platform::SignalError::Changed) => {
                 self.status = Some(format!(
                     "{label}: process changed or left the sampled list; select it again"
-                ))
+                ));
             }
             Err(crate::platform::SignalError::Failed(error)) => {
-                self.status = Some(format!("{label}: {error}"))
+                self.status = Some(format!("{label}: {error}"));
             }
         }
     }

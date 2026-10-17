@@ -2,6 +2,7 @@
 
 use super::super::build::*;
 use super::super::{Confirm, MonitorOutcome, MonitorOverlay};
+use crate::chrome::S;
 use crate::sections::{Cell, Section, TableSection, spacer};
 use crate::seg::Tok;
 use crate::telemetry::Metric;
@@ -186,6 +187,7 @@ fn kind_str(k: thegn_metrics::DiskKind) -> &'static str {
 }
 
 impl MonitorOverlay {
+    /// Open a clean confirmation for the selected worktree row.
     pub(in crate::monitor) fn begin_clean(&mut self) -> MonitorOutcome {
         let Some(path) = self.disk_rows.get(self.sel).map(|r| r.path.clone()) else {
             return MonitorOutcome::Pending;

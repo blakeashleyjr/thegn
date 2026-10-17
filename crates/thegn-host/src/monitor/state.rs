@@ -170,7 +170,6 @@ impl MonitorPrefs {
                             self.tab_mut(tab).window = v;
                         }
                     }
-                    "kv" => {}
                     field if field.starts_with("kv.") => {
                         self.set_kv(tab, &field[3..], value);
                     }
