@@ -1,6 +1,7 @@
-//! Queue-private rerere; merge-queue folds never access the repository's `rr-cache`.
+//! Queue-private rerere; folds only read, and never write, the repository's `rr-cache`.
 
 use crate::platform::gate_path::{Directory, Lock, ScratchDirectory};
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::atomic::AtomicBool;
@@ -76,8 +77,21 @@ impl Cache {
         Some(cache)
     }
 
-    pub(super) fn rerere(&self, scratch: &Path, args: &[&str]) -> anyhow::Result<String> {
+    pub(super) fn session<T>(
+        &self,
+        run_steps: impl FnOnce(&Session<'_>) -> anyhow::Result<T>,
+    ) -> anyhow::Result<T> {
+        let session = Session { cache: self };
         self.clear_merge_rr()?;
+        let result = run_steps(&session);
+        drop(session);
+        if let Err(error) = self.gc() {
+            tracing::debug!(target: "thegn::integrate", %error, "queue rerere maintenance deferred");
+        }
+        result
+    }
+
+    fn rerere(&self, scratch: &Path, args: &[&str]) -> anyhow::Result<String> {
         let index = util::git_out(
             scratch,
             &["rev-parse", "--path-format=absolute", "--git-path", "index"],
@@ -106,11 +120,8 @@ impl Cache {
             ..Limits::silent(Duration::from_secs(60))
         };
         let result = thegn_proc::run(&mut command, &limits, &AtomicBool::new(false));
-        let clear = self.clear_merge_rr();
-        clear?;
         match (&result.end, &result.leader) {
             (End::LeaderExited, Leader::Reaped(status)) if status.success() => {
-                self.gc()?;
                 Ok(String::from_utf8_lossy(&result.stdout.bytes).into_owned())
             }
             _ => anyhow::bail!("private git rerere failed or did not reap"),
@@ -170,6 +181,149 @@ impl Cache {
     }
 }
 
+pub(super) struct Session<'a> {
+    cache: &'a Cache,
+}
+
+pub(super) fn import_shared(cache: &Cache, repo_root: &Path) {
+    let Some(common_dir) = util::git_out(
+        repo_root,
+        &["rev-parse", "--path-format=absolute", "--git-common-dir"],
+    ) else {
+        return;
+    };
+    let shared = PathBuf::from(common_dir.trim()).join("rr-cache");
+    let Ok(entries) = std::fs::read_dir(shared) else {
+        return;
+    };
+    let object_format = util::git_out(repo_root, &["rev-parse", "--show-object-format"]);
+    let Some(hash_len) = object_format
+        .as_deref()
+        .map(str::trim)
+        .and_then(|format| match format {
+            "sha1" => Some(40),
+            "sha256" => Some(64),
+            _ => None,
+        })
+    else {
+        return;
+    };
+    let mut candidates = Vec::new();
+    for entry in entries {
+        let Ok(entry) = entry else { continue };
+        let id = entry.file_name();
+        let id = id.to_string_lossy();
+        if id.len() != hash_len || !id.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            continue;
+        }
+        let path = entry.path();
+        let Ok(metadata) = std::fs::symlink_metadata(&path) else {
+            continue;
+        };
+        if !metadata.is_dir() || metadata.file_type().is_symlink() {
+            continue;
+        }
+        let Ok(files) = std::fs::read_dir(&path) else {
+            continue;
+        };
+        let mut pairs = Vec::new();
+        for file in files {
+            let Ok(file) = file else { continue };
+            let name = file.file_name().to_string_lossy().into_owned();
+            let Some(suffix) = name.strip_prefix("postimage") else {
+                continue;
+            };
+            if !suffix.is_empty() && !suffix.bytes().all(|byte| byte.is_ascii_digit()) {
+                continue;
+            }
+            let preimage = format!("preimage{suffix}");
+            let preimage_path = path.join(&preimage);
+            let postimage_path = file.path();
+            if std::fs::symlink_metadata(&preimage_path).is_err() {
+                continue;
+            }
+            let modified = std::fs::symlink_metadata(&postimage_path)
+                .and_then(|meta| meta.modified())
+                .unwrap_or(SystemTime::UNIX_EPOCH);
+            pairs.push((preimage, name, modified));
+        }
+        if !pairs.is_empty() {
+            let modified = pairs
+                .iter()
+                .map(|pair| pair.2)
+                .max()
+                .unwrap_or(SystemTime::UNIX_EPOCH);
+            candidates.push((modified, id.into_owned(), path, pairs));
+        }
+    }
+    candidates.sort_by_key(|candidate| std::cmp::Reverse(candidate.0));
+    for (_, id, source, pairs) in candidates.into_iter().take(1024) {
+        let destination = cache.gitdir.join("rr-cache").join(id);
+        for (preimage, postimage, _) in pairs {
+            let preimage_path = destination.join(&preimage);
+            let postimage_path = destination.join(&postimage);
+            if preimage_path.exists() || postimage_path.exists() {
+                continue;
+            }
+            let pair = read_import_file(&source.join(&preimage))
+                .and_then(|pre| read_import_file(&source.join(&postimage)).map(|post| (pre, post)));
+            let (preimage_bytes, postimage_bytes) = match pair {
+                Ok(pair) => pair,
+                Err(error) => {
+                    tracing::debug!(target: "thegn::integrate", %error, "could not read shared rerere pair");
+                    continue;
+                }
+            };
+            if let Err(error) = std::fs::create_dir_all(&destination)
+                .and_then(|()| write_new_file(&preimage_path, &preimage_bytes))
+                .and_then(|()| write_new_file(&postimage_path, &postimage_bytes))
+            {
+                tracing::debug!(target: "thegn::integrate", %error, "could not import shared rerere pair");
+            }
+        }
+    }
+}
+
+fn read_import_file(source: &Path) -> std::io::Result<Vec<u8>> {
+    let mut input = crate::platform::open_read_nofollow(source)?;
+    if !input.metadata()?.is_file() {
+        return Err(std::io::Error::other(
+            "shared rerere entry is not a regular file",
+        ));
+    }
+    let mut contents = Vec::new();
+    input.take(1024 * 1024 + 1).read_to_end(&mut contents)?;
+    if contents.len() > 1024 * 1024 {
+        return Err(std::io::Error::other(
+            "shared rerere entry exceeds import limit",
+        ));
+    }
+    Ok(contents)
+}
+
+fn write_new_file(destination: &Path, contents: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+    let mut output = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(destination)?;
+    output.write_all(contents)
+}
+
+impl Session<'_> {
+    pub(super) fn step(&self, scratch: &Path, args: &[&str]) -> anyhow::Result<String> {
+        self.cache.rerere(scratch, args)
+    }
+}
+
+impl Drop for Session<'_> {
+    fn drop(&mut self) {
+        if let Err(error) = self.cache.clear_merge_rr() {
+            tracing::debug!(target: "thegn::integrate", %error, "could not clear private MERGE_RR");
+        }
+    }
+}
+
 fn run(dir: &Path, args: &[&str], timeout: Duration) -> anyhow::Result<String> {
     let mut command = util::git_cmd(dir);
     command
@@ -197,6 +351,11 @@ pub(super) fn train_from_history(
     theirs: &str,
     overrides: &[String],
 ) {
+    if thegn_core::git_operand::revision(ours).is_err()
+        || thegn_core::git_operand::revision(theirs).is_err()
+    {
+        return;
+    }
     let Ok(history) = run(
         repo_root,
         &[
@@ -276,8 +435,10 @@ pub(super) fn train_merge(
         anyhow::bail!("could not create rerere training worktree");
     }
     let result = (|| {
+        let refused = super::scratch_driver_overrides(&path, overrides)
+            .ok_or_else(|| anyhow::anyhow!("could not inspect training merge drivers"))?;
         let mut args = Vec::new();
-        for item in overrides {
+        for item in &refused {
             args.push("-c".to_owned());
             args.push(item.clone());
         }
@@ -295,13 +456,28 @@ pub(super) fn train_merge(
         {
             anyhow::bail!("historical merge did not reproduce a conflict");
         }
-        cache.rerere(&path, &["rerere"])?;
-        anyhow::ensure!(
-            util::git_ok(&path, &["checkout", merge, "--", "."]),
-            "could not restore historical merge resolution"
-        );
-        cache.rerere(&path, &["rerere"])?;
-        Ok(())
+        let unmerged = util::git_out_allow_empty(&path, &["ls-files", "-u", "-z"])
+            .ok_or_else(|| anyhow::anyhow!("could not inspect training conflict paths"))?;
+        let mut paths = std::collections::BTreeSet::new();
+        for record in unmerged.split('\0').filter(|record| !record.is_empty()) {
+            let (_, path) = record
+                .split_once('\t')
+                .ok_or_else(|| anyhow::anyhow!("malformed training conflict path"))?;
+            paths.insert(path.to_owned());
+        }
+        anyhow::ensure!(!paths.is_empty(), "historical merge had no unmerged paths");
+        let paths = paths.into_iter().collect::<Vec<_>>();
+        cache.session(|session| {
+            session.step(&path, &["rerere"])?;
+            let mut checkout = vec!["--literal-pathspecs", "checkout", merge, "--"];
+            checkout.extend(paths.iter().map(String::as_str));
+            anyhow::ensure!(
+                util::git_ok(&path, &checkout),
+                "could not restore historical merge resolution"
+            );
+            session.step(&path, &["rerere"])?;
+            Ok(())
+        })
     })();
     super::remove_scratch_worktree(repo_root, scratch);
     result

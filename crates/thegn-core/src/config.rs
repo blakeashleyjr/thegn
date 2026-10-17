@@ -990,8 +990,8 @@ pub struct MergeQueueConfig {
     /// stops the drain as an infrastructure error and never blames the branch.
     pub sign_commits: bool,
     /// Enable queue-private git rerere, trained from conflict-resolving merge
-    /// commits in repository history. Off by default. A rerere-resolved merge
-    /// still runs the gate before landing.
+    /// commits and imported read-only from the repository's rr-cache. Off by
+    /// default. A rerere-resolved merge still runs the gate before landing.
     pub rerere: bool,
 }
 
