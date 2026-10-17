@@ -840,11 +840,15 @@ fn attribute_sysinfo_rows<'a>(
         if row.is_thread {
             continue;
         }
-        let Some(cwd) = row.cwd else { continue };
+        let Some(cwd) = row.cwd else { continue }; // Elevated/protected processes hide their cwd; skipped, same as unreadable /proc entries on Linux.
         let Some((_, wt)) = targets.iter().find(|(p, _)| cwd.starts_with(p)) else {
             continue;
         };
-        // sysinfo reports milliseconds; CLK_TCK = 100, so divide by 10.
+        // sysinfo reports accumulated CPU time in **milliseconds**, but the FSM's
+        // busy threshold (`[activity] cpu_percent`) is in Linux jiffies
+        // (CLK_TCK = 100, i.e. 10ms each). Convert ms → jiffy-equivalents so the
+        // same threshold means the same fraction of a core on both platforms;
+        // otherwise Windows would flip 'busy' at 1/10th the intended CPU.
         out.entry(wt.clone())
             .or_default()
             .insert(row.pid, row.cpu_ms / 10);
