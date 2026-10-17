@@ -282,21 +282,26 @@ impl Collector for CpuFreqCollector {
                 .cur
                 .read(&mut self.held, self.cap, slow)
                 .and_then(|bytes| parse_khz(&bytes));
-            if cur.is_some() && files.cur_fallback.is_some() {
-                files.policy.cur_source = Some(FreqSource::Avg);
-            }
+            let mut cur_source = cur.map(|_| {
+                if files.cur_fallback.is_some() {
+                    FreqSource::Avg
+                } else {
+                    FreqSource::Scaling
+                }
+            });
             if cur.is_none()
-                && files.policy.cur_source == Some(FreqSource::Avg)
+                && files.cur_fallback.is_some()
                 && let Some(path) = files.cur_fallback.as_ref()
             {
                 cur = ProcFile::open(path)
                     .ok()
                     .and_then(|mut file| file.read_all().ok().and_then(parse_khz));
                 if cur.is_some() {
-                    files.policy.cur_source = Some(FreqSource::Scaling);
+                    cur_source = Some(FreqSource::Scaling);
                 }
             }
             files.policy.cur_khz = cur;
+            files.policy.cur_source = cur_source;
             if slow {
                 files.policy.scaling_min_khz = files
                     .scaling_min
@@ -576,6 +581,16 @@ mod tests {
             frame.parts.cpu_freq.policies[0].cur_source,
             Some(crate::collect::model::cpu_policy::FreqSource::Scaling)
         );
+        for tick in [1, 2] {
+            collector
+                .sample(&crate::collect::TickCtx { tick, now_ms: tick }, &mut frame)
+                .unwrap();
+            assert_eq!(frame.parts.cpu_freq.policies[0].cur_khz, Some(1_800_000));
+            assert_eq!(
+                frame.parts.cpu_freq.policies[0].cur_source,
+                Some(crate::collect::model::cpu_policy::FreqSource::Scaling)
+            );
+        }
     }
 
     #[test]
@@ -701,11 +716,6 @@ mod tests {
         for number in 0..3_u16 {
             policy(root.path(), number, &number.to_string(), "5000000");
         }
-        fs::remove_file(
-            root.path()
-                .join("sys/devices/system/cpu/cpufreq/policy2/amd_pstate_prefcore_ranking"),
-        )
-        .unwrap();
         fs::write(
             root.path().join("sys/devices/system/cpu/cpufreq/boost"),
             "1",
@@ -718,7 +728,19 @@ mod tests {
         collector
             .sample(&crate::collect::TickCtx { tick: 0, now_ms: 0 }, &mut frame)
             .unwrap();
-        assert_eq!(frame.parts.cpu_freq.policies[2].prefcore_rank, None);
+        assert_eq!(collector.held_count(), 8);
+        assert_eq!(
+            frame.parts.cpu_freq.policies[2].governor.unwrap().as_str(),
+            "schedutil"
+        );
+        collector
+            .sample(&crate::collect::TickCtx { tick: 5, now_ms: 5 }, &mut frame)
+            .unwrap();
+        assert_eq!(collector.held_count(), 8);
+        assert_eq!(
+            frame.parts.cpu_freq.policies[2].governor.unwrap().as_str(),
+            "schedutil"
+        );
     }
 
     #[test]
