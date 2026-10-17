@@ -1,4 +1,5 @@
 //! Allocation-free parsers for Linux CPU frequency sysfs values.
+//! Numeric values accept digits only, stricter than the old `str::parse` shim's leading `+`.
 use super::super::model::cpu_policy::{CpuSet, SysToken, TokenList};
 
 pub fn parse_khz(bytes: &[u8]) -> Option<u64> {

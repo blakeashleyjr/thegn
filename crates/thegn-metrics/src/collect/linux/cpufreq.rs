@@ -31,25 +31,32 @@ impl AttrRead for ProcFile {
 }
 
 struct Attr {
-    path: PathBuf,
+    path: Option<PathBuf>,
     reader: Option<Box<dyn AttrRead>>,
 }
 impl Attr {
     fn open(path: PathBuf, held: &mut usize, cap: usize) -> Self {
-        let reader = if *held < cap {
+        if !path.exists() {
+            return Self {
+                path: None,
+                reader: None,
+            };
+        }
+        let (path, reader) = if *held < cap {
             match ProcFile::open(&path) {
                 Ok(file) => {
                     *held += 1;
-                    Some(Box::new(file) as Box<dyn AttrRead>)
+                    (Some(path), Some(Box::new(file) as Box<dyn AttrRead>))
                 }
-                Err(_) => None,
+                Err(error) if error.kind() == io::ErrorKind::NotFound => (None, None),
+                Err(_) => (Some(path), None),
             }
         } else {
-            None
+            (Some(path), None)
         };
         Self { path, reader }
     }
-    fn read(&mut self, held: &mut usize, cap: usize, reopen: bool) -> Option<&[u8]> {
+    fn read(&mut self, held: &mut usize, cap: usize, reopen: bool) -> Option<Vec<u8>> {
         if reopen
             && self
                 .reader
@@ -59,19 +66,30 @@ impl Attr {
             self.reader = None;
             *held = (*held).saturating_sub(1);
         }
-        if self.reader.is_none()
-            && *held < cap
-            && let Ok(file) = ProcFile::open(&self.path)
+        if let Some(reader) = self.reader.as_mut() {
+            return reader.read().ok().map(|bytes| bytes.to_vec());
+        }
+        let path = self.path.as_ref()?;
+        if *held < cap
+            && let Ok(file) = ProcFile::open(path)
         {
             self.reader = Some(Box::new(file));
             *held += 1;
+            return self
+                .reader
+                .as_mut()
+                .and_then(|reader| reader.read().ok())
+                .map(|bytes| bytes.to_vec());
         }
-        self.reader.as_mut()?.read().ok()
+        ProcFile::open(path)
+            .ok()
+            .and_then(|mut file| file.read_all().ok().map(|bytes| bytes.to_vec()))
     }
 }
 struct PolicyFiles {
     policy: CpuPolicy,
     cur: Attr,
+    cur_fallback: Option<PathBuf>,
     scaling_min: Attr,
     scaling_max: Attr,
     governor: Attr,
@@ -151,6 +169,7 @@ impl Collector for CpuFreqCollector {
         };
         dirs.sort_by_key(|(number, _)| *number);
         let mut first_epp_choices = None;
+        let mut policy_dirs = Vec::with_capacity(dirs.len());
         for (number, path) in dirs {
             let mut policy = CpuPolicy {
                 policy: number,
@@ -176,13 +195,23 @@ impl Collector for CpuFreqCollector {
                     read_static(path.join("energy_performance_available_preferences"))
                         .map(|b| parse_token_list(&b));
             }
+            policy_dirs.push((policy, path));
+        }
+        // Current frequency is sampled every tick, so reserve held descriptors for
+        // every policy before allocating the slower attributes.
+        let mut policy_attrs = Vec::with_capacity(policy_dirs.len());
+        for (policy, path) in policy_dirs {
             let avg = path.join("cpuinfo_avg_freq");
-            let (cur_path, source) = if avg.exists() {
-                (avg, FreqSource::Avg)
+            let scaling_cur = path.join("scaling_cur_freq");
+            let (cur_path, source, cur_fallback) = if avg.exists() {
+                (avg, FreqSource::Avg, Some(scaling_cur))
             } else {
-                (path.join("scaling_cur_freq"), FreqSource::Scaling)
+                (scaling_cur, FreqSource::Scaling, None)
             };
             let cur = self.dynamic(cur_path);
+            policy_attrs.push((policy, path, cur, source, cur_fallback));
+        }
+        for (policy, path, cur, source, cur_fallback) in policy_attrs {
             let scaling_min = self.dynamic(path.join("scaling_min_freq"));
             let scaling_max = self.dynamic(path.join("scaling_max_freq"));
             let governor = self.dynamic(path.join("scaling_governor"));
@@ -192,6 +221,7 @@ impl Collector for CpuFreqCollector {
             let mut files = PolicyFiles {
                 policy,
                 cur,
+                cur_fallback,
                 scaling_min,
                 scaling_max,
                 governor,
@@ -199,7 +229,7 @@ impl Collector for CpuFreqCollector {
                 boost,
                 rank,
             };
-            // Record selected current-frequency source; an unreadable avg file remains degraded in place.
+            // Record the preferred source; sampling falls back to scaling frequency if avg fails.
             files.policy.cur_source = Some(source);
             self.policies.push(files);
         }
@@ -248,36 +278,50 @@ impl Collector for CpuFreqCollector {
             self.last_slow = Some(ctx.tick);
         }
         for files in &mut self.policies {
-            let cur = files
+            let mut cur = files
                 .cur
                 .read(&mut self.held, self.cap, slow)
-                .and_then(parse_khz);
+                .and_then(|bytes| parse_khz(&bytes));
+            if cur.is_some() && files.cur_fallback.is_some() {
+                files.policy.cur_source = Some(FreqSource::Avg);
+            }
+            if cur.is_none()
+                && files.policy.cur_source == Some(FreqSource::Avg)
+                && let Some(path) = files.cur_fallback.as_ref()
+            {
+                cur = ProcFile::open(path)
+                    .ok()
+                    .and_then(|mut file| file.read_all().ok().and_then(parse_khz));
+                if cur.is_some() {
+                    files.policy.cur_source = Some(FreqSource::Scaling);
+                }
+            }
             files.policy.cur_khz = cur;
             if slow {
                 files.policy.scaling_min_khz = files
                     .scaling_min
                     .read(&mut self.held, self.cap, true)
-                    .and_then(parse_khz);
+                    .and_then(|bytes| parse_khz(&bytes));
                 files.policy.scaling_max_khz = files
                     .scaling_max
                     .read(&mut self.held, self.cap, true)
-                    .and_then(parse_khz);
+                    .and_then(|bytes| parse_khz(&bytes));
                 files.policy.governor = files
                     .governor
                     .read(&mut self.held, self.cap, true)
-                    .and_then(parse_token);
+                    .and_then(|bytes| parse_token(&bytes));
                 files.policy.epp = files
                     .epp
                     .read(&mut self.held, self.cap, true)
-                    .and_then(parse_token);
+                    .and_then(|bytes| parse_token(&bytes));
                 files.policy.boost = files
                     .boost
                     .read(&mut self.held, self.cap, true)
-                    .and_then(parse_flag);
+                    .and_then(|bytes| parse_flag(&bytes));
                 files.policy.prefcore_rank = files
                     .rank
                     .read(&mut self.held, self.cap, true)
-                    .and_then(parse_u32);
+                    .and_then(|bytes| parse_u32(&bytes));
             }
         }
         if slow && let Some(power) = &mut self.power_files {
@@ -285,18 +329,18 @@ impl Collector for CpuFreqCollector {
                 .boost
                 .as_mut()
                 .and_then(|attr| attr.read(&mut self.held, self.cap, true))
-                .and_then(parse_flag);
+                .and_then(|bytes| parse_flag(&bytes));
             let no_turbo = power
                 .no_turbo
                 .as_mut()
                 .and_then(|attr| attr.read(&mut self.held, self.cap, true))
-                .and_then(parse_flag);
+                .and_then(|bytes| parse_flag(&bytes));
             self.power.boost = boost.or_else(|| no_turbo.map(|disabled| !disabled));
             self.power.platform_profile = power
                 .profile
                 .as_mut()
                 .and_then(|attr| attr.read(&mut self.held, self.cap, true))
-                .and_then(parse_token);
+                .and_then(|bytes| parse_token(&bytes));
         }
         let part = &mut frame.parts.cpu_freq;
         part.policies.clear();
@@ -533,6 +577,26 @@ mod tests {
             Some(crate::collect::model::cpu_policy::FreqSource::Scaling)
         );
     }
+
+    #[test]
+    fn scaling_frequency_fallback_is_used_when_average_read_fails() {
+        let root = tempdir().unwrap();
+        policy(root.path(), 0, "0-3", "3000000");
+        let dir = root.path().join("sys/devices/system/cpu/cpufreq/policy0");
+        fs::write(dir.join("scaling_cur_freq"), "1800000").unwrap();
+        let mut collector = CpuFreqCollector::new(root.path().to_path_buf());
+        collector.discover(&Env::default());
+        collector.policies[0].cur.reader = Some(Box::new(BrokenRead { failed: false }));
+        let mut frame = crate::collect::frame::MonitorFrame::default();
+        collector
+            .sample(&crate::collect::TickCtx { tick: 0, now_ms: 0 }, &mut frame)
+            .unwrap();
+        assert_eq!(frame.parts.cpu_freq.policies[0].cur_khz, Some(1_800_000));
+        assert_eq!(
+            frame.parts.cpu_freq.policies[0].cur_source,
+            Some(crate::collect::model::cpu_policy::FreqSource::Scaling)
+        );
+    }
     #[test]
     fn slow_pass_is_due_first_then_each_five_ticks() {
         assert!(slow_due(None, 12));
@@ -552,13 +616,7 @@ mod tests {
                       frame: &mut crate::collect::frame::MonitorFrame,
                       tick| {
             collector
-                .sample(
-                    &crate::collect::TickCtx {
-                        tick,
-                        now_ms: u64::from(tick),
-                    },
-                    frame,
-                )
+                .sample(&crate::collect::TickCtx { tick, now_ms: tick }, frame)
                 .unwrap();
         };
         sample(&mut collector, &mut frame, 0);
@@ -598,13 +656,16 @@ mod tests {
     }
 
     #[derive(Debug)]
-    struct BrokenRead;
+    struct BrokenRead {
+        failed: bool,
+    }
     impl AttrRead for BrokenRead {
         fn read(&mut self) -> io::Result<&[u8]> {
+            self.failed = true;
             Err(io::Error::from_raw_os_error(libc::ENODEV))
         }
         fn needs_reopen(&self) -> bool {
-            true
+            self.failed
         }
     }
 
@@ -614,7 +675,7 @@ mod tests {
         policy(root.path(), 0, "0", "5000000");
         let mut collector = CpuFreqCollector::new(root.path().to_path_buf());
         collector.discover(&Env::default());
-        collector.policies[0].epp.reader = Some(Box::new(BrokenRead));
+        collector.policies[0].epp.reader = Some(Box::new(BrokenRead { failed: false }));
         let mut frame = crate::collect::frame::MonitorFrame::default();
         assert!(
             collector
@@ -625,12 +686,26 @@ mod tests {
         assert_eq!(policy.epp, None);
         assert_eq!(policy.cur_khz, Some(1_200_000));
         assert_eq!(policy.governor.unwrap().as_str(), "schedutil");
+        collector
+            .sample(&crate::collect::TickCtx { tick: 5, now_ms: 5 }, &mut frame)
+            .unwrap();
+        assert_eq!(
+            frame.parts.cpu_freq.policies[0].epp.unwrap().as_str(),
+            "balance_performance"
+        );
     }
 
     #[test]
     fn dynamic_fd_cap_is_respected() {
         let root = tempdir().unwrap();
-        policy(root.path(), 0, "0", "5000000");
+        for number in 0..3_u16 {
+            policy(root.path(), number, &number.to_string(), "5000000");
+        }
+        fs::remove_file(
+            root.path()
+                .join("sys/devices/system/cpu/cpufreq/policy2/amd_pstate_prefcore_ranking"),
+        )
+        .unwrap();
         fs::write(
             root.path().join("sys/devices/system/cpu/cpufreq/boost"),
             "1",
@@ -639,5 +714,36 @@ mod tests {
         let mut collector = CpuFreqCollector::with_cap(root.path().to_path_buf(), 8);
         collector.discover(&Env::default());
         assert_eq!(collector.held_count(), 8);
+        let mut frame = crate::collect::frame::MonitorFrame::default();
+        collector
+            .sample(&crate::collect::TickCtx { tick: 0, now_ms: 0 }, &mut frame)
+            .unwrap();
+        assert_eq!(frame.parts.cpu_freq.policies[2].prefcore_rank, None);
+    }
+
+    #[test]
+    fn frequency_descriptors_are_reserved_for_every_policy() {
+        let root = tempdir().unwrap();
+        for number in 0..3_u16 {
+            policy(root.path(), number, &number.to_string(), "5000000");
+        }
+        let mut collector = CpuFreqCollector::with_cap(root.path().to_path_buf(), 4);
+        collector.discover(&Env::default());
+        let mut frame = crate::collect::frame::MonitorFrame::default();
+        collector
+            .sample(&crate::collect::TickCtx { tick: 0, now_ms: 0 }, &mut frame)
+            .unwrap();
+        assert!(
+            frame
+                .parts
+                .cpu_freq
+                .policies
+                .iter()
+                .all(|policy| policy.cur_khz.is_some())
+        );
+        assert_eq!(
+            frame.parts.cpu_freq.policies[2].governor.unwrap().as_str(),
+            "schedutil"
+        );
     }
 }
