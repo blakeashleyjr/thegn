@@ -491,9 +491,6 @@ mod tests {
     fn put16(buf: &mut [u8], off: usize, value: u16) {
         buf[off..off + 2].copy_from_slice(&value.to_le_bytes());
     }
-    fn put32(buf: &mut [u8], off: usize, value: u32) {
-        buf[off..off + 4].copy_from_slice(&value.to_le_bytes());
-    }
     fn put64(buf: &mut [u8], off: usize, value: u64) {
         buf[off..off + 8].copy_from_slice(&value.to_le_bytes());
     }
@@ -530,7 +527,7 @@ mod tests {
         assert_eq!(decode(&v10, &mut metrics), Decoded::Full);
         assert_eq!(metrics.temperature_edge, Some(6500));
         assert_eq!(metrics.system_clock_counter, Some(0x1234));
-        assert_ne!(metrics.temperature_edge, Some(99900));
+        assert_ne!(metrics.temperature_edge, Some(999));
         assert_eq!(metrics.pcie_link_width, Some(255));
         assert_eq!(metrics.pcie_link_speed, Some(7));
         assert_eq!(metrics.temperature_hbm, [None; 4]);
