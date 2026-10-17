@@ -490,6 +490,11 @@ fn draw_braille_spans_mirrored(upper_h: usize, table: &RasterTable, buf: &mut Ce
 }
 
 /// Draws N stacked bands over the buffer height, clamping their total to one.
+///
+/// If an inter-band boundary and the stack's top both fall inside one cell,
+/// the cell uses the colour of the band with the largest coverage. Equal
+/// coverage keeps the lower-index band. The single glyph cannot represent all
+/// three regions in that case.
 pub fn stacked(bands: &[&[f32]], table: &RasterTable, buf: &mut CellBuf) {
     buf.reset(buf.w, buf.h);
     if buf.w == 0 || buf.h == 0 || bands.is_empty() {
@@ -901,6 +906,30 @@ mod tests {
             assert!((got - lower).abs() <= 1.0 / 8.0);
             assert!(b.row(0)[0].bg.is_some());
         }
+
+        for step in 0..=10 {
+            let lower = 0.16 + step as f32 * 0.008;
+            let upper = 0.38 + step as f32 * 0.005;
+            let mut b = CellBuf::new();
+            b.reset(1, 4);
+            stacked(&[&[lower], &[upper]], &RasterTable::FULL, &mut b);
+
+            // The inter-band boundary lies in the bottom cell; the stack's
+            // partial top lies two cells above it.
+            assert_eq!(b.row(3)[0].fg, 0);
+            assert_eq!(b.row(3)[0].bg, Some(1));
+            let boundary_eighths = ((lower * 4.0 * 8.0).round() as usize).clamp(1, 8);
+            assert_eq!(
+                b.row(3)[0].ch,
+                RasterTable::FULL.ramp8[boundary_eighths - 1]
+            );
+            assert_eq!(b.row(1)[0].fg, 1);
+            assert_eq!(b.row(1)[0].bg, None);
+            let total_top = lower + upper;
+            let top_eighths = (((total_top - 0.5) * 4.0 * 8.0).round() as usize).clamp(1, 8);
+            assert_eq!(b.row(1)[0].ch, RasterTable::FULL.ramp8[top_eighths - 1]);
+        }
+
         let mut b = CellBuf::new();
         b.reset(1, 4);
         stacked(&[&[0.375], &[0.25]], &RasterTable::FULL, &mut b);
@@ -915,6 +944,7 @@ mod tests {
         b.reset(1, 1);
         stacked(&[&[0.25], &[0.25]], &RasterTable::FULL, &mut b);
         assert_eq!(b.row(0)[0].ch, '▄');
+        assert_eq!(b.row(0)[0].fg, 0);
         assert_eq!(b.row(0)[0].bg, None);
     }
 
