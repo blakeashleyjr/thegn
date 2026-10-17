@@ -6856,6 +6856,7 @@ mod tests {
                 std::fs::write(entry.join(name), b"resolution").unwrap();
             }
         }
+        std::fs::create_dir_all(rr_cache.join("not-a-rerere-id")).unwrap();
 
         let after = rerere::cache_status(&repo.dir).unwrap();
         assert!(after.present);
