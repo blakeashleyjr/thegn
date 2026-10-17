@@ -552,14 +552,34 @@ mod tests {
     }
 
     fn overview() -> Node {
-        Node::Row(vec![
-            (Size::Weight(1), panel(CPU)),
-            (Size::Weight(1), panel(MEM)),
-            (Size::Weight(1), panel(NET)),
-            (Size::Weight(1), panel(DISK)),
-            (Size::Weight(1), panel(PROCS)),
-            (Size::Weight(1), panel(CHIPS)),
-            (Size::Weight(1), panel(PSI)),
+        Node::Col(vec![
+            (
+                Size::Weight(2),
+                Node::Row(vec![
+                    (Size::Weight(3), panel(CPU)),
+                    (
+                        Size::Weight(2),
+                        Node::Col(vec![
+                            (Size::Weight(1), panel(MEM)),
+                            (Size::Weight(1), panel(NET)),
+                            (Size::Weight(1), panel(DISK)),
+                        ]),
+                    ),
+                ]),
+            ),
+            (
+                Size::Weight(1),
+                Node::Row(vec![
+                    (Size::Weight(3), panel(PROCS)),
+                    (
+                        Size::Min(12),
+                        Node::Col(vec![
+                            (Size::Weight(1), panel(CHIPS)),
+                            (Size::Weight(1), panel(PSI)),
+                        ]),
+                    ),
+                ]),
+            ),
         ])
     }
 
@@ -578,16 +598,13 @@ mod tests {
             assert!(placed.rect.x >= area.x && placed.rect.y >= area.y);
             assert!(placed.rect.x + placed.rect.cols <= area.x + area.cols);
             assert!(placed.rect.y + placed.rect.rows <= area.y + area.rows);
-            for row in counts.iter_mut().enumerate() {
-                let (local_y, cells) = row;
-                let y = area.y + local_y;
-                if y >= placed.rect.y && y < placed.rect.y + placed.rect.rows {
-                    for (local_x, count) in cells.iter_mut().enumerate() {
-                        let x = area.x + local_x;
-                        if x >= placed.rect.x && x < placed.rect.x + placed.rect.cols {
-                            *count += 1;
-                        }
-                    }
+            let x0 = placed.rect.x - area.x;
+            let x1 = x0 + placed.rect.cols;
+            let y0 = placed.rect.y - area.y;
+            let y1 = y0 + placed.rect.rows;
+            for row in &mut counts[y0..y1] {
+                for count in &mut row[x0..x1] {
+                    *count += 1;
                 }
             }
         }
@@ -661,10 +678,38 @@ mod tests {
         assert_eq!(first.dropped, vec![PSI, CHIPS, DISK, NET, MEM, PROCS]);
         assert!(!first.dropped.contains(&CPU));
         let middle = solve(&tree, SPECS, area(100, 30), None, &[]);
-        assert_eq!(middle.hidden(), middle.dropped.len());
+        assert_eq!(middle.hidden(), 0);
+        assert!(middle.dropped.is_empty());
         let narrow = solve(&tree, SPECS, area(56, 16), None, &[]);
-        assert_eq!(narrow.dropped, vec![PSI, CHIPS, DISK, NET, MEM]);
+        assert_eq!(narrow.dropped, vec![PSI, CHIPS, DISK]);
+        assert_eq!(
+            narrow
+                .placed
+                .iter()
+                .find(|placed| placed.id == NET)
+                .map(|placed| placed.variant),
+            Some(VariantKind::Mini)
+        );
         assert!(!narrow.dropped.contains(&CPU));
+
+        let mut larger = solve(&tree, SPECS, area(300, 80), None, &[]);
+        for step in 1..=244 {
+            let cols = 300 - step;
+            let rows = 80 - ((step * 64) / 244);
+            let smaller = solve(&tree, SPECS, area(cols, rows), None, &[]);
+            assert!(smaller.dropped.starts_with(&larger.dropped));
+            assert_dropped_by_priority(&smaller.dropped);
+            larger = smaller;
+        }
+        assert_eq!(larger.dropped, narrow.dropped);
+    }
+
+    fn assert_dropped_by_priority(dropped: &[PanelId]) {
+        let priorities = dropped
+            .iter()
+            .map(|id| SPECS.iter().find(|spec| spec.id == *id).unwrap().priority)
+            .collect::<Vec<_>>();
+        assert!(priorities.windows(2).all(|pair| pair[0] >= pair[1]));
     }
 
     #[test]
