@@ -7,14 +7,18 @@
 //! registry routes fall back to the cache's waited one-shot pipeline. Diff
 //! paths may be cleaned once during status verification and again during diff;
 //! carrying bytes across that boundary is deferred. Non-required and clean-less
-//! process drivers keep gix's existing behavior (THE-701).
+//! process drivers keep gix's existing behavior (THE-701). Because `clean` is
+//! stripped, raw bytes matching the index blob are reported clean even when a
+//! non-idempotent clean filter would change them, unlike Git. A hung routed
+//! filter can block `is_dirty` for about 30 seconds across request, respawn,
+//! and retry budgets; the read deadline cannot interrupt that wait.
 
 use anyhow::{Context, Result};
 use gix::bstr::ByteSlice;
 
 use super::{ReapingCache, filter_route};
 
-pub(super) struct StatusRoute {
+pub(in crate::git) struct StatusRoute {
     repo: gix::Repository,
     workdir: std::path::PathBuf,
     state: Option<(filter_route::ProcessDrivers, ReapingCache)>,
@@ -89,10 +93,11 @@ impl StatusRoute {
             filter_route::StatusClean::Unavailable => {
                 let raw = std::fs::read(&pathname)
                     .with_context(|| format!("read status filter input {}", pathname.display()))?;
+                let platform = &mut cache.0;
                 filter_route::ProcessDrivers::convert_pipeline(
                     &self.repo,
-                    &mut cache.filter.worktree_filter,
-                    &mut cache.attr_stack,
+                    &mut platform.filter.worktree_filter,
+                    &mut platform.attr_stack,
                     path,
                     &raw,
                 )?

@@ -682,8 +682,13 @@ fn tree_to_worktree(repo: &gix::Repository, rev: &str) -> Result<Vec<DiffEntry>>
     // which together are exactly what `git diff HEAD` reports.
     // A path appears once per staged and once per unstaged change; dedup is
     // order-preserving and O(1) per item (a linear `contains` was O(N^2)).
-    let (status_repo, mut status_route) = routed_status(filter_repo.clone())?;
-    let status_source = status_route.as_ref().map_or(repo, |_| &status_repo);
+    let (status_repo, mut status_route) = if persistent_filter_sections(&filter_repo).is_empty() {
+        (None, None)
+    } else {
+        let (status_repo, status_route) = routed_status(filter_repo)?;
+        (Some(status_repo), status_route)
+    };
+    let status_source = status_repo.as_ref().map_or(repo, |status_repo| status_repo);
     let iter = super::read_budget::budgeted_status(status_source)
         .context("gix status")?
         .untracked_files(gix::status::UntrackedFiles::None)
@@ -2092,13 +2097,15 @@ mod tests {
     #[test]
     fn routed_status_is_a_no_op_without_persistent_sections() {
         let plain = TestRepo::new("filter-status-noop");
-        let (_, route) = discover_for_routed_status(&plain.dir).unwrap();
+        let isolated = gix::open_opts(&plain.dir, gix::open::Options::isolated()).unwrap();
+        let (_, route) = routed_status(isolated).unwrap();
         assert!(route.is_none());
 
         let non_required = TestRepo::new("filter-status-non-required");
         non_required.out(&["config", "filter.tgoptional.process", "cat"]);
         non_required.out(&["config", "filter.tgoptional.clean", "cat"]);
-        let (repo, route) = discover_for_routed_status(&non_required.dir).unwrap();
+        let isolated = gix::open_opts(&non_required.dir, gix::open::Options::isolated()).unwrap();
+        let (repo, route) = routed_status(isolated).unwrap();
         assert!(route.is_none());
         assert_eq!(
             repo.config_snapshot()

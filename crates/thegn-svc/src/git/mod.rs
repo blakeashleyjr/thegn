@@ -2297,7 +2297,7 @@ impl GitBackend for GixGit {
         // --porcelain`) reports — a silent sidebar-glyph semantics change.
         let status = read_budget::budgeted_status(&repo).context("gix status")?;
         with_read_deadline(git_read_timeout(), |interrupt| {
-            let mut iter = status
+            let iter = status
                 .should_interrupt_owned(interrupt.clone())
                 .into_iter(Vec::<gix::bstr::BString>::new())
                 .context("gix status iter")?;
