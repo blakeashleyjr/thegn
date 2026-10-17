@@ -829,9 +829,7 @@ mod tests {
 
     #[tokio::test]
     async fn ip_cache_is_keyed_by_name() {
-        let tmp = tempfile::tempdir().unwrap();
-        let _env =
-            thegn_core::testenv::EnvGuard::set(&[("THEGN_DIR", &tmp.path().to_string_lossy())]);
+        let _state = thegn_core::testenv::IsolatedState::new();
         let provider = FlyProvider::new(spec());
         provider
             .ips
@@ -856,9 +854,7 @@ mod tests {
 
     #[tokio::test]
     async fn foreign_provider_registry_record_is_not_a_fly_address() {
-        let tmp = tempfile::tempdir().unwrap();
-        let _env =
-            thegn_core::testenv::EnvGuard::set(&[("THEGN_DIR", &tmp.path().to_string_lossy())]);
+        let _state = thegn_core::testenv::IsolatedState::new();
         registry::write(&registry::VpsRecord {
             name: "tg-fly-x".into(),
             provider: "hetzner".into(),
@@ -889,9 +885,7 @@ mod tests {
 
     #[tokio::test]
     async fn successful_remote_destroy_evicts_the_name_ip_cache() {
-        let tmp = tempfile::tempdir().unwrap();
-        let _env =
-            thegn_core::testenv::EnvGuard::set(&[("THEGN_DIR", &tmp.path().to_string_lossy())]);
+        let _state = thegn_core::testenv::IsolatedState::new();
         let hits = std::sync::Arc::new(Mutex::new(Vec::new()));
         let (base, _srv) = fake_fly_server(hits.clone()).await;
         let provider = FlyProvider::new(FlySpec {
@@ -931,9 +925,7 @@ mod tests {
 
     #[tokio::test]
     async fn invalid_names_are_rejected_before_fly_custody_or_registry_access() {
-        let tmp = tempfile::tempdir().unwrap();
-        let _env =
-            thegn_core::testenv::EnvGuard::set(&[("THEGN_DIR", &tmp.path().to_string_lossy())]);
+        let _state = thegn_core::testenv::IsolatedState::new();
         let provider = FlyProvider::new(spec());
 
         for result in [
@@ -1214,12 +1206,7 @@ mod tests {
     /// machine) and only clears the record when that teardown succeeds.
     #[tokio::test]
     async fn create_4xx_after_app_exists_tears_down_not_orphans() {
-        let tmp = tempfile::tempdir().unwrap();
-        // The shared env lock, so this can't race any other env-mutating test in
-        // this binary — and so `THEGN_DIR` is restored even if an assertion below
-        // panics (the hand-rolled remove_var at the end never ran on failure).
-        let _env =
-            thegn_core::testenv::EnvGuard::set(&[("THEGN_DIR", &tmp.path().to_string_lossy())]);
+        let _state = thegn_core::testenv::IsolatedState::new();
         let hits = std::sync::Arc::new(Mutex::new(Vec::new()));
         let (base, _srv) = fake_fly_server(hits.clone()).await;
         let s = FlySpec {

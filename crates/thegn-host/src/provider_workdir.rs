@@ -277,9 +277,9 @@ mod tests {
     #[test]
     fn with_workdir_cd_prefixes_provider_panes_only() {
         use thegn_core::placement::{Placement, ProviderPlacement};
-        let tmp = std::env::temp_dir().join(format!("tg-cd-test-{}", std::process::id()));
+        let state = crate::testenv::IsolatedState::new();
+        let tmp = state.thegn_dir();
         let _ = std::fs::remove_dir_all(&tmp); // best-effort: cleanup: the target may already be gone; a failed removal never fails the caller
-        let _env = crate::testenv::EnvVarGuard::set(&[("THEGN_DIR", &tmp.to_string_lossy())]);
         let provider = Placement::Provider(ProviderPlacement {
             provider: "machine0".into(),
             id: "tg-x-abc".into(),
@@ -314,9 +314,9 @@ mod tests {
 
     #[test]
     fn provisioned_marker_roundtrips() {
-        let tmp = std::env::temp_dir().join(format!("tg-prov-marker-{}", std::process::id()));
+        let state = crate::testenv::IsolatedState::new();
+        let tmp = state.thegn_dir();
         let _ = std::fs::remove_dir_all(&tmp); // best-effort: cleanup: the target may already be gone; a failed removal never fails the caller
-        let _env = crate::testenv::EnvVarGuard::set(&[("THEGN_DIR", &tmp.to_string_lossy())]);
         let id = "thegn-tg-clever-falcon-rmuy88";
         assert!(!is_provisioned_locally(id), "absent before mark");
         mark_provisioned(id);
@@ -331,9 +331,9 @@ mod tests {
     #[test]
     fn cache_roundtrip_and_resolution() {
         // Isolate the state dir so the test never touches a live cache.
-        let tmp = std::env::temp_dir().join(format!("tg-workdir-test-{}", std::process::id()));
+        let state = crate::testenv::IsolatedState::new();
+        let tmp = state.thegn_dir();
         let _ = std::fs::remove_dir_all(&tmp); // best-effort: cleanup: the target may already be gone; a failed removal never fails the caller
-        let _env = crate::testenv::EnvVarGuard::set(&[("THEGN_DIR", &tmp.to_string_lossy())]);
 
         let id = "sandbox-abc";
         // Cold: no cache ⇒ the bare `/workspace` fallback.

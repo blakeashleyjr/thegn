@@ -87,25 +87,81 @@ pub(crate) fn refuse_real_state_write(path: &std::path::Path, what: &str) {
 #[cfg(test)]
 pub(crate) struct IsolatedState {
     _env: EnvVarGuard,
-    _temp: tempfile::TempDir,
+    temp: tempfile::TempDir,
 }
 
 #[cfg(test)]
 impl IsolatedState {
     pub(crate) fn new() -> Self {
+        Self::build(false, false)
+    }
+
+    pub(crate) fn with_runtime_dir() -> Self {
+        Self::build(true, false)
+    }
+
+    /// XDG state at `$HOME/.local/state`: the layout the THE-744 guard treats as
+    /// the user's real state. Only for tests of that guard.
+    pub(crate) fn with_real_home_layout() -> Self {
+        Self::build(false, true)
+    }
+
+    fn build(runtime_dir: bool, real_home_layout: bool) -> Self {
         let temp = tempfile::tempdir().expect("private isolated state dir");
         thegn_core::fsperm::restrict_dir_to_owner(temp.path())
             .expect("restrict isolated state dir");
         let mut vars = thegn_core::testenv::state_env_all(temp.path());
+        if real_home_layout {
+            for (key, value) in &mut vars {
+                if *key == "XDG_STATE_HOME" {
+                    *value = temp.path().join(".local/state");
+                }
+            }
+        }
         vars.push(("THEGN_DIR", temp.path().join(".thegn")));
+        if runtime_dir {
+            vars.push(("XDG_RUNTIME_DIR", temp.path().to_path_buf()));
+        }
         let strings: Vec<_> = vars
             .iter()
             .map(|(key, value)| (*key, value.to_str().expect("state path is UTF-8")))
             .collect();
         let env = EnvVarGuard::set(&strings);
-        Self {
-            _env: env,
-            _temp: temp,
+        Self { _env: env, temp }
+    }
+
+    pub(crate) fn root(&self) -> &std::path::Path {
+        self.temp.path()
+    }
+
+    pub(crate) fn state_home(&self) -> std::path::PathBuf {
+        thegn_core::util::xdg_state_home()
+    }
+
+    pub(crate) fn thegn_dir(&self) -> std::path::PathBuf {
+        self.root().join(".thegn")
+    }
+}
+
+#[cfg(test)]
+mod isolated_state_tests {
+    use super::IsolatedState;
+
+    #[test]
+    fn isolated_state_accessors_resolve_inside_root() {
+        {
+            let state = IsolatedState::new();
+            assert!(state.root().is_dir());
+            assert!(state.state_home().starts_with(state.root()));
+            assert!(state.thegn_dir().starts_with(state.root()));
+            assert_eq!(state.state_home(), thegn_core::util::xdg_state_home());
+            assert_eq!(state.thegn_dir(), thegn_core::util::thegn_dir());
         }
+
+        let runtime = IsolatedState::with_runtime_dir();
+        assert_eq!(
+            std::env::var_os("XDG_RUNTIME_DIR").as_deref(),
+            Some(runtime.root().as_os_str())
+        );
     }
 }

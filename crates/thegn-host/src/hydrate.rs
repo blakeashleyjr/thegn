@@ -2994,7 +2994,10 @@ pub(crate) fn build_panel(
                 reads_ok.store(false, std::sync::atomic::Ordering::Relaxed);
             }
             let diff_ok = diff.is_ok();
-            let entries = diff.unwrap_or_default();
+            let mut entries = diff.unwrap_or_default();
+            if matches!(loc, GitLoc::Local(_)) {
+                entries.retain(|entry| !crate::git_watch::is_panel_excluded_rel(&entry.path));
+            }
             let entities = crate::hydrate_semantic::compute_entity_summary(&loc, &entries);
             (entries, entities, diff_ok)
         });
@@ -3007,7 +3010,11 @@ pub(crate) fn build_panel(
             if status.is_err() {
                 reads_ok.store(false, std::sync::atomic::Ordering::Relaxed);
             }
-            status.unwrap_or_default()
+            let mut status = status.unwrap_or_default();
+            if matches!(loc, GitLoc::Local(_)) {
+                status.retain(|entry| !crate::git_watch::is_panel_excluded_rel(&entry.path));
+            }
+            status
         });
         let h_ahead = s.spawn(|| {
             let _cpu = crate::perf::measure(crate::perf::Subsys::HydrateChild);

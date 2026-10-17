@@ -353,6 +353,11 @@ pub struct PluginSpec {
     /// for config-declared plugins).
     #[serde(default)]
     pub cwd: String,
+    /// Optional child environment. Plain values pass through verbatim;
+    /// `keyring:`, `env:`, and `file:` references resolve at spawn for
+    /// config-declared `[[plugins]]` entries through the host secret broker.
+    /// An unresolved reference refuses the plugin, and references in a
+    /// directory `plugin.toml` are refused without expansion.
     #[serde(default)]
     pub env: BTreeMap<String, String>,
     /// Per-call (one-shot: per-run) wall-clock cap before the process group

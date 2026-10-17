@@ -271,7 +271,8 @@ fn read_pipe<R: Read + Send + 'static>(mut pipe: R) -> PipeReader {
     let captured = Arc::new(Mutex::new(PipeCapture::default()));
     let worker_capture = Arc::clone(&captured);
     let (finished_tx, finished) = std::sync::mpsc::channel();
-    std::thread::spawn(move || {
+    thegn_core::thread_name::spawn_named("thegn-hook-pipe", move || {
+        crate::platform::qos::set_self(crate::platform::qos::Qos::Utility); // Utility: keep the user-hook pipe drained.
         let mut chunk = [0_u8; 8192];
         loop {
             match pipe.read(&mut chunk) {

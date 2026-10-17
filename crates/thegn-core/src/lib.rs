@@ -223,6 +223,7 @@ pub mod notification_route;
 pub mod notification_scope;
 pub mod notification_sound;
 pub mod notify_debounce;
+pub mod numfmt;
 pub mod push_inbox;
 // `OSC 9` / `OSC 777` attention signalling: how a process says "I need you"
 // instead of thegn guessing from CPU and silence.
@@ -317,6 +318,7 @@ pub mod secretref;
 pub mod semantic;
 pub mod semantic_graph;
 pub mod series;
+pub mod series_store;
 pub mod series_window;
 // The pane daemon's per-session observer of the activity FSM (one decision
 // function, two observers -- see the module docs).
@@ -358,6 +360,7 @@ pub mod usage_tokens;
 pub mod usage_view;
 pub mod util;
 pub mod viz;
+pub mod viz_raster;
 pub mod voice;
 pub mod weather;
 pub mod work;

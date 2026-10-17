@@ -40,12 +40,12 @@ pub(super) struct FooterInput<'a> {
 }
 
 /// Ghost text, the footer's default voice.
-fn ghost(text: impl Into<String>) -> Seg {
+pub(super) fn ghost(text: impl Into<String>) -> Seg {
     seg(Tok::Slot(S::Ghost), text)
 }
 
 /// One `key + label` hint.
-fn hint(k: &str, label: impl Into<String>) -> Vec<Seg> {
+pub(super) fn hint(k: &str, label: impl Into<String>) -> Vec<Seg> {
     vec![Seg::key(k), ghost(label)]
 }
 
@@ -99,38 +99,7 @@ pub(super) fn line(input: FooterInput<'_>) -> Line {
         hints.push(hint("s", format!(" {}", p.scale.label())));
     }
     hints.push(hint("spc", if input.paused { " resume" } else { " pause" }));
-    match input.tab {
-        MonitorTab::Procs => {
-            hints.push(hint(
-                "c/m/n",
-                format!(
-                    " sort {}{}",
-                    input.prefs.proc_sort.label(),
-                    if input.prefs.proc_desc { "↓" } else { "↑" }
-                ),
-            ));
-            hints.push(hint("/", " find"));
-            hints.push(hint(
-                "t",
-                if input.prefs.proc_tree {
-                    " flat"
-                } else {
-                    " tree"
-                },
-            ));
-            hints.push(hint("x", " signal"));
-        }
-        MonitorTab::Disk if input.disk_rows > 0 => hints.push(hint("x", " clean")),
-        MonitorTab::Containers if input.container_ours => {
-            hints.push(hint("↵", " shell"));
-            hints.push(hint("o", " logs"));
-            hints.push(hint("t", " stop"));
-            hints.push(hint("r", " restart"));
-            hints.push(hint("x", " remove"));
-        }
-        MonitorTab::Containers => hints.push(vec![ghost("foreign container — read-only")]),
-        _ => {}
-    }
+    super::tabs::hints(&input, &mut hints);
     hints.push(hint("?", " help"));
 
     let mut left: Vec<Seg> = Vec::new();

@@ -2,7 +2,7 @@ use super::Db;
 use std::path::Path;
 
 fn isolated_state() -> crate::testenv::IsolatedState {
-    crate::testenv::IsolatedState::new()
+    crate::testenv::IsolatedState::with_real_home_layout()
 }
 
 fn assert_guard_panic<T>(outcome: std::thread::Result<T>, path: &Path) {

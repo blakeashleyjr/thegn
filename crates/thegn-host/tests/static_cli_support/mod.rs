@@ -98,21 +98,6 @@ impl Fixture {
         self.execute(command, stdout, None)
             .expect("static child must finish")
     }
-    /// A command that consults configuration refuses a non-regular source
-    /// before doing work. Static commands are tested against the same FIFO by
-    /// the caller and continue without consulting it.
-    pub fn assert_source_refused(&mut self, args: &[&str], config: &Path) {
-        let output = self.run(args, Some(config), false);
-        assert!(
-            !output.status.success(),
-            "configured counterpart accepted a non-regular configuration source: {args:?}"
-        );
-        assert!(
-            output.stderr.contains("not a regular file"),
-            "expected a non-regular-source refusal for {args:?}, got: {}",
-            output.stderr
-        );
-    }
     fn execute(
         &mut self,
         mut command: Command,

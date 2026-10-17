@@ -24,6 +24,9 @@ thegn::perf  perf rollup  wakes_per_s renders_per_s render_skips_per_s
    pty_chunks_per_s pty_budget_hits
    cpu_hydrate_ms cpu_stats_ms cpu_pr_ms cpu_metrics_ms cpu_dashboard_ms cpu_diff_ms
    cpu_process_ms cpu_loop_ms cpu_scan_ms cpu_children_reaped_ms cpu_unattributed_ms
+   malloc_arena_max malloc_arena_cap_applied malloc_trims_idle malloc_trims_scan
+   malloc_scan_drains malloc_trims_released malloc_trim_bytes malloc_trim_total_us
+   malloc_trim_max_us
 ```
 
 At `debug`, one `perf source` line per active wake source (`Model`, `Watcher`,

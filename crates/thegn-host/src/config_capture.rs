@@ -707,7 +707,7 @@ impl ConfigCaptureSeed {
     /// absence; all other DB failures remain fatal. Used by the standalone
     /// capture tests; production startup composes hosts through
     /// [`Self::admit_staged`] with the migrated state store instead.
-    #[cfg(test)]
+    #[cfg(all(test, target_os = "linux"))]
     pub(crate) fn load_once(&self) -> Result<CapturedConfig, CaptureFailure> {
         self.load_with(&crate::platform::config_file_capture::Reader, || {
             crate::state_host_capture::capture(&self.state_db)

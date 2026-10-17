@@ -447,6 +447,7 @@
             "type": "string"
           },
           "default": {},
+          "description": "Optional child environment. Plain values pass through verbatim; `keyring:`, `env:`, and `file:` references resolve at spawn for config-declared `[[plugins]]` entries through the host secret broker. An unresolved reference refuses the plugin, and references in a directory `plugin.toml` are refused without expansion.",
           "type": "object"
         },
         "id": {

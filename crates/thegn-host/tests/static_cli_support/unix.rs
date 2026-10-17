@@ -4,6 +4,19 @@ use std::os::fd::{FromRawFd, OwnedFd};
 use std::os::unix::ffi::OsStrExt;
 use std::process::Stdio;
 
+fn assert_source_refused(fixture: &mut Fixture, args: &[&str], config: &Path) {
+    let output = fixture.run(args, Some(config), false);
+    assert!(
+        !output.status.success(),
+        "configured counterpart accepted a non-regular configuration source: {args:?}"
+    );
+    assert!(
+        output.stderr.contains("not a regular file"),
+        "expected a non-regular-source refusal for {args:?}, got: {}",
+        output.stderr
+    );
+}
+
 fn fifo(path: &Path) {
     let path = CString::new(path.as_os_str().as_bytes()).unwrap();
     // SAFETY: NUL-terminated private TempDir path, valid mode, no borrowed fd.
@@ -29,7 +42,7 @@ fn static_commands_skip_config_but_configured_commands_refuse_fifo_sources() {
         &["automations", "test", "missing", "--event", "{}"],
     ];
     for args in configured {
-        fixture.assert_source_refused(args, &config);
+        assert_source_refused(&mut fixture, args, &config);
     }
     assert_eq!(
         fixture.snapshot(),
