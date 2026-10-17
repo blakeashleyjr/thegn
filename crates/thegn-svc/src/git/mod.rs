@@ -2289,7 +2289,7 @@ impl GitBackend for GixGit {
         if loc.is_remote() {
             return self.fallback.is_dirty(loc);
         }
-        let repo = native_diff::discover_for_status(loc.path())?;
+        let (repo, mut status_route) = native_diff::discover_for_routed_status(loc.path())?;
         // The full status iterator (HEAD↔index, index↔worktree, untracked
         // dirwalk), early-exiting on the first entry. Deliberately NOT gix's
         // `Repository::is_dirty()`: that disables the dirwalk and would miss
@@ -2301,11 +2301,17 @@ impl GitBackend for GixGit {
                 .should_interrupt_owned(interrupt.clone())
                 .into_iter(Vec::<gix::bstr::BString>::new())
                 .context("gix status iter")?;
-            let found = iter
-                .next()
-                .transpose()
-                .context("gix status item")?
-                .is_some();
+            let mut found = false;
+            for item in iter {
+                let item = item.context("gix status item")?;
+                if status_route
+                    .as_mut()
+                    .map_or(Ok(true), |route| route.keep(&item))?
+                {
+                    found = true;
+                    break;
+                }
+            }
             // An interrupted iterator ends with `None`, which is
             // indistinguishable from "clean" — so an expired deadline must
             // be an error, never a silent `false`.

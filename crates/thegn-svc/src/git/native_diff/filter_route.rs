@@ -5,8 +5,9 @@
 //! process drivers before the cache's one-shot reroute, runs clean once through
 //! the registry, then applies the remaining encoding/eol/ident pipeline. If a
 //! process cannot be used, `None` preserves gix's existing one-shot fallback.
-//! Status walks still use gix's internally built pipeline. Idle children remain
-//! blocked on their protocol read until the next diff sweeps them or thegn exits.
+//! Status walks use this route to verify candidates after a raw-byte status
+//! pass. Idle children remain blocked on their protocol read until the next
+//! routed use or thegn exits.
 //! A hung filter can delay one diff by about 30 seconds: a 10-second request,
 //! a 10-second respawn handshake, and a 10-second retry, followed by 60 seconds
 //! of backoff.
@@ -30,6 +31,12 @@ struct ProcessDriver {
 pub(super) struct ProcessDrivers {
     drivers: Vec<ProcessDriver>,
     post_clean: Option<gix::filter::plumbing::Pipeline>,
+}
+
+pub(super) enum StatusClean {
+    NotRouted,
+    Unavailable,
+    Cleaned(Vec<u8>),
 }
 
 impl ProcessDrivers {
@@ -67,6 +74,11 @@ impl ProcessDrivers {
         }
     }
 
+    pub(super) fn retain_rerouted(&mut self) {
+        self.drivers
+            .retain(|driver| driver.required && driver.has_clean);
+    }
+
     pub(super) fn route_worktree_side(
         &mut self,
         repo: &gix::Repository,
@@ -75,8 +87,33 @@ impl ProcessDrivers {
         path: &str,
         platform: &mut gix::diff::blob::Platform,
     ) -> Result<Option<Vec<u8>>> {
+        match self.route_side(repo, workdir, rela, path, platform)? {
+            StatusClean::Cleaned(bytes) => Ok(Some(bytes)),
+            StatusClean::NotRouted | StatusClean::Unavailable => Ok(None),
+        }
+    }
+
+    pub(super) fn route_status_side(
+        &mut self,
+        repo: &gix::Repository,
+        workdir: &Path,
+        rela: &gix::bstr::BStr,
+        path: &str,
+        platform: &mut gix::diff::blob::Platform,
+    ) -> Result<StatusClean> {
+        self.route_side(repo, workdir, rela, path, platform)
+    }
+
+    fn route_side(
+        &mut self,
+        repo: &gix::Repository,
+        workdir: &Path,
+        rela: &gix::bstr::BStr,
+        path: &str,
+        platform: &mut gix::diff::blob::Platform,
+    ) -> Result<StatusClean> {
         if self.drivers.is_empty() {
-            return Ok(None);
+            return Ok(StatusClean::NotRouted);
         }
         let mut attributes = platform.attr_stack.selected_attribute_matches(["filter"]);
         platform
@@ -84,7 +121,7 @@ impl ProcessDrivers {
             .at_entry(rela, None, &repo.objects)?
             .matching_attributes(&mut attributes);
         let Some(matched) = attributes.iter_selected().next() else {
-            return Ok(None);
+            return Ok(StatusClean::NotRouted);
         };
         let Some(driver_name) = matched
             .assignment
@@ -92,23 +129,23 @@ impl ProcessDrivers {
             .as_bstr()
             .and_then(|name| name.to_str().ok())
         else {
-            return Ok(None);
+            return Ok(StatusClean::NotRouted);
         };
         let Some(driver) = self
             .drivers
             .iter()
             .find(|driver| driver.name == driver_name)
         else {
-            return Ok(None);
+            return Ok(StatusClean::NotRouted);
         };
         let pathname = workdir.join(path);
         let metadata = match std::fs::metadata(&pathname) {
             Ok(metadata) if metadata.is_file() => metadata,
-            _ => return Ok(None),
+            _ => return Ok(StatusClean::Unavailable),
         };
         let limit = platform.filter.options.large_file_threshold_bytes;
         if limit > 0 && metadata.len() > limit {
-            return Ok(None);
+            return Ok(StatusClean::Unavailable);
         }
         let content: Arc<[u8]> = Arc::from(
             std::fs::read(&pathname)
@@ -134,17 +171,17 @@ impl ProcessDrivers {
             Arc::clone(&content),
         );
         match routed {
-            Routed::Unavailable => Ok(None),
+            Routed::Unavailable => Ok(StatusClean::Unavailable),
             Routed::Done(Outcome::Success(bytes)) => self
                 .convert_post_clean(repo, platform, path, &bytes)
-                .map(Some),
+                .map(StatusClean::Cleaned),
             Routed::Done(Outcome::Error | Outcome::Abort) if driver.required => {
                 bail!("required clean filter {:?} failed for {path}", driver.name)
             }
             Routed::Done(Outcome::Error | Outcome::Abort) => {
                 tracing::debug!(target: "thegn::git", driver = %driver.name, has_clean = driver.has_clean, "non-required clean filter passed through");
                 self.convert_post_clean(repo, platform, path, &content[..])
-                    .map(Some)
+                    .map(StatusClean::Cleaned)
             }
         }
     }
@@ -159,12 +196,22 @@ impl ProcessDrivers {
         let Some(pipeline) = &mut self.post_clean else {
             return Ok(bytes.to_vec());
         };
+        Self::convert_pipeline(repo, pipeline, &mut platform.attr_stack, path, bytes)
+    }
+
+    pub(super) fn convert_pipeline(
+        repo: &gix::Repository,
+        pipeline: &mut gix::filter::plumbing::Pipeline,
+        attr_stack: &mut gix::worktree::Stack,
+        path: &str,
+        bytes: &[u8],
+    ) -> Result<Vec<u8>> {
         let rela = Path::new(path);
         let mut lookup_error = None;
         let outcome = pipeline.convert_to_git(
             bytes,
             rela,
-            &mut |rela, attrs| match platform.attr_stack.at_entry(rela, None, &repo.objects) {
+            &mut |rela, attrs| match attr_stack.at_entry(rela, None, &repo.objects) {
                 Ok(entry) => {
                     // The match flag is irrelevant here; `attrs` is filled in place.
                     let _matched = entry.matching_attributes(attrs);
