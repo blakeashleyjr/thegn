@@ -833,7 +833,7 @@ mod tests {
     #[test]
     fn every_table_glyph_is_one_cell_and_levels_map() {
         for table in [&RasterTable::FULL, &RasterTable::BASIC, &RasterTable::ASCII] {
-            let glyphs = table
+            let mut glyphs = table
                 .ramp8
                 .iter()
                 .chain(table.hbar8.iter())
