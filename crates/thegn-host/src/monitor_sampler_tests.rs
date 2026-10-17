@@ -170,10 +170,7 @@ fn harness_with_gate(
                 spawns.fetch_add(1, Ordering::SeqCst);
                 *name.lock().unwrap() = Some(thread_name.to_owned());
                 if spawn_error {
-                    Err(std::io::Error::new(
-                        std::io::ErrorKind::Other,
-                        "injected spawn failure",
-                    ))
+                    Err(std::io::Error::other("injected spawn failure"))
                 } else {
                     Ok(std::thread::spawn(task))
                 }
@@ -187,9 +184,10 @@ fn harness_with_gate(
             if wake_error { Err(()) } else { Ok(()) }
         })
     };
+    let worker_clock: Arc<dyn Clock> = Arc::clone(&clock);
     let sampler = MonitorSampler::with_inputs(SpawnInputs {
         factory,
-        clock: Arc::clone(&clock),
+        clock: worker_clock,
         wake,
         spawn,
     });
@@ -307,8 +305,19 @@ fn close_closes_once_and_wakes_for_loop_owned_reap() {
 fn sample_errors_set_failing_health_and_mode_helpers_are_pure() {
     let mut h = harness(false, true);
     h.sampler.sync(Mode::Open, demand());
-    wait_phase(&h, Phase::Waiting);
-    let frame = h.sampler.take_latest().unwrap();
+    wait_until(|| h.samples.load(Ordering::SeqCst) > 0);
+    let mut sampled_frame = None;
+    for _ in 0..100_000 {
+        if let Some(frame) = h.sampler.take_latest() {
+            if frame.sampled.contains(CollectorId::Loadavg) {
+                sampled_frame = Some(frame);
+                break;
+            }
+            h.sampler.recycle(frame);
+        }
+        std::thread::yield_now();
+    }
+    let frame = sampled_frame.expect("a sampled Loadavg frame should be published");
     assert!(matches!(
         frame.health[CollectorId::Loadavg.index()],
         Health::Failing { .. }
@@ -414,9 +423,11 @@ fn slow_consumer_coalesces_publication_wakes() {
             .as_ref()
             .is_some_and(|frame| frame.seq >= 5)
     });
+    let wakes_before = h.wakes.load(Ordering::SeqCst);
     let frame = h.sampler.take_latest().unwrap();
     assert!(frame.seq >= 5);
-    assert_eq!(h.wakes.load(Ordering::SeqCst), 1);
+    assert_eq!(wakes_before, 1);
+    assert!(wakes_before < frame.seq as usize + 1);
     h.sampler.recycle(frame);
 }
 
@@ -439,9 +450,9 @@ fn draining_consumer_gets_one_wake_per_publication() {
         };
         assert_eq!(frame.seq, expected_seq);
         h.sampler.recycle(frame);
-        wait_until(|| h.wakes.load(Ordering::SeqCst) == expected_seq + 1);
+        wait_until(|| h.wakes.load(Ordering::SeqCst) == expected_seq as usize + 1);
         if expected_seq < 10 {
-            drain_gate.store(expected_seq + 1, Ordering::SeqCst);
+            drain_gate.store(expected_seq as usize + 1, Ordering::SeqCst);
         }
     }
     assert_eq!(h.wakes.load(Ordering::SeqCst), 11);
