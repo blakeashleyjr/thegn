@@ -42,7 +42,7 @@ pub fn kv_u64(value: &[u8]) -> Option<u64> {
     parse_u64(fields(value).next()?)
 }
 
-pub fn find_line(input: &[u8], prefix: &[u8]) -> Option<&[u8]> {
+pub fn find_line<'a>(input: &'a [u8], prefix: &[u8]) -> Option<&'a [u8]> {
     input
         .split(|byte| *byte == b'\n')
         .find_map(|line| line.strip_prefix(prefix))

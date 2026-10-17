@@ -73,7 +73,7 @@ pub fn due_set(
 #[cfg(test)]
 mod tests {
     use super::{Cadence, Mode, due, due_set, phases};
-    use crate::{CollectorId, CollectorSet};
+    use crate::collect::{CollectorId, CollectorSet};
 
     #[test]
     fn cadence_and_demand_are_enforced() {
