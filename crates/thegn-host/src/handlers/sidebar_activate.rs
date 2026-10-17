@@ -408,8 +408,8 @@ mod tests {
     }
 
     #[test]
-    fn non_pending_activation_still_lands() {
-        let mut session = Session {
+    fn non_pending_targets_are_not_refused() {
+        let session = Session {
             id: "/repo".into(),
             worktrees: vec![
                 WorktreeGroup::new("app/home", GroupKind::Home, "/tmp/home"),
@@ -417,20 +417,27 @@ mod tests {
             ],
             active: 0,
         };
-        let mut model = FrameModel::default();
-        let mut sb = SidebarState::default();
-        sb.deleting.insert("/tmp/not-this-branch".into());
-        let activation = activate_for_test(
-            crate::sidebar::RowTarget::Workspace {
-                repo_path: session.id.clone(),
-                group: Some("app/branch".into()),
-            },
-            &mut session,
-            &mut model,
-            &mut sb,
+        let deleting = std::collections::HashSet::from(["/tmp/not-this-branch".to_string()]);
+        assert_eq!(
+            crate::handlers::worktree_delete::pending_target_refusal(
+                &crate::sidebar::RowTarget::Workspace {
+                    repo_path: session.id.clone(),
+                    group: Some("app/branch".into()),
+                },
+                &session,
+                &[],
+                &deleting,
+            ),
+            None
         );
-
-        assert!(matches!(activation, Activation::Landed { .. }));
-        assert_eq!(session.active, 1);
+        assert_eq!(
+            crate::handlers::worktree_delete::pending_target_refusal(
+                &crate::sidebar::RowTarget::Tab(1, 0),
+                &session,
+                &[],
+                &deleting,
+            ),
+            None
+        );
     }
 }
