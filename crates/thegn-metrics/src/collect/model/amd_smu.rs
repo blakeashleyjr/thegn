@@ -8,6 +8,7 @@ pub const MAX_CARDS: usize = 8;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AmdSmuStatus {
     Decoded(Decoded),
+    Suspended,
     Error(io::ErrorKind),
 }
 

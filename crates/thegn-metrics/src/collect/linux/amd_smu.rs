@@ -5,7 +5,7 @@ use std::path::PathBuf;
 
 use super::procfile::ProcFile;
 use crate::collect::model::amd_smu::{AmdSmuCard, AmdSmuStatus, MAX_CARDS};
-use crate::collect::parse::amd_gpu_metrics::{Decoded, GpuMetrics, decode, parse_header};
+use crate::collect::parse::amd_gpu_metrics::{GpuMetrics, decode};
 use crate::collect::{
     CollectError, Collector, CollectorId, TickCtx,
     env::Env,
@@ -58,7 +58,7 @@ impl AmdSmuCollector {
                 return Ok(AmdSmuCard {
                     card: card.index,
                     suspended: true,
-                    decoded: AmdSmuStatus::Decoded(Decoded::NoHeader),
+                    decoded: AmdSmuStatus::Suspended,
                     metrics: GpuMetrics::default(),
                 });
             }
@@ -70,7 +70,7 @@ impl AmdSmuCollector {
         let bytes = metrics_file.read_all().map_err(|error| error.kind())?;
         let mut metrics = GpuMetrics::default();
         let decoded = decode(bytes, &mut metrics);
-        if let Some(header) = parse_header(bytes)
+        if let Some(header) = metrics.header
             && matches!(header.format, 2 | 3)
         {
             card.gate = None;
@@ -278,6 +278,10 @@ mod tests {
         assert!(collector.sample(&TickCtx::default(), &mut frame).is_ok());
         assert_eq!(frame.parts.amd_smu.cards.len(), 1);
         assert!(frame.parts.amd_smu.cards[0].suspended);
+        assert_eq!(
+            frame.parts.amd_smu.cards[0].decoded,
+            AmdSmuStatus::Suspended
+        );
         put(
             &dir.path().join("card0/device/power/runtime_status"),
             b"active\n",
@@ -297,17 +301,12 @@ mod tests {
         let mut collector = AmdSmuCollector::with_root(PathBuf::from(dir.path()));
         assert_eq!(collector.discover(&Env::default()), Health::Ok);
         let gate = dir.path().join("card1/device/power/runtime_status");
-        assert!(
-            collector
-                .sample(&TickCtx::default(), &mut MonitorFrame::default())
-                .is_ok()
-        );
-        fs::remove_file(gate).unwrap();
-        assert!(
-            collector
-                .sample(&TickCtx::default(), &mut MonitorFrame::default())
-                .is_ok()
-        );
+        let mut frame = MonitorFrame::default();
+        assert!(collector.sample(&TickCtx::default(), &mut frame).is_ok());
+        assert!(collector.cards[0].gate.is_none());
+        put(&gate, b"suspended\n");
+        assert!(collector.sample(&TickCtx::default(), &mut frame).is_ok());
+        assert!(!frame.parts.amd_smu.cards[0].suspended);
         let empty = tempfile::tempdir().unwrap();
         let mut none = AmdSmuCollector::with_root(PathBuf::from(empty.path()));
         assert_eq!(
@@ -322,9 +321,11 @@ mod tests {
         for id in 0..9 {
             card(dir.path(), id, b"active\n", &v3());
         }
+        let metrics_path = dir.path().join("card0/device/gpu_metrics");
+        fs::remove_file(&metrics_path).unwrap();
+        fs::create_dir(&metrics_path).unwrap();
         let mut collector = AmdSmuCollector::with_root(PathBuf::from(dir.path()));
         assert_eq!(collector.discover(&Env::default()), Health::Ok);
-        fs::remove_file(dir.path().join("card0/device/gpu_metrics")).unwrap();
         let mut frame = MonitorFrame::default();
         assert!(collector.sample(&TickCtx::default(), &mut frame).is_ok());
         assert_eq!(frame.parts.amd_smu.cards.len(), 8);
@@ -335,6 +336,10 @@ mod tests {
         assert!(matches!(
             frame.parts.amd_smu.cards[1].decoded,
             AmdSmuStatus::Decoded(_)
+        ));
+        assert!(matches!(
+            frame.parts.amd_smu.cards[0].decoded,
+            AmdSmuStatus::Error(std::io::ErrorKind::IsADirectory)
         ));
     }
 }

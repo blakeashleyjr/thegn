@@ -85,6 +85,9 @@ pub struct GpuMetrics {
     pub current_vpeclk: Option<u16>,
     pub current_ipuclk: Option<u16>,
     pub current_coreclk: [Option<u16>; 16],
+    pub current_l3clk: [Option<u16>; 2],
+    pub avg_vpeclk: Option<u16>,
+    pub avg_ipuclk: Option<u16>,
     pub core_maxfreq: Option<u16>,
     pub gfx_maxfreq: Option<u16>,
     pub throttle_status: Option<u32>,
@@ -106,6 +109,13 @@ fn rd_u16(buf: &[u8], limit: usize, off: usize) -> Option<u16> {
     let bytes: [u8; 2] = buf.get(off..end.min(limit))?.try_into().ok()?;
     let value = u16::from_le_bytes(bytes);
     (value != u16::MAX).then_some(value)
+}
+fn rd_u8(buf: &[u8], limit: usize, off: usize) -> Option<u8> {
+    if off < limit {
+        buf.get(off).copied()
+    } else {
+        None
+    }
 }
 fn rd_u32(buf: &[u8], limit: usize, off: usize) -> Option<u32> {
     let end = off.checked_add(4)?;
@@ -137,7 +147,8 @@ pub fn decode(buf: &[u8], target: &mut GpuMetrics) -> Decoded {
     let limit = usize::from(header.structure_size).min(buf.len());
     let truncated = usize::from(header.structure_size) > buf.len();
     let result = match (header.format, header.content) {
-        (1, 0..=3) => decode_v1(buf, limit, header.content, target),
+        (1, 0) => decode_v1_0(buf, limit, target),
+        (1, 1..=3) => decode_v1(buf, limit, header.content, target),
         (2, 0) => decode_v2_0(buf, limit, target),
         (2, 1..=2) => decode_v2_1(buf, limit, header.format, header.content, target),
         (3, 0) => decode_v3(buf, limit, target),
@@ -151,6 +162,36 @@ pub fn decode(buf: &[u8], target: &mut GpuMetrics) -> Decoded {
     } else {
         Decoded::Full
     }
+}
+
+fn decode_v1_0(buf: &[u8], limit: usize, m: &mut GpuMetrics) -> bool {
+    m.layout_verified = false;
+    m.system_clock_counter = rd_u64(buf, limit, 8);
+    m.temperature_edge = temp(buf, limit, 16, 100);
+    m.temperature_hotspot = temp(buf, limit, 18, 100);
+    m.temperature_mem = temp(buf, limit, 20, 100);
+    m.temperature_vr_gfx = temp(buf, limit, 22, 100);
+    m.temperature_vr_soc = temp(buf, limit, 24, 100);
+    m.temperature_vr_mem = temp(buf, limit, 26, 100);
+    m.activity_gfx = rd_u16(buf, limit, 28);
+    m.activity_umc = rd_u16(buf, limit, 30);
+    m.activity_mm = rd_u16(buf, limit, 32);
+    m.power_socket = power_u16(buf, limit, 34, 1000);
+    m.avg_gfxclk = rd_u16(buf, limit, 40);
+    m.avg_socclk = rd_u16(buf, limit, 42);
+    m.avg_uclk = rd_u16(buf, limit, 44);
+    m.avg_vclk = rd_u16(buf, limit, 46).or_else(|| rd_u16(buf, limit, 50));
+    m.avg_dclk = rd_u16(buf, limit, 48).or_else(|| rd_u16(buf, limit, 52));
+    m.current_gfxclk = rd_u16(buf, limit, 54);
+    m.current_socclk = rd_u16(buf, limit, 56);
+    m.current_uclk = rd_u16(buf, limit, 58);
+    m.current_vclk = rd_u16(buf, limit, 60).or_else(|| rd_u16(buf, limit, 64));
+    m.current_dclk = rd_u16(buf, limit, 62).or_else(|| rd_u16(buf, limit, 66));
+    m.throttle_status = rd_u32(buf, limit, 68);
+    m.fan_rpm = rd_u16(buf, limit, 72);
+    m.pcie_link_width = rd_u8(buf, limit, 74).map(u16::from);
+    m.pcie_link_speed = rd_u8(buf, limit, 75).map(u16::from);
+    true
 }
 
 fn decode_v1(buf: &[u8], limit: usize, revision: u8, m: &mut GpuMetrics) -> bool {
@@ -229,7 +270,7 @@ fn decode_v2_0(buf: &[u8], limit: usize, m: &mut GpuMetrics) -> bool {
     for (i, value) in m.current_coreclk[..8].iter_mut().enumerate() {
         *value = rd_u16(buf, limit, 92 + i * 2);
     }
-    for (i, value) in m.current_coreclk[8..10].iter_mut().enumerate() {
+    for (i, value) in m.current_l3clk.iter_mut().enumerate() {
         *value = rd_u16(buf, limit, 108 + i * 2);
     }
     m.throttle_status = rd_u32(buf, limit, 112);
@@ -272,7 +313,7 @@ fn decode_v2_1(buf: &[u8], limit: usize, _format: u8, content: u8, m: &mut GpuMe
     for (i, value) in m.current_coreclk[..8].iter_mut().enumerate() {
         *value = rd_u16(buf, limit, 88 + i * 2);
     }
-    for (i, value) in m.current_coreclk[8..10].iter_mut().enumerate() {
+    for (i, value) in m.current_l3clk.iter_mut().enumerate() {
         *value = rd_u16(buf, limit, 104 + i * 2);
     }
     m.throttle_status = rd_u32(buf, limit, 108);
@@ -316,13 +357,13 @@ fn decode_v3(buf: &[u8], limit: usize, m: &mut GpuMetrics) -> bool {
     m.power_sys = rd_u16(buf, limit, 168).map(u32::from);
     m.power_stapm_limit = rd_u16(buf, limit, 170).map(u32::from);
     m.power_current_stapm_limit = rd_u16(buf, limit, 172).map(u32::from);
-    m.current_gfxclk = rd_u16(buf, limit, 174);
-    m.current_socclk = rd_u16(buf, limit, 176);
-    m.current_vpeclk = rd_u16(buf, limit, 178);
-    m.current_ipuclk = rd_u16(buf, limit, 180);
-    m.current_fclk = rd_u16(buf, limit, 182);
-    m.current_vclk = rd_u16(buf, limit, 184);
-    m.current_uclk = rd_u16(buf, limit, 186);
+    m.avg_gfxclk = rd_u16(buf, limit, 174);
+    m.avg_socclk = rd_u16(buf, limit, 176);
+    m.avg_vpeclk = rd_u16(buf, limit, 178);
+    m.avg_ipuclk = rd_u16(buf, limit, 180);
+    m.avg_fclk = rd_u16(buf, limit, 182);
+    m.avg_vclk = rd_u16(buf, limit, 184);
+    m.avg_uclk = rd_u16(buf, limit, 186);
     m.current_coreclk = [None; 16];
     for (i, value) in m.current_coreclk.iter_mut().enumerate() {
         *value = rd_u16(buf, limit, 190 + i * 2);
@@ -398,9 +439,10 @@ mod tests {
         assert_eq!(metrics.power_core[8], Some(1569));
         assert_eq!(metrics.power_stapm_limit, None);
         assert_eq!(metrics.power_current_stapm_limit, None);
-        assert_eq!(metrics.current_gfxclk, Some(619));
-        assert_eq!(metrics.current_fclk, Some(1959));
-        assert_eq!(metrics.current_uclk, Some(2800));
+        assert_eq!(metrics.avg_gfxclk, Some(619));
+        assert_eq!(metrics.avg_fclk, Some(1959));
+        assert_eq!(metrics.avg_uclk, Some(2800));
+        assert_eq!(metrics.current_gfxclk, None);
         assert_eq!(metrics.gfx_maxfreq, Some(2900));
         assert_eq!(metrics.core_maxfreq, Some(1200));
         assert_eq!(metrics.current_coreclk[8], Some(2800));
@@ -480,9 +522,17 @@ mod tests {
         assert_eq!(metrics.temperature_core[0], None);
         let mut v10 = [0_u8; 80];
         v10[0..4].copy_from_slice(&[80, 0, 1, 0]);
-        put16(&mut v10, 4, 0xffff);
+        put16(&mut v10, 4, 999);
+        put64(&mut v10, 8, 0x1234);
+        put16(&mut v10, 16, 65);
+        v10[74] = u8::MAX;
+        v10[75] = 7;
         assert_eq!(decode(&v10, &mut metrics), Decoded::Full);
-        assert_eq!(metrics.temperature_edge, None);
+        assert_eq!(metrics.temperature_edge, Some(6500));
+        assert_eq!(metrics.system_clock_counter, Some(0x1234));
+        assert_ne!(metrics.temperature_edge, Some(99900));
+        assert_eq!(metrics.pcie_link_width, Some(255));
+        assert_eq!(metrics.pcie_link_speed, Some(7));
         assert_eq!(metrics.temperature_hbm, [None; 4]);
         assert_eq!(metrics.voltage_soc, None);
         let mut v22 = [0_u8; 128];
@@ -494,5 +544,34 @@ mod tests {
         assert_eq!(metrics.temperature_gfx, Some(55));
         assert_eq!(metrics.power_socket, Some(700));
         assert_eq!(metrics.indep_throttle_status, Some(0x55));
+    }
+
+    #[test]
+    fn l3_clocks_are_separate_and_v3_frequencies_are_averages() {
+        let mut v20 = [0_u8; 128];
+        v20[0..4].copy_from_slice(&[128, 0, 2, 0]);
+        put16(&mut v20, 108, 1400);
+        put16(&mut v20, 110, 1500);
+        let mut metrics = GpuMetrics::default();
+        assert_eq!(decode(&v20, &mut metrics), Decoded::Full);
+        assert_eq!(metrics.current_l3clk, [Some(1400), Some(1500)]);
+        assert_eq!(metrics.current_coreclk, [None; 16]);
+
+        let mut v21 = [0_u8; 120];
+        v21[0..4].copy_from_slice(&[120, 0, 2, 1]);
+        put16(&mut v21, 104, 1600);
+        put16(&mut v21, 106, 1700);
+        assert_eq!(decode(&v21, &mut metrics), Decoded::Full);
+        assert_eq!(metrics.current_l3clk, [Some(1600), Some(1700)]);
+        assert_eq!(metrics.current_coreclk, [None; 16]);
+
+        assert_eq!(decode(&V3_0_BLOB, &mut metrics), Decoded::Full);
+        assert_eq!(metrics.avg_gfxclk, Some(619));
+        assert_eq!(metrics.avg_vpeclk, Some(800));
+        assert_eq!(metrics.avg_ipuclk, Some(0));
+        assert_eq!(metrics.avg_fclk, Some(1959));
+        assert_eq!(metrics.avg_vclk, Some(800));
+        assert_eq!(metrics.avg_uclk, Some(2800));
+        assert_eq!(metrics.current_gfxclk, None);
     }
 }
