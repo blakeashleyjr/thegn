@@ -1,5 +1,5 @@
-use super::{GraphOut, Paint, Resolved, default_palette, table};
-use thegn_core::theme::SeriesRole;
+use super::{GraphOut, Paint, Resolved, table};
+use thegn_core::theme::{Palette, SeriesRole};
 use thegn_core::viz_raster;
 
 pub(crate) fn paint_stacked(
@@ -8,11 +8,11 @@ pub(crate) fn paint_stacked(
     roles: &'static [SeriesRole],
     w: usize,
     h: usize,
+    palette: &Palette,
 ) {
     out.prepare(w, h);
     viz_raster::stacked(bands, table(), &mut out.cells);
-    let palette = default_palette();
     let paint = Paint::Bands(roles);
-    let resolved = Resolved::new(&palette, paint, crate::caps::color_depth());
+    let resolved = Resolved::new(palette, paint, crate::caps::color_depth());
     out.emit(&resolved);
 }

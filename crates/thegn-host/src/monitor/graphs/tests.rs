@@ -1,4 +1,4 @@
-use super::graph::{GraphKind, paint_graph};
+use super::graph::{GraphKind, GraphPaint, paint_graph};
 use super::heatmap::paint_heatmap;
 use super::mirrored::paint_mirrored;
 use super::spark::paint_spark;
@@ -29,15 +29,28 @@ fn text(out: &GraphOut) -> Vec<String> {
 }
 
 fn assert_cell_styles(out: &GraphOut, cells: &viz_raster::CellBuf, resolved: &Resolved) {
-    for (row_index, line) in out.lines.iter().enumerate() {
+    assert_cell_styles_rows(out, cells, resolved, 0, out.lines.len());
+}
+
+fn assert_cell_styles_rows(
+    out: &GraphOut,
+    cells: &viz_raster::CellBuf,
+    resolved: &Resolved,
+    start_row: usize,
+    end_row: usize,
+) {
+    for row_index in start_row..end_row {
+        let line = &out.lines[row_index];
         let Line::Segs(segs) = line else {
             panic!("expected emitted runs")
         };
         let row = cells.row(row_index);
         let mut offset = 0;
+        let mut previous_style = None;
         for run in segs {
             let width = crate::seg::seg_width(std::slice::from_ref(run));
             let expected = resolved.cell(row[offset]);
+            assert_ne!(previous_style, Some(expected), "adjacent equal-style runs");
             assert_eq!(run.fg, Tok::Attr(expected.fg));
             assert_eq!(run.bg, expected.bg.map(Tok::Attr));
             assert_eq!(run.bold, expected.bold);
@@ -47,6 +60,7 @@ fn assert_cell_styles(out: &GraphOut, cells: &viz_raster::CellBuf, resolved: &Re
                     .all(|cell| resolved.cell(*cell) == expected)
             );
             offset += width;
+            previous_style = Some(expected);
         }
         assert_eq!(offset, cells.width());
     }
@@ -56,85 +70,169 @@ fn assert_cell_styles(out: &GraphOut, cells: &viz_raster::CellBuf, resolved: &Re
 fn graph_glyph_and_style_goldens_follow_each_unicode_table() {
     for level in [UnicodeLevel::Full, UnicodeLevel::Basic, UnicodeLevel::Ascii] {
         test_override::with_unicode(level, || {
-            let mut out = GraphOut::new();
-            paint_graph(
-                &mut out,
-                GraphKind::Area,
-                &[0.15, 0.4, 0.8, 1.0],
-                None,
-                4,
-                2,
-                Paint::Ramp {
-                    id: RampId::Util,
-                    warn: 0.6,
-                    crit: 0.9,
-                },
-            );
-            let expected_table = viz_raster::RasterTable::for_level(level);
-            let mut expected = viz_raster::CellBuf::new();
-            viz_raster::area(&[0.15, 0.4, 0.8, 1.0], expected_table, &mut expected);
-            let expected_rows: Vec<String> = (0..expected.height())
-                .map(|row| expected.row(row).iter().map(|cell| cell.ch).collect())
-                .collect();
-            assert_eq!(text(&out), expected_rows);
-            let palette = default_palette();
-            let paint = Paint::Ramp {
-                id: RampId::Util,
-                warn: 0.6,
-                crit: 0.9,
-            };
-            let resolved = Resolved::new(&palette, paint, ColorDepth::Truecolor);
-            assert_cell_styles(&out, &expected, &resolved);
-            for (kind, vals, lo) in [
-                (GraphKind::Line, &[0.2, 0.5, 0.8][..], None),
-                (GraphKind::Blocks, &[0.2, 0.5, 0.8][..], None),
-                (
-                    GraphKind::Band,
-                    &[0.7, 0.8, 0.9][..],
-                    Some(&[0.1, 0.3, 0.5][..]),
-                ),
-            ] {
+            test_override::with_color(ColorDepth::Truecolor, || {
+                let palette = default_palette();
+                let raster_table = viz_raster::RasterTable::for_level(level);
+                let mut out = GraphOut::new();
                 paint_graph(
                     &mut out,
-                    kind,
-                    vals,
-                    lo,
-                    3,
-                    2,
-                    Paint::Flat(SeriesRole::CpuUser),
+                    GraphPaint {
+                        kind: GraphKind::Area,
+                        vals: &[0.15, 0.4, 0.8, 1.0],
+                        lo: None,
+                        w: 4,
+                        h: 2,
+                        paint: Paint::Ramp {
+                            id: RampId::Util,
+                            warn: 0.6,
+                            crit: 0.9,
+                        },
+                    },
+                    &palette,
                 );
-                assert_eq!(out.lines.len(), 2);
-                assert_eq!(out.cells.width(), 3);
-                assert!(out.lines.iter().all(|line| matches!(line, Line::Segs(_))));
-            }
+                let mut expected = viz_raster::CellBuf::new();
+                expected.reset(4, 2);
+                viz_raster::area(&[0.15, 0.4, 0.8, 1.0], raster_table, &mut expected);
+                assert_eq!(text(&out), raster_text(&expected));
+                let area_resolved = Resolved::new(
+                    &palette,
+                    Paint::Ramp {
+                        id: RampId::Util,
+                        warn: 0.6,
+                        crit: 0.9,
+                    },
+                    ColorDepth::Truecolor,
+                );
+                assert_cell_styles(&out, &expected, &area_resolved);
 
-            paint_stacked(
-                &mut out,
-                &[&[0.4, 0.4], &[0.4, 0.4]],
-                &[SeriesRole::CpuUser, SeriesRole::CpuSys],
-                2,
-                4,
-            );
-            assert_eq!(out.lines.len(), 4);
-            paint_mirrored(
-                &mut out,
-                &[0.8, 0.8],
-                &[0.2, 0.2],
-                2,
-                4,
-                RampId::Rx,
-                RampId::Tx,
-            );
-            assert_eq!(out.lines.len(), 4);
-            paint_heatmap(&mut out, &[&[0.1, 0.8], &[0.6, 0.4]], RampId::Heat);
-            assert_eq!(out.cells.width(), 2);
-            paint_spark(&mut out, &[0.1, 0.5, 0.8], 2, RampId::Mem);
-            assert_eq!(text(&out)[0].chars().count(), 2);
-            paint_spark(&mut out, &[0.8], 3, RampId::Mem);
-            assert_eq!(text(&out)[0].chars().count(), 3);
-            assert!(text(&out)[0].starts_with(' '));
+                let graph_cases = [
+                    (GraphKind::Line, &[0.2, 0.5, 0.8][..], None),
+                    (GraphKind::Blocks, &[0.2, 0.5, 0.8][..], None),
+                    (
+                        GraphKind::Band,
+                        &[0.7, 0.8, 0.9][..],
+                        Some(&[0.1, 0.3, 0.5][..]),
+                    ),
+                ];
+                for (kind, vals, lo) in graph_cases {
+                    let paint = Paint::Flat(SeriesRole::CpuUser);
+                    paint_graph(
+                        &mut out,
+                        GraphPaint {
+                            kind,
+                            vals,
+                            lo,
+                            w: 3,
+                            h: 2,
+                            paint,
+                        },
+                        &palette,
+                    );
+                    let mut expected = viz_raster::CellBuf::new();
+                    expected.reset(3, 2);
+                    match kind {
+                        GraphKind::Line => viz_raster::line(vals, raster_table, &mut expected),
+                        GraphKind::Blocks => viz_raster::columns(
+                            vals,
+                            &raster_table.ramp8,
+                            raster_table,
+                            &mut expected,
+                        ),
+                        GraphKind::Band => {
+                            if let Some(low) = lo {
+                                viz_raster::band(low, vals, raster_table, &mut expected);
+                            }
+                        }
+                        GraphKind::Area => unreachable!(),
+                    }
+                    let resolved = Resolved::new(&palette, paint, ColorDepth::Truecolor);
+                    assert_eq!(text(&out), raster_text(&expected));
+                    assert_cell_styles(&out, &expected, &resolved);
+                }
+
+                let stacked_bands = [&[0.4, 0.4][..], &[0.4, 0.4][..]];
+                let stacked_roles = &[SeriesRole::CpuUser, SeriesRole::CpuSys];
+                paint_stacked(&mut out, &stacked_bands, stacked_roles, 2, 4, &palette);
+                let mut expected = viz_raster::CellBuf::new();
+                expected.reset(2, 4);
+                viz_raster::stacked(&stacked_bands, raster_table, &mut expected);
+                let stacked_resolved =
+                    Resolved::new(&palette, Paint::Bands(stacked_roles), ColorDepth::Truecolor);
+                assert_eq!(text(&out), raster_text(&expected));
+                assert_cell_styles(&out, &expected, &stacked_resolved);
+
+                let up = [0.8, 0.8];
+                let down = [0.2, 0.2];
+                let ramps = (RampId::Rx, RampId::Tx);
+                paint_mirrored(&mut out, &up, &down, 2, 4, ramps, &palette);
+                let mut expected = viz_raster::CellBuf::new();
+                expected.reset(2, 4);
+                viz_raster::mirrored(&up, &down, raster_table, &mut expected);
+                let up_resolved = Resolved::new(
+                    &palette,
+                    Paint::Ramp {
+                        id: ramps.0,
+                        warn: 0.7,
+                        crit: 0.9,
+                    },
+                    ColorDepth::Truecolor,
+                );
+                let down_resolved = Resolved::new(
+                    &palette,
+                    Paint::Ramp {
+                        id: ramps.1,
+                        warn: 0.7,
+                        crit: 0.9,
+                    },
+                    ColorDepth::Truecolor,
+                );
+                assert_eq!(text(&out), raster_text(&expected));
+                assert_cell_styles_rows(&out, &expected, &up_resolved, 0, 2);
+                assert_cell_styles_rows(&out, &expected, &down_resolved, 2, 4);
+
+                let heat_rows = [&[0.1, 0.8][..], &[0.6, 0.4][..]];
+                paint_heatmap(&mut out, &heat_rows, RampId::Heat, &palette);
+                let mut expected = viz_raster::CellBuf::new();
+                viz_raster::heatmap(&heat_rows, raster_table, &mut expected);
+                let heat_resolved = Resolved::new(
+                    &palette,
+                    Paint::Ramp {
+                        id: RampId::Heat,
+                        warn: 0.7,
+                        crit: 0.9,
+                    },
+                    ColorDepth::Truecolor,
+                );
+                assert_eq!(text(&out), raster_text(&expected));
+                assert_cell_styles(&out, &expected, &heat_resolved);
+
+                paint_spark(&mut out, &[0.1, 0.5, 0.8], 2, RampId::Mem, &palette);
+                let mut expected = viz_raster::CellBuf::new();
+                viz_raster::sparkline(&[0.5, 0.8], raster_table, &mut expected);
+                let spark_resolved = Resolved::new(
+                    &palette,
+                    Paint::Ramp {
+                        id: RampId::Mem,
+                        warn: 0.7,
+                        crit: 0.9,
+                    },
+                    ColorDepth::Truecolor,
+                );
+                assert_eq!(text(&out), raster_text(&expected));
+                assert_cell_styles(&out, &expected, &spark_resolved);
+
+                paint_spark(&mut out, &[0.8], 3, RampId::Mem, &palette);
+                assert_eq!(text(&out)[0].chars().count(), 3);
+                assert!(text(&out)[0].starts_with(' '));
+            });
         });
     }
+}
+
+fn raster_text(cells: &viz_raster::CellBuf) -> Vec<String> {
+    (0..cells.height())
+        .map(|row| cells.row(row).iter().map(|cell| cell.ch).collect())
+        .collect()
 }
 
 #[test]
@@ -152,16 +250,19 @@ fn color_depth_resolves_ramps_once_and_degrades_without_color() {
             let mut out = GraphOut::new();
             paint_graph(
                 &mut out,
-                GraphKind::Area,
-                &vals,
-                None,
-                vals.len(),
-                4,
-                Paint::Ramp {
-                    id: RampId::Util,
-                    warn: 0.4,
-                    crit: 0.8,
+                GraphPaint {
+                    kind: GraphKind::Area,
+                    vals: &vals,
+                    lo: None,
+                    w: vals.len(),
+                    h: 4,
+                    paint: Paint::Ramp {
+                        id: RampId::Util,
+                        warn: 0.4,
+                        crit: 0.8,
+                    },
                 },
+                &palette,
             );
             assert_eq!(resolution_count(), 1);
             assert!(!out.lines.is_empty());
@@ -245,7 +346,8 @@ fn stacked_boundary_uses_lower_foreground_and_upper_background_roles() {
         crate::caps::test_override::with_color(ColorDepth::Truecolor, || {
             let mut out = GraphOut::new();
             let roles = &[SeriesRole::CpuUser, SeriesRole::CpuSys];
-            paint_stacked(&mut out, &[&[0.45], &[0.45]], roles, 1, 4);
+            let palette = default_palette();
+            paint_stacked(&mut out, &[&[0.45], &[0.45]], roles, 1, 4, &palette);
             let boundary = out
                 .cells
                 .row(2)
@@ -262,13 +364,11 @@ fn stacked_boundary_uses_lower_foreground_and_upper_background_roles() {
             };
             assert_eq!(
                 run.fg,
-                Tok::Attr(chrome::theme_color(default_palette().series(roles[0])))
+                Tok::Attr(chrome::theme_color(palette.series(roles[0])))
             );
             assert_eq!(
                 run.bg,
-                Some(Tok::Attr(chrome::theme_color(
-                    default_palette().series(roles[1])
-                )))
+                Some(Tok::Attr(chrome::theme_color(palette.series(roles[1]))))
             );
         });
     });
@@ -279,8 +379,16 @@ fn mirrored_halves_resolve_through_their_own_ramps() {
     crate::caps::test_override::with_unicode(UnicodeLevel::Full, || {
         crate::caps::test_override::with_color(ColorDepth::Truecolor, || {
             let mut out = GraphOut::new();
-            paint_mirrored(&mut out, &[1.0], &[1.0], 1, 4, RampId::Rx, RampId::Tx);
             let palette = default_palette();
+            paint_mirrored(
+                &mut out,
+                &[1.0],
+                &[1.0],
+                1,
+                4,
+                (RampId::Rx, RampId::Tx),
+                &palette,
+            );
             let up = Resolved::new(
                 &palette,
                 Paint::Ramp {
@@ -311,6 +419,70 @@ fn mirrored_halves_resolve_through_their_own_ramps() {
             assert_eq!(lower, Tok::Attr(down.levels[7].fg));
         });
     });
+}
+
+#[test]
+fn heatmap_half_block_uses_upper_foreground_and_lower_background() {
+    let palette = default_palette();
+    let rows = [&[0.2][..], &[0.8][..]];
+    crate::caps::test_override::with_unicode(UnicodeLevel::Full, || {
+        crate::caps::test_override::with_color(ColorDepth::Truecolor, || {
+            let mut out = GraphOut::new();
+            paint_heatmap(&mut out, &rows, RampId::Heat, &palette);
+            let upper = (0.2_f32 * 7.0).round() as usize;
+            let lower = (0.8_f32 * 7.0).round() as usize;
+            let Line::Segs(runs) = &out.lines[0] else {
+                panic!("expected heatmap row")
+            };
+            assert_eq!(runs.len(), 1);
+            assert_eq!(
+                runs[0].fg,
+                Tok::Attr(chrome::theme_color(&palette.ramp(RampId::Heat)[upper]))
+            );
+            assert_eq!(
+                runs[0].bg,
+                Some(Tok::Attr(chrome::theme_color(
+                    &palette.ramp(RampId::Heat)[lower]
+                )))
+            );
+        });
+    });
+    crate::caps::test_override::with_unicode(UnicodeLevel::Ascii, || {
+        let mut out = GraphOut::new();
+        paint_heatmap(&mut out, &rows, RampId::Heat, &palette);
+        assert_eq!(out.lines.len(), rows.len());
+        assert!(out.lines.iter().all(|line| match line {
+            Line::Segs(runs) => runs.len() == 1,
+            _ => false,
+        }));
+    });
+}
+
+#[test]
+fn stacked_out_of_range_band_index_falls_back_to_dim() {
+    let palette = default_palette();
+    static ROLES: &[SeriesRole] = &[
+        SeriesRole::CpuUser,
+        SeriesRole::CpuNice,
+        SeriesRole::CpuSys,
+        SeriesRole::CpuIrq,
+        SeriesRole::CpuIowait,
+        SeriesRole::CpuSteal,
+        SeriesRole::CpuGuest,
+        SeriesRole::Cat5,
+    ];
+    assert_ne!(
+        chrome::theme_color(palette.series(ROLES[7])),
+        chrome::theme_color(&palette.dim)
+    );
+    let resolved = Resolved::new(&palette, Paint::Bands(ROLES), ColorDepth::Truecolor);
+    let style = resolved.cell(viz_raster::RCell {
+        ch: 'x',
+        fg: 8,
+        bg: Some(9),
+    });
+    assert_eq!(style.fg, chrome::theme_color(&palette.dim));
+    assert_eq!(style.bg, Some(chrome::theme_color(&palette.dim)));
 }
 
 #[test]
