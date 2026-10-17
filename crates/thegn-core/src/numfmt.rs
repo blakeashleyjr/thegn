@@ -257,9 +257,10 @@ fn nonzero_or_overflow(rendered: String, unit: Unit, width: usize) -> String {
     }
     let trimmed = rendered.trim();
     let mantissa = trimmed.trim_end_matches(|ch: char| !(ch.is_ascii_digit() || ch == '.'));
-    match mantissa.parse::<f64>() {
-        Ok(number) if number == 0.0 => "#".repeat(width),
-        _ => rendered,
+    if mantissa.parse::<f64>().is_ok_and(|number| number == 0.0) {
+        "#".repeat(width)
+    } else {
+        rendered
     }
 }
 
