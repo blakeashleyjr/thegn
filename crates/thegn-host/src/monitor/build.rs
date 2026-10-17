@@ -128,7 +128,7 @@ pub(super) fn tab(input: TabInput) -> TabBuild {
     }
 }
 
-/// Worktree-usage rows for the Disk tab. Read from the
+/// Build the Disk tab's worktree-usage rows from the sidebar's `worktree_disk`
 /// cache — sorted by total size (biggest first), with the measurement age. Pure:
 /// no filesystem walk, so opening the tab never triggers a `du`.
 pub(super) fn worktree_disk_rows(model: &FrameModel, now_secs: u64) -> Vec<DiskWtRow> {
