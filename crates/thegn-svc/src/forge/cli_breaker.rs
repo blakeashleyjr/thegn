@@ -384,9 +384,7 @@ mod tests {
         }
         let opened = circuit.active_error().is_some();
         let count = inner.polls.load(Ordering::Relaxed);
-        let held_errors = (0..10)
-            .map(|_| breaker.pr_status(&loc, PrRef::Current).is_err())
-            .all(|held| held);
+        let held_errors = (0..10).all(|_| breaker.pr_status(&loc, PrRef::Current).is_err());
         let held_count = inner.polls.load(Ordering::Relaxed);
         let held_failures = circuit.failure_count();
         circuit.record_success();
