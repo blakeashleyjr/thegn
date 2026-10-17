@@ -38,6 +38,7 @@ use thegn_metrics::StatsSnapshot;
 mod build;
 mod footer;
 mod invalidation;
+mod layout;
 pub(crate) mod procs_view;
 pub(crate) mod state;
 mod tabbar;
