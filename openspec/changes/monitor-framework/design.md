@@ -11,20 +11,49 @@ base `StatsSnapshot` is not widened to carry deep-monitor data. Published
 frames use a three-frame pool and latest-wins delivery; a worker pulses the
 `TerminalWaker` at most once for each published frame.
 
-Shared readers keep their current owners: the base stats path supplies the
-masthead; monitor collection owns deep metric snapshots; process sampling stays
-with the process worker; container inventory remains with its backend refresh;
-and UDisks2 remains the disk-volume source. The monitor composes these sources
-without moving blocking reads onto the event loop.
+The deep sampler owns registered collectors. Three existing sources remain
+outside it and enter monitor frames through
+`post_external(CollectorId, Part)`: the parked process worker, container
+inventory from its hydrate refresh, and UDisks2 SMART data from the host async
+runtime. This seam lets the board compose those readings without moving
+blocking work onto the event loop.
 
 ## Module layout
 
-The framework separates lifecycle and frame publication from panel layout and
-rendering. Sampling policy and bounded series storage live below the host
-compositor; the host monitor owns the board, panel selection, tab state, and
-frame painting. Tab-specific builders and interactions remain in their tab
-modules. Shared readers remain behind their existing metrics and platform
-interfaces.
+The metrics collector tree is
+`thegn-metrics/src/collect/{parse,model,policy,linux,macos,windows}`. Pure
+parsers, models, and policy live in their named subtrees; platform readers live
+under the platform subtrees. The only platform `cfg` declarations are the
+`mod` lines in `collect/mod.rs`, which is the single platform-cfg ratchet pin.
+Process `procs_parse.rs` and `procs_model.rs` are flat siblings of `procs.rs`.
+
+The host monitor owns `monitor/{layout,board,kit,tabs}`: the solver, board
+integration, shared widgets, and mechanically separated tab modules. The core
+owns `numfmt.rs`, `viz_raster.rs`, and `series_store.rs` for numeric formatting,
+graph rasterization, and bounded history.
+
+## Shared-reader ownership
+
+Locations are relative to `thegn-metrics/src/collect/` unless stated otherwise.
+
+| Reader                                      | Owning lane      | Location                                                           |
+| ------------------------------------------- | ---------------- | ------------------------------------------------------------------ |
+| PSI parser and system reader                | F3b              | `parse/psi.rs`, `linux/psi.rs`                                     |
+| `/proc/stat`                                | CPU, SR-1        | `parse/stat.rs`, `linux/cpu_stat.rs`                               |
+| cpufreq and CPU policy                      | CPU, SR-2        | `linux/cpufreq.rs` (absorbs P0-03 interim reader)                  |
+| hwmon                                       | Thermal, SR-3    | `linux/hwmon.rs`, `policy/hwmon_group.rs`                          |
+| cgroup reader and classification            | Containers, SR-4 | `parse/cgroup.rs`, `linux/cgroup*.rs`, `policy/cgroup_classify.rs` |
+| amdgpu `gpu_metrics` decoder and SMU reader | GPU, SR-5        | `parse/amd_gpu_metrics.rs`, `linux/amd_smu.rs`                     |
+| Process parsing and model                   | Processes, SR-6  | `procs_parse.rs`, `procs_model.rs`, alongside `procs.rs`           |
+| meminfo and vmstat                          | Memory, M-1      | `parse/{meminfo,vmstat}.rs`, `linux/{meminfo,vmstat}.rs`           |
+| `/proc/net/dev`                             | Network, N-1     | `parse/netdev.rs`, `linux/netdev.rs`                               |
+| diskstats and mountinfo                     | Disk, D-1        | `parse/{diskstats,mountinfo}.rs`, `linux/diskstats.rs`             |
+| powercap                                    | Power, T-3       | `linux/powercap.rs`                                                |
+| numeric formatting                          | Framework, F1a   | `thegn-core/src/numfmt.rs`                                         |
+
+Memory's interim `proc_mem.rs` reader is dropped; process memory detail is
+owned by the process lane. The interim P0-03 cpufreq reader is absorbed by
+SR-2. These owners provide each shared read once for all consuming panels.
 
 ## Keys and presentation
 

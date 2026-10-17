@@ -10,11 +10,10 @@ contexts: [overlay:monitor]
 
 A tabbed, live view of what this machine is doing: CPU, memory, temperature,
 network, disk, GPU, power, processes, containers, and notifications.
-`Ctrl-Alt-Shift-M` opens it (the
-capital `M` in the binding is the Shift — `Ctrl-Alt-m` is the notification-mode
-cycle), or run **System monitor** from the command palette. Pressing the same
-chord again closes it, and `Ctrl-g` still toggles the key lock rather than
-dismissing the monitor.
+`Ctrl-Alt-Shift-M` opens it (the capital `M` in the binding is the Shift —
+`Ctrl-Alt-m` is the notification-mode cycle), or run **System monitor** from
+the command palette. Pressing the same chord again closes it. `Ctrl-g` still
+toggles the key lock rather than dismissing the monitor.
 
 You can also get here from the masthead. Focus the top bar with `Ctrl-↑`, walk
 to a stat chip with `←`/`→`, and press `↵` — that opens the chip's own popup;
@@ -34,9 +33,8 @@ rather than clipping the tab you are on.
 Tabs only appear when their source is available — no battery means no Power
 tab, and the GPU tab appears when a GPU reports utilisation. AMD cards and APUs
 use sysfs, NVIDIA uses `nvidia-smi`, and Apple silicon uses its system GPU
-reader. A metric that disappears while
-you are looking at it (an unplugged battery, an unmounted disk) moves you to a
-tab that still has something to show.
+reader. A metric that disappears while you are looking at it (an unplugged
+battery, an unmounted disk) moves you to a tab that still has something to show.
 
 On **Apple silicon**, temperatures come from the machine's HID thermal sensors
 rather than the SMC keys that only exist on Intel Macs — so the temperature tab
@@ -91,14 +89,15 @@ and `spc` pause on every tab.
 
 The CPU tab shows total and per-core utilisation as a graph, with a heat grid
 for logical cores. Its load and clock section shows 1-, 5-, and 15-minute load,
-per-core frequency, temperature, and a load sparkline. The CPU masthead chip
-expands into this tab.
+per-core frequency, temperature, and a load sparkline. The CPU, load, frequency,
+and uptime masthead chips expand into this tab.
 
 ## Memory
 
 The Memory tab shows used, available, free when reported, and total memory; a
 swap graph appears when swap exists. It also reports thegn and daemon RSS and
-CPU, with an RSS sparkline. The Memory masthead chip expands into this tab.
+CPU, with an RSS sparkline. The memory and swap masthead chips expand into this
+tab.
 
 ## Thermal
 

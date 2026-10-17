@@ -90,8 +90,9 @@ be widened for deep monitor data.
 
 ### Requirement: Monitor history is tiered and bounded
 
-The monitor SHALL keep T0 history at 600 one-second samples, T1 at 720 five-
-second mean/maximum buckets, and T2 at 1440 sixty-second mean/maximum buckets.
+The monitor SHALL keep T0 history at 600 one-second samples, T1 at 720
+five-second mean/maximum buckets, and T2 at 1440 sixty-second
+mean/maximum buckets.
 Class A, B, and C series MUST each have explicit caps under a compile-time
 8 MiB total budget. Pushes MUST allocate nothing. Skipped buckets SHALL be NaN
 gaps rather than zeroes, and history MUST NOT persist across restarts.
