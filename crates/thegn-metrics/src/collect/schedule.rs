@@ -143,7 +143,8 @@ mod tests {
         for mode in [Mode::Paused, Mode::Hidden, Mode::Closed] {
             assert!(due_set(mode, demand, &inputs, &phase, 3).is_empty());
         }
-        let open_singletons = (0..6)
+        // One full Every(5) period: each phase is due exactly once.
+        let open_singletons = (0..5)
             .map(|tick| due_set(Mode::Open, demand, &inputs, &phase, tick))
             .filter(|due| due.len() == 1)
             .collect::<Vec<_>>();
