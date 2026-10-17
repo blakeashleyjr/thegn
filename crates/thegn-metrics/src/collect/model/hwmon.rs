@@ -1,27 +1,32 @@
 //! Shared hwmon layout and readings for §2.3 monitor consumers.
 use std::sync::Arc;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum SensorKind {
     Temp,
     Fan,
-    Pwm,
     Power,
     Voltage,
     Current,
     Freq,
-    Energy,
 }
 impl SensorKind {
-    /// Multiplier converting the kernel attribute unit to the displayed unit.
-    pub const fn scale(self) -> f32 {
+    /// Divisor converting the kernel attribute unit to the displayed unit.
+    pub const fn divisor(self) -> f32 {
         match self {
-            Self::Temp | Self::Voltage | Self::Current => 0.001,
-            Self::Fan | Self::Pwm | Self::Energy => 1.0,
-            Self::Power => 0.000_001,
-            Self::Freq => 0.000_001,
+            Self::Temp | Self::Voltage | Self::Current => 1000.0,
+            Self::Fan => 1.0,
+            Self::Power => 1_000_000.0,
+            Self::Freq => 1_000_000.0,
         }
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SensorRole {
+    Input,
+    Target,
+    Average,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -97,6 +102,7 @@ pub struct HwmonSensor {
     pub chip: u16,
     pub kind: SensorKind,
     pub channel: u16,
+    pub role: SensorRole,
     pub label: Option<String>,
     pub thresholds: Thresholds,
     pub cost: CostClass,

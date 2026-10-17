@@ -1,5 +1,7 @@
 //! Shared Linux hwmon reader for the §2.3 CPU, GPU, thermal and detail consumers.
 //! `gpu_sysfs.rs` and `sample.rs` switch their existing hwmon temperature readers in G-2/T-4.
+//! Virtual chips use hwmon directory order as a final dedupe tie-breaker, so renumbering
+//! duplicate same-name virtual chips can change their `~N` suffixes.
 use std::fs::File;
 use std::io::{self, Read};
 use std::os::unix::fs::FileExt;
@@ -13,7 +15,7 @@ use crate::collect::{
     health::{Absent, Health},
     model::hwmon::{
         ChipGroup, CostClass, HwmonChip, HwmonLayout, HwmonPart, HwmonSensor, HwmonValue, Level,
-        Thresholds, ValueStatus,
+        SensorRole, Thresholds, ValueStatus,
     },
     policy::hwmon_group::{
         cost_for, group_for, level, parse_attr, parse_milli, plausible_input, plausible_threshold,
@@ -94,6 +96,14 @@ struct Slot<H> {
     sensor: HwmonSensor,
     handle: Option<H>,
     value: HwmonValue,
+    reopen_at: u64,
+    retrying: bool,
+}
+#[derive(Clone)]
+struct ChipIdentity {
+    dir: PathBuf,
+    name: String,
+    device: String,
 }
 
 pub struct HwmonCollector<F: HwmonFs = RealFs> {
@@ -106,7 +116,8 @@ pub struct HwmonCollector<F: HwmonFs = RealFs> {
     health: Health,
     generation: u64,
     held: usize,
-    needs_probe: bool,
+    probe_reads: u32,
+    inventory: Vec<ChipIdentity>,
 }
 impl HwmonCollector<RealFs> {
     pub fn new() -> Self {
@@ -130,7 +141,8 @@ impl<F: HwmonFs> HwmonCollector<F> {
             health: Health::Warming,
             generation: 0,
             held: 0,
-            needs_probe: false,
+            probe_reads: 0,
+            inventory: Vec::new(),
         }
     }
     pub fn held_fds(&self) -> usize {
@@ -138,6 +150,13 @@ impl<F: HwmonFs> HwmonCollector<F> {
     }
 
     fn probe(&mut self) -> Health {
+        self.probe_reads = 0;
+        let old = self
+            .slots
+            .drain(..)
+            .map(|slot| (slot.sensor.key.clone(), (slot.sensor, slot.value)))
+            .collect::<std::collections::HashMap<_, _>>();
+        self.held = 0;
         self.drop_slots();
         self.gates.clear();
         let class = self.root.join("class/hwmon");
@@ -155,12 +174,25 @@ impl<F: HwmonFs> HwmonCollector<F> {
             .canonical(&self.root)
             .unwrap_or_else(|_| self.root.clone());
         let mut chips = Vec::<ProbedChip>::new();
+        self.inventory.clear();
         for dir in dirs {
+            self.probe_reads = self.probe_reads.saturating_add(1);
             let name = match read_text(&mut self.fs, &dir.join("name")) {
                 Some(value) if !value.is_empty() => value,
                 _ => continue,
             };
             let Some(group) = group_for(&name) else {
+                let device = self
+                    .fs
+                    .canonical(&dir.join("device"))
+                    .ok()
+                    .and_then(|path| {
+                        path.strip_prefix(&canonical_root)
+                            .ok()
+                            .map(|rel| format!("/{}", rel.display()))
+                    })
+                    .unwrap_or_else(|| "virtual".to_owned());
+                self.inventory.push(ChipIdentity { dir, name, device });
                 continue;
             };
             let device_path = dir.join("device");
@@ -170,13 +202,17 @@ impl<F: HwmonFs> HwmonCollector<F> {
                 .and_then(|path| path.strip_prefix(&canonical_root).ok())
                 .map(|p| format!("/{}", p.display()))
                 .unwrap_or_else(|| "virtual".to_owned());
+            self.inventory.push(ChipIdentity {
+                dir: dir.clone(),
+                name: name.clone(),
+                device: device.clone(),
+            });
             let runtime_path = dir.join("device/power/runtime_status");
             let state_path = (name == "drivetemp").then(|| dir.join("device/state"));
-            let status = match read_text(&mut self.fs, &runtime_path) {
-                Some(value) => value,
-                None => String::new(),
-            };
+            self.probe_reads = self.probe_reads.saturating_add(1);
+            let status = read_text(&mut self.fs, &runtime_path).unwrap_or_default();
             let scsi_state = state_path.as_ref().map(|path| {
+                self.probe_reads = self.probe_reads.saturating_add(1);
                 let mut bytes = Vec::with_capacity(32);
                 if let Some(value) = read_text(&mut self.fs, path) {
                     bytes.extend_from_slice(value.as_bytes());
@@ -226,8 +262,8 @@ impl<F: HwmonFs> HwmonCollector<F> {
                     .state_path
                     .as_ref()
                     .map(|_| chip.dir.join("device/state")),
-                status: chip.status.clone(),
-                scsi_state: chip.state.clone(),
+                status: bounded_bytes(&chip.status),
+                scsi_state: chip.state.as_deref().map(bounded_bytes),
                 gated,
                 can_wake: chip.can_wake,
             });
@@ -243,7 +279,6 @@ impl<F: HwmonFs> HwmonCollector<F> {
                     let attr = path.file_name()?.to_str()?;
                     let (kind, channel, suffix) = parse_attr(attr)?;
                     let dynamic = match kind {
-                        crate::collect::model::hwmon::SensorKind::Pwm => suffix.is_empty(),
                         crate::collect::model::hwmon::SensorKind::Fan => {
                             suffix == "_input" || suffix == "_target"
                         }
@@ -252,38 +287,67 @@ impl<F: HwmonFs> HwmonCollector<F> {
                         }
                         _ => suffix == "_input",
                     };
-                    dynamic.then_some((kind, channel, suffix, path.clone()))
+                    let role = match suffix {
+                        "_target" => SensorRole::Target,
+                        "_average" => SensorRole::Average,
+                        _ => SensorRole::Input,
+                    };
+                    dynamic.then_some((kind, channel, suffix, role, path.clone()))
                 })
                 .collect::<Vec<_>>();
-            candidates.sort_by(|a, b| a.1.cmp(&b.1).then_with(|| a.2.cmp(b.2)));
+            candidates.sort_by(|a, b| {
+                sensor_kind_index(a.0)
+                    .cmp(&sensor_kind_index(b.0))
+                    .then_with(|| a.1.cmp(&b.1))
+                    .then_with(|| a.2.cmp(b.2))
+            });
             let mut seen_channels =
                 Vec::<(crate::collect::model::hwmon::SensorKind, u16, &'static str)>::new();
-            for (kind, channel, suffix, path) in candidates {
+            let mut metadata = std::collections::HashMap::new();
+            for (kind, channel, suffix, role, path) in candidates {
                 let selector = match kind {
                     crate::collect::model::hwmon::SensorKind::Power => "_average",
-                    crate::collect::model::hwmon::SensorKind::Fan => "_input",
                     _ => "",
                 };
-                if suffix != selector
+                if !matches!(role, SensorRole::Target)
+                    && suffix != selector
                     && seen_channels
                         .iter()
                         .any(|(k, c, s)| *k == kind && *c == channel && *s == selector)
                 {
                     continue;
                 }
-                if !selector.is_empty() {
+                if !selector.is_empty() && !matches!(role, SensorRole::Target) {
                     seen_channels.push((kind, channel, selector));
                 }
                 let key = stable_key(&chip.name, Some(&chip.device), kind, channel);
+                let key = if role == SensorRole::Target {
+                    format!("{key}_target")
+                } else {
+                    key
+                };
                 let unique = dedupe_key(key, &mut occupied);
                 let label_path = chip.dir.join(format!("{}{channel}_label", prefix(kind)));
-                let label = read_text(&mut self.fs, &label_path);
-                let thresholds = read_thresholds(&mut self.fs, &chip.dir, kind, channel);
+                let previous = old.get(&unique);
+                let (label, thresholds) = if let Some((sensor, _)) = previous {
+                    (sensor.label.clone(), sensor.thresholds)
+                } else if let Some(cached) = metadata.get(&(kind, channel)) {
+                    cached.clone()
+                } else {
+                    self.probe_reads = self.probe_reads.saturating_add(7);
+                    let value = (
+                        read_text(&mut self.fs, &label_path),
+                        read_thresholds(&mut self.fs, &chip.dir, kind, channel),
+                    );
+                    metadata.insert((kind, channel), value.clone());
+                    value
+                };
                 let sensor = HwmonSensor {
                     key: unique,
                     chip: chip_index,
                     kind,
                     channel,
+                    role,
                     label,
                     thresholds,
                     cost: cost_for(&chip.name),
@@ -304,13 +368,14 @@ impl<F: HwmonFs> HwmonCollector<F> {
                     path,
                     sensor,
                     handle,
-                    value: HwmonValue::default(),
+                    value: previous.map_or_else(HwmonValue::default, |(_, value)| *value),
+                    reopen_at: 0,
+                    retrying: false,
                 });
             }
         }
         self.generation = layout.generation;
         self.layout = Some(Arc::new(layout));
-        self.needs_probe = false;
         self.health = if self.gates.is_empty() {
             Health::Absent(Absent::NoHardware)
         } else {
@@ -322,6 +387,73 @@ impl<F: HwmonFs> HwmonCollector<F> {
     fn drop_slots(&mut self) {
         self.slots.clear();
         self.held = 0;
+    }
+
+    fn refresh_if_changed(&mut self) -> usize {
+        let Ok(dirs) = self.fs.list(&self.root.join("class/hwmon")) else {
+            return 0;
+        };
+        let canonical_root = self
+            .fs
+            .canonical(&self.root)
+            .unwrap_or_else(|_| self.root.clone());
+        let mut current = Vec::new();
+        let mut inventory = Vec::new();
+        let mut reads = 0;
+        for dir in dirs {
+            let device = self
+                .fs
+                .canonical(&dir.join("device"))
+                .ok()
+                .and_then(|path| {
+                    path.strip_prefix(&canonical_root)
+                        .ok()
+                        .map(|rel| format!("/{}", rel.display()))
+                })
+                .unwrap_or_else(|| "virtual".to_owned());
+            let name = if device != "virtual"
+                && let Some(previous) = self
+                    .inventory
+                    .iter()
+                    .find(|entry| entry.dir == dir && entry.device == device)
+            {
+                previous.name.clone()
+            } else {
+                reads += 1;
+                let Some(name) = read_text(&mut self.fs, &dir.join("name")) else {
+                    continue;
+                };
+                name
+            };
+            inventory.push(ChipIdentity {
+                dir,
+                name: name.clone(),
+                device: device.clone(),
+            });
+            if group_for(&name).is_none() {
+                continue;
+            }
+            current.push((name, device));
+        }
+        self.inventory = inventory;
+        current.sort();
+        let mut previous = self
+            .layout
+            .as_ref()
+            .map(|layout| {
+                layout
+                    .chips
+                    .iter()
+                    .map(|chip| (chip.name.clone(), chip.device.clone()))
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        previous.sort();
+        if current != previous {
+            self.probe();
+            reads += self.probe_reads as usize;
+        }
+        reads
     }
 }
 
@@ -336,16 +468,16 @@ impl<F: HwmonFs> Collector for HwmonCollector<F> {
         self.probe()
     }
     fn sample(&mut self, ctx: &TickCtx, frame: &mut MonitorFrame) -> Result<(), CollectError> {
-        if self.layout.is_none()
-            || self.needs_probe
-            || (ctx.tick > 0 && ctx.tick.is_multiple_of(30_u64))
-        {
-            self.probe();
-        }
         let mut reads = 0_u32;
+        if self.layout.is_none() {
+            self.probe();
+            reads = reads.saturating_add(self.probe_reads);
+        } else if ctx.tick > 0 && ctx.tick.is_multiple_of(30_u64) {
+            reads = reads.saturating_add(self.refresh_if_changed() as u32);
+        }
         let mut woke = false;
-        for gate in &mut self.gates {
-            if gate.gated && gate.can_wake {
+        for (chip_index, gate) in self.gates.iter_mut().enumerate() {
+            if gate.can_wake {
                 let mut buf = [0_u8; 32];
                 let status = self.fs.read_small(&gate.path, &mut buf);
                 reads = reads.saturating_add(1);
@@ -363,15 +495,37 @@ impl<F: HwmonFs> Collector for HwmonCollector<F> {
                         state_bytes.extend_from_slice(&buf[..length]);
                     }
                 }
+                let was_gated = gate.gated;
                 gate.gated = wake_gate(&gate.status, gate.scsi_state.as_deref());
-                woke |= !gate.gated;
+                woke |= was_gated && !gate.gated;
+                if was_gated != gate.gated {
+                    if let Some(layout) = &mut self.layout
+                        && let Some(chip) = Arc::make_mut(layout).chips.get_mut(chip_index)
+                    {
+                        chip.gated = gate.gated;
+                    }
+                    for slot in self
+                        .slots
+                        .iter_mut()
+                        .filter(|slot| usize::from(slot.sensor.chip) == chip_index)
+                    {
+                        if gate.gated {
+                            if slot.handle.take().is_some() {
+                                self.held = self.held.saturating_sub(1);
+                            }
+                            slot.value.status = ValueStatus::Gated;
+                        } else {
+                            slot.handle = None;
+                            slot.reopen_at = ctx.tick;
+                            slot.retrying = false;
+                        }
+                    }
+                }
             }
         }
         if woke {
-            self.needs_probe = true;
-        }
-        if self.needs_probe {
             self.probe();
+            reads = reads.saturating_add(self.probe_reads);
         }
         for (index, slot) in self.slots.iter_mut().enumerate() {
             if self
@@ -387,6 +541,22 @@ impl<F: HwmonFs> Collector for HwmonCollector<F> {
                 continue;
             }
             let mut buf = [0_u8; 32];
+            if slot.retrying {
+                if ctx.tick < slot.reopen_at {
+                    continue;
+                }
+                if slot.sensor.cost == CostClass::VerySlow || self.held >= self.fd_cap {
+                    slot.retrying = false;
+                } else if let Ok(handle) = self.fs.open(&slot.path) {
+                    slot.handle = Some(handle);
+                    self.held += 1;
+                    slot.retrying = false;
+                } else {
+                    slot.reopen_at = ctx.tick.saturating_add(30);
+                    slot.value.status = ValueStatus::Error;
+                    continue;
+                }
+            }
             let result = match &slot.handle {
                 Some(handle) => self.fs.pread(handle, &mut buf),
                 None => self.fs.read_small(&slot.path, &mut buf),
@@ -418,7 +588,11 @@ impl<F: HwmonFs> Collector for HwmonCollector<F> {
                     if matches!(error.kind(), io::ErrorKind::NotFound)
                         || matches!(error.raw_os_error(), Some(code) if code == libc::ENODEV || code == libc::ESTALE)
                     {
-                        self.needs_probe = true;
+                        if slot.handle.take().is_some() {
+                            self.held = self.held.saturating_sub(1);
+                        }
+                        slot.reopen_at = ctx.tick.saturating_add(30);
+                        slot.retrying = true;
                     }
                 }
             }
@@ -441,7 +615,6 @@ impl<F: HwmonFs> Collector for HwmonCollector<F> {
         self.drop_slots();
         self.gates.clear();
         self.layout = None;
-        self.needs_probe = false;
     }
 }
 
@@ -459,12 +632,10 @@ fn prefix(kind: crate::collect::model::hwmon::SensorKind) -> &'static str {
     match kind {
         crate::collect::model::hwmon::SensorKind::Temp => "temp",
         crate::collect::model::hwmon::SensorKind::Fan => "fan",
-        crate::collect::model::hwmon::SensorKind::Pwm => "pwm",
         crate::collect::model::hwmon::SensorKind::Power => "power",
         crate::collect::model::hwmon::SensorKind::Voltage => "in",
         crate::collect::model::hwmon::SensorKind::Current => "curr",
         crate::collect::model::hwmon::SensorKind::Freq => "freq",
-        crate::collect::model::hwmon::SensorKind::Energy => "energy",
     }
 }
 fn group_index(group: ChipGroup) -> usize {
@@ -478,6 +649,17 @@ fn group_index(group: ChipGroup) -> usize {
         ChipGroup::BoardEc => 6,
         ChipGroup::Wifi => 7,
         ChipGroup::Other => 8,
+    }
+}
+fn sensor_kind_index(kind: crate::collect::model::hwmon::SensorKind) -> u8 {
+    use crate::collect::model::hwmon::SensorKind;
+    match kind {
+        SensorKind::Temp => 0,
+        SensorKind::Fan => 1,
+        SensorKind::Power => 2,
+        SensorKind::Voltage => 3,
+        SensorKind::Current => 4,
+        SensorKind::Freq => 5,
     }
 }
 fn dedupe_key(key: String, used: &mut Vec<String>) -> String {
@@ -785,12 +967,15 @@ mod tests {
                 .level
                     == Level::OverMax)
         );
-        assert!(
-            layout
-                .sensors
-                .iter()
-                .any(|sensor| sensor.key.contains("#fan1~2"))
-        );
+        let fan_target = layout
+            .sensors
+            .iter()
+            .position(|sensor| {
+                sensor.key.ends_with("#fan1_target")
+                    && sensor.role == crate::collect::model::hwmon::SensorRole::Target
+            })
+            .unwrap();
+        assert_eq!(frame.parts.hwmon.values[fan_target].value, Some(1400.0));
     }
 
     #[test]
@@ -869,7 +1054,7 @@ mod tests {
         collector.discover(&Env::default());
         let mut frame = MonitorFrame::default();
         let mut seen_fresh = Vec::new();
-        for tick in 0_u64..30 {
+        for tick in 0_u64..=30 {
             collector.fs.trace.0.lock().unwrap().clear();
             collector
                 .sample(&TickCtx { tick, now_ms: tick }, &mut frame)
@@ -881,6 +1066,18 @@ mod tests {
             }
             for (seen, value) in seen_fresh.iter_mut().zip(&frame.parts.hwmon.values) {
                 *seen |= value.status != ValueStatus::Carried;
+            }
+            if tick == 30 {
+                let layout = frame.parts.hwmon.layout.as_ref().unwrap();
+                assert_eq!(layout.generation, 1);
+                assert!(
+                    layout
+                        .sensors
+                        .iter()
+                        .zip(&frame.parts.hwmon.values)
+                        .any(|(sensor, value)| sensor.key.ends_with("#temp1")
+                            && value.value == Some(51.0))
+                );
             }
         }
         assert!(seen_fresh.iter().all(|seen| *seen));
@@ -908,10 +1105,34 @@ mod tests {
             }
         }
         collector.fs.fail_path = Some(root.join("class/hwmon/hwmon0/temp1_input"));
+        let generation = frame.parts.hwmon.layout.as_ref().unwrap().generation;
         collector.sample(&TickCtx::default(), &mut frame).unwrap();
         assert_eq!(frame.parts.hwmon.values[0].status, ValueStatus::Error);
+        assert_eq!(
+            frame.parts.hwmon.layout.as_ref().unwrap().generation,
+            generation
+        );
         for value in frame.parts.hwmon.values.iter().skip(1) {
             assert_ne!(value.status, ValueStatus::Error);
+        }
+        collector.fs.trace.0.lock().unwrap().clear();
+        for tick in 1_u64..30 {
+            collector
+                .sample(&TickCtx { tick, now_ms: tick }, &mut frame)
+                .unwrap();
+            assert_eq!(
+                frame.parts.hwmon.layout.as_ref().unwrap().generation,
+                generation
+            );
+            assert!(
+                !collector
+                    .fs
+                    .trace
+                    .0
+                    .lock()
+                    .unwrap()
+                    .contains(&root.join("class/hwmon/hwmon0/name"))
+            );
         }
         collector.close();
         assert_eq!(collector.held_fds(), 0);
@@ -928,7 +1149,7 @@ mod tests {
             let mut collector = collector(&root, trace.clone());
             collector.discover(&Env::default());
             let mut frame = MonitorFrame::default();
-            for tick in 0_u64..30 {
+            for tick in 0_u64..7 {
                 collector
                     .sample(&TickCtx { tick, now_ms: tick }, &mut frame)
                     .unwrap();
@@ -959,16 +1180,38 @@ mod tests {
             fs::write(gate_runtime, "active").unwrap();
             fs::write(gate_state, wake_state).unwrap();
             collector
-                .sample(
-                    &TickCtx {
-                        tick: 30,
-                        now_ms: 30,
-                    },
-                    &mut frame,
-                )
+                .sample(&TickCtx { tick: 7, now_ms: 7 }, &mut frame)
                 .unwrap();
             assert_eq!(frame.parts.hwmon.values.len(), 1);
-            assert_eq!(frame.parts.hwmon.values[0].status, ValueStatus::Fresh);
+            assert_eq!(frame.parts.hwmon.values[0].status, ValueStatus::Carried);
+        }
+    }
+
+    #[test]
+    fn active_chip_that_suspends_is_gated_each_sample() {
+        let (_temp, root) = drivetemp_fixture("active", "running");
+        let trace = Trace::default();
+        let mut collector = collector(&root, trace.clone());
+        collector.discover(&Env::default());
+        let mut frame = MonitorFrame::default();
+        collector
+            .sample(&TickCtx { tick: 0, now_ms: 0 }, &mut frame)
+            .unwrap();
+        let hwmon = root.join("class/hwmon/hwmon0");
+        let attr = hwmon.join("temp1_input");
+        let runtime = hwmon.join("device/power/runtime_status");
+        trace.0.lock().unwrap().clear();
+        for tick in 1_u64..=30 {
+            if tick == 3 {
+                fs::write(&runtime, "suspended").unwrap();
+            }
+            collector
+                .sample(&TickCtx { tick, now_ms: tick }, &mut frame)
+                .unwrap();
+            if tick >= 3 {
+                assert_eq!(frame.parts.hwmon.values[0].status, ValueStatus::Gated);
+                assert!(!trace.0.lock().unwrap().iter().any(|path| path == &attr));
+            }
         }
     }
 }
