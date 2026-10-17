@@ -12,6 +12,7 @@
 //! [`StatsSampler::sample`], preserving thegn's ~0%-idle invariant.
 
 mod battery;
+pub mod collect;
 mod coverage;
 mod cpu_freq;
 mod disk_aggregate;
