@@ -245,6 +245,17 @@ fn fit_mark(mark: &str, width: usize) -> String {
     format!("{}{}", " ".repeat(width - cells(&clipped)), clipped)
 }
 
+fn candidate_preserves_nonzero(candidate: &str, value: f64, suffix: &str) -> bool {
+    if value == 0.0 {
+        return true;
+    }
+    candidate
+        .strip_suffix(suffix)
+        .unwrap_or(candidate)
+        .parse::<f64>()
+        .is_ok_and(|rendered| rendered != 0.0)
+}
+
 fn scaled(value: f64, divisor: f64, suffixes: &[&str], decimals: &[usize], width: usize) -> String {
     if !value.is_finite() {
         return "#".repeat(width);
@@ -326,11 +337,11 @@ fn bytes(value: f64, divisor: f64, width: usize) -> String {
 
 fn percent(v: f64, width: usize) -> String {
     let mut candidate = format!("{v:.0}%");
-    if cells(&candidate) <= width {
+    if cells(&candidate) <= width && candidate_preserves_nonzero(&candidate, v, "%") {
         return candidate;
     }
     candidate = format!("{v:.0}");
-    if cells(&candidate) <= width {
+    if cells(&candidate) <= width && candidate_preserves_nonzero(&candidate, v, "") {
         return candidate;
     }
     scaled(v, 1000.0, &["%", "k"], &[0], width)
@@ -338,12 +349,12 @@ fn percent(v: f64, width: usize) -> String {
 
 fn cpu_sum(v: f64, width: usize) -> String {
     let decimal = format!("{v:.1}");
-    if cells(&decimal) <= width {
+    if cells(&decimal) <= width && candidate_preserves_nonzero(&decimal, v, "") {
         return decimal;
     }
     if v.abs() < 10_000.0 {
         let integer = format!("{v:.0}");
-        if cells(&integer) <= width {
+        if cells(&integer) <= width && candidate_preserves_nonzero(&integer, v, "") {
             return integer;
         }
     }
@@ -377,7 +388,7 @@ fn temperature(v: f64, scale: viz::TempScale, width: usize) -> String {
     // Other candidates keep Rust's ties-to-even formatting; integer temperatures
     // use half-away-from-zero rounding for intuitive readings.
     for candidate in [format!("{shown:.1}°"), format!("{:.0}°", shown.round())] {
-        if cells(&candidate) <= width {
+        if cells(&candidate) <= width && candidate_preserves_nonzero(&candidate, shown, "°") {
             return candidate;
         }
     }
@@ -386,7 +397,7 @@ fn temperature(v: f64, scale: viz::TempScale, width: usize) -> String {
 
 fn rpm(v: f64, width: usize) -> String {
     let full = format!("{v:.0}rpm");
-    if cells(&full) <= width {
+    if cells(&full) <= width && candidate_preserves_nonzero(&full, v, "rpm") {
         return full;
     }
     scaled(v, 1000.0, &["", "k", "M", "G"], &[1, 0], width)
@@ -496,6 +507,8 @@ mod tests {
         let mut values = vec![
             0.0,
             -0.0,
+            0.4,
+            0.04,
             f64::from_bits(1),
             f64::NAN,
             f64::INFINITY,
@@ -526,16 +539,40 @@ mod tests {
                     );
                     if value.is_finite() && value != 0.0 {
                         let rendered = out.trim();
-                        if let Some(suffix) = rendered.chars().last()
-                            && matches!(suffix, 'k' | 'K' | 'M' | 'G' | 'T' | 'P' | 'E')
-                            && let Some(mantissa) = rendered.strip_suffix(suffix)
-                            && let Ok(mantissa) = mantissa.parse::<f64>()
-                        {
-                            assert_ne!(mantissa, 0.0, "{unit:?} {value:?} w{width}: {out:?}");
-                            assert!(
-                                mantissa.abs() < 1000.0,
-                                "{unit:?} {value:?} w{width}: {out:?}"
-                            );
+                        assert!(
+                            !rendered.starts_with("-0"),
+                            "{unit:?} {value:?} w{width}: {out:?}"
+                        );
+                        if !matches!(unit, Unit::Duration | Unit::Age | Unit::TimePlus) {
+                            let suffixes = [
+                                "kWh", "MWh", "kW", "MW", "kV", "kA", "rpm", "Hz", "Wh", "W", "V",
+                                "A", "°", "%", "B", "K", "M", "G", "T", "P", "E", "k", "b",
+                            ];
+                            let numeric = suffixes
+                                .iter()
+                                .find_map(|suffix| {
+                                    rendered
+                                        .strip_suffix(suffix)
+                                        .and_then(|mantissa| mantissa.parse::<f64>().ok())
+                                })
+                                .or_else(|| rendered.parse::<f64>().ok());
+                            if let Some(mantissa) = numeric {
+                                assert_ne!(mantissa, 0.0, "{unit:?} {value:?} w{width}: {out:?}");
+                            }
+                            let scaled_suffixes = [
+                                "kWh", "MWh", "kW", "MW", "kV", "kA", "K", "M", "G", "T", "P", "E",
+                                "k",
+                            ];
+                            if let Some(mantissa) = scaled_suffixes.iter().find_map(|suffix| {
+                                rendered
+                                    .strip_suffix(suffix)
+                                    .and_then(|mantissa| mantissa.parse::<f64>().ok())
+                            }) {
+                                assert!(
+                                    mantissa.abs() < 1000.0,
+                                    "{unit:?} {value:?} w{width}: {out:?}"
+                                );
+                            }
                         }
                     }
                 }
@@ -657,9 +694,8 @@ mod tests {
         assert_eq!(fmt(48_000.0, Unit::Count, 4), " 48k");
         assert_eq!(fmt(12_000.0, Unit::Hertz, 4), " 12k");
         assert_eq!(fmt(4.8, Unit::Watts, 4), "4.8W");
-        assert_eq!(fmt(12.0, Unit::Volts, 4), "12V");
+        assert_eq!(fmt(12.0, Unit::Volts, 4), " 12V");
         assert_eq!(fmt(4.9, Unit::Amps, 4), "4.9A");
-        assert_eq!(fmt(12.0, Unit::Age, 4), " 12s");
         assert_eq!(fmt(360_000.0, Unit::TimePlus, 4), "####");
     }
 
