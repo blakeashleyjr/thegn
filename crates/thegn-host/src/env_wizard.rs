@@ -47,7 +47,8 @@ const KINDS: &[&str] = &[
 fn spawn_keyring_probe() -> std::sync::Arc<std::sync::atomic::AtomicU8> {
     let state = std::sync::Arc::new(std::sync::atomic::AtomicU8::new(0));
     let out = state.clone();
-    std::thread::spawn(move || {
+    thegn_core::thread_name::spawn_named("thegn-kr-probe", move || {
+        crate::platform::qos::set_self(crate::platform::qos::Qos::Utility); // Utility: open wizard hint probe.
         let v = if crate::secret::keyring_available() {
             1
         } else {

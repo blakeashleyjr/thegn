@@ -155,3 +155,78 @@ fn state_env_ratchet_tracks_direct_test_environment_writes() {
          testenv::IsolatedState and state_env_for so isolation works on every OS.",
     );
 }
+
+fn spawn_named_without_entry_qos(body: &str) -> Vec<usize> {
+    let code = thegn_core::test_support::ratchet::code_only(body);
+    let lines: Vec<&str> = code.lines().collect();
+    let production_end = lines
+        .windows(2)
+        .position(|pair| {
+            pair[0].trim() == "#[cfg(test)]" && pair[1].trim_start().starts_with("mod ")
+        })
+        .unwrap_or(lines.len());
+    lines[..production_end]
+        .iter()
+        .enumerate()
+        .filter_map(|(index, line)| {
+            if !line.contains("spawn_named(") {
+                return None;
+            }
+            let next = lines[index + 1..production_end]
+                .iter()
+                .find(|candidate| !candidate.trim().is_empty());
+            (!next.is_some_and(|candidate| candidate.contains("qos::set_self")))
+                .then_some(index + 1)
+        })
+        .collect()
+}
+
+#[test]
+fn qos_debt_threads_declare_on_entry() {
+    const FILES: &[&str] = &[
+        "cmd/attach.rs",
+        "env_ui.rs",
+        "env_wizard.rs",
+        "handlers/provision.rs",
+        "hibernator.rs",
+        "hook_run.rs",
+        "lifecycle.rs",
+        "placement_flow.rs",
+        "secret.rs",
+        "structural_diff.rs",
+    ];
+
+    for file in FILES {
+        let path = format!("{MANIFEST}/src/{file}");
+        let body = std::fs::read_to_string(path).expect("read production source file");
+        assert!(body.contains("spawn_named("), "{file} has no named thread");
+        assert_eq!(
+            spawn_named_without_entry_qos(&body),
+            [],
+            "{file} has a named thread without entry QoS"
+        );
+    }
+}
+
+#[test]
+fn spawn_named_entry_qos_predicate_tracks_the_next_statement() {
+    let cases = [
+        (
+            "spawn_named(\"thegn-x\", f);\nqos::set_self(Qos::Background);",
+            vec![],
+        ),
+        (
+            "spawn_named(\"thegn-x\", f);\nlet x = 1;\nqos::set_self(Qos::Background);",
+            vec![1],
+        ),
+        ("spawn_named(\"thegn-x\", f);", vec![1]),
+        (
+            "#[cfg(test)]\nmod tests {\nspawn_named(\"thegn-x\", f);\n}",
+            vec![],
+        ),
+    ];
+
+    for (source, expected) in cases {
+        assert_eq!(spawn_named_without_entry_qos(source), expected, "{source}");
+    }
+}

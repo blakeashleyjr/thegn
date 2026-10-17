@@ -5,13 +5,4 @@
 # SHRINK-ONLY. Enforced by `threads_are_named_ratchet` in
 # crates/thegn-host/src/platform_ratchet_tests.rs.
 # proc_workload_alloc.rs is compiled only through main.rs's cfg(test) module.
-cmd/attach.rs
-env_ui.rs
-env_wizard.rs
-handlers/provision.rs
-hibernator.rs
-hook_run.rs
-lifecycle.rs
-placement_flow.rs
-secret.rs
-structural_diff.rs
+# RATCHET-EMPTY

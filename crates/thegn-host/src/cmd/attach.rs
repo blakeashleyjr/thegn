@@ -96,7 +96,10 @@ async fn interactive(
     let (tty_tx, mut tty_rx) = tokio::sync::mpsc::channel::<FromTty>(256);
     let input_thread = {
         let done = done.clone();
-        std::thread::spawn(move || input_loop(term, tty_tx, done))
+        thegn_core::thread_name::spawn_named("thegn-attach-in", move || {
+            crate::platform::qos::set_self(crate::platform::qos::Qos::Interactive); // Interactive: attach keystrokes.
+            input_loop(term, tty_tx, done)
+        })
     };
 
     let mut out = std::io::stdout();

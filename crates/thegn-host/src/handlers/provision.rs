@@ -122,7 +122,8 @@ pub(crate) fn handle_sandbox_retry_choice(
         menu::MenuChoice::SandboxStartRuntime(name) => {
             let name = name.clone();
             *status = format!("Starting {name}…");
-            std::thread::spawn(move || {
+            thegn_core::thread_name::spawn_named("thegn-sbx-start", move || {
+                crate::platform::qos::set_self(crate::platform::qos::Qos::Utility); // Utility: user-requested runtime start.
                 let argv = thegn_core::sandbox_dormant::start_argv(
                     thegn_core::sandbox::Backend::parse(&name)
                         .unwrap_or(thegn_core::sandbox::Backend::None),
