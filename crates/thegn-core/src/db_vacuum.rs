@@ -1,14 +1,17 @@
 //! SQLite space inspection, bounded incremental reclamation, and conversion.
 
 use crate::db::Db;
+use crate::db_workspace::{ORPHAN_CACHE_SWEEP_MAX_KEYS, is_removed_root, registered_roots};
+use crate::issue::AgentDispatchStatus;
 use anyhow::{Result, anyhow};
-use rusqlite::{Error as SqlError, ErrorCode, params};
+use rusqlite::{Error as SqlError, ErrorCode, Transaction, TransactionBehavior, params};
 use serde::Serialize;
 use std::time::Duration;
 
 pub const NOTIFICATION_READ_RETENTION_SECS: i64 = 30 * 24 * 60 * 60;
 pub const INCREMENTAL_PAGES_PER_ROUND: u32 = 2048;
 pub const AUTO_CONVERT_MAX_LIVE_BYTES: u64 = 64 * 1024 * 1024;
+pub(crate) const DISPATCH_TERMINAL_RETENTION_SECS: i64 = 90 * 24 * 60 * 60;
 const MIN_RECLAIM_BYTES: u64 = 8 * 1024 * 1024;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
@@ -90,11 +93,105 @@ pub enum MaintenanceStep {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct MaintenanceReport {
     pub pruned_notifications: usize,
+    pub pruned_removed_notifications: usize,
+    pub pruned_issue_links: usize,
+    pub pruned_dispatches: usize,
     pub reclaimed_pages: u64,
     pub conversion: Option<ConvertOutcome>,
 }
 
 impl Db {
+    /// Prune read notifications and issue links for a bounded set of removed roots.
+    pub(crate) fn prune_removed_worktree_rows(&self, max_keys: usize) -> Result<(usize, usize)> {
+        if max_keys == 0 {
+            return Ok((0, 0));
+        }
+        let conn = self.conn();
+        let keys = {
+            let mut stmt = conn.prepare(
+                "SELECT DISTINCT worktree_path FROM (
+                   SELECT worktree_path FROM notifications WHERE read=1
+                   UNION SELECT worktree_path FROM issue_links
+                 ) WHERE worktree_path != '' ORDER BY worktree_path",
+            )?;
+            let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+            rows.collect::<rusqlite::Result<Vec<_>>>()?
+        };
+        let registered = registered_roots(&conn)?;
+        let removed: Vec<String> = keys
+            .into_iter()
+            .filter(|key| is_removed_root(&registered, key))
+            .take(max_keys.min(ORPHAN_CACHE_SWEEP_MAX_KEYS))
+            .collect();
+        let mut notifications = 0;
+        let mut issue_links = 0;
+        for key in removed {
+            let tx = Transaction::new_unchecked(&conn, TransactionBehavior::Immediate)?;
+            notifications += tx.execute(
+                "DELETE FROM notifications WHERE worktree_path=?1 AND read=1",
+                params![key],
+            )?;
+            issue_links += tx.execute(
+                "DELETE FROM issue_links WHERE worktree_path=?1",
+                params![key],
+            )?;
+            tx.commit()?;
+        }
+        Ok((notifications, issue_links))
+    }
+
+    /// Prune old terminal dispatch history while preserving rows still used by admission or supervision.
+    pub(crate) fn prune_terminal_dispatches(&self, now_ms: i64) -> Result<usize> {
+        let terminal_statuses = [
+            AgentDispatchStatus::Merged,
+            AgentDispatchStatus::Abandoned,
+            AgentDispatchStatus::Done,
+            AgentDispatchStatus::Failed,
+        ];
+        let statuses = terminal_statuses
+            .into_iter()
+            .filter(|status| status.is_terminal())
+            .map(|status| format!("'{}'", status.as_str()))
+            .collect::<Vec<_>>()
+            .join(",");
+        let cutoff = now_ms.saturating_sub(DISPATCH_TERMINAL_RETENTION_SECS.saturating_mul(1000));
+        let conn = self.conn();
+        let tx = Transaction::new_unchecked(&conn, TransactionBehavior::Immediate)?;
+        let ids = {
+            let query = format!(
+                "WITH eligible AS (
+                   SELECT d.id FROM agent_dispatches d
+                   WHERE d.status IN ({statuses}) AND d.task_kind IS NULL
+                     AND COALESCE(d.status_changed_at_ms,d.exited_at_ms,d.dispatched_at_ms) < ?1
+                     AND NOT EXISTS (SELECT 1 FROM worktrees w WHERE w.worktree=d.worktree_path)
+                     AND NOT EXISTS (SELECT 1 FROM autopilot_runs a WHERE a.dispatch_id=d.id
+                                     AND a.state NOT IN ('done','stopped'))
+                 )
+                 SELECT e.id FROM eligible e
+                 WHERE NOT EXISTS (
+                   SELECT 1 FROM agent_dispatches child
+                   WHERE child.parent_id=e.id AND child.id NOT IN (SELECT id FROM eligible)
+                 )"
+            );
+            let mut stmt = tx.prepare(&query)?;
+            let rows = stmt.query_map(params![cutoff], |row| row.get::<_, i64>(0))?;
+            rows.collect::<rusqlite::Result<Vec<_>>>()?
+        };
+        for id in &ids {
+            tx.execute(
+                "DELETE FROM agent_dispatch_notes WHERE dispatch_id=?1",
+                params![id],
+            )?;
+            tx.execute(
+                "DELETE FROM pipeline_validations WHERE dispatch_id=?1",
+                params![id],
+            )?;
+            tx.execute("DELETE FROM agent_dispatches WHERE id=?1", params![id])?;
+        }
+        tx.commit()?;
+        Ok(ids.len())
+    }
+
     /// Read the current SQLite page and auto-vacuum counters without writing.
     pub fn space(&self) -> Result<DbSpace> {
         let conn = self.conn();
@@ -168,8 +265,17 @@ impl Db {
                 params![cutoff],
             )
             .map_err(map_busy)?;
+        let (pruned_removed_notifications, pruned_issue_links) = self
+            .prune_removed_worktree_rows(ORPHAN_CACHE_SWEEP_MAX_KEYS)
+            .map_err(map_busy)?;
+        let pruned_dispatches = self
+            .prune_terminal_dispatches(now_secs.saturating_mul(1000))
+            .map_err(map_busy)?;
         let mut report = MaintenanceReport {
             pruned_notifications,
+            pruned_removed_notifications,
+            pruned_issue_links,
+            pruned_dispatches,
             reclaimed_pages: 0,
             conversion: None,
         };
@@ -258,6 +364,7 @@ pub fn plan_maintenance(space: &DbSpace, auto_attempts_left: u32) -> Maintenance
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::store::NotificationStore;
     use rusqlite::Connection;
 
     fn temp_db() -> (tempfile::TempDir, Db) {
@@ -473,6 +580,269 @@ mod tests {
             .query_row("SELECT count(*) FROM notifications", [], |row| row.get(0))
             .unwrap();
         assert_eq!(remaining, 1);
+    }
+
+    fn notification(db: &Db, issue: &str, worktree: &str, read: i64, created: i64) {
+        db.conn()
+            .execute(
+                "INSERT INTO notifications(kind,issue_id,message,created_at_ms,read,worktree_path) \
+             VALUES('fixture',?1,'fixture',?2,?3,?4)",
+                params![issue, created, read, worktree],
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn removed_worktree_read_notifications_prune_and_unread_survive() {
+        let (dir, db) = temp_db();
+        let gone = dir.path().join("gone").to_string_lossy().into_owned();
+        let registered = dir.path().join("registered").to_string_lossy().into_owned();
+        let ancestor = dir.path().join("ancestor").to_string_lossy().into_owned();
+        let registered_child = format!("{ancestor}/child");
+        let existing = dir.path().join("existing");
+        std::fs::create_dir(&existing).unwrap();
+        let existing = existing.to_string_lossy().into_owned();
+        db.conn()
+            .execute(
+                "INSERT INTO worktrees(worktree,repo_path,location) VALUES(?1,?2,'local')",
+                params![registered, registered],
+            )
+            .unwrap();
+        db.conn()
+            .execute(
+                "INSERT INTO worktrees(worktree,repo_path,location) VALUES(?1,?2,'remote')",
+                params![registered_child, ancestor],
+            )
+            .unwrap();
+        let now = 2_000_000_000;
+        notification(&db, "read-gone", &gone, 1, now);
+        notification(&db, "unread-gone", &gone, 0, now);
+        notification(&db, "registered", &registered, 1, now);
+        notification(&db, "existing", &existing, 1, now);
+        notification(&db, "ancestor", &ancestor, 1, now);
+        notification(&db, "empty", "", 1, now);
+
+        assert_eq!(db.prune_removed_worktree_rows(0).unwrap(), (0, 0));
+        let (removed_notifications, removed_links) = db
+            .prune_removed_worktree_rows(ORPHAN_CACHE_SWEEP_MAX_KEYS)
+            .unwrap();
+        assert_eq!((removed_notifications, removed_links), (1, 0));
+        let unread: i64 = db
+            .conn()
+            .query_row(
+                "SELECT count(*) FROM notifications WHERE issue_id='unread-gone'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(unread, 1);
+        let retained_read: i64 = db
+            .conn()
+            .query_row(
+                "SELECT count(*) FROM notifications WHERE read=1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(retained_read, 4);
+    }
+
+    #[test]
+    fn unread_removed_notification_is_pruned_once_read() {
+        let (dir, db) = temp_db();
+        let gone = dir.path().join("gone").to_string_lossy().into_owned();
+        notification(&db, "unread", &gone, 0, 2_000_000_000);
+        assert_eq!(db.prune_removed_worktree_rows(8).unwrap(), (0, 0));
+        db.conn()
+            .execute(
+                "UPDATE notifications SET read=1 WHERE issue_id='unread'",
+                [],
+            )
+            .unwrap();
+        assert_eq!(db.prune_removed_worktree_rows(8).unwrap(), (1, 0));
+    }
+
+    #[test]
+    fn issue_links_of_removed_worktrees_are_pruned() {
+        let (dir, db) = temp_db();
+        let gone = dir.path().join("gone").to_string_lossy().into_owned();
+        let registered = dir.path().join("registered").to_string_lossy().into_owned();
+        let remote = dir.path().join("remote").to_string_lossy().into_owned();
+        let existing = dir.path().join("existing");
+        std::fs::create_dir(&existing).unwrap();
+        let existing = existing.to_string_lossy().into_owned();
+        db.conn()
+            .execute(
+                "INSERT INTO worktrees(worktree,location) VALUES(?1,'local'),(?2,'remote')",
+                params![registered, remote],
+            )
+            .unwrap();
+        for (path, id) in [
+            (&gone, "gone"),
+            (&registered, "registered"),
+            (&remote, "remote"),
+            (&existing, "existing"),
+        ] {
+            db.conn()
+                .execute(
+                    "INSERT INTO issue_links(worktree_path,issue_id,linked_at) VALUES(?1,?2,1)",
+                    params![path, id],
+                )
+                .unwrap();
+        }
+        assert_eq!(db.prune_removed_worktree_rows(8).unwrap(), (0, 1));
+        let count: i64 = db
+            .conn()
+            .query_row("SELECT count(*) FROM issue_links", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(count, 3);
+    }
+
+    fn dispatch(
+        db: &Db,
+        worktree: &str,
+        status: &str,
+        dispatched: i64,
+        changed: Option<i64>,
+        task_kind: Option<&str>,
+        parent_id: Option<i64>,
+    ) -> i64 {
+        db.conn().execute(
+            "INSERT INTO agent_dispatches(issue_id,worktree_path,agent_name,dispatched_at_ms,status,status_changed_at_ms,task_kind,parent_id) \
+             VALUES(?1,?2,'fixture',?3,?4,?5,?6,?7)",
+            params![worktree, worktree, dispatched, status, changed, task_kind, parent_id],
+        ).unwrap();
+        db.conn().last_insert_rowid()
+    }
+
+    #[test]
+    fn terminal_dispatch_retention_is_ninety_days() {
+        let (_dir, db) = temp_db();
+        let now = 2_000_000_000_000_i64;
+        let old = now - 200 * 24 * 60 * 60 * 1000;
+        let done_old = dispatch(&db, "/gone/old", "done", old, None, None, None);
+        let done_89 = dispatch(
+            &db,
+            "/gone/recent",
+            "done",
+            now - 89 * 24 * 60 * 60 * 1000,
+            None,
+            None,
+            None,
+        );
+        for status in ["running", "queued", "waiting_human", "pr_open", "unknown"] {
+            dispatch(
+                &db,
+                &format!("/gone/{status}"),
+                status,
+                old,
+                None,
+                None,
+                None,
+            );
+        }
+        let changed_recent = dispatch(
+            &db,
+            "/gone/changed",
+            "done",
+            old,
+            Some(now - 10 * 24 * 60 * 60 * 1000),
+            None,
+            None,
+        );
+        assert_eq!(db.prune_terminal_dispatches(now).unwrap(), 1);
+        assert!(db.get_dispatch(done_old).unwrap().is_none());
+        assert!(db.get_dispatch(done_89).unwrap().is_some());
+        assert!(db.get_dispatch(changed_recent).unwrap().is_some());
+        let remaining: i64 = db
+            .conn()
+            .query_row("SELECT count(*) FROM agent_dispatches", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(remaining, 7);
+    }
+
+    #[test]
+    fn pruned_dispatch_takes_notes_and_validations() {
+        let (_dir, db) = temp_db();
+        let now = 2_000_000_000_000_i64;
+        let old = now - 91 * 24 * 60 * 60 * 1000;
+        let expired = dispatch(&db, "/gone/expired", "failed", old, None, None, None);
+        db.conn()
+            .execute(
+                "INSERT INTO worktrees(worktree) VALUES('/registered/retained')",
+                [],
+            )
+            .unwrap();
+        let retained = dispatch(&db, "/registered/retained", "failed", old, None, None, None);
+        db.conn().execute("INSERT INTO agent_dispatch_notes(dispatch_id,created_at_ms,text) VALUES(?1,1,'note'),(?2,1,'note')", params![expired, retained]).unwrap();
+        db.conn().execute("INSERT INTO pipeline_validations(dispatch_id,task,commit_sha,class,ran_at_ms) VALUES(?1,'task','sha','class',1),(?2,'task','sha','class',1)", params![expired, retained]).unwrap();
+        assert_eq!(db.prune_terminal_dispatches(now).unwrap(), 1);
+        let notes: i64 = db
+            .conn()
+            .query_row("SELECT count(*) FROM agent_dispatch_notes", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        let validations: i64 = db
+            .conn()
+            .query_row("SELECT count(*) FROM pipeline_validations", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!((notes, validations), (1, 1));
+    }
+
+    #[test]
+    fn dispatch_retention_keeps_referenced_rows() {
+        let (_dir, db) = temp_db();
+        let now = 2_000_000_000_000_i64;
+        let old = now - 91 * 24 * 60 * 60 * 1000;
+        let registered_path = "/registered/wt";
+        db.conn()
+            .execute(
+                "INSERT INTO worktrees(worktree) VALUES(?1)",
+                [registered_path],
+            )
+            .unwrap();
+        let registered = dispatch(&db, registered_path, "done", old, None, None, None);
+        let autopilot = dispatch(&db, "/gone/autopilot", "done", old, None, None, None);
+        db.conn().execute("INSERT INTO autopilot_runs(provider,account,issue_id,repo_root,state,dispatch_id,created_at,updated_at) VALUES('p','a','i','/repo','working',?1,1,1)", [autopilot]).unwrap();
+        let parent = dispatch(&db, "/gone/parent", "done", old, None, None, None);
+        dispatch(&db, "/gone/child", "running", old, None, None, Some(parent));
+        let review = dispatch(&db, "/gone/review", "done", old, None, Some("review"), None);
+        assert_eq!(db.prune_terminal_dispatches(now).unwrap(), 0);
+        for id in [registered, autopilot, parent, review] {
+            assert!(db.get_dispatch(id).unwrap().is_some());
+        }
+    }
+
+    #[test]
+    fn maintain_reports_retention_counts() {
+        let (dir, db) = temp_db();
+        let now = 2_000_000_000_i64;
+        let gone = dir.path().join("gone").to_string_lossy().into_owned();
+        notification(&db, "read", &gone, 1, now);
+        db.conn()
+            .execute(
+                "INSERT INTO issue_links(worktree_path,issue_id,linked_at) VALUES(?1,'issue',1)",
+                [&gone],
+            )
+            .unwrap();
+        dispatch(
+            &db,
+            "/gone/dispatch",
+            "done",
+            now * 1000 - 91 * 24 * 60 * 60 * 1000,
+            None,
+            None,
+            None,
+        );
+        let report = db.maintain(now, MaintenanceStep::Nothing).unwrap();
+        assert_eq!(report.pruned_removed_notifications, 1);
+        assert_eq!(report.pruned_issue_links, 1);
+        assert_eq!(report.pruned_dispatches, 1);
     }
 
     #[test]

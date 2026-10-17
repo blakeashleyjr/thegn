@@ -108,6 +108,26 @@ pub(crate) fn delete_worktree_cache_rows(db: &Db, wt: &str) -> Result<()> {
     Ok(())
 }
 
+pub(crate) fn registered_roots(
+    conn: &rusqlite::Connection,
+) -> Result<std::collections::HashSet<String>> {
+    let mut stmt = conn.prepare(
+        "SELECT worktree FROM worktrees WHERE worktree != '' \
+         UNION SELECT repo_path FROM worktrees WHERE repo_path != '' \
+         UNION SELECT repo_path FROM workspaces WHERE repo_path != ''",
+    )?;
+    let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+    Ok(rows.collect::<rusqlite::Result<std::collections::HashSet<_>>>()?)
+}
+
+pub(crate) fn is_removed_root(registered: &std::collections::HashSet<String>, key: &str) -> bool {
+    !registered.contains(key)
+        && !registered
+            .iter()
+            .any(|root| std::path::Path::new(root).starts_with(std::path::Path::new(key)))
+        && !std::path::Path::new(key).exists()
+}
+
 impl Db {
     /// Prune cached rows for up to `ORPHAN_CACHE_SWEEP_MAX_KEYS` worktree keys
     /// that are neither registered nor present on disk. This is called from the
@@ -143,24 +163,10 @@ impl Db {
             let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
             rows.collect::<rusqlite::Result<Vec<_>>>()?
         };
-        let registered = {
-            let mut stmt = conn.prepare(
-                "SELECT worktree FROM worktrees WHERE worktree != '' \
-                 UNION SELECT repo_path FROM worktrees WHERE repo_path != '' \
-                 UNION SELECT repo_path FROM workspaces WHERE repo_path != ''",
-            )?;
-            let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
-            rows.collect::<rusqlite::Result<std::collections::HashSet<_>>>()?
-        };
+        let registered = registered_roots(conn)?;
         let orphan_keys: Vec<String> = keys
             .into_iter()
-            .filter(|key| {
-                !registered.contains(key)
-                    && !registered.iter().any(|root| {
-                        std::path::Path::new(root).starts_with(std::path::Path::new(key))
-                    })
-                    && !std::path::Path::new(key).exists()
-            })
+            .filter(|key| is_removed_root(&registered, key))
             .take(max_keys)
             .collect();
         for key in &orphan_keys {
@@ -194,13 +200,7 @@ impl Db {
             };
             let orphan_repo_roots: Vec<String> = repo_roots
                 .into_iter()
-                .filter(|key| {
-                    !registered.contains(key)
-                        && !registered.iter().any(|root| {
-                            std::path::Path::new(root).starts_with(std::path::Path::new(key))
-                        })
-                        && !std::path::Path::new(key).exists()
-                })
+                .filter(|key| is_removed_root(&registered, key))
                 .take(remaining_budget)
                 .collect();
             for repo_root in orphan_repo_roots {
