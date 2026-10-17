@@ -93,7 +93,7 @@ pub fn draw(grid: &mut CellGrid, rect: Rect, spec: &TableSpec<'_>) {
                 .copied()
                 .unwrap_or(TableCell::Text(""));
             let text = match cell {
-                TableCell::Text(value) => None,
+                TableCell::Text(_) => None,
                 TableCell::Number(reading) => Some(spec.fmt.reading(
                     reading,
                     col.unit.unwrap_or(Unit::Count),

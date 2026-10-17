@@ -15,38 +15,19 @@ struct CacheKey {
     generation: u64,
     depth: ColorDepth,
 }
+#[derive(Default)]
 struct StyleCache {
     key: Option<CacheKey>,
     colors: HashMap<StyleTok, ColorAttribute>,
     #[cfg(test)]
     rebuilds: usize,
 }
-impl Default for StyleCache {
-    fn default() -> Self {
-        Self {
-            key: None,
-            colors: HashMap::new(),
-            #[cfg(test)]
-            rebuilds: 0,
-        }
-    }
-}
-
+#[derive(Default)]
 pub struct Emitter {
     cache: StyleCache,
     scratch: String,
     #[cfg(test)]
     text_runs: usize,
-}
-impl Default for Emitter {
-    fn default() -> Self {
-        Self {
-            cache: StyleCache::default(),
-            scratch: String::new(),
-            #[cfg(test)]
-            text_runs: 0,
-        }
-    }
 }
 impl Emitter {
     fn rebuild(&mut self) {

@@ -1,6 +1,6 @@
 use super::grid::{CellGrid, CellStyle, GridView};
 use crate::{
-    caps::{self, Glyph},
+    caps,
     compositor::Rect,
     seg::{StyleTok, Tok},
 };

@@ -46,6 +46,7 @@ impl Meter {
             if let Some(cell) = self.raster.row(0).get(x) {
                 let style = CellStyle {
                     ch: cell.ch,
+                    // Fill keeps its positional gradient; warn/crit bands apply to the label, and track cells stay dim.
                     fg: StyleTok::from_tok(if cell.ch == caps::raster_table().track {
                         Tok::Slot(crate::chrome::S::Dim)
                     } else {
