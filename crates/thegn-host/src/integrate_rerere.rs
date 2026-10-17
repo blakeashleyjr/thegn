@@ -9,6 +9,8 @@ use std::time::{Duration, SystemTime};
 use thegn_core::util;
 use thegn_proc::{End, Leader, Limits, Stream};
 
+const MAX_CACHE_STATUS_DIRENTS: usize = 16_384;
+
 pub(super) struct Cache {
     _directory: Directory,
     _lock: Lock,
@@ -47,12 +49,15 @@ pub(crate) fn cache_status(repo_root: &Path) -> Option<CacheStatus> {
     };
     let mut entries = 0;
     let mut resolved = 0;
-    for item in items.filter_map(Result::ok) {
+    for item in cache_status_items(items) {
+        if entries == 4096 {
+            break;
+        }
         let name = item.file_name();
         let Some(name) = name.to_str() else {
             continue;
         };
-        if !valid_rerere_id(name) || entries == 4096 {
+        if !valid_rerere_id(name) {
             continue;
         }
         let item_path = item.path();
@@ -90,6 +95,10 @@ pub(crate) fn cache_status(repo_root: &Path) -> Option<CacheStatus> {
         entries,
         resolved,
     })
+}
+
+fn cache_status_items<T, E, I: Iterator<Item = Result<T, E>>>(items: I) -> impl Iterator<Item = T> {
+    items.take(MAX_CACHE_STATUS_DIRENTS).filter_map(Result::ok)
 }
 
 fn valid_postimage_suffix(suffix: &str) -> bool {
@@ -584,4 +593,21 @@ pub(super) fn train_merge(
     })();
     super::remove_scratch_worktree(repo_root, scratch);
     result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{MAX_CACHE_STATUS_DIRENTS, cache_status_items};
+
+    #[test]
+    fn cache_status_caps_total_dirents() {
+        let dirents = cache_status_items((0..MAX_CACHE_STATUS_DIRENTS + 1).map(Ok::<_, ()>))
+            .collect::<Vec<_>>();
+
+        assert_eq!(dirents.len(), MAX_CACHE_STATUS_DIRENTS);
+        assert_eq!(
+            dirents[MAX_CACHE_STATUS_DIRENTS - 1],
+            MAX_CACHE_STATUS_DIRENTS - 1
+        );
+    }
 }
