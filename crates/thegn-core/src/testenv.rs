@@ -16,7 +16,7 @@
 //! A test that mutates an env var but forgets to restore it leaks process-global
 //! state into every test that runs afterward; the guard makes that impossible.
 
-use crate::sandbox_backend::{HostOs, host_os};
+use crate::sandbox_backend::HostOs;
 use std::path::{Path, PathBuf};
 
 #[cfg(any(test, feature = "test-utils"))]
