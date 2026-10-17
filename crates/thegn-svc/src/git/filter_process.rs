@@ -1,13 +1,13 @@
 //! A fully owned, reusable Git filter-process child (THE-700).
 //!
-//! This first slice is deliberately not wired into native diff/status yet. It
-//! provides the long-lived process and protocol lifecycle needed to replace
-//! gix's leaking persistent-filter path in a follow-up slice.
+//! Owned, reusable Git filter-process children (THE-700).
 
 pub mod protocol;
+pub mod registry;
 
 use std::io;
 use std::process::{Child, Command as ProcessCommand, ExitStatus, Stdio};
+use std::sync::Arc;
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, SyncSender};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -22,7 +22,7 @@ enum JobMessage {
     Request {
         command: Command,
         pathname: String,
-        content: Vec<u8>,
+        content: Arc<[u8]>,
         max_output: usize,
         reply: SyncSender<Result<Outcome, ProtocolError>>,
     },
@@ -141,7 +141,7 @@ impl FilterProcess {
         &mut self,
         command: Command,
         pathname: &str,
-        content: Vec<u8>,
+        content: impl Into<Arc<[u8]>>,
         max_output: usize,
     ) -> Result<Outcome, FilterProcessError> {
         if self.dead {
@@ -151,7 +151,7 @@ impl FilterProcess {
         let job = JobMessage::Request {
             command,
             pathname: pathname.to_owned(),
-            content,
+            content: content.into(),
             max_output,
             reply: reply_tx,
         };
@@ -325,7 +325,7 @@ fn serve_filter(
             &mut stdin,
             command,
             &pathname,
-            &content,
+            &content[..],
             max_output,
         );
         let failed = result.is_err()

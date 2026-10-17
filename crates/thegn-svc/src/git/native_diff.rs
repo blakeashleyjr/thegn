@@ -24,6 +24,7 @@ use std::sync::{LazyLock, Mutex};
 use std::time::{Duration, SystemTime};
 
 use super::DiffEntry;
+mod filter_route;
 
 const WORKTREE_DIFF_MEMO_CAP: usize = 4096;
 const WORKTREE_DIFF_RACY_MARGIN: Duration = Duration::from_secs(2);
@@ -623,16 +624,21 @@ fn tree_to_worktree(repo: &gix::Repository, rev: &str) -> Result<Vec<DiffEntry>>
     invalidate_worktree_diff_memo(&workdir, environment);
     let old_tree = tree_of(repo, rev)?;
 
-    let mut cache = new_cache(
-        repo.diff_resource_cache(
+    // `repo` came from `discover_for_status`, whose private config snapshot
+    // strips required persistent filters for the status walk. Re-discover for
+    // this cache so process drivers remain visible to the owned route below.
+    let filter_repo = gix::discover(&workdir).context("gix worktree diff filter repository")?;
+    let mut platform = filter_repo
+        .diff_resource_cache(
             gix::diff::blob::pipeline::Mode::ToGit,
             gix::diff::blob::pipeline::WorktreeRoots {
                 old_root: None,
                 new_root: Some(workdir.clone()),
             },
         )
-        .context("gix worktree diff resource cache")?,
-    );
+        .context("gix worktree diff resource cache")?;
+    let route = filter_route::ProcessDrivers::capture(&mut platform);
+    let mut cache = new_cache(platform);
 
     // Enumerate the paths that differ from HEAD — staged and unstaged both,
     // which together are exactly what `git diff HEAD` reports.
@@ -704,15 +710,44 @@ fn tree_to_worktree(repo: &gix::Repository, rev: &str) -> Result<Vec<DiffEntry>>
         })?;
         // The worktree side: a null id means "read it from the worktree root".
         path_operation(rela.as_ref(), "load worktree resource", || {
-            cache
-                .set_resource(
-                    repo.object_hash().null(),
-                    gix::object::tree::EntryKind::Blob,
-                    rela.as_ref(),
-                    gix::diff::blob::ResourceKind::NewOrDestination,
-                    &repo.objects,
-                )
-                .map_err(anyhow::Error::from)
+            match route.route_worktree_side(
+                &filter_repo,
+                &workdir,
+                rela.as_ref(),
+                &path,
+                &mut cache.0,
+            )? {
+                Some(bytes) => {
+                    let id =
+                        gix::objs::compute_hash(repo.object_hash(), gix::objs::Kind::Blob, &bytes)?;
+                    let overlay = filter_route::Overlay {
+                        id,
+                        bytes: &bytes,
+                        inner: &repo.objects,
+                    };
+                    let saved = cache.filter.roots.new_root.take();
+                    let set_result = cache
+                        .set_resource(
+                            id,
+                            gix::object::tree::EntryKind::Blob,
+                            rela.as_ref(),
+                            gix::diff::blob::ResourceKind::NewOrDestination,
+                            &overlay,
+                        )
+                        .map_err(anyhow::Error::from);
+                    cache.filter.roots.new_root = saved;
+                    set_result
+                }
+                None => cache
+                    .set_resource(
+                        repo.object_hash().null(),
+                        gix::object::tree::EntryKind::Blob,
+                        rela.as_ref(),
+                        gix::diff::blob::ResourceKind::NewOrDestination,
+                        &repo.objects,
+                    )
+                    .map_err(anyhow::Error::from),
+            }
         })?;
         let prep = path_operation(rela.as_ref(), "prepare diff", || cache.prepare_diff())?;
         match prep.operation {
@@ -1741,5 +1776,126 @@ mod tests {
                 .map(|v| v.to_string()),
             Some("cat".to_string())
         );
+    }
+
+    fn filter_pkt(bytes: &mut Vec<u8>, payload: &[u8]) {
+        bytes.extend_from_slice(format!("{:04x}", payload.len() + 4).as_bytes());
+        bytes.extend_from_slice(payload);
+    }
+
+    fn filter_server_bytes(output: &[u8], requests: usize) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        for line in [b"git-filter-server\n".as_slice(), b"version=2\n"] {
+            filter_pkt(&mut bytes, line);
+        }
+        bytes.extend_from_slice(b"0000");
+        filter_pkt(&mut bytes, b"capability=clean\n");
+        bytes.extend_from_slice(b"0000");
+        for _ in 0..requests {
+            filter_pkt(&mut bytes, b"status=success\n");
+            bytes.extend_from_slice(b"0000");
+            filter_pkt(&mut bytes, output);
+            bytes.extend_from_slice(b"0000");
+            filter_pkt(&mut bytes, b"status=success\n");
+            bytes.extend_from_slice(b"0000");
+        }
+        bytes
+    }
+
+    fn configure_filter(repo: &TestRepo, process: &str, clean: &str) {
+        repo.out(&["config", "filter.tgproc.process", process]);
+        repo.out(&["config", "filter.tgproc.clean", clean]);
+        repo.out(&["config", "filter.tgproc.required", "true"]);
+    }
+
+    #[test]
+    fn worktree_diffs_over_filtered_files_spawn_one_filter_process() {
+        if !thegn_core::util::have("sh") || !std::path::Path::new("/proc/self/stat").exists() {
+            return;
+        }
+        let repo = TestRepo::new("filter-process-wire-reuse");
+        let files = ["a.dat", "b.dat", "c.dat"];
+        for path in files {
+            std::fs::write(repo.dir.join(path), "base\n").unwrap();
+        }
+        std::fs::write(repo.dir.join(".gitattributes"), "*.dat filter=tgproc\n").unwrap();
+        repo.out(&["add", "a.dat", "b.dat", "c.dat", ".gitattributes"]);
+        repo.out(&["-c", "commit.gpgsign=false", "commit", "-q", "-m", "seed"]);
+
+        let script_dir = tempfile::tempdir().unwrap();
+        let canned = script_dir.path().join("server-bytes");
+        let marker = script_dir.path().join("spawn-marker");
+        let clean_marker = script_dir.path().join("clean-marker");
+        std::fs::write(
+            &canned,
+            filter_server_bytes(b"cleaned\ncanned\nthird\n", 12),
+        )
+        .unwrap();
+        let process = format!(
+            "sh -c 'echo x >> \"$1\"; cat \"$2\"; exec cat >/dev/null' sh {} {}",
+            marker.display(),
+            canned.display()
+        );
+        let clean = format!("tee -a {}", clean_marker.display());
+        configure_filter(&repo, &process, &clean);
+
+        let before = own_children().len();
+        for round in 0..4 {
+            for path in files {
+                std::fs::write(
+                    repo.dir.join(path),
+                    format!("raw-round-{round}-{}\n", path.len()),
+                )
+                .unwrap();
+            }
+            let entries = diff_entries(&repo.dir, "HEAD").expect("native filtered diff");
+            for path in files {
+                let entry = entries.iter().find(|entry| entry.path == path).unwrap();
+                assert_eq!((entry.added, entry.deleted), (3, 1));
+            }
+        }
+        assert_eq!(std::fs::read_to_string(&marker).unwrap().lines().count(), 1);
+        assert!(
+            !clean_marker.exists(),
+            "one-shot clean filter ran on routed data"
+        );
+        assert!(!own_children().iter().any(|(state, _)| state == "Z"));
+        crate::git::filter_process::registry::global().shutdown_all();
+        assert!(
+            own_children().len() <= before,
+            "filter child was not reaped"
+        );
+    }
+
+    #[test]
+    fn broken_filter_process_falls_back_to_one_shot_clean() {
+        if !thegn_core::util::have("sh") {
+            return;
+        }
+        let repo = TestRepo::new("filter-process-wire-fallback");
+        std::fs::write(repo.dir.join("tracked.dat"), "base\n").unwrap();
+        std::fs::write(
+            repo.dir.join(".gitattributes"),
+            "tracked.dat filter=tgproc\n",
+        )
+        .unwrap();
+        repo.out(&["add", "tracked.dat", ".gitattributes"]);
+        repo.out(&["-c", "commit.gpgsign=false", "commit", "-q", "-m", "seed"]);
+        std::fs::write(repo.dir.join("tracked.dat"), "changed\nwith two\nlines\n").unwrap();
+        let expected = cli_totals(&repo, "HEAD");
+        let script_dir = tempfile::tempdir().unwrap();
+        let marker = script_dir.path().join("spawn-marker");
+        let clean_marker = script_dir.path().join("clean-marker");
+        let process = format!("sh -c 'echo x >> \"$1\"; exec cat' sh {}", marker.display());
+        let clean = format!("tee -a {}", clean_marker.display());
+        configure_filter(&repo, &process, &clean);
+        let before = own_children().len();
+        for _ in 0..3 {
+            let entries = diff_entries(&repo.dir, "HEAD").unwrap();
+            assert_eq!(super::super::typed_totals(Ok(&entries)), expected);
+        }
+        assert_eq!(std::fs::read_to_string(marker).unwrap().lines().count(), 1);
+        assert!(clean_marker.exists(), "one-shot clean fallback did not run");
+        assert!(own_children().len() <= before);
     }
 }
