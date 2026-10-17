@@ -23,12 +23,12 @@ impl UptimeCollector {
     }
     fn read(&mut self) -> Result<uptime::Uptime, CollectError> {
         let file = self.file.as_mut().ok_or(CollectError::Gone)?;
-        let bytes = match file.read_all() {
+        let bytes = match file.read_all().map(<[u8]>::to_vec) {
             Ok(bytes) => bytes,
             Err(_error) if file.needs_reopen() => return Err(CollectError::Gone),
             Err(error) => return Err(error.into()),
         };
-        uptime::parse(bytes).ok_or(CollectError::Parse("/proc/uptime"))
+        uptime::parse(&bytes).ok_or(CollectError::Parse("/proc/uptime"))
     }
 }
 impl Collector for UptimeCollector {
