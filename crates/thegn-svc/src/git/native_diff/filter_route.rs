@@ -7,6 +7,9 @@
 //! process cannot be used, `None` preserves gix's existing one-shot fallback.
 //! Status walks still use gix's internally built pipeline. Idle children remain
 //! blocked on their protocol read until the next diff sweeps them or thegn exits.
+//! A hung filter can delay one diff by about 30 seconds: a 10-second request,
+//! a 10-second respawn handshake, and a 10-second retry, followed by 60 seconds
+//! of backoff.
 
 use std::io::Read;
 use std::path::Path;
@@ -15,6 +18,7 @@ use std::sync::Arc;
 use crate::git::filter_process::protocol::Outcome;
 use crate::git::filter_process::registry::{self, FilterKey, Routed};
 use anyhow::{Context, Result, bail};
+use gix::bstr::ByteSlice;
 
 struct ProcessDriver {
     name: String,
@@ -64,7 +68,7 @@ impl ProcessDrivers {
     }
 
     pub(super) fn route_worktree_side(
-        &self,
+        &mut self,
         repo: &gix::Repository,
         workdir: &Path,
         rela: &gix::bstr::BStr,
@@ -74,15 +78,16 @@ impl ProcessDrivers {
         if self.drivers.is_empty() {
             return Ok(None);
         }
-        let attr_stack = &platform.filter.attr_stack;
-        let mut attributes = attr_stack.selected_attribute_matches(["filter"]);
-        attr_stack
+        let mut attributes = platform.attr_stack.selected_attribute_matches(["filter"]);
+        platform
+            .attr_stack
             .at_entry(rela, None, &repo.objects)?
             .matching_attributes(&mut attributes);
-        let Some(assignment) = attributes.iter_selected().next() else {
+        let Some(matched) = attributes.iter_selected().next() else {
             return Ok(None);
         };
-        let Some(driver_name) = assignment
+        let Some(driver_name) = matched
+            .assignment
             .state
             .as_bstr()
             .and_then(|name| name.to_str().ok())
@@ -105,9 +110,10 @@ impl ProcessDrivers {
         if limit > 0 && metadata.len() > limit {
             return Ok(None);
         }
-        let content = std::fs::read(&pathname)
-            .with_context(|| format!("read filter input {}", pathname.display()))?;
-        let command_context = repo.command_context()?;
+        let content: Arc<[u8]> = Arc::from(
+            std::fs::read(&pathname)
+                .with_context(|| format!("read filter input {}", pathname.display()))?,
+        );
         let process_command = driver.process.clone();
         let spawn_workdir = workdir.to_owned();
         let routed = registry::global().clean(
@@ -116,15 +122,16 @@ impl ProcessDrivers {
                 process: driver.process.clone(),
             },
             || {
-                let mut command = gix::command::prepare(&process_command)
+                let command_context = repo.command_context().map_err(std::io::Error::other)?;
+                let mut command: std::process::Command = gix::command::prepare(&process_command)
                     .command_may_be_shell_script()
-                    .with_context(command_context.clone())
+                    .with_context(command_context)
                     .into();
                 command.current_dir(&spawn_workdir);
-                command
+                Ok(command)
             },
             path,
-            Arc::from(content.clone()),
+            Arc::clone(&content),
         );
         match routed {
             Routed::Unavailable => Ok(None),
@@ -136,35 +143,40 @@ impl ProcessDrivers {
             }
             Routed::Done(Outcome::Error | Outcome::Abort) => {
                 tracing::debug!(target: "thegn::git", driver = %driver.name, has_clean = driver.has_clean, "non-required clean filter passed through");
-                self.convert_post_clean(repo, platform, path, &content)
+                self.convert_post_clean(repo, platform, path, &content[..])
                     .map(Some)
             }
         }
     }
 
     fn convert_post_clean(
-        &self,
+        &mut self,
         repo: &gix::Repository,
         platform: &mut gix::diff::blob::Platform,
         path: &str,
         bytes: &[u8],
     ) -> Result<Vec<u8>> {
-        let Some(pipeline) = &self.post_clean else {
+        let Some(pipeline) = &mut self.post_clean else {
             return Ok(bytes.to_vec());
         };
-        let mut pipeline = pipeline.clone();
         let rela = Path::new(path);
-        let mut attr_stack = platform.filter.attr_stack.clone();
+        let mut lookup_error = None;
         let outcome = pipeline.convert_to_git(
             bytes,
             rela,
-            &mut |rela, attrs| {
-                if let Ok(entry) = attr_stack.at_entry(rela, None, &repo.objects) {
-                    entry.matching_attributes(attrs);
+            &mut |rela, attrs| match platform.attr_stack.at_entry(rela, None, &repo.objects) {
+                Ok(entry) => entry.matching_attributes(attrs),
+                Err(error) => {
+                    if lookup_error.is_none() {
+                        lookup_error = Some(error);
+                    }
                 }
             },
             &mut |_| Ok(None),
         )?;
+        if let Some(error) = lookup_error {
+            return Err(error.into());
+        }
         match outcome {
             gix::filter::plumbing::pipeline::convert::ToGitOutcome::Unchanged(mut reader) => {
                 let mut output = Vec::new();

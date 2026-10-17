@@ -52,7 +52,7 @@ fn key(dir: &tempfile::TempDir, name: &str) -> FilterKey {
 }
 
 fn clean(registry: &FilterRegistry, key: FilterKey, spawn: impl Fn() -> ProcessCommand) -> Routed {
-    registry.clean(key, spawn, "file.dat", Arc::from(&b"raw"[..]))
+    registry.clean(key, || Ok(spawn()), "file.dat", Arc::from(&b"raw"[..]))
 }
 
 #[test]
@@ -204,20 +204,34 @@ fn lru_cap_evicts_the_oldest_entry() {
     let input = dir.path().join("server");
     fs::write(&input, server_bytes(2)).unwrap();
     let input_arg = input.to_string_lossy().into_owned();
+    let marker = dir.path().join("evicted");
+    let marker_arg = marker.to_string_lossy().into_owned();
     let registry =
         FilterRegistry::with_limits(Duration::from_secs(120), 1, Duration::from_secs(60));
-    let spawn = || command("cat \"$1\"; exec cat >/dev/null", &[&input_arg]);
+    let spawn_a = || {
+        command(
+            "cat \"$1\"; cat >/dev/null; echo exited >> \"$2\"",
+            &[&input_arg, &marker_arg],
+        )
+    };
+    let spawn_b = || command("cat \"$1\"; exec cat >/dev/null", &[&input_arg]);
     assert!(matches!(
-        clean(&registry, key(&dir, "a"), spawn),
+        clean(&registry, key(&dir, "a"), spawn_a),
         Routed::Done(_)
     ));
     assert!(matches!(
-        clean(&registry, key(&dir, "b"), spawn),
+        clean(&registry, key(&dir, "b"), spawn_b),
         Routed::Done(_)
     ));
+    assert!(
+        fs::read_to_string(&marker)
+            .unwrap()
+            .lines()
+            .any(|line| line == "exited")
+    );
     assert_eq!(registry.live(), 1);
     assert!(matches!(
-        clean(&registry, key(&dir, "a"), spawn),
+        clean(&registry, key(&dir, "a"), spawn_a),
         Routed::Done(_)
     ));
 }

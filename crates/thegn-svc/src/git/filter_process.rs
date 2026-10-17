@@ -1,5 +1,3 @@
-//! A fully owned, reusable Git filter-process child (THE-700).
-//!
 //! Owned, reusable Git filter-process children (THE-700).
 
 pub mod protocol;
