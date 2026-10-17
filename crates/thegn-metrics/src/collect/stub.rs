@@ -35,7 +35,7 @@ pub fn stub_collectors() -> Vec<Box<dyn Collector>> {
 #[cfg(test)]
 mod tests {
     use super::{Absent, Health, stub_collectors};
-    use crate::{CollectorId, TickCtx, env::Env, frame::MonitorFrame};
+    use crate::collect::{CollectorId, TickCtx, env::Env, frame::MonitorFrame};
     #[test]
     fn stubs_cover_each_id_and_leave_frames_unsampled() {
         let mut collectors = stub_collectors();
