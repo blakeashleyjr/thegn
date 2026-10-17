@@ -42,6 +42,15 @@ impl RampId {
         }
     }
 
+    fn band_family(self) -> Hue {
+        match self {
+            // Signal's green normal hue and red critical hue both quantize to
+            // ANSI-16 index 8; teal keeps the threshold bands distinct.
+            Self::Signal => Hue::Teal,
+            id => id.family(),
+        }
+    }
+
     fn stops(self) -> &'static [Hue] {
         match self {
             Self::Util => &[Hue::Teal, Hue::Green, Hue::Amber, Hue::Orange, Hue::Red],
@@ -209,10 +218,10 @@ impl OwnerRole {
 impl Palette {
     /// Build eight contrast-stepped colors for a monitor series.
     pub fn ramp(&self, id: RampId) -> [String; 8] {
-        if id == RampId::Heat {
+        let stops = id.stops();
+        if stops.is_empty() {
             return std::array::from_fn(|k| self.heat[k * 4 / 7].clone());
         }
-        let stops = id.stops();
         let c_max = stops
             .iter()
             .map(|&hue| contrast_ratio(self.hue(hue), &self.panel))
@@ -245,7 +254,7 @@ impl Palette {
         match band {
             Band::Normal => match id.family() {
                 Hue::Amber | Hue::Orange | Hue::Red => &self.dim,
-                hue => self.hue(hue),
+                _ => self.hue(id.band_family()),
             },
             Band::Warn => self.hue(Hue::Amber),
             Band::Crit => self.hue(Hue::Red),
@@ -436,8 +445,10 @@ mod tests {
 
     #[test]
     fn degenerate_palette_ramp_stays_monotone() {
-        let mut palette = Palette::default();
-        palette.panel = "80;80;80".into();
+        let mut palette = Palette {
+            panel: "80;80;80".into(),
+            ..Palette::default()
+        };
         for hue in [
             &mut palette.hues.teal,
             &mut palette.hues.magenta,
@@ -462,8 +473,10 @@ mod tests {
 
     #[test]
     fn decreasing_stop_contrast_is_clamped_to_the_previous_level() {
-        let mut palette = Palette::default();
-        palette.panel = "34;217;29".into();
+        let mut palette = Palette {
+            panel: "34;217;29".into(),
+            ..Palette::default()
+        };
         palette.hues.teal = "253;236;30".into();
         palette.hues.green = "205;38;210".into();
         palette.hues.amber = "73;109;116".into();
