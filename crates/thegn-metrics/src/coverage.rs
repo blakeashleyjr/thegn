@@ -178,6 +178,70 @@ fn classify(family: MetricFamily, s: &StatsSnapshot) -> Coverage {
     }
 }
 
+/// Metric families each registry collector can provide.
+pub fn collector_families(id: crate::collect::CollectorId) -> &'static [MetricFamily] {
+    use crate::collect::CollectorId as Id;
+    match id {
+        Id::Loadavg => &[MetricFamily::Load],
+        Id::Uptime => &[MetricFamily::Uptime],
+        Id::CpuStat => &[MetricFamily::Cpu, MetricFamily::Cores],
+        Id::CpuFreq => &[MetricFamily::Frequency],
+        Id::Hwmon => &[MetricFamily::Temperature],
+        Id::Meminfo => &[MetricFamily::Memory, MetricFamily::Swap],
+        Id::Vmstat => &[MetricFamily::Reclaim],
+        Id::Netdev => &[MetricFamily::Network],
+        Id::Diskstats => &[MetricFamily::Disk],
+        Id::AmdSmu => &[MetricFamily::Gpu],
+        Id::Psi | Id::Cgroup | Id::CgroupSlice | Id::Powercap => &[],
+    }
+}
+
+/// Combine sampled coverage with collector health without changing report keys.
+pub fn coverage_with_collectors(
+    snapshot: &StatsSnapshot,
+    health: &[crate::collect::health::Health; crate::collect::COLLECTORS],
+) -> Vec<FamilyReport> {
+    use crate::collect::{
+        CollectorId,
+        health::{Absent, Health},
+    };
+    MetricFamily::ALL
+        .into_iter()
+        .map(|family| {
+            let snapshot_result = classify(family, snapshot);
+            let mut collector_available = false;
+            let mut collector_absent = None;
+            if snapshot_result != Coverage::Available {
+                for id in CollectorId::ALL {
+                    if collector_families(id).contains(&family) {
+                        match health[id.index()] {
+                            Health::Ok | Health::Warming | Health::Failing { .. } => {
+                                collector_available = true;
+                                break;
+                            }
+                            Health::Absent(reason)
+                                if reason != Absent::NotImplemented
+                                    && collector_absent.is_none() =>
+                            {
+                                collector_absent = Some(reason.to_coverage());
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+            }
+            let coverage = if snapshot_result == Coverage::Available || collector_available {
+                Coverage::Available
+            } else if let Some(reason) = collector_absent {
+                Coverage::Absent(reason)
+            } else {
+                snapshot_result
+            };
+            FamilyReport { family, coverage }
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -321,5 +385,43 @@ mod tests {
         keys.sort_unstable();
         keys.dedup();
         assert_eq!(keys.len(), n);
+    }
+
+    #[test]
+    fn collector_health_adds_coverage_without_downgrading_snapshot() {
+        use crate::collect::{
+            COLLECTORS, CollectorId,
+            health::{Absent, Health},
+        };
+        let snapshot = StatsSnapshot::default();
+        let mut health = [Health::Absent(Absent::NotImplemented); COLLECTORS];
+        health[CollectorId::Loadavg.index()] = Health::Ok;
+        assert_eq!(
+            cov(
+                &coverage_with_collectors(&snapshot, &health),
+                MetricFamily::Load
+            ),
+            Coverage::Available
+        );
+        health[CollectorId::Loadavg.index()] = Health::Absent(Absent::NoPermission);
+        assert_eq!(
+            cov(
+                &coverage_with_collectors(&snapshot, &health),
+                MetricFamily::Load
+            ),
+            Coverage::Absent(AbsentReason::NoPermission)
+        );
+        assert!(collector_families(CollectorId::Psi).is_empty());
+        let available_load = StatsSnapshot {
+            load_avg: Some((1.0, 1.0, 1.0)),
+            ..Default::default()
+        };
+        assert_eq!(
+            cov(
+                &coverage_with_collectors(&available_load, &health),
+                MetricFamily::Load
+            ),
+            Coverage::Available
+        );
     }
 }

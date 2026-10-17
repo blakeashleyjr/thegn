@@ -2,11 +2,13 @@
 pub mod amd_gpu_metrics;
 pub mod cgroup;
 pub mod diskstats;
+pub mod loadavg;
 pub mod meminfo;
 pub mod mountinfo;
 pub mod netdev;
 pub mod psi;
 pub mod stat;
+pub mod uptime;
 pub mod vmstat;
 
 pub fn fields(input: &[u8]) -> impl Iterator<Item = &[u8]> {

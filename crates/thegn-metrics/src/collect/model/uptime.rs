@@ -1,6 +1,10 @@
-//! Empty F3a part for the uptime collector; populated by its owner lane.
+//! Uptime collector result.
 #[derive(Debug, Default, Clone, PartialEq)]
-pub struct UptimePart;
+pub struct UptimePart {
+    pub value: Option<crate::collect::parse::uptime::Uptime>,
+}
 impl crate::collect::frame::Part for UptimePart {
-    fn clear(&mut self) {}
+    fn clear(&mut self) {
+        self.value = None;
+    }
 }
