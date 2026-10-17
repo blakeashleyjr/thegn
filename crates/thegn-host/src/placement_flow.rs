@@ -864,7 +864,8 @@ pub(crate) fn maintain_tick(cfg: &Config) {
         *last = Some(std::time::Instant::now());
     }
     let cfg = cfg.clone();
-    std::thread::spawn(move || {
+    thegn_core::thread_name::spawn_named("thegn-placement", move || {
+        crate::platform::qos::set_self(crate::platform::qos::Qos::Background); // Background: periodic placement maintenance.
         sweep_stale();
         if let Ok(db) = Db::open() {
             use thegn_core::store::ComputeLedgerStore;

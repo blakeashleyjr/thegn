@@ -174,12 +174,14 @@ fn run_capture(cmd: &mut Command, timeout: Duration) -> Result<String> {
     };
     let (out_tx, out_rx) = mpsc::sync_channel(1);
     let (err_tx, err_rx) = mpsc::sync_channel(1);
-    std::thread::spawn(move || {
+    thegn_core::thread_name::spawn_named("thegn-difft-out", move || {
+        crate::platform::qos::set_self(crate::platform::qos::Qos::Utility); // Utility: drain output for a user-opened diff.
         if let Err(error) = out_tx.send(drain_stdout(stdout_pipe)) {
             tracing::debug!(target: "thegn::diff", %error, "stdout reader result receiver closed");
         }
     });
-    std::thread::spawn(move || {
+    thegn_core::thread_name::spawn_named("thegn-difft-err", move || {
+        crate::platform::qos::set_self(crate::platform::qos::Qos::Utility); // Utility: drain output for a user-opened diff.
         if let Err(error) = err_tx.send(drain_stderr(stderr_pipe)) {
             tracing::debug!(target: "thegn::diff", %error, "stderr reader result receiver closed");
         }
