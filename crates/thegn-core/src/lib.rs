@@ -223,6 +223,7 @@ pub mod notification_route;
 pub mod notification_scope;
 pub mod notification_sound;
 pub mod notify_debounce;
+pub mod numfmt;
 pub mod push_inbox;
 // `OSC 9` / `OSC 777` attention signalling: how a process says "I need you"
 // instead of thegn guessing from CPU and silence.
