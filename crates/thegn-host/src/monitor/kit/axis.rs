@@ -17,7 +17,17 @@ pub fn y_gutter(grid: &mut CellGrid, rect: Rect, max: f64, unit: Unit, fmt: NumF
         (v.rect().rows / 2, max / 2.0),
         (v.rect().rows - 1, 0.0),
     ];
-    for (row, value) in values {
+    let mut taken = [usize::MAX; 3];
+    let mut count = 0usize;
+    for (index, (row, value)) in values.into_iter().enumerate() {
+        if index == 1 && v.rect().rows <= 2 {
+            continue;
+        }
+        if taken[..count].contains(&row) {
+            continue;
+        }
+        taken[count] = row;
+        count += 1;
         let label = fmt.fmt(value, unit, label_width);
         v.put_str(0, row, &label, CellStyle::default());
         if width > 0 {
@@ -81,9 +91,6 @@ pub fn x_ticks(grid: &mut CellGrid, rect: Rect, labels: &[&str]) {
                         ..CellStyle::default()
                     },
                 );
-                if char_width == 2 {
-                    v.put(start + used + 1, 0, CellStyle::default());
-                }
                 used += char_width;
             }
             last_end = start.saturating_add(used).saturating_add(1);

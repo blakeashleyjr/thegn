@@ -1,3 +1,5 @@
+use super::grid::{CellGrid, CellStyle};
+use super::meter::{Meter, MeterSpec};
 use super::*;
 use crate::{
     caps::{self, Glyph},
@@ -168,13 +170,90 @@ fn widget_snapshot_matrix_degrades_for_every_unicode_and_color_level() {
                 );
             }
             if depth == ColorDepth::None {
-                assert_eq!(
-                    crate::wire::color_spec(
-                        crate::chrome::with_palette(|p| Tok::Series(SeriesRole::CpuUser).resolve(p)),
-                        depth
-                    ),
-                    termwiz::color::ColorSpec::Default
-                );
+                for row in 0.._grid.rows() {
+                    for col in 0.._grid.cols() {
+                        let cell = _grid.get(col, row).unwrap();
+                        let fg = cell
+                            .fg
+                            .tok()
+                            .map(|tok| {
+                                caps::test_override::with_color(depth, || {
+                                    crate::chrome::with_palette(|p| tok.resolve(p))
+                                })
+                            })
+                            .unwrap_or_default();
+                        let bg = if cell.bg == StyleTok::INHERIT {
+                            caps::test_override::with_color(depth, || {
+                                crate::chrome::with_palette(|p| {
+                                    crate::chrome::theme_color(crate::chrome::slot_rgb(
+                                        p,
+                                        crate::chrome::S::Panel,
+                                    ))
+                                })
+                            })
+                        } else {
+                            cell.bg
+                                .tok()
+                                .map(|tok| {
+                                    caps::test_override::with_color(depth, || {
+                                        crate::chrome::with_palette(|p| tok.resolve(p))
+                                    })
+                                })
+                                .unwrap_or_default()
+                        };
+                        assert_eq!(
+                            crate::wire::color_spec(fg, depth),
+                            termwiz::color::ColorSpec::Default
+                        );
+                        assert_eq!(
+                            crate::wire::color_spec(bg, depth),
+                            termwiz::color::ColorSpec::Default
+                        );
+                    }
+                }
+            }
+            let (grid, surface) = fixture(level, depth);
+            let cells = surface.screen_cells();
+            for row in 0..grid.rows() {
+                for col in 0..grid.cols() {
+                    let cell = grid.get(col, row).unwrap();
+                    let expected_fg = cell
+                        .fg
+                        .tok()
+                        .map(|tok| {
+                            caps::test_override::with_color(depth, || {
+                                crate::chrome::with_palette(|p| tok.resolve(p))
+                            })
+                        })
+                        .unwrap_or_default();
+                    let expected_bg = if cell.bg == StyleTok::INHERIT {
+                        caps::test_override::with_color(depth, || {
+                            crate::chrome::with_palette(|p| {
+                                crate::chrome::theme_color(crate::chrome::slot_rgb(
+                                    p,
+                                    crate::chrome::S::Panel,
+                                ))
+                            })
+                        })
+                    } else {
+                        cell.bg
+                            .tok()
+                            .map(|tok| {
+                                caps::test_override::with_color(depth, || {
+                                    crate::chrome::with_palette(|p| tok.resolve(p))
+                                })
+                            })
+                            .unwrap_or_default()
+                    };
+                    assert_eq!(
+                        crate::wire::color_spec(cells[row][col].attrs().foreground(), depth),
+                        crate::wire::color_spec(expected_fg, depth)
+                    );
+                    assert_eq!(
+                        crate::wire::color_spec(cells[row][col].attrs().background(), depth),
+                        crate::wire::color_spec(expected_bg, depth)
+                    );
+                }
             }
         }
     }
@@ -225,6 +304,188 @@ fn emitter_coalesces_style_runs_and_rebuilds_cache_only_for_a_new_key() {
     emitter.bump_test_generation();
     emitter.emit(&grid, Rect::full(6, 1), &mut surface, 0, 0);
     assert_eq!(emitter.rebuilds(), 2);
+}
+
+#[test]
+fn wide_char_continuation_is_not_emitted_as_text() {
+    let mut grid = CellGrid::new(8, 1);
+    grid.view(Rect::full(8, 1))
+        .put_str(0, 0, "a界b", CellStyle::default());
+    let mut surface = Surface::new(8, 1);
+    emit::Emitter::default().emit(&grid, Rect::full(8, 1), &mut surface, 0, 0);
+    assert_eq!(rows(&mut surface)[0], format!("a界b{}", " ".repeat(4)));
+    assert_eq!(grid.get(3, 0).unwrap().ch, 'b');
+
+    let mut overwritten = CellGrid::new(4, 1);
+    overwritten
+        .view(Rect::full(4, 1))
+        .put_str(0, 0, "界xy", CellStyle::default());
+    overwritten.view(Rect::full(4, 1)).put(
+        1,
+        0,
+        CellStyle {
+            ch: 'q',
+            ..CellStyle::default()
+        },
+    );
+    assert_eq!(overwritten.get(0, 0).unwrap().ch, ' ');
+    assert_eq!(overwritten.get(1, 0).unwrap().ch, 'q');
+}
+
+#[test]
+fn ascii_panel_long_title_preserves_top_right_corner() {
+    caps::test_override::with_unicode(UnicodeLevel::Ascii, || {
+        let mut grid = CellGrid::new(10, 3);
+        let _body = panel::panel(
+            &mut grid,
+            Rect::full(10, 3),
+            "a very long panel title",
+            None,
+        );
+        assert_eq!(
+            grid.get(9, 0).unwrap().ch,
+            Glyph::BoxTr
+                .resolve(&caps::active_glyphs())
+                .chars()
+                .next()
+                .unwrap()
+        );
+    });
+}
+
+#[test]
+fn small_y_axis_keeps_max_and_zero_labels_distinct() {
+    for rows in [1, 2] {
+        let mut grid = CellGrid::new(8, rows);
+        axis::y_gutter(
+            &mut grid,
+            Rect::full(8, rows),
+            100.0,
+            Unit::Percent,
+            NumFmt::default(),
+        );
+        let max = (0..8)
+            .map(|x| grid.get(x, 0).unwrap().ch)
+            .collect::<String>();
+        assert!(
+            max.contains("100"),
+            "max label missing at {rows} rows: {max:?}"
+        );
+        if rows == 2 {
+            let zero = (0..8)
+                .map(|x| grid.get(x, 1).unwrap().ch)
+                .collect::<String>();
+            assert!(zero.contains('0'), "zero label missing: {zero:?}");
+        }
+    }
+}
+
+#[test]
+fn legend_exact_fit_does_not_drop_last_entry() {
+    let entries = [legend::LegendSwatch::series("cpu", SeriesRole::CpuUser)];
+    let width =
+        unicode_width::UnicodeWidthStr::width(caps::glyph(Glyph::LegendSwatch)) + 1 + "cpu".len();
+    let mut grid = CellGrid::new(width, 1);
+    legend::draw(&mut grid, Rect::full(width, 1), &entries);
+    let row = (0..width)
+        .map(|x| grid.get(x, 0).unwrap().ch)
+        .collect::<String>();
+    assert!(row.contains("cpu"));
+    assert!(!row.contains(caps::glyph(Glyph::Ellipsis)));
+}
+
+#[test]
+fn util_meter_emits_three_ansi16_or_eight_truecolor_levels() {
+    for (depth, expected) in [(ColorDepth::Ansi16, 3), (ColorDepth::Truecolor, 8)] {
+        caps::test_override::with_color(depth, || {
+            let mut grid = CellGrid::new(8, 1);
+            let mut meter = Meter::default();
+            meter.paint(
+                &mut grid,
+                Rect::full(8, 1),
+                MeterSpec {
+                    value: 1.0,
+                    warn: 0.7,
+                    crit: 0.9,
+                    ramp: RampId::Util,
+                    label: false,
+                    fmt: NumFmt::default(),
+                },
+            );
+            assert!((0..8).all(|x| grid.get(x, 0).unwrap().ch == caps::raster_table().hbar8[7]));
+            let mut surface = Surface::new(8, 1);
+            emit::Emitter::default().emit(&grid, Rect::full(8, 1), &mut surface, 0, 0);
+            let mut specs = Vec::new();
+            for cell in surface.screen_cells()[0].iter() {
+                let spec = crate::wire::color_spec(cell.attrs().foreground(), depth);
+                if !specs.contains(&spec) {
+                    specs.push(spec);
+                }
+            }
+            assert_eq!(specs.len(), expected);
+        });
+    }
+}
+
+#[test]
+fn warm_chrome_repaint_allocates_nothing() {
+    let mut grid = CellGrid::new(64, 8);
+    let entries = [legend::LegendSwatch::series("cpu", SeriesRole::CpuUser)];
+    let cols = [table::Col {
+        title: "process",
+        width: 16,
+        align: table::Align::Left,
+        unit: None,
+    }];
+    let row = [table::TableCell::Text("worker")];
+    let table_rows: [&[table::TableCell<'_>]; 1] = [&row];
+    let repaint = |grid: &mut CellGrid| {
+        let _body = panel::panel(grid, Rect::full(64, 8), "monitor panel title", None);
+        legend::draw(
+            grid,
+            Rect {
+                x: 1,
+                y: 1,
+                cols: 40,
+                rows: 1,
+            },
+            &entries,
+        );
+        axis::x_ticks(
+            grid,
+            Rect {
+                x: 1,
+                y: 2,
+                cols: 40,
+                rows: 1,
+            },
+            &["1m", "now"],
+        );
+        table::draw(
+            grid,
+            Rect {
+                x: 1,
+                y: 3,
+                cols: 40,
+                rows: 3,
+            },
+            &table::TableSpec {
+                cols: &cols,
+                rows: &table_rows,
+                offset: 0,
+                visible: 1,
+                sort: None,
+                selected: None,
+                fmt: NumFmt::default(),
+            },
+        );
+    };
+    repaint(&mut grid);
+    let ((), counts) = crate::proc_workload_alloc::measure(|| repaint(&mut grid));
+    assert_eq!(
+        counts.allocation_calls, 0,
+        "warm chrome repaint allocated: {counts:?}"
+    );
 }
 
 #[test]
@@ -376,9 +637,14 @@ fn warm_emit_allocations_scale_with_style_runs() {
 fn clipping_and_degenerate_widget_sizes_stay_inside_grid() {
     for (cols, rows) in [(0, 0), (1, 1), (2, 2), (7, 4)] {
         let mut grid = CellGrid::new(3, 3);
+        let sentinel = CellStyle {
+            ch: '!',
+            ..CellStyle::default()
+        };
+        grid.view(Rect::full(3, 3)).fill(sentinel);
         let rect = Rect {
-            x: 0,
-            y: 0,
+            x: 1,
+            y: 1,
             cols,
             rows,
         };
@@ -436,5 +702,16 @@ fn clipping_and_degenerate_widget_sizes_stay_inside_grid() {
             },
         );
         assert!(grid.cols() == 3 && grid.rows() == 3);
+        for y in 0..3 {
+            for x in 0..3 {
+                if x < rect.x
+                    || x >= rect.x.saturating_add(rect.cols)
+                    || y < rect.y
+                    || y >= rect.y.saturating_add(rect.rows)
+                {
+                    assert_eq!(grid.get(x, y).unwrap().ch, sentinel.ch);
+                }
+            }
+        }
     }
 }
