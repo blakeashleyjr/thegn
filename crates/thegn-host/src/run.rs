@@ -8083,7 +8083,17 @@ async fn event_loop<T: Terminal>(
             let target = $target.to_string();
             let group = $group.map(str::to_string);
             let after_switch = $after;
-            if session.id != target && !workspace_pool.contains(&target) {
+            if let Some(group_name) = group.as_deref()
+                && let Some(reason) = crate::handlers::worktree_delete::pending_delete_refusal(
+                    group_name,
+                    &session,
+                    &model.sidebar_db_worktrees,
+                    &sb.deleting,
+                )
+            {
+                model.status = reason;
+                false
+            } else if session.id != target && !workspace_pool.contains(&target) {
                 let request = crate::workspace_switch_prep::SwitchRequestSpec {
                     target: target.clone(),
                     group,
@@ -8218,9 +8228,11 @@ async fn event_loop<T: Terminal>(
                 &mut clear_on_next_frame,
                 Some((&terminal_restore_tx, &waker)),
             );
+            // A refusal's status must survive the caller's jump status.
             let activation_pending = matches!(
                 &activation,
                 crate::handlers::sidebar_activate::Activation::Pending(_)
+                    | crate::handlers::sidebar_activate::Activation::Refused
             );
             let workspace_switched = match activation {
                 crate::handlers::sidebar_activate::Activation::Pending(mut spec) => {
@@ -8247,6 +8259,7 @@ async fn event_loop<T: Terminal>(
                     false
                 }
                 crate::handlers::sidebar_activate::Activation::Failed => false,
+                crate::handlers::sidebar_activate::Activation::Refused => false,
                 crate::handlers::sidebar_activate::Activation::Landed { workspace_switched } => {
                     if workspace_switched
                         && adoption_target.as_deref().is_some_and(|target| {
@@ -10163,11 +10176,21 @@ async fn event_loop<T: Terminal>(
                         };
                         let previous_id = session.id.clone();
                         session.apply_workspace_switch(&request.target, prepared.clone());
-                        if let Some(group) = request.group.as_deref()
-                            && !session.land_on_group(group)
-                        {
-                            model.status =
-                                format!("'{group}' isn't loaded — its registry row may be stale");
+                        if let Some(group) = request.group.as_deref() {
+                            if let Some(reason) =
+                                crate::handlers::worktree_delete::pending_delete_refusal(
+                                    group,
+                                    &session,
+                                    &model.sidebar_db_worktrees,
+                                    &sb.deleting,
+                                )
+                            {
+                                model.status = reason;
+                            } else if !session.land_on_group(group) {
+                                model.status = format!(
+                                    "'{group}' isn't loaded — its registry row may be stale"
+                                );
+                            }
                         }
                         workspace_pool.stash(previous_id, previous, &mut panes);
                         if request.group.is_none()
@@ -10278,8 +10301,19 @@ async fn event_loop<T: Terminal>(
                         match crate::workspace_switch_prep::adoption_decision(current, found) {
                             crate::workspace_switch_prep::AdoptionDecision::Ignore => {}
                             crate::workspace_switch_prep::AdoptionDecision::Land => {
-                                session.land_on_group(name);
-                                persist_active_focus(&session);
+                                if let Some(reason) =
+                                    crate::handlers::worktree_delete::pending_delete_refusal(
+                                        name,
+                                        &session,
+                                        &model.sidebar_db_worktrees,
+                                        &sb.deleting,
+                                    )
+                                {
+                                    model.status = reason;
+                                } else {
+                                    session.land_on_group(name);
+                                    persist_active_focus(&session);
+                                }
                             }
                             crate::workspace_switch_prep::AdoptionDecision::ReportStale => {
                                 model.status = format!(
@@ -10337,18 +10371,31 @@ async fn event_loop<T: Terminal>(
                                             &current_paths,
                                         )
                                     {
-                                        session.switch_to(current_index);
-                                        refresh_tab_model(&mut model, &session, &mut sb);
-                                        need_relayout = true;
-                                        reconcile_drawer_runtime(
-                                            &session,
-                                            &mut panes,
-                                            &mut drawer,
-                                            &mut drawer_runtime,
-                                            &mut drawer_home,
-                                            keymap.config(),
-                                            chrome.center,
-                                        );
+                                        let target =
+                                            crate::sidebar::RowTarget::Tab(current_index, 0);
+                                        if let Some(reason) =
+                                            crate::handlers::worktree_delete::pending_target_refusal(
+                                                &target,
+                                                &session,
+                                                &model.sidebar_db_worktrees,
+                                                &sb.deleting,
+                                            )
+                                        {
+                                            model.status = reason;
+                                        } else {
+                                            session.switch_to(current_index);
+                                            refresh_tab_model(&mut model, &session, &mut sb);
+                                            need_relayout = true;
+                                            reconcile_drawer_runtime(
+                                                &session,
+                                                &mut panes,
+                                                &mut drawer,
+                                                &mut drawer_runtime,
+                                                &mut drawer_home,
+                                                keymap.config(),
+                                                chrome.center,
+                                            );
+                                        }
                                     }
                                 }
                                 Some(crate::nav::ConnectTarget::Workspace { repo_path, tab }) => {

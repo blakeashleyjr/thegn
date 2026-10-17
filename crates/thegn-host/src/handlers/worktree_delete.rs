@@ -33,6 +33,49 @@ pub(crate) fn resolve_group_indices(
         .collect()
 }
 
+/// Refuse name-based activation when the resident or registered worktree is
+/// already being destroyed.
+pub(crate) fn pending_delete_refusal(
+    name: &str,
+    session: &crate::session::Session,
+    db_worktrees: &[crate::sidebar::DbWorktree],
+    deleting: &std::collections::HashSet<String>,
+) -> Option<String> {
+    if deleting.is_empty() {
+        return None;
+    }
+    let is_pending = session
+        .worktrees
+        .iter()
+        .any(|group| group.name == name && deleting.contains(&group.path))
+        || db_worktrees
+            .iter()
+            .any(|worktree| worktree.tab_name == name && deleting.contains(&worktree.path));
+    is_pending.then(|| format!("'{name}' is being deleted"))
+}
+
+/// Resolve a visible row target to its pending worktree path, if any.
+pub(crate) fn pending_target_refusal(
+    target: &crate::sidebar::RowTarget,
+    session: &crate::session::Session,
+    db_worktrees: &[crate::sidebar::DbWorktree],
+    deleting: &std::collections::HashSet<String>,
+) -> Option<String> {
+    match target {
+        crate::sidebar::RowTarget::Tab(gi, _) => session.worktrees.get(*gi).and_then(|group| {
+            deleting
+                .contains(&group.path)
+                .then(|| format!("'{}' is being deleted", group.name))
+        }),
+        crate::sidebar::RowTarget::Workspace { repo_path, group } if repo_path != "terminal" => {
+            group
+                .as_deref()
+                .and_then(|name| pending_delete_refusal(name, session, db_worktrees, deleting))
+        }
+        _ => None,
+    }
+}
+
 pub(crate) struct DeleteCtx<'a> {
     pub session: &'a mut crate::session::Session,
     pub panes: &'a mut crate::panes::Panes,
@@ -313,14 +356,32 @@ pub(crate) fn hide_pending_deletes(
     if deleting.is_empty() {
         return;
     }
-    for row in rows {
-        if matches!(
-            row.kind,
-            crate::sidebar::RowKind::Worktree | crate::sidebar::RowKind::PipelineWorktree
-        ) && let Some(path) = &row.worktree_path
-            && deleting.contains(path)
+    for index in 0..rows.len() {
+        let hidden_depth = {
+            let row = &mut rows[index];
+            if matches!(
+                row.kind,
+                crate::sidebar::RowKind::Worktree | crate::sidebar::RowKind::PipelineWorktree
+            ) && let Some(path) = &row.worktree_path
+                && deleting.contains(path)
+            {
+                row.visible = false;
+                Some(row.depth)
+            } else {
+                None
+            }
+        };
+        if let Some(depth) = hidden_depth
+            && let Some(parent) = rows[..index]
+                .iter_mut()
+                .rev()
+                .find(|candidate| candidate.depth < depth)
+            && matches!(
+                parent.kind,
+                crate::sidebar::RowKind::Folder | crate::sidebar::RowKind::PipelineLane
+            )
         {
-            row.visible = false;
+            parent.child_count = parent.child_count.saturating_sub(1);
         }
     }
 }
@@ -581,8 +642,8 @@ fn landing_for_slug(session: &crate::session::Session, slug: Option<&str>) -> Op
 #[cfg(test)]
 mod tests {
     use super::{
-        TargetState, group_names_for, landing_for_slug, next_or_prev, resolve_group_indices,
-        target_state,
+        TargetState, group_names_for, hide_pending_deletes, landing_for_slug, next_or_prev,
+        pending_delete_refusal, pending_target_refusal, resolve_group_indices, target_state,
     };
     use crate::session::{GroupKind, Session, WorktreeGroup};
     use std::collections::HashSet;
@@ -755,5 +816,180 @@ mod tests {
             rows.iter().map(|row| row.visible).collect::<Vec<_>>(),
             [false, false, true, true]
         );
+    }
+
+    #[test]
+    fn pending_delete_refusal_names_only_pending_groups() {
+        let session = session_with(vec![WorktreeGroup::new(
+            "app/active",
+            GroupKind::Branch,
+            "/tmp/active",
+        )]);
+        let pending = HashSet::from(["/tmp/active".to_string(), "/tmp/parked".to_string()]);
+        let parked = crate::sidebar::DbWorktree {
+            slug: "app".into(),
+            branch: "parked".into(),
+            repo_path: "/repo".into(),
+            tab_name: "app/parked".into(),
+            path: "/tmp/parked".into(),
+            folder_id: None,
+            sandbox_backend: None,
+            env_name: None,
+            env_degraded: false,
+        };
+        assert_eq!(
+            pending_delete_refusal("app/active", &session, &[], &pending),
+            Some("'app/active' is being deleted".into())
+        );
+        assert_eq!(
+            pending_delete_refusal(
+                "app/parked",
+                &session,
+                std::slice::from_ref(&parked),
+                &pending
+            ),
+            Some("'app/parked' is being deleted".into())
+        );
+        assert_eq!(
+            pending_delete_refusal("app/other", &session, &[parked], &pending),
+            None
+        );
+        assert_eq!(
+            pending_delete_refusal("app/active", &session, &[], &HashSet::new()),
+            None
+        );
+    }
+
+    #[test]
+    fn pending_target_refusal_covers_tab_and_workspace_targets() {
+        let session = session_with(vec![
+            WorktreeGroup::new("app/home", GroupKind::Home, "/tmp/home"),
+            WorktreeGroup::new("app/branch", GroupKind::Branch, "/tmp/branch"),
+        ]);
+        let pending = HashSet::from(["/tmp/branch".to_string()]);
+        assert_eq!(
+            pending_target_refusal(
+                &crate::sidebar::RowTarget::Tab(1, 0),
+                &session,
+                &[],
+                &pending,
+            ),
+            Some("'app/branch' is being deleted".into())
+        );
+        assert_eq!(
+            pending_target_refusal(
+                &crate::sidebar::RowTarget::Workspace {
+                    repo_path: session.id.clone(),
+                    group: Some("app/branch".into()),
+                },
+                &session,
+                &[],
+                &pending,
+            ),
+            Some("'app/branch' is being deleted".into())
+        );
+        assert_eq!(
+            pending_target_refusal(
+                &crate::sidebar::RowTarget::Workspace {
+                    repo_path: "terminal".into(),
+                    group: Some("app/branch".into()),
+                },
+                &session,
+                &[],
+                &pending,
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn hide_pending_deletes_drops_hidden_rows_from_folder_and_lane_counts() {
+        let mut folder =
+            crate::sidebar::SidebarRow::base(crate::sidebar::RowKind::Folder, 1, "folder", "app");
+        folder.child_count = 2;
+        let mut lane = crate::sidebar::SidebarRow::base(
+            crate::sidebar::RowKind::PipelineLane,
+            2,
+            "lane",
+            "app",
+        );
+        lane.child_count = 1;
+        let mut pending_child = crate::sidebar::SidebarRow::base(
+            crate::sidebar::RowKind::Worktree,
+            2,
+            "pending",
+            "app",
+        );
+        pending_child.worktree_path = Some("/tmp/pending".into());
+        let mut sibling = crate::sidebar::SidebarRow::base(
+            crate::sidebar::RowKind::Worktree,
+            2,
+            "sibling",
+            "app",
+        );
+        sibling.worktree_path = Some("/tmp/sibling".into());
+        let mut mirror = crate::sidebar::SidebarRow::base(
+            crate::sidebar::RowKind::PipelineWorktree,
+            3,
+            "mirror",
+            "app",
+        );
+        mirror.worktree_path = Some("/tmp/mirror".into());
+        let mut untouched_folder = crate::sidebar::SidebarRow::base(
+            crate::sidebar::RowKind::Folder,
+            0,
+            "untouched",
+            "other",
+        );
+        untouched_folder.child_count = 2;
+        let untouched_child = crate::sidebar::SidebarRow::base(
+            crate::sidebar::RowKind::Worktree,
+            1,
+            "untouched child",
+            "other",
+        );
+        let mut rows = vec![
+            untouched_folder,
+            untouched_child,
+            folder,
+            pending_child,
+            sibling,
+            lane,
+            mirror,
+        ];
+
+        hide_pending_deletes(
+            &mut rows,
+            &HashSet::from(["/tmp/pending".to_string(), "/tmp/mirror".to_string()]),
+        );
+
+        assert_eq!(rows[0].child_count, 2);
+        assert_eq!(rows[2].child_count, 1);
+        assert_eq!(rows[5].child_count, 0);
+    }
+
+    #[test]
+    fn hide_pending_deletes_stops_parent_search_at_nearest_shallower_row() {
+        let mut folder =
+            crate::sidebar::SidebarRow::base(crate::sidebar::RowKind::Folder, 0, "folder", "app");
+        folder.child_count = 3;
+        let workspace = crate::sidebar::SidebarRow::base(
+            crate::sidebar::RowKind::Workspace,
+            0,
+            "workspace",
+            "app",
+        );
+        let mut pending = crate::sidebar::SidebarRow::base(
+            crate::sidebar::RowKind::Worktree,
+            1,
+            "pending",
+            "app",
+        );
+        pending.worktree_path = Some("/tmp/pending".into());
+        let mut rows = vec![folder, workspace, pending];
+
+        hide_pending_deletes(&mut rows, &HashSet::from(["/tmp/pending".to_string()]));
+
+        assert_eq!(rows[0].child_count, 3);
     }
 }
