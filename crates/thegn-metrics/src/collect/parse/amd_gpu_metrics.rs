@@ -110,6 +110,9 @@ fn rd_u16(buf: &[u8], limit: usize, off: usize) -> Option<u16> {
     let value = u16::from_le_bytes(bytes);
     (value != u16::MAX).then_some(value)
 }
+fn rd_current_coreclk(buf: &[u8], limit: usize, off: usize) -> Option<u16> {
+    rd_u16(buf, limit, off).filter(|value| *value != 0)
+}
 fn rd_u8(buf: &[u8], limit: usize, off: usize) -> Option<u8> {
     if off < limit {
         buf.get(off).copied()
@@ -268,7 +271,7 @@ fn decode_v2_0(buf: &[u8], limit: usize, m: &mut GpuMetrics) -> bool {
     m.current_vclk = rd_u16(buf, limit, 88);
     m.current_dclk = rd_u16(buf, limit, 90);
     for (i, value) in m.current_coreclk[..8].iter_mut().enumerate() {
-        *value = rd_u16(buf, limit, 92 + i * 2);
+        *value = rd_current_coreclk(buf, limit, 92 + i * 2);
     }
     for (i, value) in m.current_l3clk.iter_mut().enumerate() {
         *value = rd_u16(buf, limit, 108 + i * 2);
@@ -311,7 +314,7 @@ fn decode_v2_1(buf: &[u8], limit: usize, _format: u8, content: u8, m: &mut GpuMe
     m.current_vclk = rd_u16(buf, limit, 84);
     m.current_dclk = rd_u16(buf, limit, 86);
     for (i, value) in m.current_coreclk[..8].iter_mut().enumerate() {
-        *value = rd_u16(buf, limit, 88 + i * 2);
+        *value = rd_current_coreclk(buf, limit, 88 + i * 2);
     }
     for (i, value) in m.current_l3clk.iter_mut().enumerate() {
         *value = rd_u16(buf, limit, 104 + i * 2);
@@ -366,7 +369,7 @@ fn decode_v3(buf: &[u8], limit: usize, m: &mut GpuMetrics) -> bool {
     m.avg_uclk = rd_u16(buf, limit, 186);
     m.current_coreclk = [None; 16];
     for (i, value) in m.current_coreclk.iter_mut().enumerate() {
-        *value = rd_u16(buf, limit, 190 + i * 2);
+        *value = rd_current_coreclk(buf, limit, 190 + i * 2);
     }
     m.core_maxfreq = rd_u16(buf, limit, 222);
     m.gfx_maxfreq = rd_u16(buf, limit, 224);
