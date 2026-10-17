@@ -160,7 +160,10 @@ roster — its rows of **any** status, not only the live ones — so they surviv
 restart and a finished lane stays until its rows are removed from the roster.
 Every active roster row is retained, along with the newest 2048 finished rows.
 Older finished lanes drop out of the sidebar. A worktree no roster row references
-stays exactly where it was. A pipeline
+stays exactly where it was. Finished roster rows (not review tasks) are deleted
+90 days after they finish unless their worktree is still registered, an active
+autopilot run uses them, or a retained child points to them, so a finished lane
+of a removed worktree eventually leaves the sidebar. A pipeline
 folder only ever hangs under a project: a lane whose worktree is not registered
 anywhere is filed by the directory its siblings live in, and one thegn cannot
 tie to any project at all is left out of the tree rather than opening a second,
