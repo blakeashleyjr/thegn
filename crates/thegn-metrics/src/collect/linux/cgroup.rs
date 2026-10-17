@@ -288,9 +288,11 @@ mod tests {
         assert_eq!(cgroup2_root(temp.path()), Some(temp.path().to_path_buf()));
         let group = temp.path().join("group");
         std::fs::create_dir(&group).unwrap();
-        let mut collector = CgroupCollector::default();
-        collector.root = Some(temp.path().to_path_buf());
-        collector.filter = DeviceFilter::default();
+        let mut collector = CgroupCollector {
+            root: Some(temp.path().to_path_buf()),
+            filter: DeviceFilter::default(),
+            ..CgroupCollector::default()
+        };
         collector.set_targets(&vec![PathBuf::from("group"); MAX_GROUPS + 1]);
         assert!(collector.truncated);
         let mut frame = MonitorFrame::default();
@@ -317,8 +319,10 @@ mod tests {
     fn targets_cannot_escape_root_and_empty_device_filter_is_unknown() {
         let temp = tempfile::tempdir().unwrap();
         std::fs::write(temp.path().join("cgroup.controllers"), b"cpu").unwrap();
-        let mut collector = CgroupCollector::default();
-        collector.root = Some(temp.path().to_path_buf());
+        let mut collector = CgroupCollector {
+            root: Some(temp.path().to_path_buf()),
+            ..CgroupCollector::default()
+        };
         collector.set_targets(&[
             PathBuf::from("group"),
             PathBuf::from("../outside"),
