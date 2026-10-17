@@ -131,3 +131,10 @@ fn the_cache_key_round_trips() {
     );
     assert_eq!(CACHE_SCOPE, "weather");
 }
+
+#[test]
+fn weather_poll_uses_shared_runtime() {
+    let source = include_str!("hydrate_weather.rs");
+    assert!(!source.contains("new_current_thread"));
+    assert!(source.contains("thegn_svc::bg_runtime::block_on("));
+}

@@ -6,6 +6,7 @@
 //! kept permanently so a native gap degrades to "slower but works," never
 //! "broken." ssh has no native impl — the `ssh` CLI is the transport.
 
+pub mod bg_runtime;
 pub mod bridge;
 pub mod calendar;
 pub mod ci;
