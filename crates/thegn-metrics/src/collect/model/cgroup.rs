@@ -5,9 +5,9 @@ pub struct CpuStat {
     pub usage_usec: u64,
     pub user_usec: u64,
     pub system_usec: u64,
-    pub nr_periods: u64,
-    pub nr_throttled: u64,
-    pub throttled_usec: u64,
+    pub nr_periods: Option<u64>,
+    pub nr_throttled: Option<u64>,
+    pub throttled_usec: Option<u64>,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]

@@ -20,7 +20,7 @@ pub struct Owner<'a> {
     pub name: &'a [u8],
 }
 
-fn segments(path: &[u8]) -> impl Iterator<Item = &[u8]> {
+fn segments(path: &[u8]) -> impl DoubleEndedIterator<Item = &[u8]> {
     path.split(|byte| *byte == b'/')
         .filter(|part| !part.is_empty())
 }
@@ -34,15 +34,9 @@ pub fn is_thegn_slice(path: &[u8]) -> bool {
 }
 
 pub fn slice_prefix(path: &[u8]) -> Option<&[u8]> {
-    let mut start = 0;
-    for part in segments(path) {
-        let offset = part.as_ptr() as usize - path.as_ptr() as usize;
-        if part == THEGN_SLICE.as_bytes() {
-            start = offset + part.len();
-            return Some(&path[..start]);
-        }
-    }
-    None
+    let part = segments(path).find(|part| *part == THEGN_SLICE.as_bytes())?;
+    let offset = part.as_ptr() as usize - path.as_ptr() as usize;
+    Some(&path[..offset + part.len()])
 }
 
 pub fn scope_dir(path: &[u8]) -> &[u8] {
