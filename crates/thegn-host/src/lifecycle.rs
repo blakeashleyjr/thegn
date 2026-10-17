@@ -824,13 +824,8 @@ mod live_recycle {
             eprintln!("SPRITES_TOKEN unset — skipping");
             return;
         };
-        let tmp = std::env::temp_dir().join(format!("tg-live-recycle-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&tmp); // best-effort: cleanup: the target may already be gone; a failed removal never fails the caller
-        std::fs::create_dir_all(&tmp).unwrap();
-        let _env = crate::testenv::EnvVarGuard::set(&[(
-            "XDG_STATE_HOME",
-            tmp.join("state").to_str().unwrap(),
-        )]);
+        let state = crate::testenv::IsolatedState::new();
+        let tmp = state.root().to_path_buf();
         let before = sprite_names(&tok);
         let cfg = live_cfg();
         let repo = scratch_repo(&tmp);
@@ -925,13 +920,8 @@ mod live_recycle {
             eprintln!("SPRITES_TOKEN unset — skipping");
             return;
         };
-        let tmp = std::env::temp_dir().join(format!("tg-live-claim-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&tmp); // best-effort: cleanup: the target may already be gone; a failed removal never fails the caller
-        std::fs::create_dir_all(&tmp).unwrap();
-        let _env = crate::testenv::EnvVarGuard::set(&[(
-            "XDG_STATE_HOME",
-            tmp.join("state").to_str().unwrap(),
-        )]);
+        let state = crate::testenv::IsolatedState::new();
+        let tmp = state.root().to_path_buf();
         let before = sprite_names(&tok);
         let cfg = live_cfg();
         let repo = scratch_repo(&tmp);
@@ -987,13 +977,8 @@ mod live_recycle {
             eprintln!("SPRITES_TOKEN unset — skipping");
             return;
         };
-        let tmp = std::env::temp_dir().join(format!("tg-live-fallback-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&tmp); // best-effort: cleanup: the target may already be gone; a failed removal never fails the caller
-        std::fs::create_dir_all(&tmp).unwrap();
-        let _env = crate::testenv::EnvVarGuard::set(&[(
-            "XDG_STATE_HOME",
-            tmp.join("state").to_str().unwrap(),
-        )]);
+        let state = crate::testenv::IsolatedState::new();
+        let tmp = state.root().to_path_buf();
         let before = sprite_names(&tok);
         let cfg = live_cfg();
         let repo = scratch_repo(&tmp);

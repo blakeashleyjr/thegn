@@ -3,25 +3,13 @@
 # SHRINK-ONLY: migrate tests and remove their entries. Seeded for cross-platform
 # state isolation (owner request 2026-10-16, cross-platform test layer piece 3).
 
-agent_tests.rs
-canonical_history_tests.rs
 cmd/config.rs
 cmd/doctor.rs
-daemon/service.rs
-diff_watch.rs
-handlers/merge_queue.rs
-handlers/pr_queue.rs
-handlers/sidebar_mouse.rs
-handlers/sidebar_reorder.rs
-handlers/worktree_attach.rs
-handlers/worktree_launch.rs
-hook_run.rs
 hydrate_tests.rs
 integrate.rs
 integrate_candidate_tests.rs
 integrate_gate_tests.rs
 integrate_persistence.rs
-lifecycle.rs
 merge_cleanup.rs
 merge_driver.rs
 merge_ops.rs
@@ -29,5 +17,3 @@ platform/sandbox_floor_preflight_tests.rs
 platform/startup_watchdog_tests.rs
 platform/unix.rs
 run_tests.rs
-wizard.rs
-worktree_lifecycle.rs

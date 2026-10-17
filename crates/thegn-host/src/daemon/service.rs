@@ -3752,21 +3752,13 @@ mod tests {
             .prefix("thegn-provider-history-")
             .tempdir_in(std::fs::canonicalize(std::env::temp_dir()).unwrap())
             .unwrap();
-        let state = temp.path().join("state");
-        let config_root = temp.path().join("config");
-        let local = temp.path().join("local");
         let global = temp.path().join("gitconfig");
         let template = temp.path().join("template");
         std::fs::write(&global, "").unwrap();
         std::fs::create_dir(&template).unwrap();
         // Set and retain isolation before constructing any runtime or Git
         // worker. The implicit canonical-history Db::open is private too.
-        let _env = crate::testenv::EnvVarGuard::set(&[
-            ("XDG_STATE_HOME", state.to_str().unwrap()),
-            ("XDG_CONFIG_HOME", config_root.to_str().unwrap()),
-            ("APPDATA", config_root.to_str().unwrap()),
-            ("LOCALAPPDATA", local.to_str().unwrap()),
-            ("THEGN_DIR", temp.path().to_str().unwrap()),
+        let _env = crate::testenv::IsolatedState::with_env(&[
             ("THEGN_PROFILE", ""),
             ("GIT_CONFIG_GLOBAL", global.to_str().unwrap()),
             ("GIT_CONFIG_NOSYSTEM", "1"),
@@ -5014,11 +5006,7 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
         use thegn_core::store::IntentStore;
 
-        let state = tempfile::tempdir().expect("isolated state dir");
-        let _env = crate::testenv::EnvVarGuard::set(&[(
-            "XDG_STATE_HOME",
-            state.path().to_str().expect("state path"),
-        )]);
+        let _state = crate::testenv::IsolatedState::new();
         let (svc, _events) = service(0);
         let sh = thegn_core::util::which_path("sh").unwrap_or_else(|| "/bin/sh".into());
         let script = "i=0; while [ $i -lt 2005 ]; do printf 'source-line-%s\\n' $i; i=$((i+1)); done; if [ -n \"$THEGN_FORKED_FROM\" ]; then printf 'forked=%s\\nscrollback=%s\\n' \"$THEGN_FORKED_FROM\" \"$THEGN_FORK_SCROLLBACK\"; fi; while :; do sleep 1; done";
@@ -5069,8 +5057,8 @@ mod tests {
         assert_eq!((child.rows, child.cols), (41, 137));
         assert_eq!(child.forked_from.as_deref(), Some(source.id.as_str()));
 
-        let handoff = state
-            .path()
+        let handoff = _state
+            .state_home()
             .join("thegn/forks")
             .join(format!("{}.txt", child.id));
         let history = std::fs::read_to_string(&handoff).expect("handoff exists");
@@ -5173,23 +5161,15 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test(flavor = "multi_thread")]
     async fn agent_open_retains_the_provider_used_by_fresh_resolution() {
-        let state = tempfile::tempdir().expect("isolated state dir");
-        let config_home = tempfile::tempdir().expect("isolated config dir");
+        let state = crate::testenv::IsolatedState::new();
         let worktree = tempfile::tempdir().expect("isolated worktree");
-        let config_dir = config_home.path().join("thegn");
+        let config_dir = state.config_home().join("thegn");
         std::fs::create_dir_all(&config_dir).expect("config directory");
         std::fs::write(
             config_dir.join("config.toml"),
             "[sandbox]\nenabled = false\n\n[[agents]]\nname = \"worker\"\ncommand = \"sh\"\nprovider = \"codex\"\n",
         )
         .expect("fresh config");
-        let _env = crate::testenv::EnvVarGuard::set(&[
-            ("XDG_STATE_HOME", state.path().to_str().expect("state path")),
-            (
-                "XDG_CONFIG_HOME",
-                config_home.path().to_str().expect("config path"),
-            ),
-        ]);
 
         let mut boot = thegn_core::config::Config::default();
         boot.sandbox.enabled = false;

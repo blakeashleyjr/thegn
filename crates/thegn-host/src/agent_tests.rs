@@ -123,8 +123,8 @@ fn auto_chain_without_host_halts_instead_of_opening_a_host_shell() {
 #[test]
 #[cfg(unix)]
 fn compose_policy_miss_halts_before_auto_chain_host_entry() {
-    let tmp = std::env::temp_dir().join(format!("tg-compose-halt-{}", std::process::id()));
-    let fake_bin = tmp.join("bin");
+    let fake_root = tempfile::tempdir().unwrap();
+    let fake_bin = fake_root.path().join("bin");
     std::fs::create_dir_all(&fake_bin).unwrap();
     let fake_smol = fake_bin.join("smolmachines");
     std::fs::write(&fake_smol, "#!/bin/sh\nexit 0\n").unwrap();
@@ -133,13 +133,8 @@ fn compose_policy_miss_halts_before_auto_chain_host_entry() {
         use std::os::unix::fs::PermissionsExt as _;
         std::fs::set_permissions(&fake_smol, std::fs::Permissions::from_mode(0o755)).unwrap();
     }
-    let state = tmp.join("state");
-    std::fs::create_dir_all(&state).unwrap();
     let path = format!("{}:/usr/bin:/bin", fake_bin.display());
-    let _env = crate::testenv::EnvVarGuard::set(&[
-        ("XDG_STATE_HOME", state.to_str().unwrap()),
-        ("PATH", &path),
-    ]);
+    let _state = crate::testenv::IsolatedState::with_env(&[("PATH", &path)]);
     let mut cfg = Config::default();
     cfg.sandbox.backend = thegn_core::config::SandboxBackend::Auto;
     cfg.sandbox.backend_chain = vec!["smol".into(), "none".into()];
@@ -171,7 +166,6 @@ fn compose_policy_miss_halts_before_auto_chain_host_entry() {
         "{}",
         halt.reason
     );
-    std::fs::remove_dir_all(&tmp).unwrap();
 }
 
 #[test]
@@ -1245,25 +1239,9 @@ fn resolve_command_maps_agent_tool_and_shell() {
     assert_eq!(resolve_command(&cfg, "lazygit").unwrap(), "lazygit");
 }
 
-// Crate-wide env lock (shared with `run`'s sidebar tests): both redirect the
-// process-global `XDG_STATE_HOME`, so they must serialize on the SAME mutex.
-use crate::testenv::ENV_LOCK;
-
-fn with_temp_state<T>(name: &str, f: impl FnOnce() -> T) -> T {
-    let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    let dir = std::env::temp_dir().join(format!("tg-agent-{name}-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir); // best-effort: test cleanup: scratch removal must never fail the test
-    std::fs::create_dir_all(&dir).unwrap();
-    let old = std::env::var_os("XDG_STATE_HOME");
-    // SAFETY: guarded by ENV_LOCK; this module's DB-touching tests run inside this critical section.
-    unsafe { std::env::set_var("XDG_STATE_HOME", &dir) };
-    let out = f();
-    match old {
-        Some(v) => unsafe { std::env::set_var("XDG_STATE_HOME", v) },
-        None => unsafe { std::env::remove_var("XDG_STATE_HOME") },
-    }
-    let _ = std::fs::remove_dir_all(&dir); // best-effort: test cleanup: scratch removal must never fail the test
-    out
+fn with_temp_state<T>(_name: &str, f: impl FnOnce() -> T) -> T {
+    let _state = crate::testenv::IsolatedState::new();
+    f()
 }
 
 #[test]
@@ -2678,23 +2656,11 @@ fn explicit_floor_beats_deliberate_host() {
 
 #[test]
 fn compose_guard_protects_host_credentials_sockets_state_runtime_and_extra_paths() {
-    let root = tempfile::tempdir().expect("private tempdir");
-    let home = root.path().join("home");
-    let state = root.path().join("state");
-    let runtime = root.path().join("runtime");
-    let extra = root.path().join("control");
-    std::fs::create_dir_all(&home).unwrap();
-    std::fs::create_dir_all(&state).unwrap();
-    std::fs::create_dir_all(&runtime).unwrap();
+    let state = crate::testenv::IsolatedState::with_runtime_dir();
+    let home = state.root();
+    let runtime = state.root();
+    let extra = state.root().join("control");
     std::fs::create_dir_all(&extra).unwrap();
-    let home_s = home.to_str().unwrap();
-    let state_s = state.to_str().unwrap();
-    let runtime_s = runtime.to_str().unwrap();
-    let _env = crate::testenv::EnvVarGuard::set(&[
-        ("HOME", home_s),
-        ("XDG_STATE_HOME", state_s),
-        ("XDG_RUNTIME_DIR", runtime_s),
-    ]);
     let extra_paths = vec![extra.clone()];
     let guard = thegn_core::sandbox_compose::ComposeGuard::for_host(&extra_paths);
     let expected = [
@@ -2703,7 +2669,7 @@ fn compose_guard_protects_host_credentials_sockets_state_runtime_and_extra_paths
         home.join(".git-credentials"),
         std::path::PathBuf::from("/var/run/docker.sock"),
         runtime.join("podman/podman.sock"),
-        state.join("thegn"),
+        state.state_home().join("thegn"),
         runtime.join("thegn"),
         extra,
     ];
