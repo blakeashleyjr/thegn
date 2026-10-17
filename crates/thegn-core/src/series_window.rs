@@ -76,7 +76,8 @@ impl Window {
     }
 
     /// The canonical form: the largest whole unit that divides the span
-    /// (`30s`, `5m`, `1h`, `12h`, `all`), else plain seconds.
+    /// (`30s`, `5m`, `1h`, `24h`, `all`), else plain seconds. Whole days use
+    /// the `d` suffix only above one day, so one day is `24h`.
     ///
     /// This is *both* the display label and the persistence slug, on purpose.
     /// The pair it replaced were two copies of one match kept in step by hand;
@@ -88,6 +89,9 @@ impl Window {
         };
         for (div, suffix) in [(86_400, 'd'), (3_600, 'h'), (60, 'm')] {
             if s % div == 0 {
+                if div == 86_400 && s / div == 1 {
+                    return "24h".into();
+                }
                 return format!("{}{suffix}", s / div);
             }
         }
@@ -142,7 +146,7 @@ pub struct WindowLadder(Vec<Window>);
 impl WindowLadder {
     /// The shipped default ladder.
     pub const DEFAULT_KEYS: [&'static str; 9] =
-        ["30s", "1m", "5m", "10m", "30m", "1h", "6h", "12h", "all"];
+        ["30s", "1m", "5m", "10m", "30m", "1h", "6h", "12h", "24h"];
 
     /// Build from config strings.
     ///
@@ -311,10 +315,11 @@ mod tests {
     #[test]
     fn parse_and_label_round_trip() {
         for s in [
-            "30s", "1m", "5m", "10m", "30m", "1h", "6h", "12h", "1d", "all",
+            "30s", "1m", "5m", "10m", "30m", "1h", "6h", "12h", "24h", "1d", "2d", "all",
         ] {
             let parsed = Window::parse(s).unwrap_or_else(|| panic!("parse {s}"));
-            assert_eq!(parsed.label(), s, "label round trip for {s}");
+            let expected = if s == "1d" { "24h" } else { s };
+            assert_eq!(parsed.label(), expected, "label for {s}");
             assert_eq!(Window::parse(&parsed.label()), Some(parsed));
         }
     }
@@ -326,7 +331,9 @@ mod tests {
         assert_eq!(w(600).label(), "10m");
         assert_eq!(w(3_600).label(), "1h");
         assert_eq!(w(43_200).label(), "12h");
-        assert_eq!(w(86_400).label(), "1d");
+        assert_eq!(w(86_400).label(), "24h");
+        assert_eq!(w(172_800).label(), "2d");
+        assert_eq!(w(259_200).label(), "3d");
         // Not a whole number of minutes, so it stays in seconds rather than
         // rounding to a label that would parse back to a different window.
         assert_eq!(w(5_430).label(), "5430s");
@@ -426,15 +433,16 @@ mod tests {
     }
 
     #[test]
-    fn the_default_ladder_reaches_twelve_hours() {
+    fn the_default_ladder_reaches_a_day() {
         let l = WindowLadder::default_ladder();
         assert!(
             l.contains(w(43_200)),
             "12h must be a rung: {:?}",
             l.windows()
         );
-        assert!(l.contains(Window::EVERYTHING));
-        assert_eq!(l.widest_bounded_secs(), 43_200);
+        assert!(l.contains(w(86_400)));
+        assert!(!l.contains(Window::EVERYTHING));
+        assert_eq!(l.widest_bounded_secs(), 86_400);
         // Every documented rung parses — a typo in DEFAULT_KEYS would silently
         // shorten the shipped ladder.
         assert_eq!(l.windows().len(), WindowLadder::DEFAULT_KEYS.len());
@@ -467,9 +475,12 @@ mod tests {
     #[test]
     fn everything_walks_the_ladder_like_any_other_rung() {
         let l = WindowLadder::default_ladder();
-        assert_eq!(l.wider(Window::EVERYTHING), Window::EVERYTHING);
-        assert_eq!(l.narrower(Window::EVERYTHING), w(43_200));
-        assert_eq!(l.wider(w(43_200)), Window::EVERYTHING);
+        assert_eq!(l.wider(Window::EVERYTHING), w(86_400));
+        assert_eq!(l.narrower(Window::EVERYTHING), w(86_400));
+        assert_eq!(l.wider(w(86_400)), w(86_400));
+        let with_all = WindowLadder::parse(&["12h", "all"]);
+        assert_eq!(with_all.wider(w(43_200)), Window::EVERYTHING);
+        assert_eq!(with_all.narrower(Window::EVERYTHING), w(43_200));
     }
 
     #[test]
@@ -497,6 +508,7 @@ mod tests {
     #[test]
     fn display_matches_the_label() {
         assert_eq!(w(43_200).to_string(), "12h");
+        assert_eq!(w(86_400).to_string(), "24h");
         assert_eq!(Window::EVERYTHING.to_string(), "all");
     }
 }
