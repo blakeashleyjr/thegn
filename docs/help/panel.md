@@ -361,6 +361,8 @@ unread, low-priority, and shown rows. The inbox retains every unread row and
 the newest 50 read rows. Read rows older than 30 days are deleted from the
 state database; unread rows are never pruned. At Half width the highlighted
 row shows its whole message; Full width puts it in the detail column.
+At the next background maintenance round, read rows for a removed worktree
+are deleted regardless of age; unread rows are never pruned.
 
 {{keys:notifications}}
 

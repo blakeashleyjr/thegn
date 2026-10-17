@@ -89,8 +89,9 @@ and `spc` pause on every tab.
 
 The CPU tab shows total and per-core utilisation as a graph, with a heat grid
 for logical cores. Its load and clock section shows 1-, 5-, and 15-minute load,
-per-core frequency, temperature, and a load sparkline. The CPU, load, frequency,
-and uptime masthead chips expand into this tab.
+per-core load, one mean frequency across cores, temperature, and a load
+sparkline. The per-core bars are heat-tinted. The CPU, load, frequency, and
+uptime masthead chips expand into this tab.
 
 ## Memory
 
@@ -138,12 +139,16 @@ The optional `[stats.alerts] disk_eta` rule (off by default) fires off the same
 projection when the runway drops below a configured number of hours. The Disk
 masthead chip expands into this tab.
 
+The `worktrees filesystem` block reports total, available, and used space.
+
 ## GPU
 
 The GPU tab shows utilisation, memory, temperature, and power when those
 readings are available, with sparklines for the sampled metrics. On APUs, GPU
 memory is shared system memory and is labelled `gpu mem (shared)`. The GPU
-masthead chip expands into this tab.
+masthead chip expands into this tab. When several cards are available, it shows
+the busiest awake card. Runtime-suspended cards are not woken to sample them
+and read as 0% utilisation.
 
 ## Power
 
@@ -175,8 +180,10 @@ thegn's own panes and its pane daemon called out in the `owner` column.
   explicit step. A signal whose sampled process changed or left the displayed
   list is refused with “process changed or left the sampled list; select it
   again”. A signal that fails — no such process, permission denied — is shown
-  in the footer, never silently swallowed. This is a local, terminal-only
-  action: it is not exposed to the CLI, the control API, or any remote surface.
+  in the footer, never silently swallowed. When process identity cannot be
+  pinned, the signal is refused and the reason is shown in the footer. This is
+  a local, terminal-only action: it is not exposed to the CLI, the control API,
+  or any remote surface.
 
 Enumerating every process is the one genuinely expensive reading thegn takes, so
 it only happens while this tab is open and unpaused — closing the tab stops it
