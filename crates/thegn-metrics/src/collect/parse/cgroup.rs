@@ -15,9 +15,9 @@ pub fn cpu_stat(input: &[u8]) -> Option<CpuStat> {
         usage_usec: value_for(input, b"usage_usec")?,
         user_usec: value_for(input, b"user_usec")?,
         system_usec: value_for(input, b"system_usec")?,
-        nr_periods: value_for(input, b"nr_periods")?,
-        nr_throttled: value_for(input, b"nr_throttled")?,
-        throttled_usec: value_for(input, b"throttled_usec")?,
+        nr_periods: value_for(input, b"nr_periods"),
+        nr_throttled: value_for(input, b"nr_throttled"),
+        throttled_usec: value_for(input, b"throttled_usec"),
     })
 }
 
@@ -59,9 +59,15 @@ pub fn pids_max(input: &[u8]) -> Option<Limit> {
 
 pub fn maj_min(input: &[u8]) -> Option<(u32, u32)> {
     let colon = input.iter().position(|byte| *byte == b':')?;
-    let major = u32::try_from(parse_u64(&input[..colon])?).ok()?;
-    let minor = u32::try_from(parse_u64(&input[colon + 1..])?).ok()?;
+    let major = u32::try_from(parse_u64(trim_ascii(&input[..colon])?)?).ok()?;
+    let minor = u32::try_from(parse_u64(trim_ascii(&input[colon + 1..]))?).ok()?;
     Some((major, minor))
+}
+
+fn trim_ascii(input: &[u8]) -> Option<&[u8]> {
+    let start = input.iter().position(|byte| !byte.is_ascii_whitespace())?;
+    let end = input.iter().rposition(|byte| !byte.is_ascii_whitespace())?;
+    Some(&input[start..=end])
 }
 
 pub fn io_stat_sum(input: &[u8], counted: &[(u32, u32)]) -> IoTotals {
@@ -79,9 +85,10 @@ pub fn io_stat_sum(input: &[u8], counted: &[(u32, u32)]) -> IoTotals {
             continue;
         };
         for field in fields(line).skip(1) {
-            let Some((key, value)) = field.split_once(|byte| *byte == b'=') else {
+            let Some(separator) = field.iter().position(|byte| *byte == b'=') else {
                 continue;
             };
+            let (key, value) = (&field[..separator], &field[separator + 1..]);
             let Some(value) = parse_u64(value) else {
                 continue;
             };
@@ -121,7 +128,7 @@ mod tests {
                 cpu.nr_throttled,
                 cpu.throttled_usec
             ),
-            (100, 70, 30, 9, 2, 8)
+            (100, 70, 30, Some(9), Some(2), Some(8))
         );
         let mem = mem_stat(MEM);
         assert_eq!(
@@ -158,7 +165,9 @@ mod tests {
             (Some(1), Some(2), Some(3), Some(4), Some(5))
         );
         assert_eq!(mem_stat(b"anon 0\n").file, None);
-        assert_eq!(cpu_stat(b"usage_usec 2\n"), None);
+        let cpu = cpu_stat(b"usage_usec 2\nuser_usec 1\nsystem_usec 1\n").unwrap();
+        assert_eq!(cpu.usage_usec, 2);
+        assert_eq!(cpu.nr_periods, None);
         assert_eq!(single_u64(b"123\n"), Some(123));
         assert_eq!(single_u64(b"18446744073709551616"), None);
         assert_eq!(pids_max(b"max\n"), Some(Limit::Max));
@@ -168,6 +177,7 @@ mod tests {
     #[test]
     fn parses_io_totals_and_rejects_bad_device_numbers() {
         assert_eq!(maj_min(b"259:0"), Some((259, 0)));
+        assert_eq!(maj_min(b"259:0\n"), Some((259, 0)));
         assert_eq!(maj_min(b"999999999999:0"), None);
         assert_eq!(
             io_stat_sum(

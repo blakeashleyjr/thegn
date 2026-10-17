@@ -6,7 +6,7 @@ use std::fs::File;
 use std::io;
 use std::path::{Path, PathBuf};
 
-use super::procfile::{self, Source};
+use super::procfile;
 use crate::collect::env::Env;
 use crate::collect::frame::MonitorFrame;
 use crate::collect::health::{Absent, Health};
@@ -55,28 +55,31 @@ impl DeviceFilter {
             .collect();
         Self { devices }
     }
+
+    pub(crate) fn devices(&self) -> &[(u32, u32)] {
+        &self.devices
+    }
 }
 
 fn read_bytes<F: CgroupFs>(fs: &mut F, path: &Path, buf: &mut Vec<u8>) -> Option<usize> {
-    match fs.read(path, buf) {
-        Ok(length) => Some(length),
-        Err(_) => None,
-    }
+    fs.read(path, buf).ok()
 }
 
 pub fn read_group<F: CgroupFs>(
     fs: &mut F,
-    dir: &Path,
     filter: &DeviceFilter,
     buf: &mut Vec<u8>,
     sample: &mut CgroupSample,
+    path: &mut PathBuf,
 ) {
     *sample = CgroupSample::default();
     macro_rules! read {
         ($file:literal, $parse:expr, $field:ident) => {
-            if let Some(length) = read_bytes(fs, &dir.join($file), buf) {
+            path.push($file);
+            if let Some(length) = read_bytes(fs, path, buf) {
                 sample.$field = $parse(&buf[..length]);
             }
+            path.pop();
         };
     }
     read!("cpu.stat", cgroup::cpu_stat, cpu);
@@ -94,9 +97,13 @@ pub fn read_group<F: CgroupFs>(
     );
     read!("memory.swap.current", cgroup::single_u64, swap_current);
     read!("pids.current", cgroup::single_u64, pids_current);
-    if let Some(length) = read_bytes(fs, &dir.join("io.stat"), buf) {
-        sample.io = Some(cgroup::io_stat_sum(&buf[..length], &filter.devices));
+    path.push("io.stat");
+    if let Some(length) = read_bytes(fs, path, buf)
+        && !filter.devices.is_empty()
+    {
+        sample.io = Some(cgroup::io_stat_sum(&buf[..length], filter.devices()));
     }
+    path.pop();
 }
 
 #[derive(Debug, Default)]
@@ -107,15 +114,35 @@ pub struct CgroupCollector {
     filter: DeviceFilter,
     fs: RealFs,
     buffer: Vec<u8>,
+    path_buffer: PathBuf,
 }
 
 impl CgroupCollector {
     pub fn set_targets(&mut self, targets: &[PathBuf]) {
         self.targets.clear();
         self.truncated = targets.len() > MAX_GROUPS;
-        self.targets
-            .extend(targets.iter().take(MAX_GROUPS).cloned());
+        self.targets.extend(
+            targets
+                .iter()
+                .filter(|target| valid_target(target))
+                .take(MAX_GROUPS)
+                .map(|target| {
+                    self.root
+                        .as_ref()
+                        .map_or_else(|| target.clone(), |root| root.join(target))
+                }),
+        );
+        if let Some(root) = self.root.as_ref() {
+            self.targets.retain(|target| target.starts_with(root));
+        }
     }
+}
+
+fn valid_target(target: &Path) -> bool {
+    !target.is_absolute()
+        && target
+            .components()
+            .all(|component| !matches!(component, std::path::Component::ParentDir))
 }
 
 impl Collector for CgroupCollector {
@@ -136,6 +163,12 @@ impl Collector for CgroupCollector {
             return Health::Absent(Absent::NotOnThisOs);
         };
         self.filter = DeviceFilter::from_sys_block(Path::new("/sys/block"));
+        for target in &mut self.targets {
+            if !target.is_absolute() {
+                *target = root.join(&*target);
+            }
+        }
+        self.targets.retain(|target| target.starts_with(&root));
         self.root = Some(root);
         Health::Ok
     }
@@ -147,18 +180,20 @@ impl Collector for CgroupCollector {
         frame.parts.cgroup.groups.clear();
         frame.parts.cgroup.truncated = self.truncated;
         for (index, target) in self.targets.iter().enumerate() {
-            let dir = if target.is_absolute() {
-                target.clone()
-            } else {
-                root.join(target)
-            };
             let mut sample = CgroupSample::default();
+            self.path_buffer.clear();
+            if target.is_absolute() {
+                self.path_buffer.push(target);
+            } else {
+                self.path_buffer.push(root);
+                self.path_buffer.push(target);
+            }
             read_group(
                 &mut self.fs,
-                &dir,
                 &self.filter,
                 &mut self.buffer,
                 &mut sample,
+                &mut self.path_buffer,
             );
             frame.parts.cgroup.groups.push(GroupRow {
                 target: index as u16,
@@ -174,6 +209,7 @@ impl Collector for CgroupCollector {
         self.targets.clear();
         self.filter.devices.clear();
         self.buffer.clear();
+        self.path_buffer.clear();
     }
 }
 
@@ -208,12 +244,13 @@ mod tests {
         let mut fs = CountingFs::default();
         let mut buf = Vec::new();
         let mut sample = CgroupSample::default();
+        let mut path = group.clone();
         read_group(
             &mut fs,
-            &group,
             &DeviceFilter::default(),
             &mut buf,
             &mut sample,
+            &mut path,
         );
         assert!(fs.0 <= 12);
         assert_eq!(sample.mem_current, Some(123));
@@ -230,7 +267,7 @@ mod tests {
         ] {
             let dir = temp.path().join(name);
             std::fs::create_dir_all(&dir).unwrap();
-            std::fs::write(dir.join("dev"), dev).unwrap();
+            std::fs::write(dir.join("dev"), format!("{dev}\n")).unwrap();
             if physical {
                 std::fs::create_dir(dir.join("device")).unwrap();
             }
@@ -238,7 +275,7 @@ mod tests {
         let filter = DeviceFilter::from_sys_block(temp.path());
         let text = b"253:0 rbytes=100 wbytes=100\n259:0 rbytes=10 wbytes=20\n254:0 rbytes=10 wbytes=20\n259:0 rbytes=90\n";
         assert_eq!(
-            crate::collect::parse::cgroup::io_stat_sum(text, &filter.devices).rbytes,
+            crate::collect::parse::cgroup::io_stat_sum(text, filter.devices()).rbytes,
             10
         );
     }
@@ -274,5 +311,35 @@ mod tests {
             }),
             Health::Absent(Absent::NotOnThisOs)
         );
+    }
+
+    #[test]
+    fn targets_cannot_escape_root_and_empty_device_filter_is_unknown() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::write(temp.path().join("cgroup.controllers"), b"cpu").unwrap();
+        let mut collector = CgroupCollector::default();
+        collector.root = Some(temp.path().to_path_buf());
+        collector.set_targets(&[
+            PathBuf::from("group"),
+            PathBuf::from("../outside"),
+            PathBuf::from("/etc"),
+        ]);
+        assert_eq!(collector.targets, vec![temp.path().join("group")]);
+
+        let group = temp.path().join("group");
+        std::fs::create_dir(&group).unwrap();
+        std::fs::write(group.join("io.stat"), b"259:0 rbytes=10\n").unwrap();
+        let mut fs = CountingFs::default();
+        let mut buf = Vec::new();
+        let mut sample = CgroupSample::default();
+        let mut path = group.clone();
+        read_group(
+            &mut fs,
+            &DeviceFilter::default(),
+            &mut buf,
+            &mut sample,
+            &mut path,
+        );
+        assert_eq!(sample.io, None);
     }
 }
