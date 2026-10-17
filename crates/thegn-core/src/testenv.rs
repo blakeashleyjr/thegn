@@ -201,10 +201,13 @@ pub fn state_env_for(os: HostOs, root: &Path) -> Vec<(&'static str, PathBuf)> {
             ("APPDATA", root.join("AppData").join("Roaming")),
             ("LOCALAPPDATA", root.join("AppData").join("Local")),
         ],
+        // XDG_STATE_HOME deliberately lives OUTSIDE `$HOME/.local/state`: the THE-744
+        // guard treats `$HOME/.local/state` as the real state root, so an isolated
+        // root there would be refused.
         _ => vec![
             ("HOME", root.to_path_buf()),
             ("XDG_CONFIG_HOME", root.join(".config")),
-            ("XDG_STATE_HOME", root.join(".local/state")),
+            ("XDG_STATE_HOME", root.join("state")),
         ],
     }
 }
@@ -215,7 +218,7 @@ pub fn state_env_all(root: &Path) -> Vec<(&'static str, PathBuf)> {
     vec![
         ("HOME", root.to_path_buf()),
         ("XDG_CONFIG_HOME", root.join(".config")),
-        ("XDG_STATE_HOME", root.join(".local/state")),
+        ("XDG_STATE_HOME", root.join("state")),
         ("USERPROFILE", root.to_path_buf()),
         ("APPDATA", root.join("AppData").join("Roaming")),
         ("LOCALAPPDATA", root.join("AppData").join("Local")),
@@ -252,7 +255,7 @@ impl IsolatedState {
         let state = crate::util::xdg_state_home();
         let expected = match host_os() {
             HostOs::Windows => self.root().join("AppData").join("Local"),
-            _ => self.root().join(".local/state"),
+            _ => self.root().join("state"),
         };
         debug_assert_eq!(state, expected);
         state
