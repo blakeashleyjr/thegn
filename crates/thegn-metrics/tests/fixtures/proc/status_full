@@ -1,0 +1,14 @@
+Name:	bash
+Tgid:	1234
+Pid:	1234
+PPid:	1
+Uid:	1000	1001	1002	1003
+Gid:	4	5	6	7
+VmRSS:	1024 kB
+RssAnon:	512 kB
+RssFile:	256 kB
+RssShmem:	0 kB
+VmSwap:	0 kB
+Threads:	3
+voluntary_ctxt_switches:	10
+nonvoluntary_ctxt_switches:	2
