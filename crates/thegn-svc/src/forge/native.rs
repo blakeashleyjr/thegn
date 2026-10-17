@@ -450,7 +450,7 @@ impl GhCircuit {
         Self::with_seed(0)
     }
 
-    fn with_seed(seed: u64) -> Self {
+    pub(crate) fn with_seed(seed: u64) -> Self {
         Self {
             seed,
             failures: std::sync::atomic::AtomicU32::new(0),
@@ -544,6 +544,8 @@ fn cli_circuit_key(label: &str) -> u64 {
 
 const CLI_CIRCUIT_KEY_LABEL: &str = "gh-cli";
 
+/// Shared GitHub CLI poll circuit, registered so poll backoff and native reads
+/// also see it; an open CLI circuit holds the native read path too.
 pub(crate) fn cli_poll_circuit() -> Arc<GhCircuit> {
     let key = cli_circuit_key(CLI_CIRCUIT_KEY_LABEL);
     let circuits = CIRCUITS.get_or_init(|| Mutex::new(HashMap::new()));

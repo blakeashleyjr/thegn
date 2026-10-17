@@ -218,7 +218,8 @@ impl Forge for CliPollBreaker {
         self.inner.pr_authorship(loc, number)
     }
 
-    // pr_panel and fetch_pr deliberately use their default compositions so their component polls pass through this breaker.
+    // pr_panel and fetch_pr use their default compositions so component polls
+    // pass through this breaker.
 }
 
 #[cfg(test)]
@@ -365,7 +366,7 @@ mod tests {
     }
     #[test]
     fn cli_failures_open_hold_and_success_resets_the_shared_circuit() {
-        let circuit = super::super::native::cli_poll_circuit_for_test("cli-pr-status-regression");
+        let circuit = Arc::new(GhCircuit::with_seed(1));
         circuit.record_success();
         let inner = Arc::new(CountingForge::new(Some(ForgeError::Other(
             "http 502: bad gateway".into(),
@@ -462,17 +463,14 @@ mod tests {
 
     #[test]
     fn non_transient_cli_failures_do_not_open_circuit() {
-        for (index, error) in [
+        for error in [
             ForgeError::Offline,
             ForgeError::NotAuthenticated,
             ForgeError::NoPr,
         ]
         .into_iter()
-        .enumerate()
         {
-            let circuit = super::super::native::cli_poll_circuit_for_test(&format!(
-                "cli-nontransient-{index}"
-            ));
+            let circuit = Arc::new(GhCircuit::with_seed(2));
             circuit.record_success();
             let inner = Arc::new(CountingForge::new(Some(error.clone())));
             let breaker = CliPollBreaker::new(
@@ -510,7 +508,7 @@ mod tests {
         for message in [
             "http 404: missing",
             "http 499: client",
-            "parse error suffix",
+            "unexpected parse error",
             "other",
         ] {
             assert!(
