@@ -390,11 +390,11 @@ fn monitor_defaults() {
     let m = MonitorConfig::default();
     assert_eq!(m.system, "btm");
     assert_eq!(m.gpu, "nvtop");
-    // The shipped ladder reaches 12h and its default window is one of its own
+    // The shipped ladder reaches 24h and its default window is one of its own
     // rungs — a default between two rungs would snap on the first `[`/`]`.
     let ladder = crate::series_window::WindowLadder::parse(&m.window_ladder);
-    assert!(ladder.contains(crate::series_window::Window::from_secs(43_200)));
-    assert!(ladder.contains(crate::series_window::Window::EVERYTHING));
+    assert!(ladder.contains(crate::series_window::Window::from_secs(86_400)));
+    assert!(!ladder.contains(crate::series_window::Window::EVERYTHING));
     let default = crate::series_window::Window::parse(&m.default_window)
         .expect("the shipped default_window must parse");
     assert!(

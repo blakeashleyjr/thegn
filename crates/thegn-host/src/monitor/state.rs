@@ -336,11 +336,11 @@ mod tests {
     }
 
     #[test]
-    fn the_shipped_default_reaches_twelve_hours() {
+    fn the_shipped_default_reaches_a_day() {
         // The requirement, pinned where a config edit would break it.
         let p = MonitorPrefs::from_config(&thegn_core::config::MonitorConfig::default());
-        assert!(p.ladder().contains(Window::from_secs(43_200)));
-        assert!(p.ladder().contains(Window::EVERYTHING));
+        assert!(p.ladder().contains(Window::from_secs(86_400)));
+        assert!(!p.ladder().contains(Window::EVERYTHING));
         // The shipped default window must itself be a rung, or the first
         // `[`/`]` press would visibly snap somewhere the user didn't ask for.
         let w = p.tab(MonitorTab::Cpu).window;

@@ -296,11 +296,11 @@ gpu = "nvtop"    # GPU monitor
 # starting values: `[`/`]`, `g` and `s` change them live per tab, and the choice
 # is remembered per tab thereafter.
 #
-# The rungs `[`/`]` step through. Each is a duration (`30s`, `5m`, `12h`) or
-# `all`. Entries that don't parse are ignored rather than fatal, and an empty
-# list falls back to this default — the keys never go inert. Windows wider than
-# an hour are served from a coarser rolled-up history; see `history_retain`.
-window_ladder = ["30s", "1m", "5m", "10m", "30m", "1h", "6h", "12h", "all"]
+# The rungs `[`/`]` step through. Each is a duration (`30s`, `5m`, `24h`) or
+# `all` (everything retained). Entries that don't parse are ignored rather
+# than fatal, and an empty list falls back to this default — the keys never go
+# inert. A rung wider than collected history shows what it has and says so.
+window_ladder = ["30s", "1m", "5m", "10m", "30m", "1h", "6h", "12h", "24h"]
 default_window = "1m"      # snapped to the nearest window_ladder rung
 default_style = "area"     # area | line | spark
 default_scale = "window"   # window (relative to the visible max) | fixed | log
