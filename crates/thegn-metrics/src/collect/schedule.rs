@@ -79,14 +79,19 @@ mod tests {
     fn cadence_and_demand_are_enforced() {
         let mut demand = CollectorSet::empty();
         demand.insert(CollectorId::Loadavg);
-        assert!(due(
-            Mode::Open,
-            demand,
-            CollectorId::Loadavg,
-            Cadence::Every(1),
-            99,
-            99
-        ));
+        assert_eq!(
+            (0..100)
+                .filter(|tick| due(
+                    Mode::Open,
+                    demand,
+                    CollectorId::Loadavg,
+                    Cadence::Every(1),
+                    0,
+                    *tick
+                ))
+                .count(),
+            100
+        );
         assert_eq!(
             (0..100)
                 .filter(|tick| due(
@@ -101,14 +106,19 @@ mod tests {
             20
         );
         assert_eq!(Cadence::Static.period(), 30);
-        assert!(!due(
-            Mode::Open,
-            CollectorSet::empty(),
-            CollectorId::Loadavg,
-            Cadence::Every(1),
-            0,
+        assert_eq!(
+            (0..100)
+                .filter(|tick| due(
+                    Mode::Open,
+                    CollectorSet::empty(),
+                    CollectorId::Loadavg,
+                    Cadence::Every(1),
+                    0,
+                    *tick
+                ))
+                .count(),
             0
-        ));
+        );
     }
 
     #[test]
@@ -133,5 +143,15 @@ mod tests {
         for mode in [Mode::Paused, Mode::Hidden, Mode::Closed] {
             assert!(due_set(mode, demand, &inputs, &phase, 3).is_empty());
         }
+        let open_singletons = (0..6)
+            .map(|tick| due_set(Mode::Open, demand, &inputs, &phase, tick))
+            .filter(|due| due.len() == 1)
+            .collect::<Vec<_>>();
+        assert_eq!(open_singletons.len(), 4);
+        let distinct = open_singletons
+            .iter()
+            .flat_map(|due| due.iter())
+            .collect::<std::collections::HashSet<_>>();
+        assert_eq!(distinct.len(), 4);
     }
 }
