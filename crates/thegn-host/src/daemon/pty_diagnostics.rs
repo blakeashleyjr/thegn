@@ -61,27 +61,13 @@ mod tests {
             .or_else(|| payload.downcast_ref::<&str>().copied())
     }
 
-    fn isolated_state_env(root: &Path) -> crate::testenv::EnvVarGuard {
-        crate::testenv::EnvVarGuard::set(&[
-            ("HOME", root.to_str().expect("home path")),
-            (
-                "XDG_STATE_HOME",
-                root.join(".local/state").to_str().expect("state path"),
-            ),
-        ])
-    }
-
     #[test]
     fn record_never_writes_the_callers_xdg_state() {
-        let caller_state = tempfile::tempdir().expect("caller state");
-        let _env = crate::testenv::EnvVarGuard::set(&[(
-            "XDG_STATE_HOME",
-            caller_state.path().to_str().expect("caller state path"),
-        )]);
+        let state = crate::testenv::IsolatedState::new();
 
         record("d0-guard", "s1", None, "teardown_complete", Some("x"));
 
-        assert!(!caller_state.path().join("thegn/pty-shutdown").exists());
+        assert!(!state.state_home().join("thegn/pty-shutdown").exists());
         let record_path = path_in(&state_root(), "d0-guard", "s1");
         let contents = std::fs::read_to_string(record_path).expect("private record");
         assert!(contents.contains("teardown_complete"));
@@ -100,9 +86,8 @@ mod tests {
         if thegn_core::sandbox_backend::host_os() == thegn_core::sandbox_backend::HostOs::Windows {
             return;
         }
-        let root = tempfile::tempdir().expect("state root");
-        let _env = isolated_state_env(root.path());
-        let refused_path = root.path().join(".local/state/thegn/probe/x");
+        let state = crate::testenv::IsolatedState::with_real_home_layout();
+        let refused_path = state.root().join(".local/state/thegn/probe/x");
         let refused = std::panic::catch_unwind(|| {
             crate::platform::write_state_file(&refused_path, "v");
         });
@@ -117,9 +102,9 @@ mod tests {
             message.contains(&refused_path.display().to_string()),
             "{message}"
         );
-        assert!(!root.path().join(".local/state/thegn/probe").exists());
+        assert!(!state.root().join(".local/state/thegn/probe").exists());
 
-        let elsewhere = root.path().join("elsewhere/x");
+        let elsewhere = state.root().join("elsewhere/x");
         crate::platform::write_state_file(&elsewhere, "v");
         assert_eq!(
             std::fs::read_to_string(elsewhere).expect("written file"),
@@ -132,13 +117,12 @@ mod tests {
         if thegn_core::sandbox_backend::host_os() == thegn_core::sandbox_backend::HostOs::Windows {
             return;
         }
-        let root = tempfile::tempdir().expect("state root");
-        let _env = isolated_state_env(root.path());
+        let state = crate::testenv::IsolatedState::with_real_home_layout();
         let refused = std::panic::catch_unwind(crate::handlers::task_output::task_output_dir);
         assert!(
             matches!(refused, Err(payload) if panic_message(payload.as_ref()).is_some_and(|message| message.contains("THE-744")))
         );
-        assert!(!root.path().join(".local/state/thegn/task-output").exists());
+        assert!(!state.root().join(".local/state/thegn/task-output").exists());
     }
 
     #[test]
@@ -146,12 +130,11 @@ mod tests {
         if thegn_core::sandbox_backend::host_os() == thegn_core::sandbox_backend::HostOs::Windows {
             return;
         }
-        let root = tempfile::tempdir().expect("state root");
-        let _env = isolated_state_env(root.path());
+        let state = crate::testenv::IsolatedState::with_real_home_layout();
         let refused = std::panic::catch_unwind(|| crate::daemon::fork::write_handoff("c", "t"));
         assert!(
             matches!(refused, Err(payload) if panic_message(payload.as_ref()).is_some_and(|message| message.contains("THE-744")))
         );
-        assert!(!root.path().join(".local/state/thegn/forks").exists());
+        assert!(!state.root().join(".local/state/thegn/forks").exists());
     }
 }

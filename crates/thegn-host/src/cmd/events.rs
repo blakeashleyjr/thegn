@@ -346,12 +346,7 @@ mod tests {
 
     #[test]
     fn missing_daemon_returns_the_shared_recoverable_error() {
-        let state = tempfile::tempdir().unwrap();
-        let runtime = tempfile::tempdir().unwrap();
-        let _env = crate::testenv::EnvVarGuard::set(&[
-            ("XDG_STATE_HOME", state.path().to_str().unwrap()),
-            ("XDG_RUNTIME_DIR", runtime.path().to_str().unwrap()),
-        ]);
+        let _state = crate::testenv::IsolatedState::with_runtime_dir();
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()

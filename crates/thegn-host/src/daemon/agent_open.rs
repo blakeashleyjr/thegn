@@ -765,11 +765,7 @@ mod tests {
     #[test]
     fn matching_native_fork_preserves_source_command_and_fresh_launch_context() {
         let worktree = tempfile::tempdir().expect("isolated worktree");
-        let state = tempfile::tempdir().expect("isolated state dir");
-        let _env = crate::testenv::EnvVarGuard::set(&[(
-            "XDG_STATE_HOME",
-            state.path().to_str().expect("state path"),
-        )]);
+        let _state = crate::testenv::IsolatedState::new();
         let mut c = cfg();
         c.sandbox.enabled = false;
         let mut env = std::collections::BTreeMap::new();

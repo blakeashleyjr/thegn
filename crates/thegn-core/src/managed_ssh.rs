@@ -399,12 +399,10 @@ mod tests {
 
     #[test]
     fn global_operations_honor_thegn_dir_and_persist_rotation_recovery() {
-        let temp = tempfile::tempdir().unwrap();
-        let root = temp.path().to_string_lossy().into_owned();
-        let _env = crate::testenv::EnvGuard::set(&[("THEGN_DIR", &root)]);
+        let state = crate::testenv::IsolatedState::new();
         let key_path = Path::new("/state/ssh/fly-env-FLY-WORK_ed25519");
 
-        assert_eq!(dir(), temp.path().join("ssh/authorized.d"));
+        assert_eq!(dir(), state.thegn_dir().join("ssh/authorized.d"));
         record_authorized(
             "fly",
             "env:FLY_WORK",
@@ -451,9 +449,7 @@ mod tests {
 
     #[test]
     fn proxy_context_round_trips_and_unique_lookup_rejects_account_ambiguity() {
-        let temp = tempfile::tempdir().unwrap();
-        let root = temp.path().to_string_lossy().into_owned();
-        let _env = crate::testenv::EnvGuard::set(&[("THEGN_DIR", &root)]);
+        let _state = crate::testenv::IsolatedState::new();
         let key = Path::new("/state/ssh/sprite_ed25519");
 
         record_authorized_with_proxy_worktree(

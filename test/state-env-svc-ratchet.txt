@@ -3,5 +3,4 @@
 # SHRINK-ONLY: migrate tests and remove their entries. Seeded for cross-platform
 # state isolation (owner request 2026-10-16, cross-platform test layer piece 3).
 
-fly/mod.rs
 forge/native_global_connectivity_tests.rs
