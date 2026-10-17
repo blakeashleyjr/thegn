@@ -213,18 +213,8 @@ fn shared_client() -> Result<Client, IssueError> {
         .map_err(|_| IssueError::Policy("tracker HTTP client configuration failed"))
 }
 
-static TRACKER_RUNTIME: OnceLock<Result<tokio::runtime::Runtime, String>> = OnceLock::new();
-
 fn tracker_runtime() -> Result<&'static tokio::runtime::Runtime, IssueError> {
-    TRACKER_RUNTIME
-        .get_or_init(|| {
-            tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .map_err(|error| error.to_string())
-        })
-        .as_ref()
-        .map_err(|_| IssueError::Policy("tracker runtime unavailable"))
+    crate::bg_runtime::runtime().ok_or(IssueError::Policy("tracker runtime unavailable"))
 }
 
 /// Runs tracker work on the shared runtime so pooled connections survive

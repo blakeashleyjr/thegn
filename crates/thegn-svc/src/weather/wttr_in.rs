@@ -6,6 +6,7 @@
 //! a city from the request IP. Decoding is pure and lives in
 //! `thegn_core::weather::decode_wttr_j1` — this file is the transport.
 
+use std::sync::OnceLock;
 use std::time::Duration;
 
 use thegn_core::config_weather::WeatherConfig;
@@ -38,6 +39,7 @@ pub struct WttrInBackend {
     /// nothing here converts.
     units: Units,
     timeout: Duration,
+    base: &'static str,
 }
 
 impl WttrInBackend {
@@ -46,6 +48,17 @@ impl WttrInBackend {
             location: cfg.location.trim().to_string(),
             units,
             timeout: cfg.timeout(),
+            base: BASE,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_base(cfg: &WeatherConfig, units: Units, base: &'static str) -> Self {
+        Self {
+            location: cfg.location.trim().to_string(),
+            units,
+            timeout: cfg.timeout(),
+            base,
         }
     }
 }
@@ -60,8 +73,13 @@ impl WttrInBackend {
 /// There is no `?m` / `?u` unit flag: the `j1` payload carries **both** unit
 /// systems and `decode_wttr_j1` selects between them. That is why this feature
 /// contains no conversion arithmetic anywhere.
+#[cfg(test)]
 pub(crate) fn url_for(location: &str) -> Result<String, WeatherError> {
-    let mut u = reqwest::Url::parse(BASE).map_err(|e| WeatherError::Api(e.to_string()))?;
+    url_for_base(BASE, location)
+}
+
+fn url_for_base(base: &str, location: &str) -> Result<String, WeatherError> {
+    let mut u = reqwest::Url::parse(base).map_err(|e| WeatherError::Api(e.to_string()))?;
     let location = location.trim();
     if !location.is_empty() {
         u.path_segments_mut()
@@ -85,6 +103,20 @@ fn network_error(e: reqwest::Error) -> WeatherError {
     WeatherError::Network(e.without_url().to_string())
 }
 
+static CLIENT: OnceLock<Result<reqwest::Client, String>> = OnceLock::new();
+
+fn shared_client() -> Result<&'static reqwest::Client, WeatherError> {
+    CLIENT
+        .get_or_init(|| {
+            reqwest::Client::builder()
+                .user_agent(USER_AGENT)
+                .build()
+                .map_err(|_| "weather HTTP client configuration failed".to_string())
+        })
+        .as_ref()
+        .map_err(|_| WeatherError::Network("weather HTTP client configuration failed".into()))
+}
+
 impl WeatherProvider for WttrInBackend {
     fn provider_id(&self) -> &'static str {
         PROVIDER_ID
@@ -92,13 +124,13 @@ impl WeatherProvider for WttrInBackend {
 
     fn fetch<'a>(&'a self) -> BoxFuture<'a, Result<WeatherSnapshot, WeatherError>> {
         Box::pin(async move {
-            let url = url_for(&self.location)?;
-            let client = reqwest::Client::builder()
+            let url = url_for_base(self.base, &self.location)?;
+            let resp = shared_client()?
+                .get(url)
                 .timeout(self.timeout)
-                .user_agent(USER_AGENT)
-                .build()
+                .send()
+                .await
                 .map_err(network_error)?;
-            let resp = client.get(url).send().await.map_err(network_error)?;
 
             let status = resp.status();
             if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
