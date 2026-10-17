@@ -131,7 +131,10 @@ sandboxing — each with the gate that enforces it. Behavioural contracts are
   are inherited by later threads and child processes, so pooled runtime threads
   (`thegn-rt`, `tokio-runtime-worker`) are left alone. This is a no-op on
   Windows and other platforms. New long-lived threads should declare a class;
-  the default is `Interactive`, which for background work is wrong.
+  the default is `Interactive`, which for background work is wrong. Name each
+  thread with `thegn_core::thread_name::spawn_named` (`thegn-` prefix, at most
+  15 bytes, the Linux comm limit) and call `qos::set_self` first; a bare
+  production `thread::spawn` fails `test/thread-name-<crate>-ratchet.txt`.
 
 ## Source map
 
@@ -182,6 +185,8 @@ just coverage        # cargo llvm-cov, gated at 95% lines on the core
 just bench           # startup benchmarks (hyperfine; not part of ci)
 just bench-soak      # resource-soak gate: children/fds/threads/syscall rate (not in ci)
 just start name=dev  # run the host with an isolated XDG_STATE_HOME
+just test-windows-wine  # windows-gnu tests under Wine (heavy, not in ci)
+just test-remote host=<h>  # gate on an ssh host; see CONTRIBUTING.md
 just ci              # lint (fmt + ratchets) + deps-audit + build + cross/feature/msrv checks + test + coverage + smoke + term-check + nix-build (no e2e)
 just ci-local        # ci + e2e
 ```
@@ -351,7 +356,9 @@ part of the shipped `thegn` binary.
   outside the caps chokepoints, `gh` calls outside the forge impl,
   `async fn` in provider traits, ignored `Result`s, and a guard that the idle
   loop never polls. Pay debt down and delete the entry; never add one without a
-  reason in the file. `just ratchet-update` regenerates after a burn-down.)
+  reason in the file. This includes unnamed production threads and tests
+  writing HOME/XDG state directly (use `testenv::IsolatedState`).
+  `just ratchet-update` regenerates after a burn-down.)
 - **Remote CI is TEMPORARILY OFF — the pre-push hook is the only gate.**
   `.github/workflows/ci.yml` is dispatch-only (its `push`/`pull_request`
   triggers are commented out, with the reasoning above the `on:` key) because a

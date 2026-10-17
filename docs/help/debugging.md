@@ -74,7 +74,13 @@ ratios, the hot wake source, PTY throughput, and per-subsystem CPU timing. It
 also reports whole-process (`cpu_process_ms`), loop-thread (`cpu_loop_ms`),
 scan-pool (`cpu_scan_ms`), reaped-child (`cpu_children_reaped_ms`) and
 unattributed (`cpu_unattributed_ms`) CPU. Child CPU is counted when the child
-is reaped.
+is reaped. Allocator fields report the requested glibc arena cap and whether it
+applied, idle and scan-drain trims, released memory, bytes released on macOS,
+trim-call time, and drained scan bursts (including throttled ones). The
+`malloc_*` counters are cumulative since process start.
+`THEGN_MALLOC_ARENA_MAX` sets the glibc arena cap (default 2; 0 = uncapped).
+Named worker threads carry `thegn-` names (the Tokio pool is `thegn-rt`), so
+`top -H -p <pid>` or `/proc/<pid>/task/*/comm` shows which named thread is busy.
 The existing tuning variables are `THEGN_PERF_INTERVAL_MS` and
 `THEGN_PERF_WAKE_LIMIT`; `THEGN_PERF_PTY_LIMIT`, `THEGN_FRAME_BUDGET_US`, and
 `THEGN_INPUT_BUDGET_US` adjust the related guards. A `THEGN_LOG` filter that
