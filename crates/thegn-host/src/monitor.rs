@@ -367,11 +367,11 @@ pub enum ContainerReqKind {
 /// One Containers-tab row's identity, cached at rebuild so a key handler (which
 /// has no model) can resolve `sel` to a container without re-reading the model.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(super) struct ContainerRowMeta {
-    pub(super) name: String,
-    pub(super) backend: String,
-    pub(super) ours: bool,
-    pub(super) running: bool,
+struct ContainerRowMeta {
+    name: String,
+    backend: String,
+    ours: bool,
+    running: bool,
 }
 
 /// The tabbed system-monitor modal.
