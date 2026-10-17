@@ -15,11 +15,14 @@ use std::os::unix::fs::{MetadataExt, PermissionsExt};
 
 pub(crate) struct Directory {
     path: PathBuf,
+    #[cfg_attr(not(unix), allow(dead_code))]
     pins: Vec<(PathBuf, File, bool)>,
 }
 
 pub(crate) struct Regular {
+    #[cfg_attr(not(unix), allow(dead_code))]
     parent: Directory,
+    #[cfg_attr(not(unix), allow(dead_code))]
     path: PathBuf,
     file: File,
 }
@@ -701,6 +704,7 @@ impl Regular {
         }
     }
 
+    #[cfg_attr(not(unix), allow(dead_code))]
     pub(crate) fn write_all(&mut self, bytes: &[u8]) -> io::Result<()> {
         use std::io::Write;
         self.file.write_all(bytes)

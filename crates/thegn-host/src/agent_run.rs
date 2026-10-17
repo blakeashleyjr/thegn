@@ -90,6 +90,13 @@ fn fit_command(
 }
 
 /// One dispatch: where to run, what to say, and how long to allow.
+#[cfg_attr(
+    not(unix),
+    allow(
+        dead_code,
+        reason = "The Windows stub only reads kind; THE-235 uses these fields on Unix."
+    )
+)]
 pub(crate) struct AgentTaskRun<'a> {
     pub kind: TaskKind,
     /// Absolute path of the worktree the agent works in (its cwd).
