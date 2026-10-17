@@ -310,10 +310,11 @@ the output, and exits with the remote gate's status. Afterwards it deletes
   the Windows OpenSSH default shell). If the Windows default shell is
   PowerShell, set `THEGN_REMOTE_OS=windows`.
 - **Knobs:** `THEGN_REMOTE_DIR` (default `.cache/thegn-remote/<worktree>` on
-  unix, `tgr/<worktree>` on Windows, relative to the remote home directory),
-  `THEGN_REMOTE_CMD` (replaces the gate: a sh snippet on unix, PowerShell on
-  Windows), and `THEGN_REMOTE_SSH_CONFIG` (`ssh -F`). Each is described at the
-  top of the script.
+  unix, `tgr/<worktree>` on Windows, relative to the remote home directory).
+  Absolute paths, drive-letter paths, and `.` or `..` path segments are
+  refused. `THEGN_REMOTE_CMD` replaces the gate (a sh snippet on unix,
+  PowerShell on Windows), and `THEGN_REMOTE_SSH_CONFIG` passes `ssh -F`.
+  Each is described at the top of the script.
 - `just test-remote-selftest` checks the runner itself against a local ssh
   shim. It needs no network and compiles nothing.
 
@@ -357,6 +358,8 @@ just windows-vm-down      # clean shutdown;  windows-vm-status / windows-vm-dest
   and the generated `ssh_config` for host `thegn-winvm`. To reach the VM by
   name yourself, add `Include <state>/ssh_config` to `~/.ssh/config`. `setup`
   refuses to start with less than 80 GiB free (`THEGN_WINVM_MIN_FREE_GB`).
+  `windows-vm-destroy` deletes this directory only when it contains the VM
+  state marker; it refuses `/` and your home directory.
 - **Provisioning** needs no clicks. quickget's unattended install creates a
   local admin `Quickemu`, and `setup` adds a first-logon step that runs
   `test/windows-vm/provision.ps1`. That script installs OpenSSH Server (key
