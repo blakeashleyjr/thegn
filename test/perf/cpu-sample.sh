@@ -304,6 +304,26 @@ LOG_ENV=""
 if [ "$WORKLOAD" = 1 ]; then
   LOG_ENV=THEGN_LOG=thegn::input=debug
 fi
+
+# Resolve and configure the isolated daemon socket before the UI starts: config
+# is read once at startup, and the UI must see the same path the harness binds.
+DAEMON_LAUNCHER=""
+DAEMON_SOCK=""
+if [ "$SCENARIO" = soak-daemon ]; then
+  mkdir -p "$XDG_RUNTIME_DIR/thegn"
+  DAEMON_SOCK="$XDG_RUNTIME_DIR/thegn/perf.sock"
+  if [ "${#DAEMON_SOCK}" -gt 100 ]; then
+    PERF_SOCK_DIR="$(mktemp -d /tmp/tgpd.XXXXXX)"
+    chmod 700 "$PERF_SOCK_DIR"
+    DAEMON_SOCK="$PERF_SOCK_DIR/d.sock"
+  fi
+  mkdir -p "$(dirname "$DAEMON_SOCK")"
+  chmod 700 "$(dirname "$DAEMON_SOCK")"
+  mkdir -p "$XDG_CONFIG_HOME/thegn"
+  DAEMON_SOCK_CONFIG="${DAEMON_SOCK//\\/\\\\}"
+  DAEMON_SOCK_CONFIG="${DAEMON_SOCK_CONFIG//\"/\\\"}"
+  printf '[daemon]\nsocket = "%s"\n' "$DAEMON_SOCK_CONFIG" >"$XDG_CONFIG_HOME/thegn/config.toml"
+fi
 if [ "$SPAWN_ENABLED" = 1 ] && [ "$SAMPLER" = proc ]; then
   # `$1`/`$@` are the bash -c positionals passed after `$0`, not outer values.
   # shellcheck disable=SC2016
@@ -348,21 +368,8 @@ if [ "$WORKLOAD" = 1 ]; then
 fi
 
 # `soak-daemon` starts an isolated daemon and the workload input opens panes on
-# it. Use an explicit configured socket so the UI and daemon resolve the same path.
-DAEMON_LAUNCHER=""
-DAEMON_SOCK=""
+# it. Use the configured socket so the UI and daemon resolve the same path.
 if [ "$SCENARIO" = soak-daemon ]; then
-  mkdir -p "$XDG_RUNTIME_DIR/thegn"
-  DAEMON_SOCK="$XDG_RUNTIME_DIR/thegn/perf.sock"
-  if [ "${#DAEMON_SOCK}" -gt 100 ]; then
-    PERF_SOCK_DIR="$(mktemp -d /tmp/tgpd.XXXXXX)"
-    chmod 700 "$PERF_SOCK_DIR"
-    DAEMON_SOCK="$PERF_SOCK_DIR/d.sock"
-  fi
-  mkdir -p "$(dirname "$DAEMON_SOCK")"
-  chmod 700 "$(dirname "$DAEMON_SOCK")"
-  mkdir -p "$XDG_CONFIG_HOME/thegn"
-  printf '[daemon]\nsocket = "%s"\n' "$DAEMON_SOCK" >"$XDG_CONFIG_HOME/thegn/config.toml"
   if [ "$SPAWN_ENABLED" = 1 ] && [ "$SAMPLER" = proc ]; then
     TRACE_DAEMON_FILE="$PERF_TMP/daemon.execve"
     DAEMON_PIDFILE="$PERF_TMP/daemon.pid"
@@ -386,6 +393,9 @@ if [ "$SCENARIO" = soak-daemon ]; then
   done
   if [ ! -S "$DAEMON_SOCK" ]; then
     echo "FAIL: pane daemon never bound $DAEMON_SOCK" >&2
+    if [ "$JSON_ONLY" = 1 ]; then
+      printf '%s\n' '{"input":{"status":"failed","error":"daemon never bound"}}'
+    fi
     kill "$LAUNCHER" 2>/dev/null || true
     exec 3>&-
     wait "$LAUNCHER" 2>/dev/null || true
@@ -520,7 +530,11 @@ if [ "$SCENARIO" = steady-workload ] || [ "$SCENARIO" = soak ] || [ "$SCENARIO" 
   # Allow a first frame, then dismiss onboarding before counting dispatcher
   # output: onboarding-consumed keys do not reach the keymap logger.
   KEYS="$HERE/scenarios/steady-workload.keys"
-  [ "$SCENARIO" = soak-daemon ] && KEYS="$HERE/scenarios/soak-daemon.keys"
+  MIN_DISPATCH_LINES=7 # Both key files contain at least seven key events; Esc setup is excluded.
+  if [ "$SCENARIO" = soak-daemon ]; then
+    KEYS="$HERE/scenarios/soak-daemon.keys"
+    MIN_DISPATCH_LINES=7
+  fi
   sleep 3
   printf '\033' >&3
   sleep 0.8
@@ -553,12 +567,14 @@ if [ "$SCENARIO" = steady-workload ] || [ "$SCENARIO" = soak ] || [ "$SCENARIO" 
       DISPATCH_LINES="$(printf '%s\n' "$NEW_LINES" | grep -c 'key dispatch' || true)"
       MATCHED_LINES="$(printf '%s\n' "$NEW_LINES" | grep 'key dispatch' | grep -c 'matched' || true)"
     fi
-    [ "$DISPATCH_LINES" -gt 0 ] && break
+    [ "$DISPATCH_LINES" -ge "$MIN_DISPATCH_LINES" ] && break
     sleep 0.1
   done
-  if [ "$DISPATCH_LINES" -lt 1 ]; then
-    echo "FAIL: key injection had no observable effect (0 key dispatch lines in $LOG_FILE)" >&2
-    if [ "$JSON_ONLY" = 1 ]; then printf '%s\n' '{"input":{"status":"failed","keys_bytes":0,"dispatch_lines":0,"matched":0,"sessions":null}}'; fi
+  if [ "$DISPATCH_LINES" -lt "$MIN_DISPATCH_LINES" ]; then
+    echo "FAIL: key injection had no observable effect ($DISPATCH_LINES key dispatch lines; expected at least $MIN_DISPATCH_LINES in $LOG_FILE)" >&2
+    if [ "$JSON_ONLY" = 1 ]; then
+      printf '{"input":{"status":"failed","keys_bytes":%s,"dispatch_lines":%s,"matched":%s,"sessions":null}}\n' "$KEYS_BYTES" "$DISPATCH_LINES" "$MATCHED_LINES"
+    fi
     kill "$PID" 2>/dev/null || true
     exec 3>&-
     wait "$LAUNCHER" 2>/dev/null || true
@@ -570,7 +586,9 @@ if [ "$SCENARIO" = steady-workload ] || [ "$SCENARIO" = soak ] || [ "$SCENARIO" 
   fi
   if [ "$SCENARIO" = soak-daemon ] && [ "$MATCHED_LINES" -lt 1 ]; then
     echo "FAIL: soak-daemon key injection had no matched dispatch line in $LOG_FILE" >&2
-    if [ "$JSON_ONLY" = 1 ]; then printf '%s\n' '{"input":{"status":"failed","keys_bytes":0,"dispatch_lines":0,"matched":0,"sessions":null}}'; fi
+    if [ "$JSON_ONLY" = 1 ]; then
+      printf '{"input":{"status":"failed","keys_bytes":%s,"dispatch_lines":%s,"matched":%s,"sessions":null}}\n' "$KEYS_BYTES" "$DISPATCH_LINES" "$MATCHED_LINES"
+    fi
     kill "$PID" 2>/dev/null || true
     exec 3>&-
     wait "$LAUNCHER" 2>/dev/null || true
@@ -582,13 +600,19 @@ if [ "$SCENARIO" = steady-workload ] || [ "$SCENARIO" = soak ] || [ "$SCENARIO" 
   if [ "$SCENARIO" = soak-daemon ]; then
     SESSION_COUNT=0
     for _ in $(seq 1 150); do
-      SESSION_COUNT="$("$BIN_ABS" session list --live --json 2>/dev/null | python3 -c 'import json,sys; print(len(json.load(sys.stdin)))' 2>/dev/null || echo 0)"
+      OUT="$("$BIN_ABS" session list --live --json 2>/dev/null || true)"
+      SESSION_COUNT="$(python3 -c 'import json,sys; print(len(json.loads(sys.stdin.read())))' <<<"$OUT" 2>/dev/null || printf '0')"
+      case "$SESSION_COUNT" in
+      '' | *[!0-9]*) SESSION_COUNT=0 ;;
+      esac
       [ "$SESSION_COUNT" -ge 1 ] && break
       sleep 0.1
     done
     if [ "$SESSION_COUNT" -lt 1 ]; then
       echo 'FAIL: soak-daemon attached no panes to the harness daemon' >&2
-      if [ "$JSON_ONLY" = 1 ]; then printf '%s\n' '{"input":{"status":"failed","keys_bytes":%s,"dispatch_lines":%s,"matched":%s,"sessions":0}}' "$KEYS_BYTES" "$DISPATCH_LINES" "$MATCHED_LINES"; fi
+      if [ "$JSON_ONLY" = 1 ]; then
+        printf '{"input":{"status":"failed","keys_bytes":%s,"dispatch_lines":%s,"matched":%s,"sessions":0}}\n' "$KEYS_BYTES" "$DISPATCH_LINES" "$MATCHED_LINES"
+      fi
       kill "$PID" 2>/dev/null || true
       exec 3>&-
       wait "$LAUNCHER" 2>/dev/null || true
