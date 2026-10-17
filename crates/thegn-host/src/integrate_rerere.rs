@@ -47,8 +47,14 @@ pub(crate) fn cache_status(repo_root: &Path) -> Option<CacheStatus> {
     };
     let mut entries = 0;
     let mut resolved = 0;
-    for item in items.take(4096) {
-        let Ok(item) = item else { continue };
+    for item in items.filter_map(Result::ok) {
+        let name = item.file_name();
+        let Some(name) = name.to_str() else {
+            continue;
+        };
+        if !valid_rerere_id(name) || entries == 4096 {
+            continue;
+        }
         let item_path = item.path();
         let Ok(item_metadata) = std::fs::symlink_metadata(&item_path) else {
             continue;
@@ -91,6 +97,10 @@ fn valid_postimage_suffix(suffix: &str) -> bool {
         || suffix.strip_prefix('.').is_some_and(|digits| {
             !digits.is_empty() && digits.bytes().all(|byte| byte.is_ascii_digit())
         })
+}
+
+fn valid_rerere_id(id: &str) -> bool {
+    matches!(id.len(), 40 | 64) && id.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
 
 impl Cache {

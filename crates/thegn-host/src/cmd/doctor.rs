@@ -3468,7 +3468,7 @@ fn source_control_json(cfg: &Config) -> serde_json::Value {
     };
     let rerere_cache = if mq.rerere {
         root.as_deref()
-            .and_then(|root| crate::integrate::rerere_cache_status(root))
+            .and_then(crate::integrate::rerere_cache_status)
             .map(|status| {
                 serde_json::json!({
                     "path": status.path.display().to_string(),
