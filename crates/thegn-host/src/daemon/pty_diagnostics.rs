@@ -86,7 +86,7 @@ mod tests {
         if thegn_core::sandbox_backend::host_os() == thegn_core::sandbox_backend::HostOs::Windows {
             return;
         }
-        let state = crate::testenv::IsolatedState::new();
+        let state = crate::testenv::IsolatedState::with_real_home_layout();
         let refused_path = state.root().join(".local/state/thegn/probe/x");
         let refused = std::panic::catch_unwind(|| {
             crate::platform::write_state_file(&refused_path, "v");
@@ -117,7 +117,7 @@ mod tests {
         if thegn_core::sandbox_backend::host_os() == thegn_core::sandbox_backend::HostOs::Windows {
             return;
         }
-        let state = crate::testenv::IsolatedState::new();
+        let state = crate::testenv::IsolatedState::with_real_home_layout();
         let refused = std::panic::catch_unwind(crate::handlers::task_output::task_output_dir);
         assert!(
             matches!(refused, Err(payload) if panic_message(payload.as_ref()).is_some_and(|message| message.contains("THE-744")))
@@ -130,7 +130,7 @@ mod tests {
         if thegn_core::sandbox_backend::host_os() == thegn_core::sandbox_backend::HostOs::Windows {
             return;
         }
-        let state = crate::testenv::IsolatedState::new();
+        let state = crate::testenv::IsolatedState::with_real_home_layout();
         let refused = std::panic::catch_unwind(|| crate::daemon::fork::write_handoff("c", "t"));
         assert!(
             matches!(refused, Err(payload) if panic_message(payload.as_ref()).is_some_and(|message| message.contains("THE-744")))
