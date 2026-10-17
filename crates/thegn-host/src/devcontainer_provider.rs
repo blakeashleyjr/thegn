@@ -267,7 +267,7 @@ pub(crate) fn session_for(worktree: &str) -> Option<DevcontainerSession> {
     Some(session)
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 pub(crate) fn install_failing_test_session(
     worktree: &str,
     config_path: &Path,
@@ -323,7 +323,7 @@ pub(crate) fn install_failing_test_session(
     Ok(())
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 pub(crate) fn remove_test_session(worktree: &str) {
     sessions()
         .lock()

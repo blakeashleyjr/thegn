@@ -97,6 +97,7 @@ pub struct StatsSampler {
     last_net_medium: NetMedium,
     net_classes: std::collections::BTreeMap<String, crate::net_kind::IfaceClass>,
     net_up: std::collections::BTreeMap<String, bool>,
+    net_probed: bool,
 }
 
 /// Parse Linux `/proc/net/route`, returning every interface tied for the
@@ -217,6 +218,7 @@ impl StatsSampler {
             last_net_medium: NetMedium::Unknown,
             net_classes: std::collections::BTreeMap::new(),
             net_up: std::collections::BTreeMap::new(),
+            net_probed: false,
         }
     }
 
@@ -247,6 +249,24 @@ impl StatsSampler {
         if procs != self.tracked {
             self.tracked = procs;
             self.proc_primed = false;
+        }
+    }
+
+    fn refresh_net_links(
+        &mut self,
+        slow: bool,
+        probe: impl FnOnce(
+            &mut std::collections::BTreeMap<String, crate::net_kind::IfaceClass>,
+        ) -> (
+            crate::MediumSelection,
+            std::collections::BTreeMap<String, bool>,
+        ),
+    ) {
+        if slow || !self.net_probed {
+            let (network, up) = probe(&mut self.net_classes);
+            self.last_net_medium = network.medium;
+            self.net_up = up;
+            self.net_probed = true;
         }
     }
 
@@ -305,12 +325,7 @@ impl StatsSampler {
         self.nets.refresh(false);
         let dt_net = now.duration_since(self.prev_net).as_secs_f64().max(0.001);
         self.prev_net = now;
-        #[cfg(target_os = "linux")]
-        if self.net_classes.is_empty() {
-            let (network, up) = probe_net_links(&mut self.net_classes);
-            self.last_net_medium = network.medium;
-            self.net_up = up;
-        }
+        self.refresh_net_links(slow, probe_net_links);
         let (ifaces, physical, all) = crate::net_kind::aggregate(
             self.nets.iter().map(|(name, data)| {
                 (
@@ -354,9 +369,6 @@ impl StatsSampler {
 
         // --- Slow tier (every SLOW_EVERY-th tick): frequency, temps, disks ---
         if slow {
-            let (network, up) = probe_net_links(&mut self.net_classes);
-            self.last_net_medium = network.medium;
-            self.net_up = up;
             // Apple silicon publishes no SMC components, so `Components` comes
             // back empty there and the temperature row silently vanished. Ask
             // whichever backend the probe selected; `Components` stays the
@@ -872,5 +884,47 @@ mod tests {
             sampler.sys.processes().len(),
             pids.len()
         );
+    }
+
+    #[test]
+    fn net_probe_runs_once_per_slow_period_with_no_interfaces() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut sampler = StatsSampler::new(dir.path().to_path_buf());
+        let mut probes = 0;
+        for tick in 0..(3 * SLOW_EVERY) {
+            sampler.refresh_net_links(tick.is_multiple_of(SLOW_EVERY), |_| {
+                probes += 1;
+                (
+                    crate::MediumSelection::probe_unavailable(),
+                    std::collections::BTreeMap::new(),
+                )
+            });
+        }
+        assert_eq!(probes, 3);
+    }
+
+    #[test]
+    fn net_links_are_classified_on_the_first_call() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut sampler = StatsSampler::new(dir.path().to_path_buf());
+        let mut probes = 0;
+        sampler.refresh_net_links(false, |classes| {
+            probes += 1;
+            classes.insert(
+                "eth0".to_owned(),
+                crate::net_kind::IfaceClass {
+                    kind: crate::net_kind::IfaceKind::Ethernet,
+                    bond_slave: false,
+                    has_device: true,
+                    medium: NetMedium::Ethernet,
+                },
+            );
+            (
+                crate::MediumSelection::probe_unavailable(),
+                std::collections::BTreeMap::from([("eth0".to_owned(), true)]),
+            )
+        });
+        assert_eq!(probes, 1);
+        assert!(!sampler.net_classes.is_empty());
     }
 }

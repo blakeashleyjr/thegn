@@ -81,15 +81,9 @@ test-group = 'git-subprocess'
 # hiding it would make this gate lie. A filter that stops matching is silent
 # (see the git-subprocess note above), so prune entries when their test moves.
 #
-# Current entries, all one cause: Wine maps the host's Unix root as drive Z:
-# and resolves `/bin/sh`, `/proc/self/fd` etc. through it, so a test guard of
-# the form `Path::new("/bin/sh").exists()` is TRUE under Wine (it is false on
-# real Windows, where these tests return early and pass). The test then spawns
-# `sh`, which a Windows CreateProcess cannot run. The guards would be better as
-# `cfg!(unix)`; until then they are skipped here, not on real Windows.
+# The skip list is currently empty. The `/bin/sh` and `/proc` guards in the
+# media and metrics tests now use compile-time platform checks, so they return
+# before spawning or reading Linux-only resources under Wine. Keep the Z: drive
+# trap in mind when adding tests; runtime path checks are not platform checks.
 [profile.wine]
-default-filter = '''
-all()
-- (package(thegn-media) & test(/^helper::tests::(completes_and_captures|grandchild_dies_with_the_tree|infinite_stderr_is_capped|infinite_stdout_is_capped|never_exit_times_out_and_is_reaped|cancelling_the_future_kills_the_tree)$/))
-- (package(thegn-metrics) & test(=sample::tests::reaped_tracked_process_is_pruned_and_its_proc_fd_is_released))
-'''
+default-filter = 'all()'
