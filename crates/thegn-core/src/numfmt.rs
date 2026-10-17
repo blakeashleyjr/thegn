@@ -256,26 +256,28 @@ fn scaled(value: f64, divisor: f64, suffixes: &[&str], decimals: &[usize], width
         magnitude /= divisor;
         scale += 1;
     }
-    for current in scale..suffixes.len() {
+    let mut current = scale;
+    let mut did_promote = false;
+    loop {
         let scaled = value.abs() / divisor.powi(current as i32);
+        let mut promote = false;
         for places in decimals {
             let mantissa = format!("{scaled:.precision$}", precision = *places);
             let rounded = mantissa.parse::<f64>().unwrap_or(f64::INFINITY);
-            if rounded >= 1000.0 && current + 1 < suffixes.len() {
+            if rounded >= 1000.0 {
+                promote = !did_promote && current + 1 < suffixes.len();
                 break;
             }
             let candidate = format!("{sign}{mantissa}{}", suffixes[current]);
-            if cells(&candidate) <= width {
+            if (value == 0.0 || rounded != 0.0) && cells(&candidate) <= width {
                 return candidate;
             }
         }
-    }
-    if scale + 1 == suffixes.len() {
-        let scaled = value.abs() / divisor.powi(scale as i32);
-        let candidate = format!("{sign}{scaled:.0}{}", suffixes[scale]);
-        if cells(&candidate) <= width {
-            return candidate;
+        if !promote {
+            break;
         }
+        current += 1;
+        did_promote = true;
     }
     "#".repeat(width)
 }
@@ -289,7 +291,9 @@ fn bytes(value: f64, divisor: f64, width: usize) -> String {
         scale += 1;
     }
     let sign = if value.is_sign_negative() { "-" } else { "" };
-    for current in scale..suffixes.len() {
+    let mut current = scale;
+    let mut did_promote = false;
+    loop {
         let mantissa_value = value.abs() / divisor.powi(current as i32);
         let decimals: &[usize] = if mantissa_value >= 100.0 {
             &[0]
@@ -298,18 +302,24 @@ fn bytes(value: f64, divisor: f64, width: usize) -> String {
         } else {
             &[2, 1, 0]
         };
+        let mut promote = false;
         for places in decimals {
             let mantissa = format!("{mantissa_value:.precision$}", precision = *places);
-            if mantissa.parse::<f64>().unwrap_or(f64::INFINITY) >= 1000.0
-                && current + 1 < suffixes.len()
-            {
+            let rounded = mantissa.parse::<f64>().unwrap_or(f64::INFINITY);
+            if rounded >= 1000.0 {
+                promote = !did_promote && current + 1 < suffixes.len();
                 break;
             }
             let candidate = format!("{sign}{mantissa}{}", suffixes[current]);
-            if cells(&candidate) <= width {
+            if (value == 0.0 || rounded != 0.0) && cells(&candidate) <= width {
                 return candidate;
             }
         }
+        if !promote {
+            break;
+        }
+        current += 1;
+        did_promote = true;
     }
     "#".repeat(width)
 }
@@ -364,7 +374,9 @@ fn temperature(v: f64, scale: viz::TempScale, width: usize) -> String {
     if !shown.is_finite() {
         return "#".repeat(width);
     }
-    for candidate in [format!("{shown:.1}°"), format!("{shown:.0}°")] {
+    // Other candidates keep Rust's ties-to-even formatting; integer temperatures
+    // use half-away-from-zero rounding for intuitive readings.
+    for candidate in [format!("{shown:.1}°"), format!("{:.0}°", shown.round())] {
         if cells(&candidate) <= width {
             return candidate;
         }
@@ -387,37 +399,41 @@ fn duration(v: f64, width: usize) -> String {
     let minutes = n / 60 % 60;
     let seconds = n % 60;
     let full = if days >= 100 {
-        format!("{}d", days)
-    } else if days >= 7 {
-        format!("{}w", days / 7)
+        format!("{days}d")
     } else if days > 0 {
-        format!("{}d{:02}h", days, hours)
+        format!("{days}d{hours:02}h")
     } else if n >= 3_600 {
         format!("{}h{:02}m", n / 3_600, minutes)
     } else if n >= 60 {
         format!("{}m{:02}", n / 60, seconds)
     } else {
-        format!("{}s", n)
+        format!("{n}s")
     };
     if cells(&full) <= width {
         return full;
     }
     let compact = if days > 0 {
-        format!("{}d{:02}", days, hours)
+        format!("{days}d{hours:02}")
     } else if n >= 3_600 {
         format!("{}h{:02}", n / 3_600, minutes)
     } else if n >= 60 {
         format!("{}m{:02}", n / 60, seconds)
     } else {
-        format!("{}s", n)
+        format!("{n}s")
     };
     if cells(&compact) <= width {
         return compact;
     }
-    if n >= 60 && n < 3_600 {
+    if (60..3_600).contains(&n) {
         let short_minutes = format!("{}m", n / 60);
         if cells(&short_minutes) <= width {
             return short_minutes;
+        }
+    }
+    if days >= 7 {
+        let weeks = format!("{}w", days / 7);
+        if cells(&weeks) <= width {
+            return weeks;
         }
     }
     compact
@@ -508,6 +524,20 @@ mod tests {
                         width,
                         "{unit:?} {value:?} w{width}: {out:?}"
                     );
+                    if value.is_finite() && value != 0.0 {
+                        let rendered = out.trim();
+                        if let Some(suffix) = rendered.chars().last()
+                            && matches!(suffix, 'k' | 'K' | 'M' | 'G' | 'T' | 'P' | 'E')
+                            && let Some(mantissa) = rendered.strip_suffix(suffix)
+                            && let Ok(mantissa) = mantissa.parse::<f64>()
+                        {
+                            assert_ne!(mantissa, 0.0, "{unit:?} {value:?} w{width}: {out:?}");
+                            assert!(
+                                mantissa.abs() < 1000.0,
+                                "{unit:?} {value:?} w{width}: {out:?}"
+                            );
+                        }
+                    }
                 }
             }
         }
@@ -580,7 +610,7 @@ mod tests {
             },
             ..NumFmt::default()
         };
-        assert_eq!(decimal.fmt(1_000_000.0, Unit::Bytes, 5), "1.0M");
+        assert_eq!(decimal.fmt(1_000_000.0, Unit::Bytes, 5), " 1.0M");
         assert_eq!(fmt(1_000_000.0, Unit::Bytes, 5), " 977K");
     }
 
@@ -590,9 +620,10 @@ mod tests {
         assert_eq!(fmt(912.0, Unit::CpuCoreSum, 5), "912.0");
         assert_eq!(fmt(912.0, Unit::CpuCoreSum, 4), " 912");
         assert_eq!(fmt(1_610_612_736.0, Unit::Bytes, 5), "1.50G");
-        assert_eq!(fmt(48_000.0, Unit::Count, 5), "48k");
+        assert_eq!(fmt(125.0, Unit::BitsPerSec, 5), " 1.0K");
+        assert_eq!(fmt(48_000.0, Unit::Count, 5), "  48k");
         assert_eq!(fmt(1.42, Unit::Ratio, 4), "1.42");
-        assert_eq!(fmt(772_000_000.0, Unit::Hertz, 5), "772M");
+        assert_eq!(fmt(772_000_000.0, Unit::Hertz, 5), " 772M");
         assert_eq!(fmt(5_160_000_000.0, Unit::Hertz, 5), "5.16G");
         assert_eq!(fmt(4.82, Unit::Watts, 5), "4.82W");
         assert_eq!(fmt(53.6, Unit::WattHours, 6), "53.6Wh");
@@ -604,11 +635,13 @@ mod tests {
         assert_eq!(fmt(90.5, Unit::Temp, 4), " 91°");
         assert_eq!(fmt(45.0, Unit::Duration, 5), "  45s");
         assert_eq!(fmt(243.0, Unit::Duration, 4), "4m03");
-        assert_eq!(fmt(720.0, Unit::Duration, 4), "12m");
+        assert_eq!(fmt(720.0, Unit::Duration, 4), " 12m");
         assert_eq!(fmt(86_400.0 * 3.0 + 14_400.0, Unit::Duration, 5), "3d04h");
-        assert_eq!(fmt(86_400.0 * 123.0, Unit::Duration, 5), "123d");
-        assert_eq!(fmt(86_400.0 * 98.0, Unit::Duration, 5), "14w");
-        assert_eq!(fmt(12.0, Unit::Age, 4), "12s");
+        assert_eq!(fmt(86_400.0 * 123.0, Unit::Duration, 5), " 123d");
+        assert_eq!(fmt(86_400.0 * 10.0, Unit::Duration, 5), "10d00");
+        assert_eq!(fmt(86_400.0 * 13.0, Unit::Duration, 5), "13d00");
+        assert_eq!(fmt(86_400.0 * 98.0, Unit::Duration, 3), "14w");
+        assert_eq!(fmt(12.0, Unit::Age, 4), " 12s");
         let fahrenheit = NumFmt {
             units: viz::UnitFmt {
                 temp: viz::TempScale::Fahrenheit,
@@ -617,7 +650,17 @@ mod tests {
             ..NumFmt::default()
         };
         assert_eq!(fahrenheit.fmt(100.0, Unit::Temp, 5), " 212°");
-        assert_eq!(fmt(4096.0, Unit::Bytes, 5), "4.0K");
+        assert_eq!(fmt(4096.0, Unit::Bytes, 5), " 4.0K");
+
+        assert_eq!(fmt(4096.0, Unit::Bytes, 4), "4.0K");
+        assert_eq!(fmt(125.0, Unit::BitsPerSec, 4), "1.0K");
+        assert_eq!(fmt(48_000.0, Unit::Count, 4), " 48k");
+        assert_eq!(fmt(12_000.0, Unit::Hertz, 4), " 12k");
+        assert_eq!(fmt(4.8, Unit::Watts, 4), "4.8W");
+        assert_eq!(fmt(12.0, Unit::Volts, 4), "12V");
+        assert_eq!(fmt(4.9, Unit::Amps, 4), "4.9A");
+        assert_eq!(fmt(12.0, Unit::Age, 4), " 12s");
+        assert_eq!(fmt(360_000.0, Unit::TimePlus, 4), "####");
     }
 
     #[test]
@@ -628,6 +671,10 @@ mod tests {
             "    -"
         );
         assert_eq!(fmt(100.0, Unit::Percent, 2), "##");
+        assert_eq!(fmt(400.0, Unit::Count, 2), "##");
+        assert_eq!(fmt(500.0, Unit::Bytes, 3), "###");
+        assert_eq!(fmt(50.0, Unit::Bytes, 2), "##");
+        assert_eq!(fmt(400.0, Unit::Hertz, 2), "##");
         assert_eq!(
             formatter(Marks::UNICODE, ZeroStyle::Dot).fmt(0.0, Unit::Count, 3),
             "  ·"
