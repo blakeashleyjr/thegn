@@ -265,12 +265,9 @@ impl Db {
                 params![cutoff],
             )
             .map_err(map_busy)?;
-        let (pruned_removed_notifications, pruned_issue_links) = self
-            .prune_removed_worktree_rows(ORPHAN_CACHE_SWEEP_MAX_KEYS)
-            .map_err(map_busy)?;
-        let pruned_dispatches = self
-            .prune_terminal_dispatches(now_secs.saturating_mul(1000))
-            .map_err(map_busy)?;
+        let (pruned_removed_notifications, pruned_issue_links) =
+            self.prune_removed_worktree_rows(ORPHAN_CACHE_SWEEP_MAX_KEYS)?;
+        let pruned_dispatches = self.prune_terminal_dispatches(now_secs.saturating_mul(1000))?;
         let mut report = MaintenanceReport {
             pruned_notifications,
             pruned_removed_notifications,
