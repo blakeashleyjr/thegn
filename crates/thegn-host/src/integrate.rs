@@ -526,6 +526,7 @@ impl PlumbingAdapter {
         if self.rerere
             && let Some(cache) = rerere::Cache::open(&self.repo_root)
         {
+            rerere::import_shared(&cache, &self.repo_root);
             rerere::train_from_history(
                 &cache,
                 &self.repo_root,
@@ -618,7 +619,8 @@ fn scratch_driver_overrides(dir: &Path, base: &[String]) -> Option<Vec<String>> 
 
 /// Merge `theirs` onto `ours` in a throwaway detached worktree with a real
 /// `git merge`, with configured custom drivers refused, and (when `rerere`) a
-/// recorded resolution may auto-apply from the queue-private rerere cache. Returns the
+/// recorded resolution may auto-apply from the queue-private cache or its
+/// read-only shared import. Returns the
 /// written tree oid only if the merge ends with NO unmerged paths; otherwise
 /// `None` (caller defers). Never leaves a worktree behind.
 // off-loop: the fold runs from the CLI / spawn_blocking (see the module doc).
@@ -696,17 +698,13 @@ fn driver_merge(
             return None;
         }
         if let Some(cache) = opts.rerere {
-            if let Err(error) = cache.rerere(&tmp, &["rerere"]) {
-                warn_driver_merge_failure("private rerere failed", &error.to_string());
-                return None;
-            }
-            let remaining = match cache.rerere(&tmp, &["rerere", "remaining"]) {
+            let remaining = match cache.session(|session| {
+                session.step(&tmp, &["rerere"])?;
+                session.step(&tmp, &["rerere", "remaining"])
+            }) {
                 Ok(remaining) => remaining,
                 Err(error) => {
-                    warn_driver_merge_failure(
-                        "private rerere remaining check failed",
-                        &error.to_string(),
-                    );
+                    warn_driver_merge_failure("private rerere session failed", &error.to_string());
                     return None;
                 }
             };
@@ -714,14 +712,10 @@ fn driver_merge(
                 warn_driver_merge_failure("private rerere left unresolved paths", &remaining);
                 return None;
             }
-            let Some(unmerged) = util::git_out_allow_empty(&tmp, &["ls-files", "-u", "-z"]) else {
-                return None;
-            };
+            let unmerged = util::git_out_allow_empty(&tmp, &["ls-files", "-u", "-z"])?;
             let mut paths = std::collections::BTreeSet::new();
             for record in unmerged.split('\0').filter(|record| !record.is_empty()) {
-                let Some(path) = record.split_once('\t').map(|(_, path)| path) else {
-                    return None;
-                };
+                let (_, path) = record.split_once('\t')?;
                 if !approved_paths.iter().any(|approved| approved == path) {
                     return None;
                 }
@@ -731,9 +725,21 @@ fn driver_merge(
             let mut add_args = vec!["add", "--"];
             add_args.extend(paths.iter().copied());
             if add_args.len() > 2 && !util::git_ok(&tmp, &add_args) {
+                warn_driver_merge_failure("could not stage rerere paths", &paths.join("\n"));
                 return None;
             }
-            if !util::git_ok(&tmp, &["diff", "--cached", "--check"]) {
+            let mut check_args = vec![
+                "-c",
+                "core.whitespace=-blank-at-eol,-blank-at-eof,-space-before-tab,-indent-with-non-tab,-tab-in-indent,-cr-at-eol",
+                "--literal-pathspecs",
+                "diff",
+                "--cached",
+                "--check",
+                "--",
+            ];
+            check_args.extend(paths.iter().copied());
+            if !util::git_ok(&tmp, &check_args) {
+                warn_driver_merge_failure("rerere conflict-marker check failed", &paths.join("\n"));
                 return None;
             }
         }
@@ -5352,6 +5358,7 @@ mod tests {
             ],
         );
         let merge = util::git_out(&path, &["rev-parse", "HEAD"]).unwrap();
+        git(&repo.dir, &["update-ref", "refs/keep/resolution", &merge]);
         remove_scratch_worktree(&repo.dir, scratch);
         rerere::train_from_history(&cache, &repo.dir, &merge, &merge, &[]);
         assert!(
@@ -5386,6 +5393,16 @@ mod tests {
         assert!(!repo.dir.join(".git/rr-cache").exists());
         let rr = cache.gitdir.join("rr-cache");
         assert_eq!(std::fs::read_dir(rr).unwrap().count(), 1);
+        let entry = std::fs::read_dir(cache.gitdir.join("rr-cache"))
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .path();
+        assert!(
+            entry.join("postimage").is_file(),
+            "training must record a postimage"
+        );
     }
 
     #[test]
@@ -6278,7 +6295,7 @@ mod tests {
         );
     }
     #[test]
-    fn fold_never_reads_the_shared_rr_cache() {
+    fn fold_imports_a_shared_resolution_read_only() {
         let repo = Repo::new("rerere-shared-read");
         if !repo.history_supported_or_refused() {
             return;
@@ -6313,18 +6330,50 @@ mod tests {
         );
         git(&repo.dir, &["reset", "-q", "--hard", "HEAD^"]);
         let shared = repo.dir.join(".git/rr-cache");
-        let before = std::fs::read_dir(&shared).unwrap().count();
-        assert!(before > 0, "fixture must populate the shared rerere cache");
+        fn snapshot(
+            root: &Path,
+        ) -> std::collections::BTreeMap<PathBuf, (u64, std::time::SystemTime)> {
+            fn visit(
+                root: &Path,
+                dir: &Path,
+                out: &mut std::collections::BTreeMap<PathBuf, (u64, std::time::SystemTime)>,
+            ) {
+                for entry in std::fs::read_dir(dir).unwrap() {
+                    let path = entry.unwrap().path();
+                    let metadata = std::fs::symlink_metadata(&path).unwrap();
+                    out.insert(
+                        path.strip_prefix(root).unwrap().to_path_buf(),
+                        (metadata.len(), metadata.modified().unwrap()),
+                    );
+                    if metadata.is_dir() {
+                        visit(root, &path, out);
+                    }
+                }
+            }
+            let mut out = std::collections::BTreeMap::new();
+            visit(root, root, &mut out);
+            out
+        }
+        assert!(
+            std::fs::read_dir(&shared).unwrap().next().is_some(),
+            "fixture must populate the shared rerere cache"
+        );
+        let before = snapshot(&shared);
 
         let mut config = cfg("");
         config.rerere = true;
         let report = run_fold(&config, &repo.dir, repo.branch_set()).unwrap();
 
         assert!(
-            report.deferred.iter().any(|item| item.branch == "feat"),
-            "{report:?}"
+            report.advanced,
+            "shared resolution should be imported: {report:?}"
         );
-        assert_eq!(std::fs::read_dir(shared).unwrap().count(), before);
+        assert_eq!(repo.out(&["show", "main:data.txt"]), "shared resolution");
+        assert_eq!(
+            snapshot(&shared),
+            before,
+            "shared rr-cache paths, sizes, and mtimes must stay stable"
+        );
     }
 
     #[test]
@@ -6338,7 +6387,7 @@ mod tests {
         repo.commit("Cargo.lock", "main\n", "main edit");
         git(&repo.dir, &["config", "rerere.enabled", "true"]);
         let mut config = cfg("");
-        config.regenerate_command = "true".into();
+        config.regenerate_command = "false".into();
 
         let report = run_fold(&config, &repo.dir, repo.branch_set()).unwrap();
 
@@ -6350,15 +6399,55 @@ mod tests {
     }
 
     #[test]
-    fn held_private_rerere_lock_defers_the_conflict() {
-        let repo = Repo::new("rerere-held-lock");
+    fn shared_preimage_without_postimage_is_not_imported() {
+        let repo = Repo::new("rerere-shared-preimage-only");
         if !repo.history_supported_or_refused() {
             return;
         }
         repo.commit("data.txt", "base\n", "seed");
-        git(&repo.dir, &["checkout", "-q", "-b", "feat"]);
-        repo.commit("data.txt", "feature\n", "feature edit");
-        git(&repo.dir, &["checkout", "-q", "main"]);
+        repo.feature("feat", "data.txt", "feature\n");
+        repo.commit("data.txt", "main\n", "main edit");
+        git(&repo.dir, &["config", "rerere.enabled", "true"]);
+        let theirs = repo.out(&["rev-parse", "feat"]);
+        let merge = run_driver_merge(
+            &repo.dir,
+            &["merge", "--no-commit", "--no-ff", &theirs],
+            Duration::from_secs(30),
+        );
+        assert!(
+            matches!(merge, DriverRun::Completed { ref status, .. } if status.code() == Some(1))
+        );
+        git(&repo.dir, &["rerere"]);
+        git(&repo.dir, &["reset", "-q", "--hard", "HEAD"]);
+        let shared = repo.dir.join(".git/rr-cache");
+        let entry = std::fs::read_dir(&shared)
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .path();
+        assert!(entry.join("preimage").is_file());
+        assert!(!entry.join("postimage").exists());
+
+        let config = MergeQueueConfig {
+            rerere: true,
+            ..cfg("")
+        };
+        let report = run_fold(&config, &repo.dir, repo.branch_set()).unwrap();
+        assert!(
+            report.deferred.iter().any(|item| item.branch == "feat"),
+            "{report:?}"
+        );
+    }
+
+    #[test]
+    fn shared_symlink_postimage_is_not_imported() {
+        let repo = Repo::new("rerere-shared-symlink");
+        if !repo.history_supported_or_refused() {
+            return;
+        }
+        repo.commit("data.txt", "base\n", "seed");
+        repo.feature("feat", "data.txt", "feature\n");
         repo.commit("data.txt", "main\n", "main edit");
         git(&repo.dir, &["config", "rerere.enabled", "true"]);
         let theirs = repo.out(&["rev-parse", "feat"]);
@@ -6384,8 +6473,169 @@ mod tests {
             ],
         );
         git(&repo.dir, &["reset", "-q", "--hard", "HEAD^"]);
-        let lock_path = gate_base_for_repo(&repo.dir).join("rerere.lock");
-        let lock = crate::platform::gate_path::Lock::acquire(&lock_path).unwrap();
+        let shared = repo.dir.join(".git/rr-cache");
+        let entry = std::fs::read_dir(&shared)
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .path();
+        let postimage = entry.join("postimage");
+        std::fs::remove_file(&postimage).unwrap();
+        let outside = repo._state.path().join("outside-rerere-postimage");
+        std::fs::write(&outside, "shared resolution\n").unwrap();
+        if crate::platform::gate_path::history_test_symlink(&outside, &postimage).is_err() {
+            return;
+        }
+
+        let config = MergeQueueConfig {
+            rerere: true,
+            ..cfg("")
+        };
+        let report = run_fold(&config, &repo.dir, repo.branch_set()).unwrap();
+        assert!(
+            report.deferred.iter().any(|item| item.branch == "feat"),
+            "{report:?}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(outside).unwrap(),
+            "shared resolution\n"
+        );
+    }
+
+    #[test]
+    fn landed_resolution_merge_trains_the_private_cache() {
+        let repo = Repo::new("rerere-landed-training");
+        if !repo.history_supported_or_refused() {
+            return;
+        }
+        repo.commit("data.txt", "base\n", "seed");
+        git(&repo.dir, &["checkout", "-q", "-b", "feat"]);
+        repo.commit("data.txt", "feature\n", "feature edit");
+        git(&repo.dir, &["checkout", "-q", "main"]);
+        repo.commit("data.txt", "main\n", "main edit");
+        let main_edit = repo.out(&["rev-parse", "HEAD"]);
+        git(&repo.dir, &["checkout", "-q", "feat"]);
+        let conflict = run_driver_merge(
+            &repo.dir,
+            &["merge", "--no-commit", "--no-ff", &main_edit],
+            Duration::from_secs(30),
+        );
+        assert!(
+            matches!(conflict, DriverRun::Completed { ref status, .. } if status.code() == Some(1))
+        );
+        std::fs::write(repo.dir.join("data.txt"), "training resolution\n").unwrap();
+        git(&repo.dir, &["add", "data.txt"]);
+        git(
+            &repo.dir,
+            &[
+                "-c",
+                "commit.gpgsign=false",
+                "commit",
+                "-q",
+                "-m",
+                "resolution merge",
+            ],
+        );
+        let merge = repo.out(&["rev-parse", "HEAD"]);
+        git(&repo.dir, &["update-ref", "refs/keep/training", &merge]);
+        git(&repo.dir, &["checkout", "-q", "main"]);
+        // A second conflict drives run_fold while keeping the resolution merge reachable
+        // from the other side of the fold.
+        git(&repo.dir, &["checkout", "-q", "-b", "trigger", &merge]);
+        repo.commit("data.txt", "trigger\n", "trigger edit");
+        git(&repo.dir, &["checkout", "-q", "main"]);
+        repo.commit("data.txt", "later main\n", "later main edit");
+        let mut config = cfg("");
+        config.rerere = true;
+        let report = run_fold(
+            &config,
+            &repo.dir,
+            vec![Branch {
+                name: "trigger".into(),
+                tip: repo.out(&["rev-parse", "trigger"]),
+            }],
+        )
+        .unwrap();
+        assert!(
+            report.deferred.iter().any(|item| item.branch == "trigger"),
+            "fold conflict should defer after training: {report:?}"
+        );
+        let cache = rerere::Cache::open(&repo.dir).expect("private cache should exist");
+        assert!(
+            std::fs::read_to_string(cache.gitdir.join("thegn-trained"))
+                .unwrap()
+                .contains(&merge)
+        );
+        let rr = std::fs::read_dir(cache.gitdir.join("rr-cache")).unwrap();
+        assert!(
+            rr.filter_map(Result::ok)
+                .any(|entry| entry.path().join("postimage").is_file())
+        );
+    }
+
+    #[test]
+    fn held_private_rerere_lock_defers_the_conflict() {
+        let repo = Repo::new("rerere-held-lock");
+        if !repo.history_supported_or_refused() {
+            return;
+        }
+        repo.commit("data.txt", "base\n", "seed");
+        git(&repo.dir, &["checkout", "-q", "-b", "feat"]);
+        repo.commit("data.txt", "feature\n", "feature edit");
+        git(&repo.dir, &["checkout", "-q", "main"]);
+        repo.commit("data.txt", "main\n", "main edit");
+        let cache = rerere::Cache::open(&repo.dir).expect("private rerere cache should open");
+        // A held cache contains a usable resolution, so lock contention is the only reason
+        // the fold below cannot land.
+        let theirs = repo.out(&["rev-parse", "feat"]);
+        git(&repo.dir, &["checkout", "-q", "main"]);
+        let ours = repo.out(&["rev-parse", "HEAD"]);
+        let scratch = ScratchDirectory::create("tg-rerere-lock-training-").unwrap();
+        let scratch_path = scratch.path().to_path_buf();
+        let scratch_s = scratch_path.to_string_lossy().to_string();
+        assert!(util::git_ok(
+            &repo.dir,
+            &["worktree", "add", "--detach", &scratch_s, &ours]
+        ));
+        let merge = run_driver_merge(
+            &scratch_path,
+            &[
+                "-c",
+                "rerere.enabled=false",
+                "merge",
+                "--no-commit",
+                "--no-ff",
+                &theirs,
+            ],
+            Duration::from_secs(30),
+        );
+        assert!(
+            matches!(merge, DriverRun::Completed { ref status, .. } if status.code() == Some(1))
+        );
+        std::fs::write(scratch_path.join("data.txt"), "shared resolution\n").unwrap();
+        git(&scratch_path, &["add", "data.txt"]);
+        git(
+            &scratch_path,
+            &[
+                "-c",
+                "commit.gpgsign=false",
+                "commit",
+                "-q",
+                "-m",
+                "resolution",
+            ],
+        );
+        let resolution = util::git_out(&scratch_path, &["rev-parse", "HEAD"]).unwrap();
+        remove_scratch_worktree(&repo.dir, scratch);
+        rerere::train_merge(&cache, &repo.dir, &ours, &theirs, &resolution, &[]).unwrap();
+        let private_rr = std::fs::read_dir(cache.gitdir.join("rr-cache"))
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .path();
+        assert!(private_rr.join("postimage").is_file());
         let mut config = cfg("");
         config.rerere = true;
 
@@ -6395,7 +6645,7 @@ mod tests {
             report.deferred.iter().any(|item| item.branch == "feat"),
             "{report:?}"
         );
-        drop(lock);
+        drop(cache);
     }
 
     #[test]
@@ -6408,7 +6658,12 @@ mod tests {
         let rr_cache = cache.gitdir.join("rr-cache");
         std::fs::create_dir_all(&rr_cache).unwrap();
         for index in 0..1030 {
-            std::fs::create_dir(rr_cache.join(format!("entry-{index:04}"))).unwrap();
+            let entry = rr_cache.join(format!("entry-{index:04}"));
+            std::fs::create_dir(&entry).unwrap();
+            std::fs::File::open(entry)
+                .unwrap()
+                .set_modified(std::time::UNIX_EPOCH + Duration::from_secs(index))
+                .unwrap();
         }
         let scratch = ScratchDirectory::create("tg-rerere-cap-").unwrap();
         let path = scratch.path().to_path_buf();
@@ -6425,10 +6680,16 @@ mod tests {
         ));
         std::fs::write(cache.gitdir.join("MERGE_RR"), b"stale\n").unwrap();
 
-        cache.rerere(&path, &["rerere"]).unwrap();
+        cache
+            .session(|session| session.step(&path, &["rerere"]))
+            .unwrap();
 
         assert!(!cache.gitdir.join("MERGE_RR").exists());
         assert_eq!(std::fs::read_dir(rr_cache).unwrap().count(), 1024);
+        for index in 0..6 {
+            assert!(!rr_cache.join(format!("entry-{index:04}")).exists());
+        }
+        assert!(rr_cache.join("entry-0006").exists());
         remove_scratch_worktree(&repo.dir, scratch);
     }
 }

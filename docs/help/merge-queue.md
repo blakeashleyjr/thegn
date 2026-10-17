@@ -71,9 +71,10 @@ for a branch already merged. Within that, `[merge_queue]` lets you shape it:
   the timeout is reported without advancing either ref (on Unix, the isolated
   signer/hook process group is killed too).
   `thegn doctor` probes signing readiness when this is on.
-- **`rerere`** — reuse recorded conflict resolutions across drains
-  (shared `rr-cache`), so a conflict resolved once auto-resolves next
-  time. A rerere-resolved merge still runs the gate before landing.
+- **`rerere`** — reuse recorded conflict resolutions across drains from the
+  queue-private cache, trained from conflict-resolving history and imported
+  read-only from the repository's `rr-cache`. A rerere-resolved merge still
+  runs the gate before landing.
 
 Folds never run a repository-configured custom merge driver. A conflict on a
 path governed by one defers the branch to `needs_human` with
