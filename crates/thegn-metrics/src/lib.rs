@@ -22,6 +22,8 @@ mod gpu_sysfs;
 mod net_kind;
 mod net_medium;
 mod procs;
+pub mod procs_model;
+pub mod procs_parse;
 mod sample;
 mod thermal;
 mod vmstat;
