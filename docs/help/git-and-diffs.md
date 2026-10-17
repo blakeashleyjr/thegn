@@ -35,10 +35,11 @@ nothing staged is refused before the message box; partially staged changes
 and merge states are allowed.
 
 For long-running `process` filters such as Git LFS, diffs reuse one filter per
-worktree and command, up to 8; an idle filter closes after 2 minutes. If a
-filter cannot run, the diff falls back to Git's one-shot filter path and skips
-that driver for 60 seconds. A required filter that fails shows an error for
-that file's diff.
+worktree and command, with at most 8 in total; a filter idle for 2 minutes is
+closed at the next diff. If a filter cannot run, the diff falls back to Git's
+one-shot filter path for that worktree and command, and continues using it for
+the next 60 seconds. A required filter that fails shows an error for that
+file's diff.
 
 ### commits — branch history
 

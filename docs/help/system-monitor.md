@@ -89,7 +89,7 @@ and `spc` pause on every tab.
 
 The CPU tab shows total and per-core utilisation as a graph, with a heat grid
 for logical cores. Its load and clock section shows 1-, 5-, and 15-minute load,
-per-core load, one mean frequency across cores, temperature, and a load
+1-minute load per core, one mean frequency across cores, temperature, and a load
 sparkline. The per-core bars are heat-tinted. The CPU, load, frequency, and
 uptime masthead chips expand into this tab.
 
