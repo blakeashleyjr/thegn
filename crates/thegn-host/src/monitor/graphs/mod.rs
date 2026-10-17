@@ -35,6 +35,7 @@ struct Style {
 /// Pre-resolved colors for a single paint operation.
 struct Resolved {
     levels: [Style; 8],
+    dim: Style,
 }
 
 impl Resolved {
@@ -42,7 +43,15 @@ impl Resolved {
         #[cfg(test)]
         RESOLUTIONS.with(|count| count.set(count.get() + 1));
 
-        let dim = chrome::theme_color(&palette.dim);
+        let dim = Style {
+            fg: if depth == ColorDepth::None {
+                ColorAttribute::Default
+            } else {
+                chrome::theme_color(&palette.dim)
+            },
+            bg: None,
+            bold: false,
+        };
         let levels = match paint {
             Paint::Ramp { id, warn, crit } => {
                 let ramp = palette.ramp(id);
@@ -80,8 +89,7 @@ impl Resolved {
                         chrome::theme_color(palette.series(*role))
                     }
                     Some(_) => ColorAttribute::Default,
-                    None if depth == ColorDepth::None => ColorAttribute::Default,
-                    None => dim,
+                    None => dim.fg,
                 };
                 Style {
                     fg,
@@ -90,14 +98,20 @@ impl Resolved {
                 }
             }),
         };
-        Self { levels }
+        Self { levels, dim }
     }
 
     fn cell(&self, cell: RCell) -> Style {
-        let mut style = self.levels[usize::from(cell.fg.min(7))];
-        style.bg = cell
-            .bg
-            .map(|index| self.levels[usize::from(index.min(7))].fg);
+        let mut style = self
+            .levels
+            .get(usize::from(cell.fg))
+            .copied()
+            .unwrap_or(self.dim);
+        style.bg = cell.bg.map(|index| {
+            self.levels
+                .get(usize::from(index))
+                .map_or(self.dim.fg, |style| style.fg)
+        });
         style
     }
 }
@@ -117,7 +131,6 @@ impl GraphOut {
     fn prepare(&mut self, w: usize, h: usize) {
         self.cells.reset(w, h);
         self.lines.resize_with(h, Line::default);
-        self.lines.truncate(h);
         for line in &mut self.lines {
             if let Line::Segs(segs) = line {
                 segs.clear();
@@ -127,17 +140,15 @@ impl GraphOut {
         }
     }
 
-    pub(crate) fn emit(&mut self, resolved: &Resolved) {
+    fn emit(&mut self, resolved: &Resolved) {
         self.lines.resize_with(self.cells.height(), Line::default);
-        self.lines.truncate(self.cells.height());
         for row_index in 0..self.cells.height() {
             self.emit_row(row_index, resolved);
         }
     }
 
-    pub(crate) fn emit_rows(&mut self, upper_h: usize, upper: &Resolved, lower: &Resolved) {
+    fn emit_rows(&mut self, upper_h: usize, upper: &Resolved, lower: &Resolved) {
         self.lines.resize_with(self.cells.height(), Line::default);
-        self.lines.truncate(self.cells.height());
         for row_index in 0..self.cells.height() {
             let resolved = if row_index < upper_h { upper } else { lower };
             self.emit_row(row_index, resolved);
@@ -174,6 +185,7 @@ pub(crate) fn table() -> &'static RasterTable {
     RasterTable::for_level(crate::caps::unicode_level())
 }
 
+#[cfg(test)]
 pub(crate) fn default_palette() -> Palette {
     crate::chrome::palette_snapshot()
 }
