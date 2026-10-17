@@ -371,18 +371,17 @@ pub(crate) fn hide_pending_deletes(
                 None
             }
         };
-        if let Some(depth) = hidden_depth {
-            if let Some(parent) = rows[..index]
+        if let Some(depth) = hidden_depth
+            && let Some(parent) = rows[..index]
                 .iter_mut()
                 .rev()
                 .find(|candidate| candidate.depth < depth)
-                && matches!(
-                    parent.kind,
-                    crate::sidebar::RowKind::Folder | crate::sidebar::RowKind::PipelineLane
-                )
-            {
-                parent.child_count = parent.child_count.saturating_sub(1);
-            }
+            && matches!(
+                parent.kind,
+                crate::sidebar::RowKind::Folder | crate::sidebar::RowKind::PipelineLane
+            )
+        {
+            parent.child_count = parent.child_count.saturating_sub(1);
         }
     }
 }
@@ -643,8 +642,8 @@ fn landing_for_slug(session: &crate::session::Session, slug: Option<&str>) -> Op
 #[cfg(test)]
 mod tests {
     use super::{
-        TargetState, group_names_for, landing_for_slug, next_or_prev, pending_delete_refusal,
-        pending_target_refusal, resolve_group_indices, target_state,
+        TargetState, group_names_for, hide_pending_deletes, landing_for_slug, next_or_prev,
+        pending_delete_refusal, pending_target_refusal, resolve_group_indices, target_state,
     };
     use crate::session::{GroupKind, Session, WorktreeGroup};
     use std::collections::HashSet;
@@ -933,18 +932,25 @@ mod tests {
         mirror.worktree_path = Some("/tmp/mirror".into());
         let mut untouched_folder = crate::sidebar::SidebarRow::base(
             crate::sidebar::RowKind::Folder,
-            1,
+            0,
             "untouched",
             "other",
         );
-        untouched_folder.child_count = 4;
+        untouched_folder.child_count = 2;
+        let untouched_child = crate::sidebar::SidebarRow::base(
+            crate::sidebar::RowKind::Worktree,
+            1,
+            "untouched child",
+            "other",
+        );
         let mut rows = vec![
+            untouched_folder,
+            untouched_child,
             folder,
             pending_child,
             sibling,
             lane,
             mirror,
-            untouched_folder,
         ];
 
         hide_pending_deletes(
@@ -952,9 +958,9 @@ mod tests {
             &HashSet::from(["/tmp/pending".to_string(), "/tmp/mirror".to_string()]),
         );
 
-        assert_eq!(rows[0].child_count, 1);
-        assert_eq!(rows[3].child_count, 0);
-        assert_eq!(rows[5].child_count, 4);
+        assert_eq!(rows[0].child_count, 2);
+        assert_eq!(rows[2].child_count, 1);
+        assert_eq!(rows[5].child_count, 0);
     }
 
     #[test]
