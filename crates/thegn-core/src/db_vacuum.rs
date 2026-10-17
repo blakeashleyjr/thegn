@@ -14,6 +14,12 @@ pub const INCREMENTAL_PAGES_PER_ROUND: u32 = 2048;
 pub const AUTO_CONVERT_MAX_LIVE_BYTES: u64 = 64 * 1024 * 1024;
 pub(crate) const DISPATCH_TERMINAL_RETENTION_SECS: i64 = 90 * 24 * 60 * 60;
 const MIN_RECLAIM_BYTES: u64 = 8 * 1024 * 1024;
+const TERMINAL_DISPATCH_STATUSES: [AgentDispatchStatus; 4] = [
+    AgentDispatchStatus::Merged,
+    AgentDispatchStatus::Abandoned,
+    AgentDispatchStatus::Done,
+    AgentDispatchStatus::Failed,
+];
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -143,16 +149,11 @@ impl Db {
 
     /// Prune old terminal dispatch history while preserving rows still used by admission or supervision.
     pub(crate) fn prune_terminal_dispatches(&self, now_ms: i64) -> Result<usize> {
-        let statuses = [
-            AgentDispatchStatus::Merged,
-            AgentDispatchStatus::Abandoned,
-            AgentDispatchStatus::Done,
-            AgentDispatchStatus::Failed,
-        ]
-        .into_iter()
-        .map(|status| format!("'{}'", status.as_str()))
-        .collect::<Vec<_>>()
-        .join(",");
+        let statuses = TERMINAL_DISPATCH_STATUSES
+            .into_iter()
+            .map(|status| format!("'{}'", status.as_str()))
+            .collect::<Vec<_>>()
+            .join(",");
         let cutoff = now_ms.saturating_sub(DISPATCH_TERMINAL_RETENTION_SECS.saturating_mul(1000));
         let conn = self.conn();
         let tx = Transaction::new_unchecked(conn, TransactionBehavior::Immediate)?;
@@ -853,15 +854,9 @@ mod tests {
 
     #[test]
     fn terminal_dispatch_status_coverage_is_exhaustive() {
-        let statuses = [
-            AgentDispatchStatus::Merged,
-            AgentDispatchStatus::Abandoned,
-            AgentDispatchStatus::Done,
-            AgentDispatchStatus::Failed,
-        ]
-        .map(AgentDispatchStatus::as_str);
+        let statuses = TERMINAL_DISPATCH_STATUSES.map(AgentDispatchStatus::as_str);
         assert_eq!(statuses, ["merged", "abandoned", "done", "failed"]);
-        for status in [
+        let all_statuses = [
             AgentDispatchStatus::Queued,
             AgentDispatchStatus::Spawning,
             AgentDispatchStatus::Running,
@@ -872,7 +867,13 @@ mod tests {
             AgentDispatchStatus::Done,
             AgentDispatchStatus::Failed,
             AgentDispatchStatus::Unknown,
-        ] {
+        ];
+        let terminal_statuses: Vec<_> = all_statuses
+            .into_iter()
+            .filter(|status| status.is_terminal())
+            .collect();
+        assert_eq!(terminal_statuses, TERMINAL_DISPATCH_STATUSES);
+        for status in all_statuses {
             let exhaustive_terminal = match status {
                 AgentDispatchStatus::Merged
                 | AgentDispatchStatus::Abandoned
@@ -913,11 +914,14 @@ mod tests {
     }
 
     #[test]
-    fn maintain_classifies_busy_retention_as_vacuum_busy() {
+    fn maintain_classifies_busy_as_vacuum_busy_smoke() {
         let (dir, db) = temp_db();
         db.conn().busy_timeout(Duration::from_millis(10)).unwrap();
         let locker = Connection::open(dir.path().join("state.db")).unwrap();
         locker.execute_batch("BEGIN IMMEDIATE").unwrap();
+        // The initial notification DELETE needs the write lock, so this is a
+        // general busy-classification smoke test. The helper regression below
+        // specifically exercises the anyhow-wrapped transaction error.
         let result = db.maintain(2_000_000_000, MaintenanceStep::Nothing);
         assert!(matches!(
             result,
@@ -930,6 +934,8 @@ mod tests {
     fn anyhow_wrapped_sqlite_busy_is_classified() {
         let (dir, db) = temp_db();
         db.conn().busy_timeout(Duration::from_millis(10)).unwrap();
+        let gone = dir.path().join("gone").to_string_lossy().into_owned();
+        notification(&db, "gone", &gone, 1, 2_000_000_000);
         let locker = Connection::open(dir.path().join("state.db")).unwrap();
         locker.execute_batch("BEGIN IMMEDIATE").unwrap();
         let error = db.prune_removed_worktree_rows(1).unwrap_err();
