@@ -118,9 +118,18 @@ fn run_round_with(
         return;
     }
     match db.maintain(thegn_core::util::now(), step) {
-        Ok(report) if report.pruned_notifications > 0 || report.reclaimed_pages > 0 => {
+        Ok(report)
+            if report.pruned_notifications > 0
+                || report.pruned_removed_notifications > 0
+                || report.pruned_issue_links > 0
+                || report.pruned_dispatches > 0
+                || report.reclaimed_pages > 0 =>
+        {
             tracing::debug!(
                 pruned_notifications = report.pruned_notifications,
+                pruned_removed_notifications = report.pruned_removed_notifications,
+                pruned_issue_links = report.pruned_issue_links,
+                pruned_dispatches = report.pruned_dispatches,
                 reclaimed_pages = report.reclaimed_pages,
                 "state database maintenance completed"
             );
@@ -375,5 +384,42 @@ mod tests {
                 })
             ));
         }
+    }
+
+    #[test]
+    fn armed_round_prunes_removed_worktree_read_notifications() {
+        let _guard = TEST_LOCK.lock().unwrap();
+        let (dir, db) = temp_db();
+        let gone = dir.path().join("gone").to_string_lossy().into_owned();
+        let read_id = db
+            .put_notification("fixture", "read", "read", &gone)
+            .unwrap();
+        let unread_id = db
+            .put_notification("fixture", "unread", "unread", &gone)
+            .unwrap();
+        db.mark_notification_read(read_id).unwrap();
+        let cursor = AtomicI64::new(0);
+        run_round_with(
+            &db,
+            false,
+            &AtomicU32::new(0),
+            &AtomicBool::new(false),
+            Duration::from_millis(20),
+            &cursor,
+        );
+        let before = db.get_all_notifications(10).unwrap();
+        assert_eq!(before.len(), 2);
+
+        run_round_with(
+            &db,
+            true,
+            &AtomicU32::new(0),
+            &AtomicBool::new(false),
+            Duration::from_millis(20),
+            &cursor,
+        );
+        let after = db.get_all_notifications(10).unwrap();
+        assert_eq!(after.len(), 1);
+        assert_eq!(after[0].id, unread_id);
     }
 }
