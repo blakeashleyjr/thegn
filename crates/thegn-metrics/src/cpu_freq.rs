@@ -8,20 +8,13 @@ use sysinfo::CpuRefreshKind;
 /// Parse a sysfs CPU frequency, expressed in kHz.
 #[cfg(any(target_os = "linux", test))]
 pub(crate) fn parse_khz(bytes: &[u8]) -> Option<u64> {
-    let value = std::str::from_utf8(bytes.trim_ascii())
-        .ok()?
-        .parse::<u64>()
-        .ok()?;
-    (value > 0).then_some(value)
+    crate::collect::parse::cpufreq::parse_khz(bytes)
 }
 
 /// Return the mean frequency in MHz from kHz readings.
 #[cfg(any(target_os = "linux", test))]
 pub(crate) fn mean_mhz(khz: &[u64]) -> Option<u64> {
-    if khz.is_empty() {
-        return None;
-    }
-    Some(khz.iter().sum::<u64>() / khz.len() as u64 / 1000)
+    crate::collect::model::cpu_freq::mean_mhz(khz)
 }
 
 /// Configure sysinfo without opening per-core frequency files on Linux.

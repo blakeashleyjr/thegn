@@ -1287,3 +1287,10 @@ fn a_long_configured_default_lead_reaches_events_beyond_tomorrow() {
     let hit = reminder_window(1, utc_ms(2026, 8, 18, 8, 59), utc_ms(2026, 8, 18, 9, 1));
     assert_eq!(due_reminders(&t.db, &cfg, hit).unwrap().reminders.len(), 1);
 }
+
+#[test]
+fn calendar_sync_uses_shared_runtime() {
+    let source = include_str!("hydrate_calendar.rs");
+    assert!(!source.contains("new_current_thread"));
+    assert!(source.contains("thegn_svc::bg_runtime::block_on("));
+}

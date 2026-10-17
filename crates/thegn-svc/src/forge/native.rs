@@ -437,7 +437,7 @@ static CIRCUITS: OnceLock<Mutex<HashMap<u64, Arc<GhCircuit>>>> = OnceLock::new()
 static HTTP_CLIENT: OnceLock<Result<reqwest::Client, String>> = OnceLock::new();
 static HTTP_RUNTIME: OnceLock<Result<tokio::runtime::Runtime, String>> = OnceLock::new();
 
-struct GhCircuit {
+pub(crate) struct GhCircuit {
     seed: u64,
     failures: std::sync::atomic::AtomicU32,
     open_until: std::sync::Mutex<Option<std::time::Instant>>,
@@ -450,7 +450,7 @@ impl GhCircuit {
         Self::with_seed(0)
     }
 
-    fn with_seed(seed: u64) -> Self {
+    pub(crate) fn with_seed(seed: u64) -> Self {
         Self {
             seed,
             failures: std::sync::atomic::AtomicU32::new(0),
@@ -459,7 +459,7 @@ impl GhCircuit {
         }
     }
 
-    fn active_error(&self) -> Option<ForgeError> {
+    pub(crate) fn active_error(&self) -> Option<ForgeError> {
         let guard = self.open_until.lock().unwrap_or_else(|e| e.into_inner());
         let is_open = guard.is_some_and(|until| std::time::Instant::now() < until);
         drop(guard);
@@ -482,7 +482,7 @@ impl GhCircuit {
         }
     }
 
-    fn record_success(&self) {
+    pub(crate) fn record_success(&self) {
         self.failures.store(0, std::sync::atomic::Ordering::Relaxed);
         if let Ok(mut g) = self.open_until.lock() {
             *g = None;
@@ -519,7 +519,7 @@ impl GhCircuit {
         self.open_for(delay, error);
     }
 
-    fn record_http_failure(&self, error: ForgeError) {
+    pub(crate) fn record_http_failure(&self, error: ForgeError) {
         let failures = self
             .failures
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
@@ -528,6 +528,33 @@ impl GhCircuit {
             self.open_for(window, error);
         }
     }
+
+    #[cfg(test)]
+    pub(crate) fn failure_count(&self) -> u32 {
+        self.failures.load(std::sync::atomic::Ordering::Relaxed)
+    }
+}
+
+fn cli_circuit_key(label: &str) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    label.hash(&mut hasher);
+    hasher.finish()
+}
+
+const CLI_CIRCUIT_KEY_LABEL: &str = "gh-cli";
+
+/// Shared GitHub CLI poll circuit, registered so poll backoff and native reads
+/// also see it; an open CLI circuit holds the native read path too.
+pub(crate) fn cli_poll_circuit() -> Arc<GhCircuit> {
+    let key = cli_circuit_key(CLI_CIRCUIT_KEY_LABEL);
+    let circuits = CIRCUITS.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut circuits = circuits.lock().unwrap_or_else(|error| error.into_inner());
+    Arc::clone(
+        circuits
+            .entry(key)
+            .or_insert_with(|| Arc::new(GhCircuit::with_seed(key))),
+    )
 }
 
 fn circuit_for(token: &str) -> Arc<GhCircuit> {
@@ -541,7 +568,10 @@ fn circuit_for(token: &str) -> Arc<GhCircuit> {
         return Arc::clone(circuit);
     }
     if circuits.len() >= MAX_CIRCUITS
-        && let Some(evicted) = circuits.keys().next().copied()
+        && let Some(evicted) = circuits
+            .keys()
+            .copied()
+            .find(|candidate| *candidate != cli_circuit_key(CLI_CIRCUIT_KEY_LABEL))
     {
         circuits.remove(&evicted);
     }
@@ -1480,6 +1510,18 @@ mod tests {
         });
         assert!(parse_graphql_pr_status_for(&missing, "acme/sage", "main").is_err());
     }
+}
+
+#[cfg(test)]
+pub(crate) fn cli_poll_circuit_for_test(label: &str) -> Arc<GhCircuit> {
+    let key = cli_circuit_key(label);
+    let circuits = CIRCUITS.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut circuits = circuits.lock().unwrap_or_else(|error| error.into_inner());
+    Arc::clone(
+        circuits
+            .entry(key)
+            .or_insert_with(|| Arc::new(GhCircuit::with_seed(key))),
+    )
 }
 
 #[cfg(test)]

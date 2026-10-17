@@ -93,20 +93,37 @@ pub(crate) struct IsolatedState {
 #[cfg(test)]
 impl IsolatedState {
     pub(crate) fn new() -> Self {
-        Self::build(false, false)
+        Self::build(false, false, &[])
+    }
+
+    pub(crate) fn with_env(extra: &[(&str, &str)]) -> Self {
+        const STATE_KEYS: &[&str] = &[
+            "HOME",
+            "XDG_STATE_HOME",
+            "XDG_CONFIG_HOME",
+            "USERPROFILE",
+            "APPDATA",
+            "LOCALAPPDATA",
+            "THEGN_DIR",
+        ];
+        assert!(
+            extra.iter().all(|(key, _)| !STATE_KEYS.contains(key)),
+            "state environment keys come from the isolated root"
+        );
+        Self::build(false, false, extra)
     }
 
     pub(crate) fn with_runtime_dir() -> Self {
-        Self::build(true, false)
+        Self::build(true, false, &[])
     }
 
     /// XDG state at `$HOME/.local/state`: the layout the THE-744 guard treats as
     /// the user's real state. Only for tests of that guard.
     pub(crate) fn with_real_home_layout() -> Self {
-        Self::build(false, true)
+        Self::build(false, true, &[])
     }
 
-    fn build(runtime_dir: bool, real_home_layout: bool) -> Self {
+    fn build(runtime_dir: bool, real_home_layout: bool, extra: &[(&str, &str)]) -> Self {
         let temp = tempfile::tempdir().expect("private isolated state dir");
         thegn_core::fsperm::restrict_dir_to_owner(temp.path())
             .expect("restrict isolated state dir");
@@ -122,10 +139,11 @@ impl IsolatedState {
         if runtime_dir {
             vars.push(("XDG_RUNTIME_DIR", temp.path().to_path_buf()));
         }
-        let strings: Vec<_> = vars
+        let mut strings: Vec<_> = vars
             .iter()
             .map(|(key, value)| (*key, value.to_str().expect("state path is UTF-8")))
             .collect();
+        strings.extend_from_slice(extra);
         let env = EnvVarGuard::set(&strings);
         Self { _env: env, temp }
     }
@@ -136,6 +154,10 @@ impl IsolatedState {
 
     pub(crate) fn state_home(&self) -> std::path::PathBuf {
         thegn_core::util::xdg_state_home()
+    }
+
+    pub(crate) fn config_home(&self) -> std::path::PathBuf {
+        thegn_core::util::xdg_config_home()
     }
 
     pub(crate) fn thegn_dir(&self) -> std::path::PathBuf {
@@ -163,5 +185,19 @@ mod isolated_state_tests {
             std::env::var_os("XDG_RUNTIME_DIR").as_deref(),
             Some(runtime.root().as_os_str())
         );
+    }
+
+    #[test]
+    fn isolated_state_with_env_sets_extras_and_restores_them() {
+        const EXTRA: &str = "THEGN_TEST_ISOLATED_EXTRA";
+        let previous = std::env::var_os(EXTRA);
+        {
+            let state = IsolatedState::with_env(&[(EXTRA, "isolated-value")]);
+            assert_eq!(std::env::var(EXTRA).unwrap(), "isolated-value");
+            assert!(state.config_home().starts_with(state.root()));
+        }
+        assert_eq!(std::env::var_os(EXTRA), previous);
+
+        assert!(std::panic::catch_unwind(|| IsolatedState::with_env(&[("HOME", "x")])).is_err());
     }
 }

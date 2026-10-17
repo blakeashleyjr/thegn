@@ -73,8 +73,12 @@ for a branch already merged. Within that, `[merge_queue]` lets you shape it:
   `thegn doctor` probes signing readiness when this is on.
 - **`rerere`** — reuse recorded conflict resolutions across drains from the
   queue-private cache, trained from conflict-resolving history and imported
-  read-only from the repository's `rr-cache`. A rerere-resolved merge still
-  runs the gate before landing.
+  read-only from the repository's `rr-cache`. The private cache lives under
+  thegn's state directory (`$XDG_STATE_HOME/thegn/gate/`); folds never write
+  the repository's `rr-cache`. Only resolved pairs are imported, and the
+  cache keeps at most 1024 resolutions, dropping the oldest. If the cache is
+  unavailable, the fold reports the conflict as usual. A rerere-resolved
+  merge still runs the gate before landing.
 
 Folds never run a repository-configured custom merge driver. A conflict on a
 path governed by one defers the branch to `needs_human` with

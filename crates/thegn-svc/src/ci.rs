@@ -1193,7 +1193,7 @@ impl CiProvider for GithubCi {
             && let Some(held) = crate::forge::native::poll_backoff_error()
         {
             let remote = self.remote(loc)?;
-            if let Some(error) = ci_backoff_gate(true, &remote.host, Some(held)) {
+            if let Some(error) = ci_backoff_gate(false, &remote.host, Some(held)) {
                 return Err(error);
             }
         }
@@ -3567,6 +3567,47 @@ esac
         for (remote_loc, host, held, expected) in cases {
             assert_eq!(ci_backoff_gate(remote_loc, host, held), expected);
         }
+    }
+
+    #[test]
+    fn github_runs_uses_the_open_local_circuit_before_spawning_gh() {
+        let temp = tempfile::tempdir().unwrap();
+        for args in [
+            vec!["init", "-q"],
+            vec![
+                "remote",
+                "add",
+                "origin",
+                "https://github.com/acme/widget.git",
+            ],
+        ] {
+            assert!(
+                thegn_core::util::git_cmd(temp.path())
+                    .args(args)
+                    .status()
+                    .unwrap()
+                    .success()
+            );
+        }
+        let empty_path = tempfile::tempdir().unwrap();
+        let path = empty_path.path().to_string_lossy().into_owned();
+        let _env = thegn_core::testenv::EnvGuard::mutate_pairs(&[("PATH", Some(&path))]);
+        let circuit = crate::forge::native::cli_poll_circuit_for_test("ci-runs-gate-regression");
+        circuit.record_success();
+        for _ in 0..3 {
+            circuit.record_http_failure(crate::forge::ForgeError::RateLimited);
+        }
+        let client = GithubCi {
+            remote: Some(GithubRemote {
+                host: "github.com".into(),
+                repository: "acme/widget".into(),
+            }),
+            cancel: Arc::new(AtomicBool::new(false)),
+        };
+        let loc = GitLoc::Local(temp.path().to_path_buf());
+        let result = client.runs(&loc, None, 10);
+        circuit.record_success();
+        assert!(matches!(result, Err(CiError::RateLimited)));
     }
 }
 

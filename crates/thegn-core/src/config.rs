@@ -2986,11 +2986,10 @@ pub struct MonitorConfig {
     pub gpu: String,
     /// The time-window rungs `[`/`]` step through in the built-in monitor.
     ///
-    /// Each entry is a duration (`30s`, `5m`, `12h`) or `all`. Unparseable
-    /// entries are ignored rather than fatal — one typo must not cost the whole
-    /// ladder — and an empty list falls back to the default. The widest bounded
-    /// rung is what `history_retain` has to cover; a rung wider than the
-    /// retained history shows what it has and says so.
+    /// Each entry is a duration (`30s`, `5m`, `24h`) or `all` (everything
+    /// retained). Unparseable entries are ignored rather than fatal — one typo
+    /// must not cost the whole ladder — and an empty list falls back to the
+    /// default. A rung wider than collected history shows what it has and says so.
     pub window_ladder: Vec<String>,
     /// Starting time window for the built-in monitor's graphs. Snapped to the
     /// nearest `window_ladder` rung.

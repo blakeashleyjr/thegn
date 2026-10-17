@@ -369,7 +369,7 @@ mod tests {
 
     #[test]
     fn a_tracked_sample_does_not_enumerate_threads() {
-        if !std::path::Path::new("/proc/self/task").exists() {
+        if !cfg!(target_os = "linux") {
             return;
         }
 
@@ -392,6 +392,30 @@ mod tests {
                 .values()
                 .all(|process| process.thread_kind().is_none()),
             "process enumeration retained thread entries"
+        );
+    }
+
+    #[test]
+    #[ignore = "live: compares against this machine's /proc"]
+    fn process_total_matches_proc_pid_dirs() {
+        if !cfg!(target_os = "linux") {
+            return;
+        }
+
+        let total = ProcSampler::new(20).sample().total;
+        let proc_dirs = std::fs::read_dir("/proc")
+            .unwrap()
+            .flatten()
+            .filter(|entry| {
+                let name = entry.file_name();
+                let name = name.to_string_lossy();
+                !name.is_empty() && name.bytes().all(|byte| byte.is_ascii_digit())
+            })
+            .count();
+
+        assert!(
+            total.abs_diff(proc_dirs) <= 5,
+            "ProcSampler total {total} differs from /proc PID directory count {proc_dirs}"
         );
     }
 }

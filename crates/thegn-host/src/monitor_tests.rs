@@ -384,9 +384,15 @@ fn window_keys_saturate_rather_than_wrap() {
     for _ in 0..10 {
         ch(&mut ov, ']');
     }
-    assert_eq!(ov.prefs.tab(MonitorTab::Cpu).window, Window::EVERYTHING);
+    assert_eq!(
+        ov.prefs.tab(MonitorTab::Cpu).window,
+        Window::from_secs(86_400)
+    );
     ch(&mut ov, ']');
-    assert_eq!(ov.prefs.tab(MonitorTab::Cpu).window, Window::EVERYTHING);
+    assert_eq!(
+        ov.prefs.tab(MonitorTab::Cpu).window,
+        Window::from_secs(86_400)
+    );
     for _ in 0..10 {
         ch(&mut ov, '[');
     }
@@ -449,7 +455,7 @@ fn a_wide_window_does_not_ask_for_fast_sampling() {
     // count, so adding a rung can't silently turn this into a no-op.
     let (mut ov, _m, _h) = open();
     assert!(ov.wants_live(), "the default window should sample live");
-    while ov.prefs.tab(MonitorTab::Cpu).window != Window::EVERYTHING {
+    while ov.prefs.tab(MonitorTab::Cpu).window != Window::from_secs(86_400) {
         ch(&mut ov, ']');
     }
     assert!(!ov.wants_live());

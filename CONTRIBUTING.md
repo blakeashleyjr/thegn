@@ -96,6 +96,11 @@ on one host through `util::{home_for, xdg_config_home_for, xdg_state_home_for}`.
 Use `testenv::state_env_for` when checking one OS's environment mapping, and
 `testenv::IsolatedState` for tests that mutate process environment or write
 state; it sets both Unix/XDG and Windows variables and restores them on drop.
+Test builds refuse to open state under `$HOME/.local/state` or the
+`XDG_STATE_HOME` inherited before the test, with a `THE-744` panic.
+`IsolatedState::new()` puts XDG state at `<root>/state`;
+`with_real_home_layout()` is only for tests of that guard. Host tests use
+`crate::testenv::IsolatedState`.
 `testenv::symlinked_tempdir` supplies a link spelling and its canonical path
 for tests where the OS resolves paths through a symlink. The per-crate
 `state-env-*-ratchet.txt` allowlists track existing tests that still set these

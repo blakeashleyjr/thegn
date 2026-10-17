@@ -1759,16 +1759,9 @@ mod tests {
 
     /// THE-515 fixture: a real git repo named `acme` plus an isolated state
     /// dir, and a config whose trusted overlay for it is ambiguous.
-    fn refused_acme() -> (
-        crate::testenv::EnvVarGuard,
-        tempfile::TempDir,
-        std::path::PathBuf,
-    ) {
-        let dir = tempfile::tempdir().unwrap();
-        let state = dir.path().join("state");
-        std::fs::create_dir_all(&state).unwrap();
-        let env = crate::testenv::EnvVarGuard::set(&[("XDG_STATE_HOME", state.to_str().unwrap())]);
-        let repo = dir.path().join("acme");
+    fn refused_acme() -> (crate::testenv::IsolatedState, std::path::PathBuf) {
+        let state = crate::testenv::IsolatedState::new();
+        let repo = state.root().join("acme");
         std::fs::create_dir_all(&repo).unwrap();
         #[expect(clippy::disallowed_methods)]
         let ok = thegn_core::util::git_cmd(&repo)
@@ -1777,12 +1770,12 @@ mod tests {
             .unwrap()
             .success();
         assert!(ok);
-        (env, dir, repo)
+        (state, repo)
     }
 
     #[test]
     fn drain_refuses_an_ambiguous_overlay_before_any_gate() {
-        let (_env, _dir, repo) = refused_acme();
+        let (_state, repo) = refused_acme();
         let mut cfg = Config::default();
         cfg.merge_queue.enabled = true;
         cfg.workspace.insert("acme".into(), Default::default());
@@ -1796,7 +1789,7 @@ mod tests {
 
     #[test]
     fn drain_honours_the_repo_resolved_enabled_flag() {
-        let (_env, _dir, repo) = refused_acme();
+        let (_state, repo) = refused_acme();
         let mut cfg = Config::default();
         cfg.merge_queue.enabled = true;
         let mut ws = thegn_core::config::WorkspaceConfig::default();
