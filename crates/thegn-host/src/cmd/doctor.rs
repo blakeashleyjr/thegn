@@ -3435,7 +3435,7 @@ fn source_control_report(cfg: &Config) {
             Err(e) => outln!("  signing       NOT ready — {e}"),
         }
     }
-    outln!("  rerere        {}", yn(mq.rerere));
+    outln!("  rerere        {} (queue-private cache)", yn(mq.rerere));
 }
 
 fn source_control_json(cfg: &Config) -> serde_json::Value {

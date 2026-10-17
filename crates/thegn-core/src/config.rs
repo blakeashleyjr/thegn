@@ -989,10 +989,9 @@ pub struct MergeQueueConfig {
     /// is always non-interactive: a would-prompt/agent-locked/missing-key failure
     /// stops the drain as an infrastructure error and never blames the branch.
     pub sign_commits: bool,
-    /// Enable git rerere in the driver-merge worktree only (shared
-    /// `<git-common>/rr-cache`), so a conflict resolved once can auto-resolve on
-    /// later drains. Off by default. A rerere-resolved merge still runs the gate
-    /// before landing.
+    /// Enable queue-private git rerere, trained from conflict-resolving merge
+    /// commits and imported read-only from the repository's rr-cache. Off by
+    /// default. A rerere-resolved merge still runs the gate before landing.
     pub rerere: bool,
 }
 
