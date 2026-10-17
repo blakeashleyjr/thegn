@@ -2017,4 +2017,118 @@ mod tests {
             "tool-state edits remain covered by the watcher"
         );
     }
+
+    #[test]
+    fn a_pipeline_artifact_edit_does_not_move_the_print() {
+        let base = scratch("pipeline-print");
+        let r = repo(&base, "r", true);
+        std::fs::create_dir_all(r.join(".thegn/pipeline/T")).unwrap();
+        std::fs::write(r.join(".thegn/pipeline/T/1.md"), "handoff\n").unwrap();
+        git(&r, &["add", ".thegn/pipeline/T/1.md"]);
+        git(&r, &["commit", "-q", "-m", "pipeline handoff"]);
+        let _w = watch(&r);
+        let before = settle(&r);
+
+        std::fs::write(r.join(".thegn/pipeline/T/1.md"), "updated handoff\n").unwrap();
+        std::fs::write(r.join(".thegn/pipeline/T/2.md"), "another handoff\n").unwrap();
+        std::fs::create_dir_all(r.join(".thegn/pipeline/U")).unwrap();
+        std::thread::sleep(Duration::from_millis(600));
+        assert_eq!(
+            print(&r),
+            Some(before),
+            "pipeline edits must not move the print"
+        );
+
+        advances(&r, "edit a.txt", || {
+            std::fs::write(r.join("a.txt"), "source edit\n").unwrap();
+        });
+    }
+
+    fn panel_test_env(base: &Path, state: &Path) -> crate::testenv::EnvVarGuard {
+        let ghome = base.join("ghome");
+        std::fs::create_dir_all(&ghome).unwrap();
+        let gsys = base.join("gitconfig-system");
+        std::fs::write(&gsys, "").unwrap();
+        let xdg_config = ghome.join("xdg");
+        let global_config = ghome.join(".gitconfig");
+        crate::testenv::EnvVarGuard::set(&[
+            ("XDG_STATE_HOME", state.to_str().unwrap()),
+            ("HOME", ghome.to_str().unwrap()),
+            ("XDG_CONFIG_HOME", xdg_config.to_str().unwrap()),
+            ("GIT_CONFIG_GLOBAL", global_config.to_str().unwrap()),
+            ("GIT_CONFIG_SYSTEM", gsys.to_str().unwrap()),
+            ("GIT_CONFIG_NOSYSTEM", "0"),
+            ("GIT_CONFIG_COUNT", "0"),
+            ("GIT_CONFIG_PARAMETERS", ""),
+        ])
+    }
+
+    #[test]
+    fn build_panel_hides_pipeline_artifacts_but_keeps_source_and_hooks() {
+        let base = scratch("panel-pipeline");
+        let state = base.join("state");
+        std::fs::create_dir_all(state.join("thegn")).unwrap();
+        let _env = panel_test_env(&base, &state);
+        let db = thegn_core::db::Db::open_at(&state.join("thegn/thegn.db")).unwrap();
+        let cfg = thegn_core::config::Config::default();
+        let hints = crate::hydrate::HydrateHints::default();
+        let r = repo(&base, "r", true);
+        std::fs::create_dir_all(r.join(".thegn/pipeline/T")).unwrap();
+        std::fs::write(r.join(".thegn/pipeline/T/1.md"), "handoff\n").unwrap();
+        std::fs::write(r.join(".thegn/pre-create.sh"), "#!/bin/sh\nexit 0\n").unwrap();
+        git(&r, &["add", ".thegn"]);
+        git(&r, &["commit", "-q", "-m", "tracked tool files"]);
+        let _w = watch(&r);
+        assert!(print(&r).is_some());
+
+        std::fs::write(r.join(".thegn/pipeline/T/1.md"), "updated handoff\n").unwrap();
+        std::fs::write(r.join(".thegn/pipeline/T/2.md"), "untracked handoff\n").unwrap();
+        std::fs::write(r.join(".thegn/pre-create.sh"), "#!/bin/sh\necho hook\n").unwrap();
+        std::fs::write(r.join("a.txt"), "source edit\n").unwrap();
+
+        let at = settle(&r);
+        let panel = crate::hydrate::build_panel(&r, &db, &hints, &cfg);
+        let cached = crate::panel_git_cache::get(
+            &r,
+            (
+                at,
+                thegn_core::git_memo::global_git_print(&r).expect("global layer"),
+            ),
+        );
+        assert!(cached.is_some(), "build stores the filtered snapshot");
+        let reused = crate::hydrate::build_panel(&r, &db, &hints, &cfg);
+
+        for paths in [
+            panel
+                .changes
+                .iter()
+                .map(|row| row.path.as_str())
+                .collect::<Vec<_>>(),
+            panel
+                .files
+                .iter()
+                .map(|file| file.path.as_str())
+                .collect::<Vec<_>>(),
+        ] {
+            assert!(
+                paths.contains(&"a.txt"),
+                "source edit remains visible: {paths:?}"
+            );
+            assert!(
+                paths.contains(&".thegn/pre-create.sh"),
+                "tracked hook remains visible: {paths:?}"
+            );
+            assert!(
+                paths
+                    .iter()
+                    .all(|path| !path.starts_with(".thegn/pipeline")),
+                "pipeline artifacts are excluded: {paths:?}"
+            );
+        }
+        assert_eq!(
+            reused.changes, panel.changes,
+            "cached changes stay filtered"
+        );
+        assert_eq!(reused.files, panel.files, "cached files stay filtered");
+    }
 }

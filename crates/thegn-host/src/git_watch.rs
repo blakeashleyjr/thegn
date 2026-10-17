@@ -160,8 +160,9 @@ pub(crate) struct WatchPlanEntry {
 /// Whether a directory must be kept out of the watch registration entirely.
 ///
 /// Gitignored build output, nested repositories/worktrees, and the object
-/// store. The event filter also discards gitignored paths and object-store
-/// churn, while nested repositories have their own watcher lifecycle.
+/// store. Panel-excluded tool-state directories are also left unwatched. The
+/// event filter also discards gitignored paths and object-store churn, while
+/// nested repositories have their own watcher lifecycle.
 pub(crate) fn prune_dir(p: &std::path::Path, ignore: &crate::diff_watch::IgnoreRules) -> bool {
     // A nested repository or linked worktree has its own git state and watcher
     // lifecycle. `.gitmodules` withholds the diff claim until submodule watches
@@ -172,6 +173,9 @@ pub(crate) fn prune_dir(p: &std::path::Path, ignore: &crate::diff_watch::IgnoreR
     // `.git/objects` — the same subtree the linked-worktree gitdir watches
     // already refuse to descend into, applied to the main checkout too.
     if p.file_name().and_then(|s| s.to_str()) == Some("objects") && in_dot_git(p) {
+        return true;
+    }
+    if is_panel_excluded_path(p, &ignore.root) {
         return true;
     }
     // `matched_path_or_any_parents` panics on a path outside the matcher's root
@@ -283,6 +287,7 @@ fn plan_descend(
             if prune_dir(&p, ignore) {
                 pruned_any = true;
             } else {
+                pruned_any |= leads_to_panel_excluded(&p, &ignore.root);
                 keep.push(p);
             }
         }
@@ -328,6 +333,7 @@ fn plan_descend_capped(
             if prune_dir(&path, ignore) {
                 pruned_any = true;
             } else {
+                pruned_any |= leads_to_panel_excluded(&path, &ignore.root);
                 keep.push(path);
             }
         }
@@ -349,6 +355,39 @@ fn plan_descend_capped(
         }
     }
     true
+}
+
+/// Tracked handoff artifacts stay available to dispatch verification, but the
+/// panel does not watch or list them. Keep tracked user hook scripts such as
+/// `.thegn/pre-create.sh` visible. THE-816 owner decision; widening this to
+/// all of `.thegn` is a one-line change.
+const PANEL_EXCLUDED_PATHS: &[&str] = &[".thegn/pipeline", ".thegn/maintenance"];
+
+fn is_panel_excluded_path(p: &std::path::Path, root: &std::path::Path) -> bool {
+    p.strip_prefix(root).is_ok_and(|relative| {
+        PANEL_EXCLUDED_PATHS
+            .iter()
+            .any(|excluded| relative.starts_with(std::path::Path::new(excluded)))
+    })
+}
+
+fn leads_to_panel_excluded(p: &std::path::Path, root: &std::path::Path) -> bool {
+    p.strip_prefix(root).is_ok_and(|relative| {
+        PANEL_EXCLUDED_PATHS.iter().any(|excluded| {
+            let excluded = std::path::Path::new(excluded);
+            relative != excluded && excluded.starts_with(relative)
+        })
+    })
+}
+
+pub(crate) fn is_panel_excluded_rel(rel: &str) -> bool {
+    let rel = rel.strip_prefix('"').unwrap_or(rel);
+    PANEL_EXCLUDED_PATHS.iter().any(|excluded| {
+        rel == *excluded
+            || rel
+                .strip_prefix(excluded)
+                .is_some_and(|suffix| suffix.starts_with('/'))
+    })
 }
 
 const TOOL_STATE_DIRS: &[&str] = &[".thegn"];
@@ -852,5 +891,84 @@ mod tests {
             assert_eq!(is_tool_state_path(&path, &root), expected, "{path:?}");
         }
         assert!(!is_tool_state_path(Path::new("/repo/.thegn/x"), &root));
+    }
+
+    #[test]
+    fn panel_excluded_paths_match_by_component() {
+        use std::path::Path;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(tmp.path()).unwrap();
+        for (relative, expected) in [
+            (".thegn/pipeline", true),
+            (".thegn/pipeline/THE-9/", true),
+            (".thegn/maintenance/job", true),
+            (".thegn/pipeline-old", false),
+            (".thegn.toml", false),
+            ("src/.thegn/pipeline", false),
+            (".thegn/pre-create.sh", false),
+        ] {
+            assert_eq!(
+                is_panel_excluded_path(&root.join(relative), &root),
+                expected,
+                "path {relative}"
+            );
+        }
+        assert!(leads_to_panel_excluded(&root.join(".thegn"), &root));
+        assert!(!leads_to_panel_excluded(
+            &root.join(".thegn/pipeline"),
+            &root
+        ));
+        assert!(!leads_to_panel_excluded(&root.join("src"), &root));
+        assert!(!is_panel_excluded_path(
+            Path::new("/elsewhere/.thegn/pipeline"),
+            &root
+        ));
+
+        for (relative, expected) in [
+            (".thegn/pipeline", true),
+            (".thegn/pipeline/THE-9/", true),
+            ("\".thegn/pipeline/THE-9/", true),
+            (".thegn/maintenance/job.md", true),
+            (".thegn/pipeline-old", false),
+            (".thegn.toml", false),
+            ("src/.thegn/pipeline/x", false),
+            (".thegn/pre-create.sh", false),
+        ] {
+            assert_eq!(
+                is_panel_excluded_rel(relative),
+                expected,
+                "relative {relative}"
+            );
+        }
+    }
+
+    #[test]
+    fn plan_prunes_pipeline_tool_state_even_without_ignored_siblings() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(tmp.path()).unwrap();
+        for dir in [".thegn/pipeline/a/b", ".thegn/hooks", "src"] {
+            std::fs::create_dir_all(root.join(dir)).unwrap();
+        }
+        let empty =
+            crate::diff_watch::IgnoreRules::new(&root, ignore::gitignore::Gitignore::empty());
+        let with_target = plan_matcher(&root);
+
+        for matcher in [&empty, &with_target] {
+            let plans = [
+                plan_watches(&root, matcher),
+                plan_watches_with_cap(&root, matcher, 64).expect("bounded plan"),
+            ];
+            for plan in plans {
+                let entry =
+                    |relative: &str| plan.iter().find(|entry| entry.path == root.join(relative));
+                assert!(entry(".thegn/pipeline").is_none());
+                assert!(entry(".thegn/pipeline/a").is_none());
+                assert!(!entry("").expect("root plan").recursive);
+                assert!(!entry(".thegn").expect("ancestor plan").recursive);
+                assert!(entry(".thegn/hooks").expect("hook plan").recursive);
+                assert!(entry("src").expect("source plan").recursive);
+            }
+        }
     }
 }
