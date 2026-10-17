@@ -165,12 +165,14 @@ impl ProcessDrivers {
             bytes,
             rela,
             &mut |rela, attrs| match platform.attr_stack.at_entry(rela, None, &repo.objects) {
-                Ok(entry) => entry.matching_attributes(attrs),
+                Ok(entry) => {
+                    // The match flag is irrelevant here; `attrs` is filled in place.
+                    let _matched = entry.matching_attributes(attrs);
+                }
                 Err(error) => {
                     if lookup_error.is_none() {
                         lookup_error = Some(error);
                     }
-                    false
                 }
             },
             &mut |_| Ok(None),
