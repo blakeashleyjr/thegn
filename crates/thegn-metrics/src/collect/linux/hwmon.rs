@@ -305,7 +305,7 @@ impl<F: HwmonFs> HwmonCollector<F> {
                 Vec::<(crate::collect::model::hwmon::SensorKind, u16, &'static str)>::new();
             let mut metadata = std::collections::HashMap::<
                 (crate::collect::model::hwmon::SensorKind, u16),
-                _,
+                (Option<String>, Thresholds),
             >::new();
             for (kind, channel, suffix, role, path) in candidates {
                 let selector = match kind {
