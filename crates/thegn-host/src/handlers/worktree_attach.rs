@@ -373,22 +373,7 @@ mod tests {
     /// `Handle::block_on`) against `socket`, with an isolated
     /// `XDG_STATE_HOME` so registry discovery finds nothing.
     fn probe_against(socket: ProbeSocket, worktree: &str) -> Vec<AttachTarget> {
-        let _guard = crate::testenv::ENV_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        let dir = std::env::temp_dir().join(format!(
-            "tg-wta-probe-{}-{}",
-            std::process::id(),
-            std::thread::current().name().unwrap_or("t")
-        ));
-        // best-effort: scratch temp dir for this test; a leftover dir is
-        // harmless and the create below retargets it.
-        let _ = std::fs::remove_dir_all(&dir); // best-effort: cleanup: the target may already be gone; a failed removal never fails the caller
-        std::fs::create_dir_all(&dir).unwrap();
-        let old = std::env::var_os("XDG_STATE_HOME");
-        // SAFETY: guarded by crate::testenv::ENV_LOCK, same critical-section
-        // shape as agent_tests' with_temp_state.
-        unsafe { std::env::set_var("XDG_STATE_HOME", &dir) };
+        let _state = crate::testenv::IsolatedState::new();
         let mut dcfg = thegn_core::config::DaemonConfig::default();
         let listener = match socket {
             ProbeSocket::None => None,
@@ -420,13 +405,6 @@ mod tests {
             .await
             .unwrap()
         });
-        match old {
-            Some(v) => unsafe { std::env::set_var("XDG_STATE_HOME", v) },
-            None => unsafe { std::env::remove_var("XDG_STATE_HOME") },
-        }
-        // best-effort: teardown of this test's scratch dir; the contents are
-        // disposable by construction.
-        let _ = std::fs::remove_dir_all(&dir); // best-effort: cleanup: the target may already be gone; a failed removal never fails the caller
         if listener.is_some() {
             let elapsed = started.elapsed();
             assert!(

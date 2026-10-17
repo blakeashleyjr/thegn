@@ -307,14 +307,8 @@ impl NewWorktreeWizard {
     /// the isolated state home only needs to live for this call.
     #[cfg(test)]
     pub(crate) fn new_isolated_for_test(repo_root: PathBuf, cfg: &Config) -> Self {
-        let dir = tempfile::tempdir().unwrap();
-        let state_home = dir.path().join("state");
-        let state_home = state_home.to_string_lossy().into_owned();
-        let _env = crate::testenv::EnvVarGuard::set(&[
-            ("XDG_STATE_HOME", &state_home),
-            ("LOCALAPPDATA", &state_home),
-        ]);
-        assert_eq!(thegn_core::util::xdg_state_home(), Path::new(&state_home));
+        let state = crate::testenv::IsolatedState::new();
+        assert!(thegn_core::util::xdg_state_home().starts_with(state.root()));
         Self::new(repo_root, cfg)
     }
 
@@ -1684,12 +1678,8 @@ mod tests {
 
     #[test]
     fn hook_workspace_slug_without_worker_path_uses_isolated_default() {
-        let dir = tempfile::tempdir().unwrap();
-        let state = dir.path().join("state");
-        let state = state.to_str().unwrap();
-        let _env =
-            crate::testenv::EnvVarGuard::set(&[("XDG_STATE_HOME", state), ("LOCALAPPDATA", state)]);
-        let root = dir.path().join("same-name");
+        let state = crate::testenv::IsolatedState::new();
+        let root = state.root().join("same-name");
         std::fs::create_dir_all(&root).unwrap();
         let db = Db::open().unwrap();
         db.slug_for_repo("/another/same-name", "same-name").unwrap();
@@ -1790,12 +1780,27 @@ mod tests {
         cmds: Vec<WizardCmd>,
         db_path: &Path,
     ) -> Vec<CreateEvent> {
-        let state_home = repo.join("state");
-        let state_home = state_home.to_string_lossy().into_owned();
-        let _env = crate::testenv::EnvVarGuard::set(&[
-            ("XDG_STATE_HOME", &state_home),
-            ("LOCALAPPDATA", &state_home),
-        ]);
+        let _state = crate::testenv::IsolatedState::new();
+        drive_worker_in_state(
+            &_state,
+            cfg,
+            repo,
+            candidate,
+            (exact_branch, base_override),
+            cmds,
+            db_path,
+        )
+    }
+
+    fn drive_worker_in_state(
+        _state: &crate::testenv::IsolatedState,
+        cfg: Config,
+        repo: &Path,
+        candidate: &str,
+        branch: (bool, Option<String>),
+        cmds: Vec<WizardCmd>,
+        db_path: &Path,
+    ) -> Vec<CreateEvent> {
         let (cmd_tx, cmd_rx) = std::sync::mpsc::channel();
         for c in cmds {
             cmd_tx.send(c).unwrap();
@@ -1807,10 +1812,10 @@ mod tests {
                 cfg,
                 repo_root: repo.to_path_buf(),
                 candidate: candidate.into(),
-                exact_branch,
+                exact_branch: branch.0,
                 generation: 7,
                 db_path: Some(db_path.to_path_buf()),
-                base_override,
+                base_override: branch.1,
             },
             cmd_rx,
             ev_tx,
@@ -2277,6 +2282,7 @@ mod tests {
 
     #[test]
     fn approved_repo_post_create_waits_before_done() {
+        let state = crate::testenv::IsolatedState::new();
         let repo = temp_repo("repo-post-wait");
         let marker = repo.join("post-create.done");
         std::fs::write(
@@ -2312,9 +2318,12 @@ mod tests {
         .unwrap();
         drop(db);
 
-        let events = drive_worker(
+        let events = drive_worker_in_state(
+            &state,
+            test_cfg(),
             &repo,
             "tg/repo-post-wait-2",
+            (false, None),
             vec![
                 WizardCmd::PrepChosen {
                     env: "default".into(),
@@ -2333,7 +2342,7 @@ mod tests {
         assert_eq!(std::fs::read_to_string(&marker).unwrap(), "done");
         assert!(Path::new(&p.path).is_dir());
         assert!(
-            repo.join("state/thegn/hooks").is_dir(),
+            state.state_home().join("thegn/hooks").is_dir(),
             "post-create hook log should use the worker's isolated state home"
         );
         let _ = std::fs::remove_dir_all(&repo); // best-effort: cleanup: the target may already be gone; a failed removal never fails the caller
