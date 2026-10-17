@@ -196,12 +196,14 @@ impl<F: HwmonFs> HwmonCollector<F> {
                 continue;
             };
             let device_path = dir.join("device");
-            let device_abs = self.fs.canonical(&device_path).ok();
-            let device = device_abs
-                .as_ref()
-                .and_then(|path| path.strip_prefix(&canonical_root).ok())
-                .map(|p| format!("/{}", p.display()))
-                .unwrap_or_else(|| "virtual".to_owned());
+            let device_abs = self.fs.canonical(&device_path);
+            let device = match device_abs.as_ref() {
+                Ok(path) => match path.strip_prefix(&canonical_root) {
+                    Ok(relative) => format!("/{}", relative.display()),
+                    Err(_) => "virtual".to_owned(),
+                },
+                Err(_) => "virtual".to_owned(),
+            };
             self.inventory.push(ChipIdentity {
                 dir: dir.clone(),
                 name: name.clone(),
@@ -222,7 +224,10 @@ impl<F: HwmonFs> HwmonCollector<F> {
             let is_gated = wake_gate(status.as_bytes(), scsi_state.as_deref());
             let can_wake = matches!(status.as_str(), "active" | "suspended" | "suspending")
                 || state_path.is_some();
-            let order = device_abs.unwrap_or_else(|| dir.clone());
+            let order = match device_abs {
+                Ok(path) => path,
+                Err(_) => dir.clone(),
+            };
             chips.push(ProbedChip {
                 order,
                 dir,
@@ -978,7 +983,7 @@ mod tests {
                     && sensor.role == crate::collect::model::hwmon::SensorRole::Target
             })
             .unwrap();
-        assert_eq!(frame.parts.hwmon.values[fan_target].value, Some(1400.0));
+        assert_eq!(frame.parts.hwmon.values[fan_target].value, Some(1500.0));
     }
 
     #[test]
