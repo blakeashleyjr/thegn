@@ -5057,8 +5057,8 @@ mod tests {
         assert_eq!((child.rows, child.cols), (41, 137));
         assert_eq!(child.forked_from.as_deref(), Some(source.id.as_str()));
 
-        let handoff = state
-            .path()
+        let handoff = _state
+            .state_home()
             .join("thegn/forks")
             .join(format!("{}.txt", child.id));
         let history = std::fs::read_to_string(&handoff).expect("handoff exists");
