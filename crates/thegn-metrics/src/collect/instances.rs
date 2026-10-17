@@ -61,12 +61,16 @@ impl Interner {
         }
     }
     pub fn intern(&mut self, key: &str) -> Interned {
+        let live = self.live();
         if let Some(entry) = self.entries.get_mut(key) {
+            if !entry.live && live >= self.family.cap() {
+                self.truncated = true;
+                return Interned::Other;
+            }
             entry.live = true;
             return Interned::Id(entry.id);
         }
-        let live = self.live();
-        let id = if live < self.family.cap() {
+        let id = if self.by_id.len() < self.family.cap() {
             let Ok(id) = u16::try_from(self.by_id.len()) else {
                 self.truncated = true;
                 return Interned::Other;
@@ -149,13 +153,36 @@ mod tests {
         interner.retire(first_id);
         assert_eq!(interner.intern("a"), first);
         interner.retire(first_id);
-        for key in ["c", "d", "e", "f", "g", "h", "i"] {
-            assert!(matches!(interner.intern(key), Interned::Id(_)));
+        for key in ["c", "d", "e", "f", "g", "h"] {
+            let Interned::Id(id) = interner.intern(key) else {
+                panic!()
+            };
+            assert!(usize::from(id.0) < Family::Gpu.cap());
         }
-        assert_eq!(interner.live(), Family::Gpu.cap());
-        assert_eq!(interner.intern("new"), Interned::Id(first_id));
+        assert_eq!(interner.live(), Family::Gpu.cap() - 1);
+        let Interned::Id(new_id) = interner.intern("new") else {
+            panic!()
+        };
+        assert_eq!(new_id, first_id);
+        assert!(usize::from(new_id.0) < Family::Gpu.cap());
         assert_eq!(interner.key(first_id), Some("new"));
         assert_eq!(interner.live(), Family::Gpu.cap());
+    }
+
+    #[test]
+    fn churn_reuses_bounded_ids_without_truncating_while_slots_are_dormant() {
+        let mut interner = Interner::new(Family::Gpu);
+        let cap = Family::Gpu.cap();
+        for n in 0..10 * cap {
+            let Interned::Id(id) = interner.intern(&format!("gpu{n}")) else {
+                panic!()
+            };
+            assert!(usize::from(id.0) < cap);
+            assert!(interner.live() < cap);
+            interner.retire(id);
+            assert!(interner.by_id.len() <= cap);
+        }
+        assert!(!interner.truncated());
     }
 
     #[test]
@@ -169,11 +196,13 @@ mod tests {
         };
         interner.retire(a);
         interner.retire(b);
-        for key in ["c", "d", "e", "f", "g", "h", "i", "j"] {
+        for key in ["c", "d", "e", "f", "g", "h"] {
             assert!(matches!(interner.intern(key), Interned::Id(_)));
         }
-        assert_eq!(interner.live(), Family::Gpu.cap());
+        assert_eq!(interner.live(), 6);
         assert_eq!(interner.intern("k"), Interned::Id(a));
         assert_eq!(interner.intern("l"), Interned::Id(b));
+        assert!(usize::from(a.0) < Family::Gpu.cap());
+        assert!(usize::from(b.0) < Family::Gpu.cap());
     }
 }

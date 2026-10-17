@@ -31,12 +31,12 @@ impl PsiCollector {
         let Some(file) = self.files[index].as_mut() else {
             return Ok(PsiResource::default());
         };
-        let bytes = match file.read_all() {
+        let bytes = match file.read_all().map(<[u8]>::to_vec) {
             Ok(bytes) => bytes,
             Err(_error) if file.needs_reopen() => return Err(CollectError::Gone),
             Err(error) => return Err(error.into()),
         };
-        let parsed = psi::parse(bytes);
+        let parsed = psi::parse(&bytes);
         if parsed.some.is_none() && parsed.full.is_none() {
             return Err(CollectError::Parse("pressure"));
         }
@@ -147,5 +147,49 @@ mod tests {
             collector.discover(&Env::default()),
             Health::Absent(Absent::NoHardware)
         );
+    }
+
+    #[test]
+    fn collector_reports_some_stall_after_two_samples() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("cpu");
+        fs::write(&path, b"some avg10=0 avg60=0 avg300=0 total=100\n").unwrap();
+        let mut collector = PsiCollector::at(dir.path());
+        assert_eq!(collector.discover(&Env::default()), Health::Ok);
+        let mut frame = MonitorFrame::default();
+        collector
+            .sample(
+                &TickCtx {
+                    tick: 0,
+                    now_ms: 1000,
+                },
+                &mut frame,
+            )
+            .unwrap();
+        assert_eq!(frame.parts.psi.cpu.some_stall_centi, None);
+
+        fs::write(&path, b"some avg10=0 avg60=0 avg300=0 total=50100\n").unwrap();
+        collector
+            .sample(
+                &TickCtx {
+                    tick: 1,
+                    now_ms: 2000,
+                },
+                &mut frame,
+            )
+            .unwrap();
+        assert_eq!(frame.parts.psi.cpu.some_stall_centi, Some(500));
+    }
+
+    #[test]
+    fn garbage_pressure_file_is_a_parse_error() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("cpu"), b"not pressure data\n").unwrap();
+        let mut collector = PsiCollector::at(dir.path());
+        assert_eq!(collector.discover(&Env::default()), Health::Ok);
+        assert!(matches!(
+            collector.sample(&TickCtx::default(), &mut MonitorFrame::default()),
+            Err(CollectError::Parse("pressure"))
+        ));
     }
 }

@@ -424,4 +424,18 @@ mod tests {
             Coverage::Available
         );
     }
+
+    #[test]
+    fn not_implemented_collectors_preserve_snapshot_coverage_verdicts() {
+        use crate::collect::{
+            COLLECTORS,
+            health::{Absent, Health},
+        };
+        let health = [Health::Absent(Absent::NotImplemented); COLLECTORS];
+        let snapshot = StatsSnapshot::default();
+        assert_eq!(
+            coverage_with_collectors(&snapshot, &health),
+            coverage(&snapshot)
+        );
+    }
 }
