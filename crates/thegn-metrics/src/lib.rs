@@ -41,7 +41,10 @@ pub fn run_command_bounded(
 }
 
 pub use battery::{read_battery, read_battery_power};
-pub use coverage::{AbsentReason, Coverage, FamilyReport, MetricFamily, coverage};
+pub use coverage::{
+    AbsentReason, Coverage, FamilyReport, MetricFamily, collector_families, coverage,
+    coverage_with_collectors,
+};
 pub use net_kind::{IfaceKind, NetIface};
 pub use net_medium::{
     IfaceFact, MediumReason, MediumSelection, NetMedium, select_medium, select_medium_explained,

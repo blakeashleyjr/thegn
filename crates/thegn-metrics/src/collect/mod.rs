@@ -7,11 +7,13 @@ pub mod delta;
 pub mod env;
 pub mod frame;
 pub mod health;
+pub mod instances;
 #[cfg(target_os = "linux")]
 pub mod linux;
 pub mod model;
 pub mod parse;
 pub mod policy;
+pub mod registry;
 pub mod schedule;
 pub mod stub;
 
@@ -139,4 +141,20 @@ pub trait Collector: Send {
     fn discover(&mut self, env: &Env) -> Health;
     fn sample(&mut self, ctx: &TickCtx, frame: &mut MonitorFrame) -> Result<(), CollectError>;
     fn close(&mut self);
+}
+
+#[cfg(target_os = "linux")]
+pub fn default_collectors() -> Vec<Box<dyn Collector>> {
+    let mut collectors = stub::stub_collectors();
+    collectors[CollectorId::Loadavg.index()] =
+        Box::new(linux::loadavg::LoadavgCollector::at("/proc/loadavg"));
+    collectors[CollectorId::Uptime.index()] =
+        Box::new(linux::uptime::UptimeCollector::at("/proc/uptime"));
+    collectors[CollectorId::Psi.index()] = Box::new(linux::psi::PsiCollector::at("/proc/pressure"));
+    collectors
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn default_collectors() -> Vec<Box<dyn Collector>> {
+    stub::stub_collectors()
 }
