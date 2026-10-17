@@ -24,6 +24,8 @@
 #                 [--syscr-rate-ceiling N]
 #
 # Exit status: 0 ok; 2 over a ceiling (CPU or resource); 1 harness error.
+# TG_PERF_DROP_KEYS=1 is a negative control: discard workload keys and verify
+# that the input self-check fails. Workload runs require observable key dispatch.
 
 set -euo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -233,6 +235,8 @@ GIT_SHA="$(git -C "$HERE" rev-parse --short HEAD 2>/dev/null || echo unknown)"
 
 perf_make_tmp
 perf_trap_cleanup
+PERF_SOCK_DIR=""
+trap 'rm -rf "${PERF_SOCK_DIR:-}"; rm -rf "${PERF_TMP:-}"' EXIT
 HOST_TAG="$(perf_host_tag)"
 REPO="$(perf_build_fixture "$WORKTREES" "$DIRTY")"
 
@@ -259,7 +263,12 @@ SETTLE_MAX_MS=$((SETTLE_MS > 20000 ? SETTLE_MS : 20000))
 # window ended ("thegn exited before the spawn-rate idle window ended") and every
 # number from that run under-measured. The harness SIGTERMs thegn when done, so a
 # long tail costs nothing; 30 s covers any observed lag with room to spare.
-RUN_MS=$((SETTLE_MAX_MS + 1000 + WINDOW_MS + 30000))
+KEY_PHASE_MAX_MS=40000
+if [ "$SCENARIO" = steady-workload ] || [ "$SCENARIO" = soak ] || [ "$SCENARIO" = soak-daemon ]; then
+  RUN_MS=$((SETTLE_MAX_MS + 1000 + WINDOW_MS + KEY_PHASE_MAX_MS + 30000))
+else
+  RUN_MS=$((SETTLE_MAX_MS + 1000 + WINDOW_MS + 30000))
+fi
 DEADLINE_S=$(((RUN_MS / 1000) + 10)) # hard safety net
 
 # Launch thegn under a PTY (termwiz refuses to start without one); the inner
@@ -285,57 +294,75 @@ if [ "$SCENARIO" = soak-daemon ]; then
 else
   NO_DAEMON="THEGN_NO_DAEMON=1"
 fi
+WORKLOAD=0
+if [ "$SCENARIO" = steady-workload ] || [ "$SCENARIO" = soak ] || [ "$SCENARIO" = soak-daemon ]; then
+  WORKLOAD=1
+  FIFO="$PERF_TMP/input.fifo"
+  mkfifo "$FIFO"
+fi
+LOG_ENV=""
+if [ "$WORKLOAD" = 1 ]; then
+  LOG_ENV=THEGN_LOG=thegn::input=debug
+fi
 if [ "$SPAWN_ENABLED" = 1 ] && [ "$SAMPLER" = proc ]; then
   # `$1`/`$@` are the bash -c positionals passed after `$0`, not outer values.
   # shellcheck disable=SC2016
   printf -v INNER \
-    'cd %q; stty rows 50 cols 200; env THEGN_BENCH_RUN_MS=%q %s %q %s -o %q bash -c '\''echo $$ > "$1"; shift; exec "$@"'\'' _ %q %q & echo $! > %q; wait' \
-    "$REPO" "$RUN_MS" "$NO_DAEMON" "$STRACE_BIN" "$SPAWN_STRACE_FLAGS" "$TRACE_UI_FILE" "$PIDFILE" "$BIN_ABS" "$TRACE_UI_PIDFILE"
+    'cd %q; stty rows 50 cols 200; env THEGN_BENCH_RUN_MS=%q %s %s %q %s -o %q bash -c '\''echo $$ > "$1"; shift; exec "$@"'\'' _ %q %q & echo $! > %q; wait' \
+    "$REPO" "$RUN_MS" "$NO_DAEMON" "$LOG_ENV" "$STRACE_BIN" "$SPAWN_STRACE_FLAGS" "$TRACE_UI_FILE" "$PIDFILE" "$BIN_ABS" "$TRACE_UI_PIDFILE"
 else
-  printf -v INNER \
-    'cd %q; stty rows 50 cols 200; env THEGN_BENCH_RUN_MS=%q %s %q & echo $! > %q; wait' \
-    "$REPO" "$RUN_MS" "$NO_DAEMON" "$BIN_ABS" "$PIDFILE"
+  if [ "$WORKLOAD" = 1 ]; then
+    printf -v INNER \
+      'cd %q; stty rows 50 cols 200; env THEGN_BENCH_RUN_MS=%q %s THEGN_LOG=thegn::input=debug %q & echo $! > %q; wait' \
+      "$REPO" "$RUN_MS" "$NO_DAEMON" "$BIN_ABS" "$PIDFILE"
+  else
+    printf -v INNER \
+      'cd %q; stty rows 50 cols 200; env THEGN_BENCH_RUN_MS=%q %s %q & echo $! > %q; wait' \
+      "$REPO" "$RUN_MS" "$NO_DAEMON" "$BIN_ABS" "$PIDFILE"
+  fi
 fi
 TIMEOUT_BIN="$(pty_timeout_bin)"
 # Single quotes are deliberate: $0/$1 are the INNER bash's positionals, bound by
 # the two arguments below, not this shell's. (Same idiom as flood.sh.)
 # shellcheck disable=SC2016
 if [ -n "$TIMEOUT_BIN" ]; then
-  "$TIMEOUT_BIN" "${DEADLINE_S}s" bash -c 'source "$0"; pty_run "$1"' \
-    "$HERE/../lib/pty.sh" "$INNER" >/dev/null 2>&1 &
+  if [ "$WORKLOAD" = 1 ]; then
+    "$TIMEOUT_BIN" "${DEADLINE_S}s" bash -c 'source "$0"; pty_run "$1"' \
+      "$HERE/../lib/pty.sh" "$INNER" <"$FIFO" >/dev/null 2>&1 &
+  else
+    "$TIMEOUT_BIN" "${DEADLINE_S}s" bash -c 'source "$0"; pty_run "$1"' \
+      "$HERE/../lib/pty.sh" "$INNER" >/dev/null 2>&1 &
+  fi
 else
   # No timeout binary: the bench window (THEGN_BENCH_RUN_MS) still exits on its
   # own, so we lose only the belt-and-braces deadline.
-  bash -c 'source "$0"; pty_run "$1"' "$HERE/../lib/pty.sh" "$INNER" >/dev/null 2>&1 &
+  if [ "$WORKLOAD" = 1 ]; then
+    bash -c 'source "$0"; pty_run "$1"' "$HERE/../lib/pty.sh" "$INNER" <"$FIFO" >/dev/null 2>&1 &
+  else
+    bash -c 'source "$0"; pty_run "$1"' "$HERE/../lib/pty.sh" "$INNER" >/dev/null 2>&1 &
+  fi
 fi
 LAUNCHER=$!
+if [ "$WORKLOAD" = 1 ]; then
+  exec 3>"$FIFO"
+fi
 
-# `soak-daemon` starts the daemon ITSELF rather than waiting for the UI to spawn
-# one lazily.
-#
-# The lazy path needs a pane attach, and attaching a pane in this headless
-# fixture is not solved: the shared workload keystrokes are sidebar navigation
-# only, and `new-pane` needs UI context this harness does not set up. Feeding
-# keys until something opens would be tuning a gate until it passes, which is
-# how you get one that measures nothing.
-#
-# So the scope is stated instead of fudged. This scenario watches the DAEMON
-# PROCESS — its fds, threads, children and zombies over a settled window — which
-# is real coverage of the longest-lived process thegn runs, and coverage no other
-# scenario has. It does NOT exercise pane teardown; the specific regression there
-# (THE-704, a pane child left unreaped when its consumer goes away) is pinned by
-# `pane_pty::tests::a_pane_whose_consumer_vanishes_leaves_no_child_behind`, which
-# has a verified failing control. Wiring headless pane sessions in here would
-# extend this scenario to that path too.
+# `soak-daemon` starts an isolated daemon and the workload input opens panes on
+# it. Use an explicit configured socket so the UI and daemon resolve the same path.
 DAEMON_LAUNCHER=""
+DAEMON_SOCK=""
 if [ "$SCENARIO" = soak-daemon ]; then
-  # `--socket` explicitly, even though the env already resolves to this path:
-  # `find_daemon_pid` matches on the isolated runtime dir appearing in ARGV, so
-  # that it can never pick up the developer's live daemon. A daemon started
-  # without the flag inherits the path from the environment and is invisible to
-  # that match — which is exactly how this scenario first reported "not found"
-  # while its own daemon was running.
   mkdir -p "$XDG_RUNTIME_DIR/thegn"
+  DAEMON_SOCK="$XDG_RUNTIME_DIR/thegn/perf.sock"
+  if [ "${#DAEMON_SOCK}" -gt 100 ]; then
+    PERF_SOCK_DIR="$(mktemp -d /tmp/tgpd.XXXXXX)"
+    chmod 700 "$PERF_SOCK_DIR"
+    DAEMON_SOCK="$PERF_SOCK_DIR/d.sock"
+  fi
+  mkdir -p "$(dirname "$DAEMON_SOCK")"
+  chmod 700 "$(dirname "$DAEMON_SOCK")"
+  mkdir -p "$XDG_CONFIG_HOME/thegn"
+  printf '[daemon]\nsocket = "%s"\n' "$DAEMON_SOCK" >"$XDG_CONFIG_HOME/thegn/config.toml"
   if [ "$SPAWN_ENABLED" = 1 ] && [ "$SAMPLER" = proc ]; then
     TRACE_DAEMON_FILE="$PERF_TMP/daemon.execve"
     DAEMON_PIDFILE="$PERF_TMP/daemon.pid"
@@ -346,17 +373,26 @@ if [ "$SCENARIO" = soak-daemon ]; then
     # shellcheck disable=SC2016,SC2086
     "$STRACE_BIN" $SPAWN_STRACE_FLAGS -o "$TRACE_DAEMON_FILE" \
       bash -c 'echo $$ > "$1"; shift; exec "$@"' _ "$DAEMON_PIDFILE" \
-      "$BIN_ABS" daemon --socket "$XDG_RUNTIME_DIR/thegn/daemon.sock" >/dev/null 2>&1 &
+      "$BIN_ABS" daemon --socket "$DAEMON_SOCK" >/dev/null 2>&1 &
   else
     DAEMON_PIDFILE=""
-    "$BIN_ABS" daemon --socket "$XDG_RUNTIME_DIR/thegn/daemon.sock" >/dev/null 2>&1 &
+    "$BIN_ABS" daemon --socket "$DAEMON_SOCK" >/dev/null 2>&1 &
   fi
   DAEMON_LAUNCHER=$!
   # The socket is the readiness signal; the UI attaches to the same path.
   for _ in $(seq 1 100); do
-    [ -S "$XDG_RUNTIME_DIR/thegn/daemon.sock" ] && break
+    [ -S "$DAEMON_SOCK" ] && break
     sleep 0.1
   done
+  if [ ! -S "$DAEMON_SOCK" ]; then
+    echo "FAIL: pane daemon never bound $DAEMON_SOCK" >&2
+    kill "$LAUNCHER" 2>/dev/null || true
+    exec 3>&-
+    wait "$LAUNCHER" 2>/dev/null || true
+    kill "$DAEMON_LAUNCHER" 2>/dev/null || true
+    wait "$DAEMON_LAUNCHER" 2>/dev/null || true
+    exit 1
+  fi
 fi
 
 # Wait for the PID file (thegn up).
@@ -375,6 +411,12 @@ if [ -z "$PID" ] || ! kill -0 "$PID" 2>/dev/null; then
     echo "cpu-sample: thegn did not start" >&2
   fi
   kill "$LAUNCHER" 2>/dev/null || true
+  if [ "$WORKLOAD" = 1 ]; then exec 3>&-; fi
+  wait "$LAUNCHER" 2>/dev/null || true
+  if [ -n "$DAEMON_LAUNCHER" ]; then
+    kill "$DAEMON_LAUNCHER" 2>/dev/null || true
+    wait "$DAEMON_LAUNCHER" 2>/dev/null || true
+  fi
   [ "$SPAWN_ENABLED" = 1 ] && exit 2
   exit 1
 fi
@@ -451,17 +493,17 @@ proc_syscr() { # $1 = pid -> cumulative read syscalls
 
 # The pane daemon this run started, or empty.
 #
-# Matched on OUR isolated runtime dir appearing in the process's argv — not on
+# Matched on OUR isolated socket path appearing in the process's argv — not on
 # the name `thegn daemon`, which would also match the developer's live daemon
 # and turn this gate into a reading of whatever their session happens to be
-# doing. `perf_make_tmp` makes `$XDG_RUNTIME_DIR` unique per run, and the UI
+# doing. `DAEMON_SOCK` is unique per run, and the UI
 # passes the resolved socket path to the daemon it spawns, so the match is exact.
 find_daemon_pid() {
   local d
   for d in /proc/[0-9]*; do
     [ -r "$d/cmdline" ] || continue
     # NUL-separated argv; translate so a plain grep works.
-    if tr '\0' ' ' <"$d/cmdline" 2>/dev/null | grep -q -- "$XDG_RUNTIME_DIR"; then
+    if tr '\0' ' ' <"$d/cmdline" 2>/dev/null | grep -q -F -- "$DAEMON_SOCK"; then
       printf '%s' "${d##*/}"
       return 0
     fi
@@ -475,21 +517,87 @@ res_sample() { # $1 = pid -> "children zombies fdtotal fddb fdproc fdsock fdpipe
 }
 
 if [ "$SCENARIO" = steady-workload ] || [ "$SCENARIO" = soak ] || [ "$SCENARIO" = soak-daemon ]; then
-  # `soak-daemon` needs its own keystrokes. The shared workload file is sidebar
-  # navigation only — arrows and a Tab — so it never attaches a pane, and the
-  # daemon is spawned LAZILY on the first attach. With the navigation keys the
-  # scenario found no daemon and (correctly) failed rather than reporting a
-  # clean run. These open panes instead, and leave them open so the daemon has
-  # live sessions to hold for the whole sample window.
+  # Allow a first frame, then dismiss onboarding before counting dispatcher
+  # output: onboarding-consumed keys do not reach the keymap logger.
   KEYS="$HERE/scenarios/steady-workload.keys"
   [ "$SCENARIO" = soak-daemon ] && KEYS="$HERE/scenarios/soak-daemon.keys"
-  # The pty master is only reachable through /proc on Linux; on darwin the
-  # scenario degrades to plain idle rather than silently claiming a workload.
-  if [ "$SAMPLER" = proc ] && [ -f "$KEYS" ]; then
-    cat "$KEYS" >"/proc/$PID/fd/0" 2>/dev/null || true
-  elif [ "$SAMPLER" != proc ]; then
-    echo "cpu-sample: steady-workload keystrokes need /proc — measuring idle instead" >&2
+  sleep 3
+  printf '\033' >&3
+  sleep 0.8
+  printf '\033' >&3
+  sleep 0.8
+  LOG_FILE="$XDG_STATE_HOME/thegn/logs/thegn.log"
+  ESC="$(printf '\033')"
+  LOG_LINES=0
+  [ -f "$LOG_FILE" ] && LOG_LINES="$(wc -l <"$LOG_FILE" | tr -d ' ')"
+  KEYS_BYTES="$(wc -c <"$KEYS" | tr -d ' ')"
+  if [ "${TG_PERF_DROP_KEYS:-}" = 1 ]; then
+    cat "$KEYS" >/dev/null
+  elif ! cat "$KEYS" >&3; then
+    echo 'FAIL: could not write keys to the pty master' >&2
+    if [ "$JSON_ONLY" = 1 ]; then printf '%s\n' '{"input":{"status":"failed"}}'; fi
+    kill "$PID" 2>/dev/null || true
+    exec 3>&-
+    wait "$LAUNCHER" 2>/dev/null || true
+    if [ -n "$DAEMON_LAUNCHER" ]; then
+      "$BIN_ABS" daemon stop >/dev/null 2>&1 || kill "$DAEMON_LAUNCHER" 2>/dev/null || true
+      wait "$DAEMON_LAUNCHER" 2>/dev/null || true
+    fi
+    exit 1
   fi
+  DISPATCH_LINES=0
+  MATCHED_LINES=0
+  for _ in $(seq 1 150); do
+    if [ -f "$LOG_FILE" ]; then
+      NEW_LINES="$(tail -n +$((LOG_LINES + 1)) "$LOG_FILE" | sed "s/${ESC}\\[[0-9;]*[[:alpha:]]//g")"
+      DISPATCH_LINES="$(printf '%s\n' "$NEW_LINES" | grep -c 'key dispatch' || true)"
+      MATCHED_LINES="$(printf '%s\n' "$NEW_LINES" | grep 'key dispatch' | grep -c 'matched' || true)"
+    fi
+    [ "$DISPATCH_LINES" -gt 0 ] && break
+    sleep 0.1
+  done
+  if [ "$DISPATCH_LINES" -lt 1 ]; then
+    echo "FAIL: key injection had no observable effect (0 key dispatch lines in $LOG_FILE)" >&2
+    if [ "$JSON_ONLY" = 1 ]; then printf '%s\n' '{"input":{"status":"failed","keys_bytes":0,"dispatch_lines":0,"matched":0,"sessions":null}}'; fi
+    kill "$PID" 2>/dev/null || true
+    exec 3>&-
+    wait "$LAUNCHER" 2>/dev/null || true
+    if [ -n "$DAEMON_LAUNCHER" ]; then
+      "$BIN_ABS" daemon stop >/dev/null 2>&1 || kill "$DAEMON_LAUNCHER" 2>/dev/null || true
+      wait "$DAEMON_LAUNCHER" 2>/dev/null || true
+    fi
+    exit 1
+  fi
+  if [ "$SCENARIO" = soak-daemon ] && [ "$MATCHED_LINES" -lt 1 ]; then
+    echo "FAIL: soak-daemon key injection had no matched dispatch line in $LOG_FILE" >&2
+    if [ "$JSON_ONLY" = 1 ]; then printf '%s\n' '{"input":{"status":"failed","keys_bytes":0,"dispatch_lines":0,"matched":0,"sessions":null}}'; fi
+    kill "$PID" 2>/dev/null || true
+    exec 3>&-
+    wait "$LAUNCHER" 2>/dev/null || true
+    "$BIN_ABS" daemon stop >/dev/null 2>&1 || kill "$DAEMON_LAUNCHER" 2>/dev/null || true
+    wait "$DAEMON_LAUNCHER" 2>/dev/null || true
+    exit 1
+  fi
+  SESSION_COUNT=null
+  if [ "$SCENARIO" = soak-daemon ]; then
+    SESSION_COUNT=0
+    for _ in $(seq 1 150); do
+      SESSION_COUNT="$("$BIN_ABS" session list --live --json 2>/dev/null | python3 -c 'import json,sys; print(len(json.load(sys.stdin)))' 2>/dev/null || echo 0)"
+      [ "$SESSION_COUNT" -ge 1 ] && break
+      sleep 0.1
+    done
+    if [ "$SESSION_COUNT" -lt 1 ]; then
+      echo 'FAIL: soak-daemon attached no panes to the harness daemon' >&2
+      if [ "$JSON_ONLY" = 1 ]; then printf '%s\n' '{"input":{"status":"failed","keys_bytes":%s,"dispatch_lines":%s,"matched":%s,"sessions":0}}' "$KEYS_BYTES" "$DISPATCH_LINES" "$MATCHED_LINES"; fi
+      kill "$PID" 2>/dev/null || true
+      exec 3>&-
+      wait "$LAUNCHER" 2>/dev/null || true
+      "$BIN_ABS" daemon stop >/dev/null 2>&1 || kill "$DAEMON_LAUNCHER" 2>/dev/null || true
+      wait "$DAEMON_LAUNCHER" 2>/dev/null || true
+      exit 1
+    fi
+  fi
+  INPUT_JSON="{\"status\":\"ok\",\"keys_bytes\":$KEYS_BYTES,\"dispatch_lines\":$DISPATCH_LINES,\"matched\":$MATCHED_LINES,\"sessions\":$SESSION_COUNT}"
 fi
 
 WINDOW_S="$(awk "BEGIN{print $WINDOW_MS/1000}")"
@@ -684,6 +792,9 @@ fi
 if [ "$SAMPLER" = proc ] && [ -n "${PID:-}" ]; then
   kill "$PID" 2>/dev/null || true
 fi
+if [ "$WORKLOAD" = 1 ]; then
+  exec 3>&-
+fi
 wait "$LAUNCHER" 2>/dev/null || true
 # Stop the daemon this run started. It lives in an isolated state dir, so a
 # leaked one would not corrupt anything — but it WOULD sit on a socket under a
@@ -736,7 +847,8 @@ if [ "$SPAWN_ENABLED" = 1 ] && [ "$SAMPLER" = proc ]; then
   fi
 fi
 
-RESULT="{\"scenario\":\"$SCENARIO\",\"build\":\"$BUILD\",\"worktrees\":$WORKTREES,\"window_ms\":$WINDOW_MS,\"settle_used_ms\":${SETTLE_USED_MS:-$SETTLE_MS},\"cores_total\":$CORES_TOTAL,\"threads\":$THREAD_JSON,\"resources\":$RES_JSON,\"spawn_rate\":$SPAWN_JSON,\"git_sha\":\"$GIT_SHA\",\"host_tag\":\"$HOST_TAG\"}"
+INPUT_JSON="${INPUT_JSON:-null}"
+RESULT="{\"scenario\":\"$SCENARIO\",\"build\":\"$BUILD\",\"worktrees\":$WORKTREES,\"window_ms\":$WINDOW_MS,\"settle_used_ms\":${SETTLE_USED_MS:-$SETTLE_MS},\"cores_total\":$CORES_TOTAL,\"threads\":$THREAD_JSON,\"resources\":$RES_JSON,\"spawn_rate\":$SPAWN_JSON,\"input\":$INPUT_JSON,\"git_sha\":\"$GIT_SHA\",\"host_tag\":\"$HOST_TAG\"}"
 
 BASELINE="$BASELINE_DIR/$HOST_TAG.$SCENARIO.json"
 if [ "$RECORD" = 1 ]; then
@@ -748,6 +860,7 @@ if [ "$JSON_ONLY" = 1 ]; then
   printf '%s\n' "$RESULT"
 else
   echo "scenario=$SCENARIO build=$BUILD worktrees=$WORKTREES window=${WINDOW_MS}ms settle=${SETTLE_USED_MS:-$SETTLE_MS}ms"
+  echo "input: $INPUT_JSON"
   echo "binary=$BIN_ABS"
   echo "cores_total=$CORES_TOTAL  (host=$HOST_TAG sha=$GIT_SHA)"
   echo "top threads (cores comm tid):"

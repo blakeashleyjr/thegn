@@ -14,6 +14,20 @@ set -euo pipefail
 # Create the throwaway root and export the isolated environment. Caller is
 # responsible for cleanup (or use perf_trap_cleanup).
 perf_make_tmp() {
+  local v
+  # A perf run must not inherit the developer's session controls, log routing,
+  # or credentials. Keep TG_PERF_* so the harness's own knobs remain available.
+  while IFS= read -r v; do
+    case "$v" in
+    THEGN_* | GH_* | GITHUB_* | KANEO_* | LINEAR_* | JIRA_* | AWS_* | *TOKEN* | *API_KEY* | *SECRET*)
+      case "$v" in
+      TG_PERF_*) ;;
+      *) unset "$v" ;;
+      esac
+      ;;
+    esac
+  done < <(compgen -e)
+
   PERF_TMP="$(mktemp -d "${TMPDIR:-/tmp}/tg-perf.XXXXXX")"
   export PERF_TMP
   export HOME="$PERF_TMP/home"
