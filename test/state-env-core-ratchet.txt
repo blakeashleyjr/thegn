@@ -8,7 +8,6 @@ config_tests.rs
 db_tests.rs
 git_memo.rs
 log_trace.rs
-managed_ssh.rs
 migrate_brand.rs
 profile.rs
 sandbox_tests.rs

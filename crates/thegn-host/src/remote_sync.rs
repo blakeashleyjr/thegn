@@ -489,7 +489,7 @@ mod tests {
     fn run_sh(home: &std::path::Path, command: &str) -> std::process::Output {
         Command::new("sh")
             .args(["-c", command])
-            .env("HOME", home)
+            .envs(thegn_core::testenv::state_env_all(home))
             .env("GIT_CONFIG_GLOBAL", "/dev/null")
             .env("GIT_CONFIG_NOSYSTEM", "1")
             .output()

@@ -4,25 +4,15 @@
 # state isolation (owner request 2026-10-16, cross-platform test layer piece 3).
 
 agent_tests.rs
-automation_runtime.rs
 canonical_history_tests.rs
 cmd/config.rs
 cmd/doctor.rs
-cmd/events.rs
-cmd/repos.rs
-daemon/agent_open.rs
-daemon/fork.rs
-daemon/mod.rs
-daemon/pty_diagnostics.rs
 daemon/service.rs
 diff_watch.rs
 handlers/merge_queue.rs
 handlers/pr_queue.rs
 handlers/sidebar_mouse.rs
-handlers/sidebar_persist.rs
 handlers/sidebar_reorder.rs
-handlers/terminal.rs
-handlers/usage_alert.rs
 handlers/worktree_attach.rs
 handlers/worktree_launch.rs
 hook_run.rs
@@ -38,9 +28,6 @@ merge_ops.rs
 platform/sandbox_floor_preflight_tests.rs
 platform/startup_watchdog_tests.rs
 platform/unix.rs
-provider_workdir.rs
-remote_enqueue_auth.rs
-remote_sync.rs
 run_tests.rs
 wizard.rs
 worktree_lifecycle.rs

@@ -1154,19 +1154,10 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn cli_connect_rejects_foreign_scope_and_accepts_matching_and_legacy_daemons() {
-        use std::os::unix::fs::PermissionsExt as _;
         use thegn_core::config::{Config, DaemonConfig};
 
-        let temp = tempfile::Builder::new()
-            .prefix("thegn-cli-connect-scope-")
-            .permissions(std::fs::Permissions::from_mode(0o700))
-            .tempdir()
-            .unwrap();
-        let _env = crate::testenv::EnvVarGuard::set(&[
-            ("XDG_STATE_HOME", temp.path().to_str().unwrap()),
-            ("XDG_RUNTIME_DIR", temp.path().to_str().unwrap()),
-        ]);
-        let foreign_socket = temp.path().join("foreign.sock");
+        let state = crate::testenv::IsolatedState::with_runtime_dir();
+        let foreign_socket = state.root().join("foreign.sock");
         let foreign_cfg = Config {
             daemon: DaemonConfig {
                 socket: foreign_socket.display().to_string(),
@@ -1186,7 +1177,7 @@ mod tests {
         assert!(error.to_string().contains("different state directory"));
         stop_connect_test_daemon(server).await;
 
-        let local_socket = temp.path().join("local.sock");
+        let local_socket = state.root().join("local.sock");
         let local_cfg = Config {
             daemon: DaemonConfig {
                 socket: local_socket.display().to_string(),
@@ -1199,7 +1190,7 @@ mod tests {
         assert!(crate::cmd::session::connect(&local_cfg).await.is_ok());
         stop_connect_test_daemon(server).await;
 
-        let legacy_socket = temp.path().join("legacy.sock");
+        let legacy_socket = state.root().join("legacy.sock");
         let legacy_cfg = Config {
             daemon: DaemonConfig {
                 socket: legacy_socket.display().to_string(),
