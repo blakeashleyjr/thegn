@@ -421,6 +421,27 @@ pub struct GlyphSet {
     pub spin: &'static [&'static str], // ◐◓◑◒ animated active-step frames
     pub bar_fill: &'static str,        // ▓ progress-bar filled cell
     pub bar_empty: &'static str,       // ░ progress-bar empty cell
+    // System-monitor chart, sort, threshold and tree roles.
+    pub box_round_tl: &'static str,   // ╭
+    pub box_round_tr: &'static str,   // ╮
+    pub box_round_bl: &'static str,   // ╰
+    pub box_round_br: &'static str,   // ╯
+    pub box_tee_l: &'static str,      // ├
+    pub box_tee_r: &'static str,      // ┤
+    pub box_tee_u: &'static str,      // ┴
+    pub box_tee_d: &'static str,      // ┬
+    pub box_cross: &'static str,      // ┼
+    pub axis_tick: &'static str,      // ┤
+    pub axis_dot: &'static str,       // ·
+    pub legend_swatch: &'static str,  // ■
+    pub trend_up: &'static str,       // ↗
+    pub trend_down: &'static str,     // ↘
+    pub sort_asc: &'static str,       // ▴
+    pub sort_desc: &'static str,      // ▾
+    pub threshold_dash: &'static str, // ┄
+    pub now_marker: &'static str,     // ┊
+    pub lock: &'static str,           // ⚿
+    pub tree_pipe: &'static str,      // │
 }
 
 /// Full-Unicode / Nerd-Font glyphs — the current chrome look.
@@ -489,6 +510,36 @@ pub const UNICODE: GlyphSet = GlyphSet {
     spin: &["\u{25d0}", "\u{25d3}", "\u{25d1}", "\u{25d2}"], // ◐ ◓ ◑ ◒
     bar_fill: "\u{2593}",                                    // ▓
     bar_empty: "\u{2591}",                                   // ░
+    box_round_tl: "\u{256d}",                                // ╭
+    box_round_tr: "\u{256e}",                                // ╮
+    box_round_bl: "\u{2570}",                                // ╰
+    box_round_br: "\u{256f}",                                // ╯
+    box_tee_l: "\u{251c}",                                   // ├
+    box_tee_r: "\u{2524}",                                   // ┤
+    box_tee_u: "\u{2534}",                                   // ┴
+    box_tee_d: "\u{252c}",                                   // ┬
+    box_cross: "\u{253c}",                                   // ┼
+    axis_tick: "\u{2524}",                                   // ┤
+    axis_dot: "\u{00b7}",                                    // ·
+    legend_swatch: "\u{25a0}",                               // ■
+    trend_up: "\u{2197}",                                    // ↗
+    trend_down: "\u{2198}",                                  // ↘
+    sort_asc: "\u{25b4}",                                    // ▴
+    sort_desc: "\u{25be}",                                   // ▾
+    threshold_dash: "\u{2504}",                              // ┄
+    now_marker: "\u{250a}",                                  // ┊
+    lock: "\u{26bf}",                                        // ⚿
+    tree_pipe: "\u{2502}",                                   // │
+};
+
+/// Basic Unicode preserves the chrome while using square corners for the
+/// monitor's rounded-frame roles.
+pub const BASIC: GlyphSet = GlyphSet {
+    box_round_tl: "\u{250c}", // ┌
+    box_round_tr: "\u{2510}", // ┐
+    box_round_bl: "\u{2514}", // └
+    box_round_br: "\u{2518}", // ┘
+    ..UNICODE
 };
 
 /// 7-bit ASCII fallbacks for terminals/fonts that can't render [`UNICODE`].
@@ -558,13 +609,34 @@ pub const ASCII: GlyphSet = GlyphSet {
     spin: &["|", "/", "-", "\\"],
     bar_fill: "=",
     bar_empty: "-",
+    box_round_tl: "+",
+    box_round_tr: "+",
+    box_round_bl: "+",
+    box_round_br: "+",
+    box_tee_l: "+",
+    box_tee_r: "+",
+    box_tee_u: "+",
+    box_tee_d: "+",
+    box_cross: "+",
+    axis_tick: "+",
+    axis_dot: ".",
+    legend_swatch: "#",
+    trend_up: "^",
+    trend_down: "v",
+    sort_asc: "^",
+    sort_desc: "v",
+    threshold_dash: "-",
+    now_marker: "|",
+    lock: "x",
+    tree_pipe: "|",
 };
 
-/// The glyph table for a given level. `Full` and `Basic` share the Unicode set
-/// (both are UTF-8); only `Ascii` degrades.
+/// The glyph table for a given level. `Basic` uses square monitor corners;
+/// `Ascii` degrades every role to a 7-bit fallback.
 pub fn glyphs(level: UnicodeLevel) -> &'static GlyphSet {
     match level {
-        UnicodeLevel::Full | UnicodeLevel::Basic => &UNICODE,
+        UnicodeLevel::Full => &UNICODE,
+        UnicodeLevel::Basic => &BASIC,
         UnicodeLevel::Ascii => &ASCII,
     }
 }
@@ -642,6 +714,26 @@ pub enum Glyph {
     BlockBot,
     BarFill,
     BarEmpty,
+    BoxRoundTl,
+    BoxRoundTr,
+    BoxRoundBl,
+    BoxRoundBr,
+    BoxTeeL,
+    BoxTeeR,
+    BoxTeeU,
+    BoxTeeD,
+    BoxCross,
+    AxisTick,
+    AxisDot,
+    LegendSwatch,
+    TrendUp,
+    TrendDown,
+    SortAsc,
+    SortDesc,
+    ThresholdDash,
+    NowMarker,
+    Lock,
+    TreePipe,
 }
 
 impl Glyph {
@@ -706,6 +798,26 @@ impl Glyph {
         Glyph::BlockBot,
         Glyph::BarFill,
         Glyph::BarEmpty,
+        Glyph::BoxRoundTl,
+        Glyph::BoxRoundTr,
+        Glyph::BoxRoundBl,
+        Glyph::BoxRoundBr,
+        Glyph::BoxTeeL,
+        Glyph::BoxTeeR,
+        Glyph::BoxTeeU,
+        Glyph::BoxTeeD,
+        Glyph::BoxCross,
+        Glyph::AxisTick,
+        Glyph::AxisDot,
+        Glyph::LegendSwatch,
+        Glyph::TrendUp,
+        Glyph::TrendDown,
+        Glyph::SortAsc,
+        Glyph::SortDesc,
+        Glyph::ThresholdDash,
+        Glyph::NowMarker,
+        Glyph::Lock,
+        Glyph::TreePipe,
     ];
 
     /// Resolve this token to its glyph in `set` — the single-cell `&'static str`
@@ -771,6 +883,26 @@ impl Glyph {
             Glyph::BlockBot => set.block_bot,
             Glyph::BarFill => set.bar_fill,
             Glyph::BarEmpty => set.bar_empty,
+            Glyph::BoxRoundTl => set.box_round_tl,
+            Glyph::BoxRoundTr => set.box_round_tr,
+            Glyph::BoxRoundBl => set.box_round_bl,
+            Glyph::BoxRoundBr => set.box_round_br,
+            Glyph::BoxTeeL => set.box_tee_l,
+            Glyph::BoxTeeR => set.box_tee_r,
+            Glyph::BoxTeeU => set.box_tee_u,
+            Glyph::BoxTeeD => set.box_tee_d,
+            Glyph::BoxCross => set.box_cross,
+            Glyph::AxisTick => set.axis_tick,
+            Glyph::AxisDot => set.axis_dot,
+            Glyph::LegendSwatch => set.legend_swatch,
+            Glyph::TrendUp => set.trend_up,
+            Glyph::TrendDown => set.trend_down,
+            Glyph::SortAsc => set.sort_asc,
+            Glyph::SortDesc => set.sort_desc,
+            Glyph::ThresholdDash => set.threshold_dash,
+            Glyph::NowMarker => set.now_marker,
+            Glyph::Lock => set.lock,
+            Glyph::TreePipe => set.tree_pipe,
         }
     }
 }
@@ -1408,6 +1540,26 @@ mod tests {
             g.block_bot,
             g.bar_fill,
             g.bar_empty,
+            g.box_round_tl,
+            g.box_round_tr,
+            g.box_round_bl,
+            g.box_round_br,
+            g.box_tee_l,
+            g.box_tee_r,
+            g.box_tee_u,
+            g.box_tee_d,
+            g.box_cross,
+            g.axis_tick,
+            g.axis_dot,
+            g.legend_swatch,
+            g.trend_up,
+            g.trend_down,
+            g.sort_asc,
+            g.sort_desc,
+            g.threshold_dash,
+            g.now_marker,
+            g.lock,
+            g.tree_pipe,
         ]
         .into_iter()
         .chain(g.spin.iter().copied())
@@ -1426,77 +1578,98 @@ mod tests {
         // (✋, U+270B) is the one sanctioned width-2 glyph: it is classified
         // East-Asian-Wide, so the seg layout already accounts for it.
         use unicode_width::UnicodeWidthStr;
-        let g = glyphs(UnicodeLevel::Full);
-        for s in [
-            g.box_tl,
-            g.box_tr,
-            g.box_bl,
-            g.box_br,
-            g.box_h,
-            g.box_v,
-            g.dot_filled,
-            g.dot_hollow,
-            g.cross_heavy,
-            g.arrow_up,
-            g.arrow_down,
-            g.arrow_right,
-            g.net_wired,
-            g.net_generic,
-            g.net_wifi,
-            g.diamond_filled,
-            g.diamond_hollow,
-            g.role_server,
-            g.role_client,
-            g.check,
-            g.cross,
-            g.ellipsis,
-            g.middot,
-            g.refresh,
-            g.emdash,
-            g.warn,
-            g.hex,
-            g.mail,
-            g.moon,
-            g.jj,
-            g.submodule,
-            g.caret_closed,
-            g.caret_open,
-            g.tree_tee,
-            g.tree_corner,
-            g.half_block_r,
-            g.chevron,
-            g.folder,
-            g.dir,
-            g.host_local,
-            g.host_remote,
-            g.flag,
-            g.half_dot,
-            g.gauge,
-            g.quote_open,
-            g.quote_close,
-            g.wx_clear,
-            g.wx_partly,
-            g.wx_cloudy,
-            g.wx_fog,
-            g.wx_rain,
-            g.wx_snow,
-            g.wx_storm,
-            g.wx_wind,
-            g.block_full,
-            g.block_top,
-            g.block_bot,
-            g.bar_fill,
-            g.bar_empty,
-        ]
-        .into_iter()
-        .chain(g.spin.iter().copied())
-        {
-            let c = s.chars().next().unwrap();
-            assert!(s.chars().count() == 1, "multi-char glyph: {s:?}");
-            assert!((c as u32) <= 0xFFFF, "astral-plane glyph in chrome: {s:?}");
-            assert_eq!(s.width(), 1, "glyph must be display-width 1: {s:?}");
+        for g in [glyphs(UnicodeLevel::Full), glyphs(UnicodeLevel::Basic)] {
+            for s in [
+                g.box_tl,
+                g.box_tr,
+                g.box_bl,
+                g.box_br,
+                g.box_h,
+                g.box_v,
+                g.dot_filled,
+                g.dot_hollow,
+                g.cross_heavy,
+                g.arrow_up,
+                g.arrow_down,
+                g.arrow_right,
+                g.net_wired,
+                g.net_generic,
+                g.net_wifi,
+                g.diamond_filled,
+                g.diamond_hollow,
+                g.role_server,
+                g.role_client,
+                g.check,
+                g.cross,
+                g.ellipsis,
+                g.middot,
+                g.refresh,
+                g.emdash,
+                g.warn,
+                g.hex,
+                g.mail,
+                g.moon,
+                g.jj,
+                g.submodule,
+                g.caret_closed,
+                g.caret_open,
+                g.tree_tee,
+                g.tree_corner,
+                g.half_block_r,
+                g.chevron,
+                g.folder,
+                g.dir,
+                g.host_local,
+                g.host_remote,
+                g.flag,
+                g.half_dot,
+                g.gauge,
+                g.quote_open,
+                g.quote_close,
+                g.wx_clear,
+                g.wx_partly,
+                g.wx_cloudy,
+                g.wx_fog,
+                g.wx_rain,
+                g.wx_snow,
+                g.wx_storm,
+                g.wx_wind,
+                g.block_full,
+                g.block_top,
+                g.block_bot,
+                g.bar_fill,
+                g.bar_empty,
+                g.box_round_tl,
+                g.box_round_tr,
+                g.box_round_bl,
+                g.box_round_br,
+                g.box_tee_l,
+                g.box_tee_r,
+                g.box_tee_u,
+                g.box_tee_d,
+                g.box_cross,
+                g.axis_tick,
+                g.axis_dot,
+                g.legend_swatch,
+                g.trend_up,
+                g.trend_down,
+                g.sort_asc,
+                g.sort_desc,
+                g.threshold_dash,
+                g.now_marker,
+                g.lock,
+                g.tree_pipe,
+            ]
+            .into_iter()
+            .chain(g.spin.iter().copied())
+            {
+                let c = s.chars().next().unwrap();
+                assert!(s.chars().count() == 1, "multi-char glyph: {s:?}");
+                assert!((c as u32) <= 0xFFFF, "astral-plane glyph in chrome: {s:?}");
+                assert_eq!(s.width(), 1, "glyph must be display-width 1: {s:?}");
+            }
+            assert_eq!(g.attention.width(), 2, "✋ is the sanctioned wide glyph");
         }
-        assert_eq!(g.attention.width(), 2, "✋ is the sanctioned wide glyph");
     }
 
     #[test]
@@ -1515,6 +1688,26 @@ mod tests {
     }
 
     #[test]
+    fn basic_squares_the_round_roles() {
+        let roles = [
+            Glyph::BoxRoundTl,
+            Glyph::BoxRoundTr,
+            Glyph::BoxRoundBl,
+            Glyph::BoxRoundBr,
+        ];
+        for ((role, basic), full) in roles
+            .into_iter()
+            .zip(["┌", "┐", "└", "┘"])
+            .zip(["╭", "╮", "╰", "╯"])
+        {
+            assert_eq!(role.resolve(&BASIC), basic);
+            assert_eq!(role.resolve(&UNICODE), full);
+            assert_eq!(role.resolve(&ASCII), "+");
+        }
+        assert_eq!(Glyph::BoxTl.resolve(&BASIC), "╭");
+    }
+
+    #[test]
     fn every_glyph_token_resolves_across_all_sets() {
         // Every token maps to a non-empty glyph in both the Unicode and ASCII
         // sets — the exhaustive check that `Glyph::resolve` stays total and that
@@ -1522,8 +1715,12 @@ mod tests {
         // the match compile; a variant missing from ALL is simply untested,
         // which coverage catches).
         for &g in Glyph::ALL {
-            for level in [UnicodeLevel::Full, UnicodeLevel::Basic, UnicodeLevel::Ascii] {
-                let s = g.resolve(glyphs(level));
+            for (level, set) in [
+                (UnicodeLevel::Full, &UNICODE),
+                (UnicodeLevel::Basic, &BASIC),
+                (UnicodeLevel::Ascii, &ASCII),
+            ] {
+                let s = g.resolve(set);
                 assert!(!s.is_empty(), "{g:?} resolves empty at {level:?}");
             }
         }
@@ -1547,7 +1744,7 @@ mod tests {
         // token per single-string field. `spin` (the frame array) is the one
         // documented exclusion, so the count is the field total minus one.
         // (Kept as a concrete number so adding a field without a token trips it.)
-        assert_eq!(Glyph::ALL.len(), 57);
+        assert_eq!(Glyph::ALL.len(), 77);
     }
 
     #[test]
