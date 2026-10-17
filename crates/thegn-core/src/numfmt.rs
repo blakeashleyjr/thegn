@@ -551,8 +551,9 @@ mod tests {
                     // Subnormals are formatted as zero by design (see the `Reading::Value` arm).
                     if value.is_finite() && value.abs() >= f64::MIN_POSITIVE {
                         let rendered = out.trim();
+                        // A negative zero ("-0", "-0%") is wrong; "-0.4" is a real value.
                         assert!(
-                            !rendered.starts_with("-0"),
+                            !rendered.starts_with("-0") || rendered.starts_with("-0."),
                             "{unit:?} {value:?} w{width}: {out:?}"
                         );
                         if !matches!(unit, Unit::Duration | Unit::Age | Unit::TimePlus) {
