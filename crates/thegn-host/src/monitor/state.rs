@@ -7,6 +7,8 @@
 //! Unknown or malformed values fall back to the default instead of erroring: a
 //! preference file is a convenience, not a contract.
 
+use std::collections::BTreeMap;
+
 use super::{GraphStyle, MonitorTab, ProcSort, TabPrefs};
 use crate::telemetry::{ScaleMode, Window, WindowLadder};
 
@@ -17,6 +19,7 @@ pub(crate) const SCOPE: &str = "monitor";
 #[derive(Debug, Clone, PartialEq)]
 pub struct MonitorPrefs {
     per_tab: [TabPrefs; MonitorTab::ALL.len()],
+    tab_kv: [BTreeMap<String, String>; MonitorTab::ALL.len()],
     /// The `[`/`]` rungs, from `[monitor] window_ladder`.
     ///
     /// Config-derived, so deliberately **absent from [`Self::entries`]**:
@@ -32,10 +35,19 @@ pub struct MonitorPrefs {
     pub last_tab: MonitorTab,
 }
 
+fn valid_kv_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 32
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_')
+}
+
 impl Default for MonitorPrefs {
     fn default() -> Self {
         MonitorPrefs {
             per_tab: [TabPrefs::default(); MonitorTab::ALL.len()],
+            tab_kv: std::array::from_fn(|_| BTreeMap::new()),
             ladder: WindowLadder::default_ladder(),
             proc_sort: ProcSort::default(),
             // Descending: the point of the Processes tab is the heaviest
@@ -70,6 +82,24 @@ impl MonitorPrefs {
             ladder,
             ..Default::default()
         }
+    }
+
+    #[allow(dead_code)] // first readers are the Phase-2 tab lanes (THE-836 F6c)
+    pub fn kv(&self, t: MonitorTab, name: &str) -> Option<&str> {
+        self.tab_kv[t.index()].get(name).map(String::as_str)
+    }
+
+    #[allow(dead_code)] // first writers are the Phase-2 tab lanes (THE-836 F6c)
+    pub fn set_kv(&mut self, t: MonitorTab, name: &str, value: &str) -> bool {
+        if !valid_kv_name(name) || value.len() > 128 {
+            return false;
+        }
+        let values = &mut self.tab_kv[t.index()];
+        if !values.contains_key(name) && values.len() >= 16 {
+            return false;
+        }
+        values.insert(name.to_string(), value.to_string());
+        true
     }
 
     pub fn tab(&self, t: MonitorTab) -> TabPrefs {
@@ -124,22 +154,24 @@ impl MonitorPrefs {
                 let Some(tab) = MonitorTab::from_key(tab) else {
                     return;
                 };
-                let p = self.tab_mut(tab);
                 match field {
                     "style" => {
                         if let Some(v) = GraphStyle::from_key(value) {
-                            p.style = v;
+                            self.tab_mut(tab).style = v;
                         }
                     }
                     "scale" => {
                         if let Some(v) = ScaleMode::from_key(value) {
-                            p.scale = v;
+                            self.tab_mut(tab).scale = v;
                         }
                     }
                     "window" => {
                         if let Some(v) = Window::from_key(value) {
-                            p.window = v;
+                            self.tab_mut(tab).window = v;
                         }
+                    }
+                    field if field.starts_with("kv.") => {
+                        self.set_kv(tab, &field[3..], value);
                     }
                     _ => {}
                 }
@@ -168,6 +200,11 @@ impl MonitorPrefs {
             // `key()` already yields an owned String now that a window is a
             // duration rather than a `&'static str` variant.
             out.push((format!("{}.window", t.key()), p.window.key()));
+            out.extend(
+                self.tab_kv[t.index()]
+                    .iter()
+                    .map(|(name, value)| (format!("{}.kv.{name}", t.key()), value.clone())),
+            );
         }
         out
     }
@@ -362,5 +399,49 @@ mod tests {
         assert_eq!(p.tab(MonitorTab::Cpu).window, Window::from_secs(600));
         p.widen(MonitorTab::Cpu);
         assert_eq!(p.tab(MonitorTab::Cpu).window, Window::from_secs(3600));
+    }
+
+    #[test]
+    fn tab_kv_round_trips_through_entries() {
+        let mut prefs = MonitorPrefs::default();
+        assert!(prefs.set_kv(MonitorTab::Cpu, "heatmap", "compact"));
+        assert!(prefs.set_kv(MonitorTab::Memory, "unit", "gib"));
+        let mut back = MonitorPrefs::default();
+        for (key, value) in prefs.entries() {
+            back.apply(&key, &value);
+        }
+        assert_eq!(back, prefs);
+        assert_eq!(back.kv(MonitorTab::Cpu, "heatmap"), Some("compact"));
+        assert_eq!(back.kv(MonitorTab::Memory, "unit"), Some("gib"));
+    }
+
+    #[test]
+    fn tab_kv_is_scoped_and_validated() {
+        let mut prefs = MonitorPrefs::default();
+        assert!(prefs.set_kv(MonitorTab::Cpu, "valid_name9", "ok"));
+        assert_eq!(prefs.kv(MonitorTab::Memory, "valid_name9"), None);
+        for name in ["Bad-Name", "", "abcdefghijklmnopqrstuvwxyz1234567"] {
+            assert!(!prefs.set_kv(MonitorTab::Cpu, name, "x"));
+        }
+        assert!(!prefs.set_kv(MonitorTab::Cpu, "long", &"x".repeat(129)));
+        for i in 0..15 {
+            assert!(prefs.set_kv(MonitorTab::Cpu, &format!("n{i}"), "v"));
+        }
+        assert!(!prefs.set_kv(MonitorTab::Cpu, "seventeenth", "v"));
+        let before = prefs.clone();
+        for (key, value) in [
+            ("cpu.kv.Bad-Name", "x"),
+            ("cpu.kv.", "x"),
+            (
+                "cpu.kv.long",
+                "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+            ),
+            ("cpu.kvx", "x"),
+            ("cpu.kv", "x"),
+            ("cpu.kv.seventeenth", "v"),
+        ] {
+            prefs.apply(key, value);
+        }
+        assert_eq!(prefs, before);
     }
 }
