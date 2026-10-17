@@ -25,6 +25,7 @@ use std::time::{Duration, SystemTime};
 
 use super::DiffEntry;
 mod filter_route;
+mod status_route;
 
 const WORKTREE_DIFF_MEMO_CAP: usize = 4096;
 const WORKTREE_DIFF_RACY_MARGIN: Duration = Duration::from_secs(2);
@@ -329,9 +330,8 @@ fn prefer_oneshot_filters(cache: &mut gix::diff::blob::Platform) {
 /// snapshot makes that pipeline choose the waited one-shot `clean` path too.
 /// Sections gix would ignore as untrusted are rerouted as well, which is
 /// harmless.
-fn reroute_persistent_filters(repo: &mut gix::Repository) {
-    let matching_sections: Vec<_> = repo
-        .config_snapshot()
+fn persistent_filter_sections(repo: &gix::Repository) -> Vec<gix::config::file::SectionId> {
+    repo.config_snapshot()
         .sections_and_ids_by_name("filter")
         .into_iter()
         .flatten()
@@ -345,23 +345,35 @@ fn reroute_persistent_filters(repo: &mut gix::Repository) {
             (required && section.value("clean").is_some() && section.value("process").is_some())
                 .then_some(id)
         })
-        .collect();
-    if matching_sections.is_empty() {
-        return;
-    }
+        .collect()
+}
 
+fn strip_filter_keys(
+    repo: &mut gix::Repository,
+    sections: &[gix::config::file::SectionId],
+    keys: &[&str],
+) {
     let mut snapshot = repo.config_snapshot_mut();
-    for id in matching_sections {
-        if let Some(mut section) = snapshot.section_mut_by_id(id) {
-            while section.remove("process").is_some() {}
+    for id in sections {
+        if let Some(mut section) = snapshot.section_mut_by_id(*id) {
+            for key in keys {
+                while section.remove(key).is_some() {}
+            }
         }
     }
     if let Err(error) = snapshot.commit() {
         tracing::debug!(
             target: "thegn::git",
             %error,
-            "could not reroute persistent status filters"
+            "could not adjust persistent status filters"
         );
+    }
+}
+
+fn reroute_persistent_filters(repo: &mut gix::Repository) {
+    let sections = persistent_filter_sections(repo);
+    if !sections.is_empty() {
+        strip_filter_keys(repo, &sections, &["process"]);
     }
 }
 
@@ -371,6 +383,32 @@ pub(super) fn discover_for_status(path: impl AsRef<std::path::Path>) -> Result<g
     let mut repo = gix::discover(path).context("gix discover")?;
     reroute_persistent_filters(&mut repo);
     Ok(repo)
+}
+
+pub(super) fn routed_status(
+    unrouted: gix::Repository,
+) -> Result<(gix::Repository, Option<status_route::StatusRoute>)> {
+    let sections = persistent_filter_sections(&unrouted);
+    if sections.is_empty() {
+        return Ok((unrouted, None));
+    }
+    let workdir = unrouted
+        .workdir()
+        .context("status route requires a worktree")?
+        .to_owned();
+    let mut status = unrouted.clone();
+    strip_filter_keys(&mut status, &sections, &["process", "clean"]);
+    Ok((
+        status,
+        Some(status_route::StatusRoute::new(unrouted, workdir)),
+    ))
+}
+
+pub(super) fn discover_for_routed_status(
+    path: impl AsRef<std::path::Path>,
+) -> Result<(gix::Repository, Option<status_route::StatusRoute>)> {
+    let repo = gix::discover(path).context("gix discover")?;
+    routed_status(repo)
 }
 
 impl std::ops::Deref for ReapingCache {
@@ -644,7 +682,14 @@ fn tree_to_worktree(repo: &gix::Repository, rev: &str) -> Result<Vec<DiffEntry>>
     // which together are exactly what `git diff HEAD` reports.
     // A path appears once per staged and once per unstaged change; dedup is
     // order-preserving and O(1) per item (a linear `contains` was O(N^2)).
-    let iter = super::read_budget::budgeted_status(repo)
+    let (status_repo, mut status_route) = if persistent_filter_sections(&filter_repo).is_empty() {
+        (None, None)
+    } else {
+        let (status_repo, status_route) = routed_status(filter_repo.clone())?;
+        (Some(status_repo), status_route)
+    };
+    let status_source = status_repo.as_ref().map_or(repo, |status_repo| status_repo);
+    let iter = super::read_budget::budgeted_status(status_source)
         .context("gix status")?
         .untracked_files(gix::status::UntrackedFiles::None)
         .into_iter(None)
@@ -652,6 +697,12 @@ fn tree_to_worktree(repo: &gix::Repository, rev: &str) -> Result<Vec<DiffEntry>>
     let mut status_paths: Vec<gix::bstr::BString> = Vec::new();
     for item in iter {
         let item = item.context("gix status item")?;
+        if !status_route
+            .as_mut()
+            .map_or(Ok(true), |route| route.keep(&item))?
+        {
+            continue;
+        }
         if let Some(p) = item.location().to_owned().into() {
             let p: gix::bstr::BString = p;
             status_paths.push(p);
@@ -1897,5 +1948,195 @@ mod tests {
         assert_eq!(std::fs::read_to_string(marker).unwrap().lines().count(), 1);
         assert!(clean_marker.exists(), "one-shot clean fallback did not run");
         assert!(own_children().len() <= before);
+    }
+
+    #[test]
+    fn status_walks_over_filtered_files_spawn_one_filter_process() {
+        if !thegn_core::util::have("sh") || !std::path::Path::new("/proc/self/stat").exists() {
+            return;
+        }
+        let repo = TestRepo::new("filter-status-process-reuse");
+        let files = ["a.dat", "b.dat", "c.dat"];
+        for path in files {
+            std::fs::write(repo.dir.join(path), "base\n").unwrap();
+        }
+        std::fs::write(repo.dir.join(".gitattributes"), "*.dat filter=tgproc\n").unwrap();
+        repo.out(&["add", "a.dat", "b.dat", "c.dat", ".gitattributes"]);
+        repo.out(&["-c", "commit.gpgsign=false", "commit", "-q", "-m", "seed"]);
+
+        let script_dir = tempfile::tempdir().unwrap();
+        let canned = script_dir.path().join("server-bytes");
+        let marker = script_dir.path().join("spawn-marker");
+        let clean_marker = script_dir.path().join("clean-marker");
+        std::fs::write(&canned, filter_server_bytes(b"base\n", 16)).unwrap();
+        let process = format!(
+            "sh -c 'echo x >> \"$1\"; cat \"$2\"; exec cat >/dev/null' sh {} {}",
+            marker.display(),
+            canned.display()
+        );
+        configure_filter(
+            &repo,
+            &process,
+            &format!("tee -a {}", clean_marker.display()),
+        );
+
+        let before = own_children().len();
+        for raw in ["axse\n", "bxse\n", "cxse\n", "dxse\n"] {
+            for path in files {
+                std::fs::write(repo.dir.join(path), raw).unwrap();
+            }
+            assert!(
+                !crate::git::GitBackend::is_dirty(&crate::git::GixGit::new(), &repo.loc()).unwrap()
+            );
+        }
+        assert_eq!(std::fs::read_to_string(marker).unwrap().lines().count(), 1);
+        assert!(
+            !clean_marker.exists(),
+            "one-shot clean filter ran on routed status"
+        );
+        assert!(!own_children().iter().any(|(state, _)| state == "Z"));
+        crate::git::filter_process::registry::global().shutdown_all();
+        assert!(
+            own_children().len() <= before,
+            "filter child was not reaped"
+        );
+    }
+
+    #[test]
+    fn worktree_diff_status_walk_routes_same_size_edits() {
+        if !thegn_core::util::have("sh") || !std::path::Path::new("/proc/self/stat").exists() {
+            return;
+        }
+        let repo = TestRepo::new("filter-status-diff-reuse");
+        let files = ["a.dat", "b.dat", "c.dat"];
+        for path in files {
+            std::fs::write(repo.dir.join(path), "base\n").unwrap();
+        }
+        std::fs::write(repo.dir.join(".gitattributes"), "*.dat filter=tgproc\n").unwrap();
+        repo.out(&["add", "a.dat", "b.dat", "c.dat", ".gitattributes"]);
+        repo.out(&["-c", "commit.gpgsign=false", "commit", "-q", "-m", "seed"]);
+
+        let script_dir = tempfile::tempdir().unwrap();
+        let canned = script_dir.path().join("server-bytes");
+        let marker = script_dir.path().join("spawn-marker");
+        let clean_marker = script_dir.path().join("clean-marker");
+        std::fs::write(
+            &canned,
+            filter_server_bytes(b"cleaned\ncanned\nthird\n", 32),
+        )
+        .unwrap();
+        let process = format!(
+            "sh -c 'echo x >> \"$1\"; cat \"$2\"; exec cat >/dev/null' sh {} {}",
+            marker.display(),
+            canned.display()
+        );
+        configure_filter(
+            &repo,
+            &process,
+            &format!("tee -a {}", clean_marker.display()),
+        );
+        for round in ["xase\n", "xbse\n", "xcse\n", "xdse\n"] {
+            for path in files {
+                std::fs::write(repo.dir.join(path), round).unwrap();
+            }
+            let entries = diff_entries(&repo.dir, "HEAD").expect("native filtered diff");
+            for path in files {
+                let entry = entries.iter().find(|entry| entry.path == path).unwrap();
+                assert_eq!((entry.added, entry.deleted), (3, 1));
+            }
+        }
+        assert_eq!(std::fs::read_to_string(marker).unwrap().lines().count(), 1);
+        assert!(
+            !clean_marker.exists(),
+            "one-shot clean filter ran on routed status"
+        );
+        assert!(!own_children().iter().any(|(state, _)| state == "Z"));
+        crate::git::filter_process::registry::global().shutdown_all();
+    }
+
+    #[test]
+    fn routed_status_falls_back_to_one_shot_clean() {
+        if !thegn_core::util::have("sh") || !std::path::Path::new("/proc/self/stat").exists() {
+            return;
+        }
+        let repo = TestRepo::new("filter-status-one-shot-fallback");
+        std::fs::write(repo.dir.join("tracked.dat"), "base\n").unwrap();
+        std::fs::write(
+            repo.dir.join(".gitattributes"),
+            "tracked.dat filter=tgproc\n",
+        )
+        .unwrap();
+        repo.out(&["add", "tracked.dat", ".gitattributes"]);
+        repo.out(&["-c", "commit.gpgsign=false", "commit", "-q", "-m", "seed"]);
+        let script_dir = tempfile::tempdir().unwrap();
+        let marker = script_dir.path().join("spawn-marker");
+        let clean_marker = script_dir.path().join("clean-marker");
+        let process = format!("sh -c 'echo x >> \"$1\"; exec cat' sh {}", marker.display());
+        configure_filter(
+            &repo,
+            &process,
+            &format!("tee -a {}", clean_marker.display()),
+        );
+        let before = own_children().len();
+        for content in ["bXse\n", "base\n", "base\n"] {
+            std::fs::write(repo.dir.join("tracked.dat"), content).unwrap();
+            assert_eq!(
+                crate::git::GitBackend::is_dirty(&crate::git::GixGit::new(), &repo.loc()).unwrap(),
+                content != "base\n"
+            );
+        }
+        assert!(clean_marker.exists(), "one-shot clean fallback did not run");
+        assert_eq!(std::fs::read_to_string(marker).unwrap().lines().count(), 1);
+        crate::git::filter_process::registry::global().shutdown_all();
+        assert!(
+            own_children().len() <= before,
+            "filter child was not reaped"
+        );
+    }
+
+    #[test]
+    fn routed_status_is_a_no_op_without_persistent_sections() {
+        let plain = TestRepo::new("filter-status-noop");
+        let isolated = gix::open_opts(&plain.dir, gix::open::Options::isolated()).unwrap();
+        let (_, route) = routed_status(isolated).unwrap();
+        assert!(route.is_none());
+
+        let non_required = TestRepo::new("filter-status-non-required");
+        non_required.out(&["config", "filter.tgoptional.process", "cat"]);
+        non_required.out(&["config", "filter.tgoptional.clean", "cat"]);
+        let isolated = gix::open_opts(&non_required.dir, gix::open::Options::isolated()).unwrap();
+        let (repo, route) = routed_status(isolated).unwrap();
+        assert!(route.is_none());
+        assert_eq!(
+            repo.config_snapshot()
+                .string("filter.tgoptional.process")
+                .unwrap()
+                .to_string(),
+            "cat"
+        );
+        assert_eq!(
+            repo.config_snapshot()
+                .string("filter.tgoptional.clean")
+                .unwrap()
+                .to_string(),
+            "cat"
+        );
+    }
+
+    #[test]
+    fn size_differs_matches_fast_eq() {
+        let cases = [
+            (4, false, 5, true),
+            (4, false, 4, false),
+            (0, false, 5, false),
+            (0, true, 5, true),
+            (0, true, 0, false),
+        ];
+        for (entry_size, empty_blob, len, expected) in cases {
+            assert_eq!(
+                super::status_route::size_differs(entry_size, empty_blob, len),
+                expected
+            );
+        }
     }
 }
