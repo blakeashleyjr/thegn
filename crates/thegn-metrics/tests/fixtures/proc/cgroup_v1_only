@@ -1,0 +1,2 @@
+2:cpu,cpuacct:/user.slice
+1:name=systemd:/user.slice/user-1000.slice/session-1.scope
