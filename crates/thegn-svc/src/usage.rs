@@ -25,6 +25,9 @@
 //! lightweight authenticated request — gated behind `[usage] allow_network`.
 
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
+#[cfg(test)]
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use thegn_core::account;
@@ -64,7 +67,6 @@ pub fn gather_with(cfg: &UsageConfig, registered: &[HomeCandidate]) -> Vec<Accou
         return Vec::new();
     }
     let now = thegn_core::util::now();
-    let client = build_client();
     let homes = usage::discover_homes(&candidate_homes(cfg, registered));
 
     let mut rows: Vec<AccountUsage> = Vec::new();
@@ -73,6 +75,11 @@ pub fn gather_with(cfg: &UsageConfig, registered: &[HomeCandidate]) -> Vec<Accou
     let (net_homes, local_homes): (Vec<_>, Vec<_>) = homes
         .into_iter()
         .partition(|h| h.provider == "claude" || h.provider == "antigravity");
+    let client = if cfg.allow_network && !net_homes.is_empty() {
+        shared_client()
+    } else {
+        None
+    };
     for home in &local_homes {
         rows.push(match home.provider.as_str() {
             "codex" => codex_usage(home, now),
@@ -84,7 +91,6 @@ pub fn gather_with(cfg: &UsageConfig, registered: &[HomeCandidate]) -> Vec<Accou
             let handles: Vec<_> = chunk
                 .iter()
                 .map(|home| {
-                    let client = client.as_ref();
                     s.spawn(move || match home.provider.as_str() {
                         "claude" => claude_usage(cfg, client, home),
                         "antigravity" => antigravity_usage(cfg, client, home, now),
@@ -391,12 +397,25 @@ fn scan_profile_root(root: &Path, providers: &[String]) -> Vec<HomeCandidate> {
 
 /// A blocking HTTP client for the live fetches, or `None` if it can't be built
 /// (then the network-backed providers degrade to `Unavailable`).
-fn build_client() -> Option<reqwest::blocking::Client> {
-    reqwest::blocking::Client::builder()
-        .timeout(FETCH_TIMEOUT)
-        .user_agent("thegn-usage")
-        .build()
-        .ok()
+static CLIENT: OnceLock<Option<reqwest::blocking::Client>> = OnceLock::new();
+#[cfg(test)]
+static CLIENT_BUILDS: AtomicUsize = AtomicUsize::new(0);
+
+fn shared_client() -> Option<&'static reqwest::blocking::Client> {
+    CLIENT
+        .get_or_init(|| {
+            #[cfg(test)]
+            CLIENT_BUILDS.fetch_add(1, Ordering::SeqCst);
+            match reqwest::blocking::Client::builder()
+                .timeout(FETCH_TIMEOUT)
+                .user_agent("thegn-usage")
+                .build()
+            {
+                Ok(client) => Some(client),
+                Err(_) => None,
+            }
+        })
+        .as_ref()
 }
 
 // --- Codex: offline, newest rollup ----------------------------------------
@@ -884,5 +903,26 @@ mod tests {
         std::fs::create_dir_all(&empty).unwrap();
         assert_eq!(newest_rollout(&empty), None);
         std::fs::remove_dir_all(&tmp).ok(); // best-effort: test tmp cleanup
+    }
+
+    #[test]
+    fn repeated_gathers_build_one_client() {
+        let home = tempfile::tempdir().unwrap();
+        std::fs::write(home.path().join(".credentials.json"), b"{}").unwrap();
+        let cfg = UsageConfig {
+            allow_network: true,
+            accounts: vec![thegn_core::usage::UsageAccount {
+                name: "test-claude".into(),
+                provider: "claude".into(),
+                dir: home.path().display().to_string(),
+                ..Default::default()
+            }],
+            ..hermetic(&["claude"])
+        };
+
+        assert_eq!(gather_with(&cfg, &[]).len(), 1);
+        assert_eq!(gather_with(&cfg, &[]).len(), 1);
+
+        assert_eq!(CLIENT_BUILDS.load(Ordering::SeqCst), 1);
     }
 }
