@@ -9,10 +9,107 @@ use std::time::{Duration, SystemTime};
 use thegn_core::util;
 use thegn_proc::{End, Leader, Limits, Stream};
 
+const MAX_CACHE_STATUS_DIRENTS: usize = 16_384;
+
 pub(super) struct Cache {
     _directory: Directory,
     _lock: Lock,
     pub(super) gitdir: PathBuf,
+}
+
+pub(crate) struct CacheStatus {
+    pub(crate) path: PathBuf,
+    pub(crate) present: bool,
+    pub(crate) entries: usize,
+    pub(crate) resolved: usize,
+}
+
+/// Read the queue-private rerere cache posture without opening or creating it.
+pub(crate) fn cache_status(repo_root: &Path) -> Option<CacheStatus> {
+    let identity = thegn_core::repo::repository_id(repo_root).ok()?;
+    let path = super::gate_base(&identity.hex()).join("rerere/git/rr-cache");
+    match std::fs::symlink_metadata(&path) {
+        Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => {}
+        _ => {
+            return Some(CacheStatus {
+                path,
+                present: false,
+                entries: 0,
+                resolved: 0,
+            });
+        }
+    };
+    let Ok(items) = std::fs::read_dir(&path) else {
+        return Some(CacheStatus {
+            path,
+            present: true,
+            entries: 0,
+            resolved: 0,
+        });
+    };
+    let mut entries = 0;
+    let mut resolved = 0;
+    for item in cache_status_items(items) {
+        if entries == 4096 {
+            break;
+        }
+        let name = item.file_name();
+        let Some(name) = name.to_str() else {
+            continue;
+        };
+        if !valid_rerere_id(name) {
+            continue;
+        }
+        let item_path = item.path();
+        let Ok(item_metadata) = std::fs::symlink_metadata(&item_path) else {
+            continue;
+        };
+        if !item_metadata.is_dir() || item_metadata.file_type().is_symlink() {
+            continue;
+        }
+        entries += 1;
+        let Ok(files) = std::fs::read_dir(item_path) else {
+            continue;
+        };
+        let has_resolution = files.filter_map(Result::ok).any(|file| {
+            let name = file.file_name();
+            let Some(name) = name.to_str() else {
+                return false;
+            };
+            let Some(suffix) = name.strip_prefix("postimage") else {
+                return false;
+            };
+            if !valid_postimage_suffix(suffix) {
+                return false;
+            }
+            std::fs::symlink_metadata(file.path())
+                .is_ok_and(|metadata| metadata.is_file() && !metadata.file_type().is_symlink())
+        });
+        if has_resolution {
+            resolved += 1;
+        }
+    }
+    Some(CacheStatus {
+        path,
+        present: true,
+        entries,
+        resolved,
+    })
+}
+
+fn cache_status_items<T, E, I: Iterator<Item = Result<T, E>>>(items: I) -> impl Iterator<Item = T> {
+    items.take(MAX_CACHE_STATUS_DIRENTS).filter_map(Result::ok)
+}
+
+fn valid_postimage_suffix(suffix: &str) -> bool {
+    suffix.is_empty()
+        || suffix.strip_prefix('.').is_some_and(|digits| {
+            !digits.is_empty() && digits.bytes().all(|byte| byte.is_ascii_digit())
+        })
+}
+
+fn valid_rerere_id(id: &str) -> bool {
+    matches!(id.len(), 40 | 64) && id.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
 
 impl Cache {
@@ -233,7 +330,7 @@ pub(super) fn import_shared(cache: &Cache, repo_root: &Path) {
             let Some(suffix) = name.strip_prefix("postimage") else {
                 continue;
             };
-            if !suffix.is_empty() && !suffix.bytes().all(|byte| byte.is_ascii_digit()) {
+            if !valid_postimage_suffix(suffix) {
                 continue;
             }
             let preimage = format!("preimage{suffix}");
@@ -496,4 +593,21 @@ pub(super) fn train_merge(
     })();
     super::remove_scratch_worktree(repo_root, scratch);
     result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{MAX_CACHE_STATUS_DIRENTS, cache_status_items};
+
+    #[test]
+    fn cache_status_caps_total_dirents() {
+        let dirents = cache_status_items((0..MAX_CACHE_STATUS_DIRENTS + 1).map(Ok::<_, ()>))
+            .collect::<Vec<_>>();
+
+        assert_eq!(dirents.len(), MAX_CACHE_STATUS_DIRENTS);
+        assert_eq!(
+            dirents[MAX_CACHE_STATUS_DIRENTS - 1],
+            MAX_CACHE_STATUS_DIRENTS - 1
+        );
+    }
 }

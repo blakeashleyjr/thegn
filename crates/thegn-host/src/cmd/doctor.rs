@@ -3435,7 +3435,20 @@ fn source_control_report(cfg: &Config) {
             Err(e) => outln!("  signing       NOT ready — {e}"),
         }
     }
-    outln!("  rerere        {} (queue-private cache)", yn(mq.rerere));
+    if mq.rerere
+        && let Some(root) = current_repo_root()
+        && let Some(status) = crate::integrate::rerere_cache_status(&root)
+        && status.present
+    {
+        outln!(
+            "  rerere        {} (queue-private cache, {} entries, {} resolved)",
+            yn(mq.rerere),
+            status.entries,
+            status.resolved
+        );
+    } else {
+        outln!("  rerere        {} (queue-private cache)", yn(mq.rerere));
+    }
 }
 
 fn source_control_json(cfg: &Config) -> serde_json::Value {
@@ -3453,6 +3466,20 @@ fn source_control_json(cfg: &Config) -> serde_json::Value {
     } else {
         None
     };
+    let rerere_cache = if mq.rerere {
+        root.as_deref()
+            .and_then(crate::integrate::rerere_cache_status)
+            .map(|status| {
+                serde_json::json!({
+                    "path": status.path.display().to_string(),
+                    "present": status.present,
+                    "entries": status.entries,
+                    "resolved": status.resolved,
+                })
+            })
+    } else {
+        None
+    };
     serde_json::json!({
         "git_version": ver.map(|(a, b, c)| format!("{a}.{b}.{c}")),
         "merge_tree_floor": format!("{}.{}", MERGE_TREE_FLOOR.0, MERGE_TREE_FLOOR.1),
@@ -3463,6 +3490,7 @@ fn source_control_json(cfg: &Config) -> serde_json::Value {
         "sign_commits": mq.sign_commits,
         "signing": signing,
         "rerere": mq.rerere,
+        "rerere_cache": rerere_cache,
     })
 }
 
@@ -4904,6 +4932,7 @@ args = ["--verbose"]
         assert_eq!(v["land_strategy"], "merge");
         assert_eq!(v["sign_commits"], false);
         assert!(v["signing"].is_null(), "no probe when signing is off");
+        assert!(v["rerere_cache"].is_null());
         assert!(v["custom_merge_drivers"].is_array());
         source_control_report(&Config::default());
     }
