@@ -344,6 +344,17 @@ fn percent(v: f64, width: usize) -> String {
     if cells(&candidate) <= width && candidate_preserves_nonzero(&candidate, v, "") {
         return candidate;
     }
+    if v != 0.0 && v.abs() < 0.5 {
+        // Rounds to zero: say "under one" rather than claim nothing happened.
+        if v > 0.0 {
+            for under in ["<1%", "<1"] {
+                if cells(under) <= width {
+                    return under.into();
+                }
+            }
+        }
+        return "#".repeat(width);
+    }
     scaled(v, 1000.0, &["%", "k"], &[0], width)
 }
 
