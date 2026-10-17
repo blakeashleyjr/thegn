@@ -125,6 +125,7 @@ pub(crate) use persistence::run_selected_fold;
 use persistence::{observe_outcomes, persist};
 #[path = "integrate_rerere.rs"]
 mod rerere;
+pub(crate) use rerere::cache_status as rerere_cache_status;
 
 fn remove_scratch_worktree(repo_root: &Path, scratch: ScratchDirectory) {
     if scratch.verify().is_err() {
@@ -6764,5 +6765,102 @@ mod tests {
         }
         assert!(rr_cache.join("entry-0006").exists());
         remove_scratch_worktree(&repo.dir, scratch);
+    }
+
+    #[test]
+    fn shared_rerere_variants_are_imported() {
+        let repo = Repo::new("rerere-shared-variants");
+        if !repo.history_supported_or_refused() {
+            return;
+        }
+        let shared = repo.dir.join(".git/rr-cache");
+        let id = "a".repeat(40);
+        let entry = shared.join(&id);
+        std::fs::create_dir_all(&entry).unwrap();
+        for name in [
+            "preimage",
+            "postimage",
+            "preimage.1",
+            "postimage.1",
+            "preimage1",
+            "postimage1",
+        ] {
+            std::fs::write(entry.join(name), name.as_bytes()).unwrap();
+        }
+
+        let cache = rerere::Cache::open(&repo.dir).unwrap();
+        rerere::import_shared(&cache, &repo.dir);
+
+        let imported = cache.gitdir.join("rr-cache").join(id);
+        for name in ["preimage", "postimage", "preimage.1", "postimage.1"] {
+            assert!(imported.join(name).is_file(), "missing imported {name}");
+        }
+        assert!(!imported.join("preimage1").exists());
+        assert!(!imported.join("postimage1").exists());
+    }
+
+    #[test]
+    fn failed_shared_postimage_write_leaves_no_half_import() {
+        let repo = Repo::new("rerere-shared-write-failure");
+        if !repo.history_supported_or_refused() {
+            return;
+        }
+        let id = "b".repeat(40);
+        let shared_entry = repo.dir.join(".git/rr-cache").join(&id);
+        std::fs::create_dir_all(&shared_entry).unwrap();
+        std::fs::write(shared_entry.join("preimage"), b"shared preimage").unwrap();
+        std::fs::write(shared_entry.join("postimage"), b"shared postimage").unwrap();
+
+        let cache = rerere::Cache::open(&repo.dir).unwrap();
+        let private_entry = cache.gitdir.join("rr-cache").join(&id);
+        std::fs::create_dir_all(&private_entry).unwrap();
+        std::fs::write(private_entry.join("preimage"), b"deferred preimage").unwrap();
+        let missing_target = private_entry.join("missing-postimage-target");
+        let postimage = private_entry.join("postimage");
+        if crate::platform::gate_path::history_test_symlink(&missing_target, &postimage).is_err() {
+            return;
+        }
+
+        rerere::import_shared(&cache, &repo.dir);
+
+        assert!(!private_entry.join("preimage").exists());
+        assert!(std::fs::symlink_metadata(&postimage).is_ok());
+        assert!(!missing_target.exists());
+    }
+
+    #[test]
+    fn rerere_cache_status_is_read_only_and_counts_resolutions() {
+        let repo = Repo::new("rerere-cache-status");
+        if !repo.history_supported_or_refused() {
+            return;
+        }
+        let expected_path = gate_base_for_repo(&repo.dir).join("rerere/git/rr-cache");
+        let before = rerere::cache_status(&repo.dir).unwrap();
+        assert_eq!(before.path, expected_path);
+        assert!(!before.present);
+        assert_eq!(before.entries, 0);
+        assert_eq!(before.resolved, 0);
+        assert!(!gate_base_for_repo(&repo.dir).join("rerere").exists());
+
+        let cache = rerere::Cache::open(&repo.dir).unwrap();
+        let rr_cache = cache.gitdir.join("rr-cache");
+        for (id, resolution) in [
+            ("c", Some("postimage")),
+            ("d", Some("postimage.1")),
+            ("e", None),
+        ] {
+            let entry = rr_cache.join(id.repeat(40));
+            std::fs::create_dir_all(&entry).unwrap();
+            std::fs::write(entry.join("preimage"), b"preimage").unwrap();
+            if let Some(name) = resolution {
+                std::fs::write(entry.join(name), b"resolution").unwrap();
+            }
+        }
+        std::fs::create_dir_all(rr_cache.join("not-a-rerere-id")).unwrap();
+
+        let after = rerere::cache_status(&repo.dir).unwrap();
+        assert!(after.present);
+        assert_eq!(after.entries, 3);
+        assert_eq!(after.resolved, 2);
     }
 }
