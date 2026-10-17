@@ -155,12 +155,40 @@ fn widget_snapshot_matrix_degrades_for_every_unicode_and_color_level() {
     ];
     for level in levels {
         for depth in depths {
-            let (_grid, mut surface) = fixture(level, depth);
+            let (grid, mut surface) = fixture(level, depth);
             let rendered = rows(&mut surface);
             assert_eq!(rendered.len(), 10);
             assert!(rendered.iter().all(|row| row.chars().count() == 48));
             assert!(rendered.iter().any(|row| row.contains("Monitor")));
             assert!(rendered.iter().any(|row| row.contains("cpu")));
+            caps::test_override::with_unicode(level, || {
+                let (top_left, top_right) = if level == UnicodeLevel::Ascii {
+                    (Glyph::BoxTl, Glyph::BoxTr)
+                } else {
+                    (Glyph::BoxRoundTl, Glyph::BoxRoundTr)
+                };
+                assert_eq!(
+                    grid.get(0, 0).unwrap().ch,
+                    top_left
+                        .resolve(caps::active_glyphs())
+                        .chars()
+                        .next()
+                        .unwrap()
+                );
+                assert_eq!(
+                    grid.get(47, 0).unwrap().ch,
+                    top_right
+                        .resolve(caps::active_glyphs())
+                        .chars()
+                        .next()
+                        .unwrap()
+                );
+
+                let full = caps::raster_table().hbar8[7];
+                for col in 16..26 {
+                    assert_eq!(grid.get(col, 7).unwrap().ch, full);
+                }
+            });
             if level == UnicodeLevel::Ascii {
                 assert!(
                     rendered
@@ -170,49 +198,10 @@ fn widget_snapshot_matrix_degrades_for_every_unicode_and_color_level() {
                 );
             }
             if depth == ColorDepth::None {
-                for row in 0.._grid.rows() {
-                    for col in 0.._grid.cols() {
-                        let cell = _grid.get(col, row).unwrap();
-                        let fg = cell
-                            .fg
-                            .tok()
-                            .map(|tok| {
-                                caps::test_override::with_color(depth, || {
-                                    crate::chrome::with_palette(|p| tok.resolve(p))
-                                })
-                            })
-                            .unwrap_or_default();
-                        let bg = if cell.bg == StyleTok::INHERIT {
-                            caps::test_override::with_color(depth, || {
-                                crate::chrome::with_palette(|p| {
-                                    crate::chrome::theme_color(crate::chrome::slot_rgb(
-                                        p,
-                                        crate::chrome::S::Panel,
-                                    ))
-                                })
-                            })
-                        } else {
-                            cell.bg
-                                .tok()
-                                .map(|tok| {
-                                    caps::test_override::with_color(depth, || {
-                                        crate::chrome::with_palette(|p| tok.resolve(p))
-                                    })
-                                })
-                                .unwrap_or_default()
-                        };
-                        assert_eq!(
-                            crate::wire::color_spec(fg, depth),
-                            termwiz::color::ColorSpec::Default
-                        );
-                        assert_eq!(
-                            crate::wire::color_spec(bg, depth),
-                            termwiz::color::ColorSpec::Default
-                        );
-                    }
-                }
+                let (_, mut truecolor_surface) = fixture(level, ColorDepth::Truecolor);
+                assert_eq!(rendered, rows(&mut truecolor_surface));
             }
-            let (grid, surface) = fixture(level, depth);
+            let (grid, mut surface) = fixture(level, depth);
             let cells = surface.screen_cells();
             for row in 0..grid.rows() {
                 for col in 0..grid.cols() {
@@ -440,7 +429,22 @@ fn warm_chrome_repaint_allocates_nothing() {
     let row = [table::TableCell::Text("worker")];
     let table_rows: [&[table::TableCell<'_>]; 1] = [&row];
     let repaint = |grid: &mut CellGrid| {
-        let _body = panel::panel(grid, Rect::full(64, 8), "monitor panel title", None);
+        {
+            let _body = panel::panel(grid, Rect::full(64, 8), "monitor panel title", None);
+        }
+        {
+            let _clipped = panel::panel(
+                grid,
+                Rect {
+                    x: 50,
+                    y: 0,
+                    cols: 12,
+                    rows: 8,
+                },
+                "title that must be clipped",
+                None,
+            );
+        }
         legend::draw(
             grid,
             Rect {
