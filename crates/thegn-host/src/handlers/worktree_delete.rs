@@ -842,7 +842,12 @@ mod tests {
             Some("'app/active' is being deleted".into())
         );
         assert_eq!(
-            pending_delete_refusal("app/parked", &session, &[parked.clone()], &pending),
+            pending_delete_refusal(
+                "app/parked",
+                &session,
+                std::slice::from_ref(&parked),
+                &pending
+            ),
             Some("'app/parked' is being deleted".into())
         );
         assert_eq!(
