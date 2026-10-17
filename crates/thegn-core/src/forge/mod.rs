@@ -478,7 +478,12 @@ pub trait Forge: Probe + Send + Sync {
                 .review_threads(loc, &repo, p.number)
                 .unwrap_or_default();
         }
-        if depth == PrDepth::Full {
+        if depth == PrDepth::Full
+            && !matches!(
+                &panel.state,
+                PanelState::Error { .. } | PanelState::Offline | PanelState::RateLimited
+            )
+        {
             panel.issues = self.issue_rows(loc, 10).unwrap_or_default();
         }
         panel
@@ -695,5 +700,78 @@ mod tests {
         assert!(all.whoami && all.line_comments && all.resolve_review_thread);
         assert!(!none.pr_status);
         assert_ne!(all, none);
+    }
+    struct IssueCountingForge {
+        status_error: Option<ForgeError>,
+        issue_calls: std::sync::atomic::AtomicUsize,
+    }
+
+    impl Probe for IssueCountingForge {
+        fn probe(&self) -> ProbeReport {
+            ProbeReport::new("forge", "issue-counting", crate::seam::Availability::Ready)
+        }
+    }
+
+    impl Forge for IssueCountingForge {
+        fn id(&self) -> &'static str {
+            "issue-counting"
+        }
+        fn caps(&self) -> ForgeCaps {
+            ForgeCaps::ALL
+        }
+        fn repo_ref(&self, _: &GitLoc) -> Option<RepoRef> {
+            None
+        }
+        fn pr_status(&self, _: &GitLoc, _: PrRef) -> Result<PrStatus, ForgeError> {
+            match &self.status_error {
+                Some(error) => Err(error.clone()),
+                None => Ok(PrStatus {
+                    number: 7,
+                    title: "title".into(),
+                    state: "OPEN".into(),
+                    url: "https://github.com/acme/widget/pull/7".into(),
+                    ..Default::default()
+                }),
+            }
+        }
+        fn pr_list(&self, _: &GitLoc, _: usize) -> Result<Vec<PrHeader>, ForgeError> {
+            Ok(Vec::new())
+        }
+        fn issue_rows(&self, _: &GitLoc, _: usize) -> Result<Vec<IssueRow>, ForgeError> {
+            self.issue_calls
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            Ok(Vec::new())
+        }
+    }
+
+    #[test]
+    fn pr_panel_full_skips_issue_rows_for_non_definitive_status_errors() {
+        for error in [
+            ForgeError::RateLimited,
+            ForgeError::Other("temporary failure".into()),
+            ForgeError::Offline,
+        ] {
+            let forge = IssueCountingForge {
+                status_error: Some(error),
+                issue_calls: std::sync::atomic::AtomicUsize::new(0),
+            };
+            let panel = forge.pr_panel(&loc(), PrRef::Current, PrDepth::Full);
+            assert!(panel.issues.is_empty());
+            assert_eq!(
+                forge.issue_calls.load(std::sync::atomic::Ordering::Relaxed),
+                0
+            );
+        }
+        for status_error in [Some(ForgeError::NoPr), None] {
+            let forge = IssueCountingForge {
+                status_error,
+                issue_calls: std::sync::atomic::AtomicUsize::new(0),
+            };
+            forge.pr_panel(&loc(), PrRef::Current, PrDepth::Full);
+            assert_eq!(
+                forge.issue_calls.load(std::sync::atomic::Ordering::Relaxed),
+                1
+            );
+        }
     }
 }
