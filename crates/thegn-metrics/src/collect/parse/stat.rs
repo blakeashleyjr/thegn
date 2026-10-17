@@ -2,7 +2,7 @@
 
 use super::{fields, parse_u64};
 
-const MAX_CPUS: u64 = 512;
+pub const MAX_CPUS: usize = 512;
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct CpuTicks {
@@ -38,32 +38,19 @@ impl CpuTicks {
         }
     }
 
-    pub fn nondecreasing_from(self, previous: Self) -> bool {
-        self.user >= previous.user
-            && self.nice >= previous.nice
-            && self.system >= previous.system
-            && self.idle >= previous.idle
-            && self.iowait >= previous.iowait
-            && self.irq >= previous.irq
-            && self.softirq >= previous.softirq
-            && self.steal >= previous.steal
-            && self.guest >= previous.guest
-            && self.guest_nice >= previous.guest_nice
-    }
-
-    pub fn delta_from(self, previous: Self) -> Self {
-        Self {
-            user: self.user - previous.user,
-            nice: self.nice - previous.nice,
-            system: self.system - previous.system,
-            idle: self.idle - previous.idle,
-            iowait: self.iowait - previous.iowait,
-            irq: self.irq - previous.irq,
-            softirq: self.softirq - previous.softirq,
-            steal: self.steal - previous.steal,
-            guest: self.guest - previous.guest,
-            guest_nice: self.guest_nice - previous.guest_nice,
-        }
+    pub fn checked_delta(self, previous: Self) -> Option<Self> {
+        Some(Self {
+            user: self.user.checked_sub(previous.user)?,
+            nice: self.nice.checked_sub(previous.nice)?,
+            system: self.system.checked_sub(previous.system)?,
+            idle: self.idle.checked_sub(previous.idle)?,
+            iowait: self.iowait.saturating_sub(previous.iowait),
+            irq: self.irq.checked_sub(previous.irq)?,
+            softirq: self.softirq.checked_sub(previous.softirq)?,
+            steal: self.steal.checked_sub(previous.steal)?,
+            guest: self.guest.checked_sub(previous.guest)?,
+            guest_nice: self.guest_nice.checked_sub(previous.guest_nice)?,
+        })
     }
 }
 
@@ -78,6 +65,7 @@ pub struct StatRaw {
     pub btime: Option<u64>,
     pub procs_running: Option<u32>,
     pub procs_blocked: Option<u32>,
+    pub truncated: bool,
 }
 
 pub fn parse_stat(buf: &[u8], out: &mut StatRaw) {
@@ -90,8 +78,13 @@ pub fn parse_stat(buf: &[u8], out: &mut StatRaw) {
     out.btime = None;
     out.procs_running = None;
     out.procs_blocked = None;
+    out.truncated = false;
 
-    for line in buf.split(|byte| *byte == b'\n') {
+    let body = match buf.iter().rposition(|byte| *byte == b'\n') {
+        Some(index) => &buf[..=index],
+        None => &[],
+    };
+    for line in body.split(|byte| *byte == b'\n') {
         let mut words = fields(line);
         let Some(name) = words.next() else { continue };
         if name == b"cpu" {
@@ -102,7 +95,10 @@ pub fn parse_stat(buf: &[u8], out: &mut StatRaw) {
             let Some(id) = parse_u64(suffix) else {
                 continue;
             };
-            if id >= MAX_CPUS || id > u64::from(u16::MAX) {
+            if id >= MAX_CPUS as u64 || id > u64::from(u16::MAX) {
+                if id >= MAX_CPUS as u64 {
+                    out.truncated = true;
+                }
                 continue;
             }
             if let Some(ticks) = parse_ticks(words) {
@@ -134,10 +130,7 @@ pub fn parse_stat(buf: &[u8], out: &mut StatRaw) {
 fn parse_ticks<'a>(words: impl Iterator<Item = &'a [u8]>) -> Option<CpuTicks> {
     let mut tail = [0_u64; 10];
     let mut count = 0;
-    for word in words {
-        if count == tail.len() {
-            return None;
-        }
+    for word in words.take(tail.len()) {
         tail[count] = parse_u64(word)?;
         count += 1;
     }
@@ -160,7 +153,7 @@ fn parse_ticks<'a>(words: impl Iterator<Item = &'a [u8]>) -> Option<CpuTicks> {
 
 #[cfg(test)]
 mod tests {
-    use super::{CpuTicks, StatRaw, parse_stat};
+    use super::{CpuTicks, MAX_CPUS, StatRaw, parse_stat};
 
     const STAT_24C: &[u8] = include_bytes!(concat!(
         env!("CARGO_MANIFEST_DIR"),
@@ -187,16 +180,16 @@ mod tests {
         assert_eq!(
             raw.total,
             Some(CpuTicks {
-                user: 1100,
-                nice: 120,
-                system: 520,
-                idle: 8200,
-                iowait: 220,
-                irq: 22,
-                softirq: 33,
-                steal: 11,
-                guest: 44,
-                guest_nice: 6,
+                user: 2676,
+                nice: 516,
+                system: 1476,
+                idle: 19476,
+                iowait: 756,
+                irq: 324,
+                softirq: 348,
+                steal: 300,
+                guest: 1236,
+                guest_nice: 396,
             })
         );
         assert_eq!(
@@ -278,9 +271,20 @@ mod tests {
     #[test]
     fn every_truncated_prefix_and_garbage_line_is_safe_and_skips_partial_cpus() {
         let mut raw = StatRaw::default();
+        let full = {
+            let mut parsed = StatRaw::default();
+            parse_stat(STAT_24C, &mut parsed);
+            parsed
+        };
         for end in 0..=STAT_24C.len() {
             parse_stat(&STAT_24C[..end], &mut raw);
-            assert!(raw.cpus.iter().all(|(_, ticks)| ticks.total() > 0));
+            assert!(raw.cpus.iter().all(|(id, ticks)| {
+                full.cpus
+                    .iter()
+                    .find(|(full_id, _)| full_id == id)
+                    .is_some_and(|(_, full_ticks)| ticks == full_ticks)
+            }));
+            assert!(raw.total.is_none() || raw.total == full.total);
         }
         parse_stat(
             b"cpu x y\ncpuZZ 1 2 3 4\nctxt\n\xff\ncpu0 1 2 3\n",
@@ -289,5 +293,46 @@ mod tests {
         assert!(raw.total.is_none());
         assert!(raw.cpus.is_empty());
         assert!(raw.ctxt.is_none());
+    }
+
+    #[test]
+    fn ignores_fields_after_the_kernel_tick_fields() {
+        let mut raw = StatRaw::default();
+        parse_stat(
+            b"cpu 1 2 3 4 5 6 7 8 9 10 11\ncpu0 1 2 3 4 5 6 7 8 9 10 11\n",
+            &mut raw,
+        );
+        assert_eq!(raw.total.map(|ticks| ticks.guest_nice), Some(10));
+        assert_eq!(raw.cpus[0].1.guest_nice, 10);
+    }
+
+    #[test]
+    fn reports_cpu_ids_outside_the_model_limit() {
+        let mut raw = StatRaw::default();
+        parse_stat(b"cpu 1 2 3 4\ncpu600 1 2 3 4\n", &mut raw);
+        assert!(raw.truncated);
+        assert!(raw.cpus.is_empty());
+        assert_eq!(MAX_CPUS, 512);
+    }
+
+    #[test]
+    fn checked_delta_rejects_decreases_except_iowait() {
+        let previous = CpuTicks {
+            user: 2,
+            iowait: 3,
+            ..CpuTicks::default()
+        };
+        let current = CpuTicks {
+            user: 1,
+            iowait: 2,
+            ..CpuTicks::default()
+        };
+        assert!(current.checked_delta(previous).is_none());
+        let current = CpuTicks {
+            user: 3,
+            iowait: 2,
+            ..CpuTicks::default()
+        };
+        assert_eq!(current.checked_delta(previous).unwrap().iowait, 0);
     }
 }
