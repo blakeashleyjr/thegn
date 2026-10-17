@@ -464,7 +464,8 @@ pub fn panel_key(
             let toast = refresh_tx.clone();
             let wk = waker.clone();
             // Off-loop: a provider `list()` can take seconds; never block the frame.
-            std::thread::spawn(move || {
+            thegn_core::thread_name::spawn_named("thegn-env-test", move || {
+                crate::platform::qos::set_self(crate::platform::qos::Qos::Utility); // Utility: user-requested provider reachability test.
                 let Some(pc) = pc else { return };
                 use thegn_core::notification::Priority;
                 // The outcome pops as a toast where the user is looking; the
