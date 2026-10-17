@@ -437,7 +437,7 @@ fn plugin_example_block_agrees_with_the_schema() {
             .iter()
             .all(|key| !thegn_core::redact::is_sensitive(key))
     );
-    assert!(block.contains("do not put secrets here"));
+    assert!(block.contains("Prefer refs over pasted secrets"));
 
     let support = thegn_core::plugin_api::HOST_EXTENSION_SUPPORT
         .iter()
