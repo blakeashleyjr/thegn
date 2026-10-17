@@ -548,7 +548,8 @@ mod tests {
                         width,
                         "{unit:?} {value:?} w{width}: {out:?}"
                     );
-                    if value.is_finite() && value != 0.0 {
+                    // Subnormals are formatted as zero by design (see the `Reading::Value` arm).
+                    if value.is_finite() && value.abs() >= f64::MIN_POSITIVE {
                         let rendered = out.trim();
                         assert!(
                             !rendered.starts_with("-0"),
