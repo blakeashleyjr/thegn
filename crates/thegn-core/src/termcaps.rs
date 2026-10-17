@@ -535,10 +535,10 @@ pub const UNICODE: GlyphSet = GlyphSet {
 /// Basic Unicode preserves the chrome while using square corners for the
 /// monitor's rounded-frame roles.
 pub const BASIC: GlyphSet = GlyphSet {
-    box_round_tl: "┌",
-    box_round_tr: "┐",
-    box_round_bl: "└",
-    box_round_br: "┘",
+    box_round_tl: "\u{250c}", // ┌
+    box_round_tr: "\u{2510}", // ┐
+    box_round_bl: "\u{2514}", // └
+    box_round_br: "\u{2518}", // ┘
     ..UNICODE
 };
 
@@ -1715,8 +1715,12 @@ mod tests {
         // the match compile; a variant missing from ALL is simply untested,
         // which coverage catches).
         for &g in Glyph::ALL {
-            for level in [UnicodeLevel::Full, UnicodeLevel::Basic, UnicodeLevel::Ascii] {
-                let s = g.resolve(glyphs(level));
+            for (level, set) in [
+                (UnicodeLevel::Full, &UNICODE),
+                (UnicodeLevel::Basic, &BASIC),
+                (UnicodeLevel::Ascii, &ASCII),
+            ] {
+                let s = g.resolve(set);
                 assert!(!s.is_empty(), "{g:?} resolves empty at {level:?}");
             }
         }
