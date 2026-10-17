@@ -372,13 +372,15 @@ pub(crate) fn hide_pending_deletes(
             }
         };
         if let Some(depth) = hidden_depth {
-            if let Some(parent) = rows[..index].iter_mut().rev().find(|candidate| {
-                candidate.depth < depth
-                    && matches!(
-                        candidate.kind,
-                        crate::sidebar::RowKind::Folder | crate::sidebar::RowKind::PipelineLane
-                    )
-            }) {
+            if let Some(parent) = rows[..index]
+                .iter_mut()
+                .rev()
+                .find(|candidate| candidate.depth < depth)
+                && matches!(
+                    parent.kind,
+                    crate::sidebar::RowKind::Folder | crate::sidebar::RowKind::PipelineLane
+                )
+            {
                 parent.child_count = parent.child_count.saturating_sub(1);
             }
         }
@@ -929,7 +931,21 @@ mod tests {
             "app",
         );
         mirror.worktree_path = Some("/tmp/mirror".into());
-        let mut rows = vec![folder, pending_child, sibling, lane, mirror];
+        let mut untouched_folder = crate::sidebar::SidebarRow::base(
+            crate::sidebar::RowKind::Folder,
+            1,
+            "untouched",
+            "other",
+        );
+        untouched_folder.child_count = 4;
+        let mut rows = vec![
+            folder,
+            pending_child,
+            sibling,
+            lane,
+            mirror,
+            untouched_folder,
+        ];
 
         hide_pending_deletes(
             &mut rows,
@@ -938,6 +954,31 @@ mod tests {
 
         assert_eq!(rows[0].child_count, 1);
         assert_eq!(rows[3].child_count, 0);
-        assert_eq!(rows[2].child_count, 0);
+        assert_eq!(rows[5].child_count, 4);
+    }
+
+    #[test]
+    fn hide_pending_deletes_stops_parent_search_at_nearest_shallower_row() {
+        let mut folder =
+            crate::sidebar::SidebarRow::base(crate::sidebar::RowKind::Folder, 0, "folder", "app");
+        folder.child_count = 3;
+        let workspace = crate::sidebar::SidebarRow::base(
+            crate::sidebar::RowKind::Workspace,
+            0,
+            "workspace",
+            "app",
+        );
+        let mut pending = crate::sidebar::SidebarRow::base(
+            crate::sidebar::RowKind::Worktree,
+            1,
+            "pending",
+            "app",
+        );
+        pending.worktree_path = Some("/tmp/pending".into());
+        let mut rows = vec![folder, workspace, pending];
+
+        hide_pending_deletes(&mut rows, &HashSet::from(["/tmp/pending".to_string()]));
+
+        assert_eq!(rows[0].child_count, 3);
     }
 }
