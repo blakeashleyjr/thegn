@@ -6,6 +6,7 @@ use crate::issue::AgentDispatchStatus;
 use anyhow::{Result, anyhow};
 use rusqlite::{Error as SqlError, ErrorCode, Transaction, TransactionBehavior, params};
 use serde::Serialize;
+use std::collections::{HashMap, HashSet};
 use std::time::Duration;
 
 pub const NOTIFICATION_READ_RETENTION_SECS: i64 = 30 * 24 * 60 * 60;
@@ -117,7 +118,7 @@ impl Db {
             let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
             rows.collect::<rusqlite::Result<Vec<_>>>()?
         };
-        let registered = registered_roots(&conn)?;
+        let registered = registered_roots(conn)?;
         let removed: Vec<String> = keys
             .into_iter()
             .filter(|key| is_removed_root(&registered, key))
@@ -126,7 +127,7 @@ impl Db {
         let mut notifications = 0;
         let mut issue_links = 0;
         for key in removed {
-            let tx = Transaction::new_unchecked(&conn, TransactionBehavior::Immediate)?;
+            let tx = Transaction::new_unchecked(conn, TransactionBehavior::Immediate)?;
             notifications += tx.execute(
                 "DELETE FROM notifications WHERE worktree_path=?1 AND read=1",
                 params![key],
@@ -142,41 +143,66 @@ impl Db {
 
     /// Prune old terminal dispatch history while preserving rows still used by admission or supervision.
     pub(crate) fn prune_terminal_dispatches(&self, now_ms: i64) -> Result<usize> {
-        let terminal_statuses = [
+        let statuses = [
             AgentDispatchStatus::Merged,
             AgentDispatchStatus::Abandoned,
             AgentDispatchStatus::Done,
             AgentDispatchStatus::Failed,
-        ];
-        let statuses = terminal_statuses
-            .into_iter()
-            .filter(|status| status.is_terminal())
-            .map(|status| format!("'{}'", status.as_str()))
-            .collect::<Vec<_>>()
-            .join(",");
+        ]
+        .into_iter()
+        .map(|status| format!("'{}'", status.as_str()))
+        .collect::<Vec<_>>()
+        .join(",");
         let cutoff = now_ms.saturating_sub(DISPATCH_TERMINAL_RETENTION_SECS.saturating_mul(1000));
         let conn = self.conn();
-        let tx = Transaction::new_unchecked(&conn, TransactionBehavior::Immediate)?;
-        let ids = {
+        let tx = Transaction::new_unchecked(conn, TransactionBehavior::Immediate)?;
+        let (ids, children) = {
             let query = format!(
-                "WITH eligible AS (
-                   SELECT d.id FROM agent_dispatches d
+                "SELECT d.id FROM agent_dispatches d
                    WHERE d.status IN ({statuses}) AND d.task_kind IS NULL
                      AND COALESCE(d.status_changed_at_ms,d.exited_at_ms,d.dispatched_at_ms) < ?1
                      AND NOT EXISTS (SELECT 1 FROM worktrees w WHERE w.worktree=d.worktree_path)
                      AND NOT EXISTS (SELECT 1 FROM autopilot_runs a WHERE a.dispatch_id=d.id
-                                     AND a.state NOT IN ('done','stopped'))
-                 )
-                 SELECT e.id FROM eligible e
-                 WHERE NOT EXISTS (
-                   SELECT 1 FROM agent_dispatches child
-                   WHERE child.parent_id=e.id AND child.id NOT IN (SELECT id FROM eligible)
-                 )"
+                                     AND a.state NOT IN ('done','stopped'))"
             );
             let mut stmt = tx.prepare(&query)?;
             let rows = stmt.query_map(params![cutoff], |row| row.get::<_, i64>(0))?;
-            rows.collect::<rusqlite::Result<Vec<_>>>()?
+            let ids = rows.collect::<rusqlite::Result<Vec<_>>>()?;
+            let mut stmt = tx.prepare(
+                "SELECT parent_id, id FROM agent_dispatches WHERE parent_id IS NOT NULL",
+            )?;
+            let rows =
+                stmt.query_map([], |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)))?;
+            let children = rows
+                .collect::<rusqlite::Result<Vec<_>>>()?
+                .into_iter()
+                .fold(
+                    HashMap::<i64, Vec<i64>>::new(),
+                    |mut children, (parent, child)| {
+                        children.entry(parent).or_default().push(child);
+                        children
+                    },
+                );
+            (ids, children)
         };
+        let mut candidates: HashSet<i64> = ids.into_iter().collect();
+        loop {
+            let retained: HashSet<i64> = candidates
+                .iter()
+                .copied()
+                .filter(|id| {
+                    children.get(id).is_none_or(|children| {
+                        children.iter().all(|child| candidates.contains(child))
+                    })
+                })
+                .collect();
+            if retained.len() == candidates.len() {
+                break;
+            }
+            candidates = retained;
+        }
+        let mut ids: Vec<i64> = candidates.into_iter().collect();
+        ids.sort_unstable();
         for id in &ids {
             tx.execute(
                 "DELETE FROM agent_dispatch_notes WHERE dispatch_id=?1",
@@ -265,9 +291,12 @@ impl Db {
                 params![cutoff],
             )
             .map_err(map_busy)?;
-        let (pruned_removed_notifications, pruned_issue_links) =
-            self.prune_removed_worktree_rows(ORPHAN_CACHE_SWEEP_MAX_KEYS)?;
-        let pruned_dispatches = self.prune_terminal_dispatches(now_secs.saturating_mul(1000))?;
+        let (pruned_removed_notifications, pruned_issue_links) = self
+            .prune_removed_worktree_rows(ORPHAN_CACHE_SWEEP_MAX_KEYS)
+            .map_err(map_busy_any)?;
+        let pruned_dispatches = self
+            .prune_terminal_dispatches(now_secs.saturating_mul(1000))
+            .map_err(map_busy_any)?;
         let mut report = MaintenanceReport {
             pruned_notifications,
             pruned_removed_notifications,
@@ -329,6 +358,13 @@ fn map_busy(error: SqlError) -> anyhow::Error {
             VacuumError::Busy.into()
         }
         error => error.into(),
+    }
+}
+
+fn map_busy_any(error: anyhow::Error) -> anyhow::Error {
+    match error.downcast::<SqlError>() {
+        Ok(sql) => map_busy(sql),
+        Err(other) => other,
     }
 }
 
@@ -608,7 +644,7 @@ mod tests {
         db.conn()
             .execute(
                 "INSERT INTO worktrees(worktree,repo_path,location) VALUES(?1,?2,'remote')",
-                params![registered_child, ancestor],
+                params![registered_child, registered],
             )
             .unwrap();
         let now = 2_000_000_000;
@@ -813,6 +849,96 @@ mod tests {
         for id in [registered, autopilot, parent, review] {
             assert!(db.get_dispatch(id).unwrap().is_some());
         }
+    }
+
+    #[test]
+    fn terminal_dispatch_status_coverage_is_exhaustive() {
+        let statuses = [
+            AgentDispatchStatus::Merged,
+            AgentDispatchStatus::Abandoned,
+            AgentDispatchStatus::Done,
+            AgentDispatchStatus::Failed,
+        ]
+        .map(AgentDispatchStatus::as_str);
+        assert_eq!(statuses, ["merged", "abandoned", "done", "failed"]);
+        for status in [
+            AgentDispatchStatus::Queued,
+            AgentDispatchStatus::Spawning,
+            AgentDispatchStatus::Running,
+            AgentDispatchStatus::WaitingHuman,
+            AgentDispatchStatus::PrOpen,
+            AgentDispatchStatus::Merged,
+            AgentDispatchStatus::Abandoned,
+            AgentDispatchStatus::Done,
+            AgentDispatchStatus::Failed,
+            AgentDispatchStatus::Unknown,
+        ] {
+            let exhaustive_terminal = match status {
+                AgentDispatchStatus::Merged
+                | AgentDispatchStatus::Abandoned
+                | AgentDispatchStatus::Done
+                | AgentDispatchStatus::Failed => true,
+                AgentDispatchStatus::Queued
+                | AgentDispatchStatus::Spawning
+                | AgentDispatchStatus::Running
+                | AgentDispatchStatus::WaitingHuman
+                | AgentDispatchStatus::PrOpen
+                | AgentDispatchStatus::Unknown => false,
+            };
+            assert_eq!(status.is_terminal(), exhaustive_terminal);
+        }
+    }
+
+    #[test]
+    fn terminal_dispatch_retention_keeps_all_ancestors_of_non_candidate_child() {
+        let (_dir, db) = temp_db();
+        let now = 2_000_000_000_000_i64;
+        let old = now - 91 * 24 * 60 * 60 * 1000;
+        let grandparent = dispatch(&db, "/gone/grandparent", "done", old, None, None, None);
+        let parent = dispatch(
+            &db,
+            "/gone/parent",
+            "done",
+            old,
+            None,
+            None,
+            Some(grandparent),
+        );
+        let child = dispatch(&db, "/gone/child", "running", old, None, None, Some(parent));
+
+        assert_eq!(db.prune_terminal_dispatches(now).unwrap(), 0);
+        for id in [grandparent, parent, child] {
+            assert!(db.get_dispatch(id).unwrap().is_some());
+        }
+    }
+
+    #[test]
+    fn maintain_classifies_busy_retention_as_vacuum_busy() {
+        let (dir, db) = temp_db();
+        db.conn().busy_timeout(Duration::from_millis(10)).unwrap();
+        let locker = Connection::open(dir.path().join("state.db")).unwrap();
+        locker.execute_batch("BEGIN IMMEDIATE").unwrap();
+        let result = db.maintain(2_000_000_000, MaintenanceStep::Nothing);
+        assert!(matches!(
+            result,
+            Err(error) if matches!(error.downcast_ref::<VacuumError>(), Some(VacuumError::Busy))
+        ));
+        locker.execute_batch("ROLLBACK").unwrap();
+    }
+
+    #[test]
+    fn anyhow_wrapped_sqlite_busy_is_classified() {
+        let (dir, db) = temp_db();
+        db.conn().busy_timeout(Duration::from_millis(10)).unwrap();
+        let locker = Connection::open(dir.path().join("state.db")).unwrap();
+        locker.execute_batch("BEGIN IMMEDIATE").unwrap();
+        let error = db.prune_removed_worktree_rows(1).unwrap_err();
+        let error = map_busy_any(error);
+        assert!(matches!(
+            error.downcast_ref::<VacuumError>(),
+            Some(VacuumError::Busy)
+        ));
+        locker.execute_batch("ROLLBACK").unwrap();
     }
 
     #[test]
