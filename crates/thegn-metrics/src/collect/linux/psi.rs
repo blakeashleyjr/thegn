@@ -11,10 +11,12 @@ use crate::collect::{
 };
 use std::path::{Path, PathBuf};
 
+type PreviousTotals = (u64, Option<u64>, Option<u64>);
+
 pub struct PsiCollector {
     root: PathBuf,
     files: [Option<ProcFile>; 4],
-    previous: [Option<(u64, Option<u64>, Option<u64>)>; 4],
+    previous: [Option<PreviousTotals>; 4],
 }
 impl PsiCollector {
     pub fn at(path: impl AsRef<Path>) -> Self {
