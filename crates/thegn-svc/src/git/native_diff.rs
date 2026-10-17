@@ -637,7 +637,7 @@ fn tree_to_worktree(repo: &gix::Repository, rev: &str) -> Result<Vec<DiffEntry>>
             },
         )
         .context("gix worktree diff resource cache")?;
-    let route = filter_route::ProcessDrivers::capture(&mut platform);
+    let mut route = filter_route::ProcessDrivers::capture(&mut platform);
     let mut cache = new_cache(platform);
 
     // Enumerate the paths that differ from HEAD — staged and unstaged both,
