@@ -151,7 +151,10 @@ impl NumFmt {
             {
                 fit_mark(self.marks.unknown, width)
             }
-            Reading::Value(value) => fit(self.format_value(value, unit, width), width),
+            Reading::Value(value) => fit(
+                nonzero_or_overflow(self.format_value(value, unit, width), unit, width),
+                width,
+            ),
             Reading::Unknown => fit_mark(self.marks.unknown, width),
             Reading::Warming => fit_mark(self.marks.warming, width),
             Reading::Denied => fit_mark(self.marks.denied, width),
@@ -243,6 +246,21 @@ fn fit_mark(mark: &str, width: usize) -> String {
         clipped.push(c);
     }
     format!("{}{}", " ".repeat(width - cells(&clipped)), clipped)
+}
+
+/// A nonzero value must never read as zero. When a unit formatter could only
+/// produce a zero mantissa at this width (e.g. 0.4 at width 1), show the
+/// overflow marks instead. Time units carry their own zero forms and are exempt.
+fn nonzero_or_overflow(rendered: String, unit: Unit, width: usize) -> String {
+    if matches!(unit, Unit::Duration | Unit::Age | Unit::TimePlus) {
+        return rendered;
+    }
+    let trimmed = rendered.trim();
+    let mantissa = trimmed.trim_end_matches(|ch: char| !(ch.is_ascii_digit() || ch == '.'));
+    match mantissa.parse::<f64>() {
+        Ok(number) if number == 0.0 => "#".repeat(width),
+        _ => rendered,
+    }
 }
 
 fn candidate_preserves_nonzero(candidate: &str, value: f64, suffix: &str) -> bool {
