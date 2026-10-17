@@ -93,18 +93,31 @@ pub(crate) struct IsolatedState {
 #[cfg(test)]
 impl IsolatedState {
     pub(crate) fn new() -> Self {
-        Self::with_runtime_dir_inner(false)
+        Self::build(false, false)
     }
 
     pub(crate) fn with_runtime_dir() -> Self {
-        Self::with_runtime_dir_inner(true)
+        Self::build(true, false)
     }
 
-    fn with_runtime_dir_inner(runtime_dir: bool) -> Self {
+    /// XDG state at `$HOME/.local/state`: the layout the THE-744 guard treats as
+    /// the user's real state. Only for tests of that guard.
+    pub(crate) fn with_real_home_layout() -> Self {
+        Self::build(false, true)
+    }
+
+    fn build(runtime_dir: bool, real_home_layout: bool) -> Self {
         let temp = tempfile::tempdir().expect("private isolated state dir");
         thegn_core::fsperm::restrict_dir_to_owner(temp.path())
             .expect("restrict isolated state dir");
         let mut vars = thegn_core::testenv::state_env_all(temp.path());
+        if real_home_layout {
+            for (key, value) in &mut vars {
+                if *key == "XDG_STATE_HOME" {
+                    *value = temp.path().join(".local/state");
+                }
+            }
+        }
         vars.push(("THEGN_DIR", temp.path().join(".thegn")));
         if runtime_dir {
             vars.push(("XDG_RUNTIME_DIR", temp.path().to_path_buf()));

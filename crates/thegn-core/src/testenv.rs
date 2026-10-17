@@ -235,9 +235,26 @@ pub struct IsolatedState {
 #[cfg(any(test, feature = "test-utils"))]
 impl IsolatedState {
     pub fn new() -> Self {
+        Self::build(false)
+    }
+
+    /// Like [`IsolatedState::new`], but with XDG state at `$HOME/.local/state` — the layout the
+    /// THE-744 guard treats as the user's real state. Only for tests of that guard.
+    pub fn with_real_home_layout() -> Self {
+        Self::build(true)
+    }
+
+    fn build(real_home_layout: bool) -> Self {
         let temp = tempfile::tempdir().expect("private isolated state dir");
         crate::fsperm::restrict_dir_to_owner(temp.path()).expect("restrict isolated state dir");
         let mut vars = state_env_all(temp.path());
+        if real_home_layout {
+            for (key, value) in &mut vars {
+                if *key == "XDG_STATE_HOME" {
+                    *value = temp.path().join(".local/state");
+                }
+            }
+        }
         vars.push(("THEGN_DIR", temp.path().join(".thegn")));
         let strings: Vec<_> = vars
             .iter()
@@ -253,11 +270,10 @@ impl IsolatedState {
 
     pub fn state_home(&self) -> PathBuf {
         let state = crate::util::xdg_state_home();
-        let expected = match host_os() {
-            HostOs::Windows => self.root().join("AppData").join("Local"),
-            _ => self.root().join("state"),
-        };
-        debug_assert_eq!(state, expected);
+        debug_assert!(
+            state.starts_with(self.root()),
+            "state home escaped the isolated root"
+        );
         state
     }
 
