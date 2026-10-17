@@ -685,7 +685,7 @@ fn tree_to_worktree(repo: &gix::Repository, rev: &str) -> Result<Vec<DiffEntry>>
     let (status_repo, mut status_route) = if persistent_filter_sections(&filter_repo).is_empty() {
         (None, None)
     } else {
-        let (status_repo, status_route) = routed_status(filter_repo)?;
+        let (status_repo, status_route) = routed_status(filter_repo.clone())?;
         (Some(status_repo), status_route)
     };
     let status_source = status_repo.as_ref().map_or(repo, |status_repo| status_repo);

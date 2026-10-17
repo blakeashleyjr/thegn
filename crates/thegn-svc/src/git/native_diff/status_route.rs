@@ -84,7 +84,7 @@ impl StatusRoute {
         let cleaned = match drivers.route_status_side(
             &self.repo,
             &self.workdir,
-            rela_path,
+            rela_path.as_ref(),
             path,
             &mut cache.0,
         )? {
