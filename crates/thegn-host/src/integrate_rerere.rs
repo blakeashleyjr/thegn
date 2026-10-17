@@ -285,7 +285,7 @@ pub(super) fn import_shared(cache: &Cache, repo_root: &Path) {
 }
 
 fn read_import_file(source: &Path) -> std::io::Result<Vec<u8>> {
-    let mut input = crate::platform::open_read_nofollow(source)?;
+    let input = crate::platform::open_read_nofollow(source)?;
     if !input.metadata()?.is_file() {
         return Err(std::io::Error::other(
             "shared rerere entry is not a regular file",
