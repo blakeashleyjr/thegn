@@ -39,32 +39,6 @@ pub struct TableSpec<'a> {
     pub fmt: NumFmt,
 }
 
-fn clipped(s: &str, width: usize) -> String {
-    if UnicodeWidthStr::width(s) <= width {
-        return s.to_owned();
-    }
-    if width == 0 {
-        return String::new();
-    }
-    let mark = caps::glyph(Glyph::Ellipsis);
-    let mark_w = UnicodeWidthStr::width(mark);
-    let mut out = String::new();
-    let limit = width.saturating_sub(mark_w);
-    let mut used = 0;
-    for ch in s.chars() {
-        let cw = unicode_width::UnicodeWidthChar::width(ch).unwrap_or(0);
-        if used + cw > limit {
-            break;
-        }
-        out.push(ch);
-        used += cw;
-    }
-    if mark_w <= width {
-        out.push_str(mark);
-    }
-    out
-}
-
 pub fn draw(grid: &mut CellGrid, rect: Rect, spec: &TableSpec<'_>) {
     let mut v = GridView::new(grid, rect);
     let area = v.rect();
@@ -77,24 +51,27 @@ pub fn draw(grid: &mut CellGrid, rect: Rect, spec: &TableSpec<'_>) {
             break;
         }
         let width = col.width.min(area.cols - x);
-        let mut title = col.title.to_owned();
-        if let Some((_, direction)) = spec.sort.filter(|(n, _)| *n == i) {
-            title.push(' ');
-            title.push_str(caps::glyph(match direction {
+        let style = CellStyle {
+            attr: super::grid::BOLD,
+            ..CellStyle::default()
+        };
+        let sort_mark = spec.sort.filter(|(n, _)| *n == i).map(|(_, direction)| {
+            caps::glyph(match direction {
                 SortDirection::Asc => Glyph::SortAsc,
                 SortDirection::Desc => Glyph::SortDesc,
-            }));
+            })
+        });
+        if let Some(mark) = sort_mark {
+            let mark_width = UnicodeWidthStr::width(mark);
+            let title_width = width.saturating_sub(mark_width + 1);
+            let title_used = super::grid::put_clipped(&mut v, x, 0, col.title, title_width, style);
+            if title_used + 1 + mark_width <= width {
+                v.put_str(x + title_used, 0, " ", style);
+                v.put_str(x + title_used + 1, 0, mark, style);
+            }
+        } else {
+            super::grid::put_clipped(&mut v, x, 0, col.title, width, style);
         }
-        let text = clipped(&title, width);
-        v.put_str(
-            x,
-            0,
-            &text,
-            CellStyle {
-                attr: super::grid::BOLD,
-                ..CellStyle::default()
-            },
-        );
         x += col.width.saturating_add(1);
     }
     let start = spec.offset.min(spec.rows.len());
@@ -115,17 +92,14 @@ pub fn draw(grid: &mut CellGrid, rect: Rect, spec: &TableSpec<'_>) {
                 .get(col_idx)
                 .copied()
                 .unwrap_or(TableCell::Text(""));
-            let mut text = match cell {
-                TableCell::Text(value) => clipped(value, width),
-                TableCell::Number(reading) => {
-                    spec.fmt
-                        .reading(reading, col.unit.unwrap_or(Unit::Count), width)
-                }
+            let text = match cell {
+                TableCell::Text(value) => None,
+                TableCell::Number(reading) => Some(spec.fmt.reading(
+                    reading,
+                    col.unit.unwrap_or(Unit::Count),
+                    width,
+                )),
             };
-            let text_width = UnicodeWidthStr::width(text.as_str());
-            if col.align == Align::Right && text_width < width {
-                text.insert_str(0, &" ".repeat(width - text_width));
-            }
             let style = CellStyle {
                 fg: StyleTok::from_tok(Tok::Slot(crate::chrome::S::Text))
                     .unwrap_or(StyleTok::INHERIT),
@@ -137,7 +111,27 @@ pub fn draw(grid: &mut CellGrid, rect: Rect, spec: &TableSpec<'_>) {
                 },
                 ..CellStyle::default()
             };
-            v.put_str(x, y, &text, style);
+            if let Some(text) = text {
+                v.put_str(x, y, &text, style);
+            } else if let TableCell::Text(value) = cell {
+                let text_width = UnicodeWidthStr::width(value);
+                let pad = if col.align == Align::Right {
+                    width.saturating_sub(text_width.min(width))
+                } else {
+                    0
+                };
+                for dx in 0..pad {
+                    v.put(x + dx, y, CellStyle { ch: ' ', ..style });
+                }
+                super::grid::put_clipped(
+                    &mut v,
+                    x + pad,
+                    y,
+                    value,
+                    width.saturating_sub(pad),
+                    style,
+                );
+            }
             x += col.width.saturating_add(1);
         }
     }

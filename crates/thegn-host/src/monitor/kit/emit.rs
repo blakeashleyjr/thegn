@@ -131,6 +131,10 @@ impl Emitter {
                 let Some(cell) = grid.get(src.x + col, src.y + row) else {
                     break;
                 };
+                if cell.ch == '\0' {
+                    col += 1;
+                    continue;
+                }
                 let style = (cell.fg, cell.bg, cell.attr);
                 self.scratch.clear();
                 let mut end = col;
@@ -141,7 +145,9 @@ impl Emitter {
                     if (next.fg, next.bg, next.attr) != style {
                         break;
                     }
-                    self.scratch.push(next.ch);
+                    if next.ch != '\0' {
+                        self.scratch.push(next.ch);
+                    }
                     end += 1;
                 }
                 surface.add_change(Change::CursorPosition {
@@ -151,7 +157,10 @@ impl Emitter {
                 let mut attrs = CellAttributes::default();
                 attrs.set_foreground(self.color(cell.fg));
                 attrs.set_background(if cell.bg == StyleTok::INHERIT {
-                    chrome::col(chrome::S::Panel)
+                    self.color(
+                        StyleTok::from_tok(Tok::Slot(chrome::S::Panel))
+                            .unwrap_or(StyleTok::INHERIT),
+                    )
                 } else {
                     self.color(cell.bg)
                 });

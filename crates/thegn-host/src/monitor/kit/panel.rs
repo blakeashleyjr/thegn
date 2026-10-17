@@ -38,14 +38,11 @@ pub fn panel<'a>(
         );
     }
     let g = caps::active_glyphs();
-    let mut title_text = title.to_owned();
-    let max = r
-        .cols
-        .saturating_sub(4 + badge.map_or(0, UnicodeWidthStr::width));
-    if UnicodeWidthStr::width(title_text.as_str()) > max {
-        title_text = title.chars().take(max.saturating_sub(1)).collect();
-        title_text.push_str(caps::glyph(Glyph::Ellipsis));
-    }
+    let badge_width = badge
+        .map_or(0, UnicodeWidthStr::width)
+        .min(r.cols.saturating_sub(4));
+    let badge_start = r.cols.saturating_sub(badge_width + 2);
+    let title_width = badge.map_or(r.cols.saturating_sub(4), |_| badge_start.saturating_sub(3));
     {
         let mut v = super::grid::GridView::new(grid, r);
         let corners = if caps::unicode_level() == UnicodeLevel::Ascii {
@@ -96,13 +93,14 @@ pub fn panel<'a>(
             bg: StyleTok::INHERIT,
             attr: 0,
         };
-        v.put_str(2, 0, &title_text, textstyle);
+        super::grid::put_clipped(&mut v, 2, 0, title, title_width, textstyle);
         if let Some(b) = badge {
-            let w = UnicodeWidthStr::width(b);
-            v.put_str(
-                r.cols.saturating_sub(w + 2),
+            super::grid::put_clipped(
+                &mut v,
+                badge_start,
                 0,
                 b,
+                badge_width,
                 CellStyle {
                     fg: tok(crate::seg::Tok::State(thegn_core::theme::StateRole::Stale)),
                     ..textstyle

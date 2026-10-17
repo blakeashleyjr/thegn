@@ -86,8 +86,25 @@ impl<'a> GridView<'a> {
     }
     pub fn put(&mut self, x: usize, y: usize, style: CellStyle) {
         if x < self.rect.cols && y < self.rect.rows && self.grid.cols > 0 {
-            let i = (self.rect.y + y) * self.grid.cols + self.rect.x + x;
-            self.grid.cells[i] = style;
+            let gx = self.rect.x + x;
+            let gy = self.rect.y + y;
+            let i = gy * self.grid.cols + gx;
+            let width = style.ch.width().unwrap_or(0);
+            if width == 2 && x + 1 >= self.rect.cols {
+                return;
+            }
+            clear_wide_pair(&mut self.grid.cells, self.grid.cols, gx, gy);
+            if style.ch == '\0' {
+                self.grid.cells[i] = style;
+                return;
+            }
+            if width == 2 && x + 1 < self.rect.cols {
+                clear_wide_pair(&mut self.grid.cells, self.grid.cols, gx + 1, gy);
+                self.grid.cells[i] = style;
+                self.grid.cells[i + 1] = CellStyle { ch: '\0', ..style };
+            } else {
+                self.grid.cells[i] = style;
+            }
         }
     }
     pub fn put_str(&mut self, x: usize, y: usize, text: &str, style: CellStyle) -> usize {
@@ -101,9 +118,6 @@ impl<'a> GridView<'a> {
                 break;
             }
             self.put(col, y, CellStyle { ch, ..style });
-            if width == 2 {
-                self.put(col + 1, y, CellStyle { ch: ' ', ..style });
-            }
             col += width;
         }
         col.saturating_sub(x)
@@ -144,4 +158,45 @@ impl<'a> GridView<'a> {
 
 pub fn display_width(s: &str) -> usize {
     UnicodeWidthStr::width(s)
+}
+
+fn clear_wide_pair(cells: &mut [CellStyle], cols: usize, x: usize, y: usize) {
+    let i = y * cols + x;
+    if cells[i].ch == '\0' && x > 0 {
+        cells[i - 1] = CellStyle::default();
+    } else if cells[i].ch.width().unwrap_or(0) == 2 && x + 1 < cols {
+        cells[i + 1] = CellStyle::default();
+    }
+}
+
+/// Write a width-clipped string directly to the grid, adding the active
+/// ellipsis when the text does not fit. Returns the number of columns written.
+pub fn put_clipped(
+    view: &mut GridView<'_>,
+    x: usize,
+    y: usize,
+    text: &str,
+    width: usize,
+    style: CellStyle,
+) -> usize {
+    if display_width(text) <= width {
+        return view.put_str(x, y, text, style);
+    }
+    let mark = crate::caps::glyph(crate::caps::Glyph::Ellipsis);
+    let mark_width = display_width(mark);
+    let text_width = width.saturating_sub(mark_width);
+    let mut used = 0;
+    for ch in text.chars() {
+        let cw = ch.width().unwrap_or(0);
+        if used + cw > text_width {
+            break;
+        }
+        view.put(x + used, y, CellStyle { ch, ..style });
+        used += cw;
+    }
+    if mark_width <= width {
+        used + view.put_str(x + used, y, mark, style)
+    } else {
+        used
+    }
 }

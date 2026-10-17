@@ -46,8 +46,12 @@ impl Meter {
             if let Some(cell) = self.raster.row(0).get(x) {
                 let style = CellStyle {
                     ch: cell.ch,
-                    fg: StyleTok::from_tok(Tok::Ramp(spec.ramp, cell.fg))
-                        .unwrap_or(StyleTok::INHERIT),
+                    fg: StyleTok::from_tok(if cell.ch == caps::raster_table().track {
+                        Tok::Slot(crate::chrome::S::Dim)
+                    } else {
+                        Tok::Ramp(spec.ramp, cell.fg)
+                    })
+                    .unwrap_or(StyleTok::INHERIT),
                     bg: StyleTok::INHERIT,
                     ..CellStyle::default()
                 };

@@ -72,7 +72,7 @@ impl Tok {
             Tok::Ramp(id, level)
                 if crate::caps::color_depth() == thegn_core::termcaps::ColorDepth::Ansi16 =>
             {
-                let band = match level.min(7) {
+                let band = match (*level).min(7) {
                     0..=4 => Band::Normal,
                     5..=6 => Band::Warn,
                     _ => Band::Crit,

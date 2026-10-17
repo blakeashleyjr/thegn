@@ -34,7 +34,13 @@ pub fn draw(grid: &mut CellGrid, rect: Rect, entries: &[LegendSwatch]) {
     let mark_width = UnicodeWidthStr::width(mark);
     let all_width = entries
         .iter()
-        .map(|entry| swatch_width + 1 + UnicodeWidthStr::width(entry.label.as_str()) + 2)
+        .enumerate()
+        .map(|(i, entry)| {
+            swatch_width
+                + 1
+                + UnicodeWidthStr::width(entry.label.as_str())
+                + if i + 1 < entries.len() { 2 } else { 0 }
+        })
         .sum::<usize>();
     let truncated = all_width > width;
     let limit = if truncated {
@@ -42,8 +48,9 @@ pub fn draw(grid: &mut CellGrid, rect: Rect, entries: &[LegendSwatch]) {
     } else {
         width
     };
-    for entry in entries {
-        let need = swatch_width + 1 + UnicodeWidthStr::width(entry.label.as_str()) + 2;
+    for (index, entry) in entries.iter().enumerate() {
+        let entry_width = swatch_width + 1 + UnicodeWidthStr::width(entry.label.as_str());
+        let need = entry_width + if index + 1 < entries.len() { 2 } else { 0 };
         if x + need > limit {
             break;
         }
@@ -55,7 +62,9 @@ pub fn draw(grid: &mut CellGrid, rect: Rect, entries: &[LegendSwatch]) {
         x += view.put_str(x, row, swatch, style);
         x += view.put_str(x, row, " ", style);
         x += view.put_str(x, row, &entry.label, style);
-        x += 2;
+        if index + 1 < entries.len() {
+            x += 2;
+        }
     }
     if truncated && mark_width <= width {
         view.put_str(width - mark_width, row, mark, CellStyle::default());
