@@ -15,6 +15,84 @@ pub(super) struct Cache {
     pub(super) gitdir: PathBuf,
 }
 
+pub(crate) struct CacheStatus {
+    pub(crate) path: PathBuf,
+    pub(crate) present: bool,
+    pub(crate) entries: usize,
+    pub(crate) resolved: usize,
+}
+
+/// Read the queue-private rerere cache posture without opening or creating it.
+pub(crate) fn cache_status(repo_root: &Path) -> Option<CacheStatus> {
+    let identity = thegn_core::repo::repository_id(repo_root).ok()?;
+    let path = super::gate_base(&identity.hex()).join("rerere/git/rr-cache");
+    match std::fs::symlink_metadata(&path) {
+        Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => {}
+        _ => {
+            return Some(CacheStatus {
+                path,
+                present: false,
+                entries: 0,
+                resolved: 0,
+            });
+        }
+    };
+    let Ok(items) = std::fs::read_dir(&path) else {
+        return Some(CacheStatus {
+            path,
+            present: true,
+            entries: 0,
+            resolved: 0,
+        });
+    };
+    let mut entries = 0;
+    let mut resolved = 0;
+    for item in items.take(4096) {
+        let Ok(item) = item else { continue };
+        let item_path = item.path();
+        let Ok(item_metadata) = std::fs::symlink_metadata(&item_path) else {
+            continue;
+        };
+        if !item_metadata.is_dir() || item_metadata.file_type().is_symlink() {
+            continue;
+        }
+        entries += 1;
+        let Ok(files) = std::fs::read_dir(item_path) else {
+            continue;
+        };
+        let has_resolution = files.filter_map(Result::ok).any(|file| {
+            let name = file.file_name();
+            let Some(name) = name.to_str() else {
+                return false;
+            };
+            let Some(suffix) = name.strip_prefix("postimage") else {
+                return false;
+            };
+            if !valid_postimage_suffix(suffix) {
+                return false;
+            }
+            std::fs::symlink_metadata(file.path())
+                .is_ok_and(|metadata| metadata.is_file() && !metadata.file_type().is_symlink())
+        });
+        if has_resolution {
+            resolved += 1;
+        }
+    }
+    Some(CacheStatus {
+        path,
+        present: true,
+        entries,
+        resolved,
+    })
+}
+
+fn valid_postimage_suffix(suffix: &str) -> bool {
+    suffix.is_empty()
+        || suffix.strip_prefix('.').is_some_and(|digits| {
+            !digits.is_empty() && digits.bytes().all(|byte| byte.is_ascii_digit())
+        })
+}
+
 impl Cache {
     pub(super) fn open(repo_root: &Path) -> Option<Self> {
         let identity = thegn_core::repo::repository_id(repo_root).ok()?;
@@ -233,7 +311,7 @@ pub(super) fn import_shared(cache: &Cache, repo_root: &Path) {
             let Some(suffix) = name.strip_prefix("postimage") else {
                 continue;
             };
-            if !suffix.is_empty() && !suffix.bytes().all(|byte| byte.is_ascii_digit()) {
+            if !valid_postimage_suffix(suffix) {
                 continue;
             }
             let preimage = format!("preimage{suffix}");
