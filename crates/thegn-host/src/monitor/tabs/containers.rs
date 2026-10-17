@@ -5,6 +5,7 @@ use super::super::{
     ContainerReqKind, ContainerRequest, ContainerRowMeta, MonitorAction, MonitorOutcome,
     MonitorOverlay,
 };
+use crate::chrome::S;
 use crate::sections::{Cell, Section, TableSection};
 use crate::seg::Tok;
 use thegn_core::theme::Hue;
@@ -118,13 +119,11 @@ pub(in crate::monitor) fn containers(cx: &Ctx, sel: usize) -> TabBuild {
     }
 }
 
-pub(in crate::monitor) fn row_meta(
-    model: &crate::chrome::FrameModel,
-) -> Vec<super::super::ContainerRowMeta> {
+pub(in crate::monitor) fn row_meta(model: &crate::chrome::FrameModel) -> Vec<ContainerRowMeta> {
     model
         .containers
         .iter()
-        .map(|c| super::super::ContainerRowMeta {
+        .map(|c| ContainerRowMeta {
             name: c.name.clone(),
             backend: c.backend.clone(),
             ours: c.ours,
@@ -134,6 +133,13 @@ pub(in crate::monitor) fn row_meta(
 }
 
 impl MonitorOverlay {
+    /// Containers-tab row actions. Reached only after every global key; offered
+    /// only on an OWNED row (foreign containers are read-only, so their keys are
+    /// no-ops). Records the request and hands the loop [`MonitorOutcome::Action`]
+    /// — the overlay can't spawn a subprocess or open a pane itself.
+    ///
+    /// Keys: `t` stop, `r` restart, `x` remove, `o` logs, `Enter` shell-in.
+    /// (`s`/`g`/`l` are global — scale/graph/switch — so stop is `t`, not `s`.)
     pub(in crate::monitor) fn container_key(&mut self, c: char) -> MonitorOutcome {
         let kind = match c {
             't' => ContainerReqKind::Stop,
@@ -146,9 +152,13 @@ impl MonitorOverlay {
         let Some(row) = self.container_rows.get(self.sel).cloned() else {
             return MonitorOutcome::Pending;
         };
+        // Actions are offered only on OWNED rows — foreign containers are
+        // read-only on every surface.
         if !row.ours {
             return MonitorOutcome::Pending;
         }
+        // Remove is a two-press confirm; a running container gets a force
+        // warning (the "second confirmation when running" the spec calls for).
         if kind == ContainerReqKind::Remove
             && self.remove_armed.as_deref() != Some(row.name.as_str())
         {

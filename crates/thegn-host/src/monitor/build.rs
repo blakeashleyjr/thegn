@@ -12,7 +12,7 @@
 use super::procs_view::ProcRow;
 use super::{GraphStyle, MonitorTab, ProcSort, TabPrefs};
 use crate::chrome::{FrameModel, S};
-use crate::sections::{Cell, GraphSection, Section, TableSection, spacer};
+use crate::sections::{GraphSection, Section};
 use crate::seg::Tok;
 use crate::telemetry::{Metric, SeriesOut, SeriesReq, TelemetryHistory};
 use thegn_core::disk_fill::DiskFillEta;
@@ -128,6 +128,9 @@ pub(super) fn tab(input: TabInput) -> TabBuild {
     }
 }
 
+/// Worktree-usage rows for the Disk tab. Read from the
+/// cache — sorted by total size (biggest first), with the measurement age. Pure:
+/// no filesystem walk, so opening the tab never triggers a `du`.
 pub(super) fn worktree_disk_rows(model: &FrameModel, now_secs: u64) -> Vec<DiskWtRow> {
     #[cfg(test)]
     crate::proc_workload_alloc::disk_rows();

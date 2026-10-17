@@ -598,6 +598,9 @@ impl MonitorOverlay {
         // Only the active list is derived, and navigation/geometry changes do
         // not re-sort an unchanged process snapshot. Identity remains sampled.
         self.refresh_active_rows(model, now / 1000, preserve_process);
+        // Container row identities for the key handler (the same order the
+        // builder renders `model.containers` in), so a key resolves `sel`
+        // without a model borrow.
         if self.tab == MonitorTab::Containers {
             self.container_rows = tabs::containers::row_meta(model);
         }

@@ -1,6 +1,7 @@
 //! Notifications tab renderer and tab-specific monitor actions.
 
 use super::super::build::*;
+use crate::chrome::S;
 use crate::sections::{Cell, Section, TableSection};
 use crate::seg::Tok;
 use thegn_core::theme::Hue;
