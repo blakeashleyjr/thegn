@@ -358,6 +358,7 @@ pub mod usage_tokens;
 pub mod usage_view;
 pub mod util;
 pub mod viz;
+pub mod viz_raster;
 pub mod voice;
 pub mod weather;
 pub mod work;
