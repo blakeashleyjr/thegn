@@ -1114,4 +1114,38 @@ binary_cache_key = "cache.example.test-1:PUBLICKEY"
             assert_clean(&format!("explain {key}"), &shown);
         }
     }
+
+    #[test]
+    fn config_show_redacts_plugin_literals_and_keeps_secret_refs_unresolved() {
+        let _env =
+            thegn_core::testenv::EnvGuard::set(&[("THEGN_B42_SHOW_FIXTURE", "RESOLVED_SENTINEL")]);
+        let mut spec: thegn_core::plugin_api::PluginSpec = toml::from_str(include_str!(
+            "../../../../examples/plugins/hello/plugin.toml"
+        ))
+        .unwrap();
+        spec.env
+            .insert("GITHUB_TOKEN".into(), "ghp_SENTINEL".into());
+        spec.env
+            .insert("LINEAR".into(), "env:THEGN_B42_SHOW_FIXTURE".into());
+        let cfg = Config {
+            plugins: vec![spec],
+            ..Default::default()
+        };
+
+        for (label, shown) in [
+            ("toml", show_text(&cfg, false).unwrap()),
+            ("json", show_text(&cfg, true).unwrap()),
+        ] {
+            assert!(!shown.contains("ghp_SENTINEL"), "{label}: {shown}");
+            assert!(!shown.contains("RESOLVED_SENTINEL"), "{label}: {shown}");
+            assert!(
+                shown.contains(thegn_core::redact::PLACEHOLDER),
+                "{label}: {shown}"
+            );
+            assert!(
+                shown.contains("env:THEGN_B42_SHOW_FIXTURE"),
+                "{label}: {shown}"
+            );
+        }
+    }
 }

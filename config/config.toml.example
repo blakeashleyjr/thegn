@@ -4953,8 +4953,9 @@ heartbeat_secs = 10
 # capabilities = []                     # Requested capability grants; default is empty.
 # command = ["/path/to/reviewed-plugin"] # Executable argv (required); never a shell string.
 # cwd = ""                              # Working directory; default is empty (plugin directory or host cwd).
-# env = { RUST_LOG = "info" }            # Optional child environment; entries are passed verbatim.
-#                                         # No env:/file: expansion is performed; do not put secrets here.
+# env = { RUST_LOG = "info" }            # Optional child environment; plain entries pass verbatim.
+#                                         # keyring:NAME, env:VAR, and file:PATH refs resolve at spawn; failure refuses the plugin.
+#                                         # Prefer refs over pasted secrets; plugin.toml refs are refused.
 #                                         # The plugin also inherits thegn's own environment.
 # timeout_secs = 30                     # Per-call wall-clock limit in seconds; default is 30.
 # scopes = []                           # host.call scope ceiling; default empty (read/write/git/merge_add/exec/admin).
