@@ -1781,6 +1781,26 @@ mod tests {
         db_path: &Path,
     ) -> Vec<CreateEvent> {
         let _state = crate::testenv::IsolatedState::new();
+        drive_worker_in_state(
+            &_state,
+            cfg,
+            repo,
+            candidate,
+            (exact_branch, base_override),
+            cmds,
+            db_path,
+        )
+    }
+
+    fn drive_worker_in_state(
+        _state: &crate::testenv::IsolatedState,
+        cfg: Config,
+        repo: &Path,
+        candidate: &str,
+        branch: (bool, Option<String>),
+        cmds: Vec<WizardCmd>,
+        db_path: &Path,
+    ) -> Vec<CreateEvent> {
         let (cmd_tx, cmd_rx) = std::sync::mpsc::channel();
         for c in cmds {
             cmd_tx.send(c).unwrap();
@@ -1792,10 +1812,10 @@ mod tests {
                 cfg,
                 repo_root: repo.to_path_buf(),
                 candidate: candidate.into(),
-                exact_branch,
+                exact_branch: branch.0,
                 generation: 7,
                 db_path: Some(db_path.to_path_buf()),
-                base_override,
+                base_override: branch.1,
             },
             cmd_rx,
             ev_tx,
@@ -2262,6 +2282,7 @@ mod tests {
 
     #[test]
     fn approved_repo_post_create_waits_before_done() {
+        let state = crate::testenv::IsolatedState::new();
         let repo = temp_repo("repo-post-wait");
         let marker = repo.join("post-create.done");
         std::fs::write(
@@ -2297,9 +2318,12 @@ mod tests {
         .unwrap();
         drop(db);
 
-        let events = drive_worker(
+        let events = drive_worker_in_state(
+            &state,
+            test_cfg(),
             &repo,
             "tg/repo-post-wait-2",
+            (false, None),
             vec![
                 WizardCmd::PrepChosen {
                     env: "default".into(),
@@ -2318,7 +2342,7 @@ mod tests {
         assert_eq!(std::fs::read_to_string(&marker).unwrap(), "done");
         assert!(Path::new(&p.path).is_dir());
         assert!(
-            repo.join("state/thegn/hooks").is_dir(),
+            state.state_home().join("thegn/hooks").is_dir(),
             "post-create hook log should use the worker's isolated state home"
         );
         let _ = std::fs::remove_dir_all(&repo); // best-effort: cleanup: the target may already be gone; a failed removal never fails the caller
