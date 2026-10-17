@@ -37,6 +37,7 @@ use thegn_metrics::StatsSnapshot;
 
 mod build;
 mod footer;
+mod graphs;
 mod invalidation;
 mod layout;
 pub(crate) mod procs_view;
