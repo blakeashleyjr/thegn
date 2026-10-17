@@ -42,7 +42,7 @@ fn warmed_push_and_read_do_not_allocate() {
     let mut out = SeriesBuf {
         rows: Vec::with_capacity(1_440),
     };
-    for tick in 0..86_500 {
+    for tick in 0_u64..86_500 {
         for (n, id) in ids.iter().enumerate() {
             if !tick.is_multiple_of(97) {
                 assert!(store.push(*id, tick * 1_000, n as f32));
@@ -50,7 +50,7 @@ fn warmed_push_and_read_do_not_allocate() {
         }
     }
     let before = ALLOCS.load(Ordering::SeqCst);
-    for tick in 86_500..96_500 {
+    for tick in 86_500_u64..96_500 {
         for (n, id) in ids.iter().enumerate() {
             if !tick.is_multiple_of(97) {
                 assert!(store.push(*id, tick * 1_000, n as f32));
