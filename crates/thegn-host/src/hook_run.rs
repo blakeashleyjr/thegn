@@ -758,11 +758,7 @@ mod tests {
 
     #[test]
     fn log_root_panics_when_xdg_state_home_is_the_real_default() {
-        let real_state_home = thegn_core::util::home()
-            .join(".local/state")
-            .to_string_lossy()
-            .into_owned();
-        let _env = crate::testenv::EnvVarGuard::set(&[("XDG_STATE_HOME", &real_state_home)]);
+        let _state = crate::testenv::IsolatedState::with_real_home_layout();
         assert!(std::panic::catch_unwind(log_root).is_err());
     }
 

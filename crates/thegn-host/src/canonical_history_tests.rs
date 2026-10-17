@@ -75,7 +75,7 @@ fn canonical_history_platform_without_pins_is_explicitly_unsupported() {
 }
 
 struct Fixture {
-    _env: crate::testenv::EnvVarGuard,
+    _env: crate::testenv::IsolatedState,
     root: tempfile::TempDir,
     repo: PathBuf,
     first: String,
@@ -96,15 +96,8 @@ impl Fixture {
         std::fs::write(&global, "").unwrap();
         let template = root.path().join("template");
         std::fs::create_dir(&template).unwrap();
-        let state = root.path().join("state");
-        let config = root.path().join("config");
-        let local = root.path().join("local");
         let graft = root.path().join("external-grafts");
         let mut variables = vec![
-            ("XDG_STATE_HOME", state.to_str().unwrap()),
-            ("XDG_CONFIG_HOME", config.to_str().unwrap()),
-            ("LOCALAPPDATA", local.to_str().unwrap()),
-            ("THEGN_DIR", root.path().to_str().unwrap()),
             ("THEGN_PROFILE", ""),
             ("GIT_CONFIG_GLOBAL", global.to_str().unwrap()),
             ("GIT_CONFIG_NOSYSTEM", "1"),
@@ -118,7 +111,7 @@ impl Fixture {
         }
         // Set the process environment before any canonical-history probe can
         // start a worker. The fixture guard restores it on all exits.
-        let env = crate::testenv::EnvVarGuard::set(&variables);
+        let env = crate::testenv::IsolatedState::with_env(&variables);
         let repo = root.path().join("repo");
         std::fs::create_dir(&repo).unwrap();
         let mut value = Self {
