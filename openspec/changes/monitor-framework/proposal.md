@@ -6,10 +6,11 @@ Linear: THE-829
 
 The system monitor is currently a vertical `Vec<Section>` stack. At a 240×60
 terminal it fills only about 0.3 of the available overlay, while graph histories
-are rebuilt as braille strings every frame. The monitor programme in
-`monitor-spec/PROGRAMME.md` §2 and the accepted decisions define a tiled board,
+are rebuilt as braille strings every frame. This change defines a tiled board,
 a bounded sampling lifecycle, and reusable history so the interface can use its
-space and stay responsive without adding an event-loop wake source.
+space and stay responsive without adding an event-loop wake source. The
+architecture and shared-reader ownership are summarized in this change's
+`design.md`.
 
 ## What Changes
 
