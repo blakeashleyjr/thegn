@@ -504,14 +504,10 @@ mod tests {
 
     #[test]
     fn handoff_never_overwrites_a_preexisting_file_link() {
-        let state = tempfile::tempdir().expect("state tempdir");
-        let _env = crate::testenv::EnvVarGuard::set(&[(
-            "XDG_STATE_HOME",
-            state.path().to_str().expect("state path"),
-        )]);
-        let dir = state.path().join("thegn/forks");
+        let state = crate::testenv::IsolatedState::new();
+        let dir = state.state_home().join("thegn/forks");
         std::fs::create_dir_all(&dir).expect("fork directory");
-        let target = state.path().join("outside.txt");
+        let target = state.root().join("outside.txt");
         std::fs::write(&target, "must remain unchanged").expect("target");
         std::fs::hard_link(&target, dir.join("child.txt")).expect("hard link");
 

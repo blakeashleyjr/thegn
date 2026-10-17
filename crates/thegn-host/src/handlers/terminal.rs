@@ -314,14 +314,9 @@ mod tests {
         }
         use thegn_core::store::WorkspaceStore;
 
-        let state_home = tempfile::Builder::new()
-            .prefix("tg-terminal-lock-")
-            .tempdir()
-            .unwrap();
-        let state_path = state_home.path().to_string_lossy().into_owned();
-        let _env = crate::testenv::EnvVarGuard::set(&[("XDG_STATE_HOME", &state_path)]);
+        let state = crate::testenv::IsolatedState::new();
         drop(thegn_core::db::Db::open().unwrap());
-        let lock = rusqlite::Connection::open(state_home.path().join("thegn/thegn.db")).unwrap();
+        let lock = rusqlite::Connection::open(state.state_home().join("thegn/thegn.db")).unwrap();
         lock.execute_batch("BEGIN IMMEDIATE").unwrap();
 
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
