@@ -29,7 +29,7 @@ diagnostics add no timer or wake.
 | malloc_arena_max, malloc_arena_cap_applied | Requested glibc arena cap from `THEGN_MALLOC_ARENA_MAX` (default 2; 0 = uncapped); applied is false off glibc Linux or if refused.                               |
 | malloc_trims_idle, malloc_trims_scan       | Trims after 10 s idle and after a scan-pool burst drains; both share one 30 s limiter.                                                                           |
 | malloc_scan_drains                         | Drained scan bursts, including ones throttled by the shared limiter.                                                                                             |
-| malloc_trims_released                      | Trims that returned memory to the allocator.                                                                                                                     |
+| malloc_trims_released                      | Trims that returned memory to the operating system.                                                                                                              |
 | malloc_trim_bytes                          | Bytes released by trimming; macOS only, always 0 on Linux.                                                                                                       |
 | malloc_trim_total_us, malloc_trim_max_us   | Cumulative time spent in trim calls and the longest trim call.                                                                                                   |
 | resync_samples, resync_p99_us              | Count and cost of baseline reset/full-screen re-emission, independent of incremental/full composition classification.                                            |
