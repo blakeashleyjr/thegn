@@ -35,7 +35,10 @@ impl FakeClock {
 
 impl Clock for FakeClock {
     fn now(&self) -> Instant {
-        *self.now.lock().unwrap()
+        *self
+            .now
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
     fn wait<'a>(
@@ -47,12 +50,19 @@ impl Clock for FakeClock {
         match deadline {
             Some(deadline) => {
                 self.timed.fetch_add(1, Ordering::SeqCst);
-                *self.now.lock().unwrap() = deadline + std::time::Duration::from_millis(1);
+                *self
+                    .now
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                    deadline + std::time::Duration::from_millis(1);
                 state
             }
             None => {
                 self.untimed.fetch_add(1, Ordering::SeqCst);
-                shared.changed.wait(state).unwrap()
+                shared
+                    .changed
+                    .wait(state)
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
             }
         }
     }
@@ -87,7 +97,10 @@ impl Collector for FakeCollector {
         ctx: &TickCtx,
         _frame: &mut MonitorFrame,
     ) -> Result<(), collect::CollectError> {
-        self.sample_ticks.lock().unwrap().push(ctx.tick);
+        self.sample_ticks
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(ctx.tick);
         self.samples.fetch_add(1, Ordering::SeqCst);
         if let Some(drain_gate) = &self.drain_gate {
             while drain_gate.load(Ordering::SeqCst) as u64 <= ctx.tick {
@@ -168,7 +181,10 @@ fn harness_with_gate(
                   task: Box<dyn FnOnce() + Send>|
                   -> std::io::Result<JoinHandle<()>> {
                 spawns.fetch_add(1, Ordering::SeqCst);
-                *name.lock().unwrap() = Some(thread_name.to_owned());
+                *name
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                    Some(thread_name.to_owned());
                 if spawn_error {
                     Err(std::io::Error::other("injected spawn failure"))
                 } else {
@@ -248,7 +264,13 @@ fn closed_does_not_spawn_and_open_reuses_one_named_worker() {
     }
     wait_phase(&h, Phase::Waiting);
     assert_eq!(h.spawns.load(Ordering::SeqCst), 1);
-    assert_eq!(h.name.lock().unwrap().as_deref(), Some("thegn-monitor"));
+    assert_eq!(
+        h.name
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_deref(),
+        Some("thegn-monitor")
+    );
 }
 
 #[test]
@@ -390,7 +412,10 @@ fn failed_collector_is_not_retried_before_retry_tick() {
     let mut h = harness(false, true);
     h.sampler.sync(Mode::Open, demand());
     wait_until(|| h.samples.load(Ordering::SeqCst) >= 2);
-    let ticks = h.sample_ticks.lock().unwrap();
+    let ticks = h
+        .sample_ticks
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     assert_eq!(&ticks[..2], &[0, 2]);
 }
 
