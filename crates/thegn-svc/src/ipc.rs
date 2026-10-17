@@ -202,7 +202,7 @@ pub async fn connect(ep: &IpcEndpoint) -> io::Result<IpcStream> {
             }
             #[cfg(not(unix))]
             {
-                drop(path);
+                let _ = path;
                 Err(unsupported("unix-socket IPC on a non-unix host"))
             }
         }
@@ -559,7 +559,7 @@ impl IpcListener {
                 }
                 #[cfg(not(unix))]
                 {
-                    drop(sock);
+                    let _ = sock;
                     Err(unsupported("unix-socket IPC on a non-unix host"))
                 }
             }

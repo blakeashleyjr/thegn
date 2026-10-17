@@ -401,7 +401,6 @@ fn apply_relaunch_with(
 mod tests {
     use super::*;
     use crate::testenv::EnvVarGuard;
-    use std::path::PathBuf;
     use std::sync::{Arc, Mutex as StdMutex};
     use thegn_core::config::{SandboxBackend, UsageConfig};
 
@@ -829,7 +828,7 @@ mod tests {
                 3,
                 LaunchSpec {
                     argv: vec![shell_launcher.display().to_string()],
-                    cwd: Some(PathBuf::from(worktree.clone())),
+                    cwd: Some(std::path::PathBuf::from(worktree.clone())),
                     env: Vec::new(),
                     backend: "host".into(),
                     warnings: Vec::new(),
