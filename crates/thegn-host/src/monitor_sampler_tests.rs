@@ -47,7 +47,7 @@ impl Clock for FakeClock {
         match deadline {
             Some(deadline) => {
                 self.timed.fetch_add(1, Ordering::SeqCst);
-                *self.now.lock().unwrap() = deadline;
+                *self.now.lock().unwrap() = deadline + std::time::Duration::from_millis(1);
                 state
             }
             None => {
@@ -62,6 +62,8 @@ struct FakeCollector {
     id: CollectorId,
     absent: bool,
     samples: Arc<AtomicUsize>,
+    sample_ticks: Arc<Mutex<Vec<u64>>>,
+    drain_gate: Option<Arc<AtomicUsize>>,
     closes: Arc<AtomicUsize>,
     errors: bool,
 }
@@ -82,10 +84,16 @@ impl Collector for FakeCollector {
     }
     fn sample(
         &mut self,
-        _ctx: &TickCtx,
+        ctx: &TickCtx,
         _frame: &mut MonitorFrame,
     ) -> Result<(), collect::CollectError> {
+        self.sample_ticks.lock().unwrap().push(ctx.tick);
         self.samples.fetch_add(1, Ordering::SeqCst);
+        if let Some(drain_gate) = &self.drain_gate {
+            while drain_gate.load(Ordering::SeqCst) <= ctx.tick {
+                std::thread::yield_now();
+            }
+        }
         if self.errors {
             Err(collect::CollectError::Gone)
         } else {
@@ -101,6 +109,7 @@ struct Harness {
     sampler: MonitorSampler,
     clock: Arc<FakeClock>,
     samples: Arc<AtomicUsize>,
+    sample_ticks: Arc<Mutex<Vec<u64>>>,
     closes: Arc<AtomicUsize>,
     spawns: Arc<AtomicUsize>,
     name: Arc<Mutex<Option<String>>>,
@@ -108,16 +117,29 @@ struct Harness {
 }
 
 fn harness(absent: bool, errors: bool) -> Harness {
+    harness_with_gate(absent, errors, None, false, false)
+}
+
+fn harness_with_gate(
+    absent: bool,
+    errors: bool,
+    drain_gate: Option<Arc<AtomicUsize>>,
+    wake_error: bool,
+    spawn_error: bool,
+) -> Harness {
     let clock = Arc::new(FakeClock::new());
     let samples = Arc::new(AtomicUsize::new(0));
+    let sample_ticks = Arc::new(Mutex::new(Vec::new()));
     let closes = Arc::new(AtomicUsize::new(0));
     let spawns = Arc::new(AtomicUsize::new(0));
     let name = Arc::new(Mutex::new(None));
     let wakes = Arc::new(AtomicUsize::new(0));
     let factory: Factory = {
         let samples = Arc::clone(&samples);
+        let sample_ticks = Arc::clone(&sample_ticks);
+        let drain_gate = drain_gate.clone();
         let closes = Arc::clone(&closes);
-        Box::new(move || {
+        Arc::new(move || {
             let ids = if absent {
                 CollectorId::ALL.to_vec()
             } else {
@@ -129,6 +151,8 @@ fn harness(absent: bool, errors: bool) -> Harness {
                         id,
                         absent,
                         samples: Arc::clone(&samples),
+                        sample_ticks: Arc::clone(&sample_ticks),
+                        drain_gate: drain_gate.clone(),
                         closes: Arc::clone(&closes),
                         errors,
                     }) as Box<dyn Collector>
@@ -139,21 +163,28 @@ fn harness(absent: bool, errors: bool) -> Harness {
     let spawn = {
         let spawns = Arc::clone(&spawns);
         let name = Arc::clone(&name);
-        Box::new(
+        Arc::new(
             move |thread_name: &str,
                   task: Box<dyn FnOnce() + Send>|
                   -> std::io::Result<JoinHandle<()>> {
                 spawns.fetch_add(1, Ordering::SeqCst);
                 *name.lock().unwrap() = Some(thread_name.to_owned());
-                Ok(std::thread::spawn(task))
+                if spawn_error {
+                    Err(std::io::Error::new(
+                        std::io::ErrorKind::Other,
+                        "injected spawn failure",
+                    ))
+                } else {
+                    Ok(std::thread::spawn(task))
+                }
             },
         )
     };
-    let wake = {
+    let wake: super::Wake = {
         let wakes = Arc::clone(&wakes);
         Arc::new(move || {
             wakes.fetch_add(1, Ordering::SeqCst);
-            Ok(())
+            if wake_error { Err(()) } else { Ok(()) }
         })
     };
     let sampler = MonitorSampler::with_inputs(SpawnInputs {
@@ -166,6 +197,7 @@ fn harness(absent: bool, errors: bool) -> Harness {
         sampler,
         clock,
         samples,
+        sample_ticks,
         closes,
         spawns,
         name,
@@ -192,11 +224,26 @@ fn wait_phase(harness: &Harness, expected: Phase) {
     assert_eq!(harness.sampler.shared.lock().phase, expected);
 }
 
+fn wait_until(mut condition: impl FnMut() -> bool) {
+    for _ in 0..100_000 {
+        if condition() {
+            return;
+        }
+        std::thread::yield_now();
+    }
+    assert!(
+        condition(),
+        "condition did not become true before the bounded wait ended"
+    );
+}
+
 #[test]
 fn closed_does_not_spawn_and_open_reuses_one_named_worker() {
     let mut h = harness(false, false);
     h.sampler.sync(Mode::Closed, demand());
     assert_eq!(h.spawns.load(Ordering::SeqCst), 0);
+    assert_eq!(h.sampler.shared.lock().phase, Phase::Stopped);
+    assert_eq!(h.sampler.shared.lock().generation, 0);
     assert!(h.sampler.poster().is_none());
     for _ in 0..3 {
         h.sampler.sync(Mode::Open, demand());
@@ -238,7 +285,7 @@ fn hidden_and_paused_use_untimed_parks_then_open_samples() {
     assert_eq!(h.clock.timed.load(Ordering::SeqCst), 0);
     h.sampler.sync(Mode::Open, demand());
     wait_phase(&h, Phase::Waiting);
-    assert!(h.samples.load(Ordering::SeqCst) > 0);
+    wait_until(|| h.samples.load(Ordering::SeqCst) > 0);
     assert!(h.clock.timed.load(Ordering::SeqCst) > 0);
 }
 
@@ -247,10 +294,11 @@ fn close_closes_once_and_wakes_for_loop_owned_reap() {
     let mut h = harness(false, false);
     h.sampler.sync(Mode::Open, demand());
     wait_phase(&h, Phase::Waiting);
+    wait_until(|| h.samples.load(Ordering::SeqCst) > 0);
     h.sampler.sync(Mode::Closed, demand());
     wait_phase(&h, Phase::Stopped);
     assert_eq!(h.closes.load(Ordering::SeqCst), 1);
-    assert!(h.wakes.load(Ordering::SeqCst) >= 2);
+    wait_until(|| h.wakes.load(Ordering::SeqCst) >= 2);
     h.sampler.sync(Mode::Closed, demand());
     assert!(h.sampler.handle.is_none());
 }
@@ -289,7 +337,16 @@ fn frame_publication_is_latest_wins_and_wakes_only_on_empty_to_full() {
     let mut addresses = std::collections::HashSet::new();
     addresses.insert((&*held as *const MonitorFrame) as usize);
     let mut last_seq = held.seq;
-    assert_eq!(h.wakes.load(Ordering::SeqCst), 1);
+    wait_until(|| {
+        h.wakes.load(Ordering::SeqCst) >= 2
+            && h.sampler
+                .shared
+                .lock()
+                .latest
+                .as_ref()
+                .is_some_and(|frame| frame.seq > last_seq)
+    });
+    assert_eq!(h.wakes.load(Ordering::SeqCst), 2);
     for _ in 0..20 {
         let mut newest = None;
         for _ in 0..100_000 {
@@ -309,6 +366,108 @@ fn frame_publication_is_latest_wins_and_wakes_only_on_empty_to_full() {
     }
     assert!(addresses.len() <= 3);
     h.sampler.recycle(held);
+}
+
+#[test]
+fn timed_wait_overshoot_still_collects() {
+    let mut h = harness(false, false);
+    h.sampler.sync(Mode::Open, demand());
+    wait_until(|| h.samples.load(Ordering::SeqCst) > 0);
+    assert!(h.clock.timed.load(Ordering::SeqCst) > 0);
+}
+
+#[test]
+fn failed_collector_is_not_retried_before_retry_tick() {
+    let mut h = harness(false, true);
+    h.sampler.sync(Mode::Open, demand());
+    wait_until(|| h.samples.load(Ordering::SeqCst) >= 2);
+    let ticks = h.sample_ticks.lock().unwrap();
+    assert_eq!(&ticks[..2], &[0, 2]);
+}
+
+#[test]
+fn reopen_before_exit_wake_waits_for_reap_then_restarts() {
+    let drain_gate = Arc::new(AtomicUsize::new(0));
+    let mut h = harness_with_gate(false, false, Some(Arc::clone(&drain_gate)), false, false);
+    h.sampler.sync(Mode::Open, demand());
+    wait_until(|| h.samples.load(Ordering::SeqCst) > 0);
+    let prior_samples = h.samples.load(Ordering::SeqCst);
+    h.sampler.sync(Mode::Closed, demand());
+    h.sampler.sync(Mode::Open, demand());
+    assert_eq!(h.spawns.load(Ordering::SeqCst), 1);
+    drain_gate.store(1, Ordering::SeqCst);
+    wait_until(|| h.wakes.load(Ordering::SeqCst) >= 2);
+    h.sampler.sync(Mode::Open, demand());
+    assert_eq!(h.spawns.load(Ordering::SeqCst), 2);
+    wait_until(|| h.samples.load(Ordering::SeqCst) > prior_samples);
+}
+
+#[test]
+fn slow_consumer_coalesces_publication_wakes() {
+    let mut h = harness(false, false);
+    h.sampler.sync(Mode::Open, demand());
+    wait_until(|| {
+        h.sampler
+            .shared
+            .lock()
+            .latest
+            .as_ref()
+            .is_some_and(|frame| frame.seq >= 5)
+    });
+    let frame = h.sampler.take_latest().unwrap();
+    assert!(frame.seq >= 5);
+    assert_eq!(h.wakes.load(Ordering::SeqCst), 1);
+    h.sampler.recycle(frame);
+}
+
+#[test]
+fn draining_consumer_gets_one_wake_per_publication() {
+    let drain_gate = Arc::new(AtomicUsize::new(0));
+    let mut h = harness_with_gate(false, false, Some(Arc::clone(&drain_gate)), false, false);
+    h.sampler.sync(Mode::Open, demand());
+    for expected_seq in 0..=10 {
+        let frame = {
+            let mut received = None;
+            for _ in 0..100_000 {
+                if let Some(frame) = h.sampler.take_latest() {
+                    received = Some(frame);
+                    break;
+                }
+                std::thread::yield_now();
+            }
+            received.expect("worker should publish each frame after the prior frame is drained")
+        };
+        assert_eq!(frame.seq, expected_seq);
+        h.sampler.recycle(frame);
+        wait_until(|| h.wakes.load(Ordering::SeqCst) == expected_seq + 1);
+        if expected_seq < 10 {
+            drain_gate.store(expected_seq + 1, Ordering::SeqCst);
+        }
+    }
+    assert_eq!(h.wakes.load(Ordering::SeqCst), 11);
+    drain_gate.store(11, Ordering::SeqCst);
+    h.sampler.sync(Mode::Closed, demand());
+    wait_phase(&h, Phase::Stopped);
+}
+
+#[test]
+fn wake_failure_is_terminal_for_the_sampler() {
+    let mut h = harness_with_gate(false, false, None, true, false);
+    h.sampler.sync(Mode::Open, demand());
+    wait_phase(&h, Phase::Failed);
+    h.sampler.sync(Mode::Open, demand());
+    h.sampler.sync(Mode::Open, demand());
+    assert_eq!(h.spawns.load(Ordering::SeqCst), 1);
+}
+
+#[test]
+fn spawn_failure_is_logged_once_and_not_retried() {
+    let mut h = harness_with_gate(false, false, None, false, true);
+    h.sampler.sync(Mode::Open, demand());
+    assert_eq!(h.sampler.shared.lock().phase, Phase::Failed);
+    h.sampler.sync(Mode::Open, demand());
+    h.sampler.sync(Mode::Open, demand());
+    assert_eq!(h.spawns.load(Ordering::SeqCst), 1);
 }
 
 #[test]
