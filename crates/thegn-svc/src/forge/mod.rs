@@ -3,6 +3,7 @@
 //! `thegn doctor`. The trait, models and the CLI transport live in
 //! `thegn_core::forge` / `thegn_core::github`.
 
+mod cli_breaker;
 pub mod native;
 
 pub use native::GithubNative;
@@ -252,7 +253,10 @@ pub fn github(enterprise: bool) -> Ladder<dyn Forge> {
         } else {
             vec![
                 Box::new(GithubNative::new()) as Box<dyn Forge>,
-                Box::new(GithubCli { enterprise }) as Box<dyn Forge>,
+                Box::new(cli_breaker::CliPollBreaker::new(
+                    Box::new(GithubCli { enterprise }),
+                    native::cli_poll_circuit(),
+                )) as Box<dyn Forge>,
             ]
         },
     )
