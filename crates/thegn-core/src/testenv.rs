@@ -67,14 +67,7 @@ pub fn is_real_state_path(
     dynamic_home: &std::path::Path,
     ambient: &[std::path::PathBuf],
 ) -> bool {
-    // A HOME inside the temp dir is a test home (IsolatedState and friends set
-    // one), so its `.local/state` is isolated, not the user's. The real
-    // `~/.local/state` is still caught through the ambient roots captured before
-    // any test mutated the environment.
-    let temp = std::env::temp_dir();
-    let temp_home = dynamic_home.starts_with(&temp)
-        || std::fs::canonicalize(&temp).is_ok_and(|canonical| dynamic_home.starts_with(canonical));
-    (!temp_home && path.starts_with(dynamic_home.join(".local/state")))
+    path.starts_with(dynamic_home.join(".local/state"))
         || ambient.iter().any(|root| path.starts_with(root))
 }
 
@@ -372,25 +365,6 @@ mod tests {
         let ambient = vec![temp.path().join("state")];
 
         assert!(!is_real_state_path(&sibling, &home, &ambient));
-    }
-
-    #[test]
-    fn temp_dir_home_state_is_isolated_but_ambient_roots_stay_real() {
-        let temp = tempfile::tempdir().unwrap();
-        let home = temp.path().join("home");
-        let isolated = home.join(".local/state/thegn/thegn.db");
-        assert!(!is_real_state_path(&isolated, &home, &[]));
-        let ambient = vec![PathBuf::from("/real/home/.local/state")];
-        assert!(is_real_state_path(
-            Path::new("/real/home/.local/state/thegn/thegn.db"),
-            &home,
-            &ambient
-        ));
-        assert!(is_real_state_path(
-            Path::new("/h/.local/state/thegn/thegn.db"),
-            Path::new("/h"),
-            &[]
-        ));
     }
 
     #[test]
