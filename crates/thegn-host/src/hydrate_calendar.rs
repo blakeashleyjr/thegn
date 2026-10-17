@@ -3,7 +3,7 @@
 //! Threading contract, same as `hydrate_tracker`:
 //! - runs on the background lane ([`crate::sched::spawn_bg`], 8 permits) so a
 //!   slow calendar can't starve interactive model hydration;
-//! - builds its own current-thread runtime *inside* the blocking task;
+//! - uses the shared `thegn_svc::bg_runtime` current-thread runtime;
 //! - pulses the [`TerminalWaker`] only when something actually changed.
 //!
 //! Three rules differ from the issue/PR refreshers and are each easy to get
@@ -525,19 +525,14 @@ fn sync_accounts_with_generation(
     if !router.is_configured() {
         return false;
     }
-    let Ok(rt) = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-    else {
-        return false;
-    };
-
     // Each account's page is applied and dropped inside the sink, releasing its
     // share of the global admission budget before the next account is fetched.
     let mut changed = false;
     let network_accounts = network_account_names(&accounts);
     let mut connectivity = ConnectivityEvidenceBatch::default();
-    rt.block_on(router.list_events_each(window, &tokens, |r| {
+    // The sink applies database pages while this blocking thread drives the shared
+    // runtime (ms-scale).
+    let Some(()) = thegn_svc::bg_runtime::block_on(router.list_events_each(window, &tokens, |r| {
         connectivity.observe(connectivity_evidence(
             network_accounts.contains(r.account.as_str()),
             &r.result,
@@ -575,7 +570,9 @@ fn sync_accounts_with_generation(
         if apply_page_with_generation(db, &r.account, r.provider, &page, window, generation) {
             changed = true;
         }
-    }));
+    })) else {
+        return false;
+    };
     if crate::hydrate_schedule::generation_is_current(generation) {
         match connectivity.outcome() {
             Some(ConnEvidence::Reachable) => thegn_core::connectivity::report_success(),
