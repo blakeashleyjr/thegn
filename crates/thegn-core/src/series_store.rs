@@ -17,7 +17,6 @@ pub const CAP_A: usize = 96;
 pub const CAP_B: usize = 400;
 pub const CAP_C: usize = 512;
 pub const HISTORY_BUDGET: usize = 8 << 20;
-pub const LADDER_KEYS: [&str; 9] = ["30s", "1m", "5m", "10m", "30m", "1h", "6h", "12h", "24h"];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Class {
@@ -594,11 +593,12 @@ mod tests {
         assert_eq!(tier_for(Class::B, 86_400), Tier::T1);
         assert_eq!(resolve_window(Class::A, Window::EVERYTHING), 86_400);
         assert_eq!(resolve_window(Class::C, Window::from_secs(300)), 120);
-        for rung in LADDER_KEYS {
+        for rung in crate::series_window::WindowLadder::DEFAULT_KEYS {
             assert!(Window::parse(rung).is_some());
         }
         assert_eq!(
-            Window::parse(LADDER_KEYS[8]).and_then(Window::secs),
+            Window::parse(crate::series_window::WindowLadder::DEFAULT_KEYS[8])
+                .and_then(Window::secs),
             Some(86_400)
         );
         let mut store = SeriesStore::new();
@@ -774,5 +774,19 @@ mod tests {
                 assert_eq!(row.max, expected_max);
             }
         }
+    }
+
+    #[test]
+    fn all_resolves_to_the_widest_default_rung() {
+        let ladder = crate::series_window::WindowLadder::default_ladder();
+        assert_eq!(
+            resolve_window(Class::A, Window::EVERYTHING),
+            ladder.widest_bounded_secs()
+        );
+        assert_eq!(ladder.widest_bounded_secs(), 86_400);
+        assert_eq!(
+            ladder.windows().last().and_then(|window| window.secs()),
+            Some(86_400)
+        );
     }
 }
