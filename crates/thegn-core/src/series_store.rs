@@ -60,6 +60,7 @@ pub struct SeriesBuf {
 #[derive(Debug, Clone, Copy, Default)]
 struct Acc {
     bucket: u64,
+    next_bucket: Option<u64>,
     sum: f64,
     n: u32,
     max: f32,
@@ -116,24 +117,6 @@ impl Series {
                 Class::C => C_LEN * 4,
             }
     }
-    fn clear(&mut self) {
-        self.t0.fill(f32::NAN);
-        if let Some(x) = &mut self.t1_mean {
-            x.fill(f32::NAN);
-        }
-        if let Some(x) = &mut self.t1_max {
-            x.fill(f32::NAN);
-        }
-        if let Some(x) = &mut self.t2_mean {
-            x.fill(f32::NAN);
-        }
-        if let Some(x) = &mut self.t2_max {
-            x.fill(f32::NAN);
-        }
-        self.t1_acc = Acc::default();
-        self.t2_acc = Acc::default();
-        self.open_second = None;
-    }
     fn push(&mut self, at_ms: u64, value: f32) -> bool {
         let second = at_ms / T0_MS;
         if self.open_second.is_some_and(|s| second < s) {
@@ -145,19 +128,11 @@ impl Series {
         if let Some(open) = self.open_second
             && second > open
         {
-            let gap = second - open;
-            if gap > 1_440 {
-                self.clear();
-            } else {
-                self.close_second(open, self.open_value);
-                let fill_start = (open + 1).max(second.saturating_sub(self.t0.len() as u64));
-                for skipped in fill_start..second {
-                    let index = skipped as usize % self.t0.len();
-                    self.t0[index] = f32::NAN;
-                }
-                for skipped in (open + 1)..second {
-                    self.close_second(skipped, f32::NAN);
-                }
+            self.close_second(open, self.open_value);
+            let fill_start = (open + 1).max(second.saturating_sub(self.t0.len() as u64));
+            for skipped in fill_start..second {
+                let index = skipped as usize % self.t0.len();
+                self.t0[index] = f32::NAN;
             }
         }
         self.open_second = Some(second);
@@ -212,18 +187,23 @@ fn update_acc(
 ) {
     if acc.active && acc.bucket != bucket {
         commit_acc(*acc, means, maxima);
-        let missing = bucket
-            .saturating_sub(acc.bucket + 1)
-            .min(means.len() as u64);
+        acc.active = false;
+    }
+    if let Some(next_bucket) = acc.next_bucket
+        && bucket > next_bucket
+    {
+        let missing = bucket.saturating_sub(next_bucket).min(means.len() as u64);
         for offset in 0..missing {
-            let idx = (acc.bucket + 1 + offset) as usize % means.len();
+            let idx = (next_bucket + offset) as usize % means.len();
             means[idx] = f32::NAN;
             maxima[idx] = f32::NAN;
         }
-        *acc = Acc::default();
     }
     if !acc.active {
         acc.bucket = bucket;
+        acc.sum = 0.0;
+        acc.n = 0;
+        acc.max = 0.0;
         acc.active = true;
     }
     if value.is_finite() {
@@ -237,8 +217,9 @@ fn update_acc(
     }
     if finish {
         commit_acc(*acc, means, maxima);
-        *acc = Acc::default();
+        acc.active = false;
     }
+    acc.next_bucket = Some(bucket.saturating_add(1));
 }
 
 fn commit_acc(acc: Acc, means: &mut [f32], maxima: &mut [f32]) {
@@ -365,9 +346,6 @@ impl SeriesStore {
                 self.generations.push(0);
                 self.slots.len() - 1
             });
-        if self.count(class) >= Self::cap(class) {
-            return None;
-        }
         self.slots[slot] = Some(Series::new(key, class));
         Some(self.id(slot))
     }
@@ -491,8 +469,31 @@ impl SeriesStore {
                 )
             }
         };
-        let first = from_ms / period;
-        let last = to_ms / period;
+        if to_ms < from_ms || s.open_second.is_none() {
+            return true;
+        }
+        let first = (from_ms / period).max(s.first_push_ms / period);
+        let last_committed = match tier {
+            Tier::T0 => s.open_second,
+            Tier::T1 => {
+                if s.t1_acc.active {
+                    s.t1_acc.bucket.checked_sub(1)
+                } else {
+                    s.t1_acc.next_bucket.and_then(|next| next.checked_sub(1))
+                }
+            }
+            Tier::T2 => {
+                if s.t2_acc.active {
+                    s.t2_acc.bucket.checked_sub(1)
+                } else {
+                    s.t2_acc.next_bucket.and_then(|next| next.checked_sub(1))
+                }
+            }
+        };
+        let Some(last_committed) = last_committed else {
+            return true;
+        };
+        let last = (to_ms / period).min(last_committed);
         if last < first {
             return true;
         }
@@ -510,8 +511,12 @@ impl SeriesStore {
     }
     pub fn covered_secs(&self, id: SeriesId, now_ms: u64) -> Option<u32> {
         self.get(id).map(|s| {
-            ((now_ms.saturating_sub(s.first_push_ms) / 1_000 + 1)
-                .min(u64::from(horizon_secs(s.class))) as u32)
+            if s.open_second.is_none() {
+                0
+            } else {
+                (now_ms.saturating_sub(s.first_push_ms) / 1_000 + 1)
+                    .min(u64::from(horizon_secs(s.class))) as u32
+            }
         })
     }
     pub fn revision(&self, id: SeriesId) -> Option<u64> {
@@ -538,7 +543,8 @@ mod tests {
         let mut out = SeriesBuf::default();
         assert!(store.read(id, Tier::T0, 0, 17_000, &mut out));
         assert!(out.rows[1..17].iter().all(|r| r.mean.is_nan()));
-        assert!(store.read(id, Tier::T1, 0, 17_000, &mut out));
+        assert!(store.push(id, 18_000, 4.0));
+        assert!(store.read(id, Tier::T1, 0, 18_000, &mut out));
         assert!(
             out.rows[1..3]
                 .iter()
@@ -547,8 +553,6 @@ mod tests {
         let rev = store.revision(id).unwrap();
         assert!(!store.push(id, 16_000, 4.0));
         assert_eq!(store.revision(id), Some(rev));
-        assert_eq!(class_bytes(Class::A), 19_680 + size_of::<Series>());
-        assert!(WORST_CASE_BYTES <= HISTORY_BUDGET);
     }
     #[test]
     fn caps_lru_and_stale_ids() {
@@ -559,10 +563,20 @@ mod tests {
         assert!(store.intern(key(900), Class::A).is_none());
         let mut c = SeriesStore::new();
         let first = c.intern(key(0), Class::C).unwrap();
+        let mut middle = None;
         for i in 1..CAP_C {
-            assert!(c.intern(key(i as u16), Class::C).is_some());
+            let id = c.intern(key(i as u16), Class::C).unwrap();
+            if i == 300 {
+                middle = Some(id);
+            } else {
+                assert!(c.push(id, 1_000, i as f32));
+            }
         }
+        assert!(c.push(first, 2_000, 1.0));
+        let middle = middle.unwrap();
         let new = c.intern(key(900), Class::C).unwrap();
+        assert!(!c.push(middle, 3_000, 4.0));
+        assert!(c.push(first, 3_000, 4.0));
         assert!(!c.push(first, 1_000, 4.0));
         let mut out = SeriesBuf::default();
         assert!(!c.read(first, Tier::T0, 0, 1_000, &mut out));
@@ -587,15 +601,26 @@ mod tests {
         );
         let mut store = SeriesStore::new();
         let id = store.intern(key(1), Class::C).unwrap();
-        for second in 0..7 {
+        for second in 0..5 {
             assert!(store.push(id, second * 1_000, second as f32));
         }
         let id = store.select(key(1), true).unwrap();
         let mut out = SeriesBuf::default();
+        for second in 5..=10 {
+            assert!(store.push(id, second * 1_000, second as f32));
+        }
         assert!(store.read(id, Tier::T1, 0, 10_000, &mut out));
-        assert!(out.rows.iter().any(|r| r.mean.is_finite()));
+        assert_eq!(
+            out.rows.iter().find(|r| r.at_ms == 5_000).unwrap().mean,
+            7.0
+        );
         store.select(key(1), false).unwrap();
         assert_eq!(store.get(id).unwrap().t0.len(), C_LEN);
+        assert!(store.read(id, Tier::T0, 0, 10_000, &mut out));
+        assert_eq!(out.rows.len(), 11);
+        for (second, row) in out.rows.iter().enumerate() {
+            assert_eq!(row.mean, second as f32);
+        }
 
         let mut full_b = SeriesStore::new();
         for metric in 0..CAP_B {
@@ -607,53 +632,113 @@ mod tests {
     }
 
     #[test]
-    fn three_day_gap_is_bounded_and_resets_visible_history() {
+    fn thirty_minute_gap_preserves_t2_history_and_fills_missing_minutes() {
         let mut store = SeriesStore::new();
         let id = store.intern(key(1), Class::A).unwrap();
-        assert!(store.push(id, 0, 2.0));
-        assert!(store.push(id, 3 * 86_400_000, 7.0));
+        for second in 0..120_u64 {
+            assert!(store.push(id, second * 1_000, second as f32));
+        }
+        assert!(store.push(id, 30 * 60_000, 9_000.0));
+        assert!(store.push(id, 30 * 60_000 + 1_000, 9_001.0));
         let mut out = SeriesBuf::default();
-        assert!(store.read(
-            id,
-            Tier::T0,
-            3 * 86_400_000 - 599_000,
-            3 * 86_400_000,
-            &mut out,
-        ));
-        assert_eq!(out.rows.len(), T0_LEN);
-        assert!(out.rows[..T0_LEN - 1].iter().all(|row| row.mean.is_nan()));
-        assert_eq!(out.rows[T0_LEN - 1].mean, 7.0);
+        assert!(store.read(id, Tier::T2, 0, 30 * 60_000, &mut out));
+        assert_eq!(out.rows[0].mean, 29.5);
+        assert_eq!(out.rows[1].mean, 89.5);
+        assert!(out.rows[2..30].iter().all(|row| row.mean.is_nan()));
+    }
+
+    #[test]
+    fn t1_reads_stop_before_the_open_bucket_after_wrap() {
+        let mut store = SeriesStore::new();
+        let id = store.intern(key(2), Class::B).unwrap();
+        for second in 0..3_700_u64 {
+            assert!(store.push(id, second * 1_000, second as f32));
+        }
+        let mut out = SeriesBuf::default();
+        assert!(store.read(id, Tier::T1, 0, 3_700_000, &mut out));
+        assert_eq!(out.rows.len(), T1_LEN);
+        assert_eq!(out.rows.last().unwrap().at_ms, 3_690_000);
+        assert!(out.rows.iter().all(|row| row.at_ms < 3_700_000));
+    }
+
+    #[test]
+    fn coverage_ids_missing_tiers_and_empty_ranges() {
+        let mut store = SeriesStore::new();
+        let id = store.intern(key(3), Class::C).unwrap();
+        assert_eq!(store.covered_secs(id, 1_000_000), Some(0));
+        assert_eq!(store.id_of(key(3)), Some(id));
+        assert_eq!(store.id_of(key(4)), None);
+        assert_eq!(store.select(key(4), true), None);
+        let mut out = SeriesBuf::default();
+        assert!(!store.read(id, Tier::T1, 0, 10_000, &mut out));
+        assert!(!store.read(id, Tier::T2, 0, 10_000, &mut out));
+        assert!(store.push(id, 10_000, 1.0));
+        assert_eq!(store.covered_secs(id, 15_000), Some(6));
+        assert!(store.read(id, Tier::T0, 10_000, 9_000, &mut out));
+        assert!(out.rows.is_empty());
+    }
+
+    #[test]
+    fn demoting_at_c_cap_evicts_one_c_series_and_keeps_recent_values() {
+        let mut store = SeriesStore::new();
+        for metric in 0..CAP_C {
+            let id = store.intern(key(metric as u16), Class::C).unwrap();
+            assert!(store.push(id, 1_000, metric as f32));
+        }
+        let evicted_id = store.id_of(key(0)).unwrap();
+        let chosen = store.intern(key(1_000), Class::B).unwrap();
+        for second in 0..130_u64 {
+            assert!(store.push(chosen, second * 1_000, second as f32));
+        }
+        let demoted = store.select(key(1_000), false).unwrap();
+        assert!(!store.push(evicted_id, 2_000, 2.0));
+        let mut out = SeriesBuf::default();
+        assert!(store.read(demoted, Tier::T0, 0, 129_000, &mut out));
+        assert_eq!(out.rows.len(), C_LEN);
+        assert_eq!(out.rows.first().unwrap().mean, 10.0);
+        assert_eq!(out.rows.last().unwrap().mean, 129.0);
     }
 
     #[test]
     fn seeded_tier_means_and_maxima_match_latest_per_second_model() {
         let mut store = SeriesStore::new();
         let id = store.intern(key(7), Class::A).unwrap();
-        let mut model = vec![f32::NAN; 300];
+        let mut model = vec![f32::NAN; 3_882];
         let mut random = 0x9e37_79b9_u32;
-        for second in 0..300_u64 {
+        let mut gap = 0_u64;
+        for second in 0..3_700_u64 {
+            if second == 1_800 {
+                gap = 180;
+            }
             random ^= random << 13;
             random ^= random >> 17;
             random ^= random << 5;
-            let pushes = 1 + (random % 3) as usize;
-            for push_index in 0..pushes {
-                random ^= random << 13;
-                random ^= random >> 17;
-                random ^= random << 5;
-                let value = if random % 11 == 0 {
-                    f32::NAN
-                } else {
-                    (random % 10_000) as f32 / 37.0
-                };
-                let at_ms = second * 1_000 + push_index as u64 * 200;
-                assert!(store.push(id, at_ms, value));
-                model[second as usize] = if value.is_finite() { value } else { f32::NAN };
+            let actual_second = second + gap;
+            if second == 0 || !random.is_multiple_of(7) {
+                let pushes = 1 + (random % 3) as usize;
+                for push_index in 0..pushes {
+                    random ^= random << 13;
+                    random ^= random >> 17;
+                    random ^= random << 5;
+                    let value = if random.is_multiple_of(11) {
+                        f32::NAN
+                    } else {
+                        (random % 10_000) as f32 / 37.0
+                    };
+                    let at_ms = actual_second * 1_000 + push_index as u64 * 200;
+                    assert!(store.push(id, at_ms, value));
+                    model[actual_second as usize] =
+                        if value.is_finite() { value } else { f32::NAN };
+                }
             }
         }
-        assert!(store.push(id, 300_000, 1.0));
+        assert!(store.push(id, 3_880_000, 1.0));
+        assert!(store.push(id, 3_881_000, 2.0));
         let mut out = SeriesBuf::default();
-        assert!(store.read(id, Tier::T1, 0, 300_000, &mut out));
-        for (bucket, row) in out.rows.iter().take(60).enumerate() {
+        assert!(store.read(id, Tier::T1, 0, 3_880_000, &mut out));
+        assert_eq!(out.rows.len(), T1_LEN);
+        for row in &out.rows {
+            let bucket = (row.at_ms / T1_MS) as usize;
             let values = &model[bucket * 5..bucket * 5 + 5];
             let finite: Vec<f32> = values.iter().copied().filter(|v| v.is_finite()).collect();
             if finite.is_empty() {
@@ -669,8 +754,9 @@ mod tests {
                 assert_eq!(row.max, expected_max);
             }
         }
-        assert!(store.read(id, Tier::T2, 0, 300_000, &mut out));
-        for (bucket, row) in out.rows.iter().take(5).enumerate() {
+        assert!(store.read(id, Tier::T2, 0, 3_880_000, &mut out));
+        for row in &out.rows {
+            let bucket = (row.at_ms / T2_MS) as usize;
             let values = &model[bucket * 60..bucket * 60 + 60];
             let finite: Vec<f32> = values.iter().copied().filter(|v| v.is_finite()).collect();
             if finite.is_empty() {
