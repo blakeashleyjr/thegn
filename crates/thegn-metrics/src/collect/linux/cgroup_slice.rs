@@ -7,7 +7,6 @@ use super::cgroup::{DeviceFilter, RealFs, cgroup2_root, read_group};
 use crate::collect::env::{self, Env};
 use crate::collect::frame::MonitorFrame;
 use crate::collect::health::{Absent, Health};
-use crate::collect::model::cgroup_slice::CgroupSlicePart;
 use crate::collect::policy::cgroup_classify::{THEGN_SLICE, slice_prefix};
 use crate::collect::schedule::Cadence;
 use crate::collect::{CollectError, Collector, CollectorId, TickCtx};
