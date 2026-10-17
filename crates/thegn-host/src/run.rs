@@ -7407,6 +7407,7 @@ async fn event_loop<T: Terminal>(
     // clamp, tab bar and global toggles stay out of the detail popups' shared
     // key/geometry paths.
     let mut monitor: Option<crate::monitor::MonitorOverlay> = None;
+    let mut monitor_sampler = crate::monitor_sampler::MonitorSampler::new(waker.clone());
     // The agent-pipeline board. Its own slot beside the monitor rather than a
     // tab of it: a stage pipeline is not a hardware metric, it wants the whole
     // box for its stage columns, and as the tenth tab it was unreachable by
@@ -12502,6 +12503,11 @@ async fn event_loop<T: Terminal>(
                 dirty = true;
             }
         }
+        // F7/F6b consume the frame later; recycle it now to keep the pool bounded.
+        if let Some(frame) = monitor_sampler.take_latest() {
+            loop_perf.tick(crate::perf::WakeSource::Stats);
+            monitor_sampler.recycle(frame);
+        }
         // Hydration can clear process state while a Processes overlay remains
         // open (for example when config disables then re-enables sampling).
         // Reapply the loop-owned terminal reason independently of the worker's
@@ -14530,6 +14536,24 @@ async fn event_loop<T: Terminal>(
         stats_live.store(
             crate::monitor::wants_live_stats(telemetry_now, monitor.as_ref()),
             std::sync::atomic::Ordering::Relaxed,
+        );
+        let obscured = help_overlay.is_some()
+            || board.is_some()
+            || pr_view.is_some()
+            || diff_view.is_some()
+            || theme_builder.is_some();
+        let sampler_mode = crate::monitor_sampler::mode_for(
+            monitor.is_some(),
+            monitor.as_ref().is_some_and(|overlay| overlay.is_paused()),
+            obscured,
+        );
+        let window = monitor
+            .as_ref()
+            .and_then(|overlay| overlay.prefs().tab(overlay.tab()).window.secs());
+        // TabView/registry demand replaces this all-collector seed in batch 44.
+        monitor_sampler.sync(
+            sampler_mode,
+            crate::monitor_sampler::Demand::all(crate::monitor_sampler::base_ms_for(window)),
         );
         // The expensive `stats --no-stream` + `system df` container enrichment
         // runs ONLY while a per-container-stats surface is visible: the monitor's
