@@ -438,7 +438,7 @@ fn worker(shared: &Shared, clock: &dyn Clock, factory: Factory, wake: &Wake) {
             frame.demand_gen = generation;
             frame.sampled = sampled;
             frame.health = health;
-            frame.parts = parts.clone();
+            frame.parts.clone_from(&parts);
             drop(state);
             publish_box(shared, frame, wake);
             continue;
