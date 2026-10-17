@@ -155,6 +155,7 @@ mod model_proxy_daemon;
 mod monitor;
 mod monitor_action;
 mod monitor_pipeline;
+mod monitor_sampler;
 mod mousefilter;
 mod naming;
 mod nav;
