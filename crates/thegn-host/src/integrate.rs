@@ -722,9 +722,9 @@ fn driver_merge(
                 paths.insert(path);
             }
             let paths: Vec<&str> = paths.into_iter().collect();
-            let mut add_args = vec!["add", "--"];
+            let mut add_args = vec!["--literal-pathspecs", "add", "--"];
             add_args.extend(paths.iter().copied());
-            if add_args.len() > 2 && !util::git_ok(&tmp, &add_args) {
+            if !paths.is_empty() && !util::git_ok(&tmp, &add_args) {
                 warn_driver_merge_failure("could not stage rerere paths", &paths.join("\n"));
                 return None;
             }
@@ -6429,6 +6429,17 @@ mod tests {
         assert!(entry.join("preimage").is_file());
         assert!(!entry.join("postimage").exists());
 
+        let cache = rerere::Cache::open(&repo.dir).expect("private rerere cache should open");
+        rerere::import_shared(&cache, &repo.dir);
+        assert!(
+            !cache
+                .gitdir
+                .join("rr-cache")
+                .join(entry.file_name().unwrap())
+                .exists(),
+            "a shared preimage without a postimage must not create a private cache entry"
+        );
+
         let config = MergeQueueConfig {
             rerere: true,
             ..cfg("")
@@ -6438,6 +6449,65 @@ mod tests {
             report.deferred.iter().any(|item| item.branch == "feat"),
             "{report:?}"
         );
+    }
+
+    #[test]
+    fn shared_resolution_replaces_a_deferred_private_preimage() {
+        let repo = Repo::new("rerere-deferred-shared-resolution");
+        if !repo.history_supported_or_refused() {
+            return;
+        }
+        repo.commit("data.txt", "base\n", "seed");
+        repo.feature("feat", "data.txt", "feature\n");
+        repo.commit("data.txt", "main\n", "main edit");
+        git(&repo.dir, &["config", "rerere.enabled", "true"]);
+        let mut config = cfg("");
+        config.rerere = true;
+
+        let first = run_fold(&config, &repo.dir, repo.branch_set()).unwrap();
+        assert!(
+            first.deferred.iter().any(|item| item.branch == "feat"),
+            "the first fold should defer and record only a private preimage: {first:?}"
+        );
+        let cache = rerere::Cache::open(&repo.dir).expect("private rerere cache should open");
+        let private_rr = cache.gitdir.join("rr-cache");
+        assert!(
+            std::fs::read_dir(&private_rr)
+                .unwrap()
+                .filter_map(Result::ok)
+                .any(|entry| entry.path().join("preimage").is_file()
+                    && !entry.path().join("postimage").exists()),
+            "deferred conflict should leave a private preimage-only entry"
+        );
+        drop(cache);
+
+        let theirs = repo.out(&["rev-parse", "feat"]);
+        let merge = run_driver_merge(
+            &repo.dir,
+            &["merge", "--no-commit", "--no-ff", &theirs],
+            Duration::from_secs(30),
+        );
+        assert!(
+            matches!(merge, DriverRun::Completed { ref status, .. } if status.code() == Some(1))
+        );
+        std::fs::write(repo.dir.join("data.txt"), "shared resolution\n").unwrap();
+        git(&repo.dir, &["add", "data.txt"]);
+        git(
+            &repo.dir,
+            &[
+                "-c",
+                "commit.gpgsign=false",
+                "commit",
+                "-q",
+                "-m",
+                "record shared resolution",
+            ],
+        );
+        git(&repo.dir, &["reset", "-q", "--hard", "HEAD^"]);
+
+        let second = run_fold(&config, &repo.dir, repo.branch_set()).unwrap();
+        assert!(second.advanced, "shared resolution should land: {second:?}");
+        assert_eq!(repo.out(&["show", "main:data.txt"]), "shared resolution");
     }
 
     #[test]
@@ -6652,6 +6722,9 @@ mod tests {
     fn private_rerere_cache_is_capped_and_clears_stale_merge_rr() {
         let repo = Repo::new("rerere-entry-cap");
         if !repo.history_supported_or_refused() {
+            return;
+        }
+        if thegn_core::sandbox_backend::host_os() == thegn_core::sandbox_backend::HostOs::Windows {
             return;
         }
         let cache = rerere::Cache::open(&repo.dir).unwrap();

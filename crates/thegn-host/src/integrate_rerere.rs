@@ -262,7 +262,10 @@ pub(super) fn import_shared(cache: &Cache, repo_root: &Path) {
         for (preimage, postimage, _) in pairs {
             let preimage_path = destination.join(&preimage);
             let postimage_path = destination.join(&postimage);
-            if preimage_path.exists() || postimage_path.exists() {
+            // A postimage means the private cache has a trained resolution. A
+            // preimage alone is only a deferred conflict, so shared training
+            // may replace it.
+            if postimage_path.exists() {
                 continue;
             }
             let pair = read_import_file(&source.join(&preimage))
@@ -274,10 +277,22 @@ pub(super) fn import_shared(cache: &Cache, repo_root: &Path) {
                     continue;
                 }
             };
-            if let Err(error) = std::fs::create_dir_all(&destination)
-                .and_then(|()| write_new_file(&preimage_path, &preimage_bytes))
-                .and_then(|()| write_new_file(&postimage_path, &postimage_bytes))
-            {
+            let imported = std::fs::create_dir_all(&destination).and_then(|()| {
+                match std::fs::remove_file(&preimage_path) {
+                    Ok(()) => {}
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(error) => return Err(error),
+                }
+                write_new_file(&preimage_path, &preimage_bytes)?;
+                if let Err(error) = write_new_file(&postimage_path, &postimage_bytes) {
+                    if let Err(cleanup_error) = std::fs::remove_file(&preimage_path) {
+                        tracing::debug!(target: "thegn::integrate", %cleanup_error, "could not remove partial shared rerere import");
+                    }
+                    return Err(error);
+                }
+                Ok(())
+            });
+            if let Err(error) = imported {
                 tracing::debug!(target: "thegn::integrate", %error, "could not import shared rerere pair");
             }
         }
