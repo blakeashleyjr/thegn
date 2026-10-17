@@ -145,6 +145,7 @@ fn rows(surface: &mut Surface) -> Vec<String> {
 }
 
 #[test]
+#[allow(clippy::needless_range_loop)] // row/col index both the grid and the rendered cells
 fn widget_snapshot_matrix_degrades_for_every_unicode_and_color_level() {
     let levels = [UnicodeLevel::Full, UnicodeLevel::Basic, UnicodeLevel::Ascii];
     let depths = [
@@ -334,7 +335,7 @@ fn ascii_panel_long_title_preserves_top_right_corner() {
         assert_eq!(
             grid.get(9, 0).unwrap().ch,
             Glyph::BoxTr
-                .resolve(&caps::active_glyphs())
+                .resolve(caps::active_glyphs())
                 .chars()
                 .next()
                 .unwrap()
