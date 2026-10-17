@@ -17,6 +17,8 @@ pub struct RasterTable {
     pub hbar8: [char; 8],
     /// Upper half-block, used to pack two heatmap instances per row.
     pub half_upper: char,
+    /// Lower half-block, used when only the second packed instance is present.
+    pub half_lower: char,
     /// ASCII density choices from light to full.
     pub shade4: [char; 4],
     /// Vertical column raster steps, empty to full.
@@ -29,6 +31,8 @@ pub struct RasterTable {
     pub track: char,
     /// Blank cell glyph.
     pub blank: char,
+    /// Space used for empty column-raster cells.
+    pub cell_blank: char,
 }
 
 const RAMP8: [char; 8] = ['▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'];
@@ -48,12 +52,14 @@ impl RasterTable {
         ramp8: RAMP8,
         hbar8: HBAR8,
         half_upper: '▀',
+        half_lower: '▄',
         shade4: SHADE4,
         cols: FULL_COLS,
         heat: FULL_HEAT,
         spark: FULL_SPARK,
         track: '░',
         blank: '⠀',
+        cell_blank: ' ',
     };
 
     /// Basic Unicode retains the same raster glyphs as full Unicode.
@@ -65,12 +71,14 @@ impl RasterTable {
         ramp8: ['.', ':', '-', '=', '+', '*', '#', '#'],
         hbar8: ['.', ':', '-', '=', '+', '*', '#', '#'],
         half_upper: '#',
+        half_lower: '#',
         shade4: ['.', '-', '=', '#'],
         cols: ASCII_COLS,
         heat: ASCII_HEAT,
         spark: ASCII_SPARK,
         track: '-',
         blank: ' ',
+        cell_blank: ' ',
     };
 
     /// Selects the raster set matching terminal Unicode support.
@@ -295,16 +303,23 @@ fn column_cell(
 ) -> RCell {
     let units = value * height as f32;
     let full = units.floor() as usize;
-    let rem = (((units - full as f32) * steps.len() as f32).ceil() as usize).saturating_sub(1);
+    let fraction = units - full as f32;
+    let rem = ((fraction * steps.len() as f32).ceil() as usize).saturating_sub(1);
+    let gradient_level = |height_position: f32| {
+        ((height_position * 8.0 / height as f32).ceil() as i32 - 1).clamp(0, 7) as u8
+    };
     let (ch, fg) = if distance < full {
-        (*steps.last().unwrap_or(&table.blank), 7)
-    } else if distance == full && full < height && rem > 0 {
+        (
+            *steps.last().unwrap_or(&table.cell_blank),
+            gradient_level((distance + 1) as f32),
+        )
+    } else if distance == full && full < height && fraction > 0.0 {
         (
             steps[rem.min(steps.len() - 1)],
-            ((value * 7.0).round() as u8).min(7),
+            gradient_level(distance as f32 + fraction),
         )
     } else {
-        (table.blank, 0)
+        (table.cell_blank, 0)
     };
     RCell { ch, fg, bg: None }
 }
@@ -401,27 +416,25 @@ pub fn mirrored(up: &[f32], down: &[f32], table: &RasterTable, buf: &mut CellBuf
         spans_for(up, buf.w, upper_h, SpanMode::Area, &[], &mut buf.spans);
         spans_for(down, buf.w, lower_h, SpanMode::Area, &[], &mut buf.spans2);
         draw_braille_spans_mirrored(upper_h, table, buf);
-    } else {
-        if !table.cols.is_empty() {
-            let up_off = up.len().saturating_sub(buf.w);
-            let down_off = down.len().saturating_sub(buf.w);
-            for c in 0..buf.w {
-                let upper_value = clamp01(up.get(up_off + c).copied().unwrap_or(0.0));
-                let lower_value = clamp01(down.get(down_off + c).copied().unwrap_or(0.0));
-                for r in 0..upper_h {
-                    buf.put(
-                        c,
-                        r,
-                        column_cell(upper_value, upper_h - 1 - r, upper_h, table.cols, table),
-                    );
-                }
-                for r in 0..lower_h {
-                    buf.put(
-                        c,
-                        upper_h + r,
-                        column_cell(lower_value, r, lower_h, table.cols, table),
-                    );
-                }
+    } else if !table.cols.is_empty() {
+        let up_off = up.len().saturating_sub(buf.w);
+        let down_off = down.len().saturating_sub(buf.w);
+        for c in 0..buf.w {
+            let upper_value = clamp01(up.get(up_off + c).copied().unwrap_or(0.0));
+            let lower_value = clamp01(down.get(down_off + c).copied().unwrap_or(0.0));
+            for r in 0..upper_h {
+                buf.put(
+                    c,
+                    r,
+                    column_cell(upper_value, upper_h - 1 - r, upper_h, table.cols, table),
+                );
+            }
+            for r in 0..lower_h {
+                buf.put(
+                    c,
+                    upper_h + r,
+                    column_cell(lower_value, r, lower_h, table.cols, table),
+                );
             }
         }
     }
@@ -476,43 +489,110 @@ fn draw_braille_spans_mirrored(upper_h: usize, table: &RasterTable, buf: &mut Ce
     }
 }
 
-/// Draws two stacked bands per column with their shared boundary quantized to eighths.
-pub fn stacked(lower: &[f32], upper: &[f32], table: &RasterTable, buf: &mut CellBuf) {
-    let w = lower.len().max(upper.len());
-    buf.reset(w, 1);
-    let lower_off = lower.len().saturating_sub(w);
-    let upper_off = upper.len().saturating_sub(w);
-    for c in 0..w {
-        let a = clamp01(lower.get(lower_off + c).copied().unwrap_or(0.0));
-        let b = clamp01(upper.get(upper_off + c).copied().unwrap_or(0.0));
-        let total = (a + b).min(1.0);
-        if !table.braille {
-            let density = ((a.max(b) * 3.0).round() as usize).min(3);
-            let band = if a >= b { 0 } else { 1 };
-            buf.put(
-                c,
-                0,
-                RCell {
-                    ch: if total == 0.0 {
-                        table.blank
-                    } else {
-                        table.shade4[density]
+/// Draws N stacked bands over the buffer height, clamping their total to one.
+pub fn stacked(bands: &[&[f32]], table: &RasterTable, buf: &mut CellBuf) {
+    buf.reset(buf.w, buf.h);
+    if buf.w == 0 || buf.h == 0 || bands.is_empty() {
+        return;
+    }
+    for c in 0..buf.w {
+        for r in 0..buf.h {
+            let bottom = (buf.h - 1 - r) as f32 / buf.h as f32;
+            let top = (buf.h - r) as f32 / buf.h as f32;
+            let middle = (bottom + top) / 2.0;
+            let mut cumulative = 0.0f32;
+            let mut largest = (0.0f32, 0usize);
+            let mut boundary = None;
+            let mut middle_band = None;
+            for (i, band) in bands.iter().enumerate() {
+                let start = cumulative;
+                let offset = band.len().saturating_sub(buf.w);
+                let amount = clamp01(band.get(offset + c).copied().unwrap_or(0.0));
+                cumulative = (cumulative + amount).min(1.0);
+                let coverage = (cumulative.min(top) - start.max(bottom)).max(0.0);
+                if coverage > largest.0 {
+                    largest = (coverage, i);
+                }
+                if i + 1 < bands.len()
+                    && boundary.is_none()
+                    && cumulative > bottom
+                    && cumulative < top
+                {
+                    boundary = Some((i + 1, cumulative));
+                }
+                if middle >= start && middle < cumulative {
+                    middle_band = Some(i);
+                }
+            }
+            if largest.0 == 0.0 {
+                continue;
+            }
+            if !table.braille {
+                let density = ((largest.0 * buf.h as f32 * 4.0).ceil() as usize)
+                    .saturating_sub(1)
+                    .min(3);
+                buf.put(
+                    c,
+                    r,
+                    RCell {
+                        ch: table.shade4[density],
+                        fg: largest.1 as u8,
+                        bg: None,
                     },
-                    fg: band,
-                    bg: None,
-                },
-            );
-            continue;
+                );
+                continue;
+            }
+            let total_inside_cell = cumulative > bottom && cumulative < top;
+            if total_inside_cell && boundary.is_some() {
+                let eighths = ((cumulative - bottom) * buf.h as f32 * 8.0).round() as usize;
+                buf.put(
+                    c,
+                    r,
+                    RCell {
+                        ch: table.ramp8[eighths.saturating_sub(1).min(7)],
+                        fg: largest.1 as u8,
+                        bg: None,
+                    },
+                );
+            } else if let Some((i, at)) = boundary {
+                let eighths = ((at - bottom) * buf.h as f32 * 8.0).round() as usize;
+                let ch = if eighths == 0 {
+                    table.cell_blank
+                } else {
+                    table.ramp8[(eighths - 1).min(7)]
+                };
+                buf.put(
+                    c,
+                    r,
+                    RCell {
+                        ch,
+                        fg: (i - 1) as u8,
+                        bg: Some(i as u8),
+                    },
+                );
+            } else if total_inside_cell {
+                let eighths = ((cumulative - bottom) * buf.h as f32 * 8.0).round() as usize;
+                buf.put(
+                    c,
+                    r,
+                    RCell {
+                        ch: table.ramp8[eighths.saturating_sub(1).min(7)],
+                        fg: largest.1 as u8,
+                        bg: None,
+                    },
+                );
+            } else if let Some(i) = middle_band {
+                buf.put(
+                    c,
+                    r,
+                    RCell {
+                        ch: table.ramp8[7],
+                        fg: i as u8,
+                        bg: None,
+                    },
+                );
+            }
         }
-        let boundary = ((a.min(total) * 8.0).round() as usize).min(8);
-        let ch = if boundary == 0 {
-            table.blank
-        } else {
-            table.ramp8[boundary.saturating_sub(1).min(7)]
-        };
-        let fg = if boundary == 0 { 1 } else { 0 };
-        let bg = (b > 0.0 && boundary < 8).then_some(1);
-        buf.put(c, 0, RCell { ch, fg, bg });
     }
 }
 
@@ -530,16 +610,29 @@ pub fn heatmap(rows: &[&[f32]], table: &RasterTable, buf: &mut CellBuf) {
             for c in 0..w {
                 let a = rows.get(r * 2).and_then(|row| row.get(c)).copied();
                 let b = rows.get(r * 2 + 1).and_then(|row| row.get(c)).copied();
-                if a.is_some_and(f32::is_nan) || b.is_some_and(f32::is_nan) {
+                let a = a.filter(|value| !value.is_nan());
+                let b = b.filter(|value| !value.is_nan());
+                if a.is_none() && b.is_none() {
                     continue;
                 }
-                let fg = a.map(|v| (clamp01(v) * 7.0).round() as u8).unwrap_or(0);
-                let bg = b.map(|v| (clamp01(v) * 7.0).round() as u8);
+                let fg = a
+                    .or(b)
+                    .map(|v| (clamp01(v) * 7.0).round() as u8)
+                    .unwrap_or(0);
+                let bg = if a.is_some() {
+                    b.map(|v| (clamp01(v) * 7.0).round() as u8)
+                } else {
+                    None
+                };
                 buf.put(
                     c,
                     r,
                     RCell {
-                        ch: table.half_upper,
+                        ch: if a.is_some() {
+                            table.half_upper
+                        } else {
+                            table.half_lower
+                        },
                         fg,
                         bg,
                     },
@@ -602,19 +695,11 @@ pub fn meter(frac: f32, w: usize, table: &RasterTable, buf: &mut CellBuf) {
     let full = (cells.floor() as usize).min(w);
     let rem = ((cells - full as f32) * 8.0).round() as usize;
     for c in 0..w {
-        let fg = if w == 0 {
-            0
-        } else {
-            ((c * 8) / w).min(7) as u8
-        };
+        let fg = (c.saturating_mul(8).checked_div(w).unwrap_or(0)).min(7) as u8;
         let ch = if c < full {
-            if table.braille { '█' } else { '#' }
-        } else if c == full && rem > 0 && c < w {
-            if table.braille {
-                table.hbar8[(rem - 1).min(7)]
-            } else {
-                '#'
-            }
+            table.hbar8[7]
+        } else if c == full && rem > 0 {
+            table.hbar8[(rem - 1).min(7)]
         } else {
             table.track
         };
@@ -631,6 +716,25 @@ mod tests {
         (0..buf.height())
             .map(|r| buf.row(r).iter().map(|cell| cell.ch).collect())
             .collect()
+    }
+
+    fn glyphs_of(table: &RasterTable) -> impl Iterator<Item = char> + '_ {
+        table
+            .ramp8
+            .iter()
+            .chain(table.hbar8.iter())
+            .chain(table.shade4.iter())
+            .copied()
+            .chain([
+                table.half_upper,
+                table.half_lower,
+                table.track,
+                table.blank,
+                table.cell_blank,
+            ])
+            .chain(table.cols.iter().copied())
+            .chain(table.heat.iter().copied())
+            .chain(table.spark.iter().copied())
     }
 
     #[test]
@@ -689,18 +793,26 @@ mod tests {
         let mut b = CellBuf::new();
         for table in [&RasterTable::FULL, &RasterTable::BASIC, &RasterTable::ASCII] {
             sparkline(&[0.0, 0.5, 1.0], table, &mut b);
-            assert_eq!(chars(&b), [if table.braille { "▁▄█" } else { "_-#" }]);
+            assert_eq!(chars(&b), [if table.braille { "▁▅█" } else { "_-#" }]);
             meter(0.625, 4, table, &mut b);
             assert_eq!(
                 chars(&b),
                 [if table.braille {
                     "██▌░"
                 } else {
-                    "###-"
+                    "##=-"
                 }]
             );
-            stacked(&[0.25], &[0.25], table, &mut b);
-            assert_eq!(chars(&b), [if table.braille { "▂" } else { "-" }]);
+            b.reset(1, 4);
+            stacked(&[&[0.25]], table, &mut b);
+            assert_eq!(
+                chars(&b),
+                if table.braille {
+                    [" ", " ", " ", "█"]
+                } else {
+                    [" ", " ", " ", "#"]
+                }
+            );
             let instances = [&[0.0, 0.5][..], &[1.0, 0.25][..], &[0.75][..]];
             heatmap(&instances, table, &mut b);
             assert_eq!(b.height(), if table.braille { 2 } else { 3 });
@@ -752,21 +864,28 @@ mod tests {
 
     #[test]
     fn gradient_levels_are_monotone_by_row() {
-        let mut b = CellBuf::new();
-        b.reset(1, 8);
-        area(&[1.0, 1.0], &RasterTable::FULL, &mut b);
-        let levels: Vec<u8> = (0..8).rev().map(|r| b.row(r)[0].fg).collect();
-        assert!(levels.windows(2).all(|pair| pair[0] <= pair[1]));
-        assert_eq!(levels[7], 7);
+        for (table, steps) in [
+            (&RasterTable::ASCII, RasterTable::ASCII.cols),
+            (&RasterTable::FULL, &RasterTable::FULL.ramp8[..]),
+        ] {
+            let mut b = CellBuf::new();
+            b.reset(1, 8);
+            columns(&[1.0], steps, table, &mut b);
+            let levels: Vec<u8> = (0..8).rev().map(|r| b.row(r)[0].fg).collect();
+            assert!(levels.windows(2).all(|pair| pair[0] <= pair[1]));
+            assert_eq!(levels, (0..8).collect::<Vec<_>>());
+            assert_eq!(levels[7], 7);
+        }
     }
 
     #[test]
     fn stacked_boundary_within_one_eighth() {
-        for step in 0..=100 {
+        for step in 7..=93 {
             let lower = step as f32 / 100.0;
             let upper = 1.0 - lower;
             let mut b = CellBuf::new();
-            stacked(&[lower], &[upper], &RasterTable::FULL, &mut b);
+            b.reset(1, 1);
+            stacked(&[&[lower], &[upper]], &RasterTable::FULL, &mut b);
             let ch = b.row(0)[0].ch;
             let got = if ch == '⠀' {
                 0.0
@@ -780,7 +899,23 @@ mod tests {
                     / 8.0
             };
             assert!((got - lower).abs() <= 1.0 / 8.0);
+            assert!(b.row(0)[0].bg.is_some());
         }
+        let mut b = CellBuf::new();
+        b.reset(1, 4);
+        stacked(&[&[0.375], &[0.25]], &RasterTable::FULL, &mut b);
+        assert_eq!(b.row(2)[0].ch, '▄');
+        assert_eq!(b.row(2)[0].fg, 0);
+        assert_eq!(b.row(2)[0].bg, Some(1));
+        assert_eq!(b.row(1)[0].ch, '▄');
+        assert_eq!(b.row(1)[0].fg, 1);
+        assert_eq!(b.row(1)[0].bg, None);
+        assert_eq!(b.row(0)[0].ch, ' ');
+
+        b.reset(1, 1);
+        stacked(&[&[0.25], &[0.25]], &RasterTable::FULL, &mut b);
+        assert_eq!(b.row(0)[0].ch, '▄');
+        assert_eq!(b.row(0)[0].bg, None);
     }
 
     #[test]
@@ -790,6 +925,19 @@ mod tests {
         heatmap(&rows, &RasterTable::FULL, &mut b);
         assert_eq!(b.height(), 2);
         assert_eq!(b.row(1)[0].bg, None);
+
+        let rows = [&[f32::NAN][..], &[0.5][..], &[1.0][..], &[f32::NAN][..]];
+        heatmap(&rows, &RasterTable::FULL, &mut b);
+        assert_eq!(b.row(0)[0].ch, RasterTable::FULL.half_lower);
+        assert_eq!(b.row(0)[0].fg, 4);
+        assert_eq!(b.row(0)[0].bg, None);
+        assert_eq!(b.row(1)[0].ch, RasterTable::FULL.half_upper);
+        assert_eq!(b.row(1)[0].fg, 7);
+        assert_eq!(b.row(1)[0].bg, None);
+
+        let rows = [&[f32::NAN][..], &[f32::NAN][..]];
+        heatmap(&rows, &RasterTable::FULL, &mut b);
+        assert_eq!(b.row(0)[0].ch, ' ');
     }
 
     #[test]
@@ -810,7 +958,9 @@ mod tests {
         let mut b = CellBuf::new();
         b.reset(1, 2);
         area(&[f32::NAN, 1.0], &RasterTable::FULL, &mut b);
-        assert_eq!(b.row(0)[0].ch, char::from_u32(0x2800).unwrap());
+        for row in 0..b.height() {
+            assert_eq!((b.row(row)[0].ch as u32 - 0x2800) & 0x47, 0);
+        }
         area(&[0.0, 0.0, 1.0, 1.0], &RasterTable::FULL, &mut b);
         let mut expected = CellBuf::new();
         expected.reset(1, 2);
@@ -833,30 +983,22 @@ mod tests {
     #[test]
     fn every_table_glyph_is_one_cell_and_levels_map() {
         for table in [&RasterTable::FULL, &RasterTable::BASIC, &RasterTable::ASCII] {
-            let mut glyphs = table
-                .ramp8
-                .iter()
-                .chain(table.hbar8.iter())
-                .chain(table.shade4.iter())
-                .copied()
-                .chain([table.half_upper, table.track, table.blank])
-                .chain(table.cols.iter().copied())
-                .chain(table.heat.iter().copied())
-                .chain(table.spark.iter().copied());
-            assert!(glyphs.all(|ch| UnicodeWidthChar::width(ch) == Some(1)));
+            assert!(glyphs_of(table).all(|ch| UnicodeWidthChar::width(ch) == Some(1)));
         }
-        assert!(std::ptr::eq(
-            RasterTable::for_level(UnicodeLevel::Full),
-            &RasterTable::FULL
-        ));
-        assert!(std::ptr::eq(
-            RasterTable::for_level(UnicodeLevel::Basic),
-            &RasterTable::BASIC
-        ));
-        assert!(std::ptr::eq(
-            RasterTable::for_level(UnicodeLevel::Ascii),
-            &RasterTable::ASCII
-        ));
+        assert!(glyphs_of(&RasterTable::ASCII).all(|ch| ch.is_ascii()));
+        assert_eq!(
+            *RasterTable::for_level(UnicodeLevel::Full),
+            RasterTable::FULL
+        );
+        assert_eq!(
+            *RasterTable::for_level(UnicodeLevel::Basic),
+            RasterTable::BASIC
+        );
+        assert_eq!(
+            *RasterTable::for_level(UnicodeLevel::Ascii),
+            RasterTable::ASCII
+        );
+        assert!(!RasterTable::for_level(UnicodeLevel::Ascii).braille);
         assert_eq!(RasterTable::BASIC, RasterTable::FULL);
     }
 }
