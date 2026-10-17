@@ -90,7 +90,7 @@ impl Collector for FakeCollector {
         self.sample_ticks.lock().unwrap().push(ctx.tick);
         self.samples.fetch_add(1, Ordering::SeqCst);
         if let Some(drain_gate) = &self.drain_gate {
-            while drain_gate.load(Ordering::SeqCst) <= ctx.tick {
+            while drain_gate.load(Ordering::SeqCst) as u64 <= ctx.tick {
                 std::thread::yield_now();
             }
         }
@@ -184,7 +184,7 @@ fn harness_with_gate(
             if wake_error { Err(()) } else { Ok(()) }
         })
     };
-    let worker_clock: Arc<dyn Clock> = Arc::clone(&clock);
+    let worker_clock: Arc<dyn Clock> = clock.clone();
     let sampler = MonitorSampler::with_inputs(SpawnInputs {
         factory,
         clock: worker_clock,
