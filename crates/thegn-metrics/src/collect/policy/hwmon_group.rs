@@ -2,19 +2,18 @@
 use crate::collect::model::hwmon::{ChipGroup, CostClass, Level, SensorKind, Thresholds};
 
 pub fn parse_attr(attr: &str) -> Option<(SensorKind, u16, &str)> {
-    let (prefix, rest) = attr.split_once(|c: char| !c.is_ascii_alphabetic())?;
+    let split = attr.find(|c: char| !c.is_ascii_alphabetic())?;
+    let (prefix, rest) = attr.split_at(split);
     let split = rest.find('_').unwrap_or(rest.len());
     let channel = rest.get(..split)?.parse::<u16>().ok()?;
     let suffix = rest.get(split..)?;
     let kind = match prefix {
         "temp" => SensorKind::Temp,
         "fan" => SensorKind::Fan,
-        "pwm" => SensorKind::Pwm,
         "power" => SensorKind::Power,
         "in" => SensorKind::Voltage,
         "curr" => SensorKind::Current,
         "freq" => SensorKind::Freq,
-        "energy" => SensorKind::Energy,
         _ => return None,
     };
     let valid = matches!(
@@ -25,12 +24,10 @@ pub fn parse_attr(attr: &str) -> Option<(SensorKind, u16, &str)> {
         ) | (
             SensorKind::Fan,
             "_input" | "_target" | "_min" | "_max" | "_crit"
-        ) | (SensorKind::Pwm, "" | "_enable")
-            | (
-                SensorKind::Power,
-                "_average" | "_input" | "_min" | "_max" | "_crit"
-            )
-            | (_, "_input" | "_min" | "_max" | "_crit")
+        ) | (
+            SensorKind::Power,
+            "_average" | "_input" | "_min" | "_max" | "_crit"
+        ) | (_, "_input" | "_min" | "_max" | "_crit")
     );
     valid.then_some((kind, channel, suffix))
 }
@@ -44,12 +41,10 @@ pub const fn kind_slug(kind: SensorKind) -> &'static str {
     match kind {
         SensorKind::Temp => "temp",
         SensorKind::Fan => "fan",
-        SensorKind::Pwm => "pwm",
         SensorKind::Power => "power",
         SensorKind::Voltage => "in",
         SensorKind::Current => "curr",
         SensorKind::Freq => "freq",
-        SensorKind::Energy => "energy",
     }
 }
 
@@ -103,7 +98,7 @@ pub fn parse_milli(bytes: &[u8]) -> Option<i64> {
 }
 
 pub fn plausible_threshold(kind: SensorKind, value: i64) -> Option<f32> {
-    let scaled = value as f32 * kind.scale();
+    let scaled = value as f32 / kind.divisor();
     match kind {
         SensorKind::Temp if !(-40.0..=200.0).contains(&scaled) => None,
         _ if scaled.is_finite() => Some(scaled),
@@ -112,11 +107,10 @@ pub fn plausible_threshold(kind: SensorKind, value: i64) -> Option<f32> {
 }
 
 pub fn plausible_input(kind: SensorKind, value: i64) -> Option<f32> {
-    let scaled = value as f32 * kind.scale();
+    let scaled = value as f32 / kind.divisor();
     let plausible = match kind {
         SensorKind::Temp => (-40.0..=200.0).contains(&scaled),
         SensorKind::Fan => (0.0..=50_000.0).contains(&scaled),
-        SensorKind::Pwm => (0.0..=255.0).contains(&scaled),
         _ => scaled.is_finite(),
     };
     plausible.then_some(scaled)
@@ -161,12 +155,10 @@ mod tests {
         for (attr, kind, channel, suffix) in [
             ("temp10_input", SensorKind::Temp, 10, "_input"),
             ("fan1_target", SensorKind::Fan, 1, "_target"),
-            ("pwm1", SensorKind::Pwm, 1, ""),
             ("power1_average", SensorKind::Power, 1, "_average"),
             ("in0_input", SensorKind::Voltage, 0, "_input"),
             ("curr1_input", SensorKind::Current, 1, "_input"),
             ("freq1_input", SensorKind::Freq, 1, "_input"),
-            ("energy1_input", SensorKind::Energy, 1, "_input"),
             ("temp2_crit_hyst", SensorKind::Temp, 2, "_crit_hyst"),
         ] {
             assert_eq!(parse_attr(attr), Some((kind, channel, suffix)));
