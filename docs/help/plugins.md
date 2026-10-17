@@ -22,7 +22,13 @@ Two equivalent homes:
   fields. Its `cwd` defaults to that directory.
 
 The optional `env` map adds or overrides environment variables for the plugin
-process; other inherited variables remain available.
+process; other inherited variables remain available. Values may be
+`keyring:NAME`, `env:VAR`, or `file:PATH` references, resolved just before the
+plugin starts; other values pass verbatim. Only a `[[plugins]]` entry in your
+config may use references: a reference in a directory `plugin.toml` refuses
+that plugin. An empty or unresolved reference also refuses the plugin, with
+the reason in the status line and log. Values are never shown; config output
+keeps the reference, not the secret.
 
 Check what thegn sees with `thegn plugin list`; validate everything (api
 compatibility, command presence, contribution acceptance) with

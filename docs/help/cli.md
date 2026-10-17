@@ -253,6 +253,10 @@ a finished row's artifact (exists under the worktree, tracked by git — exit
 refuses a row whose artifact is missing or untracked unless `--force` — an
 untracked artifact is not a handoff. See [[daemon-and-sessions]] for the
 dispatch door (`session open --stage --issue`) that creates these rows.
+Finished rows (not review tasks) older than 90 days are pruned during
+background maintenance unless their worktree is still registered, an active
+autopilot run uses them, or a retained child points to them. `thegn db vacuum`
+does not run this prune.
 
 - `thegn doctor` — resolved terminal capabilities, release channel,
   environment. See [[terminal-compatibility]] and [[debugging]].

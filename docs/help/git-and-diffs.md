@@ -17,6 +17,10 @@ the full tool.
 
 ### changes — the working diff
 
+The changes view omits handoff artifacts under `.thegn/pipeline` and
+`.thegn/maintenance`; other `.thegn` files, including hooks, remain visible.
+`a` (stage all) still stages those omitted paths.
+
 Binary and mode-only changes say so instead of showing hunks. `↵` on a file
 opens line-level staging at every width; at Normal width it widens to Half,
 and Esc retracts that drill. At Half, the inline preview follows the cursor.
@@ -29,6 +33,12 @@ untracked and added files are refused, and other unavailable blame states are
 reported. An empty stash message becomes `WIP on <branch>`. A commit with
 nothing staged is refused before the message box; partially staged changes
 and merge states are allowed.
+
+For long-running `process` filters such as Git LFS, diffs reuse one filter per
+worktree and command, up to 8; an idle filter closes after 2 minutes. If a
+filter cannot run, the diff falls back to Git's one-shot filter path and skips
+that driver for 60 seconds. A required filter that fails shows an error for
+that file's diff.
 
 ### commits — branch history
 
