@@ -134,10 +134,10 @@ impl Clock for LiveClock {
     }
 }
 
-type Factory = Box<dyn FnOnce() -> Vec<Box<dyn Collector>> + Send>;
+type Factory = Arc<dyn Fn() -> Vec<Box<dyn Collector>> + Send + Sync>;
 type Wake = Arc<dyn Fn() -> Result<(), ()> + Send + Sync>;
 type Spawn =
-    Box<dyn FnOnce(&str, Box<dyn FnOnce() + Send>) -> std::io::Result<JoinHandle<()>> + Send>;
+    Arc<dyn Fn(&str, Box<dyn FnOnce() + Send>) -> std::io::Result<JoinHandle<()>> + Send + Sync>;
 
 struct SpawnInputs {
     factory: Factory,
@@ -153,25 +153,24 @@ fn live_spawn(name: &str, task: Box<dyn FnOnce() + Send>) -> std::io::Result<Joi
 pub(crate) struct MonitorSampler {
     shared: Arc<Shared>,
     handle: Option<JoinHandle<()>>,
-    test_inputs: Option<SpawnInputs>,
-    default_wake: Wake,
+    inputs: SpawnInputs,
+    failed: bool,
 }
 
 impl MonitorSampler {
     pub(crate) fn new(waker: termwiz::terminal::TerminalWaker) -> Self {
         Self::with_inputs(SpawnInputs {
-            factory: Box::new(thegn_metrics::collect::stub::stub_collectors),
+            factory: Arc::new(thegn_metrics::collect::stub::stub_collectors),
             clock: Arc::new(LiveClock),
             wake: Arc::new({
                 let wake = waker.clone();
                 move || wake.wake().map_err(|_| ())
             }),
-            spawn: Box::new(live_spawn),
+            spawn: Arc::new(live_spawn),
         })
     }
 
     fn with_inputs(inputs: SpawnInputs) -> Self {
-        let default_wake = Arc::clone(&inputs.wake);
         Self {
             shared: Arc::new(Shared {
                 state: Mutex::new(State {
@@ -190,8 +189,8 @@ impl MonitorSampler {
                 changed: Condvar::new(),
             }),
             handle: None,
-            test_inputs: Some(inputs),
-            default_wake,
+            inputs,
+            failed: false,
         }
     }
 
@@ -201,8 +200,9 @@ impl MonitorSampler {
             self.request_stop();
             return;
         }
-        if self.handle.is_none() {
-            self.start_worker();
+        if self.handle.is_none() && !self.failed {
+            self.start_worker(mode, demand);
+            return;
         }
         let mut state = self.shared.lock();
         if state.stop {
@@ -238,11 +238,13 @@ impl MonitorSampler {
 
     pub(crate) fn recycle(&mut self, frame: Box<MonitorFrame>) {
         self.shared.lock().pool.recycle(frame);
-        self.shared.changed.notify_all();
     }
 
     fn request_stop(&mut self) {
         let mut state = self.shared.lock();
+        if self.handle.is_none() && state.phase == Phase::Stopped {
+            return;
+        }
         if !state.stop {
             state.stop = true;
             state.mode = Mode::Closed;
@@ -258,31 +260,34 @@ impl MonitorSampler {
     }
 
     fn reap_finished(&mut self) {
-        if self.handle.as_ref().is_some_and(JoinHandle::is_finished)
+        if matches!(self.shared.lock().phase, Phase::Stopped | Phase::Failed)
             && let Some(handle) = self.handle.take()
-            && let Err(error) = handle.join()
         {
-            tracing::debug!(target: "thegn::monitor", ?error, "monitor worker panicked while joining");
+            if let Err(error) = handle.join() {
+                tracing::debug!(target: "thegn::monitor", ?error, "monitor worker panicked while joining");
+                self.failed = true;
+            }
+            if self.shared.lock().phase == Phase::Failed {
+                self.failed = true;
+            }
         }
     }
 
-    fn start_worker(&mut self) {
-        let inputs = {
-            self.test_inputs
-                .take()
-                .unwrap_or_else(|| self.production_inputs())
-        };
+    fn start_worker(&mut self, mode: Mode, demand: Demand) {
         {
             let mut state = self.shared.lock();
             state.stop = false;
-            state.mode = Mode::Closed;
+            state.mode = mode;
+            state.demand = demand;
+            state.generation = state.generation.saturating_add(1);
             state.phase = Phase::Starting;
         }
         let shared = Arc::clone(&self.shared);
-        let wake = Arc::clone(&inputs.wake);
-        let clock = Arc::clone(&inputs.clock);
-        let factory = inputs.factory;
-        match (inputs.spawn)(
+        let wake = Arc::clone(&self.inputs.wake);
+        let clock = Arc::clone(&self.inputs.clock);
+        let factory = Arc::clone(&self.inputs.factory);
+        let spawn = Arc::clone(&self.inputs.spawn);
+        match spawn(
             THREAD_NAME,
             Box::new(move || {
                 crate::platform::qos::set_self(crate::platform::qos::Qos::Utility);
@@ -290,6 +295,7 @@ impl MonitorSampler {
                     worker(&shared, clock.as_ref(), factory, &wake)
                 }));
                 if result.is_err() {
+                    tracing::error!(target: "thegn::monitor", "monitor worker panicked; sampler is disabled");
                     let mut state = shared.lock();
                     state.phase = Phase::Failed;
                     state.stop = true;
@@ -297,23 +303,21 @@ impl MonitorSampler {
                         drop(pending.take());
                     });
                     shared.changed.notify_all();
+                    drop(state);
+                    if let Err(error) =
+                        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| wake()))
+                    {
+                        tracing::debug!(target: "thegn::monitor", ?error, "monitor panic wake panicked");
+                    }
                 }
             }),
         ) {
             Ok(handle) => self.handle = Some(handle),
             Err(error) => {
                 tracing::error!(target: "thegn::monitor", %error, "could not spawn monitor sampler");
+                self.failed = true;
                 self.shared.announce(Phase::Failed);
             }
-        }
-    }
-
-    fn production_inputs(&self) -> SpawnInputs {
-        SpawnInputs {
-            factory: Box::new(thegn_metrics::collect::stub::stub_collectors),
-            clock: Arc::new(LiveClock),
-            wake: Arc::clone(&self.default_wake),
-            spawn: Box::new(live_spawn),
         }
     }
 }
@@ -372,14 +376,17 @@ fn worker(shared: &Shared, clock: &dyn Clock, factory: Factory, wake: &Wake) {
     let mut seq = 0_u64;
     let mut tick = 0_u64;
     let mut last_ms = None;
-    let mut last_deadline = None;
+    let mut next_due = None;
+    let mut scheduled_base = None;
+    let mut scheduled_generation = None;
     let mut parts = Parts::default();
+    let mut scratch = MonitorFrame::default();
     let discover = MonitorFrame {
         health,
         ..MonitorFrame::default()
     };
     let discover_generation = shared.lock().generation;
-    publish(shared, discover, discover_generation, wake);
+    publish(shared, &discover, discover_generation, wake);
 
     loop {
         let mut state = shared.lock();
@@ -443,7 +450,12 @@ fn worker(shared: &Shared, clock: &dyn Clock, factory: Factory, wake: &Wake) {
             continue;
         }
         let now = clock.now();
-        let deadline = next_deadline(now, demand.base_ms, last_deadline);
+        if scheduled_base != Some(demand.base_ms) || scheduled_generation != Some(generation) {
+            next_due = Some(next_deadline(now, demand.base_ms, false));
+            scheduled_base = Some(demand.base_ms);
+            scheduled_generation = Some(generation);
+        }
+        let deadline = next_due.expect("worker deadline is initialized");
         if now < deadline {
             state.phase = Phase::Waiting;
             shared.changed.notify_all();
@@ -459,36 +471,33 @@ fn worker(shared: &Shared, clock: &dyn Clock, factory: Factory, wake: &Wake) {
             now_ms.saturating_sub(last).min(u64::from(u32::MAX)) as u32
         });
         let mut sampled = CollectorSet::empty();
+        scratch.parts.clone_from(&parts);
         for collector in &mut collectors {
             let id = collector.id();
             if due.contains(id) && health[id.index()].retry_due(tick) {
-                let mut candidate = MonitorFrame {
-                    parts: parts.clone(),
-                    ..MonitorFrame::default()
-                };
-                match collector.sample(&TickCtx { tick, now_ms }, &mut candidate) {
+                match collector.sample(&TickCtx { tick, now_ms }, &mut scratch) {
                     Ok(()) => {
-                        parts = candidate.parts;
                         health[id.index()] = health[id.index()].after_ok();
                     }
-                    Err(_) => health[id.index()] = health[id.index()].after_error(tick),
+                    Err(_) => {
+                        restore_collector_part(&mut scratch.parts, &parts, id);
+                        health[id.index()] = health[id.index()].after_error(tick);
+                    }
                 }
                 sampled.insert(id);
             }
         }
+        parts.clone_from(&scratch.parts);
         last_ms = Some(now_ms);
         seq = seq.saturating_add(1);
-        let frame = MonitorFrame {
-            seq,
-            at_ms: now_ms,
-            dt_ms,
-            demand_gen: generation,
-            sampled,
-            health,
-            parts: parts.clone(),
-        };
-        last_deadline = Some(deadline);
-        publish(shared, frame, generation, wake);
+        scratch.seq = seq;
+        scratch.at_ms = now_ms;
+        scratch.dt_ms = dt_ms;
+        scratch.demand_gen = generation;
+        scratch.sampled = sampled;
+        scratch.health = health;
+        next_due = Some(next_deadline(now, demand.base_ms, true));
+        publish(shared, &scratch, generation, wake);
         tick = tick.saturating_add(1);
     }
 }
@@ -504,17 +513,34 @@ fn origin() -> Instant {
     *ORIGIN.get_or_init(Instant::now)
 }
 
-fn next_deadline(now: Instant, base_ms: u32, last_deadline: Option<Instant>) -> Instant {
+fn next_deadline(now: Instant, base_ms: u32, strictly_after: bool) -> Instant {
     let period_ns = u128::from(base_ms.max(1)) * 1_000_000;
     let elapsed_ns = now.saturating_duration_since(origin()).as_nanos();
     let next_ns = elapsed_ns.div_ceil(period_ns) * period_ns;
     let mut deadline = origin() + Duration::from_nanos(next_ns.min(u128::from(u64::MAX)) as u64);
-    if let Some(last) = last_deadline
-        && deadline <= last
-    {
-        deadline = last + Duration::from_millis(u64::from(base_ms.max(1)));
+    if strictly_after && deadline <= now {
+        deadline += Duration::from_millis(u64::from(base_ms.max(1)));
     }
     deadline
+}
+
+fn restore_collector_part(target: &mut Parts, source: &Parts, id: CollectorId) {
+    match id {
+        CollectorId::Loadavg => target.loadavg.clone_from(&source.loadavg),
+        CollectorId::Uptime => target.uptime.clone_from(&source.uptime),
+        CollectorId::Psi => target.psi.clone_from(&source.psi),
+        CollectorId::CpuStat => target.cpu_stat.clone_from(&source.cpu_stat),
+        CollectorId::CpuFreq => target.cpu_freq.clone_from(&source.cpu_freq),
+        CollectorId::Hwmon => target.hwmon.clone_from(&source.hwmon),
+        CollectorId::Cgroup => target.cgroup.clone_from(&source.cgroup),
+        CollectorId::CgroupSlice => target.cgroup_slice.clone_from(&source.cgroup_slice),
+        CollectorId::AmdSmu => target.amd_smu.clone_from(&source.amd_smu),
+        CollectorId::Meminfo => target.meminfo.clone_from(&source.meminfo),
+        CollectorId::Vmstat => target.vmstat.clone_from(&source.vmstat),
+        CollectorId::Netdev => target.netdev.clone_from(&source.netdev),
+        CollectorId::Diskstats => target.diskstats.clone_from(&source.diskstats),
+        CollectorId::Powercap => target.powercap.clone_from(&source.powercap),
+    }
 }
 
 fn take_frame(state: &mut State) -> Box<MonitorFrame> {
@@ -527,10 +553,15 @@ fn take_frame(state: &mut State) -> Box<MonitorFrame> {
     panic!("monitor frame pool invariant violated")
 }
 
-fn publish(shared: &Shared, frame: MonitorFrame, generation: u64, wake: &Wake) {
+fn publish(shared: &Shared, frame: &MonitorFrame, generation: u64, wake: &Wake) {
     let mut state = shared.lock();
     let mut pooled = take_frame(&mut state);
-    *pooled = frame;
+    pooled.seq = frame.seq;
+    pooled.at_ms = frame.at_ms;
+    pooled.dt_ms = frame.dt_ms;
+    pooled.sampled = frame.sampled;
+    pooled.health = frame.health;
+    pooled.parts.clone_from(&frame.parts);
     pooled.demand_gen = generation;
     drop(state);
     publish_box(shared, pooled, wake);
@@ -551,6 +582,7 @@ fn publish_box(shared: &Shared, frame: Box<MonitorFrame>, wake: &Wake) {
         shared.lock().pool.recycle(replaced);
     }
     if needs_wake && wake().is_err() {
+        tracing::error!(target: "thegn::monitor", "monitor wake failed; sampler is disabled");
         let mut state = shared.lock();
         state.phase = Phase::Failed;
         state.stop = true;
