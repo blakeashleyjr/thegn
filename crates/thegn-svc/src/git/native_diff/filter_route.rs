@@ -170,6 +170,7 @@ impl ProcessDrivers {
                     if lookup_error.is_none() {
                         lookup_error = Some(error);
                     }
+                    false
                 }
             },
             &mut |_| Ok(None),
