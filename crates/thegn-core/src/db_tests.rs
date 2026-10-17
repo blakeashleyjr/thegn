@@ -410,8 +410,9 @@ fn canonical_migration_without_policy_is_file_backed_and_fail_closed() {
         "pin-match",
         "pin-mismatch",
     ];
-    #[cfg(unix)]
-    cases.extend(["symlink-alias", "hardlink-alias"]);
+    if cfg!(unix) {
+        cases.extend(["symlink-alias", "hardlink-alias"]);
+    }
 
     for case in cases {
         let state_home = tempfile::tempdir().unwrap();

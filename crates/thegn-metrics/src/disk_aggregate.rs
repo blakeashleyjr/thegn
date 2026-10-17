@@ -203,6 +203,13 @@ pub(crate) fn dedupe_by_name(disks: Vec<DiskInfo>) -> Vec<DiskInfo> {
 }
 
 #[cfg(any(target_os = "linux", test))]
+#[cfg_attr(
+    not(target_os = "linux"),
+    allow(
+        dead_code,
+        reason = "Volume metadata is consumed by the Linux disk aggregate."
+    )
+)]
 pub(crate) trait VolumeProbe {
     fn statvfs(&mut self, mount: &str) -> Option<(u64, u64)>;
     fn block_name(&mut self, source: &str) -> Option<String>;

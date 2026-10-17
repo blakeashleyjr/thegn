@@ -259,9 +259,9 @@ How it is wired:
   cdylib that `iroh-relay` declares exceeds the 65,535-entry PE export table
   in a debug build, so that one unused DLL is replaced by an empty stub.
 - **Skips** live in the `wine` profile in `.config/nextest.toml`, each with
-  its cause. That list is only for Wine artefacts. A test that fails because
-  thegn is wrong on Windows, or because the test assumes Linux, is a bug to
-  fix, not a skip.
+  its cause. The list is currently empty and only covers Wine artefacts. A test
+  that fails because thegn is wrong on Windows, or because the test assumes
+  Linux, is a bug to fix, not a skip.
 
 What it covers: pure logic, the `cfg(windows)` code paths in the leaf crates
 (`thegn-proc`, `thegn-metrics`, `thegn-media`, `tg-kit`, `gtui-*`), process
@@ -276,9 +276,10 @@ Wine also exposes the host's Unix root as drive `Z:`, so a test that checks
 `Path::new("/bin/sh").exists()` before spawning `sh` sees `true` under Wine and
 `false` on real Windows. Prefer `cfg!(unix)` for that kind of guard.
 
-Known gap: the test targets of `thegn-core`, `thegn-svc` and `thegn-host` do
-not yet compile for Windows (test code uses `std::os::unix` without a gate),
-so today the recipe runs only the leaf crates in practice.
+Known gap: all crates' test targets compile for `x86_64-pc-windows-gnu`, but
+`thegn-core`, `thegn-svc` and `thegn-host` do not yet have a clean Wine run.
+Many host and svc tests still use runtime `/bin/sh` or `/proc` guards; scope a
+run with `just test-windows-wine -p <crate>`.
 
 ## Testing on other platforms
 
