@@ -822,29 +822,25 @@ fn macos_cpu_jiffies(pid: libc::pid_t) -> Option<u64> {
     Some((nanos / 10_000_000) as u64)
 }
 
-/// Windows (and any other non-Linux, non-macOS unix): same contract via sysinfo
-/// (per-process cwd + accumulated CPU time) — the PEB read on Windows.
-/// sysinfo reports milliseconds; we divide by 10 to convert to jiffy-equivalents
-/// (CLK_TCK = 100) so the shared busy threshold — which is expressed in jiffies —
-/// means the same fraction of a core here as it does on Linux.
-#[cfg(not(any(target_os = "linux", target_os = "macos")))]
-fn scan_proc(targets: &[(PathBuf, String)]) -> BTreeMap<String, BTreeMap<u32, u64>> {
-    use sysinfo::{ProcessRefreshKind, ProcessesToUpdate, UpdateKind};
+#[cfg(any(test, not(any(target_os = "linux", target_os = "macos"))))]
+struct SysProcRow<'a> {
+    pid: u32,
+    cwd: Option<&'a Path>,
+    is_thread: bool,
+    cpu_ms: u64,
+}
+
+#[cfg(any(test, not(any(target_os = "linux", target_os = "macos"))))]
+fn attribute_sysinfo_rows<'a>(
+    targets: &[(PathBuf, String)],
+    rows: impl IntoIterator<Item = SysProcRow<'a>>,
+) -> BTreeMap<String, BTreeMap<u32, u64>> {
     let mut out: BTreeMap<String, BTreeMap<u32, u64>> = BTreeMap::new();
-    let mut sys = sysinfo::System::new();
-    sys.refresh_processes_specifics(
-        ProcessesToUpdate::All,
-        true,
-        ProcessRefreshKind::nothing()
-            .with_cwd(UpdateKind::Always)
-            .with_cpu()
-            // sysinfo enumerates tasks only on linux/android.
-            .without_tasks(),
-    );
-    for proc in sys.processes().values() {
-        // Elevated/protected processes (and, on macOS, other users') hide their
-        // cwd — skipped, same as unreadable /proc entries on Linux.
-        let Some(cwd) = proc.cwd() else { continue };
+    for row in rows {
+        if row.is_thread {
+            continue;
+        }
+        let Some(cwd) = row.cwd else { continue }; // Elevated/protected processes hide their cwd; skipped, same as unreadable /proc entries on Linux.
         let Some((_, wt)) = targets.iter().find(|(p, _)| cwd.starts_with(p)) else {
             continue;
         };
@@ -855,9 +851,38 @@ fn scan_proc(targets: &[(PathBuf, String)]) -> BTreeMap<String, BTreeMap<u32, u6
         // otherwise Windows would flip 'busy' at 1/10th the intended CPU.
         out.entry(wt.clone())
             .or_default()
-            .insert(proc.pid().as_u32(), proc.accumulated_cpu_time() / 10);
+            .insert(row.pid, row.cpu_ms / 10);
     }
     out
+}
+
+/// Windows (and any other non-Linux, non-macOS unix): same contract via sysinfo
+/// (per-process cwd + accumulated CPU time) — the PEB read on Windows.
+/// sysinfo reports milliseconds; we divide by 10 to convert to jiffy-equivalents
+/// (CLK_TCK = 100) so the shared busy threshold — which is expressed in jiffies —
+/// means the same fraction of a core here as it does on Linux.
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn scan_proc(targets: &[(PathBuf, String)]) -> BTreeMap<String, BTreeMap<u32, u64>> {
+    use sysinfo::{ProcessRefreshKind, ProcessesToUpdate, UpdateKind};
+    let mut sys = sysinfo::System::new();
+    sys.refresh_processes_specifics(
+        ProcessesToUpdate::All,
+        true,
+        ProcessRefreshKind::nothing()
+            .with_cwd(UpdateKind::Always)
+            .with_cpu()
+            // sysinfo enumerates tasks only on linux/android.
+            .without_tasks(),
+    );
+    attribute_sysinfo_rows(
+        targets,
+        sys.processes().values().map(|proc| SysProcRow {
+            pid: proc.pid().as_u32(),
+            cwd: proc.cwd(),
+            is_thread: proc.thread_kind().is_some(),
+            cpu_ms: proc.accumulated_cpu_time(),
+        }),
+    )
 }
 
 /// utime+stime from /proc/PID/stat. comm (field 2) may contain spaces and
@@ -2321,5 +2346,71 @@ mod tests {
         assert!(seq1 >= seq0 + 2, "each save must consume a fresh counter");
         // best-effort: test cleanup: scratch removal must never fail the test
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn sysinfo_thread_rows_are_never_attributed() {
+        let targets = vec![(PathBuf::from("/w/a"), String::from("a"))];
+        let rows = [
+            SysProcRow {
+                pid: 10,
+                cwd: Some(Path::new("/w/a/src")),
+                is_thread: false,
+                cpu_ms: 250,
+            },
+            SysProcRow {
+                pid: 11,
+                cwd: Some(Path::new("/w/a")),
+                is_thread: true,
+                cpu_ms: 990,
+            },
+        ];
+
+        assert_eq!(
+            attribute_sysinfo_rows(&targets, rows),
+            BTreeMap::from([(String::from("a"), BTreeMap::from([(10, 25)]))])
+        );
+    }
+
+    #[test]
+    fn sysinfo_rows_without_cwd_or_target_are_skipped_and_longest_prefix_wins() {
+        let targets = vec![
+            (PathBuf::from("/w/a/nested"), String::from("n")),
+            (PathBuf::from("/w/a"), String::from("a")),
+        ];
+        let rows = [
+            SysProcRow {
+                pid: 1,
+                cwd: Some(Path::new("/w/a/nested/x")),
+                is_thread: false,
+                cpu_ms: 19,
+            },
+            SysProcRow {
+                pid: 2,
+                cwd: Some(Path::new("/w/a")),
+                is_thread: false,
+                cpu_ms: 20,
+            },
+            SysProcRow {
+                pid: 3,
+                cwd: Some(Path::new("/elsewhere")),
+                is_thread: false,
+                cpu_ms: 100,
+            },
+            SysProcRow {
+                pid: 4,
+                cwd: None,
+                is_thread: false,
+                cpu_ms: 100,
+            },
+        ];
+
+        assert_eq!(
+            attribute_sysinfo_rows(&targets, rows),
+            BTreeMap::from([
+                (String::from("a"), BTreeMap::from([(2, 2)])),
+                (String::from("n"), BTreeMap::from([(1, 1)])),
+            ])
+        );
     }
 }
