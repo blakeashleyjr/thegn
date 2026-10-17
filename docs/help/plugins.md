@@ -27,8 +27,9 @@ process; other inherited variables remain available. Values may be
 plugin starts; other values pass verbatim. Only a `[[plugins]]` entry in your
 config may use references: a reference in a directory `plugin.toml` refuses
 that plugin. An empty or unresolved reference also refuses the plugin, with
-the reason in the status line and log. Values are never shown; config output
-keeps the reference, not the secret.
+the reason in the status line and log. Config output shows a reference as
+written, never its resolved value, and masks literal values under
+secret-looking names such as `*_TOKEN`.
 
 Check what thegn sees with `thegn plugin list`; validate everything (api
 compatibility, command presence, contribution acceptance) with
