@@ -6685,7 +6685,7 @@ mod tests {
             .unwrap();
 
         assert!(!cache.gitdir.join("MERGE_RR").exists());
-        assert_eq!(std::fs::read_dir(rr_cache).unwrap().count(), 1024);
+        assert_eq!(std::fs::read_dir(&rr_cache).unwrap().count(), 1024);
         for index in 0..6 {
             assert!(!rr_cache.join(format!("entry-{index:04}")).exists());
         }
