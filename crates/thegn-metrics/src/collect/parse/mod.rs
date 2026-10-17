@@ -1,6 +1,7 @@
 //! Allocation-free byte parsers shared by collector readers.
 pub mod amd_gpu_metrics;
 pub mod cgroup;
+pub mod cpufreq;
 pub mod diskstats;
 pub mod meminfo;
 pub mod mountinfo;
