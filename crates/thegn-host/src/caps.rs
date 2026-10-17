@@ -148,6 +148,18 @@ pub fn bar_track(frac: f32, w: usize) -> (String, String) {
     }
 }
 
+/// Raster characters selected for the active Unicode capability.
+#[allow(dead_code)] // First production caller is the F5a monitor kit.
+pub fn raster_table() -> &'static thegn_core::viz_raster::RasterTable {
+    thegn_core::viz_raster::RasterTable::for_level(unicode_level())
+}
+
+/// Width-aware monitor marks using the active glyph set.
+#[allow(dead_code)] // First production caller is the F5a monitor kit.
+pub fn num_marks() -> thegn_core::numfmt::Marks {
+    thegn_core::numfmt::Marks::from_glyphs(active_glyphs(), glyph(Glyph::Lock))
+}
+
 /// Install the resolved capabilities together with the config's themed glyph
 /// preferences. The single install entry point used by the loop at startup and
 /// on config reload — [`install`] handles the color/glyph atomics, the
@@ -325,5 +337,33 @@ mod tests {
         for frac in [0.0f32, 0.37, 0.5, 0.99, 1.0] {
             assert_eq!(bar_track(frac, 16), thegn_core::viz::bar_track(frac, 16));
         }
+    }
+}
+
+#[cfg(test)]
+mod monitor_accessors_tests {
+    use super::*;
+    use thegn_core::termcaps::UnicodeLevel;
+
+    #[test]
+    fn raster_accessor_tracks_unicode_override() {
+        for level in [UnicodeLevel::Full, UnicodeLevel::Basic, UnicodeLevel::Ascii] {
+            test_override::with_unicode(level, || {
+                assert!(std::ptr::eq(
+                    raster_table(),
+                    thegn_core::viz_raster::RasterTable::for_level(level)
+                ));
+            });
+        }
+    }
+
+    #[test]
+    fn marks_accessor_uses_active_marks_and_lock() {
+        test_override::with_unicode(UnicodeLevel::Ascii, || {
+            let marks = num_marks();
+            assert_eq!(marks.unknown, active_glyphs().emdash);
+            assert_eq!(marks.warming, active_glyphs().ellipsis);
+            assert_eq!(marks.denied, glyph(Glyph::Lock));
+        });
     }
 }

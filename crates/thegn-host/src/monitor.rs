@@ -39,6 +39,7 @@ mod build;
 mod footer;
 mod graphs;
 mod invalidation;
+mod kit;
 mod layout;
 pub(crate) mod procs_view;
 pub(crate) mod state;
