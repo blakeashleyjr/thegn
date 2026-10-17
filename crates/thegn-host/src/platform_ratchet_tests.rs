@@ -200,9 +200,8 @@ fn qos_debt_threads_declare_on_entry() {
         let path = format!("{MANIFEST}/src/{file}");
         let body = std::fs::read_to_string(path).expect("read production source file");
         assert!(body.contains("spawn_named("), "{file} has no named thread");
-        assert_eq!(
-            spawn_named_without_entry_qos(&body),
-            [],
+        assert!(
+            spawn_named_without_entry_qos(&body).is_empty(),
             "{file} has a named thread without entry QoS"
         );
     }
