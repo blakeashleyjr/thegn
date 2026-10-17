@@ -406,14 +406,11 @@ fn shared_client() -> Option<&'static reqwest::blocking::Client> {
         .get_or_init(|| {
             #[cfg(test)]
             CLIENT_BUILDS.fetch_add(1, Ordering::SeqCst);
-            match reqwest::blocking::Client::builder()
+            reqwest::blocking::Client::builder()
                 .timeout(FETCH_TIMEOUT)
                 .user_agent("thegn-usage")
                 .build()
-            {
-                Ok(client) => Some(client),
-                Err(_) => None,
-            }
+                .ok()
         })
         .as_ref()
 }

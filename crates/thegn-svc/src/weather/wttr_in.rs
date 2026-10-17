@@ -73,6 +73,7 @@ impl WttrInBackend {
 /// There is no `?m` / `?u` unit flag: the `j1` payload carries **both** unit
 /// systems and `decode_wttr_j1` selects between them. That is why this feature
 /// contains no conversion arithmetic anywhere.
+#[cfg(test)]
 pub(crate) fn url_for(location: &str) -> Result<String, WeatherError> {
     url_for_base(BASE, location)
 }
