@@ -1,0 +1,4 @@
+# Files in crates/thegn-metrics/src that still contain a bare production thread spawn.
+# Every long-lived thread needs a stable task attribution key.
+# SHRINK-ONLY. Enforced by platform_ratchet_thread_names_are_frozen_empty.
+# RATCHET-EMPTY
