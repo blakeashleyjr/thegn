@@ -317,6 +317,7 @@ pub mod secretref;
 pub mod semantic;
 pub mod semantic_graph;
 pub mod series;
+pub mod series_store;
 pub mod series_window;
 // The pane daemon's per-session observer of the activity FSM (one decision
 // function, two observers -- see the module docs).
