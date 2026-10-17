@@ -481,7 +481,11 @@ fn worker(shared: &Shared, clock: &dyn Clock, factory: Factory, wake: &Wake) {
                     }
                     Err(_) => {
                         restore_collector_part(&mut scratch.parts, &parts, id);
-                        health[id.index()] = health[id.index()].after_error(tick);
+                        // `after_error` schedules relative to the tick passed in. The
+                        // current tick is still in progress here, so anchor the
+                        // backoff at the completed tick to leave the full interval
+                        // before a retry is eligible.
+                        health[id.index()] = health[id.index()].after_error(tick.saturating_add(1));
                     }
                 }
                 sampled.insert(id);
