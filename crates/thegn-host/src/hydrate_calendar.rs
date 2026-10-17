@@ -530,7 +530,8 @@ fn sync_accounts_with_generation(
     let mut changed = false;
     let network_accounts = network_account_names(&accounts);
     let mut connectivity = ConnectivityEvidenceBatch::default();
-    // The sink applies database pages while this blocking thread drives the shared runtime (ms-scale).
+    // The sink applies database pages while this blocking thread drives the shared
+    // runtime (ms-scale).
     let Some(()) = thegn_svc::bg_runtime::block_on(router.list_events_each(window, &tokens, |r| {
         connectivity.observe(connectivity_evidence(
             network_accounts.contains(r.account.as_str()),
