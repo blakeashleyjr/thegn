@@ -588,18 +588,16 @@ fn setup_and_schedule_with_waker(
         let env = match thegn_svc::plugin::resolve_env(&plugin) {
             Ok(env) => env,
             Err(problem) => {
+                tracing::warn!(target: "thegn::plugin", error = %problem, "plugin refused: env secret reference");
                 refusals.push(problem);
                 continue;
             }
         };
-        resolved_envs.insert(id.clone(), env);
         let writer = match plugin.spec.mode {
             PluginMode::Resident => match spawn_session(
                 &supervisor,
                 &plugin,
-                resolved_envs
-                    .get(&id)
-                    .expect("environment resolved before spawn"),
+                &env,
                 &tx,
                 waker.as_ref().expect("runtime setup has a terminal waker"),
             ) {
@@ -621,6 +619,7 @@ fn setup_and_schedule_with_waker(
             },
             PluginMode::OneShot => None,
         };
+        resolved_envs.insert(id.clone(), env);
         loaded.push(LoadedState {
             plugin,
             negotiated,
@@ -629,8 +628,12 @@ fn setup_and_schedule_with_waker(
     }
     let mut sched = build_schedule(&loaded, now);
     for entry in &mut sched {
-        if let Some(env) = resolved_envs.get(&entry.plugin) {
-            entry.env.clone_from(env);
+        match resolved_envs.get(&entry.plugin) {
+            Some(env) => entry.env.clone_from(env),
+            None => {
+                tracing::warn!(target: "thegn::plugin", plugin = %entry.plugin, "scheduled plugin has no resolved environment; clearing child environment");
+                entry.env.clear();
+            }
         }
     }
 
@@ -646,17 +649,19 @@ fn setup_and_schedule_with_waker(
     let mut initial_runs: Vec<InitialRun> = Vec::new();
     let initial_run_ids = initial_run_ids(&loaded, &sched);
     for st in &loaded {
-        if initial_run_ids.contains(st.plugin.spec.manifest.id.as_str()) {
-            initial_runs.push(InitialRun {
-                plugin: st.plugin.spec.manifest.id.as_str().to_string(),
-                command: st.plugin.spec.command.clone(),
-                env: resolved_envs
-                    .get(st.plugin.spec.manifest.id.as_str())
-                    .expect("loaded plugin environment was resolved")
-                    .clone(),
-                cwd: st.plugin.effective_cwd(),
-                timeout: st.plugin.spec.run_timeout(),
-            });
+        let id = st.plugin.spec.manifest.id.as_str();
+        if initial_run_ids.contains(id) {
+            if let Some(env) = resolved_envs.get(id) {
+                initial_runs.push(InitialRun {
+                    plugin: id.to_string(),
+                    command: st.plugin.spec.command.clone(),
+                    env: env.clone(),
+                    cwd: st.plugin.effective_cwd(),
+                    timeout: st.plugin.spec.run_timeout(),
+                });
+            } else {
+                tracing::warn!(target: "thegn::plugin", plugin = %id, "initial run skipped because plugin environment is unresolved");
+            }
         }
     }
     drop(resolved_envs);
@@ -1160,6 +1165,10 @@ mod tests {
         );
 
         assert!(matches!(rx.try_recv().unwrap(), PluginMsg::Loaded(_)));
+        assert!(matches!(
+            rx.try_recv().unwrap(),
+            PluginMsg::OneShot { plugin, run: Ok(_) } if plugin == "hello"
+        ));
         assert_eq!(std::fs::read_to_string(marker).unwrap(), "s3cr3t");
         assert!(rx.try_recv().is_err());
     }

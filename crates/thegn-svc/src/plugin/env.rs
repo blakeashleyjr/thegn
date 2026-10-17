@@ -29,22 +29,42 @@ fn resolve_env_with(
             continue;
         }
         if plugin.dir.is_some() {
-            return Err(refusal(id, key, &reference));
+            return Err(directory_refusal(id, key, &reference));
         }
         if !reference.is_configured() {
-            return Err(refusal(id, key, &reference));
+            return Err(empty_refusal(id, key, &reference));
         }
         match resolve(&reference, &consumer) {
             Some(value) => {
                 env.insert(key.clone(), value);
             }
-            None => return Err(refusal(id, key, &reference)),
+            None => return Err(unresolved_refusal(id, key, &reference)),
         }
     }
     Ok(env)
 }
 
-fn refusal(plugin: &str, key: &str, reference: &SecretRef) -> SpecProblem {
+fn directory_refusal(plugin: &str, key: &str, reference: &SecretRef) -> SpecProblem {
+    SpecProblem {
+        plugin: plugin.to_string(),
+        problem: format!(
+            "refused: env {key}: secret reference {} in plugin.toml is not allowed; only a [[plugins]] entry in your config may use keyring:/env:/file: references. Move the env value to a [[plugins]] entry; plugin not started",
+            reference.audit_name()
+        ),
+    }
+}
+
+fn empty_refusal(plugin: &str, key: &str, reference: &SecretRef) -> SpecProblem {
+    SpecProblem {
+        plugin: plugin.to_string(),
+        problem: format!(
+            "refused: env {key}: secret reference {} has an empty name; set the variable/account/path or remove the entry; plugin not started",
+            reference.audit_name()
+        ),
+    }
+}
+
+fn unresolved_refusal(plugin: &str, key: &str, reference: &SecretRef) -> SpecProblem {
     SpecProblem {
         plugin: plugin.to_string(),
         problem: format!(
@@ -125,6 +145,7 @@ mod tests {
         };
         assert!(empty_problem.problem.contains("API_TOKEN"));
         assert!(empty_problem.problem.contains("env:"));
+        assert!(empty_problem.problem.contains("empty"));
     }
 
     #[test]
@@ -143,6 +164,8 @@ mod tests {
         assert_eq!(problem.plugin, "hello");
         assert!(problem.problem.contains("TOKEN"));
         assert!(problem.problem.contains("keyring:work"));
+        assert!(problem.problem.contains("plugin.toml"));
+        assert!(problem.problem.contains("[[plugins]]"));
     }
 
     #[test]
