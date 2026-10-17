@@ -1,8 +1,8 @@
 //! Weather refreshing, off the event loop.
 //!
 //! Threading contract: the whole pass — the cache read *and* the network round
-//! trip — rides one blocking task, which builds its own current-thread runtime
-//! *inside* itself (the [`crate::hydrate_calendar`] pattern) and pulses the
+//! trip — rides one blocking task, which uses the shared
+//! [`thegn_svc::bg_runtime`] current-thread runtime and pulses the
 //! [`TerminalWaker`] once per delivery.
 //!
 //! Three rules differ from the other refreshers and are each easy to get wrong:
@@ -115,25 +115,21 @@ fn poll(
         return;
     };
     let provider_id = provider.provider_id();
-    let rt = match tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-    {
-        Ok(rt) => rt,
-        Err(e) => {
+    let result = match thegn_svc::bg_runtime::block_on(provider.fetch()) {
+        Some(result) => result,
+        None => {
             // Practically unreachable (an fd/thread exhaustion), but silence
             // here would be indistinguishable from "the service was quiet" —
             // and the cached reading has already been delivered, so the only
             // cost of saying so is one log line.
             tracing::debug!(
                 target: "thegn::weather",
-                error = %e,
                 "no runtime for the weather fetch; keeping the cached reading"
             );
             return;
         }
     };
-    match rt.block_on(provider.fetch()) {
+    match result {
         Ok(snap) => {
             if !crate::hydrate_schedule::generation_is_current(generation.as_ref()) {
                 return;

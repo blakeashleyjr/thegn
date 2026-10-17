@@ -902,37 +902,22 @@ impl SidebarState {
 mod tests {
     use super::*;
     use crate::hydrate::build_initial_model;
-    use crate::run::{SidebarOutcome, now_secs};
+    use crate::run::SidebarOutcome;
     use crate::session::{GroupKind, Session, WorktreeGroup};
     use crate::sidebar::SortMode;
-    use crate::testenv::ENV_LOCK;
     use termwiz::input::{KeyCode, Modifiers};
 
     /// Isolate the user DB: the move helpers open it to persist `position`
     /// swaps. The swap no-ops on the throwaway `/tmp` paths — the tests assert
     /// the in-memory reorder, which is the user-visible part.
     struct DbGuard {
-        home: std::path::PathBuf,
-        _lock: std::sync::MutexGuard<'static, ()>,
+        _state: crate::testenv::IsolatedState,
     }
     impl DbGuard {
-        fn new(tag: &str) -> Self {
-            let lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-            let home = std::env::temp_dir().join(format!(
-                "thegn-reorder-{tag}-{}-{}",
-                std::process::id(),
-                now_secs()
-            ));
-            // SAFETY: guarded by ENV_LOCK; cleared on drop.
-            unsafe { std::env::set_var("XDG_STATE_HOME", &home) };
-            Self { home, _lock: lock }
-        }
-    }
-    impl Drop for DbGuard {
-        fn drop(&mut self) {
-            // SAFETY: still under ENV_LOCK for this guard's lifetime.
-            unsafe { std::env::remove_var("XDG_STATE_HOME") };
-            let _ = std::fs::remove_dir_all(&self.home); // best-effort: cleanup: the target may already be gone; a failed removal never fails the caller
+        fn new(_tag: &str) -> Self {
+            Self {
+                _state: crate::testenv::IsolatedState::new(),
+            }
         }
     }
 

@@ -1,6 +1,4 @@
-//! Weather-seam unit tests. **Nothing here touches the network** — the seam's
-//! one round trip is exercised by the pure URL builder and by the error
-//! classification, exactly as the probe contract requires of a cheap check.
+//! Weather-seam unit tests. No live network; one loopback test checks connection reuse.
 
 use super::wttr_in::url_for;
 use super::*;
@@ -139,4 +137,57 @@ fn errors_never_carry_the_location() {
         // …and never the URL it was built into either.
         assert!(!msg.contains("wttr.in"), "error leaked the URL: {msg}");
     }
+}
+
+#[test]
+fn consecutive_fetches_reuse_one_connection() {
+    use axum::extract::ConnectInfo;
+    use std::collections::HashSet;
+    use std::net::{SocketAddr, TcpListener};
+    use std::sync::{Arc, Mutex};
+
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let address = listener.local_addr().unwrap();
+    let peers = Arc::new(Mutex::new(HashSet::<SocketAddr>::new()));
+    let route_peers = Arc::clone(&peers);
+    let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
+    let server_thread = std::thread::spawn(move || {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async move {
+            let listener = tokio::net::TcpListener::from_std(listener).unwrap();
+            let app = axum::Router::new().fallback(axum::routing::any(
+                move |ConnectInfo(peer): ConnectInfo<SocketAddr>| {
+                    let route_peers = Arc::clone(&route_peers);
+                    async move {
+                        route_peers.lock().unwrap().insert(peer);
+                        (axum::http::StatusCode::OK, "{}")
+                    }
+                },
+            ));
+            axum::serve(
+                listener,
+                app.into_make_service_with_connect_info::<SocketAddr>(),
+            )
+            .with_graceful_shutdown(async move {
+                shutdown_rx.await.unwrap();
+            })
+            .await
+            .unwrap();
+        });
+    });
+
+    let base = format!("http://{address}/").leak();
+    for _ in 0..2 {
+        let backend = wttr_in::WttrInBackend::with_base(&cfg("Oslo"), Units::Metric, base);
+        let result = crate::bg_runtime::block_on(backend.fetch()).expect("shared runtime");
+        assert!(matches!(result, Err(WeatherError::Parse(_))));
+    }
+
+    shutdown_tx.send(()).unwrap();
+    server_thread.join().unwrap();
+    assert_eq!(peers.lock().unwrap().len(), 1);
 }

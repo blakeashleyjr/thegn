@@ -135,6 +135,9 @@ sandboxing — each with the gate that enforces it. Behavioural contracts are
   thread with `thegn_core::thread_name::spawn_named` (`thegn-` prefix, at most
   15 bytes, the Linux comm limit) and call `qos::set_self` first; a bare
   production `thread::spawn` fails `test/thread-name-<crate>-ratchet.txt`.
+  A thread whose caller waits on it synchronously (such as attach input or a
+  keyring lookup) declares `Interactive` explicitly; `qos::set_self` must be
+  the first statement after `spawn_named(`.
 
 ## Source map
 

@@ -2269,10 +2269,8 @@ mod tests {
 
     #[test]
     fn destroy_waits_for_detached_session_end_before_removing_worktree() {
+        let _state = crate::testenv::IsolatedState::new();
         let base = tempfile::tempdir().unwrap();
-        let state_home = base.path().join("state");
-        let _env =
-            crate::testenv::EnvVarGuard::set(&[("XDG_STATE_HOME", state_home.to_str().unwrap())]);
         let root = base.path().join("repo");
         let worktree = base.path().join("feature");
         std::fs::create_dir_all(&root).unwrap();
@@ -2359,13 +2357,7 @@ mod tests {
 
     #[test]
     fn waiting_post_create_failure_blocks_create_pipeline() {
-        let state_home = std::env::temp_dir().join(format!(
-            "tg-lifecycle-post-wait-state-{}-{}",
-            std::process::id(),
-            thegn_core::util::now()
-        ));
-        let _env =
-            crate::testenv::EnvVarGuard::set(&[("XDG_STATE_HOME", state_home.to_str().unwrap())]);
+        let _state = crate::testenv::IsolatedState::new();
         let dir = tempfile::tempdir().unwrap();
         let mut cfg = Config::default();
         cfg.hooks.post_create = vec![thegn_core::hooks::HookEntry::Spec(
@@ -2393,12 +2385,7 @@ mod tests {
 
     #[test]
     fn rollback_removes_branch_when_add_left_no_checkout() {
-        let state_home = std::env::temp_dir().join(format!(
-            "tg-lifecycle-rollback-state-{}",
-            std::process::id()
-        ));
-        let _env =
-            crate::testenv::EnvVarGuard::set(&[("XDG_STATE_HOME", state_home.to_str().unwrap())]);
+        let _state = crate::testenv::IsolatedState::new();
         let root = std::env::temp_dir().join(format!(
             "tg-lifecycle-rollback-repo-{}-{}",
             std::process::id(),
@@ -2424,10 +2411,7 @@ mod tests {
 
     #[test]
     fn add_failure_preserves_primary_error_after_force_cleanup() {
-        let state_home =
-            std::env::temp_dir().join(format!("tg-lifecycle-add-state-{}", std::process::id()));
-        let _env =
-            crate::testenv::EnvVarGuard::set(&[("XDG_STATE_HOME", state_home.to_str().unwrap())]);
+        let _state = crate::testenv::IsolatedState::new();
         let root = std::env::temp_dir().join(format!(
             "tg-lifecycle-add-repo-{}-{}",
             std::process::id(),
