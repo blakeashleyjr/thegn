@@ -303,7 +303,10 @@ impl<F: HwmonFs> HwmonCollector<F> {
             });
             let mut seen_channels =
                 Vec::<(crate::collect::model::hwmon::SensorKind, u16, &'static str)>::new();
-            let mut metadata = std::collections::HashMap::new();
+            let mut metadata = std::collections::HashMap::<
+                (crate::collect::model::hwmon::SensorKind, u16),
+                _,
+            >::new();
             for (kind, channel, suffix, role, path) in candidates {
                 let selector = match kind {
                     crate::collect::model::hwmon::SensorKind::Power => "_average",
