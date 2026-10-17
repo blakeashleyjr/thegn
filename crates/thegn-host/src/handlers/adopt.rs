@@ -74,6 +74,8 @@ pub(crate) enum DropReason {
     /// The named worktree is not a resident group — the user is in another
     /// workspace, and grafting across one would need a cold resurrect.
     NoGroup(String),
+    /// The named worktree is in the optimistic-delete window.
+    PendingDelete(String),
 }
 
 /// Decide what to do with one claimed row. Pure.
@@ -128,6 +130,23 @@ pub(crate) fn plan(
     }
 }
 
+/// Drop grafts targeting paths whose destroy worker is still running.
+pub(crate) fn refuse_pending_grafts(
+    plan: AdoptPlan,
+    groups: &[String],
+    deleting: &std::collections::HashSet<String>,
+) -> AdoptPlan {
+    let AdoptPlan::Graft { group, .. } = &plan else {
+        return plan;
+    };
+    groups
+        .get(*group)
+        .filter(|path| deleting.contains(*path))
+        .map_or(plan.clone(), |path| {
+            AdoptPlan::Drop(DropReason::PendingDelete(path.clone()))
+        })
+}
+
 /// Apply every claimed `adopt_session` row. Returns `true` when the frame
 /// changed.
 ///
@@ -174,16 +193,26 @@ pub(crate) fn apply(
     let mut adopted = 0usize;
     let mut focus_to: Option<usize> = None;
     for row in rows {
-        match plan(&row, now_secs, &live_sessions, &groups, session.active) {
+        let plan = plan(&row, now_secs, &live_sessions, &groups, session.active);
+        match refuse_pending_grafts(plan, &groups, &sb.deleting) {
             AdoptPlan::Drop(reason) => {
                 tracing::debug!(
                     target: "thegn::daemon",
                     intent = row.id, ?reason,
                     "adopt_session intent dropped"
                 );
-                if let DropReason::NoGroup(wt) = reason {
-                    model.status = format!("adopt: {wt} is not open here — session left headless");
-                    changed = true;
+                match reason {
+                    DropReason::NoGroup(wt) => {
+                        model.status =
+                            format!("adopt: {wt} is not open here — session left headless");
+                        changed = true;
+                    }
+                    DropReason::PendingDelete(path) => {
+                        model.status =
+                            format!("adopt: {path} is being deleted — session left headless");
+                        changed = true;
+                    }
+                    _ => {}
                 }
             }
             AdoptPlan::Graft {
@@ -325,6 +354,35 @@ mod tests {
                 focus: true,
                 tab: false
             }
+        );
+    }
+
+    #[test]
+    fn graft_into_a_pending_worktree_is_dropped() {
+        let pending_path = "/wt/b".to_string();
+        let pending = std::collections::HashSet::from([pending_path.clone()]);
+        let graft = plan(
+            &row(r#"{"session":"s1","worktree":"/wt/b","focus":true}"#, 100),
+            100,
+            &[],
+            &groups(),
+            0,
+        );
+        assert_eq!(
+            refuse_pending_grafts(graft, &groups(), &pending),
+            AdoptPlan::Drop(DropReason::PendingDelete(pending_path))
+        );
+
+        let other = plan(
+            &row(r#"{"session":"s2","worktree":"/wt/a"}"#, 100),
+            100,
+            &[],
+            &groups(),
+            0,
+        );
+        assert_eq!(
+            refuse_pending_grafts(other.clone(), &groups(), &pending),
+            other
         );
     }
 

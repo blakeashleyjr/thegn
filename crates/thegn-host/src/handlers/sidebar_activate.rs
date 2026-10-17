@@ -13,6 +13,7 @@ use crate::run::{
 pub(crate) enum Activation {
     Landed { workspace_switched: bool },
     Pending(crate::workspace_switch_prep::SwitchRequestSpec),
+    Refused,
     Failed,
 }
 
@@ -66,6 +67,15 @@ pub(crate) fn activate_row_target(
         &termwiz::terminal::TerminalWaker,
     )>,
 ) -> Activation {
+    if let Some(reason) = crate::handlers::worktree_delete::pending_target_refusal(
+        &target,
+        session,
+        &model.sidebar_db_worktrees,
+        &sb.deleting,
+    ) {
+        model.status = reason;
+        return Activation::Refused;
+    }
     // Set when this activation switched to a different workspace, so the caller
     // can kick an immediate model hydration (the new workspace's worktree paths
     // aren't in `model.sidebar_status` yet — without this the git glyphs blank
@@ -229,6 +239,36 @@ mod tests {
     use super::*;
     use crate::session::{GroupKind, Session, WorktreeGroup};
 
+    fn activate_for_test(
+        target: crate::sidebar::RowTarget,
+        session: &mut Session,
+        model: &mut FrameModel,
+        sb: &mut SidebarState,
+    ) -> Activation {
+        let (tx, _rx) = tokio::sync::mpsc::channel(1);
+        let mut need_relayout = false;
+        let mut clear_on_next_frame = false;
+        activate_row_target(
+            target,
+            session,
+            model,
+            sb,
+            &mut Panes::new(tx),
+            &mut DrawerRuntime::default(),
+            &mut WorkspacePool::default(),
+            &thegn_core::config::Config::default(),
+            Rect {
+                x: 0,
+                y: 0,
+                cols: 80,
+                rows: 24,
+            },
+            &mut need_relayout,
+            &mut clear_on_next_frame,
+            None,
+        )
+    }
+
     #[test]
     fn resident_terminal_lookup_does_not_match_same_named_worktree() {
         let session = Session {
@@ -295,5 +335,102 @@ mod tests {
         );
         assert!(matches!(activation, Activation::Pending(_)));
         assert_eq!(session.id, before);
+    }
+
+    #[test]
+    fn notification_jump_to_a_pending_worktree_is_refused() {
+        let mut session = Session {
+            id: "/repo".into(),
+            worktrees: vec![
+                WorktreeGroup::new("app/home", GroupKind::Home, "/tmp/home"),
+                WorktreeGroup::new("app/branch", GroupKind::Branch, "/tmp/branch"),
+            ],
+            active: 0,
+        };
+        let notification = thegn_core::notification::Notification {
+            id: 1,
+            kind: thegn_core::notification::NotificationKind::Mentioned,
+            source_ref: "issue:THE-1".into(),
+            message: "attention".into(),
+            created_at_ms: 0,
+            read: false,
+            worktree_path: "/tmp/branch".into(),
+        };
+        let groups: Vec<(String, usize)> = session
+            .worktrees
+            .iter()
+            .enumerate()
+            .map(|(index, group)| (group.path.clone(), index))
+            .collect();
+        let crate::handlers::take_me_there::NotificationTarget::Jump(target) =
+            crate::handlers::take_me_there::notification_target(&notification, &groups, &[])
+        else {
+            panic!("notification should resolve to a worktree target");
+        };
+        assert!(matches!(target, crate::sidebar::RowTarget::Tab(1, _)));
+
+        let mut model = FrameModel::default();
+        let mut sb = SidebarState::default();
+        sb.deleting.insert("/tmp/branch".into());
+        let activation = activate_for_test(target, &mut session, &mut model, &mut sb);
+
+        assert!(matches!(activation, Activation::Refused));
+        assert_eq!(session.active, 0);
+        assert_eq!(model.status, "'app/branch' is being deleted");
+    }
+
+    #[test]
+    fn named_switch_to_a_pending_group_in_this_workspace_is_refused() {
+        let mut session = Session {
+            id: "/repo".into(),
+            worktrees: vec![
+                WorktreeGroup::new("app/home", GroupKind::Home, "/tmp/home"),
+                WorktreeGroup::new("app/branch", GroupKind::Branch, "/tmp/branch"),
+            ],
+            active: 0,
+        };
+        let mut model = FrameModel::default();
+        let mut sb = SidebarState::default();
+        sb.deleting.insert("/tmp/branch".into());
+        let activation = activate_for_test(
+            crate::sidebar::RowTarget::Workspace {
+                repo_path: session.id.clone(),
+                group: Some("app/branch".into()),
+            },
+            &mut session,
+            &mut model,
+            &mut sb,
+        );
+
+        assert!(matches!(activation, Activation::Refused));
+        assert_eq!(session.active, 0);
+        assert_eq!(model.status, "'app/branch' is being deleted");
+    }
+
+    #[test]
+    fn non_pending_activation_still_lands() {
+        let mut session = Session {
+            id: "/repo".into(),
+            worktrees: vec![
+                WorktreeGroup::new("app/home", GroupKind::Home, "/tmp/home"),
+                WorktreeGroup::new("app/branch", GroupKind::Branch, "/tmp/branch"),
+            ],
+            active: 0,
+        };
+        let mut model = FrameModel::default();
+        let mut sb = SidebarState::default();
+        sb.deleting.insert("/tmp/not-this-branch".into());
+        let activation = activate_for_test(
+            crate::sidebar::RowTarget::Workspace {
+                repo_path: session.id.clone(),
+                group: Some("app/branch".into()),
+            },
+            &mut session,
+            &mut model,
+            &mut sb,
+        );
+
+        assert!(matches!(activation, Activation::Landed { .. }));
+        assert_eq!(session.active, 1);
     }
 }
