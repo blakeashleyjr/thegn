@@ -132,7 +132,9 @@ fn fixture(level: UnicodeLevel, depth: ColorDepth) -> (CellGrid, Surface) {
     });
     let mut surface = Surface::new(48, 10);
     let mut emitter = emit::Emitter::default();
-    emitter.emit(&grid, Rect::full(48, 10), &mut surface, 0, 0);
+    caps::test_override::with_color(depth, || {
+        emitter.emit(&grid, Rect::full(48, 10), &mut surface, 0, 0);
+    });
     (grid, surface)
 }
 
@@ -140,7 +142,12 @@ fn rows(surface: &mut Surface) -> Vec<String> {
     surface
         .screen_cells()
         .iter()
-        .map(|row| row.iter().map(|cell| cell.str()).collect())
+        .map(|row| {
+            row.iter()
+                .filter(|cell| cell.width() != 0)
+                .map(|cell| cell.str())
+                .collect()
+        })
         .collect()
 }
 
@@ -587,13 +594,17 @@ fn table_window_sort_selection_and_dot_zero_are_visible() {
             fmt,
         },
     );
+    let header = (0..16)
+        .filter_map(|x| grid.get(x, 0))
+        .map(|cell| cell.ch)
+        .collect::<String>();
     let row = (0..16)
         .filter_map(|x| grid.get(x, 1))
         .map(|cell| cell.ch)
         .collect::<String>();
     assert!(row.contains("one"));
     assert!(!row.contains("zero"));
-    assert!(row.contains(caps::glyph(Glyph::SortAsc)));
+    assert!(header.contains(caps::glyph(Glyph::SortAsc)));
     assert_eq!(
         grid.get(0, 1).map(|cell| cell.bg),
         StyleTok::from_tok(Tok::Series(SeriesRole::Selected))
