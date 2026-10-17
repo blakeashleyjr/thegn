@@ -990,16 +990,9 @@ mod tests {
 
     /// THE-515 fixture: a real git repo named `acme` plus an isolated state
     /// dir, and a config whose trusted overlay for it is ambiguous.
-    fn refused_acme() -> (
-        crate::testenv::EnvVarGuard,
-        tempfile::TempDir,
-        std::path::PathBuf,
-    ) {
-        let dir = tempfile::tempdir().unwrap();
-        let state = dir.path().join("state");
-        std::fs::create_dir_all(&state).unwrap();
-        let env = crate::testenv::EnvVarGuard::set(&[("XDG_STATE_HOME", state.to_str().unwrap())]);
-        let repo = dir.path().join("acme");
+    fn refused_acme() -> (crate::testenv::IsolatedState, std::path::PathBuf) {
+        let state = crate::testenv::IsolatedState::new();
+        let repo = state.root().join("acme");
         std::fs::create_dir_all(&repo).unwrap();
         #[expect(clippy::disallowed_methods)]
         let ok = thegn_core::util::git_cmd(&repo)
@@ -1008,12 +1001,12 @@ mod tests {
             .unwrap()
             .success();
         assert!(ok);
-        (env, dir, repo)
+        (state, repo)
     }
 
     #[test]
     fn drive_refuses_an_ambiguous_overlay_before_any_forge_work() {
-        let (_env, _dir, repo) = refused_acme();
+        let (_state, repo) = refused_acme();
         let mut cfg = Config::default();
         cfg.pr_queue.enabled = true;
         cfg.workspace.insert("acme".into(), Default::default());
@@ -1031,7 +1024,7 @@ mod tests {
     #[test]
     fn drive_honours_the_repo_resolved_enabled_flag() {
         // Ticker armed on the GLOBAL flag; the repo's own block turned it off.
-        let (_env, dir, repo) = refused_acme();
+        let (state, repo) = refused_acme();
         let mut cfg = Config::default();
         cfg.pr_queue.enabled = true;
         let mut ws = thegn_core::config::WorkspaceConfig::default();
@@ -1048,7 +1041,7 @@ mod tests {
         // The pass stopped before touching state (the old code opened the DB
         // and walked the queue rows toward the forge).
         assert!(
-            !dir.path().join("state/thegn/thegn.db").exists(),
+            !state.state_home().join("thegn/thegn.db").exists(),
             "a repo-disabled PR queue must not start a drive pass"
         );
     }

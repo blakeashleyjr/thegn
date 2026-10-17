@@ -1472,18 +1472,13 @@ mod tests {
     fn build_panel_follows_every_change_while_reusing_snapshots() {
         use crate::panel::Stage;
         let base = scratch("panel");
-        let state = base.join("state");
-        std::fs::create_dir_all(state.join("thegn")).unwrap();
         // Hermetic git global layer: never read the real ~/.gitconfig, system
         // config, or injected GIT_CONFIG_* of the machine running the test.
         let ghome = base.join("ghome");
         std::fs::create_dir_all(&ghome).unwrap();
         let gsys = base.join("gitconfig-system");
         std::fs::write(&gsys, "").unwrap();
-        let _env = crate::testenv::EnvVarGuard::set(&[
-            ("XDG_STATE_HOME", state.to_str().unwrap()),
-            ("HOME", ghome.to_str().unwrap()),
-            ("XDG_CONFIG_HOME", ghome.join("xdg").to_str().unwrap()),
+        let state = crate::testenv::IsolatedState::with_env(&[
             (
                 "GIT_CONFIG_GLOBAL",
                 ghome.join(".gitconfig").to_str().unwrap(),
@@ -1493,7 +1488,8 @@ mod tests {
             ("GIT_CONFIG_COUNT", "0"),
             ("GIT_CONFIG_PARAMETERS", ""),
         ]);
-        let db = thegn_core::db::Db::open_at(&state.join("thegn/thegn.db")).unwrap();
+        std::fs::create_dir_all(state.state_home().join("thegn")).unwrap();
+        let db = thegn_core::db::Db::open_at(&state.state_home().join("thegn/thegn.db")).unwrap();
         let cfg = thegn_core::config::Config::default();
         let hints = crate::hydrate::HydrateHints::default();
         let r = repo(&base, "r", true);
@@ -2044,17 +2040,13 @@ mod tests {
         });
     }
 
-    fn panel_test_env(base: &Path, state: &Path) -> crate::testenv::EnvVarGuard {
+    fn panel_test_env(base: &Path) -> crate::testenv::IsolatedState {
         let ghome = base.join("ghome");
         std::fs::create_dir_all(&ghome).unwrap();
         let gsys = base.join("gitconfig-system");
         std::fs::write(&gsys, "").unwrap();
-        let xdg_config = ghome.join("xdg");
         let global_config = ghome.join(".gitconfig");
-        crate::testenv::EnvVarGuard::set(&[
-            ("XDG_STATE_HOME", state.to_str().unwrap()),
-            ("HOME", ghome.to_str().unwrap()),
-            ("XDG_CONFIG_HOME", xdg_config.to_str().unwrap()),
+        crate::testenv::IsolatedState::with_env(&[
             ("GIT_CONFIG_GLOBAL", global_config.to_str().unwrap()),
             ("GIT_CONFIG_SYSTEM", gsys.to_str().unwrap()),
             ("GIT_CONFIG_NOSYSTEM", "0"),
@@ -2066,10 +2058,9 @@ mod tests {
     #[test]
     fn build_panel_hides_pipeline_artifacts_but_keeps_source_and_hooks() {
         let base = scratch("panel-pipeline");
-        let state = base.join("state");
-        std::fs::create_dir_all(state.join("thegn")).unwrap();
-        let _env = panel_test_env(&base, &state);
-        let db = thegn_core::db::Db::open_at(&state.join("thegn/thegn.db")).unwrap();
+        let state = panel_test_env(&base);
+        std::fs::create_dir_all(state.state_home().join("thegn")).unwrap();
+        let db = thegn_core::db::Db::open_at(&state.state_home().join("thegn/thegn.db")).unwrap();
         let cfg = thegn_core::config::Config::default();
         let hints = crate::hydrate::HydrateHints::default();
         let r = repo(&base, "r", true);

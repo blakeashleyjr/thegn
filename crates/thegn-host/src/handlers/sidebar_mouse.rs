@@ -2147,10 +2147,7 @@ mod tests {
     #[test]
     fn clicking_the_header_layout_chip_toggles_flat() {
         let (mut model, rect) = fixture();
-        let dir = std::env::temp_dir().join(format!("thegn-layout-chip-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir); // best-effort: cleanup: the target may already be gone; a failed removal never fails the caller
-        std::fs::create_dir_all(&dir).unwrap();
-        let _env = crate::testenv::EnvVarGuard::set(&[("XDG_STATE_HOME", dir.to_str().unwrap())]);
+        let _state = crate::testenv::IsolatedState::new();
 
         let mut sb = SidebarState::default();
         let session = crate::session::Session::default();
@@ -2191,7 +2188,6 @@ mod tests {
             .unwrap();
         press(&mut sb, &mut model, lx - 1);
         assert!(!sb.view.flat);
-        let _ = std::fs::remove_dir_all(&dir); // best-effort: cleanup: the target may already be gone; a failed removal never fails the caller
     }
 
     #[test]
@@ -2203,10 +2199,7 @@ mod tests {
         // itself. The toggle path persists to the DB, so isolate
         // `XDG_STATE_HOME`.
         let (model, rect) = fixture();
-        let dir = std::env::temp_dir().join(format!("thegn-the64-caret-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir); // best-effort: cleanup: the target may already be gone; a failed removal never fails the caller
-        std::fs::create_dir_all(&dir).unwrap();
-        let _env = crate::testenv::EnvVarGuard::set(&[("XDG_STATE_HOME", dir.to_str().unwrap())]);
+        let _state = crate::testenv::IsolatedState::new();
 
         let visible: Vec<&SidebarRow> = model.sidebar_rows.iter().filter(|r| r.visible).collect();
         let hits = hit_rows(&model, rect);

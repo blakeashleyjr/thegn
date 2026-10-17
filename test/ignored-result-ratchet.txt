@@ -226,7 +226,6 @@ crates/thegn-host/src/handlers/sidebar_folder.rs
 crates/thegn-host/src/handlers/sidebar_keys.rs
 crates/thegn-host/src/handlers/sidebar_mouse.rs
 crates/thegn-host/src/handlers/sidebar_persist.rs
-crates/thegn-host/src/handlers/sidebar_reorder.rs
 # THE-29: the async pane-fork request pulses the compositor waker best-effort;
 # the daemon result remains authoritative and a failed pulse only delays UI
 # refresh.
@@ -241,7 +240,6 @@ crates/thegn-host/src/handlers/wizard.rs
 crates/thegn-host/src/handlers/workspace_remove.rs
 # thegn-attach probe tests only (`#[cfg(test)]`): scratch temp-dir teardown
 # and a socket file a fresh bind replaces. Annotated `// best-effort:` in-file.
-crates/thegn-host/src/handlers/worktree_attach.rs
 crates/thegn-host/src/handlers/worktree_rename.rs
 crates/thegn-host/src/help/ratchet_tests.rs
 crates/thegn-host/src/help/render.rs

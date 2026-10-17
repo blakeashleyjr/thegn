@@ -307,14 +307,8 @@ impl NewWorktreeWizard {
     /// the isolated state home only needs to live for this call.
     #[cfg(test)]
     pub(crate) fn new_isolated_for_test(repo_root: PathBuf, cfg: &Config) -> Self {
-        let dir = tempfile::tempdir().unwrap();
-        let state_home = dir.path().join("state");
-        let state_home = state_home.to_string_lossy().into_owned();
-        let _env = crate::testenv::EnvVarGuard::set(&[
-            ("XDG_STATE_HOME", &state_home),
-            ("LOCALAPPDATA", &state_home),
-        ]);
-        assert_eq!(thegn_core::util::xdg_state_home(), Path::new(&state_home));
+        let state = crate::testenv::IsolatedState::new();
+        assert!(thegn_core::util::xdg_state_home().starts_with(state.root()));
         Self::new(repo_root, cfg)
     }
 
@@ -1684,12 +1678,8 @@ mod tests {
 
     #[test]
     fn hook_workspace_slug_without_worker_path_uses_isolated_default() {
-        let dir = tempfile::tempdir().unwrap();
-        let state = dir.path().join("state");
-        let state = state.to_str().unwrap();
-        let _env =
-            crate::testenv::EnvVarGuard::set(&[("XDG_STATE_HOME", state), ("LOCALAPPDATA", state)]);
-        let root = dir.path().join("same-name");
+        let state = crate::testenv::IsolatedState::new();
+        let root = state.root().join("same-name");
         std::fs::create_dir_all(&root).unwrap();
         let db = Db::open().unwrap();
         db.slug_for_repo("/another/same-name", "same-name").unwrap();
@@ -1790,12 +1780,7 @@ mod tests {
         cmds: Vec<WizardCmd>,
         db_path: &Path,
     ) -> Vec<CreateEvent> {
-        let state_home = repo.join("state");
-        let state_home = state_home.to_string_lossy().into_owned();
-        let _env = crate::testenv::EnvVarGuard::set(&[
-            ("XDG_STATE_HOME", &state_home),
-            ("LOCALAPPDATA", &state_home),
-        ]);
+        let _state = crate::testenv::IsolatedState::new();
         let (cmd_tx, cmd_rx) = std::sync::mpsc::channel();
         for c in cmds {
             cmd_tx.send(c).unwrap();
