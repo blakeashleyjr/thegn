@@ -152,74 +152,77 @@ fn have(program: &str) -> bool {
 }
 
 fn detected() -> Option<Player> {
-    #[cfg(target_os = "macos")]
-    if have("afplay") {
-        return Some(Player {
-            id: "afplay",
-            program: "afplay",
-            args: &[],
-            formats: &["wav", "aiff", "caf", "m4a"],
-            volume: false,
-            powershell: false,
-        });
-    }
-
     #[cfg(windows)]
     {
-        return Some(Player {
+        Some(Player {
             id: "powershell",
             program: "powershell",
             args: &[],
             formats: &["wav"],
             volume: false,
             powershell: true,
-        });
+        })
     }
 
-    #[cfg(not(any(target_os = "macos", windows)))]
-    for (id, program, args, formats, volume) in [
-        (
-            "pw-play",
-            "pw-play",
-            &[][..],
-            &["wav", "flac", "ogg", "mp3"][..],
-            true,
-        ),
-        (
-            "paplay",
-            "paplay",
-            &[][..],
-            &["wav", "aiff", "flac", "ogg"][..],
-            false,
-        ),
-        ("aplay", "aplay", &["-q"][..], &["wav"][..], false),
-        (
-            "ffplay",
-            "ffplay",
-            &["-nodisp", "-autoexit", "-loglevel", "quiet"][..],
-            &["wav", "aiff", "flac", "ogg", "mp3"][..],
-            false,
-        ),
-        (
-            "play",
-            "play",
-            &["-q"][..],
-            &["wav", "aiff", "flac", "ogg", "mp3"][..],
-            false,
-        ),
-    ] {
-        if have(program) {
+    #[cfg(not(windows))]
+    {
+        #[cfg(target_os = "macos")]
+        if have("afplay") {
             return Some(Player {
-                id,
-                program,
-                args,
-                formats,
-                volume,
+                id: "afplay",
+                program: "afplay",
+                args: &[],
+                formats: &["wav", "aiff", "caf", "m4a"],
+                volume: false,
                 powershell: false,
             });
         }
+
+        #[cfg(not(any(target_os = "macos", windows)))]
+        for (id, program, args, formats, volume) in [
+            (
+                "pw-play",
+                "pw-play",
+                &[][..],
+                &["wav", "flac", "ogg", "mp3"][..],
+                true,
+            ),
+            (
+                "paplay",
+                "paplay",
+                &[][..],
+                &["wav", "aiff", "flac", "ogg"][..],
+                false,
+            ),
+            ("aplay", "aplay", &["-q"][..], &["wav"][..], false),
+            (
+                "ffplay",
+                "ffplay",
+                &["-nodisp", "-autoexit", "-loglevel", "quiet"][..],
+                &["wav", "aiff", "flac", "ogg", "mp3"][..],
+                false,
+            ),
+            (
+                "play",
+                "play",
+                &["-q"][..],
+                &["wav", "aiff", "flac", "ogg", "mp3"][..],
+                false,
+            ),
+        ] {
+            if have(program) {
+                return Some(Player {
+                    id,
+                    program,
+                    args,
+                    formats,
+                    volume,
+                    powershell: false,
+                });
+            }
+        }
+        None
     }
-    None
 }
 
 pub(crate) fn provider() -> Option<Box<dyn SoundPlayer>> {

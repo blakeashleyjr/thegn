@@ -38,9 +38,11 @@ use thegn_metrics::StatsSnapshot;
 mod build;
 mod footer;
 mod invalidation;
+mod layout;
 pub(crate) mod procs_view;
 pub(crate) mod state;
 mod tabbar;
+mod tabs;
 
 pub(crate) use state::MonitorPrefs;
 
@@ -225,7 +227,7 @@ impl MonitorTab {
     /// `[ ]` / `g` / `s` hints on.
     ///
     /// Processes and Containers emit only headings and a table (see
-    /// `build::procs`), so advertising a window, a graph style and a scale
+    /// `tabs::procs::procs`), so advertising a window, a graph style and a scale
     /// there names four keys with nothing to act on. The three toggles still
     /// *work* on those tabs — they write the same per-tab prefs — but nothing
     /// on screen moves, which is the bug.
@@ -234,25 +236,6 @@ impl MonitorTab {
             self,
             MonitorTab::Procs | MonitorTab::Containers | MonitorTab::Notifications
         )
-    }
-
-    /// Whether this machine has anything to show on the tab. A tab with no data
-    /// is worse than a missing one: it reads as broken. `has_containers` is
-    /// `!model.containers.is_empty()` — the "a container engine is present"
-    /// signal the Containers tab hides on (like GPU/Power hiding with no
-    /// device).
-    fn present(self, s: &StatsSnapshot, has_containers: bool) -> bool {
-        match self {
-            MonitorTab::Gpu => s.gpu_pct.is_some(),
-            MonitorTab::Power => s.battery.is_some(),
-            MonitorTab::Thermal => s.cpu_temp_c.is_some() || !s.temps.is_empty(),
-            MonitorTab::Disk => !s.disks.is_empty(),
-            MonitorTab::Network => s.net_bps.is_some() || !s.net_ifaces.is_empty(),
-            MonitorTab::Containers => has_containers,
-            MonitorTab::Notifications => false,
-            // CPU, Memory and Processes are always meaningful.
-            _ => true,
-        }
     }
 
     pub fn visible(s: &StatsSnapshot, has_containers: bool) -> Vec<MonitorTab> {
@@ -620,16 +603,7 @@ impl MonitorOverlay {
         // builder renders `model.containers` in), so a key resolves `sel`
         // without a model borrow.
         if self.tab == MonitorTab::Containers {
-            self.container_rows = model
-                .containers
-                .iter()
-                .map(|c| ContainerRowMeta {
-                    name: c.name.clone(),
-                    backend: c.backend.clone(),
-                    ours: c.ours,
-                    running: thegn_core::sandbox_manage::container_running(&c.status),
-                })
-                .collect();
+            self.container_rows = tabs::containers::row_meta(model);
         }
         self.clamp_sel();
         // Bind the build to a local so the immutable borrows of `self.proc_rows`
@@ -1109,29 +1083,8 @@ impl MonitorOverlay {
                 MonitorOutcome::Pending
             }
 
-            // --- Row actions (before the per-tab sort letters) ---
-            // `/` opens the incremental process filter.
-            KeyCode::Char('/') if self.tab == MonitorTab::Procs => {
-                self.filtering = true;
-                self.status = None;
-                MonitorOutcome::Pending
-            }
-            // `t` toggles process-tree grouping (persisted).
-            KeyCode::Char('t') if self.tab == MonitorTab::Procs => {
-                self.prefs.proc_tree = !self.prefs.proc_tree;
-                self.sel = 0;
-                MonitorOutcome::PrefsChanged
-            }
-            // `x` acts on the selected row: signal a process, or clean a
-            // worktree. Both open a confirmation rather than firing immediately.
-            KeyCode::Char('x') if self.tab == MonitorTab::Procs => self.begin_signal(),
-            KeyCode::Char('x') if self.tab == MonitorTab::Disk => self.begin_clean(),
-
-            // --- Per-tab (last, so it can never shadow the above) ---
-            KeyCode::Char(c) if self.tab == MonitorTab::Procs => self.proc_key(*c),
-            KeyCode::Enter if self.tab == MonitorTab::Containers => self.container_key('\r'),
-            KeyCode::Char(c) if self.tab == MonitorTab::Containers => self.container_key(*c),
-            _ => MonitorOutcome::Pending,
+            // Tab-specific keys run last so they cannot shadow global keys.
+            _ => self.tab_key(key),
         }
     }
 
@@ -1159,48 +1112,6 @@ impl MonitorOverlay {
             return;
         }
         self.scroll_by(delta);
-    }
-
-    /// Whether the active tab is a row list (so the cursor, not the viewport, is
-    /// what the navigation keys move).
-    fn is_list_tab(&self) -> bool {
-        matches!(
-            self.tab,
-            MonitorTab::Procs | MonitorTab::Disk | MonitorTab::Containers
-        )
-    }
-
-    /// How many rows the active LIST tab is showing — the single source the
-    /// cursor clamp and the navigation bound both measure against, so they can
-    /// never disagree about where the list ends.
-    fn row_len(&self) -> usize {
-        match self.tab {
-            MonitorTab::Procs => self.proc_rows.len(),
-            MonitorTab::Disk => self.disk_rows.len(),
-            MonitorTab::Containers => self.container_rows.len(),
-            MonitorTab::Notifications => 0,
-            _ => 0,
-        }
-    }
-
-    /// Processes-tab sort keys. Reached only after every global key has had its
-    /// chance.
-    fn proc_key(&mut self, c: char) -> MonitorOutcome {
-        let sort = match c {
-            'c' => ProcSort::Cpu,
-            'm' => ProcSort::Rss,
-            'n' => ProcSort::Name,
-            'p' => ProcSort::Pid,
-            '>' | '<' => self.prefs.proc_sort.next(),
-            'r' => {
-                self.prefs.proc_desc = !self.prefs.proc_desc;
-                return MonitorOutcome::PrefsChanged;
-            }
-            _ => return MonitorOutcome::Pending,
-        };
-        self.prefs.proc_sort = sort;
-        self.sel = 0;
-        MonitorOutcome::PrefsChanged
     }
 
     /// Filter-input sub-mode: edit `self.filter`, or leave it. Every key is
@@ -1271,131 +1182,6 @@ impl MonitorOverlay {
             self.status = Some("cancelled".into());
         }
         MonitorOutcome::Pending
-    }
-
-    /// Open a signal confirmation for the selected process. A second signal on
-    /// the just-TERMed pid escalates to KILL (a distinct, explicit second step).
-    fn begin_signal(&mut self) -> MonitorOutcome {
-        // Copy out of the row first so the immutable borrow of `self.proc_rows`
-        // ends before `self.confirm`/`self.status` are written.
-        let Some((pid, start_time, name, owner)) = self
-            .proc_rows
-            .get(self.sel)
-            .map(|r| (r.pid, r.start_time, r.name.clone(), r.owner))
-        else {
-            return MonitorOutcome::Pending;
-        };
-        let stage = if self.last_termed == Some((pid, start_time)) {
-            crate::platform::ProcSignal::Kill
-        } else {
-            crate::platform::ProcSignal::Terminate
-        };
-        let owner = procs_view::owner_label(owner);
-        let owner = if owner.is_empty() {
-            String::new()
-        } else {
-            format!(" ({owner})")
-        };
-        let label = format!("pid {pid} {name}{owner}");
-        self.confirm = Some(Confirm::Signal {
-            pid,
-            start_time,
-            label,
-            stage,
-        });
-        self.status = None;
-        MonitorOutcome::Pending
-    }
-
-    /// Deliver the confirmed signal, surfacing the outcome — never swallowed.
-    fn perform_signal(
-        &mut self,
-        pid: u32,
-        start_time: u64,
-        label: &str,
-        stage: crate::platform::ProcSignal,
-    ) {
-        let name = match stage {
-            crate::platform::ProcSignal::Terminate => "SIGTERM",
-            crate::platform::ProcSignal::Kill => "SIGKILL",
-        };
-        match crate::platform::signal_identity(pid, start_time, stage) {
-            Ok(()) => {
-                self.status = Some(format!("sent {name} to {label}"));
-                if stage == crate::platform::ProcSignal::Terminate {
-                    self.last_termed = Some((pid, start_time));
-                }
-            }
-            Err(crate::platform::SignalError::Changed) => {
-                self.status = Some(format!(
-                    "{label}: process changed or left the sampled list; select it again"
-                ));
-            }
-            Err(crate::platform::SignalError::Failed(error)) => {
-                self.status = Some(format!("{label}: {error}"));
-            }
-        }
-    }
-
-    /// Open a clean confirmation for the selected worktree row.
-    fn begin_clean(&mut self) -> MonitorOutcome {
-        let Some(path) = self.disk_rows.get(self.sel).map(|r| r.path.clone()) else {
-            return MonitorOutcome::Pending;
-        };
-        let label = path
-            .file_name()
-            .map(|s| s.to_string_lossy().into_owned())
-            .unwrap_or_else(|| path.display().to_string());
-        self.confirm = Some(Confirm::Clean { path, label });
-        self.status = None;
-        MonitorOutcome::Pending
-    }
-
-    /// Containers-tab row actions. Reached only after every global key; offered
-    /// only on an OWNED row (foreign containers are read-only, so their keys are
-    /// no-ops). Records the request and hands the loop [`MonitorOutcome::Action`]
-    /// — the overlay can't spawn a subprocess or open a pane itself.
-    ///
-    /// Keys: `t` stop, `r` restart, `x` remove, `o` logs, `Enter` shell-in.
-    /// (`s`/`g`/`l` are global — scale/graph/switch — so stop is `t`, not `s`.)
-    fn container_key(&mut self, c: char) -> MonitorOutcome {
-        let kind = match c {
-            't' => ContainerReqKind::Stop,
-            'r' => ContainerReqKind::Restart,
-            'x' => ContainerReqKind::Remove,
-            'o' => ContainerReqKind::Logs,
-            '\r' | '\n' => ContainerReqKind::Shell,
-            _ => return MonitorOutcome::Pending,
-        };
-        let Some(row) = self.container_rows.get(self.sel).cloned() else {
-            return MonitorOutcome::Pending;
-        };
-        // Actions are offered only on OWNED rows — foreign containers are
-        // read-only on every surface.
-        if !row.ours {
-            return MonitorOutcome::Pending;
-        }
-        // Remove is a two-press confirm; a running container gets a force
-        // warning (the "second confirmation when running" the spec calls for).
-        if kind == ContainerReqKind::Remove
-            && self.remove_armed.as_deref() != Some(row.name.as_str())
-        {
-            self.remove_armed = Some(row.name.clone());
-            self.notice = Some(if row.running {
-                format!("remove RUNNING {}? press x again to force-remove", row.name)
-            } else {
-                format!("remove {}? press x again to confirm", row.name)
-            });
-            return MonitorOutcome::Pending;
-        }
-        self.remove_armed = None;
-        self.pending_action = Some(MonitorAction::Container(ContainerRequest {
-            kind,
-            name: row.name,
-            backend: row.backend,
-            running: row.running,
-        }));
-        MonitorOutcome::Action
     }
 
     /// The loop pushes an action outcome (or immediate confirmation) here; it

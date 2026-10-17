@@ -9,11 +9,11 @@ contexts: [overlay:monitor]
 # System monitor
 
 A tabbed, live view of what this machine is doing: CPU, memory, temperature,
-network, disk, GPU, power, and processes. `Ctrl-Alt-Shift-M` opens it (the
-capital `M` in the binding is the Shift — `Ctrl-Alt-m` is the notification-mode
-cycle), or run **System monitor** from the command palette. Pressing the same
-chord again closes it, and `Ctrl-g` still toggles the key lock rather than
-dismissing the monitor.
+network, disk, GPU, power, processes, containers, and notifications.
+`Ctrl-Alt-Shift-M` opens it (the capital `M` in the binding is the Shift —
+`Ctrl-Alt-m` is the notification-mode cycle), or run **System monitor** from
+the command palette. Pressing the same chord again closes it. `Ctrl-g` still
+toggles the key lock rather than dismissing the monitor.
 
 You can also get here from the masthead. Focus the top bar with `Ctrl-↑`, walk
 to a stat chip with `←`/`→`, and press `↵` — that opens the chip's own popup;
@@ -30,10 +30,11 @@ on a GPU-less server. On a terminal too narrow for the whole strip, the bar
 scrolls to keep the active tab whole and marks the tabs scrolled off each end,
 rather than clipping the tab you are on.
 
-Tabs only appear for hardware this machine actually has — no battery means no
-Power tab, no discrete GPU means no GPU tab. A metric that disappears while
-you are looking at it (an unplugged battery, an unmounted disk) moves you to a
-tab that still has something to show.
+Tabs only appear when their source is available — no battery means no Power
+tab, and the GPU tab appears when a GPU reports utilisation. AMD cards and APUs
+use sysfs, NVIDIA uses `nvidia-smi`, and Apple silicon uses its system GPU
+reader. A metric that disappears while you are looking at it (an unplugged
+battery, an unmounted disk) moves you to a tab that still has something to show.
 
 On **Apple silicon**, temperatures come from the machine's HID thermal sensors
 rather than the SMC keys that only exist on Intel Macs — so the temperature tab
@@ -84,45 +85,39 @@ advertises only the keys the tab in front of you actually has: the graph
 toggles appear on the graph tabs, the row actions on the tab that owns them,
 and `spc` pause on every tab.
 
-## Processes
+## CPU
 
-The Processes tab lists the heaviest processes by CPU and by memory, with
-thegn's own panes and its pane daemon called out in the `owner` column.
+The CPU tab shows total and per-core utilisation as a graph, with a heat grid
+for logical cores. Its load and clock section shows 1-, 5-, and 15-minute load,
+per-core frequency, temperature, and a load sparkline. The CPU, load, frequency,
+and uptime masthead chips expand into this tab.
 
-- `c`, `m`, `n`, `p` sort by CPU, memory, name, or PID.
-- `r` reverses the sort direction.
-- `/` opens an incremental filter over process name, PID, and owner (type to
-  narrow, `Backspace` to edit, `Enter` to apply, `Esc` to clear). `Esc` backs
-  out of the filter first — it does not close the monitor while a filter is open.
-- `t` toggles a tree view grouped by the sampled parent chain. Because the tab
-  only keeps the heaviest processes, a child whose parent fell outside that set
-  is hoisted to a top-level row and marked with a leading `…`, rather than
-  hiding it or enumerating every process on the machine.
-- `x` signals the selected process — the row under the cursor, which the arrows
-  and `j`/`k` move and the view follows, so it is always a row on screen. It
-  always asks first: the confirmation names
-  the PID, process name, and owner, so a pane-owned build is recognizably
-  thegn's own. The first `x` sends a graceful terminate (SIGTERM); pressing `x`
-  again on the same process offers a hard kill (SIGKILL) as a separate,
-  explicit step. A signal that fails — no such process, permission denied — is
-  shown in the footer, never silently swallowed. This is a local, terminal-only
-  action: it is not exposed to the CLI, the control API, or any remote surface.
+## Memory
 
-Enumerating every process is the one genuinely expensive reading thegn takes, so
-it only happens while this tab is open and unpaused — closing the tab stops it
-entirely. The first sample after you open the tab shows `—` for CPU, because CPU
-is measured as a change between two readings and there is not yet a previous one.
+The Memory tab shows used, available, free when reported, and total memory; a
+swap graph appears when swap exists. It also reports thegn and daemon RSS and
+CPU, with an RSS sparkline. The memory and swap masthead chips expand into this
+tab.
 
-Processes inside a `podman` or `docker` pane are attributed to the sandbox rather
-than to the pane: the real work runs in a different PID namespace, where the host
-cannot see it. `bwrap` panes attribute normally.
+## Thermal
 
-Set `[monitor] processes = false` to disable the tab entirely, and
-`[monitor] proc_rows` to change how many rows it shows.
+The Thermal tab graphs CPU temperature and lists each available temperature
+sensor, including GPU temperature when reported. When the machine has no
+temperature sensors, the tab says so instead of showing a fabricated reading.
+The temperature masthead chip expands into this tab.
+
+## Network
+
+The Network tab graphs receive and transmit rates and lists interfaces with
+kind, state, and rates. Totals count physical links only, so VPN traffic is not
+double-counted; an “all links” row appears when that total differs from the
+physical-link total. The network masthead chip expands into this tab.
 
 ## Disk
 
-The Disk tab shows live disk I/O and per-volume free space at the top, then a
+The Disk tab shows live disk I/O and per-volume free space at the top. When
+several mount points belong to one device, `+N` means N additional mount points
+are folded into that row; I/O is counted once per physical disk. Below is a
 **worktree lane**: each worktree's total size and its reclaimable `target/`
 share, biggest first, with how long ago each was measured. The sizes come from
 the background `[disk]` scanner's cache — opening the tab never starts a `du`
@@ -140,7 +135,61 @@ heading also shows a **time-to-full projection** ("filling · full in ~2d"). It
 is deliberately conservative: with a flat or growing disk, or too little history
 to extrapolate honestly, it shows nothing rather than a confident wrong number.
 The optional `[stats.alerts] disk_eta` rule (off by default) fires off the same
-projection when the runway drops below a configured number of hours.
+projection when the runway drops below a configured number of hours. The Disk
+masthead chip expands into this tab.
+
+## GPU
+
+The GPU tab shows utilisation, memory, temperature, and power when those
+readings are available, with sparklines for the sampled metrics. On APUs, GPU
+memory is shared system memory and is labelled `gpu mem (shared)`. The GPU
+masthead chip expands into this tab.
+
+## Power
+
+The Power tab shows battery charge, power source, draw, and estimated time to
+full or empty when the source provides those readings. It appears when a
+battery source is available. The battery masthead chip expands into this tab.
+
+## Processes
+
+The Processes tab lists the heaviest processes by CPU and by memory, with
+thegn's own panes and its pane daemon called out in the `owner` column.
+
+- `c`, `m`, `n`, `p` sort by CPU, memory, name, or PID.
+- `r` reverses the sort direction.
+- `/` opens an incremental filter over process name, PID, and owner (type to
+  narrow, `Backspace` to edit, `Enter` to apply, `Esc` to clear). `Esc` backs
+  out of the filter first — it does not close the monitor while a filter is
+  open.
+- `t` toggles a tree view grouped by the sampled parent chain. Because the tab
+  only keeps the heaviest processes, a child whose parent fell outside that set
+  is hoisted to a top-level row and marked with a leading `…`, rather than
+  hiding it or enumerating every process on the machine.
+- `x` signals the selected process — the row under the cursor, which the arrows
+  and `j`/`k` move and the view follows, so it is always a row on screen. It
+  always asks first: the confirmation names
+  the PID, process name, and owner, so a pane-owned build is recognizably
+  thegn's own. The first `x` sends a graceful terminate (SIGTERM); pressing `x`
+  again on the same process offers a hard kill (SIGKILL) as a separate,
+  explicit step. A signal whose sampled process changed or left the displayed
+  list is refused with “process changed or left the sampled list; select it
+  again”. A signal that fails — no such process, permission denied — is shown
+  in the footer, never silently swallowed. This is a local, terminal-only
+  action: it is not exposed to the CLI, the control API, or any remote surface.
+
+Enumerating every process is the one genuinely expensive reading thegn takes, so
+it only happens while this tab is open and unpaused — closing the tab stops it
+entirely. The first sample after you open the tab shows `—` for CPU, because
+CPU is measured as a change between two readings and there is not yet a previous
+one.
+
+Processes inside a `podman` or `docker` pane are attributed to the sandbox
+rather than to the pane: the real work runs in a different PID namespace, where
+the host cannot see it. `bwrap` panes attribute normally.
+
+Set `[monitor] processes = false` to disable the tab entirely, and
+`[monitor] proc_rows` to change how many rows it shows.
 
 ## Containers
 
@@ -152,7 +201,8 @@ leads with the ownership split — how many are owned under that rule, how many
 are foreign — because the list deliberately includes foreign containers. On an
 engine that reports a footprint it continues with images, volumes and the
 engine's on-disk total (marked `≥` when a backend can't report disk usage);
-otherwise with how many are running. The tab only appears when a container engine is present.
+otherwise with how many are running. The tab only appears when a container
+engine is present.
 
 Sampling those per-container numbers (and the disk total) is the one expensive
 reading here, so — like Processes — it runs **only while this tab is open**;
@@ -176,7 +226,15 @@ Stop, restart and remove run off the UI loop and report their outcome as a
 toast; the row's own status catches up on the next refresh. Managing foreign
 containers is deliberately not offered — run `lazydocker`/`oxker` in a pane for
 that. Estate cleanup from the command line is `thegn sandbox gc` /
-`thegn sandbox prune` (see [[sandboxing]]).
+`thegn sandbox prune` (see [[sandboxing]]). No masthead chip expands into this
+tab.
+
+## Notifications
+
+The Notifications tab reports configured notification sinks and their kind,
+queue drops, rate drops, retries, sent messages, and dead letters. It appears
+when a sink is configured or a notification counter has been reported. No
+masthead chip expands into this tab.
 
 ## Pipeline
 

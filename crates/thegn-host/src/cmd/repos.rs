@@ -252,10 +252,8 @@ mod tests {
 
     #[test]
     fn repo_trust_lists_approves_and_executes_pending_hook() {
-        let state_home =
-            std::env::temp_dir().join(format!("tg-repo-trust-hook-state-{}", std::process::id()));
-        let state_home_s = state_home.to_string_lossy().into_owned();
-        let _env = crate::testenv::EnvVarGuard::set(&[("XDG_STATE_HOME", &state_home_s)]);
+        let state = crate::testenv::IsolatedState::new();
+        let state_home = state.state_home();
         let root = std::env::temp_dir().join(format!(
             "tg-repo-trust-hook-repo-{}-{}",
             std::process::id(),

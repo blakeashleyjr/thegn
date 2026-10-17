@@ -345,7 +345,8 @@ fn run_keyring_op_with_timeout<T: Send + 'static>(
     op: impl FnOnce() -> T + Send + 'static,
 ) -> Result<T> {
     let (tx, rx) = std::sync::mpsc::sync_channel(1);
-    std::thread::spawn(move || {
+    thegn_core::thread_name::spawn_named("thegn-keyring", move || {
+        crate::platform::qos::set_self(crate::platform::qos::Qos::Interactive); // Interactive: synchronous UI callers wait up to 2s.
         // best-effort: the receiver is gone if the operation exceeded its cap.
         let _ = tx.send(op());
     });

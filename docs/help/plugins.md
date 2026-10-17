@@ -21,6 +21,9 @@ Two equivalent homes:
 - A directory: `<config dir>/plugins/<name>/plugin.toml` with the same
   fields. Its `cwd` defaults to that directory.
 
+The optional `env` map adds or overrides environment variables for the plugin
+process; other inherited variables remain available.
+
 Check what thegn sees with `thegn plugin list`; validate everything (api
 compatibility, command presence, contribution acceptance) with
 `thegn plugin check` — it exits non-zero on problems, so it fits a hook.

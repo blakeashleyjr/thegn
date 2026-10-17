@@ -101,11 +101,15 @@ terminal environments through `thegn doctor`) in `just ci`.
 ## 4. Platform code
 
 Per-OS code lives in `thegn-host/src/platform/`, the `termcaps`/`sandbox*`
-tables in core, and the two per-OS leaf crates. A `#[cfg(unix|windows|
+tables in core, and the per-OS leaf crates (`thegn-metrics`, `thegn-media`,
+`thegn-proc`). A `#[cfg(unix|windows|
 target_os…)]` anywhere else is debt.
 
-**Gate:** `test/platform-cfg-<crate>-ratchet.txt` ×5 (shrink-only);
-`just check-cross`, `just check-features`, `just check-msrv` in `just ci`.
+**Gate:** `test/platform-cfg-<crate>-ratchet.txt` ×6 (shrink-only);
+`test/state-env-<crate>-ratchet.txt` ×3 (tests isolate HOME/XDG and Windows
+user-state through `testenv`, shrink-only); `just check-cross`,
+`just check-features`, `just check-msrv` in `just ci`; opt-in
+`just test-windows-wine` (not in `ci`).
 
 ## 5. Provider seams
 

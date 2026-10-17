@@ -511,7 +511,7 @@ pub(crate) fn record_once_with_facts(
     (decision, inserted)
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 fn record_once(
     db: &thegn_core::db::Db,
     state: &NotifyState,

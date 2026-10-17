@@ -717,6 +717,20 @@ mod tests {
     }
 
     #[test]
+    fn fallback_bell_latch_is_consumed_exactly_once() {
+        if !UNIX {
+            return;
+        }
+        let (waker, _master, _terminal) = test_waker();
+        let runtime = SoundRuntime::new(waker);
+        assert!(!runtime.take_fallback_bell());
+        runtime.latch_fallback_bell_for_test();
+        assert!(runtime.take_fallback_bell());
+        assert!(!runtime.take_fallback_bell());
+        runtime.shutdown();
+    }
+
+    #[test]
     fn legacy_command_failure_is_reported() {
         assert!(run_command("exit 7", &AtomicBool::new(false)).is_err());
     }

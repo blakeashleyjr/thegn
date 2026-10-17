@@ -270,7 +270,8 @@ pub fn effective_pool_target(
 pub fn refill_pool_after_claim(cfg: &Config, worktree: &str) {
     let cfg = cfg.clone();
     let worktree = worktree.to_string();
-    std::thread::spawn(move || {
+    thegn_core::thread_name::spawn_named("thegn-pool-fill", move || {
+        crate::platform::qos::set_self(crate::platform::qos::Qos::Background); // Background: warm-spare provisioning.
         let loc = GitLoc::for_worktree(Path::new(&worktree));
         if !loc.is_remote() {
             return;
@@ -400,7 +401,8 @@ where
         let notify = notify.clone();
         // Concurrent build: provision_spare inserts a `provisioning` row first
         // (so this tick + the next don't double-count), then builds + checkpoints.
-        std::thread::spawn(move || {
+        thegn_core::thread_name::spawn_named("thegn-pool-new", move || {
+            crate::platform::qos::set_self(crate::platform::qos::Qos::Background); // Background: warm-spare provisioning.
             match crate::provision_gate::provision_spare(&cfg, &repo_root, &env_name, |_| {}) {
                 Ok(name) => {
                     tracing::debug!(target: "thegn::lifecycle", %name, "warm spare ready");

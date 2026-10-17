@@ -4383,10 +4383,9 @@ sign_commits = false          # sign the fold/land commits thegn creates (commit
                               # `thegn doctor` probes signing readiness when this is on.
                               # (Which key / whose GNUPGHOME signs is the active identity's
                               # business — see [identities]; this key only decides WHETHER.)
-rerere = false                # enable git rerere in the reused gate worktree and the
-                              # driver-merge worktree (shared <git-common>/rr-cache), so a
-                              # conflict resolved once auto-resolves on later drains. A
-                              # rerere-resolved merge still runs the gate before landing.
+rerere = false                # enable queue-private rerere, trained from conflict-resolving
+                              # merge commits and imported read-only from the repository's
+                              # rr-cache. A rerere-resolved merge still runs the gate before landing.
 agent_max_attempts = 2        # agent-dispatch → re-fold cycles before marking a branch "needs_human".
                               # The budget belongs to the BRANCH and is persisted, so a later drain
                               # doesn't spend it again; `thegn merge retry` re-arms a row.
@@ -4953,8 +4952,9 @@ heartbeat_secs = 10
 # capabilities = []                     # Requested capability grants; default is empty.
 # command = ["/path/to/reviewed-plugin"] # Executable argv (required); never a shell string.
 # cwd = ""                              # Working directory; default is empty (plugin directory or host cwd).
-# env = { RUST_LOG = "info" }            # Optional child environment; entries are passed verbatim.
-#                                         # No env:/file: expansion is performed; do not put secrets here.
+# env = { RUST_LOG = "info" }            # Optional child environment; plain entries pass verbatim.
+#                                         # keyring:NAME, env:VAR, and file:PATH refs resolve at spawn; failure refuses the plugin.
+#                                         # Prefer refs over pasted secrets; plugin.toml refs are refused.
 #                                         # The plugin also inherits thegn's own environment.
 # timeout_secs = 30                     # Per-call wall-clock limit in seconds; default is 30.
 # scopes = []                           # host.call scope ceiling; default empty (read/write/git/merge_add/exec/admin).

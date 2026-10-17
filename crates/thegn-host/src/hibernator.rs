@@ -232,7 +232,8 @@ fn spawn_cycle(cfg: Config, cycle: Cycle) {
     if IN_FLIGHT.swap(true, Ordering::SeqCst) {
         return;
     }
-    std::thread::spawn(move || {
+    thegn_core::thread_name::spawn_named("thegn-hibernate", move || {
+        crate::platform::qos::set_self(crate::platform::qos::Qos::Background); // Background: idle hibernation housekeeping.
         let done = || IN_FLIGHT.store(false, Ordering::SeqCst);
         match cycle {
             Cycle::Hibernate { worktree, env_name } => {

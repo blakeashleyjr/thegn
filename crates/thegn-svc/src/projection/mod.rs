@@ -719,8 +719,8 @@ mod tests {
 
     #[test]
     fn reaper_unmounts_and_removes_legacy_dirs_only() {
-        let mounts = tempfile::tempdir().unwrap();
-        let mounts_path = std::fs::canonicalize(mounts.path()).unwrap();
+        let mounts = thegn_core::testenv::symlinked_tempdir();
+        let mounts_path = mounts.real_path();
         let legacy = mounts_path.join("dev-box-srv-work");
         let current = mounts_path.join("dev-box-srv-work--0123456789abcdef0123456789abcdef");
         std::fs::create_dir(&legacy).unwrap();
@@ -814,8 +814,8 @@ mod tests {
 
     #[test]
     fn reaper_unmounts_a_mountinfo_legacy_path() {
-        let mounts = tempfile::tempdir().unwrap();
-        let mounts_path = std::fs::canonicalize(mounts.path()).unwrap();
+        let mounts = thegn_core::testenv::symlinked_tempdir();
+        let mounts_path = mounts.real_path();
         let legacy = mounts_path.join("dev-box-srv-work");
         std::fs::create_dir(&legacy).unwrap();
         let mounted = std::collections::BTreeSet::from([legacy.to_string_lossy().into_owned()]);
@@ -836,16 +836,8 @@ mod tests {
 
     #[test]
     fn reaper_matches_mountinfo_path_through_symlinked_mounts_directory() {
-        let temp = tempfile::tempdir().unwrap();
-        let real_mounts = temp.path().join("real-mounts");
-        let linked_mounts = temp.path().join("linked-mounts");
-        std::fs::create_dir(&real_mounts).unwrap();
-        if let Err(error) = thegn_core::fsperm::create_symlink(&real_mounts, &linked_mounts, true) {
-            if cfg!(unix) {
-                panic!("symlink fixture: {error}");
-            }
-            return;
-        }
+        let mounts = thegn_core::testenv::symlinked_tempdir();
+        let real_mounts = mounts.real_path();
         let legacy = real_mounts.join("dev-box-srv-work");
         std::fs::create_dir(&legacy).unwrap();
         let resolved_legacy = std::fs::canonicalize(&legacy).unwrap();
@@ -853,7 +845,7 @@ mod tests {
             std::collections::BTreeSet::from([resolved_legacy.to_string_lossy().into_owned()]);
         let mut calls = Vec::new();
 
-        let reaped = reap_legacy_mounts_with(&linked_mounts, Some(&mounted), |argv| {
+        let reaped = reap_legacy_mounts_with(mounts.path(), Some(&mounted), |argv| {
             calls.push(argv.to_vec());
             Ok(())
         });

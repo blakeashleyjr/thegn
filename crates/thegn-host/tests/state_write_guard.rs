@@ -5,7 +5,7 @@ use std::path::Path;
 use thegn_core::db::Db;
 
 fn isolated_state() -> thegn_core::testenv::IsolatedState {
-    thegn_core::testenv::IsolatedState::new()
+    thegn_core::testenv::IsolatedState::with_real_home_layout()
 }
 
 fn assert_the744_panic(outcome: std::thread::Result<anyhow::Result<Db>>, path: &Path) {

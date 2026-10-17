@@ -639,9 +639,7 @@ mod tests {
 
     #[test]
     fn bounded_queue_overflow_writes_a_durable_dropped_audit() {
-        let state = tempfile::tempdir().unwrap();
-        let _env =
-            crate::testenv::EnvVarGuard::set(&[("XDG_STATE_HOME", state.path().to_str().unwrap())]);
+        let _state = crate::testenv::IsolatedState::new();
         let (tx, _rx) = mpsc::channel(1);
         tx.try_send(AutomationEvent {
             id: "occupy".into(),

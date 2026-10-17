@@ -289,17 +289,32 @@ impl PluginsHost {
                 if stop.load(Ordering::SeqCst) {
                     return;
                 }
-                let writer = match spawn_session(&supervisor, &plugin, &tx, &waker) {
-                    Ok(session) => {
-                        let w = session.writer();
-                        if let Err(session) = admit_unless_stopped(&sessions, &stop, id.clone(), session) {
-                            session.kill();
-                            return;
+                let writer = match thegn_svc::plugin::resolve_env(&plugin) {
+                    Ok(env) => {
+                        match spawn_session(&supervisor, &plugin, &env, &tx, &waker) {
+                            Ok(session) => {
+                                let w = session.writer();
+                                if let Err(session) =
+                                    admit_unless_stopped(&sessions, &stop, id.clone(), session)
+                                {
+                                    session.kill();
+                                    return;
+                                }
+                                Some(w)
+                            }
+                            Err(e) => {
+                                tracing::warn!(target: "thegn::plugin", plugin = %id, error = %e, "respawn failed");
+                                None
+                            }
                         }
-                        Some(w)
-                    }
-                    Err(e) => {
-                        tracing::warn!(target: "thegn::plugin", plugin = %id, error = %e, "respawn failed");
+                    },
+                    Err(problem) => {
+                        if let Err(error) = tx.send(PluginMsg::Refused(vec![problem])) {
+                            tracing::debug!(target: "thegn::plugin", %error, "refusal message consumer is gone");
+                        }
+                        if let Err(error) = waker.wake() {
+                            tracing::debug!(target: "thegn::plugin", %error, "refusal message waker pulse failed");
+                        }
                         None
                     }
                 };
@@ -329,12 +344,24 @@ impl PluginsHost {
                 // Utility: the user just invoked this one-shot and is waiting on its result.
                 crate::platform::qos::set_self(crate::platform::qos::Qos::Utility);
                 let id = plugin.spec.manifest.id.as_str().to_string();
-                let run = thegn_svc::plugin::spawn_ndjson(
-                    &plugin.spec.command,
-                    &plugin.spec.env,
-                    plugin.effective_cwd().as_deref(),
-                    plugin.spec.run_timeout(),
-                );
+                let run = match thegn_svc::plugin::resolve_env(&plugin) {
+                    Ok(env) => thegn_svc::plugin::spawn_ndjson(
+                        &plugin.spec.command,
+                        &env,
+                        plugin.effective_cwd().as_deref(),
+                        plugin.spec.run_timeout(),
+                    ),
+                    Err(problem) => {
+                        drop(ticket);
+                        if let Err(error) = tx.send(PluginMsg::Refused(vec![problem])) {
+                            tracing::debug!(target: "thegn::plugin", %error, "refusal message consumer is gone");
+                        }
+                        if let Err(error) = waker.wake() {
+                            tracing::debug!(target: "thegn::plugin", %error, "refusal message waker pulse failed");
+                        }
+                        return;
+                    }
+                };
                 drop(ticket);
                 // best-effort: the loop may be shutting down.
                 let _ = tx.send(PluginMsg::OneShot { plugin: id, run });
@@ -403,6 +430,7 @@ fn admitted_plugins(
 fn spawn_session(
     supervisor: &ResidentSupervisor,
     plugin: &LoadedPlugin,
+    env: &BTreeMap<String, String>,
     tx: &PluginTx,
     waker: &TerminalWaker,
 ) -> Result<ResidentSession, PluginError> {
@@ -414,7 +442,7 @@ fn spawn_session(
         supervisor,
         &id.clone(),
         &plugin.spec.command,
-        &plugin.spec.env,
+        env,
         plugin.effective_cwd().as_deref(),
         move |event| {
             // best-effort: the loop may be gone during shutdown.
@@ -537,11 +565,12 @@ fn setup_and_schedule_with_waker(
             return;
         }
     };
-    let (discovered, refusals) = partition_native_trust(discovered);
+    let (discovered, mut refusals) = partition_native_trust(discovered);
     for problem in &refusals {
         tracing::warn!(target: "thegn::plugin", error = %problem, "native plugin refused without explicit trust");
     }
     let mut loaded: Vec<LoadedState> = Vec::new();
+    let mut resolved_envs: BTreeMap<String, BTreeMap<String, String>> = BTreeMap::new();
     let now = Instant::now();
     for plugin in discovered {
         let id = plugin.spec.manifest.id.as_str().to_string();
@@ -556,10 +585,19 @@ fn setup_and_schedule_with_waker(
                 continue;
             }
         };
+        let env = match thegn_svc::plugin::resolve_env(&plugin) {
+            Ok(env) => env,
+            Err(problem) => {
+                tracing::warn!(target: "thegn::plugin", error = %problem, "plugin refused: env secret reference");
+                refusals.push(problem);
+                continue;
+            }
+        };
         let writer = match plugin.spec.mode {
             PluginMode::Resident => match spawn_session(
                 &supervisor,
                 &plugin,
+                &env,
                 &tx,
                 waker.as_ref().expect("runtime setup has a terminal waker"),
             ) {
@@ -581,6 +619,7 @@ fn setup_and_schedule_with_waker(
             },
             PluginMode::OneShot => None,
         };
+        resolved_envs.insert(id.clone(), env);
         loaded.push(LoadedState {
             plugin,
             negotiated,
@@ -588,6 +627,15 @@ fn setup_and_schedule_with_waker(
         });
     }
     let mut sched = build_schedule(&loaded, now);
+    for entry in &mut sched {
+        match resolved_envs.get(&entry.plugin) {
+            Some(env) => entry.env.clone_from(env),
+            None => {
+                tracing::warn!(target: "thegn::plugin", plugin = %entry.plugin, "scheduled plugin has no resolved environment; clearing child environment");
+                entry.env.clear();
+            }
+        }
+    }
 
     // One-shot plugins with no interval contribution still get exactly one
     // run, so their register/update messages produce an initial view.
@@ -601,16 +649,22 @@ fn setup_and_schedule_with_waker(
     let mut initial_runs: Vec<InitialRun> = Vec::new();
     let initial_run_ids = initial_run_ids(&loaded, &sched);
     for st in &loaded {
-        if initial_run_ids.contains(st.plugin.spec.manifest.id.as_str()) {
-            initial_runs.push(InitialRun {
-                plugin: st.plugin.spec.manifest.id.as_str().to_string(),
-                command: st.plugin.spec.command.clone(),
-                env: st.plugin.spec.env.clone(),
-                cwd: st.plugin.effective_cwd(),
-                timeout: st.plugin.spec.run_timeout(),
-            });
+        let id = st.plugin.spec.manifest.id.as_str();
+        if initial_run_ids.contains(id) {
+            if let Some(env) = resolved_envs.get(id) {
+                initial_runs.push(InitialRun {
+                    plugin: id.to_string(),
+                    command: st.plugin.spec.command.clone(),
+                    env: env.clone(),
+                    cwd: st.plugin.effective_cwd(),
+                    timeout: st.plugin.spec.run_timeout(),
+                });
+            } else {
+                tracing::warn!(target: "thegn::plugin", plugin = %id, "initial run skipped because plugin environment is unresolved");
+            }
         }
     }
+    drop(resolved_envs);
 
     // best-effort: the loop may already be tearing down.
     let _ = tx.send(PluginMsg::Loaded(loaded));
@@ -1067,6 +1121,106 @@ mod tests {
             rx.try_recv().unwrap(),
             PluginMsg::Refused(problems)
                 if problems.iter().any(|problem| problem.plugin == "untrusted-runner")
+        ));
+        assert!(rx.try_recv().is_err());
+        assert!(!marker.exists());
+    }
+
+    #[test]
+    fn startup_resolves_plugin_env_before_running_one_shot() {
+        let _env = thegn_core::testenv::EnvGuard::set(&[("THEGN_B42_PLUGIN_SECRET", "s3cr3t")]);
+        let tmp = tempfile::tempdir().unwrap();
+        let marker = tmp.path().join("resolved-env");
+        let mut spec = example_spec();
+        spec.mode = PluginMode::OneShot;
+        spec.manifest.contributions.clear();
+        spec.env
+            .insert("X".into(), "env:THEGN_B42_PLUGIN_SECRET".into());
+        spec.command = vec![
+            "sh".into(),
+            "-c".into(),
+            "printf %s \"$X\" > \"$1\"".into(),
+            "plugin".into(),
+            marker.display().to_string(),
+        ];
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let supervisor = ResidentSupervisor::new(runtime.handle().clone());
+        let sessions: Sessions = Arc::new(Mutex::new(BTreeMap::new()));
+        let disabled: Disabled = Arc::new(Mutex::new(Default::default()));
+        let stop = Arc::new(AtomicBool::new(false));
+        let (tx, mut rx) = plugin_channel();
+        setup_and_schedule_with_waker(
+            supervisor,
+            vec![spec],
+            tmp.path().to_path_buf(),
+            sessions,
+            disabled,
+            stop,
+            tx,
+            None,
+        );
+
+        assert!(matches!(rx.try_recv().unwrap(), PluginMsg::Loaded(_)));
+        assert!(matches!(
+            rx.try_recv().unwrap(),
+            PluginMsg::OneShot { plugin, run: Ok(_) } if plugin == "hello"
+        ));
+        assert_eq!(std::fs::read_to_string(marker).unwrap(), "s3cr3t");
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn startup_refuses_unset_plugin_env_without_running_one_shot() {
+        let _env = thegn_core::testenv::EnvGuard::unset(&["THEGN_B42_PLUGIN_SECRET"]);
+        let tmp = tempfile::tempdir().unwrap();
+        let marker = tmp.path().join("must-not-run");
+        let mut spec = example_spec();
+        spec.mode = PluginMode::OneShot;
+        spec.manifest.contributions.clear();
+        spec.env
+            .insert("X".into(), "env:THEGN_B42_PLUGIN_SECRET".into());
+        spec.command = vec![
+            "sh".into(),
+            "-c".into(),
+            "touch \"$1\"".into(),
+            "plugin".into(),
+            marker.display().to_string(),
+        ];
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let supervisor = ResidentSupervisor::new(runtime.handle().clone());
+        let sessions: Sessions = Arc::new(Mutex::new(BTreeMap::new()));
+        let disabled: Disabled = Arc::new(Mutex::new(Default::default()));
+        let stop = Arc::new(AtomicBool::new(false));
+        let (tx, mut rx) = plugin_channel();
+        setup_and_schedule_with_waker(
+            supervisor,
+            vec![spec],
+            tmp.path().to_path_buf(),
+            sessions,
+            disabled,
+            stop,
+            tx,
+            None,
+        );
+
+        assert!(matches!(
+            rx.try_recv().unwrap(),
+            PluginMsg::Loaded(loaded) if loaded.is_empty()
+        ));
+        assert!(matches!(
+            rx.try_recv().unwrap(),
+            PluginMsg::Refused(problems)
+                if problems.iter().any(|problem| {
+                    problem.plugin == "hello" && problem.problem.contains("env X")
+                })
         ));
         assert!(rx.try_recv().is_err());
         assert!(!marker.exists());

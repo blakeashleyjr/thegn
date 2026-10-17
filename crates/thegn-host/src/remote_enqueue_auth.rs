@@ -1038,7 +1038,9 @@ mod tests {
         assert!(!script.contains(worktree));
 
         let mut command = Command::new("/bin/sh");
-        command.args(["-c", &script]).env("HOME", temp.path());
+        command
+            .args(["-c", &script])
+            .envs(thegn_core::testenv::state_env_all(temp.path()));
         assert!(!format!("{command:?}").contains(&credential.token));
         stream_credential(command, &credential).unwrap();
 

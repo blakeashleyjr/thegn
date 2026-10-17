@@ -852,6 +852,18 @@
       "summary": "Truthful backend caveats shipped; smolvm and WSL remain unverified until real-host proof."
     },
     {
+      "change": "monitor-framework",
+      "lifecycle": "active",
+      "disposition": "strategic-unstarted",
+      "owners": [
+        {
+          "issue": "THE-829",
+          "project": "Workspace Product & Observability"
+        }
+      ],
+      "summary": "System monitor framework contract is recorded; implementation lanes remain unstarted."
+    },
+    {
       "change": "package-shell-completions",
       "lifecycle": "archived",
       "disposition": "superseded-retire",

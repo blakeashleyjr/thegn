@@ -251,15 +251,10 @@ mod tests {
 
     #[test]
     fn persist_does_not_block_on_a_held_write_lock() {
-        let state_home = tempfile::Builder::new()
-            .prefix("tg-sidebar-lock-")
-            .tempdir()
-            .unwrap();
-        let state_path = state_home.path().to_string_lossy().into_owned();
-        let _env = crate::testenv::EnvVarGuard::set(&[("XDG_STATE_HOME", &state_path)]);
+        let state = crate::testenv::IsolatedState::new();
         let db = thegn_core::db::Db::open().unwrap();
         drop(db);
-        let db_path = state_home.path().join("thegn/thegn.db");
+        let db_path = state.state_home().join("thegn/thegn.db");
         let lock = rusqlite::Connection::open(db_path).unwrap();
         lock.execute_batch("BEGIN IMMEDIATE").unwrap();
 
@@ -278,12 +273,7 @@ mod tests {
 
     #[test]
     fn persist_then_unpersist_keeps_order() {
-        let state_home = tempfile::Builder::new()
-            .prefix("tg-sidebar-order-")
-            .tempdir()
-            .unwrap();
-        let state_path = state_home.path().to_string_lossy().into_owned();
-        let _env = crate::testenv::EnvVarGuard::set(&[("XDG_STATE_HOME", &state_path)]);
+        let _state = crate::testenv::IsolatedState::new();
         let db = thegn_core::db::Db::open().unwrap();
         drop(db);
 
