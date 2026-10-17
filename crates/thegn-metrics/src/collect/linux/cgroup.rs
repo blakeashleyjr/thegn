@@ -43,7 +43,7 @@ pub fn cgroup2_root(root: &Path) -> Option<PathBuf> {
 
 #[derive(Debug, Default, Clone)]
 pub struct DeviceFilter {
-    devices: Vec<(u32, u32)>,
+    pub(crate) devices: Vec<(u32, u32)>,
 }
 
 impl DeviceFilter {

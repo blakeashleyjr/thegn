@@ -60,7 +60,7 @@ pub fn pids_max(input: &[u8]) -> Option<Limit> {
 pub fn maj_min(input: &[u8]) -> Option<(u32, u32)> {
     let colon = input.iter().position(|byte| *byte == b':')?;
     let major = u32::try_from(parse_u64(trim_ascii(&input[..colon])?)?).ok()?;
-    let minor = u32::try_from(parse_u64(trim_ascii(&input[colon + 1..]))?).ok()?;
+    let minor = u32::try_from(parse_u64(trim_ascii(&input[colon + 1..])?)?).ok()?;
     Some((major, minor))
 }
 
