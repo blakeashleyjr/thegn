@@ -18,9 +18,10 @@ impl Absent {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum Health {
     Ok,
+    #[default]
     Warming,
     Absent(Absent),
     Failing {
@@ -28,12 +29,6 @@ pub enum Health {
         backoff: u16,
         retry_at: u64,
     },
-}
-
-impl Default for Health {
-    fn default() -> Self {
-        Self::Warming
-    }
 }
 
 impl Health {
