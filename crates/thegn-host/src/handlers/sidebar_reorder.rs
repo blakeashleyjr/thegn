@@ -905,7 +905,6 @@ mod tests {
     use crate::run::SidebarOutcome;
     use crate::session::{GroupKind, Session, WorktreeGroup};
     use crate::sidebar::SortMode;
-
     use termwiz::input::{KeyCode, Modifiers};
 
     /// Isolate the user DB: the move helpers open it to persist `position`
