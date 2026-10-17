@@ -3,10 +3,8 @@
 use crate::collect::{
     delta::Counter,
     frame::Part,
-    parse::stat::{CpuTicks, StatRaw},
+    parse::stat::{CpuTicks, MAX_CPUS, StatRaw},
 };
-
-pub const MAX_CPUS: usize = 512;
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct ModeShare {
@@ -106,13 +104,17 @@ impl CpuStatDelta {
             self.previous_cpus.resize(highest, None);
             self.seen_cpus.resize(highest, false);
         }
-        out.truncated = raw.cpus.iter().any(|(id, _)| usize::from(*id) >= MAX_CPUS);
+        out.truncated = raw.truncated;
 
+        let mut cpu_index = 0;
         for id in 0..highest {
+            while cpu_index < raw.cpus.len() && usize::from(raw.cpus[cpu_index].0) < id {
+                cpu_index += 1;
+            }
             let current = raw
                 .cpus
-                .iter()
-                .find(|(cpu_id, _)| usize::from(*cpu_id) == id)
+                .get(cpu_index)
+                .filter(|(cpu_id, _)| usize::from(*cpu_id) == id)
                 .map(|(_, ticks)| *ticks);
             if let Some(ticks) = current {
                 self.seen_cpus[id] = true;
@@ -159,9 +161,7 @@ impl CpuStatDelta {
 }
 
 fn tick_delta(current: CpuTicks, previous: CpuTicks) -> Option<CpuTicks> {
-    current
-        .nondecreasing_from(previous)
-        .then(|| current.delta_from(previous))
+    current.checked_delta(previous)
 }
 
 fn mode_share(ticks: CpuTicks) -> ModeShare {
@@ -322,7 +322,8 @@ mod tests {
         let mut part = CpuStatPart::default();
         delta.update(&first, 1000, &mut part);
         delta.update(&second, 2000, &mut part);
-        assert_eq!(part.cores[0].share.map(|share| share.steal), Some(1000));
+        assert_eq!(part.cores[0].share.map(|share| share.steal), Some(100));
+        assert_eq!(part.total.map(|share| share.steal), Some(100));
         assert!(part.steal_seen);
         assert_eq!(part.ctxt_per_s, Some(1000.0));
         assert_eq!(part.intr_per_s, Some(200.0));
@@ -351,5 +352,67 @@ mod tests {
         assert!(part.cores.capacity() >= capacity);
         assert!(part.total.is_none());
         assert!(!part.steal_seen);
+    }
+
+    #[test]
+    fn iowait_decrease_is_clamped_but_other_counter_decreases_reprimes() {
+        let first = StatRaw {
+            total: Some(CpuTicks {
+                user: 100,
+                idle: 100,
+                iowait: 20,
+                ..CpuTicks::default()
+            }),
+            cpus: vec![(
+                0,
+                CpuTicks {
+                    user: 100,
+                    idle: 100,
+                    iowait: 20,
+                    ..CpuTicks::default()
+                },
+            )],
+            ..StatRaw::default()
+        };
+        let second = StatRaw {
+            total: Some(CpuTicks {
+                user: 110,
+                idle: 110,
+                iowait: 10,
+                ..CpuTicks::default()
+            }),
+            cpus: vec![(
+                0,
+                CpuTicks {
+                    user: 110,
+                    idle: 110,
+                    iowait: 10,
+                    ..CpuTicks::default()
+                },
+            )],
+            ..StatRaw::default()
+        };
+        let mut delta = CpuStatDelta::new();
+        let mut part = CpuStatPart::default();
+        delta.update(&first, 1000, &mut part);
+        delta.update(&second, 2000, &mut part);
+        assert!(part.total.is_some());
+        assert_eq!(part.cores[0].share.map(|share| share.iowait), Some(0));
+
+        let mut backwards = second;
+        backwards.cpus[0].1.user -= 1;
+        backwards.total.as_mut().unwrap().user -= 1;
+        delta.update(&backwards, 3000, &mut part);
+        assert!(part.total.is_none());
+        assert_eq!(part.cores[0].share, None);
+    }
+
+    #[test]
+    fn truncated_parser_input_is_exposed_in_the_part() {
+        let raw = parse(b"cpu 1 2 3 4\ncpu600 1 2 3 4\n");
+        let mut delta = CpuStatDelta::new();
+        let mut part = CpuStatPart::default();
+        delta.update(&raw, 1000, &mut part);
+        assert!(part.truncated);
     }
 }
