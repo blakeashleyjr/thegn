@@ -11,6 +11,9 @@
 //! 12 original slots; the extension tokens are derived via [`extend_palette`].
 #![allow(dead_code)]
 
+mod roles;
+pub use roles::{Band, OwnerRole, RampId, SeriesRole, StateRole, band_of};
+
 // ---- legacy storm surfaces (the pre-prism default, kept as a preset) ----
 pub const BG0: &str = "20;22;31"; // deepest background
 pub const BG1: &str = "26;29;41"; // bar / surface
