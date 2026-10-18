@@ -12,7 +12,7 @@ use crate::collect::{
 use std::io;
 use std::sync::{
     Arc,
-    atomic::{AtomicUsize, Ordering},
+    atomic::{AtomicI32, AtomicUsize, Ordering},
 };
 
 #[derive(Clone)]
@@ -21,11 +21,14 @@ struct FakeTransport {
     open_errno: Option<i32>,
     interfaces: Vec<Interface>,
     station: Option<Station>,
+    station_errno: Arc<AtomicI32>,
     open_count: Arc<AtomicUsize>,
     resolve_count: Arc<AtomicUsize>,
     interface_count: Arc<AtomicUsize>,
     station_count: Arc<AtomicUsize>,
     enoent_once: bool,
+    station_enoent_once: bool,
+    closed: bool,
 }
 
 impl WifiTransport for FakeTransport {
@@ -38,8 +41,15 @@ impl WifiTransport for FakeTransport {
         }
     }
 
+    fn close(&mut self) {
+        self.closed = true;
+    }
+
     fn resolve_family(&mut self) -> io::Result<u16> {
         self.resolve_count.fetch_add(1, Ordering::SeqCst);
+        if self.closed {
+            return Err(io::Error::from_raw_os_error(libc::EPERM));
+        }
         Ok(37)
     }
 
@@ -56,13 +66,8 @@ impl WifiTransport for FakeTransport {
             return Err(io::Error::from_raw_os_error(libc::ENOENT));
         }
         out.clear();
-        *truncated = self.interfaces.len() > super::nl80211::MAX_INTERFACES;
-        out.extend(
-            self.interfaces
-                .iter()
-                .take(super::nl80211::MAX_INTERFACES)
-                .copied(),
-        );
+        *truncated = false;
+        out.extend(self.interfaces.iter().copied());
         Ok(())
     }
 
@@ -70,6 +75,14 @@ impl WifiTransport for FakeTransport {
         assert_eq!(family, 37);
         assert_eq!(ifindex, 7);
         self.station_count.fetch_add(1, Ordering::SeqCst);
+        if self.station_enoent_once {
+            self.station_enoent_once = false;
+            return Err(io::Error::from_raw_os_error(libc::ENOENT));
+        }
+        let errno = self.station_errno.swap(0, Ordering::SeqCst);
+        if errno != 0 {
+            return Err(io::Error::from_raw_os_error(errno));
+        }
         Ok(self.station.clone())
     }
 }
@@ -119,36 +132,48 @@ fn fixture(
     open_error: Option<io::ErrorKind>,
     open_errno: Option<i32>,
     enoent_once: bool,
-) -> (NetWifiCollector, Arc<AtomicUsize>, Arc<AtomicUsize>) {
+    station_enoent_once: bool,
+) -> (
+    NetWifiCollector,
+    Arc<AtomicUsize>,
+    Arc<AtomicUsize>,
+    Arc<AtomicI32>,
+) {
     let open_count = Arc::new(AtomicUsize::new(0));
     let resolve_count = Arc::new(AtomicUsize::new(0));
     let interface_count = Arc::new(AtomicUsize::new(0));
     let station_count = Arc::new(AtomicUsize::new(0));
+    let station_errno = Arc::new(AtomicI32::new(0));
     let transport = FakeTransport {
         open_error,
         open_errno,
         interfaces,
         station,
+        station_errno: station_errno.clone(),
         open_count: open_count.clone(),
         resolve_count: resolve_count.clone(),
         interface_count,
         station_count,
         enoent_once,
+        station_enoent_once,
+        closed: false,
     };
     (
         NetWifiCollector::with_transport(Box::new(transport)),
         open_count,
         resolve_count,
+        station_errno,
     )
 }
 
 #[test]
 fn canned_interface_and_station_replies_produce_visible_ssid_and_masked_bssid() {
-    let (mut collector, _, _) = fixture(
+    let (mut collector, _, _, _) = fixture(
         vec![managed_interface()],
         Some(connected_station()),
         None,
         None,
+        false,
         false,
     );
     assert_eq!(collector.discover(&Env::default()), Health::Warming);
@@ -181,7 +206,7 @@ fn canned_interface_and_station_replies_produce_visible_ssid_and_masked_bssid() 
 fn no_managed_wireless_interface_is_absent_no_hardware() {
     let mut other = managed_interface();
     other.iftype = Some(1);
-    let (mut collector, _, _) = fixture(vec![other], None, None, None, false);
+    let (mut collector, _, _, _) = fixture(vec![other], None, None, None, false, false);
     assert_eq!(
         collector.discover(&Env::default()),
         Health::Absent(Absent::NoHardware)
@@ -190,11 +215,12 @@ fn no_managed_wireless_interface_is_absent_no_hardware() {
 
 #[test]
 fn permission_denial_is_absent_and_does_not_reopen_each_tick() {
-    let (collector, opens, _) = fixture(
+    let (collector, opens, _, _) = fixture(
         Vec::new(),
         None,
         Some(io::ErrorKind::PermissionDenied),
         None,
+        false,
         false,
     );
     let mut registry = Registry::new(vec![Box::new(collector)]);
@@ -222,7 +248,14 @@ fn permission_denial_is_absent_and_does_not_reopen_each_tick() {
 
 #[test]
 fn unsupported_generic_netlink_family_is_absent_no_hardware() {
-    let (mut collector, _, _) = fixture(Vec::new(), None, None, Some(libc::EAFNOSUPPORT), false);
+    let (mut collector, _, _, _) = fixture(
+        Vec::new(),
+        None,
+        None,
+        Some(libc::EAFNOSUPPORT),
+        false,
+        false,
+    );
     assert_eq!(
         collector.discover(&Env::default()),
         Health::Absent(Absent::NoHardware)
@@ -231,24 +264,97 @@ fn unsupported_generic_netlink_family_is_absent_no_hardware() {
 
 #[test]
 fn family_is_resolved_again_after_kernel_reports_enoent() {
-    let (mut collector, _, resolves) = fixture(
+    let (mut collector, _, resolves, _) = fixture(
         vec![managed_interface()],
         Some(connected_station()),
         None,
         None,
         true,
+        false,
     );
     assert_eq!(collector.discover(&Env::default()), Health::Warming);
     assert_eq!(resolves.load(Ordering::SeqCst), 2);
 }
 
 #[test]
-fn collector_retains_interface_vector_capacity_for_one_thousand_samples() {
-    let (mut collector, _, _) = fixture(
+fn station_enoent_reresolves_family_and_sample_succeeds_through_registry() {
+    let (collector, _, resolves, _) = fixture(
         vec![managed_interface()],
         Some(connected_station()),
         None,
         None,
+        false,
+        true,
+    );
+    let mut registry = Registry::new(vec![Box::new(collector)]);
+    registry.discover(&Env::default());
+    let mut demand = CollectorSet::empty();
+    demand.insert(CollectorId::NetWifi);
+    let mut frame = MonitorFrame::default();
+    registry.tick(
+        Mode::Open,
+        demand,
+        &TickCtx {
+            tick: 0,
+            ..Default::default()
+        },
+        &mut frame,
+    );
+    assert_eq!(resolves.load(Ordering::SeqCst), 2);
+    assert_eq!(registry.health(CollectorId::NetWifi), Health::Ok);
+    assert_eq!(frame.parts.net_wifi.ifaces.len(), 1);
+}
+
+#[test]
+fn sample_permission_error_becomes_absent_after_registry_rediscovery() {
+    let (collector, opens, _, station_errno) = fixture(
+        vec![managed_interface()],
+        Some(connected_station()),
+        None,
+        None,
+        false,
+        false,
+    );
+    station_errno.store(libc::EPERM, Ordering::SeqCst);
+    let mut registry = Registry::new(vec![Box::new(collector)]);
+    registry.discover(&Env::default());
+    let mut demand = CollectorSet::empty();
+    demand.insert(CollectorId::NetWifi);
+    let mut frame = MonitorFrame::default();
+    registry.tick(
+        Mode::Open,
+        demand,
+        &TickCtx {
+            tick: 0,
+            ..Default::default()
+        },
+        &mut frame,
+    );
+    assert_eq!(
+        registry.health(CollectorId::NetWifi),
+        Health::Absent(Absent::NoPermission)
+    );
+    assert!(frame.parts.net_wifi.ifaces.is_empty());
+    registry.tick(
+        Mode::Open,
+        demand,
+        &TickCtx {
+            tick: 5,
+            ..Default::default()
+        },
+        &mut frame,
+    );
+    assert_eq!(opens.load(Ordering::SeqCst), 2);
+}
+
+#[test]
+fn collector_retains_interface_vector_capacity_for_one_thousand_samples() {
+    let (mut collector, _, _, _) = fixture(
+        vec![managed_interface()],
+        Some(connected_station()),
+        None,
+        None,
+        false,
         false,
     );
     assert_eq!(collector.discover(&Env::default()), Health::Warming);
@@ -266,11 +372,12 @@ fn collector_retains_interface_vector_capacity_for_one_thousand_samples() {
 
 #[test]
 fn interface_rows_are_bounded_and_report_truncation() {
-    let (mut collector, _, _) = fixture(
+    let (mut collector, _, _, _) = fixture(
         vec![managed_interface(); 17],
         Some(connected_station()),
         None,
         None,
+        false,
         false,
     );
     assert_eq!(collector.discover(&Env::default()), Health::Warming);

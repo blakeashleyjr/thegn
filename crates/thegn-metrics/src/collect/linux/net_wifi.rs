@@ -17,6 +17,7 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(2);
 
 trait WifiTransport: Send {
     fn open(&mut self) -> io::Result<()>;
+    fn close(&mut self);
     fn resolve_family(&mut self) -> io::Result<u16>;
     fn interfaces(
         &mut self,
@@ -30,6 +31,7 @@ trait WifiTransport: Send {
 #[derive(Default)]
 struct NetlinkTransport {
     socket: Option<NetlinkSocket>,
+    request: Vec<u8>,
 }
 
 impl NetlinkTransport {
@@ -46,6 +48,10 @@ impl WifiTransport for NetlinkTransport {
         Ok(())
     }
 
+    fn close(&mut self) {
+        self.socket = None;
+    }
+
     fn resolve_family(&mut self) -> io::Result<u16> {
         nl80211::resolve_family(self.socket()?, Instant::now() + REQUEST_TIMEOUT)
     }
@@ -56,20 +62,28 @@ impl WifiTransport for NetlinkTransport {
         out: &mut Vec<nl80211::Interface>,
         truncated: &mut bool,
     ) -> io::Result<()> {
+        let (socket, request) = (&mut self.socket, &mut self.request);
         nl80211::dump_interfaces(
-            self.socket()?,
+            socket.as_mut().ok_or_else(|| {
+                io::Error::new(io::ErrorKind::NotConnected, "nl80211 socket is closed")
+            })?,
             family,
             out,
             truncated,
+            request,
             Instant::now() + REQUEST_TIMEOUT,
         )
     }
 
     fn station(&mut self, family: u16, ifindex: u32) -> io::Result<Option<nl80211::Station>> {
+        let (socket, request) = (&mut self.socket, &mut self.request);
         nl80211::dump_station(
-            self.socket()?,
+            socket.as_mut().ok_or_else(|| {
+                io::Error::new(io::ErrorKind::NotConnected, "nl80211 socket is closed")
+            })?,
             family,
             ifindex,
+            request,
             Instant::now() + REQUEST_TIMEOUT,
         )
     }
@@ -206,7 +220,7 @@ impl Collector for NetWifiCollector {
         self.interfaces.clear();
         self.interfaces_truncated = false;
         self.family = None;
-        self.transport = Box::<NetlinkTransport>::default();
+        self.transport.close();
     }
 }
 
@@ -245,7 +259,7 @@ fn collect_io_error(error: io::Error) -> CollectError {
 fn wifi_row(
     interface: &nl80211::Interface,
     ifindex: u32,
-    name: nl80211::InlineBytes<nl80211::IFNAME_LEN>,
+    name: nl80211::InlineBytes<{ nl80211::IFNAME_LEN }>,
     station: &nl80211::Station,
 ) -> WifiRow {
     WifiRow {
