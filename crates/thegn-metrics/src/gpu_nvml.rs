@@ -1,5 +1,8 @@
 //! Optional Linux NVML binding. The library and every entry point are resolved
 //! at runtime, so installations without the NVIDIA driver remain supported.
+//! Init failures, including watchdog timeouts, are intentionally not a separate
+//! `GpuHealth` state: the monitor records the result of the nvidia-smi fallback
+//! there. `nvml_attempted` keeps the cold-init outcome retired for this process.
 
 use std::ffi::{CStr, c_void};
 use std::sync::mpsc;
@@ -24,18 +27,25 @@ pub(crate) trait NvmlApi: Send {
 
 /// Build and initialize NVML on a named custody thread. If init exceeds the
 /// watchdog, that thread and its library remain owned by the detached thread;
-/// the caller marks NVML attempted and never starts another init this process.
+/// the caller marks NVML attempted and never starts another cold init this
+/// process. At process exit, a timed-out thread may still be inside
+/// `libnvidia-ml` while the library's destructors run.
 pub(crate) fn init_with_watchdog(
     mut api: Box<dyn NvmlApi>,
     timeout: Duration,
 ) -> Result<Box<dyn NvmlApi>, InitFailure> {
     let (tx, rx) = mpsc::sync_channel(1);
-    thegn_core::thread_name::spawn_named("thegn-nvml-init", move || {
-        let result = api.init();
-        if tx.send((api, result)).is_err() {
-            // The watchdog already gave up. The worker owns and drops the API.
-        }
-    });
+    let spawned = std::thread::Builder::new()
+        .name("thegn-nvml-init".into())
+        .spawn(move || {
+            let result = api.init();
+            match tx.send((api, result)) {
+                Ok(()) | Err(_) => {}
+            }
+        });
+    if spawned.is_err() {
+        return Err(InitFailure::Unavailable);
+    }
     match rx.recv_timeout(timeout) {
         Ok((api, Ok(()))) => Ok(api),
         Ok((_api, Err(()))) => Err(InitFailure::Unavailable),
@@ -87,19 +97,31 @@ pub(crate) fn read(api: &mut dyn NvmlApi) -> Option<GpuReading> {
     reading.util_pct.map(|_| reading)
 }
 
+// Header reference for the signatures below: NVIDIA's archived
+// `bindings/go/nvml/nvml.h` in `NVIDIA/gpu-monitoring-tools`. No pinned commit
+// was verified, so the repository path is intentionally unpinned.
+// nvmlReturn_t nvmlInit_v2(void);
 type InitFn = unsafe extern "C" fn() -> i32;
+// nvmlReturn_t nvmlShutdown(void);
 type ShutdownFn = unsafe extern "C" fn() -> i32;
+// nvmlReturn_t nvmlDeviceGetCount_v2(unsigned int *deviceCount);
 type CountFn = unsafe extern "C" fn(*mut u32) -> i32;
+// nvmlReturn_t nvmlDeviceGetHandleByIndex_v2(unsigned int index, nvmlDevice_t *device);
 type HandleFn = unsafe extern "C" fn(u32, *mut Device) -> i32;
+// nvmlReturn_t nvmlDeviceGetUtilizationRates(nvmlDevice_t device, nvmlUtilization_t *utilization);
 type UtilFn = unsafe extern "C" fn(Device, *mut Utilization) -> i32;
+// nvmlReturn_t nvmlDeviceGetMemoryInfo(nvmlDevice_t device, nvmlMemory_t *memory);
 type MemoryFn = unsafe extern "C" fn(Device, *mut MemoryInfo) -> i32;
+// nvmlReturn_t nvmlDeviceGetTemperature(nvmlDevice_t device, nvmlTemperatureSensors_t sensorType, unsigned int *temp);
 type TemperatureFn = unsafe extern "C" fn(Device, u32, *mut u32) -> i32;
+// nvmlReturn_t nvmlDeviceGetPowerUsage(nvmlDevice_t device, unsigned int *power);
 type PowerFn = unsafe extern "C" fn(Device, *mut u32) -> i32;
 
 // Layouts copied from NVIDIA's nvml.h: nvmlUtilization_t has two unsigned int
 // fields (gpu, memory); nvmlMemory_t has three unsigned long long fields
 // (total, free, used). Source: https://github.com/NVIDIA/gpu-monitoring-tools/
-// blob/master/bindings/go/nvml/nvml.h
+// `NVIDIA/gpu-monitoring-tools/bindings/go/nvml/nvml.h` (unpinned repository
+// path; no verified commit was available).
 #[repr(C)]
 #[derive(Default)]
 struct Utilization {
@@ -228,9 +250,12 @@ impl NvmlApi for DynamicNvml {
         (unsafe { f(device as Device, &mut value) } == 0).then_some(value as f32)
     }
     fn shutdown(&mut self) {
-        if let Some(shutdown) = self.shutdown {
+        if self.initialized
+            && let Some(shutdown) = self.shutdown
+        {
             // SAFETY: shutdown is resolved from this library; call is best effort.
             let _status = unsafe { shutdown() };
+            self.initialized = false;
         }
     }
 }

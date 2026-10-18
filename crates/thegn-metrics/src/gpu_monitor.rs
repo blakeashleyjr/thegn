@@ -83,6 +83,8 @@ pub(crate) struct HelperSpec {
     pub backoff_max: Duration,
     pub absent_retry: Duration,
     pub stale_max: Duration,
+    #[cfg(target_os = "linux")]
+    nvml_loader: fn() -> Option<Box<dyn crate::gpu_nvml::NvmlApi>>,
 }
 
 impl Default for HelperSpec {
@@ -100,6 +102,8 @@ impl Default for HelperSpec {
             backoff_max: Duration::from_secs(600),
             absent_retry: Duration::from_secs(600),
             stale_max: Duration::from_secs(120),
+            #[cfg(target_os = "linux")]
+            nvml_loader: crate::gpu_nvml::load,
         }
     }
 }
@@ -203,7 +207,21 @@ impl GpuMonitor {
         {
             return sysfs.sample(slow);
         }
-        if slow && !nvidia_suspended(&self.spec) {
+        #[cfg(target_os = "linux")]
+        let suspended = slow && nvidia_suspended(&self.spec);
+        #[cfg(target_os = "linux")]
+        if suspended {
+            let retired = {
+                let mut state = self.shared.lock();
+                state.nvml.take()
+            };
+            if let Some(mut api) = retired {
+                api.shutdown();
+            }
+        }
+        #[cfg(not(target_os = "linux"))]
+        let suspended = slow && nvidia_suspended(&self.spec);
+        if slow && !suspended {
             self.kick();
         }
         self.latest()
@@ -300,7 +318,7 @@ fn run_linux_probe(
         && !attempted
         && !NVML_INIT_ATTEMPTED.swap(true, std::sync::atomic::Ordering::AcqRel);
     let candidate = if first_attempt {
-        crate::gpu_nvml::load()
+        (spec.nvml_loader)()
     } else {
         None
     };
@@ -326,10 +344,26 @@ fn run_linux_probe_with_candidate(
     use crate::gpu_nvml::{InitFailure, init_with_watchdog, read};
 
     if backend == Backend::Nvml {
-        if let Some(reading) = api.as_mut().and_then(|api| read(api.as_mut())) {
-            return (Probe::Reading(Backend::Nvml, reading), api, attempted);
+        if let Some(live_api) = api.as_mut() {
+            if let Some(reading) = read(live_api.as_mut()) {
+                return (Probe::Reading(Backend::Nvml, reading), api, attempted);
+            }
+            if let Some(mut retired) = api.take() {
+                retired.shutdown();
+            }
+            return (run_probe(spec, Backend::Unresolved), None, attempted);
         }
-        return (nvidia_sample(spec), None, attempted);
+        // A runtime-suspended device releases its session above. Re-open it
+        // lazily on the next active probe; the cold init already used watchdog.
+        if let Some(mut api) = (spec.nvml_loader)() {
+            if api.init().is_ok()
+                && let Some(reading) = read(api.as_mut())
+            {
+                return (Probe::Reading(Backend::Nvml, reading), Some(api), attempted);
+            }
+            api.shutdown();
+        }
+        return (run_probe(spec, Backend::Unresolved), None, attempted);
     }
     if !attempted {
         if let Some(api) = candidate {
@@ -457,6 +491,8 @@ mod tests {
     #[cfg(target_os = "linux")]
     struct FakeNvml {
         hang: bool,
+        no_reading: bool,
+        shutdown: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
     }
 
     #[cfg(target_os = "linux")]
@@ -474,7 +510,7 @@ mod tests {
             Ok(1)
         }
         fn utilization(&mut self, _: usize) -> Option<u32> {
-            Some(71)
+            (!self.no_reading).then_some(71)
         }
         fn memory_info(&mut self, _: usize) -> Option<(u64, u64)> {
             None
@@ -485,7 +521,11 @@ mod tests {
         fn power_usage(&mut self, _: usize) -> Option<f32> {
             None
         }
-        fn shutdown(&mut self) {}
+        fn shutdown(&mut self) {
+            if let Some(shutdown) = &self.shutdown {
+                shutdown.store(true, std::sync::atomic::Ordering::Release);
+            }
+        }
     }
 
     fn spec_for(dir: &Path, body: &str) -> HelperSpec {
@@ -498,6 +538,8 @@ mod tests {
             nvidia_proc: dir.join("nvidia-missing"),
             pci_devices: dir.join("pci-devices"),
             try_ioreg: false,
+            #[cfg(target_os = "linux")]
+            nvml_loader: || None,
             discovery_deadline: Duration::from_secs(3),
             sample_deadline: Duration::from_secs(3),
             output_cap: 4096,
@@ -599,6 +641,8 @@ mod tests {
     fn missing_helper_is_absent_and_not_respawned() {
         let mut spec = HelperSpec {
             try_ioreg: false,
+            #[cfg(target_os = "linux")]
+            nvml_loader: || None,
             ..HelperSpec::default()
         };
         spec.nvidia = HelperCmd::named("/nonexistent/thegn-nvidia-smi");
@@ -668,6 +712,8 @@ mod tests {
         let mut spec = HelperSpec {
             try_ioreg: false,
             absent_retry: Duration::from_millis(1),
+            #[cfg(target_os = "linux")]
+            nvml_loader: || None,
             ..HelperSpec::default()
         };
         spec.nvidia = HelperCmd::named("/nonexistent/thegn-nvidia-smi");
@@ -710,6 +756,8 @@ mod tests {
             backoff_max: Duration::from_millis(1),
             absent_retry: Duration::from_millis(1),
             stale_max: Duration::from_secs(60),
+            #[cfg(target_os = "linux")]
+            nvml_loader: || None,
         }
     }
 
@@ -793,7 +841,11 @@ mod tests {
         let (probe, _, attempted) = run_linux_probe_with_candidate(
             &spec,
             Backend::Nvml,
-            Some(Box::new(FakeNvml { hang: false })),
+            Some(Box::new(FakeNvml {
+                hang: false,
+                no_reading: false,
+                shutdown: None,
+            })),
             true,
             None,
             Duration::from_millis(50),
@@ -821,12 +873,70 @@ mod tests {
             Backend::Unresolved,
             None,
             false,
-            Some(Box::new(FakeNvml { hang: true })),
+            Some(Box::new(FakeNvml {
+                hang: true,
+                no_reading: false,
+                shutdown: None,
+            })),
             Duration::from_millis(20),
         );
         assert!(attempted, "a timed out init is permanently retired");
         assert!(matches!(probe, Probe::Reading(Backend::Nvidia, _)));
         let calls = std::fs::read_to_string(marker).unwrap();
         assert_eq!(calls.lines().count(), 2, "version and sample fallback ran");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn nvml_without_a_reading_uses_discovery_and_classifies_missing_smi_absent() {
+        let d = tempfile::tempdir().unwrap();
+        let mut spec = spec_for(d.path(), "exit 0\n");
+        spec.nvidia = HelperCmd::named("/nonexistent/thegn-nvidia-smi");
+        let (probe, api, attempted) = run_linux_probe_with_candidate(
+            &spec,
+            Backend::Unresolved,
+            None,
+            false,
+            Some(Box::new(FakeNvml {
+                hang: false,
+                no_reading: true,
+                shutdown: None,
+            })),
+            Duration::from_secs(1),
+        );
+        assert!(matches!(probe, Probe::Absent { permanent: true }));
+        assert!(api.is_none());
+        assert!(attempted);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn runtime_suspension_shuts_down_the_cached_nvml_session() {
+        let d = tempfile::tempdir().unwrap();
+        let nvidia_proc = d.path().join("nvidia-gpus");
+        let pci_devices = d.path().join("pci-devices");
+        std::fs::create_dir_all(nvidia_proc.join("GPU-0")).unwrap();
+        let status = pci_devices.join("GPU-0/power/runtime_status");
+        std::fs::create_dir_all(status.parent().unwrap()).unwrap();
+        std::fs::write(status, "suspended\n").unwrap();
+        let shutdown = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let mut spec = spec_for(d.path(), "exit 0\n");
+        spec.nvidia_proc = nvidia_proc;
+        spec.pci_devices = pci_devices;
+        let monitor = GpuMonitor::with_spec(None, spec);
+        {
+            let mut state = monitor.shared.lock();
+            state.backend = Backend::Nvml;
+            state.nvml_attempted = true;
+            state.nvml = Some(Box::new(FakeNvml {
+                hang: false,
+                no_reading: false,
+                shutdown: Some(std::sync::Arc::clone(&shutdown)),
+            }));
+        }
+        monitor.sample(true);
+        assert!(shutdown.load(std::sync::atomic::Ordering::Acquire));
+        assert!(monitor.shared.lock().nvml.is_none());
+        assert_eq!(monitor.probes_started(), 0);
     }
 }
