@@ -2,7 +2,7 @@
 use std::collections::VecDeque;
 use std::fs;
 use std::io;
-use std::net::{IpAddr};
+use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -227,6 +227,8 @@ struct OwnerLabel {
     name: Arc<[u8]>,
 }
 
+type OwnerLabelData = (Arc<[u8]>, cgroup_classify::OwnerKind, Arc<[u8]>);
+
 /// Cached cgroup-id to path resolution, with at most 64 inode stats per refresh.
 pub struct OwnerTable<F = RealCgroupFs> {
     fs: F,
@@ -270,7 +272,7 @@ impl<F: CgroupFs> OwnerTable<F> {
             .map(|label| label.path.as_os_str().as_bytes())
     }
 
-    fn label(&self, id: u64) -> Option<(Arc<[u8]>, cgroup_classify::OwnerKind, Arc<[u8]>)> {
+    fn label(&self, id: u64) -> Option<OwnerLabelData> {
         self.paths
             .iter()
             .find(|label| label.id == id)
