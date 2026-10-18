@@ -88,6 +88,46 @@ pub struct ProcSnapshot {
     pub primed: bool,
     /// Whether process sampling is enabled at all (`[monitor] processes`).
     pub enabled: bool,
+    /// Aggregate readings from the complete native process pass. Backends that
+    /// cannot observe every field leave the summary absent.
+    pub summary: Option<ProcSummary>,
+}
+
+/// Aggregate readings computed from one complete process enumeration.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct ProcSummary {
+    pub tasks: usize,
+    pub threads: u64,
+    pub kernel_threads: usize,
+    pub running: usize,
+    pub sleeping: usize,
+    pub disk_sleep: usize,
+    pub zombies: usize,
+    pub stopped: usize,
+    pub idle: usize,
+    /// Unknown on the first pass, before an identity baseline exists.
+    pub new: Option<usize>,
+    /// Unknown on the first pass, before an identity baseline exists.
+    pub exited: Option<usize>,
+    pub owners: ProcOwnerSummary,
+}
+
+/// CPU and resident memory totals grouped by owner class.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct ProcOwnerSummary {
+    pub ui: ProcOwnerTotals,
+    pub daemon: ProcOwnerTotals,
+    pub panes: ProcOwnerTotals,
+    pub other: ProcOwnerTotals,
+}
+
+/// Totals for one owner class. CPU is unknown until deltas are available;
+/// RSS is unknown when the backend cannot determine page size.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct ProcOwnerTotals {
+    pub count: usize,
+    pub cpu_pct: Option<f64>,
+    pub rss_bytes: Option<u64>,
 }
 
 /// Sort + dedup a PID list.
@@ -261,6 +301,7 @@ impl ProcSampler {
             total,
             primed,
             enabled: true,
+            summary: None,
         }
     }
 

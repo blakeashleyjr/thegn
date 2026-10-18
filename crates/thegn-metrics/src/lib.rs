@@ -63,7 +63,8 @@ pub use net_medium::{
     IfaceFact, MediumReason, MediumSelection, NetMedium, select_medium, select_medium_explained,
 };
 pub use procs::{
-    MIN_INTERVAL as PROC_MIN_INTERVAL, ProcOwner, ProcSample, ProcSampler, ProcSnapshot,
+    MIN_INTERVAL as PROC_MIN_INTERVAL, ProcOwner, ProcOwnerSummary, ProcOwnerTotals, ProcSample,
+    ProcSampler, ProcSnapshot, ProcSummary,
 };
 pub use sample::{StatsSampler, SystemInfo, TrackedSpec, probe_net_path};
 

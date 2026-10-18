@@ -202,6 +202,13 @@ owner, CPU%, the CPU bar, RSS, and the sampled command name; tree indentation
 stays inside the command column. The command is the sampled process name, not
 its argument list.
 
+At 120 columns and wider, a summary above the table shows task, thread and
+kernel-thread totals; R/S/D/Z/T/I state counts; new and exited process counts
+since the previous pass; and CPU/RSS totals for the UI, daemon, panes and other
+processes. The D count uses the warning tone when any process is in disk wait.
+The first pass leaves CPU and new/exited values unknown until their baselines
+are available.
+
 - `c`, `m`, `n`, `p` sort by CPU, memory, name, or PID.
 - `r` reverses the sort direction.
 - `/` opens an incremental, space-separated AND filter (type to narrow,
