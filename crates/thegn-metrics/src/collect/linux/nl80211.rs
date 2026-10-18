@@ -3,6 +3,7 @@ use std::io;
 use std::time::Instant;
 
 use super::netlink::{AttributeIter, MessageIter, NetlinkMessage, NetlinkSocket};
+pub use crate::collect::model::net_wifi::InlineBytes;
 
 // Generic-netlink control constants from include/uapi/linux/genetlink.h.
 const GENL_ID_CTRL: u16 = 0x10;
@@ -65,14 +66,17 @@ const NLM_F_DUMP_INTR: u16 = libc::NLM_F_DUMP_INTR as u16;
 const REQUEST: u16 = libc::NLM_F_REQUEST as u16;
 const DUMP: u16 = (libc::NLM_F_REQUEST | libc::NLM_F_DUMP) as u16;
 
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub const IFNAME_LEN: usize = 16;
+pub const SSID_LEN: usize = 32;
+pub const MAX_INTERFACES: usize = 16;
+pub const MASKED_BSSID: &str = "xx:xx:xx:xx:xx:xx";
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct Interface {
     pub ifindex: Option<u32>,
-    // TODO(THE-887): replace these per-dump allocations with inline buffers before
-    // wiring the net_wifi collector (monitor spec §6.2).
-    pub name: Option<String>,
+    pub name: Option<InlineBytes<IFNAME_LEN>>,
     pub iftype: Option<u32>,
-    pub ssid: Option<Vec<u8>>,
+    pub ssid: Option<InlineBytes<SSID_LEN>>,
     pub wiphy: Option<u32>,
     pub frequency_mhz: Option<u32>,
     pub channel_width: Option<u32>,
@@ -146,20 +150,27 @@ pub fn dump_interfaces(
     socket: &mut NetlinkSocket,
     family_id: u16,
     out: &mut Vec<Interface>,
+    truncated: &mut bool,
+    request: &mut Vec<u8>,
     deadline: Instant,
 ) -> io::Result<()> {
     out.clear();
+    *truncated = false;
     let sequence = socket.next_sequence();
-    let mut request = Vec::with_capacity(20);
-    push_header(&mut request, family_id, DUMP, sequence);
-    push_genl(&mut request, CMD_GET_INTERFACE, 1);
-    set_message_len(&mut request);
-    socket.send(&request)?;
+    request.clear();
+    push_header(request, family_id, DUMP, sequence);
+    push_genl(request, CMD_GET_INTERFACE, 1);
+    set_message_len(request);
+    socket.send(request)?;
     receive_dump(socket, sequence, deadline, out, |message, out| {
         if message.header.kind == family_id {
             let (command, payload) = genl_parts(message.payload)?;
             if command == CMD_NEW_INTERFACE {
-                out.push(decode_interface(payload));
+                if out.len() < MAX_INTERFACES {
+                    out.push(decode_interface(payload));
+                } else {
+                    *truncated = true;
+                }
             }
         }
         Ok(())
@@ -208,9 +219,41 @@ pub fn get_station(
     }
 }
 
+/// Dumps the connected peer station for one interface; the peer MAC is learned
+/// from the kernel reply, so this does not require a scan or a caller guess.
+pub fn dump_station(
+    socket: &mut NetlinkSocket,
+    family_id: u16,
+    ifindex: u32,
+    request: &mut Vec<u8>,
+    deadline: Instant,
+) -> io::Result<Option<Station>> {
+    let sequence = socket.next_sequence();
+    request.clear();
+    push_header(request, family_id, DUMP, sequence);
+    push_genl(request, CMD_GET_STATION, 1);
+    push_attr(request, ATTR_IFINDEX, &ifindex.to_ne_bytes());
+    set_message_len(request);
+    socket.send(request)?;
+    let mut station = None;
+    // The station decode keeps its result in `station`; the dump's output vec is unused.
+    let mut ignored: Vec<()> = Vec::new();
+    receive_dump(socket, sequence, deadline, &mut ignored, |message, _out| {
+        if message.header.kind == family_id && station.is_none() {
+            let (_, payload) = genl_parts(message.payload)?;
+            let decoded = decode_station(payload);
+            if decoded.bssid.is_some() {
+                station = Some(decoded);
+            }
+        }
+        Ok(())
+    })?;
+    Ok(station)
+}
+
 /// Masks every octet of a MAC/BSSID.
 pub fn mask_bssid(_bssid: [u8; 6]) -> String {
-    "xx:xx:xx:xx:xx:xx".to_owned()
+    MASKED_BSSID.to_owned()
 }
 
 fn decode_interface(payload: &[u8]) -> Interface {
@@ -220,15 +263,21 @@ fn decode_interface(payload: &[u8]) -> Interface {
         match attribute.kind & NLA_TYPE_MASK {
             ATTR_IFINDEX => row.ifindex = get_u32(attribute.payload, 0),
             ATTR_IFNAME => {
-                row.name = attribute
-                    .payload
-                    .split(|byte| *byte == 0)
-                    .next()
-                    .map(|name| String::from_utf8_lossy(name).into_owned())
+                let mut name = InlineBytes::default();
+                name.set(
+                    attribute
+                        .payload
+                        .split(|byte| *byte == 0)
+                        .next()
+                        .unwrap_or(&[]),
+                );
+                row.name = Some(name);
             }
             ATTR_IFTYPE => row.iftype = get_u32(attribute.payload, 0),
-            ATTR_SSID if attribute.payload.len() <= 32 => {
-                row.ssid = Some(attribute.payload.to_vec())
+            ATTR_SSID if attribute.payload.len() <= SSID_LEN => {
+                let mut ssid = InlineBytes::default();
+                ssid.set(attribute.payload);
+                row.ssid = Some(ssid);
             }
             ATTR_WIPHY => row.wiphy = get_u32(attribute.payload, 0),
             ATTR_WIPHY_FREQ => row.frequency_mhz = get_u32(attribute.payload, 0),
