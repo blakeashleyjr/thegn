@@ -157,37 +157,50 @@ fn absorb_frame_matches_mem_health_for_healthy_and_pressure_inputs() {
 }
 
 #[test]
-fn absent_swap_and_cgroup_are_hidden_and_not_demanded() {
+fn absent_swap_is_hidden_and_limit_panel_demands_cgroup_slice() {
     let mut model = MemoryModel::default();
     model.absorb_frame(&fixture(false));
     model.swap_total = Some(0);
     let view = MemoryView(&model);
     let placed = Board::default().placed(&view, Rect::full(160, 45));
     assert!(!placed.iter().any(|panel| panel.id.0 == "memory.swap"));
-    assert!(!placed.iter().any(|panel| panel.id.0 == "memory.limit"));
+    assert!(placed.iter().any(|panel| panel.id.0 == "memory.limit"));
     let demand = Board::default()
         .demand(&view, Rect::full(160, 45), 1000)
         .collectors;
-    assert!(!demand.contains(CollectorId::CgroupSlice));
+    assert!(demand.contains(CollectorId::CgroupSlice));
     model.swap_total = Some(1);
     let mut cgroup_frame = fixture(false);
     cgroup_frame.parts.cgroup_slice.found = true;
     cgroup_frame.parts.cgroup_slice.sample.mem_current = Some(1024);
     model.absorb_frame(&cgroup_frame);
-    // CgroupSlice and memory.limit stay deferred until the collector exposes
-    // memory.max or memory.high; even a reported current value cannot supply it.
     let view = MemoryView(&model);
     let demand = Board::default()
         .demand(&view, Rect::full(160, 45), 1000)
         .collectors;
-    assert!(!demand.contains(CollectorId::CgroupSlice));
+    assert!(demand.contains(CollectorId::CgroupSlice));
+}
+
+#[test]
+fn composition_keeps_available_distinct_from_free() {
+    let mut model = MemoryModel::default();
+    model.absorb_frame(&fixture(false));
+    assert_eq!(model.available, Some(4 * 1024 * 1024 * 1024));
+    assert_eq!(model.free, Some(512 * 1024 * 1024));
+    assert_eq!(model.used, Some(4 * 1024 * 1024 * 1024));
+    let view = MemoryView(&model);
+    let mut surface = Surface::new(160, 45);
+    Board::default().paint(&view, &mut surface, Rect::full(160, 45), 0, &[]);
+    let rendered = text(&surface);
+    assert!(rendered.contains("available"), "{rendered}");
+    assert!(rendered.contains("free"), "{rendered}");
 }
 
 #[test]
 fn board_snapshots_cover_size_and_capability_matrix() {
     let sizes = [(100, 30), (160, 45), (240, 60)];
     let levels = [UnicodeLevel::Full, UnicodeLevel::Basic, UnicodeLevel::Ascii];
-    let depths = [ColorDepth::Truecolor, ColorDepth::Ansi16];
+    let depths = [ColorDepth::Truecolor, ColorDepth::Ansi16, ColorDepth::None];
     for (cols, rows) in sizes {
         for level in levels {
             for depth in depths {
@@ -222,9 +235,7 @@ fn board_snapshots_cover_size_and_capability_matrix() {
                 assert!(rendered.contains("Memory"));
                 assert!(rendered.contains("health"));
                 if cols == 240 {
-                    // These history charts show real bounded model samples. The remaining
-                    // Density follow-up in batch 47 (wiring lane).
-                    assert!(fill_ratio(&surface, Rect::full(cols, rows)) >= 0.30);
+                    assert!(fill_ratio(&surface, Rect::full(cols, rows)) >= 0.55);
                     assert!(rendered.contains("used / available history"));
                     assert!(rendered.contains("PSI history"));
                     assert!(rendered.contains("direct reclaim history"));
@@ -232,6 +243,7 @@ fn board_snapshots_cover_size_and_capability_matrix() {
                     assert!(rendered.contains("kswapd steal"));
                     assert!(rendered.contains("refaults"));
                     assert!(rendered.contains("allocstall"));
+                    assert!(rendered.contains("Container limit"));
                 }
                 if level == UnicodeLevel::Ascii {
                     assert!(rendered.is_ascii());
@@ -257,6 +269,47 @@ fn board_snapshots_cover_size_and_capability_matrix() {
             }
         }
     }
+}
+
+#[test]
+fn limit_panel_uses_absent_mark_and_unlimited_label() {
+    use thegn_metrics::collect::model::cgroup::Limit;
+
+    let mut model = MemoryModel::default();
+    let mut frame = MonitorFrame::default();
+    model.absorb_frame(&frame);
+    let view = MemoryView(&model);
+    let board = Board::default();
+    let limit = board
+        .placed(&view, Rect::full(160, 45))
+        .into_iter()
+        .find(|panel| panel.id.0 == "memory.limit")
+        .expect("limit panel is placed");
+    let mut missing = Surface::new(limit.rect.cols, limit.rect.rows);
+    view.paint(
+        &mut missing,
+        &limit,
+        Rect::full(limit.rect.cols, limit.rect.rows),
+        0,
+        &[],
+    );
+    assert!(text(&missing).contains(caps::active_glyphs().emdash));
+
+    frame.parts.cgroup_slice.effective_limit = Some(Limit::Max);
+    frame.parts.cgroup_slice.own_current = Some(1024);
+    frame.parts.cgroup_slice.sample.mem_high = Some(Limit::Max);
+    frame.parts.cgroup_slice.sample.mem_max = Some(Limit::Max);
+    model.absorb_frame(&frame);
+    let view = MemoryView(&model);
+    let mut unlimited = Surface::new(limit.rect.cols, limit.rect.rows);
+    view.paint(
+        &mut unlimited,
+        &limit,
+        Rect::full(limit.rect.cols, limit.rect.rows),
+        0,
+        &[],
+    );
+    assert!(text(&unlimited).contains("no limit"));
 }
 
 #[test]

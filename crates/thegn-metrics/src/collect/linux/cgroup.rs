@@ -2,8 +2,10 @@
 //! double-counting observed on this host (259:0 and 254:0 both have no whole
 //! disk holders, while 254:0 duplicates 259:0 and 253:0 is zram).
 
+use std::collections::HashMap;
 use std::fs::File;
 use std::io;
+use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
 
 use super::procfile;
@@ -65,6 +67,51 @@ fn read_bytes<F: CgroupFs>(fs: &mut F, path: &Path, buf: &mut Vec<u8>) -> Option
     fs.read(path, buf).ok()
 }
 
+/// Held cgroup pseudo-files are read from offset zero without reopening them on
+/// each sample. `None` entries remember files absent at discovery.
+#[derive(Debug, Default)]
+pub(super) struct HeldFiles {
+    files: HashMap<PathBuf, Option<File>>,
+    reopen_needed: bool,
+}
+
+impl HeldFiles {
+    pub(super) fn discover(&mut self, paths: impl Iterator<Item = PathBuf>) {
+        self.files.clear();
+        self.reopen_needed = false;
+        self.files.extend(paths.map(|path| {
+            let file = match File::open(&path) {
+                Ok(file) => Some(file),
+                Err(_) => None,
+            };
+            (path, file)
+        }));
+    }
+
+    pub(super) fn read(&mut self, path: &Path, buf: &mut Vec<u8>) -> Option<usize> {
+        let file = self.files.get(path)?.as_ref()?;
+        buf.resize(buf.capacity().max(4096), 0);
+        match file.read_at(buf, 0) {
+            Ok(length) => {
+                buf.truncate(length);
+                Some(length)
+            }
+            Err(error)
+                if matches!(error.kind(), io::ErrorKind::NotFound)
+                    || matches!(error.raw_os_error(), Some(libc::ENODEV)) =>
+            {
+                self.reopen_needed = true;
+                None
+            }
+            Err(_) => None,
+        }
+    }
+
+    pub(super) fn take_reopen_needed(&mut self) -> bool {
+        std::mem::take(&mut self.reopen_needed)
+    }
+}
+
 pub fn read_group<F: CgroupFs>(
     fs: &mut F,
     filter: &DeviceFilter,
@@ -118,6 +165,7 @@ pub struct CgroupCollector {
     fs: RealFs,
     buffer: Vec<u8>,
     path_buffer: PathBuf,
+    held: HeldFiles,
 }
 
 impl CgroupCollector {
@@ -157,6 +205,7 @@ impl Collector for CgroupCollector {
     }
 
     fn discover(&mut self, env: &Env) -> Health {
+        self.held = HeldFiles::default();
         let root = env
             .cgroup_root
             .as_deref()
@@ -173,6 +222,11 @@ impl Collector for CgroupCollector {
         }
         self.targets.retain(|target| target.starts_with(&root));
         self.root = Some(root);
+        self.held.discover(
+            self.targets
+                .iter()
+                .flat_map(|target| [target.join("memory.max"), target.join("memory.high")]),
+        );
         Health::Ok
     }
 
@@ -198,6 +252,18 @@ impl Collector for CgroupCollector {
                 &mut sample,
                 &mut self.path_buffer,
             );
+            for (name, field) in [
+                ("memory.max", &mut sample.mem_max),
+                ("memory.high", &mut sample.mem_high),
+            ] {
+                let file = target.join(name);
+                if let Some(length) = self.held.read(&file, &mut self.buffer) {
+                    *field = cgroup::memory_limit(&self.buffer[..length]);
+                }
+            }
+            if self.held.take_reopen_needed() {
+                return Err(CollectError::Gone);
+            }
             frame.parts.cgroup.groups.push(GroupRow {
                 target: index as u16,
                 sample,
@@ -213,12 +279,13 @@ impl Collector for CgroupCollector {
         self.filter.devices.clear();
         self.buffer.clear();
         self.path_buffer.clear();
+        self.held.files.clear();
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{CgroupCollector, CgroupFs, DeviceFilter, cgroup2_root, read_group};
+    use super::{CgroupCollector, CgroupFs, DeviceFilter, HeldFiles, cgroup2_root, read_group};
     use crate::collect::frame::MonitorFrame;
     use crate::collect::health::{Absent, Health};
     use crate::collect::model::cgroup::{CgroupSample, MAX_GROUPS};
@@ -258,6 +325,42 @@ mod tests {
         assert!(fs.0 <= 12);
         assert_eq!(sample.mem_current, Some(123));
         assert_eq!(sample.cpu, None);
+    }
+
+    #[test]
+    fn held_memory_limit_files_parse_values_and_do_not_reopen_steady_state() {
+        use crate::collect::model::cgroup::Limit;
+
+        let temp = tempfile::tempdir().unwrap();
+        let group = temp.path().join("group");
+        std::fs::create_dir(&group).unwrap();
+        let max = group.join("memory.max");
+        let high = group.join("memory.high");
+        std::fs::write(&max, b"8192\n").unwrap();
+        std::fs::write(&high, b"max\n").unwrap();
+        let mut held = HeldFiles::default();
+        held.discover([max.clone(), high.clone(), group.join("missing")].into_iter());
+        let mut buf = Vec::new();
+        let first_len = held.read(&max, &mut buf).unwrap();
+        assert_eq!(
+            crate::collect::parse::cgroup::memory_limit(&buf[..first_len]),
+            Some(Limit::Value(8192))
+        );
+        let high_len = held.read(&high, &mut buf).unwrap();
+        assert_eq!(
+            crate::collect::parse::cgroup::memory_limit(&buf[..high_len]),
+            Some(Limit::Max)
+        );
+        assert!(held.read(&group.join("missing"), &mut buf).is_none());
+        for _ in 0..20 {
+            let length = held.read(&max, &mut buf).unwrap();
+            assert_eq!(
+                crate::collect::parse::cgroup::memory_limit(&buf[..length]),
+                Some(Limit::Value(8192))
+            );
+        }
+        std::fs::rename(&max, group.join("memory.max.old")).unwrap();
+        assert_eq!(held.read(&max, &mut buf), Some(5));
     }
 
     #[test]

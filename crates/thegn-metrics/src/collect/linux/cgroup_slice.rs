@@ -3,7 +3,7 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use super::cgroup::{DeviceFilter, RealFs, cgroup2_root, read_group};
+use super::cgroup::{DeviceFilter, HeldFiles, RealFs, cgroup2_root, read_group};
 use crate::collect::env::{self, Env};
 use crate::collect::frame::MonitorFrame;
 use crate::collect::health::{Absent, Health};
@@ -47,9 +47,43 @@ fn path_from_membership(root: &Path, relative: &[u8]) -> Option<PathBuf> {
     Some(root.join(std::ffi::OsStr::from_bytes(relative)))
 }
 
+#[derive(Default)]
+struct LimitFold {
+    minimum: Option<u64>,
+    all_max: bool,
+    observed: bool,
+}
+
+impl LimitFold {
+    fn include(&mut self, limit: Option<crate::collect::model::cgroup::Limit>) {
+        use crate::collect::model::cgroup::Limit;
+
+        self.observed = true;
+        match limit {
+            Some(Limit::Value(value)) => {
+                self.all_max = false;
+                self.minimum = Some(self.minimum.map_or(value, |current| current.min(value)));
+            }
+            Some(Limit::Max) => {}
+            None => self.all_max = false,
+        }
+    }
+
+    fn result(self) -> Option<crate::collect::model::cgroup::Limit> {
+        use crate::collect::model::cgroup::Limit;
+
+        self.minimum
+            .map(Limit::Value)
+            .or_else(|| (self.observed && self.all_max).then_some(Limit::Max))
+    }
+}
+
 #[derive(Debug, Default)]
 pub struct CgroupSliceCollector {
     path: Option<PathBuf>,
+    own_leaf: Option<PathBuf>,
+    own_chain: Vec<PathBuf>,
+    held: HeldFiles,
     filter: DeviceFilter,
     fs: RealFs,
     buffer: Vec<u8>,
@@ -65,6 +99,9 @@ impl Collector for CgroupSliceCollector {
     }
 
     fn discover(&mut self, env: &Env) -> Health {
+        self.held = HeldFiles::default();
+        self.own_leaf = None;
+        self.own_chain.clear();
         let root = env
             .cgroup_root
             .as_deref()
@@ -81,8 +118,35 @@ impl Collector for CgroupSliceCollector {
             self.path = None;
             return Health::Absent(Absent::NotOnThisOs);
         };
+        let own_membership = env::self_cgroup_v2(&membership);
+        let own_leaf = own_membership
+            .and_then(|member| path_from_membership(&root, member.strip_prefix(b"/")?));
+        self.own_leaf = own_leaf.clone();
+        self.own_chain.clear();
+        if let Some(leaf) = own_leaf.as_ref() {
+            let mut level = leaf.clone();
+            loop {
+                self.own_chain.push(level.clone());
+                if level == root || !level.pop() || !level.starts_with(&root) {
+                    break;
+                }
+            }
+        }
         self.filter = DeviceFilter::from_sys_block(Path::new("/sys/block"));
+        let slice_path = path.clone();
         self.path = Some(path);
+        let own_paths = self.own_chain.iter().flat_map(|dir| {
+            [
+                dir.join("memory.current"),
+                dir.join("memory.max"),
+                dir.join("memory.high"),
+            ]
+        });
+        self.held.discover(own_paths.chain([
+            slice_path.join("memory.current"),
+            slice_path.join("memory.max"),
+            slice_path.join("memory.high"),
+        ]));
         Health::Ok
     }
 
@@ -102,12 +166,56 @@ impl Collector for CgroupSliceCollector {
             &mut part.sample,
             &mut self.path_buffer,
         );
+        if let Some(length) = self
+            .held
+            .read(&path.join("memory.current"), &mut self.buffer)
+        {
+            part.sample.mem_current =
+                crate::collect::parse::cgroup::single_u64(&self.buffer[..length]);
+        }
+        if let Some(length) = self.held.read(&path.join("memory.max"), &mut self.buffer) {
+            part.sample.mem_max =
+                crate::collect::parse::cgroup::memory_limit(&self.buffer[..length]);
+        }
+        if let Some(length) = self.held.read(&path.join("memory.high"), &mut self.buffer) {
+            part.sample.mem_high =
+                crate::collect::parse::cgroup::memory_limit(&self.buffer[..length]);
+        }
+        part.own_current = self.own_leaf.as_ref().and_then(|leaf| {
+            self.held
+                .read(&leaf.join("memory.current"), &mut self.buffer)
+                .and_then(|length| {
+                    crate::collect::parse::cgroup::single_u64(&self.buffer[..length])
+                })
+        });
+        let mut effective = LimitFold {
+            all_max: true,
+            ..LimitFold::default()
+        };
+        for level in &self.own_chain {
+            for name in ["memory.max", "memory.high"] {
+                let limit = self
+                    .held
+                    .read(&level.join(name), &mut self.buffer)
+                    .and_then(|length| {
+                        crate::collect::parse::cgroup::memory_limit(&self.buffer[..length])
+                    });
+                effective.include(limit);
+            }
+        }
+        part.effective_limit = effective.result();
+        if self.held.take_reopen_needed() {
+            return Err(CollectError::Gone);
+        }
         frame.sampled.insert(CollectorId::CgroupSlice);
         Ok(())
     }
 
     fn close(&mut self) {
         self.path = None;
+        self.own_leaf = None;
+        self.own_chain.clear();
+        self.held = HeldFiles::default();
         self.filter.devices.clear();
         self.buffer.clear();
         self.path_buffer.clear();
@@ -116,10 +224,39 @@ impl Collector for CgroupSliceCollector {
 
 #[cfg(test)]
 mod tests {
-    use super::{CgroupSliceCollector, discover_slice};
+    use super::{CgroupSliceCollector, LimitFold, discover_slice};
     use crate::collect::frame::MonitorFrame;
     use crate::collect::health::{Absent, Health};
     use crate::collect::{Collector, TickCtx, env::Env};
+
+    #[test]
+    fn effective_limit_uses_minimum_numeric_value_and_only_reports_all_max_when_complete() {
+        use crate::collect::model::cgroup::Limit;
+
+        let mut limits = LimitFold {
+            all_max: true,
+            ..LimitFold::default()
+        };
+        limits.include(Some(Limit::Max));
+        limits.include(Some(Limit::Value(4096)));
+        limits.include(Some(Limit::Value(2048)));
+        assert_eq!(limits.result(), Some(Limit::Value(2048)));
+
+        let mut unlimited = LimitFold {
+            all_max: true,
+            ..LimitFold::default()
+        };
+        unlimited.include(Some(Limit::Max));
+        unlimited.include(Some(Limit::Max));
+        assert_eq!(unlimited.result(), Some(Limit::Max));
+
+        let mut unreadable = LimitFold {
+            all_max: true,
+            ..LimitFold::default()
+        };
+        unreadable.include(None);
+        assert_eq!(unreadable.result(), None);
+    }
 
     #[test]
     fn discovers_the_slice_from_mixed_membership_and_rejects_outside_paths() {
