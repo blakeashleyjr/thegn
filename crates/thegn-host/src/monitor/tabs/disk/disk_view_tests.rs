@@ -38,8 +38,8 @@ fn frame_fixture() -> MonitorFrame {
             kind: DevKind::Disk,
             physical: true,
             parent: None,
-            read_bps: Some(6_000_000.0),
-            write_bps: Some(1_125_000.0),
+            read_bps: Some(3_000_000.0 + f64::from(index) * 1_500_000.0),
+            write_bps: Some(350_000.0 + f64::from(index) * 220_000.0),
             read_iops: Some(150.0),
             write_iops: Some(48.0),
             util_pct: Some(25.0 + f64::from(index) * 7.0),
@@ -53,9 +53,9 @@ fn frame_fixture() -> MonitorFrame {
             source: format!("nvme{index}n1"),
             superblock_dev: format!("259:{index}"),
             kind: FilesystemKind::Local,
-            total_bytes: Some(1_000_000_000_000),
-            free_bytes: Some(240_000_000_000),
-            avail_bytes: Some(220_000_000_000),
+            total_bytes: Some(500_000_000_000 + u64::from(index) * 125_000_000_000),
+            free_bytes: Some(40_000_000_000 + u64::from(index) * 19_000_000_000),
+            avail_bytes: Some(35_000_000_000 + u64::from(index) * 17_000_000_000),
             total_inodes: None,
             free_inodes: None,
             avail_inodes: None,
@@ -160,6 +160,8 @@ fn absorbs_disk_frame_and_reuses_warm_buffers() {
     );
     assert_eq!(model.read_history.len, 240);
     assert_eq!(model.write_history.len, 240);
+    assert_eq!(model.psi_some_history.len, 240);
+    assert_eq!(model.psi_full_history.len, 240);
     assert_eq!(model.device_history.len(), 8);
     assert!(
         model
@@ -184,10 +186,31 @@ fn snapshots_cover_target_sizes_capabilities_and_static_panel_demand() {
         frame.parts.diskstats.aggregate.write_bps =
             Some(2_000_000.0 + f64::from(239 - tick) * 25_000.0);
         for (index, device) in frame.parts.diskstats.devices.iter_mut().enumerate() {
+            device.read_bps = Some(
+                1_000_000.0
+                    + f64::from(index as u16) * 1_000_000.0
+                    + f64::from(tick % 31) * 75_000.0,
+            );
+            device.write_bps = Some(
+                250_000.0 + f64::from(index as u16) * 250_000.0 + f64::from(tick % 23) * 20_000.0,
+            );
             device.util_pct = Some(f64::from((tick + index as u16 * 11) % 100));
+        }
+        if let Some(line) = &mut frame.parts.psi.io.file.some {
+            line.avg10 = 1200 + u32::from((tick * 17) % 7600);
+        }
+        if let Some(line) = &mut frame.parts.psi.io.file.full {
+            line.avg10 = 500 + u32::from((tick * 29) % 6500);
         }
         model.absorb_frame(&frame);
     }
+    if let Some(line) = &mut frame.parts.psi.io.file.some {
+        line.avg10 = 4800;
+    }
+    if let Some(line) = &mut frame.parts.psi.io.file.full {
+        line.avg10 = 4000;
+    }
+    model.absorb_frame(&frame);
     for (cols, rows) in [(100, 30), (160, 45), (240, 60)] {
         for (unicode, depth) in [
             (UnicodeLevel::Full, ColorDepth::Truecolor),
@@ -236,8 +259,22 @@ fn snapshots_cover_target_sizes_capabilities_and_static_panel_demand() {
                     }
                     assert_eq!(demand, expected);
                     if (cols, rows) == (240, 60) {
-                        // V-DSK-1b adds the device tree, btrfs dossier, and per-device read/write history.
-                        assert!(fill_ratio(&surface, Rect::full(cols, rows)) >= 0.30);
+                        let ratio = fill_ratio(&surface, Rect::full(cols, rows));
+                        match (unicode, depth) {
+                            (UnicodeLevel::Full, ColorDepth::Truecolor) => {
+                                // density follow-up (batch 48)
+                                assert!(ratio >= 0.30, "fill ratio {ratio:.3}");
+                            }
+                            (UnicodeLevel::Full, ColorDepth::Ansi16) => {
+                                // density follow-up (batch 48)
+                                assert!(ratio >= 0.30, "fill ratio {ratio:.3}");
+                            }
+                            (UnicodeLevel::Ascii, ColorDepth::None) => {
+                                // density follow-up (batch 48): ASCII glyphs limit graph density.
+                                assert!(ratio >= 0.24, "fill ratio {ratio:.3}");
+                            }
+                            _ => unreachable!(),
+                        }
                     }
                 })
             });
@@ -258,6 +295,7 @@ fn fill_ratio(surface: &Surface, area: Rect) -> f32 {
                 && x < area.x.saturating_add(area.cols)
                 && !cell.str().is_empty()
                 && cell.str() != " "
+                && cell.str() != "\u{2800}"
             {
                 occupied += cell.width();
             }
@@ -271,6 +309,25 @@ fn fill_ratio(surface: &Surface, area: Rect) -> f32 {
                 .saturating_sub(area.y),
         );
     occupied as f32 / area_cells.max(1) as f32
+}
+
+#[test]
+fn io_peak_scale_remains_visible_beside_the_history_graphs() {
+    let mut model = DiskModel::default();
+    let mut frame = frame_fixture();
+    for tick in 0_u16..240 {
+        frame.parts.diskstats.aggregate.read_bps = Some(10_000_000.0 + f64::from(tick) * 100_000.0);
+        frame.parts.diskstats.aggregate.write_bps = Some(2_000_000.0 + f64::from(tick) * 25_000.0);
+        model.absorb_frame(&frame);
+    }
+    for (cols, rows) in [(100, 30), (240, 60)] {
+        let (surface, _, _) = render(&model, cols, rows);
+        let text = surface.screen_chars_to_string();
+        assert!(
+            text.contains("peak"),
+            "peak missing at {cols}x{rows}: {text}"
+        );
+    }
 }
 
 #[test]
