@@ -196,8 +196,16 @@ impl NetworkModel {
             *axis_max = series.axis_max;
             let first_real = series.gap.iter().position(|gap| !gap);
             if let Some(first_real) = first_real {
+                let mut held = None;
                 for (value, gap) in series.hi.iter().zip(series.gap.iter()).skip(first_real) {
-                    ring.push(if *gap { f32::NAN } else { *value });
+                    if *gap {
+                        ring.push(held.unwrap_or(f32::NAN));
+                    } else {
+                        ring.push(*value);
+                        if value.is_finite() {
+                            held = Some(*value);
+                        }
+                    }
                 }
             }
         }
