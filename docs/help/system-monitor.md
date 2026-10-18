@@ -79,8 +79,10 @@ at the normal, non-live rate, so resuming shows no gap; the monitor's detailed
 sampler stops until you resume. That makes a paused monitor cheaper than a live
 one.
 
-On the Overview, CPU, Memory and Power tabs, the sampler reads only
-what the panels on screen need; the other tabs still read every collector.
+On the Overview, CPU, Memory, Thermal, Network and Power tabs, and on the GPU
+tab when an amdgpu device is present, the sampler reads only what the panels
+on screen need. The other tabs, and the GPU tab on other hardware (where it
+keeps the NVML-backed sections), still read every collector.
 When paused or covered, the monitor's detailed sampler parks; nothing runs once
 the monitor is closed.
 
