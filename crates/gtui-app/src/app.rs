@@ -37,6 +37,8 @@ pub struct ObserveApp {
     pub selected_panel: usize,
     panels: HashMap<u32, PanelState>,
     windows: HashMap<u32, TimeRange>,
+    generations: HashMap<u32, u64>,
+    generation_counter: u64,
     frames_rx: mpsc::Receiver<PanelUpdate>,
     cmd_tx: mpsc::UnboundedSender<EngineCmd>,
     gate: Arc<WakeGate>,
@@ -75,6 +77,8 @@ impl ObserveApp {
             selected_panel: 0,
             panels,
             windows: HashMap::new(),
+            generations: HashMap::new(),
+            generation_counter: 0,
             frames_rx,
             cmd_tx,
             gate,
@@ -101,12 +105,19 @@ impl ObserveApp {
         // this point re-arms a wake instead of being swallowed by a stale flag.
         self.gate.drained();
         while let Ok(update) = self.frames_rx.try_recv() {
-            let state = PanelState::Ready(update.targets);
-            self.panels.insert(update.panel_id, state);
-            self.windows.insert(update.panel_id, update.window);
+            self.apply_update(update);
             changed = true;
         }
         changed
+    }
+
+    fn apply_update(&mut self, update: PanelUpdate) {
+        self.generation_counter = self.generation_counter.wrapping_add(1);
+        self.generations
+            .insert(update.panel_id, self.generation_counter);
+        self.panels
+            .insert(update.panel_id, PanelState::Ready(update.targets));
+        self.windows.insert(update.panel_id, update.window);
     }
 
     /// Latest state for a panel (`Loading` until its first result lands).
@@ -117,6 +128,12 @@ impl ObserveApp {
     /// Latest resolved query window for a panel, if a refresh has completed.
     pub fn panel_window(&self, panel_id: u32) -> Option<&TimeRange> {
         self.windows.get(&panel_id)
+    }
+
+    /// Monotonic identity for the latest drained result for this panel.
+    /// Returns zero until the panel has received an update.
+    pub fn panel_generation(&self, panel_id: u32) -> u64 {
+        self.generations.get(&panel_id).copied().unwrap_or(0)
     }
 
     /// Ask the engine to re-run every panel now. Non-blocking best-effort.
@@ -158,6 +175,7 @@ mod tests {
         assert!(matches!(app.panel_state(1), PanelState::Loading));
         // An id with no panel still reports Loading, never panics.
         assert!(matches!(app.panel_state(9999), PanelState::Loading));
+        assert_eq!(app.panel_generation(1), 0);
     }
 
     #[tokio::test]
@@ -174,6 +192,8 @@ mod tests {
         );
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         assert!(app.tick(), "expected at least one panel update to drain");
+        let first = app.panel_generation(1);
+        assert!(first > 0, "a drained update advances the panel generation");
         assert!(
             matches!(app.panel_state(1), PanelState::Ready(targets) if targets.iter().all(|target| target.result.is_err()))
         );
@@ -181,5 +201,37 @@ mod tests {
             .panel_window(1)
             .expect("drained update carries its query window");
         assert_eq!(window.to - window.from, chrono::Duration::minutes(15));
+        app.request_requery();
+        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+        assert!(app.tick(), "expected requery updates to drain");
+        assert!(app.panel_generation(1) > first);
+    }
+
+    #[tokio::test]
+    async fn each_panel_update_advances_only_that_panel_generation() {
+        let mut app = ObserveApp::new(
+            Handle::current(),
+            builtin_host_dashboard(),
+            HashMap::new(),
+            now_range(),
+            std::time::Duration::from_secs(15),
+            Arc::new(|| {}),
+        );
+        let window = now_range();
+        app.apply_update(PanelUpdate {
+            panel_id: 1,
+            targets: Vec::new(),
+            window: window.clone(),
+        });
+        let first = app.panel_generation(1);
+        assert!(first > 0);
+        assert_eq!(app.panel_generation(2), 0);
+        app.apply_update(PanelUpdate {
+            panel_id: 1,
+            targets: Vec::new(),
+            window,
+        });
+        assert!(app.panel_generation(1) > first);
+        assert_eq!(app.panel_generation(2), 0);
     }
 }
