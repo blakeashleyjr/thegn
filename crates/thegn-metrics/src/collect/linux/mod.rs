@@ -10,6 +10,7 @@ pub mod cpu_topology;
 pub mod cpufreq;
 pub mod disk_topology;
 pub mod diskstats;
+pub mod drm_fdinfo;
 pub mod gpu_discover;
 pub mod hwmon;
 pub mod loadavg;
