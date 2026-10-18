@@ -190,6 +190,9 @@ pub fn default_collectors() -> Vec<Box<dyn Collector>> {
         Box::new(linux::cpu_sched::CpuSchedCollector::new());
     collectors[CollectorId::ThermalZone.index()] =
         Box::new(linux::thermal_zones::ThermalZoneCollector::new());
+    collectors[CollectorId::Powercap.index()] = Box::new(linux::powercap::PowercapCollector::at(
+        "/sys/class/powercap",
+    ));
     collectors
 }
 
@@ -221,6 +224,7 @@ mod default_collectors_tests {
             CollectorId::CpuIrq,
             CollectorId::CpuSched,
             CollectorId::ThermalZone,
+            CollectorId::Powercap,
         ] {
             assert_ne!(
                 collectors[id.index()].cadence(),
