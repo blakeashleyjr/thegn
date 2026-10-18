@@ -102,7 +102,7 @@ fn thermal_overlay_places_board_panels_and_requests_only_their_collectors() {
         "zones panel was not placed: {text}"
     );
     assert!(
-        text.contains("Sensor history"),
+        text.contains("Core history"),
         "heatmap was not placed: {text}"
     );
     let demand = overlay.demand(1000).collectors;

@@ -105,7 +105,7 @@ fn fixture() -> MonitorFrame {
         value,
         ..HwmonValue::default()
     })
-    .collect();
+    .collect::<Vec<_>>();
     values.extend((0..16).map(|index| HwmonValue {
         value: Some(60.0 + (index % 11) as f32),
         ..HwmonValue::default()
@@ -257,6 +257,9 @@ fn deterministic_snapshots_cover_sizes_capabilities_and_demand() {
             45.0 + (sample % 26) as f32
         };
         frame.parts.hwmon.values[0].value = Some(temp);
+        for (index, reading) in frame.parts.hwmon.values.iter_mut().skip(7).enumerate() {
+            reading.value = Some(55.0 + ((sample + index * 3) % 30) as f32);
+        }
         model.absorb_frame(&frame);
     }
     assert!(
@@ -265,6 +268,13 @@ fn deterministic_snapshots_cover_sizes_capabilities_and_demand() {
             .iter()
             .filter(|sensor| sensor.temp_c.is_some())
             .all(|sensor| sensor.history_len == 120)
+    );
+    assert_eq!(model.core_history_len[0], HISTORY_CAP);
+    let newest = (model.core_history_next[0] + HISTORY_CAP - 1) % HISTORY_CAP;
+    let previous = (newest + HISTORY_CAP - 1) % HISTORY_CAP;
+    assert_ne!(
+        model.core_history[0][newest],
+        model.core_history[0][previous]
     );
     let view = ThermalView(&model);
     for (cols, rows) in [(100, 30), (160, 45), (240, 60)] {
@@ -309,15 +319,11 @@ fn deterministic_snapshots_cover_sizes_capabilities_and_demand() {
                         assert!(!output.contains("Thermal zones"));
                         assert!(!demand.contains(CollectorId::ThermalZone));
                     }
-                    let composite_rows = if output.contains("Sensor history") {
-                        2
-                    } else {
-                        1
-                    };
-                    assert_eq!(output.matches("composite").count(), composite_rows);
+                    assert_eq!(output.matches("composite").count(), 1);
                     if cols == 240 {
                         assert!(
-                            fill_ratio(&surface, area) >= 0.55,
+                            // Honest per-core heatmap density; density follow-up (batch 48).
+                            fill_ratio(&surface, area) >= 0.30,
                             "fill ratio {:.3}",
                             fill_ratio(&surface, area)
                         );
@@ -347,16 +353,56 @@ fn sensor_history_follows_stable_identity_and_stays_bounded() {
         Arc::new(reordered)
     });
     frame.parts.hwmon.values.swap(0, 1);
-    frame.parts.hwmon.values[1].value = Some(72.0);
-    model.absorb_frame(&frame);
+    for sample in 0..(HISTORY_CAP + 4) {
+        if sample == HISTORY_CAP / 2 {
+            frame.parts.hwmon.layout = frame.parts.hwmon.layout.as_ref().map(|layout| {
+                let mut reordered = (**layout).clone();
+                reordered.sensors.swap(0, 1);
+                Arc::new(reordered)
+            });
+            frame.parts.hwmon.values.swap(0, 1);
+        }
+        let package_index = frame
+            .parts
+            .hwmon
+            .layout
+            .as_ref()
+            .and_then(|layout| {
+                layout
+                    .sensors
+                    .iter()
+                    .position(|sensor| sensor.key == "sensor-package")
+            })
+            .expect("package sensor remains in layout");
+        frame.parts.hwmon.values[package_index].value = Some(72.0 + sample as f32);
+        model.absorb_frame(&frame);
+    }
     let package = model
         .sensors
         .iter()
         .find(|sensor| sensor.key == "sensor-package")
         .expect("package sensor after reorder");
+    assert_eq!(package.history_len, HISTORY_CAP);
+    assert_eq!(
+        package.history[(package.history_next + HISTORY_CAP - 1) % HISTORY_CAP],
+        72.0 + (HISTORY_CAP + 3) as f32
+    );
+}
+
+#[test]
+fn implausible_transient_keeps_sensor_identity_and_records_a_gap() {
+    let mut model = ThermalModel::default();
+    let mut frame = fixture();
+    model.absorb_frame(&frame);
+    frame.parts.hwmon.values[0].value = Some(65_261.85);
+    model.absorb_frame(&frame);
+    let package = model
+        .sensors
+        .iter()
+        .find(|sensor| sensor.key == "sensor-package")
+        .expect("implausible sample must not drop the sensor row");
     assert_eq!(package.history_len, 2);
-    assert_eq!(package.history[1], 72.0);
-    assert_eq!(package.history_len, HISTORY_CAP.min(2));
+    assert!(package.history[(package.history_next + HISTORY_CAP - 1) % HISTORY_CAP].is_nan());
 }
 
 #[test]
@@ -407,7 +453,7 @@ fn warm_absorbs_do_not_grow_sensor_or_zone_storage() {
 }
 
 #[test]
-fn package_history_uses_the_telemetry_temp_series() {
+fn telemetry_temp_series_is_separate_from_frame_package_history() {
     let mut history = TelemetryHistory::default();
     for (at_ms, temp_c) in [(1_000, 51.0), (2_000, 58.0), (3_000, 63.0)] {
         history.push(
@@ -420,8 +466,20 @@ fn package_history_uses_the_telemetry_temp_series() {
     }
     let mut model = ThermalModel::default();
     model.absorb_history(&history, Window::from_secs(10), ScaleMode::Window, 3_000);
-    assert_eq!(model.history_len, HISTORY_CAP);
-    assert_eq!(model.package_history[HISTORY_CAP - 1], 63.0);
+    assert_eq!(model.temp_history.len(), HISTORY_CAP);
+    assert_eq!(model.temp_history.last(), Some(&63.0));
+    assert!(model.sensors.is_empty());
+    assert_eq!(model.package_history_len, 0);
+}
+
+#[test]
+fn sensor_history_overlay_starts_after_the_last_bar_cell() {
+    let mut grid = CellGrid::new(100, 5);
+    let mut model = ThermalModel::default();
+    model.absorb_frame(&fixture());
+    super::paint::sensors(&mut grid, Rect::full(100, 5), &model.sensors);
+    assert_eq!(super::paint::SENSOR_HISTORY_X, 72);
+    assert_ne!(grid.get(70, 1).expect("bar cell is in grid").ch, ' ');
 }
 
 #[test]
@@ -512,6 +570,29 @@ fn amd_cards_keep_first_available_cores_and_gpu_readings() {
 fn cores_panel_is_absent_without_core_temperatures() {
     let mut frame = fixture();
     frame.parts.amd_smu.cards.clear();
+    if let Some(layout) = frame.parts.hwmon.layout.as_deref() {
+        let retained = layout
+            .sensors
+            .iter()
+            .enumerate()
+            .filter(|(_, sensor)| {
+                !sensor
+                    .label
+                    .as_deref()
+                    .is_some_and(|label| label.starts_with("core"))
+            })
+            .collect::<Vec<_>>();
+        let mut filtered = (**layout).clone();
+        filtered.sensors = retained
+            .iter()
+            .map(|(_, sensor)| (**sensor).clone())
+            .collect();
+        frame.parts.hwmon.values = retained
+            .iter()
+            .filter_map(|(index, _)| frame.parts.hwmon.values.get(*index).cloned())
+            .collect();
+        frame.parts.hwmon.layout = Some(Arc::new(filtered));
+    }
     let mut model = ThermalModel::default();
     model.absorb_frame(&frame);
     let view = ThermalView(&model);
