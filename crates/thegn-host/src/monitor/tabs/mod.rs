@@ -115,5 +115,8 @@ mod presence_tests {
             ..StatsSnapshot::default()
         };
         assert!(MonitorTab::Power.present(&battery_snapshot, false));
+
+        let empty_snapshot = StatsSnapshot::default();
+        assert!(!MonitorTab::Power.present(&empty_snapshot, false));
     }
 }
