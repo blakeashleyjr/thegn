@@ -237,6 +237,7 @@ mod revtunnel;
 mod run;
 mod sandbox_admission;
 mod sandbox_events;
+mod sandbox_fallback_memo;
 mod sandbox_start;
 mod scan_pool;
 mod sched;

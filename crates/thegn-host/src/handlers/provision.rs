@@ -120,6 +120,9 @@ pub(crate) fn handle_sandbox_retry_choice(
         // replaying the "absent" answer that got us here.
         menu::MenuChoice::SandboxStartRuntime(name) => {
             let name = name.clone();
+            if let Some(wt) = active_wt {
+                crate::sandbox_fallback_memo::clear_worktree(&wt.to_string_lossy());
+            }
             *status = format!("Starting {name}…");
             thegn_core::thread_name::spawn_named("thegn-sbx-start", move || {
                 crate::platform::qos::set_self(crate::platform::qos::Qos::Utility); // Utility: user-requested runtime start.

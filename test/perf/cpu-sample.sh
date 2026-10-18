@@ -327,13 +327,19 @@ if [ "$SCENARIO" = soak-daemon ]; then
   printf '[daemon]\nsocket = "%s"\n' "$DAEMON_SOCK_CONFIG" >"$XDG_CONFIG_HOME/thegn/config.toml"
 fi
 perf_sandbox_off_default
+if [ "$SCENARIO" = soak ] || [ "$SCENARIO" = soak-daemon ]; then
+  # The first auto-fetch's per-worktree remote probes belong outside the soak window.
+  printf '\n[git]\nauto_fetch = false\n' >>"$XDG_CONFIG_HOME/thegn/config.toml"
+fi
 perf_seed_fixture_registry "$WORKTREES" "$BIN_ABS" "$REPO"
+perf_check_systemd_calls
 LOG_FILE="$XDG_STATE_HOME/thegn/logs/thegn.log"
 rm -f -- "$LOG_FILE"
 # Verify registry adoption in a short instrumented launch so idle measurements
 # retain their original no-sink environment.
 # Usage switch: TG_PERF_SANDBOX=1 measures sandboxed panes and requires the
-# original runtime directory's user bus for `systemd-run --user --scope`.
+# Sandbox-on runs use cgroupfs and fail closed on systemd calls; the harness
+# verifies the shim log before reporting a result.
 VERIFY_PIDFILE="$PERF_TMP/verify.pid"
 printf -v VERIFY_INNER 'cd %q; stty rows 50 cols 200; env THEGN_NO_DAEMON=1 THEGN_BENCH_RUN_MS=30000 THEGN_LOG=thegn::hydrate=debug %q & echo $! > %q; wait' \
   "$REPO" "$BIN_ABS" "$VERIFY_PIDFILE"
@@ -951,6 +957,7 @@ if [ "$SPAWN_ENABLED" = 1 ] && [ "$SAMPLER" = proc ]; then
 fi
 
 INPUT_JSON="${INPUT_JSON:-null}"
+perf_check_systemd_calls
 RESULT="{\"scenario\":\"$SCENARIO\",\"build\":\"$BUILD\",\"worktrees\":$WORKTREES,\"worktrees_collected\":$WORKTREES_COLLECTED,\"window_ms\":$WINDOW_MS,\"settle_used_ms\":${SETTLE_USED_MS:-$SETTLE_MS},\"cores_total\":$CORES_TOTAL,\"threads\":$THREAD_JSON,\"resources\":$RES_JSON,\"spawn_rate\":$SPAWN_JSON,\"input\":$INPUT_JSON,\"git_sha\":\"$GIT_SHA\",\"host_tag\":\"$HOST_TAG\"}"
 
 BASELINE="$BASELINE_DIR/$HOST_TAG.$SCENARIO.json"

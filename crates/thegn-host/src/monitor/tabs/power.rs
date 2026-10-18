@@ -2,6 +2,10 @@
 
 pub(in crate::monitor) mod view;
 
+#[cfg(test)]
+#[path = "power/power_wire_tests.rs"]
+mod wire_tests;
+
 use super::super::build::*;
 use crate::chrome::S;
 use crate::sections::{Section, spacer};

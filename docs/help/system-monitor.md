@@ -79,10 +79,10 @@ at the normal, non-live rate, so resuming shows no gap; the monitor's detailed
 sampler stops until you resume. That makes a paused monitor cheaper than a live
 one.
 
-On the Overview, CPU and Memory tabs, the sampler reads only what the panels
-on screen need; the other tabs still read every collector. When paused or
-covered, the monitor's detailed sampler parks; nothing runs once the monitor is
-closed.
+On the Overview, CPU, Memory and Power tabs, the sampler reads only
+what the panels on screen need; the other tabs still read every collector.
+When paused or covered, the monitor's detailed sampler parks; nothing runs once
+the monitor is closed.
 
 Note two deliberate differences from the other overlays: `Space` is pause here
 (use `PgDn` to page), and `g` cycles the graph style rather than jumping to the
@@ -111,11 +111,12 @@ when their source has a reading; absent readings use the terminal absent mark.
 ## CPU
 
 The CPU board shows total busy history and the current user, system, iowait, and
-steal shares. The `cpu.cores` panel labels known performance and efficiency
-cores and groups them by L3 cache; missing topology stays unlabelled. The
-`cpu.idle` panel shows C0 and reported idle-state residency per core. Frequency,
-load/pressure, IRQ/softirq, and scheduler wait have separate panels. Panel
-focus (`f`/`F`), zoom (`z`), and Escape follow the monitor board controls.
+steal shares, plus per-core heat. The `cpu.cores` panel labels known
+performance/efficiency cores with P/E badges and groups them by L3 cache;
+missing topology stays unlabelled. The `cpu.idle` panel shows C0 and reported
+C-state residency per core. Frequency, load/pressure, IRQ/softirq, and scheduler
+wait have separate panels. Panel focus (`f`/`F`), zoom (`z`), and Escape follow
+the monitor board controls.
 
 ## Memory
 
@@ -169,6 +170,11 @@ projection when the runway drops below a configured number of hours. The Disk
 masthead chip expands into this tab.
 
 The `worktrees filesystem` block reports total, available, and used space.
+`thegn doctor` also reports Disk health from UDisks2 when available, including
+health, critical warnings, wear, spare, read/write totals, power-on time, and
+the last four serial characters. Missing serial or health values show `n/a`.
+If UDisks2 is unavailable, the report says `n/a (udisks2 unavailable)` and
+gives the reason; it does not prompt.
 
 ## GPU
 
@@ -184,9 +190,13 @@ installed; otherwise it reads through `nvidia-smi`.
 
 ## Power
 
-The Power tab shows battery charge, power source, draw, and estimated time to
-full or empty when the source provides those readings. It appears when a
-battery source is available. The battery masthead chip expands into this tab.
+The Power tab has three panels: `power.rails` plots per-rail power history and
+shows available socket, package, battery, and powercap readings;
+`power.battery` shows battery charge, signed draw, energy, and history; and
+`power.policy` shows the platform profile, boost state, and CPU power policies.
+Unavailable readings use the platform's absent or warming mark. Panel focus and
+zoom use `f`/`F` and `z`. The tab appears when a battery source is available;
+the battery masthead chip opens it.
 
 ## Processes
 
@@ -197,6 +207,13 @@ The table fits its default columns to the available width. Today it shows PID,
 owner, CPU%, the CPU bar, RSS, and the sampled command name; tree indentation
 stays inside the command column. The command is the sampled process name, not
 its argument list.
+
+At 120 columns and wider, a summary above the table shows task, thread and
+kernel-thread totals; R/S/D/Z/T/I state counts; new and exited process counts
+since the previous pass; and CPU/RSS totals for the UI, daemon, panes and other
+processes. The D count uses the warning tone when any process is in disk wait.
+The first pass leaves CPU and new/exited values unknown until their baselines
+are available.
 
 - `c`, `m`, `n`, `p` sort by CPU, memory, name, or PID.
 - `r` reverses the sort direction.

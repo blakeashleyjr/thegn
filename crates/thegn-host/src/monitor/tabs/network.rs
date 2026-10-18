@@ -8,6 +8,12 @@ use crate::telemetry::Metric;
 use thegn_core::theme::Hue;
 use thegn_core::viz::Unit;
 
+pub(in crate::monitor) mod view;
+
+#[cfg(test)]
+#[path = "network/network_view_tests.rs"]
+mod view_tests;
+
 pub(in crate::monitor) fn network(cx: &Ctx) -> Vec<Section> {
     let s = &cx.model.stats;
     let rx = cx.series(Metric::NetRx);

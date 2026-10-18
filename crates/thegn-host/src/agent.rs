@@ -276,6 +276,17 @@ pub(crate) fn prepare_devcontainer(
     }
 }
 
+#[derive(Debug)]
+struct VpnAttachFailed(String);
+
+impl std::fmt::Display for VpnAttachFailed {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "sandbox vpn attach failed: {}", self.0)
+    }
+}
+
+impl std::error::Error for VpnAttachFailed {}
+
 /// Resolve and `ensure` the sandbox for `worktree` — the BLOCKING half of a
 /// launch (container inspect/image pull/start can take seconds-to-minutes), so
 /// callers must keep it off the event loop. No DB access: `backend_choice` is
@@ -304,6 +315,8 @@ pub fn prepare_sandbox_env(
     selected_env: Option<&str>,
 ) -> anyhow::Result<SandboxOutcome> {
     use crate::handlers::repo_trust::resolve_env_trusted;
+    let generation =
+        crate::config_startup::display().map_or(0, |admitted| admitted.revision().generation);
     let trusted = resolve_env_trusted(cfg, repo_root, loc, worktree, selected_env);
     let environment = trusted.environment;
     let devcontainer = trusted.devcontainer;
@@ -366,6 +379,9 @@ pub fn prepare_sandbox_env(
     } else {
         placement.clone()
     };
+    let fallback_key =
+        crate::sandbox_fallback_memo::Key::new(&env_name, &exec_placement.label(), worktree);
+    crate::sandbox_fallback_memo::observe_generation(generation, &fallback_key);
     let mut env_is_remote = environment.is_remote() && cwd_override.is_none();
     let mut route_ssh_target = if env_is_remote {
         match &placement {
@@ -785,13 +801,29 @@ pub fn prepare_sandbox_env(
             if let Some(note) = thegn_core::sandbox::hostname_rules_note(&spec) {
                 warnings.push(note);
             }
+            // The full candidate has passed the current floor, home and compose
+            // gates above. Reuse only its prior ensure/exec failure; those gates
+            // remain live for every resolution, including ones using this memo.
+            if let Some(previous_warning) = crate::sandbox_fallback_memo::reusable_failure(
+                explicit_choice,
+                generation,
+                &fallback_key,
+                spec.backend.label(),
+            ) {
+                warnings.push(previous_warning);
+                warnings.push(format!(
+                    "sandbox {}: reused this session's earlier failed probe",
+                    spec.backend.label()
+                ));
+                continue;
+            }
             // Keep the final validation adjacent to the effects it protects:
             // VPN attachment and container ensure/exec are reached only after
             // the fully composed spec has passed the admission gate.
             let launch = admit_final_sandbox_spec_then(&mut spec, |spec| {
                 // VPN up BEFORE the container (joins the sidecar netns); failure bails.
                 if let Err(e) = attach_vpn(spec) {
-                    anyhow::bail!("sandbox vpn attach failed for {worktree}: {e}");
+                    return Err(anyhow::Error::new(VpnAttachFailed(e.to_string())));
                 }
                 // `ensure` proves the container RUNNING, but not that OCI `exec` works
                 // (broken keep-id/crun); probe so the real error surfaces, not a vanish.
@@ -854,6 +886,14 @@ pub fn prepare_sandbox_env(
                     let m = format!("sandbox {} failed: {e}", spec.backend.label());
                     if explicit_choice {
                         anyhow::bail!("{m} for {worktree}")
+                    }
+                    if e.downcast_ref::<VpnAttachFailed>().is_none() {
+                        crate::sandbox_fallback_memo::remember_failure(
+                            generation,
+                            fallback_key.clone(),
+                            spec.backend.label(),
+                            &m,
+                        );
                     }
                     thegn_core::msg::warn(&format!("{m} for {worktree}; trying next backend"));
                     warnings.push(m);
@@ -1832,6 +1872,7 @@ pub fn request_force_host(worktree: &str) {
     if let Ok(mut s) = force_host_registry().lock() {
         s.insert(worktree.to_string());
     }
+    crate::sandbox_fallback_memo::clear_worktree(worktree);
 }
 
 /// Whether `worktree` is pinned to the host (see [`request_force_host`]).
@@ -1882,6 +1923,7 @@ pub fn clear_force_host(worktree: &str) {
     if let Ok(mut s) = force_host_registry().lock() {
         s.remove(worktree);
     }
+    crate::sandbox_fallback_memo::clear_worktree(worktree);
 }
 
 /// Clear the failure cooldown for the worktree's provider native exec so a

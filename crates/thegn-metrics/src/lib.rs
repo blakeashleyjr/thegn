@@ -2,8 +2,10 @@
 //! overlay. Sampled on the host's refresh-ticker thread (never the event loop)
 //! and handed over as a [`StatsSnapshot`].
 //!
-//! The substrate is `sysinfo` (CPU/mem/swap/net/disk/components/system) on
-//! every platform, plus two things sysinfo does not cover:
+//! Linux reads base CPU/memory/network values directly, with `sysinfo` retained
+//! for targeted process accounting and the remaining system data. Other
+//! platforms use `sysinfo` for CPU/mem/swap/net/disk and components, plus two
+//! things sysinfo does not cover:
 //! - **GPU** — Linux sysfs (`/sys/class/drm`) + `nvidia-smi`; `None` elsewhere.
 //! - **Battery** — native sysfs + adapter `online` flag on Linux,
 //!   `starship-battery` on other platforms.
@@ -63,7 +65,8 @@ pub use net_medium::{
     IfaceFact, MediumReason, MediumSelection, NetMedium, select_medium, select_medium_explained,
 };
 pub use procs::{
-    MIN_INTERVAL as PROC_MIN_INTERVAL, ProcOwner, ProcSample, ProcSampler, ProcSnapshot,
+    MIN_INTERVAL as PROC_MIN_INTERVAL, ProcOwner, ProcOwnerSummary, ProcOwnerTotals, ProcSample,
+    ProcSampler, ProcSnapshot, ProcSummary,
 };
 pub use sample::{StatsSampler, SystemInfo, TrackedSpec, probe_net_path};
 

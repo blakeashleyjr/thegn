@@ -13,6 +13,8 @@
 //! makes shell-script plugins impossible to write.
 
 mod env;
+#[cfg(test)]
+mod frame_corpus_tests;
 pub mod loader;
 pub(crate) mod platform;
 pub mod proc;

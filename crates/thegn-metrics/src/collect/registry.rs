@@ -167,6 +167,7 @@ fn copy_part(target: &mut Parts, source: &Parts, id: CollectorId) {
         CollectorId::Meminfo => target.meminfo.clone_from(&source.meminfo),
         CollectorId::Vmstat => target.vmstat.clone_from(&source.vmstat),
         CollectorId::Netdev => target.netdev.clone_from(&source.netdev),
+        CollectorId::NetWifi => target.net_wifi.clone_from(&source.net_wifi),
         CollectorId::Diskstats => target.diskstats.clone_from(&source.diskstats),
         CollectorId::Powercap => target.powercap.clone_from(&source.powercap),
         CollectorId::PowerSupply => target.power_supply.clone_from(&source.power_supply),
@@ -178,6 +179,7 @@ fn copy_part(target: &mut Parts, source: &Parts, id: CollectorId) {
         CollectorId::Filesystems => target.filesystems.clone_from(&source.filesystems),
         CollectorId::GpuDevices => target.gpu_devices.clone_from(&source.gpu_devices),
         CollectorId::GpuEngines => target.gpu_engines.clone_from(&source.gpu_engines),
+        CollectorId::GpuClients => target.gpu_clients.clone_from(&source.gpu_clients),
     }
 }
 

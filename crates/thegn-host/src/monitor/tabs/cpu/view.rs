@@ -1,4 +1,4 @@
-use crate::telemetry::{Metric, ScaleMode, SeriesReq, TelemetryHistory, Window};
+use crate::telemetry::{Metric, ScaleMode, SeriesBuf, SeriesReq, TelemetryHistory, Window};
 use crate::{
     compositor::Rect,
     monitor::{
@@ -46,6 +46,12 @@ impl Default for SampleRing {
 }
 
 impl SampleRing {
+    fn clear(&mut self) {
+        self.values.clear();
+        self.head = 0;
+        self.len = 0;
+    }
+
     fn push(&mut self, value: f32) {
         if self.len < CORE_HISTORY_SAMPLES {
             self.values.push(value);
@@ -153,6 +159,7 @@ pub(in crate::monitor) struct CpuModel {
     idle: thegn_metrics::collect::model::cpu_idle::CpuIdlePart,
     cpu_history: Vec<f32>,
     load_history: Vec<f32>,
+    history_buf: SeriesBuf,
     core_busy_history: Vec<SampleRing>,
     iowait_history: SampleRing,
     steal_history: SampleRing,
@@ -178,15 +185,24 @@ impl CpuModel {
         self.cpu_stat.total = source.total;
         self.cpu_stat.cores.clone_from(&source.cores);
         let core_count = source.cores.len().min(CORE_HISTORY_LIMIT);
-        self.core_busy_history
-            .resize_with(core_count, SampleRing::default);
-        self.core_busy_history.truncate(core_count);
-        for (history, core) in self.core_busy_history.iter_mut().zip(&source.cores) {
+        if self.core_busy_history.len() < core_count {
+            self.core_busy_history
+                .resize_with(core_count, SampleRing::default);
+        }
+        for (history, core) in self
+            .core_busy_history
+            .iter_mut()
+            .take(core_count)
+            .zip(&source.cores)
+        {
             let value = core
                 .share
                 .map(|share| f32::from(share.busy) / 1000.0)
                 .unwrap_or(f32::NAN);
             history.push(value);
+        }
+        for history in self.core_busy_history.iter_mut().skip(core_count) {
+            history.clear();
         }
         if let Some(total) = source.total {
             self.iowait_history.push(f32::from(total.iowait) / 1000.0);
@@ -283,18 +299,20 @@ impl CpuModel {
             (Metric::Cpu, &mut self.cpu_history),
             (Metric::Load, &mut self.load_history),
         ] {
-            let series = history.series(&SeriesReq {
-                metric,
-                window,
-                scale: TelemetryHistory::scale_for(metric, scale),
-                buckets: 240,
-                agg: thegn_core::series::Agg::Max,
-                now_ms,
-            });
-            if series.empty {
-                slot.clear();
-            } else {
-                slot.clone_from(&series.hi);
+            history.series_into(
+                &SeriesReq {
+                    metric,
+                    window,
+                    scale: TelemetryHistory::scale_for(metric, scale),
+                    buckets: 240,
+                    agg: thegn_core::series::Agg::Max,
+                    now_ms,
+                },
+                &mut self.history_buf,
+            );
+            slot.clear();
+            if !self.history_buf.empty() {
+                slot.extend_from_slice(self.history_buf.hi());
             }
         }
     }
@@ -382,3 +400,7 @@ mod paint;
 #[cfg(test)]
 #[path = "cpu_view_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "view_budget_tests.rs"]
+mod budget_tests;

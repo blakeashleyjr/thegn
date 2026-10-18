@@ -149,6 +149,7 @@ struct GlyphPartitionConfig<'a> {
     now: Instant,
     ttls: &'a GlyphTtls,
     since_active: &'a std::collections::HashMap<String, Duration>,
+    fingerprint_changed: &'a std::collections::HashSet<String>,
     since_ref_move: Option<Duration>,
 }
 
@@ -203,6 +204,10 @@ fn partition_glyph_paths(
             )
         });
         let window = glyph_window(is_active, touched, std::path::Path::new(p), config.ttls);
+        let window = crate::hydrate_tuning::fingerprint_adjusted_window(
+            config.fingerprint_changed.contains(p),
+            window,
+        );
         if should_rescan_glyphs(age, window) {
             if let Some((row, _)) = cached {
                 prior_for_scan.insert(p.clone(), row.clone());
@@ -1802,6 +1807,33 @@ fn collect_sidebar_status(
     let ref_generation = crate::diff_watch::current_ref_generation(&ref_path);
     let since_ref_move = observe_ref_generation(&ref_path, ref_generation, now)
         .map(|changed_at| now.saturating_duration_since(changed_at));
+    let fingerprints: std::collections::HashMap<
+        String,
+        Option<crate::hydrate_tuning::GlyphFingerprint>,
+    > = paths
+        .iter()
+        .map(|p| {
+            (
+                p.clone(),
+                crate::hydrate_tuning::glyph_fingerprint(p, std::path::Path::new(p)),
+            )
+        })
+        .collect();
+    let fingerprint_changed: std::collections::HashSet<String> = paths
+        .iter()
+        .filter(|p| {
+            crate::hydrate_tuning::glyph_fingerprint_changed(
+                p,
+                fingerprints.get(*p).copied().flatten(),
+            )
+        })
+        .cloned()
+        .collect();
+    if keep_ok {
+        let fingerprint_keep: std::collections::HashSet<String> =
+            paths.iter().chain(all_wt_paths.iter()).cloned().collect();
+        crate::hydrate_tuning::retain_glyph_fingerprints(&fingerprint_keep);
+    }
     // Resolve DB-backed location and bridge state before taking the UI-shared
     // glyph cache mutex. Reuse this hydration's Db instead of opening/querying
     // SQLite once per path while holding the cache lock.
@@ -1834,10 +1866,17 @@ fn collect_sidebar_status(
                 now,
                 ttls: &ttls,
                 since_active: &since_active,
+                fingerprint_changed: &fingerprint_changed,
                 since_ref_move,
             },
         )
     };
+    for path in &to_scan {
+        crate::hydrate_tuning::record_glyph_fingerprint(
+            path,
+            fingerprints.get(path).copied().flatten(),
+        );
+    }
 
     // (path, GlyphRow, clean) — git only, no DB access in the scope. `repo_root`
     // is the main-worktree root shared by every linked worktree of the repo; it

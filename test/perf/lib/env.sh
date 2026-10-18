@@ -14,8 +14,7 @@ set -euo pipefail
 # Create the throwaway root and export the isolated environment. Caller is
 # responsible for cleanup (or use perf_trap_cleanup).
 perf_make_tmp() {
-  local entry v real_runtime
-  real_runtime="${XDG_RUNTIME_DIR:-}"
+  local entry v command_name
   # A perf run must not inherit the developer's session controls, log routing,
   # or credentials. Keep TG_PERF_* so the harness's own knobs remain available.
   while IFS= read -r -d '' entry; do
@@ -30,14 +29,15 @@ perf_make_tmp() {
     esac
   done < <(env -0)
 
-  # Only sandbox-on measurements need the host user manager. Expose its private
-  # socket in the isolated runtime dir, keeping the session bus private.
+  # Never expose the host user manager to a perf run. Sandbox-on Podman uses
+  # cgroupfs, while systemd entry points fail closed and leave an audit log.
   unset DBUS_SESSION_BUS_ADDRESS
 
   PERF_TMP="$(mktemp -d "${TMPDIR:-/tmp}/tg-perf.XXXXXX")"
   export PERF_TMP
   export HOME="$PERF_TMP/home"
   export XDG_CONFIG_HOME="$PERF_TMP/config"
+  export XDG_DATA_HOME="$PERF_TMP/data"
   export XDG_STATE_HOME="$PERF_TMP/state"
   export XDG_CACHE_HOME="$PERF_TMP/cache"
   # ALSO the runtime dir, and this one is not cosmetic. The pane daemon's
@@ -60,21 +60,25 @@ perf_make_tmp() {
   ln -s "$(command -v bash)" "$PERF_PANE_SHELL"
   export PERF_PANE_SHELL
   export SHELL="$PERF_PANE_SHELL"
-  mkdir -p "$HOME" "$XDG_CONFIG_HOME" "$XDG_STATE_HOME" "$XDG_CACHE_HOME"
+  mkdir -p "$HOME" "$XDG_CONFIG_HOME" "$XDG_DATA_HOME" "$XDG_STATE_HOME" "$XDG_CACHE_HOME"
   # 0700 to match the real run dir: the daemon rejects a lax one.
   mkdir -p "$XDG_RUNTIME_DIR"
   chmod 700 "$XDG_RUNTIME_DIR"
   if [ "${TG_PERF_SANDBOX:-}" = 1 ]; then
-    if [ -n "$real_runtime" ] && [ -S "$real_runtime/systemd/private" ]; then
-      mkdir -p "$XDG_RUNTIME_DIR/systemd"
-      ln -s "$real_runtime/systemd/private" "$XDG_RUNTIME_DIR/systemd/private"
-    elif [ -n "$real_runtime" ] && [ -S "$real_runtime/bus" ]; then
-      export DBUS_SESSION_BUS_ADDRESS="unix:path=$real_runtime/bus"
-      echo 'perf: user manager private socket unavailable; exposing the session bus for TG_PERF_SANDBOX=1' >&2
-    else
-      echo 'perf: TG_PERF_SANDBOX=1 requires a user manager socket or session bus in the original XDG_RUNTIME_DIR' >&2
-      return 1
-    fi
+    mkdir -p "$XDG_CONFIG_HOME/containers"
+    printf '[engine]\ncgroup_manager = "cgroupfs"\nevents_logger = "file"\n\n[containers]\ncgroups = "disabled"\n' \
+      >"$XDG_CONFIG_HOME/containers/containers.conf"
+    export PATH="$PERF_TMP/bin:$PATH"
+    for command_name in systemd-run systemctl; do
+      cat >"$PERF_TMP/bin/$command_name" <<'SHIM'
+#!/usr/bin/env bash
+printf '%s' "${0##*/}" >>"$PERF_TMP/systemd-calls.log"
+printf ' <%q>' "$@" >>"$PERF_TMP/systemd-calls.log"
+printf '\n' >>"$PERF_TMP/systemd-calls.log"
+exit 1
+SHIM
+      chmod 700 "$PERF_TMP/bin/$command_name"
+    done
   fi
   # ~/.gitconfig is masked as a *directory* in some sandboxes; GIT_CONFIG_GLOBAL
   # points git at this file unconditionally.
@@ -95,11 +99,21 @@ perf_track_process_group() {
 
 perf_sandbox_off_default() {
   mkdir -p "$XDG_CONFIG_HOME/thegn"
+  printf '\n[media]\nenabled = false\n' >>"$XDG_CONFIG_HOME/thegn/config.toml"
   if [ "${TG_PERF_SANDBOX:-}" != 1 ]; then
     printf '\n[sandbox]\nenabled = false\n' >>"$XDG_CONFIG_HOME/thegn/config.toml"
   fi
   printf '\n[sandbox.limits]\ncpu_total = "off"\nmemory_total = "off"\n' \
     >>"$XDG_CONFIG_HOME/thegn/config.toml"
+}
+
+# Catch callers that ignored a fail-closed systemd shim's nonzero status.
+perf_check_systemd_calls() {
+  if [ -s "${PERF_TMP:-}/systemd-calls.log" ]; then
+    echo 'FAIL: sandbox-on perf run attempted to call the host systemd user manager:' >&2
+    cat "$PERF_TMP/systemd-calls.log" >&2
+    return 1
+  fi
 }
 
 perf_stop_process_group() {
@@ -212,11 +226,11 @@ perf_watch_process_group() {
   PERF_PROCESS_WATCHFILES["$pgid"]="$watchfile"
 }
 
-# Remove any podman pause process owned by this fixture, then remove its files.
-# Podman overlay layers may be owned by its user namespace, so retry deletion
-# through `podman unshare` when ordinary rm cannot remove the isolated tree.
+# Remove temporary files and any matching podman pause process owned by this
+# fixture. Podman overlay layers may be owned by its user namespace, so remove
+# them through `podman unshare` before trying ordinary rm.
 perf_cleanup() {
-  local d cmdline pgid ppid pidfile
+  local d pgid ppid pidfile pid
   if [ "${#PERF_PROCESS_GROUPS[@]}" -gt 0 ]; then
     for pgid in "${PERF_PROCESS_GROUPS[@]}"; do
       ppid="$(ps -o ppid= -p "$pgid" 2>/dev/null | tr -d ' ' || true)"
@@ -232,25 +246,39 @@ perf_cleanup() {
     rm -rf -- "$PERF_SOCK_DIR" || true
   fi
   if [ -n "${PERF_TMP:-}" ] && [ -e "$PERF_TMP" ]; then
-    if ! rm -rf -- "$PERF_TMP" && command -v podman >/dev/null 2>&1; then
+    # Podman-owned overlay files may be inaccessible outside its user namespace.
+    if [ -d "${XDG_DATA_HOME:-$HOME/.local/share}/containers/storage" ] &&
+      command -v podman >/dev/null 2>&1; then
       podman unshare rm -rf -- "$PERF_TMP" || true
+    fi
+    if [ -e "$PERF_TMP" ]; then
+      rm -rf -- "$PERF_TMP" || true
     fi
   fi
   # `podman unshare` can start a new pause process with this fixture's runtime
-  # environment, so scan after both deletion attempts. Match a path component.
-  if [ -n "${PERF_TMP:-}" ] && [ -d /proc ]; then
-    for d in /proc/[0-9]*; do
-      [ -r "$d/cmdline" ] && [ -r "$d/environ" ] || continue
-      cmdline="$(tr '\0' ' ' <"$d/cmdline" 2>/dev/null || true)"
-      case "$cmdline" in
-      *podman\ pause*)
-        if tr '\0' '\n' <"$d/environ" 2>/dev/null | grep -F -- "$PERF_TMP/" >/dev/null; then
-          kill "${d##*/}" 2>/dev/null || true
-        fi
-        ;;
-      esac
-    done
+  # environment, so scan after both deletion attempts. `/proc/PID/comm` holds
+  # `podman pause`; cmdline contains only `podman`. Read races are silent.
+  if [ -n "${PERF_TMP:-}" ] && [ -d "${PERF_PROC_ROOT:-/proc}" ]; then
+    while IFS= read -r pid; do
+      d="${PERF_PROC_ROOT:-/proc}/$pid"
+      if tr '\0' '\n' 2>/dev/null <"$d/environ" | grep -F -- "$PERF_TMP/" >/dev/null; then
+        "${PERF_KILL:-kill}" "$pid" 2>/dev/null || true
+      fi
+    done < <(perf_pause_pids)
   fi
+}
+
+# Print pause-process PIDs using procfs comm (cmdline is only `podman`).
+# Kept separate so the matcher can be exercised against an isolated proc tree.
+perf_pause_pids() {
+  local d comm proc_root="${PERF_PROC_ROOT:-/proc}"
+  [ -d "$proc_root" ] || return 0
+  for d in "$proc_root"/[0-9]*; do
+    [ -d "$d" ] || continue
+    if IFS= read -r comm 2>/dev/null <"$d/comm" && [ "$comm" = 'podman pause' ]; then
+      printf '%s\n' "${d##*/}"
+    fi
+  done
 }
 
 # Install an EXIT trap that removes the temp dir.
