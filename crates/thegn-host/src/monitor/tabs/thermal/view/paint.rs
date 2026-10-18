@@ -1,6 +1,4 @@
-#![allow(dead_code)] // helpers are reached by ThermalView painters
-
-use super::{SensorRow, ThermalModel, ZoneRow};
+use super::{HISTORY_CAP, SensorRow, ThermalModel, ZoneRow};
 use crate::{
     caps,
     chrome::S,
@@ -19,13 +17,21 @@ use thegn_core::{
 };
 use thegn_metrics::collect::model::{hwmon::ChipGroup, thermal_zone::ThermalTrip};
 
+const SENSOR_COLUMN_WIDTHS: [usize; 5] = [14, 22, 7, 12, 12];
+pub(super) const SENSOR_HISTORY_X: usize = SENSOR_COLUMN_WIDTHS[0]
+    + SENSOR_COLUMN_WIDTHS[1]
+    + SENSOR_COLUMN_WIDTHS[2]
+    + SENSOR_COLUMN_WIDTHS[3]
+    + SENSOR_COLUMN_WIDTHS[4]
+    + 5;
+
 pub(super) fn package(
     grid: &mut CellGrid,
     rect: Rect,
     sensor: Option<&SensorRow>,
-    history: &[f32; 120],
-    history_len: usize,
-    history_next: usize,
+    package_history: &[f32; HISTORY_CAP],
+    package_history_len: usize,
+    package_history_next: usize,
 ) {
     let Some(sensor) = sensor else {
         put(
@@ -85,26 +91,28 @@ pub(super) fn package(
             Tok::Slot(S::Dim),
         );
     }
-    let graph_rows = rect.rows.saturating_sub(3);
-    if graph_rows > 0 && history_len > 0 {
-        let mut values = [0.0_f32; 120];
-        let first = if history_len == values.len() {
-            history_next
-        } else {
-            0
-        };
-        let capacity = values.len();
-        let graph_width = rect.cols.min(capacity);
+    let mut frame_values = [0.0_f32; HISTORY_CAP];
+    let count = package_history_len.min(HISTORY_CAP);
+    let start = if package_history_len == HISTORY_CAP {
+        package_history_next
+    } else {
+        0
+    };
+    for (offset, value) in frame_values.iter_mut().take(count).enumerate() {
+        *value = package_history[(start + offset) % HISTORY_CAP];
+    }
+    let frame_history = &frame_values[..count];
+    if !frame_history.is_empty() {
+        put(grid, rect, 0, 3, "live 80/95 C", Tok::Slot(S::Dim));
+        let graph_width = rect
+            .cols
+            .saturating_sub(12)
+            .min(frame_history.len())
+            .min(HISTORY_CAP);
+        let mut values = [0.0_f32; HISTORY_CAP];
+        let first = frame_history.len().saturating_sub(graph_width);
         for (index, value) in values.iter_mut().take(graph_width).enumerate() {
-            // Scale the bounded history ring across the graph's available time axis.
-            // Each plotted column samples a real ring value; no synthetic readings are added.
-            let source_index = index.saturating_mul(history_len) / graph_width.max(1);
-            let source = (first + source_index) % capacity;
-            *value = thermal_level(
-                history[source],
-                sensor.max_c.unwrap_or(80.0),
-                sensor.crit_c.unwrap_or(95.0),
-            );
+            *value = thermal_level(frame_history[first + index], 80.0, 95.0);
         }
         let mut graph = crate::monitor::graphs::GraphOut::new();
         crate::monitor::graphs::paint_heatmap(
@@ -113,8 +121,19 @@ pub(super) fn package(
             RampId::Temp,
             &crate::chrome::palette_snapshot(),
         );
-        draw_graph(grid, rect, 0, 3, &graph.lines, graph_rows);
+        draw_graph(
+            grid,
+            rect,
+            rect.cols.saturating_sub(graph_width),
+            3,
+            &graph.lines,
+            1,
+        );
     }
+}
+
+pub(super) fn telemetry_label(grid: &mut CellGrid, rect: Rect) {
+    put(grid, rect, 0, 4, "telemetry 80/95 C", Tok::Slot(S::Dim));
 }
 
 pub(super) fn cores(grid: &mut CellGrid, rect: Rect, cores: &[Option<f32>; 16]) {
@@ -235,10 +254,10 @@ pub(super) fn sensors(grid: &mut CellGrid, rect: Rect, sensors: &[SensorRow]) {
             (Some(max), Some(crit)) => format!("{max:.0}/{crit:.0}"),
             (Some(max), None) => format!("max {max:.0}"),
             (None, Some(crit)) => format!("crit {crit:.0}"),
-            (None, None) => caps::active_glyphs().emdash.to_owned(),
+            (None, None) => "ref 100".to_owned(),
         })
         .collect::<Vec<_>>();
-    let bar_width = rect.cols.saturating_sub(14 + 22 + 7 + 12 + 4).max(8);
+    let bar_width = SENSOR_COLUMN_WIDTHS[4];
     let bars = sensors
         .iter()
         .map(|sensor| {
@@ -265,37 +284,45 @@ pub(super) fn sensors(grid: &mut CellGrid, rect: Rect, sensors: &[SensorRow]) {
             ),
             table::TableCell::Text(limit),
             table::TableCell::Text(bar),
+            table::TableCell::Text(""),
         ]);
     }
     let row_refs = owned_rows.iter().map(Vec::as_slice).collect::<Vec<_>>();
+    let spark_width = rect.cols.saturating_sub(SENSOR_HISTORY_X).max(1);
     let cols = [
         table::Col {
             title: "chip",
-            width: 14,
+            width: SENSOR_COLUMN_WIDTHS[0],
             align: table::Align::Left,
             unit: None,
         },
         table::Col {
             title: "sensor",
-            width: 22,
+            width: SENSOR_COLUMN_WIDTHS[1],
             align: table::Align::Left,
             unit: None,
         },
         table::Col {
             title: "temp C",
-            width: 7,
+            width: SENSOR_COLUMN_WIDTHS[2],
             align: table::Align::Right,
             unit: Some(Unit::Temp),
         },
         table::Col {
             title: "max/crit",
-            width: 12,
+            width: SENSOR_COLUMN_WIDTHS[3],
             align: table::Align::Right,
             unit: None,
         },
         table::Col {
             title: "to limit",
             width: bar_width,
+            align: table::Align::Left,
+            unit: None,
+        },
+        table::Col {
+            title: "history",
+            width: spark_width,
             align: table::Align::Left,
             unit: None,
         },
@@ -316,6 +343,17 @@ pub(super) fn sensors(grid: &mut CellGrid, rect: Rect, sensors: &[SensorRow]) {
 }
 
 pub(super) fn zones(grid: &mut CellGrid, rect: Rect, zones: &[ZoneRow]) {
+    if zones.is_empty() {
+        put(
+            grid,
+            rect,
+            0,
+            0,
+            caps::active_glyphs().emdash,
+            Tok::Slot(S::Dim),
+        );
+        return;
+    }
     for (index, zone) in zones.iter().enumerate().take(rect.rows) {
         let trip = zone
             .trips
@@ -404,6 +442,98 @@ pub(super) fn gpu(grid: &mut CellGrid, rect: Rect, model: &ThermalModel) {
     }
 }
 
+pub(super) fn heatmap(
+    grid: &mut CellGrid,
+    rect: Rect,
+    history: &[[f32; HISTORY_CAP]; 16],
+    history_len: &[usize; 16],
+    history_next: &[usize; 16],
+) {
+    if history_len.iter().all(|len| *len == 0) {
+        put(
+            grid,
+            rect,
+            0,
+            0,
+            caps::active_glyphs().emdash,
+            Tok::Slot(S::Dim),
+        );
+        return;
+    }
+    let braille = crate::monitor::graphs::table().braille;
+    let core_count = history_len
+        .iter()
+        .rposition(|len| *len > 0)
+        .map_or(0, |index| index + 1);
+    let raster_rows = if braille {
+        core_count.div_ceil(2)
+    } else {
+        core_count
+    };
+    let label_width = if braille {
+        "c00/01 ".len()
+    } else {
+        "core 15 ".len()
+    };
+    let graph_width = rect.cols.saturating_sub(label_width);
+    let display_width = graph_width.min(HISTORY_CAP);
+    let mut values = [[f32::NAN; HISTORY_CAP]; 16];
+    for core in 0..core_count {
+        let count = history_len[core].min(display_width);
+        if count == 0 {
+            continue;
+        }
+        let start = (history_next[core] + HISTORY_CAP - count) % HISTORY_CAP;
+        for offset in 0..count {
+            let value = history[core][(start + offset) % HISTORY_CAP];
+            values[core][display_width - count + offset] = thermal_level(value, 80.0, 95.0);
+        }
+    }
+    let rows: [&[f32]; 16] = std::array::from_fn(|core| {
+        if core >= core_count || history_len[core] == 0 {
+            &[]
+        } else {
+            &values[core][..display_width]
+        }
+    });
+    let mut graph = crate::monitor::graphs::GraphOut::new();
+    crate::monitor::graphs::paint_heatmap(
+        &mut graph,
+        &rows[..core_count],
+        RampId::Temp,
+        &crate::chrome::palette_snapshot(),
+    );
+    let rows_emitted = raster_rows.min(rect.rows);
+    for index in 0..rows_emitted {
+        let label = if braille {
+            format!("c{:02}/{:02} ", index * 2, index * 2 + 1)
+        } else {
+            format!("core {index:02} ")
+        };
+        put(grid, rect, 0, index, &label, Tok::Slot(S::Dim));
+    }
+    draw_graph(
+        grid,
+        rect,
+        label_width + graph_width.saturating_sub(display_width),
+        0,
+        &graph.lines,
+        rows_emitted,
+    );
+}
+
+pub(super) fn history_into(sensor: &SensorRow, width: usize, output: &mut [f32]) -> usize {
+    let count = sensor.history_len.min(width).min(output.len());
+    if count == 0 {
+        return 0;
+    }
+    let first = (sensor.history_next + HISTORY_CAP - count) % HISTORY_CAP;
+    for (offset, value) in output[..count].iter_mut().enumerate() {
+        *value = sensor.history[(first + offset) % HISTORY_CAP];
+    }
+    count
+}
+
 fn format_temp(temp: Option<f32>) -> String {
     temp.map_or_else(
         || caps::active_glyphs().emdash.to_owned(),
@@ -429,7 +559,7 @@ fn state_tok(temp: f32, max: Option<f32>, crit: Option<f32>) -> Tok {
     }
 }
 
-fn thermal_level(temp: f32, warn: f32, crit: f32) -> f32 {
+pub(super) fn thermal_level(temp: f32, warn: f32, crit: f32) -> f32 {
     if temp <= warn {
         (temp / warn * 0.7).clamp(0.0, 0.7)
     } else {

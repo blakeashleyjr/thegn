@@ -55,6 +55,7 @@ pub enum CollectorId {
     Vmstat,
     Netdev,
     NetWifi,
+    NetSockets,
     Diskstats,
     Powercap,
     PowerSupply,
@@ -70,7 +71,7 @@ pub enum CollectorId {
 }
 
 impl CollectorId {
-    pub const ALL: [Self; 25] = [
+    pub const ALL: [Self; 26] = [
         Self::Loadavg,
         Self::Uptime,
         Self::Psi,
@@ -84,6 +85,7 @@ impl CollectorId {
         Self::Vmstat,
         Self::Netdev,
         Self::NetWifi,
+        Self::NetSockets,
         Self::Diskstats,
         Self::Powercap,
         Self::PowerSupply,
@@ -113,6 +115,7 @@ impl CollectorId {
             Self::Vmstat => "vmstat",
             Self::Netdev => "netdev",
             Self::NetWifi => "net_wifi",
+            Self::NetSockets => "net_sockets",
             Self::Diskstats => "diskstats",
             Self::Powercap => "powercap",
             Self::PowerSupply => "power_supply",
@@ -133,7 +136,7 @@ impl CollectorId {
     }
 
     pub const fn visible_only(self) -> bool {
-        matches!(self, Self::GpuClients)
+        matches!(self, Self::GpuClients | Self::NetSockets)
     }
 }
 
@@ -219,6 +222,8 @@ pub fn default_collectors() -> Vec<Box<dyn Collector>> {
         "/sys/class/net",
     ));
     collectors[CollectorId::NetWifi.index()] = Box::new(linux::net_wifi::NetWifiCollector::new());
+    collectors[CollectorId::NetSockets.index()] =
+        Box::new(linux::net_sockets::NetSocketsCollector::new());
     collectors[CollectorId::Diskstats.index()] = Box::new(
         linux::diskstats::DiskstatsCollector::at("/proc/diskstats", "/sys/block"),
     );
@@ -277,6 +282,7 @@ mod default_collectors_tests {
             CollectorId::CpuIdle,
             CollectorId::CpuTopology,
             CollectorId::NetWifi,
+            CollectorId::NetSockets,
             CollectorId::Filesystems,
             CollectorId::GpuDevices,
             CollectorId::GpuEngines,

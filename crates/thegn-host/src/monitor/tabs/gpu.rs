@@ -8,7 +8,6 @@ use crate::telemetry::Metric;
 use thegn_core::theme::Hue;
 use thegn_core::viz::Unit;
 
-#[allow(dead_code)] // wired in a later batch (V-GPU-1b)
 pub(in crate::monitor) mod view;
 
 pub(in crate::monitor) fn gpu(cx: &Ctx) -> Vec<Section> {
@@ -60,3 +59,7 @@ pub(in crate::monitor) fn gpu(cx: &Ctx) -> Vec<Section> {
 #[cfg(test)]
 #[path = "gpu/gpu_view_tests.rs"]
 mod view_tests;
+
+#[cfg(test)]
+#[path = "gpu/gpu_wire_tests.rs"]
+mod wire_tests;

@@ -73,8 +73,9 @@ pub(in crate::monitor) struct PowerModel {
     pub(super) session: SessionEnergy,
     ewma: Ewma,
     history: Vec<f32>,
-    battery_history: Vec<f32>,
-    battery_power_history: Vec<f32>,
+    telemetry_battery_history: Vec<f32>,
+    telemetry_battery_power_history: Vec<f32>,
+    telemetry_draw_peak_w: Option<f32>,
     pub(super) power_supply_health: Health,
     pub(super) powercap_health: Health,
     pub(super) amd_smu_health: Health,
@@ -254,6 +255,7 @@ impl PowerModel {
                     .map(|watts| watts as f32)
             });
         }
+        let socket_history_w = self.socket_w;
         self.socket_w = self.socket_w.or_else(|| {
             self.zones
                 .iter()
@@ -276,7 +278,7 @@ impl PowerModel {
         self.session.update(frame.at_ms, ac_state, session_watts);
         self.session_previous = session_watts.map(|watts| (frame.at_ms, watts));
         self.session_ac = ac_state;
-        if let Some(watts) = self.socket_w.or(self.battery_w.map(f32::abs)) {
+        if let Some(watts) = socket_history_w {
             push_history(&mut self.history, watts);
         }
     }
@@ -288,8 +290,11 @@ impl PowerModel {
         now_ms: u64,
     ) {
         for (metric, slot) in [
-            (Metric::Battery, &mut self.battery_history),
-            (Metric::BatteryPower, &mut self.battery_power_history),
+            (Metric::Battery, &mut self.telemetry_battery_history),
+            (
+                Metric::BatteryPower,
+                &mut self.telemetry_battery_power_history,
+            ),
         ] {
             let series = history.series(&SeriesReq {
                 metric,
@@ -301,8 +306,53 @@ impl PowerModel {
             });
             if series.empty {
                 slot.clear();
+                if metric == Metric::BatteryPower {
+                    self.telemetry_draw_peak_w = None;
+                }
             } else {
-                slot.clone_from(&series.hi);
+                let first_sample = series.gap.iter().position(|gap| !gap);
+                let draw_peak = if metric == Metric::BatteryPower {
+                    let peak = series
+                        .raw_hi
+                        .iter()
+                        .zip(&series.gap)
+                        .filter(|(_, gap)| !**gap)
+                        .map(|(value, _)| value.abs())
+                        .filter(|value| value.is_finite())
+                        .fold(0.0_f32, f32::max);
+                    self.telemetry_draw_peak_w = (peak > 0.0).then_some(peak);
+                    peak
+                } else {
+                    0.0
+                };
+                slot.clear();
+                slot.extend(
+                    series
+                        .hi
+                        .iter()
+                        .zip(&series.raw_hi)
+                        .zip(&series.gap)
+                        .enumerate()
+                        .map(|(index, ((value, raw), _gap))| {
+                            if first_sample.is_none_or(|first| index < first) || !raw.is_finite() {
+                                f32::NAN
+                            } else if metric == Metric::Battery {
+                                if (0.0..=100.0).contains(raw) {
+                                    raw / 100.0
+                                } else {
+                                    f32::NAN
+                                }
+                            } else if metric == Metric::BatteryPower {
+                                if draw_peak > 0.0 {
+                                    raw.abs() / draw_peak
+                                } else {
+                                    0.0
+                                }
+                            } else {
+                                *value
+                            }
+                        }),
+                );
             }
         }
     }
@@ -376,6 +426,13 @@ fn watts_label(name: &str, watts: Option<f32>) -> String {
         .map(|watts| format!("{watts:.1} W"))
         .unwrap_or_else(|| crate::caps::active_glyphs().emdash.to_owned());
     format!("{name} {value}")
+}
+fn draw_history_label(model: &PowerModel) -> String {
+    let peak = model
+        .telemetry_draw_peak_w
+        .map(|watts| format!("{watts:.1} W"))
+        .unwrap_or_else(|| paint::mark(model.power_supply_health).to_owned());
+    format!("battery draw peak {peak}")
 }
 fn rail_title(model: &PowerModel) -> String {
     let ceiling = rail_ceiling(model);
@@ -486,10 +543,10 @@ impl TabView for PowerView<'_> {
             let graph_rows = (inner.rows.saturating_sub(5) / 2).min(6);
             let graph_y = rect.y + inner.y + inner.rows - graph_rows * 2;
             let graph_x = rect.x + inner.x;
-            let charge_label = if self.0.battery_history.is_empty() {
+            let charge_label = if self.0.telemetry_battery_history.is_empty() {
                 format!("charge history {}", paint::mark(self.0.power_supply_health))
             } else {
-                "charge history".to_owned()
+                "telemetry charge / 100%".to_owned()
             };
             if self.0.batteries.is_empty() {
                 let charge = Rect {
@@ -508,7 +565,7 @@ impl TabView for PowerView<'_> {
                     graph_x,
                     graph_y + graph_rows,
                     inner.cols,
-                    "battery power",
+                    &draw_history_label(self.0),
                 );
                 let charge = Rect {
                     y: charge.y + 1,
@@ -522,22 +579,22 @@ impl TabView for PowerView<'_> {
                 };
                 let charge = right_align_history(
                     charge,
-                    self.0.battery_history.len(),
+                    self.0.telemetry_battery_history.len(),
                     graphs::table().braille,
                 );
                 let power = right_align_history(
                     power,
-                    self.0.battery_power_history.len(),
+                    self.0.telemetry_battery_power_history.len(),
                     graphs::table().braille,
                 );
                 graphs::paint_history_graph(
-                    &self.0.battery_history,
+                    &self.0.telemetry_battery_history,
                     RampId::Power,
                     charge,
                     surface,
                 );
                 graphs::paint_history_graph(
-                    &self.0.battery_power_history,
+                    &self.0.telemetry_battery_power_history,
                     RampId::Power,
                     power,
                     surface,
@@ -562,7 +619,7 @@ impl TabView for PowerView<'_> {
                     graph_x,
                     graph_y + graph_rows,
                     telemetry_cols,
-                    "battery power",
+                    &draw_history_label(self.0),
                 );
                 let charge = Rect {
                     y: charge.y + 1,
@@ -576,22 +633,22 @@ impl TabView for PowerView<'_> {
                 };
                 let charge = right_align_history(
                     charge,
-                    self.0.battery_history.len(),
+                    self.0.telemetry_battery_history.len(),
                     graphs::table().braille,
                 );
                 let power = right_align_history(
                     power,
-                    self.0.battery_power_history.len(),
+                    self.0.telemetry_battery_power_history.len(),
                     graphs::table().braille,
                 );
                 graphs::paint_history_graph(
-                    &self.0.battery_history,
+                    &self.0.telemetry_battery_history,
                     RampId::Power,
                     charge,
                     surface,
                 );
                 graphs::paint_history_graph(
-                    &self.0.battery_power_history,
+                    &self.0.telemetry_battery_power_history,
                     RampId::Power,
                     power,
                     surface,
@@ -618,14 +675,14 @@ impl TabView for PowerView<'_> {
                         battery_x,
                         battery_y,
                         battery_cols,
-                        &format!("{} charge", battery.name),
+                        &format!("{} charge / 100%", battery.name),
                     );
                     draw_graph_label(
                         surface,
                         battery_x,
                         battery_y + row_height / 2,
                         battery_cols,
-                        &format!("{} energy", battery.name),
+                        &format!("{} energy / capacity", battery.name),
                     );
                     let charge = Rect {
                         y: charge.y + 1,

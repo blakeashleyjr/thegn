@@ -79,8 +79,10 @@ at the normal, non-live rate, so resuming shows no gap; the monitor's detailed
 sampler stops until you resume. That makes a paused monitor cheaper than a live
 one.
 
-On the Overview, CPU, Memory and Power tabs, the sampler reads only
-what the panels on screen need; the other tabs still read every collector.
+On the Overview, CPU, Memory, Thermal, Network and Power tabs, and on the GPU
+tab when an amdgpu device is present, the sampler reads only what the panels
+on screen need. The other tabs, and the GPU tab on other hardware (where it
+keeps the NVML-backed sections), still read every collector.
 When paused or covered, the monitor's detailed sampler parks; nothing runs once
 the monitor is closed.
 
@@ -111,38 +113,49 @@ when their source has a reading; absent readings use the terminal absent mark.
 ## CPU
 
 The CPU board shows total busy history and the current user, system, iowait, and
-steal shares, plus per-core heat. The `cpu.cores` panel labels known
-performance/efficiency cores with P/E badges and groups them by L3 cache;
-missing topology stays unlabelled. The `cpu.idle` panel shows C0 and reported
-C-state residency per core. Frequency, load/pressure, IRQ/softirq, and scheduler
-wait have separate panels. Panel focus (`f`/`F`), zoom (`z`), and Escape follow
-the monitor board controls.
+steal shares, plus a per-core busy heatmap. The `Cores (L3)` panel labels known
+performance/efficiency cores with P/E badges and adds an `L3<n>` tag (such as
+`L30`) when the cache group is known; missing topology stays unlabelled. The
+`C states residency` panel shows C0 and reported C-state residency per core.
+Frequency, load/pressure, IRQ/softirq, and scheduler wait have separate panels.
+Panel focus (`f`/`F`), zoom (`z`), and Escape follow the monitor board controls.
 
 ## Memory
 
 The Memory tab is a panel board. `memory.composition` shows total, available,
-used, free and the component breakdown with a bounded usage history;
-`memory.verdict` summarizes memory health; `memory.pressure` shows PSI some/full
-pressure; `memory.swap` appears when swap exists; `memory.paging` shows reclaim,
-refault and fault rates; and `memory.limit` shows the process cgroup limit and
-thegn.slice usage. A missing limit is shown as `—`; when every cgroup level is
-unlimited, the panel says `no limit`. Use `f`/`F` to focus or unfocus a panel,
+used, free and the component breakdown with bounded usage history from the
+selected telemetry window, scaled against total memory; frame samples and
+telemetry history use separate rings. `memory.verdict` summarizes memory health;
+`memory.pressure` shows PSI some/full pressure; `memory.swap` appears when swap
+exists and includes selected-window history scaled against total swap when
+samples are available;
+`memory.paging` shows reclaim, refault and fault rates; and `memory.limit` shows
+the process cgroup limit and thegn.slice usage. A missing limit is shown as
+`—`; when every cgroup level is unlimited, the panel says `no limit`. Use
+`f`/`F` to focus or unfocus a panel,
 `z` to zoom it, and `Esc` to step back through focus and zoom. The memory and
 swap masthead chips expand into this tab.
 
 ## Thermal
 
-The Thermal tab graphs CPU temperature and lists each available temperature
-sensor, including GPU temperature when reported. When the machine has no
-temperature sensors, the tab says so instead of showing a fabricated reading.
-The temperature masthead chip expands into this tab.
+The Thermal tab shows the CPU package trend, per-core temperatures, the sensor
+table with bounded per-sensor history, GPU temperatures and telemetry, thermal
+zones with trips, and a per-core history heatmap. Missing readings use the
+absent mark; no reading is displayed as zero. Panel demand follows the panels
+placed on screen: `thermal.package`, `thermal.cores`, `thermal.sensors`,
+`thermal.zones`, `thermal.gpu`, and `thermal.heatmap`. Use `f`/`F` to move panel
+focus, `z` to zoom the focused panel, and `Esc` to unzoom before closing the
+monitor. The temperature masthead chip expands into this tab.
 
 ## Network
 
-The Network tab graphs receive and transmit rates and lists interfaces with
-kind, state, and rates. Totals count physical links only, so VPN traffic is not
-double-counted; an “all links” row appears when that total differs from the
-physical-link total. The network masthead chip expands into this tab.
+The Network board has separate panels for mirrored receive/transmit throughput,
+interfaces, and error/drop health. The throughput plot uses telemetry history;
+the interface sparklines use the sampled per-interface rings. Totals count
+physical links only, so VPN traffic is not double-counted. Interface rows keep
+idle and down links visible, and fold interfaces beyond the eight history slots
+into `other`. Use `f`/`F` to focus a panel, `z` to zoom it, and `Esc` to step
+back through focus and zoom. The network masthead chip expands into this tab.
 
 ## Disk
 
@@ -170,33 +183,39 @@ projection when the runway drops below a configured number of hours. The Disk
 masthead chip expands into this tab.
 
 The `worktrees filesystem` block reports total, available, and used space.
-`thegn doctor` also reports Disk health from UDisks2 when available, including
-health, critical warnings, wear, spare, read/write totals, power-on time, and
-the last four serial characters. Missing serial or health values show `n/a`.
-If UDisks2 is unavailable, the report says `n/a (udisks2 unavailable)` and
-gives the reason; it does not prompt.
+On Linux, `thegn doctor` also reports Disk health from UDisks2 when available,
+including health, critical warnings, wear, spare, read/write totals, power-on
+time, and the last four serial characters. Missing serial or health values
+show `n/a`. A partial report still lists the drives it could read and gives the
+reason; if UDisks2 is unavailable, it says `n/a (udisks2 unavailable)` and
+gives the reason. On other platforms the reason is `unsupported on this
+platform`. The check does not prompt.
 
 ## GPU
 
-The GPU tab shows utilisation, memory, temperature, and power when those
-readings are available, with sparklines for the sampled metrics. On APUs, GPU
-memory is shared system memory and is labelled `gpu mem (shared)`. The GPU
-masthead chip expands into this tab. When several cards are available, it shows
-the busiest awake card. Runtime-suspended cards are not woken to sample them
-and read as 0% utilisation.
+On AMDGPU, the GPU tab has device, engine, memory, and clocks panels. Engine
+busy history, VRAM/GTT use, clock level, and power against its reported cap are
+plotted on their labelled 0–100% scales when readings are available. A runtime-
+suspended card is not woken to sample it; its values are shown as unavailable
+rather than zero. On APUs, shared memory is labelled `shared vram`.
+
+On NVIDIA and Intel, the tab keeps the legacy GPU readings because this board's
+engine counters are AMDGPU-only. The GPU masthead chip expands into the tab. When
+several cards are available, it shows the busiest awake card.
 
 On NVIDIA, the masthead uses NVML in process when `libnvidia-ml.so.1` is
 installed; otherwise it reads through `nvidia-smi`.
 
 ## Power
 
-The Power tab has three panels: `power.rails` plots per-rail power history and
-shows available socket, package, battery, and powercap readings;
-`power.battery` shows battery charge, signed draw, energy, and history; and
-`power.policy` shows the platform profile, boost state, and CPU power policies.
-Unavailable readings use the platform's absent or warming mark. Panel focus and
-zoom use `f`/`F` and `z`. The tab appears when a battery source is available;
-the battery masthead chip opens it.
+The Power tab has three panels: `power.rails` plots socket and powercap history
+against its labelled ceiling; `power.battery` plots charge against 100%, energy
+against battery capacity, and draw magnitude against its labelled peak with the
+current signed direction shown; and `power.policy` shows profile, boost, and EPP
+as status chips. Frame and telemetry histories use separate scales. Unavailable
+readings use the platform's absent or warming mark.
+Panel focus and zoom use `f`/`F` and `z`. The tab appears when a battery source
+is available; the battery masthead chip opens it.
 
 ## Processes
 
@@ -210,10 +229,10 @@ its argument list.
 
 At 120 columns and wider, a summary above the table shows task, thread and
 kernel-thread totals; R/S/D/Z/T/I state counts; new and exited process counts
-since the previous pass; and CPU/RSS totals for the UI, daemon, panes and other
-processes. The D count uses the warning tone when any process is in disk wait.
-The first pass leaves CPU and new/exited values unknown until their baselines
-are available.
+since the previous pass; and a CPU/RSS breakdown for the UI, daemon, panes and
+other processes. The pane row also shows its process count. The D count uses
+the warning tone when any process is in disk wait. The first pass leaves CPU
+and new/exited values unknown until their baselines are available.
 
 - `c`, `m`, `n`, `p` sort by CPU, memory, name, or PID.
 - `r` reverses the sort direction.

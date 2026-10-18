@@ -1257,7 +1257,268 @@ fn sample_metric_coverage(cfg: &Config) -> Vec<thegn_metrics::FamilyReport> {
     let _ = s.sample(); // best-effort: warm-up sample: CPU/net are deltas, so the first only primes
     std::thread::sleep(std::time::Duration::from_millis(300));
     let snap = s.sample();
-    thegn_metrics::coverage(&snap)
+    thegn_metrics::coverage_with_collectors(&snap, monitor_collectors_health())
+}
+
+/// Discover the CLI diagnostic collector set once; visible-only readers are
+/// deliberately left untouched because their cost belongs to visible panels.
+/// This process-wide cache assumes CLI callers (`thegn doctor` and `thegn
+/// bundle`) exit after the command. A long-lived caller of `doctor_json*`
+/// would retain this health snapshot for the process lifetime.
+fn monitor_collectors_health()
+-> &'static [thegn_metrics::collect::health::Health; thegn_metrics::collect::COLLECTORS] {
+    static HEALTH: std::sync::OnceLock<
+        [thegn_metrics::collect::health::Health; thegn_metrics::collect::COLLECTORS],
+    > = std::sync::OnceLock::new();
+    HEALTH.get_or_init(|| {
+        discover_monitor_collectors(
+            thegn_metrics::collect::default_collectors(),
+            &thegn_metrics::collect::env::Env::default(),
+        )
+    })
+}
+
+fn discover_monitor_collectors(
+    mut collectors: Vec<Box<dyn thegn_metrics::collect::Collector>>,
+    env: &thegn_metrics::collect::env::Env,
+) -> [thegn_metrics::collect::health::Health; thegn_metrics::collect::COLLECTORS] {
+    use thegn_metrics::collect::health::{Absent, Health};
+
+    let mut health = [Health::Absent(Absent::NotImplemented); thegn_metrics::collect::COLLECTORS];
+    for collector in &mut collectors {
+        let id = collector.id();
+        if !id.visible_only() {
+            health[id.index()] = collector.discover(env);
+        }
+    }
+    for collector in &mut collectors {
+        collector.close();
+    }
+    health
+}
+
+fn monitor_collector_health(
+    id: thegn_metrics::collect::CollectorId,
+    health: &[thegn_metrics::collect::health::Health; thegn_metrics::collect::COLLECTORS],
+) -> String {
+    use thegn_metrics::collect::health::{Absent, Health};
+
+    if id.visible_only() {
+        return "visible-only (not probed)".to_string();
+    }
+    match health[id.index()] {
+        Health::Ok => "ok".to_string(),
+        Health::Warming => "warming".to_string(),
+        Health::Failing { .. } => "failing".to_string(),
+        Health::Absent(Absent::NoPermission) => "denied".to_string(),
+        Health::Absent(reason) => format!("absent ({})", reason.to_coverage().word()),
+    }
+}
+
+fn monitor_collectors_json() -> serde_json::Value {
+    monitor_collectors_json_for(monitor_collectors_health())
+}
+
+fn monitor_collectors_json_for(
+    health: &[thegn_metrics::collect::health::Health; thegn_metrics::collect::COLLECTORS],
+) -> serde_json::Value {
+    use thegn_metrics::collect::{
+        CollectorId,
+        health::{Absent, Health},
+    };
+
+    let mut map = serde_json::Map::new();
+    for id in CollectorId::ALL {
+        let status = monitor_collector_health(id, health);
+        let value = if id.visible_only() {
+            serde_json::json!({ "health": status })
+        } else {
+            match health[id.index()] {
+                Health::Absent(Absent::NoPermission) => serde_json::json!({ "health": status }),
+                Health::Absent(reason) => serde_json::json!({
+                    "health": "absent",
+                    "reason": reason.to_coverage().word(),
+                }),
+                _ => serde_json::json!({ "health": status }),
+            }
+        };
+        map.insert(id.slug().to_string(), value);
+    }
+    serde_json::Value::Object(map)
+}
+
+fn monitor_collectors_lines(
+    health: &[thegn_metrics::collect::health::Health; thegn_metrics::collect::COLLECTORS],
+) -> Vec<String> {
+    thegn_metrics::collect::CollectorId::ALL
+        .into_iter()
+        .map(|id| {
+            format!(
+                "  {:<16} {}",
+                id.slug(),
+                monitor_collector_health(id, health)
+            )
+        })
+        .collect()
+}
+
+fn monitor_collectors_report() {
+    outln!("Monitor collectors");
+    for line in monitor_collectors_lines(monitor_collectors_health()) {
+        outln!("{line}");
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn monitor_collector_formatters_cover_every_id_and_health_state() {
+    use thegn_metrics::collect::{
+        COLLECTORS, CollectorId,
+        health::{Absent, Health},
+    };
+
+    let mut health = [Health::Warming; COLLECTORS];
+    health[CollectorId::Loadavg.index()] = Health::Ok;
+    health[CollectorId::Uptime.index()] = Health::Failing {
+        since_tick: 1,
+        backoff: 2,
+        retry_at: 4,
+    };
+    health[CollectorId::Psi.index()] = Health::Absent(Absent::NoHardware);
+    health[CollectorId::CpuStat.index()] = Health::Absent(Absent::NoPermission);
+
+    let expected_status = |id| match id {
+        CollectorId::Loadavg => "ok",
+        CollectorId::Uptime => "failing",
+        CollectorId::Psi => "absent (no such hardware)",
+        CollectorId::CpuStat => "denied",
+        id if id.visible_only() => "visible-only (not probed)",
+        _ => "warming",
+    };
+    let expected_text = std::iter::once("Monitor collectors".to_string())
+        .chain(
+            CollectorId::ALL
+                .into_iter()
+                .map(|id| format!("  {:<16} {}", id.slug(), expected_status(id))),
+        )
+        .collect::<Vec<_>>()
+        .join("\n");
+    let actual_text = std::iter::once("Monitor collectors".to_string())
+        .chain(monitor_collectors_lines(&health))
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert_eq!(actual_text, expected_text);
+    assert!(
+        monitor_collectors_lines(&health)
+            .iter()
+            .any(|line| line.as_str() == "  loadavg          ok")
+    );
+
+    let expected_json: serde_json::Map<String, serde_json::Value> = CollectorId::ALL
+        .into_iter()
+        .map(|id| {
+            let value = match id {
+                CollectorId::Psi => serde_json::json!({
+                    "health": "absent",
+                    "reason": "no such hardware",
+                }),
+                _ => serde_json::json!({ "health": expected_status(id) }),
+            };
+            (id.slug().to_string(), value)
+        })
+        .collect();
+    let actual_json = monitor_collectors_json_for(&health)
+        .as_object()
+        .unwrap()
+        .clone();
+    assert_eq!(actual_json, expected_json);
+}
+
+#[cfg(test)]
+#[test]
+fn monitor_collector_discovery_skips_visible_only_and_closes_collectors() {
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+    use thegn_metrics::collect::{
+        CollectError, Collector, CollectorId, TickCtx, env::Env, frame::MonitorFrame,
+        health::Health, schedule::Cadence,
+    };
+
+    struct CountingCollector {
+        id: CollectorId,
+        discovered: Arc<AtomicUsize>,
+        closed: Arc<AtomicUsize>,
+    }
+
+    impl Collector for CountingCollector {
+        fn id(&self) -> CollectorId {
+            self.id
+        }
+        fn cadence(&self) -> Cadence {
+            Cadence::Every(1)
+        }
+        fn discover(&mut self, _env: &Env) -> Health {
+            self.discovered.fetch_add(1, Ordering::SeqCst);
+            Health::Ok
+        }
+        fn sample(
+            &mut self,
+            _ctx: &TickCtx,
+            _frame: &mut MonitorFrame,
+        ) -> Result<(), CollectError> {
+            Ok(())
+        }
+        fn close(&mut self) {
+            self.closed.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    let normal_discovered = Arc::new(AtomicUsize::new(0));
+    let visible_discovered = Arc::new(AtomicUsize::new(0));
+    let closed = Arc::new(AtomicUsize::new(0));
+    let collectors: Vec<Box<dyn Collector>> = vec![
+        Box::new(CountingCollector {
+            id: CollectorId::Loadavg,
+            discovered: Arc::clone(&normal_discovered),
+            closed: Arc::clone(&closed),
+        }),
+        Box::new(CountingCollector {
+            id: CollectorId::GpuClients,
+            discovered: Arc::clone(&visible_discovered),
+            closed: Arc::clone(&closed),
+        }),
+    ];
+
+    let health = discover_monitor_collectors(collectors, &Env::default());
+    assert_eq!(normal_discovered.load(Ordering::SeqCst), 1);
+    assert_eq!(visible_discovered.load(Ordering::SeqCst), 0);
+    assert_eq!(closed.load(Ordering::SeqCst), 2);
+    assert_eq!(health[CollectorId::Loadavg.index()], Health::Ok);
+    assert_eq!(
+        health[CollectorId::GpuClients.index()],
+        Health::Absent(thegn_metrics::collect::health::Absent::NotImplemented)
+    );
+}
+
+#[cfg(test)]
+#[test]
+fn doctor_json_exposes_monitor_collector_health_for_every_id() {
+    use thegn_metrics::collect::CollectorId;
+
+    let report = doctor_json(&Config::default());
+    let collectors = report["monitor_collectors"].as_object().unwrap();
+    assert_eq!(collectors.len(), CollectorId::ALL.len());
+    for id in CollectorId::ALL {
+        let entry = &collectors[id.slug()];
+        assert!(entry["health"].is_string(), "{}: {entry}", id.slug());
+        assert_eq!(entry.get("reason").is_some(), entry["health"] == "absent");
+    }
+    assert_eq!(
+        collectors[CollectorId::GpuClients.slug()]["health"],
+        "visible-only (not probed)"
+    );
 }
 
 /// `--json` twin of [`system_metrics_report`]: one object keyed by family with
@@ -2053,6 +2314,7 @@ fn doctor_json_with_health_and_overrides_and_legacy(
         "mobile_access": mobile_access_json(cfg),
         "lsp": lsp_json(cfg),
         "system_metrics": system_metrics_json(cfg),
+        "monitor_collectors": monitor_collectors_json(),
         "network_path": network_path_json(&thegn_metrics::probe_net_path()),
         "source_control": source_control_json(cfg),
         "harnesses": harness_json(),
@@ -2537,6 +2799,9 @@ pub fn run(
 
     outln!("");
     system_metrics_report(cfg);
+
+    outln!("");
+    monitor_collectors_report();
 
     outln!("");
     source_control_report(cfg);

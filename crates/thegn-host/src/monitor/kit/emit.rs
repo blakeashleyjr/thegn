@@ -185,7 +185,7 @@ impl Emitter {
         }
     }
     #[cfg(test)]
-    pub(super) fn rebuilds(&self) -> usize {
+    pub(crate) fn rebuilds(&self) -> usize {
         self.cache.rebuilds
     }
     #[cfg(test)]

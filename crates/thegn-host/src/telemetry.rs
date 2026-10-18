@@ -339,6 +339,9 @@ impl SeriesBuf {
     pub fn empty(&self) -> bool {
         self.empty
     }
+    pub fn gap(&self) -> &[bool] {
+        &self.gap
+    }
 }
 
 fn normalize_value(value: f32, scale: Scale, axis_max: f32) -> f32 {

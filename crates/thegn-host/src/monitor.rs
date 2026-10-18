@@ -468,10 +468,13 @@ pub struct MonitorOverlay {
     /// `rows - CHROME_ROWS`. What [`Self::scroll_max`] measures against.
     body_rows: usize,
     board: board::Board,
+    gpu: tabs::gpu::view::GpuModel,
     overview: tabs::overview::OverviewModel,
     cpu: tabs::cpu::view::CpuModel,
     power: tabs::power::view::PowerModel,
+    network: tabs::network::view::NetworkModel,
     memory: tabs::memory::view::MemoryModel,
+    thermal: tabs::thermal::view::ThermalModel,
 }
 
 impl MonitorOverlay {
@@ -529,10 +532,13 @@ impl MonitorOverlay {
             screen: ctx.screen,
             body_rows: rows.saturating_sub(CHROME_ROWS),
             board: board::Board::default(),
+            gpu: tabs::gpu::view::GpuModel::default(),
             overview: tabs::overview::OverviewModel::default(),
             cpu: tabs::cpu::view::CpuModel::default(),
             power: tabs::power::view::PowerModel::default(),
+            network: tabs::network::view::NetworkModel::default(),
             memory: tabs::memory::view::MemoryModel::default(),
+            thermal: tabs::thermal::view::ThermalModel::default(),
         };
         ov.rebuild(model, ctx, false);
         ov
@@ -610,11 +616,21 @@ impl MonitorOverlay {
     fn view(&self) -> board::ActiveView<'_> {
         match self.tab {
             MonitorTab::Cpu => board::ActiveView::Cpu(tabs::cpu::view::CpuView(&self.cpu)),
+            MonitorTab::Gpu if !self.gpu.has_engine_devices() => {
+                board::ActiveView::Legacy(board::LegacyTab)
+            }
+            MonitorTab::Gpu => board::ActiveView::Gpu(tabs::gpu::view::GpuView(&self.gpu)),
             MonitorTab::Power => {
                 board::ActiveView::Power(tabs::power::view::PowerView(&self.power))
             }
+            MonitorTab::Network => {
+                board::ActiveView::Network(tabs::network::view::NetworkView(&self.network))
+            }
             MonitorTab::Memory => {
                 board::ActiveView::Memory(tabs::memory::view::MemoryView(&self.memory))
+            }
+            MonitorTab::Thermal => {
+                board::ActiveView::Thermal(tabs::thermal::view::ThermalView(&self.thermal))
             }
             _ => board::ActiveView::for_tab(self.tab, &self.overview),
         }
@@ -630,12 +646,24 @@ impl MonitorOverlay {
             self.cpu.absorb_frame(frame);
             return true;
         }
+        if self.tab == MonitorTab::Gpu {
+            self.gpu.absorb_frame(frame);
+            return true;
+        }
         if self.tab == MonitorTab::Power {
             self.power.absorb_frame(frame);
             return true;
         }
+        if self.tab == MonitorTab::Network {
+            self.network.absorb_frame(frame);
+            return true;
+        }
         if self.tab == MonitorTab::Memory {
             self.memory.absorb_frame(frame);
+            return true;
+        }
+        if self.tab == MonitorTab::Thermal {
+            self.thermal.absorb_frame(frame);
             return true;
         }
         self.overview.absorb_frame(frame);
@@ -666,6 +694,11 @@ impl MonitorOverlay {
         let live_now = ctx.now_ms.max(0) as u64;
         self.last_now_ms = live_now;
         let now = self.frozen_now_ms.unwrap_or(live_now);
+        if !self.paused && self.tab == MonitorTab::Memory {
+            let prefs = self.prefs.tab(MonitorTab::Memory);
+            self.memory
+                .absorb_history(ctx.hist, prefs.window, prefs.scale, now);
+        }
         if !self.paused && self.tab == MonitorTab::Cpu {
             let prefs = self.prefs.tab(MonitorTab::Cpu);
             self.cpu
@@ -676,11 +709,21 @@ impl MonitorOverlay {
             self.power
                 .absorb_history(ctx.hist, prefs.window, prefs.scale, now);
         }
+        if !self.paused && self.tab == MonitorTab::Network {
+            let prefs = self.prefs.tab(MonitorTab::Network);
+            self.network
+                .absorb_history(ctx.hist, prefs.window, prefs.scale, now);
+        }
         if !self.paused && self.tab == MonitorTab::Overview {
             self.overview.absorb_stats(&model.stats);
             self.overview.absorb_container_count(model.containers.len());
             let prefs = self.prefs.tab(MonitorTab::Overview);
             self.overview
+                .absorb_history(ctx.hist, prefs.window, prefs.scale, now);
+        }
+        if !self.paused && self.tab == MonitorTab::Thermal {
+            let prefs = self.prefs.tab(MonitorTab::Thermal);
+            self.thermal
                 .absorb_history(ctx.hist, prefs.window, prefs.scale, now);
         }
         // Only the active list is derived, and navigation/geometry changes do

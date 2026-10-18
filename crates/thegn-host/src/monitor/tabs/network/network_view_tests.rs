@@ -1,4 +1,5 @@
 use super::view::{HEALTH, IFACE_CAP, INTERFACES, NetworkModel, NetworkView, THROUGHPUT};
+use crate::telemetry::{ScaleMode, TelemetryHistory, Window};
 use crate::{
     caps,
     compositor::Rect,
@@ -100,6 +101,20 @@ fn frame(tick: u16, order: &[u16]) -> MonitorFrame {
     frame
 }
 
+fn telemetry_history() -> TelemetryHistory {
+    let mut history = TelemetryHistory::default();
+    for tick in 0..120_u64 {
+        history.push(
+            &thegn_metrics::StatsSnapshot {
+                net_bps: Some((20_000 + tick * 1_700, 8_000 + tick * 630)),
+                ..thegn_metrics::StatsSnapshot::default()
+            },
+            1_000 + tick * 1_000,
+        );
+    }
+    history
+}
+
 fn lines(surface: &Surface) -> Vec<String> {
     surface
         .screen_lines()
@@ -193,8 +208,8 @@ fn interface_slots_are_capped_and_absorb_capacity_stays_warm() {
     assert_eq!(model.overflow, 4);
     let capacities = (
         model.interfaces.capacity(),
-        model.rx.values.capacity(),
-        model.tx.values.capacity(),
+        model.error_history.values.capacity(),
+        model.drop_history.values.capacity(),
         model
             .interfaces
             .iter()
@@ -205,8 +220,8 @@ fn interface_slots_are_capped_and_absorb_capacity_stays_warm() {
         model.absorb_frame(&frame(tick, &ids));
     }
     assert_eq!(model.interfaces.capacity(), capacities.0);
-    assert_eq!(model.rx.values.capacity(), capacities.1);
-    assert_eq!(model.tx.values.capacity(), capacities.2);
+    assert_eq!(model.error_history.values.capacity(), capacities.1);
+    assert_eq!(model.drop_history.values.capacity(), capacities.2);
     assert_eq!(
         model
             .interfaces
@@ -222,7 +237,7 @@ fn cloned_warming_rings_keep_their_logical_capacity() {
     let mut model = NetworkModel::default();
     model.absorb_frame(&frame(1, &[1]));
     let mut cloned = model.clone();
-    for tick in 2..30_u16 {
+    for tick in 2..40_u16 {
         cloned.absorb_frame(&frame(tick, &[1]));
     }
     let history = cloned
@@ -230,7 +245,7 @@ fn cloned_warming_rings_keep_their_logical_capacity() {
         .iter()
         .find(|entry| entry.id == InstanceId(1))
         .expect("interface history remains present");
-    assert_eq!(history.rx.len, 24);
+    assert_eq!(history.rx.len, 32);
 }
 
 #[test]
@@ -300,6 +315,17 @@ fn short_throughput_history_is_right_aligned_and_scaled() {
     let mut model = NetworkModel::default();
     model.absorb_frame(&frame(1, &[1]));
     model.absorb_frame(&frame(2, &[1]));
+    let mut history = TelemetryHistory::default();
+    for tick in 0..3_u64 {
+        history.push(
+            &thegn_metrics::StatsSnapshot {
+                net_bps: Some((10_000 + tick * 2_000, 5_000 + tick * 1_000)),
+                ..thegn_metrics::StatsSnapshot::default()
+            },
+            1_000 + tick * 1_000,
+        );
+    }
+    model.absorb_history(&history, Window::from_secs(10), ScaleMode::Window, 4_000);
     let view = NetworkView(&model);
     let area = Rect::full(100, 30);
     let throughput = Board::default()
@@ -325,12 +351,59 @@ fn short_throughput_history_is_right_aligned_and_scaled() {
     assert_ne!(
         cell.str(),
         "\u{2800}",
-        "newest throughput sample is not at right edge"
+        "trailing telemetry gap must draw the held throughput value"
     );
-    assert_ne!(cell.str(), " ", "rightmost graph column is blank");
+    let mut rx = [0.0; super::view::TELEMETRY_HISTORY];
+    let len = model.history_rx.copy_ordered(&mut rx);
+    assert!(len > 3);
+    assert_eq!(rx[len - 1], rx[len - 2]);
     let rendered = lines(&surface).join("\n");
-    assert!(rendered.contains("peak"));
+    assert!(rendered.contains("window"));
     assert!(lines(&surface)[throughput.y + throughput.rows - 2].contains("tx"));
+}
+
+#[test]
+fn interior_telemetry_gap_keeps_its_bucket_position() {
+    let mut history = TelemetryHistory::default();
+    history.push(
+        &thegn_metrics::StatsSnapshot {
+            net_bps: Some((10_000, 5_000)),
+            ..thegn_metrics::StatsSnapshot::default()
+        },
+        1_000,
+    );
+    history.push(
+        &thegn_metrics::StatsSnapshot {
+            net_bps: None,
+            ..thegn_metrics::StatsSnapshot::default()
+        },
+        2_000,
+    );
+    history.push(
+        &thegn_metrics::StatsSnapshot {
+            net_bps: Some((30_000, 15_000)),
+            ..thegn_metrics::StatsSnapshot::default()
+        },
+        3_000,
+    );
+    let mut model = NetworkModel::default();
+    model.absorb_history(&history, Window::from_secs(4), ScaleMode::Window, 4_000);
+    let mut rx = [0.0; super::view::TELEMETRY_HISTORY];
+    let len = model.history_rx.copy_ordered(&mut rx);
+    assert_eq!(
+        len, 360,
+        "retained ring must preserve its span after leading gaps"
+    );
+    assert!(rx[120..240].iter().all(|value| *value == 1.0 / 3.0));
+    assert!(
+        rx[240..len].iter().any(|value| value.is_finite()),
+        "later sample shifted away"
+    );
+    assert!(
+        rx[240..len]
+            .iter()
+            .all(|value| (*value - 1.0).abs() <= f32::EPSILON)
+    );
 }
 
 #[test]
@@ -346,6 +419,12 @@ fn snapshots_cover_view_sizes_capabilities_and_static_demand() {
     for tick in 1..121_u16 {
         model.absorb_frame(&frame(tick, &ids));
     }
+    model.absorb_history(
+        &telemetry_history(),
+        Window::from_secs(120),
+        ScaleMode::Window,
+        121_000,
+    );
     let view = NetworkView(&model);
     for (cols, rows) in sizes {
         for (unicode, depth) in levels {
@@ -377,9 +456,9 @@ fn snapshots_cover_view_sizes_capabilities_and_static_demand() {
             }
             if cols == 240 {
                 let fill = fill_ratio(&surface, Rect::full(cols, rows));
-                // density follow-up (batch 49): measured 0.17
+                // density follow-up (batch 50): estimated, primary sets from the printed value
                 assert!(
-                    fill >= 0.17,
+                    fill >= 0.30,
                     "fill ratio {fill:.3} at {cols}x{rows} {unicode:?}/{depth:?}"
                 );
             }
