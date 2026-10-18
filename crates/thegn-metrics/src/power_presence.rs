@@ -84,10 +84,13 @@ mod tests {
         mkdir(root, "class");
     }
 
+    type ProbeSetup = fn(&Path);
+    type ProbeCase = (&'static str, ProbeSetup, bool);
+
     #[test]
     fn power_presence_probe_recognizes_static_sources() {
         let temp = tempfile::tempdir().unwrap();
-        let cases: [(&str, fn(&Path), bool); 7] = [
+        let cases: [ProbeCase; 7] = [
             ("battery only", battery_only, false),
             ("RAPL only", rapl_only, true),
             ("powercap power only", powercap_power_only, true),
