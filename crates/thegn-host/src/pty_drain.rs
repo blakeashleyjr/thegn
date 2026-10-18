@@ -677,10 +677,12 @@ fn handle_output(ctx: &mut DrainCtx<'_>, id: u32, b: &[u8], admit_generation: bo
         // splash (by owner, so a background worktree that finished while away
         // shows no stale splash on return). Held while provisioning is still
         // live (the premature-shell guard); only the shell-wait shape clears.
-        // Empty eager/warm-spare markers are not tracked, and a live splash
-        // whose shell already spoke needs only the scan that records that
-        // fact. See `loading::any_unspoken_splash`.
-        if crate::loading::any_unspoken_splash(ctx.loading_state, ctx.loading_retired)
+        // `any_clearable_splash` pre-gates the tab scan: the lingering empty
+        // markers parked by eager/warm-spare success keep the map non-empty,
+        // so gating on `!is_empty()` rescanned + re-logged per output chunk
+        // forever (the log storm). See `loading::{any_clearable_splash,
+        // should_clear_splash_on_output}`.
+        if crate::loading::any_clearable_splash(ctx.loading_state)
             && let Some((gi, ti)) = ctx
                 .session
                 .iter_tabs()
@@ -697,12 +699,6 @@ fn handle_output(ctx: &mut DrainCtx<'_>, id: u32, b: &[u8], admit_generation: bo
                 ctx.loading_state.remove(&key);
                 ctx.loading_remote.remove(&key);
                 // Shell spoke ⇒ retire: no late splash re-raise.
-                ctx.loading_retired.insert(key);
-            } else if ctx.loading_state.contains_key(&key) {
-                // Output can beat the provisioning update that changes this
-                // entry into shell-wait. Remember the output using the same
-                // per-tab retirement set; drain_provision keeps live steps,
-                // then clears the entry as soon as shell-wait arrives.
                 ctx.loading_retired.insert(key);
             }
         }

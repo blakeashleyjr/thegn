@@ -11692,6 +11692,7 @@ async fn event_loop<T: Terminal>(
                 current_config: &current_config,
                 center: chrome.center,
                 loading_state: &mut loading_state,
+                loading_retired: &loading_retired,
                 loading_remote: &mut loading_remote,
                 materialize_inflight: &mut materialize_inflight,
                 prewarm_inflight: &mut prewarm_inflight,
