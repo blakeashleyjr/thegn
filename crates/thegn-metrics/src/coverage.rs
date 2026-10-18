@@ -192,6 +192,7 @@ pub fn collector_families(id: crate::collect::CollectorId) -> &'static [MetricFa
         Id::Netdev => &[MetricFamily::Network],
         Id::NetWifi => &[],
         Id::NetSockets => &[],
+        Id::ContainersStats => &[],
         Id::Diskstats => &[MetricFamily::Disk],
         Id::AmdSmu => &[MetricFamily::Gpu],
         Id::PowerSupply => &[MetricFamily::Battery],
