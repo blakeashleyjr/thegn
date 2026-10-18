@@ -256,7 +256,13 @@ probe is unavailable/degraded, the config is not safe to pass through raw, or
 `devcontainer up` fails, thegn uses its existing native OCI path for the
 supported approved subset. A non-OCI backend cannot honor an
 image/build/compose source; doctor reports that degradation instead of
-silently claiming the container shape was used.
+silently claiming the container shape was used. While falling back between
+backends, a backend whose launch probe failed is remembered for the same
+environment, placement, and worktree; later launches skip it with a warning that
+the earlier probe failed, while current policy and isolation checks still run.
+The memory is dropped when the config is reloaded, and for a worktree when you
+retry, start its runtime, or run it on the host. An explicitly chosen backend is
+always probed.
 
 `thegn doctor` shows the `Devcontainer support` block: mode, repo, candidates,
 selected file or selection error, provider, status, trust counts, and backend
