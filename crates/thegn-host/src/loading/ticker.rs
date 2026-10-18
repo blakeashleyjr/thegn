@@ -19,8 +19,17 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
+use crate::chrome::{LoadStep, StepState};
+
 /// One spinner frame per tick (see `plan::SPINNER_FRAME_MS`).
 const PERIOD: Duration = Duration::from_millis(250);
+
+/// Whether the derived splash needs periodic animation repaints. A terminal
+/// Done/Failed row can remain drawn for context, but its elapsed value is
+/// frozen and it must not keep the event loop awake.
+pub(crate) fn is_animating(steps: &[LoadStep]) -> bool {
+    steps.iter().any(|step| step.state == StepState::Active)
+}
 
 pub(crate) struct SplashTicker {
     active: Arc<AtomicBool>,
@@ -87,6 +96,63 @@ impl SplashTicker {
 mod tests {
     use super::*;
     use std::sync::atomic::AtomicUsize;
+
+    #[test]
+    fn only_steps_with_live_animation_keep_the_ticker_visible() {
+        let active = [LoadStep::active("probing bwrap")];
+        assert!(is_animating(&active));
+
+        let failed = [LoadStep::failed("provisioning")];
+        assert!(!is_animating(&failed));
+
+        let pending = [LoadStep::pending("shell")];
+        assert!(!is_animating(&pending));
+    }
+
+    #[test]
+    fn failed_provision_drain_leaves_a_static_splash_without_a_ticker() {
+        let key = ("app/home".to_string(), 0);
+        let session = crate::session::Session {
+            id: "test".into(),
+            worktrees: vec![crate::session::WorktreeGroup::new(
+                "app/home",
+                crate::session::GroupKind::Home,
+                "",
+            )],
+            active: 0,
+        };
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let steps = crate::loading::provision_load_steps(&[crate::agent::ProvisionStepView {
+            label: "setup".into(),
+            state: crate::agent::ProvisionState::Failed,
+            detail: Some("backend setup failed".into()),
+        }]);
+        tx.send((key.0.clone(), key.1, steps)).unwrap();
+        drop(tx);
+        let mut tracker = crate::loading::track::LoadingTracker::default();
+        let mut remote = std::collections::HashMap::new();
+        let retired = std::collections::HashSet::new();
+        let mut perf = crate::perf::LoopPerf::new();
+
+        crate::handlers::provision::drain_provision(
+            &mut rx,
+            &session,
+            &mut tracker,
+            &mut remote,
+            &retired,
+            &mut perf,
+        );
+
+        let steps = tracker
+            .get(&key)
+            .expect("drained failed progress remains drawn");
+        assert_eq!(steps[0].state, StepState::Failed);
+        assert!(crate::loading::any_clearable_splash(&tracker));
+        assert!(crate::loading::should_clear_splash_on_output(
+            &tracker, &key
+        ));
+        assert!(!is_animating(steps));
+    }
 
     /// Poll until `cond` holds (a loaded test machine makes fixed sleeps
     /// flaky); panics with `what` after a generous deadline.
