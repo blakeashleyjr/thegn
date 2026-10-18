@@ -284,6 +284,57 @@ fn deferred_initialization_deduplicates_against_already_known_slots() {
 }
 
 #[test]
+fn rediscovery_remembers_a_deferred_duplicate_without_reinitializing_or_changing_generation() {
+    let (_root, fake, drm, accel) = fixture();
+    add_card(&drm, "card0", "0000:c1:00.0", "amdgpu");
+    add_card(&drm, "card1", "0000:c1:00.0", "amdgpu");
+    let delayed_status = drm.join("card1/device/power/runtime_status");
+    fs::write(&delayed_status, "suspended\n").unwrap();
+    let duplicate_uevent = drm.join("card1/device/uevent");
+    let mut collector = GpuDevicesCollector::with_fs(fake, &drm, &accel);
+    assert_eq!(collector.discover(&Env::default()), Health::Ok);
+
+    fs::write(&delayed_status, "active\n").unwrap();
+    let mut frame = MonitorFrame::default();
+    collector
+        .sample(
+            &TickCtx {
+                tick: 1,
+                now_ms: 500,
+            },
+            &mut frame,
+        )
+        .unwrap();
+    assert_eq!(frame.parts.gpu_devices.devices.len(), 1);
+    assert_eq!(
+        collector
+            .fs
+            .touched
+            .iter()
+            .filter(|path| *path == &duplicate_uevent)
+            .count(),
+        1
+    );
+    let generation = collector.generation;
+
+    for (tick, now_ms) in [(2, 60_500), (3, 120_500), (4, 180_500)] {
+        collector
+            .sample(&TickCtx { tick, now_ms }, &mut frame)
+            .unwrap();
+    }
+    assert_eq!(collector.generation, generation);
+    assert_eq!(
+        collector
+            .fs
+            .touched
+            .iter()
+            .filter(|path| *path == &duplicate_uevent)
+            .count(),
+        1
+    );
+}
+
+#[test]
 fn apu_thresholds_classify_without_uma_directory() {
     let (_root, fake, drm, accel) = fixture();
     add_card(&drm, "card0", "0000:c1:00.0", "amdgpu");
