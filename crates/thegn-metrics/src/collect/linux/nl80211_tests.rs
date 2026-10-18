@@ -80,6 +80,7 @@ fn nested_station_bitrate_is_decoded_and_unknown_fields_are_ignored() {
     rate.extend_from_slice(&attr(6, &[9]));
     rate.extend_from_slice(&attr(7, &[2]));
     rate.extend_from_slice(&attr(8, &[]));
+    rate.extend_from_slice(&attr(1, &54_u16.to_ne_bytes()));
     rate.extend_from_slice(&attr(777, &[1, 2]));
     let rx_rate = attr(1, &54_u16.to_ne_bytes());
     let mut info = attr(7, &[(-47_i8) as u8]);
@@ -122,7 +123,25 @@ fn nested_station_bitrate_is_decoded_and_unknown_fields_are_ignored() {
             beacon_loss: Some(2),
             connected_time_secs: Some(99),
             inactive_time_ms: Some(250),
-            ..Station::default()
+        }
+    );
+}
+
+#[test]
+fn eht_rate_attributes_include_320_mhz_and_use_uapi_enum_values() {
+    let mut rate = attr(18, &[]);
+    rate.extend_from_slice(&attr(19, &[11]));
+    rate.extend_from_slice(&attr(20, &[2]));
+    rate.extend_from_slice(&attr(21, &[1]));
+    assert_eq!(
+        decode_rate(&rate),
+        RateInfo {
+            mcs: Some(11),
+            nss: Some(2),
+            width_mhz: Some(320),
+            phy: Some(Phy::Eht),
+            guard_interval: Some(1),
+            ..RateInfo::default()
         }
     );
 }
@@ -156,12 +175,24 @@ fn malformed_trailing_attribute_preserves_prior_fields() {
 
 #[test]
 fn stale_sequence_message_is_ignored_before_current_reply() {
-    let mut bytes = frame(0x31, 6, &genl(1, &attr(1, &0x99_u16.to_ne_bytes())));
-    bytes.extend_from_slice(&frame(0x31, 7, &genl(1, &attr(1, &0x42_u16.to_ne_bytes()))));
+    let mut stale_attrs = attr(2, b"nl80211\0");
+    stale_attrs.extend_from_slice(&attr(1, &0x99_u16.to_ne_bytes()));
+    let mut current_attrs = attr(2, b"nl80211\0");
+    current_attrs.extend_from_slice(&attr(1, &0x42_u16.to_ne_bytes()));
+    let mut bytes = frame(0x10, 6, &genl(1, &stale_attrs));
+    bytes.extend_from_slice(&frame(0x10, 7, &genl(1, &current_attrs)));
     assert_eq!(
         consume_family_batch(&bytes, 7).unwrap(),
         (Some(0x42), false)
     );
+}
+
+#[test]
+fn malformed_trailing_family_attribute_preserves_resolved_id() {
+    let mut attrs = attr(2, b"nl80211\0");
+    attrs.extend_from_slice(&attr(1, &0x42_u16.to_ne_bytes()));
+    attrs.extend_from_slice(&[8, 0, 99, 0, 1, 2]);
+    assert_eq!(decode_family_reply(&genl(1, &attrs)).unwrap(), Some(0x42));
 }
 
 #[test]
@@ -174,11 +205,13 @@ fn unknown_attributes_are_skipped_by_checked_attribute_iterator() {
 }
 
 #[test]
-fn bssid_mask_keeps_only_the_oui_and_last_octet() {
-    assert_eq!(
-        mask_bssid([0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff]),
-        "aa:bb:cc:xx:xx:ff"
-    );
+fn bssid_mask_hides_every_octet() {
+    let bssid = [0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff];
+    let masked = mask_bssid(bssid);
+    assert_eq!(masked, "xx:xx:xx:xx:xx:xx");
+    for octet in bssid {
+        assert!(!masked.contains(&format!("{octet:02x}")));
+    }
 }
 
 #[test]

@@ -52,9 +52,10 @@ const RATE_INFO_HE_MCS: u16 = 13;
 const RATE_INFO_HE_NSS: u16 = 14;
 const RATE_INFO_HE_GI: u16 = 15;
 const RATE_INFO_HE_DCM: u16 = 16;
-const RATE_INFO_EHT_MCS: u16 = 18;
-const RATE_INFO_EHT_NSS: u16 = 19;
-const RATE_INFO_EHT_GI: u16 = 20;
+const RATE_INFO_320_MHZ_WIDTH: u16 = 18;
+const RATE_INFO_EHT_MCS: u16 = 19;
+const RATE_INFO_EHT_NSS: u16 = 20;
+const RATE_INFO_EHT_GI: u16 = 21;
 const GENL_HEADER_LEN: usize = 4;
 const NLA_HEADER_LEN: usize = 4;
 // NLA_F_NESTED and NLA_F_NET_BYTEORDER are type flags, not attribute IDs.
@@ -67,6 +68,8 @@ const DUMP: u16 = (libc::NLM_F_REQUEST | libc::NLM_F_DUMP) as u16;
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Interface {
     pub ifindex: Option<u32>,
+    // TODO(THE-887): replace these per-dump allocations with inline buffers before
+    // wiring the net_wifi collector (monitor spec §6.2).
     pub name: Option<String>,
     pub iftype: Option<u32>,
     pub ssid: Option<Vec<u8>>,
@@ -194,6 +197,9 @@ pub fn get_station(
             if message.header.kind == family_id {
                 let (_, payload) = genl_parts(message.payload)?;
                 let station = decode_station(payload);
+                // GET_STATION is a unicast request keyed by IFINDEX and MAC. Some
+                // kernels omit ATTR_MAC in the reply, so accept that reply as the
+                // requested peer's station record.
                 if station.bssid == Some(bssid) || station.bssid.is_none() {
                     return Ok(Some(station));
                 }
@@ -202,12 +208,9 @@ pub fn get_station(
     }
 }
 
-/// Masks the middle octets of a MAC/BSSID while retaining the OUI and last octet.
-pub fn mask_bssid(bssid: [u8; 6]) -> String {
-    format!(
-        "{:02x}:{:02x}:{:02x}:xx:xx:{:02x}",
-        bssid[0], bssid[1], bssid[2], bssid[5]
-    )
+/// Masks every octet of a MAC/BSSID.
+pub fn mask_bssid(_bssid: [u8; 6]) -> String {
+    "xx:xx:xx:xx:xx:xx".to_owned()
 }
 
 fn decode_interface(payload: &[u8]) -> Interface {
@@ -244,12 +247,7 @@ fn decode_station(payload: &[u8]) -> Station {
     for item in AttributeIter::new(payload) {
         let Ok(attribute) = item else { break };
         match attribute.kind & NLA_TYPE_MASK {
-            ATTR_MAC => {
-                row.bssid = match <[u8; 6]>::try_from(attribute.payload) {
-                    Ok(bssid) => Some(bssid),
-                    Err(_) => None,
-                }
-            }
+            ATTR_MAC => row.bssid = <[u8; 6]>::try_from(attribute.payload).ok(),
             ATTR_STA_INFO => sta_info = Some(attribute.payload),
             _ => {}
         }
@@ -287,7 +285,9 @@ fn decode_rate(payload: &[u8]) -> RateInfo {
     for item in AttributeIter::new(payload) {
         let Ok(attribute) = item else { break };
         match attribute.kind & NLA_TYPE_MASK {
-            RATE_INFO_BITRATE => row.bitrate_100kbps = get_u16(attribute.payload, 0).map(u32::from),
+            RATE_INFO_BITRATE if row.bitrate_100kbps.is_none() => {
+                row.bitrate_100kbps = get_u16(attribute.payload, 0).map(u32::from)
+            }
             RATE_INFO_BITRATE32 => row.bitrate_100kbps = get_u32(attribute.payload, 0),
             RATE_INFO_MCS => {
                 row.mcs = attribute.payload.first().copied();
@@ -333,6 +333,7 @@ fn decode_rate(payload: &[u8]) -> RateInfo {
             RATE_INFO_80_MHZ_WIDTH => row.width_mhz = Some(80),
             RATE_INFO_80P80_MHZ_WIDTH => row.width_mhz = Some(160),
             RATE_INFO_160_MHZ_WIDTH => row.width_mhz = Some(160),
+            RATE_INFO_320_MHZ_WIDTH => row.width_mhz = Some(320),
             RATE_INFO_10_MHZ_WIDTH => row.width_mhz = Some(10),
             RATE_INFO_5_MHZ_WIDTH => row.width_mhz = Some(5),
             _ => {}
@@ -385,7 +386,7 @@ fn decode_family_reply(payload: &[u8]) -> io::Result<Option<u16>> {
     let mut family_id = None;
     let mut family_name = None;
     for item in AttributeIter::new(attrs) {
-        let attribute = item?;
+        let Ok(attribute) = item else { break };
         match attribute.kind & NLA_TYPE_MASK {
             CTRL_ATTR_FAMILY_ID => family_id = get_u16(attribute.payload, 0),
             CTRL_ATTR_FAMILY_NAME => {
