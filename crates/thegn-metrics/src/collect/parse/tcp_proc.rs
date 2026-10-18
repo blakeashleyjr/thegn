@@ -11,7 +11,7 @@ pub struct TcpProcRow {
     pub tx_queue: u32,
     pub rx_queue: u32,
     pub uid: u32,
-    pub inode: u64,
+    pub inode: u32,
 }
 
 /// Parses valid rows into a reusable vector and returns the number of malformed data rows.
@@ -57,7 +57,7 @@ fn parse_row(line: &[u8], ipv6: bool) -> Option<TcpProcRow> {
         tx_queue: u32::try_from(parse_hex(tx_queue)?).ok()?,
         rx_queue: u32::try_from(parse_hex(rx_queue)?).ok()?,
         uid: u32::try_from(parse_decimal(uid)?).ok()?,
-        inode: parse_decimal(inode)?,
+        inode: u32::try_from(parse_decimal(inode)?).ok()?,
     })
 }
 
@@ -72,7 +72,7 @@ fn parse_endpoint(input: &[u8], ipv6: bool) -> Option<(IpAddr, u16)> {
         let mut octets = [0_u8; 16];
         for (index, word) in address_hex.chunks_exact(8).enumerate() {
             let value = u32::try_from(parse_hex(word)?).ok()?;
-            octets[index * 4..index * 4 + 4].copy_from_slice(&value.to_le_bytes());
+            octets[index * 4..index * 4 + 4].copy_from_slice(&value.to_ne_bytes());
         }
         IpAddr::V6(Ipv6Addr::from(octets))
     } else {
@@ -80,7 +80,7 @@ fn parse_endpoint(input: &[u8], ipv6: bool) -> Option<(IpAddr, u16)> {
             return None;
         }
         let value = u32::try_from(parse_hex(address_hex)?).ok()?;
-        IpAddr::V4(Ipv4Addr::from(value.to_le_bytes()))
+        IpAddr::V4(Ipv4Addr::from(value.to_ne_bytes()))
     };
     Some((address, port))
 }

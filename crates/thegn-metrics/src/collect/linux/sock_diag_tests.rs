@@ -1,5 +1,5 @@
 use super::{AddressFamily, TcpInfo, decode_message, encode_request};
-use crate::collect::linux::netlink::{NetlinkHeader, NetlinkMessage};
+use crate::collect::linux::netlink::{MessageIter, NetlinkHeader, NetlinkMessage};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
 fn response(family: AddressFamily, info_len: usize) -> Vec<u8> {
@@ -31,6 +31,9 @@ fn response(family: AddressFamily, info_len: usize) -> Vec<u8> {
         payload.extend_from_slice(&2_u16.to_ne_bytes());
         let mut info = vec![0_u8; info_len];
         info[0] = 1;
+        if info_len >= 40 {
+            info[36..40].copy_from_slice(&7_u32.to_ne_bytes());
+        }
         if info_len >= 76 {
             info[68..72].copy_from_slice(&321_u32.to_ne_bytes());
             info[72..76].copy_from_slice(&654_u32.to_ne_bytes());
@@ -56,7 +59,8 @@ fn decode(payload: &[u8]) -> super::TcpSock {
 #[test]
 fn encoder_builds_v4_and_v6_dump_requests_with_tcp_info_ext() {
     for family in [AddressFamily::Ipv4, AddressFamily::Ipv6] {
-        let request = encode_request(family, 0x1234);
+        let mut request = [0_u8; 72];
+        encode_request(&mut request, family, 0x1234, 9);
         assert_eq!(
             u32::from_ne_bytes(request[0..4].try_into().unwrap()) as usize,
             request.len()
@@ -70,6 +74,7 @@ fn encoder_builds_v4_and_v6_dump_requests_with_tcp_info_ext() {
         );
         assert_eq!(request[17], 6);
         assert_eq!(request[18], 2);
+        assert_eq!(u32::from_ne_bytes(request[8..12].try_into().unwrap()), 9);
         assert_eq!(
             u32::from_ne_bytes(request[20..24].try_into().unwrap()),
             0x1234
@@ -104,10 +109,77 @@ fn truncated_tcp_info_keeps_complete_rtt_fields_only() {
             rtt_us: Some(321),
             rttvar_us: Some(654),
             snd_cwnd: None,
-            retrans: None,
+            retrans: Some(7),
             total_retrans: None,
             bytes_acked: None,
             bytes_received: None,
         })
     );
+}
+
+#[test]
+fn non_word_aligned_tcp_info_cut_keeps_only_complete_fields() {
+    let row = decode(&response(AddressFamily::Ipv4, 70));
+    let info = row.info.unwrap();
+    assert_eq!(info.retrans, Some(7));
+    assert_eq!(info.rtt_us, None);
+    assert_eq!(info.rttvar_us, None);
+    assert_eq!(info.snd_cwnd, None);
+    assert_eq!(info.total_retrans, None);
+    assert_eq!(info.bytes_acked, None);
+    assert_eq!(info.bytes_received, None);
+}
+
+#[test]
+fn truncated_trailing_attribute_degrades_tcp_info_only() {
+    let mut payload = response(AddressFamily::Ipv4, 0);
+    payload.extend_from_slice(&[8, 0, 2, 0, 1, 2, 3, 4]);
+    payload.extend_from_slice(&[8, 0, 2, 0, 1, 2, 3]);
+    let row = decode(&payload);
+    assert_eq!(row.info, None);
+}
+
+fn frame(kind: u16, sequence: u32, payload: &[u8]) -> Vec<u8> {
+    let len = 16 + payload.len();
+    let mut bytes = Vec::with_capacity((len + 3) & !3);
+    bytes.extend_from_slice(&(len as u32).to_ne_bytes());
+    bytes.extend_from_slice(&kind.to_ne_bytes());
+    bytes.extend_from_slice(&0_u16.to_ne_bytes());
+    bytes.extend_from_slice(&sequence.to_ne_bytes());
+    bytes.extend_from_slice(&0_u32.to_ne_bytes());
+    bytes.extend_from_slice(payload);
+    bytes.resize((len + 3) & !3, 0);
+    bytes
+}
+
+#[test]
+fn framed_response_iterates_through_message_iter_before_decode() {
+    let mut bytes = frame(20, 4, &response(AddressFamily::Ipv4, 0));
+    bytes.extend_from_slice(&frame(libc::NLMSG_DONE as u16, 4, &[]));
+    let mut messages = MessageIter::new(&bytes);
+    let message = messages.next().unwrap().unwrap();
+    let row = decode_message(&message).unwrap();
+    assert_eq!(row.source, IpAddr::V4(Ipv4Addr::LOCALHOST));
+    assert!(messages.next().is_none());
+    assert!(messages.is_done());
+}
+
+#[test]
+fn stale_done_does_not_end_current_sequence_dump() {
+    let mut bytes = frame(libc::NLMSG_DONE as u16, 3, &[]);
+    bytes.extend_from_slice(&frame(20, 4, &response(AddressFamily::Ipv4, 0)));
+    bytes.extend_from_slice(&frame(libc::NLMSG_DONE as u16, 4, &[]));
+    let mut rows = Vec::new();
+    let (done, malformed) = super::consume_batch(&bytes, 4, &mut rows).unwrap();
+    assert!(done);
+    assert_eq!(malformed, 0);
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].source, IpAddr::V4(Ipv4Addr::LOCALHOST));
+}
+
+#[test]
+fn negative_error_in_done_payload_is_reported() {
+    let bytes = frame(libc::NLMSG_DONE as u16, 5, &(-13_i32).to_ne_bytes());
+    let result = super::consume_batch(&bytes, 5, &mut Vec::new());
+    assert!(matches!(result, Err(error) if error.raw_os_error() == Some(libc::EACCES)));
 }

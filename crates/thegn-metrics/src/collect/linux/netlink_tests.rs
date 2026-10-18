@@ -73,7 +73,7 @@ fn live_sock_diag_dump_completes_within_deadline_when_available() {
         Err(error)
             if matches!(
                 error.raw_os_error(),
-                Some(libc::EPERM | libc::EACCES | libc::EAFNOSUPPORT)
+                Some(libc::EPERM | libc::EACCES | libc::EAFNOSUPPORT | libc::EPROTONOSUPPORT)
             ) =>
         {
             return;
@@ -81,10 +81,17 @@ fn live_sock_diag_dump_completes_within_deadline_when_available() {
         Err(error) => panic!("cannot open sock_diag socket: {error}"),
     };
     let mut rows = Vec::new();
-    super::super::sock_diag::dump_tcp(
+    if let Err(error) = super::super::sock_diag::dump_tcp(
         &mut socket,
         &mut rows,
         Instant::now() + Duration::from_secs(1),
-    )
-    .unwrap();
+    ) {
+        if matches!(
+            error.raw_os_error(),
+            Some(libc::EPERM | libc::EACCES | libc::EAFNOSUPPORT | libc::EPROTONOSUPPORT)
+        ) {
+            return;
+        }
+        panic!("sock_diag dump failed: {error}");
+    }
 }
