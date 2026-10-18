@@ -3,8 +3,9 @@ use crate::telemetry::{Metric, TelemetryHistory, Window};
 use thegn_core::series_store::{CAP_B, SeriesBuf, SeriesId, SeriesKey, Tier};
 use thegn_metrics::StatsSnapshot;
 use thegn_metrics::collect::{
-    CollectorId, CollectorSet,
+    COLLECTORS, CollectorId, CollectorSet,
     frame::{MonitorFrame, Parts},
+    health::Health,
     model::{
         cpu_stat::{CoreSample, ModeShare},
         loadavg::LoadavgPart,
@@ -22,6 +23,14 @@ fn key(family: u8, metric: u16, instance: u16) -> SeriesKey {
         metric,
         instance,
     }
+}
+
+fn successful_health(ids: &[CollectorId]) -> [Health; COLLECTORS] {
+    let mut health = [Health::default(); COLLECTORS];
+    for id in ids {
+        health[id.index()] = Health::Ok;
+    }
+    health
 }
 
 fn read(
@@ -43,6 +52,11 @@ fn frame_with_load(load1: u32, sampled: bool) -> MonitorFrame {
     }
     MonitorFrame {
         sampled: collectors,
+        health: if sampled {
+            successful_health(&[CollectorId::Loadavg])
+        } else {
+            [Health::default(); COLLECTORS]
+        },
         parts: Parts {
             loadavg: LoadavgPart {
                 value: Some(Loadavg {
@@ -61,6 +75,7 @@ fn frame_with_core(core_id: u16, busy: Option<u16>, online: bool) -> MonitorFram
     sampled.insert(CollectorId::CpuStat);
     MonitorFrame {
         sampled,
+        health: successful_health(&[CollectorId::CpuStat]),
         parts: Parts {
             cpu_stat: thegn_metrics::collect::model::cpu_stat::CpuStatPart {
                 total: Some(ModeShare {
@@ -94,7 +109,7 @@ fn snapshot(load: f32, cpu: Option<u8>) -> StatsSnapshot {
 #[test]
 fn masthead_covers_a_simulated_day_in_t2_and_last_hour_in_t1() {
     let mut history = MonitorHistory::new();
-    let start = 137_u64;
+    let start = 1_760_000_017_137_u64;
     for tick in 0_u64..43_200 {
         let at = start + tick * 2_000 + 3;
         history.ingest_masthead(&snapshot(1.5, Some(42)), at);
@@ -105,12 +120,17 @@ fn masthead_covers_a_simulated_day_in_t2_and_last_hour_in_t1() {
         .id_for(key(FAMILY_MASTHEAD, Metric::Cpu.index() as u16, 0))
         .unwrap();
     let now = start + 86_400_000;
-    assert_eq!(history.store().covered_secs(id, now), Some(86_400));
+    assert_ne!(start % 60_000, 0);
+    let expected_covered_secs = ((now - (start + 3)) / 1_000 + 1) as u32;
+    assert_eq!(
+        history.store().covered_secs(id, now),
+        Some(expected_covered_secs)
+    );
     let day = read(&history, id, Tier::T2, now - 86_400_000, now);
-    assert_eq!(day.len(), 1_440);
+    assert_eq!(day.len(), now / 60_000 - (now - 86_400_000) / 60_000);
     assert!(day.iter().all(|row| row.mean.is_finite()));
     let hour = read(&history, id, Tier::T1, now - 3_600_000, now);
-    assert_eq!(hour.len(), 720);
+    assert_eq!(hour.len(), now / 5_000 - (now - 3_600_000) / 5_000);
     assert!(hour.iter().all(|row| row.mean.is_finite()));
 }
 
@@ -177,12 +197,32 @@ fn unsampled_loadavg_does_not_push_or_claim_a_second() {
 }
 
 #[test]
+fn failed_loadavg_attempt_does_not_push_or_claim_the_second() {
+    let mut history = MonitorHistory::new();
+    history.ingest_masthead(&snapshot(1.0, None), 10_000);
+    let mut failed = frame_with_load(200, true);
+    failed.health[CollectorId::Loadavg.index()] = Health::Failing {
+        since_tick: 4,
+        backoff: 1,
+        retry_at: 5,
+    };
+    history.ingest_frame(&failed, 10_001);
+    history.ingest_masthead(&snapshot(1.25, None), 10_002);
+
+    let id = history
+        .id_for(key(FAMILY_MASTHEAD, Metric::Load.index() as u16, 0))
+        .unwrap();
+    assert_eq!(read(&history, id, Tier::T0, 10_000, 10_000)[0].mean, 1.25);
+}
+
+#[test]
 fn psi_and_cpu_stat_parts_map_to_class_a_and_b_series() {
     let mut sampled = CollectorSet::empty();
     sampled.insert(CollectorId::Psi);
     sampled.insert(CollectorId::CpuStat);
     let frame = MonitorFrame {
         sampled,
+        health: successful_health(&[CollectorId::Psi, CollectorId::CpuStat]),
         parts: Parts {
             psi: PsiPart {
                 cpu: thegn_metrics::collect::model::psi::PsiResource {
@@ -284,6 +324,7 @@ fn capped_core_ids_are_refused_once_and_never_panic() {
     let mut sampled = CollectorSet::empty();
     sampled.insert(CollectorId::CpuStat);
     let cores: Vec<_> = (0_u16..600)
+        .rev()
         .map(|id| CoreSample {
             id,
             online: true,
@@ -295,6 +336,7 @@ fn capped_core_ids_are_refused_once_and_never_panic() {
         .collect();
     let frame = MonitorFrame {
         sampled,
+        health: successful_health(&[CollectorId::CpuStat]),
         parts: Parts {
             cpu_stat: thegn_metrics::collect::model::cpu_stat::CpuStatPart {
                 cores,
@@ -386,6 +428,7 @@ fn psi_absence_records_nan_and_wall_clock_is_unix_milliseconds() {
     sampled.insert(CollectorId::Psi);
     let present = MonitorFrame {
         sampled,
+        health: successful_health(&[CollectorId::Psi]),
         parts: Parts {
             psi: PsiPart {
                 cpu: thegn_metrics::collect::model::psi::PsiResource {
@@ -410,6 +453,7 @@ fn psi_absence_records_nan_and_wall_clock_is_unix_milliseconds() {
     history.ingest_frame(
         &MonitorFrame {
             sampled,
+            health: successful_health(&[CollectorId::Psi]),
             ..MonitorFrame::default()
         },
         4_000,
