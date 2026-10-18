@@ -144,8 +144,12 @@ until config reload). That crash/backoff state is process-lifetime supervisor
 state: it is not persisted across a daemon or compositor restart. After such a
 restart, the offline `plugin list` command cannot reconcile live state and
 reports an enabled plugin as `unknown` with `live_health = unavailable` until a
-future attached-snapshot surface exists. Plugin processes are _not sandboxed_ —
-treat a plugin like any program you choose to run.
+future attached-snapshot surface exists. Resident-plugin stderr is drained and
+written to the debug log at most 20 lines per second; a line is capped at 512
+bytes, and excess lines are suppressed. The service retains the latest 8 KiB
+for its session outcome, but that tail and its byte, line, dropped-line, and
+truncated-line counts are not shown by a user-facing command. Plugin processes
+are _not sandboxed_ — treat a plugin like any program you choose to run.
 
 ## Writing one
 
