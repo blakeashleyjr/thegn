@@ -28,6 +28,9 @@ pub struct PreviewGfx {
     /// The placement and content revision currently drawn, or `None` when
     /// nothing is drawn.
     drawn: Option<(Placement, u64)>,
+    /// A full terminal clear makes the actual image state unknown. Preserve
+    /// that fact until a frame either draws or deletes the preview.
+    cleared: bool,
     /// Number of image encodes, exposed only for retry regression tests.
     #[cfg(test)]
     encodes: usize,
@@ -47,10 +50,11 @@ impl PreviewGfx {
         self.rev = self.rev.wrapping_add(1);
     }
 
-    /// Forget the terminal placement after a full screen clear. The clear
-    /// already erased the image, so the next frame must transmit it again.
+    /// Mark the terminal image state unknown after a full screen clear. A
+    /// later visible frame redraws it; a hidden frame sends a scoped delete so
+    /// any refused draw cannot reappear after the clear.
     pub fn invalidate(&mut self) {
-        self.drawn = None;
+        self.cleared = true;
     }
 
     /// Bytes to write to the outer terminal this frame: draw the image once at
@@ -91,6 +95,7 @@ impl PreviewGfx {
                         }
                         out.extend_from_slice(&image);
                         self.drawn = Some((place, self.rev));
+                        self.cleared = false;
                         out
                     }
                     Err(e) => {
@@ -113,8 +118,9 @@ impl PreviewGfx {
                 }
             }
             Some(_) => Vec::new(), // already drawn at this placement and revision
-            None if self.drawn.is_some() => {
+            None if self.drawn.is_some() || self.cleared => {
                 self.drawn = None;
+                self.cleared = false;
                 graphics::delete_preview()
             }
             None => Vec::new(),
@@ -439,6 +445,28 @@ mod tests {
         });
         assert_eq!(admitted, vec![delete]);
         assert_eq!(admitted[0], graphics::delete_preview());
+        assert!(!admitted.iter().any(|bytes| bytes == &draw));
+    }
+
+    #[test]
+    fn invalidate_then_hide_replaces_refused_draw_with_delete() {
+        let mut g = PreviewGfx::new();
+        g.set("a.png".to_string(), raster());
+        let draw = g.frame(Some(panel()), Some("a.png"), false, true);
+        let mut pending = crate::preview_retry::PendingPreviewOob::default();
+        pending.offer(draw.clone(), Err);
+
+        g.invalidate();
+        let delete = g.frame(Some(panel()), Some("a.png"), true, true);
+        assert_eq!(delete, graphics::delete_preview());
+        pending.offer(delete, Err);
+
+        let mut admitted = Vec::new();
+        pending.retry(|bytes| {
+            admitted.push(bytes);
+            Ok(())
+        });
+        assert_eq!(admitted, vec![graphics::delete_preview()]);
         assert!(!admitted.iter().any(|bytes| bytes == &draw));
     }
 }
