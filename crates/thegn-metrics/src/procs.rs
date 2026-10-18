@@ -304,6 +304,9 @@ fn read_start_stat(
     crate::procs_parse::parse_stat(buf)
 }
 
+/// The accepted residual race is a same-parent, same-name PID reuse between
+/// the sysinfo refresh and this stat read: the replacement's ticks are kept,
+/// so pidfd and ticks checks can target that replacement within one sample.
 fn matching_start_ticks(
     stat: &crate::procs_model::Stat,
     pid: u32,
