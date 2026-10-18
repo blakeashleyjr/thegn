@@ -149,13 +149,16 @@ monitor. The temperature masthead chip expands into this tab.
 
 ## Network
 
-The Network board has separate panels for mirrored receive/transmit throughput,
-interfaces, and error/drop health. The throughput plot uses telemetry history;
-the interface sparklines use the sampled per-interface rings. Totals count
-physical links only, so VPN traffic is not double-counted. Interface rows keep
-idle and down links visible, and fold interfaces beyond the eight history slots
-into `other`. Use `f`/`F` to focus a panel, `z` to zoom it, and `Esc` to step
-back through focus and zoom. The network masthead chip expands into this tab.
+The Network board has panels for mirrored receive/transmit throughput,
+interfaces, error/drop health, and Wi-Fi. The throughput plot uses telemetry
+history; interface rates and Wi-Fi signal use sampled per-interface rings. The
+Wi-Fi panel shows the SSID, a masked BSSID, frequency and width, signal and
+average signal, retry/failure counts, and connection time. Its sparkline uses a
+labelled −90 to −30 dBm scale. Totals count physical links only, so VPN traffic
+is not double-counted. Interface rows keep idle and down links visible, and
+fold interfaces beyond the eight history slots into `other`. Use `f`/`F` to
+focus a panel, `z` to zoom it, and `Esc` to step back through focus and zoom.
+The network masthead chip expands into this tab.
 
 ## Disk
 
