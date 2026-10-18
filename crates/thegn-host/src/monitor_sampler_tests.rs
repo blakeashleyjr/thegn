@@ -17,6 +17,15 @@ use thegn_metrics::collect::{
     schedule::{Cadence, Mode},
 };
 
+#[test]
+fn all_demand_excludes_visible_only_gpu_clients() {
+    assert!(
+        !Demand::all(500)
+            .collectors
+            .contains(CollectorId::GpuClients)
+    );
+}
+
 struct FakeClock {
     now: Mutex<Instant>,
     timed: AtomicUsize,

@@ -178,6 +178,7 @@ fn copy_part(target: &mut Parts, source: &Parts, id: CollectorId) {
         CollectorId::Filesystems => target.filesystems.clone_from(&source.filesystems),
         CollectorId::GpuDevices => target.gpu_devices.clone_from(&source.gpu_devices),
         CollectorId::GpuEngines => target.gpu_engines.clone_from(&source.gpu_engines),
+        CollectorId::GpuClients => target.gpu_clients.clone_from(&source.gpu_clients),
     }
 }
 
