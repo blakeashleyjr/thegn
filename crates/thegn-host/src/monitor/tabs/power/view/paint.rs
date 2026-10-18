@@ -175,7 +175,12 @@ pub(super) fn paint_rails(grid: &mut CellGrid, rect: Rect, model: &PowerModel) {
         );
         row += 1;
     }
-    for zone in model.zones.iter().take(rect.rows.saturating_sub(row)) {
+    for zone in model
+        .zones
+        .iter()
+        .filter(|zone| zone.active)
+        .take(rect.rows.saturating_sub(row))
+    {
         put_line(
             grid,
             rect,
