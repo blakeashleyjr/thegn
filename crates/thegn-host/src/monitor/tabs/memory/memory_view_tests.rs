@@ -457,8 +457,8 @@ fn zero_dirty_and_writeback_histories_draw_baselines() {
     caps::test_override::with_unicode(UnicodeLevel::Full, || {
         board.paint(&view, &mut surface, area, 0, &[]);
     });
-    let line = surface
-        .screen_lines()
+    let lines = surface.screen_lines();
+    let line = lines
         .get(kernel.rect.y + 14)
         .expect("writeback chart bottom row exists");
     assert!(line.visible_cells().any(|cell| {
@@ -565,8 +565,8 @@ fn kernel_panel_shows_demand_and_right_aligned_histories() {
         .take(kernel.rect.cols)
         .collect::<String>();
     assert!(kernel_hugepages_row.contains("hugepages"));
-    let thp_sparkline_row = surface
-        .screen_lines()
+    let lines = surface.screen_lines();
+    let thp_sparkline_row = lines
         .get(kernel.rect.y + 1 + 7)
         .expect("THP sparkline row exists");
     assert!(thp_sparkline_row.visible_cells().any(|cell| {
