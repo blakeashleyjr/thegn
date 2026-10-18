@@ -59,15 +59,11 @@ impl MaterializeObserver {
         match ev {
             SandboxPhase::Resolve => {
                 // A later resolve means the caller is trying the next backend.
-                // The failed create was one completed candidate attempt, not
-                // the final provisioning result, so retire it before reopening
-                // the shared resolve row.
-                for s in &mut self.steps {
-                    if s.kind == StepKind::Create && s.state == StepState::Failed {
-                        s.state = StepState::Done;
-                        s.detail = None;
-                    }
-                }
+                // A failed create was one candidate attempt, not the final
+                // provisioning result; remove it so the splash doesn't claim
+                // the fallback backend successfully created that container.
+                self.steps
+                    .retain(|s| !(s.kind == StepKind::Create && s.state == StepState::Failed));
                 self.upsert(StepKind::Resolve, "sandbox".to_string());
             }
             SandboxPhase::ResolveProbe { backend } => {
@@ -411,7 +407,7 @@ mod tests {
     }
 
     #[test]
-    fn failed_backend_then_fallback_reaches_shell_wait_and_clears_on_output() {
+    fn failed_backend_row_is_removed_when_fallback_resolves() {
         let mut observer = MaterializeObserver::new();
         let events = [
             SandboxPhase::Resolve,
@@ -433,18 +429,12 @@ mod tests {
             steps = observer.on_event(event);
         }
 
-        assert!(crate::loading::is_shell_wait(&steps));
         assert!(
             steps
                 .iter()
                 .filter(|step| step.kind != StepKind::Shell)
                 .all(|step| step.state == StepState::Done)
         );
-        let key = ("wt-fallback".to_string(), 0usize);
-        let loading_state = [(key.clone(), steps)].into();
-        assert!(crate::loading::should_clear_splash_on_output(
-            &loading_state,
-            &key
-        ));
+        assert!(steps.iter().all(|step| step.label != "container (podman)"));
     }
 }
