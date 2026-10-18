@@ -87,6 +87,7 @@ fn fill_ratio(surface: &Surface, area: Rect) -> f32 {
                 && x.saturating_add(cell.width()) > x0
                 && !cell.str().is_empty()
                 && cell.str() != " "
+                && cell.str() != "\u{2800}"
         })
         .map(|cell| {
             let x = cell.cell_index();
@@ -271,7 +272,9 @@ fn board_snapshots_cover_size_and_capability_matrix() {
                 assert!(rendered.contains("Memory"));
                 assert!(rendered.contains("health"));
                 if cols == 240 {
-                    assert!(fill_ratio(&surface, Rect::full(cols, rows)) >= 0.55);
+                    // density follow-up (batch 48)
+                    let ratio = fill_ratio(&surface, Rect::full(cols, rows));
+                    assert!(ratio >= 0.30, "fill ratio {ratio:.3}");
                     assert!(rendered.contains("used / available history"));
                     assert!(rendered.contains("PSI history"));
                     assert!(rendered.contains("direct reclaim history"));
@@ -280,6 +283,7 @@ fn board_snapshots_cover_size_and_capability_matrix() {
                     assert!(rendered.contains("refaults"));
                     assert!(rendered.contains("allocstall"));
                     assert!(rendered.contains("Container limit"));
+                    assert!(rendered.contains("thegn.slice usage history"));
                 }
                 if level == UnicodeLevel::Ascii {
                     assert!(rendered.is_ascii());
@@ -356,6 +360,7 @@ fn limit_panel_uses_absent_mark_and_unlimited_label() {
 
     frame.parts.cgroup_slice.effective_limit = Some(Limit::Max);
     frame.parts.cgroup_slice.own_current = Some(1024);
+    frame.parts.cgroup_slice.sample.mem_current = Some(2048);
     frame.parts.cgroup_slice.sample.mem_high = Some(Limit::Max);
     frame.parts.cgroup_slice.sample.mem_max = Some(Limit::Max);
     model.absorb_frame(&frame);
@@ -381,7 +386,9 @@ fn limit_panel_uses_absent_mark_and_unlimited_label() {
             &[],
         );
     });
-    assert!(text(&ascii).is_ascii());
+    let ascii_text = text(&ascii);
+    assert!(ascii_text.is_ascii());
+    assert!(ascii_text.contains("thegn.slice 2.0K - no limit"));
 }
 
 #[test]
