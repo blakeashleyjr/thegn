@@ -18,18 +18,24 @@ fn process(pid: u32, ppid: u32, utime: u64, starttime: u64) -> FakeProcess {
     }
 }
 
-fn summary_process(
+struct SummaryRow {
     pid: u32,
     ppid: u32,
     state: char,
     threads: u64,
     flags: u64,
-    utime: u64,
-    starttime: u64,
     rss_pages: u64,
-) -> FakeProcess {
+}
+
+fn summary_process(row: SummaryRow, utime: u64, starttime: u64) -> FakeProcess {
     let stat = format!(
-        "{pid} (worker {pid}) {state} {ppid} 1 1 0 0 {flags} 0 0 0 0 {utime} 0 0 0 0 0 {threads} 0 {starttime} 1 {rss_pages}"
+        "{pid} (worker {pid}) {state} {ppid} 1 1 0 0 {flags} 0 0 0 0 {utime} 0 0 0 0 0 {threads} 0 {starttime} 1 {rss_pages}",
+        pid = row.pid,
+        state = row.state,
+        ppid = row.ppid,
+        flags = row.flags,
+        threads = row.threads,
+        rss_pages = row.rss_pages,
     );
     FakeProcess {
         stat: stat.into_bytes(),
@@ -283,19 +289,36 @@ fn native_summary_uses_every_live_entry_and_diffs_pid_start_identities() {
     for (pid, ppid, state, threads, flags, rss) in rows {
         fs.insert(
             pid,
-            summary_process(pid, ppid, state, threads, flags, 10, 250, rss),
+            summary_process(
+                SummaryRow {
+                    pid,
+                    ppid,
+                    state,
+                    threads,
+                    flags,
+                    rss_pages: rss,
+                },
+                10,
+                250,
+            ),
         );
     }
     let mut native = NativeBackend::with(fs, 16, None, Some(100), Some(4096));
     let mut primed = false;
-    let request = ProcSampleRequest {
-        rows: 1,
-        self_pid: 99,
-        daemon_pid: Some(88),
-        pane_pids: &[(77, 5)],
-        primed: false,
-    };
-    let (first, successful) = sample_with(&mut native, request, Instant::now(), 20, &mut primed);
+    let panes = [(77, 5)];
+    let (first, successful) = sample_with(
+        &mut native,
+        ProcSampleRequest {
+            rows: 1,
+            self_pid: 99,
+            daemon_pid: Some(88),
+            pane_pids: &panes,
+            primed: false,
+        },
+        Instant::now(),
+        20,
+        &mut primed,
+    );
     assert!(successful);
     let summary = first.summary.as_ref().expect("native summary");
     assert_eq!(first.total, 7);
@@ -315,21 +338,50 @@ fn native_summary_uses_every_live_entry_and_diffs_pid_start_identities() {
     assert_eq!(summary.owners.panes.rss_bytes, Some(7 * 4096));
     assert_eq!(summary.owners.other.rss_bytes, Some((5 + 6 + 7) * 4096));
     assert_eq!(summary.owners.ui.cpu_pct, None);
+    assert_eq!(summary.owners.other.cpu_pct, None);
 
     for (pid, ppid, state, threads, flags, rss) in rows {
         native.table.fs_mut().insert(
             pid,
-            summary_process(pid, ppid, state, threads, flags, 20, 250, rss),
+            summary_process(
+                SummaryRow {
+                    pid,
+                    ppid,
+                    state,
+                    threads,
+                    flags,
+                    rss_pages: rss,
+                },
+                20,
+                250,
+            ),
         );
     }
     native.table.fs_mut().remove(32);
-    native
-        .table
-        .fs_mut()
-        .insert(33, summary_process(33, 1, 'S', 1, 0, 20, 500, 8));
+    native.table.fs_mut().insert(
+        33,
+        summary_process(
+            SummaryRow {
+                pid: 33,
+                ppid: 1,
+                state: 'S',
+                threads: 1,
+                flags: 0,
+                rss_pages: 8,
+            },
+            20,
+            500,
+        ),
+    );
     let (second, successful) = sample_with(
         &mut native,
-        request,
+        ProcSampleRequest {
+            rows: 1,
+            self_pid: 99,
+            daemon_pid: Some(88),
+            pane_pids: &panes,
+            primed: false,
+        },
         Instant::now() + Duration::from_secs(2),
         22,
         &mut primed,
@@ -339,5 +391,5 @@ fn native_summary_uses_every_live_entry_and_diffs_pid_start_identities() {
     assert_eq!((summary.new, summary.exited), (Some(1), Some(1)));
     assert!((summary.owners.ui.cpu_pct.unwrap_or(0.0) - 5.0).abs() < 0.1);
     assert!((summary.owners.panes.cpu_pct.unwrap_or(0.0) - 10.0).abs() < 0.1);
-    assert!((summary.owners.other.cpu_pct.unwrap_or(0.0) - 15.0).abs() < 0.1);
+    assert!((summary.owners.other.cpu_pct.unwrap_or(0.0) - 10.0).abs() < 0.1);
 }

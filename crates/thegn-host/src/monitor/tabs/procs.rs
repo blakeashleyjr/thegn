@@ -130,13 +130,13 @@ fn summary_sections(summary: &thegn_metrics::ProcSummary) -> Vec<Section> {
         )),
     )];
     let state_tone = if summary.disk_sleep > 0 {
-        Tok::Hue(Hue::Red)
+        Tok::Hue(Hue::Amber)
     } else {
         Tok::Slot(S::Text)
     };
     sections.push(Section::HeadingToned {
         label: "states".into(),
-        label_tone: state_tone,
+        label_tone: Tok::Slot(S::Text),
         note: format!(
             "R {}  S {}  D {}  Z {}  T {}  I {}",
             summary.running,
@@ -161,7 +161,16 @@ fn summary_sections(summary: &thegn_metrics::ProcSummary) -> Vec<Section> {
 }
 
 fn count_mark(value: Option<usize>) -> String {
-    value.map_or_else(|| "—".into(), |count| count.to_string())
+    value.map_or_else(
+        || {
+            crate::monitor::kit::edge_fmt(NumFmt::default()).reading(
+                Reading::Unknown,
+                Unit::Count,
+                5,
+            )
+        },
+        |count| count.to_string(),
+    )
 }
 
 fn owner_share_table(owners: &thegn_metrics::ProcOwnerSummary) -> Section {
@@ -225,7 +234,14 @@ fn owner_share_table(owners: &thegn_metrics::ProcOwnerSummary) -> Section {
 fn meter_cell(value: Option<f32>, tone: Tok) -> Cell {
     match value {
         Some(value) => Cell::Bar(value, 5, tone),
-        None => Cell::Text("—".into(), Tok::Slot(S::Ghost)),
+        None => Cell::Text(
+            crate::monitor::kit::edge_fmt(NumFmt::default()).reading(
+                Reading::Unknown,
+                Unit::Count,
+                5,
+            ),
+            Tok::Slot(S::Ghost),
+        ),
     }
 }
 
@@ -544,12 +560,13 @@ mod tests {
             },
         };
         let sections = summary_sections(&summary);
-        assert_eq!(crate::sections::stack_height(&sections), 7);
+        assert_eq!(crate::sections::stack_height(&sections), 8);
         assert!(matches!(
             &sections[1],
             Section::HeadingToned {
-                label_tone: Tok::Hue(Hue::Red),
+                label_tone: Tok::Slot(S::Text),
                 note,
+                tone: Tok::Hue(Hue::Amber),
                 ..
             } if note.contains("D 1")
         ));
@@ -561,6 +578,22 @@ mod tests {
                     && matches!(&table.rows[0][2], Cell::Text(cpu, _) if cpu.contains("12.0"))
                     && matches!(&table.rows[0][3], Cell::Bar(frac, 5, Tok::Hue(Hue::Purple)) if *frac == 1.0)
         ));
+    }
+
+    #[test]
+    fn summary_unknown_marks_follow_ascii_glyph_selection() {
+        crate::caps::test_override::with_unicode(thegn_core::termcaps::UnicodeLevel::Ascii, || {
+            let expected = crate::monitor::kit::edge_fmt(NumFmt::default()).reading(
+                Reading::Unknown,
+                Unit::Count,
+                5,
+            );
+            assert_eq!(count_mark(None), expected);
+            assert!(matches!(
+                meter_cell(None, Tok::Hue(Hue::Teal)),
+                Cell::Text(mark, Tok::Slot(S::Ghost)) if mark == expected
+            ));
+        });
     }
 
     #[test]
@@ -624,7 +657,14 @@ mod tests {
                     primed: true,
                 },
             );
-            assert_eq!(build.row_y, vec![9]);
+            assert_eq!(
+                build.row_y,
+                vec![
+                    2 + crate::sections::stack_height(&summary_sections(
+                        model.procs.summary.as_ref().expect("summary")
+                    ))
+                ]
+            );
             assert!(matches!(
                 build.sections.last(),
                 Some(Section::FixedTable { table, .. })
