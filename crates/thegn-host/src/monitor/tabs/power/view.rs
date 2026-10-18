@@ -467,6 +467,39 @@ fn draw_graph_label(surface: &mut Surface, x: usize, y: usize, width: usize, lab
         crate::seg::Tok::Slot(crate::chrome::S::Dim),
     );
 }
+fn paint_history_runs(values: &[f32], rect: Rect, surface: &mut Surface) {
+    if values.is_empty() || rect.rows == 0 || rect.cols == 0 {
+        return;
+    }
+    let graph =
+        crate::monitor::kit::history_rect::graph_rect(rect, values.len(), graphs::table().braille);
+    let mut run_start = 0;
+    while run_start < values.len() {
+        while run_start < values.len() && !values[run_start].is_finite() {
+            run_start += 1;
+        }
+        let mut run_end = run_start;
+        while run_end < values.len() && values[run_end].is_finite() {
+            run_end += 1;
+        }
+        if run_start < run_end {
+            let first_col = run_start * graph.cols / values.len();
+            let end_col = (run_end * graph.cols).div_ceil(values.len());
+            let run_rect = Rect {
+                x: graph.x + first_col,
+                cols: end_col.saturating_sub(first_col),
+                ..graph
+            };
+            graphs::paint_history_graph(
+                &values[run_start..run_end],
+                RampId::Power,
+                run_rect,
+                surface,
+            );
+        }
+        run_start = run_end.saturating_add(1);
+    }
+}
 fn watts_label(name: &str, watts: Option<f32>) -> String {
     let value = watts
         .map(|watts| format!("{watts:.1} W"))
@@ -633,18 +666,8 @@ impl TabView for PowerView<'_> {
                     self.0.telemetry_battery_power_history.len(),
                     graphs::table().braille,
                 );
-                graphs::paint_history_graph(
-                    &self.0.telemetry_battery_history,
-                    RampId::Power,
-                    charge,
-                    surface,
-                );
-                graphs::paint_history_graph(
-                    &self.0.telemetry_battery_power_history,
-                    RampId::Power,
-                    power,
-                    surface,
-                );
+                paint_history_runs(&self.0.telemetry_battery_history, charge, surface);
+                paint_history_runs(&self.0.telemetry_battery_power_history, power, surface);
             } else {
                 let telemetry_cols = inner.cols * 2 / 3;
                 let battery_x = graph_x + telemetry_cols;
@@ -687,18 +710,8 @@ impl TabView for PowerView<'_> {
                     self.0.telemetry_battery_power_history.len(),
                     graphs::table().braille,
                 );
-                graphs::paint_history_graph(
-                    &self.0.telemetry_battery_history,
-                    RampId::Power,
-                    charge,
-                    surface,
-                );
-                graphs::paint_history_graph(
-                    &self.0.telemetry_battery_power_history,
-                    RampId::Power,
-                    power,
-                    surface,
-                );
+                paint_history_runs(&self.0.telemetry_battery_history, charge, surface);
+                paint_history_runs(&self.0.telemetry_battery_power_history, power, surface);
                 let row_height = (graph_rows * 2) / self.0.batteries.len();
                 for (index, battery) in self.0.batteries.iter().enumerate() {
                     if row_height < 2 {
