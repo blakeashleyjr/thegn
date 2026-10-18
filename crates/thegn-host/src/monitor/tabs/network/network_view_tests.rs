@@ -1,4 +1,4 @@
-use super::view::{HEALTH, IFACE_CAP, INTERFACES, NetworkModel, NetworkView, THROUGHPUT};
+use super::view::{HEALTH, IFACE_CAP, INTERFACES, NetworkModel, NetworkView, THROUGHPUT, WIFI};
 use crate::telemetry::{ScaleMode, TelemetryHistory, Window};
 use crate::{
     caps,
@@ -12,6 +12,7 @@ use thegn_metrics::collect::{
     frame::MonitorFrame,
     health::Health,
     instances::InstanceId,
+    model::net_wifi::{InlineBytes, WifiRow},
     model::netdev::{IfaceSample, ScopeTotal},
     policy::net_scope::{IfaceKind, Scope},
 };
@@ -41,6 +42,27 @@ fn iface(id: u16, name: &[u8], scope: Scope, rx: f64, tx: f64) -> IfaceSample {
 fn frame(tick: u16, order: &[u16]) -> MonitorFrame {
     let mut frame = MonitorFrame::default();
     frame.health[CollectorId::Netdev.index()] = Health::Ok;
+    frame.health[CollectorId::NetWifi.index()] = Health::Ok;
+    let mut ssid = InlineBytes::default();
+    ssid.set(format!("test-net-{tick}").as_bytes());
+    frame.parts.net_wifi.ifaces.push(WifiRow {
+        ifindex: 7,
+        name: {
+            let mut name = InlineBytes::default();
+            name.set(b"wlan0");
+            name
+        },
+        ssid: Some(ssid),
+        bssid_masked: Some("aa:bb:xx:ee:ff"),
+        freq_mhz: Some(5180 + u32::from(tick % 3) * 20),
+        width_mhz: Some(80),
+        signal_dbm: Some(-54 + i8::try_from(tick % 4).expect("small signal delta")),
+        signal_avg_dbm: Some(-55),
+        tx_retries: Some(u32::from(tick)),
+        tx_failed: Some(u32::from(tick / 2)),
+        connected_secs: Some(u32::from(tick) * 60),
+        ..WifiRow::default()
+    });
     frame.parts.netdev.ifaces = order
         .iter()
         .map(|id| {
@@ -230,6 +252,119 @@ fn interface_slots_are_capped_and_absorb_capacity_stays_warm() {
             .collect::<Vec<_>>(),
         capacities.3
     );
+}
+
+#[test]
+fn wifi_panel_shows_ssid_masked_bssid_and_signal_without_raw_mac() {
+    let mut model = NetworkModel::default();
+    model.absorb_frame(&frame(1, &[1]));
+    let view = NetworkView(&model);
+    let placed = Board::default()
+        .placed(&view, Rect::full(240, 60))
+        .into_iter()
+        .find(|panel| panel.id == WIFI)
+        .expect("NetWifi health is available, so Wi-Fi panel is placed")
+        .rect;
+    let mut surface = Surface::new(240, 60);
+    caps::test_override::with_unicode(UnicodeLevel::Full, || {
+        caps::test_override::with_color(ColorDepth::Truecolor, || {
+            Board::default().paint(&view, &mut surface, Rect::full(240, 60), 0, &[]);
+        })
+    });
+    let rendered = lines(&surface).join("\n");
+    assert!(rendered.contains("test-net-1"), "SSID missing: {rendered}");
+    assert!(
+        rendered.contains("aa:bb:xx:ee:ff"),
+        "masked BSSID missing: {rendered}"
+    );
+    assert!(rendered.contains("-53 dBm"), "signal missing: {rendered}");
+    assert!(
+        rendered.contains("avg -55"),
+        "average signal missing: {rendered}"
+    );
+    assert!(rendered.contains("5 GHz (5200 MHz)"));
+    assert!(rendered.contains("80 MHz"));
+    assert!(
+        rendered.contains("1 / 0"),
+        "retry/failure counts missing: {rendered}"
+    );
+    assert!(
+        rendered.contains("1m"),
+        "connected time missing: {rendered}"
+    );
+    assert!(!rendered.contains("aa:bb:cc:dd:ee:ff"));
+    assert!(placed.rows > 0);
+    let newest = surface.screen_lines()[placed.y + 2]
+        .visible_cells()
+        .find(|cell| cell.cell_index() == placed.x + placed.cols - 2)
+        .expect("Wi-Fi sparkline reaches its last inner column");
+    assert_ne!(
+        newest.str(),
+        " ",
+        "newest signal sample is not right-aligned"
+    );
+    assert_ne!(newest.str(), "\u{2800}", "newest signal sample is blank");
+    assert!(view.demand(WIFI).contains(CollectorId::NetWifi));
+
+    let mut no_wifi = frame(2, &[1]);
+    no_wifi.health[CollectorId::NetWifi.index()] =
+        Health::Absent(thegn_metrics::collect::health::Absent::NotImplemented);
+    model.absorb_frame(&no_wifi);
+    let absent_view = NetworkView(&model);
+    assert!(
+        !Board::default()
+            .placed(&absent_view, Rect::full(240, 60))
+            .iter()
+            .any(|panel| panel.id == WIFI)
+    );
+    assert!(absent_view.demand(WIFI).is_empty());
+
+    let mut missing_signal = frame(3, &[1]);
+    missing_signal.parts.net_wifi.ifaces[0].signal_dbm = None;
+    let mut missing_model = NetworkModel::default();
+    missing_model.absorb_frame(&missing_signal);
+    let mut missing_surface = Surface::new(240, 60);
+    let missing_view = NetworkView(&missing_model);
+    Board::default().paint(
+        &missing_view,
+        &mut missing_surface,
+        Rect::full(240, 60),
+        0,
+        &[],
+    );
+    let missing_rendered = lines(&missing_surface).join("\n");
+    assert!(missing_rendered.contains(&format!("{} avg -55", caps::active_glyphs().emdash)));
+    assert!(!missing_rendered.contains("0 dBm"));
+    assert!(missing_model.wifi[0].signal.values[0].is_nan());
+}
+
+#[test]
+fn wifi_signal_ring_stays_warm_after_one_thousand_absorbs() {
+    let mut model = NetworkModel::default();
+    model.absorb_frame(&frame(1, &[1]));
+    let ring_capacity = model.wifi[0].signal.values.capacity();
+    for tick in 2..1002_u16 {
+        model.absorb_frame(&frame(tick, &[1]));
+    }
+    assert_eq!(model.wifi[0].signal.values.capacity(), ring_capacity);
+    assert_eq!(model.wifi[0].signal.len, 120);
+    let view = NetworkView(&model);
+    let wifi = Board::default()
+        .placed(&view, Rect::full(240, 60))
+        .into_iter()
+        .find(|panel| panel.id == WIFI)
+        .expect("Wi-Fi panel is placed")
+        .rect;
+    let mut surface = Surface::new(240, 60);
+    caps::test_override::with_unicode(UnicodeLevel::Full, || {
+        Board::default().paint(&view, &mut surface, Rect::full(240, 60), 0, &[]);
+    });
+    let newest = surface.screen_lines()[wifi.y + 2]
+        .visible_cells()
+        .find(|cell| cell.cell_index() == wifi.x + wifi.cols - 2)
+        .expect("newest Wi-Fi sample occupies the last inner column");
+    assert_ne!(newest.str(), " ");
+    assert_ne!(newest.str(), "\u{2800}");
 }
 
 #[test]
@@ -438,6 +573,9 @@ fn snapshots_cover_view_sizes_capabilities_and_static_demand() {
             assert!(rendered.contains("Network throughput"));
             assert!(rendered.contains("Interfaces"));
             assert!(rendered.contains("eth"));
+            if placed_contains_wifi(&view, Rect::full(cols, rows)) {
+                assert!(rendered.contains("Wi-Fi interfaces"));
+            }
             let placed = Board::default().placed(&view, Rect::full(cols, rows));
             let expected = placed.iter().fold(CollectorSet::empty(), |mut set, panel| {
                 for collector in view.demand(panel.id).iter() {
@@ -456,7 +594,7 @@ fn snapshots_cover_view_sizes_capabilities_and_static_demand() {
             }
             if cols == 240 {
                 let fill = fill_ratio(&surface, Rect::full(cols, rows));
-                // density follow-up (batch 50): estimated, primary sets from the printed value
+                // density follow-up (batch 51): estimated, primary sets from the printed value
                 assert!(
                     fill >= 0.30,
                     "fill ratio {fill:.3} at {cols}x{rows} {unicode:?}/{depth:?}"
@@ -464,4 +602,11 @@ fn snapshots_cover_view_sizes_capabilities_and_static_demand() {
             }
         }
     }
+}
+
+fn placed_contains_wifi(view: &NetworkView<'_>, area: Rect) -> bool {
+    Board::default()
+        .placed(view, area)
+        .iter()
+        .any(|panel| panel.id == WIFI)
 }

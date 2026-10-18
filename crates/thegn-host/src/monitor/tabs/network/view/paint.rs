@@ -1,5 +1,6 @@
 use super::{
-    HEALTH, HISTORY, IFACE_HISTORY, INTERFACES, NetworkModel, TELEMETRY_HISTORY, THROUGHPUT,
+    HEALTH, HISTORY, IFACE_HISTORY, INTERFACES, NetworkModel, TELEMETRY_HISTORY, THROUGHPUT, WIFI,
+    WIFI_HISTORY,
 };
 use crate::{
     caps,
@@ -8,6 +9,7 @@ use crate::{
         kit::{
             emit::Emitter,
             grid::{CellGrid, CellStyle},
+            history_rect::graph_rect,
             panel,
         },
         layout::PanelId,
@@ -50,6 +52,7 @@ pub(super) fn paint(model: &NetworkModel, surface: &mut Surface, id: PanelId, re
             }
         ),
         HEALTH => "Network health".to_owned(),
+        WIFI => "Wi-Fi interfaces (signal -90..-30 dBm)".to_owned(),
         _ => return,
     };
     let body = panel::panel(&mut grid, Rect::full(rect.cols, rect.rows), &title, None).rect();
@@ -57,6 +60,7 @@ pub(super) fn paint(model: &NetworkModel, surface: &mut Surface, id: PanelId, re
         THROUGHPUT => paint_throughput(&mut grid, body, model),
         INTERFACES => paint_interfaces(&mut grid, body, model),
         HEALTH => paint_health(&mut grid, body, model),
+        WIFI => paint_wifi(&mut grid, body, model),
         _ => return,
     }
     Emitter::default().emit(
@@ -70,6 +74,8 @@ pub(super) fn paint(model: &NetworkModel, surface: &mut Surface, id: PanelId, re
         paint_interface_sparks(model, surface, body, rect);
     } else if id == HEALTH {
         paint_health_history(model, surface, body, rect);
+    } else if id == WIFI {
+        paint_wifi_histories(model, surface, body, rect);
     }
 }
 
@@ -118,42 +124,235 @@ fn paint_throughput(grid: &mut CellGrid, body: Rect, model: &NetworkModel) {
     let rx_len = model.history_rx.copy_ordered(&mut rx);
     let tx_len = model.history_tx.copy_ordered(&mut tx);
     for value in rx.iter_mut().take(rx_len).chain(tx.iter_mut().take(tx_len)) {
-        *value = if value.is_finite() {
-            value.clamp(0.0, 1.0)
-        } else {
-            0.0
-        };
+        if value.is_finite() {
+            *value = value.clamp(0.0, 1.0);
+        }
     }
     let braille = crate::monitor::graphs::table().braille;
-    let used = if braille {
-        rx_len.max(tx_len).div_ceil(2)
-    } else {
-        rx_len.max(tx_len)
+    let plot = Rect {
+        y: body.y + 1,
+        rows: graph_rows,
+        ..body
     };
-    let graph_cols = body.cols.min(used);
-    let graph_x = body.cols.saturating_sub(graph_cols);
-    let mut raster = thegn_core::viz_raster::CellBuf::new();
-    raster.reset(graph_cols, graph_rows);
-    thegn_core::viz_raster::mirrored(
-        &rx[..rx_len],
-        &tx[..tx_len],
-        crate::monitor::graphs::table(),
-        &mut raster,
-    );
+    let aligned = graph_rect(plot, rx_len.max(tx_len), braille);
     let mut canvas = grid.view(body);
-    for y in 0..graph_rows {
-        for x in 0..graph_cols {
-            if let Some(cell) = raster.get(x, y) {
-                canvas.put(
-                    graph_x + x,
-                    y + 1,
-                    CellStyle {
-                        ch: cell.ch,
-                        ..CellStyle::default()
-                    },
-                );
+    let mut raster = thegn_core::viz_raster::CellBuf::new();
+    let len = rx_len.min(tx_len);
+    let mut start = 0;
+    while start < len {
+        while start < len && (!rx[start].is_finite() || !tx[start].is_finite()) {
+            start += 1;
+        }
+        let mut end = start;
+        while end < len && rx[end].is_finite() && tx[end].is_finite() {
+            end += 1;
+        }
+        if end > start {
+            let x = aligned.x.saturating_sub(body.x) + if braille { start / 2 } else { start };
+            let width = (if braille {
+                (end - start).div_ceil(2)
+            } else {
+                end - start
+            })
+            .min(body.cols.saturating_sub(x));
+            raster.reset(width, graph_rows);
+            thegn_core::viz_raster::mirrored(
+                &rx[start..end],
+                &tx[start..end],
+                crate::monitor::graphs::table(),
+                &mut raster,
+            );
+            for y in 0..graph_rows {
+                for x in 0..width {
+                    if let Some(cell) = raster.get(x, y) {
+                        canvas.put(
+                            aligned.x.saturating_sub(body.x)
+                                + if braille { start / 2 } else { start }
+                                + x,
+                            y + 1,
+                            CellStyle {
+                                ch: cell.ch,
+                                ..CellStyle::default()
+                            },
+                        );
+                    }
+                }
             }
         }
+        start = end.max(start + 1);
+    }
+}
+
+fn paint_wifi(grid: &mut CellGrid, body: Rect, model: &NetworkModel) {
+    let mut view = grid.view(body);
+    view.put_str(
+        0,
+        0,
+        "interface  SSID  BSSID  band / width  signal (dBm)  retries / failed  connected",
+        CellStyle::default(),
+    );
+    if !model.wifi.iter().any(|entry| entry.live) && body.rows > 1 {
+        view.put_str(0, 1, health_mark(model.wifi_health), CellStyle::default());
+    }
+    for (row, entry) in model
+        .wifi
+        .iter()
+        .filter(|entry| entry.live)
+        .take(body.rows.saturating_sub(1))
+        .enumerate()
+    {
+        let sample = &entry.sample;
+        let ssid = sample
+            .ssid
+            .as_ref()
+            .map(|ssid| String::from_utf8_lossy(ssid.as_bytes()).into_owned())
+            .unwrap_or_else(|| caps::active_glyphs().emdash.to_owned());
+        let bssid = sample.bssid_masked.unwrap_or(caps::active_glyphs().emdash);
+        let band = sample.freq_mhz.map_or_else(
+            || caps::active_glyphs().emdash.to_owned(),
+            |mhz| {
+                format!(
+                    "{} GHz ({mhz} MHz)",
+                    if mhz < 3_000 {
+                        "2.4"
+                    } else if mhz < 6_000 {
+                        "5"
+                    } else {
+                        "6"
+                    }
+                )
+            },
+        );
+        let width = sample.width_mhz.map_or_else(
+            || caps::active_glyphs().emdash.to_owned(),
+            |mhz| format!("{mhz} MHz"),
+        );
+        let signal = sample
+            .signal_dbm
+            .filter(|dbm| (-120..=0).contains(dbm))
+            .map_or_else(
+                || caps::active_glyphs().emdash.to_owned(),
+                |dbm| format!("{dbm} dBm"),
+            );
+        let average = sample
+            .signal_avg_dbm
+            .filter(|dbm| (-120..=0).contains(dbm))
+            .map_or_else(
+                || caps::active_glyphs().emdash.to_owned(),
+                |dbm| format!("avg {dbm}"),
+            );
+        let retries = sample.tx_retries.map_or_else(
+            || caps::active_glyphs().emdash.to_owned(),
+            |count| count.to_string(),
+        );
+        let failed = sample.tx_failed.map_or_else(
+            || caps::active_glyphs().emdash.to_owned(),
+            |count| count.to_string(),
+        );
+        let connected = sample
+            .connected_secs
+            .map_or_else(|| caps::active_glyphs().emdash.to_owned(), format_duration);
+        view.put_str(
+            0,
+            row + 1,
+            &format!(
+                "{}  \"{}\"  {}  {} / {}  {} {}  {} / {}  {}",
+                sample.name.as_str(),
+                ssid,
+                bssid,
+                band,
+                width,
+                signal,
+                average,
+                retries,
+                failed,
+                connected
+            ),
+            CellStyle::default(),
+        );
+    }
+}
+
+fn paint_wifi_histories(model: &NetworkModel, surface: &mut Surface, body: Rect, panel: Rect) {
+    if body.cols == 0 {
+        return;
+    }
+    let x = panel.x + body.x + body.cols.saturating_sub(24);
+    for (row, entry) in model
+        .wifi
+        .iter()
+        .filter(|entry| entry.live)
+        .take(body.rows.saturating_sub(1))
+        .enumerate()
+    {
+        paint_wifi_signal(
+            &entry.signal,
+            x,
+            panel.y + body.y + row + 1,
+            body.cols.min(24),
+            surface,
+        );
+    }
+}
+
+fn paint_wifi_signal(ring: &super::Ring, x: usize, y: usize, width: usize, surface: &mut Surface) {
+    if ring.len == 0 || width == 0 {
+        return;
+    }
+    let mut raw = [f32::NAN; WIFI_HISTORY];
+    let len = ring.copy_ordered(&mut raw);
+    let braille = crate::monitor::graphs::table().braille;
+    let area = Rect {
+        x,
+        y,
+        cols: width,
+        rows: 1,
+    };
+    let aligned = graph_rect(area, len, braille);
+    let window_start = len.saturating_sub(aligned.cols);
+    let mut start = window_start;
+    while start < len {
+        while start < len && !raw[start].is_finite() {
+            start += 1;
+        }
+        let mut end = start;
+        while end < len && raw[end].is_finite() {
+            end += 1;
+        }
+        if end > start {
+            let mut values = [0.0; WIFI_HISTORY];
+            for (slot, dbm) in values.iter_mut().zip(raw[start..end].iter()) {
+                *slot = ((*dbm + 90.0) / 60.0).clamp(0.0, 1.0);
+            }
+            let run_len = end - start;
+            let offset = start - window_start;
+            let cols = end - start;
+            crate::monitor::graphs::paint_sparkline(
+                &values[..run_len],
+                cols,
+                RampId::Rx,
+                Rect {
+                    x: aligned.x + offset,
+                    cols,
+                    ..area
+                },
+                surface,
+            );
+        }
+        start = end.max(start + 1);
+    }
+}
+
+fn format_duration(seconds: u32) -> String {
+    let days = seconds / 86_400;
+    let hours = seconds % 86_400 / 3_600;
+    let minutes = seconds % 3_600 / 60;
+    if days > 0 {
+        format!("{days}d {hours}h")
+    } else if hours > 0 {
+        format!("{hours}h {minutes}m")
+    } else {
+        format!("{minutes}m")
     }
 }
 
