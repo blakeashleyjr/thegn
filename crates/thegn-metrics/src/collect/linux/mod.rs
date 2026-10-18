@@ -4,6 +4,7 @@ pub mod cgroup;
 pub mod cgroup_slice;
 pub mod cpu_stat;
 pub mod cpufreq;
+pub mod disk_topology;
 pub mod diskstats;
 pub mod hwmon;
 pub mod loadavg;

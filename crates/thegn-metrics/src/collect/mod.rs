@@ -167,6 +167,9 @@ pub fn default_collectors() -> Vec<Box<dyn Collector>> {
         "/proc/net/dev",
         "/sys/class/net",
     ));
+    collectors[CollectorId::Diskstats.index()] = Box::new(
+        linux::diskstats::DiskstatsCollector::at("/proc/diskstats", "/sys/block"),
+    );
     collectors
 }
 
