@@ -166,8 +166,10 @@ pub enum ProcSignal {
 
 mod signal_identity;
 pub use signal_identity::{ProcStart, SignalError, signal_identity};
-#[allow(dead_code)] // V-PRC-4 wires the renice/ionice prompts.
 mod priority;
+pub(crate) use priority::{
+    IONICE_SUPPORTED, IoClass, PriorityError, get_ioprio, get_nice, set_ioprio, set_nice,
+};
 
 #[cfg(target_os = "linux")]
 mod udisks_smart_linux;

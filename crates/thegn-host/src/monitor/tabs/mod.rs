@@ -79,6 +79,12 @@ impl MonitorOverlay {
             // worktree. Both open a confirmation rather than firing immediately.
             KeyCode::Char('x') if self.tab == MonitorTab::Procs => self.begin_signal(),
             KeyCode::Char('x') if self.tab == MonitorTab::Disk => self.begin_clean(),
+            KeyCode::Char('=') if self.tab == MonitorTab::Procs => self.begin_renice(),
+            KeyCode::Char('I')
+                if self.tab == MonitorTab::Procs && crate::platform::IONICE_SUPPORTED =>
+            {
+                self.begin_ionice()
+            }
             // --- Per-tab (last, so it can never shadow the above) ---
             KeyCode::Char(c) if self.tab == MonitorTab::Procs => self.proc_key(*c),
             KeyCode::Enter if self.tab == MonitorTab::Containers => self.container_key('\r'),
