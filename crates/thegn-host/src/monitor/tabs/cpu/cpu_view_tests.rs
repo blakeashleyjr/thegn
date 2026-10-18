@@ -15,6 +15,7 @@ use thegn_metrics::collect::{
         loadavg::LoadavgPart,
         psi::PsiPart,
     },
+    parse::interrupts::name_hash,
     parse::loadavg::Loadavg,
 };
 
@@ -77,7 +78,7 @@ fn fixture_frame() -> MonitorFrame {
         platform_profile: SysToken::new(b"balanced"),
         ..PowerPolicy::default()
     };
-    frame.parts.cpu_irq.softirq_top[0].name_hash = 0x1234;
+    frame.parts.cpu_irq.softirq_top[0].name_hash = name_hash(b"TIMER");
     frame.parts.cpu_irq.softirq_top[0].total_per_s = Some(42.0);
     frame
         .parts
@@ -129,7 +130,7 @@ fn lines(surface: &Surface) -> Vec<String> {
         .iter()
         .map(|line| {
             line.visible_cells()
-                .map(|cell| cell.str())
+                .map(|cell| cell.str().to_owned())
                 .collect::<String>()
         })
         .collect()
@@ -172,7 +173,22 @@ fn fill_ratio(surface: &Surface, area: Rect) -> f32 {
 fn absorb_frame_reuses_parts_and_keeps_all_carried_cpu_values() {
     let frame = fixture_frame();
     let mut model = CpuModel::default();
+    model.cpu_stat.cores.reserve(24);
+    model.cpu_freq.policies.reserve(2);
+    model.cpu_irq.cores.reserve(1);
+    model.cpu_irq.numeric_top.reserve(5);
+    model.cpu_sched.cores.reserve(24);
+    let stat_cores = model.cpu_stat.cores.as_ptr();
+    let policies = model.cpu_freq.policies.as_ptr();
+    let irq_cores = model.cpu_irq.cores.as_ptr();
+    let numeric_top = model.cpu_irq.numeric_top.as_ptr();
+    let sched_cores = model.cpu_sched.cores.as_ptr();
     model.absorb_frame(&frame);
+    assert_eq!(model.cpu_stat.cores.as_ptr(), stat_cores);
+    assert_eq!(model.cpu_freq.policies.as_ptr(), policies);
+    assert_eq!(model.cpu_irq.cores.as_ptr(), irq_cores);
+    assert_eq!(model.cpu_irq.numeric_top.as_ptr(), numeric_top);
+    assert_eq!(model.cpu_sched.cores.as_ptr(), sched_cores);
     assert_eq!(model.cpu_stat.cores.len(), 24);
     assert_eq!(
         model.cpu_stat.cores[23].share.map(|share| share.busy),
@@ -181,7 +197,12 @@ fn absorb_frame_reuses_parts_and_keeps_all_carried_cpu_values() {
     assert_eq!(model.cpu_freq.policies.len(), 2);
     assert_eq!(model.cpu_freq.policies[1].cur_khz, Some(1_800_000));
     assert_eq!(
-        model.cpu_freq.power.platform_profile.map(|v| v.as_str()),
+        model
+            .cpu_freq
+            .power
+            .platform_profile
+            .as_ref()
+            .map(|v| v.as_str()),
         Some("balanced")
     );
     assert_eq!(
@@ -193,6 +214,12 @@ fn absorb_frame_reuses_parts_and_keeps_all_carried_cpu_values() {
     );
     assert_eq!(model.cpu_irq.softirq_top[0].total_per_s, Some(42.0));
     assert_eq!(model.cpu_sched.cores.len(), 24);
+
+    let default_model = CpuModel::default();
+    let default_view = CpuView(&default_model);
+    assert!(default_view.demand(SCHED).contains(CollectorId::CpuSched));
+    let default_placed = Board::default().placed(&default_view, Rect::full(160, 45));
+    assert!(default_placed.iter().any(|panel| panel.id == SCHED));
 
     let mut absent = frame;
     absent.health[CollectorId::CpuSched.index()] = Health::Absent(Absent::NotImplemented);
@@ -268,6 +295,33 @@ fn snapshots_cover_sizes_capabilities_demand_absence_and_fill() {
     let mut surface = Surface::new(160, 45);
     Board::default().paint(&absent_view, &mut surface, Rect::full(160, 45), 0, &[]);
     let rendered = lines(&surface).join("\n");
-    assert!(rendered.contains(caps::glyph(Glyph::Lock)));
+    assert!(rendered.contains("TIMER"));
+    assert!(rendered.contains(caps::active_glyphs().emdash));
+    assert!(!rendered.contains(caps::glyph(Glyph::Lock)));
     assert!(!rendered.contains("0MHz"));
+
+    absent_frame.health[CollectorId::CpuFreq.index()] = Health::Absent(Absent::NoPermission);
+    absent_model.absorb_frame(&absent_frame);
+    Board::default().paint(
+        &CpuView(&absent_model),
+        &mut surface,
+        Rect::full(160, 45),
+        0,
+        &[],
+    );
+    let rendered = lines(&surface).join("\n");
+    assert!(rendered.contains(caps::glyph(Glyph::Lock)));
+}
+
+#[test]
+fn unknown_softirq_hash_uses_the_absent_mark() {
+    let mut frame = fixture_frame();
+    frame.parts.cpu_irq.softirq_top[0].name_hash = 0;
+    let mut model = CpuModel::default();
+    model.absorb_frame(&frame);
+    let mut surface = Surface::new(160, 45);
+    Board::default().paint(&CpuView(&model), &mut surface, Rect::full(160, 45), 0, &[]);
+    let rendered = lines(&surface).join("\n");
+    assert!(!rendered.contains("softirq #"));
+    assert!(rendered.contains(caps::active_glyphs().emdash));
 }

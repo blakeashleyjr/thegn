@@ -106,10 +106,34 @@ pub(in crate::monitor) struct CpuModel {
 
 impl CpuModel {
     pub(in crate::monitor) fn absorb_frame(&mut self, frame: &MonitorFrame) {
-        self.cpu_stat.clone_from(&frame.parts.cpu_stat);
-        self.cpu_freq.clone_from(&frame.parts.cpu_freq);
-        self.cpu_irq.clone_from(&frame.parts.cpu_irq);
-        self.cpu_sched.clone_from(&frame.parts.cpu_sched);
+        let source = &frame.parts.cpu_stat;
+        self.cpu_stat.total = source.total;
+        self.cpu_stat.cores.clone_from(&source.cores);
+        self.cpu_stat.ctxt_per_s = source.ctxt_per_s;
+        self.cpu_stat.intr_per_s = source.intr_per_s;
+        self.cpu_stat.softirq_per_s = source.softirq_per_s;
+        self.cpu_stat.forks_per_s = source.forks_per_s;
+        self.cpu_stat.procs_running = source.procs_running;
+        self.cpu_stat.procs_blocked = source.procs_blocked;
+        self.cpu_stat.btime = source.btime;
+        self.cpu_stat.steal_seen = source.steal_seen;
+        self.cpu_stat.truncated = source.truncated;
+
+        let source = &frame.parts.cpu_freq;
+        self.cpu_freq.policies.clone_from(&source.policies);
+        self.cpu_freq.power = source.power;
+
+        let source = &frame.parts.cpu_irq;
+        self.cpu_irq.cores.clone_from(&source.cores);
+        self.cpu_irq.softirq_top = source.softirq_top;
+        self.cpu_irq.thr_per_s = source.thr_per_s;
+        self.cpu_irq.mce_per_s = source.mce_per_s;
+        self.cpu_irq.dfr_per_s = source.dfr_per_s;
+        self.cpu_irq.numeric_top.clone_from(&source.numeric_top);
+
+        let source = &frame.parts.cpu_sched;
+        self.cpu_sched.cores.clone_from(&source.cores);
+        self.cpu_sched.version = source.version;
         self.loadavg.clone_from(&frame.parts.loadavg);
         self.psi.clone_from(&frame.parts.psi);
         self.cpu_stat_health = frame.health[CollectorId::CpuStat.index()];
@@ -122,8 +146,6 @@ impl CpuModel {
 
     fn sched_supported(&self) -> bool {
         !matches!(self.sched_health, Health::Absent(_))
-            && self.cpu_sched.version.is_some()
-            && !self.cpu_sched.cores.is_empty()
     }
 }
 
@@ -158,7 +180,7 @@ impl TabView for CpuView<'_> {
                 ]),
             ),
         ];
-        if !self.0.sched_supported() {
+        if matches!(self.0.sched_health, Health::Absent(_)) {
             rows[2].1 = Node::Panel(IRQ);
         }
         Node::Col(rows)
