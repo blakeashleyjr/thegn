@@ -61,6 +61,14 @@ impl Counter32 {
     }
 }
 
+pub fn rate(current: u64, previous: u64, previous_ms: Option<u64>, now_ms: u64) -> Option<f64> {
+    let dt = now_ms.checked_sub(previous_ms?)?;
+    if current < previous || dt < 100 {
+        return None;
+    }
+    Some((current - previous) as f64 * 1000.0 / dt as f64)
+}
+
 pub fn jiffies_pct(delta: u64, dt_ms: u64, clk_tck: u64) -> Option<f64> {
     if dt_ms == 0 || clk_tck == 0 {
         None
@@ -96,5 +104,13 @@ mod tests {
         assert_eq!(jiffies_pct(100, 1000, 100), Some(100.0));
         assert_eq!(jiffies_pct(1, 0, 100), None);
         assert_eq!(jiffies_pct(1, 1, 0), None);
+    }
+
+    #[test]
+    fn direct_rate_rejects_resets_backwards_time_and_short_intervals() {
+        assert_eq!(super::rate(20, 10, Some(1000), 2000), Some(10.0));
+        assert_eq!(super::rate(9, 10, Some(1000), 2000), None);
+        assert_eq!(super::rate(20, 10, Some(2000), 1000), None);
+        assert_eq!(super::rate(20, 10, Some(1000), 1099), None);
     }
 }
