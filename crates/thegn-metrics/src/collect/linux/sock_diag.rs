@@ -8,6 +8,10 @@ use super::netlink::{AttributeIter, MessageIter, NetlinkMessage, NetlinkSocket};
 // SOCK_DIAG_BY_FAMILY and INET_DIAG_INFO: include/uapi/linux/inet_diag.h.
 const SOCK_DIAG_BY_FAMILY: u16 = 20;
 const INET_DIAG_INFO: u16 = 2;
+// INET_DIAG_CGROUP_ID is a response attribute (21), emitted by kernels that
+// support CONFIG_SOCK_CGROUP_DATA. It is not requestable through idiag_ext:
+// that field only has eight bits. The kernel includes it in each diag row.
+const INET_DIAG_CGROUP_ID: u16 = 21;
 const NLMSG_DONE: u16 = libc::NLMSG_DONE as u16;
 const NLMSG_ERROR: u16 = libc::NLMSG_ERROR as u16;
 const NLM_F_DUMP_INTR: u16 = libc::NLM_F_DUMP_INTR as u16;
@@ -56,6 +60,8 @@ pub struct TcpSock {
     pub source_port: u16,
     pub destination_port: u16,
     pub inode: u32,
+    pub cookie: Option<u64>,
+    pub cgroup_id: Option<u64>,
     pub uid: u32,
     pub rqueue: u32,
     pub wqueue: u32,
@@ -133,15 +139,27 @@ pub fn decode_message(message: &NetlinkMessage<'_>) -> io::Result<TcpSock> {
         ),
     };
     let mut info = None;
+    let mut cgroup_id = None;
     for attribute in AttributeIter::new(&payload[INET_DIAG_MSG_LEN..]) {
         let Ok(attribute) = attribute else {
-            info = None;
             break;
         };
         if attribute.kind == TCP_INFO_KIND {
             info = Some(decode_tcp_info(attribute.payload));
+        } else if attribute.kind == INET_DIAG_CGROUP_ID {
+            cgroup_id = get_u64(attribute.payload, 0);
         }
     }
+    let cookie = Some(u64::from_ne_bytes([
+        payload[44],
+        payload[45],
+        payload[46],
+        payload[47],
+        payload[48],
+        payload[49],
+        payload[50],
+        payload[51],
+    ]));
     Ok(TcpSock {
         family,
         state: payload[1],
@@ -153,6 +171,8 @@ pub fn decode_message(message: &NetlinkMessage<'_>) -> io::Result<TcpSock> {
         wqueue: get_u32(payload, 60).ok_or_else(|| invalid("missing write queue"))?,
         uid: get_u32(payload, 64).ok_or_else(|| invalid("missing uid"))?,
         inode: get_u32(payload, 68).ok_or_else(|| invalid("missing inode"))?,
+        cookie,
+        cgroup_id,
         info,
     })
 }
