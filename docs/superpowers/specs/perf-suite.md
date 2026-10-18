@@ -73,10 +73,14 @@ Recipes:
 - The shell perf harness writes `[media] enabled = false` so the media fallback cannot
   spawn `playerctl` when the isolated session has no MPRIS bus. The harness
   disables sandboxing by default; set `TG_PERF_SANDBOX=1` to
-  measure with sandboxed panes enabled. In that mode it exposes the user
-  manager's private socket when available; if only the session bus is available,
-  it exposes that and reports the fallback, and fails if neither exists. The
-  fixture writes
+  measure with sandboxed panes enabled. Sandbox-on mode never exposes the host
+  user manager or session bus. It writes a fixture Podman config with
+  `cgroup_manager = "cgroupfs"` and `events_logger = "file"`, and places
+  `[containers] cgroups = "disabled"` in the same config so rootless Podman
+  does not need a systemd cgroup scope. It also places
+  fail-closed `systemd-run` and `systemctl` shims first on `PATH`. The shims
+  record argv in `$PERF_TMP/systemd-calls.log`; the harness fails if the log is
+  nonempty. The fixture writes
   `cpu_total = "off"` and `memory_total = "off"` to its sandbox limits in
   either mode. A separate verify launch checks that the seeded worktree count
   was collected before the measured launch. The `soak` and `soak-daemon`
@@ -92,6 +96,12 @@ Recipes:
   is only `podman`) and removes matching processes whose environment names the
   fixture path. Procfs read races are ignored. Registry-seeding status goes to
   stderr so `--json` stdout remains a single JSON object.
+  Verify JSON stdout with:
+
+  ```sh
+  bash test/perf/cpu-sample.sh --scenario soak --worktrees 3 --json 2>/dev/null |
+    python3 -c 'import json,sys; json.load(sys.stdin)'
+  ```
 
 The fixture (`lib/fixture.sh`) and the Rust bench fixture
 (`crates/thegn-svc/benches/support/fixture.rs`) build the same layout — keep

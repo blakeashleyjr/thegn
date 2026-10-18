@@ -14,8 +14,7 @@ set -euo pipefail
 # Create the throwaway root and export the isolated environment. Caller is
 # responsible for cleanup (or use perf_trap_cleanup).
 perf_make_tmp() {
-  local entry v real_runtime
-  real_runtime="${XDG_RUNTIME_DIR:-}"
+  local entry v command_name
   # A perf run must not inherit the developer's session controls, log routing,
   # or credentials. Keep TG_PERF_* so the harness's own knobs remain available.
   while IFS= read -r -d '' entry; do
@@ -30,14 +29,15 @@ perf_make_tmp() {
     esac
   done < <(env -0)
 
-  # Only sandbox-on measurements need the host user manager. Expose its private
-  # socket in the isolated runtime dir, keeping the session bus private.
+  # Never expose the host user manager to a perf run. Sandbox-on Podman uses
+  # cgroupfs, while systemd entry points fail closed and leave an audit log.
   unset DBUS_SESSION_BUS_ADDRESS
 
   PERF_TMP="$(mktemp -d "${TMPDIR:-/tmp}/tg-perf.XXXXXX")"
   export PERF_TMP
   export HOME="$PERF_TMP/home"
   export XDG_CONFIG_HOME="$PERF_TMP/config"
+  export XDG_DATA_HOME="$PERF_TMP/data"
   export XDG_STATE_HOME="$PERF_TMP/state"
   export XDG_CACHE_HOME="$PERF_TMP/cache"
   # ALSO the runtime dir, and this one is not cosmetic. The pane daemon's
@@ -60,21 +60,25 @@ perf_make_tmp() {
   ln -s "$(command -v bash)" "$PERF_PANE_SHELL"
   export PERF_PANE_SHELL
   export SHELL="$PERF_PANE_SHELL"
-  mkdir -p "$HOME" "$XDG_CONFIG_HOME" "$XDG_STATE_HOME" "$XDG_CACHE_HOME"
+  mkdir -p "$HOME" "$XDG_CONFIG_HOME" "$XDG_DATA_HOME" "$XDG_STATE_HOME" "$XDG_CACHE_HOME"
   # 0700 to match the real run dir: the daemon rejects a lax one.
   mkdir -p "$XDG_RUNTIME_DIR"
   chmod 700 "$XDG_RUNTIME_DIR"
   if [ "${TG_PERF_SANDBOX:-}" = 1 ]; then
-    if [ -n "$real_runtime" ] && [ -S "$real_runtime/systemd/private" ]; then
-      mkdir -p "$XDG_RUNTIME_DIR/systemd"
-      ln -s "$real_runtime/systemd/private" "$XDG_RUNTIME_DIR/systemd/private"
-    elif [ -n "$real_runtime" ] && [ -S "$real_runtime/bus" ]; then
-      export DBUS_SESSION_BUS_ADDRESS="unix:path=$real_runtime/bus"
-      echo 'perf: user manager private socket unavailable; exposing the session bus for TG_PERF_SANDBOX=1' >&2
-    else
-      echo 'perf: TG_PERF_SANDBOX=1 requires a user manager socket or session bus in the original XDG_RUNTIME_DIR' >&2
-      return 1
-    fi
+    mkdir -p "$XDG_CONFIG_HOME/containers"
+    printf '[engine]\ncgroup_manager = "cgroupfs"\nevents_logger = "file"\n\n[containers]\ncgroups = "disabled"\n' \
+      >"$XDG_CONFIG_HOME/containers/containers.conf"
+    export PATH="$PERF_TMP/bin:$PATH"
+    for command_name in systemd-run systemctl; do
+      cat >"$PERF_TMP/bin/$command_name" <<'SHIM'
+#!/usr/bin/env bash
+printf '%s' "${0##*/}" >>"$PERF_TMP/systemd-calls.log"
+printf ' <%q>' "$@" >>"$PERF_TMP/systemd-calls.log"
+printf '\n' >>"$PERF_TMP/systemd-calls.log"
+exit 1
+SHIM
+      chmod 700 "$PERF_TMP/bin/$command_name"
+    done
   fi
   # ~/.gitconfig is masked as a *directory* in some sandboxes; GIT_CONFIG_GLOBAL
   # points git at this file unconditionally.
@@ -101,6 +105,15 @@ perf_sandbox_off_default() {
   fi
   printf '\n[sandbox.limits]\ncpu_total = "off"\nmemory_total = "off"\n' \
     >>"$XDG_CONFIG_HOME/thegn/config.toml"
+}
+
+# Catch callers that ignored a fail-closed systemd shim's nonzero status.
+perf_check_systemd_calls() {
+  if [ -s "${PERF_TMP:-}/systemd-calls.log" ]; then
+    echo 'FAIL: sandbox-on perf run attempted to call the host systemd user manager:' >&2
+    cat "$PERF_TMP/systemd-calls.log" >&2
+    return 1
+  fi
 }
 
 perf_stop_process_group() {
@@ -234,7 +247,7 @@ perf_cleanup() {
   fi
   if [ -n "${PERF_TMP:-}" ] && [ -e "$PERF_TMP" ]; then
     # Podman-owned overlay files may be inaccessible outside its user namespace.
-    if [ -d "$PERF_TMP/home/.local/share/containers/storage" ] &&
+    if [ -d "${XDG_DATA_HOME:-$HOME/.local/share}/containers/storage" ] &&
       command -v podman >/dev/null 2>&1; then
       podman unshare rm -rf -- "$PERF_TMP" || true
     fi
@@ -249,7 +262,7 @@ perf_cleanup() {
     while IFS= read -r pid; do
       d="${PERF_PROC_ROOT:-/proc}/$pid"
       if tr '\0' '\n' 2>/dev/null <"$d/environ" | grep -F -- "$PERF_TMP/" >/dev/null; then
-        kill "$pid" 2>/dev/null || true
+        "${PERF_KILL:-kill}" "$pid" 2>/dev/null || true
       fi
     done < <(perf_pause_pids)
   fi
