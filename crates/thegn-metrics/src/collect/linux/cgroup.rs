@@ -88,10 +88,7 @@ impl HeldFiles {
                 self.open_attempts = self.open_attempts.saturating_add(1);
             }
             let present = path.exists();
-            let file = match File::open(&path) {
-                Ok(file) => Some(file),
-                Err(_) => None,
-            };
+            let file = File::open(&path).ok();
             self.files.push(file);
             self.present.push(present);
             self.reopen_needed.push(false);
@@ -125,7 +122,7 @@ impl HeldFiles {
     pub(super) fn take_reopen_needed(&mut self, index: usize) -> bool {
         self.reopen_needed
             .get_mut(index)
-            .is_some_and(|needed| std::mem::take(needed))
+            .is_some_and(std::mem::take)
     }
 
     pub(super) fn needs_reopen(&self) -> bool {
