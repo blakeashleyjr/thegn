@@ -4,7 +4,6 @@ use crate::{
     monitor::{
         board::TabView,
         layout::{PanelId, Placed, VariantKind},
-        tabs::cpu::view::CpuModel,
     },
     sections::Section,
     telemetry::{ScaleMode, TelemetryHistory, Window},
