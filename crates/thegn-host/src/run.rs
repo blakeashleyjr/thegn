@@ -15953,6 +15953,7 @@ async fn event_loop<T: Terminal>(
                 front.flush_changes_older_than(seq);
                 wire.push(clear);
                 wire_renderer.invalidate();
+                preview_gfx.invalidate();
                 full_repaint = false;
                 last_resync = std::time::Instant::now();
             } else if resync_now {
