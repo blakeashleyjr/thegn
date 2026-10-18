@@ -101,6 +101,9 @@ Test builds refuse to open state under `$HOME/.local/state` or the
 `IsolatedState::new()` puts XDG state at `<root>/state`;
 `with_real_home_layout()` is only for tests of that guard. Host tests use
 `crate::testenv::IsolatedState`.
+Host tests needing extra non-state variables use
+`IsolatedState::with_env(&[...])`; state keys are refused. `config_home()` gives
+the isolated config directory.
 `testenv::symlinked_tempdir` supplies a link spelling and its canonical path
 for tests where the OS resolves paths through a symlink. The per-crate
 `state-env-*-ratchet.txt` allowlists track existing tests that still set these
