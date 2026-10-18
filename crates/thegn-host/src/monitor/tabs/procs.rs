@@ -10,18 +10,24 @@ use super::super::{Confirm, MonitorOutcome, MonitorOverlay, ProcSort};
 use crate::chrome::S;
 use crate::sections::{Cell, Section, TableSection};
 use crate::seg::Tok;
+use thegn_core::numfmt::{NumFmt, Reading, Unit};
 use thegn_core::theme::Hue;
 
-#[allow(clippy::too_many_arguments)] // one call site; every argument is real view state
+pub(super) struct ProcDisplay<'a> {
+    pub(super) filter: &'a str,
+    pub(super) filtering: bool,
+    pub(super) tree: bool,
+    pub(super) sort: ProcSort,
+    pub(super) desc: bool,
+    pub(super) invalid_terms: &'a [procs_view::procs_query::InvalidTerm],
+    pub(super) primed: bool,
+}
+
 pub(in crate::monitor) fn procs(
     cx: &Ctx,
     rows: &[ProcRow],
     sel: usize,
-    filter: &str,
-    filtering: bool,
-    tree: bool,
-    sort: ProcSort,
-    desc: bool,
+    display: ProcDisplay<'_>,
 ) -> TabBuild {
     let snap = &cx.model.procs;
     // Only the CONFIG can say sampling is off. `ProcSnapshot::default()` is
@@ -48,7 +54,7 @@ pub(in crate::monitor) fn procs(
 
     // Header note: how many of the sampled set are shown, the sort, and the
     // active view toggles (filter/tree), so the list never lies about scope.
-    let mut note = if snap.primed {
+    let mut note = if display.primed {
         format!("{} of {} processes", rows.len(), snap.total)
     } else {
         // CPU is a delta; the first sample has nothing to diff against.
@@ -56,21 +62,20 @@ pub(in crate::monitor) fn procs(
     };
     note.push_str(&format!(
         " · {}{}",
-        sort.label(),
-        if desc { "↓" } else { "↑" }
+        display.sort.label(),
+        if display.desc { "↓" } else { "↑" }
     ));
-    if tree {
+    if display.tree {
         note.push_str(" · tree");
     }
-    if !filter.trim().is_empty() || filtering {
-        note.push_str(&format!(" · /{}", filter));
+    if !display.filter.trim().is_empty() || display.filtering {
+        note.push_str(&format!(" · /{}", display.filter));
     }
     let mut out = vec![heading("processes", Some(note))];
 
-    let query = procs_view::procs_query::Query::parse(filter.trim());
-    if !query.invalid().is_empty() {
-        let ignored = query
-            .invalid()
+    if !display.filtering && !display.invalid_terms.is_empty() {
+        let ignored = display
+            .invalid_terms
             .iter()
             .map(|term| format!("{} ({})", term.text, term.reason))
             .collect::<Vec<_>>()
@@ -89,10 +94,10 @@ pub(in crate::monitor) fn procs(
         return plain(out);
     }
 
-    let fitted = process_columns(cx.cols, tree);
+    let fitted = process_columns(cx.cols, display.tree);
     let widths: Vec<usize> = fitted.iter().map(|(_, width)| *width).collect();
     let headers = fitted.iter().map(|(id, _)| column_title(*id)).collect();
-    let body = process_cells(rows, &fitted, tree, snap.primed);
+    let body = process_cells(rows, &fitted, display.tree, display.primed);
     let row_y = row_ys(&out, body.len(), true);
     out.push(Section::FixedTable {
         table: TableSection {
@@ -133,10 +138,8 @@ pub(in crate::monitor) fn reflow_process_geometry(
     rows: &[ProcRow],
     tree: bool,
     cols: usize,
+    primed: bool,
 ) {
-    let primed = !body.iter().any(|section| {
-        matches!(section, Section::Heading { note: Some(note), .. } if note.contains("cpu warming up"))
-    });
     let fitted = process_columns(cols, tree);
     let widths: Vec<usize> = fitted.iter().map(|(_, width)| *width).collect();
     let headers = fitted.iter().map(|(id, _)| column_title(*id)).collect();
@@ -156,6 +159,9 @@ pub(in crate::monitor) fn reflow_process_geometry(
 /// Fit the default preset, remove columns the sampled process rows cannot
 /// provide, and let COMMAND take the remaining viewport width.
 fn process_columns(cols: usize, tree: bool) -> Vec<(ColId, usize)> {
+    if cols < 2 {
+        return vec![(ColId::Command, 0)];
+    }
     let mut fitted = procs_columns::fit_columns(
         Preset::Default,
         cols,
@@ -166,6 +172,13 @@ fn process_columns(cols: usize, tree: bool) -> Vec<(ColId, usize)> {
     );
     let caps = proc_row_caps();
     fitted.retain(|(id, _)| availability(*id, &caps) == Availability::Available);
+    if let Some((_, pid_width)) = fitted.iter_mut().find(|(id, _)| *id == ColId::Pid) {
+        *pid_width = if cols >= 60 {
+            (*pid_width).max(7)
+        } else {
+            (*pid_width).min(cols.saturating_sub(2))
+        };
+    }
     let other_widths: usize = fitted
         .iter()
         .filter(|(id, _)| *id != ColId::Command)
@@ -209,6 +222,8 @@ fn process_cells(
                         Tok::Hue(Hue::Teal),
                     ),
                     ColId::CpuBar if primed => Cell::Bar(
+                        // This currently visualizes total CPU clamped to one core;
+                        // user/system split and multi-core scaling are deferred.
                         (row.cpu_pct / 100.0).clamp(0.0, 1.0),
                         *width,
                         Tok::Hue(Hue::Teal),
@@ -222,7 +237,10 @@ fn process_cells(
                         // indentation remains inside the COMMAND column.
                         Cell::Text(process_name(row, tree, *width), owner_tone(row.owner))
                     }
-                    _ => unreachable!("unavailable process column escaped filtering"),
+                    _ => Cell::Text(
+                        NumFmt::default().reading(Reading::Unknown, Unit::Count, *width),
+                        Tok::Slot(S::Ghost),
+                    ),
                 })
                 .collect()
         })
@@ -349,4 +367,29 @@ pub(super) fn hints(
         },
     ));
     out.push(hint("x", " signal"));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn available_unrendered_columns_use_unknown_ghost_cells() {
+        let row = ProcRow {
+            pid: 41,
+            start_time: 1,
+            start_ticks: None,
+            name: "worker".into(),
+            owner: thegn_metrics::ProcOwner::Other,
+            cpu_pct: 0.0,
+            rss_bytes: 0,
+            depth: 0,
+            elided_parent: false,
+        };
+        let cells = process_cells(&[row], &[(ColId::Ppid, 4)], false, true);
+        assert!(matches!(
+            &cells[0][0],
+            Cell::Text(value, Tok::Slot(S::Ghost)) if value.trim() == "—"
+        ));
+    }
 }
