@@ -224,9 +224,9 @@ BIN_ABS="$(cd "$(dirname "$BIN")" && pwd)/$(basename "$BIN")"
   echo "cpu-sample: binary not executable: $BIN_ABS" >&2
   exit 1
 }
-case "$BIN_ABS" in
-*/release/*) BUILD=release ;;
-*/debug/*) BUILD=debug ;;
+case "$(basename "$(dirname "$BIN_ABS")")" in
+release) BUILD=release ;;
+debug) BUILD=debug ;;
 *) BUILD=unknown ;;
 esac
 
@@ -301,9 +301,9 @@ if [ "$SCENARIO" = steady-workload ] || [ "$SCENARIO" = soak ] || [ "$SCENARIO" 
   FIFO="$PERF_TMP/input.fifo"
   mkfifo "$FIFO"
 fi
-LOG_ENV=THEGN_LOG=thegn::hydrate=debug
+LOG_ENV=""
 if [ "$WORKLOAD" = 1 ]; then
-  LOG_ENV=THEGN_LOG=thegn::hydrate=debug,thegn::input=debug
+  LOG_ENV=THEGN_LOG=thegn::input=debug
 fi
 
 # Resolve and configure the isolated daemon socket before the UI starts: config
@@ -331,6 +331,45 @@ if [ "${TG_PERF_SANDBOX:-}" != 1 ]; then
 fi
 perf_seed_fixture_registry "$WORKTREES" "$BIN_ABS" "$REPO"
 LOG_FILE="$XDG_STATE_HOME/thegn/logs/thegn.log"
+rm -f -- "$LOG_FILE"
+# Verify registry adoption in a short instrumented launch so idle measurements
+# retain their original no-sink environment.
+printf -v VERIFY_INNER 'cd %q; stty rows 50 cols 200; env THEGN_NO_DAEMON=1 THEGN_BENCH_RUN_MS=30000 THEGN_LOG=thegn::hydrate=debug %q' \
+  "$REPO" "$BIN_ABS"
+TIMEOUT_BIN="$(pty_timeout_bin)"
+VERIFY_TIMEOUT_S=$(((SETTLE_MAX_MS / 1000) + 10))
+if [ -n "$TIMEOUT_BIN" ]; then
+  # `$0`/`$1` are the bash -c positionals bound by the arguments below.
+  # shellcheck disable=SC2016
+  "$TIMEOUT_BIN" "${VERIFY_TIMEOUT_S}s" bash -c 'source "$0"; pty_run "$1"' \
+    "$HERE/../lib/pty.sh" "$VERIFY_INNER" >/dev/null 2>&1 &
+else
+  bash -c 'source "$0"; pty_run "$1"' \
+    "$HERE/../lib/pty.sh" "$VERIFY_INNER" >/dev/null 2>&1 &
+fi
+VERIFY_LAUNCHER=$!
+EXPECTED_WORKTREES=$((WORKTREES + 1))
+WORKTREES_COLLECTED=0
+VERIFY_POLLS=$(((SETTLE_MAX_MS + 199) / 200))
+for _ in $(seq 1 "$VERIFY_POLLS"); do
+  if [ -f "$LOG_FILE" ] && awk -v expected="$EXPECTED_WORKTREES" \
+    'index($0, "sidebar status collected") && match($0, "(^|[[:space:]])worktrees=" expected "([[:space:]]|$)") { found = 1 } END { exit !found }' \
+    "$LOG_FILE"; then
+    WORKTREES_COLLECTED="$EXPECTED_WORKTREES"
+    break
+  fi
+  sleep 0.2
+done
+if [ "$WORKTREES_COLLECTED" != "$EXPECTED_WORKTREES" ]; then
+  kill "$VERIFY_LAUNCHER" 2>/dev/null || true
+  wait "$VERIFY_LAUNCHER" 2>/dev/null || true
+  echo "FAIL: sidebar status did not collect worktrees=$EXPECTED_WORKTREES in $LOG_FILE" >&2
+  if [ "$JSON_ONLY" = 1 ]; then
+    printf '{"worktrees_collected":{"status":"failed","expected":%s}}\n' "$EXPECTED_WORKTREES"
+  fi
+  exit 1
+fi
+wait "$VERIFY_LAUNCHER" 2>/dev/null || true
 if [ "$SPAWN_ENABLED" = 1 ] && [ "$SAMPLER" = proc ]; then
   # `$1`/`$@` are the bash -c positionals passed after `$0`, not outer values.
   # shellcheck disable=SC2016
@@ -340,12 +379,12 @@ if [ "$SPAWN_ENABLED" = 1 ] && [ "$SAMPLER" = proc ]; then
 else
   if [ "$WORKLOAD" = 1 ]; then
     printf -v INNER \
-      'cd %q; stty rows 50 cols 200; env THEGN_BENCH_RUN_MS=%q %s THEGN_LOG=thegn::hydrate=debug,thegn::input=debug %q & echo $! > %q; wait' \
-      "$REPO" "$RUN_MS" "$NO_DAEMON" "$BIN_ABS" "$PIDFILE"
+      'cd %q; stty rows 50 cols 200; env THEGN_BENCH_RUN_MS=%q %s %s %q & echo $! > %q; wait' \
+      "$REPO" "$RUN_MS" "$NO_DAEMON" "$LOG_ENV" "$BIN_ABS" "$PIDFILE"
   else
     printf -v INNER \
-      'cd %q; stty rows 50 cols 200; env THEGN_BENCH_RUN_MS=%q %s THEGN_LOG=thegn::hydrate=debug %q & echo $! > %q; wait' \
-      "$REPO" "$RUN_MS" "$NO_DAEMON" "$BIN_ABS" "$PIDFILE"
+      'cd %q; stty rows 50 cols 200; env THEGN_BENCH_RUN_MS=%q %s %s %q & echo $! > %q; wait' \
+      "$REPO" "$RUN_MS" "$NO_DAEMON" "$LOG_ENV" "$BIN_ABS" "$PIDFILE"
   fi
 fi
 TIMEOUT_BIN="$(pty_timeout_bin)"
@@ -435,31 +474,6 @@ if [ -z "$PID" ] || ! kill -0 "$PID" 2>/dev/null; then
     wait "$DAEMON_LAUNCHER" 2>/dev/null || true
   fi
   [ "$SPAWN_ENABLED" = 1 ] && exit 2
-  exit 1
-fi
-
-# The status collector reports the number of paths it actually adopted. Check
-# the live run's log so --worktrees cannot silently describe only git fixtures.
-EXPECTED_WORKTREES=$((WORKTREES + 1))
-for _ in $(seq 1 100); do
-  if [ -f "$LOG_FILE" ] && awk -v expected="$EXPECTED_WORKTREES" \
-    'index($0, "sidebar status collected") && match($0, "(^|[[:space:]])worktrees=" expected "([[:space:]]|$)") { found = 1 } END { exit !found }' \
-    "$LOG_FILE"; then
-    break
-  fi
-  sleep 0.05
-done
-if [ ! -f "$LOG_FILE" ] || ! awk -v expected="$EXPECTED_WORKTREES" \
-  'index($0, "sidebar status collected") && match($0, "(^|[[:space:]])worktrees=" expected "([[:space:]]|$)") { found = 1 } END { exit !found }' \
-  "$LOG_FILE"; then
-  echo "FAIL: sidebar status did not collect worktrees=$EXPECTED_WORKTREES in $LOG_FILE" >&2
-  kill "$PID" 2>/dev/null || true
-  if [ "$WORKLOAD" = 1 ]; then exec 3>&-; fi
-  wait "$LAUNCHER" 2>/dev/null || true
-  if [ -n "$DAEMON_LAUNCHER" ]; then
-    "$BIN_ABS" daemon stop >/dev/null 2>&1 || kill "$DAEMON_LAUNCHER" 2>/dev/null || true
-    wait "$DAEMON_LAUNCHER" 2>/dev/null || true
-  fi
   exit 1
 fi
 
@@ -933,7 +947,7 @@ if [ "$SPAWN_ENABLED" = 1 ] && [ "$SAMPLER" = proc ]; then
 fi
 
 INPUT_JSON="${INPUT_JSON:-null}"
-RESULT="{\"scenario\":\"$SCENARIO\",\"build\":\"$BUILD\",\"worktrees\":$WORKTREES,\"window_ms\":$WINDOW_MS,\"settle_used_ms\":${SETTLE_USED_MS:-$SETTLE_MS},\"cores_total\":$CORES_TOTAL,\"threads\":$THREAD_JSON,\"resources\":$RES_JSON,\"spawn_rate\":$SPAWN_JSON,\"input\":$INPUT_JSON,\"git_sha\":\"$GIT_SHA\",\"host_tag\":\"$HOST_TAG\"}"
+RESULT="{\"scenario\":\"$SCENARIO\",\"build\":\"$BUILD\",\"worktrees\":$WORKTREES,\"worktrees_collected\":$WORKTREES_COLLECTED,\"window_ms\":$WINDOW_MS,\"settle_used_ms\":${SETTLE_USED_MS:-$SETTLE_MS},\"cores_total\":$CORES_TOTAL,\"threads\":$THREAD_JSON,\"resources\":$RES_JSON,\"spawn_rate\":$SPAWN_JSON,\"input\":$INPUT_JSON,\"git_sha\":\"$GIT_SHA\",\"host_tag\":\"$HOST_TAG\"}"
 
 BASELINE="$BASELINE_DIR/$HOST_TAG.$SCENARIO.json"
 if [ "$RECORD" = 1 ]; then
