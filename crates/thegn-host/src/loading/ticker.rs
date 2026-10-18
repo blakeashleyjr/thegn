@@ -110,7 +110,7 @@ mod tests {
     }
 
     #[test]
-    fn failed_provision_drain_leaves_a_static_splash_without_a_ticker() {
+    fn podman_failure_then_bwrap_resolution_keeps_splash_without_a_ticker() {
         let key = ("app/home".to_string(), 0);
         let session = crate::session::Session {
             id: "test".into(),
@@ -122,12 +122,27 @@ mod tests {
             active: 0,
         };
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-        let steps = crate::loading::provision_load_steps(&[crate::agent::ProvisionStepView {
-            label: "setup".into(),
-            state: crate::agent::ProvisionState::Failed,
-            detail: Some("backend setup failed".into()),
-        }]);
-        tx.send((key.0.clone(), key.1, steps)).unwrap();
+        let seed = crate::loading::catalog::generic_seed();
+        let mut observer = crate::loading::observe::MaterializeObserver::from_steps(&seed);
+        for event in [
+            thegn_core::progress::SandboxPhase::Resolve,
+            thegn_core::progress::SandboxPhase::ResolveProbe {
+                backend: "podman-rootless".into(),
+            },
+            thegn_core::progress::SandboxPhase::PhaseDone,
+            thegn_core::progress::SandboxPhase::ContainerCreate { backend: "podman" },
+            thegn_core::progress::SandboxPhase::PhaseFailed {
+                err: "could not start podman container".into(),
+            },
+            thegn_core::progress::SandboxPhase::Resolve,
+            thegn_core::progress::SandboxPhase::ResolveProbe {
+                backend: "bwrap".into(),
+            },
+            thegn_core::progress::SandboxPhase::PhaseDone,
+        ] {
+            tx.send((key.0.clone(), key.1, observer.on_event(event)))
+                .unwrap();
+        }
         drop(tx);
         let mut tracker = crate::loading::track::LoadingTracker::default();
         let mut remote = std::collections::HashMap::new();
@@ -143,15 +158,32 @@ mod tests {
             &mut perf,
         );
 
-        let steps = tracker
-            .get(&key)
-            .expect("drained failed progress remains drawn");
-        assert_eq!(steps[0].state, StepState::Failed);
-        assert!(crate::loading::any_clearable_splash(&tracker));
+        let (steps, ticker_visible) = crate::loading::derive_splash(&tracker, &session);
+        assert!(
+            !steps.is_empty(),
+            "materialize shell-wait splash remains drawn"
+        );
+        assert_eq!(
+            steps
+                .iter()
+                .find(|step| step.label == "container (podman)")
+                .map(|s| s.state),
+            None,
+            "failed podman create row is removed when fallback resolves"
+        );
+        assert_eq!(steps.last().map(|step| step.label.as_str()), Some("shell"));
         assert!(crate::loading::should_clear_splash_on_output(
             &tracker, &key
         ));
-        assert!(!is_animating(steps));
+        assert!(
+            !ticker_visible,
+            "no Active step means run.rs hides the ticker"
+        );
+
+        tracker.set(key.clone(), vec![LoadStep::active("provisioning")]);
+        assert!(crate::loading::derive_splash(&tracker, &session).1);
+        tracker.set(key, vec![LoadStep::done("provisioning")]);
+        assert!(!crate::loading::derive_splash(&tracker, &session).1);
     }
 
     /// Poll until `cond` holds (a loaded test machine makes fixed sleeps
