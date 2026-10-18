@@ -7,7 +7,7 @@ const COMM_CAP: usize = 16;
 const WCHAN_CAP: usize = 32;
 const FD_TARGET_CAP: usize = 48;
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct ThreadSample {
     pub(crate) tid: u32,
     pub(crate) comm: [u8; COMM_CAP],
@@ -21,6 +21,25 @@ pub(crate) struct ThreadSample {
     pub(crate) wchan_len: u8,
     pub(crate) fd_target: [u8; FD_TARGET_CAP],
     pub(crate) fd_target_len: u8,
+}
+
+impl Default for ThreadSample {
+    fn default() -> Self {
+        Self {
+            tid: 0,
+            comm: [0; COMM_CAP],
+            comm_len: 0,
+            voluntary: None,
+            nonvoluntary: None,
+            utime_ticks: None,
+            syscall: None,
+            arg0: None,
+            wchan: [0; WCHAN_CAP],
+            wchan_len: 0,
+            fd_target: [0; FD_TARGET_CAP],
+            fd_target_len: 0,
+        }
+    }
 }
 
 impl ThreadSample {
@@ -43,7 +62,13 @@ fn copy_text<const N: usize>(dst: &mut [u8; N], src: &str) -> u8 {
     while !src.is_char_boundary(count) {
         count -= 1;
     }
-    dst[..count].copy_from_slice(&src.as_bytes()[..count]);
+    copy_bytes(dst, &src.as_bytes()[..count])
+}
+
+#[cfg(target_os = "linux")]
+fn copy_bytes<const N: usize>(dst: &mut [u8; N], src: &[u8]) -> u8 {
+    let count = src.len().min(N);
+    dst[..count].copy_from_slice(&src[..count]);
     count as u8
 }
 
@@ -90,6 +115,8 @@ pub(crate) fn parse_stat_utime(stat: &str) -> Option<u64> {
 /// Fill `out` with at most `cap` samples from this process.
 #[cfg(target_os = "linux")]
 pub(crate) fn sample_self(out: &mut Vec<ThreadSample>, cap: usize) {
+    use std::fmt::Write as _;
+    use std::os::unix::ffi::OsStrExt as _;
     use std::path::PathBuf;
 
     out.clear();
@@ -97,7 +124,9 @@ pub(crate) fn sample_self(out: &mut Vec<ThreadSample>, cap: usize) {
         return;
     };
     let mut path = PathBuf::from("/proc/self/task");
+    let mut fd_path = PathBuf::from("/proc/self/fd");
     let mut text = String::with_capacity(512);
+    let mut fd_number = String::with_capacity(10);
     for entry in entries.flatten().take(cap) {
         let tid_name = entry.file_name();
         let Some(tid) = tid_name.to_str().and_then(|name| name.parse().ok()) else {
@@ -126,9 +155,15 @@ pub(crate) fn sample_self(out: &mut Vec<ThreadSample>, cap: usize) {
             (sample.syscall, sample.arg0) = parse_syscall(&text);
             if let (Some(number), Some(fd)) = (sample.syscall, sample.arg0)
                 && syscall_arg0_is_fd(number)
-                && let Ok(target) = std::fs::read_link(format!("/proc/self/fd/{fd}"))
             {
-                sample.fd_target_len = copy_text(&mut sample.fd_target, &target.to_string_lossy());
+                fd_number.clear();
+                write!(&mut fd_number, "{fd}").expect("writing an fd number to String");
+                fd_path.push_str(&fd_number);
+                if let Ok(target) = std::fs::read_link(&fd_path) {
+                    sample.fd_target_len =
+                        copy_bytes(&mut sample.fd_target, target.as_os_str().as_bytes());
+                }
+                fd_path.pop();
             }
         }
         if read_task_file(&mut path, "wchan", &mut text).is_ok() {
