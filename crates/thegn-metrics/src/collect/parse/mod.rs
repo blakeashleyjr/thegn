@@ -9,8 +9,10 @@ pub mod mountinfo;
 pub mod netdev;
 pub mod psi;
 pub mod stat;
+pub mod swaps;
 pub mod uptime;
 pub mod vmstat;
+pub mod zram;
 
 pub fn fields(input: &[u8]) -> impl Iterator<Item = &[u8]> {
     input

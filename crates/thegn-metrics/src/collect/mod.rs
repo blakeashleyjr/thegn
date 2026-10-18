@@ -151,6 +151,8 @@ pub fn default_collectors() -> Vec<Box<dyn Collector>> {
     collectors[CollectorId::Uptime.index()] =
         Box::new(linux::uptime::UptimeCollector::at("/proc/uptime"));
     collectors[CollectorId::Psi.index()] = Box::new(linux::psi::PsiCollector::at("/proc/pressure"));
+    collectors[CollectorId::Meminfo.index()] = Box::new(linux::meminfo::MeminfoCollector::new());
+    collectors[CollectorId::Vmstat.index()] = Box::new(linux::vmstat::VmstatCollector::new());
     collectors
 }
 
