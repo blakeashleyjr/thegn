@@ -255,6 +255,8 @@ fn apu_and_dgpu_memory_labels_are_distinct_and_demand_is_panel_static() {
     let engine_demand = view.demand(engine_panel.id);
     let mut expected = thegn_metrics::collect::CollectorSet::empty();
     expected.insert(CollectorId::GpuEngines);
+    expected.insert(CollectorId::AmdSmu);
+    expected.insert(CollectorId::GpuDevices);
     assert_eq!(engine_demand, expected);
     let device_panel = placed
         .iter()
@@ -380,10 +382,22 @@ fn busy_history_is_slot_keyed_bounded_and_reuses_capacity_after_warmup() {
     let engine_capacity = model.engines.devices.capacity();
     let smu_capacity = model.smu.cards.capacity();
     let history_capacity = model.histories.capacity();
-    let activity_capacity = model.histories[0].activity[0].values.len();
-    for tick in 0_u32..1_000 {
-        model.absorb_frame(&fixture(tick, GpuKind::Apu, RuntimeStatus::Active));
-    }
+    let frames = (0_u32..1_000)
+        .map(|tick| fixture(tick, GpuKind::Apu, RuntimeStatus::Active))
+        .collect::<Vec<_>>();
+    let (_, counts) = crate::proc_workload_alloc::measure(|| {
+        for frame in &frames {
+            model.absorb_frame(frame);
+        }
+    });
+    assert_eq!(
+        counts.allocation_calls, 0,
+        "1000 warm GPU absorbs allocated: {counts:?}"
+    );
+    assert_eq!(
+        counts.realloc_calls, 0,
+        "1000 warm GPU absorbs reallocated: {counts:?}"
+    );
     assert_eq!(model.histories.len(), 1);
     assert_eq!(model.histories[0].len, 480);
     assert_eq!(model.histories[0].memory_len, 480);
@@ -395,10 +409,6 @@ fn busy_history_is_slot_keyed_bounded_and_reuses_capacity_after_warmup() {
             .activity
             .iter()
             .all(|ring| ring.len == HISTORY_CAP)
-    );
-    assert_eq!(
-        model.histories[0].activity[0].values.len(),
-        activity_capacity
     );
     let capacity = model.histories.capacity();
     assert_eq!(model.devices.devices.capacity(), device_capacity);
@@ -450,6 +460,26 @@ fn aux_history_draws_each_device_and_activity_rings_require_verified_layout() {
     assert!(memory.contains("GPU1 VRAM / total"), "{memory}");
     assert!(memory.contains("GPU0 GTT / total"), "{memory}");
     assert!(memory.contains("GPU1 GTT / total"), "{memory}");
+    let label_row = |label: &str| {
+        memory_surface
+            .screen_lines()
+            .iter()
+            .position(|line| {
+                line.visible_cells()
+                    .fold(String::new(), |mut row, cell| {
+                        row.push_str(cell.str());
+                        row
+                    })
+                    .contains(label)
+            })
+            .expect("history label rendered")
+    };
+    let vram_row = label_row("GPU0 VRAM / total");
+    let gtt_row = label_row("GPU0 GTT / total");
+    assert!(
+        gtt_row >= vram_row + 3,
+        "VRAM area graph has fewer than two rows: VRAM {vram_row}, GTT {gtt_row}"
+    );
 
     let mut clocks_surface = Surface::new(100, 18);
     view.paint_aux_history(&mut clocks_surface, rect, body, false);
@@ -470,6 +500,69 @@ fn aux_history_draws_each_device_and_activity_rings_require_verified_layout() {
             .iter()
             .all(|ring| ring.len == 0)
     );
+    assert_eq!(unverified_model.histories[0].power_len, 1);
+}
+
+#[test]
+fn busy_area_and_activity_rows_do_not_overlap_with_vcn_present() {
+    let mut model = GpuModel::default();
+    for tick in 0_u32..8 {
+        model.absorb_frame(&fixture(tick, GpuKind::Apu, RuntimeStatus::Active));
+    }
+    let history = &model.histories[0];
+    let activity_rows = history.activity.iter().filter(|ring| ring.len > 0).count();
+    let graph_rows = 20_usize.saturating_sub(2 + activity_rows.min(18));
+    let activity_start = 20 - 1 - activity_rows.min(18);
+    let busy_graph_rows = 1..1 + graph_rows;
+    let activity_label_rows = activity_start..19;
+    assert!(
+        activity_label_rows.all(|row| !busy_graph_rows.contains(&row)),
+        "activity labels overlap busy graph rows {busy_graph_rows:?}"
+    );
+
+    let mut surface = Surface::new(40, 20);
+    let rect = Rect::full(40, 20);
+    GpuView(&model).paint_busy_history(&mut surface, rect, rect);
+    let rendered = text(&surface);
+    assert!(rendered.contains("GPU0 gfx 0-100%"), "{rendered}");
+    assert!(rendered.contains("vcn %"), "{rendered}");
+    let gfx_label_row = surface
+        .screen_lines()
+        .iter()
+        .position(|line| {
+            line.visible_cells()
+                .fold(String::new(), |mut row, cell| {
+                    row.push_str(cell.str());
+                    row
+                })
+                .contains("GPU0 gfx 0-100%")
+        })
+        .expect("gfx activity label rendered");
+    assert!(
+        !busy_graph_rows.contains(&gfx_label_row),
+        "gfx label row {gfx_label_row} overlaps busy graph {busy_graph_rows:?}"
+    );
+}
+
+#[test]
+fn activity_gap_holds_the_last_sample_and_suspended_frames_do_not_push() {
+    let mut first = fixture(1, GpuKind::Apu, RuntimeStatus::Active);
+    first.parts.amd_smu.cards[0].metrics.activity_gfx = Some(64);
+    let mut model = GpuModel::default();
+    model.absorb_frame(&first);
+
+    let mut gap = fixture(2, GpuKind::Apu, RuntimeStatus::Active);
+    gap.parts.amd_smu.cards[0].metrics.activity_gfx = Some(101);
+    model.absorb_frame(&gap);
+    let ring = &model.histories[0].activity[0];
+    assert_eq!(ring.len, 2);
+    let previous = ring.values[(ring.next + HISTORY_CAP - 2) % HISTORY_CAP];
+    let held = ring.values[(ring.next + HISTORY_CAP - 1) % HISTORY_CAP];
+    assert_eq!(previous, held);
+
+    let suspended = fixture(3, GpuKind::Apu, RuntimeStatus::Suspended);
+    model.absorb_frame(&suspended);
+    assert_eq!(model.histories[0].activity[0].len, 2);
 }
 
 #[test]
@@ -535,12 +628,20 @@ fn activity_history_places_newest_sample_in_last_inner_column() {
     let mut surface = Surface::new(40, 8);
     let rect = Rect::full(40, 8);
     GpuView(&model).paint_busy_history(&mut surface, rect, rect);
-    let newest_column = surface
+    let gfx_row = surface
         .screen_lines()
         .iter()
-        .enumerate()
-        .filter(|(row, _)| *row == 1)
-        .flat_map(|(_, line)| line.visible_cells())
+        .position(|line| {
+            line.visible_cells()
+                .fold(String::new(), |mut row, cell| {
+                    row.push_str(cell.str());
+                    row
+                })
+                .contains("GPU0 gfx 0-100%")
+        })
+        .expect("gfx activity label rendered");
+    let newest_column = surface.screen_lines()[gfx_row]
+        .visible_cells()
         .any(|cell| cell.cell_index() == 39 && cell.str() != " " && cell.str() != "\u{2800}");
     assert!(
         newest_column,

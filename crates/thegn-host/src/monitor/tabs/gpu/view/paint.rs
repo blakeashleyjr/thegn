@@ -3,37 +3,13 @@ use crate::caps::{self, Glyph};
 use crate::compositor::Rect;
 use crate::monitor::kit::emit::Emitter;
 use crate::monitor::kit::grid::CellGrid;
+use std::fmt::Write as _;
 use termwiz::surface::Surface;
 use thegn_core::numfmt::{NumFmt, Unit};
 use thegn_metrics::collect::{
     health::{Absent, Health},
     model::{amd_smu::AmdSmuStatus, gpu::GpuKind, gpu::RuntimeStatus},
 };
-
-struct AuxRing<'a> {
-    label: &'a str,
-    values: &'a [f32; HISTORY_CAP],
-    next: usize,
-    len: usize,
-    ramp: thegn_core::theme::RampId,
-}
-
-fn draw_aux_ring(
-    surface: &mut Surface,
-    rect: Rect,
-    body: Rect,
-    row: usize,
-    ring: AuxRing<'_>,
-) -> usize {
-    if ring.len == 0 {
-        return row;
-    }
-    let mut values = [0.0_f32; HISTORY_CAP];
-    let len = super::BusyHistory::ordered_ring(ring.values, ring.next, ring.len, &mut values);
-    let label = format!("{} 0-100%", ring.label);
-    draw_labelled_spark(surface, rect, body, row, &label, &values[..len], ring.ramp);
-    row + 1
-}
 
 fn draw_labelled_spark(
     surface: &mut Surface,
@@ -45,7 +21,7 @@ fn draw_labelled_spark(
     ramp: thegn_core::theme::RampId,
 ) {
     const LABEL_COLS: usize = 28;
-    if values.is_empty() || row >= body.rows || body.cols <= LABEL_COLS {
+    if row >= body.rows || body.cols <= LABEL_COLS {
         return;
     }
     let mut label_grid = CellGrid::new(LABEL_COLS, 1);
@@ -65,20 +41,57 @@ fn draw_labelled_spark(
         cols: body.cols - LABEL_COLS,
         rows: 1,
     };
-    let graph = crate::monitor::kit::history_rect::graph_rect(
-        area,
-        values.len(),
-        crate::monitor::graphs::table().braille,
-    );
-    crate::monitor::graphs::paint_sparkline(values, graph.cols, ramp, graph, surface);
+    if !values.is_empty() {
+        let graph = crate::monitor::kit::history_rect::graph_rect(
+            area,
+            values.len(),
+            crate::monitor::graphs::table().braille,
+        );
+        crate::monitor::graphs::paint_sparkline(values, graph.cols, ramp, graph, surface);
+    }
+}
+
+fn aux_rings(
+    history: &super::BusyHistory,
+    memory: bool,
+) -> (
+    &[f32; HISTORY_CAP],
+    usize,
+    usize,
+    &[f32; HISTORY_CAP],
+    usize,
+    usize,
+    [&'static str; 2],
+) {
+    if memory {
+        (
+            &history.memory,
+            history.memory_next,
+            history.memory_len,
+            &history.gtt,
+            history.gtt_next,
+            history.gtt_len,
+            ["VRAM / total", "GTT / total"],
+        )
+    } else {
+        (
+            &history.clocks,
+            history.clocks_next,
+            history.clocks_len,
+            &history.power,
+            history.power_next,
+            history.power_len,
+            ["gfx clock / max", "power / cap"],
+        )
+    }
 }
 
 fn activity_label(index: usize) -> &'static str {
     match index {
         0 => "gfx",
-        1 => "mm",
+        1 => "media",
         2 => "vcn",
-        3 => "umc",
+        3 => "mem ctl",
         4 => "ipu0",
         5 => "ipu1",
         6 => "ipu2",
@@ -123,10 +136,85 @@ impl GpuView<'_> {
         if body.rows < 4 || body.cols < 28 {
             return;
         }
-        let data_rows = self.0.devices.devices.len().min(body.rows);
+        let source_count = if memory {
+            self.0.devices.devices.len()
+        } else {
+            self.0.engines.devices.len()
+        };
+        let data_rows = source_count.min(body.rows);
+        let active_count = self
+            .0
+            .engines
+            .devices
+            .iter()
+            .take(DEVICE_CAP)
+            .filter(|engine| engine.runtime_status == RuntimeStatus::Active)
+            .count();
+        if active_count == 0 {
+            return;
+        }
+        let available_rows = body.rows.saturating_sub(data_rows);
+        let rows_per_device = available_rows / active_count;
+        if rows_per_device < 4 {
+            let mut output_row = data_rows;
+            let mut label_text = String::new();
+            for (device_index, engine) in self.0.engines.devices.iter().take(DEVICE_CAP).enumerate()
+            {
+                if engine.runtime_status != RuntimeStatus::Active || output_row >= body.rows {
+                    continue;
+                }
+                if let Some(history) = self
+                    .0
+                    .histories
+                    .iter()
+                    .find(|item| item.slot == engine.slot.as_str())
+                {
+                    let (first, first_next, first_len, second, second_next, second_len, labels) =
+                        aux_rings(history, memory);
+                    for (values, next, len, label, ramp) in [
+                        (
+                            first,
+                            first_next,
+                            first_len,
+                            labels[0],
+                            thegn_core::theme::RampId::Mem,
+                        ),
+                        (
+                            second,
+                            second_next,
+                            second_len,
+                            labels[1],
+                            thegn_core::theme::RampId::Util,
+                        ),
+                    ] {
+                        if len == 0 || output_row >= body.rows {
+                            continue;
+                        }
+                        let mut ordered = [0.0_f32; HISTORY_CAP];
+                        let ordered_len =
+                            super::BusyHistory::ordered_ring(values, next, len, &mut ordered);
+                        label_text.clear();
+                        write!(label_text, "GPU{device_index} {label}").expect("write to String");
+                        draw_labelled_spark(
+                            surface,
+                            rect,
+                            body,
+                            output_row,
+                            &label_text,
+                            &ordered[..ordered_len],
+                            ramp,
+                        );
+                        output_row += 1;
+                    }
+                }
+            }
+            return;
+        }
         let mut output_row = data_rows;
+        let mut first_label = String::new();
+        let mut second_label = String::new();
         for (device_index, engine) in self.0.engines.devices.iter().take(DEVICE_CAP).enumerate() {
-            if engine.runtime_status != RuntimeStatus::Active || output_row >= body.rows {
+            if engine.runtime_status != RuntimeStatus::Active {
                 continue;
             }
             let Some(history) = self
@@ -137,58 +225,79 @@ impl GpuView<'_> {
             else {
                 continue;
             };
-            let (first, first_next, first_len, second, second_next, second_len, labels) = if memory
-            {
-                (
-                    &history.memory,
-                    history.memory_next,
-                    history.memory_len,
-                    &history.gtt,
-                    history.gtt_next,
-                    history.gtt_len,
-                    ["VRAM / total", "GTT / total"],
-                )
-            } else {
-                (
-                    &history.clocks,
-                    history.clocks_next,
-                    history.clocks_len,
-                    &history.power,
-                    history.power_next,
-                    history.power_len,
-                    ["gfx clock / max", "power / cap"],
-                )
-            };
-            let first_label = format!("GPU{device_index} {}", labels[0]);
-            let second_label = format!("GPU{device_index} {}", labels[1]);
-            output_row = draw_aux_ring(
+            let (first, first_next, first_len, second, second_next, second_len, labels) =
+                aux_rings(history, memory);
+            first_label.clear();
+            write!(first_label, "GPU{device_index} {}", labels[0]).expect("write to String");
+            second_label.clear();
+            write!(second_label, "GPU{device_index} {}", labels[1]).expect("write to String");
+            let slot_rows = rows_per_device.min(body.rows.saturating_sub(output_row));
+            if slot_rows < 2 {
+                break;
+            }
+            draw_labelled_spark(
                 surface,
                 rect,
                 body,
                 output_row,
-                AuxRing {
-                    label: &first_label,
-                    values: first,
-                    next: first_next,
-                    len: first_len,
-                    ramp: thegn_core::theme::RampId::Mem,
-                },
+                &first_label,
+                &[],
+                thegn_core::theme::RampId::Mem,
             );
-            if output_row < body.rows {
-                output_row = draw_aux_ring(
-                    surface,
-                    rect,
-                    body,
-                    output_row,
-                    AuxRing {
-                        label: &second_label,
-                        values: second,
-                        next: second_next,
-                        len: second_len,
-                        ramp: thegn_core::theme::RampId::Util,
+            if first_len > 0 {
+                let mut values = [0.0_f32; HISTORY_CAP];
+                let len =
+                    super::BusyHistory::ordered_ring(first, first_next, first_len, &mut values);
+                let graph = crate::monitor::kit::history_rect::graph_rect(
+                    Rect {
+                        x: rect.x + body.x + 28,
+                        y: rect.y + body.y + output_row + 1,
+                        cols: body.cols - 28,
+                        rows: slot_rows.saturating_sub(3),
                     },
+                    len,
+                    crate::monitor::graphs::table().braille,
+                );
+                crate::monitor::graphs::paint_history_graph(
+                    &values[..len],
+                    thegn_core::theme::RampId::Mem,
+                    graph,
+                    surface,
                 );
             }
+            let second_row = output_row + slot_rows - 1;
+            draw_labelled_spark(
+                surface,
+                rect,
+                body,
+                second_row,
+                &second_label,
+                &[],
+                thegn_core::theme::RampId::Util,
+            );
+            if second_len > 0 {
+                let mut values = [0.0_f32; HISTORY_CAP];
+                let len =
+                    super::BusyHistory::ordered_ring(second, second_next, second_len, &mut values);
+                let graph = crate::monitor::kit::history_rect::graph_rect(
+                    Rect {
+                        x: rect.x + body.x + 28,
+                        y: rect.y + body.y + second_row,
+                        cols: body.cols - 28,
+                        rows: 1,
+                    },
+                    len,
+                    crate::monitor::graphs::table().braille,
+                );
+                crate::monitor::graphs::paint_sparkline(
+                    &values[..len],
+                    graph.cols,
+                    thegn_core::theme::RampId::Util,
+                    graph,
+                    surface,
+                );
+            }
+            output_row += slot_rows;
         }
     }
 
@@ -253,6 +362,8 @@ impl GpuView<'_> {
                 return;
             };
             if history.len > 0 && body.rows >= 3 && body.cols >= 12 {
+                let activity_count = history.activity.iter().filter(|ring| ring.len > 0).count();
+                let activity_rows = activity_count.min(body.rows.saturating_sub(2));
                 let mut values = [0.0_f32; HISTORY_CAP];
                 let len = history.ordered_into(&mut values);
                 let graph_rect = crate::monitor::kit::history_rect::graph_rect(
@@ -260,7 +371,7 @@ impl GpuView<'_> {
                         x: rect.x + body.x,
                         y: rect.y + body.y + 1,
                         cols: body.cols,
-                        rows: body.rows.saturating_sub(2),
+                        rows: body.rows.saturating_sub(2 + activity_rows),
                     },
                     len,
                     crate::monitor::graphs::table().braille,
@@ -307,6 +418,23 @@ impl GpuView<'_> {
             }
         }
         let mut output_row = self.0.engines.devices.len().min(body.rows);
+        let mut label_text = String::new();
+        if self.0.engines.devices.len() == 1
+            && let Some(engine) = self.0.engines.devices.first()
+            && let Some(history) = self
+                .0
+                .histories
+                .iter()
+                .find(|item| item.slot == engine.slot.as_str())
+        {
+            let activity_rows = history
+                .activity
+                .iter()
+                .filter(|ring| ring.len > 0)
+                .count()
+                .min(body.rows.saturating_sub(2));
+            output_row = body.rows.saturating_sub(1 + activity_rows);
+        }
         for (device_index, engine) in self.0.engines.devices.iter().take(DEVICE_CAP).enumerate() {
             if output_row >= body.rows {
                 break;
@@ -332,12 +460,14 @@ impl GpuView<'_> {
                 let label = activity_label(index);
                 let mut values = [0.0_f32; HISTORY_CAP];
                 let len = ring.ordered_into(&mut values);
+                label_text.clear();
+                write!(label_text, "GPU{device_index} {label} 0-100%").expect("write to String");
                 draw_labelled_spark(
                     surface,
                     rect,
                     body,
                     output_row,
-                    &format!("GPU{device_index} {label} 0-100%"),
+                    &label_text,
                     &values[..len],
                     thegn_core::theme::RampId::Util,
                 );
