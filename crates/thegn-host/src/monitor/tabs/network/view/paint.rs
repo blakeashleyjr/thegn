@@ -26,12 +26,18 @@ pub(super) fn paint(model: &NetworkModel, surface: &mut Surface, id: PanelId, re
     let mut grid = CellGrid::new(rect.cols, rect.rows);
     let title = match id {
         THROUGHPUT => format!(
-            "Network throughput (peak {} B/s)",
-            format_rate(f64::from(peak(&model.rx, &model.tx)))
+            "Network throughput (window peak {} B/s)",
+            peak_label(&model.history_rx, &model.history_tx)
         ),
         INTERFACES => format!(
             "Interfaces - rates/errors (spark peak {} B/s)",
-            format_rate(f64::from(interface_peak(model)))
+            if model.interfaces.iter().any(|entry| {
+                entry.live && (entry.rx.has_finite_sample() || entry.tx.has_finite_sample())
+            }) {
+                format_rate(f64::from(interface_peak(model)))
+            } else {
+                caps::active_glyphs().emdash.to_owned()
+            }
         ),
         HEALTH => "Network health".to_owned(),
         _ => return,
@@ -52,6 +58,8 @@ pub(super) fn paint(model: &NetworkModel, surface: &mut Surface, id: PanelId, re
     );
     if id == INTERFACES {
         paint_interface_sparks(model, surface, body, rect);
+    } else if id == HEALTH {
+        paint_health_history(model, surface, body, rect);
     }
 }
 
@@ -72,7 +80,7 @@ fn paint_throughput(grid: &mut CellGrid, body: Rect, model: &NetworkModel) {
     );
     grid.view(Rect { rows: 1, ..body })
         .put_str(0, 0, &rx_label, CellStyle::default());
-    if !model.rx.has_finite_sample() || !model.tx.has_finite_sample() {
+    if !model.history_rx.has_finite_sample() || !model.history_tx.has_finite_sample() {
         let rows = body.rows.saturating_sub(1).min(1);
         if rows > 0 {
             let mark = health_mark(model.health);
@@ -97,9 +105,9 @@ fn paint_throughput(grid: &mut CellGrid, body: Rect, model: &NetworkModel) {
     }
     let mut rx = [0.0; HISTORY];
     let mut tx = [0.0; HISTORY];
-    let rx_len = model.rx.copy_ordered(&mut rx);
-    let tx_len = model.tx.copy_ordered(&mut tx);
-    let max = peak(&model.rx, &model.tx);
+    let rx_len = model.history_rx.copy_ordered(&mut rx);
+    let tx_len = model.history_tx.copy_ordered(&mut tx);
+    let max = peak(&model.history_rx, &model.history_tx);
     for value in rx.iter_mut().take(rx_len).chain(tx.iter_mut().take(tx_len)) {
         *value = if value.is_finite() && max > 0.0 {
             (*value / max).clamp(0.0, 1.0)
@@ -201,13 +209,62 @@ fn paint_health(grid: &mut CellGrid, body: Rect, model: &NetworkModel) {
             thegn_metrics::collect::health::Absent::NoPermission,
         ) => format!("{} root-only", health_mark(model.health)),
         thegn_metrics::collect::health::Health::Absent(_) => health_mark(model.health).to_owned(),
-        _ => format!(
-            "errors/s {}    drops/s {}",
-            rate(model.error_total),
-            rate(model.drop_total)
-        ),
+        _ => {
+            let history_peak = peak(&model.error_history, &model.drop_history);
+            let peak_label = if model.error_history.has_finite_sample()
+                || model.drop_history.has_finite_sample()
+            {
+                format!("{}/s", format_rate(f64::from(history_peak)))
+            } else {
+                caps::active_glyphs().emdash.to_owned()
+            };
+            format!(
+                "errors/s {}    drops/s {}    history peak {}",
+                rate(model.error_total),
+                rate(model.drop_total),
+                peak_label
+            )
+        }
     };
     view.put_str(0, 0, &label, CellStyle::default());
+}
+
+fn paint_health_history(model: &NetworkModel, surface: &mut Surface, body: Rect, panel: Rect) {
+    let max = peak(&model.error_history, &model.drop_history);
+    if max <= 0.0 || body.rows < 2 {
+        return;
+    }
+    for (row, ring) in [&model.error_history, &model.drop_history]
+        .into_iter()
+        .take(body.rows.saturating_sub(1))
+        .enumerate()
+    {
+        paint_rate_history(
+            ring,
+            max,
+            Rect {
+                x: panel.x + body.x,
+                y: panel.y + body.y + row + 1,
+                cols: body.cols,
+                rows: 1,
+            },
+            surface,
+        );
+    }
+}
+
+fn paint_rate_history(ring: &super::Ring, peak: f32, rect: Rect, surface: &mut Surface) {
+    if !ring.has_finite_sample() {
+        return;
+    }
+    let mut values = [0.0; IFACE_HISTORY];
+    let len = ring.copy_ordered(&mut values);
+    for value in values.iter_mut().take(len) {
+        if value.is_finite() {
+            *value = (*value / peak).clamp(0.0, 1.0);
+        }
+    }
+    crate::monitor::graphs::paint_sparkline(&values[..len], rect.cols, RampId::Rx, rect, surface);
 }
 
 fn health_mark(health: thegn_metrics::collect::health::Health) -> &'static str {
@@ -301,6 +358,14 @@ fn peak(rx: &super::Ring, tx: &super::Ring) -> f32 {
         .copied()
         .filter(|value| value.is_finite())
         .fold(0.0_f32, f32::max)
+}
+
+fn peak_label(rx: &super::Ring, tx: &super::Ring) -> String {
+    if rx.has_finite_sample() || tx.has_finite_sample() {
+        format_rate(f64::from(peak(rx, tx)))
+    } else {
+        caps::active_glyphs().emdash.to_owned()
+    }
 }
 
 fn interface_peak(model: &NetworkModel) -> f32 {

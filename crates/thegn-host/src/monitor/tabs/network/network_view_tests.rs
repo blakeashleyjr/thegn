@@ -1,4 +1,5 @@
 use super::view::{HEALTH, IFACE_CAP, INTERFACES, NetworkModel, NetworkView, THROUGHPUT};
+use crate::telemetry::{ScaleMode, TelemetryHistory, Window};
 use crate::{
     caps,
     compositor::Rect,
@@ -100,6 +101,20 @@ fn frame(tick: u16, order: &[u16]) -> MonitorFrame {
     frame
 }
 
+fn telemetry_history() -> TelemetryHistory {
+    let mut history = TelemetryHistory::default();
+    for tick in 0..120_u64 {
+        history.push(
+            &thegn_metrics::StatsSnapshot {
+                net_bps: Some((20_000 + tick * 1_700, 8_000 + tick * 630)),
+                ..thegn_metrics::StatsSnapshot::default()
+            },
+            1_000 + tick * 1_000,
+        );
+    }
+    history
+}
+
 fn lines(surface: &Surface) -> Vec<String> {
     surface
         .screen_lines()
@@ -195,6 +210,8 @@ fn interface_slots_are_capped_and_absorb_capacity_stays_warm() {
         model.interfaces.capacity(),
         model.rx.values.capacity(),
         model.tx.values.capacity(),
+        model.error_history.values.capacity(),
+        model.drop_history.values.capacity(),
         model
             .interfaces
             .iter()
@@ -207,6 +224,8 @@ fn interface_slots_are_capped_and_absorb_capacity_stays_warm() {
     assert_eq!(model.interfaces.capacity(), capacities.0);
     assert_eq!(model.rx.values.capacity(), capacities.1);
     assert_eq!(model.tx.values.capacity(), capacities.2);
+    assert_eq!(model.error_history.values.capacity(), capacities.3);
+    assert_eq!(model.drop_history.values.capacity(), capacities.4);
     assert_eq!(
         model
             .interfaces
@@ -300,6 +319,17 @@ fn short_throughput_history_is_right_aligned_and_scaled() {
     let mut model = NetworkModel::default();
     model.absorb_frame(&frame(1, &[1]));
     model.absorb_frame(&frame(2, &[1]));
+    let mut history = TelemetryHistory::default();
+    for tick in 0..3_u64 {
+        history.push(
+            &thegn_metrics::StatsSnapshot {
+                net_bps: Some((10_000 + tick * 2_000, 5_000 + tick * 1_000)),
+                ..thegn_metrics::StatsSnapshot::default()
+            },
+            1_000 + tick * 1_000,
+        );
+    }
+    model.absorb_history(&history, Window::from_secs(10), ScaleMode::Window, 4_000);
     let view = NetworkView(&model);
     let area = Rect::full(100, 30);
     let throughput = Board::default()
@@ -346,6 +376,12 @@ fn snapshots_cover_view_sizes_capabilities_and_static_demand() {
     for tick in 1..121_u16 {
         model.absorb_frame(&frame(tick, &ids));
     }
+    model.absorb_history(
+        &telemetry_history(),
+        Window::from_secs(120),
+        ScaleMode::Window,
+        121_000,
+    );
     let view = NetworkView(&model);
     for (cols, rows) in sizes {
         for (unicode, depth) in levels {
@@ -377,9 +413,9 @@ fn snapshots_cover_view_sizes_capabilities_and_static_demand() {
             }
             if cols == 240 {
                 let fill = fill_ratio(&surface, Rect::full(cols, rows));
-                // density follow-up (batch 49): measured 0.17
+                // density follow-up (batch 50): estimated, primary sets from the printed value
                 assert!(
-                    fill >= 0.17,
+                    fill >= 0.30,
                     "fill ratio {fill:.3} at {cols}x{rows} {unicode:?}/{depth:?}"
                 );
             }

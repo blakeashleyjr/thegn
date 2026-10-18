@@ -471,6 +471,7 @@ pub struct MonitorOverlay {
     overview: tabs::overview::OverviewModel,
     cpu: tabs::cpu::view::CpuModel,
     power: tabs::power::view::PowerModel,
+    network: tabs::network::view::NetworkModel,
     memory: tabs::memory::view::MemoryModel,
 }
 
@@ -532,6 +533,7 @@ impl MonitorOverlay {
             overview: tabs::overview::OverviewModel::default(),
             cpu: tabs::cpu::view::CpuModel::default(),
             power: tabs::power::view::PowerModel::default(),
+            network: tabs::network::view::NetworkModel::default(),
             memory: tabs::memory::view::MemoryModel::default(),
         };
         ov.rebuild(model, ctx, false);
@@ -613,6 +615,9 @@ impl MonitorOverlay {
             MonitorTab::Power => {
                 board::ActiveView::Power(tabs::power::view::PowerView(&self.power))
             }
+            MonitorTab::Network => {
+                board::ActiveView::Network(tabs::network::view::NetworkView(&self.network))
+            }
             MonitorTab::Memory => {
                 board::ActiveView::Memory(tabs::memory::view::MemoryView(&self.memory))
             }
@@ -632,6 +637,10 @@ impl MonitorOverlay {
         }
         if self.tab == MonitorTab::Power {
             self.power.absorb_frame(frame);
+            return true;
+        }
+        if self.tab == MonitorTab::Network {
+            self.network.absorb_frame(frame);
             return true;
         }
         if self.tab == MonitorTab::Memory {
@@ -674,6 +683,11 @@ impl MonitorOverlay {
         if !self.paused && self.tab == MonitorTab::Power {
             let prefs = self.prefs.tab(MonitorTab::Power);
             self.power
+                .absorb_history(ctx.hist, prefs.window, prefs.scale, now);
+        }
+        if !self.paused && self.tab == MonitorTab::Network {
+            let prefs = self.prefs.tab(MonitorTab::Network);
+            self.network
                 .absorb_history(ctx.hist, prefs.window, prefs.scale, now);
         }
         if !self.paused && self.tab == MonitorTab::Overview {
