@@ -178,13 +178,15 @@ gives the reason; it does not prompt.
 
 ## GPU
 
-The GPU tab has device, engine, memory, and clocks panels. Engine busy history,
-VRAM/GTT use, clock level, and power against its reported cap are plotted on
-their labelled 0–100% scales when readings are available. A runtime-suspended
-card is not woken to sample it; its values are shown as unavailable rather than
-zero. On APUs, GPU memory is shared system memory and is labelled `gpu mem
-(shared)`. The GPU masthead chip expands into this tab. When several cards are
-available, it shows the busiest awake card.
+On AMDGPU, the GPU tab has device, engine, memory, and clocks panels. Engine
+busy history, VRAM/GTT use, clock level, and power against its reported cap are
+plotted on their labelled 0–100% scales when readings are available. A runtime-
+suspended card is not woken to sample it; its values are shown as unavailable
+rather than zero. On APUs, shared memory is labelled `shared vram`.
+
+On NVIDIA and Intel, the tab keeps the legacy GPU readings because this board's
+engine counters are AMDGPU-only. The GPU masthead chip expands into the tab. When
+several cards are available, it shows the busiest awake card.
 
 On NVIDIA, the masthead uses NVML in process when `libnvidia-ml.so.1` is
 installed; otherwise it reads through `nvidia-smi`.

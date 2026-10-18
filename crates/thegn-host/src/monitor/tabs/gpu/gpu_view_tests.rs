@@ -46,9 +46,9 @@ fn fixture(tick: u32, kind: GpuKind, status: RuntimeStatus) -> MonitorFrame {
         } else {
             (tick % 13) as u8
         }),
-        vram_used: Some(300 * 1024 * 1024 + u64::from(tick) * 1024 * 1024),
+        vram_used: Some(300 * 1024 * 1024 + u64::from(tick % 150) * 1024 * 1024),
         vram_total: Some(512 * 1024 * 1024),
-        gtt_used: Some(3 * 1024 * 1024 * 1024 + u64::from(tick) * 2 * 1024 * 1024),
+        gtt_used: Some(3 * 1024 * 1024 * 1024 + u64::from(tick % 150) * 2 * 1024 * 1024),
         gtt_total: Some(46 * 1024 * 1024 * 1024),
         sclk: DpmLevels {
             levels_mhz: [600, 764, 2900, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
@@ -66,8 +66,8 @@ fn fixture(tick: u32, kind: GpuKind, status: RuntimeStatus) -> MonitorFrame {
         },
     });
     let metrics = GpuMetrics {
-        power_socket: Some(17_300 + tick * 100),
-        power_stapm_limit: Some(28_000),
+        power_socket: Some(12_000 + (tick % 60) * 150),
+        power_current_stapm_limit: Some(28),
         temperature_gfx: Some(8_000 + (tick % 7) as u16 * 100),
         ..GpuMetrics::default()
     };
@@ -83,6 +83,21 @@ fn fixture(tick: u32, kind: GpuKind, status: RuntimeStatus) -> MonitorFrame {
     frame.health[CollectorId::GpuEngines.index()] = Health::Ok;
     frame.health[CollectorId::AmdSmu.index()] = Health::Ok;
     frame
+}
+
+#[test]
+fn power_history_normalizes_milliwatts_against_watt_limit() {
+    let mut model = GpuModel::default();
+    let mut sample = fixture(0, GpuKind::Apu, RuntimeStatus::Active);
+    sample.parts.amd_smu.cards[0].metrics.power_socket = Some(17_300);
+    sample.parts.amd_smu.cards[0]
+        .metrics
+        .power_current_stapm_limit = Some(28);
+    model.absorb_frame(&sample);
+
+    let history = &model.histories[0];
+    let latest = history.power[(history.power_next + HISTORY_CAP - 1) % HISTORY_CAP];
+    assert!((latest - 0.62).abs() < 0.01);
 }
 
 fn text(surface: &Surface) -> String {
@@ -237,6 +252,7 @@ fn apu_and_dgpu_memory_labels_are_distinct_and_demand_is_panel_static() {
     let clocks_demand = view.demand(clocks_panel.id);
     expected = thegn_metrics::collect::CollectorSet::empty();
     expected.insert(CollectorId::GpuEngines);
+    expected.insert(CollectorId::GpuDevices);
     expected.insert(CollectorId::AmdSmu);
     assert_eq!(clocks_demand, expected);
     assert!(!placed.is_empty());

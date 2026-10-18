@@ -283,15 +283,18 @@ impl GpuModel {
                         .map(|reading| &reading.metrics)
                 });
                 if let Some(metrics) = metrics
-                    && let (Some(watts), Some(cap)) =
-                        (metrics.power_socket, metrics.power_stapm_limit)
-                    && cap > 0
+                    && let (Some(watts_mw), Some(cap_w)) = (
+                        metrics.power_socket,
+                        metrics
+                            .power_current_stapm_limit
+                            .filter(|watts| *watts > 0 && *watts != u32::MAX),
+                    )
                 {
                     BusyHistory::push_ring(
                         &mut history.power,
                         &mut history.power_next,
                         &mut history.power_len,
-                        (watts as f32 / cap as f32).clamp(0.0, 1.0),
+                        (watts_mw as f32 / (cap_w as f32 * 1000.0)).clamp(0.0, 1.0),
                     );
                 }
             }
@@ -347,6 +350,7 @@ impl TabView for GpuView<'_> {
             }
             CLOCKS => {
                 demand.insert(CollectorId::GpuEngines);
+                demand.insert(CollectorId::GpuDevices);
                 demand.insert(CollectorId::AmdSmu);
             }
             _ => {}
