@@ -309,13 +309,15 @@ impl ThermalModel {
                 .then_with(|| left.key.cmp(&right.key))
         });
 
-        let package_key = self.package().map(|sensor| sensor.key.as_str());
-        if package_key != self.package_history_key.as_deref() {
+        let (package_key, package_temp) = self.package().map_or((None, None), |sensor| {
+            (Some(sensor.key.clone()), sensor.temp_c)
+        });
+        if package_key.as_deref() != self.package_history_key.as_deref() {
             self.package_history_len = 0;
             self.package_history_next = 0;
-            self.package_history_key = package_key.map(str::to_owned);
+            self.package_history_key = package_key;
         }
-        if let Some(temp) = self.package().and_then(|sensor| sensor.temp_c) {
+        if let Some(temp) = package_temp {
             self.package_history[self.package_history_next] = temp;
             self.package_history_next = (self.package_history_next + 1) % HISTORY_CAP;
             self.package_history_len = self.package_history_len.saturating_add(1).min(HISTORY_CAP);
