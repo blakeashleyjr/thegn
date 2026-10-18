@@ -797,7 +797,9 @@ impl TabView for DiskView<'_> {
                             );
                         }
                         let format_peak = |values: &[f32], peak: f32| {
-                            if values.iter().any(|value| value.is_finite()) {
+                            if matches!(self.model.disk_health, Health::Warming) {
+                                crate::caps::active_glyphs().ellipsis.into()
+                            } else if values.iter().any(|value| value.is_finite()) {
                                 format!(
                                     "{}/s",
                                     crate::monitor::kit::edge_fmt(NumFmt::default()).fmt(
