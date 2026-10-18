@@ -470,6 +470,7 @@ pub struct MonitorOverlay {
     board: board::Board,
     overview: tabs::overview::OverviewModel,
     cpu: tabs::cpu::view::CpuModel,
+    power: tabs::power::view::PowerModel,
     memory: tabs::memory::view::MemoryModel,
 }
 
@@ -530,6 +531,7 @@ impl MonitorOverlay {
             board: board::Board::default(),
             overview: tabs::overview::OverviewModel::default(),
             cpu: tabs::cpu::view::CpuModel::default(),
+            power: tabs::power::view::PowerModel::default(),
             memory: tabs::memory::view::MemoryModel::default(),
         };
         ov.rebuild(model, ctx, false);
@@ -608,6 +610,9 @@ impl MonitorOverlay {
     fn view(&self) -> board::ActiveView<'_> {
         match self.tab {
             MonitorTab::Cpu => board::ActiveView::Cpu(tabs::cpu::view::CpuView(&self.cpu)),
+            MonitorTab::Power => {
+                board::ActiveView::Power(tabs::power::view::PowerView(&self.power))
+            }
             MonitorTab::Memory => {
                 board::ActiveView::Memory(tabs::memory::view::MemoryView(&self.memory))
             }
@@ -623,6 +628,10 @@ impl MonitorOverlay {
         }
         if self.tab == MonitorTab::Cpu {
             self.cpu.absorb_frame(frame);
+            return true;
+        }
+        if self.tab == MonitorTab::Power {
+            self.power.absorb_frame(frame);
             return true;
         }
         if self.tab == MonitorTab::Memory {
@@ -660,6 +669,11 @@ impl MonitorOverlay {
         if !self.paused && self.tab == MonitorTab::Cpu {
             let prefs = self.prefs.tab(MonitorTab::Cpu);
             self.cpu
+                .absorb_history(ctx.hist, prefs.window, prefs.scale, now);
+        }
+        if !self.paused && self.tab == MonitorTab::Power {
+            let prefs = self.prefs.tab(MonitorTab::Power);
+            self.power
                 .absorb_history(ctx.hist, prefs.window, prefs.scale, now);
         }
         if !self.paused && self.tab == MonitorTab::Overview {
