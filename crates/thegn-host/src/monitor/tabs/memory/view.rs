@@ -14,6 +14,7 @@ use thegn_core::{
     mem_health::{self, MemHealth, MemHealthInput, Reason, Verdict},
     numfmt::{NumFmt, Reading, Unit},
     theme::{RampId, SeriesRole, StateRole},
+    viz_raster::{self, CellBuf},
 };
 use thegn_metrics::collect::{
     CollectorId, CollectorSet, frame::MonitorFrame, parse::meminfo::MemField,
@@ -49,6 +50,7 @@ const PAGING_VARIANTS: [Variant; 1] = [Variant {
     min: (36, 8),
     pref: (72, 9),
 }];
+const HISTORY_CAPACITY: usize = 120;
 const SPECS: [PanelSpec; 5] = [
     PanelSpec {
         id: COMPOSITION,
@@ -109,7 +111,45 @@ pub(in crate::monitor) struct MemoryModel {
     pub psi_some_avg60: Option<f64>,
     pub psi_full_avg10: Option<f64>,
     pub psi_full_avg60: Option<f64>,
+    psi_history: MemoryHistory,
+    used_history: MemoryHistory,
     pub health: MemHealth,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+struct MemoryHistory {
+    values: [f32; HISTORY_CAPACITY],
+    next: usize,
+    len: usize,
+}
+
+impl Default for MemoryHistory {
+    fn default() -> Self {
+        Self {
+            values: [0.0; HISTORY_CAPACITY],
+            next: 0,
+            len: 0,
+        }
+    }
+}
+
+impl MemoryHistory {
+    fn push(&mut self, value: f32) {
+        self.values[self.next] = value;
+        self.next = (self.next + 1) % HISTORY_CAPACITY;
+        self.len = self.len.saturating_add(1).min(HISTORY_CAPACITY);
+    }
+
+    fn copy_recent(&self, out: &mut [f32; HISTORY_CAPACITY]) -> (usize, f32) {
+        let start = (self.next + HISTORY_CAPACITY - self.len) % HISTORY_CAPACITY;
+        let mut peak = 0.0_f32;
+        for (offset, slot) in out.iter_mut().take(self.len).enumerate() {
+            let index = (start + offset) % HISTORY_CAPACITY;
+            *slot = self.values[index];
+            peak = peak.max(*slot);
+        }
+        (self.len, peak)
+    }
 }
 
 impl Default for MemoryModel {
@@ -145,6 +185,8 @@ impl Default for MemoryModel {
             psi_some_avg60: None,
             psi_full_avg10: None,
             psi_full_avg60: None,
+            psi_history: MemoryHistory::default(),
+            used_history: MemoryHistory::default(),
             health: mem_health::evaluate(&MemHealthInput::default()),
         }
     }
@@ -210,6 +252,17 @@ impl MemoryModel {
         self.psi_some_avg60 = psi.file.some.map(|line| f64::from(line.avg60) / 100.0);
         self.psi_full_avg10 = psi.file.full.map(|line| f64::from(line.avg10) / 100.0);
         self.psi_full_avg60 = psi.file.full.map(|line| f64::from(line.avg60) / 100.0);
+        if let (Some(some), Some(full)) = (self.psi_some_avg10, self.psi_full_avg10) {
+            self.psi_history.push((some + full) as f32);
+        }
+        if let Some((total, available)) = self
+            .total
+            .zip(self.available)
+            .filter(|(total, _)| *total > 0)
+        {
+            self.used_history
+                .push((total.saturating_sub(available)) as f32 / total as f32);
+        }
 
         let input = MemHealthInput {
             mem_total_bytes: self.total,
@@ -469,6 +522,52 @@ impl MemoryView<'_> {
                 fmt: NumFmt::default(),
             },
         );
+        self.paint_used_history(grid, body);
+    }
+
+    fn paint_used_history(&self, grid: &mut CellGrid, body: Rect) {
+        if self.0.used_history.len == 0 || body.rows < 4 || body.cols == 0 {
+            return;
+        }
+        let label_y = body.y.saturating_add(16);
+        if label_y >= body.y.saturating_add(body.rows) {
+            return;
+        }
+        grid.view(Rect {
+            x: body.x,
+            y: label_y,
+            cols: body.cols,
+            rows: 1,
+        })
+        .put_str(0, 0, "used / available history", Default::default());
+        let chart = Rect {
+            x: body.x,
+            y: label_y + 1,
+            cols: body.cols,
+            rows: body.y.saturating_add(body.rows).saturating_sub(label_y + 1),
+        };
+        if chart.rows == 0 {
+            return;
+        }
+        let mut used = [0.0_f32; HISTORY_CAPACITY];
+        let (len, _) = self.0.used_history.copy_recent(&mut used);
+        if len == 0 {
+            return;
+        }
+        let available = used.map(|value| 1.0 - value.clamp(0.0, 1.0));
+        let mut raster = CellBuf::new();
+        raster.reset(chart.cols, chart.rows);
+        viz_raster::stacked(
+            &[&used[..len], &available[..len]],
+            viz_raster::RasterTable::for_level(crate::caps::unicode_level()),
+            &mut raster,
+        );
+        draw_raster(
+            grid,
+            chart,
+            &raster,
+            RasterStyle::Series(&[SeriesRole::MemAnon, SeriesRole::MemFree]),
+        );
     }
 
     fn paint_verdict(&self, grid: &mut CellGrid, body: Rect) {
@@ -566,6 +665,51 @@ impl MemoryView<'_> {
             })
             .put_str(0, 0, &avg60, Default::default());
         }
+        self.paint_psi_history(grid, body);
+    }
+
+    fn paint_psi_history(&self, grid: &mut CellGrid, body: Rect) {
+        if self.0.psi_history.len == 0 || body.rows < 8 || body.cols == 0 {
+            return;
+        }
+        let label_y = body.y.saturating_add(5);
+        if label_y >= body.y.saturating_add(body.rows) {
+            return;
+        }
+        let mut values = [0.0_f32; HISTORY_CAPACITY];
+        let (len, peak) = self.0.psi_history.copy_recent(&mut values);
+        if len == 0 {
+            return;
+        }
+        let scale = if peak > 0.0 { peak * 1.1 } else { 1.0 };
+        for value in values.iter_mut().take(len) {
+            *value = (*value / scale).clamp(0.0, 1.0);
+        }
+        let label = format!("some + full PSI history (window peak {peak:.2}%)");
+        grid.view(Rect {
+            x: body.x,
+            y: label_y,
+            cols: body.cols,
+            rows: 1,
+        })
+        .put_str(0, 0, &label, Default::default());
+        let chart = Rect {
+            x: body.x,
+            y: label_y + 1,
+            cols: body.cols,
+            rows: body.y.saturating_add(body.rows).saturating_sub(label_y + 1),
+        };
+        if chart.rows == 0 {
+            return;
+        }
+        let mut raster = CellBuf::new();
+        raster.reset(chart.cols, chart.rows);
+        viz_raster::area(
+            &values[..len],
+            viz_raster::RasterTable::for_level(crate::caps::unicode_level()),
+            &mut raster,
+        );
+        draw_raster(grid, chart, &raster, RasterStyle::Ramp(RampId::Mem));
     }
 
     fn paint_swap(&self, grid: &mut CellGrid, body: Rect) {
@@ -677,6 +821,55 @@ impl MemoryView<'_> {
                 fmt: NumFmt::default(),
             },
         );
+    }
+}
+
+#[derive(Clone, Copy)]
+enum RasterStyle<'a> {
+    Series(&'a [SeriesRole]),
+    Ramp(RampId),
+}
+
+fn draw_raster(grid: &mut CellGrid, rect: Rect, raster: &CellBuf, style: RasterStyle<'_>) {
+    for y in 0..rect.rows.min(raster.height()) {
+        for x in 0..rect.cols.min(raster.width()) {
+            let cell = raster.row(y)[x];
+            let (fg, bg) = match style {
+                RasterStyle::Series(roles) => (
+                    roles
+                        .get(usize::from(cell.fg))
+                        .copied()
+                        .map(Tok::Series)
+                        .and_then(StyleTok::from_tok)
+                        .unwrap_or(StyleTok::INHERIT),
+                    cell.bg
+                        .and_then(|index| roles.get(usize::from(index)).copied())
+                        .map(Tok::Series)
+                        .and_then(StyleTok::from_tok)
+                        .unwrap_or(StyleTok::INHERIT),
+                ),
+                RasterStyle::Ramp(ramp) => (
+                    StyleTok::from_tok(Tok::Ramp(ramp, cell.fg)).unwrap_or(StyleTok::INHERIT),
+                    StyleTok::INHERIT,
+                ),
+            };
+            grid.view(Rect {
+                x: rect.x + x,
+                y: rect.y + y,
+                cols: 1,
+                rows: 1,
+            })
+            .put(
+                0,
+                0,
+                crate::monitor::kit::grid::CellStyle {
+                    ch: cell.ch,
+                    fg,
+                    bg,
+                    ..Default::default()
+                },
+            );
+        }
     }
 }
 
