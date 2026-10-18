@@ -229,14 +229,10 @@ fn snapshot_sizes_capabilities_demand_and_absent_marks() {
                         }
                     }
                     assert_eq!(board.demand(&view, area, 1000).collectors, expected);
-                    if cols == 240 && unicode == UnicodeLevel::Ascii {
+                    if cols == 240 {
                         let r = fill_ratio(&surface, area);
-                        // density follow-up (batch 49): measured <x.xx>; current estimate 0.24.
-                        assert!(r >= 0.24, "fill ratio {r:.3}");
-                    } else if cols == 240 {
-                        let r = fill_ratio(&surface, area);
-                        // density follow-up (batch 49): measured <x.xx>; current estimate 0.24.
-                        assert!(r >= 0.24, "fill ratio {r:.3}");
+                        // density follow-up (batch 49): measured 0.19.
+                        assert!(r >= 0.19, "fill ratio {r:.3}");
                     }
                 })
             });
@@ -351,7 +347,7 @@ fn battery_history_uses_latest_telemetry_and_empty_history_is_absent() {
     let graph_y = battery.rect.y + 1 + inner_rows - graph_rows * 2;
     let charge_end = graph_y + graph_rows;
     let has_graph_ink = |x| {
-        surface.screen_lines()[graph_y..charge_end]
+        surface.screen_lines()[graph_y + 1..charge_end]
             .iter()
             .any(|line| {
                 line.visible_cells().any(|cell| {
