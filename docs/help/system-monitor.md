@@ -147,10 +147,13 @@ monitor. The temperature masthead chip expands into this tab.
 
 ## Network
 
-The Network tab graphs receive and transmit rates and lists interfaces with
-kind, state, and rates. Totals count physical links only, so VPN traffic is not
-double-counted; an “all links” row appears when that total differs from the
-physical-link total. The network masthead chip expands into this tab.
+The Network board has separate panels for mirrored receive/transmit throughput,
+interfaces, and error/drop health. The throughput plot uses telemetry history;
+the interface sparklines use the sampled per-interface rings. Totals count
+physical links only, so VPN traffic is not double-counted. Interface rows keep
+idle and down links visible, and fold interfaces beyond the eight history slots
+into `other`. Use `f`/`F` to focus a panel, `z` to zoom it, and `Esc` to step
+back through focus and zoom. The network masthead chip expands into this tab.
 
 ## Disk
 
