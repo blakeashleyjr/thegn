@@ -10,6 +10,10 @@ use thegn_core::viz::Unit;
 
 pub(in crate::monitor) mod view;
 
+#[cfg(test)]
+#[path = "thermal/thermal_wire_tests.rs"]
+mod wire_tests;
+
 pub(in crate::monitor) fn thermal(cx: &Ctx) -> Vec<Section> {
     let s = &cx.model.stats;
     let mut out = Vec::new();
