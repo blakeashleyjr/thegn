@@ -228,6 +228,7 @@ fn row(
         pid,
         ppid,
         start_time: 1_767_268_800,
+        start_ticks: None,
         name: name.to_string(),
         cpu_pct: cpu,
         rss_bytes: rss,

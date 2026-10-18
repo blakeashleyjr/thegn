@@ -833,7 +833,13 @@ pub(crate) fn pool_target_adjust(
     waker: &termwiz::terminal::TerminalWaker,
 ) -> Option<String> {
     let g = session.active_group().filter(|g| !g.path.is_empty())?;
-    crate::run::run_pending_db::queue_pool_target_adjust(tx, waker, cfg.clone(), g.path.clone(), delta);
+    crate::run::run_pending_db::queue_pool_target_adjust(
+        tx,
+        waker,
+        cfg.clone(),
+        g.path.clone(),
+        delta,
+    );
     Some("warm pool: updating target…".into())
 }
 

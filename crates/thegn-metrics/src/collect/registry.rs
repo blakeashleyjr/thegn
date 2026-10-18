@@ -169,6 +169,7 @@ fn copy_part(target: &mut Parts, source: &Parts, id: CollectorId) {
         CollectorId::Netdev => target.netdev.clone_from(&source.netdev),
         CollectorId::Diskstats => target.diskstats.clone_from(&source.diskstats),
         CollectorId::Powercap => target.powercap.clone_from(&source.powercap),
+        CollectorId::PowerSupply => target.power_supply.clone_from(&source.power_supply),
     }
 }
 
@@ -357,7 +358,11 @@ mod tests {
             }
         );
         assert_eq!(registry.rollup().failing, 1);
-        assert_eq!(registry.rollup().absent, 12);
+        // Every collector except the Ok Loadavg and the failing Uptime.
+        assert_eq!(
+            registry.rollup().absent as usize,
+            CollectorId::ALL.len() - 2
+        );
     }
 
     struct WritesThenFails(u8);
