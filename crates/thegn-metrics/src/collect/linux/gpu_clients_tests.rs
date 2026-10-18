@@ -9,7 +9,6 @@ use crate::collect::{
     schedule::Mode,
 };
 use std::{
-    collections::BTreeMap,
     io,
     sync::{Arc, Mutex},
 };
@@ -19,7 +18,7 @@ struct FakeState {
     pids: Vec<u32>,
     start: u64,
     reads: usize,
-    fdinfo_reads: BTreeMap<u32, usize>,
+    busy_ns: u64,
 }
 
 #[derive(Clone, Default)]
@@ -68,9 +67,7 @@ impl FdFs for FakeFdFs {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         state.reads += 1;
-        let reads = state.fdinfo_reads.entry(pid).or_default();
-        *reads += 1;
-        let amount = *reads as u64 * 10_000_000;
+        let amount = state.busy_ns;
         out.clear();
         out.extend_from_slice(
             format!("drm-pdev:\t0000:03:00.0\ndrm-client-id:\t{}\ndrm-engine-gfx:\t{} ns\ndrm-resident-vram:\t4 KiB\n", pid, amount).as_bytes(),
@@ -91,7 +88,9 @@ fn collector_publishes_two_clients_and_primes_then_reports_engine_deltas() {
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
         state.pids = vec![41, 42];
         state.start = 900;
+        state.busy_ns = 10_000_000;
     }
+    let fs_state = fs.0.clone();
     let mut collector = GpuClientsCollector::at(fs, &dri);
     assert_eq!(collector.discover(&Env::default()), Health::Warming);
     let mut frame = MonitorFrame::default();
@@ -105,6 +104,10 @@ fn collector_publishes_two_clients_and_primes_then_reports_engine_deltas() {
         )
         .unwrap();
     assert_eq!(frame.parts.gpu_clients.clients.len(), 2);
+    fs_state
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .busy_ns = 20_000_000;
     assert!(
         frame
             .parts
@@ -123,10 +126,76 @@ fn collector_publishes_two_clients_and_primes_then_reports_engine_deltas() {
         )
         .unwrap();
     assert_eq!(frame.parts.gpu_clients.clients.len(), 2);
-    assert!(frame.parts.gpu_clients.clients.iter().all(|row| {
-        row.engine_busy_pct[0].is_some_and(|percent| (percent - 10.0).abs() < 0.001)
-            && row.memory_resident == Some(4096)
-    }));
+    for row in &frame.parts.gpu_clients.clients {
+        assert!(matches!(row.pid, 41 | 42));
+        assert!(row.engine_busy_pct[0].is_some_and(|percent| (percent - 10.0).abs() < 0.001));
+        assert_eq!(row.memory_resident, Some(4096));
+    }
+    assert_eq!(
+        frame
+            .parts
+            .gpu_clients
+            .clients
+            .iter()
+            .map(|row| row.pid)
+            .collect::<Vec<_>>(),
+        vec![41, 42]
+    );
+}
+
+#[test]
+fn memory_parser_converts_mib_and_reads_drm_total_regions() {
+    let fdinfo =
+        b"drm-resident-vram: 2 MiB\ndrm-resident-gtt: invalid KiB\ndrm-total-vram: 3 MiB\n";
+    assert_eq!(super::memory_resident(fdinfo), Some(2 * 1024 * 1024));
+    assert_eq!(super::memory_total(fdinfo), Some(3 * 1024 * 1024));
+    let legacy = b"drm-memory-vram: 2 KiB\ndrm-memory-gtt: 3 KiB\n";
+    assert_eq!(super::memory_resident(legacy), Some(5 * 1024));
+    assert_eq!(super::memory_total(legacy), None);
+}
+
+#[test]
+fn close_clears_scanner_client_state() {
+    let root = tempfile::tempdir().unwrap();
+    let dri = root.path().join("dri");
+    std::fs::create_dir(&dri).unwrap();
+    let fs = FakeFdFs::default();
+    {
+        let mut state =
+            fs.0.lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.pids = vec![41];
+        state.start = 900;
+    }
+    let mut collector = GpuClientsCollector::at(fs, &dri);
+    assert_eq!(collector.discover(&Env::default()), Health::Warming);
+    collector
+        .sample(
+            &TickCtx {
+                tick: 1,
+                now_ms: 100,
+            },
+            &mut MonitorFrame::default(),
+        )
+        .unwrap();
+    assert_eq!(
+        collector
+            .scanner
+            .as_ref()
+            .expect("injected scanner")
+            .clients()
+            .len(),
+        1
+    );
+    collector.close();
+    assert!(
+        collector
+            .scanner
+            .as_ref()
+            .expect("injected scanner")
+            .clients()
+            .is_empty()
+    );
 }
 
 #[test]
