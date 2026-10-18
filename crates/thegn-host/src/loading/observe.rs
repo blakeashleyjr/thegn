@@ -58,6 +58,12 @@ impl MaterializeObserver {
     pub(crate) fn on_event(&mut self, ev: SandboxPhase) -> Vec<LoadStep> {
         match ev {
             SandboxPhase::Resolve => {
+                // A later resolve means the caller is trying the next backend.
+                // A failed create was one candidate attempt, not the final
+                // provisioning result; remove it so the splash doesn't claim
+                // the fallback backend successfully created that container.
+                self.steps
+                    .retain(|s| !(s.kind == StepKind::Create && s.state == StepState::Failed));
                 self.upsert(StepKind::Resolve, "sandbox".to_string());
             }
             SandboxPhase::ResolveProbe { backend } => {
@@ -398,5 +404,37 @@ mod tests {
             1,
             "never two spinners"
         );
+    }
+
+    #[test]
+    fn failed_backend_row_is_removed_when_fallback_resolves() {
+        let mut observer = MaterializeObserver::new();
+        let events = [
+            SandboxPhase::Resolve,
+            SandboxPhase::ResolveProbe {
+                backend: "podman-rootless".into(),
+            },
+            SandboxPhase::ContainerCreate { backend: "podman" },
+            SandboxPhase::PhaseFailed {
+                err: "could not start podman container".into(),
+            },
+            SandboxPhase::Resolve,
+            SandboxPhase::ResolveProbe {
+                backend: "bwrap".into(),
+            },
+            SandboxPhase::PhaseDone,
+        ];
+        let mut steps = Vec::new();
+        for event in events {
+            steps = observer.on_event(event);
+        }
+
+        assert!(
+            steps
+                .iter()
+                .filter(|step| step.kind != StepKind::Shell)
+                .all(|step| step.state == StepState::Done)
+        );
+        assert!(steps.iter().all(|step| step.label != "container (podman)"));
     }
 }
