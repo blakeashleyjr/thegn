@@ -388,8 +388,13 @@ impl GpuView<'_> {
                 return;
             };
             if history.len > 0 && body.rows >= 3 && body.cols >= 12 {
+                let mut vcn = [0.0_f32; HISTORY_CAP];
+                let vcn_len = history.ordered_vcn_into(&mut vcn);
                 let activity_count = history.activity.iter().filter(|ring| ring.len > 0).count();
-                let activity_rows = activity_count.min(body.rows.saturating_sub(2));
+                let activity_rows = activity_count.min(
+                    body.rows
+                        .saturating_sub(2 + if vcn_len > 0 { 1 } else { 0 }),
+                );
                 let mut values = [0.0_f32; HISTORY_CAP];
                 let len = history.ordered_into(&mut values);
                 let graph_rect = crate::monitor::kit::history_rect::graph_rect(
@@ -408,8 +413,6 @@ impl GpuView<'_> {
                     graph_rect,
                     surface,
                 );
-                let mut vcn = [0.0_f32; HISTORY_CAP];
-                let vcn_len = history.ordered_vcn_into(&mut vcn);
                 if vcn_len > 0 {
                     let graph_y = rect.y + body.y + body.rows - 1;
                     let mut label = CellGrid::new(5, 1);
@@ -453,12 +456,16 @@ impl GpuView<'_> {
                 .iter()
                 .find(|item| item.slot == engine.slot.as_str())
         {
+            let vcn_len = history.vcn_len;
             let activity_rows = history
                 .activity
                 .iter()
                 .filter(|ring| ring.len > 0)
                 .count()
-                .min(body.rows.saturating_sub(2));
+                .min(
+                    body.rows
+                        .saturating_sub(2 + if vcn_len > 0 { 1 } else { 0 }),
+                );
             output_row = body.rows.saturating_sub(1 + activity_rows);
         }
         for (device_index, engine) in self.0.engines.devices.iter().take(DEVICE_CAP).enumerate() {
@@ -476,8 +483,13 @@ impl GpuView<'_> {
             else {
                 continue;
             };
+            let activity_end = if self.0.engines.devices.len() == 1 && history.vcn_len > 0 {
+                body.rows.saturating_sub(1)
+            } else {
+                body.rows
+            };
             for (index, ring) in history.activity.iter().enumerate() {
-                if output_row >= body.rows {
+                if output_row >= activity_end {
                     break;
                 }
                 if ring.len == 0 {
