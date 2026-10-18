@@ -43,6 +43,7 @@ pub(crate) mod history;
 mod invalidation;
 mod kit;
 mod layout;
+mod procs_columns;
 pub(crate) mod procs_view;
 #[cfg(test)]
 mod snapshot;
