@@ -24,6 +24,7 @@ fn request(pane_pids: &[(u32, u32)]) -> ProcSampleRequest<'_> {
         self_pid: 99,
         daemon_pid: None,
         pane_pids,
+        primed: false,
     }
 }
 

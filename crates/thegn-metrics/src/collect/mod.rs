@@ -21,6 +21,8 @@ pub(crate) struct ProcSampleRequest<'a> {
     pub self_pid: u32,
     pub daemon_pid: Option<u32>,
     pub pane_pids: &'a [(u32, u32)],
+    /// Whether a previous pass exists (set by the sampler before projecting).
+    pub primed: bool,
 }
 pub mod model;
 pub mod parse;
