@@ -77,8 +77,8 @@ fn cached_palette_resolves_current_color_depth_on_each_paint() {
 }
 
 fn emit_shape(out: &mut GraphOut, values: &[f32], resolved: &Resolved) {
-    out.prepare(16, 1);
-    viz_raster::line(values, table(), &mut out.cells);
+    out.prepare(4, 1);
+    viz_raster::area(values, &viz_raster::RasterTable::FULL, &mut out.cells);
     out.emit(resolved);
 }
 
@@ -102,10 +102,10 @@ fn graph_run_strings_reuse_storage_after_run_count_falls_and_recovers() {
                 warn: 0.7,
                 crit: 0.9,
             },
-            ColorDepth::Truecolor,
+            ColorDepth::None,
         )
     });
-    let many = [0.0, 1.0, 0.0, 1.0, 0.0, 1.0, 0.0, 1.0];
+    let many = [0.0, 0.0, 1.0, 1.0, 0.0, 0.0, 1.0, 1.0];
     let few = [0.5; 8];
     let mut out = GraphOut::new();
     emit_shape(&mut out, &many, &resolved);
