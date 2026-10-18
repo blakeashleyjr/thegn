@@ -348,11 +348,15 @@ fn short_throughput_history_is_right_aligned_and_scaled() {
         .visible_cells()
         .find(|cell| cell.cell_index() == right_x)
         .expect("rightmost graph cell exists");
-    assert_eq!(
+    assert_ne!(
         cell.str(),
         "\u{2800}",
-        "trailing telemetry gap must stay blank"
+        "trailing telemetry gap must draw the held throughput value"
     );
+    let mut rx = [0.0; super::view::TELEMETRY_HISTORY];
+    let len = model.history_rx.copy_ordered(&mut rx);
+    assert!(len > 3);
+    assert_eq!(rx[len - 1], rx[len - 2]);
     let rendered = lines(&surface).join("\n");
     assert!(rendered.contains("window"));
     assert!(lines(&surface)[throughput.y + throughput.rows - 2].contains("tx"));
@@ -390,14 +394,12 @@ fn interior_telemetry_gap_keeps_its_bucket_position() {
         len, 360,
         "retained ring must preserve its span after leading gaps"
     );
-    assert!(
-        rx[120..240].iter().any(|value| value.is_nan()),
-        "interior gap lost"
-    );
+    assert!(rx[120..240].iter().all(|value| *value == 1.0 / 3.0));
     assert!(
         rx[240..].iter().any(|value| value.is_finite()),
         "later sample shifted away"
     );
+    assert!(rx[240..].iter().all(|value| *value == 1.0));
 }
 
 #[test]
