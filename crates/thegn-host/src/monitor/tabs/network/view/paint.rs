@@ -136,27 +136,84 @@ fn paint_throughput(grid: &mut CellGrid, body: Rect, model: &NetworkModel) {
     };
     let aligned = graph_rect(plot, rx_len.max(tx_len), braille);
     let mut canvas = grid.view(body);
-    let mut raster = thegn_core::viz_raster::CellBuf::new();
-    raster.reset(aligned.cols, graph_rows);
-    thegn_core::viz_raster::mirrored(
+    paint_mirrored_finite_runs(
         &rx[..rx_len],
-        &tx[..tx_len],
-        crate::monitor::graphs::table(),
-        &mut raster,
+        true,
+        aligned,
+        graph_rows,
+        body.x,
+        &mut canvas,
     );
-    for y in 0..graph_rows {
-        for x in 0..aligned.cols {
-            if let Some(cell) = raster.get(x, y) {
-                canvas.put(
-                    aligned.x.saturating_sub(body.x) + x,
-                    y + 1,
-                    CellStyle {
-                        ch: cell.ch,
-                        ..CellStyle::default()
-                    },
-                );
+    paint_mirrored_finite_runs(
+        &tx[..tx_len],
+        false,
+        aligned,
+        graph_rows,
+        body.x,
+        &mut canvas,
+    );
+}
+
+fn paint_mirrored_finite_runs(
+    values: &[f32],
+    upper: bool,
+    area: Rect,
+    rows: usize,
+    body_x: usize,
+    canvas: &mut crate::monitor::kit::grid::GridView<'_>,
+) {
+    let table = crate::monitor::graphs::table();
+    let mut start = 0;
+    while start < values.len() {
+        while start < values.len() && !values[start].is_finite() {
+            start += 1;
+        }
+        let mut end = start;
+        while end < values.len() && values[end].is_finite() {
+            end += 1;
+        }
+        if end > start {
+            let left = start * area.cols / values.len();
+            let right = (end * area.cols).div_ceil(values.len()).min(area.cols);
+            let width = right.saturating_sub(left);
+            if width > 0 {
+                let mut run = [0.0; TELEMETRY_HISTORY];
+                for (slot, value) in run.iter_mut().zip(&values[start..end]) {
+                    *slot = value.clamp(0.0, 1.0);
+                }
+                let zeros = [0.0; TELEMETRY_HISTORY];
+                let (up, down) = if upper {
+                    (&run[..end - start], &zeros[..end - start])
+                } else {
+                    (&zeros[..end - start], &run[..end - start])
+                };
+                let mut raster = thegn_core::viz_raster::CellBuf::new();
+                raster.reset(width, rows);
+                thegn_core::viz_raster::mirrored(up, down, table, &mut raster);
+                let upper_rows = rows.div_ceil(2);
+                for y in 0..rows {
+                    if (y < upper_rows) != upper {
+                        continue;
+                    }
+                    for x in 0..width {
+                        if let Some(cell) = raster.get(x, y)
+                            && cell.ch != table.cell_blank
+                            && cell.ch != table.blank
+                        {
+                            canvas.put(
+                                area.x.saturating_sub(body_x) + left + x,
+                                y + 1,
+                                CellStyle {
+                                    ch: cell.ch,
+                                    ..CellStyle::default()
+                                },
+                            );
+                        }
+                    }
+                }
             }
         }
+        start = end.max(start + 1);
     }
 }
 
@@ -482,7 +539,46 @@ fn paint_rate_history(ring: &super::Ring, peak: f32, rect: Rect, surface: &mut S
             *value = (*value / peak).clamp(0.0, 1.0);
         }
     }
-    crate::monitor::graphs::paint_sparkline(&values[..len], rect.cols, RampId::Rx, rect, surface);
+    paint_finite_spark_runs(&values[..len], rect, surface);
+}
+
+fn paint_finite_spark_runs(values: &[f32], area: Rect, surface: &mut Surface) {
+    let braille = crate::monitor::graphs::table().braille;
+    let aligned = graph_rect(area, values.len(), braille);
+    if values.is_empty() || aligned.cols == 0 {
+        return;
+    }
+    let mut start = 0;
+    while start < values.len() {
+        while start < values.len() && !values[start].is_finite() {
+            start += 1;
+        }
+        let mut end = start;
+        while end < values.len() && values[end].is_finite() {
+            end += 1;
+        }
+        if end > start {
+            let left = start * aligned.cols / values.len();
+            let right = (end * aligned.cols)
+                .div_ceil(values.len())
+                .min(aligned.cols);
+            let cols = right.saturating_sub(left);
+            if cols > 0 {
+                crate::monitor::graphs::paint_sparkline(
+                    &values[start..end],
+                    cols,
+                    RampId::Rx,
+                    Rect {
+                        x: aligned.x + left,
+                        cols,
+                        ..area
+                    },
+                    surface,
+                );
+            }
+        }
+        start = end.max(start + 1);
+    }
 }
 
 fn health_mark(health: thegn_metrics::collect::health::Health) -> &'static str {
@@ -631,19 +727,15 @@ fn paint_interface_spark(
     available_cols: usize,
     surface: &mut Surface,
 ) {
-    let mut values = [0.0; IFACE_HISTORY];
+    let mut values = [f32::NAN; IFACE_HISTORY];
     let len = ring.copy_ordered(&mut values);
     for value in values.iter_mut().take(len) {
-        *value = if value.is_finite() {
-            (*value / peak).clamp(0.0, 1.0)
-        } else {
-            0.0
-        };
+        if value.is_finite() {
+            *value = (*value / peak).clamp(0.0, 1.0);
+        }
     }
-    crate::monitor::graphs::paint_sparkline(
+    paint_finite_spark_runs(
         &values[..len],
-        SPARK_SERIES_WIDTH,
-        RampId::Rx,
         Rect {
             x,
             y,

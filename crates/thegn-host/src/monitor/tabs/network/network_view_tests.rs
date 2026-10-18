@@ -293,7 +293,8 @@ fn wifi_panel_shows_ssid_masked_bssid_and_signal_without_raw_mac() {
         "connected time missing: {rendered}"
     );
     assert!(placed.rows > 0);
-    let newest = surface.screen_lines()[placed.y + 2]
+    let screen_lines = surface.screen_lines();
+    let newest = screen_lines[placed.y + 2]
         .visible_cells()
         .find(|cell| cell.cell_index() == placed.x + placed.cols - 2)
         .expect("Wi-Fi sparkline reaches its last inner column");
@@ -419,7 +420,8 @@ fn wifi_signal_ring_stays_warm_after_one_thousand_absorbs() {
     caps::test_override::with_unicode(UnicodeLevel::Full, || {
         Board::default().paint(&view, &mut surface, Rect::full(240, 60), 0, &[]);
     });
-    let newest = surface.screen_lines()[wifi.y + 2]
+    let screen_lines = surface.screen_lines();
+    let newest = screen_lines[wifi.y + 2]
         .visible_cells()
         .find(|cell| cell.cell_index() == wifi.x + wifi.cols - 2)
         .expect("newest Wi-Fi sample occupies the last inner column");
