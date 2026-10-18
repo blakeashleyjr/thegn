@@ -280,7 +280,7 @@ mod tests {
         assert_eq!(part.totals[Scope::Physical.index()].rx_bps, Some(100.0));
         assert_eq!(part.totals[Scope::Vpn.index()].rx_bps, Some(60.0));
         assert_eq!(part.all.rx_bps, Some(160.0));
-        assert_ne!(part.totals[ScopeIndex::PHYSICAL], part.all);
+        assert_ne!(part.totals[Scope::Physical.index()], part.all);
         assert!(part.ifaces.iter().any(|row| row.name.as_str() == "enp95s0"
             && row.scope == Scope::Physical
             && row.rx_bps == Some(0.0)));
