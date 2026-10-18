@@ -101,6 +101,14 @@ impl Ring {
         self.len = self.len.saturating_add(1).min(HISTORY_CAP);
     }
 
+    fn push_held(&mut self) {
+        let mut ordered = [f32::NAN; HISTORY_CAP];
+        let len = self.ordered(&mut ordered);
+        if let Some(value) = ordered[..len].iter().rev().find(|value| value.is_finite()) {
+            self.push(*value);
+        }
+    }
+
     fn ordered(&self, out: &mut [f32; HISTORY_CAP]) -> usize {
         let start = (self.next + HISTORY_CAP - self.len) % HISTORY_CAP;
         for (offset, slot) in out.iter_mut().take(self.len).enumerate() {
@@ -264,6 +272,7 @@ impl ContainersModel {
                         .cmp(&self.slots[*right].id.as_deref())
                 })
         });
+        let has_gap = part.rows.iter().any(|row| row.gap);
         let cpu = sum_values(
             part.rows
                 .iter()
@@ -288,13 +297,20 @@ impl ContainersModel {
                 .filter(|row| !row.gap)
                 .map(|row| row.io_write_bps),
         );
-        self.latest_cpu = cpu;
-        self.latest_memory = memory;
-        self.cpu_total.push(cpu.map_or(f32::NAN, |v| v as f32));
-        self.memory_total
-            .push(memory.map_or(f32::NAN, |v| v as f32));
-        self.read_total.push(read.map_or(f32::NAN, |v| v as f32));
-        self.write_total.push(write.map_or(f32::NAN, |v| v as f32));
+        if has_gap {
+            self.cpu_total.push_held();
+            self.memory_total.push_held();
+            self.read_total.push_held();
+            self.write_total.push_held();
+        } else {
+            self.latest_cpu = cpu;
+            self.latest_memory = memory;
+            self.cpu_total.push(cpu.map_or(f32::NAN, |v| v as f32));
+            self.memory_total
+                .push(memory.map_or(f32::NAN, |v| v as f32));
+            self.read_total.push(read.map_or(f32::NAN, |v| v as f32));
+            self.write_total.push(write.map_or(f32::NAN, |v| v as f32));
+        }
     }
 }
 
@@ -310,59 +326,30 @@ fn sum_values(values: impl Iterator<Item = Option<f64>>) -> Option<f64> {
     found.then_some(sum)
 }
 
-fn finite<T: Copy>(value: Option<T>, gap: bool, convert: impl FnOnce(T) -> f32) -> f32 {
-    if gap {
-        f32::NAN
-    } else {
-        value.map_or(f32::NAN, convert)
-    }
-}
-
 fn fill_slot(slot: &mut Slot, row: &ContainerStatsRow) {
     slot.id = Some(Arc::clone(&row.id));
-    slot.cpu = if row.gap {
-        None
-    } else {
-        row.cpu_pct.filter(|v| v.is_finite() && *v >= 0.0)
-    };
-    slot.memory = if row.gap { None } else { row.mem_current };
-    slot.peak = if row.gap { None } else { row.mem_peak };
+    if row.gap {
+        slot.cpu_history.push_held();
+        slot.memory_history.push_held();
+        slot.read_history.push_held();
+        slot.write_history.push_held();
+        return;
+    }
+
+    slot.cpu = row.cpu_pct.filter(|v| v.is_finite() && *v >= 0.0);
+    slot.memory = row.mem_current;
+    slot.peak = row.mem_peak;
     slot.pids = row.pids;
-    slot.read = if row.gap {
-        None
-    } else {
-        row.io_read_bps.filter(|v| v.is_finite() && *v >= 0.0)
-    };
-    slot.write = if row.gap {
-        None
-    } else {
-        row.io_write_bps.filter(|v| v.is_finite() && *v >= 0.0)
-    };
-    slot.cpu_history.push(finite(row.cpu_pct, row.gap, |v| {
-        if v.is_finite() && v >= 0.0 {
-            v as f32
-        } else {
-            f32::NAN
-        }
-    }));
+    slot.read = row.io_read_bps.filter(|v| v.is_finite() && *v >= 0.0);
+    slot.write = row.io_write_bps.filter(|v| v.is_finite() && *v >= 0.0);
+    slot.cpu_history
+        .push(slot.cpu.map_or(f32::NAN, |v| v as f32));
     slot.memory_history
-        .push(finite(row.mem_current, row.gap, |v| v as f32));
+        .push(slot.memory.map_or(f32::NAN, |v| v as f32));
     slot.read_history
-        .push(finite(row.io_read_bps, row.gap, |v| {
-            if v.is_finite() && v >= 0.0 {
-                v as f32
-            } else {
-                f32::NAN
-            }
-        }));
+        .push(slot.read.map_or(f32::NAN, |v| v as f32));
     slot.write_history
-        .push(finite(row.io_write_bps, row.gap, |v| {
-            if v.is_finite() && v >= 0.0 {
-                v as f32
-            } else {
-                f32::NAN
-            }
-        }));
+        .push(slot.write.map_or(f32::NAN, |v| v as f32));
 }
 
 pub(in crate::monitor) struct ContainersView<'a> {
@@ -626,36 +613,27 @@ impl ContainersView<'_> {
                     rows: graph_area.rows - half,
                     ..graph_area
                 };
-                graphs::paint_history_graph(
+                paint_finite_history_runs(
                     &values[..len],
                     ramp,
-                    crate::monitor::kit::history_rect::graph_rect(
-                        upper,
-                        len,
-                        graphs::table().braille,
-                    ),
+                    upper,
+                    graphs::table().braille,
                     surface,
                 );
-                graphs::paint_history_graph(
+                paint_finite_history_runs(
                     &down[..down_len],
                     RampId::Write,
-                    crate::monitor::kit::history_rect::graph_rect(
-                        lower,
-                        down_len,
-                        graphs::table().braille,
-                    ),
+                    lower,
+                    graphs::table().braille,
                     surface,
                 );
             }
         } else if len > 0 {
-            graphs::paint_history_graph(
+            paint_finite_history_runs(
                 &values[..len],
                 ramp,
-                crate::monitor::kit::history_rect::graph_rect(
-                    graph_area,
-                    len,
-                    graphs::table().braille,
-                ),
+                graph_area,
+                graphs::table().braille,
                 surface,
             );
         }
@@ -776,6 +754,45 @@ impl ContainersView<'_> {
                 paint_finite_spark_runs(&memory[..memory_len], RampId::Mem, memory_area, surface);
             }
         }
+    }
+}
+
+fn paint_finite_history_runs(
+    values: &[f32],
+    ramp: RampId,
+    area: Rect,
+    braille: bool,
+    surface: &mut Surface,
+) {
+    let samples_per_cell = if braille { 2 } else { 1 };
+    let max_samples = area.cols.saturating_mul(samples_per_cell);
+    let start_index = values.len().saturating_sub(max_samples);
+    let visible = &values[start_index..];
+    let aligned = crate::monitor::kit::history_rect::graph_rect(area, visible.len(), braille);
+    let mut start = 0;
+    while start < visible.len() {
+        while start < visible.len() && !visible[start].is_finite() {
+            start += 1;
+        }
+        let mut end = start;
+        while end < visible.len() && visible[end].is_finite() {
+            end += 1;
+        }
+        if end > start {
+            let first_col = start / samples_per_cell;
+            let last_col = end.div_ceil(samples_per_cell);
+            graphs::paint_history_graph(
+                &visible[start..end],
+                ramp,
+                Rect {
+                    x: aligned.x + first_col,
+                    cols: last_col - first_col,
+                    ..area
+                },
+                surface,
+            );
+        }
+        start = end.max(start + 1);
     }
 }
 
