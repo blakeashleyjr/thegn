@@ -377,8 +377,10 @@ fn worker(shared: &Shared, clock: &dyn Clock, factory: Factory, wake: &Wake) {
     let mut next_due = None;
     let mut scheduled_base = None;
     let mut scheduled_generation = None;
-    let mut scratch = MonitorFrame::default();
-    scratch.health = registry.healths();
+    let mut scratch = MonitorFrame {
+        health: registry.healths(),
+        ..MonitorFrame::default()
+    };
     let discover_generation = shared.lock().generation;
     publish(shared, &scratch, discover_generation, wake);
 
