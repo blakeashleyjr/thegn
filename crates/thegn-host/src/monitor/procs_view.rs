@@ -314,6 +314,7 @@ mod tests {
             procs,
             primed: true,
             enabled: true,
+            summary: None,
         }
     }
 

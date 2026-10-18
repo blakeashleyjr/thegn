@@ -18,6 +18,27 @@ fn process(pid: u32, ppid: u32, utime: u64, starttime: u64) -> FakeProcess {
     }
 }
 
+fn summary_process(
+    pid: u32,
+    ppid: u32,
+    state: char,
+    threads: u64,
+    flags: u64,
+    utime: u64,
+    starttime: u64,
+    rss_pages: u64,
+) -> FakeProcess {
+    let stat = format!(
+        "{pid} (worker {pid}) {state} {ppid} 1 1 0 0 {flags} 0 0 0 0 {utime} 0 0 0 0 0 {threads} 0 {starttime} 1 {rss_pages}"
+    );
+    FakeProcess {
+        stat: stat.into_bytes(),
+        uid: 1000,
+        cmdline: Vec::new(),
+        cgroup: Vec::new(),
+    }
+}
+
 fn request(pane_pids: &[(u32, u32)], rows: usize) -> ProcSampleRequest<'_> {
     ProcSampleRequest {
         rows,
@@ -245,4 +266,78 @@ fn native_projection_omits_zero_parent_pid() {
     assert!(successful);
     assert_eq!(snapshot.procs.len(), 1);
     assert_eq!(snapshot.procs[0].ppid, None);
+}
+
+#[test]
+fn native_summary_uses_every_live_entry_and_diffs_pid_start_identities() {
+    let mut fs = FakeProcFs::new();
+    let rows = [
+        (99, 1, 'R', 1, 0, 1),
+        (88, 1, 'S', 2, 0, 2),
+        (77, 1, 'D', 3, 0, 3),
+        (20, 77, 'Z', 4, 0, 4),
+        (30, 2, 'T', 5, crate::procs_model::PF_KTHREAD, 5),
+        (31, 1, 'I', 6, 0, 6),
+        (32, 1, 'S', 7, 0, 7),
+    ];
+    for (pid, ppid, state, threads, flags, rss) in rows {
+        fs.insert(
+            pid,
+            summary_process(pid, ppid, state, threads, flags, 10, 250, rss),
+        );
+    }
+    let mut native = NativeBackend::with(fs, 16, None, Some(100), Some(4096));
+    let mut primed = false;
+    let request = ProcSampleRequest {
+        rows: 1,
+        self_pid: 99,
+        daemon_pid: Some(88),
+        pane_pids: &[(77, 5)],
+        primed: false,
+    };
+    let (first, successful) = sample_with(&mut native, request, Instant::now(), 20, &mut primed);
+    assert!(successful);
+    let summary = first.summary.as_ref().expect("native summary");
+    assert_eq!(first.total, 7);
+    assert_eq!(summary.tasks, 7);
+    assert_eq!(summary.threads, 28);
+    assert_eq!(summary.kernel_threads, 1);
+    assert_eq!(
+        (summary.running, summary.sleeping, summary.disk_sleep),
+        (1, 2, 1)
+    );
+    assert_eq!((summary.zombies, summary.stopped, summary.idle), (1, 1, 1));
+    assert_eq!((summary.new, summary.exited), (None, None));
+    assert_eq!(summary.owners.ui.count, 1);
+    assert_eq!(summary.owners.daemon.count, 1);
+    assert_eq!(summary.owners.panes.count, 2);
+    assert_eq!(summary.owners.other.count, 3);
+    assert_eq!(summary.owners.panes.rss_bytes, Some(7 * 4096));
+    assert_eq!(summary.owners.other.rss_bytes, Some((5 + 6 + 7) * 4096));
+    assert_eq!(summary.owners.ui.cpu_pct, None);
+
+    for (pid, ppid, state, threads, flags, rss) in rows {
+        native.table.fs_mut().insert(
+            pid,
+            summary_process(pid, ppid, state, threads, flags, 20, 250, rss),
+        );
+    }
+    native.table.fs_mut().remove(32);
+    native
+        .table
+        .fs_mut()
+        .insert(33, summary_process(33, 1, 'S', 1, 0, 20, 500, 8));
+    let (second, successful) = sample_with(
+        &mut native,
+        request,
+        Instant::now() + Duration::from_secs(2),
+        22,
+        &mut primed,
+    );
+    assert!(successful);
+    let summary = second.summary.as_ref().expect("native summary");
+    assert_eq!((summary.new, summary.exited), (Some(1), Some(1)));
+    assert!((summary.owners.ui.cpu_pct.unwrap_or(0.0) - 5.0).abs() < 0.1);
+    assert!((summary.owners.panes.cpu_pct.unwrap_or(0.0) - 10.0).abs() < 0.1);
+    assert!((summary.owners.other.cpu_pct.unwrap_or(0.0) - 15.0).abs() < 0.1);
 }

@@ -5,9 +5,12 @@ use std::time::{Duration, Instant};
 use sysinfo::Pid;
 
 use crate::collect::ProcSampleRequest as SampleRequest;
-use crate::procs::{ProcOwner, ProcSample, ProcSnapshot};
+use crate::procs::{
+    ProcOwner, ProcOwnerSummary, ProcOwnerTotals, ProcSample, ProcSnapshot, ProcSummary,
+};
 use crate::procs_fs::ProcFs;
 use crate::procs_linux::{ProcTable, RealProcFs, clock_ticks_per_second, kept_max_from_rlimit};
+use crate::procs_model::ProcState;
 
 const TOP_N: usize = 32;
 const MAX_ANCESTRY: usize = 16;
@@ -58,6 +61,7 @@ pub(crate) struct NativeBackend<F: ProcFs> {
     ticks_per_second: Option<u64>,
     page_size: Option<u64>,
     previous_pids: Vec<u32>,
+    previous_ids: Option<Vec<(u32, u64)>>,
     pass_time: Duration,
     last_sample: Option<Instant>,
     scratch: Vec<(Pid, f32, u64)>,
@@ -95,6 +99,7 @@ impl<F: ProcFs> NativeBackend<F> {
             ticks_per_second,
             page_size,
             previous_pids: Vec::new(),
+            previous_ids: None,
             pass_time: Duration::ZERO,
             last_sample: None,
             scratch: Vec::new(),
@@ -106,6 +111,7 @@ impl<F: ProcFs> NativeBackend<F> {
     pub(crate) fn reset(&mut self) {
         self.table.reset();
         self.previous_pids.clear();
+        self.previous_ids = None;
         self.pass_time = Duration::ZERO;
         self.last_sample = None;
         self.scratch.clear();
@@ -157,6 +163,84 @@ fn project_native_table<F: ProcFs>(
 ) -> (ProcSnapshot, Vec<Pid>) {
     let table = &native.table;
     let live = table.entries().iter().filter(|entry| !entry.ghost).count();
+    let mut summary = ProcSummary {
+        tasks: live,
+        new: None,
+        exited: None,
+        ..ProcSummary::default()
+    };
+    let mut current_ids = Vec::with_capacity(live);
+    let mut owners = ProcOwnerSummary {
+        ui: owner_totals(native.page_size),
+        daemon: owner_totals(native.page_size),
+        panes: owner_totals(native.page_size),
+        other: owner_totals(native.page_size),
+    };
+    for entry in table.entries().iter().filter(|entry| !entry.ghost) {
+        let stat = &entry.stat;
+        current_ids.push((entry.id.pid, stat.starttime));
+        summary.threads = summary.threads.saturating_add(stat.num_threads);
+        summary.kernel_threads += usize::from(stat.is_kthread() || stat.ppid == 2);
+        match stat.state {
+            ProcState::Running => summary.running += 1,
+            ProcState::Sleeping => summary.sleeping += 1,
+            ProcState::DiskSleep => summary.disk_sleep += 1,
+            ProcState::Zombie => summary.zombies += 1,
+            ProcState::Stopped | ProcState::TracingStop => summary.stopped += 1,
+            ProcState::Idle => summary.idle += 1,
+            _ => {}
+        }
+        let owner = owner_of_table(
+            table,
+            entry.id.pid,
+            request.self_pid,
+            request.daemon_pid,
+            request.pane_pids,
+        );
+        let totals = match owner {
+            ProcOwner::ThegnSelf => &mut owners.ui,
+            ProcOwner::ThegnDaemon => &mut owners.daemon,
+            ProcOwner::Pane(_) => &mut owners.panes,
+            ProcOwner::Other => &mut owners.other,
+        };
+        totals.count += 1;
+        match entry.cpu_delta.and_then(|delta| delta.percent) {
+            Some(cpu) => {
+                if let Some(total) = &mut totals.cpu_pct {
+                    *total += cpu;
+                }
+            }
+            None => totals.cpu_pct = None,
+        }
+        if let Some(rss) = native.page_size.and_then(|page_size| {
+            u64::try_from(stat.rss_pages.max(0))
+                .ok()
+                .and_then(|pages| pages.checked_mul(page_size))
+        }) {
+            if let Some(total) = &mut totals.rss_bytes {
+                *total = total.saturating_add(rss);
+            }
+        } else {
+            totals.rss_bytes = None;
+        }
+    }
+    current_ids.sort_unstable();
+    if let Some(previous_ids) = &native.previous_ids {
+        summary.new = Some(
+            current_ids
+                .iter()
+                .filter(|identity| previous_ids.binary_search(identity).is_err())
+                .count(),
+        );
+        summary.exited = Some(
+            previous_ids
+                .iter()
+                .filter(|identity| current_ids.binary_search(identity).is_err())
+                .count(),
+        );
+    }
+    native.previous_ids = Some(current_ids);
+    summary.owners = owners;
     native.scratch.clear();
     native.scratch.reserve(live);
     for entry in table.entries().iter().filter(|entry| !entry.ghost) {
@@ -233,9 +317,18 @@ fn project_native_table<F: ProcFs>(
             total: live,
             primed: request.primed,
             enabled: true,
+            summary: Some(summary),
         },
         chosen,
     )
+}
+
+fn owner_totals(page_size: Option<u64>) -> ProcOwnerTotals {
+    ProcOwnerTotals {
+        count: 0,
+        cpu_pct: Some(0.0),
+        rss_bytes: page_size.map(|_| 0),
+    }
 }
 
 fn owner_of_table<F: ProcFs>(
