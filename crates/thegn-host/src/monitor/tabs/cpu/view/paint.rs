@@ -239,6 +239,7 @@ fn paint_cores(grid: &mut CellGrid, rect: Rect, model: &CpuModel, label: &mut St
     let labels = model.cpu_stat.cores.len().div_ceil(per_row).min(area.rows);
     for row in 0..labels {
         let first = row * per_row;
+        label.clear();
         core_label(model, first, label);
         if per_row == 2 && model.cpu_stat.cores.get(first + 1).is_some() {
             label.push_str(" / ");
@@ -250,7 +251,6 @@ fn paint_cores(grid: &mut CellGrid, rect: Rect, model: &CpuModel, label: &mut St
 
 fn core_label(model: &CpuModel, index: usize, out: &mut String) {
     let Some(core) = model.cpu_stat.cores.get(index) else {
-        out.clear();
         out.push_str(mark(model.cpu_stat_health));
         return;
     };
@@ -278,7 +278,6 @@ fn core_label(model: &CpuModel, index: usize, out: &mut String) {
             .iter()
             .position(|group| group.contains(&core.id))
     };
-    out.clear();
     write!(out, "{:>2}", core.id).expect("write to String");
     if !kind.is_empty() {
         write!(out, " {kind}").expect("write to String");
@@ -689,7 +688,9 @@ fn paint_load(
     if let Some(centi_percent) = model.psi.cpu.some_stall_centi {
         let x = text.len().min(area.cols);
         let width = area.cols.saturating_sub(x);
-        gauge.resize(width, 1);
+        if gauge.cols() != width || gauge.rows() != 1 {
+            gauge.resize(width, 1);
+        }
         gauge.clear();
         Meter::default().paint(
             gauge,
@@ -780,5 +781,31 @@ fn consecutive_cpu_paints_reuse_the_style_cache() {
         paint(&model, &mut surface, USAGE, Rect::full(80, 20));
         let after_second = PAINT_SCRATCH.with(|scratch| scratch.borrow().emitter.rebuilds());
         assert_eq!(after_second, after_first);
+    });
+}
+
+#[cfg(test)]
+#[test]
+fn paired_core_labels_keep_the_first_core_on_the_row() {
+    crate::caps::test_override::with_unicode(thegn_core::termcaps::UnicodeLevel::Full, || {
+        let mut model = CpuModel::default();
+        model.cpu_stat.cores.extend([
+            thegn_metrics::collect::model::cpu_stat::CoreSample {
+                id: 0,
+                online: true,
+                ..Default::default()
+            },
+            thegn_metrics::collect::model::cpu_stat::CoreSample {
+                id: 1,
+                online: true,
+                ..Default::default()
+            },
+        ]);
+        let mut grid = CellGrid::new(40, 8);
+        paint_cores(&mut grid, Rect::full(40, 8), &model, &mut String::new());
+        let row: String = (1..8)
+            .map(|x| grid.get(x, 1).expect("inner row cell").ch)
+            .collect();
+        assert_eq!(row, " 0 /  1");
     });
 }

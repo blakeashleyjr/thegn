@@ -20,10 +20,10 @@ pub(crate) fn paint_spark(
     out.emit(&resolved);
     let missing = w.saturating_sub(tail.len());
     if missing > 0 {
-        let prefix = crate::seg::seg(
-            crate::seg::Tok::Slot(crate::chrome::S::Dim),
-            " ".repeat(missing),
-        );
+        let mut prefix_text = out.take_string(missing);
+        prefix_text.clear();
+        prefix_text.resize(missing, ' ');
+        let prefix = crate::seg::seg(crate::seg::Tok::Slot(crate::chrome::S::Dim), prefix_text);
         if let Some(crate::seg::Line::Segs(segs)) = out.lines.first_mut() {
             segs.insert(0, prefix);
         }

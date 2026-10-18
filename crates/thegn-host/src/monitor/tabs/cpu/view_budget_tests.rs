@@ -107,6 +107,10 @@ fn warmed_absorbs_stay_allocation_free_across_changing_frames_and_history() {
 }
 
 #[test]
+#[allow(
+    clippy::disallowed_macros,
+    reason = "budget gate prints observed counts for the primary"
+)]
 fn cpu_usage_paint_stays_within_its_pinned_allocation_budget() {
     // THE-898 regression ceiling; primary pins the reduced value from observed counts.
     const PAINT_ALLOCATION_BUDGET: u64 = 30_300;
@@ -119,6 +123,7 @@ fn cpu_usage_paint_stays_within_its_pinned_allocation_budget() {
     let (_, counts) = crate::proc_workload_alloc::measure(|| {
         super::paint::paint(&model, &mut surface, USAGE, Rect::full(240, 60));
     });
+    eprintln!("CPU usage paint observed counts: {counts:?}");
     assert!(
         counts.allocation_calls <= PAINT_ALLOCATION_BUDGET
             && counts.realloc_calls <= PAINT_REALLOC_BUDGET,

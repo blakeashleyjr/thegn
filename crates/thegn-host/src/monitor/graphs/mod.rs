@@ -21,6 +21,7 @@ thread_local! {
 }
 
 /// Use one cloned palette per thread and palette generation for graph paints.
+/// Callers must not invoke `with_palette` recursively from `f`.
 pub(crate) fn with_palette<R>(f: impl FnOnce(&Palette) -> R) -> R {
     let generation = chrome::palette_generation();
     PALETTE.with(|cached| {
@@ -144,6 +145,18 @@ impl Resolved {
 pub(crate) struct GraphOut {
     pub(crate) cells: CellBuf,
     pub(crate) lines: Vec<Line>,
+    spare_strings: Vec<String>,
+}
+
+impl GraphOut {
+    fn take_string(&mut self, capacity: usize) -> String {
+        let reusable = self
+            .spare_strings
+            .iter()
+            .position(|text| text.capacity() >= capacity)
+            .map(|index| self.spare_strings.swap_remove(index));
+        reusable.unwrap_or_default()
+    }
 }
 
 pub(crate) fn paint_sparkline(
@@ -252,6 +265,7 @@ impl GraphOut {
         if !matches!(line, Line::Segs(_)) {
             *line = Line::Segs(Vec::new());
         }
+        let spare_strings = &mut self.spare_strings;
         if let Line::Segs(segs) = line {
             let row = self.cells.row(row_index);
             let mut start = 0;
@@ -262,10 +276,25 @@ impl GraphOut {
                 while end < row.len() && resolved.cell(row[end]) == style {
                     end += 1;
                 }
+                let required_capacity: usize =
+                    row[start..end].iter().map(|cell| cell.ch.len_utf8()).sum();
                 if seg_index == segs.len() {
-                    segs.push(seg::seg(Tok::Attr(style.fg), String::new()));
+                    let reusable = spare_strings
+                        .iter()
+                        .position(|text| text.capacity() >= required_capacity)
+                        .map(|index| spare_strings.swap_remove(index));
+                    segs.push(seg::seg(Tok::Attr(style.fg), reusable.unwrap_or_default()));
                 }
                 let run = &mut segs[seg_index];
+                if run.text.capacity() < required_capacity {
+                    let old_text = std::mem::take(&mut run.text);
+                    spare_strings.push(old_text);
+                    let reusable = spare_strings
+                        .iter()
+                        .position(|text| text.capacity() >= required_capacity)
+                        .map(|index| spare_strings.swap_remove(index));
+                    run.text = reusable.unwrap_or_default();
+                }
                 run.text.clear();
                 run.text.extend(row[start..end].iter().map(|cell| cell.ch));
                 run.fg = Tok::Attr(style.fg);
@@ -278,8 +307,8 @@ impl GraphOut {
                 seg_index += 1;
                 start = end;
             }
-            for stale in &mut segs[seg_index..] {
-                stale.text.clear();
+            for stale in segs.drain(seg_index..) {
+                spare_strings.push(stale.text);
             }
         }
     }
