@@ -18,8 +18,8 @@ lists every active share: `↵` copies the URL, `o` opens it in the
 browser, `n` starts a share, and `x` stops the highlighted share (the
 stop-share action stops them all). Stopping a share also removes its saved
 entry, so it will not return on the next launch. A failed share shows its
-reason and can simply be retried. At full panel width, the list gains a detail
-column with the untruncated URL (or iroh consumer command), provider, and reach.
+reason and can simply be retried. At the panel's full width the list gains a
+detail column with the untruncated URL (or iroh consumer command), provider, and reach.
 The bottom status bar shows a `⇅` chip while anything is
 shared; activating it opens a detail popup listing the shares (the
 `open-shares` action opens the panel section instead).
