@@ -121,9 +121,11 @@ focus (`f`/`F`), zoom (`z`), and Escape follow the monitor board controls.
 
 The Memory tab is a panel board. `memory.composition` shows total, available,
 used, free and the component breakdown with bounded usage history from the
-selected telemetry window. `memory.verdict` summarizes memory health;
+selected telemetry window, scaled against total memory; frame samples and
+telemetry history use separate rings. `memory.verdict` summarizes memory health;
 `memory.pressure` shows PSI some/full pressure; `memory.swap` appears when swap
-exists and includes selected-window history when samples are available;
+exists and includes selected-window history scaled against total swap when
+samples are available;
 `memory.paging` shows reclaim, refault and fault rates; and `memory.limit` shows
 the process cgroup limit and thegn.slice usage. A missing limit is shown as
 `—`; when every cgroup level is unlimited, the panel says `no limit`. Use
