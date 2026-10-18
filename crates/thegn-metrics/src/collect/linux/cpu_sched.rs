@@ -37,12 +37,11 @@ impl CpuSchedCollector {
     }
     fn read(&mut self) -> Result<(), CollectError> {
         let file = self.file.as_mut().ok_or(CollectError::Gone)?;
-        match file.read_all() {
-            Ok(bytes) => match schedstat::parse(bytes, &mut self.raw) {
-                Ok(()) => Ok(()),
-                Err(ParseError::Unsupported) => Err(CollectError::Parse("/proc/schedstat version")),
-                Err(ParseError::Invalid) => Err(CollectError::Parse("/proc/schedstat")),
-            },
+        let raw = &mut self.raw;
+        match file.read_all().map(|bytes| schedstat::parse(bytes, raw)) {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(ParseError::Unsupported)) => Err(CollectError::Parse("/proc/schedstat version")),
+            Ok(Err(ParseError::Invalid)) => Err(CollectError::Parse("/proc/schedstat")),
             Err(_error) if file.needs_reopen() => Err(CollectError::Gone),
             Err(error) => Err(error.into()),
         }
