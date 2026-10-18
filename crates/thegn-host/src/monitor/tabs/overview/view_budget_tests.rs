@@ -151,6 +151,75 @@ fn populated_overview_panels_stay_within_the_pinned_paint_budget() {
 }
 
 #[test]
+#[allow(
+    clippy::disallowed_macros,
+    reason = "phase budget gate prints observed counts for the primary"
+)]
+fn overview_paint_phases_report_counts() {
+    const PAINT_ALLOCATION_BUDGET: u64 = 160_200;
+    const PAINT_REALLOC_BUDGET: u64 = 2_400;
+    let (model, _) = populated_overview();
+    let area = Rect::full(240, 60);
+    let panels = [
+        "overview.cpu",
+        "overview.load",
+        "overview.memory",
+        "overview.network",
+        "overview.disk",
+        "overview.thermal",
+        "overview.power",
+        "overview.activity",
+    ];
+    let placed: Vec<_> = panels
+        .iter()
+        .map(|id| Placed {
+            id: PanelId(id),
+            rect: area,
+            variant: VariantKind::Full,
+        })
+        .collect();
+    let mut surface = Surface::new(240, 60);
+
+    let mut text_model = model.clone();
+    text_model.sparks.clear();
+    let text_view = super::OverviewView(&text_model);
+    for _ in 0..3 {
+        for panel in &placed {
+            text_view.paint(&mut surface, panel, area, 0, &[] as &[Section]);
+        }
+    }
+    let (_, text_counts) = crate::proc_workload_alloc::measure(|| {
+        for panel in &placed {
+            text_view.paint(&mut surface, panel, area, 0, &[] as &[Section]);
+        }
+    });
+    eprintln!("Overview panel text and grid emit phase observed counts: {text_counts:?}");
+    assert!(
+        text_counts.allocation_calls <= PAINT_ALLOCATION_BUDGET
+            && text_counts.realloc_calls <= PAINT_REALLOC_BUDGET,
+        "Overview panel text and grid emit phase exceeded total budget: {text_counts:?}"
+    );
+
+    let spark_view = super::OverviewView(&model);
+    for _ in 0..3 {
+        for panel in &placed {
+            spark_view.paint(&mut surface, panel, area, 0, &[] as &[Section]);
+        }
+    }
+    let (_, graph_counts) = crate::proc_workload_alloc::measure(|| {
+        for panel in &placed {
+            spark_view.paint(&mut surface, panel, area, 0, &[] as &[Section]);
+        }
+    });
+    eprintln!("Overview history graph phase observed counts: {graph_counts:?}");
+    assert!(
+        graph_counts.allocation_calls <= PAINT_ALLOCATION_BUDGET
+            && graph_counts.realloc_calls <= PAINT_REALLOC_BUDGET,
+        "Overview history graph phase exceeded total budget: {graph_counts:?}"
+    );
+}
+
+#[test]
 fn consecutive_overview_paints_reuse_the_style_cache() {
     let model = OverviewModel::default();
     let view = super::OverviewView(&model);

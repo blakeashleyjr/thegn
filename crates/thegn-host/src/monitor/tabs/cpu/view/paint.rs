@@ -37,6 +37,11 @@ struct CpuPaintScratch {
     text: String,
     label: String,
     emitter: Emitter,
+    io: Vec<f32>,
+    steal: Vec<f32>,
+    freq: Vec<f32>,
+    heat_rows: Vec<Vec<f32>>,
+    heat_out: crate::monitor::graphs::GraphOut,
 }
 
 thread_local! {
@@ -82,8 +87,9 @@ pub(super) fn paint(model: &CpuModel, surface: &mut Surface, id: PanelId, rect: 
                 rect,
                 &model.cpu_sched,
                 model.sched_health,
+                &mut scratch.text,
             ),
-            IDLE => paint_idle(&mut scratch.grid, rect, model),
+            IDLE => paint_idle(&mut scratch.grid, rect, model, &mut scratch.text),
             _ => return,
         }
         scratch.emitter.emit(
@@ -127,11 +133,11 @@ pub(super) fn paint(model: &CpuModel, surface: &mut Surface, id: PanelId, rect: 
                     surface,
                 );
             }
-            let io_values = model.iowait_history.ordered();
-            let steal_values = model.steal_history.ordered();
+            model.iowait_history.copy_ordered_into(&mut scratch.io);
+            model.steal_history.copy_ordered_into(&mut scratch.steal);
             for (values, offset) in [
-                (&io_values, graph_rect.rows.saturating_sub(2)),
-                (&steal_values, graph_rect.rows.saturating_sub(1)),
+                (&scratch.io, graph_rect.rows.saturating_sub(2)),
+                (&scratch.steal, graph_rect.rows.saturating_sub(1)),
             ] {
                 if !values.is_empty() && graph_rect.rows >= 2 {
                     scratch.aux_grid.resize(3, 1);
@@ -170,10 +176,10 @@ pub(super) fn paint(model: &CpuModel, surface: &mut Surface, id: PanelId, rect: 
             }
         }
         if id == CORES && rect.rows > 2 && rect.cols > 24 {
-            paint_core_heatmap(model, rect, surface);
+            paint_core_heatmap(model, rect, surface, scratch);
         }
         if id == FREQ && rect.rows > 5 {
-            paint_frequency_history(model, rect, surface);
+            paint_frequency_history(model, rect, surface, scratch);
         }
         if id == LOAD && rect.rows > 5 && rect.cols > 2 && !model.load_history.is_empty() {
             crate::monitor::graphs::paint_history_graph(
@@ -191,7 +197,12 @@ pub(super) fn paint(model: &CpuModel, surface: &mut Surface, id: PanelId, rect: 
     });
 }
 
-fn paint_frequency_history(model: &CpuModel, rect: Rect, surface: &mut Surface) {
+fn paint_frequency_history(
+    model: &CpuModel,
+    rect: Rect,
+    surface: &mut Surface,
+    scratch: &mut CpuPaintScratch,
+) {
     let visible = rect.rows.saturating_sub(3) / 2;
     for (index, policy) in model.cpu_freq.policies.iter().take(visible).enumerate() {
         let y = rect.y + 3 + index * 2;
@@ -205,9 +216,9 @@ fn paint_frequency_history(model: &CpuModel, rect: Rect, surface: &mut Surface) 
         else {
             continue;
         };
-        let values = history.samples.ordered();
+        history.samples.copy_ordered_into(&mut scratch.freq);
         crate::monitor::graphs::paint_sparkline(
-            &values,
+            &scratch.freq,
             rect.cols.saturating_sub(2),
             RampId::Util,
             Rect {
@@ -287,7 +298,12 @@ fn core_label(model: &CpuModel, index: usize, out: &mut String) {
     }
 }
 
-fn paint_core_heatmap(model: &CpuModel, rect: Rect, surface: &mut Surface) {
+fn paint_core_heatmap(
+    model: &CpuModel,
+    rect: Rect,
+    surface: &mut Surface,
+    scratch: &mut CpuPaintScratch,
+) {
     if model.core_busy_history.is_empty() {
         return;
     }
@@ -302,23 +318,33 @@ fn paint_core_heatmap(model: &CpuModel, rect: Rect, surface: &mut Surface) {
         return;
     }
     let mut rows = [&[][..]; super::CORE_HISTORY_LIMIT];
-    let mut ordered_rows = Vec::with_capacity(model.core_busy_history.len());
     let count = model.core_busy_history.len().min(rows.len());
-    ordered_rows.extend(
-        model
-            .core_busy_history
-            .iter()
-            .take(count)
-            .map(|history| history.ordered()),
-    );
-    for (row, samples) in rows.iter_mut().zip(&ordered_rows) {
+    while scratch.heat_rows.len() < count {
+        scratch.heat_rows.push(Vec::new());
+    }
+    for (index, history) in model.core_busy_history.iter().take(count).enumerate() {
+        history
+            .samples
+            .copy_ordered_into(&mut scratch.heat_rows[index]);
+    }
+    for (row, samples) in rows.iter_mut().zip(&scratch.heat_rows[..count]) {
         *row = &samples[samples.len().saturating_sub(graph_rect.cols)..];
     }
-    let mut out = crate::monitor::graphs::GraphOut::new();
     crate::monitor::graphs::with_palette(|palette| {
-        crate::monitor::graphs::paint_heatmap(&mut out, &rows[..count], RampId::Util, palette);
+        crate::monitor::graphs::paint_heatmap(
+            &mut scratch.heat_out,
+            &rows[..count],
+            RampId::Util,
+            palette,
+        );
     });
-    for (row, line) in out.lines.iter().take(graph_rect.rows).enumerate() {
+    for (row, line) in scratch
+        .heat_out
+        .lines
+        .iter()
+        .take(graph_rect.rows)
+        .enumerate()
+    {
         crate::seg::draw_line(
             surface,
             graph_rect.x,
@@ -330,7 +356,7 @@ fn paint_core_heatmap(model: &CpuModel, rect: Rect, surface: &mut Surface) {
     }
 }
 
-fn paint_idle(grid: &mut CellGrid, rect: Rect, model: &CpuModel) {
+fn paint_idle(grid: &mut CellGrid, rect: Rect, model: &CpuModel, text: &mut String) {
     let mut body = panel::panel(
         grid,
         Rect::full(rect.cols, rect.rows),
@@ -346,26 +372,28 @@ fn paint_idle(grid: &mut CellGrid, rect: Rect, model: &CpuModel) {
         return;
     }
     for (row, core) in model.idle.cores.iter().take(area.rows).enumerate() {
-        let c0 = core.c0_pct.map_or_else(
-            || mark(model.idle_health).to_owned(),
-            |value| format!("{value:.0}%"),
-        );
-        let states = core
-            .states
-            .iter()
-            .map(|state| {
-                let name = state.name.as_deref().unwrap_or("C?");
-                let value = state.residency_pct.map_or_else(
-                    || mark(model.idle_health).to_owned(),
-                    |pct| format!("{pct:.0}%"),
-                );
-                format!("{name} {value}")
-            })
-            .collect::<Vec<_>>()
-            .join("  ");
-        let label = format!("{:>2} C0 {c0}  {states}", core.cpu);
-        body.put_str(0, row, &label, CellStyle::default());
-        let start_x = label.chars().count().min(area.cols);
+        text.clear();
+        write!(text, "{:>2} C0 ", core.cpu).expect("write to String");
+        if let Some(value) = core.c0_pct {
+            write!(text, "{value:.0}%").expect("write to String");
+        } else {
+            text.push_str(mark(model.idle_health));
+        }
+        text.push_str("  ");
+        for (index, state) in core.states.iter().enumerate() {
+            if index > 0 {
+                text.push_str("  ");
+            }
+            text.push_str(state.name.as_deref().unwrap_or("C?"));
+            text.push(' ');
+            if let Some(pct) = state.residency_pct {
+                write!(text, "{pct:.0}%").expect("write to String");
+            } else {
+                text.push_str(mark(model.idle_health));
+            }
+        }
+        body.put_str(0, row, text, CellStyle::default());
+        let start_x = text.chars().count().min(area.cols);
         let width = area.cols.saturating_sub(start_x);
         if width == 0 {
             continue;
@@ -714,7 +742,13 @@ fn paint_load(
 
 mod irq;
 
-fn paint_sched(grid: &mut CellGrid, rect: Rect, part: &CpuSchedPart, health: Health) {
+fn paint_sched(
+    grid: &mut CellGrid,
+    rect: Rect,
+    part: &CpuSchedPart,
+    health: Health,
+    text: &mut String,
+) {
     let mut body = panel::panel(
         grid,
         Rect::full(rect.cols, rect.rows),
@@ -731,21 +765,22 @@ fn paint_sched(grid: &mut CellGrid, rect: Rect, part: &CpuSchedPart, health: Hea
         return;
     }
     for (row, core) in part.cores.iter().take(visible).enumerate() {
-        let id = format!("CPU{:02}", core.id);
+        text.clear();
+        write!(text, "CPU{:02} ", core.id).expect("write to String");
         let missing = if core.online {
             health
         } else {
             Health::Absent(Absent::NoHardware)
         };
-        let wait = core
-            .run_queue_wait_ms_per_s
-            .map(|v| format!("{v:.2} ms/s"))
-            .unwrap_or_else(|| mark(missing).to_owned());
-        let line = format!("{id} {wait}");
-        body.put_str(0, row, &line, CellStyle::default());
+        if let Some(wait) = core.run_queue_wait_ms_per_s {
+            write!(text, "{wait:.2} ms/s").expect("write to String");
+        } else {
+            text.push_str(mark(missing));
+        }
+        body.put_str(0, row, text, CellStyle::default());
         if let Some(wait) = core.run_queue_wait_ms_per_s {
             let max_wait = 100.0_f64;
-            let x = line.len().min(area.cols);
+            let x = text.len().min(area.cols);
             let width = area.cols.saturating_sub(x);
             let (filled, track) = caps::bar_track((wait / max_wait).clamp(0.0, 1.0) as f32, width);
             body.put_str(
