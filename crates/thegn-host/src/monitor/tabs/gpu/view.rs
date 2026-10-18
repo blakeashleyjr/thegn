@@ -27,6 +27,7 @@ const MEMORY: PanelId = PanelId("gpu.memory");
 const CLOCKS: PanelId = PanelId("gpu.clocks");
 pub(super) const HISTORY_CAP: usize = 480;
 const DEVICE_CAP: usize = 32;
+const ACTIVITY_RING_COUNT: usize = 12;
 const FULL: [Variant; 1] = [Variant {
     kind: VariantKind::Full,
     min: (34, 5),
@@ -56,6 +57,37 @@ const SPECS: [PanelSpec; 4] = [
 ];
 
 #[derive(Debug, Clone)]
+pub(super) struct ActivityRing {
+    pub(super) values: [f32; HISTORY_CAP],
+    pub(super) next: usize,
+    pub(super) len: usize,
+}
+
+impl ActivityRing {
+    fn new() -> Self {
+        Self {
+            values: [0.0; HISTORY_CAP],
+            next: 0,
+            len: 0,
+        }
+    }
+
+    fn push(&mut self, value: f32) {
+        self.values[self.next] = value;
+        self.next = (self.next + 1) % HISTORY_CAP;
+        self.len = self.len.saturating_add(1).min(HISTORY_CAP);
+    }
+
+    pub(super) fn ordered_into(&self, output: &mut [f32; HISTORY_CAP]) -> usize {
+        let start = (self.next + HISTORY_CAP - self.len) % HISTORY_CAP;
+        for (offset, value) in output.iter_mut().take(self.len).enumerate() {
+            *value = self.values[(start + offset) % HISTORY_CAP];
+        }
+        self.len
+    }
+}
+
+#[derive(Debug, Clone)]
 pub(super) struct BusyHistory {
     pub(super) slot: String,
     pub(super) values: [f32; HISTORY_CAP],
@@ -76,6 +108,7 @@ pub(super) struct BusyHistory {
     pub(super) power: [f32; HISTORY_CAP],
     pub(super) power_next: usize,
     pub(super) power_len: usize,
+    pub(super) activity: [ActivityRing; ACTIVITY_RING_COUNT],
 }
 
 impl BusyHistory {
@@ -100,6 +133,7 @@ impl BusyHistory {
             power: [0.0; HISTORY_CAP],
             power_next: 0,
             power_len: 0,
+            activity: std::array::from_fn(|_| ActivityRing::new()),
         }
     }
 
@@ -283,9 +317,28 @@ impl GpuModel {
                     self.smu
                         .cards
                         .iter()
-                        .find(|reading| u32::from(reading.card) == card && !reading.suspended)
+                        .find(|reading| {
+                            u32::from(reading.card) == card
+                                && !reading.suspended
+                                && reading.metrics.layout_verified
+                        })
                         .map(|reading| &reading.metrics)
                 });
+                if let Some(metrics) = metrics {
+                    let mut activities = [None; ACTIVITY_RING_COUNT];
+                    activities[..4].copy_from_slice(&[
+                        metrics.activity_gfx,
+                        metrics.activity_mm,
+                        metrics.activity_vcn,
+                        metrics.activity_umc,
+                    ]);
+                    activities[4..].copy_from_slice(&metrics.activity_ipu);
+                    for (ring, value) in history.activity.iter_mut().zip(activities) {
+                        if let Some(value) = value.filter(|value| *value <= 100) {
+                            ring.push(f32::from(value) / 100.0);
+                        }
+                    }
+                }
                 if let Some(metrics) = metrics
                     && let (Some(watts_mw), Some(cap_w)) = (
                         metrics.power_socket,
