@@ -179,7 +179,9 @@ fn caps_reads_at_64_and_round_robins_every_scope_within_three_ticks() {
             4096,
         );
     }
-    let second = sampler.sample(&scopes, start + Duration::from_secs(1)).to_vec();
+    let second = sampler
+        .sample(&scopes, start + Duration::from_secs(1))
+        .to_vec();
     assert_eq!(second.len(), MAX_CONTAINER_SCOPES_PER_TICK);
     assert!(
         second
