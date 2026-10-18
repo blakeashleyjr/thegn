@@ -177,6 +177,10 @@ impl Default for GpuModel {
 }
 
 impl GpuModel {
+    pub(crate) fn has_engine_devices(&self) -> bool {
+        !matches!(self.engine_health, Health::Absent(_))
+    }
+
     pub(in crate::monitor) fn absorb_frame(&mut self, frame: &MonitorFrame) {
         copy_rows(
             &mut self.devices.devices,

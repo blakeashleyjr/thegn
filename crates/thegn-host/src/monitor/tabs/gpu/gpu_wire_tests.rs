@@ -114,7 +114,7 @@ fn gpu_overlay_ingest_is_visible_only_and_pause_freezes_model() {
     assert!(!overlay.ingest_frame(&next));
     assert_eq!(overlay.gpu.engines.devices[0].gfx_busy_pct, Some(37));
 
-    let mut other = overlay_for(MonitorTab::Processes);
+    let mut other = overlay_for(MonitorTab::Procs);
     assert!(!other.ingest_frame(&frame()));
     assert!(other.gpu.engines.devices.is_empty());
 }
