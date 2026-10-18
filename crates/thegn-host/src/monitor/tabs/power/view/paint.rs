@@ -1,6 +1,13 @@
 use super::{EffectiveState, PowerModel};
 use crate::caps::{self, Glyph};
-use crate::{compositor::Rect, monitor::kit::grid::CellGrid};
+use crate::{
+    compositor::Rect,
+    monitor::kit::{chip, grid::CellGrid},
+};
+use thegn_core::{
+    numfmt::{NumFmt, Reading, Unit},
+    theme::StateRole,
+};
 use thegn_metrics::collect::health::{Absent, Health};
 
 fn style() -> crate::monitor::kit::grid::CellStyle {
@@ -108,7 +115,7 @@ pub(super) fn paint_battery(grid: &mut CellGrid, rect: Rect, model: &PowerModel)
             );
         }
     }
-    if model.battery_history.is_empty() && rect.rows > 0 {
+    if model.telemetry_battery_history.is_empty() && rect.rows > 0 {
         put_line(
             grid,
             rect,
@@ -211,26 +218,74 @@ pub(super) fn paint_policy(grid: &mut CellGrid, rect: Rect, model: &PowerModel) 
     let profile = model
         .policy
         .platform_profile
-        .map(|v| v.as_str().to_owned())
-        .unwrap_or_else(|| mark(model.cpu_freq_health).to_owned());
-    put_line(
-        grid,
-        rect,
-        0,
-        &format!(
-            "profile {profile}  boost {}  AMD pstate {}",
-            model
-                .policy
-                .boost
-                .map(|v| (if v { "on" } else { "off" }).to_owned())
-                .unwrap_or_else(|| mark(model.cpu_freq_health).to_owned()),
-            model
-                .policy
-                .amd_pstate_status
-                .map(|v| v.as_str().to_owned())
-                .unwrap_or_else(|| mark(model.cpu_freq_health).to_owned())
+        .map(|v| format!("profile {}", v.as_str()))
+        .unwrap_or_else(|| format!("profile {}", mark(model.cpu_freq_health)));
+    let boost = model
+        .policy
+        .boost
+        .map(|enabled| format!("boost {}", if enabled { "on" } else { "off" }))
+        .unwrap_or_else(|| format!("boost {}", mark(model.cpu_freq_health)));
+    let epp = model
+        .cpu_policy
+        .first()
+        .and_then(|policy| policy.epp)
+        .map(|token| format!("EPP {}", token.as_str()))
+        .unwrap_or_else(|| format!("EPP {}", mark(model.cpu_freq_health)));
+    let chip_width = rect.cols / 3;
+    for (index, (label, state)) in [
+        (
+            profile,
+            if model.policy.platform_profile.is_some() {
+                StateRole::Ok
+            } else {
+                StateRole::Unknown
+            },
         ),
-    );
+        (
+            boost,
+            if model.policy.boost.is_some() {
+                StateRole::Ok
+            } else {
+                StateRole::Unknown
+            },
+        ),
+        (
+            epp,
+            if model
+                .cpu_policy
+                .first()
+                .and_then(|policy| policy.epp)
+                .is_some()
+            {
+                StateRole::Ok
+            } else {
+                StateRole::Unknown
+            },
+        ),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let x = rect.x + index * chip_width;
+        chip::draw(
+            grid,
+            Rect {
+                x,
+                y: rect.y,
+                cols: if index == 2 {
+                    rect.cols.saturating_sub(chip_width * 2)
+                } else {
+                    chip_width
+                },
+                rows: 1,
+            },
+            &label,
+            Reading::NotApplicable,
+            Unit::Count,
+            NumFmt::default(),
+            state,
+        );
+    }
     for (row, policy) in model
         .cpu_policy
         .iter()
@@ -242,7 +297,7 @@ pub(super) fn paint_policy(grid: &mut CellGrid, rect: Rect, model: &PowerModel) 
             rect,
             row + 1,
             &format!(
-                "policy {}  {} | {} | EPP {}",
+                "policy {}  {} / {} / EPP {}",
                 policy.policy,
                 policy
                     .driver
