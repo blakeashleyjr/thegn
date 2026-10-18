@@ -347,7 +347,9 @@ impl TabView for ThermalView<'_> {
             }
             GPU if self.0.has_gpu() => {
                 set.insert(CollectorId::Hwmon);
-                set.insert(CollectorId::AmdSmu);
+                if self.0.has_amd_gpu_readings() {
+                    set.insert(CollectorId::AmdSmu);
+                }
             }
             _ => {}
         }
@@ -406,6 +408,14 @@ impl ThermalModel {
             || self.gfx_c.is_some()
             || self.edge_c.is_some()
             || self.hotspot_c.is_some()
+    }
+
+    fn has_amd_gpu_readings(&self) -> bool {
+        self.gfx_c.is_some()
+            || self.edge_c.is_some()
+            || self.hotspot_c.is_some()
+            || self.soc_c.is_some()
+            || self.socket_w.is_some()
     }
 }
 

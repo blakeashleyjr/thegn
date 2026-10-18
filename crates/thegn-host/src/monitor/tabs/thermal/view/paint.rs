@@ -94,8 +94,12 @@ pub(super) fn package(
             0
         };
         let capacity = values.len();
-        for (index, value) in values.iter_mut().take(history_len).enumerate() {
-            let source = (first + index) % capacity;
+        let graph_width = rect.cols.min(capacity);
+        for (index, value) in values.iter_mut().take(graph_width).enumerate() {
+            // Scale the bounded history ring across the graph's available time axis.
+            // Each plotted column samples a real ring value; no synthetic readings are added.
+            let source_index = index.saturating_mul(history_len) / graph_width.max(1);
+            let source = (first + source_index) % capacity;
             *value = thermal_level(
                 history[source],
                 sensor.max_c.unwrap_or(80.0),
@@ -105,7 +109,7 @@ pub(super) fn package(
         let mut graph = crate::monitor::graphs::GraphOut::new();
         crate::monitor::graphs::paint_heatmap(
             &mut graph,
-            &[&values[..history_len]],
+            &[&values[..graph_width]],
             RampId::Temp,
             &crate::chrome::palette_snapshot(),
         );
@@ -153,7 +157,11 @@ pub(super) fn cores(grid: &mut CellGrid, rect: Rect, cores: &[Option<f32>; 16]) 
                         y,
                         CellStyle {
                             ch,
-                            fg: StyleTok::from_tok(seg.fg).unwrap_or(StyleTok::INHERIT),
+                            fg: StyleTok::from_tok(Tok::Ramp(
+                                RampId::Temp,
+                                (normalized * 7.0).round() as u8,
+                            ))
+                            .unwrap_or(StyleTok::INHERIT),
                             bg: seg
                                 .bg
                                 .and_then(StyleTok::from_tok)
