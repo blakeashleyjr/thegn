@@ -679,7 +679,7 @@ fn pct_u8(v: f32) -> u8 {
 
 /// Pick the CPU/package temperature from labelled sensors: the hottest sensor
 /// whose label looks CPU-ish, else the hottest sensor overall.
-fn cpu_temp(temps: &[(String, f32)]) -> Option<f32> {
+pub(crate) fn cpu_temp(temps: &[(String, f32)]) -> Option<f32> {
     // `tdie` is Apple silicon's die-temperature sensor family ("PMU tdie1", …).
     // Without it the Apple path fell through to "hottest of anything", which
     // picks `PMU tcal` — a calibration reference that reads ~15C above the die
