@@ -476,7 +476,11 @@ mod collector_tests {
         std::fs::write(temp.path().join("cgroup.controllers"), b"cpu memory\n").unwrap();
         let group = temp.path().join("system.slice/docker-111111.scope");
         std::fs::create_dir_all(&group).unwrap();
-        std::fs::write(group.join("cpu.stat"), b"usage_usec 1000000\n").unwrap();
+        std::fs::write(
+            group.join("cpu.stat"),
+            b"usage_usec 1000000\nuser_usec 500000\nsystem_usec 500000\n",
+        )
+        .unwrap();
         std::fs::write(group.join("memory.current"), b"100\n").unwrap();
         let directory_fs = FakeDirs(HashMap::from([(
             temp.path().join("system.slice"),
