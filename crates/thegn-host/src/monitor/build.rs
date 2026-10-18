@@ -56,6 +56,8 @@ pub(super) struct TabInput<'a> {
     pub proc_sort: ProcSort,
     pub proc_desc: bool,
     pub proc_rows: &'a [ProcRow],
+    pub proc_invalid_terms: &'a [super::procs_view::procs_query::InvalidTerm],
+    pub proc_primed: bool,
     pub disk_rows: &'a [DiskWtRow],
     pub disk_eta: Option<DiskFillEta>,
 }
@@ -115,11 +117,15 @@ pub(super) fn tab(input: TabInput) -> TabBuild {
             &cx,
             input.proc_rows,
             input.sel,
-            input.filter,
-            input.filtering,
-            input.tree,
-            input.proc_sort,
-            input.proc_desc,
+            super::tabs::procs::ProcDisplay {
+                filter: input.filter,
+                filtering: input.filtering,
+                tree: input.tree,
+                sort: input.proc_sort,
+                desc: input.proc_desc,
+                invalid_terms: input.proc_invalid_terms,
+                primed: input.proc_primed,
+            },
         ),
         // Containers renders straight off `cx.model.containers` — the overlay's
         // cached `container_rows` mirrors that exact order, so `input.sel`

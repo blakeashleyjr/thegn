@@ -1120,7 +1120,7 @@ fn process_columns_follow_viewport_not_sample_values_and_keep_visible_identity()
         let mut previous_widths = None;
         for changed in [false, true] {
             let mut sample = proc(
-                u32::MAX,
+                4_194_305,
                 None,
                 if changed {
                     "fixture-世-e\u{301}-👩‍💻-longer-name"
@@ -1163,7 +1163,7 @@ fn process_columns_follow_viewport_not_sample_values_and_keep_visible_identity()
             }
             assert!(matches!(
                 &table.rows[0][0],
-                crate::sections::Cell::Text(value, _) if value == "4294967295"
+                crate::sections::Cell::Text(value, _) if value == "4194305"
             ));
             if let Some(previous) = &previous_widths {
                 assert_eq!(previous, widths);
@@ -1182,12 +1182,16 @@ fn process_columns_follow_viewport_not_sample_values_and_keep_visible_identity()
                     })
                     .collect();
                 assert!(text.contains("fixture"));
+                assert!(
+                    text.contains("4194305"),
+                    "full seven-digit PID is visible: {text}"
+                );
             }
             assert_eq!(ch(&mut ov, 'x'), MonitorOutcome::Pending);
             assert!(matches!(
                 ov.confirm,
                 Some(Confirm::Signal {
-                    pid: u32::MAX,
+                    pid: 4_194_305,
                     start_time: 100,
                     ..
                 })
@@ -1264,6 +1268,32 @@ fn process_filter_lists_ignored_terms_and_still_matches_valid_bare_terms() {
             if label == "ignored filter terms"
                 && note == "thr>abc (bad value), user: (empty value)"
     )));
+    ov.filtering = true;
+    ov.sync(&model, &hist, screen);
+    assert!(!ov.body.iter().any(|section| matches!(
+        section,
+        Section::HeadingToned { label, .. } if label == "ignored filter terms"
+    )));
+}
+
+#[test]
+fn process_columns_stay_inside_very_narrow_viewports() {
+    let hist = history(10, NOW_MS);
+    let model = model_with_procs(vec![proc(41, None, "worker", 0.0, 4096)]);
+    for cols in 1..=6 {
+        let screen = Rect::full(cols, 12);
+        let ov = open_tab(MonitorTab::Procs, &model, &hist, screen);
+        let widths = ov.body.iter().find_map(|section| match section {
+            Section::FixedTable { widths, .. } => Some(widths),
+            _ => None,
+        });
+        if let Some(widths) = widths {
+            assert_eq!(
+                widths.iter().sum::<usize>() + widths.len().saturating_sub(1) + 1,
+                cols
+            );
+        }
+    }
 }
 
 #[test]
@@ -1298,6 +1328,33 @@ fn process_reflow_keeps_selected_identity_and_fits_the_resized_viewport() {
     assert_eq!(table.sel, Some(3));
     ch(&mut ov, 'x');
     assert!(matches!(ov.confirm, Some(Confirm::Signal { pid, .. }) if pid == selected_pid));
+}
+
+#[test]
+fn process_reflow_uses_frozen_priming_state_when_filter_mentions_warming_note() {
+    let hist = history(240, NOW_MS);
+    let mut model = model_with_procs(vec![proc(41, None, "cpu warming up worker", 12.0, 4096)]);
+    model.procs.primed = true;
+    let small = Rect::full(100, 30);
+    let mut ov = open_tab(MonitorTab::Procs, &model, &hist, small);
+    ov.filter = "cpu warming up".into();
+    ov.sync(&model, &hist, small);
+    assert_eq!(ov.proc_rows.len(), 1);
+    let wide = Rect::full(160, 30);
+    assert!(ov.reflow_geometry(wide));
+    let cpu = ov
+        .body
+        .iter()
+        .find_map(|section| match section {
+            Section::FixedTable { table, .. } => table
+                .header
+                .iter()
+                .position(|header| header == "CPU%")
+                .map(|index| &table.rows[0][index]),
+            _ => None,
+        })
+        .expect("CPU% cell is rendered");
+    assert!(matches!(cpu, crate::sections::Cell::Text(value, _) if value.trim() != "—"));
 }
 
 fn cell_tone(c: &crate::sections::Cell) -> Tok {
@@ -2309,6 +2366,8 @@ fn gpu_monitor_labels_shared_memory_and_preserves_vram_for_discrete_cards() {
             proc_sort: ProcSort::default(),
             proc_desc: false,
             proc_rows: &[],
+            proc_invalid_terms: &[],
+            proc_primed: false,
             disk_rows: &[],
             disk_eta: None,
         });

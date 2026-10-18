@@ -191,10 +191,12 @@ its argument list.
 - `/` opens an incremental, space-separated AND filter (type to narrow,
   `Backspace` to edit, `Enter` to apply, `Esc` to clear). A bare word matches
   process name, PID, or owner. Field terms include `user:blake`, `wt:feat`,
-  `pane:3`, `ctr:web`, `s:D`, `cpu>10`, `mem>1G`, `io>1M`, `age<5m`, and
-  `thr>50`; `!term` negates a term. Unsupported or malformed terms are ignored
-  and listed in the header. `Esc` backs out of the filter first — it does not
-  close the monitor while a filter is open.
+  `cpu>10`, `mem>1G`, `age<5m`, `pid:42`, and `owner:thegn`; `!term` negates
+  a term. `cpu`, `mem`, `age`, `pid`, and `owner` are the fields currently
+  applied. `user`, `wt`, `pane`, `ctr`, `s`, `io`, and `thr` are recognized but
+  currently ignored; ignored and malformed terms are listed in the header.
+  `Esc` backs out of the filter first — it does not close the monitor while a
+  filter is open.
 - `t` toggles a tree view grouped by the sampled parent chain. Because the tab
   only keeps the heaviest processes, a child whose parent fell outside that set
   is hoisted to a top-level row and marked with a leading `…`, rather than

@@ -420,6 +420,8 @@ pub struct MonitorOverlay {
     /// indexes and the signal action reads. Recomputed on rebuild so the key
     /// handler never re-derives ordering out of step with the render.
     proc_rows: Vec<procs_view::ProcRow>,
+    proc_invalid_terms: Vec<procs_view::procs_query::InvalidTerm>,
+    proc_primed: bool,
     lists: invalidation::Lists,
     /// The last body was Processes with these header/display-only inputs.
     process_body: Option<(u64, crate::model_eq::ProcessViewState, bool, bool)>,
@@ -502,6 +504,8 @@ impl MonitorOverlay {
             filter: String::new(),
             filtering: false,
             proc_rows: Vec::new(),
+            proc_invalid_terms: Vec::new(),
+            proc_primed: false,
             lists: invalidation::Lists::default(),
             process_body: None,
             disk_rows: Vec::new(),
@@ -645,6 +649,7 @@ impl MonitorOverlay {
         // Only the active list is derived, and navigation/geometry changes do
         // not re-sort an unchanged process snapshot. Identity remains sampled.
         self.refresh_active_rows(model, now / 1000, preserve_process);
+        self.proc_primed = model.procs.primed;
         // Container row identities for the key handler (the same order the
         // builder renders `model.containers` in), so a key resolves `sel`
         // without a model borrow.
@@ -668,6 +673,8 @@ impl MonitorOverlay {
             proc_sort: self.prefs.proc_sort,
             proc_desc: self.prefs.proc_desc,
             proc_rows: &self.proc_rows,
+            proc_invalid_terms: &self.proc_invalid_terms,
+            proc_primed: model.procs.primed,
             disk_rows: &self.disk_rows,
             disk_eta: ctx.hist.disk_fill_eta(),
         });
@@ -828,6 +835,7 @@ impl MonitorOverlay {
                 &self.proc_rows,
                 self.prefs.proc_tree,
                 self.cols,
+                self.proc_primed,
             );
         }
         self.clamp();
