@@ -13,6 +13,23 @@ pub mod track;
 
 use crate::chrome::LoadStep;
 
+/// Derive the active tab's drawn splash and whether the run loop needs periodic
+/// repaint ticks. Keep both decisions here so tests exercise the same ticker
+/// visibility rule used by `run.rs`.
+pub(crate) fn derive_splash(
+    loading_state: &track::LoadingTracker,
+    session: &crate::session::Session,
+) -> (Vec<LoadStep>, bool) {
+    let steps = session
+        .worktrees
+        .get(session.active)
+        .and_then(|group| loading_state.get(&(group.name.clone(), group.active_tab)))
+        .cloned()
+        .unwrap_or_default();
+    let ticker_visible = ticker::is_animating(&steps);
+    (steps, ticker_visible)
+}
+
 /// The startup-shell watchdog deadline: how long a just-attached login shell may
 /// emit no PTY output before it's treated as hung and swapped for a clean rc-free
 /// shell. A LOCAL shell should prompt in ~1-2s, so 8s is snappy-but-safe. A
@@ -169,7 +186,9 @@ pub(crate) fn apply_spec_batch(
 /// *every* output chunk of *every* pane for the rest of the session. Only a
 /// shell-wait entry or a fully terminal eager-provision plan is clearable here
 /// (empty markers and live-provision steps are not), so when this returns
-/// `false` the drain can skip the tab scan entirely.
+/// `false` the drain can skip the tab scan entirely. Like the existing
+/// shell-wait pre-gate, a terminal eager plan on a background worktree can keep
+/// this true and cause output from unrelated panes to rescan tabs.
 pub(crate) fn any_clearable_splash(
     loading_state: &std::collections::HashMap<(String, usize), Vec<LoadStep>>,
 ) -> bool {
