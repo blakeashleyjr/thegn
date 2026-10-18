@@ -128,7 +128,7 @@ fn row_of(p: &ProcSample, depth: usize, elided_parent: bool) -> ProcRow {
 ///   than dropped. A non-empty filter keeps a row when it matches *or* has a
 ///   matching descendant, so filtering never severs a matching child from its
 ///   visible ancestry.
-pub fn rows_with_invalid(
+pub(in crate::monitor) fn rows_with_invalid(
     snap: &ProcSnapshot,
     view: ProcSnapshotView,
 ) -> (Vec<ProcRow>, Vec<procs_query::InvalidTerm>) {
