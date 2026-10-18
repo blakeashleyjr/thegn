@@ -239,6 +239,7 @@ mod tests {
 
     #[test]
     fn parses_driver_keys_with_kernel_units_and_device_identity() {
+        // Fixture keys: Documentation/gpu/drm-usage-stats.rst (driver, pdev, client id) and drivers/gpu/drm/amd/amdgpu/amdgpu_fdinfo.c (gfx ns output).
         let parsed = parse(
             b"drm-driver:\tamdgpu\ndrm-pdev:\t0000:03:00.0\ndrm-client-id:\t42\ndrm-engine-gfx:\t900 ns\n",
         );
@@ -281,21 +282,26 @@ mod tests {
         );
     }
 
-    // Kernel shapes follow amdgpu_fdinfo.c's amdgpu_ip_name table and the
-    // DRM/Xe fdinfo docs: drm-engine values use ns; xe cycle values are bare.
     #[test]
     fn parses_kernel_amdgpu_i915_and_xe_shapes_and_pairs_xe_totals() {
-        let amdgpu = parse(b"drm-driver:\tamdgpu\ndrm-engine-gfx:\t12 ns\ndrm-engine-dma:\t8 ns\n");
+        // Fixture: Documentation/gpu/drm-usage-stats.rst (driver key) and drivers/gpu/drm/amd/amdgpu/amdgpu_fdinfo.c (engine names and ns output).
+        let amdgpu = parse(
+            b"drm-driver:\tamdgpu\ndrm-engine-gfx:\t12 ns\ndrm-engine-dma:\t8 ns\ndrm-engine-dec:\t4 ns\ndrm-engine-enc:\t5 ns\ndrm-engine-enc_1:\t6 ns\ndrm-engine-jpeg:\t7 ns\ndrm-engine-vpe:\t8 ns\n",
+        );
+        // Fixture: Documentation/gpu/drm-usage-stats.rst (driver key) and drivers/gpu/drm/i915/i915_drm_client.c (render/video ns output).
         let i915 =
             parse(b"drm-driver:\ti915\ndrm-engine-render:\t31 ns\ndrm-engine-video:\t7 ns\n");
+        // Fixture: Documentation/gpu/drm-usage-stats.rst (driver key) and drivers/gpu/drm/xe/xe_drm_client.c (bare cycles/totals/capacity).
         let xe = parse(
             b"drm-driver:\txe\ndrm-cycles-vcs:\t50\ndrm-total-cycles-vcs:\t100\ndrm-engine-capacity-vcs:\t2\n",
         );
         assert_eq!((amdgpu.slots[0], amdgpu.slots[2]), (12, 8));
+        assert_eq!(&amdgpu.slots[3..8], &[4, 5, 6, 7, 8]);
         assert_eq!((i915.slots[0], i915.slots[3]), (31, 7));
         assert_eq!((xe.slots[2], xe.slots[10]), (50, 100));
         let mut previous = None;
         assert!(delta(&mut previous, 1, 100, &xe).is_none());
+        // Fixture: Documentation/gpu/drm-usage-stats.rst (driver key) and drivers/gpu/drm/xe/xe_drm_client.c (bare cycles/totals/capacity).
         let next = parse(
             b"drm-driver:\txe\ndrm-cycles-vcs:\t70\ndrm-total-cycles-vcs:\t200\ndrm-engine-capacity-vcs:\t2\n",
         );
