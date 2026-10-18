@@ -1576,7 +1576,7 @@ mod tests {
         let executable = std::env::current_exe().expect("test executable");
         let args = vec![
             "--exact".to_owned(),
-            format!("{}::resident_fixture_child", module_path!()),
+            "handlers::plugins::tests::resident_fixture_child".to_owned(),
         ];
         let mut env = BTreeMap::new();
         env.insert("THEGN_PLUGIN_TEST_HOLD".to_owned(), "1".to_owned());
@@ -1596,17 +1596,40 @@ mod tests {
         state.plugins.get_mut("p").expect("plugin entry").writer = Some(session.writer());
 
         for id in [1, 2] {
-            let _damage = apply_host_call(
-                &mut state,
-                "p",
-                RpcMessage {
-                    id: Some(id),
-                    method: "host.call".into(),
-                    // The missing route placeholder makes dispatch fail before
-                    // connecting to a daemon, while still exercising admission.
-                    params: serde_json::json!({ "cap": "sessions.snapshot", "params": null }),
-                },
+            assert!(matches!(
+                apply_host_call(
+                    &mut state,
+                    "p",
+                    RpcMessage {
+                        id: Some(id),
+                        method: "host.call".into(),
+                        // The missing route placeholder makes dispatch fail before
+                        // connecting to a daemon, while still exercising admission.
+                        params: serde_json::json!({ "cap": "sessions.snapshot", "params": null }),
+                    },
+                ),
+                PluginDamage::None
+            ));
+        }
+        assert!(state.dispatcher.is_some());
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            let total = state
+                .dispatcher
+                .as_ref()
+                .expect("host.call starts dispatcher")
+                .load
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .total;
+            if total == 0 {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "dispatcher requests did not finish before shared-config assertion"
             );
+            std::thread::sleep(std::time::Duration::from_millis(5));
         }
         assert_eq!(Arc::strong_count(&state.cfg), 2);
 
