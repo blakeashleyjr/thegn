@@ -2894,9 +2894,7 @@ mod tests {
 
     #[test]
     fn dropping_a_pane_returns_without_the_grace_sleep() {
-        if !std::path::Path::new("/proc/self/stat").exists()
-            || crate::platform::pty_term_grace().is_zero()
-        {
+        if !cfg!(target_os = "linux") || crate::platform::pty_term_grace().is_zero() {
             return;
         }
         let (tx, _rx) = tokio_mpsc::channel::<PaneEvent>(64);

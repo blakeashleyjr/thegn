@@ -1146,7 +1146,7 @@ mod tests {
     #[test]
     fn a_status_walk_leaves_no_unreaped_filter_process() {
         // No procfs, no observation — see `own_children`.
-        if !std::path::Path::new("/proc/self/stat").exists() {
+        if !cfg!(target_os = "linux") {
             return;
         }
 
@@ -1185,7 +1185,7 @@ mod tests {
     #[test]
     fn a_worktree_diff_leaves_no_unreaped_filter_process() {
         // No procfs, no observation — see `own_children`.
-        if !std::path::Path::new("/proc/self/stat").exists() {
+        if !cfg!(target_os = "linux") {
             return;
         }
 
@@ -1716,7 +1716,7 @@ mod tests {
 
     #[test]
     fn a_same_size_status_walk_leaves_no_unreaped_filter_process() {
-        if !std::path::Path::new("/proc/self/stat").exists() {
+        if !cfg!(target_os = "linux") {
             return;
         }
 
@@ -1751,7 +1751,7 @@ mod tests {
 
     #[test]
     fn gix_is_dirty_on_same_size_filtered_edits_reaps_and_reports_dirty() {
-        if !std::path::Path::new("/proc/self/stat").exists() {
+        if !cfg!(target_os = "linux") {
             return;
         }
 
@@ -1861,7 +1861,7 @@ mod tests {
 
     #[test]
     fn worktree_diffs_over_filtered_files_spawn_one_filter_process() {
-        if !thegn_core::util::have("sh") || !std::path::Path::new("/proc/self/stat").exists() {
+        if !cfg!(target_os = "linux") || !thegn_core::util::have("sh") {
             return;
         }
         let repo = TestRepo::new("filter-process-wire-reuse");
@@ -1952,7 +1952,7 @@ mod tests {
 
     #[test]
     fn status_walks_over_filtered_files_spawn_one_filter_process() {
-        if !thegn_core::util::have("sh") || !std::path::Path::new("/proc/self/stat").exists() {
+        if !cfg!(target_os = "linux") || !thegn_core::util::have("sh") {
             return;
         }
         let repo = TestRepo::new("filter-status-process-reuse");
@@ -2004,7 +2004,7 @@ mod tests {
 
     #[test]
     fn worktree_diff_status_walk_routes_same_size_edits() {
-        if !thegn_core::util::have("sh") || !std::path::Path::new("/proc/self/stat").exists() {
+        if !cfg!(target_os = "linux") || !thegn_core::util::have("sh") {
             return;
         }
         let repo = TestRepo::new("filter-status-diff-reuse");
@@ -2056,7 +2056,7 @@ mod tests {
 
     #[test]
     fn routed_status_falls_back_to_one_shot_clean() {
-        if !thegn_core::util::have("sh") || !std::path::Path::new("/proc/self/stat").exists() {
+        if !cfg!(target_os = "linux") || !thegn_core::util::have("sh") {
             return;
         }
         let repo = TestRepo::new("filter-status-one-shot-fallback");

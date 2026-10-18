@@ -10,9 +10,9 @@
 # there is no cross-platform way to create one without the deprecated
 # `fs::soft_link`, and the production code's Windows arm
 # (`FILE_FLAG_OPEN_REPARSE_POINT`) cannot be exercised from Linux regardless.
-# Prefer a runtime probe over a `#[cfg]` wherever the API is portable and only
-# the environment differs — that is how the same problem was avoided in
-# `thegn-svc/src/git/native_diff.rs`, which probes for `/proc` instead.
+# Prefer a compile-time `cfg!()` early return wherever an OS-specific runtime
+# dependency (such as `/proc`) is required; Wine maps `/` to `Z:`, so filesystem
+# probes can succeed on Windows even though the API is unavailable.
 #
 # SHRINK-ONLY. Enforced by `platform_cfgs_are_pinned` in
 # crates/thegn-svc/src/platform_ratchet_tests.rs; `just ratchet-update`.
@@ -36,3 +36,6 @@ plugin/proc.rs
 share/tests.rs
 vpn/tests.rs
 vps/ssh_shim.rs
+
+# TEST-ONLY inner cfg (pre-existing platform-specific snapshot filesystem tests; newly detected by inner-attribute scanning).
+snapshot/fs_tests.rs
