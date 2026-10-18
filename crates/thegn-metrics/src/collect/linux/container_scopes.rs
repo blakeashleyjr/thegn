@@ -13,7 +13,7 @@ pub const MAX_CONTAINER_SCOPES: usize = 256;
 const MAX_DIRECTORY_DIRECTORIES: usize = MAX_CONTAINER_SCOPES * 2;
 // The entry budget adds one sentinel so listing truncation can be reported without an unbounded read.
 const MAX_DIRECTORY_ENTRIES: usize = MAX_DIRECTORY_DIRECTORIES + 1;
-// A 64-user ceiling bounds fanout to 323 listings while covering multi-user hosts.
+// Primary-chosen THE-916 cap: 64 concurrently logged-in uids.
 const MAX_USER_SLICES: usize = 64;
 // systemd has one user@UID.service per logged-in user; allow one stale duplicate.
 const MAX_USER_SERVICES: usize = 2;
@@ -72,7 +72,7 @@ pub struct Discovery {
 }
 
 pub fn discover(fs: &dyn DirectoryFs, root: &Path) -> Discovery {
-    discover_for_uid(fs, root, unsafe { libc::geteuid() })
+    discover_for_uid(fs, root, nix::unistd::geteuid().as_raw())
 }
 
 fn discover_for_uid(fs: &dyn DirectoryFs, root: &Path, current_uid: u32) -> Discovery {
@@ -102,7 +102,7 @@ fn discover_for_uid(fs: &dyn DirectoryFs, root: &Path, current_uid: u32) -> Disc
     users.retain(|user| starts_with(user, "user-") && ends_with(user, ".slice"));
     let current_user = OsString::from(format!("user-{current_uid}.slice"));
     if let Some(index) = users.iter().position(|user| user == &current_user) {
-        users.swap(0, index);
+        users[..=index].rotate_right(1);
     }
     if users.len() > MAX_USER_SLICES {
         discovery.truncated = true;
