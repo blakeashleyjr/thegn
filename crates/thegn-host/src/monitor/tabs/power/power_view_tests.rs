@@ -203,6 +203,15 @@ fn snapshot_sizes_capabilities_demand_and_absent_marks() {
         crate::telemetry::ScaleMode::Window,
         (HISTORY_SEED as u64 - 1) * 1_000,
     );
+    assert_eq!(model.batteries[0].charge_history.len(), HISTORY_SEED);
+    assert_eq!(model.telemetry_battery_history.len(), 240);
+    assert_eq!(model.telemetry_draw_peak_w, Some(14.0));
+    assert!(
+        model
+            .telemetry_battery_power_history
+            .iter()
+            .all(|value| !value.is_finite() || (0.0..=1.0).contains(value))
+    );
     let view = PowerView(&model);
     for (cols, rows) in [(100, 30), (160, 45), (240, 60)] {
         for (depth, unicode) in [
@@ -221,7 +230,10 @@ fn snapshot_sizes_capabilities_demand_and_absent_marks() {
                     assert!(output.contains("Power rails"));
                     assert!(output.contains("BAT1"));
                     assert!(output.contains("17.40 W"));
+                    assert!(output.contains("battery draw peak"));
                     assert!(output.contains("balanced"));
+                    assert!(output.contains("boost on"));
+                    assert!(output.contains("EPP balance_perf"));
                     let mut expected = CollectorSet::empty();
                     for panel in placed {
                         for id in view.demand(panel.id).iter() {
@@ -231,8 +243,12 @@ fn snapshot_sizes_capabilities_demand_and_absent_marks() {
                     assert_eq!(board.demand(&view, area, 1000).collectors, expected);
                     if cols == 240 {
                         let r = fill_ratio(&surface, area);
-                        // density follow-up (batch 49): measured 0.19.
-                        assert!(r >= 0.19, "fill ratio {r:.3}");
+                        // density follow-up (batch 50): estimated, primary sets from the printed value
+                        if unicode == UnicodeLevel::Ascii {
+                            assert!(r >= 0.30, "ASCII fill ratio {r:.3}, floor 0.30");
+                        } else {
+                            assert!(r >= 0.30, "Unicode fill ratio {r:.3}, floor 0.30");
+                        }
                     }
                 })
             });
@@ -310,6 +326,7 @@ fn battery_history_uses_latest_telemetry_and_empty_history_is_absent() {
     for tick in 0..24_u64 {
         let stats = thegn_metrics::StatsSnapshot {
             battery: Some((40 + (tick % 50) as u8, false)),
+            battery_power_w: Some(2.0 + (tick % 13) as f32),
             ..thegn_metrics::StatsSnapshot::default()
         };
         history.push(&stats, 97_000 + tick * 1_000);
@@ -321,10 +338,11 @@ fn battery_history_uses_latest_telemetry_and_empty_history_is_absent() {
         crate::telemetry::ScaleMode::Window,
         120_000,
     );
-    assert!(!model.battery_history.is_empty());
+    assert!(!model.telemetry_battery_history.is_empty());
+    assert_eq!(model.batteries[0].charge_history.len(), 1);
     assert!(
         model
-            .battery_history
+            .telemetry_battery_history
             .last()
             .is_some_and(|value| *value > 0.0)
     );
@@ -346,6 +364,11 @@ fn battery_history_uses_latest_telemetry_and_empty_history_is_absent() {
     let graph_rows = (inner_rows.saturating_sub(5) / 2).min(6);
     let graph_y = battery.rect.y + 1 + inner_rows - graph_rows * 2;
     let charge_end = graph_y + graph_rows;
+    let power_start = charge_end + 1;
+    let power_end = graph_y + graph_rows * 2;
+    let inner_cols = battery.rect.cols.saturating_sub(2);
+    let telemetry_cols = inner_cols * 2 / 3;
+    let power_right = battery.rect.x + 1 + telemetry_cols - 1;
     let has_graph_ink = |x| {
         surface.screen_lines()[graph_y + 1..charge_end]
             .iter()
@@ -366,6 +389,19 @@ fn battery_history_uses_latest_telemetry_and_empty_history_is_absent() {
     assert!(
         !has_graph_ink(battery.rect.x + 1),
         "short history leaves the panel's left graph edge blank"
+    );
+    assert!(
+        surface.screen_lines()[power_start..power_end]
+            .iter()
+            .any(|line| {
+                line.visible_cells().any(|cell| {
+                    cell.cell_index() == power_right
+                        && !cell.str().is_empty()
+                        && cell.str() != " "
+                        && cell.str() != "\u{2800}"
+                })
+            }),
+        "newest draw sample reaches the last telemetry graph column"
     );
     let output = text(&mut surface);
     let absent_line = format!("charge history {}", caps::active_glyphs().emdash);
@@ -502,8 +538,8 @@ fn demand_is_static_for_each_panel_and_history_reuses_capacity_after_warmup() {
         model.zones.capacity(),
         model.cpu_policy.capacity(),
         model.history_capacity(),
-        model.battery_history.capacity(),
-        model.battery_power_history.capacity(),
+        model.telemetry_battery_history.capacity(),
+        model.telemetry_battery_power_history.capacity(),
     );
     for index in 0..1_000 {
         frame.at_ms += 1_000 + index as u64;
@@ -522,8 +558,8 @@ fn demand_is_static_for_each_panel_and_history_reuses_capacity_after_warmup() {
             model.zones.capacity(),
             model.cpu_policy.capacity(),
             model.history_capacity(),
-            model.battery_history.capacity(),
-            model.battery_power_history.capacity(),
+            model.telemetry_battery_history.capacity(),
+            model.telemetry_battery_power_history.capacity(),
         ),
         capacities
     );
