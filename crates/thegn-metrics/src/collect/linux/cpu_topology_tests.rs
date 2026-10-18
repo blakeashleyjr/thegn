@@ -246,11 +246,11 @@ fn fake_sysfs_classifies_intel_arm_amd_and_uniform_without_cpufreq() {
 
 #[test]
 fn online_change_rescans_and_removes_cpu_from_topology_and_l3() {
-    let (fs, root) = topology_fixture("intel");
+    let (fs, root) = topology_fixture("amd");
     let online = root.join("devices/system/cpu/online");
     let mut collector = CpuTopologyCollector::with_view(fs, &root);
     assert_eq!(collector.discover(&Env::default()), Health::Ok);
-    collector.view.files.insert(online, b"0-2\n".to_vec());
+    collector.view.files.insert(online, b"0-22\n".to_vec());
     let mut frame = MonitorFrame::default();
     collector
         .sample(
@@ -269,15 +269,13 @@ fn online_change_rescans_and_removes_cpu_from_topology_and_l3() {
             .iter()
             .map(|cpu| cpu.id)
             .collect::<Vec<_>>(),
-        vec![0, 1, 2]
+        (0..23).collect::<Vec<_>>()
     );
-    assert!(
-        !frame
-            .parts
-            .cpu_topology
-            .l3_groups
-            .iter()
-            .flatten()
-            .any(|cpu| *cpu == 3)
+    assert_eq!(
+        frame.parts.cpu_topology.l3_groups,
+        vec![
+            vec![0, 1, 2, 3, 12, 13, 14, 15],
+            (4..12).chain(16..23).collect()
+        ]
     );
 }

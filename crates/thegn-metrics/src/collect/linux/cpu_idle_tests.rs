@@ -43,6 +43,7 @@ fn held_state_times_produce_residency_and_c0_from_two_samples() {
         )
         .unwrap();
     assert_eq!(frame.parts.cpu_idle.cores[0].states[0].residency_pct, None);
+    assert_eq!(frame.parts.cpu_idle.cores[0].c0_pct, None);
     std::fs::write(cpu.join("cpu0/cpuidle/state0/time"), "250000\n").unwrap();
     std::fs::write(cpu.join("cpu0/cpuidle/state1/time"), "350000\n").unwrap();
     collector
@@ -88,6 +89,7 @@ fn backwards_time_degrades_only_that_attribute_and_missing_cpuidle_is_absent() {
         )
         .unwrap();
     assert_eq!(frame.parts.cpu_idle.cores[0].states[0].residency_pct, None);
+    assert_eq!(frame.parts.cpu_idle.cores[0].c0_pct, None);
     assert!(
         frame.parts.cpu_idle.cores[0].states[1]
             .residency_pct

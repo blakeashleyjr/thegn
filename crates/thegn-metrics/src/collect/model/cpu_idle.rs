@@ -1,9 +1,11 @@
 //! Per-CPU cpuidle state metadata and residency percentages.
 
+use std::sync::Arc;
+
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct CpuIdleState {
     pub index: u8,
-    pub name: Option<String>,
+    pub name: Option<Arc<str>>,
     pub latency_us: Option<u64>,
     pub disabled: Option<bool>,
     pub residency_pct: Option<f32>,
