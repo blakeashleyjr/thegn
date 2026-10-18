@@ -798,7 +798,7 @@ fn table_zero_dot_uses_active_marks() {
         );
         let zero = caps::num_marks().zero;
         assert!(zero.is_ascii());
-        assert!((0..5).any(|x| grid.get(x, 1).unwrap().ch == zero));
+        assert!((0..5).any(|x| grid.get(x, 1).unwrap().ch.to_string() == zero));
     });
 }
 
