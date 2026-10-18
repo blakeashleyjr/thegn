@@ -24,11 +24,11 @@ Chips that can expand say so in their top-right corner.
 
 `Tab` and `Shift-Tab` walk the tabs; so do `←`/`→` and `h`/`l`. Each tab in the
 bar carries its own number, and typing that number jumps straight to it —
-`1`–`9`, then `0` for the tenth, so the last tab is reachable too. The numbers
-count the tabs you can actually see, so `2` means the same thing on a laptop and
-on a GPU-less server. On a terminal too narrow for the whole strip, the bar
-scrolls to keep the active tab whole and marks the tabs scrolled off each end,
-rather than clipping the tab you are on.
+`1`–`9`, then `0` for the tenth. An eleventh visible tab has no digit shortcut.
+The numbers count the tabs you can actually see, so `2` means the same thing on
+a laptop and on a GPU-less server. On a terminal too narrow for the whole
+strip, the bar scrolls to keep the active tab whole and marks the tabs scrolled
+off each end, rather than clipping the tab you are on.
 
 Tabs only appear when their source is available — no battery means no Power
 tab, and the GPU tab appears when a GPU reports utilisation. AMD cards and APUs
@@ -72,13 +72,13 @@ log scale while Network stays on a live linear one.
   load average — fall back to `window` under `fixed`, since there is no honest
   number to divide by.
 
-`Space` **pauses**. That freezes the picture, not the recording: samples keep
-accumulating underneath, so resuming shows a continuous timeline with no gap.
-Pausing also drops the sampler back to its normal rate, so a frozen monitor is
-cheaper than a live one.
+`Space` **pauses**. That freezes the picture and parks the sampler, so no new
+samples are recorded until you resume. This makes a paused monitor cheaper than
+a live one.
 
-While the monitor is open and live, its sampler reads every available
-collector; paused or covered, it parks, and nothing runs once it is closed.
+While the monitor is open and live, board tabs sample only the collectors needed
+by their placed panels. The legacy tabs still sample every collector. When
+paused or covered, the sampler parks; nothing runs once the monitor is closed.
 
 Note two deliberate differences from the other overlays: `Space` is pause here
 (use `PgDn` to page), and `g` cycles the graph style rather than jumping to the

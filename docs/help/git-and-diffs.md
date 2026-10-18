@@ -197,7 +197,9 @@ unlocked and locks only the branch update. Pull and fast-forwards on remote
 worktrees stay locked.
 
 A background `[git] auto_fetch` that moves no remote refs does not trigger a
-badge refresh.
+badge refresh. When remote refs do move, the ahead/behind badges are patched
+for that repository's checked-out worktrees; their status and diff counts are
+left alone.
 
 ## Rollback
 
