@@ -553,6 +553,29 @@ fn pending_external_write_is_dropped_when_sampler_closes() {
 }
 
 #[test]
+fn external_health_overlay_survives_registry_health_refresh() {
+    let mut health = [Health::default(); collect::COLLECTORS];
+    health[CollectorId::Uptime.index()] = Health::Absent(Absent::NotImplemented);
+    let overlay =
+        std::array::from_fn(|index| (index == CollectorId::Uptime.index()).then_some(Health::Ok));
+    super::apply_health_overlay(&mut health, &overlay);
+    assert_eq!(health[CollectorId::Uptime.index()], Health::Ok);
+}
+
+#[test]
+fn production_factory_discovers_real_linux_loadavg_collector() {
+    let mut registry =
+        thegn_metrics::collect::registry::Registry::new(super::production_factory()());
+    registry.discover(&Env::default());
+    if cfg!(target_os = "linux") {
+        assert_ne!(
+            registry.health(CollectorId::Loadavg),
+            Health::Absent(Absent::NotImplemented)
+        );
+    }
+}
+
+#[test]
 fn external_write_waits_while_paused_and_is_applied_after_resume() {
     let mut h = harness(false, false);
     h.sampler.sync(Mode::Paused, demand());
