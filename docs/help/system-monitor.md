@@ -107,11 +107,12 @@ If every optional tab appears, Notifications is eleventh and has no digit key.
 
 ## CPU
 
-The CPU tab shows total and per-core utilisation as a graph, with a heat grid
-for logical cores. Its load and clock section shows 1-, 5-, and 15-minute load,
-1-minute load per core, one mean frequency across cores, temperature, and a load
-sparkline. The per-core bars are heat-tinted. The CPU, load, frequency, and
-uptime masthead chips expand into this tab.
+The CPU board shows total busy history and the current user, system, iowait, and
+steal shares. The `cpu.cores` panel labels known performance and efficiency
+cores and groups them by L3 cache; missing topology stays unlabelled. The
+`cpu.idle` panel shows C0 and reported idle-state residency per core. Frequency,
+load/pressure, IRQ/softirq, and scheduler wait have separate panels. Panel
+focus (`f`/`F`), zoom (`z`), and Escape follow the monitor board controls.
 
 ## Memory
 
