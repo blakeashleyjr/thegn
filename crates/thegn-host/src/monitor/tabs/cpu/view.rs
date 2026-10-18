@@ -62,6 +62,7 @@ impl SampleRing {
         }
     }
 
+    #[cfg(test)]
     fn ordered(&self) -> Vec<f32> {
         if self.len < CORE_HISTORY_SAMPLES || self.head == 0 {
             return self.values.clone();
@@ -71,6 +72,19 @@ impl SampleRing {
             .chain(&self.values[..self.head])
             .copied()
             .collect()
+    }
+
+    fn copy_ordered_into(&self, out: &mut Vec<f32>) {
+        out.clear();
+        if self.len == 0 {
+            return;
+        }
+        if self.len < CORE_HISTORY_SAMPLES || self.head == 0 {
+            out.extend_from_slice(&self.values[..self.len]);
+            return;
+        }
+        out.extend_from_slice(&self.values[self.head..]);
+        out.extend_from_slice(&self.values[..self.head]);
     }
 }
 

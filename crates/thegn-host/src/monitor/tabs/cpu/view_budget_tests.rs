@@ -1,4 +1,4 @@
-use super::{CpuModel, USAGE};
+use super::{CpuModel, SampleRing, USAGE};
 use crate::{
     compositor::Rect,
     telemetry::{ScaleMode, TelemetryHistory, Window},
@@ -131,6 +131,138 @@ fn cpu_usage_paint_stays_within_its_pinned_allocation_budget() {
         counts.allocation_calls,
         counts.realloc_calls,
     );
+}
+
+#[test]
+#[allow(
+    clippy::disallowed_macros,
+    reason = "phase budget gate prints observed counts for the primary"
+)]
+fn cpu_usage_paint_phases_report_counts() {
+    const PAINT_ALLOCATION_BUDGET: u64 = 30_300;
+    const PAINT_REALLOC_BUDGET: u64 = 550;
+    let (model, _) = paint_fixture();
+    let mut surface = Surface::new(240, 60);
+
+    let mut grid_model = model.clone();
+    grid_model.cpu_history.clear();
+    grid_model.iowait_history.clear();
+    grid_model.steal_history.clear();
+    for _ in 0..3 {
+        super::paint::paint(&grid_model, &mut surface, USAGE, Rect::full(240, 60));
+    }
+    let (_, grid_counts) = crate::proc_workload_alloc::measure(|| {
+        super::paint::paint(&grid_model, &mut surface, USAGE, Rect::full(240, 60));
+    });
+    eprintln!("CPU usage grid and emit phase observed counts: {grid_counts:?}");
+    assert!(
+        grid_counts.allocation_calls <= PAINT_ALLOCATION_BUDGET
+            && grid_counts.realloc_calls <= PAINT_REALLOC_BUDGET,
+        "CPU usage grid and emit phase observed counts above total budget: {grid_counts:?}"
+    );
+
+    let mut history_model = model.clone();
+    history_model.iowait_history.clear();
+    history_model.steal_history.clear();
+    for _ in 0..3 {
+        super::paint::paint(&history_model, &mut surface, USAGE, Rect::full(240, 60));
+    }
+    let (_, history_counts) = crate::proc_workload_alloc::measure(|| {
+        super::paint::paint(&history_model, &mut surface, USAGE, Rect::full(240, 60));
+    });
+    eprintln!("CPU usage history graph phase observed counts: {history_counts:?}");
+    assert!(
+        history_counts.allocation_calls <= PAINT_ALLOCATION_BUDGET
+            && history_counts.realloc_calls <= PAINT_REALLOC_BUDGET,
+        "CPU usage history graph phase observed counts above total budget: {history_counts:?}"
+    );
+
+    let mut spark_model = model;
+    spark_model.cpu_history.clear();
+    for _ in 0..3 {
+        super::paint::paint(&spark_model, &mut surface, USAGE, Rect::full(240, 60));
+    }
+    let (_, spark_counts) = crate::proc_workload_alloc::measure(|| {
+        super::paint::paint(&spark_model, &mut surface, USAGE, Rect::full(240, 60));
+    });
+    eprintln!("CPU usage io/steal sparkline phase observed counts: {spark_counts:?}");
+    assert!(
+        spark_counts.allocation_calls <= PAINT_ALLOCATION_BUDGET
+            && spark_counts.realloc_calls <= PAINT_REALLOC_BUDGET,
+        "CPU usage io/steal sparkline phase observed counts above total budget: {spark_counts:?}"
+    );
+}
+
+#[test]
+#[allow(
+    clippy::disallowed_macros,
+    reason = "allocation gate prints observed counts for the primary"
+)]
+fn warmed_cpu_heatmap_and_usage_paints_report_allocations() {
+    let (model, _) = paint_fixture();
+    let mut surface = Surface::new(240, 60);
+    for _ in 0..3 {
+        super::paint::paint(&model, &mut surface, super::CORES, Rect::full(240, 60));
+        super::paint::paint(&model, &mut surface, USAGE, Rect::full(240, 60));
+    }
+    let (_, heatmap_counts) = crate::proc_workload_alloc::measure(|| {
+        super::paint::paint(&model, &mut surface, super::CORES, Rect::full(240, 60));
+    });
+    eprintln!("Warmed CPU heatmap paint observed counts: {heatmap_counts:?}");
+    assert_eq!(
+        heatmap_counts.allocation_calls, 0,
+        "warmed CPU heatmap paint allocated: {heatmap_counts:?}"
+    );
+    assert_eq!(
+        heatmap_counts.realloc_calls, 0,
+        "warmed CPU heatmap paint reallocated: {heatmap_counts:?}"
+    );
+
+    let (_, usage_counts) = crate::proc_workload_alloc::measure(|| {
+        super::paint::paint(&model, &mut surface, USAGE, Rect::full(240, 60));
+    });
+    eprintln!("Warmed CPU usage paint observed counts: {usage_counts:?}");
+    assert_eq!(
+        usage_counts.allocation_calls, 0,
+        "warmed CPU usage paint allocated: {usage_counts:?}"
+    );
+    assert_eq!(
+        usage_counts.realloc_calls, 0,
+        "warmed CPU usage paint reallocated: {usage_counts:?}"
+    );
+}
+
+#[test]
+fn copy_ordered_into_matches_ordered_and_retains_capacity() {
+    for values in [Vec::new(), (0..17).map(|value| value as f32).collect()] {
+        let mut ring = SampleRing::default();
+        for value in values {
+            ring.push(value);
+        }
+        let mut out = Vec::new();
+        ring.copy_ordered_into(&mut out);
+        assert_eq!(out, ring.ordered());
+        let capacity = out.capacity();
+        for _ in 0..1_000 {
+            ring.copy_ordered_into(&mut out);
+            assert_eq!(out, ring.ordered());
+            assert_eq!(out.capacity(), capacity);
+        }
+    }
+
+    let mut wrapped = SampleRing::default();
+    for value in 0..(super::CORE_HISTORY_SAMPLES + 5) {
+        wrapped.push(value as f32);
+    }
+    let mut out = Vec::new();
+    wrapped.copy_ordered_into(&mut out);
+    assert_eq!(out, wrapped.ordered());
+    let capacity = out.capacity();
+    for _ in 0..1_000 {
+        wrapped.copy_ordered_into(&mut out);
+        assert_eq!(out, wrapped.ordered());
+        assert_eq!(out.capacity(), capacity);
+    }
 }
 
 #[test]
