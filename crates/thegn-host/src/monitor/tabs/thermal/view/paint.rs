@@ -105,11 +105,11 @@ pub(super) fn cores(grid: &mut CellGrid, rect: Rect, cores: &[Option<f32>; 16]) 
         RampId::Temp,
         &crate::chrome::palette_snapshot(),
     );
-    let mut heat_index = 0;
-    for (index, temp) in cores
+    for (heat_index, (index, temp)) in cores
         .iter()
         .enumerate()
         .filter_map(|(index, temp)| temp.map(|value| (index, value)))
+        .enumerate()
     {
         let x = (index % per_row) * cell_width;
         let y = index / per_row;
@@ -133,7 +133,6 @@ pub(super) fn cores(grid: &mut CellGrid, rect: Rect, cores: &[Option<f32>; 16]) 
                 }
             }
         }
-        heat_index += 1;
         put(
             grid,
             rect,
