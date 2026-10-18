@@ -456,13 +456,13 @@ impl Custody {
     }
     fn finish(&mut self, outcome: SessionOutcome) {
         let process = self.process.take();
-        if !outcome.settled() {
-            if let Some(process) = process {
-                *self.held.lock().unwrap_or_else(|e| e.into_inner()) = Some(HeldProcess {
-                    process,
-                    stderr: std::mem::replace(&mut self.stderr, StderrCapture::new()),
-                });
-            }
+        if !outcome.settled()
+            && let Some(process) = process
+        {
+            *self.held.lock().unwrap_or_else(|e| e.into_inner()) = Some(HeldProcess {
+                process,
+                stderr: std::mem::replace(&mut self.stderr, StderrCapture::new()),
+            });
         }
         self.shared.outcome.send_replace(Some(outcome));
     }
