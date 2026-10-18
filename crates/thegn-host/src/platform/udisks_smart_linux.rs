@@ -59,8 +59,8 @@ struct DriveProperties {
     critical_warning: Option<Vec<String>>,
 }
 
-fn smart_options() -> HashMap<&'static str, Value<'static>> {
-    HashMap::from([("auth.no_user_interaction", Value::Bool(true))])
+fn smart_options() -> HashMap<&'static str, OwnedValue> {
+    HashMap::from([("auth.no_user_interaction", OwnedValue::from(true))])
 }
 
 fn unavailable(reason: impl ToString) -> DiskHealthReport {
@@ -149,7 +149,7 @@ fn decode_drive(path: &str, interfaces: &Interfaces, attributes: &Properties) ->
 }
 
 fn numeric_value(value: &OwnedValue) -> Option<u64> {
-    match &*value {
+    match &**value {
         Value::U8(n) => Some(u64::from(*n)),
         Value::U16(n) => Some(u64::from(*n)),
         Value::U32(n) => Some(u64::from(*n)),
@@ -162,7 +162,7 @@ fn numeric_value(value: &OwnedValue) -> Option<u64> {
 }
 
 fn float_value(value: &OwnedValue) -> Option<f64> {
-    match &*value {
+    match &**value {
         Value::F64(n) => Some(*n),
         _ => None,
     }
@@ -276,7 +276,7 @@ async fn collect(deadline: Duration) -> DiskHealthReport {
             }
             drives.push(decode_drive(path.as_str(), &interfaces, &attributes));
         }
-        Ok(finish_report(drives, &failures))
+        Ok::<DiskHealthReport, String>(finish_report(drives, &failures))
     })
     .await;
     match result {
