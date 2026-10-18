@@ -57,6 +57,10 @@ impl ProcFile {
     pub const fn needs_reopen(&self) -> bool {
         self.needs_reopen
     }
+    #[cfg(test)]
+    pub(super) fn buffer_capacity(&self) -> usize {
+        self.buffer.capacity()
+    }
 }
 
 pub fn fill<S: Source>(

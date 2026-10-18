@@ -28,10 +28,7 @@ impl ZramMmStat {
 pub fn parse_mm_stat(buf: &[u8]) -> Option<ZramMmStat> {
     let mut values = [0_u64; 9];
     let mut count = 0;
-    for field in fields(buf) {
-        if count == values.len() {
-            return None;
-        }
+    for field in fields(buf).take(values.len()) {
         values[count] = parse_u64(field)?;
         count += 1;
     }
@@ -64,6 +61,9 @@ mod tests {
         assert_eq!(eight.huge_pages_since, None);
         let nine = parse_mm_stat(include_bytes!("../../../tests/fixtures/mem/mm_stat_9")).unwrap();
         assert_eq!(nine.huge_pages_since, Some(5));
+        let ten = parse_mm_stat(b"100 50 60 0 70 2 3 4 5 6").unwrap();
+        assert_eq!(ten.huge_pages, Some(4));
+        assert_eq!(ten.huge_pages_since, Some(5));
         assert_eq!(parse_mm_stat(b"1 2 3 4 5 6"), None);
         assert_eq!(parse_mm_stat(b"1 2 3 4 5 6 nope"), None);
         assert_eq!(parse_mm_stat(b"1 0 3 4 5 6 7").unwrap().ratio_milli(), None);
