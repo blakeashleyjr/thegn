@@ -145,7 +145,8 @@ pub(super) fn paint(model: &CpuModel, surface: &mut Surface, id: PanelId, rect: 
 }
 
 fn paint_frequency_history(model: &CpuModel, rect: Rect, surface: &mut Surface) {
-    for (index, policy) in model.cpu_freq.policies.iter().enumerate() {
+    let visible = rect.rows.saturating_sub(3) / 2;
+    for (index, policy) in model.cpu_freq.policies.iter().take(visible).enumerate() {
         let y = rect.y + 3 + index * 2;
         if y >= rect.y + rect.rows || rect.cols == 0 {
             break;
@@ -237,13 +238,14 @@ fn core_label(model: &CpuModel, index: usize) -> String {
             .iter()
             .position(|group| group.contains(&core.id))
     };
-    let group_label = group.map_or_else(String::new, |value| format!(" L3{value}"));
-    let kind_label = if kind.is_empty() {
-        String::new()
-    } else {
-        format!("{kind} ")
-    };
-    format!("{:>2} {kind_label}{group_label}", core.id)
+    let mut parts = vec![format!("{:>2}", core.id)];
+    if !kind.is_empty() {
+        parts.push(kind.to_owned());
+    }
+    if let Some(group) = group {
+        parts.push(format!("L3{group}"));
+    }
+    parts.join(" ")
 }
 
 fn paint_core_heatmap(model: &CpuModel, rect: Rect, surface: &mut Surface) {

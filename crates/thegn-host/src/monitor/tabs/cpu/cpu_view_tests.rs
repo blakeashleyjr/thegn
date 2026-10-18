@@ -194,6 +194,7 @@ fn absorb_fixture_core_history(model: &mut CpuModel, frame: &MonitorFrame) {
         }
         model.absorb_frame(&sample);
     }
+    model.absorb_frame(frame);
 }
 
 fn lines(surface: &Surface) -> Vec<String> {
@@ -230,6 +231,7 @@ fn fill_ratio(surface: &Surface, area: Rect) -> f32 {
                 && x.saturating_add(cell.width()) > x0
                 && !cell.str().is_empty()
                 && cell.str() != " "
+                && cell.str() != "\u{2800}"
         })
         .map(|cell| {
             let x = cell.cell_index();
@@ -368,7 +370,8 @@ fn snapshots_cover_sizes_capabilities_demand_absence_and_fill() {
                 assert!(rendered.contains("C0 30%"));
             }
             if cols == 240 {
-                assert!(fill_ratio(&surface, Rect::full(cols, rows)) >= 0.55);
+                let r = fill_ratio(&surface, Rect::full(cols, rows));
+                assert!(r >= 0.55, "fill ratio {r:.3}");
             }
         }
     }
@@ -551,7 +554,7 @@ fn heatmap_right_edge_shows_the_newest_core_sample() {
             .chars()
             .nth(graph_x + graph_width - 1)
             .unwrap();
-        assert_eq!(newest, caps::raster_table().heat[7]);
+        assert_eq!(newest, *caps::raster_table().heat.last().unwrap());
     });
 }
 
