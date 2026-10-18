@@ -1,4 +1,9 @@
 //! AMD GPU engine and memory readings from held sysfs descriptors.
+//!
+//! Sampling performs at most 5 preads per card on ordinary ticks and 7 on
+//! DPM ticks. With `DEVICE_CAP` cards, that is at most 40 and 56 preads per
+//! tick respectively. DPM reads follow the five-tick cadence; the collector
+//! has no CLOCKS panel visibility mask yet.
 
 use std::fs::File;
 use std::io::{self, Read};
@@ -6,7 +11,7 @@ use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
 
 use crate::collect::model::gpu::RuntimeStatus;
-use crate::collect::model::gpu_engines::{DpmLevels, GpuEngineRow, GpuEnginesPart, GpuSlot};
+use crate::collect::model::gpu_engines::{DpmLevels, GpuEngineRow, GpuSlot};
 use crate::collect::{
     CollectError, Collector, CollectorId, TickCtx,
     env::Env,
@@ -215,6 +220,7 @@ impl<F: GpuAmdFs> GpuAmdCollector<F> {
             Err(error) if is_gone(&error) => return true,
             Err(_) => {
                 card.row.runtime_status = RuntimeStatus::Unknown;
+                clear_hot_fields(&mut card.row);
                 return false;
             }
         }
@@ -222,6 +228,7 @@ impl<F: GpuAmdFs> GpuAmdCollector<F> {
             card.row.runtime_status,
             RuntimeStatus::Active | RuntimeStatus::Unsupported
         ) {
+            clear_hot_fields(&mut card.row);
             return false;
         }
         let gone = self.update_busy(card.gfx_busy.as_ref(), &mut card.row.gfx_busy_pct)
@@ -264,18 +271,11 @@ impl<F: GpuAmdFs> Collector for GpuAmdCollector<F> {
         if !self.discovered {
             return Err(CollectError::Gone);
         }
-        let mut index = 0;
-        let mut removed = false;
-        while index < self.cards.len() {
-            let mut card = self.cards.remove(index);
-            let gone = self.sample_card(&mut card, ctx.tick);
-            if gone {
-                removed = true;
-            } else {
-                self.cards.insert(index, card);
-                index += 1;
-            }
-        }
+        let mut cards = std::mem::take(&mut self.cards);
+        let card_count = cards.len();
+        cards.retain_mut(|card| !self.sample_card(card, ctx.tick));
+        let removed = cards.len() != card_count;
+        self.cards = cards;
         if removed && self.cards.is_empty() {
             return Err(CollectError::Gone);
         }
@@ -301,7 +301,14 @@ impl<F: GpuAmdFs> Collector for GpuAmdCollector<F> {
 }
 
 fn is_gone(error: &io::Error) -> bool {
-    error.kind() == io::ErrorKind::NotFound || error.raw_os_error() == Some(19)
+    error.kind() == io::ErrorKind::NotFound || error.raw_os_error() == Some(libc::ENODEV)
+}
+
+fn clear_hot_fields(row: &mut GpuEngineRow) {
+    row.gfx_busy_pct = None;
+    row.vcn_busy_pct = None;
+    row.vram_used = None;
+    row.gtt_used = None;
 }
 
 fn parse_u64(bytes: &[u8]) -> Option<u64> {
