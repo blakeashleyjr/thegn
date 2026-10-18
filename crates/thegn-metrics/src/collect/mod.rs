@@ -70,7 +70,7 @@ pub enum CollectorId {
 }
 
 impl CollectorId {
-    pub const ALL: [Self; 24] = [
+    pub const ALL: [Self; 25] = [
         Self::Loadavg,
         Self::Uptime,
         Self::Psi,
