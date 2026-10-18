@@ -304,8 +304,10 @@ impl StatsSampler {
 
     /// Take one reading (blocking refreshes — ticker-thread only).
     pub fn sample(&mut self) -> StatsSnapshot {
-        let mut snap = StatsSnapshot::default();
-        snap.power_present = self.power_present;
+        let mut snap = StatsSnapshot {
+            power_present: self.power_present,
+            ..StatsSnapshot::default()
+        };
         let now = Instant::now();
         let slow = self.tick.is_multiple_of(SLOW_EVERY);
 
