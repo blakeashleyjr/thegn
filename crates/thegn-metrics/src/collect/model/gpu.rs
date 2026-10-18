@@ -20,6 +20,8 @@ pub struct IpVersion {
 pub enum RuntimeStatus {
     Active,
     Suspended,
+    Suspending,
+    Unsupported,
     Unknown,
 }
 
