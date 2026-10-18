@@ -733,8 +733,9 @@ fn missing_aux_readings_keep_time_alignment_and_paint_blank_gaps() {
             } else {
                 &[(157, true), (158, true), (159, false)]
             };
+            let lines = surface.screen_lines();
             for &(col, should_paint) in aux_expected {
-                let cell = surface.screen_lines()[44]
+                let cell = lines[44]
                     .visible_cells()
                     .find(|cell| cell.cell_index() == col)
                     .expect("GTT sparkline cell exists");
@@ -745,7 +746,6 @@ fn missing_aux_readings_keep_time_alignment_and_paint_blank_gaps() {
                 );
             }
 
-            let lines = surface.screen_lines();
             let activity_row = lines
                 .iter()
                 .position(|line| {
