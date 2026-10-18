@@ -215,7 +215,7 @@ fn board_snapshots_cover_size_and_capability_matrix() {
                     assert!(rendered.contains("allocstall"));
                 }
                 if level == UnicodeLevel::Ascii {
-                    assert!(rendered.chars().all(|character| character.is_ascii()));
+                    assert!(rendered.is_ascii());
                 }
                 let placed = board.placed(&view, Rect::full(cols, rows));
                 let solution = board.solve(&view, Rect::full(cols, rows));
