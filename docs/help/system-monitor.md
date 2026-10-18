@@ -111,12 +111,12 @@ when their source has a reading; absent readings use the terminal absent mark.
 ## CPU
 
 The CPU board shows total busy history and the current user, system, iowait, and
-steal shares, plus per-core heat. The `cpu.cores` panel labels known
-performance/efficiency cores with P/E badges and groups them by L3 cache;
-missing topology stays unlabelled. The `cpu.idle` panel shows C0 and reported
-C-state residency per core. Frequency, load/pressure, IRQ/softirq, and scheduler
-wait have separate panels. Panel focus (`f`/`F`), zoom (`z`), and Escape follow
-the monitor board controls.
+steal shares, plus a per-core busy heatmap. The `Cores (L3)` panel labels known
+performance/efficiency cores with P/E badges and adds an `L3<n>` tag (such as
+`L30`) when the cache group is known; missing topology stays unlabelled. The
+`C states residency` panel shows C0 and reported C-state residency per core.
+Frequency, load/pressure, IRQ/softirq, and scheduler wait have separate panels.
+Panel focus (`f`/`F`), zoom (`z`), and Escape follow the monitor board controls.
 
 ## Memory
 
@@ -170,11 +170,13 @@ projection when the runway drops below a configured number of hours. The Disk
 masthead chip expands into this tab.
 
 The `worktrees filesystem` block reports total, available, and used space.
-`thegn doctor` also reports Disk health from UDisks2 when available, including
-health, critical warnings, wear, spare, read/write totals, power-on time, and
-the last four serial characters. Missing serial or health values show `n/a`.
-If UDisks2 is unavailable, the report says `n/a (udisks2 unavailable)` and
-gives the reason; it does not prompt.
+On Linux, `thegn doctor` also reports Disk health from UDisks2 when available,
+including health, critical warnings, wear, spare, read/write totals, power-on
+time, and the last four serial characters. Missing serial or health values
+show `n/a`. A partial report still lists the drives it could read and gives the
+reason; if UDisks2 is unavailable, it says `n/a (udisks2 unavailable)` and
+gives the reason. On other platforms, it reports `unsupported on this
+platform`. The check does not prompt.
 
 ## GPU
 
@@ -210,10 +212,10 @@ its argument list.
 
 At 120 columns and wider, a summary above the table shows task, thread and
 kernel-thread totals; R/S/D/Z/T/I state counts; new and exited process counts
-since the previous pass; and CPU/RSS totals for the UI, daemon, panes and other
-processes. The D count uses the warning tone when any process is in disk wait.
-The first pass leaves CPU and new/exited values unknown until their baselines
-are available.
+since the previous pass; and a CPU/RSS breakdown for the UI, daemon, panes and
+other processes. The pane row also shows its process count. The D count uses
+the warning tone when any process is in disk wait. The first pass leaves CPU
+and new/exited values unknown until their baselines are available.
 
 - `c`, `m`, `n`, `p` sort by CPU, memory, name, or PID.
 - `r` reverses the sort direction.
