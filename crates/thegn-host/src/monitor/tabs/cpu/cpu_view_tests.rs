@@ -59,7 +59,7 @@ fn fixture_frame() -> MonitorFrame {
         .map(
             |id| thegn_metrics::collect::model::cpu_topology::CpuTopologyEntry {
                 id,
-                core_type: if id < 4 || id >= 12 && id < 16 {
+                core_type: if id < 4 || (12..16).contains(&id) {
                     thegn_metrics::collect::policy::cpu_topology::CoreType::Performance
                 } else {
                     thegn_metrics::collect::policy::cpu_topology::CoreType::Efficiency
