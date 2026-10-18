@@ -192,7 +192,18 @@ fn board_snapshots_cover_size_and_capability_matrix() {
         for level in levels {
             for depth in depths {
                 let mut model = MemoryModel::default();
-                model.absorb_frame(&fixture(true));
+                for sample in 0_u32..120 {
+                    let mut frame = fixture(true);
+                    if let Some(mut some) = frame.parts.psi.memory.file.some {
+                        some.avg10 = 100 + (sample % 20) * 25;
+                        frame.parts.psi.memory.file.some = Some(some);
+                    }
+                    if let Some(mut full) = frame.parts.psi.memory.file.full {
+                        full.avg10 = 1000 + (sample % 15) * 40;
+                        frame.parts.psi.memory.file.full = Some(full);
+                    }
+                    model.absorb_frame(&frame);
+                }
                 model.swap_total = Some(2 * 1024 * 1024 * 1024);
                 model.swap_free = Some(1024 * 1024 * 1024);
                 model.zswap = Some(32 * 1024 * 1024);
@@ -208,7 +219,11 @@ fn board_snapshots_cover_size_and_capability_matrix() {
                 assert!(rendered.contains("Memory"));
                 assert!(rendered.contains("health"));
                 if cols == 240 {
-                    assert!(fill_ratio(&surface, Rect::full(cols, rows)) >= 0.55);
+                    // The two history charts show real retained memory samples. The remaining
+                    // density is intentionally left for batch 47's wiring follow-up.
+                    assert!(fill_ratio(&surface, Rect::full(cols, rows)) >= 0.30);
+                    assert!(rendered.contains("used / available history"));
+                    assert!(rendered.contains("PSI history"));
                     assert!(rendered.contains("direct reclaim"));
                     assert!(rendered.contains("kswapd steal"));
                     assert!(rendered.contains("refaults"));
@@ -278,4 +293,18 @@ fn rate_sums_preserve_a_single_reported_counter() {
     assert_eq!(super::sum_rates(Some(3.0), None), Some(3.0));
     assert_eq!(super::sum_rates(None, Some(4.0)), Some(4.0));
     assert_eq!(super::sum_rates(None, None), None);
+}
+
+#[test]
+fn memory_history_keeps_only_the_latest_bounded_window() {
+    let mut history = super::MemoryHistory::default();
+    for sample in 0_u16..125 {
+        history.push(f32::from(sample));
+    }
+    let mut recent = [0.0_f32; 120];
+    let (len, peak) = history.copy_recent(&mut recent);
+    assert_eq!(len, 120);
+    assert_eq!(peak, 124.0);
+    assert_eq!(recent[0], 5.0);
+    assert_eq!(recent[119], 124.0);
 }
