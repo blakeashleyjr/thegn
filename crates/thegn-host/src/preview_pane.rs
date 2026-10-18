@@ -76,8 +76,24 @@ pub fn spawn_fetch(
             let delivered = ctx.deliver(|| {
                 let mut delivered = false;
                 if let Some((r, w, h)) = raster {
+                    let prepared = if kitty {
+                        match crate::graphics::kitty_payload(&r, w, h) {
+                            Ok(payload) => Some(std::sync::Arc::new(payload)),
+                            Err(_) => None,
+                        }
+                    } else {
+                        None
+                    };
                     delivered |= img_tx
-                        .try_send((rel.clone(), Raster { rgba: r, w, h }))
+                        .try_send((
+                            rel.clone(),
+                            Raster {
+                                rgba: r,
+                                w,
+                                h,
+                                kitty: prepared,
+                            },
+                        ))
                         .is_ok();
                 }
                 delivered |= text_tx.try_send((rel, text)).is_ok();
