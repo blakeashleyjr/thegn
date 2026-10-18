@@ -7,6 +7,8 @@ thread_local! {
     static NICE_SET: Cell<Option<i32>> = const { Cell::new(None) };
     static SET_CALLS: Cell<usize> = const { Cell::new(0) };
     static DENY_SET: Cell<bool> = const { Cell::new(false) };
+    static IOPRIO_SET_CALLS: Cell<usize> = const { Cell::new(0) };
+    static DENY_IOPRIO_SET: Cell<bool> = const { Cell::new(false) };
 }
 
 fn fake_get_nice(
@@ -36,15 +38,22 @@ fn fake_get_ioprio(
     _pid: u32,
     _start: crate::platform::ProcStart,
 ) -> Result<crate::platform::IoClass, crate::platform::PriorityError> {
-    Ok(crate::platform::IoClass::Idle)
+    Ok(crate::platform::IoClass::None)
 }
 
 fn fake_set_ioprio(
     _pid: u32,
     _start: crate::platform::ProcStart,
-    _class: crate::platform::IoClass,
+    class: crate::platform::IoClass,
 ) -> Result<(), crate::platform::PriorityError> {
-    Ok(())
+    IOPRIO_SET_CALLS.set(IOPRIO_SET_CALLS.get() + 1);
+    if DENY_IOPRIO_SET.get() && matches!(class, crate::platform::IoClass::RealTime(_)) {
+        Err(crate::platform::PriorityError::Denied(
+            "Operation not permitted".into(),
+        ))
+    } else {
+        Ok(())
+    }
 }
 
 fn install_fake_priority_calls() {
@@ -58,6 +67,8 @@ fn install_fake_priority_calls() {
     NICE_SET.set(None);
     SET_CALLS.set(0);
     DENY_SET.set(false);
+    IOPRIO_SET_CALLS.set(0);
+    DENY_IOPRIO_SET.set(false);
 }
 
 fn overlay() -> MonitorOverlay {
@@ -160,9 +171,18 @@ fn cancel_and_identity_change_never_call_the_priority_backend() {
 #[test]
 fn ionice_order_and_platform_visibility_follow_the_platform_constant() {
     use crate::platform::IoClass::{BestEffort, Idle, RealTime};
+    assert_eq!(
+        next_ioprio(crate::platform::IoClass::None, true),
+        BestEffort(5)
+    );
+    assert_eq!(
+        next_ioprio(crate::platform::IoClass::None, false),
+        BestEffort(3)
+    );
     assert_eq!(next_ioprio(Idle, true), BestEffort(0));
-    assert_eq!(next_ioprio(BestEffort(7), true), RealTime(0));
-    assert_eq!(next_ioprio(RealTime(0), false), BestEffort(7));
+    assert_eq!(next_ioprio(BestEffort(7), true), RealTime(4));
+    assert_eq!(next_ioprio(Idle, false), RealTime(4));
+    assert_eq!(next_ioprio(RealTime(4), false), BestEffort(7));
     assert_eq!(next_ioprio(BestEffort(0), false), Idle);
 
     let prefs = crate::monitor::MonitorPrefs::default();
@@ -201,6 +221,30 @@ fn ionice_order_and_platform_visibility_follow_the_platform_constant() {
     } else {
         assert!(overlay.confirm.is_none());
     }
+}
+
+#[test]
+fn ionice_y_reports_realtime_denial_once_without_retry() {
+    install_fake_priority_calls();
+    DENY_IOPRIO_SET.set(true);
+    let mut overlay = overlay();
+    overlay.begin_ionice();
+    key(&mut overlay, KeyCode::Char('+'));
+    key(&mut overlay, KeyCode::Char('+'));
+    key(&mut overlay, KeyCode::Char('+'));
+    assert!(matches!(
+        overlay.confirm,
+        Some(Confirm::Ionice {
+            target: crate::platform::IoClass::RealTime(4),
+            ..
+        })
+    ));
+    key(&mut overlay, KeyCode::Char('y'));
+    assert_eq!(IOPRIO_SET_CALLS.get(), 1);
+    assert_eq!(
+        overlay.status.as_deref(),
+        Some("pid 4242 worker: realtime I/O priority needs privileges (not retried)")
+    );
 }
 
 #[test]

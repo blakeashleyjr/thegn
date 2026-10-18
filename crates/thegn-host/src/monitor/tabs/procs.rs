@@ -58,7 +58,10 @@ fn priority_error(label: &str, error: crate::platform::PriorityError, denial_hin
             format!("{label}: {denial_hint} (not retried)")
         }
         crate::platform::PriorityError::Denied(error) => format!("{label}: {error} (not retried)"),
-        other => format!("{label}: {other:?}"),
+        crate::platform::PriorityError::Failed(message) => format!("{label}: {message}"),
+        crate::platform::PriorityError::Unsupported => {
+            format!("{label}: not supported on this platform")
+        }
     }
 }
 
@@ -71,7 +74,7 @@ fn process_label(pid: u32, name: &str, owner: thegn_metrics::ProcOwner) -> Strin
     }
 }
 
-fn ioprio_label(class: crate::platform::IoClass) -> String {
+pub(in crate::monitor) fn ioprio_label(class: crate::platform::IoClass) -> String {
     match class {
         crate::platform::IoClass::Idle => "idle".to_string(),
         crate::platform::IoClass::BestEffort(level) => format!("best-effort {level}"),
@@ -88,14 +91,14 @@ pub(in crate::monitor) fn next_ioprio(
     match (class, forward) {
         (Idle, true) => BestEffort(0),
         (BestEffort(level), true) if level < 7 => BestEffort(level + 1),
-        (BestEffort(_), true) => RealTime(0),
+        (BestEffort(_), true) => RealTime(4),
         (RealTime(_), true) => Idle,
-        (Idle, false) => RealTime(0),
+        (Idle, false) => RealTime(4),
         (RealTime(_), false) => BestEffort(7),
         (BestEffort(level), false) if level > 0 => BestEffort(level - 1),
         (BestEffort(_), false) => Idle,
-        (crate::platform::IoClass::None, true) => Idle,
-        (crate::platform::IoClass::None, false) => RealTime(0),
+        (crate::platform::IoClass::None, true) => BestEffort(5),
+        (crate::platform::IoClass::None, false) => BestEffort(3),
     }
 }
 
