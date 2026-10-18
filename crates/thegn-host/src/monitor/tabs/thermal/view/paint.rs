@@ -29,7 +29,6 @@ pub(super) fn package(
     grid: &mut CellGrid,
     rect: Rect,
     sensor: Option<&SensorRow>,
-    history: &[f32],
     package_history: &[f32; HISTORY_CAP],
     package_history_len: usize,
     package_history_next: usize,
@@ -92,7 +91,6 @@ pub(super) fn package(
             Tok::Slot(S::Dim),
         );
     }
-    let graph_rows = rect.rows.saturating_sub(5);
     let mut frame_values = [0.0_f32; HISTORY_CAP];
     let count = package_history_len.min(HISTORY_CAP);
     let start = if package_history_len == HISTORY_CAP {
@@ -132,9 +130,10 @@ pub(super) fn package(
             1,
         );
     }
-    if graph_rows > 0 && !history.is_empty() {
-        put(grid, rect, 0, 4, "telemetry 80/95 C", Tok::Slot(S::Dim));
-    }
+}
+
+pub(super) fn telemetry_label(grid: &mut CellGrid, rect: Rect) {
+    put(grid, rect, 0, 4, "telemetry 80/95 C", Tok::Slot(S::Dim));
 }
 
 pub(super) fn cores(grid: &mut CellGrid, rect: Rect, cores: &[Option<f32>; 16]) {
@@ -255,7 +254,7 @@ pub(super) fn sensors(grid: &mut CellGrid, rect: Rect, sensors: &[SensorRow]) {
             (Some(max), Some(crit)) => format!("{max:.0}/{crit:.0}"),
             (Some(max), None) => format!("max {max:.0}"),
             (None, Some(crit)) => format!("crit {crit:.0}"),
-            (None, None) => caps::active_glyphs().emdash.to_owned(),
+            (None, None) => "ref 100 C".to_owned(),
         })
         .collect::<Vec<_>>();
     let bar_width = SENSOR_COLUMN_WIDTHS[4];
