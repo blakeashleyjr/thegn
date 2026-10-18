@@ -76,20 +76,19 @@ fn same_identity_cpu_counters_use_saturating_deltas_over_elapsed_time() {
 }
 
 #[test]
-fn exited_stat_read_becomes_ghost_and_closes_handle() {
+fn exited_stat_read_is_pruned_and_closes_handle() {
     let mut table = table_with(1, 8);
     table.pass(Duration::from_secs(1), &[1]).unwrap();
     table.fs_mut().exit_on_next_read(1);
 
     table.pass(Duration::from_secs(2), &[1]).unwrap();
 
-    assert!(table.entries()[0].ghost);
-    assert!(!table.entries()[0].has_kept_fd());
+    assert!(table.entries().is_empty());
     assert_eq!(table.fs().ops().closes, 1);
 }
 
 #[test]
-fn gone_read_error_ghosts_and_later_pids_still_refresh() {
+fn gone_read_error_prunes_and_later_pids_still_refresh() {
     let mut table = table_with(2, 8);
     table.pass(Duration::from_secs(1), &[]).unwrap();
     table.fs_mut().reset_ops();
@@ -97,10 +96,25 @@ fn gone_read_error_ghosts_and_later_pids_still_refresh() {
 
     table.pass(Duration::from_secs(2), &[]).unwrap();
 
-    assert!(table.entries()[0].ghost);
+    assert_eq!(table.entries().len(), 1);
+    assert_eq!(table.entries()[0].id.pid, 2);
     assert!(!table.entries()[0].has_kept_fd());
-    assert_eq!(table.entries()[1].last_seen, Duration::from_secs(2));
+    assert_eq!(table.entries()[0].last_seen, Duration::from_secs(2));
     assert_eq!(table.fs().ops().closes, 1);
+}
+
+#[test]
+fn removed_process_is_pruned_on_the_next_pass() {
+    let mut table = table_with(2, 8);
+    table.pass(Duration::from_secs(1), &[]).unwrap();
+    assert_eq!(table.entries().len(), 2);
+
+    table.fs_mut().remove(1);
+    table.pass(Duration::from_secs(2), &[]).unwrap();
+
+    assert_eq!(table.entries().len(), 1);
+    assert_eq!(table.entries()[0].id.pid, 2);
+    assert_eq!(table.kept_count(), 1);
 }
 
 #[test]
