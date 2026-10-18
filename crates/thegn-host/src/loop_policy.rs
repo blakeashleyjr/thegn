@@ -101,7 +101,7 @@ pub fn drain_logs(
             break;
         }
         took = true;
-        let records = slice.iter().filter(|log| !is_gap_marker(log)).count();
+        let records = slice.len() - usize::from(slice.first().is_some_and(is_gap_marker));
         dirty |= apply_log_slice(rows, first_seq, slice, visible);
         applied += records;
         if applied >= budget.max_records
@@ -118,6 +118,7 @@ pub fn drain_logs(
     }
 }
 
+/// Identifies the leading overload marker created by `thegn_svc::log::ingress::gap_marker`.
 fn is_gap_marker(log: &ParsedLog) -> bool {
     log.timestamp.is_empty()
         && log.level == thegn_core::log::parser::LogLevel::Warn

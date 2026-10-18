@@ -14788,7 +14788,7 @@ async fn event_loop<T: Terminal>(
         // -- 23. Log streams
         let log_backlog = {
             let track_cursor = panel_ui.open == crate::panel::Section::Logs || panel_ui.logs_tail;
-            let anchor = if track_cursor {
+            let anchor = if track_cursor && !panel_ui.logs_tail && logs_ingress.has_pending() {
                 crate::panel::sections::logs::cursor_seq(&model.panel, &panel_ui)
             } else {
                 None
