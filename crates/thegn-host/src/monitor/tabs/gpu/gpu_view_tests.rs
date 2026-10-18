@@ -580,7 +580,8 @@ fn implausible_activity_is_blank_and_suspended_frames_do_not_push() {
                 .contains("GPU0 gfx 0-100%")
         })
         .expect("gfx activity label rendered");
-    let newest_cell = surface.screen_lines()[gfx_row]
+    let screen_lines = surface.screen_lines();
+    let newest_cell = screen_lines[gfx_row]
         .visible_cells()
         .find(|cell| cell.cell_index() == 39)
         .expect("newest graph cell");
