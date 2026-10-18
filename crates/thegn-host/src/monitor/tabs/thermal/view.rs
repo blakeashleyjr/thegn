@@ -466,6 +466,20 @@ fn is_package_label(label: &str) -> bool {
     package_label_rank(label) != usize::MAX
 }
 
+fn history_graph_rect(rect: Rect, inner: Rect, len: usize, braille: bool) -> Rect {
+    let used = if braille { len.div_ceil(2) } else { len };
+    let cols = used.min(inner.cols);
+    Rect {
+        x: rect
+            .x
+            .saturating_add(inner.x)
+            .saturating_add(inner.cols.saturating_sub(cols)),
+        y: rect.y.saturating_add(inner.y).saturating_add(5),
+        cols,
+        rows: inner.rows.saturating_sub(5),
+    }
+}
+
 mod paint;
 
 pub(in crate::monitor) struct ThermalView<'a>(pub &'a ThermalModel);
@@ -573,7 +587,7 @@ impl TabView for ThermalView<'_> {
             rect.y,
         );
         if placed.id == PACKAGE && inner.rows > 5 && !self.0.temp_history.is_empty() {
-            let count = self.0.temp_history.len().min(inner.cols).min(HISTORY_CAP);
+            let count = self.0.temp_history.len().min(HISTORY_CAP);
             let first = self.0.temp_history.len().saturating_sub(count);
             let mut normalized = [f32::NAN; HISTORY_CAP];
             for (index, value) in normalized.iter_mut().take(count).enumerate() {
@@ -582,18 +596,12 @@ impl TabView for ThermalView<'_> {
                     *value = paint::thermal_level(temp, 80.0, 95.0);
                 }
             }
+            let graph_rect =
+                history_graph_rect(rect, inner, count, crate::monitor::graphs::table().braille);
             crate::monitor::graphs::paint_history_graph(
                 &normalized[..count],
                 thegn_core::theme::RampId::Temp,
-                Rect {
-                    x: rect
-                        .x
-                        .saturating_add(inner.x)
-                        .saturating_add(inner.cols.saturating_sub(count)),
-                    y: rect.y.saturating_add(inner.y).saturating_add(5),
-                    cols: count,
-                    rows: inner.rows.saturating_sub(5),
-                },
+                graph_rect,
                 surface,
             );
         }
