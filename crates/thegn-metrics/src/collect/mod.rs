@@ -43,10 +43,12 @@ pub enum CollectorId {
     Diskstats,
     Powercap,
     PowerSupply,
+    CpuIrq,
+    CpuSched,
 }
 
 impl CollectorId {
-    pub const ALL: [Self; 15] = [
+    pub const ALL: [Self; 17] = [
         Self::Loadavg,
         Self::Uptime,
         Self::Psi,
@@ -62,6 +64,8 @@ impl CollectorId {
         Self::Diskstats,
         Self::Powercap,
         Self::PowerSupply,
+        Self::CpuIrq,
+        Self::CpuSched,
     ];
 
     pub const fn slug(self) -> &'static str {
@@ -81,6 +85,8 @@ impl CollectorId {
             Self::Diskstats => "diskstats",
             Self::Powercap => "powercap",
             Self::PowerSupply => "power_supply",
+            Self::CpuIrq => "cpu_irq",
+            Self::CpuSched => "cpu_sched",
         }
     }
 
@@ -176,6 +182,9 @@ pub fn default_collectors() -> Vec<Box<dyn Collector>> {
     collectors[CollectorId::PowerSupply.index()] = Box::new(
         linux::power_supply::PowerSupplyCollector::at("/sys/class/power_supply"),
     );
+    collectors[CollectorId::CpuIrq.index()] = Box::new(linux::cpu_irq::CpuIrqCollector::new());
+    collectors[CollectorId::CpuSched.index()] =
+        Box::new(linux::cpu_sched::CpuSchedCollector::new());
     collectors
 }
 
@@ -204,6 +213,8 @@ mod default_collectors_tests {
             CollectorId::Cgroup,
             CollectorId::CgroupSlice,
             CollectorId::AmdSmu,
+            CollectorId::CpuIrq,
+            CollectorId::CpuSched,
         ] {
             assert_ne!(
                 collectors[id.index()].cadence(),
