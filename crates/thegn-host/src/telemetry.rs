@@ -225,7 +225,7 @@ impl Metric {
 
     /// Value to record from one snapshot, or NaN when the platform does not
     /// expose it.
-    fn read(self, s: &StatsSnapshot) -> f32 {
+    pub(crate) fn read(self, s: &StatsSnapshot) -> f32 {
         fn or_nan<T>(v: Option<T>, f: impl Fn(T) -> f32) -> f32 {
             v.map(f).unwrap_or(f32::NAN)
         }
