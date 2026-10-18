@@ -175,7 +175,7 @@ including health, critical warnings, wear, spare, read/write totals, power-on
 time, and the last four serial characters. Missing serial or health values
 show `n/a`. A partial report still lists the drives it could read and gives the
 reason; if UDisks2 is unavailable, it says `n/a (udisks2 unavailable)` and
-gives the reason. On other platforms, it reports `unsupported on this
+gives the reason. On other platforms the reason is `unsupported on this
 platform`. The check does not prompt.
 
 ## GPU
