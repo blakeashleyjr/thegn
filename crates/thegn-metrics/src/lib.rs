@@ -23,6 +23,9 @@ mod gpu_sysfs;
 mod net_kind;
 mod net_medium;
 mod procs;
+pub mod procs_fs;
+#[cfg(target_os = "linux")]
+pub mod procs_linux;
 pub mod procs_model;
 pub mod procs_parse;
 mod sample;
