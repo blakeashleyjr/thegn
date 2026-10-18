@@ -67,6 +67,26 @@ pub(super) fn line(input: FooterInput<'_>) -> Line {
                 format!("{verb} {label}?")
             }
             Confirm::Clean { label, .. } => format!("clean target/ in {label}?"),
+            Confirm::Renice {
+                label,
+                current,
+                target,
+                ..
+            } => {
+                format!("{label}: nice {current} -> {target} · +/- adjust · y apply · n cancel")
+            }
+            Confirm::Ionice {
+                label,
+                current,
+                target,
+                ..
+            } => {
+                format!(
+                    "{label}: ionice {} -> {} · +/- adjust · y apply · n cancel",
+                    super::tabs::procs::ioprio_label(*current),
+                    super::tabs::procs::ioprio_label(*target)
+                )
+            }
         };
         return Line::split(
             vec![seg(Tok::Slot(S::Accent), msg).bold()],
