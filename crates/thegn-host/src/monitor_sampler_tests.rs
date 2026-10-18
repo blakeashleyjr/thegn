@@ -76,6 +76,7 @@ struct FakeCollector {
     drain_gate: Option<Arc<AtomicUsize>>,
     closes: Arc<AtomicUsize>,
     errors: bool,
+    parse_failure: bool,
 }
 
 impl Collector for FakeCollector {
@@ -95,7 +96,7 @@ impl Collector for FakeCollector {
     fn sample(
         &mut self,
         ctx: &TickCtx,
-        _frame: &mut MonitorFrame,
+        frame: &mut MonitorFrame,
     ) -> Result<(), collect::CollectError> {
         self.sample_ticks
             .lock()
@@ -107,7 +108,17 @@ impl Collector for FakeCollector {
                 std::thread::yield_now();
             }
         }
-        if self.errors {
+        if self.parse_failure {
+            frame.parts.loadavg.value = Some(collect::parse::loadavg::Loadavg {
+                load1: if ctx.tick == 0 { 100 } else { 900 },
+                ..Default::default()
+            });
+        }
+        if self.parse_failure && ctx.tick > 0 {
+            Err(collect::CollectError::Parse("injected parse failure"))
+        } else if self.parse_failure {
+            Ok(())
+        } else if self.errors {
             Err(collect::CollectError::Gone)
         } else {
             Ok(())
@@ -140,6 +151,17 @@ fn harness_with_gate(
     wake_error: bool,
     spawn_error: bool,
 ) -> Harness {
+    harness_with_options(absent, errors, drain_gate, wake_error, spawn_error, false)
+}
+
+fn harness_with_options(
+    absent: bool,
+    errors: bool,
+    drain_gate: Option<Arc<AtomicUsize>>,
+    wake_error: bool,
+    spawn_error: bool,
+    parse_failure: bool,
+) -> Harness {
     let clock = Arc::new(FakeClock::new());
     let samples = Arc::new(AtomicUsize::new(0));
     let sample_ticks = Arc::new(Mutex::new(Vec::new()));
@@ -168,6 +190,7 @@ fn harness_with_gate(
                         drain_gate: drain_gate.clone(),
                         closes: Arc::clone(&closes),
                         errors,
+                        parse_failure,
                     }) as Box<dyn Collector>
                 })
                 .collect()
@@ -554,12 +577,57 @@ fn pending_external_write_is_dropped_when_sampler_closes() {
 
 #[test]
 fn external_health_overlay_survives_registry_health_refresh() {
-    let mut health = [Health::default(); collect::COLLECTORS];
-    health[CollectorId::Uptime.index()] = Health::Absent(Absent::NotImplemented);
-    let overlay =
-        std::array::from_fn(|index| (index == CollectorId::Uptime.index()).then_some(Health::Ok));
-    super::apply_health_overlay(&mut health, &overlay);
-    assert_eq!(health[CollectorId::Uptime.index()], Health::Ok);
+    let mut h = harness(false, false);
+    h.sampler.sync(Mode::Paused, demand());
+    wait_phase(&h, Phase::Parked);
+    let poster = h.sampler.poster().unwrap();
+    poster.post_external(CollectorId::Uptime, Health::Ok, |_parts| {});
+    h.sampler.sync(Mode::Open, demand());
+    let mut registry_frame = None;
+    for _ in 0..100_000 {
+        if let Some(frame) = h.sampler.take_latest() {
+            if frame.sampled.contains(CollectorId::Loadavg)
+                && !frame.sampled.contains(CollectorId::Uptime)
+            {
+                registry_frame = Some(frame);
+                break;
+            }
+            h.sampler.recycle(frame);
+        }
+        std::thread::yield_now();
+    }
+    let frame = registry_frame.expect("registry-sampled Loadavg frame should be published");
+    assert_eq!(frame.health[CollectorId::Uptime.index()], Health::Ok);
+    h.sampler.recycle(frame);
+}
+
+#[test]
+fn failed_sampler_tick_preserves_the_last_published_part_value() {
+    let mut h = harness_with_options(false, true, None, false, false, true);
+    h.sampler.sync(Mode::Open, demand());
+    let mut failed_frame = None;
+    for _ in 0..100_000 {
+        if let Some(frame) = h.sampler.take_latest() {
+            if frame.sampled.contains(CollectorId::Loadavg)
+                && matches!(
+                    frame.health[CollectorId::Loadavg.index()],
+                    Health::Failing { .. }
+                )
+            {
+                failed_frame = Some(frame);
+                break;
+            }
+            h.sampler.recycle(frame);
+        }
+        std::thread::yield_now();
+    }
+    let frame = failed_frame.expect("failed Loadavg tick should be published");
+    assert_eq!(frame.parts.loadavg.value.as_ref().unwrap().load1, 100);
+    assert!(matches!(
+        frame.health[CollectorId::Loadavg.index()],
+        Health::Failing { .. }
+    ));
+    h.sampler.recycle(frame);
 }
 
 #[test]
@@ -573,6 +641,7 @@ fn production_factory_discovers_real_linux_loadavg_collector() {
             Health::Absent(Absent::NotImplemented)
         );
     }
+    registry.close_all();
 }
 
 #[test]
