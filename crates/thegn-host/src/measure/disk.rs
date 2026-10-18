@@ -1153,6 +1153,6 @@ mod generation_tests {
             Some("true".to_string())
         );
         let after = thegn_core::util::core_git_spawn_count();
-        assert!(after > before);
+        assert_eq!(after - before, 1);
     }
 }
