@@ -222,8 +222,9 @@ installed; otherwise it reads through `nvidia-smi`.
 
 ## Power
 
-The Power tab has three panels: `power.rails` plots socket and powercap history
-against its labelled ceiling; `power.battery` plots charge against 100%, energy
+The Power tab has three panels: `power.rails` plots labelled socket, APU, core,
+gfx, system, and powercap-zone bands against its labelled ceiling;
+`power.battery` plots charge against 100%, energy
 against battery capacity, and draw magnitude against its labelled peak with the
 current signed direction shown; and `power.policy` shows profile, boost, and EPP
 as status chips. Frame and telemetry histories use separate scales. Unavailable

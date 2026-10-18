@@ -779,30 +779,12 @@ impl TabView for PowerView<'_> {
             }
         }
         if placed.id == RAILS && inner.rows > 2 {
-            let rail_samples = self
-                .0
-                .rail_history
-                .iter()
-                .map(Vec::len)
-                .chain(
-                    self.0
-                        .zones
-                        .iter()
-                        .filter(|zone| zone.active)
-                        .map(|zone| zone.history.len()),
-                )
-                .max()
-                .unwrap_or(0);
-            let graph_rect = crate::monitor::kit::history_rect::graph_rect(
-                Rect {
-                    x: rect.x + inner.x,
-                    y: rect.y + inner.y,
-                    cols: inner.cols,
-                    rows: inner.rows,
-                },
-                rail_samples,
-                graphs::table().braille,
-            );
+            let bands_rect = Rect {
+                x: rect.x + inner.x,
+                y: rect.y + inner.y,
+                cols: inner.cols,
+                rows: inner.rows,
+            };
             let band_count = self
                 .0
                 .rail_history
@@ -818,9 +800,9 @@ impl TabView for PowerView<'_> {
                     .iter()
                     .filter(|zone| zone.active && !zone.history.is_empty())
                     .count();
-            if band_count > 0 && graph_rect.rows >= 2 {
-                let drawn_bands = band_count.min(graph_rect.rows / 2);
-                let plot_rows = graph_rect.rows / drawn_bands;
+            if band_count > 0 && bands_rect.rows >= 2 {
+                let drawn_bands = band_count.min(bands_rect.rows / 2);
+                let plot_rows = bands_rect.rows / drawn_bands;
                 let ceiling = rail_ceiling(self.0);
                 let mut band = 0;
                 for (index, history) in self.0.rail_history.iter().enumerate() {
@@ -838,7 +820,7 @@ impl TabView for PowerView<'_> {
                         self.0.rail_current[3],
                         self.0.rail_current[4],
                     ];
-                    let band_y = graph_rect.y + band * plot_rows;
+                    let band_y = bands_rect.y + band * plot_rows;
                     let mut normalized = [0.0_f32; HISTORY_CAP];
                     normalized[..history.len()].copy_from_slice(history);
                     for value in normalized.iter_mut().take(history.len()) {
@@ -846,16 +828,18 @@ impl TabView for PowerView<'_> {
                     }
                     draw_graph_label(
                         surface,
-                        graph_rect.x,
+                        bands_rect.x,
                         band_y,
-                        graph_rect.cols,
+                        bands_rect.cols,
                         &watts_label(labels[index], values[index]),
                     );
                     let plot = crate::monitor::kit::history_rect::graph_rect(
                         Rect {
                             y: band_y + 1,
                             rows: plot_rows.saturating_sub(1),
-                            ..graph_rect
+                            x: bands_rect.x,
+                            cols: bands_rect.cols,
+                            ..bands_rect
                         },
                         history.len(),
                         graphs::table().braille,
@@ -877,7 +861,7 @@ impl TabView for PowerView<'_> {
                     if band >= drawn_bands {
                         break;
                     }
-                    let band_y = graph_rect.y + band * plot_rows;
+                    let band_y = bands_rect.y + band * plot_rows;
                     let mut normalized = [0.0_f32; HISTORY_CAP];
                     normalized[..zone.history.len()].copy_from_slice(&zone.history);
                     for value in normalized.iter_mut().take(zone.history.len()) {
@@ -885,16 +869,18 @@ impl TabView for PowerView<'_> {
                     }
                     draw_graph_label(
                         surface,
-                        graph_rect.x,
+                        bands_rect.x,
                         band_y,
-                        graph_rect.cols,
+                        bands_rect.cols,
                         &watts_label(&zone.name, zone.watts),
                     );
                     let plot = crate::monitor::kit::history_rect::graph_rect(
                         Rect {
                             y: band_y + 1,
                             rows: plot_rows.saturating_sub(1),
-                            ..graph_rect
+                            x: bands_rect.x,
+                            cols: bands_rect.cols,
+                            ..bands_rect
                         },
                         zone.history.len(),
                         graphs::table().braille,
