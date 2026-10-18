@@ -9,6 +9,7 @@ pub mod meminfo;
 pub mod mountinfo;
 pub mod netdev;
 pub mod netstat;
+pub mod pp_dpm;
 pub mod psi;
 pub mod schedstat;
 pub mod snmp;
