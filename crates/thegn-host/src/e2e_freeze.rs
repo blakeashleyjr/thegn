@@ -26,6 +26,8 @@
 //!   [`BUILD_TIME`], since `THEGN_BUILD_TIME` changes on every rebuild.
 //! - the UI locale → `en-US` before `i18n::init`, so host locale/config and the
 //!   developer pseudolocale cannot change snapshots.
+//! - Processes rows → six fixed, high odd PIDs, so the live sampler cannot
+//!   expose machine processes or let a driven signal reach one.
 //!
 //! It is a test hook only: nothing else reads it, and when the variable is
 //! unset every check is one relaxed atomic load.
@@ -147,6 +149,216 @@ pub fn stats() -> thegn_metrics::StatsSnapshot {
     }
 }
 
+/// Fixed process rows used by deterministic monitor snapshots.
+pub fn procs() -> thegn_metrics::ProcSnapshot {
+    use thegn_metrics::ProcOwner;
+    thegn_metrics::ProcSnapshot {
+        procs: vec![
+            row(
+                4_194_305,
+                None,
+                "thegn",
+                3.5,
+                64 << 20,
+                3600,
+                ProcOwner::ThegnSelf,
+            ),
+            row(
+                4_194_307,
+                None,
+                "thegn-daemon",
+                0.8,
+                32 << 20,
+                7200,
+                ProcOwner::ThegnDaemon,
+            ),
+            row(
+                4_194_309,
+                None,
+                "pane-shell",
+                1.2,
+                48 << 20,
+                1800,
+                ProcOwner::Pane(1),
+            ),
+            row(
+                4_194_311,
+                Some(4_194_309),
+                "pane-child",
+                0.4,
+                12 << 20,
+                1200,
+                ProcOwner::Pane(1),
+            ),
+            row(
+                4_194_313,
+                None,
+                "editor",
+                8.1,
+                256 << 20,
+                900,
+                ProcOwner::Other,
+            ),
+            row(
+                4_194_315,
+                None,
+                "worker",
+                2.0,
+                96 << 20,
+                300,
+                ProcOwner::Other,
+            ),
+        ],
+        total: 6,
+        primed: true,
+        enabled: true,
+    }
+}
+
+fn row(
+    pid: u32,
+    ppid: Option<u32>,
+    name: &str,
+    cpu: f32,
+    rss: u64,
+    run_secs: u64,
+    owner: thegn_metrics::ProcOwner,
+) -> thegn_metrics::ProcSample {
+    thegn_metrics::ProcSample {
+        pid,
+        ppid,
+        start_time: 1_767_268_800,
+        name: name.to_string(),
+        cpu_pct: cpu,
+        rss_bytes: rss,
+        run_secs,
+        owner,
+    }
+}
+
+pub fn procs_or(live: thegn_metrics::ProcSnapshot) -> thegn_metrics::ProcSnapshot {
+    procs_when(active(), live)
+}
+
+fn procs_when(frozen: bool, live: thegn_metrics::ProcSnapshot) -> thegn_metrics::ProcSnapshot {
+    if frozen { procs() } else { live }
+}
+
+#[cfg(test)]
+pub(crate) const FROZEN_MS: u64 = 1_767_268_800_000;
+
+#[cfg(test)]
+pub(crate) fn freeze_frame(frame: &mut thegn_metrics::collect::frame::MonitorFrame) {
+    use thegn_metrics::collect::{
+        CollectorId,
+        health::Health,
+        model::cpu_stat::{CoreSample, ModeShare},
+        parse::{loadavg::Loadavg, psi::PsiFile, uptime::Uptime},
+    };
+    frame.reset();
+    frame.seq = 1;
+    frame.at_ms = FROZEN_MS;
+    frame.dt_ms = 1000;
+    for id in [
+        CollectorId::Loadavg,
+        CollectorId::Uptime,
+        CollectorId::Psi,
+        CollectorId::CpuStat,
+    ] {
+        frame.sampled.insert(id);
+    }
+    frame.health = [Health::Ok; thegn_metrics::collect::COLLECTORS];
+    frame.parts.loadavg.value = Some(Loadavg {
+        load1: 50,
+        load5: 40,
+        load15: 30,
+        running: 1,
+        total: 6,
+        last_pid: 4_194_315,
+    });
+    frame.parts.uptime.value = Some(Uptime {
+        up_centi: 360_000,
+        idle_centi: 0,
+    });
+    frame.parts.psi.cpu.present = true;
+    frame.parts.psi.cpu.file = PsiFile::default();
+    frame.parts.psi.cpu.some_stall_centi = Some(12);
+    frame.parts.psi.memory.present = true;
+    frame.parts.psi.memory.some_stall_centi = Some(4);
+    frame.parts.cpu_stat.total = Some(ModeShare {
+        user: 120,
+        system: 80,
+        idle: 800,
+        busy: 200,
+        ..Default::default()
+    });
+    frame.parts.cpu_stat.cores.clear();
+    frame.parts.cpu_stat.cores.extend([
+        CoreSample {
+            id: 0,
+            online: true,
+            share: frame.parts.cpu_stat.total,
+        },
+        CoreSample {
+            id: 1,
+            online: true,
+            share: frame.parts.cpu_stat.total,
+        },
+    ]);
+}
+
+#[cfg(test)]
+pub(crate) fn seed_series(
+    store: &mut thegn_core::series_store::SeriesStore,
+    keys: &[(
+        thegn_core::series_store::SeriesKey,
+        thegn_core::series_store::Class,
+    )],
+    now_ms: u64,
+) -> usize {
+    use thegn_core::series_store::horizon_secs;
+    let mut seeded = 0;
+    for (key, class) in keys {
+        let Some(id) = store.intern(*key, *class) else {
+            continue;
+        };
+        seeded += 1;
+        let start = now_ms.saturating_sub(u64::from(horizon_secs(*class)) * 1000);
+        let hour_start = now_ms.saturating_sub(3_600_000).max(start);
+        let ten_min_start = now_ms.saturating_sub(600_000).max(start);
+        let mut at = start;
+        let mut step = 0_u64;
+        while at < hour_start {
+            let _pushed = store.push(id, at, seed_value(*key, step));
+            step += 1;
+            at = at.saturating_add(60_000);
+        }
+        at = hour_start.max(at);
+        while at < ten_min_start {
+            let _pushed = store.push(id, at, seed_value(*key, step));
+            step += 1;
+            at = at.saturating_add(5_000);
+        }
+        at = ten_min_start.max(at);
+        while at <= now_ms {
+            let _pushed = store.push(id, at, seed_value(*key, step));
+            step += 1;
+            let next = at.saturating_add(1_000);
+            if next == at {
+                break;
+            }
+            at = next;
+        }
+    }
+    seeded
+}
+
+#[cfg(test)]
+fn seed_value(key: thegn_core::series_store::SeriesKey, step: u64) -> f32 {
+    ((u64::from(key.family) * 31 + u64::from(key.metric) * 17 + u64::from(key.instance) * 7 + step)
+        % 1000) as f32
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -199,5 +411,102 @@ mod tests {
         let mut live = "ja-JP".to_string();
         pin_locale_when(false, &mut live);
         assert_eq!(live, "ja-JP");
+    }
+
+    #[test]
+    fn procs_when_frozen_replaces_the_live_list() {
+        let live = thegn_metrics::ProcSnapshot {
+            procs: vec![row(
+                1,
+                None,
+                "init",
+                0.0,
+                0,
+                0,
+                thegn_metrics::ProcOwner::Other,
+            )],
+            total: 1,
+            primed: false,
+            enabled: false,
+        };
+        let frozen = procs_when(true, live.clone());
+        assert_eq!(frozen, procs());
+        assert_eq!(frozen.total, 6);
+        assert!(frozen.primed && frozen.enabled);
+        assert_eq!(procs_when(false, live.clone()), live);
+    }
+
+    #[test]
+    fn frozen_pids_cannot_name_a_real_process() {
+        let fixture = procs();
+        let pids: std::collections::HashSet<_> = fixture.procs.iter().map(|p| p.pid).collect();
+        assert_eq!(fixture.procs.len(), 6);
+        for process in &fixture.procs {
+            assert!(process.pid >= 4_194_305 && process.pid % 2 == 1);
+            if let Some(parent) = process.ppid {
+                assert!(pids.contains(&parent));
+            }
+        }
+    }
+
+    #[test]
+    fn freeze_frame_is_stable_and_reuses_buffers() {
+        use thegn_metrics::collect::frame::MonitorFrame;
+        let mut frame = MonitorFrame::default();
+        frame.parts.cpu_stat.cores.reserve(8);
+        frame.parts.cpu_stat.cores.push(Default::default());
+        freeze_frame(&mut frame);
+        let first = frame.clone();
+        let pointer = frame.parts.cpu_stat.cores.as_ptr();
+        let capacity = frame.parts.cpu_stat.cores.capacity();
+        frame.parts.cpu_stat.cores.clear();
+        frame.parts.cpu_stat.cores.push(Default::default());
+        freeze_frame(&mut frame);
+        assert_eq!(frame, first);
+        assert_eq!(frame.parts.cpu_stat.cores.as_ptr(), pointer);
+        assert_eq!(frame.parts.cpu_stat.cores.capacity(), capacity);
+        assert_eq!(frame.at_ms, FROZEN_MS);
+    }
+
+    #[test]
+    fn seed_series_is_deterministic_and_covers_the_horizon() {
+        use thegn_core::series_store::{Class, SeriesBuf, SeriesKey, SeriesStore, Tier};
+        let keys = [(
+            SeriesKey {
+                family: 1,
+                metric: 2,
+                instance: 3,
+            },
+            Class::A,
+        )];
+        let now = FROZEN_MS;
+        let mut first = SeriesStore::new();
+        let mut second = SeriesStore::new();
+        assert_eq!(seed_series(&mut first, &keys, now), 1);
+        assert_eq!(seed_series(&mut second, &keys, now), 1);
+        let id1 = first.id_of(keys[0].0).unwrap();
+        let id2 = second.id_of(keys[0].0).unwrap();
+        assert_eq!(first.covered_secs(id1, now), Some(86_400));
+        for tier in [Tier::T0, Tier::T1, Tier::T2] {
+            let mut a = SeriesBuf::default();
+            let mut b = SeriesBuf::default();
+            assert!(first.read(id1, tier, now - 86_400_000, now, &mut a));
+            assert!(second.read(id2, tier, now - 86_400_000, now, &mut b));
+            assert_eq!(a.rows, b.rows);
+        }
+        let over_cap: Vec<_> = (0..97_u16)
+            .map(|instance| {
+                (
+                    SeriesKey {
+                        family: 4,
+                        metric: 1,
+                        instance,
+                    },
+                    Class::A,
+                )
+            })
+            .collect();
+        let mut capped = SeriesStore::new();
+        assert_eq!(seed_series(&mut capped, &over_cap, now), 96);
     }
 }
