@@ -6,7 +6,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use thegn_core::series_store::SeriesId;
 use thegn_core::series_store::{CAP_A, CAP_B, Class, SeriesKey, SeriesStore};
 use thegn_metrics::StatsSnapshot;
-use thegn_metrics::collect::{CollectorId, frame::MonitorFrame};
+use thegn_metrics::collect::{CollectorId, frame::MonitorFrame, health::Health};
 
 use crate::telemetry::Metric;
 
@@ -40,7 +40,7 @@ pub(crate) struct MonitorHistory {
     masthead_ids: [CachedId; Metric::ALL.len()],
     psi_ids: [CachedId; 6],
     cpu_total_id: CachedId,
-    core_ids: [CoreId; CAP_B],
+    core_ids: Box<[CoreId; CAP_B]>,
     core_len: usize,
     refused_core_ids: [u64; CORE_ID_WORDS],
     frame_owned_second: [Option<u64>; Metric::ALL.len()],
@@ -56,7 +56,7 @@ impl MonitorHistory {
             masthead_ids: [CachedId::Unseen; Metric::ALL.len()],
             psi_ids: [CachedId::Unseen; 6],
             cpu_total_id: CachedId::Unseen,
-            core_ids: [CoreId::default(); CAP_B],
+            core_ids: Box::new([CoreId::default(); CAP_B]),
             core_len: 0,
             refused_core_ids: [0; CORE_ID_WORDS],
             frame_owned_second: [None; Metric::ALL.len()],
@@ -89,7 +89,9 @@ impl MonitorHistory {
 
     pub(crate) fn ingest_frame(&mut self, frame: &MonitorFrame, wall_ms: u64) {
         let second = wall_ms / 1_000;
-        if frame.sampled.contains(CollectorId::Loadavg) {
+        if frame.sampled.contains(CollectorId::Loadavg)
+            && matches!(frame.health[CollectorId::Loadavg.index()], Health::Ok)
+        {
             let index = Metric::Load.index();
             if let Some(load) = frame.parts.loadavg.value {
                 let key = SeriesKey {
@@ -105,7 +107,9 @@ impl MonitorHistory {
             }
         }
 
-        if frame.sampled.contains(CollectorId::Psi) {
+        if frame.sampled.contains(CollectorId::Psi)
+            && matches!(frame.health[CollectorId::Psi.index()], Health::Ok)
+        {
             let resources = [
                 &frame.parts.psi.cpu,
                 &frame.parts.psi.memory,
@@ -133,7 +137,9 @@ impl MonitorHistory {
             }
         }
 
-        if frame.sampled.contains(CollectorId::CpuStat) {
+        if frame.sampled.contains(CollectorId::CpuStat)
+            && matches!(frame.health[CollectorId::CpuStat.index()], Health::Ok)
+        {
             let key = SeriesKey {
                 family: FAMILY_CPU_STAT,
                 metric: 0,
@@ -242,6 +248,9 @@ impl MonitorHistory {
             metric: 0,
             instance: core_id,
         };
+        let position = self.core_ids[..self.core_len]
+            .binary_search_by_key(&core_id, |entry| entry.id)
+            .unwrap_err();
         let id = Self::resolve(
             &mut self.store,
             &mut self.intern_scans,
@@ -250,7 +259,10 @@ impl MonitorHistory {
             key,
             Class::B,
         );
-        self.core_ids[self.core_len].id = core_id;
+        self.core_ids
+            .copy_within(position..self.core_len, position + 1);
+        self.core_ids[position].id = core_id;
+        self.core_ids[position].series = id;
         self.core_len += 1;
         id
     }
@@ -260,9 +272,8 @@ impl MonitorHistory {
             return CachedId::Refused;
         }
         self.core_ids[..self.core_len]
-            .iter()
-            .find(|entry| entry.id == core_id)
-            .map_or(CachedId::Unseen, |entry| entry.series)
+            .binary_search_by_key(&core_id, |entry| entry.id)
+            .map_or(CachedId::Unseen, |index| self.core_ids[index].series)
     }
 
     fn push(&mut self, id: CachedId, at_ms: u64, value: f32) {
