@@ -766,6 +766,7 @@ pub const MAX_ALERT_SOURCE_BYTES: usize = 128;
 pub const MAX_ALERT_MESSAGE_BYTES: usize = 4 * 1024;
 pub const MAX_PLUGIN_SUBSCRIPTIONS: usize = 64;
 pub const MAX_EVENT_KIND_BYTES: usize = 128;
+pub const MAX_PLUGIN_SURFACES: usize = MAX_MANIFEST_CONTRIBUTIONS;
 pub const MAX_PLUGIN_RETAINED_BYTES: usize = 8 * 1024 * 1024;
 
 fn validate_manifest_bounds(manifest: &PluginManifest) -> Result<(), PluginApiError> {
@@ -1076,6 +1077,14 @@ impl PluginRuntime {
         surface: SurfaceId,
         view: View,
     ) -> Result<UpdateResult, PluginApiError> {
+        let surface_bytes = surface.as_str().len();
+        if surface_bytes > MAX_PLUGIN_IDENTIFIER_BYTES {
+            return Err(quota_error(
+                "surface identifier bytes",
+                surface_bytes,
+                MAX_PLUGIN_IDENTIFIER_BYTES,
+            ));
+        }
         let cap = self
             .surface_caps
             .get(&surface)
@@ -1096,7 +1105,16 @@ impl PluginRuntime {
                 MAX_VIEW_TEXT_BYTES,
             ));
         }
-        let new_view_bytes = retained_view_bytes(&view);
+        if !self.views.surfaces.contains_key(&surface)
+            && self.views.surfaces.len() >= MAX_PLUGIN_SURFACES
+        {
+            return Err(quota_error(
+                "plugin surfaces",
+                self.views.surfaces.len().saturating_add(1),
+                MAX_PLUGIN_SURFACES,
+            ));
+        }
+        let new_view_bytes = retained_surface_bytes(&surface, &view);
         let old_view_bytes = self.views.retained_surface_bytes(&surface);
         let retained = self
             .state_bytes
@@ -1138,6 +1156,14 @@ impl PluginRuntime {
     }
 
     pub fn emit(&mut self, _plugin: PluginId, event: Event) -> Result<(), PluginApiError> {
+        let event_kind_bytes = event_kind_bytes(&event.kind);
+        if event_kind_bytes > MAX_EVENT_KIND_BYTES {
+            return Err(quota_error(
+                "event kind bytes",
+                event_kind_bytes,
+                MAX_EVENT_KIND_BYTES,
+            ));
+        }
         match json_footprint(&event.payload, MAX_PLUGIN_JSON_DEPTH) {
             Err(QuotaBreach::Depth) => {
                 return Err(quota_error(
@@ -1490,6 +1516,13 @@ fn retained_view_bytes(view: &View) -> usize {
         .saturating_add(text_bytes)
 }
 
+fn retained_surface_bytes(surface: &SurfaceId, view: &View) -> usize {
+    std::mem::size_of::<SurfaceId>()
+        .saturating_add(surface.as_str().len())
+        .saturating_add(std::mem::size_of::<(View, bool)>())
+        .saturating_add(retained_view_bytes(view))
+}
+
 fn event_kind_bytes(kind: &EventKind) -> usize {
     match kind {
         EventKind::Custom(name) => name.len(),
@@ -1632,15 +1665,15 @@ pub struct SurfaceCache {
 impl SurfaceCache {
     fn retained_bytes(&self) -> usize {
         self.surfaces
-            .values()
-            .map(|(view, _)| retained_view_bytes(view))
+            .iter()
+            .map(|(surface, (view, _))| retained_surface_bytes(surface, view))
             .fold(0_usize, usize::saturating_add)
     }
 
     fn retained_surface_bytes(&self, surface: &SurfaceId) -> usize {
         self.surfaces
             .get(surface)
-            .map_or(0, |(view, _)| retained_view_bytes(view))
+            .map_or(0, |(view, _)| retained_surface_bytes(surface, view))
     }
 
     pub fn update(&mut self, surface: SurfaceId, view: View) -> UpdateResult {
@@ -4005,6 +4038,71 @@ mod runtime_quota_tests {
     }
 
     #[test]
+    fn cached_surfaces_bound_identifier_bytes_and_cardinality() {
+        let (mut runtime, plugin, _) = runtime();
+        runtime
+            .manifest
+            .granted
+            .insert(Capability::new("surface", "unknown"));
+        let exact_surface = SurfaceId::new("s".repeat(MAX_PLUGIN_IDENTIFIER_BYTES));
+        runtime
+            .update(plugin.clone(), exact_surface, View::line([]))
+            .unwrap();
+        assert!(quota(
+            runtime
+                .update(
+                    plugin.clone(),
+                    SurfaceId::new("s".repeat(MAX_PLUGIN_IDENTIFIER_BYTES + 1)),
+                    View::line([]),
+                )
+                .unwrap_err()
+        ));
+
+        for index in 1..MAX_PLUGIN_SURFACES {
+            runtime
+                .update(
+                    plugin.clone(),
+                    SurfaceId::new(format!("surface-{index}")),
+                    View::line([]),
+                )
+                .unwrap();
+        }
+        assert_eq!(runtime.views.surfaces.len(), MAX_PLUGIN_SURFACES);
+        assert!(quota(
+            runtime
+                .update(plugin, SurfaceId::new("one-too-many"), View::line([]))
+                .unwrap_err()
+        ));
+        assert_eq!(runtime.views.surfaces.len(), MAX_PLUGIN_SURFACES);
+    }
+
+    #[test]
+    fn emitted_custom_event_names_are_bounded() {
+        let (mut runtime, plugin, _) = runtime();
+        runtime
+            .emit(
+                plugin.clone(),
+                Event::new(
+                    EventKind::Custom("k".repeat(MAX_EVENT_KIND_BYTES)),
+                    serde_json::Value::Null,
+                ),
+            )
+            .unwrap();
+        assert!(quota(
+            runtime
+                .emit(
+                    plugin,
+                    Event::new(
+                        EventKind::Custom("k".repeat(MAX_EVENT_KIND_BYTES + 1)),
+                        serde_json::Value::Null,
+                    ),
+                )
+                .unwrap_err()
+        ));
+        assert_eq!(runtime.events().len(), 1);
+    }
+
+    #[test]
     fn retained_total_bounds_events_and_rejects_without_mutation() {
         let (mut runtime, plugin, _) = runtime();
         let retained_state_value = serde_json::Value::String("s".repeat(60 * 1024));
@@ -4114,7 +4212,10 @@ mod runtime_quota_tests {
         );
         let last_surface =
             SurfaceId::new(format!("view.surface.{}", MAX_MANIFEST_CONTRIBUTIONS - 1));
-        let view_overhead = std::mem::size_of::<View>()
+        let view_overhead = std::mem::size_of::<SurfaceId>()
+            + last_surface.as_str().len()
+            + std::mem::size_of::<(View, bool)>()
+            + std::mem::size_of::<View>()
             + std::mem::size_of::<Vec<Span>>()
             + std::mem::size_of::<Span>();
         let exact_text_bytes = MAX_PLUGIN_RETAINED_BYTES
