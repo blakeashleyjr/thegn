@@ -309,6 +309,9 @@ fn clear_hot_fields(row: &mut GpuEngineRow) {
     row.vcn_busy_pct = None;
     row.vram_used = None;
     row.gtt_used = None;
+    // The DPM ladders are static; the current level is live and must not outlive a suspend.
+    row.sclk.current_mhz = None;
+    row.mclk.current_mhz = None;
 }
 
 fn parse_u64(bytes: &[u8]) -> Option<u64> {
