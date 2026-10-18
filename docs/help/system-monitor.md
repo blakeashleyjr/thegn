@@ -200,9 +200,11 @@ platform`. The check does not prompt.
 
 ## GPU
 
-On AMDGPU, the GPU tab has device, engine, memory, and clocks panels. Engine
-busy history, VRAM/GTT use, clock level, and power against its reported cap are
-plotted on their labelled 0–100% scales when readings are available. A runtime-
+On AMDGPU, the GPU tab has device, engine, memory, and clocks panels. The engine
+panel plots verified SMU gfx, media, VCN, UMC, and available IPU activity rings
+on a labelled 0–100% scale, alongside engine busy history. Memory and clocks
+panels plot each device's VRAM/GTT use, clock level, and power against its
+reported cap on labelled 0–100% scales when readings are available. A runtime-
 suspended card is not woken to sample it; its values are shown as unavailable
 rather than zero. On APUs, shared memory is labelled `shared vram`.
 
