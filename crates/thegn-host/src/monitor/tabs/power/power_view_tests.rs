@@ -105,6 +105,9 @@ fn fixture() -> MonitorFrame {
 fn text(surface: &mut Surface) -> String {
     surface.screen_chars_to_string()
 }
+fn tail_from_column(line: &str, column: usize) -> String {
+    line.chars().skip(column).collect()
+}
 fn collector_set(ids: &[CollectorId]) -> CollectorSet {
     let mut set = CollectorSet::empty();
     for id in ids {
@@ -246,8 +249,7 @@ fn snapshot_sizes_capabilities_demand_and_absent_marks() {
                         let socket_row = output
                             .lines()
                             .position(|line| {
-                                line.get(graph_left..)
-                                    .is_some_and(|tail| tail.starts_with("socket "))
+                                tail_from_column(line, graph_left).starts_with("socket ")
                             })
                             .expect("socket graph label is drawn");
                         assert!(
@@ -277,7 +279,7 @@ fn snapshot_sizes_capabilities_demand_and_absent_marks() {
                     assert_eq!(board.demand(&view, area, 1000).collectors, expected);
                     if cols == 240 {
                         let r = fill_ratio(&surface, area);
-                        // density follow-up (batch 51): estimated, primary sets from the printed value
+                        // density follow-up (batch 52): estimated, primary sets from the printed value
                         if unicode == UnicodeLevel::Ascii {
                             assert!(r >= 0.24, "ASCII fill ratio {r:.3}, floor 0.24");
                         } else {
@@ -712,8 +714,7 @@ fn newest_powercap_and_amd_rail_samples_reach_the_last_graph_column() {
             .enumerate()
             .skip(graph_top)
             .filter(|(_, line)| {
-                line.get(graph_left..)
-                    .is_some_and(|tail| tail.starts_with(&format!("{label} ")))
+                tail_from_column(line, graph_left).starts_with(&format!("{label} "))
             })
             .map(|(row, _)| row)
             .collect::<Vec<_>>();
