@@ -100,6 +100,7 @@ impl CookieDelta {
                 continue;
             };
             let index = hash_cookie(cookie) % entries.len();
+            #[cfg_attr(not(test), allow(unused_variables))]
             let (slot, probes) = find_slot(entries, index, cookie);
             #[cfg(test)]
             {
@@ -253,7 +254,7 @@ fn rebuild_cookie_table(entries: &mut [CookieEntry], scratch: &mut [CookieEntry]
             ..*entry
         };
     }
-    std::mem::swap(entries, scratch);
+    entries.swap_with_slice(scratch);
     scratch.fill(CookieEntry::default());
 }
 
