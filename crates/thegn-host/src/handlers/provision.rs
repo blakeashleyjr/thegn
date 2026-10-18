@@ -9,7 +9,6 @@ use crate::handlers::worktree_attach::{self, AttachTarget};
 use crate::handlers::worktree_launch::RelaunchOutcome;
 use crate::loading::{SpecOrigin, apply_spec_batch};
 use crate::menu::{self, MenuOverlay};
-use thegn_core::store::{PoolStore, WorkspaceStore};
 
 /// Resolved launch specs routed back to the requesting group by its unique
 /// NAME (a path can be shared by two groups); the batch also carries the path
@@ -830,11 +829,11 @@ pub(crate) fn pool_target_adjust(
     session: &crate::session::Session,
     cfg: &thegn_core::config::Config,
     delta: i64,
-    tx: &tokio::sync::mpsc::UnboundedSender<crate::run_pending_db::PendingDbResult>,
+    tx: &tokio::sync::mpsc::UnboundedSender<crate::run::run_pending_db::PendingDbResult>,
     waker: &termwiz::terminal::TerminalWaker,
 ) -> Option<String> {
     let g = session.active_group().filter(|g| !g.path.is_empty())?;
-    crate::run_pending_db::queue_pool_target_adjust(tx, waker, cfg.clone(), g.path.clone(), delta);
+    crate::run::run_pending_db::queue_pool_target_adjust(tx, waker, cfg.clone(), g.path.clone(), delta);
     Some("warm pool: updating target…".into())
 }
 
@@ -1648,7 +1647,7 @@ mod tests {
             .unwrap();
         assert!(matches!(
             rx.try_recv(),
-            Ok(crate::run_pending_db::PendingDbResult::PoolTarget { status })
+            Ok(crate::run::run_pending_db::PendingDbResult::PoolTarget { status })
                 if status == "warm pool target: 1 spare(s)"
         ));
         assert!(matches!(
