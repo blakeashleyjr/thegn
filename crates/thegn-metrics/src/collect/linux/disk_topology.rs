@@ -28,7 +28,7 @@ fn text(path: &Path) -> Option<String> {
         .ok()
         .map(|s| s.trim().to_owned())
 }
-fn kind(name: &str) -> DevKind {
+fn kind(name: &str, partition: bool) -> DevKind {
     if partition {
         DevKind::Partition
     } else if name.starts_with("dm-") {
@@ -66,7 +66,7 @@ pub fn scan(sys_block: &Path, rev: u32) -> Topology {
             name: Arc::from(name.as_str()),
             major,
             minor,
-            kind: kind(&name),
+            kind: kind(&name, parent_disk),
             physical: !parent_disk
                 && root.join("device").exists()
                 && !is_virtual_name(name.as_bytes()),
