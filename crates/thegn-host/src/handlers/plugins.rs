@@ -31,6 +31,9 @@ const MAX_ALERT_MESSAGE_BYTES: usize = 1024;
 const MAX_FEED_BRIDGES: usize = 8;
 const MAX_SUBSCRIPTIONS_PER_PLUGIN: usize = 64;
 const MAX_PLUGIN_MESSAGES_PER_DRAIN: usize = 256;
+const DISPATCH_QUEUE_CAPACITY: usize = 64;
+const MAX_DISPATCH_IN_FLIGHT_PER_PLUGIN: usize = 8;
+const DISPATCH_DEADLINE: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// Owns a feed worker and its cancellation signal. Dropping the owner cancels
 /// the worker even if the feed is idle and the plugin never reads another frame.
@@ -418,6 +421,13 @@ fn one_shot_status(plugin: &str, contribution: &str, start: OneShotStart) -> Str
 /// Record this drain's raised alerts to the notification inbox, off-loop.
 /// Call after [`drain`] from the event loop (requires a tokio runtime).
 pub(crate) fn flush_alerts(state: &mut PluginsState) {
+    if let Some(dispatcher) = &state.dispatcher {
+        for (plugin, counts) in dispatcher.take_diagnostics() {
+            if counts.rejected > 0 || counts.timed_out > 0 || counts.unavailable > 0 {
+                tracing::warn!(target: "thegn::plugin", plugin = %plugin, rejected = counts.rejected, timed_out = counts.timed_out, unavailable = counts.unavailable, "plugin host.call dispatcher pressure");
+            }
+        }
+    }
     if let Some(inbox) = &state.inbox {
         for (plugin, counts) in inbox.take_diagnostics() {
             if counts.dropped > 0 || counts.rejected > 0 {
@@ -1008,7 +1018,7 @@ fn apply_host_call(state: &mut PluginsState, plugin: &str, msg: RpcMessage) -> P
     let dispatcher = state
         .dispatcher
         .get_or_insert_with(|| Dispatcher::spawn(cfg));
-    dispatcher.dispatch(writer, id, cap, params);
+    dispatcher.dispatch(plugin, writer, id, cap, params);
     PluginDamage::None
 }
 
@@ -1151,24 +1161,111 @@ fn spawn_feed_bridge(cfg: thegn_core::config::Config, writer: SessionWriter) -> 
 // ---------------------------------------------------------------------------
 
 struct DispatchReq {
+    plugin: String,
     writer: SessionWriter,
     id: u64,
     cap: String,
     /// Parameters for the capability (path placeholders + body/query), resolved
     /// against the `API_CALLS` route spine.
     params: serde_json::Value,
+    _permit: DispatchPermit,
+}
+
+struct DispatchPermit {
+    plugin: String,
+    load: Arc<std::sync::Mutex<DispatchLoad>>,
+}
+
+impl Drop for DispatchPermit {
+    fn drop(&mut self) {
+        let mut load = self.load.lock().unwrap_or_else(|error| error.into_inner());
+        load.total = load.total.saturating_sub(1);
+        if let Some(count) = load.per_plugin.get_mut(&self.plugin) {
+            *count = count.saturating_sub(1);
+            if *count == 0 {
+                load.per_plugin.remove(&self.plugin);
+            }
+        }
+    }
+}
+
+fn acquire_dispatch_permit(
+    load: &Arc<std::sync::Mutex<DispatchLoad>>,
+    plugin: &str,
+) -> Option<DispatchPermit> {
+    let mut load_guard = load.lock().unwrap_or_else(|error| error.into_inner());
+    let plugin_count = load_guard
+        .per_plugin
+        .get(plugin)
+        .copied()
+        .unwrap_or_default();
+    if load_guard.total >= DISPATCH_QUEUE_CAPACITY
+        || plugin_count >= MAX_DISPATCH_IN_FLIGHT_PER_PLUGIN
+    {
+        return None;
+    }
+    load_guard.total += 1;
+    *load_guard.per_plugin.entry(plugin.to_owned()).or_default() += 1;
+    Some(DispatchPermit {
+        plugin: plugin.to_owned(),
+        load: Arc::clone(load),
+    })
+}
+
+#[derive(Default)]
+struct DispatchLoad {
+    total: usize,
+    per_plugin: BTreeMap<String, usize>,
+}
+
+#[derive(Default)]
+struct DispatchDiagnostics {
+    rejected: usize,
+    timed_out: usize,
+    unavailable: usize,
+}
+
+#[derive(Default)]
+struct DispatchDiagnosticsByPlugin(BTreeMap<String, DispatchDiagnostics>);
+
+impl DispatchDiagnosticsByPlugin {
+    fn record(&mut self, plugin: &str, update: impl FnOnce(&mut DispatchDiagnostics)) {
+        update(self.0.entry(plugin.to_owned()).or_default());
+    }
+
+    fn take(&mut self) -> BTreeMap<String, DispatchDiagnostics> {
+        std::mem::take(&mut self.0)
+    }
 }
 
 /// One background thread owning a current-thread tokio runtime + the control
 /// client, answering plugins directly through their [`SessionWriter`]s (never
 /// re-entering the event loop).
 pub(crate) struct Dispatcher {
-    tx: std::sync::mpsc::Sender<DispatchReq>,
+    tx: std::sync::mpsc::SyncSender<DispatchReq>,
+    load: Arc<std::sync::Mutex<DispatchLoad>>,
+    diagnostics: Arc<std::sync::Mutex<DispatchDiagnosticsByPlugin>>,
 }
 
 impl Dispatcher {
     fn spawn(cfg: thegn_core::config::Config) -> Self {
-        let (tx, rx) = std::sync::mpsc::channel::<DispatchReq>();
+        Self::spawn_with(cfg, DISPATCH_DEADLINE, |cfg, cap, params| {
+            Box::pin(async move { dispatch_one(&cfg, &cap, params).await })
+        })
+    }
+
+    fn spawn_with(
+        cfg: thegn_core::config::Config,
+        deadline: std::time::Duration,
+        dispatch: impl Fn(thegn_core::config::Config, String, serde_json::Value) -> DispatchFuture
+        + Send
+        + Sync
+        + 'static,
+    ) -> Self {
+        let (tx, rx) = std::sync::mpsc::sync_channel::<DispatchReq>(DISPATCH_QUEUE_CAPACITY);
+        let load = Arc::new(std::sync::Mutex::new(DispatchLoad::default()));
+        let diagnostics = Arc::new(std::sync::Mutex::new(DispatchDiagnosticsByPlugin::default()));
+        let worker_diagnostics = Arc::clone(&diagnostics);
         let spawn = std::thread::Builder::new()
             .name("thegn-plugin-dispatch".into())
             .spawn(move || {
@@ -1186,35 +1283,120 @@ impl Dispatcher {
                 };
                 while let Ok(req) = rx.recv() {
                     let DispatchReq {
+                        plugin,
                         writer,
                         id,
                         cap,
                         params,
+                        _permit,
                     } = req;
-                    let resp = match rt.block_on(dispatch_one(&cfg, &cap, params)) {
-                        Ok(v) => RpcResponse::ok(id, v),
-                        Err(e) => RpcResponse::err(id, e),
+                    let response = match rt.block_on(tokio::time::timeout(
+                        deadline,
+                        dispatch(cfg.clone(), cap, params),
+                    )) {
+                        Ok(Ok(value)) => RpcResponse::ok(id, value),
+                        Ok(Err(error)) => RpcResponse::err(id, error),
+                        Err(_) => {
+                            worker_diagnostics
+                                .lock()
+                                .unwrap_or_else(|error| error.into_inner())
+                                .record(&plugin, |counts| counts.timed_out += 1);
+                            RpcResponse::err(
+                                id,
+                                RpcError::new(RpcErrorCode::Timeout, "host.call timed out"),
+                            )
+                        }
                     };
                     // best-effort: the session may have died mid-dispatch.
-                    let _ = writer.respond(&resp);
+                    if let Err(error) = writer.respond(&response) {
+                        tracing::debug!(target: "thegn::plugin", error = %error, "host.call response writer is gone");
+                    }
+                    drop(_permit);
                 }
             });
         if let Err(e) = spawn {
             tracing::warn!(target: "thegn::plugin", error = %e, "dispatcher thread failed to start");
         }
-        Self { tx }
+        Self {
+            tx,
+            load,
+            diagnostics,
+        }
     }
 
-    fn dispatch(&self, writer: SessionWriter, id: u64, cap: String, params: serde_json::Value) {
-        // best-effort: a dead dispatcher thread means the daemon reply is lost;
-        // the plugin's request times out on its own side.
-        // best-effort: send: the consumer may be gone; a closed channel is the consumer going away
-        let _ = self.tx.send(DispatchReq {
+    fn dispatch(
+        &self,
+        plugin: &str,
+        writer: SessionWriter,
+        id: u64,
+        cap: String,
+        params: serde_json::Value,
+    ) {
+        let Some(permit) = acquire_dispatch_permit(&self.load, plugin) else {
+            self.record(plugin, |counts| counts.rejected += 1);
+            answer_dispatch_error(
+                &writer,
+                id,
+                RpcErrorCode::RateLimited,
+                "host.call dispatcher is full",
+            );
+            return;
+        };
+        let req = DispatchReq {
+            plugin: plugin.to_owned(),
             writer,
             id,
             cap,
             params,
-        });
+            _permit: permit,
+        };
+        match self.tx.try_send(req) {
+            Ok(()) => {}
+            Err(std::sync::mpsc::TrySendError::Full(req)) => {
+                self.record(&req.plugin, |counts| counts.rejected += 1);
+                answer_dispatch_error(
+                    &req.writer,
+                    req.id,
+                    RpcErrorCode::RateLimited,
+                    "host.call dispatcher is full",
+                );
+                drop(req);
+            }
+            Err(std::sync::mpsc::TrySendError::Disconnected(req)) => {
+                self.record(&req.plugin, |counts| counts.unavailable += 1);
+                answer_dispatch_error(
+                    &req.writer,
+                    req.id,
+                    RpcErrorCode::Other,
+                    "host.call dispatcher stopped",
+                );
+                drop(req);
+            }
+        }
+    }
+
+    fn record(&self, plugin: &str, update: impl FnOnce(&mut DispatchDiagnostics)) {
+        self.diagnostics
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .record(plugin, update);
+    }
+
+    fn take_diagnostics(&self) -> BTreeMap<String, DispatchDiagnostics> {
+        self.diagnostics
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .take()
+    }
+}
+
+type DispatchFuture = std::pin::Pin<
+    Box<dyn std::future::Future<Output = Result<serde_json::Value, RpcError>> + Send>,
+>;
+
+fn answer_dispatch_error(writer: &SessionWriter, id: u64, code: RpcErrorCode, message: &str) {
+    if let Err(error) = writer.respond(&RpcResponse::err(id, RpcError::new(code, message))) {
+        tracing::debug!(target: "thegn::plugin", error = %error, "host.call rejection response writer is gone");
     }
 }
 
@@ -1247,6 +1429,55 @@ mod tests {
     use thegn_core::plugin_api::{
         ApiVersion, CadenceHint, ContributionId, PluginManifest, Span, StyleRole,
     };
+
+    #[test]
+    fn dispatcher_admission_is_bounded_and_plugin_fair() {
+        let load = Arc::new(std::sync::Mutex::new(DispatchLoad::default()));
+        let mut plugin_a = (0..MAX_DISPATCH_IN_FLIGHT_PER_PLUGIN)
+            .map(|_| acquire_dispatch_permit(&load, "plugin-a").expect("within per-plugin cap"))
+            .collect::<Vec<_>>();
+
+        assert!(acquire_dispatch_permit(&load, "plugin-a").is_none());
+        let plugin_b = acquire_dispatch_permit(&load, "plugin-b");
+        assert!(
+            plugin_b.is_some(),
+            "plugin A cannot consume plugin B's limit"
+        );
+
+        drop(plugin_a.pop());
+        assert!(acquire_dispatch_permit(&load, "plugin-a").is_some());
+        drop(plugin_a);
+        drop(plugin_b);
+        let load = load.lock().unwrap_or_else(|error| error.into_inner());
+        assert_eq!(load.total, 0);
+        assert!(load.per_plugin.is_empty());
+    }
+
+    #[test]
+    fn dispatcher_global_admission_is_bounded() {
+        let load = Arc::new(std::sync::Mutex::new(DispatchLoad::default()));
+        let permits = (0..DISPATCH_QUEUE_CAPACITY)
+            .map(|index| acquire_dispatch_permit(&load, &format!("plugin-{index}")))
+            .collect::<Option<Vec<_>>>()
+            .expect("global capacity is available");
+
+        assert!(acquire_dispatch_permit(&load, "another-plugin").is_none());
+        drop(permits);
+        assert!(acquire_dispatch_permit(&load, "another-plugin").is_some());
+    }
+
+    #[test]
+    fn dispatcher_diagnostics_are_taken_once_per_drain() {
+        let mut diagnostics = DispatchDiagnosticsByPlugin::default();
+        diagnostics.record("plugin-a", |counts| counts.rejected += 2);
+        diagnostics.record("plugin-a", |counts| counts.timed_out += 1);
+
+        let drained = diagnostics.take();
+        let counts = drained.get("plugin-a").expect("recorded plugin");
+        assert_eq!(counts.rejected, 2);
+        assert_eq!(counts.timed_out, 1);
+        assert!(diagnostics.take().is_empty());
+    }
 
     fn contribution(id: &str, ep: ExtensionPoint, surface: &str, label: &str) -> Contribution {
         Contribution {
