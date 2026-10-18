@@ -151,6 +151,9 @@ fn absorbs_disk_frame_and_reuses_warm_buffers() {
         for (index, device) in frame.parts.diskstats.devices.iter_mut().enumerate() {
             device.util_pct = Some(f64::from((tick + index as u32 * 7) % 100));
         }
+        for (index, fs) in frame.parts.filesystems.rows.iter_mut().enumerate() {
+            fs.free_bytes = Some(40_000_000_000 + index as u64 * 19_000_000_000 + u64::from(tick));
+        }
         model.absorb_frame(&frame);
     }
     assert_eq!(model.capacities(), capacity);
@@ -184,6 +187,17 @@ fn absorbs_disk_frame_and_reuses_warm_buffers() {
             .iter()
             .all(|history| { history.read.len == 240 && history.write.len == 240 })
     );
+    assert_eq!(model.filesystem_history.len(), 8);
+    assert!(
+        model
+            .filesystem_history
+            .iter()
+            .all(|history| history.used.len == 240)
+    );
+    let newest_filesystem = &model.filesystem_history[0].used;
+    let newest_fill =
+        newest_filesystem.values[(newest_filesystem.next + super::HISTORY - 1) % super::HISTORY];
+    assert!(newest_fill > 0.0 && newest_fill < 1.0);
     let read_next = model.read_history.next;
     let write_next = model.write_history.next;
     frame.parts.diskstats.aggregate.read_bps = None;
@@ -215,6 +229,10 @@ fn snapshots_cover_target_sizes_capabilities_and_static_panel_demand() {
                 250_000.0 + f64::from(index as u16) * 250_000.0 + f64::from(tick % 23) * 20_000.0,
             );
             device.util_pct = Some(f64::from((tick + index as u16 * 11) % 100));
+        }
+        for (index, fs) in frame.parts.filesystems.rows.iter_mut().enumerate() {
+            fs.free_bytes =
+                Some(40_000_000_000 + index as u64 * 19_000_000_000 + u64::from(tick) * 1_000_000);
         }
         if let Some(line) = &mut frame.parts.psi.io.file.some {
             line.avg10 = 1200 + u32::from((tick * 17) % 7600);
@@ -282,23 +300,23 @@ fn snapshots_cover_target_sizes_capabilities_and_static_panel_demand() {
                         let ratio = fill_ratio(&surface, Rect::full(cols, rows));
                         match (unicode, depth) {
                             (UnicodeLevel::Full, ColorDepth::Truecolor) => {
-                                // density follow-up (batch 49): estimated, primary sets from the printed value
+                                // density follow-up (batch 50): estimated, primary sets from the printed value
                                 assert!(
                                     ratio >= 0.30,
                                     "{cols}x{rows} {unicode:?}/{depth:?}: fill ratio {ratio:.3}"
                                 );
                             }
                             (UnicodeLevel::Full, ColorDepth::Ansi16) => {
-                                // density follow-up (batch 49): estimated, primary sets from the printed value
+                                // density follow-up (batch 50): estimated, primary sets from the printed value
                                 assert!(
                                     ratio >= 0.30,
                                     "{cols}x{rows} {unicode:?}/{depth:?}: fill ratio {ratio:.3}"
                                 );
                             }
                             (UnicodeLevel::Ascii, ColorDepth::None) => {
-                                // density follow-up (batch 49): estimated, primary sets from the printed value
+                                // density follow-up (batch 50): estimated, primary sets from the printed value
                                 assert!(
-                                    ratio >= 0.24,
+                                    ratio >= 0.30,
                                     "{cols}x{rows} {unicode:?}/{depth:?}: fill ratio {ratio:.3}"
                                 );
                             }
@@ -610,6 +628,12 @@ fn per_device_histories_follow_identity_across_reordering_and_missing_sides() {
             && history.write.len == super::HISTORY
             && history.util.len == super::HISTORY
     }));
+    assert!(
+        model
+            .filesystem_history
+            .iter()
+            .all(|history| { history.used.len == super::HISTORY })
+    );
     let newest_history = &model
         .device_history
         .iter()
@@ -709,4 +733,64 @@ fn mirrored_io_plot_places_newest_read_and_write_samples_at_the_right_edge() {
     assert!((0..4).any(|row| { grid.get(11, row).is_some_and(|cell| !blank(cell.ch)) }));
     assert!((4..8).any(|row| { grid.get(11, row).is_some_and(|cell| !blank(cell.ch)) }));
     assert!((0..8).all(|row| { grid.get(0, row).is_some_and(|cell| blank(cell.ch)) }));
+}
+
+#[test]
+fn filesystem_fill_history_tracks_newest_sample_and_is_drawn_at_the_right_edge() {
+    let mut model = DiskModel::default();
+    let mut frame = frame_fixture();
+    for tick in 0_u16..32 {
+        frame.parts.filesystems.rows[0].free_bytes =
+            Some(40_000_000_000 + u64::from(tick) * 20_000_000);
+        model.absorb_frame(&frame);
+    }
+    let history = &model.filesystem_history[0].used;
+    let newest = history.values[(history.next + super::HISTORY - 1) % super::HISTORY];
+    let expected =
+        (500_000_000_000_u64 - (40_000_000_000 + 31 * 20_000_000)) as f32 / 500_000_000_000_f32;
+    assert!((newest - expected).abs() < 0.001);
+
+    let (surface, placed, _) = render(&model, 240, 60);
+    let filesystems = placed
+        .iter()
+        .find(|panel| panel.id == PanelId("disk.filesystems"))
+        .expect("filesystem panel placed");
+    let right = filesystems.rect.x + filesystems.rect.cols - 2;
+    let trend_y = filesystems.rect.y + 2;
+    let cell = surface
+        .screen_lines()
+        .get(trend_y)
+        .and_then(|line| line.visible_cells().find(|cell| cell.cell_index() == right))
+        .expect("filesystem trend reaches the panel's last inner column");
+    assert_ne!(cell.str(), " ");
+}
+
+#[test]
+fn per_device_mirrored_read_write_histories_reach_the_right_inner_column() {
+    let mut model = DiskModel::default();
+    let mut frame = frame_fixture();
+    for tick in 0_u16..32 {
+        for (index, device) in frame.parts.diskstats.devices.iter_mut().enumerate() {
+            device.read_bps = Some(1_000_000.0 + f64::from(tick) * (index as f64 + 1.0));
+            device.write_bps = Some(200_000.0 + f64::from(tick) * (index as f64 + 2.0));
+        }
+        model.absorb_frame(&frame);
+    }
+    let (surface, placed, _) = render(&model, 240, 60);
+    let devices = placed
+        .iter()
+        .find(|panel| panel.id == PanelId("disk.devices"))
+        .expect("device panel placed");
+    let last_inner_col = devices.rect.x + devices.rect.cols - 2;
+    for row in [devices.rect.y + 2, devices.rect.y + 3] {
+        let cell = surface
+            .screen_lines()
+            .get(row)
+            .and_then(|line| {
+                line.visible_cells()
+                    .find(|cell| cell.cell_index() == last_inner_col)
+            })
+            .expect("per-device history reaches the last inner column");
+        assert_ne!(cell.str(), " ");
+    }
 }
