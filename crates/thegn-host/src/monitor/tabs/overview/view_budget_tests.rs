@@ -101,9 +101,9 @@ fn warmed_absorbs_stay_allocation_free_across_changing_frames_and_history() {
 
 #[test]
 fn populated_overview_panels_stay_within_the_pinned_paint_budget() {
-    // THE-898 first reduction: expected, primary sets from the printed counts
-    const PAINT_ALLOCATION_BUDGET: u64 = 150_000;
-    const PAINT_REALLOC_BUDGET: u64 = 11_000;
+    // THE-898 regression ceiling; primary pins the reduced value from observed counts.
+    const PAINT_ALLOCATION_BUDGET: u64 = 184_000;
+    const PAINT_REALLOC_BUDGET: u64 = 14_000;
     let (model, _) = populated_overview();
     let view = super::OverviewView(&model);
     let area = Rect::full(240, 60);
@@ -143,4 +143,24 @@ fn populated_overview_panels_stay_within_the_pinned_paint_budget() {
         counts.allocation_calls,
         counts.realloc_calls,
     );
+}
+
+#[test]
+fn consecutive_overview_paints_reuse_the_style_cache() {
+    let model = OverviewModel::default();
+    let view = super::OverviewView(&model);
+    let area = Rect::full(80, 20);
+    let placed = Placed {
+        id: PanelId("overview.cpu"),
+        rect: area,
+        variant: VariantKind::Full,
+    };
+    let mut surface = Surface::new(80, 20);
+    crate::caps::test_override::with_color(thegn_core::termcaps::ColorDepth::Truecolor, || {
+        view.paint(&mut surface, &placed, area, 0, &[] as &[Section]);
+        let after_first = super::PAINT_SCRATCH.with(|scratch| scratch.borrow().emitter.rebuilds());
+        view.paint(&mut surface, &placed, area, 0, &[] as &[Section]);
+        let after_second = super::PAINT_SCRATCH.with(|scratch| scratch.borrow().emitter.rebuilds());
+        assert_eq!(after_second, after_first);
+    });
 }

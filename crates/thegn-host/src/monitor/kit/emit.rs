@@ -199,19 +199,3 @@ impl Emitter {
         }
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn repeated_emits_reuse_the_resolved_style_cache() {
-        let grid = CellGrid::new(4, 1);
-        let mut surface = Surface::new(4, 1);
-        let mut emitter = Emitter::default();
-        for _ in 0..2 {
-            emitter.emit(&grid, Rect::full(4, 1), &mut surface, 0, 0);
-        }
-        assert_eq!(emitter.rebuilds(), 1);
-    }
-}

@@ -142,13 +142,9 @@ pub(crate) fn paint_sparkline(
     }
     GRAPH_OUT.with(|scratch| {
         let mut out = scratch.borrow_mut();
-        spark::paint_spark(
-            &mut out,
-            values,
-            width,
-            ramp,
-            &crate::chrome::palette_snapshot(),
-        );
+        chrome::with_palette(|palette| {
+            spark::paint_spark(&mut out, values, width, ramp, palette);
+        });
         if let Some(line) = out.lines.first() {
             crate::seg::draw_line(
                 surface,
@@ -174,22 +170,24 @@ pub(crate) fn paint_history_graph(
     }
     GRAPH_OUT.with(|scratch| {
         let mut out = scratch.borrow_mut();
-        graph::paint_graph(
-            &mut out,
-            graph::GraphPaint {
-                kind: graph::GraphKind::Area,
-                vals: values,
-                lo: None,
-                w: rect.cols,
-                h: rect.rows,
-                paint: Paint::Ramp {
-                    id: ramp,
-                    warn: 0.7,
-                    crit: 0.9,
+        chrome::with_palette(|palette| {
+            graph::paint_graph(
+                &mut out,
+                graph::GraphPaint {
+                    kind: graph::GraphKind::Area,
+                    vals: values,
+                    lo: None,
+                    w: rect.cols,
+                    h: rect.rows,
+                    paint: Paint::Ramp {
+                        id: ramp,
+                        warn: 0.7,
+                        crit: 0.9,
+                    },
                 },
-            },
-            &crate::chrome::palette_snapshot(),
-        );
+                palette,
+            );
+        });
         for (row, line) in out.lines.iter().enumerate() {
             crate::seg::draw_line(
                 surface,
@@ -212,9 +210,7 @@ impl GraphOut {
         self.cells.reset(w, h);
         self.lines.resize_with(h, Line::default);
         for line in &mut self.lines {
-            if let Line::Segs(segs) = line {
-                segs.clear();
-            } else {
+            if !matches!(line, Line::Segs(_)) {
                 *line = Line::Segs(Vec::new());
             }
         }
@@ -241,22 +237,32 @@ impl GraphOut {
             *line = Line::Segs(Vec::new());
         }
         if let Line::Segs(segs) = line {
-            segs.clear();
             let row = self.cells.row(row_index);
             let mut start = 0;
+            let mut seg_index = 0;
             while start < row.len() {
                 let style = resolved.cell(row[start]);
                 let mut end = start + 1;
                 while end < row.len() && resolved.cell(row[end]) == style {
                     end += 1;
                 }
-                let text: String = row[start..end].iter().map(|cell| cell.ch).collect();
-                let mut run = seg::seg(Tok::Attr(style.fg), text);
+                if seg_index == segs.len() {
+                    segs.push(seg::seg(Tok::Attr(style.fg), String::new()));
+                }
+                let run = &mut segs[seg_index];
+                run.text.clear();
+                run.text.extend(row[start..end].iter().map(|cell| cell.ch));
+                run.fg = Tok::Attr(style.fg);
                 run.bg = style.bg.map(Tok::Attr);
                 run.bold = style.bold;
-                segs.push(run);
+                run.italic = false;
+                run.strike = false;
+                run.under = seg::Under::None;
+                run.caret = false;
+                seg_index += 1;
                 start = end;
             }
+            segs.truncate(seg_index);
         }
     }
 }
