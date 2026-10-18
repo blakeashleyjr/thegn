@@ -203,6 +203,8 @@ fn switching_tabs_records_where_to_reopen() {
 #[test]
 fn tab_cycles_the_visible_list_and_wraps() {
     let (mut ov, _m, _h) = open();
+    assert_eq!(ch(&mut ov, '1'), MonitorOutcome::PrefsChanged);
+    assert_eq!(ov.tab, MonitorTab::Overview);
     let tabs = ov.tabs.clone();
     assert_eq!(
         tabs.len(),
