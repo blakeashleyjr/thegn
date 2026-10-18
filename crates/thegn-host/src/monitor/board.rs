@@ -42,6 +42,7 @@ pub(super) enum ActiveView<'a> {
     Network(super::tabs::network::view::NetworkView<'a>),
     Memory(super::tabs::memory::view::MemoryView<'a>),
     Thermal(super::tabs::thermal::view::ThermalView<'a>),
+    Disk(super::tabs::disk::view::DiskView<'a>),
 }
 
 impl TabView for ActiveView<'_> {
@@ -55,6 +56,7 @@ impl TabView for ActiveView<'_> {
             Self::Network(view) => view.specs(),
             Self::Memory(view) => view.specs(),
             Self::Thermal(view) => view.specs(),
+            Self::Disk(view) => view.specs(),
         }
     }
 
@@ -68,6 +70,7 @@ impl TabView for ActiveView<'_> {
             Self::Network(view) => view.template(),
             Self::Memory(view) => view.template(),
             Self::Thermal(view) => view.template(),
+            Self::Disk(view) => view.template(),
         }
     }
 
@@ -81,6 +84,7 @@ impl TabView for ActiveView<'_> {
             Self::Network(view) => view.demand(panel),
             Self::Memory(view) => view.demand(panel),
             Self::Thermal(view) => view.demand(panel),
+            Self::Disk(view) => view.demand(panel),
         }
     }
 
@@ -101,6 +105,7 @@ impl TabView for ActiveView<'_> {
             Self::Network(view) => view.paint(surface, placed, rect, scroll, sections),
             Self::Memory(view) => view.paint(surface, placed, rect, scroll, sections),
             Self::Thermal(view) => view.paint(surface, placed, rect, scroll, sections),
+            Self::Disk(view) => view.paint(surface, placed, rect, scroll, sections),
         }
     }
 }
