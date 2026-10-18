@@ -807,6 +807,73 @@ fn load_or_seed_session_registers_bootstrap_workspace() {
 }
 
 #[test]
+fn load_or_seed_session_does_not_block_on_startup_cache_writes() {
+    use std::time::{Duration, Instant};
+    use thegn_core::store::WorkspaceStore;
+
+    let state_home = tempfile::tempdir().unwrap();
+    let ws_dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(state_home.path().join("thegn")).unwrap();
+    let ws_str = ws_dir.path().to_string_lossy().into_owned();
+    let state_str = state_home.path().to_str().unwrap();
+    let _env = crate::testenv::EnvVarGuard::set(&[
+        ("XDG_STATE_HOME", state_str),
+        ("THEGN_SESSION", &ws_str),
+    ]);
+    let db_path = state_home.path().join("thegn/thegn.db");
+
+    // Give resurrection a real layout so this test exercises only the three
+    // startup cache writes, not the separate empty-session seed persist.
+    {
+        let db = thegn_core::db::Db::open_at(&db_path).unwrap();
+        let session = Session {
+            id: ws_str.clone(),
+            worktrees: vec![WorktreeGroup::new(
+                thegn_core::repo::home_tab("workspace"),
+                GroupKind::Home,
+                ws_str.clone(),
+            )],
+            active: 0,
+        };
+        session.persist(&db, &ws_str, 1).unwrap();
+    }
+
+    let lock = rusqlite::Connection::open(&db_path).unwrap();
+    lock.execute_batch("BEGIN IMMEDIATE").unwrap();
+    let started = Instant::now();
+    let (session, seeded) = load_or_seed_session(ws_dir.path(), &Default::default());
+    assert!(!seeded);
+    assert_eq!(session.id, ws_str);
+    assert!(
+        started.elapsed() < Duration::from_millis(500),
+        "startup cache writes must not wait for the held DB write lock"
+    );
+
+    lock.execute_batch("ROLLBACK").unwrap();
+    drop(lock);
+    let (barrier_tx, barrier_rx) = std::sync::mpsc::channel();
+    crate::db_task::persist_critical(move |_| {
+        if barrier_tx.send(()).is_err() {
+            tracing::debug!("startup DB writer barrier receiver closed");
+        }
+    });
+    barrier_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+
+    let db = thegn_core::db::Db::open_at(&db_path).unwrap();
+    assert!(
+        db.workspaces()
+            .unwrap()
+            .iter()
+            .any(|w| w.repo_path == ws_str)
+    );
+    assert!(db.known_repos().unwrap().contains(&ws_str));
+    assert_eq!(
+        db.active_workspace().unwrap().as_deref(),
+        Some(ws_str.as_str())
+    );
+}
+
+#[test]
 fn load_or_seed_session_does_not_resurrect_tombstoned_workspace() {
     // Regression: removing a workspace keeps its home checkout on disk (git
     // is truth), so a cold start that resolves to that directory must NOT
