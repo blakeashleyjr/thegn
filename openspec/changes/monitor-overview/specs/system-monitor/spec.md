@@ -30,3 +30,9 @@ mark rather than a numeric zero.
 
 The monitor SHALL copy a sampled frame into overlay-owned Overview state before
 the sampler recycles the frame. A paused overlay SHALL ignore incoming frames.
+
+#### Scenario: Paused Overview receives a frame
+
+- **WHEN** the overlay is paused and a sampled frame arrives
+- **THEN** the Overview model is unchanged
+- **AND** the frame is not marked dirty
