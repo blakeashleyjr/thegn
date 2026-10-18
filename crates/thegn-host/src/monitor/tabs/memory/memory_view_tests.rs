@@ -1,4 +1,5 @@
 use super::{MemoryModel, MemoryView};
+use crate::telemetry::{ScaleMode, TelemetryHistory, Window};
 use crate::{
     caps,
     compositor::Rect,
@@ -9,6 +10,7 @@ use thegn_core::{
     mem_health::{self, MemHealthInput, Verdict},
     termcaps::{ColorDepth, UnicodeLevel},
 };
+use thegn_metrics::StatsSnapshot;
 use thegn_metrics::collect::{
     CollectorId,
     frame::MonitorFrame,
@@ -257,6 +259,18 @@ fn board_snapshots_cover_size_and_capability_matrix() {
                         Some(thegn_metrics::collect::model::cgroup::Limit::Value(8192));
                     model.absorb_frame(&frame);
                 }
+                let mut telemetry = TelemetryHistory::default();
+                for sample in 0_u32..120 {
+                    telemetry.push(
+                        &StatsSnapshot {
+                            mem_gib: Some((4.0 + (sample % 31) as f32 / 10.0, 8.0)),
+                            swap_gib: Some((0.5 + (sample % 17) as f32 / 10.0, 2.0)),
+                            ..Default::default()
+                        },
+                        1000 + u64::from(sample) * 1000,
+                    );
+                }
+                model.absorb_history(&telemetry, Window::EVERYTHING, ScaleMode::Window, 120_000);
                 model.swap_total = Some(2 * 1024 * 1024 * 1024);
                 model.swap_free = Some(1024 * 1024 * 1024);
                 model.zswap = Some(32 * 1024 * 1024);
@@ -272,9 +286,9 @@ fn board_snapshots_cover_size_and_capability_matrix() {
                 assert!(rendered.contains("Memory"));
                 assert!(rendered.contains("health"));
                 if cols == 240 {
-                    // density follow-up (batch 48)
                     let ratio = fill_ratio(&surface, Rect::full(cols, rows));
-                    assert!(ratio >= 0.30, "fill ratio {ratio:.3}");
+                    // density follow-up (batch 49): measured 0.40
+                    assert!(ratio >= 0.40, "fill ratio {ratio:.3}");
                     assert!(rendered.contains("used / available history"));
                     assert!(rendered.contains("PSI history"));
                     assert!(rendered.contains("direct reclaim history"));
@@ -284,6 +298,7 @@ fn board_snapshots_cover_size_and_capability_matrix() {
                     assert!(rendered.contains("allocstall"));
                     assert!(rendered.contains("Container limit"));
                     assert!(rendered.contains("thegn.slice usage history"));
+                    assert!(rendered.contains("swap history"));
                 }
                 if level == UnicodeLevel::Ascii {
                     assert!(rendered.is_ascii());
@@ -443,4 +458,10 @@ fn memory_history_keeps_only_the_latest_bounded_window() {
     assert_eq!(peak, 124.0);
     assert_eq!(recent[0], 5.0);
     assert_eq!(recent[119], 124.0);
+}
+
+#[test]
+fn short_history_is_right_aligned_without_upsampling() {
+    assert_eq!(super::right_aligned_window(3, 10), (0, 3, 7));
+    assert_eq!(super::right_aligned_window(12, 10), (2, 10, 0));
 }
