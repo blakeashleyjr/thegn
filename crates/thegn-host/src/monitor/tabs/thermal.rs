@@ -8,6 +8,9 @@ use crate::telemetry::Metric;
 use thegn_core::theme::Hue;
 use thegn_core::viz::Unit;
 
+#[allow(dead_code)] // wired into the overlay dispatch in batch 47 (see THE-871)
+pub(in crate::monitor) mod view;
+
 pub(in crate::monitor) fn thermal(cx: &Ctx) -> Vec<Section> {
     let s = &cx.model.stats;
     let mut out = Vec::new();
