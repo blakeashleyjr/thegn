@@ -4,6 +4,13 @@ use std::cmp::Ordering;
 
 /// A term rejected by the query parser or unavailable in the sampled row.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "header display of invalid terms lands in batch 47 (tabs/procs.rs)"
+    )
+)]
 pub(in crate::monitor) struct InvalidTerm {
     pub text: String,
     pub reason: &'static str,
@@ -93,20 +100,28 @@ impl Query {
     }
 
     fn parse_term(&mut self, text: &str) -> Term {
-        if let Some(inner) = text.strip_prefix('!') {
-            if inner.is_empty() {
-                self.invalid.push(InvalidTerm {
-                    text: text.to_string(),
-                    reason: "expected a term after !",
-                });
-                return Term::Ignored;
-            }
-            return match self.parse_term(inner) {
-                Term::Ignored => Term::Ignored,
-                term => Term::Not(Box::new(term)),
-            };
+        let mut inner = text;
+        let mut negated = false;
+        while let Some(rest) = inner.strip_prefix('!') {
+            negated = !negated;
+            inner = rest;
+        }
+        if inner.is_empty() {
+            self.invalid.push(InvalidTerm {
+                text: text.to_string(),
+                reason: "expected a term after !",
+            });
+            return Term::Ignored;
         }
 
+        let mut term = self.parse_positive_term(inner);
+        if negated && !matches!(term, Term::Ignored) {
+            term = Term::Not(Box::new(term));
+        }
+        term
+    }
+
+    fn parse_positive_term(&mut self, text: &str) -> Term {
         let Some((name, op, raw_value)) = split_field(text) else {
             return Term::Bare(text.to_ascii_lowercase());
         };
@@ -142,13 +157,6 @@ impl Query {
             });
             return Term::Ignored;
         }
-        if matches!(field, Field::User | Field::State | Field::Threads) {
-            self.invalid.push(InvalidTerm {
-                text: text.to_string(),
-                reason: "not available yet",
-            });
-        }
-
         let value = match field {
             Field::Cpu => parse_percent(raw_value).map(Value::Number),
             Field::Mem => parse_size(raw_value).map(Value::Number),
@@ -174,6 +182,14 @@ impl Query {
             });
             return Term::Ignored;
         };
+        // Availability is judged against ProcSample until P-2 adds these fields.
+        if matches!(field, Field::User | Field::State | Field::Threads) {
+            self.invalid.push(InvalidTerm {
+                text: text.to_string(),
+                reason: "not available yet",
+            });
+            return Term::Ignored;
+        }
         if field == Field::Owner && !matches!(op, Op::Contains | Op::Equal) {
             self.invalid.push(InvalidTerm {
                 text: text.to_string(),
@@ -185,6 +201,13 @@ impl Query {
     }
 
     /// Terms to display as invalid. Invalid terms are ignored by `matches`.
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "header display of invalid terms lands in batch 47 (tabs/procs.rs)"
+        )
+    )]
     pub(in crate::monitor) fn invalid(&self) -> &[InvalidTerm] {
         &self.invalid
     }
@@ -202,6 +225,7 @@ impl Query {
 }
 
 fn split_field(text: &str) -> Option<(&str, Op, &str)> {
+    let mut earliest: Option<(usize, usize, Op)> = None;
     for (needle, op) in [
         (">=", Op::GreaterEqual),
         ("<=", Op::LessEqual),
@@ -210,13 +234,20 @@ fn split_field(text: &str) -> Option<(&str, Op, &str)> {
         ("<", Op::Less),
         ("=", Op::Equal),
     ] {
-        if let Some((name, value)) = text.split_once(needle) {
-            if !name.is_empty() {
-                return Some((name, op, value));
-            }
+        if let Some(position) = text.find(needle)
+            && earliest.is_none_or(|(current, len, _)| {
+                position < current || (position == current && needle.len() > len)
+            })
+        {
+            earliest = Some((position, needle.len(), op));
         }
     }
-    None
+    let (position, len, op) = earliest?;
+    let name = &text[..position];
+    if name.is_empty() || !name.bytes().all(|byte| byte.is_ascii_alphabetic()) {
+        return None;
+    }
+    Some((name, op, &text[position + len..]))
 }
 
 fn parse_percent(value: &str) -> Option<f64> {
@@ -226,17 +257,22 @@ fn parse_percent(value: &str) -> Option<f64> {
 }
 
 fn parse_size(value: &str) -> Option<f64> {
-    let split = value.find(|ch: char| !ch.is_ascii_digit() && ch != '.')?;
+    let split = value
+        .find(|ch: char| !ch.is_ascii_digit() && ch != '.')
+        .unwrap_or(value.len());
     let (number, suffix) = value.split_at(split);
     let magnitude = number.parse::<f64>().ok()?;
     let multiplier = match suffix.to_ascii_lowercase().as_str() {
+        "" => 1_f64,
         "k" | "ki" | "kib" => 1024_f64,
         "m" | "mi" | "mib" => 1024_f64.powi(2),
         "g" | "gi" | "gib" => 1024_f64.powi(3),
         "t" | "ti" | "tib" => 1024_f64.powi(4),
         _ => return None,
     };
-    (magnitude.is_finite()).then_some(magnitude * multiplier)
+    (magnitude * multiplier)
+        .is_finite()
+        .then_some(magnitude * multiplier)
 }
 
 fn parse_duration(value: &str) -> Option<f64> {
@@ -351,6 +387,7 @@ fn compare(actual: f64, expected: f64, op: Op) -> bool {
 mod tests {
     use super::{Query, QueryRow};
 
+    #[derive(Clone)]
     struct FakeRow {
         name: &'static str,
         pid: u32,
@@ -429,10 +466,8 @@ mod tests {
 
     #[test]
     fn every_operator_and_value_family_matches_at_its_boundary() {
-        let row = row();
+        let base = row();
         for (query, expected) in [
-            ("user:BLake", true),
-            ("s:DZ", true),
             ("cpu>10", false),
             ("cpu>=10%", true),
             ("cpu<11", true),
@@ -445,26 +480,25 @@ mod tests {
             ("age<5m", true),
             ("age<=5m", true),
             ("age>30s", true),
-            ("thr>50", true),
             ("pid:42", true),
             ("pid:420", false),
             ("owner:pane", true),
             ("!firefox", false),
             ("Firefox pane", true),
         ] {
-            assert_eq!(Query::parse(query).matches(&row), expected, "{query}");
+            assert_eq!(Query::parse(query).matches(&base), expected, "{query}");
         }
         assert!(!Query::parse("age<5m").matches(&FakeRow {
             age: Some(300),
-            ..row()
+            ..base.clone()
         }));
         assert!(Query::parse("age>2h").matches(&FakeRow {
             age: Some(7201),
-            ..row()
+            ..base.clone()
         }));
         assert!(Query::parse("age<1d").matches(&FakeRow {
             age: Some(86_399),
-            ..row()
+            ..base
         }));
     }
 
@@ -479,14 +513,10 @@ mod tests {
             },
         ];
         for (base, addition) in [("", "fire"), ("pid:42", "fox"), ("cpu>0", "missing")] {
-            let base_matches = rows
-                .iter()
-                .filter(|item| Query::parse(base).matches(item))
-                .count();
-            let extended_matches = rows
-                .iter()
-                .filter(|item| Query::parse(&format!("{base} {addition}")).matches(item))
-                .count();
+            let query = Query::parse(base);
+            let base_matches = rows.iter().filter(|item| query.matches(*item)).count();
+            let extended = Query::parse(&format!("{base} {addition}"));
+            let extended_matches = rows.iter().filter(|item| extended.matches(*item)).count();
             assert!(extended_matches <= base_matches, "{base} + {addition}");
         }
     }
@@ -498,5 +528,42 @@ mod tests {
             ..row()
         };
         assert!(Query::parse("!thr>50").matches(&row));
+    }
+
+    #[test]
+    fn large_negation_prefix_is_parsed_without_recursive_nesting() {
+        let query = format!("{}firefox", "!".repeat(100_000));
+        assert!(Query::parse(&query).matches(&row()));
+    }
+
+    #[test]
+    fn field_split_uses_earliest_operator_and_bare_sizes_are_bytes() {
+        let row = row();
+        assert!(
+            Query::parse("user:a>=b")
+                .invalid()
+                .iter()
+                .any(|item| item.reason == "not available yet")
+        );
+        let bytes = Query::parse("mem>=1073741824");
+        assert!(bytes.invalid().is_empty());
+        assert!(bytes.matches(&row));
+        let huge_digits = format!("1{}", "0".repeat(308));
+        let huge_size = format!("mem>{huge_digits}T");
+        assert!(!Query::parse(&huge_size).invalid().is_empty());
+    }
+
+    #[test]
+    fn unavailable_field_with_bad_value_reports_only_bad_value() {
+        let query = Query::parse("thr>abc");
+        assert_eq!(query.invalid().len(), 1);
+        assert_eq!(query.invalid()[0].reason, "bad value");
+
+        for query in ["user:blake", "s:D", "thr>50"] {
+            let parsed = Query::parse(query);
+            assert_eq!(parsed.invalid().len(), 1, "{query}");
+            assert_eq!(parsed.invalid()[0].reason, "not available yet", "{query}");
+            assert!(parsed.matches(&row()), "{query}");
+        }
     }
 }
