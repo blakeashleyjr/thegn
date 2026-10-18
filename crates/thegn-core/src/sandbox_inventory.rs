@@ -169,7 +169,7 @@ pub struct InspectDetail {
     pub labels: BTreeMap<String, String>,
 }
 
-fn strv(v: &Value, key: &str) -> Option<&str> {
+fn strv<'a>(v: &'a Value, key: &str) -> Option<&'a str> {
     v.get(key)?.as_str()
 }
 fn int(v: &Value, key: &str) -> Option<i64> {
@@ -587,7 +587,7 @@ fn inspect_health(state: &Value) -> (Option<HealthState>, Option<i32>, Option<St
     (status, streak, probe)
 }
 fn inspect_ips(v: Option<&Value>) -> Vec<String> {
-    let mut networks = v
+    let mut networks: Vec<(&String, String)> = v
         .and_then(|n| n.get("Networks"))
         .and_then(Value::as_object)
         .map(|networks| {
