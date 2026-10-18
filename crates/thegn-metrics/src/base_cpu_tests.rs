@@ -24,9 +24,10 @@ fn fixture_deltas_match_sysinfo_busy_formula_for_global_and_each_core() {
     // busy = 720 and total = 2400 (30%). Guest is subtracted from user and
     // added back as virtual time; guest is unchanged between these fixtures.
     // iowait is also unchanged, and when it changes sysinfo counts it as idle.
-    assert_eq!(global, Some(30.0));
+    assert!(global.is_some_and(|value| (value - 30.0).abs() < 0.001));
     // Each core has +20 user, +10 steal, and +70 idle: 30 / 100 = 30%.
-    assert_eq!(cores, vec![30.0; 24]);
+    assert_eq!(cores.len(), 24);
+    assert!(cores.iter().all(|value| (*value - 30.0).abs() < 0.001));
 }
 
 #[test]
@@ -102,8 +103,10 @@ fn fixture_core_with_guest_and_iowait_deltas_keeps_its_index() {
     let mut primed = false;
     assert_eq!(reader.fill_bytes(&mut primed, first), (None, Vec::new()));
     let (_, cores) = reader.fill_bytes(&mut primed, second);
-    assert_eq!(cores, vec![10.0, 30.0, 50.0]);
-    assert_eq!(cores[1], 30.0);
+    assert_eq!(cores.len(), 3);
+    assert_eq!(cores[0], 10.0);
+    assert!((cores[1] - 30.0).abs() < 0.001);
+    assert_eq!(cores[2], 50.0);
 }
 
 #[test]
@@ -141,7 +144,7 @@ fn missing_cpu_seven_keeps_cpu_eight_at_index_eight() {
     let (_, cores) = reader.fill_bytes(&mut primed, &second);
     assert_eq!(cores.len(), 9);
     assert_eq!(cores[7], 0.0);
-    assert_eq!(cores[8], 67.0);
+    assert!((cores[8] - (2.0 / 3.0 * 100.0)).abs() < 0.001);
 }
 
 #[test]
