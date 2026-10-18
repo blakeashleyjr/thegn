@@ -18,7 +18,7 @@ use super::super::{
 };
 
 pub const MAX_SUPPLIES: usize = 16;
-const REDISCOVER_TICKS: u64 = 30;
+const REDISCOVER_AFTER_MS: u64 = 60_000;
 const BUFFER_LEN: usize = 128;
 const ATTRS: [&str; 9] = [
     "status",
@@ -79,7 +79,6 @@ pub struct SupplyReader<F: SupplyFs = RealFs> {
     fs: F,
     root: PathBuf,
     supplies: Vec<Held<F::Handle>>,
-    ticks_since_discovery: u64,
     #[cfg(test)]
     counters: Counters,
     #[cfg(test)]
@@ -98,7 +97,6 @@ impl<F: SupplyFs> SupplyReader<F> {
             fs,
             root: root.into(),
             supplies: Vec::new(),
-            ticks_since_discovery: REDISCOVER_TICKS,
             #[cfg(test)]
             counters: Counters::default(),
             #[cfg(test)]
@@ -135,24 +133,32 @@ impl<F: SupplyFs> SupplyReader<F> {
         let entries = match self.fs.list(&self.root) {
             Ok(entries) => entries,
             Err(_) => {
-                self.ticks_since_discovery = 0;
                 return Health::Absent(Absent::NoHardware);
             }
         };
         let mut buffer = [0_u8; BUFFER_LEN];
+        let mut typed_entries = Vec::new();
         for dir in entries {
-            if self.supplies.len() >= MAX_SUPPLIES {
-                break;
-            }
             let Some(kind_bytes) = self.read_small(&dir.join("type"), &mut buffer) else {
                 continue;
             };
             let kind = match trim(kind_bytes) {
                 b"Battery" => SupplyKind::Battery,
                 b"Mains" => SupplyKind::Mains,
-                b"USB" | b"USB_C" => SupplyKind::Usb,
-                _ => continue,
+                value if value.starts_with(b"USB") => SupplyKind::Usb,
+                b"Unknown" => continue,
+                _ => SupplyKind::Other,
             };
+            typed_entries.push((dir, kind));
+        }
+        typed_entries.sort_by_key(|(_, kind)| match kind {
+            SupplyKind::Battery => 0,
+            SupplyKind::Mains => 1,
+            SupplyKind::Usb => 2,
+            SupplyKind::Other => 3,
+        });
+        let mut counted_supplies = 0;
+        for (dir, kind) in typed_entries {
             let Some(file_name) = dir.file_name() else {
                 continue;
             };
@@ -160,15 +166,36 @@ impl<F: SupplyFs> SupplyReader<F> {
             let scope = self
                 .read_small(&dir.join("scope"), &mut buffer)
                 .is_some_and(|b| trim(b) == b"Device");
+            if !scope && counted_supplies >= MAX_SUPPLIES {
+                continue;
+            }
             let mut handles: [Option<F::Handle>; ATTRS.len()] = std::array::from_fn(|_| None);
-            for (index, attr) in ATTRS.iter().enumerate() {
+            let attrs = if kind == SupplyKind::Other {
+                &[(7, "online")][..]
+            } else {
+                &[
+                    (0, "status"),
+                    (1, "capacity"),
+                    (2, "energy_now"),
+                    (3, "charge_now"),
+                    (4, "voltage_now"),
+                    (5, "current_now"),
+                    (6, "power_now"),
+                    (7, "online"),
+                    (8, "usb_type"),
+                ][..]
+            };
+            for (index, attr) in attrs {
                 if let Ok(handle) = self.fs.open(&dir.join(attr)) {
                     #[cfg(test)]
                     {
                         self.counters.opens += 1;
                     }
-                    handles[index] = Some(handle);
+                    handles[*index] = Some(handle);
                 }
+            }
+            if kind == SupplyKind::Other && handles[7].is_none() {
+                continue;
             }
             let mut static_values = [None; 6];
             for (slot, attr) in static_values.iter_mut().zip([
@@ -190,9 +217,15 @@ impl<F: SupplyFs> SupplyReader<F> {
                 kind,
                 device_scope: scope,
             });
+            if !scope {
+                counted_supplies += 1;
+            }
         }
-        self.ticks_since_discovery = 0;
-        if self.supplies.is_empty() {
+        if !self
+            .supplies
+            .iter()
+            .any(|supply| supply.kind == SupplyKind::Battery && !supply.device_scope)
+        {
             Health::Absent(Absent::NoHardware)
         } else {
             Health::Ok
@@ -201,6 +234,11 @@ impl<F: SupplyFs> SupplyReader<F> {
 
     pub fn read_full(&mut self, part: &mut PowerSupplyPart) -> Result<(), CollectError> {
         part.supplies.clear();
+        #[cfg(test)]
+        if self.fail_next_read {
+            self.fail_next_read = false;
+            return Err(CollectError::Gone);
+        }
         let mut buffer = [0_u8; BUFFER_LEN];
         for supply in &self.supplies {
             let mut values = [None; ATTRS.len()];
@@ -226,7 +264,13 @@ impl<F: SupplyFs> SupplyReader<F> {
                                 values[index] = parse_u64(bytes);
                             }
                         }
-                        Err(_) if matches!(index, 0 | 1) => {
+                        Err(error)
+                            if matches!(index, 0 | 1)
+                                && supply.kind == SupplyKind::Battery
+                                && !supply.device_scope
+                                && (error.kind() == io::ErrorKind::NotFound
+                                    || error.raw_os_error() == Some(libc::ENODEV)) =>
+                        {
                             return Err(CollectError::Gone);
                         }
                         Err(_) => {}
@@ -268,11 +312,14 @@ impl<F: SupplyFs> SupplyReader<F> {
             }
             part.supplies.push(reading);
         }
-        self.ticks_since_discovery = self.ticks_since_discovery.saturating_add(1);
         Ok(())
     }
 
-    pub fn read_base(&mut self, out: &mut Vec<BaseSupply>) -> Result<(), CollectError> {
+    pub fn read_base(
+        &mut self,
+        out: &mut Vec<BaseSupply>,
+        signal_critical_errors: bool,
+    ) -> Result<(), CollectError> {
         out.clear();
         #[cfg(test)]
         if self.fail_next_read {
@@ -282,27 +329,54 @@ impl<F: SupplyFs> SupplyReader<F> {
         let mut buffer = [0_u8; BUFFER_LEN];
         let mut adapter_online = false;
         let mut status_ac = false;
-        let (fs, supplies) = (&mut self.fs, &self.supplies);
+        let fs = &mut self.fs;
+        let supplies = &self.supplies;
+        #[cfg(test)]
+        let counters = &mut self.counters;
         for supply in supplies {
             if supply.kind != SupplyKind::Battery || supply.device_scope {
                 continue;
             }
-            #[cfg(test)]
-            {
-                self.counters.reads += 2;
-            }
-            let status =
-                read_slot(fs, &supply.handles[0], &mut buffer)?.and_then(SupplyStatus::parse);
-            let capacity = read_slot(fs, &supply.handles[1], &mut buffer)?
-                .and_then(parse_u64)
-                .and_then(to_u8);
+            let status = read_slot(
+                fs,
+                &supply.handles[0],
+                &mut buffer,
+                signal_critical_errors,
+                #[cfg(test)]
+                counters,
+            )?
+            .and_then(SupplyStatus::parse);
+            let capacity = read_slot(
+                fs,
+                &supply.handles[1],
+                &mut buffer,
+                signal_critical_errors,
+                #[cfg(test)]
+                counters,
+            )?
+            .and_then(parse_u64)
+            .and_then(to_u8);
             status_ac |= matches!(
                 status,
                 Some(SupplyStatus::Charging | SupplyStatus::Full | SupplyStatus::NotCharging)
             );
-            let energy = read_optional(fs, &supply.handles[2], &mut buffer).and_then(parse_u64);
+            let energy = read_optional(
+                fs,
+                &supply.handles[2],
+                &mut buffer,
+                #[cfg(test)]
+                counters,
+            )
+            .and_then(parse_u64);
             let charge = if energy.is_none() {
-                read_optional(fs, &supply.handles[3], &mut buffer).and_then(parse_u64)
+                read_optional(
+                    fs,
+                    &supply.handles[3],
+                    &mut buffer,
+                    #[cfg(test)]
+                    counters,
+                )
+                .and_then(parse_u64)
             } else {
                 None
             };
@@ -311,18 +385,32 @@ impl<F: SupplyFs> SupplyReader<F> {
                 self.fail_next_power_read = false;
                 None
             } else {
-                read_optional(fs, &supply.handles[6], &mut buffer).and_then(parse_u64)
+                read_optional(fs, &supply.handles[6], &mut buffer, counters).and_then(parse_u64)
             };
             #[cfg(not(test))]
             let power = read_optional(fs, &supply.handles[6], &mut buffer).and_then(parse_u64);
             let needs_iv = power.is_none() || (energy.is_none() && charge.is_some());
             let current = if needs_iv {
-                read_optional(fs, &supply.handles[5], &mut buffer).and_then(parse_i64)
+                read_optional(
+                    fs,
+                    &supply.handles[5],
+                    &mut buffer,
+                    #[cfg(test)]
+                    counters,
+                )
+                .and_then(parse_i64)
             } else {
                 None
             };
             let voltage = if needs_iv {
-                read_optional(fs, &supply.handles[4], &mut buffer).and_then(parse_u64)
+                read_optional(
+                    fs,
+                    &supply.handles[4],
+                    &mut buffer,
+                    #[cfg(test)]
+                    counters,
+                )
+                .and_then(parse_u64)
             } else {
                 None
             };
@@ -346,13 +434,19 @@ impl<F: SupplyFs> SupplyReader<F> {
         }
         if !status_ac && !out.is_empty() {
             for supply in supplies {
-                if matches!(supply.kind, SupplyKind::Mains | SupplyKind::Usb) {
+                if supply.kind != SupplyKind::Battery && supply.handles[7].is_some() {
                     #[cfg(test)]
                     {
-                        self.counters.adapter_reads += 1;
-                        self.counters.reads += 1;
+                        counters.adapter_reads += 1;
                     }
-                    if read_optional(fs, &supply.handles[7], &mut buffer).and_then(parse_u64)
+                    if read_optional(
+                        fs,
+                        &supply.handles[7],
+                        &mut buffer,
+                        #[cfg(test)]
+                        counters,
+                    )
+                    .and_then(parse_u64)
                         == Some(1)
                     {
                         adapter_online = true;
@@ -364,12 +458,7 @@ impl<F: SupplyFs> SupplyReader<F> {
         for row in out {
             row.on_ac = status_ac || adapter_online;
         }
-        self.ticks_since_discovery = self.ticks_since_discovery.saturating_add(1);
         Ok(())
-    }
-
-    pub fn needs_rediscovery(&self) -> bool {
-        self.ticks_since_discovery >= REDISCOVER_TICKS
     }
     pub fn close(&mut self) {
         self.supplies.clear();
@@ -399,17 +488,26 @@ pub struct BaseSupply {
     pub voltage_min_design: Option<u64>,
 }
 
-pub struct PowerSupplyCollector {
-    reader: SupplyReader,
+pub struct PowerSupplyCollector<F: SupplyFs = RealFs> {
+    reader: SupplyReader<F>,
+    discovered_at_ms: Option<u64>,
+    last_now_ms: u64,
 }
 impl PowerSupplyCollector {
     pub fn at(root: impl Into<PathBuf>) -> Self {
+        Self::with_fs(RealFs, root)
+    }
+}
+impl<F: SupplyFs> PowerSupplyCollector<F> {
+    pub fn with_fs(fs: F, root: impl Into<PathBuf>) -> Self {
         Self {
-            reader: SupplyReader::at(root),
+            reader: SupplyReader::with_fs(fs, root),
+            discovered_at_ms: None,
+            last_now_ms: 0,
         }
     }
 }
-impl Collector for PowerSupplyCollector {
+impl<F: SupplyFs> Collector for PowerSupplyCollector<F> {
     fn id(&self) -> CollectorId {
         CollectorId::PowerSupply
     }
@@ -417,11 +515,20 @@ impl Collector for PowerSupplyCollector {
         Cadence::Every(2)
     }
     fn discover(&mut self, _env: &Env) -> Health {
-        self.reader.discover()
+        let health = self.reader.discover();
+        self.discovered_at_ms = Some(self.last_now_ms);
+        health
     }
-    fn sample(&mut self, _ctx: &TickCtx, frame: &mut MonitorFrame) -> Result<(), CollectError> {
-        if self.reader.needs_rediscovery() {
+    fn sample(&mut self, ctx: &TickCtx, frame: &mut MonitorFrame) -> Result<(), CollectError> {
+        self.last_now_ms = ctx.now_ms;
+        let mut rediscovered = false;
+        if self
+            .discovered_at_ms
+            .is_none_or(|then| ctx.now_ms.saturating_sub(then) >= REDISCOVER_AFTER_MS)
+        {
             self.discover(&Env::default());
+            self.discovered_at_ms = Some(ctx.now_ms);
+            rediscovered = true;
         }
         match self.reader.read_full(&mut frame.parts.power_supply) {
             Ok(()) => {
@@ -429,7 +536,10 @@ impl Collector for PowerSupplyCollector {
                 Ok(())
             }
             Err(error) => {
-                self.reader.discover();
+                if !rediscovered {
+                    self.reader.discover();
+                    self.discovered_at_ms = Some(ctx.now_ms);
+                }
                 match self.reader.read_full(&mut frame.parts.power_supply) {
                     Ok(()) => {
                         frame.sampled.insert(CollectorId::PowerSupply);
@@ -449,34 +559,37 @@ fn read_slot<'a, F: SupplyFs>(
     fs: &mut F,
     handle: &Option<F::Handle>,
     buffer: &'a mut [u8],
+    signal_critical_errors: bool,
+    #[cfg(test)] counters: &mut Counters,
 ) -> Result<Option<&'a [u8]>, CollectError> {
     let Some(handle) = handle else {
         return Ok(None);
     };
+    #[cfg(test)]
+    {
+        counters.reads += 1;
+    }
     match fs.pread(handle, buffer) {
         Ok(len) => Ok(Some(trim(&buffer[..len.min(buffer.len())]))),
-        Err(error)
-            if error.raw_os_error() == Some(libc::ENODEV)
-                || error.raw_os_error() == Some(libc::EIO) =>
-        {
-            Err(CollectError::Gone)
-        }
-        Err(error) => Err(error.into()),
+        Err(_) if signal_critical_errors => Err(CollectError::Gone),
+        Err(_) => Ok(None),
     }
 }
-#[allow(
-    clippy::manual_ok_err,
-    reason = "the ignored-result ratchet forbids Result::ok here"
-)]
 fn read_optional<'a, F: SupplyFs>(
     fs: &mut F,
     handle: &Option<F::Handle>,
     buffer: &'a mut [u8],
+    #[cfg(test)] counters: &mut Counters,
 ) -> Option<&'a [u8]> {
-    match read_slot(fs, handle, buffer) {
-        Ok(value) => value,
-        Err(_) => None,
-    }
+    read_slot(
+        fs,
+        handle,
+        buffer,
+        false,
+        #[cfg(test)]
+        counters,
+    )
+    .unwrap_or_default()
 }
 
 fn trim(mut bytes: &[u8]) -> &[u8] {
@@ -525,10 +638,14 @@ mod tests {
         dirs: Vec<PathBuf>,
         files: HashMap<PathBuf, Vec<u8>>,
         failures: HashSet<PathBuf>,
+        failure_codes: HashMap<PathBuf, i32>,
+        lists: usize,
+        opens: usize,
     }
     impl SupplyFs for FakeFs {
         type Handle = PathBuf;
         fn list(&mut self, dir: &Path) -> io::Result<Vec<PathBuf>> {
+            self.lists += 1;
             Ok(self
                 .dirs
                 .iter()
@@ -546,6 +663,7 @@ mod tests {
             Ok(len)
         }
         fn open(&mut self, path: &Path) -> io::Result<Self::Handle> {
+            self.opens += 1;
             if self.files.contains_key(path) {
                 Ok(path.to_owned())
             } else {
@@ -553,6 +671,9 @@ mod tests {
             }
         }
         fn pread(&mut self, handle: &Self::Handle, buffer: &mut [u8]) -> io::Result<usize> {
+            if let Some(code) = self.failure_codes.get(handle) {
+                return Err(io::Error::from_raw_os_error(*code));
+            }
             if self.failures.contains(handle) {
                 return Err(io::Error::from_raw_os_error(libc::ENODEV));
             }
@@ -675,6 +796,8 @@ mod tests {
         let mut part = PowerSupplyPart::default();
         reader.read_full(&mut part).unwrap();
         assert_eq!(part.supplies.len(), 2);
+        assert_eq!(part.supplies[0].online, Some(true));
+        assert_eq!(part.supplies[1].online, Some(true));
         assert_eq!(
             part.supplies[1].usb_type_active,
             Some(crate::collect::model::power_supply::UsbType::Pd)
@@ -693,11 +816,201 @@ mod tests {
         std::fs::create_dir(&mains).unwrap();
         std::fs::write(mains.join("type"), "Mains\n").unwrap();
         std::fs::write(mains.join("online"), "1\n").unwrap();
-        assert_eq!(collector.discover(&Env::default()), Health::Ok);
+        assert_eq!(
+            collector.discover(&Env::default()),
+            Health::Absent(Absent::NoHardware)
+        );
         let mut frame = MonitorFrame::default();
         collector.sample(&TickCtx::default(), &mut frame).unwrap();
         assert_eq!(frame.parts.power_supply.supplies.len(), 1);
         assert_eq!(frame.parts.power_supply.supplies[0].kind, SupplyKind::Mains);
         assert_eq!(frame.parts.power_supply.supplies[0].online, Some(true));
+    }
+
+    #[test]
+    fn collector_steady_sample_does_not_list_or_open() {
+        let root = PathBuf::from("/fake/power");
+        let mut fs = FakeFs::default();
+        fake_supply(
+            &mut fs,
+            &root,
+            "BAT0",
+            &[
+                ("type", "Battery\n"),
+                ("status", "Discharging\n"),
+                ("capacity", "61\n"),
+                ("energy_now", "1000\n"),
+                ("power_now", "500\n"),
+            ],
+        );
+        let mut collector = PowerSupplyCollector::with_fs(fs, &root);
+        assert_eq!(collector.discover(&Env::default()), Health::Ok);
+        collector.reader.fs.lists = 0;
+        collector.reader.fs.opens = 0;
+        let mut frame = MonitorFrame::default();
+        collector
+            .sample(
+                &TickCtx {
+                    tick: 2,
+                    now_ms: 500,
+                },
+                &mut frame,
+            )
+            .unwrap();
+        assert_eq!(collector.reader.fs.lists, 0);
+        assert_eq!(collector.reader.fs.opens, 0);
+    }
+
+    #[test]
+    fn collector_rediscovery_uses_overshot_sixty_second_clock_deadline() {
+        let root = PathBuf::from("/fake/power");
+        let mut fs = FakeFs::default();
+        fake_supply(
+            &mut fs,
+            &root,
+            "BAT0",
+            &[("type", "Battery\n"), ("status", "Discharging\n")],
+        );
+        let mut collector = PowerSupplyCollector::with_fs(fs, &root);
+        assert_eq!(collector.discover(&Env::default()), Health::Ok);
+        collector.reader.fail_next_read_for_test();
+        let mut frame = MonitorFrame::default();
+        collector
+            .sample(
+                &TickCtx {
+                    tick: 120,
+                    now_ms: 60_001,
+                },
+                &mut frame,
+            )
+            .unwrap();
+        assert_eq!(collector.reader.fs.lists, 2);
+    }
+
+    #[test]
+    fn unknown_or_missing_type_entries_are_absent_and_publish_no_rows() {
+        for attrs in [vec![("type", "Unknown\n"), ("online", "1\n")], vec![]] {
+            let root = PathBuf::from("/fake/power");
+            let mut fs = FakeFs::default();
+            fake_supply(&mut fs, &root, "OTHER0", &attrs);
+            let mut collector = PowerSupplyCollector::with_fs(fs, &root);
+            assert_eq!(
+                collector.discover(&Env::default()),
+                Health::Absent(Absent::NoHardware)
+            );
+            let mut frame = MonitorFrame::default();
+            collector
+                .sample(&TickCtx { tick: 1, now_ms: 1 }, &mut frame)
+                .unwrap();
+            assert!(frame.parts.power_supply.supplies.is_empty());
+        }
+    }
+
+    #[test]
+    fn device_battery_and_noncritical_errno_errors_degrade_fields() {
+        let root = PathBuf::from("/fake/power");
+        let mut fs = FakeFs::default();
+        fake_supply(
+            &mut fs,
+            &root,
+            "BAT-HID",
+            &[
+                ("type", "Battery\n"),
+                ("scope", "Device\n"),
+                ("status", "Discharging\n"),
+                ("capacity", "44\n"),
+            ],
+        );
+        fake_supply(
+            &mut fs,
+            &root,
+            "BAT0",
+            &[
+                ("type", "Battery\n"),
+                ("status", "Discharging\n"),
+                ("capacity", "82\n"),
+            ],
+        );
+        fs.failure_codes
+            .insert(root.join("BAT-HID/status"), libc::EIO);
+        fs.failure_codes
+            .insert(root.join("BAT-HID/capacity"), libc::ENODATA);
+        fs.failure_codes.insert(root.join("BAT0/status"), libc::EIO);
+        let mut reader = SupplyReader::with_fs(fs, &root);
+        assert_eq!(reader.discover(), Health::Ok);
+        let mut part = PowerSupplyPart::default();
+        reader.read_full(&mut part).unwrap();
+        assert_eq!(part.supplies.len(), 2);
+        assert_eq!(part.supplies[0].status, None);
+        assert_eq!(part.supplies[0].capacity_pct, None);
+        assert_eq!(part.supplies[1].status, None);
+        assert_eq!(part.supplies[1].capacity_pct, Some(82));
+        let mut rows = Vec::new();
+        reader.read_base(&mut rows, false).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].capacity, Some(82));
+        assert!(matches!(
+            reader.read_base(&mut rows, true),
+            Err(CollectError::Gone)
+        ));
+    }
+
+    #[test]
+    fn other_online_supply_types_are_kept_and_read_as_adapters() {
+        let root = PathBuf::from("/fake/power");
+        let mut fs = FakeFs::default();
+        fake_supply(
+            &mut fs,
+            &root,
+            "BAT0",
+            &[
+                ("type", "Battery\n"),
+                ("status", "Discharging\n"),
+                ("capacity", "80\n"),
+                ("energy_now", "500\n"),
+                ("power_now", "5\n"),
+            ],
+        );
+        fake_supply(
+            &mut fs,
+            &root,
+            "USB-PD",
+            &[("type", "USB_PD_DRP\n"), ("online", "1\n")],
+        );
+        let mut reader = SupplyReader::with_fs(fs, &root);
+        assert_eq!(reader.discover(), Health::Ok);
+        let mut rows = Vec::new();
+        reader.read_base(&mut rows, true).unwrap();
+        assert!(rows[0].on_ac);
+        assert_eq!(reader.counters().adapter_reads, 1);
+        assert_eq!(reader.counters().reads, 5);
+        let mut part = PowerSupplyPart::default();
+        reader.read_full(&mut part).unwrap();
+        assert_eq!(part.supplies[1].kind, SupplyKind::Usb);
+    }
+
+    #[test]
+    fn battery_is_kept_ahead_of_usb_rows_when_supply_cap_is_reached() {
+        let root = PathBuf::from("/fake/power");
+        let mut fs = FakeFs::default();
+        for index in 0..17 {
+            let name = format!("USB{index}");
+            let dir = root.join(name);
+            fs.dirs.push(dir.clone());
+            fs.files.insert(dir.join("type"), b"USB_DCP\n".to_vec());
+            fs.files.insert(dir.join("online"), b"0\n".to_vec());
+        }
+        fake_supply(
+            &mut fs,
+            &root,
+            "BAT0",
+            &[("type", "Battery\n"), ("capacity", "70\n")],
+        );
+        let mut reader = SupplyReader::with_fs(fs, &root);
+        assert_eq!(reader.discover(), Health::Ok);
+        let mut part = PowerSupplyPart::default();
+        reader.read_full(&mut part).unwrap();
+        assert_eq!(part.supplies.len(), MAX_SUPPLIES);
+        assert_eq!(part.supplies[0].name.as_ref(), "BAT0");
     }
 }

@@ -215,8 +215,18 @@ pub fn coverage_with_collectors(
             if snapshot_result != Coverage::Available {
                 for id in CollectorId::ALL {
                     if collector_families(id).contains(&family) {
+                        if id == CollectorId::PowerSupply
+                            && family == MetricFamily::Battery
+                            && snapshot.battery.is_none()
+                        {
+                            continue;
+                        }
                         match health[id.index()] {
-                            Health::Ok | Health::Warming | Health::Failing { .. } => {
+                            Health::Ok | Health::Failing { .. } => {
+                                collector_available = true;
+                                break;
+                            }
+                            Health::Warming if id != CollectorId::PowerSupply => {
                                 collector_available = true;
                                 break;
                             }
@@ -441,7 +451,7 @@ mod tests {
     }
 
     #[test]
-    fn power_supply_health_covers_battery_family() {
+    fn power_supply_health_does_not_claim_battery_without_battery() {
         use crate::collect::{
             COLLECTORS, CollectorId,
             health::{Absent, Health},
@@ -453,7 +463,15 @@ mod tests {
             &[MetricFamily::Battery]
         );
         health[CollectorId::PowerSupply.index()] = Health::Ok;
-        assert_eq!(
+        assert_ne!(
+            cov(
+                &coverage_with_collectors(&snapshot, &health),
+                MetricFamily::Battery
+            ),
+            Coverage::Available
+        );
+        health[CollectorId::PowerSupply.index()] = Health::Warming;
+        assert_ne!(
             cov(
                 &coverage_with_collectors(&snapshot, &health),
                 MetricFamily::Battery
