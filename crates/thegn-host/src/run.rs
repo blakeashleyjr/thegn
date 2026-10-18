@@ -16139,11 +16139,15 @@ async fn event_loop<T: Terminal>(
             // `writer.take_status()` at the next wake. The termwiz debug
             // renderer keeps the old synchronous path (it writes via the
             // BufferedTerminal) with its inline retry handling.
-            let input_close = crate::perf_timing::classify_input(
-                input_at,
-                input_went_idle,
-                std::time::Instant::now(),
-            );
+            let input_close = if crate::perf::enabled() {
+                crate::perf_timing::classify_input(
+                    input_at,
+                    input_went_idle,
+                    std::time::Instant::now(),
+                )
+            } else {
+                crate::perf_timing::InputClose::None
+            };
             let frame_input_at = match input_close {
                 crate::perf_timing::InputClose::Latency(stamp) => Some(stamp),
                 crate::perf_timing::InputClose::None | crate::perf_timing::InputClose::NoEffect => {
