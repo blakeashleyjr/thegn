@@ -17,6 +17,7 @@ mod paint;
 use thegn_metrics::collect::{
     CollectorId, CollectorSet,
     frame::MonitorFrame,
+    health::{Absent, Health},
     model::{
         amd_smu::AmdSmuStatus,
         cpu_policy::{CpuPolicy, PowerPolicy},
@@ -72,11 +73,20 @@ pub(in crate::monitor) struct PowerModel {
     pub(super) session: SessionEnergy,
     ewma: Ewma,
     history: Vec<f32>,
-    history_scale_w: f32,
+    history_next: usize,
+    history_len: usize,
+    pub(super) power_supply_health: Health,
+    pub(super) powercap_health: Health,
+    pub(super) amd_smu_health: Health,
+    pub(super) cpu_freq_health: Health,
+    pub(super) session_started: bool,
+    session_previous: Option<(u64, f32)>,
+    session_ac: Option<bool>,
 }
 #[derive(Debug, Clone, Default, PartialEq)]
 pub(super) struct BatteryRow {
     pub(super) name: String,
+    pub(super) state: Option<EffectiveState>,
     pub(super) status: Option<SupplyStatus>,
     pub(super) capacity: Option<u8>,
     pub(super) now_wh: Option<f64>,
@@ -90,22 +100,19 @@ pub(super) struct AdapterRow {
     pub(super) name: String,
     pub(super) online: Option<bool>,
 }
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub(super) struct ZoneRow {
     pub(super) name: String,
+    pub(super) domain: Option<thegn_metrics::collect::model::powercap::PowerDomain>,
     pub(super) watts: Option<f32>,
-}
-impl Default for ZoneRow {
-    fn default() -> Self {
-        Self {
-            name: String::new(),
-            watts: None,
-        }
-    }
 }
 
 impl PowerModel {
     pub(in crate::monitor) fn absorb_frame(&mut self, frame: &MonitorFrame) {
+        self.power_supply_health = frame.health[CollectorId::PowerSupply.index()];
+        self.powercap_health = frame.health[CollectorId::Powercap.index()];
+        self.amd_smu_health = frame.health[CollectorId::AmdSmu.index()];
+        self.cpu_freq_health = frame.health[CollectorId::CpuFreq.index()];
         let mut battery_count = 0;
         let mut adapter_count = 0;
         for supply in &frame.parts.power_supply.supplies {
@@ -143,6 +150,10 @@ impl PowerModel {
             .iter()
             .any(|adapter| adapter.online == Some(true));
         let ac_state = (!self.adapters.is_empty()).then_some(ac_online);
+        for battery in &mut self.batteries {
+            battery.state =
+                power::effective_state(battery.status, ac_state, battery.capacity, None);
+        }
         self.state = self.batteries.first().and_then(|battery| {
             power::effective_state(battery.status, ac_state, battery.capacity, None)
         });
@@ -182,6 +193,7 @@ impl PowerModel {
             let row = &mut self.zones[index];
             row.name.clear();
             row.name.push_str(&zone.name);
+            row.domain = Some(zone.domain);
             row.watts = zone.watts.filter(|value| value.is_finite());
         }
         self.zones
@@ -208,32 +220,36 @@ impl PowerModel {
         self.socket_w = self.socket_w.or_else(|| {
             self.zones
                 .iter()
-                .find(|zone| zone.name.contains("package"))
+                .find(|zone| {
+                    zone.domain
+                        == Some(thegn_metrics::collect::model::powercap::PowerDomain::Package)
+                })
                 .and_then(|zone| zone.watts)
         });
-        self.session.update(
-            frame.at_ms,
-            ac_state,
-            self.socket_w.or_else(|| self.battery_w.map(f32::abs)),
-        );
+        let session_watts = self.socket_w.or_else(|| self.battery_w.map(f32::abs));
+        if self.session_previous.is_some_and(|(previous_ms, _)| {
+            let elapsed = frame.at_ms.saturating_sub(previous_ms);
+            session_watts.is_some() && elapsed > 0 && elapsed <= 30_000
+        }) {
+            self.session_started = true;
+        }
+        if self.session_ac == Some(true) && ac_state == Some(false) {
+            self.session_started = false;
+        }
+        self.session.update(frame.at_ms, ac_state, session_watts);
+        self.session_previous = session_watts.map(|watts| (frame.at_ms, watts));
+        self.session_ac = ac_state;
         if let Some(watts) = self.socket_w.or(self.battery_w.map(f32::abs)) {
             if self.history.capacity() == 0 {
                 self.history.reserve_exact(HISTORY_CAP);
             }
-            if watts > self.history_scale_w {
-                let previous_scale = self.history_scale_w;
-                if previous_scale > 0.0 {
-                    for sample in &mut self.history {
-                        *sample *= previous_scale / watts;
-                    }
-                }
-                self.history_scale_w = watts;
+            if self.history.len() < HISTORY_CAP {
+                self.history.push(watts / 30.0);
+                self.history_len = self.history.len();
+            } else {
+                self.history[self.history_next] = watts / 30.0;
             }
-            if self.history.len() == HISTORY_CAP {
-                self.history.remove(0);
-            }
-            self.history
-                .push(watts / self.history_scale_w.max(f32::EPSILON));
+            self.history_next = (self.history_next + 1) % HISTORY_CAP;
         }
     }
     #[cfg(test)]
@@ -243,11 +259,7 @@ impl PowerModel {
 }
 fn metric_watts(value: Option<u32>) -> Option<f32> {
     value
-        .filter(|value| {
-            *value != u32::MAX
-                && *value != u32::from(u16::MAX)
-                && *value != u32::from(u16::MAX) * 1000
-        })
+        .filter(|value| *value != u32::MAX)
         .map(|value| value as f32 / 1000.0)
 }
 fn fill_battery(row: &mut BatteryRow, supply: &SupplyReading) {
@@ -318,15 +330,15 @@ impl TabView for PowerView<'_> {
         let mut grid = CellGrid::new(rect.cols, rect.rows);
         let title = match placed.id {
             BATTERY => "Battery",
-            RAILS => "Power rails",
+            RAILS => "Power rails (30 W max)",
             POLICY => "Power policy",
             _ => return,
         };
         let inner = panel::panel(&mut grid, Rect::full(rect.cols, rect.rows), title, None).rect();
         match placed.id {
-            BATTERY => paint::paint_battery(&mut grid, inner, &self.0),
-            RAILS => paint::paint_rails(&mut grid, inner, &self.0),
-            POLICY => paint::paint_policy(&mut grid, inner, &self.0),
+            BATTERY => paint::paint_battery(&mut grid, inner, self.0),
+            RAILS => paint::paint_rails(&mut grid, inner, self.0),
+            POLICY => paint::paint_policy(&mut grid, inner, self.0),
             _ => {}
         }
         Emitter::default().emit(
@@ -337,8 +349,17 @@ impl TabView for PowerView<'_> {
             rect.y,
         );
         if placed.id == RAILS && !self.0.history.is_empty() && inner.rows > 2 {
+            let mut ordered = [0.0_f32; HISTORY_CAP];
+            let start = if self.0.history_len == HISTORY_CAP {
+                self.0.history_next
+            } else {
+                0
+            };
+            for (offset, value) in ordered.iter_mut().take(self.0.history_len).enumerate() {
+                *value = self.0.history[(start + offset) % self.0.history_len.max(1)];
+            }
             graphs::paint_history_graph(
-                &self.0.history,
+                &ordered[..self.0.history_len],
                 RampId::Power,
                 Rect {
                     x: rect.x + inner.x,
