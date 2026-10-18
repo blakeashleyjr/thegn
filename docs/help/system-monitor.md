@@ -266,11 +266,13 @@ and new/exited values unknown until their baselines are available.
   Use `+` / `-` to adjust within `-20..=19`, `y` to apply, or `n` / `Esc` to
   cancel. The selected PID and start time are checked again before applying;
   a changed or missing process is refused. Permission errors while lowering
-  nice are shown and never retried.
+  nice are shown and never retried. On Windows, nice values represent priority
+  classes, so a one-point adjustment can remain in the same class.
 - `I` opens the Linux-only ionice confirmation. `+` / `-` cycle through idle,
-  best-effort levels 0–7 and realtime. Realtime requires root; permission
-  errors are shown and never retried. The selected PID and start time are
-  checked again before applying.
+  best-effort levels 0–7 and realtime. A process with no explicit I/O priority
+  is treated as the kernel's default best-effort level 4. Realtime requires
+  root; permission errors are shown and never retried. The selected PID and
+  start time are checked again before applying.
 
 Enumerating every process is the one genuinely expensive reading thegn takes, so
 it only happens while this tab is open and unpaused — closing the tab stops it

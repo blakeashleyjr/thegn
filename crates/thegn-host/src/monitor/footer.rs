@@ -81,16 +81,10 @@ pub(super) fn line(input: FooterInput<'_>) -> Line {
                 target,
                 ..
             } => {
-                let class_name = |class: crate::platform::IoClass| match class {
-                    crate::platform::IoClass::Idle => "idle".to_string(),
-                    crate::platform::IoClass::BestEffort(level) => format!("be {level}"),
-                    crate::platform::IoClass::RealTime(_) => "realtime".to_string(),
-                    crate::platform::IoClass::None => "none".to_string(),
-                };
                 format!(
                     "{label}: ionice {} -> {} · +/- adjust · y apply · n cancel",
-                    class_name(*current),
-                    class_name(*target)
+                    super::tabs::procs::ioprio_label(*current),
+                    super::tabs::procs::ioprio_label(*target)
                 )
             }
         };
