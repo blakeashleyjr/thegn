@@ -76,19 +76,19 @@ fn paint_throughput(grid: &mut CellGrid, body: Rect, model: &NetworkModel) {
         let rows = body.rows.saturating_sub(1).min(1);
         if rows > 0 {
             let mark = health_mark(model.health);
-            grid.view(Rect { y: 1, rows, ..body })
-                .put_str(0, 0, mark, CellStyle::default());
+            grid.view(Rect {
+                y: body.y + 1,
+                rows,
+                ..body
+            })
+            .put_str(0, 0, mark, CellStyle::default());
         }
         return;
     }
     if body.rows > 1 {
         let label_y = body.rows.saturating_sub(1);
-        grid.view(Rect {
-            y: label_y,
-            rows: 1,
-            ..body
-        })
-        .put_str(0, 0, &tx_label, CellStyle::default());
+        grid.view(body)
+            .put_str(0, label_y, &tx_label, CellStyle::default());
     }
     let graph_rows = body.rows.saturating_sub(2);
     let half = graph_rows / 2;

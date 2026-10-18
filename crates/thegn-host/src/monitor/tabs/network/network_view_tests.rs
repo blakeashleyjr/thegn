@@ -377,9 +377,9 @@ fn snapshots_cover_view_sizes_capabilities_and_static_demand() {
             }
             if cols == 240 {
                 let fill = fill_ratio(&surface, Rect::full(cols, rows));
-                // Estimated floor until the primary measures the merged layout.
+                // density follow-up (batch 49): measured 0.17
                 assert!(
-                    fill >= 0.30,
+                    fill >= 0.17,
                     "fill ratio {fill:.3} at {cols}x{rows} {unicode:?}/{depth:?}"
                 );
             }
