@@ -1,5 +1,6 @@
 //! Compatibility shim for the base-tier disk sampler; shared parsing lives in collect readers.
 use crate::DiskInfo;
+use std::time::Instant;
 #[cfg(any(target_os = "linux", test))]
 use crate::DiskKind;
 
@@ -32,7 +33,7 @@ pub(crate) use crate::collect::linux::disk_topology::physical_disks;
 
 #[cfg(any(target_os = "linux", test))]
 pub(crate) use crate::collect::parse::mountinfo::{
-    MountRow, group_mounts, hidden, parse_mountinfo,
+    MountRow, group_mounts, parse_mountinfo,
 };
 
 #[cfg(any(target_os = "linux", test))]
