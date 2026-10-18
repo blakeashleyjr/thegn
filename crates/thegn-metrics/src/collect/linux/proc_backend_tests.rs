@@ -71,7 +71,9 @@ fn sampler_backend_samples_and_reset_clear_native_baseline_and_kept_handles() {
     primed = successful;
     assert!(primed);
     // Both instants come from separate Instant::now() calls, so allow scheduling jitter.
-    assert!(native.pass_time >= Duration::from_secs(2) && native.pass_time < Duration::from_secs(3));
+    assert!(
+        native.pass_time >= Duration::from_secs(2) && native.pass_time < Duration::from_secs(3)
+    );
     assert!(!native.previous_pids.is_empty());
 
     let held_before_reset = native.table.kept_count();
