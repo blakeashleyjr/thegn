@@ -183,13 +183,11 @@ fn memory_history_right_aligns_two_samples_in_unicode_and_ascii() {
                 .map(|cell| cell.str().to_owned())
                 .unwrap_or_default()
         };
-        // The VRAM graph runs from the row under its label to the first inner row of
-        // plain spaces (an empty braille cell is still graph); GTT follows below.
+        // The VRAM graph occupies the rows between its label and the next label
+        // (GTT), whose text starts at the inner left column.
         let panel_bottom = memory.rect.y + memory.rect.rows - 1;
         let graph_end = (label_y + 1..panel_bottom)
-            .find(|&y| {
-                (inner_left..=inner_right).all(|x| matches!(cell_at(y, x).as_str(), "" | " "))
-            })
+            .find(|&y| !blank(&cell_at(y, inner_left)))
             .unwrap_or(panel_bottom);
         let graph_rows = (label_y + 1)..graph_end;
         assert!(!graph_rows.is_empty(), "VRAM graph rows found: {level:?}");
