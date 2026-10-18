@@ -35,6 +35,7 @@ use crate::seg::{Line, Seg, Tok, seg};
 use crate::telemetry::{ScaleMode, Window};
 use thegn_metrics::StatsSnapshot;
 
+mod board;
 mod build;
 mod footer;
 mod graphs;
@@ -457,6 +458,7 @@ pub struct MonitorOverlay {
     rows: usize,
     /// `rows - CHROME_ROWS`. What [`Self::scroll_max`] measures against.
     body_rows: usize,
+    board: board::Board,
 }
 
 impl MonitorOverlay {
@@ -510,6 +512,7 @@ impl MonitorOverlay {
             cols,
             rows,
             body_rows: rows.saturating_sub(CHROME_ROWS),
+            board: board::Board::default(),
         };
         ov.rebuild(model, ctx, false);
         ov
@@ -576,6 +579,13 @@ impl MonitorOverlay {
 
     pub fn prefs(&self) -> &MonitorPrefs {
         &self.prefs
+    }
+
+    /// Sampler work required by the panels placed in the current monitor body.
+    pub fn demand(&self, base_ms: u32) -> crate::monitor_sampler::Demand {
+        let view = board::LegacyTab;
+        self.board
+            .demand(&view, Rect::full(self.cols, self.body_rows), base_ms)
     }
 
     /// Drain a pending loop-side action (a Disk-tab clean, or a Containers-tab
@@ -958,7 +968,10 @@ impl MonitorOverlay {
             };
         }
         if crate::input::is_escape_key(key) {
-            return MonitorOutcome::Close;
+            return match self.board.esc() {
+                board::EscOutcome::Unzoomed => MonitorOutcome::Pending,
+                board::EscOutcome::Close => MonitorOutcome::Close,
+            };
         }
         let shift = mods.contains(Modifiers::SHIFT);
         let page = self.body_rows.saturating_sub(1).max(1) as isize;
@@ -1048,6 +1061,30 @@ impl MonitorOverlay {
             KeyCode::Char(']') => {
                 self.prefs.widen(self.tab);
                 MonitorOutcome::PrefsChanged
+            }
+            KeyCode::Char('f') => {
+                let view = board::LegacyTab;
+                let placed = self
+                    .board
+                    .placed(&view, Rect::full(self.cols, self.body_rows));
+                self.board.focus_next(&placed);
+                MonitorOutcome::Pending
+            }
+            KeyCode::Char('F') => {
+                let view = board::LegacyTab;
+                let placed = self
+                    .board
+                    .placed(&view, Rect::full(self.cols, self.body_rows));
+                self.board.focus_prev(&placed);
+                MonitorOutcome::Pending
+            }
+            KeyCode::Char('z') => {
+                let view = board::LegacyTab;
+                let placed = self
+                    .board
+                    .placed(&view, Rect::full(self.cols, self.body_rows));
+                self.board.toggle_zoom(&placed);
+                MonitorOutcome::Pending
             }
 
             // --- Navigation ---
@@ -1252,7 +1289,9 @@ impl MonitorOverlay {
             cols: inner.cols,
             rows: inner.rows.saturating_sub(CHROME_ROWS),
         };
-        sections::render_stack(surface, body, self.scroll(), &self.body);
+        let view = board::LegacyTab;
+        self.board
+            .paint(&view, surface, body, self.scroll(), &self.body);
         crate::seg::draw_line(
             surface,
             inner.x,
@@ -1276,7 +1315,7 @@ impl MonitorOverlay {
     /// `Line::Split` cuts the LEFT run, and on an 80-column terminal that cut
     /// used to land on the last two tabs — including the one the user was on.
     fn tab_bar(&self) -> Line {
-        let right = if self.paused {
+        let mut right = if self.paused {
             vec![seg(
                 Tok::Slot(S::Accent),
                 format!("⏸ paused {}", self.paused_for()),
@@ -1284,6 +1323,12 @@ impl MonitorOverlay {
         } else {
             vec![seg(Tok::Slot(S::Ghost), self.coverage_note())]
         };
+        if let Some(hidden) = board::hidden_label(
+            self.board
+                .hidden_count(&board::LegacyTab, Rect::full(self.cols, self.body_rows)),
+        ) {
+            right.push(seg(Tok::Slot(S::Ghost), format!(" · {hidden}")));
+        }
         // Exactly what `draw_line`'s `Line::Split` arm leaves the left run: the
         // right cluster's width, plus the one-cell gap it reserves before it.
         let right_w = crate::seg::seg_width(&right);
@@ -1390,6 +1435,11 @@ impl MonitorOverlay {
             paused: self.paused,
             container_ours: self.container_rows.get(self.sel).is_some_and(|r| r.ours),
             disk_rows: self.disk_rows.len(),
+            board_panels: self
+                .board
+                .placed(&board::LegacyTab, Rect::full(self.cols, self.body_rows))
+                .len(),
+            board_zoomed: self.board.is_zoomed(),
         })
     }
 }

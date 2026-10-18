@@ -14605,11 +14605,11 @@ async fn event_loop<T: Terminal>(
         let window = monitor
             .as_ref()
             .and_then(|overlay| overlay.prefs().tab(overlay.tab()).window.secs());
-        // TabView/registry demand replaces this all-collector seed in batch 44.
-        monitor_sampler.sync(
-            sampler_mode,
-            crate::monitor_sampler::Demand::all(crate::monitor_sampler::base_ms_for(window)),
+        let demand = monitor.as_ref().map_or_else(
+            || crate::monitor_sampler::Demand::all(crate::monitor_sampler::base_ms_for(window)),
+            |overlay| overlay.demand(crate::monitor_sampler::base_ms_for(window)),
         );
+        monitor_sampler.sync(sampler_mode, demand);
         // The expensive `stats --no-stream` + `system df` container enrichment
         // runs ONLY while a per-container-stats surface is visible: the monitor's
         // Containers tab, or the Sandbox panel section (its expanded stats). One
