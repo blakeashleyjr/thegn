@@ -113,6 +113,18 @@ async fn stop_sink(task: JoinHandle<()>) -> io::Result<()> {
 pub trait IoStream: AsyncRead + AsyncWrite + Unpin + Send {}
 impl<T: AsyncRead + AsyncWrite + Unpin + Send> IoStream for T {}
 
+trait TunnelListener: Send + 'static {
+    fn accept(&mut self)
+    -> impl std::future::Future<Output = io::Result<Box<dyn IoStream>>> + Send;
+}
+
+impl TunnelListener for TcpListener {
+    async fn accept(&mut self) -> io::Result<Box<dyn IoStream>> {
+        let (stream, _) = TcpListener::accept(self).await?;
+        Ok(Box::new(stream))
+    }
+}
+
 /// Adapt a provider [`ExecSession`](crate::provider::ExecSession) (a non-tty exec
 /// over the WSS API — stdout frames in, stdin control out) into a standard
 /// bidirectional `DuplexStream` so `run_host` can pump the tunnel over it.
@@ -541,7 +553,7 @@ where
 
 async fn run_sandbox_with_limit<S>(
     stream: S,
-    listener: TcpListener,
+    mut listener: impl TunnelListener,
     max_connections: usize,
 ) -> io::Result<()>
 where
@@ -568,7 +580,7 @@ where
     let acc_tasks = tasks.clone();
     tasks.lock().await.spawn(async move {
         loop {
-            let Ok((sock, _)) = listener.accept().await else {
+            let Ok(sock) = listener.accept().await else {
                 break;
             };
             reap_finished(&acc_tasks).await;
@@ -599,7 +611,7 @@ where
             let conns = acc_conns.clone();
             acc_tasks.lock().await.spawn(async move {
                 let _permit = permit;
-                pump_conn(id, Box::new(sock), in_rx, sink).await;
+                pump_conn(id, sock, in_rx, sink).await;
                 let mut routes = conns.lock().await;
                 if routes
                     .get(&id)
@@ -623,6 +635,20 @@ where
 mod tests {
     use super::*;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    struct DuplexListener {
+        accepted: tokio::sync::mpsc::UnboundedReceiver<tokio::io::DuplexStream>,
+    }
+
+    impl TunnelListener for DuplexListener {
+        async fn accept(&mut self) -> io::Result<Box<dyn IoStream>> {
+            self.accepted
+                .recv()
+                .await
+                .map(|stream| Box::new(stream) as Box<dyn IoStream>)
+                .ok_or_else(|| io::Error::new(io::ErrorKind::UnexpectedEof, "listener closed"))
+        }
+    }
 
     #[derive(Clone)]
     struct HoldingDialer {
@@ -1049,6 +1075,244 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn host_open_storm_stays_bounded_and_recovers_all_permits() {
+        const PER_TUNNEL: usize = 8;
+        const GLOBAL: usize = 16;
+        const STORM: u32 = 1_000;
+
+        let rejections_before = rejection_total();
+        let global = Arc::new(Semaphore::new(GLOBAL));
+        let (host, mut peer) = tokio::io::duplex(64 * 1024);
+        let calls = Arc::new(AtomicUsize::new(0));
+        let (far_tx, mut far_rx) = tokio::sync::mpsc::unbounded_channel();
+        let task = tokio::spawn(run_host_with_caps(
+            host,
+            HoldingDialer {
+                calls: calls.clone(),
+                far_ends: far_tx,
+            },
+            PER_TUNNEL,
+            global.clone(),
+        ));
+
+        let ids: Vec<u32> = (1..=STORM).collect();
+        send_opens(&mut peer, &ids).await;
+        let mut decoder = FrameDecoder::new();
+        for id in (PER_TUNNEL as u32 + 1)..=STORM {
+            assert_eq!(next_frame(&mut peer, &mut decoder).await, Frame::Close(id));
+        }
+        assert!(rejection_total() >= rejections_before + (STORM as u64 - PER_TUNNEL as u64));
+        let mut far_ends = Vec::with_capacity(PER_TUNNEL);
+        for _ in 0..PER_TUNNEL {
+            far_ends.push(
+                tokio::time::timeout(std::time::Duration::from_secs(2), far_rx.recv())
+                    .await
+                    .expect("admitted host connection did not dial")
+                    .expect("holding dialer receiver closed"),
+            );
+        }
+        assert_eq!(calls.load(Ordering::Relaxed), PER_TUNNEL);
+        assert_eq!(global.available_permits(), GLOBAL - PER_TUNNEL);
+
+        let closes: Vec<u8> = (1..=PER_TUNNEL as u32)
+            .flat_map(|id| encode(&Frame::Close(id)))
+            .collect();
+        tokio::time::timeout(std::time::Duration::from_secs(2), peer.write_all(&closes))
+            .await
+            .expect("timed out disconnecting admitted host peers")
+            .unwrap();
+        drop(far_ends);
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while global.available_permits() != GLOBAL {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("host storm leaked a global permit after peers disconnected");
+
+        send_open(&mut peer, STORM + 1).await;
+        let _recovered = tokio::time::timeout(std::time::Duration::from_secs(2), far_rx.recv())
+            .await
+            .expect("fresh host Open did not recover after the storm")
+            .expect("holding dialer receiver closed after recovery");
+        assert_eq!(calls.load(Ordering::Relaxed), PER_TUNNEL + 1);
+        drop(peer);
+        tokio::time::timeout(std::time::Duration::from_secs(2), task)
+            .await
+            .expect("host did not stop after peer disconnect")
+            .unwrap()
+            .unwrap();
+        assert_eq!(global.available_permits(), GLOBAL);
+    }
+
+    #[tokio::test]
+    async fn host_peer_disconnect_after_open_storm_aborts_all_admitted_tasks() {
+        const CAP: usize = 8;
+        const GLOBAL: usize = 16;
+
+        let global = Arc::new(Semaphore::new(GLOBAL));
+        let (host, mut peer) = tokio::io::duplex(64 * 1024);
+        let calls = Arc::new(AtomicUsize::new(0));
+        let (far_tx, mut far_rx) = tokio::sync::mpsc::unbounded_channel();
+        let task = tokio::spawn(run_host_with_caps(
+            host,
+            HoldingDialer {
+                calls: calls.clone(),
+                far_ends: far_tx,
+            },
+            CAP,
+            global.clone(),
+        ));
+
+        let ids: Vec<u32> = (1..=1_000).collect();
+        send_opens(&mut peer, &ids).await;
+        let first_far = tokio::time::timeout(std::time::Duration::from_secs(2), far_rx.recv())
+            .await
+            .expect("storm did not admit a host connection before disconnect")
+            .expect("holding dialer receiver closed");
+        drop(peer);
+        tokio::time::timeout(std::time::Duration::from_secs(2), task)
+            .await
+            .expect("host did not abort its connection tasks after peer disconnect")
+            .unwrap()
+            .unwrap();
+        let mut byte = [0u8; 1];
+        let read = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            let mut first_far = first_far;
+            first_far.read(&mut byte).await
+        })
+        .await
+        .expect("admitted connection task survived host tunnel cancellation")
+        .unwrap();
+        assert_eq!(read, 0, "aborted host pump should drop its stream");
+        assert_eq!(global.available_permits(), GLOBAL);
+        assert!(calls.load(Ordering::Relaxed) <= CAP);
+    }
+
+    #[tokio::test]
+    async fn two_host_open_storms_share_the_global_cap() {
+        const PER_TUNNEL: usize = 64;
+        const GLOBAL: usize = 16;
+        const STORM: u32 = 1_000;
+
+        let global = Arc::new(Semaphore::new(GLOBAL));
+        let (host_a, mut peer_a) = tokio::io::duplex(64 * 1024);
+        let (host_b, mut peer_b) = tokio::io::duplex(64 * 1024);
+        let calls_a = Arc::new(AtomicUsize::new(0));
+        let calls_b = Arc::new(AtomicUsize::new(0));
+        let (far_a_tx, mut far_a_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (far_b_tx, mut far_b_rx) = tokio::sync::mpsc::unbounded_channel();
+        let task_a = tokio::spawn(run_host_with_caps(
+            host_a,
+            HoldingDialer {
+                calls: calls_a.clone(),
+                far_ends: far_a_tx,
+            },
+            PER_TUNNEL,
+            global.clone(),
+        ));
+        let task_b = tokio::spawn(run_host_with_caps(
+            host_b,
+            HoldingDialer {
+                calls: calls_b.clone(),
+                far_ends: far_b_tx,
+            },
+            PER_TUNNEL,
+            global.clone(),
+        ));
+
+        let ids: Vec<u32> = (1..=STORM).collect();
+        send_opens(&mut peer_a, &ids).await;
+        send_opens(&mut peer_b, &ids).await;
+        let mut decoder_a = FrameDecoder::new();
+        let mut decoder_b = FrameDecoder::new();
+        let mut rejected_a = Vec::new();
+        let mut rejected_b = Vec::new();
+        for _ in 0..(STORM as usize * 2 - GLOBAL) {
+            tokio::select! {
+                frame = next_frame(&mut peer_a, &mut decoder_a) => {
+                    let Frame::Close(id) = frame else { panic!("tunnel A sent a non-Close storm response"); };
+                    rejected_a.push(id);
+                }
+                frame = next_frame(&mut peer_b, &mut decoder_b) => {
+                    let Frame::Close(id) = frame else { panic!("tunnel B sent a non-Close storm response"); };
+                    rejected_b.push(id);
+                }
+            }
+        }
+        let admitted_a = STORM as usize - rejected_a.len();
+        let admitted_b = STORM as usize - rejected_b.len();
+        assert_eq!(admitted_a + admitted_b, GLOBAL);
+        assert_eq!(
+            rejected_a,
+            ((admitted_a as u32 + 1)..=STORM).collect::<Vec<_>>()
+        );
+        assert_eq!(
+            rejected_b,
+            ((admitted_b as u32 + 1)..=STORM).collect::<Vec<_>>()
+        );
+        assert_eq!(global.available_permits(), 0);
+
+        let mut far_a = Vec::new();
+        let mut far_b = Vec::new();
+        for _ in 0..admitted_a {
+            far_a.push(
+                tokio::time::timeout(std::time::Duration::from_secs(2), far_a_rx.recv())
+                    .await
+                    .expect("tunnel A dial did not complete")
+                    .expect("tunnel A dialer closed"),
+            );
+        }
+        for _ in 0..admitted_b {
+            far_b.push(
+                tokio::time::timeout(std::time::Duration::from_secs(2), far_b_rx.recv())
+                    .await
+                    .expect("tunnel B dial did not complete")
+                    .expect("tunnel B dialer closed"),
+            );
+        }
+        assert_eq!(calls_a.load(Ordering::Relaxed), admitted_a);
+        assert_eq!(calls_b.load(Ordering::Relaxed), admitted_b);
+        let closes: Vec<u8> = ids
+            .iter()
+            .flat_map(|id| encode(&Frame::Close(*id)))
+            .collect();
+        tokio::time::timeout(std::time::Duration::from_secs(2), peer_a.write_all(&closes))
+            .await
+            .expect("timed out disconnecting tunnel A storm connections")
+            .unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(2), peer_b.write_all(&closes))
+            .await
+            .expect("timed out disconnecting tunnel B storm connections")
+            .unwrap();
+        drop(far_a);
+        drop(far_b);
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while global.available_permits() != GLOBAL {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("shared host storm leaked global permits");
+
+        send_open(&mut peer_a, STORM + 1).await;
+        let _recovered = tokio::time::timeout(std::time::Duration::from_secs(2), far_a_rx.recv())
+            .await
+            .expect("tunnel A did not recover after the shared storm")
+            .expect("tunnel A dialer closed after recovery");
+        drop(peer_a);
+        drop(peer_b);
+        for tunnel in [task_a, task_b] {
+            tokio::time::timeout(std::time::Duration::from_secs(2), tunnel)
+                .await
+                .expect("host tunnel did not stop after disconnect")
+                .unwrap()
+                .unwrap();
+        }
+        assert_eq!(global.available_permits(), GLOBAL);
+    }
+
+    #[tokio::test]
     async fn rejection_total_counts_connection_limit_rejections() {
         let before = rejection_total();
         let (host, mut peer) = tokio::io::duplex(4096);
@@ -1121,6 +1385,92 @@ mod tests {
         drop(first);
         drop(excess);
         drop(peer);
+        tokio::time::timeout(std::time::Duration::from_secs(2), task)
+            .await
+            .expect("sandbox did not stop after tunnel disconnect")
+            .unwrap()
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn sandbox_accept_storm_keeps_only_capped_pumps_and_recovers() {
+        const CAP: usize = 8;
+        const STORM: usize = 1_000;
+
+        let (sandbox, mut peer) = tokio::io::duplex(64 * 1024);
+        let (accept_tx, accept_rx) = tokio::sync::mpsc::unbounded_channel();
+        let listener = DuplexListener {
+            accepted: accept_rx,
+        };
+        let task = tokio::spawn(run_sandbox_with_limit(sandbox, listener, CAP));
+        let mut sync = vec![0u8; SYNC_MAGIC.len()];
+        tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            peer.read_exact(&mut sync),
+        )
+        .await
+        .expect("sandbox did not send the sync marker")
+        .unwrap();
+        assert_eq!(sync, SYNC_MAGIC);
+
+        let mut clients = Vec::with_capacity(STORM);
+        for _ in 0..STORM {
+            let (sandbox_end, client_end) = tokio::io::duplex(1024);
+            accept_tx.send(sandbox_end).unwrap();
+            clients.push(client_end);
+        }
+        let mut decoder = FrameDecoder::new();
+        for id in 1..=CAP as u32 {
+            assert_eq!(next_frame(&mut peer, &mut decoder).await, Frame::Open(id));
+        }
+        for (index, client) in clients.iter_mut().enumerate().skip(CAP) {
+            let mut byte = [0u8; 1];
+            let read =
+                tokio::time::timeout(std::time::Duration::from_secs(2), client.read(&mut byte))
+                    .await
+                    .unwrap_or_else(|_| panic!("sandbox retained excess accepted stream {index}"))
+                    .unwrap();
+            assert_eq!(read, 0, "excess sandbox stream should be dropped");
+        }
+
+        let closes: Vec<u8> = (1..=CAP as u32)
+            .flat_map(|id| encode(&Frame::Close(id)))
+            .collect();
+        tokio::time::timeout(std::time::Duration::from_secs(2), peer.write_all(&closes))
+            .await
+            .expect("timed out closing sandbox storm connections")
+            .unwrap();
+        drop(clients);
+        let mut closed_ids = Vec::with_capacity(CAP);
+        for _ in 0..CAP {
+            let Frame::Close(id) = next_frame(&mut peer, &mut decoder).await else {
+                panic!("sandbox sent a non-Close frame while closing storm connections");
+            };
+            closed_ids.push(id);
+        }
+        closed_ids.sort_unstable();
+        assert_eq!(closed_ids, (1..=CAP as u32).collect::<Vec<_>>());
+
+        let (sandbox_end, mut recovered_client) = tokio::io::duplex(1024);
+        accept_tx.send(sandbox_end).unwrap();
+        assert_eq!(
+            next_frame(&mut peer, &mut decoder).await,
+            Frame::Open(CAP as u32 + 1)
+        );
+        tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            recovered_client.write_all(b"recovered"),
+        )
+        .await
+        .expect("timed out writing through recovered sandbox stream")
+        .unwrap();
+        assert_eq!(
+            next_frame(&mut peer, &mut decoder).await,
+            Frame::Data(CAP as u32 + 1, b"recovered".to_vec())
+        );
+
+        drop(peer);
+        drop(accept_tx);
         tokio::time::timeout(std::time::Duration::from_secs(2), task)
             .await
             .expect("sandbox did not stop after tunnel disconnect")
