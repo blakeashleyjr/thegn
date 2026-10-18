@@ -24,19 +24,26 @@ pub struct SoftnetTotals {
 
 pub fn for_each(input: &[u8], mut visit: impl FnMut(SoftnetCpu)) {
     for (line_index, line) in input.split(|byte| *byte == b'\n').enumerate() {
-        let columns: Vec<_> = line
-            .split(u8::is_ascii_whitespace)
-            .filter(|field| !field.is_empty())
-            .collect();
-        if columns.len() < 11 {
+        let mut values = [0_u32; 16];
+        let mut count = 0;
+        let mut valid = true;
+        for field in super::fields(line) {
+            let parsed = std::str::from_utf8(field)
+                .ok()
+                .and_then(|value| u32::from_str_radix(value, 16).ok());
+            let Some(value) = parsed else {
+                valid = false;
+                break;
+            };
+            if count < values.len() {
+                values[count] = value;
+            }
+            count += 1;
+        }
+        if !valid || count < 11 {
             continue;
         }
-        let parsed: Option<Vec<u32>> = columns
-            .iter()
-            .map(|field| u32::from_str_radix(std::str::from_utf8(field).ok()?, 16).ok())
-            .collect();
-        let Some(values) = parsed else { continue };
-        let cpu = if values.len() >= 13 {
+        let cpu = if count >= 13 {
             values[12]
         } else {
             u32::try_from(line_index).unwrap_or(u32::MAX)
@@ -49,8 +56,8 @@ pub fn for_each(input: &[u8], mut visit: impl FnMut(SoftnetCpu)) {
             received_rps: values[8],
             flow_limit: values[10],
             backlog_len: values[7],
-            input_qlen: (values.len() >= 15).then_some(values[13]),
-            process_qlen: (values.len() >= 15).then_some(values[14]),
+            input_qlen: (count >= 15).then_some(values[13]),
+            process_qlen: (count >= 15).then_some(values[14]),
         });
     }
 }

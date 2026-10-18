@@ -99,7 +99,7 @@ pub fn parse(input: &[u8], mut visit: impl FnMut(&[u8], &NetdevCounters)) -> Opt
         let Some(colon) = line.iter().rposition(|byte| *byte == b':') else {
             continue;
         };
-        let name = trim(&line[..colon]);
+        let name = line[..colon].trim_ascii();
         if name.is_empty() {
             continue;
         }
@@ -124,16 +124,6 @@ pub fn parse(input: &[u8], mut visit: impl FnMut(&[u8], &NetdevCounters)) -> Opt
         rows += 1;
     }
     Some(rows)
-}
-
-fn trim(mut value: &[u8]) -> &[u8] {
-    while value.first().is_some_and(u8::is_ascii_whitespace) {
-        value = &value[1..];
-    }
-    while value.last().is_some_and(u8::is_ascii_whitespace) {
-        value = &value[..value.len() - 1];
-    }
-    value
 }
 
 #[cfg(test)]

@@ -18,14 +18,8 @@ pub struct NetstatCounters {
 impl NetstatCounters {
     pub fn parse_into(input: &[u8], out: &mut Self) {
         *out = Self::default();
-        snmp::for_each(input, |section, key, value| {
-            let value = value.and_then(|number| {
-                if number >= 0 {
-                    Some(number as u64)
-                } else {
-                    None
-                }
-            });
+        snmp::for_each(input, |section, key, number| {
+            let value = snmp::non_negative(number);
             match (section, key) {
                 (b"TcpExt", b"TCPTimeouts") => out.tcp_timeouts = value,
                 (b"TcpExt", b"TCPSynRetrans") => out.tcp_syn_retrans = value,

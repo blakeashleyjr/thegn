@@ -148,10 +148,6 @@ impl Collector for NetdevCollector {
                 let scope = crate::collect::policy::net_scope::scope(kind, facts.bonding_slave);
                 InterfaceState::new(kind, scope)
             });
-            if state.kind == IfaceKind::Other {
-                truncated = true;
-                continue;
-            }
             let counters = &row.counters;
             let mut sample = IfaceSample {
                 id,
@@ -223,7 +219,11 @@ fn add(total: &mut ScopeTotal, rx: Option<f64>, tx: Option<f64>) {
 mod tests {
     use super::{IfaceSample, NetdevCollector};
     use crate::collect::{
-        Collector, TickCtx, env::Env, frame::MonitorFrame, health::Health, policy::net_scope::Scope,
+        Collector, TickCtx,
+        env::Env,
+        frame::MonitorFrame,
+        health::Health,
+        policy::net_scope::{IfaceKind, Scope},
     };
     use std::fs::{self, File};
     use std::os::unix::fs::FileExt;
@@ -249,7 +249,18 @@ mod tests {
         fs::create_dir_all(sys.join("enp95s0/device")).unwrap();
         fs::write(sys.join("enp95s0/operstate"), "down\n").unwrap();
         fs::write(sys.join("lo/type"), "772\n").unwrap();
-        fs::write(&proc_path, proc(1000, 2000, 100, 200, 772, 772)).unwrap();
+        fs::write(
+            &proc_path,
+            proc(
+                364_088_397_722,
+                8_000_000_000,
+                66_432_107_634,
+                9_000_000_000,
+                772,
+                772,
+            ),
+        )
+        .unwrap();
         let mut collector = NetdevCollector::at(&proc_path, &sys);
         assert_eq!(collector.discover(&Env::default()), Health::Warming);
         let mut frame = MonitorFrame::default();
@@ -265,7 +276,17 @@ mod tests {
         let writer = File::options().write(true).open(&proc_path).unwrap();
         writer.set_len(0).unwrap();
         writer
-            .write_at(&proc(1100, 2200, 160, 280, 1772, 1772), 0)
+            .write_at(
+                &proc(
+                    364_088_397_822,
+                    8_000_000_200,
+                    66_432_107_694,
+                    9_000_000_080,
+                    1772,
+                    1772,
+                ),
+                0,
+            )
             .unwrap();
         collector
             .sample(
@@ -284,6 +305,51 @@ mod tests {
         assert!(part.ifaces.iter().any(|row| row.name.as_str() == "enp95s0"
             && row.scope == Scope::Physical
             && row.rx_bps == Some(0.0)));
+    }
+
+    #[test]
+    fn non_ethernet_device_is_kept_as_physical_without_truncation() {
+        let dir = tempfile::tempdir().unwrap();
+        let proc_path = dir.path().join("netdev");
+        let sys = dir.path().join("sys");
+        fs::create_dir_all(sys.join("ib0/device")).unwrap();
+        fs::write(sys.join("ib0/type"), "32\n").unwrap();
+        let content = |rx: u64| {
+            format!(
+                "Inter-| Receive | Transmit\n face |bytes packets errs drop fifo frame compressed multicast|bytes packets errs drop fifo colls carrier compressed\nib0: {rx} 1 0 0 0 0 0 0 {rx} 1 0 0 0 0 0 0\n"
+            )
+            .into_bytes()
+        };
+        fs::write(&proc_path, content(1000)).unwrap();
+        let mut collector = NetdevCollector::at(&proc_path, &sys);
+        assert_eq!(collector.discover(&Env::default()), Health::Warming);
+        let mut frame = MonitorFrame::default();
+        collector
+            .sample(
+                &TickCtx {
+                    tick: 1,
+                    now_ms: 1000,
+                },
+                &mut frame,
+            )
+            .unwrap();
+        rewrite(&proc_path, &content(1100));
+        collector
+            .sample(
+                &TickCtx {
+                    tick: 2,
+                    now_ms: 2000,
+                },
+                &mut frame,
+            )
+            .unwrap();
+        let part = &frame.parts.netdev;
+        assert_eq!(part.ifaces.len(), 1);
+        assert_eq!(part.ifaces[0].kind, IfaceKind::Other);
+        assert_eq!(part.ifaces[0].scope, Scope::Physical);
+        assert_eq!(part.ifaces[0].rx_bps, Some(100.0));
+        assert_eq!(part.totals[Scope::Physical.index()].rx_bps, Some(100.0));
+        assert!(!part.truncated);
     }
 
     fn one_iface(rx: u64) -> Vec<u8> {
