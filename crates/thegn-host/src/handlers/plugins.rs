@@ -77,8 +77,8 @@ pub(crate) struct PluginsState {
     /// Lazily started `host.call` dispatcher (a thread is only spawned once a
     /// plugin actually calls).
     dispatcher: Option<Dispatcher>,
-    /// Owned config for the dispatcher's daemon discovery.
-    cfg: thegn_core::config::Config,
+    /// Shared config for the dispatcher's daemon discovery and feed bridges.
+    cfg: Arc<thegn_core::config::Config>,
 }
 
 impl PluginsState {
@@ -89,8 +89,19 @@ impl PluginsState {
             pending_alert_drops: BTreeMap::new(),
             inbox: None,
             dispatcher: None,
-            cfg,
+            cfg: Arc::new(cfg),
         }
+    }
+
+    /// Lazily start the host.call dispatcher, sharing the config without
+    /// cloning the full value on each request.
+    fn dispatcher(&mut self) -> &mut Dispatcher {
+        if self.dispatcher.is_none() {
+            self.dispatcher = Some(Dispatcher::spawn(Arc::clone(&self.cfg)));
+        }
+        self.dispatcher
+            .as_mut()
+            .expect("dispatcher was initialized")
     }
 }
 
@@ -994,9 +1005,8 @@ fn apply_host_call(state: &mut PluginsState, plugin: &str, msg: RpcMessage) -> P
             ),
             Err(error) => respond(entry, RpcResponse::err(id, error)),
             Ok(true) => {
-                let cfg = state.cfg.clone();
                 let bridge = if claim_feed_bridge(entry) {
-                    spawn_feed_bridge(cfg, writer.clone())
+                    spawn_feed_bridge(Arc::clone(&state.cfg), writer.clone())
                 } else {
                     None
                 };
@@ -1020,10 +1030,7 @@ fn apply_host_call(state: &mut PluginsState, plugin: &str, msg: RpcMessage) -> P
         }
         return PluginDamage::None;
     }
-    let cfg = state.cfg.clone();
-    let dispatcher = state
-        .dispatcher
-        .get_or_insert_with(|| Dispatcher::spawn(cfg));
+    let dispatcher = state.dispatcher();
     dispatcher.dispatch(plugin, writer, id, cap, params);
     PluginDamage::None
 }
@@ -1114,7 +1121,10 @@ fn spawn_cancellable_bridge(
     }
 }
 
-fn spawn_feed_bridge(cfg: thegn_core::config::Config, writer: SessionWriter) -> Option<FeedBridge> {
+fn spawn_feed_bridge(
+    cfg: Arc<thegn_core::config::Config>,
+    writer: SessionWriter,
+) -> Option<FeedBridge> {
     spawn_cancellable_bridge("thegn-plugin-feed", async move {
         let client = match crate::cmd::session::connect(&cfg).await {
             Ok(c) => c,
@@ -1283,8 +1293,7 @@ pub(crate) struct Dispatcher {
 }
 
 impl Dispatcher {
-    fn spawn(cfg: thegn_core::config::Config) -> Self {
-        let cfg = Arc::new(cfg);
+    fn spawn(cfg: Arc<thegn_core::config::Config>) -> Self {
         Self::spawn_with(DISPATCH_DEADLINE, move |cap, params| {
             let cfg = Arc::clone(&cfg);
             Box::pin(async move { dispatch_one(&cfg, &cap, params).await })
@@ -1313,67 +1322,63 @@ impl Dispatcher {
                 };
             }
         };
-        let spawn = std::thread::Builder::new()
-            .name("thegn-plugin-dispatch".into())
-            .spawn(move || {
-                // Utility: plugin host.call round-trips back visible plugin content.
-                crate::platform::qos::set_self(crate::platform::qos::Qos::Utility);
-                while let Ok(req) = rx.recv() {
-                    let DispatchReq {
-                        plugin,
-                        reply,
-                        id,
-                        cap,
-                        params,
-                        _permit,
-                    } = req;
-                    if reply.is_closed() {
+        let thread = thegn_core::thread_name::spawn_named("thegn-plugdisp", move || {
+            // Utility: plugin host.call round-trips back visible plugin content.
+            crate::platform::qos::set_self(crate::platform::qos::Qos::Utility);
+            while let Ok(req) = rx.recv() {
+                let DispatchReq {
+                    plugin,
+                    reply,
+                    id,
+                    cap,
+                    params,
+                    _permit,
+                } = req;
+                if reply.is_closed() {
+                    worker_diagnostics
+                        .lock()
+                        .unwrap_or_else(|error| error.into_inner())
+                        .record(&plugin, |counts| counts.abandoned += 1);
+                    drop(_permit);
+                    continue;
+                }
+                // Timeout cancels this local future. Synchronous setup before its first
+                // await may already have run, and a daemon mutation may have completed.
+                let response = match rt
+                    .block_on(async { tokio::time::timeout(deadline, dispatch(cap, params)).await })
+                {
+                    Ok(Ok(value)) => RpcResponse::ok(id, value),
+                    Ok(Err(error)) => RpcResponse::err(id, error),
+                    Err(_) => {
                         worker_diagnostics
                             .lock()
                             .unwrap_or_else(|error| error.into_inner())
-                            .record(&plugin, |counts| counts.abandoned += 1);
-                        drop(_permit);
-                        continue;
+                            .record(&plugin, |counts| counts.timed_out += 1);
+                        RpcResponse::err(
+                            id,
+                            RpcError::new(RpcErrorCode::Timeout, "host.call timed out"),
+                        )
                     }
-                    // Timeout cancels this local future. Synchronous setup before its first
-                    // await may already have run, and a daemon mutation may have completed.
-                    let response = match rt.block_on(async {
-                        tokio::time::timeout(deadline, dispatch(cap, params)).await
-                    }) {
-                        Ok(Ok(value)) => RpcResponse::ok(id, value),
-                        Ok(Err(error)) => RpcResponse::err(id, error),
-                        Err(_) => {
-                            worker_diagnostics
-                                .lock()
-                                .unwrap_or_else(|error| error.into_inner())
-                                .record(&plugin, |counts| counts.timed_out += 1);
-                            RpcResponse::err(
-                                id,
-                                RpcError::new(RpcErrorCode::Timeout, "host.call timed out"),
-                            )
+                };
+                drop(_permit);
+                // best-effort: the session may have died mid-dispatch.
+                if let Err(error) = reply.respond(&response) {
+                    let mut diagnostics = worker_diagnostics
+                        .lock()
+                        .unwrap_or_else(|error| error.into_inner());
+                    match error {
+                        SessionFailure::Full | SessionFailure::TooLarge => {
+                            diagnostics.record(&plugin, |counts| counts.undelivered += 1);
                         }
-                    };
-                    drop(_permit);
-                    // best-effort: the session may have died mid-dispatch.
-                    if let Err(error) = reply.respond(&response) {
-                        let mut diagnostics = worker_diagnostics
-                            .lock()
-                            .unwrap_or_else(|error| error.into_inner());
-                        match error {
-                            SessionFailure::Full | SessionFailure::TooLarge => {
-                                diagnostics.record(&plugin, |counts| counts.undelivered += 1);
-                            }
-                            SessionFailure::Closed => {
-                                diagnostics.record(&plugin, |counts| counts.abandoned += 1);
-                            }
+                        SessionFailure::Closed => {
+                            diagnostics.record(&plugin, |counts| counts.abandoned += 1);
                         }
-                        tracing::debug!(target: "thegn::plugin", error = %error, "host.call response writer is gone");
                     }
+                    tracing::debug!(target: "thegn::plugin", error = %error, "host.call response writer is gone");
                 }
-            });
-        if let Err(e) = spawn {
-            tracing::warn!(target: "thegn::plugin", error = %e, "dispatcher thread failed to start");
-        }
+            }
+        });
+        drop(thread);
         Self {
             tx,
             load,
@@ -1493,8 +1498,9 @@ impl Dispatcher {
     }
 }
 
-type DispatchFuture =
-    std::pin::Pin<Box<dyn std::future::Future<Output = Result<serde_json::Value, RpcError>>>>;
+type DispatchFuture = std::pin::Pin<
+    Box<dyn std::future::Future<Output = Result<serde_json::Value, RpcError>> + Send>,
+>;
 
 /// Run one dispatched capability against the pane daemon's control API,
 /// generically: resolve `(method, path, body)` from the catalog + `API_CALLS`
@@ -1542,6 +1548,41 @@ mod tests {
 
     fn never_dispatch(_: String, _: serde_json::Value) -> DispatchFuture {
         Box::pin(std::future::pending())
+    }
+
+    #[test]
+    fn dispatcher_reuses_shared_config_after_first_host_call() {
+        let mut state = PluginsState::new(thegn_core::config::Config::default());
+
+        assert_eq!(Arc::strong_count(&state.cfg), 1);
+        state.dispatcher();
+        assert_eq!(Arc::strong_count(&state.cfg), 2);
+        state.dispatcher();
+        assert_eq!(Arc::strong_count(&state.cfg), 2);
+    }
+
+    #[test]
+    fn dispatcher_thread_has_a_bounded_attribution_name() {
+        let (name_tx, name_rx) = std::sync::mpsc::channel();
+        let dispatcher = Dispatcher::spawn_with(std::time::Duration::from_secs(2), move |_, _| {
+            let name = std::thread::current()
+                .name()
+                .map(str::to_owned)
+                .expect("dispatcher thread has a name");
+            name_tx.send(name).expect("test is listening");
+            Box::pin(async { Ok(serde_json::Value::Null) })
+        });
+
+        let response = dispatch_request(&dispatcher, "plugin-a", 1)
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .expect("dispatch response");
+        assert!(response.error.is_none());
+        assert_eq!(
+            name_rx
+                .recv_timeout(std::time::Duration::from_secs(2))
+                .expect("thread name"),
+            "thegn-plugdisp"
+        );
     }
 
     fn dispatch_request(
