@@ -70,13 +70,14 @@ rejected before parsing.
 
 Plugin declarations are bounded too: a manifest may have up to 64 contributions
 and 64 capabilities. Each contribution allows 32 metadata entries (keys up to
-256 B and values up to 1 KiB); labels and chords can be up to 256 B. Plugin,
-contribution, surface, and capability identifiers are limited to 128 B, and
-contribution capability data to 4 KiB. `thegn plugin check` reports the
-specific quota reason when an oversized manifest is rejected. Alerts are
-limited to a 128 B source and a 4 KiB message, and a plugin may subscribe to 64
-event kinds; an oversized alert or a 65th subscription is refused. State, views,
-and retained events share an 8 MiB per-plugin limit. When state or a view needs
+256 B and values up to 1 KiB); labels and chords can be up to 256 B. The plugin
+ID, name, and version, plus contribution, surface, and capability identifiers,
+are limited to 128 B, and contribution capability data to 4 KiB. `thegn plugin
+check` reports the specific quota reason when an oversized manifest is rejected.
+An alert source over 128 B is refused; a message longer than 1 KiB is truncated
+for display.
+A plugin may subscribe to 64 event kinds; a 65th subscription is refused.
+State, views, and retained events share an 8 MiB per-plugin limit. When state or a view needs
 room, the oldest retained events are evicted first; a new item is refused if
 state and views alone would exceed the limit. A new event is refused if it
 cannot fit alongside state and views, otherwise older events are evicted as

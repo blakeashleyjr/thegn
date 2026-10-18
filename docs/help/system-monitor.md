@@ -75,8 +75,8 @@ log scale while Network stays on a live linear one.
   number to divide by.
 
 On the Memory, Thermal, and Network graphs, leading gaps before the first
-reading stay blank; later gaps carry the last reading forward. Rate metrics
-such as network traffic and disk I/O read empty intervals as zero.
+reading stay blank; later gaps carry the last reading forward. In the Overview
+traffic graphs, empty intervals for network and disk I/O rates read as zero.
 
 `Space` **pauses**. That freezes the picture. The history graphs keep recording
 at the normal, non-live rate, so resuming shows no gap; the monitor's detailed
