@@ -14690,12 +14690,13 @@ async fn event_loop<T: Terminal>(
             crate::monitor::wants_container_stats(monitor.as_ref(), sandbox_section_now),
             std::sync::atomic::Ordering::Relaxed,
         );
-        let container_demand_now = crate::hydrate::ContainerDemand::resolve(
+        let container_demand_now = crate::sandbox_gc_gate::container_demand(
+            &current_config,
             chrome.panel.is_some(),
             monitor.is_some(),
             monitor.as_ref().is_some_and(|m| m.shows_containers()),
             sandbox_section_now,
-            crate::sandbox_gc_gate::active_oci_wanted(&cfg, &model.active_sandbox_backend),
+            &model.active_sandbox_backend,
         );
         container_demand.store(
             container_demand_now.signal(),
