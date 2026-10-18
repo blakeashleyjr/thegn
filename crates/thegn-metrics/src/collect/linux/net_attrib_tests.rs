@@ -299,7 +299,7 @@ fn tombstone_rebuild_keeps_a_forced_collision_chain_reachable() {
         2
     );
 
-    for batch in 0_u64..3 {
+    for batch in 0_u64..4 {
         let mut sockets = Vec::with_capacity(502);
         sockets.push(socket(
             b,
@@ -320,7 +320,7 @@ fn tombstone_rebuild_keeps_a_forced_collision_chain_reachable() {
 
         assert_eq!(owner_delta(&result, 42), (7, 11));
         assert_eq!(owner_delta(&result, 43), (7, 11));
-        if batch == 2 {
+        if batch == 3 {
             assert_eq!(
                 map.tombstone_count(),
                 0,
@@ -331,8 +331,8 @@ fn tombstone_rebuild_keeps_a_forced_collision_chain_reachable() {
 
     let sockets = [
         socket(a, Some(41), 9_000, 9_000),
-        socket(b, Some(42), 128, 244),
-        socket(c, Some(43), 228, 344),
+        socket(b, Some(42), 142, 266),
+        socket(c, Some(43), 242, 366),
     ];
     update(&mut map, &sockets, 0, 0, &mut owners, &mut result);
     assert_eq!(owner_delta(&result, 41), (0, 0));
