@@ -14,9 +14,11 @@ use std::sync::atomic::AtomicBool;
 
 /// A decoded raster ready for [`crate::graphics::kitty_image`].
 pub struct Raster {
+    /// Original pixels for the fallback encoder; empty when `kitty` is prepared.
     pub rgba: Vec<u8>,
     pub w: u32,
     pub h: u32,
+    pub kitty: Option<std::sync::Arc<crate::graphics::KittyPayload>>,
 }
 
 /// Cap the longest visible raster side so the kitty payload (and base64 of it)
@@ -103,6 +105,7 @@ fn decode_and_fit(bytes: &[u8], limits: DecodeLimits) -> Result<Raster, String> 
         rgba: rgba.into_raw(),
         w,
         h,
+        kitty: None,
     })
 }
 

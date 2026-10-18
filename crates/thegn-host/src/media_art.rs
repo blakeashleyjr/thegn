@@ -773,6 +773,7 @@ mod tests {
             rgba: vec![255u8; 8 * 8 * 4],
             w: 8,
             h: 8,
+            kitty: None,
         };
         let lines = mosaic(&raster, 6, 3);
         assert_eq!(lines.len(), 3);
