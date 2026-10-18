@@ -23,6 +23,10 @@ local diagnostics. `--json` emits the same kind of report as one
 machine-readable object, which is useful when collecting a report in a
 script.
 
+The **Monitor collectors** block lists each system monitor collector and its
+discovered health. Collectors that are checked only while their panel is
+visible are marked `visible-only (not probed)`.
+
 The report's `db space` line shows the database size, reclaimable space, and
 vacuum mode. It suggests `thegn db vacuum` when the database is not yet in
 incremental mode or is too large to convert automatically (more than 64 MiB
