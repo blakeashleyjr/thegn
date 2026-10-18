@@ -25,6 +25,10 @@ use thegn_svc::provider::{ExecControl, ExecFrame, ExecSession};
 use crate::emulator::{AlacrittyEmulator, PaneEmulator};
 use crate::pane_writer::StdinSendError;
 
+#[cfg(test)]
+#[path = "platform/pty_drop_witness.rs"]
+mod pty_drop_witness;
+
 /// How a pane talks to its process: a local PTY, or a provider exec session.
 enum PaneIo {
     /// A local child on a pseudo-terminal. `stdin` is the bounded queue to the
@@ -157,9 +161,6 @@ pub struct PtyPane {
     /// Time-travel recording ring (`[replay]`). `None` when replay is disabled —
     /// then `feed` does a single null check and allocates nothing.
     record: Option<crate::replay::Recording>,
-    /// Test sentinel for the same parcel lifetime as replay data.
-    #[cfg(test)]
-    drop_probe: Option<Box<dyn Send>>,
     /// Corner panes receive parser-filtered fragments, so their byte stream is
     /// not safe to retain as an independently replayable recording.
     corner_role: bool,
@@ -232,16 +233,12 @@ impl Drop for PtyPane {
                 PaneIo::Pty { master, .. } => master.take(),
                 PaneIo::Stream { .. } => None,
             };
-            #[cfg(test)]
-            let drop_probe = self.drop_probe.take();
             process.terminate_and_reap_detached_with(Box::new((
                 emulator,
                 history,
                 history_partial,
                 record,
                 master,
-                #[cfg(test)]
-                drop_probe,
             )));
         }
     }
@@ -423,8 +420,6 @@ impl PtyPane {
             predictor: crate::predict::Predictor::new(),
             predict_clock: std::time::Instant::now(),
             record: None,
-            #[cfg(test)]
-            drop_probe: None,
             corner_role: false,
             loop_fed,
             last_output_at: None,
@@ -511,8 +506,6 @@ impl PtyPane {
             predictor: crate::predict::Predictor::new(),
             predict_clock: std::time::Instant::now(),
             record: None,
-            #[cfg(test)]
-            drop_probe: None,
             corner_role: false,
             // Stream frames arrive via the relay task's Output events with no
             // reader-side feeder — the loop parses them.
@@ -941,8 +934,6 @@ impl PtyPane {
             predictor: crate::predict::Predictor::new(),
             predict_clock: std::time::Instant::now(),
             record: None,
-            #[cfg(test)]
-            drop_probe: None,
             corner_role: false,
             loop_fed: Arc::new(std::sync::atomic::AtomicBool::new(true)),
             last_output_at: None,
@@ -3037,35 +3028,47 @@ mod tests {
         );
     }
 
-    struct PaneDropProbe(std::sync::mpsc::Sender<Option<String>>);
-
-    impl Drop for PaneDropProbe {
-        fn drop(&mut self) {
-            self.0
-                .send(std::thread::current().name().map(str::to_owned))
-                .unwrap();
-        }
-    }
-
     #[test]
-    fn dropping_a_pane_releases_its_replay_parcel_off_loop() {
+    fn dropping_a_pane_releases_the_real_pty_master_after_reap_off_loop() {
         if !cfg!(unix) {
             return;
         }
         let (tx, _rx) = tokio_mpsc::channel::<PaneEvent>(64);
         let mut pane =
             PtyPane::spawn_with_env(0, &sh("sleep 30"), None, &[], 24, 80, tx, None).unwrap();
+        let process = pane
+            .child_process
+            .as_ref()
+            .expect("a PTY pane owns its child process")
+            .clone();
         let (dropped_tx, dropped_rx) = std::sync::mpsc::channel();
-        pane.drop_probe = Some(Box::new(PaneDropProbe(dropped_tx)));
+        let master = match &mut pane.io {
+            PaneIo::Pty { master, .. } => master.take().expect("PTY pane owns its master"),
+            PaneIo::Stream { .. } => panic!("spawn_with_env creates a PTY pane"),
+        };
+        let witness = pty_drop_witness::DropWitnessMaster::new(
+            master,
+            Box::new(move || {
+                dropped_tx
+                    .send((
+                        std::thread::current().name().map(str::to_owned),
+                        process.is_complete(),
+                    ))
+                    .unwrap();
+            }),
+        );
+        match &mut pane.io {
+            PaneIo::Pty { master, .. } => *master = Some(Box::new(witness)),
+            PaneIo::Stream { .. } => panic!("spawn_with_env creates a PTY pane"),
+        }
 
         drop(pane);
         assert_eq!(
             dropped_rx
                 .recv_timeout(std::time::Duration::from_secs(5))
-                .unwrap()
-                .as_deref(),
-            Some("thegn-pty-reap"),
-            "the replay parcel must be released after the child reap off-loop"
+                .unwrap(),
+            (Some("thegn-pty-reap".to_owned()), true),
+            "the real PTY master must close on the reaper thread after child reap"
         );
     }
 }
