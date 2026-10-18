@@ -361,11 +361,32 @@ pub(crate) fn drain_provision(
     while let Ok((name, ti, steps)) = rx.try_recv() {
         loop_perf.tick(crate::perf::WakeSource::Spec);
         let key = (name, ti);
-        // A tab whose shell has already spoken has RETIRED its splash: a late
-        // provisioning update (queued before the first-output clear) must not
-        // re-raise it over the live shell — the flash-back-to-splash flicker.
-        if !crate::loading::splash_update_allowed(loading_retired, &key) {
-            continue;
+        // PTY output may beat the update that moves a live entry into
+        // shell-wait. Keep its live progress visible, then clear the splash on
+        // that terminal update. A missing entry means it was already retired.
+        match crate::loading::provision_splash_update(
+            loading_retired,
+            &key,
+            loading_state.get(&key).map(Vec::as_slice),
+            &steps,
+        ) {
+            crate::loading::ProvisionSplashUpdate::Ignore => continue,
+            crate::loading::ProvisionSplashUpdate::Clear => {
+                let active = session
+                    .worktrees
+                    .iter()
+                    .position(|g| g.name == key.0)
+                    .is_some_and(|gi| {
+                        gi == session.active && session.worktrees[gi].active_tab == key.1
+                    });
+                loading_state.remove(&key);
+                loading_remote.remove(&key);
+                if active {
+                    dirty = true;
+                }
+                continue;
+            }
+            crate::loading::ProvisionSplashUpdate::Apply => {}
         }
         // Always record this worktree's progress; the splash for whichever
         // worktree is active is derived from `loading_state` below.

@@ -159,21 +159,24 @@ pub(crate) fn apply_spec_batch(
     origin == SpecOrigin::Materialize || !provision_owns_tab(materialize_inflight, loading_steps)
 }
 
-/// Cheap pre-gate for the per-PTY-output splash-clear on the hot output-drain
-/// path: is there ANY splash currently in the clearable *shell-wait* shape?
-///
-/// The eager-success / warm-spare paths park a lingering EMPTY Vec in
-/// `loading_state` for the whole session (see [`provision_owns_tab`]), so
-/// `!loading_state.is_empty()` stays true forever — gating the drain on the raw
-/// map emptiness made it rescan every tab (and re-log "first pane output") on
-/// *every* output chunk of *every* pane for the rest of the session. Only a
-/// shell-wait entry is ever clearable here (empty markers and live-provision
-/// steps are not), so when this returns `false` the drain can skip the tab scan
-/// entirely.
+/// Test helper for whether any shell-wait splash remains clearable.
+#[cfg(test)]
 pub(crate) fn any_clearable_splash(
     loading_state: &std::collections::HashMap<(String, usize), Vec<LoadStep>>,
 ) -> bool {
     loading_state.values().any(|s| is_shell_wait(s))
+}
+
+/// Whether any non-empty splash needs pane-output association. Unlike
+/// [`any_clearable_splash`], this includes live provisioning entries so output
+/// that arrives before the shell-wait update can be remembered.
+pub(crate) fn any_unspoken_splash(
+    loading_state: &std::collections::HashMap<(String, usize), Vec<LoadStep>>,
+    retired: &std::collections::HashSet<(String, usize)>,
+) -> bool {
+    loading_state
+        .iter()
+        .any(|(key, steps)| !steps.is_empty() && !retired.contains(key))
 }
 
 /// Whether a pane's PTY output should clear its worktree/tab's loading splash:
@@ -189,20 +192,43 @@ pub(crate) fn should_clear_splash_on_output(
     loading_state.get(key).is_some_and(|s| is_shell_wait(s))
 }
 
-/// Whether a live provisioning-splash update for `key` should be applied, given
-/// the set of tabs whose shell has already spoken (the splash was RETIRED on its
-/// first PTY output). Once a tab's shell produces output and its splash clears,
-/// a provisioning update that was queued on `provision_rx` just before the clear
-/// (or a transient pane-death re-raise) must NOT bring the splash back — that's
-/// the "flashes back and forth to the shell" flicker seen during a sprite
-/// bring-up where the OOM-restarted VM churns the pane. A non-retired tab always
-/// applies. Retirement is per-tab and cleared when a fresh materialize re-seeds
-/// the tab (a genuine re-provision), so a rebuilt worktree shows its splash again.
+/// What a provisioning update does after PTY output was observed for the tab.
+/// A live provisioning shape stays visible until it reaches its terminal
+/// shell-wait/empty shape; then the splash is dismissed. An absent entry means
+/// the splash was already retired, so late updates stay suppressed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ProvisionSplashUpdate {
+    Apply,
+    Clear,
+    Ignore,
+}
+
+/// Whether `key` has not yet recorded shell output. The retirement set is
+/// cleared by a fresh materialize so a genuine re-provision can show its splash.
 pub(crate) fn splash_update_allowed(
     retired: &std::collections::HashSet<(String, usize)>,
     key: &(String, usize),
 ) -> bool {
     !retired.contains(key)
+}
+
+pub(crate) fn provision_splash_update(
+    retired: &std::collections::HashSet<(String, usize)>,
+    key: &(String, usize),
+    current: Option<&[LoadStep]>,
+    incoming: &[LoadStep],
+) -> ProvisionSplashUpdate {
+    if splash_update_allowed(retired, key) {
+        return ProvisionSplashUpdate::Apply;
+    }
+    if current.is_none() {
+        return ProvisionSplashUpdate::Ignore;
+    }
+    if incoming.is_empty() || is_shell_wait(incoming) {
+        ProvisionSplashUpdate::Clear
+    } else {
+        ProvisionSplashUpdate::Apply
+    }
 }
 
 #[cfg(test)]
@@ -381,7 +407,7 @@ mod tests {
 
     #[test]
     fn any_clearable_splash_ignores_empty_and_live_provision_entries() {
-        use std::collections::HashMap;
+        use std::collections::{HashMap, HashSet};
         let mut ls: HashMap<(String, usize), Vec<LoadStep>> = HashMap::new();
         // Empty map ⇒ nothing to clear ⇒ the output drain skips the tab scan.
         assert!(!any_clearable_splash(&ls));
@@ -408,25 +434,119 @@ mod tests {
             any_clearable_splash(&ls),
             "a shell-wait splash makes the drain look for the owning pane"
         );
+
+        let mut retired = HashSet::new();
+        assert!(any_unspoken_splash(&ls, &retired));
+        retired.insert(("wt-provisioning".to_string(), 0));
+        retired.insert(("wt-ready".to_string(), 0));
+        assert!(
+            !any_unspoken_splash(&ls, &retired),
+            "once output was recorded, later chunks skip the tab scan"
+        );
     }
 
     #[test]
-    fn splash_update_dropped_only_for_retired_tabs() {
+    fn provisioning_update_decision_remembers_output_until_shell_wait() {
         use std::collections::HashSet;
-        let mut retired: HashSet<(String, usize)> = HashSet::new();
-        let live = ("wt-live".to_string(), 0usize);
-        let done = ("wt-done".to_string(), 0usize);
-        // A tab still bringing up applies every provisioning update.
-        assert!(splash_update_allowed(&retired, &live));
-        // A retired tab (its shell already spoke) drops a late/stale update, so
-        // the splash never flashes back over the live shell.
-        retired.insert(done.clone());
-        assert!(!splash_update_allowed(&retired, &done));
-        // Same name, different tab is unaffected.
-        assert!(splash_update_allowed(
+        let key = ("wt-fallback".to_string(), 0usize);
+        let retired = HashSet::from([key.clone()]);
+        let live = [LoadStep::active("probing bwrap")];
+        let shell_wait = [
+            LoadStep::done("sandbox"),
+            LoadStep::done("container (bwrap)"),
+            LoadStep::active("shell"),
+        ];
+
+        assert_eq!(
+            provision_splash_update(&retired, &key, Some(&live), &live),
+            ProvisionSplashUpdate::Apply,
+            "output during fallback must not dismiss live provisioning progress"
+        );
+        assert_eq!(
+            provision_splash_update(&retired, &key, Some(&live), &shell_wait),
+            ProvisionSplashUpdate::Clear,
+            "the update reaching shell-wait retires the already-spoken shell's splash"
+        );
+        assert_eq!(
+            provision_splash_update(&retired, &key, None, &shell_wait),
+            ProvisionSplashUpdate::Ignore,
+            "a previously removed splash still drops late updates"
+        );
+
+        let mut fresh_retired = retired;
+        fresh_retired.remove(&key);
+        assert_eq!(
+            provision_splash_update(&fresh_retired, &key, None, &live),
+            ProvisionSplashUpdate::Apply,
+            "fresh materialize un-retires a genuine re-provision"
+        );
+    }
+
+    #[test]
+    fn drain_provision_clears_shell_wait_after_output_arrived_during_fallback() {
+        let key = ("app/home".to_string(), 0usize);
+        let session = crate::session::Session {
+            id: "s1".into(),
+            worktrees: vec![crate::session::WorktreeGroup::new(
+                "app/home",
+                crate::session::GroupKind::Home,
+                "",
+            )],
+            active: 0,
+        };
+        let mut loading_state = crate::loading::track::LoadingTracker::default();
+        let live = vec![LoadStep::active("probing bwrap")];
+        loading_state.set(key.clone(), live.clone());
+        let mut loading_remote = std::collections::HashMap::from([(key.clone(), true)]);
+        // handle_output records this key when output beats the shell-wait
+        // update while the pane is already associated with its tab.
+        let retired = std::collections::HashSet::from([key.clone()]);
+        let terminal = vec![
+            LoadStep::done("sandbox"),
+            LoadStep::done("container (bwrap)"),
+            LoadStep::active("shell"),
+        ];
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut perf = crate::perf::LoopPerf::new();
+
+        tx.send((key.0.clone(), key.1, live)).unwrap();
+        let live_dirty = crate::handlers::provision::drain_provision(
+            &mut rx,
+            &session,
+            &mut loading_state,
+            &mut loading_remote,
             &retired,
-            &("wt-done".to_string(), 1usize)
-        ));
+            &mut perf,
+        );
+        assert!(live_dirty, "live fallback progress remains visible");
+        assert!(
+            loading_state.contains_key(&key),
+            "output during provisioning does not clear live steps"
+        );
+
+        tx.send((key.0.clone(), key.1, terminal)).unwrap();
+        let dirty = crate::handlers::provision::drain_provision(
+            &mut rx,
+            &session,
+            &mut loading_state,
+            &mut loading_remote,
+            &retired,
+            &mut perf,
+        );
+
+        assert!(dirty, "the active splash removal dirties the frame");
+        assert!(
+            loading_state.is_empty(),
+            "the stuck splash entry is removed"
+        );
+        assert!(
+            loading_remote.is_empty(),
+            "the watchdog remoteness is removed"
+        );
+        assert!(
+            !any_clearable_splash(&loading_state),
+            "the splash ticker has no clearable loading entry to display"
+        );
     }
 
     #[test]
