@@ -1,5 +1,5 @@
 use super::*;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 #[test]
 fn unfinished_child_or_pipe_owns_capacity_until_all_holders_release() {
@@ -70,7 +70,7 @@ fn failed_pipe_worker_creation_hands_owned_child_to_bounded_reaper() {
 
 #[test]
 fn timeout_returns_without_waiting_for_child_reap() {
-    if !Path::new("/bin/sh").is_file() {
+    if !cfg!(unix) {
         return;
     } // private Unix runtime canary
     static COUNTER: AtomicUsize = AtomicUsize::new(0);
@@ -91,7 +91,7 @@ fn timeout_returns_without_waiting_for_child_reap() {
 
 #[test]
 fn inherited_pipe_is_bounded_and_keeps_its_resource_budget() {
-    if !Path::new("/bin/sh").is_file() {
+    if !cfg!(unix) {
         return;
     } // private Unix runtime canary
     static COUNTER: AtomicUsize = AtomicUsize::new(0);
