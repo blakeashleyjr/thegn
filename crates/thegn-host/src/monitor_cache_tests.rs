@@ -110,7 +110,9 @@ fn terminal_resize_reflows_frozen_process_body_without_consuming_model_updates()
                                     .iter()
                                     .map(|cell| match cell {
                                         crate::sections::Cell::Text(text, _) => text.clone(),
-                                        _ => panic!("process fixture requires text cells"),
+                                        crate::sections::Cell::Bar(value, width, _) => {
+                                            format!("bar:{value:.2}:{width}")
+                                        }
                                     })
                                     .collect::<Vec<_>>()
                             })
@@ -121,7 +123,11 @@ fn terminal_resize_reflows_frozen_process_body_without_consuming_model_updates()
                 .unwrap()
         };
         assert_eq!(table(&overlay), table(&expected));
-        assert!(table(&overlay).0.iter().sum::<usize>() + 5 <= overlay.cols);
+        let (widths, _) = table(&overlay);
+        assert_eq!(
+            widths.iter().sum::<usize>() + widths.len().saturating_sub(1) + 1,
+            overlay.cols
+        );
         let text = render_text(&overlay, cols, rows);
         assert!(text.contains(&identity.0.to_string()));
         assert!(!text.contains("new sample"));

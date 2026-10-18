@@ -128,7 +128,10 @@ fn row_of(p: &ProcSample, depth: usize, elided_parent: bool) -> ProcRow {
 ///   than dropped. A non-empty filter keeps a row when it matches *or* has a
 ///   matching descendant, so filtering never severs a matching child from its
 ///   visible ancestry.
-pub fn rows(snap: &ProcSnapshot, view: ProcSnapshotView) -> Vec<ProcRow> {
+pub(in crate::monitor) fn rows_with_invalid(
+    snap: &ProcSnapshot,
+    view: ProcSnapshotView,
+) -> (Vec<ProcRow>, Vec<procs_query::InvalidTerm>) {
     #[cfg(test)]
     crate::proc_workload_alloc::process_rows();
     let ProcSnapshotView {
@@ -138,6 +141,7 @@ pub fn rows(snap: &ProcSnapshot, view: ProcSnapshotView) -> Vec<ProcRow> {
         tree,
     } = view;
     let query = procs_query::Query::parse(filter.trim());
+    let invalid = query.invalid().to_vec();
 
     if !tree {
         let mut kept: Vec<&ProcSample> = snap.procs.iter().filter(|p| matches(p, &query)).collect();
@@ -145,10 +149,15 @@ pub fn rows(snap: &ProcSnapshot, view: ProcSnapshotView) -> Vec<ProcRow> {
             let ord = cmp(a, b, sort);
             (if desc { ord.reverse() } else { ord }).then_with(|| a.pid.cmp(&b.pid))
         });
-        return kept.iter().map(|p| row_of(p, 0, false)).collect();
+        return (kept.iter().map(|p| row_of(p, 0, false)).collect(), invalid);
     }
 
-    tree_rows(snap, sort, desc, &query)
+    (tree_rows(snap, sort, desc, &query), invalid)
+}
+
+#[cfg(test)]
+pub fn rows(snap: &ProcSnapshot, view: ProcSnapshotView) -> Vec<ProcRow> {
+    rows_with_invalid(snap, view).0
 }
 
 /// Tree flatten: build children lists over the kept set, DFS from roots in sort

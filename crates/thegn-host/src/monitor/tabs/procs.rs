@@ -1,24 +1,33 @@
 //! Procs tab renderer and tab-specific monitor actions.
 
 use super::super::build::*;
+use super::super::procs_columns::{
+    self, Availability, ColId, FitFlags, Preset, availability, format_bytes, format_cpu,
+    proc_row_caps,
+};
 use super::super::procs_view::{self, ProcRow};
 use super::super::{Confirm, MonitorOutcome, MonitorOverlay, ProcSort};
 use crate::chrome::S;
 use crate::sections::{Cell, Section, TableSection};
 use crate::seg::Tok;
+use thegn_core::numfmt::{NumFmt, Reading, Unit};
 use thegn_core::theme::Hue;
-use thegn_core::viz::Unit;
 
-#[allow(clippy::too_many_arguments)] // one call site; every argument is real view state
+pub(in crate::monitor) struct ProcDisplay<'a> {
+    pub(in crate::monitor) filter: &'a str,
+    pub(in crate::monitor) filtering: bool,
+    pub(in crate::monitor) tree: bool,
+    pub(in crate::monitor) sort: ProcSort,
+    pub(in crate::monitor) desc: bool,
+    pub(in crate::monitor) invalid_terms: &'a [procs_view::procs_query::InvalidTerm],
+    pub(in crate::monitor) primed: bool,
+}
+
 pub(in crate::monitor) fn procs(
     cx: &Ctx,
     rows: &[ProcRow],
     sel: usize,
-    filter: &str,
-    filtering: bool,
-    tree: bool,
-    sort: ProcSort,
-    desc: bool,
+    display: ProcDisplay<'_>,
 ) -> TabBuild {
     let snap = &cx.model.procs;
     // Only the CONFIG can say sampling is off. `ProcSnapshot::default()` is
@@ -45,7 +54,7 @@ pub(in crate::monitor) fn procs(
 
     // Header note: how many of the sampled set are shown, the sort, and the
     // active view toggles (filter/tree), so the list never lies about scope.
-    let mut note = if snap.primed {
+    let mut note = if display.primed {
         format!("{} of {} processes", rows.len(), snap.total)
     } else {
         // CPU is a delta; the first sample has nothing to diff against.
@@ -53,16 +62,31 @@ pub(in crate::monitor) fn procs(
     };
     note.push_str(&format!(
         " · {}{}",
-        sort.label(),
-        if desc { "↓" } else { "↑" }
+        display.sort.label(),
+        if display.desc { "↓" } else { "↑" }
     ));
-    if tree {
+    if display.tree {
         note.push_str(" · tree");
     }
-    if !filter.trim().is_empty() || filtering {
-        note.push_str(&format!(" · /{}", filter));
+    if !display.filter.trim().is_empty() || display.filtering {
+        note.push_str(&format!(" · /{}", display.filter));
     }
     let mut out = vec![heading("processes", Some(note))];
+
+    if !display.filtering && !display.invalid_terms.is_empty() {
+        let ignored = display
+            .invalid_terms
+            .iter()
+            .map(|term| format!("{} ({})", term.text, term.reason))
+            .collect::<Vec<_>>()
+            .join(", ");
+        out.push(Section::HeadingToned {
+            label: "ignored filter terms".into(),
+            label_tone: Tok::Hue(Hue::Red),
+            note: ignored,
+            tone: Tok::Hue(Hue::Red),
+        });
+    }
 
     if rows.is_empty() {
         // Filtered everything out — say so rather than show an empty table.
@@ -70,48 +94,18 @@ pub(in crate::monitor) fn procs(
         return plain(out);
     }
 
-    let widths = process_column_widths(cx.cols);
-    let name_width = widths[1];
-    let body: Vec<Vec<Cell>> = rows
-        .iter()
-        .map(|p| {
-            // The owner tint is the ONLY foreground rule here: the cursor row is
-            // the table's `sel`, painted as a background, so selecting a row no
-            // longer erases whose process it is.
-            let name_tone = owner_tone(p.owner);
-            // Tree indent: two spaces per depth, with an elision marker on a row
-            // whose real parent fell outside the kept top-N set.
-            let name = process_name(p, tree, name_width);
-            vec![
-                Cell::Text(p.pid.to_string(), Tok::Slot(S::Ghost)),
-                Cell::Text(name, name_tone),
-                Cell::Text(procs_view::owner_label(p.owner), Tok::Slot(S::Ghost)),
-                Cell::Text(
-                    if snap.primed {
-                        Unit::Percent.fmt(p.cpu_pct)
-                    } else {
-                        "—".into()
-                    },
-                    Tok::Hue(Hue::Teal),
-                ),
-                Cell::Text(Unit::Bytes.fmt(p.rss_bytes as f32), Tok::Hue(Hue::Purple)),
-            ]
-        })
-        .collect();
+    let fitted = process_columns(cx.cols, display.tree);
+    let widths: Vec<usize> = fitted.iter().map(|(_, width)| *width).collect();
+    let headers = fitted.iter().map(|(id, _)| column_title(*id)).collect();
+    let body = process_cells(rows, &fitted, display.tree, display.primed);
     let row_y = row_ys(&out, body.len(), true);
     out.push(Section::FixedTable {
         table: TableSection {
-            header: vec![
-                "pid".into(),
-                "name".into(),
-                "owner".into(),
-                "cpu".into(),
-                "mem".into(),
-            ],
+            header: headers,
             rows: body,
             sel: Some(sel),
         },
-        widths: widths.to_vec(),
+        widths,
     });
     TabBuild {
         sections: out,
@@ -144,37 +138,116 @@ pub(in crate::monitor) fn reflow_process_geometry(
     rows: &[ProcRow],
     tree: bool,
     cols: usize,
+    primed: bool,
 ) {
-    let new_widths = process_column_widths(cols);
+    let fitted = process_columns(cols, tree);
+    let widths: Vec<usize> = fitted.iter().map(|(_, width)| *width).collect();
+    let headers = fitted.iter().map(|(id, _)| column_title(*id)).collect();
     for section in body {
-        if let Section::FixedTable { table, widths } = section {
-            *widths = new_widths.to_vec();
-            for (cells, row) in table.rows.iter_mut().zip(rows) {
-                if let Some(Cell::Text(name, _)) = cells.get_mut(1) {
-                    *name = process_name(row, tree, new_widths[1]);
-                }
-            }
+        if let Section::FixedTable {
+            table,
+            widths: current_widths,
+        } = section
+        {
+            *current_widths = widths.clone();
+            table.header.clone_from(&headers);
+            table.rows = process_cells(rows, &fitted, tree, primed);
         }
     }
 }
 
-/// Stable at each viewport width, independent of sampled values and ordering.
-/// Include one cursor gutter and four intercolumn spaces in the budget. Preserve
-/// numeric/owner room first; the name receives the remaining viewport space.
-fn process_column_widths(cols: usize) -> [usize; 5] {
-    let mut remaining = cols.saturating_sub(5);
-    let mut widths = [0usize; 5];
-    for width in &mut widths {
-        *width = remaining.min(1);
-        remaining -= *width;
+/// Fit the default preset, remove columns the sampled process rows cannot
+/// provide, and let COMMAND take the remaining viewport width.
+fn process_columns(cols: usize, tree: bool) -> Vec<(ColId, usize)> {
+    if cols < 2 {
+        return vec![(ColId::Command, 0)];
     }
-    for (index, target) in [(0, 10usize), (3, 7), (4, 9), (2, 9)] {
-        let extra = target.saturating_sub(widths[index]).min(remaining);
-        widths[index] += extra;
-        remaining -= extra;
+    let mut fitted = procs_columns::fit_columns(
+        Preset::Default,
+        cols,
+        FitFlags {
+            tree,
+            detail_open: false,
+        },
+    );
+    let caps = proc_row_caps();
+    fitted.retain(|(id, _)| availability(*id, &caps) == Availability::Available);
+    let non_pid_non_command_widths: usize = fitted
+        .iter()
+        .filter(|(id, _)| *id != ColId::Pid && *id != ColId::Command)
+        .map(|(_, width)| *width)
+        .sum();
+    let gutters = fitted.len().saturating_sub(1);
+    if let Some((_, pid_width)) = fitted.iter_mut().find(|(id, _)| *id == ColId::Pid) {
+        let room_for_pid = cols.saturating_sub(1 + gutters + non_pid_non_command_widths + 1);
+        *pid_width = (*pid_width).max(7).min(room_for_pid);
     }
-    widths[1] += remaining;
-    widths
+    let other_widths: usize = fitted
+        .iter()
+        .filter(|(id, _)| *id != ColId::Command)
+        .map(|(_, width)| *width)
+        .sum();
+    let gutters = fitted.len().saturating_sub(1);
+    let command = fitted
+        .iter_mut()
+        .find(|(id, _)| *id == ColId::Command)
+        .expect("COMMAND is always fitted and available");
+    command.1 = cols.saturating_sub(1 + gutters + other_widths);
+    fitted
+}
+
+fn column_title(id: ColId) -> String {
+    procs_columns::CATALOG
+        .iter()
+        .find(|spec| spec.id == id)
+        .map(|spec| spec.title)
+        .expect("fitted column is in the catalogue")
+        .into()
+}
+
+fn process_cells(
+    rows: &[ProcRow],
+    fitted: &[(ColId, usize)],
+    tree: bool,
+    primed: bool,
+) -> Vec<Vec<Cell>> {
+    rows.iter()
+        .map(|row| {
+            fitted
+                .iter()
+                .map(|(id, width)| match id {
+                    ColId::Pid => Cell::Text(row.pid.to_string(), Tok::Slot(S::Ghost)),
+                    ColId::Owner => {
+                        Cell::Text(procs_view::owner_label(row.owner), Tok::Slot(S::Ghost))
+                    }
+                    ColId::Cpu => Cell::Text(
+                        format_cpu(primed.then_some(f64::from(row.cpu_pct))),
+                        Tok::Hue(Hue::Teal),
+                    ),
+                    ColId::CpuBar if primed => Cell::Bar(
+                        // This currently visualizes total CPU clamped to one core;
+                        // user/system split and multi-core scaling are deferred.
+                        (row.cpu_pct / 100.0).clamp(0.0, 1.0),
+                        *width,
+                        Tok::Hue(Hue::Teal),
+                    ),
+                    ColId::CpuBar => Cell::Text(format_cpu(None), Tok::Hue(Hue::Teal)),
+                    ColId::Rss => {
+                        Cell::Text(format_bytes(Some(row.rss_bytes)), Tok::Hue(Hue::Purple))
+                    }
+                    ColId::Command => {
+                        // Owner tint stays on the sampled command; tree
+                        // indentation remains inside the COMMAND column.
+                        Cell::Text(process_name(row, tree, *width), owner_tone(row.owner))
+                    }
+                    _ => Cell::Text(
+                        NumFmt::default().reading(Reading::Unknown, Unit::Count, *width),
+                        Tok::Slot(S::Ghost),
+                    ),
+                })
+                .collect()
+        })
+        .collect()
 }
 
 fn owner_tone(o: thegn_metrics::ProcOwner) -> Tok {
@@ -297,4 +370,29 @@ pub(super) fn hints(
         },
     ));
     out.push(hint("x", " signal"));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn available_unrendered_columns_use_unknown_ghost_cells() {
+        let row = ProcRow {
+            pid: 41,
+            start_time: 1,
+            start_ticks: None,
+            name: "worker".into(),
+            owner: thegn_metrics::ProcOwner::Other,
+            cpu_pct: 0.0,
+            rss_bytes: 0,
+            depth: 0,
+            elided_parent: false,
+        };
+        let cells = process_cells(&[row], &[(ColId::Ppid, 4)], false, true);
+        assert!(matches!(
+            &cells[0][0],
+            Cell::Text(value, Tok::Slot(S::Ghost)) if value.trim() == "—"
+        ));
+    }
 }

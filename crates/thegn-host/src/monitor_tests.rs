@@ -1147,7 +1147,7 @@ fn process_columns_follow_viewport_not_sample_values_and_keep_visible_identity()
         let mut previous_widths = None;
         for changed in [false, true] {
             let mut sample = proc(
-                u32::MAX,
+                4_194_305,
                 None,
                 if changed {
                     "fixture-世-e\u{301}-👩‍💻-longer-name"
@@ -1178,14 +1178,27 @@ fn process_columns_follow_viewport_not_sample_values_and_keep_visible_identity()
                 })
                 .expect("Processes opts into fixed columns");
             assert_eq!(table.rows.len(), 1);
-            assert!(widths.iter().sum::<usize>() + 5 <= ov.cols);
+            assert_eq!(
+                widths.iter().sum::<usize>() + widths.len().saturating_sub(1) + 1,
+                ov.cols
+            );
+            if cols >= 80 {
+                assert_eq!(
+                    table.header.iter().map(String::as_str).collect::<Vec<_>>(),
+                    ["PID", "OWNER", "CPU%", "usr/sys", "RSS", "COMMAND"]
+                );
+            }
+            assert!(matches!(
+                &table.rows[0][0],
+                crate::sections::Cell::Text(value, _) if value == "4194305"
+            ));
             if let Some(previous) = &previous_widths {
                 assert_eq!(previous, widths);
             }
             previous_widths = Some(widths.clone());
             let mut surface = Surface::new(cols, 30);
             ov.render(&mut surface, screen);
-            if cols >= 80 {
+            if cols >= 40 {
                 let text: String = surface
                     .screen_lines()
                     .iter()
@@ -1195,17 +1208,17 @@ fn process_columns_follow_viewport_not_sample_values_and_keep_visible_identity()
                             .collect::<Vec<_>>()
                     })
                     .collect();
-                assert!(
-                    text.contains("4294967295"),
-                    "full PID fits its fixed ten-cell budget"
-                );
                 assert!(text.contains("fixture"));
+                assert!(
+                    text.contains("4194305"),
+                    "full seven-digit PID is visible: {text}"
+                );
             }
             assert_eq!(ch(&mut ov, 'x'), MonitorOutcome::Pending);
             assert!(matches!(
                 ov.confirm,
                 Some(Confirm::Signal {
-                    pid: u32::MAX,
+                    pid: 4_194_305,
                     start_time: 100,
                     ..
                 })
@@ -1213,6 +1226,162 @@ fn process_columns_follow_viewport_not_sample_values_and_keep_visible_identity()
             // Inspect confirmation only; never dispatch a process signal.
         }
     }
+}
+
+#[test]
+fn process_columns_use_available_fitted_default_and_keep_cpu_unprimed_unknown() {
+    let hist = history(120, NOW_MS);
+    for cols in [100usize, 160, 240] {
+        let screen = Rect::full(cols, 30);
+        let mut model = model_with_procs(vec![proc(41, None, "worker", 0.0, 4096)]);
+        model.procs.primed = false;
+        let ov = open_tab(MonitorTab::Procs, &model, &hist, screen);
+        let table = ov
+            .body
+            .iter()
+            .find_map(|section| match section {
+                Section::FixedTable { table, .. } => Some(table),
+                _ => None,
+            })
+            .expect("process table is rendered");
+        assert_eq!(
+            table.header.iter().map(String::as_str).collect::<Vec<_>>(),
+            ["PID", "OWNER", "CPU%", "usr/sys", "RSS", "COMMAND"]
+        );
+        let cpu = table
+            .header
+            .iter()
+            .position(|header| header == "CPU%")
+            .unwrap();
+        assert!(matches!(
+            &table.rows[0][cpu],
+            crate::sections::Cell::Text(value, _) if value.trim() == "—"
+        ));
+        let cpu_bar = table
+            .header
+            .iter()
+            .position(|header| header == "usr/sys")
+            .unwrap();
+        assert!(matches!(
+            &table.rows[0][cpu_bar],
+            crate::sections::Cell::Text(value, _) if value.trim() == "—"
+        ));
+        assert_eq!(
+            table.rows[0].len(),
+            table.header.len(),
+            "each fitted header has exactly one cell"
+        );
+    }
+}
+
+#[test]
+fn process_filter_lists_ignored_terms_and_still_matches_valid_bare_terms() {
+    let screen = Rect::full(120, 40);
+    let model = model_with_procs(vec![
+        proc(101, None, "kworker/0:1", 0.0, 1),
+        proc(102, None, "bash", 0.0, 1),
+    ]);
+    let hist = history(120, NOW_MS);
+    let mut ov = open_tab(MonitorTab::Procs, &model, &hist, screen);
+    ov.filter = "kworker/0:1 thr>abc user:".into();
+    ov.sync(&model, &hist, screen);
+    assert_eq!(
+        ov.proc_rows.iter().map(|row| row.pid).collect::<Vec<_>>(),
+        [101]
+    );
+    assert!(ov.body.iter().any(|section| matches!(
+        section,
+        Section::HeadingToned { label, note, .. }
+            if label == "ignored filter terms"
+                && note == "thr>abc (bad value), user: (empty value)"
+    )));
+    ov.filtering = true;
+    ov.sync(&model, &hist, screen);
+    assert!(!ov.body.iter().any(|section| matches!(
+        section,
+        Section::HeadingToned { label, .. } if label == "ignored filter terms"
+    )));
+}
+
+#[test]
+fn process_columns_stay_inside_very_narrow_viewports() {
+    let hist = history(10, NOW_MS);
+    let model = model_with_procs(vec![proc(41, None, "worker", 0.0, 4096)]);
+    for cols in 1..=6 {
+        let screen = Rect::full(cols, 12);
+        let ov = open_tab(MonitorTab::Procs, &model, &hist, screen);
+        let widths = ov.body.iter().find_map(|section| match section {
+            Section::FixedTable { widths, .. } => Some(widths),
+            _ => None,
+        });
+        if let Some(widths) = widths {
+            assert_eq!(
+                widths.iter().sum::<usize>() + widths.len().saturating_sub(1) + 1,
+                ov.cols
+            );
+        }
+    }
+}
+
+#[test]
+fn process_reflow_keeps_selected_identity_and_fits_the_resized_viewport() {
+    let hist = history(120, NOW_MS);
+    let model = model_with_n_procs(12);
+    let small = Rect::full(100, 30);
+    let mut ov = open_tab(MonitorTab::Procs, &model, &hist, small);
+    for _ in 0..3 {
+        press(&mut ov, &model, &hist, small, 'j');
+    }
+    let selected_pid = ov.proc_rows[ov.sel].pid;
+    let wide = Rect::full(240, 30);
+    assert!(ov.reflow_geometry(wide));
+    assert_eq!(ov.proc_rows[ov.sel].pid, selected_pid);
+    let (table, widths) = ov
+        .body
+        .iter()
+        .find_map(|section| match section {
+            Section::FixedTable { table, widths } => Some((table, widths)),
+            _ => None,
+        })
+        .expect("process table remains after reflow");
+    assert_eq!(
+        widths.iter().sum::<usize>() + widths.len().saturating_sub(1) + 1,
+        ov.cols
+    );
+    assert_eq!(
+        table.header.iter().map(String::as_str).collect::<Vec<_>>(),
+        ["PID", "OWNER", "CPU%", "usr/sys", "RSS", "COMMAND"]
+    );
+    assert_eq!(table.sel, Some(3));
+    ch(&mut ov, 'x');
+    assert!(matches!(ov.confirm, Some(Confirm::Signal { pid, .. }) if pid == selected_pid));
+}
+
+#[test]
+fn process_reflow_uses_frozen_priming_state_when_filter_mentions_warming_note() {
+    let hist = history(120, NOW_MS);
+    let mut model = model_with_procs(vec![proc(41, None, "cpu warming up worker", 12.0, 4096)]);
+    model.procs.primed = true;
+    let small = Rect::full(100, 30);
+    let mut ov = open_tab(MonitorTab::Procs, &model, &hist, small);
+    ov.filter = "cpu warming up".into();
+    ov.sync(&model, &hist, small);
+    assert_eq!(ov.proc_rows.len(), 1);
+    let wide = Rect::full(160, 30);
+    assert!(ov.reflow_geometry(wide));
+    let cpu = ov
+        .body
+        .iter()
+        .find_map(|section| match section {
+            Section::FixedTable { table, .. } => table
+                .header
+                .iter()
+                .position(|header| header == "CPU%")
+                .map(|index| &table.rows[0][index]),
+            _ => None,
+        })
+        .expect("CPU% cell is rendered");
+    assert!(matches!(cpu, crate::sections::Cell::Text(value, _) if value.trim() != "—"));
 }
 
 fn cell_tone(c: &crate::sections::Cell) -> Tok {
@@ -2210,6 +2379,8 @@ fn gpu_monitor_labels_shared_memory_and_preserves_vram_for_discrete_cards() {
             proc_sort: ProcSort::default(),
             proc_desc: false,
             proc_rows: &[],
+            proc_invalid_terms: &[],
+            proc_primed: false,
             disk_rows: &[],
             disk_eta: None,
         });
