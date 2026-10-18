@@ -1934,6 +1934,7 @@ fn memory_tab_wires_board_demand_and_freezes_frames() {
     assert!(placed.iter().any(|panel| panel.id.0.starts_with("memory.")));
     assert!(!placed.iter().any(|panel| panel.id.0 == "legacy"));
     let demand = {
+        use super::board::TabView as _;
         let view = ov.view();
         let demand = ov.board.demand(&view, ov.body_rect(), 1000).collectors;
         let expected = placed.iter().fold(
