@@ -129,9 +129,10 @@ generic control route exists.
 
 `host.call` has its own bounded dispatcher, separate from the resident-message
 queue above: at most 64 calls are outstanding across all plugins, with at most
-8 per plugin. Calls over either limit get `rate_limited`; a call that exceeds
-30 seconds gets `timeout`, and a stopped dispatcher replies `other`. If the
-plugin exits before its reply can be delivered, the reply is dropped and
+8 per plugin. Calls over either limit get `rate_limited`; a call that runs
+longer than 30 seconds gets `timeout`, and a stopped dispatcher replies
+`other`. A queued call is skipped if its plugin exits before the call runs. If
+the plugin exits before its reply can be delivered, the reply is dropped and
 counted as abandoned. Full or oversized reply frames are counted as
 undelivered. Dispatcher pressure is warned once per plugin per drain.
 
