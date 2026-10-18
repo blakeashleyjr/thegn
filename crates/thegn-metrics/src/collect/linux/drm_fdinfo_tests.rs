@@ -46,6 +46,7 @@ impl FdFs for FakeFdFs {
     }
     fn read_fdinfo(&mut self, _pid: u32, _fd: u32, out: &mut Vec<u8>) -> io::Result<usize> {
         out.clear();
+        // Fixture: Documentation/gpu/drm-usage-stats.rst (pdev/client id) and drivers/gpu/drm/amd/amdgpu/amdgpu_fdinfo.c (gfx ns output).
         out.extend_from_slice(
             b"drm-pdev:\t0000:03:00.0\ndrm-client-id:\t7\ndrm-engine-gfx:\t20 ns\n",
         );
