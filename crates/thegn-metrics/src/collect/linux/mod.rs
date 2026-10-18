@@ -9,6 +9,7 @@ pub mod hwmon;
 pub mod loadavg;
 pub mod meminfo;
 pub mod netdev;
+pub mod power_supply;
 pub mod powercap;
 pub mod procfile;
 pub mod psi;

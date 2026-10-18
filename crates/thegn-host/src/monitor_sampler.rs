@@ -544,6 +544,7 @@ fn restore_collector_part(target: &mut Parts, source: &Parts, id: CollectorId) {
         CollectorId::Netdev => target.netdev.clone_from(&source.netdev),
         CollectorId::Diskstats => target.diskstats.clone_from(&source.diskstats),
         CollectorId::Powercap => target.powercap.clone_from(&source.powercap),
+        CollectorId::PowerSupply => target.power_supply.clone_from(&source.power_supply),
     }
 }
 
