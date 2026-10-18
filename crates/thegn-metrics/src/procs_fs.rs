@@ -61,6 +61,7 @@ pub struct FakeProcFs {
     gone_reads: BTreeMap<u32, usize>,
     small_read_errors: BTreeMap<(u32, String), VecDeque<io::ErrorKind>>,
     list_order: Option<Vec<u32>>,
+    list_errors: VecDeque<io::ErrorKind>,
     ops: ProcFsOps,
 }
 
@@ -83,6 +84,11 @@ impl FakeProcFs {
     /// Override directory enumeration order for the currently installed PIDs.
     pub fn set_list_order(&mut self, pids: Vec<u32>) {
         self.list_order = Some(pids);
+    }
+
+    /// Script an error for the next process-list operation.
+    pub fn fail_next_list(&mut self, kind: io::ErrorKind) {
+        self.list_errors.push_back(kind);
     }
 
     /// Script a zero-byte stat read on the next read for this PID.
@@ -152,6 +158,9 @@ impl ProcFs for FakeProcFs {
 
     fn list_pids(&mut self, out: &mut Vec<u32>) -> io::Result<()> {
         self.ops.lists += 1;
+        if let Some(kind) = self.list_errors.pop_front() {
+            return Err(io::Error::new(kind, "scripted process-list error"));
+        }
         if let Some(order) = &self.list_order {
             out.extend(
                 order

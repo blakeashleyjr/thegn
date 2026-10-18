@@ -164,7 +164,13 @@ impl<F: ProcFs> ProcTable<F> {
         &mut self.fs
     }
 
-    /// Reset rows and release every retained stat descriptor.
+    /// Number of retained process stat descriptors.
+    pub const fn kept_count(&self) -> usize {
+        self.kept_count
+    }
+
+    /// Reset rows and release every retained stat descriptor. The filesystem
+    /// provider (and, for `RealProcFs`, its `/proc` root descriptor) remains open.
     pub fn reset(&mut self) {
         for mut entry in self.entries.drain(..) {
             if let Some(handle) = entry.handle.take() {
@@ -192,7 +198,7 @@ impl<F: ProcFs> ProcTable<F> {
                 self.mark_ghost(index);
                 index += 1;
             }
-            let visible_now = visible.contains(&pid);
+            let visible_now = visible.binary_search(&pid).is_ok();
             if index < self.entries.len() && self.entries[index].id.pid == pid {
                 self.refresh_existing(index, now, visible_now)?;
                 index += 1;
@@ -207,11 +213,11 @@ impl<F: ProcFs> ProcTable<F> {
             self.mark_ghost(index);
             index += 1;
         }
+        self.entries.retain(|entry| !entry.ghost);
         Ok(())
     }
 
     fn mark_ghost(&mut self, index: usize) {
-        // P-2: define a bounded ghost lifetime and prune old rows.
         let entry = &mut self.entries[index];
         entry.ghost = true;
         entry.cpu_delta = None;
@@ -529,7 +535,7 @@ fn is_permission_denied(error: &io::Error) -> bool {
         || matches!(error.raw_os_error(), Some(libc::EACCES) | Some(libc::EPERM))
 }
 
-fn clock_ticks_per_second() -> Option<u64> {
+pub(crate) fn clock_ticks_per_second() -> Option<u64> {
     // SAFETY: `sysconf` reads a process-wide constant and has no pointer arguments.
     let ticks_per_second = unsafe { libc::sysconf(libc::_SC_CLK_TCK) };
     u64::try_from(ticks_per_second)
