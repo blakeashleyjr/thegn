@@ -602,6 +602,7 @@ pub struct LoopPerf {
     pub input_us: Histo,
     pub input_events: u64,
     pub input_coalesced_events: u64,
+    pub input_no_effect_events: u64,
     pending_input_events: u64,
     pub resync_us: Histo,
     pub(crate) writer: crate::perf_timing::WriterMetrics,
@@ -660,6 +661,7 @@ impl LoopPerf {
             input_us: Histo::new(),
             input_events: 0,
             input_coalesced_events: 0,
+            input_no_effect_events: 0,
             pending_input_events: 0,
             resync_us: Histo::new(),
             writer: crate::perf_timing::WriterMetrics::default(),
@@ -779,7 +781,9 @@ impl LoopPerf {
     /// incremental composition, even if a periodic resync re-emitted the full
     /// surface. `input_since` is the earliest host observation in the pending
     /// cohort, taken once on submission. No causal response/display guarantee
-    /// is implied. Clearing it also releases the input-priority PTY budget.
+    /// is implied. The classified close determines whether it enters latency
+    /// accounting or the no-effect counter. Clearing it also releases the
+    /// input-priority PTY budget.
     /// Switch stamps likewise measure action→next submission, split by kind.
     /// Both cleared even when accounting is off.
     #[inline]
@@ -788,9 +792,10 @@ impl LoopPerf {
         dt: Duration,
         pane_only: bool,
         input_since: &mut Option<Instant>,
+        input_close: crate::perf_timing::InputClose,
         switch_since: &mut Option<(Instant, SwitchKind)>,
     ) {
-        let input = input_since.take();
+        let _closed_stamp = input_since.take();
         self.pending_input_events = 0;
         let switch = switch_since.take();
         if enabled() {
@@ -805,8 +810,14 @@ impl LoopPerf {
             }
             self.render_us.record_us(us);
             self.render_busy += dt;
-            if let Some(t) = input {
-                self.input_us.record_us(t.elapsed().as_micros() as u64);
+            match input_close {
+                crate::perf_timing::InputClose::None => {}
+                crate::perf_timing::InputClose::Latency(t) => {
+                    self.input_us.record_us(t.elapsed().as_micros() as u64);
+                }
+                crate::perf_timing::InputClose::NoEffect => {
+                    self.input_no_effect_events += 1;
+                }
             }
             if let Some((t, kind)) = switch {
                 match kind {
@@ -881,6 +892,7 @@ impl LoopPerf {
         self.input_us.reset();
         self.input_events = 0;
         self.input_coalesced_events = 0;
+        self.input_no_effect_events = 0;
         self.resync_us.reset();
         self.writer = crate::perf_timing::WriterMetrics::default();
         self.writer_deferred = false;
@@ -919,6 +931,7 @@ pub struct PerfSnapshot {
     pub input_samples: u64,
     pub input_events: u64,
     pub input_coalesced_events: u64,
+    pub input_no_effect_events: u64,
     pub resync_samples: u64,
     pub resync_p99_us: u64,
     pub writer_frames: u64,
@@ -1027,6 +1040,7 @@ impl LoopPerf {
             input_samples: self.input_us.count(),
             input_events: self.input_events,
             input_coalesced_events: self.input_coalesced_events,
+            input_no_effect_events: self.input_no_effect_events,
             resync_samples: self.resync_us.count(),
             resync_p99_us: self.resync_us.percentile_us(0.99),
             writer_frames: self.writer.completion_us.count(),
@@ -1094,6 +1108,7 @@ impl LoopPerf {
             input_samples = snap.input_samples,
             input_events = snap.input_events,
             input_coalesced_events = snap.input_coalesced_events,
+            input_no_effect_events = snap.input_no_effect_events,
             resync_samples = snap.resync_samples,
             resync_p99_us = snap.resync_p99_us,
             writer_metrics_deferred = self.writer_deferred,
