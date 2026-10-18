@@ -4,4 +4,5 @@ pub mod cpu_topology;
 pub mod gpu_family;
 pub mod hwmon_group;
 pub mod net_scope;
+pub mod power;
 pub mod thermal;
