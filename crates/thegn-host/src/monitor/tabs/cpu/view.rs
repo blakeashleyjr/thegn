@@ -28,6 +28,52 @@ const IDLE: PanelId = PanelId("cpu.idle");
 const CORE_HISTORY_SAMPLES: usize = 240;
 const CORE_HISTORY_LIMIT: usize = 256;
 
+#[derive(Debug, Clone)]
+struct SampleRing {
+    values: Vec<f32>,
+    head: usize,
+    len: usize,
+}
+
+impl Default for SampleRing {
+    fn default() -> Self {
+        Self {
+            values: Vec::with_capacity(CORE_HISTORY_SAMPLES),
+            head: 0,
+            len: 0,
+        }
+    }
+}
+
+impl SampleRing {
+    fn push(&mut self, value: f32) {
+        if self.len < CORE_HISTORY_SAMPLES {
+            self.values.push(value);
+            self.len += 1;
+        } else {
+            self.values[self.head] = value;
+            self.head = (self.head + 1) % CORE_HISTORY_SAMPLES;
+        }
+    }
+
+    fn ordered(&self) -> Vec<f32> {
+        if self.len < CORE_HISTORY_SAMPLES || self.head == 0 {
+            return self.values.clone();
+        }
+        self.values[self.head..]
+            .iter()
+            .chain(&self.values[..self.head])
+            .copied()
+            .collect()
+    }
+}
+
+#[derive(Debug, Clone)]
+struct PolicyHistory {
+    policy: u16,
+    samples: SampleRing,
+}
+
 const FULL_VARIANTS: [Variant; 3] = [
     Variant {
         kind: VariantKind::Full,
@@ -107,7 +153,10 @@ pub(in crate::monitor) struct CpuModel {
     idle: thegn_metrics::collect::model::cpu_idle::CpuIdlePart,
     cpu_history: Vec<f32>,
     load_history: Vec<f32>,
-    core_busy_history: Vec<Vec<f32>>,
+    core_busy_history: Vec<SampleRing>,
+    iowait_history: SampleRing,
+    steal_history: SampleRing,
+    frequency_history: Vec<PolicyHistory>,
     cpu_stat_health: Health,
     cpu_freq_health: Health,
     cpu_irq_health: Health,
@@ -137,12 +186,52 @@ impl CpuModel {
                 .share
                 .map(|share| f32::from(share.busy) / 1000.0)
                 .unwrap_or(f32::NAN);
-            if history.len() == CORE_HISTORY_SAMPLES {
-                history.rotate_left(1);
-                history[CORE_HISTORY_SAMPLES - 1] = value;
-            } else {
-                history.push(value);
-            }
+            history.push(value);
+        }
+        if let Some(total) = source.total {
+            self.iowait_history.push(f32::from(total.iowait) / 1000.0);
+            self.steal_history.push(f32::from(total.steal) / 1000.0);
+        } else {
+            self.iowait_history.push(f32::NAN);
+            self.steal_history.push(f32::NAN);
+        }
+        for policy in frame
+            .parts
+            .cpu_freq
+            .policies
+            .iter()
+            .take(CORE_HISTORY_LIMIT)
+        {
+            let index = self
+                .frequency_history
+                .iter()
+                .position(|history| history.policy == policy.policy);
+            let history = match index {
+                Some(index) => &mut self.frequency_history[index].samples,
+                None => {
+                    if self.frequency_history.len() >= CORE_HISTORY_LIMIT {
+                        continue;
+                    }
+                    self.frequency_history.push(PolicyHistory {
+                        policy: policy.policy,
+                        samples: SampleRing::default(),
+                    });
+                    &mut self
+                        .frequency_history
+                        .last_mut()
+                        .expect("just inserted")
+                        .samples
+                }
+            };
+            let min = policy.scaling_min_khz.or(policy.hw_min_khz);
+            let max = policy.scaling_max_khz.or(policy.hw_max_khz);
+            let value = match (min, max, policy.cur_khz) {
+                (Some(min), Some(max), Some(current)) => (current.saturating_sub(min) as f32
+                    / max.saturating_sub(min).max(1) as f32)
+                    .clamp(0.0, 1.0),
+                _ => f32::NAN,
+            };
+            history.push(value);
         }
         self.cpu_stat.ctxt_per_s = source.ctxt_per_s;
         self.cpu_stat.intr_per_s = source.intr_per_s;
@@ -223,6 +312,18 @@ impl TabView for CpuView<'_> {
     }
 
     fn template(&self) -> Node {
+        let third_row = if matches!(self.0.sched_health, Health::Absent(_)) {
+            Node::Row(vec![
+                (Size::Weight(1), Node::Panel(FREQ)),
+                (Size::Weight(1), Node::Panel(IRQ)),
+            ])
+        } else {
+            Node::Row(vec![
+                (Size::Weight(1), Node::Panel(FREQ)),
+                (Size::Weight(1), Node::Panel(IRQ)),
+                (Size::Weight(1), Node::Panel(SCHED)),
+            ])
+        };
         Node::Col(vec![
             (
                 Size::Weight(2),
@@ -238,14 +339,7 @@ impl TabView for CpuView<'_> {
                     (Size::Weight(1), Node::Panel(IDLE)),
                 ]),
             ),
-            (
-                Size::Weight(1),
-                Node::Row(vec![
-                    (Size::Weight(1), Node::Panel(FREQ)),
-                    (Size::Weight(1), Node::Panel(IRQ)),
-                    (Size::Weight(1), Node::Panel(SCHED)),
-                ]),
-            ),
+            (Size::Weight(1), third_row),
         ])
     }
 

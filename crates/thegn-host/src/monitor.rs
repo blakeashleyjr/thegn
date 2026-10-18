@@ -644,16 +644,16 @@ impl MonitorOverlay {
         let live_now = ctx.now_ms.max(0) as u64;
         self.last_now_ms = live_now;
         let now = self.frozen_now_ms.unwrap_or(live_now);
+        if !self.paused && self.tab == MonitorTab::Cpu {
+            let prefs = self.prefs.tab(MonitorTab::Cpu);
+            self.cpu
+                .absorb_history(ctx.hist, prefs.window, prefs.scale, now);
+        }
         if !self.paused && self.tab == MonitorTab::Overview {
             self.overview.absorb_stats(&model.stats);
             self.overview.absorb_container_count(model.containers.len());
             let prefs = self.prefs.tab(MonitorTab::Overview);
             self.overview
-                .absorb_history(ctx.hist, prefs.window, prefs.scale, now);
-        }
-        if !self.paused && self.tab == MonitorTab::Cpu {
-            let prefs = self.prefs.tab(MonitorTab::Cpu);
-            self.cpu
                 .absorb_history(ctx.hist, prefs.window, prefs.scale, now);
         }
         // Only the active list is derived, and navigation/geometry changes do
