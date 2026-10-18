@@ -15,13 +15,13 @@ const MAX_ANCESTRY: usize = 16;
 #[derive(Debug)]
 pub(crate) enum ProcBackend {
     Sysinfo,
-    Native(NativeBackend<RealProcFs>),
+    Native(Box<NativeBackend<RealProcFs>>),
 }
 
 impl ProcBackend {
     pub(crate) fn new() -> Self {
         match RealProcFs::new() {
-            Ok(fs) => Self::Native(NativeBackend::new(fs)),
+            Ok(fs) => Self::Native(Box::new(NativeBackend::new(fs))),
             Err(_) => Self::Sysinfo,
         }
     }
