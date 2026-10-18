@@ -287,8 +287,8 @@ impl StatsSampler {
         #[cfg(target_os = "linux")]
         {
             let (cpu_pct, cpu_cores) = self.base_cpu.fill(&mut self.cpu_primed);
-            snap.cpu_pct = cpu_pct;
-            snap.cpu_cores = cpu_cores;
+            snap.cpu_pct = cpu_pct.map(pct_u8);
+            snap.cpu_cores = cpu_cores.into_iter().map(pct_u8).collect();
         }
         #[cfg(not(target_os = "linux"))]
         {
