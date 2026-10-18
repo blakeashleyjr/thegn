@@ -253,7 +253,7 @@ impl MemoryModel {
                 scale: TelemetryHistory::scale_for(metric, ScaleMode::Fixed),
                 buckets: HISTORY_CAPACITY,
                 agg: thegn_core::series::Agg::Max,
-                now_ms,
+                now_ms: now_ms.saturating_add(1),
             });
             slot.clear();
             if !series.empty {
@@ -378,9 +378,30 @@ fn sum_rates(left: Option<f64>, right: Option<f64>) -> Option<f64> {
     }
 }
 
+#[cfg(test)]
 fn right_aligned_window(len: usize, width: usize) -> (usize, usize, usize) {
     let visible = len.min(width);
     (len - visible, visible, width - visible)
+}
+
+/// Return the sample slice and cell span needed to show the newest history
+/// without stretching it. Braille cells carry two samples; ASCII columns carry
+/// one.
+fn right_aligned_raster_window(len: usize, width: usize) -> (usize, usize, usize, usize) {
+    let samples_per_cell =
+        if viz_raster::RasterTable::for_level(crate::caps::unicode_level()).braille {
+            2
+        } else {
+            1
+        };
+    let visible_samples = len.min(width.saturating_mul(samples_per_cell));
+    let visible_cells = visible_samples.div_ceil(samples_per_cell);
+    (
+        len - visible_samples,
+        visible_samples,
+        width - visible_cells,
+        visible_cells,
+    )
 }
 
 pub(in crate::monitor) struct MemoryView<'a>(pub &'a MemoryModel);
@@ -394,7 +415,7 @@ impl TabView for MemoryView<'_> {
         let mut panels = vec![COMPOSITION, VERDICT, PRESSURE, PAGING];
         // Follow-up: gate on meminfo Health::Absent once source health is carried
         // into this model; SwapTotal presence is the available field today.
-        if self.0.swap_total.is_some() {
+        if self.0.swap_total.is_some_and(|total| total > 0) {
             panels.push(SWAP);
         }
         Node::Col(vec![
@@ -807,20 +828,24 @@ impl MemoryView<'_> {
         if len == 0 {
             return;
         }
-        let (start, visible, offset) = right_aligned_window(len, chart.cols);
-        if visible == 0 {
+        let (start, visible_samples, offset, visible_cells) =
+            right_aligned_raster_window(len, chart.cols);
+        if visible_samples == 0 {
             return;
         }
         let chart = Rect {
             x: chart.x + offset,
-            cols: visible,
+            cols: visible_cells,
             ..chart
         };
         let available = used.map(|value| 1.0 - value.clamp(0.0, 1.0));
         let mut raster = CellBuf::new();
         raster.reset(chart.cols, chart.rows);
         viz_raster::stacked(
-            &[&used[start..len], &available[start..len]],
+            &[
+                &used[start..start + visible_samples],
+                &available[start..start + visible_samples],
+            ],
             viz_raster::RasterTable::for_level(crate::caps::unicode_level()),
             &mut raster,
         );
@@ -943,8 +968,8 @@ impl MemoryView<'_> {
         if len == 0 {
             return;
         }
-        let (start, visible, _) = right_aligned_window(len, body.cols);
-        if visible == 0 {
+        let (start, visible_samples, _, _) = right_aligned_raster_window(len, body.cols);
+        if visible_samples == 0 {
             return;
         }
         let scale = if peak > 0.0 { peak * 1.1 } else { 1.0 };
@@ -968,16 +993,16 @@ impl MemoryView<'_> {
         if chart.rows == 0 {
             return;
         }
-        let (_, _, offset) = right_aligned_window(len, chart.cols);
+        let (_, _, offset, visible_cells) = right_aligned_raster_window(len, chart.cols);
         let chart = Rect {
             x: chart.x + offset,
-            cols: visible,
+            cols: visible_cells,
             ..chart
         };
         let mut raster = CellBuf::new();
         raster.reset(chart.cols, chart.rows);
         viz_raster::area(
-            &values[start..len],
+            &values[start..start + visible_samples],
             viz_raster::RasterTable::for_level(crate::caps::unicode_level()),
             &mut raster,
         );
@@ -1061,18 +1086,19 @@ impl MemoryView<'_> {
                 ),
                 Default::default(),
             );
-            let (start, visible, offset) = right_aligned_window(len, body.cols);
-            if visible > 0 && body.rows > 4 {
+            let (start, visible_samples, offset, visible_cells) =
+                right_aligned_raster_window(len, body.cols);
+            if visible_samples > 0 && body.rows > 4 {
                 let chart = Rect {
                     x: body.x + offset,
                     y: body.y + 4,
-                    cols: visible,
+                    cols: visible_cells,
                     rows: body.rows - 4,
                 };
                 let mut raster = CellBuf::new();
                 raster.reset(chart.cols, chart.rows);
                 viz_raster::area(
-                    &values[start..len],
+                    &values[start..start + visible_samples],
                     viz_raster::RasterTable::for_level(crate::caps::unicode_level()),
                     &mut raster,
                 );
@@ -1145,8 +1171,8 @@ impl MemoryView<'_> {
         if len == 0 || peak <= 0.0 {
             return;
         }
-        let (start, visible, _) = right_aligned_window(len, body.cols);
-        if visible == 0 {
+        let (start, visible_samples, _, _) = right_aligned_raster_window(len, body.cols);
+        if visible_samples == 0 {
             return;
         }
         for value in values.iter_mut().take(len) {
@@ -1173,16 +1199,16 @@ impl MemoryView<'_> {
         if chart.rows == 0 {
             return;
         }
-        let (_, _, offset) = right_aligned_window(len, chart.cols);
+        let (_, _, offset, visible_cells) = right_aligned_raster_window(len, chart.cols);
         let chart = Rect {
             x: chart.x + offset,
-            cols: visible,
+            cols: visible_cells,
             ..chart
         };
         let mut raster = CellBuf::new();
         raster.reset(chart.cols, chart.rows);
         viz_raster::area(
-            &values[start..len],
+            &values[start..start + visible_samples],
             viz_raster::RasterTable::for_level(crate::caps::unicode_level()),
             &mut raster,
         );
