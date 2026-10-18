@@ -190,6 +190,7 @@ pub fn collector_families(id: crate::collect::CollectorId) -> &'static [MetricFa
         Id::Meminfo => &[MetricFamily::Memory, MetricFamily::Swap],
         Id::Vmstat => &[MetricFamily::Reclaim],
         Id::Netdev => &[MetricFamily::Network],
+        Id::NetWifi => &[],
         Id::Diskstats => &[MetricFamily::Disk],
         Id::AmdSmu => &[MetricFamily::Gpu],
         Id::PowerSupply => &[MetricFamily::Battery],

@@ -20,6 +20,7 @@ pub struct Parts {
     pub meminfo: super::model::meminfo::MeminfoPart,
     pub vmstat: super::model::vmstat::VmstatPart,
     pub netdev: super::model::netdev::NetdevPart,
+    pub net_wifi: super::model::net_wifi::NetWifiPart,
     pub diskstats: super::model::diskstats::DiskstatsPart,
     pub powercap: super::model::powercap::PowercapPart,
     pub power_supply: super::model::power_supply::PowerSupplyPart,
@@ -47,6 +48,7 @@ impl Parts {
         self.meminfo.clear();
         self.vmstat.clear();
         self.netdev.clear();
+        self.net_wifi.clear();
         self.diskstats.clear();
         self.powercap.clear();
         self.power_supply.clear();
