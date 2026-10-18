@@ -44,6 +44,130 @@ fn history_graph_rect(rect: Rect, body: Rect, len: usize, braille: bool) -> Rect
 }
 
 impl GpuView<'_> {
+    pub(in crate::monitor::tabs::gpu) fn paint_aux_history(
+        &self,
+        surface: &mut Surface,
+        rect: Rect,
+        body: Rect,
+        memory: bool,
+    ) {
+        let Some(engine) = self.0.engines.devices.first() else {
+            return;
+        };
+        if engine.runtime_status != RuntimeStatus::Active {
+            return;
+        }
+        let Some(history) = self
+            .0
+            .histories
+            .iter()
+            .find(|item| item.slot == engine.slot.as_str())
+        else {
+            return;
+        };
+        if body.rows < 7 || body.cols < 12 {
+            return;
+        }
+        let (
+            first,
+            first_next,
+            first_len,
+            second,
+            second_next,
+            second_len,
+            first_label,
+            second_label,
+        ) = if memory {
+            (
+                &history.memory,
+                history.memory_next,
+                history.memory_len,
+                &history.gtt,
+                history.gtt_next,
+                history.gtt_len,
+                "VRAM used / total 0-100%",
+                "GTT used / total 0-100%",
+            )
+        } else {
+            (
+                &history.clocks,
+                history.clocks_next,
+                history.clocks_len,
+                &history.power,
+                history.power_next,
+                history.power_len,
+                "gfx clock / max 0-100%",
+                "power / cap 0-100%",
+            )
+        };
+        let device_rows = self.0.devices.devices.len().min(body.rows);
+        let graph_rows = body.rows.saturating_sub(device_rows + 4).min(5);
+        if graph_rows == 0 {
+            return;
+        }
+        let graph_cols = body.cols.saturating_sub(1);
+        if first_len > 0 {
+            let mut values = [0.0_f32; HISTORY_CAP];
+            let len = super::BusyHistory::ordered_ring(first, first_next, first_len, &mut values);
+            let mut label = CellGrid::new(body.cols, 1);
+            label
+                .view(Rect::full(body.cols, 1))
+                .put_str(0, 0, first_label, Default::default());
+            Emitter::default().emit(
+                &label,
+                Rect::full(body.cols, 1),
+                surface,
+                rect.x + body.x,
+                rect.y + body.y + device_rows,
+            );
+            let graph_rect = history_graph_rect(
+                rect,
+                Rect {
+                    x: body.x,
+                    y: body.y + device_rows,
+                    cols: graph_cols,
+                    rows: graph_rows,
+                },
+                len,
+                crate::monitor::graphs::table().braille,
+            );
+            crate::monitor::graphs::paint_history_graph(
+                &values[..len],
+                thegn_core::theme::RampId::Mem,
+                graph_rect,
+                surface,
+            );
+        }
+        if second_len > 0 {
+            let mut values = [0.0_f32; HISTORY_CAP];
+            let len =
+                super::BusyHistory::ordered_ring(second, second_next, second_len, &mut values);
+            let mut label = CellGrid::new(body.cols, 1);
+            label
+                .view(Rect::full(body.cols, 1))
+                .put_str(0, 0, second_label, Default::default());
+            Emitter::default().emit(
+                &label,
+                Rect::full(body.cols, 1),
+                surface,
+                rect.x + body.x,
+                rect.y + body.y + device_rows + graph_rows + 2,
+            );
+            crate::monitor::graphs::paint_sparkline(
+                &values[..len],
+                graph_cols,
+                thegn_core::theme::RampId::Util,
+                Rect {
+                    x: rect.x + body.x,
+                    y: rect.y + body.y + device_rows + graph_rows + 1,
+                    cols: graph_cols,
+                    rows: 1,
+                },
+                surface,
+            );
+        }
+    }
+
     pub(in crate::monitor::tabs::gpu) fn paint_busy_history(
         &self,
         surface: &mut Surface,
@@ -272,9 +396,11 @@ impl GpuView<'_> {
             let (used_vram, total_vram, used_gtt, total_gtt) =
                 engine.map_or((None, device.vram_total, None, device.gtt_total), |item| {
                     (
-                        item.vram_used,
+                        item.vram_used
+                            .filter(|_| item.runtime_status == RuntimeStatus::Active),
                         item.vram_total.or(device.vram_total),
-                        item.gtt_used,
+                        item.gtt_used
+                            .filter(|_| item.runtime_status == RuntimeStatus::Active),
                         item.gtt_total.or(device.gtt_total),
                     )
                 });

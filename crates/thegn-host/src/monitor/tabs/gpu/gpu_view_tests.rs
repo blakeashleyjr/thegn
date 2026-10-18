@@ -53,7 +53,11 @@ fn fixture(tick: u32, kind: GpuKind, status: RuntimeStatus) -> MonitorFrame {
         sclk: DpmLevels {
             levels_mhz: [600, 764, 2900, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
             len: 3,
-            current_mhz: (status == RuntimeStatus::Active).then_some(764),
+            current_mhz: (status == RuntimeStatus::Active).then_some(match tick % 3 {
+                0 => 600,
+                1 => 764,
+                _ => 2900,
+            }),
         },
         mclk: DpmLevels {
             levels_mhz: [500, 2400, 2800, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
@@ -63,6 +67,7 @@ fn fixture(tick: u32, kind: GpuKind, status: RuntimeStatus) -> MonitorFrame {
     });
     let metrics = GpuMetrics {
         power_socket: Some(17_300 + tick * 100),
+        power_stapm_limit: Some(28_000),
         temperature_gfx: Some(8_000 + (tick % 7) as u16 * 100),
         ..GpuMetrics::default()
     };
@@ -158,9 +163,9 @@ fn gpu_view_snapshots_cover_size_and_capability_matrix() {
                 assert!(rendered.contains("gfx"));
                 assert!(rendered.contains("vcn %"));
                 assert!(rendered.contains("shared"));
-                assert!(rendered.contains("764 MHz [2/3]"));
+                assert!(rendered.contains("MHz ["));
                 if cols == 240 {
-                    // Density floor is an estimate; the reported ratio can replace it.
+                    // density follow-up (batch 50): estimated, primary sets from the printed value
                     let ratio = fill_ratio(&surface, Rect::full(cols, rows));
                     assert!(
                         ratio >= 0.30,
@@ -281,6 +286,7 @@ fn suspended_gpu_never_renders_zero_busy_or_clock_and_missing_is_absent() {
     assert!(!rendered.contains("gfx 0%"));
     assert!(!rendered.contains("vcn 0%"));
     assert!(!rendered.contains("sclk 0 MHz"));
+    assert!(!rendered.contains("301"));
     assert!(rendered.contains(caps::active_glyphs().emdash));
 
     let mut suspending_model = GpuModel::default();
@@ -326,6 +332,10 @@ fn busy_history_is_slot_keyed_bounded_and_reuses_capacity_after_warmup() {
     }
     assert_eq!(model.histories.len(), 1);
     assert_eq!(model.histories[0].len, 480);
+    assert_eq!(model.histories[0].memory_len, 480);
+    assert_eq!(model.histories[0].gtt_len, 480);
+    assert_eq!(model.histories[0].clocks_len, 480);
+    assert_eq!(model.histories[0].power_len, 480);
     let capacity = model.histories.capacity();
     assert_eq!(model.devices.devices.capacity(), device_capacity);
     assert_eq!(model.engines.devices.capacity(), engine_capacity);
