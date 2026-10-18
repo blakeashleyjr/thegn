@@ -303,11 +303,11 @@ impl StatsSampler {
         #[cfg(target_os = "linux")]
         {
             let reading = self.base_mem.fill();
-            if let Some((used, total)) = reading.mem.filter(|(_, total)| *total > 0) {
+            if let Some((used, total)) = crate::base_mem::nonzero_total(reading.mem) {
                 snap.mem_gib = Some((gib(used), gib(total)));
                 snap.mem_free_gib = reading.free.map(gib);
             }
-            if let Some((used, total)) = reading.swap.filter(|(_, total)| *total > 0) {
+            if let Some((used, total)) = crate::base_mem::nonzero_total(reading.swap) {
                 snap.swap_gib = Some((gib(used), gib(total)));
             }
         }

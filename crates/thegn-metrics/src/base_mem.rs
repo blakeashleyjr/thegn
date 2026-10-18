@@ -5,6 +5,7 @@ use crate::collect::{
     parse::meminfo::{self, MemField, MeminfoRaw},
 };
 
+// Keep in sync with sample.rs::SLOW_EVERY so failed opens retry once per slow tier.
 const SLOW_EVERY: u8 = 5;
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
@@ -41,6 +42,12 @@ pub(crate) struct BaseMem {
     file: Option<ProcFile>,
     raw: MeminfoRaw,
     retry_in: u8,
+    #[cfg(test)]
+    reads: usize,
+}
+
+pub(crate) fn nonzero_total(reading: Option<(u64, u64)>) -> Option<(u64, u64)> {
+    reading.filter(|(_, total)| *total > 0)
 }
 
 impl BaseMem {
@@ -54,6 +61,8 @@ impl BaseMem {
             file: None,
             raw: MeminfoRaw::default(),
             retry_in: 0,
+            #[cfg(test)]
+            reads: 0,
         }
     }
 
@@ -75,16 +84,22 @@ impl BaseMem {
         }
 
         let result = match self.file.as_mut() {
-            Some(file) => match file.read_all() {
-                Ok(bytes) => {
-                    meminfo::parse(bytes, &mut self.raw);
-                    Ok(())
+            Some(file) => {
+                #[cfg(test)]
+                {
+                    self.reads += 1;
                 }
-                Err(error) => Err((error, file.needs_reopen())),
-            },
+                match file.read_all() {
+                    Ok(bytes) => {
+                        meminfo::parse(bytes, &mut self.raw);
+                        true
+                    }
+                    Err(_) => false,
+                }
+            }
             None => return MemReading::default(),
         };
-        if let Err((_error, _needs_reopen)) = result {
+        if !result {
             self.file = None;
             self.raw = MeminfoRaw::default();
             self.retry_in = SLOW_EVERY - 1;
@@ -96,7 +111,7 @@ impl BaseMem {
 
 #[cfg(test)]
 mod tests {
-    use super::{BaseMem, MemReading, reading};
+    use super::{BaseMem, MemReading, nonzero_total, reading};
     use crate::collect::parse::meminfo::{MemField, MeminfoRaw, parse};
     use std::fs;
 
@@ -155,7 +170,8 @@ SwapFree:       30823012 kB\n";
         );
         let result = reading(&raw);
         assert_eq!(result.swap, Some((0, 0)));
-        assert_eq!(result.swap.filter(|(_, total)| *total > 0), None);
+        assert_eq!(nonzero_total(result.swap), None);
+        assert_eq!(nonzero_total(Some((1, 2))), Some((1, 2)));
         assert_eq!(raw.get(MemField::SwapTotal), Some(0));
     }
 
@@ -170,6 +186,7 @@ SwapFree:       30823012 kB\n";
             assert_eq!(reader.fill(), MemReading::default());
         }
         assert_eq!(reader.fill().mem, reading_from_capture().mem);
+        assert_eq!(reader.reads, 1);
 
         let moved = dir.path().join("held-meminfo");
         fs::rename(&path, moved).unwrap();
@@ -179,6 +196,7 @@ SwapFree:       30823012 kB\n";
         )
         .unwrap();
         assert_eq!(reader.fill().mem, reading_from_capture().mem);
+        assert_eq!(reader.reads, 2);
     }
 
     fn reading_from_capture() -> MemReading {
