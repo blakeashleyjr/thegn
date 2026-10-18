@@ -66,17 +66,38 @@ pub(crate) fn invalidate_glyphs(paths: &[String]) {
     }
 }
 
-/// Update only the upstream counts of a cached glyph row. A fetch changes
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum GlyphPatch {
+    Patched,
+    Newer,
+    /// No cached row for this path, or the row is for another branch.
+    Missing,
+}
+
+/// Update only the upstream counts of a cached glyph row when its scan and
+/// branch still match the state observed before the ref read. A fetch changes
 /// remote-tracking refs, which cannot change worktree status or diff counts, so
 /// preserve the scan timestamp and avoid scheduling a full glyph rescan.
-pub(crate) fn patch_glyph_ahead_behind(path: &str, ahead: usize, behind: usize) -> bool {
+pub(crate) fn patch_glyph_ahead_behind(
+    path: &str,
+    branch: &str,
+    ahead: usize,
+    behind: usize,
+    read_at: Instant,
+) -> GlyphPatch {
     let mut cache = glyph_cache().lock().unwrap_or_else(|e| e.into_inner());
-    let Some((row, _)) = cache.get_mut(path) else {
-        return false;
+    let Some((row, scanned_at)) = cache.get_mut(path) else {
+        return GlyphPatch::Missing;
     };
+    if *scanned_at > read_at {
+        return GlyphPatch::Newer;
+    }
+    if row.branch.as_deref() != Some(branch) {
+        return GlyphPatch::Missing;
+    }
     row.ahead = ahead;
     row.behind = behind;
-    true
+    GlyphPatch::Patched
 }
 
 /// Combine the registered-worktree paths and the known repo roots into the

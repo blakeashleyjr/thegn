@@ -426,7 +426,10 @@ fn patching_cached_glyph_counts_preserves_the_scan_age() {
             ),
         );
 
-    assert!(patch_glyph_ahead_behind(&path, 2, 7));
+    assert_eq!(
+        patch_glyph_ahead_behind(&path, "main", 2, 7, Instant::now()),
+        GlyphPatch::Patched
+    );
     {
         let cache = glyph_cache().lock().unwrap_or_else(|e| e.into_inner());
         let (row, timestamp) = cache.get(&path).unwrap();
@@ -439,11 +442,103 @@ fn patching_cached_glyph_counts_preserves_the_scan_age() {
             Duration::from_secs(120),
         ));
     }
-    assert!(!patch_glyph_ahead_behind("/test/missing-glyph-row", 0, 1));
+    assert_eq!(
+        patch_glyph_ahead_behind("/test/missing-glyph-row", "main", 0, 1, Instant::now()),
+        GlyphPatch::Missing
+    );
     glyph_cache()
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .remove(&path);
+}
+
+#[test]
+fn patching_a_newer_glyph_scan_evicts_without_changing_its_counts() {
+    let path = format!("/test/newer-patch-glyph-{}", std::process::id());
+    let read_at = Instant::now();
+    let scanned_at = read_at.checked_add(Duration::from_millis(1)).unwrap();
+    glyph_cache()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(
+            path.clone(),
+            (
+                crate::glyph_types::GlyphRow {
+                    dirty: true,
+                    ahead: 4,
+                    behind: 6,
+                    branch: Some("main".into()),
+                    repo_root: "/repo".into(),
+                    add: thegn_svc::git::DiffCount::Exact(3),
+                    del: thegn_svc::git::DiffCount::Exact(2),
+                    branch_diff: None,
+                    submodule_dirty: false,
+                },
+                scanned_at,
+            ),
+        );
+
+    assert_eq!(
+        patch_glyph_ahead_behind(&path, "main", 2, 7, read_at),
+        GlyphPatch::Newer
+    );
+    {
+        let cache = glyph_cache().lock().unwrap_or_else(|e| e.into_inner());
+        let (row, timestamp) = cache.get(&path).unwrap();
+        assert_eq!((row.ahead, row.behind), (4, 6));
+        assert_eq!(*timestamp, scanned_at);
+    }
+    invalidate_glyphs(std::slice::from_ref(&path));
+    assert!(
+        !glyph_cache()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .contains_key(&path)
+    );
+}
+
+#[test]
+fn patching_a_different_branch_is_rejected_without_changing_counts() {
+    let path = format!("/test/branch-patch-glyph-{}", std::process::id());
+    let scanned_at = Instant::now();
+    glyph_cache()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(
+            path.clone(),
+            (
+                crate::glyph_types::GlyphRow {
+                    dirty: true,
+                    ahead: 4,
+                    behind: 6,
+                    branch: Some("old-branch".into()),
+                    repo_root: "/repo".into(),
+                    add: thegn_svc::git::DiffCount::Exact(3),
+                    del: thegn_svc::git::DiffCount::Exact(2),
+                    branch_diff: None,
+                    submodule_dirty: false,
+                },
+                scanned_at,
+            ),
+        );
+
+    assert_eq!(
+        patch_glyph_ahead_behind(&path, "new-branch", 2, 7, Instant::now()),
+        GlyphPatch::Missing
+    );
+    {
+        let cache = glyph_cache().lock().unwrap_or_else(|e| e.into_inner());
+        let (row, timestamp) = cache.get(&path).unwrap();
+        assert_eq!((row.ahead, row.behind), (4, 6));
+        assert_eq!(*timestamp, scanned_at);
+    }
+    invalidate_glyphs(std::slice::from_ref(&path));
+    assert!(
+        !glyph_cache()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .contains_key(&path)
+    );
 }
 
 #[test]
