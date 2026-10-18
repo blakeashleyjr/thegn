@@ -317,7 +317,8 @@ fn short_throughput_history_is_right_aligned_and_scaled() {
     let (cols, _) = surface.dimensions();
     let right_x = (throughput.x + throughput.cols - 2).min(cols - 1);
     let graph_y = throughput.y + 3;
-    let cell = surface.screen_lines()[graph_y]
+    let screen_lines = surface.screen_lines();
+    let cell = screen_lines[graph_y]
         .visible_cells()
         .find(|cell| cell.cell_index() == right_x)
         .expect("rightmost graph cell exists");
