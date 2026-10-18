@@ -169,10 +169,12 @@ fn denied_and_absent_udisks_errors_remain_unavailable_with_the_reason() {
 
 #[test]
 fn smart_request_disables_interactive_authorization() {
-    assert!(matches!(
-        smart_options().get("auth.no_user_interaction"),
-        Some(zbus::zvariant::Value::Bool(true))
-    ));
+    assert_eq!(
+        smart_options()
+            .get("auth.no_user_interaction")
+            .and_then(|value| bool::try_from(value.clone()).ok()),
+        Some(true)
+    );
 }
 
 #[test]
