@@ -14,6 +14,8 @@ use crate::collect::{
     policy::hwmon_group::{parse_milli, plausible_input, wake_gate},
 };
 
+const TEXT_ATTRIBUTE_CAP: usize = 4096;
+
 #[derive(Debug)]
 struct Slot<H> {
     label: String,
@@ -91,13 +93,7 @@ impl<F: HwmonFs> BaseTemp<F> {
                     if let Some(milli) = parse_milli(&self.buffer[..length])
                         && let Some(value) = plausible_input(SensorKind::Temp, milli)
                     {
-                        if let Some((_, existing)) =
-                            values.iter_mut().find(|(label, _)| label == &slot.label)
-                        {
-                            *existing = value;
-                        } else {
-                            values.push((slot.label.clone(), value));
-                        }
+                        merge_temperature(&mut values, &slot.label, value);
                     }
                 }
                 Err(error) if matches!(error.raw_os_error(), Some(2 | 6 | 19)) => {
@@ -270,14 +266,27 @@ impl<F: HwmonFs> BaseTemp<F> {
 }
 
 fn read_text<F: HwmonFs>(fs: &mut F, path: &Path) -> Option<String> {
-    let mut buffer = [0; 256];
+    let mut buffer = [0; TEXT_ATTRIBUTE_CAP];
     let length = fs.read_small(path, &mut buffer).ok()?;
+    if length >= buffer.len() {
+        return None;
+    }
     Some(
         String::from_utf8(buffer[..length].to_vec())
             .ok()?
             .trim_end()
             .to_owned(),
     )
+}
+
+/// Preserve sysinfo's component behavior: keep the first label position and
+/// update it with each later valid reading in deterministic hwmon order.
+fn merge_temperature(values: &mut Vec<(String, f32)>, label: &str, value: f32) {
+    if let Some((_, existing)) = values.iter_mut().find(|(found, _)| found == label) {
+        *existing = value;
+    } else {
+        values.push((label.to_owned(), value));
+    }
 }
 
 fn format_label(name: &str, label: Option<&str>, model: Option<&str>, channel: u32) -> String {
@@ -525,6 +534,106 @@ mod tests {
         assert_eq!(matches.len(), 1);
         assert_eq!(matches[0].1, 33.0);
         assert_eq!(temps[3].0, "spd5118 temp1");
+    }
+
+    #[test]
+    fn long_labels_are_complete_and_over_cap_labels_use_generated_fallback() {
+        let mut reader = fixture();
+        let long_label = "x".repeat(300);
+        reader
+            .fs
+            .put("/fake/class/hwmon/hwmon5/name", b"longchip\n");
+        reader
+            .fs
+            .put("/fake/class/hwmon/hwmon5/temp1_input", b"33000\n");
+        reader.fs.put(
+            "/fake/class/hwmon/hwmon5/temp1_label",
+            format!("{long_label}\n").as_bytes(),
+        );
+        reader
+            .fs
+            .put("/fake/class/hwmon/hwmon6/name", b"fallback\n");
+        reader
+            .fs
+            .put("/fake/class/hwmon/hwmon6/temp1_input", b"34000\n");
+        reader.fs.put(
+            "/fake/class/hwmon/hwmon6/temp1_label",
+            format!("{}\n", "y".repeat(5000)).as_bytes(),
+        );
+
+        let temps = reader.fill();
+        assert!(
+            temps
+                .iter()
+                .any(|(label, value)| label == "fallback temp1" && *value == 34.0)
+        );
+        assert!(temps.iter().any(|(label, value)| {
+            label == &format!("longchip {long_label}") && *value == 33.0
+        }));
+    }
+
+    #[test]
+    fn duplicate_label_rule_table_keeps_first_position_and_last_valid_value() {
+        let cases = [
+            (
+                vec![("a", 10.0), ("b", 20.0), ("a", 30.0)],
+                vec![("a", 30.0), ("b", 20.0)],
+            ),
+            (
+                vec![("a", 10.0), ("a", 20.0), ("c", 30.0)],
+                vec![("a", 20.0), ("c", 30.0)],
+            ),
+        ];
+        for (readings, expected) in cases {
+            let mut values = Vec::new();
+            for (label, value) in readings {
+                super::merge_temperature(&mut values, label, value);
+            }
+            assert_eq!(
+                values,
+                expected
+                    .into_iter()
+                    .map(|(label, value)| (label.to_owned(), value))
+                    .collect::<Vec<_>>()
+            );
+        }
+    }
+
+    #[test]
+    fn duplicate_hwmon_label_keeps_earlier_value_when_later_reading_is_implausible() {
+        let mut reader = fixture();
+        reader
+            .fs
+            .put("/fake/class/hwmon/hwmon5/name", b"sharedchip\n");
+        reader
+            .fs
+            .put("/fake/class/hwmon/hwmon5/temp1_input", b"42000\n");
+        reader
+            .fs
+            .put("/fake/class/hwmon/hwmon5/temp1_label", b"shared\n");
+        reader
+            .fs
+            .put("/fake/class/hwmon/hwmon6/name", b"sharedchip\n");
+        reader
+            .fs
+            .put("/fake/class/hwmon/hwmon6/temp1_input", b"65261850\n");
+        reader
+            .fs
+            .put("/fake/class/hwmon/hwmon6/temp1_label", b"shared\n");
+
+        let temps = reader.fill();
+        assert_eq!(
+            temps
+                .iter()
+                .filter(|(label, _)| label == "sharedchip shared")
+                .count(),
+            1
+        );
+        assert!(
+            temps
+                .iter()
+                .any(|(label, value)| { label == "sharedchip shared" && *value == 42.0 })
+        );
     }
 
     #[test]

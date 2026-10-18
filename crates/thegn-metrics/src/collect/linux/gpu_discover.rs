@@ -62,6 +62,7 @@ pub struct GpuDevicesCollector<F: GpuFs = RealFs> {
     drm: PathBuf,
     accel: PathBuf,
     devices: Vec<DeviceReader<F::Handle>>,
+    duplicate_cards: Vec<(u32, String)>,
     accels: Vec<Accelerator>,
     last_discovery_ms: Option<u64>,
     generation: u64,
@@ -86,6 +87,7 @@ impl<F: GpuFs> GpuDevicesCollector<F> {
             drm: drm.into(),
             accel: accel.into(),
             devices: Vec::new(),
+            duplicate_cards: Vec::new(),
             accels: Vec::new(),
             last_discovery_ms: None,
             generation: 0,
@@ -115,8 +117,29 @@ impl<F: GpuFs> GpuDevicesCollector<F> {
             changed |= !present;
             present
         });
+        self.duplicate_cards.retain(|(card, slot)| {
+            cards.iter().any(|(index, _)| index == card)
+                && self.devices.iter().any(|reader| {
+                    reader.initialized && !reader.excluded && reader.device.slot == *slot
+                })
+        });
         self.truncated = false;
         for (index, card_path) in cards {
+            if let Some(remembered_slot) = self
+                .duplicate_cards
+                .iter()
+                .find(|(card, _)| *card == index)
+                .map(|(_, slot)| slot.clone())
+            {
+                let current_uevent = read_text(&mut self.fs, &card_path.join("device/uevent"));
+                let current_slot = current_uevent
+                    .as_deref()
+                    .and_then(|text| value(text, "PCI_SLOT_NAME"));
+                if current_slot == Some(remembered_slot.as_str()) {
+                    continue;
+                }
+                self.duplicate_cards.retain(|(card, _)| *card != index);
+            }
             if self
                 .devices
                 .iter()
@@ -166,6 +189,8 @@ impl<F: GpuFs> GpuDevicesCollector<F> {
                     !known.excluded && known.device.slot == self.devices[last].device.slot
                 })
             {
+                self.duplicate_cards
+                    .push((index, self.devices[last].device.slot.clone()));
                 self.devices.pop();
             }
         }
@@ -279,6 +304,10 @@ impl<F: GpuFs> Collector for GpuDevicesCollector<F> {
                             && known.device.slot == slot
                     });
                 if duplicate {
+                    self.duplicate_cards.push((
+                        self.devices[index].device.card,
+                        self.devices[index].device.slot.clone(),
+                    ));
                     self.devices.remove(index);
                     continue;
                 }
@@ -319,6 +348,7 @@ impl<F: GpuFs> Collector for GpuDevicesCollector<F> {
     }
     fn close(&mut self) {
         self.devices.clear();
+        self.duplicate_cards.clear();
         self.accels.clear();
         self.discovered = false;
         self.last_discovery_ms = None;

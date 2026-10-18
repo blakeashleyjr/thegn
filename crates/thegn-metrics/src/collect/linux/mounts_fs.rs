@@ -507,6 +507,13 @@ fn filesystem_kind(fstype: &str, mount: &str) -> Option<FilesystemKind> {
             | "lustre"
             | "gpfs"
             | "davfs"
+            | "virtiofs"
+            | "coda"
+            | "ocfs2"
+            | "gfs2"
+            | "orangefs"
+            | "pvfs2"
+            | "beegfs"
     ) || fstype == "fuse"
         || fstype == "fuseblk"
         || fstype.starts_with("fuse.")
