@@ -713,6 +713,7 @@ fn newest_powercap_and_amd_rail_samples_reach_the_last_graph_column() {
             .iter()
             .enumerate()
             .skip(graph_top)
+            .take(rails.rect.rows.saturating_sub(2 + super::RAIL_TABLE_ROWS))
             .filter(|(_, line)| {
                 tail_from_column(line, graph_left).starts_with(&format!("{label} "))
             })

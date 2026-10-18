@@ -133,7 +133,7 @@ pub(super) fn paint_rails(grid: &mut CellGrid, rect: Rect, model: &PowerModel) {
         ("system", model.system_w),
         ("battery", model.battery_w),
     ];
-    let mut row = rect.rows.saturating_sub(11);
+    let mut row = rect.rows.saturating_sub(super::RAIL_TABLE_ROWS);
     if matches!(model.powercap_health, Health::Absent(Absent::NoPermission)) {
         put_line(
             grid,
