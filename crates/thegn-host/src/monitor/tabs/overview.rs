@@ -106,6 +106,9 @@ const VARIANTS: [Variant; 1] = [Variant {
     min: (12, 5),
     pref: (32, 12),
 }];
+// At the 240-column target, a four-panel row gives each panel 60 cells and
+// the three-panel row gives 80. The raster uses two braille samples per cell.
+const HISTORY_BUCKETS: usize = 160;
 const SPECS: [PanelSpec; 8] = [
     PanelSpec {
         id: IDS[0],
@@ -202,7 +205,7 @@ impl OverviewModel {
                     metric,
                     window,
                     scale: TelemetryHistory::scale_for(metric, scale),
-                    buckets: 64,
+                    buckets: HISTORY_BUCKETS,
                     agg: Agg::Max,
                     now_ms,
                 });
@@ -373,21 +376,6 @@ impl TabView for OverviewView<'_> {
                 body.put_str(0, row, line, kit_style(tone));
             }
         }
-        let mut sparks = Vec::new();
-        if let Some(values) = self.0.sparks.get(index) {
-            let start = lines.len().saturating_add(1);
-            for (series_index, series) in values.iter().enumerate() {
-                let y = start + series_index;
-                if !series.is_empty() && y < content_rect.rows {
-                    sparks.push((
-                        series.as_slice(),
-                        content_rect.x,
-                        content_rect.y + y,
-                        content_rect.cols,
-                    ));
-                }
-            }
-        }
         let mut emitter = kit::emit::Emitter::default();
         emitter.emit(
             &grid,
@@ -396,19 +384,32 @@ impl TabView for OverviewView<'_> {
             rect.x,
             rect.y,
         );
-        for (values, x, y, cols) in sparks {
-            crate::monitor::graphs::paint_sparkline(
-                values,
-                cols,
-                PANELS[index].ramp,
-                Rect {
-                    x: rect.x + x,
-                    y: rect.y + y,
-                    cols,
-                    rows: 1,
-                },
-                surface,
-            );
+        let graph_y = content_rect.y + lines.len();
+        let graph_rows = content_rect.rows.saturating_sub(lines.len());
+        if graph_rows > 0
+            && let Some(values) = self.0.sparks.get(index)
+        {
+            let series_count = values.iter().filter(|series| !series.is_empty()).count();
+            let rows_per_series = (graph_rows / series_count.max(1)).max(1);
+            let mut series_row = 0;
+            for series in values.iter().filter(|series| !series.is_empty()) {
+                let rows = rows_per_series.min(graph_rows.saturating_sub(series_row));
+                if rows == 0 {
+                    break;
+                }
+                crate::monitor::graphs::paint_history_graph(
+                    series,
+                    PANELS[index].ramp,
+                    Rect {
+                        x: rect.x + content_rect.x,
+                        y: rect.y + graph_y + series_row,
+                        cols: content_rect.cols,
+                        rows,
+                    },
+                    surface,
+                );
+                series_row += rows;
+            }
         }
     }
 }

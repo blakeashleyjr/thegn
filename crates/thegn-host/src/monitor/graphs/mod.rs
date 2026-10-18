@@ -153,6 +153,45 @@ pub(crate) fn paint_sparkline(
     }
 }
 
+/// Paint retained telemetry history into a multi-row graph area.
+pub(crate) fn paint_history_graph(
+    values: &[f32],
+    ramp: RampId,
+    rect: crate::compositor::Rect,
+    surface: &mut termwiz::surface::Surface,
+) {
+    if values.is_empty() || rect.rows == 0 || rect.cols == 0 {
+        return;
+    }
+    let mut out = GraphOut::new();
+    graph::paint_graph(
+        &mut out,
+        graph::GraphPaint {
+            kind: graph::GraphKind::Area,
+            vals: values,
+            lo: None,
+            w: rect.cols,
+            h: rect.rows,
+            paint: Paint::Ramp {
+                id: ramp,
+                warn: 0.7,
+                crit: 0.9,
+            },
+        },
+        &crate::chrome::palette_snapshot(),
+    );
+    for (row, line) in out.lines.iter().enumerate() {
+        crate::seg::draw_line(
+            surface,
+            rect.x,
+            rect.y + row,
+            rect.cols,
+            line,
+            crate::seg::Tok::Slot(crate::chrome::S::Dim),
+        );
+    }
+}
+
 impl GraphOut {
     pub(crate) fn new() -> Self {
         Self::default()

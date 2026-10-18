@@ -238,14 +238,17 @@ fn shrinking_the_body_drops_lower_priority_panels_before_cpu() {
     let model = fixture();
     let mut observed_drop = false;
     for rows in 5..30 {
-        let (_, placed, _) = paint(&model, 100, rows);
-        if placed.len() < 8 {
+        let view = OverviewView(&model);
+        let solution = Board::default().solve(&view, Rect::full(100, rows));
+        if !solution.dropped.is_empty() {
             observed_drop = true;
             assert!(
-                placed
+                solution
+                    .placed
                     .iter()
                     .any(|panel| panel.id == PanelId("overview.cpu"))
             );
+            assert!(!solution.dropped.contains(&PanelId("overview.cpu")));
         }
     }
     assert!(observed_drop, "fixture never reached a constrained layout");
