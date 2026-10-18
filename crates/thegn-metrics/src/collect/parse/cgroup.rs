@@ -49,17 +49,20 @@ pub fn single_u64(input: &[u8]) -> Option<u64> {
 }
 
 pub fn pids_max(input: &[u8]) -> Option<Limit> {
-    let value = fields(input).next()?;
-    if value == b"max" {
-        Some(Limit::Max)
-    } else {
-        parse_u64(value).map(Limit::Value)
-    }
+    limit(input)
 }
 
 /// Parse memory.{max,high}; malformed or empty values remain absent.
 pub fn memory_limit(input: &[u8]) -> Option<Limit> {
-    let value = fields(input).next()?;
+    limit(input)
+}
+
+fn limit(input: &[u8]) -> Option<Limit> {
+    let mut values = fields(input);
+    let value = values.next()?;
+    if values.next().is_some() {
+        return None;
+    }
     if value == b"max" {
         Some(Limit::Max)
     } else {
@@ -199,6 +202,7 @@ mod tests {
         assert_eq!(memory_limit(b"max\n"), Some(Limit::Max));
         assert_eq!(memory_limit(b""), None);
         assert_eq!(memory_limit(b"not-a-limit\n"), None);
+        assert_eq!(memory_limit(b"8192 junk\n"), None);
     }
 
     #[test]

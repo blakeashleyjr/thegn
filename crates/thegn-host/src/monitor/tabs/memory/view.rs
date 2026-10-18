@@ -129,6 +129,7 @@ pub(in crate::monitor) struct MemoryModel {
     pub slice_max: Option<thegn_metrics::collect::model::cgroup::Limit>,
     pub effective_limit: Option<thegn_metrics::collect::model::cgroup::Limit>,
     pub own_current: Option<u64>,
+    limit_history: MemoryHistory,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -209,6 +210,7 @@ impl Default for MemoryModel {
             slice_max: None,
             effective_limit: None,
             own_current: None,
+            limit_history: MemoryHistory::default(),
         }
     }
 }
@@ -316,6 +318,14 @@ impl MemoryModel {
         self.slice_max = slice.sample.mem_max;
         self.effective_limit = slice.effective_limit;
         self.own_current = slice.own_current;
+        if let (Some(current), Some(limit)) = (
+            slice.sample.mem_current,
+            min_numeric_limit(slice.sample.mem_max, slice.sample.mem_high),
+        ) && limit > 0
+        {
+            self.limit_history
+                .push((current as f32 / limit as f32).clamp(0.0, 1.0));
+        }
     }
 }
 
@@ -335,7 +345,7 @@ impl TabView for MemoryView<'_> {
     }
 
     fn template(&self) -> Node {
-        let mut panels = vec![COMPOSITION, VERDICT, PRESSURE, PAGING, LIMIT];
+        let mut panels = vec![COMPOSITION, VERDICT, PRESSURE, PAGING];
         if self.0.swap_total.is_some_and(|total| total > 0) {
             panels.push(SWAP);
         }
@@ -358,6 +368,7 @@ impl TabView for MemoryView<'_> {
                         .collect(),
                 ),
             ),
+            (Size::Fixed(6), Node::Panel(LIMIT)),
         ])
     }
 
@@ -467,7 +478,7 @@ impl MemoryView<'_> {
                     fmt: NumFmt::default(),
                 },
             );
-        } else if (used.is_none() || ceiling.is_none()) && body.rows > 1 {
+        } else if (self.0.effective_limit.is_none() || used.is_none()) && body.rows > 1 {
             grid.view(Rect {
                 x: body.x,
                 y: body.y + 1,
@@ -481,8 +492,14 @@ impl MemoryView<'_> {
                 Default::default(),
             );
         }
-        let slice_limit =
-            numeric_limit(self.0.slice_high).or_else(|| numeric_limit(self.0.slice_max));
+        let slice_limit = match (
+            numeric_limit(self.0.slice_high),
+            numeric_limit(self.0.slice_max),
+        ) {
+            (Some(high), Some(max)) => Some(high.min(max)),
+            (Some(limit), None) | (None, Some(limit)) => Some(limit),
+            (None, None) => None,
+        };
         let slice_text = match (self.0.slice_current, slice_limit) {
             (Some(current), Some(limit)) => format!(
                 "thegn.slice {} / {}",
@@ -493,7 +510,11 @@ impl MemoryView<'_> {
                 if self.0.slice_high == Some(Limit::Max)
                     && self.0.slice_max == Some(Limit::Max) =>
             {
-                format!("thegn.slice {} · no limit", fmt_bytes(Some(current)))
+                format!(
+                    "thegn.slice {} {} no limit",
+                    fmt_bytes(Some(current)),
+                    crate::caps::active_glyphs().middot
+                )
             }
             (Some(current), None) => format!(
                 "thegn.slice {} / {}",
@@ -532,6 +553,39 @@ impl MemoryView<'_> {
                     fmt: NumFmt::default(),
                 },
             );
+        }
+        if body.rows > 4 && self.0.limit_history.len > 1 {
+            grid.view(Rect {
+                x: body.x,
+                y: body.y + 4,
+                cols: body.cols,
+                rows: 1,
+            })
+            .put_str(0, 0, "thegn.slice usage history", Default::default());
+            if body.rows > 5 {
+                let mut used = [0.0_f32; HISTORY_CAPACITY];
+                let (len, _) = self.0.limit_history.copy_recent(&mut used);
+                let available = used.map(|value| 1.0 - value.clamp(0.0, 1.0));
+                let chart = Rect {
+                    x: body.x,
+                    y: body.y + 5,
+                    cols: body.cols,
+                    rows: body.rows - 5,
+                };
+                let mut raster = CellBuf::new();
+                raster.reset(chart.cols, chart.rows);
+                viz_raster::stacked(
+                    &[&used[..len], &available[..len]],
+                    viz_raster::RasterTable::for_level(crate::caps::unicode_level()),
+                    &mut raster,
+                );
+                draw_raster(
+                    grid,
+                    chart,
+                    &raster,
+                    RasterStyle::Series(&[SeriesRole::MemAnon, SeriesRole::MemFree]),
+                );
+            }
         }
     }
 
@@ -1022,6 +1076,17 @@ fn numeric_limit(limit: Option<thegn_metrics::collect::model::cgroup::Limit>) ->
     match limit {
         Some(thegn_metrics::collect::model::cgroup::Limit::Value(value)) => Some(value),
         Some(thegn_metrics::collect::model::cgroup::Limit::Max) | None => None,
+    }
+}
+
+fn min_numeric_limit(
+    left: Option<thegn_metrics::collect::model::cgroup::Limit>,
+    right: Option<thegn_metrics::collect::model::cgroup::Limit>,
+) -> Option<u64> {
+    match (numeric_limit(left), numeric_limit(right)) {
+        (Some(left), Some(right)) => Some(left.min(right)),
+        (Some(limit), None) | (None, Some(limit)) => Some(limit),
+        (None, None) => None,
     }
 }
 
