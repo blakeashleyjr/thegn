@@ -468,6 +468,7 @@ pub struct MonitorOverlay {
     /// `rows - CHROME_ROWS`. What [`Self::scroll_max`] measures against.
     body_rows: usize,
     board: board::Board,
+    gpu: tabs::gpu::view::GpuModel,
     overview: tabs::overview::OverviewModel,
     cpu: tabs::cpu::view::CpuModel,
     power: tabs::power::view::PowerModel,
@@ -530,6 +531,7 @@ impl MonitorOverlay {
             screen: ctx.screen,
             body_rows: rows.saturating_sub(CHROME_ROWS),
             board: board::Board::default(),
+            gpu: tabs::gpu::view::GpuModel::default(),
             overview: tabs::overview::OverviewModel::default(),
             cpu: tabs::cpu::view::CpuModel::default(),
             power: tabs::power::view::PowerModel::default(),
@@ -612,6 +614,10 @@ impl MonitorOverlay {
     fn view(&self) -> board::ActiveView<'_> {
         match self.tab {
             MonitorTab::Cpu => board::ActiveView::Cpu(tabs::cpu::view::CpuView(&self.cpu)),
+            MonitorTab::Gpu if !self.gpu.has_engine_devices() => {
+                board::ActiveView::Legacy(board::LegacyTab)
+            }
+            MonitorTab::Gpu => board::ActiveView::Gpu(tabs::gpu::view::GpuView(&self.gpu)),
             MonitorTab::Power => {
                 board::ActiveView::Power(tabs::power::view::PowerView(&self.power))
             }
@@ -633,6 +639,10 @@ impl MonitorOverlay {
         }
         if self.tab == MonitorTab::Cpu {
             self.cpu.absorb_frame(frame);
+            return true;
+        }
+        if self.tab == MonitorTab::Gpu {
+            self.gpu.absorb_frame(frame);
             return true;
         }
         if self.tab == MonitorTab::Power {

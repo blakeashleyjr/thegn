@@ -64,6 +64,18 @@ pub(super) struct BusyHistory {
     pub(super) vcn_values: [f32; HISTORY_CAP],
     pub(super) vcn_next: usize,
     pub(super) vcn_len: usize,
+    pub(super) memory: [f32; HISTORY_CAP],
+    pub(super) memory_next: usize,
+    pub(super) memory_len: usize,
+    pub(super) gtt: [f32; HISTORY_CAP],
+    pub(super) gtt_next: usize,
+    pub(super) gtt_len: usize,
+    pub(super) clocks: [f32; HISTORY_CAP],
+    pub(super) clocks_next: usize,
+    pub(super) clocks_len: usize,
+    pub(super) power: [f32; HISTORY_CAP],
+    pub(super) power_next: usize,
+    pub(super) power_len: usize,
 }
 
 impl BusyHistory {
@@ -76,6 +88,18 @@ impl BusyHistory {
             vcn_values: [0.0; HISTORY_CAP],
             vcn_next: 0,
             vcn_len: 0,
+            memory: [0.0; HISTORY_CAP],
+            memory_next: 0,
+            memory_len: 0,
+            gtt: [0.0; HISTORY_CAP],
+            gtt_next: 0,
+            gtt_len: 0,
+            clocks: [0.0; HISTORY_CAP],
+            clocks_next: 0,
+            clocks_len: 0,
+            power: [0.0; HISTORY_CAP],
+            power_next: 0,
+            power_len: 0,
         }
     }
 
@@ -106,6 +130,25 @@ impl BusyHistory {
         }
         self.vcn_len
     }
+
+    fn push_ring(values: &mut [f32; HISTORY_CAP], next: &mut usize, len: &mut usize, value: f32) {
+        values[*next] = value;
+        *next = (*next + 1) % HISTORY_CAP;
+        *len = (*len).saturating_add(1).min(HISTORY_CAP);
+    }
+
+    fn ordered_ring(
+        values: &[f32; HISTORY_CAP],
+        next: usize,
+        len: usize,
+        output: &mut [f32; HISTORY_CAP],
+    ) -> usize {
+        let start = (next + HISTORY_CAP - len) % HISTORY_CAP;
+        for (offset, value) in output.iter_mut().take(len).enumerate() {
+            *value = values[(start + offset) % HISTORY_CAP];
+        }
+        len
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -134,6 +177,10 @@ impl Default for GpuModel {
 }
 
 impl GpuModel {
+    pub(crate) fn has_engine_devices(&self) -> bool {
+        !matches!(self.engine_health, Health::Absent(_))
+    }
+
     pub(in crate::monitor) fn absorb_frame(&mut self, frame: &MonitorFrame) {
         copy_rows(
             &mut self.devices.devices,
@@ -188,6 +235,73 @@ impl GpuModel {
             {
                 history.push_vcn(f32::from(busy) / 100.0);
             }
+            if row.runtime_status == RuntimeStatus::Active {
+                if let (Some(used), Some(total)) = (row.vram_used, row.vram_total)
+                    && total > 0
+                {
+                    BusyHistory::push_ring(
+                        &mut history.memory,
+                        &mut history.memory_next,
+                        &mut history.memory_len,
+                        (used as f64 / total as f64).clamp(0.0, 1.0) as f32,
+                    );
+                }
+                if let (Some(used), Some(total)) = (row.gtt_used, row.gtt_total)
+                    && total > 0
+                {
+                    BusyHistory::push_ring(
+                        &mut history.gtt,
+                        &mut history.gtt_next,
+                        &mut history.gtt_len,
+                        (used as f64 / total as f64).clamp(0.0, 1.0) as f32,
+                    );
+                }
+                let gfx_max = row
+                    .sclk
+                    .levels_mhz
+                    .iter()
+                    .take(usize::from(row.sclk.len).min(row.sclk.levels_mhz.len()))
+                    .copied()
+                    .max();
+                if let (Some(current), Some(max)) = (row.sclk.current_mhz, gfx_max)
+                    && max > 0
+                {
+                    BusyHistory::push_ring(
+                        &mut history.clocks,
+                        &mut history.clocks_next,
+                        &mut history.clocks_len,
+                        (current as f32 / max as f32).clamp(0.0, 1.0),
+                    );
+                }
+                let device_card = self
+                    .devices
+                    .devices
+                    .iter()
+                    .find(|device| device.slot == slot)
+                    .map(|device| device.card);
+                let metrics = device_card.and_then(|card| {
+                    self.smu
+                        .cards
+                        .iter()
+                        .find(|reading| u32::from(reading.card) == card && !reading.suspended)
+                        .map(|reading| &reading.metrics)
+                });
+                if let Some(metrics) = metrics
+                    && let (Some(watts_mw), Some(cap_w)) = (
+                        metrics.power_socket,
+                        metrics
+                            .power_current_stapm_limit
+                            .filter(|watts| *watts > 0 && *watts != u32::MAX),
+                    )
+                {
+                    BusyHistory::push_ring(
+                        &mut history.power,
+                        &mut history.power_next,
+                        &mut history.power_len,
+                        (watts_mw as f32 / (cap_w as f32 * 1000.0)).clamp(0.0, 1.0),
+                    );
+                }
+            }
         }
     }
 }
@@ -240,6 +354,7 @@ impl TabView for GpuView<'_> {
             }
             CLOCKS => {
                 demand.insert(CollectorId::GpuEngines);
+                demand.insert(CollectorId::GpuDevices);
                 demand.insert(CollectorId::AmdSmu);
             }
             _ => {}
@@ -280,6 +395,10 @@ impl TabView for GpuView<'_> {
         );
         if placed.id == ENGINES {
             self.paint_busy_history(surface, rect, body);
+        } else if placed.id == MEMORY {
+            self.paint_aux_history(surface, rect, body, true);
+        } else if placed.id == CLOCKS {
+            self.paint_aux_history(surface, rect, body, false);
         }
     }
 }
