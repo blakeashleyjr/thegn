@@ -208,6 +208,7 @@ pub mod managed_ssh;
 pub mod managed_tool;
 pub mod mcp;
 pub mod media;
+pub mod mem_health;
 pub mod merge_classify;
 pub mod merge_guard;
 pub mod merge_lifecycle;
