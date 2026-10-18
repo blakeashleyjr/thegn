@@ -283,6 +283,19 @@ pub(crate) fn persist_critical(job: impl FnOnce(&Db) + Send + 'static) {
     persist_critical_for(writer(), job);
 }
 
+#[cfg(test)]
+pub(crate) fn persist_critical_to_closed_writer_for_test(
+    job: impl FnOnce(&Db) + Send + 'static,
+) -> bool {
+    let (tx, rx) = channel();
+    drop(rx);
+    let writer = Writer {
+        tx,
+        state: Arc::new(QueueState::default()),
+    };
+    persist_critical_for(&writer, job)
+}
+
 fn persist_critical_for(writer: &Writer, job: impl FnOnce(&Db) + Send + 'static) -> bool {
     writer.state.depth.fetch_add(1, Ordering::AcqRel);
     if let Err(error) = writer.tx.send(Msg::RunCritical(QueuedJob {
