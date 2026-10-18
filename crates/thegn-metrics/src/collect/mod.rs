@@ -56,6 +56,7 @@ pub enum CollectorId {
     Netdev,
     NetWifi,
     NetSockets,
+    ContainersStats,
     Diskstats,
     Powercap,
     PowerSupply,
@@ -71,7 +72,7 @@ pub enum CollectorId {
 }
 
 impl CollectorId {
-    pub const ALL: [Self; 26] = [
+    pub const ALL: [Self; 27] = [
         Self::Loadavg,
         Self::Uptime,
         Self::Psi,
@@ -86,6 +87,7 @@ impl CollectorId {
         Self::Netdev,
         Self::NetWifi,
         Self::NetSockets,
+        Self::ContainersStats,
         Self::Diskstats,
         Self::Powercap,
         Self::PowerSupply,
@@ -116,6 +118,7 @@ impl CollectorId {
             Self::Netdev => "netdev",
             Self::NetWifi => "net_wifi",
             Self::NetSockets => "net_sockets",
+            Self::ContainersStats => "containers_stats",
             Self::Diskstats => "diskstats",
             Self::Powercap => "powercap",
             Self::PowerSupply => "power_supply",
@@ -136,7 +139,10 @@ impl CollectorId {
     }
 
     pub const fn visible_only(self) -> bool {
-        matches!(self, Self::GpuClients | Self::NetSockets)
+        matches!(
+            self,
+            Self::GpuClients | Self::NetSockets | Self::ContainersStats
+        )
     }
 }
 
@@ -224,6 +230,8 @@ pub fn default_collectors() -> Vec<Box<dyn Collector>> {
     collectors[CollectorId::NetWifi.index()] = Box::new(linux::net_wifi::NetWifiCollector::new());
     collectors[CollectorId::NetSockets.index()] =
         Box::new(linux::net_sockets::NetSocketsCollector::new());
+    collectors[CollectorId::ContainersStats.index()] =
+        Box::new(linux::containers_stats::ContainersStatsCollector::default());
     collectors[CollectorId::Diskstats.index()] = Box::new(
         linux::diskstats::DiskstatsCollector::at("/proc/diskstats", "/sys/block"),
     );
@@ -266,6 +274,7 @@ mod default_collectors_tests {
         let collectors = default_collectors();
         let ids: Vec<_> = collectors.iter().map(|collector| collector.id()).collect();
         assert_eq!(ids.as_slice(), CollectorId::ALL.as_slice());
+        assert!(CollectorId::ContainersStats.visible_only());
         for id in [
             CollectorId::Loadavg,
             CollectorId::Uptime,
@@ -283,6 +292,7 @@ mod default_collectors_tests {
             CollectorId::CpuTopology,
             CollectorId::NetWifi,
             CollectorId::NetSockets,
+            CollectorId::ContainersStats,
             CollectorId::Filesystems,
             CollectorId::GpuDevices,
             CollectorId::GpuEngines,
