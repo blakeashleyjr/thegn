@@ -905,7 +905,7 @@ mod tests {
         ));
 
         results.clear();
-        run_host_add(request(name), Err("write failed".into()), |result| {
+        run_host_add(request(name, hc), Err("write failed".into()), |result| {
             results.push(result)
         });
         assert!(matches!(
