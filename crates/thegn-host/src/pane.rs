@@ -30,8 +30,9 @@ enum PaneIo {
     /// A local child on a pseudo-terminal. `stdin` is the bounded queue to the
     /// pane's dedicated writer thread (see [`crate::pane_writer`]): the raw
     /// PTY writer blocks once the child stops draining stdin, so it never
-    /// lives on the event loop. `master` stays for resize — an ioctl on a
-    /// different channel, needing no ordering with stdin.
+    /// lives on the event loop. `master` stays available for resize — an ioctl
+    /// on a different channel, needing no ordering with stdin — until pane
+    /// Drop moves it into the reaper parcel.
     Pty {
         master: Option<Box<dyn MasterPty + Send>>,
         stdin: crate::pane_writer::StdinTx,
