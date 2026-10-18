@@ -291,10 +291,11 @@ impl<F: SupplyFs> SupplyReader<F> {
             {
                 self.counters.reads += 2;
             }
-            let status_bytes = read_slot(fs, &supply.handles[0], &mut buffer)?;
-            let capacity_bytes = read_slot(fs, &supply.handles[1], &mut buffer)?;
-            let status = status_bytes.and_then(SupplyStatus::parse);
-            let capacity = capacity_bytes.and_then(parse_u64).and_then(to_u8);
+            let status =
+                read_slot(fs, &supply.handles[0], &mut buffer)?.and_then(SupplyStatus::parse);
+            let capacity = read_slot(fs, &supply.handles[1], &mut buffer)?
+                .and_then(parse_u64)
+                .and_then(to_u8);
             status_ac |= matches!(
                 status,
                 Some(SupplyStatus::Charging | SupplyStatus::Full | SupplyStatus::NotCharging)
