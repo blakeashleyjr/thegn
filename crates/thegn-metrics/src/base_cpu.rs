@@ -1,11 +1,11 @@
 //! Base-tier Linux CPU usage from the shared `/proc/stat` parser.
 
-use std::io;
 use std::path::{Path, PathBuf};
 
 use crate::collect::linux::procfile::ProcFile;
 use crate::collect::parse::stat::{CpuTicks, StatRaw, parse_stat};
 
+// Keep this aligned with sample.rs's SLOW_EVERY cadence.
 const REOPEN_EVERY: u64 = 5;
 
 #[derive(Debug)]
@@ -42,28 +42,33 @@ impl BaseCpu {
         }
     }
 
-    pub(crate) fn fill(&mut self, primed: &mut bool) -> (Option<u8>, Vec<u8>) {
+    pub(crate) fn fill(&mut self, primed: &mut bool) -> (Option<f32>, Vec<f32>) {
         let tick = self.tick;
         self.tick = self.tick.saturating_add(1);
         if self.file.is_none() && tick.is_multiple_of(REOPEN_EVERY) {
             self.file = self.open_file();
         }
-        let read = self.read_once();
-        let bytes = match read {
-            Some(Ok(bytes)) => Some(bytes),
-            Some(Err(_error)) => {
-                if self.file.as_ref().is_some_and(ProcFile::needs_reopen) {
-                    self.file = None;
-                }
-                None
-            }
-            None => None,
-        };
-        let Some(bytes) = bytes else {
+        let Some(file) = self.file.as_mut() else {
             *primed = true;
             return (None, Vec::new());
         };
-        self.fill_bytes(primed, &bytes)
+        #[cfg(test)]
+        {
+            self.read_count = self.read_count.saturating_add(1);
+        }
+        let read = file
+            .read_all()
+            .map(|bytes| parse_stat(bytes, &mut self.raw));
+        match read {
+            Ok(()) => self.fill_parsed(primed),
+            Err(_error) => {
+                if self.file.as_ref().is_some_and(ProcFile::needs_reopen) {
+                    self.file = None;
+                }
+                *primed = true;
+                (None, Vec::new())
+            }
+        }
     }
 
     fn open_file(&mut self) -> Option<ProcFile> {
@@ -71,23 +76,16 @@ impl BaseCpu {
         {
             self.open_count = self.open_count.saturating_add(1);
         }
-        match ProcFile::open(&self.path) {
-            Ok(file) => Some(file),
-            Err(_error) => None,
-        }
+        ProcFile::open(&self.path).ok()
     }
 
-    fn read_once(&mut self) -> Option<io::Result<Vec<u8>>> {
-        let file = self.file.as_mut()?;
-        #[cfg(test)]
-        {
-            self.read_count = self.read_count.saturating_add(1);
-        }
-        Some(file.read_all().map(|bytes| bytes.to_vec()))
-    }
-
-    fn fill_bytes(&mut self, primed: &mut bool, bytes: &[u8]) -> (Option<u8>, Vec<u8>) {
+    #[cfg(test)]
+    fn fill_bytes(&mut self, primed: &mut bool, bytes: &[u8]) -> (Option<f32>, Vec<f32>) {
         parse_stat(bytes, &mut self.raw);
+        self.fill_parsed(primed)
+    }
+
+    fn fill_parsed(&mut self, primed: &mut bool) -> (Option<f32>, Vec<f32>) {
         let Some(global) = self.raw.total else {
             *primed = true;
             return (None, Vec::new());
@@ -99,20 +97,21 @@ impl BaseCpu {
             return (None, Vec::new());
         };
 
-        let global_pct = usage(previous_global, global).map(pct_u8);
+        let global_pct = usage(previous_global, global);
         let max_id = self.raw.cpus.iter().map(|(id, _)| usize::from(*id)).max();
         let Some(max_id) = max_id else {
             self.update_previous_cpus();
             *primed = true;
             return (global_pct, Vec::new());
         };
-        let mut cores = vec![0; max_id + 1];
+        // A missing CPU slot is represented as zero in the fenced snapshot field.
+        let mut cores = vec![0.0; max_id + 1];
         for (id, current) in &self.raw.cpus {
             let index = usize::from(*id);
             if let Some(previous) = self.previous_cpus.get(index).copied().flatten()
                 && let Some(value) = usage(previous, *current)
             {
-                cores[index] = pct_u8(value);
+                cores[index] = value;
             }
         }
         self.update_previous_cpus();
@@ -121,6 +120,7 @@ impl BaseCpu {
     }
 
     fn update_previous_cpus(&mut self) {
+        self.previous_cpus.fill(None);
         if let Some((last_id, _)) = self.raw.cpus.last() {
             self.previous_cpus.resize(usize::from(*last_id) + 1, None);
         }
@@ -135,9 +135,10 @@ impl BaseCpu {
 }
 
 fn usage(previous: CpuTicks, current: CpuTicks) -> Option<f32> {
+    let raw_delta = current.checked_delta(previous)?;
     let previous = previous.corrected();
     let current = current.corrected();
-    let delta = current.checked_delta(previous)?;
+    let delta = raw_delta.corrected();
     let virtual_delta = current
         .guest
         .saturating_add(current.guest_nice)
@@ -174,10 +175,6 @@ fn usage(previous: CpuTicks, current: CpuTicks) -> Option<f32> {
         / total;
     let steal_and_guest = delta.steal.saturating_add(virtual_delta) as f32 / total;
     Some(((nice + user + system + steal_and_guest) * 100.0).min(100.0))
-}
-
-fn pct_u8(value: f32) -> u8 {
-    value.round().clamp(0.0, 100.0) as u8
 }
 
 #[cfg(test)]

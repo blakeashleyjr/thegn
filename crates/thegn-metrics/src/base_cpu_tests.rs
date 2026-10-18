@@ -24,9 +24,9 @@ fn fixture_deltas_match_sysinfo_busy_formula_for_global_and_each_core() {
     // busy = 720 and total = 2400 (30%). Guest is subtracted from user and
     // added back as virtual time; guest is unchanged between these fixtures.
     // iowait is also unchanged, and when it changes sysinfo counts it as idle.
-    assert_eq!(global, Some(30));
+    assert_eq!(global, Some(30.0));
     // Each core has +20 user, +10 steal, and +70 idle: 30 / 100 = 30%.
-    assert_eq!(cores, vec![30; 24]);
+    assert_eq!(cores, vec![30.0; 24]);
 }
 
 #[test]
@@ -74,6 +74,50 @@ fn guest_ticks_count_as_busy_and_iowait_counts_as_idle() {
         usage(previous, current)
             .is_some_and(|value| (value - (50.0 / 110.0 * 100.0)).abs() < 0.001)
     );
+}
+
+#[test]
+fn monotonic_raw_counters_survive_a_corrected_user_regression() {
+    let previous = CpuTicks {
+        user: 100,
+        idle: 100,
+        guest: 50,
+        ..CpuTicks::default()
+    };
+    let current = CpuTicks {
+        user: 101,
+        idle: 108,
+        guest: 52,
+        ..CpuTicks::default()
+    };
+    let value = usage(previous, current).expect("raw counters are monotonic");
+    assert!((value - (2.0 / 9.0 * 100.0)).abs() < 0.001);
+}
+
+#[test]
+fn fixture_core_with_guest_and_iowait_deltas_keeps_its_index() {
+    let first = b"cpu 300 0 0 300 0 0 0 0 0 0\ncpu0 100 0 0 100 0 0 0 0 0 0\ncpu1 100 0 0 100 0 0 0 0 0 0\ncpu2 100 0 0 100 0 0 0 0 0 0\n";
+    let second = b"cpu 390 0 0 500 10 0 0 0 10 0\ncpu0 110 0 0 190 0 0 0 0 0 0\ncpu1 130 0 0 160 10 0 0 0 10 0\ncpu2 150 0 0 150 0 0 0 0 0 0\n";
+    let mut reader = BaseCpu::with_path("unused");
+    let mut primed = false;
+    assert_eq!(reader.fill_bytes(&mut primed, first), (None, Vec::new()));
+    let (_, cores) = reader.fill_bytes(&mut primed, second);
+    assert_eq!(cores, vec![10.0, 30.0, 50.0]);
+    assert_eq!(cores[1], 30.0);
+}
+
+#[test]
+fn returning_cpu_is_primed_after_an_offline_sample() {
+    let mut reader = BaseCpu::with_path("unused");
+    let first = b"cpu 200 0 0 200\ncpu0 100 0 0 100\ncpu1 100 0 0 100\n";
+    let offline = b"cpu 200 0 0 200\ncpu0 100 0 0 100\n";
+    let returned = b"cpu 210 0 0 210\ncpu0 105 0 0 105\ncpu1 110 0 0 110\n";
+    let mut primed = false;
+    reader.fill_bytes(&mut primed, first);
+    let (_, missing) = reader.fill_bytes(&mut primed, offline);
+    assert_eq!(missing, vec![0.0]);
+    let (_, back) = reader.fill_bytes(&mut primed, returned);
+    assert_eq!(back, vec![50.0, 0.0]);
 }
 
 #[test]
