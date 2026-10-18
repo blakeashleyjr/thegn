@@ -161,7 +161,7 @@ impl Collector for CpuIrqCollector {
         part.thr_per_s = None;
         part.mce_per_s = None;
         part.dfr_per_s = None;
-        let mut soft_order = [0_usize, 1, 2];
+        let mut soft_order: [usize; 10] = std::array::from_fn(|row| row);
         let mut soft_totals = [None; 10];
         if self.primed {
             for (row, total) in soft_totals.iter_mut().enumerate() {
@@ -178,7 +178,7 @@ impl Collector for CpuIrqCollector {
                     .partial_cmp(&soft_totals[*left])
                     .unwrap_or(std::cmp::Ordering::Equal)
             });
-            for (slot, &row) in soft_order.iter().enumerate() {
+            for (slot, &row) in soft_order[..part.softirq_top.len()].iter().enumerate() {
                 part.softirq_top[slot] = SoftirqTop {
                     name_hash: interrupts::name_hash(softirqs::TYPES[row]),
                     total_per_s: soft_totals[row],
@@ -191,7 +191,7 @@ impl Collector for CpuIrqCollector {
                 ..CoreIrqSample::default()
             };
             if self.primed {
-                for (slot, &row) in soft_order.iter().enumerate() {
+                for (slot, &row) in soft_order[..core.softirq_per_s.len()].iter().enumerate() {
                     core.softirq_per_s[slot] = soft_cell_rate(
                         &self.soft,
                         &self.previous_soft,
@@ -511,9 +511,76 @@ mod tests {
             .cpu_irq
             .softirq_top
             .iter()
-            .position(|top| top.name_hash == interrupts::name_hash(b"TIMER"))
+            .position(|top| top.name_hash == interrupts::name_hash(b"TIMER"));
+        if let Some(slot) = timer_slot {
+            assert_eq!(frame.parts.cpu_irq.softirq_top[slot].total_per_s, None);
+            assert_eq!(frame.parts.cpu_irq.cores[0].softirq_per_s[slot], None);
+        }
+
+        let mut previous = crate::collect::parse::softirqs::SoftirqTable::default();
+        let mut current = crate::collect::parse::softirqs::SoftirqTable::default();
+        assert!(crate::collect::parse::softirqs::parse(
+            b" CPU0 CPU1\nTIMER: 20 30\n",
+            &mut previous,
+        ));
+        assert!(crate::collect::parse::softirqs::parse(
+            b" CPU0 CPU1\nTIMER: 5 50\n",
+            &mut current,
+        ));
+        assert_eq!(
+            super::soft_cell_rate(&current, &previous, 1, 0, Some(6001), 11002),
+            None
+        );
+    }
+
+    #[test]
+    fn ranks_all_softirq_types_for_top_three_and_core_rates() {
+        let dir = tempfile::tempdir().unwrap();
+        let soft = dir.path().join("softirqs");
+        let irq = dir.path().join("interrupts");
+        fs::write(&soft, b" CPU0 CPU1\nHI: 0 0\nTIMER: 0 0\nNET_TX: 0 0\nNET_RX: 0 0\nBLOCK: 0 0\nIRQ_POLL: 0 0\nTASKLET: 0 0\nSCHED: 0 0\nHRTIMER: 0 0\nRCU: 0 0\n").unwrap();
+        fs::write(
+            &irq,
+            b" CPU0 CPU1\nRES: 0 0\nCAL: 0 0\nTLB: 0 0\nLOC: 0 0\n",
+        )
+        .unwrap();
+
+        let mut collector = CpuIrqCollector::at(&soft, &irq);
+        assert_eq!(collector.discover(&Env::default()), Health::Warming);
+        let mut frame = MonitorFrame::default();
+        collector
+            .sample(
+                &TickCtx {
+                    tick: 1,
+                    now_ms: 1000,
+                },
+                &mut frame,
+            )
             .unwrap();
-        assert_eq!(frame.parts.cpu_irq.cores[0].softirq_per_s[timer_slot], None);
+
+        let write = |path: &std::path::Path, bytes: &[u8]| {
+            let file = fs::OpenOptions::new().write(true).open(path).unwrap();
+            file.set_len(0).unwrap();
+            file.write_at(bytes, 0).unwrap();
+        };
+        write(&soft, b" CPU0 CPU1\nHI: 1 0\nTIMER: 2 0\nNET_TX: 3 0\nNET_RX: 4 0\nBLOCK: 5 0\nIRQ_POLL: 6 0\nTASKLET: 7 0\nSCHED: 8 0\nHRTIMER: 9 0\nRCU: 100 0\n");
+        collector
+            .sample(
+                &TickCtx {
+                    tick: 2,
+                    now_ms: 2000,
+                },
+                &mut frame,
+            )
+            .unwrap();
+
+        assert_eq!(
+            frame.parts.cpu_irq.softirq_top[0].name_hash,
+            interrupts::name_hash(b"RCU")
+        );
+        assert_eq!(frame.parts.cpu_irq.softirq_top[0].total_per_s, Some(100.0));
+        assert_eq!(frame.parts.cpu_irq.cores[0].softirq_per_s[0], Some(100.0));
+        assert_eq!(frame.parts.cpu_irq.cores[1].softirq_per_s[0], Some(0.0));
     }
 
     #[test]
