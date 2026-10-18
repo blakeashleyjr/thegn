@@ -535,7 +535,7 @@ fn paint_heat_panel(
         body.put_str(
             area.cols.saturating_sub(modes.len()),
             y,
-            &modes,
+            modes,
             CellStyle::default(),
         );
     } else {
