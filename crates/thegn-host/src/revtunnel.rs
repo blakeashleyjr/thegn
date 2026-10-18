@@ -48,6 +48,9 @@ pub(crate) fn report_rejection_counts(interval_seconds: f64) {
         lifetime: current.lifetime.saturating_sub(previous.lifetime),
     };
     *previous = current;
+    if delta == Default::default() {
+        return;
+    }
     tracing::info!(
         target: "thegn::perf::revtunnel",
         interval_seconds,

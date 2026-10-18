@@ -20,7 +20,7 @@ use std::io;
 use std::sync::Arc;
 use std::sync::LazyLock;
 use std::sync::Mutex as StdMutex;
-use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use thegn_core::revtunnel::{
@@ -29,7 +29,7 @@ use thegn_core::revtunnel::{
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tokio::sync::mpsc::{Sender, channel};
-use tokio::sync::{Mutex, Semaphore};
+use tokio::sync::{Mutex, Notify, Semaphore};
 use tokio::task::{JoinHandle, JoinSet};
 
 /// Bounded depth for the shared outbound frame sink and each per-connection
@@ -104,17 +104,16 @@ impl RejectionCounters {
         }
     }
 
-    fn increment(&self, reason: &'static str) -> u64 {
+    fn increment(&self, reason: RejectionReason) -> u64 {
         let counter = match reason {
-            "connection_limit" => &self.connection_limit,
-            "global_connection_limit" => &self.global_connection_limit,
-            "duplicate_id" => &self.duplicate_id,
-            "dial_timeout" => &self.dial_timeout,
-            "accept_transient" => &self.accept_transient,
-            "write_stall" => &self.write_stall,
-            "idle" => &self.idle,
-            "lifetime" => &self.lifetime,
-            _ => return 0,
+            RejectionReason::ConnectionLimit => &self.connection_limit,
+            RejectionReason::GlobalConnectionLimit => &self.global_connection_limit,
+            RejectionReason::DuplicateId => &self.duplicate_id,
+            RejectionReason::DialTimeout => &self.dial_timeout,
+            RejectionReason::AcceptTransient => &self.accept_transient,
+            RejectionReason::WriteStall => &self.write_stall,
+            RejectionReason::Idle => &self.idle,
+            RejectionReason::Lifetime => &self.lifetime,
         };
         counter.fetch_add(1, Ordering::Relaxed) + 1
     }
@@ -133,9 +132,36 @@ impl RejectionCounters {
     }
 }
 
+#[derive(Clone, Copy, Debug)]
+enum RejectionReason {
+    ConnectionLimit,
+    GlobalConnectionLimit,
+    DuplicateId,
+    DialTimeout,
+    AcceptTransient,
+    WriteStall,
+    Idle,
+    Lifetime,
+}
+
+impl RejectionReason {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::ConnectionLimit => "connection_limit",
+            Self::GlobalConnectionLimit => "global_connection_limit",
+            Self::DuplicateId => "duplicate_id",
+            Self::DialTimeout => "dial_timeout",
+            Self::AcceptTransient => "accept_transient",
+            Self::WriteStall => "write_stall",
+            Self::Idle => "idle",
+            Self::Lifetime => "lifetime",
+        }
+    }
+}
+
 type ConnectionTasks = Arc<Mutex<JoinSet<()>>>;
 
-fn report_rejection(rejections: &AtomicUsize, endpoint: &'static str, reason: &'static str) {
+fn report_rejection(rejections: &AtomicUsize, endpoint: &'static str, reason: RejectionReason) {
     REJECTIONS_TOTAL.fetch_add(1, Ordering::Relaxed);
     let count = rejections.fetch_add(1, Ordering::Relaxed) + 1;
     let total = REJECTION_COUNTS.increment(reason);
@@ -148,7 +174,7 @@ fn report_rejection(rejections: &AtomicUsize, endpoint: &'static str, reason: &'
         tracing::warn!(
             target: "thegn::revtunnel",
             endpoint,
-            reason,
+            reason = reason.as_str(),
             tunnel_rejections = count,
             process_rejections = total,
             "reverse-tunnel connection rejected"
@@ -158,21 +184,21 @@ fn report_rejection(rejections: &AtomicUsize, endpoint: &'static str, reason: &'
 
 fn rejection_warning_due(
     last: &mut HashMap<&'static str, Instant>,
-    reason: &'static str,
+    reason: RejectionReason,
     now: Instant,
 ) -> bool {
     if last
-        .get(reason)
+        .get(reason.as_str())
         .is_some_and(|at| now.duration_since(*at) < REJECTION_LOG_INTERVAL)
     {
         false
     } else {
-        last.insert(reason, now);
+        last.insert(reason.as_str(), now);
         true
     }
 }
 
-fn report_global_rejection(endpoint: &'static str, reason: &'static str) {
+fn report_global_rejection(endpoint: &'static str, reason: RejectionReason) {
     static EMPTY: AtomicUsize = AtomicUsize::new(0);
     report_rejection(&EMPTY, endpoint, reason);
 }
@@ -249,17 +275,11 @@ impl TunnelListener for TcpListener {
 fn transient_accept_error(error: &io::Error) -> bool {
     matches!(
         error.kind(),
-        io::ErrorKind::Interrupted | io::ErrorKind::WouldBlock
-    ) || matches!(
-        error.raw_os_error(),
-        Some(libc::EMFILE)
-            | Some(libc::ENFILE)
-            | Some(libc::ENOBUFS)
-            | Some(libc::ENOMEM)
-            | Some(libc::ECONNABORTED)
-            | Some(libc::EINTR)
-            | Some(libc::EAGAIN)
-    )
+        io::ErrorKind::Interrupted
+            | io::ErrorKind::WouldBlock
+            | io::ErrorKind::ConnectionAborted
+            | io::ErrorKind::OutOfMemory
+    ) || crate::plugin::platform::is_transient_accept_resource_error(error.raw_os_error())
 }
 
 fn next_accept_backoff(current: Duration) -> Duration {
@@ -370,7 +390,7 @@ fn spawn_sink_with_timeout<W: AsyncWrite + Unpin + Send + 'static>(
                     break;
                 }
                 Err(_) => {
-                    report_global_rejection("tunnel", "write_stall");
+                    report_global_rejection("tunnel", RejectionReason::WriteStall);
                     break;
                 }
             }
@@ -382,6 +402,9 @@ fn spawn_sink_with_timeout<W: AsyncWrite + Unpin + Send + 'static>(
 /// Pump one logical connection's local stream ⇄ the mux:
 /// - local reads → `Data(id)` frames on the sink, then `Close(id)` at EOF;
 /// - `inbound` payloads (peer `Data(id)`) → local writes.
+/// Deadline closes send `Close(id)`, a half-close; the peer's other direction
+/// can remain until its own idle or lifetime deadline because this protocol has
+/// no full-close frame.
 async fn pump_conn(
     id: u32,
     local: Box<dyn IoStream>,
@@ -417,79 +440,102 @@ async fn pump_conn_with_deadlines(
     deadlines: ConnectionDeadlines,
 ) {
     let (mut rd, mut wr) = tokio::io::split(local);
-    let mut buf = vec![0u8; 16 * 1024];
     let started = tokio::time::Instant::now();
     let lifetime_deadline = started + deadlines.lifetime;
-    let mut idle_deadline = started + deadlines.idle;
-    let rejections = AtomicUsize::new(0);
-    let mut local_open = true;
-    let mut inbound_open = true;
-    let reason = loop {
-        if !local_open && !inbound_open {
-            break None;
+    let activity_ms = Arc::new(AtomicU64::new(0));
+    let activity_notify = Arc::new(Notify::new());
+    let stall_notify = Arc::new(Notify::new());
+    let close_sent = Arc::new(AtomicBool::new(false));
+
+    let local_activity = activity_ms.clone();
+    let local_activity_notify = activity_notify.clone();
+    let local_stall_notify = stall_notify.clone();
+    let local_close_sent = close_sent.clone();
+    let local_sink = sink.clone();
+    let local_to_peer = async move {
+        let mut buf = vec![0u8; 16 * 1024];
+        loop {
+            let (frame, is_close) = match rd.read(&mut buf).await {
+                Ok(0) | Err(_) => (encode(&Frame::Close(id)), true),
+                Ok(n) => (encode_data_chunked(id, &buf[..n]), false),
+            };
+            match tokio::time::timeout(deadlines.write_stall, local_sink.send(frame)).await {
+                Err(_) => {
+                    local_stall_notify.notify_one();
+                    return;
+                }
+                Ok(Err(_)) => return,
+                Ok(Ok(())) if is_close => {
+                    local_close_sent.store(true, Ordering::Release);
+                    return;
+                }
+                Ok(Ok(())) => {
+                    local_activity.fetch_max(
+                        started.elapsed().as_millis().min(u64::MAX as u128) as u64,
+                        Ordering::Release,
+                    );
+                    local_activity_notify.notify_one();
+                    tokio::task::yield_now().await;
+                }
+            }
         }
-        tokio::select! {
-            biased;
-            _ = tokio::time::sleep_until(lifetime_deadline) => break Some("lifetime"),
-            _ = tokio::time::sleep_until(idle_deadline) => break Some("idle"),
-            read = rd.read(&mut buf), if local_open => match read {
-                Ok(0) | Err(_) => {
-                    local_open = false;
-                    if !matches!(
-                        tokio::time::timeout(deadlines.write_stall, sink.send(encode(&Frame::Close(id)))).await,
-                        Ok(Ok(()))
-                    ) {
-                        break Some("write_stall");
-                    }
+    };
+
+    let inbound_activity = activity_ms.clone();
+    let inbound_activity_notify = activity_notify.clone();
+    let inbound_stall_notify = stall_notify.clone();
+    let inbound_to_local = async move {
+        while let Some(data) = inbound.recv().await {
+            match tokio::time::timeout(deadlines.write_stall, wr.write_all(&data)).await {
+                Err(_) => {
+                    inbound_stall_notify.notify_one();
+                    return;
                 }
-                Ok(n) => {
-                    idle_deadline = tokio::time::Instant::now() + deadlines.idle;
-                    if !matches!(
-                        tokio::time::timeout(deadlines.write_stall, sink.send(encode_data_chunked(id, &buf[..n]))).await,
-                        Ok(Ok(()))
-                    )
-                    {
-                        break Some("write_stall");
-                    }
+                Ok(Err(_)) => return,
+                Ok(Ok(())) => {
+                    inbound_activity.fetch_max(
+                        started.elapsed().as_millis().min(u64::MAX as u128) as u64,
+                        Ordering::Release,
+                    );
+                    inbound_activity_notify.notify_one();
+                    tokio::task::yield_now().await;
                 }
-            },
-            data = inbound.recv(), if inbound_open => match data {
-                Some(data) => {
-                    if !matches!(
-                        tokio::time::timeout(deadlines.write_stall, wr.write_all(&data)).await,
-                        Ok(Ok(()))
-                    )
-                    {
-                        break Some("write_stall");
-                    }
-                    idle_deadline = tokio::time::Instant::now() + deadlines.idle;
-                }
-                None => {
-                    inbound_open = false;
-                    if let Err(error) = wr.shutdown().await {
-                        tracing::debug!(target: "thegn::revtunnel", %error, "local tunnel half-close failed");
-                    }
-                }
-            },
+            }
+        }
+        if let Err(error) = wr.shutdown().await {
+            tracing::debug!(target: "thegn::revtunnel", %error, "local tunnel half-close failed");
+        }
+    };
+
+    // These independent futures preserve full-duplex draining while either
+    // bounded sink send or local write applies backpressure.
+    let reason = {
+        let directions = async { tokio::join!(local_to_peer, inbound_to_local) };
+        tokio::pin!(directions);
+        loop {
+            let last_activity = Duration::from_millis(activity_ms.load(Ordering::Acquire));
+            let idle_deadline = started + last_activity + deadlines.idle;
+            tokio::select! {
+                _ = &mut directions => break None,
+                _ = tokio::time::sleep_until(lifetime_deadline) => break Some(RejectionReason::Lifetime),
+                _ = tokio::time::sleep_until(idle_deadline) => break Some(RejectionReason::Idle),
+                _ = activity_notify.notified() => continue,
+                _ = stall_notify.notified() => break Some(RejectionReason::WriteStall),
+            }
         }
     };
     if let Some(reason) = reason {
-        report_rejection(&rejections, "connection", reason);
+        report_global_rejection("connection", reason);
     }
-    if local_open {
-        if let Err(error) =
-            tokio::time::timeout(deadlines.write_stall, sink.send(encode(&Frame::Close(id))))
-                .await
-                .map_err(|_| {
-                    io::Error::new(io::ErrorKind::TimedOut, "reverse-tunnel close stalled")
-                })
-                .and_then(|result| {
-                    result.map_err(|_| {
-                        io::Error::new(io::ErrorKind::BrokenPipe, "reverse-tunnel sink closed")
-                    })
-                })
+    if !close_sent.load(Ordering::Acquire) {
+        match tokio::time::timeout(deadlines.write_stall, sink.send(encode(&Frame::Close(id))))
+            .await
         {
-            tracing::debug!(target: "thegn::revtunnel", %error, "connection close frame dropped");
+            Err(_) => report_global_rejection("connection", RejectionReason::WriteStall),
+            Ok(Err(error)) => {
+                tracing::debug!(target: "thegn::revtunnel", %error, "connection close frame dropped")
+            }
+            Ok(Ok(())) => {}
         }
     }
     if let Err(error) = wr.shutdown().await {
@@ -701,7 +747,11 @@ where
                 let global_permit = match global_permits.try_acquire_owned() {
                     Ok(permit) => permit,
                     Err(_) => {
-                        report_rejection(&rejections, "host", "global_connection_limit");
+                        report_rejection(
+                            &rejections,
+                            "host",
+                            RejectionReason::GlobalConnectionLimit,
+                        );
                         if let Err(error) = sink.send(encode(&Frame::Close(id))).await {
                             tracing::debug!(target: "thegn::revtunnel", %error, "close reply dropped");
                         }
@@ -711,7 +761,7 @@ where
                 let permit = match permits.try_acquire_owned() {
                     Ok(permit) => permit,
                     Err(_) => {
-                        report_rejection(&rejections, "host", "connection_limit");
+                        report_rejection(&rejections, "host", RejectionReason::ConnectionLimit);
                         drop(global_permit);
                         if let Err(error) = sink.send(encode(&Frame::Close(id))).await {
                             tracing::debug!(target: "thegn::revtunnel", %error, "close reply dropped");
@@ -722,7 +772,7 @@ where
                 let (in_tx, in_rx) = channel::<Vec<u8>>(CHANNEL_DEPTH);
                 let mut routes = conns.lock().await;
                 if routes.contains_key(&id) {
-                    report_rejection(&rejections, "host", "duplicate_id");
+                    report_rejection(&rejections, "host", RejectionReason::DuplicateId);
                     drop(routes);
                     drop(permit);
                     drop(global_permit);
@@ -750,7 +800,7 @@ where
                         }
                         Ok(Err(_)) => true,
                         Err(_) => {
-                            report_rejection(&rejections, "host", "dial_timeout");
+                            report_rejection(&rejections, "host", RejectionReason::DialTimeout);
                             true
                         }
                     };
@@ -827,7 +877,7 @@ where
                     sock
                 }
                 Err(error) if transient_accept_error(&error) => {
-                    report_global_rejection("sandbox", "accept_transient");
+                    report_global_rejection("sandbox", RejectionReason::AcceptTransient);
                     tokio::time::sleep(accept_backoff).await;
                     accept_backoff = next_accept_backoff(accept_backoff);
                     continue;
@@ -841,7 +891,7 @@ where
             let permit = match acc_permits.clone().try_acquire_owned() {
                 Ok(permit) => permit,
                 Err(_) => {
-                    report_rejection(&acc_rejections, "sandbox", "connection_limit");
+                    report_rejection(&acc_rejections, "sandbox", RejectionReason::ConnectionLimit);
                     drop(sock);
                     continue;
                 }
@@ -894,6 +944,9 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    static WRITE_STALL_TEST_LOCK: std::sync::LazyLock<tokio::sync::Mutex<()>> =
+        std::sync::LazyLock::new(|| tokio::sync::Mutex::new(()));
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     struct DuplexListener {
@@ -1190,7 +1243,7 @@ mod tests {
             .unwrap();
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn host_dial_timeout_closes_route_and_releases_permit() {
         let (host, mut peer) = tokio::io::duplex(16 * 1024);
         let calls = Arc::new(AtomicUsize::new(0));
@@ -1201,22 +1254,15 @@ mod tests {
             },
             1,
             Arc::new(Semaphore::new(1)),
-            std::time::Duration::from_millis(50),
+            DIAL_TIMEOUT,
         ));
         send_opens(&mut peer, &[1]).await;
-        let mut data = Vec::new();
-        for _ in 0..(CHANNEL_DEPTH + 4) {
-            data.extend(encode(&Frame::Data(1, vec![0; 8])));
-        }
-        tokio::time::timeout(std::time::Duration::from_secs(2), peer.write_all(&data))
-            .await
-            .expect("timed out filling the stalled route's inbound queue")
-            .unwrap();
-
+        tokio::task::yield_now().await;
+        tokio::time::advance(DIAL_TIMEOUT + Duration::from_secs(1)).await;
         let mut decoder = FrameDecoder::new();
         assert_eq!(next_frame(&mut peer, &mut decoder).await, Frame::Close(1));
         send_open(&mut peer, 2).await;
-        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        tokio::time::timeout(Duration::from_secs(2), async {
             while calls.load(Ordering::Relaxed) < 2 {
                 tokio::task::yield_now().await;
             }
@@ -1224,11 +1270,7 @@ mod tests {
         .await
         .expect("timed-out dial did not release the permit and read loop");
         drop(peer);
-        tokio::time::timeout(std::time::Duration::from_secs(2), task)
-            .await
-            .expect("host did not stop after peer disconnect")
-            .unwrap()
-            .unwrap();
+        task.await.unwrap().unwrap();
     }
 
     #[tokio::test]
@@ -2019,7 +2061,7 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn sandbox_retries_emfile_and_pumps_later_accepts() {
         let (sandbox, mut peer) = tokio::io::duplex(4096);
         let (accept_tx, accept_rx) = tokio::sync::mpsc::unbounded_channel();
@@ -2033,14 +2075,22 @@ mod tests {
 
         let before = rejection_counts().accept_transient;
         accept_tx
-            .send(Err(io::Error::from_raw_os_error(libc::EMFILE)))
+            .send(Err(
+                crate::plugin::platform::accept_resource_error_for_test(),
+            ))
             .unwrap();
         let (sandbox_conn, mut client) = tokio::io::duplex(128);
         accept_tx.send(Ok(sandbox_conn)).unwrap();
         drop(accept_tx);
+        tokio::task::yield_now().await;
+        tokio::time::advance(ACCEPT_BACKOFF_BASE + Duration::from_secs(1)).await;
 
         let mut decoder = FrameDecoder::new();
-        assert_eq!(next_frame(&mut peer, &mut decoder).await, Frame::Open(1));
+        let open =
+            tokio::time::timeout(Duration::from_secs(3), next_frame(&mut peer, &mut decoder))
+                .await
+                .expect("timed out waiting for accepted connection Open");
+        assert_eq!(open, Frame::Open(1));
         peer.write_all(&encode_data_chunked(1, b"accepted-after-emfile"))
             .await
             .unwrap();
@@ -2050,14 +2100,10 @@ mod tests {
         assert_eq!(rejection_counts().accept_transient, before + 1);
 
         drop(peer);
-        tokio::time::timeout(Duration::from_secs(2), task)
-            .await
-            .unwrap()
-            .unwrap()
-            .unwrap();
+        task.await.unwrap().unwrap();
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn idle_deadline_closes_only_the_stalled_connection() {
         let (local, _client) = tokio::io::duplex(128);
         let (mut peer, sink_stream) = tokio::io::duplex(4096);
@@ -2075,13 +2121,15 @@ mod tests {
                 in_rx,
                 sink,
                 ConnectionDeadlines {
-                    write_stall: Duration::from_secs(1),
-                    idle: Duration::from_millis(20),
-                    lifetime: Duration::from_secs(2),
+                    write_stall: WRITE_STALL_TIMEOUT,
+                    idle: IDLE_TIMEOUT,
+                    lifetime: LIFETIME_TIMEOUT,
                 },
             )
             .await;
         });
+        tokio::task::yield_now().await;
+        tokio::time::advance(IDLE_TIMEOUT + Duration::from_secs(1)).await;
         assert_eq!(
             next_frame(&mut peer, &mut FrameDecoder::new()).await,
             Frame::Close(91)
@@ -2098,7 +2146,7 @@ mod tests {
         drop(in_tx);
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn lifetime_deadline_closes_only_the_stalled_connection() {
         let (local, _client) = tokio::io::duplex(128);
         let (mut peer, sink_stream) = tokio::io::duplex(4096);
@@ -2116,13 +2164,15 @@ mod tests {
                 in_rx,
                 sink,
                 ConnectionDeadlines {
-                    write_stall: Duration::from_secs(1),
-                    idle: Duration::from_secs(2),
-                    lifetime: Duration::from_millis(20),
+                    write_stall: WRITE_STALL_TIMEOUT,
+                    idle: IDLE_TIMEOUT,
+                    lifetime: LIFETIME_TIMEOUT,
                 },
             )
             .await;
         });
+        tokio::task::yield_now().await;
+        tokio::time::advance(LIFETIME_TIMEOUT + Duration::from_secs(1)).await;
         assert_eq!(
             next_frame(&mut peer, &mut FrameDecoder::new()).await,
             Frame::Close(92)
@@ -2138,8 +2188,44 @@ mod tests {
         stop_sink(sink_task).await.unwrap();
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
+    async fn activity_before_idle_deadline_keeps_connection_until_lifetime() {
+        let (local, mut client) = tokio::io::duplex(128);
+        let (mut peer, sink_stream) = tokio::io::duplex(4096);
+        let (sink, sink_task) = spawn_sink(sink_stream);
+        let (in_tx, in_rx) = channel(CHANNEL_DEPTH);
+        let task = tokio::spawn(pump_conn_with_deadlines(
+            94,
+            Box::new(local),
+            in_rx,
+            sink,
+            ConnectionDeadlines {
+                write_stall: WRITE_STALL_TIMEOUT,
+                idle: IDLE_TIMEOUT,
+                lifetime: LIFETIME_TIMEOUT,
+            },
+        ));
+        tokio::task::yield_now().await;
+
+        for byte in 0..12_u8 {
+            tokio::time::advance(IDLE_TIMEOUT - Duration::from_secs(1)).await;
+            in_tx.send(vec![byte]).await.unwrap();
+            let mut received = [0];
+            client.read_exact(&mut received).await.unwrap();
+            assert_eq!(received, [byte]);
+        }
+        tokio::time::advance(Duration::from_secs(13)).await;
+        assert_eq!(
+            next_frame(&mut peer, &mut FrameDecoder::new()).await,
+            Frame::Close(94)
+        );
+        task.await.unwrap();
+        stop_sink(sink_task).await.unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
     async fn local_write_stall_closes_the_connection_and_releases_its_permit() {
+        let _guard = WRITE_STALL_TEST_LOCK.lock().await;
         let (local, _client) = tokio::io::duplex(64);
         let (mut peer, sink_stream) = tokio::io::duplex(4096);
         let (sink, sink_task) = spawn_sink(sink_stream);
@@ -2157,13 +2243,15 @@ mod tests {
                 in_rx,
                 sink,
                 ConnectionDeadlines {
-                    write_stall: Duration::from_millis(20),
-                    idle: Duration::from_secs(2),
-                    lifetime: Duration::from_secs(2),
+                    write_stall: WRITE_STALL_TIMEOUT,
+                    idle: IDLE_TIMEOUT,
+                    lifetime: LIFETIME_TIMEOUT,
                 },
             )
             .await;
         });
+        tokio::task::yield_now().await;
+        tokio::time::advance(WRITE_STALL_TIMEOUT + Duration::from_secs(1)).await;
         assert_eq!(
             next_frame(&mut peer, &mut FrameDecoder::new()).await,
             Frame::Close(93)
@@ -2179,28 +2267,64 @@ mod tests {
         stop_sink(sink_task).await.unwrap();
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
+    async fn ordinary_local_disconnect_does_not_count_as_write_stall() {
+        let _guard = WRITE_STALL_TEST_LOCK.lock().await;
+        let (local, client) = tokio::io::duplex(128);
+        let (sink, mut sink_rx) = channel(4);
+        let (in_tx, in_rx) = channel(4);
+        in_tx.send(vec![0xA5]).await.unwrap();
+        let before = rejection_counts().write_stall;
+        let task = tokio::spawn(pump_conn_with_deadlines(
+            95,
+            Box::new(local),
+            in_rx,
+            sink,
+            ConnectionDeadlines {
+                write_stall: WRITE_STALL_TIMEOUT,
+                idle: IDLE_TIMEOUT,
+                lifetime: LIFETIME_TIMEOUT,
+            },
+        ));
+        drop(client);
+        drop(in_tx);
+
+        task.await.unwrap();
+        assert!(sink_rx.recv().await.is_some());
+        assert_eq!(rejection_counts().write_stall, before);
+    }
+
+    #[tokio::test(start_paused = true)]
     async fn shared_sink_write_stall_ends_its_tunnel_stream() {
+        let _guard = WRITE_STALL_TEST_LOCK.lock().await;
         let (near, mut far) = tokio::io::duplex(64);
-        let (sink, sink_task) = spawn_sink_with_timeout(near, Duration::from_millis(20));
+        let (sink, sink_task) = spawn_sink_with_timeout(near, WRITE_STALL_TIMEOUT);
         let before = rejection_counts().write_stall;
         sink.send(vec![0xAB; 1024]).await.unwrap();
         let mut sink_task = sink_task;
-        let (result, sink_failed) =
-            supervise_sink(std::future::pending::<io::Result<()>>(), &mut sink_task).await;
+        let supervisor = tokio::spawn(async move {
+            supervise_sink(std::future::pending::<io::Result<()>>(), &mut sink_task).await
+        });
+        tokio::task::yield_now().await;
+        tokio::time::advance(WRITE_STALL_TIMEOUT + Duration::from_secs(1)).await;
+        let (result, sink_failed) = supervisor.await.unwrap();
         assert!(sink_failed);
         assert!(matches!(result, Err(error) if error.kind() == io::ErrorKind::BrokenPipe));
         assert!(rejection_counts().write_stall >= before + 1);
-        let mut byte = [0; 1];
-        assert_eq!(far.read(&mut byte).await.unwrap(), 0);
+        let mut buffered = Vec::new();
+        tokio::time::timeout(Duration::from_secs(1), far.read_to_end(&mut buffered))
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(buffered.len() <= 64);
     }
 
     #[test]
     fn rejection_counters_track_each_reason() {
         let before = rejection_counts();
         let local = AtomicUsize::new(0);
-        report_rejection(&local, "test", "duplicate_id");
-        report_rejection(&local, "test", "dial_timeout");
+        report_rejection(&local, "test", RejectionReason::DuplicateId);
+        report_rejection(&local, "test", RejectionReason::DialTimeout);
         let after = rejection_counts();
         assert_eq!(after.duplicate_id, before.duplicate_id + 1);
         assert_eq!(after.dial_timeout, before.dial_timeout + 1);
@@ -2210,31 +2334,48 @@ mod tests {
     fn rejection_warning_is_limited_to_one_per_reason_per_minute() {
         let start = Instant::now();
         let mut last = HashMap::new();
-        assert!(rejection_warning_due(&mut last, "idle", start));
+        assert!(rejection_warning_due(
+            &mut last,
+            RejectionReason::Idle,
+            start
+        ));
         assert!(!rejection_warning_due(
             &mut last,
-            "idle",
+            RejectionReason::Idle,
             start + Duration::from_secs(59)
         ));
         assert!(rejection_warning_due(
             &mut last,
-            "idle",
+            RejectionReason::Idle,
             start + REJECTION_LOG_INTERVAL
         ));
         assert!(rejection_warning_due(
             &mut last,
-            "lifetime",
+            RejectionReason::Lifetime,
             start + Duration::from_secs(1)
         ));
     }
 
     #[test]
     fn accept_errors_retry_with_capped_exponential_backoff() {
-        assert!(transient_accept_error(&io::Error::from_raw_os_error(
-            libc::EMFILE
+        assert!(transient_accept_error(
+            &crate::plugin::platform::accept_resource_error_for_test()
+        ));
+        assert!(transient_accept_error(&io::Error::new(
+            io::ErrorKind::ConnectionAborted,
+            "accept aborted"
         )));
-        assert!(transient_accept_error(&io::Error::from_raw_os_error(
-            libc::ECONNABORTED
+        assert!(transient_accept_error(&io::Error::new(
+            io::ErrorKind::OutOfMemory,
+            "accept out of memory"
+        )));
+        assert!(transient_accept_error(&io::Error::new(
+            io::ErrorKind::Interrupted,
+            "accept interrupted"
+        )));
+        assert!(transient_accept_error(&io::Error::new(
+            io::ErrorKind::WouldBlock,
+            "accept would block"
         )));
         assert!(!transient_accept_error(&io::Error::new(
             io::ErrorKind::PermissionDenied,
