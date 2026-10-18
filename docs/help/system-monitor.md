@@ -124,7 +124,7 @@ tab.
 
 The Thermal tab shows the CPU package trend, per-core temperatures, the sensor
 table with bounded per-sensor history, GPU temperatures and telemetry, thermal
-zones with trips, and the sensor history heatmap. Missing readings use the
+zones with trips, and a per-core history heatmap. Missing readings use the
 absent mark; no reading is displayed as zero. Panel demand follows the panels
 placed on screen: `thermal.package`, `thermal.cores`, `thermal.sensors`,
 `thermal.zones`, `thermal.gpu`, and `thermal.heatmap`. Use `f`/`F` to move panel

@@ -5,9 +5,10 @@ use crate::{
         kit::{emit::Emitter, grid::CellGrid, panel},
         layout::{Node, PanelId, PanelSpec, Placed, Size, Variant, VariantKind},
     },
-    telemetry::{Agg, Metric, ScaleMode, SeriesReq, TelemetryHistory, Window},
+    telemetry::{Metric, ScaleMode, SeriesReq, TelemetryHistory, Window},
 };
 use termwiz::surface::Surface;
+use thegn_core::series::Agg;
 use thegn_metrics::collect::{
     CollectorId, CollectorSet,
     frame::MonitorFrame,
@@ -83,14 +84,18 @@ pub(in crate::monitor) struct ThermalModel {
     sensors: Vec<SensorRow>,
     zones: Vec<ZoneRow>,
     cores: [Option<f32>; 16],
+    core_history: [[f32; HISTORY_CAP]; 16],
+    core_history_len: [usize; 16],
+    core_history_next: [usize; 16],
     gfx_c: Option<f32>,
     edge_c: Option<f32>,
     hotspot_c: Option<f32>,
     soc_c: Option<f32>,
     socket_w: Option<f32>,
     package_history: [f32; HISTORY_CAP],
-    history_len: usize,
-    history_next: usize,
+    package_history_len: usize,
+    package_history_next: usize,
+    temp_history: Vec<f32>,
 }
 
 impl Default for ThermalModel {
@@ -99,14 +104,18 @@ impl Default for ThermalModel {
             sensors: Vec::with_capacity(SENSOR_CAP),
             zones: Vec::with_capacity(16),
             cores: [None; 16],
+            core_history: [[0.0; HISTORY_CAP]; 16],
+            core_history_len: [0; 16],
+            core_history_next: [0; 16],
             gfx_c: None,
             edge_c: None,
             hotspot_c: None,
             soc_c: None,
             socket_w: None,
             package_history: [0.0; HISTORY_CAP],
-            history_len: 0,
-            history_next: 0,
+            package_history_len: 0,
+            package_history_next: 0,
+            temp_history: Vec::with_capacity(HISTORY_CAP),
         }
     }
 }
@@ -169,18 +178,10 @@ impl ThermalModel {
             now_ms,
         });
         if series.empty {
+            self.temp_history.clear();
             return;
         }
-        self.package_history.fill(0.0);
-        self.history_len = series.hi.len().min(HISTORY_CAP);
-        self.history_next = 0;
-        for index in 0..self.history_len {
-            self.package_history[index] = if series.gap[index] {
-                f32::NAN
-            } else {
-                series.raw_hi[index]
-            };
-        }
+        self.temp_history.clone_from(&series.hi);
     }
 
     pub(in crate::monitor) fn absorb_frame(&mut self, frame: &MonitorFrame) {
@@ -210,15 +211,6 @@ impl ThermalModel {
                     .values
                     .get(index)
                     .map(|reading| reading.value);
-                if value.is_some_and(|reading| {
-                    reading.is_some_and(|value| {
-                        hwmon_group::plausible_input(SensorKind::Temp, (value * 1000.0) as i64)
-                            .is_none()
-                    })
-                }) {
-                    continue;
-                }
-                let temp_c = value.flatten();
                 let row_index = self.sensors.iter().position(|row| row.key == sensor.key);
                 if row_index.is_none() && self.sensors.len() == SENSOR_CAP {
                     continue;
@@ -231,6 +223,7 @@ impl ThermalModel {
                         .last_mut()
                         .expect("sensor row was just inserted")
                 };
+                row.seen = true;
                 row.key.clone_from(&sensor.key);
                 row.chip.clone_from(&chip.name);
                 row.group = chip.group;
@@ -242,10 +235,32 @@ impl ThermalModel {
                         .filter(|label| !label.is_empty())
                         .unwrap_or("temperature"),
                 );
-                row.temp_c = temp_c;
                 row.max_c = sensor.thresholds.max;
                 row.crit_c = sensor.thresholds.crit;
-                row.seen = true;
+                if value.is_some_and(|reading| {
+                    reading.is_some_and(|value| {
+                        hwmon_group::plausible_input(SensorKind::Temp, (value * 1000.0) as i64)
+                            .is_none()
+                    })
+                }) {
+                    row.temp_c = None;
+                    row.history[row.history_next] = f32::NAN;
+                    row.history_next = (row.history_next + 1) % HISTORY_CAP;
+                    row.history_len = row.history_len.saturating_add(1).min(HISTORY_CAP);
+                    continue;
+                }
+                let temp_c = value.flatten();
+                row.temp_c = temp_c;
+                if row.group == ChipGroup::Cpu
+                    && let Some(core) = row
+                        .label
+                        .strip_prefix("core")
+                        .or_else(|| row.label.strip_prefix("Core "))
+                        .and_then(|suffix| suffix.parse::<usize>().ok())
+                    && core < self.cores.len()
+                {
+                    self.cores[core] = temp_c;
+                }
                 if let Some(temp) = temp_c {
                     row.history[row.history_next] = temp;
                     row.history_next = (row.history_next + 1) % HISTORY_CAP;
@@ -266,6 +281,12 @@ impl ThermalModel {
                 .then_with(|| left.label.cmp(&right.label))
         });
 
+        if let Some(temp) = self.package().and_then(|sensor| sensor.temp_c) {
+            self.package_history[self.package_history_next] = temp;
+            self.package_history_next = (self.package_history_next + 1) % HISTORY_CAP;
+            self.package_history_len = self.package_history_len.saturating_add(1).min(HISTORY_CAP);
+        }
+
         for zone in &frame.parts.thermal_zone.zones {
             if zone.alias
                 || zone
@@ -282,12 +303,6 @@ impl ThermalModel {
             row.alarm_events = zone.alarm_events;
         }
         self.zones.truncate(zone_count);
-
-        if let Some(temp) = self.package().and_then(|sensor| sensor.temp_c) {
-            self.package_history[self.history_next] = temp;
-            self.history_next = (self.history_next + 1) % HISTORY_CAP;
-            self.history_len = self.history_len.saturating_add(1).min(HISTORY_CAP);
-        }
 
         for card in &frame.parts.amd_smu.cards {
             if !matches!(
@@ -336,6 +351,16 @@ impl ThermalModel {
             if self.socket_w.is_none() {
                 self.socket_w = metrics.power_socket.map(|value| value as f32 / 1000.0);
             }
+        }
+        for (index, temp) in self.cores.iter().enumerate() {
+            if temp.is_none() && self.core_history_len[index] == 0 {
+                continue;
+            }
+            self.core_history[index][self.core_history_next[index]] = temp.unwrap_or(f32::NAN);
+            self.core_history_next[index] = (self.core_history_next[index] + 1) % HISTORY_CAP;
+            self.core_history_len[index] = self.core_history_len[index]
+                .saturating_add(1)
+                .min(HISTORY_CAP);
         }
     }
 
@@ -423,7 +448,7 @@ impl TabView for ThermalView<'_> {
             SENSORS => "Sensors",
             ZONES => "Thermal zones",
             GPU => "GPU thermals",
-            HEATMAP => "Sensor history",
+            HEATMAP => "Core history",
             _ => return,
         };
         let inner = {
@@ -435,15 +460,22 @@ impl TabView for ThermalView<'_> {
                 &mut grid,
                 inner,
                 self.0.package(),
+                &self.0.temp_history,
                 &self.0.package_history,
-                self.0.history_len,
-                self.0.history_next,
+                self.0.package_history_len,
+                self.0.package_history_next,
             ),
             CORES => paint::cores(&mut grid, inner, &self.0.cores),
             SENSORS => paint::sensors(&mut grid, inner, &self.0.sensors),
             ZONES => paint::zones(&mut grid, inner, &self.0.zones),
             GPU => paint::gpu(&mut grid, inner, self.0),
-            HEATMAP => paint::heatmap(&mut grid, inner, &self.0.sensors),
+            HEATMAP => paint::heatmap(
+                &mut grid,
+                inner,
+                &self.0.core_history,
+                &self.0.core_history_len,
+                &self.0.core_history_next,
+            ),
             _ => {}
         }
         Emitter::default().emit(
@@ -454,8 +486,11 @@ impl TabView for ThermalView<'_> {
             rect.y,
         );
         if placed.id == SENSORS {
-            let spark_x = rect.x.saturating_add(inner.x).saturating_add(71);
-            let spark_width = inner.cols.saturating_sub(71);
+            let spark_x = rect
+                .x
+                .saturating_add(inner.x)
+                .saturating_add(paint::SENSOR_HISTORY_X);
+            let spark_width = inner.cols.saturating_sub(paint::SENSOR_HISTORY_X);
             for (index, sensor) in self
                 .0
                 .sensors
@@ -463,19 +498,20 @@ impl TabView for ThermalView<'_> {
                 .enumerate()
                 .take(inner.rows.saturating_sub(1))
             {
-                let mut ordered = paint::history_width(sensor, spark_width);
+                let mut ordered = [0.0_f32; HISTORY_CAP];
+                let count = paint::history_into(sensor, spark_width, &mut ordered);
                 let limit = sensor.crit_c.or(sensor.max_c).unwrap_or(100.0);
-                for sample in &mut ordered {
+                for sample in &mut ordered[..count] {
                     *sample = (*sample / limit).clamp(0.0, 1.0);
                 }
                 crate::monitor::graphs::paint_sparkline(
-                    &ordered,
-                    spark_width,
+                    &ordered[..count],
+                    count,
                     thegn_core::theme::RampId::Temp,
                     Rect {
-                        x: spark_x,
+                        x: spark_x.saturating_add(spark_width.saturating_sub(count)),
                         y: rect.y.saturating_add(inner.y).saturating_add(index + 1),
-                        cols: spark_width,
+                        cols: count,
                         rows: 1,
                     },
                     surface,
