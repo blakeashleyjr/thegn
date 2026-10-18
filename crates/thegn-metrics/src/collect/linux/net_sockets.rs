@@ -13,7 +13,7 @@ use crate::collect::{
     schedule::Cadence,
 };
 
-const SOCKET_DUMP_TIMEOUT: Duration = Duration::from_secs(2);
+const SOCKET_DUMP_TIMEOUT: Duration = Duration::from_millis(250);
 const RECENT_DATA_MS: u32 = 10_000;
 const TCP_ESTABLISHED: u8 = 1;
 const TCP_LISTEN: u8 = 10;
@@ -36,6 +36,9 @@ impl SocketTransport for NetlinkTransport {
     }
 
     fn dump(&mut self, out: &mut Vec<sock_diag::TcpSock>) -> io::Result<sock_diag::DumpStats> {
+        if self.socket.is_none() {
+            self.open()?;
+        }
         let socket = self.socket.as_mut().ok_or_else(|| {
             io::Error::new(io::ErrorKind::NotConnected, "sock_diag socket is closed")
         })?;
@@ -61,8 +64,8 @@ impl NetSocketsCollector {
     fn with_transport(transport: Box<dyn SocketTransport>) -> Self {
         Self {
             transport,
-            sockets: Vec::with_capacity(sock_diag::MAX_TCP_SOCKETS),
-            rtts: Vec::with_capacity(sock_diag::MAX_TCP_SOCKETS),
+            sockets: Vec::new(),
+            rtts: Vec::new(),
         }
     }
 }
@@ -84,12 +87,23 @@ impl Collector for NetSocketsCollector {
 
     fn discover(&mut self, _env: &Env) -> Health {
         match self.transport.open() {
-            Ok(()) => Health::Warming,
+            Ok(()) => {
+                self.transport.close();
+                Health::Warming
+            }
             Err(error) => absent_or_warming(&error),
         }
     }
 
     fn sample(&mut self, _ctx: &TickCtx, frame: &mut MonitorFrame) -> Result<(), CollectError> {
+        self.sockets.clear();
+        self.rtts.clear();
+        if self.sockets.capacity() < sock_diag::MAX_TCP_SOCKETS {
+            self.sockets.reserve(sock_diag::MAX_TCP_SOCKETS);
+        }
+        if self.rtts.capacity() < sock_diag::MAX_TCP_SOCKETS {
+            self.rtts.reserve(sock_diag::MAX_TCP_SOCKETS);
+        }
         let stats = self
             .transport
             .dump(&mut self.sockets)
@@ -100,7 +114,6 @@ impl Collector for NetSocketsCollector {
             truncated: stats.truncated,
             ..NetSocketsPart::default()
         };
-        self.rtts.clear();
         for socket in &self.sockets {
             if let Some(count) = socket
                 .state
@@ -152,14 +165,14 @@ impl Collector for NetSocketsCollector {
     }
 
     fn close(&mut self) {
-        self.sockets.clear();
-        self.rtts.clear();
+        self.sockets = Vec::new();
+        self.rtts = Vec::new();
         self.transport.close();
     }
 }
 
 fn is_loopback(address: IpAddr) -> bool {
-    address.is_loopback()
+    address.to_canonical().is_loopback()
 }
 
 fn absent_or_warming(error: &io::Error) -> Health {
@@ -179,7 +192,15 @@ fn collect_io_error(error: io::Error) -> CollectError {
     if error.kind() == io::ErrorKind::PermissionDenied
         || matches!(
             error.raw_os_error(),
-            Some(libc::EPERM) | Some(libc::EPROTONOSUPPORT) | Some(libc::EAFNOSUPPORT)
+            Some(libc::EPERM)
+                | Some(libc::EPROTONOSUPPORT)
+                | Some(libc::EAFNOSUPPORT)
+                | Some(libc::EBUSY)
+                | Some(libc::ENOBUFS)
+        )
+        || matches!(
+            error.kind(),
+            io::ErrorKind::TimedOut | io::ErrorKind::Interrupted
         )
     {
         CollectError::Gone

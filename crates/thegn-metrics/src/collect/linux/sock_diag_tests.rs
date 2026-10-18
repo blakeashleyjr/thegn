@@ -214,9 +214,11 @@ fn last_data_recv_is_length_checked_at_its_uapi_offset() {
 fn dump_rows_stop_at_the_fixed_socket_cap_and_report_truncation() {
     let mut bytes = Vec::new();
     let row = response(AddressFamily::Ipv4, 0);
-    for _ in 0..=super::MAX_TCP_SOCKETS {
+    for _ in 0..super::MAX_TCP_SOCKETS {
         bytes.extend_from_slice(&frame(20, 8, &row));
     }
+    // Once the cap is reached this malformed payload must be skipped without decoding.
+    bytes.extend_from_slice(&frame(20, 8, &[1, 2, 3]));
     bytes.extend_from_slice(&frame(libc::NLMSG_DONE as u16, 8, &[]));
     let mut rows = Vec::new();
     let (done, malformed, truncated) = super::consume_batch(&bytes, 8, &mut rows).unwrap();
