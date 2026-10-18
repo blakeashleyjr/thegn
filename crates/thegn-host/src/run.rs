@@ -7408,6 +7408,7 @@ async fn event_loop<T: Terminal>(
     // key/geometry paths.
     let mut monitor: Option<crate::monitor::MonitorOverlay> = None;
     let mut monitor_sampler = crate::monitor_sampler::MonitorSampler::new(waker.clone());
+    let mut monitor_history = crate::monitor::history::MonitorHistory::new();
     // The agent-pipeline board. Its own slot beside the monitor rather than a
     // tab of it: a stage pipeline is not a hardware metric, it wants the whole
     // box for its stage columns, and as the tenth tab it was unreachable by
@@ -12401,6 +12402,7 @@ async fn event_loop<T: Terminal>(
                 snap
             };
             panel_ui.docs.telemetry.push(&snap, at_ms);
+            monitor_history.ingest_masthead(&snap, at_ms);
             panel_ui.docs.tick = panel_ui.docs.tick.wrapping_add(1);
             status_data_moved = true;
             if telemetry_visible {
@@ -12550,9 +12552,10 @@ async fn event_loop<T: Terminal>(
                 dirty = true;
             }
         }
-        // F7/F6b consume the frame later; recycle it now to keep the pool bounded.
+        // F7 ingests frames here; F6b reads the history later. Recycle to keep the pool bounded.
         if let Some(frame) = monitor_sampler.take_latest() {
             loop_perf.tick(crate::perf::WakeSource::Stats);
+            monitor_history.ingest_frame(&frame, crate::monitor::history::wall_now_ms());
             monitor_sampler.recycle(frame);
         }
         // Hydration can clear process state while a Processes overlay remains

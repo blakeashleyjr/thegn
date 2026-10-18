@@ -38,6 +38,7 @@ use thegn_metrics::StatsSnapshot;
 mod build;
 mod footer;
 mod graphs;
+pub(crate) mod history;
 mod invalidation;
 mod kit;
 mod layout;
