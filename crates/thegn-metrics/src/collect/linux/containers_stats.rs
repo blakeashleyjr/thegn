@@ -214,14 +214,14 @@ impl<F: CgroupFs> ContainerStatsSampler<F> {
             let carried_cpu_pct =
                 cpu_pct.unwrap_or_else(|| old.map_or(0.0, |previous| previous.cpu_pct));
             if let Some(previous) = self.previous.get_mut(&scope.id) {
-                previous.sample = self.sample;
+                previous.sample.clone_from(&self.sample);
                 previous.at = at;
                 previous.cpu_pct = carried_cpu_pct;
             } else {
                 self.previous.insert(
                     scope.id.clone(),
                     PreviousSample {
-                        sample: self.sample,
+                        sample: self.sample.clone(),
                         at,
                         cpu_pct: carried_cpu_pct,
                     },
