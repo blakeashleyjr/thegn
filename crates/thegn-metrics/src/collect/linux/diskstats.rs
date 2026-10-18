@@ -777,6 +777,7 @@ mod tests {
             )
             .unwrap();
         assert!(!collector.ids.contains_key("sd00"));
+        assert!(collector.ids.contains_key("sd64"));
 
         fs::write(&proc, &rows).unwrap();
         collector

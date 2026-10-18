@@ -694,13 +694,14 @@ fn resolve_git_dirs(cwd: &Path) -> (Option<PathBuf>, Option<PathBuf>) {
     (git_dir, common_dir)
 }
 
-/// Build + register the diff fs-watcher for `cwd` (blocking: registration walks
-/// the tree and runs git commands — call it off the loop). `None` when no usable
-/// watcher could be attached or the directory-watch cap selects ticker fallback.
+/// Notify configuration shared by the host's filesystem watchers.
 pub(crate) fn watcher_config() -> notify::Config {
     notify::Config::default().with_event_kinds(EventKindMask::CORE)
 }
 
+/// Build + register the diff fs-watcher for `cwd` (blocking: registration walks
+/// the tree and runs git commands — call it off the loop). `None` when no usable
+/// watcher could be attached or the directory-watch cap selects ticker fallback.
 pub(crate) fn build_diff_watcher(cwd: &Path, sink: RefreshSink) -> Option<RecommendedWatcher> {
     let cwd = cwd.to_path_buf();
     let RefreshSink { tx, wake, revive } = sink;
