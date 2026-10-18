@@ -31,13 +31,12 @@ pub(crate) fn glyph_fingerprint(path: &str, worktree: &Path) -> Option<GlyphFing
         .map(|(gitdir, _)| gitdir.clone())
         .or_else(|| resolve_gitdir(worktree))?;
     let (mut current, index_missing, head_missing) = fingerprint_at(&gitdir);
-    if index_missing || head_missing {
-        if let Some(resolved) = resolve_gitdir(worktree) {
-            if resolved != gitdir {
-                gitdir = resolved;
-                current = fingerprint_at(&gitdir).0;
-            }
-        }
+    if (index_missing || head_missing)
+        && let Some(resolved) = resolve_gitdir(worktree)
+        && resolved != gitdir
+    {
+        gitdir = resolved;
+        current = fingerprint_at(&gitdir).0;
     }
     let baseline = previous
         .as_ref()
