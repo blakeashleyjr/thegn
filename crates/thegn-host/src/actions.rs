@@ -2431,7 +2431,7 @@ mod tests {
     #[test]
     fn detached_children_are_reaped_without_a_thread_each() {
         // No procfs, no observation.
-        if !std::path::Path::new("/proc/self/stat").exists() {
+        if !cfg!(target_os = "linux") {
             return;
         }
         fn own_children() -> usize {

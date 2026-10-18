@@ -62,3 +62,65 @@ fn threads_are_named_ratchet() {
          their task comm identifies their role. Keep the allowlist empty.",
     );
 }
+
+fn has_runtime_platform_guard(code: &str) -> bool {
+    let mut remaining = code;
+    while let Some(start) = remaining.find("Path::new(\"") {
+        remaining = &remaining[start + "Path::new(\"".len()..];
+        let Some(end_quote) = remaining.find('\"') else {
+            return false;
+        };
+        let path = &remaining[..end_quote];
+        if path != "/bin/sh" && !path.starts_with("/proc") {
+            continue;
+        }
+        let after_path = remaining[end_quote + 1..].trim_start();
+        let Some(after_close) = after_path.strip_prefix(')') else {
+            continue;
+        };
+        let after_close = after_close.trim_start();
+        let Some(after_dot) = after_close.strip_prefix('.') else {
+            continue;
+        };
+        let after_dot = after_dot.trim_start();
+        if ["exists", "is_file", "is_dir"].iter().any(|method| {
+            after_dot
+                .strip_prefix(method)
+                .is_some_and(|tail| tail.trim_start().starts_with('('))
+        }) {
+            return true;
+        }
+    }
+    false
+}
+
+#[test]
+fn converted_runtime_guards_stay_compile_time() {
+    const FILES: &[&str] = &["voice.rs", "git/native_diff.rs"];
+
+    for file in FILES {
+        let path = format!("{}/src/{file}", env!("CARGO_MANIFEST_DIR"));
+        let body = std::fs::read_to_string(path).expect("read production source file");
+        let code = thegn_core::test_support::ratchet::code_only(&body);
+        assert!(
+            !has_runtime_platform_guard(&code),
+            "{file} still probes /proc or /bin/sh at runtime"
+        );
+    }
+}
+
+#[test]
+fn runtime_platform_guard_predicate_tracks_only_direct_probes() {
+    let cases = [
+        (r#"std::path::Path::new("/proc/self/stat").exists()"#, true),
+        (r#"Path::new("/bin/sh").is_file()"#, true),
+        (r#"Path::new("/proc").join(pid)"#, false),
+        (r#"cfg!(target_os = "linux")"#, false),
+        (r#"// Path::new("/proc/self/stat").exists()"#, false),
+    ];
+
+    for (source, expected) in cases {
+        let code = thegn_core::test_support::ratchet::code_only(source);
+        assert_eq!(has_runtime_platform_guard(&code), expected, "{source}");
+    }
+}

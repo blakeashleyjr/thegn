@@ -2,21 +2,27 @@
 
 use super::ProcSignal;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ProcStart {
+    pub secs: u64,
+    pub ticks: Option<u64>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SignalError {
     Changed,
     Failed(String),
 }
 
-pub fn signal_identity(pid: u32, start_secs: u64, sig: ProcSignal) -> Result<(), SignalError> {
+pub fn signal_identity(pid: u32, start: ProcStart, sig: ProcSignal) -> Result<(), SignalError> {
     if pid == 0 || pid > i32::MAX as u32 {
         return Err(SignalError::Failed("invalid pid".into()));
     }
-    signal_identity_inner(pid, start_secs, sig)
+    signal_identity_inner(pid, start, sig)
 }
 
 #[cfg(target_os = "linux")]
-fn signal_identity_inner(pid: u32, start_secs: u64, sig: ProcSignal) -> Result<(), SignalError> {
+fn signal_identity_inner(pid: u32, start: ProcStart, sig: ProcSignal) -> Result<(), SignalError> {
     use std::os::fd::FromRawFd;
 
     // SAFETY: pid is range-checked above; pidfd_open returns a new owned fd.
@@ -24,7 +30,7 @@ fn signal_identity_inner(pid: u32, start_secs: u64, sig: ProcSignal) -> Result<(
     if fd < 0 {
         let error = std::io::Error::last_os_error();
         if error.raw_os_error() == Some(libc::ENOSYS) {
-            return compare_then_signal(pid, start_secs, sig);
+            return compare_then_signal(pid, start, sig);
         }
         if error.raw_os_error() == Some(libc::EPERM) {
             return Err(SignalError::Failed(
@@ -35,7 +41,10 @@ fn signal_identity_inner(pid: u32, start_secs: u64, sig: ProcSignal) -> Result<(
     }
     // SAFETY: successful pidfd_open returned a fresh fd owned by this scope.
     let pidfd = unsafe { std::os::fd::OwnedFd::from_raw_fd(fd as std::os::fd::RawFd) };
-    if read_start_secs(pid) != Some(start_secs) {
+    let live_ticks = read_start_ticks(pid);
+    if !identity_matches(start, live_ticks, || {
+        live_ticks.and_then(start_secs_for_ticks)
+    }) {
         return Err(SignalError::Changed);
     }
     let signal = signal_number(sig);
@@ -54,7 +63,7 @@ fn signal_identity_inner(pid: u32, start_secs: u64, sig: ProcSignal) -> Result<(
     }
     let error = std::io::Error::last_os_error();
     if pidfd_unsupported(error.raw_os_error()) {
-        return compare_then_signal(pid, start_secs, sig);
+        return compare_then_signal(pid, start, sig);
     }
     Err(map_unix_error(error))
 }
@@ -82,10 +91,14 @@ fn map_unix_error(error: std::io::Error) -> SignalError {
 }
 
 #[cfg(target_os = "linux")]
+#[cfg(test)]
 fn read_start_secs(pid: u32) -> Option<u64> {
+    start_secs_for_ticks(read_start_ticks(pid)?)
+}
+
+#[cfg(target_os = "linux")]
+fn start_secs_for_ticks(ticks: u64) -> Option<u64> {
     static BOOT_TIME: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
-    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
-    let ticks = super::unix::parse_proc_start_time(&stat)?;
     let btime = match BOOT_TIME.get() {
         Some(btime) => *btime,
         None => {
@@ -100,8 +113,30 @@ fn read_start_secs(pid: u32) -> Option<u64> {
 }
 
 #[cfg(target_os = "linux")]
-fn compare_then_signal(pid: u32, start_secs: u64, sig: ProcSignal) -> Result<(), SignalError> {
-    if read_start_secs(pid) != Some(start_secs) {
+fn read_start_ticks(pid: u32) -> Option<u64> {
+    let stat = std::fs::read(format!("/proc/{pid}/stat")).ok()?;
+    let stat = thegn_metrics::procs_parse::parse_stat(&stat)?;
+    (stat.pid == pid).then_some(stat.starttime)
+}
+
+#[cfg(target_os = "linux")]
+fn identity_matches(
+    start: ProcStart,
+    live_ticks: Option<u64>,
+    live_secs: impl FnOnce() -> Option<u64>,
+) -> bool {
+    match start.ticks {
+        Some(ticks) => live_ticks == Some(ticks),
+        None => live_secs() == Some(start.secs),
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn compare_then_signal(pid: u32, start: ProcStart, sig: ProcSignal) -> Result<(), SignalError> {
+    let live_ticks = read_start_ticks(pid);
+    if !identity_matches(start, live_ticks, || {
+        live_ticks.and_then(start_secs_for_ticks)
+    }) {
         return Err(SignalError::Changed);
     }
     super::signal_pid(pid, sig).map_err(SignalError::Failed)
@@ -121,7 +156,7 @@ fn start_secs_from_ticks(ticks: u64, clk_tck: u64, btime: u64) -> Option<u64> {
 }
 
 #[cfg(target_os = "macos")]
-fn signal_identity_inner(pid: u32, start_secs: u64, sig: ProcSignal) -> Result<(), SignalError> {
+fn signal_identity_inner(pid: u32, start: ProcStart, sig: ProcSignal) -> Result<(), SignalError> {
     // SAFETY: zeroed POD out-param; the kernel is told its exact size.
     let mut info: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
     let want = std::mem::size_of::<libc::proc_bsdinfo>() as libc::c_int;
@@ -135,21 +170,25 @@ fn signal_identity_inner(pid: u32, start_secs: u64, sig: ProcSignal) -> Result<(
             want,
         )
     };
-    if got != want || info.pbi_start_tvsec != start_secs {
+    if got != want || info.pbi_start_tvsec != start.secs {
         return Err(SignalError::Changed);
     }
     super::signal_pid(pid, sig).map_err(SignalError::Failed)
 }
 
 #[cfg(all(unix, not(any(target_os = "linux", target_os = "macos"))))]
-fn signal_identity_inner(_pid: u32, _start_secs: u64, _sig: ProcSignal) -> Result<(), SignalError> {
+fn signal_identity_inner(
+    _pid: u32,
+    _start: ProcStart,
+    _sig: ProcSignal,
+) -> Result<(), SignalError> {
     Err(SignalError::Failed(
         "process identity unavailable on this platform".into(),
     ))
 }
 
 #[cfg(windows)]
-fn signal_identity_inner(pid: u32, start_secs: u64, _sig: ProcSignal) -> Result<(), SignalError> {
+fn signal_identity_inner(pid: u32, start: ProcStart, _sig: ProcSignal) -> Result<(), SignalError> {
     use windows_sys::Win32::Foundation::{CloseHandle, FILETIME};
     use windows_sys::Win32::System::Threading::{
         GetProcessTimes, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_TERMINATE,
@@ -191,7 +230,7 @@ fn signal_identity_inner(pid: u32, start_secs: u64, _sig: ProcSignal) -> Result<
             ));
         }
         let ticks = (u64::from(creation.dwHighDateTime) << 32) | u64::from(creation.dwLowDateTime);
-        if filetime_to_unix_secs(ticks) != start_secs {
+        if filetime_to_unix_secs(ticks) != start.secs {
             CloseHandle(handle);
             return Err(SignalError::Changed);
         }
@@ -206,7 +245,11 @@ fn signal_identity_inner(pid: u32, start_secs: u64, _sig: ProcSignal) -> Result<
 }
 
 #[cfg(not(any(unix, windows)))]
-fn signal_identity_inner(_pid: u32, _start_secs: u64, _sig: ProcSignal) -> Result<(), SignalError> {
+fn signal_identity_inner(
+    _pid: u32,
+    _start: ProcStart,
+    _sig: ProcSignal,
+) -> Result<(), SignalError> {
     Err(SignalError::Failed(
         "process identity unavailable on this platform".into(),
     ))
@@ -236,11 +279,25 @@ mod pure_tests {
     #[test]
     fn invalid_pids_are_refused_before_platform_calls() {
         assert_eq!(
-            signal_identity(0, 1, ProcSignal::Terminate),
+            signal_identity(
+                0,
+                ProcStart {
+                    secs: 1,
+                    ticks: None
+                },
+                ProcSignal::Terminate
+            ),
             Err(SignalError::Failed("invalid pid".into()))
         );
         assert_eq!(
-            signal_identity(u32::MAX, 1, ProcSignal::Terminate),
+            signal_identity(
+                u32::MAX,
+                ProcStart {
+                    secs: 1,
+                    ticks: None
+                },
+                ProcSignal::Terminate
+            ),
             Err(SignalError::Failed("invalid pid".into()))
         );
     }
@@ -263,6 +320,36 @@ mod pure_tests {
         assert!(!pidfd_unsupported(None));
     }
 
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn identity_matches_prefers_ticks_and_falls_back_to_seconds() {
+        let start = ProcStart {
+            secs: 10,
+            ticks: Some(22),
+        };
+        assert!(identity_matches(start, Some(22), || panic!(
+            "seconds must not be read"
+        )));
+        assert!(!identity_matches(start, Some(23), || Some(10)));
+        assert!(!identity_matches(start, None, || Some(10)));
+        assert!(identity_matches(
+            ProcStart {
+                secs: 10,
+                ticks: None
+            },
+            Some(999),
+            || Some(10)
+        ));
+        assert!(!identity_matches(
+            ProcStart {
+                secs: 10,
+                ticks: None
+            },
+            None,
+            || Some(11)
+        ));
+    }
+
     #[cfg(windows)]
     #[test]
     fn filetime_conversion_uses_sysinfo_unix_seconds() {
@@ -283,7 +370,6 @@ mod linux_tests {
     use super::*;
     use std::os::unix::process::ExitStatusExt;
     use std::process::{Child, Command};
-    use sysinfo::{Pid, ProcessesToUpdate, System};
 
     struct ChildGuard(Child);
 
@@ -312,32 +398,32 @@ mod linux_tests {
             .expect("spawn sleep child")
     }
 
-    fn sampled_start(pid: u32) -> u64 {
-        let pid = Pid::from_u32(pid);
-        let mut system = System::new();
-        system.refresh_processes(ProcessesToUpdate::Some(&[pid]), true);
-        system
-            .process(pid)
-            .expect("targeted sysinfo refresh includes sleep child")
-            .start_time()
-    }
-
     #[test]
-    fn sampler_seconds_match_the_signal_identity_reader() {
+    fn metrics_sampler_ticks_match_the_signal_reader() {
         let mut child = ChildGuard(spawn_sleep());
         let pid = child.0.id();
-        let sampled = sampled_start(pid);
-        assert_eq!(read_start_secs(pid), Some(sampled));
+        assert_eq!(
+            thegn_metrics::ProcSampler::start_ticks_of(pid),
+            read_start_ticks(pid)
+        );
         child.0.kill().expect("kill sleep child");
         child.0.wait().expect("reap sleep child");
     }
 
     #[test]
-    fn matching_identity_sends_sigterm_to_child() {
+    fn matching_ticks_send_sigterm_even_when_seconds_disagree() {
         let mut child = ChildGuard(spawn_sleep());
-        let sampled = sampled_start(child.0.id());
+        let ticks = read_start_ticks(child.0.id()).expect("read sleep child start ticks");
+        let secs = read_start_secs(child.0.id()).expect("read sleep child start seconds");
         assert_eq!(
-            signal_identity(child.0.id(), sampled, ProcSignal::Terminate),
+            signal_identity(
+                child.0.id(),
+                ProcStart {
+                    secs: secs + 5,
+                    ticks: Some(ticks)
+                },
+                ProcSignal::Terminate
+            ),
             Ok(())
         );
         let status = child.0.wait().expect("reap signalled child");
@@ -345,11 +431,52 @@ mod linux_tests {
     }
 
     #[test]
-    fn mismatched_identity_leaves_child_alive() {
+    fn ticks_off_by_one_leave_child_alive() {
         let mut child = ChildGuard(spawn_sleep());
-        let sampled = read_start_secs(child.0.id()).expect("read sleep child start time");
+        let ticks = read_start_ticks(child.0.id()).expect("read sleep child start ticks");
+        let secs = read_start_secs(child.0.id()).expect("read sleep child start seconds");
         assert_eq!(
-            signal_identity(child.0.id(), sampled + 1, ProcSignal::Kill),
+            signal_identity(
+                child.0.id(),
+                ProcStart {
+                    secs,
+                    ticks: Some(ticks + 1)
+                },
+                ProcSignal::Kill
+            ),
+            Err(SignalError::Changed)
+        );
+        assert!(child.0.try_wait().expect("check child status").is_none());
+        child.0.kill().expect("kill sleep child after mismatch");
+        child.0.wait().expect("reap sleep child after mismatch");
+    }
+
+    #[test]
+    fn missing_ticks_fall_back_to_seconds() {
+        let mut child = ChildGuard(spawn_sleep());
+        let secs = read_start_secs(child.0.id()).expect("read sleep child start seconds");
+        assert_eq!(
+            signal_identity(
+                child.0.id(),
+                ProcStart { secs, ticks: None },
+                ProcSignal::Terminate
+            ),
+            Ok(())
+        );
+        let status = child.0.wait().expect("reap signalled child");
+        assert_eq!(status.signal(), Some(libc::SIGTERM));
+
+        let mut child = ChildGuard(spawn_sleep());
+        let secs = read_start_secs(child.0.id()).expect("read sleep child start seconds");
+        assert_eq!(
+            signal_identity(
+                child.0.id(),
+                ProcStart {
+                    secs: secs + 1,
+                    ticks: None
+                },
+                ProcSignal::Terminate
+            ),
             Err(SignalError::Changed)
         );
         assert!(child.0.try_wait().expect("check child status").is_none());

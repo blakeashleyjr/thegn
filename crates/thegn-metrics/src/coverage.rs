@@ -192,6 +192,7 @@ pub fn collector_families(id: crate::collect::CollectorId) -> &'static [MetricFa
         Id::Netdev => &[MetricFamily::Network],
         Id::Diskstats => &[MetricFamily::Disk],
         Id::AmdSmu => &[MetricFamily::Gpu],
+        Id::PowerSupply => &[MetricFamily::Battery],
         Id::Psi | Id::Cgroup | Id::CgroupSlice | Id::Powercap => &[],
     }
 }
@@ -214,8 +215,18 @@ pub fn coverage_with_collectors(
             if snapshot_result != Coverage::Available {
                 for id in CollectorId::ALL {
                     if collector_families(id).contains(&family) {
+                        if id == CollectorId::PowerSupply
+                            && family == MetricFamily::Battery
+                            && snapshot.battery.is_none()
+                        {
+                            continue;
+                        }
                         match health[id.index()] {
-                            Health::Ok | Health::Warming | Health::Failing { .. } => {
+                            Health::Ok | Health::Failing { .. } => {
+                                collector_available = true;
+                                break;
+                            }
+                            Health::Warming if id != CollectorId::PowerSupply => {
                                 collector_available = true;
                                 break;
                             }
@@ -436,6 +447,36 @@ mod tests {
         assert_eq!(
             coverage_with_collectors(&snapshot, &health),
             coverage(&snapshot)
+        );
+    }
+
+    #[test]
+    fn power_supply_health_does_not_claim_battery_without_battery() {
+        use crate::collect::{
+            COLLECTORS, CollectorId,
+            health::{Absent, Health},
+        };
+        let snapshot = StatsSnapshot::default();
+        let mut health = [Health::Absent(Absent::NotImplemented); COLLECTORS];
+        assert_eq!(
+            collector_families(CollectorId::PowerSupply),
+            &[MetricFamily::Battery]
+        );
+        health[CollectorId::PowerSupply.index()] = Health::Ok;
+        assert_ne!(
+            cov(
+                &coverage_with_collectors(&snapshot, &health),
+                MetricFamily::Battery
+            ),
+            Coverage::Available
+        );
+        health[CollectorId::PowerSupply.index()] = Health::Warming;
+        assert_ne!(
+            cov(
+                &coverage_with_collectors(&snapshot, &health),
+                MetricFamily::Battery
+            ),
+            Coverage::Available
         );
     }
 }

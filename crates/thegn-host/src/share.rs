@@ -689,6 +689,26 @@ fn supervise(
 }
 
 #[cfg(test)]
+pub(crate) fn seed_failed_instance_for_test(
+    supervisor: &mut ShareSupervisor,
+    worktree: &str,
+    port: u16,
+    generation: u64,
+) {
+    supervisor.instances.push(ShareInstance {
+        worktree: worktree.into(),
+        port,
+        generation,
+        provider: "bore",
+        public: true,
+        state: ShareState::Failed("test failure".into()),
+        shared: Shared::new(),
+        event_tx: None,
+        event_waker: None,
+    });
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
 

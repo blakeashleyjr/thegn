@@ -48,11 +48,13 @@ drawn, and each one is remembered **per tab** — so CPU can sit on a ten-minute
 log scale while Network stays on a live linear one.
 
 - `[` and `]` narrow and widen the **time window**, stepping along the rungs of
-  `[monitor] window_ladder` — 30 seconds up to `all` out of the box, starting at
-  `[monitor] default_window`. The ladder is configurable, so the footer always
-  names the rung you are actually on rather than a list from the manual. When
-  the window is wider than the history collected so far, the header says so
-  (`1h · 4m of history`) rather than implying an hour of flat readings.
+  `[monitor] window_ladder` — 30 seconds up to 24 hours out of the box, starting
+  at `[monitor] default_window`. A custom ladder may end in `all`, meaning
+  everything collected. The ladder is configurable, so the footer always names
+  the rung you are actually on rather than a list from the manual. The monitor
+  currently keeps about an hour of history; wider rungs show the available
+  history, which the header reports (`1h · 4m of history`) rather than implying
+  an hour of flat readings.
 - `g` cycles the **graph style**: filled area, line, or a single-row sparkline.
   Sparkline mode collapses each block to one row, which is how a machine with a
   dozen thermal sensors fits on one screen.
@@ -67,6 +69,9 @@ log scale while Network stays on a live linear one.
 accumulating underneath, so resuming shows a continuous timeline with no gap.
 Pausing also drops the sampler back to its normal rate, so a frozen monitor is
 cheaper than a live one.
+
+The monitor's sampling thread exists only while it is open, waits without
+waking while paused or covered by another overlay, and stops on close.
 
 Note two deliberate differences from the other overlays: `Space` is pause here
 (use `PgDn` to page), and `g` cycles the graph style rather than jumping to the

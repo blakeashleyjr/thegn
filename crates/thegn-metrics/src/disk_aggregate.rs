@@ -1,6 +1,4 @@
-//! Linux disk counters and filesystem rows, kept separate from the sampler so
-//! parsing and grouping remain deterministic and easy to carry into D-1.
-
+//! Compatibility shim for the base-tier disk sampler; shared parsing lives in collect readers.
 use crate::DiskInfo;
 #[cfg(any(target_os = "linux", test))]
 use crate::DiskKind;
@@ -9,169 +7,35 @@ use std::time::Instant;
 
 #[cfg(any(target_os = "linux", test))]
 pub(crate) fn parse_diskstats_line(line: &[u8]) -> Option<(&[u8], u64, u64)> {
-    let mut fields = line
-        .split(|b| b.is_ascii_whitespace())
-        .filter(|f| !f.is_empty());
-    let _major = fields.next()?;
-    let _minor = fields.next()?;
-    let name = fields.next()?;
-    let count = 3 + fields.clone().count();
-    if !matches!(count, 14 | 18 | 20) {
-        return None;
-    }
-    let read = std::str::from_utf8(fields.clone().nth(2)?)
-        .ok()?
-        .parse::<u64>()
-        .ok()?;
-    let written = std::str::from_utf8(fields.nth(6)?)
-        .ok()?
-        .parse::<u64>()
-        .ok()?;
-    Some((name, read, written))
+    let parsed = crate::collect::parse::diskstats::parse_line(line)?;
+    // The phase-0 tuple reader intentionally accepts only the historical layouts.
+    let count = crate::collect::parse::fields(line).count();
+    matches!(count, 14 | 18 | 20).then_some((
+        parsed.name,
+        parsed.sectors_read,
+        parsed.sectors_written,
+    ))
 }
 
 #[cfg(any(target_os = "linux", test))]
 pub(crate) fn sum_physical(buf: &[u8], names: &[String]) -> (u64, u64) {
-    let mut read = 0u64;
-    let mut written = 0u64;
-    for line in buf.split(|b| *b == b'\n') {
-        if let Some((name, r, w)) = parse_diskstats_line(line)
-            && names.iter().any(|n| n.as_bytes() == name)
+    let (mut read, mut written) = (0_u64, 0_u64);
+    for line in buf.split(|byte| *byte == b'\n') {
+        if let Some((name, sectors_read, sectors_written)) = parse_diskstats_line(line)
+            && names.iter().any(|disk| disk.as_bytes() == name)
         {
-            read = read.saturating_add(r.saturating_mul(512));
-            written = written.saturating_add(w.saturating_mul(512));
+            read = read.saturating_add(sectors_read.saturating_mul(512));
+            written = written.saturating_add(sectors_written.saturating_mul(512));
         }
     }
     (read, written)
 }
 
-#[cfg(any(target_os = "linux", test))]
-pub(crate) fn physical_disks(sys_block: &std::path::Path) -> Vec<String> {
-    let Ok(entries) = std::fs::read_dir(sys_block) else {
-        return Vec::new();
-    };
-    let mut disks = entries
-        .flatten()
-        .filter_map(|entry| {
-            let name = entry.file_name().to_string_lossy().into_owned();
-            let excluded = ["dm-", "md", "loop", "zram", "ram", "nbd"]
-                .iter()
-                .any(|p| name.starts_with(p));
-            (!excluded && entry.path().join("device").exists()).then_some(name)
-        })
-        .collect::<Vec<_>>();
-    disks.sort();
-    disks
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-#[cfg(any(target_os = "linux", test))]
-pub(crate) struct MountRow {
-    pub major_minor: String,
-    pub mount: String,
-    pub fstype: String,
-    pub source: String,
-}
+#[cfg(target_os = "linux")]
+pub(crate) use crate::collect::linux::disk_topology::physical_disks;
 
 #[cfg(any(target_os = "linux", test))]
-fn unescape_mount(value: &str) -> String {
-    let bytes = value.as_bytes();
-    let mut out = Vec::with_capacity(bytes.len());
-    let mut i = 0;
-    while i < bytes.len() {
-        if bytes[i] == b'\\' && i + 3 < bytes.len() {
-            let code = &bytes[i + 1..i + 4];
-            let decoded = match code {
-                b"040" => Some(b' '),
-                b"011" => Some(b'\t'),
-                b"012" => Some(b'\n'),
-                b"134" => Some(b'\\'),
-                _ => None,
-            };
-            if let Some(byte) = decoded {
-                out.push(byte);
-                i += 4;
-                continue;
-            }
-        }
-        out.push(bytes[i]);
-        i += 1;
-    }
-    String::from_utf8_lossy(&out).into_owned()
-}
-
-#[cfg(any(target_os = "linux", test))]
-pub(crate) fn parse_mountinfo(text: &str) -> Vec<MountRow> {
-    text.lines()
-        .filter_map(|line| {
-            let (before, after) = line.split_once(" - ")?;
-            let left = before.split_whitespace().collect::<Vec<_>>();
-            let right = after.split_whitespace().collect::<Vec<_>>();
-            Some(MountRow {
-                major_minor: left.get(2)?.to_string(),
-                mount: unescape_mount(left.get(4)?),
-                fstype: right.first()?.to_string(),
-                source: unescape_mount(right.get(1)?),
-            })
-        })
-        .collect()
-}
-
-#[cfg(any(target_os = "linux", test))]
-pub(crate) fn hidden(fstype: &str, mount: &str, source: &str) -> bool {
-    matches!(
-        fstype,
-        "rootfs"
-            | "sysfs"
-            | "proc"
-            | "devtmpfs"
-            | "cgroup"
-            | "cgroup2"
-            | "pstore"
-            | "squashfs"
-            | "rpc_pipefs"
-            | "iso9660"
-            | "devpts"
-            | "hugetlbfs"
-            | "mqueue"
-            | "tmpfs"
-            | "cifs"
-            | "nfs"
-            | "nfs4"
-            | "autofs"
-    ) || (mount.starts_with("/sys/")
-        || mount == "/sys"
-        || mount.starts_with("/proc/")
-        || mount == "/proc"
-        || ((mount.starts_with("/run/") || mount == "/run") && !mount.starts_with("/run/media")))
-        || source.starts_with("sunrpc")
-}
-
-#[cfg(any(target_os = "linux", test))]
-pub(crate) fn group_mounts(rows: Vec<MountRow>) -> Vec<(MountRow, u32)> {
-    let mut groups: Vec<(String, Vec<MountRow>)> = Vec::new();
-    for row in rows
-        .into_iter()
-        .filter(|r| !hidden(&r.fstype, &r.mount, &r.source))
-    {
-        if let Some((_, rows)) = groups
-            .iter_mut()
-            .find(|(major_minor, _)| *major_minor == row.major_minor)
-        {
-            rows.push(row);
-        } else {
-            groups.push((row.major_minor.clone(), vec![row]));
-        }
-    }
-    groups
-        .into_iter()
-        .filter_map(|(_, mut rows)| {
-            rows.sort_by_key(|r| r.mount.len());
-            let primary = rows.first()?.clone();
-            Some((primary, rows.len().saturating_sub(1) as u32))
-        })
-        .collect()
-}
+pub(crate) use crate::collect::parse::mountinfo::{MountRow, group_mounts, parse_mountinfo};
 
 #[cfg(any(target_os = "linux", test))]
 pub(crate) fn rate(prev: (u64, u64), cur: (u64, u64), dt: f64) -> Option<(u64, u64)> {
@@ -424,6 +288,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(target_os = "linux")]
     fn aggregate_counts_only_top_level_physical_disks() {
         let root = tempfile::tempdir().unwrap();
         for name in ["nvme0n1", "dm-0", "zram0", "loop0", "md0", "sda", "sdb"] {
@@ -438,7 +303,7 @@ mod tests {
             physical_disks(root.path()),
             vec!["nvme0n1".to_string(), "sda".to_string()]
         );
-        let stats = b"259 0 nvme0n1 1 0 10 0 1 0 20 0 0 0 0 0 0 0 0 0 0\n259 5 nvme0n1p5 1 0 100 0 1 0 200 0 0 0 0 0 0 0 0 0 0\n253 0 dm-0 1 0 300 0 1 0 400 0 0 0 0 0 0 0 0 0 0\n252 0 zram0 1 0 500 0 1 0 600 0 0 0 0 0 0 0 0 0 0\n8 0 sda 1 0 30 0 1 0 40 0 0 0 0 0 0 0 0 0 0\n8 1 sda1 1 0 300 0 1 0 400 0 0 0 0 0 0 0 0 0 0";
+        let stats = b"259 0 nvme0n1 1 0 10 0 1 0 20 0 0 0 0 0 0 0 0 0 0\n259 5 nvme0n1p5 1 0 100 0 1 0 200 0 0 0 0 0 0 0 0 0 0\n253 0 dm-0 1 0 300 0 1 0 400 0 0 0 0 0 0 0 0 0 0\n252 0 zram0 1 0 500 0 1 0 600 0 0 0 0 0 0 0 0 0 0\n8 0 sda 1 0 30 0 1 0 40 0 0 0 0 0 0 0 0 0 0\n8 1 sda1 1 0 300 0 1 0 400 0 0 0 0 0 0 0 0 0 0\n8 0 sda 1 0 900 0 1 0 900 0 0 0 0 0 0 0 0 0 0 0";
         assert_eq!(
             sum_physical(stats, &physical_disks(root.path())),
             (40 * 512, 60 * 512)

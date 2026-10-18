@@ -1118,7 +1118,7 @@ mod tests {
     }
     #[test]
     fn status_probe_maps_exit_status_and_spawn_failure() {
-        if !Path::new("/bin/sh").exists() {
+        if !cfg!(unix) {
             return;
         }
         assert!(status_with_timeout(
@@ -1141,9 +1141,6 @@ mod tests {
     fn status_probe_timeout_kills_the_probe_group() {
         use std::time::Instant;
 
-        if !Path::new("/bin/sh").exists() || !Path::new("/proc/self/stat").exists() {
-            return;
-        }
         let dir = tempfile::tempdir().unwrap();
         let pidfile = dir.path().join("grandchild.pid");
         let argv = vec![

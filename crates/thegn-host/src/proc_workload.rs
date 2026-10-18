@@ -202,6 +202,7 @@ fn render_workloads() -> Vec<serde_json::Value> {
                         pid: 10_000 + i as u32,
                         ppid: None,
                         start_time: 1_000 + i as u64,
+                        start_ticks: None,
                         name: format!("fixture-{i:03}-世-e\u{301}-worker"),
                         cpu_pct: (i % 101) as f32,
                         rss_bytes: (i as u64 + 1) * 1_048_576,

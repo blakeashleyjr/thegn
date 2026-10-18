@@ -7408,6 +7408,7 @@ async fn event_loop<T: Terminal>(
     // key/geometry paths.
     let mut monitor: Option<crate::monitor::MonitorOverlay> = None;
     let mut monitor_sampler = crate::monitor_sampler::MonitorSampler::new(waker.clone());
+    let mut monitor_history = crate::monitor::history::MonitorHistory::new();
     // The agent-pipeline board. Its own slot beside the monitor rather than a
     // tab of it: a stage pipeline is not a hardware metric, it wants the whole
     // box for its stage columns, and as the tenth tab it was unreachable by
@@ -10756,6 +10757,11 @@ async fn event_loop<T: Terminal>(
                     model.status = status;
                     dirty = true;
                 }
+                run_pending_db::PendingDbResult::PoolTarget { status } => {
+                    model.status = status;
+                    last_pool_reconcile = None;
+                    dirty = true;
+                }
             }
         }
         let active_tests_wt = active_tab_path(&session).to_string_lossy().into_owned();
@@ -12401,6 +12407,7 @@ async fn event_loop<T: Terminal>(
                 snap
             };
             panel_ui.docs.telemetry.push(&snap, at_ms);
+            monitor_history.ingest_masthead(&snap, at_ms);
             panel_ui.docs.tick = panel_ui.docs.tick.wrapping_add(1);
             status_data_moved = true;
             if telemetry_visible {
@@ -12550,9 +12557,10 @@ async fn event_loop<T: Terminal>(
                 dirty = true;
             }
         }
-        // F7/F6b consume the frame later; recycle it now to keep the pool bounded.
+        // F7 ingests frames here; F6b reads the history later. Recycle to keep the pool bounded.
         if let Some(frame) = monitor_sampler.take_latest() {
             loop_perf.tick(crate::perf::WakeSource::Stats);
+            monitor_history.ingest_frame(&frame, crate::monitor::history::wall_now_ms());
             monitor_sampler.recycle(frame);
         }
         // Hydration can clear process state while a Processes overlay remains
@@ -14787,30 +14795,28 @@ async fn event_loop<T: Terminal>(
 
         // -- 23. Log streams
         let log_backlog = {
-            let slice = logs_ingress.take(crate::loop_policy::log_apply_budget(
-                !pending_input.is_empty(),
-            ));
-            if !slice.is_empty() {
+            let track_cursor = panel_ui.open == crate::panel::Section::Logs || panel_ui.logs_tail;
+            let anchor = if track_cursor && !panel_ui.logs_tail && logs_ingress.has_pending() {
+                crate::panel::sections::logs::cursor_seq(&model.panel, &panel_ui)
+            } else {
+                None
+            };
+            let result = crate::loop_policy::drain_logs(
+                &logs_ingress,
+                &mut model.panel.log_lines_structured,
+                &mut model.panel.log_first_seq,
+                crate::loop_policy::log_budget(!pending_input.is_empty()),
+                want_panel && panel_ui.open == crate::panel::Section::Logs,
+                std::time::Instant::now,
+            );
+            if result.took {
                 loop_perf.tick(crate::perf::WakeSource::Other);
-                // Avoid the render -> own-log -> tail -> render feedback loop.
-                let track_cursor =
-                    panel_ui.open == crate::panel::Section::Logs || panel_ui.logs_tail;
-                let anchor = if track_cursor {
-                    crate::panel::sections::logs::cursor_seq(&model.panel, &panel_ui)
-                } else {
-                    None
-                };
-                dirty |= crate::loop_policy::apply_log_slice(
-                    &mut model.panel.log_lines_structured,
-                    &mut model.panel.log_first_seq,
-                    slice,
-                    want_panel && panel_ui.open == crate::panel::Section::Logs,
-                );
-                if track_cursor {
-                    crate::panel::sections::logs::repin(&model.panel, &mut panel_ui, anchor);
-                }
             }
-            logs_ingress.has_pending()
+            dirty |= result.dirty;
+            if track_cursor && result.took {
+                crate::panel::sections::logs::repin(&model.panel, &mut panel_ui, anchor);
+            }
+            result.backlog
         };
 
         // Ingress-share state from the supervisor threads: persist the row,
@@ -15953,6 +15959,7 @@ async fn event_loop<T: Terminal>(
                 front.flush_changes_older_than(seq);
                 wire.push(clear);
                 wire_renderer.invalidate();
+                preview_gfx.invalidate();
                 full_repaint = false;
                 last_resync = std::time::Instant::now();
             } else if resync_now {
@@ -23196,21 +23203,7 @@ async fn event_loop<T: Terminal>(
                                 Some((wt, port)) => {
                                     let stopped = share_supervisor.stop(&wt, Some(port));
                                     let did_stop = !stopped.is_empty();
-                                    let stopped_runs = stopped;
-                                    crate::db_task::persist(move |db| {
-                                        for (port, generation) in stopped_runs {
-                                            match db.delete_share_generation(&wt, port, generation)
-                                            {
-                                                Ok(true) => {}
-                                                Ok(false) => {
-                                                    tracing::debug!(target: "thegn::db", %wt, port, generation, "stale stopped share delete left another generation intact")
-                                                }
-                                                Err(error) => {
-                                                    tracing::debug!(target: "thegn::db", %error, "stopped share cache delete failed")
-                                                }
-                                            }
-                                        }
-                                    });
+                                    crate::handlers::host::queue_stopped_share_deletes(wt, stopped);
                                     model.shares = current_share_views(&share_supervisor, &session);
                                     model.status = if !did_stop {
                                         format!("Share :{port} was already down")
@@ -24863,9 +24856,10 @@ async fn event_loop<T: Terminal>(
                                     &session,
                                     &current_config,
                                     delta,
+                                    &pending_db_tx,
+                                    &waker,
                                 ) {
                                     model.status = msg;
-                                    last_pool_reconcile = None; // reconcile immediately
                                 }
                             }
                             Action::TogglePanel => {
