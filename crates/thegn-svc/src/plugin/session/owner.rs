@@ -1,13 +1,128 @@
 //! Sole process/pipe owner; cancellation never travels through the data queue.
 use super::admission::Shared;
-use super::{CLOSE_BUDGET, CloseReason, SessionEvent, SessionOutcome, TreeGuarantee, junk_text};
+use super::{
+    CLOSE_BUDGET, CloseReason, MAX_STDERR_LINE_BYTES, MAX_STDERR_TAIL_BYTES,
+    STDERR_LOG_LINES_PER_WINDOW, SessionEvent, SessionOutcome, TreeGuarantee, junk_text,
+};
 use crate::plugin::platform::{Input, Output, Process};
 use crate::plugin::proc::{FrameReject, MAX_LINE_BYTES};
 use futures_util::FutureExt;
+use std::collections::VecDeque;
 use std::io;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::{Arc, Mutex};
 use tokio::time::{Duration, Instant};
+
+const STDERR_LOG_WINDOW: Duration = Duration::from_secs(1);
+const STDERR_TRUNCATION_MARKER: &str = "...[truncated]";
+
+struct StderrCapture {
+    partial: Vec<u8>,
+    truncating: bool,
+    tail: VecDeque<u8>,
+    bytes: u64,
+    lines: u64,
+    dropped_lines: u64,
+    truncated_lines: u64,
+    window_started: Instant,
+    logged_in_window: u64,
+}
+impl StderrCapture {
+    fn new() -> Self {
+        Self {
+            partial: Vec::with_capacity(MAX_STDERR_LINE_BYTES),
+            truncating: false,
+            tail: VecDeque::with_capacity(MAX_STDERR_TAIL_BYTES),
+            bytes: 0,
+            lines: 0,
+            dropped_lines: 0,
+            truncated_lines: 0,
+            window_started: Instant::now(),
+            logged_in_window: 0,
+        }
+    }
+
+    fn feed(&mut self, bytes: &[u8]) {
+        self.bytes = self.bytes.saturating_add(bytes.len() as u64);
+        if bytes.len() >= MAX_STDERR_TAIL_BYTES {
+            self.tail.clear();
+            self.tail
+                .extend(&bytes[bytes.len() - MAX_STDERR_TAIL_BYTES..]);
+        } else {
+            let excess = self
+                .tail
+                .len()
+                .saturating_add(bytes.len())
+                .saturating_sub(MAX_STDERR_TAIL_BYTES);
+            self.tail.drain(..excess);
+            self.tail.extend(bytes);
+        }
+        for &byte in bytes {
+            if byte == b'\n' {
+                self.finish_line();
+            } else if !self.truncating && self.partial.len() < MAX_STDERR_LINE_BYTES {
+                self.partial.push(byte);
+            } else if !self.truncating {
+                self.truncating = true;
+            }
+        }
+    }
+
+    fn finish_line(&mut self) {
+        self.lines = self.lines.saturating_add(1);
+        if self.truncating {
+            self.truncated_lines = self.truncated_lines.saturating_add(1);
+        }
+        let now = Instant::now();
+        if now.duration_since(self.window_started) >= STDERR_LOG_WINDOW {
+            self.window_started = now;
+            self.logged_in_window = 0;
+        }
+        if self.logged_in_window < STDERR_LOG_LINES_PER_WINDOW {
+            self.logged_in_window += 1;
+            let line = framed_stderr_line(&self.partial, self.truncating);
+            tracing::debug!(target: "thegn::plugin", "stderr: {line}");
+        } else {
+            self.dropped_lines = self.dropped_lines.saturating_add(1);
+        }
+        self.partial.clear();
+        self.truncating = false;
+    }
+
+    fn finish_partial(&mut self) {
+        if !self.partial.is_empty() || self.truncating {
+            self.finish_line();
+        }
+    }
+
+    fn outcome_fields(&self) -> (Vec<u8>, u64, u64, u64, u64) {
+        (
+            self.tail.iter().copied().collect(),
+            self.bytes,
+            self.lines,
+            self.dropped_lines,
+            self.truncated_lines,
+        )
+    }
+}
+
+fn framed_stderr_line(bytes: &[u8], truncated: bool) -> String {
+    let mut line = String::from_utf8_lossy(bytes).into_owned();
+    if truncated {
+        let content_limit = MAX_STDERR_LINE_BYTES - STDERR_TRUNCATION_MARKER.len();
+        while !line.is_char_boundary(content_limit.min(line.len())) {
+            line.pop();
+        }
+        line.truncate(content_limit.min(line.len()));
+        line.push_str(STDERR_TRUNCATION_MARKER);
+    }
+    line
+}
+
+pub(super) struct HeldProcess {
+    process: Process,
+    stderr: StderrCapture,
+}
 
 struct Lines {
     partial: Vec<u8>,
@@ -114,6 +229,7 @@ async fn running(
     process: &mut Process,
     shared: &Shared,
     lines: &mut Lines,
+    stderr: &mut StderrCapture,
     callback: &impl Fn(SessionEvent),
 ) -> CloseReason {
     if !process.errors.is_empty() {
@@ -178,7 +294,7 @@ async fn running(
             },
             result = read(&mut process.stderr, &mut error, stderr_live) => match result {
                 Ok(0) => stderr_live = false,
-                Ok(len) => tracing::debug!(target: "thegn::plugin", "stderr: {}", String::from_utf8_lossy(&error[..len])),
+                Ok(len) => stderr.feed(&error[..len]),
                 Err(error) => { process.errors.push(format!("stderr read: {error}")); return CloseReason::Protocol; }
             },
             result = write(&mut process.stdin, &active) => match result {
@@ -200,6 +316,7 @@ async fn cleanup(
     process: &mut Process,
     shared: &Shared,
     lines: &mut Lines,
+    stderr: &mut StderrCapture,
     callback: &impl Fn(SessionEvent),
     reason: CloseReason,
 ) -> SessionOutcome {
@@ -250,11 +367,12 @@ async fn cleanup(
             },
             result = read(&mut process.stderr, &mut error, stderr_live) => match result {
                 Ok(0) | Err(_) => stderr_live = false,
-                Ok(len) => tracing::debug!(target: "thegn::plugin", "stderr: {}", String::from_utf8_lossy(&error[..len])),
+                Ok(len) => stderr.feed(&error[..len]),
             },
         }
         tokio::task::yield_now().await;
     }
+    stderr.finish_partial();
     shared.finish_close();
     // Pipe cancellation and leader observation share the SAME deadline. Start
     // cancellation before waiting so inherited Windows pipes cannot consume
@@ -285,6 +403,8 @@ async fn cleanup(
     {
         process.errors.push("terminal callback panicked".into());
     }
+    let (stderr_tail, stderr_bytes, stderr_lines, stderr_dropped_lines, stderr_truncated_lines) =
+        stderr.outcome_fields();
     SessionOutcome {
         reason,
         leader_reaped,
@@ -293,6 +413,11 @@ async fn cleanup(
         tree: TreeGuarantee::Unproven,
         termination_requested,
         errors: std::mem::take(&mut process.errors),
+        stderr_tail,
+        stderr_bytes,
+        stderr_lines,
+        stderr_dropped_lines,
+        stderr_truncated_lines,
     }
 }
 
@@ -301,20 +426,43 @@ async fn cleanup(
 pub(super) struct Custody {
     process: Option<Process>,
     shared: Arc<Shared>,
-    held: Arc<Mutex<Option<Process>>>,
+    held: Arc<Mutex<Option<HeldProcess>>>,
+    stderr: StderrCapture,
 }
 impl Custody {
-    pub fn new(process: Process, shared: Arc<Shared>, held: Arc<Mutex<Option<Process>>>) -> Self {
+    pub fn new(
+        process: Process,
+        shared: Arc<Shared>,
+        held: Arc<Mutex<Option<HeldProcess>>>,
+    ) -> Self {
         Self {
             process: Some(process),
             shared,
             held,
+            stderr: StderrCapture::new(),
+        }
+    }
+    pub(super) fn from_held(
+        held_process: HeldProcess,
+        shared: Arc<Shared>,
+        held: Arc<Mutex<Option<HeldProcess>>>,
+    ) -> Self {
+        Self {
+            process: Some(held_process.process),
+            shared,
+            held,
+            stderr: held_process.stderr,
         }
     }
     fn finish(&mut self, outcome: SessionOutcome) {
         let process = self.process.take();
         if !outcome.settled() {
-            *self.held.lock().unwrap_or_else(|e| e.into_inner()) = process;
+            if let Some(process) = process {
+                *self.held.lock().unwrap_or_else(|e| e.into_inner()) = Some(HeldProcess {
+                    process,
+                    stderr: std::mem::replace(&mut self.stderr, StderrCapture::new()),
+                });
+            }
         }
         self.shared.outcome.send_replace(Some(outcome));
     }
@@ -331,8 +479,16 @@ impl Drop for Custody {
                 tree: TreeGuarantee::Unproven,
                 termination_requested: false,
                 errors: vec!["lifecycle task cancelled or unwound with owned resources".into()],
+                stderr_tail: self.stderr.outcome_fields().0,
+                stderr_bytes: self.stderr.bytes,
+                stderr_lines: self.stderr.lines,
+                stderr_dropped_lines: self.stderr.dropped_lines,
+                stderr_truncated_lines: self.stderr.truncated_lines,
             };
-            *self.held.lock().unwrap_or_else(|e| e.into_inner()) = Some(process);
+            *self.held.lock().unwrap_or_else(|e| e.into_inner()) = Some(HeldProcess {
+                process,
+                stderr: std::mem::replace(&mut self.stderr, StderrCapture::new()),
+            });
             self.shared
                 .close(CloseReason::OwnerPanic, Instant::now() + CLOSE_BUDGET);
             self.shared.finish_close();
@@ -353,11 +509,25 @@ pub(super) async fn run(mut custody: Custody, callback: impl Fn(SessionEvent) + 
     };
     let mut lines = Lines::new();
     let process = custody.process.as_mut().expect("owned process");
-    let reason = AssertUnwindSafe(running(process, &shared, &mut lines, &routed))
-        .catch_unwind()
-        .await
-        .unwrap_or(CloseReason::OwnerPanic);
-    let outcome = cleanup(process, &shared, &mut lines, &routed, reason).await;
+    let reason = AssertUnwindSafe(running(
+        process,
+        &shared,
+        &mut lines,
+        &mut custody.stderr,
+        &routed,
+    ))
+    .catch_unwind()
+    .await
+    .unwrap_or(CloseReason::OwnerPanic);
+    let outcome = cleanup(
+        process,
+        &shared,
+        &mut lines,
+        &mut custody.stderr,
+        &routed,
+        reason,
+    )
+    .await;
     custody.finish(outcome);
 }
 
@@ -376,9 +546,58 @@ pub(super) async fn retry(mut custody: Custody, deadline: Instant) {
         custody.process.as_mut().expect("held process"),
         &shared,
         &mut Lines::new(),
+        &mut custody.stderr,
         &|_| {},
         CloseReason::Shutdown,
     )
     .await;
     custody.finish(outcome);
+}
+
+#[cfg(test)]
+mod stderr_tests {
+    use super::{StderrCapture, framed_stderr_line};
+    use crate::plugin::session::{
+        MAX_STDERR_LINE_BYTES, MAX_STDERR_TAIL_BYTES, STDERR_LOG_LINES_PER_WINDOW,
+    };
+
+    #[test]
+    fn newline_free_flood_counts_every_byte_and_keeps_only_the_tail() {
+        let mut capture = StderrCapture::new();
+        let block = [b'x'; 8192];
+        for _ in 0..8192 {
+            capture.feed(&block);
+        }
+        capture.finish_partial();
+
+        assert_eq!(capture.bytes, 64 * 1024 * 1024);
+        assert_eq!(capture.tail.len(), MAX_STDERR_TAIL_BYTES);
+        assert_eq!(capture.lines, 1);
+        assert_eq!(capture.truncated_lines, 1);
+    }
+
+    #[test]
+    fn fast_lines_obey_the_fixed_log_budget_and_count_drops() {
+        let mut capture = StderrCapture::new();
+        for _ in 0..100 {
+            capture.feed(b"line\n");
+        }
+
+        assert_eq!(capture.lines, 100);
+        assert_eq!(capture.dropped_lines, 100 - STDERR_LOG_LINES_PER_WINDOW);
+    }
+
+    #[test]
+    fn oversized_line_has_a_bounded_truncation_marker() {
+        let mut capture = StderrCapture::new();
+        capture.feed(&vec![b'x'; MAX_STDERR_LINE_BYTES + 100]);
+        let rendered = framed_stderr_line(&capture.partial, capture.truncating);
+        assert!(capture.truncating);
+        assert!(rendered.ends_with("...[truncated]"));
+        assert!(rendered.len() <= MAX_STDERR_LINE_BYTES);
+        capture.feed(b"\nnext\n");
+        assert_eq!(capture.lines, 2);
+        assert_eq!(capture.truncated_lines, 1);
+        assert_eq!(capture.partial, b"");
+    }
 }
