@@ -114,17 +114,17 @@ macro_rules! col {
 
 pub(crate) const CATALOG: [ColSpec; 37] = [
     col!(Pid, "PID", 0, 3, 6, false, Right, Always),
-    col!(Ppid, "PPID", 8, 3, 6, false, Right, Always),
-    col!(User, "USER", 7, 3, 8, false, Left, User),
-    col!(Owner, "OWNER", 6, 1, 10, false, Left, Owner),
-    col!(Worktree, "WORKTR", 9, 2, 12, false, Left, Worktree),
+    col!(Ppid, "PPID", 8, 4, 6, false, Right, Always),
+    col!(User, "USER", 7, 4, 8, false, Left, User),
+    col!(Owner, "OWNER", 6, 5, 10, false, Left, Owner),
+    col!(Worktree, "WORKTR", 9, 6, 12, false, Left, Worktree),
     col!(State, "S", 1, 1, 1, false, Center, State),
     col!(Nice, "NI", 8, 2, 3, false, Right, Nice),
-    col!(Priority, "PRI", 9, 2, 4, false, Right, Priority),
-    col!(Policy, "POL", 9, 2, 3, false, Left, Policy),
-    col!(Threads, "THR", 8, 2, 4, false, Right, Threads),
+    col!(Priority, "PRI", 9, 3, 4, false, Right, Priority),
+    col!(Policy, "POL", 9, 3, 3, false, Left, Policy),
+    col!(Threads, "THR", 8, 3, 4, false, Right, Threads),
     col!(Cpu, "CPU%", 2, 5, 5, false, Right, Cpu),
-    col!(CpuBar, "usr/sys", 9, 5, 8, false, Left, Cpu),
+    col!(CpuBar, "usr/sys", 9, 7, 8, false, Left, Cpu),
     col!(CpuHistory, "CPU~", 9, 4, 8, false, Left, History),
     col!(Average, "AVG", 9, 5, 5, false, Right, Average),
     col!(Time, "TIME+", 8, 8, 8, false, Right, Time),
@@ -134,28 +134,28 @@ pub(crate) const CATALOG: [ColSpec; 37] = [
     col!(Shared, "SHR", 8, 5, 5, false, Right, Memory),
     col!(Swap, "SWAP", 8, 5, 5, false, Right, Memory),
     col!(MemHistory, "MEM~", 9, 4, 8, false, Left, History),
-    col!(MinorFaults, "MINF/s", 9, 4, 6, false, Right, Always),
-    col!(MajorFaults, "MAJF/s", 9, 4, 6, false, Right, Always),
+    col!(MinorFaults, "MINF/s", 9, 6, 6, false, Right, Always),
+    col!(MajorFaults, "MAJF/s", 9, 6, 6, false, Right, Always),
     col!(ReadRate, "RD/s", 7, 4, 6, false, Right, Io),
     col!(WriteRate, "WR/s", 7, 4, 6, false, Right, Io),
-    col!(IoTotal, "IO tot", 9, 4, 8, false, Right, Io),
+    col!(IoTotal, "IO tot", 9, 6, 8, false, Right, Io),
     col!(Fds, "FDS", 8, 3, 5, false, Right, Fds),
     col!(Delay, "DLY%", 8, 4, 5, false, Right, Delay),
     col!(
         ContextSwitches,
         "CSW/s",
         8,
-        4,
+        5,
         6,
         false,
         Right,
         ContextSwitches
     ),
     col!(CpuNumber, "CPU#", 9, 4, 4, false, Right, CpuNumber),
-    col!(Age, "AGE", 7, 3, 4, false, Right, Age),
+    col!(Age, "AGE", 7, 4, 4, false, Right, Age),
     col!(Tty, "TTY", 9, 3, 6, false, Left, Tty),
     col!(Oom, "OOM", 9, 3, 5, false, Right, Oom),
-    col!(Unit, "UNIT", 8, 3, 10, false, Left, Unit),
+    col!(Unit, "UNIT", 8, 4, 10, false, Left, Unit),
     col!(Container, "CTR", 8, 3, 8, false, Left, Container),
     col!(Gpu, "GPU", 9, 3, 6, false, Right, Gpu),
     col!(Command, "COMMAND", 0, 8, 8, true, Left, Command),
@@ -183,8 +183,8 @@ impl Preset {
         use ColId::*;
         match self {
             Preset::Default => &[
-                Pid, User, Owner, State, Cpu, CpuBar, CpuHistory, MemPercent, Rss, ReadRate,
-                WriteRate, Time, Command, Threads, Nice, Swap,
+                Pid, User, Owner, State, Nice, Threads, Cpu, CpuBar, CpuHistory, MemPercent, Rss,
+                Swap, ReadRate, WriteRate, Time, Command,
             ],
             Preset::Memory => &[
                 Pid,
@@ -248,35 +248,49 @@ pub(crate) fn fit_columns(preset: Preset, width: usize, flags: FitFlags) -> Vec<
         .copied()
         .filter(|id| *id != Pid && *id != Command)
         .collect();
-    // These two columns are the narrow-table core and remain present as width
-    // grows, so switching presets cannot make a previously visible column vanish.
+    // CPU% and RSS are injected into presets that omit them so the narrow-table
+    // layout remains a subset when the 60-cell preset layout takes over.
     for id in [Cpu, Rss] {
         if !candidates.contains(&id) {
             candidates.push(id);
         }
     }
     let mut ordered: Vec<ColId> = candidates;
-    ordered.sort_by_key(|id| (spec(*id).priority, std::cmp::Reverse(collapse_rank(*id))));
+    // The collapse order defines the greedy order directly: latest-to-collapse
+    // columns are considered first, independent of the catalogue priority.
+    ordered.sort_by_key(|id| std::cmp::Reverse(collapse_rank(*id)));
+    // `width` is the whole table viewport. Tree mode reserves two cells for
+    // its branch prefix; an open detail pane reserves one for the divider.
     let overhead = usize::from(flags.detail_open) + if flags.tree { 2 } else { 0 };
-    let mut used = spec(columns[0]).min + 1 + overhead; // command always follows
+    let mut used = spec(Pid).min + 1 + overhead; // COMMAND always follows
     for id in ordered {
         let need = spec(id).min + 1;
         if used + need + spec(Command).min <= width {
             chosen.push(id);
             used += need;
+        } else {
+            break;
         }
     }
-    // Render in preset order, irrespective of the greedy inclusion order.
+    // Render in preset order. Injected columns have a stable explicit position
+    // immediately after PID rather than falling back to catalogue indexes.
+    let mut render_order = Vec::with_capacity(columns.len() + 2);
+    for id in columns {
+        render_order.push(*id);
+        if *id == Pid {
+            if !columns.contains(&Cpu) {
+                render_order.push(Cpu);
+            }
+            if !columns.contains(&Rss) {
+                render_order.push(Rss);
+            }
+        }
+    }
     chosen.sort_by_key(|id| {
-        columns
+        render_order
             .iter()
             .position(|candidate| candidate == id)
-            .unwrap_or_else(|| {
-                CATALOG
-                    .iter()
-                    .position(|col| col.id == *id)
-                    .unwrap_or(usize::MAX)
-            })
+            .unwrap_or(usize::MAX)
     });
     chosen.push(Command);
     let gutters = chosen.len().saturating_sub(1);
@@ -332,7 +346,7 @@ fn collapse_rank(id: ColId) -> usize {
         State => 27,
         Pid => 28,
         Command => 29,
-        Ppid | Worktree | Container | Unit | Gpu | IoTotal => 30,
+        Ppid | Worktree | Container | Unit | Gpu | IoTotal | Age => 30,
     }
 }
 
@@ -459,7 +473,8 @@ pub(crate) fn proc_row_caps() -> RowCaps {
 pub(crate) fn format_cpu(value: Option<f64>) -> String {
     match value {
         Some(value) if value.is_finite() => {
-            let rendered = if value.abs() >= 100.0 {
+            let rounded = (value * 10.0).round() / 10.0;
+            let rendered = if rounded.abs() >= 100.0 {
                 format!("{value:.0}")
             } else {
                 format!("{value:.1}")
@@ -470,7 +485,7 @@ pub(crate) fn format_cpu(value: Option<f64>) -> String {
                 format!("{rendered:>5}")
             }
         }
-        Some(_) | None => "    —".into(),
+        Some(_) | None => NumFmt::default().reading(Reading::Unknown, Unit::CpuCoreSum, 5),
     }
 }
 
@@ -491,7 +506,7 @@ pub(crate) fn format_bytes(value: Option<u64>) -> String {
 pub(crate) fn format_time_plus(seconds: Option<f64>) -> String {
     match seconds {
         Some(seconds) if seconds.is_finite() && seconds >= 0.0 => time_plus(seconds),
-        Some(_) | None => "       —".into(),
+        Some(_) | None => NumFmt::default().reading(Reading::Unknown, Unit::TimePlus, 8),
     }
 }
 
