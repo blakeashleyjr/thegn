@@ -45,7 +45,7 @@ fn key(overlay: &mut MonitorOverlay, key: KeyCode) {
 }
 
 #[test]
-fn x_opens_for_selected_process_and_letter_then_y_delivers_through_seam() {
+fn x_opens_menu_and_non_destructive_letter_delivers_immediately_through_seam() {
     set_test_signal_call(fake_signal);
     SIGNAL_SENT.set(None);
     let mut overlay = overlay();
@@ -62,11 +62,7 @@ fn x_opens_for_selected_process_and_letter_then_y_delivers_through_seam() {
             key(&mut overlay, KeyCode::Char('t'));
             crate::platform::ProcSignal::Terminate
         };
-    assert!(matches!(
-        overlay.confirm,
-        Some(Confirm::Signal { stage, .. }) if stage == signal
-    ));
-    key(&mut overlay, KeyCode::Char('y'));
+    assert!(overlay.confirm.is_none());
     assert_eq!(SIGNAL_SENT.get(), Some(signal));
     let sent_text = format!("SIG{}", signal.label());
     assert!(
@@ -75,6 +71,28 @@ fn x_opens_for_selected_process_and_letter_then_y_delivers_through_seam() {
             .as_deref()
             .is_some_and(|s| s.contains(sent_text.as_str()))
     );
+}
+
+#[test]
+fn kill_and_stop_open_the_identity_checked_confirmation() {
+    for signal in [
+        crate::platform::ProcSignal::Kill,
+        crate::platform::ProcSignal::Stop,
+    ] {
+        if !crate::platform::ProcSignal::menu().contains(&signal) {
+            continue;
+        }
+        let mut overlay = overlay();
+        key(&mut overlay, KeyCode::Char('X'));
+        key(&mut overlay, KeyCode::Char(signal.menu_key()));
+        assert!(matches!(
+            overlay.confirm,
+            Some(Confirm::Signal { stage, .. }) if stage == signal
+        ));
+        SIGNAL_SENT.set(None);
+        key(&mut overlay, KeyCode::Char('y'));
+        assert_eq!(SIGNAL_SENT.get(), Some(signal));
+    }
 }
 
 #[test]
@@ -111,9 +129,8 @@ fn missing_selection_does_not_open_and_vanished_identity_is_refused() {
 
     let mut vanished = overlay();
     key(&mut vanished, KeyCode::Char('X'));
-    key(&mut vanished, KeyCode::Char('t'));
     vanished.proc_rows.clear();
-    key(&mut vanished, KeyCode::Char('y'));
+    key(&mut vanished, KeyCode::Char('t'));
     assert!(vanished.confirm.is_none());
     assert!(vanished.status.as_deref().is_some_and(|s| {
         s.contains("process changed or left the sampled list; select it again")
@@ -177,7 +194,7 @@ fn footer_names_menu_entries_and_non_legacy_signal_confirmation() {
     };
     assert!(menu_text.contains(">t TERM"));
     assert!(menu_text.contains(crate::platform::ProcSignal::menu()[0].label()));
-    assert!(menu_text.contains("Enter select"));
+    assert!(menu_text.contains("Up/Down choose · Enter select · Esc cancel"));
 
     let hangup = Confirm::Signal {
         pid: 4242,
