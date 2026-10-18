@@ -130,6 +130,8 @@ fn fill_ratio(surface: &Surface, area: Rect) -> f32 {
                 && x.saturating_add(cell.width()) > x0
                 && !cell.str().is_empty()
                 && cell.str() != " "
+                // A blank braille cell (U+2800) is visually empty.
+                && cell.str() != "\u{2800}"
         })
         .map(|cell| {
             let x = cell.cell_index();
