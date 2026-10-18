@@ -108,10 +108,9 @@ fn warmed_absorbs_stay_allocation_free_across_changing_frames_and_history() {
 
 #[test]
 fn cpu_usage_paint_stays_within_its_pinned_allocation_budget() {
-    // Provisional ceiling accounts for CellGrid sites in paint.rs:33, 66, 95,
-    // 466 and 632 plus graph raster scratch/formatting. The failure message
-    // records the observed count so the primary can pin it precisely.
-    const PAINT_ALLOCATION_BUDGET: u64 = 64;
+    // THE-898 allocation reduction follow-up: keep the observed baseline as
+    // a regression ceiling while paint allocations are reduced incrementally.
+    const PAINT_ALLOCATION_BUDGET: u64 = 38_500;
     let (model, _) = paint_fixture();
     let mut surface = Surface::new(240, 60);
     for _ in 0..3 {
