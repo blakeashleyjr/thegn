@@ -82,7 +82,7 @@ fn discovers_rootful_docker_podman_and_rootless_scopes_only() {
         &["unrelated.service"],
     );
 
-    let found = discover(&fs, Path::new("/cg"));
+    let found = discover_for_uid(&fs, Path::new("/cg"), 65_534);
     let rows: Vec<_> = found.scopes.iter().map(|scope| scope.id.as_ref()).collect();
     assert_eq!(rows, vec!["111111", "222222", "333333", "444444"]);
     assert!(!found.truncated);
@@ -98,7 +98,7 @@ fn scope_cap_marks_truncation() {
     let mut fs = FakeDirs::default();
     put(&mut fs, "/cg/system.slice", &names_ref);
 
-    let found = discover(&fs, Path::new("/cg"));
+    let found = discover_for_uid(&fs, Path::new("/cg"), 65_534);
     assert_eq!(found.scopes.len(), MAX_CONTAINER_SCOPES);
     assert!(found.truncated);
 }
@@ -112,7 +112,7 @@ fn more_than_the_directory_cap_reports_truncation() {
     let mut fs = FakeDirs::default();
     put(&mut fs, "/cg/system.slice", &names_ref);
 
-    let found = discover(&fs, Path::new("/cg"));
+    let found = discover_for_uid(&fs, Path::new("/cg"), 65_534);
     assert!(found.scopes.is_empty());
     assert!(found.truncated);
 }
@@ -127,7 +127,7 @@ impl DirectoryFs for DeniedDirs {
 
 #[test]
 fn listing_errors_are_counted() {
-    let found = discover(&DeniedDirs, Path::new("/cg"));
+    let found = discover_for_uid(&DeniedDirs, Path::new("/cg"), 65_534);
     assert_eq!(found.list_errors, 3);
 }
 
@@ -152,7 +152,6 @@ fn user_scope_walk_is_bounded_and_keeps_the_first_sorted_users() {
         put(&mut fs, &user_path, &service_refs);
         for (service_index, service) in services.iter().enumerate() {
             let service_path = format!("{user_path}/{service}");
-            put(&mut fs, &service_path, &["user.slice", "app.slice"]);
             let app_path = format!("{service_path}/app.slice");
             if service_index == 0 {
                 let scope = format!("docker-{index:04}-0.scope");
@@ -164,8 +163,11 @@ fn user_scope_walk_is_bounded_and_keeps_the_first_sorted_users() {
     }
 
     let found = discover_for_uid(&fs, Path::new("/cg"), 9999);
-    assert!(fs.listings.get() <= MAX_DIRECTORY_LISTINGS);
-    assert_eq!(fs.listings.get(), MAX_DIRECTORY_LISTINGS);
+    assert_eq!(
+        fs.listings.get(),
+        MAX_DIRECTORY_LISTINGS,
+        "3 + 64 x (1 + 2 x 2) = 323"
+    );
     assert!(found.truncated);
     let expected: Vec<_> = (0..64).map(|index| format!("{index:04}-0")).collect();
     let actual: Vec<_> = found
@@ -191,7 +193,6 @@ fn too_many_user_services_reports_truncation() {
     );
     for service in ["user@1000-a.service", "user@1000-b.service"] {
         let path = format!("/cg/user.slice/user-1000.slice/{service}");
-        put(&mut fs, &path, &["user.slice", "app.slice"]);
         let app_path = format!("{path}/app.slice");
         put(&mut fs, &app_path, &["docker-1000.scope"]);
     }
@@ -226,5 +227,25 @@ fn current_users_slice_is_walked_before_the_sorted_user_cap() {
         found.scopes.first().map(|scope| scope.id.as_ref()),
         Some("999")
     );
-    assert!(found.scopes.iter().any(|scope| scope.id.as_ref() == "999"));
+    let ids: Vec<_> = found.scopes.iter().map(|scope| scope.id.as_ref()).collect();
+    assert!(ids.contains(&"0"));
+    assert!(!ids.contains(&"9"));
+    assert!(ids[1..].windows(2).all(|pair| pair[0] < pair[1]));
+}
+
+#[test]
+fn discover_uses_the_current_users_slice() {
+    let uid = nix::unistd::geteuid().as_raw();
+    let user = format!("user-{uid}.slice");
+    let user_path = format!("/cg/user.slice/{user}");
+    let service_path = format!("{user_path}/user@session.service");
+    let app_path = format!("{service_path}/app.slice");
+    let mut fs = FakeDirs::default();
+    put(&mut fs, "/cg/user.slice", &[&user]);
+    put(&mut fs, &user_path, &["user@session.service"]);
+    put(&mut fs, &app_path, &["docker-current.scope"]);
+
+    let found = discover(&fs, Path::new("/cg"));
+    assert_eq!(found.scopes.len(), 1);
+    assert_eq!(found.scopes[0].id.as_ref(), "current");
 }
