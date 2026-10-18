@@ -238,7 +238,7 @@ impl FrameWriter {
     /// message with a warning; it never makes the compositor fatal.
     #[cfg(test)]
     pub(crate) fn submit_oob(&self, bytes: Vec<u8>) {
-        if let Err(bytes) = self.try_submit_oob(bytes) {
+        if let Err(bytes) = self.admit_oob(bytes, false) {
             if self.inner.oob_pressure_logged.swap(true, Ordering::SeqCst) {
                 tracing::debug!(
                     bytes = bytes.len(),
@@ -261,6 +261,10 @@ impl FrameWriter {
     /// Refusals record the smallest needed message size so capacity wakes only
     /// when the current queue can admit at least one retained update.
     pub(crate) fn try_submit_oob(&self, bytes: Vec<u8>) -> Result<(), Vec<u8>> {
+        self.admit_oob(bytes, true)
+    }
+
+    fn admit_oob(&self, bytes: Vec<u8>, retained: bool) -> Result<(), Vec<u8>> {
         if bytes.is_empty() {
             return Ok(());
         }
@@ -270,11 +274,13 @@ impl FrameWriter {
             || q.oob_in_flight >= OOB_QUEUE_COUNT
             || bytes.len() > OOB_QUEUE_BYTES.saturating_sub(q.oob_bytes)
         {
-            self.inner.oob_retry.store(true, Ordering::SeqCst);
-            q.oob_retry_need = Some(
-                q.oob_retry_need
-                    .map_or(bytes.len(), |need| need.min(bytes.len())),
-            );
+            if retained {
+                self.inner.oob_retry.store(true, Ordering::SeqCst);
+                q.oob_retry_need = Some(
+                    q.oob_retry_need
+                        .map_or(bytes.len(), |need| need.min(bytes.len())),
+                );
+            }
             return Err(bytes);
         }
         self.inner
@@ -1699,5 +1705,30 @@ mod tests {
         assert!(released);
         assert!(oob_capacity_wake_requested(&writer.inner, released));
         assert!(writer.try_submit_oob(vec![4; 200 * 1024]).is_ok());
+    }
+
+    #[test]
+    fn dropped_lossy_refusal_does_not_dilute_retained_wake_need() {
+        let writer = test_writer();
+        assert!(writer.try_submit_oob(vec![1; 300 * 1024]).is_ok());
+        assert!(writer.try_submit_oob(vec![2; 3_600 * 1024]).is_ok());
+        assert!(writer.try_submit_oob(vec![3; 3_500 * 1024]).is_err());
+        assert_eq!(
+            writer.inner.q.lock().unwrap().oob_retry_need,
+            Some(3_500 * 1024)
+        );
+
+        writer.submit_oob(vec![4]);
+        assert_eq!(
+            writer.inner.q.lock().unwrap().oob_retry_need,
+            Some(3_500 * 1024)
+        );
+
+        let small = pop_message(&mut writer.inner.q.lock().unwrap()).unwrap();
+        let (errored, released, _) = write_message(&writer.inner, small, |_| Ok(()));
+        assert!(!errored);
+        assert!(released);
+        assert!(!oob_capacity_wake_requested(&writer.inner, released));
+        assert!(writer.inner.oob_retry.load(Ordering::SeqCst));
     }
 }
