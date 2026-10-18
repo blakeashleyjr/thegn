@@ -1,1 +1,578 @@
-//! Doc-only Linux collector stub owned by the deferred collector-family lane; §2.3 consumers: system-monitor. Absorbs disk_aggregate.rs (D-1).
+//! Held-fd Linux `/proc/diskstats` collector with a bounded device topology.
+use super::{
+    disk_topology::{self, Topology},
+    procfile::ProcFile,
+};
+use crate::collect::{
+    CollectError, Collector, CollectorId, TickCtx,
+    delta::Counter,
+    env::Env,
+    frame::MonitorFrame,
+    health::{Absent, Health},
+    instances::{Family, InstanceId, Interned, Interner},
+    model::diskstats::{DiskDevice, DiskTotals},
+    parse::diskstats,
+    schedule::Cadence,
+};
+use std::{
+    collections::{HashMap, HashSet},
+    io,
+    path::{Path, PathBuf},
+    sync::Arc,
+};
+
+#[derive(Debug, Default)]
+struct Rates {
+    seen: bool,
+    sectors_read: Counter,
+    sectors_written: Counter,
+    reads: Counter,
+    writes: Counter,
+    io_ticks: Counter,
+}
+#[derive(Debug, Default)]
+struct AggregateRates {
+    sectors_read: Counter,
+    sectors_written: Counter,
+    reads: Counter,
+    writes: Counter,
+}
+#[derive(Debug)]
+pub struct DiskstatsCollector {
+    path: PathBuf,
+    sys_block: PathBuf,
+    file: Option<ProcFile>,
+    topology: Topology,
+    interner: Interner,
+    ids: HashMap<String, InstanceId>,
+    names: HashMap<String, Arc<str>>,
+    rates: HashMap<String, Rates>,
+    aggregate_rates: AggregateRates,
+    last_scan: u64,
+    topology_rev: u32,
+    last_unknown_scan: u64,
+}
+impl DiskstatsCollector {
+    pub fn at(diskstats: impl AsRef<Path>, sys_block: impl AsRef<Path>) -> Self {
+        Self {
+            path: diskstats.as_ref().to_owned(),
+            sys_block: sys_block.as_ref().to_owned(),
+            file: None,
+            topology: Topology::default(),
+            interner: Interner::new(Family::BlockDev),
+            ids: HashMap::new(),
+            names: HashMap::new(),
+            rates: HashMap::new(),
+            aggregate_rates: AggregateRates::default(),
+            last_scan: 0,
+            topology_rev: 0,
+            last_unknown_scan: 0,
+        }
+    }
+    fn scan(&mut self, now_ms: u64) {
+        let next = disk_topology::scan(&self.sys_block, self.topology_rev.wrapping_add(1));
+        if next.devs != self.topology.devs {
+            self.topology_rev = self.topology_rev.wrapping_add(1);
+            self.topology = Topology {
+                rev: self.topology_rev,
+                ..next
+            };
+            self.aggregate_rates = AggregateRates::default();
+            let active: HashSet<_> = self
+                .topology
+                .devs
+                .iter()
+                .map(|d| d.name.to_string())
+                .collect();
+            let vanished: Vec<_> = self
+                .ids
+                .keys()
+                .filter(|name| !active.contains(*name))
+                .cloned()
+                .collect();
+            for name in vanished {
+                if let Some(id) = self.ids.remove(&name) {
+                    self.interner.retire(id);
+                }
+                self.names.remove(&name);
+                self.rates.remove(&name);
+            }
+        }
+        for dev in &self.topology.devs {
+            if !self.ids.contains_key(dev.name.as_ref())
+                && let Interned::Id(id) = self.interner.intern(&dev.name)
+            {
+                self.ids.insert(dev.name.to_string(), id);
+                self.names
+                    .insert(dev.name.to_string(), Arc::clone(&dev.name));
+                self.rates.insert(dev.name.to_string(), Rates::default());
+            }
+        }
+        self.last_scan = now_ms;
+    }
+}
+impl Collector for DiskstatsCollector {
+    fn id(&self) -> CollectorId {
+        CollectorId::Diskstats
+    }
+    fn cadence(&self) -> Cadence {
+        Cadence::Every(1)
+    }
+    fn discover(&mut self, _env: &Env) -> Health {
+        self.close();
+        match ProcFile::open(&self.path) {
+            Ok(file) => {
+                self.file = Some(file);
+                self.topology = Topology::default();
+                self.topology_rev = 0;
+                self.scan(0);
+                Health::Warming
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                Health::Absent(Absent::NotOnThisOs)
+            }
+            Err(error) if error.kind() == io::ErrorKind::PermissionDenied => {
+                Health::Absent(Absent::NoPermission)
+            }
+            Err(_) => Health::Warming,
+        }
+    }
+    fn sample(&mut self, ctx: &TickCtx, frame: &mut MonitorFrame) -> Result<(), CollectError> {
+        let read = {
+            let file = self.file.as_mut().ok_or(CollectError::Gone)?;
+            match file.read_all() {
+                Ok(bytes) => Ok(bytes),
+                Err(error) => Err((error, file.needs_reopen())),
+            }
+        };
+        let bytes = match read {
+            Ok(bytes) => bytes,
+            Err((_error, true)) => {
+                self.file = None;
+                return Err(CollectError::Gone);
+            }
+            Err((error, false)) => return Err(error.into()),
+        };
+        let mut rows = diskstats::lines(bytes);
+        let first = rows.next();
+        let empty = first.is_none();
+        let unknown = first.into_iter().chain(rows).any(|row| {
+            !self
+                .ids
+                .contains_key(std::str::from_utf8(row.name).unwrap_or(""))
+        });
+        if empty {
+            return Err(CollectError::Parse("/proc/diskstats"));
+        }
+        let should_rescan = ctx.now_ms.saturating_sub(self.last_scan) >= 60_000
+            || (unknown
+                && (self.last_unknown_scan == 0
+                    || ctx.now_ms.saturating_sub(self.last_unknown_scan) >= 5_000));
+        let part = &mut frame.parts.diskstats;
+        part.devices.clear();
+        part.topology_rev = self.topology_rev;
+        part.physical = 0;
+        part.truncated = false;
+        let mut read_total = 0_u64;
+        let mut write_total = 0_u64;
+        let mut reads_total = 0_u64;
+        let mut writes_total = 0_u64;
+        let mut sectors_read_total = 0_u64;
+        let mut sectors_written_total = 0_u64;
+        for rates in self.rates.values_mut() {
+            rates.seen = false;
+        }
+        for row in diskstats::lines(bytes) {
+            let Ok(name) = std::str::from_utf8(row.name) else {
+                continue;
+            };
+            let Some(dev) = self
+                .topology
+                .devs
+                .iter()
+                .find(|dev| dev.name.as_ref() == name)
+            else {
+                continue;
+            };
+            let Some(id) = self.ids.get(name).copied() else {
+                part.truncated = true;
+                continue;
+            };
+            let Some(rates) = self.rates.get_mut(name) else {
+                continue;
+            };
+            rates.seen = true;
+            let r_bps = rates
+                .sectors_read
+                .rate(row.sectors_read, ctx.now_ms)
+                .map(|v| v * 512.0);
+            let w_bps = rates
+                .sectors_written
+                .rate(row.sectors_written, ctx.now_ms)
+                .map(|v| v * 512.0);
+            let r_iops = rates.reads.rate(row.reads, ctx.now_ms);
+            let w_iops = rates.writes.rate(row.writes, ctx.now_ms);
+            let util = rates
+                .io_ticks
+                .rate(row.io_ticks, ctx.now_ms)
+                .map(|v| v.min(100.0));
+            part.devices.push(DiskDevice {
+                id,
+                name: Arc::clone(&dev.name),
+                label: dev.label.clone(),
+                kind: dev.kind,
+                physical: dev.physical,
+                parent: dev
+                    .parent
+                    .and_then(|idx| self.topology.devs.get(idx))
+                    .and_then(|p| self.ids.get(p.name.as_ref()).copied()),
+                read_bps: r_bps,
+                write_bps: w_bps,
+                read_iops: r_iops,
+                write_iops: w_iops,
+                util_pct: util,
+                in_flight: row.in_flight,
+            });
+            if dev.physical {
+                part.physical = part.physical.saturating_add(1);
+                read_total = read_total.saturating_add(row.sectors_read);
+                write_total = write_total.saturating_add(row.sectors_written);
+                reads_total = reads_total.saturating_add(row.reads);
+                writes_total = writes_total.saturating_add(row.writes);
+                sectors_read_total = sectors_read_total.saturating_add(row.sectors_read);
+                sectors_written_total = sectors_written_total.saturating_add(row.sectors_written);
+            }
+        }
+        loop {
+            let vanished = self.rates.iter().find_map(|(name, rates)| {
+                if rates.seen {
+                    None
+                } else {
+                    self.ids.get(name).map(|id| (name.clone(), *id))
+                }
+            });
+            let Some((name, id)) = vanished else { break };
+            self.ids.remove(&name);
+            self.names.remove(&name);
+            self.rates.remove(&name);
+            self.interner.retire(id);
+        }
+        part.aggregate = DiskTotals {
+            read_bps: self
+                .aggregate_rates
+                .sectors_read
+                .rate(read_total, ctx.now_ms)
+                .map(|v| v * 512.0),
+            write_bps: self
+                .aggregate_rates
+                .sectors_written
+                .rate(write_total, ctx.now_ms)
+                .map(|v| v * 512.0),
+            read_iops: self.aggregate_rates.reads.rate(reads_total, ctx.now_ms),
+            write_iops: self.aggregate_rates.writes.rate(writes_total, ctx.now_ms),
+            sectors_read_total,
+            sectors_written_total,
+        };
+        if should_rescan {
+            let previous_rev = self.topology_rev;
+            self.scan(ctx.now_ms);
+            if unknown {
+                self.last_unknown_scan = ctx.now_ms.max(1);
+            }
+            if self.topology_rev != previous_rev {
+                part.topology_rev = self.topology_rev;
+                part.devices
+                    .retain(|device| self.ids.contains_key(device.name.as_ref()));
+                part.aggregate = DiskTotals::default();
+            }
+        }
+        part.truncated |= self.interner.truncated();
+        frame.sampled.insert(CollectorId::Diskstats);
+        Ok(())
+    }
+    fn close(&mut self) {
+        self.file = None;
+        self.rates.clear();
+        self.ids.clear();
+        self.names.clear();
+        self.topology = Topology::default();
+        self.interner = Interner::new(Family::BlockDev);
+        self.aggregate_rates = AggregateRates::default();
+        self.last_scan = 0;
+        self.last_unknown_scan = 0;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::DiskstatsCollector;
+    use crate::collect::{
+        Collector, TickCtx,
+        env::Env,
+        frame::MonitorFrame,
+        health::{Absent, Health},
+    };
+    use std::fs;
+    #[test]
+    fn missing_file_is_absent_and_bad_rows_are_parse_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut missing = DiskstatsCollector::at(dir.path().join("missing"), dir.path());
+        assert_eq!(
+            missing.discover(&Env::default()),
+            Health::Absent(Absent::NotOnThisOs)
+        );
+        let path = dir.path().join("diskstats");
+        fs::write(&path, b"garbage\n").unwrap();
+        let mut collector = DiskstatsCollector::at(&path, dir.path());
+        collector.discover(&Env::default());
+        assert!(matches!(
+            collector.sample(
+                &TickCtx {
+                    tick: 1,
+                    now_ms: 1000
+                },
+                &mut MonitorFrame::default()
+            ),
+            Err(crate::collect::CollectError::Parse(_))
+        ));
+    }
+
+    #[test]
+    fn rates_count_physical_devices_once_and_reuse_the_row_buffer() {
+        let dir = tempfile::tempdir().unwrap();
+        let sys = dir.path().join("sys/block");
+        fs::create_dir_all(sys.join("sda/device")).unwrap();
+        fs::write(sys.join("sda/dev"), "8:0\n").unwrap();
+        fs::create_dir_all(sys.join("loop0")).unwrap();
+        fs::write(sys.join("loop0/dev"), "7:0\n").unwrap();
+        let proc = dir.path().join("diskstats");
+        let row = |name: &str, major: u32, minor: u32, sectors: u64, io_ms: u64| {
+            format!(
+                "{major} {minor} {name} 1 0 {sectors} 1 1 0 {} 1 0 {io_ms} 10 0 0 0 0 0\n",
+                sectors.saturating_mul(2)
+            )
+        };
+        fs::write(
+            &proc,
+            format!(
+                "{}{}",
+                row("sda", 8, 0, 10, 10),
+                row("loop0", 7, 0, 100, 10)
+            ),
+        )
+        .unwrap();
+        let mut collector = DiskstatsCollector::at(&proc, &sys);
+        assert_eq!(collector.discover(&Env::default()), Health::Warming);
+        let mut frame = MonitorFrame::default();
+        collector
+            .sample(
+                &TickCtx {
+                    tick: 1,
+                    now_ms: 1000,
+                },
+                &mut frame,
+            )
+            .unwrap();
+        let capacity = frame.parts.diskstats.devices.capacity();
+        let pointer = frame.parts.diskstats.devices.as_ptr();
+        fs::write(
+            &proc,
+            format!(
+                "{}{}",
+                row("sda", 8, 0, 12, 2_010),
+                row("loop0", 7, 0, 900, 2_010)
+            ),
+        )
+        .unwrap();
+        collector
+            .sample(
+                &TickCtx {
+                    tick: 2,
+                    now_ms: 2000,
+                },
+                &mut frame,
+            )
+            .unwrap();
+        assert_eq!(frame.parts.diskstats.devices.capacity(), capacity);
+        assert_eq!(frame.parts.diskstats.devices.as_ptr(), pointer);
+        assert_eq!(
+            frame
+                .parts
+                .diskstats
+                .devices
+                .iter()
+                .find(|dev| dev.name.as_ref() == "sda")
+                .unwrap()
+                .read_bps,
+            Some(1024.0)
+        );
+        assert_eq!(frame.parts.diskstats.aggregate.read_bps, Some(1024.0));
+        assert_eq!(frame.parts.diskstats.physical, 1);
+        assert_eq!(frame.parts.diskstats.devices[0].util_pct, Some(100.0));
+        fs::write(
+            &proc,
+            format!(
+                "{}{}",
+                row("sda", 8, 0, 5, 2_010),
+                row("loop0", 7, 0, 900, 2_010)
+            ),
+        )
+        .unwrap();
+        collector
+            .sample(
+                &TickCtx {
+                    tick: 3,
+                    now_ms: 3_000,
+                },
+                &mut frame,
+            )
+            .unwrap();
+        assert_eq!(frame.parts.diskstats.devices[0].read_bps, None);
+        fs::write(
+            &proc,
+            format!(
+                "{}{}",
+                row("sda", 8, 0, 7, 2_010),
+                row("loop0", 7, 0, 900, 2_010)
+            ),
+        )
+        .unwrap();
+        collector
+            .sample(
+                &TickCtx {
+                    tick: 4,
+                    now_ms: 4_000,
+                },
+                &mut frame,
+            )
+            .unwrap();
+        assert_eq!(frame.parts.diskstats.devices[0].read_bps, Some(1024.0));
+    }
+
+    #[test]
+    fn unknown_device_rescans_and_vanished_device_reappears_primed() {
+        let dir = tempfile::tempdir().unwrap();
+        let sys = dir.path().join("sys/block");
+        fs::create_dir_all(sys.join("sda/device")).unwrap();
+        fs::write(sys.join("sda/dev"), "8:0\n").unwrap();
+        let proc = dir.path().join("diskstats");
+        let row = |name: &str, minor: u32, sectors: u64| {
+            format!("8 {minor} {name} 1 0 {sectors} 1 1 0 {sectors} 1 0 10 10 0 0 0 0 0\n")
+        };
+        fs::write(&proc, row("sda", 0, 10)).unwrap();
+        let mut collector = DiskstatsCollector::at(&proc, &sys);
+        collector.discover(&Env::default());
+        let mut frame = MonitorFrame::default();
+        collector
+            .sample(
+                &TickCtx {
+                    tick: 1,
+                    now_ms: 1000,
+                },
+                &mut frame,
+            )
+            .unwrap();
+        let first_rev = frame.parts.diskstats.topology_rev;
+
+        fs::create_dir_all(sys.join("sdb/device")).unwrap();
+        fs::write(sys.join("sdb/dev"), "8:16\n").unwrap();
+        fs::write(
+            &proc,
+            format!("{}{}", row("sda", 0, 11), row("sdb", 16, 20)),
+        )
+        .unwrap();
+        collector
+            .sample(
+                &TickCtx {
+                    tick: 2,
+                    now_ms: 2000,
+                },
+                &mut frame,
+            )
+            .unwrap();
+        assert!(frame.parts.diskstats.topology_rev > first_rev);
+
+        collector
+            .sample(
+                &TickCtx {
+                    tick: 3,
+                    now_ms: 3000,
+                },
+                &mut frame,
+            )
+            .unwrap();
+        assert_eq!(
+            frame
+                .parts
+                .diskstats
+                .devices
+                .iter()
+                .find(|dev| dev.name.as_ref() == "sdb")
+                .unwrap()
+                .read_bps,
+            None
+        );
+        fs::write(&proc, row("sda", 0, 13)).unwrap();
+        collector
+            .sample(
+                &TickCtx {
+                    tick: 4,
+                    now_ms: 4000,
+                },
+                &mut frame,
+            )
+            .unwrap();
+        fs::write(
+            &proc,
+            format!("{}{}", row("sda", 0, 14), row("sdb", 16, 25)),
+        )
+        .unwrap();
+        collector
+            .sample(
+                &TickCtx {
+                    tick: 5,
+                    now_ms: 5000,
+                },
+                &mut frame,
+            )
+            .unwrap();
+        collector
+            .sample(
+                &TickCtx {
+                    tick: 6,
+                    now_ms: 6000,
+                },
+                &mut frame,
+            )
+            .unwrap();
+        collector
+            .sample(
+                &TickCtx {
+                    tick: 7,
+                    now_ms: 7001,
+                },
+                &mut frame,
+            )
+            .unwrap();
+        collector
+            .sample(
+                &TickCtx {
+                    tick: 8,
+                    now_ms: 8001,
+                },
+                &mut frame,
+            )
+            .unwrap();
+        assert_eq!(
+            frame
+                .parts
+                .diskstats
+                .devices
+                .iter()
+                .find(|dev| dev.name.as_ref() == "sdb")
+                .unwrap()
+                .read_bps,
+            None
+        );
+    }
+}
