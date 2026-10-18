@@ -242,6 +242,7 @@ pub enum GitLoc {
 impl GitLoc {
     /// Resolve a worktree location without treating a DB failure as local.
     /// A genuinely absent row still means a local worktree.
+    #[track_caller]
     pub fn for_worktree_checked(path: &Path) -> Result<GitLoc, String> {
         let p = path
             .to_str()
@@ -272,6 +273,7 @@ impl GitLoc {
 
     /// Resolve a worktree path's location from the DB. Local on any miss, so
     /// existing/local worktrees behave exactly as before.
+    #[track_caller]
     pub fn for_worktree(path: &Path) -> GitLoc {
         let p = path.to_string_lossy().into_owned();
         let loc = crate::db::Db::open()
