@@ -216,8 +216,7 @@ impl GpuView<'_> {
             );
             return;
         }
-        let mut row = 0;
-        for engine in self.0.engines.devices.iter().take(DEVICE_CAP) {
+        for (row, engine) in self.0.engines.devices.iter().take(DEVICE_CAP).enumerate() {
             if row >= body.rows {
                 break;
             }
@@ -245,7 +244,6 @@ impl GpuView<'_> {
                 &format!("{}  {}  vcn {}", engine.slot.as_str(), busy, vcn),
                 Default::default(),
             );
-            row += 1;
         }
     }
 
@@ -282,18 +280,18 @@ impl GpuView<'_> {
                 });
             let shared = device.kind == GpuKind::Apu;
             let name = "VRAM";
+            let unknown = crate::caps::active_glyphs().emdash;
             let memory = match (used_vram, total_vram) {
                 (Some(used), Some(total)) => format!("{name} {} / {}", bytes(used), bytes(total)),
-                (_, Some(total)) if shared => format!(
-                    "VRAM {} / {}",
-                    crate::caps::active_glyphs().emdash,
-                    bytes(total)
-                ),
-                _ => format!("{name} {}", crate::caps::active_glyphs().emdash),
+                (Some(used), None) => format!("{name} {} / {unknown}", bytes(used)),
+                (None, Some(total)) => format!("{name} {unknown} / {}", bytes(total)),
+                (None, None) => format!("{name} {unknown}"),
             };
             let gtt = match (used_gtt, total_gtt) {
                 (Some(used), Some(total)) => format!("gtt {} / {}", bytes(used), bytes(total)),
-                _ => format!("gtt {}", crate::caps::active_glyphs().emdash),
+                (Some(used), None) => format!("gtt {} / {unknown}", bytes(used)),
+                (None, Some(total)) => format!("gtt {unknown} / {}", bytes(total)),
+                (None, None) => format!("gtt {unknown}"),
             };
             let memory = if shared {
                 format!(
