@@ -63,6 +63,24 @@ fn aux_rings(
     }
 }
 
+fn finite_runs(values: &[f32]) -> impl Iterator<Item = (usize, usize)> + '_ {
+    let mut start = 0;
+    std::iter::from_fn(move || {
+        while start < values.len() && !values[start].is_finite() {
+            start += 1;
+        }
+        if start == values.len() {
+            return None;
+        }
+        let run_start = start;
+        while start < values.len() && values[start].is_finite() {
+            start += 1;
+        }
+        let run_end = start;
+        Some((run_start, run_end))
+    })
+}
+
 fn paint_history_graph_runs(
     values: &[f32],
     ramp: thegn_core::theme::RampId,
@@ -73,12 +91,9 @@ fn paint_history_graph_runs(
         crate::monitor::graphs::paint_history_graph(values, ramp, plot, surface);
         return;
     }
-    let graph = crate::monitor::kit::history_rect::graph_rect(
-        plot,
-        values.len(),
-        crate::monitor::graphs::table().braille,
-    );
-    let slots = if crate::monitor::graphs::table().braille {
+    let braille = crate::monitor::graphs::table().braille;
+    let graph = crate::monitor::kit::history_rect::graph_rect(plot, values.len(), braille);
+    let slots = if braille {
         graph.cols.saturating_mul(2)
     } else {
         graph.cols
@@ -87,37 +102,30 @@ fn paint_history_graph_runs(
     let skip = values.len().saturating_sub(shown);
     let pad = slots.saturating_sub(shown);
     let visible = &values[skip..];
-    let braille = crate::monitor::graphs::table().braille;
     let stride = if braille { 2 } else { 1 };
-    let mut start = 0;
-    while start < shown {
-        while start < shown && !visible[start].is_finite() {
-            start += 1;
+    for (start, end) in finite_runs(visible) {
+        let slot_start = pad + start;
+        let offset = if braille { slot_start % stride } else { 0 };
+        let x = graph.x + slot_start / stride;
+        let cols = (offset + end - start).div_ceil(stride);
+        let run_len = end - start;
+        let mut aligned = [f32::NAN; HISTORY_CAP + 2];
+        let mut aligned_len = offset + run_len;
+        aligned[offset..aligned_len].copy_from_slice(&visible[start..end]);
+        if braille && !aligned_len.is_multiple_of(2) {
+            aligned[aligned_len] = f32::NAN;
+            aligned_len += 1;
         }
-        let mut end = start;
-        while end < shown && visible[end].is_finite() {
-            end += 1;
-        }
-        if start < end {
-            let slot_start = pad + start;
-            let offset = if braille { slot_start % stride } else { 0 };
-            let x = graph.x + slot_start / stride;
-            let cols = (offset + end - start).div_ceil(stride);
-            let mut aligned = [f32::NAN; HISTORY_CAP + 1];
-            let aligned_len = offset + end - start;
-            aligned[offset..aligned_len].copy_from_slice(&visible[start..end]);
-            crate::monitor::graphs::paint_history_graph(
-                &aligned[..aligned_len],
-                ramp,
-                Rect {
-                    x,
-                    cols: cols.min(graph.x + graph.cols - x),
-                    ..graph
-                },
-                surface,
-            );
-        }
-        start = end.saturating_add(1);
+        crate::monitor::graphs::paint_history_graph(
+            &aligned[..aligned_len],
+            ramp,
+            Rect {
+                x,
+                cols: cols.min(graph.x + graph.cols - x),
+                ..graph
+            },
+            surface,
+        );
     }
 }
 
@@ -127,48 +135,27 @@ fn paint_sparkline_runs(
     plot: Rect,
     surface: &mut Surface,
 ) {
-    let graph = crate::monitor::kit::history_rect::graph_rect(
-        plot,
-        values.len(),
-        crate::monitor::graphs::table().braille,
-    );
+    let braille = crate::monitor::graphs::table().braille;
+    let graph = crate::monitor::kit::history_rect::graph_rect(plot, values.len(), braille);
     if values.iter().all(|value| value.is_finite()) {
         crate::monitor::graphs::paint_sparkline(values, graph.cols, ramp, graph, surface);
         return;
     }
-    let braille = crate::monitor::graphs::table().braille;
-    let stride = if braille { 2 } else { 1 };
-    let slots = graph.cols.saturating_mul(stride);
+    let slots = graph.cols;
     let shown = values.len().min(slots);
     let skip = values.len().saturating_sub(shown);
     let pad = slots.saturating_sub(shown);
     let visible = &values[skip..];
-    let mut start = 0;
-    while start < shown {
-        while start < shown && !visible[start].is_finite() {
-            start += 1;
-        }
-        let mut end = start;
-        while end < shown && visible[end].is_finite() {
-            end += 1;
-        }
-        if start < end {
-            let slot_start = pad + start;
-            let offset = if braille { slot_start % stride } else { 0 };
-            let x = graph.x + slot_start / stride;
-            let right = graph.x + graph.cols;
-            let cols = (offset + end - start)
-                .div_ceil(stride)
-                .min(right.saturating_sub(x));
-            crate::monitor::graphs::paint_sparkline(
-                &visible[start..end],
-                cols,
-                ramp,
-                Rect { x, cols, ..graph },
-                surface,
-            );
-        }
-        start = end.saturating_add(1);
+    for (start, end) in finite_runs(visible) {
+        let x = graph.x + pad + start;
+        let cols = end - start;
+        crate::monitor::graphs::paint_sparkline(
+            &visible[start..end],
+            cols,
+            ramp,
+            Rect { x, cols, ..graph },
+            surface,
+        );
     }
 }
 

@@ -601,6 +601,72 @@ fn implausible_activity_is_blank_and_suspended_frames_do_not_push() {
 }
 
 #[test]
+fn missing_busy_sample_is_aligned_after_history_starts() {
+    let mut leading_gap = fixture(0, GpuKind::Apu, RuntimeStatus::Active);
+    leading_gap.parts.gpu_engines.devices[0].gfx_busy_pct = None;
+    let mut model = GpuModel::default();
+    model.absorb_frame(&leading_gap);
+    assert!(model.histories[0].busy.is_empty());
+
+    model.absorb_frame(&fixture(1, GpuKind::Apu, RuntimeStatus::Active));
+    let mut missing = fixture(2, GpuKind::Apu, RuntimeStatus::Active);
+    missing.parts.gpu_engines.devices[0].gfx_busy_pct = None;
+    model.absorb_frame(&missing);
+
+    let busy = &model.histories[0].busy;
+    let mut ordered = [0.0_f32; HISTORY_CAP];
+    assert_eq!(busy.ordered_into(&mut ordered), 2);
+    assert!(ordered[0].is_finite());
+    assert!(
+        ordered[1].is_nan(),
+        "active missing busy sample must be a gap"
+    );
+}
+
+#[test]
+fn odd_ending_braille_run_keeps_its_first_half_cell() {
+    let mut model = GpuModel::default();
+    for (tick, busy) in [
+        (1, Some(70)),
+        (2, Some(80)),
+        (3, None),
+        (4, Some(30)),
+        (5, Some(40)),
+    ] {
+        let mut frame = fixture(tick, GpuKind::Apu, RuntimeStatus::Active);
+        frame.parts.gpu_engines.devices[0].gfx_busy_pct = busy;
+        model.absorb_frame(&frame);
+    }
+
+    caps::test_override::with_unicode(UnicodeLevel::Full, || {
+        let mut surface = Surface::new(160, 45);
+        let rect = Rect::full(160, 45);
+        GpuView(&model).paint_busy_history(&mut surface, rect, rect);
+        let braille_codes = surface.screen_lines()[1..35]
+            .iter()
+            .filter_map(|line| {
+                line.visible_cells()
+                    .find(|cell| cell.cell_index() == 157)
+                    .and_then(|cell| cell.str().chars().next())
+                    .map(|glyph| glyph as u32)
+            })
+            .filter(|glyph| (0x2800..=0x28ff).contains(glyph))
+            .map(|glyph| glyph - 0x2800)
+            .collect::<Vec<_>>();
+        let right_half_has_dots = braille_codes.iter().any(|code| code & 0xB8 != 0);
+        let left_half_has_dots = braille_codes.iter().any(|code| code & 0x47 != 0);
+        assert!(
+            right_half_has_dots,
+            "first sample must occupy column 157's right half"
+        );
+        assert!(
+            !left_half_has_dots,
+            "gap padding must leave column 157's left half blank"
+        );
+    });
+}
+
+#[test]
 fn missing_aux_readings_keep_time_alignment_and_paint_blank_gaps() {
     let mut warmup = GpuModel::default();
     let mut first_missing = fixture(0, GpuKind::Apu, RuntimeStatus::Active);
@@ -617,12 +683,17 @@ fn missing_aux_readings_keep_time_alignment_and_paint_blank_gaps() {
     let mut model = GpuModel::default();
     model.absorb_frame(&fixture(1, GpuKind::Apu, RuntimeStatus::Active));
     for tick in 2..5 {
-        let mut missing = fixture(tick, GpuKind::Apu, RuntimeStatus::Active);
-        missing.parts.gpu_engines.devices[0].vram_used = None;
-        missing.parts.gpu_engines.devices[0].gtt_used = None;
-        missing.parts.gpu_engines.devices[0].sclk.current_mhz = None;
-        missing.parts.amd_smu.cards[0].metrics.power_socket = None;
-        model.absorb_frame(&missing);
+        if tick == 3 {
+            let mut missing = fixture(tick, GpuKind::Apu, RuntimeStatus::Active);
+            missing.parts.gpu_engines.devices[0].vram_used = None;
+            missing.parts.gpu_engines.devices[0].gtt_used = None;
+            missing.parts.gpu_engines.devices[0].sclk.current_mhz = None;
+            missing.parts.amd_smu.cards[0].metrics.power_socket = None;
+            missing.parts.amd_smu.cards[0].metrics.activity_gfx = None;
+            model.absorb_frame(&missing);
+        } else {
+            model.absorb_frame(&fixture(tick, GpuKind::Apu, RuntimeStatus::Active));
+        }
     }
     model.absorb_frame(&fixture(5, GpuKind::Apu, RuntimeStatus::Active));
 
@@ -635,51 +706,69 @@ fn missing_aux_readings_keep_time_alignment_and_paint_blank_gaps() {
     let len = history.memory.ordered_into(&mut memory);
     assert_eq!(len, 5);
     assert!(memory[0].is_finite());
-    assert!(memory[1..4].iter().all(|value| value.is_nan()));
-    assert!(memory[4].is_finite());
+    assert!(memory[1].is_finite());
+    assert!(memory[2].is_nan());
+    assert!(memory[3..5].iter().all(|value| value.is_finite()));
 
-    let mut surface = Surface::new(160, 45);
-    let rect = Rect::full(160, 45);
-    GpuView(&model).paint_aux_history(&mut surface, rect, rect, true);
-    let graph = crate::monitor::kit::history_rect::graph_rect(
-        Rect {
-            x: 28,
-            y: 2,
-            cols: 132,
-            rows: 41,
-        },
-        len,
-        crate::monitor::graphs::table().braille,
-    );
-    let gap_col = graph.x
-        + if crate::monitor::graphs::table().braille {
-            1
-        } else {
-            2
-        };
-    for line in surface.screen_lines().iter().skip(graph.y).take(graph.rows) {
-        let cell = line
-            .visible_cells()
-            .find(|cell| cell.cell_index() == gap_col)
-            .expect("gap graph column exists");
-        assert!(
-            cell.str() == " " || cell.str() == "\u{2800}",
-            "missing sample column must be blank, got {:?}",
-            cell.str()
-        );
-    }
-    let screen_lines = surface.screen_lines();
-    for col in [graph.x, graph.x + graph.cols - 1] {
-        let painted = screen_lines
-            .iter()
-            .skip(graph.y)
-            .take(graph.rows)
-            .any(|line| {
-                line.visible_cells()
+    let mut spark_model = GpuModel::default();
+    spark_model.absorb_frame(&fixture(1, GpuKind::Apu, RuntimeStatus::Active));
+    spark_model.absorb_frame(&fixture(2, GpuKind::Apu, RuntimeStatus::Active));
+    let mut spark_gap = fixture(3, GpuKind::Apu, RuntimeStatus::Active);
+    spark_gap.parts.gpu_engines.devices[0].gtt_used = None;
+    spark_gap.parts.amd_smu.cards[0].metrics.activity_gfx = None;
+    spark_model.absorb_frame(&spark_gap);
+
+    for unicode in [UnicodeLevel::Full, UnicodeLevel::Ascii] {
+        caps::test_override::with_unicode(unicode, || {
+            let mut surface = Surface::new(160, 45);
+            let rect = Rect::full(160, 45);
+            GpuView(&spark_model).paint_aux_history(&mut surface, rect, rect, true);
+            GpuView(&spark_model).paint_busy_history(&mut surface, rect, rect);
+
+            // The GTT sparkline is on row 44. It has two present samples and a
+            // trailing gap; the right-aligned window is one cell shorter in Full.
+            // Both are right-aligned in the 132-column graph area.
+            let aux_expected: &[(usize, bool)] = if unicode == UnicodeLevel::Full {
+                &[(158, true), (159, false)]
+            } else {
+                &[(157, true), (158, true), (159, false)]
+            };
+            for &(col, should_paint) in aux_expected {
+                let cell = surface.screen_lines()[44]
+                    .visible_cells()
                     .find(|cell| cell.cell_index() == col)
-                    .is_some_and(|cell| cell.str() != " " && cell.str() != "\u{2800}")
-            });
-        assert!(painted, "present sample column must be painted at {col}");
+                    .expect("GTT sparkline cell exists");
+                assert_eq!(
+                    cell.str() != " " && cell.str() != "\u{2800}",
+                    should_paint,
+                    "GTT sparkline at column {col} in {unicode:?}"
+                );
+            }
+
+            let lines = surface.screen_lines();
+            let activity_row = lines
+                .iter()
+                .position(|line| {
+                    line.visible_cells()
+                        .fold(String::new(), |mut row, cell| {
+                            row.push_str(cell.str());
+                            row
+                        })
+                        .contains("GPU0 gfx 0-100%")
+                })
+                .expect("activity sparkline row exists");
+            for &(col, should_paint) in aux_expected {
+                let cell = lines[activity_row]
+                    .visible_cells()
+                    .find(|cell| cell.cell_index() == col)
+                    .expect("activity sparkline cell exists");
+                assert_eq!(
+                    cell.str() != " " && cell.str() != "\u{2800}",
+                    should_paint,
+                    "activity sparkline at column {col} in {unicode:?}"
+                );
+            }
+        });
     }
     let mut suspended = fixture(6, GpuKind::Apu, RuntimeStatus::Suspended);
     suspended.parts.gpu_engines.devices[0].vram_used = None;
