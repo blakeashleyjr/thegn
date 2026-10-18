@@ -188,7 +188,7 @@ mod tests {
         for (status, ac, capacity, threshold, expected) in cases {
             assert_eq!(effective_state(status, ac, capacity, threshold), expected);
         }
-        assert_eq!((signed_battery_watts(12.0, EffectiveState::Discharging) - 12.0).abs() < 0.001);
+        assert!((signed_battery_watts(12.0, EffectiveState::Discharging) - 12.0).abs() < 0.001);
         assert!((signed_battery_watts(12.0, EffectiveState::Charging) + 12.0).abs() < 0.001);
     }
 
