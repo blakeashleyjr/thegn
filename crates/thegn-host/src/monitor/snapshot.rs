@@ -171,9 +171,9 @@ fn snapshot(ov: &MonitorOverlay, w: usize, h: usize) -> (String, String) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use thegn_core::termcaps::{ColorDepth, UnicodeLevel};
     use termwiz::color::ColorAttribute;
     use termwiz::surface::{Change, Position};
+    use thegn_core::termcaps::{ColorDepth, UnicodeLevel};
 
     fn paint(surface: &mut Surface, x: usize, y: usize, attrs: CellAttributes, text: &str) {
         surface.add_change(Change::CursorPosition {
@@ -186,7 +186,7 @@ mod tests {
 
     #[test]
     fn frozen_monitor_renders_byte_identically() {
-        let tabs = MonitorTab::visible_for(&crate::e2e_freeze::stats(), false, false);
+        let tabs = MonitorTab::visible_for(&crate::e2e_freeze::stats(), true, false);
         for tab in tabs {
             let first = frozen_overlay(tab, Rect::full(100, 32));
             let second = frozen_overlay(tab, Rect::full(100, 32));
@@ -234,27 +234,24 @@ mod tests {
         blue.set_foreground(ColorAttribute::PaletteIndex(2));
         paint(&mut surface, 2, 0, blue, "c");
         let runs = style_runs(&surface);
-        assert_eq!(runs.len(), 3);
+        assert_eq!(runs.len(), 4);
         assert_eq!((runs[0].x, runs[0].y, runs[0].len), (0, 0, 2));
         assert_eq!((runs[1].x, runs[1].y, runs[1].len), (2, 0, 1));
-    }
-
-    #[test]
-    fn runs_never_cross_rows() {
-        let mut surface = Surface::new(3, 2);
-        paint(&mut surface, 0, 0, CellAttributes::default(), "a");
-        paint(&mut surface, 0, 1, CellAttributes::default(), "b");
-        let runs = style_runs(&surface);
-        assert!(runs.iter().any(|run| run.y == 0));
-        assert!(runs.iter().any(|run| run.y == 1));
+        assert_eq!((runs[2].x, runs[2].y, runs[2].len), (3, 0, 5));
+        assert_eq!(runs[2].fg, ColorSpec::Default);
+        assert_eq!((runs[3].x, runs[3].y, runs[3].len), (0, 1, 8));
+        // Exact row starts also guard the x-adjacency check against crossing rows.
     }
 
     #[test]
     fn wide_glyph_run_counts_cells() {
         let mut surface = Surface::new(4, 1);
-        paint(&mut surface, 0, 0, CellAttributes::default(), "界");
+        let mut wide = CellAttributes::default();
+        wide.set_foreground(ColorAttribute::PaletteIndex(1));
+        paint(&mut surface, 0, 0, wide, "界");
         let runs = style_runs(&surface);
-        assert_eq!(runs[0].len, 2);
+        assert_eq!((runs[0].x, runs[0].len), (0, 2));
+        assert_eq!(runs[1].x, 2);
     }
 
     #[test]
@@ -357,36 +354,20 @@ mod tests {
 
     #[test]
     fn ascii_level_changes_graph_glyphs() {
-        crate::caps::test_override::with_unicode(UnicodeLevel::Ascii, || {
-            let ascii = snapshot(
+        let ascii = crate::caps::test_override::with_unicode(UnicodeLevel::Ascii, || {
+            snapshot(
                 &frozen_overlay(MonitorTab::Cpu, Rect::full(100, 32)),
                 100,
                 32,
-            );
-            assert_eq!(
-                ascii,
-                snapshot(
-                    &frozen_overlay(MonitorTab::Cpu, Rect::full(100, 32)),
-                    100,
-                    32,
-                )
-            );
-            crate::caps::test_override::with_unicode(UnicodeLevel::Full, || {
-                let full = snapshot(
-                    &frozen_overlay(MonitorTab::Cpu, Rect::full(100, 32)),
-                    100,
-                    32,
-                );
-                assert_eq!(
-                    full,
-                    snapshot(
-                        &frozen_overlay(MonitorTab::Cpu, Rect::full(100, 32)),
-                        100,
-                        32,
-                    )
-                );
-                assert_ne!(ascii.0, full.0);
-            });
+            )
         });
+        let full = crate::caps::test_override::with_unicode(UnicodeLevel::Full, || {
+            snapshot(
+                &frozen_overlay(MonitorTab::Cpu, Rect::full(100, 32)),
+                100,
+                32,
+            )
+        });
+        assert_ne!(ascii.0, full.0);
     }
 }
