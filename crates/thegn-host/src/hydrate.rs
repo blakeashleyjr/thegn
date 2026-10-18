@@ -892,15 +892,21 @@ pub(crate) fn load_or_seed_session(
     let tombstoned = db.workspace_tombstoned(&session.id).unwrap_or(false);
     if !tombstoned && Path::new(&session.id).is_dir() {
         let (name, kind) = crate::workspace_identity::workspace_identity(&session.id, None);
-        // best-effort: the DB is a cache; git is the source of truth
-        let _ = db.put_workspace(&session.id, &name, kind);
-        let _ = db.touch_repo(&session.id, &name); // best-effort: cache write: the DB is a cache; git/forge stays the source of truth
-    }
-    // Record the resolved workspace as the active pointer so the next cold
-    // start reopens it even on a first run (where no switch has happened yet).
-    // Skipped for a tombstoned workspace so it doesn't re-pin itself active.
-    if !tombstoned {
-        let _ = db.set_active_workspace(&session.id); // best-effort: cache write: the DB is a cache; git/forge stays the source of truth
+        let repo_path = session.id.clone();
+        // These are cache writes; the session returned to startup does not
+        // depend on them. Keep them behind the FIFO writer so a held DB write
+        // lock cannot delay the first frame.
+        crate::db_task::persist_critical(move |db| {
+            if let Err(error) = db.put_workspace(&repo_path, &name, kind) {
+                tracing::debug!(%error, "failed to register startup workspace cache row");
+            }
+            if let Err(error) = db.touch_repo(&repo_path, &name) {
+                tracing::debug!(%error, "failed to touch startup repository cache row");
+            }
+            if let Err(error) = db.set_active_workspace(&repo_path) {
+                tracing::debug!(%error, "failed to persist startup active workspace cache row");
+            }
+        });
     }
     (session, seeded)
 }
