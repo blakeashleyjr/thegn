@@ -9,7 +9,7 @@
 //! → no flashing).
 
 use anyhow::{Context, Result};
-use notify::{Config, Event, EventKindMask, RecommendedWatcher, RecursiveMode, Watcher};
+use notify::{Event, RecommendedWatcher, RecursiveMode, Watcher};
 
 use std::path::{Path, PathBuf};
 use tokio::sync::mpsc as tokio_mpsc;
@@ -973,7 +973,7 @@ pub async fn main(
                         let _ = ev_tx.send(()); // best-effort: send: the consumer may be gone; a closed channel is the consumer going away
                     }
                 },
-                Config::default().with_event_kinds(EventKindMask::CORE),
+                crate::diff_watch::watcher_config(),
             ) {
                 let _ = watcher.watch(parent, RecursiveMode::NonRecursive); // best-effort: watch: a failed registration just delays session updates until the next poll
                 let debounce = std::time::Duration::from_millis(200);
