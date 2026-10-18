@@ -27,7 +27,8 @@ pub(crate) fn glyph_fingerprint(path: &str, worktree: &Path) -> Option<GlyphFing
         .unwrap_or_else(|error| error.into_inner());
     let previous = fingerprints.get(path).cloned();
     let mut gitdir = previous
-        .map(|(gitdir, _)| gitdir)
+        .as_ref()
+        .map(|(gitdir, _)| gitdir.clone())
         .or_else(|| resolve_gitdir(worktree))?;
     let (mut current, index_missing, head_missing) = fingerprint_at(&gitdir);
     if index_missing || head_missing {
@@ -39,7 +40,8 @@ pub(crate) fn glyph_fingerprint(path: &str, worktree: &Path) -> Option<GlyphFing
         }
     }
     let baseline = previous
-        .map(|(_, fingerprint)| fingerprint)
+        .as_ref()
+        .map(|(_, fingerprint)| *fingerprint)
         .unwrap_or(current);
     fingerprints.insert(path.to_string(), (gitdir, baseline));
     Some(current)
