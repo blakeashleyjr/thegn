@@ -1,8 +1,8 @@
 use super::{
-    Interface, Phy, RateInfo, Station, consume_family_batch, decode_family_reply, decode_interface,
-    decode_rate, decode_station, mask_bssid,
+    IFNAME_LEN, Interface, Phy, RateInfo, SSID_LEN, Station, consume_family_batch,
+    decode_family_reply, decode_interface, decode_rate, decode_station, mask_bssid,
 };
-use crate::collect::linux::netlink::AttributeIter;
+use crate::collect::{linux::netlink::AttributeIter, model::net_wifi::InlineBytes};
 use std::time::{Duration, Instant};
 
 fn attr(kind: u16, payload: &[u8]) -> Vec<u8> {
@@ -62,9 +62,9 @@ fn interface_decoder_reads_fields_and_skips_unknown_attributes() {
         decode_interface(&attrs),
         Interface {
             ifindex: Some(7),
-            name: Some("wlan0".to_owned()),
+            name: Some(inline::<IFNAME_LEN>(b"wlan0")),
             iftype: Some(2),
-            ssid: Some(b"sample".to_vec()),
+            ssid: Some(inline::<SSID_LEN>(b"sample")),
             wiphy: Some(4),
             frequency_mhz: Some(5180),
             channel_width: Some(3),
@@ -72,6 +72,39 @@ fn interface_decoder_reads_fields_and_skips_unknown_attributes() {
             tx_power_mbm: Some(2000),
         }
     );
+}
+
+fn inline<const N: usize>(value: &[u8]) -> InlineBytes<N> {
+    let mut output = InlineBytes::default();
+    output.bytes[..value.len()].copy_from_slice(value);
+    output.len = u8::try_from(value.len()).unwrap();
+    output
+}
+
+#[test]
+fn interface_decode_uses_fixed_inline_name_and_ssid_storage() {
+    let mut attrs = attr(4, b"wlan0\0");
+    attrs.extend_from_slice(&attr(52, b"12345678901234567890123456789012"));
+    let output = decode_interface(&attrs);
+    assert!(output.name.unwrap().as_bytes().starts_with(b"wlan0"));
+    assert!(output.ssid.unwrap().as_bytes().len() <= SSID_LEN);
+    assert_eq!(std::mem::size_of::<InlineBytes<IFNAME_LEN>>(), 17);
+    assert_eq!(std::mem::size_of::<InlineBytes<SSID_LEN>>(), 33);
+}
+
+#[test]
+fn decoding_one_thousand_interface_dumps_reuses_the_output_capacity() {
+    let mut attrs = attr(3, &7_u32.to_ne_bytes());
+    attrs.extend_from_slice(&attr(4, b"wlan0\0"));
+    attrs.extend_from_slice(&attr(52, b"sample"));
+    let mut output = Vec::with_capacity(16);
+    let capacity = output.capacity();
+    for _ in 0..1_000 {
+        output.clear();
+        output.push(decode_interface(&attrs));
+        assert_eq!(output[0].name.unwrap().as_bytes(), b"wlan0");
+    }
+    assert_eq!(output.capacity(), capacity);
 }
 
 #[test]

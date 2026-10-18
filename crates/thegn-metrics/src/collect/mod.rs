@@ -54,6 +54,7 @@ pub enum CollectorId {
     Meminfo,
     Vmstat,
     Netdev,
+    NetWifi,
     Diskstats,
     Powercap,
     PowerSupply,
@@ -68,7 +69,7 @@ pub enum CollectorId {
 }
 
 impl CollectorId {
-    pub const ALL: [Self; 23] = [
+    pub const ALL: [Self; 24] = [
         Self::Loadavg,
         Self::Uptime,
         Self::Psi,
@@ -81,6 +82,7 @@ impl CollectorId {
         Self::Meminfo,
         Self::Vmstat,
         Self::Netdev,
+        Self::NetWifi,
         Self::Diskstats,
         Self::Powercap,
         Self::PowerSupply,
@@ -108,6 +110,7 @@ impl CollectorId {
             Self::Meminfo => "meminfo",
             Self::Vmstat => "vmstat",
             Self::Netdev => "netdev",
+            Self::NetWifi => "net_wifi",
             Self::Diskstats => "diskstats",
             Self::Powercap => "powercap",
             Self::PowerSupply => "power_supply",
@@ -208,6 +211,7 @@ pub fn default_collectors() -> Vec<Box<dyn Collector>> {
         "/proc/net/dev",
         "/sys/class/net",
     ));
+    collectors[CollectorId::NetWifi.index()] = Box::new(linux::net_wifi::NetWifiCollector::new());
     collectors[CollectorId::Diskstats.index()] = Box::new(
         linux::diskstats::DiskstatsCollector::at("/proc/diskstats", "/sys/block"),
     );
@@ -263,6 +267,7 @@ mod default_collectors_tests {
             CollectorId::ThermalZone,
             CollectorId::CpuIdle,
             CollectorId::CpuTopology,
+            CollectorId::NetWifi,
             CollectorId::Filesystems,
             CollectorId::GpuDevices,
             CollectorId::GpuEngines,
