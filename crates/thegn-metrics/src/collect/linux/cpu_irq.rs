@@ -1,8 +1,7 @@
 //! Linux `/proc/softirqs` and `/proc/interrupts` collector.
 use super::procfile::ProcFile;
 use crate::collect::{
-    CollectError, Collector, CollectorId, TickCtx,
-    delta::Counter,
+    CollectError, Collector, CollectorId, TickCtx, delta,
     env::Env,
     frame::MonitorFrame,
     health::{Absent, Health},
@@ -57,25 +56,43 @@ impl CpuIrqCollector {
         }
     }
     fn read(&mut self) -> Result<(), CollectError> {
-        #[cfg(test)]
-        {
-            self.reads += 2;
-        }
         let soft_file = self.soft_file.as_mut().ok_or(CollectError::Gone)?;
         let soft = &mut self.soft;
-        match soft_file.read_all().map(|bytes| softirqs::parse(bytes, soft)) {
+        #[cfg(test)]
+        {
+            self.reads += 1;
+        }
+        match soft_file
+            .read_all()
+            .map(|bytes| softirqs::parse(bytes, soft))
+        {
             Ok(true) => (),
             Ok(false) => return Err(CollectError::Parse("/proc/softirqs")),
-            Err(_error) if soft_file.needs_reopen() => return Err(CollectError::Gone),
-            Err(error) => return Err(error.into()),
+            Err(error) => {
+                return Err(if soft_file.needs_reopen() {
+                    CollectError::Gone
+                } else {
+                    error.into()
+                });
+            }
         }
         let irq_file = self.irq_file.as_mut().ok_or(CollectError::Gone)?;
         let irq = &mut self.irq;
-        match irq_file.read_all().map(|bytes| interrupts::parse(bytes, irq)) {
+        #[cfg(test)]
+        {
+            self.reads += 1;
+        }
+        match irq_file
+            .read_all()
+            .map(|bytes| interrupts::parse(bytes, irq))
+        {
             Ok(true) => Ok(()),
             Ok(false) => Err(CollectError::Parse("/proc/interrupts")),
-            Err(_error) if irq_file.needs_reopen() => Err(CollectError::Gone),
-            Err(error) => Err(error.into()),
+            Err(error) => Err(if irq_file.needs_reopen() {
+                CollectError::Gone
+            } else {
+                error.into()
+            }),
         }
     }
 }
@@ -93,6 +110,10 @@ impl Collector for CpuIrqCollector {
     }
     fn discover(&mut self, _env: &Env) -> Health {
         self.close();
+        #[cfg(test)]
+        {
+            self.opens += 1;
+        }
         let soft = match ProcFile::open(&self.soft_path) {
             Ok(file) => file,
             Err(error) if error.kind() == io::ErrorKind::NotFound => {
@@ -103,6 +124,10 @@ impl Collector for CpuIrqCollector {
             }
             Err(_) => return Health::Warming.after_error(0),
         };
+        #[cfg(test)]
+        {
+            self.opens += 1;
+        }
         let irq = match ProcFile::open(&self.irq_path) {
             Ok(file) => file,
             Err(error) if error.kind() == io::ErrorKind::NotFound => {
@@ -115,10 +140,6 @@ impl Collector for CpuIrqCollector {
         };
         self.soft_file = Some(soft);
         self.irq_file = Some(irq);
-        #[cfg(test)]
-        {
-            self.opens += 2;
-        }
         match self.read() {
             Ok(()) => {
                 self.primed = false;
@@ -143,41 +164,39 @@ impl Collector for CpuIrqCollector {
         let mut soft_order = [0_usize, 1, 2];
         let mut soft_totals = [None; 10];
         if self.primed {
-            for row in 0..softirqs::TYPES.len() {
-                let mut current_total = 0_u64;
-                let mut previous_total = 0_u64;
-                for cpu in 0..self.soft.cpu_count {
-                    current_total = current_total.saturating_add(self.soft.counts[row][cpu]);
-                    previous_total =
-                        previous_total.saturating_add(self.previous_soft.counts[row][cpu]);
-                }
-                soft_totals[row] =
-                    counter_rate(current_total, previous_total, previous_ms, ctx.now_ms);
+            for (row, total) in soft_totals.iter_mut().enumerate() {
+                *total = soft_total_rate(
+                    &self.soft,
+                    &self.previous_soft,
+                    row,
+                    previous_ms,
+                    ctx.now_ms,
+                );
             }
             soft_order.sort_by(|left, right| {
                 soft_totals[*right]
                     .partial_cmp(&soft_totals[*left])
                     .unwrap_or(std::cmp::Ordering::Equal)
             });
-            for slot in 0..3 {
-                let row = soft_order[slot];
+            for (slot, &row) in soft_order.iter().enumerate() {
                 part.softirq_top[slot] = SoftirqTop {
-                    name_hash: interrupts::hash_name(softirqs::TYPES[row]),
+                    name_hash: interrupts::name_hash(softirqs::TYPES[row]),
                     total_per_s: soft_totals[row],
                 };
             }
         }
-        for cpu in 0..self.soft.cpu_count {
+        for &cpu_id in &self.soft.cpu_ids[..self.soft.cpu_count] {
             let mut core = CoreIrqSample {
-                id: cpu as u16,
+                id: cpu_id,
                 ..CoreIrqSample::default()
             };
             if self.primed {
-                for slot in 0..3 {
-                    let row = soft_order[slot];
-                    core.softirq_per_s[slot] = counter_rate(
-                        self.soft.counts[row][cpu],
-                        self.previous_soft.counts[row][cpu],
+                for (slot, &row) in soft_order.iter().enumerate() {
+                    core.softirq_per_s[slot] = soft_cell_rate(
+                        &self.soft,
+                        &self.previous_soft,
+                        row,
+                        cpu_id,
                         previous_ms,
                         ctx.now_ms,
                     );
@@ -186,37 +205,33 @@ impl Collector for CpuIrqCollector {
                     &self.irq,
                     &self.previous_irq,
                     b"RES",
-                    cpu,
+                    cpu_id,
                     previous_ms,
                     ctx.now_ms,
-                    self.primed,
                 );
                 core.cal_per_s = named_cell_rate(
                     &self.irq,
                     &self.previous_irq,
                     b"CAL",
-                    cpu,
+                    cpu_id,
                     previous_ms,
                     ctx.now_ms,
-                    self.primed,
                 );
                 core.tlb_per_s = named_cell_rate(
                     &self.irq,
                     &self.previous_irq,
                     b"TLB",
-                    cpu,
+                    cpu_id,
                     previous_ms,
                     ctx.now_ms,
-                    self.primed,
                 );
                 core.loc_per_s = named_cell_rate(
                     &self.irq,
                     &self.previous_irq,
                     b"LOC",
-                    cpu,
+                    cpu_id,
                     previous_ms,
                     ctx.now_ms,
-                    self.primed,
                 );
             }
             part.cores.push(core);
@@ -226,7 +241,6 @@ impl Collector for CpuIrqCollector {
                 &self.irq,
                 &self.previous_irq,
                 b"THR",
-                self.irq.cpu_count,
                 previous_ms,
                 ctx.now_ms,
             );
@@ -234,7 +248,6 @@ impl Collector for CpuIrqCollector {
                 &self.irq,
                 &self.previous_irq,
                 b"MCE",
-                self.irq.cpu_count,
                 previous_ms,
                 ctx.now_ms,
             );
@@ -242,7 +255,6 @@ impl Collector for CpuIrqCollector {
                 &self.irq,
                 &self.previous_irq,
                 b"DFR",
-                self.irq.cpu_count,
                 previous_ms,
                 ctx.now_ms,
             );
@@ -255,18 +267,14 @@ impl Collector for CpuIrqCollector {
                 else {
                     continue;
                 };
-                let mut current_total = 0_u64;
-                let mut previous_total = 0_u64;
-                let mut valid = true;
-                for cpu in 0..self.irq.cpu_count {
-                    current_total = current_total.saturating_add(row.counts[cpu]);
-                    previous_total = previous_total.saturating_add(previous.counts[cpu]);
-                    valid &= row.counts[cpu].checked_sub(previous.counts[cpu]).is_some();
-                }
-                if valid
-                    && let Some(per_s) =
-                        counter_rate(current_total, previous_total, previous_ms, ctx.now_ms)
-                {
+                if let Some(per_s) = irq_row_total_rate(
+                    &self.irq,
+                    &self.previous_irq,
+                    row,
+                    previous,
+                    previous_ms,
+                    ctx.now_ms,
+                ) {
                     insert_top(
                         &mut part.numeric_top,
                         NumericIrqTop {
@@ -290,36 +298,75 @@ impl Collector for CpuIrqCollector {
         self.previous_ms = None;
         self.primed = false;
         self.previous_soft = SoftirqTable::default();
-        self.irq = InterruptsTable::with_capacity();
-        self.previous_irq = InterruptsTable::with_capacity();
     }
 }
-fn counter_rate(current: u64, previous: u64, previous_ms: Option<u64>, now_ms: u64) -> Option<f64> {
-    let mut counter = Counter::new();
-    match counter.rate(previous, previous_ms?) {
-        None => {}
-        Some(_) => return None,
+fn delta32(current: u32, previous: u32) -> Option<u64> {
+    if current >= previous {
+        Some(u64::from(current - previous))
+    } else if previous > 0xC000_0000 {
+        Some(u64::from(current.wrapping_sub(previous)))
+    } else {
+        None
     }
-    counter.rate(current, now_ms)
+}
+
+fn rate_from_delta(delta: u64, previous_ms: Option<u64>, now_ms: u64) -> Option<f64> {
+    delta::rate(delta, 0, previous_ms, now_ms)
+}
+
+fn cpu_column(ids: &[u16], cpu_id: u16) -> Option<usize> {
+    ids.iter().position(|id| *id == cpu_id)
+}
+
+fn soft_cell_rate(
+    current: &SoftirqTable,
+    old: &SoftirqTable,
+    row: usize,
+    id: u16,
+    then: Option<u64>,
+    now: u64,
+) -> Option<f64> {
+    let current_col = cpu_column(&current.cpu_ids[..current.cpu_count], id)?;
+    let old_col = cpu_column(&old.cpu_ids[..old.cpu_count], id)?;
+    rate_from_delta(
+        delta32(current.counts[row][current_col], old.counts[row][old_col])?,
+        then,
+        now,
+    )
+}
+
+fn soft_total_rate(
+    current: &SoftirqTable,
+    old: &SoftirqTable,
+    row: usize,
+    then: Option<u64>,
+    now: u64,
+) -> Option<f64> {
+    let mut delta = 0_u64;
+    for (col, &id) in current.cpu_ids[..current.cpu_count].iter().enumerate() {
+        let old_col = cpu_column(&old.cpu_ids[..old.cpu_count], id)?;
+        delta = delta.checked_add(delta32(current.counts[row][col], old.counts[row][old_col])?)?;
+    }
+    rate_from_delta(delta, then, now)
 }
 fn named_cell_rate(
     current: &InterruptsTable,
     previous: &InterruptsTable,
     name: &[u8],
-    cpu: usize,
+    cpu_id: u16,
     previous_ms: Option<u64>,
     now_ms: u64,
-    primed: bool,
 ) -> Option<f64> {
-    if !primed {
-        return None;
-    }
-    let hash = interrupts::hash_name(name);
+    let hash = interrupts::name_hash(name);
     let current_row = current.named.iter().find(|row| row.hash == hash)?;
     let old_row = previous.named.iter().find(|row| row.hash == hash)?;
-    counter_rate(
-        current_row.counts[cpu],
-        old_row.counts[cpu],
+    let current_col = cpu_column(&current.cpu_ids[..current.cpu_count], cpu_id)?;
+    let old_col = cpu_column(&previous.cpu_ids[..previous.cpu_count], cpu_id)?;
+    rate_from_delta(
+        delta32(
+            *current_row.counts.get(current_col)?,
+            *old_row.counts.get(old_col)?,
+        )?,
         previous_ms,
         now_ms,
     )
@@ -328,26 +375,51 @@ fn named_total_rate(
     current: &InterruptsTable,
     previous: &InterruptsTable,
     name: &[u8],
-    cpus: usize,
     previous_ms: Option<u64>,
     now_ms: u64,
 ) -> Option<f64> {
-    let hash = interrupts::hash_name(name);
+    let hash = interrupts::name_hash(name);
     let current_row = current.named.iter().find(|row| row.hash == hash)?;
     let old_row = previous.named.iter().find(|row| row.hash == hash)?;
-    let mut current_total = 0_u64;
-    let mut previous_total = 0_u64;
-    for cpu in 0..cpus {
-        current_total = current_total.checked_add(current_row.counts[cpu])?;
-        previous_total = previous_total.checked_add(old_row.counts[cpu])?;
-        if current_row.counts[cpu]
-            .checked_sub(old_row.counts[cpu])
-            .is_none()
-        {
-            return None;
-        }
+    irq_named_total_rate(current, previous, current_row, old_row, previous_ms, now_ms)
+}
+
+fn irq_named_total_rate(
+    current: &InterruptsTable,
+    previous: &InterruptsTable,
+    row: &interrupts::NamedRow,
+    old: &interrupts::NamedRow,
+    then: Option<u64>,
+    now: u64,
+) -> Option<f64> {
+    irq_columns_total_rate(current, previous, &row.counts, &old.counts, then, now)
+}
+
+fn irq_row_total_rate(
+    current: &InterruptsTable,
+    previous: &InterruptsTable,
+    row: &interrupts::IrqRow,
+    old: &interrupts::IrqRow,
+    then: Option<u64>,
+    now: u64,
+) -> Option<f64> {
+    irq_columns_total_rate(current, previous, &row.counts, &old.counts, then, now)
+}
+
+fn irq_columns_total_rate(
+    current: &InterruptsTable,
+    previous: &InterruptsTable,
+    counts: &[u32],
+    old_counts: &[u32],
+    then: Option<u64>,
+    now: u64,
+) -> Option<f64> {
+    let mut delta = 0_u64;
+    for (col, &id) in current.cpu_ids[..current.cpu_count].iter().enumerate() {
+        let old_col = cpu_column(&previous.cpu_ids[..previous.cpu_count], id)?;
+        delta = delta.checked_add(delta32(*counts.get(col)?, *old_counts.get(old_col)?)?)?;
     }
-    counter_rate(current_total, previous_total, previous_ms, now_ms)
+    rate_from_delta(delta, then, now)
 }
 fn insert_top(top: &mut Vec<NumericIrqTop>, value: NumericIrqTop) {
     let index = top
@@ -439,8 +511,69 @@ mod tests {
             .cpu_irq
             .softirq_top
             .iter()
-            .position(|top| top.name_hash == interrupts::hash_name(b"TIMER"))
+            .position(|top| top.name_hash == interrupts::name_hash(b"TIMER"))
             .unwrap();
         assert_eq!(frame.parts.cpu_irq.cores[0].softirq_per_s[timer_slot], None);
+    }
+
+    #[test]
+    fn maps_interrupt_columns_to_real_cpu_ids_after_hotplug_gap() {
+        let dir = tempfile::tempdir().unwrap();
+        let soft = dir.path().join("softirqs");
+        let irq = dir.path().join("interrupts");
+        fs::write(&soft, b" CPU0 CPU1 CPU2\nTIMER: 1 2 3\n").unwrap();
+        fs::write(
+            &irq,
+            b" CPU0 CPU2\nRES: 10 100\nCAL: 1 1\nTLB: 1 1\nLOC: 1 1\n",
+        )
+        .unwrap();
+        let mut collector = CpuIrqCollector::at(&soft, &irq);
+        assert_eq!(collector.discover(&Env::default()), Health::Warming);
+        let mut frame = MonitorFrame::default();
+        collector
+            .sample(
+                &TickCtx {
+                    tick: 1,
+                    now_ms: 1000,
+                },
+                &mut frame,
+            )
+            .unwrap();
+        let write = |path: &std::path::Path, bytes: &[u8]| {
+            let file = fs::OpenOptions::new().write(true).open(path).unwrap();
+            file.set_len(0).unwrap();
+            file.write_at(bytes, 0).unwrap();
+        };
+        write(&soft, b" CPU0 CPU1 CPU2\nTIMER: 2 3 4\n");
+        write(
+            &irq,
+            b" CPU0 CPU2\nRES: 11 102\nCAL: 2 2\nTLB: 2 2\nLOC: 2 2\n",
+        );
+        collector
+            .sample(
+                &TickCtx {
+                    tick: 2,
+                    now_ms: 2000,
+                },
+                &mut frame,
+            )
+            .unwrap();
+        assert_eq!(
+            frame
+                .parts
+                .cpu_irq
+                .cores
+                .iter()
+                .map(|core| core.id)
+                .collect::<Vec<_>>(),
+            [0, 1, 2]
+        );
+        assert_eq!(frame.parts.cpu_irq.cores[1].res_per_s, None);
+        assert_eq!(frame.parts.cpu_irq.cores[2].res_per_s, Some(2.0));
+    }
+
+    #[test]
+    fn wrapped_u32_cells_produce_a_rate() {
+        assert_eq!(super::delta32(16, u32::MAX - 15), Some(32));
     }
 }

@@ -21,6 +21,8 @@ pub mod uptime;
 pub mod vmstat;
 pub mod zram;
 
+pub const MAX_CPUS: usize = 512;
+
 pub fn fields(input: &[u8]) -> impl Iterator<Item = &[u8]> {
     input
         .split(u8::is_ascii_whitespace)

@@ -1,13 +1,15 @@
 //! Linux `/proc/schedstat` collector.
 use super::procfile::ProcFile;
 use crate::collect::{
-    CollectError, Collector, CollectorId, TickCtx,
-    delta::Counter,
+    CollectError, Collector, CollectorId, TickCtx, delta,
     env::Env,
     frame::MonitorFrame,
     health::{Absent, Health},
     model::cpu_sched::CoreSchedSample,
-    parse::schedstat::{self, CpuSchedRaw, ParseError, SchedstatTable},
+    parse::{
+        MAX_CPUS,
+        schedstat::{self, CpuSchedRaw, ParseError, SchedstatTable},
+    },
     schedule::Cadence,
 };
 use std::{
@@ -19,7 +21,7 @@ pub struct CpuSchedCollector {
     path: PathBuf,
     file: Option<ProcFile>,
     raw: SchedstatTable,
-    previous: [Option<CpuSchedRaw>; schedstat::MAX_CPUS],
+    previous: [Option<CpuSchedRaw>; MAX_CPUS],
     previous_ms: Option<u64>,
 }
 impl CpuSchedCollector {
@@ -31,19 +33,21 @@ impl CpuSchedCollector {
             path: path.as_ref().to_path_buf(),
             file: None,
             raw: SchedstatTable::default(),
-            previous: [None; schedstat::MAX_CPUS],
+            previous: [None; MAX_CPUS],
             previous_ms: None,
         }
     }
-    fn read(&mut self) -> Result<(), CollectError> {
-        let file = self.file.as_mut().ok_or(CollectError::Gone)?;
+    fn read(&mut self) -> Result<(), ReadError> {
+        let file = self.file.as_mut().ok_or(ReadError::Gone)?;
         let raw = &mut self.raw;
         match file.read_all().map(|bytes| schedstat::parse(bytes, raw)) {
             Ok(Ok(())) => Ok(()),
-            Ok(Err(ParseError::Unsupported)) => Err(CollectError::Parse("/proc/schedstat version")),
-            Ok(Err(ParseError::Invalid)) => Err(CollectError::Parse("/proc/schedstat")),
-            Err(_error) if file.needs_reopen() => Err(CollectError::Gone),
-            Err(error) => Err(error.into()),
+            Ok(Err(error)) => Err(ReadError::Parse(error)),
+            Err(error) => Err(if file.needs_reopen() {
+                ReadError::Gone
+            } else {
+                ReadError::Io(error)
+            }),
         }
     }
 }
@@ -70,7 +74,7 @@ impl Collector for CpuSchedCollector {
                         self.previous_ms = None;
                         Health::Warming
                     }
-                    Err(CollectError::Parse("/proc/schedstat version")) => {
+                    Err(ReadError::Parse(ParseError::Unsupported)) => {
                         self.file = None;
                         Health::Absent(Absent::NotOnThisOs)
                     }
@@ -90,7 +94,7 @@ impl Collector for CpuSchedCollector {
         }
     }
     fn sample(&mut self, ctx: &TickCtx, frame: &mut MonitorFrame) -> Result<(), CollectError> {
-        self.read()?;
+        self.read().map_err(ReadError::into_collect)?;
         let part = &mut frame.parts.cpu_sched;
         part.cores.clear();
         part.version = Some(self.raw.version);
@@ -114,10 +118,12 @@ impl Collector for CpuSchedCollector {
                     )
                 })
                 .map(|ns_per_s| ns_per_s / 1_000_000.0);
-            let average = delay
-                .zip(slices)
-                .filter(|(_, slices)| *slices > 0)
-                .map(|(ns, slices)| ns as f64 / slices as f64 / 1_000_000.0);
+            let average = self.previous_ms.is_some().then_some(()).and(
+                delay
+                    .zip(slices)
+                    .filter(|(_, slices)| *slices > 0)
+                    .map(|(ns, slices)| ns as f64 / slices as f64 / 1_000_000.0),
+            );
             part.cores.push(CoreSchedSample {
                 id: id as u16,
                 online: current.is_some(),
@@ -132,18 +138,29 @@ impl Collector for CpuSchedCollector {
     }
     fn close(&mut self) {
         self.file = None;
-        self.previous = [None; schedstat::MAX_CPUS];
+        self.previous = [None; MAX_CPUS];
         self.previous_ms = None;
     }
 }
 
-fn counter_rate(current: u64, previous: u64, previous_ms: Option<u64>, now_ms: u64) -> Option<f64> {
-    let mut counter = Counter::new();
-    match counter.rate(previous, previous_ms?) {
-        None => {}
-        Some(_) => return None,
+enum ReadError {
+    Gone,
+    Io(io::Error),
+    Parse(ParseError),
+}
+impl ReadError {
+    fn into_collect(self) -> CollectError {
+        match self {
+            Self::Gone => CollectError::Gone,
+            Self::Io(error) => error.into(),
+            Self::Parse(ParseError::Unsupported) => CollectError::Parse("/proc/schedstat version"),
+            Self::Parse(ParseError::Invalid) => CollectError::Parse("/proc/schedstat"),
+        }
     }
-    counter.rate(current, now_ms)
+}
+
+fn counter_rate(current: u64, previous: u64, previous_ms: Option<u64>, now_ms: u64) -> Option<f64> {
+    delta::rate(current, previous, previous_ms, now_ms)
 }
 
 #[cfg(test)]
@@ -175,7 +192,7 @@ mod tests {
         let mut frame = MonitorFrame::default();
         fs::write(
             &path,
-            b"version 17\ncpu0 0 0 0 0 0 0 30000000 40000000 20\n",
+            b"version 17\ncpu0 0 0 0 0 0 0 20000000 40000000 20\n",
         )
         .unwrap();
         collector
@@ -188,9 +205,13 @@ mod tests {
             )
             .unwrap();
         assert_eq!(frame.parts.cpu_sched.cores[0].run_queue_wait_ms_per_s, None);
+        assert_eq!(
+            frame.parts.cpu_sched.cores[0].avg_wait_ms_per_timeslice,
+            None
+        );
         fs::write(
             &path,
-            b"version 17\ncpu0 0 0 0 0 0 0 50000000 60000000 30\n",
+            b"version 17\ncpu0 0 0 0 0 0 0 30000000 60000000 30\n",
         )
         .unwrap();
         collector
@@ -205,6 +226,10 @@ mod tests {
         assert_eq!(
             frame.parts.cpu_sched.cores[0].run_queue_wait_ms_per_s,
             Some(3.9992001599680064)
+        );
+        assert_eq!(
+            frame.parts.cpu_sched.cores[0].avg_wait_ms_per_timeslice,
+            Some(2.0)
         );
     }
 }
