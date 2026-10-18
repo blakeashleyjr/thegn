@@ -51,12 +51,15 @@ impl GpuView<'_> {
         body: Rect,
         memory: bool,
     ) {
-        let Some(engine) = self.0.engines.devices.first() else {
+        let Some(engine) = self
+            .0
+            .engines
+            .devices
+            .iter()
+            .find(|engine| engine.runtime_status == RuntimeStatus::Active)
+        else {
             return;
         };
-        if engine.runtime_status != RuntimeStatus::Active {
-            return;
-        }
         let Some(history) = self
             .0
             .histories
@@ -100,8 +103,13 @@ impl GpuView<'_> {
                 "power / cap 0-100%",
             )
         };
-        let device_rows = self.0.devices.devices.len().min(body.rows);
-        let graph_rows = body.rows.saturating_sub(device_rows + 4).min(5);
+        let data_rows = if memory {
+            self.0.devices.devices.len()
+        } else {
+            self.0.engines.devices.len()
+        }
+        .min(body.rows);
+        let graph_rows = body.rows.saturating_sub(data_rows + 4).min(5);
         if graph_rows == 0 {
             return;
         }
@@ -118,13 +126,13 @@ impl GpuView<'_> {
                 Rect::full(body.cols, 1),
                 surface,
                 rect.x + body.x,
-                rect.y + body.y + device_rows,
+                rect.y + body.y + data_rows,
             );
             let graph_rect = history_graph_rect(
                 rect,
                 Rect {
                     x: body.x,
-                    y: body.y + device_rows,
+                    y: body.y + data_rows,
                     cols: graph_cols,
                     rows: graph_rows,
                 },
@@ -151,7 +159,7 @@ impl GpuView<'_> {
                 Rect::full(body.cols, 1),
                 surface,
                 rect.x + body.x,
-                rect.y + body.y + device_rows + graph_rows + 2,
+                rect.y + body.y + data_rows + graph_rows,
             );
             crate::monitor::graphs::paint_sparkline(
                 &values[..len],
@@ -159,7 +167,7 @@ impl GpuView<'_> {
                 thegn_core::theme::RampId::Util,
                 Rect {
                     x: rect.x + body.x,
-                    y: rect.y + body.y + device_rows + graph_rows + 1,
+                    y: rect.y + body.y + data_rows + graph_rows + 1,
                     cols: graph_cols,
                     rows: 1,
                 },
