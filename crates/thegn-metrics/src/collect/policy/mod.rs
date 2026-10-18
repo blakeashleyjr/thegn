@@ -2,4 +2,5 @@
 pub mod cgroup_classify;
 pub mod hwmon_group;
 pub mod net_scope;
+pub mod power;
 pub mod thermal;
