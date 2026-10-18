@@ -14,6 +14,7 @@ use crate::{
     },
     seg::{StyleTok, Tok},
 };
+use std::{cell::RefCell, fmt::Write as _};
 use termwiz::surface::Surface;
 use thegn_core::{numfmt::NumFmt, theme::RampId};
 use thegn_metrics::collect::{
@@ -29,119 +30,158 @@ const IRQ: PanelId = PanelId("cpu.irq");
 const SCHED: PanelId = PanelId("cpu.sched");
 const IDLE: PanelId = PanelId("cpu.idle");
 
+#[derive(Default)]
+struct CpuPaintScratch {
+    grid: CellGrid,
+    aux_grid: CellGrid,
+    text: String,
+    emitter: Emitter,
+}
+
+thread_local! {
+    static PAINT_SCRATCH: RefCell<CpuPaintScratch> = RefCell::new(CpuPaintScratch::default());
+}
+
 pub(super) fn paint(model: &CpuModel, surface: &mut Surface, id: PanelId, rect: Rect) {
-    let mut grid = CellGrid::new(rect.cols, rect.rows);
-    match id {
-        USAGE => paint_heat_panel(
-            &mut grid,
-            rect,
-            "CPU usage",
-            &model.cpu_stat,
-            model.cpu_stat_health,
-            true,
-        ),
-        CORES => paint_cores(&mut grid, rect, model),
-        FREQ => paint_freq(&mut grid, rect, &model.cpu_freq, model.cpu_freq_health),
-        LOAD => paint_load(&mut grid, rect, model),
-        IRQ => irq::paint_irq(&mut grid, rect, &model.cpu_irq, model.cpu_irq_health),
-        SCHED => paint_sched(&mut grid, rect, &model.cpu_sched, model.sched_health),
-        IDLE => paint_idle(&mut grid, rect, model),
-        _ => return,
-    }
-    Emitter::default().emit(
-        &grid,
-        Rect::full(rect.cols, rect.rows),
-        surface,
-        rect.x,
-        rect.y,
-    );
-    if id == USAGE && rect.rows > 5 && rect.cols > 2 {
-        let graph_rect = Rect {
-            x: rect.x + 1,
-            y: rect.y + 2,
-            cols: rect.cols.saturating_sub(2),
-            rows: rect.rows.saturating_sub(5),
-        };
-        if model.cpu_history.is_empty() {
-            let mut warming = CellGrid::new(graph_rect.cols, graph_rect.rows.min(1));
-            warming
-                .view(Rect::full(graph_rect.cols, graph_rect.rows.min(1)))
-                .put_str(0, 0, mark(Health::Warming), CellStyle::default());
-            Emitter::default().emit(
-                &warming,
-                Rect::full(graph_rect.cols, graph_rect.rows.min(1)),
-                surface,
-                graph_rect.x,
-                graph_rect.y,
-            );
-        } else {
-            crate::monitor::graphs::paint_history_graph(
-                &model.cpu_history,
-                thegn_core::theme::RampId::Util,
-                Rect {
-                    rows: graph_rect.rows.saturating_sub(2),
-                    ..graph_rect
-                },
-                surface,
-            );
+    PAINT_SCRATCH.with(|scratch| {
+        let scratch = &mut *scratch.borrow_mut();
+        scratch.grid.resize(rect.cols, rect.rows);
+        scratch.grid.clear();
+        match id {
+            USAGE => paint_heat_panel(
+                rect,
+                "CPU usage",
+                &model.cpu_stat,
+                model.cpu_stat_health,
+                true,
+                scratch,
+            ),
+            CORES => paint_cores(&mut scratch.grid, rect, model),
+            FREQ => paint_freq(
+                &mut scratch.grid,
+                rect,
+                &model.cpu_freq,
+                model.cpu_freq_health,
+            ),
+            LOAD => paint_load(&mut scratch.grid, rect, model, &mut scratch.aux_grid),
+            IRQ => irq::paint_irq(
+                &mut scratch.grid,
+                rect,
+                &model.cpu_irq,
+                model.cpu_irq_health,
+            ),
+            SCHED => paint_sched(
+                &mut scratch.grid,
+                rect,
+                &model.cpu_sched,
+                model.sched_health,
+            ),
+            IDLE => paint_idle(&mut scratch.grid, rect, model),
+            _ => return,
         }
-        let io_values = model.iowait_history.ordered();
-        let steal_values = model.steal_history.ordered();
-        for (values, offset) in [
-            (&io_values, graph_rect.rows.saturating_sub(2)),
-            (&steal_values, graph_rect.rows.saturating_sub(1)),
-        ] {
-            if !values.is_empty() && graph_rect.rows >= 2 {
-                let mut label = CellGrid::new(3, 1);
-                let name = if offset == graph_rect.rows.saturating_sub(2) {
-                    "io"
-                } else {
-                    "st"
-                };
-                label
-                    .view(Rect::full(3, 1))
-                    .put_str(0, 0, name, CellStyle::default());
-                Emitter::default().emit(
-                    &label,
-                    Rect::full(3, 1),
+        scratch.emitter.emit(
+            &scratch.grid,
+            Rect::full(rect.cols, rect.rows),
+            surface,
+            rect.x,
+            rect.y,
+        );
+        if id == USAGE && rect.rows > 5 && rect.cols > 2 {
+            let graph_rect = Rect {
+                x: rect.x + 1,
+                y: rect.y + 2,
+                cols: rect.cols.saturating_sub(2),
+                rows: rect.rows.saturating_sub(5),
+            };
+            if model.cpu_history.is_empty() {
+                scratch
+                    .aux_grid
+                    .resize(graph_rect.cols, graph_rect.rows.min(1));
+                scratch.aux_grid.clear();
+                scratch
+                    .aux_grid
+                    .view(Rect::full(graph_rect.cols, graph_rect.rows.min(1)))
+                    .put_str(0, 0, mark(Health::Warming), CellStyle::default());
+                scratch.emitter.emit(
+                    &scratch.aux_grid,
+                    Rect::full(graph_rect.cols, graph_rect.rows.min(1)),
                     surface,
                     graph_rect.x,
-                    graph_rect.y + offset,
+                    graph_rect.y,
                 );
-                crate::monitor::graphs::paint_sparkline(
-                    values,
-                    graph_rect.cols.saturating_sub(4),
-                    RampId::Util,
+            } else {
+                crate::monitor::graphs::paint_history_graph(
+                    &model.cpu_history,
+                    thegn_core::theme::RampId::Util,
                     Rect {
-                        x: graph_rect.x + 4,
-                        y: graph_rect.y + offset,
-                        cols: graph_rect.cols.saturating_sub(4),
-                        rows: 1,
+                        rows: graph_rect.rows.saturating_sub(2),
+                        ..graph_rect
                     },
                     surface,
                 );
             }
+            let io_values = model.iowait_history.ordered();
+            let steal_values = model.steal_history.ordered();
+            for (values, offset) in [
+                (&io_values, graph_rect.rows.saturating_sub(2)),
+                (&steal_values, graph_rect.rows.saturating_sub(1)),
+            ] {
+                if !values.is_empty() && graph_rect.rows >= 2 {
+                    scratch.aux_grid.resize(3, 1);
+                    scratch.aux_grid.clear();
+                    let name = if offset == graph_rect.rows.saturating_sub(2) {
+                        "io"
+                    } else {
+                        "st"
+                    };
+                    scratch.aux_grid.view(Rect::full(3, 1)).put_str(
+                        0,
+                        0,
+                        name,
+                        CellStyle::default(),
+                    );
+                    scratch.emitter.emit(
+                        &scratch.aux_grid,
+                        Rect::full(3, 1),
+                        surface,
+                        graph_rect.x,
+                        graph_rect.y + offset,
+                    );
+                    crate::monitor::graphs::paint_sparkline(
+                        values,
+                        graph_rect.cols.saturating_sub(4),
+                        RampId::Util,
+                        Rect {
+                            x: graph_rect.x + 4,
+                            y: graph_rect.y + offset,
+                            cols: graph_rect.cols.saturating_sub(4),
+                            rows: 1,
+                        },
+                        surface,
+                    );
+                }
+            }
         }
-    }
-    if id == CORES && rect.rows > 2 && rect.cols > 24 {
-        paint_core_heatmap(model, rect, surface);
-    }
-    if id == FREQ && rect.rows > 5 {
-        paint_frequency_history(model, rect, surface);
-    }
-    if id == LOAD && rect.rows > 5 && rect.cols > 2 && !model.load_history.is_empty() {
-        crate::monitor::graphs::paint_history_graph(
-            &model.load_history,
-            RampId::Util,
-            Rect {
-                x: rect.x + 1,
-                y: rect.y + 4,
-                cols: rect.cols.saturating_sub(2),
-                rows: rect.rows.saturating_sub(5),
-            },
-            surface,
-        );
-    }
+        if id == CORES && rect.rows > 2 && rect.cols > 24 {
+            paint_core_heatmap(model, rect, surface);
+        }
+        if id == FREQ && rect.rows > 5 {
+            paint_frequency_history(model, rect, surface);
+        }
+        if id == LOAD && rect.rows > 5 && rect.cols > 2 && !model.load_history.is_empty() {
+            crate::monitor::graphs::paint_history_graph(
+                &model.load_history,
+                RampId::Util,
+                Rect {
+                    x: rect.x + 1,
+                    y: rect.y + 4,
+                    cols: rect.cols.saturating_sub(2),
+                    rows: rect.rows.saturating_sub(5),
+                },
+                surface,
+            );
+        }
+    });
 }
 
 fn paint_frequency_history(model: &CpuModel, rect: Rect, surface: &mut Surface) {
@@ -367,13 +407,19 @@ fn style(tok: Tok) -> StyleTok {
 }
 
 fn paint_heat_panel(
-    grid: &mut CellGrid,
     rect: Rect,
     title: &str,
     part: &CpuStatPart,
     health: Health,
     total: bool,
+    scratch: &mut CpuPaintScratch,
 ) {
+    let CpuPaintScratch {
+        grid,
+        aux_grid: gauge,
+        text: modes,
+        ..
+    } = scratch;
     let mut body = panel::panel(grid, Rect::full(rect.cols, rect.rows), title, None);
     let area = body.rect();
     if area.cols == 0 || area.rows == 0 {
@@ -396,12 +442,13 @@ fn paint_heat_panel(
             } else {
                 Health::Absent(Absent::NoHardware)
             };
-            let id = format!("{}", core.id);
+            modes.clear();
+            write!(modes, "{}", core.id).expect("writing CPU core id to String");
             if area.rows > 0 {
                 body.put_str(
                     left,
                     0,
-                    &id,
+                    modes.as_str(),
                     CellStyle {
                         fg: style(Tok::Slot(S::Text)),
                         ..CellStyle::default()
@@ -453,7 +500,9 @@ fn paint_heat_panel(
     body.put_str(0, y, label, CellStyle::default());
     if let Some(share) = part.total {
         let value = f32::from(share.busy) / 1000.0;
-        let modes = format!(
+        modes.clear();
+        write!(
+            modes,
             "busy {:>2}% u{:>2} s{:>2} io{:>2} irq{:>2} st{:>2}",
             (value * 100.0).round() as u8,
             share.user / 10,
@@ -461,11 +510,13 @@ fn paint_heat_panel(
             share.iowait / 10,
             (share.irq + share.softirq) / 10,
             share.steal / 10
-        );
+        )
+        .expect("writing CPU mode labels to String");
         let width = area.cols.saturating_sub(7).saturating_sub(modes.len());
-        let mut gauge = CellGrid::new(width, 1);
+        gauge.resize(width, 1);
+        gauge.clear();
         Meter::default().paint(
-            &mut gauge,
+            gauge,
             Rect::full(width, 1),
             MeterSpec {
                 value,
@@ -484,7 +535,7 @@ fn paint_heat_panel(
         body.put_str(
             area.cols.saturating_sub(modes.len()),
             y,
-            &modes,
+            modes,
             CellStyle::default(),
         );
     } else {
@@ -582,7 +633,7 @@ fn paint_freq(grid: &mut CellGrid, rect: Rect, part: &CpuFreqPart, health: Healt
     }
 }
 
-fn paint_load(grid: &mut CellGrid, rect: Rect, model: &CpuModel) {
+fn paint_load(grid: &mut CellGrid, rect: Rect, model: &CpuModel, gauge: &mut CellGrid) {
     let mut body = panel::panel(
         grid,
         Rect::full(rect.cols, rect.rows),
@@ -629,9 +680,10 @@ fn paint_load(grid: &mut CellGrid, rect: Rect, model: &CpuModel) {
     if let Some(centi_percent) = model.psi.cpu.some_stall_centi {
         let x = psi.len().min(area.cols);
         let width = area.cols.saturating_sub(x);
-        let mut gauge = CellGrid::new(width, 1);
+        gauge.resize(width, 1);
+        gauge.clear();
         Meter::default().paint(
-            &mut gauge,
+            gauge,
             Rect::full(width, 1),
             MeterSpec {
                 value: (centi_percent as f32 / 10_000.0).clamp(0.0, 1.0),
@@ -706,4 +758,18 @@ fn paint_sched(grid: &mut CellGrid, rect: Rect, part: &CpuSchedPart, health: Hea
             );
         }
     }
+}
+
+#[cfg(test)]
+#[test]
+fn consecutive_cpu_paints_reuse_the_style_cache() {
+    let model = CpuModel::default();
+    let mut surface = Surface::new(80, 20);
+    crate::caps::test_override::with_color(thegn_core::termcaps::ColorDepth::Truecolor, || {
+        paint(&model, &mut surface, USAGE, Rect::full(80, 20));
+        let after_first = PAINT_SCRATCH.with(|scratch| scratch.borrow().emitter.rebuilds());
+        paint(&model, &mut surface, USAGE, Rect::full(80, 20));
+        let after_second = PAINT_SCRATCH.with(|scratch| scratch.borrow().emitter.rebuilds());
+        assert_eq!(after_second, after_first);
+    });
 }
