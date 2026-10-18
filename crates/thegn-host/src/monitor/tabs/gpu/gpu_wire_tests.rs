@@ -165,8 +165,11 @@ fn memory_history_right_aligns_two_samples_in_unicode_and_ascii() {
             .screen_lines()
             .iter()
             .position(|line| {
-                line.visible_cells()
-                    .any(|cell| cell.str().contains("VRAM used / total 0-100%"))
+                let text = line.visible_cells().fold(String::new(), |mut text, cell| {
+                    text.push_str(cell.str());
+                    text
+                });
+                text.contains("VRAM used / total 0-100%")
             })
             .expect("VRAM history label rendered");
         let graph_y = label_y + 1;

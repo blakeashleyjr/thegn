@@ -113,7 +113,7 @@ impl GpuView<'_> {
         if graph_rows == 0 {
             return;
         }
-        let graph_cols = body.cols.saturating_sub(1);
+        let graph_cols = body.cols;
         if first_len > 0 {
             let mut values = [0.0_f32; HISTORY_CAP];
             let len = super::BusyHistory::ordered_ring(first, first_next, first_len, &mut values);
