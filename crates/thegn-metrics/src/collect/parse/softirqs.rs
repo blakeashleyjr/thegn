@@ -1,7 +1,5 @@
 //! Allocation-free `/proc/softirqs` parser.
-use super::{fields, parse_u64};
-
-pub const MAX_CPUS: usize = 512;
+use super::{MAX_CPUS, fields, parse_u64};
 pub const TYPES: [&[u8]; 10] = [
     b"HI",
     b"TIMER",
@@ -18,12 +16,14 @@ pub const TYPES: [&[u8]; 10] = [
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SoftirqTable {
     pub cpu_count: usize,
-    pub counts: [[u64; MAX_CPUS]; 10],
+    pub cpu_ids: [u16; MAX_CPUS],
+    pub counts: [[u32; MAX_CPUS]; 10],
 }
 impl Default for SoftirqTable {
     fn default() -> Self {
         Self {
             cpu_count: 0,
+            cpu_ids: [0; MAX_CPUS],
             counts: [[0; MAX_CPUS]; 10],
         }
     }
@@ -37,11 +37,11 @@ pub fn parse(bytes: &[u8], out: &mut SoftirqTable) -> bool {
         return false;
     };
     for field in fields(header) {
-        if field
-            .strip_prefix(b"CPU")
-            .and_then(parse_u64)
-            .is_some_and(|id| id < MAX_CPUS as u64)
+        if let Some(id) = field.strip_prefix(b"CPU").and_then(parse_u64)
+            && id < MAX_CPUS as u64
+            && out.cpu_count < MAX_CPUS
         {
+            out.cpu_ids[out.cpu_count] = id as u16;
             out.cpu_count += 1;
         }
     }
@@ -58,7 +58,7 @@ pub fn parse(bytes: &[u8], out: &mut SoftirqTable) -> bool {
         };
         let mut count = 0;
         for value in fields(&line[colon + 1..]) {
-            let Some(value) = parse_u64(value) else {
+            let Some(value) = parse_u64(value).and_then(|v| u32::try_from(v).ok()) else {
                 return false;
             };
             if count >= out.cpu_count || count >= MAX_CPUS {
@@ -96,6 +96,8 @@ mod tests {
         let mut table = SoftirqTable::default();
         assert!(parse(CAPTURE, &mut table));
         assert_eq!(table.cpu_count, 24);
+        assert_eq!(table.cpu_ids[0], 0);
+        assert_eq!(table.cpu_ids[23], 23);
         assert_eq!(table.counts[1][0], 15_461_207);
         assert_eq!(table.counts[3][23], 895_249);
         assert!(!parse(b" CPU0 CPU1\n TIMER: 1\n", &mut table));

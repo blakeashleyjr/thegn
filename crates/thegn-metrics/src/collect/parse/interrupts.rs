@@ -1,39 +1,23 @@
-//! Allocation-free `/proc/interrupts` parser; output storage belongs to caller.
-use super::{fields, parse_u64};
+//! `/proc/interrupts` parser; output storage belongs to caller.
+use super::{MAX_CPUS, fields, parse_u64};
 
-pub const MAX_CPUS: usize = 512;
 pub const MAX_ROWS: usize = 512;
 pub const MAX_NAMED: usize = 32;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct IrqRow {
     pub irq: u32,
-    pub counts: [u64; MAX_CPUS],
+    pub counts: Vec<u32>,
 }
-impl Default for IrqRow {
-    fn default() -> Self {
-        Self {
-            irq: 0,
-            counts: [0; MAX_CPUS],
-        }
-    }
-}
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NamedRow {
     pub hash: u64,
-    pub counts: [u64; MAX_CPUS],
-}
-impl Default for NamedRow {
-    fn default() -> Self {
-        Self {
-            hash: 0,
-            counts: [0; MAX_CPUS],
-        }
-    }
+    pub counts: Vec<u32>,
 }
 #[derive(Debug)]
 pub struct InterruptsTable {
     pub cpu_count: usize,
+    pub cpu_ids: [u16; MAX_CPUS],
     pub numeric: Vec<IrqRow>,
     pub named: Vec<NamedRow>,
 }
@@ -41,6 +25,7 @@ impl InterruptsTable {
     pub fn with_capacity() -> Self {
         Self {
             cpu_count: 0,
+            cpu_ids: [0; MAX_CPUS],
             numeric: Vec::with_capacity(MAX_ROWS),
             named: Vec::with_capacity(MAX_NAMED),
         }
@@ -54,18 +39,18 @@ impl Default for InterruptsTable {
 
 pub fn parse(bytes: &[u8], out: &mut InterruptsTable) -> bool {
     out.cpu_count = 0;
-    out.numeric.clear();
-    out.named.clear();
+    let mut numeric_rows = 0;
+    let mut named_rows = 0;
     let mut lines = bytes.split(|byte| *byte == b'\n');
     let Some(header) = lines.next() else {
         return false;
     };
     for field in fields(header) {
-        if field
-            .strip_prefix(b"CPU")
-            .and_then(parse_u64)
-            .is_some_and(|id| id < MAX_CPUS as u64)
+        if let Some(id) = field.strip_prefix(b"CPU").and_then(parse_u64)
+            && id < MAX_CPUS as u64
+            && out.cpu_count < MAX_CPUS
         {
+            out.cpu_ids[out.cpu_count] = id as u16;
             out.cpu_count += 1;
         }
     }
@@ -82,50 +67,59 @@ pub fn parse(bytes: &[u8], out: &mut InterruptsTable) -> bool {
             None => continue,
         };
         if let Some(irq) = parse_u64(label) {
-            if irq > u64::from(u32::MAX)
-                || out.numeric.len() >= MAX_ROWS
-                || out.numeric.len() == out.numeric.capacity()
-            {
+            if irq > u64::from(u32::MAX) || numeric_rows >= MAX_ROWS {
                 continue;
             }
-            let mut row = IrqRow {
-                irq: irq as u32,
-                ..IrqRow::default()
-            };
-            let mut count = 0;
+            if numeric_rows == out.numeric.len() {
+                out.numeric.push(IrqRow {
+                    irq: irq as u32,
+                    counts: Vec::with_capacity(out.cpu_count),
+                });
+            }
+            let row = &mut out.numeric[numeric_rows];
+            row.irq = irq as u32;
+            row.counts.clear();
             for token in fields(tail) {
-                let Some(value) = parse_u64(token) else { break };
-                if count == out.cpu_count {
+                let Some(value) = parse_u64(token).and_then(|v| u32::try_from(v).ok()) else {
+                    break;
+                };
+                if row.counts.len() == out.cpu_count {
                     break;
                 }
-                row.counts[count] = value;
-                count += 1;
+                row.counts.push(value);
             }
-            if count == out.cpu_count {
-                out.numeric.push(row);
+            if row.counts.len() == out.cpu_count {
+                numeric_rows += 1;
             }
             continue;
         }
-        if out.named.len() >= MAX_NAMED || out.named.len() == out.named.capacity() {
+        if named_rows >= MAX_NAMED {
             continue;
         }
-        let mut row = NamedRow {
-            hash: name_hash(label),
-            ..NamedRow::default()
-        };
-        let mut count = 0;
+        if named_rows == out.named.len() {
+            out.named.push(NamedRow {
+                hash: name_hash(label),
+                counts: Vec::with_capacity(out.cpu_count),
+            });
+        }
+        let row = &mut out.named[named_rows];
+        row.hash = name_hash(label);
+        row.counts.clear();
         for token in fields(tail) {
-            let Some(value) = parse_u64(token) else { break };
-            if count == out.cpu_count {
+            let Some(value) = parse_u64(token).and_then(|v| u32::try_from(v).ok()) else {
+                break;
+            };
+            if row.counts.len() == out.cpu_count {
                 break;
             }
-            row.counts[count] = value;
-            count += 1;
+            row.counts.push(value);
         }
-        if count >= out.cpu_count.saturating_sub(1) {
-            out.named.push(row);
+        if row.counts.len() >= out.cpu_count.saturating_sub(1) {
+            named_rows += 1;
         }
     }
+    out.numeric.truncate(numeric_rows);
+    out.named.truncate(named_rows);
     true
 }
 
@@ -133,9 +127,6 @@ pub fn name_hash(name: &[u8]) -> u64 {
     name.iter().fold(0xcbf2_9ce4_8422_2325_u64, |hash, byte| {
         (hash ^ u64::from(*byte)).wrapping_mul(0x100_0000_01b3)
     })
-}
-pub fn hash_name(name: &[u8]) -> u64 {
-    name_hash(name)
 }
 fn trim(mut bytes: &[u8]) -> &[u8] {
     while bytes.first().is_some_and(u8::is_ascii_whitespace) {
@@ -149,7 +140,7 @@ fn trim(mut bytes: &[u8]) -> &[u8] {
 
 #[cfg(test)]
 mod tests {
-    use super::{InterruptsTable, hash_name, parse};
+    use super::{InterruptsTable, name_hash, parse};
     const CAPTURE: &[u8] = include_bytes!(concat!(
         env!("CARGO_MANIFEST_DIR"),
         "/tests/fixtures/cpu/interrupts_24c.txt"
@@ -159,6 +150,8 @@ mod tests {
         let mut table = InterruptsTable::with_capacity();
         assert!(parse(CAPTURE, &mut table));
         assert_eq!(table.cpu_count, 24);
+        assert_eq!(table.cpu_ids[0], 0);
+        assert_eq!(table.cpu_ids[23], 23);
         for name in [
             b"LOC".as_slice(),
             b"RES",
@@ -169,18 +162,43 @@ mod tests {
             b"DFR",
         ] {
             assert!(
-                table.named.iter().any(|row| row.hash == hash_name(name)),
+                table.named.iter().any(|row| row.hash == name_hash(name)),
                 "missing {name:?}"
             );
         }
+        let cell = |name: &[u8], cpu: usize| {
+            table
+                .named
+                .iter()
+                .find(|row| row.hash == name_hash(name))
+                .unwrap()
+                .counts[cpu]
+        };
+        assert_eq!(
+            (cell(b"LOC", 0), cell(b"LOC", 1), cell(b"LOC", 23)),
+            (362_865_162, 327_749_704, 270_900_762)
+        );
+        assert_eq!(
+            (cell(b"RES", 0), cell(b"RES", 23)),
+            (30_831_258, 18_551_363)
+        );
+        assert_eq!(
+            (cell(b"CAL", 0), cell(b"CAL", 23)),
+            (645_504_627, 356_775_613)
+        );
+        assert_eq!(
+            (cell(b"TLB", 0), cell(b"TLB", 23)),
+            (166_525_239, 127_948_430)
+        );
         assert_eq!(table.numeric.len(), 65);
         assert!(parse(
             b" CPU0 CPU1 CPU2\nNMI: 1 2 description\nLOC: 4 5 6 local\nXYZ: 6 7 8 custom\n7: 9 8 7 dev\n",
             &mut table
         ));
         assert_eq!(table.named.len(), 3);
-        assert_eq!(table.named[0].counts[1], 2);
-        assert!(table.named.iter().any(|row| row.hash == hash_name(b"XYZ")));
+        assert_eq!(table.named[1].counts.as_slice(), &[4, 5, 6]);
+        assert_eq!(table.named[2].counts.as_slice(), &[6, 7, 8]);
+        assert!(table.named.iter().any(|row| row.hash == name_hash(b"XYZ")));
         assert_eq!(table.numeric.len(), 1);
     }
 }

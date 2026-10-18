@@ -1,7 +1,7 @@
-//! Allocation-free `/proc/schedstat` parser for versions 15 through 17.
-use super::{fields, parse_u64};
+//! `/proc/schedstat` parser for versions 15 through 17. Fields 7–9 are run time,
+//! run delay, and timeslices, respectively.
+use super::{MAX_CPUS, fields, parse_u64};
 
-pub const MAX_CPUS: usize = 512;
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct CpuSchedRaw {
     pub run_delay_ns: u64,
@@ -71,8 +71,8 @@ pub fn parse(bytes: &[u8], out: &mut SchedstatTable) -> Result<(), ParseError> {
             continue;
         }
         out.cpus[cpu_id as usize] = Some(CpuSchedRaw {
-            run_delay_ns: values[6],
-            run_time_ns: values[7],
+            run_time_ns: values[6],
+            run_delay_ns: values[7],
             timeslices: values[8],
         });
         out.cpu_count = out.cpu_count.max(cpu_id as usize + 1);
@@ -99,8 +99,8 @@ mod tests {
         assert_eq!(table.cpu_count, 24);
         assert!(table.cpus[..24].iter().all(Option::is_some));
         let cpu0 = table.cpus[0].unwrap();
-        assert_eq!(cpu0.run_delay_ns, 101_612_179_810_580);
-        assert_eq!(cpu0.run_time_ns, 221_999_373_497_909);
+        assert_eq!(cpu0.run_delay_ns, 221_999_373_497_909);
+        assert_eq!(cpu0.run_time_ns, 101_612_179_810_580);
         assert_eq!(cpu0.timeslices, 663_603_432);
         assert_eq!(parse(V99, &mut table), Err(ParseError::Unsupported));
         for version in [15, 16] {
