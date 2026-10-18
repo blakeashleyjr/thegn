@@ -340,6 +340,7 @@ fn run_fetch(loc: &GitLoc, remote: &str) -> Result<(), String> {
         ],
     );
     // off-loop: every caller is inside `sched::spawn_bg` (a spawn_blocking task).
+    thegn_core::util::note_core_git_spawn();
     #[expect(clippy::disallowed_methods)]
     let out = cmd.output().map_err(|e| e.to_string())?;
     if out.status.success() {
@@ -693,6 +694,25 @@ fn next_sweep_target(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "initialize the isolated local git fixture"
+    )]
+    fn gitloc_git_out_counts_a_single_spawn() {
+        let dir = tempfile::tempdir().unwrap();
+        thegn_core::fsperm::restrict_dir_to_owner(dir.path()).unwrap();
+        let init = thegn_core::util::git_cmd(dir.path())
+            .args(["init", "--quiet"])
+            .status()
+            .unwrap();
+        assert!(init.success());
+        let loc = GitLoc::Local(dir.path().to_path_buf());
+        let before = thegn_core::util::core_git_spawn_count();
+        assert!(loc.git_out(&["rev-parse", "--git-dir"]).is_some());
+        assert_eq!(thegn_core::util::core_git_spawn_count() - before, 1);
+    }
 
     #[test]
     fn remote_ref_fingerprint_tracks_loose_and_packed_refs() {
@@ -1056,7 +1076,13 @@ mod tests {
         );
 
         // One background fetch and the count behind the badge is honest.
+        let git_spawns_before_fetch = thegn_core::util::core_git_spawn_count();
         run_fetch(&loc, "origin").unwrap();
+        assert_eq!(
+            thegn_core::util::core_git_spawn_count() - git_spawns_before_fetch,
+            1,
+            "remote_poll fetch must contribute exactly one git spawn"
+        );
         let (upstream, behind) = tracked(&loc, "main").unwrap();
         assert_eq!(behind, 1);
 

@@ -1,5 +1,4 @@
-#![allow(dead_code)] // wired into the overlay dispatch in batch 48 (see THE-888)
-
+use crate::telemetry::{Metric, ScaleMode, SeriesReq, TelemetryHistory, Window};
 use crate::{
     compositor::Rect,
     monitor::{
@@ -74,8 +73,8 @@ pub(in crate::monitor) struct PowerModel {
     pub(super) session: SessionEnergy,
     ewma: Ewma,
     history: Vec<f32>,
-    history_next: usize,
-    history_len: usize,
+    battery_history: Vec<f32>,
+    battery_power_history: Vec<f32>,
     pub(super) power_supply_health: Health,
     pub(super) powercap_health: Health,
     pub(super) amd_smu_health: Health,
@@ -95,6 +94,8 @@ pub(super) struct BatteryRow {
     pub(super) design_wh: Option<f64>,
     pub(super) power_w: Option<f32>,
     pub(super) cycles: Option<u32>,
+    charge_history: Vec<f32>,
+    energy_history: Vec<f32>,
 }
 #[derive(Debug, Clone, Default, PartialEq)]
 pub(super) struct AdapterRow {
@@ -106,6 +107,7 @@ pub(super) struct ZoneRow {
     pub(super) name: String,
     pub(super) domain: Option<thegn_metrics::collect::model::powercap::PowerDomain>,
     pub(super) watts: Option<f32>,
+    history: Vec<f32>,
 }
 
 impl PowerModel {
@@ -114,19 +116,26 @@ impl PowerModel {
         self.powercap_health = frame.health[CollectorId::Powercap.index()];
         self.amd_smu_health = frame.health[CollectorId::AmdSmu.index()];
         self.cpu_freq_health = frame.health[CollectorId::CpuFreq.index()];
-        let mut battery_count = 0;
         let mut adapter_count = 0;
         for supply in &frame.parts.power_supply.supplies {
             match supply.kind {
-                SupplyKind::Battery if !supply.device_scope && battery_count < INSTANCE_CAP => {
+                SupplyKind::Battery if !supply.device_scope => {
                     if self.batteries.capacity() == 0 {
                         self.batteries.reserve_exact(INSTANCE_CAP);
                     }
-                    if battery_count == self.batteries.len() {
-                        self.batteries.push(BatteryRow::default());
-                    }
-                    fill_battery(&mut self.batteries[battery_count], supply);
-                    battery_count += 1;
+                    let index = self
+                        .batteries
+                        .iter()
+                        .position(|battery| battery.name == supply.name.as_ref());
+                    let index = match index {
+                        Some(index) => index,
+                        None if self.batteries.len() < INSTANCE_CAP => {
+                            self.batteries.push(BatteryRow::default());
+                            self.batteries.len() - 1
+                        }
+                        None => continue,
+                    };
+                    fill_battery(&mut self.batteries[index], supply);
                 }
                 SupplyKind::Mains | SupplyKind::Usb if adapter_count < INSTANCE_CAP => {
                     if self.adapters.capacity() == 0 {
@@ -144,7 +153,13 @@ impl PowerModel {
                 _ => {}
             }
         }
-        self.batteries.truncate(battery_count);
+        self.batteries.retain(|battery| {
+            frame.parts.power_supply.supplies.iter().any(|supply| {
+                supply.kind == SupplyKind::Battery
+                    && !supply.device_scope
+                    && battery.name == supply.name.as_ref()
+            })
+        });
         self.adapters.truncate(adapter_count);
         let ac_online = self
             .adapters
@@ -177,28 +192,42 @@ impl PowerModel {
         });
         self.policy = frame.parts.cpu_freq.power;
         self.cpu_policy.clone_from(&frame.parts.cpu_freq.policies);
-        for (index, zone) in frame
-            .parts
-            .powercap
-            .zones
-            .iter()
-            .take(INSTANCE_CAP)
-            .enumerate()
-        {
+        for zone in frame.parts.powercap.zones.iter().take(INSTANCE_CAP) {
             if self.zones.capacity() == 0 {
                 self.zones.reserve_exact(INSTANCE_CAP);
             }
-            if index == self.zones.len() {
-                self.zones.push(ZoneRow::default());
-            }
+            let index = self
+                .zones
+                .iter()
+                .position(|row| row.name == zone.name.as_ref() && row.domain == Some(zone.domain));
+            let index = match index {
+                Some(index) => index,
+                None if self.zones.len() < INSTANCE_CAP => {
+                    self.zones.push(ZoneRow::default());
+                    self.zones.len() - 1
+                }
+                None => continue,
+            };
             let row = &mut self.zones[index];
             row.name.clear();
             row.name.push_str(&zone.name);
             row.domain = Some(zone.domain);
             row.watts = zone.watts.filter(|value| value.is_finite());
+            if row.history.capacity() == 0 {
+                row.history.reserve_exact(HISTORY_CAP);
+            }
+            if let Some(watts) = row.watts {
+                push_history(&mut row.history, watts);
+            }
         }
-        self.zones
-            .truncate(frame.parts.powercap.zones.len().min(INSTANCE_CAP));
+        self.zones.retain(|row| {
+            frame
+                .parts
+                .powercap
+                .zones
+                .iter()
+                .any(|zone| row.name == zone.name.as_ref() && row.domain == Some(zone.domain))
+        });
         self.socket_w = None;
         self.apu_w = None;
         self.gfx_w = None;
@@ -248,21 +277,49 @@ impl PowerModel {
         self.session_previous = session_watts.map(|watts| (frame.at_ms, watts));
         self.session_ac = ac_state;
         if let Some(watts) = self.socket_w.or(self.battery_w.map(f32::abs)) {
-            if self.history.capacity() == 0 {
-                self.history.reserve_exact(HISTORY_CAP);
-            }
-            if self.history.len() < HISTORY_CAP {
-                self.history.push(watts);
-                self.history_len = self.history.len();
+            push_history(&mut self.history, watts);
+        }
+    }
+    pub(in crate::monitor) fn absorb_history(
+        &mut self,
+        history: &TelemetryHistory,
+        window: Window,
+        scale: ScaleMode,
+        now_ms: u64,
+    ) {
+        for (metric, slot) in [
+            (Metric::Battery, &mut self.battery_history),
+            (Metric::BatteryPower, &mut self.battery_power_history),
+        ] {
+            let series = history.series(&SeriesReq {
+                metric,
+                window,
+                scale: TelemetryHistory::scale_for(metric, scale),
+                buckets: 240,
+                agg: thegn_core::series::Agg::Max,
+                now_ms,
+            });
+            if series.empty {
+                slot.clear();
             } else {
-                self.history[self.history_next] = watts;
+                slot.clone_from(&series.hi);
             }
-            self.history_next = (self.history_next + 1) % HISTORY_CAP;
         }
     }
     #[cfg(test)]
     pub(in crate::monitor) fn history_capacity(&self) -> usize {
         self.history.capacity()
+    }
+}
+fn push_history(history: &mut Vec<f32>, value: f32) {
+    if history.capacity() == 0 {
+        history.reserve_exact(HISTORY_CAP);
+    }
+    if history.len() < HISTORY_CAP {
+        history.push(value);
+    } else {
+        history.rotate_left(1);
+        history[HISTORY_CAP - 1] = value;
     }
 }
 fn metric_watts(value: Option<u32>) -> Option<f32> {
@@ -280,12 +337,45 @@ fn rail_ceiling(model: &PowerModel) -> f32 {
 fn history_graph_rect(rect: Rect, inner: Rect, len: usize, braille: bool) -> Rect {
     let used = if braille { len.div_ceil(2) } else { len };
     let cols = inner.cols.min(used);
+    right_align_history(
+        Rect {
+            x: rect.x + inner.x + inner.cols.saturating_sub(cols),
+            y: rect.y + inner.y,
+            cols,
+            rows: inner.rows.saturating_sub(11),
+        },
+        len,
+        braille,
+    )
+}
+fn right_align_history(area: Rect, len: usize, braille: bool) -> Rect {
+    let used = if braille { len.div_ceil(2) } else { len };
+    let cols = area.cols.min(used);
     Rect {
-        x: rect.x + inner.x + inner.cols.saturating_sub(cols),
-        y: rect.y + inner.y,
+        x: area.x + area.cols.saturating_sub(cols),
         cols,
-        rows: inner.rows.saturating_sub(11),
+        ..area
     }
+}
+fn draw_graph_label(surface: &mut Surface, x: usize, y: usize, width: usize, label: &str) {
+    let line = crate::seg::Line::segs(vec![crate::seg::seg(
+        crate::seg::Tok::Slot(crate::chrome::S::Dim),
+        label,
+    )]);
+    crate::seg::draw_line(
+        surface,
+        x,
+        y,
+        width,
+        &line,
+        crate::seg::Tok::Slot(crate::chrome::S::Dim),
+    );
+}
+fn watts_label(name: &str, watts: Option<f32>) -> String {
+    let value = watts
+        .map(|watts| format!("{watts:.1} W"))
+        .unwrap_or_else(|| crate::caps::active_glyphs().emdash.to_owned());
+    format!("{name} {value}")
 }
 fn rail_title(model: &PowerModel) -> String {
     let ceiling = rail_ceiling(model);
@@ -318,6 +408,14 @@ fn fill_battery(row: &mut BatteryRow, supply: &SupplyReading) {
                 .map(|(a, v)| (a.unsigned_abs() as f64 * v as f64 / 1_000_000_000_000.0) as f32)
         });
     row.cycles = supply.cycle_count;
+    if let Some(charge) = row.capacity {
+        push_history(&mut row.charge_history, charge as f32 / 100.0);
+    }
+    if let (Some(energy), Some(full)) = (row.now_wh, row.full_wh.or(row.design_wh))
+        && full > 0.0
+    {
+        push_history(&mut row.energy_history, (energy / full) as f32);
+    }
 }
 
 pub(in crate::monitor) struct PowerView<'a>(pub &'a PowerModel);
@@ -384,26 +482,293 @@ impl TabView for PowerView<'_> {
             rect.x,
             rect.y,
         );
-        if placed.id == RAILS && !self.0.history.is_empty() && inner.rows > 2 {
-            let mut ordered = [0.0_f32; HISTORY_CAP];
-            let start = if self.0.history_len == HISTORY_CAP {
-                self.0.history_next
+        if placed.id == BATTERY && inner.rows >= 14 {
+            let graph_rows = (inner.rows.saturating_sub(5) / 2).min(6);
+            let graph_y = rect.y + inner.y + inner.rows - graph_rows * 2;
+            let graph_x = rect.x + inner.x;
+            let charge_label = if self.0.battery_history.is_empty() {
+                format!("charge history {}", paint::mark(self.0.power_supply_health))
             } else {
-                0
+                "charge history".to_owned()
             };
-            for (offset, value) in ordered.iter_mut().take(self.0.history_len).enumerate() {
-                *value = self.0.history[(start + offset) % self.0.history_len.max(1)];
+            if self.0.batteries.is_empty() {
+                let charge = Rect {
+                    x: graph_x,
+                    y: graph_y,
+                    cols: inner.cols,
+                    rows: graph_rows,
+                };
+                draw_graph_label(surface, graph_x, graph_y, inner.cols, &charge_label);
+                let power = Rect {
+                    y: graph_y + graph_rows,
+                    ..charge
+                };
+                draw_graph_label(
+                    surface,
+                    graph_x,
+                    graph_y + graph_rows,
+                    inner.cols,
+                    "battery power",
+                );
+                let charge = Rect {
+                    y: charge.y + 1,
+                    rows: charge.rows.saturating_sub(1),
+                    ..charge
+                };
+                let power = Rect {
+                    y: power.y + 1,
+                    rows: power.rows.saturating_sub(1),
+                    ..power
+                };
+                let charge = right_align_history(
+                    charge,
+                    self.0.battery_history.len(),
+                    graphs::table().braille,
+                );
+                let power = right_align_history(
+                    power,
+                    self.0.battery_power_history.len(),
+                    graphs::table().braille,
+                );
+                graphs::paint_history_graph(
+                    &self.0.battery_history,
+                    RampId::Power,
+                    charge,
+                    surface,
+                );
+                graphs::paint_history_graph(
+                    &self.0.battery_power_history,
+                    RampId::Power,
+                    power,
+                    surface,
+                );
+            } else {
+                let telemetry_cols = inner.cols * 2 / 3;
+                let battery_x = graph_x + telemetry_cols;
+                let battery_cols = inner.cols.saturating_sub(telemetry_cols);
+                let charge = Rect {
+                    x: graph_x,
+                    y: graph_y,
+                    cols: telemetry_cols,
+                    rows: graph_rows,
+                };
+                let power = Rect {
+                    y: graph_y + graph_rows,
+                    ..charge
+                };
+                draw_graph_label(surface, graph_x, graph_y, telemetry_cols, &charge_label);
+                draw_graph_label(
+                    surface,
+                    graph_x,
+                    graph_y + graph_rows,
+                    telemetry_cols,
+                    "battery power",
+                );
+                let charge = Rect {
+                    y: charge.y + 1,
+                    rows: charge.rows.saturating_sub(1),
+                    ..charge
+                };
+                let power = Rect {
+                    y: power.y + 1,
+                    rows: power.rows.saturating_sub(1),
+                    ..power
+                };
+                let charge = right_align_history(
+                    charge,
+                    self.0.battery_history.len(),
+                    graphs::table().braille,
+                );
+                let power = right_align_history(
+                    power,
+                    self.0.battery_power_history.len(),
+                    graphs::table().braille,
+                );
+                graphs::paint_history_graph(
+                    &self.0.battery_history,
+                    RampId::Power,
+                    charge,
+                    surface,
+                );
+                graphs::paint_history_graph(
+                    &self.0.battery_power_history,
+                    RampId::Power,
+                    power,
+                    surface,
+                );
+                let row_height = (graph_rows * 2) / self.0.batteries.len();
+                for (index, battery) in self.0.batteries.iter().enumerate() {
+                    if row_height < 2 {
+                        break;
+                    }
+                    let battery_y = graph_y + index * row_height;
+                    let charge = Rect {
+                        x: battery_x,
+                        y: battery_y,
+                        cols: battery_cols,
+                        rows: row_height / 2,
+                    };
+                    let energy = Rect {
+                        y: battery_y + row_height / 2,
+                        rows: row_height - row_height / 2,
+                        ..charge
+                    };
+                    draw_graph_label(
+                        surface,
+                        battery_x,
+                        battery_y,
+                        battery_cols,
+                        &format!("{} charge", battery.name),
+                    );
+                    draw_graph_label(
+                        surface,
+                        battery_x,
+                        battery_y + row_height / 2,
+                        battery_cols,
+                        &format!("{} energy", battery.name),
+                    );
+                    let charge = Rect {
+                        y: charge.y + 1,
+                        rows: charge.rows.saturating_sub(1),
+                        ..charge
+                    };
+                    let energy = Rect {
+                        y: energy.y + 1,
+                        rows: energy.rows.saturating_sub(1),
+                        ..energy
+                    };
+                    let charge = right_align_history(
+                        charge,
+                        battery.charge_history.len(),
+                        graphs::table().braille,
+                    );
+                    let energy = right_align_history(
+                        energy,
+                        battery.energy_history.len(),
+                        graphs::table().braille,
+                    );
+                    graphs::paint_history_graph(
+                        &battery.charge_history,
+                        RampId::Power,
+                        charge,
+                        surface,
+                    );
+                    graphs::paint_history_graph(
+                        &battery.energy_history,
+                        RampId::Power,
+                        energy,
+                        surface,
+                    );
+                }
             }
-            let ceiling = rail_ceiling(self.0);
-            for value in ordered.iter_mut().take(self.0.history_len) {
-                *value /= ceiling;
+        }
+        if placed.id == RAILS && inner.rows > 2 {
+            let rail_samples = self
+                .0
+                .zones
+                .iter()
+                .map(|zone| zone.history.len())
+                .max()
+                .unwrap_or(self.0.history.len())
+                .max(self.0.history.len());
+            let graph_rect = history_graph_rect(rect, inner, rail_samples, graphs::table().braille);
+            if self.0.zones.is_empty() && !self.0.history.is_empty() {
+                let mut ordered = [0.0_f32; HISTORY_CAP];
+                ordered[..self.0.history.len()].copy_from_slice(&self.0.history);
+                let ceiling = rail_ceiling(self.0);
+                for value in ordered.iter_mut().take(self.0.history.len()) {
+                    *value /= ceiling;
+                }
+                draw_graph_label(
+                    surface,
+                    graph_rect.x,
+                    graph_rect.y,
+                    graph_rect.cols,
+                    &watts_label("socket", self.0.socket_w),
+                );
+                graphs::paint_history_graph(
+                    &ordered[..self.0.history.len()],
+                    RampId::Power,
+                    right_align_history(
+                        Rect {
+                            y: graph_rect.y + 1,
+                            rows: graph_rect.rows.saturating_sub(1),
+                            ..graph_rect
+                        },
+                        self.0.history.len(),
+                        graphs::table().braille,
+                    ),
+                    surface,
+                );
+            } else if !self.0.zones.is_empty() {
+                let has_socket = !self.0.history.is_empty();
+                let band_count = self.0.zones.len().min(INSTANCE_CAP) + usize::from(has_socket);
+                let plot_rows = graph_rect.rows / band_count;
+                let mut band_offset = 0;
+                if has_socket && plot_rows > 0 {
+                    let mut normalized = [0.0_f32; HISTORY_CAP];
+                    normalized[..self.0.history.len()].copy_from_slice(&self.0.history);
+                    for value in normalized.iter_mut().take(self.0.history.len()) {
+                        *value /= rail_ceiling(self.0);
+                    }
+                    draw_graph_label(
+                        surface,
+                        graph_rect.x,
+                        graph_rect.y,
+                        graph_rect.cols,
+                        &watts_label("socket", self.0.socket_w),
+                    );
+                    let socket_plot = right_align_history(
+                        Rect {
+                            y: graph_rect.y + 1,
+                            rows: plot_rows.saturating_sub(1),
+                            ..graph_rect
+                        },
+                        self.0.history.len(),
+                        graphs::table().braille,
+                    );
+                    graphs::paint_history_graph(
+                        &normalized[..self.0.history.len()],
+                        RampId::Power,
+                        socket_plot,
+                        surface,
+                    );
+                    band_offset = 1;
+                }
+                for (index, zone) in self.0.zones.iter().take(INSTANCE_CAP).enumerate() {
+                    if zone.history.is_empty() || plot_rows == 0 {
+                        continue;
+                    }
+                    let mut normalized = [0.0_f32; HISTORY_CAP];
+                    normalized[..zone.history.len()].copy_from_slice(&zone.history);
+                    for value in normalized.iter_mut().take(zone.history.len()) {
+                        *value /= rail_ceiling(self.0);
+                    }
+                    let band_y = graph_rect.y + (index + band_offset) * plot_rows;
+                    draw_graph_label(
+                        surface,
+                        graph_rect.x,
+                        band_y,
+                        graph_rect.cols,
+                        &watts_label(&zone.name, zone.watts),
+                    );
+                    let plot = right_align_history(
+                        Rect {
+                            y: band_y + 1,
+                            rows: plot_rows.saturating_sub(1),
+                            ..graph_rect
+                        },
+                        zone.history.len(),
+                        graphs::table().braille,
+                    );
+                    graphs::paint_history_graph(
+                        &normalized[..zone.history.len()],
+                        RampId::Power,
+                        plot,
+                        surface,
+                    );
+                }
             }
-            graphs::paint_history_graph(
-                &ordered[..self.0.history_len],
-                RampId::Power,
-                history_graph_rect(rect, inner, self.0.history_len, graphs::table().braille),
-                surface,
-            );
         }
     }
 }

@@ -1,5 +1,5 @@
 //! First real board view: a compact summary of the latest system frame.
-use crate::telemetry::{Metric, ScaleMode, SeriesReq, TelemetryHistory, Window};
+use crate::telemetry::{Metric, ScaleMode, SeriesBuf, SeriesReq, TelemetryHistory, Window};
 use crate::{
     compositor::Rect,
     monitor::{
@@ -156,6 +156,7 @@ const SPECS: [PanelSpec; 8] = [
 pub(in crate::monitor) struct OverviewModel {
     stats: StatsSnapshot,
     sparks: Vec<[Vec<f32>; 2]>,
+    history_buf: SeriesBuf,
     container_count: usize,
     cpu_cores: Vec<u16>,
     procs_running: Option<u32>,
@@ -201,18 +202,20 @@ impl OverviewModel {
                     slot.clear();
                     continue;
                 };
-                let series = history.series(&SeriesReq {
-                    metric,
-                    window,
-                    scale: TelemetryHistory::scale_for(metric, scale),
-                    buckets: HISTORY_BUCKETS,
-                    agg: Agg::Max,
-                    now_ms,
-                });
-                if series.empty {
-                    slot.clear();
-                } else {
-                    slot.clone_from(&series.hi);
+                history.series_into(
+                    &SeriesReq {
+                        metric,
+                        window,
+                        scale: TelemetryHistory::scale_for(metric, scale),
+                        buckets: HISTORY_BUCKETS,
+                        agg: Agg::Max,
+                        now_ms,
+                    },
+                    &mut self.history_buf,
+                );
+                slot.clear();
+                if !self.history_buf.empty() {
+                    slot.extend_from_slice(self.history_buf.hi());
                 }
             }
         }
@@ -424,3 +427,7 @@ fn kit_style(role: StateRole) -> kit::grid::CellStyle {
 #[cfg(test)]
 #[path = "overview_view_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "overview/view_budget_tests.rs"]
+mod budget_tests;

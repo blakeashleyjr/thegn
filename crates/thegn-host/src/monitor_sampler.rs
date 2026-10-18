@@ -30,7 +30,9 @@ impl Demand {
     pub(crate) fn all(base_ms: u32) -> Self {
         let mut collectors = CollectorSet::empty();
         for id in CollectorId::ALL {
-            collectors.insert(id);
+            if !id.visible_only() {
+                collectors.insert(id);
+            }
         }
         Self {
             collectors,

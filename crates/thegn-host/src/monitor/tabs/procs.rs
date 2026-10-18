@@ -88,6 +88,14 @@ pub(in crate::monitor) fn procs(
         });
     }
 
+    // The strip uses the same 120-column floor as the documented table
+    // layout. Narrow terminals keep the existing table height and geometry.
+    if cx.cols >= 120
+        && let Some(summary) = &snap.summary
+    {
+        out.extend(summary_sections(summary));
+    }
+
     if rows.is_empty() {
         // Filtered everything out — say so rather than show an empty table.
         out.push(heading("no matching processes", None));
@@ -110,6 +118,138 @@ pub(in crate::monitor) fn procs(
     TabBuild {
         sections: out,
         row_y,
+    }
+}
+
+fn summary_sections(summary: &thegn_metrics::ProcSummary) -> Vec<Section> {
+    let mut sections = vec![heading(
+        "tasks",
+        Some(format!(
+            "{} procs  {} thr  {} kthr",
+            summary.tasks, summary.threads, summary.kernel_threads
+        )),
+    )];
+    let state_tone = if summary.disk_sleep > 0 {
+        Tok::Hue(Hue::Amber)
+    } else {
+        Tok::Slot(S::Text)
+    };
+    sections.push(Section::HeadingToned {
+        label: "states".into(),
+        label_tone: Tok::Slot(S::Text),
+        note: format!(
+            "R {}  S {}  D {}  Z {}  T {}  I {}",
+            summary.running,
+            summary.sleeping,
+            summary.disk_sleep,
+            summary.zombies,
+            summary.stopped,
+            summary.idle
+        ),
+        tone: state_tone,
+    });
+    sections.push(heading(
+        "new / exited",
+        Some(format!(
+            "+{}  -{}",
+            count_mark(summary.new),
+            count_mark(summary.exited)
+        )),
+    ));
+    sections.push(owner_share_table(&summary.owners));
+    sections
+}
+
+fn count_mark(value: Option<usize>) -> String {
+    value.map_or_else(
+        || {
+            crate::monitor::kit::edge_fmt(NumFmt::default()).reading(
+                Reading::Unknown,
+                Unit::Count,
+                5,
+            )
+        },
+        |count| count.to_string(),
+    )
+}
+
+fn owner_share_table(owners: &thegn_metrics::ProcOwnerSummary) -> Section {
+    let classes = [
+        ("ui", &owners.ui),
+        ("daemon", &owners.daemon),
+        ("panes", &owners.panes),
+        ("other", &owners.other),
+    ];
+    let max_cpu = classes
+        .iter()
+        .filter_map(|(_, totals)| totals.cpu_pct)
+        .reduce(f64::max);
+    let max_rss = classes
+        .iter()
+        .filter_map(|(_, totals)| totals.rss_bytes)
+        .max();
+    let rows = classes
+        .iter()
+        .map(|(name, totals)| {
+            let label = if *name == "panes" {
+                format!("panes({})", totals.count)
+            } else {
+                (*name).to_string()
+            };
+            vec![
+                Cell::Text(label, Tok::Slot(S::Ghost)),
+                meter_cell(
+                    totals
+                        .cpu_pct
+                        .map(|value| max_cpu.map_or(0.0, |max| relative_meter(value, max))),
+                    Tok::Hue(Hue::Teal),
+                ),
+                Cell::Text(
+                    procs_columns::format_cpu(totals.cpu_pct),
+                    Tok::Hue(Hue::Teal),
+                ),
+                meter_cell(
+                    totals.rss_bytes.map(|value| {
+                        max_rss.map_or(0.0, |max| relative_meter(value as f64, max as f64))
+                    }),
+                    Tok::Hue(Hue::Purple),
+                ),
+                Cell::Text(format_bytes(totals.rss_bytes), Tok::Hue(Hue::Purple)),
+            ]
+        })
+        .collect();
+    Section::Table(TableSection {
+        header: vec![
+            "owner".into(),
+            "CPU".into(),
+            "%".into(),
+            "RSS".into(),
+            "bytes".into(),
+        ],
+        rows,
+        sel: None,
+    })
+}
+
+fn meter_cell(value: Option<f32>, tone: Tok) -> Cell {
+    match value {
+        Some(value) => Cell::Bar(value, 5, tone),
+        None => Cell::Text(
+            crate::monitor::kit::edge_fmt(NumFmt::default()).reading(
+                Reading::Unknown,
+                Unit::Count,
+                5,
+            ),
+            Tok::Slot(S::Ghost),
+        ),
+    }
+}
+
+fn relative_meter(value: f64, max: f64) -> f32 {
+    if max > 0.0 {
+        (value / max).clamp(0.0, 1.0) as f32
+    } else {
+        0.0
     }
 }
 
@@ -394,5 +534,164 @@ mod tests {
             &cells[0][0],
             Cell::Text(value, Tok::Slot(S::Ghost)) if value.trim() == "—"
         ));
+    }
+
+    #[test]
+    fn process_summary_has_fixed_rows_and_warns_on_disk_wait() {
+        let summary = thegn_metrics::ProcSummary {
+            tasks: 4,
+            threads: 9,
+            kernel_threads: 1,
+            running: 1,
+            sleeping: 1,
+            disk_sleep: 1,
+            zombies: 0,
+            stopped: 0,
+            idle: 1,
+            new: Some(2),
+            exited: Some(1),
+            owners: thegn_metrics::ProcOwnerSummary {
+                ui: thegn_metrics::ProcOwnerTotals {
+                    count: 1,
+                    cpu_pct: Some(12.0),
+                    rss_bytes: Some(4096),
+                },
+                ..thegn_metrics::ProcOwnerSummary::default()
+            },
+        };
+        let sections = summary_sections(&summary);
+        assert_eq!(crate::sections::stack_height(&sections), 8);
+        assert!(matches!(
+            &sections[1],
+            Section::HeadingToned {
+                label_tone: Tok::Slot(S::Text),
+                note,
+                tone: Tok::Hue(Hue::Amber),
+                ..
+            } if note.contains("D 1")
+        ));
+        assert!(matches!(
+            &sections[3],
+            Section::Table(table)
+                if table.rows.len() == 4
+                    && matches!(&table.rows[0][1], Cell::Bar(frac, 5, Tok::Hue(Hue::Teal)) if *frac == 1.0)
+                    && matches!(&table.rows[0][2], Cell::Text(cpu, _) if cpu.contains("12.0"))
+                    && matches!(&table.rows[0][3], Cell::Bar(frac, 5, Tok::Hue(Hue::Purple)) if *frac == 1.0)
+        ));
+    }
+
+    #[test]
+    fn summary_unknown_marks_follow_ascii_glyph_selection() {
+        crate::caps::test_override::with_unicode(thegn_core::termcaps::UnicodeLevel::Ascii, || {
+            let expected = crate::monitor::kit::edge_fmt(NumFmt::default()).reading(
+                Reading::Unknown,
+                Unit::Count,
+                5,
+            );
+            assert_eq!(count_mark(None), expected);
+            assert!(matches!(
+                meter_cell(None, Tok::Hue(Hue::Teal)),
+                Cell::Text(mark, Tok::Slot(S::Ghost)) if mark == expected
+            ));
+        });
+    }
+
+    #[test]
+    fn summary_appears_at_wide_widths_and_table_row_y_tracks_it() {
+        let row = ProcRow {
+            pid: 41,
+            start_time: 1,
+            start_ticks: None,
+            name: "worker".into(),
+            owner: thegn_metrics::ProcOwner::Other,
+            cpu_pct: 1.0,
+            rss_bytes: 4096,
+            depth: 0,
+            elided_parent: false,
+        };
+        let model = crate::chrome::FrameModel {
+            procs: thegn_metrics::ProcSnapshot {
+                procs: vec![thegn_metrics::ProcSample {
+                    pid: 41,
+                    ppid: None,
+                    start_time: 1,
+                    start_ticks: None,
+                    name: "worker".into(),
+                    cpu_pct: 1.0,
+                    rss_bytes: 4096,
+                    run_secs: 1,
+                    owner: thegn_metrics::ProcOwner::Other,
+                }],
+                total: 1,
+                primed: true,
+                enabled: true,
+                summary: Some(thegn_metrics::ProcSummary {
+                    tasks: 1,
+                    threads: 1,
+                    ..thegn_metrics::ProcSummary::default()
+                }),
+            },
+            ..crate::chrome::FrameModel::default()
+        };
+        let rows = [row];
+        let hist = crate::telemetry::TelemetryHistory::default();
+        for cols in [160, 240] {
+            let cx = Ctx {
+                model: &model,
+                hist: &hist,
+                prefs: super::super::TabPrefs::default(),
+                cols,
+                now_ms: 0,
+            };
+            let build = procs(
+                &cx,
+                &rows,
+                0,
+                ProcDisplay {
+                    filter: "",
+                    filtering: false,
+                    tree: false,
+                    sort: ProcSort::Cpu,
+                    desc: true,
+                    invalid_terms: &[],
+                    primed: true,
+                },
+            );
+            assert_eq!(
+                build.row_y,
+                vec![
+                    2 + crate::sections::stack_height(&summary_sections(
+                        model.procs.summary.as_ref().expect("summary")
+                    ))
+                ]
+            );
+            assert!(matches!(
+                build.sections.last(),
+                Some(Section::FixedTable { table, .. })
+                    if matches!(&table.rows[0][0], Cell::Text(pid, _) if pid == "41")
+            ));
+        }
+        let cx = Ctx {
+            model: &model,
+            hist: &hist,
+            prefs: super::super::TabPrefs::default(),
+            cols: 119,
+            now_ms: 0,
+        };
+        let build = procs(
+            &cx,
+            &rows,
+            0,
+            ProcDisplay {
+                filter: "",
+                filtering: false,
+                tree: false,
+                sort: ProcSort::Cpu,
+                desc: true,
+                invalid_terms: &[],
+                primed: true,
+            },
+        );
+        assert_eq!(build.row_y, vec![2]);
     }
 }

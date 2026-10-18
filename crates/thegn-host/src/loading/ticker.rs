@@ -19,8 +19,17 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
+use crate::chrome::{LoadStep, StepState};
+
 /// One spinner frame per tick (see `plan::SPINNER_FRAME_MS`).
 const PERIOD: Duration = Duration::from_millis(250);
+
+/// Whether the derived splash needs periodic animation repaints. A terminal
+/// Done/Failed row can remain drawn for context, but its elapsed value is
+/// frozen and it must not keep the event loop awake.
+pub(crate) fn is_animating(steps: &[LoadStep]) -> bool {
+    steps.iter().any(|step| step.state == StepState::Active)
+}
 
 pub(crate) struct SplashTicker {
     active: Arc<AtomicBool>,
@@ -87,6 +96,95 @@ impl SplashTicker {
 mod tests {
     use super::*;
     use std::sync::atomic::AtomicUsize;
+
+    #[test]
+    fn only_steps_with_live_animation_keep_the_ticker_visible() {
+        let active = [LoadStep::active("probing bwrap")];
+        assert!(is_animating(&active));
+
+        let failed = [LoadStep::failed("provisioning")];
+        assert!(!is_animating(&failed));
+
+        let pending = [LoadStep::pending("shell")];
+        assert!(!is_animating(&pending));
+    }
+
+    #[test]
+    fn podman_failure_then_bwrap_resolution_keeps_splash_without_a_ticker() {
+        let key = ("app/home".to_string(), 0);
+        let session = crate::session::Session {
+            id: "test".into(),
+            worktrees: vec![crate::session::WorktreeGroup::new(
+                "app/home",
+                crate::session::GroupKind::Home,
+                "",
+            )],
+            active: 0,
+        };
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let seed = crate::loading::catalog::generic_seed();
+        let mut observer = crate::loading::observe::MaterializeObserver::from_steps(&seed);
+        for event in [
+            thegn_core::progress::SandboxPhase::Resolve,
+            thegn_core::progress::SandboxPhase::ResolveProbe {
+                backend: "podman-rootless".into(),
+            },
+            thegn_core::progress::SandboxPhase::PhaseDone,
+            thegn_core::progress::SandboxPhase::ContainerCreate { backend: "podman" },
+            thegn_core::progress::SandboxPhase::PhaseFailed {
+                err: "could not start podman container".into(),
+            },
+            thegn_core::progress::SandboxPhase::Resolve,
+            thegn_core::progress::SandboxPhase::ResolveProbe {
+                backend: "bwrap".into(),
+            },
+            thegn_core::progress::SandboxPhase::PhaseDone,
+        ] {
+            tx.send((key.0.clone(), key.1, observer.on_event(event)))
+                .unwrap();
+        }
+        drop(tx);
+        let mut tracker = crate::loading::track::LoadingTracker::default();
+        let mut remote = std::collections::HashMap::new();
+        let retired = std::collections::HashSet::new();
+        let mut perf = crate::perf::LoopPerf::new();
+
+        crate::handlers::provision::drain_provision(
+            &mut rx,
+            &session,
+            &mut tracker,
+            &mut remote,
+            &retired,
+            &mut perf,
+        );
+
+        let (steps, ticker_visible) = crate::loading::derive_splash(&tracker, &session);
+        assert!(
+            !steps.is_empty(),
+            "materialize shell-wait splash remains drawn"
+        );
+        assert_eq!(
+            steps
+                .iter()
+                .find(|step| step.label == "container (podman)")
+                .map(|s| s.state),
+            None,
+            "failed podman create row is removed when fallback resolves"
+        );
+        assert_eq!(steps.last().map(|step| step.label.as_str()), Some("shell"));
+        assert!(crate::loading::should_clear_splash_on_output(
+            &tracker, &key
+        ));
+        assert!(
+            !ticker_visible,
+            "no Active step means run.rs hides the ticker"
+        );
+
+        tracker.set(key.clone(), vec![LoadStep::active("provisioning")]);
+        assert!(crate::loading::derive_splash(&tracker, &session).1);
+        tracker.set(key, vec![LoadStep::done("provisioning")]);
+        assert!(!crate::loading::derive_splash(&tracker, &session).1);
+    }
 
     /// Poll until `cond` holds (a loaded test machine makes fixed sleeps
     /// flaky); panics with `what` after a generous deadline.

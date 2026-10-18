@@ -212,6 +212,7 @@ pub fn procs() -> thegn_metrics::ProcSnapshot {
         total: 6,
         primed: true,
         enabled: true,
+        summary: None,
     }
 }
 
@@ -429,6 +430,7 @@ mod tests {
             total: 1,
             primed: false,
             enabled: false,
+            summary: None,
         };
         let frozen = procs_when(true, live.clone());
         assert_eq!(frozen, procs());

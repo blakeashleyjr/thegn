@@ -14461,11 +14461,7 @@ async fn event_loop<T: Terminal>(
                 .worktrees
                 .get(session.active)
                 .map(|g| (g.name.clone(), g.active_tab));
-            let derived = akey
-                .as_ref()
-                .and_then(|k| loading_state.get(k))
-                .cloned()
-                .unwrap_or_default();
+            let (derived, ticker_visible) = crate::loading::derive_splash(&loading_state, &session);
             if model.load_steps != derived {
                 model.load_steps = derived;
                 // Refresh the splash context block (see `LoadingTracker::load_context`).
@@ -14477,10 +14473,10 @@ async fn event_loop<T: Terminal>(
                 );
                 dirty = true;
             }
-            // Keep the splash-scoped animation ticker alive exactly while a
-            // splash is visible (spinner/elapsed repaints); it self-retires
-            // within one period of the splash clearing — 0%-idle preserved.
-            splash_ticker.set_visible(!model.load_steps.is_empty());
+            // A terminal splash may remain drawn after provisioning fails,
+            // but only a live step needs spinner/elapsed repaints. The ticker
+            // self-retires within one period after the last live counter ends.
+            splash_ticker.set_visible(ticker_visible);
         }
 
         // Startup-shell watchdog (extracted to keep run.rs capped): a shell alive

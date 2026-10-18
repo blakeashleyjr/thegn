@@ -54,6 +54,7 @@ pub enum CollectorId {
     Meminfo,
     Vmstat,
     Netdev,
+    NetWifi,
     Diskstats,
     Powercap,
     PowerSupply,
@@ -65,10 +66,11 @@ pub enum CollectorId {
     Filesystems,
     GpuDevices,
     GpuEngines,
+    GpuClients,
 }
 
 impl CollectorId {
-    pub const ALL: [Self; 23] = [
+    pub const ALL: [Self; 25] = [
         Self::Loadavg,
         Self::Uptime,
         Self::Psi,
@@ -81,6 +83,7 @@ impl CollectorId {
         Self::Meminfo,
         Self::Vmstat,
         Self::Netdev,
+        Self::NetWifi,
         Self::Diskstats,
         Self::Powercap,
         Self::PowerSupply,
@@ -92,6 +95,7 @@ impl CollectorId {
         Self::Filesystems,
         Self::GpuDevices,
         Self::GpuEngines,
+        Self::GpuClients,
     ];
 
     pub const fn slug(self) -> &'static str {
@@ -108,6 +112,7 @@ impl CollectorId {
             Self::Meminfo => "meminfo",
             Self::Vmstat => "vmstat",
             Self::Netdev => "netdev",
+            Self::NetWifi => "net_wifi",
             Self::Diskstats => "diskstats",
             Self::Powercap => "powercap",
             Self::PowerSupply => "power_supply",
@@ -119,11 +124,16 @@ impl CollectorId {
             Self::Filesystems => "filesystems",
             Self::GpuDevices => "gpu_devices",
             Self::GpuEngines => "gpu_engines",
+            Self::GpuClients => "gpu_clients",
         }
     }
 
     pub const fn index(self) -> usize {
         self as usize
+    }
+
+    pub const fn visible_only(self) -> bool {
+        matches!(self, Self::GpuClients)
     }
 }
 
@@ -208,6 +218,7 @@ pub fn default_collectors() -> Vec<Box<dyn Collector>> {
         "/proc/net/dev",
         "/sys/class/net",
     ));
+    collectors[CollectorId::NetWifi.index()] = Box::new(linux::net_wifi::NetWifiCollector::new());
     collectors[CollectorId::Diskstats.index()] = Box::new(
         linux::diskstats::DiskstatsCollector::at("/proc/diskstats", "/sys/block"),
     );
@@ -227,6 +238,8 @@ pub fn default_collectors() -> Vec<Box<dyn Collector>> {
     collectors[CollectorId::GpuDevices.index()] =
         Box::new(linux::gpu_discover::GpuDevicesCollector::new());
     collectors[CollectorId::GpuEngines.index()] = Box::new(linux::gpu_amd::GpuAmdCollector::new());
+    collectors[CollectorId::GpuClients.index()] =
+        Box::new(linux::gpu_clients::GpuClientsCollector::new());
     collectors[CollectorId::Powercap.index()] = Box::new(linux::powercap::PowercapCollector::at(
         "/sys/class/powercap",
     ));
@@ -263,9 +276,11 @@ mod default_collectors_tests {
             CollectorId::ThermalZone,
             CollectorId::CpuIdle,
             CollectorId::CpuTopology,
+            CollectorId::NetWifi,
             CollectorId::Filesystems,
             CollectorId::GpuDevices,
             CollectorId::GpuEngines,
+            CollectorId::GpuClients,
             CollectorId::Powercap,
         ] {
             assert_ne!(

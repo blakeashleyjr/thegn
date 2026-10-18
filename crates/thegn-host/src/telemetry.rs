@@ -313,6 +313,57 @@ pub struct SeriesOut {
     pub empty: bool,
 }
 
+/// Reusable scratch and output storage for [`TelemetryHistory::series_into`].
+///
+/// Keep one with a view model so rebucketing the same plot does not allocate
+/// on each refresh. The buffers grow only when a larger bucket count is used.
+#[derive(Debug, Default, Clone)]
+pub struct SeriesBuf {
+    buckets: Vec<series::Bucket>,
+    sums: Vec<(f64, u32)>,
+    raw_lo: Vec<f32>,
+    raw_hi: Vec<f32>,
+    hi: Vec<f32>,
+    lo: Vec<f32>,
+    gap: Vec<bool>,
+    axis_max: f32,
+    last: f32,
+    covered_secs: f32,
+    empty: bool,
+}
+
+impl SeriesBuf {
+    pub fn hi(&self) -> &[f32] {
+        &self.hi
+    }
+    pub fn empty(&self) -> bool {
+        self.empty
+    }
+}
+
+fn normalize_value(value: f32, scale: Scale, axis_max: f32) -> f32 {
+    match scale {
+        Scale::Window | Scale::Fixed(_) => {
+            if value.is_finite() {
+                (value / axis_max).clamp(0.0, 1.0)
+            } else {
+                0.0
+            }
+        }
+        Scale::Log { floor } => {
+            if !value.is_finite() || value <= 0.0 {
+                return 0.0;
+            }
+            let floor = if floor.is_finite() && floor > 0.0 {
+                floor
+            } else {
+                1.0
+            };
+            ((value / floor).ln_1p() / (axis_max / floor).ln_1p()).clamp(0.0, 1.0)
+        }
+    }
+}
+
 /// Rolling per-metric history, pushed on every stats drain in the loop.
 ///
 /// Deliberately **not** `Clone`: at [`CAP`] this is ~620 KiB, and an accidental
@@ -490,20 +541,50 @@ impl TelemetryHistory {
 
     /// Reduce one metric to plot columns.
     pub fn series(&self, req: &SeriesReq) -> SeriesOut {
-        let buckets = req.buckets;
-        let empty_out = || SeriesOut {
-            hi: vec![0.0; buckets],
-            lo: vec![0.0; buckets],
-            raw_hi: vec![f32::NAN; buckets],
-            gap: vec![true; buckets],
-            axis_max: req.metric.full_scale().unwrap_or(1.0),
+        let mut buf = SeriesBuf::default();
+        self.series_into(req, &mut buf);
+        SeriesOut {
+            hi: buf.hi,
+            lo: buf.lo,
+            raw_hi: buf.raw_hi,
+            gap: buf.gap,
+            axis_max: buf.axis_max,
             axis_min: 0.0,
-            last: f32::NAN,
-            covered_secs: 0.0,
-            empty: true,
-        };
+            last: buf.last,
+            covered_secs: buf.covered_secs,
+            empty: buf.empty,
+        }
+    }
+
+    /// Reduce one metric into caller-owned buffers, retaining their capacity.
+    ///
+    /// This host implementation must stay equivalent to
+    /// [`thegn_core::series::bucket_ranged`], [`thegn_core::series::fill_gaps`],
+    /// and [`thegn_core::series::normalize`].
+    pub fn series_into(&self, req: &SeriesReq, out: &mut SeriesBuf) {
+        let buckets = req.buckets;
+        out.buckets.clear();
+        out.buckets.resize(buckets, None);
+        out.sums.clear();
+        if req.agg == Agg::Mean {
+            out.sums.resize(buckets, (0.0, 0));
+        }
+        out.raw_lo.resize(buckets, f32::NAN);
+        out.raw_hi.resize(buckets, f32::NAN);
+        out.hi.resize(buckets, 0.0);
+        out.lo.resize(buckets, 0.0);
+        out.gap.resize(buckets, true);
+        out.raw_lo.fill(f32::NAN);
+        out.raw_hi.fill(f32::NAN);
+        out.hi.fill(0.0);
+        out.lo.fill(0.0);
+        out.gap.fill(true);
+        out.axis_max = req.metric.full_scale().unwrap_or(1.0);
+        out.last = f32::NAN;
+        out.covered_secs = 0.0;
+        out.empty = true;
         if buckets == 0 || self.at.is_empty() {
-            return empty_out();
+            return;
         }
         let t1 = req.now_ms;
         let span_ms = req.window.secs().map(|s| u64::from(s) * 1000);
@@ -518,7 +599,7 @@ impl TelemetryHistory {
                 .max(t1.saturating_sub(RETAIN_SECS * 1000)),
         };
         if t1 <= t0 {
-            return empty_out();
+            return;
         }
 
         let idx = self.start_index(t0);
@@ -532,34 +613,108 @@ impl TelemetryHistory {
             .zip(ring.q.iter().skip(idx))
             .map(|(&t, &v)| (t, v));
 
-        let mut b = series::bucket_timed(it, t0, t1, buckets, req.agg);
-        let empty = b.iter().all(|x| x.is_none());
-        let gap = series::fill_gaps(&mut b, req.metric.gap_policy());
-
-        let raw_lo: Vec<f32> = b.iter().map(|x| x.map_or(f32::NAN, |(lo, _)| lo)).collect();
-        let raw_hi: Vec<f32> = b.iter().map(|x| x.map_or(f32::NAN, |(_, hi)| hi)).collect();
+        let span = (t1 - t0) as f64;
+        for (t, value) in it {
+            if value.is_nan() || t < t0 || t >= t1 {
+                continue;
+            }
+            let index = (((t - t0) as f64 / span) * buckets as f64) as usize;
+            let index = index.min(buckets - 1);
+            match req.agg {
+                Agg::Mean => {
+                    out.sums[index].0 += f64::from((value + value) * 0.5);
+                    out.sums[index].1 += 1;
+                }
+                Agg::Last => out.buckets[index] = Some((value, value)),
+                Agg::Max => {
+                    out.buckets[index] = Some(match out.buckets[index] {
+                        Some((_, prev)) if prev >= value => (prev, prev),
+                        _ => (value, value),
+                    })
+                }
+                Agg::MinMax => {
+                    out.buckets[index] = Some(match out.buckets[index] {
+                        Some((lo, hi)) => (lo.min(value), hi.max(value)),
+                        None => (value, value),
+                    })
+                }
+            }
+        }
+        if req.agg == Agg::Mean {
+            for (bucket, (sum, count)) in out.buckets.iter_mut().zip(&out.sums) {
+                if *count > 0 {
+                    let mean = (*sum / f64::from(*count)) as f32;
+                    *bucket = Some((mean, mean));
+                }
+            }
+        }
+        out.empty = out.buckets.iter().all(Option::is_none);
+        let gap_policy = req.metric.gap_policy();
+        let mut previous = None;
+        for (index, bucket) in out.buckets.iter_mut().enumerate() {
+            out.gap[index] = bucket.is_none();
+            match gap_policy {
+                series::Gap::Mark => {}
+                series::Gap::Zero => *bucket = Some(bucket.unwrap_or((0.0, 0.0))),
+                series::Gap::Hold => {
+                    if bucket.is_none() {
+                        *bucket = previous;
+                    }
+                    previous = *bucket;
+                }
+            }
+            if gap_policy != series::Gap::Hold {
+                previous = *bucket;
+            }
+        }
+        for (index, bucket) in out.buckets.iter().enumerate() {
+            out.raw_lo[index] = bucket.map_or(f32::NAN, |(lo, _)| lo);
+            out.raw_hi[index] = bucket.map_or(f32::NAN, |(_, hi)| hi);
+        }
 
         // Both edges must share one divisor, or the band would be skewed — so
         // normalize `hi` (which sets the axis) and reuse its scale for `lo`.
-        let (hi, axis_max) = series::normalize(&raw_hi, req.scale);
-        let (lo, _) = series::normalize(&raw_lo, Scale::Fixed(axis_max));
+        let finite_max = out
+            .raw_hi
+            .iter()
+            .copied()
+            .filter(|value| value.is_finite())
+            .fold(0.0_f32, f32::max);
+        let axis_max = match req.scale {
+            Scale::Window => finite_max.max(f32::MIN_POSITIVE),
+            Scale::Fixed(full) => {
+                if full.is_finite() && full > 0.0 {
+                    full
+                } else {
+                    1.0
+                }
+            }
+            Scale::Log { floor } => {
+                let floor = if floor.is_finite() && floor > 0.0 {
+                    floor
+                } else {
+                    1.0
+                };
+                finite_max.max(floor)
+            }
+        };
+        let hi_scale = match req.scale {
+            Scale::Window => Scale::Fixed(axis_max),
+            other => other,
+        };
+        for (dst, raw) in out.hi.iter_mut().zip(&out.raw_hi) {
+            *dst = normalize_value(*raw, hi_scale, axis_max);
+        }
+        for (dst, raw) in out.lo.iter_mut().zip(&out.raw_lo) {
+            *dst = normalize_value(*raw, Scale::Fixed(axis_max), axis_max);
+        }
 
         // How much wall time the window really covers: the request, clipped to
         // the history that actually exists.
         let first = self.at.get(idx).copied().unwrap_or(t1);
-        let covered_secs = (t1.saturating_sub(first.max(t0))) as f32 / 1000.0;
-
-        SeriesOut {
-            hi,
-            lo,
-            raw_hi,
-            gap,
-            axis_max,
-            axis_min: 0.0,
-            last: ring.last(),
-            covered_secs,
-            empty,
-        }
+        out.axis_max = axis_max;
+        out.last = ring.last();
+        out.covered_secs = (t1.saturating_sub(first.max(t0))) as f32 / 1000.0;
     }
 
     /// The scale a metric should use under a UI scale mode, resolving
@@ -858,6 +1013,200 @@ mod tests {
             agg: Agg::Max,
             now_ms: now,
         }
+    }
+
+    fn bits(values: &[f32]) -> Vec<u32> {
+        values.iter().map(|value| value.to_bits()).collect()
+    }
+
+    /// Kept as the pre-buffering implementation: the core helpers form the
+    /// independent oracle for the caller-owned implementation.
+    fn oracle(history: &TelemetryHistory, req: &SeriesReq) -> SeriesOut {
+        let buckets = req.buckets;
+        let empty_out = || SeriesOut {
+            hi: vec![0.0; buckets],
+            lo: vec![0.0; buckets],
+            raw_hi: vec![f32::NAN; buckets],
+            gap: vec![true; buckets],
+            axis_max: req.metric.full_scale().unwrap_or(1.0),
+            axis_min: 0.0,
+            last: f32::NAN,
+            covered_secs: 0.0,
+            empty: true,
+        };
+        if buckets == 0 || history.at.is_empty() {
+            return empty_out();
+        }
+
+        let t1 = req.now_ms;
+        let span_ms = req.window.secs().map(|secs| u64::from(secs) * 1000);
+        let t0 = match span_ms {
+            Some(ms) => t1.saturating_sub(ms),
+            None => history
+                .oldest_ms()
+                .unwrap_or(t1)
+                .max(t1.saturating_sub(RETAIN_SECS * 1000)),
+        };
+        if t1 <= t0 {
+            return empty_out();
+        }
+
+        let idx = history.start_index(t0);
+        let ring = &history.rings[req.metric.index()];
+        let it = history
+            .at
+            .iter()
+            .skip(idx)
+            .zip(ring.q.iter().skip(idx))
+            .map(|(&time, &value)| (time, value));
+        let mut bucketed = series::bucket_timed(it, t0, t1, buckets, req.agg);
+        let empty = bucketed.iter().all(Option::is_none);
+        let gap = series::fill_gaps(&mut bucketed, req.metric.gap_policy());
+        let raw_lo: Vec<f32> = bucketed
+            .iter()
+            .map(|bucket| bucket.map_or(f32::NAN, |(lo, _)| lo))
+            .collect();
+        let raw_hi: Vec<f32> = bucketed
+            .iter()
+            .map(|bucket| bucket.map_or(f32::NAN, |(_, hi)| hi))
+            .collect();
+        let (hi, axis_max) = series::normalize(&raw_hi, req.scale);
+        let (lo, _) = series::normalize(&raw_lo, Scale::Fixed(axis_max));
+        let first = history.at.get(idx).copied().unwrap_or(t1);
+        SeriesOut {
+            hi,
+            lo,
+            raw_hi,
+            gap,
+            axis_max,
+            axis_min: 0.0,
+            last: ring.last(),
+            covered_secs: (t1.saturating_sub(first.max(t0))) as f32 / 1000.0,
+            empty,
+        }
+    }
+
+    fn assert_matches_oracle(history: &TelemetryHistory, req: &SeriesReq, buffer: &mut SeriesBuf) {
+        let expected = oracle(history, req);
+        history.series_into(req, buffer);
+        assert_eq!(bits(&buffer.hi), bits(&expected.hi), "hi: {req:?}");
+        assert_eq!(bits(&buffer.lo), bits(&expected.lo), "lo: {req:?}");
+        assert_eq!(
+            bits(&buffer.raw_hi),
+            bits(&expected.raw_hi),
+            "raw_hi: {req:?}"
+        );
+        assert_eq!(buffer.gap, expected.gap, "gap: {req:?}");
+        assert_eq!(buffer.empty, expected.empty, "empty: {req:?}");
+        assert_eq!(
+            buffer.axis_max.to_bits(),
+            expected.axis_max.to_bits(),
+            "axis: {req:?}"
+        );
+        assert_eq!(
+            buffer.last.to_bits(),
+            expected.last.to_bits(),
+            "last: {req:?}"
+        );
+        assert_eq!(
+            buffer.covered_secs.to_bits(),
+            expected.covered_secs.to_bits(),
+            "covered: {req:?}"
+        );
+    }
+
+    #[test]
+    fn series_into_matches_core_oracle_for_all_metrics_and_request_shapes() {
+        let history = history(&[10, 70, 20, 90, 30], SEC, 5 * SEC);
+        let empty_history = TelemetryHistory::default();
+        let windows = [
+            Window::from_secs(10),
+            Window::from_secs(60),
+            Window::from_secs(600),
+            Window::EVERYTHING,
+        ];
+        let scales = [
+            Scale::Window,
+            Scale::Fixed(100.0),
+            Scale::Log { floor: 1.0 },
+        ];
+        let aggs = [Agg::Max, Agg::Mean, Agg::MinMax, Agg::Last];
+        // One buffer sees decreasing and increasing sizes, every metric and
+        // every output shape; stale bucket/sum/gap data would show up here.
+        let bucket_counts = [240, 32, 1, 0, 1, 32, 240];
+        let mut buffer = SeriesBuf::default();
+        for metric in Metric::ALL {
+            for window in windows {
+                for agg in aggs {
+                    for scale in scales {
+                        for buckets in bucket_counts {
+                            let request = SeriesReq {
+                                metric,
+                                window,
+                                scale,
+                                buckets,
+                                agg,
+                                now_ms: 5 * SEC,
+                            };
+                            assert_matches_oracle(&history, &request, &mut buffer);
+                        }
+                    }
+                }
+            }
+        }
+        let mut request = req(Metric::Cpu, Window::from_secs(10), 32, 0);
+        for agg in aggs {
+            request.agg = agg;
+            assert_matches_oracle(&history, &request, &mut buffer);
+            assert_matches_oracle(&empty_history, &request, &mut buffer);
+        }
+
+        // The rate metric exercises Gap::Zero and CPU contains leading NaN
+        // buckets under Gap::Hold. Both are compared bit-for-bit by the oracle.
+        assert_matches_oracle(
+            &history,
+            &SeriesReq {
+                metric: Metric::NetRx,
+                window: Window::from_secs(10),
+                scale: Scale::Window,
+                buckets: 32,
+                agg: Agg::Max,
+                now_ms: 5 * SEC,
+            },
+            &mut buffer,
+        );
+    }
+
+    #[test]
+    fn series_into_keeps_infinite_samples_present_like_core_bucketing() {
+        let mut history = history(&[10, 70, 20, 90, 30], SEC, 5 * SEC);
+        history.rings[Metric::Cpu.index()].q[2] = f32::INFINITY;
+        let request = req(Metric::Cpu, Window::from_secs(10), 32, 5 * SEC);
+        let mut buffer = SeriesBuf::default();
+        assert_matches_oracle(&history, &request, &mut buffer);
+        let time = history.at[2];
+        let bucket = (((time as f64 / (5 * SEC) as f64) * 32.0) as usize).min(31);
+        assert!(!buffer.gap[bucket], "an infinite reading remains present");
+        assert_eq!(buffer.raw_hi[bucket], f32::INFINITY);
+    }
+
+    #[test]
+    fn series_into_reuses_warmed_storage() {
+        let history = history(&[10, 70, 20, 90, 30], SEC, 5 * SEC);
+        let request = req(Metric::Cpu, Window::from_secs(10), 32, 5 * SEC);
+        let mut buffer = SeriesBuf::default();
+        history.series_into(&request, &mut buffer);
+        let (_, counts) = crate::proc_workload_alloc::measure(|| {
+            history.series_into(&request, &mut buffer);
+        });
+        assert_eq!(
+            counts.allocation_calls, 0,
+            "warmed series_into allocated: {counts:?}"
+        );
+        assert_eq!(
+            counts.realloc_calls, 0,
+            "warmed series_into reallocated: {counts:?}"
+        );
     }
 
     #[test]

@@ -197,6 +197,7 @@ fn render_workloads() -> Vec<serde_json::Value> {
                 total: count,
                 primed: true,
                 enabled: true,
+                summary: None,
                 procs: (0..count)
                     .map(|i| thegn_metrics::ProcSample {
                         pid: 10_000 + i as u32,
