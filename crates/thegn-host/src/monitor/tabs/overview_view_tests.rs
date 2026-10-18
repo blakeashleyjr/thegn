@@ -202,11 +202,7 @@ fn overview_history_skips_leading_gaps_holds_interior_gaps_and_reuses_capacity()
     }
     assert!(model.sparks[5][0].is_empty());
     assert!(model.sparks[6][0].is_empty());
-    assert!(
-        model.sparks[7]
-            .iter()
-            .all(|slots| slots.iter().all(|series| series.is_empty()))
-    );
+    assert!(model.sparks[7].iter().all(|series| series.is_empty()));
 
     // The samples at 50 s and 51 s are absent; buckets 133 through 137
     // retain the 49 s reading for CPU, Memory, Network, and Disk.
@@ -347,7 +343,8 @@ fn overview_renders_all_target_sizes_and_terminal_levels() {
                     });
                     assert_eq!(demand, union);
                     if (cols, rows) == (240, 60) {
-                        assert!(fill_ratio(&surface, Rect::full(cols, rows)) >= 0.55);
+                        let ratio = fill_ratio(&surface, Rect::full(cols, rows));
+                        assert!(ratio >= 0.55, "fill ratio {ratio:.3}");
                     }
                 });
             });
