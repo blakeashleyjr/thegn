@@ -71,11 +71,17 @@ Recipes:
   (null for idle). The environment scrubs inherited `THEGN_*` and credential
   variables while keeping `TG_PERF_*`; soak-daemon binds its own daemon socket.
 - The harness disables sandboxing by default; set `TG_PERF_SANDBOX=1` to
-  measure with sandboxing enabled. A separate verify launch checks that the
-  seeded worktree count was collected before the measured launch. Fixed resource
-  ceilings apply to every non-debug procfs run; the CPU ceiling
-  applies to non-debug idle runs.
-  Fixture cleanup removes its temporary Podman state and any matching rootless
+  measure with sandboxed panes enabled. In that mode it exposes the user
+  manager's private socket when available; if only the session bus is available,
+  it exposes that and reports the fallback. The fixture writes
+  `cpu_total = "off"` and `memory_total = "off"` to its sandbox limits in
+  either mode. A separate verify launch checks that the seeded worktree count
+  was collected before the measured launch. Fixed resource ceilings apply to
+  every non-debug procfs run; the CPU ceiling applies to non-debug idle runs.
+  Cleanup signals a process group only while its tracked launcher is still a
+  child of the harness, and only for groups registered by the harness; it does
+  not signal a launcher group after that child has been reaped. Fixture cleanup
+  also removes its temporary Podman state and any matching rootless
   `podman pause` process.
 
 The fixture (`lib/fixture.sh`) and the Rust bench fixture
