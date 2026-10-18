@@ -230,7 +230,7 @@ perf_watch_process_group() {
 # fixture. Podman overlay layers may be owned by its user namespace, so remove
 # them through `podman unshare` before trying ordinary rm.
 perf_cleanup() {
-  local d pgid ppid pidfile pid
+  local pgid ppid pidfile
   if [ "${#PERF_PROCESS_GROUPS[@]}" -gt 0 ]; then
     for pgid in "${PERF_PROCESS_GROUPS[@]}"; do
       ppid="$(ps -o ppid= -p "$pgid" 2>/dev/null | tr -d ' ' || true)"

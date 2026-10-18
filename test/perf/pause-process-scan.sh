@@ -55,6 +55,8 @@ if [ -s "$stderr" ]; then
 fi
 
 perf_cleanup 2>"$stderr"
+# The fake proc tree is static, so the post-delete rescan sees 101 again; its
+# second kill proves that scan ran.
 if [ "$(grep -c '^kill 101$' "$PERF_KILL_LOG")" -ne 2 ]; then
   printf 'expected both cleanup scans to kill only PID 101; log was <%s>\n' \
     "$(cat "$PERF_KILL_LOG" 2>/dev/null || true)" >&2
