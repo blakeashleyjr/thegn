@@ -416,7 +416,7 @@ impl ThermalModel {
                         | thegn_metrics::collect::parse::amd_gpu_metrics::Decoded::Truncated
                 )
             ) && card.metrics.header.is_some_and(|header| {
-                matches!((header.format, header.content), (2, 0 | 1 | 2) | (3, 0))
+                matches!((header.format, header.content), (2, 0..=2) | (3, 0))
             })
         });
         self.core_panel_present = self.core_source_hwmon || smu_apu_layout;
