@@ -13,6 +13,15 @@ const FD_SCRATCH_CAPACITY: usize = 4096;
 const FDINFO_CAPACITY: usize = 4096;
 
 pub trait FdFs {
+    fn open_default() -> io::Result<Self>
+    where
+        Self: Sized,
+    {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "no default fd filesystem",
+        ))
+    }
     fn list_pids(&mut self, out: &mut Vec<u32>) -> io::Result<()>;
     fn start_time(&mut self, pid: u32) -> io::Result<u64>;
     fn list_fds(&mut self, pid: u32, out: &mut Vec<u32>) -> io::Result<()>;
@@ -76,6 +85,16 @@ impl<F: FdFs> DrmFdinfoScanner<F> {
     }
     pub fn fs_mut(&mut self) -> &mut F {
         &mut self.fs
+    }
+
+    pub fn clear(&mut self) {
+        self.processes.clear();
+        self.pids.clear();
+        self.fd_scratch.clear();
+        self.fdinfo.clear();
+        self.clients.clear();
+        self.sweep_cursor = 0;
+        self.truncated = false;
     }
 
     /// Enumerate and incrementally scan candidates. `readlinks` is the exact
@@ -279,7 +298,13 @@ impl RealFdFs {
     pub fn new() -> Self {
         Self::at("/proc")
     }
+    pub fn try_new() -> io::Result<Self> {
+        Self::try_at("/proc")
+    }
     pub fn at(root: impl Into<PathBuf>) -> Self {
+        Self::try_at(root).unwrap_or_else(|error| panic!("failed to open proc root: {error}"))
+    }
+    pub fn try_at(root: impl Into<PathBuf>) -> io::Result<Self> {
         use std::os::fd::FromRawFd;
 
         let proc_root = root.into();
@@ -293,14 +318,12 @@ impl RealFdFs {
                 libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC,
             )
         };
-        assert!(
-            fd >= 0,
-            "failed to open proc root: {}",
-            io::Error::last_os_error()
-        );
+        if fd < 0 {
+            return Err(io::Error::last_os_error());
+        }
         // SAFETY: `fd` is nonnegative and uniquely owned here.
         let proc_fd = unsafe { OwnedFd::from_raw_fd(fd) };
-        Self { proc_root, proc_fd }
+        Ok(Self { proc_root, proc_fd })
     }
     fn process_path(&self, pid: u32, name: &str) -> PathBuf {
         self.proc_root.join(pid.to_string()).join(name)
@@ -314,6 +337,10 @@ impl Default for RealFdFs {
 }
 
 impl FdFs for RealFdFs {
+    fn open_default() -> io::Result<Self> {
+        Self::try_new()
+    }
+
     fn list_pids(&mut self, out: &mut Vec<u32>) -> io::Result<()> {
         out.clear();
         for entry in fs::read_dir(&self.proc_root)? {
