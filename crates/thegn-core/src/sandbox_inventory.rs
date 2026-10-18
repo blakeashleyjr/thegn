@@ -27,10 +27,11 @@ impl EngineState {
     pub fn parse(value: &str) -> Self {
         match value.to_ascii_lowercase().as_str() {
             "created" => Self::Created,
+            "configured" | "initialized" => Self::Created,
             "running" => Self::Running,
             "paused" => Self::Paused,
-            "restarting" => Self::Restarting,
-            "exited" => Self::Exited,
+            "restarting" | "stopping" => Self::Restarting,
+            "exited" | "stopped" => Self::Exited,
             "dead" => Self::Dead,
             "removing" => Self::Removing,
             _ => Self::Unknown,
@@ -338,6 +339,7 @@ pub fn parse_podman_ps_all(json: &str, backend: &str) -> Parsed<ContainerRecord>
                     .map(EngineState::from_status)
                     .unwrap_or(EngineState::Unknown)
             });
+        let status = opt_string(&v, "Status").unwrap_or_default();
         let row = strv(&v, "Id")
             .or_else(|| strv(&v, "ID"))
             .map(str::to_owned)
@@ -349,9 +351,11 @@ pub fn parse_podman_ps_all(json: &str, backend: &str) -> Parsed<ContainerRecord>
                     image_id: opt_text(v.get("ImageID")),
                     command,
                     state,
-                    status: opt_string(&v, "Status").unwrap_or_default(),
+                    status: status.clone(),
                     created: int(&v, "Created"),
-                    exit_code: int(&v, "ExitCode").and_then(|n| i32::try_from(n).ok()),
+                    exit_code: int(&v, "ExitCode")
+                        .and_then(|n| i32::try_from(n).ok())
+                        .or_else(|| exit_code_from_status(state, &status)),
                     pid: int(&v, "Pid").and_then(|n| u32::try_from(n).ok()),
                     labels: labels_map(v.get("Labels")),
                     ports,
@@ -448,7 +452,13 @@ pub fn parse_docker_ps_ndjson(text: &str, backend: &str) -> Parsed<ContainerReco
             continue;
         };
         let names = strv(&v, "Names")
-            .map(|s| s.split(',').map(str::to_owned).collect())
+            .map(|s| {
+                s.split(',')
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .map(str::to_owned)
+                    .collect()
+            })
             .unwrap_or_default();
         let status = opt_string(&v, "Status").unwrap_or_default();
         let state = strv(&v, "State")
@@ -467,14 +477,7 @@ pub fn parse_docker_ps_ndjson(text: &str, backend: &str) -> Parsed<ContainerReco
             })
             .unwrap_or_default();
         let ports = strv(&v, "Ports").map(parse_text_ports).unwrap_or_default();
-        let code = if state == EngineState::Exited {
-            status
-                .strip_prefix("Exited (")
-                .and_then(|s| s.split(')').next())
-                .and_then(|s| s.parse().ok())
-        } else {
-            None
-        };
+        let code = exit_code_from_status(state, &status);
         let row = strv(&v, "ID")
             .or_else(|| strv(&v, "Id"))
             .map(str::to_owned)
@@ -506,6 +509,15 @@ pub fn parse_docker_ps_ndjson(text: &str, backend: &str) -> Parsed<ContainerReco
     }
     out
 }
+fn exit_code_from_status(state: EngineState, status: &str) -> Option<i32> {
+    if state != EngineState::Exited {
+        return None;
+    }
+    status
+        .strip_prefix("Exited (")
+        .and_then(|s| s.split(')').next())
+        .and_then(|s| s.parse().ok())
+}
 /// Parse Docker Engine `/containers/json?all=1` output.
 pub fn parse_docker_api_list(json: &str, backend: &str) -> Parsed<ContainerRecord> {
     let Ok(rows) = doc_rows(json) else {
@@ -530,6 +542,7 @@ pub fn parse_docker_api_list(json: &str, backend: &str) -> Parsed<ContainerRecor
             .and_then(Value::as_object)
             .map(|m| m.keys().cloned().collect())
             .unwrap_or_default();
+        let exit_code = exit_code_from_status(state, &status);
         let row = strv(&v, "Id").map(str::to_owned).and_then(|id| {
             record(RecordInput {
                 id,
@@ -540,7 +553,7 @@ pub fn parse_docker_api_list(json: &str, backend: &str) -> Parsed<ContainerRecor
                 state,
                 status,
                 created: int(&v, "Created"),
-                exit_code: None,
+                exit_code,
                 pid: None,
                 labels: labels_map(v.get("Labels")),
                 ports: array_ports(v.get("Ports")),
@@ -597,7 +610,7 @@ fn inspect_ips(v: Option<&Value>) -> Vec<String> {
                 .collect()
         })
         .unwrap_or_default();
-    networks.sort_by(|(left, _), (right, _)| left.cmp(right));
+    networks.sort_by_key(|(name, _)| (*name).clone());
     networks.into_iter().map(|(_, ip)| ip).collect()
 }
 /// Parse a batch inspect response from podman or Docker.
@@ -623,7 +636,7 @@ pub fn parse_inspect_batch(json: &str) -> Parsed<InspectDetail> {
             .map(EngineState::parse)
             .unwrap_or(EngineState::Unknown);
         let (health, failing_streak, last_probe) = inspect_health(state_obj);
-        let mut ips = inspect_ips(
+        let ips = inspect_ips(
             state_obj
                 .get("NetworkSettings")
                 .or_else(|| v.get("NetworkSettings")),
@@ -631,36 +644,33 @@ pub fn parse_inspect_batch(json: &str) -> Parsed<InspectDetail> {
         let cfg = v.get("HostConfig").unwrap_or(&Value::Null);
         let runtime = opt_string(&v, "OCIRuntime").or_else(|| opt_string(cfg, "Runtime"));
         let restart = cfg.get("RestartPolicy").and_then(|r| opt_string(r, "Name"));
-        let row = id.filter(|_| !name.is_empty()).map(|id| {
-            ips.sort();
-            InspectDetail {
-                id,
-                name,
-                oci_runtime: runtime,
-                restart_policy: restart,
-                restart_count: int(&v, "RestartCount").and_then(|n| u32::try_from(n).ok()),
-                oom_killed: state_obj
-                    .get("OOMKilled")
-                    .and_then(Value::as_bool)
-                    .unwrap_or(false),
-                state,
-                pid: int(state_obj, "Pid")
-                    .and_then(|n| u32::try_from(n).ok())
-                    .filter(|n| *n != 0),
-                exit_code: int(state_obj, "ExitCode").and_then(|n| i32::try_from(n).ok()),
-                started: timestamp(state_obj.get("StartedAt")),
-                finished: timestamp(state_obj.get("FinishedAt")),
-                health,
-                failing_streak,
-                last_probe,
-                ips,
-                cgroup_path: opt_text(state_obj.get("CgroupPath")),
-                labels: labels_map(
-                    v.get("Config")
-                        .and_then(|c| c.get("Labels"))
-                        .or_else(|| v.get("Labels")),
-                ),
-            }
+        let row = id.filter(|_| !name.is_empty()).map(|id| InspectDetail {
+            id,
+            name,
+            oci_runtime: runtime,
+            restart_policy: restart,
+            restart_count: int(&v, "RestartCount").and_then(|n| u32::try_from(n).ok()),
+            oom_killed: state_obj
+                .get("OOMKilled")
+                .and_then(Value::as_bool)
+                .unwrap_or(false),
+            state,
+            pid: int(state_obj, "Pid")
+                .and_then(|n| u32::try_from(n).ok())
+                .filter(|n| *n != 0),
+            exit_code: int(state_obj, "ExitCode").and_then(|n| i32::try_from(n).ok()),
+            started: timestamp(state_obj.get("StartedAt")),
+            finished: timestamp(state_obj.get("FinishedAt")),
+            health,
+            failing_streak,
+            last_probe,
+            ips,
+            cgroup_path: opt_text(state_obj.get("CgroupPath")),
+            labels: labels_map(
+                v.get("Config")
+                    .and_then(|c| c.get("Labels"))
+                    .or_else(|| v.get("Labels")),
+            ),
         });
         if let Some(r) = row {
             out.rows.push(r)
