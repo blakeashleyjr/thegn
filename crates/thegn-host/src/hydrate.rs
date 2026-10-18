@@ -275,6 +275,10 @@ pub(crate) fn merge_glyph_scan(
     )
 }
 
+fn keep_glyph_scan_row(clean: bool, has_prior: bool, dirty_known: bool) -> bool {
+    clean || has_prior || dirty_known
+}
+
 /// A refresh request delivered to the event loop. `Model` rehydrates the
 /// sidebar/panel/diff (cheap, gix-backed, off-thread); `Pr` additionally kicks
 /// the GitHub PR-cache refresh; `Issues` kicks the issue-tracker cache refresh.
@@ -1807,14 +1811,14 @@ fn collect_sidebar_status(
     // happens inside each job, off the hydration thread; the config is cloned
     // once per hydration.
     let cfg = std::sync::Arc::new(app_cfg.clone());
-    let jobs: Vec<(bool, crate::scan_pool::ScanJob<(GlyphRow, bool)>)> = to_scan
+    let jobs: Vec<(bool, crate::scan_pool::ScanJob<(GlyphRow, bool, bool)>)> = to_scan
         .iter()
         .map(|p| {
             let prior = prior_for_scan.get(p).cloned();
             let urgent = active_path.as_deref() == Some(p.as_str());
             let path = p.clone();
             let cfg = std::sync::Arc::clone(&cfg);
-            let job: crate::scan_pool::ScanJob<(GlyphRow, bool)> = Box::new(move || {
+            let job: crate::scan_pool::ScanJob<(GlyphRow, bool, bool)> = Box::new(move || {
                 let wt = std::path::Path::new(&path);
                 let repo_root =
                     thegn_core::repo::main_worktree(wt).unwrap_or_else(|| wt.to_path_buf());
@@ -1825,7 +1829,8 @@ fn collect_sidebar_status(
                 // behind + branch), gix/CLI reads for a local one.
                 let reads =
                     crate::git_handle::get().glyph_reads_with_submodules(&loc, include_submodules);
-                merge_glyph_scan(
+                let dirty_known = reads.dirty.is_ok() && reads.submodule_dirty.is_ok();
+                let (row, clean) = merge_glyph_scan(
                     prior.as_ref(),
                     reads.dirty.map_err(|_| ()),
                     reads.ahead_behind.map_err(|_| ()),
@@ -1834,7 +1839,8 @@ fn collect_sidebar_status(
                     reads.uncommitted.map_err(|_| ()),
                     reads.branch_diff.map_err(|_| ()),
                     reads.submodule_dirty.map_err(|_| ()),
-                )
+                );
+                (row, clean, dirty_known)
             });
             (urgent, job)
         })
@@ -1845,15 +1851,15 @@ fn collect_sidebar_status(
     // degraded outcome: every read errored, so it keeps the last-known row (or
     // stays absent), never a fabricated clean one.
     let outcomes = crate::scan_pool::ScanPool::global().run(jobs);
-    let scanned: Vec<(String, GlyphRow, bool)> = to_scan
+    let scanned: Vec<(String, GlyphRow, bool, bool)> = to_scan
         .iter()
         .zip(outcomes)
         .map(|(p, out)| {
-            let (row, clean) = out.unwrap_or_else(|| {
+            let (row, clean, dirty_known) = out.unwrap_or_else(|| {
                 let wt = std::path::Path::new(p);
                 let repo_root =
                     thegn_core::repo::main_worktree(wt).unwrap_or_else(|| wt.to_path_buf());
-                merge_glyph_scan(
+                let (row, clean) = merge_glyph_scan(
                     prior_for_scan.get(p),
                     Err(()),
                     Err(()),
@@ -1862,9 +1868,10 @@ fn collect_sidebar_status(
                     Err(()),
                     Err(()),
                     Err(()),
-                )
+                );
+                (row, clean, false)
             });
-            (p.clone(), row, clean)
+            (p.clone(), row, clean, dirty_known)
         })
         .collect();
 
@@ -1884,7 +1891,7 @@ fn collect_sidebar_status(
         let mut cache = glyph_cache().lock().unwrap();
         let mut persist = Vec::new();
         let scan_completed_at = Instant::now();
-        for (p, row, clean) in &scanned {
+        for (p, row, clean, _) in &scanned {
             if *clean {
                 cache.insert(p.clone(), (row.clone(), scan_completed_at));
                 persist.push(glyph_persist_entry(p, row));
@@ -1912,13 +1919,14 @@ fn collect_sidebar_status(
     let scanned_n = scanned.len();
     let git_rows = scanned
         .into_iter()
-        // A FIRST-ever scan that errored has nothing to merge prior values
-        // from — `merge_glyph_scan` fell back to all-zeros. Leave the row
-        // absent (blank) rather than rendering a dirty-but-unreadable
-        // worktree as confidently clean; the next tick retries. A degraded
-        // rescan (prior existed) keeps its merged last-known row as before.
-        .filter(|(p, _, clean)| *clean || prior_for_scan.contains_key(p))
-        .map(|(p, row, _clean)| (p, row))
+        // Keep first-scan degraded rows only when dirty and submodule status
+        // were both read successfully; Unavailable counts then render as
+        // unknown without claiming the worktree is clean. Otherwise leave the
+        // row absent so delete confirmation remains fail-closed.
+        .filter(|(p, _, clean, dirty_known)| {
+            keep_glyph_scan_row(*clean, prior_for_scan.contains_key(p), *dirty_known)
+        })
+        .map(|(p, row, _clean, _dirty_known)| (p, row))
         .chain(reused);
     for (path, row) in git_rows {
         let GlyphRow {
