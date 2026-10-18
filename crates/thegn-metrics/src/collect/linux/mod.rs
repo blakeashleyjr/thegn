@@ -2,6 +2,8 @@
 pub mod amd_smu;
 pub mod cgroup;
 pub mod cgroup_slice;
+pub mod cpu_irq;
+pub mod cpu_sched;
 pub mod cpu_stat;
 pub mod cpufreq;
 pub mod disk_topology;
@@ -15,5 +17,6 @@ pub mod powercap;
 pub mod procfile;
 pub mod psi;
 pub mod swap_zram;
+pub mod thermal_zones;
 pub mod uptime;
 pub mod vmstat;

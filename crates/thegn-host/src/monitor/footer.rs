@@ -37,6 +37,10 @@ pub(super) struct FooterInput<'a> {
     pub container_ours: bool,
     /// Disk-tab worktree row count: no rows, nothing for `x` to clean.
     pub disk_rows: usize,
+    /// Number of visible board panels, including the focused one.
+    pub board_panels: usize,
+    /// Whether `z` currently restores the board from zoom.
+    pub board_zoomed: bool,
 }
 
 /// Ghost text, the footer's default voice.
@@ -99,6 +103,17 @@ pub(super) fn line(input: FooterInput<'_>) -> Line {
         hints.push(hint("s", format!(" {}", p.scale.label())));
     }
     hints.push(hint("spc", if input.paused { " resume" } else { " pause" }));
+    if input.board_panels > 1 {
+        hints.push(hint("f", " panel"));
+        hints.push(hint(
+            "z",
+            if input.board_zoomed {
+                " unzoom"
+            } else {
+                " zoom"
+            },
+        ));
+    }
     super::tabs::hints(&input, &mut hints);
     hints.push(hint("?", " help"));
 

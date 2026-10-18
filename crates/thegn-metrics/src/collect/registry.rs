@@ -170,6 +170,9 @@ fn copy_part(target: &mut Parts, source: &Parts, id: CollectorId) {
         CollectorId::Diskstats => target.diskstats.clone_from(&source.diskstats),
         CollectorId::Powercap => target.powercap.clone_from(&source.powercap),
         CollectorId::PowerSupply => target.power_supply.clone_from(&source.power_supply),
+        CollectorId::CpuIrq => target.cpu_irq.clone_from(&source.cpu_irq),
+        CollectorId::CpuSched => target.cpu_sched.clone_from(&source.cpu_sched),
+        CollectorId::ThermalZone => target.thermal_zone.clone_from(&source.thermal_zone),
     }
 }
 

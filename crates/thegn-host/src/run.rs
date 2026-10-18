@@ -9,7 +9,7 @@
 //! → no flashing).
 
 use anyhow::{Context, Result};
-use notify::{Event, RecursiveMode, Watcher, recommended_watcher};
+use notify::{Event, RecommendedWatcher, RecursiveMode, Watcher};
 
 use std::path::{Path, PathBuf};
 use tokio::sync::mpsc as tokio_mpsc;
@@ -958,20 +958,23 @@ pub async fn main(
             // leading-edge load would read the empty intermediate and drop the
             // trailing complete-content event.
             let (ev_tx, ev_rx) = std::sync::mpsc::channel::<()>();
-            if let Ok(mut watcher) = recommended_watcher(move |res: notify::Result<Event>| {
-                if let Ok(ev) = res
-                    && matches!(
-                        ev.kind,
-                        notify::EventKind::Modify(_)
-                            | notify::EventKind::Create(_)
-                            | notify::EventKind::Remove(_)
-                    )
-                {
-                    // best-effort: the recv loop owns the coalescing/load; a full
-                    // channel already has a pending wake-up, so a drop is fine.
-                    let _ = ev_tx.send(()); // best-effort: send: the consumer may be gone; a closed channel is the consumer going away
-                }
-            }) {
+            if let Ok(mut watcher) = RecommendedWatcher::new(
+                move |res: notify::Result<Event>| {
+                    if let Ok(ev) = res
+                        && matches!(
+                            ev.kind,
+                            notify::EventKind::Modify(_)
+                                | notify::EventKind::Create(_)
+                                | notify::EventKind::Remove(_)
+                        )
+                    {
+                        // best-effort: the recv loop owns the coalescing/load; a full
+                        // channel already has a pending wake-up, so a drop is fine.
+                        let _ = ev_tx.send(()); // best-effort: send: the consumer may be gone; a closed channel is the consumer going away
+                    }
+                },
+                crate::diff_watch::watcher_config(),
+            ) {
                 let _ = watcher.watch(parent, RecursiveMode::NonRecursive); // best-effort: watch: a failed registration just delays session updates until the next poll
                 let debounce = std::time::Duration::from_millis(200);
                 loop {
@@ -1231,6 +1234,9 @@ pub async fn main(
     if !crate::pane_pty::drain_detached_reapers(std::time::Duration::from_secs(1)) {
         tracing::warn!(target: "thegn::pty", "pane reapers did not settle during shutdown");
     }
+    thegn_core::sandbox_events::shutdown_event_streams(
+        std::time::Instant::now() + std::time::Duration::from_secs(1),
+    );
     for (plugin, outcome) in &resident_report.outcomes {
         tracing::debug!(target: "thegn::plugin", plugin = %plugin, ?outcome, "resident lifecycle receipt; descendant containment remains unproven");
     }
@@ -10762,6 +10768,58 @@ async fn event_loop<T: Terminal>(
                     last_pool_reconcile = None;
                     dirty = true;
                 }
+                run_pending_db::PendingDbResult::HostAdded { name, defs, then } => {
+                    thegn_core::host_config::merge_host_defs(&mut current_config, &defs);
+                    thegn_core::thread_name::spawn_named("thegn-cfg-load", || {
+                        crate::platform::qos::set_self(crate::platform::qos::Qos::Utility);
+                        if let crate::config_startup::ReloadOutcome::Failed(error) =
+                            crate::config_startup::reload()
+                        {
+                            tracing::warn!(
+                                target: "thegn::config",
+                                %error,
+                                "config reload after host add failed"
+                            );
+                        }
+                    });
+                    keymap = rebuild_keymap(&current_config, &session);
+                    model.status = format!("host {name} added");
+                    match then {
+                        run_pending_db::HostAddThen::Wizard { repo_root } => {
+                            if let Some(active_repo_root) = session.repo_root()
+                                && active_repo_root == repo_root.as_path()
+                            {
+                                crate::handlers::wizard::begin_worktree_wizard(
+                                    repo_root,
+                                    None,
+                                    None,
+                                    keymap.config(),
+                                    &mut create_gen,
+                                    &create_tx,
+                                    &waker,
+                                    &mut inflight,
+                                    &mut wizard_cmd_tx,
+                                    &mut wizard_ui,
+                                    &mut model,
+                                );
+                            }
+                        }
+                        run_pending_db::HostAddThen::Panel => {
+                            if let Err(error) = refresh_tx.send(RefreshKind::Model) {
+                                tracing::debug!(
+                                    target: "thegn::host",
+                                    %error,
+                                    "host-added panel refresh receiver is gone"
+                                );
+                            }
+                        }
+                    }
+                    dirty = true;
+                }
+                run_pending_db::PendingDbResult::HostAddFailed { status } => {
+                    model.status = status;
+                    dirty = true;
+                }
             }
         }
         let active_tests_wt = active_tab_path(&session).to_string_lossy().into_owned();
@@ -14605,11 +14663,11 @@ async fn event_loop<T: Terminal>(
         let window = monitor
             .as_ref()
             .and_then(|overlay| overlay.prefs().tab(overlay.tab()).window.secs());
-        // TabView/registry demand replaces this all-collector seed in batch 44.
-        monitor_sampler.sync(
-            sampler_mode,
-            crate::monitor_sampler::Demand::all(crate::monitor_sampler::base_ms_for(window)),
+        let demand = monitor.as_ref().map_or_else(
+            || crate::monitor_sampler::Demand::all(crate::monitor_sampler::base_ms_for(window)),
+            |overlay| overlay.demand(crate::monitor_sampler::base_ms_for(window)),
         );
+        monitor_sampler.sync(sampler_mode, demand);
         // The expensive `stats --no-stream` + `system df` container enrichment
         // runs ONLY while a per-container-stats surface is visible: the monitor's
         // Containers tab, or the Sandbox panel section (its expanded stats). One
@@ -18872,26 +18930,15 @@ async fn event_loop<T: Terminal>(
                                     HostInputKind::NewHost { repo_root } => {
                                         match crate::handlers::wizard::add_host_from_input(
                                             &text,
-                                            &mut current_config,
+                                            &current_config,
+                                            run_pending_db::HostAddThen::Wizard { repo_root },
+                                            &pending_db_tx,
+                                            &waker,
                                         ) {
-                                            Ok(name) => {
-                                                keymap = rebuild_keymap(&current_config, &session);
-                                                model.status = format!("host {name} added");
-                                                crate::handlers::wizard::begin_worktree_wizard(
-                                                    repo_root,
-                                                    None,
-                                                    None,
-                                                    keymap.config(),
-                                                    &mut create_gen,
-                                                    &create_tx,
-                                                    &waker,
-                                                    &mut inflight,
-                                                    &mut wizard_cmd_tx,
-                                                    &mut wizard_ui,
-                                                    &mut model,
-                                                );
+                                            Ok(()) => model.status = "add host: saving…".into(),
+                                            Err(error) => {
+                                                model.status = format!("add host: {error}")
                                             }
-                                            Err(e) => model.status = format!("add host: {e}"),
                                         }
                                     }
                                     HostInputKind::RenameWorktree {
@@ -19192,11 +19239,13 @@ async fn event_loop<T: Terminal>(
                                             );
                                     }
                                     HostInputKind::AddHost => {
-                                        model.status = crate::handlers::host::add_and_refresh(
-                                            &text,
-                                            &mut current_config,
-                                            &refresh_tx,
-                                        );
+                                        model.status =
+                                            crate::handlers::host::queue_host_add_from_input(
+                                                &text,
+                                                &current_config,
+                                                &pending_db_tx,
+                                                &waker,
+                                            );
                                     }
                                 }
                             }

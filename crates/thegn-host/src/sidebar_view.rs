@@ -1972,31 +1972,36 @@ fn compose_row_lines(
                 }
                 if disp.show_diff_stat {
                     use thegn_svc::git::DiffCount;
-                    if g.add == DiffCount::Binary || g.del == DiffCount::Binary {
+                    if g.add == DiffCount::Unavailable || g.del == DiffCount::Unavailable {
                         push_sp(&mut right);
-                        right.push(seg(Tok::Slot(S::Dim), "bin"));
-                    }
-                    match g.add {
-                        DiffCount::Exact(n) if n > 0 => {
+                        right.push(seg(Tok::Hue(theme::Hue::Amber), "?"));
+                    } else {
+                        if g.add == DiffCount::Binary || g.del == DiffCount::Binary {
                             push_sp(&mut right);
-                            right.push(seg(Tok::Hue(theme::Hue::Green), format!("+{n}")));
+                            right.push(seg(Tok::Slot(S::Dim), "bin"));
                         }
-                        DiffCount::Capped => {
-                            push_sp(&mut right);
-                            right.push(seg(Tok::Hue(theme::Hue::Green), "+capped"));
+                        match g.add {
+                            DiffCount::Exact(n) if n > 0 => {
+                                push_sp(&mut right);
+                                right.push(seg(Tok::Hue(theme::Hue::Green), format!("+{n}")));
+                            }
+                            DiffCount::Capped => {
+                                push_sp(&mut right);
+                                right.push(seg(Tok::Hue(theme::Hue::Green), "+capped"));
+                            }
+                            DiffCount::Exact(_) | DiffCount::Binary | DiffCount::Unavailable => {}
                         }
-                        DiffCount::Exact(_) | DiffCount::Binary | DiffCount::Unavailable => {}
-                    }
-                    match g.del {
-                        DiffCount::Exact(n) if n > 0 => {
-                            push_sp(&mut right);
-                            right.push(seg(Tok::Hue(theme::Hue::Red), format!("-{n}")));
+                        match g.del {
+                            DiffCount::Exact(n) if n > 0 => {
+                                push_sp(&mut right);
+                                right.push(seg(Tok::Hue(theme::Hue::Red), format!("-{n}")));
+                            }
+                            DiffCount::Capped => {
+                                push_sp(&mut right);
+                                right.push(seg(Tok::Hue(theme::Hue::Red), "-capped"));
+                            }
+                            DiffCount::Exact(_) | DiffCount::Binary | DiffCount::Unavailable => {}
                         }
-                        DiffCount::Capped => {
-                            push_sp(&mut right);
-                            right.push(seg(Tok::Hue(theme::Hue::Red), "-capped"));
-                        }
-                        DiffCount::Exact(_) | DiffCount::Binary | DiffCount::Unavailable => {}
                     }
                 }
                 if disp.show_ahead_behind {
@@ -3590,21 +3595,43 @@ mod tests {
                 }
                 _ => Vec::new(),
             })
-            .map(|seg| seg.text)
-            .collect::<String>()
+            .collect::<Vec<_>>()
         };
 
-        let binary = render(DiffCount::Binary, DiffCount::Binary);
+        let text =
+            |segs: &[crate::seg::Seg]| segs.iter().map(|seg| seg.text.as_str()).collect::<String>();
+
+        let binary = text(&render(DiffCount::Binary, DiffCount::Binary));
         assert!(binary.contains("bin"), "{binary:?}");
         assert!(!binary.contains("+0"), "{binary:?}");
 
-        let capped = render(DiffCount::Capped, DiffCount::Capped);
+        let capped = text(&render(DiffCount::Capped, DiffCount::Capped));
         assert!(capped.contains("+capped"), "{capped:?}");
         assert!(capped.contains("-capped"), "{capped:?}");
         assert!(!capped.contains("4294967295"), "{capped:?}");
 
-        let exact = render(DiffCount::Exact(42), DiffCount::Exact(7));
+        let exact = text(&render(DiffCount::Exact(42), DiffCount::Exact(7)));
         assert!(exact.contains("+42"), "{exact:?}");
         assert!(exact.contains("-7"), "{exact:?}");
+
+        let unavailable = render(DiffCount::Unavailable, DiffCount::Unavailable);
+        let unavailable_marks = unavailable
+            .iter()
+            .filter(|seg| seg.text == "?" && seg.fg == crate::seg::Tok::Hue(theme::Hue::Amber))
+            .count();
+        assert_eq!(unavailable_marks, 1, "{unavailable:?}");
+        let unavailable_text = text(&unavailable);
+        assert!(!unavailable_text.contains("+0"), "{unavailable_text:?}");
+        assert!(!unavailable_text.contains("-0"), "{unavailable_text:?}");
+
+        let partial = render(DiffCount::Exact(3), DiffCount::Unavailable);
+        let partial_marks = partial
+            .iter()
+            .filter(|seg| seg.text == "?" && seg.fg == crate::seg::Tok::Hue(theme::Hue::Amber))
+            .count();
+        assert_eq!(partial_marks, 1, "{partial:?}");
+        let partial_text = text(&partial);
+        assert!(!partial_text.contains("+3"), "{partial_text:?}");
+        assert!(!partial_text.contains("-0"), "{partial_text:?}");
     }
 }

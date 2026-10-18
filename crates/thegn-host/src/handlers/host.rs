@@ -233,20 +233,23 @@ fn remove_host_def(
 }
 
 /// Parse + persist an add-host target (the System ▸ Hosts panel's `n` key),
-/// then queue a panel refresh so the new machine shows up. Returns the status
-/// line to display (the new host's name, or the parse/persist error).
-pub(crate) fn add_and_refresh(
+/// then queue the durable write; the pending-DB drain queues a panel refresh
+/// after success. Returns the immediate status line or a parse error.
+pub(crate) fn queue_host_add_from_input(
     text: &str,
-    cfg: &mut thegn_core::config::Config,
-    refresh_tx: &tokio::sync::mpsc::UnboundedSender<crate::hydrate::RefreshKind>,
+    cfg: &thegn_core::config::Config,
+    pending_db_tx: &tokio::sync::mpsc::UnboundedSender<crate::run::run_pending_db::PendingDbResult>,
+    waker: &termwiz::terminal::TerminalWaker,
 ) -> String {
-    match crate::handlers::wizard::add_host_from_input(text, cfg) {
-        Ok(name) => {
-            // best-effort: the ticker also re-hydrates on its cadence.
-            let _ = refresh_tx.send(crate::hydrate::RefreshKind::Model);
-            format!("host {name} added")
-        }
-        Err(e) => format!("add host: {e}"),
+    match crate::handlers::wizard::add_host_from_input(
+        text,
+        cfg,
+        crate::run::run_pending_db::HostAddThen::Panel,
+        pending_db_tx,
+        waker,
+    ) {
+        Ok(()) => "add host: saving…".into(),
+        Err(error) => format!("add host: {error}"),
     }
 }
 

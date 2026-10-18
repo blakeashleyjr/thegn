@@ -11,6 +11,12 @@
 //! sysinfo does no background work; cost is paid only when the host calls
 //! [`StatsSampler::sample`], preserving thegn's ~0%-idle invariant.
 
+#[cfg(target_os = "linux")]
+mod base_cpu;
+#[cfg(target_os = "linux")]
+mod base_mem;
+#[cfg(target_os = "linux")]
+mod base_net;
 mod battery;
 pub mod collect;
 mod coverage;
@@ -23,6 +29,9 @@ mod gpu_sysfs;
 mod net_kind;
 mod net_medium;
 mod procs;
+pub mod procs_fs;
+#[cfg(target_os = "linux")]
+pub mod procs_linux;
 pub mod procs_model;
 pub mod procs_parse;
 mod sample;

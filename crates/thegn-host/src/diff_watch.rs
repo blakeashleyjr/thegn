@@ -28,7 +28,7 @@ use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use notify::{Event, RecommendedWatcher, RecursiveMode, Watcher, recommended_watcher};
+use notify::{Event, EventKindMask, RecommendedWatcher, RecursiveMode, Watcher};
 use tokio::sync::mpsc as tokio_mpsc;
 
 use crate::hydrate::RefreshKind;
@@ -697,6 +697,10 @@ fn resolve_git_dirs(cwd: &Path) -> (Option<PathBuf>, Option<PathBuf>) {
 /// Build + register the diff fs-watcher for `cwd` (blocking: registration walks
 /// the tree and runs git commands — call it off the loop). `None` when no usable
 /// watcher could be attached or the directory-watch cap selects ticker fallback.
+pub(crate) fn watcher_config() -> notify::Config {
+    notify::Config::default().with_event_kinds(EventKindMask::CORE)
+}
+
 pub(crate) fn build_diff_watcher(cwd: &Path, sink: RefreshSink) -> Option<RecommendedWatcher> {
     let cwd = cwd.to_path_buf();
     let RefreshSink { tx, wake, revive } = sink;
@@ -830,86 +834,93 @@ pub(crate) fn build_diff_watcher(cwd: &Path, sink: RefreshSink) -> Option<Recomm
     let revive_cwd = cwd.clone();
     let revive_tx = tx.clone();
     let revive_wake = wake.clone();
-    let new_watcher = recommended_watcher(move |res: notify::Result<Event>| {
-        let vouched = guard.cov.vouches();
-        guard.cov.observe(&res, &rules);
-        // The claim was live and this very event withdrew it: re-register once.
-        if vouched
-            && !guard.cov.vouches()
-            && let Some(r) = &revive
-        {
-            r.fire(&revive_cwd, &revive_tx, &revive_wake);
-        }
-        if let Ok(ev) = res
-            && matches!(
-                ev.kind,
-                notify::EventKind::Modify(_)
-                    | notify::EventKind::Create(_)
-                    | notify::EventKind::Remove(_)
-            )
-            // React to real worktree edits (the diffs this watcher exists to
-            // track) AND to git-state changes — commits, checkouts, branch
-            // moves, rebase/merge progress — wherever they land. The latter
-            // are gated through `is_git_state_path` so the index stat-cache
-            // that hydration's own `git` reads rewrite (and the object-store
-            // churn on commit/gc) never match: that allowlist is what keeps
-            // the old self-sustaining ~2 Hz refresh loop — which once read
-            // as a freeze — from coming back.
-            && (ev.paths.is_empty()
-                || ev.paths.iter().any(|p| {
-                    crate::git_watch::watcher_path_triggers_refresh(p, &rules.roots, &rules.ignore)
-                }))
-            && last_send.elapsed() > Duration::from_millis(500)
-        {
-            if tx.send(RefreshKind::Model).is_ok() {
-                wake();
-            }
-            // The tree just changed under the ACTIVE worktree, so its line
-            // count is the one that can actually be wrong. `watch: true`
-            // lets the scan bypass the long `[loc] scan_interval_secs` for
-            // that single path — bounded by `watch_invalidate_secs`, so a
-            // save storm still recounts at most once per window.
-            let _ = tx.send(RefreshKind::Loc { watch: true }); // best-effort: send: the consumer may be gone; a closed channel is the consumer going away
-            // A branch-ref move also kicks the guarded main-checkout self-heal
-            // so a checkout sitting on that branch fast-forwards its own tree
-            // (external `update-ref` / a fold-actor CAS land elsewhere) without
-            // waiting for a tab switch or restart.
-            if ev
-                .paths
-                .iter()
-                .any(|p| crate::git_watch::is_ref_move_path(p))
+    let new_watcher = RecommendedWatcher::new(
+        move |res: notify::Result<Event>| {
+            let vouched = guard.cov.vouches();
+            guard.cov.observe(&res, &rules);
+            // The claim was live and this very event withdrew it: re-register once.
+            if vouched
+                && !guard.cov.vouches()
+                && let Some(r) = &revive
             {
-                let _ = tx.send(RefreshKind::MainRefMoved); // best-effort: send: the consumer may be gone; a closed channel is the consumer going away
+                r.fire(&revive_cwd, &revive_tx, &revive_wake);
             }
-            // A checkout changed the branch: the PR cache row is the OLD
-            // branch's, so look the new one up now.
-            if ev
-                .paths
-                .iter()
-                .any(|p| crate::git_watch::is_head_move_path(p))
+            if let Ok(ev) = res
+                && matches!(
+                    ev.kind,
+                    notify::EventKind::Modify(_)
+                        | notify::EventKind::Create(_)
+                        | notify::EventKind::Remove(_)
+                )
+                // React to real worktree edits (the diffs this watcher exists to
+                // track) AND to git-state changes — commits, checkouts, branch
+                // moves, rebase/merge progress — wherever they land. The latter
+                // are gated through `is_git_state_path` so the index stat-cache
+                // that hydration's own `git` reads rewrite (and the object-store
+                // churn on commit/gc) never match: that allowlist is what keeps
+                // the old self-sustaining ~2 Hz refresh loop — which once read
+                // as a freeze — from coming back.
+                && (ev.paths.is_empty()
+                    || ev.paths.iter().any(|p| {
+                        crate::git_watch::watcher_path_triggers_refresh(
+                            p,
+                            &rules.roots,
+                            &rules.ignore,
+                        )
+                    }))
+                && last_send.elapsed() > Duration::from_millis(500)
             {
-                let _ = tx.send(RefreshKind::Pr); // best-effort: send: the consumer may be gone; a closed channel is the consumer going away
+                if tx.send(RefreshKind::Model).is_ok() {
+                    wake();
+                }
+                // The tree just changed under the ACTIVE worktree, so its line
+                // count is the one that can actually be wrong. `watch: true`
+                // lets the scan bypass the long `[loc] scan_interval_secs` for
+                // that single path — bounded by `watch_invalidate_secs`, so a
+                // save storm still recounts at most once per window.
+                let _ = tx.send(RefreshKind::Loc { watch: true }); // best-effort: send: the consumer may be gone; a closed channel is the consumer going away
+                // A branch-ref move also kicks the guarded main-checkout self-heal
+                // so a checkout sitting on that branch fast-forwards its own tree
+                // (external `update-ref` / a fold-actor CAS land elsewhere) without
+                // waiting for a tab switch or restart.
+                if ev
+                    .paths
+                    .iter()
+                    .any(|p| crate::git_watch::is_ref_move_path(p))
+                {
+                    let _ = tx.send(RefreshKind::MainRefMoved); // best-effort: send: the consumer may be gone; a closed channel is the consumer going away
+                }
+                // A checkout changed the branch: the PR cache row is the OLD
+                // branch's, so look the new one up now.
+                if ev
+                    .paths
+                    .iter()
+                    .any(|p| crate::git_watch::is_head_move_path(p))
+                {
+                    let _ = tx.send(RefreshKind::Pr); // best-effort: send: the consumer may be gone; a closed channel is the consumer going away
+                }
+                // A remote-tracking ref moved — the local signature of a push
+                // (or fetch): kick the PR + CI caches now so the just-pushed
+                // branch's checks appear without waiting for the tickers.
+                // Non-forced, so `[ci] ttl_secs` still bounds subprocess churn.
+                if ev
+                    .paths
+                    .iter()
+                    .any(|p| crate::git_watch::is_remote_ref_path(p))
+                {
+                    let _ = tx.send(RefreshKind::Pr); // best-effort: send: the consumer may be gone; a closed channel is the consumer going away
+                    let _ = tx.send(RefreshKind::Ci { force: false }); // best-effort: send: the consumer may be gone; a closed channel is the consumer going away
+                    // The PR queue cares about exactly this event: a push is
+                    // what unblocks a PR (or is the teammate the queue must not
+                    // race), so re-evaluate now rather than up to a minute later.
+                    // Inert when the queue is off — the pass finds no rows.
+                    let _ = tx.send(RefreshKind::PrQueue); // best-effort: send: the consumer may be gone; a closed channel is the consumer going away
+                }
+                last_send = Instant::now();
             }
-            // A remote-tracking ref moved — the local signature of a push
-            // (or fetch): kick the PR + CI caches now so the just-pushed
-            // branch's checks appear without waiting for the tickers.
-            // Non-forced, so `[ci] ttl_secs` still bounds subprocess churn.
-            if ev
-                .paths
-                .iter()
-                .any(|p| crate::git_watch::is_remote_ref_path(p))
-            {
-                let _ = tx.send(RefreshKind::Pr); // best-effort: send: the consumer may be gone; a closed channel is the consumer going away
-                let _ = tx.send(RefreshKind::Ci { force: false }); // best-effort: send: the consumer may be gone; a closed channel is the consumer going away
-                // The PR queue cares about exactly this event: a push is
-                // what unblocks a PR (or is the teammate the queue must not
-                // race), so re-evaluate now rather than up to a minute later.
-                // Inert when the queue is off — the pass finds no rows.
-                let _ = tx.send(RefreshKind::PrQueue); // best-effort: send: the consumer may be gone; a closed channel is the consumer going away
-            }
-            last_send = Instant::now();
-        }
-    });
+        },
+        watcher_config(),
+    );
     let Ok(mut nw) = new_watcher else {
         tracing::warn!(
             target: "thegn::hydrate",
@@ -2121,5 +2132,82 @@ mod tests {
             "cached changes stay filtered"
         );
         assert_eq!(reused.files, panel.files, "cached files stay filtered");
+    }
+
+    #[test]
+    fn production_mask_ignores_open_read_and_keeps_file_changes() {
+        if !cfg!(target_os = "linux") {
+            return;
+        }
+
+        use notify::EventKind::{Create, Modify, Remove};
+        use notify::event::{DataChange, ModifyKind};
+        use std::io::Read;
+
+        let temp = tempfile::tempdir().unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let mut watcher = RecommendedWatcher::new(
+            move |result: notify::Result<Event>| {
+                tx.send(result).expect("test receiver stays alive");
+            },
+            watcher_config(),
+        )
+        .expect("watcher constructs");
+        watcher
+            .watch(temp.path(), RecursiveMode::NonRecursive)
+            .expect("tempdir watch registers");
+
+        let path = temp.path().join("observed.txt");
+        std::fs::write(&path, b"initial content").unwrap();
+        std::thread::sleep(Duration::from_millis(300));
+        while rx.try_recv().is_ok() {}
+
+        let mut file = std::fs::File::open(&path).unwrap();
+        let mut contents = Vec::new();
+        file.read_to_end(&mut contents).unwrap();
+        assert_eq!(contents, b"initial content");
+        assert!(
+            matches!(
+                rx.recv_timeout(Duration::from_millis(300)),
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+            ),
+            "open and read must not deliver an event with the production mask"
+        );
+
+        let created = temp.path().join("created.txt");
+        std::fs::write(&created, b"first").unwrap();
+        std::fs::write(&created, b"updated").unwrap();
+        std::fs::remove_file(&created).unwrap();
+
+        let deadline = Instant::now() + Duration::from_secs(3);
+        let mut kinds = Vec::new();
+        while Instant::now() < deadline {
+            match rx.recv_timeout(Duration::from_millis(50)) {
+                Ok(Ok(event)) => kinds.push(event.kind),
+                Ok(Err(error)) => panic!("watcher returned error: {error}"),
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                    panic!("watcher callback disconnected")
+                }
+            }
+            if kinds.iter().any(|kind| matches!(kind, Remove(_))) {
+                break;
+            }
+        }
+
+        assert!(
+            kinds.iter().any(|kind| matches!(kind, Create(_))),
+            "{kinds:?}"
+        );
+        assert!(
+            kinds
+                .iter()
+                .any(|kind| matches!(kind, Modify(ModifyKind::Data(DataChange::Any)))),
+            "{kinds:?}"
+        );
+        assert!(
+            kinds.iter().any(|kind| matches!(kind, Remove(_))),
+            "{kinds:?}"
+        );
     }
 }
