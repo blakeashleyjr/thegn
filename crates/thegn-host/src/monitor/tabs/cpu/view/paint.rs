@@ -319,13 +319,15 @@ fn paint_core_heatmap(
     }
     let mut rows = [&[][..]; super::CORE_HISTORY_LIMIT];
     let count = model.core_busy_history.len().min(rows.len());
-    while scratch.heat_rows.len() < count {
-        scratch.heat_rows.push(Vec::new());
+    if scratch.heat_rows.len() < count {
+        scratch.heat_rows.resize_with(count, Vec::new);
     }
-    for (index, history) in model.core_busy_history.iter().take(count).enumerate() {
-        history
-            .samples
-            .copy_ordered_into(&mut scratch.heat_rows[index]);
+    for (history, row) in model
+        .core_busy_history
+        .iter()
+        .zip(&mut scratch.heat_rows[..count])
+    {
+        history.copy_ordered_into(row);
     }
     for (row, samples) in rows.iter_mut().zip(&scratch.heat_rows[..count]) {
         *row = &samples[samples.len().saturating_sub(graph_rect.cols)..];

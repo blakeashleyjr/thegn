@@ -211,7 +211,18 @@ fn overview_paint_phases_report_counts() {
             spark_view.paint(&mut surface, panel, area, 0, &[] as &[Section]);
         }
     });
-    eprintln!("Overview history graph phase observed counts: {graph_counts:?}");
+    let graph_delta = crate::proc_workload_alloc::Counts {
+        allocation_calls: graph_counts
+            .allocation_calls
+            .saturating_sub(text_counts.allocation_calls),
+        realloc_calls: graph_counts
+            .realloc_calls
+            .saturating_sub(text_counts.realloc_calls),
+        ..Default::default()
+    };
+    eprintln!(
+        "Overview history graph phase cumulative counts: {graph_counts:?}; delta (graph - text): {graph_delta:?}"
+    );
     assert!(
         graph_counts.allocation_calls <= PAINT_ALLOCATION_BUDGET
             && graph_counts.realloc_calls <= PAINT_REALLOC_BUDGET,
