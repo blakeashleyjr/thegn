@@ -293,7 +293,7 @@ impl MemoryModel {
                 // series_into normalizes leading gaps to zero. Its gap mask
                 // distinguishes those from real zero readings; Hold carries
                 // interior gaps after the first observed value.
-                let gaps = &self.telemetry_series.0.gap;
+                let gaps = self.telemetry_series.0.gap();
                 let first_present = gaps.iter().position(|gap| !gap);
                 for (index, &value) in values.iter().enumerate() {
                     slot.push(if first_present.is_some_and(|first| index < first) {
