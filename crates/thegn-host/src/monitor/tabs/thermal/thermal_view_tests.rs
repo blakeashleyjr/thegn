@@ -189,6 +189,7 @@ fn fill_ratio(surface: &Surface, area: Rect) -> f32 {
                 && x.saturating_add(cell.width()) > x0
                 && !cell.str().is_empty()
                 && cell.str() != " "
+                && cell.str() != "\u{2800}"
         })
         .map(|cell| {
             let x = cell.cell_index();
@@ -257,7 +258,7 @@ fn deterministic_snapshots_cover_sizes_capabilities_and_demand() {
             45.0 + (sample % 26) as f32
         };
         frame.parts.hwmon.values[0].value = Some(temp);
-        for (index, reading) in frame.parts.hwmon.values.iter_mut().skip(7).enumerate() {
+        for (index, reading) in frame.parts.hwmon.values.iter_mut().skip(1).enumerate() {
             reading.value = Some(55.0 + ((sample + index * 3) % 30) as f32);
         }
         model.absorb_frame(&frame);
@@ -321,12 +322,9 @@ fn deterministic_snapshots_cover_sizes_capabilities_and_demand() {
                     }
                     assert_eq!(output.matches("composite").count(), 1);
                     if cols == 240 {
-                        assert!(
-                            // Honest per-core heatmap density; density follow-up (batch 48).
-                            fill_ratio(&surface, area) >= 0.30,
-                            "fill ratio {:.3}",
-                            fill_ratio(&surface, area)
-                        );
+                        // Honest per-core heatmap density; density follow-up (batch 48).
+                        let r = fill_ratio(&surface, area);
+                        assert!(r >= 0.30, "fill ratio {r:.3}");
                     }
                 })
             });
@@ -514,6 +512,39 @@ fn core_heat_cells_keep_individual_temperatures_in_unicode_and_ascii() {
                 });
             });
         }
+    }
+}
+
+#[test]
+fn heatmap_labels_name_core_three_in_unicode_and_ascii() {
+    for (unicode, row, label) in [
+        (UnicodeLevel::Full, 1, "c02/03 "),
+        (UnicodeLevel::Ascii, 3, "core 03 "),
+    ] {
+        test_override::with_unicode(unicode, || {
+            let mut history = [[f32::NAN; HISTORY_CAP]; 16];
+            let mut history_len = [0; 16];
+            let history_next = [0; 16];
+            history[3] = [95.0; HISTORY_CAP];
+            history_len[3] = HISTORY_CAP;
+            let mut grid = CellGrid::new(32, 16);
+            super::paint::heatmap(
+                &mut grid,
+                Rect::full(32, 16),
+                &history,
+                &history_len,
+                &history_next,
+            );
+            let label_width = label.len();
+            let actual_label = (0..label_width)
+                .map(|col| grid.get(col, row).expect("heatmap label cell").ch)
+                .collect::<String>();
+            assert_eq!(actual_label, label);
+            assert_ne!(
+                grid.get(label_width, row).expect("core 3 heat cell").ch,
+                ' '
+            );
+        });
     }
 }
 
