@@ -31,6 +31,7 @@ const RAILS: PanelId = PanelId("power.rails");
 const POLICY: PanelId = PanelId("power.policy");
 const HISTORY_CAP: usize = 120;
 const INSTANCE_CAP: usize = 32;
+const RAIL_TABLE_ROWS: usize = 11;
 const VARIANT: [Variant; 1] = [Variant {
     kind: VariantKind::Full,
     min: (28, 5),
@@ -783,7 +784,7 @@ impl TabView for PowerView<'_> {
                 x: rect.x + inner.x,
                 y: rect.y + inner.y,
                 cols: inner.cols,
-                rows: inner.rows,
+                rows: inner.rows.saturating_sub(RAIL_TABLE_ROWS),
             };
             let band_count = self
                 .0
@@ -839,7 +840,6 @@ impl TabView for PowerView<'_> {
                             rows: plot_rows.saturating_sub(1),
                             x: bands_rect.x,
                             cols: bands_rect.cols,
-                            ..bands_rect
                         },
                         history.len(),
                         graphs::table().braille,
@@ -880,7 +880,6 @@ impl TabView for PowerView<'_> {
                             rows: plot_rows.saturating_sub(1),
                             x: bands_rect.x,
                             cols: bands_rect.cols,
-                            ..bands_rect
                         },
                         zone.history.len(),
                         graphs::table().braille,
