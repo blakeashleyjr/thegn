@@ -34,10 +34,9 @@ impl ZramFiles {
             .collect();
         names.sort_by(|left, right| left.0.cmp(&right.0));
         for (name, path) in names.into_iter().take(8) {
-            let file = ProcFile::open(path).ok();
             self.files.push(ZramFile {
                 name,
-                file,
+                file: ProcFile::open(path).ok(),
                 mm: None,
             });
         }
