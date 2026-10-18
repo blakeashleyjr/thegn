@@ -67,6 +67,32 @@ pub(super) fn line(input: FooterInput<'_>) -> Line {
                 format!("{verb} {label}?")
             }
             Confirm::Clean { label, .. } => format!("clean target/ in {label}?"),
+            Confirm::Renice {
+                label,
+                current,
+                target,
+                ..
+            } => {
+                format!("{label}: nice {current} -> {target} · +/- adjust · y apply · n cancel")
+            }
+            Confirm::Ionice {
+                label,
+                current,
+                target,
+                ..
+            } => {
+                let class_name = |class: crate::platform::IoClass| match class {
+                    crate::platform::IoClass::Idle => "idle".to_string(),
+                    crate::platform::IoClass::BestEffort(level) => format!("be {level}"),
+                    crate::platform::IoClass::RealTime(_) => "realtime".to_string(),
+                    crate::platform::IoClass::None => "none".to_string(),
+                };
+                format!(
+                    "{label}: ionice {} -> {} · +/- adjust · y apply · n cancel",
+                    class_name(*current),
+                    class_name(*target)
+                )
+            }
         };
         return Line::split(
             vec![seg(Tok::Slot(S::Accent), msg).bold()],

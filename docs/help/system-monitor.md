@@ -262,6 +262,15 @@ and new/exited values unknown until their baselines are available.
   pinned, the signal is refused and the reason is shown in the footer. This is
   a local, terminal-only action: it is not exposed to the CLI, the control API,
   or any remote surface.
+- `=` opens a renice confirmation showing the current and proposed nice values.
+  Use `+` / `-` to adjust within `-20..=19`, `y` to apply, or `n` / `Esc` to
+  cancel. The selected PID and start time are checked again before applying;
+  a changed or missing process is refused. Permission errors while lowering
+  nice are shown and never retried.
+- `I` opens the Linux-only ionice confirmation. `+` / `-` cycle through idle,
+  best-effort levels 0–7 and realtime. Realtime requires root; permission
+  errors are shown and never retried. The selected PID and start time are
+  checked again before applying.
 
 Enumerating every process is the one genuinely expensive reading thegn takes, so
 it only happens while this tab is open and unpaused — closing the tab stops it

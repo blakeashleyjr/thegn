@@ -8,6 +8,9 @@
 
 use super::ProcStart;
 
+/// Whether this build exposes the Linux I/O-priority controls.
+pub(crate) const IONICE_SUPPORTED: bool = cfg!(target_os = "linux");
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum IoClass {
     RealTime(u8),

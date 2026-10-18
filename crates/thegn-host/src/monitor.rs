@@ -82,6 +82,22 @@ enum Confirm {
         path: std::path::PathBuf,
         label: String,
     },
+    Renice {
+        pid: u32,
+        start_time: u64,
+        start_ticks: Option<u64>,
+        label: String,
+        current: i32,
+        target: i32,
+    },
+    Ionice {
+        pid: u32,
+        start_time: u64,
+        start_ticks: Option<u64>,
+        label: String,
+        current: crate::platform::IoClass,
+        target: crate::platform::IoClass,
+    },
 }
 
 /// An action the loop must perform on the overlay's behalf because it needs
@@ -1369,9 +1385,50 @@ impl MonitorOverlay {
                     self.pending_action = Some(MonitorAction::CleanWorktree(path));
                     self.status = Some(format!("cleaning {label}…"));
                 }
+                Some(Confirm::Renice {
+                    pid,
+                    start_time,
+                    start_ticks,
+                    label,
+                    current,
+                    target,
+                }) => {
+                    self.apply_renice(pid, start_time, start_ticks, &label, current, target);
+                }
+                Some(Confirm::Ionice {
+                    pid,
+                    start_time,
+                    start_ticks,
+                    label,
+                    target,
+                    ..
+                }) => {
+                    self.apply_ionice(pid, start_time, start_ticks, &label, target);
+                }
                 None => {}
             }
             return MonitorOutcome::Pending;
+        }
+        if let Some(confirm) = self.confirm.as_mut() {
+            match (confirm, key) {
+                (Confirm::Renice { target, .. }, KeyCode::Char('+')) => {
+                    *target = (*target + 1).clamp(-20, 19);
+                    return MonitorOutcome::Pending;
+                }
+                (Confirm::Renice { target, .. }, KeyCode::Char('-')) => {
+                    *target = (*target - 1).clamp(-20, 19);
+                    return MonitorOutcome::Pending;
+                }
+                (Confirm::Ionice { target, .. }, KeyCode::Char('+')) => {
+                    *target = tabs::procs::next_ioprio(*target, true);
+                    return MonitorOutcome::Pending;
+                }
+                (Confirm::Ionice { target, .. }, KeyCode::Char('-')) => {
+                    *target = tabs::procs::next_ioprio(*target, false);
+                    return MonitorOutcome::Pending;
+                }
+                _ => {}
+            }
         }
         if crate::input::is_escape_key(key) || matches!(key, KeyCode::Char('n' | 'N')) {
             self.confirm = None;
