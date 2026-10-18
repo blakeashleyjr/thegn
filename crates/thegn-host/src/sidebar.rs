@@ -4918,7 +4918,7 @@ mod tests {
         };
         let unavailable_marks = segs
             .iter()
-            .filter(|seg| seg.text == "diff ?" && seg.fg == crate::seg::Tok::Hue(theme::Hue::Amber))
+            .filter(|seg| seg.text == "diff ?" && seg.fg == crate::seg::Tok::Hue(thegn_core::theme::Hue::Amber))
             .count();
         assert_eq!(unavailable_marks, 1, "{segs:?}");
         let text = segs.iter().map(|seg| seg.text.as_str()).collect::<String>();
