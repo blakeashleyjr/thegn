@@ -46,6 +46,12 @@ impl Default for SampleRing {
 }
 
 impl SampleRing {
+    fn clear(&mut self) {
+        self.values.clear();
+        self.head = 0;
+        self.len = 0;
+    }
+
     fn push(&mut self, value: f32) {
         if self.len < CORE_HISTORY_SAMPLES {
             self.values.push(value);
@@ -179,15 +185,24 @@ impl CpuModel {
         self.cpu_stat.total = source.total;
         self.cpu_stat.cores.clone_from(&source.cores);
         let core_count = source.cores.len().min(CORE_HISTORY_LIMIT);
-        self.core_busy_history
-            .resize_with(core_count, SampleRing::default);
-        self.core_busy_history.truncate(core_count);
-        for (history, core) in self.core_busy_history.iter_mut().zip(&source.cores) {
+        if self.core_busy_history.len() < core_count {
+            self.core_busy_history
+                .resize_with(core_count, SampleRing::default);
+        }
+        for (history, core) in self
+            .core_busy_history
+            .iter_mut()
+            .take(core_count)
+            .zip(&source.cores)
+        {
             let value = core
                 .share
                 .map(|share| f32::from(share.busy) / 1000.0)
                 .unwrap_or(f32::NAN);
             history.push(value);
+        }
+        for history in self.core_busy_history.iter_mut().skip(core_count) {
+            history.clear();
         }
         if let Some(total) = source.total {
             self.iowait_history.push(f32::from(total.iowait) / 1000.0);
