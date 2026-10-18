@@ -59,7 +59,7 @@ const SPECS: [PanelSpec; 6] = [
     },
     PanelSpec {
         id: SENSORS,
-        priority: 5,
+        priority: 0,
         variants: VARIANTS,
     },
     PanelSpec {
@@ -84,6 +84,7 @@ pub(in crate::monitor) struct ThermalModel {
     sensors: Vec<SensorRow>,
     zones: Vec<ZoneRow>,
     cores: [Option<f32>; 16],
+    cores_sampled: bool,
     core_history: [[f32; HISTORY_CAP]; 16],
     core_history_len: [usize; 16],
     core_history_next: [usize; 16],
@@ -104,6 +105,7 @@ impl Default for ThermalModel {
             sensors: Vec::with_capacity(SENSOR_CAP),
             zones: Vec::with_capacity(16),
             cores: [None; 16],
+            cores_sampled: false,
             core_history: [[0.0; HISTORY_CAP]; 16],
             core_history_len: [0; 16],
             core_history_next: [0; 16],
@@ -186,10 +188,12 @@ impl ThermalModel {
 
     pub(in crate::monitor) fn absorb_frame(&mut self, frame: &MonitorFrame) {
         let mut zone_count = 0;
+        let mut smu_cores = None;
         for sensor in &mut self.sensors {
             sensor.seen = false;
         }
         self.cores.fill(None);
+        self.cores_sampled = true;
         self.gfx_c = None;
         self.edge_c = None;
         self.hotspot_c = None;
@@ -317,8 +321,8 @@ impl ThermalModel {
                     .map(|value| f32::from(value) / 100.0)
                     .filter(|value| thermal::plausible_range(*value))
             });
-            if card_cores.iter().any(Option::is_some) && !self.cores.iter().any(Option::is_some) {
-                self.cores = card_cores;
+            if card_cores.iter().any(Option::is_some) && smu_cores.is_none() {
+                smu_cores = Some(card_cores);
             }
             let gfx_c = metrics
                 .temperature_gfx
@@ -351,6 +355,9 @@ impl ThermalModel {
             if self.socket_w.is_none() {
                 self.socket_w = metrics.power_socket.map(|value| value as f32 / 1000.0);
             }
+        }
+        if let Some(cores) = smu_cores {
+            self.cores = cores;
         }
         for (index, temp) in self.cores.iter().enumerate() {
             if temp.is_none() && self.core_history_len[index] == 0 {
@@ -394,17 +401,20 @@ impl TabView for ThermalView<'_> {
     }
 
     fn template(&self) -> Node {
+        let mut top = vec![(Size::Weight(2), Node::Panel(PACKAGE))];
+        if !self.0.cores_sampled || self.0.cores.iter().any(Option::is_some) {
+            top.push((Size::Weight(1), Node::Panel(CORES)));
+        }
+        top.push((Size::Weight(1), Node::Panel(GPU)));
         Node::Col(vec![
+            (Size::Weight(1), Node::Row(top)),
             (
-                Size::Weight(1),
+                Size::Weight(3),
                 Node::Row(vec![
-                    (Size::Weight(2), Node::Panel(PACKAGE)),
-                    (Size::Weight(1), Node::Panel(CORES)),
-                    (Size::Weight(1), Node::Panel(GPU)),
+                    (Size::Weight(3), Node::Panel(SENSORS)),
+                    (Size::Weight(1), Node::Panel(ZONES)),
                 ]),
             ),
-            (Size::Weight(3), Node::Panel(SENSORS)),
-            (Size::Fixed(11), Node::Panel(ZONES)),
             (Size::Weight(2), Node::Panel(HEATMAP)),
         ])
     }
@@ -460,7 +470,7 @@ impl TabView for ThermalView<'_> {
                 &mut grid,
                 inner,
                 self.0.package(),
-                &self.0.temp_history,
+                &[],
                 &self.0.package_history,
                 self.0.package_history_len,
                 self.0.package_history_next,
