@@ -66,6 +66,19 @@ pub(crate) fn invalidate_glyphs(paths: &[String]) {
     }
 }
 
+/// Update only the upstream counts of a cached glyph row. A fetch changes
+/// remote-tracking refs, which cannot change worktree status or diff counts, so
+/// preserve the scan timestamp and avoid scheduling a full glyph rescan.
+pub(crate) fn patch_glyph_ahead_behind(path: &str, ahead: usize, behind: usize) -> bool {
+    let mut cache = glyph_cache().lock().unwrap_or_else(|e| e.into_inner());
+    let Some((row, _)) = cache.get_mut(path) else {
+        return false;
+    };
+    row.ahead = ahead;
+    row.behind = behind;
+    true
+}
+
 /// Combine the registered-worktree paths and the known repo roots into the
 /// set of glyph-cache keys that must stay resident across hydrations (repo
 /// roots back dormant workspaces' *home* rows, which have no registry row).
