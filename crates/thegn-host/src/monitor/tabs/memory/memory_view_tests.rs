@@ -1,8 +1,8 @@
-use super::view::{MemoryModel, MemoryView};
+use super::{MemoryModel, MemoryView};
 use crate::{caps, compositor::Rect, monitor::board::Board};
 use termwiz::surface::Surface;
 use thegn_core::{
-    mem_health::Verdict,
+    mem_health::{self, MemHealthInput, Verdict},
     termcaps::{ColorDepth, UnicodeLevel},
 };
 use thegn_metrics::collect::{
@@ -14,7 +14,7 @@ use thegn_metrics::collect::{
 fn fixture(pressure: bool) -> MonitorFrame {
     let mut frame = MonitorFrame::default();
     meminfo::parse(
-        b"MemTotal: 8388608 kB\nMemAvailable: 1048576 kB\nMemFree: 524288 kB\nBuffers: 262144 kB\nCached: 2097152 kB\nShmem: 131072 kB\nSlab: 131072 kB\nAnonPages: 4194304 kB\nActive(file): 1048576 kB\nInactive(file): 1048576 kB\nDirty: 1024 kB\nWriteback: 512 kB\nSwapTotal: 2097152 kB\nSwapFree: 1048576 kB\nZswap: 32768 kB\nHugePages_Total: 4\nHugePages_Free: 2\n",
+        b"MemTotal: 8388608 kB\nMemAvailable: 4194304 kB\nMemFree: 524288 kB\nBuffers: 262144 kB\nCached: 2097152 kB\nShmem: 131072 kB\nSlab: 131072 kB\nAnonPages: 4194304 kB\nActive(file): 1048576 kB\nInactive(file): 1048576 kB\nDirty: 1024 kB\nWriteback: 512 kB\nSwapTotal: 2097152 kB\nSwapFree: 1048576 kB\nZswap: 32768 kB\nHugePages_Total: 4\nHugePages_Free: 2\n",
         &mut frame.parts.meminfo.raw,
     );
     vmstat::parse(
@@ -31,10 +31,20 @@ fn fixture(pressure: bool) -> MonitorFrame {
         Some(if pressure { 250.0 } else { 0.0 });
     frame.parts.vmstat.rates[thegn_metrics::collect::model::vmstat::VmRate::StealDirect as usize] =
         Some(if pressure { 1200.0 } else { 0.0 });
+    frame.parts.vmstat.rates[thegn_metrics::collect::model::vmstat::VmRate::StealKswapd as usize] =
+        Some(if pressure { 5.0 } else { 0.0 });
     frame.parts.vmstat.rates[thegn_metrics::collect::model::vmstat::VmRate::ScanDirect as usize] =
         Some(20.0);
     frame.parts.vmstat.rates[thegn_metrics::collect::model::vmstat::VmRate::ScanKswapd as usize] =
         Some(30.0);
+    frame.parts.vmstat.rates[thegn_metrics::collect::model::vmstat::VmRate::Pswpin as usize] =
+        Some(if pressure { 1.0 } else { 0.0 });
+    frame.parts.vmstat.rates[thegn_metrics::collect::model::vmstat::VmRate::RefaultAnon as usize] =
+        Some(0.0);
+    frame.parts.vmstat.rates[thegn_metrics::collect::model::vmstat::VmRate::RefaultFile as usize] =
+        Some(0.0);
+    frame.parts.vmstat.rates[thegn_metrics::collect::model::vmstat::VmRate::Allocstall as usize] =
+        Some(0.0);
     frame.parts.psi.memory.present = true;
     frame.parts.psi.memory.file = psi::parse(if pressure {
         b"some avg10=6.00 avg60=4.00 avg300=2.00 total=100\nfull avg10=11.00 avg60=8.00 avg300=3.00 total=20\n"
@@ -86,17 +96,59 @@ fn fill_ratio(surface: &Surface, area: Rect) -> f32 {
 
 #[test]
 fn absorb_frame_matches_mem_health_for_healthy_and_pressure_inputs() {
+    let frame = fixture(false);
     let mut healthy = MemoryModel::default();
-    healthy.absorb_frame(&fixture(false));
+    healthy.absorb_frame(&frame);
     assert_eq!(healthy.health.verdict, Verdict::Ok);
+    assert_eq!(
+        healthy.health,
+        mem_health::evaluate(&MemHealthInput {
+            mem_total_bytes: Some(8 * 1024 * 1024 * 1024),
+            mem_available_bytes: Some(4 * 1024 * 1024 * 1024),
+            swap_total_bytes: Some(2 * 1024 * 1024 * 1024),
+            swap_free_bytes: Some(1024 * 1024 * 1024),
+            swap_in_per_sec: Some(0.0),
+            psi_some_avg10: Some(0.0),
+            psi_full_avg10: Some(0.0),
+            refault_pages_per_sec: Some(0.0),
+            majflt_per_sec: Some(0.0),
+            direct_reclaim_pages_per_sec: Some(0.0),
+            allocstall_per_sec: Some(0.0),
+            secs_since_oom_kill: None,
+            slice_used_frac_of_high: None,
+            os_level: None,
+        })
+    );
     let mut pressure = MemoryModel::default();
     pressure.absorb_frame(&fixture(true));
+    assert_eq!(pressure.reclaim, Some(1200.0));
+    assert_eq!(pressure.steal, Some(5.0));
+    assert_eq!(pressure.scan, Some(50.0));
     assert_eq!(pressure.health.verdict, Verdict::Thrashing);
     assert!(
         pressure
             .health
             .reasons
             .contains(thegn_core::mem_health::Reason::PsiFull)
+    );
+    assert_eq!(
+        pressure.health,
+        mem_health::evaluate(&MemHealthInput {
+            mem_total_bytes: Some(8 * 1024 * 1024 * 1024),
+            mem_available_bytes: Some(4 * 1024 * 1024 * 1024),
+            swap_total_bytes: Some(2 * 1024 * 1024 * 1024),
+            swap_free_bytes: Some(1024 * 1024 * 1024),
+            swap_in_per_sec: Some(1.0),
+            psi_some_avg10: Some(6.0),
+            psi_full_avg10: Some(11.0),
+            refault_pages_per_sec: Some(0.0),
+            majflt_per_sec: Some(250.0),
+            direct_reclaim_pages_per_sec: Some(1200.0),
+            allocstall_per_sec: Some(0.0),
+            secs_since_oom_kill: None,
+            slice_used_frac_of_high: None,
+            os_level: None,
+        })
     );
 }
 
@@ -105,7 +157,6 @@ fn absent_swap_and_cgroup_are_hidden_and_not_demanded() {
     let mut model = MemoryModel::default();
     model.absorb_frame(&fixture(false));
     model.swap_total = Some(0);
-    model.slice_present = false;
     let view = MemoryView(&model);
     let placed = Board::default().placed(&view, Rect::full(160, 45));
     assert!(!placed.iter().any(|panel| panel.id.0 == "memory.swap"));
@@ -115,12 +166,17 @@ fn absent_swap_and_cgroup_are_hidden_and_not_demanded() {
         .collectors;
     assert!(!demand.contains(CollectorId::CgroupSlice));
     model.swap_total = Some(1);
-    model.slice_present = true;
+    let mut cgroup_frame = fixture(false);
+    cgroup_frame.parts.cgroup_slice.found = true;
+    cgroup_frame.parts.cgroup_slice.sample.mem_current = Some(1024);
+    model.absorb_frame(&cgroup_frame);
+    // CgroupSlice and memory.limit stay deferred until the collector exposes
+    // memory.max or memory.high; even a reported current value cannot supply it.
     let view = MemoryView(&model);
     let demand = Board::default()
         .demand(&view, Rect::full(160, 45), 1000)
         .collectors;
-    assert!(demand.contains(CollectorId::Meminfo));
+    assert!(!demand.contains(CollectorId::CgroupSlice));
 }
 
 #[test]
@@ -149,6 +205,10 @@ fn board_snapshots_cover_size_and_capability_matrix() {
                 assert!(rendered.contains("health"));
                 if cols == 240 {
                     assert!(fill_ratio(&surface, Rect::full(cols, rows)) >= 0.55);
+                    assert!(rendered.contains("direct reclaim"));
+                    assert!(rendered.contains("kswapd steal"));
+                    assert!(rendered.contains("refaults"));
+                    assert!(rendered.contains("allocstall"));
                 }
                 if level == UnicodeLevel::Ascii {
                     assert!(rendered.chars().all(|character| character.is_ascii()));
@@ -184,5 +244,34 @@ fn missing_values_render_the_capability_absent_mark() {
     let mut surface = Surface::new(100, 30);
     Board::default().paint(&view, &mut surface, Rect::full(100, 30), 0, &[]);
     assert!(text(&surface).contains(caps::active_glyphs().emdash));
-    assert!(!text(&surface).contains("0 B"));
+    let rendered = text(&surface);
+    let zero_bytes = crate::monitor::kit::edge_fmt(thegn_core::numfmt::NumFmt::default()).fmt(
+        0.0,
+        thegn_core::numfmt::Unit::Bytes,
+        12,
+    );
+    assert!(!rendered.contains(zero_bytes.trim()));
+}
+
+#[test]
+fn a_positive_oom_kill_rate_triggers_the_oom_verdict() {
+    let mut frame = fixture(false);
+    frame.at_ms = 12_345;
+    frame.parts.vmstat.rates[thegn_metrics::collect::model::vmstat::VmRate::OomKill as usize] =
+        Some(1.0);
+    let mut model = MemoryModel::default();
+    model.absorb_frame(&frame);
+    assert_eq!(model.health.verdict, Verdict::Oom);
+    frame.at_ms += 60_001;
+    frame.parts.vmstat.rates[thegn_metrics::collect::model::vmstat::VmRate::OomKill as usize] =
+        Some(0.0);
+    model.absorb_frame(&frame);
+    assert_ne!(model.health.verdict, Verdict::Oom);
+}
+
+#[test]
+fn rate_sums_preserve_a_single_reported_counter() {
+    assert_eq!(super::sum_rates(Some(3.0), None), Some(3.0));
+    assert_eq!(super::sum_rates(None, Some(4.0)), Some(4.0));
+    assert_eq!(super::sum_rates(None, None), None);
 }
