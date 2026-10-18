@@ -329,7 +329,7 @@ fn paint_core_heatmap(model: &CpuModel, rect: Rect, surface: &mut Surface) {
             graph_rect.y + row,
             graph_rect.cols,
             line,
-            Tok::Slot(S::Dim),
+            Tok::Slot(S::Panel),
         );
     }
 }

@@ -152,7 +152,7 @@ pub(crate) fn paint_sparkline(
                 rect.y,
                 rect.cols,
                 line,
-                crate::seg::Tok::Slot(crate::chrome::S::Dim),
+                crate::seg::Tok::Slot(crate::chrome::S::Panel),
             );
         }
     });
@@ -195,7 +195,7 @@ pub(crate) fn paint_history_graph(
                 rect.y + row,
                 rect.cols,
                 line,
-                crate::seg::Tok::Slot(crate::chrome::S::Dim),
+                crate::seg::Tok::Slot(crate::chrome::S::Panel),
             );
         }
     });
