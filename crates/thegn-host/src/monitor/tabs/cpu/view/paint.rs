@@ -35,6 +35,7 @@ struct CpuPaintScratch {
     grid: CellGrid,
     aux_grid: CellGrid,
     text: String,
+    label: String,
     emitter: Emitter,
 }
 
@@ -56,14 +57,20 @@ pub(super) fn paint(model: &CpuModel, surface: &mut Surface, id: PanelId, rect: 
                 true,
                 scratch,
             ),
-            CORES => paint_cores(&mut scratch.grid, rect, model),
+            CORES => paint_cores(&mut scratch.grid, rect, model, &mut scratch.label),
             FREQ => paint_freq(
                 &mut scratch.grid,
                 rect,
                 &model.cpu_freq,
                 model.cpu_freq_health,
             ),
-            LOAD => paint_load(&mut scratch.grid, rect, model, &mut scratch.aux_grid),
+            LOAD => paint_load(
+                &mut scratch.grid,
+                rect,
+                model,
+                &mut scratch.aux_grid,
+                &mut scratch.text,
+            ),
             IRQ => irq::paint_irq(
                 &mut scratch.grid,
                 rect,
@@ -214,7 +221,7 @@ fn paint_frequency_history(model: &CpuModel, rect: Rect, surface: &mut Surface) 
     }
 }
 
-fn paint_cores(grid: &mut CellGrid, rect: Rect, model: &CpuModel) {
+fn paint_cores(grid: &mut CellGrid, rect: Rect, model: &CpuModel, label: &mut String) {
     let mut body = panel::panel(grid, Rect::full(rect.cols, rect.rows), "Cores (L3)", None);
     let area = body.rect();
     if area.cols == 0 || area.rows == 0 {
@@ -232,27 +239,20 @@ fn paint_cores(grid: &mut CellGrid, rect: Rect, model: &CpuModel) {
     let labels = model.cpu_stat.cores.len().div_ceil(per_row).min(area.rows);
     for row in 0..labels {
         let first = row * per_row;
-        let first_label = core_label(model, first);
-        let second_label = if per_row == 2 {
-            model
-                .cpu_stat
-                .cores
-                .get(first + 1)
-                .map(|_| core_label(model, first + 1))
-        } else {
-            None
-        };
-        let line = match second_label {
-            Some(second) => format!("{first_label} / {second}"),
-            None => first_label,
-        };
-        body.put_str(0, row, &line, CellStyle::default());
+        label.clear();
+        core_label(model, first, label);
+        if per_row == 2 && model.cpu_stat.cores.get(first + 1).is_some() {
+            label.push_str(" / ");
+            core_label(model, first + 1, label);
+        }
+        body.put_str(0, row, label, CellStyle::default());
     }
 }
 
-fn core_label(model: &CpuModel, index: usize) -> String {
+fn core_label(model: &CpuModel, index: usize, out: &mut String) {
     let Some(core) = model.cpu_stat.cores.get(index) else {
-        return mark(model.cpu_stat_health).to_owned();
+        out.push_str(mark(model.cpu_stat_health));
+        return;
     };
     let kind = if matches!(model.topology_health, Health::Absent(_)) {
         ""
@@ -278,14 +278,13 @@ fn core_label(model: &CpuModel, index: usize) -> String {
             .iter()
             .position(|group| group.contains(&core.id))
     };
-    let mut parts = vec![format!("{:>2}", core.id)];
+    write!(out, "{:>2}", core.id).expect("write to String");
     if !kind.is_empty() {
-        parts.push(kind.to_owned());
+        write!(out, " {kind}").expect("write to String");
     }
     if let Some(group) = group {
-        parts.push(format!("L3{group}"));
+        write!(out, " L3{group}").expect("write to String");
     }
-    parts.join(" ")
 }
 
 fn paint_core_heatmap(model: &CpuModel, rect: Rect, surface: &mut Surface) {
@@ -316,12 +315,9 @@ fn paint_core_heatmap(model: &CpuModel, rect: Rect, surface: &mut Surface) {
         *row = &samples[samples.len().saturating_sub(graph_rect.cols)..];
     }
     let mut out = crate::monitor::graphs::GraphOut::new();
-    crate::monitor::graphs::paint_heatmap(
-        &mut out,
-        &rows[..count],
-        RampId::Util,
-        &crate::chrome::palette_snapshot(),
-    );
+    crate::monitor::graphs::with_palette(|palette| {
+        crate::monitor::graphs::paint_heatmap(&mut out, &rows[..count], RampId::Util, palette);
+    });
     for (row, line) in out.lines.iter().take(graph_rect.rows).enumerate() {
         crate::seg::draw_line(
             surface,
@@ -633,7 +629,13 @@ fn paint_freq(grid: &mut CellGrid, rect: Rect, part: &CpuFreqPart, health: Healt
     }
 }
 
-fn paint_load(grid: &mut CellGrid, rect: Rect, model: &CpuModel, gauge: &mut CellGrid) {
+fn paint_load(
+    grid: &mut CellGrid,
+    rect: Rect,
+    model: &CpuModel,
+    gauge: &mut CellGrid,
+    text: &mut String,
+) {
     let mut body = panel::panel(
         grid,
         Rect::full(rect.cols, rect.rows),
@@ -645,42 +647,50 @@ fn paint_load(grid: &mut CellGrid, rect: Rect, model: &CpuModel, gauge: &mut Cel
         return;
     }
     let load = model.loadavg.value.as_ref();
-    let load_line = load
-        .map(|v| {
-            format!(
-                "load {:.2} {:.2} {:.2}",
-                f64::from(v.load1) / 100.0,
-                f64::from(v.load5) / 100.0,
-                f64::from(v.load15) / 100.0
-            )
-        })
-        .unwrap_or_else(|| format!("load {}", mark(model.loadavg_health)));
-    body.put_str(0, 0, &load_line, CellStyle::default());
+    text.clear();
+    if let Some(load) = load {
+        write!(
+            text,
+            "load {:.2} {:.2} {:.2}",
+            f64::from(load.load1) / 100.0,
+            f64::from(load.load5) / 100.0,
+            f64::from(load.load15) / 100.0
+        )
+        .expect("write to String");
+    } else {
+        write!(text, "load {}", mark(model.loadavg_health)).expect("write to String");
+    }
+    body.put_str(0, 0, text, CellStyle::default());
     let running = model
         .cpu_stat
         .procs_running
-        .or_else(|| model.loadavg.value.map(|value| value.running))
-        .map(|n| n.to_string())
-        .unwrap_or_else(|| mark(model.cpu_stat_health).to_owned());
-    let runnable = format!("runnable {running}");
+        .or_else(|| model.loadavg.value.map(|value| value.running));
+    text.clear();
+    if let Some(running) = running {
+        write!(text, "runnable {running}").expect("write to String");
+    } else {
+        write!(text, "runnable {}", mark(model.cpu_stat_health)).expect("write to String");
+    }
     body.put_str(
         0,
         1.min(area.rows.saturating_sub(1)),
-        &runnable,
+        text,
         CellStyle::default(),
     );
-    let psi = model
-        .psi
-        .cpu
-        .some_stall_centi
-        .map(|v| format!("CPU some {:.2}%", f64::from(v) / 100.0))
-        .unwrap_or_else(|| format!("CPU some {}", mark(model.psi_health)));
-    let y = 2.min(area.rows.saturating_sub(1));
-    body.put_str(0, y, &psi, CellStyle::default());
+    text.clear();
     if let Some(centi_percent) = model.psi.cpu.some_stall_centi {
-        let x = psi.len().min(area.cols);
+        write!(text, "CPU some {:.2}%", f64::from(centi_percent) / 100.0).expect("write to String");
+    } else {
+        write!(text, "CPU some {}", mark(model.psi_health)).expect("write to String");
+    }
+    let y = 2.min(area.rows.saturating_sub(1));
+    body.put_str(0, y, text, CellStyle::default());
+    if let Some(centi_percent) = model.psi.cpu.some_stall_centi {
+        let x = text.len().min(area.cols);
         let width = area.cols.saturating_sub(x);
-        gauge.resize(width, 1);
+        if gauge.cols() != width || gauge.rows() != 1 {
+            gauge.resize(width, 1);
+        }
         gauge.clear();
         Meter::default().paint(
             gauge,
@@ -771,5 +781,31 @@ fn consecutive_cpu_paints_reuse_the_style_cache() {
         paint(&model, &mut surface, USAGE, Rect::full(80, 20));
         let after_second = PAINT_SCRATCH.with(|scratch| scratch.borrow().emitter.rebuilds());
         assert_eq!(after_second, after_first);
+    });
+}
+
+#[cfg(test)]
+#[test]
+fn paired_core_labels_keep_the_first_core_on_the_row() {
+    crate::caps::test_override::with_unicode(thegn_core::termcaps::UnicodeLevel::Full, || {
+        let mut model = CpuModel::default();
+        model.cpu_stat.cores.extend([
+            thegn_metrics::collect::model::cpu_stat::CoreSample {
+                id: 0,
+                online: true,
+                ..Default::default()
+            },
+            thegn_metrics::collect::model::cpu_stat::CoreSample {
+                id: 1,
+                online: true,
+                ..Default::default()
+            },
+        ]);
+        let mut grid = CellGrid::new(40, 8);
+        paint_cores(&mut grid, Rect::full(40, 8), &model, &mut String::new());
+        let row: String = (1..8)
+            .map(|x| grid.get(x, 1).expect("inner row cell").ch)
+            .collect();
+        assert_eq!(row, " 0 /  1");
     });
 }
