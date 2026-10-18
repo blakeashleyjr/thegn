@@ -795,7 +795,7 @@ impl LoopPerf {
         input_close: crate::perf_timing::InputClose,
         switch_since: &mut Option<(Instant, SwitchKind)>,
     ) {
-        let _closed_stamp = input_since.take();
+        *input_since = None;
         self.pending_input_events = 0;
         let switch = switch_since.take();
         if enabled() {
@@ -1443,7 +1443,13 @@ mod tests {
         let start = lp.report_t0;
         lp.input_event();
         lp.input_event();
-        lp.render(Duration::from_millis(1), true, &mut Some(start), &mut None);
+        lp.render(
+            Duration::from_millis(1),
+            true,
+            &mut Some(start),
+            crate::perf_timing::InputClose::Latency(start),
+            &mut None,
+        );
         lp.resync(Duration::from_micros(200));
         lp.add_busy(Duration::from_millis(3));
         let boundary = start + Duration::from_millis(10);
@@ -1475,12 +1481,25 @@ mod tests {
         let mut lp = LoopPerf::new();
         lp.wake();
         lp.tick(WakeSource::Model);
-        lp.render(Duration::from_micros(900), false, &mut None, &mut None);
+        lp.render(
+            Duration::from_micros(900),
+            false,
+            &mut None,
+            crate::perf_timing::InputClose::None,
+            &mut None,
+        );
         // Stamps are consumed even while accounting is off (they also gate the
         // input-priority PTY budget, which must not stick).
         let mut input = Some(Instant::now());
+        let t = input.expect("input stamp was set");
         let mut switch = Some((Instant::now(), SwitchKind::Worktree));
-        lp.render(Duration::from_micros(900), false, &mut input, &mut switch);
+        lp.render(
+            Duration::from_micros(900),
+            false,
+            &mut input,
+            crate::perf_timing::InputClose::Latency(t),
+            &mut switch,
+        );
         assert!(input.is_none());
         assert!(switch.is_none());
         assert_eq!(lp.wakes, 0);
@@ -1504,10 +1523,13 @@ mod tests {
         lp.pty(10, 80 * 1024, true);
         lp.drain(Duration::from_micros(300));
         lp.flush(Duration::from_micros(120));
+        let t = Instant::now();
+        let mut input = Some(t);
         lp.render(
             Duration::from_micros(900),
             true,
-            &mut Some(Instant::now()),
+            &mut input,
+            crate::perf_timing::InputClose::Latency(t),
             &mut Some((Instant::now(), SwitchKind::Worktree)),
         );
         lp.render_skip();
@@ -1536,12 +1558,46 @@ mod tests {
     }
 
     #[test]
+    fn no_effect_input_is_counted_and_rolls_up_without_latency_sample() {
+        let _g = TEST_GUARD.lock().unwrap_or_else(|e| e.into_inner());
+        set_enabled(true);
+        let mut lp = LoopPerf::new();
+        let t = Instant::now();
+        let mut input = Some(t);
+        lp.render(
+            Duration::from_micros(900),
+            false,
+            &mut input,
+            crate::perf_timing::InputClose::NoEffect,
+            &mut None,
+        );
+
+        assert!(lp.input_us.is_empty());
+        assert_eq!(lp.input_no_effect_events, 1);
+        assert!(input.is_none(), "render consumes the pending stamp");
+
+        let boundary = t + Duration::from_millis(10);
+        let snapshot = lp.rollup(boundary, 0, 0, 0);
+        assert_eq!(snapshot.input_samples, 0);
+        assert_eq!(snapshot.input_no_effect_events, 1);
+        let next = lp.rollup(boundary + Duration::from_millis(10), 0, 0, 0);
+        assert_eq!(next.input_no_effect_events, 0);
+        set_enabled(false);
+    }
+
+    #[test]
     fn workspace_switch_records_into_its_own_histogram() {
         let _g = TEST_GUARD.lock().unwrap_or_else(|e| e.into_inner());
         set_enabled(true);
         let mut lp = LoopPerf::new();
         let mut switch = Some((Instant::now(), SwitchKind::Workspace));
-        lp.render(Duration::from_micros(500), false, &mut None, &mut switch);
+        lp.render(
+            Duration::from_micros(500),
+            false,
+            &mut None,
+            crate::perf_timing::InputClose::None,
+            &mut switch,
+        );
         assert!(switch.is_none(), "stamp is taken by the first frame");
         assert!(!lp.switch_ws_us.is_empty());
         assert!(lp.switch_us.is_empty());
@@ -1557,12 +1613,24 @@ mod tests {
         set_enabled(true);
         let mut lp = LoopPerf::new();
         let mut switch = Some((Instant::now(), SwitchKind::Worktree));
-        lp.render(Duration::from_micros(500), false, &mut None, &mut switch);
+        lp.render(
+            Duration::from_micros(500),
+            false,
+            &mut None,
+            crate::perf_timing::InputClose::None,
+            &mut switch,
+        );
         assert!(switch.is_none(), "stamp is taken by the first frame");
         assert!(!lp.switch_us.is_empty());
         // A second frame without a fresh stamp records no new switch sample.
         let one = lp.switch_us.percentile_us(1.0);
-        lp.render(Duration::from_micros(500), false, &mut None, &mut switch);
+        lp.render(
+            Duration::from_micros(500),
+            false,
+            &mut None,
+            crate::perf_timing::InputClose::None,
+            &mut switch,
+        );
         assert_eq!(lp.switch_us.percentile_us(1.0), one);
         assert_eq!(lp.renders, 2);
         set_enabled(false);
