@@ -1131,7 +1131,7 @@ mod tests {
         );
 
         let resolved =
-            pick_backend_with_notice(&cfg, &Placement::Local, Fallthrough::Chain, &mut |_, _| {});
+            pick_backend_with_notice(&cfg, &Placement::Local, Fallthrough::Chain, |_: &SandboxConfig, _: &str| {});
 
         assert_eq!(resolved, Some(backend));
         assert_eq!(
