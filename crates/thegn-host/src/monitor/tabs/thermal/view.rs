@@ -310,12 +310,12 @@ impl ThermalModel {
         });
 
         let package = self.package();
-        let package_key = package.map(|sensor| sensor.key.as_str());
+        let package_key = package.map(|sensor| sensor.key.clone());
         let package_temp = package.and_then(|sensor| sensor.temp_c);
-        if package_key != self.package_history_key.as_deref() {
+        if package_key.as_deref() != self.package_history_key.as_deref() {
             self.package_history_len = 0;
             self.package_history_next = 0;
-            match package_key {
+            match package_key.as_deref() {
                 Some(key) => match &mut self.package_history_key {
                     Some(current) => {
                         current.clear();
