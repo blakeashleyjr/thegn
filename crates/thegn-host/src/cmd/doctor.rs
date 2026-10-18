@@ -1320,7 +1320,7 @@ fn denied_hint(id: thegn_metrics::collect::CollectorId) -> &'static str {
 
     match id {
         CollectorId::Powercap => {
-            "RAPL energy_uj files are root-only (0400); see the debugging help page for an optional udev rule."
+            "RAPL energy_uj files are root-only (0400); see docs/help/debugging.md for an optional udev rule."
         }
         _ => "This reading needs privileges thegn does not request; it never escalates or prompts.",
     }
@@ -1425,7 +1425,7 @@ fn monitor_collector_formatters_cover_every_id_and_health_state() {
     };
     for id in CollectorId::ALL {
         let expected_hint = if id == CollectorId::Powercap {
-            "RAPL energy_uj files are root-only (0400); see the debugging help page for an optional udev rule."
+            "RAPL energy_uj files are root-only (0400); see docs/help/debugging.md for an optional udev rule."
         } else {
             "This reading needs privileges thegn does not request; it never escalates or prompts."
         };
