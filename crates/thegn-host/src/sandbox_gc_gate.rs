@@ -1,5 +1,6 @@
 //! Decide whether startup should probe container runtimes for orphan cleanup.
 
+use std::path::Path;
 use thegn_core::config::Config;
 
 /// Whether the effective global/profile/env configuration can produce a
