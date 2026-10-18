@@ -84,7 +84,6 @@ pub trait ContainerEvents: Send {
 
 struct EventChild {
     child: Mutex<Option<Child>>,
-    #[cfg(test)]
     reaped: Arc<std::sync::atomic::AtomicBool>,
 }
 
@@ -122,48 +121,42 @@ fn shutdown_event_child(event: &EventChild, deadline: Instant) {
     };
     crate::sandbox::proc::terminate_event_group(process);
     loop {
-        match process.try_wait() {
+        let Some(process) = child.as_mut() else {
+            return;
+        };
+        let wait_result = process.try_wait();
+        match wait_result {
             Ok(Some(_)) => {
-                *child = None;
-                #[cfg(test)]
-                event
-                    .reaped
-                    .store(true, std::sync::atomic::Ordering::SeqCst);
+                mark_event_child_reaped(event, &mut child);
                 return;
             }
             Err(error) => {
                 tracing::debug!(%error, "sandbox events: child reap failed");
-                match process.wait() {
-                    Ok(_) => {
-                        *child = None;
-                        #[cfg(test)]
-                        event
-                            .reaped
-                            .store(true, std::sync::atomic::Ordering::SeqCst);
-                    }
-                    Err(wait_error) => {
-                        tracing::error!(%wait_error, "sandbox events: child wait failed");
-                    }
+                let process = child.take();
+                drop(child);
+                if let Some(process) = process {
+                    crate::sandbox::proc::reap_event_child(process);
                 }
                 return;
             }
             Ok(None) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(5)),
-            Ok(None) => match process.wait() {
-                Ok(_) => {
-                    *child = None;
-                    #[cfg(test)]
-                    event
-                        .reaped
-                        .store(true, std::sync::atomic::Ordering::SeqCst);
-                    return;
+            Ok(None) => {
+                let process = child.take();
+                drop(child);
+                if let Some(process) = process {
+                    crate::sandbox::proc::reap_event_child(process);
                 }
-                Err(error) => {
-                    tracing::error!(%error, "sandbox events: child wait failed");
-                    return;
-                }
-            },
+                return;
+            }
         }
     }
+}
+
+fn mark_event_child_reaped(event: &EventChild, child: &mut Option<Child>) {
+    *child = None;
+    event
+        .reaped
+        .store(true, std::sync::atomic::Ordering::SeqCst);
 }
 
 impl Drop for EventChildGuard {
@@ -177,7 +170,6 @@ static EVENT_CHILDREN: OnceLock<Mutex<Vec<Weak<EventChild>>>> = OnceLock::new();
 pub(crate) fn register_event_child(child: Child) -> EventChildGuard {
     let guard = EventChildGuard(Arc::new(EventChild {
         child: Mutex::new(Some(child)),
-        #[cfg(test)]
         reaped: Arc::new(std::sync::atomic::AtomicBool::new(false)),
     }));
     let mut children = EVENT_CHILDREN
