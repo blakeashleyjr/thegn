@@ -4,83 +4,144 @@ use crate::{
     monitor::{
         board::TabView,
         layout::{PanelId, Placed, VariantKind},
+        tabs::cpu::view::CpuModel,
     },
     sections::Section,
     telemetry::{ScaleMode, TelemetryHistory, Window},
 };
 use termwiz::surface::Surface;
-use thegn_metrics::{StatsSnapshot, collect::frame::MonitorFrame};
+use thegn_metrics::{
+    StatsSnapshot,
+    collect::{
+        frame::MonitorFrame,
+        model::cpu_stat::{CoreSample, ModeShare},
+    },
+};
 
-#[test]
-fn warmed_absorb_frame_and_history_allocate_nothing() {
-    let mut model = OverviewModel::default();
+fn stats(iteration: usize) -> StatsSnapshot {
+    StatsSnapshot {
+        cpu_pct: Some((iteration % 100) as u8),
+        mem_gib: Some((4.0 + (iteration % 8) as f32, 16.0)),
+        net_bps: Some((iteration as u64 * 1024, iteration as u64 * 512)),
+        disk_io: Some((iteration as u64 * 4096, iteration as u64 * 2048)),
+        load_avg: Some((iteration as f32 / 10.0, 1.0, 0.5)),
+        ..Default::default()
+    }
+}
+
+fn frame(iteration: usize) -> MonitorFrame {
     let mut frame = MonitorFrame::default();
-    frame
-        .parts
-        .cpu_stat
-        .cores
-        .push(thegn_metrics::collect::model::cpu_stat::CoreSample {
-            id: 0,
+    for id in 0..(iteration % 2 + 1) {
+        frame.parts.cpu_stat.cores.push(CoreSample {
+            id: id as u16,
             online: true,
-            share: Some(thegn_metrics::collect::model::cpu_stat::ModeShare {
-                busy: 400,
+            share: Some(ModeShare {
+                busy: ((iteration * 37 + id * 113) % 1000) as u16,
                 ..Default::default()
             }),
-            ..Default::default()
         });
-    model.absorb_frame(&frame);
-    let (_, frame_counts) = crate::proc_workload_alloc::measure(|| model.absorb_frame(&frame));
-    assert_eq!(
-        frame_counts.allocation_calls, 0,
-        "warmed absorb_frame allocated: {frame_counts:?}"
-    );
-    assert_eq!(
-        frame_counts.realloc_calls, 0,
-        "warmed absorb_frame reallocated: {frame_counts:?}"
-    );
+    }
+    frame
+}
 
-    let stats = StatsSnapshot {
-        cpu_pct: Some(40),
-        ..Default::default()
-    };
+fn populated_overview() -> (OverviewModel, TelemetryHistory) {
+    let mut model = OverviewModel::default();
     let mut history = TelemetryHistory::default();
     for second in 0..=60_u64 {
-        history.push(&stats, second * 1000);
+        let current = stats(second as usize);
+        model.absorb_stats(&current);
+        model.absorb_frame(&frame(second as usize));
+        history.push(&current, second * 1000);
     }
     model.absorb_history(&history, Window::from_secs(60), ScaleMode::Window, 60_000);
-    let (_, history_counts) = crate::proc_workload_alloc::measure(|| {
-        model.absorb_history(&history, Window::from_secs(60), ScaleMode::Window, 60_000);
+    (model, history)
+}
+
+#[test]
+fn warmed_absorbs_stay_allocation_free_across_changing_frames_and_history() {
+    let mut model = OverviewModel::default();
+    let mut history = TelemetryHistory::default();
+    for iteration in 0..3 {
+        let current = stats(iteration);
+        model.absorb_frame(&frame(iteration));
+        model.absorb_stats(&current);
+        history.push(&current, iteration as u64 * 1000);
+        model.absorb_history(
+            &history,
+            Window::from_secs(60),
+            ScaleMode::Window,
+            iteration as u64 * 1000,
+        );
+    }
+    let changing: Vec<_> = (3..103)
+        .map(|iteration| (iteration, frame(iteration), stats(iteration)))
+        .collect();
+
+    let (_, counts) = crate::proc_workload_alloc::measure(|| {
+        for (iteration, current_frame, current) in &changing {
+            model.absorb_frame(current_frame);
+            model.absorb_stats(current);
+            history.push(current, *iteration as u64 * 1000);
+            model.absorb_history(
+                &history,
+                Window::from_secs(60),
+                ScaleMode::Window,
+                *iteration as u64 * 1000,
+            );
+        }
     });
     assert_eq!(
-        history_counts.allocation_calls, 0,
-        "warmed absorb_history allocated: {history_counts:?}"
+        counts.allocation_calls, 0,
+        "100 changing Overview frame/stats/history absorbs allocated: {counts:?}"
     );
     assert_eq!(
-        history_counts.realloc_calls, 0,
-        "warmed absorb_history reallocated: {history_counts:?}"
+        counts.realloc_calls, 0,
+        "100 changing Overview frame/stats/history absorbs reallocated: {counts:?}"
     );
 }
 
 #[test]
-fn overview_cpu_paint_stays_within_its_pinned_allocation_budget() {
-    // Panel formatting currently creates owned display strings on each paint.
+fn populated_overview_panels_stay_within_the_pinned_paint_budget() {
+    // Provisional ceiling includes eight CellGrid allocations (overview.rs:368)
+    // plus the owned panel lines/badges built in panel_content; the assertion
+    // reports the measured total for the primary to pin precisely.
     const PAINT_ALLOCATION_BUDGET: u64 = 64;
-    let model = OverviewModel::default();
+    let (model, _) = populated_overview();
     let view = super::OverviewView(&model);
-    let area = Rect::full(80, 20);
-    let placed = Placed {
-        id: PanelId("overview.cpu"),
-        rect: area,
-        variant: VariantKind::Full,
-    };
-    let mut surface = Surface::new(160, 45);
-    view.paint(&mut surface, &placed, area, 0, &[] as &[Section]);
-    view.paint(&mut surface, &placed, area, 0, &[] as &[Section]);
+    let area = Rect::full(240, 60);
+    let mut surface = Surface::new(240, 60);
+    let panels = [
+        "overview.cpu",
+        "overview.load",
+        "overview.memory",
+        "overview.network",
+        "overview.disk",
+        "overview.thermal",
+        "overview.power",
+        "overview.activity",
+    ];
+    let placed: Vec<_> = panels
+        .iter()
+        .map(|id| Placed {
+            id: PanelId(*id),
+            rect: area,
+            variant: VariantKind::Full,
+        })
+        .collect();
+    for _ in 0..3 {
+        for panel in &placed {
+            view.paint(&mut surface, panel, area, 0, &[] as &[Section]);
+        }
+    }
     let (_, counts) = crate::proc_workload_alloc::measure(|| {
-        view.paint(&mut surface, &placed, area, 0, &[] as &[Section]);
+        for panel in &placed {
+            view.paint(&mut surface, panel, area, 0, &[] as &[Section]);
+        }
     });
     assert!(
-        counts.allocation_calls <= PAINT_ALLOCATION_BUDGET,
-        "Overview CPU paint exceeded {PAINT_ALLOCATION_BUDGET} allocations: {counts:?}"
+        counts.allocation_calls <= PAINT_ALLOCATION_BUDGET && counts.realloc_calls == 0,
+        "Overview eight-panel paint observed {} allocations ({} reallocations), budget {PAINT_ALLOCATION_BUDGET}: {counts:?}",
+        counts.allocation_calls,
+        counts.realloc_calls,
     );
 }

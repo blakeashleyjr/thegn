@@ -295,10 +295,8 @@ impl CpuModel {
                 },
                 &mut self.history_buf,
             );
-            if self.history_buf.empty() {
-                slot.clear();
-            } else {
-                slot.clear();
+            slot.clear();
+            if !self.history_buf.empty() {
                 slot.extend_from_slice(self.history_buf.hi());
             }
         }
