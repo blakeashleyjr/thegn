@@ -208,6 +208,33 @@ fn absorbs_disk_frame_and_reuses_warm_buffers() {
 }
 
 #[test]
+fn filesystem_history_reuses_dormant_slots_for_new_mounts() {
+    let mut frame = frame_fixture();
+    let mut model = DiskModel::default();
+    model.absorb_frame(&frame);
+    for tick in 0_u16..12 {
+        let fs = &mut frame.parts.filesystems.rows[0];
+        fs.mount_point = format!("/mnt/churn{tick}");
+        fs.source = format!("device-churn{tick}");
+        fs.free_bytes = Some(25_000_000_000 + u64::from(tick));
+        model.absorb_frame(&frame);
+    }
+
+    let newest = model
+        .filesystem_history
+        .iter()
+        .find(|history| history.mount_point == "/mnt/churn11")
+        .expect("newest mount has a history slot");
+    assert_eq!(
+        model.filesystem_history.len(),
+        super::MAX_FILESYSTEM_HISTORIES
+    );
+    assert_eq!(newest.used.len, 1);
+    let newest_fill = newest.used.values[(newest.used.next + super::HISTORY - 1) % super::HISTORY];
+    assert!(newest_fill.is_finite() && newest_fill > 0.0 && newest_fill < 1.0);
+}
+
+#[test]
 fn snapshots_cover_target_sizes_capabilities_and_static_panel_demand() {
     let mut model = DiskModel::default();
     let mut frame = frame_fixture();
@@ -757,12 +784,28 @@ fn filesystem_fill_history_tracks_newest_sample_and_is_drawn_at_the_right_edge()
         .expect("filesystem panel placed");
     let right = filesystems.rect.x + filesystems.rect.cols - 2;
     let trend_y = filesystems.rect.y + 2;
-    let cell = surface
-        .screen_lines()
-        .get(trend_y)
-        .and_then(|line| line.visible_cells().find(|cell| cell.cell_index() == right))
+    let lines = surface.screen_lines();
+    let trend_line = lines.get(trend_y).expect("filesystem trend row rendered");
+    let meter_cols = (filesystems.rect.cols - 2) * 2 / 3;
+    let first_trend = filesystems.rect.x + 1 + meter_cols;
+    let first_trend_cell = trend_line
+        .visible_cells()
+        .find(|cell| cell.cell_index() == first_trend)
+        .expect("first filesystem trend cell rendered");
+    assert_eq!(first_trend_cell.str(), " ");
+    let newest = trend_line
+        .visible_cells()
+        .find(|cell| cell.cell_index() == right)
         .expect("filesystem trend reaches the panel's last inner column");
-    assert_ne!(cell.str(), " ");
+    assert_ne!(newest.str(), " ");
+    assert_ne!(newest.str(), "%");
+    assert!(
+        newest
+            .str()
+            .chars()
+            .next()
+            .is_some_and(|ch| ch != crate::caps::raster_table().track)
+    );
 }
 
 #[test]
@@ -777,14 +820,31 @@ fn per_device_mirrored_read_write_histories_reach_the_right_inner_column() {
         model.absorb_frame(&frame);
     }
     let (surface, placed, _) = render(&model, 240, 60);
+    assert!(surface.screen_chars_to_string().contains("240-sample pk"));
     let devices = placed
         .iter()
         .find(|panel| panel.id == PanelId("disk.devices"))
         .expect("device panel placed");
     let last_inner_col = devices.rect.x + devices.rect.cols - 2;
+    let device_one_text_row = devices.rect.y + 1 + 3;
+    let lines = surface.screen_lines();
+    let text_line = lines
+        .get(device_one_text_row)
+        .expect("second device text row rendered");
+    assert!((devices.rect.x + 38..devices.rect.x + 46).any(|col| {
+        text_line
+            .visible_cells()
+            .find(|cell| cell.cell_index() == col)
+            .is_some_and(|cell| cell.str() != " " && cell.str() != "\u{2800}")
+    }));
+    assert!((devices.rect.x + 46..=last_inner_col).all(|col| {
+        text_line
+            .visible_cells()
+            .find(|cell| cell.cell_index() == col)
+            .is_none_or(|cell| cell.str() == " " || cell.str() == "\u{2800}")
+    }));
     for row in [devices.rect.y + 2, devices.rect.y + 3] {
-        let cell = surface
-            .screen_lines()
+        let cell = lines
             .get(row)
             .and_then(|line| {
                 line.visible_cells()
