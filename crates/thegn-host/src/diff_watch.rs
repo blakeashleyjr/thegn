@@ -28,7 +28,7 @@ use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use notify::{Config, Event, EventKindMask, RecommendedWatcher, RecursiveMode, Watcher};
+use notify::{Event, EventKindMask, RecommendedWatcher, RecursiveMode, Watcher};
 use tokio::sync::mpsc as tokio_mpsc;
 
 use crate::hydrate::RefreshKind;
@@ -697,6 +697,10 @@ fn resolve_git_dirs(cwd: &Path) -> (Option<PathBuf>, Option<PathBuf>) {
 /// Build + register the diff fs-watcher for `cwd` (blocking: registration walks
 /// the tree and runs git commands — call it off the loop). `None` when no usable
 /// watcher could be attached or the directory-watch cap selects ticker fallback.
+pub(crate) fn watcher_config() -> notify::Config {
+    notify::Config::default().with_event_kinds(EventKindMask::CORE)
+}
+
 pub(crate) fn build_diff_watcher(cwd: &Path, sink: RefreshSink) -> Option<RecommendedWatcher> {
     let cwd = cwd.to_path_buf();
     let RefreshSink { tx, wake, revive } = sink;
@@ -842,25 +846,29 @@ pub(crate) fn build_diff_watcher(cwd: &Path, sink: RefreshSink) -> Option<Recomm
                 r.fire(&revive_cwd, &revive_tx, &revive_wake);
             }
             if let Ok(ev) = res
-            && matches!(
-                ev.kind,
-                notify::EventKind::Modify(_)
-                    | notify::EventKind::Create(_)
-                    | notify::EventKind::Remove(_)
-            )
-            // React to real worktree edits (the diffs this watcher exists to
-            // track) AND to git-state changes — commits, checkouts, branch
-            // moves, rebase/merge progress — wherever they land. The latter
-            // are gated through `is_git_state_path` so the index stat-cache
-            // that hydration's own `git` reads rewrite (and the object-store
-            // churn on commit/gc) never match: that allowlist is what keeps
-            // the old self-sustaining ~2 Hz refresh loop — which once read
-            // as a freeze — from coming back.
-            && (ev.paths.is_empty()
-                || ev.paths.iter().any(|p| {
-                    crate::git_watch::watcher_path_triggers_refresh(p, &rules.roots, &rules.ignore)
-                }))
-            && last_send.elapsed() > Duration::from_millis(500)
+                && matches!(
+                    ev.kind,
+                    notify::EventKind::Modify(_)
+                        | notify::EventKind::Create(_)
+                        | notify::EventKind::Remove(_)
+                )
+                // React to real worktree edits (the diffs this watcher exists to
+                // track) AND to git-state changes — commits, checkouts, branch
+                // moves, rebase/merge progress — wherever they land. The latter
+                // are gated through `is_git_state_path` so the index stat-cache
+                // that hydration's own `git` reads rewrite (and the object-store
+                // churn on commit/gc) never match: that allowlist is what keeps
+                // the old self-sustaining ~2 Hz refresh loop — which once read
+                // as a freeze — from coming back.
+                && (ev.paths.is_empty()
+                    || ev.paths.iter().any(|p| {
+                        crate::git_watch::watcher_path_triggers_refresh(
+                            p,
+                            &rules.roots,
+                            &rules.ignore,
+                        )
+                    }))
+                && last_send.elapsed() > Duration::from_millis(500)
             {
                 if tx.send(RefreshKind::Model).is_ok() {
                     wake();
@@ -911,7 +919,7 @@ pub(crate) fn build_diff_watcher(cwd: &Path, sink: RefreshSink) -> Option<Recomm
                 last_send = Instant::now();
             }
         },
-        Config::default().with_event_kinds(EventKindMask::CORE),
+        watcher_config(),
     );
     let Ok(mut nw) = new_watcher else {
         tracing::warn!(
@@ -2124,5 +2132,82 @@ mod tests {
             "cached changes stay filtered"
         );
         assert_eq!(reused.files, panel.files, "cached files stay filtered");
+    }
+
+    #[test]
+    fn production_mask_ignores_open_read_and_keeps_file_changes() {
+        if !cfg!(target_os = "linux") {
+            return;
+        }
+
+        use notify::EventKind::{Create, Modify, Remove};
+        use notify::event::{DataChange, ModifyKind};
+        use std::io::Read;
+
+        let temp = tempfile::tempdir().unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let mut watcher = RecommendedWatcher::new(
+            move |result: notify::Result<Event>| {
+                tx.send(result).expect("test receiver stays alive");
+            },
+            watcher_config(),
+        )
+        .expect("watcher constructs");
+        watcher
+            .watch(temp.path(), RecursiveMode::NonRecursive)
+            .expect("tempdir watch registers");
+
+        let path = temp.path().join("observed.txt");
+        std::fs::write(&path, b"initial content").unwrap();
+        std::thread::sleep(Duration::from_millis(300));
+        while rx.try_recv().is_ok() {}
+
+        let mut file = std::fs::File::open(&path).unwrap();
+        let mut contents = Vec::new();
+        file.read_to_end(&mut contents).unwrap();
+        assert_eq!(contents, b"initial content");
+        assert!(
+            matches!(
+                rx.recv_timeout(Duration::from_millis(300)),
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+            ),
+            "open and read must not deliver an event with the production mask"
+        );
+
+        let created = temp.path().join("created.txt");
+        std::fs::write(&created, b"first").unwrap();
+        std::fs::write(&created, b"updated").unwrap();
+        std::fs::remove_file(&created).unwrap();
+
+        let deadline = Instant::now() + Duration::from_secs(3);
+        let mut kinds = Vec::new();
+        while Instant::now() < deadline {
+            match rx.recv_timeout(Duration::from_millis(50)) {
+                Ok(Ok(event)) => kinds.push(event.kind),
+                Ok(Err(error)) => panic!("watcher returned error: {error}"),
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                    panic!("watcher callback disconnected")
+                }
+            }
+            if kinds.iter().any(|kind| matches!(kind, Remove(_))) {
+                break;
+            }
+        }
+
+        assert!(
+            kinds.iter().any(|kind| matches!(kind, Create(_))),
+            "{kinds:?}"
+        );
+        assert!(
+            kinds
+                .iter()
+                .any(|kind| matches!(kind, Modify(ModifyKind::Data(DataChange::Any)))),
+            "{kinds:?}"
+        );
+        assert!(
+            kinds.iter().any(|kind| matches!(kind, Remove(_))),
+            "{kinds:?}"
+        );
     }
 }
