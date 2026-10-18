@@ -24,6 +24,8 @@ pub const MAX_RUN_BYTES: usize = 8 << 20;
 pub const MAX_STDERR: usize = 8 << 10;
 /// Maximum UTF-8 bytes in a plugin RPC method name.
 const MAX_METHOD_BYTES: usize = 128;
+/// Maximum nesting depth of an entire plugin RPC frame, including its envelope.
+pub(crate) const MAX_FRAME_DEPTH: usize = 32;
 /// Maximum time to wait for a killed leader and its pipe readers to finish.
 const READER_GRACE: Duration = Duration::from_millis(500);
 
@@ -100,14 +102,97 @@ pub(crate) enum FrameReject {
     ResponseArms,
     ResponseFrame,
     Member,
+    Depth,
 }
 
-/// Decode one canonical RPC frame. Classification uses a JSON value so mixed
-/// request/response members and invalid IDs are rejected before typed decode;
-/// the typed decode then catches unknown and duplicate members.
+/// Decode one canonical RPC frame. One duplicate-aware JSON parse supports
+/// classification and typed construction without losing duplicate members.
 pub(crate) fn decode_frame(text: &str) -> Result<Frame, FrameReject> {
-    use serde::Deserialize;
+    use serde::de::{self, MapAccess, SeqAccess, Visitor};
+    use serde::{Deserialize, Deserializer};
     use serde_json::Value;
+    use std::fmt;
+
+    struct UniqueValue(Value);
+    const DUPLICATE_MEMBER_ERROR: &str = "__thegn_duplicate_json_member__";
+
+    impl<'de> Deserialize<'de> for UniqueValue {
+        fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+        where
+            D: Deserializer<'de>,
+        {
+            struct UniqueValueVisitor;
+
+            impl<'de> Visitor<'de> for UniqueValueVisitor {
+                type Value = UniqueValue;
+
+                fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+                    formatter.write_str("a JSON value without duplicate object members")
+                }
+
+                fn visit_bool<E>(self, value: bool) -> Result<Self::Value, E> {
+                    Ok(UniqueValue(Value::Bool(value)))
+                }
+
+                fn visit_i64<E>(self, value: i64) -> Result<Self::Value, E> {
+                    Ok(UniqueValue(Value::Number(value.into())))
+                }
+
+                fn visit_u64<E>(self, value: u64) -> Result<Self::Value, E> {
+                    Ok(UniqueValue(Value::Number(value.into())))
+                }
+
+                fn visit_f64<E>(self, value: f64) -> Result<Self::Value, E>
+                where
+                    E: de::Error,
+                {
+                    let number = serde_json::Number::from_f64(value)
+                        .ok_or_else(|| E::custom("invalid JSON number"))?;
+                    Ok(UniqueValue(Value::Number(number)))
+                }
+
+                fn visit_str<E>(self, value: &str) -> Result<Self::Value, E> {
+                    Ok(UniqueValue(Value::String(value.to_owned())))
+                }
+
+                fn visit_string<E>(self, value: String) -> Result<Self::Value, E> {
+                    Ok(UniqueValue(Value::String(value)))
+                }
+
+                fn visit_unit<E>(self) -> Result<Self::Value, E> {
+                    Ok(UniqueValue(Value::Null))
+                }
+
+                fn visit_seq<A>(self, mut sequence: A) -> Result<Self::Value, A::Error>
+                where
+                    A: SeqAccess<'de>,
+                {
+                    let mut values = Vec::new();
+                    while let Some(UniqueValue(value)) = sequence.next_element()? {
+                        values.push(value);
+                    }
+                    Ok(UniqueValue(Value::Array(values)))
+                }
+
+                fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
+                where
+                    A: MapAccess<'de>,
+                {
+                    let mut values = serde_json::Map::new();
+                    while let Some(key) = map.next_key::<String>()? {
+                        if values.contains_key(&key) {
+                            return Err(de::Error::custom(DUPLICATE_MEMBER_ERROR));
+                        }
+                        let UniqueValue(value) = map.next_value()?;
+                        values.insert(key, value);
+                    }
+                    Ok(UniqueValue(Value::Object(values)))
+                }
+            }
+
+            deserializer.deserialize_any(UniqueValueVisitor)
+        }
+    }
 
     #[derive(Deserialize)]
     #[serde(deny_unknown_fields)]
@@ -138,7 +223,16 @@ pub(crate) fn decode_frame(text: &str) -> Result<Frame, FrameReject> {
         error: Option<Error>,
     }
 
-    let value: Value = serde_json::from_str(text).map_err(|_| FrameReject::Syntax)?;
+    if json_depth_exceeds(text, MAX_FRAME_DEPTH) {
+        return Err(FrameReject::Depth);
+    }
+    let UniqueValue(value) = serde_json::from_str(text).map_err(|error| {
+        if error.to_string().contains(DUPLICATE_MEMBER_ERROR) {
+            FrameReject::Member
+        } else {
+            FrameReject::Syntax
+        }
+    })?;
     let object = value.as_object().ok_or(FrameReject::NotObject)?;
     let has_method = object.contains_key("method");
     let has_result = object.contains_key("result");
@@ -169,7 +263,7 @@ pub(crate) fn decode_frame(text: &str) -> Result<Frame, FrameReject> {
         {
             return Err(FrameReject::Id);
         }
-        let message: Message = serde_json::from_str(text).map_err(|_| FrameReject::Member)?;
+        let message: Message = serde_json::from_value(value).map_err(|_| FrameReject::Member)?;
         return Ok(Frame::Message(RpcMessage {
             id: message.id,
             method: message.method,
@@ -183,7 +277,7 @@ pub(crate) fn decode_frame(text: &str) -> Result<Frame, FrameReject> {
     if object.get("id").and_then(Value::as_u64).is_none() {
         return Err(FrameReject::Id);
     }
-    let response: Response = serde_json::from_str(text).map_err(|_| FrameReject::Member)?;
+    let response: Response = serde_json::from_value(value).map_err(|_| FrameReject::Member)?;
     if has_result {
         Ok(Frame::Response(RpcResponse::ok(
             response.id,
@@ -200,6 +294,41 @@ pub(crate) fn decode_frame(text: &str) -> Result<Frame, FrameReject> {
             },
         )))
     }
+}
+
+/// Return whether JSON container nesting exceeds `limit`, without allocating.
+/// Brackets in strings are ignored, including those following escaped quotes.
+pub(crate) fn json_depth_exceeds(text: &str, limit: usize) -> bool {
+    let mut depth = 0usize;
+    let mut in_string = false;
+    let mut escaped = false;
+
+    for byte in text.bytes() {
+        if in_string {
+            if escaped {
+                escaped = false;
+            } else if byte == b'\\' {
+                escaped = true;
+            } else if byte == b'"' {
+                in_string = false;
+            }
+            continue;
+        }
+
+        match byte {
+            b'"' => in_string = true,
+            b'[' | b'{' => {
+                depth = depth.saturating_add(1);
+                if depth > limit {
+                    return true;
+                }
+            }
+            b']' | b'}' => depth = depth.saturating_sub(1),
+            _ => {}
+        }
+    }
+
+    false
 }
 
 /// What a streamed run produced besides the sink's own state.
@@ -671,9 +800,17 @@ pub(crate) fn term_group(pid: u32) {
 #[cfg(unix)]
 pub(crate) fn kill_group(pid: u32) {
     // Negative pid targets the whole group.
-    unsafe {
-        libc::kill(-(pid as i32), libc::SIGKILL);
+    if unsafe { libc::kill(-(pid as i32), libc::SIGKILL) } == -1 {
+        let error = std::io::Error::last_os_error();
+        if error.raw_os_error().is_none_or(kill_errno_should_warn) {
+            tracing::warn!(pid, %error, "failed to kill plugin process group");
+        }
     }
+}
+
+#[cfg(unix)]
+fn kill_errno_should_warn(errno: i32) -> bool {
+    errno != libc::ESRCH
 }
 
 #[cfg(not(unix))]
@@ -689,3 +826,14 @@ pub(crate) fn kill_group(pid: u32) {
 #[cfg(test)]
 #[path = "proc_tests.rs"]
 mod tests;
+
+#[cfg(all(test, unix))]
+mod kill_errno_tests {
+    use super::kill_errno_should_warn;
+
+    #[test]
+    fn kill_group_errno_classification_silences_esrch_and_warns_other_errors() {
+        assert!(!kill_errno_should_warn(libc::ESRCH));
+        assert!(kill_errno_should_warn(libc::EPERM));
+    }
+}

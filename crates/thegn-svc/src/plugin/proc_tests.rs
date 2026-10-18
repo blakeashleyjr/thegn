@@ -58,6 +58,11 @@ fn strict_frame_decoder_accepts_only_canonical_rpc_frames() {
         (r#"{"method":"x","error":{}}"#, FrameReject::Mixed),
         (r#"{"method":"x","bogus":1}"#, FrameReject::Member),
         (r#"{"method":"x","method":"y"}"#, FrameReject::Member),
+        (
+            r#"{"method":"x","params":{"a":1,"a":2}}"#,
+            FrameReject::Member,
+        ),
+        (r#"{"id":1,"id":2,"result":0}"#, FrameReject::Member),
         (r#"{"method":"x","id":null}"#, FrameReject::Id),
         (r#"{"method":"x","id":-1}"#, FrameReject::Id),
         (r#"{"method":"x","id":"1"}"#, FrameReject::Id),
@@ -68,6 +73,35 @@ fn strict_frame_decoder_accepts_only_canonical_rpc_frames() {
     for (text, expected) in rejected {
         assert_eq!(decode_frame(text).unwrap_err(), expected, "frame {text:?}");
     }
+}
+
+#[test]
+fn frame_depth_is_bounded_before_json_materialization() {
+    let at_limit = format!(
+        "{{\"method\":\"x\",\"params\":{}0{}}}",
+        "[".repeat(MAX_FRAME_DEPTH - 1),
+        "]".repeat(MAX_FRAME_DEPTH - 1)
+    );
+    assert!(!json_depth_exceeds(&at_limit, MAX_FRAME_DEPTH));
+    assert!(decode_frame(&at_limit).is_ok());
+
+    let over_limit = format!(
+        "{{\"method\":\"x\",\"params\":{}0{}}}",
+        "[".repeat(MAX_FRAME_DEPTH),
+        "]".repeat(MAX_FRAME_DEPTH)
+    );
+    assert!(json_depth_exceeds(&over_limit, MAX_FRAME_DEPTH));
+    assert!(matches!(decode_frame(&over_limit), Err(FrameReject::Depth)));
+}
+
+#[test]
+fn frame_depth_prescan_stops_early_and_ignores_string_brackets() {
+    let excessive = "[".repeat(10_000);
+    assert!(json_depth_exceeds(&excessive, MAX_FRAME_DEPTH));
+    assert!(matches!(decode_frame(&excessive), Err(FrameReject::Depth)));
+
+    assert!(!json_depth_exceeds(r#"{"text":"[[[["}"#, MAX_FRAME_DEPTH));
+    assert!(!json_depth_exceeds(r#"{"text":"\"[[[["}"#, MAX_FRAME_DEPTH));
 }
 
 #[test]
