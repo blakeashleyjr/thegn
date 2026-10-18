@@ -146,13 +146,12 @@ impl<F: HwmonFs> BaseTemp<F> {
 
     fn read_thermal(&mut self, values: &mut Vec<(String, f32)>) {
         for slot in &mut self.thermal {
-            if let Some(handle) = &slot.handle {
-                if let Ok(length) = self.fs.pread(handle, &mut self.buffer)
-                    && let Some(milli) = parse_milli(&self.buffer[..length])
-                    && let Some(value) = plausible_input(SensorKind::Temp, milli)
-                {
-                    values.push((slot.label.clone(), value));
-                }
+            if let Some(handle) = &slot.handle
+                && let Ok(length) = self.fs.pread(handle, &mut self.buffer)
+                && let Some(milli) = parse_milli(&self.buffer[..length])
+                && let Some(value) = plausible_input(SensorKind::Temp, milli)
+            {
+                values.push((slot.label.clone(), value));
             }
         }
     }
@@ -450,7 +449,7 @@ mod tests {
                 .fs
                 .preads
                 .iter()
-                .filter(|path| path.ends_with("_input"))
+                .filter(|path| path.to_string_lossy().ends_with("_input"))
                 .count(),
             5
         );
@@ -470,7 +469,7 @@ mod tests {
                 .fs
                 .preads
                 .iter()
-                .filter(|path| path.ends_with("_input"))
+                .filter(|path| path.to_string_lossy().ends_with("_input"))
                 .count(),
             10
         );
@@ -488,7 +487,7 @@ mod tests {
                 .fs
                 .opens
                 .iter()
-                .filter(|path| path.ends_with("_input"))
+                .filter(|path| path.to_string_lossy().ends_with("_input"))
                 .count(),
             5
         );
@@ -616,7 +615,7 @@ mod tests {
                 .fs
                 .preads
                 .iter()
-                .filter(|path| path.ends_with("_input"))
+                .filter(|path| path.to_string_lossy().ends_with("_input"))
                 .count(),
             15
         );
