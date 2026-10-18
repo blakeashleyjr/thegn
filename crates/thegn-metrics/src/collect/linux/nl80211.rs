@@ -453,7 +453,7 @@ fn push_attr(bytes: &mut Vec<u8>, kind: u16, payload: &[u8]) {
     bytes.extend_from_slice(&(len as u16).to_ne_bytes());
     bytes.extend_from_slice(&kind.to_ne_bytes());
     bytes.extend_from_slice(payload);
-    while bytes.len() % 4 != 0 {
+    while !bytes.len().is_multiple_of(4) {
         bytes.push(0);
     }
 }
