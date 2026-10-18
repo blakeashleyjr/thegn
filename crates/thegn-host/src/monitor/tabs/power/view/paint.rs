@@ -1,6 +1,13 @@
 use super::{EffectiveState, PowerModel};
 use crate::caps::{self, Glyph};
-use crate::{compositor::Rect, monitor::kit::grid::CellGrid};
+use crate::{
+    compositor::Rect,
+    monitor::kit::{chip, grid::CellGrid},
+};
+use thegn_core::{
+    numfmt::{NumFmt, Reading, Unit},
+    theme::StateRole,
+};
 use thegn_metrics::collect::health::{Absent, Health};
 
 fn style() -> crate::monitor::kit::grid::CellStyle {
@@ -78,7 +85,7 @@ pub(super) fn paint_battery(grid: &mut CellGrid, rect: Rect, model: &PowerModel)
             rect,
             row,
             &format!(
-                "signed power {}  ETA {}",
+                "draw direction {}  ETA {}",
                 model
                     .battery_w
                     .map(|v| format!("{v:.2}W"))
@@ -108,7 +115,7 @@ pub(super) fn paint_battery(grid: &mut CellGrid, rect: Rect, model: &PowerModel)
             );
         }
     }
-    if model.battery_history.is_empty() && rect.rows > 0 {
+    if model.telemetry_battery_history.is_empty() && rect.rows > 0 {
         put_line(
             grid,
             rect,
@@ -211,38 +218,91 @@ pub(super) fn paint_policy(grid: &mut CellGrid, rect: Rect, model: &PowerModel) 
     let profile = model
         .policy
         .platform_profile
-        .map(|v| v.as_str().to_owned())
-        .unwrap_or_else(|| mark(model.cpu_freq_health).to_owned());
-    put_line(
-        grid,
-        rect,
-        0,
-        &format!(
-            "profile {profile}  boost {}  AMD pstate {}",
-            model
-                .policy
-                .boost
-                .map(|v| (if v { "on" } else { "off" }).to_owned())
-                .unwrap_or_else(|| mark(model.cpu_freq_health).to_owned()),
-            model
-                .policy
-                .amd_pstate_status
-                .map(|v| v.as_str().to_owned())
-                .unwrap_or_else(|| mark(model.cpu_freq_health).to_owned())
+        .map(|v| format!("profile {}", v.as_str()))
+        .unwrap_or_else(|| format!("profile {}", mark(model.cpu_freq_health)));
+    let boost = model
+        .policy
+        .boost
+        .map(|enabled| format!("boost {}", if enabled { "on" } else { "off" }))
+        .unwrap_or_else(|| format!("boost {}", mark(model.cpu_freq_health)));
+    let epp = model
+        .cpu_policy
+        .first()
+        .and_then(|policy| policy.epp)
+        .map(|token| format!("EPP {}", token.as_str()))
+        .unwrap_or_else(|| format!("EPP {}", mark(model.cpu_freq_health)));
+    let mut chip_x = rect.x;
+    let mut chip_y = rect.y;
+    for (label, state) in [
+        (
+            profile,
+            if model.policy.platform_profile.is_some() {
+                StateRole::Ok
+            } else {
+                StateRole::Unknown
+            },
         ),
-    );
+        (
+            boost,
+            if model.policy.boost.is_some() {
+                StateRole::Ok
+            } else {
+                StateRole::Unknown
+            },
+        ),
+        (
+            epp,
+            if model
+                .cpu_policy
+                .first()
+                .and_then(|policy| policy.epp)
+                .is_some()
+            {
+                StateRole::Ok
+            } else {
+                StateRole::Unknown
+            },
+        ),
+    ]
+    .into_iter()
+    {
+        let chip_width = label.len().saturating_add(1).min(rect.cols);
+        if chip_x > rect.x && chip_x + chip_width > rect.x + rect.cols {
+            chip_x = rect.x;
+            chip_y += 1;
+        }
+        if chip_y >= rect.y + rect.rows {
+            break;
+        }
+        chip::draw(
+            grid,
+            Rect {
+                x: chip_x,
+                y: chip_y,
+                cols: chip_width.min(rect.x + rect.cols - chip_x),
+                rows: 1,
+            },
+            &label,
+            Reading::NotApplicable,
+            Unit::Count,
+            NumFmt::default(),
+            state,
+        );
+        chip_x += chip_width;
+    }
+    let chip_rows = chip_y.saturating_sub(rect.y) + 1;
     for (row, policy) in model
         .cpu_policy
         .iter()
-        .take(rect.rows.saturating_sub(1))
+        .take(rect.rows.saturating_sub(chip_rows))
         .enumerate()
     {
         put_line(
             grid,
             rect,
-            row + 1,
+            row + chip_rows,
             &format!(
-                "policy {}  {} | {} | EPP {}",
+                "policy {}  {} / {} / EPP {}",
                 policy.policy,
                 policy
                     .driver

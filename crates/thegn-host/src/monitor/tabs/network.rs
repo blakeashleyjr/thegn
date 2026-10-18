@@ -14,6 +14,10 @@ pub(in crate::monitor) mod view;
 #[path = "network/network_view_tests.rs"]
 mod view_tests;
 
+#[cfg(test)]
+#[path = "network/network_wire_tests.rs"]
+mod wire_tests;
+
 pub(in crate::monitor) fn network(cx: &Ctx) -> Vec<Section> {
     let s = &cx.model.stats;
     let rx = cx.series(Metric::NetRx);

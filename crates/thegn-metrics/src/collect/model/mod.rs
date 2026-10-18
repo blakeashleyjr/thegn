@@ -2,6 +2,7 @@
 pub mod amd_smu;
 pub mod cgroup;
 pub mod cgroup_slice;
+pub mod containers_stats;
 pub mod cpu_freq;
 pub mod cpu_idle;
 pub mod cpu_irq;
@@ -17,6 +18,7 @@ pub mod gpu_engines;
 pub mod hwmon;
 pub mod loadavg;
 pub mod meminfo;
+pub mod net_sockets;
 pub mod net_wifi;
 pub mod netdev;
 pub mod power_supply;

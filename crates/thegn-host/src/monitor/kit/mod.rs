@@ -6,6 +6,7 @@ pub(crate) mod axis;
 pub(crate) mod chip;
 pub(crate) mod emit;
 pub(crate) mod grid;
+pub(crate) mod history_rect;
 pub(crate) mod legend;
 pub(crate) mod meter;
 pub(crate) mod panel;

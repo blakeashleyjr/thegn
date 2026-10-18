@@ -1,4 +1,5 @@
 use super::{MemoryModel, MemoryView};
+use crate::telemetry::{ScaleMode, TelemetryHistory, Window};
 use crate::{
     caps,
     compositor::Rect,
@@ -9,6 +10,7 @@ use thegn_core::{
     mem_health::{self, MemHealthInput, Verdict},
     termcaps::{ColorDepth, UnicodeLevel},
 };
+use thegn_metrics::StatsSnapshot;
 use thegn_metrics::collect::{
     CollectorId,
     frame::MonitorFrame,
@@ -160,8 +162,43 @@ fn absorb_frame_matches_mem_health_for_healthy_and_pressure_inputs() {
 #[test]
 fn absent_swap_is_hidden_and_limit_panel_demands_cgroup_slice() {
     let mut model = MemoryModel::default();
-    model.absorb_frame(&fixture(false));
-    model.swap_total = Some(0);
+    let mut frame = fixture(false);
+    model.absorb_frame(&frame);
+    assert!(model.swap_present);
+
+    // Exhausting swap does not remove an installed swap device.
+    meminfo::parse(
+        b"MemTotal: 8388608 kB\nMemAvailable: 4194304 kB\nSwapTotal: 2097152 kB\nSwapFree: 0 kB\n",
+        &mut frame.parts.meminfo.raw,
+    );
+    model.absorb_frame(&frame);
+    let view = MemoryView(&model);
+    assert!(
+        Board::default()
+            .placed(&view, Rect::full(160, 45))
+            .iter()
+            .any(|panel| panel.id.0 == "memory.swap")
+    );
+
+    // A missing reading is not a swapoff event; preserve the last known layout.
+    meminfo::parse(
+        b"MemTotal: 8388608 kB\nMemAvailable: 4194304 kB\n",
+        &mut frame.parts.meminfo.raw,
+    );
+    model.absorb_frame(&frame);
+    let view = MemoryView(&model);
+    assert!(
+        Board::default()
+            .placed(&view, Rect::full(160, 45))
+            .iter()
+            .any(|panel| panel.id.0 == "memory.swap")
+    );
+
+    meminfo::parse(
+        b"MemTotal: 8388608 kB\nMemAvailable: 4194304 kB\nSwapTotal: 0 kB\nSwapFree: 0 kB\n",
+        &mut frame.parts.meminfo.raw,
+    );
+    model.absorb_frame(&frame);
     let view = MemoryView(&model);
     let placed = Board::default().placed(&view, Rect::full(160, 45));
     assert!(!placed.iter().any(|panel| panel.id.0 == "memory.swap"));
@@ -170,12 +207,34 @@ fn absent_swap_is_hidden_and_limit_panel_demands_cgroup_slice() {
         .demand(&view, Rect::full(160, 45), 1000)
         .collectors;
     assert!(demand.contains(CollectorId::CgroupSlice));
-    model.swap_total = Some(1);
-    let mut cgroup_frame = fixture(false);
-    cgroup_frame.parts.cgroup_slice.found = true;
-    cgroup_frame.parts.cgroup_slice.sample.mem_current = Some(1024);
-    model.absorb_frame(&cgroup_frame);
+
+    // Changing free space alone does not change the static device layout.
+    meminfo::parse(
+        b"MemTotal: 8388608 kB\nMemAvailable: 4194304 kB\nSwapTotal: 0 kB\nSwapFree: 1 kB\n",
+        &mut frame.parts.meminfo.raw,
+    );
+    model.absorb_frame(&frame);
     let view = MemoryView(&model);
+    assert!(
+        !Board::default()
+            .placed(&view, Rect::full(160, 45))
+            .iter()
+            .any(|panel| panel.id.0 == "memory.swap")
+    );
+
+    // A zero-to-nonzero SwapTotal transition is a swapon layout change.
+    meminfo::parse(
+        b"MemTotal: 8388608 kB\nMemAvailable: 4194304 kB\nSwapTotal: 1 kB\nSwapFree: 0 kB\n",
+        &mut frame.parts.meminfo.raw,
+    );
+    model.absorb_frame(&frame);
+    let view = MemoryView(&model);
+    assert!(
+        Board::default()
+            .placed(&view, Rect::full(160, 45))
+            .iter()
+            .any(|panel| panel.id.0 == "memory.swap")
+    );
     let demand = Board::default()
         .demand(&view, Rect::full(160, 45), 1000)
         .collectors;
@@ -257,6 +316,18 @@ fn board_snapshots_cover_size_and_capability_matrix() {
                         Some(thegn_metrics::collect::model::cgroup::Limit::Value(8192));
                     model.absorb_frame(&frame);
                 }
+                let mut telemetry = TelemetryHistory::default();
+                for sample in 0_u32..120 {
+                    telemetry.push(
+                        &StatsSnapshot {
+                            mem_gib: Some((4.0 + (sample % 31) as f32 / 10.0, 8.0)),
+                            swap_gib: Some((0.5 + (sample % 17) as f32 / 10.0, 2.0)),
+                            ..Default::default()
+                        },
+                        1000 + u64::from(sample) * 1000,
+                    );
+                }
+                model.absorb_history(&telemetry, Window::EVERYTHING, ScaleMode::Window, 120_000);
                 model.swap_total = Some(2 * 1024 * 1024 * 1024);
                 model.swap_free = Some(1024 * 1024 * 1024);
                 model.zswap = Some(32 * 1024 * 1024);
@@ -272,9 +343,13 @@ fn board_snapshots_cover_size_and_capability_matrix() {
                 assert!(rendered.contains("Memory"));
                 assert!(rendered.contains("health"));
                 if cols == 240 {
-                    // density follow-up (batch 48)
                     let ratio = fill_ratio(&surface, Rect::full(cols, rows));
-                    assert!(ratio >= 0.30, "fill ratio {ratio:.3}");
+                    // density follow-up (batch 50): estimated, primary sets from the printed value
+                    if level == UnicodeLevel::Ascii {
+                        assert!(ratio >= 0.30, "ASCII fill ratio {ratio:.3}");
+                    } else {
+                        assert!(ratio >= 0.30, "Unicode fill ratio {ratio:.3}");
+                    }
                     assert!(rendered.contains("used / available history"));
                     assert!(rendered.contains("PSI history"));
                     assert!(rendered.contains("direct reclaim history"));
@@ -284,6 +359,7 @@ fn board_snapshots_cover_size_and_capability_matrix() {
                     assert!(rendered.contains("allocstall"));
                     assert!(rendered.contains("Container limit"));
                     assert!(rendered.contains("thegn.slice usage history"));
+                    assert!(rendered.contains("swap history"));
                 }
                 if level == UnicodeLevel::Ascii {
                     assert!(rendered.is_ascii());
@@ -443,4 +519,135 @@ fn memory_history_keeps_only_the_latest_bounded_window() {
     assert_eq!(peak, 124.0);
     assert_eq!(recent[0], 5.0);
     assert_eq!(recent[119], 124.0);
+}
+
+#[test]
+fn short_history_is_right_aligned_without_upsampling() {
+    caps::test_override::with_unicode(UnicodeLevel::Full, || {
+        assert_eq!(super::right_aligned_raster_window(3, 10), (0, 3, 8, 2));
+    });
+    caps::test_override::with_unicode(UnicodeLevel::Ascii, || {
+        assert_eq!(super::right_aligned_raster_window(3, 10), (0, 3, 7, 3));
+    });
+}
+
+#[test]
+fn composition_stacked_history_uses_one_unicode_column_per_sample() {
+    caps::test_override::with_unicode(UnicodeLevel::Full, || {
+        let mut model = MemoryModel::default();
+        model.set_mem_history_for_test(&[
+            0.20, 0.25, 0.30, 0.35, 0.40, 0.45, 0.50, 0.55, 0.60, 0.65,
+        ]);
+        let view = MemoryView(&model);
+        let area = Rect::full(240, 60);
+        let board = Board::default();
+        let panel = board
+            .placed(&view, area)
+            .into_iter()
+            .find(|panel| panel.id.0 == "memory.composition")
+            .expect("composition panel is placed");
+        let mut surface = Surface::new(area.cols, area.rows);
+        board.paint(&view, &mut surface, area, 0, &[]);
+        let lines: Vec<Vec<char>> = text(&surface)
+            .lines()
+            .map(|line| line.chars().collect())
+            .collect();
+        let label_row = lines
+            .iter()
+            .position(|line| {
+                line.iter()
+                    .collect::<String>()
+                    .contains("used / available history")
+            })
+            .expect("composition history label is rendered");
+        let bottom_row = panel.rect.y + panel.rect.rows - 2;
+        assert!(bottom_row > label_row);
+        let row = &lines[bottom_row];
+        let chart = &row[panel.rect.x + 1..panel.rect.x + panel.rect.cols - 1];
+        let painted = chart
+            .iter()
+            .filter(|ch| **ch != ' ' && **ch != '\u{2800}')
+            .count();
+        assert_eq!(painted, 10, "composition history painted {painted} columns");
+    });
+}
+
+#[test]
+fn short_memory_histories_are_right_aligned_by_the_painters() {
+    let mut model = MemoryModel::default();
+    for sample in 0_u64..10 {
+        let mut frame = fixture(true);
+        if let Some(mut some) = frame.parts.psi.memory.file.some {
+            some.avg10 = 100 + sample as u32 * 100;
+            frame.parts.psi.memory.file.some = Some(some);
+        }
+        model.absorb_frame(&frame);
+    }
+    let mut telemetry = TelemetryHistory::default();
+    for sample in 0_u64..10 {
+        telemetry.push(
+            &StatsSnapshot {
+                mem_gib: Some((4.0 + sample as f32 / 10.0, 8.0)),
+                swap_gib: Some((0.5 + sample as f32 / 10.0, 2.0)),
+                ..Default::default()
+            },
+            (sample + 1) * 1000,
+        );
+    }
+    model.absorb_history(&telemetry, Window::EVERYTHING, ScaleMode::Window, 10_000);
+    model.swap_total = Some(2 * 1024 * 1024 * 1024);
+    model.swap_free = Some(1024 * 1024 * 1024);
+    let view = MemoryView(&model);
+    let area = Rect::full(240, 60);
+    let board = Board::default();
+    let placed = board.placed(&view, area);
+    let mut surface = Surface::new(area.cols, area.rows);
+    board.paint(&view, &mut surface, area, 0, &[]);
+    let lines: Vec<Vec<char>> = text(&surface)
+        .lines()
+        .map(|line| line.chars().collect())
+        .collect();
+
+    for (panel_id, label) in [
+        ("memory.composition", "used / available history"),
+        ("memory.pressure", "PSI history"),
+        ("memory.swap", "swap history"),
+    ] {
+        let panel = placed
+            .iter()
+            .find(|panel| panel.id.0 == panel_id)
+            .expect("history panel is placed");
+        let label_row = lines
+            .iter()
+            .position(|line| line.iter().collect::<String>().contains(label))
+            .expect("history label is rendered");
+        let left = panel.rect.x + 1;
+        let right = panel.rect.x + panel.rect.cols - 2;
+        let last_inner_row = panel.rect.y + panel.rect.rows - 2;
+        for (chart_row, line) in lines
+            .iter()
+            .enumerate()
+            .take(last_inner_row + 1)
+            .skip(label_row + 1)
+        {
+            let mut chart = line.clone();
+            chart.resize(area.cols, ' ');
+            assert!(
+                chart[left..left + 3]
+                    .iter()
+                    .all(|ch| *ch == ' ' || *ch == '\u{2800}'),
+                "{label} chart should leave its unused left columns blank on row {chart_row}"
+            );
+        }
+        let mut bottom_row = lines[last_inner_row].clone();
+        bottom_row.resize(area.cols, ' ');
+        assert_ne!(
+            bottom_row[right], ' ',
+            "{label} chart should reach the right edge"
+        );
+        assert_ne!(
+            bottom_row[right], '\u{2800}',
+            "{label} chart should reach the right edge"
+        );
+    }
 }

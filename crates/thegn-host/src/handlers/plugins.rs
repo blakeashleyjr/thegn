@@ -19,6 +19,7 @@ use thegn_core::plugin_api::{
     SupportState, SurfaceId, View,
 };
 use thegn_svc::issue::IssueCaps;
+use thegn_svc::plugin::session::SessionFailure;
 use thegn_svc::plugin::{LoadedPlugin, SessionEvent, SessionWriter};
 
 use crate::chrome::FrameModel;
@@ -31,6 +32,9 @@ const MAX_ALERT_MESSAGE_BYTES: usize = 1024;
 const MAX_FEED_BRIDGES: usize = 8;
 const MAX_SUBSCRIPTIONS_PER_PLUGIN: usize = 64;
 const MAX_PLUGIN_MESSAGES_PER_DRAIN: usize = 256;
+const DISPATCH_QUEUE_CAPACITY: usize = 64;
+const MAX_DISPATCH_IN_FLIGHT_PER_PLUGIN: usize = 8;
+const DISPATCH_DEADLINE: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// Owns a feed worker and its cancellation signal. Dropping the owner cancels
 /// the worker even if the feed is idle and the plugin never reads another frame.
@@ -418,6 +422,18 @@ fn one_shot_status(plugin: &str, contribution: &str, start: OneShotStart) -> Str
 /// Record this drain's raised alerts to the notification inbox, off-loop.
 /// Call after [`drain`] from the event loop (requires a tokio runtime).
 pub(crate) fn flush_alerts(state: &mut PluginsState) {
+    if let Some(dispatcher) = &state.dispatcher {
+        for (plugin, counts) in dispatcher.take_diagnostics() {
+            if counts.rejected > 0
+                || counts.timed_out > 0
+                || counts.unavailable > 0
+                || counts.abandoned > 0
+                || counts.undelivered > 0
+            {
+                tracing::warn!(target: "thegn::plugin", plugin = %plugin, rejected = counts.rejected, timed_out = counts.timed_out, unavailable = counts.unavailable, abandoned = counts.abandoned, undelivered = counts.undelivered, "plugin host.call dispatcher pressure");
+            }
+        }
+    }
     if let Some(inbox) = &state.inbox {
         for (plugin, counts) in inbox.take_diagnostics() {
             if counts.dropped > 0 || counts.rejected > 0 {
@@ -1008,7 +1024,7 @@ fn apply_host_call(state: &mut PluginsState, plugin: &str, msg: RpcMessage) -> P
     let dispatcher = state
         .dispatcher
         .get_or_insert_with(|| Dispatcher::spawn(cfg));
-    dispatcher.dispatch(writer, id, cap, params);
+    dispatcher.dispatch(plugin, writer, id, cap, params);
     PluginDamage::None
 }
 
@@ -1151,72 +1167,334 @@ fn spawn_feed_bridge(cfg: thegn_core::config::Config, writer: SessionWriter) -> 
 // ---------------------------------------------------------------------------
 
 struct DispatchReq {
-    writer: SessionWriter,
+    plugin: String,
+    reply: DispatchReply,
     id: u64,
     cap: String,
     /// Parameters for the capability (path placeholders + body/query), resolved
     /// against the `API_CALLS` route spine.
     params: serde_json::Value,
+    _permit: DispatchPermit,
+}
+
+type DispatchRespond = dyn Fn(&RpcResponse) -> Result<(), SessionFailure> + Send;
+type DispatchIsClosed = dyn Fn() -> bool + Send;
+
+struct DispatchReply {
+    respond: Box<DispatchRespond>,
+    is_closed: Box<DispatchIsClosed>,
+}
+
+impl DispatchReply {
+    fn writer(writer: SessionWriter) -> Self {
+        let respond_writer = writer.clone();
+        Self {
+            respond: Box::new(move |response| respond_writer.respond(response)),
+            is_closed: Box::new(move || writer.is_closed()),
+        }
+    }
+
+    fn respond(&self, response: &RpcResponse) -> Result<(), SessionFailure> {
+        (self.respond)(response)
+    }
+
+    fn is_closed(&self) -> bool {
+        (self.is_closed)()
+    }
+}
+
+struct DispatchPermit {
+    plugin: String,
+    load: Arc<std::sync::Mutex<DispatchLoad>>,
+}
+
+impl Drop for DispatchPermit {
+    fn drop(&mut self) {
+        let mut load = self.load.lock().unwrap_or_else(|error| error.into_inner());
+        load.total = load.total.saturating_sub(1);
+        if let Some(count) = load.per_plugin.get_mut(&self.plugin) {
+            *count = count.saturating_sub(1);
+            if *count == 0 {
+                load.per_plugin.remove(&self.plugin);
+            }
+        }
+    }
+}
+
+fn acquire_dispatch_permit(
+    load: &Arc<std::sync::Mutex<DispatchLoad>>,
+    plugin: &str,
+) -> Option<DispatchPermit> {
+    let mut load_guard = load.lock().unwrap_or_else(|error| error.into_inner());
+    let plugin_count = load_guard
+        .per_plugin
+        .get(plugin)
+        .copied()
+        .unwrap_or_default();
+    if load_guard.total >= DISPATCH_QUEUE_CAPACITY
+        || plugin_count >= MAX_DISPATCH_IN_FLIGHT_PER_PLUGIN
+    {
+        return None;
+    }
+    load_guard.total += 1;
+    *load_guard.per_plugin.entry(plugin.to_owned()).or_default() += 1;
+    Some(DispatchPermit {
+        plugin: plugin.to_owned(),
+        load: Arc::clone(load),
+    })
+}
+
+#[derive(Default)]
+struct DispatchLoad {
+    total: usize,
+    per_plugin: BTreeMap<String, usize>,
+}
+
+#[derive(Default)]
+struct DispatchDiagnostics {
+    rejected: usize,
+    timed_out: usize,
+    unavailable: usize,
+    abandoned: usize,
+    undelivered: usize,
+}
+
+#[derive(Default)]
+struct DispatchDiagnosticsByPlugin(BTreeMap<String, DispatchDiagnostics>);
+
+impl DispatchDiagnosticsByPlugin {
+    fn record(&mut self, plugin: &str, update: impl FnOnce(&mut DispatchDiagnostics)) {
+        update(self.0.entry(plugin.to_owned()).or_default());
+    }
+
+    fn take(&mut self) -> BTreeMap<String, DispatchDiagnostics> {
+        std::mem::take(&mut self.0)
+    }
 }
 
 /// One background thread owning a current-thread tokio runtime + the control
 /// client, answering plugins directly through their [`SessionWriter`]s (never
-/// re-entering the event loop).
+/// re-entering the event loop). A worker panic can still drop already-queued
+/// requests; subsequent requests observe a disconnected channel and get `Other`.
 pub(crate) struct Dispatcher {
-    tx: std::sync::mpsc::Sender<DispatchReq>,
+    tx: std::sync::mpsc::SyncSender<DispatchReq>,
+    load: Arc<std::sync::Mutex<DispatchLoad>>,
+    diagnostics: Arc<std::sync::Mutex<DispatchDiagnosticsByPlugin>>,
 }
 
 impl Dispatcher {
     fn spawn(cfg: thegn_core::config::Config) -> Self {
-        let (tx, rx) = std::sync::mpsc::channel::<DispatchReq>();
+        let cfg = Arc::new(cfg);
+        Self::spawn_with(DISPATCH_DEADLINE, move |cap, params| {
+            let cfg = Arc::clone(&cfg);
+            Box::pin(async move { dispatch_one(&cfg, &cap, params).await })
+        })
+    }
+
+    fn spawn_with(
+        deadline: std::time::Duration,
+        dispatch: impl Fn(String, serde_json::Value) -> DispatchFuture + Send + 'static,
+    ) -> Self {
+        let (tx, rx) = std::sync::mpsc::sync_channel::<DispatchReq>(DISPATCH_QUEUE_CAPACITY);
+        let load = Arc::new(std::sync::Mutex::new(DispatchLoad::default()));
+        let diagnostics = Arc::new(std::sync::Mutex::new(DispatchDiagnosticsByPlugin::default()));
+        let worker_diagnostics = Arc::clone(&diagnostics);
+        let rt = match tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+        {
+            Ok(rt) => rt,
+            Err(error) => {
+                tracing::warn!(target: "thegn::plugin", error = %error, "dispatcher runtime failed");
+                return Self {
+                    tx,
+                    load,
+                    diagnostics,
+                };
+            }
+        };
         let spawn = std::thread::Builder::new()
             .name("thegn-plugin-dispatch".into())
             .spawn(move || {
                 // Utility: plugin host.call round-trips back visible plugin content.
                 crate::platform::qos::set_self(crate::platform::qos::Qos::Utility);
-                let rt = match tokio::runtime::Builder::new_current_thread()
-                    .enable_all()
-                    .build()
-                {
-                    Ok(rt) => rt,
-                    Err(e) => {
-                        tracing::warn!(target: "thegn::plugin", error = %e, "dispatcher runtime failed");
-                        return;
-                    }
-                };
                 while let Ok(req) = rx.recv() {
                     let DispatchReq {
-                        writer,
+                        plugin,
+                        reply,
                         id,
                         cap,
                         params,
+                        _permit,
                     } = req;
-                    let resp = match rt.block_on(dispatch_one(&cfg, &cap, params)) {
-                        Ok(v) => RpcResponse::ok(id, v),
-                        Err(e) => RpcResponse::err(id, e),
+                    if reply.is_closed() {
+                        worker_diagnostics
+                            .lock()
+                            .unwrap_or_else(|error| error.into_inner())
+                            .record(&plugin, |counts| counts.abandoned += 1);
+                        drop(_permit);
+                        continue;
+                    }
+                    // Timeout cancels this local future. Synchronous setup before its first
+                    // await may already have run, and a daemon mutation may have completed.
+                    let response = match rt.block_on(async {
+                        tokio::time::timeout(deadline, dispatch(cap, params)).await
+                    }) {
+                        Ok(Ok(value)) => RpcResponse::ok(id, value),
+                        Ok(Err(error)) => RpcResponse::err(id, error),
+                        Err(_) => {
+                            worker_diagnostics
+                                .lock()
+                                .unwrap_or_else(|error| error.into_inner())
+                                .record(&plugin, |counts| counts.timed_out += 1);
+                            RpcResponse::err(
+                                id,
+                                RpcError::new(RpcErrorCode::Timeout, "host.call timed out"),
+                            )
+                        }
                     };
+                    drop(_permit);
                     // best-effort: the session may have died mid-dispatch.
-                    let _ = writer.respond(&resp);
+                    if let Err(error) = reply.respond(&response) {
+                        let mut diagnostics = worker_diagnostics
+                            .lock()
+                            .unwrap_or_else(|error| error.into_inner());
+                        match error {
+                            SessionFailure::Full | SessionFailure::TooLarge => {
+                                diagnostics.record(&plugin, |counts| counts.undelivered += 1);
+                            }
+                            SessionFailure::Closed => {
+                                diagnostics.record(&plugin, |counts| counts.abandoned += 1);
+                            }
+                        }
+                        tracing::debug!(target: "thegn::plugin", error = %error, "host.call response writer is gone");
+                    }
                 }
             });
         if let Err(e) = spawn {
             tracing::warn!(target: "thegn::plugin", error = %e, "dispatcher thread failed to start");
         }
-        Self { tx }
+        Self {
+            tx,
+            load,
+            diagnostics,
+        }
     }
 
-    fn dispatch(&self, writer: SessionWriter, id: u64, cap: String, params: serde_json::Value) {
-        // best-effort: a dead dispatcher thread means the daemon reply is lost;
-        // the plugin's request times out on its own side.
-        // best-effort: send: the consumer may be gone; a closed channel is the consumer going away
-        let _ = self.tx.send(DispatchReq {
-            writer,
+    fn dispatch(
+        &self,
+        plugin: &str,
+        writer: SessionWriter,
+        id: u64,
+        cap: String,
+        params: serde_json::Value,
+    ) {
+        self.dispatch_with_reply(plugin, DispatchReply::writer(writer), id, cap, params);
+    }
+
+    fn dispatch_with_reply(
+        &self,
+        plugin: &str,
+        reply: DispatchReply,
+        id: u64,
+        cap: String,
+        params: serde_json::Value,
+    ) {
+        let Some(permit) = acquire_dispatch_permit(&self.load, plugin) else {
+            self.record(plugin, |counts| counts.rejected += 1);
+            self.answer_error(
+                plugin,
+                &reply,
+                id,
+                RpcErrorCode::RateLimited,
+                "host.call dispatcher is full",
+            );
+            return;
+        };
+        let req = DispatchReq {
+            plugin: plugin.to_owned(),
+            reply,
             id,
             cap,
             params,
-        });
+            _permit: permit,
+        };
+        match self.tx.try_send(req) {
+            Ok(()) => {}
+            Err(std::sync::mpsc::TrySendError::Full(req)) => {
+                self.record(&req.plugin, |counts| counts.rejected += 1);
+                self.answer_error(
+                    &req.plugin,
+                    &req.reply,
+                    req.id,
+                    RpcErrorCode::RateLimited,
+                    "host.call dispatcher is full",
+                );
+                drop(req);
+            }
+            Err(std::sync::mpsc::TrySendError::Disconnected(req)) => {
+                self.record(&req.plugin, |counts| counts.unavailable += 1);
+                self.answer_error(
+                    &req.plugin,
+                    &req.reply,
+                    req.id,
+                    RpcErrorCode::Other,
+                    "host.call dispatcher stopped",
+                );
+                drop(req);
+            }
+        }
+    }
+
+    fn record(&self, plugin: &str, update: impl FnOnce(&mut DispatchDiagnostics)) {
+        self.diagnostics
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .record(plugin, update);
+    }
+
+    fn answer_error(
+        &self,
+        plugin: &str,
+        reply: &DispatchReply,
+        id: u64,
+        code: RpcErrorCode,
+        message: &str,
+    ) {
+        if let Err(error) = reply.respond(&RpcResponse::err(id, RpcError::new(code, message))) {
+            match error {
+                SessionFailure::Full | SessionFailure::TooLarge => {
+                    self.record(plugin, |counts| counts.undelivered += 1);
+                }
+                SessionFailure::Closed => {
+                    self.record(plugin, |counts| counts.abandoned += 1);
+                }
+            }
+            tracing::debug!(target: "thegn::plugin", error = %error, "host.call rejection response writer is gone");
+        }
+    }
+
+    fn take_diagnostics(&self) -> BTreeMap<String, DispatchDiagnostics> {
+        self.diagnostics
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .take()
+    }
+
+    #[cfg(test)]
+    fn disconnected() -> Self {
+        let (tx, rx) = std::sync::mpsc::sync_channel::<DispatchReq>(DISPATCH_QUEUE_CAPACITY);
+        drop(rx);
+        Self {
+            tx,
+            load: Arc::new(std::sync::Mutex::new(DispatchLoad::default())),
+            diagnostics: Arc::new(std::sync::Mutex::new(DispatchDiagnosticsByPlugin::default())),
+        }
     }
 }
+
+type DispatchFuture =
+    std::pin::Pin<Box<dyn std::future::Future<Output = Result<serde_json::Value, RpcError>>>>;
 
 /// Run one dispatched capability against the pane daemon's control API,
 /// generically: resolve `(method, path, body)` from the catalog + `API_CALLS`
@@ -1247,6 +1525,265 @@ mod tests {
     use thegn_core::plugin_api::{
         ApiVersion, CadenceHint, ContributionId, PluginManifest, Span, StyleRole,
     };
+
+    fn test_reply() -> (DispatchReply, std::sync::mpsc::Receiver<RpcResponse>) {
+        let (tx, rx) = std::sync::mpsc::channel();
+        (
+            DispatchReply {
+                respond: Box::new(move |response| {
+                    tx.send(response.clone())
+                        .map_err(|_| SessionFailure::Closed)
+                }),
+                is_closed: Box::new(|| false),
+            },
+            rx,
+        )
+    }
+
+    fn never_dispatch(_: String, _: serde_json::Value) -> DispatchFuture {
+        Box::pin(std::future::pending())
+    }
+
+    fn dispatch_request(
+        dispatcher: &Dispatcher,
+        plugin: &str,
+        id: u64,
+    ) -> std::sync::mpsc::Receiver<RpcResponse> {
+        let (reply, response) = test_reply();
+        dispatcher.dispatch_with_reply(
+            plugin,
+            reply,
+            id,
+            "test.cap".into(),
+            serde_json::Value::Null,
+        );
+        response
+    }
+
+    #[test]
+    fn dispatcher_admission_is_bounded_and_plugin_fair() {
+        let load = Arc::new(std::sync::Mutex::new(DispatchLoad::default()));
+        let mut plugin_a = (0..MAX_DISPATCH_IN_FLIGHT_PER_PLUGIN)
+            .map(|_| acquire_dispatch_permit(&load, "plugin-a").expect("within per-plugin cap"))
+            .collect::<Vec<_>>();
+
+        assert!(acquire_dispatch_permit(&load, "plugin-a").is_none());
+        let plugin_b = acquire_dispatch_permit(&load, "plugin-b");
+        assert!(
+            plugin_b.is_some(),
+            "plugin A cannot consume plugin B's limit"
+        );
+
+        drop(plugin_a.pop());
+        assert!(acquire_dispatch_permit(&load, "plugin-a").is_some());
+        drop(plugin_a);
+        drop(plugin_b);
+        let load = load.lock().unwrap_or_else(|error| error.into_inner());
+        assert_eq!(load.total, 0);
+        assert!(load.per_plugin.is_empty());
+    }
+
+    #[test]
+    fn dispatcher_global_admission_is_bounded() {
+        let load = Arc::new(std::sync::Mutex::new(DispatchLoad::default()));
+        let permits = (0..DISPATCH_QUEUE_CAPACITY)
+            .map(|index| acquire_dispatch_permit(&load, &format!("plugin-{index}")))
+            .collect::<Option<Vec<_>>>()
+            .expect("global capacity is available");
+
+        assert!(acquire_dispatch_permit(&load, "another-plugin").is_none());
+        drop(permits);
+        assert!(acquire_dispatch_permit(&load, "another-plugin").is_some());
+    }
+
+    #[test]
+    fn dispatcher_diagnostics_are_taken_once_per_drain() {
+        let mut diagnostics = DispatchDiagnosticsByPlugin::default();
+        diagnostics.record("plugin-a", |counts| counts.rejected += 2);
+        diagnostics.record("plugin-a", |counts| counts.timed_out += 1);
+
+        let drained = diagnostics.take();
+        let counts = drained.get("plugin-a").expect("recorded plugin");
+        assert_eq!(counts.rejected, 2);
+        assert_eq!(counts.timed_out, 1);
+        assert!(diagnostics.take().is_empty());
+    }
+
+    #[test]
+    fn dispatcher_replies_rate_limited_and_admits_other_plugins() {
+        let (release, waiting) = tokio::sync::watch::channel(false);
+        let dispatcher = Dispatcher::spawn_with(std::time::Duration::from_secs(10), move |_, _| {
+            let mut waiting = waiting.clone();
+            Box::pin(async move {
+                waiting
+                    .changed()
+                    .await
+                    .map_err(|error| RpcError::new(RpcErrorCode::Other, error.to_string()))?;
+                Ok(serde_json::Value::Null)
+            })
+        });
+        let in_flight = (0..MAX_DISPATCH_IN_FLIGHT_PER_PLUGIN)
+            .map(|id| dispatch_request(&dispatcher, "plugin-a", id as u64))
+            .collect::<Vec<_>>();
+
+        let rejected = dispatch_request(&dispatcher, "plugin-a", 99);
+        let response = rejected
+            .recv_timeout(std::time::Duration::from_millis(500))
+            .expect("rate limit response is immediate");
+        assert_eq!(
+            response.error.expect("error response").code,
+            RpcErrorCode::RateLimited
+        );
+        let admitted_b = dispatch_request(&dispatcher, "plugin-b", 100);
+        assert!(
+            dispatcher
+                .load
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .per_plugin
+                .contains_key("plugin-b")
+        );
+
+        // Exercise the actual dispatch rejection path twice, then prove diagnostics flush once.
+        let rejected_again = dispatch_request(&dispatcher, "plugin-a", 101);
+        assert_eq!(
+            rejected_again
+                .recv_timeout(std::time::Duration::from_millis(500))
+                .expect("second rejection")
+                .error
+                .expect("error response")
+                .code,
+            RpcErrorCode::RateLimited
+        );
+        let counts = dispatcher.take_diagnostics();
+        assert_eq!(
+            counts.get("plugin-a").expect("plugin diagnostics").rejected,
+            2
+        );
+        assert!(dispatcher.take_diagnostics().is_empty());
+
+        release.send(true).expect("workers are waiting");
+        for response in in_flight.iter().chain(std::iter::once(&admitted_b)) {
+            response
+                .recv_timeout(std::time::Duration::from_secs(2))
+                .expect("released dispatch completes");
+        }
+        assert_eq!(
+            dispatcher
+                .load
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .total,
+            0
+        );
+    }
+
+    #[test]
+    fn dispatcher_timeout_replies_and_releases_permit() {
+        let dispatcher =
+            Dispatcher::spawn_with(std::time::Duration::from_millis(50), never_dispatch);
+        let response = dispatch_request(&dispatcher, "plugin-a", 1)
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .expect("timeout response");
+        assert_eq!(
+            response.error.expect("error response").code,
+            RpcErrorCode::Timeout
+        );
+        assert_eq!(
+            dispatcher
+                .load
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .total,
+            0
+        );
+    }
+
+    #[test]
+    fn disconnected_dispatcher_answers_other() {
+        let dispatcher = Dispatcher::disconnected();
+        let response = dispatch_request(&dispatcher, "plugin-a", 1)
+            .recv_timeout(std::time::Duration::from_millis(500))
+            .expect("disconnected response");
+        assert_eq!(
+            response.error.expect("error response").code,
+            RpcErrorCode::Other
+        );
+    }
+
+    #[test]
+    fn dispatcher_skips_closed_sessions_and_counts_undelivered_replies() {
+        let called = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let dispatch_called = Arc::clone(&called);
+        let (completed, completion) = std::sync::mpsc::channel();
+        let dispatcher = Dispatcher::spawn_with(std::time::Duration::from_secs(2), move |_, _| {
+            dispatch_called.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let completed = completed.clone();
+            Box::pin(async move {
+                completed.send(()).expect("test is listening");
+                Ok(serde_json::Value::Null)
+            })
+        });
+        let closed = DispatchReply {
+            respond: Box::new(|_| Err(SessionFailure::Closed)),
+            is_closed: Box::new(|| true),
+        };
+        dispatcher.dispatch_with_reply(
+            "plugin-a",
+            closed,
+            1,
+            "test.cap".into(),
+            serde_json::Value::Null,
+        );
+        let (replied, response) = std::sync::mpsc::channel();
+        let reply = DispatchReply {
+            respond: Box::new(move |_| {
+                replied.send(()).expect("test is listening");
+                Err(SessionFailure::Full)
+            }),
+            is_closed: Box::new(|| false),
+        };
+        dispatcher.dispatch_with_reply(
+            "plugin-b",
+            reply,
+            2,
+            "test.cap".into(),
+            serde_json::Value::Null,
+        );
+        completion
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .expect("later request passes the abandoned one");
+        response
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .expect("later dispatch reaches reply sink");
+        dispatch_request(&dispatcher, "plugin-c", 3)
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .expect("FIFO barrier completes after diagnostics update");
+        assert_eq!(called.load(std::sync::atomic::Ordering::SeqCst), 2);
+        let diagnostics = dispatcher.take_diagnostics();
+        assert_eq!(
+            diagnostics
+                .get("plugin-a")
+                .expect("abandoned count")
+                .abandoned,
+            1
+        );
+        assert_eq!(
+            diagnostics
+                .get("plugin-b")
+                .expect("undelivered count")
+                .undelivered,
+            1
+        );
+        assert_eq!(
+            dispatcher
+                .load
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .total,
+            0
+        );
+    }
 
     fn contribution(id: &str, ep: ExtensionPoint, surface: &str, label: &str) -> Contribution {
         Contribution {

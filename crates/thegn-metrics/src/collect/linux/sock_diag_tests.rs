@@ -113,6 +113,7 @@ fn truncated_tcp_info_keeps_complete_rtt_fields_only() {
             total_retrans: None,
             bytes_acked: None,
             bytes_received: None,
+            last_data_recv_ms: Some(0),
         })
     );
 }
@@ -128,6 +129,7 @@ fn non_word_aligned_tcp_info_cut_keeps_only_complete_fields() {
     assert_eq!(info.total_retrans, None);
     assert_eq!(info.bytes_acked, None);
     assert_eq!(info.bytes_received, None);
+    assert_eq!(info.last_data_recv_ms, Some(0));
 }
 
 #[test]
@@ -170,9 +172,10 @@ fn stale_done_does_not_end_current_sequence_dump() {
     bytes.extend_from_slice(&frame(20, 4, &response(AddressFamily::Ipv4, 0)));
     bytes.extend_from_slice(&frame(libc::NLMSG_DONE as u16, 4, &[]));
     let mut rows = Vec::new();
-    let (done, malformed) = super::consume_batch(&bytes, 4, &mut rows).unwrap();
+    let (done, malformed, truncated) = super::consume_batch(&bytes, 4, &mut rows).unwrap();
     assert!(done);
     assert_eq!(malformed, 0);
+    assert!(!truncated);
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0].source, IpAddr::V4(Ipv4Addr::LOCALHOST));
 }
@@ -197,4 +200,30 @@ fn malformed_diag_rows_are_counted_for_the_dump_result() {
     assert!(done);
     assert!(rows.is_empty());
     assert_eq!(stats.malformed, 2);
+}
+
+#[test]
+fn last_data_recv_is_length_checked_at_its_uapi_offset() {
+    let short = decode(&response(AddressFamily::Ipv4, 55));
+    assert_eq!(short.info.unwrap().last_data_recv_ms, None);
+    let complete = decode(&response(AddressFamily::Ipv4, 56));
+    assert_eq!(complete.info.unwrap().last_data_recv_ms, Some(0));
+}
+
+#[test]
+fn dump_rows_stop_at_the_fixed_socket_cap_and_report_truncation() {
+    let mut bytes = Vec::new();
+    let row = response(AddressFamily::Ipv4, 0);
+    for _ in 0..super::MAX_TCP_SOCKETS {
+        bytes.extend_from_slice(&frame(20, 8, &row));
+    }
+    // Once the cap is reached this malformed payload must be skipped without decoding.
+    bytes.extend_from_slice(&frame(20, 8, &[1, 2, 3]));
+    bytes.extend_from_slice(&frame(libc::NLMSG_DONE as u16, 8, &[]));
+    let mut rows = Vec::new();
+    let (done, malformed, truncated) = super::consume_batch(&bytes, 8, &mut rows).unwrap();
+    assert!(done);
+    assert_eq!(malformed, 0);
+    assert!(truncated);
+    assert_eq!(rows.len(), super::MAX_TCP_SOCKETS);
 }
