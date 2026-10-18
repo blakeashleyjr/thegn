@@ -106,7 +106,10 @@ impl Emitter {
     /// Writes cells directly, bypassing the Surface change log and line seqno.
     /// Host frame paths diff cells (`diff_region`/`diff_screens` and
     /// `draw_from_screen`), and image placements in overwritten cells are
-    /// dropped because the host draws images out of band.
+    /// dropped because the host draws images out of band. For 1–4 rows,
+    /// `screen_cells()` needs one row-table allocation and no growth
+    /// reallocations; beyond 4 rows, Vec doubling adds
+    /// `ceil(log2(rows / 4))` reallocations.
     pub fn emit(&mut self, grid: &CellGrid, src: Rect, surface: &mut Surface, x: usize, y: usize) {
         self.rebuild();
         let (surface_cols, surface_rows) = surface.dimensions();
