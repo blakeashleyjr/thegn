@@ -582,7 +582,7 @@ fn cores_panel_is_absent_without_core_temperatures() {
                     .is_some_and(|label| label.starts_with("core"))
             })
             .collect::<Vec<_>>();
-        let mut filtered = (**layout).clone();
+        let mut filtered = (*layout).clone();
         filtered.sensors = retained
             .iter()
             .map(|(_, sensor)| (**sensor).clone())
