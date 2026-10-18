@@ -38,7 +38,6 @@ pub struct CookieDelta {
     generation: u64,
     totals: Vec<(u64, u64, u64)>,
     ids: Vec<u64>,
-    #[cfg(test)]
     probes_last_update: usize,
 }
 
@@ -55,10 +54,7 @@ impl CookieDelta {
         self.entries = None;
         self.scratch = None;
         self.tombstones = 0;
-        #[cfg(test)]
-        {
-            self.probes_last_update = 0;
-        }
+        self.probes_last_update = 0;
         self.generation = 0;
         self.totals.clear();
         self.ids.clear();
@@ -81,10 +77,7 @@ impl CookieDelta {
         self.scratch.get_or_insert_with(|| {
             vec![CookieEntry::default(); COOKIE_CAPACITY].into_boxed_slice()
         });
-        #[cfg(test)]
-        {
-            self.probes_last_update = 0;
-        }
+        self.probes_last_update = 0;
         self.generation = self.generation.wrapping_add(1).max(1);
         let generation = self.generation;
         self.totals.clear();
@@ -100,19 +93,15 @@ impl CookieDelta {
                 continue;
             };
             let index = hash_cookie(cookie) % entries.len();
-            #[cfg_attr(not(test), allow(unused_variables))]
             let (slot, probes) = find_slot(entries, index, cookie);
-            #[cfg(test)]
-            {
-                self.probes_last_update += probes;
-            }
+            self.probes_last_update += probes;
             let Some(slot) = slot else {
                 truncated = true;
                 continue;
             };
             let entry = &mut entries[slot];
             if entry.tombstone {
-                self.tombstones -= 1;
+                self.tombstones = self.tombstones.saturating_sub(1);
             }
             let (rx_delta, tx_delta) = if entry.occupied && entry.cookie == cookie {
                 (rx.saturating_sub(entry.rx), tx.saturating_sub(entry.tx))
@@ -241,7 +230,7 @@ fn find_slot(entries: &[CookieEntry], start: usize, cookie: u64) -> (Option<usiz
     (tombstone, entries.len())
 }
 
-fn rebuild_cookie_table(entries: &mut [CookieEntry], scratch: &mut [CookieEntry]) {
+fn rebuild_cookie_table(entries: &mut Box<[CookieEntry]>, scratch: &mut Box<[CookieEntry]>) {
     scratch.fill(CookieEntry::default());
     for entry in entries.iter().filter(|entry| entry.occupied) {
         let start = hash_cookie(entry.cookie) % scratch.len();
@@ -254,8 +243,7 @@ fn rebuild_cookie_table(entries: &mut [CookieEntry], scratch: &mut [CookieEntry]
             ..*entry
         };
     }
-    entries.swap_with_slice(scratch);
-    scratch.fill(CookieEntry::default());
+    std::mem::swap(entries, scratch);
 }
 
 /// Small filesystem seam used by the bounded cgroup-id walk and its tests.
