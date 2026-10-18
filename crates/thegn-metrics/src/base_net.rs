@@ -204,7 +204,6 @@ mod tests {
     #[test]
     fn holds_the_open_file_and_reads_once_per_sample() {
         let dir = tempfile::Builder::new()
-            .permissions(0o700)
             .tempdir()
             .unwrap();
         let path = dir.path().join("net.dev");
@@ -238,7 +237,6 @@ mod tests {
     #[test]
     fn unavailable_source_stays_absent_until_a_slow_retry() {
         let dir = tempfile::Builder::new()
-            .permissions(0o700)
             .tempdir()
             .unwrap();
         let path = dir.path().join("net.dev");
