@@ -602,6 +602,7 @@ impl HostContract {
         &self,
         manifest: &PluginManifest,
     ) -> Result<NegotiatedManifest, PluginApiError> {
+        validate_manifest_bounds(manifest)?;
         if manifest.api.major != self.api_version.major
             || manifest.api.minor > self.api_version.minor
         {
@@ -755,6 +756,132 @@ pub const MAX_EVENT_PAYLOAD_BYTES: usize = 64 * 1024;
 pub const MAX_VIEW_ROWS: usize = 256;
 pub const MAX_VIEW_SPANS: usize = 4096;
 pub const MAX_VIEW_TEXT_BYTES: usize = 128 * 1024;
+pub const MAX_MANIFEST_CONTRIBUTIONS: usize = 64;
+pub const MAX_MANIFEST_METADATA_ENTRIES: usize = 32;
+pub const MAX_MANIFEST_METADATA_KEY_BYTES: usize = 256;
+pub const MAX_MANIFEST_METADATA_VALUE_BYTES: usize = 1024;
+pub const MAX_MANIFEST_CONTRIBUTION_LABEL_BYTES: usize = 256;
+pub const MAX_MANIFEST_CONTRIBUTION_CAPS_BYTES: usize = 4 * 1024;
+pub const MAX_MANIFEST_CONTRIBUTION_CHORD_BYTES: usize = 256;
+pub const MAX_PLUGIN_IDENTIFIER_BYTES: usize = 128;
+pub const MAX_MANIFEST_CAPABILITIES: usize = 64;
+pub const MAX_ALERT_SOURCE_BYTES: usize = 128;
+pub const MAX_ALERT_MESSAGE_BYTES: usize = 4 * 1024;
+pub const MAX_PLUGIN_SUBSCRIPTIONS: usize = 64;
+pub const MAX_EVENT_KIND_BYTES: usize = 128;
+pub const MAX_PLUGIN_SURFACES: usize = MAX_MANIFEST_CONTRIBUTIONS;
+pub const MAX_PLUGIN_RETAINED_BYTES: usize = 8 * 1024 * 1024;
+
+fn validate_manifest_bounds(manifest: &PluginManifest) -> Result<(), PluginApiError> {
+    for (what, size) in [
+        ("plugin identifier bytes", manifest.id.as_str().len()),
+        ("plugin name bytes", manifest.name.len()),
+        ("plugin version bytes", manifest.version.len()),
+    ] {
+        if size > MAX_PLUGIN_IDENTIFIER_BYTES {
+            return Err(quota_error(what, size, MAX_PLUGIN_IDENTIFIER_BYTES));
+        }
+    }
+    if manifest.contributions.len() > MAX_MANIFEST_CONTRIBUTIONS {
+        return Err(quota_error(
+            "manifest contributions",
+            manifest.contributions.len(),
+            MAX_MANIFEST_CONTRIBUTIONS,
+        ));
+    }
+    if manifest.capabilities.len() > MAX_MANIFEST_CAPABILITIES {
+        return Err(quota_error(
+            "manifest capabilities",
+            manifest.capabilities.len(),
+            MAX_MANIFEST_CAPABILITIES,
+        ));
+    }
+    for capability in &manifest.capabilities {
+        if capability.as_str().len() > MAX_PLUGIN_IDENTIFIER_BYTES {
+            return Err(quota_error(
+                "capability identifier bytes",
+                capability.as_str().len(),
+                MAX_PLUGIN_IDENTIFIER_BYTES,
+            ));
+        }
+    }
+    for contribution in &manifest.contributions {
+        if contribution.label.len() > MAX_MANIFEST_CONTRIBUTION_LABEL_BYTES {
+            return Err(quota_error(
+                "contribution label bytes",
+                contribution.label.len(),
+                MAX_MANIFEST_CONTRIBUTION_LABEL_BYTES,
+            ));
+        }
+        if let Some(chord) = &contribution.chord
+            && chord.len() > MAX_MANIFEST_CONTRIBUTION_CHORD_BYTES
+        {
+            return Err(quota_error(
+                "contribution chord bytes",
+                chord.len(),
+                MAX_MANIFEST_CONTRIBUTION_CHORD_BYTES,
+            ));
+        }
+        match json_footprint(&contribution.caps, MAX_PLUGIN_JSON_DEPTH) {
+            Ok(size) if size <= MAX_MANIFEST_CONTRIBUTION_CAPS_BYTES => {}
+            Ok(size) => {
+                return Err(quota_error(
+                    "contribution caps bytes",
+                    size,
+                    MAX_MANIFEST_CONTRIBUTION_CAPS_BYTES,
+                ));
+            }
+            Err(QuotaBreach::Depth) => {
+                return Err(quota_error(
+                    "contribution caps depth",
+                    MAX_PLUGIN_JSON_DEPTH + 1,
+                    MAX_PLUGIN_JSON_DEPTH,
+                ));
+            }
+        }
+        for (what, size) in [
+            (
+                "contribution identifier bytes",
+                contribution.id.as_str().len(),
+            ),
+            (
+                "surface identifier bytes",
+                contribution
+                    .surface
+                    .as_ref()
+                    .map_or(0, |surface| surface.as_str().len()),
+            ),
+        ] {
+            if size > MAX_PLUGIN_IDENTIFIER_BYTES {
+                return Err(quota_error(what, size, MAX_PLUGIN_IDENTIFIER_BYTES));
+            }
+        }
+        if contribution.metadata.len() > MAX_MANIFEST_METADATA_ENTRIES {
+            return Err(quota_error(
+                "contribution metadata entries",
+                contribution.metadata.len(),
+                MAX_MANIFEST_METADATA_ENTRIES,
+            ));
+        }
+        for (key, value) in &contribution.metadata {
+            if key.len() > MAX_MANIFEST_METADATA_KEY_BYTES {
+                return Err(quota_error(
+                    "contribution metadata key bytes",
+                    key.len(),
+                    MAX_MANIFEST_METADATA_KEY_BYTES,
+                ));
+            }
+            if value.len() > MAX_MANIFEST_METADATA_VALUE_BYTES {
+                return Err(quota_error(
+                    "contribution metadata value bytes",
+                    value.len(),
+                    MAX_MANIFEST_METADATA_VALUE_BYTES,
+                ));
+            }
+        }
+    }
+    Ok(())
+}
 
 #[derive(Debug, Clone)]
 pub struct AuditLogEntry {
@@ -869,6 +996,8 @@ pub struct PluginRuntime {
     subscriptions: std::collections::HashSet<(PluginId, EventKind)>,
     registered_contributions: std::collections::HashSet<ContributionId>,
     events: Vec<Event>,
+    event_bytes: usize,
+    view_bytes: usize,
     events_evicted: u64,
     surface_caps: BTreeMap<SurfaceId, Capability>,
     views: SurfaceCache,
@@ -897,6 +1026,8 @@ impl PluginRuntime {
             subscriptions: Default::default(),
             registered_contributions: Default::default(),
             events: Default::default(),
+            event_bytes: 0,
+            view_bytes: 0,
             events_evicted: 0,
             surface_caps,
             views: SurfaceCache::default(),
@@ -955,7 +1086,31 @@ impl PluginRuntime {
     }
 
     pub fn subscribe(&mut self, plugin: PluginId, kind: EventKind) -> Result<(), PluginApiError> {
-        self.subscriptions.insert((plugin, kind));
+        let kind_bytes = event_kind_bytes(&kind);
+        if kind_bytes > MAX_EVENT_KIND_BYTES {
+            return Err(quota_error(
+                "event kind bytes",
+                kind_bytes,
+                MAX_EVENT_KIND_BYTES,
+            ));
+        }
+        let key = (plugin.clone(), kind);
+        if self.subscriptions.contains(&key) {
+            return Ok(());
+        }
+        let plugin_count = self
+            .subscriptions
+            .iter()
+            .filter(|(subscribed_plugin, _)| subscribed_plugin == &plugin)
+            .count();
+        if plugin_count >= MAX_PLUGIN_SUBSCRIPTIONS {
+            return Err(quota_error(
+                "plugin subscriptions",
+                plugin_count.saturating_add(1),
+                MAX_PLUGIN_SUBSCRIPTIONS,
+            ));
+        }
+        self.subscriptions.insert(key);
         Ok(())
     }
 
@@ -969,6 +1124,14 @@ impl PluginRuntime {
         surface: SurfaceId,
         view: View,
     ) -> Result<UpdateResult, PluginApiError> {
+        let surface_bytes = surface.as_str().len();
+        if surface_bytes > MAX_PLUGIN_IDENTIFIER_BYTES {
+            return Err(quota_error(
+                "surface identifier bytes",
+                surface_bytes,
+                MAX_PLUGIN_IDENTIFIER_BYTES,
+            ));
+        }
         let cap = self
             .surface_caps
             .get(&surface)
@@ -989,6 +1152,35 @@ impl PluginRuntime {
                 MAX_VIEW_TEXT_BYTES,
             ));
         }
+        if !self.views.surfaces.contains_key(&surface)
+            && self.views.surfaces.len() >= MAX_PLUGIN_SURFACES
+        {
+            return Err(quota_error(
+                "plugin surfaces",
+                self.views.surfaces.len().saturating_add(1),
+                MAX_PLUGIN_SURFACES,
+            ));
+        }
+        let new_view_bytes =
+            retained_surface_bytes_from_footprint(&surface, (rows, spans, text_bytes));
+        let old_view_bytes = self.views.retained_surface_bytes(&surface);
+        let non_event_retained = self
+            .state_bytes
+            .saturating_add(self.view_bytes)
+            .saturating_sub(old_view_bytes)
+            .saturating_add(new_view_bytes);
+        if non_event_retained > MAX_PLUGIN_RETAINED_BYTES {
+            return Err(quota_error(
+                "plugin retained bytes",
+                non_event_retained,
+                MAX_PLUGIN_RETAINED_BYTES,
+            ));
+        }
+        self.evict_events_to_fit(MAX_PLUGIN_RETAINED_BYTES - non_event_retained);
+        self.view_bytes = self
+            .view_bytes
+            .saturating_sub(old_view_bytes)
+            .saturating_add(new_view_bytes);
         Ok(self.views.update(surface, view))
     }
 
@@ -1016,7 +1208,15 @@ impl PluginRuntime {
     }
 
     pub fn emit(&mut self, _plugin: PluginId, event: Event) -> Result<(), PluginApiError> {
-        match json_footprint(&event.payload, MAX_PLUGIN_JSON_DEPTH) {
+        let event_kind_bytes = event_kind_bytes(&event.kind);
+        if event_kind_bytes > MAX_EVENT_KIND_BYTES {
+            return Err(quota_error(
+                "event kind bytes",
+                event_kind_bytes,
+                MAX_EVENT_KIND_BYTES,
+            ));
+        }
+        let payload_bytes = match json_footprint(&event.payload, MAX_PLUGIN_JSON_DEPTH) {
             Err(QuotaBreach::Depth) => {
                 return Err(quota_error(
                     "event payload depth",
@@ -1031,15 +1231,46 @@ impl PluginRuntime {
                     MAX_EVENT_PAYLOAD_BYTES,
                 ));
             }
-            _ => {}
+            Ok(size) => size,
+        };
+        let event_bytes = retained_event_bytes(&event, payload_bytes);
+        let non_event_retained = self.state_bytes.saturating_add(self.view_bytes);
+        if non_event_retained.saturating_add(event_bytes) > MAX_PLUGIN_RETAINED_BYTES {
+            return Err(quota_error(
+                "plugin retained bytes",
+                non_event_retained.saturating_add(event_bytes),
+                MAX_PLUGIN_RETAINED_BYTES,
+            ));
         }
+        self.evict_events_to_fit(MAX_PLUGIN_RETAINED_BYTES - non_event_retained - event_bytes);
         if self.events.len() == MAX_RETAINED_EVENTS {
             let evict_count = (MAX_RETAINED_EVENTS / 4).max(1);
-            self.events.drain(..evict_count);
-            self.events_evicted = self.events_evicted.saturating_add(evict_count as u64);
+            self.evict_oldest_events(evict_count);
         }
+        self.event_bytes = self.event_bytes.saturating_add(event_bytes);
         self.events.push(event);
         Ok(())
+    }
+
+    fn evict_events_to_fit(&mut self, event_budget: usize) {
+        while self.event_bytes > event_budget && !self.events.is_empty() {
+            self.evict_oldest_events(1);
+        }
+    }
+
+    fn evict_oldest_events(&mut self, count: usize) {
+        let count = count.min(self.events.len());
+        let evicted_bytes = self.events[..count]
+            .iter()
+            .map(|event| {
+                let payload_bytes =
+                    json_footprint(&event.payload, MAX_PLUGIN_JSON_DEPTH).unwrap_or(usize::MAX);
+                retained_event_bytes(event, payload_bytes)
+            })
+            .fold(0_usize, usize::saturating_add);
+        self.events.drain(..count);
+        self.event_bytes = self.event_bytes.saturating_sub(evicted_bytes);
+        self.events_evicted = self.events_evicted.saturating_add(count as u64);
     }
 
     pub fn events(&self) -> &[Event] {
@@ -1089,6 +1320,20 @@ impl PluginRuntime {
     }
 
     pub fn notify(&mut self, plugin: PluginId, alert: Alert) -> Result<(), PluginApiError> {
+        if alert.source.len() > MAX_ALERT_SOURCE_BYTES {
+            return Err(quota_error(
+                "alert source bytes",
+                alert.source.len(),
+                MAX_ALERT_SOURCE_BYTES,
+            ));
+        }
+        if alert.message.len() > MAX_ALERT_MESSAGE_BYTES {
+            return Err(quota_error(
+                "alert message bytes",
+                alert.message.len(),
+                MAX_ALERT_MESSAGE_BYTES,
+            ));
+        }
         let cap = Capability::parse(&format!("notify:{}", alert.source))
             .unwrap_or_else(|| Capability("unknown".into()));
         self.audit(plugin, cap, "notify")?;
@@ -1148,6 +1393,15 @@ impl PluginRuntime {
                 MAX_STATE_TOTAL_BYTES,
             ));
         }
+        let non_event_retained = new_total.saturating_add(self.view_bytes);
+        if non_event_retained > MAX_PLUGIN_RETAINED_BYTES {
+            return Err(quota_error(
+                "plugin retained bytes",
+                non_event_retained,
+                MAX_PLUGIN_RETAINED_BYTES,
+            ));
+        }
+        self.evict_events_to_fit(MAX_PLUGIN_RETAINED_BYTES - non_event_retained);
         self.state_bytes = new_total;
         self.state.insert(state_key, (val, entry_bytes));
         Ok(())
@@ -1317,6 +1571,40 @@ fn view_footprint(view: &View) -> (usize, usize, usize) {
     (rows, spans, text_bytes)
 }
 
+fn retained_view_bytes_from_footprint(rows: usize, spans: usize, text_bytes: usize) -> usize {
+    std::mem::size_of::<View>()
+        .saturating_add(rows.saturating_mul(std::mem::size_of::<Vec<Span>>()))
+        .saturating_add(spans.saturating_mul(std::mem::size_of::<Span>()))
+        .saturating_add(text_bytes)
+}
+
+fn retained_surface_bytes(surface: &SurfaceId, view: &View) -> usize {
+    retained_surface_bytes_from_footprint(surface, view_footprint(view))
+}
+
+fn retained_surface_bytes_from_footprint(
+    surface: &SurfaceId,
+    (rows, spans, text_bytes): (usize, usize, usize),
+) -> usize {
+    std::mem::size_of::<SurfaceId>()
+        .saturating_add(surface.as_str().len())
+        .saturating_add(std::mem::size_of::<(View, bool)>())
+        .saturating_add(retained_view_bytes_from_footprint(rows, spans, text_bytes))
+}
+
+fn event_kind_bytes(kind: &EventKind) -> usize {
+    match kind {
+        EventKind::Custom(name) => name.len(),
+        _ => 0,
+    }
+}
+
+fn retained_event_bytes(event: &Event, payload_bytes: usize) -> usize {
+    std::mem::size_of::<Event>()
+        .saturating_add(event_kind_bytes(&event.kind))
+        .saturating_add(payload_bytes)
+}
+
 // ----------------------------------------------------------------------------
 // Render model
 // ----------------------------------------------------------------------------
@@ -1434,6 +1722,7 @@ pub enum DegradeReason {
     Crash,
 }
 
+#[derive(Debug)]
 pub struct UpdateResult {
     pub changed: bool,
 }
@@ -1444,6 +1733,12 @@ pub struct SurfaceCache {
 }
 
 impl SurfaceCache {
+    fn retained_surface_bytes(&self, surface: &SurfaceId) -> usize {
+        self.surfaces
+            .get(surface)
+            .map_or(0, |(view, _)| retained_surface_bytes(surface, view))
+    }
+
     pub fn update(&mut self, surface: SurfaceId, view: View) -> UpdateResult {
         let changed = self
             .surfaces
@@ -3588,6 +3883,7 @@ mod runtime_quota_tests {
             granted: [
                 Capability::new("state", plugin.as_str()),
                 Capability::new("surface", "statusbar"),
+                Capability::new("notify", "quota-source"),
             ]
             .into_iter()
             .collect(),
@@ -3606,6 +3902,481 @@ mod runtime_quota_tests {
 
     fn quota(error: PluginApiError) -> bool {
         matches!(error, PluginApiError::QuotaExceeded { .. })
+    }
+
+    fn quota_manifest() -> PluginManifest {
+        PluginManifest {
+            id: PluginId::new("quota-manifest"),
+            name: "Quota manifest".into(),
+            version: "1".into(),
+            api: API_VERSION,
+            capabilities: Vec::new(),
+            contributions: vec![Contribution {
+                id: ContributionId::new("quota.surface"),
+                extension_point: ExtensionPoint::StatusBarSegment,
+                label: "quota".into(),
+                surface: Some(SurfaceId::new("quota.surface")),
+                cadence: CadenceHint::OnDemand,
+                metadata: Default::default(),
+                caps: serde_json::Value::Null,
+                chord: None,
+            }],
+        }
+    }
+
+    #[test]
+    fn negotiation_bounds_manifest_collection_and_string_sizes() {
+        let host = HostContract::new(API_VERSION)
+            .with_extension_points([ExtensionPoint::StatusBarSegment]);
+
+        let mut manifest = quota_manifest();
+        manifest.contributions = (0..MAX_MANIFEST_CONTRIBUTIONS)
+            .map(|index| {
+                let mut contribution = manifest.contributions[0].clone();
+                contribution.id = ContributionId::new(format!("item-{index}"));
+                contribution
+            })
+            .collect();
+        assert!(host.negotiate(&manifest).is_ok());
+        manifest
+            .contributions
+            .push(manifest.contributions[0].clone());
+        assert!(quota(host.negotiate(&manifest).unwrap_err()));
+
+        let mut manifest = quota_manifest();
+        manifest.contributions[0].metadata = (0..MAX_MANIFEST_METADATA_ENTRIES)
+            .map(|index| (format!("key-{index}"), "v".to_string()))
+            .collect();
+        assert!(host.negotiate(&manifest).is_ok());
+        manifest.contributions[0]
+            .metadata
+            .insert("extra".into(), "v".into());
+        assert!(quota(host.negotiate(&manifest).unwrap_err()));
+
+        let mut manifest = quota_manifest();
+        manifest.contributions[0].metadata =
+            [("k".repeat(MAX_MANIFEST_METADATA_KEY_BYTES), "v".into())]
+                .into_iter()
+                .collect();
+        assert!(host.negotiate(&manifest).is_ok());
+        manifest.contributions[0]
+            .metadata
+            .insert("k".repeat(MAX_MANIFEST_METADATA_KEY_BYTES + 1), "v".into());
+        assert!(quota(host.negotiate(&manifest).unwrap_err()));
+
+        let mut manifest = quota_manifest();
+        manifest.contributions[0].metadata =
+            [("k".into(), "v".repeat(MAX_MANIFEST_METADATA_VALUE_BYTES))]
+                .into_iter()
+                .collect();
+        assert!(host.negotiate(&manifest).is_ok());
+        manifest.contributions[0].metadata.insert(
+            "k".into(),
+            "v".repeat(MAX_MANIFEST_METADATA_VALUE_BYTES + 1),
+        );
+        assert!(quota(host.negotiate(&manifest).unwrap_err()));
+
+        let mut manifest = quota_manifest();
+        manifest.contributions[0].id = ContributionId::new("i".repeat(MAX_PLUGIN_IDENTIFIER_BYTES));
+        assert!(host.negotiate(&manifest).is_ok());
+        manifest.contributions[0].id =
+            ContributionId::new("i".repeat(MAX_PLUGIN_IDENTIFIER_BYTES + 1));
+        assert!(quota(host.negotiate(&manifest).unwrap_err()));
+
+        let mut manifest = quota_manifest();
+        manifest.contributions[0].label = "l".repeat(MAX_MANIFEST_CONTRIBUTION_LABEL_BYTES);
+        assert!(host.negotiate(&manifest).is_ok());
+        manifest.contributions[0].label.push('l');
+        assert!(quota(host.negotiate(&manifest).unwrap_err()));
+
+        let mut manifest = quota_manifest();
+        manifest.contributions[0].chord = Some("c".repeat(MAX_MANIFEST_CONTRIBUTION_CHORD_BYTES));
+        assert!(host.negotiate(&manifest).is_ok());
+        manifest.contributions[0].chord.as_mut().unwrap().push('c');
+        assert!(quota(host.negotiate(&manifest).unwrap_err()));
+
+        let mut manifest = quota_manifest();
+        manifest.contributions[0].caps =
+            serde_json::Value::String("c".repeat(MAX_MANIFEST_CONTRIBUTION_CAPS_BYTES - 8));
+        assert!(host.negotiate(&manifest).is_ok());
+        manifest.contributions[0].caps =
+            serde_json::Value::String("c".repeat(MAX_MANIFEST_CONTRIBUTION_CAPS_BYTES - 7));
+        assert!(quota(host.negotiate(&manifest).unwrap_err()));
+
+        let mut manifest = quota_manifest();
+        manifest.id = PluginId::new("p".repeat(MAX_PLUGIN_IDENTIFIER_BYTES));
+        manifest.name = "n".repeat(MAX_PLUGIN_IDENTIFIER_BYTES);
+        manifest.version = "v".repeat(MAX_PLUGIN_IDENTIFIER_BYTES);
+        assert!(host.negotiate(&manifest).is_ok());
+        manifest.id = PluginId::new("p".repeat(MAX_PLUGIN_IDENTIFIER_BYTES + 1));
+        assert!(quota(host.negotiate(&manifest).unwrap_err()));
+        let mut manifest = quota_manifest();
+        manifest.name = "n".repeat(MAX_PLUGIN_IDENTIFIER_BYTES + 1);
+        assert!(quota(host.negotiate(&manifest).unwrap_err()));
+        let mut manifest = quota_manifest();
+        manifest.version = "v".repeat(MAX_PLUGIN_IDENTIFIER_BYTES + 1);
+        assert!(quota(host.negotiate(&manifest).unwrap_err()));
+
+        let mut manifest = quota_manifest();
+        manifest.contributions[0].surface =
+            Some(SurfaceId::new("s".repeat(MAX_PLUGIN_IDENTIFIER_BYTES)));
+        assert!(host.negotiate(&manifest).is_ok());
+        manifest.contributions[0].surface =
+            Some(SurfaceId::new("s".repeat(MAX_PLUGIN_IDENTIFIER_BYTES + 1)));
+        assert!(quota(host.negotiate(&manifest).unwrap_err()));
+
+        let mut manifest = quota_manifest();
+        manifest.capabilities = (0..MAX_MANIFEST_CAPABILITIES)
+            .map(|index| Capability::new("cap", index.to_string()))
+            .collect();
+        assert!(host.negotiate(&manifest).is_ok());
+        manifest.capabilities.push(Capability::new("cap", "extra"));
+        assert!(quota(host.negotiate(&manifest).unwrap_err()));
+
+        let mut manifest = quota_manifest();
+        manifest.capabilities = vec![Capability::new(
+            "x",
+            "c".repeat(MAX_PLUGIN_IDENTIFIER_BYTES - 2),
+        )];
+        assert!(host.negotiate(&manifest).is_ok());
+        manifest.capabilities[0] =
+            Capability::new("x", "c".repeat(MAX_PLUGIN_IDENTIFIER_BYTES - 1));
+        assert!(quota(host.negotiate(&manifest).unwrap_err()));
+    }
+
+    #[test]
+    fn notify_bounds_source_and_message_bytes_at_utf8_safe_byte_limits() {
+        let (mut runtime, plugin, _) = runtime();
+        assert!(
+            runtime
+                .notify(
+                    plugin.clone(),
+                    Alert::new("quota-source", "m".repeat(MAX_ALERT_MESSAGE_BYTES)),
+                )
+                .is_ok()
+        );
+        let exact_source = "s".repeat(MAX_ALERT_SOURCE_BYTES);
+        runtime
+            .manifest
+            .granted
+            .insert(Capability::new("notify", &exact_source));
+        assert!(
+            runtime
+                .notify(plugin.clone(), Alert::new(&exact_source, "message"),)
+                .is_ok()
+        );
+        assert!(quota(
+            runtime
+                .notify(
+                    plugin.clone(),
+                    Alert::new("quota-source", "m".repeat(MAX_ALERT_MESSAGE_BYTES + 1)),
+                )
+                .unwrap_err()
+        ));
+        assert!(quota(
+            runtime
+                .notify(
+                    plugin.clone(),
+                    Alert::new("s".repeat(MAX_ALERT_SOURCE_BYTES + 1), "message"),
+                )
+                .unwrap_err()
+        ));
+        assert!(quota(
+            runtime
+                .notify(
+                    plugin,
+                    Alert::new("é".repeat(MAX_ALERT_SOURCE_BYTES / 2 + 1), "message"),
+                )
+                .unwrap_err()
+        ));
+    }
+
+    #[test]
+    fn subscriptions_are_bounded_per_plugin_and_duplicate_is_idempotent() {
+        let (mut runtime, plugin, _) = runtime();
+        for index in 0..MAX_PLUGIN_SUBSCRIPTIONS {
+            runtime
+                .subscribe(plugin.clone(), EventKind::Custom(format!("kind-{index}")))
+                .unwrap();
+        }
+        runtime
+            .subscribe(plugin.clone(), EventKind::Custom("kind-0".into()))
+            .unwrap();
+        assert!(quota(
+            runtime
+                .subscribe(plugin.clone(), EventKind::Custom("extra".into()))
+                .unwrap_err()
+        ));
+        assert!(
+            runtime
+                .subscribe(
+                    PluginId::new("other-plugin"),
+                    EventKind::Custom("extra".into())
+                )
+                .is_ok()
+        );
+
+        assert!(
+            runtime
+                .subscribe(
+                    PluginId::new("another-plugin"),
+                    EventKind::Custom("k".repeat(MAX_EVENT_KIND_BYTES)),
+                )
+                .is_ok()
+        );
+        assert!(quota(
+            runtime
+                .subscribe(
+                    PluginId::new("third-plugin"),
+                    EventKind::Custom("k".repeat(MAX_EVENT_KIND_BYTES + 1)),
+                )
+                .unwrap_err()
+        ));
+    }
+
+    #[test]
+    fn cached_surfaces_bound_identifier_bytes_and_cardinality() {
+        let (mut runtime, plugin, _) = runtime();
+        runtime
+            .manifest
+            .granted
+            .insert(Capability::new("surface", "unknown"));
+        let exact_surface = SurfaceId::new("s".repeat(MAX_PLUGIN_IDENTIFIER_BYTES));
+        runtime
+            .update(plugin.clone(), exact_surface, View::line([]))
+            .unwrap();
+        assert!(quota(
+            runtime
+                .update(
+                    plugin.clone(),
+                    SurfaceId::new("s".repeat(MAX_PLUGIN_IDENTIFIER_BYTES + 1)),
+                    View::line([]),
+                )
+                .unwrap_err()
+        ));
+
+        for index in 1..MAX_PLUGIN_SURFACES {
+            runtime
+                .update(
+                    plugin.clone(),
+                    SurfaceId::new(format!("surface-{index}")),
+                    View::line([]),
+                )
+                .unwrap();
+        }
+        assert_eq!(runtime.views.surfaces.len(), MAX_PLUGIN_SURFACES);
+        assert!(quota(
+            runtime
+                .update(plugin, SurfaceId::new("one-too-many"), View::line([]))
+                .unwrap_err()
+        ));
+        assert_eq!(runtime.views.surfaces.len(), MAX_PLUGIN_SURFACES);
+    }
+
+    #[test]
+    fn emitted_custom_event_names_are_bounded() {
+        let (mut runtime, plugin, _) = runtime();
+        runtime
+            .emit(
+                plugin.clone(),
+                Event::new(
+                    EventKind::Custom("k".repeat(MAX_EVENT_KIND_BYTES)),
+                    serde_json::Value::Null,
+                ),
+            )
+            .unwrap();
+        assert!(quota(
+            runtime
+                .emit(
+                    plugin,
+                    Event::new(
+                        EventKind::Custom("k".repeat(MAX_EVENT_KIND_BYTES + 1)),
+                        serde_json::Value::Null,
+                    ),
+                )
+                .unwrap_err()
+        ));
+        assert_eq!(runtime.events().len(), 1);
+    }
+
+    #[test]
+    fn retained_total_bounds_events_with_exact_headroom() {
+        let (mut runtime, plugin, _) = runtime();
+        let retained_state_value = serde_json::Value::String("s".repeat(60 * 1024));
+        for index in 0..17 {
+            runtime
+                .state_set(
+                    plugin.clone(),
+                    &index.to_string(),
+                    retained_state_value.clone(),
+                )
+                .unwrap();
+        }
+        let string_overhead = json_footprint(
+            &serde_json::Value::String(String::new()),
+            MAX_PLUGIN_JSON_DEPTH,
+        )
+        .unwrap();
+        let maximum_payload =
+            serde_json::Value::String("x".repeat(MAX_EVENT_PAYLOAD_BYTES - string_overhead));
+        let event_chunk_bytes = MAX_EVENT_PAYLOAD_BYTES + std::mem::size_of::<Event>();
+        for _ in
+            0..MAX_PLUGIN_RETAINED_BYTES.saturating_sub(runtime.state_bytes) / event_chunk_bytes
+        {
+            runtime
+                .emit(
+                    plugin.clone(),
+                    Event::new(EventKind::Timer, maximum_payload.clone()),
+                )
+                .unwrap();
+        }
+        let before_evicted = runtime.events_evicted();
+        let before_len = runtime.events().len();
+        let remaining = MAX_PLUGIN_RETAINED_BYTES
+            .saturating_sub(runtime.state_bytes)
+            .saturating_sub(runtime.event_bytes)
+            .saturating_sub(runtime.view_bytes);
+        let exact_payload_bytes = remaining
+            .saturating_sub(std::mem::size_of::<Event>())
+            .saturating_sub(string_overhead);
+        assert!(exact_payload_bytes <= MAX_EVENT_PAYLOAD_BYTES - string_overhead);
+        let exact_payload = serde_json::Value::String("x".repeat(exact_payload_bytes));
+        runtime
+            .emit(
+                plugin.clone(),
+                Event::new(EventKind::Timer, exact_payload.clone()),
+            )
+            .unwrap();
+        assert_eq!(runtime.events().len(), before_len + 1);
+        assert_eq!(runtime.events_evicted(), before_evicted);
+        assert_eq!(
+            runtime.events().last().map(|event| &event.payload),
+            Some(&exact_payload)
+        );
+        runtime
+            .state_set(plugin.clone(), "0", serde_json::Value::String("x".into()))
+            .unwrap();
+        assert_eq!(
+            runtime.state_get(plugin, "0").unwrap(),
+            Some(serde_json::Value::String("x".into()))
+        );
+    }
+
+    #[test]
+    fn full_event_budget_does_not_lock_out_views_or_state() {
+        let (mut runtime, plugin, surface) = runtime();
+        let string_overhead = json_footprint(
+            &serde_json::Value::String(String::new()),
+            MAX_PLUGIN_JSON_DEPTH,
+        )
+        .unwrap();
+        let payload =
+            serde_json::Value::String("x".repeat(MAX_EVENT_PAYLOAD_BYTES - string_overhead));
+        let event_bytes = std::mem::size_of::<Event>() + MAX_EVENT_PAYLOAD_BYTES;
+        let count = MAX_PLUGIN_RETAINED_BYTES / event_bytes;
+        for _ in 0..count {
+            runtime
+                .emit(
+                    plugin.clone(),
+                    Event::new(EventKind::Timer, payload.clone()),
+                )
+                .unwrap();
+        }
+        let evicted_before = runtime.events_evicted();
+        runtime
+            .update(plugin.clone(), surface.clone(), View::line([]))
+            .unwrap();
+        runtime
+            .state_set(plugin.clone(), "alive", serde_json::Value::Bool(true))
+            .unwrap();
+        assert!(runtime.view(&surface).is_some());
+        assert_eq!(
+            runtime.state_get(plugin.clone(), "alive").unwrap(),
+            Some(serde_json::Value::Bool(true))
+        );
+        runtime
+            .emit(plugin, Event::new(EventKind::Timer, payload))
+            .unwrap();
+        assert!(runtime.events_evicted() > evicted_before);
+        assert_eq!(
+            runtime.events().last().map(|event| &event.kind),
+            Some(&EventKind::Timer)
+        );
+    }
+
+    #[test]
+    fn retained_total_bounds_all_cached_views_and_allows_replacement() {
+        let plugin = PluginId::new("view-quota");
+        let accepted_contributions = (0..MAX_MANIFEST_CONTRIBUTIONS)
+            .map(|index| Contribution {
+                id: ContributionId::new(format!("view-{index}")),
+                extension_point: ExtensionPoint::StatusBarSegment,
+                label: "view".into(),
+                surface: Some(SurfaceId::new(format!("view.surface.{index}"))),
+                cadence: CadenceHint::OnDemand,
+                metadata: Default::default(),
+                caps: serde_json::Value::Null,
+                chord: None,
+            })
+            .collect();
+        let manifest = NegotiatedManifest {
+            api: API_VERSION,
+            granted: [Capability::new("surface", "statusbar")]
+                .into_iter()
+                .collect(),
+            accepted_contributions,
+            supported_extension_points: [ExtensionPoint::StatusBarSegment].into_iter().collect(),
+            ..NegotiatedManifest::default()
+        };
+        let mut runtime = PluginRuntime::new(manifest);
+        let view_with_text =
+            |text_bytes| View::line([Span::styled("v".repeat(text_bytes), StyleRole::Default)]);
+        for index in 0..MAX_MANIFEST_CONTRIBUTIONS - 1 {
+            runtime
+                .update(
+                    plugin.clone(),
+                    SurfaceId::new(format!("view.surface.{index}")),
+                    view_with_text(MAX_VIEW_TEXT_BYTES),
+                )
+                .unwrap();
+        }
+        assert!(
+            runtime
+                .update(
+                    plugin.clone(),
+                    SurfaceId::new("view.surface.0"),
+                    view_with_text(MAX_VIEW_TEXT_BYTES),
+                )
+                .is_ok()
+        );
+        let last_surface =
+            SurfaceId::new(format!("view.surface.{}", MAX_MANIFEST_CONTRIBUTIONS - 1));
+        let view_overhead = std::mem::size_of::<SurfaceId>()
+            + last_surface.as_str().len()
+            + std::mem::size_of::<(View, bool)>()
+            + std::mem::size_of::<View>()
+            + std::mem::size_of::<Vec<Span>>()
+            + std::mem::size_of::<Span>();
+        let exact_text_bytes = MAX_PLUGIN_RETAINED_BYTES
+            .saturating_sub(runtime.view_bytes)
+            .saturating_sub(view_overhead);
+        assert!(exact_text_bytes <= MAX_VIEW_TEXT_BYTES);
+        let exact_view = view_with_text(exact_text_bytes);
+        assert!(
+            runtime
+                .update(plugin.clone(), last_surface.clone(), exact_view.clone())
+                .is_ok()
+        );
+        assert!(quota(
+            runtime
+                .update(
+                    plugin,
+                    last_surface.clone(),
+                    view_with_text(exact_text_bytes + 1)
+                )
+                .unwrap_err()
+        ));
+        assert_eq!(runtime.view(&last_surface), Some(&exact_view));
     }
 
     #[test]
