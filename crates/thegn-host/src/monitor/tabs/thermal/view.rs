@@ -431,6 +431,11 @@ impl ThermalModel {
         &mut self.zones[index]
     }
 
+    #[cfg(test)]
+    pub(crate) fn package(&self) -> Option<&SensorRow> {
+        self.package_index().map(|index| &self.sensors[index])
+    }
+
     fn package_index(&self) -> Option<usize> {
         self.sensors
             .iter()
