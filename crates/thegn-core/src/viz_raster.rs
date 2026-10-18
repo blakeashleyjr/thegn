@@ -178,7 +178,32 @@ fn clamp01(v: f32) -> f32 {
 }
 
 fn dot_offset(len: usize, w: usize) -> usize {
-    len.saturating_sub(w.saturating_mul(2))
+    w.saturating_mul(2)
+        .saturating_sub(len.min(w.saturating_mul(2)))
+}
+
+fn sample_offset(len: usize, w: usize) -> usize {
+    w.saturating_sub(len.min(w))
+}
+
+fn aligned_sample(values: &[f32], column: usize, width: usize) -> Option<f32> {
+    let capacity = width;
+    let destination = sample_offset(values.len(), width);
+    if column < destination || column - destination >= values.len().min(capacity) {
+        return None;
+    }
+    values
+        .get(values.len().saturating_sub(capacity) + column - destination)
+        .copied()
+}
+
+fn has_braille_sample(len: usize, w: usize, cell: usize) -> bool {
+    let capacity = w.saturating_mul(2);
+    let start = dot_offset(len, w);
+    (0..2).any(|dot| {
+        let index = cell.saturating_mul(2).saturating_add(dot);
+        index >= start && index < start.saturating_add(len.min(capacity))
+    })
 }
 
 fn level_for_dot(top_dot: i32, total: usize) -> u8 {
@@ -209,25 +234,53 @@ fn spans_for(
     if total == 0 {
         return;
     }
-    let off = dot_offset(vals.len(), w);
-    let off_other = dot_offset(other.len(), w);
+    let capacity = w.saturating_mul(2);
+    let dest = dot_offset(vals.len(), w);
+    let dest_other = dot_offset(other.len(), w);
+    let source = vals.len().saturating_sub(capacity);
+    let source_other = other.len().saturating_sub(capacity);
     spans.reserve(w.saturating_mul(2));
     spans.extend((0..w.saturating_mul(2)).map(|i| {
-        let v = clamp01(vals.get(off + i).copied().unwrap_or(0.0));
+        let sample_i = source.saturating_add(i.saturating_sub(dest));
+        let has_value = i >= dest && i - dest < vals.len().min(capacity);
+        let v = clamp01(if has_value {
+            vals.get(sample_i).copied().unwrap_or(0.0)
+        } else {
+            0.0
+        });
         match mode {
             SpanMode::Area => {
                 let n = ((v * total as f32).round() as i32).max(if v > 0.001 { 1 } else { 0 });
                 (0, n - 1)
             }
             SpanMode::Line => {
+                if !has_value {
+                    return (0, -1);
+                }
                 let y = ((v * total as f32).floor() as i32).min(total as i32 - 1);
                 let prev_i = i.saturating_sub(1);
-                let prev = clamp01(vals.get(off + prev_i).copied().unwrap_or(0.0));
+                let prev_i = if i <= dest { i } else { prev_i };
+                let prev_has_value = prev_i >= dest && prev_i - dest < vals.len().min(capacity);
+                let prev = clamp01(if prev_has_value {
+                    vals.get(source.saturating_add(prev_i.saturating_sub(dest)))
+                        .copied()
+                        .unwrap_or(0.0)
+                } else {
+                    0.0
+                });
                 let py = ((prev * total as f32).floor() as i32).min(total as i32 - 1);
                 (y.min(py), y.max(py))
             }
             SpanMode::Band => {
-                let hi = clamp01(other.get(off_other + i).copied().unwrap_or(0.0));
+                let has_hi = i >= dest_other && i - dest_other < other.len().min(capacity);
+                let hi = clamp01(if has_hi {
+                    other
+                        .get(source_other.saturating_add(i.saturating_sub(dest_other)))
+                        .copied()
+                        .unwrap_or(0.0)
+                } else {
+                    0.0
+                });
                 let (lo, hi) = (v.min(hi), v.max(hi));
                 let bot = ((lo * total as f32).floor() as i32).clamp(0, total as i32 - 1);
                 let top = ((hi * total as f32).ceil() as i32 - 1).clamp(bot, total as i32 - 1);
@@ -284,9 +337,8 @@ fn column_area(
     if steps.is_empty() {
         return;
     }
-    let off = vals.len().saturating_sub(buf.w);
     for c in 0..buf.w {
-        let value = clamp01(vals.get(off + c).copied().unwrap_or(0.0));
+        let value = clamp01(aligned_sample(vals, c, buf.w).unwrap_or(0.0));
         for r in 0..buf.h {
             let distance = if mirrored_top { r } else { buf.h - 1 - r };
             buf.put(c, r, column_cell(value, distance, buf.h, steps, table));
@@ -329,6 +381,13 @@ pub fn area(vals: &[f32], table: &RasterTable, buf: &mut CellBuf) {
     if table.braille {
         spans_for(vals, buf.w, buf.h, SpanMode::Area, &[], &mut buf.spans);
         draw_braille_spans(table, true, buf);
+        for row in 0..buf.h {
+            for col in 0..buf.w {
+                if !has_braille_sample(vals.len(), buf.w, col) {
+                    buf.put(col, row, RCell::blank(table.cell_blank));
+                }
+            }
+        }
     } else {
         columns(vals, table.cols, table, buf);
     }
@@ -339,11 +398,20 @@ pub fn line(vals: &[f32], table: &RasterTable, buf: &mut CellBuf) {
     if table.braille {
         spans_for(vals, buf.w, buf.h, SpanMode::Line, &[], &mut buf.spans);
         draw_braille_spans(table, false, buf);
+        for row in 0..buf.h {
+            for col in 0..buf.w {
+                if !has_braille_sample(vals.len(), buf.w, col) {
+                    buf.put(col, row, RCell::blank(table.cell_blank));
+                }
+            }
+        }
     } else {
         buf.reset(buf.w, buf.h);
-        let off = vals.len().saturating_sub(buf.w);
         for c in 0..buf.w {
-            let v = clamp01(vals.get(off + c).copied().unwrap_or(0.0));
+            let Some(value) = aligned_sample(vals, c, buf.w) else {
+                continue;
+            };
+            let v = clamp01(value);
             if buf.h == 0 || table.cols.is_empty() {
                 continue;
             }
@@ -368,13 +436,18 @@ pub fn band(lo: &[f32], hi: &[f32], table: &RasterTable, buf: &mut CellBuf) {
     if table.braille {
         spans_for(lo, buf.w, buf.h, SpanMode::Band, hi, &mut buf.spans);
         draw_braille_spans(table, false, buf);
+        for row in 0..buf.h {
+            for col in 0..buf.w {
+                if !has_braille_sample(lo.len().max(hi.len()), buf.w, col) {
+                    buf.put(col, row, RCell::blank(table.cell_blank));
+                }
+            }
+        }
     } else {
         buf.reset(buf.w, buf.h);
-        let off_lo = lo.len().saturating_sub(buf.w);
-        let off_hi = hi.len().saturating_sub(buf.w);
         for c in 0..buf.w {
-            let low = clamp01(lo.get(off_lo + c).copied().unwrap_or(0.0));
-            let high = clamp01(hi.get(off_hi + c).copied().unwrap_or(0.0));
+            let low = clamp01(aligned_sample(lo, c, buf.w).unwrap_or(0.0));
+            let high = clamp01(aligned_sample(hi, c, buf.w).unwrap_or(0.0));
             let lower = (low.min(high) * buf.h as f32).floor() as usize;
             let upper = (high.max(low) * buf.h as f32).ceil() as usize;
             for r in 0..buf.h {
@@ -416,12 +489,18 @@ pub fn mirrored(up: &[f32], down: &[f32], table: &RasterTable, buf: &mut CellBuf
         spans_for(up, buf.w, upper_h, SpanMode::Area, &[], &mut buf.spans);
         spans_for(down, buf.w, lower_h, SpanMode::Area, &[], &mut buf.spans2);
         draw_braille_spans_mirrored(upper_h, table, buf);
+        for r in 0..buf.h {
+            let len = if r < upper_h { up.len() } else { down.len() };
+            for c in 0..buf.w {
+                if !has_braille_sample(len, buf.w, c) {
+                    buf.put(c, r, RCell::blank(table.cell_blank));
+                }
+            }
+        }
     } else if !table.cols.is_empty() {
-        let up_off = up.len().saturating_sub(buf.w);
-        let down_off = down.len().saturating_sub(buf.w);
         for c in 0..buf.w {
-            let upper_value = clamp01(up.get(up_off + c).copied().unwrap_or(0.0));
-            let lower_value = clamp01(down.get(down_off + c).copied().unwrap_or(0.0));
+            let upper_value = clamp01(aligned_sample(up, c, buf.w).unwrap_or(0.0));
+            let lower_value = clamp01(aligned_sample(down, c, buf.w).unwrap_or(0.0));
             for r in 0..upper_h {
                 buf.put(
                     c,
@@ -511,8 +590,7 @@ pub fn stacked(bands: &[&[f32]], table: &RasterTable, buf: &mut CellBuf) {
             let mut middle_band = None;
             for (i, band) in bands.iter().enumerate() {
                 let start = cumulative;
-                let offset = band.len().saturating_sub(buf.w);
-                let amount = clamp01(band.get(offset + c).copied().unwrap_or(0.0));
+                let amount = clamp01(aligned_sample(band, c, buf.w).unwrap_or(0.0));
                 cumulative = (cumulative + amount).min(1.0);
                 let coverage = (cumulative.min(top) - start.max(bottom)).max(0.0);
                 if coverage > largest.0 {
@@ -612,9 +690,11 @@ pub fn heatmap(rows: &[&[f32]], table: &RasterTable, buf: &mut CellBuf) {
     buf.reset(w, h);
     if table.braille {
         for r in 0..h {
+            let row_a = rows.get(r * 2).copied().unwrap_or(&[]);
+            let row_b = rows.get(r * 2 + 1).copied().unwrap_or(&[]);
             for c in 0..w {
-                let a = rows.get(r * 2).and_then(|row| row.get(c)).copied();
-                let b = rows.get(r * 2 + 1).and_then(|row| row.get(c)).copied();
+                let a = aligned_sample(row_a, c, w);
+                let b = aligned_sample(row_b, c, w);
                 let a = a.filter(|value| !value.is_nan());
                 let b = b.filter(|value| !value.is_nan());
                 if a.is_none() && b.is_none() {
@@ -647,7 +727,7 @@ pub fn heatmap(rows: &[&[f32]], table: &RasterTable, buf: &mut CellBuf) {
     } else {
         for (r, row) in rows.iter().enumerate() {
             for c in 0..w {
-                let Some(v) = row.get(c).copied() else {
+                let Some(v) = aligned_sample(row, c, w) else {
                     continue;
                 };
                 if v.is_nan() {
@@ -672,12 +752,18 @@ pub fn heatmap(rows: &[&[f32]], table: &RasterTable, buf: &mut CellBuf) {
 
 /// Draws one sparkline row.
 pub fn sparkline(vals: &[f32], table: &RasterTable, buf: &mut CellBuf) {
-    let w = vals.len();
+    sparkline_width(vals, vals.len(), table, buf);
+}
+
+/// Draws a one-row sparkline aligned within an explicit cell capacity.
+pub fn sparkline_width(vals: &[f32], w: usize, table: &RasterTable, buf: &mut CellBuf) {
     buf.reset(w, 1);
     if table.spark.is_empty() {
         return;
     }
-    for (c, &v) in vals.iter().enumerate() {
+    let off = sample_offset(vals.len(), w);
+    for (index, &v) in vals.iter().enumerate() {
+        let c = off + index;
         let value = clamp01(v);
         let idx = (value * (table.spark.len() - 1) as f32).round() as usize;
         buf.put(
@@ -791,6 +877,86 @@ mod tests {
         b.reset(1, 4);
         mirrored(&[1.0], &[1.0], &RasterTable::ASCII, &mut b);
         assert_eq!(chars(&b), ["#", "#", "#", "#"]);
+    }
+
+    #[test]
+    fn short_series_right_align_across_rasters_and_unicode_tables() {
+        for table in [&RasterTable::FULL, &RasterTable::BASIC, &RasterTable::ASCII] {
+            let blank = table.cell_blank;
+            let mut b = CellBuf::new();
+
+            b.reset(4, 1);
+            area(&[1.0], table, &mut b);
+            assert_eq!(
+                b.row(0)[..3].iter().map(|cell| cell.ch).collect::<String>(),
+                blank.to_string().repeat(3)
+            );
+            assert_ne!(b.row(0)[3].ch, blank);
+
+            b.reset(4, 1);
+            line(&[1.0], table, &mut b);
+            assert_eq!(
+                b.row(0)[..3].iter().map(|cell| cell.ch).collect::<String>(),
+                blank.to_string().repeat(3)
+            );
+            assert_ne!(b.row(0)[3].ch, blank);
+
+            b.reset(4, 1);
+            columns(&[1.0], &table.ramp8, table, &mut b);
+            assert_eq!(
+                b.row(0)[..3].iter().map(|cell| cell.ch).collect::<String>(),
+                blank.to_string().repeat(3)
+            );
+            assert_ne!(b.row(0)[3].ch, blank);
+
+            b.reset(4, 1);
+            band(&[0.5], &[1.0], table, &mut b);
+            assert_eq!(
+                b.row(0)[..3].iter().map(|cell| cell.ch).collect::<String>(),
+                blank.to_string().repeat(3)
+            );
+            assert_ne!(b.row(0)[3].ch, blank);
+
+            b.reset(4, 2);
+            mirrored(&[1.0], &[1.0], table, &mut b);
+            for row in 0..2 {
+                assert_eq!(
+                    b.row(row)[..3]
+                        .iter()
+                        .map(|cell| cell.ch)
+                        .collect::<String>(),
+                    blank.to_string().repeat(3)
+                );
+                assert_ne!(b.row(row)[3].ch, blank);
+            }
+
+            b.reset(4, 1);
+            stacked(&[&[1.0]], table, &mut b);
+            assert_eq!(
+                b.row(0)[..3].iter().map(|cell| cell.ch).collect::<String>(),
+                blank.to_string().repeat(3)
+            );
+            assert_ne!(b.row(0)[3].ch, blank);
+
+            let rows = [
+                &[0.0, 0.0, 0.0, 0.0][..],
+                &[0.0, 0.0, 0.0, 0.0][..],
+                &[1.0][..],
+            ];
+            heatmap(&rows, table, &mut b);
+            assert_eq!(
+                b.row(1)[..3].iter().map(|cell| cell.ch).collect::<String>(),
+                blank.to_string().repeat(3)
+            );
+            assert_ne!(b.row(1)[3].ch, blank);
+
+            sparkline_width(&[1.0], 4, table, &mut b);
+            assert_eq!(
+                b.row(0)[..3].iter().map(|cell| cell.ch).collect::<String>(),
+                blank.to_string().repeat(3)
+            );
+            assert_ne!(b.row(0)[3].ch, blank);
+        }
     }
 
     #[test]
