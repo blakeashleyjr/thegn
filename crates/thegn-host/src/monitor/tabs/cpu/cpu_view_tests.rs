@@ -357,9 +357,10 @@ fn snapshots_cover_sizes_capabilities_demand_absence_and_fill() {
                 }
             }
             if cols == 100 {
-                assert!(placed.len() < SPECS.len());
-                assert!(!demand.collectors.contains(CollectorId::CpuIrq));
-                assert!(!demand.collectors.contains(CollectorId::CpuSched));
+                assert!(placed.iter().any(|panel| panel.id == IRQ));
+                assert!(placed.iter().any(|panel| panel.id == SCHED));
+                assert!(demand.collectors.contains(CollectorId::CpuIrq));
+                assert!(demand.collectors.contains(CollectorId::CpuSched));
             }
             if cols >= 160 {
                 assert!(placed.iter().any(|panel| panel.id == IRQ));
