@@ -25,7 +25,7 @@ impl MonitorTab {
         match self {
             MonitorTab::Overview => true,
             MonitorTab::Gpu => s.gpu_pct.is_some(),
-            MonitorTab::Power => s.battery.is_some(),
+            MonitorTab::Power => s.battery.is_some() || s.power_present,
             MonitorTab::Thermal => s.cpu_temp_c.is_some() || !s.temps.is_empty(),
             MonitorTab::Disk => !s.disks.is_empty(),
             MonitorTab::Network => s.net_bps.is_some() || !s.net_ifaces.is_empty(),
@@ -94,5 +94,29 @@ pub(super) fn hints(input: &footer::FooterInput<'_>, out: &mut Vec<Vec<Seg>>) {
         MonitorTab::Disk => disk::hints(input, out),
         MonitorTab::Containers => containers::hints(input, out),
         _ => {}
+    }
+}
+
+#[cfg(test)]
+mod presence_tests {
+    use super::*;
+
+    #[test]
+    fn power_tab_is_present_for_static_power_hardware_without_a_battery() {
+        let snapshot = StatsSnapshot {
+            power_present: true,
+            ..StatsSnapshot::default()
+        };
+
+        assert!(MonitorTab::Power.present(&snapshot, false));
+
+        let battery_snapshot = StatsSnapshot {
+            battery: Some((80, false)),
+            ..StatsSnapshot::default()
+        };
+        assert!(MonitorTab::Power.present(&battery_snapshot, false));
+
+        let empty_snapshot = StatsSnapshot::default();
+        assert!(!MonitorTab::Power.present(&empty_snapshot, false));
     }
 }
