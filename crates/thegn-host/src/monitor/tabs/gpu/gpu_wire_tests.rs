@@ -169,7 +169,7 @@ fn memory_history_right_aligns_two_samples_in_unicode_and_ascii() {
                     text.push_str(cell.str());
                     text
                 });
-                text.contains("VRAM used / total 0-100%")
+                text.contains("GPU0 VRAM / total")
             })
             .expect("VRAM history label rendered");
         let inner_left = memory.rect.x + 1;

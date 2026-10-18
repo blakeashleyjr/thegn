@@ -19,6 +19,15 @@ pub(crate) fn platform_is_executable_file(_metadata: &std::fs::Metadata) -> bool
     true
 }
 
+pub(crate) fn platform_is_transient_accept_resource_error(raw_os_error: Option<i32>) -> bool {
+    matches!(raw_os_error, Some(10024) | Some(10055)) // WSAEMFILE, WSAENOBUFS
+}
+
+#[cfg(test)]
+pub(crate) fn platform_accept_resource_error_for_test() -> io::Error {
+    io::Error::from_raw_os_error(10024) // WSAEMFILE
+}
+
 type ReadReply = oneshot::Sender<io::Result<Vec<u8>>>;
 type WriteReply = oneshot::Sender<io::Result<usize>>;
 enum Operation {

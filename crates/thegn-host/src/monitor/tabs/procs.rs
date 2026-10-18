@@ -13,6 +13,95 @@ use crate::seg::Tok;
 use thegn_core::numfmt::{NumFmt, Reading, Unit};
 use thegn_core::theme::Hue;
 
+#[derive(Clone, Copy)]
+struct PriorityCalls {
+    get_nice: fn(u32, crate::platform::ProcStart) -> Result<i32, crate::platform::PriorityError>,
+    set_nice:
+        fn(u32, crate::platform::ProcStart, i32) -> Result<(), crate::platform::PriorityError>,
+    get_ioprio: fn(
+        u32,
+        crate::platform::ProcStart,
+    ) -> Result<crate::platform::IoClass, crate::platform::PriorityError>,
+    set_ioprio: fn(
+        u32,
+        crate::platform::ProcStart,
+        crate::platform::IoClass,
+    ) -> Result<(), crate::platform::PriorityError>,
+}
+
+const SYSTEM_PRIORITY_CALLS: PriorityCalls = PriorityCalls {
+    get_nice: crate::platform::get_nice,
+    set_nice: crate::platform::set_nice,
+    get_ioprio: crate::platform::get_ioprio,
+    set_ioprio: crate::platform::set_ioprio,
+};
+
+#[cfg(test)]
+thread_local! {
+    static TEST_PRIORITY_CALLS: std::cell::Cell<Option<PriorityCalls>> = const { std::cell::Cell::new(None) };
+}
+
+fn priority_calls() -> PriorityCalls {
+    #[cfg(test)]
+    if let Some(calls) = TEST_PRIORITY_CALLS.get() {
+        return calls;
+    }
+    SYSTEM_PRIORITY_CALLS
+}
+
+fn priority_error(label: &str, error: crate::platform::PriorityError, denial_hint: &str) -> String {
+    match error {
+        crate::platform::PriorityError::Changed => {
+            format!("{label}: process changed; select it again")
+        }
+        crate::platform::PriorityError::Denied(_) if !denial_hint.is_empty() => {
+            format!("{label}: {denial_hint} (not retried)")
+        }
+        crate::platform::PriorityError::Denied(error) => format!("{label}: {error} (not retried)"),
+        crate::platform::PriorityError::Failed(message) => format!("{label}: {message}"),
+        crate::platform::PriorityError::Unsupported => {
+            format!("{label}: not supported on this platform")
+        }
+    }
+}
+
+fn process_label(pid: u32, name: &str, owner: thegn_metrics::ProcOwner) -> String {
+    let owner = procs_view::owner_label(owner);
+    if owner.is_empty() {
+        format!("pid {pid} {name}")
+    } else {
+        format!("pid {pid} {name} ({owner})")
+    }
+}
+
+pub(in crate::monitor) fn ioprio_label(class: crate::platform::IoClass) -> String {
+    match class {
+        crate::platform::IoClass::Idle => "idle".to_string(),
+        crate::platform::IoClass::BestEffort(level) => format!("best-effort {level}"),
+        crate::platform::IoClass::RealTime(_) => "realtime".to_string(),
+        crate::platform::IoClass::None => "none".to_string(),
+    }
+}
+
+pub(in crate::monitor) fn next_ioprio(
+    class: crate::platform::IoClass,
+    forward: bool,
+) -> crate::platform::IoClass {
+    use crate::platform::IoClass::{BestEffort, Idle, RealTime};
+    match (class, forward) {
+        (Idle, true) => BestEffort(0),
+        (BestEffort(level), true) if level < 7 => BestEffort(level + 1),
+        (BestEffort(_), true) => RealTime(4),
+        (RealTime(_), true) => Idle,
+        (Idle, false) => RealTime(4),
+        (RealTime(_), false) => BestEffort(7),
+        (BestEffort(level), false) if level > 0 => BestEffort(level - 1),
+        (BestEffort(_), false) => Idle,
+        (crate::platform::IoClass::None, true) => BestEffort(5),
+        (crate::platform::IoClass::None, false) => BestEffort(3),
+    }
+}
+
 pub(in crate::monitor) struct ProcDisplay<'a> {
     pub(in crate::monitor) filter: &'a str,
     pub(in crate::monitor) filtering: bool,
@@ -421,6 +510,154 @@ impl MonitorOverlay {
         MonitorOutcome::PrefsChanged
     }
 
+    pub(in crate::monitor) fn begin_renice(&mut self) -> MonitorOutcome {
+        let Some((pid, start_time, start_ticks, name, owner)) =
+            self.proc_rows.get(self.sel).map(|row| {
+                (
+                    row.pid,
+                    row.start_time,
+                    row.start_ticks,
+                    row.name.clone(),
+                    row.owner,
+                )
+            })
+        else {
+            return MonitorOutcome::Pending;
+        };
+        let label = process_label(pid, &name, owner);
+        let start = crate::platform::ProcStart {
+            secs: start_time,
+            ticks: start_ticks,
+        };
+        match (priority_calls().get_nice)(pid, start) {
+            Ok(current) => {
+                self.confirm = Some(Confirm::Renice {
+                    pid,
+                    start_time,
+                    start_ticks,
+                    label,
+                    current,
+                    target: (current + 1).clamp(-20, 19),
+                });
+                self.status = None;
+            }
+            Err(error) => self.status = Some(priority_error(&label, error, "")),
+        }
+        MonitorOutcome::Pending
+    }
+
+    pub(in crate::monitor) fn begin_ionice(&mut self) -> MonitorOutcome {
+        let Some((pid, start_time, start_ticks, name, owner)) =
+            self.proc_rows.get(self.sel).map(|row| {
+                (
+                    row.pid,
+                    row.start_time,
+                    row.start_ticks,
+                    row.name.clone(),
+                    row.owner,
+                )
+            })
+        else {
+            return MonitorOutcome::Pending;
+        };
+        let label = process_label(pid, &name, owner);
+        let start = crate::platform::ProcStart {
+            secs: start_time,
+            ticks: start_ticks,
+        };
+        match (priority_calls().get_ioprio)(pid, start) {
+            Ok(current) => {
+                self.confirm = Some(Confirm::Ionice {
+                    pid,
+                    start_time,
+                    start_ticks,
+                    label,
+                    current,
+                    target: next_ioprio(current, true),
+                });
+                self.status = None;
+            }
+            Err(error) => self.status = Some(priority_error(&label, error, "")),
+        }
+        MonitorOutcome::Pending
+    }
+
+    pub(in crate::monitor) fn apply_renice(
+        &mut self,
+        pid: u32,
+        start_time: u64,
+        start_ticks: Option<u64>,
+        label: &str,
+        current: i32,
+        target: i32,
+    ) {
+        if !self
+            .proc_rows
+            .iter()
+            .any(|row| (row.pid, row.start_time) == (pid, start_time))
+        {
+            self.status = Some(format!(
+                "{label}: process changed or left the sampled list; select it again"
+            ));
+            return;
+        }
+        let start = crate::platform::ProcStart {
+            secs: start_time,
+            ticks: start_ticks,
+        };
+        self.status = match (priority_calls().set_nice)(pid, start, target.clamp(-20, 19)) {
+            Ok(()) => Some(format!("{label}: nice set to {}", target.clamp(-20, 19))),
+            Err(error) => Some(priority_error(
+                label,
+                error,
+                if target < current {
+                    "lowering priority needs privileges"
+                } else {
+                    ""
+                },
+            )),
+        };
+    }
+
+    pub(in crate::monitor) fn apply_ionice(
+        &mut self,
+        pid: u32,
+        start_time: u64,
+        start_ticks: Option<u64>,
+        label: &str,
+        target: crate::platform::IoClass,
+    ) {
+        if !self
+            .proc_rows
+            .iter()
+            .any(|row| (row.pid, row.start_time) == (pid, start_time))
+        {
+            self.status = Some(format!(
+                "{label}: process changed or left the sampled list; select it again"
+            ));
+            return;
+        }
+        let start = crate::platform::ProcStart {
+            secs: start_time,
+            ticks: start_ticks,
+        };
+        self.status = match (priority_calls().set_ioprio)(pid, start, target) {
+            Ok(()) => Some(format!(
+                "{label}: I/O priority set to {}",
+                ioprio_label(target)
+            )),
+            Err(error) => Some(priority_error(
+                label,
+                error,
+                if matches!(target, crate::platform::IoClass::RealTime(_)) {
+                    "realtime I/O priority needs privileges"
+                } else {
+                    ""
+                },
+            )),
+        };
+    }
+
     /// Open a signal confirmation for the selected process. A second signal on
     /// the just-TERMed pid escalates to KILL (a distinct, explicit second step).
     pub(in crate::monitor) fn begin_signal(&mut self) -> MonitorOutcome {
@@ -510,6 +747,10 @@ pub(super) fn hints(
         },
     ));
     out.push(hint("x", " signal"));
+    out.push(hint("=", " nice"));
+    if crate::platform::IONICE_SUPPORTED {
+        out.push(hint("I", " ionice"));
+    }
 }
 
 #[cfg(test)]
@@ -695,3 +936,7 @@ mod tests {
         assert_eq!(build.row_y, vec![2]);
     }
 }
+
+#[cfg(test)]
+#[path = "procs_renice_tests.rs"]
+mod renice_tests;

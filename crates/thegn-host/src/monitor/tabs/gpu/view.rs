@@ -27,6 +27,7 @@ const MEMORY: PanelId = PanelId("gpu.memory");
 const CLOCKS: PanelId = PanelId("gpu.clocks");
 pub(super) const HISTORY_CAP: usize = 480;
 const DEVICE_CAP: usize = 32;
+const ACTIVITY_RING_COUNT: usize = 12;
 const FULL: [Variant; 1] = [Variant {
     kind: VariantKind::Full,
     min: (34, 5),
@@ -56,6 +57,31 @@ const SPECS: [PanelSpec; 4] = [
 ];
 
 #[derive(Debug, Clone)]
+pub(super) struct ActivityRing {
+    pub(super) values: [f32; HISTORY_CAP],
+    pub(super) next: usize,
+    pub(super) len: usize,
+}
+
+impl ActivityRing {
+    fn new() -> Self {
+        Self {
+            values: [0.0; HISTORY_CAP],
+            next: 0,
+            len: 0,
+        }
+    }
+
+    fn push(&mut self, value: f32) {
+        BusyHistory::push_ring(&mut self.values, &mut self.next, &mut self.len, value);
+    }
+
+    pub(super) fn ordered_into(&self, output: &mut [f32; HISTORY_CAP]) -> usize {
+        BusyHistory::ordered_ring(&self.values, self.next, self.len, output)
+    }
+}
+
+#[derive(Debug, Clone)]
 pub(super) struct BusyHistory {
     pub(super) slot: String,
     pub(super) values: [f32; HISTORY_CAP],
@@ -76,6 +102,7 @@ pub(super) struct BusyHistory {
     pub(super) power: [f32; HISTORY_CAP],
     pub(super) power_next: usize,
     pub(super) power_len: usize,
+    pub(super) activity: [ActivityRing; ACTIVITY_RING_COUNT],
 }
 
 impl BusyHistory {
@@ -100,6 +127,7 @@ impl BusyHistory {
             power: [0.0; HISTORY_CAP],
             power_next: 0,
             power_len: 0,
+            activity: std::array::from_fn(|_| ActivityRing::new()),
         }
     }
 
@@ -182,7 +210,7 @@ impl GpuModel {
     }
 
     pub(in crate::monitor) fn absorb_frame(&mut self, frame: &MonitorFrame) {
-        copy_rows(
+        copy_gpu_devices(
             &mut self.devices.devices,
             &frame.parts.gpu_devices.devices,
             DEVICE_CAP,
@@ -286,6 +314,23 @@ impl GpuModel {
                         .find(|reading| u32::from(reading.card) == card && !reading.suspended)
                         .map(|reading| &reading.metrics)
                 });
+                let mut activities = [None; ACTIVITY_RING_COUNT];
+                if let Some(metrics) = metrics.filter(|metrics| metrics.layout_verified) {
+                    activities[..4].copy_from_slice(&[
+                        metrics.activity_gfx,
+                        metrics.activity_mm,
+                        metrics.activity_vcn,
+                        metrics.activity_umc,
+                    ]);
+                    activities[4..].copy_from_slice(&metrics.activity_ipu);
+                }
+                for (ring, value) in history.activity.iter_mut().zip(activities) {
+                    if let Some(value) = value.filter(|value| *value <= 100) {
+                        ring.push(f32::from(value) / 100.0);
+                    } else if ring.len > 0 {
+                        ring.push(f32::NAN);
+                    }
+                }
                 if let Some(metrics) = metrics
                     && let (Some(watts_mw), Some(cap_w)) = (
                         metrics.power_socket,
@@ -318,6 +363,42 @@ fn copy_rows<T: Clone>(destination: &mut Vec<T>, source: &[T], cap: usize) {
     destination.truncate(count);
 }
 
+fn copy_gpu_devices(
+    destination: &mut Vec<thegn_metrics::collect::model::gpu::GpuDevice>,
+    source: &[thegn_metrics::collect::model::gpu::GpuDevice],
+    cap: usize,
+) {
+    let count = source.len().min(cap);
+    for (index, source_row) in source.iter().take(count).enumerate() {
+        if let Some(destination_row) = destination.get_mut(index) {
+            destination_row.card = source_row.card;
+            destination_row.kind = source_row.kind;
+            destination_row.ip_version = source_row.ip_version;
+            destination_row.runtime_status = source_row.runtime_status;
+            destination_row.vram_total = source_row.vram_total;
+            destination_row.gtt_total = source_row.gtt_total;
+            destination_row.boot_vga = source_row.boot_vga;
+            destination_row.slot.clone_from(&source_row.slot);
+            clone_optional_string(&mut destination_row.driver, &source_row.driver);
+            clone_optional_string(&mut destination_row.pci_id, &source_row.pci_id);
+            clone_optional_string(&mut destination_row.family, &source_row.family);
+        } else {
+            destination.push(source_row.clone());
+        }
+    }
+    destination.truncate(count);
+}
+
+fn clone_optional_string(destination: &mut Option<String>, source: &Option<String>) {
+    match source {
+        Some(source) => match destination {
+            Some(destination) => destination.clone_from(source),
+            None => *destination = Some(source.clone()),
+        },
+        None => *destination = None,
+    }
+}
+
 pub(in crate::monitor) struct GpuView<'a>(pub &'a GpuModel);
 
 impl TabView for GpuView<'_> {
@@ -347,6 +428,8 @@ impl TabView for GpuView<'_> {
             }
             ENGINES => {
                 demand.insert(CollectorId::GpuEngines);
+                demand.insert(CollectorId::AmdSmu);
+                demand.insert(CollectorId::GpuDevices);
             }
             MEMORY => {
                 demand.insert(CollectorId::GpuDevices);

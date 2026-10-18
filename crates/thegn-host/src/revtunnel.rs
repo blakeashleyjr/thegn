@@ -22,6 +22,50 @@ use tokio::runtime::Handle;
 use tokio::sync::Semaphore;
 use tokio::task::JoinHandle;
 
+/// Emit the process-wide reverse-tunnel rejection deltas for one perf interval.
+pub(crate) fn report_rejection_counts(interval_seconds: f64) {
+    static PREVIOUS: OnceLock<Mutex<thegn_svc::revtunnel::RejectionCounts>> = OnceLock::new();
+    let current = thegn_svc::revtunnel::rejection_counts();
+    let previous = PREVIOUS.get_or_init(|| Mutex::new(Default::default()));
+    let mut previous = match previous.lock() {
+        Ok(previous) => previous,
+        Err(_) => return,
+    };
+    let delta = thegn_svc::revtunnel::RejectionCounts {
+        connection_limit: current
+            .connection_limit
+            .saturating_sub(previous.connection_limit),
+        global_connection_limit: current
+            .global_connection_limit
+            .saturating_sub(previous.global_connection_limit),
+        duplicate_id: current.duplicate_id.saturating_sub(previous.duplicate_id),
+        dial_timeout: current.dial_timeout.saturating_sub(previous.dial_timeout),
+        accept_transient: current
+            .accept_transient
+            .saturating_sub(previous.accept_transient),
+        write_stall: current.write_stall.saturating_sub(previous.write_stall),
+        idle: current.idle.saturating_sub(previous.idle),
+        lifetime: current.lifetime.saturating_sub(previous.lifetime),
+    };
+    *previous = current;
+    if delta == Default::default() {
+        return;
+    }
+    tracing::info!(
+        target: "thegn::perf::revtunnel",
+        interval_seconds,
+        connection_limit = delta.connection_limit,
+        global_connection_limit = delta.global_connection_limit,
+        duplicate_id = delta.duplicate_id,
+        dial_timeout = delta.dial_timeout,
+        accept_transient = delta.accept_transient,
+        write_stall = delta.write_stall,
+        idle = delta.idle,
+        lifetime = delta.lifetime,
+        "reverse-tunnel rejection counts"
+    );
+}
+
 /// `(worktree, sandbox_port)` → its supervisor task (self-healing pump loop).
 type Tasks = Arc<Mutex<HashMap<(String, u16), JoinHandle<()>>>>;
 

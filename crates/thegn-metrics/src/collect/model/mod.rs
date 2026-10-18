@@ -18,6 +18,7 @@ pub mod gpu_engines;
 pub mod hwmon;
 pub mod loadavg;
 pub mod meminfo;
+pub mod net_attrib;
 pub mod net_sockets;
 pub mod net_wifi;
 pub mod netdev;

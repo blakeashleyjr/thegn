@@ -1249,6 +1249,7 @@ impl LoopPerf {
         }
 
         crate::perf_rt::report(snap.interval_seconds);
+        crate::revtunnel::report_rejection_counts(snap.interval_seconds);
         self.take();
         // Rollup/logging/publication work belongs to the NEXT interval, whose
         // active clock uses this exact same boundary. Do not discard its cost.
