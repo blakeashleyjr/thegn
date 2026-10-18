@@ -85,7 +85,7 @@ pub(super) fn package(
     );
     if let Some(limit) = sensor.crit_c.or(sensor.max_c) {
         let label = if let Some(crit) = sensor.crit_c {
-            format!("scale {limit:.1} C · critical at {crit:.1} C")
+            format!("scale {limit:.1} C, critical at {crit:.1} C")
         } else {
             format!("scale {limit:.1} C")
         };

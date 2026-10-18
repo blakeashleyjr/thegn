@@ -23,7 +23,7 @@ use thegn_metrics::collect::{
         },
         thermal_zone::{ThermalTrip, ThermalZone, TripKind},
     },
-    parse::amd_gpu_metrics::{Decoded, GpuMetrics},
+    parse::amd_gpu_metrics::{Decoded, GpuMetrics, Header},
 };
 
 fn fixture() -> MonitorFrame {
@@ -761,6 +761,11 @@ fn smu_core_panel_is_placed_before_the_first_core_reading() {
     let mut first_frame = fixture();
     if let Some(card) = first_frame.parts.amd_smu.cards.first_mut() {
         card.metrics.temperature_core = [None; 16];
+        card.metrics.header = Some(Header {
+            structure_size: 100,
+            format: 2,
+            content: 0,
+        });
     }
     if let Some(layout) = first_frame.parts.hwmon.layout.as_deref() {
         let retained = layout
@@ -838,6 +843,91 @@ fn core_panel_presence_does_not_follow_missing_frame_values() {
 }
 
 #[test]
+fn core_panel_placement_uses_apu_metrics_revision_not_health() {
+    let health_states = [
+        thegn_metrics::collect::health::Health::Warming,
+        thegn_metrics::collect::health::Health::Ok,
+        thegn_metrics::collect::health::Health::Absent(
+            thegn_metrics::collect::health::Absent::NoHardware,
+        ),
+    ];
+    let headers = [
+        (
+            Some(Header {
+                structure_size: 100,
+                format: 2,
+                content: 0,
+            }),
+            true,
+        ),
+        (
+            Some(Header {
+                structure_size: 100,
+                format: 1,
+                content: 0,
+            }),
+            false,
+        ),
+        (None, false),
+    ];
+    let area = Rect::full(160, 45);
+    for health in health_states {
+        for (header, expected) in headers {
+            let mut frame = fixture();
+            frame.health[CollectorId::AmdSmu.index()] = health;
+            if let Some(layout) = frame.parts.hwmon.layout.as_deref() {
+                let retained = layout
+                    .sensors
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, sensor)| {
+                        !sensor
+                            .label
+                            .as_deref()
+                            .is_some_and(|label| label.starts_with("core"))
+                    })
+                    .collect::<Vec<_>>();
+                let mut filtered = (*layout).clone();
+                filtered.sensors = retained
+                    .iter()
+                    .map(|(_, sensor)| (**sensor).clone())
+                    .collect();
+                frame.parts.hwmon.values = retained
+                    .iter()
+                    .filter_map(|(index, _)| frame.parts.hwmon.values.get(*index).cloned())
+                    .collect();
+                frame.parts.hwmon.layout = Some(Arc::new(filtered));
+            }
+            frame.parts.amd_smu.cards.clear();
+            if let Some(header) = header {
+                frame.parts.amd_smu.cards.push(AmdSmuCard {
+                    card: 0,
+                    suspended: false,
+                    decoded: AmdSmuStatus::Decoded(Decoded::Full),
+                    metrics: GpuMetrics {
+                        header: Some(header),
+                        ..GpuMetrics::default()
+                    },
+                });
+            }
+            let mut model = ThermalModel::default();
+            model.absorb_frame(&frame);
+            let first = Board::default()
+                .placed(&ThermalView(&model), area)
+                .iter()
+                .any(|panel| panel.id == super::CORES);
+            model.absorb_frame(&frame);
+            let second = Board::default()
+                .placed(&ThermalView(&model), area)
+                .iter()
+                .any(|panel| panel.id == super::CORES);
+            assert_eq!(first, expected, "health={health:?}, header={header:?}");
+            assert_eq!(second, expected, "health={health:?}, header={header:?}");
+        }
+    }
+}
+
+#[test]
 fn telemetry_series_storage_stays_warm_across_one_thousand_absorbs() {
     let mut history = TelemetryHistory::default();
     for sample in 0..120_u64 {
@@ -903,6 +993,54 @@ fn gpu_temperature_history_is_bounded_and_right_aligned() {
             .nth(78)
             .is_some_and(|cell| cell != ' ' && cell != '\u{2800}')
     }));
+}
+
+#[test]
+fn narrow_package_graph_clamps_and_keeps_newest_sample_at_right_edge() {
+    for unicode in [UnicodeLevel::Ascii, UnicodeLevel::Full] {
+        test_override::with_unicode(unicode, || {
+            let mut model = ThermalModel::default();
+            model.temp_history = vec![40.0; HISTORY_CAP - 1];
+            model.temp_history.push(95.0);
+            let area = Rect {
+                x: 5,
+                y: 1,
+                cols: 50,
+                rows: 12,
+            };
+            let placed = Placed {
+                id: super::PACKAGE,
+                rect: area,
+                variant: super::FULL.kind,
+            };
+            let mut surface = Surface::new(60, 15);
+            ThermalView(&model).paint(&mut surface, &placed, area, 0, &[]);
+            let output = text(&mut surface);
+            let lines = output.lines().collect::<Vec<_>>();
+            for (y, line) in lines.iter().enumerate() {
+                for (x, ch) in line.chars().enumerate() {
+                    if !(area.x..area.x + area.cols).contains(&x)
+                        || !(area.y..area.y + area.rows).contains(&y)
+                    {
+                        assert!(
+                            ch == ' ' || ch == '\u{2800}',
+                            "painted outside panel at {x},{y}"
+                        );
+                    }
+                }
+            }
+            let inner_right = area.x + area.cols - 2;
+            let newest_graph_row = area.y + 6;
+            let newest = lines
+                .get(newest_graph_row)
+                .and_then(|line| line.chars().nth(inner_right))
+                .expect("newest graph cell at panel's last inner column");
+            assert!(
+                newest != ' ' && newest != '\u{2800}',
+                "newest 95 C sample missing at right edge for {unicode:?}: {output}"
+            );
+        });
+    }
 }
 
 #[test]
@@ -1123,9 +1261,6 @@ fn amd_cards_keep_first_available_cores_and_gpu_readings() {
 fn cores_panel_is_absent_without_core_temperatures() {
     let mut frame = fixture();
     frame.parts.amd_smu.cards.clear();
-    frame.health[CollectorId::AmdSmu.index()] = thegn_metrics::collect::health::Health::Absent(
-        thegn_metrics::collect::health::Absent::NoHardware,
-    );
     if let Some(layout) = frame.parts.hwmon.layout.as_deref() {
         let retained = layout
             .sensors
