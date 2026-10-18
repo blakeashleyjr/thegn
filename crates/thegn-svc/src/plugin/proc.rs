@@ -114,6 +114,7 @@ pub(crate) fn decode_frame(text: &str) -> Result<Frame, FrameReject> {
     use std::fmt;
 
     struct UniqueValue(Value);
+    const DUPLICATE_MEMBER_ERROR: &str = "__thegn_duplicate_json_member__";
 
     impl<'de> Deserialize<'de> for UniqueValue {
         fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
@@ -180,7 +181,7 @@ pub(crate) fn decode_frame(text: &str) -> Result<Frame, FrameReject> {
                     let mut values = serde_json::Map::new();
                     while let Some(key) = map.next_key::<String>()? {
                         if values.contains_key(&key) {
-                            return Err(de::Error::custom("duplicate JSON object member"));
+                            return Err(de::Error::custom(DUPLICATE_MEMBER_ERROR));
                         }
                         let UniqueValue(value) = map.next_value()?;
                         values.insert(key, value);
@@ -226,7 +227,7 @@ pub(crate) fn decode_frame(text: &str) -> Result<Frame, FrameReject> {
         return Err(FrameReject::Depth);
     }
     let UniqueValue(value) = serde_json::from_str(text).map_err(|error| {
-        if error.to_string().contains("duplicate JSON object member") {
+        if error.to_string().contains(DUPLICATE_MEMBER_ERROR) {
             FrameReject::Member
         } else {
             FrameReject::Syntax
@@ -807,7 +808,7 @@ pub(crate) fn kill_group(pid: u32) {
     }
 }
 
-#[cfg(any(unix, test))]
+#[cfg(unix)]
 fn kill_errno_should_warn(errno: i32) -> bool {
     errno != libc::ESRCH
 }
@@ -825,3 +826,14 @@ pub(crate) fn kill_group(pid: u32) {
 #[cfg(test)]
 #[path = "proc_tests.rs"]
 mod tests;
+
+#[cfg(all(test, unix))]
+mod kill_errno_tests {
+    use super::kill_errno_should_warn;
+
+    #[test]
+    fn kill_group_errno_classification_silences_esrch_and_warns_other_errors() {
+        assert!(!kill_errno_should_warn(libc::ESRCH));
+        assert!(kill_errno_should_warn(libc::EPERM));
+    }
+}
