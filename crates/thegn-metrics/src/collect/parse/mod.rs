@@ -3,6 +3,7 @@ pub mod amd_gpu_metrics;
 pub mod cgroup;
 pub mod cpufreq;
 pub mod diskstats;
+pub mod fdinfo;
 pub mod interrupts;
 pub mod loadavg;
 pub mod meminfo;
