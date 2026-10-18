@@ -246,12 +246,22 @@ async fn supervise_sink<F>(read_loop: F, sink_task: &mut JoinHandle<()>) -> (io:
 where
     F: std::future::Future<Output = io::Result<()>>,
 {
+    tokio::pin!(read_loop);
     tokio::select! {
-        result = read_loop => (result, false),
-        _ = sink_task => (
-            Err(io::Error::new(io::ErrorKind::BrokenPipe, "reverse-tunnel shared sink stopped")),
-            true,
-        ),
+        result = &mut read_loop => (result, false),
+        _ = sink_task => {
+            // A peer close can make a queued sink write fail just before the
+            // read half observes EOF. Give that read one poll before reporting
+            // a sink failure; do not prioritize it indefinitely over writes.
+            tokio::select! {
+                biased;
+                result = &mut read_loop => (result, false),
+                _ = tokio::task::yield_now() => (
+                    Err(io::Error::new(io::ErrorKind::BrokenPipe, "reverse-tunnel shared sink stopped")),
+                    true,
+                ),
+            }
+        }
     }
 }
 
@@ -485,7 +495,7 @@ async fn pump_conn_with_deadlines(
     let inbound_activity = activity_ms.clone();
     let inbound_activity_notify = activity_notify.clone();
     let inbound_stall_notify = stall_notify.clone();
-    let inbound_to_local = async move {
+    let inbound_to_local = async {
         while let Some(data) = inbound.recv().await {
             match tokio::time::timeout(deadlines.write_stall, wr.write_all(&data)).await {
                 Err(_) => {
@@ -539,8 +549,9 @@ async fn pump_conn_with_deadlines(
             Ok(Ok(())) => {}
         }
     }
-    // The inbound future owns the local write half and half-closes it on a clean end;
-    // on a deadline abort it is dropped with the stream.
+    if let Err(error) = wr.shutdown().await {
+        tracing::debug!(target: "thegn::revtunnel", %error, "local tunnel stream shutdown failed");
+    }
 }
 
 /// Shared per-connection routing table: id → inbound payload sender.
@@ -2148,7 +2159,7 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn lifetime_deadline_closes_only_the_stalled_connection() {
-        let (local, _client) = tokio::io::duplex(128);
+        let (local, mut client) = tokio::io::duplex(128);
         let (mut peer, sink_stream) = tokio::io::duplex(4096);
         let (sink, sink_task) = spawn_sink(sink_stream);
         let survivor_sink = sink.clone();
@@ -2178,6 +2189,14 @@ mod tests {
             Frame::Close(92)
         );
         task.await.unwrap();
+        let mut local_byte = [0u8; 1];
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(1), client.read(&mut local_byte))
+                .await
+                .expect("lifetime deadline did not close the local write half")
+                .unwrap(),
+            0
+        );
         assert_eq!(permits.available_permits(), 1);
         assert_eq!(rejection_counts().lifetime, before + 1);
         survivor_sink.send(encode(&Frame::Open(192))).await.unwrap();
