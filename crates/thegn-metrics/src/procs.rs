@@ -186,6 +186,7 @@ impl ProcSampler {
                 self_pid: self.self_pid,
                 daemon_pid: self.daemon_pid,
                 pane_pids: &self.pane_pids,
+                primed: false,
             },
             &mut self.primed,
         ) {
