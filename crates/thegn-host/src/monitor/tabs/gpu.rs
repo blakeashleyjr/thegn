@@ -8,6 +8,13 @@ use crate::telemetry::Metric;
 use thegn_core::theme::Hue;
 use thegn_core::viz::Unit;
 
+#[allow(dead_code)] // wired in a later batch (V-GPU-1b)
+pub(in crate::monitor) mod view;
+
+#[cfg(test)]
+#[path = "gpu_view_tests.rs"]
+mod view_tests;
+
 pub(in crate::monitor) fn gpu(cx: &Ctx) -> Vec<Section> {
     let s = &cx.model.stats;
     let mut out = vec![cx.graph(Metric::Gpu, MAIN_H, Tok::Hue(Hue::Teal))];
