@@ -777,10 +777,37 @@ fn a_short_window_over_thin_history_admits_how_much_it_has() {
 
 #[test]
 fn per_core_utilization_is_shown() {
-    // The sampler has always collected `cpu_cores`; the popups never showed it.
-    let (ov, _m, _h) = open();
+    // The CPU board renders per-core readings from the sampled monitor frame.
+    let (mut ov, _m, _h) = open();
+    let mut frame = thegn_metrics::collect::frame::MonitorFrame::default();
+    frame.health[thegn_metrics::collect::CollectorId::CpuStat.index()] =
+        thegn_metrics::collect::health::Health::Ok;
+    frame.health[thegn_metrics::collect::CollectorId::CpuTopology.index()] =
+        thegn_metrics::collect::health::Health::Ok;
+    frame
+        .parts
+        .cpu_stat
+        .cores
+        .push(thegn_metrics::collect::model::cpu_stat::CoreSample {
+            id: 0,
+            online: true,
+            share: Some(thegn_metrics::collect::model::cpu_stat::ModeShare {
+                busy: 500,
+                ..Default::default()
+            }),
+        });
+    frame.parts.cpu_topology.cpus.push(
+        thegn_metrics::collect::model::cpu_topology::CpuTopologyEntry {
+            id: 0,
+            core_type: thegn_metrics::collect::policy::cpu_topology::CoreType::Performance,
+            online: true,
+            ..Default::default()
+        },
+    );
+    frame.parts.cpu_topology.l3_groups.push(vec![0]);
+    assert!(ov.ingest_frame(&frame));
     let text = render_text(&ov, 120, 40);
-    assert!(text.contains("cores"), "no per-core block: {text}");
+    assert!(text.contains("0 P L30"), "per-core reading missing: {text}");
 }
 
 #[test]
