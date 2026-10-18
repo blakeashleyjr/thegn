@@ -55,19 +55,19 @@ pub(super) fn paint(model: &CpuModel, surface: &mut Surface, id: PanelId, rect: 
         rect.x,
         rect.y,
     );
-    if id == USAGE && rect.rows > 3 && rect.cols > 2 {
+    if id == USAGE && rect.rows > 5 && rect.cols > 2 {
         let graph_rect = Rect {
             x: rect.x + 1,
             y: rect.y + 2,
             cols: rect.cols.saturating_sub(2),
-            rows: rect.rows.saturating_sub(3),
+            rows: rect.rows.saturating_sub(5),
         };
         if model.cpu_history.is_empty() {
-            let mut warming = CellGrid::new(graph_rect.cols, 1);
+            let mut warming = CellGrid::new(graph_rect.cols, graph_rect.rows.min(1));
             warming.put_str(0, 0, mark(Health::Warming), CellStyle::default());
             Emitter::default().emit(
                 &warming,
-                Rect::full(graph_rect.cols, 1),
+                Rect::full(graph_rect.cols, graph_rect.rows.min(1)),
                 surface,
                 graph_rect.x,
                 graph_rect.y,
@@ -76,13 +76,54 @@ pub(super) fn paint(model: &CpuModel, surface: &mut Surface, id: PanelId, rect: 
             crate::monitor::graphs::paint_history_graph(
                 &model.cpu_history,
                 thegn_core::theme::RampId::Util,
-                graph_rect,
+                Rect {
+                    rows: graph_rect.rows.saturating_sub(2),
+                    ..graph_rect
+                },
                 surface,
             );
+        }
+        let io_values = model.iowait_history.ordered();
+        let steal_values = model.steal_history.ordered();
+        for (values, offset) in [
+            (&io_values, graph_rect.rows.saturating_sub(2)),
+            (&steal_values, graph_rect.rows.saturating_sub(1)),
+        ] {
+            if !values.is_empty() && graph_rect.rows >= 2 {
+                let mut label = CellGrid::new(3, 1);
+                let name = if offset == graph_rect.rows.saturating_sub(2) {
+                    "io"
+                } else {
+                    "st"
+                };
+                label.put_str(0, 0, name, CellStyle::default());
+                Emitter::default().emit(
+                    &label,
+                    Rect::full(3, 1),
+                    surface,
+                    graph_rect.x,
+                    graph_rect.y + offset,
+                );
+                crate::monitor::graphs::paint_sparkline(
+                    values,
+                    graph_rect.cols.saturating_sub(4),
+                    RampId::Util,
+                    Rect {
+                        x: graph_rect.x + 4,
+                        y: graph_rect.y + offset,
+                        cols: graph_rect.cols.saturating_sub(4),
+                        rows: 1,
+                    },
+                    surface,
+                );
+            }
         }
     }
     if id == CORES && rect.rows > 2 && rect.cols > 24 {
         paint_core_heatmap(model, rect, surface);
+    }
+    if id == FREQ && rect.rows > 5 {
+        paint_frequency_history(model, rect, surface);
     }
     if id == LOAD && rect.rows > 5 && rect.cols > 2 && !model.load_history.is_empty() {
         crate::monitor::graphs::paint_history_graph(
@@ -99,13 +140,37 @@ pub(super) fn paint(model: &CpuModel, surface: &mut Surface, id: PanelId, rect: 
     }
 }
 
+fn paint_frequency_history(model: &CpuModel, rect: Rect, surface: &mut Surface) {
+    for (index, policy) in model.cpu_freq.policies.iter().enumerate() {
+        let y = rect.y + 3 + index * 2;
+        if y >= rect.y + rect.rows || rect.cols == 0 {
+            break;
+        }
+        let Some(history) = model
+            .frequency_history
+            .iter()
+            .find(|history| history.policy == policy.policy)
+        else {
+            continue;
+        };
+        let values = history.samples.ordered();
+        crate::monitor::graphs::paint_sparkline(
+            &values,
+            rect.cols.saturating_sub(2),
+            RampId::Util,
+            Rect {
+                x: rect.x + 1,
+                y,
+                cols: rect.cols.saturating_sub(2),
+                rows: 1,
+            },
+            surface,
+        );
+    }
+}
+
 fn paint_cores(grid: &mut CellGrid, rect: Rect, model: &CpuModel) {
-    let mut body = panel::panel(
-        grid,
-        Rect::full(rect.cols, rect.rows),
-        "Cores grouped by L3",
-        None,
-    );
+    let mut body = panel::panel(grid, Rect::full(rect.cols, rect.rows), "Cores (L3)", None);
     let area = body.rect();
     if area.cols == 0 || area.rows == 0 {
         return;
@@ -114,18 +179,28 @@ fn paint_cores(grid: &mut CellGrid, rect: Rect, model: &CpuModel) {
         body.put_str(0, 0, mark(model.cpu_stat_health), CellStyle::default());
         return;
     }
-    let labels = model.cpu_stat.cores.len().div_ceil(2).min(area.rows);
+    let per_row = if crate::monitor::graphs::table().braille {
+        2
+    } else {
+        1
+    };
+    let labels = model.cpu_stat.cores.len().div_ceil(per_row).min(area.rows);
     for row in 0..labels {
-        let first = row * 2;
+        let first = row * per_row;
         let first_label = core_label(model, first);
-        let second_label = model
-            .cpu_stat
-            .cores
-            .get(first + 1)
-            .map(|_| core_label(model, first + 1));
-        let line = second_label.map_or(first_label.clone(), |second| {
-            format!("{first_label} / {second}")
-        });
+        let second_label = if per_row == 2 {
+            model
+                .cpu_stat
+                .cores
+                .get(first + 1)
+                .map(|_| core_label(model, first + 1))
+        } else {
+            None
+        };
+        let line = match second_label {
+            Some(second) => format!("{first_label} / {second}"),
+            None => first_label,
+        };
         body.put_str(0, row, &line, CellStyle::default());
     }
 }
@@ -159,7 +234,12 @@ fn core_label(model: &CpuModel, index: usize) -> String {
             .position(|group| group.contains(&core.id))
     };
     let group_label = group.map_or_else(String::new, |value| format!(" L3{value}"));
-    format!("{:>2} {kind}{group_label}", core.id)
+    let kind_label = if kind.is_empty() {
+        String::new()
+    } else {
+        format!("{kind} ")
+    };
+    format!("{:>2} {kind_label}{group_label}", core.id)
 }
 
 fn paint_core_heatmap(model: &CpuModel, rect: Rect, surface: &mut Surface) {
@@ -177,13 +257,17 @@ fn paint_core_heatmap(model: &CpuModel, rect: Rect, surface: &mut Surface) {
         return;
     }
     let mut rows = [&[][..]; super::CORE_HISTORY_LIMIT];
+    let mut ordered_rows = Vec::with_capacity(model.core_busy_history.len());
     let count = model.core_busy_history.len().min(rows.len());
-    for (row, history) in rows
-        .iter_mut()
-        .zip(model.core_busy_history.iter())
-        .take(count)
-    {
-        *row = history;
+    ordered_rows.extend(
+        model
+            .core_busy_history
+            .iter()
+            .take(count)
+            .map(|history| history.ordered()),
+    );
+    for (row, samples) in rows.iter_mut().zip(&ordered_rows) {
+        *row = &samples[samples.len().saturating_sub(graph_rect.cols)..];
     }
     let mut out = crate::monitor::graphs::GraphOut::new();
     crate::monitor::graphs::paint_heatmap(
@@ -358,31 +442,19 @@ fn paint_heat_panel(
         }
         return;
     }
-    let mut y = 0;
+    let y = 0;
     let label = "total";
     body.put_str(0, y, label, CellStyle::default());
-    let value = part.total.map(|share| f32::from(share.busy) / 1000.0);
-    if let Some(value) = value {
-        let modes = part.total.map_or_else(
-            || {
-                format!(
-                    "busy {:>2}% io{} st{}",
-                    (value * 100.0).round() as u8,
-                    mark(health),
-                    mark(health)
-                )
-            },
-            |share| {
-                format!(
-                    "busy {:>2}% u{:>2} s{:>2} io{:>2} irq{:>2} st{:>2}",
-                    (value * 100.0).round() as u8,
-                    share.user / 10,
-                    share.system / 10,
-                    share.iowait / 10,
-                    (share.irq + share.softirq) / 10,
-                    share.steal / 10
-                )
-            },
+    if let Some(share) = part.total {
+        let value = f32::from(share.busy) / 1000.0;
+        let modes = format!(
+            "busy {:>2}% u{:>2} s{:>2} io{:>2} irq{:>2} st{:>2}",
+            (value * 100.0).round() as u8,
+            share.user / 10,
+            share.system / 10,
+            share.iowait / 10,
+            (share.irq + share.softirq) / 10,
+            share.steal / 10
         );
         let width = area.cols.saturating_sub(7).saturating_sub(modes.len());
         let mut gauge = CellGrid::new(width, 1);
@@ -412,73 +484,6 @@ fn paint_heat_panel(
     } else {
         body.put_str(7.min(area.cols), y, mark(health), CellStyle::default());
     }
-    y += 1;
-    if rows.is_empty() {
-        body.put_str(0, y, mark(health), CellStyle::default());
-        return;
-    }
-    let visible = area.rows.saturating_sub(y).min(rows.len());
-    for (line, core) in rows.iter().take(visible).enumerate() {
-        let y = y + line;
-        let label = format!("CPU{:02}", core.id);
-        body.put_str(
-            0,
-            y,
-            &label,
-            CellStyle {
-                fg: style(Tok::Slot(S::Ghost)),
-                ..CellStyle::default()
-            },
-        );
-        let start = 6.min(area.cols);
-        let missing = if core.online {
-            Health::Warming
-        } else {
-            Health::Absent(Absent::NoHardware)
-        };
-        let suffix = core.share.map_or_else(
-            || mark(missing).to_owned(),
-            |share| {
-                format!(
-                    "{:>3}% io{:>2}% st{:>2}%",
-                    share.busy / 10,
-                    share.iowait / 10,
-                    share.steal / 10
-                )
-            },
-        );
-        let width = area.cols.saturating_sub(start).saturating_sub(suffix.len());
-        if let Some(share) = core.share {
-            let fraction = f32::from(share.busy) / 1000.0;
-            let (filled, track) = caps::bar_track(fraction, width);
-            body.put_str(
-                start,
-                y,
-                &filled,
-                CellStyle {
-                    fg: style(Tok::Ramp(RampId::Util, (fraction * 7.0) as u8)),
-                    ..CellStyle::default()
-                },
-            );
-            body.put_str(
-                start + filled.chars().count(),
-                y,
-                &track,
-                CellStyle {
-                    fg: style(Tok::Slot(S::Dim)),
-                    ..CellStyle::default()
-                },
-            );
-            body.put_str(
-                area.cols.saturating_sub(suffix.len()),
-                y,
-                &suffix,
-                CellStyle::default(),
-            );
-        } else {
-            body.put_str(start, y, mark(missing), CellStyle::default());
-        }
-    }
 }
 
 fn mark(health: Health) -> &'static str {
@@ -504,7 +509,7 @@ fn paint_freq(grid: &mut CellGrid, rect: Rect, part: &CpuFreqPart, health: Healt
         .unwrap_or(mark(missing));
     let profile_line = format!("profile {profile}");
     body.put_str(0, 0, &profile_line, CellStyle::default());
-    let count = part.policies.len().min(area.rows.saturating_sub(1));
+    let count = part.policies.len().min(area.rows.saturating_sub(1) / 2);
     if count == 0 {
         body.put_str(
             0,
@@ -514,7 +519,8 @@ fn paint_freq(grid: &mut CellGrid, rect: Rect, part: &CpuFreqPart, health: Healt
         );
         return;
     }
-    for (row, policy) in part.policies.iter().take(count).enumerate() {
+    for (index, policy) in part.policies.iter().take(count).enumerate() {
+        let row = index * 2;
         let min = policy.scaling_min_khz.or(policy.hw_min_khz);
         let max = policy.scaling_max_khz.or(policy.hw_max_khz);
         let current = policy.cur_khz;
