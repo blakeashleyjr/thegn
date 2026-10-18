@@ -2158,6 +2158,8 @@ fn disk_volume_row_displays_collapsed_mount_count() {
     let model = model_with(full_snap());
     let hist = history(120, NOW_MS);
     let mut overlay = open_tab(MonitorTab::Disk, &model, &hist, SHORT);
+    // Placement is computed from SHORT's 64x15 dimensions; render_text at 100x30
+    // reuses those dimensions, so this verifies the same Filesystems panel.
     assert!(
         overlay
             .placed_panels()

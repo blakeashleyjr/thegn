@@ -592,6 +592,7 @@ fn same_row_identity(left: &FilesystemRow, right: &FilesystemRow) -> bool {
 }
 
 fn copy_numeric(target: &mut FilesystemRow, source: &FilesystemRow) {
+    target.extra_mounts = source.extra_mounts;
     target.total_bytes = source.total_bytes;
     target.free_bytes = source.free_bytes;
     target.avail_bytes = source.avail_bytes;

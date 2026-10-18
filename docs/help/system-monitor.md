@@ -174,8 +174,8 @@ The network masthead chip expands into this tab.
 The Disk tab is a panel board. `disk.io` shows aggregate read/write throughput
 and its selected-window history with the actual peak values and units. `disk.pressure`
 shows I/O PSI on a 0–100% scale. `disk.devices` shows device rates and utilization
-with each trend's peak labeled. `disk.filesystems` shows used space against each
-filesystem's total and a bounded recent fill trend; `+N` marks further mount
+with each trend's peak labeled. `disk.filesystems` shows each mount point,
+filesystem type, used/total space, and a fill gauge; `+N` marks further mount
 points of the same superblock folded into that row. `disk.slice` shows thegn.slice
 I/O totals, interval rates, and their actual history peaks. Each placed panel
 requests only its own collectors; `disk.worktrees` uses the background `[disk]`
@@ -191,15 +191,17 @@ removes only regenerable build artifacts off the event loop; the row updates
 after the next measurement. Use `f`/`F` to move panel focus, `z` to zoom, and
 `Esc` to unzoom before closing the monitor.
 
-When the recorded free-space trend is clearly downward, the worktrees-filesystem
-heading also shows a **time-to-full projection** ("filling · full in ~2d"). It
-is deliberately conservative: with a flat or growing disk, or too little history
-to extrapolate honestly, it shows nothing rather than a confident wrong number.
-The optional `[stats.alerts] disk_eta` rule (off by default) fires off the same
-projection when the runway drops below a configured number of hours. The Disk
-masthead chip expands into this tab.
+The Worktrees panel lists each cached worktree's total size, reclaimable
+`target/` size, and measurement age, and its title gives the total reclaimable
+amount. It does not show a time-to-full projection. The optional
+`[stats.alerts] disk_eta` rule (off by default) still uses the recorded
+free-space history and fires when its runway drops below the configured number
+of hours. The Disk masthead chip expands into this tab.
 
-The `worktrees filesystem` block reports total, available, and used space.
+The Filesystems panel shows each mount point, filesystem type, used/total
+space, and a fill gauge. It does not show available space as a separate
+column. `+N` marks further mount points of the same superblock folded into that
+row.
 On Linux, `thegn doctor` also reports Disk health from UDisks2 when available,
 including health, critical warnings, wear, spare, read/write totals, power-on
 time, and the last four serial characters. Missing serial or health values

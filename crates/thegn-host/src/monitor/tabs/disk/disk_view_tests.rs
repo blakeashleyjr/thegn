@@ -354,21 +354,21 @@ fn snapshots_cover_target_sizes_capabilities_and_static_panel_demand() {
                         let ratio = fill_ratio(&surface, Rect::full(cols, rows));
                         match (unicode, depth) {
                             (UnicodeLevel::Full, ColorDepth::Truecolor) => {
-                                // density follow-up (batch 50): estimated, primary sets from the printed value
+                                // density follow-up (batch 52): estimated, primary sets from the printed value
                                 assert!(
                                     ratio >= 0.30,
                                     "{cols}x{rows} {unicode:?}/{depth:?}: fill ratio {ratio:.3}"
                                 );
                             }
                             (UnicodeLevel::Full, ColorDepth::Ansi16) => {
-                                // density follow-up (batch 50): estimated, primary sets from the printed value
+                                // density follow-up (batch 52): estimated, primary sets from the printed value
                                 assert!(
                                     ratio >= 0.30,
                                     "{cols}x{rows} {unicode:?}/{depth:?}: fill ratio {ratio:.3}"
                                 );
                             }
                             (UnicodeLevel::Ascii, ColorDepth::None) => {
-                                // density follow-up (batch 50): estimated, primary sets from the printed value
+                                // density follow-up (batch 52): estimated, primary sets from the printed value
                                 assert!(
                                     ratio >= 0.30,
                                     "{cols}x{rows} {unicode:?}/{depth:?}: fill ratio {ratio:.3}"
@@ -579,9 +579,10 @@ fn a_ring_with_no_finite_live_sample_has_no_peak() {
     history.push(f32::NAN);
 
     assert_eq!(
-        history_peak(&history, Health::Ok, 16),
+        history_peak(&history, Health::Ok, 16).trim_start(),
         crate::caps::active_glyphs().emdash
     );
+    assert!(!history_peak(&history, Health::Ok, 16).contains("0B/s"));
 }
 
 #[test]
