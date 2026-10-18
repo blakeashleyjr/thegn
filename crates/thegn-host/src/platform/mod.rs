@@ -165,7 +165,7 @@ pub enum ProcSignal {
 }
 
 mod signal_identity;
-pub use signal_identity::{SignalError, signal_identity};
+pub use signal_identity::{ProcStart, SignalError, signal_identity};
 
 /// Live per-process introspection (pane cwd / foreground job / argv). Unlike the
 /// rest of this module the split is Linux-vs-macOS-vs-other rather than

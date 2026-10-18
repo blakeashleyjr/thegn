@@ -213,10 +213,10 @@ impl MonitorOverlay {
     pub(in crate::monitor) fn begin_signal(&mut self) -> MonitorOutcome {
         // Copy out of the row first so the immutable borrow of `self.proc_rows`
         // ends before `self.confirm`/`self.status` are written.
-        let Some((pid, start_time, name, owner)) = self
+        let Some((pid, start_time, start_ticks, name, owner)) = self
             .proc_rows
             .get(self.sel)
-            .map(|r| (r.pid, r.start_time, r.name.clone(), r.owner))
+            .map(|r| (r.pid, r.start_time, r.start_ticks, r.name.clone(), r.owner))
         else {
             return MonitorOutcome::Pending;
         };
@@ -235,6 +235,7 @@ impl MonitorOverlay {
         self.confirm = Some(Confirm::Signal {
             pid,
             start_time,
+            start_ticks,
             label,
             stage,
         });
@@ -246,7 +247,7 @@ impl MonitorOverlay {
     pub(in crate::monitor) fn perform_signal(
         &mut self,
         pid: u32,
-        start_time: u64,
+        start: crate::platform::ProcStart,
         label: &str,
         stage: crate::platform::ProcSignal,
     ) {
@@ -254,11 +255,11 @@ impl MonitorOverlay {
             crate::platform::ProcSignal::Terminate => "SIGTERM",
             crate::platform::ProcSignal::Kill => "SIGKILL",
         };
-        match crate::platform::signal_identity(pid, start_time, stage) {
+        match crate::platform::signal_identity(pid, start, stage) {
             Ok(()) => {
                 self.status = Some(format!("sent {name} to {label}"));
                 if stage == crate::platform::ProcSignal::Terminate {
-                    self.last_termed = Some((pid, start_time));
+                    self.last_termed = Some((pid, start.secs));
                 }
             }
             Err(crate::platform::SignalError::Changed) => {
