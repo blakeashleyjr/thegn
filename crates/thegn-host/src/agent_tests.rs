@@ -33,6 +33,22 @@ fn pinned_worktree_candidate_check_uses_off_floor_by_default() {
 }
 
 #[test]
+fn clear_force_host_clears_failed_sandbox_memo_for_worktree() {
+    let _guard = crate::sandbox_fallback_memo::TEST_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    crate::sandbox_fallback_memo::reset_for_test();
+    let worktree = "/repo/retry-wt";
+    let key = crate::sandbox_fallback_memo::Key::new("dev", "local", worktree);
+    crate::sandbox_fallback_memo::remember_failure(1, key.clone(), "podman", "failed");
+
+    clear_force_host(worktree);
+
+    assert!(crate::sandbox_fallback_memo::is_empty_for_test());
+    assert!(crate::sandbox_fallback_memo::reusable_failure(false, 1, &key, "podman").is_none());
+}
+
+#[test]
 fn on_missing_fail_refuses_the_pane_instead_of_exiting() {
     with_temp_state("auto-host-on-missing-fail", || {
         let mut cfg = cfg_with(&[], &[]);
@@ -166,6 +182,104 @@ fn compose_policy_miss_halts_before_auto_chain_host_entry() {
         "{}",
         halt.reason
     );
+}
+
+#[test]
+#[cfg(unix)]
+fn prepare_sandbox_env_reuses_failed_podman_probe_and_keeps_warnings() {
+    if thegn_core::sandbox_backend::host_os() != thegn_core::sandbox_backend::HostOs::Linux {
+        return;
+    }
+    let _memo_guard = crate::sandbox_fallback_memo::TEST_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let scratch = tempfile::tempdir().unwrap();
+    let bin = scratch.path().join("bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    let counter = scratch.path().join("podman-attempts");
+    let podman = bin.join("podman");
+    let bwrap = bin.join("bwrap");
+    std::fs::write(
+        &podman,
+        format!(
+            "#!/bin/sh\nif [ \"$1\" = version ]; then exit 0; fi\nif [ \"$1\" = run ]; then echo attempt >> '{}'; fi\nexit 1\n",
+            counter.display()
+        ),
+    )
+    .unwrap();
+    std::fs::write(&bwrap, "#!/bin/sh\nexit 0\n").unwrap();
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(&podman, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::fs::set_permissions(&bwrap, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    let path = format!("{}:/usr/bin:/bin", bin.display());
+    let _state = crate::testenv::IsolatedState::with_env(&[("PATH", &path)]);
+    crate::sandbox_fallback_memo::reset_for_test();
+
+    let mut cfg = Config::default();
+    cfg.sandbox.backend = thegn_core::config::SandboxBackend::Auto;
+    cfg.sandbox.backend_chain = vec!["podman-rootless".into(), "bwrap".into()];
+    cfg.sandbox.isolation_floor = Some(thegn_core::config::IsolationFloor::Off);
+    let loc = GitLoc::from_db("/wt/memo", None);
+    let first = prepare_sandbox_env(
+        &cfg,
+        Path::new("/repo"),
+        "/wt/memo",
+        &loc,
+        None,
+        false,
+        None,
+    )
+    .expect("bwrap fake succeeds after podman ensure fails");
+    assert_eq!(first.backend_label, "bwrap");
+    assert_eq!(crate::sandbox_fallback_memo::attempts_for_test(), 1);
+    let podman_runs = std::fs::read_to_string(&counter).unwrap().lines().count();
+    assert!(podman_runs > 0, "the first resolution must attempt podman");
+
+    let second = prepare_sandbox_env(
+        &cfg,
+        Path::new("/repo"),
+        "/wt/memo",
+        &loc,
+        None,
+        false,
+        None,
+    )
+    .expect("memoized podman failure still falls through to bwrap");
+    assert_eq!(second.backend_label, "bwrap");
+    assert_eq!(
+        second.spec.as_ref().map(|spec| spec.backend),
+        first.spec.as_ref().map(|spec| spec.backend)
+    );
+    assert_eq!(second.shell, first.shell);
+    assert_eq!(second.is_remote, first.is_remote);
+    assert_eq!(second.cwd_override, first.cwd_override);
+    assert_eq!(second.location, first.location);
+    assert_eq!(second.degraded_from_provider, first.degraded_from_provider);
+    assert_eq!(second.route_ssh_target, first.route_ssh_target);
+    assert_eq!(crate::sandbox_fallback_memo::attempts_for_test(), 1);
+    assert_eq!(crate::sandbox_fallback_memo::reused_for_test(), 1);
+    assert_eq!(
+        second.warnings,
+        [
+            first.warnings,
+            vec!["sandbox podman-rootless: reused this session's earlier failed probe".into()]
+        ]
+        .concat()
+    );
+    assert_eq!(
+        std::fs::read_to_string(counter).unwrap().lines().count(),
+        podman_runs,
+        "the second resolution must not spawn podman again"
+    );
+    crate::sandbox_fallback_memo::clear_all();
+}
+
+#[test]
+fn vpn_attach_failure_is_classified_by_its_typed_error() {
+    let error = anyhow::Error::new(super::VpnAttachFailed("fixture failure".into()));
+    assert!(error.downcast_ref::<super::VpnAttachFailed>().is_some());
 }
 
 #[test]
@@ -1868,6 +1982,10 @@ fn disabled_sandbox_auto_backend_skips_host_fallback_notice() {
 #[test]
 fn final_host_fallback_honors_fail_closed_floor_without_a_resolved_candidate() {
     with_temp_state("floor-auto-host", || {
+        let _memo_guard = crate::sandbox_fallback_memo::TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        crate::sandbox_fallback_memo::reset_for_test();
         let mut cfg = Config::default();
         cfg.sandbox.backend = thegn_core::config::SandboxBackend::Auto;
         // No candidate reaches the pre-ensure floor check; final admission must
@@ -1880,6 +1998,10 @@ fn final_host_fallback_honors_fail_closed_floor_without_a_resolved_candidate() {
             .unwrap_err();
         assert!(error.to_string().contains("isolation floor"), "{error}");
         assert!(error.to_string().contains("host-process"), "{error}");
+        assert!(
+            crate::sandbox_fallback_memo::is_empty_for_test(),
+            "a fail-closed floor refusal must not be memoized"
+        );
     });
 }
 

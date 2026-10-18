@@ -28,25 +28,39 @@ impl Key {
 
 #[derive(Default)]
 struct Memo {
-    generation: Option<u64>,
-    failures: HashMap<Key, HashMap<String, String>>,
+    failures: HashMap<Key, FailureEntry>,
     lru: VecDeque<Key>,
 }
 
+#[derive(Default)]
+struct FailureEntry {
+    generation: u64,
+    failures: HashMap<String, String>,
+}
+
 impl Memo {
-    fn observe_generation(&mut self, generation: u64) {
-        if self.generation != Some(generation) {
-            self.generation = Some(generation);
-            self.failures.clear();
-            self.lru.clear();
+    fn observe_generation(&mut self, generation: u64, key: &Key) {
+        if self
+            .failures
+            .get(key)
+            .is_some_and(|entry| entry.generation < generation)
+        {
+            self.failures.remove(key);
+            self.lru.retain(|seen| seen != key);
         }
     }
 
     fn failed(&mut self, generation: u64, key: &Key, backend: &str) -> Option<String> {
-        if self.generation != Some(generation) {
+        let found_generation = self.failures.get(key)?.generation;
+        if found_generation < generation {
+            self.failures.remove(key);
+            self.lru.retain(|seen| seen != key);
             return None;
         }
-        let failure = self.failures.get(key)?.get(backend).cloned();
+        if found_generation != generation {
+            return None;
+        }
+        let failure = self.failures.get(key)?.failures.get(backend).cloned();
         if failure.is_some() {
             self.touch(key);
         }
@@ -68,18 +82,31 @@ impl Memo {
     }
 
     fn remember_failure(&mut self, generation: u64, key: Key, backend: String, warning: String) {
-        if self.generation != Some(generation) {
+        if self
+            .failures
+            .get(&key)
+            .is_some_and(|entry| entry.generation > generation)
+        {
             return;
         }
-        if !self.failures.contains_key(&key) && self.failures.len() == CAPACITY {
-            if let Some(evicted) = self.lru.pop_front() {
-                self.failures.remove(&evicted);
-            }
+        if !self.failures.contains_key(&key)
+            && self.failures.len() == CAPACITY
+            && let Some(evicted) = self.lru.pop_front()
+        {
+            self.failures.remove(&evicted);
         }
-        self.failures
+        let entry = self
+            .failures
             .entry(key.clone())
-            .or_default()
-            .insert(backend, warning);
+            .or_insert_with(|| FailureEntry {
+                generation,
+                failures: HashMap::new(),
+            });
+        if entry.generation < generation {
+            entry.generation = generation;
+            entry.failures.clear();
+        }
+        entry.failures.insert(backend, warning);
         self.touch(&key);
     }
 
@@ -99,11 +126,11 @@ fn memo() -> &'static Mutex<Memo> {
     MEMO.get_or_init(|| Mutex::new(Memo::default()))
 }
 
-pub(crate) fn observe_generation(generation: u64) {
+pub(crate) fn observe_generation(generation: u64, key: &Key) {
     memo()
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .observe_generation(generation);
+        .observe_generation(generation, key);
 }
 
 pub(crate) fn reusable_failure(
@@ -112,18 +139,60 @@ pub(crate) fn reusable_failure(
     key: &Key,
     backend: &str,
 ) -> Option<String> {
-    memo()
+    let result = memo()
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .reusable_failure(explicit_choice, generation, key, backend)
+        .reusable_failure(explicit_choice, generation, key, backend);
+    #[cfg(test)]
+    if result.is_some() {
+        REUSED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+    result
 }
 
 pub(crate) fn remember_failure(generation: u64, key: Key, backend: &str, warning: &str) {
+    #[cfg(test)]
+    ATTEMPTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     memo()
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .remember_failure(generation, key, backend.to_string(), warning.to_string());
 }
+
+#[cfg(test)]
+static ATTEMPTS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+#[cfg(test)]
+pub(crate) fn reset_for_test() {
+    clear_all();
+    ATTEMPTS.store(0, std::sync::atomic::Ordering::Relaxed);
+    REUSED.store(0, std::sync::atomic::Ordering::Relaxed);
+}
+
+#[cfg(test)]
+pub(crate) fn attempts_for_test() -> usize {
+    ATTEMPTS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+#[cfg(test)]
+pub(crate) fn reused_for_test() -> usize {
+    REUSED.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+#[cfg(test)]
+pub(crate) fn is_empty_for_test() -> bool {
+    memo()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .failures
+        .is_empty()
+}
+
+#[cfg(test)]
+pub(crate) static TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+#[cfg(test)]
+static REUSED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
 pub(crate) fn clear_worktree(worktree: &str) {
     memo()
@@ -133,61 +202,61 @@ pub(crate) fn clear_worktree(worktree: &str) {
 }
 
 #[cfg(test)]
+pub(crate) fn clear_all() {
+    let mut memo = memo()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    memo.failures.clear();
+    memo.lru.clear();
+}
+
+#[cfg(test)]
 mod tests {
     use super::{CAPACITY, Key, Memo};
 
     #[test]
-    fn cached_fallback_skips_failed_backend_for_same_session_key() {
+    fn memo_entry_is_scoped_and_generation_is_per_key() {
         let key = Key::new("dev", "local", "/repo/wt-a");
         let mut memo = Memo::default();
-        memo.observe_generation(1);
-        let mut attempts = 0;
-
-        for _ in 0..2 {
-            if memo
-                .reusable_failure(false, 1, &key, "podman-rootless")
-                .is_none()
-            {
-                attempts += 1;
-                memo.remember_failure(
-                    1,
-                    key.clone(),
-                    "podman-rootless".into(),
-                    "sandbox podman-rootless failed: probe failed".into(),
-                );
-            }
-            attempts += 1; // bwrap is reached and succeeds.
-        }
-
-        assert_eq!(attempts, 3, "the second resolution must not probe podman");
+        memo.remember_failure(1, key.clone(), "podman-rootless".into(), "failed".into());
         assert!(
             memo.reusable_failure(false, 1, &key, "podman-rootless")
                 .is_some()
         );
-    }
-
-    #[test]
-    fn memo_is_scoped_invalidated_and_bounded() {
-        let mut memo = Memo::default();
-        memo.observe_generation(1);
-        let original = Key::new("dev", "local", "/repo/wt-a");
-        memo.remember_failure(1, original.clone(), "podman".into(), "failed".into());
         assert!(
-            memo.failed(1, &Key::new("dev", "ssh host", "/repo/wt-a"), "podman")
-                .is_none()
+            memo.failed(
+                1,
+                &Key::new("dev", "ssh host", "/repo/wt-a"),
+                "podman-rootless"
+            )
+            .is_none()
         );
         assert!(
-            memo.failed(1, &Key::new("dev", "local", "/repo/wt-b"), "podman")
-                .is_none()
+            memo.failed(
+                1,
+                &Key::new("dev", "local", "/repo/wt-b"),
+                "podman-rootless"
+            )
+            .is_none()
         );
 
-        memo.observe_generation(2);
-        assert!(memo.failed(1, &original, "podman").is_none());
-        assert!(memo.failed(2, &original, "podman").is_none());
-        memo.remember_failure(2, original.clone(), "podman".into(), "failed".into());
+        memo.observe_generation(2, &key);
+        assert!(memo.failed(2, &key, "podman-rootless").is_none());
+        memo.remember_failure(
+            2,
+            key.clone(),
+            "podman-rootless".into(),
+            "new failure".into(),
+        );
+        memo.observe_generation(1, &key);
+        assert_eq!(
+            memo.failed(2, &key, "podman-rootless"),
+            Some("new failure".into())
+        );
         memo.clear_worktree("/repo/wt-a");
-        assert!(memo.failed(2, &original, "podman").is_none());
+        assert!(memo.failed(2, &key, "podman-rootless").is_none());
 
+        let mut memo = Memo::default();
         for index in 0..=CAPACITY {
             let key = Key::new("dev", "local", &format!("/repo/wt-{index}"));
             memo.remember_failure(2, key, "podman".into(), "failed".into());
@@ -203,7 +272,6 @@ mod tests {
     fn explicit_backend_does_not_reuse_a_memoized_failure() {
         let key = Key::new("dev", "local", "/repo/wt-a");
         let mut memo = Memo::default();
-        memo.observe_generation(1);
         memo.remember_failure(1, key.clone(), "podman".into(), "failed".into());
 
         assert!(memo.reusable_failure(false, 1, &key, "podman").is_some());
@@ -212,26 +280,47 @@ mod tests {
     }
 
     #[test]
-    fn shared_memo_is_safe_for_parallel_launch_workers() {
-        use std::sync::{Arc, Barrier, Mutex};
+    fn admitted_generation_bump_is_observed_through_shared_memo() {
+        use super::{TEST_LOCK, clear_all, observe_generation, remember_failure, reusable_failure};
 
+        let _guard = TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        clear_all();
+        let key = Key::new("dev", "local", "/repo/generation-wt");
+        remember_failure(1, key.clone(), "podman", "old failure");
+        observe_generation(2, &key);
+        assert!(reusable_failure(false, 2, &key, "podman").is_none());
+
+        remember_failure(2, key.clone(), "podman", "new failure");
+        observe_generation(1, &key);
+        assert_eq!(
+            reusable_failure(false, 2, &key, "podman").as_deref(),
+            Some("new failure")
+        );
+        clear_all();
+    }
+
+    #[test]
+    fn shared_memo_is_safe_for_parallel_launch_workers() {
+        use super::{clear_all, observe_generation, remember_failure, reusable_failure};
+        use std::sync::{Arc, Barrier};
+
+        let _guard = super::TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        clear_all();
         let key = Key::new("dev", "local", "/repo/wt-a");
-        let mut initial = Memo::default();
-        initial.observe_generation(1);
-        initial.remember_failure(1, key.clone(), "podman".into(), "failed".into());
-        let memo = Arc::new(Mutex::new(initial));
+        remember_failure(1, key.clone(), "podman", "failed");
+        observe_generation(1, &key);
         let start = Arc::new(Barrier::new(5));
         let workers = (0..4)
             .map(|_| {
-                let memo = Arc::clone(&memo);
                 let start = Arc::clone(&start);
                 let key = key.clone();
                 std::thread::spawn(move || {
                     start.wait();
-                    memo.lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner)
-                        .reusable_failure(false, 1, &key, "podman")
-                        .is_some()
+                    reusable_failure(false, 1, &key, "podman").is_some()
                 })
             })
             .collect::<Vec<_>>();
