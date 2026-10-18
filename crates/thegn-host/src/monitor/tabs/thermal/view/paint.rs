@@ -92,32 +92,29 @@ pub(super) fn package(
             Tok::Slot(S::Dim),
         );
     }
-    let graph_rows = rect.rows.saturating_sub(3);
+    let graph_rows = rect.rows.saturating_sub(5);
     let mut frame_values = [0.0_f32; HISTORY_CAP];
-    let history = if history.is_empty() {
-        let count = package_history_len.min(HISTORY_CAP);
-        let start = if package_history_len == HISTORY_CAP {
-            package_history_next
-        } else {
-            0
-        };
-        for (offset, value) in frame_values.iter_mut().take(count).enumerate() {
-            *value = package_history[(start + offset) % HISTORY_CAP];
-        }
-        &frame_values[..count]
+    let count = package_history_len.min(HISTORY_CAP);
+    let start = if package_history_len == HISTORY_CAP {
+        package_history_next
     } else {
-        history
+        0
     };
-    if graph_rows > 0 && !history.is_empty() {
-        let graph_width = rect.cols.min(history.len()).min(HISTORY_CAP);
+    for (offset, value) in frame_values.iter_mut().take(count).enumerate() {
+        *value = package_history[(start + offset) % HISTORY_CAP];
+    }
+    let frame_history = &frame_values[..count];
+    if !frame_history.is_empty() {
+        put(grid, rect, 0, 3, "live 80/95 C", Tok::Slot(S::Dim));
+        let graph_width = rect
+            .cols
+            .saturating_sub(12)
+            .min(frame_history.len())
+            .min(HISTORY_CAP);
         let mut values = [0.0_f32; HISTORY_CAP];
-        let first = history.len().saturating_sub(graph_width);
+        let first = frame_history.len().saturating_sub(graph_width);
         for (index, value) in values.iter_mut().take(graph_width).enumerate() {
-            *value = thermal_level(
-                history[first + index],
-                sensor.max_c.unwrap_or(80.0),
-                sensor.crit_c.unwrap_or(95.0),
-            );
+            *value = thermal_level(frame_history[first + index], 80.0, 95.0);
         }
         let mut graph = crate::monitor::graphs::GraphOut::new();
         crate::monitor::graphs::paint_heatmap(
@@ -132,8 +129,11 @@ pub(super) fn package(
             rect.cols.saturating_sub(graph_width),
             3,
             &graph.lines,
-            graph_rows,
+            1,
         );
+    }
+    if graph_rows > 0 && !history.is_empty() {
+        put(grid, rect, 0, 4, "telemetry 80/95 C", Tok::Slot(S::Dim));
     }
 }
 
@@ -462,6 +462,15 @@ pub(super) fn heatmap(
         return;
     }
     let braille = crate::monitor::graphs::table().braille;
+    let core_count = history_len
+        .iter()
+        .rposition(|len| *len > 0)
+        .map_or(0, |index| index + 1);
+    let raster_rows = if braille {
+        core_count.div_ceil(2)
+    } else {
+        core_count
+    };
     let label_width = if braille {
         "c00/01 ".len()
     } else {
@@ -470,7 +479,7 @@ pub(super) fn heatmap(
     let graph_width = rect.cols.saturating_sub(label_width);
     let display_width = graph_width.min(HISTORY_CAP);
     let mut values = [[f32::NAN; HISTORY_CAP]; 16];
-    for core in 0..history.len() {
+    for core in 0..core_count {
         let count = history_len[core].min(display_width);
         if count == 0 {
             continue;
@@ -478,11 +487,11 @@ pub(super) fn heatmap(
         let start = (history_next[core] + HISTORY_CAP - count) % HISTORY_CAP;
         for offset in 0..count {
             let value = history[core][(start + offset) % HISTORY_CAP];
-            values[core][display_width - count + offset] = (value / 95.0).clamp(0.0, 1.0);
+            values[core][display_width - count + offset] = thermal_level(value, 80.0, 95.0);
         }
     }
     let rows: [&[f32]; 16] = std::array::from_fn(|core| {
-        if history_len[core] == 0 {
+        if core >= core_count || history_len[core] == 0 {
             &[]
         } else {
             &values[core][..display_width]
@@ -491,11 +500,11 @@ pub(super) fn heatmap(
     let mut graph = crate::monitor::graphs::GraphOut::new();
     crate::monitor::graphs::paint_heatmap(
         &mut graph,
-        &rows,
+        &rows[..core_count],
         RampId::Temp,
         &crate::chrome::palette_snapshot(),
     );
-    let rows_emitted = graph.lines.len().min(rect.rows);
+    let rows_emitted = raster_rows.min(rect.rows);
     for index in 0..rows_emitted {
         let label = if braille {
             format!("c{:02}/{:02} ", index * 2, index * 2 + 1)
@@ -510,7 +519,7 @@ pub(super) fn heatmap(
         label_width + graph_width.saturating_sub(display_width),
         0,
         &graph.lines,
-        rect.rows,
+        rows_emitted,
     );
 }
 
@@ -551,7 +560,7 @@ fn state_tok(temp: f32, max: Option<f32>, crit: Option<f32>) -> Tok {
     }
 }
 
-fn thermal_level(temp: f32, warn: f32, crit: f32) -> f32 {
+pub(super) fn thermal_level(temp: f32, warn: f32, crit: f32) -> f32 {
     if temp <= warn {
         (temp / warn * 0.7).clamp(0.0, 0.7)
     } else {

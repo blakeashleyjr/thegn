@@ -12,6 +12,7 @@ use thegn_core::series::Agg;
 use thegn_metrics::collect::{
     CollectorId, CollectorSet,
     frame::MonitorFrame,
+    health::Health,
     model::{
         amd_smu::AmdSmuStatus,
         hwmon::{ChipGroup, SensorKind, SensorRole},
@@ -84,7 +85,10 @@ pub(in crate::monitor) struct ThermalModel {
     sensors: Vec<SensorRow>,
     zones: Vec<ZoneRow>,
     cores: [Option<f32>; 16],
-    cores_sampled: bool,
+    core_layout_generation: Option<u64>,
+    core_source_hwmon: bool,
+    core_panel_present: bool,
+    smu_cores_seen: bool,
     core_history: [[f32; HISTORY_CAP]; 16],
     core_history_len: [usize; 16],
     core_history_next: [usize; 16],
@@ -96,6 +100,7 @@ pub(in crate::monitor) struct ThermalModel {
     package_history: [f32; HISTORY_CAP],
     package_history_len: usize,
     package_history_next: usize,
+    package_history_key: Option<String>,
     temp_history: Vec<f32>,
 }
 
@@ -105,7 +110,10 @@ impl Default for ThermalModel {
             sensors: Vec::with_capacity(SENSOR_CAP),
             zones: Vec::with_capacity(16),
             cores: [None; 16],
-            cores_sampled: false,
+            core_layout_generation: None,
+            core_source_hwmon: false,
+            core_panel_present: true,
+            smu_cores_seen: false,
             core_history: [[0.0; HISTORY_CAP]; 16],
             core_history_len: [0; 16],
             core_history_next: [0; 16],
@@ -117,6 +125,7 @@ impl Default for ThermalModel {
             package_history: [0.0; HISTORY_CAP],
             package_history_len: 0,
             package_history_next: 0,
+            package_history_key: None,
             temp_history: Vec::with_capacity(HISTORY_CAP),
         }
     }
@@ -193,7 +202,6 @@ impl ThermalModel {
             sensor.seen = false;
         }
         self.cores.fill(None);
-        self.cores_sampled = true;
         self.gfx_c = None;
         self.edge_c = None;
         self.hotspot_c = None;
@@ -201,6 +209,26 @@ impl ThermalModel {
         self.socket_w = None;
 
         let layout = frame.parts.hwmon.layout.as_deref();
+        if let Some(layout) = layout
+            && self.core_layout_generation != Some(layout.generation)
+        {
+            let has_hwmon_cores = layout.sensors.iter().any(|sensor| {
+                sensor.kind == SensorKind::Temp
+                    && sensor.role == SensorRole::Input
+                    && layout
+                        .chips
+                        .get(usize::from(sensor.chip))
+                        .is_some_and(|chip| {
+                            chip.group == ChipGroup::Cpu
+                                && sensor.label.as_deref().is_some_and(is_core_label)
+                        })
+            });
+            self.core_layout_generation = Some(layout.generation);
+            self.core_source_hwmon = has_hwmon_cores;
+            self.core_panel_present = has_hwmon_cores;
+            self.core_history_len = [0; 16];
+            self.core_history_next = [0; 16];
+        }
         if let Some(layout) = layout {
             for (index, sensor) in layout.sensors.iter().enumerate() {
                 if sensor.kind != SensorKind::Temp || sensor.role != SensorRole::Input {
@@ -255,7 +283,8 @@ impl ThermalModel {
                 }
                 let temp_c = value.flatten();
                 row.temp_c = temp_c;
-                if row.group == ChipGroup::Cpu
+                if self.core_source_hwmon
+                    && row.group == ChipGroup::Cpu
                     && let Some(core) = row
                         .label
                         .strip_prefix("core")
@@ -276,15 +305,16 @@ impl ThermalModel {
         self.sensors.sort_unstable_by(|left, right| {
             left.chip
                 .cmp(&right.chip)
-                .then_with(|| {
-                    right
-                        .temp_c
-                        .partial_cmp(&left.temp_c)
-                        .unwrap_or(std::cmp::Ordering::Equal)
-                })
                 .then_with(|| left.label.cmp(&right.label))
+                .then_with(|| left.key.cmp(&right.key))
         });
 
+        let package_key = self.package().map(|sensor| sensor.key.as_str());
+        if package_key != self.package_history_key.as_deref() {
+            self.package_history_len = 0;
+            self.package_history_next = 0;
+            self.package_history_key = package_key.map(str::to_owned);
+        }
         if let Some(temp) = self.package().and_then(|sensor| sensor.temp_c) {
             self.package_history[self.package_history_next] = temp;
             self.package_history_next = (self.package_history_next + 1) % HISTORY_CAP;
@@ -321,6 +351,9 @@ impl ThermalModel {
                     .map(|value| f32::from(value) / 100.0)
                     .filter(|value| thermal::plausible_range(*value))
             });
+            if card_cores.iter().any(Option::is_some) {
+                self.smu_cores_seen = true;
+            }
             if card_cores.iter().any(Option::is_some) && smu_cores.is_none() {
                 smu_cores = Some(card_cores);
             }
@@ -356,8 +389,16 @@ impl ThermalModel {
                 self.socket_w = metrics.power_socket.map(|value| value as f32 / 1000.0);
             }
         }
-        if let Some(cores) = smu_cores {
+        self.core_panel_present = self.core_source_hwmon
+            || (self.smu_cores_seen
+                && !matches!(frame.health[CollectorId::AmdSmu.index()], Health::Absent(_)));
+        if !self.core_source_hwmon
+            && let Some(cores) = smu_cores
+        {
             self.cores = cores;
+            self.smu_cores_seen = true;
+            self.core_panel_present =
+                !matches!(frame.health[CollectorId::AmdSmu.index()], Health::Absent(_));
         }
         for (index, temp) in self.cores.iter().enumerate() {
             if temp.is_none() && self.core_history_len[index] == 0 {
@@ -382,13 +423,45 @@ impl ThermalModel {
     fn package(&self) -> Option<&SensorRow> {
         self.sensors
             .iter()
-            .filter(|row| row.group == ChipGroup::Cpu)
-            .max_by(|left, right| {
-                left.temp_c
-                    .partial_cmp(&right.temp_c)
-                    .unwrap_or(std::cmp::Ordering::Equal)
+            .filter(|row| row.group == ChipGroup::Cpu && is_package_label(&row.label))
+            .min_by_key(|row| package_label_rank(&row.label))
+            .or_else(|| {
+                self.sensors
+                    .iter()
+                    .filter(|row| row.group == ChipGroup::Cpu)
+                    .max_by(|left, right| {
+                        left.temp_c
+                            .partial_cmp(&right.temp_c)
+                            .unwrap_or(std::cmp::Ordering::Equal)
+                    })
             })
     }
+}
+
+fn is_core_label(label: &str) -> bool {
+    label
+        .strip_prefix("core")
+        .or_else(|| label.strip_prefix("Core "))
+        .is_some_and(|suffix| suffix.parse::<usize>().is_ok())
+}
+
+fn package_label_rank(label: &str) -> usize {
+    let lower = label.to_ascii_lowercase();
+    if lower.starts_with("package id ") {
+        0
+    } else if lower == "tctl" {
+        1
+    } else if lower == "tdie" {
+        2
+    } else if lower == "package" {
+        3
+    } else {
+        usize::MAX
+    }
+}
+
+fn is_package_label(label: &str) -> bool {
+    package_label_rank(label) != usize::MAX
 }
 
 mod paint;
@@ -402,7 +475,7 @@ impl TabView for ThermalView<'_> {
 
     fn template(&self) -> Node {
         let mut top = vec![(Size::Weight(2), Node::Panel(PACKAGE))];
-        if !self.0.cores_sampled || self.0.cores.iter().any(Option::is_some) {
+        if self.0.core_panel_present {
             top.push((Size::Weight(1), Node::Panel(CORES)));
         }
         top.push((Size::Weight(1), Node::Panel(GPU)));
@@ -426,6 +499,7 @@ impl TabView for ThermalView<'_> {
                 set.insert(CollectorId::Hwmon);
             }
             CORES => {
+                set.insert(CollectorId::Hwmon);
                 set.insert(CollectorId::AmdSmu);
             }
             ZONES => {
@@ -433,6 +507,7 @@ impl TabView for ThermalView<'_> {
             }
             HEATMAP => {
                 set.insert(CollectorId::Hwmon);
+                set.insert(CollectorId::AmdSmu);
             }
             GPU => {
                 set.insert(CollectorId::Hwmon);
@@ -470,7 +545,7 @@ impl TabView for ThermalView<'_> {
                 &mut grid,
                 inner,
                 self.0.package(),
-                &[],
+                &self.0.temp_history,
                 &self.0.package_history,
                 self.0.package_history_len,
                 self.0.package_history_next,
@@ -495,6 +570,31 @@ impl TabView for ThermalView<'_> {
             rect.x,
             rect.y,
         );
+        if placed.id == PACKAGE && inner.rows > 5 && !self.0.temp_history.is_empty() {
+            let count = self.0.temp_history.len().min(inner.cols).min(HISTORY_CAP);
+            let first = self.0.temp_history.len().saturating_sub(count);
+            let mut normalized = [f32::NAN; HISTORY_CAP];
+            for (index, value) in normalized.iter_mut().take(count).enumerate() {
+                let temp = self.0.temp_history[first + index];
+                if temp.is_finite() {
+                    *value = paint::thermal_level(temp, 80.0, 95.0);
+                }
+            }
+            crate::monitor::graphs::paint_history_graph(
+                &normalized[..count],
+                thegn_core::theme::RampId::Temp,
+                Rect {
+                    x: rect
+                        .x
+                        .saturating_add(inner.x)
+                        .saturating_add(inner.cols.saturating_sub(count)),
+                    y: rect.y.saturating_add(inner.y).saturating_add(5),
+                    cols: count,
+                    rows: inner.rows.saturating_sub(5),
+                },
+                surface,
+            );
+        }
         if placed.id == SENSORS {
             let spark_x = rect
                 .x
