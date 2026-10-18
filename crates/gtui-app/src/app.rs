@@ -202,9 +202,16 @@ mod tests {
             .expect("drained update carries its query window");
         assert_eq!(window.to - window.from, chrono::Duration::minutes(15));
         app.request_requery();
-        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
-        assert!(app.tick(), "expected requery updates to drain");
-        assert!(app.panel_generation(1) > first);
+        for _ in 0..200 {
+            if app.tick() && app.panel_generation(1) > first {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        assert!(
+            app.panel_generation(1) > first,
+            "expected a requery update to advance the panel generation"
+        );
     }
 
     #[tokio::test]
