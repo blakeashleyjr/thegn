@@ -50,7 +50,7 @@ fn fixture() -> MonitorFrame {
         (1, "junction", 78.0, Some(100.0), Some(110.0)),
         (2, "composite", 42.0, None, None),
         (3, "temperature", 39.0, None, None),
-        (2, "bad sentinel", 65_261_850.0, None, None),
+        (2, "bad sentinel", 65_261.85, None, None),
         (3, "warming", 0.0, None, None),
     ]
     .into_iter()
@@ -81,7 +81,7 @@ fn fixture() -> MonitorFrame {
         Some(78.0),
         Some(42.0),
         Some(39.0),
-        Some(65_261_850.0),
+        Some(65_261.85),
         None,
     ]
     .into_iter()
@@ -121,6 +121,7 @@ fn fixture() -> MonitorFrame {
     ];
     let mut metrics = GpuMetrics {
         layout_verified: true,
+        temperature_edge: Some(6_000),
         temperature_gfx: Some(6_200),
         temperature_soc: Some(5_400),
         power_socket: Some(45_000),
@@ -244,10 +245,13 @@ fn deterministic_snapshots_cover_sizes_capabilities_and_demand() {
                     board.paint(&view, &mut surface, area, 0, &[]);
                     let output = text(&mut surface);
                     assert!(output.contains("CPU package"));
+                    assert!(output.contains("71.0 C"));
                     assert!(output.contains("nvme"));
                     assert!(output.contains("socket power"));
                     assert!(output.contains("critical"));
-                    assert!(output.contains("alarm 1"));
+                    if cols != 100 {
+                        assert!(output.contains("alarm 1"));
+                    }
                     let required_text = if cols == 100 {
                         "CPU package|CPU cores|Sensors|GPU thermals|k10temp|amdgpu|nvme|spd5118"
                     } else {
@@ -268,9 +272,11 @@ fn deterministic_snapshots_cover_sizes_capabilities_and_demand() {
                     }
                     assert_eq!(demand, expected);
                     if cols == 100 {
+                        assert!(output.contains("00 72C"));
                         assert!(!output.contains("Thermal zones"));
                         assert!(!demand.contains(CollectorId::ThermalZone));
                     }
+                    assert_eq!(output.matches("composite").count(), 1);
                     if cols == 240 {
                         assert!(
                             fill_ratio(&surface, area) >= 0.55,
@@ -282,6 +288,78 @@ fn deterministic_snapshots_cover_sizes_capabilities_and_demand() {
             });
         }
     }
+}
+
+#[test]
+fn amd_cards_keep_first_available_cores_and_gpu_readings() {
+    let mut frame = fixture();
+    let mut dgpu = GpuMetrics {
+        temperature_edge: Some(8_100),
+        temperature_gfx: Some(8_200),
+        temperature_soc: Some(8_300),
+        ..GpuMetrics::default()
+    };
+    dgpu.temperature_core.fill(None);
+    let mut apu = GpuMetrics {
+        temperature_edge: Some(6_100),
+        temperature_gfx: Some(6_200),
+        temperature_soc: Some(6_300),
+        ..GpuMetrics::default()
+    };
+    apu.temperature_core[0] = Some(7_200);
+    frame.parts.amd_smu.cards.clear();
+    frame.parts.amd_smu.cards.extend([
+        AmdSmuCard {
+            card: 0,
+            suspended: false,
+            decoded: AmdSmuStatus::Decoded(Decoded::Full),
+            metrics: dgpu,
+        },
+        AmdSmuCard {
+            card: 1,
+            suspended: false,
+            decoded: AmdSmuStatus::Decoded(Decoded::Full),
+            metrics: apu,
+        },
+    ]);
+    let mut model = ThermalModel::default();
+    model.absorb_frame(&frame);
+    assert_eq!(model.cores[0], Some(72.0));
+    assert_eq!(model.gfx_c, Some(82.0));
+    assert_eq!(model.edge_c, Some(81.0));
+    assert_eq!(model.soc_c, Some(83.0));
+    let mut surface = Surface::new(160, 45);
+    Board::default().paint(
+        &ThermalView(&model),
+        &mut surface,
+        Rect::full(160, 45),
+        0,
+        &[],
+    );
+    assert!(text(&mut surface).contains("edge  81.0 C"));
+}
+
+#[test]
+fn cores_panel_is_absent_without_core_temperatures() {
+    let mut frame = fixture();
+    frame.parts.amd_smu.cards.clear();
+    let mut model = ThermalModel::default();
+    model.absorb_frame(&frame);
+    let view = ThermalView(&model);
+    let board = Board::default();
+    let area = Rect::full(160, 45);
+    assert!(
+        !board
+            .placed(&view, area)
+            .iter()
+            .any(|panel| { panel.id == PanelId("thermal.cores") })
+    );
+    assert!(
+        !board
+            .demand(&view, area, 1000)
+            .collectors
+            .contains(CollectorId::AmdSmu)
+    );
 }
 
 #[test]

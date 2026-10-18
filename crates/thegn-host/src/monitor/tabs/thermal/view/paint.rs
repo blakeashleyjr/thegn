@@ -17,7 +17,7 @@ use thegn_core::{
     numfmt::{NumFmt, Reading, Unit},
     theme::{RampId, StateRole},
 };
-use thegn_metrics::collect::model::thermal_zone::ThermalTrip;
+use thegn_metrics::collect::model::{hwmon::ChipGroup, thermal_zone::ThermalTrip};
 
 pub(super) fn package(grid: &mut CellGrid, rect: Rect, sensor: Option<&SensorRow>) {
     let Some(sensor) = sensor else {
@@ -65,7 +65,7 @@ pub(super) fn package(grid: &mut CellGrid, rect: Rect, sensor: Option<&SensorRow
         rect,
         0,
         1,
-        &format!("{}  {} C", sensor.label, temp),
+        &format!("{}  {temp:.1} C", sensor.label),
         state_tok(temp, sensor.max_c, sensor.crit_c),
     );
     if let Some(crit) = sensor.crit_c {
@@ -94,40 +94,50 @@ pub(super) fn cores(grid: &mut CellGrid, rect: Rect, cores: &[Option<f32>; 16]) 
         return;
     }
     let width = rect.cols.saturating_sub(2);
-    let per_row = (width / 12).max(1);
+    let cell_width = 10;
+    let per_row = (width / cell_width).max(1);
+    let values = cores.iter().flatten().copied().collect::<Vec<_>>();
+    let heat_rows: Vec<&[f32]> = values.iter().map(std::slice::from_ref).collect();
+    let mut heatmap = crate::monitor::graphs::GraphOut::new();
+    crate::monitor::graphs::paint_heatmap(
+        &mut heatmap,
+        &heat_rows,
+        RampId::Temp,
+        &crate::chrome::palette_snapshot(),
+    );
+    let mut heat_index = 0;
     for (index, temp) in cores
         .iter()
         .enumerate()
         .filter_map(|(index, temp)| temp.map(|value| (index, value)))
     {
-        let x = (index % per_row) * 12;
+        let x = (index % per_row) * cell_width;
         let y = index / per_row;
         if y >= rect.rows {
             break;
         }
-        let mut meter = Meter::default();
-        let value = (temp / 100.0).clamp(0.0, 1.0);
-        meter.paint(
-            grid,
-            Rect {
-                x: rect.x + x,
-                y: rect.y + y,
-                cols: 8.min(rect.cols.saturating_sub(x)),
-                rows: 1,
-            },
-            MeterSpec {
-                value,
-                warn: 0.7,
-                crit: 0.9,
-                ramp: RampId::Temp,
-                label: false,
-                fmt: NumFmt::default(),
-            },
-        );
+        if let Some(crate::seg::Line::Segs(segs)) = heatmap.lines.get(heat_index) {
+            for seg in segs {
+                if let Some(fg) = StyleTok::from_tok(seg.fg) {
+                    for (offset, ch) in seg.text.chars().enumerate() {
+                        grid.view(rect).put(
+                            x + offset,
+                            y,
+                            CellStyle {
+                                ch,
+                                fg,
+                                ..CellStyle::default()
+                            },
+                        );
+                    }
+                }
+            }
+        }
+        heat_index += 1;
         put(
             grid,
             rect,
-            x + 8,
+            x + 1,
             y,
             &format!("{index:02} {temp:.0}C"),
             state_tok(temp, Some(80.0), Some(95.0)),
@@ -146,39 +156,6 @@ pub(super) fn sensors(grid: &mut CellGrid, rect: Rect, sensors: &[SensorRow]) {
             Tok::Slot(S::Dim),
         );
         return;
-    }
-    for y in 0..rect.rows {
-        let sensor = &sensors[y % sensors.len()];
-        let Some(temp) = sensor.temp_c else {
-            put(
-                grid,
-                rect,
-                0,
-                y,
-                caps::active_glyphs().emdash,
-                Tok::Slot(S::Dim),
-            );
-            continue;
-        };
-        let mut meter = Meter::default();
-        let value = (temp / sensor.crit_c.unwrap_or(100.0)).clamp(0.0, 1.0);
-        meter.paint(
-            grid,
-            Rect {
-                x: rect.x,
-                y: rect.y + y,
-                cols: rect.cols,
-                rows: 1,
-            },
-            MeterSpec {
-                value,
-                warn: 0.7,
-                crit: 0.9,
-                ramp: RampId::Temp,
-                label: false,
-                fmt: NumFmt::default(),
-            },
-        );
     }
     let limits = sensors
         .iter()
@@ -279,7 +256,7 @@ pub(super) fn zones(grid: &mut CellGrid, rect: Rect, zones: &[ZoneRow]) {
 }
 
 pub(super) fn gpu(grid: &mut CellGrid, rect: Rect, model: &ThermalModel) {
-    let edge = model.gfx_c.or_else(|| {
+    let edge = model.edge_c.or(model.gfx_c).or_else(|| {
         model
             .sensors
             .iter()
