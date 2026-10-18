@@ -235,7 +235,7 @@ fn remove_host_def(
 /// Parse + persist an add-host target (the System ▸ Hosts panel's `n` key),
 /// then queue the durable write; the pending-DB drain queues a panel refresh
 /// after success. Returns the immediate status line or a parse error.
-pub(crate) fn add_and_refresh(
+pub(crate) fn queue_host_add_from_input(
     text: &str,
     cfg: &thegn_core::config::Config,
     pending_db_tx: &tokio::sync::mpsc::UnboundedSender<crate::run::run_pending_db::PendingDbResult>,
