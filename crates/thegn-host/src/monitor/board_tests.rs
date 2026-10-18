@@ -110,6 +110,19 @@ fn zoom_uses_solver_area_and_escape_unzooms_before_close() {
 }
 
 #[test]
+fn a_single_panel_never_focuses_or_zooms_and_escape_closes() {
+    let mut board = Board::default();
+    let placed = board.placed(&LegacyTab, area());
+    board.focus_next(&placed);
+    assert_eq!(board.focus, None);
+    board.focus_prev(&placed);
+    assert_eq!(board.focus, None);
+    board.toggle_zoom(&placed);
+    assert!(!board.is_zoomed());
+    assert_eq!(board.esc(), EscOutcome::Close);
+}
+
+#[test]
 fn demand_unions_placed_panels_and_legacy_demands_every_collector() {
     let view = ThreePanels;
     let board = Board::default();
@@ -170,14 +183,14 @@ fn footer_shows_board_hints_only_for_multiple_panels_and_names_unzoom() {
     assert!(!single.contains("panel"));
     assert!(!single.contains("zoom"));
     let multi = text(footer(2, false));
-    assert!(multi.contains("f") && multi.contains("panel"));
-    assert!(multi.contains("z") && multi.contains("zoom"));
+    assert!(multi.contains("f panel"));
+    assert!(multi.contains("z zoom"));
     assert!(text(footer(2, true)).contains("unzoom"));
 }
 
 #[test]
 fn legacy_paint_matches_render_stack_cells_and_styles() {
-    let body = [
+    let body = vec![
         Section::Heading {
             label: "legacy heading".into(),
             note: Some("note".into()),
@@ -187,21 +200,47 @@ fn legacy_paint_matches_render_stack_cells_and_styles() {
             "1.25".into(),
             Tok::Slot(crate::chrome::S::Accent),
         )]),
+        Section::Heading {
+            label: "second heading".into(),
+            note: None,
+        },
+        Section::KeyVal(vec![(
+            "uptime".into(),
+            "longer body".into(),
+            Tok::Slot(crate::chrome::S::Accent),
+        )]),
     ];
     let rect = Rect {
         x: 1,
         y: 1,
         cols: 24,
-        rows: 6,
+        rows: 3,
     };
     let mut expected = Surface::new(28, 8);
     let mut actual = Surface::new(28, 8);
-    sections::render_stack(&mut expected, rect, 0, &body);
-    let placed = Board::default().placed(&LegacyTab, rect);
-    LegacyTab.paint(&mut actual, &placed[0], rect, 0, &body);
+    sections::render_stack(&mut expected, rect, 1, &body);
+    Board::default().paint(&LegacyTab, &mut actual, rect, 1, &body);
     assert_eq!(
         expected.screen_chars_to_string(),
         actual.screen_chars_to_string()
     );
     assert_eq!(expected.screen_cells(), actual.screen_cells());
+}
+
+#[test]
+fn paint_skips_a_solver_rect_when_the_body_is_empty() {
+    let rect = Rect {
+        x: 2,
+        y: 2,
+        cols: 3,
+        rows: 0,
+    };
+    let body = [Section::Heading {
+        label: "must not draw".into(),
+        note: None,
+    }];
+    let mut surface = Surface::new(8, 8);
+    let before = surface.screen_chars_to_string();
+    Board::default().paint(&LegacyTab, &mut surface, rect, 0, &body);
+    assert_eq!(surface.screen_chars_to_string(), before);
 }

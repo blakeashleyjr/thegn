@@ -109,7 +109,7 @@ impl Board {
     }
 
     fn move_focus(&mut self, placed: &[Placed], delta: isize) {
-        if placed.is_empty() {
+        if placed.len() < 2 {
             self.focus = None;
             return;
         }
@@ -125,6 +125,8 @@ impl Board {
     pub(super) fn toggle_zoom(&mut self, placed: &[Placed]) {
         if self.zoom.is_some() {
             self.zoom = None;
+        } else if placed.len() < 2 {
+            self.focus = None;
         } else if let Some(focus) = self
             .focus
             .filter(|focus| placed.iter().any(|panel| panel.id == *focus))
@@ -174,9 +176,33 @@ impl Board {
         sections: &[Section],
     ) {
         for placed in self.solve(view, area).placed {
-            view.paint(surface, &placed, placed.rect, scroll, sections);
+            let Some(rect) = intersect(placed.rect, area) else {
+                continue;
+            };
+            let mut clipped = placed;
+            clipped.rect = rect;
+            view.paint(surface, &clipped, rect, scroll, sections);
         }
     }
+}
+
+fn intersect(rect: Rect, area: Rect) -> Option<Rect> {
+    let x = rect.x.max(area.x);
+    let y = rect.y.max(area.y);
+    let right = rect
+        .x
+        .saturating_add(rect.cols)
+        .min(area.x.saturating_add(area.cols));
+    let bottom = rect
+        .y
+        .saturating_add(rect.rows)
+        .min(area.y.saturating_add(area.rows));
+    (right > x && bottom > y).then_some(Rect {
+        x,
+        y,
+        cols: right - x,
+        rows: bottom - y,
+    })
 }
 
 /// Text for the tab-bar's right cluster, kept pure for a focused regression test.

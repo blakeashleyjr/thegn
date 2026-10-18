@@ -456,6 +456,7 @@ pub struct MonitorOverlay {
     covered_secs: Option<f32>,
     cols: usize,
     rows: usize,
+    screen: Rect,
     /// `rows - CHROME_ROWS`. What [`Self::scroll_max`] measures against.
     body_rows: usize,
     board: board::Board,
@@ -511,6 +512,7 @@ impl MonitorOverlay {
             covered_secs: None,
             cols,
             rows,
+            screen: ctx.screen,
             body_rows: rows.saturating_sub(CHROME_ROWS),
             board: board::Board::default(),
         };
@@ -584,8 +586,7 @@ impl MonitorOverlay {
     /// Sampler work required by the panels placed in the current monitor body.
     pub fn demand(&self, base_ms: u32) -> crate::monitor_sampler::Demand {
         let view = board::LegacyTab;
-        self.board
-            .demand(&view, Rect::full(self.cols, self.body_rows), base_ms)
+        self.board.demand(&view, self.body_rect(), base_ms)
     }
 
     /// Drain a pending loop-side action (a Disk-tab clean, or a Containers-tab
@@ -752,6 +753,7 @@ impl MonitorOverlay {
         let tabs_changed = tabs != self.tabs;
         self.tabs = tabs;
         if !self.tabs.contains(&self.tab) {
+            self.board = board::Board::default();
             self.tab = self.tabs.first().copied().unwrap_or(MonitorTab::Cpu);
         }
         if self.tab == MonitorTab::Procs
@@ -808,6 +810,7 @@ impl MonitorOverlay {
 
     /// Update cached dimensions; content reflow/rebuild is the caller's job.
     fn resize(&mut self, screen: Rect) {
+        self.screen = screen;
         let (cols, rows) = Self::dims(screen);
         if (cols, rows) != (self.cols, self.rows) {
             self.cols = cols;
@@ -822,7 +825,11 @@ impl MonitorOverlay {
         }
         let n = self.tabs.len() as isize;
         let cur = self.tabs.iter().position(|t| *t == self.tab).unwrap_or(0) as isize;
-        self.tab = self.tabs[(((cur + delta) % n + n) % n) as usize];
+        let tab = self.tabs[(((cur + delta) % n + n) % n) as usize];
+        if tab != self.tab {
+            self.board = board::Board::default();
+        }
+        self.tab = tab;
         self.sel = 0;
         self.follow = true;
         self.remember_tab();
@@ -836,6 +843,32 @@ impl MonitorOverlay {
     /// tab (the arrows/Tab and the digits).
     fn remember_tab(&mut self) {
         self.prefs.last_tab = self.tab;
+    }
+
+    fn body_rect(&self) -> Rect {
+        self.body_rect_at(self.screen)
+    }
+
+    fn body_rect_at(&self, screen: Rect) -> Rect {
+        let Some(outer) = layer::box_rect(&self.spec(), screen) else {
+            return Rect::full(0, 0);
+        };
+        let inner = Rect {
+            x: outer.x + 2,
+            y: outer.y + 1,
+            cols: outer.cols.saturating_sub(4),
+            rows: outer.rows.saturating_sub(2),
+        };
+        Rect {
+            x: inner.x,
+            y: inner.y + 1,
+            cols: inner.cols,
+            rows: inner.rows.saturating_sub(CHROME_ROWS),
+        }
+    }
+
+    fn placed_panels(&self) -> Vec<board::Placed> {
+        self.board.placed(&board::LegacyTab, self.body_rect())
     }
 }
 
@@ -1015,6 +1048,9 @@ impl MonitorOverlay {
             // the key and the label can never disagree.
             KeyCode::Char(c @ '0'..='9') => {
                 if let Some(t) = tabbar::index_of(*c).and_then(|i| self.tabs.get(i).copied()) {
+                    if t != self.tab {
+                        self.board = board::Board::default();
+                    }
                     self.tab = t;
                     self.sel = 0;
                     self.follow = true;
@@ -1062,31 +1098,6 @@ impl MonitorOverlay {
                 self.prefs.widen(self.tab);
                 MonitorOutcome::PrefsChanged
             }
-            KeyCode::Char('f') => {
-                let view = board::LegacyTab;
-                let placed = self
-                    .board
-                    .placed(&view, Rect::full(self.cols, self.body_rows));
-                self.board.focus_next(&placed);
-                MonitorOutcome::Pending
-            }
-            KeyCode::Char('F') => {
-                let view = board::LegacyTab;
-                let placed = self
-                    .board
-                    .placed(&view, Rect::full(self.cols, self.body_rows));
-                self.board.focus_prev(&placed);
-                MonitorOutcome::Pending
-            }
-            KeyCode::Char('z') => {
-                let view = board::LegacyTab;
-                let placed = self
-                    .board
-                    .placed(&view, Rect::full(self.cols, self.body_rows));
-                self.board.toggle_zoom(&placed);
-                MonitorOutcome::Pending
-            }
-
             // --- Navigation ---
             KeyCode::DownArrow | KeyCode::Char('j') => {
                 self.nav(1);
@@ -1123,6 +1134,22 @@ impl MonitorOverlay {
                 } else {
                     self.scroll[self.tab.index()] = self.scroll_max();
                 }
+                MonitorOutcome::Pending
+            }
+
+            KeyCode::Char('f') => {
+                let placed = self.placed_panels();
+                self.board.focus_next(&placed);
+                MonitorOutcome::Pending
+            }
+            KeyCode::Char('F') => {
+                let placed = self.placed_panels();
+                self.board.focus_prev(&placed);
+                MonitorOutcome::Pending
+            }
+            KeyCode::Char('z') => {
+                let placed = self.placed_panels();
+                self.board.toggle_zoom(&placed);
                 MonitorOutcome::Pending
             }
 
@@ -1283,12 +1310,7 @@ impl MonitorOverlay {
             &self.tab_bar(),
             sections::panel(),
         );
-        let body = Rect {
-            x: inner.x,
-            y: inner.y + 1,
-            cols: inner.cols,
-            rows: inner.rows.saturating_sub(CHROME_ROWS),
-        };
+        let body = self.body_rect_at(screen);
         let view = board::LegacyTab;
         self.board
             .paint(&view, surface, body, self.scroll(), &self.body);
@@ -1323,10 +1345,9 @@ impl MonitorOverlay {
         } else {
             vec![seg(Tok::Slot(S::Ghost), self.coverage_note())]
         };
-        if let Some(hidden) = board::hidden_label(
-            self.board
-                .hidden_count(&board::LegacyTab, Rect::full(self.cols, self.body_rows)),
-        ) {
+        if let Some(hidden) =
+            board::hidden_label(self.board.hidden_count(&board::LegacyTab, self.body_rect()))
+        {
             right.push(seg(Tok::Slot(S::Ghost), format!(" · {hidden}")));
         }
         // Exactly what `draw_line`'s `Line::Split` arm leaves the left run: the
@@ -1435,10 +1456,7 @@ impl MonitorOverlay {
             paused: self.paused,
             container_ours: self.container_rows.get(self.sel).is_some_and(|r| r.ours),
             disk_rows: self.disk_rows.len(),
-            board_panels: self
-                .board
-                .placed(&board::LegacyTab, Rect::full(self.cols, self.body_rows))
-                .len(),
+            board_panels: self.placed_panels().len(),
             board_zoomed: self.board.is_zoomed(),
         })
     }
