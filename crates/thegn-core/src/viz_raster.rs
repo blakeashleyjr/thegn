@@ -1117,7 +1117,7 @@ mod tests {
             columns(&[1.0], &table.ramp8, table, &mut b);
             assert_eq!(chars(&b), [" █"]);
             columns(&[1.0, 1.0], &table.ramp8, table, &mut b);
-            assert_eq!(chars(&b), ["█"]);
+            assert_eq!(chars(&b), ["██"]);
 
             b.reset(1, 2);
             mirrored(&[1.0], &[1.0], table, &mut b);
