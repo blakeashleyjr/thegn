@@ -1565,6 +1565,8 @@ fn footer_for(tab: MonitorTab) -> String {
         // on, so an assertion about an absent hint can only be about the tab.
         container_ours: true,
         disk_rows: 3,
+        board_panels: 1,
+        board_zoomed: false,
     }))
 }
 
@@ -1625,6 +1627,8 @@ fn every_tab_advertises_pause() {
         paused: true,
         container_ours: false,
         disk_rows: 3,
+        board_panels: 1,
+        board_zoomed: false,
     }));
     assert!(frozen.contains("resume"), "{frozen}");
 }
