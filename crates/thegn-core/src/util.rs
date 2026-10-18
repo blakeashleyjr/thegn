@@ -225,6 +225,7 @@ pub(crate) fn git_stdout_bounded(
         .args(args)
         .stdout(Stdio::piped())
         .stderr(Stdio::null());
+    GIT_SPAWNS.fetch_add(1, Ordering::Relaxed);
     bounded_stdout(command, max_bytes)
 }
 
@@ -1600,7 +1601,7 @@ pub fn git_out(dir: &Path, args: &[&str]) -> Option<String> {
 
 static GIT_SPAWNS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
-/// Number of git subprocess invocations made through [`git_out`] helpers.
+/// Number of git subprocess invocations made through core's Git helpers.
 pub fn core_git_spawn_count() -> u64 {
     GIT_SPAWNS.load(Ordering::Relaxed)
 }
@@ -1738,6 +1739,7 @@ pub fn sh_join(argv: &[String]) -> String {
 
 /// Run `git -C <dir> <args...>`, returning success (stdout/stderr discarded).
 pub fn git_ok(dir: &Path, args: &[&str]) -> bool {
+    GIT_SPAWNS.fetch_add(1, Ordering::Relaxed);
     git_cmd(dir)
         .args(args)
         .output()
@@ -1750,6 +1752,7 @@ pub fn git_ok(dir: &Path, args: &[&str]) -> bool {
 /// failure, bad object, repository/permission error). Callers choosing a
 /// destructive branch must treat `None` as unknown, never as "not an ancestor".
 pub fn git_is_ancestor(dir: &Path, ancestor: &str, descendant: &str) -> Option<bool> {
+    GIT_SPAWNS.fetch_add(1, Ordering::Relaxed);
     let out = git_cmd(dir)
         .args(["merge-base", "--is-ancestor", ancestor, descendant])
         .output()
