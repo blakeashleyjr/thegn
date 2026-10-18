@@ -43,8 +43,8 @@ const G3: &[(ColId, usize)] = &[
     (User, 8),
     (Owner, 10),
     (State, 1),
-    (Nice, 2),
-    (Threads, 3),
+    (Nice, 3),
+    (Threads, 4),
     (Cpu, 5),
     (CpuBar, 8),
     (CpuHistory, 8),
@@ -61,8 +61,8 @@ const G4: &[(ColId, usize)] = &[
     (User, 8),
     (Owner, 10),
     (State, 1),
-    (Nice, 2),
-    (Threads, 3),
+    (Nice, 3),
+    (Threads, 4),
     (Cpu, 5),
     (CpuBar, 8),
     (CpuHistory, 8),
@@ -110,8 +110,8 @@ const G8: &[(ColId, usize)] = &[
     (User, 8),
     (Owner, 10),
     (State, 1),
-    (Nice, 2),
-    (Threads, 3),
+    (Nice, 3),
+    (Threads, 4),
     (Cpu, 5),
     (CpuBar, 8),
     (CpuHistory, 8),
@@ -128,8 +128,8 @@ const G9: &[(ColId, usize)] = &[
     (User, 8),
     (Owner, 10),
     (State, 1),
-    (Nice, 2),
-    (Threads, 3),
+    (Nice, 3),
+    (Threads, 4),
     (Cpu, 5),
     (CpuBar, 8),
     (CpuHistory, 8),
@@ -164,7 +164,7 @@ const G11: &[(ColId, usize)] = &[
     (MemHistory, 8),
     (MajorFaults, 6),
     (MinorFaults, 6),
-    (Oom, 3),
+    (Oom, 5),
     (Command, 17),
 ];
 const G12: &[(ColId, usize)] = &[
@@ -179,7 +179,7 @@ const G12: &[(ColId, usize)] = &[
     (MemHistory, 8),
     (MajorFaults, 6),
     (MinorFaults, 6),
-    (Oom, 3),
+    (Oom, 5),
     (Command, 77),
 ];
 const G13: &[(ColId, usize)] = &[
@@ -194,7 +194,7 @@ const G13: &[(ColId, usize)] = &[
     (MemHistory, 8),
     (MajorFaults, 6),
     (MinorFaults, 6),
-    (Oom, 3),
+    (Oom, 5),
     (Command, 157),
 ];
 const G14: &[(ColId, usize)] = &[
@@ -220,7 +220,7 @@ const G15: &[(ColId, usize)] = &[
     (MemHistory, 8),
     (MajorFaults, 6),
     (MinorFaults, 6),
-    (Oom, 3),
+    (Oom, 5),
     (Command, 15),
 ];
 const G16: &[(ColId, usize)] = &[
@@ -235,7 +235,7 @@ const G16: &[(ColId, usize)] = &[
     (MemHistory, 8),
     (MajorFaults, 6),
     (MinorFaults, 6),
-    (Oom, 3),
+    (Oom, 5),
     (Command, 75),
 ];
 const G17: &[(ColId, usize)] = &[
@@ -250,7 +250,7 @@ const G17: &[(ColId, usize)] = &[
     (MemHistory, 8),
     (MajorFaults, 6),
     (MinorFaults, 6),
-    (Oom, 3),
+    (Oom, 5),
     (Command, 155),
 ];
 const G18: &[(ColId, usize)] = &[
@@ -729,6 +729,13 @@ fn preset_fit_goldens_cover_widths_and_tree_reservation() {
             *expected,
             "{preset:?} at width {width} with tree={tree}"
         );
+        let occupied = actual.iter().map(|(_, cells)| cells).sum::<usize>()
+            + actual.len().saturating_sub(1)
+            + if *tree { 2 } else { 0 };
+        assert_eq!(
+            occupied, *width,
+            "{preset:?} at width {width} with tree={tree}: columns, gutters, and reserve must fill the viewport"
+        );
     }
 }
 
@@ -741,8 +748,10 @@ fn fit_columns_stays_in_width_and_command_is_last() {
                 for width in 20..=300 {
                     let fitted = fit_columns(preset, width, flags);
                     let occupied = fitted.iter().map(|(_, cells)| cells).sum::<usize>()
-                        + fitted.len().saturating_sub(1);
-                    assert!(occupied <= width);
+                        + fitted.len().saturating_sub(1)
+                        + usize::from(detail_open)
+                        + if tree { 2 } else { 0 };
+                    assert_eq!(occupied, width);
                     assert_eq!(fitted.last().map(|item| item.0), Some(ColId::Command));
                     assert!(fitted.iter().all(|(_, cells)| *cells > 0));
                 }
