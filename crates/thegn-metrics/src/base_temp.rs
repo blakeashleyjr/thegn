@@ -83,7 +83,8 @@ impl<F: HwmonFs> BaseTemp<F> {
                 continue;
             }
             if slot.handle.is_none() && slot.pending {
-                slot.handle = self.fs.open(&slot.path).ok();
+                // A sensor that cannot be opened stays absent until the next rediscovery.
+                slot.handle = Result::ok(self.fs.open(&slot.path));
                 slot.pending = false;
             }
             let Some(handle) = slot.handle.as_ref() else {
