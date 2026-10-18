@@ -13,6 +13,7 @@ pub mod snmp;
 pub mod softnet;
 pub mod stat;
 pub mod swaps;
+pub mod upower_history;
 pub mod uptime;
 pub mod vmstat;
 pub mod zram;

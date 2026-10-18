@@ -42,10 +42,11 @@ pub enum CollectorId {
     Netdev,
     Diskstats,
     Powercap,
+    PowerSupply,
 }
 
 impl CollectorId {
-    pub const ALL: [Self; 14] = [
+    pub const ALL: [Self; 15] = [
         Self::Loadavg,
         Self::Uptime,
         Self::Psi,
@@ -60,6 +61,7 @@ impl CollectorId {
         Self::Netdev,
         Self::Diskstats,
         Self::Powercap,
+        Self::PowerSupply,
     ];
 
     pub const fn slug(self) -> &'static str {
@@ -78,6 +80,7 @@ impl CollectorId {
             Self::Netdev => "netdev",
             Self::Diskstats => "diskstats",
             Self::Powercap => "powercap",
+            Self::PowerSupply => "power_supply",
         }
     }
 
@@ -169,6 +172,9 @@ pub fn default_collectors() -> Vec<Box<dyn Collector>> {
     ));
     collectors[CollectorId::Diskstats.index()] = Box::new(
         linux::diskstats::DiskstatsCollector::at("/proc/diskstats", "/sys/block"),
+    );
+    collectors[CollectorId::PowerSupply.index()] = Box::new(
+        linux::power_supply::PowerSupplyCollector::at("/sys/class/power_supply"),
     );
     collectors
 }
