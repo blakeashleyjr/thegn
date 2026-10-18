@@ -23,10 +23,7 @@ impl BaseNet {
     fn at(path: impl AsRef<Path>) -> Self {
         let path = path.as_ref().to_path_buf();
         let mut reader = Self {
-            file: match ProcFile::open(&path) {
-                Ok(file) => Some(file),
-                Err(_) => None,
-            },
+            file: ProcFile::open(&path).ok(),
             path,
             prev: Vec::new(),
             primed: false,
@@ -49,14 +46,11 @@ impl BaseNet {
         retry_open: bool,
     ) -> Option<Vec<(String, u64, u64)>> {
         if self.file.is_none() && retry_open {
-            self.file = match ProcFile::open(&self.path) {
-                Ok(file) => Some(file),
-                Err(_) => None,
-            };
+            if let Ok(file) = ProcFile::open(&self.path) {
+                self.file = Some(file);
+            }
         }
-        let Some(file) = self.file.as_mut() else {
-            return None;
-        };
+        let file = self.file.as_mut()?;
         let bytes = match file.read_all() {
             Ok(bytes) => bytes,
             Err(error) => {
@@ -74,7 +68,12 @@ impl BaseNet {
             self.primed = false;
             return None;
         };
-        let previous = if self.primed { &self.prev } else { &rows };
+        if !self.primed {
+            self.prev = rows;
+            self.primed = true;
+            return None;
+        }
+        let previous = &self.prev;
         let result = rates(previous, &rows, dt_secs);
         self.prev = rows;
         self.primed = true;
@@ -203,9 +202,7 @@ mod tests {
 
     #[test]
     fn holds_the_open_file_and_reads_once_per_sample() {
-        let dir = tempfile::Builder::new()
-            .tempdir()
-            .unwrap();
+        let dir = tempfile::Builder::new().tempdir().unwrap();
         let path = dir.path().join("net.dev");
         fs::write(&path, FIRST).unwrap();
         let mut reader = BaseNet::at(&path);
@@ -236,14 +233,22 @@ mod tests {
 
     #[test]
     fn unavailable_source_stays_absent_until_a_slow_retry() {
-        let dir = tempfile::Builder::new()
-            .tempdir()
-            .unwrap();
+        let dir = tempfile::Builder::new().tempdir().unwrap();
         let path = dir.path().join("net.dev");
         let mut reader = BaseNet::at(&path);
         assert!(reader.rates(1.0, false).is_none());
         fs::write(&path, FIRST).unwrap();
         assert!(reader.rates(1.0, false).is_none());
-        assert_eq!(reader.rates(1.0, true).unwrap().len(), 4);
+        assert!(reader.rates(1.0, true).is_none());
+        fs::write(&path, SECOND).unwrap();
+        assert_eq!(
+            reader.rates(1.0, false).unwrap(),
+            [
+                ("lo".to_owned(), 1000, 2000),
+                ("enp4s0".to_owned(), 300, 400),
+                ("wlan0".to_owned(), 600, 800),
+                ("tun0".to_owned(), 500, 700),
+            ]
+        );
     }
 }

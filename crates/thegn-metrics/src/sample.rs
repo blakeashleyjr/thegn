@@ -332,7 +332,7 @@ impl StatsSampler {
         let network = {
             #[cfg(target_os = "linux")]
             {
-                // Keep the constructor's sysinfo setup until its deferred cfg split.
+                // Silences dead_code until X-1 removes the Linux Networks field.
                 let _legacy_networks = &self.nets;
                 self.base_net.rates(dt_net, slow).map(|rates| {
                     crate::net_kind::aggregate(
