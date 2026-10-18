@@ -158,7 +158,7 @@ pub(crate) fn sample_self(out: &mut Vec<ThreadSample>, cap: usize) {
             {
                 fd_number.clear();
                 write!(&mut fd_number, "{fd}").expect("writing an fd number to String");
-                fd_path.push_str(&fd_number);
+                fd_path.push(fd_number.as_str());
                 if let Ok(target) = std::fs::read_link(&fd_path) {
                     sample.fd_target_len =
                         copy_bytes(&mut sample.fd_target, target.as_os_str().as_bytes());
