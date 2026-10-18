@@ -538,9 +538,8 @@ async fn pump_conn_with_deadlines(
             Ok(Ok(())) => {}
         }
     }
-    if let Err(error) = wr.shutdown().await {
-        tracing::debug!(target: "thegn::revtunnel", %error, "local tunnel stream shutdown failed");
-    }
+    // The inbound future owns the local write half and half-closes it on a clean end;
+    // on a deadline abort it is dropped with the stream.
 }
 
 /// Shared per-connection routing table: id → inbound payload sender.
@@ -2258,7 +2257,7 @@ mod tests {
         );
         task.await.unwrap();
         assert_eq!(permits.available_permits(), 1);
-        assert!(rejection_counts().write_stall >= before + 1);
+        assert!(rejection_counts().write_stall > before);
         survivor_sink.send(encode(&Frame::Open(193))).await.unwrap();
         assert_eq!(
             next_frame(&mut peer, &mut FrameDecoder::new()).await,
@@ -2310,7 +2309,7 @@ mod tests {
         let (result, sink_failed) = supervisor.await.unwrap();
         assert!(sink_failed);
         assert!(matches!(result, Err(error) if error.kind() == io::ErrorKind::BrokenPipe));
-        assert!(rejection_counts().write_stall >= before + 1);
+        assert!(rejection_counts().write_stall > before);
         let mut buffered = Vec::new();
         tokio::time::timeout(Duration::from_secs(1), far.read_to_end(&mut buffered))
             .await
