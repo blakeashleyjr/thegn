@@ -58,6 +58,16 @@ impl MaterializeObserver {
     pub(crate) fn on_event(&mut self, ev: SandboxPhase) -> Vec<LoadStep> {
         match ev {
             SandboxPhase::Resolve => {
+                // A later resolve means the caller is trying the next backend.
+                // The failed create was one completed candidate attempt, not
+                // the final provisioning result, so retire it before reopening
+                // the shared resolve row.
+                for s in &mut self.steps {
+                    if s.kind == StepKind::Create && s.state == StepState::Failed {
+                        s.state = StepState::Done;
+                        s.detail = None;
+                    }
+                }
                 self.upsert(StepKind::Resolve, "sandbox".to_string());
             }
             SandboxPhase::ResolveProbe { backend } => {
@@ -398,5 +408,43 @@ mod tests {
             1,
             "never two spinners"
         );
+    }
+
+    #[test]
+    fn failed_backend_then_fallback_reaches_shell_wait_and_clears_on_output() {
+        let mut observer = MaterializeObserver::new();
+        let events = [
+            SandboxPhase::Resolve,
+            SandboxPhase::ResolveProbe {
+                backend: "podman-rootless".into(),
+            },
+            SandboxPhase::ContainerCreate { backend: "podman" },
+            SandboxPhase::PhaseFailed {
+                err: "could not start podman container".into(),
+            },
+            SandboxPhase::Resolve,
+            SandboxPhase::ResolveProbe {
+                backend: "bwrap".into(),
+            },
+            SandboxPhase::PhaseDone,
+        ];
+        let mut steps = Vec::new();
+        for event in events {
+            steps = observer.on_event(event);
+        }
+
+        assert!(crate::loading::is_shell_wait(&steps));
+        assert!(
+            steps
+                .iter()
+                .filter(|step| step.kind != StepKind::Shell)
+                .all(|step| step.state == StepState::Done)
+        );
+        let key = ("wt-fallback".to_string(), 0usize);
+        let loading_state = [(key.clone(), steps)].into();
+        assert!(crate::loading::should_clear_splash_on_output(
+            &loading_state,
+            &key
+        ));
     }
 }
