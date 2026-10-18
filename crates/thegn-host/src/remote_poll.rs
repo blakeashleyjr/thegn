@@ -33,14 +33,15 @@
 //! `BatchMode`/`ConnectTimeout`, http low-speed abort), so a repo needing
 //! credentials fails fast instead of wedging a pool thread on a prompt.
 //!
-//! **The badge is the only default surface.** A landed fetch refreshes the
-//! affected rows ([`refresh_badges`]) and repaints — nothing pops, nothing
+//! **The badge is the only default surface.** A fetch that moves refs refreshes
+//! the affected rows ([`refresh_badges`]) and repaints — nothing pops, nothing
 //! chimes. The inbox notice in [`notify_behind`] is strictly opt-in behind
 //! `[git] auto_fetch_notify`, on the view that an interrupting notification for
 //! a routine upstream commit is noise; the number next to the down arrow is
 //! what the user asked to be kept current.
 
 use std::collections::HashMap;
+use std::hash::{Hash, Hasher};
 use std::sync::Mutex;
 
 use termwiz::terminal::TerminalWaker;
@@ -51,6 +52,100 @@ use crate::hydrate::RefreshKind;
 
 /// Notification kind string for "the branch is behind its upstream now".
 const KIND_UPSTREAM: &str = "upstream_behind";
+
+const MAX_LOOSE_REMOTE_REF_ENTRIES: usize = 4096;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum FetchOutcome {
+    NotRun,
+    Unchanged,
+    Changed,
+}
+
+fn should_refresh(outcomes: &[FetchOutcome]) -> bool {
+    outcomes.contains(&FetchOutcome::Changed)
+}
+
+fn fetch_outcome(ok: bool, before: Option<u64>, after: Option<u64>) -> FetchOutcome {
+    match (ok, before, after) {
+        (_, Some(before), Some(after)) if before != after => FetchOutcome::Changed,
+        (true, Some(_), Some(_)) => FetchOutcome::Unchanged,
+        (true, _, _) => FetchOutcome::Changed,
+        (false, _, _) => FetchOutcome::NotRun,
+    }
+}
+
+/// Hash the remote-tracking refs in a local common dir without invoking git.
+/// Any uncertainty returns `None`; a successful fetch conservatively refreshes
+/// in that case.
+fn remote_ref_fingerprint(loc: &GitLoc, common_dir: &std::path::Path) -> Option<u64> {
+    if !matches!(loc, GitLoc::Local(_)) {
+        return None;
+    }
+
+    let mut entries = Vec::new();
+    let packed_refs = common_dir.join("packed-refs");
+    match std::fs::read(&packed_refs) {
+        Ok(contents) => entries.push((std::path::PathBuf::from("packed-refs"), contents)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(_) => return None,
+    }
+
+    /// The cap is 4096 directory entries, including directories as well as ref files.
+    fn collect_refs(
+        common_dir: &std::path::Path,
+        refs_root: &std::path::Path,
+        dir: &std::path::Path,
+        entries: &mut Vec<(std::path::PathBuf, Vec<u8>)>,
+        visited: &mut usize,
+    ) -> Option<()> {
+        let children = match std::fs::read_dir(dir) {
+            Ok(children) => children,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound && dir == refs_root => {
+                return Some(());
+            }
+            Err(_) => return None,
+        };
+        for child in children {
+            if *visited >= MAX_LOOSE_REMOTE_REF_ENTRIES {
+                return None;
+            }
+            *visited += 1;
+            let child = child.ok()?;
+            let path = child.path();
+            let kind = child.file_type().ok()?;
+            if kind.is_dir() {
+                collect_refs(common_dir, refs_root, &path, entries, visited)?;
+            } else if kind.is_file() {
+                entries.push((
+                    path.strip_prefix(common_dir).ok()?.to_path_buf(),
+                    std::fs::read(path).ok()?,
+                ));
+            } else {
+                return None;
+            }
+        }
+        Some(())
+    }
+
+    let refs_root = common_dir.join("refs/remotes");
+    let mut visited = 0;
+    collect_refs(
+        common_dir,
+        &refs_root,
+        &refs_root,
+        &mut entries,
+        &mut visited,
+    )?;
+    entries.sort_by(|a, b| a.0.cmp(&b.0));
+
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    for (path, contents) in entries {
+        path.hash(&mut hasher);
+        contents.hash(&mut hasher);
+    }
+    Some(hasher.finish())
+}
 
 // --- pure policy ------------------------------------------------------------
 
@@ -401,11 +496,11 @@ pub(crate) fn poll(
     let refresh_tx = refresh_tx.clone();
     let waker = waker.clone();
     crate::sched::spawn_bg_replaceable(move || {
-        let mut any = false;
+        let mut outcomes = Vec::with_capacity(targets.len());
         for target in targets {
-            any |= poll_one(&target, &all, &cfg, &notify);
+            outcomes.push(poll_one(&target, &all, &cfg, &notify));
         }
-        if any {
+        if should_refresh(&outcomes) {
             // The fetch moved `refs/remotes/…`, so every cached upstream count
             // is stale. The ref fs-watcher normally catches this, but it only
             // watches the ACTIVE local worktree — drop the (tiny, in-memory)
@@ -421,27 +516,28 @@ pub(crate) fn poll(
 }
 
 /// Fetch one worktree's repo (if due) and raise any behind-notifications for the
-/// session worktrees that share it. Returns whether a fetch actually ran.
+/// session worktrees that share it. Returns whether the fetched refs changed.
 /// Blocking — background lane only.
 fn poll_one(
     worktree: &str,
     all_worktrees: &[String],
     cfg: &GitConfig,
     notify: &crate::notify::NotifyState,
-) -> bool {
+) -> FetchOutcome {
     let path = std::path::Path::new(worktree);
     if !path.is_dir() {
-        return false;
+        return FetchOutcome::NotRun;
     }
     let loc = GitLoc::for_worktree(path);
     let Some(repo) = repo_key(worktree, &loc) else {
-        return false;
+        return FetchOutcome::NotRun;
     };
     // Stay out of a jj-colocated repo's way: jj's docs warn a background
     // `git fetch` can interleave with its auto-snapshot, so skip unless the user
     // opted in with `[git] auto_fetch_colocated`. The repo root (main checkout)
     // is the `.git` common dir's parent — that's where a `.jj/` sibling lives.
-    let repo_root = thegn_core::util::git_common_dir(path)
+    let common_dir = thegn_core::util::git_common_dir(path);
+    let repo_root = common_dir
         .parent()
         .map(|p| p.to_path_buf())
         .unwrap_or_else(|| path.to_path_buf());
@@ -450,18 +546,25 @@ fn poll_one(
         thegn_core::jj::is_colocated(&repo_root),
         cfg.auto_fetch_colocated,
     ) {
-        return false;
+        return FetchOutcome::NotRun;
     }
     let now = thegn_core::util::now();
     if !claim(&repo, now, cfg.auto_fetch_min_interval_secs) {
-        return false;
+        return FetchOutcome::NotRun;
     }
     let result = match remote_for(&loc) {
-        Some(remote) => run_fetch(&loc, &remote),
+        Some(remote) => {
+            let before = remote_ref_fingerprint(&loc, &common_dir);
+            let result = run_fetch(&loc, &remote);
+            let ok = result.is_ok();
+            let after = remote_ref_fingerprint(&loc, &common_dir);
+            (result, fetch_outcome(ok, before, after))
+        }
         // No remotes configured: nothing to poll, but treat it as a success so
         // the repo just rides the normal interval instead of backing off.
-        None => Ok(()),
+        None => (Ok(()), FetchOutcome::NotRun),
     };
+    let (result, outcome) = result;
     let ok = result.is_ok();
     release(
         &repo,
@@ -477,7 +580,9 @@ fn poll_one(
             // unrelated repo's branches, so neither the badge refresh nor the
             // (opt-in) notice can ever touch an unrelated worktree.
             let checkouts = session_checkouts(&loc, all_worktrees);
-            refresh_badges(&checkouts);
+            if outcome == FetchOutcome::Changed {
+                refresh_badges(&checkouts);
+            }
             if cfg.auto_fetch_notify {
                 notify_behind(&loc, &checkouts, notify);
             }
@@ -489,7 +594,7 @@ fn poll_one(
             tracing::debug!(target: "thegn::git", repo = %repo, error = %e, "auto-fetch failed");
         }
     }
-    ok
+    outcome
 }
 
 /// Round-robin cursor over background worktrees, advanced once per sweep so
@@ -520,6 +625,82 @@ fn next_sweep_target(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn remote_ref_fingerprint_tracks_loose_and_packed_refs() {
+        let dir = tempfile::tempdir().unwrap();
+        let refs = dir.path().join("refs/remotes/origin");
+        std::fs::create_dir_all(&refs).unwrap();
+
+        // Missing packed-refs is valid, and identical files have a stable hash.
+        let loc = GitLoc::Local(dir.path().to_path_buf());
+        std::fs::write(refs.join("main"), "1111111\n").unwrap();
+        let first = remote_ref_fingerprint(&loc, dir.path()).unwrap();
+        assert_eq!(remote_ref_fingerprint(&loc, dir.path()), Some(first));
+
+        // A loose remote-tracking ref update changes the fingerprint.
+        std::fs::write(refs.join("main"), "2222222\n").unwrap();
+        let loose_updated = remote_ref_fingerprint(&loc, dir.path()).unwrap();
+        assert_ne!(loose_updated, first);
+
+        // Packed refs participate too, even when the loose refs are unchanged.
+        std::fs::write(
+            dir.path().join("packed-refs"),
+            "# pack-refs\n3333333 refs/remotes/origin/release\n",
+        )
+        .unwrap();
+        let packed_added = remote_ref_fingerprint(&loc, dir.path()).unwrap();
+        assert_ne!(packed_added, loose_updated);
+        std::fs::write(
+            dir.path().join("packed-refs"),
+            "# pack-refs\n4444444 refs/remotes/origin/release\n",
+        )
+        .unwrap();
+        assert_ne!(remote_ref_fingerprint(&loc, dir.path()), Some(packed_added));
+    }
+
+    #[test]
+    fn remote_ref_fingerprint_returns_unknown_past_loose_ref_cap() {
+        let dir = tempfile::tempdir().unwrap();
+        let refs = dir.path().join("refs/remotes/origin");
+        std::fs::create_dir_all(&refs).unwrap();
+        for i in 0..=MAX_LOOSE_REMOTE_REF_ENTRIES {
+            std::fs::write(refs.join(format!("ref-{i}")), i.to_string()).unwrap();
+        }
+        let loc = GitLoc::Local(dir.path().to_path_buf());
+        assert_eq!(remote_ref_fingerprint(&loc, dir.path()), None);
+    }
+
+    #[test]
+    fn only_changed_fetch_outcomes_request_refresh() {
+        let cases = [
+            (&[][..], false),
+            (&[FetchOutcome::NotRun][..], false),
+            (&[FetchOutcome::Unchanged][..], false),
+            (&[FetchOutcome::NotRun, FetchOutcome::Unchanged][..], false),
+            (&[FetchOutcome::Changed][..], true),
+            (&[FetchOutcome::Unchanged, FetchOutcome::Changed][..], true),
+        ];
+        for (outcomes, expected) in cases {
+            assert_eq!(should_refresh(outcomes), expected, "{outcomes:?}");
+        }
+    }
+
+    #[test]
+    fn fetch_outcome_refreshes_only_known_ref_moves_after_failure() {
+        let cases = [
+            (true, Some(1), Some(1), FetchOutcome::Unchanged),
+            (true, Some(1), Some(2), FetchOutcome::Changed),
+            (true, None, Some(2), FetchOutcome::Changed),
+            (true, Some(1), None, FetchOutcome::Changed),
+            (false, None, None, FetchOutcome::NotRun),
+            (false, Some(1), Some(1), FetchOutcome::NotRun),
+            (false, Some(1), Some(2), FetchOutcome::Changed),
+        ];
+        for (ok, before, after, expected) in cases {
+            assert_eq!(fetch_outcome(ok, before, after), expected);
+        }
+    }
 
     #[test]
     fn enormous_fetch_floor_cannot_narrow_into_an_immediate_retry() {
