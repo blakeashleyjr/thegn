@@ -368,7 +368,7 @@ impl TabView for MemoryView<'_> {
                         .collect(),
                 ),
             ),
-            (Size::Fixed(6), Node::Panel(LIMIT)),
+            (Size::Fixed(9), Node::Panel(LIMIT)),
         ])
     }
 
