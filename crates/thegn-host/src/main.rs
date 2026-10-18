@@ -179,6 +179,7 @@ mod panel_util;
 mod panes;
 mod parity;
 mod perf;
+mod perf_rt;
 mod perf_timing;
 #[cfg(test)]
 mod perf_workloads;
@@ -1111,6 +1112,10 @@ fn run_main() -> anyhow::Result<()> {
         .max_blocking_threads(32)
         .thread_keep_alive(std::time::Duration::from_secs(45))
         .thread_name("thegn-rt")
+        .on_thread_start(crate::perf_rt::on_thread_start)
+        .on_thread_stop(crate::perf_rt::on_thread_stop)
+        .on_thread_park(crate::perf_rt::on_thread_park)
+        .on_thread_unpark(crate::perf_rt::on_thread_unpark)
         .build()?;
     // Admit the configuration before the runtime starts and before the
     // terminal enters the alternate screen, so a refusal is a plain typed
