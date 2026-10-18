@@ -17,7 +17,7 @@ mod paint;
 use thegn_metrics::collect::{
     CollectorId, CollectorSet,
     frame::MonitorFrame,
-    health::{Absent, Health},
+    health::Health,
     model::{
         amd_smu::AmdSmuStatus,
         cpu_policy::{CpuPolicy, PowerPolicy},

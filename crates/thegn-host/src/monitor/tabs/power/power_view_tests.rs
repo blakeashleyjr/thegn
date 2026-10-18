@@ -104,6 +104,13 @@ fn fixture() -> MonitorFrame {
 fn text(surface: &mut Surface) -> String {
     surface.screen_chars_to_string()
 }
+fn collector_set(ids: &[CollectorId]) -> CollectorSet {
+    let mut set = CollectorSet::empty();
+    for id in ids {
+        set.insert(*id);
+    }
+    set
+}
 fn fill_ratio(surface: &Surface, area: Rect) -> f32 {
     let (cols, rows) = surface.dimensions();
     let total = area.cols.min(cols).saturating_mul(area.rows.min(rows));
@@ -250,26 +257,22 @@ fn demand_is_static_for_each_panel_and_history_reuses_capacity_after_warmup() {
     );
     assert_eq!(model.history.len(), super::HISTORY_CAP);
     let view = PowerView(&model);
-    let battery: CollectorSet = [CollectorId::PowerSupply].into_iter().collect();
-    let rails: CollectorSet = [
+    let battery = collector_set(&[CollectorId::PowerSupply]);
+    let rails = collector_set(&[
         CollectorId::PowerSupply,
         CollectorId::Powercap,
         CollectorId::AmdSmu,
-    ]
-    .into_iter()
-    .collect();
-    let policy: CollectorSet = [CollectorId::CpuFreq].into_iter().collect();
+    ]);
+    let policy = collector_set(&[CollectorId::CpuFreq]);
     assert_eq!(view.demand(PanelId("power.battery")), battery);
     assert_eq!(view.demand(PanelId("power.rails")), rails);
     assert_eq!(view.demand(PanelId("power.policy")), policy);
-    let union: CollectorSet = [
+    let union = collector_set(&[
         CollectorId::PowerSupply,
         CollectorId::Powercap,
         CollectorId::AmdSmu,
         CollectorId::CpuFreq,
-    ]
-    .into_iter()
-    .collect();
+    ]);
     assert_eq!(
         union,
         [battery, rails, policy]
