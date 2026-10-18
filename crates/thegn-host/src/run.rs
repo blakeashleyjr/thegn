@@ -10762,6 +10762,54 @@ async fn event_loop<T: Terminal>(
                     last_pool_reconcile = None;
                     dirty = true;
                 }
+                run_pending_db::PendingDbResult::HostAdded { name, defs, then } => {
+                    thegn_core::host_config::merge_host_defs(&mut current_config, &defs);
+                    thegn_core::thread_name::spawn_named("thegn-cfg-load", || {
+                        crate::platform::qos::set_self(crate::platform::qos::Qos::Utility);
+                        if let crate::config_startup::ReloadOutcome::Failed(error) =
+                            crate::config_startup::reload()
+                        {
+                            tracing::warn!(
+                                target: "thegn::config",
+                                %error,
+                                "config reload after host add failed"
+                            );
+                        }
+                    });
+                    keymap = rebuild_keymap(&current_config, &session);
+                    model.status = format!("host {name} added");
+                    match then {
+                        run_pending_db::HostAddThen::Wizard { repo_root } => {
+                            crate::handlers::wizard::begin_worktree_wizard(
+                                repo_root,
+                                None,
+                                None,
+                                keymap.config(),
+                                &mut create_gen,
+                                &create_tx,
+                                &waker,
+                                &mut inflight,
+                                &mut wizard_cmd_tx,
+                                &mut wizard_ui,
+                                &mut model,
+                            );
+                        }
+                        run_pending_db::HostAddThen::Panel => {
+                            if let Err(error) = refresh_tx.send(RefreshKind::Model) {
+                                tracing::debug!(
+                                    target: "thegn::host",
+                                    %error,
+                                    "host-added panel refresh receiver is gone"
+                                );
+                            }
+                        }
+                    }
+                    dirty = true;
+                }
+                run_pending_db::PendingDbResult::HostAddFailed { status } => {
+                    model.status = status;
+                    dirty = true;
+                }
             }
         }
         let active_tests_wt = active_tab_path(&session).to_string_lossy().into_owned();
@@ -18872,26 +18920,15 @@ async fn event_loop<T: Terminal>(
                                     HostInputKind::NewHost { repo_root } => {
                                         match crate::handlers::wizard::add_host_from_input(
                                             &text,
-                                            &mut current_config,
+                                            &current_config,
+                                            run_pending_db::HostAddThen::Wizard { repo_root },
+                                            &pending_db_tx,
+                                            &waker,
                                         ) {
-                                            Ok(name) => {
-                                                keymap = rebuild_keymap(&current_config, &session);
-                                                model.status = format!("host {name} added");
-                                                crate::handlers::wizard::begin_worktree_wizard(
-                                                    repo_root,
-                                                    None,
-                                                    None,
-                                                    keymap.config(),
-                                                    &mut create_gen,
-                                                    &create_tx,
-                                                    &waker,
-                                                    &mut inflight,
-                                                    &mut wizard_cmd_tx,
-                                                    &mut wizard_ui,
-                                                    &mut model,
-                                                );
+                                            Ok(()) => model.status = "add host: saving…".into(),
+                                            Err(error) => {
+                                                model.status = format!("add host: {error}")
                                             }
-                                            Err(e) => model.status = format!("add host: {e}"),
                                         }
                                     }
                                     HostInputKind::RenameWorktree {
@@ -19194,8 +19231,9 @@ async fn event_loop<T: Terminal>(
                                     HostInputKind::AddHost => {
                                         model.status = crate::handlers::host::add_and_refresh(
                                             &text,
-                                            &mut current_config,
-                                            &refresh_tx,
+                                            &current_config,
+                                            &pending_db_tx,
+                                            &waker,
                                         );
                                     }
                                 }

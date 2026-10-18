@@ -42,6 +42,28 @@ pub(crate) enum PendingDbResult {
     PoolTarget {
         status: String,
     },
+    HostAdded {
+        name: String,
+        defs: Vec<(String, thegn_core::host_config::HostConfig)>,
+        then: HostAddThen,
+    },
+    HostAddFailed {
+        status: String,
+    },
+}
+
+#[derive(Debug, Clone)]
+pub(crate) enum HostAddThen {
+    Wizard { repo_root: std::path::PathBuf },
+    Panel,
+}
+
+pub(crate) struct HostAddRequest {
+    pub(crate) name: String,
+    pub(crate) hc: thegn_core::host_config::HostConfig,
+    pub(crate) cfg_has_name: bool,
+    pub(crate) then: HostAddThen,
+    pub(crate) now: i64,
 }
 
 #[derive(Debug, Default)]
@@ -289,6 +311,42 @@ fn run_pool_target_adjust(
 ) {
     let status = crate::handlers::provision::adjust_pool_target(db, cfg, wt, delta);
     notify(PendingDbResult::PoolTarget { status });
+}
+
+pub(crate) fn queue_host_add(
+    tx: &tokio::sync::mpsc::UnboundedSender<PendingDbResult>,
+    waker: &termwiz::terminal::TerminalWaker,
+    request: HostAddRequest,
+) {
+    let tx = tx.clone();
+    let waker = waker.clone();
+    crate::db_task::persist_critical(move |db| {
+        let result = crate::handlers::wizard::store_host_def(
+            db,
+            &request.name,
+            &request.hc,
+            request.cfg_has_name,
+            request.now,
+        );
+        run_host_add(request, result, |result| send_result(&tx, &waker, result));
+    });
+}
+
+fn run_host_add(
+    request: HostAddRequest,
+    result: Result<Vec<(String, thegn_core::host_config::HostConfig)>, String>,
+    notify: impl FnOnce(PendingDbResult),
+) {
+    match result {
+        Ok(defs) => notify(PendingDbResult::HostAdded {
+            name: request.name,
+            defs,
+            then: request.then,
+        }),
+        Err(error) => notify(PendingDbResult::HostAddFailed {
+            status: format!("add host: {error}"),
+        }),
+    }
 }
 
 async fn send_dropped_result(
@@ -779,6 +837,130 @@ mod tests {
             results.as_slice(),
             [PendingDbResult::PoolTarget { status }]
                 if status == "warm pool: only for provider (remote) workspaces"
+        ));
+    }
+
+    #[test]
+    fn store_host_def_persists_and_preserves_the_config_duplicate_rule() {
+        use thegn_core::store::HostStore as _;
+
+        let (name, hc) =
+            thegn_core::host_config::parse_host_target("alice@host.example", None).unwrap();
+        let db = thegn_core::db::Db::open_memory().unwrap();
+        let defs = crate::handlers::wizard::store_host_def(&db, &name, &hc, false, 123).unwrap();
+        assert!(
+            defs.iter()
+                .any(|(stored, config)| stored == &name && config.ssh.host == hc.ssh.host)
+        );
+
+        let (config_name, config_hc) =
+            thegn_core::host_config::parse_host_target("bob@config-only.example", None).unwrap();
+        let duplicate =
+            crate::handlers::wizard::store_host_def(&db, &config_name, &config_hc, true, 124);
+        assert!(matches!(duplicate, Err(error) if error.contains("already exists in config.toml")));
+        assert!(
+            db.host_defs()
+                .unwrap()
+                .iter()
+                .any(|(stored, _)| stored == &name)
+        );
+        assert!(
+            !db.host_defs()
+                .unwrap()
+                .iter()
+                .any(|(stored, _)| stored == &config_name)
+        );
+
+        let readded = crate::handlers::wizard::store_host_def(&db, &name, &hc, true, 125).unwrap();
+        assert!(
+            readded
+                .iter()
+                .any(|(stored, config)| stored == &name && config.ssh.host == hc.ssh.host)
+        );
+    }
+
+    #[test]
+    fn host_add_result_is_sent_once_on_success_and_failure() {
+        let (name, hc) =
+            thegn_core::host_config::parse_host_target("alice@host.example", None).unwrap();
+        let request = |name: String, hc: thegn_core::host_config::HostConfig| HostAddRequest {
+            name,
+            hc,
+            cfg_has_name: false,
+            then: HostAddThen::Panel,
+            now: 123,
+        };
+        let mut results = Vec::new();
+        run_host_add(
+            request(name.clone(), hc.clone()),
+            Ok(vec![(name.clone(), hc.clone())]),
+            |result| results.push(result),
+        );
+        assert!(matches!(
+            results.as_slice(),
+            [PendingDbResult::HostAdded { name: added, defs, then: HostAddThen::Panel }]
+                if added == &name
+                    && matches!(defs.as_slice(), [(stored, config)]
+                        if stored == &name && config.ssh.host == hc.ssh.host)
+        ));
+
+        results.clear();
+        run_host_add(request(name), Err("write failed".into()), |result| {
+            results.push(result)
+        });
+        assert!(matches!(
+            results.as_slice(),
+            [PendingDbResult::HostAddFailed { status }]
+                if status == "add host: write failed"
+        ));
+    }
+
+    #[test]
+    fn host_add_submit_does_not_block_on_a_held_write_lock() {
+        if !crate::platform::sound_process::test_support::UNIX {
+            return;
+        }
+
+        let state = crate::testenv::IsolatedState::new();
+        drop(thegn_core::db::Db::open().unwrap());
+        let lock = rusqlite::Connection::open(state.state_home().join("thegn/thegn.db")).unwrap();
+        lock.execute_batch("BEGIN IMMEDIATE").unwrap();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let (waker, _master, _terminal) =
+            crate::platform::sound_process::test_support::test_waker();
+        let started = std::time::Instant::now();
+        let status = crate::handlers::host::add_and_refresh(
+            "alice@host.example",
+            &thegn_core::config::Config::default(),
+            &tx,
+            &waker,
+        );
+        assert_eq!(status, "add host: saving…");
+        assert!(started.elapsed() < std::time::Duration::from_millis(500));
+        assert!(matches!(
+            rx.try_recv(),
+            Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+        ));
+
+        lock.execute_batch("ROLLBACK").unwrap();
+        drop(lock);
+        let (barrier_tx, barrier_rx) = std::sync::mpsc::channel();
+        crate::db_task::persist_critical(move |_| {
+            if barrier_tx.send(()).is_err() {
+                tracing::debug!(target: "thegn::host", "host-add barrier receiver closed");
+            }
+        });
+        barrier_rx
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .unwrap();
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(PendingDbResult::HostAdded { name, defs, then: HostAddThen::Panel })
+                if name == "host-example" && defs.iter().any(|(stored, _)| stored == "host-example")
+        ));
+        assert!(matches!(
+            rx.try_recv(),
+            Err(tokio::sync::mpsc::error::TryRecvError::Empty)
         ));
     }
 }
