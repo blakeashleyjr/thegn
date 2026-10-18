@@ -1,4 +1,5 @@
 use super::*;
+use crate::collect::model::gpu::GpuKind;
 use std::fs::{self, File};
 use std::os::unix::fs::{FileExt, PermissionsExt};
 use tempfile::Builder;
@@ -10,20 +11,21 @@ struct Opened {
 
 #[derive(Default)]
 struct FakeFs {
-    opens: Vec<PathBuf>,
-    preads: Vec<PathBuf>,
+    touched: Vec<PathBuf>,
 }
 
 impl GpuFs for FakeFs {
     type Handle = Opened;
 
     fn list(&mut self, path: &Path) -> io::Result<Vec<PathBuf>> {
+        self.touched.push(path.to_owned());
         fs::read_dir(path)?
             .map(|entry| entry.map(|entry| entry.path()))
             .collect()
     }
 
     fn read_small(&mut self, path: &Path, buffer: &mut [u8]) -> io::Result<usize> {
+        self.touched.push(path.to_owned());
         let bytes = fs::read(path)?;
         let length = bytes.len().min(buffer.len());
         buffer[..length].copy_from_slice(&bytes[..length]);
@@ -31,7 +33,7 @@ impl GpuFs for FakeFs {
     }
 
     fn open(&mut self, path: &Path) -> io::Result<Self::Handle> {
-        self.opens.push(path.to_owned());
+        self.touched.push(path.to_owned());
         Ok(Opened {
             path: path.to_owned(),
             file: File::open(path)?,
@@ -39,7 +41,7 @@ impl GpuFs for FakeFs {
     }
 
     fn pread(&mut self, handle: &Self::Handle, buffer: &mut [u8]) -> io::Result<usize> {
-        self.preads.push(handle.path.clone());
+        self.touched.push(handle.path.clone());
         handle.file.read_at(buffer, 0)
     }
 }
@@ -83,10 +85,11 @@ fn discovers_the_captured_box_gpu_and_accel_and_skips_connectors() {
     put(&device.join("ip_discovery/die/0/GC/0/revision"), "0\n");
     put(&device.join("mem_info_vram_total"), "536870912\n");
     put(&device.join("mem_info_gtt_total"), "50244972544\n");
-    put(&device.join("boot_vga"), "0\n");
     for connector in ["card1-DP-1", "card1-eDP-1", "card1-Writeback-1"] {
         fs::create_dir_all(drm.join(connector)).unwrap();
     }
+    fs::create_dir_all(drm.join("renderD128")).unwrap();
+    fs::create_dir_all(device.join("uma")).unwrap();
     let accel_uevent = accel.join("accel0/device/uevent");
     put(
         &accel_uevent,
@@ -101,6 +104,7 @@ fn discovers_the_captured_box_gpu_and_accel_and_skips_connectors() {
     assert_eq!(gpu.slot, "0000:c1:00.0");
     assert_eq!(gpu.kind, GpuKind::Apu);
     assert_eq!(gpu.family.as_deref(), Some("RDNA3.5"));
+    assert_eq!(gpu.boot_vga, None);
     assert_eq!(
         gpu.ip_version,
         Some(IpVersion {
@@ -129,18 +133,89 @@ fn runtime_sampling_only_reads_the_held_power_status_handle() {
     );
     let mut collector = GpuDevicesCollector::with_fs(fake, &drm, &accel);
     assert_eq!(collector.discover(&Env::default()), Health::Ok);
-    let opens_after_discovery = collector.fs.opens.clone();
-    collector.fs.opens.clear();
+    assert!(
+        collector
+            .fs
+            .touched
+            .iter()
+            .all(|path| { !path.starts_with(drm.join("card0/device")) || path == &status })
+    );
+    let touched_after_discovery = collector.fs.touched.len();
     let mut frame = MonitorFrame::default();
-    collector.sample(&TickCtx::default(), &mut frame).unwrap();
-    assert!(collector.fs.opens.is_empty());
-    assert_eq!(collector.fs.preads, vec![status]);
-    assert_eq!(collector.fs.opens, Vec::<PathBuf>::new());
-    assert_eq!(opens_after_discovery.len(), 1);
+    for (sample, now_ms) in [
+        0, 5_000, 10_000, 15_000, 20_000, 25_000, 30_000, 35_000, 40_000, 45_000, 50_000, 55_000,
+        60_001,
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        collector
+            .sample(
+                &TickCtx {
+                    tick: sample as u64,
+                    now_ms,
+                },
+                &mut frame,
+            )
+            .unwrap();
+    }
+    let touched = &collector.fs.touched[touched_after_discovery..];
+    assert!(
+        touched
+            .iter()
+            .all(|path| { !path.starts_with(drm.join("card0/device")) || path == &status })
+    );
+    assert_eq!(touched.iter().filter(|path| *path == &status).count(), 13);
     assert_eq!(
         frame.parts.gpu_devices.devices[0].runtime_status,
         RuntimeStatus::Suspended
     );
+}
+
+#[test]
+fn suspended_device_identity_is_filled_after_it_becomes_active() {
+    let (_root, fake, drm, accel) = fixture();
+    add_card(&drm, "card0", "0000:c1:00.0", "amdgpu");
+    let device = drm.join("card0/device");
+    let status = device.join("power/runtime_status");
+    fs::write(&status, "suspended\n").unwrap();
+    put(&device.join("mem_info_vram_total"), "2147483648\n");
+    put(&device.join("mem_info_gtt_total"), "8589934592\n");
+    let mut collector = GpuDevicesCollector::with_fs(fake, &drm, &accel);
+    assert_eq!(collector.discover(&Env::default()), Health::Ok);
+    let mut frame = MonitorFrame::default();
+    collector.sample(&TickCtx::default(), &mut frame).unwrap();
+    assert_eq!(frame.parts.gpu_devices.devices[0].driver, None);
+    assert_eq!(frame.parts.gpu_devices.devices[0].kind, GpuKind::Unknown);
+
+    fs::write(&status, "active\n").unwrap();
+    collector
+        .sample(
+            &TickCtx {
+                tick: 1,
+                now_ms: 500,
+            },
+            &mut frame,
+        )
+        .unwrap();
+    let gpu = &frame.parts.gpu_devices.devices[0];
+    assert_eq!(gpu.slot, "0000:c1:00.0");
+    assert_eq!(gpu.driver.as_deref(), Some("amdgpu"));
+    assert_eq!(gpu.kind, GpuKind::Apu);
+}
+
+#[test]
+fn apu_thresholds_classify_without_uma_directory() {
+    let (_root, fake, drm, accel) = fixture();
+    add_card(&drm, "card0", "0000:c1:00.0", "amdgpu");
+    let device = drm.join("card0/device");
+    put(&device.join("mem_info_vram_total"), "2147483648\n");
+    put(&device.join("mem_info_gtt_total"), "8589934592\n");
+    let mut collector = GpuDevicesCollector::with_fs(fake, &drm, &accel);
+    assert_eq!(collector.discover(&Env::default()), Health::Ok);
+    let mut frame = MonitorFrame::default();
+    collector.sample(&TickCtx::default(), &mut frame).unwrap();
+    assert_eq!(frame.parts.gpu_devices.devices[0].kind, GpuKind::Apu);
 }
 
 #[test]
