@@ -200,7 +200,7 @@ mod tests {
                 .sample(
                     &TickCtx {
                         tick,
-                        now_ms: u64::from(tick) * 1000,
+                        now_ms: tick * 1000,
                     },
                     &mut frame,
                 )
