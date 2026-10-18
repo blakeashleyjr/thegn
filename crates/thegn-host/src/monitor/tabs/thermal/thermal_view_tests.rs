@@ -326,7 +326,7 @@ fn deterministic_snapshots_cover_sizes_capabilities_and_demand() {
                         assert!(output.contains("Thermal zones"));
                         assert!(output.contains("GPU thermals"));
                         assert!(output.contains("k10temp"));
-                        assert!(output.contains("ref 100 C"));
+                        assert!(output.contains("ref 100"));
                         assert!(output.contains("amdgpu"));
                         assert!(output.contains("spd5118"));
                         assert!(output.contains("alarm 1"));

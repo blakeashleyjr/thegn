@@ -309,19 +309,19 @@ impl ThermalModel {
                 .then_with(|| left.key.cmp(&right.key))
         });
 
-        let package = self.package();
-        let package_key = package.map(|sensor| sensor.key.clone());
-        let package_temp = package.and_then(|sensor| sensor.temp_c);
-        if package_key.as_deref() != self.package_history_key.as_deref() {
+        let package_index = self.package_index();
+        let package_temp = package_index.and_then(|index| self.sensors[index].temp_c);
+        let package_key_changed = package_index.is_some_and(|index| {
+            Some(self.sensors[index].key.as_str()) != self.package_history_key.as_deref()
+        }) || (package_index.is_none()
+            && self.package_history_key.is_some());
+        if package_key_changed {
             self.package_history_len = 0;
             self.package_history_next = 0;
-            match package_key.as_deref() {
-                Some(key) => match &mut self.package_history_key {
-                    Some(current) => {
-                        current.clear();
-                        current.push_str(key);
-                    }
-                    None => self.package_history_key = Some(key.to_owned()),
+            match package_index {
+                Some(index) => match &mut self.package_history_key {
+                    Some(current) => current.clone_from(&self.sensors[index].key),
+                    None => self.package_history_key = Some(self.sensors[index].key.clone()),
                 },
                 None => self.package_history_key = None,
             }
@@ -431,20 +431,24 @@ impl ThermalModel {
         &mut self.zones[index]
     }
 
-    fn package(&self) -> Option<&SensorRow> {
+    fn package_index(&self) -> Option<usize> {
         self.sensors
             .iter()
-            .filter(|row| row.group == ChipGroup::Cpu && is_package_label(&row.label))
-            .min_by_key(|row| package_label_rank(&row.label))
+            .enumerate()
+            .filter(|(_, row)| row.group == ChipGroup::Cpu && is_package_label(&row.label))
+            .min_by_key(|(_, row)| package_label_rank(&row.label))
+            .map(|(index, _)| index)
             .or_else(|| {
                 self.sensors
                     .iter()
-                    .filter(|row| row.group == ChipGroup::Cpu)
-                    .max_by(|left, right| {
+                    .enumerate()
+                    .filter(|(_, row)| row.group == ChipGroup::Cpu)
+                    .max_by(|(_, left), (_, right)| {
                         left.temp_c
                             .partial_cmp(&right.temp_c)
                             .unwrap_or(std::cmp::Ordering::Equal)
                     })
+                    .map(|(index, _)| index)
             })
     }
 }
@@ -457,14 +461,16 @@ fn is_core_label(label: &str) -> bool {
 }
 
 fn package_label_rank(label: &str) -> usize {
-    let lower = label.to_ascii_lowercase();
-    if lower.starts_with("package id ") {
+    if label
+        .get(.."package id ".len())
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("package id "))
+    {
         0
-    } else if lower == "tctl" {
+    } else if label.eq_ignore_ascii_case("tctl") {
         1
-    } else if lower == "tdie" {
+    } else if label.eq_ignore_ascii_case("tdie") {
         2
-    } else if lower == "package" {
+    } else if label.eq_ignore_ascii_case("package") {
         3
     } else {
         usize::MAX
@@ -569,7 +575,9 @@ impl TabView for ThermalView<'_> {
             PACKAGE => paint::package(
                 &mut grid,
                 inner,
-                self.0.package(),
+                self.0
+                    .package_index()
+                    .and_then(|index| self.0.sensors.get(index)),
                 &self.0.package_history,
                 self.0.package_history_len,
                 self.0.package_history_next,
