@@ -25,6 +25,7 @@ const PRESSURE: PanelId = PanelId("memory.pressure");
 const SWAP: PanelId = PanelId("memory.swap");
 const PAGING: PanelId = PanelId("memory.paging");
 const LIMIT: PanelId = PanelId("memory.limit");
+const KERNEL: PanelId = PanelId("memory.kernel");
 const COMPOSITION_VARIANTS: [Variant; 1] = [Variant {
     kind: VariantKind::Full,
     min: (36, 8),
@@ -55,8 +56,13 @@ const LIMIT_VARIANTS: [Variant; 1] = [Variant {
     min: (36, 4),
     pref: (72, 6),
 }];
+const KERNEL_VARIANTS: [Variant; 1] = [Variant {
+    kind: VariantKind::Full,
+    min: (36, 16),
+    pref: (72, 18),
+}];
 const HISTORY_CAPACITY: usize = 120;
-const SPECS: [PanelSpec; 6] = [
+const SPECS: [PanelSpec; 7] = [
     PanelSpec {
         id: COMPOSITION,
         priority: 0,
@@ -87,6 +93,11 @@ const SPECS: [PanelSpec; 6] = [
         priority: 5,
         variants: &LIMIT_VARIANTS,
     },
+    PanelSpec {
+        id: KERNEL,
+        priority: 6,
+        variants: &KERNEL_VARIANTS,
+    },
 ];
 
 #[derive(Debug, Clone, PartialEq)]
@@ -112,6 +123,10 @@ pub(in crate::monitor) struct MemoryModel {
     zram_totals: (Option<u64>, Option<u64>, Option<u64>),
     pub hugepages_total: Option<u64>,
     pub hugepages_free: Option<u64>,
+    hugepages_size: Option<u64>,
+    thp_anon: Option<u64>,
+    thp_shmem: Option<u64>,
+    thp_file: Option<u64>,
     pub reclaim: Option<f64>,
     pub scan: Option<f64>,
     pub steal: Option<f64>,
@@ -131,6 +146,20 @@ pub(in crate::monitor) struct MemoryModel {
     reclaim_history: MemoryHistory,
     scan_history: MemoryHistory,
     refault_history: MemoryHistory,
+    anon_history: MemoryHistory,
+    cache_history: MemoryHistory,
+    slab_history: MemoryHistory,
+    free_history: MemoryHistory,
+    minor_fault_history: MemoryHistory,
+    major_fault_history: MemoryHistory,
+    dirty_history: MemoryHistory,
+    writeback_history: MemoryHistory,
+    thp_fault_history: MemoryHistory,
+    thp_collapse_history: MemoryHistory,
+    thp_split_history: MemoryHistory,
+    page_in_kib_per_sec: Option<f64>,
+    page_out_kib_per_sec: Option<f64>,
+    prior_vm_counters: [Option<u64>; 5],
     pub health: MemHealth,
     pub slice_current: Option<u64>,
     pub slice_high: Option<thegn_metrics::collect::model::cgroup::Limit>,
@@ -215,6 +244,10 @@ impl Default for MemoryModel {
             zram_totals: (None, None, None),
             hugepages_total: None,
             hugepages_free: None,
+            hugepages_size: None,
+            thp_anon: None,
+            thp_shmem: None,
+            thp_file: None,
             reclaim: None,
             scan: None,
             steal: None,
@@ -234,6 +267,20 @@ impl Default for MemoryModel {
             reclaim_history: MemoryHistory::default(),
             scan_history: MemoryHistory::default(),
             refault_history: MemoryHistory::default(),
+            anon_history: MemoryHistory::default(),
+            cache_history: MemoryHistory::default(),
+            slab_history: MemoryHistory::default(),
+            free_history: MemoryHistory::default(),
+            minor_fault_history: MemoryHistory::default(),
+            major_fault_history: MemoryHistory::default(),
+            dirty_history: MemoryHistory::default(),
+            writeback_history: MemoryHistory::default(),
+            thp_fault_history: MemoryHistory::default(),
+            thp_collapse_history: MemoryHistory::default(),
+            thp_split_history: MemoryHistory::default(),
+            page_in_kib_per_sec: None,
+            page_out_kib_per_sec: None,
+            prior_vm_counters: [None; 5],
             health: mem_health::evaluate(&MemHealthInput::default()),
             slice_current: None,
             slice_high: None,
@@ -375,8 +422,29 @@ impl MemoryModel {
         };
         self.hugepages_total = mem.get(MemField::HugePagesTotal);
         self.hugepages_free = mem.get(MemField::HugePagesFree);
+        self.hugepages_size = mem.get(MemField::Hugepagesize);
+        self.thp_anon = mem.get(MemField::AnonHugePages);
+        self.thp_shmem = mem.get(MemField::ShmemHugePages);
+        self.thp_file = mem.get(MemField::FileHugePages);
+        let total = self.total.filter(|value| *value > 0);
+        for (history, value) in [
+            (&mut self.anon_history, self.anon),
+            (&mut self.cache_history, self.cache),
+            (&mut self.slab_history, self.slab),
+            (&mut self.free_history, self.free),
+        ] {
+            history.push(match (value, total) {
+                (Some(value), Some(total)) if value <= total => value as f32 / total as f32,
+                _ => f32::NAN,
+            });
+        }
+        self.dirty_history
+            .push(self.dirty.map_or(f32::NAN, |v| v as f32));
+        self.writeback_history
+            .push(self.writeback.map_or(f32::NAN, |v| v as f32));
 
         use thegn_metrics::collect::model::vmstat::VmRate;
+        use thegn_metrics::collect::parse::vmstat::VmField;
         let vm = &frame.parts.vmstat;
         self.reclaim = vm.rates[VmRate::StealDirect as usize];
         self.scan = sum_rates(
@@ -390,6 +458,42 @@ impl MemoryModel {
         );
         self.allocstall = vm.rates[VmRate::Allocstall as usize];
         self.major_faults = vm.rates[VmRate::Pgmajfault as usize];
+        let minor_faults = vm.rates[VmRate::Pgfault as usize]
+            .zip(self.major_faults)
+            .filter(|(all, major)| {
+                all.is_finite() && major.is_finite() && *all >= *major && *major >= 0.0
+            })
+            .map(|(all, major)| all - major);
+        self.minor_fault_history.push(
+            minor_faults
+                .filter(|value| value.is_finite())
+                .map_or(f32::NAN, |v| v as f32),
+        );
+        self.major_fault_history.push(
+            self.major_faults
+                .filter(|value| value.is_finite() && *value >= 0.0)
+                .map_or(f32::NAN, |v| v as f32),
+        );
+        let counters = [
+            vm.raw.get(VmField::Pgpgin),
+            vm.raw.get(VmField::Pgpgout),
+            vm.raw.get(VmField::ThpFaultAlloc),
+            vm.raw.get(VmField::ThpCollapseAlloc),
+            vm.raw.get(VmField::ThpSplitPage),
+        ];
+        let rates: [Option<f64>; 5] = std::array::from_fn(|index| {
+            let rate = counter_rate(counters[index], self.prior_vm_counters[index], frame.dt_ms);
+            self.prior_vm_counters[index] = counters[index];
+            rate
+        });
+        self.page_in_kib_per_sec = rates[0];
+        self.page_out_kib_per_sec = rates[1];
+        self.thp_fault_history
+            .push(rates[2].map_or(f32::NAN, |value| value as f32));
+        self.thp_collapse_history
+            .push(rates[3].map_or(f32::NAN, |value| value as f32));
+        self.thp_split_history
+            .push(rates[4].map_or(f32::NAN, |value| value as f32));
         self.oom_kill = vm.rates[VmRate::OomKill as usize];
         if let Some(reclaim) = self.reclaim.filter(|rate| rate.is_finite() && *rate >= 0.0) {
             self.reclaim_history.push(reclaim as f32);
@@ -454,6 +558,116 @@ impl MemoryModel {
     }
 }
 
+fn counter_rate(current: Option<u64>, previous: Option<u64>, dt_ms: u32) -> Option<f64> {
+    let (Some(current), Some(previous)) = (current, previous) else {
+        return None;
+    };
+    if dt_ms == 0 || current < previous {
+        return None;
+    }
+    Some((current - previous) as f64 * 1000.0 / f64::from(dt_ms))
+}
+
+fn rate_text(value: Option<f64>) -> String {
+    value
+        .filter(|rate| rate.is_finite() && *rate >= 0.0)
+        .map_or_else(|| absent_mark().to_owned(), |rate| format!("{rate:.1}"))
+}
+
+fn latest_rate(history: &MemoryHistory) -> Option<f64> {
+    let mut values = [f32::NAN; HISTORY_CAPACITY];
+    let (len, _) = history.copy_recent(&mut values);
+    len.checked_sub(1)
+        .and_then(|index| values.get(index))
+        .copied()
+        .filter(|value| value.is_finite())
+        .map(f64::from)
+}
+
+fn paint_memory_history(
+    grid: &mut CellGrid,
+    rect: Rect,
+    history: &MemoryHistory,
+    ramp: RampId,
+    label: &str,
+    unit: Unit,
+) {
+    if rect.rows == 0 || rect.cols == 0 {
+        return;
+    }
+    let mut values = [f32::NAN; HISTORY_CAPACITY];
+    let (len, peak) = history.copy_recent(&mut values);
+    let peak = peak.max(0.0);
+    grid.view(Rect { rows: 1, ..rect }).put_str(
+        0,
+        0,
+        &format!(
+            "{label} / window peak {}",
+            kit::edge_fmt(NumFmt::default()).fmt(peak as f64, unit, 8)
+        ),
+        Default::default(),
+    );
+    if rect.rows < 2 || len == 0 || peak <= 0.0 {
+        return;
+    }
+    for value in values.iter_mut().take(len) {
+        if value.is_finite() {
+            *value = (*value / peak).clamp(0.0, 1.0);
+        }
+    }
+    let table = crate::monitor::graphs::table();
+    let visible = len.min(rect.cols.saturating_mul(if table.braille { 2 } else { 1 }));
+    if visible > 0 {
+        let chart = kit::history_rect::graph_rect(
+            Rect {
+                y: rect.y + 1,
+                rows: rect.rows - 1,
+                ..rect
+            },
+            visible,
+            table.braille,
+        );
+        draw_line_runs(grid, chart, &values[len - visible..len], table, ramp);
+    }
+}
+
+fn draw_line_runs(
+    grid: &mut CellGrid,
+    chart: Rect,
+    values: &[f32],
+    table: &viz_raster::RasterTable,
+    ramp: RampId,
+) {
+    let samples_per_cell = if table.braille { 2 } else { 1 };
+    let mut sample = 0;
+    while sample < values.len() {
+        while sample < values.len() && !values[sample].is_finite() {
+            sample += 1;
+        }
+        let run_start = sample;
+        while sample < values.len() && values[sample].is_finite() {
+            sample += 1;
+        }
+        if run_start < sample {
+            let first_cell = run_start / samples_per_cell;
+            let end_cell = sample.div_ceil(samples_per_cell);
+            let mut raster = CellBuf::new();
+            raster.reset(end_cell - first_cell, chart.rows);
+            viz_raster::line(&values[run_start..sample], table, &mut raster);
+            draw_raster(
+                grid,
+                Rect {
+                    x: chart.x + first_cell,
+                    cols: end_cell - first_cell,
+                    ..chart
+                },
+                &raster,
+                RasterStyle::Ramp(ramp),
+            );
+        }
+    }
+}
+
 fn sum_rates(left: Option<f64>, right: Option<f64>) -> Option<f64> {
     match (left, right) {
         (Some(left), Some(right)) => Some(left + right),
@@ -470,7 +684,7 @@ impl TabView for MemoryView<'_> {
     }
 
     fn template(&self) -> Node {
-        let mut panels = vec![COMPOSITION, VERDICT, PRESSURE, PAGING];
+        let mut panels = vec![COMPOSITION, VERDICT, PRESSURE, PAGING, KERNEL];
         // SwapTotal changes only on a swap-device layout change; swap usage does
         // not affect panel placement.
         if self.0.swap_present {
@@ -520,6 +734,10 @@ impl TabView for MemoryView<'_> {
             PAGING => {
                 demand.insert(CollectorId::Vmstat);
             }
+            KERNEL => {
+                demand.insert(CollectorId::Meminfo);
+                demand.insert(CollectorId::Vmstat);
+            }
             LIMIT => {
                 demand.insert(CollectorId::CgroupSlice);
             }
@@ -544,6 +762,7 @@ impl TabView for MemoryView<'_> {
             SWAP => "Swap and compression",
             PAGING => "Paging activity",
             LIMIT => "Container limit",
+            KERNEL => "Kernel and paging",
             _ => return,
         };
         let area = Rect::full(rect.cols, rect.rows);
@@ -555,6 +774,7 @@ impl TabView for MemoryView<'_> {
             SWAP => self.paint_swap(&mut grid, body),
             PAGING => self.paint_paging(&mut grid, body),
             LIMIT => self.paint_limit(&mut grid, body),
+            KERNEL => self.paint_kernel(&mut grid, body),
             _ => {}
         }
         Emitter::default().emit(&grid, area, surface, rect.x, rect.y);
@@ -562,6 +782,147 @@ impl TabView for MemoryView<'_> {
 }
 
 impl MemoryView<'_> {
+    fn paint_kernel(&self, grid: &mut CellGrid, body: Rect) {
+        let rates = [
+            ("minor faults/s", &self.0.minor_fault_history),
+            ("major faults/s", &self.0.major_fault_history),
+        ];
+        if body.rows > 0 {
+            grid.view(Rect {
+                x: body.x,
+                y: body.y,
+                cols: body.cols,
+                rows: 1,
+            })
+            .put_str(
+                0,
+                0,
+                &format!(
+                    "faults/s  minor {}  major {}",
+                    rate_text(latest_rate(&self.0.minor_fault_history)),
+                    rate_text(self.0.major_faults)
+                ),
+                Default::default(),
+            );
+        }
+        for (index, (label, history)) in rates.into_iter().enumerate() {
+            let row = 1 + index * 2;
+            if body.rows < row + 2 {
+                continue;
+            }
+            paint_memory_history(
+                grid,
+                Rect {
+                    x: body.x,
+                    y: body.y + row,
+                    cols: body.cols,
+                    rows: 2,
+                },
+                history,
+                RampId::Mem,
+                label,
+                Unit::Count,
+            );
+        }
+        if body.rows > 5 {
+            grid.view(Rect {
+                x: body.x,
+                y: body.y + 5,
+                cols: body.cols,
+                rows: 1,
+            })
+            .put_str(
+                0,
+                0,
+                &format!(
+                    "page in {} KiB/s  out {} KiB/s",
+                    rate_text(self.0.page_in_kib_per_sec),
+                    rate_text(self.0.page_out_kib_per_sec)
+                ),
+                Default::default(),
+            );
+        }
+        if body.rows > 6 {
+            grid.view(Rect {
+                x: body.x,
+                y: body.y + 6,
+                cols: body.cols,
+                rows: 1,
+            })
+            .put_str(
+                0,
+                0,
+                &format!(
+                    "THP alloc {}  collapse {}  split {} /s",
+                    rate_text(latest_rate(&self.0.thp_fault_history)),
+                    rate_text(latest_rate(&self.0.thp_collapse_history)),
+                    rate_text(latest_rate(&self.0.thp_split_history))
+                ),
+                Default::default(),
+            );
+        }
+        if body.rows > 7 && self.0.hugepages_total.is_some_and(|total| total > 0) {
+            let hugepages = format!(
+                "hugepages {} total / {} free x {}",
+                reading_text(self.0.hugepages_total, Unit::Count),
+                reading_text(self.0.hugepages_free, Unit::Count),
+                reading_text(self.0.hugepages_size, Unit::Bytes)
+            );
+            grid.view(Rect {
+                x: body.x,
+                y: body.y + 7,
+                cols: body.cols,
+                rows: 1,
+            })
+            .put_str(0, 0, &hugepages, Default::default());
+        }
+        if body.rows > 8 {
+            let thp = format!(
+                "THP anon {}  shmem {}  file {}",
+                fmt_bytes(self.0.thp_anon),
+                fmt_bytes(self.0.thp_shmem),
+                fmt_bytes(self.0.thp_file)
+            );
+            grid.view(Rect {
+                x: body.x,
+                y: body.y + 8,
+                cols: body.cols,
+                rows: 1,
+            })
+            .put_str(0, 0, &thp, Default::default());
+        }
+        if body.rows > 10 {
+            paint_memory_history(
+                grid,
+                Rect {
+                    x: body.x,
+                    y: body.y + 9,
+                    cols: body.cols,
+                    rows: 2,
+                },
+                &self.0.dirty_history,
+                RampId::Mem,
+                "dirty bytes",
+                Unit::Bytes,
+            );
+        }
+        if body.rows > 12 {
+            paint_memory_history(
+                grid,
+                Rect {
+                    x: body.x,
+                    y: body.y + 11,
+                    cols: body.cols,
+                    rows: 2,
+                },
+                &self.0.writeback_history,
+                RampId::Mem,
+                "writeback bytes",
+                Unit::Bytes,
+            );
+        }
+    }
+
     fn paint_limit(&self, grid: &mut CellGrid, body: Rect) {
         use thegn_metrics::collect::model::cgroup::Limit;
 
@@ -718,6 +1079,12 @@ impl MemoryView<'_> {
 
     fn paint_composition(&self, grid: &mut CellGrid, body: Rect) {
         let m = self.0;
+        let show_small_multiples = body.cols >= 72 && body.rows >= 17;
+        let table_cols = if show_small_multiples {
+            body.cols / 2
+        } else {
+            body.cols
+        };
         let total = m.total;
         let values = [
             (
@@ -823,20 +1190,20 @@ impl MemoryView<'_> {
             Rect {
                 x: body.x,
                 y: body.y.saturating_add(1),
-                cols: body.cols,
+                cols: table_cols,
                 rows: body.rows.saturating_sub(1),
             },
             &kit::table::TableSpec {
                 cols: &[
                     kit::table::Col {
                         title: "component",
-                        width: body.cols / 2,
+                        width: table_cols / 2,
                         align: kit::table::Align::Left,
                         unit: None,
                     },
                     kit::table::Col {
                         title: "size",
-                        width: body.cols.saturating_sub(body.cols / 2 + 1),
+                        width: table_cols.saturating_sub(table_cols / 2 + 1),
                         align: kit::table::Align::Right,
                         unit: None,
                     },
@@ -849,6 +1216,49 @@ impl MemoryView<'_> {
                 fmt: NumFmt::default(),
             },
         );
+        if show_small_multiples {
+            let components = [
+                ("anon", m.anon, &m.anon_history),
+                ("cache", m.cache, &m.cache_history),
+                ("slab", m.slab, &m.slab_history),
+                ("free", m.free, &m.free_history),
+            ];
+            let chart_x = body.x + table_cols;
+            let chart_cols = body.cols - table_cols;
+            for (index, (label, value, history)) in components.into_iter().enumerate() {
+                let y = body.y + 1 + index * 3;
+                grid.view(Rect {
+                    x: chart_x,
+                    y,
+                    cols: chart_cols,
+                    rows: 1,
+                })
+                .put_str(
+                    0,
+                    0,
+                    &format!("{label} {} / total", fmt_bytes(value)),
+                    Default::default(),
+                );
+                if history.len > 0 {
+                    let mut values = [f32::NAN; HISTORY_CAPACITY];
+                    let (len, _) = history.copy_recent(&mut values);
+                    let chart = Rect {
+                        x: chart_x,
+                        y: y + 1,
+                        cols: chart_cols,
+                        rows: 2,
+                    };
+                    let table = crate::monitor::graphs::table();
+                    let visible =
+                        len.min(chart.cols.saturating_mul(if table.braille { 2 } else { 1 }));
+                    if visible > 0 {
+                        let normalized = &values[len - visible..len];
+                        let chart = kit::history_rect::graph_rect(chart, visible, table.braille);
+                        draw_line_runs(grid, chart, normalized, table, RampId::Mem);
+                    }
+                }
+            }
+        }
         self.paint_used_history(grid, body);
     }
 
