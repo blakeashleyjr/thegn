@@ -24,42 +24,56 @@ const VERDICT: PanelId = PanelId("memory.verdict");
 const PRESSURE: PanelId = PanelId("memory.pressure");
 const SWAP: PanelId = PanelId("memory.swap");
 const PAGING: PanelId = PanelId("memory.paging");
-const LIMIT: PanelId = PanelId("memory.limit");
-const VARIANTS: [Variant; 1] = [Variant {
+const COMPOSITION_VARIANTS: [Variant; 1] = [Variant {
     kind: VariantKind::Full,
     min: (36, 8),
-    pref: (72, 16),
+    pref: (72, 19),
 }];
-const SPECS: [PanelSpec; 6] = [
+const VERDICT_VARIANTS: [Variant; 1] = [Variant {
+    kind: VariantKind::Full,
+    min: (36, 5),
+    pref: (72, 8),
+}];
+const PRESSURE_VARIANTS: [Variant; 1] = [Variant {
+    kind: VariantKind::Full,
+    min: (36, 7),
+    pref: (72, 10),
+}];
+const SWAP_VARIANTS: [Variant; 1] = [Variant {
+    kind: VariantKind::Full,
+    min: (36, 4),
+    pref: (72, 7),
+}];
+const PAGING_VARIANTS: [Variant; 1] = [Variant {
+    kind: VariantKind::Full,
+    min: (36, 8),
+    pref: (72, 9),
+}];
+const SPECS: [PanelSpec; 5] = [
     PanelSpec {
         id: COMPOSITION,
         priority: 0,
-        variants: &VARIANTS,
+        variants: &COMPOSITION_VARIANTS,
     },
     PanelSpec {
         id: VERDICT,
         priority: 1,
-        variants: &VARIANTS,
+        variants: &VERDICT_VARIANTS,
     },
     PanelSpec {
         id: PRESSURE,
         priority: 2,
-        variants: &VARIANTS,
+        variants: &PRESSURE_VARIANTS,
     },
     PanelSpec {
         id: SWAP,
         priority: 3,
-        variants: &VARIANTS,
+        variants: &SWAP_VARIANTS,
     },
     PanelSpec {
         id: PAGING,
         priority: 4,
-        variants: &VARIANTS,
-    },
-    PanelSpec {
-        id: LIMIT,
-        priority: 5,
-        variants: &VARIANTS,
+        variants: &PAGING_VARIANTS,
     },
 ];
 
@@ -86,15 +100,15 @@ pub(in crate::monitor) struct MemoryModel {
     pub reclaim: Option<f64>,
     pub scan: Option<f64>,
     pub steal: Option<f64>,
+    pub refaults: Option<f64>,
+    pub allocstall: Option<f64>,
     pub major_faults: Option<f64>,
     pub oom_kill: Option<f64>,
+    last_oom_at_ms: Option<u64>,
     pub psi_some_avg10: Option<f64>,
     pub psi_some_avg60: Option<f64>,
     pub psi_full_avg10: Option<f64>,
     pub psi_full_avg60: Option<f64>,
-    pub slice_current: Option<u64>,
-    pub slice_max: Option<u64>,
-    pub slice_present: bool,
     pub health: MemHealth,
 }
 
@@ -122,15 +136,15 @@ impl Default for MemoryModel {
             reclaim: None,
             scan: None,
             steal: None,
+            refaults: None,
+            allocstall: None,
             major_faults: None,
             oom_kill: None,
+            last_oom_at_ms: None,
             psi_some_avg10: None,
             psi_some_avg60: None,
             psi_full_avg10: None,
             psi_full_avg60: None,
-            slice_current: None,
-            slice_max: None,
-            slice_present: false,
             health: mem_health::evaluate(&MemHealthInput::default()),
         }
     }
@@ -179,12 +193,17 @@ impl MemoryModel {
             vm.rates[VmRate::ScanKswapd as usize],
             vm.rates[VmRate::ScanDirect as usize],
         );
-        self.steal = sum_rates(
-            vm.rates[VmRate::StealKswapd as usize],
-            vm.rates[VmRate::StealDirect as usize],
+        self.steal = vm.rates[VmRate::StealKswapd as usize];
+        self.refaults = sum_rates(
+            vm.rates[VmRate::RefaultAnon as usize],
+            vm.rates[VmRate::RefaultFile as usize],
         );
+        self.allocstall = vm.rates[VmRate::Allocstall as usize];
         self.major_faults = vm.rates[VmRate::Pgmajfault as usize];
         self.oom_kill = vm.rates[VmRate::OomKill as usize];
+        if self.oom_kill.is_some_and(|rate| rate > 0.0) {
+            self.last_oom_at_ms = Some(frame.at_ms);
+        }
 
         let psi = &frame.parts.psi.memory;
         self.psi_some_avg10 = psi.file.some.map(|line| f64::from(line.avg10) / 100.0);
@@ -192,16 +211,6 @@ impl MemoryModel {
         self.psi_full_avg10 = psi.file.full.map(|line| f64::from(line.avg10) / 100.0);
         self.psi_full_avg60 = psi.file.full.map(|line| f64::from(line.avg60) / 100.0);
 
-        let slice = &frame.parts.cgroup_slice;
-        self.slice_present = slice.found;
-        self.slice_current = slice.found.then_some(slice.sample.mem_current).flatten();
-        // The current main frame model does not carry memory.max yet. Keep this
-        // absent instead of treating memory.events.max as a byte limit.
-        self.slice_max = None;
-        let slice_used_frac_of_high = self
-            .slice_current
-            .zip(self.slice_max)
-            .and_then(|(current, max)| (max > 0).then_some(current as f64 / max as f64));
         let input = MemHealthInput {
             mem_total_bytes: self.total,
             mem_available_bytes: self.available,
@@ -217,8 +226,10 @@ impl MemoryModel {
             majflt_per_sec: self.major_faults,
             direct_reclaim_pages_per_sec: self.reclaim,
             allocstall_per_sec: vm.rates[VmRate::Allocstall as usize],
-            secs_since_oom_kill: None,
-            slice_used_frac_of_high,
+            secs_since_oom_kill: self
+                .last_oom_at_ms
+                .map(|last| frame.at_ms.saturating_sub(last) as f64 / 1000.0),
+            slice_used_frac_of_high: None,
             os_level: None,
         };
         self.health = mem_health::evaluate(&input);
@@ -226,7 +237,11 @@ impl MemoryModel {
 }
 
 fn sum_rates(left: Option<f64>, right: Option<f64>) -> Option<f64> {
-    left.zip(right).map(|(left, right)| left + right)
+    match (left, right) {
+        (Some(left), Some(right)) => Some(left + right),
+        (Some(value), None) | (None, Some(value)) => Some(value),
+        (None, None) => None,
+    }
 }
 
 pub(in crate::monitor) struct MemoryView<'a>(pub &'a MemoryModel);
@@ -240,9 +255,6 @@ impl TabView for MemoryView<'_> {
         let mut panels = vec![COMPOSITION, VERDICT, PRESSURE, PAGING];
         if self.0.swap_total.is_some_and(|total| total > 0) {
             panels.push(SWAP);
-        }
-        if self.0.slice_current.is_some() && self.0.slice_max.is_some() {
-            panels.push(LIMIT);
         }
         Node::Col(vec![
             (
@@ -276,9 +288,6 @@ impl TabView for MemoryView<'_> {
                 demand.insert(CollectorId::Meminfo);
                 demand.insert(CollectorId::Vmstat);
                 demand.insert(CollectorId::Psi);
-                if self.0.slice_present {
-                    demand.insert(CollectorId::CgroupSlice);
-                }
             }
             PRESSURE => {
                 demand.insert(CollectorId::Psi);
@@ -289,13 +298,6 @@ impl TabView for MemoryView<'_> {
             }
             PAGING => {
                 demand.insert(CollectorId::Vmstat);
-            }
-            LIMIT
-                if self.0.slice_present
-                    && self.0.slice_current.is_some()
-                    && self.0.slice_max.is_some() =>
-            {
-                demand.insert(CollectorId::CgroupSlice);
             }
             _ => {}
         }
@@ -317,7 +319,6 @@ impl TabView for MemoryView<'_> {
             PRESSURE => "Memory pressure",
             SWAP => "Swap and compression",
             PAGING => "Paging activity",
-            LIMIT => "thegn.slice limit",
             _ => return,
         };
         let area = Rect::full(rect.cols, rect.rows);
@@ -328,67 +329,13 @@ impl TabView for MemoryView<'_> {
             PRESSURE => self.paint_pressure(&mut grid, body),
             SWAP => self.paint_swap(&mut grid, body),
             PAGING => self.paint_paging(&mut grid, body),
-            LIMIT => self.paint_limit(&mut grid, body),
             _ => {}
         }
-        self.paint_details(&mut grid, body);
         Emitter::default().emit(&grid, area, surface, rect.x, rect.y);
     }
 }
 
 impl MemoryView<'_> {
-    fn paint_details(&self, grid: &mut CellGrid, body: Rect) {
-        let model = self.0;
-        let summary = [
-            format!(
-                "total {}  available {}  used {}  free {}  cache {}  buffers {}",
-                fmt_bytes(model.total),
-                fmt_bytes(model.available),
-                fmt_bytes(model.used),
-                fmt_bytes(model.free),
-                fmt_bytes(model.cache),
-                fmt_bytes(model.buffers)
-            ),
-            format!(
-                "anon {}  file {}  shmem {}  slab {}  dirty {}  writeback {}",
-                fmt_bytes(model.anon),
-                fmt_bytes(model.file),
-                fmt_bytes(model.shmem),
-                fmt_bytes(model.slab),
-                fmt_bytes(model.dirty),
-                fmt_bytes(model.writeback)
-            ),
-            format!(
-                "swap {} / {}  zram {}  zswap {}  hugepages {} / {}",
-                fmt_bytes(
-                    model
-                        .swap_total
-                        .zip(model.swap_free)
-                        .map(|(total, free)| total.saturating_sub(free))
-                ),
-                fmt_bytes(model.swap_total),
-                fmt_bytes(model.zram_used),
-                fmt_bytes(model.zswap),
-                reading_text(model.hugepages_total, Unit::Count),
-                reading_text(model.hugepages_free, Unit::Count)
-            ),
-        ];
-        for row in 5..body.rows {
-            grid.view(Rect {
-                x: body.x,
-                y: body.y + row,
-                cols: body.cols,
-                rows: 1,
-            })
-            .put_str(
-                0,
-                0,
-                &summary[(row - 5) % summary.len()],
-                Default::default(),
-            );
-        }
-    }
-
     fn paint_composition(&self, grid: &mut CellGrid, body: Rect) {
         let m = self.0;
         let total = m.total;
@@ -416,7 +363,9 @@ impl MemoryView<'_> {
         {
             let proportions =
                 [used, cache, buffers, free].map(|value| value.min(total) as f32 / total as f32);
-            let mut x = 0;
+            // The graph stacked painter still emits GraphOut rows; adapting it
+            // to CellGrid is deferred until the kit exposes that adapter.
+            let mut x: usize = 0;
             for (proportion, (_, _, role)) in proportions.into_iter().zip(values) {
                 let width = (proportion * body.cols as f32).round() as usize;
                 let end = x.saturating_add(width).min(body.cols);
@@ -442,36 +391,54 @@ impl MemoryView<'_> {
                 }
                 x = end;
             }
-        } else {
-            if body.cols > 0 && body.rows > 0 {
-                grid.view(Rect {
-                    x: body.x,
-                    y: body.y,
-                    cols: body.cols,
-                    rows: 1,
-                })
-                .put_str(
-                    0,
-                    0,
-                    crate::caps::active_glyphs().emdash,
-                    Default::default(),
-                );
-            }
+        } else if body.cols > 0 && body.rows > 0 {
+            grid.view(Rect {
+                x: body.x,
+                y: body.y,
+                cols: body.cols,
+                rows: 1,
+            })
+            .put_str(
+                0,
+                0,
+                crate::caps::active_glyphs().emdash,
+                Default::default(),
+            );
         }
         let entries = [
-            ("used", m.used, SeriesRole::MemAnon),
-            ("cache", m.cache, SeriesRole::MemCache),
-            ("buffers", m.buffers, SeriesRole::MemBuffers),
-            ("free", m.free, SeriesRole::MemFree),
+            ("total", fmt_bytes(m.total)),
+            ("available", fmt_bytes(m.available)),
+            ("used", fmt_bytes(m.used)),
+            ("free", fmt_bytes(m.free)),
+            ("cache", fmt_bytes(m.cache)),
+            ("buffers", fmt_bytes(m.buffers)),
+            ("anon", fmt_bytes(m.anon)),
+            ("file", fmt_bytes(m.file)),
+            ("shmem", fmt_bytes(m.shmem)),
+            ("slab", fmt_bytes(m.slab)),
+            ("dirty", fmt_bytes(m.dirty)),
+            ("writeback", fmt_bytes(m.writeback)),
+            (
+                "hugepages total",
+                reading_text(m.hugepages_total, Unit::Count),
+            ),
+            (
+                "hugepages free",
+                reading_text(m.hugepages_free, Unit::Count),
+            ),
         ];
-        let mut labels = Vec::with_capacity(entries.len());
-        for (name, value, role) in entries {
-            labels.push(kit::legend::LegendSwatch::series(
-                format!("{name} {}", reading_text(value, Unit::Bytes)),
-                role,
-            ));
-        }
-        kit::legend::draw(
+        let rows_data: Vec<[kit::table::TableCell<'_>; 2]> = entries
+            .iter()
+            .map(|(name, size)| {
+                [
+                    kit::table::TableCell::Text(name),
+                    kit::table::TableCell::Text(size),
+                ]
+            })
+            .collect();
+        let rows: Vec<&[kit::table::TableCell<'_>]> =
+            rows_data.iter().map(|row| row.as_slice()).collect();
+        kit::table::draw(
             grid,
             Rect {
                 x: body.x,
@@ -479,7 +446,28 @@ impl MemoryView<'_> {
                 cols: body.cols,
                 rows: body.rows.saturating_sub(1),
             },
-            &labels,
+            &kit::table::TableSpec {
+                cols: &[
+                    kit::table::Col {
+                        title: "component",
+                        width: body.cols / 2,
+                        align: kit::table::Align::Left,
+                        unit: None,
+                    },
+                    kit::table::Col {
+                        title: "size",
+                        width: body.cols.saturating_sub(body.cols / 2 + 1),
+                        align: kit::table::Align::Right,
+                        unit: None,
+                    },
+                ],
+                rows: &rows,
+                offset: 0,
+                visible: body.rows.saturating_sub(1),
+                sort: None,
+                selected: None,
+                fmt: NumFmt::default(),
+            },
         );
     }
 
@@ -498,13 +486,13 @@ impl MemoryView<'_> {
                 cols: body.cols,
                 rows: 1,
             },
-            "memory",
-            Reading::Unknown,
+            self.0.health.verdict.label(),
+            Reading::NotApplicable,
             Unit::Count,
             NumFmt::default(),
             state,
         );
-        let mut line = String::from(self.0.health.verdict.label());
+        let mut line = String::new();
         for reason in self.0.health.reasons.iter() {
             line.push_str("  ");
             line.push_str(reason_label(reason));
@@ -657,9 +645,11 @@ impl MemoryView<'_> {
             },
         ];
         let items = [
-            ("reclaim", self.0.reclaim),
+            ("direct reclaim", self.0.reclaim),
+            ("kswapd steal", self.0.steal),
             ("scan", self.0.scan),
-            ("steal", self.0.steal),
+            ("refaults", self.0.refaults),
+            ("allocstall", self.0.allocstall),
             ("major faults", self.0.major_faults),
             ("OOM kills", self.0.oom_kill),
         ];
@@ -688,50 +678,6 @@ impl MemoryView<'_> {
             },
         );
     }
-
-    fn paint_limit(&self, grid: &mut CellGrid, body: Rect) {
-        let (Some(current), Some(max)) = (self.0.slice_current, self.0.slice_max) else {
-            draw_absent(grid, body);
-            return;
-        };
-        let ratio = if max == 0 {
-            0.0
-        } else {
-            (current as f64 / max as f64) as f32
-        };
-        let label = format!(
-            "current {} / max {}",
-            fmt_bytes(Some(current)),
-            fmt_bytes(Some(max))
-        );
-        grid.view(Rect {
-            x: body.x,
-            y: body.y,
-            cols: body.cols,
-            rows: 1,
-        })
-        .put_str(0, 0, &label, Default::default());
-        if body.rows > 1 {
-            let mut meter = Meter::default();
-            meter.paint(
-                grid,
-                Rect {
-                    x: body.x,
-                    y: body.y + 1,
-                    cols: body.cols,
-                    rows: 1,
-                },
-                kit::meter::MeterSpec {
-                    value: ratio.clamp(0.0, 1.0),
-                    warn: 0.75,
-                    crit: 0.9,
-                    ramp: RampId::Mem,
-                    label: true,
-                    fmt: NumFmt::default(),
-                },
-            );
-        }
-    }
 }
 
 fn absent_mark() -> &'static str {
@@ -746,13 +692,13 @@ fn draw_absent(grid: &mut CellGrid, body: Rect) {
 fn fmt_bytes(value: Option<u64>) -> String {
     value.map_or_else(
         || absent_mark().to_owned(),
-        |value| NumFmt::default().fmt(value as f64, Unit::Bytes, 12),
+        |value| kit::edge_fmt(NumFmt::default()).fmt(value as f64, Unit::Bytes, 12),
     )
 }
 fn reading_text(value: Option<u64>, unit: Unit) -> String {
     value.map_or_else(
         || absent_mark().to_owned(),
-        |value| NumFmt::default().fmt(value as f64, unit, 12),
+        |value| kit::edge_fmt(NumFmt::default()).fmt(value as f64, unit, 12),
     )
 }
 fn percent_text(value: Option<f64>) -> String {
