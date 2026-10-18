@@ -25,9 +25,71 @@ use std::{fs::File, io::Read};
 
 use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, RefreshKind, System};
 
+#[cfg(target_os = "linux")]
+use crate::procs_fs::ProcFs;
+#[cfg(target_os = "linux")]
+use crate::procs_linux::{ProcTable, RealProcFs, kept_max_from_rlimit};
+
 /// Never enumerate faster than this: per-process CPU is a delta over the
 /// interval, and a shorter one measures scheduler jitter rather than load.
 pub const MIN_INTERVAL: Duration = Duration::from_secs(2);
+
+#[cfg(target_os = "linux")]
+#[derive(Debug)]
+enum Backend {
+    Sysinfo,
+    Native(NativeBackend),
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Debug)]
+struct NativeBackend {
+    table: ProcTable<RealProcFs>,
+    boot_time: Option<u64>,
+    ticks_per_second: Option<u64>,
+    page_size: Option<u64>,
+    previous_pids: Vec<u32>,
+    pass_time: Duration,
+    last_sample: Option<Instant>,
+}
+
+#[cfg(target_os = "linux")]
+impl NativeBackend {
+    fn new(fs: RealProcFs) -> Self {
+        Self {
+            table: ProcTable::with_kept_max(fs, kept_max_from_rlimit()),
+            boot_time: read_boot_time(),
+            ticks_per_second: clock_ticks_per_second(),
+            page_size: page_size(),
+            previous_pids: Vec::new(),
+            pass_time: Duration::ZERO,
+            last_sample: None,
+        }
+    }
+
+    fn reset(&mut self) {
+        self.table.reset();
+        self.previous_pids.clear();
+        self.pass_time = Duration::ZERO;
+        self.last_sample = None;
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BackendKind {
+    Native,
+    Sysinfo,
+}
+
+#[cfg(target_os = "linux")]
+fn backend_kind(is_linux: bool, procfs_opened: bool) -> BackendKind {
+    if is_linux && procfs_opened {
+        BackendKind::Native
+    } else {
+        BackendKind::Sysinfo
+    }
+}
 
 /// How many processes to keep per sort key. The tab shows the union of the top
 /// N by CPU and the top N by memory, so flipping the sort column re-sorts an
@@ -116,6 +178,8 @@ pub struct ProcSampler {
     self_pid: u32,
     daemon_pid: Option<u32>,
     rows: usize,
+    #[cfg(target_os = "linux")]
+    backend: Backend,
 }
 
 impl Default for ProcSampler {
@@ -128,6 +192,20 @@ impl ProcSampler {
     /// `rows` is `[monitor] proc_rows` — how many the UI will show; the sampler
     /// keeps at least that many per sort key.
     pub fn new(rows: usize) -> Self {
+        #[cfg(target_os = "linux")]
+        let backend = {
+            let opened = match RealProcFs::new() {
+                Ok(fs) => Some(fs),
+                Err(_) => None,
+            };
+            match backend_kind(true, opened.is_some()) {
+                BackendKind::Native => match opened {
+                    Some(fs) => Backend::Native(NativeBackend::new(fs)),
+                    None => Backend::Sysinfo,
+                },
+                BackendKind::Sysinfo => Backend::Sysinfo,
+            }
+        };
         ProcSampler {
             // Nothing but processes: this instance never reads cpu/mem/disk
             // globals, which the main sampler already covers.
@@ -141,6 +219,8 @@ impl ProcSampler {
             self_pid: std::process::id(),
             daemon_pid: None,
             rows: rows.clamp(1, 200),
+            #[cfg(target_os = "linux")]
+            backend,
         }
     }
 
@@ -164,6 +244,10 @@ impl ProcSampler {
         self.start_buf = Vec::new();
         self.primed = false;
         self.last = None;
+        #[cfg(target_os = "linux")]
+        if let Backend::Native(native) = &mut self.backend {
+            native.reset();
+        }
     }
 
     /// Whether enough time has passed for another pass to be meaningful.
@@ -175,6 +259,14 @@ impl ProcSampler {
     /// Take one reading. Blocking — background thread only.
     pub fn sample(&mut self) -> ProcSnapshot {
         self.last = Some(Instant::now());
+        #[cfg(target_os = "linux")]
+        if matches!(&self.backend, Backend::Native(_)) {
+            return self.sample_native();
+        }
+        self.sample_sysinfo()
+    }
+
+    fn sample_sysinfo(&mut self) -> ProcSnapshot {
         // Only what we display. Every other `with_*` costs a readlink or an
         // extra read per process.
         self.sys.refresh_processes_specifics(
@@ -241,6 +333,55 @@ impl ProcSampler {
             primed,
             enabled: true,
         }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn sample_native(&mut self) -> ProcSnapshot {
+        let now = self.last.unwrap_or_else(Instant::now);
+        let self_pid = self.self_pid;
+        let daemon_pid = self.daemon_pid;
+        let pane_pids = self.pane_pids.clone();
+        let native = match &mut self.backend {
+            Backend::Native(native) => native,
+            Backend::Sysinfo => unreachable!("native sampling selected for sysinfo backend"),
+        };
+        if let Some(previous) = native.last_sample {
+            native.pass_time = native
+                .pass_time
+                .saturating_add(now.saturating_duration_since(previous));
+        }
+        native.last_sample = Some(now);
+        let uptime_secs = System::uptime();
+        if native
+            .table
+            .pass(native.pass_time, &native.previous_pids)
+            .is_err()
+        {
+            let primed = self.primed;
+            self.primed = true;
+            return ProcSnapshot {
+                primed,
+                enabled: true,
+                ..ProcSnapshot::default()
+            };
+        }
+        let (snapshot, chosen) = project_native_table(
+            &native.table,
+            NativeProjection {
+                rows: self.rows,
+                boot_time: native.boot_time,
+                ticks_per_second: native.ticks_per_second,
+                page_size: native.page_size,
+                uptime_secs,
+                self_pid,
+                daemon_pid,
+                pane_pids: &pane_pids,
+                primed: self.primed,
+            },
+        );
+        native.previous_pids = chosen.iter().map(|pid| pid.as_u32()).collect();
+        self.primed = true;
+        snapshot
     }
 
     /// Read one process's raw Linux start ticks. Useful for identity checks
@@ -315,6 +456,165 @@ fn matching_start_ticks(
 ) -> Option<u64> {
     (stat.pid == pid && stat.ppid == ppid && stat.comm.to_string_lossy().as_ref() == name)
         .then_some(stat.starttime)
+}
+
+#[cfg(target_os = "linux")]
+struct NativeProjection<'a> {
+    rows: usize,
+    boot_time: Option<u64>,
+    ticks_per_second: Option<u64>,
+    page_size: Option<u64>,
+    uptime_secs: u64,
+    self_pid: u32,
+    daemon_pid: Option<u32>,
+    pane_pids: &'a [(u32, u32)],
+    primed: bool,
+}
+
+#[cfg(target_os = "linux")]
+fn project_native_table<F: ProcFs>(
+    table: &ProcTable<F>,
+    projection: NativeProjection<'_>,
+) -> (ProcSnapshot, Vec<Pid>) {
+    let live = table.entries().iter().filter(|entry| !entry.ghost).count();
+    let mut candidates = Vec::with_capacity(live);
+    for entry in table.entries().iter().filter(|entry| !entry.ghost) {
+        candidates.push((
+            Pid::from_u32(entry.id.pid),
+            entry
+                .cpu_delta
+                .and_then(|delta| delta.percent)
+                .unwrap_or(0.0) as f32,
+            projection
+                .page_size
+                .map(|size| entry.stat.rss_pages.max(0) as u64 * size)
+                .unwrap_or(0),
+        ));
+    }
+    let chosen = choose_top(&mut candidates, projection.rows.max(TOP_N));
+    let ppid_by_pid = table
+        .entries()
+        .iter()
+        .filter(|entry| !entry.ghost)
+        .map(|entry| (entry.id.pid, entry.stat.ppid))
+        .collect::<std::collections::BTreeMap<_, _>>();
+    let procs = chosen
+        .iter()
+        .filter_map(|pid| {
+            let entry = table
+                .entries()
+                .iter()
+                .find(|entry| entry.id.pid == pid.as_u32() && !entry.ghost)?;
+            let name = entry.stat.comm.to_string_lossy();
+            // ProcSample's legacy start_time is not optional. Zero is the existing
+            // unavailable sentinel; start_ticks remains the identity source.
+            let start_time = projection
+                .boot_time
+                .and_then(|btime| {
+                    projection.ticks_per_second.and_then(|hz| {
+                        crate::procs_parse::start_unix_secs(entry.stat.starttime, hz, btime)
+                    })
+                })
+                .unwrap_or(0);
+            let run_secs = projection
+                .ticks_per_second
+                .filter(|hz| *hz > 0)
+                .map(|hz| {
+                    projection
+                        .uptime_secs
+                        .saturating_sub(entry.stat.starttime / hz)
+                })
+                .unwrap_or(0);
+            Some(ProcSample {
+                pid: entry.id.pid,
+                ppid: Some(entry.stat.ppid),
+                start_time,
+                start_ticks: Some(entry.stat.starttime),
+                name: name.chars().take(32).collect(),
+                cpu_pct: entry
+                    .cpu_delta
+                    .and_then(|delta| delta.percent)
+                    .unwrap_or(0.0) as f32,
+                rss_bytes: projection
+                    .page_size
+                    .map(|size| entry.stat.rss_pages.max(0) as u64 * size)
+                    .unwrap_or(0),
+                run_secs,
+                owner: owner_of_map(
+                    entry.id.pid,
+                    &ppid_by_pid,
+                    projection.self_pid,
+                    projection.daemon_pid,
+                    projection.pane_pids,
+                ),
+            })
+        })
+        .collect();
+    (
+        ProcSnapshot {
+            procs,
+            total: live,
+            primed: projection.primed,
+            enabled: true,
+        },
+        chosen,
+    )
+}
+
+#[cfg(target_os = "linux")]
+fn owner_of_map(
+    pid: u32,
+    ppid_by_pid: &std::collections::BTreeMap<u32, u32>,
+    self_pid: u32,
+    daemon_pid: Option<u32>,
+    pane_pids: &[(u32, u32)],
+) -> ProcOwner {
+    let mut current = pid;
+    for _ in 0..MAX_ANCESTRY {
+        if current == self_pid {
+            return ProcOwner::ThegnSelf;
+        }
+        if Some(current) == daemon_pid {
+            return ProcOwner::ThegnDaemon;
+        }
+        if let Some((_, pane)) = pane_pids.iter().find(|(pane_pid, _)| *pane_pid == current) {
+            return ProcOwner::Pane(*pane);
+        }
+        match ppid_by_pid.get(&current).copied() {
+            Some(parent) if parent != current => current = parent,
+            _ => break,
+        }
+    }
+    ProcOwner::Other
+}
+
+#[cfg(target_os = "linux")]
+fn read_boot_time() -> Option<u64> {
+    let contents = match std::fs::read("/proc/stat") {
+        Ok(contents) => contents,
+        Err(_) => return None,
+    };
+    contents.split(|byte| *byte == b'\n').find_map(|line| {
+        let mut fields = line.split(|byte| byte.is_ascii_whitespace());
+        (fields.next() == Some(b"btime".as_slice()))
+            .then(|| fields.find(|field| !field.is_empty()))
+            .flatten()
+            .and_then(|field| std::str::from_utf8(field).ok()?.parse().ok())
+    })
+}
+
+#[cfg(target_os = "linux")]
+fn clock_ticks_per_second() -> Option<u64> {
+    // SAFETY: sysconf reads a process-wide constant and has no pointer arguments.
+    let value = unsafe { libc::sysconf(libc::_SC_CLK_TCK) };
+    u64::try_from(value).ok().filter(|value| *value > 0)
+}
+
+#[cfg(target_os = "linux")]
+fn page_size() -> Option<u64> {
+    // SAFETY: sysconf reads a process-wide constant and has no pointer arguments.
+    let value = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+    u64::try_from(value).ok().filter(|value| *value > 0)
 }
 
 /// Keep the bounded union deterministically even when the OS process map arrives
@@ -428,6 +728,120 @@ mod tests {
         assert_eq!(s.owner_of(Pid::from_u32(777)), ProcOwner::Pane(3));
         // An unrelated pid with no parent chain is simply Other, not a panic.
         assert_eq!(s.owner_of(Pid::from_u32(999_999)), ProcOwner::Other);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_backend_selection_uses_sysinfo_when_procfs_cannot_open() {
+        assert_eq!(backend_kind(true, true), BackendKind::Native);
+        assert_eq!(backend_kind(true, false), BackendKind::Sysinfo);
+        assert_eq!(backend_kind(false, true), BackendKind::Sysinfo);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn native_projection_uses_table_stat_and_keeps_the_722_pid_pass_bounded() {
+        use crate::procs_fs::{FakeProcFs, FakeProcess};
+        use crate::procs_linux::ProcTable;
+
+        let mut fs = FakeProcFs::new();
+        for pid in 1..=722_u32 {
+            let parent = if pid == 1 { 1 } else { 1000 };
+            let stat = format!(
+                "{pid} (worker {pid}) S {parent} 1 1 0 0 0 0 0 0 0 10 5 0 0 0 0 1 0 250 4096 3"
+            );
+            fs.insert(
+                pid,
+                FakeProcess {
+                    stat: stat.into_bytes(),
+                    uid: 1000,
+                    cmdline: Vec::new(),
+                    cgroup: Vec::new(),
+                },
+            );
+        }
+        let mut table = ProcTable::with_kept_max(fs, 4096);
+        let visible = (1..=40).collect::<Vec<_>>();
+        table.pass(Duration::from_secs(1), &visible).unwrap();
+        table.fs_mut().reset_ops();
+
+        table.pass(Duration::from_secs(3), &visible).unwrap();
+        let (snapshot, chosen) = project_native_table(
+            &table,
+            NativeProjection {
+                rows: 40,
+                boot_time: Some(1_700_000_000),
+                ticks_per_second: Some(100),
+                page_size: Some(4096),
+                uptime_secs: 20,
+                self_pid: 1000,
+                daemon_pid: None,
+                pane_pids: &[(1, 7)],
+                primed: true,
+            },
+        );
+
+        assert!(
+            table.fs().ops().total() <= 1000,
+            "operations: {:?}",
+            table.fs().ops()
+        );
+        assert_eq!(table.fs().ops().reads, 722, "one stat read per listed PID");
+        assert_eq!(snapshot.total, 722);
+        assert_eq!(snapshot.procs.len(), 40);
+        assert!(chosen.iter().all(|pid| visible.contains(&pid.as_u32())));
+        let first = snapshot.procs.iter().find(|row| row.pid == 1).unwrap();
+        assert_eq!(first.ppid, Some(1));
+        assert_eq!(first.name, "worker 1");
+        assert_eq!(first.start_ticks, Some(250));
+        assert_eq!(first.start_time, 1_700_000_002);
+        assert_eq!(first.rss_bytes, 3 * 4096);
+        assert_eq!(first.owner, ProcOwner::Pane(7));
+        let (without_btime, _) = project_native_table(
+            &table,
+            NativeProjection {
+                rows: 40,
+                boot_time: None,
+                ticks_per_second: Some(100),
+                page_size: Some(4096),
+                uptime_secs: 20,
+                self_pid: 1000,
+                daemon_pid: None,
+                pane_pids: &[(1, 7)],
+                primed: true,
+            },
+        );
+        let first_without_btime = without_btime.procs.iter().find(|row| row.pid == 1).unwrap();
+        assert_eq!(first_without_btime.start_time, 0);
+        assert_eq!(first_without_btime.start_ticks, Some(250));
+        let held_before_reset = table
+            .entries()
+            .iter()
+            .filter(|entry| entry.has_kept_fd())
+            .count();
+        table.reset();
+        assert_eq!(table.entries().len(), 0);
+        assert_eq!(table.fs().ops().closes, held_before_reset);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn native_owner_walk_matches_legacy_self_daemon_and_pane_rules() {
+        let parents = std::collections::BTreeMap::from([(10, 20), (20, 30), (30, 40)]);
+        let panes = [(30, 8)];
+        assert_eq!(
+            owner_of_map(10, &parents, 40, None, &panes),
+            ProcOwner::ThegnSelf
+        );
+        assert_eq!(
+            owner_of_map(10, &parents, 99, Some(40), &panes),
+            ProcOwner::ThegnDaemon
+        );
+        assert_eq!(
+            owner_of_map(10, &parents, 99, None, &panes),
+            ProcOwner::Pane(8)
+        );
+        assert_eq!(owner_of_map(10, &parents, 99, None, &[]), ProcOwner::Other);
     }
 
     #[test]

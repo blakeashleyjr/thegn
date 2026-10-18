@@ -29,3 +29,5 @@ cpu_freq.rs
 vmstat.rs
 # collect/mod.rs — the only cfg in the collect/ tree: per-OS mod declarations (linux/ today).
 collect/mod.rs
+# procs.rs — Linux native procfs backend selection; sysinfo elsewhere.
+procs.rs
