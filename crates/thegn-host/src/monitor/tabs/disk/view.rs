@@ -65,6 +65,55 @@ const SPECS: [PanelSpec; 5] = [
 const HISTORY: usize = 240;
 const MAX_DEVICES: usize = 32;
 
+#[derive(Debug, Clone)]
+struct HistoryRing {
+    values: [f32; HISTORY],
+    next: usize,
+    len: usize,
+}
+
+impl Default for HistoryRing {
+    fn default() -> Self {
+        Self {
+            values: [0.0; HISTORY],
+            next: 0,
+            len: 0,
+        }
+    }
+}
+
+impl HistoryRing {
+    fn push(&mut self, value: f32) {
+        self.values[self.next] = value;
+        self.next = (self.next + 1) % HISTORY;
+        self.len = self.len.saturating_add(1).min(HISTORY);
+    }
+
+    fn copy_normalized(&self, out: &mut [f32; HISTORY]) -> (usize, f32) {
+        let start = (self.next + HISTORY - self.len) % HISTORY;
+        let peak = self.values.iter().copied().fold(0.0_f32, f32::max);
+        for (offset, slot) in out.iter_mut().take(self.len).enumerate() {
+            let value = self.values[(start + offset) % HISTORY];
+            *slot = if peak > 0.0 { value / peak } else { 0.0 };
+        }
+        (self.len, peak)
+    }
+
+    fn copy_ordered(&self, out: &mut [f32; HISTORY]) -> usize {
+        let start = (self.next + HISTORY - self.len) % HISTORY;
+        for (offset, slot) in out.iter_mut().take(self.len).enumerate() {
+            *slot = self.values[(start + offset) % HISTORY];
+        }
+        self.len
+    }
+}
+
+#[derive(Debug, Clone)]
+struct DeviceHistory {
+    id: thegn_metrics::collect::instances::InstanceId,
+    util: HistoryRing,
+}
+
 #[derive(Debug, Default, Clone)]
 pub(in crate::monitor) struct DiskModel {
     devices: Vec<DiskDevice>,
@@ -73,8 +122,10 @@ pub(in crate::monitor) struct DiskModel {
     slice_io: Option<IoTotals>,
     read_bps: Option<f64>,
     write_bps: Option<f64>,
-    read_history: Vec<f32>,
-    write_history: Vec<f32>,
+    read_history: HistoryRing,
+    write_history: HistoryRing,
+    device_history: Vec<DeviceHistory>,
+    physical_count: u16,
     disk_health: Health,
     fs_health: Health,
     psi_health: Health,
@@ -93,23 +144,89 @@ impl DiskModel {
                 .take(MAX_DEVICES)
                 .cloned(),
         );
-        self.filesystems.clone_from(&frame.parts.filesystems.rows);
+        self.filesystems.reserve(
+            frame
+                .parts
+                .filesystems
+                .rows
+                .len()
+                .saturating_sub(self.filesystems.len()),
+        );
+        for (index, source) in frame.parts.filesystems.rows.iter().enumerate() {
+            if let Some(destination) = self.filesystems.get_mut(index) {
+                destination.mount_point.clone_from(&source.mount_point);
+                destination.fstype.clone_from(&source.fstype);
+                destination.source.clone_from(&source.source);
+                destination
+                    .superblock_dev
+                    .clone_from(&source.superblock_dev);
+                destination.kind = source.kind;
+                destination.total_bytes = source.total_bytes;
+                destination.free_bytes = source.free_bytes;
+                destination.avail_bytes = source.avail_bytes;
+                destination.total_inodes = source.total_inodes;
+                destination.free_inodes = source.free_inodes;
+                destination.avail_inodes = source.avail_inodes;
+                destination.btrfs_unallocated = source.btrfs_unallocated;
+                destination.read_only = source.read_only;
+            } else {
+                self.filesystems.push(source.clone());
+            }
+        }
+        self.filesystems
+            .truncate(frame.parts.filesystems.rows.len());
         self.io_psi.clone_from(&frame.parts.psi.io);
         self.slice_io = frame.parts.cgroup_slice.sample.io;
+        self.physical_count = frame.parts.diskstats.physical;
         self.read_bps = frame.parts.diskstats.aggregate.read_bps;
         self.write_bps = frame.parts.diskstats.aggregate.write_bps;
         self.disk_health = frame.health[CollectorId::Diskstats.index()];
         self.fs_health = frame.health[CollectorId::Filesystems.index()];
         self.psi_health = frame.health[CollectorId::Psi.index()];
         self.slice_health = frame.health[CollectorId::CgroupSlice.index()];
-        push_bounded(
-            &mut self.read_history,
+        if let (Some(read), Some(write)) = (
             frame.parts.diskstats.aggregate.read_bps,
-        );
-        push_bounded(
-            &mut self.write_history,
             frame.parts.diskstats.aggregate.write_bps,
-        );
+        ) && read.is_finite()
+            && write.is_finite()
+            && read >= 0.0
+            && write >= 0.0
+        {
+            self.read_history.push(read.min(f64::from(f32::MAX)) as f32);
+            self.write_history
+                .push(write.min(f64::from(f32::MAX)) as f32);
+        }
+        self.device_history
+            .retain(|history| self.devices.iter().any(|device| device.id == history.id));
+        if self.device_history.capacity() == 0 && !frame.parts.diskstats.devices.is_empty() {
+            self.device_history.reserve_exact(MAX_DEVICES);
+        }
+        for device in self
+            .devices
+            .iter()
+            .filter(|device| device.physical)
+            .take(MAX_DEVICES)
+        {
+            if let Some(value) = device
+                .util_pct
+                .filter(|value| value.is_finite() && *value >= 0.0)
+            {
+                if let Some(history) = self
+                    .device_history
+                    .iter_mut()
+                    .find(|history| history.id == device.id)
+                {
+                    history.util.push(value.min(100.0) as f32 / 100.0);
+                } else if self.device_history.len() < MAX_DEVICES {
+                    let mut history = DeviceHistory {
+                        id: device.id,
+                        util: HistoryRing::default(),
+                    };
+                    history.util.push(value.min(100.0) as f32 / 100.0);
+                    self.device_history.push(history);
+                }
+            }
+        }
     }
 
     #[cfg(test)]
@@ -117,23 +234,10 @@ impl DiskModel {
         (
             self.devices.capacity(),
             self.filesystems.capacity(),
-            self.read_history.capacity(),
-            self.write_history.capacity(),
+            self.device_history.capacity(),
+            HISTORY,
         )
     }
-}
-
-fn push_bounded(ring: &mut Vec<f32>, value: Option<f64>) {
-    let Some(value) = value.filter(|value| value.is_finite() && *value >= 0.0) else {
-        return;
-    };
-    if ring.len() == HISTORY {
-        ring.remove(0);
-    }
-    if ring.capacity() < HISTORY {
-        ring.reserve_exact(HISTORY - ring.capacity());
-    }
-    ring.push(value.min(f64::from(f32::MAX)) as f32);
 }
 
 pub(in crate::monitor) struct DiskView<'a>(pub &'a DiskModel);
@@ -145,7 +249,7 @@ impl TabView for DiskView<'_> {
     fn template(&self) -> Node {
         Node::Col(vec![
             (
-                Size::Min(8),
+                Size::Weight(3),
                 Node::Row(vec![
                     (Size::Weight(2), Node::Panel(IO)),
                     (Size::Weight(1), Node::Panel(PRESSURE)),
@@ -153,7 +257,7 @@ impl TabView for DiskView<'_> {
                 ]),
             ),
             (
-                Size::Min(10),
+                Size::Weight(2),
                 Node::Row(vec![
                     (Size::Weight(1), Node::Panel(DEVICES)),
                     (Size::Weight(1), Node::Panel(FILESYSTEMS)),
@@ -198,11 +302,13 @@ impl TabView for DiskView<'_> {
         );
         if placed.id == IO
             && !matches!(self.0.disk_health, Health::Absent(_))
-            && !self.0.read_history.is_empty()
+            && self.0.read_history.len > 0
             && rect.rows > 3
         {
+            let mut normalized = [0.0; HISTORY];
+            let (len, _) = self.0.read_history.copy_normalized(&mut normalized);
             crate::monitor::graphs::paint_history_graph(
-                &self.0.read_history,
+                &normalized[..len],
                 RampId::Read,
                 Rect {
                     x: rect.x + 1,
@@ -213,13 +319,47 @@ impl TabView for DiskView<'_> {
                 surface,
             );
         }
+        if placed.id == DEVICES && !matches!(self.0.disk_health, Health::Absent(_)) {
+            for (row, device) in self
+                .0
+                .devices
+                .iter()
+                .take(rect.rows.saturating_sub(2))
+                .enumerate()
+            {
+                if device.physical
+                    && let Some(history) = self
+                        .0
+                        .device_history
+                        .iter()
+                        .find(|history| history.id == device.id)
+                {
+                    let mut normalized = [0.0; HISTORY];
+                    let len = history.util.copy_ordered(&mut normalized);
+                    crate::monitor::graphs::paint_sparkline(
+                        &normalized[..len],
+                        8,
+                        RampId::Util,
+                        Rect {
+                            x: rect.x + rect.cols.saturating_sub(10),
+                            y: rect.y + row + 1,
+                            cols: 8,
+                            rows: 1,
+                        },
+                        surface,
+                    );
+                }
+            }
+        }
         if placed.id == IO
             && !matches!(self.0.disk_health, Health::Absent(_))
-            && !self.0.write_history.is_empty()
+            && self.0.write_history.len > 0
             && rect.rows > 4
         {
+            let mut normalized = [0.0; HISTORY];
+            let (len, _) = self.0.write_history.copy_normalized(&mut normalized);
             crate::monitor::graphs::paint_history_graph(
-                &self.0.write_history,
+                &normalized[..len],
                 RampId::Write,
                 Rect {
                     x: rect.x + 1,
@@ -240,14 +380,8 @@ fn paint_io(grid: &mut CellGrid, rect: Rect, model: &DiskModel) {
         body.put_str(0, 0, absent_mark(model.disk_health), CellStyle::default());
         return;
     }
-    let read = model
-        .read_bps
-        .map(|value| reading(value, Unit::BytesPerSec, area.cols / 2))
-        .unwrap_or_else(|| crate::caps::active_glyphs().emdash.into());
-    let write = model
-        .write_bps
-        .map(|value| reading(value, Unit::BytesPerSec, area.cols / 2))
-        .unwrap_or_else(|| crate::caps::active_glyphs().emdash.into());
+    let read = rate_reading(model.read_bps, model.disk_health, area.cols / 2);
+    let write = rate_reading(model.write_bps, model.disk_health, area.cols / 2);
     body.put_str(
         0,
         0,
@@ -259,12 +393,23 @@ fn paint_io(grid: &mut CellGrid, rect: Rect, model: &DiskModel) {
         CellStyle::default(),
     );
     if area.rows > 1 {
+        let count = if model.devices.is_empty() {
+            format!("{} physical devices", crate::caps::active_glyphs().ellipsis)
+        } else {
+            format!("{} physical devices", model.physical_count)
+        };
+        body.put_str(0, 1, &count, CellStyle::default());
+    }
+    if area.rows > 2 {
         body.put_str(
             0,
-            1,
+            2,
             &format!(
-                "{} physical devices",
-                model.devices.iter().filter(|d| d.physical).count()
+                "peak {}{}  {}{}",
+                crate::caps::active_glyphs().arrow_up,
+                history_peak(&model.read_history, model.disk_health, area.cols / 2),
+                crate::caps::active_glyphs().arrow_down,
+                history_peak(&model.write_history, model.disk_health, area.cols / 2)
             ),
             CellStyle::default(),
         );
@@ -278,12 +423,12 @@ fn paint_pressure(grid: &mut CellGrid, rect: Rect, model: &DiskModel) {
         return;
     }
     if !model.io_psi.present && model.io_psi.file.some.is_none() {
-        body.put_str(
-            0,
-            0,
-            &format!("{} measuring", crate::caps::active_glyphs().ellipsis),
-            CellStyle::default(),
-        );
+        let mark = if matches!(model.psi_health, Health::Warming) {
+            crate::caps::active_glyphs().ellipsis
+        } else {
+            crate::caps::active_glyphs().emdash
+        };
+        body.put_str(0, 0, mark, CellStyle::default());
         return;
     }
     let some = model
@@ -310,7 +455,7 @@ fn paint_devices(grid: &mut CellGrid, rect: Rect, model: &DiskModel) {
     }
     for (row, device) in model.devices.iter().take(body.rect().rows).enumerate() {
         let text = format!(
-            "{:<12} {:>8} {:>8} {:>5}%",
+            "{:<12} {:>8} {:>8} {:>5}{}",
             truncate(&device.name, 12),
             optional_rate(device.read_bps),
             optional_rate(device.write_bps),
@@ -319,18 +464,18 @@ fn paint_devices(grid: &mut CellGrid, rect: Rect, model: &DiskModel) {
                 .map(|value| value.round() as u32)
                 .map_or_else(
                     || crate::caps::active_glyphs().emdash.into(),
-                    |value| value.to_string()
+                    |value| format!("{value}%")
                 )
         );
         body.put_str(0, row, &text, CellStyle::default());
     }
     if model.devices.is_empty() && !matches!(model.disk_health, Health::Absent(_)) {
-        body.put_str(
-            0,
-            0,
-            &format!("{} measuring", crate::caps::active_glyphs().ellipsis),
-            CellStyle::default(),
-        );
+        let mark = if matches!(model.disk_health, Health::Warming) {
+            crate::caps::active_glyphs().ellipsis
+        } else {
+            crate::caps::active_glyphs().emdash
+        };
+        body.put_str(0, 0, mark, CellStyle::default());
     }
 }
 
@@ -347,10 +492,14 @@ fn paint_filesystems(grid: &mut CellGrid, rect: Rect, model: &DiskModel) {
             .map(|(total, free)| total.saturating_sub(free));
         let total = fs
             .total_bytes
-            .map(|value| Unit::Bytes.fmt(value as f32))
+            .map(|value| {
+                crate::monitor::kit::edge_fmt(NumFmt::default()).fmt(value as f64, Unit::Bytes, 8)
+            })
             .unwrap_or_else(|| crate::caps::active_glyphs().emdash.into());
         let used = used
-            .map(|value| Unit::Bytes.fmt(value as f32))
+            .map(|value| {
+                crate::monitor::kit::edge_fmt(NumFmt::default()).fmt(value as f64, Unit::Bytes, 8)
+            })
             .unwrap_or_else(|| crate::caps::active_glyphs().emdash.into());
         let text = format!(
             "{} {} {used}/{total}",
@@ -360,12 +509,12 @@ fn paint_filesystems(grid: &mut CellGrid, rect: Rect, model: &DiskModel) {
         body.put_str(0, row, &text, CellStyle::default());
     }
     if model.filesystems.is_empty() {
-        body.put_str(
-            0,
-            0,
-            &format!("{} measuring", crate::caps::active_glyphs().ellipsis),
-            CellStyle::default(),
-        );
+        let mark = if matches!(model.fs_health, Health::Warming) {
+            crate::caps::active_glyphs().ellipsis
+        } else {
+            crate::caps::active_glyphs().emdash
+        };
+        body.put_str(0, 0, mark, CellStyle::default());
     }
 }
 
@@ -381,22 +530,34 @@ fn paint_slice(grid: &mut CellGrid, rect: Rect, model: &DiskModel) {
         return;
     }
     match model.slice_io {
-        Some(io) => body.put_str(
-            0,
-            0,
-            &format!(
-                "read {}  write {}",
-                Unit::Bytes.fmt(io.rbytes as f32),
-                Unit::Bytes.fmt(io.wbytes as f32)
-            ),
-            CellStyle::default(),
-        ),
-        None => body.put_str(
-            0,
-            0,
-            &format!("{} measuring", crate::caps::active_glyphs().ellipsis),
-            CellStyle::default(),
-        ),
+        Some(io) => {
+            body.put_str(
+                0,
+                0,
+                &format!(
+                    "totals read {}  write {}",
+                    crate::monitor::kit::edge_fmt(NumFmt::default()).fmt(
+                        io.rbytes as f64,
+                        Unit::Bytes,
+                        8
+                    ),
+                    crate::monitor::kit::edge_fmt(NumFmt::default()).fmt(
+                        io.wbytes as f64,
+                        Unit::Bytes,
+                        8
+                    )
+                ),
+                CellStyle::default(),
+            );
+        }
+        None => {
+            let mark = if matches!(model.slice_health, Health::Warming) {
+                crate::caps::active_glyphs().ellipsis
+            } else {
+                crate::caps::active_glyphs().emdash
+            };
+            body.put_str(0, 0, mark, CellStyle::default());
+        }
     }
 }
 
@@ -407,15 +568,35 @@ fn absent_mark(health: Health) -> &'static str {
     }
 }
 
-fn reading(value: f64, unit: Unit, width: usize) -> String {
-    kit_reading(value, unit, width)
+fn rate_reading(value: Option<f64>, health: Health, width: usize) -> String {
+    let reading = match (health, value) {
+        (Health::Warming, _) => Reading::Warming,
+        (_, Some(value)) => Reading::Value(value),
+        (_, None) => Reading::Unknown,
+    };
+    let formatted = crate::monitor::kit::edge_fmt(NumFmt::default()).reading(
+        reading,
+        Unit::Bytes,
+        width.saturating_sub(2),
+    );
+    format!("{formatted}/s")
 }
-fn kit_reading(value: f64, unit: Unit, width: usize) -> String {
-    crate::monitor::kit::edge_fmt(NumFmt::default()).reading(Reading::Value(value), unit, width)
+fn history_peak(history: &HistoryRing, health: Health, width: usize) -> String {
+    if history.len == 0 {
+        rate_reading(None, health, width)
+    } else {
+        let peak = history.values.iter().copied().fold(0.0_f32, f32::max);
+        rate_reading(Some(f64::from(peak)), health, width)
+    }
 }
 fn optional_rate(value: Option<f64>) -> String {
     value
-        .map(|value| reading(value, Unit::BytesPerSec, 8))
+        .map(|value| {
+            format!(
+                "{}/s",
+                crate::monitor::kit::edge_fmt(NumFmt::default()).fmt(value, Unit::Bytes, 5)
+            )
+        })
         .unwrap_or_else(|| crate::caps::active_glyphs().emdash.into())
 }
 fn truncate(value: &str, width: usize) -> String {

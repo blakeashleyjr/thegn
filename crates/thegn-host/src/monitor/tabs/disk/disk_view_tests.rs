@@ -24,6 +24,7 @@ use thegn_metrics::collect::{
 fn frame_fixture() -> MonitorFrame {
     let mut frame = MonitorFrame::default();
     frame.health[CollectorId::Diskstats.index()] = Health::Ok;
+    frame.parts.diskstats.physical = 8;
     frame.health[CollectorId::Filesystems.index()] = Health::Ok;
     frame.health[CollectorId::Psi.index()] = Health::Ok;
     frame.health[CollectorId::CgroupSlice.index()] = Health::Ok;
@@ -41,7 +42,7 @@ fn frame_fixture() -> MonitorFrame {
             write_bps: Some(1_125_000.0),
             read_iops: Some(150.0),
             write_iops: Some(48.0),
-            util_pct: Some(61.0),
+            util_pct: Some(25.0 + f64::from(index) * 7.0),
             in_flight: 2,
         })
         .collect();
@@ -102,24 +103,91 @@ fn render(
 
 #[test]
 fn absorbs_disk_frame_and_reuses_warm_buffers() {
-    let frame = frame_fixture();
+    let mut frame = frame_fixture();
     let mut model = DiskModel::default();
     model.absorb_frame(&frame);
     assert_eq!(model.devices.len(), 8);
     assert_eq!(model.filesystems.len(), 8);
     assert_eq!(model.read_bps, Some(48_000_000.0));
+    assert_eq!(model.physical_count, 8);
+    for row in &mut frame.parts.filesystems.rows {
+        row.mount_point.push_str("/with/a/long/path/component");
+        row.fstype.push_str("_filesystem_type");
+        row.source.push_str("_physical_device_source");
+        row.superblock_dev.push_str("_extended_superblock_id");
+    }
+    model.absorb_frame(&frame);
+    let string_capacities = model
+        .filesystems
+        .iter()
+        .map(|row| {
+            (
+                row.mount_point.capacity(),
+                row.fstype.capacity(),
+                row.source.capacity(),
+                row.superblock_dev.capacity(),
+            )
+        })
+        .collect::<Vec<_>>();
+    for row in &mut frame.parts.filesystems.rows {
+        row.mount_point.truncate(6);
+        row.fstype.truncate(5);
+        row.source.truncate(7);
+        row.superblock_dev.truncate(5);
+    }
     let capacity = model.capacities();
-    for _ in 0..1000 {
+    for tick in 0..1000 {
+        frame.parts.diskstats.aggregate.read_bps = Some(48_000_000.0 + f64::from(tick));
+        frame.parts.diskstats.aggregate.write_bps = Some(9_000_000.0 + f64::from(tick));
+        for (index, device) in frame.parts.diskstats.devices.iter_mut().enumerate() {
+            device.util_pct = Some(f64::from((tick + index as u32 * 7) % 100));
+        }
         model.absorb_frame(&frame);
     }
     assert_eq!(model.capacities(), capacity);
-    assert_eq!(model.read_history.len(), 240);
+    assert_eq!(
+        model
+            .filesystems
+            .iter()
+            .map(|row| (
+                row.mount_point.capacity(),
+                row.fstype.capacity(),
+                row.source.capacity(),
+                row.superblock_dev.capacity(),
+            ))
+            .collect::<Vec<_>>(),
+        string_capacities
+    );
+    assert_eq!(model.read_history.len, 240);
+    assert_eq!(model.write_history.len, 240);
+    assert_eq!(model.device_history.len(), 8);
+    assert!(
+        model
+            .device_history
+            .iter()
+            .all(|history| history.util.len == 240)
+    );
+    let read_next = model.read_history.next;
+    let write_next = model.write_history.next;
+    frame.parts.diskstats.aggregate.read_bps = None;
+    model.absorb_frame(&frame);
+    assert_eq!(model.read_history.next, read_next);
+    assert_eq!(model.write_history.next, write_next);
 }
 
 #[test]
 fn snapshots_cover_target_sizes_capabilities_and_static_panel_demand() {
     let mut model = DiskModel::default();
-    model.absorb_frame(&frame_fixture());
+    let mut frame = frame_fixture();
+    for tick in 0_u16..240 {
+        frame.parts.diskstats.aggregate.read_bps = Some(10_000_000.0 + f64::from(tick) * 100_000.0);
+        frame.parts.diskstats.aggregate.write_bps =
+            Some(2_000_000.0 + f64::from(239 - tick) * 25_000.0);
+        for (index, device) in frame.parts.diskstats.devices.iter_mut().enumerate() {
+            device.util_pct = Some(f64::from((tick + index as u16 * 11) % 100));
+        }
+        model.absorb_frame(&frame);
+    }
     for (cols, rows) in [(100, 30), (160, 45), (240, 60)] {
         for (unicode, depth) in [
             (UnicodeLevel::Full, ColorDepth::Truecolor),
@@ -128,7 +196,7 @@ fn snapshots_cover_target_sizes_capabilities_and_static_panel_demand() {
         ] {
             test_override::with_color(depth, || {
                 test_override::with_unicode(unicode, || {
-                    let (surface, placed, demand) = render(&model, cols, rows);
+                    let (surface, _placed, demand) = render(&model, cols, rows);
                     let text = surface.screen_chars_to_string();
                     for label in [
                         "I/O",
@@ -142,17 +210,34 @@ fn snapshots_cover_target_sizes_capabilities_and_static_panel_demand() {
                             "missing {label} at {cols}x{rows}: {text}"
                         );
                     }
-                    let view = DiskView(&model);
-                    let union = placed.iter().fold(CollectorSet::empty(), |mut all, panel| {
-                        for id in view.demand(panel.id).iter() {
-                            all.insert(id);
-                        }
-                        all
-                    });
-                    assert_eq!(demand, union);
+                    for golden in [
+                        "some 48.00%",
+                        "full 40.00%",
+                        "nvme0n1",
+                        "/data0 btrfs",
+                        "totals read",
+                    ] {
+                        assert!(
+                            text.contains(golden),
+                            "missing golden {golden} at {cols}x{rows}: {text}"
+                        );
+                    }
+                    if unicode == UnicodeLevel::Ascii {
+                        assert!(text.is_ascii(), "non-ASCII output at {cols}x{rows}: {text}");
+                    }
+                    let mut expected = CollectorSet::empty();
+                    for id in [
+                        CollectorId::Diskstats,
+                        CollectorId::Psi,
+                        CollectorId::CgroupSlice,
+                        CollectorId::Filesystems,
+                    ] {
+                        expected.insert(id);
+                    }
+                    assert_eq!(demand, expected);
                     if (cols, rows) == (240, 60) {
-                        // V-DSK-1b adds the device tree, btrfs dossier, and per-row histories.
-                        assert!(fill_ratio(&surface, Rect::full(cols, rows)) >= 0.15);
+                        // V-DSK-1b adds the device tree, btrfs dossier, and per-device read/write history.
+                        assert!(fill_ratio(&surface, Rect::full(cols, rows)) >= 0.30);
                     }
                 })
             });
@@ -219,4 +304,26 @@ fn absent_collectors_render_absent_marks_and_do_not_change_demand() {
     let text = surface.screen_chars_to_string();
     assert!(text.contains(crate::caps::active_glyphs().emdash));
     assert!(!text.contains(crate::caps::active_glyphs().arrow_up));
+}
+
+#[test]
+fn diskstats_warming_and_no_permission_keep_their_reading_states() {
+    let mut frame = MonitorFrame::default();
+    frame.health[CollectorId::Diskstats.index()] = Health::Warming;
+    let mut model = DiskModel::default();
+    model.absorb_frame(&frame);
+    let (surface, _, _) = render(&model, 160, 45);
+    let text = surface.screen_chars_to_string();
+    assert!(text.contains(crate::caps::active_glyphs().ellipsis));
+    assert!(!text.contains("0 physical devices"));
+    assert!(!text.contains("0B/s"));
+
+    frame.health[CollectorId::Diskstats.index()] = Health::Absent(Absent::NoPermission);
+    model.absorb_frame(&frame);
+    let (surface, _, _) = render(&model, 160, 45);
+    assert!(
+        surface
+            .screen_chars_to_string()
+            .contains(crate::caps::glyph(crate::caps::Glyph::Lock))
+    );
 }
