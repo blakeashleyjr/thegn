@@ -127,7 +127,7 @@ def main() -> int:
         if connection is not None:
             connection.close()
 
-    print(f"seed-registry: registered {count} worktrees in {db_path}")
+    print(f"seed-registry: registered {count} worktrees in {db_path}", file=sys.stderr)
     return 0
 
 

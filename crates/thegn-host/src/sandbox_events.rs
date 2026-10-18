@@ -33,9 +33,9 @@ pub struct SandboxEventBatch {
 /// Start the background container-events subscriber for the configured
 /// sandbox backend.
 ///
-/// Silently does nothing when the selection yields no transport (auto with no
-/// events-capable chain entry, a reserved or `No` cap, or the transport's
-/// binary not on PATH) — audit is best-effort.
+/// Silently does nothing when sandboxing is disabled or the selection yields no
+/// transport (auto with no events-capable chain entry, a reserved or `No` cap,
+/// or the transport's binary not on PATH) — audit is best-effort.
 pub fn spawn(cfg: &SandboxConfig, tx: tokio_mpsc::UnboundedSender<SandboxEventBatch>) {
     let Some(backend) = select_backend(cfg) else {
         return;
@@ -104,9 +104,13 @@ impl ContainerEventSink for BatchForwarder {
 /// `Backend::from_config`; `auto` walks `backend_chain` and picks the FIRST
 /// entry whose events cap is `Yes` — mirroring how chain resolution picks a
 /// runtime. `None` only when an explicit `auto` has no events-capable chain
-/// entry; an explicit kind always resolves (a reserved/`No` cap is answered
-/// downstream, after the honest `Reserved` note).
+/// entry; it also returns `None` when sandboxing is disabled. An explicit kind
+/// always resolves (a reserved/`No` cap is answered downstream, after the
+/// honest `Reserved` note).
 fn select_backend(cfg: &SandboxConfig) -> Option<Backend> {
+    if !cfg.enabled {
+        return None;
+    }
     match cfg.backend {
         SandboxBackend::Auto => cfg
             .backend_chain
@@ -173,5 +177,16 @@ mod tests {
             select_backend(&cfg(SandboxBackend::None, &[])).expect("none resolves as a backend");
         assert_eq!(backend, Backend::None);
         assert!(backend.events().is_none());
+    }
+
+    #[test]
+    fn disabled_sandbox_selects_no_event_transport() {
+        for backend in [SandboxBackend::Auto, SandboxBackend::Podman] {
+            let cfg = SandboxConfig {
+                enabled: false,
+                ..cfg(backend, &["podman-rootless"])
+            };
+            assert_eq!(select_backend(&cfg), None);
+        }
     }
 }

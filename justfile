@@ -421,6 +421,10 @@ bench-micro-svc *args:
 perf: bench bench-idle bench-micro
     @echo "perf: startup + idle + micro complete"
 
+# Cheap hermetic regression checks for perf harness internals.
+perf-selftest:
+    bash test/perf/pause-process-scan.sh
+
 # Build thegn with the in-process sampling profiler (release + profiling
 # feature). SIGUSR2 toggles a flamegraph capture written to
 # $XDG_STATE_HOME/thegn/profiles/. Profiles the live process (sidesteps
@@ -765,7 +769,7 @@ ratchets-all: ratchets
     cargo nextest run -p thegn-metrics -E 'test(/ratchet/)'
     cargo nextest run -p thegn-proc -E 'test(/ratchet/)'
 
-lint: ratchets
+lint: ratchets perf-selftest
     @for t in treefmt shellcheck yamllint taplo; do command -v "$t" >/dev/null 2>&1 || { echo "lint: '$t' not found — run inside 'nix develop' (or 'direnv allow'); 'just doctor' for details"; exit 1; }; done
     # Formatting gate (treefmt, fail-on-change) — FIRST so drift fails fast before
     # the clippy compile. This is what makes `just lint` (and thus the merge-queue
