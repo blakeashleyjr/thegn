@@ -17,6 +17,7 @@ pub mod meminfo;
 pub mod mounts_fs;
 pub mod netdev;
 pub mod netlink;
+pub mod nl80211;
 pub mod power_supply;
 pub mod powercap;
 pub mod procfile;
