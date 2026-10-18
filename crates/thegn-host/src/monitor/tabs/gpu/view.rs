@@ -73,17 +73,11 @@ impl ActivityRing {
     }
 
     fn push(&mut self, value: f32) {
-        self.values[self.next] = value;
-        self.next = (self.next + 1) % HISTORY_CAP;
-        self.len = self.len.saturating_add(1).min(HISTORY_CAP);
+        BusyHistory::push_ring(&mut self.values, &mut self.next, &mut self.len, value);
     }
 
     pub(super) fn ordered_into(&self, output: &mut [f32; HISTORY_CAP]) -> usize {
-        let start = (self.next + HISTORY_CAP - self.len) % HISTORY_CAP;
-        for (offset, value) in output.iter_mut().take(self.len).enumerate() {
-            *value = self.values[(start + offset) % HISTORY_CAP];
-        }
-        self.len
+        BusyHistory::ordered_ring(&self.values, self.next, self.len, output)
     }
 }
 
@@ -317,15 +311,11 @@ impl GpuModel {
                     self.smu
                         .cards
                         .iter()
-                        .find(|reading| {
-                            u32::from(reading.card) == card
-                                && !reading.suspended
-                                && reading.metrics.layout_verified
-                        })
+                        .find(|reading| u32::from(reading.card) == card && !reading.suspended)
                         .map(|reading| &reading.metrics)
                 });
-                if let Some(metrics) = metrics {
-                    let mut activities = [None; ACTIVITY_RING_COUNT];
+                let mut activities = [None; ACTIVITY_RING_COUNT];
+                if let Some(metrics) = metrics.filter(|metrics| metrics.layout_verified) {
                     activities[..4].copy_from_slice(&[
                         metrics.activity_gfx,
                         metrics.activity_mm,
@@ -333,10 +323,13 @@ impl GpuModel {
                         metrics.activity_umc,
                     ]);
                     activities[4..].copy_from_slice(&metrics.activity_ipu);
-                    for (ring, value) in history.activity.iter_mut().zip(activities) {
-                        if let Some(value) = value.filter(|value| *value <= 100) {
-                            ring.push(f32::from(value) / 100.0);
-                        }
+                }
+                for (ring, value) in history.activity.iter_mut().zip(activities) {
+                    if let Some(value) = value.filter(|value| *value <= 100) {
+                        ring.push(f32::from(value) / 100.0);
+                    } else if engine.runtime_status == RuntimeStatus::Active && ring.len > 0 {
+                        let previous = (ring.next + HISTORY_CAP - 1) % HISTORY_CAP;
+                        ring.push(ring.values[previous]);
                     }
                 }
                 if let Some(metrics) = metrics
@@ -400,6 +393,8 @@ impl TabView for GpuView<'_> {
             }
             ENGINES => {
                 demand.insert(CollectorId::GpuEngines);
+                demand.insert(CollectorId::AmdSmu);
+                demand.insert(CollectorId::GpuDevices);
             }
             MEMORY => {
                 demand.insert(CollectorId::GpuDevices);
