@@ -168,6 +168,7 @@ fn copy_part(target: &mut Parts, source: &Parts, id: CollectorId) {
         CollectorId::Vmstat => target.vmstat.clone_from(&source.vmstat),
         CollectorId::Netdev => target.netdev.clone_from(&source.netdev),
         CollectorId::NetWifi => target.net_wifi.clone_from(&source.net_wifi),
+        CollectorId::NetSockets => target.net_sockets.clone_from(&source.net_sockets),
         CollectorId::Diskstats => target.diskstats.clone_from(&source.diskstats),
         CollectorId::Powercap => target.powercap.clone_from(&source.powercap),
         CollectorId::PowerSupply => target.power_supply.clone_from(&source.power_supply),

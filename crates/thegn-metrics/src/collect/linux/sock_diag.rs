@@ -26,6 +26,8 @@ const TCP_INFO_RETRANS_OFFSET: usize = 36;
 const TCP_INFO_TOTAL_RETRANS_OFFSET: usize = 100;
 const TCP_INFO_BYTES_ACKED_OFFSET: usize = 120;
 const TCP_INFO_BYTES_RECEIVED_OFFSET: usize = 128;
+const TCP_INFO_LAST_DATA_RECV_OFFSET: usize = 52;
+pub const MAX_TCP_SOCKETS: usize = 4_096;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AddressFamily {
     Ipv4,
@@ -42,6 +44,7 @@ pub struct TcpInfo {
     pub total_retrans: Option<u32>,
     pub bytes_acked: Option<u64>,
     pub bytes_received: Option<u64>,
+    pub last_data_recv_ms: Option<u32>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -62,6 +65,7 @@ pub struct TcpSock {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct DumpStats {
     pub malformed: usize,
+    pub truncated: bool,
 }
 
 /// Encodes inet_diag_req_v2 asking the kernel to dump TCP sockets in `states`.
@@ -184,14 +188,20 @@ fn consume_and_record(
     out: &mut Vec<TcpSock>,
     stats: &mut DumpStats,
 ) -> io::Result<bool> {
-    let (done, malformed) = consume_batch(bytes, sequence, out)?;
+    let (done, malformed, truncated) = consume_batch(bytes, sequence, out)?;
     stats.malformed = stats.malformed.saturating_add(malformed);
+    stats.truncated |= truncated;
     Ok(done)
 }
 
-fn consume_batch(bytes: &[u8], sequence: u32, out: &mut Vec<TcpSock>) -> io::Result<(bool, usize)> {
+fn consume_batch(
+    bytes: &[u8],
+    sequence: u32,
+    out: &mut Vec<TcpSock>,
+) -> io::Result<(bool, usize, bool)> {
     let mut messages = MessageIter::for_sequence(bytes, sequence);
     let mut malformed = 0;
+    let mut truncated = false;
     for message in &mut messages {
         let message = message?;
         if message.header.sequence != sequence {
@@ -215,7 +225,7 @@ fn consume_batch(bytes: &[u8], sequence: u32, out: &mut Vec<TcpSock>) -> io::Res
                     return Err(io::Error::from_raw_os_error(error.saturating_neg()));
                 }
             }
-            return Ok((true, malformed));
+            return Ok((true, malformed, truncated));
         }
         if message.header.kind == NLMSG_ERROR {
             if message.payload.len() < 4 {
@@ -234,12 +244,13 @@ fn consume_batch(bytes: &[u8], sequence: u32, out: &mut Vec<TcpSock>) -> io::Res
         }
         if message.header.kind == SOCK_DIAG_BY_FAMILY {
             match decode_message(&message) {
-                Ok(row) => out.push(row),
+                Ok(row) if out.len() < MAX_TCP_SOCKETS => out.push(row),
+                Ok(_) => truncated = true,
                 Err(_) => malformed += 1,
             }
         }
     }
-    Ok((false, malformed))
+    Ok((false, malformed, truncated))
 }
 
 fn decode_tcp_info(bytes: &[u8]) -> TcpInfo {
@@ -252,6 +263,7 @@ fn decode_tcp_info(bytes: &[u8]) -> TcpInfo {
         total_retrans: get_u32(bytes, TCP_INFO_TOTAL_RETRANS_OFFSET),
         bytes_acked: get_u64(bytes, TCP_INFO_BYTES_ACKED_OFFSET),
         bytes_received: get_u64(bytes, TCP_INFO_BYTES_RECEIVED_OFFSET),
+        last_data_recv_ms: get_u32(bytes, TCP_INFO_LAST_DATA_RECV_OFFSET),
     }
 }
 
