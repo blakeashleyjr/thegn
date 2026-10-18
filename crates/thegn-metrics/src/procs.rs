@@ -304,16 +304,15 @@ fn read_start_stat(
     crate::procs_parse::parse_stat(buf)
 }
 
+/// The accepted residual race is a same-parent, same-name PID reuse between
+/// the sysinfo refresh and this stat read: the replacement's ticks are kept,
+/// so pidfd and ticks checks can target that replacement within one sample.
 fn matching_start_ticks(
     stat: &crate::procs_model::Stat,
     pid: u32,
     ppid: u32,
     name: &str,
 ) -> Option<u64> {
-    // A same-parent, same-name PID reuse between the sysinfo refresh and this
-    // stat read can retain the replacement's ticks; the signal path then
-    // targets that replacement after its pidfd and ticks checks. This narrow
-    // race is accepted for a fork inside one sampling window.
     (stat.pid == pid && stat.ppid == ppid && stat.comm.to_string_lossy().as_ref() == name)
         .then_some(stat.starttime)
 }
