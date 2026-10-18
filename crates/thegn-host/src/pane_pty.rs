@@ -80,6 +80,14 @@ impl PtyProcessOwner {
         })))
     }
 
+    #[cfg(test)]
+    pub(crate) fn is_complete(&self) -> bool {
+        self.0
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .complete
+    }
+
     /// Bounded tree teardown. No wait/reap occurs until after the final group
     /// signal, keeping the Unix group id anchored to this child; Windows keeps
     /// the corresponding Job Object in the platform handle.

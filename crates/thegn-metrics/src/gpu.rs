@@ -1,5 +1,6 @@
 //! GPU utilization — the one metric sysinfo does not provide. Linux exposes it
-//! via sysfs (`amdgpu`: `gpu_busy_percent`) or `nvidia-smi`; macOS via
+//! via sysfs (`amdgpu`: `gpu_busy_percent`) or NVML with `nvidia-smi`
+//! fallback; macOS via
 //! IOKit accelerator statistics, read with `ioreg` (no root, unlike
 //! `powermetrics`). Where none of those answer, the monitor
 //! ([`crate::gpu_monitor`]) reports no reading and the widget hides — the same behaviour as a Linux box

@@ -54,7 +54,7 @@ mod tabs;
 pub(crate) use state::MonitorPrefs;
 
 /// The view toggles the Processes tab's row list depends on. Bundled so the pure
-/// [`procs_view::rows`] builder and the overlay share one input shape and cannot
+/// [`procs_view::rows_with_invalid`] builder and the overlay share one input shape and cannot
 /// disagree about which rows are shown.
 #[derive(Debug, Clone)]
 pub(crate) struct ProcSnapshotView {
@@ -420,6 +420,8 @@ pub struct MonitorOverlay {
     /// indexes and the signal action reads. Recomputed on rebuild so the key
     /// handler never re-derives ordering out of step with the render.
     proc_rows: Vec<procs_view::ProcRow>,
+    proc_invalid_terms: Vec<procs_view::procs_query::InvalidTerm>,
+    proc_primed: bool,
     lists: invalidation::Lists,
     /// The last body was Processes with these header/display-only inputs.
     process_body: Option<(u64, crate::model_eq::ProcessViewState, bool, bool)>,
@@ -467,6 +469,8 @@ pub struct MonitorOverlay {
     body_rows: usize,
     board: board::Board,
     overview: tabs::overview::OverviewModel,
+    cpu: tabs::cpu::view::CpuModel,
+    memory: tabs::memory::view::MemoryModel,
 }
 
 impl MonitorOverlay {
@@ -502,6 +506,8 @@ impl MonitorOverlay {
             filter: String::new(),
             filtering: false,
             proc_rows: Vec::new(),
+            proc_invalid_terms: Vec::new(),
+            proc_primed: false,
             lists: invalidation::Lists::default(),
             process_body: None,
             disk_rows: Vec::new(),
@@ -523,6 +529,8 @@ impl MonitorOverlay {
             body_rows: rows.saturating_sub(CHROME_ROWS),
             board: board::Board::default(),
             overview: tabs::overview::OverviewModel::default(),
+            cpu: tabs::cpu::view::CpuModel::default(),
+            memory: tabs::memory::view::MemoryModel::default(),
         };
         ov.rebuild(model, ctx, false);
         ov
@@ -598,14 +606,28 @@ impl MonitorOverlay {
     }
 
     fn view(&self) -> board::ActiveView<'_> {
-        board::ActiveView::for_tab(self.tab, &self.overview)
+        match self.tab {
+            MonitorTab::Cpu => board::ActiveView::Cpu(tabs::cpu::view::CpuView(&self.cpu)),
+            MonitorTab::Memory => {
+                board::ActiveView::Memory(tabs::memory::view::MemoryView(&self.memory))
+            }
+            _ => board::ActiveView::for_tab(self.tab, &self.overview),
+        }
     }
 
     /// Copy the latest pooled frame before the sampler reuses it. Pausing freezes
-    /// the owned Overview snapshot; only a visible live Overview needs repaint.
+    /// the active owned board model; only a visible live board needs repaint.
     pub fn ingest_frame(&mut self, frame: &thegn_metrics::collect::frame::MonitorFrame) -> bool {
         if self.paused {
             return false;
+        }
+        if self.tab == MonitorTab::Cpu {
+            self.cpu.absorb_frame(frame);
+            return true;
+        }
+        if self.tab == MonitorTab::Memory {
+            self.memory.absorb_frame(frame);
+            return true;
         }
         self.overview.absorb_frame(frame);
         self.tab == MonitorTab::Overview
@@ -618,7 +640,7 @@ impl MonitorOverlay {
         self.pending_action.take()
     }
 
-    /// The Processes list's current view toggles, for [`procs_view::rows`].
+    /// The Processes list's current view toggles, for [`procs_view::rows_with_invalid`].
     fn proc_view(&self) -> ProcSnapshotView {
         ProcSnapshotView {
             sort: self.prefs.proc_sort,
@@ -635,6 +657,11 @@ impl MonitorOverlay {
         let live_now = ctx.now_ms.max(0) as u64;
         self.last_now_ms = live_now;
         let now = self.frozen_now_ms.unwrap_or(live_now);
+        if !self.paused && self.tab == MonitorTab::Cpu {
+            let prefs = self.prefs.tab(MonitorTab::Cpu);
+            self.cpu
+                .absorb_history(ctx.hist, prefs.window, prefs.scale, now);
+        }
         if !self.paused && self.tab == MonitorTab::Overview {
             self.overview.absorb_stats(&model.stats);
             self.overview.absorb_container_count(model.containers.len());
@@ -645,6 +672,7 @@ impl MonitorOverlay {
         // Only the active list is derived, and navigation/geometry changes do
         // not re-sort an unchanged process snapshot. Identity remains sampled.
         self.refresh_active_rows(model, now / 1000, preserve_process);
+        self.proc_primed = model.procs.primed;
         // Container row identities for the key handler (the same order the
         // builder renders `model.containers` in), so a key resolves `sel`
         // without a model borrow.
@@ -668,6 +696,8 @@ impl MonitorOverlay {
             proc_sort: self.prefs.proc_sort,
             proc_desc: self.prefs.proc_desc,
             proc_rows: &self.proc_rows,
+            proc_invalid_terms: &self.proc_invalid_terms,
+            proc_primed: model.procs.primed,
             disk_rows: &self.disk_rows,
             disk_eta: ctx.hist.disk_fill_eta(),
         });
@@ -828,6 +858,7 @@ impl MonitorOverlay {
                 &self.proc_rows,
                 self.prefs.proc_tree,
                 self.cols,
+                self.proc_primed,
             );
         }
         self.clamp();

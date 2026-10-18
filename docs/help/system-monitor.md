@@ -22,19 +22,21 @@ Chips that can expand say so in their top-right corner.
 
 ## Tabs
 
-`Tab` and `Shift-Tab` walk the tabs; so do `←`/`→` and `h`/`l`. Each tab in the
-bar carries its own number, and typing that number jumps straight to it —
-`1`–`9`, then `0` for the tenth, so the last tab is reachable too. The numbers
-count the tabs you can actually see, so `2` means the same thing on a laptop and
-on a GPU-less server. On a terminal too narrow for the whole strip, the bar
-scrolls to keep the active tab whole and marks the tabs scrolled off each end,
-rather than clipping the tab you are on.
+`Tab` and `Shift-Tab` walk the tabs; so do `←`/`→` and `h`/`l`. Each of the
+first ten tabs carries its number, and typing that number jumps straight to it —
+`1`–`9`, then `0` for the tenth. If every optional tab appears, Notifications
+is eleventh and has no digit key.
+The numbers count the tabs you can actually see, so `2` means the same thing on
+a laptop and on a GPU-less server. On a terminal too narrow for the whole
+strip, the bar scrolls to keep the active tab whole and marks the tabs scrolled
+off each end, rather than clipping the tab you are on.
 
 Tabs only appear when their source is available — no battery means no Power
 tab, and the GPU tab appears when a GPU reports utilisation. AMD cards and APUs
-use sysfs, NVIDIA uses `nvidia-smi`, and Apple silicon uses its system GPU
-reader. A metric that disappears while you are looking at it (an unplugged
-battery, an unmounted disk) moves you to a tab that still has something to show.
+use sysfs, NVIDIA uses NVML when its library is installed and falls back to
+`nvidia-smi`, and Apple silicon uses its system GPU reader. A metric that
+disappears while you are looking at it (an unplugged battery, an unmounted
+disk) moves you to a tab that still has something to show.
 
 On **Apple silicon**, temperatures come from the machine's HID thermal sensors
 rather than the SMC keys that only exist on Intel Macs — so the temperature tab
@@ -72,13 +74,15 @@ log scale while Network stays on a live linear one.
   load average — fall back to `window` under `fixed`, since there is no honest
   number to divide by.
 
-`Space` **pauses**. That freezes the picture, not the recording: samples keep
-accumulating underneath, so resuming shows a continuous timeline with no gap.
-Pausing also drops the sampler back to its normal rate, so a frozen monitor is
-cheaper than a live one.
+`Space` **pauses**. That freezes the picture. The history graphs keep recording
+at the normal, non-live rate, so resuming shows no gap; the monitor's detailed
+sampler stops until you resume. That makes a paused monitor cheaper than a live
+one.
 
-While the monitor is open and live, its sampler reads every available
-collector; paused or covered, it parks, and nothing runs once it is closed.
+On the Overview, CPU and Memory tabs, the sampler reads only what the panels
+on screen need; the other tabs still read every collector. When paused or
+covered, the monitor's detailed sampler parks; nothing runs once the monitor is
+closed.
 
 Note two deliberate differences from the other overlays: `Space` is pause here
 (use `PgDn` to page), and `g` cycles the graph style rather than jumping to the
@@ -103,22 +107,27 @@ Overview is the default landing tab. It summarizes CPU and per-core activity,
 load and pressure, memory health, network rates, disk activity, thermal state,
 power when a battery is present, and process/container counts. Panels appear
 when their source has a reading; absent readings use the terminal absent mark.
-If every optional tab appears, Notifications is eleventh and has no digit key.
 
 ## CPU
 
-The CPU tab shows total and per-core utilisation as a graph, with a heat grid
-for logical cores. Its load and clock section shows 1-, 5-, and 15-minute load,
-1-minute load per core, one mean frequency across cores, temperature, and a load
-sparkline. The per-core bars are heat-tinted. The CPU, load, frequency, and
-uptime masthead chips expand into this tab.
+The CPU board shows total busy history and the current user, system, iowait, and
+steal shares. The `cpu.cores` panel labels known performance and efficiency
+cores and groups them by L3 cache; missing topology stays unlabelled. The
+`cpu.idle` panel shows C0 and reported idle-state residency per core. Frequency,
+load/pressure, IRQ/softirq, and scheduler wait have separate panels. Panel
+focus (`f`/`F`), zoom (`z`), and Escape follow the monitor board controls.
 
 ## Memory
 
-The Memory tab shows used, available, free when reported, and total memory; a
-swap graph appears when swap exists. It also reports thegn and daemon RSS and
-CPU, with an RSS sparkline. The memory and swap masthead chips expand into this
-tab.
+The Memory tab is a panel board. `memory.composition` shows total, available,
+used, free and the component breakdown with a bounded usage history;
+`memory.verdict` summarizes memory health; `memory.pressure` shows PSI some/full
+pressure; `memory.swap` appears when swap exists; `memory.paging` shows reclaim,
+refault and fault rates; and `memory.limit` shows the process cgroup limit and
+thegn.slice usage. A missing limit is shown as `—`; when every cgroup level is
+unlimited, the panel says `no limit`. Use `f`/`F` to focus or unfocus a panel,
+`z` to zoom it, and `Esc` to step back through focus and zoom. The memory and
+swap masthead chips expand into this tab.
 
 ## Thermal
 
@@ -170,6 +179,9 @@ masthead chip expands into this tab. When several cards are available, it shows
 the busiest awake card. Runtime-suspended cards are not woken to sample them
 and read as 0% utilisation.
 
+On NVIDIA, the masthead uses NVML in process when `libnvidia-ml.so.1` is
+installed; otherwise it reads through `nvidia-smi`.
+
 ## Power
 
 The Power tab shows battery charge, power source, draw, and estimated time to
@@ -181,12 +193,22 @@ battery source is available. The battery masthead chip expands into this tab.
 The Processes tab lists the heaviest processes by CPU and by memory, with
 thegn's own panes and its pane daemon called out in the `owner` column.
 
+The table fits its default columns to the available width. Today it shows PID,
+owner, CPU%, the CPU bar, RSS, and the sampled command name; tree indentation
+stays inside the command column. The command is the sampled process name, not
+its argument list.
+
 - `c`, `m`, `n`, `p` sort by CPU, memory, name, or PID.
 - `r` reverses the sort direction.
-- `/` opens an incremental filter over process name, PID, and owner (type to
-  narrow, `Backspace` to edit, `Enter` to apply, `Esc` to clear). `Esc` backs
-  out of the filter first — it does not close the monitor while a filter is
-  open.
+- `/` opens an incremental, space-separated AND filter (type to narrow,
+  `Backspace` to edit, `Enter` to apply, `Esc` to clear). A bare word matches
+  process name, PID, or owner. Field terms include `user:blake`, `wt:feat`,
+  `cpu>10`, `mem>1G`, `age<5m`, `pid:42`, and `owner:thegn`; `!term` negates
+  a term. `cpu`, `mem`, `age`, `pid`, and `owner` are the fields currently
+  applied. `user`, `wt`, `pane`, `ctr`, `s`, `io`, and `thr` are recognized but
+  currently ignored; ignored and malformed terms are listed in the header.
+  `Esc` backs out of the filter first — it does not close the monitor while a
+  filter is open.
 - `t` toggles a tree view grouped by the sampled parent chain. Because the tab
   only keeps the heaviest processes, a child whose parent fell outside that set
   is hoisted to a top-level row and marked with a leading `…`, rather than

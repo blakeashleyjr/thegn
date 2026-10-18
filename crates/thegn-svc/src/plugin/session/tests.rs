@@ -58,6 +58,36 @@ fn collect(rx: &mpsc::Receiver<SessionEvent>) -> Vec<SessionEvent> {
 }
 
 #[test]
+fn resident_outcome_retains_stderr_tail_after_process_exit() {
+    let fixture = FixtureSupervisor::new();
+    let session = fixture
+        .spawn(
+            &sh("printf 'resident tail\\n' >&2"),
+            &BTreeMap::new(),
+            None,
+            |_| {},
+        )
+        .unwrap();
+    let mut completion = session.completion();
+    let outcome = fixture.runtime.block_on(async {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                if let Some(outcome) = completion.borrow().clone() {
+                    break outcome;
+                }
+                completion.changed().await.expect("owner completion");
+            }
+        })
+        .await
+        .expect("resident process completion")
+    });
+
+    assert_eq!(outcome.stderr_tail, b"resident tail\n");
+    assert_eq!(outcome.stderr_bytes, 14);
+    assert_eq!(outcome.stderr_lines, 1);
+}
+
+#[test]
 fn resident_parser_uses_strict_rpc_frames_and_bounds_junk() {
     for rejected in [
         r#"{"id":1,"method":"m","result":1}"#,
@@ -519,6 +549,11 @@ fn resident_cancelled_join_waiter_retains_handle_and_global_deadline() {
             tree: TreeGuarantee::Unproven,
             termination_requested: true,
             errors: Vec::new(),
+            stderr_tail: Vec::new(),
+            stderr_bytes: 0,
+            stderr_lines: 0,
+            stderr_dropped_lines: 0,
+            stderr_truncated_lines: 0,
         }));
         let (release, ready) = tokio::sync::oneshot::channel();
         releases.push(release);

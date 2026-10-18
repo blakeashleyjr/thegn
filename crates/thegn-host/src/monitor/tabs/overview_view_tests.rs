@@ -163,6 +163,8 @@ fn fill_ratio(surface: &Surface, area: Rect) -> f32 {
                 && x < area.x.saturating_add(area.cols)
                 && !cell.str().is_empty()
                 && cell.str() != " "
+                // A blank braille cell (U+2800) is visually empty.
+                && cell.str() != "\u{2800}"
             {
                 occupied += cell.width();
             }

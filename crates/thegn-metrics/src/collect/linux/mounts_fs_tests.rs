@@ -115,6 +115,13 @@ fn classifies_remote_filesystems_and_drops_kernel_and_container_mounts() {
         "lustre",
         "gpfs",
         "davfs",
+        "virtiofs",
+        "coda",
+        "ocfs2",
+        "gfs2",
+        "orangefs",
+        "pvfs2",
+        "beegfs",
         "fuse",
         "fuseblk",
         "fuse.portal",
@@ -141,6 +148,43 @@ fn classifies_remote_filesystems_and_drops_kernel_and_container_mounts() {
     ] {
         assert_eq!(super::filesystem_kind(fstype, mount_point), None);
     }
+}
+
+#[test]
+fn added_network_filesystems_are_listed_without_statvfs_calls() {
+    let types = [
+        "virtiofs", "coda", "ocfs2", "gfs2", "orangefs", "pvfs2", "beegfs",
+    ];
+    let io = FakeIo {
+        mountinfo: types
+            .iter()
+            .enumerate()
+            .map(|(index, fstype)| {
+                mount(
+                    index + 1,
+                    &format!("0:{index}"),
+                    &format!("/mnt/{index}"),
+                    fstype,
+                    "remote",
+                    "rw",
+                )
+            })
+            .collect(),
+        ..FakeIo::default()
+    };
+    let mut collector = make_collector(io);
+    assert_eq!(collector.discover(&Env::default()), Health::Ok);
+    let frame = sample(&mut collector, 40_000);
+    assert_eq!(frame.parts.filesystems.rows.len(), types.len());
+    assert!(
+        frame
+            .parts
+            .filesystems
+            .rows
+            .iter()
+            .all(|row| { row.kind == FilesystemKind::Network && row.total_bytes.is_none() })
+    );
+    assert!(collector.io.stat_calls.is_empty());
 }
 
 #[test]

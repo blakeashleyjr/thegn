@@ -59,6 +59,11 @@ pub struct TcpSock {
     pub info: Option<TcpInfo>,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct DumpStats {
+    pub malformed: usize,
+}
+
 /// Encodes inet_diag_req_v2 asking the kernel to dump TCP sockets in `states`.
 pub fn encode_request(
     bytes: &mut [u8; NLMSG_HEADER_LEN + INET_DIAG_REQ_V2_LEN],
@@ -153,8 +158,9 @@ pub fn dump_tcp(
     socket: &mut NetlinkSocket,
     out: &mut Vec<TcpSock>,
     deadline: Instant,
-) -> io::Result<()> {
+) -> io::Result<DumpStats> {
     out.clear();
+    let mut stats = DumpStats::default();
     for family in [AddressFamily::Ipv4, AddressFamily::Ipv6] {
         let sequence = socket.next_sequence();
         let mut request = [0_u8; NLMSG_HEADER_LEN + INET_DIAG_REQ_V2_LEN];
@@ -162,14 +168,25 @@ pub fn dump_tcp(
         socket.send(&request)?;
         loop {
             socket.recv(deadline)?;
-            // thegn-metrics has no logging dependency; malformed rows are skipped and counted by consume_batch.
-            let (done, _malformed) = consume_batch(socket.received(), sequence, out)?;
+            // Malformed rows are skipped and counted for the caller to report.
+            let done = consume_and_record(socket.received(), sequence, out, &mut stats)?;
             if done {
                 break;
             }
         }
     }
-    Ok(())
+    Ok(stats)
+}
+
+fn consume_and_record(
+    bytes: &[u8],
+    sequence: u32,
+    out: &mut Vec<TcpSock>,
+    stats: &mut DumpStats,
+) -> io::Result<bool> {
+    let (done, malformed) = consume_batch(bytes, sequence, out)?;
+    stats.malformed = stats.malformed.saturating_add(malformed);
+    Ok(done)
 }
 
 fn consume_batch(bytes: &[u8], sequence: u32, out: &mut Vec<TcpSock>) -> io::Result<(bool, usize)> {

@@ -60,6 +60,10 @@ pub(in crate::monitor) fn cpu(cx: &Ctx) -> Vec<Section> {
     out
 }
 
+#[cfg(test)]
+#[path = "cpu/cpu_wire_tests.rs"]
+mod wire_tests;
+
 /// Per-core utilization as heat-tinted bars, wrapped to the box width.
 fn core_rows(cores: &[u8], cols: usize) -> Vec<Section> {
     // Each core costs `id + bar + pct`; fit as many per row as the box allows.

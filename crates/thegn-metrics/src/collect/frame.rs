@@ -30,6 +30,7 @@ pub struct Parts {
     pub cpu_topology: super::model::cpu_topology::CpuTopologyPart,
     pub filesystems: super::model::filesystems::FilesystemsPart,
     pub gpu_devices: super::model::gpu::GpuDevicesPart,
+    pub gpu_engines: super::model::gpu_engines::GpuEnginesPart,
 }
 impl Parts {
     pub fn clear(&mut self) {
@@ -55,6 +56,7 @@ impl Parts {
         self.cpu_topology.clear();
         self.filesystems.clear();
         self.gpu_devices.clear();
+        self.gpu_engines.clear();
     }
 }
 

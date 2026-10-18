@@ -35,28 +35,36 @@ pub(super) struct LegacyTab;
 
 pub(super) enum ActiveView<'a> {
     Legacy(LegacyTab),
+    Cpu(super::tabs::cpu::view::CpuView<'a>),
     Overview(OverviewView<'a>),
+    Memory(super::tabs::memory::view::MemoryView<'a>),
 }
 
 impl TabView for ActiveView<'_> {
     fn specs(&self) -> &'static [PanelSpec] {
         match self {
             Self::Legacy(view) => view.specs(),
+            Self::Cpu(view) => view.specs(),
             Self::Overview(view) => view.specs(),
+            Self::Memory(view) => view.specs(),
         }
     }
 
     fn template(&self) -> Node {
         match self {
             Self::Legacy(view) => view.template(),
+            Self::Cpu(view) => view.template(),
             Self::Overview(view) => view.template(),
+            Self::Memory(view) => view.template(),
         }
     }
 
     fn demand(&self, panel: PanelId) -> CollectorSet {
         match self {
             Self::Legacy(view) => view.demand(panel),
+            Self::Cpu(view) => view.demand(panel),
             Self::Overview(view) => view.demand(panel),
+            Self::Memory(view) => view.demand(panel),
         }
     }
 
@@ -70,7 +78,9 @@ impl TabView for ActiveView<'_> {
     ) {
         match self {
             Self::Legacy(view) => view.paint(surface, placed, rect, scroll, sections),
+            Self::Cpu(view) => view.paint(surface, placed, rect, scroll, sections),
             Self::Overview(view) => view.paint(surface, placed, rect, scroll, sections),
+            Self::Memory(view) => view.paint(surface, placed, rect, scroll, sections),
         }
     }
 }
