@@ -243,9 +243,12 @@ fn consume_batch(
             continue;
         }
         if message.header.kind == SOCK_DIAG_BY_FAMILY {
+            if out.len() >= MAX_TCP_SOCKETS {
+                truncated = true;
+                continue;
+            }
             match decode_message(&message) {
-                Ok(row) if out.len() < MAX_TCP_SOCKETS => out.push(row),
-                Ok(_) => truncated = true,
+                Ok(row) => out.push(row),
                 Err(_) => malformed += 1,
             }
         }

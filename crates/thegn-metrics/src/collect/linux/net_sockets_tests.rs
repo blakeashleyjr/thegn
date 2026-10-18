@@ -21,27 +21,40 @@ struct FakeTransport {
     opens: Arc<AtomicUsize>,
     malformed: usize,
     truncated: bool,
+    opened: bool,
+    dump_error: Option<io::ErrorKind>,
 }
 
 impl SocketTransport for FakeTransport {
     fn open(&mut self) -> io::Result<()> {
         self.opens.fetch_add(1, Ordering::SeqCst);
-        match self.open_error {
+        match self.open_error.take() {
             Some(errno) => Err(io::Error::from_raw_os_error(errno)),
-            None => Ok(()),
+            None => {
+                self.opened = true;
+                Ok(())
+            }
         }
     }
 
     fn dump(&mut self, out: &mut Vec<TcpSock>) -> io::Result<DumpStats> {
+        if !self.opened {
+            self.open()?;
+        }
+        if let Some(kind) = self.dump_error.take() {
+            return Err(io::Error::new(kind, "scripted dump error"));
+        }
         out.clear();
         out.extend(self.sockets.iter().take(MAX_TCP_SOCKETS).cloned());
         Ok(DumpStats {
             malformed: self.malformed,
-            truncated: self.truncated || self.sockets.len() > MAX_TCP_SOCKETS,
+            truncated: self.truncated,
         })
     }
 
-    fn close(&mut self) {}
+    fn close(&mut self) {
+        self.opened = false;
+    }
 }
 
 fn socket(state: u8, remote: [u8; 4], rtt_us: u32, last_data_recv_ms: u32) -> TcpSock {
@@ -68,6 +81,14 @@ fn collector(
     sockets: Vec<TcpSock>,
     open_error: Option<i32>,
 ) -> (NetSocketsCollector, Arc<AtomicUsize>) {
+    collector_with_dump_error(sockets, open_error, None)
+}
+
+fn collector_with_dump_error(
+    sockets: Vec<TcpSock>,
+    open_error: Option<i32>,
+    dump_error: Option<io::ErrorKind>,
+) -> (NetSocketsCollector, Arc<AtomicUsize>) {
     let opens = Arc::new(AtomicUsize::new(0));
     let transport = FakeTransport {
         sockets,
@@ -75,6 +96,8 @@ fn collector(
         opens: opens.clone(),
         malformed: 3,
         truncated: false,
+        opened: false,
+        dump_error,
     };
     (
         NetSocketsCollector::with_transport(Box::new(transport)),
@@ -117,7 +140,7 @@ fn canned_dump_reports_states_listener_recent_non_loopback_rtts_and_histogram() 
 }
 
 #[test]
-fn socket_cap_sets_truncated_without_growing_collector_buffers() {
+fn collector_passes_through_transport_truncation_and_reuses_sample_buffers() {
     let (mut collector, _) = collector(
         vec![socket(1, [198, 51, 100, 1], 1_000, 0); MAX_TCP_SOCKETS + 1],
         None,
@@ -126,9 +149,10 @@ fn socket_cap_sets_truncated_without_growing_collector_buffers() {
     let mut frame = MonitorFrame::default();
     collector.sample(&TickCtx::default(), &mut frame).unwrap();
     assert_eq!(frame.parts.net_sockets.sockets, MAX_TCP_SOCKETS as u32);
-    assert!(frame.parts.net_sockets.truncated);
+    assert!(!frame.parts.net_sockets.truncated);
     let socket_capacity = collector.sockets.capacity();
     let rtt_capacity = collector.rtts.capacity();
+    assert!(socket_capacity >= MAX_TCP_SOCKETS);
     for _ in 0..1_000 {
         collector.sample(&TickCtx::default(), &mut frame).unwrap();
     }
@@ -164,6 +188,90 @@ fn permission_denial_is_absent_and_does_not_retry_on_each_tick() {
 }
 
 #[test]
+fn transient_discovery_open_failure_recovers_on_later_sample() {
+    let (collector, opens) = collector(
+        vec![socket(1, [198, 51, 100, 1], 1_000, 0)],
+        Some(libc::EMFILE),
+    );
+    let mut registry = Registry::new(vec![Box::new(collector)]);
+    registry.discover(&Env::default());
+    assert!(matches!(
+        registry.health(CollectorId::NetSockets),
+        Health::Failing { .. }
+    ));
+    let mut demand = CollectorSet::empty();
+    demand.insert(CollectorId::NetSockets);
+    let mut frame = MonitorFrame::default();
+    registry.tick(
+        Mode::Open,
+        demand,
+        &TickCtx {
+            tick: 0,
+            ..Default::default()
+        },
+        &mut frame,
+    );
+    registry.tick(
+        Mode::Open,
+        demand,
+        &TickCtx {
+            tick: 5,
+            ..Default::default()
+        },
+        &mut frame,
+    );
+    assert_eq!(frame.parts.net_sockets.sockets, 1);
+    assert_eq!(opens.load(Ordering::SeqCst), 2);
+}
+
+#[test]
+fn mapped_ipv4_loopback_is_excluded_from_rtt_statistics() {
+    let mut row = socket(1, [127, 0, 0, 1], 42_000, 0);
+    row.family = AddressFamily::Ipv6;
+    row.destination = IpAddr::V6(Ipv4Addr::LOCALHOST.to_ipv6_mapped());
+    let (mut collector, _) = collector(vec![row], None);
+    assert_eq!(collector.discover(&Env::default()), Health::Warming);
+    let mut frame = MonitorFrame::default();
+    collector.sample(&TickCtx::default(), &mut frame).unwrap();
+    assert_eq!(frame.parts.net_sockets.rtt_p50_us, None);
+}
+
+#[test]
+fn timed_out_dump_is_gone_and_registry_reopens_before_next_sample() {
+    let (collector, opens) = collector_with_dump_error(
+        vec![socket(1, [198, 51, 100, 1], 1_000, 0)],
+        None,
+        Some(io::ErrorKind::TimedOut),
+    );
+    let mut registry = Registry::new(vec![Box::new(collector)]);
+    registry.discover(&Env::default());
+    let mut demand = CollectorSet::empty();
+    demand.insert(CollectorId::NetSockets);
+    let mut frame = MonitorFrame::default();
+    registry.tick(
+        Mode::Open,
+        demand,
+        &TickCtx {
+            tick: 0,
+            ..Default::default()
+        },
+        &mut frame,
+    );
+    assert_eq!(opens.load(Ordering::SeqCst), 3);
+    registry.tick(
+        Mode::Open,
+        demand,
+        &TickCtx {
+            tick: 5,
+            ..Default::default()
+        },
+        &mut frame,
+    );
+    assert_eq!(frame.parts.net_sockets.sockets, 1);
+    assert_eq!(opens.load(Ordering::SeqCst), 4);
+}
+
+#[test]
 fn permission_or_unsupported_protocol_maps_to_absence() {
     let (mut collector, _) = collector(Vec::new(), Some(libc::EPROTONOSUPPORT));
     assert_eq!(
@@ -176,6 +284,8 @@ fn permission_or_unsupported_protocol_maps_to_absence() {
 fn open_collector_reuses_socket_and_percentile_buffers_over_one_thousand_samples() {
     let (mut collector, opens) = collector(vec![socket(1, [198, 51, 100, 1], 12_000, 100)], None);
     assert_eq!(collector.discover(&Env::default()), Health::Warming);
+    assert_eq!(collector.sockets.capacity(), 0);
+    assert_eq!(collector.rtts.capacity(), 0);
     let mut frame = MonitorFrame::default();
     collector.sample(&TickCtx::default(), &mut frame).unwrap();
     let socket_capacity = collector.sockets.capacity();
@@ -185,7 +295,7 @@ fn open_collector_reuses_socket_and_percentile_buffers_over_one_thousand_samples
     }
     assert_eq!(collector.sockets.capacity(), socket_capacity);
     assert_eq!(collector.rtts.capacity(), rtt_capacity);
-    assert_eq!(opens.load(Ordering::SeqCst), 1);
+    assert_eq!(opens.load(Ordering::SeqCst), 2);
 }
 
 #[test]
