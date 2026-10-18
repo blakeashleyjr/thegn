@@ -1,0 +1,6 @@
+pswpin 10
+pswpout 20
+pgfault 30
+pgmajfault 4
+pgsteal_kswapd 2
+pgsteal_direct 3
