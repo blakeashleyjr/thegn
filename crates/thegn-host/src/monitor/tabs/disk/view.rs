@@ -124,6 +124,8 @@ pub(in crate::monitor) struct DiskModel {
     write_bps: Option<f64>,
     read_history: HistoryRing,
     write_history: HistoryRing,
+    psi_some_history: HistoryRing,
+    psi_full_history: HistoryRing,
     device_history: Vec<DeviceHistory>,
     physical_count: u16,
     disk_health: Health,
@@ -176,6 +178,12 @@ impl DiskModel {
         self.filesystems
             .truncate(frame.parts.filesystems.rows.len());
         self.io_psi.clone_from(&frame.parts.psi.io);
+        if let Some(line) = self.io_psi.file.some {
+            self.psi_some_history.push(line.avg10 as f32);
+        }
+        if let Some(line) = self.io_psi.file.full {
+            self.psi_full_history.push(line.avg10 as f32);
+        }
         self.slice_io = frame.parts.cgroup_slice.sample.io;
         self.physical_count = frame.parts.diskstats.physical;
         self.read_bps = frame.parts.diskstats.aggregate.read_bps;
@@ -303,7 +311,7 @@ impl TabView for DiskView<'_> {
         if placed.id == IO
             && !matches!(self.0.disk_health, Health::Absent(_))
             && self.0.read_history.len > 0
-            && rect.rows > 3
+            && rect.rows > 4
         {
             let mut normalized = [0.0; HISTORY];
             let (len, _) = self.0.read_history.copy_normalized(&mut normalized);
@@ -312,9 +320,41 @@ impl TabView for DiskView<'_> {
                 RampId::Read,
                 Rect {
                     x: rect.x + 1,
+                    y: rect.y + 4,
+                    cols: rect.cols.saturating_sub(2),
+                    rows: rect.rows.saturating_sub(5) / 2,
+                },
+                surface,
+            );
+        }
+        if placed.id == PRESSURE
+            && !matches!(self.0.psi_health, Health::Absent(_))
+            && rect.rows > 5
+            && rect.cols > 2
+        {
+            let graph_rows = rect.rows.saturating_sub(4) / 2;
+            let mut normalized = [0.0; HISTORY];
+            let some_len = self.0.psi_some_history.copy_ordered(&mut normalized);
+            crate::monitor::graphs::paint_history_graph(
+                &normalized[..some_len],
+                RampId::Read,
+                Rect {
+                    x: rect.x + 1,
                     y: rect.y + 3,
                     cols: rect.cols.saturating_sub(2),
-                    rows: rect.rows.saturating_sub(4) / 2,
+                    rows: graph_rows,
+                },
+                surface,
+            );
+            let full_len = self.0.psi_full_history.copy_ordered(&mut normalized);
+            crate::monitor::graphs::paint_history_graph(
+                &normalized[..full_len],
+                RampId::Write,
+                Rect {
+                    x: rect.x + 1,
+                    y: rect.y + 3 + graph_rows,
+                    cols: rect.cols.saturating_sub(2),
+                    rows: graph_rows,
                 },
                 surface,
             );
@@ -354,7 +394,7 @@ impl TabView for DiskView<'_> {
         if placed.id == IO
             && !matches!(self.0.disk_health, Health::Absent(_))
             && self.0.write_history.len > 0
-            && rect.rows > 4
+            && rect.rows > 5
         {
             let mut normalized = [0.0; HISTORY];
             let (len, _) = self.0.write_history.copy_normalized(&mut normalized);
@@ -363,9 +403,9 @@ impl TabView for DiskView<'_> {
                 RampId::Write,
                 Rect {
                     x: rect.x + 1,
-                    y: rect.y + 3 + rect.rows.saturating_sub(4) / 2,
+                    y: rect.y + 4 + rect.rows.saturating_sub(5) / 2,
                     cols: rect.cols.saturating_sub(2),
-                    rows: rect.rows.saturating_sub(4) / 2,
+                    rows: rect.rows.saturating_sub(5) / 2,
                 },
                 surface,
             );
