@@ -98,7 +98,8 @@ fn gone_read_error_prunes_and_later_pids_still_refresh() {
 
     assert_eq!(table.entries().len(), 1);
     assert_eq!(table.entries()[0].id.pid, 2);
-    assert!(!table.entries()[0].has_kept_fd());
+    // The fd budget (8) easily covers the surviving pid, so it keeps its handle; only the gone pid closed.
+    assert!(table.entries()[0].has_kept_fd());
     assert_eq!(table.entries()[0].last_seen, Duration::from_secs(2));
     assert_eq!(table.fs().ops().closes, 1);
 }
