@@ -30,6 +30,7 @@ mod panels;
 struct OverviewPaintScratch {
     grid: CellGrid,
     emitter: kit::emit::Emitter,
+    panel_text: panels::PanelText,
 }
 
 thread_local! {
@@ -379,18 +380,24 @@ impl TabView for OverviewView<'_> {
             scratch.grid.resize(rect.cols, rect.rows);
             scratch.grid.clear();
             let title = PANELS[index].title;
-            let (badge, lines, tone) = self.panel_content(index);
+            self.panel_content_into(index, &mut scratch.panel_text);
+            let panel_text = &scratch.panel_text;
+            let badge = (!panel_text.badge.is_empty()).then_some(panel_text.badge.as_str());
             let content_rect;
             {
                 let mut body = kit::panel::panel(
                     &mut scratch.grid,
                     Rect::full(rect.cols, rect.rows),
                     title,
-                    badge.as_deref(),
+                    badge,
                 );
                 content_rect = body.rect();
-                for (row, line) in lines.iter().take(body.rect().rows).enumerate() {
-                    body.put_str(0, row, line, kit_style(tone));
+                for (row, line) in panel_text.lines[..panel_text.line_count]
+                    .iter()
+                    .take(body.rect().rows)
+                    .enumerate()
+                {
+                    body.put_str(0, row, line, kit_style(panel_text.tone));
                 }
             }
             scratch.emitter.emit(
@@ -400,8 +407,8 @@ impl TabView for OverviewView<'_> {
                 rect.x,
                 rect.y,
             );
-            let graph_y = content_rect.y + lines.len();
-            let graph_rows = content_rect.rows.saturating_sub(lines.len());
+            let graph_y = content_rect.y + panel_text.line_count;
+            let graph_rows = content_rect.rows.saturating_sub(panel_text.line_count);
             if graph_rows > 0
                 && let Some(values) = self.0.sparks.get(index)
             {

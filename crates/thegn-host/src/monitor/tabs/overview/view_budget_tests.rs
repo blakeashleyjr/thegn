@@ -100,6 +100,10 @@ fn warmed_absorbs_stay_allocation_free_across_changing_frames_and_history() {
 }
 
 #[test]
+#[allow(
+    clippy::disallowed_macros,
+    reason = "budget gate prints observed counts for the primary"
+)]
 fn populated_overview_panels_stay_within_the_pinned_paint_budget() {
     // THE-898 regression ceiling; primary pins the reduced value from observed counts.
     const PAINT_ALLOCATION_BUDGET: u64 = 160_200;
@@ -136,6 +140,7 @@ fn populated_overview_panels_stay_within_the_pinned_paint_budget() {
             view.paint(&mut surface, panel, area, 0, &[] as &[Section]);
         }
     });
+    eprintln!("Overview eight-panel paint observed counts: {counts:?}");
     assert!(
         counts.allocation_calls <= PAINT_ALLOCATION_BUDGET
             && counts.realloc_calls <= PAINT_REALLOC_BUDGET,
