@@ -73,22 +73,26 @@ pub fn spawn_fetch(
     crate::preview_jobs::global().submit_guarded(
         move |ctx| {
             let (text, raster) = route_and_render(&abs, kitty, ctx.cancelled());
+            // Prepare the potentially multi-megabyte base64 payload before
+            // deliver takes the supervisor mutex. Deliver closures must stay
+            // O(1): submit and cancel_fetches need this same lock on the loop.
+            let prepared = raster
+                .as_ref()
+                .filter(|_| kitty && !ctx.cancelled().load(std::sync::atomic::Ordering::Relaxed))
+                .and_then(|(r, w, h)| crate::graphics::kitty_payload(r, *w, *h).ok())
+                .map(std::sync::Arc::new);
             let delivered = ctx.deliver(|| {
                 let mut delivered = false;
                 if let Some((r, w, h)) = raster {
-                    let prepared = if kitty {
-                        match crate::graphics::kitty_payload(&r, w, h) {
-                            Ok(payload) => Some(std::sync::Arc::new(payload)),
-                            Err(_) => None,
-                        }
-                    } else {
-                        None
-                    };
+                    // The display path uses the prepared payload; keep RGBA
+                    // only when preparation was skipped or failed, for its
+                    // legacy fallback encoder.
+                    let rgba = if prepared.is_some() { Vec::new() } else { r };
                     delivered |= img_tx
                         .try_send((
                             rel.clone(),
                             Raster {
-                                rgba: r,
+                                rgba,
                                 w,
                                 h,
                                 kitty: prepared,
