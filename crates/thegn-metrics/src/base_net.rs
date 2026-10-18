@@ -45,10 +45,11 @@ impl BaseNet {
         dt_secs: f64,
         retry_open: bool,
     ) -> Option<Vec<(String, u64, u64)>> {
-        if self.file.is_none() && retry_open {
-            if let Ok(file) = ProcFile::open(&self.path) {
-                self.file = Some(file);
-            }
+        if self.file.is_none()
+            && retry_open
+            && let Ok(file) = ProcFile::open(&self.path)
+        {
+            self.file = Some(file);
         }
         let file = self.file.as_mut()?;
         let bytes = match file.read_all() {
