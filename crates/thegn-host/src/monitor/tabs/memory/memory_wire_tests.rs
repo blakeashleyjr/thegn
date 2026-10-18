@@ -54,6 +54,7 @@ fn panel_demand_does_not_depend_on_current_readings() {
         "memory.pressure",
         "memory.swap",
         "memory.paging",
+        "memory.kernel",
         "memory.limit",
     ] {
         let panel = crate::monitor::layout::PanelId(id);
