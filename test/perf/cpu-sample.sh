@@ -334,10 +334,14 @@ LOG_FILE="$XDG_STATE_HOME/thegn/logs/thegn.log"
 rm -f -- "$LOG_FILE"
 # Verify registry adoption in a short instrumented launch so idle measurements
 # retain their original no-sink environment.
-printf -v VERIFY_INNER 'cd %q; stty rows 50 cols 200; env THEGN_NO_DAEMON=1 THEGN_BENCH_RUN_MS=30000 THEGN_LOG=thegn::hydrate=debug %q' \
-  "$REPO" "$BIN_ABS"
+# Usage switch: TG_PERF_SANDBOX=1 measures sandboxed panes and requires the
+# original runtime directory's user bus for `systemd-run --user --scope`.
+VERIFY_PIDFILE="$PERF_TMP/verify.pid"
+printf -v VERIFY_INNER 'cd %q; stty rows 50 cols 200; env THEGN_NO_DAEMON=1 THEGN_BENCH_RUN_MS=30000 THEGN_LOG=thegn::hydrate=debug %q & echo $! > %q; wait' \
+  "$REPO" "$BIN_ABS" "$VERIFY_PIDFILE"
 TIMEOUT_BIN="$(pty_timeout_bin)"
 VERIFY_TIMEOUT_S=$(((SETTLE_MAX_MS / 1000) + 10))
+set -m
 if [ -n "$TIMEOUT_BIN" ]; then
   # `$0`/`$1` are the bash -c positionals bound by the arguments below.
   # shellcheck disable=SC2016
@@ -348,6 +352,8 @@ else
     "$HERE/../lib/pty.sh" "$VERIFY_INNER" >/dev/null 2>&1 &
 fi
 VERIFY_LAUNCHER=$!
+perf_track_process_group "$VERIFY_LAUNCHER"
+perf_watch_process_group "$VERIFY_LAUNCHER" "$VERIFY_TIMEOUT_S"
 EXPECTED_WORKTREES=$((WORKTREES + 1))
 WORKTREES_COLLECTED=0
 VERIFY_POLLS=$(((SETTLE_MAX_MS + 199) / 200))
@@ -361,15 +367,18 @@ for _ in $(seq 1 "$VERIFY_POLLS"); do
   sleep 0.2
 done
 if [ "$WORKTREES_COLLECTED" != "$EXPECTED_WORKTREES" ]; then
-  kill "$VERIFY_LAUNCHER" 2>/dev/null || true
-  wait "$VERIFY_LAUNCHER" 2>/dev/null || true
+  perf_stop_process_group "$VERIFY_LAUNCHER"
   echo "FAIL: sidebar status did not collect worktrees=$EXPECTED_WORKTREES in $LOG_FILE" >&2
   if [ "$JSON_ONLY" = 1 ]; then
     printf '{"worktrees_collected":{"status":"failed","expected":%s}}\n' "$EXPECTED_WORKTREES"
   fi
   exit 1
 fi
-wait "$VERIFY_LAUNCHER" 2>/dev/null || true
+VERIFY_PID="$(cat "$VERIFY_PIDFILE" 2>/dev/null || true)"
+if [ -n "$VERIFY_PID" ]; then
+  kill -TERM "$VERIFY_PID" 2>/dev/null || true
+fi
+perf_stop_process_group "$VERIFY_LAUNCHER"
 if [ "$SPAWN_ENABLED" = 1 ] && [ "$SAMPLER" = proc ]; then
   # `$1`/`$@` are the bash -c positionals passed after `$0`, not outer values.
   # shellcheck disable=SC2016
@@ -409,6 +418,8 @@ else
   fi
 fi
 LAUNCHER=$!
+perf_track_process_group "$LAUNCHER"
+perf_watch_process_group "$LAUNCHER" "$DEADLINE_S"
 if [ "$WORKLOAD" = 1 ]; then
   exec 3>"$FIFO"
 fi
