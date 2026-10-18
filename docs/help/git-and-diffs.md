@@ -41,6 +41,10 @@ one-shot filter path for that worktree and command, and continues using it for
 the next 60 seconds. A required filter that fails shows an error for that
 file's diff.
 
+The dirty check and the diff's changed-file walk also reuse filters for drivers
+marked `required = true` that have both `clean` and `process` commands. If such
+a filter cannot run, those operations use Git's one-shot `clean` filter.
+
 ### commits — branch history
 
 At Half and Full width, the detail region follows the cursor and shows the

@@ -114,6 +114,11 @@ From the sidebar delete menu, the worktree row and its pipeline rows disappear
 at once, and focus moves on. If removal fails, the row returns in place and
 the status line says `Worktree delete failed for <path>: <reason>`.
 
+While a worktree delete is in flight, jumping to that worktree from the
+sidebar, a notification, the command palette, or connect is refused with
+`'<name>' is being deleted`. An adopt into it leaves the session headless with
+`adopt: <path> is being deleted`.
+
 New worktrees live under `~/.thegn/worktrees/<repo>/<label>--<digest>` by
 default; `worktree_mode = "in_repo"` keeps them in `<repo>/.worktrees`. The
 label is a readable slug of the branch; the 64-hex digest is derived from the
