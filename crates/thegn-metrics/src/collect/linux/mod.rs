@@ -8,6 +8,7 @@ pub mod cpu_stat;
 pub mod cpufreq;
 pub mod disk_topology;
 pub mod diskstats;
+pub mod gpu_discover;
 pub mod hwmon;
 pub mod loadavg;
 pub mod meminfo;
