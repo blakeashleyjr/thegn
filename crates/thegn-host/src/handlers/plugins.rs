@@ -96,12 +96,8 @@ impl PluginsState {
     /// Lazily start the host.call dispatcher, sharing the config without
     /// cloning the full value on each request.
     fn dispatcher(&mut self) -> &mut Dispatcher {
-        if self.dispatcher.is_none() {
-            self.dispatcher = Some(Dispatcher::spawn(Arc::clone(&self.cfg)));
-        }
         self.dispatcher
-            .as_mut()
-            .expect("dispatcher was initialized")
+            .get_or_insert_with(|| Dispatcher::spawn(Arc::clone(&self.cfg)))
     }
 }
 
@@ -1322,7 +1318,7 @@ impl Dispatcher {
                 };
             }
         };
-        let thread = thegn_core::thread_name::spawn_named("thegn-plugdisp", move || {
+        let _thread = thegn_core::thread_name::spawn_named("thegn-plugdisp", move || {
             // Utility: plugin host.call round-trips back visible plugin content.
             crate::platform::qos::set_self(crate::platform::qos::Qos::Utility);
             while let Ok(req) = rx.recv() {
@@ -1378,7 +1374,6 @@ impl Dispatcher {
                 }
             }
         });
-        drop(thread);
         Self {
             tx,
             load,
