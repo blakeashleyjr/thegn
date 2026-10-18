@@ -9,8 +9,9 @@
 //! **input preemption** contract: a keystroke discovered mid-drain aborts the
 //! drain immediately instead of waiting out the whole backlog.
 
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use thegn_core::log::parser::ParsedLog;
+use thegn_svc::log::ingress::LogIngress;
 
 /// Per-iteration PTY parse budget. `max_bytes` bounds the vt100 feed volume;
 /// `deadline` is the wall-clock backstop for pathological escape-heavy input
@@ -45,9 +46,84 @@ pub fn drain_budget(input_pending: bool) -> DrainBudget {
 /// Display rows retained for the Logs panel.
 pub const LOG_RETAIN: usize = 1000;
 
-/// Log records applied per host iteration; input pending gets a smaller slice.
-pub fn log_apply_budget(input_pending: bool) -> usize {
-    if input_pending { 32 } else { 256 }
+/// Per-iteration log application limit. The deadline is a backstop for
+/// pathological records; the record count stays the operative bound.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LogBudget {
+    pub max_records: usize,
+    pub deadline: Duration,
+}
+
+/// Maximum records applied in one chunk, bounding deadline-check granularity.
+pub const LOG_CHUNK: usize = 32;
+
+/// Log application budget; input pending gets a smaller count and deadline.
+pub fn log_budget(input_pending: bool) -> LogBudget {
+    if input_pending {
+        LogBudget {
+            max_records: 32,
+            deadline: Duration::from_millis(1),
+        }
+    } else {
+        LogBudget {
+            max_records: 256,
+            deadline: Duration::from_millis(2),
+        }
+    }
+}
+
+/// Outcome of applying one bounded portion of the log ingress.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LogDrain {
+    pub applied: usize,
+    pub took: bool,
+    pub dirty: bool,
+    pub backlog: bool,
+}
+
+/// Drain bounded log chunks, checking the time backstop between chunks.
+pub fn drain_logs(
+    ingress: &LogIngress,
+    rows: &mut Vec<ParsedLog>,
+    first_seq: &mut u64,
+    budget: LogBudget,
+    visible: bool,
+    mut now: impl FnMut() -> Instant,
+) -> LogDrain {
+    let started = now();
+    let mut applied = 0;
+    let mut took = false;
+    let mut dirty = false;
+    while applied < budget.max_records {
+        let count = LOG_CHUNK.min(budget.max_records - applied);
+        let slice = ingress.take(count);
+        if slice.is_empty() {
+            break;
+        }
+        took = true;
+        let records = slice.len() - usize::from(slice.first().is_some_and(is_gap_marker));
+        dirty |= apply_log_slice(rows, first_seq, slice, visible);
+        applied += records;
+        if applied >= budget.max_records
+            || now().saturating_duration_since(started) >= budget.deadline
+        {
+            break;
+        }
+    }
+    LogDrain {
+        applied,
+        took,
+        dirty,
+        backlog: ingress.has_pending(),
+    }
+}
+
+/// Identifies the leading overload marker created by `thegn_svc::log::ingress::gap_marker`.
+fn is_gap_marker(log: &ParsedLog) -> bool {
+    log.timestamp.is_empty()
+        && log.level == thegn_core::log::parser::LogLevel::Warn
+        && log.target.is_none()
+        && log.message.contains("log lines dropped under overload")
 }
 
 /// Whether a parsed log belongs to a target that must not dirty the frame.
@@ -173,12 +249,223 @@ pub fn frame_gate(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::cell::Cell;
+    use std::time::Instant;
+    use thegn_core::log::parser::LogLevel;
+    use thegn_svc::log::ingress::MAX_PENDING_RECORDS;
+
+    fn record(message: &str) -> ParsedLog {
+        ParsedLog {
+            timestamp: String::new(),
+            level: LogLevel::Info,
+            original: message.to_string(),
+            message: message.to_string(),
+            worktree: None,
+            target: Some("test".to_string()),
+        }
+    }
+
+    fn noise() -> ParsedLog {
+        ParsedLog {
+            timestamp: String::new(),
+            level: LogLevel::Debug,
+            original: "frame noise".to_string(),
+            message: "frame noise".to_string(),
+            worktree: None,
+            target: Some("thegn::frame".to_string()),
+        }
+    }
 
     #[test]
     fn log_application_budget_is_bounded_and_yields_to_input() {
-        assert!(log_apply_budget(true) < log_apply_budget(false));
-        assert!(log_apply_budget(false) <= LOG_RETAIN);
-        assert!(log_apply_budget(true) > 0);
+        let hot = log_budget(true);
+        let quiet = log_budget(false);
+        assert!(hot.max_records < quiet.max_records);
+        assert!(hot.deadline <= quiet.deadline);
+        assert!(quiet.max_records <= LOG_RETAIN);
+        assert!(hot.max_records > 0);
+        assert!(LOG_CHUNK <= hot.max_records);
+    }
+
+    #[test]
+    fn drain_stops_at_the_time_budget() {
+        let ingress = LogIngress::new();
+        ingress.push(
+            (0..300)
+                .map(|index| record(&format!("record-{index}")))
+                .collect(),
+        );
+        let clock = Cell::new(Instant::now());
+        let result = drain_logs(
+            &ingress,
+            &mut Vec::new(),
+            &mut 0,
+            log_budget(false),
+            true,
+            || {
+                let at = clock.get();
+                clock.set(at + Duration::from_micros(1500));
+                at
+            },
+        );
+        assert_eq!(result.applied, 2 * LOG_CHUNK);
+        assert!(result.backlog);
+    }
+
+    #[test]
+    fn drain_stops_at_the_record_budget_with_a_frozen_clock() {
+        let ingress = LogIngress::new();
+        ingress.push(
+            (0..300)
+                .map(|index| record(&format!("record-{index}")))
+                .collect(),
+        );
+        let fixed = Instant::now();
+        let quiet = drain_logs(
+            &ingress,
+            &mut Vec::new(),
+            &mut 0,
+            log_budget(false),
+            true,
+            || fixed,
+        );
+        assert_eq!(quiet.applied, 256);
+        assert!(quiet.backlog);
+
+        let hot_ingress = LogIngress::new();
+        hot_ingress.push(
+            (0..300)
+                .map(|index| record(&format!("record-{index}")))
+                .collect(),
+        );
+        let hot = drain_logs(
+            &hot_ingress,
+            &mut Vec::new(),
+            &mut 0,
+            log_budget(true),
+            true,
+            || fixed,
+        );
+        assert_eq!(hot.applied, 32);
+        assert!(hot.backlog);
+    }
+
+    #[test]
+    fn continuous_producer_with_input_and_visibility_transitions() {
+        let ingress = LogIngress::new();
+        let mut rows = Vec::new();
+        let mut first_seq = 0;
+        let mut next_record = 0;
+        let mut total_applied = 0;
+        let iterations = 12;
+
+        for iteration in 0..iterations {
+            let mut batch = Vec::new();
+            if iteration % 3 == 0 {
+                batch.push(noise());
+            }
+            for _ in 0..64 {
+                batch.push(record(&format!("record-{next_record}")));
+                next_record += 1;
+            }
+            ingress.push(batch);
+
+            let input_pending = iteration % 2 == 0;
+            let visible = (iterations / 3..2 * iterations / 3).contains(&iteration);
+            let fixed = Instant::now();
+            let result = drain_logs(
+                &ingress,
+                &mut rows,
+                &mut first_seq,
+                log_budget(input_pending),
+                visible,
+                || fixed,
+            );
+            total_applied += result.applied;
+            assert!(result.applied <= log_budget(input_pending).max_records);
+            if !visible {
+                assert!(!result.dirty);
+            } else if result.applied > 0 {
+                assert!(result.dirty);
+            }
+            assert_eq!(
+                crate::idle_poll::poll_timeout(None, false, false, result.backlog),
+                result.backlog.then_some(crate::idle_poll::BATCH_POLL)
+            );
+        }
+
+        let pending = ingress.stats().pending;
+        let max_drain_iterations = pending.div_ceil(LOG_CHUNK) + 1;
+        let mut trailing_iterations = 0;
+        while ingress.has_pending() && trailing_iterations < max_drain_iterations {
+            let fixed = Instant::now();
+            let result = drain_logs(
+                &ingress,
+                &mut rows,
+                &mut first_seq,
+                log_budget(true),
+                false,
+                || fixed,
+            );
+            total_applied += result.applied;
+            trailing_iterations += 1;
+        }
+        assert!(!ingress.has_pending());
+        assert!(trailing_iterations <= max_drain_iterations);
+        assert_eq!(
+            rows.last().map(|log| log.message.as_str()),
+            Some("record-767")
+        );
+        assert!(rows.windows(2).all(|pair| {
+            let left = pair[0].message.strip_prefix("record-");
+            let right = pair[1].message.strip_prefix("record-");
+            match (left, right) {
+                (Some(left), Some(right)) => {
+                    left.parse::<usize>().unwrap() < right.parse::<usize>().unwrap()
+                }
+                _ => true,
+            }
+        }));
+        assert!(rows.len() <= LOG_RETAIN);
+        assert_eq!(first_seq + rows.len() as u64, total_applied as u64);
+        assert_eq!(
+            crate::idle_poll::poll_timeout(None, false, false, false),
+            None
+        );
+
+        let fixed = Instant::now();
+        let empty = drain_logs(
+            &ingress,
+            &mut rows,
+            &mut first_seq,
+            log_budget(false),
+            false,
+            || fixed,
+        );
+        assert_eq!(empty.applied, 0);
+        assert!(!empty.took);
+        assert!(!empty.dirty);
+        assert!(!empty.backlog);
+    }
+
+    #[test]
+    fn overload_gap_marker_is_applied_in_order_and_not_counted() {
+        let ingress = LogIngress::new();
+        ingress.push(
+            (0..MAX_PENDING_RECORDS + 25)
+                .map(|index| record(&format!("record-{index}")))
+                .collect(),
+        );
+        let mut rows = Vec::new();
+        let fixed = Instant::now();
+        let result = drain_logs(&ingress, &mut rows, &mut 0, log_budget(false), true, || {
+            fixed
+        });
+        assert_eq!(result.applied, 256);
+        assert!(result.took);
+        assert_eq!(rows.len(), 257);
+        assert!(rows[0].message.contains("25 log lines dropped"));
+        assert_eq!(rows[1].message, "record-25");
     }
 
     #[test]
