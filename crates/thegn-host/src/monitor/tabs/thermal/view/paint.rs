@@ -55,24 +55,26 @@ pub(super) fn package(
         );
         return;
     };
-    let mut meter = Meter::default();
-    meter.paint(
-        grid,
-        Rect {
-            x: rect.x,
-            y: rect.y,
-            cols: rect.cols,
-            rows: 1,
-        },
-        MeterSpec {
-            value: (temp / sensor.crit_c.unwrap_or(100.0)).clamp(0.0, 1.0),
-            warn: 0.7,
-            crit: 0.9,
-            ramp: RampId::Temp,
-            label: false,
-            fmt: NumFmt::default(),
-        },
-    );
+    if let Some(limit) = sensor.crit_c.or(sensor.max_c) {
+        let mut meter = Meter::default();
+        meter.paint(
+            grid,
+            Rect {
+                x: rect.x,
+                y: rect.y,
+                cols: rect.cols,
+                rows: 1,
+            },
+            MeterSpec {
+                value: (temp / limit).clamp(0.0, 1.0),
+                warn: 0.7,
+                crit: 0.9,
+                ramp: RampId::Temp,
+                label: false,
+                fmt: NumFmt::default(),
+            },
+        );
+    }
     put(
         grid,
         rect,
@@ -81,15 +83,13 @@ pub(super) fn package(
         &format!("{}  {temp:.1} C", sensor.label),
         state_tok(temp, sensor.max_c, sensor.crit_c),
     );
-    if let Some(crit) = sensor.crit_c {
-        put(
-            grid,
-            rect,
-            0,
-            2,
-            &format!("critical at {crit:.1} C"),
-            Tok::Slot(S::Dim),
-        );
+    if let Some(limit) = sensor.crit_c.or(sensor.max_c) {
+        let label = if let Some(crit) = sensor.crit_c {
+            format!("scale {limit:.1} C · critical at {crit:.1} C")
+        } else {
+            format!("scale {limit:.1} C")
+        };
+        put(grid, rect, 0, 2, &label, Tok::Slot(S::Dim));
     }
     let mut frame_values = [0.0_f32; HISTORY_CAP];
     let count = package_history_len.min(HISTORY_CAP);
@@ -254,23 +254,22 @@ pub(super) fn sensors(grid: &mut CellGrid, rect: Rect, sensors: &[SensorRow]) {
             (Some(max), Some(crit)) => format!("{max:.0}/{crit:.0}"),
             (Some(max), None) => format!("max {max:.0}"),
             (None, Some(crit)) => format!("crit {crit:.0}"),
-            (None, None) => "ref 100".to_owned(),
+            (None, None) => caps::active_glyphs().emdash.to_owned(),
         })
         .collect::<Vec<_>>();
     let bar_width = SENSOR_COLUMN_WIDTHS[4];
     let bars = sensors
         .iter()
-        .map(|sensor| {
-            sensor.temp_c.map_or_else(
-                || caps::active_glyphs().emdash.to_owned(),
-                |temp| {
-                    let limit = sensor.crit_c.or(sensor.max_c).unwrap_or(100.0);
+        .map(
+            |sensor| match (sensor.temp_c, sensor.crit_c.or(sensor.max_c)) {
+                (Some(temp), Some(limit)) => {
                     let (filled, track) =
                         caps::bar_track((temp / limit).clamp(0.0, 1.0), bar_width);
                     format!("{filled}{track}")
-                },
-            )
-        })
+                }
+                _ => caps::active_glyphs().emdash.to_owned(),
+            },
+        )
         .collect::<Vec<_>>();
     let mut owned_rows: Vec<Vec<table::TableCell<'_>>> = Vec::with_capacity(sensors.len());
     for ((sensor, limit), bar) in sensors.iter().zip(&limits).zip(&bars) {

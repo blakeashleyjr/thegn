@@ -326,7 +326,7 @@ fn deterministic_snapshots_cover_sizes_capabilities_and_demand() {
                         assert!(output.contains("Thermal zones"));
                         assert!(output.contains("GPU thermals"));
                         assert!(output.contains("k10temp"));
-                        assert!(output.contains("ref 100"));
+                        assert!(!output.contains("ref 100"));
                         assert!(output.contains("amdgpu"));
                         assert!(output.contains("spd5118"));
                         assert!(output.contains("alarm 1"));
@@ -347,7 +347,7 @@ fn deterministic_snapshots_cover_sizes_capabilities_and_demand() {
                     assert_eq!(output.matches("composite").count(), 1);
                     if cols == 240 {
                         let r = fill_ratio(&surface, area);
-                        // density follow-up (batch 50): estimated, primary sets from the printed value
+                        // density follow-up (batch 51): estimated, primary sets from the printed value
                         assert!(r >= 0.33, "fill ratio {r:.3}");
                     }
                 })
@@ -425,6 +425,37 @@ fn implausible_transient_keeps_sensor_identity_and_records_a_gap() {
         .expect("implausible sample must not drop the sensor row");
     assert_eq!(package.history_len, 2);
     assert!(package.history[(package.history_next + HISTORY_CAP - 1) % HISTORY_CAP].is_nan());
+}
+
+#[test]
+fn package_without_threshold_shows_temperature_without_a_meter() {
+    let mut model = ThermalModel::default();
+    model.absorb_frame(&fixture());
+    let mut package = model.package().expect("package sensor").clone();
+    package.max_c = None;
+    package.crit_c = None;
+    let mut grid = CellGrid::new(60, 8);
+    super::paint::package(
+        &mut grid,
+        Rect::full(60, 8),
+        Some(&package),
+        &model.package_history,
+        model.package_history_len,
+        model.package_history_next,
+    );
+    assert!((0..60).all(|x| grid.get(x, 0).expect("meter row cell").ch == ' '));
+    let reading = (0..60)
+        .map(|x| grid.get(x, 1).expect("temperature row cell").ch)
+        .collect::<String>();
+    assert!(reading.contains("71.0 C"));
+
+    let mut sensor_grid = CellGrid::new(100, 3);
+    super::paint::sensors(&mut sensor_grid, Rect::full(100, 3), &[package]);
+    let bar_row = (59..71)
+        .map(|x| sensor_grid.get(x, 1).expect("sensor bar cell").ch)
+        .collect::<String>();
+    let (filled, _) = caps::bar_track(0.71, 12);
+    assert!(!bar_row.contains(&filled));
 }
 
 #[test]
@@ -696,20 +727,153 @@ fn hwmon_core_source_stays_selected_for_the_layout_generation() {
 }
 
 #[test]
+fn smu_core_panel_is_placed_before_the_first_core_reading() {
+    let mut first_frame = fixture();
+    if let Some(card) = first_frame.parts.amd_smu.cards.first_mut() {
+        card.metrics.temperature_core = [None; 16];
+    }
+    if let Some(layout) = first_frame.parts.hwmon.layout.as_deref() {
+        let retained = layout
+            .sensors
+            .iter()
+            .enumerate()
+            .filter(|(_, sensor)| {
+                !sensor
+                    .label
+                    .as_deref()
+                    .is_some_and(|label| label.starts_with("core"))
+            })
+            .collect::<Vec<_>>();
+        let mut without_core_layout = (*layout).clone();
+        without_core_layout.sensors = retained
+            .iter()
+            .map(|(_, sensor)| (**sensor).clone())
+            .collect();
+        first_frame.parts.hwmon.values = retained
+            .iter()
+            .filter_map(|(index, _)| first_frame.parts.hwmon.values.get(*index).cloned())
+            .collect();
+        first_frame.parts.hwmon.layout = Some(Arc::new(without_core_layout));
+    }
+    let mut second_frame = first_frame.clone();
+    if let Some(card) = second_frame.parts.amd_smu.cards.first_mut() {
+        card.metrics.temperature_core[0] = Some(8_000);
+    }
+    let area = Rect::full(160, 45);
+    let mut model = ThermalModel::default();
+    model.absorb_frame(&first_frame);
+    let first_placed = Board::default()
+        .placed(&ThermalView(&model), area)
+        .into_iter()
+        .map(|panel| panel.id)
+        .collect::<Vec<_>>();
+    model.absorb_frame(&second_frame);
+    let second_placed = Board::default()
+        .placed(&ThermalView(&model), area)
+        .into_iter()
+        .map(|panel| panel.id)
+        .collect::<Vec<_>>();
+    assert_eq!(first_placed, second_placed);
+    assert!(first_placed.contains(&super::CORES));
+}
+
+#[test]
 fn core_panel_presence_does_not_follow_missing_frame_values() {
     let mut frame = fixture();
     let mut model = ThermalModel::default();
     model.absorb_frame(&frame);
+    let area = Rect::full(160, 45);
+    let first_placed = Board::default()
+        .placed(&ThermalView(&model), area)
+        .into_iter()
+        .map(|panel| panel.id)
+        .collect::<Vec<_>>();
     for value in frame.parts.hwmon.values.iter_mut().skip(7) {
         value.value = None;
     }
     model.absorb_frame(&frame);
     let view = ThermalView(&model);
+    let second_placed = Board::default()
+        .placed(&view, area)
+        .into_iter()
+        .map(|panel| panel.id)
+        .collect::<Vec<_>>();
+    assert_eq!(first_placed, second_placed);
     assert!(
         Board::default()
-            .placed(&view, Rect::full(160, 45))
+            .placed(&view, area)
             .iter()
             .any(|panel| panel.id == super::CORES)
+    );
+}
+
+#[test]
+fn telemetry_series_storage_stays_warm_across_one_thousand_absorbs() {
+    let mut history = TelemetryHistory::default();
+    for sample in 0..120_u64 {
+        history.push(
+            &thegn_metrics::StatsSnapshot {
+                cpu_temp_c: Some(40.0 + (sample % 45) as f32),
+                ..thegn_metrics::StatsSnapshot::default()
+            },
+            1_000 + sample * 1_000,
+        );
+    }
+    let mut model = ThermalModel::default();
+    model.absorb_history(&history, Window::from_secs(180), ScaleMode::Window, 121_000);
+    let history_capacity = model.temp_history.capacity();
+    assert_eq!(model.temp_history.len(), HISTORY_CAP);
+    let (_, counts) = crate::proc_workload_alloc::measure(|| {
+        for _ in 0..1_000 {
+            model.absorb_history(&history, Window::from_secs(180), ScaleMode::Window, 121_000);
+        }
+    });
+    assert_eq!(
+        counts.allocation_calls, 0,
+        "1000 telemetry history absorbs allocated: {counts:?}"
+    );
+    assert_eq!(
+        counts.realloc_calls, 0,
+        "1000 telemetry history absorbs reallocated: {counts:?}"
+    );
+    assert_eq!(model.temp_history.capacity(), history_capacity);
+    assert_eq!(model.temp_history.last(), Some(&69.0));
+}
+
+#[test]
+fn telemetry_temp_history_keeps_leading_gaps_and_holds_interior_gaps() {
+    let mut history = TelemetryHistory::default();
+    for (at_ms, temp_c) in [(1_000, 50.0), (9_000, 65.0)] {
+        history.push(
+            &thegn_metrics::StatsSnapshot {
+                cpu_temp_c: Some(temp_c),
+                ..thegn_metrics::StatsSnapshot::default()
+            },
+            at_ms,
+        );
+    }
+    let mut model = ThermalModel::default();
+    model.absorb_history(&history, Window::from_secs(10), ScaleMode::Window, 10_001);
+    let first_sample = model
+        .temp_history
+        .iter()
+        .position(|value| value.is_finite())
+        .expect("recorded telemetry sample");
+    assert!(first_sample > 0);
+    assert!(
+        model.temp_history[..first_sample]
+            .iter()
+            .all(|value| value.is_nan())
+    );
+    assert!(
+        model.temp_history[first_sample..]
+            .iter()
+            .all(|value| value.is_finite())
+    );
+    assert!(
+        model.temp_history[first_sample..]
+            .windows(2)
+            .any(|pair| pair[0] == pair[1])
     );
 }
 
@@ -894,6 +1058,9 @@ fn amd_cards_keep_first_available_cores_and_gpu_readings() {
 fn cores_panel_is_absent_without_core_temperatures() {
     let mut frame = fixture();
     frame.parts.amd_smu.cards.clear();
+    frame.health[CollectorId::AmdSmu.index()] = thegn_metrics::collect::health::Health::Absent(
+        thegn_metrics::collect::health::Absent::NoHardware,
+    );
     if let Some(layout) = frame.parts.hwmon.layout.as_deref() {
         let retained = layout
             .sensors
