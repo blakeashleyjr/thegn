@@ -1,26 +1,37 @@
 use super::{EffectiveState, PowerModel};
+use crate::caps::{self, Glyph};
 use crate::{compositor::Rect, monitor::kit::grid::CellGrid};
+use thegn_metrics::collect::health::{Absent, Health};
 
 fn style() -> crate::monitor::kit::grid::CellStyle {
     crate::monitor::kit::grid::CellStyle::default()
 }
-fn absent() -> String {
-    crate::caps::active_glyphs().emdash.to_owned()
+fn mark(health: Health) -> &'static str {
+    match health {
+        Health::Warming => caps::active_glyphs().ellipsis,
+        Health::Absent(Absent::NoPermission) => caps::glyph(Glyph::Lock),
+        Health::Absent(_) | Health::Failing { .. } | Health::Ok => caps::active_glyphs().emdash,
+    }
 }
 fn put_line(grid: &mut CellGrid, rect: Rect, row: usize, text: &str) {
     grid.view(rect).put_str(0, row, text, style());
 }
 pub(super) fn paint_battery(grid: &mut CellGrid, rect: Rect, model: &PowerModel) {
     if model.batteries.is_empty() {
-        put_line(grid, rect, 0, &format!("battery {}", absent()));
+        put_line(
+            grid,
+            rect,
+            0,
+            &format!("battery {}", mark(model.power_supply_health)),
+        );
         return;
     }
     for (index, battery) in model.batteries.iter().take(rect.rows / 2).enumerate() {
         let capacity = battery
             .capacity
             .map(|v| format!("{v}%"))
-            .unwrap_or_else(absent);
-        let state = match model.state {
+            .unwrap_or_else(|| mark(model.power_supply_health).to_owned());
+        let state = match battery.state {
             Some(EffectiveState::Charging) => "charging",
             Some(EffectiveState::Discharging) => "discharging",
             Some(EffectiveState::Held) => "held",
@@ -39,7 +50,7 @@ pub(super) fn paint_battery(grid: &mut CellGrid, rect: Rect, model: &PowerModel)
                 .now_wh
                 .zip(battery.full_wh)
                 .map(|(a, b)| format!("{a:.1}/{b:.1} Wh"))
-                .unwrap_or_else(absent);
+                .unwrap_or_else(|| mark(model.power_supply_health).to_owned());
             put_line(
                 grid,
                 rect,
@@ -51,8 +62,11 @@ pub(super) fn paint_battery(grid: &mut CellGrid, rect: Rect, model: &PowerModel)
                         .zip(battery.design_wh)
                         .filter(|(_, d)| *d > 0.0)
                         .map(|(a, b)| format!("{:.1}%", a / b * 100.0))
-                        .unwrap_or_else(absent),
-                    battery.cycles.map(|v| v.to_string()).unwrap_or_else(absent)
+                        .unwrap_or_else(|| mark(model.power_supply_health).to_owned()),
+                    battery
+                        .cycles
+                        .map(|v| v.to_string())
+                        .unwrap_or_else(|| mark(model.power_supply_health).to_owned())
                 ),
             );
         }
@@ -68,11 +82,11 @@ pub(super) fn paint_battery(grid: &mut CellGrid, rect: Rect, model: &PowerModel)
                 model
                     .battery_w
                     .map(|v| format!("{v:.2}W"))
-                    .unwrap_or_else(absent),
+                    .unwrap_or_else(|| mark(model.power_supply_health).to_owned()),
                 model
                     .eta_hours
                     .map(|v| format!("{v:.1}h"))
-                    .unwrap_or_else(absent)
+                    .unwrap_or_else(|| mark(model.power_supply_health).to_owned())
             ),
         );
     }
@@ -89,7 +103,7 @@ pub(super) fn paint_battery(grid: &mut CellGrid, rect: Rect, model: &PowerModel)
                         .online
                         .map(|v| if v { "online" } else { "offline" })
                         .map(str::to_owned)
-                        .unwrap_or_else(absent)
+                        .unwrap_or_else(|| mark(model.power_supply_health).to_owned())
                 ),
             );
         }
@@ -105,6 +119,18 @@ pub(super) fn paint_rails(grid: &mut CellGrid, rect: Rect, model: &PowerModel) {
         ("battery", model.battery_w),
     ];
     let mut row = rect.rows.saturating_sub(11);
+    if matches!(model.powercap_health, Health::Absent(Absent::NoPermission)) {
+        put_line(
+            grid,
+            rect,
+            row,
+            &format!("{} RAPL root-only", caps::glyph(Glyph::Lock)),
+        );
+        row += 1;
+    } else if model.powercap_health == Health::Warming {
+        put_line(grid, rect, row, caps::active_glyphs().ellipsis);
+        row += 1;
+    }
     for (label, value) in values {
         if row >= rect.rows {
             break;
@@ -115,7 +141,21 @@ pub(super) fn paint_rails(grid: &mut CellGrid, rect: Rect, model: &PowerModel) {
             row,
             &format!(
                 "{label:8} {}",
-                value.map(|v| format!("{v:.2} W")).unwrap_or_else(absent)
+                value.map(|v| format!("{v:.2} W")).unwrap_or_else(|| {
+                    mark(
+                        if label == "socket"
+                            || label == "APU"
+                            || label == "core"
+                            || label == "gfx"
+                            || label == "system"
+                        {
+                            model.amd_smu_health
+                        } else {
+                            model.power_supply_health
+                        },
+                    )
+                    .to_owned()
+                })
             ),
         );
         row += 1;
@@ -130,7 +170,7 @@ pub(super) fn paint_rails(grid: &mut CellGrid, rect: Rect, model: &PowerModel) {
                 zone.name,
                 zone.watts
                     .map(|v| format!("{v:.2} W"))
-                    .unwrap_or_else(absent)
+                    .unwrap_or_else(|| mark(model.powercap_health).to_owned())
             ),
         );
         row += 1;
@@ -140,7 +180,22 @@ pub(super) fn paint_rails(grid: &mut CellGrid, rect: Rect, model: &PowerModel) {
             grid,
             rect,
             row,
-            &format!("session {:.3} Wh", model.session.energy_wh()),
+            &if model.session_started {
+                format!("session {:.3} Wh", model.session.energy_wh())
+            } else {
+                format!(
+                    "session {}",
+                    mark(
+                        if model.power_supply_health == Health::Warming
+                            || model.powercap_health == Health::Warming
+                        {
+                            Health::Warming
+                        } else {
+                            model.power_supply_health
+                        }
+                    )
+                )
+            },
         );
     }
 }
@@ -148,9 +203,8 @@ pub(super) fn paint_policy(grid: &mut CellGrid, rect: Rect, model: &PowerModel) 
     let profile = model
         .policy
         .platform_profile
-        .map(|v| v.as_str())
-        .map(str::to_owned)
-        .unwrap_or_else(absent);
+        .map(|v| v.as_str().to_owned())
+        .unwrap_or_else(|| mark(model.cpu_freq_health).to_owned());
     put_line(
         grid,
         rect,
@@ -160,13 +214,13 @@ pub(super) fn paint_policy(grid: &mut CellGrid, rect: Rect, model: &PowerModel) 
             model
                 .policy
                 .boost
-                .map(|v| if v { "on" } else { "off" })
-                .unwrap_or_else(absent),
+                .map(|v| (if v { "on" } else { "off" }).to_owned())
+                .unwrap_or_else(|| mark(model.cpu_freq_health).to_owned()),
             model
                 .policy
                 .amd_pstate_status
                 .map(|v| v.as_str().to_owned())
-                .unwrap_or_else(absent)
+                .unwrap_or_else(|| mark(model.cpu_freq_health).to_owned())
         ),
     );
     for (row, policy) in model
@@ -185,15 +239,15 @@ pub(super) fn paint_policy(grid: &mut CellGrid, rect: Rect, model: &PowerModel) 
                 policy
                     .driver
                     .map(|v| v.as_str().to_owned())
-                    .unwrap_or_else(absent),
+                    .unwrap_or_else(|| mark(model.cpu_freq_health).to_owned()),
                 policy
                     .governor
                     .map(|v| v.as_str().to_owned())
-                    .unwrap_or_else(absent),
+                    .unwrap_or_else(|| mark(model.cpu_freq_health).to_owned()),
                 policy
                     .epp
                     .map(|v| v.as_str().to_owned())
-                    .unwrap_or_else(absent)
+                    .unwrap_or_else(|| mark(model.cpu_freq_health).to_owned())
             ),
         );
     }

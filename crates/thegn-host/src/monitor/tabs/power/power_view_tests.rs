@@ -13,6 +13,7 @@ use thegn_core::termcaps::{ColorDepth, UnicodeLevel};
 use thegn_metrics::collect::{
     CollectorId, CollectorSet,
     frame::MonitorFrame,
+    health::{Absent, Health},
     model::{
         amd_smu::{AmdSmuCard, AmdSmuStatus},
         cpu_policy::{CpuPolicy, SysToken},
@@ -123,12 +124,24 @@ fn fill_ratio(surface: &Surface, area: Rect) -> f32 {
 fn absorb_frame_derives_battery_sign_rails_and_profile_from_fixture() {
     let mut model = PowerModel::default();
     let mut frame = fixture();
+    let mut second_battery = frame.parts.power_supply.supplies[0].clone();
+    second_battery.name = Arc::from("BAT2");
+    second_battery.status = Some(SupplyStatus::Charging);
+    frame.parts.power_supply.supplies.push(second_battery);
     model.absorb_frame(&frame);
     assert_eq!(model.batteries[0].capacity, Some(73));
+    assert_eq!(
+        model.batteries[0].state,
+        Some(super::EffectiveState::Discharging)
+    );
+    assert_eq!(
+        model.batteries[1].state,
+        Some(super::EffectiveState::Charging)
+    );
     assert_eq!(model.battery_w, Some(-14.0));
     assert_eq!(model.socket_w, Some(17.4));
     assert_eq!(
-        model.cpu_policy[0].epp.map(|token| token.as_str()),
+        model.cpu_policy[0].epp.as_ref().map(SysToken::as_str),
         Some("balance_perf")
     );
     frame.at_ms += 1_000;
@@ -138,6 +151,7 @@ fn absorb_frame_derives_battery_sign_rails_and_profile_from_fixture() {
     frame.parts.amd_smu.cards[0].metrics.power_socket = Some(u32::MAX);
     model.absorb_frame(&frame);
     assert_eq!(model.socket_w, Some(18.0));
+    assert!((super::metric_watts(Some(65_535)).unwrap() - 65.535).abs() < 0.001);
 }
 
 #[test]
@@ -180,7 +194,7 @@ fn snapshot_sizes_capabilities_demand_and_absent_marks() {
                     }
                     assert_eq!(board.demand(&view, area, 1000).collectors, expected);
                     if cols == 240 && unicode == UnicodeLevel::Ascii {
-                        // ASCII columns are a one-cell-per-sample line; follow-up: a capability-aware dense history treatment.
+                        // ASCII graph glyphs are capability-limited; follow-up THE-888 tracks a denser ASCII history treatment.
                         assert!(
                             fill_ratio(&surface, area) >= 0.08,
                             "ASCII fill {:.3}",
@@ -205,6 +219,7 @@ fn snapshot_sizes_capabilities_demand_and_absent_marks() {
     let output = text(&mut surface);
     assert!(output.contains(caps::active_glyphs().emdash));
     assert!(!output.contains("0.00 W"));
+    assert!(!output.contains("session 0.000"));
 }
 
 #[test]
@@ -235,25 +250,77 @@ fn demand_is_static_for_each_panel_and_history_reuses_capacity_after_warmup() {
     );
     assert_eq!(model.history.len(), super::HISTORY_CAP);
     let view = PowerView(&model);
-    assert!(
-        view.demand(PanelId("power.battery"))
-            .contains(CollectorId::PowerSupply)
+    let battery: CollectorSet = [CollectorId::PowerSupply].into_iter().collect();
+    let rails: CollectorSet = [
+        CollectorId::PowerSupply,
+        CollectorId::Powercap,
+        CollectorId::AmdSmu,
+    ]
+    .into_iter()
+    .collect();
+    let policy: CollectorSet = [CollectorId::CpuFreq].into_iter().collect();
+    assert_eq!(view.demand(PanelId("power.battery")), battery);
+    assert_eq!(view.demand(PanelId("power.rails")), rails);
+    assert_eq!(view.demand(PanelId("power.policy")), policy);
+    let union: CollectorSet = [
+        CollectorId::PowerSupply,
+        CollectorId::Powercap,
+        CollectorId::AmdSmu,
+        CollectorId::CpuFreq,
+    ]
+    .into_iter()
+    .collect();
+    assert_eq!(
+        union,
+        [battery, rails, policy]
+            .into_iter()
+            .fold(CollectorSet::empty(), |mut all, set| {
+                for id in set.iter() {
+                    all.insert(id);
+                }
+                all
+            })
     );
-    assert!(
-        view.demand(PanelId("power.rails"))
-            .contains(CollectorId::Powercap)
+    assert_eq!(
+        Board::default()
+            .demand(&view, Rect::full(100, 30), 1000)
+            .collectors,
+        union
     );
-    assert!(
-        view.demand(PanelId("power.policy"))
-            .contains(CollectorId::CpuFreq)
-    );
-    let empty_model = PowerModel::default();
-    let empty_view = PowerView(&empty_model);
-    for panel in ["power.battery", "power.rails", "power.policy"] {
-        assert_eq!(
-            view.demand(PanelId(panel)),
-            empty_view.demand(PanelId(panel))
-        );
-    }
+}
+
+#[test]
+fn power_health_is_copied_and_renders_warming_and_permission_denied_marks() {
+    let mut frame = fixture();
+    frame.health[CollectorId::PowerSupply.index()] = Health::Warming;
+    frame.health[CollectorId::Powercap.index()] = Health::Absent(Absent::NoPermission);
+    frame.health[CollectorId::AmdSmu.index()] = Health::Absent(Absent::NoHardware);
+    frame.health[CollectorId::CpuFreq.index()] = Health::Warming;
+    let mut model = PowerModel::default();
+    model.absorb_frame(&frame);
+    assert_eq!(model.power_supply_health, Health::Warming);
+    assert_eq!(model.powercap_health, Health::Absent(Absent::NoPermission));
+    assert_eq!(model.amd_smu_health, Health::Absent(Absent::NoHardware));
+    assert_eq!(model.cpu_freq_health, Health::Warming);
+    model.zones.clear();
+    model.socket_w = None;
+    let view = PowerView(&model);
+    let mut surface = Surface::new(100, 30);
+    Board::default().paint(&view, &mut surface, Rect::full(100, 30), 0, &[]);
+    let output = text(&mut surface);
+    assert!(output.contains("RAPL root-only"));
+    assert!(output.contains(caps::active_glyphs().ellipsis));
+    assert!(!output.contains("session 0.000"));
+}
+
+#[test]
+fn empty_warming_frame_renders_ellipsis_for_unavailable_values() {
+    let frame = MonitorFrame::default();
+    let mut model = PowerModel::default();
+    model.absorb_frame(&frame);
+    let view = PowerView(&model);
+    let mut surface = Surface::new(100, 30);
+    Board::default().paint(&view, &mut surface, Rect::full(100, 30), 0, &[]);
+    assert!(text(&mut surface).contains(caps::active_glyphs().ellipsis));
 }
 const HISTORY_SEED: usize = 120;
