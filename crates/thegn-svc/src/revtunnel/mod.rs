@@ -228,13 +228,14 @@ async fn abort_tasks(tasks: &ConnectionTasks) {
     while tasks.join_next().await.is_some() {}
 }
 
-async fn stop_sink(task: JoinHandle<()>) -> io::Result<()> {
+async fn stop_sink(task: JoinHandle<io::Result<()>>) -> io::Result<()> {
     // Once the read side has hit EOF, queued frames (including final Close
     // frames) are intentionally discarded. Waiting for the sink to drain here
     // could hang forever if the peer stopped reading at tunnel end.
     task.abort();
     match task.await {
-        Ok(()) => Ok(()),
+        Ok(Err(error)) if peer_disconnect_error(&error) => Ok(()),
+        Ok(result) => result,
         Err(error) if error.is_cancelled() => Ok(()),
         Err(error) => Err(io::Error::other(format!(
             "reverse-tunnel sink task: {error}"
@@ -242,27 +243,40 @@ async fn stop_sink(task: JoinHandle<()>) -> io::Result<()> {
     }
 }
 
-async fn supervise_sink<F>(read_loop: F, sink_task: &mut JoinHandle<()>) -> (io::Result<()>, bool)
+async fn supervise_sink<F>(
+    read_loop: F,
+    sink_task: &mut JoinHandle<io::Result<()>>,
+) -> (io::Result<()>, bool)
 where
     F: std::future::Future<Output = io::Result<()>>,
 {
     tokio::pin!(read_loop);
     tokio::select! {
         result = &mut read_loop => (result, false),
-        _ = sink_task => {
-            // A peer close can make a queued sink write fail just before the
-            // read half observes EOF. Give that read one poll before reporting
-            // a sink failure; do not prioritize it indefinitely over writes.
-            tokio::select! {
-                biased;
-                result = &mut read_loop => (result, false),
-                _ = tokio::task::yield_now() => (
+        sink_result = sink_task => {
+            // The peer may stop reading before the read half has drained
+            // buffered frames and observed EOF. On transport-close errors,
+            // let that read finish so a peer disconnect remains a clean end.
+            if matches!(sink_result, Ok(Err(ref error)) if peer_disconnect_error(error)) {
+                (read_loop.await, true)
+            } else {
+                (
                     Err(io::Error::new(io::ErrorKind::BrokenPipe, "reverse-tunnel shared sink stopped")),
                     true,
-                ),
+                )
             }
         }
     }
+}
+
+fn peer_disconnect_error(error: &io::Error) -> bool {
+    matches!(
+        error.kind(),
+        io::ErrorKind::BrokenPipe
+            | io::ErrorKind::ConnectionAborted
+            | io::ErrorKind::ConnectionReset
+            | io::ErrorKind::UnexpectedEof
+    )
 }
 
 /// Any bidirectional async stream usable as a tunneled connection (a real
@@ -377,14 +391,16 @@ fn decode_err(e: thegn_core::revtunnel::DecodeError) -> io::Error {
 /// task) onto the shared stream write half. Returns the frame sink. The sink is
 /// **bounded** ([`CHANNEL_DEPTH`]) so a producer outracing the stream write
 /// blocks on `send().await` instead of queueing unboundedly (see the constant).
-fn spawn_sink<W: AsyncWrite + Unpin + Send + 'static>(wr: W) -> (Sender<Vec<u8>>, JoinHandle<()>) {
+fn spawn_sink<W: AsyncWrite + Unpin + Send + 'static>(
+    wr: W,
+) -> (Sender<Vec<u8>>, JoinHandle<io::Result<()>>) {
     spawn_sink_with_timeout(wr, WRITE_STALL_TIMEOUT)
 }
 
 fn spawn_sink_with_timeout<W: AsyncWrite + Unpin + Send + 'static>(
     mut wr: W,
     write_timeout: Duration,
-) -> (Sender<Vec<u8>>, JoinHandle<()>) {
+) -> (Sender<Vec<u8>>, JoinHandle<io::Result<()>>) {
     let (tx, mut rx) = channel::<Vec<u8>>(CHANNEL_DEPTH);
     let task = tokio::spawn(async move {
         while let Some(bytes) = rx.recv().await {
@@ -397,14 +413,18 @@ fn spawn_sink_with_timeout<W: AsyncWrite + Unpin + Send + 'static>(
                 Ok(Ok(())) => {}
                 Ok(Err(error)) => {
                     tracing::warn!(target: "thegn::revtunnel", %error, "reverse-tunnel shared sink failed");
-                    break;
+                    return Err(error);
                 }
                 Err(_) => {
                     report_global_rejection("tunnel", RejectionReason::WriteStall);
-                    break;
+                    return Err(io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        "reverse-tunnel shared sink write stalled",
+                    ));
                 }
             }
         }
+        Ok(())
     });
     (tx, task)
 }
