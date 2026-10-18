@@ -1,5 +1,6 @@
 //! Filesystem usage reader. Keep tmpfs under /tmp, /dev/shm and /run/user because
 //! those mounts can hold user data; omit other pseudo mounts and container overlays.
+//! Btrfs `bytes_used` is deferred; unallocated space uses device size minus `disk_total`.
 use std::fs::File;
 use std::io::{self, Read, Seek, SeekFrom};
 use std::os::fd::AsRawFd;
@@ -35,16 +36,22 @@ pub trait FilesystemIo: Send {
     fn read_mountinfo(&mut self) -> io::Result<String>;
     fn statvfs(&mut self, mount: &Path) -> io::Result<StatvfsData>;
     fn list(&mut self, path: &Path) -> io::Result<Vec<PathBuf>>;
-    fn read_text(&mut self, path: &Path) -> io::Result<String>;
     fn canonicalize(&mut self, path: &Path) -> io::Result<PathBuf>;
+    fn clear_btrfs_files(&mut self);
+    fn open_btrfs_file(&mut self, path: &Path) -> io::Result<usize>;
+    fn read_btrfs_file(&mut self, handle: usize, buffer: &mut [u8]) -> io::Result<usize>;
 }
 
 pub struct RealFilesystemIo {
     mountinfo: Option<File>,
+    btrfs_files: Vec<File>,
 }
 impl RealFilesystemIo {
     fn new() -> Self {
-        Self { mountinfo: None }
+        Self {
+            mountinfo: None,
+            btrfs_files: Vec::new(),
+        }
     }
 }
 impl FilesystemIo for RealFilesystemIo {
@@ -82,13 +89,13 @@ impl FilesystemIo for RealFilesystemIo {
     fn statvfs(&mut self, mount: &Path) -> io::Result<StatvfsData> {
         let stats = nix::sys::statvfs::statvfs(mount).map_err(io::Error::from)?;
         Ok(StatvfsData {
-            blocks: stats.blocks() as u64,
-            blocks_free: stats.blocks_free() as u64,
-            blocks_available: stats.blocks_available() as u64,
-            fragment_size: stats.fragment_size() as u64,
-            files: stats.files() as u64,
-            files_free: stats.files_free() as u64,
-            files_available: stats.files_available() as u64,
+            blocks: stats.blocks(),
+            blocks_free: stats.blocks_free(),
+            blocks_available: stats.blocks_available(),
+            fragment_size: stats.fragment_size(),
+            files: stats.files(),
+            files_free: stats.files_free(),
+            files_available: stats.files_available(),
         })
     }
     fn list(&mut self, path: &Path) -> io::Result<Vec<PathBuf>> {
@@ -96,11 +103,37 @@ impl FilesystemIo for RealFilesystemIo {
             .map(|entry| entry.map(|entry| entry.path()))
             .collect()
     }
-    fn read_text(&mut self, path: &Path) -> io::Result<String> {
-        std::fs::read_to_string(path)
-    }
     fn canonicalize(&mut self, path: &Path) -> io::Result<PathBuf> {
         std::fs::canonicalize(path)
+    }
+    fn clear_btrfs_files(&mut self) {
+        self.btrfs_files.clear();
+    }
+    fn open_btrfs_file(&mut self, path: &Path) -> io::Result<usize> {
+        let file = File::open(path)?;
+        let handle = self.btrfs_files.len();
+        self.btrfs_files.push(file);
+        Ok(handle)
+    }
+    fn read_btrfs_file(&mut self, handle: usize, buffer: &mut [u8]) -> io::Result<usize> {
+        let file = self
+            .btrfs_files
+            .get(handle)
+            .ok_or_else(|| io::Error::from(io::ErrorKind::NotFound))?;
+        // SAFETY: the buffer is writable for its length and the held fd remains open.
+        let count = unsafe {
+            libc::pread(
+                file.as_raw_fd(),
+                buffer.as_mut_ptr().cast(),
+                buffer.len(),
+                0,
+            )
+        };
+        if count < 0 {
+            Err(io::Error::last_os_error())
+        } else {
+            Ok(count as usize)
+        }
     }
 }
 
@@ -108,7 +141,23 @@ impl FilesystemIo for RealFilesystemIo {
 struct DiscoveredRow {
     row: FilesystemRow,
     mount_path: PathBuf,
-    btrfs_uuid: Option<String>,
+    btrfs_index: Option<usize>,
+}
+
+struct BtrfsFs {
+    uuid_path: PathBuf,
+    allocation_handles: [Option<usize>; 3],
+    device_handles: Vec<Option<usize>>,
+}
+
+#[derive(PartialEq, Eq)]
+struct FilesystemIdentity {
+    mount_point: String,
+    fstype: String,
+    source: String,
+    superblock_dev: String,
+    kind: FilesystemKind,
+    read_only: bool,
 }
 
 pub struct FilesystemsCollector<F: FilesystemIo = RealFilesystemIo> {
@@ -116,9 +165,12 @@ pub struct FilesystemsCollector<F: FilesystemIo = RealFilesystemIo> {
     mountinfo_path: PathBuf,
     sys_fs_btrfs: PathBuf,
     rows: Vec<DiscoveredRow>,
+    btrfs: Vec<BtrfsFs>,
     truncated: bool,
     opened: bool,
-    last_read_ms: u64,
+    last_read_ms: Option<u64>,
+    generation: u64,
+    published_generation: u64,
 }
 
 impl FilesystemsCollector<RealFilesystemIo> {
@@ -141,13 +193,16 @@ impl<F: FilesystemIo> FilesystemsCollector<F> {
             mountinfo_path: mountinfo.into(),
             sys_fs_btrfs: sys_fs_btrfs.into(),
             rows: Vec::new(),
+            btrfs: Vec::new(),
             truncated: false,
             opened: false,
-            last_read_ms: 0,
+            last_read_ms: None,
+            generation: 0,
+            published_generation: u64::MAX,
         }
     }
 
-    fn discover_rows(&mut self, now_ms: u64) -> Health {
+    fn discover_rows(&mut self, now_ms: Option<u64>) -> Health {
         if !self.opened {
             if self.io.open_mountinfo(&self.mountinfo_path).is_err() {
                 return Health::Absent(Absent::NoHardware);
@@ -157,14 +212,21 @@ impl<F: FilesystemIo> FilesystemsCollector<F> {
         let Ok(text) = self.io.read_mountinfo() else {
             return Health::Absent(Absent::NoHardware);
         };
+        let previous_identity = self
+            .rows
+            .iter()
+            .map(|row| row_identity(&row.row))
+            .collect::<Vec<_>>();
         self.rows.clear();
+        self.btrfs.clear();
+        self.io.clear_btrfs_files();
         self.truncated = false;
         let mut unique_count = 0;
         for line in text.lines() {
             let Some(parsed) = parse_line(line.as_bytes()) else {
                 continue;
             };
-            let Some((row, mount_path, btrfs_uuid)) = self.make_row(parsed) else {
+            let Some((mut row, mount_path)) = self.make_row(parsed) else {
                 continue;
             };
             if self
@@ -176,14 +238,28 @@ impl<F: FilesystemIo> FilesystemsCollector<F> {
             }
             unique_count += 1;
             if self.rows.len() < ROW_CAP {
+                let btrfs_index = if row.fstype == "btrfs" {
+                    self.btrfs_index(&row.source)
+                } else {
+                    None
+                };
+                row.btrfs_unallocated = None;
                 self.rows.push(DiscoveredRow {
                     row,
                     mount_path,
-                    btrfs_uuid,
+                    btrfs_index,
                 });
             }
         }
         self.truncated = unique_count > ROW_CAP;
+        let next_identity = self
+            .rows
+            .iter()
+            .map(|row| row_identity(&row.row))
+            .collect::<Vec<_>>();
+        if previous_identity != next_identity {
+            self.generation = self.generation.wrapping_add(1);
+        }
         self.last_read_ms = now_ms;
         if self.rows.is_empty() {
             Health::Absent(Absent::NoHardware)
@@ -192,10 +268,7 @@ impl<F: FilesystemIo> FilesystemsCollector<F> {
         }
     }
 
-    fn make_row(
-        &mut self,
-        parsed: MountLine<'_>,
-    ) -> Option<(FilesystemRow, PathBuf, Option<String>)> {
+    fn make_row(&mut self, parsed: MountLine<'_>) -> Option<(FilesystemRow, PathBuf)> {
         let fstype = String::from_utf8_lossy(parsed.fstype).into_owned();
         let mut mount_bytes = Vec::with_capacity(parsed.mount_point.len());
         unescape_into(parsed.mount_point, &mut mount_bytes);
@@ -205,11 +278,6 @@ impl<F: FilesystemIo> FilesystemsCollector<F> {
         let source = String::from_utf8_lossy(&source_bytes).into_owned();
         let kind = filesystem_kind(&fstype, &mount_point)?;
         let superblock_dev = format!("{}:{}", parsed.major, parsed.minor);
-        let btrfs_uuid = if fstype == "btrfs" {
-            self.btrfs_uuid(&superblock_dev)
-        } else {
-            None
-        };
         let read_only = parsed
             .options
             .split(|byte| *byte == b',')
@@ -231,17 +299,15 @@ impl<F: FilesystemIo> FilesystemsCollector<F> {
                 read_only,
             },
             PathBuf::from(mount_point),
-            btrfs_uuid,
         ))
     }
 
-    fn btrfs_uuid(&mut self, dev: &str) -> Option<String> {
+    fn btrfs_index(&mut self, source: &str) -> Option<usize> {
         let entries = match self.io.list(&self.sys_fs_btrfs) {
             Ok(entries) => entries,
             Err(_) => return None,
         };
-        let sys_root = self.sys_fs_btrfs.parent()?.parent()?;
-        let block_device = match self.io.canonicalize(&sys_root.join("dev/block").join(dev)) {
+        let block_device = match self.io.canonicalize(Path::new(source)) {
             Ok(path) => path,
             Err(_) => return None,
         };
@@ -253,9 +319,33 @@ impl<F: FilesystemIo> FilesystemsCollector<F> {
             };
             for device_path in device_paths {
                 if device_path.file_name() == Some(block_name) {
-                    return uuid_path
-                        .file_name()
-                        .map(|name| name.to_string_lossy().into_owned());
+                    if let Some(index) = self
+                        .btrfs
+                        .iter()
+                        .position(|filesystem| filesystem.uuid_path == uuid_path)
+                    {
+                        return Some(index);
+                    }
+                    let allocation = uuid_path.join("allocation");
+                    let allocation_handles = ["data", "metadata", "system"].map(|class| {
+                        self.io
+                            .open_btrfs_file(&allocation.join(class).join("disk_total"))
+                            .ok()
+                    });
+                    let device_handles = self
+                        .io
+                        .list(&devices)
+                        .ok()?
+                        .into_iter()
+                        .map(|path| self.io.open_btrfs_file(&path.join("size")).ok())
+                        .collect();
+                    let index = self.btrfs.len();
+                    self.btrfs.push(BtrfsFs {
+                        uuid_path,
+                        allocation_handles,
+                        device_handles,
+                    });
+                    return Some(index);
                 }
             }
         }
@@ -263,12 +353,16 @@ impl<F: FilesystemIo> FilesystemsCollector<F> {
     }
 
     fn refresh_if_needed(&mut self, now_ms: u64) {
-        let changed = match self.io.mountinfo_changed() {
-            Ok(changed) => changed,
-            Err(_) => false,
-        };
-        if changed || now_ms.saturating_sub(self.last_read_ms) >= REREAD_MS {
-            self.discover_rows(now_ms);
+        let changed = self.io.mountinfo_changed().unwrap_or_default();
+        match self.last_read_ms {
+            None if changed => {
+                self.discover_rows(Some(now_ms));
+            }
+            None => self.last_read_ms = Some(now_ms),
+            Some(last) if changed || now_ms.saturating_sub(last) >= REREAD_MS => {
+                self.discover_rows(Some(now_ms));
+            }
+            Some(_) => {}
         }
     }
 
@@ -293,50 +387,49 @@ impl<F: FilesystemIo> FilesystemsCollector<F> {
         row.btrfs_unallocated = None;
     }
 
+    fn read_u64(&mut self, handle: usize) -> Option<u64> {
+        let mut buffer = [0_u8; 64];
+        let count = self.io.read_btrfs_file(handle, &mut buffer).ok()?;
+        std::str::from_utf8(&buffer[..count])
+            .ok()?
+            .trim()
+            .parse()
+            .ok()
+    }
+
     fn sample_btrfs(&mut self) {
-        for index in 0..self.rows.len() {
-            let Some(uuid) = self.rows[index].btrfs_uuid.clone() else {
-                continue;
-            };
-            if self.rows[..index]
-                .iter()
-                .any(|row| row.btrfs_uuid.as_deref() == Some(uuid.as_str()))
-            {
-                continue;
-            }
-            let allocation = self.sys_fs_btrfs.join(&uuid).join("allocation");
+        for btrfs_index in 0..self.btrfs.len() {
+            let allocation_handles = self.btrfs[btrfs_index].allocation_handles;
+            let device_count = self.btrfs[btrfs_index].device_handles.len();
             let mut allocated = Some(0_u64);
-            for class in ["data", "metadata", "system"] {
-                let path = allocation.join(class);
-                let total = self.io.read_text(&path.join("total_bytes"));
-                let Ok(total) = total else {
-                    allocated = None;
-                    break;
-                };
-                let Ok(total) = total.trim().parse::<u64>() else {
-                    allocated = None;
-                    break;
-                };
-                allocated = allocated.and_then(|sum| sum.checked_add(total));
+            for handle in allocation_handles.into_iter().flatten() {
+                allocated = allocated.and_then(|sum| {
+                    self.read_u64(handle)
+                        .and_then(|value| sum.checked_add(value))
+                });
             }
-            let device_total = match self.io.list(&self.sys_fs_btrfs.join(&uuid).join("devices")) {
-                Ok(devices) => devices.into_iter().try_fold(0_u64, |sum, device| {
-                    let size = match self.io.read_text(&device.join("size")) {
-                        Ok(size) => size,
-                        Err(_) => return None,
-                    };
-                    let Ok(size) = size.trim().parse::<u64>() else {
-                        return None;
-                    };
-                    sum.checked_add(size.checked_mul(512)?)
-                }),
-                Err(_) => None,
-            };
+            if allocation_handles.iter().any(Option::is_none) {
+                allocated = None;
+            }
+            let mut device_total = Some(0_u64);
+            for device_index in 0..device_count {
+                let handle = self.btrfs[btrfs_index].device_handles[device_index];
+                let Some(handle) = handle else {
+                    device_total = None;
+                    break;
+                };
+                device_total = device_total.and_then(|sum| {
+                    self.read_u64(handle).and_then(|size| {
+                        size.checked_mul(512)
+                            .and_then(|bytes| sum.checked_add(bytes))
+                    })
+                });
+            }
             let unallocated = device_total
                 .zip(allocated)
                 .and_then(|(total, used)| total.checked_sub(used));
             for row in &mut self.rows {
-                if row.btrfs_uuid.as_deref() == Some(uuid.as_str()) {
+                if row.btrfs_index == Some(btrfs_index) {
                     row.row.btrfs_unallocated = unallocated;
                 }
             }
@@ -352,40 +445,72 @@ impl<F: FilesystemIo> Collector for FilesystemsCollector<F> {
         Cadence::Every(5)
     }
     fn discover(&mut self, _env: &Env) -> Health {
-        self.discover_rows(0)
+        self.discover_rows(None)
     }
     fn sample(&mut self, ctx: &TickCtx, frame: &mut MonitorFrame) -> Result<(), CollectError> {
         self.refresh_if_needed(ctx.now_ms);
         for index in 0..self.rows.len() {
-            if self.rows[index].row.kind == FilesystemKind::Local {
+            if self.rows[index].row.kind != FilesystemKind::Network {
                 self.sample_row(index);
             }
         }
         self.sample_btrfs();
         let part: &mut FilesystemsPart = &mut frame.parts.filesystems;
         part.truncated = self.truncated;
-        for (index, discovered) in self.rows.iter().enumerate() {
-            if index < part.rows.len() {
-                part.rows[index].clone_from(&discovered.row);
-            } else {
-                part.rows.push(discovered.row.clone());
+        if self.generation != self.published_generation
+            || part.rows.len() != self.rows.len()
+            || part
+                .rows
+                .iter()
+                .zip(&self.rows)
+                .any(|(published, discovered)| !same_row_identity(published, &discovered.row))
+        {
+            part.rows.clear();
+            part.rows
+                .extend(self.rows.iter().map(|discovered| discovered.row.clone()));
+            self.published_generation = self.generation;
+        } else {
+            for (published, discovered) in part.rows.iter_mut().zip(&self.rows) {
+                copy_numeric(published, &discovered.row);
             }
         }
-        part.rows.truncate(self.rows.len());
         frame.sampled.insert(CollectorId::Filesystems);
         Ok(())
     }
     fn close(&mut self) {
         self.opened = false;
         self.rows.clear();
+        self.btrfs.clear();
+        self.io.clear_btrfs_files();
+        self.last_read_ms = None;
+        self.published_generation = self.generation.wrapping_sub(1);
     }
 }
 
 fn filesystem_kind(fstype: &str, mount: &str) -> Option<FilesystemKind> {
+    if fstype == "fuse.lxcfs" {
+        return None;
+    }
     if matches!(
         fstype,
-        "nfs" | "nfs4" | "cifs" | "smb3" | "sshfs" | "fuse.sshfs" | "9p"
-    ) {
+        "nfs"
+            | "nfs4"
+            | "cifs"
+            | "smb"
+            | "smbfs"
+            | "smb3"
+            | "sshfs"
+            | "9p"
+            | "ceph"
+            | "glusterfs"
+            | "afs"
+            | "lustre"
+            | "gpfs"
+            | "davfs"
+    ) || fstype == "fuse"
+        || fstype == "fuseblk"
+        || fstype.starts_with("fuse.")
+    {
         return Some(FilesystemKind::Network);
     }
     if (fstype == "tmpfs" || fstype == "devtmpfs")
@@ -411,13 +536,21 @@ fn filesystem_kind(fstype: &str, mount: &str) -> Option<FilesystemKind> {
             | "hugetlbfs"
             | "configfs"
             | "fusectl"
+            | "nsfs"
+            | "efivarfs"
+            | "squashfs"
+            | "selinuxfs"
+            | "rpc_pipefs"
+            | "nfsd"
             | "autofs"
             | "binfmt_misc"
             | "rootfs"
             | "devpts"
             | "ramfs"
     ) || (fstype == "overlay"
-        && (mount == "/var/lib/containers" || mount.starts_with("/var/lib/containers/")))
+        && (mount == "/var/lib/containers"
+            || mount.starts_with("/var/lib/containers/")
+            || mount.contains("/containers/storage/")))
     {
         return None;
     }
@@ -426,6 +559,36 @@ fn filesystem_kind(fstype: &str, mount: &str) -> Option<FilesystemKind> {
     } else {
         Some(FilesystemKind::Local)
     }
+}
+
+fn row_identity(row: &FilesystemRow) -> FilesystemIdentity {
+    FilesystemIdentity {
+        mount_point: row.mount_point.clone(),
+        fstype: row.fstype.clone(),
+        source: row.source.clone(),
+        superblock_dev: row.superblock_dev.clone(),
+        kind: row.kind,
+        read_only: row.read_only,
+    }
+}
+
+fn same_row_identity(left: &FilesystemRow, right: &FilesystemRow) -> bool {
+    left.mount_point == right.mount_point
+        && left.fstype == right.fstype
+        && left.source == right.source
+        && left.superblock_dev == right.superblock_dev
+        && left.kind == right.kind
+        && left.read_only == right.read_only
+}
+
+fn copy_numeric(target: &mut FilesystemRow, source: &FilesystemRow) {
+    target.total_bytes = source.total_bytes;
+    target.free_bytes = source.free_bytes;
+    target.avail_bytes = source.avail_bytes;
+    target.total_inodes = source.total_inodes;
+    target.free_inodes = source.free_inodes;
+    target.avail_inodes = source.avail_inodes;
+    target.btrfs_unallocated = source.btrfs_unallocated;
 }
 
 #[cfg(test)]
