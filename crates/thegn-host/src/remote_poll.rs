@@ -66,8 +66,18 @@ fn should_refresh(outcomes: &[FetchOutcome]) -> bool {
     outcomes.contains(&FetchOutcome::Changed)
 }
 
+fn fetch_outcome(ok: bool, before: Option<u64>, after: Option<u64>) -> FetchOutcome {
+    match (ok, before, after) {
+        (_, Some(before), Some(after)) if before != after => FetchOutcome::Changed,
+        (true, Some(_), Some(_)) => FetchOutcome::Unchanged,
+        (true, _, _) => FetchOutcome::Changed,
+        (false, _, _) => FetchOutcome::NotRun,
+    }
+}
+
 /// Hash the remote-tracking refs in a local common dir without invoking git.
-/// Any uncertainty returns `None`; callers conservatively refresh in that case.
+/// Any uncertainty returns `None`; a successful fetch conservatively refreshes
+/// in that case.
 fn remote_ref_fingerprint(loc: &GitLoc, common_dir: &std::path::Path) -> Option<u64> {
     if !matches!(loc, GitLoc::Local(_)) {
         return None;
@@ -81,6 +91,7 @@ fn remote_ref_fingerprint(loc: &GitLoc, common_dir: &std::path::Path) -> Option<
         Err(_) => return None,
     }
 
+    /// The cap is 4096 directory entries, including directories as well as ref files.
     fn collect_refs(
         common_dir: &std::path::Path,
         refs_root: &std::path::Path,
@@ -545,14 +556,9 @@ fn poll_one(
         Some(remote) => {
             let before = remote_ref_fingerprint(&loc, &common_dir);
             let result = run_fetch(&loc, &remote);
+            let ok = result.is_ok();
             let after = remote_ref_fingerprint(&loc, &common_dir);
-            (
-                result,
-                match (before, after) {
-                    (Some(before), Some(after)) if before == after => FetchOutcome::Unchanged,
-                    _ => FetchOutcome::Changed,
-                },
-            )
+            (result, fetch_outcome(ok, before, after))
         }
         // No remotes configured: nothing to poll, but treat it as a success so
         // the repo just rides the normal interval instead of backing off.
@@ -677,6 +683,22 @@ mod tests {
         ];
         for (outcomes, expected) in cases {
             assert_eq!(should_refresh(outcomes), expected, "{outcomes:?}");
+        }
+    }
+
+    #[test]
+    fn fetch_outcome_refreshes_only_known_ref_moves_after_failure() {
+        let cases = [
+            (true, Some(1), Some(1), FetchOutcome::Unchanged),
+            (true, Some(1), Some(2), FetchOutcome::Changed),
+            (true, None, Some(2), FetchOutcome::Changed),
+            (true, Some(1), None, FetchOutcome::Changed),
+            (false, None, None, FetchOutcome::NotRun),
+            (false, Some(1), Some(1), FetchOutcome::NotRun),
+            (false, Some(1), Some(2), FetchOutcome::Changed),
+        ];
+        for (ok, before, after, expected) in cases {
+            assert_eq!(fetch_outcome(ok, before, after), expected);
         }
     }
 
