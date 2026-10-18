@@ -236,7 +236,8 @@ pub fn dump_station(
     set_message_len(request);
     socket.send(request)?;
     let mut station = None;
-    let mut ignored = Vec::new();
+    // The station decode keeps its result in `station`; the dump's output vec is unused.
+    let mut ignored: Vec<()> = Vec::new();
     receive_dump(socket, sequence, deadline, &mut ignored, |message, _out| {
         if message.header.kind == family_id && station.is_none() {
             let (_, payload) = genl_parts(message.payload)?;
