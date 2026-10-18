@@ -2,9 +2,11 @@
 pub mod amd_smu;
 pub mod cgroup;
 pub mod cgroup_slice;
+pub mod cpu_idle;
 pub mod cpu_irq;
 pub mod cpu_sched;
 pub mod cpu_stat;
+pub mod cpu_topology;
 pub mod cpufreq;
 pub mod disk_topology;
 pub mod diskstats;
