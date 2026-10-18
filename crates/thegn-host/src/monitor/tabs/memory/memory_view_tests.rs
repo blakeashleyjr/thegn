@@ -1,5 +1,9 @@
 use super::{MemoryModel, MemoryView};
-use crate::{caps, compositor::Rect, monitor::board::Board};
+use crate::{
+    caps,
+    compositor::Rect,
+    monitor::board::{Board, TabView as _},
+};
 use termwiz::surface::Surface;
 use thegn_core::{
     mem_health::{self, MemHealthInput, Verdict},
