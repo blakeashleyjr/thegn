@@ -1,5 +1,7 @@
 //! Power tab renderer and tab-specific monitor actions.
 
+pub(in crate::monitor) mod view;
+
 use super::super::build::*;
 use crate::chrome::S;
 use crate::sections::{Section, spacer};
