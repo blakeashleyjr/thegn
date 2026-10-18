@@ -14,7 +14,8 @@ use thegn_metrics::collect::{
     frame::MonitorFrame,
     health::Health,
     instances::InstanceId,
-    model::netdev::{IfaceSample, Scope, ScopeTotal},
+    model::netdev::{IfaceSample, ScopeTotal},
+    policy::net_scope::Scope,
 };
 
 mod paint;
@@ -53,6 +54,7 @@ pub(super) struct Ring {
     pub(super) values: Vec<f32>,
     pub(super) head: usize,
     pub(super) len: usize,
+    capacity: usize,
 }
 
 impl Ring {
@@ -61,11 +63,12 @@ impl Ring {
             values: Vec::with_capacity(capacity),
             head: 0,
             len: 0,
+            capacity,
         }
     }
 
     fn push(&mut self, value: f32) {
-        if self.len < self.values.capacity() {
+        if self.len < self.capacity {
             self.values.push(value);
             self.len += 1;
         } else if !self.values.is_empty() {
@@ -74,16 +77,27 @@ impl Ring {
         }
     }
 
-    fn ordered(&self) -> Vec<f32> {
-        if self.len < self.values.len() || self.head == 0 {
-            self.values.clone()
+    pub(super) fn copy_ordered(&self, out: &mut [f32]) -> usize {
+        let len = self.len.min(out.len());
+        let start = if self.len == self.capacity {
+            self.head
         } else {
-            self.values[self.head..]
-                .iter()
-                .chain(&self.values[..self.head])
-                .copied()
-                .collect()
+            0
+        };
+        for (index, slot) in out.iter_mut().take(len).enumerate() {
+            *slot = self.values[(start + index) % self.len];
         }
+        len
+    }
+
+    fn reset(&mut self) {
+        self.values.clear();
+        self.head = 0;
+        self.len = 0;
+    }
+
+    fn has_finite_sample(&self) -> bool {
+        self.values.iter().any(|value| value.is_finite())
     }
 }
 
@@ -169,6 +183,10 @@ impl NetworkModel {
                 self.interfaces.push(InterfaceHistory::default());
             }
             let history = &mut self.interfaces[slot];
+            if history.id != sample.id {
+                history.rx.reset();
+                history.tx.reset();
+            }
             history.id = sample.id;
             history.sample.clone_from(sample);
             history.live = true;
@@ -213,17 +231,15 @@ fn add(total: &mut Option<f64>, value: Option<f64>) {
 }
 
 fn sum_rates(values: impl Iterator<Item = [Option<f64>; 2]>) -> Option<f64> {
-    let mut total = Some(0.0);
+    let mut total = 0.0;
     let mut found = false;
     for pair in values {
-        for value in pair {
-            if let Some(value) = value {
-                found = true;
-                total = total.map(|sum| sum + value);
-            }
+        for value in pair.into_iter().flatten() {
+            found = true;
+            total += value;
         }
     }
-    if found { total } else { None }
+    found.then_some(total)
 }
 
 pub(in crate::monitor) struct NetworkView<'a>(pub &'a NetworkModel);

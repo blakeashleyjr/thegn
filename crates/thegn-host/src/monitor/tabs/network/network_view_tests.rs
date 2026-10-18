@@ -163,6 +163,25 @@ fn mirrored_sources_use_physical_or_all_and_interface_history_follows_ids() {
         .expect("interface retained after reorder");
     assert_eq!(after.rx.len, retained + 1);
     assert_eq!(after.sample.name.as_str(), "if1");
+    let mut values = [0.0; 2];
+    let len = after.rx.copy_ordered(&mut values);
+    assert_eq!(&values[..len], &[18.0, 35.0]);
+}
+
+#[test]
+fn reused_interface_slot_starts_with_only_the_new_interfaces_sample() {
+    let mut model = NetworkModel::default();
+    model.absorb_frame(&frame(1, &[0, 1, 2, 3, 4, 5, 6, 7]));
+    model.absorb_frame(&frame(2, &[1, 2, 3, 4, 5, 6, 7, 8]));
+    let replacement = model
+        .interfaces
+        .iter()
+        .find(|entry| entry.id == InstanceId(8))
+        .expect("replacement interface occupies the dropped slot");
+    assert_eq!(replacement.rx.len, 1);
+    let mut values = [0.0; 1];
+    assert_eq!(replacement.rx.copy_ordered(&mut values), 1);
+    assert_eq!(values, [42.0]);
 }
 
 #[test]
@@ -199,6 +218,22 @@ fn interface_slots_are_capped_and_absorb_capacity_stays_warm() {
 }
 
 #[test]
+fn cloned_warming_rings_keep_their_logical_capacity() {
+    let mut model = NetworkModel::default();
+    model.absorb_frame(&frame(1, &[1]));
+    let mut cloned = model.clone();
+    for tick in 2..30_u16 {
+        cloned.absorb_frame(&frame(tick, &[1]));
+    }
+    let history = cloned
+        .interfaces
+        .iter()
+        .find(|entry| entry.id == InstanceId(1))
+        .expect("interface history remains present");
+    assert_eq!(history.rx.len, 24);
+}
+
+#[test]
 fn warming_interfaces_show_ellipsis_and_demands_are_static_netdev() {
     let mut frame = MonitorFrame::default();
     let mut warming_iface = iface(1, b"eth0", Scope::Physical, 0.0, 0.0);
@@ -216,8 +251,16 @@ fn warming_interfaces_show_ellipsis_and_demands_are_static_netdev() {
     }
     let mut surface = Surface::new(100, 30);
     Board::default().paint(&view, &mut surface, Rect::full(100, 30), 0, &[]);
+    let throughput = Board::default()
+        .placed(&view, Rect::full(100, 30))
+        .into_iter()
+        .find(|panel| panel.id == THROUGHPUT)
+        .expect("throughput panel is placed")
+        .rect;
+    let warming_lines = lines(&surface);
+    assert!(warming_lines[throughput.y + 2].contains(caps::active_glyphs().ellipsis));
     assert!(
-        lines(&surface)
+        warming_lines
             .join("\n")
             .contains(caps::active_glyphs().ellipsis)
     );
@@ -229,6 +272,64 @@ fn warming_interfaces_show_ellipsis_and_demands_are_static_netdev() {
     for panel in [THROUGHPUT, INTERFACES, HEALTH] {
         assert!(absent_view.demand(panel).is_empty());
     }
+    let mut absent_surface = Surface::new(100, 30);
+    Board::default().paint(
+        &absent_view,
+        &mut absent_surface,
+        Rect::full(100, 30),
+        0,
+        &[],
+    );
+    let absent_rendered = lines(&absent_surface).join("\n");
+    assert!(
+        absent_rendered.contains("root-only"),
+        "root-only chip missing: {absent_rendered}"
+    );
+    assert!(absent_rendered.contains(caps::glyph(caps::Glyph::Lock)));
+    assert!(
+        absent_rendered
+            .lines()
+            .any(|line| line.contains("eth0") && line.contains("root-only"))
+    );
+    assert!(!absent_rendered.contains("… B/s"));
+    assert!(!absent_rendered.contains("…"));
+}
+
+#[test]
+fn short_throughput_history_is_right_aligned_and_scaled() {
+    let mut model = NetworkModel::default();
+    model.absorb_frame(&frame(1, &[1]));
+    model.absorb_frame(&frame(2, &[1]));
+    let view = NetworkView(&model);
+    let area = Rect::full(100, 30);
+    let throughput = Board::default()
+        .placed(&view, area)
+        .into_iter()
+        .find(|panel| panel.id == THROUGHPUT)
+        .expect("throughput panel is placed")
+        .rect;
+    let mut surface = Surface::new(100, 30);
+    caps::test_override::with_unicode(UnicodeLevel::Full, || {
+        caps::test_override::with_color(ColorDepth::Truecolor, || {
+            Board::default().paint(&view, &mut surface, area, 0, &[]);
+        })
+    });
+    let (cols, _) = surface.dimensions();
+    let right_x = (throughput.x + throughput.cols - 2).min(cols - 1);
+    let graph_y = throughput.y + 3;
+    let cell = surface.screen_lines()[graph_y]
+        .visible_cells()
+        .find(|cell| cell.cell_index() == right_x)
+        .expect("rightmost graph cell exists");
+    assert_ne!(
+        cell.str(),
+        "\u{2800}",
+        "newest throughput sample is not at right edge"
+    );
+    assert_ne!(cell.str(), " ", "rightmost graph column is blank");
+    let rendered = lines(&surface).join("\n");
+    assert!(rendered.contains("peak"));
+    assert!(lines(&surface)[throughput.y + throughput.rows - 2].contains("tx"));
 }
 
 #[test]
@@ -237,7 +338,7 @@ fn snapshots_cover_view_sizes_capabilities_and_static_demand() {
     let levels = [
         (UnicodeLevel::Full, ColorDepth::Truecolor),
         (UnicodeLevel::Full, ColorDepth::Ansi16),
-        (UnicodeLevel::Ascii, ColorDepth::Truecolor),
+        (UnicodeLevel::Ascii, ColorDepth::None),
     ];
     let ids: Vec<u16> = (0..8).collect();
     let mut model = NetworkModel::default();
@@ -275,8 +376,11 @@ fn snapshots_cover_view_sizes_capabilities_and_static_demand() {
             }
             if cols == 240 {
                 let fill = fill_ratio(&surface, Rect::full(cols, rows));
-                // density follow-up (batch 49): measured 0.30
-                assert!(fill >= 0.30, "fill ratio {fill:.3}");
+                // Estimated floor until the primary measures the merged layout.
+                assert!(
+                    fill >= 0.30,
+                    "fill ratio {fill:.3} at {cols}x{rows} {unicode:?}/{depth:?}"
+                );
             }
         }
     }

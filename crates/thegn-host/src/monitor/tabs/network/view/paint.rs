@@ -1,4 +1,4 @@
-use super::{HEALTH, INTERFACES, NetworkModel, THROUGHPUT};
+use super::{HEALTH, HISTORY, IFACE_HISTORY, INTERFACES, NetworkModel, THROUGHPUT};
 use crate::{
     caps,
     compositor::Rect,
@@ -12,16 +12,31 @@ use crate::{
     },
 };
 use termwiz::surface::Surface;
+use thegn_core::theme::RampId;
+
+const NAME_WIDTH: usize = 16;
+const KIND_WIDTH: usize = 10;
+const SCOPE_WIDTH: usize = 10;
+const RATE_WIDTH: usize = 10;
+const ERR_WIDTH: usize = 7;
+const SPARK_WIDTH: usize = 17;
+const SPARK_SERIES_WIDTH: usize = 8;
 
 pub(super) fn paint(model: &NetworkModel, surface: &mut Surface, id: PanelId, rect: Rect) {
     let mut grid = CellGrid::new(rect.cols, rect.rows);
     let title = match id {
-        THROUGHPUT => "Network throughput - bytes/s",
-        INTERFACES => "Interfaces - rates and errors",
-        HEALTH => "Network health",
+        THROUGHPUT => format!(
+            "Network throughput (peak {} B/s)",
+            format_rate(f64::from(peak(&model.rx, &model.tx)))
+        ),
+        INTERFACES => format!(
+            "Interfaces - rates/errors (spark peak {} B/s)",
+            format_rate(f64::from(interface_peak(model)))
+        ),
+        HEALTH => "Network health".to_owned(),
         _ => return,
     };
-    let body = panel::panel(&mut grid, Rect::full(rect.cols, rect.rows), title, None).rect();
+    let body = panel::panel(&mut grid, Rect::full(rect.cols, rect.rows), &title, None).rect();
     match id {
         THROUGHPUT => paint_throughput(&mut grid, body, model),
         INTERFACES => paint_interfaces(&mut grid, body, model),
@@ -35,6 +50,9 @@ pub(super) fn paint(model: &NetworkModel, surface: &mut Surface, id: PanelId, re
         rect.x,
         rect.y,
     );
+    if id == INTERFACES {
+        paint_interface_sparks(model, surface, body, rect);
+    }
 }
 
 fn paint_throughput(grid: &mut CellGrid, body: Rect, model: &NetworkModel) {
@@ -43,18 +61,18 @@ fn paint_throughput(grid: &mut CellGrid, body: Rect, model: &NetworkModel) {
     }
     let glyphs = caps::active_glyphs();
     let rx_label = format!(
-        "{} rx {} B/s",
+        "{} rx {}",
         glyphs.arrow_down,
-        reading(model.total.rx_bps, model.health)
+        reading(model.total.rx_bps, model.health, true)
     );
     let tx_label = format!(
-        "{} tx {} B/s",
+        "{} tx {}",
         glyphs.arrow_up,
-        reading(model.total.tx_bps, model.health)
+        reading(model.total.tx_bps, model.health, true)
     );
     grid.view(Rect { rows: 1, ..body })
         .put_str(0, 0, &rx_label, CellStyle::default());
-    if model.rx.len == 0 || model.tx.len == 0 {
+    if !model.rx.has_finite_sample() || !model.tx.has_finite_sample() {
         let rows = body.rows.saturating_sub(1).min(1);
         if rows > 0 {
             let mark = health_mark(model.health);
@@ -70,24 +88,47 @@ fn paint_throughput(grid: &mut CellGrid, body: Rect, model: &NetworkModel) {
             rows: 1,
             ..body
         })
-        .put_str(0, label_y, &tx_label, CellStyle::default());
+        .put_str(0, 0, &tx_label, CellStyle::default());
     }
     let graph_rows = body.rows.saturating_sub(2);
     let half = graph_rows / 2;
     if half == 0 || body.cols == 0 {
         return;
     }
-    let rx = model.rx.ordered();
-    let tx = model.tx.ordered();
+    let mut rx = [0.0; HISTORY];
+    let mut tx = [0.0; HISTORY];
+    let rx_len = model.rx.copy_ordered(&mut rx);
+    let tx_len = model.tx.copy_ordered(&mut tx);
+    let max = peak(&model.rx, &model.tx);
+    for value in rx.iter_mut().take(rx_len).chain(tx.iter_mut().take(tx_len)) {
+        *value = if value.is_finite() && max > 0.0 {
+            (*value / max).clamp(0.0, 1.0)
+        } else {
+            0.0
+        };
+    }
+    let braille = crate::monitor::graphs::table().braille;
+    let used = if braille {
+        rx_len.max(tx_len).div_ceil(2)
+    } else {
+        rx_len.max(tx_len)
+    };
+    let graph_cols = body.cols.min(used);
+    let graph_x = body.cols.saturating_sub(graph_cols);
     let mut raster = thegn_core::viz_raster::CellBuf::new();
-    raster.reset(body.cols, graph_rows);
-    thegn_core::viz_raster::mirrored(&rx, &tx, crate::monitor::graphs::table(), &mut raster);
+    raster.reset(graph_cols, graph_rows);
+    thegn_core::viz_raster::mirrored(
+        &rx[..rx_len],
+        &tx[..tx_len],
+        crate::monitor::graphs::table(),
+        &mut raster,
+    );
     let mut canvas = grid.view(body);
     for y in 0..graph_rows {
-        for x in 0..body.cols {
+        for x in 0..graph_cols {
             if let Some(cell) = raster.get(x, y) {
                 canvas.put(
-                    x,
+                    graph_x + x,
                     y + 1,
                     CellStyle {
                         ch: cell.ch,
@@ -107,7 +148,10 @@ fn paint_interfaces(grid: &mut CellGrid, body: Rect, model: &NetworkModel) {
     view.put_str(
         0,
         0,
-        "name             kind       scope       rx B/s      tx B/s  err+drop/s history",
+        &format!(
+            "{:<NAME_WIDTH$} {:<KIND_WIDTH$} {:<SCOPE_WIDTH$} {:>RATE_WIDTH$} {:>RATE_WIDTH$} {:>ERR_WIDTH$} {:<SPARK_WIDTH$}",
+            "name", "kind", "scope", "rx B/s", "tx B/s", "err+drop/s", "sparkline"
+        ),
         CellStyle::default(),
     );
     let max_rows = body.rows.saturating_sub(1);
@@ -119,41 +163,43 @@ fn paint_interfaces(grid: &mut CellGrid, body: Rect, model: &NetworkModel) {
         .enumerate()
     {
         let sample = &entry.sample;
-        let history = format!("{} {}", spark(&entry.rx), spark(&entry.tx));
         let errors = rate(sum_pair(sample.rx_errs_ps, sample.tx_errs_ps));
         let drops = rate(sum_pair(sample.rx_drop_ps, sample.tx_drop_ps));
         let row = format!(
-            "{:<16} {:<10} {:<10} {:>10} {:>10} {:>7} {}",
+            "{:<NAME_WIDTH$} {:<KIND_WIDTH$} {:<SCOPE_WIDTH$} {:>RATE_WIDTH$} {:>RATE_WIDTH$} {:>ERR_WIDTH$} {:<SPARK_WIDTH$}",
             sample.name.as_str(),
             sample.kind.label(),
             scope(sample.scope),
-            reading(sample.rx_bps, model.health),
-            reading(sample.tx_bps, model.health),
+            reading(sample.rx_bps, model.health, false),
+            reading(sample.tx_bps, model.health, false),
             combine(errors, drops),
-            history
+            ""
         );
         view.put_str(0, index + 1, &row, CellStyle::default());
     }
-    if model.overflow > 0 && model.interfaces.len() < max_rows {
+    let live_count = model.interfaces.iter().filter(|entry| entry.live).count();
+    if model.overflow > 0 && live_count < max_rows {
+        let other_name = format!("other +{}", model.overflow);
         let row = format!(
-            "other +{}        {}          mixed      {:>10} {:>10}",
-            model.overflow,
+            "{:<NAME_WIDTH$} {:<KIND_WIDTH$} {:<SCOPE_WIDTH$} {:>RATE_WIDTH$} {:>RATE_WIDTH$} {:>ERR_WIDTH$} {:<SPARK_WIDTH$}",
+            other_name,
             caps::active_glyphs().emdash,
-            rate(model.overflow_rx),
-            rate(model.overflow_tx)
+            "mixed",
+            reading(model.overflow_rx, model.health, false),
+            reading(model.overflow_tx, model.health, false),
+            caps::active_glyphs().emdash,
+            "",
         );
-        view.put_str(
-            0,
-            model.interfaces.iter().filter(|entry| entry.live).count() + 1,
-            &row,
-            CellStyle::default(),
-        );
+        view.put_str(0, live_count + 1, &row, CellStyle::default());
     }
 }
 
 fn paint_health(grid: &mut CellGrid, body: Rect, model: &NetworkModel) {
     let mut view = grid.view(body);
     let label = match model.health {
+        thegn_metrics::collect::health::Health::Absent(
+            thegn_metrics::collect::health::Absent::NoPermission,
+        ) => format!("{} root-only", health_mark(model.health)),
         thegn_metrics::collect::health::Health::Absent(_) => health_mark(model.health).to_owned(),
         _ => format!(
             "errors/s {}    drops/s {}",
@@ -176,13 +222,21 @@ fn health_mark(health: thegn_metrics::collect::health::Health) -> &'static str {
 
 fn rate(value: Option<f64>) -> String {
     value
-        .map(|value| format_rate(value))
+        .map(format_rate)
         .unwrap_or_else(|| caps::active_glyphs().emdash.to_owned())
 }
 
-fn reading(value: Option<f64>, health: thegn_metrics::collect::health::Health) -> String {
+fn reading(
+    value: Option<f64>,
+    health: thegn_metrics::collect::health::Health,
+    with_unit: bool,
+) -> String {
     match value {
-        Some(value) => format_rate(value),
+        Some(value) => format!(
+            "{}{}",
+            format_rate(value),
+            if with_unit { " B/s" } else { "" }
+        ),
         None if matches!(health, thegn_metrics::collect::health::Health::Warming) => {
             caps::active_glyphs().ellipsis.to_owned()
         }
@@ -193,7 +247,7 @@ fn reading(value: Option<f64>, health: thegn_metrics::collect::health::Health) -
             )
         ) =>
         {
-            caps::glyph(caps::Glyph::Lock).to_owned()
+            format!("{} root-only", caps::glyph(caps::Glyph::Lock))
         }
         None => caps::active_glyphs().emdash.to_owned(),
     }
@@ -240,30 +294,87 @@ fn scope(scope: thegn_metrics::collect::policy::net_scope::Scope) -> &'static st
     }
 }
 
-fn spark(ring: &super::Ring) -> String {
-    let values = ring.ordered();
-    if values.is_empty() {
-        return caps::active_glyphs().ellipsis.to_owned();
-    }
-    let max = values
+fn peak(rx: &super::Ring, tx: &super::Ring) -> f32 {
+    rx.values
         .iter()
+        .chain(&tx.values)
         .copied()
         .filter(|value| value.is_finite())
-        .fold(0.0_f32, f32::max);
-    values
+        .fold(0.0_f32, f32::max)
+}
+
+fn interface_peak(model: &NetworkModel) -> f32 {
+    model
+        .interfaces
         .iter()
-        .map(|value| {
-            if !value.is_finite() {
-                return caps::active_glyphs().middot;
-            }
-            let fraction = if max > 0.0 { value / max } else { 0.0 };
-            if fraction > 0.5 {
-                caps::active_glyphs().bar_fill
-            } else if fraction > 0.25 {
-                caps::active_glyphs().bar_empty
-            } else {
-                " "
-            }
-        })
-        .collect()
+        .flat_map(|entry| entry.rx.values.iter().chain(&entry.tx.values))
+        .copied()
+        .filter(|value| value.is_finite())
+        .fold(0.0_f32, f32::max)
+}
+
+fn paint_interface_sparks(model: &NetworkModel, surface: &mut Surface, body: Rect, panel: Rect) {
+    let peak = interface_peak(model);
+    if peak <= 0.0 || body.cols == 0 {
+        return;
+    }
+    let max_rows = body.rows.saturating_sub(1);
+    let x = panel.x + body.x + body.cols.saturating_sub(SPARK_WIDTH);
+    for (row, entry) in model
+        .interfaces
+        .iter()
+        .filter(|entry| entry.live)
+        .take(max_rows)
+        .enumerate()
+    {
+        paint_interface_spark(
+            &entry.rx,
+            peak,
+            x,
+            panel.y + body.y + row + 1,
+            body.cols.min(SPARK_SERIES_WIDTH),
+            surface,
+        );
+        paint_interface_spark(
+            &entry.tx,
+            peak,
+            x + SPARK_SERIES_WIDTH + 1,
+            panel.y + body.y + row + 1,
+            body.cols
+                .saturating_sub(SPARK_SERIES_WIDTH + 1)
+                .min(SPARK_SERIES_WIDTH),
+            surface,
+        );
+    }
+}
+
+fn paint_interface_spark(
+    ring: &super::Ring,
+    peak: f32,
+    x: usize,
+    y: usize,
+    available_cols: usize,
+    surface: &mut Surface,
+) {
+    let mut values = [0.0; IFACE_HISTORY];
+    let len = ring.copy_ordered(&mut values);
+    for value in values.iter_mut().take(len) {
+        *value = if value.is_finite() {
+            (*value / peak).clamp(0.0, 1.0)
+        } else {
+            0.0
+        };
+    }
+    crate::monitor::graphs::paint_sparkline(
+        &values[..len],
+        SPARK_SERIES_WIDTH,
+        RampId::Rx,
+        Rect {
+            x,
+            y,
+            cols: SPARK_SERIES_WIDTH.min(available_cols),
+            rows: 1,
+        },
+        surface,
+    );
 }
