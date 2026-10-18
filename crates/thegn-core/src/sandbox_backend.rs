@@ -1126,7 +1126,7 @@ mod tests {
         }));
         let _pass = probe_pass_guard();
         pass_memo_put(
-            (format!("{:?}", Placement::Local), backend),
+            &(format!("{:?}", Placement::Local), backend),
             RuntimeProbe::Present,
         );
 
