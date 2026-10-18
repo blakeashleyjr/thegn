@@ -45,6 +45,12 @@ pub enum Fallthrough {
 /// Under [`Fallthrough::Exact`], `None` additionally means "the requested
 /// backend isn't usable" — the caller owns the chain, so it owns the fallback
 /// message too.
+///
+/// The progress stream always closes this resolve: selected backends and
+/// reachable host-shell fallbacks emit `PhaseDone`, including an `Exact`-mode
+/// `None`; an undecidable remote emits `PhaseFailed`. In the latter case a
+/// preceding `Connect` phase has usually already closed Resolve in the observer,
+/// so the terminal event is typically a no-op there.
 pub(crate) fn pick_backend_with(
     cfg: &SandboxConfig,
     placement: &Placement,
@@ -1130,8 +1136,12 @@ mod tests {
             RuntimeProbe::Present,
         );
 
-        let resolved =
-            pick_backend_with_notice(&cfg, &Placement::Local, Fallthrough::Chain, |_: &SandboxConfig, _: &str| {});
+        let resolved = pick_backend_with_notice(
+            &cfg,
+            &Placement::Local,
+            Fallthrough::Chain,
+            |_: &SandboxConfig, _: &str| {},
+        );
 
         assert_eq!(resolved, Some(backend));
         assert_eq!(
