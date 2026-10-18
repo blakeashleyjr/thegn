@@ -3,6 +3,7 @@
 
 use crate::chrome;
 use crate::seg::{self, Line, Tok};
+use std::cell::RefCell;
 use termwiz::color::ColorAttribute;
 use thegn_core::termcaps::ColorDepth;
 use thegn_core::theme::{Band, Palette, RampId, SeriesRole, band_of};
@@ -13,6 +14,10 @@ mod heatmap;
 mod mirrored;
 mod spark;
 mod stacked;
+
+thread_local! {
+    static GRAPH_OUT: RefCell<GraphOut> = RefCell::new(GraphOut::default());
+}
 
 pub(crate) use heatmap::paint_heatmap;
 
@@ -135,24 +140,26 @@ pub(crate) fn paint_sparkline(
     if values.is_empty() || rect.rows == 0 || rect.cols == 0 {
         return;
     }
-    let mut out = GraphOut::new();
-    spark::paint_spark(
-        &mut out,
-        values,
-        width,
-        ramp,
-        &crate::chrome::palette_snapshot(),
-    );
-    if let Some(line) = out.lines.first() {
-        crate::seg::draw_line(
-            surface,
-            rect.x,
-            rect.y,
-            rect.cols,
-            line,
-            crate::seg::Tok::Slot(crate::chrome::S::Dim),
+    GRAPH_OUT.with(|scratch| {
+        let mut out = scratch.borrow_mut();
+        spark::paint_spark(
+            &mut out,
+            values,
+            width,
+            ramp,
+            &crate::chrome::palette_snapshot(),
         );
-    }
+        if let Some(line) = out.lines.first() {
+            crate::seg::draw_line(
+                surface,
+                rect.x,
+                rect.y,
+                rect.cols,
+                line,
+                crate::seg::Tok::Slot(crate::chrome::S::Dim),
+            );
+        }
+    });
 }
 
 /// Paint retained telemetry history into a multi-row graph area.
@@ -165,33 +172,35 @@ pub(crate) fn paint_history_graph(
     if values.is_empty() || rect.rows == 0 || rect.cols == 0 {
         return;
     }
-    let mut out = GraphOut::new();
-    graph::paint_graph(
-        &mut out,
-        graph::GraphPaint {
-            kind: graph::GraphKind::Area,
-            vals: values,
-            lo: None,
-            w: rect.cols,
-            h: rect.rows,
-            paint: Paint::Ramp {
-                id: ramp,
-                warn: 0.7,
-                crit: 0.9,
+    GRAPH_OUT.with(|scratch| {
+        let mut out = scratch.borrow_mut();
+        graph::paint_graph(
+            &mut out,
+            graph::GraphPaint {
+                kind: graph::GraphKind::Area,
+                vals: values,
+                lo: None,
+                w: rect.cols,
+                h: rect.rows,
+                paint: Paint::Ramp {
+                    id: ramp,
+                    warn: 0.7,
+                    crit: 0.9,
+                },
             },
-        },
-        &crate::chrome::palette_snapshot(),
-    );
-    for (row, line) in out.lines.iter().enumerate() {
-        crate::seg::draw_line(
-            surface,
-            rect.x,
-            rect.y + row,
-            rect.cols,
-            line,
-            crate::seg::Tok::Slot(crate::chrome::S::Dim),
+            &crate::chrome::palette_snapshot(),
         );
-    }
+        for (row, line) in out.lines.iter().enumerate() {
+            crate::seg::draw_line(
+                surface,
+                rect.x,
+                rect.y + row,
+                rect.cols,
+                line,
+                crate::seg::Tok::Slot(crate::chrome::S::Dim),
+            );
+        }
+    });
 }
 
 impl GraphOut {
