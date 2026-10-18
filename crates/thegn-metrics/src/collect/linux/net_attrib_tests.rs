@@ -80,6 +80,15 @@ fn update(
     map.update_into(sockets, physical_rx, physical_tx, owners, out);
 }
 
+fn owner_delta(result: &NetAttribution, cgroup_id: u64) -> (u64, u64) {
+    let owner = result
+        .owners
+        .iter()
+        .find(|owner| owner.cgroup_id == cgroup_id)
+        .expect("socket owner remains present");
+    (owner.tx_bytes, owner.rx_bytes)
+}
+
 fn colliding_cookie(first: u64) -> u64 {
     let home = hash_cookie(first) % 4_096;
     (first + 1..)
@@ -236,6 +245,119 @@ fn colliding_new_cookie_does_not_replace_unvisited_live_cookie() {
 }
 
 #[test]
+fn tombstone_rebuild_keeps_a_forced_collision_chain_reachable() {
+    let a = 10;
+    let b = colliding_cookie(a);
+    let c = colliding_cookie(b);
+    let home = hash_cookie(a) % 4_096;
+    assert_eq!(hash_cookie(b) % 4_096, home);
+    assert_eq!(hash_cookie(c) % 4_096, home);
+
+    let mut map = CookieDelta::new();
+    let mut owners = table();
+    let mut result = NetAttribution::default();
+    update(
+        &mut map,
+        &[
+            socket(a, Some(41), 10, 20),
+            socket(b, Some(42), 100, 200),
+            socket(c, Some(43), 200, 300),
+        ],
+        0,
+        0,
+        &mut owners,
+        &mut result,
+    );
+
+    // Removing a leaves b and c behind the home-slot tombstone.
+    update(
+        &mut map,
+        &[socket(b, Some(42), 107, 211), socket(c, Some(43), 207, 311)],
+        0,
+        0,
+        &mut owners,
+        &mut result,
+    );
+    assert_eq!(owner_delta(&result, 42), (7, 11));
+    assert_eq!(owner_delta(&result, 43), (7, 11));
+    let chain_entries = map.entries.as_ref().expect("cookie table stays allocated");
+    let b_slot = chain_entries
+        .iter()
+        .position(|entry| entry.occupied && entry.cookie == b)
+        .expect("b remains behind the tombstone");
+    let c_slot = chain_entries
+        .iter()
+        .position(|entry| entry.occupied && entry.cookie == c)
+        .expect("c remains behind the tombstone");
+    assert!(chain_entries[home].tombstone);
+    assert_eq!(
+        (b_slot + chain_entries.len() - home) % chain_entries.len(),
+        1
+    );
+    assert_eq!(
+        (c_slot + chain_entries.len() - home) % chain_entries.len(),
+        2
+    );
+
+    for batch in 0_u64..3 {
+        let mut sockets = Vec::with_capacity(502);
+        sockets.push(socket(
+            b,
+            Some(42),
+            107 + (batch + 1) * 7,
+            211 + (batch + 1) * 11,
+        ));
+        sockets.push(socket(
+            c,
+            Some(43),
+            207 + (batch + 1) * 7,
+            311 + (batch + 1) * 11,
+        ));
+        sockets.extend(
+            (0_u64..500).map(|index| socket(3_000_000 + batch * 500 + index, None, batch, batch)),
+        );
+        update(&mut map, &sockets, 0, 0, &mut owners, &mut result);
+
+        assert_eq!(owner_delta(&result, 42), (7, 11));
+        assert_eq!(owner_delta(&result, 43), (7, 11));
+        if batch == 2 {
+            assert_eq!(
+                map.tombstone_count(),
+                0,
+                "threshold-crossing dump rebuilds the table"
+            );
+        }
+    }
+
+    let sockets = [
+        socket(a, Some(41), 9_000, 9_000),
+        socket(b, Some(42), 128, 244),
+        socket(c, Some(43), 228, 344),
+    ];
+    update(&mut map, &sockets, 0, 0, &mut owners, &mut result);
+    assert_eq!(owner_delta(&result, 41), (0, 0));
+    assert_eq!(owner_delta(&result, 42), (7, 11));
+    assert_eq!(owner_delta(&result, 43), (7, 11));
+
+    let entries = map.entries.as_ref().expect("cookie table stays allocated");
+    let a_slot = entries
+        .iter()
+        .position(|entry| entry.occupied && entry.cookie == a)
+        .expect("reappearing a gets its own live slot");
+    let b_slot = entries
+        .iter()
+        .position(|entry| entry.occupied && entry.cookie == b)
+        .expect("b remains live");
+    let c_slot = entries
+        .iter()
+        .position(|entry| entry.occupied && entry.cookie == c)
+        .expect("c remains live");
+    assert_ne!(a_slot, b_slot);
+    assert_ne!(a_slot, c_slot);
+    assert_ne!(b_slot, c_slot);
+}
+
+#[test]
 fn cookie_and_result_capacities_are_stable_across_one_thousand_dumps() {
     let mut map = CookieDelta::new();
     let mut owners = table();
@@ -295,8 +417,16 @@ fn socket_churn_rebuilds_tombstones_without_changing_live_deltas() {
             map.tombstone_count()
         );
         assert!(
+            map.probes_last_update() > 0,
+            "dump {tick}: probe counter must record socket lookups"
+        );
+        assert!(
             map.probes_last_update() < 64 * sockets.len(),
-            "dump {tick}: {} probes for {} sockets exceeds the hand-derived 64 probes/socket bound",
+            // After rebuilding, at most 520 live entries + 1,024 tombstones + 520
+            // inserts occupy 4,096 slots (under 51%); sequential cookies hash to
+            // adjacent slots. Without rebuild, the table saturates in about 8
+            // dumps (4,096 / 500), and each subsequent miss scans all 4,096 slots.
+            "dump {tick}: {} probes for {} sockets exceeds the derived 64 probes/socket bound",
             map.probes_last_update(),
             sockets.len()
         );
@@ -331,8 +461,12 @@ fn socket_churn_probe_count_stays_bounded_after_table_warmup() {
 
     let last_probe_count = map.probes_last_update();
     assert!(
+        last_probe_count > 0,
+        "probe counter must record socket lookups"
+    );
+    assert!(
         last_probe_count < 64 * 500,
-        "final churn dump used {last_probe_count} probes for 500 sockets; expected fewer than {}",
+        "final churn dump used {last_probe_count} probes for 500 sockets; the derived 64/socket bound is based on under 51% occupancy (520 live + 1,024 tombstones + 520 inserts in 4,096 slots) and adjacent sequential-cookie hashes, unlike a saturated table that scans 4,096 slots per miss; expected fewer than {}",
         64 * 500
     );
 }
