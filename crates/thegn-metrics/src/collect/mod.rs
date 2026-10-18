@@ -42,10 +42,11 @@ pub enum CollectorId {
     Netdev,
     Diskstats,
     Powercap,
+    PowerSupply,
 }
 
 impl CollectorId {
-    pub const ALL: [Self; 14] = [
+    pub const ALL: [Self; 15] = [
         Self::Loadavg,
         Self::Uptime,
         Self::Psi,
@@ -60,6 +61,7 @@ impl CollectorId {
         Self::Netdev,
         Self::Diskstats,
         Self::Powercap,
+        Self::PowerSupply,
     ];
 
     pub const fn slug(self) -> &'static str {
@@ -78,6 +80,7 @@ impl CollectorId {
             Self::Netdev => "netdev",
             Self::Diskstats => "diskstats",
             Self::Powercap => "powercap",
+            Self::PowerSupply => "power_supply",
         }
     }
 
@@ -145,16 +148,68 @@ pub trait Collector: Send {
 
 #[cfg(target_os = "linux")]
 pub fn default_collectors() -> Vec<Box<dyn Collector>> {
+    use std::path::PathBuf;
+
     let mut collectors = stub::stub_collectors();
     collectors[CollectorId::Loadavg.index()] =
         Box::new(linux::loadavg::LoadavgCollector::at("/proc/loadavg"));
     collectors[CollectorId::Uptime.index()] =
         Box::new(linux::uptime::UptimeCollector::at("/proc/uptime"));
     collectors[CollectorId::Psi.index()] = Box::new(linux::psi::PsiCollector::at("/proc/pressure"));
+    collectors[CollectorId::CpuStat.index()] = Box::new(linux::cpu_stat::CpuStatCollector::new());
+    collectors[CollectorId::CpuFreq.index()] =
+        Box::new(linux::cpufreq::CpuFreqCollector::new(PathBuf::from("/")));
+    collectors[CollectorId::Hwmon.index()] = Box::new(linux::hwmon::HwmonCollector::new());
+    collectors[CollectorId::Cgroup.index()] = Box::new(linux::cgroup::CgroupCollector::default());
+    collectors[CollectorId::CgroupSlice.index()] =
+        Box::new(linux::cgroup_slice::CgroupSliceCollector::default());
+    collectors[CollectorId::AmdSmu.index()] = Box::new(linux::amd_smu::AmdSmuCollector::new());
+    collectors[CollectorId::Meminfo.index()] = Box::new(linux::meminfo::MeminfoCollector::new());
+    collectors[CollectorId::Vmstat.index()] = Box::new(linux::vmstat::VmstatCollector::new());
+    collectors[CollectorId::Netdev.index()] = Box::new(linux::netdev::NetdevCollector::at(
+        "/proc/net/dev",
+        "/sys/class/net",
+    ));
+    collectors[CollectorId::Diskstats.index()] = Box::new(
+        linux::diskstats::DiskstatsCollector::at("/proc/diskstats", "/sys/block"),
+    );
+    collectors[CollectorId::PowerSupply.index()] = Box::new(
+        linux::power_supply::PowerSupplyCollector::at("/sys/class/power_supply"),
+    );
     collectors
 }
 
 #[cfg(not(target_os = "linux"))]
 pub fn default_collectors() -> Vec<Box<dyn Collector>> {
     stub::stub_collectors()
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod default_collectors_tests {
+    use super::{CollectorId, default_collectors};
+    use crate::collect::schedule::Cadence;
+
+    #[test]
+    fn linux_defaults_register_real_collectors_in_identity_order() {
+        let collectors = default_collectors();
+        let ids: Vec<_> = collectors.iter().map(|collector| collector.id()).collect();
+        assert_eq!(ids.as_slice(), CollectorId::ALL.as_slice());
+        for id in [
+            CollectorId::Loadavg,
+            CollectorId::Uptime,
+            CollectorId::Psi,
+            CollectorId::CpuStat,
+            CollectorId::CpuFreq,
+            CollectorId::Hwmon,
+            CollectorId::Cgroup,
+            CollectorId::CgroupSlice,
+            CollectorId::AmdSmu,
+        ] {
+            assert_ne!(
+                collectors[id.index()].cadence(),
+                Cadence::Static,
+                "{id:?} should be a production collector"
+            );
+        }
+    }
 }

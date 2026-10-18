@@ -9,7 +9,6 @@ use crate::handlers::worktree_attach::{self, AttachTarget};
 use crate::handlers::worktree_launch::RelaunchOutcome;
 use crate::loading::{SpecOrigin, apply_spec_batch};
 use crate::menu::{self, MenuOverlay};
-use thegn_core::store::{PoolStore, WorkspaceStore};
 
 /// Resolved launch specs routed back to the requesting group by its unique
 /// NAME (a path can be shared by two groups); the batch also carries the path
@@ -824,53 +823,49 @@ pub(crate) fn drain_specs(
     }
 }
 
-/// Adjust the warm-spare-pool target for the ACTIVE workspace's `(repo, env)` by
-/// `delta`, persisting the override in the DB (the `+`/`-` hotkeys). Returns a
-/// status message (the new target, or why it didn't apply). The caller resets the
-/// maintainer throttle so the change takes effect immediately.
+/// Queue an adjustment to the active workspace's warm-spare-pool target. The DB
+/// read and write happen together on the critical writer in FIFO order.
 pub(crate) fn pool_target_adjust(
     session: &crate::session::Session,
     cfg: &thegn_core::config::Config,
     delta: i64,
+    tx: &tokio::sync::mpsc::UnboundedSender<crate::run::run_pending_db::PendingDbResult>,
+    waker: &termwiz::terminal::TerminalWaker,
 ) -> Option<String> {
     let g = session.active_group().filter(|g| !g.path.is_empty())?;
-    let wt = g.path.clone();
-    let loc = thegn_core::remote::GitLoc::for_worktree(std::path::Path::new(&wt));
+    crate::run::run_pending_db::queue_pool_target_adjust(
+        tx,
+        waker,
+        cfg.clone(),
+        g.path.clone(),
+        delta,
+    );
+    Some("warm pool: updating target…".into())
+}
+
+pub(crate) fn adjust_pool_target(
+    db: &thegn_core::db::Db,
+    cfg: &thegn_core::config::Config,
+    wt: &str,
+    delta: i64,
+) -> String {
+    use thegn_core::store::{PoolStore as _, WorkspaceStore as _};
+
+    let location = match db.location_for(wt) {
+        Ok(location) => location,
+        Err(error) => return format!("warm pool: persist failed: {error}"),
+    };
+    let loc = thegn_core::remote::GitLoc::from_db(wt, location.as_deref());
     if !loc.is_remote() {
-        return Some("warm pool: only for provider (remote) workspaces".into());
+        return "warm pool: only for provider (remote) workspaces".into();
     }
-    let db = thegn_core::db::Db::open().ok()?;
-    let repo_root = db
-        .repo_root_for(&wt)
-        .ok()
-        .flatten()
-        .filter(|s| !s.is_empty())
-        .or_else(|| {
-            thegn_core::repo::main_worktree(std::path::Path::new(&wt))
-                .map(|p| p.to_string_lossy().into_owned())
-        })
-        .unwrap_or_else(|| wt.clone());
-    let env_name = cfg
-        .resolve_env(
-            std::path::Path::new(&repo_root),
-            &loc,
-            std::path::Path::new(&wt),
-            None,
-        )
-        .name;
-    let cur = db
-        .pool_target(&repo_root, &env_name)
-        .ok()
-        .flatten()
-        .unwrap_or(cfg.lifecycle.pool.size as i64);
-    let new = (cur + delta).max(0);
-    // Surface a persist failure — this is a user-invoked hotkey on the primary
-    // path; a swallowed `.ok()?` would leave the user seeing nothing while the
-    // target silently didn't change (locked DB / disk full).
-    if let Err(e) = db.set_pool_target(&repo_root, &env_name, new) {
-        return Some(format!("warm pool: persist failed: {e}"));
+    let (_, repo, env) = crate::lifecycle::pool_context(db, cfg, wt, &loc);
+    let cur = crate::lifecycle::effective_pool_target(db, cfg, &repo, &env);
+    let new = (cur as i64 + delta).clamp(0, crate::lifecycle::POOL_TARGET_CEILING as i64);
+    if let Err(error) = db.set_pool_target(&repo, &env, new) {
+        return format!("warm pool: persist failed: {error}");
     }
-    Some(format!("warm pool target: {new} spare(s)"))
+    format!("warm pool target: {new} spare(s)")
 }
 
 #[cfg(test)]
@@ -1531,5 +1526,139 @@ mod tests {
         );
         assert!(!need_relayout);
         assert!(!dirty);
+    }
+
+    fn provider_db() -> thegn_core::db::Db {
+        use thegn_core::store::WorkspaceStore as _;
+        let db = thegn_core::db::Db::open_memory().unwrap();
+        db.put_worktree(
+            "repo/main",
+            "/repo",
+            "/remote/wt",
+            "main",
+            Some(r#"{"control_prefix":["provider"],"path":"/remote/wt"}"#),
+            None,
+        )
+        .unwrap();
+        db
+    }
+
+    #[test]
+    fn adjust_pool_target_writes_the_effective_env_key() {
+        use thegn_core::store::{PoolStore as _, WorkspaceStore as _};
+        let db = provider_db();
+        db.set_worktree_env("/remote/wt", "selected-env").unwrap();
+        let cfg = thegn_core::config::Config::default();
+        assert_eq!(
+            adjust_pool_target(&db, &cfg, "/remote/wt", 1),
+            "warm pool target: 1 spare(s)"
+        );
+        assert_eq!(db.pool_target("/repo", "selected-env").unwrap(), Some(1));
+        assert_eq!(db.pool_target("/repo", "default").unwrap(), None);
+    }
+
+    #[test]
+    fn adjust_pool_target_clamps_at_the_ceiling_and_floors_at_zero() {
+        use thegn_core::store::PoolStore as _;
+        let db = provider_db();
+        let cfg = thegn_core::config::Config::default();
+        db.set_pool_target(
+            "/repo",
+            "default",
+            crate::lifecycle::POOL_TARGET_CEILING as i64,
+        )
+        .unwrap();
+        assert_eq!(
+            adjust_pool_target(&db, &cfg, "/remote/wt", 1),
+            "warm pool target: 8 spare(s)"
+        );
+        assert_eq!(db.pool_target("/repo", "default").unwrap(), Some(8));
+        assert_eq!(
+            adjust_pool_target(&db, &cfg, "/remote/wt", -20),
+            "warm pool target: 0 spare(s)"
+        );
+        assert_eq!(db.pool_target("/repo", "default").unwrap(), Some(0));
+    }
+
+    #[test]
+    fn adjust_pool_target_refuses_local_worktrees() {
+        let db = thegn_core::db::Db::open_memory().unwrap();
+        let cfg = thegn_core::config::Config::default();
+        assert_eq!(
+            adjust_pool_target(&db, &cfg, "/local/wt", 1),
+            "warm pool: only for provider (remote) workspaces"
+        );
+    }
+
+    #[test]
+    fn pool_target_adjust_does_not_block_on_a_held_write_lock() {
+        if !crate::platform::sound_process::test_support::UNIX {
+            return;
+        }
+        use thegn_core::store::WorkspaceStore as _;
+
+        let state = crate::testenv::IsolatedState::new();
+        let db = thegn_core::db::Db::open().unwrap();
+        db.put_worktree(
+            "repo/main",
+            "/repo",
+            "/remote/wt",
+            "main",
+            Some(r#"{"control_prefix":["provider"],"path":"/remote/wt"}"#),
+            None,
+        )
+        .unwrap();
+        drop(db);
+        let lock = rusqlite::Connection::open(state.state_home().join("thegn/thegn.db")).unwrap();
+        lock.execute_batch("BEGIN IMMEDIATE").unwrap();
+        let session = crate::session::Session {
+            id: "test".into(),
+            worktrees: vec![crate::session::WorktreeGroup::new(
+                "repo/main",
+                crate::session::GroupKind::Home,
+                "/remote/wt",
+            )],
+            active: 0,
+        };
+        let (tx, mut rx) = tokio_mpsc::unbounded_channel();
+        let (waker, _master, _terminal) =
+            crate::platform::sound_process::test_support::test_waker();
+        let started = std::time::Instant::now();
+        assert_eq!(
+            pool_target_adjust(
+                &session,
+                &thegn_core::config::Config::default(),
+                1,
+                &tx,
+                &waker
+            )
+            .as_deref(),
+            Some("warm pool: updating target…")
+        );
+        assert!(started.elapsed() < std::time::Duration::from_millis(500));
+        assert!(matches!(
+            rx.try_recv(),
+            Err(tokio_mpsc::error::TryRecvError::Empty)
+        ));
+        lock.execute_batch("ROLLBACK").unwrap();
+        drop(lock);
+        let (barrier_tx, barrier_rx) = std::sync::mpsc::channel();
+        crate::db_task::persist_critical(move |_| {
+            if barrier_tx.send(()).is_err() {
+                tracing::debug!(target: "thegn::provision", "pool target barrier receiver closed");
+            }
+        });
+        barrier_rx
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .unwrap();
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(crate::run::run_pending_db::PendingDbResult::PoolTarget { status })
+                if status == "warm pool target: 1 spare(s)"
+        ));
+        assert!(matches!(
+            rx.try_recv(),
+            Err(tokio_mpsc::error::TryRecvError::Empty)
+        ));
     }
 }

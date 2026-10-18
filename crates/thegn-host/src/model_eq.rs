@@ -56,7 +56,7 @@ impl FrameModel {
             return false;
         };
         self.process_revision = publication.revision;
-        self.procs = publication.snapshot;
+        self.procs = crate::e2e_freeze::procs_or(publication.snapshot);
         self.process_state = ProcessViewState::Fresh;
         true
     }

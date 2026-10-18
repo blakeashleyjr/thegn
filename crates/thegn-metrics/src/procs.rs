@@ -21,6 +21,7 @@
 //! abort comes back.
 
 use std::time::{Duration, Instant};
+use std::{fs::File, io::Read};
 
 use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, RefreshKind, System};
 
@@ -57,6 +58,9 @@ pub struct ProcSample {
     pub ppid: Option<u32>,
     /// Sampled process birth time (Unix seconds), paired with PID for UI identity.
     pub start_time: u64,
+    /// Raw `/proc/<pid>/stat` field 22, clock ticks since boot. `None` means
+    /// the value is unknown (non-Linux, unreadable, or the process exited).
+    pub start_ticks: Option<u64>,
     /// Executable name, truncated. Deliberately **not** the full command line:
     /// reading `cmdline` is an extra syscall per process, and a command line can
     /// carry secrets that have no business in a UI list.
@@ -102,6 +106,8 @@ pub struct ProcSampler {
     /// Reused between passes so the common case allocates nothing: only the
     /// ≤2·[`TOP_N`] survivors get a `ProcSample` (and its `String`) built.
     scratch: Vec<(Pid, f32, u64)>,
+    start_path: String,
+    start_buf: Vec<u8>,
     primed: bool,
     last: Option<Instant>,
     /// `(pid, pane_id)` for thegn's own panes, refreshed by the host when the
@@ -127,6 +133,8 @@ impl ProcSampler {
             // globals, which the main sampler already covers.
             sys: System::new_with_specifics(RefreshKind::nothing()),
             scratch: Vec::new(),
+            start_path: String::new(),
+            start_buf: Vec::new(),
             primed: false,
             last: None,
             pane_pids: Vec::new(),
@@ -152,6 +160,8 @@ impl ProcSampler {
     pub fn reset(&mut self) {
         self.sys = System::new_with_specifics(RefreshKind::nothing());
         self.scratch = Vec::new();
+        self.start_path = String::new();
+        self.start_buf = Vec::new();
         self.primed = false;
         self.last = None;
     }
@@ -192,15 +202,27 @@ impl ProcSampler {
         let keep = self.rows.max(TOP_N).min(total);
         let chosen = choose_top(&mut self.scratch, keep);
 
+        let mut start_path = std::mem::take(&mut self.start_path);
+        let mut start_buf = std::mem::take(&mut self.start_buf);
         let procs = chosen
             .into_iter()
             .filter_map(|pid| {
                 let p = self.sys.process(pid)?;
+                let ppid = p.parent().map(|x| x.as_u32());
+                let name = p.name().to_string_lossy();
+                let start_ticks = if cfg!(target_os = "linux") {
+                    read_start_stat(pid.as_u32(), &mut start_path, &mut start_buf).and_then(
+                        |stat| matching_start_ticks(&stat, pid.as_u32(), ppid.unwrap_or(0), &name),
+                    )
+                } else {
+                    None
+                };
                 Some(ProcSample {
                     pid: pid.as_u32(),
-                    ppid: p.parent().map(|x| x.as_u32()),
+                    ppid,
                     start_time: p.start_time(),
-                    name: p.name().to_string_lossy().chars().take(32).collect(),
+                    start_ticks,
+                    name: name.chars().take(32).collect(),
                     cpu_pct: p.cpu_usage(),
                     rss_bytes: p.memory(),
                     run_secs: p.run_time(),
@@ -208,6 +230,8 @@ impl ProcSampler {
                 })
             })
             .collect();
+        self.start_path = start_path;
+        self.start_buf = start_buf;
 
         let primed = self.primed;
         self.primed = true;
@@ -217,6 +241,13 @@ impl ProcSampler {
             primed,
             enabled: true,
         }
+    }
+
+    /// Read one process's raw Linux start ticks. Useful for identity checks
+    /// that need to compare against a fresh `/proc` observation.
+    pub fn start_ticks_of(pid: u32) -> Option<u64> {
+        read_start_stat(pid, &mut String::new(), &mut Vec::new())
+            .and_then(|stat| (stat.pid == pid).then_some(stat.starttime))
     }
 
     /// Attribute a process to thegn, the daemon, or a pane — walking ancestry,
@@ -246,6 +277,41 @@ impl ProcSampler {
         }
         ProcOwner::Other
     }
+}
+
+fn read_start_stat(
+    pid: u32,
+    path: &mut String,
+    buf: &mut Vec<u8>,
+) -> Option<crate::procs_model::Stat> {
+    if !cfg!(target_os = "linux") {
+        return None;
+    }
+    path.clear();
+    use std::fmt::Write as _;
+    if write!(path, "/proc/{pid}/stat").is_err() {
+        return None;
+    }
+    buf.clear();
+    match File::open(path) {
+        Ok(mut file) => {
+            if file.read_to_end(buf).is_err() {
+                return None;
+            }
+        }
+        Err(_) => return None,
+    }
+    crate::procs_parse::parse_stat(buf)
+}
+
+fn matching_start_ticks(
+    stat: &crate::procs_model::Stat,
+    pid: u32,
+    ppid: u32,
+    name: &str,
+) -> Option<u64> {
+    (stat.pid == pid && stat.ppid == ppid && stat.comm.to_string_lossy().as_ref() == name)
+        .then_some(stat.starttime)
 }
 
 /// Keep the bounded union deterministically even when the OS process map arrives
@@ -417,5 +483,80 @@ mod tests {
             total.abs_diff(proc_dirs) <= 5,
             "ProcSampler total {total} differs from /proc PID directory count {proc_dirs}"
         );
+    }
+}
+
+#[cfg(test)]
+mod start_ticks_tests {
+    use super::*;
+
+    #[test]
+    fn current_pid_ticks_match_proc_stat_on_linux() {
+        let pid = std::process::id();
+        let actual = ProcSampler::start_ticks_of(pid);
+        if cfg!(target_os = "linux") {
+            assert!(
+                actual.is_some(),
+                "Linux sampler should parse this process's stat"
+            );
+            let stat = std::fs::read(format!("/proc/{pid}/stat")).unwrap();
+            assert_eq!(
+                actual,
+                crate::procs_parse::parse_stat(&stat).map(|s| s.starttime)
+            );
+        } else {
+            assert_eq!(actual, None);
+        }
+    }
+
+    #[test]
+    fn nonexistent_pid_has_no_start_ticks() {
+        assert_eq!(ProcSampler::start_ticks_of(u32::MAX), None);
+    }
+
+    #[test]
+    fn mismatched_stat_identity_has_no_start_ticks() {
+        let stat = crate::procs_model::Stat {
+            pid: 17,
+            comm: crate::procs_model::Comm::from_bytes(b"worker"),
+            ppid: 23,
+            starttime: 456,
+            ..Default::default()
+        };
+        assert_eq!(matching_start_ticks(&stat, 17, 23, "worker"), Some(456));
+
+        let mismatched_comm = crate::procs_model::Stat {
+            comm: crate::procs_model::Comm::from_bytes(b"replacement"),
+            ..stat
+        };
+        assert_eq!(
+            matching_start_ticks(&mismatched_comm, 17, 23, "worker"),
+            None
+        );
+
+        let mismatched_ppid = crate::procs_model::Stat { ppid: 29, ..stat };
+        assert_eq!(
+            matching_start_ticks(&mismatched_ppid, 17, 23, "worker"),
+            None
+        );
+    }
+
+    #[test]
+    fn linux_sampled_ticks_agree_with_live_proc_rows() {
+        let sample = ProcSampler::new(200).sample();
+        if cfg!(target_os = "linux") {
+            assert!(sample.procs.iter().any(|row| row.start_ticks.is_some()));
+            for row in sample
+                .procs
+                .iter()
+                .filter_map(|row| row.start_ticks.map(|ticks| (row.pid, ticks)))
+            {
+                if let Some(live_ticks) = ProcSampler::start_ticks_of(row.0) {
+                    assert_eq!(row.1, live_ticks, "pid {} changed during sampling", row.0);
+                }
+            }
+        } else {
+            assert!(sample.procs.iter().all(|row| row.start_ticks.is_none()));
+        }
     }
 }

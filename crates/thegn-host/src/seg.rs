@@ -20,7 +20,7 @@ use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::chrome::{self, S};
 use crate::compositor::Rect;
-use thegn_core::theme::{self, Palette};
+use thegn_core::theme::{self, Band, OwnerRole, Palette, RampId, SeriesRole, StateRole};
 
 /// Whether the outer terminal renders curly underlines; when false, [`Under::Curly`]
 /// degrades to a single underline at draw time so the surface never holds an
@@ -52,6 +52,10 @@ pub enum Tok {
     Rgb(u8, u8, u8),
     /// An already-resolved termwiz color (bridges legacy color-returning code).
     Attr(ColorAttribute),
+    Ramp(RampId, u8),
+    Series(SeriesRole),
+    State(StateRole),
+    Owner(OwnerRole),
 }
 
 impl Tok {
@@ -65,9 +69,76 @@ impl Tok {
             Tok::Sel(h, pct) => chrome::theme_color(&p.sel(*h, *pct as f32 / 100.0)),
             Tok::Rgb(r, g, b) => chrome::theme_color(&format!("{r};{g};{b}")),
             Tok::Attr(c) => *c,
+            Tok::Ramp(id, level)
+                if crate::caps::color_depth() == thegn_core::termcaps::ColorDepth::Ansi16 =>
+            {
+                let band = match (*level).min(7) {
+                    0..=4 => Band::Normal,
+                    5..=6 => Band::Warn,
+                    _ => Band::Crit,
+                };
+                chrome::theme_color(p.band(*id, band))
+            }
+            Tok::Ramp(id, level) => chrome::theme_color(&p.ramp_level(*id, *level)),
+            Tok::Series(role) => chrome::theme_color(p.series(*role)),
+            Tok::State(role) => chrome::theme_color(p.state(*role)),
+            Tok::Owner(role) => chrome::theme_color(p.owner(*role)),
         }
     }
 }
+
+/// Compact token for grid cells. `INHERIT` means the emitter's panel background.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct StyleTok(u16);
+
+impl StyleTok {
+    pub const INHERIT: Self = Self(u16::MAX);
+    pub const fn from_raw(raw: u16) -> Self {
+        Self(raw)
+    }
+    pub const fn raw(self) -> u16 {
+        self.0
+    }
+
+    pub fn from_tok(tok: Tok) -> Option<Self> {
+        let pair = match tok {
+            Tok::Slot(s) => (1, crate::chrome::S::ALL.iter().position(|v| *v == s)?),
+            Tok::Hue(h) => (2, theme::Hue::ALL.iter().position(|v| *v == h)?),
+            Tok::Heat(v) => (3, usize::from(v.min(4))),
+            Tok::SelAccent => (4, 0),
+            Tok::Ramp(id, v) => (
+                5,
+                RampId::ALL.iter().position(|x| *x == id)? * 8 + usize::from(v.min(7)),
+            ),
+            Tok::Series(v) => (6, SeriesRole::ALL.iter().position(|x| *x == v)?),
+            Tok::State(v) => (7, StateRole::ALL.iter().position(|x| *x == v)?),
+            Tok::Owner(v) => (8, OwnerRole::ALL.iter().position(|x| *x == v)?),
+            Tok::Sel(..) | Tok::Rgb(..) | Tok::Attr(..) => return None,
+        };
+        Some(Self(((pair.0 as u16) << 8) | pair.1 as u16))
+    }
+
+    pub fn tok(self) -> Option<Tok> {
+        if self == Self::INHERIT {
+            return None;
+        }
+        let tag = self.0 >> 8;
+        let p = usize::from(self.0 & 0xff);
+        Some(match tag {
+            1 => Tok::Slot(*crate::chrome::S::ALL.get(p)?),
+            2 => Tok::Hue(*theme::Hue::ALL.get(p)?),
+            3 if p <= 4 => Tok::Heat(p as u8),
+            4 if p == 0 => Tok::SelAccent,
+            5 => Tok::Ramp(*RampId::ALL.get(p / 8)?, (p % 8) as u8),
+            6 => Tok::Series(*SeriesRole::ALL.get(p)?),
+            7 => Tok::State(*StateRole::ALL.get(p)?),
+            8 => Tok::Owner(*OwnerRole::ALL.get(p)?),
+            _ => return None,
+        })
+    }
+}
+
+const _: [(); 2] = [(); std::mem::size_of::<StyleTok>()];
 
 /// Underline styling for a seg.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -1044,6 +1115,10 @@ mod tests {
                 Tok::SelAccent,
                 Tok::Sel(theme::Hue::Red, 14),
                 Tok::Rgb(9, 8, 7),
+                Tok::Ramp(RampId::Util, 7),
+                Tok::Series(SeriesRole::CpuUser),
+                Tok::State(StateRole::Warn),
+                Tok::Owner(OwnerRole::Pane),
             ] {
                 assert_ne!(tok.resolve(p), ColorAttribute::Default, "{tok:?}");
             }
@@ -1088,5 +1163,36 @@ mod tests {
         );
         assert_eq!(seg_width(&[]), 0);
         assert_eq!(cut(&[seg(Tok::Slot(S::Text), "abc")], 0), Vec::<Seg>::new());
+    }
+}
+
+#[cfg(test)]
+mod style_tok_tests {
+    use super::*;
+
+    #[test]
+    fn every_packable_token_round_trips_and_unrepresentable_tokens_are_rejected() {
+        let mut tokens = Vec::new();
+        tokens.extend(crate::chrome::S::ALL.into_iter().map(Tok::Slot));
+        tokens.extend(theme::Hue::ALL.into_iter().map(Tok::Hue));
+        tokens.extend((0..=4).map(Tok::Heat));
+        tokens.push(Tok::SelAccent);
+        for ramp in RampId::ALL {
+            tokens.extend((0..=7).map(|level| Tok::Ramp(ramp, level)));
+        }
+        tokens.extend(SeriesRole::ALL.into_iter().map(Tok::Series));
+        tokens.extend(StateRole::ALL.into_iter().map(Tok::State));
+        tokens.extend(OwnerRole::ALL.into_iter().map(Tok::Owner));
+        for tok in tokens {
+            assert_eq!(StyleTok::from_tok(tok).and_then(StyleTok::tok), Some(tok));
+        }
+        for tok in [
+            Tok::Sel(theme::Hue::Red, 20),
+            Tok::Rgb(1, 2, 3),
+            Tok::Attr(ColorAttribute::Default),
+        ] {
+            assert!(StyleTok::from_tok(tok).is_none());
+        }
+        assert_eq!(std::mem::size_of::<StyleTok>(), 2);
     }
 }

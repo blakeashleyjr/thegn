@@ -18,6 +18,7 @@ const MAX_DEPTH: usize = 32;
 pub struct ProcRow {
     pub pid: u32,
     pub start_time: u64,
+    pub start_ticks: Option<u64>,
     pub name: String,
     pub owner: ProcOwner,
     pub cpu_pct: f32,
@@ -87,6 +88,7 @@ fn row_of(p: &ProcSample, depth: usize, elided_parent: bool) -> ProcRow {
     ProcRow {
         pid: p.pid,
         start_time: p.start_time,
+        start_ticks: p.start_ticks,
         name: p.name.clone(),
         owner: p.owner,
         cpu_pct: p.cpu_pct,
@@ -267,6 +269,7 @@ mod tests {
             rss_bytes: rss,
             run_secs: 0,
             start_time: 100,
+            start_ticks: None,
             owner: ProcOwner::Other,
         }
     }

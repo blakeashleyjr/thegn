@@ -22,6 +22,7 @@ use gtui_query::host::HostSource;
 use gtui_query::loki::LokiSource;
 use gtui_query::prometheus::PrometheusSource;
 use gtui_render::layout::GRID_COLS;
+use gtui_render::timeseries::ReducedSeries;
 use tg_kit::input::{InputEvent, InputResult, Key};
 use tg_kit::ratatui::buffer::Buffer;
 use tg_kit::ratatui::layout::Rect;
@@ -36,6 +37,7 @@ pub struct ObserveTile {
     theme: Theme,
     is_panicked: bool,
     needs_redraw: bool,
+    series_cache: SeriesCache,
 }
 
 impl ObserveTile {
@@ -97,6 +99,7 @@ impl ObserveTile {
             theme,
             is_panicked: false,
             needs_redraw: true,
+            series_cache: SeriesCache::default(),
         })
     }
 
@@ -218,9 +221,10 @@ impl AppTile for ObserveTile {
 
         let app = &self.app;
         let result = panic::catch_unwind(panic::AssertUnwindSafe(|| {
-            render_dashboard(app, area, buf, &self.theme);
+            render_dashboard(app, area, buf, &self.theme, &mut self.series_cache);
         }));
         if result.is_err() {
+            self.series_cache.clear();
             self.is_panicked = true;
         }
     }
@@ -456,8 +460,90 @@ fn expand_tilde(path: &str) -> String {
     path.to_string()
 }
 
+#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
+struct SeriesId {
+    panel_id: u32,
+    target_index: usize,
+    frame_index: usize,
+}
+
+#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
+struct ReductionKey {
+    generation: u64,
+    window: Option<[u64; 2]>,
+    width: usize,
+}
+
+#[derive(Default)]
+struct SeriesCache {
+    entries: HashMap<SeriesId, (ReductionKey, ReducedSeries)>,
+    touched: HashSet<SeriesId>,
+    reductions: u64,
+}
+
+impl SeriesCache {
+    #[cfg(test)]
+    fn reduction_count(&self) -> u64 {
+        self.reductions
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    fn clear(&mut self) {
+        self.entries.clear();
+        self.touched.clear();
+    }
+
+    fn begin_pass(&mut self) {
+        self.touched.clear();
+    }
+
+    fn finish_pass(&mut self) {
+        self.entries.retain(|id, _| self.touched.contains(id));
+    }
+
+    fn reduced(&mut self, id: SeriesId, key: ReductionKey, frame: &Frame) -> &ReducedSeries {
+        self.touched.insert(id);
+        if self
+            .entries
+            .get(&id)
+            .is_none_or(|(old_key, _)| *old_key != key)
+        {
+            let bounds = bounds_for(frame);
+            let reduced = gtui_render::timeseries::reduce(
+                frame,
+                bounds,
+                key.window
+                    .map(|bits| [f64::from_bits(bits[0]), f64::from_bits(bits[1])]),
+                key.width,
+            );
+            self.entries.insert(id, (key, reduced));
+            self.reductions = self.reductions.wrapping_add(1);
+        }
+        &self.entries.get(&id).expect("inserted reduction").1
+    }
+}
+
+struct PanelRenderContext<'a> {
+    panel_id: u32,
+    generation: u64,
+    window: Option<[f64; 2]>,
+    series_index: Option<(usize, usize)>,
+    cache: &'a mut SeriesCache,
+}
+
 /// Lay the dashboard onto `area` and dispatch each panel to its renderer.
-fn render_dashboard(app: &ObserveApp, area: Rect, buf: &mut Buffer, theme: &Theme) {
+fn render_dashboard(
+    app: &ObserveApp,
+    area: Rect,
+    buf: &mut Buffer,
+    theme: &Theme,
+    cache: &mut SeriesCache,
+) {
+    cache.begin_pass();
     let panels = &app.dashboard.panels;
     if panels.is_empty() {
         block_msg(
@@ -468,6 +554,7 @@ fn render_dashboard(app: &ObserveApp, area: Rect, buf: &mut Buffer, theme: &Them
             Tok::Dim,
             theme,
         );
+        cache.finish_pass();
         return;
     }
     let rows = gtui_render::layout::grid_rows(panels);
@@ -483,16 +570,23 @@ fn render_dashboard(app: &ObserveApp, area: Rect, buf: &mut Buffer, theme: &Them
             rect,
             buf,
             theme,
-            app.panel_window(panel.id).map(|window| {
-                [
-                    window.from.timestamp() as f64
-                        + f64::from(window.from.timestamp_subsec_nanos()) / 1_000_000_000.0,
-                    window.to.timestamp() as f64
-                        + f64::from(window.to.timestamp_subsec_nanos()) / 1_000_000_000.0,
-                ]
-            }),
+            PanelRenderContext {
+                panel_id: panel.id,
+                generation: app.panel_generation(panel.id),
+                window: app.panel_window(panel.id).map(|window| {
+                    [
+                        window.from.timestamp() as f64
+                            + f64::from(window.from.timestamp_subsec_nanos()) / 1_000_000_000.0,
+                        window.to.timestamp() as f64
+                            + f64::from(window.to.timestamp_subsec_nanos()) / 1_000_000_000.0,
+                    ]
+                }),
+                series_index: None,
+                cache: &mut *cache,
+            },
         );
     }
+    cache.finish_pass();
 }
 
 /// Draw one panel: its renderer when data is `Ready`, else a loading/error/empty
@@ -504,7 +598,7 @@ fn render_panel(
     rect: Rect,
     buf: &mut Buffer,
     theme: &Theme,
-    window: Option<[f64; 2]>,
+    context: PanelRenderContext<'_>,
 ) {
     match state {
         PanelState::Loading => {
@@ -514,7 +608,7 @@ fn render_panel(
             block_msg(rect, buf, title, e, Tok::Red, theme);
         }
         PanelState::Ready(targets) => {
-            render_targets(kind, title, targets, rect, buf, theme, window);
+            render_targets(kind, title, targets, rect, buf, theme, context);
         }
     }
 }
@@ -527,20 +621,22 @@ fn render_targets(
     rect: Rect,
     buf: &mut Buffer,
     theme: &Theme,
-    window: Option<[f64; 2]>,
+    context: PanelRenderContext<'_>,
 ) {
     let mut entries = Vec::new();
-    for target in targets {
+    for (target_index, target) in targets.iter().enumerate() {
         match &target.result {
             Err(message) => entries.push((
                 format!("{title} · {}", target.ref_id),
                 None,
                 Some(message.as_str()),
+                None,
             )),
             Ok(frames) if frames.is_empty() => entries.push((
                 format!("{title} · {}", target.ref_id),
                 None,
                 Some("no data"),
+                None,
             )),
             Ok(frames) => {
                 for (index, frame) in frames.iter().enumerate().take(32) {
@@ -566,9 +662,9 @@ fn render_targets(
                             retained_from: None
                         }
                     ) {
-                        entries.push((label, None, Some("no samples retained yet")));
+                        entries.push((label, None, Some("no samples retained yet"), None));
                     } else {
-                        entries.push((label, Some(frame), None));
+                        entries.push((label, Some(frame), None, Some((target_index, index))));
                     }
                 }
                 if frames.len() > 32 {
@@ -576,6 +672,7 @@ fn render_targets(
                         format!("{title} · {}", target.ref_id),
                         None,
                         Some("series limit is 32"),
+                        None,
                     ));
                 }
             }
@@ -585,7 +682,7 @@ fn render_targets(
         block_msg(rect, buf, title, "no data", Tok::Faint, theme);
         return;
     }
-    for (index, (label, frame, message)) in entries.iter().enumerate() {
+    for (index, (label, frame, message, series_index)) in entries.iter().enumerate() {
         let y0 = rect.y + (u32::from(rect.height) * index as u32 / entries.len() as u32) as u16;
         let y1 =
             rect.y + (u32::from(rect.height) * (index + 1) as u32 / entries.len() as u32) as u16;
@@ -597,7 +694,22 @@ fn render_targets(
         if let Some(message) = message {
             block_msg(item_rect, buf, label, message, Tok::Faint, theme);
         } else if let Some(frame) = frame {
-            dispatch_renderer(kind, label, frame, item_rect, buf, theme, window);
+            let mut panel_context = PanelRenderContext {
+                panel_id: context.panel_id,
+                generation: context.generation,
+                window: context.window,
+                series_index: *series_index,
+                cache: &mut *context.cache,
+            };
+            dispatch_renderer(
+                kind,
+                label,
+                frame,
+                item_rect,
+                buf,
+                theme,
+                &mut panel_context,
+            );
         }
     }
 }
@@ -610,20 +722,28 @@ fn dispatch_renderer(
     rect: Rect,
     buf: &mut Buffer,
     theme: &Theme,
-    window: Option<[f64; 2]>,
+    context: &mut PanelRenderContext<'_>,
 ) {
     use gtui_render::{logs, stat, table, timeseries};
     let colors = render_colors(theme);
     match kind {
-        "timeseries" => timeseries::TimeseriesRenderer::render_in_window(
-            frame,
-            title,
-            bounds_for(frame),
-            window,
-            rect.width as usize,
-            &colors,
-        )
-        .render(rect, buf),
+        "timeseries" => {
+            let (target_index, frame_index) = context.series_index.unwrap_or((0, 0));
+            let id = SeriesId {
+                panel_id: context.panel_id,
+                target_index,
+                frame_index,
+            };
+            let key = ReductionKey {
+                generation: context.generation,
+                window: context
+                    .window
+                    .map(|window| [window[0].to_bits(), window[1].to_bits()]),
+                width: rect.width as usize,
+            };
+            timeseries::render_reduced(context.cache.reduced(id, key, frame), title, &colors)
+                .render(rect, buf)
+        }
         "stat" => stat::StatRenderer::render(frame, title, &colors).render(rect, buf),
         "table" => table::TableRenderer::render(
             frame,
@@ -750,6 +870,129 @@ mod tests {
 
     fn make_source_ids(names: &[&str]) -> HashSet<String> {
         names.iter().map(|name| (*name).to_string()).collect()
+    }
+
+    fn render_cached_series(
+        cache: &mut SeriesCache,
+        panel_id: u32,
+        generation: u64,
+        frame: Frame,
+        width: u16,
+        window: Option<[f64; 2]>,
+    ) -> Buffer {
+        let area = Rect::new(0, 0, width, 8);
+        let mut buffer = Buffer::empty(area);
+        let targets = [gtui_app::engine::TargetUpdate {
+            ref_id: "A".into(),
+            result: Ok(vec![frame]),
+        }];
+        render_targets(
+            "timeseries",
+            "Panel",
+            &targets,
+            area,
+            &mut buffer,
+            &Theme::prism(),
+            PanelRenderContext {
+                panel_id,
+                generation,
+                window,
+                series_index: None,
+                cache,
+            },
+        );
+        buffer
+    }
+
+    fn timestamped_frame() -> Frame {
+        Frame::new(vec![
+            Field::new("time", FieldType::Time, vec![0.0, 1.0, 4.0, 10.0]),
+            Field::new("value", FieldType::Float64, vec![1.0, 4.0, 3.0, 8.0]),
+        ])
+    }
+
+    #[test]
+    fn series_cache_reuses_per_panel_and_invalidates_on_generation_width_and_window() {
+        let frame = timestamped_frame();
+        let mut cache = SeriesCache::default();
+        cache.begin_pass();
+        render_cached_series(&mut cache, 1, 4, frame.clone(), 30, None);
+        render_cached_series(&mut cache, 2, 8, frame.clone(), 30, None);
+        cache.finish_pass();
+        assert_eq!(cache.reduction_count(), 2);
+
+        cache.begin_pass();
+        render_cached_series(&mut cache, 1, 4, frame.clone(), 30, None);
+        render_cached_series(&mut cache, 2, 8, frame.clone(), 30, None);
+        cache.finish_pass();
+        assert_eq!(cache.reduction_count(), 2, "unchanged panels must hit");
+
+        cache.begin_pass();
+        render_cached_series(&mut cache, 1, 5, frame.clone(), 30, None);
+        render_cached_series(&mut cache, 2, 8, frame.clone(), 30, None);
+        cache.finish_pass();
+        assert_eq!(cache.reduction_count(), 3, "only the updated panel misses");
+
+        cache.begin_pass();
+        render_cached_series(&mut cache, 1, 5, frame.clone(), 31, None);
+        render_cached_series(&mut cache, 2, 8, frame.clone(), 30, None);
+        cache.finish_pass();
+        assert_eq!(cache.reduction_count(), 4, "a width change misses");
+
+        cache.begin_pass();
+        render_cached_series(&mut cache, 1, 5, frame.clone(), 31, Some([0.0, 5.0]));
+        render_cached_series(&mut cache, 2, 8, frame, 30, None);
+        cache.finish_pass();
+        assert_eq!(cache.reduction_count(), 5, "a window change misses");
+
+        cache.begin_pass();
+        render_cached_series(&mut cache, 1, 5, timestamped_frame(), 31, Some([0.0, 5.0]));
+        cache.finish_pass();
+        assert_eq!(cache.len(), 1, "removed panel entries are swept");
+    }
+
+    #[test]
+    fn cached_and_uncached_series_buffers_match_for_all_input_shapes() {
+        let frames = [
+            timestamped_frame(),
+            Frame::new(vec![Field::new(
+                "value",
+                FieldType::Float64,
+                vec![1.0, 2.0, 3.0],
+            )]),
+            Frame::new(vec![
+                Field::new("time", FieldType::Time, vec![0.0, 1.0, 2.0, 3.0]),
+                Field::new("value", FieldType::Float64, vec![1.0, f64::NAN, 3.0, 4.0]),
+            ]),
+        ];
+        let mut cache = SeriesCache::default();
+        for (index, frame) in frames.into_iter().enumerate() {
+            let window = (index != 1).then_some([0.0, 10.0]);
+            cache.begin_pass();
+            let cached =
+                render_cached_series(&mut cache, index as u32, 1, frame.clone(), 30, window);
+            cache.finish_pass();
+            let hit = render_cached_series(&mut cache, index as u32, 1, frame.clone(), 30, window);
+            let uncached = render_targets_uncached(frame, 30, window);
+            assert_eq!(cached, hit);
+            assert_eq!(hit, uncached);
+        }
+    }
+
+    fn render_targets_uncached(frame: Frame, width: u16, window: Option<[f64; 2]>) -> Buffer {
+        let area = Rect::new(0, 0, width, 8);
+        let mut buffer = Buffer::empty(area);
+        let bounds = bounds_for(&frame);
+        gtui_render::timeseries::TimeseriesRenderer::render_in_window(
+            &frame,
+            "Panel · A",
+            bounds,
+            window,
+            width as usize,
+            &render_colors(&Theme::prism()),
+        )
+        .render(area, &mut buffer);
+        buffer
     }
 
     #[test]
@@ -921,7 +1164,13 @@ mod tests {
             buf.area,
             &mut buf,
             &theme,
-            None,
+            PanelRenderContext {
+                panel_id: 1,
+                generation: 0,
+                window: None,
+                series_index: None,
+                cache: &mut SeriesCache::default(),
+            },
         );
         assert!(
             buf.content
@@ -989,7 +1238,21 @@ mod tests {
     fn dispatch_unknown_type_does_not_panic() {
         let f = Frame::new(vec![Field::new("v", FieldType::Float64, vec![1.0])]);
         let mut buf = Buffer::empty(Rect::new(0, 0, 20, 5));
-        dispatch_renderer("nope", "P", &f, buf.area, &mut buf, &Theme::prism(), None);
+        dispatch_renderer(
+            "nope",
+            "P",
+            &f,
+            buf.area,
+            &mut buf,
+            &Theme::prism(),
+            &mut PanelRenderContext {
+                panel_id: 1,
+                generation: 0,
+                window: None,
+                series_index: None,
+                cache: &mut SeriesCache::default(),
+            },
+        );
         // A hint was drawn (top-left border of the block).
         assert_eq!(buf.cell((0, 0)).unwrap().symbol(), "┌");
     }
@@ -1004,7 +1267,13 @@ mod tests {
             buf.area,
             &mut buf,
             &Theme::prism(),
-            None,
+            PanelRenderContext {
+                panel_id: 1,
+                generation: 0,
+                window: None,
+                series_index: None,
+                cache: &mut SeriesCache::default(),
+            },
         );
         assert_eq!(buf.cell((0, 0)).unwrap().symbol(), "┌");
 
@@ -1020,7 +1289,13 @@ mod tests {
             buf2.area,
             &mut buf2,
             &Theme::prism(),
-            None,
+            PanelRenderContext {
+                panel_id: 1,
+                generation: 0,
+                window: None,
+                series_index: None,
+                cache: &mut SeriesCache::default(),
+            },
         );
         // StatRenderer drew the value "42.00".
         assert_eq!(buf2.cell((1, 1)).unwrap().symbol(), "4");
@@ -1052,7 +1327,13 @@ mod tests {
                 buf.area,
                 &mut buf,
                 &Theme::prism(),
-                None,
+                PanelRenderContext {
+                    panel_id: 1,
+                    generation: 0,
+                    window: None,
+                    series_index: None,
+                    cache: &mut SeriesCache::default(),
+                },
             );
             let mut rendered = String::new();
             for y in 0..buf.area.height {
@@ -1094,7 +1375,13 @@ mod tests {
             area,
             &mut buf,
             &Theme::prism(),
-            None,
+            PanelRenderContext {
+                panel_id: 1,
+                generation: 0,
+                window: None,
+                series_index: None,
+                cache: &mut SeriesCache::default(),
+            },
         );
         let rendered = buf
             .content
@@ -1125,7 +1412,13 @@ mod tests {
             buf.area,
             &mut buf,
             &theme,
-            Some([0.0, 2.0]),
+            PanelRenderContext {
+                panel_id: 1,
+                generation: 0,
+                window: Some([0.0, 2.0]),
+                series_index: None,
+                cache: &mut SeriesCache::default(),
+            },
         );
         let series = theme.color(Tok::Green);
         assert!(buf.content.iter().any(|cell| cell.fg == series));
@@ -1183,7 +1476,13 @@ mod tests {
                 area,
                 &mut buf,
                 &theme,
-                None,
+                PanelRenderContext {
+                    panel_id: 1,
+                    generation: 0,
+                    window: None,
+                    series_index: None,
+                    cache: &mut SeriesCache::default(),
+                },
             );
             assert!(
                 if kind == "logs" {
@@ -1239,7 +1538,13 @@ mod tests {
             buf.area,
             &mut buf,
             &Theme::prism(),
-            None,
+            PanelRenderContext {
+                panel_id: 1,
+                generation: 0,
+                window: None,
+                series_index: None,
+                cache: &mut SeriesCache::default(),
+            },
         );
         let mut rendered = String::new();
         for y in 0..buf.area.height {

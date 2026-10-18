@@ -3,41 +3,10 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
+use crate::collect::policy::net_scope::{self, IfaceFacts, Scope};
 use crate::{IfaceFact, MediumSelection, NetMedium, select_medium_explained};
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub enum IfaceKind {
-    Loopback,
-    Ethernet,
-    Wifi,
-    Bond,
-    Bridge,
-    Vlan,
-    Veth,
-    Wireguard,
-    Tun,
-    Other,
-    #[default]
-    Unknown,
-}
-
-impl IfaceKind {
-    pub const fn label(self) -> &'static str {
-        match self {
-            Self::Loopback => "lo",
-            Self::Ethernet => "eth",
-            Self::Wifi => "wifi",
-            Self::Bond => "bond",
-            Self::Bridge => "bridge",
-            Self::Vlan => "vlan",
-            Self::Veth => "veth",
-            Self::Wireguard => "wg",
-            Self::Tun => "tun",
-            Self::Other => "other",
-            Self::Unknown => "",
-        }
-    }
-}
+pub use net_scope::IfaceKind;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NetIface {
@@ -59,52 +28,45 @@ pub(crate) struct IfaceClass {
 }
 
 #[cfg_attr(not(any(test, target_os = "linux")), expect(dead_code))]
-pub(crate) fn classify_at(root: &Path, name: &str) -> IfaceClass {
+pub(crate) fn facts_at(root: &Path, name: &str) -> IfaceFacts {
     let iface = root.join(name);
-    let kind_text = std::fs::read_to_string(iface.join("type")).unwrap_or_default();
-    let dev_type = std::fs::read_to_string(iface.join("uevent"))
+    let type_code = std::fs::read_to_string(iface.join("type"))
+        .ok()
+        .and_then(|value| value.trim().parse().ok());
+    let devtype = std::fs::read_to_string(iface.join("uevent"))
         .unwrap_or_default()
         .lines()
         .find_map(|line| line.strip_prefix("DEVTYPE="))
         .unwrap_or_default()
+        .trim()
         .to_owned();
-    let has_device = iface.join("device").exists();
-    let wireless = iface.join("wireless").exists() || iface.join("phy80211").exists();
-    let bond_slave = iface.join("bonding_slave").exists();
-    let kind = if name == "lo" || kind_text.trim() == "772" {
-        IfaceKind::Loopback
-    } else if wireless || dev_type == "wlan" {
-        IfaceKind::Wifi
-    } else if dev_type == "wireguard" {
-        IfaceKind::Wireguard
-    } else if iface.join("tun_flags").exists() {
-        IfaceKind::Tun
-    } else if iface.join("bridge").exists() || dev_type == "bridge" {
-        IfaceKind::Bridge
-    } else if iface.join("bonding").exists() || dev_type == "bond" {
-        IfaceKind::Bond
-    } else if dev_type == "vlan" {
-        IfaceKind::Vlan
-    } else if !has_device && name.starts_with("veth") {
-        IfaceKind::Veth
-    } else if has_device && kind_text.trim() == "1" {
-        IfaceKind::Ethernet
-    } else if has_device {
-        IfaceKind::Other
-    } else {
-        IfaceKind::Unknown
-    };
-    let medium = if wireless {
+    IfaceFacts {
+        type_code,
+        devtype,
+        has_device: iface.join("device").exists(),
+        wireless: iface.join("wireless").exists() || iface.join("phy80211").exists(),
+        tun_flags: iface.join("tun_flags").exists(),
+        bridge: iface.join("bridge").exists(),
+        bonding: iface.join("bonding").exists(),
+        bonding_slave: iface.join("bonding_slave").exists(),
+    }
+}
+
+#[cfg_attr(not(any(test, target_os = "linux")), expect(dead_code))]
+pub(crate) fn classify_at(root: &Path, name: &str) -> IfaceClass {
+    let facts = facts_at(root, name);
+    let kind = net_scope::classify(name, &facts);
+    let medium = if facts.wireless {
         NetMedium::Wifi
-    } else if kind_text.trim() == "1" && has_device {
+    } else if facts.type_code == Some(1) && facts.has_device {
         NetMedium::Ethernet
     } else {
         NetMedium::Unknown
     };
     IfaceClass {
         kind,
-        bond_slave,
-        has_device,
+        bond_slave: facts.bonding_slave,
+        has_device: facts.has_device,
         medium,
     }
 }
@@ -189,10 +151,7 @@ pub(crate) fn aggregate<'a>(
             true
         } else {
             class.is_some_and(|class| {
-                matches!(
-                    class.kind,
-                    IfaceKind::Ethernet | IfaceKind::Wifi | IfaceKind::Other | IfaceKind::Bond
-                ) && !class.bond_slave
+                net_scope::scope(class.kind, class.bond_slave) == Scope::Physical
                     && up.get(name) != Some(&false)
             })
         };

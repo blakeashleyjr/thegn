@@ -7,10 +7,16 @@ pub mod loadavg;
 pub mod meminfo;
 pub mod mountinfo;
 pub mod netdev;
+pub mod netstat;
 pub mod psi;
+pub mod snmp;
+pub mod softnet;
 pub mod stat;
+pub mod swaps;
+pub mod upower_history;
 pub mod uptime;
 pub mod vmstat;
+pub mod zram;
 
 pub fn fields(input: &[u8]) -> impl Iterator<Item = &[u8]> {
     input

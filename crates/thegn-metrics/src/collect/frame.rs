@@ -22,6 +22,7 @@ pub struct Parts {
     pub netdev: super::model::netdev::NetdevPart,
     pub diskstats: super::model::diskstats::DiskstatsPart,
     pub powercap: super::model::powercap::PowercapPart,
+    pub power_supply: super::model::power_supply::PowerSupplyPart,
 }
 impl Parts {
     pub fn clear(&mut self) {
@@ -39,6 +40,7 @@ impl Parts {
         self.netdev.clear();
         self.diskstats.clear();
         self.powercap.clear();
+        self.power_supply.clear();
     }
 }
 

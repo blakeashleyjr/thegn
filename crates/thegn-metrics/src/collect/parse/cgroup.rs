@@ -1,7 +1,7 @@
 //! Allocation-free cgroup v2 parsers. Malformed and unknown fields are ignored.
 
 use super::{fields, parse_u64};
-use crate::collect::model::cgroup::{CpuStat, IoTotals, Limit, MemEvents, MemStat};
+use crate::collect::model::cgroup::{CpuStat, IoTotals, Limit, MemEvents, MemStat, Pressure};
 
 fn value_for(input: &[u8], key: &[u8]) -> Option<u64> {
     input.split(|byte| *byte == b'\n').find_map(|line| {
@@ -104,12 +104,23 @@ pub fn io_stat_sum(input: &[u8], counted: &[(u32, u32)]) -> IoTotals {
     totals
 }
 
-// SR-4 -> F3b psi::parse once landed.
+pub fn pressure(input: &[u8]) -> Option<Pressure> {
+    let parsed = super::psi::parse(input);
+    if parsed.some.is_none() && parsed.full.is_none() {
+        return None;
+    }
+    Some(Pressure {
+        some_avg10: parsed.some.map(|line| line.avg10 as f32 / 100.0),
+        some_total_us: parsed.some.map(|line| line.total_us),
+        full_avg10: parsed.full.map(|line| line.avg10 as f32 / 100.0),
+        full_total_us: parsed.full.map(|line| line.total_us),
+    })
+}
 
 #[cfg(test)]
 mod tests {
     use super::{cpu_stat, io_stat_sum, maj_min, mem_events, mem_stat, pids_max, single_u64};
-    use crate::collect::model::cgroup::{IoTotals, Limit};
+    use crate::collect::model::cgroup::{IoTotals, Limit, Pressure};
 
     const CPU: &[u8] = b"usage_usec 100\nuser_usec 70\nsystem_usec 30\nnr_periods 9\nnr_throttled 2\nthrottled_usec 8\n";
     const MEM: &[u8] =
@@ -206,5 +217,20 @@ mod tests {
                 let _io = io_stat_sum(bytes, &[(259, 0)]);
             }
         }
+    }
+
+    #[test]
+    fn pressure_maps_some_and_full_and_rejects_empty_parse() {
+        assert_eq!(
+            super::pressure(b"some avg10=1.50 avg60=0.00 avg300=0.00 total=1234\nfull avg10=0.25 avg60=0.00 avg300=0.00 total=99\n"),
+            Some(Pressure {
+                some_avg10: Some(1.5),
+                some_total_us: Some(1234),
+                full_avg10: Some(0.25),
+                full_total_us: Some(99),
+            })
+        );
+        assert_eq!(super::pressure(b"garbage\n"), None);
+        assert_eq!(super::pressure(b""), None);
     }
 }

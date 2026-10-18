@@ -464,7 +464,7 @@ mod tests {
 
     #[test]
     fn successful_transcription_terminates_a_redirected_group_descendant() {
-        if !std::path::Path::new("/proc/self/stat").exists() {
+        if !cfg!(target_os = "linux") {
             return;
         }
         let dir = tempfile::tempdir().unwrap();
