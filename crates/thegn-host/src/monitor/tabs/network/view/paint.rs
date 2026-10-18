@@ -137,54 +137,35 @@ fn paint_throughput(grid: &mut CellGrid, body: Rect, model: &NetworkModel) {
     let aligned = graph_rect(plot, rx_len.max(tx_len), braille);
     let mut canvas = grid.view(body);
     let mut raster = thegn_core::viz_raster::CellBuf::new();
-    let len = rx_len.min(tx_len);
-    let mut start = 0;
-    while start < len {
-        while start < len && (!rx[start].is_finite() || !tx[start].is_finite()) {
-            start += 1;
-        }
-        let mut end = start;
-        while end < len && rx[end].is_finite() && tx[end].is_finite() {
-            end += 1;
-        }
-        if end > start {
-            let x = aligned.x.saturating_sub(body.x) + if braille { start / 2 } else { start };
-            let width = (if braille {
-                (end - start).div_ceil(2)
-            } else {
-                end - start
-            })
-            .min(body.cols.saturating_sub(x));
-            raster.reset(width, graph_rows);
-            thegn_core::viz_raster::mirrored(
-                &rx[start..end],
-                &tx[start..end],
-                crate::monitor::graphs::table(),
-                &mut raster,
-            );
-            for y in 0..graph_rows {
-                for x in 0..width {
-                    if let Some(cell) = raster.get(x, y) {
-                        canvas.put(
-                            aligned.x.saturating_sub(body.x)
-                                + if braille { start / 2 } else { start }
-                                + x,
-                            y + 1,
-                            CellStyle {
-                                ch: cell.ch,
-                                ..CellStyle::default()
-                            },
-                        );
-                    }
-                }
+    raster.reset(aligned.cols, graph_rows);
+    thegn_core::viz_raster::mirrored(
+        &rx[..rx_len],
+        &tx[..tx_len],
+        crate::monitor::graphs::table(),
+        &mut raster,
+    );
+    for y in 0..graph_rows {
+        for x in 0..aligned.cols {
+            if let Some(cell) = raster.get(x, y) {
+                canvas.put(
+                    aligned.x.saturating_sub(body.x) + x,
+                    y + 1,
+                    CellStyle {
+                        ch: cell.ch,
+                        ..CellStyle::default()
+                    },
+                );
             }
         }
-        start = end.max(start + 1);
     }
 }
 
 fn paint_wifi(grid: &mut CellGrid, body: Rect, model: &NetworkModel) {
-    let mut view = grid.view(body);
+    let text_cols = body.cols.saturating_sub(25);
+    let mut view = grid.view(Rect {
+        cols: text_cols,
+        ..body
+    });
     view.put_str(
         0,
         0,
@@ -252,12 +233,42 @@ fn paint_wifi(grid: &mut CellGrid, body: Rect, model: &NetworkModel) {
         let connected = sample
             .connected_secs
             .map_or_else(|| caps::active_glyphs().emdash.to_owned(), format_duration);
-        view.put_str(
-            0,
-            row + 1,
-            &format!(
+        let row_text = if text_cols < 100 {
+            format!(
+                "{} \"{}\" {} {} / {} {} avg{} {} / {} {}",
+                String::from_utf8_lossy(sample.name.as_bytes()),
+                ssid,
+                bssid,
+                sample.freq_mhz.map_or_else(
+                    || caps::active_glyphs().emdash.to_owned(),
+                    |mhz| format!(
+                        "{}G",
+                        if mhz < 3_000 {
+                            "2.4"
+                        } else if mhz < 6_000 {
+                            "5"
+                        } else {
+                            "6"
+                        }
+                    ),
+                ),
+                width,
+                signal,
+                sample
+                    .signal_avg_dbm
+                    .filter(|dbm| (-120..=0).contains(dbm))
+                    .map_or_else(
+                        || caps::active_glyphs().emdash.to_owned(),
+                        |dbm| dbm.to_string()
+                    ),
+                retries,
+                failed,
+                connected
+            )
+        } else {
+            format!(
                 "{}  \"{}\"  {}  {} / {}  {} {}  {} / {}  {}",
-                sample.name.as_str(),
+                String::from_utf8_lossy(sample.name.as_bytes()),
                 ssid,
                 bssid,
                 band,
@@ -267,9 +278,9 @@ fn paint_wifi(grid: &mut CellGrid, body: Rect, model: &NetworkModel) {
                 retries,
                 failed,
                 connected
-            ),
-            CellStyle::default(),
-        );
+            )
+        };
+        view.put_str(0, row + 1, &row_text, CellStyle::default());
     }
 }
 
@@ -301,14 +312,13 @@ fn paint_wifi_signal(ring: &super::Ring, x: usize, y: usize, width: usize, surfa
     }
     let mut raw = [f32::NAN; WIFI_HISTORY];
     let len = ring.copy_ordered(&mut raw);
-    let braille = crate::monitor::graphs::table().braille;
     let area = Rect {
         x,
         y,
         cols: width,
         rows: 1,
     };
-    let aligned = graph_rect(area, len, braille);
+    let aligned = graph_rect(area, len, false);
     let window_start = len.saturating_sub(aligned.cols);
     let mut start = window_start;
     while start < len {

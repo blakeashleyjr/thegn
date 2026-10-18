@@ -268,12 +268,28 @@ impl NetworkModel {
         for entry in &mut self.wifi {
             entry.live = false;
         }
+        // Keep every existing interface in its slot before reusing dormant slots.
         for sample in wifi.ifaces.iter().take(WIFI_CAP) {
-            let slot = self
+            if let Some(slot) = self
                 .wifi
                 .iter()
                 .position(|entry| entry.ifindex == sample.ifindex)
-                .or_else(|| self.wifi.iter().position(|entry| !entry.live))
+            {
+                store_wifi_sample(&mut self.wifi[slot], sample);
+            }
+        }
+        for sample in wifi.ifaces.iter().take(WIFI_CAP) {
+            if self
+                .wifi
+                .iter()
+                .any(|entry| entry.live && entry.ifindex == sample.ifindex)
+            {
+                continue;
+            }
+            let slot = self
+                .wifi
+                .iter()
+                .position(|entry| !entry.live)
                 .or_else(|| (self.wifi.len() < WIFI_CAP).then_some(self.wifi.len()));
             let Some(slot) = slot else {
                 continue;
@@ -281,20 +297,7 @@ impl NetworkModel {
             if slot == self.wifi.len() {
                 self.wifi.push(WifiHistory::default());
             }
-            let entry = &mut self.wifi[slot];
-            if entry.ifindex != sample.ifindex {
-                entry.signal.reset();
-            }
-            entry.ifindex = sample.ifindex;
-            entry.sample.clone_from(sample);
-            entry.live = true;
-            entry.signal.push(sample.signal_dbm.map_or(f32::NAN, |dbm| {
-                if (-120..=0).contains(&dbm) {
-                    f32::from(dbm)
-                } else {
-                    f32::NAN
-                }
-            }));
+            store_wifi_sample(&mut self.wifi[slot], sample);
         }
         self.total = source.physical_or_all();
         self.overflow = 0;
@@ -361,6 +364,22 @@ impl NetworkModel {
     }
 }
 
+fn store_wifi_sample(entry: &mut WifiHistory, sample: &WifiRow) {
+    if entry.ifindex != sample.ifindex {
+        entry.signal.reset();
+    }
+    entry.ifindex = sample.ifindex;
+    entry.sample.clone_from(sample);
+    entry.live = true;
+    entry.signal.push(sample.signal_dbm.map_or(f32::NAN, |dbm| {
+        if (-120..=0).contains(&dbm) {
+            f32::from(dbm)
+        } else {
+            f32::NAN
+        }
+    }));
+}
+
 fn push_option(ring: &mut Ring, value: Option<f64>) {
     ring.push(value.map_or(f32::NAN, |rate| rate as f32));
 }
@@ -407,7 +426,7 @@ impl TabView for NetworkView<'_> {
         {
             demand.insert(CollectorId::Netdev);
         }
-        if panel == WIFI && !matches!(self.0.wifi_health, Health::Absent(_)) {
+        if panel == WIFI {
             demand.insert(CollectorId::NetWifi);
         }
         demand
