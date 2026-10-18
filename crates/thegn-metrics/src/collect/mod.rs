@@ -10,6 +10,18 @@ pub mod health;
 pub mod instances;
 #[cfg(target_os = "linux")]
 pub mod linux;
+#[cfg(target_os = "linux")]
+pub(crate) use linux::proc_backend;
+#[cfg(not(target_os = "linux"))]
+#[path = "proc_backend_stub.rs"]
+pub(crate) mod proc_backend;
+
+pub(crate) struct ProcSampleRequest<'a> {
+    pub rows: usize,
+    pub self_pid: u32,
+    pub daemon_pid: Option<u32>,
+    pub pane_pids: &'a [(u32, u32)],
+}
 pub mod model;
 pub mod parse;
 pub mod policy;

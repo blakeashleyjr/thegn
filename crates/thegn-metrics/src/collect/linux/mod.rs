@@ -19,6 +19,7 @@ pub mod netdev;
 pub mod netlink;
 pub mod power_supply;
 pub mod powercap;
+pub(crate) mod proc_backend;
 pub mod procfile;
 pub mod psi;
 pub mod sock_diag;
