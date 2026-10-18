@@ -1006,7 +1006,7 @@ fn gpu_temperature_history_is_bounded_and_right_aligned() {
 fn narrow_package_graph_clamps_and_keeps_newest_sample_at_right_edge() {
     for unicode in [UnicodeLevel::Ascii, UnicodeLevel::Full] {
         test_override::with_unicode(unicode, || {
-            let mut model = ThermalModel {
+            let model = ThermalModel {
                 temp_history: [vec![40.0; HISTORY_CAP - 1], vec![95.0]].concat(),
                 ..ThermalModel::default()
             };
