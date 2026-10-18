@@ -243,9 +243,9 @@ fn totals_ignore_missing_metric_rows_and_table_pids_keep_their_column() {
         .iter()
         .find(|panel| panel.id == super::TABLE)
         .unwrap();
-    let row_y = table.y + 2;
+    let row_y = table.rect.y + 2;
     let line = text(&surface).lines().nth(row_y).unwrap().to_owned();
-    let pids_x = table.x + 1 + super::TABLE_PIDS;
+    let pids_x = table.rect.x + 1 + super::TABLE_PIDS;
     assert!(
         line.chars()
             .skip(pids_x)
@@ -257,7 +257,7 @@ fn totals_ignore_missing_metric_rows_and_table_pids_keep_their_column() {
 }
 
 #[test]
-fn history_right_edge_tracks_the_newest_sample_and_leaves_a_gap_blank() {
+fn history_right_edge_tracks_the_newest_sample_and_holds_an_interior_gap() {
     let ids = ["scope-cpu-123456"];
     let mut model = ContainersModel::default();
     for tick in 0..120 {
@@ -269,8 +269,8 @@ fn history_right_edge_tracks_the_newest_sample_and_leaves_a_gap_blank() {
     let area = Rect::full(240, 60);
     let placed = board.placed(&view, area);
     let cpu = placed.iter().find(|panel| panel.id == super::CPU).unwrap();
-    let sample_x = cpu.x + cpu.cols - 2;
-    let graph_y = cpu.y + cpu.rows - 2;
+    let sample_x = cpu.rect.x + cpu.rect.cols - 2;
+    let graph_y = cpu.rect.y + cpu.rect.rows - 2;
     let mut surface = Surface::new(240, 60);
     caps::test_override::with_unicode(UnicodeLevel::Full, || {
         board.paint(&view, &mut surface, area, 0, &[])
@@ -293,16 +293,35 @@ fn history_right_edge_tracks_the_newest_sample_and_leaves_a_gap_blank() {
     let mut gap = frame(121, &ids);
     gap.parts.containers_stats.rows[0].gap = true;
     model.absorb_frame(&gap);
+    let mut ordered = [f32::NAN; super::HISTORY_CAP];
+    let len = model.cpu_total.ordered(&mut ordered);
+    assert_eq!(ordered[len - 1], ordered[len - 2]);
     let gap_view = ContainersView::new(&model, &inventory);
     let mut gap_surface = Surface::new(240, 60);
     caps::test_override::with_unicode(UnicodeLevel::Full, || {
         board.paint(&gap_view, &mut gap_surface, area, 0, &[])
     });
-    assert_eq!(
-        last_cell(&gap_surface),
-        ' ',
-        "newest gap must leave the right edge blank"
+    let held = last_cell(&gap_surface);
+    assert!(
+        held != ' ' && held != '\u{2800}',
+        "held gap cell was {held:?}"
     );
+}
+
+#[test]
+fn leading_gap_does_not_create_a_history_sample() {
+    let mut model = ContainersModel::default();
+    let mut gap = frame(0, &["scope-leading-gap"]);
+    gap.parts.containers_stats.rows[0].gap = true;
+    model.absorb_frame(&gap);
+
+    let slot = model
+        .slots
+        .iter()
+        .find(|slot| slot.id.as_deref() == Some("scope-leading-gap"))
+        .unwrap();
+    assert_eq!(slot.cpu_history.len, 0);
+    assert_eq!(model.cpu_total.len, 0);
 }
 
 #[test]
