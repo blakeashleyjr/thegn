@@ -5,9 +5,12 @@ use std::time::{Duration, Instant};
 use sysinfo::Pid;
 
 use crate::collect::ProcSampleRequest as SampleRequest;
-use crate::procs::{ProcOwner, ProcSample, ProcSnapshot};
+use crate::procs::{
+    ProcOwner, ProcOwnerSummary, ProcOwnerTotals, ProcSample, ProcSnapshot, ProcSummary,
+};
 use crate::procs_fs::ProcFs;
 use crate::procs_linux::{ProcTable, RealProcFs, clock_ticks_per_second, kept_max_from_rlimit};
+use crate::procs_model::ProcState;
 
 const TOP_N: usize = 32;
 const MAX_ANCESTRY: usize = 16;
@@ -58,6 +61,9 @@ pub(crate) struct NativeBackend<F: ProcFs> {
     ticks_per_second: Option<u64>,
     page_size: Option<u64>,
     previous_pids: Vec<u32>,
+    previous_ids: Vec<(u32, u64)>,
+    current_ids: Vec<(u32, u64)>,
+    has_previous_ids: bool,
     pass_time: Duration,
     last_sample: Option<Instant>,
     scratch: Vec<(Pid, f32, u64)>,
@@ -95,6 +101,9 @@ impl<F: ProcFs> NativeBackend<F> {
             ticks_per_second,
             page_size,
             previous_pids: Vec::new(),
+            previous_ids: Vec::new(),
+            current_ids: Vec::new(),
+            has_previous_ids: false,
             pass_time: Duration::ZERO,
             last_sample: None,
             scratch: Vec::new(),
@@ -106,6 +115,9 @@ impl<F: ProcFs> NativeBackend<F> {
     pub(crate) fn reset(&mut self) {
         self.table.reset();
         self.previous_pids.clear();
+        self.previous_ids.clear();
+        self.current_ids.clear();
+        self.has_previous_ids = false;
         self.pass_time = Duration::ZERO;
         self.last_sample = None;
         self.scratch.clear();
@@ -157,6 +169,97 @@ fn project_native_table<F: ProcFs>(
 ) -> (ProcSnapshot, Vec<Pid>) {
     let table = &native.table;
     let live = table.entries().iter().filter(|entry| !entry.ghost).count();
+    let mut summary = ProcSummary {
+        tasks: live,
+        new: None,
+        exited: None,
+        ..ProcSummary::default()
+    };
+    native.current_ids.clear();
+    native.current_ids.reserve(live);
+    let mut owners = ProcOwnerSummary {
+        ui: owner_totals(native.page_size),
+        daemon: owner_totals(native.page_size),
+        panes: owner_totals(native.page_size),
+        other: owner_totals(native.page_size),
+    };
+    let mut cpu_samples = [0_usize; 4];
+    for entry in table.entries().iter().filter(|entry| !entry.ghost) {
+        let stat = &entry.stat;
+        native.current_ids.push((entry.id.pid, stat.starttime));
+        summary.threads = summary.threads.saturating_add(stat.num_threads);
+        summary.kernel_threads += usize::from(stat.is_kthread() || stat.ppid == 2);
+        match stat.state {
+            ProcState::Running => summary.running += 1,
+            ProcState::Sleeping => summary.sleeping += 1,
+            ProcState::DiskSleep => summary.disk_sleep += 1,
+            ProcState::Zombie => summary.zombies += 1,
+            ProcState::Stopped | ProcState::TracingStop => summary.stopped += 1,
+            ProcState::Idle => summary.idle += 1,
+            _ => {}
+        }
+        let owner = owner_of_table(
+            table,
+            entry.id.pid,
+            request.self_pid,
+            request.daemon_pid,
+            request.pane_pids,
+        );
+        let (totals, cpu_sample_count) = match owner {
+            ProcOwner::ThegnSelf => (&mut owners.ui, &mut cpu_samples[0]),
+            ProcOwner::ThegnDaemon => (&mut owners.daemon, &mut cpu_samples[1]),
+            ProcOwner::Pane(_) => (&mut owners.panes, &mut cpu_samples[2]),
+            ProcOwner::Other => (&mut owners.other, &mut cpu_samples[3]),
+        };
+        totals.count += 1;
+        if let Some(cpu) = entry.cpu_delta.and_then(|delta| delta.percent) {
+            totals.cpu_pct = totals.cpu_pct.map(|total| total + cpu);
+            *cpu_sample_count += 1;
+        }
+        if let Some(rss) = native.page_size.and_then(|page_size| {
+            u64::try_from(stat.rss_pages.max(0))
+                .ok()
+                .and_then(|pages| pages.checked_mul(page_size))
+        }) {
+            if let Some(total) = &mut totals.rss_bytes {
+                *total = total.saturating_add(rss);
+            }
+        } else {
+            totals.rss_bytes = None;
+        }
+    }
+    native.current_ids.sort_unstable();
+    if native.has_previous_ids {
+        summary.new = Some(
+            native
+                .current_ids
+                .iter()
+                .filter(|identity| native.previous_ids.binary_search(identity).is_err())
+                .count(),
+        );
+        summary.exited = Some(
+            native
+                .previous_ids
+                .iter()
+                .filter(|identity| native.current_ids.binary_search(identity).is_err())
+                .count(),
+        );
+    }
+    std::mem::swap(&mut native.previous_ids, &mut native.current_ids);
+    native.has_previous_ids = true;
+    if cpu_samples[0] == 0 {
+        owners.ui.cpu_pct = None;
+    }
+    if cpu_samples[1] == 0 {
+        owners.daemon.cpu_pct = None;
+    }
+    if cpu_samples[2] == 0 {
+        owners.panes.cpu_pct = None;
+    }
+    if cpu_samples[3] == 0 {
+        owners.other.cpu_pct = None;
+    }
+    summary.owners = owners;
     native.scratch.clear();
     native.scratch.reserve(live);
     for entry in table.entries().iter().filter(|entry| !entry.ghost) {
@@ -233,9 +336,18 @@ fn project_native_table<F: ProcFs>(
             total: live,
             primed: request.primed,
             enabled: true,
+            summary: Some(summary),
         },
         chosen,
     )
+}
+
+fn owner_totals(page_size: Option<u64>) -> ProcOwnerTotals {
+    ProcOwnerTotals {
+        count: 0,
+        cpu_pct: Some(0.0),
+        rss_bytes: page_size.map(|_| 0),
+    }
 }
 
 fn owner_of_table<F: ProcFs>(

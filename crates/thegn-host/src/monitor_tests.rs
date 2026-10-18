@@ -917,6 +917,7 @@ fn model_with_procs(procs: Vec<thegn_metrics::ProcSample>) -> FrameModel {
         procs,
         primed: true,
         enabled: true,
+        summary: None,
     };
     m.process_state = crate::model_eq::ProcessViewState::Fresh;
     m
