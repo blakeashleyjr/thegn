@@ -6,7 +6,7 @@ use crate::{
     compositor::Rect,
     seg::{StyleTok, Tok},
 };
-use termwiz::surface::Surface;
+use termwiz::surface::{Change, Surface};
 use thegn_core::{
     numfmt::{NumFmt, Reading, Unit},
     termcaps::{ColorDepth, UnicodeLevel},
@@ -741,6 +741,14 @@ fn emitted_cells_reach_the_wire_diff() {
     );
     let mut emitted = Surface::new(5, 1);
     emit::Emitter::default().emit(&grid, Rect::full(5, 1), &mut emitted, 0, 0);
+    assert_eq!(rows(&mut emitted)[0], "wire!");
+    {
+        let emitted_cells = emitted.screen_cells();
+        assert_ne!(
+            emitted_cells[0][0].attrs(),
+            &termwiz::cell::CellAttributes::default()
+        );
+    }
     let mut frame = Surface::new(5, 1);
     let changes = frame.diff_screens(&emitted);
     frame.add_changes(changes);
@@ -762,6 +770,7 @@ fn emit_clips_to_a_smaller_surface_without_wrapping() {
     }
     let mut surface = Surface::new(6, 2);
     emit::Emitter::default().emit(&grid, Rect::full(7, 2), &mut surface, 0, 0);
+    assert_eq!(rows(&mut surface)[0], "12345 ");
     let cells = surface.screen_cells();
     assert_eq!(cells[0][5].str(), " ");
     assert_eq!(cells[1][0].str(), "s");
@@ -798,8 +807,28 @@ fn table_zero_dot_uses_active_marks() {
         );
         let zero = caps::num_marks().zero;
         assert!(zero.is_ascii());
-        assert!((0..5).any(|x| grid.get(x, 1).unwrap().ch.to_string() == zero));
+        let row: String = (0..5)
+            .filter_map(|x| grid.get(x, 1))
+            .map(|cell| cell.ch)
+            .collect();
+        assert!(row.contains(zero));
+        assert!(!row.contains(thegn_core::numfmt::Marks::UNICODE.zero));
     });
+}
+
+#[test]
+fn emit_nerfs_a_wide_destination_cell_at_the_left_edge() {
+    let mut surface = Surface::new(6, 1);
+    surface.add_change(Change::CursorPosition { x: 2, y: 0 });
+    surface.add_change(Change::Text("界".into()));
+
+    let mut grid = CellGrid::new(1, 1);
+    grid.view(Rect::full(1, 1)).put(0, 0, CellStyle::default());
+    emit::Emitter::default().emit(&grid, Rect::full(1, 1), &mut surface, 3, 0);
+
+    let cells = surface.screen_cells();
+    assert_eq!(cells[0][2].str(), " ");
+    assert_eq!(cells[0][3].str(), " ");
 }
 
 #[test]
