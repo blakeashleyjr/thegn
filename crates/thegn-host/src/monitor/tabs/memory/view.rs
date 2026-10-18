@@ -512,7 +512,7 @@ impl MemoryView<'_> {
             {
                 format!(
                     "thegn.slice {} {} no limit",
-                    fmt_bytes(Some(current)),
+                    fmt_bytes(Some(current)).trim(),
                     crate::caps::active_glyphs().middot
                 )
             }

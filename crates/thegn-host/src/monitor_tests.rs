@@ -1922,7 +1922,7 @@ fn disk_volume_row_displays_collapsed_mount_count() {
 #[test]
 fn memory_tab_wires_board_demand_and_freezes_frames() {
     let hist = TelemetryHistory::default();
-    let screen = Rect::full(120, 40);
+    let screen = Rect::full(160, 60);
     let stats = StatsSnapshot {
         mem_gib: Some((8.0, 32.0)),
         mem_free_gib: Some(3.0),
@@ -1933,6 +1933,7 @@ fn memory_tab_wires_board_demand_and_freezes_frames() {
     let placed = ov.placed_panels();
     assert!(placed.iter().any(|panel| panel.id.0.starts_with("memory.")));
     assert!(!placed.iter().any(|panel| panel.id.0 == "legacy"));
+    assert!(placed.iter().any(|panel| panel.id.0 == "memory.limit"));
     let demand = {
         use super::board::TabView as _;
         let view = ov.view();
