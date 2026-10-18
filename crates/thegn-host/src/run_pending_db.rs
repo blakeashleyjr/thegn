@@ -1,7 +1,30 @@
 //! User initiated DB work whose results are applied by the loop.
+//!
+//! Critical jobs whose database cannot be opened remain retained for retry, so their pending UI status
+//! stays until the database returns; this is intentional because those writes have not been lost.
 
 use std::path::Path;
 use thegn_core::store::{AccountStore, WorkspaceStore};
+
+struct ResultOnDrop<F: FnOnce()>(Option<F>);
+
+impl<F: FnOnce()> ResultOnDrop<F> {
+    fn new(notify_failure: F) -> Self {
+        Self(Some(notify_failure))
+    }
+
+    fn disarm(&mut self) {
+        self.0.take();
+    }
+}
+
+impl<F: FnOnce()> Drop for ResultOnDrop<F> {
+    fn drop(&mut self) {
+        if let Some(notify_failure) = self.0.take() {
+            notify_failure();
+        }
+    }
+}
 
 #[derive(Debug, Clone)]
 pub(crate) enum PendingDbResult {
@@ -293,13 +316,35 @@ pub(crate) fn queue_pool_target_adjust(
     wt: String,
     delta: i64,
 ) {
+    crate::db_task::persist_critical(pool_target_job(tx, waker, cfg, wt, delta));
+}
+
+fn pool_target_job(
+    tx: &tokio::sync::mpsc::UnboundedSender<PendingDbResult>,
+    waker: &termwiz::terminal::TerminalWaker,
+    cfg: thegn_core::config::Config,
+    wt: String,
+    delta: i64,
+) -> impl FnOnce(&thegn_core::db::Db) + Send + 'static {
     let tx = tx.clone();
     let waker = waker.clone();
-    crate::db_task::persist_critical(move |db| {
-        run_pool_target_adjust(db, &cfg, &wt, delta, |result| {
-            send_result(&tx, &waker, result)
-        });
+    let failure_tx = tx.clone();
+    let failure_waker = waker.clone();
+    let mut result_on_drop = ResultOnDrop::new(move || {
+        send_result(
+            &failure_tx,
+            &failure_waker,
+            PendingDbResult::PoolTarget {
+                status: "pool target: not saved (database writer unavailable)".into(),
+            },
+        );
     });
+    move |db| {
+        run_pool_target_adjust(db, &cfg, &wt, delta, |result| {
+            send_result(&tx, &waker, result);
+            result_on_drop.disarm();
+        });
+    }
 }
 
 fn run_pool_target_adjust(
@@ -318,9 +363,28 @@ pub(crate) fn queue_host_add(
     waker: &termwiz::terminal::TerminalWaker,
     request: HostAddRequest,
 ) {
+    crate::db_task::persist_critical(host_add_job(tx, waker, request));
+}
+
+fn host_add_job(
+    tx: &tokio::sync::mpsc::UnboundedSender<PendingDbResult>,
+    waker: &termwiz::terminal::TerminalWaker,
+    request: HostAddRequest,
+) -> impl FnOnce(&thegn_core::db::Db) + Send + 'static {
     let tx = tx.clone();
     let waker = waker.clone();
-    crate::db_task::persist_critical(move |db| {
+    let failure_tx = tx.clone();
+    let failure_waker = waker.clone();
+    let mut result_on_drop = ResultOnDrop::new(move || {
+        send_result(
+            &failure_tx,
+            &failure_waker,
+            PendingDbResult::HostAddFailed {
+                status: "add host: not saved (database writer unavailable)".into(),
+            },
+        );
+    });
+    move |db| {
         let result = crate::handlers::wizard::store_host_def(
             db,
             &request.name,
@@ -328,8 +392,11 @@ pub(crate) fn queue_host_add(
             request.cfg_has_name,
             request.now,
         );
-        run_host_add(request, result, |result| send_result(&tx, &waker, result));
-    });
+        run_host_add(request, result, |result| {
+            send_result(&tx, &waker, result);
+            result_on_drop.disarm();
+        });
+    }
 }
 
 fn run_host_add(
@@ -957,6 +1024,137 @@ mod tests {
             rx.try_recv(),
             Ok(PendingDbResult::HostAdded { name, defs, then: HostAddThen::Panel })
                 if name == "host-example" && defs.iter().any(|(stored, _)| stored == "host-example")
+        ));
+        assert!(matches!(
+            rx.try_recv(),
+            Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+        ));
+    }
+
+    #[test]
+    fn dropped_host_add_job_reports_unavailable_once_and_running_job_reports_added_once() {
+        if !crate::platform::sound_process::test_support::UNIX {
+            return;
+        }
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let (waker, _master, _terminal) =
+            crate::platform::sound_process::test_support::test_waker();
+        let (name, hc) =
+            thegn_core::host_config::parse_host_target("alice@host.example", None).unwrap();
+        let request = HostAddRequest {
+            name: name.clone(),
+            hc: hc.clone(),
+            cfg_has_name: false,
+            then: HostAddThen::Panel,
+            now: 123,
+        };
+
+        drop(host_add_job(&tx, &waker, request));
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(PendingDbResult::HostAddFailed { status })
+                if status == "add host: not saved (database writer unavailable)"
+        ));
+        assert!(matches!(
+            rx.try_recv(),
+            Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+        ));
+
+        let db = thegn_core::db::Db::open_memory().unwrap();
+        host_add_job(
+            &tx,
+            &waker,
+            HostAddRequest {
+                name: name.clone(),
+                hc,
+                cfg_has_name: false,
+                then: HostAddThen::Panel,
+                now: 123,
+            },
+        )(&db);
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(PendingDbResult::HostAdded { name: added, .. }) if added == name
+        ));
+        assert!(matches!(
+            rx.try_recv(),
+            Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+        ));
+    }
+
+    #[test]
+    fn dropped_pool_target_job_reports_unavailable_once_and_running_job_reports_once() {
+        if !crate::platform::sound_process::test_support::UNIX {
+            return;
+        }
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let (waker, _master, _terminal) =
+            crate::platform::sound_process::test_support::test_waker();
+
+        drop(pool_target_job(
+            &tx,
+            &waker,
+            thegn_core::config::Config::default(),
+            "/local/wt".into(),
+            1,
+        ));
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(PendingDbResult::PoolTarget { status })
+                if status == "pool target: not saved (database writer unavailable)"
+        ));
+        assert!(matches!(
+            rx.try_recv(),
+            Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+        ));
+
+        let db = thegn_core::db::Db::open_memory().unwrap();
+        pool_target_job(
+            &tx,
+            &waker,
+            thegn_core::config::Config::default(),
+            "/local/wt".into(),
+            1,
+        )(&db);
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(PendingDbResult::PoolTarget { status })
+                if status == "warm pool: only for provider (remote) workspaces"
+        ));
+        assert!(matches!(
+            rx.try_recv(),
+            Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+        ));
+    }
+
+    #[test]
+    fn closed_writer_drops_host_add_job_and_guard_reports_failure() {
+        if !crate::platform::sound_process::test_support::UNIX {
+            return;
+        }
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let (waker, _master, _terminal) =
+            crate::platform::sound_process::test_support::test_waker();
+        let (name, hc) =
+            thegn_core::host_config::parse_host_target("alice@host.example", None).unwrap();
+
+        assert!(!crate::db_task::persist_critical_to_closed_writer_for_test(
+            host_add_job(
+                &tx,
+                &waker,
+                HostAddRequest {
+                    name,
+                    hc,
+                    cfg_has_name: false,
+                    then: HostAddThen::Panel,
+                    now: 123,
+                },
+            ),
+        ));
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(PendingDbResult::HostAddFailed { status })
+                if status == "add host: not saved (database writer unavailable)"
         ));
         assert!(matches!(
             rx.try_recv(),
