@@ -1,10 +1,19 @@
 //! Bounded Wi-Fi interface and connected-station rows.
 use super::super::frame::Part;
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct InlineBytes<const N: usize> {
     pub bytes: [u8; N],
     pub len: u8,
+}
+
+impl<const N: usize> Default for InlineBytes<N> {
+    fn default() -> Self {
+        Self {
+            bytes: [0; N],
+            len: 0,
+        }
+    }
 }
 
 impl<const N: usize> InlineBytes<N> {

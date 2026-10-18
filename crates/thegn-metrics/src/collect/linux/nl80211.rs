@@ -151,16 +151,17 @@ pub fn dump_interfaces(
     family_id: u16,
     out: &mut Vec<Interface>,
     truncated: &mut bool,
+    request: &mut Vec<u8>,
     deadline: Instant,
 ) -> io::Result<()> {
     out.clear();
     *truncated = false;
     let sequence = socket.next_sequence();
-    let mut request = Vec::with_capacity(20);
-    push_header(&mut request, family_id, DUMP, sequence);
-    push_genl(&mut request, CMD_GET_INTERFACE, 1);
-    set_message_len(&mut request);
-    socket.send(&request)?;
+    request.clear();
+    push_header(request, family_id, DUMP, sequence);
+    push_genl(request, CMD_GET_INTERFACE, 1);
+    set_message_len(request);
+    socket.send(request)?;
     receive_dump(socket, sequence, deadline, out, |message, out| {
         if message.header.kind == family_id {
             let (command, payload) = genl_parts(message.payload)?;
@@ -224,44 +225,29 @@ pub fn dump_station(
     socket: &mut NetlinkSocket,
     family_id: u16,
     ifindex: u32,
+    request: &mut Vec<u8>,
     deadline: Instant,
 ) -> io::Result<Option<Station>> {
     let sequence = socket.next_sequence();
-    let mut request = Vec::with_capacity(28);
-    push_header(&mut request, family_id, DUMP, sequence);
-    push_genl(&mut request, CMD_GET_STATION, 1);
-    push_attr(&mut request, ATTR_IFINDEX, &ifindex.to_ne_bytes());
-    set_message_len(&mut request);
+    request.clear();
+    push_header(request, family_id, DUMP, sequence);
+    push_genl(request, CMD_GET_STATION, 1);
+    push_attr(request, ATTR_IFINDEX, &ifindex.to_ne_bytes());
+    set_message_len(request);
+    socket.send(request)?;
     let mut station = None;
-    loop {
-        socket.recv(deadline)?;
-        let mut messages = MessageIter::for_sequence(socket.received(), sequence);
-        for item in &mut messages {
-            let message = item?;
-            if message.header.sequence != sequence {
-                continue;
-            }
-            if message.header.kind == NLMSG_DONE {
-                if message.header.flags & NLM_F_DUMP_INTR != 0 {
-                    return Err(io::Error::new(
-                        io::ErrorKind::Interrupted,
-                        "nl80211 dump interrupted",
-                    ));
-                }
-                if let Some(error) = get_i32(message.payload, 0).filter(|error| *error < 0) {
-                    return Err(io::Error::from_raw_os_error(error.saturating_neg()));
-                }
-                return Ok(station);
-            }
-            if message.header.kind == family_id && station.is_none() {
-                let (_, payload) = genl_parts(message.payload)?;
-                let decoded = decode_station(payload);
-                if decoded.bssid.is_some() {
-                    station = Some(decoded);
-                }
+    let mut ignored = Vec::new();
+    receive_dump(socket, sequence, deadline, &mut ignored, |message, _out| {
+        if message.header.kind == family_id && station.is_none() {
+            let (_, payload) = genl_parts(message.payload)?;
+            let decoded = decode_station(payload);
+            if decoded.bssid.is_some() {
+                station = Some(decoded);
             }
         }
-    }
+        Ok(())
+    })?;
+    Ok(station)
 }
 
 /// Masks every octet of a MAC/BSSID.
