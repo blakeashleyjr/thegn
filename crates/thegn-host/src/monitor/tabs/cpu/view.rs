@@ -1,4 +1,4 @@
-use crate::telemetry::{Metric, ScaleMode, SeriesReq, TelemetryHistory, Window};
+use crate::telemetry::{Metric, ScaleMode, SeriesBuf, SeriesReq, TelemetryHistory, Window};
 use crate::{
     compositor::Rect,
     monitor::{
@@ -153,6 +153,7 @@ pub(in crate::monitor) struct CpuModel {
     idle: thegn_metrics::collect::model::cpu_idle::CpuIdlePart,
     cpu_history: Vec<f32>,
     load_history: Vec<f32>,
+    history_buf: SeriesBuf,
     core_busy_history: Vec<SampleRing>,
     iowait_history: SampleRing,
     steal_history: SampleRing,
@@ -283,18 +284,22 @@ impl CpuModel {
             (Metric::Cpu, &mut self.cpu_history),
             (Metric::Load, &mut self.load_history),
         ] {
-            let series = history.series(&SeriesReq {
-                metric,
-                window,
-                scale: TelemetryHistory::scale_for(metric, scale),
-                buckets: 240,
-                agg: thegn_core::series::Agg::Max,
-                now_ms,
-            });
-            if series.empty {
+            history.series_into(
+                &SeriesReq {
+                    metric,
+                    window,
+                    scale: TelemetryHistory::scale_for(metric, scale),
+                    buckets: 240,
+                    agg: thegn_core::series::Agg::Max,
+                    now_ms,
+                },
+                &mut self.history_buf,
+            );
+            if self.history_buf.empty() {
                 slot.clear();
             } else {
-                slot.clone_from(&series.hi);
+                slot.clear();
+                slot.extend_from_slice(self.history_buf.hi());
             }
         }
     }
@@ -382,3 +387,7 @@ mod paint;
 #[cfg(test)]
 #[path = "cpu_view_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "view_budget_tests.rs"]
+mod budget_tests;
