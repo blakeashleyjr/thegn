@@ -503,9 +503,6 @@ pub fn signal_pid(pid: u32, sig: super::ProcSignal) -> Result<(), String> {
         super::ProcSignal::Kill => nix::sys::signal::Signal::SIGKILL,
         super::ProcSignal::Hangup => nix::sys::signal::Signal::SIGHUP,
         super::ProcSignal::Interrupt => nix::sys::signal::Signal::SIGINT,
-        super::ProcSignal::Quit => nix::sys::signal::Signal::SIGQUIT,
-        super::ProcSignal::User1 => nix::sys::signal::Signal::SIGUSR1,
-        super::ProcSignal::User2 => nix::sys::signal::Signal::SIGUSR2,
         super::ProcSignal::Stop => nix::sys::signal::Signal::SIGSTOP,
         super::ProcSignal::Continue => nix::sys::signal::Signal::SIGCONT,
     };

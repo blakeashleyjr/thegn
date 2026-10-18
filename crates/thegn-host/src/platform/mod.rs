@@ -156,6 +156,13 @@ pub fn terminate_proxy_pid(_pid: u32, _expected_start_time: Option<u64>) -> bool
 /// exposes only termination; `signal_identity()` rejects other variants
 /// before opening the target process. See [`signal_identity()`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(
+    windows,
+    allow(
+        dead_code,
+        reason = "the Windows menu offers terminate only; the other variants are unix signals"
+    )
+)]
 pub enum ProcSignal {
     /// Graceful termination request (unix `SIGTERM`; Windows hard terminate).
     Terminate,
@@ -165,12 +172,6 @@ pub enum ProcSignal {
     Hangup,
     /// Interrupt (`SIGINT`).
     Interrupt,
-    /// Quit (`SIGQUIT`).
-    Quit,
-    /// User signal 1 (`SIGUSR1`).
-    User1,
-    /// User signal 2 (`SIGUSR2`).
-    User2,
     /// Stop (`SIGSTOP`).
     Stop,
     /// Continue (`SIGCONT`).
@@ -185,11 +186,20 @@ impl ProcSignal {
             Self::Kill => "KILL",
             Self::Hangup => "HUP",
             Self::Interrupt => "INT",
-            Self::Quit => "QUIT",
-            Self::User1 => "USR1",
-            Self::User2 => "USR2",
             Self::Stop => "STOP",
             Self::Continue => "CONT",
+        }
+    }
+
+    /// Letter used to choose this signal from the monitor menu.
+    pub fn menu_key(self) -> char {
+        match self {
+            Self::Terminate => 't',
+            Self::Interrupt => 'i',
+            Self::Hangup => 'h',
+            Self::Kill => 'k',
+            Self::Stop => 's',
+            Self::Continue => 'c',
         }
     }
 

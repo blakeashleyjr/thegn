@@ -75,9 +75,6 @@ fn signal_number(sig: ProcSignal) -> libc::c_int {
         ProcSignal::Kill => libc::SIGKILL,
         ProcSignal::Hangup => libc::SIGHUP,
         ProcSignal::Interrupt => libc::SIGINT,
-        ProcSignal::Quit => libc::SIGQUIT,
-        ProcSignal::User1 => libc::SIGUSR1,
-        ProcSignal::User2 => libc::SIGUSR2,
         ProcSignal::Stop => libc::SIGSTOP,
         ProcSignal::Continue => libc::SIGCONT,
     }
@@ -529,12 +526,9 @@ mod signal_mapping_tests {
     fn menu_order_and_signal_numbers_match_the_supported_linux_menu() {
         let expected = [
             (ProcSignal::Terminate, libc::SIGTERM),
-            (ProcSignal::Kill, libc::SIGKILL),
-            (ProcSignal::Hangup, libc::SIGHUP),
             (ProcSignal::Interrupt, libc::SIGINT),
-            (ProcSignal::Quit, libc::SIGQUIT),
-            (ProcSignal::User1, libc::SIGUSR1),
-            (ProcSignal::User2, libc::SIGUSR2),
+            (ProcSignal::Hangup, libc::SIGHUP),
+            (ProcSignal::Kill, libc::SIGKILL),
             (ProcSignal::Stop, libc::SIGSTOP),
             (ProcSignal::Continue, libc::SIGCONT),
         ];
