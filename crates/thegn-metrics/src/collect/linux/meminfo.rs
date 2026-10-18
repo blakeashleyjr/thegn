@@ -168,7 +168,9 @@ mod tests {
         let block = dir.path().join("block");
         fs::create_dir_all(&proc_dir).unwrap();
         fs::create_dir_all(&block).unwrap();
-        fs::create_dir_all(block.join("zram0/mm_stat")).unwrap();
+        fs::create_dir_all(block.join("zram0")).unwrap();
+        let mm_stat = block.join("zram0/mm_stat");
+        fs::write(&mm_stat, b"100 50 60 0 70 2 3 4 5\n").unwrap();
         let path = proc_dir.join("meminfo");
         fs::write(&path, b"MemTotal: 10 kB\nMemAvailable: 4 kB\n").unwrap();
         let mut collector = MeminfoCollector::with_roots(&path, proc_dir.join("swaps"), &block);
@@ -177,39 +179,46 @@ mod tests {
         collector.sample(&TickCtx::default(), &mut frame).unwrap();
         assert!(!frame.parts.meminfo.swaps_present);
         assert!(frame.parts.meminfo.raw.get(MemField::MemTotal).is_some());
-        assert_eq!(frame.parts.meminfo.zram[0].mm, None);
-        let buffer_ptr = collector
-            .meminfo
-            .as_mut()
-            .unwrap()
-            .read_all()
-            .unwrap()
-            .as_ptr();
-        let writer = fs::OpenOptions::new().write(true).open(&path).unwrap();
-        writer.set_len(0).unwrap();
-        writer
-            .write_at(b"MemTotal: 20 kB\nMemAvailable: 5 kB\n", 0)
-            .unwrap();
-        collector
-            .sample(
-                &TickCtx {
-                    tick: 1,
-                    now_ms: 1000,
-                },
-                &mut frame,
+        assert!(frame.parts.meminfo.zram[0].mm.is_some());
+        let (buffer_ptr, buffer_capacity) = {
+            let reader = collector.meminfo.as_mut().unwrap();
+            (
+                reader.read_all().unwrap().as_ptr(),
+                reader.buffer_capacity(),
             )
-            .unwrap();
-        assert_eq!(
+        };
+        for (tick, total, available) in [(1, 20, 5), (2, 30, 7), (3, 40, 9)] {
+            let writer = fs::OpenOptions::new().write(true).open(&path).unwrap();
+            writer.set_len(0).unwrap();
+            writer
+                .write_at(
+                    format!("MemTotal: {total} kB\nMemAvailable: {available} kB\n").as_bytes(),
+                    0,
+                )
+                .unwrap();
             collector
-                .meminfo
-                .as_mut()
-                .unwrap()
-                .read_all()
-                .unwrap()
-                .as_ptr(),
-            buffer_ptr
-        );
-        assert_eq!(frame.parts.meminfo.used_bytes(), Some(15 * 1024));
+                .sample(
+                    &TickCtx {
+                        tick,
+                        now_ms: u64::from(tick) * 1000,
+                    },
+                    &mut frame,
+                )
+                .unwrap();
+            let reader = collector.meminfo.as_mut().unwrap();
+            assert_eq!(reader.read_all().unwrap().as_ptr(), buffer_ptr);
+            assert_eq!(reader.buffer_capacity(), buffer_capacity);
+            assert_eq!(
+                frame.parts.meminfo.used_bytes(),
+                Some((total - available) * 1024)
+            );
+        }
+        fs::remove_file(&mm_stat).unwrap();
+        fs::create_dir(&mm_stat).unwrap();
+        assert_eq!(collector.discover(&Env::default()), Health::Warming);
+        collector.sample(&TickCtx::default(), &mut frame).unwrap();
+        assert!(frame.parts.meminfo.raw.get(MemField::MemTotal).is_some());
+        assert_eq!(frame.parts.meminfo.zram[0].mm, None);
         collector.close();
         assert!(collector.sample(&TickCtx::default(), &mut frame).is_err());
     }

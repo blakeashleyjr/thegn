@@ -1,5 +1,7 @@
 //! Header-driven parser for `/proc/swaps`.
 
+use super::parse_u64;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SwapKind {
     Partition,
@@ -117,18 +119,6 @@ pub fn parse(buf: &[u8], out: &mut Vec<SwapDev>) {
         count += 1;
     }
     out.truncate(count);
-}
-
-fn parse_u64(input: &[u8]) -> Option<u64> {
-    if input.is_empty() {
-        return None;
-    }
-    input.iter().try_fold(0_u64, |value, digit| {
-        if !digit.is_ascii_digit() {
-            return None;
-        }
-        value.checked_mul(10)?.checked_add(u64::from(*digit - b'0'))
-    })
 }
 
 fn parse_i32(input: &[u8]) -> Option<i32> {

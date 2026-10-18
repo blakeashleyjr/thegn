@@ -120,7 +120,10 @@ pub struct MeminfoRaw {
 
 impl Default for MeminfoRaw {
     fn default() -> Self {
-        Self { values: [0; MemField::COUNT], present: 0 }
+        Self {
+            values: [0; MemField::COUNT],
+            present: 0,
+        }
     }
 }
 
@@ -170,7 +173,20 @@ pub fn parse(buf: &[u8], out: &mut MeminfoRaw) {
 
 #[cfg(test)]
 mod tests {
-    use super::{MemField, MeminfoRaw, parse};
+    use super::{KEYS, MemField, MeminfoRaw, parse};
+
+    #[test]
+    fn key_table_covers_each_field_once() {
+        assert_eq!(KEYS.len(), MemField::COUNT);
+        let mut seen = [false; MemField::COUNT];
+        for (_, field) in KEYS {
+            let index = *field as usize;
+            assert!(index < MemField::COUNT);
+            assert!(!seen[index]);
+            seen[index] = true;
+        }
+        assert!(seen.into_iter().all(|present| present));
+    }
 
     #[test]
     fn parses_header_keys_units_and_absence() {

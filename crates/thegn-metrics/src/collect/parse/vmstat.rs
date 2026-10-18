@@ -107,7 +107,20 @@ pub fn field(buf: &[u8], key: &[u8]) -> Option<u64> {
 
 #[cfg(test)]
 mod tests {
-    use super::{VmField, VmstatRaw, field, parse};
+    use super::{KEYS, VmField, VmstatRaw, field, parse};
+
+    #[test]
+    fn key_table_covers_each_field_once() {
+        assert_eq!(KEYS.len(), VmField::COUNT);
+        let mut seen = [false; VmField::COUNT];
+        for (_, field) in KEYS {
+            let index = *field as usize;
+            assert!(index < VmField::COUNT);
+            assert!(!seen[index]);
+            seen[index] = true;
+        }
+        assert!(seen.into_iter().all(|present| present));
+    }
 
     #[test]
     fn exact_keys_and_old_kernel_absence() {
@@ -116,7 +129,8 @@ mod tests {
             include_bytes!("../../../tests/fixtures/mem/vmstat"),
             &mut raw,
         );
-        assert_eq!(raw.get(VmField::PgstealDirect), Some(42));
+        assert_eq!(raw.get(VmField::PgstealDirect), Some(3));
+        assert_eq!(raw.get(VmField::Pgfault), Some(30));
         assert_eq!(raw.get(VmField::Pswpin), Some(10));
         parse(
             include_bytes!("../../../tests/fixtures/mem/vmstat_old_kernel"),

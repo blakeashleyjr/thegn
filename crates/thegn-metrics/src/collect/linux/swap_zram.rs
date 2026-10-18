@@ -23,27 +23,24 @@ impl ZramFiles {
         let Ok(entries) = fs::read_dir(block_root) else {
             return;
         };
-        for entry in entries.flatten() {
-            if self.files.len() == 8 {
-                break;
-            }
-            let name = entry.file_name();
-            let name = name.to_string_lossy();
-            if !name.starts_with("zram") {
-                continue;
-            }
-            let path = entry.path().join("mm_stat");
-            let file = match ProcFile::open(path) {
-                Ok(file) => Some(file),
-                Err(_) => None,
-            };
+        let mut names: Vec<_> = entries
+            .flatten()
+            .filter_map(|entry| {
+                let name = entry.file_name();
+                let name = name.to_string_lossy();
+                name.starts_with("zram")
+                    .then_some((name.into_owned(), entry.path().join("mm_stat")))
+            })
+            .collect();
+        names.sort_by(|left, right| left.0.cmp(&right.0));
+        for (name, path) in names.into_iter().take(8) {
+            let file = ProcFile::open(path).ok();
             self.files.push(ZramFile {
-                name: name.into_owned(),
+                name,
                 file,
                 mm: None,
             });
         }
-        self.files.sort_by(|left, right| left.name.cmp(&right.name));
     }
 
     pub fn read_all(&mut self) {
@@ -82,5 +79,36 @@ impl ZramFiles {
 
     pub fn clear(&mut self) {
         self.files.clear();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ZramFiles;
+    use std::fs;
+
+    #[test]
+    fn discovery_sorts_names_before_applying_cap() {
+        let dir = tempfile::tempdir().unwrap();
+        for index in (0..10).rev() {
+            let device = dir.path().join(format!("zram{index:02}"));
+            fs::create_dir_all(&device).unwrap();
+            fs::write(device.join("mm_stat"), b"1 1 1 0 1 0 0\n").unwrap();
+        }
+        let mut files = ZramFiles::default();
+        files.discover(dir.path());
+        files.read_all();
+        let mut published = Vec::new();
+        files.publish(&mut published);
+        assert_eq!(published.len(), 8);
+        assert_eq!(
+            published
+                .iter()
+                .map(|device| device.name.as_str())
+                .collect::<Vec<_>>(),
+            [
+                "zram00", "zram01", "zram02", "zram03", "zram04", "zram05", "zram06", "zram07"
+            ]
+        );
     }
 }
