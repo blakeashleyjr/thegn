@@ -953,6 +953,12 @@ fn read_plugin_pipes<S: NdjsonSink>(
             if error.kind() == std::io::ErrorKind::Interrupted {
                 continue;
             }
+            tracing::debug!(
+                target: "thegn::plugin",
+                errno = ?error.raw_os_error(),
+                %error,
+                "plugin pipe poll failed"
+            );
             break;
         }
         if polled == 0 {
@@ -1153,7 +1159,7 @@ impl<S: NdjsonSink> OutputFramer<S> {
                 &mut self.lines,
             );
             self.truncated |= !self.accepting;
-        } else if !self.line.is_empty() || self.oversized {
+        } else if eof && (!self.line.is_empty() || self.oversized) {
             self.truncated = true;
         }
         (self.sink, self.truncated)
@@ -1304,6 +1310,9 @@ mod process_tree_deadline_tests {
     }
 
     fn assert_readers_exit_within_margin() {
+        // This counter is process-wide, so this check is exact when nextest
+        // isolates tests in separate processes; plain cargo test threads can
+        // observe a reader belonging to a concurrent sibling test.
         let until = Instant::now() + READER_GRACE + READER_RECEIVE_MARGIN;
         while LIVE_PIPE_READERS.load(Ordering::SeqCst) != 0 && Instant::now() < until {
             std::thread::yield_now();
@@ -1354,13 +1363,15 @@ mod process_tree_deadline_tests {
         assert!(!run.outcome.drained);
         assert!(run.outcome.reaped);
         assert!(!run.truncated);
-        // A 300 ms deadline permits at most 300 one-ms waits even if every
-        // wait wakes spuriously; 200 is generous for this held pipe, which
-        // normally wakes only at the 50 ms cap.
+        // The leader exits at about 100 ms, lowering the reader cutoff to
+        // leader exit + the 500 ms grace (about 600 ms from start). The
+        // 50 ms poll cap gives about 13 waits for the held pipe, plus EOF
+        // events for stdout; 200 allows ample scheduling and event overhead.
         assert!(
             run.outcome.poll_calls < 200,
-            "poll calls: {}",
-            run.outcome.poll_calls
+            "poll calls: {}; reader cutoff is about leader exit (~100 ms) + {} ms grace (~600 ms from start)",
+            run.outcome.poll_calls,
+            READER_GRACE.as_millis()
         );
         assert_readers_exit_within_margin();
     }
@@ -1418,6 +1429,28 @@ mod process_tree_deadline_tests {
         )
         .unwrap();
         assert!(started.elapsed() < Duration::from_secs(2));
+        assert!(run.outcome.abandoned);
+        assert!(!run.truncated);
+        assert_readers_exit_within_margin();
+    }
+
+    #[test]
+    fn abandoned_unterminated_stdout_is_not_output_truncation() {
+        if !setsid_available() {
+            return;
+        }
+        let run = spawn_ndjson(
+            &[
+                "sh".into(),
+                "-c".into(),
+                "printf '{\"jsonrpc\":\"2.0\",\"method\":\"log\"}'; setsid sleep 30 & exit 0"
+                    .into(),
+            ],
+            &BTreeMap::new(),
+            None,
+            Duration::from_secs(10),
+        )
+        .unwrap();
         assert!(run.outcome.abandoned);
         assert!(!run.truncated);
         assert_readers_exit_within_margin();
