@@ -12,7 +12,6 @@ use thegn_core::series::Agg;
 use thegn_metrics::collect::{
     CollectorId, CollectorSet,
     frame::MonitorFrame,
-    health::Health,
     model::{
         amd_smu::AmdSmuStatus,
         hwmon::{ChipGroup, SensorKind, SensorRole},
@@ -407,8 +406,20 @@ impl ThermalModel {
                 self.socket_w = metrics.power_socket.map(|value| value as f32 / 1000.0);
             }
         }
-        self.core_panel_present = self.core_source_hwmon
-            || !matches!(frame.health[CollectorId::AmdSmu.index()], Health::Absent(_));
+        // temperature_core is present in AMD gpu_metrics format 2 content 0-2
+        // and format 3 content 0; format 1 and other revisions are dGPU layouts.
+        let smu_apu_layout = frame.parts.amd_smu.cards.iter().any(|card| {
+            matches!(
+                card.decoded,
+                thegn_metrics::collect::model::amd_smu::AmdSmuStatus::Decoded(
+                    thegn_metrics::collect::parse::amd_gpu_metrics::Decoded::Full
+                        | thegn_metrics::collect::parse::amd_gpu_metrics::Decoded::Truncated
+                )
+            ) && card.metrics.header.is_some_and(|header| {
+                matches!((header.format, header.content), (2, 0 | 1 | 2) | (3, 0))
+            })
+        });
+        self.core_panel_present = self.core_source_hwmon || smu_apu_layout;
         if !self.core_source_hwmon
             && let Some(cores) = smu_cores
         {
@@ -502,6 +513,60 @@ fn is_package_label(label: &str) -> bool {
 }
 
 mod paint;
+
+fn paint_history_runs(
+    normalized: &[f32],
+    count: usize,
+    plot: Rect,
+    braille: bool,
+    surface: &mut Surface,
+) {
+    let count = count.min(normalized.len());
+    let graph_rect = crate::monitor::kit::history_rect::graph_rect(plot, count, braille);
+    let slots = if braille {
+        graph_rect.cols.saturating_mul(2)
+    } else {
+        graph_rect.cols
+    };
+    let shown = count.min(slots);
+    let skip = count.saturating_sub(shown);
+    let pad = slots.saturating_sub(shown);
+    let visible = &normalized[skip..count];
+    let mut run_start = 0;
+    while run_start < shown {
+        while run_start < shown && !visible[run_start].is_finite() {
+            run_start += 1;
+        }
+        let mut run_end = run_start;
+        while run_end < shown && visible[run_end].is_finite() {
+            run_end += 1;
+        }
+        if run_start < run_end {
+            let slot_start = pad + run_start;
+            let offset = if braille { slot_start % 2 } else { 0 };
+            let start_col = slot_start / if braille { 2 } else { 1 };
+            let run_cols = (offset + run_end - run_start).div_ceil(if braille { 2 } else { 1 });
+            let x = graph_rect.x.saturating_add(start_col);
+            let right = graph_rect.x.saturating_add(graph_rect.cols);
+            let cols = run_cols.min(right.saturating_sub(x));
+            let mut aligned = [f32::NAN; HISTORY_CAP + 1];
+            let aligned_len = offset + run_end - run_start;
+            aligned[offset..aligned_len].copy_from_slice(&visible[run_start..run_end]);
+            crate::monitor::graphs::paint_history_graph(
+                &aligned[..aligned_len],
+                thegn_core::theme::RampId::Temp,
+                Rect {
+                    x,
+                    y: graph_rect.y,
+                    cols,
+                    rows: graph_rect.rows,
+                },
+                surface,
+            );
+        }
+        run_start = run_end.saturating_add(1);
+    }
+}
 
 pub(in crate::monitor) struct ThermalView<'a>(pub &'a ThermalModel);
 
@@ -630,38 +695,13 @@ impl TabView for ThermalView<'_> {
                 cols: inner.cols,
                 rows: inner.rows.saturating_sub(5),
             };
-            let braille = crate::monitor::graphs::table().braille;
-            let graph_rect = crate::monitor::kit::history_rect::graph_rect(plot, count, braille);
-            let mut run_start = 0;
-            while run_start < count {
-                while run_start < count && !normalized[run_start].is_finite() {
-                    run_start += 1;
-                }
-                let mut run_end = run_start;
-                while run_end < count && normalized[run_end].is_finite() {
-                    run_end += 1;
-                }
-                if run_start < run_end {
-                    let start_col = if braille { run_start / 2 } else { run_start };
-                    let end_col = if braille {
-                        run_end.div_ceil(2)
-                    } else {
-                        run_end
-                    };
-                    crate::monitor::graphs::paint_history_graph(
-                        &normalized[run_start..run_end],
-                        thegn_core::theme::RampId::Temp,
-                        Rect {
-                            x: graph_rect.x.saturating_add(start_col),
-                            y: graph_rect.y,
-                            cols: end_col.saturating_sub(start_col),
-                            rows: graph_rect.rows,
-                        },
-                        surface,
-                    );
-                }
-                run_start = run_end.saturating_add(1);
-            }
+            paint_history_runs(
+                &normalized,
+                count,
+                plot,
+                crate::monitor::graphs::table().braille,
+                surface,
+            );
         }
         if placed.id == GPU && inner.rows > 5 && self.0.gpu_history_len > 0 {
             let count = self.0.gpu_history_len.min(HISTORY_CAP);
@@ -679,38 +719,13 @@ impl TabView for ThermalView<'_> {
                 cols: inner.cols,
                 rows: inner.rows.saturating_sub(5),
             };
-            let braille = crate::monitor::graphs::table().braille;
-            let graph_rect = crate::monitor::kit::history_rect::graph_rect(plot, count, braille);
-            let mut run_start = 0;
-            while run_start < count {
-                while run_start < count && !normalized[run_start].is_finite() {
-                    run_start += 1;
-                }
-                let mut run_end = run_start;
-                while run_end < count && normalized[run_end].is_finite() {
-                    run_end += 1;
-                }
-                if run_start < run_end {
-                    let start_col = if braille { run_start / 2 } else { run_start };
-                    let end_col = if braille {
-                        run_end.div_ceil(2)
-                    } else {
-                        run_end
-                    };
-                    crate::monitor::graphs::paint_history_graph(
-                        &normalized[run_start..run_end],
-                        thegn_core::theme::RampId::Temp,
-                        Rect {
-                            x: graph_rect.x.saturating_add(start_col),
-                            y: graph_rect.y,
-                            cols: end_col.saturating_sub(start_col),
-                            rows: graph_rect.rows,
-                        },
-                        surface,
-                    );
-                }
-                run_start = run_end.saturating_add(1);
-            }
+            paint_history_runs(
+                &normalized,
+                count,
+                plot,
+                crate::monitor::graphs::table().braille,
+                surface,
+            );
         }
         if placed.id == SENSORS {
             let spark_x = rect
