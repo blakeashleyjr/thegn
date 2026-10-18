@@ -484,10 +484,13 @@ fn package_without_threshold_shows_temperature_without_a_meter() {
         .lines()
         .nth(package_index + 2)
         .expect("painted package row");
+    let history_start = 1 + super::paint::SENSOR_HISTORY_X;
+    let history_width = 160 - 2 - super::paint::SENSOR_HISTORY_X;
     assert!(
         package_row
             .chars()
-            .skip(super::paint::SENSOR_HISTORY_X + 1)
+            .skip(history_start)
+            .take(history_width)
             .all(|cell| cell == ' ' || cell == '\u{2800}')
     );
 }
@@ -1003,9 +1006,10 @@ fn gpu_temperature_history_is_bounded_and_right_aligned() {
 fn narrow_package_graph_clamps_and_keeps_newest_sample_at_right_edge() {
     for unicode in [UnicodeLevel::Ascii, UnicodeLevel::Full] {
         test_override::with_unicode(unicode, || {
-            let mut model = ThermalModel::default();
-            model.temp_history = vec![40.0; HISTORY_CAP - 1];
-            model.temp_history.push(95.0);
+            let mut model = ThermalModel {
+                temp_history: [vec![40.0; HISTORY_CAP - 1], vec![95.0]].concat(),
+                ..ThermalModel::default()
+            };
             let area = Rect {
                 x: 5,
                 y: 1,
