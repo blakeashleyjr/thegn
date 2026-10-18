@@ -62,16 +62,18 @@ impl CpuIrqCollector {
             self.reads += 2;
         }
         let soft_file = self.soft_file.as_mut().ok_or(CollectError::Gone)?;
-        match soft_file.read_all() {
-            Ok(bytes) if softirqs::parse(bytes, &mut self.soft) => (),
-            Ok(_) => return Err(CollectError::Parse("/proc/softirqs")),
+        let soft = &mut self.soft;
+        match soft_file.read_all().map(|bytes| softirqs::parse(bytes, soft)) {
+            Ok(true) => (),
+            Ok(false) => return Err(CollectError::Parse("/proc/softirqs")),
             Err(_error) if soft_file.needs_reopen() => return Err(CollectError::Gone),
             Err(error) => return Err(error.into()),
         }
         let irq_file = self.irq_file.as_mut().ok_or(CollectError::Gone)?;
-        match irq_file.read_all() {
-            Ok(bytes) if interrupts::parse(bytes, &mut self.irq) => Ok(()),
-            Ok(_) => Err(CollectError::Parse("/proc/interrupts")),
+        let irq = &mut self.irq;
+        match irq_file.read_all().map(|bytes| interrupts::parse(bytes, irq)) {
+            Ok(true) => Ok(()),
+            Ok(false) => Err(CollectError::Parse("/proc/interrupts")),
             Err(_error) if irq_file.needs_reopen() => Err(CollectError::Gone),
             Err(error) => Err(error.into()),
         }
