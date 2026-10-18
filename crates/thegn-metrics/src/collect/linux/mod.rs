@@ -12,5 +12,6 @@ pub mod netdev;
 pub mod powercap;
 pub mod procfile;
 pub mod psi;
+pub mod swap_zram;
 pub mod uptime;
 pub mod vmstat;
