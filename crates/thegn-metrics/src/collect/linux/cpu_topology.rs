@@ -2,7 +2,9 @@
 
 use crate::collect::frame::Part as _;
 use std::{
+    fs::File,
     io,
+    os::unix::fs::FileExt,
     path::{Path, PathBuf},
 };
 
@@ -21,6 +23,9 @@ use crate::collect::{
 pub trait SysfsView: Send {
     fn read(&mut self, path: &Path) -> io::Result<Vec<u8>>;
     fn list(&mut self, path: &Path) -> io::Result<Vec<PathBuf>>;
+    fn open_online(&mut self, _path: &Path) -> Option<File> {
+        None
+    }
 }
 
 pub struct RealSysfs;
@@ -33,13 +38,23 @@ impl SysfsView for RealSysfs {
             .map(|entry| entry.map(|entry| entry.path()))
             .collect()
     }
+    fn open_online(&mut self, path: &Path) -> Option<File> {
+        File::open(path).ok()
+    }
 }
+
+const ONLINE_BUFFER_SIZE: usize = 4096;
 
 pub struct CpuTopologyCollector<V: SysfsView = RealSysfs> {
     view: V,
     root: PathBuf,
     online: Vec<u16>,
+    online_file: Option<File>,
+    online_raw: [u8; ONLINE_BUFFER_SIZE],
+    online_raw_len: usize,
     part: CpuTopologyPart,
+    generation: u64,
+    published_generation: Option<u64>,
 }
 impl CpuTopologyCollector<RealSysfs> {
     pub fn new() -> Self {
@@ -60,7 +75,12 @@ impl<V: SysfsView> CpuTopologyCollector<V> {
             view,
             root: root.into(),
             online: Vec::new(),
+            online_file: None,
+            online_raw: [0; ONLINE_BUFFER_SIZE],
+            online_raw_len: 0,
             part: CpuTopologyPart::default(),
+            generation: 0,
+            published_generation: None,
         }
     }
     fn path(&self, suffix: &str) -> PathBuf {
@@ -72,6 +92,25 @@ impl<V: SysfsView> CpuTopologyCollector<V> {
             .ok()
             .and_then(|bytes| String::from_utf8(bytes).ok())
             .map(|value| value.trim().to_owned())
+    }
+    fn online_set(&mut self, initial: bool) -> Option<Vec<u16>> {
+        let mut buffer = [0_u8; ONLINE_BUFFER_SIZE];
+        let count = if let Some(file) = &self.online_file {
+            file.read_at(&mut buffer, 0).ok()?
+        } else {
+            let path = self.path("devices/system/cpu/online");
+            let bytes = self.view.read(&path).ok()?;
+            let count = bytes.len().min(buffer.len());
+            buffer[..count].copy_from_slice(&bytes[..count]);
+            count
+        };
+        let raw = &buffer[..count];
+        if !initial && self.online_raw_len == count && &self.online_raw[..count] == raw {
+            return None;
+        }
+        self.online_raw[..count].copy_from_slice(raw);
+        self.online_raw_len = count;
+        std::str::from_utf8(raw).ok().and_then(parse_cpulist)
     }
     fn scan(&mut self, online: Vec<u16>) {
         let cpu_root = self.path("devices/system/cpu");
@@ -197,6 +236,7 @@ impl<V: SysfsView> CpuTopologyCollector<V> {
             effective_cpus: effective_cpus(online.len(), affinity),
         };
         self.online = online;
+        self.generation = self.generation.wrapping_add(1);
     }
 }
 impl<V: SysfsView> Collector for CpuTopologyCollector<V> {
@@ -208,9 +248,8 @@ impl<V: SysfsView> Collector for CpuTopologyCollector<V> {
     }
     fn discover(&mut self, _env: &Env) -> Health {
         let online_path = self.path("devices/system/cpu/online");
-        let online = self
-            .text(&online_path)
-            .and_then(|value| parse_cpulist(&value));
+        self.online_file = self.view.open_online(&online_path);
+        let online = self.online_set(true);
         match online {
             Some(cpus) if !cpus.is_empty() => {
                 self.scan(cpus);
@@ -219,25 +258,37 @@ impl<V: SysfsView> Collector for CpuTopologyCollector<V> {
             _ => {
                 self.part.clear();
                 self.online.clear();
+                self.published_generation = None;
                 Health::Absent(Absent::NoHardware)
             }
         }
     }
     fn sample(&mut self, _ctx: &TickCtx, frame: &mut MonitorFrame) -> Result<(), CollectError> {
-        let online_path = self.path("devices/system/cpu/online");
-        if let Some(online) = self
-            .text(&online_path)
-            .and_then(|value| parse_cpulist(&value))
-            && online != self.online
+        let changed = if let Some(online) = self.online_set(false) {
+            if online != self.online {
+                self.scan(online);
+                true
+            } else {
+                false
+            }
+        } else {
+            false
+        };
+        if changed
+            || self.published_generation != Some(self.generation)
+            || frame.parts.cpu_topology.cpus.is_empty()
         {
-            self.scan(online);
+            frame.parts.cpu_topology.clone_from(&self.part);
+            self.published_generation = Some(self.generation);
         }
-        frame.parts.cpu_topology.clone_from(&self.part);
         frame.sampled.insert(CollectorId::CpuTopology);
         Ok(())
     }
     fn close(&mut self) {
         self.online.clear();
+        self.online_file = None;
+        self.online_raw_len = 0;
+        self.published_generation = None;
         self.part.clear();
     }
 }

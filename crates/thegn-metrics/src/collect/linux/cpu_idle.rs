@@ -1,4 +1,7 @@
 //! Linux cpuidle state residency using held time-file descriptors.
+//!
+//! The CPU set is fixed at discovery; later CPU hotplug changes are outside
+//! this collector's snapshot.
 
 use std::{
     fs::File,
@@ -112,19 +115,15 @@ impl Collector for CpuIdleCollector {
                         "1" => Some(true),
                         _ => None,
                     });
-                let time = match File::open(path.join("time")) {
-                    Ok(file) => Some(file),
-                    Err(_) => None,
-                };
                 states.push(StateSlot {
                     state: CpuIdleState {
                         index,
-                        name: state_name,
+                        name: state_name.map(Into::into),
                         latency_us,
                         disabled,
                         residency_pct: None,
                     },
-                    time,
+                    time: File::open(path.join("time")).ok(),
                     previous_us: None,
                 });
             }
@@ -148,6 +147,7 @@ impl Collector for CpuIdleCollector {
         for (core, published) in self.cores.iter_mut().zip(&mut output.cores) {
             let mut sum = 0.0_f32;
             let mut valid = false;
+            let mut all_held_states_valid = true;
             while published.states.len() < core.states.len() {
                 published.states.push(CpuIdleState::default());
             }
@@ -164,11 +164,19 @@ impl Collector for CpuIdleCollector {
                     }
                     _ => None,
                 };
+                if slot.time.is_some() && slot.state.residency_pct.is_none() {
+                    all_held_states_valid = false;
+                }
                 slot.previous_us = current;
-                state.clone_from(&slot.state);
+                state.index = slot.state.index;
+                state.name.clone_from(&slot.state.name);
+                state.latency_us = slot.state.latency_us;
+                state.disabled = slot.state.disabled;
+                state.residency_pct = slot.state.residency_pct;
             }
             published.cpu = core.cpu;
-            published.c0_pct = valid.then_some((100.0 - sum).clamp(0.0, 100.0));
+            published.c0_pct =
+                (valid && all_held_states_valid).then_some((100.0 - sum).clamp(0.0, 100.0));
         }
         self.previous_ms = Some(ctx.now_ms);
         frame.sampled.insert(CollectorId::CpuIdle);

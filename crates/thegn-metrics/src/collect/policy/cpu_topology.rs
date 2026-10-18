@@ -88,9 +88,21 @@ pub fn classify_core_types(inputs: &[(u16, CpuClassInput)]) -> Vec<(u16, CoreTyp
         .iter()
         .filter_map(|(_, input)| input.amd_max_freq_khz.zip(input.amd_highest_perf))
         .collect();
-    if amd.len() > 1 {
+    if amd.len() == 2 {
         let min = amd.first().copied();
         let max = amd.last().copied();
+        let has_gap = match (min, max) {
+            (Some((low_freq, _)), Some((high_freq, _))) if low_freq > 0 => {
+                high_freq as f64 / low_freq as f64 >= 1.15
+            }
+            _ => false,
+        };
+        if !has_gap {
+            return inputs
+                .iter()
+                .map(|(cpu, _)| (*cpu, CoreType::Uniform))
+                .collect();
+        }
         return inputs
             .iter()
             .map(|(cpu, input)| {
@@ -220,6 +232,31 @@ mod tests {
         assert_eq!(
             classify_core_types(&amd),
             vec![(0, CoreType::Performance), (1, CoreType::Efficiency)]
+        );
+        let preferred_core_ranking = vec![
+            (0, 4_000_000, 166),
+            (1, 4_050_000, 171),
+            (2, 4_100_000, 176),
+        ]
+        .into_iter()
+        .map(|(cpu, freq, perf)| {
+            (
+                cpu,
+                CpuClassInput {
+                    amd_max_freq_khz: Some(freq),
+                    amd_highest_perf: Some(perf),
+                    ..CpuClassInput::default()
+                },
+            )
+        })
+        .collect::<Vec<_>>();
+        assert_eq!(
+            classify_core_types(&preferred_core_ranking),
+            vec![
+                (0, CoreType::Uniform),
+                (1, CoreType::Uniform),
+                (2, CoreType::Uniform)
+            ]
         );
         assert_eq!(
             classify_core_types(&[(0, CpuClassInput::default())]),
