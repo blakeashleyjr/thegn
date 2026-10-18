@@ -204,7 +204,7 @@ pub struct NetlinkSocket {
 
 impl NetlinkSocket {
     pub fn sock_diag() -> io::Result<Self> {
-        Self::open(libc::NETLINK_SOCK_DIAG as i32)
+        Self::open(libc::NETLINK_SOCK_DIAG)
     }
 
     pub fn open(protocol: i32) -> io::Result<Self> {
