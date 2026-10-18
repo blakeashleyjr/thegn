@@ -1606,6 +1606,11 @@ pub fn core_git_spawn_count() -> u64 {
     GIT_SPAWNS.load(Ordering::Relaxed)
 }
 
+/// Record a git subprocess spawned outside the core's direct Git helpers.
+pub fn note_core_git_spawn() {
+    GIT_SPAWNS.fetch_add(1, Ordering::Relaxed);
+}
+
 /// Run `git -C <dir> <args...>`, returning trimmed stdout on success — including
 /// **empty** stdout as `Some("")`. `None` means the command could not be run or
 /// exited non-zero, which is a different fact from an empty answer.

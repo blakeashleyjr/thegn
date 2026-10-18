@@ -201,6 +201,7 @@ fn glyph_partition_keeps_suspended_cache_skips_uncached_and_scans_active() {
                 Duration::from_secs(5),
             ),
             since_active: &HashMap::new(),
+            fingerprint_changed: &std::collections::HashSet::new(),
             since_ref_move: None,
         },
     );
@@ -2761,7 +2762,16 @@ fn an_idle_tick_with_no_event_rescans_nothing() {
     let no_locations = HashMap::new();
     let no_activity = HashMap::new();
 
-    for elapsed in (5..=115).step_by(5) {
+    let earliest_due = paths
+        .iter()
+        .map(|path| crate::hydrate_tuning::jittered(ttls.safety, std::path::Path::new(path)))
+        .min()
+        .unwrap();
+    for elapsed in (5..)
+        .step_by(5)
+        .map(Duration::from_secs)
+        .take_while(|elapsed| *elapsed < earliest_due)
+    {
         let (to_scan, _, _) = partition_glyph_paths(
             &paths,
             &cache,
@@ -2769,17 +2779,80 @@ fn an_idle_tick_with_no_event_rescans_nothing() {
             GlyphPartitionConfig {
                 active_path: None,
                 gate_remote_scans: false,
-                now: started + Duration::from_secs(elapsed),
+                now: started + elapsed,
                 ttls: &ttls,
                 since_active: &no_activity,
+                fingerprint_changed: &std::collections::HashSet::new(),
                 since_ref_move: None,
             },
         );
         assert!(
             to_scan.is_empty(),
-            "unexpected scans at {elapsed}s: {to_scan:?}"
+            "unexpected scans at {elapsed:?}: {to_scan:?}"
         );
     }
+}
+
+#[test]
+fn partition_scans_only_rows_with_a_changed_fingerprint_before_safety() {
+    use std::collections::{HashMap, HashSet};
+    use std::time::{Duration, Instant};
+
+    let now = Instant::now();
+    let ttls = crate::hydrate_tuning::glyph_ttls_from(
+        None,
+        None,
+        Duration::from_millis(300),
+        Duration::from_secs(5),
+    );
+    let paths: Vec<String> = (0..35)
+        .map(|index| format!("/worktrees/cached-{index}"))
+        .collect();
+    let row = glyph_row(true, 0, 0, Some("main"), "/repo", 0, 0, None);
+    let cached_at = now - Duration::from_secs(121);
+    let cache: HashMap<String, (GlyphRow, Instant)> = paths
+        .iter()
+        .cloned()
+        .map(|path| (path, (row.clone(), cached_at)))
+        .collect();
+    let may_scan = HashMap::new();
+    let no_activity = HashMap::new();
+    let no_changes = HashSet::new();
+    let (to_scan, _, _) = partition_glyph_paths(
+        &paths,
+        &cache,
+        &may_scan,
+        GlyphPartitionConfig {
+            active_path: None,
+            gate_remote_scans: false,
+            now,
+            ttls: &ttls,
+            since_active: &no_activity,
+            fingerprint_changed: &no_changes,
+            since_ref_move: None,
+        },
+    );
+    assert!(
+        to_scan.is_empty(),
+        "quiet cached rows should wait for safety"
+    );
+
+    let changed = HashSet::from([paths[7].clone()]);
+    let (to_scan, _, _) = partition_glyph_paths(
+        &paths,
+        &cache,
+        &may_scan,
+        GlyphPartitionConfig {
+            active_path: None,
+            gate_remote_scans: false,
+            now,
+            ttls: &ttls,
+            since_active: &no_activity,
+            fingerprint_changed: &changed,
+            since_ref_move: None,
+        },
+    );
+    assert_eq!(to_scan, vec![paths[7].clone()]);
 }
 
 #[test]

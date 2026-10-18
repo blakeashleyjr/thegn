@@ -954,6 +954,7 @@ impl GitLoc {
 
     /// Run a git command, returning trimmed stdout on success (None otherwise).
     pub fn git_out(&self, args: &[&str]) -> Option<String> {
+        crate::util::note_core_git_spawn();
         let out = self.git_command(args).output().ok()?;
         if !out.status.success() {
             return None;
@@ -970,6 +971,7 @@ impl GitLoc {
         const ARGS: &[&str] = &["remote", "get-url", "origin"];
         match self {
             GitLoc::Local(p) => crate::git_memo::origin_url(p, || {
+                crate::util::note_core_git_spawn();
                 match self.git_command(ARGS).output() {
                     // Could not even spawn git: transient, never memoised.
                     Err(_) => (None, false),
@@ -988,6 +990,7 @@ impl GitLoc {
 
     /// Run a git command for its exit status (output discarded).
     pub fn git_ok(&self, args: &[&str]) -> bool {
+        crate::util::note_core_git_spawn();
         self.git_command(args)
             .output()
             .map(|o| o.status.success())

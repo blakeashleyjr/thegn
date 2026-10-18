@@ -7,64 +7,184 @@ use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct GitFileStamp {
+    modified: Option<std::time::SystemTime>,
+    len: u64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct GlyphFingerprint {
+    index: Option<GitFileStamp>,
+    head: Option<GitFileStamp>,
+}
+
+/// Read only the cached gitdir's index and HEAD metadata. The `.git` marker is
+/// resolved once per worktree and again only if one of those stats is missing.
+pub(crate) fn glyph_fingerprint(path: &str, worktree: &Path) -> Option<GlyphFingerprint> {
+    let mut fingerprints = glyph_fingerprints()
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    let previous = fingerprints.get(path).cloned();
+    let mut gitdir = previous
+        .as_ref()
+        .map(|(gitdir, _)| gitdir.clone())
+        .or_else(|| resolve_gitdir(worktree))?;
+    let (mut current, index_missing, head_missing) = fingerprint_at(&gitdir);
+    if (index_missing || head_missing)
+        && let Some(resolved) = resolve_gitdir(worktree)
+        && resolved != gitdir
+    {
+        gitdir = resolved;
+        current = fingerprint_at(&gitdir).0;
+    }
+    let baseline = previous
+        .as_ref()
+        .map(|(_, fingerprint)| *fingerprint)
+        .unwrap_or(current);
+    fingerprints.insert(path.to_string(), (gitdir, baseline));
+    Some(current)
+}
+
+fn resolve_gitdir(worktree: &Path) -> Option<PathBuf> {
+    let marker = worktree.join(".git");
+    if let Ok(contents) = std::fs::read_to_string(&marker) {
+        let target = contents.trim().strip_prefix("gitdir:")?.trim();
+        let target = Path::new(target);
+        Some(if target.is_absolute() {
+            target.to_path_buf()
+        } else {
+            worktree.join(target)
+        })
+    } else {
+        Some(marker)
+    }
+}
+
+fn fingerprint_at(gitdir: &Path) -> (GlyphFingerprint, bool, bool) {
+    let (index, index_missing) = file_stamp(&gitdir.join("index"));
+    let (head, head_missing) = file_stamp(&gitdir.join("HEAD"));
+    (
+        GlyphFingerprint { index, head },
+        index_missing,
+        head_missing,
+    )
+}
+
+fn file_stamp(path: &Path) -> (Option<GitFileStamp>, bool) {
+    match std::fs::metadata(path) {
+        Ok(metadata) => (
+            Some(GitFileStamp {
+                modified: metadata.modified().ok(),
+                len: metadata.len(),
+            }),
+            false,
+        ),
+        Err(error) => (None, error.kind() == std::io::ErrorKind::NotFound),
+    }
+}
+
+/// Compare and remember a gitdir fingerprint when its row is selected for a
+/// scan. Rows without a resolvable gitdir rely on the safety interval.
+pub(crate) fn glyph_fingerprint_changed(path: &str, current: Option<GlyphFingerprint>) -> bool {
+    let previous = glyph_fingerprints()
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .get(path)
+        .map(|(_, fingerprint)| *fingerprint);
+    matches!((previous, current), (Some(previous), Some(current)) if previous != current)
+}
+
+pub(crate) fn record_glyph_fingerprint(path: &str, current: Option<GlyphFingerprint>) {
+    if let Some(current) = current {
+        let mut fingerprints = glyph_fingerprints()
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if let Some((_, fingerprint)) = fingerprints.get_mut(path) {
+            *fingerprint = current;
+        }
+    }
+}
+
+pub(crate) fn retain_glyph_fingerprints(keep: &std::collections::HashSet<String>) {
+    glyph_fingerprints()
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .retain(|path, _| keep.contains(path));
+}
+
+fn glyph_fingerprints()
+-> &'static Mutex<std::collections::HashMap<String, (PathBuf, GlyphFingerprint)>> {
+    static SEEN: OnceLock<Mutex<std::collections::HashMap<String, (PathBuf, GlyphFingerprint)>>> =
+        OnceLock::new();
+    SEEN.get_or_init(|| Mutex::new(std::collections::HashMap::new()))
+}
+
 /// Default for [`model_refresh_interval`]. It must stay a multiple of the
 /// 500ms base that divides `PR_REFRESH_INTERVAL` so the ticker keeps emitting
 /// `RefreshKind::Pr` (see the cadence-invariant test).
 pub(crate) const DEFAULT_MODEL_REFRESH_MS: u64 = 5000;
 const DEFAULT_BG_BUSY_GLYPH_TTL_MS: u64 = 10_000;
-const DEFAULT_BG_IDLE_GLYPH_TTL_MS: u64 = 120_000;
+const DEFAULT_BG_SAFETY_GLYPH_TTL_MS: u64 = 600_000;
 
 /// Background glyph policy windows and the cadence used to interpret hints.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct GlyphTtls {
     pub(crate) busy: Duration,
-    pub(crate) idle: Duration,
+    pub(crate) safety: Duration,
     pub(crate) floor: Duration,
     pub(crate) tick: Duration,
 }
 
 /// Build policy windows from explicit values. A zero busy TTL deliberately
 /// preserves the always-rescan opt-out; otherwise the busy window stays above
-/// one model tick and idle work is never checked more frequently than busy work.
+/// one model tick; quiet rows use the longer safety interval unless their
+/// gitdir fingerprint changes.
 pub(crate) fn glyph_ttls_from(
     busy_ms: Option<u64>,
-    idle_ms: Option<u64>,
+    safety_ms: Option<u64>,
     floor: Duration,
     tick: Duration,
 ) -> GlyphTtls {
     let busy_ms = busy_ms.unwrap_or(DEFAULT_BG_BUSY_GLYPH_TTL_MS);
-    let idle_ms = idle_ms.unwrap_or(DEFAULT_BG_IDLE_GLYPH_TTL_MS);
+    let safety_ms = safety_ms.unwrap_or(DEFAULT_BG_SAFETY_GLYPH_TTL_MS);
     let busy = if busy_ms == 0 {
         Duration::ZERO
     } else {
         Duration::from_millis(busy_ms).max(tick.saturating_add(Duration::from_millis(500)))
     };
-    let idle = if busy.is_zero() {
-        Duration::from_millis(idle_ms)
+    let safety = Duration::from_millis(safety_ms);
+    let safety = if busy.is_zero() {
+        safety
     } else {
-        Duration::from_millis(idle_ms).max(busy)
+        safety.max(busy)
     };
     GlyphTtls {
         busy,
-        idle,
+        safety,
         floor,
         tick,
     }
 }
 
 /// Current policy. `THEGN_BG_MODEL_REFRESH_MS` defaults to 10s (`0` always
-/// rescans background rows); `THEGN_BG_IDLE_GLYPH_TTL_MS` defaults to 120s.
-/// Both are env-only knobs, and the idle window is raised to at least busy.
+/// rescans background rows); `THEGN_BG_SAFETY_GLYPH_TTL_MS` defaults to 10m.
+/// Both are env-only knobs.
 pub(crate) fn glyph_ttls() -> GlyphTtls {
     let busy_ms = std::env::var("THEGN_BG_MODEL_REFRESH_MS")
         .ok()
         .and_then(|value| value.parse::<u64>().ok());
-    let idle_ms = std::env::var("THEGN_BG_IDLE_GLYPH_TTL_MS")
+    let safety_ms = std::env::var("THEGN_BG_SAFETY_GLYPH_TTL_MS")
         .ok()
         .and_then(|value| value.parse::<u64>().ok());
+    let safety_ms = safety_ms.or_else(|| {
+        std::env::var("THEGN_BG_IDLE_GLYPH_TTL_MS")
+            .ok()
+            .and_then(|value| value.parse::<u64>().ok())
+    });
     glyph_ttls_from(
         busy_ms,
-        idle_ms,
+        safety_ms,
         active_glyph_floor(),
         model_refresh_interval(),
     )
@@ -127,7 +247,37 @@ pub(crate) fn glyph_window(
     } else if touched {
         jittered(ttls.busy, path)
     } else {
-        jittered(ttls.idle, path)
+        jittered(ttls.safety, path)
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn glyph_should_rescan(
+    cached_age: Option<Duration>,
+    is_active: bool,
+    touched: bool,
+    fingerprint_changed: bool,
+    path: &Path,
+    ttls: &GlyphTtls,
+) -> bool {
+    let window = fingerprint_adjusted_window(
+        fingerprint_changed,
+        glyph_window(is_active, touched, path, ttls),
+    );
+    match cached_age {
+        None => true,
+        Some(age) => age >= window,
+    }
+}
+
+pub(crate) fn fingerprint_adjusted_window(
+    fingerprint_changed: bool,
+    normal_window: Duration,
+) -> Duration {
+    if fingerprint_changed {
+        Duration::ZERO
+    } else {
+        normal_window
     }
 }
 
@@ -177,7 +327,7 @@ pub(crate) fn observe_ref_generation(
     obs.as_ref().and_then(|current| current.changed_at)
 }
 
-/// Stamp a warm-cache row so its idle window expires in a staggered first wave.
+/// Stamp a warm-cache row so its safety window expires in a staggered first wave.
 pub(crate) fn warm_stamp(now: Instant, path: &Path, ttls: &GlyphTtls) -> Instant {
     let stagger = ttls
         .busy
@@ -186,7 +336,7 @@ pub(crate) fn warm_stamp(now: Instant, path: &Path, ttls: &GlyphTtls) -> Instant
         / 1000;
     warm_stamp_from_age(
         now,
-        jittered(ttls.idle, path).saturating_sub(Duration::from_millis(
+        jittered(ttls.safety, path).saturating_sub(Duration::from_millis(
             stagger.min(u128::from(u64::MAX)) as u64,
         )),
     )
@@ -198,7 +348,7 @@ fn warm_stamp_from_age(now: Instant, age: Duration) -> Instant {
 
 /// Safety-net cadence for the background model re-hydration ticker. This tick
 /// advances the activity-dot FSM and checks background glyphs against their
-/// independent busy/idle windows. The active worktree's panel + git glyphs
+/// busy window or quiet safety interval. The active worktree's panel + git glyphs
 /// update in real time off the diff fs-watcher (`retarget_diff_watcher`).
 ///
 /// It was 1s, which rebuilt the whole model — a ~0.3-0.4s `git` fan-out — every
@@ -269,7 +419,7 @@ mod tests {
         let tick = Duration::from_secs(5);
         let clamped = glyph_ttls_from(Some(5000), Some(1000), Duration::from_millis(300), tick);
         assert_eq!(clamped.busy, Duration::from_millis(5500));
-        assert_eq!(clamped.idle, clamped.busy);
+        assert_eq!(clamped.safety, clamped.busy);
 
         let disabled = glyph_ttls_from(Some(0), Some(120_000), Duration::ZERO, tick);
         let window = glyph_window(false, false, Path::new("/wt/a"), &disabled);
@@ -323,6 +473,134 @@ mod tests {
     }
 
     #[test]
+    fn idle_rows_wait_for_safety_unless_the_gitdir_fingerprint_changes() {
+        let ttls = glyph_ttls_from(
+            Some(10_000),
+            Some(600_000),
+            Duration::from_millis(300),
+            Duration::from_secs(5),
+        );
+        let path = Path::new("/worktrees/quiet");
+        assert!(!glyph_should_rescan(
+            Some(Duration::from_secs(121)),
+            false,
+            false,
+            false,
+            path,
+            &ttls
+        ));
+        assert!(!glyph_should_rescan(
+            Some(ttls.safety - Duration::from_secs(1)),
+            false,
+            false,
+            false,
+            path,
+            &ttls
+        ));
+        assert!(glyph_should_rescan(
+            Some(jittered(ttls.safety, path) + Duration::from_millis(1)),
+            false,
+            false,
+            false,
+            path,
+            &ttls,
+        ));
+        assert!(glyph_should_rescan(
+            Some(Duration::from_secs(121)),
+            false,
+            false,
+            true,
+            path,
+            &ttls
+        ));
+        let touched_window = glyph_window(false, true, path, &ttls);
+        assert!(glyph_should_rescan(
+            Some(touched_window + Duration::from_millis(1)),
+            false,
+            true,
+            false,
+            path,
+            &ttls,
+        ));
+        let active_window = glyph_window(true, false, path, &ttls);
+        assert!(glyph_should_rescan(
+            Some(active_window + Duration::from_millis(1)),
+            true,
+            false,
+            false,
+            path,
+            &ttls,
+        ));
+        let always = glyph_ttls_from(
+            Some(0),
+            Some(600_000),
+            Duration::ZERO,
+            Duration::from_secs(5),
+        );
+        assert!(glyph_should_rescan(
+            Some(Duration::from_millis(1)),
+            false,
+            false,
+            false,
+            path,
+            &always
+        ));
+    }
+
+    #[test]
+    fn gitdir_fingerprint_tracks_index_metadata_without_git() {
+        let dir = tempfile::tempdir().unwrap();
+        thegn_core::fsperm::restrict_dir_to_owner(dir.path()).unwrap();
+        let gitdir = dir.path().join(".git");
+        std::fs::create_dir(&gitdir).unwrap();
+        std::fs::write(gitdir.join("HEAD"), "ref: refs/heads/main\n").unwrap();
+        std::fs::write(gitdir.join("index"), "one").unwrap();
+        let key = dir.path().to_string_lossy().into_owned();
+        let before = glyph_fingerprint(&key, dir.path()).unwrap();
+        record_glyph_fingerprint(&key, Some(before));
+        assert!(!glyph_fingerprint_changed(&key, Some(before)));
+        std::thread::sleep(Duration::from_millis(2));
+        std::fs::write(gitdir.join("index"), "two longer").unwrap();
+        let after = glyph_fingerprint(&key, dir.path()).unwrap();
+        assert_ne!(before, after);
+        assert!(glyph_fingerprint_changed(&key, Some(after)));
+
+        let linked = dir.path().join("linked");
+        let linked_gitdir = dir.path().join("linked-gitdir");
+        std::fs::create_dir(&linked).unwrap();
+        std::fs::create_dir(&linked_gitdir).unwrap();
+        std::fs::write(
+            linked.join(".git"),
+            format!("gitdir: {}\n", linked_gitdir.display()),
+        )
+        .unwrap();
+        std::fs::write(linked_gitdir.join("HEAD"), "ref: refs/heads/linked\n").unwrap();
+        std::fs::write(linked_gitdir.join("index"), "linked index").unwrap();
+        let linked_key = linked.to_string_lossy().into_owned();
+        assert!(
+            glyph_fingerprint(&linked_key, &linked)
+                .unwrap()
+                .index
+                .is_some()
+        );
+
+        let relative = dir.path().join("relative");
+        let relative_gitdir = dir.path().join("relative-gitdir");
+        std::fs::create_dir(&relative).unwrap();
+        std::fs::create_dir(&relative_gitdir).unwrap();
+        std::fs::write(relative.join(".git"), "gitdir: ../relative-gitdir\n").unwrap();
+        std::fs::write(relative_gitdir.join("HEAD"), "ref: refs/heads/relative\n").unwrap();
+        std::fs::write(relative_gitdir.join("index"), "relative index").unwrap();
+        let relative_key = relative.to_string_lossy().into_owned();
+        assert!(
+            glyph_fingerprint(&relative_key, &relative)
+                .unwrap()
+                .index
+                .is_some()
+        );
+    }
+
+    #[test]
     fn a_ref_move_after_the_scan_touches_rows_but_first_sight_and_path_switch_do_not() {
         let now = Instant::now();
         let first_path = Path::new("/repo/one");
@@ -369,7 +647,7 @@ mod tests {
     }
 
     #[test]
-    fn warm_rows_come_due_within_half_a_busy_window() {
+    fn warm_rows_come_due_staggered_within_half_a_busy_window() {
         let now = Instant::now() + Duration::from_secs(300);
         let ttls = glyph_ttls_from(
             None,
@@ -377,14 +655,15 @@ mod tests {
             Duration::from_millis(300),
             Duration::from_secs(5),
         );
+        assert_eq!(ttls.safety, Duration::from_secs(600));
         let path = Path::new("/worktrees/warm");
         let stamp = warm_stamp(now, path, &ttls);
         let age = now.duration_since(stamp);
-        let due_after = jittered(ttls.idle, path).saturating_sub(age);
+        let due_after = jittered(ttls.safety, path).saturating_sub(age);
         assert!(due_after <= ttls.busy / 2);
         assert_eq!(
             age,
-            jittered(ttls.idle, path).saturating_sub(Duration::from_millis(
+            jittered(ttls.safety, path).saturating_sub(Duration::from_millis(
                 ttls.busy.as_millis() as u64 * u64::from(path_jitter_permille(path)) / 1000,
             )),
         );
@@ -394,7 +673,7 @@ mod tests {
             .map(|index| {
                 let path = PathBuf::from(format!("/worktrees/warm-{index}"));
                 let stamp = warm_stamp(now, &path, &ttls);
-                jittered(ttls.idle, &path).saturating_sub(now.duration_since(stamp))
+                jittered(ttls.safety, &path).saturating_sub(now.duration_since(stamp))
             })
             .collect();
         assert!(offsets.len() >= 6);
