@@ -127,6 +127,60 @@ fn small_file_race_skips_pid_and_continues_to_later_pids() {
 }
 
 #[test]
+fn failed_open_on_first_pass_does_not_advance_past_uninserted_pid() {
+    let mut fs = FakeProcFs::new();
+    for pid in [1, 2, 3] {
+        fs.insert(pid, process(pid, 10, 3));
+    }
+    fs.fail_next_open(2, std::io::ErrorKind::PermissionDenied);
+    let mut table = ProcTable::with_kept_max(fs, 8);
+
+    table.pass(Duration::from_secs(1), &[]).unwrap();
+
+    assert_eq!(
+        table
+            .entries()
+            .iter()
+            .map(|entry| entry.id.pid)
+            .collect::<Vec<_>>(),
+        vec![1, 3]
+    );
+}
+
+#[test]
+fn failed_new_pid_does_not_shift_cached_rows_during_merge_join() {
+    let mut fs = FakeProcFs::new();
+    for pid in [5, 10] {
+        fs.insert(pid, process(pid, 10, 3));
+    }
+    let mut table = ProcTable::with_kept_max(fs, 8);
+    table.pass(Duration::from_secs(1), &[]).unwrap();
+
+    table.fs_mut().insert(3, process(3, 10, 3));
+    table.fs_mut().set_list_order(vec![3, 5, 10]);
+    table
+        .fs_mut()
+        .fail_next_open(3, std::io::ErrorKind::PermissionDenied);
+
+    table.pass(Duration::from_secs(2), &[]).unwrap();
+
+    assert_eq!(
+        table
+            .entries()
+            .iter()
+            .map(|entry| entry.id.pid)
+            .collect::<Vec<_>>(),
+        vec![5, 10]
+    );
+    assert!(
+        table
+            .entries()
+            .iter()
+            .all(|entry| entry.last_seen == Duration::from_secs(2))
+    );
+}
+
+#[test]
 fn permission_denied_small_files_degrade_metadata_fields() {
     let mut fs = FakeProcFs::new();
     fs.insert(1, process(1, 10, 3));

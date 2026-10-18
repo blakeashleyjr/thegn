@@ -56,6 +56,7 @@ pub struct FakeProcess {
 pub struct FakeProcFs {
     processes: BTreeMap<u32, FakeProcess>,
     exits: BTreeMap<u32, VecDeque<usize>>,
+    open_errors: BTreeMap<u32, VecDeque<io::ErrorKind>>,
     read_errors: BTreeMap<u32, VecDeque<io::ErrorKind>>,
     gone_reads: BTreeMap<u32, usize>,
     small_read_errors: BTreeMap<(u32, String), VecDeque<io::ErrorKind>>,
@@ -94,6 +95,11 @@ impl FakeProcFs {
         if count > 0 {
             self.exits.entry(pid).or_default().push_back(count);
         }
+    }
+
+    /// Script an error for the next stat open of a PID.
+    pub fn fail_next_open(&mut self, pid: u32, kind: io::ErrorKind) {
+        self.open_errors.entry(pid).or_default().push_back(kind);
     }
 
     /// Script an error for the next stat read of a PID.
@@ -167,6 +173,11 @@ impl ProcFs for FakeProcFs {
 
     fn open_stat(&mut self, pid: u32) -> io::Result<Self::Stat> {
         self.ops.opens += 1;
+        if let Some(errors) = self.open_errors.get_mut(&pid)
+            && let Some(kind) = errors.pop_front()
+        {
+            return Err(io::Error::new(kind, "scripted stat open error"));
+        }
         if self.processes.contains_key(&pid) {
             Ok(FakeStat { pid })
         } else {
