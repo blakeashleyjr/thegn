@@ -904,21 +904,29 @@ fn read_plugin_pipes<S: NdjsonSink>(
     let mut stdout_eof = false;
     let mut stderr_eof = false;
     let mut chunk = [0_u8; 8192];
+    let mut descriptors = [
+        libc::pollfd {
+            fd: stdout_fd,
+            events: libc::POLLIN,
+            revents: 0,
+        },
+        libc::pollfd {
+            fd: stderr_fd,
+            events: libc::POLLIN,
+            revents: 0,
+        },
+    ];
     while (stdout_open || stderr_open)
         && started.elapsed().as_millis() < u128::from(deadline_ms.load(Ordering::Acquire))
     {
-        let mut descriptors = [
-            libc::pollfd {
-                fd: if stdout_open { stdout_fd } else { -1 },
-                events: if stdout_open { libc::POLLIN } else { 0 },
-                revents: 0,
-            },
-            libc::pollfd {
-                fd: if stderr_open { stderr_fd } else { -1 },
-                events: if stderr_open { libc::POLLIN } else { 0 },
-                revents: 0,
-            },
-        ];
+        // Keep closed streams out of poll: a pipe at EOF reports POLLHUP
+        // continuously, which would spin while its sibling remains open.
+        descriptors[0].fd = if stdout_open { stdout_fd } else { -1 };
+        descriptors[0].events = if stdout_open { libc::POLLIN } else { 0 };
+        descriptors[0].revents = 0;
+        descriptors[1].fd = if stderr_open { stderr_fd } else { -1 };
+        descriptors[1].events = if stderr_open { libc::POLLIN } else { 0 };
+        descriptors[1].revents = 0;
         #[cfg(test)]
         PIPE_POLL_CALLS.fetch_add(1, Ordering::Relaxed);
         let deadline = started + Duration::from_millis(deadline_ms.load(Ordering::Acquire));
@@ -983,8 +991,19 @@ fn read_plugin_pipes<S: NdjsonSink>(
             }
             if index == 0 {
                 stdout_open = open;
+                if !open {
+                    descriptors[index].fd = -1;
+                    descriptors[index].events = 0;
+                }
             } else {
                 stderr_open = open;
+                if !open {
+                    descriptors[index].fd = -1;
+                    descriptors[index].events = 0;
+                }
+            }
+            if !stdout_open && !stderr_open {
+                break;
             }
         }
     }
