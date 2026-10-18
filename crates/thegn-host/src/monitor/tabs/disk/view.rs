@@ -699,7 +699,7 @@ impl TabView for DiskView<'_> {
                         let read_peak = format_peak(&read[..read_len], read_peak);
                         let write_peak = format_peak(&write[..write_len], write_peak);
                         let peaks = format!("240-sample pk {read_peak} {write_peak}");
-                        let label_cols = rect.cols.saturating_sub(2);
+                        let label_cols = peaks.chars().count().min(rect.cols.saturating_sub(2));
                         let mut grid = CellGrid::new(label_cols, 1);
                         grid.view(Rect::full(label_cols, 1)).put_str(
                             0,
