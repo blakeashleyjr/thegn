@@ -138,7 +138,7 @@ impl<F: GpuAmdFs> GpuAmdCollector<F> {
                 Ok(handle) => handle,
                 Err(_) => continue,
             };
-            let open = |fs: &mut F, name: &str| fs.open(&device.join(name)).ok();
+            let open = |fs: &mut F, name: &str| Result::ok(fs.open(&device.join(name)));
             let vram_total = self.read_number(&device.join("mem_info_vram_total"));
             let gtt_total = self.read_number(&device.join("mem_info_gtt_total"));
             self.cards.push(Card {
