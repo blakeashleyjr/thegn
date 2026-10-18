@@ -12,6 +12,7 @@
 # frame) staying under THEGN_INPUT_BUDGET_US while pty_bytes_per_s is high.
 #
 # Usage: flood.sh [--bin PATH] [--worktrees N] [--floods N] [--switches N] [--json]
+# TG_PERF_SANDBOX=1 opts into measuring sandboxed panes.
 #
 # Exit status: 0 ok (numbers printed); 1 harness error.
 
@@ -72,6 +73,7 @@ esac
 GIT_SHA="$(git -C "$HERE" rev-parse --short HEAD 2>/dev/null || echo unknown)"
 
 perf_make_tmp
+perf_sandbox_off_default
 perf_trap_cleanup
 HOST_TAG="$(perf_host_tag)"
 REPO="$(perf_build_fixture "$WORKTREES" 0)"
