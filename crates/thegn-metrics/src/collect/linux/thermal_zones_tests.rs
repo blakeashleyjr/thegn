@@ -189,7 +189,7 @@ fn changed_zone_count_triggers_rediscovery() {
             .sample(
                 &TickCtx {
                     tick,
-                    now_ms: u64::from(tick) * 1_000,
+                    now_ms: tick * 1_000,
                 },
                 &mut frame,
             )
