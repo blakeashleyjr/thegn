@@ -111,6 +111,9 @@ pub struct RunOutcome {
     pub drained: bool,
     /// A platform reader was abandoned because an inherited pipe stayed open.
     pub abandoned: bool,
+    /// Poll calls made by the Unix pipe reader for this run (test diagnostics).
+    #[cfg(test)]
+    pub poll_calls: usize,
 }
 
 /// Consumes a plugin's stdout one line at a time, on the reader thread.
@@ -705,14 +708,14 @@ pub fn spawn_ndjson_stream<S: NdjsonSink>(
             + Duration::from_millis(reader_deadline_ms.load(Ordering::Acquire))
             + READER_RECEIVE_MARGIN,
     ) {
-        Ok(Ok((sink, stderr, truncated, drained, abandoned))) => {
+        Ok(Ok((sink, stderr, truncated, drained, abandoned, poll_calls))) => {
             match pipe_thread.join() {
                 Ok(()) => {}
                 Err(_) => {
                     tracing::warn!(target: "thegn::plugin", program, "plugin pipe reader panicked")
                 }
             }
-            ((sink, truncated), stderr, drained, abandoned)
+            ((sink, truncated, poll_calls), stderr, drained, abandoned)
         }
         Ok(Err(error)) => return Err(PluginError::Protocol(error)),
         Err(error) => {
@@ -721,6 +724,8 @@ pub fn spawn_ndjson_stream<S: NdjsonSink>(
                 reaped: status.is_some(),
                 drained: false,
                 abandoned: true,
+                #[cfg(test)]
+                poll_calls: 0,
             };
             tracing::debug!(target: "thegn::plugin", program, ?outcome, "plugin pipe reader exceeded drain deadline");
             return match error {
@@ -750,6 +755,8 @@ pub fn spawn_ndjson_stream<S: NdjsonSink>(
                     reaped: status.is_some(),
                     drained: false,
                     abandoned: true,
+                    #[cfg(test)]
+                    poll_calls: 0,
                 };
                 tracing::debug!(target: "thegn::plugin", program, ?outcome, "Windows plugin stdout reader abandoned");
                 return match error {
@@ -770,6 +777,8 @@ pub fn spawn_ndjson_stream<S: NdjsonSink>(
                     reaped: status.is_some(),
                     drained: false,
                     abandoned: true,
+                    #[cfg(test)]
+                    poll_calls: 0,
                 };
                 tracing::debug!(target: "thegn::plugin", program, ?outcome, "Windows plugin stderr reader abandoned");
                 return match error {
@@ -782,14 +791,17 @@ pub fn spawn_ndjson_stream<S: NdjsonSink>(
                 };
             }
         };
-        (stdout_result, stderr, true, false)
+        let (sink, truncated) = stdout_result;
+        ((sink, truncated, 0), stderr, true, false)
     };
-    let (sink, truncated) = stdout_result;
+    let (sink, truncated, _poll_calls) = stdout_result;
     let outcome = RunOutcome {
         killed: kill_requested,
         reaped: status.is_some(),
         drained,
         abandoned,
+        #[cfg(test)]
+        poll_calls: _poll_calls,
     };
     tracing::debug!(target: "thegn::plugin", program, ?outcome, "plugin run process-tree outcome");
 
@@ -854,10 +866,10 @@ fn recv_by_deadline<T>(
     receiver.recv_timeout(deadline.saturating_duration_since(Instant::now()))
 }
 
-/// One pipe-reader result: the sink, captured stderr, and the truncated, drained
-/// and abandoned flags, or the reader's error text.
+/// One pipe-reader result: the sink, captured stderr, the truncated, drained,
+/// abandoned and poll-count values, or the reader's error text.
 #[cfg(unix)]
-type PipeReadResult<S> = Result<(S, String, bool, bool, bool), String>;
+type PipeReadResult<S> = Result<(S, String, bool, bool, bool, usize), String>;
 
 #[cfg(unix)]
 fn read_plugin_pipes<S: NdjsonSink>(
@@ -916,9 +928,12 @@ fn read_plugin_pipes<S: NdjsonSink>(
             revents: 0,
         },
     ];
-    while (stdout_open || stderr_open)
-        && started.elapsed().as_millis() < u128::from(deadline_ms.load(Ordering::Acquire))
-    {
+    let mut poll_calls = 0usize;
+    while stdout_open || stderr_open {
+        let deadline = started + Duration::from_millis(deadline_ms.load(Ordering::Acquire));
+        if Instant::now() >= deadline {
+            break;
+        }
         // Keep closed streams out of poll: a pipe at EOF reports POLLHUP
         // continuously, which would spin while its sibling remains open.
         descriptors[0].fd = if stdout_open { stdout_fd } else { -1 };
@@ -927,11 +942,9 @@ fn read_plugin_pipes<S: NdjsonSink>(
         descriptors[1].fd = if stderr_open { stderr_fd } else { -1 };
         descriptors[1].events = if stderr_open { libc::POLLIN } else { 0 };
         descriptors[1].revents = 0;
-        #[cfg(test)]
-        PIPE_POLL_CALLS.fetch_add(1, Ordering::Relaxed);
-        let deadline = started + Duration::from_millis(deadline_ms.load(Ordering::Acquire));
+        poll_calls = poll_calls.saturating_add(1);
         let remaining = deadline.saturating_duration_since(Instant::now());
-        let wait_ms = remaining.as_millis().min(50) as i32;
+        let wait_ms = poll_wait_ms(remaining);
         // SAFETY: descriptors points to two initialized pollfd entries.
         let polled =
             unsafe { libc::poll(descriptors.as_mut_ptr(), descriptors.len() as _, wait_ms) };
@@ -1008,18 +1021,25 @@ fn read_plugin_pipes<S: NdjsonSink>(
         }
     }
     let drained = stdout_eof && stderr_eof;
-    let abandoned = !drained
-        && started.elapsed().as_millis() >= u128::from(deadline_ms.load(Ordering::Acquire))
-        && (stdout_open || stderr_open);
+    let deadline = started + Duration::from_millis(deadline_ms.load(Ordering::Acquire));
+    let abandoned = !drained && Instant::now() >= deadline && (stdout_open || stderr_open);
     let (sink, truncated) = framer.finish(stdout_eof);
     let stderr = String::from_utf8_lossy(&stderr_bytes).into_owned();
-    if let Err(error) = sender.send(Ok((sink, stderr, truncated, drained, abandoned))) {
+    if let Err(error) = sender.send(Ok((
+        sink, stderr, truncated, drained, abandoned, poll_calls,
+    ))) {
         tracing::debug!(%error, "plugin pipe reader result was not received");
     }
 }
 
-#[cfg(all(test, unix))]
-static PIPE_POLL_CALLS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+#[cfg(unix)]
+fn poll_wait_ms(remaining: Duration) -> i32 {
+    if remaining.is_zero() {
+        0
+    } else {
+        remaining.as_micros().div_ceil(1_000).clamp(1, 50) as i32
+    }
+}
 
 #[cfg(all(test, unix))]
 static LIVE_PIPE_READERS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
@@ -1268,7 +1288,7 @@ pub(crate) fn kill_group(pid: u32) {
 #[cfg(all(test, unix))]
 mod process_tree_deadline_tests {
     use super::{
-        LIVE_PIPE_READERS, PIPE_POLL_CALLS, PluginError, READER_GRACE, READER_RECEIVE_MARGIN,
+        LIVE_PIPE_READERS, PluginError, READER_GRACE, READER_RECEIVE_MARGIN, poll_wait_ms,
         spawn_ndjson,
     };
     use std::collections::BTreeMap;
@@ -1329,14 +1349,30 @@ mod process_tree_deadline_tests {
         if !setsid_available() {
             return;
         }
-        let polls_before = PIPE_POLL_CALLS.load(Ordering::Relaxed);
         let run = run_holding_pipe("stderr");
         assert!(run.outcome.abandoned);
         assert!(!run.outcome.drained);
         assert!(run.outcome.reaped);
         assert!(!run.truncated);
-        assert!(PIPE_POLL_CALLS.load(Ordering::Relaxed) - polls_before < 1_000);
+        // A 300 ms deadline permits at most 300 one-ms waits even if every
+        // wait wakes spuriously; 200 is generous for this held pipe, which
+        // normally wakes only at the 50 ms cap.
+        assert!(
+            run.outcome.poll_calls < 200,
+            "poll calls: {}",
+            run.outcome.poll_calls
+        );
         assert_readers_exit_within_margin();
+    }
+
+    #[test]
+    fn poll_wait_rounds_up_submillisecond_time() {
+        assert_eq!(poll_wait_ms(Duration::ZERO), 0);
+        assert_eq!(poll_wait_ms(Duration::from_micros(1)), 1);
+        assert_eq!(poll_wait_ms(Duration::from_micros(999)), 1);
+        assert_eq!(poll_wait_ms(Duration::from_millis(1)), 1);
+        assert_eq!(poll_wait_ms(Duration::from_micros(1_500)), 2);
+        assert_eq!(poll_wait_ms(Duration::from_millis(120)), 50);
     }
 
     #[test]
