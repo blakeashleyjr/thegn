@@ -39,6 +39,7 @@ pub(super) enum ActiveView<'a> {
     Overview(OverviewView<'a>),
     Power(super::tabs::power::view::PowerView<'a>),
     Memory(super::tabs::memory::view::MemoryView<'a>),
+    Thermal(super::tabs::thermal::view::ThermalView<'a>),
 }
 
 impl TabView for ActiveView<'_> {
@@ -49,6 +50,7 @@ impl TabView for ActiveView<'_> {
             Self::Overview(view) => view.specs(),
             Self::Power(view) => view.specs(),
             Self::Memory(view) => view.specs(),
+            Self::Thermal(view) => view.specs(),
         }
     }
 
@@ -59,6 +61,7 @@ impl TabView for ActiveView<'_> {
             Self::Overview(view) => view.template(),
             Self::Power(view) => view.template(),
             Self::Memory(view) => view.template(),
+            Self::Thermal(view) => view.template(),
         }
     }
 
@@ -69,6 +72,7 @@ impl TabView for ActiveView<'_> {
             Self::Overview(view) => view.demand(panel),
             Self::Power(view) => view.demand(panel),
             Self::Memory(view) => view.demand(panel),
+            Self::Thermal(view) => view.demand(panel),
         }
     }
 
@@ -86,6 +90,7 @@ impl TabView for ActiveView<'_> {
             Self::Overview(view) => view.paint(surface, placed, rect, scroll, sections),
             Self::Power(view) => view.paint(surface, placed, rect, scroll, sections),
             Self::Memory(view) => view.paint(surface, placed, rect, scroll, sections),
+            Self::Thermal(view) => view.paint(surface, placed, rect, scroll, sections),
         }
     }
 }
