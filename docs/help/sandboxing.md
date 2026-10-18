@@ -153,6 +153,10 @@ sandboxed launch is refused under the default floor. Pin one to skip the
 probing — `podman-rootless`, `podman-rootful`, `docker`, `bwrap`, `systemd`,
 `apple`, `wsl`, `none`.
 
+For local rootless Podman, the first thegn command is the `version` liveness
+probe, before container creation or the events client; a surviving `pause`
+process is Podman's namespace helper and is outside thegn's child ownership.
+
 One chain serves every OS: each OS-native entry is probed only on its own OS.
 
 > **NixOS tip:** set `backend = "bwrap"` to skip the podman probes and get
