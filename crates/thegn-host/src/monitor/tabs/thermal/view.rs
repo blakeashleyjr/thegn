@@ -1,5 +1,3 @@
-#![allow(dead_code)] // wired into the overlay dispatch in batch 47 (see THE-871)
-
 use crate::{
     compositor::Rect,
     monitor::{
@@ -7,8 +5,10 @@ use crate::{
         kit::{emit::Emitter, grid::CellGrid, panel},
         layout::{Node, PanelId, PanelSpec, Placed, Size, Variant, VariantKind},
     },
+    telemetry::{Metric, ScaleMode, SeriesReq, TelemetryHistory, Window},
 };
 use termwiz::surface::Surface;
+use thegn_core::series::Agg;
 use thegn_metrics::collect::{
     CollectorId, CollectorSet,
     frame::MonitorFrame,
@@ -28,6 +28,7 @@ const CORES: PanelId = PanelId("thermal.cores");
 const SENSORS: PanelId = PanelId("thermal.sensors");
 const ZONES: PanelId = PanelId("thermal.zones");
 const GPU: PanelId = PanelId("thermal.gpu");
+const HEATMAP: PanelId = PanelId("thermal.heatmap");
 
 const FULL: Variant = Variant {
     kind: VariantKind::Full,
@@ -45,7 +46,7 @@ const MINI: Variant = Variant {
     pref: (16, 11),
 };
 const VARIANTS: &[Variant] = &[FULL, COMPACT, MINI];
-const SPECS: [PanelSpec; 5] = [
+const SPECS: [PanelSpec; 6] = [
     PanelSpec {
         id: PACKAGE,
         priority: 0,
@@ -58,7 +59,7 @@ const SPECS: [PanelSpec; 5] = [
     },
     PanelSpec {
         id: SENSORS,
-        priority: 1,
+        priority: 5,
         variants: VARIANTS,
     },
     PanelSpec {
@@ -71,6 +72,11 @@ const SPECS: [PanelSpec; 5] = [
         priority: 3,
         variants: VARIANTS,
     },
+    PanelSpec {
+        id: HEATMAP,
+        priority: 3,
+        variants: VARIANTS,
+    },
 ];
 
 #[derive(Debug, Clone, PartialEq)]
@@ -78,14 +84,18 @@ pub(in crate::monitor) struct ThermalModel {
     sensors: Vec<SensorRow>,
     zones: Vec<ZoneRow>,
     cores: [Option<f32>; 16],
+    core_history: [[f32; HISTORY_CAP]; 16],
+    core_history_len: [usize; 16],
+    core_history_next: [usize; 16],
     gfx_c: Option<f32>,
     edge_c: Option<f32>,
     hotspot_c: Option<f32>,
     soc_c: Option<f32>,
     socket_w: Option<f32>,
     package_history: [f32; HISTORY_CAP],
-    history_len: usize,
-    history_next: usize,
+    package_history_len: usize,
+    package_history_next: usize,
+    temp_history: Vec<f32>,
 }
 
 impl Default for ThermalModel {
@@ -94,37 +104,51 @@ impl Default for ThermalModel {
             sensors: Vec::with_capacity(SENSOR_CAP),
             zones: Vec::with_capacity(16),
             cores: [None; 16],
+            core_history: [[0.0; HISTORY_CAP]; 16],
+            core_history_len: [0; 16],
+            core_history_next: [0; 16],
             gfx_c: None,
             edge_c: None,
             hotspot_c: None,
             soc_c: None,
             socket_w: None,
             package_history: [0.0; HISTORY_CAP],
-            history_len: 0,
-            history_next: 0,
+            package_history_len: 0,
+            package_history_next: 0,
+            temp_history: Vec::with_capacity(HISTORY_CAP),
         }
     }
 }
 
 #[derive(Debug, Clone, PartialEq)]
 struct SensorRow {
+    key: String,
     chip: String,
     label: String,
     group: ChipGroup,
     temp_c: Option<f32>,
     max_c: Option<f32>,
     crit_c: Option<f32>,
+    history: [f32; HISTORY_CAP],
+    history_len: usize,
+    history_next: usize,
+    seen: bool,
 }
 
 impl Default for SensorRow {
     fn default() -> Self {
         Self {
+            key: String::new(),
             chip: String::new(),
             label: String::new(),
             group: ChipGroup::Other,
             temp_c: None,
             max_c: None,
             crit_c: None,
+            history: [0.0; HISTORY_CAP],
+            history_len: 0,
+            history_next: 0,
+            seen: false,
         }
     }
 }
@@ -138,9 +162,33 @@ struct ZoneRow {
 }
 
 impl ThermalModel {
+    pub(in crate::monitor) fn absorb_history(
+        &mut self,
+        history: &TelemetryHistory,
+        window: Window,
+        scale: ScaleMode,
+        now_ms: u64,
+    ) {
+        let series = history.series(&SeriesReq {
+            metric: Metric::Temp,
+            window,
+            scale: TelemetryHistory::scale_for(Metric::Temp, scale),
+            buckets: HISTORY_CAP,
+            agg: Agg::Max,
+            now_ms,
+        });
+        if series.empty {
+            self.temp_history.clear();
+            return;
+        }
+        self.temp_history.clone_from(&series.raw_hi);
+    }
+
     pub(in crate::monitor) fn absorb_frame(&mut self, frame: &MonitorFrame) {
-        let mut sensor_count = 0;
         let mut zone_count = 0;
+        for sensor in &mut self.sensors {
+            sensor.seen = false;
+        }
         self.cores.fill(None);
         self.gfx_c = None;
         self.edge_c = None;
@@ -151,10 +199,7 @@ impl ThermalModel {
         let layout = frame.parts.hwmon.layout.as_deref();
         if let Some(layout) = layout {
             for (index, sensor) in layout.sensors.iter().enumerate() {
-                if sensor.kind != SensorKind::Temp
-                    || sensor.role != SensorRole::Input
-                    || sensor_count == SENSOR_CAP
-                {
+                if sensor.kind != SensorKind::Temp || sensor.role != SensorRole::Input {
                     continue;
                 }
                 let Some(chip) = layout.chips.get(usize::from(sensor.chip)) else {
@@ -166,17 +211,20 @@ impl ThermalModel {
                     .values
                     .get(index)
                     .map(|reading| reading.value);
-                if value.is_some_and(|reading| {
-                    reading.is_some_and(|value| {
-                        hwmon_group::plausible_input(SensorKind::Temp, (value * 1000.0) as i64)
-                            .is_none()
-                    })
-                }) {
+                let row_index = self.sensors.iter().position(|row| row.key == sensor.key);
+                if row_index.is_none() && self.sensors.len() == SENSOR_CAP {
                     continue;
                 }
-                let temp_c = value.flatten();
-                let row = self.sensor_slot(sensor_count);
-                sensor_count += 1;
+                let row = if let Some(index) = row_index {
+                    &mut self.sensors[index]
+                } else {
+                    self.sensors.push(SensorRow::default());
+                    self.sensors
+                        .last_mut()
+                        .expect("sensor row was just inserted")
+                };
+                row.seen = true;
+                row.key.clone_from(&sensor.key);
                 row.chip.clone_from(&chip.name);
                 row.group = chip.group;
                 row.label.clear();
@@ -187,12 +235,40 @@ impl ThermalModel {
                         .filter(|label| !label.is_empty())
                         .unwrap_or("temperature"),
                 );
-                row.temp_c = temp_c;
                 row.max_c = sensor.thresholds.max;
                 row.crit_c = sensor.thresholds.crit;
+                if value.is_some_and(|reading| {
+                    reading.is_some_and(|value| {
+                        hwmon_group::plausible_input(SensorKind::Temp, (value * 1000.0) as i64)
+                            .is_none()
+                    })
+                }) {
+                    row.temp_c = None;
+                    row.history[row.history_next] = f32::NAN;
+                    row.history_next = (row.history_next + 1) % HISTORY_CAP;
+                    row.history_len = row.history_len.saturating_add(1).min(HISTORY_CAP);
+                    continue;
+                }
+                let temp_c = value.flatten();
+                row.temp_c = temp_c;
+                if row.group == ChipGroup::Cpu
+                    && let Some(core) = row
+                        .label
+                        .strip_prefix("core")
+                        .or_else(|| row.label.strip_prefix("Core "))
+                        .and_then(|suffix| suffix.parse::<usize>().ok())
+                    && core < self.cores.len()
+                {
+                    self.cores[core] = temp_c;
+                }
+                if let Some(temp) = temp_c {
+                    row.history[row.history_next] = temp;
+                    row.history_next = (row.history_next + 1) % HISTORY_CAP;
+                    row.history_len = row.history_len.saturating_add(1).min(HISTORY_CAP);
+                }
             }
         }
-        self.sensors.truncate(sensor_count);
+        self.sensors.retain(|sensor| sensor.seen);
         self.sensors.sort_unstable_by(|left, right| {
             left.chip
                 .cmp(&right.chip)
@@ -204,6 +280,12 @@ impl ThermalModel {
                 })
                 .then_with(|| left.label.cmp(&right.label))
         });
+
+        if let Some(temp) = self.package().and_then(|sensor| sensor.temp_c) {
+            self.package_history[self.package_history_next] = temp;
+            self.package_history_next = (self.package_history_next + 1) % HISTORY_CAP;
+            self.package_history_len = self.package_history_len.saturating_add(1).min(HISTORY_CAP);
+        }
 
         for zone in &frame.parts.thermal_zone.zones {
             if zone.alias
@@ -221,12 +303,6 @@ impl ThermalModel {
             row.alarm_events = zone.alarm_events;
         }
         self.zones.truncate(zone_count);
-
-        if let Some(temp) = self.package().and_then(|sensor| sensor.temp_c) {
-            self.package_history[self.history_next] = temp;
-            self.history_next = (self.history_next + 1) % HISTORY_CAP;
-            self.history_len = self.history_len.saturating_add(1).min(HISTORY_CAP);
-        }
 
         for card in &frame.parts.amd_smu.cards {
             if !matches!(
@@ -276,13 +352,16 @@ impl ThermalModel {
                 self.socket_w = metrics.power_socket.map(|value| value as f32 / 1000.0);
             }
         }
-    }
-
-    fn sensor_slot(&mut self, index: usize) -> &mut SensorRow {
-        if index == self.sensors.len() {
-            self.sensors.push(SensorRow::default());
+        for (index, temp) in self.cores.iter().enumerate() {
+            if temp.is_none() && self.core_history_len[index] == 0 {
+                continue;
+            }
+            self.core_history[index][self.core_history_next[index]] = temp.unwrap_or(f32::NAN);
+            self.core_history_next[index] = (self.core_history_next[index] + 1) % HISTORY_CAP;
+            self.core_history_len[index] = self.core_history_len[index]
+                .saturating_add(1)
+                .min(HISTORY_CAP);
         }
-        &mut self.sensors[index]
     }
 
     fn zone_slot(&mut self, index: usize) -> &mut ZoneRow {
@@ -315,22 +394,19 @@ impl TabView for ThermalView<'_> {
     }
 
     fn template(&self) -> Node {
-        let model = self.0;
-        let mut row = vec![(Size::Weight(2), Node::Panel(PACKAGE))];
-        if self.0.cores.iter().any(Option::is_some) {
-            row.push((Size::Weight(1), Node::Panel(CORES)));
-        }
-        if model.has_gpu() {
-            row.push((Size::Weight(1), Node::Panel(GPU)));
-        }
-        let mut col = vec![
-            (Size::Weight(1), Node::Row(row)),
-            (Size::Weight(2), Node::Panel(SENSORS)),
-        ];
-        if !model.zones.is_empty() {
-            col.push((Size::Weight(1), Node::Panel(ZONES)));
-        }
-        Node::Col(col)
+        Node::Col(vec![
+            (
+                Size::Weight(1),
+                Node::Row(vec![
+                    (Size::Weight(2), Node::Panel(PACKAGE)),
+                    (Size::Weight(1), Node::Panel(CORES)),
+                    (Size::Weight(1), Node::Panel(GPU)),
+                ]),
+            ),
+            (Size::Weight(3), Node::Panel(SENSORS)),
+            (Size::Fixed(11), Node::Panel(ZONES)),
+            (Size::Weight(2), Node::Panel(HEATMAP)),
+        ])
     }
 
     fn demand(&self, panel: PanelId) -> CollectorSet {
@@ -339,17 +415,18 @@ impl TabView for ThermalView<'_> {
             PACKAGE | SENSORS => {
                 set.insert(CollectorId::Hwmon);
             }
-            CORES if self.0.cores.iter().any(Option::is_some) => {
+            CORES => {
                 set.insert(CollectorId::AmdSmu);
             }
-            ZONES if !self.0.zones.is_empty() => {
+            ZONES => {
                 set.insert(CollectorId::ThermalZone);
             }
-            GPU if self.0.has_gpu() => {
+            HEATMAP => {
                 set.insert(CollectorId::Hwmon);
-                if self.0.has_amd_gpu_readings() {
-                    set.insert(CollectorId::AmdSmu);
-                }
+            }
+            GPU => {
+                set.insert(CollectorId::Hwmon);
+                set.insert(CollectorId::AmdSmu);
             }
             _ => {}
         }
@@ -371,6 +448,7 @@ impl TabView for ThermalView<'_> {
             SENSORS => "Sensors",
             ZONES => "Thermal zones",
             GPU => "GPU thermals",
+            HEATMAP => "Core history",
             _ => return,
         };
         let inner = {
@@ -382,14 +460,22 @@ impl TabView for ThermalView<'_> {
                 &mut grid,
                 inner,
                 self.0.package(),
+                &self.0.temp_history,
                 &self.0.package_history,
-                self.0.history_len,
-                self.0.history_next,
+                self.0.package_history_len,
+                self.0.package_history_next,
             ),
             CORES => paint::cores(&mut grid, inner, &self.0.cores),
             SENSORS => paint::sensors(&mut grid, inner, &self.0.sensors),
             ZONES => paint::zones(&mut grid, inner, &self.0.zones),
             GPU => paint::gpu(&mut grid, inner, self.0),
+            HEATMAP => paint::heatmap(
+                &mut grid,
+                inner,
+                &self.0.core_history,
+                &self.0.core_history_len,
+                &self.0.core_history_next,
+            ),
             _ => {}
         }
         Emitter::default().emit(
@@ -399,23 +485,39 @@ impl TabView for ThermalView<'_> {
             rect.x,
             rect.y,
         );
-    }
-}
-
-impl ThermalModel {
-    fn has_gpu(&self) -> bool {
-        self.sensors.iter().any(|row| row.group == ChipGroup::Gpu)
-            || self.gfx_c.is_some()
-            || self.edge_c.is_some()
-            || self.hotspot_c.is_some()
-    }
-
-    fn has_amd_gpu_readings(&self) -> bool {
-        self.gfx_c.is_some()
-            || self.edge_c.is_some()
-            || self.hotspot_c.is_some()
-            || self.soc_c.is_some()
-            || self.socket_w.is_some()
+        if placed.id == SENSORS {
+            let spark_x = rect
+                .x
+                .saturating_add(inner.x)
+                .saturating_add(paint::SENSOR_HISTORY_X);
+            let spark_width = inner.cols.saturating_sub(paint::SENSOR_HISTORY_X);
+            for (index, sensor) in self
+                .0
+                .sensors
+                .iter()
+                .enumerate()
+                .take(inner.rows.saturating_sub(1))
+            {
+                let mut ordered = [0.0_f32; HISTORY_CAP];
+                let count = paint::history_into(sensor, spark_width, &mut ordered);
+                let limit = sensor.crit_c.or(sensor.max_c).unwrap_or(100.0);
+                for sample in &mut ordered[..count] {
+                    *sample = (*sample / limit).clamp(0.0, 1.0);
+                }
+                crate::monitor::graphs::paint_sparkline(
+                    &ordered[..count],
+                    count,
+                    thegn_core::theme::RampId::Temp,
+                    Rect {
+                        x: spark_x.saturating_add(spark_width.saturating_sub(count)),
+                        y: rect.y.saturating_add(inner.y).saturating_add(index + 1),
+                        cols: count,
+                        rows: 1,
+                    },
+                    surface,
+                );
+            }
+        }
     }
 }
 

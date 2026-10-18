@@ -817,9 +817,59 @@ fn every_thermal_sensor_is_listed_not_just_the_hottest() {
         key(&mut ov, KeyCode::Tab);
     }
     ov.sync(&_m, &_h, Rect::full(120, 40));
+    let mut frame = thegn_metrics::collect::frame::MonitorFrame::default();
+    frame.parts.hwmon.layout = Some(std::sync::Arc::new(
+        thegn_metrics::collect::model::hwmon::HwmonLayout {
+            generation: 1,
+            chips: vec![
+                thegn_metrics::collect::model::hwmon::HwmonChip {
+                    name: "coretemp".into(),
+                    device: "cpu0".into(),
+                    group: thegn_metrics::collect::model::hwmon::ChipGroup::Cpu,
+                    ordinal: 0,
+                    gated: false,
+                },
+                thegn_metrics::collect::model::hwmon::HwmonChip {
+                    name: "nvme".into(),
+                    device: "nvme0".into(),
+                    group: thegn_metrics::collect::model::hwmon::ChipGroup::Nvme,
+                    ordinal: 1,
+                    gated: false,
+                },
+            ],
+            sensors: ["coretemp", "nvme"]
+                .into_iter()
+                .enumerate()
+                .map(
+                    |(index, name)| thegn_metrics::collect::model::hwmon::HwmonSensor {
+                        key: format!("{name}@device#temp1_input"),
+                        chip: index as u16,
+                        kind: thegn_metrics::collect::model::hwmon::SensorKind::Temp,
+                        channel: 1,
+                        role: thegn_metrics::collect::model::hwmon::SensorRole::Input,
+                        label: Some("Package".into()),
+                        thresholds: thegn_metrics::collect::model::hwmon::Thresholds {
+                            max: Some(85.0),
+                            crit: Some(100.0),
+                            ..Default::default()
+                        },
+                        cost: thegn_metrics::collect::model::hwmon::CostClass::Fast,
+                    },
+                )
+                .collect(),
+        },
+    ));
+    frame.parts.hwmon.values = [68.0, 44.0]
+        .into_iter()
+        .map(|value| thegn_metrics::collect::model::hwmon::HwmonValue {
+            value: Some(value),
+            ..Default::default()
+        })
+        .collect();
+    assert!(ov.ingest_frame(&frame));
     let text = render_text(&ov, 120, 40);
-    assert!(text.contains("coretemp"), "{text}");
-    assert!(text.contains("nvme"), "secondary sensor hidden: {text}");
+    assert!(text.contains("coretemp"), "coretemp sensor missing: {text}");
+    assert!(text.contains("nvme"), "nvme sensor missing: {text}");
 }
 
 #[test]

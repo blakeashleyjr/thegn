@@ -471,6 +471,7 @@ pub struct MonitorOverlay {
     overview: tabs::overview::OverviewModel,
     cpu: tabs::cpu::view::CpuModel,
     memory: tabs::memory::view::MemoryModel,
+    thermal: tabs::thermal::view::ThermalModel,
 }
 
 impl MonitorOverlay {
@@ -531,6 +532,7 @@ impl MonitorOverlay {
             overview: tabs::overview::OverviewModel::default(),
             cpu: tabs::cpu::view::CpuModel::default(),
             memory: tabs::memory::view::MemoryModel::default(),
+            thermal: tabs::thermal::view::ThermalModel::default(),
         };
         ov.rebuild(model, ctx, false);
         ov
@@ -611,6 +613,9 @@ impl MonitorOverlay {
             MonitorTab::Memory => {
                 board::ActiveView::Memory(tabs::memory::view::MemoryView(&self.memory))
             }
+            MonitorTab::Thermal => {
+                board::ActiveView::Thermal(tabs::thermal::view::ThermalView(&self.thermal))
+            }
             _ => board::ActiveView::for_tab(self.tab, &self.overview),
         }
     }
@@ -627,6 +632,10 @@ impl MonitorOverlay {
         }
         if self.tab == MonitorTab::Memory {
             self.memory.absorb_frame(frame);
+            return true;
+        }
+        if self.tab == MonitorTab::Thermal {
+            self.thermal.absorb_frame(frame);
             return true;
         }
         self.overview.absorb_frame(frame);
@@ -667,6 +676,11 @@ impl MonitorOverlay {
             self.overview.absorb_container_count(model.containers.len());
             let prefs = self.prefs.tab(MonitorTab::Overview);
             self.overview
+                .absorb_history(ctx.hist, prefs.window, prefs.scale, now);
+        }
+        if !self.paused && self.tab == MonitorTab::Thermal {
+            let prefs = self.prefs.tab(MonitorTab::Thermal);
+            self.thermal
                 .absorb_history(ctx.hist, prefs.window, prefs.scale, now);
         }
         // Only the active list is derived, and navigation/geometry changes do
