@@ -17,5 +17,15 @@ pub(crate) fn is_executable_file(metadata: &std::fs::Metadata) -> bool {
     platform_is_executable_file(metadata)
 }
 
+/// Whether an accept error is a platform-specific resource exhaustion error.
+pub(crate) fn is_transient_accept_resource_error(raw_os_error: Option<i32>) -> bool {
+    platform_is_transient_accept_resource_error(raw_os_error)
+}
+
+#[cfg(test)]
+pub(crate) fn accept_resource_error_for_test() -> std::io::Error {
+    platform_accept_resource_error_for_test()
+}
+
 #[cfg(test)]
 mod native_tests;

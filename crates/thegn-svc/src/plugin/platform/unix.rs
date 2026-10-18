@@ -15,6 +15,18 @@ pub(crate) fn platform_is_executable_file(metadata: &std::fs::Metadata) -> bool 
     metadata.permissions().mode() & 0o111 != 0
 }
 
+pub(crate) fn platform_is_transient_accept_resource_error(raw_os_error: Option<i32>) -> bool {
+    matches!(
+        raw_os_error,
+        Some(libc::EMFILE) | Some(libc::ENFILE) | Some(libc::ENOBUFS) | Some(libc::ENOMEM)
+    )
+}
+
+#[cfg(test)]
+pub(crate) fn platform_accept_resource_error_for_test() -> io::Error {
+    io::Error::from_raw_os_error(libc::EMFILE)
+}
+
 enum ExitNotice {
     Signal(Signal),
     #[cfg(target_os = "linux")]
