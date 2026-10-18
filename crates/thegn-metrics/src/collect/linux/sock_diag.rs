@@ -5,14 +5,16 @@ use std::time::Instant;
 
 use super::netlink::{AttributeIter, MessageIter, NetlinkMessage, NetlinkSocket};
 
-// Values and layouts are from Linux UAPI headers: include/uapi/linux/{netlink.h,inet_diag.h,tcp.h}.
+// SOCK_DIAG_BY_FAMILY and INET_DIAG_INFO: include/uapi/linux/inet_diag.h.
 const SOCK_DIAG_BY_FAMILY: u16 = 20;
-const NLMSG_REQUEST: u16 = 1;
-const NLMSG_DUMP: u16 = 0x300;
 const INET_DIAG_INFO: u16 = 2;
-const AF_INET_U8: u8 = 2;
-const AF_INET6_U8: u8 = 10;
-const IPPROTO_TCP_U8: u8 = 6;
+const NLMSG_DONE: u16 = libc::NLMSG_DONE as u16;
+const NLMSG_ERROR: u16 = libc::NLMSG_ERROR as u16;
+const NLM_F_DUMP_INTR: u16 = libc::NLM_F_DUMP_INTR as u16;
+const REQUEST_FLAGS: u16 = (libc::NLM_F_REQUEST | libc::NLM_F_DUMP) as u16;
+const AF_INET_U8: u8 = libc::AF_INET as u8;
+const AF_INET6_U8: u8 = libc::AF_INET6 as u8;
+const IPPROTO_TCP_U8: u8 = libc::IPPROTO_TCP as u8;
 const NLMSG_HEADER_LEN: usize = 16;
 const INET_DIAG_REQ_V2_LEN: usize = 56;
 const INET_DIAG_MSG_LEN: usize = 72;
@@ -24,8 +26,6 @@ const TCP_INFO_RETRANS_OFFSET: usize = 36;
 const TCP_INFO_TOTAL_RETRANS_OFFSET: usize = 100;
 const TCP_INFO_BYTES_ACKED_OFFSET: usize = 120;
 const TCP_INFO_BYTES_RECEIVED_OFFSET: usize = 128;
-const RECEIVE_BUFFER_LEN: usize = 64 * 1024;
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AddressFamily {
     Ipv4,
@@ -60,13 +60,18 @@ pub struct TcpSock {
 }
 
 /// Encodes inet_diag_req_v2 asking the kernel to dump TCP sockets in `states`.
-pub fn encode_request(family: AddressFamily, states: u32) -> Vec<u8> {
-    let mut bytes = vec![0_u8; NLMSG_HEADER_LEN + INET_DIAG_REQ_V2_LEN];
+pub fn encode_request(
+    bytes: &mut [u8; NLMSG_HEADER_LEN + INET_DIAG_REQ_V2_LEN],
+    family: AddressFamily,
+    states: u32,
+    sequence: u32,
+) {
+    bytes.fill(0);
     let request_len = bytes.len() as u32;
-    put_u32(&mut bytes, 0, request_len);
-    put_u16(&mut bytes, 4, SOCK_DIAG_BY_FAMILY);
-    put_u16(&mut bytes, 6, NLMSG_REQUEST | NLMSG_DUMP);
-    put_u32(&mut bytes, 8, 1);
+    put_u32(bytes, 0, request_len);
+    put_u16(bytes, 4, SOCK_DIAG_BY_FAMILY);
+    put_u16(bytes, 6, REQUEST_FLAGS);
+    put_u32(bytes, 8, sequence);
     let req = NLMSG_HEADER_LEN;
     bytes[req] = match family {
         AddressFamily::Ipv4 => AF_INET_U8,
@@ -74,11 +79,10 @@ pub fn encode_request(family: AddressFamily, states: u32) -> Vec<u8> {
     };
     bytes[req + 1] = IPPROTO_TCP_U8;
     bytes[req + 2] = (1 << (INET_DIAG_INFO - 1)) as u8;
-    put_u32(&mut bytes, req + 4, states);
+    put_u32(bytes, req + 4, states);
     // Zero ports/addresses/interface select every matching socket; cookies are all-ones.
-    put_u32(&mut bytes, req + 48, u32::MAX);
-    put_u32(&mut bytes, req + 52, u32::MAX);
-    bytes
+    put_u32(bytes, req + 48, u32::MAX);
+    put_u32(bytes, req + 52, u32::MAX);
 }
 
 /// Decodes one inet_diag_msg and any INET_DIAG_INFO attribute into a reusable output row.
@@ -121,7 +125,10 @@ pub fn decode_message(message: &NetlinkMessage<'_>) -> io::Result<TcpSock> {
     };
     let mut info = None;
     for attribute in AttributeIter::new(&payload[INET_DIAG_MSG_LEN..]) {
-        let attribute = attribute?;
+        let Ok(attribute) = attribute else {
+            info = None;
+            break;
+        };
         if attribute.kind == TCP_INFO_KIND {
             info = Some(decode_tcp_info(attribute.payload));
         }
@@ -149,23 +156,78 @@ pub fn dump_tcp(
 ) -> io::Result<()> {
     out.clear();
     for family in [AddressFamily::Ipv4, AddressFamily::Ipv6] {
-        socket.send(&encode_request(family, u32::MAX))?;
-        let mut buffer = [0_u8; RECEIVE_BUFFER_LEN];
+        let sequence = socket.next_sequence();
+        let mut request = [0_u8; NLMSG_HEADER_LEN + INET_DIAG_REQ_V2_LEN];
+        encode_request(&mut request, family, u32::MAX, sequence);
+        socket.send(&request)?;
         loop {
-            let count = socket.recv(&mut buffer, deadline)?;
-            let mut messages = MessageIter::new(&buffer[..count]);
-            for message in &mut messages {
-                let message = message?;
-                if message.header.kind == SOCK_DIAG_BY_FAMILY {
-                    out.push(decode_message(&message)?);
-                }
+            socket.recv(deadline)?;
+            let (done, malformed) = consume_batch(socket.received(), sequence, out)?;
+            if malformed > 0 {
+                tracing::debug!(
+                    malformed_rows = malformed,
+                    "skipped malformed sock_diag rows"
+                );
             }
-            if messages.is_done() {
+            if done {
                 break;
             }
         }
     }
     Ok(())
+}
+
+fn consume_batch(bytes: &[u8], sequence: u32, out: &mut Vec<TcpSock>) -> io::Result<(bool, usize)> {
+    let mut messages = MessageIter::for_sequence(bytes, sequence);
+    let mut malformed = 0;
+    for message in &mut messages {
+        let message = message?;
+        if message.header.sequence != sequence {
+            continue;
+        }
+        if message.header.kind == NLMSG_DONE {
+            if message.header.flags & NLM_F_DUMP_INTR != 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::Interrupted,
+                    "netlink dump interrupted",
+                ));
+            }
+            if message.payload.len() >= 4 {
+                let error = i32::from_ne_bytes([
+                    message.payload[0],
+                    message.payload[1],
+                    message.payload[2],
+                    message.payload[3],
+                ]);
+                if error < 0 {
+                    return Err(io::Error::from_raw_os_error(error.saturating_neg()));
+                }
+            }
+            return Ok((true, malformed));
+        }
+        if message.header.kind == NLMSG_ERROR {
+            if message.payload.len() < 4 {
+                return Err(invalid("truncated NLMSG_ERROR"));
+            }
+            let error = i32::from_ne_bytes([
+                message.payload[0],
+                message.payload[1],
+                message.payload[2],
+                message.payload[3],
+            ]);
+            if error < 0 {
+                return Err(io::Error::from_raw_os_error(error.saturating_neg()));
+            }
+            continue;
+        }
+        if message.header.kind == SOCK_DIAG_BY_FAMILY {
+            match decode_message(&message) {
+                Ok(row) => out.push(row),
+                Err(_) => malformed += 1,
+            }
+        }
+    }
+    Ok((false, malformed))
 }
 
 fn decode_tcp_info(bytes: &[u8]) -> TcpInfo {
