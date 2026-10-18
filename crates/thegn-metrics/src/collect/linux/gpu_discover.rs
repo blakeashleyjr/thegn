@@ -62,6 +62,7 @@ pub struct GpuDevicesCollector<F: GpuFs = RealFs> {
     drm: PathBuf,
     accel: PathBuf,
     devices: Vec<DeviceReader<F::Handle>>,
+    duplicate_cards: Vec<u32>,
     accels: Vec<Accelerator>,
     last_discovery_ms: Option<u64>,
     generation: u64,
@@ -86,6 +87,7 @@ impl<F: GpuFs> GpuDevicesCollector<F> {
             drm: drm.into(),
             accel: accel.into(),
             devices: Vec::new(),
+            duplicate_cards: Vec::new(),
             accels: Vec::new(),
             last_discovery_ms: None,
             generation: 0,
@@ -115,8 +117,13 @@ impl<F: GpuFs> GpuDevicesCollector<F> {
             changed |= !present;
             present
         });
+        self.duplicate_cards
+            .retain(|card| cards.iter().any(|(index, _)| index == card));
         self.truncated = false;
         for (index, card_path) in cards {
+            if self.duplicate_cards.contains(&index) {
+                continue;
+            }
             if self
                 .devices
                 .iter()
@@ -166,6 +173,7 @@ impl<F: GpuFs> GpuDevicesCollector<F> {
                     !known.excluded && known.device.slot == self.devices[last].device.slot
                 })
             {
+                self.duplicate_cards.push(index);
                 self.devices.pop();
             }
         }
@@ -279,6 +287,7 @@ impl<F: GpuFs> Collector for GpuDevicesCollector<F> {
                             && known.device.slot == slot
                     });
                 if duplicate {
+                    self.duplicate_cards.push(self.devices[index].device.card);
                     self.devices.remove(index);
                     continue;
                 }
@@ -319,6 +328,7 @@ impl<F: GpuFs> Collector for GpuDevicesCollector<F> {
     }
     fn close(&mut self) {
         self.devices.clear();
+        self.duplicate_cards.clear();
         self.accels.clear();
         self.discovered = false;
         self.last_discovery_ms = None;
