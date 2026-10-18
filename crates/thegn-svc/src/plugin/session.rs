@@ -18,6 +18,9 @@ pub const MAX_RESIDENT_SESSIONS: usize = 32;
 pub const MAX_QUEUED_FRAMES: usize = 32;
 pub const MAX_QUEUED_BYTES: usize = 2 * super::proc::MAX_LINE_BYTES;
 pub const CLOSE_BUDGET: Duration = Duration::from_secs(2);
+pub const MAX_STDERR_LINE_BYTES: usize = 512;
+pub const MAX_STDERR_TAIL_BYTES: usize = 8 << 10;
+pub const STDERR_LOG_LINES_PER_WINDOW: u64 = 20;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SessionFailure {
@@ -63,6 +66,11 @@ pub struct SessionOutcome {
     pub tree: TreeGuarantee,
     pub termination_requested: bool,
     pub errors: Vec<String>,
+    pub stderr_tail: Vec<u8>,
+    pub stderr_bytes: u64,
+    pub stderr_lines: u64,
+    pub stderr_dropped_lines: u64,
+    pub stderr_truncated_lines: u64,
 }
 impl SessionOutcome {
     pub fn settled(&self) -> bool {
@@ -83,7 +91,7 @@ struct Entry {
     shared: Arc<Shared>,
     task: Arc<tokio::sync::Mutex<TaskState>>,
     // Custody survives a completed task when termination or pipe settlement failed.
-    held: Arc<Mutex<Option<super::platform::Process>>>,
+    held: Arc<Mutex<Option<owner::HeldProcess>>>,
 }
 struct TaskState {
     handle: Option<tokio::task::JoinHandle<()>>,
@@ -242,13 +250,16 @@ impl ResidentSupervisor {
                             task.handle = None;
                         }
                         if task.handle.is_none() && Instant::now() < deadline {
-                            let process = held
+                            let held_process = held
                                 .lock()
                                 .unwrap_or_else(|error| error.into_inner())
                                 .take();
-                            if let Some(process) = process {
-                                let custody =
-                                    owner::Custody::new(process, shared.clone(), held.clone());
+                            if let Some(held_process) = held_process {
+                                let custody = owner::Custody::from_held(
+                                    held_process,
+                                    shared.clone(),
+                                    held.clone(),
+                                );
                                 shared.outcome.send_replace(None);
                                 task.handle =
                                     Some(self.0.runtime.spawn(owner::retry(custody, deadline)));
