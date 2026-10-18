@@ -351,13 +351,17 @@ impl MemoryModel {
                 // distinguishes those from real zero readings; Hold carries
                 // interior gaps after the first observed value.
                 let gaps = self.telemetry_series.0.gap();
+                let raw = self.telemetry_series.0.raw_hi();
                 let first_present = gaps.iter().position(|gap| !gap);
-                for (index, &value) in values.iter().enumerate() {
-                    slot.push(if first_present.is_some_and(|first| index < first) {
-                        f32::NAN
-                    } else {
-                        value
-                    });
+                for (index, (&value, &raw)) in values.iter().zip(raw).enumerate() {
+                    let valid = raw.is_finite() && (0.0..=100.0).contains(&raw);
+                    slot.push(
+                        if !valid || first_present.is_some_and(|first| index < first) {
+                            f32::NAN
+                        } else {
+                            value
+                        },
+                    );
                 }
             }
         }

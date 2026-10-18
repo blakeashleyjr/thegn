@@ -1066,3 +1066,49 @@ fn short_memory_histories_are_right_aligned_by_the_painters() {
         );
     }
 }
+
+#[test]
+fn telemetry_memory_gaps_hold_interior_values_and_keep_invalid_readings_blank() {
+    let mut history = TelemetryHistory::default();
+    history.push(&StatsSnapshot::default(), 1_000);
+    history.push(
+        &StatsSnapshot {
+            mem_gib: Some((25.0, 100.0)),
+            ..Default::default()
+        },
+        2_000,
+    );
+    history.push(&StatsSnapshot::default(), 3_000);
+    history.push(
+        &StatsSnapshot {
+            mem_gib: Some((50.0, 100.0)),
+            ..Default::default()
+        },
+        4_000,
+    );
+    history.push(
+        &StatsSnapshot {
+            mem_gib: Some((120.0, 100.0)),
+            ..Default::default()
+        },
+        5_000,
+    );
+
+    let mut model = MemoryModel::default();
+    model.absorb_history(&history, Window::EVERYTHING, ScaleMode::Window, 5_000);
+    let mut values = [0.0; super::HISTORY_CAPACITY];
+    let (len, _) = model.mem_telemetry.copy_recent(&mut values);
+
+    assert_eq!(len, 5);
+    assert!(values[0].is_nan(), "leading telemetry gap must stay blank");
+    assert!((values[1] - 0.25).abs() < f32::EPSILON);
+    assert_eq!(
+        values[2], values[1],
+        "interior gap must hold the prior value"
+    );
+    assert!((values[3] - 0.5).abs() < f32::EPSILON);
+    assert!(
+        values[4].is_nan(),
+        "memory above its declared total is implausible and must stay blank"
+    );
+}
