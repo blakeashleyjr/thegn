@@ -71,6 +71,7 @@ enum Confirm {
     Signal {
         pid: u32,
         start_time: u64,
+        start_ticks: Option<u64>,
         label: String,
         stage: crate::platform::ProcSignal,
     },
@@ -1157,6 +1158,7 @@ impl MonitorOverlay {
                 Some(Confirm::Signal {
                     pid,
                     start_time,
+                    start_ticks,
                     label,
                     stage,
                 }) => {
@@ -1167,7 +1169,15 @@ impl MonitorOverlay {
                         .iter()
                         .any(|r| (r.pid, r.start_time) == (pid, start_time))
                     {
-                        self.perform_signal(pid, start_time, &label, stage);
+                        self.perform_signal(
+                            pid,
+                            crate::platform::ProcStart {
+                                secs: start_time,
+                                ticks: start_ticks,
+                            },
+                            &label,
+                            stage,
+                        );
                     } else {
                         self.status = Some(format!(
                             "{label}: process changed or left the sampled list; select it again"

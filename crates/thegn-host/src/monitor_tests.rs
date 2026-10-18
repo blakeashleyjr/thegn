@@ -875,6 +875,7 @@ fn proc(pid: u32, ppid: Option<u32>, name: &str, cpu: f32, rss: u64) -> thegn_me
         rss_bytes: rss,
         run_secs: 0,
         start_time: 100,
+        start_ticks: None,
         owner: thegn_metrics::ProcOwner::Other,
     }
 }
@@ -2020,6 +2021,65 @@ fn process_confirmation_refuses_changed_live_process_identity() {
     assert!(child.0.try_wait().expect("check child status").is_none());
     child.0.kill().expect("kill fixture child after mismatch");
     child.0.wait().expect("reap fixture child after mismatch");
+}
+
+#[test]
+#[expect(
+    clippy::disallowed_methods,
+    reason = "the fixture child is reaped on every path"
+)]
+fn process_confirmation_threads_sampled_ticks_to_the_signal() {
+    use std::process::Command;
+
+    struct FixtureChild(std::process::Child);
+
+    impl Drop for FixtureChild {
+        fn drop(&mut self) {
+            match self.0.try_wait() {
+                Ok(Some(_)) => return,
+                Ok(None) => {}
+                Err(error) => {
+                    tracing::debug!(%error, "could not check signal fixture before cleanup")
+                }
+            }
+            if let Err(error) = self.0.kill() {
+                tracing::debug!(%error, "could not kill signal fixture during cleanup");
+            }
+            if let Err(error) = self.0.wait() {
+                tracing::debug!(%error, "could not reap signal fixture during cleanup");
+            }
+        }
+    }
+
+    let mut child = FixtureChild(
+        Command::new(std::env::current_exe().expect("test executable path"))
+            .args(["--exact", "monitor::tests::identity_sleep_fixture"])
+            .arg("--nocapture")
+            .arg("--test-threads=1")
+            .env("THEGN_SIGNAL_IDENTITY_FIXTURE", "1")
+            .spawn()
+            .expect("spawn identity fixture"),
+    );
+    let pid = child.0.id();
+    let Some(start_ticks) = crate::platform::proxy_process_start_time(pid) else {
+        return;
+    };
+    let h = TelemetryHistory::default();
+    let screen = Rect::full(100, 24);
+    let mut m = model_with_n_procs(1);
+    m.procs.procs[0].pid = pid;
+    m.procs.procs[0].start_time = 1;
+    m.procs.procs[0].start_ticks = Some(start_ticks);
+    let mut ov = open_tab(MonitorTab::Procs, &m, &h, screen);
+    ch(&mut ov, 'x');
+    ch(&mut ov, 'y');
+    assert!(ov.status.as_deref().unwrap().contains("sent SIGTERM"));
+    let status = child.0.wait().expect("reap signalled identity fixture");
+    assert_eq!(
+        status.code(),
+        None,
+        "SIGTERM should end the fixture by signal"
+    );
 }
 
 #[test]
