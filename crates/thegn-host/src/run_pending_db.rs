@@ -929,7 +929,7 @@ mod tests {
         let (waker, _master, _terminal) =
             crate::platform::sound_process::test_support::test_waker();
         let started = std::time::Instant::now();
-        let status = crate::handlers::host::add_and_refresh(
+        let status = crate::handlers::host::queue_host_add_from_input(
             "alice@host.example",
             &thegn_core::config::Config::default(),
             &tx,

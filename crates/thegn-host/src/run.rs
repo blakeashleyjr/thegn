@@ -10780,19 +10780,23 @@ async fn event_loop<T: Terminal>(
                     model.status = format!("host {name} added");
                     match then {
                         run_pending_db::HostAddThen::Wizard { repo_root } => {
-                            crate::handlers::wizard::begin_worktree_wizard(
-                                repo_root,
-                                None,
-                                None,
-                                keymap.config(),
-                                &mut create_gen,
-                                &create_tx,
-                                &waker,
-                                &mut inflight,
-                                &mut wizard_cmd_tx,
-                                &mut wizard_ui,
-                                &mut model,
-                            );
+                            if let Some(active_repo_root) = session.repo_root()
+                                && active_repo_root == repo_root.as_path()
+                            {
+                                crate::handlers::wizard::begin_worktree_wizard(
+                                    repo_root,
+                                    None,
+                                    None,
+                                    keymap.config(),
+                                    &mut create_gen,
+                                    &create_tx,
+                                    &waker,
+                                    &mut inflight,
+                                    &mut wizard_cmd_tx,
+                                    &mut wizard_ui,
+                                    &mut model,
+                                );
+                            }
                         }
                         run_pending_db::HostAddThen::Panel => {
                             if let Err(error) = refresh_tx.send(RefreshKind::Model) {
@@ -19229,12 +19233,13 @@ async fn event_loop<T: Terminal>(
                                             );
                                     }
                                     HostInputKind::AddHost => {
-                                        model.status = crate::handlers::host::add_and_refresh(
-                                            &text,
-                                            &current_config,
-                                            &pending_db_tx,
-                                            &waker,
-                                        );
+                                        model.status =
+                                            crate::handlers::host::queue_host_add_from_input(
+                                                &text,
+                                                &current_config,
+                                                &pending_db_tx,
+                                                &waker,
+                                            );
                                     }
                                 }
                             }
