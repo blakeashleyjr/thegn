@@ -310,6 +310,10 @@ fn matching_start_ticks(
     ppid: u32,
     name: &str,
 ) -> Option<u64> {
+    // A same-parent, same-name PID reuse between the sysinfo refresh and this
+    // stat read can retain the replacement's ticks; the signal path then
+    // targets that replacement after its pidfd and ticks checks. This narrow
+    // race is accepted for a fork inside one sampling window.
     (stat.pid == pid && stat.ppid == ppid && stat.comm.to_string_lossy().as_ref() == name)
         .then_some(stat.starttime)
 }
