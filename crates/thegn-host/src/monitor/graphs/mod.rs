@@ -14,6 +14,8 @@ mod mirrored;
 mod spark;
 mod stacked;
 
+pub(crate) use heatmap::paint_heatmap;
+
 #[cfg(test)]
 mod tests;
 
