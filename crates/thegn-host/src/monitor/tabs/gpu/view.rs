@@ -210,7 +210,7 @@ impl GpuModel {
     }
 
     pub(in crate::monitor) fn absorb_frame(&mut self, frame: &MonitorFrame) {
-        copy_rows(
+        copy_gpu_devices(
             &mut self.devices.devices,
             &frame.parts.gpu_devices.devices,
             DEVICE_CAP,
@@ -361,6 +361,42 @@ fn copy_rows<T: Clone>(destination: &mut Vec<T>, source: &[T], cap: usize) {
         }
     }
     destination.truncate(count);
+}
+
+fn copy_gpu_devices(
+    destination: &mut Vec<thegn_metrics::collect::model::gpu::GpuDevice>,
+    source: &[thegn_metrics::collect::model::gpu::GpuDevice],
+    cap: usize,
+) {
+    let count = source.len().min(cap);
+    for (index, source_row) in source.iter().take(count).enumerate() {
+        if let Some(destination_row) = destination.get_mut(index) {
+            destination_row.card = source_row.card;
+            destination_row.kind = source_row.kind;
+            destination_row.ip_version = source_row.ip_version;
+            destination_row.runtime_status = source_row.runtime_status;
+            destination_row.vram_total = source_row.vram_total;
+            destination_row.gtt_total = source_row.gtt_total;
+            destination_row.boot_vga = source_row.boot_vga;
+            destination_row.slot.clone_from(&source_row.slot);
+            clone_optional_string(&mut destination_row.driver, &source_row.driver);
+            clone_optional_string(&mut destination_row.pci_id, &source_row.pci_id);
+            clone_optional_string(&mut destination_row.family, &source_row.family);
+        } else {
+            destination.push(source_row.clone());
+        }
+    }
+    destination.truncate(count);
+}
+
+fn clone_optional_string(destination: &mut Option<String>, source: &Option<String>) {
+    match source {
+        Some(source) => match destination {
+            Some(destination) => destination.clone_from(source),
+            None => *destination = Some(source.clone()),
+        },
+        None => *destination = None,
+    }
 }
 
 pub(in crate::monitor) struct GpuView<'a>(pub &'a GpuModel);
