@@ -988,6 +988,180 @@ mod tests {
     }
 
     #[test]
+    fn ascii_renderer_goldens_pin_short_exact_and_newest_long_samples() {
+        let mut b = CellBuf::new();
+
+        // One sample in a two-column raster is right-aligned.
+        b.reset(2, 2);
+        area(&[0.25], &RasterTable::ASCII, &mut b);
+        assert_eq!(chars(&b), ["  ", " :"]);
+        b.reset(2, 2);
+        line(&[0.25], &RasterTable::ASCII, &mut b);
+        assert_eq!(chars(&b), ["  ", " ."]);
+        b.reset(2, 2);
+        band(&[0.25], &[0.75], &RasterTable::ASCII, &mut b);
+        assert_eq!(chars(&b), [" :", " :"]);
+        b.reset(2, 2);
+        columns(
+            &[0.25],
+            RasterTable::ASCII.cols,
+            &RasterTable::ASCII,
+            &mut b,
+        );
+        assert_eq!(chars(&b), ["  ", " :"]);
+        b.reset(2, 2);
+        mirrored(&[0.25], &[0.25], &RasterTable::ASCII, &mut b);
+        assert_eq!(chars(&b), [" .", " ."]);
+        b.reset(2, 2);
+        stacked(&[&[0.25]], &RasterTable::ASCII, &mut b);
+        assert_eq!(chars(&b), ["  ", " -"]);
+        sparkline_width(&[0.5], 2, &RasterTable::ASCII, &mut b);
+        assert_eq!(chars(&b), [" -"]);
+
+        // Exact-width inputs occupy both columns and retain distinct glyphs.
+        b.reset(2, 2);
+        area(&[0.0, 1.0], &RasterTable::ASCII, &mut b);
+        assert_eq!(chars(&b), ["  ", " #"]);
+        b.reset(2, 2);
+        line(&[0.0, 1.0], &RasterTable::ASCII, &mut b);
+        assert_eq!(chars(&b), [" #", ". "]);
+        b.reset(2, 2);
+        band(&[0.0, 0.25], &[0.5, 1.0], &RasterTable::ASCII, &mut b);
+        assert_eq!(chars(&b), [" :", ".:"]);
+        b.reset(2, 2);
+        columns(
+            &[0.0, 1.0],
+            RasterTable::ASCII.cols,
+            &RasterTable::ASCII,
+            &mut b,
+        );
+        assert_eq!(chars(&b), ["  ", " #"]);
+        b.reset(2, 2);
+        mirrored(&[0.0, 1.0], &[0.0, 1.0], &RasterTable::ASCII, &mut b);
+        assert_eq!(chars(&b), ["  ", " #"]);
+        b.reset(2, 2);
+        stacked(&[&[0.0, 1.0]], &RasterTable::ASCII, &mut b);
+        assert_eq!(chars(&b), ["  ", " #"]);
+        sparkline_width(&[0.0, 1.0], 2, &RasterTable::ASCII, &mut b);
+        assert_eq!(chars(&b), ["_#"]);
+
+        // Values before the two-cell window are discarded; the latest pair
+        // determines every renderer's rightmost two columns.
+        b.reset(2, 2);
+        columns(
+            &[0.0, 0.0, 0.5, 1.0],
+            RasterTable::ASCII.cols,
+            &RasterTable::ASCII,
+            &mut b,
+        );
+        assert_eq!(chars(&b), [" #", "##"]);
+        b.reset(2, 2);
+        area(&[0.0, 0.0, 0.5, 1.0], &RasterTable::ASCII, &mut b);
+        assert_eq!(chars(&b), [" #", "##"]);
+        b.reset(2, 2);
+        line(&[0.0, 0.0, 0.5, 1.0], &RasterTable::ASCII, &mut b);
+        assert_eq!(chars(&b), [" #", ": "]);
+        b.reset(2, 2);
+        band(
+            &[0.0, 0.0, 0.25, 0.5],
+            &[0.0, 0.0, 0.75, 1.0],
+            &RasterTable::ASCII,
+            &mut b,
+        );
+        assert_eq!(chars(&b), [": :", ": "]);
+        b.reset(2, 2);
+        mirrored(
+            &[0.0, 0.0, 0.5, 1.0],
+            &[0.0, 0.0, 0.5, 1.0],
+            &RasterTable::ASCII,
+            &mut b,
+        );
+        assert_eq!(chars(&b), [":#", ":#"]);
+        b.reset(2, 2);
+        stacked(&[&[0.0, 0.0, 0.5, 1.0]], &RasterTable::ASCII, &mut b);
+        assert_eq!(chars(&b), [" #", "##"]);
+        sparkline_width(&[0.0, 0.0, 0.5, 1.0], 2, &RasterTable::ASCII, &mut b);
+        assert_eq!(chars(&b), ["-#"]);
+
+        let heat_rows = [&[0.0, 0.5, 1.0][..], &[0.5][..]];
+        heatmap(&heat_rows, &RasterTable::ASCII, &mut b);
+        assert_eq!(chars(&b), [" +@", "  +"]);
+    }
+
+    #[test]
+    fn full_and_basic_short_and_exact_unicode_glyph_goldens() {
+        for table in [&RasterTable::FULL, &RasterTable::BASIC] {
+            let mut b = CellBuf::new();
+            b.reset(1, 1);
+            area(&[1.0], table, &mut b);
+            assert_eq!(chars(&b), ["⢸"]);
+            area(&[1.0, 1.0], table, &mut b);
+            assert_eq!(chars(&b), ["⣿"]);
+
+            line(&[1.0], table, &mut b);
+            assert_eq!(chars(&b), ["⠈"]);
+            line(&[1.0, 1.0], table, &mut b);
+            assert_eq!(chars(&b), ["⠉"]);
+
+            band(&[0.0], &[1.0], table, &mut b);
+            assert_eq!(chars(&b), ["⢸"]);
+            band(&[0.0, 0.0], &[1.0, 1.0], table, &mut b);
+            assert_eq!(chars(&b), ["⣿"]);
+
+            columns(&[1.0], &table.ramp8, table, &mut b);
+            assert_eq!(chars(&b), ["█"]);
+            columns(&[1.0, 1.0], &table.ramp8, table, &mut b);
+            assert_eq!(chars(&b), ["█"]);
+
+            b.reset(1, 2);
+            mirrored(&[1.0], &[1.0], table, &mut b);
+            assert_eq!(chars(&b), ["⢸", "⢸"]);
+            mirrored(&[1.0, 1.0], &[1.0, 1.0], table, &mut b);
+            assert_eq!(chars(&b), ["⣿", "⣿"]);
+
+            b.reset(1, 1);
+            stacked(&[&[1.0]], table, &mut b);
+            assert_eq!(chars(&b), ["█"]);
+            stacked(&[&[1.0, 1.0]], table, &mut b);
+            assert_eq!(chars(&b), ["█"]);
+
+            let short_heat = [&[1.0][..]];
+            heatmap(&short_heat, table, &mut b);
+            assert_eq!(chars(&b), ["▀"]);
+            let exact_heat = [&[1.0, 1.0][..]];
+            heatmap(&exact_heat, table, &mut b);
+            assert_eq!(chars(&b), ["▀▀"]);
+            let long_heat = [&[0.0, 0.5, 1.0][..], &[1.0][..], &[0.5][..]];
+            heatmap(&long_heat, table, &mut b);
+            assert_eq!(chars(&b), ["▀▀▀", "  ▀"]);
+
+            sparkline_width(&[1.0], 1, table, &mut b);
+            assert_eq!(chars(&b), ["█"]);
+            sparkline_width(&[1.0, 1.0], 1, table, &mut b);
+            assert_eq!(chars(&b), ["█"]);
+
+            // The two newest braille samples fill the right dot column; the
+            // older full samples must not survive the one-cell window.
+            area(&[1.0, 1.0, 0.0, 1.0], table, &mut b);
+            assert_eq!(chars(&b), ["⢸"]);
+            line(&[1.0, 1.0, 0.0, 1.0], table, &mut b);
+            assert_eq!(chars(&b), ["⣸"]);
+            band(&[1.0, 1.0, 0.0, 0.0], &[1.0, 1.0, 0.0, 1.0], table, &mut b);
+            assert_eq!(chars(&b), ["⣸"]);
+            columns(&[0.0, 0.0, 1.0], &table.ramp8, table, &mut b);
+            assert_eq!(chars(&b), ["█"]);
+            b.reset(1, 2);
+            mirrored(&[1.0, 1.0, 0.0, 1.0], &[1.0, 1.0, 0.0, 1.0], table, &mut b);
+            assert_eq!(chars(&b), ["⢸", "⢸"]);
+            b.reset(1, 1);
+            stacked(&[&[0.0, 0.0, 1.0]], table, &mut b);
+            assert_eq!(chars(&b), ["█"]);
+            sparkline_width(&[0.0, 0.0, 1.0], 1, table, &mut b);
+            assert_eq!(chars(&b), ["█"]);
+        }
+    }
+
+    #[test]
     fn full_basic_and_ascii_golden_for_remaining_rasters() {
         let mut b = CellBuf::new();
         for table in [&RasterTable::FULL, &RasterTable::BASIC, &RasterTable::ASCII] {
