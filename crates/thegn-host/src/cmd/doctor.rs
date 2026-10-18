@@ -1319,6 +1319,64 @@ fn system_metrics_report(cfg: &Config) {
         outln!("  {:<13} {}", r.family.key(), status);
     }
     network_path_report(&thegn_metrics::probe_net_path());
+    disk_health_report(crate::platform::disk_health(
+        std::time::Duration::from_secs(10),
+    ));
+}
+
+fn disk_health_report(report: crate::platform::DiskHealthReport) {
+    outln!("Disk health");
+    match report {
+        crate::platform::DiskHealthReport::Unavailable(reason) => {
+            outln!("  health: n/a (udisks2 unavailable): {reason}");
+        }
+        crate::platform::DiskHealthReport::Degraded { drives, reason } => {
+            outln!("  health: n/a (udisks2 unavailable): {reason}");
+            disk_health_drives_report(drives);
+        }
+        crate::platform::DiskHealthReport::Available(drives) if drives.is_empty() => {
+            outln!("  health: n/a (udisks2 unavailable): no drives reported");
+        }
+        crate::platform::DiskHealthReport::Available(drives) => disk_health_drives_report(drives),
+    }
+}
+
+fn disk_health_drives_report(drives: Vec<crate::platform::DiskHealth>) {
+    for drive in drives {
+        let serial = drive.serial_last4.as_deref().unwrap_or("n/a");
+        let health = drive.health.as_deref().unwrap_or("n/a");
+        let warning = drive
+            .critical_warning
+            .map_or_else(|| "n/a".to_string(), |bits| format!("0x{bits:x}"));
+        outln!(
+            "  {} serial …{} health {health} critical-warning {warning}",
+            drive.name,
+            serial
+        );
+        outln!(
+            "    wear {}% spare {}/{} read {} B written {} B",
+            optional_metric(drive.percent_used),
+            optional_metric(drive.available_spare),
+            optional_metric(drive.spare_threshold),
+            optional_metric(drive.data_read_bytes),
+            optional_metric(drive.data_written_bytes),
+        );
+        outln!(
+            "    power {} h cycles {} unsafe-shutdowns {} media-errors {} ATA-bad-sectors {} temperature {} °C",
+            optional_metric(drive.power_on_hours),
+            optional_metric(drive.power_cycles),
+            optional_metric(drive.unsafe_shutdowns),
+            optional_metric(drive.media_errors),
+            optional_metric(drive.ata_bad_sectors),
+            drive
+                .temperature_c
+                .map_or_else(|| "n/a".to_string(), |value| value.to_string()),
+        );
+    }
+}
+
+fn optional_metric(value: Option<u64>) -> String {
+    value.map_or_else(|| "n/a".to_string(), |value| value.to_string())
 }
 
 /// One harness's probe: binary on PATH, credential home present, logged-in
