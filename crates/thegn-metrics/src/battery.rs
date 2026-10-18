@@ -44,17 +44,14 @@ mod linux {
                 self.reader.discover();
                 self.discovered_at = Some(now);
             }
-            match self.read_sample() {
+            match self.read_sample(true) {
                 Ok(reading) => reading,
                 Err(()) => {
                     if !due {
                         self.reader.discover();
                         self.discovered_at = Some(now);
                     }
-                    match self.read_sample() {
-                        Ok(reading) => reading,
-                        Err(()) => BatteryReading::default(),
-                    }
+                    self.read_sample(false).unwrap_or_default()
                 }
             }
         }
@@ -70,8 +67,10 @@ mod linux {
         pub(super) fn fail_next_power_read_for_test(&mut self) {
             self.reader.fail_next_power_read_for_test();
         }
-        fn read_sample(&mut self) -> Result<BatteryReading, ()> {
-            self.reader.read_base(&mut self.rows).map_err(|_| ())?;
+        fn read_sample(&mut self, signal_critical_errors: bool) -> Result<BatteryReading, ()> {
+            self.reader
+                .read_base(&mut self.rows, signal_critical_errors)
+                .map_err(|_| ())?;
             let rows = &self.rows;
             let battery =
                 combine_percent(rows).map(|pct| (pct, rows.first().is_some_and(|row| row.on_ac)));
@@ -173,19 +172,13 @@ mod linux {
                 .clamp(0.0, 100.0) as u8
         })
     }
+    #[cfg(test)]
     pub(super) fn parse_u64(bytes: &[u8]) -> Option<u64> {
         let text = match std::str::from_utf8(bytes) {
             Ok(value) => value,
             Err(_) => return None,
         };
-        match text.trim().parse() {
-            Ok(value) => Some(value),
-            Err(_) => None,
-        }
-    }
-    #[cfg(test)]
-    pub(super) fn counters(reader: &BatteryReader) -> Counters {
-        reader.counters()
+        text.trim().parse().ok()
     }
 }
 
