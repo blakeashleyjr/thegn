@@ -20,6 +20,7 @@ pub mod hwmon;
 pub mod loadavg;
 pub mod meminfo;
 pub mod mounts_fs;
+pub mod net_attrib;
 pub mod net_sockets;
 pub mod net_wifi;
 pub mod netdev;
