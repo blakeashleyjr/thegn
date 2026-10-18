@@ -49,6 +49,35 @@ fn priority_calls() -> PriorityCalls {
     SYSTEM_PRIORITY_CALLS
 }
 
+#[cfg(test)]
+type SignalCall = fn(
+    u32,
+    crate::platform::ProcStart,
+    crate::platform::ProcSignal,
+) -> Result<(), crate::platform::SignalError>;
+
+#[cfg(test)]
+thread_local! {
+    static TEST_SIGNAL_CALL: std::cell::Cell<Option<SignalCall>> = const { std::cell::Cell::new(None) };
+}
+
+fn deliver_signal(
+    pid: u32,
+    start: crate::platform::ProcStart,
+    signal: crate::platform::ProcSignal,
+) -> Result<(), crate::platform::SignalError> {
+    #[cfg(test)]
+    if let Some(call) = TEST_SIGNAL_CALL.get() {
+        return call(pid, start, signal);
+    }
+    crate::platform::signal_identity(pid, start, signal)
+}
+
+#[cfg(test)]
+fn set_test_signal_call(call: SignalCall) {
+    TEST_SIGNAL_CALL.set(Some(call));
+}
+
 fn priority_error(label: &str, error: crate::platform::PriorityError, denial_hint: &str) -> String {
     match error {
         crate::platform::PriorityError::Changed => {
@@ -693,6 +722,32 @@ impl MonitorOverlay {
         MonitorOutcome::Pending
     }
 
+    /// Open the platform's signal picker for the selected process.
+    pub(in crate::monitor) fn begin_signal_menu(&mut self) -> MonitorOutcome {
+        let Some((pid, start_time, start_ticks, name, owner)) = self
+            .proc_rows
+            .get(self.sel)
+            .map(|r| (r.pid, r.start_time, r.start_ticks, r.name.clone(), r.owner))
+        else {
+            return MonitorOutcome::Pending;
+        };
+        let owner = procs_view::owner_label(owner);
+        let owner = if owner.is_empty() {
+            String::new()
+        } else {
+            format!(" ({owner})")
+        };
+        self.confirm = Some(Confirm::SignalMenu {
+            pid,
+            start_time,
+            start_ticks,
+            label: format!("pid {pid} {name}{owner}"),
+            cursor: 0,
+        });
+        self.status = None;
+        MonitorOutcome::Pending
+    }
+
     /// Deliver the confirmed signal, surfacing the outcome — never swallowed.
     pub(in crate::monitor) fn perform_signal(
         &mut self,
@@ -701,11 +756,8 @@ impl MonitorOverlay {
         label: &str,
         stage: crate::platform::ProcSignal,
     ) {
-        let name = match stage {
-            crate::platform::ProcSignal::Terminate => "SIGTERM",
-            crate::platform::ProcSignal::Kill => "SIGKILL",
-        };
-        match crate::platform::signal_identity(pid, start, stage) {
+        let name = format!("SIG{}", stage.label());
+        match deliver_signal(pid, start, stage) {
             Ok(()) => {
                 self.status = Some(format!("sent {name} to {label}"));
                 if stage == crate::platform::ProcSignal::Terminate {
@@ -747,6 +799,7 @@ pub(super) fn hints(
         },
     ));
     out.push(hint("x", " signal"));
+    out.push(hint("X", " menu"));
     out.push(hint("=", " nice"));
     if crate::platform::IONICE_SUPPORTED {
         out.push(hint("I", " ionice"));
@@ -940,3 +993,7 @@ mod tests {
 #[cfg(test)]
 #[path = "procs_renice_tests.rs"]
 mod renice_tests;
+
+#[cfg(test)]
+#[path = "procs_signal_tests.rs"]
+mod signal_tests;

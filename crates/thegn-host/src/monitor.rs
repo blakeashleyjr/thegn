@@ -69,6 +69,14 @@ pub(crate) struct ProcSnapshotView {
 /// own before anything is signalled.
 #[derive(Debug, Clone)]
 enum Confirm {
+    /// Choose a signal before the usual identity-checked confirmation.
+    SignalMenu {
+        pid: u32,
+        start_time: u64,
+        start_ticks: Option<u64>,
+        label: String,
+        cursor: usize,
+    },
     /// Deliver `stage` to a process.
     Signal {
         pid: u32,
@@ -1350,6 +1358,62 @@ impl MonitorOverlay {
     /// Confirmation sub-mode: `y` performs, `n`/Esc cancels, anything else
     /// leaves the prompt standing.
     fn confirm_key(&mut self, key: &KeyCode) -> MonitorOutcome {
+        if matches!(self.confirm.as_ref(), Some(Confirm::SignalMenu { .. })) {
+            let menu = crate::platform::ProcSignal::menu();
+            let menu_key = |signal| match signal {
+                crate::platform::ProcSignal::Terminate => 't',
+                crate::platform::ProcSignal::Interrupt => 'i',
+                crate::platform::ProcSignal::Hangup => 'h',
+                crate::platform::ProcSignal::Kill => 'k',
+                crate::platform::ProcSignal::Stop => 's',
+                crate::platform::ProcSignal::Continue => 'c',
+                crate::platform::ProcSignal::Quit => 'q',
+                crate::platform::ProcSignal::User1 => '1',
+                crate::platform::ProcSignal::User2 => '2',
+            };
+            let picked = {
+                let Some(Confirm::SignalMenu { cursor, .. }) = self.confirm.as_mut() else {
+                    unreachable!();
+                };
+                match key {
+                    KeyCode::UpArrow => {
+                        *cursor = cursor.saturating_sub(1);
+                        None
+                    }
+                    KeyCode::DownArrow => {
+                        *cursor = cursor.saturating_add(1).min(menu.len().saturating_sub(1));
+                        None
+                    }
+                    KeyCode::Enter | KeyCode::Char('\r' | '\n') => menu.get(*cursor).copied(),
+                    KeyCode::Char(c) => menu
+                        .iter()
+                        .copied()
+                        .find(|signal| menu_key(*signal) == c.to_ascii_lowercase()),
+                    _ => None,
+                }
+            };
+            if let Some(stage) = picked
+                && let Some(Confirm::SignalMenu {
+                    pid,
+                    start_time,
+                    start_ticks,
+                    label,
+                    ..
+                }) = self.confirm.take()
+            {
+                self.confirm = Some(Confirm::Signal {
+                    pid,
+                    start_time,
+                    start_ticks,
+                    label,
+                    stage,
+                });
+            } else if crate::input::is_escape_key(key) || matches!(key, KeyCode::Char('n' | 'N')) {
+                self.confirm = None;
+                self.status = Some("cancelled".into());
+            }
+            return MonitorOutcome::Pending;
+        }
         if matches!(key, KeyCode::Char('y' | 'Y')) {
             match self.confirm.take() {
                 Some(Confirm::Signal {
