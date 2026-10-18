@@ -192,8 +192,40 @@ fn composition_keeps_available_distinct_from_free() {
     let mut surface = Surface::new(160, 45);
     Board::default().paint(&view, &mut surface, Rect::full(160, 45), 0, &[]);
     let rendered = text(&surface);
-    assert!(rendered.contains("available"), "{rendered}");
-    assert!(rendered.contains("free"), "{rendered}");
+    let available = crate::monitor::tabs::memory::view::fmt_bytes(Some(model.available.unwrap()));
+    let free = crate::monitor::tabs::memory::view::fmt_bytes(Some(model.free.unwrap()));
+    let available_line = rendered
+        .lines()
+        .find(|line| line.contains("available"))
+        .unwrap();
+    let free_line = rendered.lines().find(|line| line.contains("free")).unwrap();
+    assert!(available_line.contains(&available), "{rendered}");
+    assert!(free_line.contains(&free), "{rendered}");
+    assert!(!free_line.contains(&available), "{rendered}");
+
+    let mut without_free = MonitorFrame::default();
+    meminfo::parse(
+        b"MemTotal: 8388608 kB\nMemAvailable: 4194304 kB\n",
+        &mut without_free.parts.meminfo.raw,
+    );
+    let mut missing_free_model = MemoryModel::default();
+    missing_free_model.absorb_frame(&without_free);
+    let mut missing_free_surface = Surface::new(160, 45);
+    Board::default().paint(
+        &MemoryView(&missing_free_model),
+        &mut missing_free_surface,
+        Rect::full(160, 45),
+        0,
+        &[],
+    );
+    let missing_free = text(&missing_free_surface);
+    let free_line = missing_free.lines().find(|line| line.contains("free"));
+    assert!(
+        free_line.is_none_or(|line| {
+            line.contains(caps::active_glyphs().emdash) && !line.contains(&available)
+        }),
+        "{missing_free}"
+    );
 }
 
 #[test]
@@ -218,6 +250,10 @@ fn board_snapshots_cover_size_and_capability_matrix() {
                         full.avg10 = 1000 + (sample % 15) * 40;
                         frame.parts.psi.memory.file.full = Some(full);
                     }
+                    frame.parts.cgroup_slice.sample.mem_current =
+                        Some(1024 + u64::from(sample % 20) * 128);
+                    frame.parts.cgroup_slice.sample.mem_max =
+                        Some(thegn_metrics::collect::model::cgroup::Limit::Value(8192));
                     model.absorb_frame(&frame);
                 }
                 model.swap_total = Some(2 * 1024 * 1024 * 1024);
@@ -272,6 +308,29 @@ fn board_snapshots_cover_size_and_capability_matrix() {
 }
 
 #[test]
+fn slice_limit_history_stays_bounded_after_warmup() {
+    let mut model = MemoryModel::default();
+    for sample in 0_u32..1_000 {
+        let mut frame = MonitorFrame::default();
+        frame.parts.cgroup_slice.sample.mem_current = Some(1024 + u64::from(sample % 37) * 64);
+        frame.parts.cgroup_slice.sample.mem_max =
+            Some(thegn_metrics::collect::model::cgroup::Limit::Value(8192));
+        model.absorb_frame(&frame);
+    }
+    assert_eq!(model.limit_history.len, 120);
+}
+
+#[test]
+fn slice_limit_uses_the_lower_numeric_ceiling() {
+    use thegn_metrics::collect::model::cgroup::Limit;
+
+    assert_eq!(
+        super::min_numeric_limit(Some(Limit::Value(8192)), Some(Limit::Value(4096))),
+        Some(4096)
+    );
+}
+
+#[test]
 fn limit_panel_uses_absent_mark_and_unlimited_label() {
     use thegn_metrics::collect::model::cgroup::Limit;
 
@@ -310,6 +369,19 @@ fn limit_panel_uses_absent_mark_and_unlimited_label() {
         &[],
     );
     assert!(text(&unlimited).contains("no limit"));
+    assert!(!text(&unlimited).contains(caps::active_glyphs().emdash));
+
+    let mut ascii = Surface::new(limit.rect.cols, limit.rect.rows);
+    caps::test_override::with_unicode(UnicodeLevel::Ascii, || {
+        view.paint(
+            &mut ascii,
+            &limit,
+            Rect::full(limit.rect.cols, limit.rect.rows),
+            0,
+            &[],
+        );
+    });
+    assert!(text(&ascii).is_ascii());
 }
 
 #[test]

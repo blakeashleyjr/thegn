@@ -90,35 +90,9 @@ pub struct CgroupSliceCollector {
     path_buffer: PathBuf,
 }
 
-impl Collector for CgroupSliceCollector {
-    fn id(&self) -> CollectorId {
-        CollectorId::CgroupSlice
-    }
-    fn cadence(&self) -> Cadence {
-        Cadence::Every(5)
-    }
-
-    fn discover(&mut self, env: &Env) -> Health {
-        self.held = HeldFiles::default();
-        self.own_leaf = None;
-        self.own_chain.clear();
-        let root = env
-            .cgroup_root
-            .as_deref()
-            .unwrap_or_else(|| Path::new("/sys/fs/cgroup"));
-        let Some(root) = cgroup2_root(root) else {
-            self.path = None;
-            return Health::Absent(Absent::NotOnThisOs);
-        };
-        let Ok(membership) = fs::read("/proc/self/cgroup") else {
-            self.path = None;
-            return Health::Absent(Absent::NotOnThisOs);
-        };
-        let Some(path) = discover_slice(&root, &membership).filter(|path| path.is_dir()) else {
-            self.path = None;
-            return Health::Absent(Absent::NotOnThisOs);
-        };
-        let own_membership = env::self_cgroup_v2(&membership);
+impl CgroupSliceCollector {
+    fn configure(&mut self, root: PathBuf, membership: &[u8], path: PathBuf) {
+        let own_membership = env::self_cgroup_v2(membership);
         let own_leaf = own_membership
             .and_then(|member| path_from_membership(&root, member.strip_prefix(b"/")?));
         self.own_leaf = own_leaf.clone();
@@ -147,6 +121,38 @@ impl Collector for CgroupSliceCollector {
             slice_path.join("memory.max"),
             slice_path.join("memory.high"),
         ]));
+    }
+}
+
+impl Collector for CgroupSliceCollector {
+    fn id(&self) -> CollectorId {
+        CollectorId::CgroupSlice
+    }
+    fn cadence(&self) -> Cadence {
+        Cadence::Every(5)
+    }
+
+    fn discover(&mut self, env: &Env) -> Health {
+        self.held = HeldFiles::default();
+        self.own_leaf = None;
+        self.own_chain.clear();
+        let root = env
+            .cgroup_root
+            .as_deref()
+            .unwrap_or_else(|| Path::new("/sys/fs/cgroup"));
+        let Some(root) = cgroup2_root(root) else {
+            self.path = None;
+            return Health::Absent(Absent::NotOnThisOs);
+        };
+        let Ok(membership) = fs::read("/proc/self/cgroup") else {
+            self.path = None;
+            return Health::Absent(Absent::NotOnThisOs);
+        };
+        let Some(path) = discover_slice(&root, &membership).filter(|path| path.is_dir()) else {
+            self.path = None;
+            return Health::Absent(Absent::NotOnThisOs);
+        };
+        self.configure(root, &membership, path);
         Health::Ok
     }
 
@@ -166,37 +172,43 @@ impl Collector for CgroupSliceCollector {
             &mut part.sample,
             &mut self.path_buffer,
         );
-        if let Some(length) = self
-            .held
-            .read(&path.join("memory.current"), &mut self.buffer)
-        {
+        let slice_file_base = self.own_chain.len().saturating_mul(3);
+        if let Some(length) = self.held.read(slice_file_base, &mut self.buffer) {
             part.sample.mem_current =
                 crate::collect::parse::cgroup::single_u64(&self.buffer[..length]);
         }
-        if let Some(length) = self.held.read(&path.join("memory.max"), &mut self.buffer) {
+        if let Some(length) = self
+            .held
+            .read(slice_file_base.saturating_add(1), &mut self.buffer)
+        {
             part.sample.mem_max =
                 crate::collect::parse::cgroup::memory_limit(&self.buffer[..length]);
         }
-        if let Some(length) = self.held.read(&path.join("memory.high"), &mut self.buffer) {
+        if let Some(length) = self
+            .held
+            .read(slice_file_base.saturating_add(2), &mut self.buffer)
+        {
             part.sample.mem_high =
                 crate::collect::parse::cgroup::memory_limit(&self.buffer[..length]);
         }
-        part.own_current = self.own_leaf.as_ref().and_then(|leaf| {
-            self.held
-                .read(&leaf.join("memory.current"), &mut self.buffer)
-                .and_then(|length| {
-                    crate::collect::parse::cgroup::single_u64(&self.buffer[..length])
-                })
+        part.own_current = self.own_leaf.as_ref().and_then(|_| {
+            self.held.read(0, &mut self.buffer).and_then(|length| {
+                crate::collect::parse::cgroup::single_u64(&self.buffer[..length])
+            })
         });
         let mut effective = LimitFold {
             all_max: true,
             ..LimitFold::default()
         };
-        for level in &self.own_chain {
-            for name in ["memory.max", "memory.high"] {
+        for (level_index, _) in self.own_chain.iter().enumerate() {
+            for file_index in [1, 2] {
+                let held_index = level_index.saturating_mul(3).saturating_add(file_index);
+                if !self.held.is_present(held_index) {
+                    continue;
+                }
                 let limit = self
                     .held
-                    .read(&level.join(name), &mut self.buffer)
+                    .read(held_index, &mut self.buffer)
                     .and_then(|length| {
                         crate::collect::parse::cgroup::memory_limit(&self.buffer[..length])
                     });
@@ -204,7 +216,7 @@ impl Collector for CgroupSliceCollector {
             }
         }
         part.effective_limit = effective.result();
-        if self.held.take_reopen_needed() {
+        if self.held.needs_reopen() {
             return Err(CollectError::Gone);
         }
         frame.sampled.insert(CollectorId::CgroupSlice);
@@ -228,6 +240,44 @@ mod tests {
     use crate::collect::frame::MonitorFrame;
     use crate::collect::health::{Absent, Health};
     use crate::collect::{Collector, TickCtx, env::Env};
+
+    #[test]
+    fn collector_skips_absent_root_limits_and_holds_discovered_files() {
+        use crate::collect::model::cgroup::Limit;
+        for high in [b"max" as &[u8], b"4096"] {
+            let temp = tempfile::tempdir().unwrap();
+            let root = temp.path();
+            std::fs::write(root.join("cgroup.controllers"), b"memory").unwrap();
+            let membership = b"0::/a/b\n";
+            let leaf = root.join("a/b");
+            std::fs::create_dir_all(&leaf).unwrap();
+            std::fs::write(root.join("a/memory.max"), b"max\n").unwrap();
+            std::fs::write(root.join("a/memory.high"), b"max\n").unwrap();
+            std::fs::write(leaf.join("memory.current"), b"2048\n").unwrap();
+            std::fs::write(leaf.join("memory.max"), b"max\n").unwrap();
+            std::fs::write(leaf.join("memory.high"), [high, b"\n"].concat()).unwrap();
+            let slice = root.join("a/slice");
+            std::fs::create_dir_all(&slice).unwrap();
+            std::fs::write(slice.join("memory.current"), b"8192\n").unwrap();
+            std::fs::write(slice.join("memory.max"), b"max\n").unwrap();
+            std::fs::write(slice.join("memory.high"), b"max\n").unwrap();
+            let mut collector = CgroupSliceCollector::default();
+            collector.configure(root.to_path_buf(), membership, slice.clone());
+            let opens_at_discover = collector.held.open_attempts();
+            std::fs::rename(leaf.join("memory.max"), leaf.join("memory.max.moved")).unwrap();
+            for _ in 0..5 {
+                let mut frame = MonitorFrame::default();
+                collector.sample(&TickCtx::default(), &mut frame).unwrap();
+                let expected = if high == b"max" {
+                    Limit::Max
+                } else {
+                    Limit::Value(4096)
+                };
+                assert_eq!(frame.parts.cgroup_slice.effective_limit, Some(expected));
+            }
+            assert_eq!(collector.held.open_attempts(), opens_at_discover);
+        }
+    }
 
     #[test]
     fn effective_limit_uses_minimum_numeric_value_and_only_reports_all_max_when_complete() {
