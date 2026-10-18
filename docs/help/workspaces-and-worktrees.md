@@ -117,7 +117,7 @@ the status line says `Worktree delete failed for <path>: <reason>`.
 While a worktree delete is in flight, jumping to that worktree from the
 sidebar, a notification, the command palette, or connect is refused with
 `'<name>' is being deleted`. An adopt into it leaves the session headless with
-`adopt: <path> is being deleted`.
+`adopt: <path> is being deleted — session left headless`.
 
 New worktrees live under `~/.thegn/worktrees/<repo>/<label>--<digest>` by
 default; `worktree_mode = "in_repo"` keeps them in `<repo>/.worktrees`. The
