@@ -8,6 +8,7 @@ pub mod cpu_policy;
 pub mod cpu_sched;
 pub mod cpu_stat;
 pub mod diskstats;
+pub mod filesystems;
 pub mod hwmon;
 pub mod loadavg;
 pub mod meminfo;

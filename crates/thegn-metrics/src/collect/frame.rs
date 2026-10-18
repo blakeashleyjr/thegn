@@ -26,6 +26,7 @@ pub struct Parts {
     pub cpu_irq: super::model::cpu_irq::CpuIrqPart,
     pub cpu_sched: super::model::cpu_sched::CpuSchedPart,
     pub thermal_zone: super::model::thermal_zone::ThermalZonePart,
+    pub filesystems: super::model::filesystems::FilesystemsPart,
 }
 impl Parts {
     pub fn clear(&mut self) {
@@ -47,6 +48,7 @@ impl Parts {
         self.cpu_irq.clear();
         self.cpu_sched.clear();
         self.thermal_zone.clear();
+        self.filesystems.clear();
     }
 }
 

@@ -11,6 +11,7 @@ pub mod diskstats;
 pub mod hwmon;
 pub mod loadavg;
 pub mod meminfo;
+pub mod mounts_fs;
 pub mod netdev;
 pub mod power_supply;
 pub mod powercap;
