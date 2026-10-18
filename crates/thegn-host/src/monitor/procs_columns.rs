@@ -2,8 +2,6 @@
 //!
 //! This module is intentionally pure so the renderer can share the same column
 //! boundaries for every row in a frame.
-#![allow(dead_code)] // V-PRC-3 wires this catalogue into the renderer.
-
 use thegn_core::numfmt::{NumFmt, Reading, Unit};
 use thegn_core::viz::{self, UnitFmt};
 
@@ -96,7 +94,6 @@ pub(crate) struct ColSpec {
     pub align: Align,
     pub needs: Needs,
 }
-
 macro_rules! col {
     ($id:ident, $title:literal, $priority:literal, $min:literal, $ideal:literal, $flex:literal, $align:ident, $needs:ident) => {
         ColSpec {
@@ -162,6 +159,10 @@ pub(crate) const CATALOG: [ColSpec; 37] = [
 ];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "V-PRC-4 presets/catalog metadata")
+)]
 pub(crate) enum Preset {
     Default,
     Memory,
@@ -171,6 +172,10 @@ pub(crate) enum Preset {
 }
 
 impl Preset {
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "V-PRC-4 presets/catalog metadata")
+    )]
     pub(crate) const ALL: [Preset; 5] = [
         Preset::Default,
         Preset::Memory,
@@ -503,6 +508,7 @@ pub(crate) fn format_bytes(value: Option<u64>) -> String {
     }
 }
 
+#[cfg(test)]
 pub(crate) fn format_time_plus(seconds: Option<f64>) -> String {
     match seconds {
         Some(seconds) if seconds.is_finite() && seconds >= 0.0 => time_plus(seconds),
@@ -510,6 +516,7 @@ pub(crate) fn format_time_plus(seconds: Option<f64>) -> String {
     }
 }
 
+#[cfg(test)]
 fn time_plus(seconds: f64) -> String {
     let total = seconds.floor() as u64;
     let rendered = if total < 3600 {
@@ -536,6 +543,7 @@ fn time_plus(seconds: f64) -> String {
     }
 }
 
+#[cfg(test)]
 pub(crate) fn format_age(seconds: Option<u64>) -> String {
     let fmt = NumFmt::default();
     match seconds {

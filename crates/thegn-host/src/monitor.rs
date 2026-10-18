@@ -54,7 +54,7 @@ mod tabs;
 pub(crate) use state::MonitorPrefs;
 
 /// The view toggles the Processes tab's row list depends on. Bundled so the pure
-/// [`procs_view::rows`] builder and the overlay share one input shape and cannot
+/// [`procs_view::rows_with_invalid`] builder and the overlay share one input shape and cannot
 /// disagree about which rows are shown.
 #[derive(Debug, Clone)]
 pub(crate) struct ProcSnapshotView {
@@ -420,6 +420,8 @@ pub struct MonitorOverlay {
     /// indexes and the signal action reads. Recomputed on rebuild so the key
     /// handler never re-derives ordering out of step with the render.
     proc_rows: Vec<procs_view::ProcRow>,
+    proc_invalid_terms: Vec<procs_view::procs_query::InvalidTerm>,
+    proc_primed: bool,
     lists: invalidation::Lists,
     /// The last body was Processes with these header/display-only inputs.
     process_body: Option<(u64, crate::model_eq::ProcessViewState, bool, bool)>,
@@ -504,6 +506,8 @@ impl MonitorOverlay {
             filter: String::new(),
             filtering: false,
             proc_rows: Vec::new(),
+            proc_invalid_terms: Vec::new(),
+            proc_primed: false,
             lists: invalidation::Lists::default(),
             process_body: None,
             disk_rows: Vec::new(),
@@ -636,7 +640,7 @@ impl MonitorOverlay {
         self.pending_action.take()
     }
 
-    /// The Processes list's current view toggles, for [`procs_view::rows`].
+    /// The Processes list's current view toggles, for [`procs_view::rows_with_invalid`].
     fn proc_view(&self) -> ProcSnapshotView {
         ProcSnapshotView {
             sort: self.prefs.proc_sort,
@@ -668,6 +672,7 @@ impl MonitorOverlay {
         // Only the active list is derived, and navigation/geometry changes do
         // not re-sort an unchanged process snapshot. Identity remains sampled.
         self.refresh_active_rows(model, now / 1000, preserve_process);
+        self.proc_primed = model.procs.primed;
         // Container row identities for the key handler (the same order the
         // builder renders `model.containers` in), so a key resolves `sel`
         // without a model borrow.
@@ -691,6 +696,8 @@ impl MonitorOverlay {
             proc_sort: self.prefs.proc_sort,
             proc_desc: self.prefs.proc_desc,
             proc_rows: &self.proc_rows,
+            proc_invalid_terms: &self.proc_invalid_terms,
+            proc_primed: model.procs.primed,
             disk_rows: &self.disk_rows,
             disk_eta: ctx.hist.disk_fill_eta(),
         });
@@ -851,6 +858,7 @@ impl MonitorOverlay {
                 &self.proc_rows,
                 self.prefs.proc_tree,
                 self.cols,
+                self.proc_primed,
             );
         }
         self.clamp();
