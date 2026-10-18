@@ -35,9 +35,42 @@ fn network_tab_uses_the_board_and_demands_placed_netdev_panels() {
     let history = TelemetryHistory::default();
     let overlay = network_overlay(&history);
     assert_eq!(overlay.tab(), MonitorTab::Network);
+    let view = overlay.view();
+    let placed = overlay.board.placed(&view, overlay.body_rect());
+    assert!(!placed.is_empty());
+    let mut surface = termwiz::surface::Surface::new(240, 60);
+    overlay
+        .board
+        .paint(&view, &mut surface, overlay.body_rect(), 0, &[]);
+    let rendered = surface
+        .screen_lines()
+        .iter()
+        .map(|line| {
+            line.visible_cells()
+                .map(|cell| cell.str().to_owned())
+                .collect::<String>()
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    for title in ["Network throughput", "Interfaces", "Network health"] {
+        assert!(
+            rendered.contains(title),
+            "missing board panel {title}: {rendered}"
+        );
+    }
     let demand = overlay.demand(1000);
     assert!(demand.collectors.contains(CollectorId::Netdev));
     assert_eq!(demand.collectors.iter().count(), 1);
+    let expected = placed.iter().fold(
+        thegn_metrics::collect::CollectorSet::empty(),
+        |mut set, panel| {
+            for collector in view.demand(panel.id).iter() {
+                set.insert(collector);
+            }
+            set
+        },
+    );
+    assert_eq!(demand.collectors, expected);
 }
 
 #[test]
@@ -46,7 +79,7 @@ fn visible_network_ingest_updates_and_pause_freezes_the_view_model() {
     let mut overlay = network_overlay(&history);
     let frame = MonitorFrame {
         health: {
-            let mut health = Default::default();
+            let mut health = MonitorFrame::default().health;
             health[CollectorId::Netdev.index()] = thegn_metrics::collect::health::Health::Ok;
             health
         },
@@ -59,7 +92,15 @@ fn visible_network_ingest_updates_and_pause_freezes_the_view_model() {
         &termwiz::input::KeyCode::Char(' '),
         termwiz::input::Modifiers::NONE,
     );
-    assert!(!overlay.ingest_frame(&MonitorFrame::default()));
+    let mut changed = MonitorFrame::default();
+    changed.health[CollectorId::Netdev.index()] = thegn_metrics::collect::health::Health::Absent(
+        thegn_metrics::collect::health::Absent::NotImplemented,
+    );
+    assert!(!overlay.ingest_frame(&changed));
+    assert_eq!(
+        overlay.network.health,
+        thegn_metrics::collect::health::Health::Ok
+    );
     assert_eq!(overlay.demand(1000).collectors, demand.collectors);
 }
 
@@ -77,9 +118,8 @@ fn telemetry_history_is_separate_bounded_and_right_aligned() {
     }
     let mut model = NetworkModel::default();
     model.absorb_history(&history, Window::from_secs(10), ScaleMode::Window, 5_000);
-    assert_eq!(model.history_rx.len, 4);
-    assert_eq!(model.history_tx.len, 4);
-    assert_eq!(model.rx.len, 0, "telemetry must not enter frame rings");
+    assert_eq!(model.history_rx.len, 432);
+    assert_eq!(model.history_tx.len, 432);
     let rx_capacity = model.history_rx.values.capacity();
     let tx_capacity = model.history_tx.values.capacity();
     for _ in 0..1_000 {
@@ -112,7 +152,7 @@ fn rebuild_absorbs_telemetry_and_pause_keeps_the_last_series() {
     let mut overlay =
         MonitorOverlay::open(MonitorTab::Network, MonitorPrefs::default(), &model, &ctx);
     assert!(overlay.network.history_rx.len > 0);
-    let mut before = [0.0; 120];
+    let mut before = [0.0; super::view::TELEMETRY_HISTORY];
     let before_len = overlay.network.history_rx.copy_ordered(&mut before);
 
     let mut newer_history = TelemetryHistory::default();
@@ -129,7 +169,7 @@ fn rebuild_absorbs_telemetry_and_pause_keeps_the_last_series() {
         ScaleMode::default(),
         121_000,
     );
-    let mut fresh = [0.0; 120];
+    let mut fresh = [0.0; super::view::TELEMETRY_HISTORY];
     let fresh_len = fresh_model.history_rx.copy_ordered(&mut fresh);
     assert_ne!(&fresh[..fresh_len], &before[..before_len]);
 
@@ -138,7 +178,7 @@ fn rebuild_absorbs_telemetry_and_pause_keeps_the_last_series() {
         termwiz::input::Modifiers::NONE,
     );
     overlay.rebuild_after_key(&model, &newer_ctx);
-    let mut after = [0.0; 120];
+    let mut after = [0.0; super::view::TELEMETRY_HISTORY];
     let after_len = overlay.network.history_rx.copy_ordered(&mut after);
     assert_eq!(&after[..after_len], &before[..before_len]);
 }

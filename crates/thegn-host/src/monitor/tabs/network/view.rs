@@ -23,9 +23,9 @@ pub(super) const THROUGHPUT: PanelId = PanelId("network.throughput");
 pub(super) const INTERFACES: PanelId = PanelId("network.interfaces");
 pub(super) const HEALTH: PanelId = PanelId("network.health");
 const HISTORY: usize = 120;
-const TELEMETRY_HISTORY: usize = HISTORY;
+pub(super) const TELEMETRY_HISTORY: usize = 480;
 pub(super) const IFACE_CAP: usize = 8;
-const IFACE_HISTORY: usize = 24;
+const IFACE_HISTORY: usize = 32;
 const VARIANTS: [Variant; 1] = [Variant {
     kind: VariantKind::Full,
     min: (24, 4),
@@ -125,10 +125,11 @@ impl Default for InterfaceHistory {
 #[derive(Debug, Clone)]
 pub(in crate::monitor) struct NetworkModel {
     pub(super) total: ScopeTotal,
-    pub(super) rx: Ring,
-    pub(super) tx: Ring,
     pub(super) history_rx: Ring,
     pub(super) history_tx: Ring,
+    pub(super) history_rx_axis_max: f32,
+    pub(super) history_tx_axis_max: f32,
+    pub(super) history_scale: ScaleMode,
     pub(super) error_history: Ring,
     pub(super) drop_history: Ring,
     pub(super) interfaces: Vec<InterfaceHistory>,
@@ -144,12 +145,13 @@ impl Default for NetworkModel {
     fn default() -> Self {
         Self {
             total: ScopeTotal::default(),
-            rx: Ring::new(HISTORY),
-            tx: Ring::new(HISTORY),
             history_rx: Ring::new(TELEMETRY_HISTORY),
             history_tx: Ring::new(TELEMETRY_HISTORY),
-            error_history: Ring::new(IFACE_HISTORY),
-            drop_history: Ring::new(IFACE_HISTORY),
+            history_rx_axis_max: 0.0,
+            history_tx_axis_max: 0.0,
+            history_scale: ScaleMode::Window,
+            error_history: Ring::new(HISTORY),
+            drop_history: Ring::new(HISTORY),
             interfaces: Vec::with_capacity(IFACE_CAP),
             overflow: 0,
             overflow_rx: None,
@@ -169,9 +171,18 @@ impl NetworkModel {
         scale: ScaleMode,
         now_ms: u64,
     ) {
-        for (metric, ring) in [
-            (Metric::NetRx, &mut self.history_rx),
-            (Metric::NetTx, &mut self.history_tx),
+        self.history_scale = scale;
+        for (metric, ring, axis_max) in [
+            (
+                Metric::NetRx,
+                &mut self.history_rx,
+                &mut self.history_rx_axis_max,
+            ),
+            (
+                Metric::NetTx,
+                &mut self.history_tx,
+                &mut self.history_tx_axis_max,
+            ),
         ] {
             let series = history.series(&SeriesReq {
                 metric,
@@ -182,10 +193,11 @@ impl NetworkModel {
                 now_ms,
             });
             ring.reset();
-            for (index, (value, gap)) in series.hi.iter().zip(series.gap.iter()).enumerate() {
-                let raw = series.raw_hi[index];
-                if !gap && value.is_finite() && raw.is_finite() {
-                    ring.push(raw);
+            *axis_max = series.axis_max;
+            let first_real = series.gap.iter().position(|gap| !gap);
+            if let Some(first_real) = first_real {
+                for (value, gap) in series.hi.iter().zip(series.gap.iter()).skip(first_real) {
+                    ring.push(if *gap { f32::NAN } else { *value });
                 }
             }
         }
@@ -195,8 +207,6 @@ impl NetworkModel {
         let source = &frame.parts.netdev;
         self.health = frame.health[CollectorId::Netdev.index()];
         self.total = source.physical_or_all();
-        push_option(&mut self.rx, self.total.rx_bps);
-        push_option(&mut self.tx, self.total.tx_bps);
         self.overflow = 0;
         self.overflow_rx = Some(0.0);
         self.overflow_tx = Some(0.0);

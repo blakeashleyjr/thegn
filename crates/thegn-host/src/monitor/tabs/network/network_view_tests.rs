@@ -208,8 +208,6 @@ fn interface_slots_are_capped_and_absorb_capacity_stays_warm() {
     assert_eq!(model.overflow, 4);
     let capacities = (
         model.interfaces.capacity(),
-        model.rx.values.capacity(),
-        model.tx.values.capacity(),
         model.error_history.values.capacity(),
         model.drop_history.values.capacity(),
         model
@@ -222,10 +220,8 @@ fn interface_slots_are_capped_and_absorb_capacity_stays_warm() {
         model.absorb_frame(&frame(tick, &ids));
     }
     assert_eq!(model.interfaces.capacity(), capacities.0);
-    assert_eq!(model.rx.values.capacity(), capacities.1);
-    assert_eq!(model.tx.values.capacity(), capacities.2);
-    assert_eq!(model.error_history.values.capacity(), capacities.3);
-    assert_eq!(model.drop_history.values.capacity(), capacities.4);
+    assert_eq!(model.error_history.values.capacity(), capacities.1);
+    assert_eq!(model.drop_history.values.capacity(), capacities.2);
     assert_eq!(
         model
             .interfaces
@@ -241,7 +237,7 @@ fn cloned_warming_rings_keep_their_logical_capacity() {
     let mut model = NetworkModel::default();
     model.absorb_frame(&frame(1, &[1]));
     let mut cloned = model.clone();
-    for tick in 2..30_u16 {
+    for tick in 2..40_u16 {
         cloned.absorb_frame(&frame(tick, &[1]));
     }
     let history = cloned
@@ -249,7 +245,7 @@ fn cloned_warming_rings_keep_their_logical_capacity() {
         .iter()
         .find(|entry| entry.id == InstanceId(1))
         .expect("interface history remains present");
-    assert_eq!(history.rx.len, 24);
+    assert_eq!(history.rx.len, 32);
 }
 
 #[test]
@@ -352,15 +348,56 @@ fn short_throughput_history_is_right_aligned_and_scaled() {
         .visible_cells()
         .find(|cell| cell.cell_index() == right_x)
         .expect("rightmost graph cell exists");
-    assert_ne!(
+    assert_eq!(
         cell.str(),
         "\u{2800}",
-        "newest throughput sample is not at right edge"
+        "trailing telemetry gap must stay blank"
     );
-    assert_ne!(cell.str(), " ", "rightmost graph column is blank");
     let rendered = lines(&surface).join("\n");
-    assert!(rendered.contains("peak"));
+    assert!(rendered.contains("window"));
     assert!(lines(&surface)[throughput.y + throughput.rows - 2].contains("tx"));
+}
+
+#[test]
+fn interior_telemetry_gap_keeps_its_bucket_position() {
+    let mut history = TelemetryHistory::default();
+    history.push(
+        &thegn_metrics::StatsSnapshot {
+            net_bps: Some((10_000, 5_000)),
+            ..thegn_metrics::StatsSnapshot::default()
+        },
+        1_000,
+    );
+    history.push(
+        &thegn_metrics::StatsSnapshot {
+            net_bps: None,
+            ..thegn_metrics::StatsSnapshot::default()
+        },
+        2_000,
+    );
+    history.push(
+        &thegn_metrics::StatsSnapshot {
+            net_bps: Some((30_000, 15_000)),
+            ..thegn_metrics::StatsSnapshot::default()
+        },
+        3_000,
+    );
+    let mut model = NetworkModel::default();
+    model.absorb_history(&history, Window::from_secs(4), ScaleMode::Window, 4_000);
+    let mut rx = [0.0; super::view::TELEMETRY_HISTORY];
+    let len = model.history_rx.copy_ordered(&mut rx);
+    assert_eq!(
+        len, 360,
+        "retained ring must preserve its span after leading gaps"
+    );
+    assert!(
+        rx[120..240].iter().any(|value| value.is_nan()),
+        "interior gap lost"
+    );
+    assert!(
+        rx[240..].iter().any(|value| value.is_finite()),
+        "later sample shifted away"
+    );
 }
 
 #[test]
