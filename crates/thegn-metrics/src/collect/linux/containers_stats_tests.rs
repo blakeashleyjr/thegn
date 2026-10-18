@@ -84,7 +84,7 @@ fn rates_prime_then_derive_cpu_and_io_and_counter_rollback_is_a_gap() {
     let mut sampler = ContainerStatsSampler::new(fs, filter(), root());
     let scopes = [scope("container-a", path.clone())];
     let start = Instant::now();
-    let first = sampler.sample(&scopes, start);
+    let first = sampler.sample(&scopes, start).to_vec();
     assert_eq!(first.len(), 1);
     assert!(
         sampler
@@ -179,7 +179,7 @@ fn caps_reads_at_64_and_round_robins_every_scope_within_three_ticks() {
             4096,
         );
     }
-    let second = sampler.sample(&scopes, start + Duration::from_secs(1));
+    let second = sampler.sample(&scopes, start + Duration::from_secs(1)).to_vec();
     assert_eq!(second.len(), MAX_CONTAINER_SCOPES_PER_TICK);
     assert!(
         second
