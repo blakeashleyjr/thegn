@@ -4,8 +4,10 @@ use crate::{
     compositor::Rect,
     monitor::{
         board::{Board, TabView},
+        kit::grid::CellGrid,
         layout::PanelId,
     },
+    telemetry::{ScaleMode, TelemetryHistory, Window},
 };
 use std::sync::Arc;
 use termwiz::surface::Surface;
@@ -22,7 +24,10 @@ use thegn_metrics::collect::{
 };
 
 fn frame_fixture() -> MonitorFrame {
-    let mut frame = MonitorFrame::default();
+    let mut frame = MonitorFrame {
+        dt_ms: 1000,
+        ..MonitorFrame::default()
+    };
     frame.health[CollectorId::Diskstats.index()] = Health::Ok;
     frame.parts.diskstats.physical = 8;
     frame.health[CollectorId::Filesystems.index()] = Health::Ok;
@@ -139,6 +144,10 @@ fn absorbs_disk_frame_and_reuses_warm_buffers() {
     for tick in 0..1000 {
         frame.parts.diskstats.aggregate.read_bps = Some(48_000_000.0 + f64::from(tick));
         frame.parts.diskstats.aggregate.write_bps = Some(9_000_000.0 + f64::from(tick));
+        if let Some(io) = &mut frame.parts.cgroup_slice.sample.io {
+            io.rbytes = 900_000_000 + u64::from(tick) * u64::from(tick + 1);
+            io.wbytes = 80_000_000 + u64::from(tick) * u64::from(tick + 2);
+        }
         for (index, device) in frame.parts.diskstats.devices.iter_mut().enumerate() {
             device.util_pct = Some(f64::from((tick + index as u32 * 7) % 100));
         }
@@ -169,12 +178,19 @@ fn absorbs_disk_frame_and_reuses_warm_buffers() {
             .iter()
             .all(|history| history.util.len == 240)
     );
+    assert!(
+        model
+            .device_history
+            .iter()
+            .all(|history| { history.read.len == 240 && history.write.len == 240 })
+    );
     let read_next = model.read_history.next;
     let write_next = model.write_history.next;
     frame.parts.diskstats.aggregate.read_bps = None;
     model.absorb_frame(&frame);
-    assert_eq!(model.read_history.next, read_next);
-    assert_eq!(model.write_history.next, write_next);
+    assert_ne!(model.read_history.next, read_next);
+    assert_ne!(model.write_history.next, write_next);
+    assert_eq!(model.read_history.next, model.write_history.next);
 }
 
 #[test]
@@ -185,6 +201,10 @@ fn snapshots_cover_target_sizes_capabilities_and_static_panel_demand() {
         frame.parts.diskstats.aggregate.read_bps = Some(10_000_000.0 + f64::from(tick) * 100_000.0);
         frame.parts.diskstats.aggregate.write_bps =
             Some(2_000_000.0 + f64::from(239 - tick) * 25_000.0);
+        if let Some(io) = &mut frame.parts.cgroup_slice.sample.io {
+            io.rbytes += 1_000_000 + u64::from(tick) * 10_000;
+            io.wbytes += 250_000 + u64::from(tick) * 5_000;
+        }
         for (index, device) in frame.parts.diskstats.devices.iter_mut().enumerate() {
             device.read_bps = Some(
                 1_000_000.0
@@ -262,16 +282,25 @@ fn snapshots_cover_target_sizes_capabilities_and_static_panel_demand() {
                         let ratio = fill_ratio(&surface, Rect::full(cols, rows));
                         match (unicode, depth) {
                             (UnicodeLevel::Full, ColorDepth::Truecolor) => {
-                                // density follow-up (batch 48)
-                                assert!(ratio >= 0.30, "fill ratio {ratio:.3}");
+                                // density follow-up (batch 49): estimated, primary sets from the printed value
+                                assert!(
+                                    ratio >= 0.30,
+                                    "{cols}x{rows} {unicode:?}/{depth:?}: fill ratio {ratio:.3}"
+                                );
                             }
                             (UnicodeLevel::Full, ColorDepth::Ansi16) => {
-                                // density follow-up (batch 48)
-                                assert!(ratio >= 0.30, "fill ratio {ratio:.3}");
+                                // density follow-up (batch 49): estimated, primary sets from the printed value
+                                assert!(
+                                    ratio >= 0.30,
+                                    "{cols}x{rows} {unicode:?}/{depth:?}: fill ratio {ratio:.3}"
+                                );
                             }
                             (UnicodeLevel::Ascii, ColorDepth::None) => {
-                                // density follow-up (batch 48): ASCII glyphs limit graph density.
-                                assert!(ratio >= 0.24, "fill ratio {ratio:.3}");
+                                // density follow-up (batch 49): estimated, primary sets from the printed value
+                                assert!(
+                                    ratio >= 0.24,
+                                    "{cols}x{rows} {unicode:?}/{depth:?}: fill ratio {ratio:.3}"
+                                );
                             }
                             _ => unreachable!(),
                         }
@@ -365,15 +394,28 @@ fn absent_collectors_render_absent_marks_and_do_not_change_demand() {
 
 #[test]
 fn diskstats_warming_and_no_permission_keep_their_reading_states() {
-    let mut frame = MonitorFrame::default();
+    let mut frame = frame_fixture();
     frame.health[CollectorId::Diskstats.index()] = Health::Warming;
     let mut model = DiskModel::default();
     model.absorb_frame(&frame);
-    let (surface, _, _) = render(&model, 160, 45);
+    let (surface, placed, _) = render(&model, 160, 45);
     let text = surface.screen_chars_to_string();
     assert!(text.contains(crate::caps::active_glyphs().ellipsis));
     assert!(!text.contains("0 physical devices"));
     assert!(!text.contains("0B/s"));
+    let devices = placed
+        .iter()
+        .find(|panel| panel.id == PanelId("disk.devices"))
+        .expect("device panel placed");
+    let device_content = text
+        .lines()
+        .nth(devices.rect.y + 1)
+        .expect("device content row")
+        .chars()
+        .skip(devices.rect.x + 1)
+        .take(devices.rect.cols.saturating_sub(2))
+        .collect::<String>();
+    assert!(device_content.contains(crate::caps::active_glyphs().ellipsis));
 
     frame.health[CollectorId::Diskstats.index()] = Health::Absent(Absent::NoPermission);
     model.absorb_frame(&frame);
@@ -383,4 +425,288 @@ fn diskstats_warming_and_no_permission_keep_their_reading_states() {
             .screen_chars_to_string()
             .contains(crate::caps::glyph(crate::caps::Glyph::Lock))
     );
+    assert!(surface.screen_chars_to_string().contains("root-only"));
+}
+
+#[test]
+fn healthy_empty_pressure_and_missing_util_do_not_show_stale_loading_or_percent() {
+    let mut frame = MonitorFrame::default();
+    frame.health[CollectorId::Diskstats.index()] = Health::Ok;
+    frame.health[CollectorId::Psi.index()] = Health::Ok;
+    frame.parts.diskstats.devices = vec![DiskDevice {
+        id: InstanceId(0),
+        name: Arc::from("nvme0n1"),
+        label: None,
+        kind: DevKind::Disk,
+        physical: true,
+        parent: None,
+        read_bps: None,
+        write_bps: None,
+        read_iops: None,
+        write_iops: None,
+        util_pct: None,
+        in_flight: 0,
+    }];
+    let mut model = DiskModel::default();
+    model.absorb_frame(&frame);
+    let (surface, placed, _) = render(&model, 160, 45);
+    let text = surface.screen_chars_to_string();
+    let pressure = placed
+        .iter()
+        .find(|panel| panel.id == PanelId("disk.pressure"))
+        .expect("pressure panel placed");
+    let pressure_content = text
+        .lines()
+        .nth(pressure.rect.y + 1)
+        .expect("pressure content row")
+        .chars()
+        .skip(pressure.rect.x + 1)
+        .take(pressure.rect.cols.saturating_sub(2))
+        .collect::<String>();
+    assert!(pressure_content.contains(crate::caps::active_glyphs().emdash));
+    assert!(!pressure_content.contains(crate::caps::active_glyphs().ellipsis));
+    let device = placed
+        .iter()
+        .find(|panel| panel.id == PanelId("disk.devices"))
+        .expect("device panel placed");
+    let device_content = text
+        .lines()
+        .nth(device.rect.y + 1)
+        .expect("device content row")
+        .chars()
+        .skip(device.rect.x + 1)
+        .take(device.rect.cols.saturating_sub(2))
+        .collect::<String>();
+    assert!(device_content.contains(crate::caps::active_glyphs().emdash));
+    assert!(!device_content.contains(&format!("{}%", crate::caps::active_glyphs().emdash)));
+}
+
+#[test]
+fn healthy_empty_diskstats_shows_zero_devices() {
+    let mut frame = MonitorFrame::default();
+    frame.health[CollectorId::Diskstats.index()] = Health::Ok;
+    frame.health[CollectorId::Psi.index()] = Health::Ok;
+    frame.health[CollectorId::Filesystems.index()] = Health::Ok;
+    frame.health[CollectorId::CgroupSlice.index()] = Health::Ok;
+    let mut model = DiskModel::default();
+    model.absorb_frame(&frame);
+    let (surface, _, _) = render(&model, 160, 45);
+    let text = surface.screen_chars_to_string();
+    assert!(text.contains("0 physical devices"));
+    assert!(!text.contains(crate::caps::active_glyphs().ellipsis));
+}
+
+#[test]
+fn pressure_history_scales_48_percent_to_about_half_graph_height() {
+    let mut frame = frame_fixture();
+    if let Some(line) = &mut frame.parts.psi.io.file.some {
+        line.avg10 = 4800;
+    }
+    let mut model = DiskModel::default();
+    model.absorb_frame(&frame);
+    let mut values = [0.0; super::HISTORY];
+    let len = model.psi_some_history.copy_ordered(&mut values);
+    assert_eq!(len, 1);
+    assert!((values[0] - 0.48).abs() < 0.001);
+    test_override::with_unicode(UnicodeLevel::Ascii, || {
+        let mut surface = Surface::new(8, 10);
+        crate::monitor::graphs::paint_history_graph(
+            &values[..len],
+            thegn_core::theme::RampId::Read,
+            Rect::full(8, 10),
+            &mut surface,
+        );
+        let occupied_rows = surface
+            .screen_chars_to_string()
+            .lines()
+            .filter(|line| line.chars().any(|cell| cell != ' ' && cell != '\u{2800}'))
+            .count();
+        assert!(
+            (4..=6).contains(&occupied_rows),
+            "occupied graph rows: {occupied_rows}"
+        );
+    });
+}
+
+#[test]
+fn slice_history_uses_interval_rates_and_gaps_on_reset_or_missing_data() {
+    let mut frame = frame_fixture();
+    frame.dt_ms = 2000;
+    let mut model = DiskModel::default();
+    model.absorb_frame(&frame);
+    if let Some(io) = &mut frame.parts.cgroup_slice.sample.io {
+        io.rbytes += 40_000;
+        io.wbytes += 20_000;
+    }
+    model.absorb_frame(&frame);
+    assert_eq!(model.slice_read_history.values[1], 20_000.0);
+    assert_eq!(model.slice_write_history.values[1], 10_000.0);
+    if let Some(io) = &mut frame.parts.cgroup_slice.sample.io {
+        io.rbytes = 1;
+        io.wbytes = 1;
+    }
+    model.absorb_frame(&frame);
+    assert!(model.slice_read_history.values[2].is_nan());
+    assert!(model.slice_write_history.values[2].is_nan());
+    frame.parts.cgroup_slice.sample.io = None;
+    model.absorb_frame(&frame);
+    assert!(model.slice_read_history.values[3].is_nan());
+    assert!(model.slice_write_history.values[3].is_nan());
+}
+
+#[test]
+fn per_device_histories_follow_identity_across_reordering_and_missing_sides() {
+    let mut frame = frame_fixture();
+    let mut model = DiskModel::default();
+    model.absorb_frame(&frame);
+    frame.parts.diskstats.devices.swap(0, 1);
+    frame.parts.diskstats.devices[0].read_bps = Some(71_000.0);
+    frame.parts.diskstats.devices[0].write_bps = None;
+    frame.parts.diskstats.devices[1].read_bps = None;
+    frame.parts.diskstats.devices[1].write_bps = Some(83_000.0);
+    model.absorb_frame(&frame);
+
+    let first = model
+        .device_history
+        .iter()
+        .find(|history| history.id == InstanceId(1))
+        .expect("device identity retained");
+    let second = model
+        .device_history
+        .iter()
+        .find(|history| history.id == InstanceId(0))
+        .expect("device identity retained");
+    let mut values = [0.0; super::HISTORY];
+    let first_read_len = first.read.copy_ordered(&mut values);
+    assert_eq!(values[first_read_len - 1], 71_000.0);
+    assert_eq!(values[first_read_len - 2], 4_500_000.0);
+    let first_write_len = first.write.copy_ordered(&mut values);
+    assert!(values[first_write_len - 1].is_nan());
+    assert_eq!(values[first_write_len - 2], 570_000.0);
+    let second_read_len = second.read.copy_ordered(&mut values);
+    assert!(values[second_read_len - 1].is_nan());
+    assert_eq!(values[second_read_len - 2], 3_000_000.0);
+    let second_write_len = second.write.copy_ordered(&mut values);
+    assert_eq!(values[second_write_len - 1], 83_000.0);
+    assert_eq!(values[second_write_len - 2], 350_000.0);
+    assert!(
+        model
+            .device_history
+            .iter()
+            .all(|history| history.read.next == history.write.next)
+    );
+
+    let capacity = model.capacities();
+    for tick in 0_u16..1000 {
+        for device in &mut frame.parts.diskstats.devices {
+            device.read_bps = Some(10_000.0 + f64::from(tick));
+            device.write_bps = Some(20_000.0 + f64::from(tick));
+        }
+        model.absorb_frame(&frame);
+    }
+    assert_eq!(model.capacities(), capacity);
+    assert!(model.device_history.iter().all(|history| {
+        history.read.len == super::HISTORY
+            && history.write.len == super::HISTORY
+            && history.util.len == super::HISTORY
+    }));
+    let newest_history = &model
+        .device_history
+        .iter()
+        .find(|history| history.id == InstanceId(0))
+        .expect("bounded history remains attached to device")
+        .read;
+    let newest = newest_history.values[(newest_history.next + super::HISTORY - 1) % super::HISTORY];
+    assert_eq!(newest, 10_999.0);
+}
+
+#[test]
+fn device_history_survives_a_missing_frame_until_its_slot_is_reused() {
+    let mut frame = frame_fixture();
+    let mut model = DiskModel::default();
+    model.absorb_frame(&frame);
+    frame
+        .parts
+        .diskstats
+        .devices
+        .retain(|device| device.id != InstanceId(0));
+    model.absorb_frame(&frame);
+    assert!(
+        model
+            .device_history
+            .iter()
+            .any(|history| history.id == InstanceId(0))
+    );
+    assert!(
+        model
+            .device_history
+            .iter()
+            .find(|history| history.id == InstanceId(0))
+            .is_some_and(|history| history.read.values
+                [(history.read.next + super::HISTORY - 1) % super::HISTORY]
+                .is_nan())
+    );
+}
+
+#[test]
+fn disk_history_absorbs_telemetry_series_with_warm_model_capacity() {
+    let mut history = TelemetryHistory::default();
+    for tick in 0_u64..120 {
+        history.push(
+            &thegn_metrics::StatsSnapshot {
+                disk_io: Some((1_000_000 + tick * 3_000, 300_000 + tick * 700)),
+                ..Default::default()
+            },
+            tick * 1000,
+        );
+    }
+    let mut model = DiskModel::default();
+    model.absorb_history(&history, Window::from_secs(120), ScaleMode::Window, 120_000);
+    let capacity = model.capacities();
+    let warm_rebuilds = model.telemetry_rebuilds;
+    for _ in 0..1000 {
+        model.absorb_history(&history, Window::from_secs(120), ScaleMode::Window, 120_000);
+    }
+    assert_eq!(model.capacities(), capacity);
+    assert_eq!(model.telemetry_rebuilds, warm_rebuilds);
+    assert_eq!(model.telemetry_read_history.len, super::HISTORY);
+    assert_eq!(model.telemetry_write_history.len, super::HISTORY);
+    assert_ne!(
+        model.telemetry_read_history.values[0],
+        model.telemetry_read_history.values[super::HISTORY - 1]
+    );
+    assert_ne!(
+        model.telemetry_write_history.values[0],
+        model.telemetry_write_history.values[super::HISTORY - 1]
+    );
+    model.absorb_history(&history, Window::from_secs(120), ScaleMode::Window, 121_000);
+    assert_eq!(model.telemetry_rebuilds, warm_rebuilds + 1);
+}
+
+#[test]
+fn device_rate_text_survives_sparklines_at_100_by_30() {
+    let mut model = DiskModel::default();
+    model.absorb_frame(&frame_fixture());
+    let (surface, placed, _) = render(&model, 100, 30);
+    let text = surface.screen_chars_to_string();
+    let devices = placed
+        .iter()
+        .find(|panel| panel.id == PanelId("disk.devices"))
+        .expect("device panel placed");
+    let device_row = text
+        .lines()
+        .nth(devices.rect.y + 1)
+        .expect("device row rendered");
+    let expected = super::optional_rate(Some(3_000_000.0), Health::Ok);
+    assert!(device_row.contains(&expected), "{device_row}");
+}
+
+#[test]
+fn mirrored_io_plot_places_newest_read_and_write_samples_at_the_right_edge() {
+    let mut grid = CellGrid::new(12, 8);
+    super::paint_mirrored_history(&mut grid, Rect::full(12, 8), &[1.0], &[1.0]);
+    let blank = |ch| ch == ' ' || ch == '\u{2800}';
+    assert!((0..4).any(|row| { grid.get(11, row).is_some_and(|cell| !blank(cell.ch)) }));
+    assert!((4..8).any(|row| { grid.get(11, row).is_some_and(|cell| !blank(cell.ch)) }));
+    assert!((0..8).all(|row| { grid.get(0, row).is_some_and(|cell| blank(cell.ch)) }));
 }
