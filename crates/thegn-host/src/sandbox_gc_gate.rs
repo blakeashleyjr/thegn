@@ -1,6 +1,5 @@
 //! Decide whether startup should probe container runtimes for orphan cleanup.
 
-use std::path::Path;
 use thegn_core::config::Config;
 
 /// Whether the effective global/profile/env configuration can produce a
@@ -35,6 +34,28 @@ pub(crate) fn active_oci_wanted(cfg: &Config, observed_backend: &str) -> bool {
     startup_gc_wanted(cfg)
         && thegn_core::sandbox::Backend::parse(observed_backend)
             .is_some_and(|backend| backend.is_oci())
+}
+
+/// Resolve refresh demand only when the effective base config can create a
+/// container. Visible surfaces alone must not revive Podman after sandbox-off.
+pub(crate) fn container_demand(
+    cfg: &Config,
+    panel_open: bool,
+    monitor_open: bool,
+    monitor_containers_visible: bool,
+    sandbox_section_open: bool,
+    observed_backend: &str,
+) -> crate::hydrate::ContainerDemand {
+    if !startup_gc_wanted(cfg) {
+        return crate::hydrate::ContainerDemand::None;
+    }
+    crate::hydrate::ContainerDemand::resolve(
+        panel_open,
+        monitor_open,
+        monitor_containers_visible,
+        sandbox_section_open,
+        active_oci_wanted(cfg, observed_backend),
+    )
 }
 
 #[cfg(test)]
@@ -74,9 +95,19 @@ mod tests {
     #[test]
     fn stale_oci_observation_does_not_enable_container_demand_when_sandbox_is_off() {
         let cfg = parsed("[sandbox]\nenabled = false\n");
+        let profile_disabled = parsed("profile = \"p\"\n[profiles.p.sandbox]\nenabled = false\n");
 
         assert!(!super::active_oci_wanted(&cfg, "podman"));
+        assert!(!super::active_oci_wanted(&profile_disabled, "podman"));
         assert!(super::active_oci_wanted(&parsed(""), "podman"));
+        assert_eq!(
+            super::container_demand(&cfg, true, false, false, false, "podman"),
+            crate::hydrate::ContainerDemand::None
+        );
+        assert_eq!(
+            super::container_demand(&parsed(""), true, false, false, false, ""),
+            crate::hydrate::ContainerDemand::Summary
+        );
     }
 
     #[test]
