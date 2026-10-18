@@ -291,12 +291,29 @@ fn terminate_tree(child: &mut Child) {
     Result::ok(child.kill());
 }
 
-fn terminate_group_after_exit(_child: &Child) {
+pub(crate) fn terminate_group_after_exit(_child: &Child) {
     #[cfg(unix)]
     {
         use nix::sys::signal::{Signal, killpg};
         use nix::unistd::Pid;
         Result::ok(killpg(Pid::from_raw(_child.id() as i32), Signal::SIGKILL));
+    }
+}
+
+/// Put a long-lived sandbox helper in its own process group where the
+/// platform supports group termination.
+pub(crate) fn configure_event_process_group(_command: &mut Command) {
+    #[cfg(unix)]
+    std::os::unix::process::CommandExt::process_group(_command, 0);
+}
+
+/// Kill the process group for an events child (or the child itself on
+/// platforms without process groups).
+pub(crate) fn terminate_event_group(child: &mut Child) {
+    terminate_group_after_exit(child);
+    #[cfg(windows)]
+    if let Err(error) = child.kill() {
+        tracing::debug!(%error, "sandbox events: child kill failed");
     }
 }
 
