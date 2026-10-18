@@ -41,6 +41,13 @@ rather than the SMC keys that only exist on Intel Macs — so the temperature ta
 works there, showing the per-die sensors plus storage and battery. If a future
 macOS stops exposing them, the tab hides rather than showing zeroes.
 
+When a tab has several panels, `f` and `F` focus the next and previous panel,
+and `z` zooms or unzooms the focused panel. In normal monitor navigation, `Esc`
+leaves zoom before closing the monitor. The footer shows the `f panel` and
+`z zoom` hints only when more than one panel is placed; the tab bar shows
+`+N hidden` when panels do not fit. On a tab with a single panel, these keys do
+nothing, and the footer leaves them out.
+
 ## Reading the graphs
 
 Every plot has "now" at its right edge. Three toggles change how the history is

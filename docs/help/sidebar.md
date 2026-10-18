@@ -213,7 +213,9 @@ dirty dot. Set `[ui] sidebar_show_submodules = false` to hide only this marker.
 The setting is trusted user/workspace configuration and cannot be supplied by
 repo-local `.thegn.toml`.
 The +/- line counts show a dim `bin` when the change includes binary files, and
-`+capped`/`-capped` in place of a count when the diff cap is reached.
+`+capped`/`-capped` in place of a count when the diff cap is reached. If a diff
+count cannot be read, the row keeps its last known counts; with no earlier
+reading, it shows an amber `?`.
 
 ## Act
 
