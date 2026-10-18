@@ -83,6 +83,31 @@ fn encoder_builds_v4_and_v6_dump_requests_with_tcp_info_ext() {
 }
 
 #[test]
+fn decoder_reads_socket_cookie_and_optional_cgroup_attribute() {
+    let mut payload = response(AddressFamily::Ipv4, 0);
+    payload[44..52].copy_from_slice(&0x1122_3344_5566_7788_u64.to_ne_bytes());
+    payload.extend_from_slice(&12_u16.to_ne_bytes());
+    payload.extend_from_slice(&21_u16.to_ne_bytes());
+    payload.extend_from_slice(&42_u64.to_ne_bytes());
+    let row = decode(&payload);
+    assert_eq!(row.cookie, Some(0x1122_3344_5566_7788));
+    assert_eq!(row.cgroup_id, Some(42));
+
+    let without = decode(&response(AddressFamily::Ipv4, 0));
+    assert_eq!(without.cgroup_id, None);
+}
+
+#[test]
+fn truncated_cgroup_attribute_decodes_to_none() {
+    let mut payload = response(AddressFamily::Ipv4, 0);
+    payload.extend_from_slice(&12_u16.to_ne_bytes());
+    payload.extend_from_slice(&21_u16.to_ne_bytes());
+    payload.extend_from_slice(&[1, 2, 3, 4]);
+    let row = decode(&payload);
+    assert_eq!(row.cgroup_id, None);
+}
+
+#[test]
 fn decoder_round_trips_ipv4_and_ipv6_endpoints_and_ports() {
     let v4 = decode(&response(AddressFamily::Ipv4, 0));
     assert_eq!(v4.source, IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)));
