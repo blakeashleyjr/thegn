@@ -97,7 +97,7 @@ fn read_start_secs(pid: u32) -> Option<u64> {
 }
 
 #[cfg(target_os = "linux")]
-fn start_secs_for_ticks(ticks: u64) -> Option<u64> {
+pub(super) fn start_secs_for_ticks(ticks: u64) -> Option<u64> {
     static BOOT_TIME: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
     let btime = match BOOT_TIME.get() {
         Some(btime) => *btime,

@@ -3,6 +3,8 @@
 //! Linux `setpriority` and `ioprio_set` have no pidfd form. The identity checks
 //! before and after each syscall therefore leave a small check-act-check race;
 //! a post-call mismatch is reported as [`PriorityError::Changed`] and logged.
+//! Linux `/proc` start times have clock-tick granularity, so a pid recycled
+//! within the same tick can evade those checks.
 
 use super::ProcStart;
 
@@ -112,7 +114,9 @@ fn linux_identity_matches(pid: u32, start: ProcStart) -> bool {
         return false;
     }
     let live_ticks = super::signal_identity::read_start_ticks(pid);
-    super::signal_identity::identity_matches(start, live_ticks, || None)
+    super::signal_identity::identity_matches(start, live_ticks, || {
+        live_ticks.and_then(super::signal_identity::start_secs_for_ticks)
+    })
 }
 
 #[cfg(target_os = "linux")]
@@ -136,8 +140,8 @@ fn map_linux_error(error: std::io::Error) -> PriorityError {
 #[cfg(target_os = "linux")]
 fn encode_ioprio(class: IoClass) -> libc::c_int {
     let (class, data) = match class {
-        IoClass::RealTime(data) => (1, data),
-        IoClass::BestEffort(data) => (2, data),
+        IoClass::RealTime(data) => (1, data.min(7)),
+        IoClass::BestEffort(data) => (2, data.min(7)),
         IoClass::Idle => (3, 0),
         IoClass::None => (0, 0),
     };
@@ -458,10 +462,15 @@ mod tests {
     fn own_child_nice_and_ioprio_round_trip() {
         let child = spawn_sleep();
         let start = child_start(&child);
-        set_nice(child.0.id(), start, 5).expect("raise child nice to 5");
-        assert_eq!(get_nice(child.0.id(), start), Ok(5));
-        set_nice(child.0.id(), start, 10).expect("raise child nice to 10");
-        assert_eq!(get_nice(child.0.id(), start), Ok(10));
+        let base = get_nice(child.0.id(), start).expect("read child nice");
+        if base < 19 {
+            let first = (base + 1).min(19);
+            set_nice(child.0.id(), start, first).expect("raise child nice by one");
+            assert_eq!(get_nice(child.0.id(), start), Ok(first));
+            let second = (base + 2).min(19);
+            set_nice(child.0.id(), start, second).expect("raise child nice by two");
+            assert_eq!(get_nice(child.0.id(), start), Ok(second));
+        }
         set_ioprio(child.0.id(), start, IoClass::BestEffort(7))
             .expect("set child best-effort I/O priority");
         assert_eq!(get_ioprio(child.0.id(), start), Ok(IoClass::BestEffort(7)));
@@ -491,10 +500,14 @@ mod tests {
         let start = child_start(&child);
         child.0.kill().expect("stop child");
         child.0.wait().expect("reap child");
-        assert!(matches!(
-            get_nice(child.0.id(), start),
-            Err(PriorityError::Changed | PriorityError::Failed(_))
-        ));
+        assert_eq!(
+            set_nice(child.0.id(), start, 10),
+            Err(PriorityError::Changed)
+        );
+        assert_eq!(
+            set_ioprio(child.0.id(), start, IoClass::Idle),
+            Err(PriorityError::Changed)
+        );
     }
 
     #[test]
@@ -503,5 +516,27 @@ mod tests {
         let start = child_start(&child);
         set_nice(child.0.id(), start, 40).expect("raise child nice with clamping");
         assert_eq!(get_nice(child.0.id(), start), Ok(19));
+    }
+
+    #[test]
+    fn seconds_only_identity_matches_live_child() {
+        let child = spawn_sleep();
+        let ticks = super::super::signal_identity::read_start_ticks(child.0.id())
+            .expect("read child start ticks");
+        let start = ProcStart {
+            secs: super::super::signal_identity::start_secs_for_ticks(ticks)
+                .expect("convert child start ticks to seconds"),
+            ticks: None,
+        };
+        assert!(get_nice(child.0.id(), start).is_ok());
+    }
+
+    #[test]
+    fn ioprio_data_is_clamped_to_three_bits() {
+        assert_eq!(super::encode_ioprio(IoClass::RealTime(255)), (1 << 13) | 7);
+        assert_eq!(
+            super::encode_ioprio(IoClass::BestEffort(255)),
+            (2 << 13) | 7
+        );
     }
 }
