@@ -119,6 +119,7 @@ const LIVE_WINDOW_MAX_SECS: u32 = 600;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum MonitorTab {
     #[default]
+    Overview,
     Cpu,
     Memory,
     Thermal,
@@ -136,7 +137,8 @@ pub enum MonitorTab {
 }
 
 impl MonitorTab {
-    pub const ALL: [MonitorTab; 10] = [
+    pub const ALL: [MonitorTab; 11] = [
+        MonitorTab::Overview,
         MonitorTab::Cpu,
         MonitorTab::Memory,
         MonitorTab::Thermal,
@@ -155,6 +157,7 @@ impl MonitorTab {
 
     pub fn label(self) -> &'static str {
         match self {
+            MonitorTab::Overview => "Overview",
             MonitorTab::Cpu => "CPU",
             MonitorTab::Memory => "Memory",
             MonitorTab::Thermal => "Thermal",
@@ -172,6 +175,7 @@ impl MonitorTab {
     /// must not orphan the preferences saved under it.
     pub fn key(self) -> &'static str {
         match self {
+            MonitorTab::Overview => "overview",
             MonitorTab::Cpu => "cpu",
             MonitorTab::Memory => "mem",
             MonitorTab::Thermal => "temp",
@@ -198,6 +202,7 @@ impl MonitorTab {
     #[allow(dead_code)] // drift guard, see monitor_tests
     pub fn widget_id(self) -> Option<&'static str> {
         match self {
+            MonitorTab::Overview => None,
             MonitorTab::Cpu => Some("cpu"),
             MonitorTab::Memory => Some("mem"),
             MonitorTab::Thermal => Some("temp"),
@@ -239,10 +244,11 @@ impl MonitorTab {
     /// *work* on those tabs — they write the same per-tab prefs — but nothing
     /// on screen moves, which is the bug.
     pub fn has_graphs(self) -> bool {
-        !matches!(
-            self,
-            MonitorTab::Procs | MonitorTab::Containers | MonitorTab::Notifications
-        )
+        self == MonitorTab::Overview
+            || !matches!(
+                self,
+                MonitorTab::Procs | MonitorTab::Containers | MonitorTab::Notifications
+            )
     }
 
     pub fn visible(s: &StatsSnapshot, has_containers: bool) -> Vec<MonitorTab> {
@@ -460,6 +466,7 @@ pub struct MonitorOverlay {
     /// `rows - CHROME_ROWS`. What [`Self::scroll_max`] measures against.
     body_rows: usize,
     board: board::Board,
+    overview: tabs::overview::OverviewModel,
 }
 
 impl MonitorOverlay {
@@ -515,6 +522,7 @@ impl MonitorOverlay {
             screen: ctx.screen,
             body_rows: rows.saturating_sub(CHROME_ROWS),
             board: board::Board::default(),
+            overview: tabs::overview::OverviewModel::default(),
         };
         ov.rebuild(model, ctx, false);
         ov
@@ -585,8 +593,22 @@ impl MonitorOverlay {
 
     /// Sampler work required by the panels placed in the current monitor body.
     pub fn demand(&self, base_ms: u32) -> crate::monitor_sampler::Demand {
-        let view = board::LegacyTab;
+        let view = self.view();
         self.board.demand(&view, self.body_rect(), base_ms)
+    }
+
+    fn view(&self) -> board::ActiveView<'_> {
+        board::ActiveView::for_tab(self.tab, &self.overview)
+    }
+
+    /// Copy the latest pooled frame before the sampler reuses it. Pausing freezes
+    /// the owned Overview snapshot; only a visible live Overview needs repaint.
+    pub fn ingest_frame(&mut self, frame: &thegn_metrics::collect::frame::MonitorFrame) -> bool {
+        if self.paused {
+            return false;
+        }
+        self.overview.absorb_frame(frame);
+        self.tab == MonitorTab::Overview
     }
 
     /// Drain a pending loop-side action (a Disk-tab clean, or a Containers-tab
@@ -613,6 +635,11 @@ impl MonitorOverlay {
         let live_now = ctx.now_ms.max(0) as u64;
         self.last_now_ms = live_now;
         let now = self.frozen_now_ms.unwrap_or(live_now);
+        if self.tab == MonitorTab::Overview {
+            self.overview.absorb_stats(&model.stats);
+            self.overview.absorb_container_count(model.containers.len());
+            self.overview.absorb_history(ctx.hist, now);
+        }
         // Only the active list is derived, and navigation/geometry changes do
         // not re-sort an unchanged process snapshot. Identity remains sampled.
         self.refresh_active_rows(model, now / 1000, preserve_process);
@@ -868,7 +895,7 @@ impl MonitorOverlay {
     }
 
     fn placed_panels(&self) -> Vec<layout::Placed> {
-        self.board.placed(&board::LegacyTab, self.body_rect())
+        self.board.placed(&self.view(), self.body_rect())
     }
 }
 
@@ -1311,7 +1338,7 @@ impl MonitorOverlay {
             sections::panel(),
         );
         let body = self.body_rect_at(screen);
-        let view = board::LegacyTab;
+        let view = self.view();
         self.board
             .paint(&view, surface, body, self.scroll(), &self.body);
         crate::seg::draw_line(
@@ -1346,7 +1373,7 @@ impl MonitorOverlay {
             vec![seg(Tok::Slot(S::Ghost), self.coverage_note())]
         };
         if let Some(hidden) =
-            board::hidden_label(self.board.hidden_count(&board::LegacyTab, self.body_rect()))
+            board::hidden_label(self.board.hidden_count(&self.view(), self.body_rect()))
         {
             right.push(seg(Tok::Slot(S::Ghost), format!(" · {hidden}")));
         }
