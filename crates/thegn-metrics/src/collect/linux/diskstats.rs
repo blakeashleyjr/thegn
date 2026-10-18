@@ -54,8 +54,6 @@ pub struct DiskstatsCollector {
     last_unknown_scan: u64,
     #[cfg(test)]
     intern_attempts: usize,
-    #[cfg(test)]
-    topology_lookups: usize,
 }
 impl DiskstatsCollector {
     pub fn at(diskstats: impl AsRef<Path>, sys_block: impl AsRef<Path>) -> Self {
@@ -75,8 +73,6 @@ impl DiskstatsCollector {
             last_unknown_scan: 0,
             #[cfg(test)]
             intern_attempts: 0,
-            #[cfg(test)]
-            topology_lookups: 0,
         }
     }
     fn scan(&mut self, now_ms: u64) {
@@ -185,10 +181,6 @@ impl Collector for DiskstatsCollector {
             let Ok(name) = std::str::from_utf8(row.name) else {
                 return false;
             };
-            #[cfg(test)]
-            {
-                self.topology_lookups += 1;
-            }
             !self.topology_indices.contains_key(name)
         });
         if empty {
@@ -216,10 +208,6 @@ impl Collector for DiskstatsCollector {
             let Ok(name) = std::str::from_utf8(row.name) else {
                 continue;
             };
-            #[cfg(test)]
-            {
-                self.topology_lookups += 1;
-            }
             let Some(dev_index) = self.topology_indices.get(name).copied() else {
                 continue;
             };
@@ -305,6 +293,7 @@ impl Collector for DiskstatsCollector {
             self.ids.remove(&name);
             self.rates.remove(&name);
             self.interner.retire(id);
+            self.over_cap.clear();
         }
         part.aggregate = DiskTotals {
             read_bps: self
@@ -353,7 +342,6 @@ impl Collector for DiskstatsCollector {
         #[cfg(test)]
         {
             self.intern_attempts = 0;
-            self.topology_lookups = 0;
         }
     }
 }
@@ -730,7 +718,7 @@ mod tests {
     }
 
     #[test]
-    fn over_cap_names_are_cached_and_topology_lookup_is_indexed() {
+    fn over_cap_names_are_cached_until_an_id_is_retired() {
         let dir = tempfile::tempdir().unwrap();
         let sys = dir.path().join("sys/block");
         let proc = dir.path().join("diskstats");
@@ -759,7 +747,6 @@ mod tests {
             .unwrap();
         assert!(frame.parts.diskstats.truncated);
         let intern_attempts = collector.intern_attempts;
-        collector.topology_lookups = 0;
 
         collector
             .sample(
@@ -772,7 +759,37 @@ mod tests {
             .unwrap();
 
         assert_eq!(collector.intern_attempts, intern_attempts);
-        assert_eq!(collector.topology_lookups, 140);
+        assert!(frame.parts.diskstats.truncated);
+
+        let without_first_device = rows
+            .lines()
+            .filter(|row| !row.contains(" sd00 "))
+            .collect::<Vec<_>>()
+            .join("\n");
+        fs::write(&proc, without_first_device).unwrap();
+        collector
+            .sample(
+                &TickCtx {
+                    tick: 3,
+                    now_ms: 3_000,
+                },
+                &mut frame,
+            )
+            .unwrap();
+        assert!(!collector.ids.contains_key("sd00"));
+
+        fs::write(&proc, &rows).unwrap();
+        collector
+            .sample(
+                &TickCtx {
+                    tick: 4,
+                    now_ms: 4_000,
+                },
+                &mut frame,
+            )
+            .unwrap();
+
+        assert!(collector.intern_attempts > intern_attempts);
         assert!(frame.parts.diskstats.truncated);
     }
 
