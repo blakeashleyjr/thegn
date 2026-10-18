@@ -42,19 +42,17 @@ works there, showing the per-die sensors plus storage and battery. If a future
 macOS stops exposing them, the tab hides rather than showing zeroes.
 
 When a tab has several panels, `f` and `F` focus the next and previous panel,
-and `z` zooms the focused panel. In normal monitor navigation, `Esc` leaves
-zoom before closing the monitor. The footer shows `f panel · z zoom` only when
-more than one panel is placed; the tab bar shows `+N hidden` when panels do not
-fit. Today each tab has one panel, so those panel keys have nothing to act on.
+and `z` zooms or unzooms the focused panel. In normal monitor navigation, `Esc`
+leaves zoom before closing the monitor. The footer shows the `f panel` and
+`z zoom` hints only when more than one panel is placed; the tab bar shows
+`+N hidden` when panels do not fit. On a tab with a single panel, these keys do
+nothing, and the footer leaves them out.
 
 ## Reading the graphs
 
 Every plot has "now" at its right edge. Three toggles change how the history is
 drawn, and each one is remembered **per tab** — so CPU can sit on a ten-minute
 log scale while Network stays on a live linear one.
-
-On Linux, CPU%, memory and network rates use held `/proc` reads; their displayed
-values are unchanged.
 
 - `[` and `]` narrow and widen the **time window**, stepping along the rungs of
   `[monitor] window_ladder` — 30 seconds up to 24 hours out of the box, starting

@@ -45,6 +45,9 @@ The dirty check and the diff's changed-file walk also reuse filters for drivers
 marked `required = true` that have both `clean` and `process` commands. If such
 a filter cannot run, those operations use Git's one-shot `clean` filter.
 
+Opening or reading a file does not refresh anything; creating, modifying or
+removing a file refreshes the relevant views.
+
 ### commits — branch history
 
 At Half and Full width, the detail region follows the cursor and shows the
@@ -193,9 +196,8 @@ other git actions. A current-branch fast-forward uses a locked
 unlocked and locks only the branch update. Pull and fast-forwards on remote
 worktrees stay locked.
 
-An automatic fetch that moves no refs does not trigger a badge refresh. The
-host file watchers ignore opens and reads; creates, modifications and removals
-wake them to refresh the relevant views.
+A background `[git] auto_fetch` that moves no remote refs does not trigger a
+badge refresh.
 
 ## Rollback
 
