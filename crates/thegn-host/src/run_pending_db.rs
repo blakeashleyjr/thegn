@@ -39,6 +39,9 @@ pub(crate) enum PendingDbResult {
     WriteFailed {
         status: String,
     },
+    PoolTarget {
+        status: String,
+    },
 }
 
 #[derive(Debug, Default)]
@@ -259,6 +262,25 @@ pub(crate) fn queue_reported_write(
     crate::db_task::persist_critical(move |db| {
         report_write_result(job(db), on_err, |result| send_result(&tx, &waker, result));
     });
+}
+
+pub(crate) fn queue_pool_target_adjust(
+    tx: &tokio::sync::mpsc::UnboundedSender<PendingDbResult>,
+    waker: &termwiz::terminal::TerminalWaker,
+    cfg: thegn_core::config::Config,
+    wt: String,
+    delta: i64,
+) {
+    let tx = tx.clone();
+    let waker = waker.clone();
+    crate::db_task::persist_critical(move |db| {
+        let status = crate::handlers::provision::adjust_pool_target(db, &cfg, &wt, delta);
+        send_pool_target_result(status, |result| send_result(&tx, &waker, result));
+    });
+}
+
+fn send_pool_target_result(status: String, notify: impl FnOnce(PendingDbResult)) {
+    notify(PendingDbResult::PoolTarget { status });
 }
 
 async fn send_dropped_result(
@@ -717,5 +739,24 @@ mod tests {
         let db = thegn_core::db::Db::open_at(&dir.path().join("thegn.db")).unwrap();
         let error = add_account(&db, "not-a-provider").unwrap_err();
         assert!(error.to_string().contains("unknown account provider"));
+    }
+
+    #[test]
+    fn pool_target_result_is_sent_on_success_and_failure() {
+        let mut results = Vec::new();
+        send_pool_target_result("warm pool target: 1 spare(s)".into(), |result| {
+            results.push(result)
+        });
+        send_pool_target_result("warm pool: persist failed: locked".into(), |result| {
+            results.push(result)
+        });
+        assert!(matches!(
+            results.as_slice(),
+            [
+                PendingDbResult::PoolTarget { status: success },
+                PendingDbResult::PoolTarget { status: failure }
+            ] if success == "warm pool target: 1 spare(s)"
+                && failure == "warm pool: persist failed: locked"
+        ));
     }
 }

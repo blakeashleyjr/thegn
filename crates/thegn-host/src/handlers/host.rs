@@ -394,8 +394,8 @@ pub(crate) fn intercept_menu_choice(
 }
 
 /// Stop all ingress shares on the active worktree (`Action::StopWorktreeShare`),
-/// extracted from the size-capped `run.rs`. User-invoked and rare, so the
-/// best-effort DB cleanup stays inline.
+/// extracted from the size-capped `run.rs`. Durable cleanup runs on the
+/// critical DB writer so stopped tunnels cannot be resurrected on restart.
 pub(crate) fn stop_worktree_share(
     model: &mut crate::chrome::FrameModel,
     share_supervisor: &mut crate::share::ShareSupervisor,
@@ -409,20 +409,34 @@ pub(crate) fn stop_worktree_share(
     // deleting by it left the real rows behind (a "stopped" tunnel then
     // resurrected on the next launch).
     let stopped = share_supervisor.stop(&wt, None);
-    if let Ok(db) = thegn_core::db::Db::open() {
-        use thegn_core::store::WorktreeAuxStore as _;
-        for (port, generation) in &stopped {
-            if let Err(error) = db.delete_share_generation(&wt, *port, *generation) {
-                tracing::debug!(target: "thegn::db", %error, "stopped share cache delete failed");
-            }
-        }
-    }
+    let stopped_count = stopped.len();
+    queue_stopped_share_deletes(wt, stopped);
     model.shares = crate::run::current_share_views(share_supervisor, session);
-    model.status = if stopped.is_empty() {
+    model.status = if stopped_count == 0 {
         "No active shares on this worktree".into()
     } else {
-        format!("Stopped {} share(s)", stopped.len())
+        format!("Stopped {stopped_count} share(s)")
     };
+}
+
+pub(crate) fn queue_stopped_share_deletes(worktree: String, stopped: Vec<(u16, u64)>) {
+    if stopped.is_empty() {
+        return;
+    }
+    crate::db_task::persist_critical(move |db| {
+        use thegn_core::store::WorktreeAuxStore as _;
+        for (port, generation) in stopped {
+            match db.delete_share_generation(&worktree, port, generation) {
+                Ok(true) => {}
+                Ok(false) => {
+                    tracing::debug!(target: "thegn::db", %worktree, port, generation, "stale stopped share delete left another generation intact")
+                }
+                Err(error) => {
+                    tracing::debug!(target: "thegn::db", %error, "stopped share cache delete failed")
+                }
+            }
+        }
+    });
 }
 
 #[cfg(test)]
@@ -572,5 +586,59 @@ mod tests {
                 .contains("2 live placement(s)")
         );
         assert_eq!(host_remove_refusal("lab", true, 0), None);
+    }
+
+    #[test]
+    fn stop_worktree_share_does_not_block_on_a_held_write_lock() {
+        if !crate::platform::sound_process::test_support::UNIX {
+            return;
+        }
+        use thegn_core::store::WorktreeAuxStore as _;
+
+        let state = crate::testenv::IsolatedState::new();
+        let db = thegn_core::db::Db::open().unwrap();
+        db.upsert_share("/isolated/wt", 4312, 17, "bore", None, "failed")
+            .unwrap();
+        drop(db);
+        let lock = rusqlite::Connection::open(state.state_home().join("thegn/thegn.db")).unwrap();
+        lock.execute_batch("BEGIN IMMEDIATE").unwrap();
+
+        let session = crate::session::Session {
+            id: "test".into(),
+            worktrees: vec![crate::session::WorktreeGroup::new(
+                "isolated/wt",
+                crate::session::GroupKind::Home,
+                "/isolated/wt",
+            )],
+            active: 0,
+        };
+        let mut supervisor = crate::share::ShareSupervisor::new();
+        crate::share::seed_failed_instance_for_test(&mut supervisor, "/isolated/wt", 4312, 17);
+        let mut model = crate::chrome::FrameModel::default();
+        let started = std::time::Instant::now();
+        stop_worktree_share(&mut model, &mut supervisor, &session);
+        assert!(started.elapsed() < std::time::Duration::from_millis(500));
+        assert_eq!(model.status, "Stopped 1 share(s)");
+
+        lock.execute_batch("ROLLBACK").unwrap();
+        drop(lock);
+        let (read_tx, read_rx) = std::sync::mpsc::channel();
+        crate::db_task::persist_critical(move |db| {
+            let rows = db.list_shares().map(|rows| {
+                rows.into_iter()
+                    .filter(|row| row.worktree == "/isolated/wt")
+                    .collect::<Vec<_>>()
+            });
+            if read_tx.send(rows).is_err() {
+                tracing::debug!(target: "thegn::host", "share read-back receiver closed");
+            }
+        });
+        assert!(
+            read_rx
+                .recv_timeout(std::time::Duration::from_secs(10))
+                .unwrap()
+                .unwrap()
+                .is_empty()
+        );
     }
 }
