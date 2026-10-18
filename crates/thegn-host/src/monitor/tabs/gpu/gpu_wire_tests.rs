@@ -174,7 +174,6 @@ fn memory_history_right_aligns_two_samples_in_unicode_and_ascii() {
             .expect("VRAM history label rendered");
         let inner_left = memory.rect.x + 1;
         let inner_right = memory.rect.x + memory.rect.cols - 2;
-        let graph_rows = (label_y + 1)..(memory.rect.y + memory.rect.rows - 1);
         let lines = surface.screen_lines();
         let blank = |value: &str| value.is_empty() || value == " " || value == "\u{2800}";
         let cell_at = |y: usize, x: usize| {
@@ -184,6 +183,14 @@ fn memory_history_right_aligns_two_samples_in_unicode_and_ascii() {
                 .map(|cell| cell.str().to_owned())
                 .unwrap_or_default()
         };
+        // The VRAM graph runs from the row under its label to the first fully blank
+        // inner row; the GTT label and graph follow below it.
+        let panel_bottom = memory.rect.y + memory.rect.rows - 1;
+        let graph_end = (label_y + 1..panel_bottom)
+            .find(|&y| (inner_left..=inner_right).all(|x| blank(&cell_at(y, x))))
+            .unwrap_or(panel_bottom);
+        let graph_rows = (label_y + 1)..graph_end;
+        assert!(!graph_rows.is_empty(), "VRAM graph rows found: {level:?}");
         // A low reading lights only the bottom graph row, so look at every row.
         let right_is_filled = graph_rows.clone().any(|y| !blank(&cell_at(y, inner_right)));
         assert!(
