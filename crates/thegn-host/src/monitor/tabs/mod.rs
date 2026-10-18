@@ -78,6 +78,7 @@ impl MonitorOverlay {
             // `x` acts on the selected row: signal a process, or clean a
             // worktree. Both open a confirmation rather than firing immediately.
             KeyCode::Char('x') if self.tab == MonitorTab::Procs => self.begin_signal(),
+            KeyCode::Char('X') if self.tab == MonitorTab::Procs => self.begin_signal_menu(),
             KeyCode::Char('x') if self.tab == MonitorTab::Disk => self.begin_clean(),
             KeyCode::Char('=') if self.tab == MonitorTab::Procs => self.begin_renice(),
             KeyCode::Char('I')

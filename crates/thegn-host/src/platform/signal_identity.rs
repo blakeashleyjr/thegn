@@ -73,6 +73,13 @@ fn signal_number(sig: ProcSignal) -> libc::c_int {
     match sig {
         ProcSignal::Terminate => libc::SIGTERM,
         ProcSignal::Kill => libc::SIGKILL,
+        ProcSignal::Hangup => libc::SIGHUP,
+        ProcSignal::Interrupt => libc::SIGINT,
+        ProcSignal::Quit => libc::SIGQUIT,
+        ProcSignal::User1 => libc::SIGUSR1,
+        ProcSignal::User2 => libc::SIGUSR2,
+        ProcSignal::Stop => libc::SIGSTOP,
+        ProcSignal::Continue => libc::SIGCONT,
     }
 }
 
@@ -188,7 +195,12 @@ fn signal_identity_inner(
 }
 
 #[cfg(windows)]
-fn signal_identity_inner(pid: u32, start: ProcStart, _sig: ProcSignal) -> Result<(), SignalError> {
+fn signal_identity_inner(pid: u32, start: ProcStart, sig: ProcSignal) -> Result<(), SignalError> {
+    if !matches!(sig, ProcSignal::Terminate | ProcSignal::Kill) {
+        return Err(SignalError::Failed(
+            "only terminate is available on Windows".into(),
+        ));
+    }
     use windows_sys::Win32::Foundation::{CloseHandle, FILETIME};
     use windows_sys::Win32::System::Threading::{
         GetProcessTimes, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_TERMINATE,
@@ -482,5 +494,86 @@ mod linux_tests {
         assert!(child.0.try_wait().expect("check child status").is_none());
         child.0.kill().expect("kill sleep child after mismatch");
         child.0.wait().expect("reap sleep child after mismatch");
+    }
+
+    #[test]
+    fn stop_continue_and_terminate_are_identity_checked_and_reaped() {
+        let mut child = ChildGuard(spawn_sleep());
+        let pid = child.0.id();
+        let start = ProcStart {
+            secs: read_start_secs(pid).expect("read child start seconds"),
+            ticks: Some(read_start_ticks(pid).expect("read child start ticks")),
+        };
+        for signal in [ProcSignal::Stop, ProcSignal::Continue] {
+            match signal_identity(pid, start, signal) {
+                Ok(()) => {}
+                Err(SignalError::Failed(message))
+                    if message.contains("pidfd_open blocked (seccomp)") =>
+                {
+                    return;
+                }
+                Err(error) => panic!("could not deliver {signal:?}: {error:?}"),
+            }
+        }
+        assert_eq!(signal_identity(pid, start, ProcSignal::Terminate), Ok(()));
+        let status = child.0.wait().expect("reap terminated sleep child");
+        assert_eq!(status.signal(), Some(libc::SIGTERM));
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod signal_mapping_tests {
+    use super::*;
+
+    #[test]
+    fn menu_order_and_signal_numbers_match_the_supported_linux_menu() {
+        let expected = [
+            (ProcSignal::Terminate, libc::SIGTERM),
+            (ProcSignal::Kill, libc::SIGKILL),
+            (ProcSignal::Hangup, libc::SIGHUP),
+            (ProcSignal::Interrupt, libc::SIGINT),
+            (ProcSignal::Quit, libc::SIGQUIT),
+            (ProcSignal::User1, libc::SIGUSR1),
+            (ProcSignal::User2, libc::SIGUSR2),
+            (ProcSignal::Stop, libc::SIGSTOP),
+            (ProcSignal::Continue, libc::SIGCONT),
+        ];
+        assert_eq!(
+            ProcSignal::menu(),
+            &[
+                ProcSignal::Terminate,
+                ProcSignal::Interrupt,
+                ProcSignal::Hangup,
+                ProcSignal::Kill,
+                ProcSignal::Stop,
+                ProcSignal::Continue,
+            ]
+        );
+        for (signal, number) in expected {
+            assert_eq!(signal_number(signal), number);
+        }
+    }
+}
+
+#[cfg(all(test, windows))]
+mod windows_signal_tests {
+    use super::*;
+
+    #[test]
+    fn windows_refuses_non_terminate_before_opening_process() {
+        assert_eq!(
+            signal_identity_inner(
+                0,
+                ProcStart {
+                    secs: 1,
+                    ticks: None,
+                },
+                ProcSignal::Hangup,
+            ),
+            Err(SignalError::Failed(
+                "only terminate is available on Windows".into()
+            ))
+        );
+        assert_eq!(ProcSignal::menu(), &[ProcSignal::Terminate]);
     }
 }

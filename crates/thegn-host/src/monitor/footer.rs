@@ -59,10 +59,49 @@ pub(super) fn line(input: FooterInput<'_>) -> Line {
     // happen, so a pane-owned build is recognizably thegn's own.
     if let Some(c) = input.confirm {
         let msg = match c {
+            Confirm::SignalMenu { label, cursor, .. } => {
+                let menu = crate::platform::ProcSignal::menu();
+                let menu_key = |signal| match signal {
+                    crate::platform::ProcSignal::Terminate => 't',
+                    crate::platform::ProcSignal::Interrupt => 'i',
+                    crate::platform::ProcSignal::Hangup => 'h',
+                    crate::platform::ProcSignal::Kill => 'k',
+                    crate::platform::ProcSignal::Stop => 's',
+                    crate::platform::ProcSignal::Continue => 'c',
+                    crate::platform::ProcSignal::Quit => 'q',
+                    crate::platform::ProcSignal::User1 => '1',
+                    crate::platform::ProcSignal::User2 => '2',
+                };
+                let entries = menu
+                    .iter()
+                    .enumerate()
+                    .map(|(index, signal)| {
+                        let marker = if index == *cursor { '>' } else { ' ' };
+                        format!("{marker}{} {}", menu_key(*signal), signal.label())
+                    })
+                    .collect::<Vec<_>>()
+                    .join("  ");
+                return Line::split(
+                    vec![seg(
+                        Tok::Slot(S::Accent),
+                        format!("{label}: signal {entries}"),
+                    )],
+                    vec![ghost("up/down choose | enter select | esc cancel")],
+                );
+            }
             Confirm::Signal { label, stage, .. } => {
                 let verb = match stage {
                     crate::platform::ProcSignal::Terminate => "terminate",
                     crate::platform::ProcSignal::Kill => "KILL (no cleanup)",
+                    signal => {
+                        return Line::split(
+                            vec![seg(
+                                Tok::Slot(S::Accent),
+                                format!("send SIG{} to {label}?", signal.label()),
+                            )],
+                            vec![Seg::key("y"), ghost(" yes  "), Seg::key("n"), ghost(" no")],
+                        );
+                    }
                 };
                 format!("{verb} {label}?")
             }

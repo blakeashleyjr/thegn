@@ -277,6 +277,11 @@ and new/exited values unknown until their baselines are available.
   pinned, the signal is refused and the reason is shown in the footer. This is
   a local, terminal-only action: it is not exposed to the CLI, the control API,
   or any remote surface.
+- `X` opens the platform signal menu: TERM, INT, HUP, KILL, STOP and CONT on
+  Linux and macOS, or terminate on Windows. Choose by its letter or with the
+  arrow keys and Enter, then confirm with `y` or cancel with `n` / `Esc`; the
+  selected PID and start time are checked again before delivery. STOP pauses a
+  process and CONT resumes it; Windows supports termination only.
 - `=` opens a renice confirmation showing the current and proposed nice values.
   Use `+` / `-` to adjust within `-20..=19`, `y` to apply, or `n` / `Esc` to
   cancel. The selected PID and start time are checked again before applying;
