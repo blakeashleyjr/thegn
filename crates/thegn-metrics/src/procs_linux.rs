@@ -197,8 +197,9 @@ impl<F: ProcFs> ProcTable<F> {
                 self.refresh_existing(index, now, visible_now)?;
                 index += 1;
             } else {
-                self.open_new(index, pid, now, visible_now)?;
-                index += 1;
+                if self.open_new(index, pid, now, visible_now) {
+                    index += 1;
+                }
             }
             listed_index += 1;
         }
@@ -425,38 +426,37 @@ impl<F: ProcFs> ProcTable<F> {
         Ok(())
     }
 
-    fn open_new(&mut self, index: usize, pid: u32, now: Duration, visible: bool) -> io::Result<()> {
+    fn open_new(&mut self, index: usize, pid: u32, now: Duration, visible: bool) -> bool {
         let mut handle = match self.fs.open_stat(pid) {
             Ok(handle) => handle,
-            Err(error) if is_process_gone(&error) => return Ok(()),
-            Err(_) => return Ok(()),
+            Err(_) => return false,
         };
         let mut buffer = [0; STAT_BUFFER_CAP];
         let count = match self.fs.read_stat(&mut handle, &mut buffer) {
             Ok(count) => count,
             Err(error) if is_process_gone(&error) => {
                 self.fs.close_stat(handle);
-                return Ok(());
+                return false;
             }
             Err(_) => {
                 self.fs.close_stat(handle);
-                return Ok(());
+                return false;
             }
         };
         let Some(stat) = crate::procs_parse::parse_stat(&buffer[..count]) else {
             self.fs.close_stat(handle);
-            return Ok(());
+            return false;
         };
         if stat.pid != pid {
             self.fs.close_stat(handle);
-            return Ok(());
+            return false;
         }
         let metadata = initial_metadata(&mut self.fs, pid, &handle);
         let (uid, cmdline, cgroup) = match metadata {
             Ok(metadata) => metadata,
             Err(_) => {
                 self.fs.close_stat(handle);
-                return Ok(());
+                return false;
             }
         };
         let incoming_visible_at = if visible { now } else { Duration::ZERO };
@@ -483,7 +483,7 @@ impl<F: ProcFs> ProcTable<F> {
                 handle: kept_handle,
             },
         );
-        Ok(())
+        true
     }
 }
 
