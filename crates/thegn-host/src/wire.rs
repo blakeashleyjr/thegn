@@ -25,7 +25,7 @@ use thegn_core::termcaps::{ColorDepth, index_256_to_rgb, rgb_to_16, rgb_to_256};
 /// composed in truecolor; on a lesser terminal we quantize here — the single
 /// site every chrome + pane color flows through. `None` is handled by the
 /// caller (it skips color SGRs entirely), but maps to `Default` defensively.
-fn color_spec(c: ColorAttribute, depth: ColorDepth) -> termwiz::color::ColorSpec {
+pub(crate) fn color_spec(c: ColorAttribute, depth: ColorDepth) -> termwiz::color::ColorSpec {
     use termwiz::color::ColorSpec;
     if depth == ColorDepth::None {
         return ColorSpec::Default;
