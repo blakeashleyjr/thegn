@@ -18,9 +18,9 @@ fn process(pid: u32, ppid: u32, utime: u64, starttime: u64) -> FakeProcess {
     }
 }
 
-fn request(pane_pids: &[(u32, u32)]) -> ProcSampleRequest<'_> {
+fn request(pane_pids: &[(u32, u32)], rows: usize) -> ProcSampleRequest<'_> {
     ProcSampleRequest {
-        rows: 20,
+        rows,
         self_pid: 99,
         daemon_pid: None,
         pane_pids,
@@ -40,7 +40,7 @@ fn sampler_backend_samples_and_reset_clear_native_baseline_and_kept_handles() {
 
     let (first, successful) = sample_with(
         &mut native,
-        request(&panes),
+        request(&panes, 20),
         Instant::now(),
         20,
         &mut primed,
@@ -56,7 +56,7 @@ fn sampler_backend_samples_and_reset_clear_native_baseline_and_kept_handles() {
     native.table.fs_mut().reset_ops();
     let (second, successful) = sample_with(
         &mut native,
-        request(&panes),
+        request(&panes, 20),
         Instant::now() + Duration::from_secs(2),
         22,
         &mut primed,
@@ -93,7 +93,7 @@ fn sampler_backend_samples_and_reset_clear_native_baseline_and_kept_handles() {
 
     let (after_reset, successful) = sample_with(
         &mut native,
-        request(&panes),
+        request(&panes, 20),
         Instant::now() + Duration::from_secs(10),
         30,
         &mut primed,
@@ -115,7 +115,7 @@ fn native_projection_uses_pass_stat_and_keeps_the_722_pid_pass_bounded() {
 
     let (first, successful) = sample_with(
         &mut native,
-        request(&visible),
+        request(&visible, 40),
         Instant::now(),
         20,
         &mut primed,
@@ -126,7 +126,7 @@ fn native_projection_uses_pass_stat_and_keeps_the_722_pid_pass_bounded() {
 
     let (snapshot, successful) = sample_with(
         &mut native,
-        request(&visible),
+        request(&visible, 40),
         Instant::now() + Duration::from_secs(2),
         20,
         &mut primed,
@@ -152,7 +152,7 @@ fn native_projection_uses_pass_stat_and_keeps_the_722_pid_pass_bounded() {
     native.boot_time = None;
     let (without_btime, successful) = sample_with(
         &mut native,
-        request(&visible),
+        request(&visible, 40),
         Instant::now() + Duration::from_secs(4),
         20,
         &mut primed,
@@ -202,8 +202,13 @@ fn failed_list_does_not_mark_a_native_sampler_primed() {
         .fail_next_list(std::io::ErrorKind::PermissionDenied);
 
     let mut primed = false;
-    let (failed, successful) =
-        sample_with(&mut native, request(&[]), Instant::now(), 10, &mut primed);
+    let (failed, successful) = sample_with(
+        &mut native,
+        request(&[], 20),
+        Instant::now(),
+        10,
+        &mut primed,
+    );
     assert!(!successful);
     assert!(!failed.primed);
     assert!(!primed);
@@ -211,7 +216,7 @@ fn failed_list_does_not_mark_a_native_sampler_primed() {
 
     let (recovered, successful) = sample_with(
         &mut native,
-        request(&[]),
+        request(&[], 20),
         Instant::now() + Duration::from_secs(2),
         12,
         &mut primed,
@@ -226,8 +231,13 @@ fn native_projection_omits_zero_parent_pid() {
     fs.insert(1, process(1, 0, 10, 250));
     let mut native = NativeBackend::with(fs, 8, None, Some(100), Some(4096));
     let mut primed = false;
-    let (snapshot, successful) =
-        sample_with(&mut native, request(&[]), Instant::now(), 10, &mut primed);
+    let (snapshot, successful) = sample_with(
+        &mut native,
+        request(&[], 20),
+        Instant::now(),
+        10,
+        &mut primed,
+    );
 
     assert!(successful);
     assert_eq!(snapshot.procs.len(), 1);
