@@ -867,7 +867,7 @@ impl MonitorOverlay {
         }
     }
 
-    fn placed_panels(&self) -> Vec<board::Placed> {
+    fn placed_panels(&self) -> Vec<layout::Placed> {
         self.board.placed(&board::LegacyTab, self.body_rect())
     }
 }
