@@ -40,8 +40,6 @@ pub(crate) struct BaseTemp<F: HwmonFs = RealFs> {
     thermal: Vec<Slot<F::Handle>>,
     rediscover: bool,
     buffer: Vec<u8>,
-    #[cfg(test)]
-    reads: usize,
 }
 
 impl BaseTemp<RealFs> {
@@ -62,8 +60,6 @@ impl<F: HwmonFs> BaseTemp<F> {
             thermal: Vec::new(),
             rediscover: false,
             buffer: vec![0; 64],
-            #[cfg(test)]
-            reads: 0,
         }
     }
 
@@ -90,10 +86,6 @@ impl<F: HwmonFs> BaseTemp<F> {
             let Some(handle) = slot.handle.as_ref() else {
                 continue;
             };
-            #[cfg(test)]
-            {
-                self.reads += 1;
-            }
             match self.fs.pread(handle, &mut self.buffer) {
                 Ok(length) => {
                     if let Some(milli) = parse_milli(&self.buffer[..length])
@@ -155,10 +147,6 @@ impl<F: HwmonFs> BaseTemp<F> {
     fn read_thermal(&mut self, values: &mut Vec<(String, f32)>) {
         for slot in &mut self.thermal {
             if let Some(handle) = &slot.handle {
-                #[cfg(test)]
-                {
-                    self.reads += 1;
-                }
                 if let Ok(length) = self.fs.pread(handle, &mut self.buffer)
                     && let Some(milli) = parse_milli(&self.buffer[..length])
                     && let Some(value) = plausible_input(SensorKind::Temp, milli)
@@ -315,7 +303,7 @@ mod tests {
         files: BTreeMap<PathBuf, Vec<u8>>,
         dirs: Vec<PathBuf>,
         opens: Vec<PathBuf>,
-        reads: usize,
+        preads: Vec<PathBuf>,
         eio: Vec<PathBuf>,
     }
 
@@ -377,7 +365,7 @@ mod tests {
         }
 
         fn pread(&mut self, handle: &Self::Handle, buffer: &mut [u8]) -> io::Result<usize> {
-            self.reads += 1;
+            self.preads.push(handle.to_path_buf());
             if self.eio.iter().any(|path| path == handle) {
                 return Err(io::Error::from_raw_os_error(5));
             }
@@ -425,6 +413,13 @@ mod tests {
         BaseTemp::with_fs(fs, root)
     }
 
+    fn pread_count(fs: &FakeFs, path: &Path) -> usize {
+        fs.preads
+            .iter()
+            .filter(|read_path| read_path.as_path() == path)
+            .count()
+    }
+
     #[test]
     fn sysinfo_labels_values_sentinel_and_cpu_pick_match() {
         let mut reader = fixture();
@@ -450,10 +445,44 @@ mod tests {
                 .iter()
                 .all(|path| !path.ends_with("hwmon4/temp1_input"))
         );
-        assert_eq!(reader.reads, 5);
+        assert_eq!(
+            reader
+                .fs
+                .preads
+                .iter()
+                .filter(|path| path.ends_with("_input"))
+                .count(),
+            5
+        );
+        assert_eq!(
+            reader
+                .fs
+                .preads
+                .iter()
+                .filter(|path| path.ends_with("runtime_status"))
+                .count(),
+            1
+        );
         let second = reader.fill();
         assert_eq!(second, first);
-        assert_eq!(reader.reads, 10);
+        assert_eq!(
+            reader
+                .fs
+                .preads
+                .iter()
+                .filter(|path| path.ends_with("_input"))
+                .count(),
+            10
+        );
+        assert_eq!(
+            reader
+                .fs
+                .preads
+                .iter()
+                .filter(|path| path.ends_with("runtime_status"))
+                .count(),
+            2
+        );
         assert_eq!(
             reader
                 .fs
@@ -504,7 +533,8 @@ mod tests {
         let mut reader = fixture();
         reader.fill();
         let drive = Path::new("/fake/class/hwmon/hwmon4/temp1_input");
-        let initial_reads = reader.reads;
+        let gate = Path::new("/fake/class/hwmon/hwmon4/device/power/runtime_status");
+        let initial_reads = pread_count(&reader.fs, drive);
         reader.fs.put(
             "/fake/class/hwmon/hwmon4/device/power/runtime_status",
             b"active\n",
@@ -515,7 +545,7 @@ mod tests {
                 .iter()
                 .any(|(label, _)| label == "drivetemp temp1")
         );
-        let active_reads = reader.reads;
+        let active_reads = pread_count(&reader.fs, drive);
         reader.fs.put(
             "/fake/class/hwmon/hwmon4/device/power/runtime_status",
             b"suspended\n",
@@ -526,7 +556,7 @@ mod tests {
                 .iter()
                 .any(|(label, _)| label == "drivetemp temp1")
         );
-        assert_eq!(reader.reads, active_reads);
+        assert_eq!(pread_count(&reader.fs, drive), active_reads);
         reader.fs.put(
             "/fake/class/hwmon/hwmon4/device/power/runtime_status",
             b"active\n",
@@ -547,6 +577,7 @@ mod tests {
                 >= 2
         );
         assert!(active_reads > initial_reads);
+        assert_eq!(pread_count(&reader.fs, gate), 4);
     }
 
     #[test]
@@ -580,7 +611,15 @@ mod tests {
                 .count(),
             opened
         );
-        assert_eq!(reader.reads, 15);
+        assert_eq!(
+            reader
+                .fs
+                .preads
+                .iter()
+                .filter(|path| path.ends_with("_input"))
+                .count(),
+            15
+        );
     }
 
     #[test]
