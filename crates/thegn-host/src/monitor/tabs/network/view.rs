@@ -447,7 +447,8 @@ impl TabView for NetworkView<'_> {
 #[cfg(test)]
 mod tests {
     use super::{NetworkModel, Ring};
-    use crate::caps::{self, UnicodeLevel};
+    use crate::caps;
+    use thegn_core::termcaps::UnicodeLevel;
     use crate::telemetry::{ScaleMode, TelemetryHistory, Window};
     use termwiz::surface::Surface;
 

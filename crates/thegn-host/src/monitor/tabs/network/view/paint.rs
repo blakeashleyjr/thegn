@@ -719,7 +719,7 @@ fn paint_interface_sparks(model: &NetworkModel, surface: &mut Surface, body: Rec
     }
 }
 
-fn paint_interface_spark(
+pub(super) fn paint_interface_spark(
     ring: &super::Ring,
     peak: f32,
     x: usize,
