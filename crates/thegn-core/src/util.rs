@@ -1598,10 +1598,18 @@ pub fn git_out(dir: &Path, args: &[&str]) -> Option<String> {
     git_out_allow_empty(dir, args).filter(|s| !s.is_empty())
 }
 
+static GIT_SPAWNS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Number of git subprocess invocations made through [`git_out`] helpers.
+pub fn core_git_spawn_count() -> u64 {
+    GIT_SPAWNS.load(Ordering::Relaxed)
+}
+
 /// Run `git -C <dir> <args...>`, returning trimmed stdout on success — including
 /// **empty** stdout as `Some("")`. `None` means the command could not be run or
 /// exited non-zero, which is a different fact from an empty answer.
 pub fn git_out_allow_empty(dir: &Path, args: &[&str]) -> Option<String> {
+    GIT_SPAWNS.fetch_add(1, Ordering::Relaxed);
     let out = git_cmd(dir).args(args).output().ok()?;
     out.status
         .success()
