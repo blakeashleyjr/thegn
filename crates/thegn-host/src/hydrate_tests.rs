@@ -793,6 +793,8 @@ fn load_or_seed_session_registers_bootstrap_workspace() {
 
     assert!(seeded);
     assert_eq!(session.id, ws_str);
+    // The bootstrap row is written by the background DB writer now; wait for it.
+    assert!(crate::db_task::flush(std::time::Duration::from_secs(10)));
     let db = thegn_core::db::Db::open_at(&state_home.join("thegn/thegn.db")).unwrap();
     let rows = db.workspaces().unwrap();
     let row = rows
