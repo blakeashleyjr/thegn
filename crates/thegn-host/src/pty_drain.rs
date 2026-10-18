@@ -94,6 +94,14 @@ fn report_pane_connect_failure(cfg: &thegn_core::config::Config, wt: &str, known
     }
 }
 
+fn fast_fail_placement_known_local(
+    is_active_group: bool,
+    active_placement_kind: Option<&str>,
+    force_host: bool,
+) -> bool {
+    is_active_group && (active_placement_kind.is_none() || force_host)
+}
+
 /// Raw, unparsed PTY chunks awaiting their parse slice, per pane, FIFO within
 /// a pane (cross-pane order is unspecified — same as the shared channel
 /// today). Loop-persistent: leftovers carry to the next iteration.
@@ -1189,12 +1197,18 @@ fn handle_exit(ctx: &mut DrainCtx<'_>, id: u32, exit_code: Option<i32>) -> bool 
             // Resolve with the SAME config the respawn's `env_halt_reason` uses
             // (`keymap_config`), so the mark and the halt check agree.
             let worktree = &ctx.session.worktrees[gi].path;
-            // Hydration already resolved the active worktree's placement. A
-            // local/host placement needs no provider health mark, so skip the
-            // DB-backed lookup entirely on this fast-fail loop path.
-            let known_local = gi == ctx.session.active
-                && (ctx.model.active_placement_kind.is_none()
-                    || crate::agent::force_host_requested(worktree));
+            // This only skips the DB lookup for the ACTIVE group. A background
+            // tab's fast-fail still opens the DB twice on the loop, which is
+            // acceptable for this change. Also, placement is stale until
+            // hydration finishes after a cold switch: after local -> remote,
+            // a pane failing within 2s can skip the provider-health mark for
+            // one cycle, delaying the failover-off halt by one respawn. The
+            // model has no hydrated-worktree identity to guard this case.
+            let known_local = fast_fail_placement_known_local(
+                gi == ctx.session.active,
+                ctx.model.active_placement_kind.as_deref(),
+                crate::agent::force_host_requested(worktree),
+            );
             report_pane_connect_failure(ctx.keymap_config, worktree, known_local);
         }
         {
@@ -1689,14 +1703,33 @@ mod tests {
     use thegn_core::store::NotificationStore;
 
     #[test]
+    fn fast_fail_placement_known_local_only_skips_known_local_active_groups() {
+        let cases = [
+            (true, None, false, true),
+            (true, Some("ssh"), false, false),
+            (true, Some("ssh"), true, true),
+            (false, None, false, false),
+        ];
+
+        for (is_active_group, placement_kind, force_host, expected) in cases {
+            assert_eq!(
+                fast_fail_placement_known_local(is_active_group, placement_kind, force_host),
+                expected,
+                "active={is_active_group}, placement={placement_kind:?}, force_host={force_host}"
+            );
+        }
+    }
+
+    #[test]
     fn local_fast_exit_respawns_do_not_open_the_database() {
         let state = thegn_core::testenv::IsolatedState::new();
         let cfg = thegn_core::config::Config::default();
         let worktree = state.root().join("local-worktree");
         let worktree = worktree.to_string_lossy().into_owned();
 
+        let known_local = fast_fail_placement_known_local(true, None, false);
         for _ in 0..8 {
-            report_pane_connect_failure(&cfg, &worktree, true);
+            report_pane_connect_failure(&cfg, &worktree, known_local);
         }
 
         assert!(
