@@ -8,7 +8,7 @@ use std::sync::{Arc, Mutex, mpsc};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
-use notify::{Event, EventKind, RecursiveMode, Watcher, recommended_watcher};
+use notify::{Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 use termwiz::terminal::TerminalWaker;
 use tokio::sync::mpsc as tokio_mpsc;
 
@@ -257,19 +257,22 @@ fn worker(
         tracing::warn!(target: "thegn::theme", error = %error, "theme directory unavailable");
     }
     let watcher_shutdown = Arc::clone(&shutdown);
-    let watcher_result = recommended_watcher(move |result: notify::Result<Event>| {
-        if watcher_shutdown.load(Ordering::Acquire) {
-            return;
-        }
-        if result.is_ok_and(|event| {
-            matches!(
-                event.kind,
-                EventKind::Create(_) | EventKind::Modify(_) | EventKind::Remove(_)
-            )
-        }) {
-            let _ = watcher_tx.send(Work::Changed);
-        }
-    });
+    let watcher_result = RecommendedWatcher::new(
+        move |result: notify::Result<Event>| {
+            if watcher_shutdown.load(Ordering::Acquire) {
+                return;
+            }
+            if result.is_ok_and(|event| {
+                matches!(
+                    event.kind,
+                    EventKind::Create(_) | EventKind::Modify(_) | EventKind::Remove(_)
+                )
+            }) {
+                let _ = watcher_tx.send(Work::Changed);
+            }
+        },
+        crate::diff_watch::watcher_config(),
+    );
     let mut watcher = match watcher_result {
         Ok(watcher) => Some(watcher),
         Err(error) => {
