@@ -10757,6 +10757,11 @@ async fn event_loop<T: Terminal>(
                     model.status = status;
                     dirty = true;
                 }
+                run_pending_db::PendingDbResult::PoolTarget { status } => {
+                    model.status = status;
+                    last_pool_reconcile = None;
+                    dirty = true;
+                }
             }
         }
         let active_tests_wt = active_tab_path(&session).to_string_lossy().into_owned();
@@ -23199,21 +23204,7 @@ async fn event_loop<T: Terminal>(
                                 Some((wt, port)) => {
                                     let stopped = share_supervisor.stop(&wt, Some(port));
                                     let did_stop = !stopped.is_empty();
-                                    let stopped_runs = stopped;
-                                    crate::db_task::persist(move |db| {
-                                        for (port, generation) in stopped_runs {
-                                            match db.delete_share_generation(&wt, port, generation)
-                                            {
-                                                Ok(true) => {}
-                                                Ok(false) => {
-                                                    tracing::debug!(target: "thegn::db", %wt, port, generation, "stale stopped share delete left another generation intact")
-                                                }
-                                                Err(error) => {
-                                                    tracing::debug!(target: "thegn::db", %error, "stopped share cache delete failed")
-                                                }
-                                            }
-                                        }
-                                    });
+                                    crate::handlers::host::queue_stopped_share_deletes(wt, stopped);
                                     model.shares = current_share_views(&share_supervisor, &session);
                                     model.status = if !did_stop {
                                         format!("Share :{port} was already down")
@@ -24866,9 +24857,10 @@ async fn event_loop<T: Terminal>(
                                     &session,
                                     &current_config,
                                     delta,
+                                    &pending_db_tx,
+                                    &waker,
                                 ) {
                                     model.status = msg;
-                                    last_pool_reconcile = None; // reconcile immediately
                                 }
                             }
                             Action::TogglePanel => {
