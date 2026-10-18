@@ -2,7 +2,7 @@
 use std::collections::VecDeque;
 use std::fs;
 use std::io;
-use std::net::{IpAddr, Ipv4Addr};
+use std::net::{IpAddr};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -99,8 +99,9 @@ impl CookieDelta {
             entry.tombstone = false;
 
             if let Some(cgroup_id) = socket.cgroup_id {
-                let tracked = match self.totals.iter_mut().find(|owner| owner.0 == cgroup_id) {
-                    Some(owner) => {
+                let tracked = match self.totals.iter().position(|owner| owner.0 == cgroup_id) {
+                    Some(index) => {
+                        let owner = &mut self.totals[index];
                         owner.1 = owner.1.saturating_add(rx_delta);
                         owner.2 = owner.2.saturating_add(tx_delta);
                         true
@@ -306,12 +307,14 @@ impl<F: CgroupFs> OwnerTable<F> {
                 use std::os::unix::ffi::OsStrExt;
                 let path_bytes: Arc<[u8]> = Arc::from(path.as_os_str().as_bytes());
                 let classified = cgroup_classify::classify(&path_bytes);
+                let kind = classified.kind;
+                let name: Arc<str> = Arc::from(classified.name);
                 self.paths.push(OwnerLabel {
                     id: inode,
                     path: path.clone(),
                     path_bytes,
-                    kind: classified.kind,
-                    name: Arc::from(classified.name),
+                    kind,
+                    name,
                 });
             }
             self.children.clear();
