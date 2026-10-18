@@ -127,10 +127,10 @@ fn masthead_covers_a_simulated_day_in_t2_and_last_hour_in_t1() {
         Some(expected_covered_secs)
     );
     let day = read(&history, id, Tier::T2, now - 86_400_000, now);
-    assert_eq!(day.len(), now / 60_000 - (now - 86_400_000) / 60_000);
+    assert_eq!(day.len() as u64, now / 60_000 - (now - 86_400_000) / 60_000);
     assert!(day.iter().all(|row| row.mean.is_finite()));
     let hour = read(&history, id, Tier::T1, now - 3_600_000, now);
-    assert_eq!(hour.len(), now / 5_000 - (now - 3_600_000) / 5_000);
+    assert_eq!(hour.len() as u64, now / 5_000 - (now - 3_600_000) / 5_000);
     assert!(hour.iter().all(|row| row.mean.is_finite()));
 }
 
