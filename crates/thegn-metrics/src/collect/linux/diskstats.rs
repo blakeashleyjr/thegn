@@ -45,7 +45,6 @@ pub struct DiskstatsCollector {
     topology: Topology,
     interner: Interner,
     ids: HashMap<String, InstanceId>,
-    names: HashMap<String, Arc<str>>,
     rates: HashMap<String, Rates>,
     aggregate_rates: AggregateRates,
     last_scan: u64,
@@ -61,7 +60,6 @@ impl DiskstatsCollector {
             topology: Topology::default(),
             interner: Interner::new(Family::BlockDev),
             ids: HashMap::new(),
-            names: HashMap::new(),
             rates: HashMap::new(),
             aggregate_rates: AggregateRates::default(),
             last_scan: 0,
@@ -94,7 +92,6 @@ impl DiskstatsCollector {
                 if let Some(id) = self.ids.remove(&name) {
                     self.interner.retire(id);
                 }
-                self.names.remove(&name);
                 self.rates.remove(&name);
             }
         }
@@ -103,8 +100,6 @@ impl DiskstatsCollector {
                 && let Interned::Id(id) = self.interner.intern(&dev.name)
             {
                 self.ids.insert(dev.name.to_string(), id);
-                self.names
-                    .insert(dev.name.to_string(), Arc::clone(&dev.name));
                 self.rates.insert(dev.name.to_string(), Rates::default());
             }
         }
@@ -124,7 +119,6 @@ impl Collector for DiskstatsCollector {
             Ok(file) => {
                 self.file = Some(file);
                 self.topology = Topology::default();
-                self.topology_rev = 0;
                 self.scan(0);
                 Health::Warming
             }
@@ -157,9 +151,14 @@ impl Collector for DiskstatsCollector {
         let first = rows.next();
         let empty = first.is_none();
         let unknown = first.into_iter().chain(rows).any(|row| {
+            let Ok(name) = std::str::from_utf8(row.name) else {
+                return false;
+            };
             !self
-                .ids
-                .contains_key(std::str::from_utf8(row.name).unwrap_or(""))
+                .topology
+                .devs
+                .iter()
+                .any(|dev| dev.name.as_ref() == name)
         });
         if empty {
             return Err(CollectError::Parse("/proc/diskstats"));
@@ -194,9 +193,20 @@ impl Collector for DiskstatsCollector {
             else {
                 continue;
             };
-            let Some(id) = self.ids.get(name).copied() else {
-                part.truncated = true;
-                continue;
+            let id = if let Some(id) = self.ids.get(name).copied() {
+                id
+            } else {
+                match self.interner.intern(name) {
+                    Interned::Id(id) => {
+                        self.ids.insert(name.to_owned(), id);
+                        self.rates.insert(name.to_owned(), Rates::default());
+                        id
+                    }
+                    Interned::Other => {
+                        part.truncated = true;
+                        continue;
+                    }
+                }
             };
             let Some(rates) = self.rates.get_mut(name) else {
                 continue;
@@ -215,7 +225,7 @@ impl Collector for DiskstatsCollector {
             let util = rates
                 .io_ticks
                 .rate(row.io_ticks, ctx.now_ms)
-                .map(|v| v.min(100.0));
+                .map(|v| (v / 10.0).min(100.0));
             part.devices.push(DiskDevice {
                 id,
                 name: Arc::clone(&dev.name),
@@ -253,7 +263,6 @@ impl Collector for DiskstatsCollector {
             });
             let Some((name, id)) = vanished else { break };
             self.ids.remove(&name);
-            self.names.remove(&name);
             self.rates.remove(&name);
             self.interner.retire(id);
         }
@@ -294,7 +303,6 @@ impl Collector for DiskstatsCollector {
         self.file = None;
         self.rates.clear();
         self.ids.clear();
-        self.names.clear();
         self.topology = Topology::default();
         self.interner = Interner::new(Family::BlockDev);
         self.aggregate_rates = AggregateRates::default();
@@ -343,21 +351,34 @@ mod tests {
         let sys = dir.path().join("sys/block");
         fs::create_dir_all(sys.join("sda/device")).unwrap();
         fs::write(sys.join("sda/dev"), "8:0\n").unwrap();
+        fs::create_dir_all(sys.join("nvme0n1/device")).unwrap();
+        fs::write(sys.join("nvme0n1/dev"), "259:0\n").unwrap();
+        fs::create_dir_all(sys.join("nvme0n1/nvme0n1p1")).unwrap();
+        fs::write(sys.join("nvme0n1/nvme0n1p1/partition"), "1\n").unwrap();
+        fs::write(sys.join("nvme0n1/nvme0n1p1/dev"), "259:1\n").unwrap();
         fs::create_dir_all(sys.join("loop0")).unwrap();
         fs::write(sys.join("loop0/dev"), "7:0\n").unwrap();
+        for (name, major, minor) in [("dm-0", 254, 0), ("zram0", 253, 0)] {
+            fs::create_dir_all(sys.join(name)).unwrap();
+            fs::write(sys.join(name).join("dev"), format!("{major}:{minor}\n")).unwrap();
+        }
         let proc = dir.path().join("diskstats");
         let row = |name: &str, major: u32, minor: u32, sectors: u64, io_ms: u64| {
             format!(
-                "{major} {minor} {name} 1 0 {sectors} 1 1 0 {} 1 0 {io_ms} 10 0 0 0 0 0\n",
+                "{major} {minor} {name} 1 0 {sectors} 1 1 0 {} 1 0 {io_ms} 10 0 0 0 0 0 0\n",
                 sectors.saturating_mul(2)
             )
         };
         fs::write(
             &proc,
             format!(
-                "{}{}",
+                "{}{}{}{}{}{}",
                 row("sda", 8, 0, 10, 10),
-                row("loop0", 7, 0, 100, 10)
+                row("loop0", 7, 0, 100, 10),
+                row("nvme0n1", 259, 0, 10, 10),
+                row("nvme0n1p1", 259, 1, 30_000, 10),
+                row("dm-0", 254, 0, 40_000, 10),
+                row("zram0", 253, 0, 50_000, 10)
             ),
         )
         .unwrap();
@@ -378,9 +399,13 @@ mod tests {
         fs::write(
             &proc,
             format!(
-                "{}{}",
-                row("sda", 8, 0, 12, 2_010),
-                row("loop0", 7, 0, 900, 2_010)
+                "{}{}{}{}{}{}",
+                row("sda", 8, 0, 12, 510),
+                row("loop0", 7, 0, 900, 2_010),
+                row("nvme0n1", 259, 0, 12, 2_010),
+                row("nvme0n1p1", 259, 1, 30_000, 2_010),
+                row("dm-0", 254, 0, 40_000, 2_010),
+                row("zram0", 253, 0, 50_000, 2_010)
             ),
         )
         .unwrap();
@@ -406,15 +431,41 @@ mod tests {
                 .read_bps,
             Some(1024.0)
         );
-        assert_eq!(frame.parts.diskstats.aggregate.read_bps, Some(1024.0));
-        assert_eq!(frame.parts.diskstats.physical, 1);
-        assert_eq!(frame.parts.diskstats.devices[0].util_pct, Some(100.0));
+        assert_eq!(
+            frame
+                .parts
+                .diskstats
+                .devices
+                .iter()
+                .find(|dev| dev.name.as_ref() == "nvme0n1")
+                .unwrap()
+                .read_bps,
+            Some(1024.0)
+        );
+        assert_eq!(frame.parts.diskstats.aggregate.read_bps, Some(2048.0));
+        assert_eq!(frame.parts.diskstats.physical, 2);
+        assert_eq!(
+            frame
+                .parts
+                .diskstats
+                .devices
+                .iter()
+                .find(|dev| dev.name.as_ref() == "sda")
+                .unwrap()
+                .util_pct,
+            Some(50.0)
+        );
+        assert_eq!(frame.parts.diskstats.aggregate.sectors_read_total, 24);
         fs::write(
             &proc,
             format!(
-                "{}{}",
+                "{}{}{}{}{}{}",
                 row("sda", 8, 0, 5, 2_010),
-                row("loop0", 7, 0, 900, 2_010)
+                row("loop0", 7, 0, 900, 2_010),
+                row("nvme0n1", 259, 0, 12, 2_010),
+                row("nvme0n1p1", 259, 1, 30_000, 2_010),
+                row("dm-0", 254, 0, 40_000, 2_010),
+                row("zram0", 253, 0, 50_000, 2_010)
             ),
         )
         .unwrap();
@@ -427,13 +478,38 @@ mod tests {
                 &mut frame,
             )
             .unwrap();
-        assert_eq!(frame.parts.diskstats.devices[0].read_bps, None);
+        assert_eq!(
+            frame
+                .parts
+                .diskstats
+                .devices
+                .iter()
+                .find(|dev| dev.name.as_ref() == "sda")
+                .unwrap()
+                .read_bps,
+            None
+        );
+        assert_eq!(
+            frame
+                .parts
+                .diskstats
+                .devices
+                .iter()
+                .find(|dev| dev.name.as_ref() == "sda")
+                .unwrap()
+                .util_pct,
+            Some(100.0)
+        );
         fs::write(
             &proc,
             format!(
-                "{}{}",
+                "{}{}{}{}{}{}",
                 row("sda", 8, 0, 7, 2_010),
-                row("loop0", 7, 0, 900, 2_010)
+                row("loop0", 7, 0, 900, 2_010),
+                row("nvme0n1", 259, 0, 12, 2_010),
+                row("nvme0n1p1", 259, 1, 30_000, 2_010),
+                row("dm-0", 254, 0, 40_000, 2_010),
+                row("zram0", 253, 0, 50_000, 2_010)
             ),
         )
         .unwrap();
@@ -457,7 +533,7 @@ mod tests {
         fs::write(sys.join("sda/dev"), "8:0\n").unwrap();
         let proc = dir.path().join("diskstats");
         let row = |name: &str, minor: u32, sectors: u64| {
-            format!("8 {minor} {name} 1 0 {sectors} 1 1 0 {sectors} 1 0 10 10 0 0 0 0 0\n")
+            format!("8 {minor} {name} 1 0 {sectors} 1 1 0 {sectors} 1 0 10 10 0 0 0 0 0 0\n")
         };
         fs::write(&proc, row("sda", 0, 10)).unwrap();
         let mut collector = DiskstatsCollector::at(&proc, &sys);
@@ -536,29 +612,22 @@ mod tests {
                 &mut frame,
             )
             .unwrap();
+        assert_eq!(
+            frame
+                .parts
+                .diskstats
+                .devices
+                .iter()
+                .find(|dev| dev.name.as_ref() == "sdb")
+                .unwrap()
+                .read_bps,
+            None
+        );
         collector
             .sample(
                 &TickCtx {
                     tick: 6,
                     now_ms: 6000,
-                },
-                &mut frame,
-            )
-            .unwrap();
-        collector
-            .sample(
-                &TickCtx {
-                    tick: 7,
-                    now_ms: 7001,
-                },
-                &mut frame,
-            )
-            .unwrap();
-        collector
-            .sample(
-                &TickCtx {
-                    tick: 8,
-                    now_ms: 8001,
                 },
                 &mut frame,
             )
@@ -572,7 +641,44 @@ mod tests {
                 .find(|dev| dev.name.as_ref() == "sdb")
                 .unwrap()
                 .read_bps,
-            None
+            Some(0.0)
         );
+    }
+
+    #[test]
+    fn periodic_rescan_runs_after_sixty_seconds() {
+        let dir = tempfile::tempdir().unwrap();
+        let sys = dir.path().join("sys/block");
+        fs::create_dir_all(sys.join("sda/device")).unwrap();
+        fs::write(sys.join("sda/dev"), "8:0\n").unwrap();
+        let proc = dir.path().join("diskstats");
+        fs::write(&proc, "8 0 sda 1 0 1 1 1 0 1 1 0 10 10 0 0 0 0 0 0\n").unwrap();
+        let mut collector = DiskstatsCollector::at(&proc, &sys);
+        collector.discover(&Env::default());
+        let first_rev = collector.topology_rev;
+        let mut frame = MonitorFrame::default();
+        collector
+            .sample(
+                &TickCtx {
+                    tick: 1,
+                    now_ms: 1_000,
+                },
+                &mut frame,
+            )
+            .unwrap();
+        fs::write(sys.join("sda/dev"), "8:1\n").unwrap();
+        collector
+            .sample(
+                &TickCtx {
+                    tick: 2,
+                    now_ms: 60_001,
+                },
+                &mut frame,
+            )
+            .unwrap();
+        assert!(frame.parts.diskstats.topology_rev > first_rev);
+        let sampled_rev = frame.parts.diskstats.topology_rev;
+        assert_eq!(collector.discover(&Env::default()), Health::Warming);
+        assert!(collector.topology_rev > sampled_rev);
     }
 }

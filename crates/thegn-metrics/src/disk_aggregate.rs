@@ -1,8 +1,9 @@
 //! Compatibility shim for the base-tier disk sampler; shared parsing lives in collect readers.
 use crate::DiskInfo;
-use std::time::Instant;
 #[cfg(any(target_os = "linux", test))]
 use crate::DiskKind;
+#[cfg(target_os = "linux")]
+use std::time::Instant;
 
 #[cfg(any(target_os = "linux", test))]
 pub(crate) fn parse_diskstats_line(line: &[u8]) -> Option<(&[u8], u64, u64)> {
@@ -19,10 +20,12 @@ pub(crate) fn parse_diskstats_line(line: &[u8]) -> Option<(&[u8], u64, u64)> {
 #[cfg(any(target_os = "linux", test))]
 pub(crate) fn sum_physical(buf: &[u8], names: &[String]) -> (u64, u64) {
     let (mut read, mut written) = (0_u64, 0_u64);
-    for row in crate::collect::parse::diskstats::lines(buf) {
-        if names.iter().any(|name| name.as_bytes() == row.name) {
-            read = read.saturating_add(row.sectors_read.saturating_mul(512));
-            written = written.saturating_add(row.sectors_written.saturating_mul(512));
+    for line in buf.split(|byte| *byte == b'\n') {
+        if let Some((name, sectors_read, sectors_written)) = parse_diskstats_line(line)
+            && names.iter().any(|disk| disk.as_bytes() == name)
+        {
+            read = read.saturating_add(sectors_read.saturating_mul(512));
+            written = written.saturating_add(sectors_written.saturating_mul(512));
         }
     }
     (read, written)
@@ -32,9 +35,7 @@ pub(crate) fn sum_physical(buf: &[u8], names: &[String]) -> (u64, u64) {
 pub(crate) use crate::collect::linux::disk_topology::physical_disks;
 
 #[cfg(any(target_os = "linux", test))]
-pub(crate) use crate::collect::parse::mountinfo::{
-    MountRow, group_mounts, parse_mountinfo,
-};
+pub(crate) use crate::collect::parse::mountinfo::{MountRow, group_mounts, parse_mountinfo};
 
 #[cfg(any(target_os = "linux", test))]
 pub(crate) fn rate(prev: (u64, u64), cur: (u64, u64), dt: f64) -> Option<(u64, u64)> {
@@ -302,7 +303,7 @@ mod tests {
             physical_disks(root.path()),
             vec!["nvme0n1".to_string(), "sda".to_string()]
         );
-        let stats = b"259 0 nvme0n1 1 0 10 0 1 0 20 0 0 0 0 0 0 0 0 0 0\n259 5 nvme0n1p5 1 0 100 0 1 0 200 0 0 0 0 0 0 0 0 0 0\n253 0 dm-0 1 0 300 0 1 0 400 0 0 0 0 0 0 0 0 0 0\n252 0 zram0 1 0 500 0 1 0 600 0 0 0 0 0 0 0 0 0 0\n8 0 sda 1 0 30 0 1 0 40 0 0 0 0 0 0 0 0 0 0\n8 1 sda1 1 0 300 0 1 0 400 0 0 0 0 0 0 0 0 0 0";
+        let stats = b"259 0 nvme0n1 1 0 10 0 1 0 20 0 0 0 0 0 0 0 0 0 0\n259 5 nvme0n1p5 1 0 100 0 1 0 200 0 0 0 0 0 0 0 0 0 0\n253 0 dm-0 1 0 300 0 1 0 400 0 0 0 0 0 0 0 0 0 0\n252 0 zram0 1 0 500 0 1 0 600 0 0 0 0 0 0 0 0 0 0\n8 0 sda 1 0 30 0 1 0 40 0 0 0 0 0 0 0 0 0 0\n8 1 sda1 1 0 300 0 1 0 400 0 0 0 0 0 0 0 0 0 0\n8 0 sda 1 0 900 0 1 0 900 0 0 0 0 0 0 0 0 0 0 0";
         assert_eq!(
             sum_physical(stats, &physical_disks(root.path())),
             (40 * 512, 60 * 512)

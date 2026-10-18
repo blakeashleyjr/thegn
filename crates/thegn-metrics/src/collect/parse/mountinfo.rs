@@ -19,20 +19,25 @@ pub fn parse_line(line: &[u8]) -> Option<MountLine<'_>> {
     let sep = line.windows(3).position(|w| w == b" - ")?;
     let (left, right_with_sep) = line.split_at(sep);
     let right = &right_with_sep[3..];
-    let left: Vec<_> = fields(left).collect();
-    let right: Vec<_> = fields(right).collect();
-    let (major, minor) = super::cgroup::maj_min(left.get(2)?)?;
+    let mut left = fields(left);
+    let mount_id = u32::try_from(parse_u64(left.next()?)?).ok()?;
+    let parent_id = u32::try_from(parse_u64(left.next()?)?).ok()?;
+    let (major, minor) = super::cgroup::maj_min(left.next()?)?;
+    let root = left.next()?;
+    let mount_point = left.next()?;
+    let options = left.next()?;
+    let mut right = fields(right);
     Some(MountLine {
-        mount_id: u32::try_from(parse_u64(*left.first()?)?).ok()?,
-        parent_id: u32::try_from(parse_u64(*left.get(1)?)?).ok()?,
+        mount_id,
+        parent_id,
         major,
         minor,
-        root: *left.get(3)?,
-        mount_point: *left.get(4)?,
-        options: *left.get(5)?,
-        fstype: *right.first()?,
-        source: *right.get(1)?,
-        super_options: *right.get(2)?,
+        root,
+        mount_point,
+        options,
+        fstype: right.next()?,
+        source: right.next()?,
+        super_options: right.next()?,
     })
 }
 
@@ -159,6 +164,12 @@ mod tests {
         assert_eq!(output, b"a b\tc\nd\\e\\999");
         let rows =
             parse_mountinfo("1 0 0:35 /@home /a rw - btrfs dev rw\n2 0 0:35 / / rw - btrfs dev rw");
-        assert_eq!(group_mounts(rows).len(), 1);
+        let rows = group_mounts(rows);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].1, 1);
+        let escaped =
+            parse_mountinfo("3 0 8:1 / /mnt/a\\040(deleted) rw - ext4 /dev/disk\\040name rw");
+        assert_eq!(escaped[0].mount, "/mnt/a (deleted)");
+        assert_eq!(escaped[0].source, "/dev/disk name");
     }
 }
