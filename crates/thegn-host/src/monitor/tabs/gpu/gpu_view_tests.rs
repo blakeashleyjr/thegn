@@ -131,7 +131,9 @@ fn power_history_normalizes_milliwatts_against_watt_limit() {
     model.absorb_frame(&sample);
 
     let history = &model.histories[0];
-    let latest = history.power[(history.power_next + HISTORY_CAP - 1) % HISTORY_CAP];
+    let mut power = [0.0_f32; HISTORY_CAP];
+    let power_len = history.power.ordered_into(&mut power);
+    let latest = power[power_len - 1];
     assert!((latest - 0.62).abs() < 0.01);
 }
 
@@ -399,11 +401,11 @@ fn busy_history_is_slot_keyed_bounded_and_reuses_capacity_after_warmup() {
         "1000 warm GPU absorbs reallocated: {counts:?}"
     );
     assert_eq!(model.histories.len(), 1);
-    assert_eq!(model.histories[0].len, 480);
-    assert_eq!(model.histories[0].memory_len, 480);
-    assert_eq!(model.histories[0].gtt_len, 480);
-    assert_eq!(model.histories[0].clocks_len, 480);
-    assert_eq!(model.histories[0].power_len, 480);
+    assert_eq!(model.histories[0].busy.len(), 480);
+    assert_eq!(model.histories[0].memory.len(), 480);
+    assert_eq!(model.histories[0].gtt.len(), 480);
+    assert_eq!(model.histories[0].clocks.len(), 480);
+    assert_eq!(model.histories[0].power.len(), 480);
     assert!(
         model.histories[0]
             .activity
@@ -415,11 +417,13 @@ fn busy_history_is_slot_keyed_bounded_and_reuses_capacity_after_warmup() {
     assert_eq!(model.engines.devices.capacity(), engine_capacity);
     assert_eq!(model.smu.cards.capacity(), smu_capacity);
     assert_eq!(capacity, history_capacity);
-    let first =
-        model.histories[0].values[(model.histories[0].next + HISTORY_CAP - 1) % HISTORY_CAP];
+    let mut busy = [0.0_f32; HISTORY_CAP];
+    model.histories[0].busy.ordered_into(&mut busy);
+    let first = busy[HISTORY_CAP - 1];
     model.absorb_frame(&fixture(1_001, GpuKind::Apu, RuntimeStatus::Active));
     assert_eq!(model.histories.capacity(), capacity);
-    let last = model.histories[0].values[(model.histories[0].next + HISTORY_CAP - 1) % HISTORY_CAP];
+    model.histories[0].busy.ordered_into(&mut busy);
+    let last = busy[HISTORY_CAP - 1];
     assert_ne!(first, last);
 
     let mut frame = fixture(1_002, GpuKind::Apu, RuntimeStatus::Active);
@@ -429,14 +433,14 @@ fn busy_history_is_slot_keyed_bounded_and_reuses_capacity_after_warmup() {
     model.absorb_frame(&frame);
     assert_eq!(model.histories.len(), 1);
     assert_eq!(model.histories[0].slot, "0000:05:00.0");
-    assert_eq!(model.histories[0].len, 0);
+    assert_eq!(model.histories[0].busy.len(), 0);
     assert!(model.histories[0].activity.iter().all(|ring| ring.len == 0));
     frame.parts.gpu_engines.devices[0].slot =
         GpuSlot::new("0000:06:00.0").expect("valid replacement slot");
     model.absorb_frame(&frame);
     assert_eq!(model.histories.len(), 1);
     assert_eq!(model.histories[0].slot, "0000:06:00.0");
-    assert_eq!(model.histories[0].len, 0);
+    assert_eq!(model.histories[0].busy.len(), 0);
 }
 
 #[test]
@@ -500,7 +504,7 @@ fn aux_history_draws_each_device_and_activity_rings_require_verified_layout() {
             .iter()
             .all(|ring| ring.len == 0)
     );
-    assert_eq!(unverified_model.histories[0].power_len, 1);
+    assert_eq!(unverified_model.histories[0].power.len(), 1);
 }
 
 #[test]
@@ -594,6 +598,96 @@ fn implausible_activity_is_blank_and_suspended_frames_do_not_push() {
     let suspended = fixture(4, GpuKind::Apu, RuntimeStatus::Suspended);
     model.absorb_frame(&suspended);
     assert_eq!(model.histories[0].activity[0].len, 3);
+}
+
+#[test]
+fn missing_aux_readings_keep_time_alignment_and_paint_blank_gaps() {
+    let mut warmup = GpuModel::default();
+    let mut first_missing = fixture(0, GpuKind::Apu, RuntimeStatus::Active);
+    first_missing.parts.gpu_engines.devices[0].vram_used = None;
+    first_missing.parts.gpu_engines.devices[0].gtt_used = None;
+    first_missing.parts.gpu_engines.devices[0].sclk.current_mhz = None;
+    first_missing.parts.amd_smu.cards[0].metrics.power_socket = None;
+    warmup.absorb_frame(&first_missing);
+    assert!(warmup.histories[0].memory.is_empty());
+    assert!(warmup.histories[0].gtt.is_empty());
+    assert!(warmup.histories[0].clocks.is_empty());
+    assert!(warmup.histories[0].power.is_empty());
+
+    let mut model = GpuModel::default();
+    model.absorb_frame(&fixture(1, GpuKind::Apu, RuntimeStatus::Active));
+    for tick in 2..5 {
+        let mut missing = fixture(tick, GpuKind::Apu, RuntimeStatus::Active);
+        missing.parts.gpu_engines.devices[0].vram_used = None;
+        missing.parts.gpu_engines.devices[0].gtt_used = None;
+        missing.parts.gpu_engines.devices[0].sclk.current_mhz = None;
+        missing.parts.amd_smu.cards[0].metrics.power_socket = None;
+        model.absorb_frame(&missing);
+    }
+    model.absorb_frame(&fixture(5, GpuKind::Apu, RuntimeStatus::Active));
+
+    let history = &model.histories[0];
+    assert_eq!(history.memory.len(), history.busy.len());
+    assert_eq!(history.gtt.len(), history.busy.len());
+    assert_eq!(history.clocks.len(), history.busy.len());
+    assert_eq!(history.power.len(), history.busy.len());
+    let mut memory = [0.0_f32; HISTORY_CAP];
+    let len = history.memory.ordered_into(&mut memory);
+    assert_eq!(len, 5);
+    assert!(memory[0].is_finite());
+    assert!(memory[1..4].iter().all(|value| value.is_nan()));
+    assert!(memory[4].is_finite());
+
+    let mut surface = Surface::new(160, 45);
+    let rect = Rect::full(160, 45);
+    GpuView(&model).paint_aux_history(&mut surface, rect, rect, true);
+    let graph = crate::monitor::kit::history_rect::graph_rect(
+        Rect {
+            x: 28,
+            y: 2,
+            cols: 132,
+            rows: 41,
+        },
+        len,
+        crate::monitor::graphs::table().braille,
+    );
+    let gap_col = graph.x
+        + if crate::monitor::graphs::table().braille {
+            1
+        } else {
+            2
+        };
+    for line in surface.screen_lines().iter().skip(graph.y).take(graph.rows) {
+        let cell = line
+            .visible_cells()
+            .find(|cell| cell.cell_index() == gap_col)
+            .expect("gap graph column exists");
+        assert!(
+            cell.str() == " " || cell.str() == "\u{2800}",
+            "missing sample column must be blank, got {:?}",
+            cell.str()
+        );
+    }
+    let screen_lines = surface.screen_lines();
+    for col in [graph.x, graph.x + graph.cols - 1] {
+        let painted = screen_lines
+            .iter()
+            .skip(graph.y)
+            .take(graph.rows)
+            .any(|line| {
+                line.visible_cells()
+                    .find(|cell| cell.cell_index() == col)
+                    .is_some_and(|cell| cell.str() != " " && cell.str() != "\u{2800}")
+            });
+        assert!(painted, "present sample column must be painted at {col}");
+    }
+    let mut suspended = fixture(6, GpuKind::Apu, RuntimeStatus::Suspended);
+    suspended.parts.gpu_engines.devices[0].vram_used = None;
+    model.absorb_frame(&suspended);
+    assert_eq!(model.histories[0].memory.len(), len);
+    assert_eq!(model.histories[0].gtt.len(), len);
+    assert_eq!(model.histories[0].clocks.len(), len);
+    assert_eq!(model.histories[0].power.len(), len);
 }
 
 #[test]
