@@ -505,6 +505,17 @@ mod tests {
     }
 
     #[test]
+    fn kernel_thread_name_with_colon_remains_a_bare_filter() {
+        let snapshot = snap(vec![
+            sample(1, None, "kworker/0:1", 1.0, 0),
+            sample(2, None, "systemd", 1.0, 0),
+        ]);
+        let filtered = rows(&snapshot, view("kworker/0:1", false));
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(filtered[0].pid, 1);
+    }
+
+    #[test]
     fn tree_nests_children_and_flags_elided_roots() {
         // 10 (kept) → 20 → 30; plus 40 whose parent 999 is NOT in the set.
         let procs = vec![
