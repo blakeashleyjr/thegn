@@ -372,7 +372,10 @@ fn run_linux_probe_with_candidate(
                     if let Some(reading) = read(api.as_mut()) {
                         return (Probe::Reading(Backend::Nvml, reading), Some(api), true);
                     }
-                    return (nvidia_sample(spec), None, true);
+                    // NVML started but read nothing: drop the session and classify through discovery,
+                    // so a missing nvidia-smi reads as Absent rather than a spawn failure.
+                    api.shutdown();
+                    return (run_probe(spec, Backend::Unresolved), None, true);
                 }
                 Err(InitFailure::Timeout | InitFailure::Unavailable) => {
                     return (run_probe(spec, Backend::Unresolved), None, true);
