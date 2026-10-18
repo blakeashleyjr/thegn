@@ -454,38 +454,6 @@ fn topology_idle_and_history_buffers_keep_capacity_after_warmup() {
     let history = fixture_history();
     model.absorb_history(&history, Window::DEFAULT, ScaleMode::Window, 119_000);
     let caps = (
-        model.topology.cpus.capacity(),
-        model.topology.l3_groups.capacity(),
-        model.idle.cores.capacity(),
-        model.cpu_stat.cores.capacity(),
-        model
-            .idle
-            .cores
-            .iter()
-            .map(|core| core.states.capacity())
-            .collect::<Vec<_>>(),
-        model.core_busy_history.capacity(),
-        model
-            .core_busy_history
-            .iter()
-            .map(|history| history.values.capacity())
-            .collect::<Vec<_>>(),
-        model.iowait_history.values.capacity(),
-        model.steal_history.values.capacity(),
-        model.frequency_history.capacity(),
-        model
-            .frequency_history
-            .iter()
-            .map(|history| history.samples.values.capacity())
-            .collect::<Vec<_>>(),
-        model.cpu_history.capacity(),
-        model.load_history.capacity(),
-    );
-    for _ in 0..1000 {
-        model.absorb_frame(&frame);
-        model.absorb_history(&history, Window::DEFAULT, ScaleMode::Window, 119_000);
-    }
-    assert_eq!(
         (
             model.topology.cpus.capacity(),
             model.topology.l3_groups.capacity(),
@@ -503,6 +471,8 @@ fn topology_idle_and_history_buffers_keep_capacity_after_warmup() {
                 .iter()
                 .map(|history| history.values.capacity())
                 .collect::<Vec<_>>(),
+        ),
+        (
             model.iowait_history.values.capacity(),
             model.steal_history.values.capacity(),
             model.frequency_history.capacity(),
@@ -512,7 +482,45 @@ fn topology_idle_and_history_buffers_keep_capacity_after_warmup() {
                 .map(|history| history.samples.values.capacity())
                 .collect::<Vec<_>>(),
             model.cpu_history.capacity(),
-            model.load_history.capacity()
+            model.load_history.capacity(),
+        ),
+    );
+    for _ in 0..1000 {
+        model.absorb_frame(&frame);
+        model.absorb_history(&history, Window::DEFAULT, ScaleMode::Window, 119_000);
+    }
+    assert_eq!(
+        (
+            (
+                model.topology.cpus.capacity(),
+                model.topology.l3_groups.capacity(),
+                model.idle.cores.capacity(),
+                model.cpu_stat.cores.capacity(),
+                model
+                    .idle
+                    .cores
+                    .iter()
+                    .map(|core| core.states.capacity())
+                    .collect::<Vec<_>>(),
+                model.core_busy_history.capacity(),
+                model
+                    .core_busy_history
+                    .iter()
+                    .map(|history| history.values.capacity())
+                    .collect::<Vec<_>>(),
+            ),
+            (
+                model.iowait_history.values.capacity(),
+                model.steal_history.values.capacity(),
+                model.frequency_history.capacity(),
+                model
+                    .frequency_history
+                    .iter()
+                    .map(|history| history.samples.values.capacity())
+                    .collect::<Vec<_>>(),
+                model.cpu_history.capacity(),
+                model.load_history.capacity(),
+            ),
         ),
         caps
     );

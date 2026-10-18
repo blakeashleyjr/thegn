@@ -1,7 +1,7 @@
 use crate::{
     compositor::Rect,
     detail::StatusCtx,
-    monitor::{MonitorOverlay, MonitorPrefs, MonitorTab},
+    monitor::{MonitorOverlay, MonitorPrefs, MonitorTab, board::TabView},
     telemetry::TelemetryHistory,
 };
 use thegn_metrics::collect::{CollectorId, frame::MonitorFrame};
