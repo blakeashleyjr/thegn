@@ -4,6 +4,15 @@ use ratatui::widgets::{Block, Borders, canvas::Canvas, canvas::Line};
 
 pub struct TimeseriesRenderer;
 
+/// Width-reduced, renderer-independent series data held by the caller cache.
+#[derive(Clone, Debug)]
+pub struct ReducedSeries {
+    points: Vec<(f64, f64)>,
+    x_bounds: [f64; 2],
+    y_bounds: [f64; 2],
+    gap: Option<f64>,
+}
+
 /// Samples per horizontal braille pixel above which a series is reduced. Below
 /// it every sample is drawn, so the output is identical to the naive walk.
 const SAMPLES_PER_PIXEL: usize = 4;
@@ -300,62 +309,105 @@ impl TimeseriesRenderer {
         width: usize,
         colors: &crate::RenderColors,
     ) -> Canvas<'a, impl Fn(&mut ratatui::widgets::canvas::Context) + 'a> {
+        let reduced = reduce(frame, bounds, window, width);
         let colors = *colors;
-        let y_field = frame.fields.iter().find(|f| f.ty == FieldType::Float64);
-        let time_field = y_field.and_then(|y| {
-            frame
-                .fields
-                .iter()
-                .find(|field| field.ty == FieldType::Time && field.len() == y.len())
-        });
-        let (points, x_bounds, gap) = match (time_field, y_field) {
-            (Some(time), Some(y)) => {
-                let times = time.floats();
-                let times = &times[..times.len().min(y.floats().len())];
-                let (points, domain) = plot_time_points_in(times, y.floats(), width, window);
-                let x_bounds = domain.unwrap_or([bounds[0], bounds[1]]);
-                (
-                    points,
-                    x_bounds,
-                    gap_threshold_in(times, x_bounds, width, window),
-                )
-            }
-            (_, Some(y)) => (plot_points(y.floats(), width), [bounds[0], bounds[1]], None),
-            (_, None) => (Vec::new(), [bounds[0], bounds[1]], None),
-        };
+        let title = title.to_string();
         Canvas::default()
             .block(
                 Block::default()
                     .borders(Borders::ALL)
                     .border_style(Style::default().fg(colors.border))
                     .title_style(Style::default().fg(colors.title))
-                    .title(title.to_string()),
+                    .title(title),
             )
-            .x_bounds(x_bounds)
-            .y_bounds([bounds[2], bounds[3]])
-            .paint(move |ctx| {
-                if let Some(gap) = gap {
-                    for [(x1, y1), (x2, y2)] in segments_with_gap(&points, gap) {
-                        ctx.draw(&Line {
-                            x1,
-                            y1,
-                            x2,
-                            y2,
-                            color: colors.series,
-                        });
-                    }
-                } else {
-                    for [(x1, y1), (x2, y2)] in segments(&points) {
-                        ctx.draw(&Line {
-                            x1,
-                            y1,
-                            x2,
-                            y2,
-                            color: colors.series,
-                        });
-                    }
-                }
-            })
+            .x_bounds(reduced.x_bounds)
+            .y_bounds(reduced.y_bounds)
+            .paint(move |ctx| draw_reduced(ctx, &reduced, colors))
+    }
+}
+
+/// Reduce a frame to its bounded drawable points and resolved axis bounds.
+pub fn reduce(
+    frame: &Frame,
+    bounds: [f64; 4],
+    window: Option<[f64; 2]>,
+    width: usize,
+) -> ReducedSeries {
+    let y_field = frame.fields.iter().find(|f| f.ty == FieldType::Float64);
+    let time_field = y_field.and_then(|y| {
+        frame
+            .fields
+            .iter()
+            .find(|field| field.ty == FieldType::Time && field.len() == y.len())
+    });
+    let (points, x_bounds, gap) = match (time_field, y_field) {
+        (Some(time), Some(y)) => {
+            let times = time.floats();
+            let times = &times[..times.len().min(y.floats().len())];
+            let (points, domain) = plot_time_points_in(times, y.floats(), width, window);
+            let x_bounds = domain.unwrap_or([bounds[0], bounds[1]]);
+            (
+                points,
+                x_bounds,
+                gap_threshold_in(times, x_bounds, width, window),
+            )
+        }
+        (_, Some(y)) => (plot_points(y.floats(), width), [bounds[0], bounds[1]], None),
+        (_, None) => (Vec::new(), [bounds[0], bounds[1]], None),
+    };
+    ReducedSeries {
+        points,
+        x_bounds,
+        y_bounds: [bounds[2], bounds[3]],
+        gap,
+    }
+}
+
+/// Draw a previously reduced series using the current title and theme colors.
+pub fn render_reduced<'a>(
+    reduced: &'a ReducedSeries,
+    title: &str,
+    colors: &crate::RenderColors,
+) -> Canvas<'a, impl Fn(&mut ratatui::widgets::canvas::Context) + 'a> {
+    let colors = *colors;
+    Canvas::default()
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(colors.border))
+                .title_style(Style::default().fg(colors.title))
+                .title(title.to_string()),
+        )
+        .x_bounds(reduced.x_bounds)
+        .y_bounds(reduced.y_bounds)
+        .paint(move |ctx| draw_reduced(ctx, reduced, colors))
+}
+
+fn draw_reduced(
+    ctx: &mut ratatui::widgets::canvas::Context,
+    reduced: &ReducedSeries,
+    colors: crate::RenderColors,
+) {
+    if let Some(gap) = reduced.gap {
+        for [(x1, y1), (x2, y2)] in segments_with_gap(&reduced.points, gap) {
+            ctx.draw(&Line {
+                x1,
+                y1,
+                x2,
+                y2,
+                color: colors.series,
+            });
+        }
+    } else {
+        for [(x1, y1), (x2, y2)] in segments(&reduced.points) {
+            ctx.draw(&Line {
+                x1,
+                y1,
+                x2,
+                y2,
+                color: colors.series,
+            });
+        }
     }
 }
 
@@ -491,6 +543,10 @@ mod tests {
         let mut golden = Buffer::empty(area);
         expected.render(area, &mut golden);
         assert_eq!(actual, golden);
+        let reduced = reduce(&frame, bounds, None, 14);
+        let mut split = Buffer::empty(area);
+        render_reduced(&reduced, "irregular", &colors).render(area, &mut split);
+        assert_eq!(actual, split);
     }
 
     #[test]
@@ -620,6 +676,70 @@ mod tests {
                 .all(|&(time, _)| (100.0..=200.0).contains(&time))
         );
         assert_eq!(domain, Some([100.0, 200.0]));
+    }
+
+    #[test]
+    fn seeded_window_buckets_retain_finite_min_max_in_input_order() {
+        let times: Vec<f64> = (0..20_000).map(f64::from).collect();
+        let mut values: Vec<f64> = (0..times.len()).map(|index| index as f64).collect();
+        let mut seed = 0xbb67_ae85_84ca_a73b_u64;
+        for value in &mut values {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            *value = (seed % 10_001) as f64;
+        }
+        values[1_000] = f64::NAN;
+        let width = 13;
+        let window = [1_000.0, 19_000.0];
+        let (points, domain) = plot_time_points_in_window(&times, &values, width, window);
+        assert_eq!(domain, Some(window));
+        assert!(points.len() <= width * 2 * 5);
+        let emitted: Vec<usize> = points.iter().map(|(time, _)| *time as usize).collect();
+        assert!(emitted.windows(2).all(|pair| pair[0] < pair[1]));
+        for bucket in 0..width * 2 {
+            let low_time = window[0] + (window[1] - window[0]) * bucket as f64 / (width * 2) as f64;
+            let high_time =
+                window[0] + (window[1] - window[0]) * (bucket + 1) as f64 / (width * 2) as f64;
+            let mut min: Option<(usize, f64)> = None;
+            let mut max: Option<(usize, f64)> = None;
+            for index in 0..times.len() {
+                let time = times[index];
+                let value = values[index];
+                if time < low_time
+                    || time > window[1]
+                    || (time >= high_time && bucket + 1 != width * 2)
+                    || !value.is_finite()
+                {
+                    continue;
+                }
+                if min.is_none_or(|(_, current)| value < current) {
+                    min = Some((index, value));
+                }
+                if max.is_none_or(|(_, current)| value > current) {
+                    max = Some((index, value));
+                }
+            }
+            let min = min.expect("every generated bucket has samples").0;
+            let max = max.expect("every generated bucket has samples").0;
+            assert!(emitted.contains(&min), "bucket {bucket} lost min");
+            assert!(emitted.contains(&max), "bucket {bucket} lost max");
+        }
+
+        let frame = Frame::new(vec![
+            Field::new("time", FieldType::Time, times),
+            Field::new("value", FieldType::Float64, values),
+        ]);
+        let colors = crate::RenderColors::default();
+        let area = Rect::new(0, 0, 26, 12);
+        let bounds = [0.0, 19_999.0, 0.0, 10_000.0];
+        let mut regular = Buffer::empty(area);
+        TimeseriesRenderer::render_in_window(&frame, "dense", bounds, Some(window), 13, &colors)
+            .render(area, &mut regular);
+        let mut split = Buffer::empty(area);
+        render_reduced(&reduce(&frame, bounds, Some(window), 13), "dense", &colors)
+            .render(area, &mut split);
+        assert_eq!(regular, split);
     }
 
     #[test]
