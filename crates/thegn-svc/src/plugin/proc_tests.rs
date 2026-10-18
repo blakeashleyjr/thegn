@@ -19,6 +19,9 @@ fn reads_newline_delimited_messages_in_order() {
     assert_eq!(out.messages[1].method, "events");
     assert!(out.junk.is_empty());
     assert!(!out.truncated);
+    assert!(out.outcome.reaped);
+    assert!(out.outcome.drained);
+    assert!(!out.outcome.abandoned);
 }
 
 #[test]
