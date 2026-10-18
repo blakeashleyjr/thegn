@@ -118,7 +118,29 @@ impl PtyProcessOwner {
     /// Start the bounded teardown away from the calling thread. The cloned
     /// owner preserves serialization with the PTY reader's teardown path.
     pub(crate) fn terminate_and_reap_detached(&self) {
+        self.terminate_and_reap_detached_with(Box::new(()));
+    }
+
+    /// Start teardown off-thread, then release pane-owned state on the reaper
+    /// thread. The shared parcel lets the spawn-failure path keep ownership
+    /// until its inline reap has completed.
+    pub(crate) fn terminate_and_reap_detached_with(&self, parcel: Box<dyn Send>) {
+        self.terminate_and_reap_detached_with_spawner(parcel, |worker| {
+            std::thread::Builder::new()
+                .name("thegn-pty-reap".into())
+                .spawn(worker)
+                .map(|_| ())
+        });
+    }
+
+    fn terminate_and_reap_detached_with_spawner(
+        &self,
+        parcel: Box<dyn Send>,
+        spawn_worker: impl FnOnce(Box<dyn FnOnce() + Send>) -> std::io::Result<()>,
+    ) {
         let owner = self.clone();
+        let parcel = Arc::new(Mutex::new(Some(parcel)));
+        let worker_parcel = Arc::clone(&parcel);
         {
             let (in_flight, _) = &DETACHED_REAPERS;
             let mut in_flight = in_flight
@@ -126,18 +148,62 @@ impl PtyProcessOwner {
                 .unwrap_or_else(|poison| poison.into_inner());
             *in_flight += 1;
         }
-        let guard = DetachedReaperGuard;
-        let spawn = std::thread::Builder::new()
-            .name("thegn-pty-reap".into())
-            .spawn(move || {
-                let _guard = guard;
-                crate::platform::qos::set_self(crate::platform::qos::Qos::Background);
-                owner.terminate_and_reap();
-            });
+        let guard = Arc::new(Mutex::new(Some(DetachedReaperGuard)));
+        let worker_guard = Arc::clone(&guard);
+        let worker = Box::new(move || {
+            crate::platform::qos::set_self(crate::platform::qos::Qos::Background);
+            let reaper_guard = worker_guard
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner())
+                .take();
+            owner.terminate_and_reap();
+            drop(
+                worker_parcel
+                    .lock()
+                    .unwrap_or_else(|poison| poison.into_inner())
+                    .take(),
+            );
+            drop(reaper_guard);
+        });
+        let spawn = spawn_worker(worker);
         if let Err(error) = spawn {
             tracing::debug!(target: "thegn::pty", %error, "unable to spawn detached PTY reaper; reaping inline");
             self.terminate_and_reap();
+            drop(
+                parcel
+                    .lock()
+                    .unwrap_or_else(|poison| poison.into_inner())
+                    .take(),
+            );
+            drop(
+                guard
+                    .lock()
+                    .unwrap_or_else(|poison| poison.into_inner())
+                    .take(),
+            );
         }
+    }
+}
+
+/// Replacement emulator installed during pane drop, so moving the original
+/// emulator into the detached reaper does not leave expensive state on-loop.
+pub(crate) struct InertPaneEmulator;
+
+impl crate::emulator::PaneEmulator for InertPaneEmulator {
+    fn advance(&mut self, _bytes: &[u8]) {}
+
+    fn resize(&mut self, _rows: u16, _cols: u16) {}
+
+    fn size(&self) -> (u16, u16) {
+        (0, 0)
+    }
+
+    fn cell(&self, _row: u16, _col: u16) -> Option<crate::emulator::GridCell> {
+        None
+    }
+
+    fn cursor(&self) -> (u16, u16) {
+        (0, 0)
     }
 }
 
@@ -592,5 +658,83 @@ mod tests {
             "drained detached reapers left a child behind (before={before}, after={}): {after:?}",
             after.len()
         );
+    }
+
+    struct ReapDropProbe {
+        owner: PtyProcessOwner,
+        dropped: std::sync::mpsc::Sender<(Option<String>, bool)>,
+    }
+
+    impl Drop for ReapDropProbe {
+        fn drop(&mut self) {
+            let complete = self
+                .owner
+                .0
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner())
+                .complete;
+            self.dropped
+                .send((std::thread::current().name().map(str::to_owned), complete))
+                .unwrap();
+        }
+    }
+
+    fn live_test_owner() -> PtyProcessOwner {
+        let pty = portable_pty::native_pty_system();
+        let pair = pty
+            .openpty(PtySize {
+                rows: 24,
+                cols: 80,
+                pixel_width: 0,
+                pixel_height: 0,
+            })
+            .expect("open test PTY");
+        let mut command = CommandBuilder::new("sh");
+        command.args(["-c", "exec sleep 10"]);
+        let child = pair.slave.spawn_command(command).expect("spawn test child");
+        drop(pair.slave);
+        drop(pair.master);
+        PtyProcessOwner::new(child, None)
+    }
+
+    #[test]
+    fn detached_reaper_drops_parcel_after_reap_on_named_thread() {
+        if !cfg!(target_os = "linux") {
+            return;
+        }
+        let owner = live_test_owner();
+        let (dropped, received) = std::sync::mpsc::channel();
+        owner.terminate_and_reap_detached_with(Box::new(ReapDropProbe {
+            owner: owner.clone(),
+            dropped,
+        }));
+
+        let (thread_name, complete) = received
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("reaper should release the parcel");
+        assert_eq!(thread_name.as_deref(), Some("thegn-pty-reap"));
+        assert!(complete, "the parcel must be dropped after the reap");
+    }
+
+    #[test]
+    fn detached_reaper_spawn_failure_drops_parcel_after_inline_reap() {
+        if !cfg!(target_os = "linux") {
+            return;
+        }
+        let owner = live_test_owner();
+        let (dropped, received) = std::sync::mpsc::channel();
+        let parcel = Box::new(ReapDropProbe {
+            owner: owner.clone(),
+            dropped,
+        });
+        owner.terminate_and_reap_detached_with_spawner(parcel, |_worker| {
+            Err(std::io::Error::other("injected thread spawn failure"))
+        });
+
+        let (thread_name, complete) = received
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .expect("inline fallback should release the parcel");
+        assert_eq!(thread_name.as_deref(), std::thread::current().name());
+        assert!(complete, "the parcel must be dropped after the inline reap");
     }
 }

@@ -213,7 +213,17 @@ impl Drop for PtyPane {
             // it can be blocked in bounded_channel::blocking_send waiting for
             // this loop to drain events. Joining here could deadlock the loop;
             // process teardown is serialized through the shared owner instead.
-            process.terminate_and_reap_detached();
+            let emulator = std::mem::replace(
+                &mut self.emulator,
+                Box::new(crate::pane_pty::InertPaneEmulator),
+            );
+            let history = std::mem::replace(&mut self.history, HistoryBuffer::new(1));
+            let history_partial = std::mem::take(&mut self.history_partial);
+            process.terminate_and_reap_detached_with(Box::new((
+                emulator,
+                history,
+                history_partial,
+            )));
         }
     }
 }
@@ -2923,6 +2933,61 @@ mod tests {
         assert!(
             !crate::platform::pid_alive(pid as i64),
             "detached reaper left the SIGHUP-ignoring child alive (pid {pid})"
+        );
+    }
+
+    struct DropThreadEmulator(std::sync::mpsc::Sender<Option<String>>);
+
+    impl Drop for DropThreadEmulator {
+        fn drop(&mut self) {
+            self.0
+                .send(std::thread::current().name().map(str::to_owned))
+                .unwrap();
+        }
+    }
+
+    impl crate::emulator::PaneEmulator for DropThreadEmulator {
+        fn advance(&mut self, _bytes: &[u8]) {}
+
+        fn resize(&mut self, _rows: u16, _cols: u16) {}
+
+        fn size(&self) -> (u16, u16) {
+            (0, 0)
+        }
+
+        fn cell(&self, _row: u16, _col: u16) -> Option<crate::emulator::GridCell> {
+            None
+        }
+
+        fn cursor(&self) -> (u16, u16) {
+            (0, 0)
+        }
+    }
+
+    #[test]
+    fn dropping_a_pane_releases_its_emulator_off_loop() {
+        let (tx, _rx) = tokio_mpsc::channel::<PaneEvent>(64);
+        let mut pane =
+            PtyPane::spawn_with_env(0, &sh("sleep 30"), None, &[], 24, 80, tx, None).unwrap();
+        let (dropped_tx, dropped_rx) = std::sync::mpsc::channel();
+        pane.emulator = Box::new(DropThreadEmulator(dropped_tx));
+        for line in 0..50_000 {
+            pane.history.push_line(format!("history line {line}"));
+        }
+
+        let started = std::time::Instant::now();
+        drop(pane);
+        assert!(
+            started.elapsed() < std::time::Duration::from_millis(150),
+            "dropping a pane with large history blocked for {:?}",
+            started.elapsed()
+        );
+        assert_eq!(
+            dropped_rx
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .unwrap()
+                .as_deref(),
+            Some("thegn-pty-reap")
         );
     }
 }
