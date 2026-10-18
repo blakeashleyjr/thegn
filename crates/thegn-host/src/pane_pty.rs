@@ -115,12 +115,6 @@ impl PtyProcessOwner {
         }
     }
 
-    /// Start the bounded teardown away from the calling thread. The cloned
-    /// owner preserves serialization with the PTY reader's teardown path.
-    pub(crate) fn terminate_and_reap_detached(&self) {
-        self.terminate_and_reap_detached_with(Box::new(()));
-    }
-
     /// Start teardown off-thread, then release pane-owned state on the reaper
     /// thread. The shared parcel lets the spawn-failure path keep ownership
     /// until its inline reap has completed.
@@ -148,6 +142,7 @@ impl PtyProcessOwner {
                 .unwrap_or_else(|poison| poison.into_inner());
             *in_flight += 1;
         }
+        // Share the guard so inline fallback holds the in-flight count through reap and parcel drop.
         let guard = Arc::new(Mutex::new(Some(DetachedReaperGuard)));
         let worker_guard = Arc::clone(&guard);
         let worker = Box::new(move || {
@@ -644,7 +639,7 @@ mod tests {
         drop(pair.master);
         let owner = PtyProcessOwner::new(child, None);
 
-        owner.terminate_and_reap_detached();
+        owner.terminate_and_reap_detached_with(Box::new(()));
         let drained = drain_detached_reapers(std::time::Duration::from_secs(3));
         if !drained {
             let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
