@@ -229,19 +229,27 @@ impl DiskModel {
                 .filesystem_history
                 .iter()
                 .all(|history| history.mount_point != fs.mount_point || history.source != fs.source)
-                && self.filesystem_history.len() < MAX_FILESYSTEM_HISTORIES
             {
-                self.filesystem_history.push(FilesystemHistory {
-                    mount_point: fs.mount_point.clone(),
-                    source: fs.source.clone(),
-                    used: HistoryRing::default(),
-                });
+                if self.filesystem_history.len() < MAX_FILESYSTEM_HISTORIES {
+                    self.filesystem_history.push(FilesystemHistory {
+                        mount_point: fs.mount_point.clone(),
+                        source: fs.source.clone(),
+                        used: HistoryRing::default(),
+                    });
+                } else if let Some(history) = self.filesystem_history.iter_mut().find(|history| {
+                    !frame.parts.filesystems.rows.iter().any(|current| {
+                        current.mount_point == history.mount_point
+                            && current.source == history.source
+                    })
+                }) {
+                    history.mount_point.clone_from(&fs.mount_point);
+                    history.source.clone_from(&fs.source);
+                    history.used = HistoryRing::default();
+                }
             }
             if let Some(history) = self.filesystem_history.iter_mut().find(|history| {
                 history.mount_point == fs.mount_point && history.source == fs.source
             }) {
-                history.mount_point.clone_from(&fs.mount_point);
-                history.source.clone_from(&fs.source);
                 let ratio = fs
                     .total_bytes
                     .filter(|total| *total > 0)
@@ -622,7 +630,7 @@ impl TabView for DiskView<'_> {
                 .0
                 .devices
                 .iter()
-                .take(rect.rows.saturating_sub(3) / 2)
+                .take(rect.rows.saturating_sub(2) / 3)
                 .enumerate()
             {
                 if let Some(history) = self
@@ -633,42 +641,73 @@ impl TabView for DiskView<'_> {
                 {
                     let mut util = [0.0; HISTORY];
                     let util_len = history.util.copy_ordered(&mut util);
-                    crate::monitor::graphs::paint_sparkline(
-                        &util[..util_len],
-                        8,
-                        RampId::Util,
-                        Rect {
-                            x: rect.x + 38,
-                            y: rect.y + row * 2 + 1,
-                            cols: 8,
-                            rows: 1,
-                        },
-                        surface,
-                    );
+                    if rect.cols >= 38 + 8 + 1 {
+                        crate::monitor::graphs::paint_sparkline(
+                            &util[..util_len],
+                            8,
+                            RampId::Util,
+                            Rect {
+                                x: rect.x + 38,
+                                y: rect.y + row * 3 + 1,
+                                cols: 8,
+                                rows: 1,
+                            },
+                            surface,
+                        );
+                    }
                     if device.physical {
                         let mut read = [0.0; HISTORY];
-                        let read_len = history.read.copy_normalized(&mut read).0;
+                        let (read_len, read_peak) = history.read.copy_normalized(&mut read);
                         let mut write = [0.0; HISTORY];
-                        let write_len = history.write.copy_normalized(&mut write).0;
-                        let plot = Rect {
-                            x: rect.x + 38,
-                            y: rect.y + row * 2 + 2,
-                            cols: rect.cols.saturating_sub(39),
-                            rows: 2,
+                        let (write_len, write_peak) = history.write.copy_normalized(&mut write);
+                        if rect.cols > 39 {
+                            let plot = Rect {
+                                x: rect.x + 38,
+                                y: rect.y + row * 3 + 2,
+                                cols: rect.cols.saturating_sub(39),
+                                rows: 2,
+                            };
+                            let mut chart = CellGrid::new(plot.cols, plot.rows);
+                            paint_mirrored_history(
+                                &mut chart,
+                                Rect::full(plot.cols, plot.rows),
+                                &read[..read_len],
+                                &write[..write_len],
+                            );
+                            Emitter::default().emit(
+                                &chart,
+                                Rect::full(plot.cols, plot.rows),
+                                surface,
+                                plot.x,
+                                plot.y,
+                            );
+                        }
+                        let format_peak = |values: &[f32], peak: f32| {
+                            if values.iter().any(|value| value.is_finite()) {
+                                format!(
+                                    "{}/s",
+                                    crate::monitor::kit::edge_fmt(NumFmt::default()).fmt(
+                                        f64::from(peak),
+                                        Unit::Bytes,
+                                        5,
+                                    )
+                                )
+                            } else {
+                                crate::caps::active_glyphs().emdash.into()
+                            }
                         };
-                        let mut chart = CellGrid::new(plot.cols, plot.rows);
-                        paint_mirrored_history(
-                            &mut chart,
-                            Rect::full(plot.cols, plot.rows),
-                            &read[..read_len],
-                            &write[..write_len],
-                        );
+                        let read_peak = format_peak(&read[..read_len], read_peak);
+                        let write_peak = format_peak(&write[..write_len], write_peak);
+                        let peaks = format!("240-sample pk {read_peak} {write_peak}");
+                        let label_cols = rect.cols.saturating_sub(2);
+                        let mut grid = CellGrid::new(label_cols, 1);
+                        grid.put_str(0, 0, &peaks, CellStyle::default());
                         Emitter::default().emit(
-                            &chart,
-                            Rect::full(plot.cols, plot.rows),
+                            &grid,
+                            Rect::full(label_cols, 1),
                             surface,
-                            plot.x,
-                            plot.y,
+                            rect.x + 1,
+                            rect.y + row * 3 + 2,
                         );
                     }
                 }
@@ -721,6 +760,14 @@ fn paint_io(grid: &mut CellGrid, rect: Rect, model: &DiskModel) {
                     )
                 };
             body.put_str(0, 2, &scale, CellStyle::default());
+            if area.rows > 3 {
+                body.put_str(
+                    0,
+                    3,
+                    "device rates peak=100%; see Devices peaks",
+                    CellStyle::default(),
+                );
+            }
         }
     }
     if !matches!(model.disk_health, Health::Absent(_)) && rect.rows > 5 {
@@ -740,9 +787,9 @@ fn paint_io(grid: &mut CellGrid, rect: Rect, model: &DiskModel) {
             grid,
             history_plot_rect(
                 Rect {
-                    x: 1,
+                    x: rect.cols / 2,
                     y: 4,
-                    cols: rect.cols.saturating_sub(2),
+                    cols: rect.cols.saturating_sub(rect.cols / 2 + 1),
                     rows: rect.rows.saturating_sub(5),
                 },
                 read_len.max(write_len),
@@ -751,6 +798,30 @@ fn paint_io(grid: &mut CellGrid, rect: Rect, model: &DiskModel) {
             &read[..read_len],
             &write[..write_len],
         );
+        let device_cols = (rect.cols / 2).saturating_sub(2);
+        for (row, device) in model.devices.iter().take(MAX_DEVICE_HISTORIES).enumerate() {
+            if let Some(history) = model
+                .device_history
+                .iter()
+                .find(|history| history.id == device.id && device.physical)
+            {
+                let mut read = [0.0; HISTORY];
+                let read_len = history.read.copy_normalized(&mut read).0;
+                let mut write = [0.0; HISTORY];
+                let write_len = history.write.copy_normalized(&mut write).0;
+                paint_mirrored_history(
+                    grid,
+                    Rect {
+                        x: 1,
+                        y: 4 + row * 3,
+                        cols: device_cols,
+                        rows: 2,
+                    },
+                    &read[..read_len],
+                    &write[..write_len],
+                );
+            }
+        }
     }
 }
 
@@ -824,7 +895,7 @@ fn paint_pressure(grid: &mut CellGrid, rect: Rect, model: &DiskModel) {
     let mut body = panel::panel(
         grid,
         Rect::full(rect.cols, rect.rows),
-        "I/O pressure 0-100% 60s",
+        "I/O pressure 0-100%",
         None,
     );
     if matches!(model.psi_health, Health::Absent(_)) {
@@ -861,7 +932,7 @@ fn paint_devices(grid: &mut CellGrid, rect: Rect, model: &DiskModel) {
     let mut body = panel::panel(
         grid,
         Rect::full(rect.cols, rect.rows),
-        "Devices 60s trends, each peak=100%",
+        "Devices trends, each peak=100%",
         None,
     );
     if matches!(model.disk_health, Health::Absent(_)) {
@@ -869,12 +940,7 @@ fn paint_devices(grid: &mut CellGrid, rect: Rect, model: &DiskModel) {
         body.put_str(0, 0, &mark, CellStyle::default());
         return;
     }
-    for (row, device) in model
-        .devices
-        .iter()
-        .take(body.rect().rows.saturating_sub(1) / 2)
-        .enumerate()
-    {
+    for (row, device) in model.devices.iter().take(body.rect().rows / 3).enumerate() {
         let text = format!(
             "{:<12} {:>8} {:>8} {:>5}",
             truncate(&device.name, 12),
@@ -892,7 +958,7 @@ fn paint_devices(grid: &mut CellGrid, rect: Rect, model: &DiskModel) {
                     |value| format!("{value}%")
                 )
         );
-        body.put_str(0, row * 2, &text, CellStyle::default());
+        body.put_str(0, row * 3, &text, CellStyle::default());
     }
     if model.devices.is_empty() && !matches!(model.disk_health, Health::Absent(_)) {
         let mark = if matches!(model.disk_health, Health::Warming) {
