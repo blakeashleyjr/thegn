@@ -798,7 +798,7 @@ impl TabView for PowerView<'_> {
                     x: rect.x + inner.x,
                     y: rect.y + inner.y,
                     cols: inner.cols,
-                    rows: inner.rows.saturating_sub(11),
+                    rows: inner.rows,
                 },
                 rail_samples,
                 graphs::table().braille,
@@ -818,7 +818,7 @@ impl TabView for PowerView<'_> {
                     .iter()
                     .filter(|zone| zone.active && !zone.history.is_empty())
                     .count();
-            if band_count > 0 {
+            if band_count > 0 && graph_rect.rows >= 2 {
                 let drawn_bands = band_count.min(graph_rect.rows / 2);
                 let plot_rows = graph_rect.rows / drawn_bands;
                 let ceiling = rail_ceiling(self.0);

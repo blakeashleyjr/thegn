@@ -688,7 +688,7 @@ fn newest_powercap_and_amd_rail_samples_reach_the_last_graph_column() {
         .find(|panel| panel.id.0 == "power.rails")
         .expect("rails panel is placed");
     let graph_right = rails.rect.x + rails.rect.cols - 2;
-    let graph_left = graph_right.saturating_sub(HISTORY_SEED / 2 - 1);
+    let graph_left = rails.rect.x + 1;
     let graph_top = rails.rect.y + 1;
     let mut surface = Surface::new(240, 60);
     test_override::with_unicode(UnicodeLevel::Full, || {
