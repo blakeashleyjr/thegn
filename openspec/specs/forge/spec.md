@@ -24,6 +24,8 @@ Every forge operation (pull-request status, list, search, create, merge, draft/a
 
 The GitHub forge SHALL be a ladder of a native GraphQL layer (over the shared tracker HTTP client) above the `gh` CLI layer. The native layer MUST answer only the operations it implements and MUST fall through (`NotConfigured`, `Unsupported`) when it has no token, the location is remote, or its circuit breaker was opened by transport failures. When the circuit holds an API-side `RateLimited` or other HTTP/body (`Other`) error, the native layer SHALL return it for `pr_status`/`pr_list`, for `issue_rows`/`search_prs` on a local `github.com` origin, and for Actions run listing; these GitHub pollers and Actions run listing do not spawn `gh` for those held errors. Only `pr_status`/`pr_list` also return a held authentication error. `Auth`, `NotFound`, `RateLimited` and `Transient` answers are final and MUST NOT be retried on the CLI layer. HTTP 401/403/429, 5xx responses, and undecodable 2xx bodies count as circuit failures. The circuit opens after three consecutive failures for 60 seconds, doubles its duration for each further failure up to 900 seconds, and adds up to 20% deterministic jitter. A usable `Retry-After` opens it immediately for that delay.
 
+On `github.com`, CLI poll operations (`pr_status`, `pr_list`, `issue_rows`, and `search_prs`) share a circuit that opens on rate limits, HTTP 5xx responses, or unparseable output, using the same failure window; while open, those polls and Actions run listing return the held error without running `gh`. Enterprise hosts are not wrapped.
+
 #### Scenario: No token falls through
 
 - **WHEN** `GH_TOKEN`/`GITHUB_TOKEN`/`gh auth token` are all absent and `pr_list` is called
@@ -38,6 +40,11 @@ The GitHub forge SHALL be a ladder of a native GraphQL layer (over the shared tr
 
 - **WHEN** the circuit is open on a 5xx or rate-limit error and `issue_rows` is called for a local `github.com` worktree
 - **THEN** the held error is returned and `gh` is not run
+
+#### Scenario: A failing gh poll holds later polls
+
+- **WHEN** three consecutive `pr_list` CLI polls fail with HTTP 502
+- **THEN** the next `issue_rows` returns the held error and `gh` is not run
 
 ### Requirement: Forge errors are seam errors
 
