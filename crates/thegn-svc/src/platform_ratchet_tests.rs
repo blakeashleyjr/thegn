@@ -99,7 +99,7 @@ fn converted_runtime_guards_stay_compile_time() {
     const FILES: &[&str] = &["voice.rs", "git/native_diff.rs"];
 
     for file in FILES {
-        let path = format!("{MANIFEST}/src/{file}");
+        let path = format!("{}/src/{file}", env!("CARGO_MANIFEST_DIR"));
         let body = std::fs::read_to_string(path).expect("read production source file");
         let code = thegn_core::test_support::ratchet::code_only(&body);
         assert!(
