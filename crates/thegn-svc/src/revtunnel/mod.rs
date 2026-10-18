@@ -402,6 +402,7 @@ fn spawn_sink_with_timeout<W: AsyncWrite + Unpin + Send + 'static>(
 /// Pump one logical connection's local stream ⇄ the mux:
 /// - local reads → `Data(id)` frames on the sink, then `Close(id)` at EOF;
 /// - `inbound` payloads (peer `Data(id)`) → local writes.
+///
 /// Deadline closes send `Close(id)`, a half-close; the peer's other direction
 /// can remain until its own idle or lifetime deadline because this protocol has
 /// no full-close frame.
