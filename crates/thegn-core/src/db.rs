@@ -1231,6 +1231,7 @@ fn shared_db_path(path: &std::path::Path) -> std::path::PathBuf {
 }
 
 impl Db {
+    #[track_caller]
     pub fn open() -> Result<Db> {
         // Timed for the loop-thread open counter (THE-179). Only opens on the
         // render/input thread are recorded — those are the ones that can freeze
@@ -1239,7 +1240,10 @@ impl Db {
         // process that never marked a loop thread it is the compare alone.
         let started = std::time::Instant::now();
         let out = Self::open_timed();
-        crate::db_open_stats::record_open(started.elapsed().as_micros() as u64);
+        crate::db_open_stats::record_open(
+            started.elapsed().as_micros() as u64,
+            std::panic::Location::caller(),
+        );
         out
     }
 
