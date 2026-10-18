@@ -25,7 +25,26 @@ script.
 
 The **Monitor collectors** block lists each system monitor collector and its
 discovered health. Collectors that are checked only while their panel is
-visible are marked `visible-only (not probed)`.
+visible are marked `visible-only (not probed)`. A `denied` row includes a hint:
+RAPL Powercap counters use root-only (0400) `energy_uj` files; other denied
+readings need privileges thegn does not request, and thegn never escalates or
+prompts.
+
+If you choose to grant a group read access to RAPL counters, install a udev rule
+manually. For example, create `/etc/udev/rules.d/99-powercap-energy.rules`
+with the following rule, replacing `energy` with a group you control and
+`/absolute/path/to` with the directory containing `chgrp` and `chmod` on your
+system. Both commands must use absolute paths; for example, NixOS users can use
+`${pkgs.coreutils}/bin/chgrp` and `${pkgs.coreutils}/bin/chmod` in
+`services.udev.extraRules`.
+
+```udev
+ACTION=="add", SUBSYSTEM=="powercap", ATTR{energy_uj}=="?*", RUN+="/absolute/path/to/chgrp energy /sys%p/energy_uj", RUN+="/absolute/path/to/chmod 0440 /sys%p/energy_uj"
+```
+
+Then reload the rules and re-trigger the powercap devices, or reboot. This is an
+optional administrator action; thegn never installs the rule or changes file
+permissions.
 
 The report's `db space` line shows the database size, reclaimable space, and
 vacuum mode. It suggests `thegn db vacuum` when the database is not yet in

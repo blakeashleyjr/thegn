@@ -229,6 +229,96 @@ fn graph_glyph_and_style_goldens_follow_each_unicode_table() {
     }
 }
 
+#[test]
+fn host_graph_entry_points_match_hand_written_ascii_rows() {
+    let palette = default_palette();
+    crate::caps::test_override::with_unicode(UnicodeLevel::Ascii, || {
+        crate::caps::test_override::with_color(ColorDepth::None, || {
+            let mut history = termwiz::surface::Surface::new(4, 2);
+            super::paint_history_graph(
+                &[0.5, 1.0],
+                RampId::Util,
+                crate::compositor::Rect {
+                    x: 0,
+                    y: 0,
+                    cols: 4,
+                    rows: 2,
+                },
+                &mut history,
+            );
+            let history_rows: Vec<String> = history
+                .screen_lines()
+                .iter()
+                .map(|line| {
+                    line.visible_cells()
+                        .map(|cell| cell.str().to_owned())
+                        .collect()
+                })
+                .collect();
+            assert_eq!(history_rows, ["   #", "  ##"]);
+
+            let mut spark = termwiz::surface::Surface::new(4, 1);
+            super::paint_sparkline(
+                &[0.0, 1.0],
+                4,
+                RampId::Mem,
+                crate::compositor::Rect {
+                    x: 0,
+                    y: 0,
+                    cols: 4,
+                    rows: 1,
+                },
+                &mut spark,
+            );
+            let spark_rows: Vec<String> = spark
+                .screen_lines()
+                .iter()
+                .map(|line| {
+                    line.visible_cells()
+                        .map(|cell| cell.str().to_owned())
+                        .collect()
+                })
+                .collect();
+            assert_eq!(spark_rows, ["  _#"]);
+
+            let mut heat = GraphOut::new();
+            let heat_rows = [&[0.0, 0.5, 1.0][..], &[0.5][..]];
+            paint_heatmap(&mut heat, &heat_rows, RampId::Heat, &palette);
+            assert_eq!(text(&heat), [" +@", "  +"]);
+        });
+    });
+}
+
+#[test]
+fn host_history_graph_paints_braille_golden() {
+    crate::caps::test_override::with_unicode(UnicodeLevel::Full, || {
+        crate::caps::test_override::with_color(ColorDepth::None, || {
+            let mut history = termwiz::surface::Surface::new(1, 1);
+            super::paint_history_graph(
+                &[1.0],
+                RampId::Util,
+                crate::compositor::Rect {
+                    x: 0,
+                    y: 0,
+                    cols: 1,
+                    rows: 1,
+                },
+                &mut history,
+            );
+            let history_rows: Vec<String> = history
+                .screen_lines()
+                .iter()
+                .map(|line| {
+                    line.visible_cells()
+                        .map(|cell| cell.str().to_owned())
+                        .collect()
+                })
+                .collect();
+            assert_eq!(history_rows, ["⢸"]);
+        });
+    });
+}
+
 fn raster_text(cells: &viz_raster::CellBuf) -> Vec<String> {
     (0..cells.height())
         .map(|row| cells.row(row).iter().map(|cell| cell.ch).collect())

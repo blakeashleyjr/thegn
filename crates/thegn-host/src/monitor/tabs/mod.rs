@@ -25,7 +25,7 @@ impl MonitorTab {
         match self {
             MonitorTab::Overview => true,
             MonitorTab::Gpu => s.gpu_pct.is_some(),
-            MonitorTab::Power => s.battery.is_some(),
+            MonitorTab::Power => s.battery.is_some() || s.power_present,
             MonitorTab::Thermal => s.cpu_temp_c.is_some() || !s.temps.is_empty(),
             MonitorTab::Disk => !s.disks.is_empty(),
             MonitorTab::Network => s.net_bps.is_some() || !s.net_ifaces.is_empty(),
@@ -79,6 +79,12 @@ impl MonitorOverlay {
             // worktree. Both open a confirmation rather than firing immediately.
             KeyCode::Char('x') if self.tab == MonitorTab::Procs => self.begin_signal(),
             KeyCode::Char('x') if self.tab == MonitorTab::Disk => self.begin_clean(),
+            KeyCode::Char('=') if self.tab == MonitorTab::Procs => self.begin_renice(),
+            KeyCode::Char('I')
+                if self.tab == MonitorTab::Procs && crate::platform::IONICE_SUPPORTED =>
+            {
+                self.begin_ionice()
+            }
             // --- Per-tab (last, so it can never shadow the above) ---
             KeyCode::Char(c) if self.tab == MonitorTab::Procs => self.proc_key(*c),
             KeyCode::Enter if self.tab == MonitorTab::Containers => self.container_key('\r'),
@@ -94,5 +100,29 @@ pub(super) fn hints(input: &footer::FooterInput<'_>, out: &mut Vec<Vec<Seg>>) {
         MonitorTab::Disk => disk::hints(input, out),
         MonitorTab::Containers => containers::hints(input, out),
         _ => {}
+    }
+}
+
+#[cfg(test)]
+mod presence_tests {
+    use super::*;
+
+    #[test]
+    fn power_tab_is_present_for_static_power_hardware_without_a_battery() {
+        let snapshot = StatsSnapshot {
+            power_present: true,
+            ..StatsSnapshot::default()
+        };
+
+        assert!(MonitorTab::Power.present(&snapshot, false));
+
+        let battery_snapshot = StatsSnapshot {
+            battery: Some((80, false)),
+            ..StatsSnapshot::default()
+        };
+        assert!(MonitorTab::Power.present(&battery_snapshot, false));
+
+        let empty_snapshot = StatsSnapshot::default();
+        assert!(!MonitorTab::Power.present(&empty_snapshot, false));
     }
 }

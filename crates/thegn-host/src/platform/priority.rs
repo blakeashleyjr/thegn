@@ -8,11 +8,18 @@
 
 use super::ProcStart;
 
+/// Whether this build exposes the Linux I/O-priority controls.
+pub(crate) const IONICE_SUPPORTED: bool = cfg!(target_os = "linux");
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum IoClass {
     RealTime(u8),
     BestEffort(u8),
     Idle,
+    #[cfg_attr(
+        not(target_os = "linux"),
+        expect(dead_code, reason = "constructed only by the Linux ioprio decoder")
+    )]
     None,
 }
 
@@ -20,6 +27,10 @@ pub enum IoClass {
 pub enum PriorityError {
     Changed,
     Denied(String),
+    #[cfg_attr(
+        target_os = "linux",
+        expect(dead_code, reason = "constructed only by the non-Linux stubs")
+    )]
     Unsupported,
     Failed(String),
 }

@@ -17,6 +17,23 @@ mod stacked;
 
 thread_local! {
     static GRAPH_OUT: RefCell<GraphOut> = RefCell::new(GraphOut::default());
+    static PALETTE: RefCell<(u64, Option<Palette>)> = const { RefCell::new((u64::MAX, None)) };
+}
+
+/// Use one cloned palette per thread and palette generation for graph paints.
+/// Callers must not invoke `with_palette` recursively from `f`.
+pub(crate) fn with_palette<R>(f: impl FnOnce(&Palette) -> R) -> R {
+    let generation = chrome::palette_generation();
+    PALETTE.with(|cached| {
+        let mut cached = cached.borrow_mut();
+        if cached.0 != generation {
+            cached.1 = Some(chrome::palette_snapshot());
+            cached.0 = generation;
+            #[cfg(test)]
+            PALETTE_RESOLUTIONS.with(|count| count.set(count.get() + 1));
+        }
+        f(cached.1.as_ref().expect("palette cache populated"))
+    })
 }
 
 pub(crate) use heatmap::paint_heatmap;
@@ -128,6 +145,18 @@ impl Resolved {
 pub(crate) struct GraphOut {
     pub(crate) cells: CellBuf,
     pub(crate) lines: Vec<Line>,
+    spare_strings: Vec<String>,
+}
+
+impl GraphOut {
+    fn take_string(&mut self, capacity: usize) -> String {
+        let reusable = self
+            .spare_strings
+            .iter()
+            .position(|text| text.capacity() >= capacity)
+            .map(|index| self.spare_strings.swap_remove(index));
+        reusable.unwrap_or_default()
+    }
 }
 
 pub(crate) fn paint_sparkline(
@@ -142,7 +171,7 @@ pub(crate) fn paint_sparkline(
     }
     GRAPH_OUT.with(|scratch| {
         let mut out = scratch.borrow_mut();
-        chrome::with_palette(|palette| {
+        with_palette(|palette| {
             spark::paint_spark(&mut out, values, width, ramp, palette);
         });
         if let Some(line) = out.lines.first() {
@@ -170,7 +199,7 @@ pub(crate) fn paint_history_graph(
     }
     GRAPH_OUT.with(|scratch| {
         let mut out = scratch.borrow_mut();
-        chrome::with_palette(|palette| {
+        with_palette(|palette| {
             graph::paint_graph(
                 &mut out,
                 graph::GraphPaint {
@@ -236,6 +265,7 @@ impl GraphOut {
         if !matches!(line, Line::Segs(_)) {
             *line = Line::Segs(Vec::new());
         }
+        let spare_strings = &mut self.spare_strings;
         if let Line::Segs(segs) = line {
             let row = self.cells.row(row_index);
             let mut start = 0;
@@ -246,10 +276,25 @@ impl GraphOut {
                 while end < row.len() && resolved.cell(row[end]) == style {
                     end += 1;
                 }
+                let required_capacity: usize =
+                    row[start..end].iter().map(|cell| cell.ch.len_utf8()).sum();
                 if seg_index == segs.len() {
-                    segs.push(seg::seg(Tok::Attr(style.fg), String::new()));
+                    let reusable = spare_strings
+                        .iter()
+                        .position(|text| text.capacity() >= required_capacity)
+                        .map(|index| spare_strings.swap_remove(index));
+                    segs.push(seg::seg(Tok::Attr(style.fg), reusable.unwrap_or_default()));
                 }
                 let run = &mut segs[seg_index];
+                if run.text.capacity() < required_capacity {
+                    let old_text = std::mem::take(&mut run.text);
+                    spare_strings.push(old_text);
+                    let reusable = spare_strings
+                        .iter()
+                        .position(|text| text.capacity() >= required_capacity)
+                        .map(|index| spare_strings.swap_remove(index));
+                    run.text = reusable.unwrap_or_default();
+                }
                 run.text.clear();
                 run.text.extend(row[start..end].iter().map(|cell| cell.ch));
                 run.fg = Tok::Attr(style.fg);
@@ -262,7 +307,9 @@ impl GraphOut {
                 seg_index += 1;
                 start = end;
             }
-            segs.truncate(seg_index);
+            for stale in segs.drain(seg_index..) {
+                spare_strings.push(stale.text);
+            }
         }
     }
 }
@@ -290,3 +337,23 @@ fn resolution_count() -> usize {
 fn reset_resolution_count() {
     RESOLUTIONS.with(|count| count.set(0));
 }
+
+#[cfg(test)]
+thread_local! {
+    static PALETTE_RESOLUTIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+fn palette_resolution_count() -> usize {
+    PALETTE_RESOLUTIONS.with(std::cell::Cell::get)
+}
+
+#[cfg(test)]
+fn reset_palette_cache() {
+    PALETTE.with(|cached| *cached.borrow_mut() = (u64::MAX, None));
+    PALETTE_RESOLUTIONS.with(|count| count.set(0));
+}
+
+#[cfg(test)]
+#[path = "reuse_tests.rs"]
+mod reuse_tests;

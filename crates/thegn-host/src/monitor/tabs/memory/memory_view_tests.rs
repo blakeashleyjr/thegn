@@ -302,6 +302,12 @@ fn board_snapshots_cover_size_and_capability_matrix() {
                     frame.parts.vmstat.rates
                         [thegn_metrics::collect::model::vmstat::VmRate::StealDirect as usize] =
                         Some(1000.0 + (sample % 20) as f64 * 50.0);
+                    frame.parts.vmstat.rates
+                        [thegn_metrics::collect::model::vmstat::VmRate::ScanDirect as usize] =
+                        Some(20.0 + (sample % 17) as f64 * 3.0);
+                    frame.parts.vmstat.rates
+                        [thegn_metrics::collect::model::vmstat::VmRate::RefaultAnon as usize] =
+                        Some(2.0 + (sample % 13) as f64 * 2.0);
                     if let Some(mut some) = frame.parts.psi.memory.file.some {
                         some.avg10 = 100 + (sample % 20) * 25;
                         frame.parts.psi.memory.file.some = Some(some);
@@ -344,7 +350,7 @@ fn board_snapshots_cover_size_and_capability_matrix() {
                 assert!(rendered.contains("health"));
                 if cols == 240 {
                     let ratio = fill_ratio(&surface, Rect::full(cols, rows));
-                    // density follow-up (batch 50): estimated, primary sets from the printed value
+                    // density follow-up (batch 51): estimated, primary sets from the printed value
                     if level == UnicodeLevel::Ascii {
                         assert!(ratio >= 0.30, "ASCII fill ratio {ratio:.3}");
                     } else {
@@ -391,13 +397,23 @@ fn board_snapshots_cover_size_and_capability_matrix() {
 fn slice_limit_history_stays_bounded_after_warmup() {
     let mut model = MemoryModel::default();
     for sample in 0_u32..1_000 {
-        let mut frame = MonitorFrame::default();
+        let mut frame = fixture(true);
+        frame.parts.vmstat.rates
+            [thegn_metrics::collect::model::vmstat::VmRate::ScanDirect as usize] =
+            Some(100.0 + f64::from(sample % 37));
+        frame.parts.vmstat.rates
+            [thegn_metrics::collect::model::vmstat::VmRate::RefaultAnon as usize] =
+            Some(20.0 + f64::from(sample % 13));
         frame.parts.cgroup_slice.sample.mem_current = Some(1024 + u64::from(sample % 37) * 64);
         frame.parts.cgroup_slice.sample.mem_max =
             Some(thegn_metrics::collect::model::cgroup::Limit::Value(8192));
         model.absorb_frame(&frame);
     }
     assert_eq!(model.limit_history.len, 120);
+    assert_eq!(model.reclaim_history.len, 120);
+    assert_eq!(model.scan_history.len, 120);
+    assert_eq!(model.refault_history.len, 120);
+    assert_eq!(model.psi_history.len, 120);
 }
 
 #[test]
@@ -524,11 +540,144 @@ fn memory_history_keeps_only_the_latest_bounded_window() {
 #[test]
 fn short_history_is_right_aligned_without_upsampling() {
     caps::test_override::with_unicode(UnicodeLevel::Full, || {
-        assert_eq!(super::right_aligned_raster_window(3, 10), (0, 3, 8, 2));
+        assert_eq!(
+            crate::monitor::kit::history_rect::graph_rect(Rect::full(10, 2), 3, true),
+            Rect {
+                x: 8,
+                y: 0,
+                cols: 2,
+                rows: 2
+            }
+        );
     });
     caps::test_override::with_unicode(UnicodeLevel::Ascii, || {
-        assert_eq!(super::right_aligned_raster_window(3, 10), (0, 3, 7, 3));
+        assert_eq!(
+            crate::monitor::kit::history_rect::graph_rect(Rect::full(10, 2), 3, false),
+            Rect {
+                x: 7,
+                y: 0,
+                cols: 3,
+                rows: 2
+            }
+        );
     });
+}
+
+#[test]
+fn paging_history_uses_varying_rates_and_reaches_the_last_inner_column() {
+    let mut model = MemoryModel::default();
+    for sample in 0_u64..20 {
+        let mut frame = fixture(true);
+        frame.parts.vmstat.rates
+            [thegn_metrics::collect::model::vmstat::VmRate::ScanDirect as usize] =
+            Some(100.0 + (sample * 17) as f64);
+        frame.parts.vmstat.rates
+            [thegn_metrics::collect::model::vmstat::VmRate::RefaultAnon as usize] =
+            Some(10.0 + (sample * 7) as f64);
+        model.absorb_frame(&frame);
+    }
+    let view = MemoryView(&model);
+    let area = Rect::full(240, 60);
+    let board = Board::default();
+    let panel = board
+        .placed(&view, area)
+        .into_iter()
+        .find(|panel| panel.id.0 == "memory.paging")
+        .expect("paging panel is placed");
+    let mut surface = Surface::new(area.cols, area.rows);
+    board.paint(&view, &mut surface, area, 0, &[]);
+    let rendered = text(&surface);
+    for label in ["scan / sec (window peak)", "refaults / sec (window peak)"] {
+        let label_row = rendered
+            .lines()
+            .position(|line| line.contains(label))
+            .expect("history scale is labelled");
+        let graph_row = label_row + 1;
+        let last_inner_col = panel.rect.x + panel.rect.cols - 2;
+        let graph_char = rendered
+            .lines()
+            .nth(graph_row)
+            .and_then(|line| line.chars().nth(last_inner_col));
+        assert!(
+            graph_char.is_some_and(|ch| ch != ' ' && ch != '\u{2800}'),
+            "{label} newest sample reaches final inner column: {rendered}"
+        );
+    }
+}
+
+#[test]
+fn swap_panel_shows_zram_composition_against_device_size() {
+    let mut frame = fixture(true);
+    frame
+        .parts
+        .meminfo
+        .zram
+        .push(thegn_metrics::collect::model::meminfo::ZramDev {
+            name: "zram0".to_owned(),
+            mm: Some(thegn_metrics::collect::parse::zram::ZramMmStat {
+                orig_data_size: 4096,
+                compr_data_size: 2048,
+                mem_used_total: 3072,
+                ..Default::default()
+            }),
+        });
+    thegn_metrics::collect::parse::swaps::parse(
+        b"Filename Type Size Used Priority\n/dev/zram0 partition 8 3 -1\n/var/swap-zram.img file 16 4 -2\n",
+        &mut frame.parts.meminfo.swaps,
+    );
+    let mut model = MemoryModel::default();
+    model.absorb_frame(&frame);
+    let mut telemetry = TelemetryHistory::default();
+    for sample in 0_u64..3 {
+        telemetry.push(
+            &StatsSnapshot {
+                swap_gib: Some((0.5 + sample as f32 / 10.0, 2.0)),
+                ..Default::default()
+            },
+            (sample + 1) * 1000,
+        );
+    }
+    model.absorb_history(&telemetry, Window::EVERYTHING, ScaleMode::Window, 3000);
+    model.swap_total = Some(8192);
+    model.swap_free = Some(4096);
+    let view = MemoryView(&model);
+    let area = Rect::full(160, 45);
+    let board = Board::default();
+    let mut surface = Surface::new(area.cols, area.rows);
+    board.paint(&view, &mut surface, area, 0, &[]);
+    let rendered = text(&surface);
+    assert!(rendered.contains("zram original"), "{rendered}");
+    assert!(rendered.contains("swap history"), "{rendered}");
+    assert!(rendered.contains("compressed"), "{rendered}");
+    assert!(rendered.contains("disk"), "{rendered}");
+    assert_eq!(model.zram_used, Some(3072));
+    assert_eq!(model.zram_totals, (Some(4096), Some(2048), Some(8192)));
+}
+
+#[test]
+fn zero_paging_histories_keep_their_rate_labels() {
+    let mut model = MemoryModel::default();
+    for _ in 0..2 {
+        let mut frame = fixture(false);
+        frame.parts.vmstat.rates
+            [thegn_metrics::collect::model::vmstat::VmRate::ScanDirect as usize] = Some(0.0);
+        model.absorb_frame(&frame);
+    }
+    let view = MemoryView(&model);
+    let area = Rect::full(240, 60);
+    let mut surface = Surface::new(area.cols, area.rows);
+    Board::default().paint(&view, &mut surface, area, 0, &[]);
+    let rendered = text(&surface);
+    for label in ["scan / sec (window peak):", "refaults / sec (window peak):"] {
+        let line = rendered
+            .lines()
+            .find(|line| line.contains(label))
+            .unwrap_or_else(|| panic!("zero history keeps {label} visible: {rendered}"));
+        assert!(
+            line.contains("0 pages/s"),
+            "zero history labels {label} with its real zero rate: {line}"
+        );
+    }
 }
 
 #[test]

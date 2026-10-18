@@ -74,6 +74,11 @@ log scale while Network stays on a live linear one.
   load average — fall back to `window` under `fixed`, since there is no honest
   number to divide by.
 
+On the Memory and Network graphs, and the batch-50 density graphs, leading
+gaps before the first reading stay blank; later gaps carry the last reading
+forward. Rate metrics such as network traffic and disk I/O read empty intervals
+as zero.
+
 `Space` **pauses**. That freezes the picture. The history graphs keep recording
 at the normal, non-live rate, so resuming shows no gap; the monitor's detailed
 sampler stops until you resume. That makes a paused monitor cheaper than a live
@@ -126,11 +131,12 @@ The Memory tab is a panel board. `memory.composition` shows total, available,
 used, free and the component breakdown with bounded usage history from the
 selected telemetry window, scaled against total memory; frame samples and
 telemetry history use separate rings. `memory.verdict` summarizes memory health;
-`memory.pressure` shows PSI some/full pressure; `memory.swap` appears when swap
-exists and includes selected-window history scaled against total swap when
-samples are available;
-`memory.paging` shows reclaim, refault and fault rates; and `memory.limit` shows
-the process cgroup limit and thegn.slice usage. A missing limit is shown as
+`memory.pressure` shows PSI some/full pressure and its history; `memory.swap`
+appears when swap exists and includes selected-window history scaled against
+total swap, plus zram original, compressed and device sizes when available;
+`memory.paging` shows reclaim, scan and refault histories with labelled window
+peaks alongside current rates; and `memory.limit` shows the process cgroup
+limit and thegn.slice usage history. A missing limit is shown as
 `—`; when every cgroup level is unlimited, the panel says `no limit`. Use
 `f`/`F` to focus or unfocus a panel,
 `z` to zoom it, and `Esc` to step back through focus and zoom. The memory and
@@ -140,22 +146,28 @@ swap masthead chips expand into this tab.
 
 The Thermal tab shows the CPU package trend, per-core temperatures, the sensor
 table with bounded per-sensor history, GPU temperatures and telemetry, thermal
-zones with trips, and a per-core history heatmap. Missing readings use the
-absent mark; no reading is displayed as zero. Panel demand follows the panels
-placed on screen: `thermal.package`, `thermal.cores`, `thermal.sensors`,
-`thermal.zones`, `thermal.gpu`, and `thermal.heatmap`. Use `f`/`F` to move panel
-focus, `z` to zoom the focused panel, and `Esc` to unzoom before closing the
-monitor. The temperature masthead chip expands into this tab.
+zones with trips, and a per-core history heatmap. Temperature bars and sensor
+sparklines use a published max or critical threshold; sensors without one show
+the reading without a bar or sparkline. GPU temperature history shows its
+80/95 C thermal ramp. Missing readings use the absent mark; no reading is
+displayed as zero. Panel demand follows the panels placed on screen:
+`thermal.package`, `thermal.cores`, `thermal.sensors`, `thermal.zones`,
+`thermal.gpu`, and `thermal.heatmap`. Use `f`/`F` to move panel focus, `z` to
+zoom the focused panel, and `Esc` to unzoom before closing the monitor. The
+temperature masthead chip expands into this tab.
 
 ## Network
 
-The Network board has separate panels for mirrored receive/transmit throughput,
-interfaces, and error/drop health. The throughput plot uses telemetry history;
-the interface sparklines use the sampled per-interface rings. Totals count
-physical links only, so VPN traffic is not double-counted. Interface rows keep
-idle and down links visible, and fold interfaces beyond the eight history slots
-into `other`. Use `f`/`F` to focus a panel, `z` to zoom it, and `Esc` to step
-back through focus and zoom. The network masthead chip expands into this tab.
+The Network board has panels for mirrored receive/transmit throughput,
+interfaces, error/drop health, and Wi-Fi. The throughput plot uses telemetry
+history; interface rates and Wi-Fi signal use sampled per-interface rings. The
+Wi-Fi panel shows the SSID, a masked BSSID, frequency and width, signal and
+average signal, retry/failure counts, and connection time. Its sparkline uses a
+labelled −90 to −30 dBm scale. Totals count physical links only, so VPN traffic
+is not double-counted. Interface rows keep idle and down links visible, and
+fold interfaces beyond the eight history slots into `other`. Use `f`/`F` to
+focus a panel, `z` to zoom it, and `Esc` to step back through focus and zoom.
+The network masthead chip expands into this tab.
 
 ## Disk
 
@@ -193,9 +205,11 @@ platform`. The check does not prompt.
 
 ## GPU
 
-On AMDGPU, the GPU tab has device, engine, memory, and clocks panels. Engine
-busy history, VRAM/GTT use, clock level, and power against its reported cap are
-plotted on their labelled 0–100% scales when readings are available. A runtime-
+On AMDGPU, the GPU tab has device, engine, memory, and clocks panels. The engine
+panel plots verified SMU gfx, media, VCN, UMC, and available IPU activity rings
+on a labelled 0–100% scale, alongside engine busy history. Memory and clocks
+panels plot each device's VRAM/GTT use, clock level, and power against its
+reported cap on labelled 0–100% scales when readings are available. A runtime-
 suspended card is not woken to sample it; its values are shown as unavailable
 rather than zero. On APUs, shared memory is labelled `shared vram`.
 
@@ -214,8 +228,9 @@ against battery capacity, and draw magnitude against its labelled peak with the
 current signed direction shown; and `power.policy` shows profile, boost, and EPP
 as status chips. Frame and telemetry histories use separate scales. Unavailable
 readings use the platform's absent or warming mark.
-Panel focus and zoom use `f`/`F` and `z`. The tab appears when a battery source
-is available; the battery masthead chip opens it.
+Panel focus and zoom use `f`/`F` and `z`. The tab appears when a battery, power
+rail, platform profile, or mains/USB power source is available; the battery
+masthead chip opens it.
 
 ## Processes
 
@@ -262,6 +277,17 @@ and new/exited values unknown until their baselines are available.
   pinned, the signal is refused and the reason is shown in the footer. This is
   a local, terminal-only action: it is not exposed to the CLI, the control API,
   or any remote surface.
+- `=` opens a renice confirmation showing the current and proposed nice values.
+  Use `+` / `-` to adjust within `-20..=19`, `y` to apply, or `n` / `Esc` to
+  cancel. The selected PID and start time are checked again before applying;
+  a changed or missing process is refused. Permission errors while lowering
+  nice are shown and never retried. On Windows, nice values represent priority
+  classes, so a one-point adjustment can remain in the same class.
+- `I` opens the Linux-only ionice confirmation. `+` / `-` cycle through idle,
+  best-effort levels 0–7 and realtime. A process with no explicit I/O priority
+  is treated as the kernel's default best-effort level 4. Realtime requires
+  root; permission errors are shown and never retried. The selected PID and
+  start time are checked again before applying.
 
 Enumerating every process is the one genuinely expensive reading thegn takes, so
 it only happens while this tab is open and unpaused — closing the tab stops it
@@ -286,13 +312,15 @@ leads with the ownership split — how many are owned under that rule, how many
 are foreign — because the list deliberately includes foreign containers. On an
 engine that reports a footprint it continues with images, volumes and the
 engine's on-disk total (marked `≥` when a backend can't report disk usage);
-otherwise with how many are running. The tab only appears when a container
-engine is present.
+otherwise with how many are running. The tab appears while any container is
+listed and, until the first listing arrives, keeps a tab you left open; an
+empty listing hides it.
 
 Sampling those per-container numbers (and the disk total) is the one expensive
-reading here, so — like Processes — it runs **only while this tab is open**;
-close it and the ambient refresh drops back to the cheap listing. The disk
-total refreshes on a slower cadence than the stats.
+reading here, so — like Processes — it runs only while this tab is open and the
+monitor is not paused, or while the panel's Sandbox section is open; close both
+and the ambient refresh drops back to the cheap listing. The disk total
+refreshes on a slower cadence than the stats.
 
 Actions apply only to containers proven to belong to this profile for a
 known worktree on that worktree's launch backend (including recognized
@@ -333,8 +361,9 @@ Separately from this modal, thegn can warn you when a metric crosses a
 threshold — see `[stats.alerts]` in the config reference. A reading has to stay
 past the line for `sustain_secs` before anything fires, a standing alert repeats
 at most every `repeat_secs`, and clearing needs the value to retreat past the
-threshold by `clear_margin`, so nothing flaps. Alerts show as a toast; set
-`notify = true` to also record them to the notification inbox.
+threshold by `clear_margin` and stay there for `sustain_secs`, so nothing flaps.
+Set `toast = true` to pop a toast and `notify = true` to record the alert to the
+notification inbox; both are off by default.
 
 ## Configuration
 
