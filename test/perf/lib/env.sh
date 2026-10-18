@@ -70,19 +70,6 @@ perf_make_tmp() {
 # through `podman unshare` when ordinary rm cannot remove the isolated tree.
 perf_cleanup() {
   local d cmdline
-  if [ -n "${PERF_TMP:-}" ] && [ -d /proc ]; then
-    for d in /proc/[0-9]*; do
-      [ -r "$d/cmdline" ] && [ -r "$d/environ" ] || continue
-      cmdline="$(tr '\0' ' ' <"$d/cmdline" 2>/dev/null || true)"
-      case "$cmdline" in
-      *podman\ pause*)
-        if tr '\0' '\n' <"$d/environ" 2>/dev/null | grep -F -- "$PERF_TMP" >/dev/null; then
-          kill "${d##*/}" 2>/dev/null || true
-        fi
-        ;;
-      esac
-    done
-  fi
   if [ -n "${PERF_SOCK_DIR:-}" ]; then
     rm -rf -- "$PERF_SOCK_DIR" || true
   fi
@@ -90,6 +77,21 @@ perf_cleanup() {
     if ! rm -rf -- "$PERF_TMP" && command -v podman >/dev/null 2>&1; then
       podman unshare rm -rf -- "$PERF_TMP" || true
     fi
+  fi
+  # `podman unshare` can start a new pause process with this fixture's runtime
+  # environment, so scan after both deletion attempts. Match a path component.
+  if [ -n "${PERF_TMP:-}" ] && [ -d /proc ]; then
+    for d in /proc/[0-9]*; do
+      [ -r "$d/cmdline" ] && [ -r "$d/environ" ] || continue
+      cmdline="$(tr '\0' ' ' <"$d/cmdline" 2>/dev/null || true)"
+      case "$cmdline" in
+      *podman\ pause*)
+        if tr '\0' '\n' <"$d/environ" 2>/dev/null | grep -F -- "$PERF_TMP/" >/dev/null; then
+          kill "${d##*/}" 2>/dev/null || true
+        fi
+        ;;
+      esac
+    done
   fi
 }
 

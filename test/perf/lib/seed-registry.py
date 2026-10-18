@@ -2,6 +2,7 @@
 """Register fixture linked worktrees in the isolated thegn database."""
 
 import os
+import pwd
 import sqlite3
 import sys
 import time
@@ -42,8 +43,15 @@ def main() -> int:
         tmp_root = Path(perf_tmp).resolve(strict=True)
         db_path = Path(sys.argv[1]).resolve()
         repo_root = Path(sys.argv[2]).resolve(strict=True)
+        live_state = (Path(pwd.getpwuid(os.getuid()).pw_dir) / ".local/state/thegn").resolve()
     except OSError as error:
         print(f"seed-registry: cannot resolve fixture paths: {error}", file=sys.stderr)
+        return 2
+    if not tmp_root.name.startswith("tg-perf."):
+        print(f"seed-registry: refusing non-perf temp root: {tmp_root}", file=sys.stderr)
+        return 2
+    if within(db_path, live_state):
+        print(f"seed-registry: refusing live thegn DB: {db_path}", file=sys.stderr)
         return 2
     if not within(db_path, tmp_root):
         print(f"seed-registry: refusing DB outside PERF_TMP: {db_path}", file=sys.stderr)
@@ -64,8 +72,15 @@ def main() -> int:
         return 2
 
     slug = repo_root.name
+    connection = None
     try:
         connection = sqlite3.connect(db_path)
+        for registered_path, registered_slug in connection.execute(
+            "SELECT repo_path, slug FROM repo_slugs"
+        ):
+            if os.path.realpath(registered_path) == str(repo_root):
+                slug = registered_slug
+                break
         columns = {
             row[1] for row in connection.execute("PRAGMA table_info(worktrees)")
         }
@@ -105,10 +120,12 @@ def main() -> int:
                         index,
                     ),
                 )
-        connection.close()
     except (OSError, sqlite3.Error, RuntimeError) as error:
         print(f"seed-registry: {error}", file=sys.stderr)
         return 1
+    finally:
+        if connection is not None:
+            connection.close()
 
     print(f"seed-registry: registered {count} worktrees in {db_path}")
     return 0
