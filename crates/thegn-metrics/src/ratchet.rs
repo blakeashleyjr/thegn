@@ -412,6 +412,7 @@ pub fn sets_state_env_directly(body: &str) -> bool {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Token<'a> {
     Hash,
+    Bang,
     OpenBracket,
     CloseBracket,
     OpenParen,
@@ -471,6 +472,7 @@ fn lex_code<'a>(code: &'a str) -> Vec<Token<'a>> {
         }
         let token = match bytes[index] {
             b'#' => Token::Hash,
+            b'!' => Token::Bang,
             b'[' => Token::OpenBracket,
             b']' => Token::CloseBracket,
             b'(' => Token::OpenParen,
@@ -601,10 +603,22 @@ pub fn has_platform_cfg(body: &str) -> bool {
     let tokens = lex_code(&code);
     let mut index = 0;
     while index + 3 < tokens.len() {
-        if tokens[index] == Token::Hash && tokens[index + 1] == Token::OpenBracket {
-            let is_cfg = matches!(tokens[index + 2], Token::Ident("cfg" | "cfg_attr"));
-            if is_cfg && tokens[index + 3] == Token::OpenParen {
-                let (found, _) = predicate(&tokens, index + 4);
+        let name_index = if tokens[index] == Token::Hash && tokens[index + 1] == Token::OpenBracket
+        {
+            Some(index + 2)
+        } else if index + 4 < tokens.len()
+            && tokens[index] == Token::Hash
+            && tokens[index + 1] == Token::Bang
+            && tokens[index + 2] == Token::OpenBracket
+        {
+            Some(index + 3)
+        } else {
+            None
+        };
+        if let Some(name_index) = name_index {
+            let is_cfg = matches!(tokens[name_index], Token::Ident("cfg" | "cfg_attr"));
+            if is_cfg && tokens[name_index + 1] == Token::OpenParen {
+                let (found, _) = predicate(&tokens, name_index + 2);
                 if found {
                     return true;
                 }
@@ -801,6 +815,11 @@ mod tests {
             "#[cfg(any(feature = \"x\", /* unix */ windows))]"
         ));
         assert!(!has_platform_cfg("#[cfg(feature = \"unix\")]"));
+        assert!(has_platform_cfg("#![cfg(unix)]"));
+        assert!(has_platform_cfg(
+            "#![cfg_attr(target_os = \"linux\", allow(dead_code))]"
+        ));
+        assert!(!has_platform_cfg("#![cfg(feature = \"unix\")]"));
         assert!(!has_platform_cfg(
             "#[cfg(kani)] #[cfg(any(test, feature = \"x\"))]"
         ));

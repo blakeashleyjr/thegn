@@ -1461,7 +1461,7 @@ mod tests {
     fn mise_child_timeout_kills_a_pipe_holding_grandchild() {
         use std::time::Instant;
 
-        if !Path::new("/bin/sh").exists() || !Path::new("/proc/self/stat").exists() {
+        if !cfg!(target_os = "linux") {
             return;
         }
         let dir = tempfile::tempdir().unwrap();
@@ -1497,7 +1497,7 @@ mod tests {
 
     #[test]
     fn mise_child_over_cap_is_an_error() {
-        if !Path::new("/bin/sh").exists() {
+        if !cfg!(unix) {
             return;
         }
         let mut command = Command::new("/bin/sh");
@@ -1508,7 +1508,7 @@ mod tests {
 
     #[test]
     fn mise_child_reports_status_output_and_spawn_failure() {
-        if !Path::new("/bin/sh").exists() {
+        if !cfg!(unix) {
             return;
         }
         let mut successful = Command::new("/bin/sh");
