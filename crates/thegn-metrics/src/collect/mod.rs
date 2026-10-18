@@ -46,10 +46,11 @@ pub enum CollectorId {
     CpuIrq,
     CpuSched,
     ThermalZone,
+    Filesystems,
 }
 
 impl CollectorId {
-    pub const ALL: [Self; 18] = [
+    pub const ALL: [Self; 19] = [
         Self::Loadavg,
         Self::Uptime,
         Self::Psi,
@@ -68,6 +69,7 @@ impl CollectorId {
         Self::CpuIrq,
         Self::CpuSched,
         Self::ThermalZone,
+        Self::Filesystems,
     ];
 
     pub const fn slug(self) -> &'static str {
@@ -90,6 +92,7 @@ impl CollectorId {
             Self::CpuIrq => "cpu_irq",
             Self::CpuSched => "cpu_sched",
             Self::ThermalZone => "thermal_zone",
+            Self::Filesystems => "filesystems",
         }
     }
 
@@ -190,6 +193,8 @@ pub fn default_collectors() -> Vec<Box<dyn Collector>> {
         Box::new(linux::cpu_sched::CpuSchedCollector::new());
     collectors[CollectorId::ThermalZone.index()] =
         Box::new(linux::thermal_zones::ThermalZoneCollector::new());
+    collectors[CollectorId::Filesystems.index()] =
+        Box::new(linux::mounts_fs::FilesystemsCollector::new());
     collectors
 }
 
@@ -221,6 +226,7 @@ mod default_collectors_tests {
             CollectorId::CpuIrq,
             CollectorId::CpuSched,
             CollectorId::ThermalZone,
+            CollectorId::Filesystems,
         ] {
             assert_ne!(
                 collectors[id.index()].cadence(),
