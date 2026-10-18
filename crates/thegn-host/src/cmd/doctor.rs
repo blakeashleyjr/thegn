@@ -1262,6 +1262,9 @@ fn sample_metric_coverage(cfg: &Config) -> Vec<thegn_metrics::FamilyReport> {
 
 /// Discover the CLI diagnostic collector set once; visible-only readers are
 /// deliberately left untouched because their cost belongs to visible panels.
+/// This process-wide cache assumes CLI callers (`thegn doctor` and `thegn
+/// bundle`) exit after the command. A long-lived caller of `doctor_json*`
+/// would retain this health snapshot for the process lifetime.
 fn monitor_collectors_health()
 -> &'static [thegn_metrics::collect::health::Health; thegn_metrics::collect::COLLECTORS] {
     static HEALTH: std::sync::OnceLock<
@@ -1279,9 +1282,9 @@ fn discover_monitor_collectors(
     mut collectors: Vec<Box<dyn thegn_metrics::collect::Collector>>,
     env: &thegn_metrics::collect::env::Env,
 ) -> [thegn_metrics::collect::health::Health; thegn_metrics::collect::COLLECTORS] {
-    use thegn_metrics::collect::health::Health;
+    use thegn_metrics::collect::health::{Absent, Health};
 
-    let mut health = [Health::Warming; thegn_metrics::collect::COLLECTORS];
+    let mut health = [Health::Absent(Absent::NotImplemented); thegn_metrics::collect::COLLECTORS];
     for collector in &mut collectors {
         let id = collector.id();
         if !id.visible_only() {
@@ -1405,6 +1408,11 @@ fn monitor_collector_formatters_cover_every_id_and_health_state() {
         .collect::<Vec<_>>()
         .join("\n");
     assert_eq!(actual_text, expected_text);
+    assert!(
+        monitor_collectors_lines(&health)
+            .iter()
+            .any(|line| line.as_str() == "  loadavg          ok")
+    );
 
     let expected_json: serde_json::Map<String, serde_json::Value> = CollectorId::ALL
         .into_iter()
@@ -1488,7 +1496,10 @@ fn monitor_collector_discovery_skips_visible_only_and_closes_collectors() {
     assert_eq!(visible_discovered.load(Ordering::SeqCst), 0);
     assert_eq!(closed.load(Ordering::SeqCst), 2);
     assert_eq!(health[CollectorId::Loadavg.index()], Health::Ok);
-    assert_eq!(health[CollectorId::GpuClients.index()], Health::Warming);
+    assert_eq!(
+        health[CollectorId::GpuClients.index()],
+        Health::Absent(thegn_metrics::collect::health::Absent::NotImplemented)
+    );
 }
 
 #[cfg(test)]
