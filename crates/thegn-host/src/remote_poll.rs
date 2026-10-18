@@ -431,10 +431,13 @@ fn refresh_badges(
 /// Match each checked-out branch to the repo-wide ref read. Detached checkouts
 /// and branches absent from the read cannot be patched, so invalidate only
 /// those rows and let normal hydration reconstruct them.
+/// (path, branch, ahead, behind) cache patches for checkouts whose upstream moved.
+type AheadBehindPatch = (String, String, usize, usize);
+
 fn ahead_behind_patches(
     checkouts: &[(String, Option<String>)],
     branches: &[thegn_core::gitrefs::BranchInfo],
-) -> (Vec<(String, String, usize, usize)>, Vec<String>) {
+) -> (Vec<AheadBehindPatch>, Vec<String>) {
     let mut patches = Vec::new();
     let mut evictions = Vec::new();
     for (path, branch) in checkouts {
