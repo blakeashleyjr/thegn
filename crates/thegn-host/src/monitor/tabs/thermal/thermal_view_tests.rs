@@ -330,8 +330,8 @@ fn deterministic_snapshots_cover_sizes_capabilities_and_demand() {
                     assert_eq!(output.matches("composite").count(), 1);
                     if cols == 240 {
                         let r = fill_ratio(&surface, area);
-                        // density follow-up (batch 49): estimated 0.30; primary to measure
-                        assert!(r >= 0.30, "fill ratio {r:.3}");
+                        // density follow-up (batch 50): estimated, primary sets from the printed value
+                        assert!(r >= 0.33, "fill ratio {r:.3}");
                     }
                 })
             });
@@ -520,13 +520,28 @@ fn telemetry_temp_series_is_separate_from_frame_package_history() {
     assert!(graph_text.contains("telemetry 80/95 C"));
     let graph_rows = graph_text.lines().collect::<Vec<_>>();
     let frame_rows = frame_only_text.lines().collect::<Vec<_>>();
-    assert_eq!(graph_rows[5], frame_rows[5]);
+    for row in 0..=4 {
+        assert_eq!(graph_rows[row], frame_rows[row]);
+    }
+    assert!(graph_rows[5].contains("telemetry 80/95 C"));
+    assert_ne!(graph_rows[5], frame_rows[5]);
     assert!(
-        graph_rows[7..]
+        graph_rows[6..=43]
             .iter()
-            .zip(&frame_rows[7..])
+            .zip(&frame_rows[6..=43])
             .any(|(left, right)| left != right)
     );
+    assert!(frame_rows[6..=43].iter().all(|row| {
+        row.chars()
+            .skip(1)
+            .take(158)
+            .all(|cell| cell == ' ' || cell == '\u{2800}')
+    }));
+    let newest_graph_cell = graph_rows[43]
+        .chars()
+        .nth(158)
+        .expect("package graph's final inner column");
+    assert!(newest_graph_cell != ' ' && newest_graph_cell != '\u{2800}');
 
     let mut with_graph = CellGrid::new(80, 12);
     let mut without_graph = CellGrid::new(80, 12);
