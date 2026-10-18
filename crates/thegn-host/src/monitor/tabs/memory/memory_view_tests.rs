@@ -624,8 +624,13 @@ fn short_memory_histories_are_right_aligned_by_the_painters() {
         let left = panel.rect.x + 1;
         let right = panel.rect.x + panel.rect.cols - 2;
         let last_inner_row = panel.rect.y + panel.rect.rows - 2;
-        for chart_row in label_row + 1..=last_inner_row {
-            let mut chart = lines[chart_row].clone();
+        for (chart_row, line) in lines
+            .iter()
+            .enumerate()
+            .take(last_inner_row + 1)
+            .skip(label_row + 1)
+        {
+            let mut chart = line.clone();
             chart.resize(area.cols, ' ');
             assert!(
                 chart[left..left + 3]
