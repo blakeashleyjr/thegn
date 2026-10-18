@@ -33,7 +33,7 @@ enum PaneIo {
     /// lives on the event loop. `master` stays for resize — an ioctl on a
     /// different channel, needing no ordering with stdin.
     Pty {
-        master: Box<dyn MasterPty + Send>,
+        master: Option<Box<dyn MasterPty + Send>>,
         stdin: crate::pane_writer::StdinTx,
     },
     /// A native provider exec session: stdin/resize go to the relay task over
@@ -156,6 +156,9 @@ pub struct PtyPane {
     /// Time-travel recording ring (`[replay]`). `None` when replay is disabled —
     /// then `feed` does a single null check and allocates nothing.
     record: Option<crate::replay::Recording>,
+    /// Test sentinel for the same parcel lifetime as replay data.
+    #[cfg(test)]
+    drop_probe: Option<Box<dyn Send>>,
     /// Corner panes receive parser-filtered fragments, so their byte stream is
     /// not safe to retain as an independently replayable recording.
     corner_role: bool,
@@ -203,6 +206,10 @@ pub struct PtyPane {
 /// local child; whether their server-side
 ///   session is killed or detached is the relay task's business, governed by
 ///   `detach_on_drop`.
+/// The recording ring and PTY master move into the reaper parcel too. The
+/// owner sends TERM/KILL and waits before releasing it, so teardown does not
+/// depend on master-close SIGHUP; the reader has its own cloned handle and sees
+/// EOF when the slave side closes.
 impl Drop for PtyPane {
     fn drop(&mut self) {
         if !matches!(self.io, PaneIo::Pty { .. }) {
@@ -219,10 +226,21 @@ impl Drop for PtyPane {
             );
             let history = std::mem::replace(&mut self.history, HistoryBuffer::new(1));
             let history_partial = std::mem::take(&mut self.history_partial);
+            let record = self.record.take();
+            let master = match &mut self.io {
+                PaneIo::Pty { master, .. } => master.take(),
+                PaneIo::Stream { .. } => None,
+            };
+            #[cfg(test)]
+            let drop_probe = self.drop_probe.take();
             process.terminate_and_reap_detached_with(Box::new((
                 emulator,
                 history,
                 history_partial,
+                record,
+                master,
+                #[cfg(test)]
+                drop_probe,
             )));
         }
     }
@@ -378,7 +396,7 @@ impl PtyPane {
 
         Ok(Self {
             io: PaneIo::Pty {
-                master: pty.master,
+                master: Some(pty.master),
                 stdin: crate::pane_writer::spawn_stdin_writer(
                     pty.writer,
                     crate::pane_writer::WriterLog::Pane { pane: id },
@@ -404,6 +422,8 @@ impl PtyPane {
             predictor: crate::predict::Predictor::new(),
             predict_clock: std::time::Instant::now(),
             record: None,
+            #[cfg(test)]
+            drop_probe: None,
             corner_role: false,
             loop_fed,
             last_output_at: None,
@@ -490,6 +510,8 @@ impl PtyPane {
             predictor: crate::predict::Predictor::new(),
             predict_clock: std::time::Instant::now(),
             record: None,
+            #[cfg(test)]
+            drop_probe: None,
             corner_role: false,
             // Stream frames arrive via the relay task's Output events with no
             // reader-side feeder — the loop parses them.
@@ -822,6 +844,9 @@ impl PtyPane {
         }
         match &self.io {
             PaneIo::Pty { master, .. } => {
+                let Some(master) = master else {
+                    return Ok(());
+                };
                 master
                     .resize(PtySize {
                         rows,
@@ -915,6 +940,8 @@ impl PtyPane {
             predictor: crate::predict::Predictor::new(),
             predict_clock: std::time::Instant::now(),
             record: None,
+            #[cfg(test)]
+            drop_probe: None,
             corner_role: false,
             loop_fed: Arc::new(std::sync::atomic::AtomicBool::new(true)),
             last_output_at: None,
@@ -1855,6 +1882,9 @@ mod tests {
 
     #[test]
     fn pty_round_trip_lands_output_in_grid() {
+        if !cfg!(unix) {
+            return;
+        }
         let (tx, mut rx) = tokio_mpsc::channel(1024);
         let mut pane =
             PtyPane::spawn_with_env(0, &sh("printf 'hello-pty'"), None, &[], 24, 80, tx, None)
@@ -1873,6 +1903,9 @@ mod tests {
 
     #[test]
     fn pty_write_input_delivers_through_writer_thread() {
+        if !cfg!(unix) {
+            return;
+        }
         // End-to-end delivery through the real wiring: loop-side write_input →
         // StdinTx → writer thread → child stdin. `read x` blocks the child on
         // stdin, so the echoed reply proves the queued bytes actually reached
@@ -1906,6 +1939,9 @@ mod tests {
 
     #[test]
     fn large_write_does_not_block() {
+        if !cfg!(unix) {
+            return;
+        }
         // Regression for the deferred large-paste hang: a ~1MB write into a
         // child that never reads stdin must queue-and-return immediately, not
         // park the caller (the old write_all blocked once the kernel's ~64KB
@@ -1926,6 +1962,9 @@ mod tests {
 
     #[test]
     fn spawn_with_env_firewalls_launcher_creds_but_keeps_infra() {
+        if !cfg!(unix) {
+            return;
+        }
         // The clear-then-allowlist firewall: a credential-shaped var present in
         // thegn's OWN environment must NOT reach a spawned pane, while curated
         // infrastructure (PATH) still does. Mutate GH_TOKEN under the shared
@@ -1967,6 +2006,9 @@ mod tests {
 
     #[test]
     fn history_tail_captures_recent_output_and_repaint_repaints_it() {
+        if !cfg!(unix) {
+            return;
+        }
         // A pane that prints three lines: the history ring should hold them, and
         // history_tail returns the bounded, blank-trimmed tail.
         let (tx, mut rx) = tokio_mpsc::channel(1024);
@@ -2017,6 +2059,9 @@ mod tests {
 
     #[test]
     fn resize_propagates_to_child_via_winsize() {
+        if !cfg!(unix) {
+            return;
+        }
         // `stty size` prints "rows cols" read from the PTY winsize.
         let (tx, mut rx) = tokio_mpsc::channel(1024);
         let mut pane =
@@ -2622,6 +2667,9 @@ mod tests {
 
     #[test]
     fn backpressure_does_not_deadlock_on_a_flood() {
+        if !cfg!(unix) {
+            return;
+        }
         // A chatty child must not block the reader; we drain a bounded window
         // and drop the pane (reader thread exits when the channel sender errors).
         let (tx, mut rx) = tokio_mpsc::channel(1024);
@@ -2653,6 +2701,9 @@ mod tests {
 
     #[test]
     fn dropping_a_pane_reaps_a_sighup_ignoring_child() {
+        if !cfg!(unix) {
+            return;
+        }
         // THE regression this Drop exists for. Closing the PTY master SIGHUPs
         // the child, which is why dropping a pane appeared to kill it — but a
         // program that traps SIGHUP just keeps running with its slave fds open
@@ -2982,6 +3033,38 @@ mod tests {
                 .unwrap()
                 .as_deref(),
             Some("thegn-pty-reap")
+        );
+    }
+
+    struct PaneDropProbe(std::sync::mpsc::Sender<Option<String>>);
+
+    impl Drop for PaneDropProbe {
+        fn drop(&mut self) {
+            self.0
+                .send(std::thread::current().name().map(str::to_owned))
+                .unwrap();
+        }
+    }
+
+    #[test]
+    fn dropping_a_pane_releases_its_replay_parcel_off_loop() {
+        if !cfg!(unix) {
+            return;
+        }
+        let (tx, _rx) = tokio_mpsc::channel::<PaneEvent>(64);
+        let mut pane =
+            PtyPane::spawn_with_env(0, &sh("sleep 30"), None, &[], 24, 80, tx, None).unwrap();
+        let (dropped_tx, dropped_rx) = std::sync::mpsc::channel();
+        pane.drop_probe = Some(Box::new(PaneDropProbe(dropped_tx)));
+
+        drop(pane);
+        assert_eq!(
+            dropped_rx
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .unwrap()
+                .as_deref(),
+            Some("thegn-pty-reap"),
+            "the replay parcel must be released after the child reap off-loop"
         );
     }
 }
