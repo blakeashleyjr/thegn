@@ -120,12 +120,14 @@ focus (`f`/`F`), zoom (`z`), and Escape follow the monitor board controls.
 ## Memory
 
 The Memory tab is a panel board. `memory.composition` shows total, available,
-used, free and the component breakdown with a bounded usage history;
-`memory.verdict` summarizes memory health; `memory.pressure` shows PSI some/full
-pressure; `memory.swap` appears when swap exists; `memory.paging` shows reclaim,
-refault and fault rates; and `memory.limit` shows the process cgroup limit and
-thegn.slice usage. A missing limit is shown as `—`; when every cgroup level is
-unlimited, the panel says `no limit`. Use `f`/`F` to focus or unfocus a panel,
+used, free and the component breakdown with bounded usage history from the
+selected telemetry window. `memory.verdict` summarizes memory health;
+`memory.pressure` shows PSI some/full pressure; `memory.swap` appears when swap
+exists and includes selected-window history when samples are available;
+`memory.paging` shows reclaim, refault and fault rates; and `memory.limit` shows
+the process cgroup limit and thegn.slice usage. A missing limit is shown as
+`—`; when every cgroup level is unlimited, the panel says `no limit`. Use
+`f`/`F` to focus or unfocus a panel,
 `z` to zoom it, and `Esc` to step back through focus and zoom. The memory and
 swap masthead chips expand into this tab.
 
