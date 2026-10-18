@@ -346,6 +346,7 @@ if [ -n "$TIMEOUT_BIN" ]; then
   "$TIMEOUT_BIN" "${VERIFY_TIMEOUT_S}s" bash -c 'source "$0"; pty_run "$1"' \
     "$HERE/../lib/pty.sh" "$VERIFY_INNER" </dev/null >/dev/null 2>&1 &
 else
+  # shellcheck disable=SC2016 # $0/$1 expand in the inner bash, not here
   bash -c 'source "$0"; pty_run "$1"' \
     "$HERE/../lib/pty.sh" "$VERIFY_INNER" </dev/null >/dev/null 2>&1 &
 fi
@@ -398,9 +399,11 @@ TIMEOUT_BIN="$(pty_timeout_bin)"
 set -m
 if [ -n "$TIMEOUT_BIN" ]; then
   if [ "$WORKLOAD" = 1 ]; then
+    # shellcheck disable=SC2016 # $0/$1 expand in the inner bash, not here
     "$TIMEOUT_BIN" "${DEADLINE_S}s" bash -c 'source "$0"; pty_run "$1"' \
       "$HERE/../lib/pty.sh" "$INNER" <"$FIFO" >/dev/null 2>&1 &
   else
+    # shellcheck disable=SC2016 # $0/$1 expand in the inner bash, not here
     "$TIMEOUT_BIN" "${DEADLINE_S}s" bash -c 'source "$0"; pty_run "$1"' \
       "$HERE/../lib/pty.sh" "$INNER" </dev/null >/dev/null 2>&1 &
   fi
@@ -408,8 +411,10 @@ else
   # No timeout binary: the bench window (THEGN_BENCH_RUN_MS) still exits on its
   # own, so we lose only the belt-and-braces deadline.
   if [ "$WORKLOAD" = 1 ]; then
+    # shellcheck disable=SC2016 # $0/$1 expand in the inner bash, not here
     bash -c 'source "$0"; pty_run "$1"' "$HERE/../lib/pty.sh" "$INNER" <"$FIFO" >/dev/null 2>&1 &
   else
+    # shellcheck disable=SC2016 # $0/$1 expand in the inner bash, not here
     bash -c 'source "$0"; pty_run "$1"' "$HERE/../lib/pty.sh" "$INNER" </dev/null >/dev/null 2>&1 &
   fi
 fi
