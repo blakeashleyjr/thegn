@@ -30,16 +30,9 @@ perf_make_tmp() {
     esac
   done < <(env -0)
 
-  # A sandbox-on perf run may use the host's user manager, but the harness must
-  # keep its daemon socket private under the isolated runtime dir below.
+  # Only sandbox-on measurements need the host user manager. Expose its private
+  # socket in the isolated runtime dir, keeping the session bus private.
   unset DBUS_SESSION_BUS_ADDRESS
-  if [ -n "$real_runtime" ] && [ -S "$real_runtime/bus" ]; then
-    export DBUS_SESSION_BUS_ADDRESS="unix:path=$real_runtime/bus"
-  fi
-  if [ "${TG_PERF_SANDBOX:-}" = 1 ] && [ -z "${DBUS_SESSION_BUS_ADDRESS:-}" ]; then
-    echo 'perf: TG_PERF_SANDBOX=1 requires a user bus at the original XDG_RUNTIME_DIR/bus socket' >&2
-    return 1
-  fi
 
   PERF_TMP="$(mktemp -d "${TMPDIR:-/tmp}/tg-perf.XXXXXX")"
   export PERF_TMP
@@ -71,6 +64,18 @@ perf_make_tmp() {
   # 0700 to match the real run dir: the daemon rejects a lax one.
   mkdir -p "$XDG_RUNTIME_DIR"
   chmod 700 "$XDG_RUNTIME_DIR"
+  if [ "${TG_PERF_SANDBOX:-}" = 1 ]; then
+    if [ -n "$real_runtime" ] && [ -S "$real_runtime/systemd/private" ]; then
+      mkdir -p "$XDG_RUNTIME_DIR/systemd"
+      ln -s "$real_runtime/systemd/private" "$XDG_RUNTIME_DIR/systemd/private"
+    elif [ -n "$real_runtime" ] && [ -S "$real_runtime/bus" ]; then
+      export DBUS_SESSION_BUS_ADDRESS="unix:path=$real_runtime/bus"
+      echo 'perf: user manager private socket unavailable; exposing the session bus for TG_PERF_SANDBOX=1' >&2
+    else
+      echo 'perf: TG_PERF_SANDBOX=1 requires a user manager socket or session bus in the original XDG_RUNTIME_DIR' >&2
+      return 1
+    fi
+  fi
   # ~/.gitconfig is masked as a *directory* in some sandboxes; GIT_CONFIG_GLOBAL
   # points git at this file unconditionally.
   printf '[user]\n\tname = perf\n\temail = perf@example.invalid\n[init]\n\tdefaultBranch = main\n' \
@@ -80,54 +85,147 @@ perf_make_tmp() {
 # Track background launch process groups so EXIT cleanup can reap descendants
 # even when timeout(1) only reports that its direct child timed out.
 PERF_PROCESS_GROUPS=()
+declare -A PERF_PROCESS_PIDFILES=()
+declare -A PERF_PROCESS_WATCHERS=()
+declare -A PERF_PROCESS_WATCHFILES=()
 perf_track_process_group() {
   PERF_PROCESS_GROUPS+=("$1")
+  PERF_PROCESS_PIDFILES["$1"]="${2:-}"
 }
 
 perf_sandbox_off_default() {
+  mkdir -p "$XDG_CONFIG_HOME/thegn"
   if [ "${TG_PERF_SANDBOX:-}" != 1 ]; then
-    mkdir -p "$XDG_CONFIG_HOME/thegn"
     printf '\n[sandbox]\nenabled = false\n' >>"$XDG_CONFIG_HOME/thegn/config.toml"
   fi
+  printf '\n[sandbox.limits]\ncpu_total = "off"\nmemory_total = "off"\n' \
+    >>"$XDG_CONFIG_HOME/thegn/config.toml"
 }
 
 perf_stop_process_group() {
-  local pgid="$1"
-  kill -TERM -- "-$pgid" 2>/dev/null || true
-  sleep 1
-  kill -KILL -- "-$pgid" 2>/dev/null || true
-  wait "$pgid" 2>/dev/null || true
+  local pgid="$1" pidfile="${2:-}" pid="" tick ppid watcher tracked=0 target
+  for target in "${PERF_PROCESS_GROUPS[@]}"; do
+    if [ "$target" = "$pgid" ]; then
+      tracked=1
+      break
+    fi
+  done
+  [ "$tracked" = 1 ] || return 0
+  if [ -n "${PERF_PROCESS_WATCHERS[$pgid]:-}" ]; then
+    watcher="${PERF_PROCESS_WATCHERS[$pgid]}"
+    if [ "$(ps -o ppid= -p "$watcher" 2>/dev/null | tr -d ' ' || true)" = "$$" ]; then
+      kill "$watcher" 2>/dev/null || true
+      wait "$watcher" 2>/dev/null || true
+    fi
+    unset "PERF_PROCESS_WATCHERS[$pgid]"
+  fi
+  if [ -n "${PERF_PROCESS_WATCHFILES[$pgid]:-}" ]; then
+    local watcher_sleep
+    watcher_sleep="$(cat "${PERF_PROCESS_WATCHFILES[$pgid]}" 2>/dev/null || true)"
+    [ -z "$watcher_sleep" ] || kill "$watcher_sleep" 2>/dev/null || true
+    rm -f -- "${PERF_PROCESS_WATCHFILES[$pgid]}"
+    unset "PERF_PROCESS_WATCHFILES[$pgid]"
+  fi
+  ppid="$(ps -o ppid= -p "$pgid" 2>/dev/null | tr -d ' ' || true)"
+  if [ "$ppid" = "$$" ] && [ -n "$pidfile" ]; then
+    pid="$(cat "$pidfile" 2>/dev/null || true)"
+    tick=0
+    while [ -z "$pid" ] && [ "$tick" -lt 10 ]; do
+      sleep 0.1
+      pid="$(cat "$pidfile" 2>/dev/null || true)"
+      tick=$((tick + 1))
+    done
+    if [ -n "$pid" ]; then
+      kill -TERM "$pid" 2>/dev/null || true
+      for ((tick = 0; tick < 50; tick++)); do
+        kill -0 "$pid" 2>/dev/null || break
+        sleep 0.1
+      done
+      if kill -0 "$pid" 2>/dev/null; then
+        kill -KILL "$pid" 2>/dev/null || true
+      fi
+    fi
+  fi
+  if [ "$ppid" = "$$" ]; then
+    kill -TERM -- "-$pgid" 2>/dev/null || true
+    sleep 1
+    kill -KILL -- "-$pgid" 2>/dev/null || true
+    wait "$pgid" 2>/dev/null || true
+  fi
+  perf_untrack_process_group "$pgid"
+}
+
+perf_untrack_process_group() {
+  local target="$1" i
+  for i in "${!PERF_PROCESS_GROUPS[@]}"; do
+    if [ "${PERF_PROCESS_GROUPS[$i]}" = "$target" ]; then
+      unset 'PERF_PROCESS_GROUPS[i]'
+    fi
+  done
+  unset "PERF_PROCESS_PIDFILES[$target]"
+  unset "PERF_PROCESS_WATCHERS[$target]"
+  unset "PERF_PROCESS_WATCHFILES[$target]"
+  PERF_PROCESS_GROUPS=("${PERF_PROCESS_GROUPS[@]}")
 }
 
 perf_watch_process_group() {
-  local pgid="$1" deadline_s="$2"
+  [ -z "${TIMEOUT_BIN:-}" ] || return 0
+  local pgid="$1" deadline_s="$2" pidfile="${3:-}" watchfile="$PERF_TMP/perf-watch-$1.sleep"
   (
-    for ((tick = 0; tick < deadline_s * 10; tick++)); do
-      kill -0 "$pgid" 2>/dev/null || exit 0
-      sleep 0.1
-    done
+    sleep "$deadline_s" &
+    local sleeper=$!
+    trap 'kill "$sleeper" 2>/dev/null || true; wait "$sleeper" 2>/dev/null || true; exit 0' TERM
+    printf '%s\n' "$sleeper" >"$watchfile"
+    wait "$sleeper" 2>/dev/null || exit 0
+    rm -f -- "$watchfile"
     if kill -0 "$pgid" 2>/dev/null; then
-      kill -TERM -- "-$pgid" 2>/dev/null || true
-      sleep 1
-      kill -KILL -- "-$pgid" 2>/dev/null || true
+      local pid="" ppid tick
+      ppid="$(ps -o ppid= -p "$pgid" 2>/dev/null | tr -d ' ' || true)"
+      [ "$ppid" = "$$" ] || exit 0
+      if [ -n "$pidfile" ]; then
+        pid="$(cat "$pidfile" 2>/dev/null || true)"
+        tick=0
+        while [ -z "$pid" ] && [ "$tick" -lt 10 ]; do
+          sleep 0.1
+          pid="$(cat "$pidfile" 2>/dev/null || true)"
+          tick=$((tick + 1))
+        done
+        if [ -n "$pid" ]; then
+          kill -TERM "$pid" 2>/dev/null || true
+          for ((tick = 0; tick < 50; tick++)); do
+            kill -0 "$pid" 2>/dev/null || break
+            sleep 0.1
+          done
+          if kill -0 "$pid" 2>/dev/null; then
+            kill -KILL "$pid" 2>/dev/null || true
+          fi
+        fi
+      fi
+      if [ "$ppid" = "$$" ]; then
+        kill -TERM -- "-$pgid" 2>/dev/null || true
+        sleep 1
+        kill -KILL -- "-$pgid" 2>/dev/null || true
+      fi
     fi
   ) &
-  perf_track_process_group "$!"
+  PERF_PROCESS_WATCHERS["$pgid"]=$!
+  PERF_PROCESS_WATCHFILES["$pgid"]="$watchfile"
 }
 
 # Remove any podman pause process owned by this fixture, then remove its files.
 # Podman overlay layers may be owned by its user namespace, so retry deletion
 # through `podman unshare` when ordinary rm cannot remove the isolated tree.
 perf_cleanup() {
-  local d cmdline pgid
+  local d cmdline pgid ppid pidfile
   if [ "${#PERF_PROCESS_GROUPS[@]}" -gt 0 ]; then
     for pgid in "${PERF_PROCESS_GROUPS[@]}"; do
-      kill -TERM -- "-$pgid" 2>/dev/null || true
-    done
-    sleep 1
-    for pgid in "${PERF_PROCESS_GROUPS[@]}"; do
-      kill -KILL -- "-$pgid" 2>/dev/null || true
-      wait "$pgid" 2>/dev/null || true
+      ppid="$(ps -o ppid= -p "$pgid" 2>/dev/null | tr -d ' ' || true)"
+      if [ "$ppid" = "$$" ]; then
+        pidfile="${PERF_PROCESS_PIDFILES[$pgid]:-}"
+        perf_stop_process_group "$pgid" "$pidfile"
+      else
+        perf_untrack_process_group "$pgid"
+      fi
     done
   fi
   if [ -n "${PERF_SOCK_DIR:-}" ]; then
