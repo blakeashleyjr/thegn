@@ -143,6 +143,22 @@ fn elapsed_text(step: &LoadStep) -> Option<String> {
     }
 }
 
+/// Total splash elapsed time: live while a step is Active, then frozen at the
+/// latest recorded completion instant. A terminal splash can remain drawn for
+/// a long time without making its gauge jump on an unrelated repaint.
+fn gauge_elapsed(steps: &[LoadStep]) -> Option<std::time::Duration> {
+    let first_start = steps.iter().filter_map(|step| step.started_at).min()?;
+    if steps.iter().any(|step| step.state == StepState::Active) {
+        return Some(first_start.elapsed());
+    }
+    steps
+        .iter()
+        .filter_map(|step| step.started_at.zip(step.took))
+        .map(|(started_at, took)| started_at + took)
+        .max()
+        .map(|finished_at| finished_at.saturating_duration_since(first_start))
+}
+
 /// Draw the loading body into `rect` starting at row `y0`. Returns nothing;
 /// clamps to the rect. `y0` comes from the splash's centering math (which
 /// used [`reserved_rows`], so the body always fits its reservation).
@@ -182,12 +198,7 @@ pub(crate) fn draw_body(
     // ── gauge ────────────────────────────────────────────────────────────
     let done = steps.iter().filter(|s| s.state == StepState::Done).count();
     let failed = steps.iter().any(|s| s.state == StepState::Failed);
-    let total_elapsed = steps
-        .iter()
-        .filter_map(|s| s.started_at)
-        .map(|t| t.elapsed())
-        .max()
-        .map(plan::fmt_elapsed);
+    let total_elapsed = gauge_elapsed(steps).map(plan::fmt_elapsed);
     let mid = match (failed, &total_elapsed) {
         (true, Some(e)) => format!(" {} failed · {} ", g.cross, e),
         (true, None) => format!(" {} failed ", g.cross),
@@ -423,6 +434,22 @@ mod tests {
     fn plan_steps(cursor: usize, failed: bool) -> Vec<LoadStep> {
         let labels = ["connect", "image", "container", "shell"];
         crate::loading::plan::LoadPlan::from_cursor(&labels, cursor, failed).into_steps()
+    }
+
+    #[test]
+    fn terminal_gauge_freezes_at_the_latest_step_completion() {
+        let first_start = std::time::Instant::now() - std::time::Duration::from_secs(30);
+        let mut first = LoadStep::done("resolve");
+        first.started_at = Some(first_start);
+        first.took = Some(std::time::Duration::from_secs(2));
+        let mut last = LoadStep::failed("create");
+        last.started_at = Some(first_start + std::time::Duration::from_secs(5));
+        last.took = Some(std::time::Duration::from_secs(3));
+
+        assert_eq!(
+            gauge_elapsed(&[first, last]),
+            Some(std::time::Duration::from_secs(8))
+        );
     }
 
     fn draw(steps: &[LoadStep], ctx: &[(String, String)]) -> Vec<String> {
