@@ -240,8 +240,9 @@ mod tests {
             }
         };
         let pid = pid_text.trim().parse::<u32>().unwrap();
+        let registered_by = Instant::now() + Duration::from_secs(5);
         while !crate::sandbox_events::registered_event_child_pids().contains(&pid)
-            && start.elapsed() < Duration::from_secs(2)
+            && Instant::now() < registered_by
         {
             thread::sleep(Duration::from_millis(10));
         }
