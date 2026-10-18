@@ -737,6 +737,7 @@ pub fn spawn_ndjson_stream<S: NdjsonSink>(
     } else {
         deadline + READER_GRACE
     };
+    #[cfg(not(unix))]
     let (stdout_result, stderr, drained, abandoned) = {
         let stdout_result = match recv_by_deadline(
             &stdout_rx,
