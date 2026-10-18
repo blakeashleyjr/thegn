@@ -87,30 +87,13 @@ pub(crate) enum Needs {
 pub(crate) struct ColSpec {
     pub id: ColId,
     pub title: &'static str,
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "V-PRC-4 presets/catalog metadata")
-    )]
     pub priority: u8,
     pub min: usize,
     pub ideal: usize,
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "V-PRC-4 presets/catalog metadata")
-    )]
     pub flex: bool,
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "V-PRC-4 presets/catalog metadata")
-    )]
     pub align: Align,
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "V-PRC-4 presets/catalog metadata")
-    )]
     pub needs: Needs,
 }
-
 macro_rules! col {
     ($id:ident, $title:literal, $priority:literal, $min:literal, $ideal:literal, $flex:literal, $align:ident, $needs:ident) => {
         ColSpec {
