@@ -70,20 +70,28 @@ Recipes:
   `TG_PERF_DROP_KEYS=1` is the negative control. Result JSON includes `input`
   (null for idle). The environment scrubs inherited `THEGN_*` and credential
   variables while keeping `TG_PERF_*`; soak-daemon binds its own daemon socket.
-- The harness disables sandboxing by default; set `TG_PERF_SANDBOX=1` to
+- The shell perf harness writes `[media] enabled = false` so the media fallback cannot
+  spawn `playerctl` when the isolated session has no MPRIS bus. The harness
+  disables sandboxing by default; set `TG_PERF_SANDBOX=1` to
   measure with sandboxed panes enabled. In that mode it exposes the user
   manager's private socket when available; if only the session bus is available,
   it exposes that and reports the fallback, and fails if neither exists. The
   fixture writes
   `cpu_total = "off"` and `memory_total = "off"` to its sandbox limits in
   either mode. A separate verify launch checks that the seeded worktree count
-  was collected before the measured launch. Fixed resource ceilings apply to
-  every non-debug procfs run; the CPU ceiling applies to non-debug idle runs.
+  was collected before the measured launch. The `soak` and `soak-daemon`
+  fixtures set `[git] auto_fetch = false` so initial per-worktree remote
+  discovery stays outside the measurement window. Fixed resource ceilings
+  apply to every non-debug procfs run; the CPU ceiling applies to non-debug
+  idle runs.
   Cleanup signals a process group only while its tracked launcher is still a
   child of the harness, and only for groups registered by the harness; it does
   not signal a launcher group after that child has been reaped. Fixture cleanup
-  also removes its temporary Podman state and any matching rootless
-  `podman pause` process.
+  runs `podman unshare rm` before ordinary removal when temporary Podman
+  storage exists, then scans `/proc/PID/comm` for `podman pause` (its cmdline
+  is only `podman`) and removes matching processes whose environment names the
+  fixture path. Procfs read races are ignored. Registry-seeding status goes to
+  stderr so `--json` stdout remains a single JSON object.
 
 The fixture (`lib/fixture.sh`) and the Rust bench fixture
 (`crates/thegn-svc/benches/support/fixture.rs`) build the same layout — keep
