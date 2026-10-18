@@ -862,7 +862,42 @@ mod tests {
     }
 
     #[test]
-    fn collector_rediscovery_uses_overshot_sixty_second_clock_deadline() {
+    fn collector_clock_rediscovery_stays_cached_before_then_scans_after_deadline() {
+        let root = PathBuf::from("/fake/power");
+        let mut fs = FakeFs::default();
+        fake_supply(
+            &mut fs,
+            &root,
+            "BAT0",
+            &[("type", "Battery\n"), ("status", "Discharging\n")],
+        );
+        let mut collector = PowerSupplyCollector::with_fs(fs, &root);
+        assert_eq!(collector.discover(&Env::default()), Health::Ok);
+        let mut frame = MonitorFrame::default();
+        collector
+            .sample(
+                &TickCtx {
+                    tick: 119,
+                    now_ms: 59_999,
+                },
+                &mut frame,
+            )
+            .unwrap();
+        assert_eq!(collector.reader.fs.lists, 1);
+        collector
+            .sample(
+                &TickCtx {
+                    tick: 121,
+                    now_ms: 60_001,
+                },
+                &mut frame,
+            )
+            .unwrap();
+        assert_eq!(collector.reader.fs.lists, 2);
+    }
+
+    #[test]
+    fn failed_read_on_clock_rediscovery_does_not_scan_twice() {
         let root = PathBuf::from("/fake/power");
         let mut fs = FakeFs::default();
         fake_supply(
@@ -875,6 +910,7 @@ mod tests {
         assert_eq!(collector.discover(&Env::default()), Health::Ok);
         collector.reader.fail_next_read_for_test();
         let mut frame = MonitorFrame::default();
+
         collector
             .sample(
                 &TickCtx {
@@ -884,6 +920,7 @@ mod tests {
                 &mut frame,
             )
             .unwrap();
+
         assert_eq!(collector.reader.fs.lists, 2);
     }
 
