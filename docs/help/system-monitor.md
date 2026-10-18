@@ -204,13 +204,14 @@ installed; otherwise it reads through `nvidia-smi`.
 
 ## Power
 
-The Power tab has three panels: `power.rails` plots per-rail power history and
-shows available socket, package, battery, and powercap readings;
-`power.battery` shows battery charge, signed draw, energy, and history; and
-`power.policy` shows the platform profile, boost state, and CPU power policies.
-Unavailable readings use the platform's absent or warming mark. Panel focus and
-zoom use `f`/`F` and `z`. The tab appears when a battery source is available;
-the battery masthead chip opens it.
+The Power tab has three panels: `power.rails` plots socket and powercap history
+against its labelled ceiling; `power.battery` plots charge against 100%, energy
+against battery capacity, and draw magnitude against its labelled peak with the
+current signed direction shown; and `power.policy` shows profile, boost, and EPP
+as status chips. Frame and telemetry histories use separate scales. Unavailable
+readings use the platform's absent or warming mark.
+Panel focus and zoom use `f`/`F` and `z`. The tab appears when a battery source
+is available; the battery masthead chip opens it.
 
 ## Processes
 
