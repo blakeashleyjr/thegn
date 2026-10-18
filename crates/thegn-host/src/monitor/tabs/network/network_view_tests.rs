@@ -399,7 +399,11 @@ fn interior_telemetry_gap_keeps_its_bucket_position() {
         rx[240..].iter().any(|value| value.is_finite()),
         "later sample shifted away"
     );
-    assert!(rx[240..].iter().all(|value| *value == 1.0));
+    assert!(
+        rx[240..]
+            .iter()
+            .all(|value| (*value - 1.0).abs() <= f32::EPSILON)
+    );
 }
 
 #[test]

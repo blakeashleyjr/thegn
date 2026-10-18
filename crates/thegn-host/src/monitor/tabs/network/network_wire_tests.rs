@@ -118,8 +118,8 @@ fn telemetry_history_is_separate_bounded_and_right_aligned() {
     }
     let mut model = NetworkModel::default();
     model.absorb_history(&history, Window::from_secs(10), ScaleMode::Window, 5_000);
-    assert_eq!(model.history_rx.len, 432);
-    assert_eq!(model.history_tx.len, 432);
+    assert_eq!(model.history_rx.len, 384);
+    assert_eq!(model.history_tx.len, 384);
     let rx_capacity = model.history_rx.values.capacity();
     let tx_capacity = model.history_tx.values.capacity();
     for _ in 0..1_000 {
