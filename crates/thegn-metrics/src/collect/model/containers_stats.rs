@@ -8,6 +8,7 @@ pub struct ContainersStatsPart {
     pub scopes: u32,
     pub truncated: bool,
     pub rescans: u32,
+    pub list_errors: u32,
 }
 
 impl Part for ContainersStatsPart {
@@ -16,6 +17,7 @@ impl Part for ContainersStatsPart {
         self.scopes = 0;
         self.truncated = false;
         self.rescans = 0;
+        self.list_errors = 0;
     }
 }
 

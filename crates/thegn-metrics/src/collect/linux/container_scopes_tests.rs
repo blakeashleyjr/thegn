@@ -1,4 +1,4 @@
-use super::{DirectoryFs, MAX_CONTAINER_SCOPES, discover};
+use super::{DirectoryFs, DirectoryListing, MAX_CONTAINER_SCOPES, discover};
 use std::collections::HashMap;
 use std::ffi::OsString;
 use std::io;
@@ -8,10 +8,14 @@ use std::path::{Path, PathBuf};
 struct FakeDirs(HashMap<PathBuf, Vec<OsString>>);
 
 impl DirectoryFs for FakeDirs {
-    fn directories(&self, path: &Path) -> io::Result<Vec<OsString>> {
+    fn directories(&self, path: &Path) -> io::Result<DirectoryListing> {
         self.0
             .get(path)
             .cloned()
+            .map(|directories| DirectoryListing {
+                directories,
+                truncated: false,
+            })
             .ok_or_else(|| io::Error::from(io::ErrorKind::NotFound))
     }
 }
@@ -88,4 +92,32 @@ fn scope_cap_marks_truncation() {
     let found = discover(&fs, Path::new("/cg"));
     assert_eq!(found.scopes.len(), MAX_CONTAINER_SCOPES);
     assert!(found.truncated);
+}
+
+#[test]
+fn more_than_the_directory_cap_reports_truncation() {
+    let names: Vec<String> = (0..MAX_CONTAINER_SCOPES * 2 + 1)
+        .map(|index| format!("unit-{index}.service"))
+        .collect();
+    let names_ref: Vec<&str> = names.iter().map(String::as_str).collect();
+    let mut fs = FakeDirs::default();
+    put(&mut fs, "/cg/system.slice", &names_ref);
+
+    let found = discover(&fs, Path::new("/cg"));
+    assert!(found.scopes.is_empty());
+    assert!(found.truncated);
+}
+
+struct DeniedDirs;
+
+impl DirectoryFs for DeniedDirs {
+    fn directories(&self, _path: &Path) -> io::Result<DirectoryListing> {
+        Err(io::Error::from(io::ErrorKind::PermissionDenied))
+    }
+}
+
+#[test]
+fn listing_errors_are_counted() {
+    let found = discover(&DeniedDirs, Path::new("/cg"));
+    assert_eq!(found.list_errors, 3);
 }

@@ -101,6 +101,7 @@ struct PreviousSample {
     at: Instant,
     cpu_pct: f64,
     seen_generation: u64,
+    present_generation: u64,
 }
 
 /// Reads at most 64 caller-resolved cgroup scopes per tick and derives rates.
@@ -116,7 +117,6 @@ pub struct ContainerStatsSampler<F> {
     prioritized: Vec<usize>,
     selected: Vec<usize>,
     priority: Vec<bool>,
-    round_robin: usize,
     generation: u64,
 }
 
@@ -134,7 +134,6 @@ impl<F> ContainerStatsSampler<F> {
             prioritized: Vec::new(),
             selected: Vec::with_capacity(MAX_CONTAINER_SCOPES_PER_TICK),
             priority: Vec::new(),
-            round_robin: 0,
             generation: 0,
         }
     }
@@ -161,11 +160,11 @@ impl<F: CgroupFs> ContainerStatsSampler<F> {
         self.generation = self.generation.wrapping_add(1);
         for scope in scopes {
             if let Some(previous) = self.previous.get_mut(scope.id.as_ref()) {
-                previous.seen_generation = self.generation;
+                previous.present_generation = self.generation;
             }
         }
         self.previous
-            .retain(|_, previous| previous.seen_generation == self.generation);
+            .retain(|_, previous| previous.present_generation == self.generation);
         self.rows.clear();
 
         self.select_scopes(scopes);
@@ -243,6 +242,7 @@ impl<F: CgroupFs> ContainerStatsSampler<F> {
                         at,
                         cpu_pct: carried_cpu_pct,
                         seen_generation: self.generation,
+                        present_generation: self.generation,
                     },
                 );
             }
@@ -279,12 +279,19 @@ impl<F: CgroupFs> ContainerStatsSampler<F> {
             self.prioritized.clear();
             self.prioritized
                 .extend((0..scopes.len()).filter(|index| !self.priority[*index]));
-            let start = self.round_robin % remainder_count;
-            for offset in 0..remainder_count.min(needed) {
-                let remainder_index = (start + offset) % remainder_count;
-                self.selected.push(self.prioritized[remainder_index]);
-            }
-            self.round_robin = (start + needed.min(remainder_count)) % remainder_count;
+            self.prioritized.sort_unstable_by(|left, right| {
+                let left_seen = self
+                    .previous
+                    .get(&scopes[*left].id)
+                    .map_or(0, |previous| previous.seen_generation);
+                let right_seen = self
+                    .previous
+                    .get(&scopes[*right].id)
+                    .map_or(0, |previous| previous.seen_generation);
+                left_seen.cmp(&right_seen).then_with(|| left.cmp(right))
+            });
+            self.selected
+                .extend(self.prioritized.iter().take(needed).copied());
         }
     }
 }
@@ -296,8 +303,8 @@ pub struct ContainersStatsCollector {
     scopes: Vec<ResolvedContainerScope>,
     truncated: bool,
     rescans: u32,
+    list_errors: u32,
     last_rescan_ms: Option<u64>,
-    fs: RealFs,
     sampler: Option<ContainerStatsSampler<RealFs>>,
     directory_fs: Box<dyn super::container_scopes::DirectoryFs + Send>,
 }
@@ -317,8 +324,8 @@ impl ContainersStatsCollector {
             scopes: Vec::new(),
             truncated: false,
             rescans: 0,
+            list_errors: 0,
             last_rescan_ms: None,
-            fs: RealFs::default(),
             sampler: None,
             directory_fs,
         }
@@ -331,6 +338,7 @@ impl ContainersStatsCollector {
         let result = super::container_scopes::discover(self.directory_fs.as_ref(), root);
         self.scopes = result.scopes;
         self.truncated = result.truncated;
+        self.list_errors = result.list_errors;
         self.last_rescan_ms = Some(now_ms);
         self.rescans = self.rescans.saturating_add(1);
     }
@@ -361,7 +369,7 @@ impl Collector for ContainersStatsCollector {
             return Health::Absent(Absent::NotOnThisOs);
         };
         self.sampler = Some(ContainerStatsSampler::new(
-            std::mem::take(&mut self.fs),
+            RealFs::default(),
             DeviceFilter::from_sys_block(Path::new("/sys/block")),
             root.clone(),
         ));
@@ -383,9 +391,10 @@ impl Collector for ContainersStatsCollector {
         let rows = sampler.sample(&self.scopes, Instant::now());
         frame.parts.containers_stats.rows.clear();
         frame.parts.containers_stats.rows.extend_from_slice(rows);
-        frame.parts.containers_stats.scopes = self.scopes.len().min(u32::MAX as usize) as u32;
+        frame.parts.containers_stats.scopes = u32::try_from(self.scopes.len()).unwrap_or(u32::MAX);
         frame.parts.containers_stats.truncated = self.truncated;
         frame.parts.containers_stats.rescans = self.rescans;
+        frame.parts.containers_stats.list_errors = self.list_errors;
         frame.sampled.insert(CollectorId::ContainersStats);
         Ok(())
     }
@@ -394,9 +403,9 @@ impl Collector for ContainersStatsCollector {
         self.root = None;
         self.scopes = Vec::new();
         self.sampler = None;
-        self.fs = RealFs::default();
         self.truncated = false;
         self.rescans = 0;
+        self.list_errors = 0;
         self.last_rescan_ms = None;
     }
 }
@@ -411,7 +420,7 @@ mod collector_tests {
     use crate::collect::env::Env;
     use crate::collect::frame::MonitorFrame;
     use crate::collect::health::Health;
-    use crate::collect::linux::container_scopes::DirectoryFs;
+    use crate::collect::linux::container_scopes::{DirectoryFs, DirectoryListing};
     use crate::collect::{Collector, TickCtx};
     use std::collections::HashMap;
     use std::ffi::OsString;
@@ -422,10 +431,14 @@ mod collector_tests {
     struct FakeDirs(HashMap<PathBuf, Vec<OsString>>);
 
     impl DirectoryFs for FakeDirs {
-        fn directories(&self, path: &Path) -> io::Result<Vec<OsString>> {
+        fn directories(&self, path: &Path) -> io::Result<DirectoryListing> {
             self.0
                 .get(path)
                 .cloned()
+                .map(|directories| DirectoryListing {
+                    directories,
+                    truncated: false,
+                })
                 .ok_or_else(|| io::Error::from(io::ErrorKind::NotFound))
         }
     }
@@ -454,6 +467,46 @@ mod collector_tests {
                 3
             };
             assert_eq!(frame.parts.containers_stats.rescans, expected);
+        }
+    }
+
+    #[test]
+    fn frame_row_capacity_stays_stable_for_1000_ticks_within_rescan_window() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::write(temp.path().join("cgroup.controllers"), b"cpu memory\n").unwrap();
+        let group = temp.path().join("system.slice/docker-111111.scope");
+        std::fs::create_dir_all(&group).unwrap();
+        std::fs::write(group.join("cpu.stat"), b"usage_usec 1000000\n").unwrap();
+        std::fs::write(group.join("memory.current"), b"100\n").unwrap();
+        let directory_fs = FakeDirs(HashMap::from([(
+            temp.path().join("system.slice"),
+            vec![OsString::from("docker-111111.scope")],
+        )]));
+        let mut collector = ContainersStatsCollector::with_directory_fs(Box::new(directory_fs));
+        let env = Env {
+            cgroup_root: Some(temp.path().to_path_buf()),
+            ..Env::default()
+        };
+        assert_eq!(collector.discover(&env), Health::Ok);
+        let mut frame = MonitorFrame::default();
+        let mut capacity = None;
+        for now_ms in 0..1000 {
+            collector
+                .sample(
+                    &TickCtx {
+                        tick: now_ms,
+                        now_ms,
+                    },
+                    &mut frame,
+                )
+                .unwrap();
+            assert_eq!(frame.parts.containers_stats.rows.len(), 1);
+            let current = frame.parts.containers_stats.rows.capacity();
+            if let Some(capacity) = capacity {
+                assert_eq!(current, capacity);
+            } else {
+                capacity = Some(current);
+            }
         }
     }
 }
