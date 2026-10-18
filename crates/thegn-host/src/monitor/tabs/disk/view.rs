@@ -880,7 +880,7 @@ fn paint_filesystems(grid: &mut CellGrid, rect: Rect, model: &DiskModel) {
                     value: used_ratio,
                     warn: 0.80,
                     crit: 0.95,
-                    ramp: RampId::Fill,
+                    ramp: RampId::Util,
                     label: true,
                     fmt: NumFmt::default(),
                 },
