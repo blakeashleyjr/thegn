@@ -17,6 +17,22 @@ mod stacked;
 
 thread_local! {
     static GRAPH_OUT: RefCell<GraphOut> = RefCell::new(GraphOut::default());
+    static PALETTE: RefCell<(u64, Option<Palette>)> = const { RefCell::new((u64::MAX, None)) };
+}
+
+/// Use one cloned palette per thread and palette generation for graph paints.
+pub(crate) fn with_palette<R>(f: impl FnOnce(&Palette) -> R) -> R {
+    let generation = chrome::palette_generation();
+    PALETTE.with(|cached| {
+        let mut cached = cached.borrow_mut();
+        if cached.0 != generation {
+            cached.1 = Some(chrome::palette_snapshot());
+            cached.0 = generation;
+            #[cfg(test)]
+            PALETTE_RESOLUTIONS.with(|count| count.set(count.get() + 1));
+        }
+        f(cached.1.as_ref().expect("palette cache populated"))
+    })
 }
 
 pub(crate) use heatmap::paint_heatmap;
@@ -142,7 +158,7 @@ pub(crate) fn paint_sparkline(
     }
     GRAPH_OUT.with(|scratch| {
         let mut out = scratch.borrow_mut();
-        chrome::with_palette(|palette| {
+        with_palette(|palette| {
             spark::paint_spark(&mut out, values, width, ramp, palette);
         });
         if let Some(line) = out.lines.first() {
@@ -170,7 +186,7 @@ pub(crate) fn paint_history_graph(
     }
     GRAPH_OUT.with(|scratch| {
         let mut out = scratch.borrow_mut();
-        chrome::with_palette(|palette| {
+        with_palette(|palette| {
             graph::paint_graph(
                 &mut out,
                 graph::GraphPaint {
@@ -262,7 +278,9 @@ impl GraphOut {
                 seg_index += 1;
                 start = end;
             }
-            segs.truncate(seg_index);
+            for stale in &mut segs[seg_index..] {
+                stale.text.clear();
+            }
         }
     }
 }
@@ -290,3 +308,23 @@ fn resolution_count() -> usize {
 fn reset_resolution_count() {
     RESOLUTIONS.with(|count| count.set(0));
 }
+
+#[cfg(test)]
+thread_local! {
+    static PALETTE_RESOLUTIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+fn palette_resolution_count() -> usize {
+    PALETTE_RESOLUTIONS.with(std::cell::Cell::get)
+}
+
+#[cfg(test)]
+fn reset_palette_cache() {
+    PALETTE.with(|cached| *cached.borrow_mut() = (u64::MAX, None));
+    PALETTE_RESOLUTIONS.with(|count| count.set(0));
+}
+
+#[cfg(test)]
+#[path = "reuse_tests.rs"]
+mod reuse_tests;
