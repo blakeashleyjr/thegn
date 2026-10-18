@@ -1331,7 +1331,7 @@ fn disk_health_report(report: crate::platform::DiskHealthReport) {
             outln!("  health: n/a (udisks2 unavailable): {reason}");
         }
         crate::platform::DiskHealthReport::Degraded { drives, reason } => {
-            outln!("  health: n/a (udisks2 unavailable): {reason}");
+            outln!("  health: partial ({reason})");
             disk_health_drives_report(drives);
         }
         crate::platform::DiskHealthReport::Available(drives) if drives.is_empty() => {
@@ -1345,9 +1345,16 @@ fn disk_health_drives_report(drives: Vec<crate::platform::DiskHealth>) {
     for drive in drives {
         let serial = drive.serial_last4.as_deref().unwrap_or("n/a");
         let health = drive.health.as_deref().unwrap_or("n/a");
-        let warning = drive
-            .critical_warning
-            .map_or_else(|| "n/a".to_string(), |bits| format!("0x{bits:x}"));
+        let warning = drive.critical_warning.as_ref().map_or_else(
+            || "n/a".to_string(),
+            |warnings| {
+                if warnings.is_empty() {
+                    "none".to_string()
+                } else {
+                    warnings.join(", ")
+                }
+            },
+        );
         outln!(
             "  {} serial …{} health {health} critical-warning {warning}",
             drive.name,

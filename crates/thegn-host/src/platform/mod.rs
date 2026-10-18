@@ -177,7 +177,7 @@ pub(crate) struct DiskHealth {
     pub(crate) name: String,
     pub(crate) serial_last4: Option<String>,
     pub(crate) health: Option<String>,
-    pub(crate) critical_warning: Option<u64>,
+    pub(crate) critical_warning: Option<Vec<String>>,
     pub(crate) percent_used: Option<u64>,
     pub(crate) available_spare: Option<u64>,
     pub(crate) spare_threshold: Option<u64>,

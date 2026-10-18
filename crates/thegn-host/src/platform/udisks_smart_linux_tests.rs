@@ -1,37 +1,78 @@
-use std::collections::HashMap;
 use std::time::Duration;
 
 use super::{
-    DiskHealthReport, DriveProperties, SmartValue, decode_attributes, finish_report, health_label,
-    make_disk_health, retry_delay, smart_failure_reason, smart_options, unavailable,
+    ATA, DRIVE, DiskHealthReport, Interfaces, NVME, Properties, decode_drive, finish_report,
+    health_label, retry_delay, smart_failure_reason, smart_options, unavailable,
 };
+use zbus::names::OwnedInterfaceName;
+use zbus::zvariant::{OwnedValue, Value};
+
+fn owned(value: Value<'static>) -> OwnedValue {
+    OwnedValue::try_from(value).unwrap()
+}
+
+fn properties(entries: Vec<(&str, Value<'static>)>) -> Properties {
+    entries
+        .into_iter()
+        .map(|(key, value)| (key.to_string(), owned(value)))
+        .collect()
+}
+
+fn interfaces(entries: Vec<(&str, Properties)>) -> Interfaces {
+    entries
+        .into_iter()
+        .map(|(name, properties)| (OwnedInterfaceName::try_from(name).unwrap(), properties))
+        .collect()
+}
+
+fn captured_nvme_fixture() -> (Interfaces, Properties) {
+    let interfaces = interfaces(vec![
+        (
+            DRIVE,
+            properties(vec![
+                ("Model", Value::from("Example NVMe")),
+                ("Serial", Value::from("SERIAL-ABCD")),
+            ]),
+        ),
+        (
+            NVME,
+            properties(vec![
+                ("SmartPowerOnHours", Value::U64(6_119)),
+                ("SmartTemperature", Value::U16(333)),
+                (
+                    "SmartCriticalWarning",
+                    Value::Array(Vec::<String>::new().into()),
+                ),
+            ]),
+        ),
+    ]);
+    let attributes = properties(vec![
+        ("percent_used", Value::U8(16)),
+        ("avail_spare", Value::U8(100)),
+        ("spare_thresh", Value::U8(10)),
+        ("total_data_read", Value::U64(1_234_567)),
+        ("total_data_written", Value::U64(9_876_543)),
+        ("media_errors", Value::U64(0)),
+        ("unsafe_shutdowns", Value::U64(156_193)),
+        ("temp_sensors", Value::Array(vec![333_u16, 334].into())),
+    ]);
+    (interfaces, attributes)
+}
 
 #[test]
-fn captured_nvme_dictionary_decodes_expected_metrics_and_masks_serial() {
-    let attributes = HashMap::from([
-        ("percent_used".to_string(), SmartValue::Unsigned(16)),
-        ("avail_spare".to_string(), SmartValue::Unsigned(100)),
-        ("media_errors".to_string(), SmartValue::Unsigned(0)),
-        (
-            "unsafe_shutdowns".to_string(),
-            SmartValue::Unsigned(156_193),
-        ),
-        ("power_on_hours".to_string(), SmartValue::Unsigned(6_119)),
-        ("critical_warning".to_string(), SmartValue::Unsigned(0)),
-    ]);
-    let drive = make_disk_health(
+fn captured_nvme_wire_values_decode_metrics_properties_and_health() {
+    let (interfaces, attributes) = captured_nvme_fixture();
+    let drive = decode_drive(
         "/org/freedesktop/UDisks2/drives/nvme0",
-        DriveProperties {
-            model: Some("Example NVMe".to_string()),
-            serial: Some("SERIAL-ABCD".to_string()),
-            temperature_kelvin: Some(333),
-            ..DriveProperties::default()
-        },
+        &interfaces,
         &attributes,
     );
 
     assert_eq!(drive.percent_used, Some(16));
     assert_eq!(drive.available_spare, Some(100));
+    assert_eq!(drive.spare_threshold, Some(10));
+    assert_eq!(drive.data_read_bytes, Some(1_234_567));
+    assert_eq!(drive.data_written_bytes, Some(9_876_543));
     assert_eq!(drive.media_errors, Some(0));
     assert_eq!(drive.unsafe_shutdowns, Some(156_193));
     assert_eq!(drive.power_on_hours, Some(6_119));
@@ -41,8 +82,61 @@ fn captured_nvme_dictionary_decodes_expected_metrics_and_masks_serial() {
         drive.health.as_deref(),
         Some("healthy (no critical warnings)")
     );
-    assert_eq!(drive.critical_warning, Some(0));
-    assert_eq!(decode_attributes(&attributes).spare_threshold, None);
+    assert_eq!(drive.critical_warning, Some(Vec::new()));
+}
+
+#[test]
+fn ata_wire_properties_decode_float_temperature_and_signed_bad_sector_count() {
+    let interfaces = interfaces(vec![
+        (
+            DRIVE,
+            properties(vec![
+                ("Model", Value::from("")),
+                ("Serial", Value::from("ATA-XYZ9")),
+            ]),
+        ),
+        (
+            ATA,
+            properties(vec![
+                ("SmartTemperature", Value::F64(310.15)),
+                ("SmartNumBadSectors", Value::I64(0)),
+                ("SmartPowerOnSeconds", Value::U64(7_200)),
+                ("SmartFailing", Value::Bool(false)),
+            ]),
+        ),
+    ]);
+    let drive = decode_drive(
+        "/org/freedesktop/UDisks2/drives/ata0",
+        &interfaces,
+        &Properties::new(),
+    );
+
+    assert_eq!(drive.name, "ata0");
+    assert_eq!(drive.ata_bad_sectors, Some(0));
+    assert_eq!(drive.power_on_hours, Some(2));
+    assert_eq!(drive.temperature_c, Some(37));
+    assert_eq!(drive.health.as_deref(), Some("healthy"));
+}
+
+#[test]
+fn nonempty_nvme_critical_warning_names_are_reported_as_critical() {
+    let interfaces = interfaces(vec![(
+        NVME,
+        properties(vec![(
+            "SmartCriticalWarning",
+            Value::Array(vec![String::from("spare"), String::from("temperature")].into()),
+        )]),
+    )]);
+    let drive = decode_drive("/drive/nvme1", &interfaces, &Properties::new());
+
+    assert_eq!(
+        drive.critical_warning,
+        Some(vec!["spare".into(), "temperature".into()])
+    );
+    assert_eq!(
+        drive.health.as_deref(),
+        Some("critical warning: spare, temperature")
+    );
 }
 
 #[test]
@@ -59,25 +153,15 @@ fn denied_and_absent_udisks_errors_remain_unavailable_with_the_reason() {
         Some("polkit authorization denied".to_string())
     );
     assert_eq!(health_label(None, None), None);
-    let drive = make_disk_health(
-        "/org/freedesktop/UDisks2/drives/nvme0",
-        DriveProperties {
-            temperature_kelvin: Some(333),
-            ..DriveProperties::default()
-        },
-        &HashMap::new(),
-    );
+    let (interfaces, attributes) = captured_nvme_fixture();
+    let drive = decode_drive("/drive/nvme0", &interfaces, &attributes);
     assert_eq!(
-        finish_report(vec![drive], &["polkit authorization denied".to_string()]),
+        finish_report(
+            vec![drive.clone()],
+            &["polkit authorization denied".to_string()]
+        ),
         DiskHealthReport::Degraded {
-            drives: vec![make_disk_health(
-                "/org/freedesktop/UDisks2/drives/nvme0",
-                DriveProperties {
-                    temperature_kelvin: Some(333),
-                    ..DriveProperties::default()
-                },
-                &HashMap::new(),
-            )],
+            drives: vec![drive],
             reason: "polkit authorization denied".to_string(),
         }
     );
@@ -99,11 +183,10 @@ fn retry_backoff_starts_at_five_minutes_then_uses_thirty() {
 }
 
 #[test]
-fn live_udisks_probe_degrades_when_service_or_authorization_is_unavailable() {
+#[ignore = "live UDisks2 probe"]
+fn live_udisks_probe_logs_raw_attribute_keys_and_signatures() {
     match super::disk_health(Duration::from_secs(5)) {
-        // Without a system bus, UDisks2, or an authorization grant, the live
-        // probe is intentionally treated as an unavailable optional source.
-        DiskHealthReport::Unavailable(_) => return,
+        DiskHealthReport::Unavailable(reason) => panic!("live UDisks2 probe unavailable: {reason}"),
         DiskHealthReport::Available(drives) => assert!(!drives.is_empty()),
         DiskHealthReport::Degraded { drives, reason } => {
             assert!(!drives.is_empty());
