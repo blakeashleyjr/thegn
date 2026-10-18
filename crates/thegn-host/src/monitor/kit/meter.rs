@@ -60,9 +60,11 @@ impl Meter {
             }
         }
         if spec.label && label_width > 0 {
-            let text = spec
-                .fmt
-                .fmt(f64::from(spec.value) * 100.0, Unit::Percent, label_width);
+            let text = super::edge_fmt(spec.fmt).fmt(
+                f64::from(spec.value) * 100.0,
+                Unit::Percent,
+                label_width,
+            );
             let style = CellStyle {
                 fg: StyleTok::from_tok(Tok::Ramp(spec.ramp, status_level))
                     .unwrap_or(StyleTok::INHERIT),

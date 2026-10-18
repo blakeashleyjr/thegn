@@ -94,7 +94,7 @@ pub fn draw(grid: &mut CellGrid, rect: Rect, spec: &TableSpec<'_>) {
                 .unwrap_or(TableCell::Text(""));
             let text = match cell {
                 TableCell::Text(_) => None,
-                TableCell::Number(reading) => Some(spec.fmt.reading(
+                TableCell::Number(reading) => Some(super::edge_fmt(spec.fmt).reading(
                     reading,
                     col.unit.unwrap_or(Unit::Count),
                     width,

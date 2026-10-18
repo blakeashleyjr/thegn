@@ -72,9 +72,10 @@ fn fixture(level: UnicodeLevel, depth: ColorDepth) -> (CellGrid, Surface) {
                     cols: 14,
                     rows: 1,
                 },
-                "temp",
+                "load",
                 Reading::Value(42.0),
-                Unit::Temp,
+                // ASCII temperature suffixes await a GlyphSet field; keep this kit snapshot on a supported unit.
+                Unit::Percent,
                 NumFmt::default(),
                 StateRole::Warn,
             );
@@ -143,9 +144,16 @@ fn rows(surface: &mut Surface) -> Vec<String> {
         .screen_cells()
         .iter()
         .map(|row| {
+            let mut skip_spacer = false;
             row.iter()
-                .filter(|cell| cell.width() != 0)
-                .map(|cell| cell.str())
+                .filter_map(|cell| {
+                    if skip_spacer {
+                        skip_spacer = false;
+                        return None;
+                    }
+                    skip_spacer = cell.width() == 2;
+                    Some(cell.str())
+                })
                 .collect()
         })
         .collect()
@@ -311,6 +319,11 @@ fn wide_char_continuation_is_not_emitted_as_text() {
     let mut surface = Surface::new(8, 1);
     emit::Emitter::default().emit(&grid, Rect::full(8, 1), &mut surface, 0, 0);
     assert_eq!(rows(&mut surface)[0], format!("a界b{}", " ".repeat(4)));
+    let cells = surface.screen_cells();
+    assert_eq!(cells[0][1].str(), "界");
+    assert_eq!(cells[0][1].width(), 2);
+    assert_eq!(cells[0][2].str(), " ");
+    assert_eq!(cells[0][3].str(), "b");
     assert_eq!(grid.get(3, 0).unwrap().ch, 'b');
 
     let mut overwritten = CellGrid::new(4, 1);
@@ -610,12 +623,14 @@ fn table_window_sort_selection_and_dot_zero_are_visible() {
         StyleTok::from_tok(Tok::Series(SeriesRole::Selected))
     );
 
+    let zero_value = [table::TableCell::Number(Reading::Value(0.0))];
+    let zero_rows: [&[table::TableCell<'_>]; 1] = [&zero_value];
     table::draw(
         &mut grid,
         Rect::full(16, 3),
         &table::TableSpec {
             cols: &cols[1..],
-            rows: &rows[..1],
+            rows: &zero_rows,
             offset: 0,
             visible: 1,
             sort: None,
@@ -644,9 +659,147 @@ fn warm_emit_allocations_scale_with_style_runs() {
         emitter.emit(&grid, Rect::full(12, 1), &mut surface, 0, 0)
     });
     assert!(
-        counts.allocation_calls <= 4,
-        "one run allows 2 * runs + 2 allocations: {counts:?}"
+        counts.allocation_calls <= 1 && counts.realloc_calls == 0,
+        "warm one-run emit permits only the screen-cell row table: {counts:?}"
     );
+
+    let mut grid = CellGrid::new(12, 1);
+    {
+        let mut view = grid.view(Rect::full(12, 1));
+        for (col, token) in [
+            StyleTok::from_tok(Tok::State(StateRole::Crit)).unwrap(),
+            StyleTok::from_tok(Tok::State(StateRole::Warn)).unwrap(),
+            StyleTok::from_tok(Tok::State(StateRole::Ok)).unwrap(),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            view.put_str(
+                col * 4,
+                0,
+                "abcd",
+                CellStyle {
+                    fg: token,
+                    ..CellStyle::default()
+                },
+            );
+        }
+    }
+    let mut emitter = emit::Emitter::default();
+    let mut surface = Surface::new(12, 1);
+    emitter.emit(&grid, Rect::full(12, 1), &mut surface, 0, 0);
+    let ((), counts) = crate::proc_workload_alloc::measure(|| {
+        emitter.emit(&grid, Rect::full(12, 1), &mut surface, 0, 0)
+    });
+    assert!(
+        counts.allocation_calls <= 1 && counts.realloc_calls == 0,
+        "warm three-run emit permits only the screen-cell row table: {counts:?}"
+    );
+}
+
+#[test]
+fn emit_changed_cells_cost_one_allocation_each() {
+    let mut grid = CellGrid::new(12, 1);
+    grid.view(Rect::full(12, 1))
+        .put_str(0, 0, "abcdefghijkl", CellStyle::default());
+    let mut emitter = emit::Emitter::default();
+    let mut surface = Surface::new(12, 1);
+    emitter.emit(&grid, Rect::full(12, 1), &mut surface, 0, 0);
+    {
+        let mut view = grid.view(Rect::full(12, 1));
+        for (col, ch) in [(1, 'x'), (5, 'y'), (10, 'z')] {
+            view.put(
+                col,
+                0,
+                CellStyle {
+                    ch,
+                    ..CellStyle::default()
+                },
+            );
+        }
+    }
+    let ((), counts) = crate::proc_workload_alloc::measure(|| {
+        emitter.emit(&grid, Rect::full(12, 1), &mut surface, 0, 0)
+    });
+    assert!(
+        counts.allocation_calls <= 4,
+        "three changed cells allow one row-table allocation plus one cell allocation each: {counts:?}"
+    );
+}
+
+#[test]
+fn emitted_cells_reach_the_wire_diff() {
+    let mut grid = CellGrid::new(5, 1);
+    grid.view(Rect::full(5, 1)).put_str(
+        0,
+        0,
+        "wire!",
+        CellStyle {
+            fg: StyleTok::from_tok(Tok::State(StateRole::Warn)).unwrap(),
+            ..CellStyle::default()
+        },
+    );
+    let mut emitted = Surface::new(5, 1);
+    emit::Emitter::default().emit(&grid, Rect::full(5, 1), &mut emitted, 0, 0);
+    let mut frame = Surface::new(5, 1);
+    let changes = frame.diff_screens(&emitted);
+    frame.add_changes(changes);
+    let emitted_cells = emitted.screen_cells();
+    let frame_cells = frame.screen_cells();
+    for col in 0..5 {
+        assert_eq!(frame_cells[0][col].str(), emitted_cells[0][col].str());
+        assert_eq!(frame_cells[0][col].attrs(), emitted_cells[0][col].attrs());
+    }
+}
+
+#[test]
+fn emit_clips_to_a_smaller_surface_without_wrapping() {
+    let mut grid = CellGrid::new(7, 2);
+    {
+        let mut view = grid.view(Rect::full(7, 2));
+        view.put_str(0, 0, "12345界", CellStyle::default());
+        view.put_str(0, 1, "second!", CellStyle::default());
+    }
+    let mut surface = Surface::new(6, 2);
+    emit::Emitter::default().emit(&grid, Rect::full(7, 2), &mut surface, 0, 0);
+    let cells = surface.screen_cells();
+    assert_eq!(cells[0][5].str(), " ");
+    assert_eq!(cells[1][0].str(), "s");
+    assert_eq!(cells[1][5].str(), "d");
+}
+
+#[test]
+fn table_zero_dot_uses_active_marks() {
+    caps::test_override::with_unicode(UnicodeLevel::Ascii, || {
+        let col = [table::Col {
+            title: "zero",
+            width: 5,
+            align: table::Align::Right,
+            unit: Some(Unit::Count),
+        }];
+        let row = [table::TableCell::Number(Reading::Value(0.0))];
+        let rows: [&[table::TableCell<'_>]; 1] = [&row];
+        let mut grid = CellGrid::new(5, 2);
+        table::draw(
+            &mut grid,
+            Rect::full(5, 2),
+            &table::TableSpec {
+                cols: &col,
+                rows: &rows,
+                offset: 0,
+                visible: 1,
+                sort: None,
+                selected: None,
+                fmt: NumFmt {
+                    zero: thegn_core::numfmt::ZeroStyle::Dot,
+                    ..NumFmt::default()
+                },
+            },
+        );
+        let zero = caps::num_marks().zero;
+        assert!(zero.is_ascii());
+        assert!((0..5).any(|x| grid.get(x, 1).unwrap().ch == zero));
+    });
 }
 
 #[test]
