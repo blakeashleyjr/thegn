@@ -193,6 +193,7 @@ pub fn collector_families(id: crate::collect::CollectorId) -> &'static [MetricFa
         Id::Diskstats => &[MetricFamily::Disk],
         Id::AmdSmu => &[MetricFamily::Gpu],
         Id::PowerSupply => &[MetricFamily::Battery],
+        Id::ThermalZone => &[],
         Id::Psi | Id::Cgroup | Id::CgroupSlice | Id::Powercap => &[],
     }
 }

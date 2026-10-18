@@ -13,5 +13,6 @@ pub mod netdev;
 pub mod power_supply;
 pub mod powercap;
 pub mod psi;
+pub mod thermal_zone;
 pub mod uptime;
 pub mod vmstat;
