@@ -175,7 +175,8 @@ The Disk tab is a panel board. `disk.io` shows aggregate read/write throughput
 and its selected-window history with the actual peak values and units. `disk.pressure`
 shows I/O PSI on a 0–100% scale. `disk.devices` shows device rates and utilization
 with each trend's peak labeled. `disk.filesystems` shows used space against each
-filesystem's total and a bounded recent fill trend. `disk.slice` shows thegn.slice
+filesystem's total and a bounded recent fill trend; `+N` marks further mount
+points of the same superblock folded into that row. `disk.slice` shows thegn.slice
 I/O totals, interval rates, and their actual history peaks. Each placed panel
 requests only its own collectors; `disk.worktrees` uses the background `[disk]`
 scanner cache and requests no collector.

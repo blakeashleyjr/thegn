@@ -2155,14 +2155,39 @@ fn process_confirmation_keeps_its_identity_while_ranks_change() {
 
 #[test]
 fn disk_volume_row_displays_collapsed_mount_count() {
-    let mut stats = full_snap();
-    let mut disks = stats.disks.to_vec();
-    disks[0].extra_mounts = 42;
-    disks[0].mount = "/var/lib/containers/storage".into();
-    stats.disks = disks.into();
-    let model = model_with(stats);
+    let model = model_with(full_snap());
     let hist = history(120, NOW_MS);
-    let overlay = open_tab(MonitorTab::Disk, &model, &hist, SHORT);
+    let mut overlay = open_tab(MonitorTab::Disk, &model, &hist, SHORT);
+    assert!(
+        overlay
+            .placed_panels()
+            .iter()
+            .any(|panel| panel.id.0 == "disk.filesystems")
+    );
+    let mut frame = thegn_metrics::collect::frame::MonitorFrame::default();
+    frame.health[thegn_metrics::collect::CollectorId::Filesystems.index()] =
+        thegn_metrics::collect::health::Health::Ok;
+    frame
+        .parts
+        .filesystems
+        .rows
+        .push(thegn_metrics::collect::model::filesystems::FilesystemRow {
+            mount_point: "/var/lib/containers/storage".into(),
+            fstype: "btrfs".into(),
+            source: "/dev/mapper/crypted".into(),
+            superblock_dev: "253:0".into(),
+            extra_mounts: 42,
+            kind: thegn_metrics::collect::model::filesystems::FilesystemKind::Local,
+            total_bytes: Some(1_000_000_000_000),
+            free_bytes: Some(200_000_000_000),
+            avail_bytes: Some(180_000_000_000),
+            total_inodes: Some(1_000_000),
+            free_inodes: Some(200_000),
+            avail_inodes: Some(180_000),
+            btrfs_unallocated: Some(0),
+            read_only: false,
+        });
+    assert!(overlay.ingest_frame(&frame));
     assert!(render_text(&overlay, 100, 30).contains("+42"));
 }
 

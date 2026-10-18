@@ -1,4 +1,4 @@
-use super::{DiskModel, DiskView};
+use super::{DiskModel, DiskView, HistoryRing, history_peak};
 use crate::{
     caps::test_override,
     compositor::Rect,
@@ -57,6 +57,7 @@ fn frame_fixture() -> MonitorFrame {
             fstype: "btrfs".into(),
             source: format!("nvme{index}n1"),
             superblock_dev: format!("259:{index}"),
+            extra_mounts: 0,
             kind: FilesystemKind::Local,
             total_bytes: Some(500_000_000_000 + index as u64 * 125_000_000_000),
             free_bytes: Some(40_000_000_000 + index as u64 * 19_000_000_000),
@@ -570,6 +571,17 @@ fn diskstats_warming_and_no_permission_keep_their_reading_states() {
             .contains(crate::caps::glyph(crate::caps::Glyph::Lock))
     );
     assert!(surface.screen_chars_to_string().contains("root-only"));
+}
+
+#[test]
+fn a_ring_with_no_finite_live_sample_has_no_peak() {
+    let mut history = HistoryRing::default();
+    history.push(f32::NAN);
+
+    assert_eq!(
+        history_peak(&history, Health::Ok, 16),
+        crate::caps::active_glyphs().emdash
+    );
 }
 
 #[test]

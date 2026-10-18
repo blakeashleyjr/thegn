@@ -100,7 +100,7 @@ impl HistoryRing {
 
     fn copy_normalized(&self, out: &mut [f32; HISTORY]) -> (usize, f32) {
         let start = (self.next + HISTORY - self.len) % HISTORY;
-        let peak = self.values.iter().copied().fold(0.0_f32, f32::max);
+        let peak = self.finite_peak().unwrap_or(0.0);
         for (offset, slot) in out.iter_mut().take(self.len).enumerate() {
             let value = self.values[(start + offset) % HISTORY];
             *slot = if value.is_nan() {
@@ -120,6 +120,14 @@ impl HistoryRing {
             *slot = self.values[(start + offset) % HISTORY];
         }
         self.len
+    }
+
+    fn finite_peak(&self) -> Option<f32> {
+        let start = (self.next + HISTORY - self.len) % HISTORY;
+        (0..self.len)
+            .map(|offset| self.values[(start + offset) % HISTORY])
+            .filter(|value| value.is_finite())
+            .reduce(f32::max)
     }
 
     fn replace_from(&mut self, values: &[f32]) {
@@ -216,6 +224,7 @@ impl DiskModel {
                 destination.avail_inodes = source.avail_inodes;
                 destination.btrfs_unallocated = source.btrfs_unallocated;
                 destination.read_only = source.read_only;
+                destination.extra_mounts = source.extra_mounts;
             } else {
                 self.filesystems.push(source.clone());
             }
@@ -1108,9 +1117,12 @@ fn paint_filesystems(grid: &mut CellGrid, rect: Rect, model: &DiskModel) {
                     )
                 })
                 .unwrap_or_else(|| crate::caps::active_glyphs().emdash.into());
+            let mount = truncate(&fs.mount_point, 16);
+            let extra_mounts = (fs.extra_mounts > 0).then(|| format!(" +{}", fs.extra_mounts));
             let text = format!(
-                "{} {} {used}/{total}",
-                truncate(&fs.mount_point, 16),
+                "{}{} {} {used}/{total}",
+                mount,
+                extra_mounts.as_deref().unwrap_or(""),
                 fs.fstype
             );
             body.put_str(0, row * 2, &text, CellStyle::default());
@@ -1303,14 +1315,8 @@ fn rate_reading(value: Option<f64>, health: Health, width: usize) -> String {
     }
 }
 fn history_peak(history: &HistoryRing, health: Health, width: usize) -> String {
-    match history
-        .values
-        .iter()
-        .copied()
-        .filter(|value| value.is_finite())
-        .reduce(f32::max)
-    {
-        Some(peak) if history.len > 0 => rate_reading(Some(f64::from(peak)), health, width),
+    match history.finite_peak() {
+        Some(peak) => rate_reading(Some(f64::from(peak)), health, width),
         _ => rate_reading(None, health, width),
     }
 }
