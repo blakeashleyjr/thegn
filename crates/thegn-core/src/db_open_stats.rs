@@ -199,7 +199,7 @@ pub fn snapshot() -> OpenStats {
 impl OpenStats {
     /// The three most frequently observed call sites, for rollup logging.
     pub fn top_sites(self) -> [Option<OpenSiteStats>; 3] {
-        let mut top = [None; 3];
+        let mut top: [Option<OpenSiteStats>; 3] = [None; 3];
         for site in self.sites.into_iter().flatten() {
             let Some(index) = top
                 .iter()
