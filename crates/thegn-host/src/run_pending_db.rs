@@ -6,6 +6,10 @@
 use std::path::Path;
 use thegn_core::store::{AccountStore, WorkspaceStore};
 
+/// Sends a terminal failure if a pending-result job disappears before its
+/// normal sink runs. If the job panics first (for example in `store_host_def`),
+/// this also fires during unwind and reports "database writer unavailable"
+/// rather than leaving the UI pending forever.
 struct ResultOnDrop<F: FnOnce()>(Option<F>);
 
 impl<F: FnOnce()> ResultOnDrop<F> {
