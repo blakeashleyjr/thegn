@@ -163,6 +163,10 @@ pub fn default_collectors() -> Vec<Box<dyn Collector>> {
     collectors[CollectorId::AmdSmu.index()] = Box::new(linux::amd_smu::AmdSmuCollector::new());
     collectors[CollectorId::Meminfo.index()] = Box::new(linux::meminfo::MeminfoCollector::new());
     collectors[CollectorId::Vmstat.index()] = Box::new(linux::vmstat::VmstatCollector::new());
+    collectors[CollectorId::Netdev.index()] = Box::new(linux::netdev::NetdevCollector::at(
+        "/proc/net/dev",
+        "/sys/class/net",
+    ));
     collectors
 }
 
