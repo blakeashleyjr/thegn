@@ -68,6 +68,7 @@ pub(in crate::monitor) struct PowerModel {
     pub(super) core_w: Option<f32>,
     pub(super) system_w: Option<f32>,
     pub(super) battery_w: Option<f32>,
+    stapm_limit_w: Option<f32>,
     pub(super) state: Option<EffectiveState>,
     pub(super) eta_hours: Option<f64>,
     pub(super) session: SessionEnergy,
@@ -203,6 +204,7 @@ impl PowerModel {
         self.gfx_w = None;
         self.core_w = None;
         self.system_w = None;
+        self.stapm_limit_w = None;
         for card in &frame.parts.amd_smu.cards {
             if !matches!(
                 card.decoded,
@@ -216,6 +218,12 @@ impl PowerModel {
             self.gfx_w = self.gfx_w.or_else(|| metric_watts(metrics.power_gfx));
             self.core_w = self.core_w.or_else(|| metric_watts(metrics.power_all_core));
             self.system_w = self.system_w.or_else(|| metric_watts(metrics.power_sys));
+            self.stapm_limit_w = self.stapm_limit_w.or_else(|| {
+                metrics
+                    .power_current_stapm_limit
+                    .filter(|watts| *watts > 0 && *watts != u32::MAX)
+                    .map(|watts| watts as f32)
+            });
         }
         self.socket_w = self.socket_w.or_else(|| {
             self.zones
@@ -244,10 +252,10 @@ impl PowerModel {
                 self.history.reserve_exact(HISTORY_CAP);
             }
             if self.history.len() < HISTORY_CAP {
-                self.history.push(watts / 30.0);
+                self.history.push(watts);
                 self.history_len = self.history.len();
             } else {
-                self.history[self.history_next] = watts / 30.0;
+                self.history[self.history_next] = watts;
             }
             self.history_next = (self.history_next + 1) % HISTORY_CAP;
         }
@@ -261,6 +269,34 @@ fn metric_watts(value: Option<u32>) -> Option<f32> {
     value
         .filter(|value| *value != u32::MAX)
         .map(|value| value as f32 / 1000.0)
+}
+fn rail_ceiling(model: &PowerModel) -> f32 {
+    if let Some(limit) = model.stapm_limit_w {
+        return limit;
+    }
+    let peak = model.history.iter().copied().fold(0.0_f32, f32::max);
+    (peak.max(30.0) / 10.0).ceil() * 10.0
+}
+fn history_graph_rect(rect: Rect, inner: Rect, len: usize, braille: bool) -> Rect {
+    let used = if braille { len.div_ceil(2) } else { len };
+    let cols = inner.cols.min(used);
+    Rect {
+        x: rect.x + inner.x + inner.cols.saturating_sub(cols),
+        y: rect.y + inner.y,
+        cols,
+        rows: inner.rows.saturating_sub(11),
+    }
+}
+fn rail_title(model: &PowerModel) -> String {
+    let ceiling = rail_ceiling(model);
+    let peak = model.history.iter().copied().fold(0.0_f32, f32::max);
+    match model.stapm_limit_w {
+        Some(_) if peak > ceiling => {
+            format!("Power rails ({ceiling:.0} W STAPM; peak {peak:.0} W)")
+        }
+        Some(_) => format!("Power rails ({ceiling:.0} W STAPM)"),
+        None => format!("Power rails ({ceiling:.0} W max)"),
+    }
 }
 fn fill_battery(row: &mut BatteryRow, supply: &SupplyReading) {
     row.name.clear();
@@ -329,12 +365,12 @@ impl TabView for PowerView<'_> {
     ) {
         let mut grid = CellGrid::new(rect.cols, rect.rows);
         let title = match placed.id {
-            BATTERY => "Battery",
-            RAILS => "Power rails (30 W max)",
-            POLICY => "Power policy",
+            BATTERY => "Battery".to_owned(),
+            RAILS => rail_title(self.0),
+            POLICY => "Power policy".to_owned(),
             _ => return,
         };
-        let inner = panel::panel(&mut grid, Rect::full(rect.cols, rect.rows), title, None).rect();
+        let inner = panel::panel(&mut grid, Rect::full(rect.cols, rect.rows), &title, None).rect();
         match placed.id {
             BATTERY => paint::paint_battery(&mut grid, inner, self.0),
             RAILS => paint::paint_rails(&mut grid, inner, self.0),
@@ -358,15 +394,14 @@ impl TabView for PowerView<'_> {
             for (offset, value) in ordered.iter_mut().take(self.0.history_len).enumerate() {
                 *value = self.0.history[(start + offset) % self.0.history_len.max(1)];
             }
+            let ceiling = rail_ceiling(self.0);
+            for value in ordered.iter_mut().take(self.0.history_len) {
+                *value /= ceiling;
+            }
             graphs::paint_history_graph(
                 &ordered[..self.0.history_len],
                 RampId::Power,
-                Rect {
-                    x: rect.x + inner.x,
-                    y: rect.y + inner.y,
-                    cols: inner.cols,
-                    rows: inner.rows.saturating_sub(11),
-                },
+                history_graph_rect(rect, inner, self.0.history_len, graphs::table().braille),
                 surface,
             );
         }
