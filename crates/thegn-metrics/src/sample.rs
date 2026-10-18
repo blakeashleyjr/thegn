@@ -66,6 +66,8 @@ pub struct StatsSampler {
     cpu_primed: bool,
     cpu_freq: crate::cpu_freq::CpuFreqProbe,
     last_cpu_freq: Option<u64>,
+    #[cfg(target_os = "linux")]
+    base_cpu: crate::base_cpu::BaseCpu,
     /// This process's PID — always watched for the daemon/status modal.
     self_pid: Pid,
     /// The pane-daemon's PID once the host resolves it (`None` = unknown).
@@ -202,6 +204,8 @@ impl StatsSampler {
                 "/sys/devices/system/cpu",
             )),
             last_cpu_freq: None,
+            #[cfg(target_os = "linux")]
+            base_cpu: crate::base_cpu::BaseCpu::new(),
             self_pid: Pid::from_u32(std::process::id()),
             daemon_pid: None,
             proc_primed: false,
@@ -280,17 +284,26 @@ impl StatsSampler {
         if slow {
             self.last_cpu_freq = self.cpu_freq.read_mhz(&mut self.sys);
         }
-        self.sys.refresh_cpu_usage();
-        if self.cpu_primed {
-            snap.cpu_pct = Some(pct_u8(self.sys.global_cpu_usage()));
-            snap.cpu_cores = self
-                .sys
-                .cpus()
-                .iter()
-                .map(|c| pct_u8(c.cpu_usage()))
-                .collect();
-        } else {
-            self.cpu_primed = true;
+        #[cfg(target_os = "linux")]
+        {
+            let (cpu_pct, cpu_cores) = self.base_cpu.fill(&mut self.cpu_primed);
+            snap.cpu_pct = cpu_pct.map(pct_u8);
+            snap.cpu_cores = cpu_cores.into_iter().map(pct_u8).collect();
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            self.sys.refresh_cpu_usage();
+            if self.cpu_primed {
+                snap.cpu_pct = Some(pct_u8(self.sys.global_cpu_usage()));
+                snap.cpu_cores = self
+                    .sys
+                    .cpus()
+                    .iter()
+                    .map(|c| pct_u8(c.cpu_usage()))
+                    .collect();
+            } else {
+                self.cpu_primed = true;
+            }
         }
         snap.cpu_freq_mhz = self.last_cpu_freq;
 
