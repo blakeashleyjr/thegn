@@ -16,6 +16,9 @@
 use crate::db::Db;
 use crate::sandbox::{Backend, CONTAINER_PREFIX};
 use crate::store::{WorkspaceStore, WorktreeAuxStore};
+use std::process::Child;
+use std::sync::{Arc, Mutex, OnceLock, Weak};
+use std::time::{Duration, Instant};
 
 /// The container-events op of the sandbox seam. A kind is either implemented
 /// or reserved with a reason — the seam rule (`seam.rs:13-19`), per backend.
@@ -71,10 +74,130 @@ pub trait ContainerEvents: Send {
     fn available(&self) -> bool;
 
     /// Blocking: runs the subscription loop on the CALLER's thread until the
-    /// stream ends (EOF ⇒ reap the child and return). Stream failures end the
-    /// loop silently — audit is best-effort (the `// audit run.rs:825`
+    /// stream ends (EOF ⇒ kill the owned process group, reap its child and
+    /// return). The host also calls [`shutdown_event_streams`] before exit
+    /// because subscriber threads retain their child guards. Stream failures
+    /// end the loop silently — audit is best-effort (the `// audit run.rs:825`
     /// contract). Never called on the event loop.
     fn subscribe(self: Box<Self>, kind: EventKind, sink: &mut dyn ContainerEventSink);
+}
+
+struct EventChild {
+    child: Mutex<Option<Child>>,
+    reaped: Arc<std::sync::atomic::AtomicBool>,
+}
+
+/// Owns a runtime events child; dropping the final guard kills and reaps it.
+pub(crate) struct EventChildGuard(Arc<EventChild>);
+
+impl EventChildGuard {
+    /// Kill and reap this child before the shared shutdown deadline.
+    fn shutdown_until(&self, deadline: Instant) {
+        shutdown_event_child(&self.0, deadline);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn is_reaped(&self) -> bool {
+        self.0
+            .child
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .is_none()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn reap_observer(&self) -> Arc<std::sync::atomic::AtomicBool> {
+        Arc::clone(&self.0.reaped)
+    }
+}
+
+fn shutdown_event_child(event: &EventChild, deadline: Instant) {
+    let mut child = event
+        .child
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let Some(process) = child.as_mut() else {
+        return;
+    };
+    crate::sandbox::proc::terminate_event_group(process);
+    loop {
+        let Some(process) = child.as_mut() else {
+            return;
+        };
+        let wait_result = process.try_wait();
+        match wait_result {
+            Ok(Some(_)) => {
+                mark_event_child_reaped(event, &mut child);
+                return;
+            }
+            Err(error) => {
+                tracing::debug!(%error, "sandbox events: child reap failed");
+                let process = child.take();
+                drop(child);
+                if let Some(process) = process {
+                    crate::sandbox::proc::reap_event_child(process);
+                }
+                return;
+            }
+            Ok(None) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(5)),
+            Ok(None) => {
+                let process = child.take();
+                drop(child);
+                if let Some(process) = process {
+                    crate::sandbox::proc::reap_event_child(process);
+                }
+                return;
+            }
+        }
+    }
+}
+
+fn mark_event_child_reaped(event: &EventChild, child: &mut Option<Child>) {
+    *child = None;
+    event
+        .reaped
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+}
+
+impl Drop for EventChildGuard {
+    fn drop(&mut self) {
+        self.shutdown_until(Instant::now() + Duration::from_secs(2));
+    }
+}
+
+static EVENT_CHILDREN: OnceLock<Mutex<Vec<Weak<EventChild>>>> = OnceLock::new();
+
+pub(crate) fn register_event_child(child: Child) -> EventChildGuard {
+    let guard = EventChildGuard(Arc::new(EventChild {
+        child: Mutex::new(Some(child)),
+        reaped: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+    }));
+    let mut children = EVENT_CHILDREN
+        .get_or_init(|| Mutex::new(Vec::new()))
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    children.retain(|registered| registered.strong_count() > 0);
+    children.push(Arc::downgrade(&guard.0));
+    guard
+}
+
+/// Kill and reap every live container-events process group by `deadline`.
+/// The host calls this in its shutdown tail because subscriber threads retain
+/// their guards and therefore do not drop when the main thread exits.
+pub fn shutdown_event_streams(deadline: Instant) {
+    let mut registry = EVENT_CHILDREN
+        .get_or_init(|| Mutex::new(Vec::new()))
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let children = registry
+        .iter()
+        .filter_map(Weak::upgrade)
+        .collect::<Vec<_>>();
+    registry.retain(|registered| registered.strong_count() > 0);
+    drop(registry);
+    for child in &children {
+        shutdown_event_child(child, deadline);
+    }
 }
 
 /// Write one parsed event to the audit DB. Returns the number of rows written

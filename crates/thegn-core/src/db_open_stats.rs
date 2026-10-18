@@ -27,7 +27,11 @@
 //!
 //! Free when unused: an unmarked process takes one relaxed load and returns.
 
+use std::panic::Location;
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
+
+const SITE_CAPACITY: usize = 16;
 
 /// The loop's thread id, once the host has named it.
 static LOOP_THREAD: std::sync::OnceLock<std::thread::ThreadId> = std::sync::OnceLock::new();
@@ -35,6 +39,71 @@ static LOOP_THREAD: std::sync::OnceLock<std::thread::ThreadId> = std::sync::Once
 static CALLS: AtomicU64 = AtomicU64::new(0);
 static TOTAL_US: AtomicU64 = AtomicU64::new(0);
 static MAX_US: AtomicU64 = AtomicU64::new(0);
+static SITES: Mutex<SiteTable> = Mutex::new(SiteTable::new());
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SiteEntry {
+    file: &'static str,
+    line: u32,
+    calls: u64,
+    overestimate: u64,
+    max_us: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SiteTable {
+    entries: [Option<SiteEntry>; SITE_CAPACITY],
+}
+
+impl SiteTable {
+    const fn new() -> Self {
+        Self {
+            entries: [None; SITE_CAPACITY],
+        }
+    }
+
+    fn record(&mut self, location: &'static Location<'static>, micros: u64) {
+        if let Some(entry) = self
+            .entries
+            .iter_mut()
+            .flatten()
+            .find(|entry| entry.file == location.file() && entry.line == location.line())
+        {
+            entry.calls = entry.calls.saturating_add(1);
+            entry.max_us = entry.max_us.max(micros);
+            return;
+        }
+
+        let new_entry = SiteEntry {
+            file: location.file(),
+            line: location.line(),
+            calls: 1,
+            overestimate: 0,
+            max_us: micros,
+        };
+        if let Some(slot) = self.entries.iter_mut().find(|entry| entry.is_none()) {
+            *slot = Some(new_entry);
+            return;
+        }
+
+        // Space-Saving replacement keeps observing new hot sites after startup
+        // has filled the fixed table. The displaced minimum is the error bound
+        // for the replacement site's estimated count.
+        if let Some(slot) = self
+            .entries
+            .iter_mut()
+            .flatten()
+            .min_by_key(|entry| entry.calls)
+        {
+            let minimum = slot.calls;
+            *slot = SiteEntry {
+                calls: minimum.saturating_add(1),
+                overestimate: minimum,
+                ..new_entry
+            };
+        }
+    }
+}
 
 /// Declare the calling thread as the render/input loop. Called once, from the
 /// host, before the loop starts. First call wins; later calls are ignored, so a
@@ -56,13 +125,17 @@ fn on_loop_thread() -> bool {
 ///
 /// Takes the duration rather than timing internally so the caller brackets
 /// exactly the work it means to measure.
-pub fn record_open(micros: u64) {
+pub fn record_open(micros: u64, location: &'static Location<'static>) {
     if !on_loop_thread() {
         return;
     }
     CALLS.fetch_add(1, Ordering::Relaxed);
     TOTAL_US.fetch_add(micros, Ordering::Relaxed);
     MAX_US.fetch_max(micros, Ordering::Relaxed);
+    SITES
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .record(location, micros);
 }
 
 /// Loop-thread database opens observed so far.
@@ -77,6 +150,23 @@ pub struct OpenStats {
     /// waiting out the 5s `busy_timeout` averages away against thousands of
     /// fast ones, while being a five-second freeze.
     pub max_us: u64,
+    /// Fixed-size call-site counts since process start, ordered by slot.
+    pub sites: [Option<OpenSiteStats>; SITE_CAPACITY],
+}
+
+/// Loop-thread opens attributed to one source location.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OpenSiteStats {
+    /// Source file reported by `#[track_caller]`.
+    pub file: &'static str,
+    /// Source line reported by `#[track_caller]`.
+    pub line: u32,
+    /// Opens recorded at this site.
+    pub calls: u64,
+    /// Maximum count contributed by evicted sites.
+    pub overestimate: u64,
+    /// Worst open at this site, microseconds.
+    pub max_us: u64,
 }
 
 impl OpenStats {
@@ -90,10 +180,49 @@ impl OpenStats {
 /// rate or a delta takes two snapshots — this deliberately does not reset, so
 /// two consumers cannot steal each other's samples.
 pub fn snapshot() -> OpenStats {
-    OpenStats {
+    let stats = OpenStats {
         calls: CALLS.load(Ordering::Relaxed),
         total_us: TOTAL_US.load(Ordering::Relaxed),
         max_us: MAX_US.load(Ordering::Relaxed),
+        sites: SITES
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .entries
+            .map(|entry| {
+                entry.map(|entry| OpenSiteStats {
+                    file: entry.file,
+                    line: entry.line,
+                    calls: entry.calls,
+                    overestimate: entry.overestimate,
+                    max_us: entry.max_us,
+                })
+            }),
+    };
+    tracing::debug!(
+        target: "thegn::perf",
+        db_open_loop_top_sites_since_start = ?stats.top_sites(),
+        "loop-thread database open call sites"
+    );
+    stats
+}
+
+impl OpenStats {
+    /// The three most frequently observed call sites since process start.
+    pub fn top_sites(self) -> [Option<OpenSiteStats>; 3] {
+        let mut top: [Option<OpenSiteStats>; 3] = [None; 3];
+        for site in self.sites.into_iter().flatten() {
+            let Some(index) = top
+                .iter()
+                .position(|candidate| candidate.is_none_or(|current| site.calls > current.calls))
+            else {
+                continue;
+            };
+            for shift in (index + 1..top.len()).rev() {
+                top[shift] = top[shift - 1];
+            }
+            top[index] = Some(site);
+        }
+        top
     }
 }
 
@@ -112,8 +241,8 @@ mod tests {
     fn an_unmarked_thread_records_nothing() {
         let before = snapshot();
         std::thread::spawn(|| {
-            record_open(1_000);
-            record_open(9_999);
+            record_open(1_000, Location::caller());
+            record_open(9_999, Location::caller());
         })
         .join()
         .unwrap();
@@ -133,6 +262,7 @@ mod tests {
             calls: 1_000,
             total_us: 1_000 * 50 + 5_000_000,
             max_us: 5_000_000,
+            ..OpenStats::default()
         };
         // A single 5s open among a thousand 50µs ones barely moves the mean —
         // which is the whole reason `max_us` is reported alongside it.
@@ -150,5 +280,88 @@ mod tests {
         let a = snapshot();
         let b = snapshot();
         assert_eq!(a, b, "snapshot must not consume the counters");
+    }
+
+    #[test]
+    fn site_table_tracks_file_line_count_and_worst_open() {
+        let location = Location::caller();
+        let mut table = SiteTable::new();
+        table.record(location, 12);
+        table.record(location, 45);
+
+        let site = table.entries[0].expect("first call site should be retained");
+        assert_eq!(site.file, location.file());
+        assert_eq!(site.line, location.line());
+        assert_eq!(site.calls, 2);
+        assert_eq!(site.max_us, 45);
+    }
+
+    #[test]
+    fn repeated_site_displaces_startup_entries_when_table_is_full() {
+        let location = Location::caller();
+        let mut table = SiteTable::new();
+        for (index, slot) in table.entries.iter_mut().enumerate() {
+            *slot = Some(SiteEntry {
+                file: "startup.rs",
+                line: index as u32,
+                calls: 2,
+                overestimate: 0,
+                max_us: 1,
+            });
+        }
+        for _ in 0..3 {
+            table.record(location, 10);
+        }
+
+        let site = table
+            .entries
+            .iter()
+            .flatten()
+            .find(|entry| entry.file == location.file() && entry.line == location.line())
+            .expect("repeated call site should be retained");
+        assert_eq!(site.calls, 5);
+        assert_eq!(site.overestimate, 2);
+    }
+
+    #[test]
+    fn top_sites_orders_counts_with_stable_ties_and_fewer_than_three() {
+        let mut stats = OpenStats::default();
+        stats.sites[0] = Some(OpenSiteStats {
+            file: "a.rs",
+            line: 1,
+            calls: 4,
+            overestimate: 0,
+            max_us: 0,
+        });
+        stats.sites[1] = Some(OpenSiteStats {
+            file: "b.rs",
+            line: 2,
+            calls: 8,
+            overestimate: 0,
+            max_us: 0,
+        });
+        assert_eq!(stats.top_sites()[0].map(|site| site.file), Some("b.rs"));
+        assert_eq!(stats.top_sites()[1].map(|site| site.file), Some("a.rs"));
+        assert!(stats.top_sites()[2].is_none());
+
+        stats.sites[2] = Some(OpenSiteStats {
+            file: "c.rs",
+            line: 3,
+            calls: 8,
+            overestimate: 0,
+            max_us: 0,
+        });
+        stats.sites[3] = Some(OpenSiteStats {
+            file: "d.rs",
+            line: 4,
+            calls: 6,
+            overestimate: 0,
+            max_us: 0,
+        });
+        let top = stats.top_sites();
+        assert_eq!(
+            top.map(|site| site.map(|site| site.file)),
+            [Some("b.rs"), Some("c.rs"), Some("d.rs")]
+        );
     }
 }

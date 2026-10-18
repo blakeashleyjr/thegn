@@ -490,8 +490,8 @@ fn reap_generation_footprints(
                     && fingerprint_mtime(profile).is_some()
             })
             .collect();
-        if !prunable_profiles.is_empty()
-            && prunable_profiles
+        if prunable_profiles.is_empty()
+            || prunable_profiles
                 .iter()
                 .all(|profile| generation_memoized(profile, min_age_secs, now_secs))
         {
@@ -1118,5 +1118,41 @@ mod generation_tests {
         assert!(!release.join(".fingerprint/pkg-a").exists());
         assert!(release.join(".fingerprint/pkg-z").exists());
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn worktree_without_target_skips_git_status_probe() {
+        let root = tempfile::tempdir().unwrap();
+        GENERATION_STATUS_PROBES.with(|calls| calls.set(0));
+        let fresh = [(
+            root.path().to_string_lossy().into_owned(),
+            thegn_core::disk::DiskUsage::default(),
+        )];
+
+        assert_eq!(reap_generation_footprints(&fresh, None, &[], 14, 0), 0);
+        GENERATION_STATUS_PROBES.with(|calls| assert_eq!(calls.get(), 0));
+    }
+
+    #[test]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "the fixture initializes an isolated temporary git repository"
+    )]
+    fn core_git_spawn_counter_counts_git_out_calls() {
+        let root = tempfile::tempdir().unwrap();
+        let init = thegn_core::util::git_cmd(root.path())
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .args(["init"])
+            .output()
+            .unwrap();
+        assert!(init.status.success());
+
+        let before = thegn_core::util::core_git_spawn_count();
+        assert_eq!(
+            thegn_core::util::git_out(root.path(), &["rev-parse", "--is-inside-work-tree"]),
+            Some("true".to_string())
+        );
+        let after = thegn_core::util::core_git_spawn_count();
+        assert_eq!(after - before, 1);
     }
 }

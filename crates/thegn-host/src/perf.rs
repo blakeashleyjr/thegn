@@ -674,7 +674,8 @@ impl LoopPerf {
             render_busy: Duration::ZERO,
             pty_chunks: 0,
             pty_budget_hits: 0,
-            git_spawns_t0: thegn_svc::git::git_spawn_count(),
+            git_spawns_t0: thegn_svc::git::git_spawn_count()
+                .saturating_add(thegn_core::util::core_git_spawn_count()),
             proc_cpu_t0: crate::platform::cpu_clock::process_cpu_ns(),
             child_cpu_t0: crate::platform::cpu_clock::reaped_children_cpu_ns(),
             loop_cpu_t0: thread_cpu_ns(),
@@ -893,7 +894,8 @@ impl LoopPerf {
         self.render_busy = Duration::ZERO;
         self.pty_chunks = 0;
         self.pty_budget_hits = 0;
-        self.git_spawns_t0 = thegn_svc::git::git_spawn_count();
+        self.git_spawns_t0 = thegn_svc::git::git_spawn_count()
+            .saturating_add(thegn_core::util::core_git_spawn_count());
         self.proc_cpu_t0 = crate::platform::cpu_clock::process_cpu_ns();
         self.child_cpu_t0 = crate::platform::cpu_clock::reaped_children_cpu_ns();
         self.loop_cpu_t0 = thread_cpu_ns();
@@ -1153,6 +1155,7 @@ impl LoopPerf {
             cpu_metrics_ms = cpu_ms[Subsys::Metrics as usize],
             cpu_diff_ms = cpu_ms[Subsys::Diff as usize],
             git_spawns_per_s = thegn_svc::git::git_spawn_count()
+                .saturating_add(thegn_core::util::core_git_spawn_count())
                 .saturating_sub(self.git_spawns_t0) as f64
                 / secs,
             // Allocator counters are cumulative since process start, like db_open.

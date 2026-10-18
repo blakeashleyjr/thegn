@@ -734,43 +734,48 @@ pub(crate) fn compose_detail_line(
     if disp.detail_branch_stat
         && let Some((add, del)) = row.git.and_then(|g| g.branch_diff)
     {
-        let mut shown = false;
-        if add == DiffCount::Binary || del == DiffCount::Binary {
-            segs.push(seg(Tok::Slot(S::Dim), "bin"));
-            shown = true;
-        }
-        if let DiffCount::Exact(n) = add
-            && n > 0
-        {
-            if shown {
-                segs.push(sp(1));
-            }
-            segs.push(seg(Tok::Hue(theme::Hue::Green), format!("+{n}")));
-            shown = true;
-        } else if matches!(add, DiffCount::Capped) {
-            if shown {
-                segs.push(sp(1));
-            }
-            segs.push(seg(Tok::Hue(theme::Hue::Green), "+capped"));
-            shown = true;
-        }
-        if let DiffCount::Exact(n) = del
-            && n > 0
-        {
-            if shown {
-                segs.push(sp(1));
-            }
-            segs.push(seg(Tok::Hue(theme::Hue::Red), format!("-{n}")));
-            shown = true;
-        } else if matches!(del, DiffCount::Capped) {
-            if shown {
-                segs.push(sp(1));
-            }
-            segs.push(seg(Tok::Hue(theme::Hue::Red), "-capped"));
-            shown = true;
-        }
-        if shown {
+        if add == DiffCount::Unavailable || del == DiffCount::Unavailable {
+            segs.push(seg(Tok::Hue(theme::Hue::Amber), "diff ?"));
             segs.push(sp(1));
+        } else {
+            let mut shown = false;
+            if add == DiffCount::Binary || del == DiffCount::Binary {
+                segs.push(seg(Tok::Slot(S::Dim), "bin"));
+                shown = true;
+            }
+            if let DiffCount::Exact(n) = add
+                && n > 0
+            {
+                if shown {
+                    segs.push(sp(1));
+                }
+                segs.push(seg(Tok::Hue(theme::Hue::Green), format!("+{n}")));
+                shown = true;
+            } else if matches!(add, DiffCount::Capped) {
+                if shown {
+                    segs.push(sp(1));
+                }
+                segs.push(seg(Tok::Hue(theme::Hue::Green), "+capped"));
+                shown = true;
+            }
+            if let DiffCount::Exact(n) = del
+                && n > 0
+            {
+                if shown {
+                    segs.push(sp(1));
+                }
+                segs.push(seg(Tok::Hue(theme::Hue::Red), format!("-{n}")));
+                shown = true;
+            } else if matches!(del, DiffCount::Capped) {
+                if shown {
+                    segs.push(sp(1));
+                }
+                segs.push(seg(Tok::Hue(theme::Hue::Red), "-capped"));
+                shown = true;
+            }
+            if shown {
+                segs.push(sp(1));
+            }
         }
     }
     let dirty = row.git.is_some_and(|g| g.dirty);
@@ -4895,5 +4900,33 @@ mod tests {
         };
         let text = segs.into_iter().map(|seg| seg.text).collect::<String>();
         assert!(text.contains("bin"), "{text:?}");
+    }
+
+    #[test]
+    fn detail_line_marks_unavailable_branch_diff() {
+        use thegn_svc::git::DiffCount;
+
+        let mut row = SidebarRow::base(RowKind::Worktree, 1, "feat", "app");
+        row.git = Some(GitGlyphs {
+            branch_diff: Some((DiffCount::Unavailable, DiffCount::Unavailable)),
+            ..GitGlyphs::default()
+        });
+        let line = compose_detail_line(&row, &crate::sidebar_view::SidebarDisplay::default())
+            .expect("default detail display shows branch stats");
+        let crate::seg::Line::Segs(segs) = line else {
+            panic!("detail line is composed from segments")
+        };
+        let unavailable_marks = segs
+            .iter()
+            .filter(|seg| {
+                seg.text == "diff ?"
+                    && seg.fg == crate::seg::Tok::Hue(thegn_core::theme::Hue::Amber)
+            })
+            .count();
+        assert_eq!(unavailable_marks, 1, "{segs:?}");
+        let text = segs.iter().map(|seg| seg.text.as_str()).collect::<String>();
+        assert!(text.contains("diff ?"), "{text:?}");
+        assert!(!text.contains("+0"), "{text:?}");
+        assert!(!text.contains("-0"), "{text:?}");
     }
 }

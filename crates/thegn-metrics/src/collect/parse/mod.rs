@@ -3,13 +3,16 @@ pub mod amd_gpu_metrics;
 pub mod cgroup;
 pub mod cpufreq;
 pub mod diskstats;
+pub mod interrupts;
 pub mod loadavg;
 pub mod meminfo;
 pub mod mountinfo;
 pub mod netdev;
 pub mod netstat;
 pub mod psi;
+pub mod schedstat;
 pub mod snmp;
+pub mod softirqs;
 pub mod softnet;
 pub mod stat;
 pub mod swaps;
@@ -17,6 +20,8 @@ pub mod upower_history;
 pub mod uptime;
 pub mod vmstat;
 pub mod zram;
+
+pub const MAX_CPUS: usize = 512;
 
 pub fn fields(input: &[u8]) -> impl Iterator<Item = &[u8]> {
     input

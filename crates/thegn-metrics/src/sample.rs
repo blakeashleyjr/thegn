@@ -66,6 +66,8 @@ pub struct StatsSampler {
     cpu_primed: bool,
     cpu_freq: crate::cpu_freq::CpuFreqProbe,
     last_cpu_freq: Option<u64>,
+    #[cfg(target_os = "linux")]
+    base_cpu: crate::base_cpu::BaseCpu,
     /// This process's PID — always watched for the daemon/status modal.
     self_pid: Pid,
     /// The pane-daemon's PID once the host resolves it (`None` = unknown).
@@ -89,6 +91,8 @@ pub struct StatsSampler {
     /// without a predecessor, and reporting the raw total would be meaningless.
     prev_reclaim: Option<(u64, Instant)>,
     vmstat: crate::vmstat::VmstatReader,
+    #[cfg(target_os = "linux")]
+    base_mem: crate::base_mem::BaseMem,
     /// Cached slow-tier results, reused between refreshes.
     last_disks: std::sync::Arc<[DiskInfo]>,
     #[cfg(not(target_os = "linux"))]
@@ -98,6 +102,8 @@ pub struct StatsSampler {
     net_classes: std::collections::BTreeMap<String, crate::net_kind::IfaceClass>,
     net_up: std::collections::BTreeMap<String, bool>,
     net_probed: bool,
+    #[cfg(target_os = "linux")]
+    base_net: crate::base_net::BaseNet,
 }
 
 /// Parse Linux `/proc/net/route`, returning every interface tied for the
@@ -202,6 +208,8 @@ impl StatsSampler {
                 "/sys/devices/system/cpu",
             )),
             last_cpu_freq: None,
+            #[cfg(target_os = "linux")]
+            base_cpu: crate::base_cpu::BaseCpu::new(),
             self_pid: Pid::from_u32(std::process::id()),
             daemon_pid: None,
             proc_primed: false,
@@ -211,6 +219,8 @@ impl StatsSampler {
             prev_disk: now,
             prev_reclaim: None,
             vmstat: crate::vmstat::VmstatReader::new(),
+            #[cfg(target_os = "linux")]
+            base_mem: crate::base_mem::BaseMem::new(),
             last_disks: std::sync::Arc::from([]),
             #[cfg(not(target_os = "linux"))]
             last_disk_io: None,
@@ -219,6 +229,8 @@ impl StatsSampler {
             net_classes: std::collections::BTreeMap::new(),
             net_up: std::collections::BTreeMap::new(),
             net_probed: false,
+            #[cfg(target_os = "linux")]
+            base_net: crate::base_net::BaseNet::new(),
         }
     }
 
@@ -280,31 +292,54 @@ impl StatsSampler {
         if slow {
             self.last_cpu_freq = self.cpu_freq.read_mhz(&mut self.sys);
         }
-        self.sys.refresh_cpu_usage();
-        if self.cpu_primed {
-            snap.cpu_pct = Some(pct_u8(self.sys.global_cpu_usage()));
-            snap.cpu_cores = self
-                .sys
-                .cpus()
-                .iter()
-                .map(|c| pct_u8(c.cpu_usage()))
-                .collect();
-        } else {
-            self.cpu_primed = true;
+        #[cfg(target_os = "linux")]
+        {
+            let (cpu_pct, cpu_cores) = self.base_cpu.fill(&mut self.cpu_primed);
+            snap.cpu_pct = cpu_pct.map(pct_u8);
+            snap.cpu_cores = cpu_cores.into_iter().map(pct_u8).collect();
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            self.sys.refresh_cpu_usage();
+            if self.cpu_primed {
+                snap.cpu_pct = Some(pct_u8(self.sys.global_cpu_usage()));
+                snap.cpu_cores = self
+                    .sys
+                    .cpus()
+                    .iter()
+                    .map(|c| pct_u8(c.cpu_usage()))
+                    .collect();
+            } else {
+                self.cpu_primed = true;
+            }
         }
         snap.cpu_freq_mhz = self.last_cpu_freq;
 
         // --- Memory + swap (every tick) ---
-        self.sys.refresh_memory();
         let gib = |b: u64| b as f32 / (1024.0 * 1024.0 * 1024.0);
-        let total = self.sys.total_memory();
-        if total > 0 {
-            snap.mem_gib = Some((gib(self.sys.used_memory()), gib(total)));
-            snap.mem_free_gib = Some(gib(self.sys.free_memory()));
+        #[cfg(target_os = "linux")]
+        {
+            let reading = self.base_mem.fill();
+            if let Some((used, total)) = crate::base_mem::nonzero_total(reading.mem) {
+                snap.mem_gib = Some((gib(used), gib(total)));
+                snap.mem_free_gib = reading.free.map(gib);
+            }
+            if let Some((used, total)) = crate::base_mem::nonzero_total(reading.swap) {
+                snap.swap_gib = Some((gib(used), gib(total)));
+            }
         }
-        let swap_total = self.sys.total_swap();
-        if swap_total > 0 {
-            snap.swap_gib = Some((gib(self.sys.used_swap()), gib(swap_total)));
+        #[cfg(not(target_os = "linux"))]
+        {
+            self.sys.refresh_memory();
+            let total = self.sys.total_memory();
+            if total > 0 {
+                snap.mem_gib = Some((gib(self.sys.used_memory()), gib(total)));
+                snap.mem_free_gib = Some(gib(self.sys.free_memory()));
+            }
+            let swap_total = self.sys.total_swap();
+            if swap_total > 0 {
+                snap.swap_gib = Some((gib(self.sys.used_swap()), gib(swap_total)));
+            }
         }
 
         // --- Direct reclaim (every tick, Linux only) ---
@@ -322,25 +357,45 @@ impl StatsSampler {
         }
 
         // --- Network (every tick): bytes/sec since the previous read ---
-        self.nets.refresh(false);
         let dt_net = now.duration_since(self.prev_net).as_secs_f64().max(0.001);
         self.prev_net = now;
         self.refresh_net_links(slow, probe_net_links);
-        let (ifaces, physical, all) = crate::net_kind::aggregate(
-            self.nets.iter().map(|(name, data)| {
-                (
-                    name.as_str(),
-                    (data.received() as f64 / dt_net) as u64,
-                    (data.transmitted() as f64 / dt_net) as u64,
-                )
-            }),
-            &self.net_classes,
-            &self.net_up,
-            cfg!(target_os = "linux"),
-        );
-        snap.net_ifaces = ifaces;
-        snap.net_bps = Some(physical);
-        snap.net_bps_all = Some(all);
+        let network = {
+            #[cfg(target_os = "linux")]
+            {
+                // Silences dead_code until X-1 removes the Linux Networks field.
+                let _legacy_networks = &self.nets;
+                self.base_net.rates(dt_net, slow).map(|rates| {
+                    crate::net_kind::aggregate(
+                        rates.iter().map(|(name, rx, tx)| (name.as_str(), *rx, *tx)),
+                        &self.net_classes,
+                        &self.net_up,
+                        cfg!(target_os = "linux"),
+                    )
+                })
+            }
+            #[cfg(not(target_os = "linux"))]
+            {
+                self.nets.refresh(false);
+                Some(crate::net_kind::aggregate(
+                    self.nets.iter().map(|(name, data)| {
+                        (
+                            name.as_str(),
+                            (data.received() as f64 / dt_net) as u64,
+                            (data.transmitted() as f64 / dt_net) as u64,
+                        )
+                    }),
+                    &self.net_classes,
+                    &self.net_up,
+                    cfg!(target_os = "linux"),
+                ))
+            }
+        };
+        if let Some((ifaces, physical, all)) = network {
+            snap.net_ifaces = ifaces;
+            snap.net_bps = Some(physical);
+            snap.net_bps_all = Some(all);
+        }
 
         // --- Battery + GPU + disk-free ---
         // Battery and disk-free are cheap file reads every tick. GPU depends on

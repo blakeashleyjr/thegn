@@ -43,13 +43,17 @@ pub struct DiskstatsCollector {
     sys_block: PathBuf,
     file: Option<ProcFile>,
     topology: Topology,
+    topology_indices: HashMap<String, usize>,
     interner: Interner,
+    over_cap: HashSet<String>,
     ids: HashMap<String, InstanceId>,
     rates: HashMap<String, Rates>,
     aggregate_rates: AggregateRates,
     last_scan: u64,
     topology_rev: u32,
     last_unknown_scan: u64,
+    #[cfg(test)]
+    intern_attempts: usize,
 }
 impl DiskstatsCollector {
     pub fn at(diskstats: impl AsRef<Path>, sys_block: impl AsRef<Path>) -> Self {
@@ -58,13 +62,17 @@ impl DiskstatsCollector {
             sys_block: sys_block.as_ref().to_owned(),
             file: None,
             topology: Topology::default(),
+            topology_indices: HashMap::new(),
             interner: Interner::new(Family::BlockDev),
+            over_cap: HashSet::new(),
             ids: HashMap::new(),
             rates: HashMap::new(),
             aggregate_rates: AggregateRates::default(),
             last_scan: 0,
             topology_rev: 0,
             last_unknown_scan: 0,
+            #[cfg(test)]
+            intern_attempts: 0,
         }
     }
     fn scan(&mut self, now_ms: u64) {
@@ -75,6 +83,14 @@ impl DiskstatsCollector {
                 rev: self.topology_rev,
                 ..next
             };
+            self.topology_indices = self
+                .topology
+                .devs
+                .iter()
+                .enumerate()
+                .map(|(index, dev)| (dev.name.to_string(), index))
+                .collect();
+            self.over_cap.clear();
             self.aggregate_rates = AggregateRates::default();
             let active: HashSet<_> = self
                 .topology
@@ -97,10 +113,21 @@ impl DiskstatsCollector {
         }
         for dev in &self.topology.devs {
             if !self.ids.contains_key(dev.name.as_ref())
-                && let Interned::Id(id) = self.interner.intern(&dev.name)
+                && !self.over_cap.contains(dev.name.as_ref())
             {
-                self.ids.insert(dev.name.to_string(), id);
-                self.rates.insert(dev.name.to_string(), Rates::default());
+                #[cfg(test)]
+                {
+                    self.intern_attempts += 1;
+                }
+                match self.interner.intern(&dev.name) {
+                    Interned::Id(id) => {
+                        self.ids.insert(dev.name.to_string(), id);
+                        self.rates.insert(dev.name.to_string(), Rates::default());
+                    }
+                    Interned::Other => {
+                        self.over_cap.insert(dev.name.to_string());
+                    }
+                }
             }
         }
         self.last_scan = now_ms;
@@ -154,11 +181,7 @@ impl Collector for DiskstatsCollector {
             let Ok(name) = std::str::from_utf8(row.name) else {
                 return false;
             };
-            !self
-                .topology
-                .devs
-                .iter()
-                .any(|dev| dev.name.as_ref() == name)
+            !self.topology_indices.contains_key(name)
         });
         if empty {
             return Err(CollectError::Parse("/proc/diskstats"));
@@ -185,17 +208,21 @@ impl Collector for DiskstatsCollector {
             let Ok(name) = std::str::from_utf8(row.name) else {
                 continue;
             };
-            let Some(dev) = self
-                .topology
-                .devs
-                .iter()
-                .find(|dev| dev.name.as_ref() == name)
-            else {
+            let Some(dev_index) = self.topology_indices.get(name).copied() else {
                 continue;
             };
+            let dev = &self.topology.devs[dev_index];
+            if self.over_cap.contains(name) {
+                part.truncated = true;
+                continue;
+            }
             let id = if let Some(id) = self.ids.get(name).copied() {
                 id
             } else {
+                #[cfg(test)]
+                {
+                    self.intern_attempts += 1;
+                }
                 match self.interner.intern(name) {
                     Interned::Id(id) => {
                         self.ids.insert(name.to_owned(), id);
@@ -203,6 +230,7 @@ impl Collector for DiskstatsCollector {
                         id
                     }
                     Interned::Other => {
+                        self.over_cap.insert(name.to_owned());
                         part.truncated = true;
                         continue;
                     }
@@ -265,6 +293,7 @@ impl Collector for DiskstatsCollector {
             self.ids.remove(&name);
             self.rates.remove(&name);
             self.interner.retire(id);
+            self.over_cap.clear();
         }
         part.aggregate = DiskTotals {
             read_bps: self
@@ -304,10 +333,16 @@ impl Collector for DiskstatsCollector {
         self.rates.clear();
         self.ids.clear();
         self.topology = Topology::default();
+        self.topology_indices.clear();
+        self.over_cap.clear();
         self.interner = Interner::new(Family::BlockDev);
         self.aggregate_rates = AggregateRates::default();
         self.last_scan = 0;
         self.last_unknown_scan = 0;
+        #[cfg(test)]
+        {
+            self.intern_attempts = 0;
+        }
     }
 }
 
@@ -680,5 +715,123 @@ mod tests {
         let sampled_rev = frame.parts.diskstats.topology_rev;
         assert_eq!(collector.discover(&Env::default()), Health::Warming);
         assert!(collector.topology_rev > sampled_rev);
+    }
+
+    #[test]
+    fn over_cap_names_are_cached_until_an_id_is_retired() {
+        let dir = tempfile::tempdir().unwrap();
+        let sys = dir.path().join("sys/block");
+        let proc = dir.path().join("diskstats");
+        let mut rows = String::new();
+        for index in 0..70_u32 {
+            let name = format!("sd{index:02}");
+            let device = sys.join(&name);
+            fs::create_dir_all(device.join("device")).unwrap();
+            fs::write(device.join("dev"), format!("8:{index}\n")).unwrap();
+            rows.push_str(&format!(
+                "8 {index} {name} 1 0 10 1 1 0 20 1 0 10 10 0 0 0 0 0 0\n"
+            ));
+        }
+        fs::write(&proc, &rows).unwrap();
+        let mut collector = DiskstatsCollector::at(&proc, &sys);
+        collector.discover(&Env::default());
+        let mut frame = MonitorFrame::default();
+        collector
+            .sample(
+                &TickCtx {
+                    tick: 1,
+                    now_ms: 1_000,
+                },
+                &mut frame,
+            )
+            .unwrap();
+        assert!(frame.parts.diskstats.truncated);
+        let intern_attempts = collector.intern_attempts;
+
+        collector
+            .sample(
+                &TickCtx {
+                    tick: 2,
+                    now_ms: 2_000,
+                },
+                &mut frame,
+            )
+            .unwrap();
+
+        assert_eq!(collector.intern_attempts, intern_attempts);
+        assert!(frame.parts.diskstats.truncated);
+
+        let without_first_device = rows
+            .lines()
+            .filter(|row| !row.contains(" sd00 "))
+            .collect::<Vec<_>>()
+            .join("\n");
+        fs::write(&proc, without_first_device).unwrap();
+        collector
+            .sample(
+                &TickCtx {
+                    tick: 3,
+                    now_ms: 3_000,
+                },
+                &mut frame,
+            )
+            .unwrap();
+        assert!(!collector.ids.contains_key("sd00"));
+
+        fs::write(&proc, &rows).unwrap();
+        collector
+            .sample(
+                &TickCtx {
+                    tick: 4,
+                    now_ms: 4_000,
+                },
+                &mut frame,
+            )
+            .unwrap();
+
+        assert!(collector.intern_attempts > intern_attempts);
+        assert!(frame.parts.diskstats.truncated);
+    }
+
+    #[test]
+    fn genuinely_new_diskstats_name_still_triggers_rescan() {
+        let dir = tempfile::tempdir().unwrap();
+        let sys = dir.path().join("sys/block");
+        fs::create_dir_all(sys.join("sda/device")).unwrap();
+        fs::write(sys.join("sda/dev"), "8:0\n").unwrap();
+        let proc = dir.path().join("diskstats");
+        fs::write(&proc, "8 0 sda 1 0 1 1 1 0 1 1 0 10 10 0 0 0 0 0 0\n").unwrap();
+        let mut collector = DiskstatsCollector::at(&proc, &sys);
+        collector.discover(&Env::default());
+        let mut frame = MonitorFrame::default();
+        collector
+            .sample(
+                &TickCtx {
+                    tick: 1,
+                    now_ms: 1_000,
+                },
+                &mut frame,
+            )
+            .unwrap();
+        let original_rev = collector.topology_rev;
+
+        fs::create_dir_all(sys.join("sdb/device")).unwrap();
+        fs::write(sys.join("sdb/dev"), "8:16\n").unwrap();
+        fs::write(
+            &proc,
+            "8 0 sda 1 0 1 1 1 0 1 1 0 10 10 0 0 0 0 0 0\n8 16 sdb 1 0 1 1 1 0 1 1 0 10 10 0 0 0 0 0 0\n",
+        )
+        .unwrap();
+        collector
+            .sample(
+                &TickCtx {
+                    tick: 2,
+                    now_ms: 2_000,
+                },
+                &mut frame,
+            )
+            .unwrap();
+
+        assert!(collector.topology_rev > original_rev);
     }
 }

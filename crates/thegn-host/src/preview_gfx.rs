@@ -82,11 +82,16 @@ impl PreviewGfx {
             Some((place, raster)) if self.cleared || self.drawn != Some((place, self.rev)) => {
                 // (Re)draw: encode first, and commit `drawn` only once there are
                 // real bytes to emit. An invalid raster draws nothing.
-                #[cfg(test)]
-                {
-                    self.encodes += 1;
-                }
-                match graphics::kitty_image(&raster.rgba, raster.w, raster.h, place) {
+                let image = if let Some(payload) = &raster.kitty {
+                    Ok(graphics::kitty_place(payload, place))
+                } else {
+                    #[cfg(test)]
+                    {
+                        self.encodes += 1;
+                    }
+                    graphics::kitty_image(&raster.rgba, raster.w, raster.h, place)
+                };
+                match image {
                     Ok(image) => {
                         // Delete any stale image first, then transmit + display.
                         let mut out = Vec::new();
@@ -150,6 +155,7 @@ mod tests {
             rgba: vec![1, 2, 3, 4],
             w: 1,
             h: 1,
+            kitty: None,
         }
     }
 
@@ -185,6 +191,68 @@ mod tests {
         assert!(
             g.frame(Some(panel()), Some("a.png"), false, true)
                 .is_empty()
+        );
+        assert_eq!(
+            g.encodes, 1,
+            "raster without a payload uses the fallback encoder"
+        );
+    }
+
+    #[test]
+    fn prepared_payload_draws_without_loop_encode_and_matches_legacy_bytes() {
+        let rgba = vec![1, 2, 3, 4];
+        let raster = Raster {
+            kitty: Some(std::sync::Arc::new(
+                graphics::kitty_payload(&rgba, 1, 1).unwrap(),
+            )),
+            rgba: rgba.clone(),
+            w: 1,
+            h: 1,
+        };
+        let mut g = PreviewGfx::new();
+        g.set("a.png".to_string(), raster);
+
+        let drawn = g.frame(Some(panel()), Some("a.png"), false, true);
+        assert_eq!(g.encodes, 0);
+        assert_eq!(
+            drawn,
+            graphics::kitty_image(&rgba, 1, 1, placement(panel())).unwrap()
+        );
+    }
+
+    #[test]
+    fn placement_change_reuses_prepared_payload_without_loop_encode() {
+        let rgba = vec![5, 6, 7, 8];
+        let raster = Raster {
+            kitty: Some(std::sync::Arc::new(
+                graphics::kitty_payload(&rgba, 1, 1).unwrap(),
+            )),
+            rgba: rgba.clone(),
+            w: 1,
+            h: 1,
+        };
+        let mut g = PreviewGfx::new();
+        g.set("a.png".to_string(), raster);
+        assert!(
+            !g.frame(Some(panel()), Some("a.png"), false, true)
+                .is_empty()
+        );
+        let resized = Rect {
+            x: panel().x,
+            y: panel().y,
+            cols: panel().cols + 1,
+            rows: panel().rows,
+        };
+
+        let redraw = g.frame(Some(resized), Some("a.png"), false, true);
+        assert_eq!(g.encodes, 0);
+        assert!(redraw.starts_with(&graphics::delete_preview()));
+        assert_eq!(
+            redraw[graphics::delete_preview().len()..].to_vec(),
+            graphics::kitty_place(
+                g.img.as_ref().unwrap().1.kitty.as_ref().unwrap(),
+                placement(resized)
+            )
         );
     }
 
@@ -231,6 +299,7 @@ mod tests {
                 rgba: vec![1, 2, 3], // 1x1 needs 4 bytes
                 w: 1,
                 h: 1,
+                kitty: None,
             },
         );
         assert!(
@@ -255,6 +324,7 @@ mod tests {
                 rgba: vec![1, 2, 3], // 1x1 needs 4 bytes
                 w: 1,
                 h: 1,
+                kitty: None,
             },
         );
         assert!(g.drawn.is_none());
@@ -282,6 +352,7 @@ mod tests {
                 rgba: Vec::new(),
                 w: 0,
                 h: 0,
+                kitty: None,
             },
         );
         assert_eq!(
@@ -304,6 +375,7 @@ mod tests {
                 rgba: vec![9, 9, 9, 9],
                 w: 1,
                 h: 1,
+                kitty: None,
             },
         );
         let second = g.frame(Some(panel()), Some("a.png"), false, true);
@@ -440,6 +512,7 @@ mod tests {
                 rgba: vec![9, 9, 9, 9],
                 w: 1,
                 h: 1,
+                kitty: None,
             },
         );
         let latest = g.frame(Some(panel()), Some("a.png"), false, true);

@@ -153,6 +153,10 @@ sandboxed launch is refused under the default floor. Pin one to skip the
 probing — `podman-rootless`, `podman-rootful`, `docker`, `bwrap`, `systemd`,
 `apple`, `wsl`, `none`.
 
+For local rootless Podman, the first thegn command is the `version` liveness
+probe, before container creation or the events client; a surviving `pause`
+process is Podman's namespace helper and is outside thegn's child ownership.
+
 One chain serves every OS: each OS-native entry is probed only on its own OS.
 
 > **NixOS tip:** set `backend = "bwrap"` to skip the podman probes and get
@@ -405,7 +409,10 @@ wizard, and `x`
 removes it after a confirm (removal also forgets the stored token). An
 environment can keep a **warm spare pool** so new worktrees start
 instantly; raise or lower the active project's pool target with the
-warm-pool actions (`Ctrl-Alt-=` / `Ctrl-Alt--`, also palette-runnable).
+warm-pool actions (`Ctrl-Alt-=` / `Ctrl-Alt--`, also palette-runnable). The
+target update runs in the background: `warm pool: updating target…` appears
+while it is queued, followed by the result, and raising the target stops at
+eight spares for the workspace's environment.
 Pool state shows on the sidebar's project chip, not in this section.
 `[sandbox] default_env` picks the environment new worktrees use.
 A repo's `env =` setting is only a hint; if that environment would weaken

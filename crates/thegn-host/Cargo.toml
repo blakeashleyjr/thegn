@@ -104,7 +104,7 @@ ignore.workspace = true
 # in-memory list fuzzing (palette/gitui/workspace picker).
 fff-search.workspace = true
 neo_frizbee.workspace = true
-notify = "8"
+notify = "=9.0.0-rc.4"
 reqwest = { version = "0.12", default-features = false, features = [
   "blocking",
   "rustls-tls",

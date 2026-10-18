@@ -45,6 +45,12 @@ pub enum Fallthrough {
 /// Under [`Fallthrough::Exact`], `None` additionally means "the requested
 /// backend isn't usable" — the caller owns the chain, so it owns the fallback
 /// message too.
+///
+/// The progress stream always closes this resolve: selected backends and
+/// reachable host-shell fallbacks emit `PhaseDone`, including an `Exact`-mode
+/// `None`; an undecidable remote emits `PhaseFailed`. In the latter case a
+/// preceding `Connect` phase has usually already closed Resolve in the observer,
+/// so the terminal event is typically a no-op there.
 pub(crate) fn pick_backend_with(
     cfg: &SandboxConfig,
     placement: &Placement,
@@ -96,84 +102,100 @@ fn pick_backend_with_notice(
 
     // Explicit backend: use it if suitable+present; otherwise warn and fall
     // through to the chain. `Auto` falls straight through to the chain.
-    if let Some(explicit) = Backend::from_config(cfg.backend) {
-        match explicit {
-            Backend::None => return Some(Backend::None),
-            b => {
-                if suitable(b) {
-                    crate::progress::emit(crate::progress::SandboxPhase::ResolveProbe {
-                        backend: b.label().to_string(),
-                    });
-                    match available(placement, b) {
-                        RuntimeProbe::Present => return Some(b),
-                        RuntimeProbe::Unreachable => saw_unreachable = true,
-                        RuntimeProbe::Absent => {}
+    let result = (|| {
+        if let Some(explicit) = Backend::from_config(cfg.backend) {
+            match explicit {
+                Backend::None => return Some(Backend::None),
+                b => {
+                    if suitable(b) {
+                        crate::progress::emit(crate::progress::SandboxPhase::ResolveProbe {
+                            backend: b.label().to_string(),
+                        });
+                        match available(placement, b) {
+                            RuntimeProbe::Present => return Some(b),
+                            RuntimeProbe::Unreachable => saw_unreachable = true,
+                            RuntimeProbe::Absent => {}
+                        }
                     }
+                    // The caller owns the chain in `Exact` mode — answering for
+                    // this backend only is the whole point, so don't walk and don't
+                    // announce a fallback the caller may not even take.
+                    if mode == Fallthrough::Exact {
+                        return None;
+                    }
+                    missing(
+                        cfg,
+                        &format!(
+                            "sandbox backend '{}' unavailable{}; trying the chain",
+                            cfg.backend,
+                            if b == Backend::WinAppContainer {
+                                " (reserved: not implemented — set [sandbox] backend to another backend, e.g. \"jobobject\" or a container runtime)"
+                            } else if suitable(b) {
+                                ""
+                            } else {
+                                unsuitable_reason(b)
+                            }
+                        ),
+                    );
                 }
-                // The caller owns the chain in `Exact` mode — answering for
-                // this backend only is the whole point, so don't walk and don't
-                // announce a fallback the caller may not even take.
-                if mode == Fallthrough::Exact {
+            }
+        }
+
+        for name in &cfg.backend_chain {
+            let Some(b) = Backend::parse(name) else {
+                continue;
+            };
+            let is_win_native = b == Backend::WinAppContainer || b == Backend::WinJobObject;
+            if b == Backend::None {
+                // Don't quietly pick the host-shell terminal for a remote we couldn't
+                // reach — surface the unreachable host so the caller halts.
+                if !placement.is_local() && saw_unreachable {
                     return None;
                 }
-                missing(
-                    cfg,
-                    &format!(
-                        "sandbox backend '{}' unavailable{}; trying the chain",
-                        cfg.backend,
-                        if b == Backend::WinAppContainer {
-                            " (reserved: not implemented — set [sandbox] backend to another backend, e.g. \"jobobject\" or a container runtime)"
-                        } else if suitable(b) {
-                            ""
-                        } else {
-                            unsuitable_reason(b)
-                        }
-                    ),
-                );
+                if !is_win_native {
+                    missing(
+                        cfg,
+                        &host_fallback_msg(
+                            cfg,
+                            placement,
+                            "sandbox: no container backend available",
+                        ),
+                    );
+                }
+                return Some(Backend::None);
+            }
+            if suitable(b) {
+                crate::progress::emit(crate::progress::SandboxPhase::ResolveProbe {
+                    backend: b.label().to_string(),
+                });
+                match available(placement, b) {
+                    RuntimeProbe::Present => return Some(b),
+                    RuntimeProbe::Unreachable => saw_unreachable = true,
+                    RuntimeProbe::Absent => {}
+                }
             }
         }
-    }
-
-    for name in &cfg.backend_chain {
-        let Some(b) = Backend::parse(name) else {
-            continue;
-        };
-        let is_win_native = b == Backend::WinAppContainer || b == Backend::WinJobObject;
-        if b == Backend::None {
-            // Don't quietly pick the host-shell terminal for a remote we couldn't
-            // reach — surface the unreachable host so the caller halts.
-            if !placement.is_local() && saw_unreachable {
-                return None;
-            }
-            if !is_win_native {
-                missing(
-                    cfg,
-                    &host_fallback_msg(cfg, placement, "sandbox: no container backend available"),
-                );
-            }
-            return Some(Backend::None);
+        // Chain didn't include "none". A reachable host with no runtime still falls
+        // back to the host shell; an unreachable remote stays undecidable.
+        if !placement.is_local() && saw_unreachable {
+            return None;
         }
-        if suitable(b) {
-            crate::progress::emit(crate::progress::SandboxPhase::ResolveProbe {
-                backend: b.label().to_string(),
+        missing(
+            cfg,
+            &host_fallback_msg(cfg, placement, "sandbox: no usable backend in chain"),
+        );
+        Some(Backend::None)
+    })();
+    match result {
+        Some(_) => crate::progress::emit(crate::progress::SandboxPhase::PhaseDone),
+        None if !placement.is_local() && saw_unreachable => {
+            crate::progress::emit(crate::progress::SandboxPhase::PhaseFailed {
+                err: format!("{} unreachable", placement.label()),
             });
-            match available(placement, b) {
-                RuntimeProbe::Present => return Some(b),
-                RuntimeProbe::Unreachable => saw_unreachable = true,
-                RuntimeProbe::Absent => {}
-            }
         }
+        None => crate::progress::emit(crate::progress::SandboxPhase::PhaseDone),
     }
-    // Chain didn't include "none". A reachable host with no runtime still falls
-    // back to the host shell; an unreachable remote stays undecidable.
-    if !placement.is_local() && saw_unreachable {
-        return None;
-    }
-    missing(
-        cfg,
-        &host_fallback_msg(cfg, placement, "sandbox: no usable backend in chain"),
-    );
-    Some(Backend::None)
+    result
 }
 
 /// Whether `backend` can even be *considered* for `placement`, before probing
@@ -1083,5 +1105,55 @@ mod tests {
             "still unreachable after budget"
         );
         assert_eq!(calls, 3, "exactly max_attempts probes");
+    }
+
+    #[test]
+    fn a_present_backend_closes_the_resolve_progress_phase() {
+        use crate::progress::{SandboxPhase, scoped};
+        use std::sync::{Arc, Mutex};
+
+        let backend = [
+            Backend::Podman,
+            Backend::Bwrap,
+            Backend::Apple,
+            Backend::WinJobObject,
+        ]
+        .into_iter()
+        .find(|backend| backend_suitable(*backend, &Placement::Local))
+        .expect("at least one supported backend for the host");
+        let cfg = SandboxConfig {
+            backend_chain: vec![backend.label().to_string()],
+            ..SandboxConfig::default()
+        };
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let sink_seen = seen.clone();
+        let _guard = scoped(Box::new(move |event| {
+            sink_seen.lock().unwrap().push(event);
+        }));
+        let _pass = probe_pass_guard();
+        pass_memo_put(
+            &(format!("{:?}", Placement::Local), backend),
+            RuntimeProbe::Present,
+        );
+
+        let resolved = pick_backend_with_notice(
+            &cfg,
+            &Placement::Local,
+            Fallthrough::Chain,
+            |_: &SandboxConfig, _: &str| {},
+        );
+
+        assert_eq!(resolved, Some(backend));
+        assert_eq!(
+            *seen.lock().unwrap(),
+            vec![
+                SandboxPhase::Resolve,
+                SandboxPhase::ResolveProbe {
+                    backend: backend.label().to_string(),
+                },
+                SandboxPhase::PhaseDone,
+            ],
+            "a selected backend closes the resolve phase it opened"
+        );
     }
 }
