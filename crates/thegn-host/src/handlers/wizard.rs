@@ -4,7 +4,6 @@
 //! create worker off-loop.
 
 use termwiz::terminal::TerminalWaker;
-use thegn_core::store::HostStore;
 use tokio::sync::mpsc as tokio_mpsc;
 use tokio::task;
 
@@ -125,43 +124,59 @@ pub(crate) fn leave_for_setup(
     }
 }
 
-/// Parse + persist an add-host input (`user@host[:port]` or
-/// `dumbpipe:<ticket> <user>`), then merge the new def into the LIVE config so
-/// the re-opened wizard lists it immediately. Returns the host name.
+/// Parse an add-host input and queue its durable write. The live config is
+/// updated when the result returns to the compositor.
 pub(crate) fn add_host_from_input(
     text: &str,
-    cfg: &mut thegn_core::config::Config,
-) -> Result<String, String> {
+    cfg: &thegn_core::config::Config,
+    then: crate::run::run_pending_db::HostAddThen,
+    tx: &tokio_mpsc::UnboundedSender<crate::run::run_pending_db::PendingDbResult>,
+    waker: &TerminalWaker,
+) -> Result<(), String> {
     let mut parts = text.split_whitespace();
     let target = parts.next().ok_or("empty input")?;
     let iroh_user = parts.next();
     let (name, hc) = thegn_core::host_config::parse_host_target(target, iroh_user)?;
-    if cfg.host.contains_key(&name)
-        && !thegn_core::db::Db::open()
-            .ok()
-            .and_then(|db| db.host_defs().ok())
-            .is_some_and(|d| d.iter().any(|(n, _)| n == &name))
-    {
-        return Err(format!("[host.{name}] already exists in config.toml"));
-    }
+    let cfg_has_name = cfg.host.contains_key(&name);
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| thegn_core::time_policy::saturating_i64(u128::from(d.as_secs())))
         .unwrap_or(0);
-    let db = thegn_core::db::Db::open().map_err(|e| format!("state db: {e}"))?;
-    db.put_host_def(&name, &hc, now)
-        .map_err(|e| e.to_string())?;
-    thegn_core::host_config::merge_db_hosts(cfg);
-    // Publish a new admitted generation that includes the stored host, so
-    // hydration (which reads the published snapshot) and later authority
-    // checks see it. Off the loop: the reload re-reads the config file and
-    // the state store.
-    thegn_core::thread_name::spawn_named("thegn-cfg-load", || {
-        crate::platform::qos::set_self(crate::platform::qos::Qos::Utility);
-        if let crate::config_startup::ReloadOutcome::Failed(error) = crate::config_startup::reload()
-        {
-            tracing::warn!(target: "thegn::config", %error, "config reload after host add failed");
-        }
-    });
-    Ok(name)
+    crate::run::run_pending_db::queue_host_add(
+        tx,
+        waker,
+        crate::run::run_pending_db::HostAddRequest {
+            name,
+            hc,
+            cfg_has_name,
+            then,
+            now,
+        },
+    );
+    Ok(())
+}
+
+/// Persist a parsed host definition and return the complete set for the loop
+/// to merge into its live config.
+pub(crate) fn store_host_def(
+    db: &thegn_core::db::Db,
+    name: &str,
+    hc: &thegn_core::host_config::HostConfig,
+    cfg_has_name: bool,
+    now: i64,
+) -> Result<Vec<(String, thegn_core::host_config::HostConfig)>, String> {
+    use thegn_core::store::HostStore;
+
+    if cfg_has_name
+        && !db
+            .host_defs()
+            .map_err(|error| format!("state db: {error}"))?
+            .iter()
+            .any(|(stored, _)| stored == name)
+    {
+        return Err(format!("[host.{name}] already exists in config.toml"));
+    }
+    db.put_host_def(name, hc, now)
+        .map_err(|error| error.to_string())?;
+    db.host_defs().map_err(|error| format!("state db: {error}"))
 }
