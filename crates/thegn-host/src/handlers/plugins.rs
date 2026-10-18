@@ -1177,9 +1177,12 @@ struct DispatchReq {
     _permit: DispatchPermit,
 }
 
+type DispatchRespond = dyn Fn(&RpcResponse) -> Result<(), SessionFailure> + Send;
+type DispatchIsClosed = dyn Fn() -> bool + Send;
+
 struct DispatchReply {
-    respond: Box<dyn Fn(&RpcResponse) -> Result<(), SessionFailure> + Send>,
-    is_closed: Box<dyn Fn() -> bool + Send>,
+    respond: Box<DispatchRespond>,
+    is_closed: Box<DispatchIsClosed>,
 }
 
 impl DispatchReply {
@@ -1334,10 +1337,9 @@ impl Dispatcher {
                     }
                     // Timeout cancels this local future. Synchronous setup before its first
                     // await may already have run, and a daemon mutation may have completed.
-                    let response = match rt.block_on(tokio::time::timeout(
-                        deadline,
-                        dispatch(cap, params),
-                    )) {
+                    let response = match rt.block_on(async {
+                        tokio::time::timeout(deadline, dispatch(cap, params)).await
+                    }) {
                         Ok(Ok(value)) => RpcResponse::ok(id, value),
                         Ok(Err(error)) => RpcResponse::err(id, error),
                         Err(_) => {
