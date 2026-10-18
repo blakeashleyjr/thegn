@@ -192,6 +192,7 @@ pub fn collector_families(id: crate::collect::CollectorId) -> &'static [MetricFa
         Id::Netdev => &[MetricFamily::Network],
         Id::Diskstats => &[MetricFamily::Disk],
         Id::AmdSmu => &[MetricFamily::Gpu],
+        Id::PowerSupply => &[MetricFamily::Battery],
         Id::Psi | Id::Cgroup | Id::CgroupSlice | Id::Powercap => &[],
     }
 }
@@ -436,6 +437,28 @@ mod tests {
         assert_eq!(
             coverage_with_collectors(&snapshot, &health),
             coverage(&snapshot)
+        );
+    }
+
+    #[test]
+    fn power_supply_health_covers_battery_family() {
+        use crate::collect::{
+            COLLECTORS, CollectorId,
+            health::{Absent, Health},
+        };
+        let snapshot = StatsSnapshot::default();
+        let mut health = [Health::Absent(Absent::NotImplemented); COLLECTORS];
+        assert_eq!(
+            collector_families(CollectorId::PowerSupply),
+            &[MetricFamily::Battery]
+        );
+        health[CollectorId::PowerSupply.index()] = Health::Ok;
+        assert_eq!(
+            cov(
+                &coverage_with_collectors(&snapshot, &health),
+                MetricFamily::Battery
+            ),
+            Coverage::Available
         );
     }
 }

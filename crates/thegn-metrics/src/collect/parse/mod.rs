@@ -9,6 +9,7 @@ pub mod mountinfo;
 pub mod netdev;
 pub mod psi;
 pub mod stat;
+pub mod upower_history;
 pub mod uptime;
 pub mod vmstat;
 

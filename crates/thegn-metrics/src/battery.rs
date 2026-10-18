@@ -14,258 +14,73 @@ pub(crate) struct BatteryReading {
 
 #[cfg(target_os = "linux")]
 mod linux {
-    use std::fs::{self, File};
-    use std::os::unix::fs::FileExt;
-    use std::path::{Path, PathBuf};
+    use std::path::PathBuf;
     use std::time::{Duration, Instant};
 
     use super::BatteryReading;
+    #[cfg(test)]
+    use crate::collect::linux::power_supply::Counters;
+    use crate::collect::linux::power_supply::{BaseSupply, SupplyReader};
 
     const REDISCOVER_EVERY: Duration = Duration::from_secs(60);
-
-    #[derive(Default)]
-    struct Battery {
-        capacity: Option<File>,
-        status: Option<File>,
-        power_now: Option<File>,
-        current_now: Option<File>,
-        voltage_now: Option<File>,
-        energy_now: Option<File>,
-        charge_now: Option<File>,
-        energy_full: Option<u64>,
-        charge_full: Option<u64>,
-        voltage_min_design: Option<u64>,
-    }
-
-    struct Adapter {
-        online: File,
-    }
-
-    #[derive(Default)]
-    struct Supplies {
-        batteries: Vec<Battery>,
-        adapters: Vec<Adapter>,
-    }
-
-    #[derive(Debug, Default, Clone, Copy)]
-    #[cfg_attr(not(test), allow(dead_code))]
-    pub(super) struct Counters {
-        pub scans: usize,
-        pub opens: usize,
-        pub reads: usize,
-        pub adapter_reads: usize,
-    }
-
     pub(crate) struct BatteryReader {
-        base: PathBuf,
-        supplies: Supplies,
+        reader: SupplyReader,
         discovered_at: Option<Instant>,
-        counters: Counters,
-        #[cfg(test)]
-        fail_next_read: bool,
-        #[cfg(test)]
-        fail_next_power_read: bool,
+        rows: Vec<BaseSupply>,
     }
-
     impl BatteryReader {
         pub(crate) fn new(base: PathBuf) -> Self {
             Self {
-                base,
-                supplies: Supplies::default(),
+                reader: SupplyReader::at(base),
                 discovered_at: None,
-                counters: Counters::default(),
-                #[cfg(test)]
-                fail_next_read: false,
-                #[cfg(test)]
-                fail_next_power_read: false,
+                rows: Vec::new(),
             }
         }
-
         pub(crate) fn sample(&mut self, now: Instant) -> BatteryReading {
-            let rediscovered = self
+            let due = self
                 .discovered_at
                 .is_none_or(|then| now.duration_since(then) >= REDISCOVER_EVERY);
-            if rediscovered {
-                self.discover(now);
+            if due {
+                self.reader.discover();
+                self.discovered_at = Some(now);
             }
-            match self.read_sample(true) {
+            match self.read_sample() {
                 Ok(reading) => reading,
                 Err(()) => {
-                    // A removed/replaced sysfs node invalidates all held fds.
-                    // Retry discovery and collection once, never more than once per sample.
-                    if !rediscovered {
-                        self.discover(now);
+                    if !due {
+                        self.reader.discover();
+                        self.discovered_at = Some(now);
                     }
-                    self.read_sample(false).unwrap_or_default()
+                    match self.read_sample() {
+                        Ok(reading) => reading,
+                        Err(()) => BatteryReading::default(),
+                    }
                 }
             }
         }
-
         #[cfg(test)]
         pub(super) fn counters(&self) -> Counters {
-            self.counters
+            self.reader.counters()
         }
-
         #[cfg(test)]
         pub(super) fn fail_next_read_for_test(&mut self) {
-            self.fail_next_read = true;
+            self.reader.fail_next_read_for_test();
         }
-
         #[cfg(test)]
         pub(super) fn fail_next_power_read_for_test(&mut self) {
-            self.fail_next_power_read = true;
+            self.reader.fail_next_power_read_for_test();
         }
-
-        fn discover(&mut self, now: Instant) {
-            self.supplies = Supplies::default();
-            #[cfg(test)]
-            {
-                self.counters.scans += 1;
-            }
-            if let Ok(entries) = fs::read_dir(&self.base) {
-                for entry in entries.flatten() {
-                    let path = entry.path();
-                    let kind = fs::read_to_string(path.join("type"));
-                    if kind.as_deref().is_ok_and(|value| value.trim() == "Battery") {
-                        let scope = fs::read_to_string(path.join("scope"));
-                        if scope.as_deref().is_ok_and(|value| value.trim() == "Device") {
-                            continue;
-                        }
-                        let battery = Battery {
-                            capacity: self.open_attr(&path, "capacity"),
-                            status: self.open_attr(&path, "status"),
-                            power_now: self.open_attr(&path, "power_now"),
-                            current_now: self.open_attr(&path, "current_now"),
-                            voltage_now: self.open_attr(&path, "voltage_now"),
-                            energy_now: self.open_attr(&path, "energy_now"),
-                            charge_now: self.open_attr(&path, "charge_now"),
-                            energy_full: Self::read_cached(&path, "energy_full"),
-                            charge_full: Self::read_cached(&path, "charge_full"),
-                            voltage_min_design: Self::read_cached(&path, "voltage_min_design"),
-                        };
-                        self.supplies.batteries.push(battery);
-                    } else if let Some(online) = self.open_attr(&path, "online") {
-                        self.supplies.adapters.push(Adapter { online });
-                    }
-                }
-            }
-            self.discovered_at = Some(now);
-        }
-
-        #[cfg_attr(not(test), allow(unused_variables))]
-        fn open_attr(&mut self, path: &Path, name: &str) -> Option<File> {
-            #[cfg(test)]
-            {
-                self.counters.opens += 1;
-            }
-            File::open(path.join(name)).ok()
-        }
-
-        fn read_cached(path: &Path, name: &str) -> Option<u64> {
-            let bytes = fs::read(path.join(name)).ok()?;
-            parse_u64(&bytes)
-        }
-
-        fn read_sample(&mut self, signal_critical_errors: bool) -> Result<BatteryReading, ()> {
-            #[cfg(test)]
-            if self.fail_next_read {
-                self.fail_next_read = false;
-                return Err(());
-            }
-            let mut buffer = [0_u8; 128];
-            let mut rows = Vec::with_capacity(self.supplies.batteries.len());
-            for battery in &self.supplies.batteries {
-                let status_bytes = match read_file(&battery.status, &mut buffer, &mut self.counters)
-                {
-                    Ok(bytes) => bytes,
-                    Err(()) if signal_critical_errors => return Err(()),
-                    Err(()) => None,
-                };
-                let status = trim_ascii(status_bytes.unwrap_or(&[]));
-                let status_ac = matches!(status, b"Charging" | b"Full" | b"Not charging");
-                let charging = status == b"Charging";
-                let capacity =
-                    match read_capacity(&battery.capacity, &mut buffer, &mut self.counters) {
-                        Ok(capacity) => capacity,
-                        Err(()) if signal_critical_errors => return Err(()),
-                        Err(()) => None,
-                    };
-                let energy_now =
-                    read_num_optional(&battery.energy_now, &mut buffer, &mut self.counters);
-                let charge_now = if energy_now.is_none() {
-                    read_num_optional(&battery.charge_now, &mut buffer, &mut self.counters)
-                } else {
-                    None
-                };
-                #[cfg(test)]
-                let power_result = if self.fail_next_power_read {
-                    self.fail_next_power_read = false;
-                    Err(())
-                } else {
-                    read_num(&battery.power_now, &mut buffer, &mut self.counters)
-                };
-                #[cfg(not(test))]
-                let power_result = read_num(&battery.power_now, &mut buffer, &mut self.counters);
-                let power_now = power_result.unwrap_or_default();
-                let need_current_voltage =
-                    power_now.is_none() || (energy_now.is_none() && charge_now.is_some());
-                let current_now = if need_current_voltage {
-                    read_signed_optional(&battery.current_now, &mut buffer, &mut self.counters)
-                } else {
-                    None
-                };
-                let voltage_now = if need_current_voltage {
-                    read_num_optional(&battery.voltage_now, &mut buffer, &mut self.counters)
-                } else {
-                    None
-                };
-                rows.push(Row {
-                    capacity,
-                    status_ac,
-                    charging,
-                    energy_now,
-                    charge_now,
-                    power_now,
-                    current_now,
-                    voltage_now,
-                    energy_full: battery.energy_full,
-                    charge_full: battery.charge_full,
-                    voltage_min_design: battery.voltage_min_design,
-                });
-            }
-
-            let status_ac = rows.iter().any(|row| row.status_ac);
-            let on_ac = if status_ac {
-                true
-            } else if !rows.is_empty() {
-                let mut online = false;
-                for adapter in &self.supplies.adapters {
-                    #[cfg(test)]
-                    {
-                        self.counters.adapter_reads += 1;
-                    }
-                    let adapter_online =
-                        match read_open(&adapter.online, &mut buffer, &mut self.counters) {
-                            Ok(bytes) => parse_u64(bytes) == Some(1),
-                            Err(()) => false,
-                        };
-                    if adapter_online {
-                        online = true;
-                        break;
-                    }
-                }
-                online
-            } else {
-                false
-            };
-
-            let battery = combine_percent(&rows).map(|pct| (pct, on_ac));
+        fn read_sample(&mut self) -> Result<BatteryReading, ()> {
+            self.reader.read_base(&mut self.rows).map_err(|_| ())?;
+            let rows = &self.rows;
+            let battery =
+                combine_percent(rows).map(|pct| (pct, rows.first().is_some_and(|row| row.on_ac)));
             let mut watts = 0.0_f64;
             let mut has_power = false;
             let mut remaining = 0.0_f64;
             let mut rate = 0.0_f64;
             let mut has_eta = false;
-            for row in &rows {
+            for row in rows {
                 let battery_power = row.power_now.map(|v| v as f64).or_else(|| {
                     Some(
                         row.current_now?.unsigned_abs() as f64 * row.voltage_now? as f64
@@ -276,7 +91,6 @@ mod linux {
                     watts += power;
                     has_power = true;
                 }
-
                 if let Some(value) = row.energy_now {
                     let rem = if row.charging {
                         row.energy_full
@@ -322,22 +136,7 @@ mod linux {
         }
     }
 
-    #[derive(Default)]
-    struct Row {
-        capacity: Option<u8>,
-        status_ac: bool,
-        charging: bool,
-        energy_now: Option<u64>,
-        charge_now: Option<u64>,
-        power_now: Option<u64>,
-        current_now: Option<i64>,
-        voltage_now: Option<u64>,
-        energy_full: Option<u64>,
-        charge_full: Option<u64>,
-        voltage_min_design: Option<u64>,
-    }
-
-    fn combine_percent(rows: &[Row]) -> Option<u8> {
+    fn combine_percent(rows: &[BaseSupply]) -> Option<u8> {
         let first = rows.first()?;
         if rows.len() == 1 {
             return first.capacity.map(|value| value.min(100));
@@ -374,91 +173,20 @@ mod linux {
                 .clamp(0.0, 100.0) as u8
         })
     }
-
-    fn read_file<'a>(
-        file: &Option<File>,
-        buffer: &'a mut [u8],
-        counters: &mut Counters,
-    ) -> Result<Option<&'a [u8]>, ()> {
-        let Some(file) = file else { return Ok(None) };
-        read_open(file, buffer, counters).map(Some)
-    }
-
-    #[cfg_attr(not(test), allow(unused_variables))]
-    fn read_open<'a>(
-        file: &File,
-        buffer: &'a mut [u8],
-        counters: &mut Counters,
-    ) -> Result<&'a [u8], ()> {
-        #[cfg(test)]
-        {
-            counters.reads += 1;
-        }
-        let count = file.read_at(buffer, 0).map_err(|_| ())?;
-        Ok(&buffer[..count])
-    }
-
-    fn read_num(
-        file: &Option<File>,
-        buffer: &mut [u8],
-        counters: &mut Counters,
-    ) -> Result<Option<u64>, ()> {
-        read_file(file, buffer, counters).map(|bytes| bytes.and_then(parse_u64))
-    }
-
-    fn read_num_optional(
-        file: &Option<File>,
-        buffer: &mut [u8],
-        counters: &mut Counters,
-    ) -> Option<u64> {
-        read_num(file, buffer, counters).unwrap_or_default()
-    }
-
-    fn read_capacity(
-        file: &Option<File>,
-        buffer: &mut [u8],
-        counters: &mut Counters,
-    ) -> Result<Option<u8>, ()> {
-        read_file(file, buffer, counters).map(|bytes| bytes.and_then(parse_u8))
-    }
-
-    fn read_signed(
-        file: &Option<File>,
-        buffer: &mut [u8],
-        counters: &mut Counters,
-    ) -> Result<Option<i64>, ()> {
-        read_file(file, buffer, counters).map(|bytes| bytes.and_then(parse_i64))
-    }
-
-    fn read_signed_optional(
-        file: &Option<File>,
-        buffer: &mut [u8],
-        counters: &mut Counters,
-    ) -> Option<i64> {
-        read_signed(file, buffer, counters).unwrap_or_default()
-    }
-
-    fn trim_ascii(mut bytes: &[u8]) -> &[u8] {
-        while bytes.first().is_some_and(u8::is_ascii_whitespace) {
-            bytes = &bytes[1..];
-        }
-        while bytes.last().is_some_and(u8::is_ascii_whitespace) {
-            bytes = &bytes[..bytes.len() - 1];
-        }
-        bytes
-    }
-
     pub(super) fn parse_u64(bytes: &[u8]) -> Option<u64> {
-        std::str::from_utf8(trim_ascii(bytes)).ok()?.parse().ok()
+        let text = match std::str::from_utf8(bytes) {
+            Ok(value) => value,
+            Err(_) => return None,
+        };
+        match text.trim().parse() {
+            Ok(value) => Some(value),
+            Err(_) => None,
+        }
     }
-    fn parse_u8(bytes: &[u8]) -> Option<u8> {
-        std::str::from_utf8(trim_ascii(bytes)).ok()?.parse().ok()
+    #[cfg(test)]
+    pub(super) fn counters(reader: &BatteryReader) -> Counters {
+        reader.counters()
     }
-    fn parse_i64(bytes: &[u8]) -> Option<i64> {
-        std::str::from_utf8(trim_ascii(bytes)).ok()?.parse().ok()
-    }
-
-    pub(crate) use BatteryReader as Reader;
 }
 
 #[cfg(target_os = "linux")]
