@@ -104,6 +104,7 @@ pub(in crate::monitor) struct MemoryModel {
     pub dirty: Option<u64>,
     pub writeback: Option<u64>,
     pub swap_total: Option<u64>,
+    swap_present: bool,
     pub swap_free: Option<u64>,
     pub zswap: Option<u64>,
     pub zram_used: Option<u64>,
@@ -191,6 +192,7 @@ impl Default for MemoryModel {
             dirty: None,
             writeback: None,
             swap_total: None,
+            swap_present: false,
             swap_free: None,
             zswap: None,
             zram_used: None,
@@ -287,6 +289,11 @@ impl MemoryModel {
         self.dirty = mem.get(MemField::Dirty);
         self.writeback = mem.get(MemField::Writeback);
         self.swap_total = mem.get(MemField::SwapTotal);
+        if let Some(total) = self.swap_total
+            && self.swap_present != (total > 0)
+        {
+            self.swap_present = total > 0;
+        }
         self.swap_free = mem.get(MemField::SwapFree);
         self.zswap = mem.get(MemField::Zswap);
         self.zram_used = (!frame.parts.meminfo.zram.is_empty()).then(|| {
@@ -413,9 +420,9 @@ impl TabView for MemoryView<'_> {
 
     fn template(&self) -> Node {
         let mut panels = vec![COMPOSITION, VERDICT, PRESSURE, PAGING];
-        // Follow-up: gate on meminfo Health::Absent once source health is carried
-        // into this model; SwapTotal presence is the available field today.
-        if self.0.swap_total.is_some_and(|total| total > 0) {
+        // SwapTotal changes only on a swap-device layout change; swap usage does
+        // not affect panel placement.
+        if self.0.swap_present {
             panels.push(SWAP);
         }
         Node::Col(vec![
