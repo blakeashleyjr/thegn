@@ -237,8 +237,8 @@ pub(crate) fn merge_glyph_scan(
         Err(()) => {
             clean = false;
             prior.map(|p| (p.add, p.del)).unwrap_or((
-                thegn_svc::git::DiffCount::Exact(0),
-                thegn_svc::git::DiffCount::Exact(0),
+                thegn_svc::git::DiffCount::Unavailable,
+                thegn_svc::git::DiffCount::Unavailable,
             ))
         }
     };
@@ -246,7 +246,10 @@ pub(crate) fn merge_glyph_scan(
         Ok(bd) => bd,
         Err(()) => {
             clean = false;
-            prior.and_then(|p| p.branch_diff)
+            prior.map(|p| p.branch_diff).unwrap_or(Some((
+                thegn_svc::git::DiffCount::Unavailable,
+                thegn_svc::git::DiffCount::Unavailable,
+            )))
         }
     };
     let submodule_dirty = match submodule_dirty {

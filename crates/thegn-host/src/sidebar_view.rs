@@ -1972,31 +1972,36 @@ fn compose_row_lines(
                 }
                 if disp.show_diff_stat {
                     use thegn_svc::git::DiffCount;
-                    if g.add == DiffCount::Binary || g.del == DiffCount::Binary {
+                    if g.add == DiffCount::Unavailable || g.del == DiffCount::Unavailable {
                         push_sp(&mut right);
-                        right.push(seg(Tok::Slot(S::Dim), "bin"));
-                    }
-                    match g.add {
-                        DiffCount::Exact(n) if n > 0 => {
+                        right.push(seg(Tok::Hue(theme::Hue::Amber), "?"));
+                    } else {
+                        if g.add == DiffCount::Binary || g.del == DiffCount::Binary {
                             push_sp(&mut right);
-                            right.push(seg(Tok::Hue(theme::Hue::Green), format!("+{n}")));
+                            right.push(seg(Tok::Slot(S::Dim), "bin"));
                         }
-                        DiffCount::Capped => {
-                            push_sp(&mut right);
-                            right.push(seg(Tok::Hue(theme::Hue::Green), "+capped"));
+                        match g.add {
+                            DiffCount::Exact(n) if n > 0 => {
+                                push_sp(&mut right);
+                                right.push(seg(Tok::Hue(theme::Hue::Green), format!("+{n}")));
+                            }
+                            DiffCount::Capped => {
+                                push_sp(&mut right);
+                                right.push(seg(Tok::Hue(theme::Hue::Green), "+capped"));
+                            }
+                            DiffCount::Exact(_) | DiffCount::Binary | DiffCount::Unavailable => {}
                         }
-                        DiffCount::Exact(_) | DiffCount::Binary | DiffCount::Unavailable => {}
-                    }
-                    match g.del {
-                        DiffCount::Exact(n) if n > 0 => {
-                            push_sp(&mut right);
-                            right.push(seg(Tok::Hue(theme::Hue::Red), format!("-{n}")));
+                        match g.del {
+                            DiffCount::Exact(n) if n > 0 => {
+                                push_sp(&mut right);
+                                right.push(seg(Tok::Hue(theme::Hue::Red), format!("-{n}")));
+                            }
+                            DiffCount::Capped => {
+                                push_sp(&mut right);
+                                right.push(seg(Tok::Hue(theme::Hue::Red), "-capped"));
+                            }
+                            DiffCount::Exact(_) | DiffCount::Binary | DiffCount::Unavailable => {}
                         }
-                        DiffCount::Capped => {
-                            push_sp(&mut right);
-                            right.push(seg(Tok::Hue(theme::Hue::Red), "-capped"));
-                        }
-                        DiffCount::Exact(_) | DiffCount::Binary | DiffCount::Unavailable => {}
                     }
                 }
                 if disp.show_ahead_behind {
@@ -3606,5 +3611,15 @@ mod tests {
         let exact = render(DiffCount::Exact(42), DiffCount::Exact(7));
         assert!(exact.contains("+42"), "{exact:?}");
         assert!(exact.contains("-7"), "{exact:?}");
+
+        let unavailable = render(DiffCount::Unavailable, DiffCount::Unavailable);
+        assert!(unavailable.contains('?'), "{unavailable:?}");
+        assert!(!unavailable.contains("+0"), "{unavailable:?}");
+        assert!(!unavailable.contains("-0"), "{unavailable:?}");
+
+        let partial = render(DiffCount::Exact(3), DiffCount::Unavailable);
+        assert!(partial.contains('?'), "{partial:?}");
+        assert!(!partial.contains("+3"), "{partial:?}");
+        assert!(!partial.contains("-0"), "{partial:?}");
     }
 }

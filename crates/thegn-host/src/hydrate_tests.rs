@@ -530,9 +530,9 @@ fn glyph_scan_partial_error_keeps_only_failed_field() {
 }
 
 #[test]
-fn glyph_scan_error_without_prior_falls_back_to_defaults() {
-    // First-ever scan that errors has no prior to reuse: best-effort zeros,
-    // and not clean so it won't be cached.
+fn glyph_scan_error_without_prior_marks_counts_unavailable() {
+    // First-ever scan that errors has no prior to reuse, so its unknown counts
+    // stay explicit and the row is not cached.
     let (row, clean) = merge_glyph_scan(
         None,
         Err(()),
@@ -543,7 +543,15 @@ fn glyph_scan_error_without_prior_falls_back_to_defaults() {
         Err(()),
         Err(()),
     );
-    assert_eq!(row, glyph_row(false, 0, 0, None, "/repo", 0, 0, None));
+    assert_eq!(row.add, thegn_svc::git::DiffCount::Unavailable);
+    assert_eq!(row.del, thegn_svc::git::DiffCount::Unavailable);
+    assert_eq!(
+        row.branch_diff,
+        Some((
+            thegn_svc::git::DiffCount::Unavailable,
+            thegn_svc::git::DiffCount::Unavailable
+        ))
+    );
     assert!(!clean);
 }
 
@@ -2600,4 +2608,24 @@ fn rows_never_all_expire_in_the_same_tick() {
         busy_buckets.values().all(|count| *count < 35),
         "busy due ticks: {busy_buckets:?}"
     );
+}
+
+#[test]
+fn glyph_scan_error_with_prior_keeps_typed_counts() {
+    let prior = glyph_row(true, 4, 1, Some("feat"), "/repo", 42, 7, Some((310, 84)));
+    let (row, clean) = merge_glyph_scan(
+        Some(&prior),
+        Ok(true),
+        Ok(Some((4, 1))),
+        Ok(Some("feat".into())),
+        "/repo".into(),
+        Err(()),
+        Err(()),
+        Ok(false),
+    );
+
+    assert_eq!(row.add, thegn_svc::git::DiffCount::Exact(42));
+    assert_eq!(row.del, thegn_svc::git::DiffCount::Exact(7));
+    assert_eq!(row.branch_diff, prior.branch_diff);
+    assert!(!clean);
 }
