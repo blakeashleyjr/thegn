@@ -304,6 +304,24 @@ pub fn prepare_sandbox_env(
     selected_env: Option<&str>,
 ) -> anyhow::Result<SandboxOutcome> {
     use crate::handlers::repo_trust::resolve_env_trusted;
+    // Config is cloned into background launch workers. Include the process
+    // admission generation when available, plus the exact cloned value, so a
+    // reload invalidates the memo even when its contents are unchanged and a
+    // stale worker cannot poison the newly published generation.
+    let generation = {
+        use std::hash::{Hash, Hasher};
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        if let Some(admitted) = crate::config_startup::display() {
+            admitted.revision().generation.hash(&mut hasher);
+        }
+        format!("{cfg:?}").hash(&mut hasher);
+        force_host_requested(worktree).hash(&mut hasher);
+        hasher.finish()
+    };
+    crate::sandbox_fallback_memo::observe_generation(generation);
+    if force_host_requested(worktree) {
+        crate::sandbox_fallback_memo::clear_worktree(worktree);
+    }
     let trusted = resolve_env_trusted(cfg, repo_root, loc, worktree, selected_env);
     let environment = trusted.environment;
     let devcontainer = trusted.devcontainer;
@@ -366,6 +384,8 @@ pub fn prepare_sandbox_env(
     } else {
         placement.clone()
     };
+    let fallback_key =
+        crate::sandbox_fallback_memo::Key::new(&env_name, &exec_placement.label(), worktree);
     let mut env_is_remote = environment.is_remote() && cwd_override.is_none();
     let mut route_ssh_target = if env_is_remote {
         match &placement {
@@ -785,6 +805,22 @@ pub fn prepare_sandbox_env(
             if let Some(note) = thegn_core::sandbox::hostname_rules_note(&spec) {
                 warnings.push(note);
             }
+            // The full candidate has passed the current floor, home and compose
+            // gates above. Reuse only its prior ensure/exec failure; those gates
+            // remain live for every resolution, including ones using this memo.
+            if let Some(previous_warning) = crate::sandbox_fallback_memo::reusable_failure(
+                explicit_choice,
+                generation,
+                &fallback_key,
+                spec.backend.label(),
+            ) {
+                warnings.push(previous_warning);
+                warnings.push(format!(
+                    "sandbox {}: reused this session's earlier failed probe",
+                    spec.backend.label()
+                ));
+                continue;
+            }
             // Keep the final validation adjacent to the effects it protects:
             // VPN attachment and container ensure/exec are reached only after
             // the fully composed spec has passed the admission gate.
@@ -854,6 +890,14 @@ pub fn prepare_sandbox_env(
                     let m = format!("sandbox {} failed: {e}", spec.backend.label());
                     if explicit_choice {
                         anyhow::bail!("{m} for {worktree}")
+                    }
+                    if !e.to_string().starts_with("sandbox vpn attach failed") {
+                        crate::sandbox_fallback_memo::remember_failure(
+                            generation,
+                            fallback_key.clone(),
+                            spec.backend.label(),
+                            &m,
+                        );
                     }
                     thegn_core::msg::warn(&format!("{m} for {worktree}; trying next backend"));
                     warnings.push(m);
