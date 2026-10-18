@@ -23,6 +23,7 @@ pub struct Parts {
     pub diskstats: super::model::diskstats::DiskstatsPart,
     pub powercap: super::model::powercap::PowercapPart,
     pub power_supply: super::model::power_supply::PowerSupplyPart,
+    pub thermal_zone: super::model::thermal_zone::ThermalZonePart,
 }
 impl Parts {
     pub fn clear(&mut self) {
@@ -41,6 +42,7 @@ impl Parts {
         self.diskstats.clear();
         self.powercap.clear();
         self.power_supply.clear();
+        self.thermal_zone.clear();
     }
 }
 

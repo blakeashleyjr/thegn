@@ -43,10 +43,11 @@ pub enum CollectorId {
     Diskstats,
     Powercap,
     PowerSupply,
+    ThermalZone,
 }
 
 impl CollectorId {
-    pub const ALL: [Self; 15] = [
+    pub const ALL: [Self; 16] = [
         Self::Loadavg,
         Self::Uptime,
         Self::Psi,
@@ -62,6 +63,7 @@ impl CollectorId {
         Self::Diskstats,
         Self::Powercap,
         Self::PowerSupply,
+        Self::ThermalZone,
     ];
 
     pub const fn slug(self) -> &'static str {
@@ -81,6 +83,7 @@ impl CollectorId {
             Self::Diskstats => "diskstats",
             Self::Powercap => "powercap",
             Self::PowerSupply => "power_supply",
+            Self::ThermalZone => "thermal_zone",
         }
     }
 
@@ -176,6 +179,8 @@ pub fn default_collectors() -> Vec<Box<dyn Collector>> {
     collectors[CollectorId::PowerSupply.index()] = Box::new(
         linux::power_supply::PowerSupplyCollector::at("/sys/class/power_supply"),
     );
+    collectors[CollectorId::ThermalZone.index()] =
+        Box::new(linux::thermal_zones::ThermalZoneCollector::new());
     collectors
 }
 
@@ -204,6 +209,7 @@ mod default_collectors_tests {
             CollectorId::Cgroup,
             CollectorId::CgroupSlice,
             CollectorId::AmdSmu,
+            CollectorId::ThermalZone,
         ] {
             assert_ne!(
                 collectors[id.index()].cadence(),
