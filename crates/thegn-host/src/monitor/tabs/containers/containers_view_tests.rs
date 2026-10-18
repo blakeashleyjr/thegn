@@ -172,36 +172,17 @@ fn warm_storage_is_bounded_and_membership_reuses_slots_without_history_leaks() {
         .iter()
         .position(|slot| slot.id.as_deref() == Some("old-a"))
         .unwrap();
-    let old_capacity = model.slots[old_slot].cpu_history.values.len();
+    assert_eq!(model.slots[old_slot].cpu_history.len, super::HISTORY_CAP);
     model.absorb_frame(&frame(121, &["old-c", "new-d", "old-a"]));
-    let capacities = (
-        model.slots.capacity(),
-        model.order.capacity(),
-        model
-            .slots
-            .iter()
-            .map(|slot| slot.cpu_history.values.len())
-            .collect::<Vec<_>>(),
-    );
-    for tick in 0..1_000 {
-        let ids = if tick.is_multiple_of(2) {
-            ["new-d", "old-a", "old-c"]
-        } else {
-            ["old-c", "new-d", "old-a"]
+    let capacities = (model.slots.capacity(), model.order.capacity());
+    for tick in 0_usize..1_000 {
+        let ids = match (tick / 7) % 3 {
+            0 => ["new-d", "old-a", "old-c"],
+            1 => ["old-c", "new-d", "old-a"],
+            _ => ["old-a", "new-e", "old-c"],
         };
         model.absorb_frame(&frame(tick + 122, &ids));
-        assert_eq!(
-            (
-                model.slots.capacity(),
-                model.order.capacity(),
-                model
-                    .slots
-                    .iter()
-                    .map(|slot| slot.cpu_history.values.len())
-                    .collect::<Vec<_>>()
-            ),
-            capacities
-        );
+        assert_eq!((model.slots.capacity(), model.order.capacity()), capacities);
     }
     let slot = model
         .slots
@@ -211,12 +192,10 @@ fn warm_storage_is_bounded_and_membership_reuses_slots_without_history_leaks() {
     let mut ordered = [f32::NAN; super::HISTORY_CAP];
     let len = slot.cpu_history.ordered(&mut ordered);
     assert_eq!(len, super::HISTORY_CAP);
-    assert_ne!(
+    assert_eq!(
         ordered[len - 1],
-        ordered[len - 2],
-        "newest sample must reach the final ring position"
+        row("old-a", 1_121).cpu_pct.unwrap() as f32
     );
-    assert_eq!(old_capacity, super::HISTORY_CAP);
 
     model.absorb_frame(&frame(2_000, &["old-c", "new-d"]));
     model.absorb_frame(&frame(2_001, &["old-c", "new-d", "old-a"]));
@@ -228,6 +207,101 @@ fn warm_storage_is_bounded_and_membership_reuses_slots_without_history_leaks() {
     assert_eq!(
         reappeared.cpu_history.len, 1,
         "a vanished id must not inherit a replaced slot's history"
+    );
+}
+
+#[test]
+fn totals_ignore_missing_metric_rows_and_table_pids_keep_their_column() {
+    let mut mixed = frame(1, &["without-io", "with-io"]);
+    mixed.parts.containers_stats.rows[0].io_read_bps = None;
+    mixed.parts.containers_stats.rows[0].io_write_bps = None;
+    let mut model = ContainersModel::default();
+    model.absorb_frame(&mixed);
+    let mut ordered = [f32::NAN; super::HISTORY_CAP];
+    assert_eq!(model.read_total.ordered(&mut ordered), 1);
+    assert!(ordered[0].is_finite());
+    assert_eq!(
+        ordered[0],
+        mixed.parts.containers_stats.rows[1].io_read_bps.unwrap() as f32
+    );
+
+    let mut stats = frame(0, &["scope-pids-123456"]);
+    stats.parts.containers_stats.rows[0].pids = Some(7);
+    let mut model = ContainersModel::default();
+    for tick in 0..120 {
+        stats.parts.containers_stats.rows[0].cpu_pct = Some(tick as f64 + 1.0);
+        model.absorb_frame(&stats);
+    }
+    let inventory = inventory();
+    let view = ContainersView::new(&model, &inventory);
+    let mut surface = Surface::new(240, 60);
+    let board = Board::default();
+    let area = Rect::full(240, 60);
+    let placed = board.placed(&view, area);
+    board.paint(&view, &mut surface, area, 0, &[]);
+    let table = placed
+        .iter()
+        .find(|panel| panel.id == super::TABLE)
+        .unwrap();
+    let row_y = table.y + 2;
+    let line = text(&surface).lines().nth(row_y).unwrap().to_owned();
+    let pids_x = table.x + 1 + super::TABLE_PIDS;
+    assert!(
+        line.chars()
+            .skip(pids_x)
+            .take(5)
+            .collect::<String>()
+            .contains('7'),
+        "pids column must retain 7 in `{line}`"
+    );
+}
+
+#[test]
+fn history_right_edge_tracks_the_newest_sample_and_leaves_a_gap_blank() {
+    let ids = ["scope-cpu-123456"];
+    let mut model = ContainersModel::default();
+    for tick in 0..120 {
+        model.absorb_frame(&frame(tick, &ids));
+    }
+    let inventory = inventory();
+    let view = ContainersView::new(&model, &inventory);
+    let board = Board::default();
+    let area = Rect::full(240, 60);
+    let placed = board.placed(&view, area);
+    let cpu = placed.iter().find(|panel| panel.id == super::CPU).unwrap();
+    let sample_x = cpu.x + cpu.cols - 2;
+    let graph_y = cpu.y + cpu.rows - 2;
+    let mut surface = Surface::new(240, 60);
+    caps::test_override::with_unicode(UnicodeLevel::Full, || {
+        board.paint(&view, &mut surface, area, 0, &[])
+    });
+    let last_cell = |surface: &Surface| {
+        text(surface)
+            .lines()
+            .nth(graph_y)
+            .unwrap()
+            .chars()
+            .nth(sample_x)
+            .unwrap()
+    };
+    let painted = last_cell(&surface);
+    assert!(
+        painted != ' ' && painted != '\u{2800}',
+        "newest graph cell was {painted:?}"
+    );
+
+    let mut gap = frame(121, &ids);
+    gap.parts.containers_stats.rows[0].gap = true;
+    model.absorb_frame(&gap);
+    let gap_view = ContainersView::new(&model, &inventory);
+    let mut gap_surface = Surface::new(240, 60);
+    caps::test_override::with_unicode(UnicodeLevel::Full, || {
+        board.paint(&gap_view, &mut gap_surface, area, 0, &[])
+    });
+    assert_eq!(
+        last_cell(&gap_surface),
+        ' ',
+        "newest gap must leave the right edge blank"
     );
 }
 
