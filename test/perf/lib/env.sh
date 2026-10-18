@@ -14,10 +14,11 @@ set -euo pipefail
 # Create the throwaway root and export the isolated environment. Caller is
 # responsible for cleanup (or use perf_trap_cleanup).
 perf_make_tmp() {
-  local v
+  local entry v
   # A perf run must not inherit the developer's session controls, log routing,
   # or credentials. Keep TG_PERF_* so the harness's own knobs remain available.
-  while IFS= read -r v; do
+  while IFS= read -r -d '' entry; do
+    v="${entry%%=*}"
     case "$v" in
     THEGN_* | GH_* | GITHUB_* | KANEO_* | LINEAR_* | JIRA_* | AWS_* | *TOKEN* | *API_KEY* | *SECRET*)
       case "$v" in
@@ -26,7 +27,7 @@ perf_make_tmp() {
       esac
       ;;
     esac
-  done < <(compgen -e)
+  done < <(env -0)
 
   PERF_TMP="$(mktemp -d "${TMPDIR:-/tmp}/tg-perf.XXXXXX")"
   export PERF_TMP
@@ -64,9 +65,37 @@ perf_make_tmp() {
     >"$GIT_CONFIG_GLOBAL"
 }
 
+# Remove any podman pause process owned by this fixture, then remove its files.
+# Podman overlay layers may be owned by its user namespace, so retry deletion
+# through `podman unshare` when ordinary rm cannot remove the isolated tree.
+perf_cleanup() {
+  local d cmdline
+  if [ -n "${PERF_TMP:-}" ] && [ -d /proc ]; then
+    for d in /proc/[0-9]*; do
+      [ -r "$d/cmdline" ] && [ -r "$d/environ" ] || continue
+      cmdline="$(tr '\0' ' ' <"$d/cmdline" 2>/dev/null || true)"
+      case "$cmdline" in
+      *podman\ pause*)
+        if tr '\0' '\n' <"$d/environ" 2>/dev/null | grep -F -- "$PERF_TMP" >/dev/null; then
+          kill "${d##*/}" 2>/dev/null || true
+        fi
+        ;;
+      esac
+    done
+  fi
+  if [ -n "${PERF_SOCK_DIR:-}" ]; then
+    rm -rf -- "$PERF_SOCK_DIR" || true
+  fi
+  if [ -n "${PERF_TMP:-}" ] && [ -e "$PERF_TMP" ]; then
+    if ! rm -rf -- "$PERF_TMP" && command -v podman >/dev/null 2>&1; then
+      podman unshare rm -rf -- "$PERF_TMP" || true
+    fi
+  fi
+}
+
 # Install an EXIT trap that removes the temp dir.
 perf_trap_cleanup() {
-  trap 'rm -rf "${PERF_TMP:-}"' EXIT
+  trap perf_cleanup EXIT
 }
 
 # A stable per-machine tag so baselines are explicitly machine-scoped.
