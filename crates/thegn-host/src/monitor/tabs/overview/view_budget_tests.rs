@@ -102,8 +102,8 @@ fn warmed_absorbs_stay_allocation_free_across_changing_frames_and_history() {
 #[test]
 fn populated_overview_panels_stay_within_the_pinned_paint_budget() {
     // THE-898 regression ceiling; primary pins the reduced value from observed counts.
-    const PAINT_ALLOCATION_BUDGET: u64 = 184_000;
-    const PAINT_REALLOC_BUDGET: u64 = 14_000;
+    const PAINT_ALLOCATION_BUDGET: u64 = 160_200;
+    const PAINT_REALLOC_BUDGET: u64 = 2_400;
     let (model, _) = populated_overview();
     let view = super::OverviewView(&model);
     let area = Rect::full(240, 60);
