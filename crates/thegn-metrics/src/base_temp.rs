@@ -128,15 +128,15 @@ impl<F: HwmonFs> BaseTemp<F> {
     fn refresh_gates(&mut self) {
         for (chip, gate) in self.gates.iter_mut().enumerate() {
             let mut buf = [0; 32];
-            if let Some(handle) = &gate.runtime {
-                if let Ok(length) = self.fs.pread(handle, &mut buf) {
-                    gate.status = buf[..length].to_vec();
-                }
+            if let Some(handle) = &gate.runtime
+                && let Ok(length) = self.fs.pread(handle, &mut buf)
+            {
+                gate.status = buf[..length].to_vec();
             }
-            if let Some(handle) = &gate.state {
-                if let Ok(length) = self.fs.pread(handle, &mut buf) {
-                    gate.scsi_state = Some(buf[..length].to_vec());
-                }
+            if let Some(handle) = &gate.state
+                && let Ok(length) = self.fs.pread(handle, &mut buf)
+            {
+                gate.scsi_state = Some(buf[..length].to_vec());
             }
             let gated = wake_gate(&gate.status, gate.scsi_state.as_deref());
             if gate.gated != gated {
