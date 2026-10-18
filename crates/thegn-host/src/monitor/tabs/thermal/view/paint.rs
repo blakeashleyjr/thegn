@@ -254,7 +254,7 @@ pub(super) fn sensors(grid: &mut CellGrid, rect: Rect, sensors: &[SensorRow]) {
             (Some(max), Some(crit)) => format!("{max:.0}/{crit:.0}"),
             (Some(max), None) => format!("max {max:.0}"),
             (None, Some(crit)) => format!("crit {crit:.0}"),
-            (None, None) => "ref 100 C".to_owned(),
+            (None, None) => "ref 100".to_owned(),
         })
         .collect::<Vec<_>>();
     let bar_width = SENSOR_COLUMN_WIDTHS[4];
