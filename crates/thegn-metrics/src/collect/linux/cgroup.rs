@@ -88,7 +88,7 @@ impl HeldFiles {
                 self.open_attempts = self.open_attempts.saturating_add(1);
             }
             let present = path.exists();
-            let file = File::open(&path).ok();
+            let file = Result::ok(File::open(&path));
             self.files.push(file);
             self.present.push(present);
             self.reopen_needed.push(false);
