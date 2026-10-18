@@ -235,7 +235,7 @@ fn host_graph_entry_points_match_hand_written_ascii_rows() {
     crate::caps::test_override::with_unicode(UnicodeLevel::Ascii, || {
         crate::caps::test_override::with_color(ColorDepth::None, || {
             let mut history = termwiz::surface::Surface::new(4, 2);
-            super::graph::paint_history_graph(
+            super::paint_history_graph(
                 &[0.5, 1.0],
                 RampId::Util,
                 crate::compositor::Rect {
@@ -285,6 +285,36 @@ fn host_graph_entry_points_match_hand_written_ascii_rows() {
             let heat_rows = [&[0.0, 0.5, 1.0][..], &[0.5][..]];
             paint_heatmap(&mut heat, &heat_rows, RampId::Heat, &palette);
             assert_eq!(text(&heat), [" +@", "  +"]);
+        });
+    });
+}
+
+#[test]
+fn host_history_graph_paints_braille_golden() {
+    crate::caps::test_override::with_unicode(UnicodeLevel::Full, || {
+        crate::caps::test_override::with_color(ColorDepth::None, || {
+            let mut history = termwiz::surface::Surface::new(1, 1);
+            super::paint_history_graph(
+                &[1.0],
+                RampId::Util,
+                crate::compositor::Rect {
+                    x: 0,
+                    y: 0,
+                    cols: 1,
+                    rows: 1,
+                },
+                &mut history,
+            );
+            let history_rows: Vec<String> = history
+                .screen_lines()
+                .iter()
+                .map(|line| {
+                    line.visible_cells()
+                        .map(|cell| cell.str().to_owned())
+                        .collect()
+                })
+                .collect();
+            assert_eq!(history_rows, ["⢸"]);
         });
     });
 }

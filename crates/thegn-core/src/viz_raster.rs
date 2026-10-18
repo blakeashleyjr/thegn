@@ -263,6 +263,9 @@ fn spans_for(
             }
             SpanMode::Band => {
                 let has_hi = i >= dest_other && i - dest_other < other.len().min(capacity);
+                if !has_value && !has_hi {
+                    return (0, -1);
+                }
                 let hi = clamp01(if has_hi {
                     other[source_other + i - dest_other]
                 } else {
@@ -1018,16 +1021,16 @@ mod tests {
         sparkline_width(&[0.5], 2, &RasterTable::ASCII, &mut b);
         assert_eq!(chars(&b), [" -"]);
 
-        // Exact-width inputs occupy both columns and retain distinct glyphs.
+        // Exact-width inputs map sample i to column i.
         b.reset(2, 2);
         area(&[0.0, 1.0], &RasterTable::ASCII, &mut b);
-        assert_eq!(chars(&b), ["  ", " #"]);
+        assert_eq!(chars(&b), [" #", " #"]);
         b.reset(2, 2);
         line(&[0.0, 1.0], &RasterTable::ASCII, &mut b);
         assert_eq!(chars(&b), [" #", ". "]);
         b.reset(2, 2);
         band(&[0.0, 0.25], &[0.5, 1.0], &RasterTable::ASCII, &mut b);
-        assert_eq!(chars(&b), [" :", ".:"]);
+        assert_eq!(chars(&b), [" |", ":|"]);
         b.reset(2, 2);
         columns(
             &[0.0, 1.0],
@@ -1035,13 +1038,13 @@ mod tests {
             &RasterTable::ASCII,
             &mut b,
         );
-        assert_eq!(chars(&b), ["  ", " #"]);
+        assert_eq!(chars(&b), [" #", " #"]);
         b.reset(2, 2);
         mirrored(&[0.0, 1.0], &[0.0, 1.0], &RasterTable::ASCII, &mut b);
-        assert_eq!(chars(&b), ["  ", " #"]);
+        assert_eq!(chars(&b), [" #", " #"]);
         b.reset(2, 2);
         stacked(&[&[0.0, 1.0]], &RasterTable::ASCII, &mut b);
-        assert_eq!(chars(&b), ["  ", " #"]);
+        assert_eq!(chars(&b), [" #", " #"]);
         sparkline_width(&[0.0, 1.0], 2, &RasterTable::ASCII, &mut b);
         assert_eq!(chars(&b), ["_#"]);
 
@@ -1068,7 +1071,7 @@ mod tests {
             &RasterTable::ASCII,
             &mut b,
         );
-        assert_eq!(chars(&b), [": :", ": "]);
+        assert_eq!(chars(&b), ["::", ": "]);
         b.reset(2, 2);
         mirrored(
             &[0.0, 0.0, 0.5, 1.0],
@@ -1110,6 +1113,9 @@ mod tests {
 
             columns(&[1.0], &table.ramp8, table, &mut b);
             assert_eq!(chars(&b), ["█"]);
+            b.reset(2, 1);
+            columns(&[1.0], &table.ramp8, table, &mut b);
+            assert_eq!(chars(&b), [" █"]);
             columns(&[1.0, 1.0], &table.ramp8, table, &mut b);
             assert_eq!(chars(&b), ["█"]);
 
@@ -1122,6 +1128,10 @@ mod tests {
             b.reset(1, 1);
             stacked(&[&[1.0]], table, &mut b);
             assert_eq!(chars(&b), ["█"]);
+            b.reset(2, 1);
+            stacked(&[&[1.0]], table, &mut b);
+            assert_eq!(chars(&b), [" █"]);
+            b.reset(1, 1);
             stacked(&[&[1.0, 1.0]], table, &mut b);
             assert_eq!(chars(&b), ["█"]);
 
@@ -1137,6 +1147,8 @@ mod tests {
 
             sparkline_width(&[1.0], 1, table, &mut b);
             assert_eq!(chars(&b), ["█"]);
+            sparkline_width(&[1.0], 2, table, &mut b);
+            assert_eq!(chars(&b), [" █"]);
             sparkline_width(&[1.0, 1.0], 1, table, &mut b);
             assert_eq!(chars(&b), ["█"]);
 
