@@ -6,7 +6,7 @@ use thegn_metrics::collect::health::{Absent, Health};
 fn style() -> crate::monitor::kit::grid::CellStyle {
     crate::monitor::kit::grid::CellStyle::default()
 }
-fn mark(health: Health) -> &'static str {
+pub(super) fn mark(health: Health) -> &'static str {
     match health {
         Health::Warming => caps::active_glyphs().ellipsis,
         Health::Absent(Absent::NoPermission) => caps::glyph(Glyph::Lock),

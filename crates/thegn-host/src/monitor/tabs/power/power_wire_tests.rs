@@ -83,7 +83,6 @@ fn power_overlay_ingest_updates_visible_model_and_pause_freezes_it() {
                     cycle_count: None,
                     usb_type_active: None,
                 }],
-                ..Default::default()
             },
             ..Default::default()
         },

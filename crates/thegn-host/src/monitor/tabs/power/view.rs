@@ -73,7 +73,6 @@ pub(in crate::monitor) struct PowerModel {
     pub(super) session: SessionEnergy,
     ewma: Ewma,
     history: Vec<f32>,
-    history_len: usize,
     battery_history: Vec<f32>,
     battery_power_history: Vec<f32>,
     pub(super) power_supply_health: Health,
@@ -203,10 +202,11 @@ impl PowerModel {
                 .position(|row| row.name == zone.name.as_ref() && row.domain == Some(zone.domain));
             let index = match index {
                 Some(index) => index,
-                None => {
+                None if self.zones.len() < INSTANCE_CAP => {
                     self.zones.push(ZoneRow::default());
                     self.zones.len() - 1
                 }
+                None => continue,
             };
             let row = &mut self.zones[index];
             row.name.clear();
@@ -278,7 +278,6 @@ impl PowerModel {
         self.session_ac = ac_state;
         if let Some(watts) = self.socket_w.or(self.battery_w.map(f32::abs)) {
             push_history(&mut self.history, watts);
-            self.history_len = self.history.len();
         }
     }
     pub(in crate::monitor) fn absorb_history(
@@ -338,12 +337,45 @@ fn rail_ceiling(model: &PowerModel) -> f32 {
 fn history_graph_rect(rect: Rect, inner: Rect, len: usize, braille: bool) -> Rect {
     let used = if braille { len.div_ceil(2) } else { len };
     let cols = inner.cols.min(used);
+    right_align_history(
+        Rect {
+            x: rect.x + inner.x + inner.cols.saturating_sub(cols),
+            y: rect.y + inner.y,
+            cols,
+            rows: inner.rows.saturating_sub(11),
+        },
+        len,
+        braille,
+    )
+}
+fn right_align_history(area: Rect, len: usize, braille: bool) -> Rect {
+    let used = if braille { len.div_ceil(2) } else { len };
+    let cols = area.cols.min(used);
     Rect {
-        x: rect.x + inner.x + inner.cols.saturating_sub(cols),
-        y: rect.y + inner.y,
+        x: area.x + area.cols.saturating_sub(cols),
         cols,
-        rows: inner.rows.saturating_sub(11),
+        ..area
     }
+}
+fn draw_graph_label(surface: &mut Surface, x: usize, y: usize, width: usize, label: &str) {
+    let line = crate::seg::Line::segs(vec![crate::seg::seg(
+        crate::seg::Tok::Slot(crate::chrome::S::Dim),
+        label,
+    )]);
+    crate::seg::draw_line(
+        surface,
+        x,
+        y,
+        width,
+        &line,
+        crate::seg::Tok::Slot(crate::chrome::S::Dim),
+    );
+}
+fn watts_label(name: &str, watts: Option<f32>) -> String {
+    let value = watts
+        .map(|watts| format!("{watts:.1} W"))
+        .unwrap_or_else(|| crate::caps::active_glyphs().emdash.to_owned());
+    format!("{name} {value}")
 }
 fn rail_title(model: &PowerModel) -> String {
     let ceiling = rail_ceiling(model);
@@ -379,8 +411,10 @@ fn fill_battery(row: &mut BatteryRow, supply: &SupplyReading) {
     if let Some(charge) = row.capacity {
         push_history(&mut row.charge_history, charge as f32 / 100.0);
     }
-    if let Some(energy) = row.now_wh {
-        push_history(&mut row.energy_history, energy as f32);
+    if let (Some(energy), Some(full)) = (row.now_wh, row.full_wh.or(row.design_wh))
+        && full > 0.0
+    {
+        push_history(&mut row.energy_history, (energy / full) as f32);
     }
 }
 
@@ -452,6 +486,11 @@ impl TabView for PowerView<'_> {
             let graph_rows = (inner.rows.saturating_sub(5) / 2).min(6);
             let graph_y = rect.y + inner.y + inner.rows - graph_rows * 2;
             let graph_x = rect.x + inner.x;
+            let charge_label = if self.0.battery_history.is_empty() {
+                format!("charge history {}", paint::mark(self.0.power_supply_health))
+            } else {
+                "charge history".to_owned()
+            };
             if self.0.batteries.is_empty() {
                 let charge = Rect {
                     x: graph_x,
@@ -459,10 +498,38 @@ impl TabView for PowerView<'_> {
                     cols: inner.cols,
                     rows: graph_rows,
                 };
+                draw_graph_label(surface, graph_x, graph_y, inner.cols, &charge_label);
                 let power = Rect {
                     y: graph_y + graph_rows,
                     ..charge
                 };
+                draw_graph_label(
+                    surface,
+                    graph_x,
+                    graph_y + graph_rows,
+                    inner.cols,
+                    "battery power",
+                );
+                let charge = Rect {
+                    y: charge.y + 1,
+                    rows: charge.rows.saturating_sub(1),
+                    ..charge
+                };
+                let power = Rect {
+                    y: power.y + 1,
+                    rows: power.rows.saturating_sub(1),
+                    ..power
+                };
+                let charge = right_align_history(
+                    charge,
+                    self.0.battery_history.len(),
+                    graphs::table().braille,
+                );
+                let power = right_align_history(
+                    power,
+                    self.0.battery_power_history.len(),
+                    graphs::table().braille,
+                );
                 graphs::paint_history_graph(
                     &self.0.battery_history,
                     RampId::Power,
@@ -489,6 +556,34 @@ impl TabView for PowerView<'_> {
                     y: graph_y + graph_rows,
                     ..charge
                 };
+                draw_graph_label(surface, graph_x, graph_y, telemetry_cols, &charge_label);
+                draw_graph_label(
+                    surface,
+                    graph_x,
+                    graph_y + graph_rows,
+                    telemetry_cols,
+                    "battery power",
+                );
+                let charge = Rect {
+                    y: charge.y + 1,
+                    rows: charge.rows.saturating_sub(1),
+                    ..charge
+                };
+                let power = Rect {
+                    y: power.y + 1,
+                    rows: power.rows.saturating_sub(1),
+                    ..power
+                };
+                let charge = right_align_history(
+                    charge,
+                    self.0.battery_history.len(),
+                    graphs::table().braille,
+                );
+                let power = right_align_history(
+                    power,
+                    self.0.battery_power_history.len(),
+                    graphs::table().braille,
+                );
                 graphs::paint_history_graph(
                     &self.0.battery_history,
                     RampId::Power,
@@ -518,6 +613,40 @@ impl TabView for PowerView<'_> {
                         rows: row_height - row_height / 2,
                         ..charge
                     };
+                    draw_graph_label(
+                        surface,
+                        battery_x,
+                        battery_y,
+                        battery_cols,
+                        &format!("{} charge", battery.name),
+                    );
+                    draw_graph_label(
+                        surface,
+                        battery_x,
+                        battery_y + row_height / 2,
+                        battery_cols,
+                        &format!("{} energy", battery.name),
+                    );
+                    let charge = Rect {
+                        y: charge.y + 1,
+                        rows: charge.rows.saturating_sub(1),
+                        ..charge
+                    };
+                    let energy = Rect {
+                        y: energy.y + 1,
+                        rows: energy.rows.saturating_sub(1),
+                        ..energy
+                    };
+                    let charge = right_align_history(
+                        charge,
+                        battery.charge_history.len(),
+                        graphs::table().braille,
+                    );
+                    let energy = right_align_history(
+                        energy,
+                        battery.energy_history.len(),
+                        graphs::table().braille,
+                    );
                     graphs::paint_history_graph(
                         &battery.charge_history,
                         RampId::Power,
@@ -540,24 +669,72 @@ impl TabView for PowerView<'_> {
                 .iter()
                 .map(|zone| zone.history.len())
                 .max()
-                .unwrap_or(self.0.history_len);
+                .unwrap_or(self.0.history.len())
+                .max(self.0.history.len());
             let graph_rect = history_graph_rect(rect, inner, rail_samples, graphs::table().braille);
-            if self.0.zones.is_empty() && self.0.history_len > 0 {
+            if self.0.zones.is_empty() && !self.0.history.is_empty() {
                 let mut ordered = [0.0_f32; HISTORY_CAP];
-                ordered[..self.0.history_len]
-                    .copy_from_slice(&self.0.history[..self.0.history_len]);
+                ordered[..self.0.history.len()].copy_from_slice(&self.0.history);
                 let ceiling = rail_ceiling(self.0);
-                for value in ordered.iter_mut().take(self.0.history_len) {
+                for value in ordered.iter_mut().take(self.0.history.len()) {
                     *value /= ceiling;
                 }
+                draw_graph_label(
+                    surface,
+                    graph_rect.x,
+                    graph_rect.y,
+                    graph_rect.cols,
+                    &watts_label("socket", self.0.socket_w),
+                );
                 graphs::paint_history_graph(
-                    &ordered[..self.0.history_len],
+                    &ordered[..self.0.history.len()],
                     RampId::Power,
-                    graph_rect,
+                    right_align_history(
+                        Rect {
+                            y: graph_rect.y + 1,
+                            rows: graph_rect.rows.saturating_sub(1),
+                            ..graph_rect
+                        },
+                        self.0.history.len(),
+                        graphs::table().braille,
+                    ),
                     surface,
                 );
             } else if !self.0.zones.is_empty() {
-                let plot_rows = graph_rect.rows / self.0.zones.len().min(INSTANCE_CAP);
+                let has_socket = !self.0.history.is_empty();
+                let band_count = self.0.zones.len().min(INSTANCE_CAP) + usize::from(has_socket);
+                let plot_rows = graph_rect.rows / band_count;
+                let mut band_offset = 0;
+                if has_socket && plot_rows > 0 {
+                    let mut normalized = [0.0_f32; HISTORY_CAP];
+                    normalized[..self.0.history.len()].copy_from_slice(&self.0.history);
+                    for value in normalized.iter_mut().take(self.0.history.len()) {
+                        *value /= rail_ceiling(self.0);
+                    }
+                    draw_graph_label(
+                        surface,
+                        graph_rect.x,
+                        graph_rect.y,
+                        graph_rect.cols,
+                        &watts_label("socket", self.0.socket_w),
+                    );
+                    let socket_plot = right_align_history(
+                        Rect {
+                            y: graph_rect.y + 1,
+                            rows: plot_rows.saturating_sub(1),
+                            ..graph_rect
+                        },
+                        self.0.history.len(),
+                        graphs::table().braille,
+                    );
+                    graphs::paint_history_graph(
+                        &normalized[..self.0.history.len()],
+                        RampId::Power,
+                        socket_plot,
+                        surface,
+                    );
+                    band_offset = 1;
+                }
                 for (index, zone) in self.0.zones.iter().take(INSTANCE_CAP).enumerate() {
                     if zone.history.is_empty() || plot_rows == 0 {
                         continue;
@@ -567,14 +744,27 @@ impl TabView for PowerView<'_> {
                     for value in normalized.iter_mut().take(zone.history.len()) {
                         *value /= rail_ceiling(self.0);
                     }
+                    let band_y = graph_rect.y + (index + band_offset) * plot_rows;
+                    draw_graph_label(
+                        surface,
+                        graph_rect.x,
+                        band_y,
+                        graph_rect.cols,
+                        &watts_label(&zone.name, zone.watts),
+                    );
+                    let plot = right_align_history(
+                        Rect {
+                            y: band_y + 1,
+                            rows: plot_rows.saturating_sub(1),
+                            ..graph_rect
+                        },
+                        zone.history.len(),
+                        graphs::table().braille,
+                    );
                     graphs::paint_history_graph(
                         &normalized[..zone.history.len()],
                         RampId::Power,
-                        Rect {
-                            y: graph_rect.y + index * plot_rows,
-                            rows: plot_rows,
-                            ..graph_rect
-                        },
+                        plot,
                         surface,
                     );
                 }

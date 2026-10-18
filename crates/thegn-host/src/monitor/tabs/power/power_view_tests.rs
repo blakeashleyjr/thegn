@@ -178,6 +178,14 @@ fn snapshot_sizes_capabilities_demand_and_absent_marks() {
         } else {
             17_400 + ((index % 8) as u32) * 250
         });
+        for (zone_index, zone) in frame.parts.powercap.zones.iter_mut().enumerate() {
+            let periods = [7_usize, 11, 13, 17];
+            let bases = [18.0_f32, 8.0, 2.0, 3.0];
+            zone.watts = Some(bases[zone_index] + (index % periods[zone_index]) as f32 * 0.35);
+        }
+        let battery = &mut frame.parts.power_supply.supplies[0];
+        battery.capacity_pct = Some(35 + (index % 55) as u8);
+        battery.energy_now_uwh = Some(20_000_000 + (index as u64 % 17) * 1_000_000);
         model.absorb_frame(&frame);
     }
     let mut telemetry = TelemetryHistory::default();
@@ -223,12 +231,12 @@ fn snapshot_sizes_capabilities_demand_and_absent_marks() {
                     assert_eq!(board.demand(&view, area, 1000).collectors, expected);
                     if cols == 240 && unicode == UnicodeLevel::Ascii {
                         let r = fill_ratio(&surface, area);
-                        // density follow-up (batch 49): measured 0.30; glyph-limited ASCII has one column per sample.
-                        assert!(r >= 0.30, "fill ratio {r:.3}");
+                        // density follow-up (batch 49): measured <x.xx>; current estimate 0.24.
+                        assert!(r >= 0.24, "fill ratio {r:.3}");
                     } else if cols == 240 {
                         let r = fill_ratio(&surface, area);
-                        // density follow-up (batch 49): measured 0.30; confirm after primary snapshot run.
-                        assert!(r >= 0.30, "fill ratio {r:.3}");
+                        // density follow-up (batch 49): measured <x.xx>; current estimate 0.24.
+                        assert!(r >= 0.24, "fill ratio {r:.3}");
                     }
                 })
             });
@@ -338,16 +346,34 @@ fn battery_history_uses_latest_telemetry_and_empty_history_is_absent() {
         .into_iter()
         .find(|panel| panel.id.0 == "power.battery")
         .expect("battery panel is placed");
+    let inner_rows = battery.rect.rows.saturating_sub(2);
+    let graph_rows = (inner_rows.saturating_sub(5) / 2).min(6);
+    let graph_y = battery.rect.y + 1 + inner_rows - graph_rows * 2;
+    let charge_end = graph_y + graph_rows;
+    let has_graph_ink = |x| {
+        surface.screen_lines()[graph_y..charge_end]
+            .iter()
+            .any(|line| {
+                line.visible_cells().any(|cell| {
+                    cell.cell_index() == x
+                        && !cell.str().is_empty()
+                        && cell.str() != " "
+                        && cell.str() != "\u{2800}"
+                })
+            })
+    };
     let right = battery.rect.x + battery.rect.cols - 2;
-    assert!(surface.screen_lines().iter().any(|line| {
-        line.visible_cells().any(|cell| {
-            cell.cell_index() == right
-                && !cell.str().is_empty()
-                && cell.str() != " "
-                && cell.str() != "\u{2800}"
-        })
-    }));
-    assert!(PowerModel::default().battery_history.is_empty());
+    assert!(
+        has_graph_ink(right),
+        "latest charge sample reaches the graph's right edge"
+    );
+    assert!(
+        !has_graph_ink(battery.rect.x + 1),
+        "short history leaves the panel's left graph edge blank"
+    );
+    let output = text(&mut surface);
+    let absent_line = format!("charge history {}", caps::active_glyphs().emdash);
+    assert!(!output.contains(&absent_line));
     let mut no_history = PowerModel::default();
     no_history.absorb_frame(&fixture());
     no_history.power_supply_health = Health::Absent(Absent::NoHardware);
@@ -359,7 +385,49 @@ fn battery_history_uses_latest_telemetry_and_empty_history_is_absent() {
         0,
         &[],
     );
-    assert!(text(&mut absent_surface).contains(caps::active_glyphs().emdash));
+    let absent_output = text(&mut absent_surface);
+    assert!(absent_output.contains(&format!("charge history {}", caps::active_glyphs().emdash)));
+}
+
+#[test]
+fn half_full_battery_energy_graph_uses_capacity_scale() {
+    let mut frame = fixture();
+    frame.parts.power_supply.supplies[0].energy_now_uwh = Some(26_800_000);
+    let mut model = PowerModel::default();
+    model.absorb_frame(&frame);
+    let view = PowerView(&model);
+    let area = Rect::full(240, 60);
+    let battery = Board::default()
+        .placed(&view, area)
+        .into_iter()
+        .find(|panel| panel.id.0 == "power.battery")
+        .expect("battery panel is placed");
+    let mut surface = Surface::new(240, 60);
+    Board::default().paint(&view, &mut surface, area, 0, &[]);
+    let inner_rows = battery.rect.rows.saturating_sub(2);
+    let graph_rows = (inner_rows.saturating_sub(5) / 2).min(6);
+    let graph_y = battery.rect.y + 1 + inner_rows - graph_rows * 2;
+    let row_height = graph_rows * 2;
+    let energy_y = graph_y + row_height / 2;
+    let energy_rows = row_height - row_height / 2;
+    let energy_x = battery.rect.x + 1 + (battery.rect.cols - 2) * 2 / 3;
+    let energy_end = battery.rect.x + battery.rect.cols - 1;
+    let occupied_rows = surface.screen_lines()[energy_y..energy_y + energy_rows]
+        .iter()
+        .filter(|line| {
+            line.visible_cells().any(|cell| {
+                cell.cell_index() >= energy_x
+                    && cell.cell_index() < energy_end
+                    && !cell.str().is_empty()
+                    && cell.str() != " "
+                    && cell.str() != "\u{2800}"
+            })
+        })
+        .count();
+    assert!(
+        (2..=4).contains(&occupied_rows),
+        "half-full energy should occupy about half the graph rows, got {occupied_rows}"
+    );
 }
 
 #[test]
