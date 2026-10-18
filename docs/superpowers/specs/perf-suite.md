@@ -48,8 +48,9 @@ Tuning env: `THEGN_PERF_INTERVAL_MS`, `THEGN_PERF_WAKE_LIMIT`.
 `test/perf/cpu-sample.sh` (+ `lib/env.sh`, `lib/fixture.sh`). Launches thegn in
 a PTY over a hermetic fixture of N worktrees (isolated `HOME`/XDG/gitconfig), lets
 it settle, samples `/proc/<pid>/stat` over a window, and reports cores-used with a
-per-thread breakdown. This is the steady-state cost `just bench` (launch→first
-frame only) never sees.
+per-thread breakdown. Pass `--worktrees N` to size the fixture; the harness
+seeds its worktrees into the registry before the measured launch. This is the
+steady-state cost `just bench` (launch→first frame only) never sees.
 
 Enabled by a new run hook **`THEGN_BENCH_RUN_MS`**: runs the full loop (ticker,
 hydration, tokio pool included) for a fixed window, then exits via the existing
@@ -64,11 +65,17 @@ Recipes:
 <host-tag>.idle.json`; host-tag = arch + cpu-model hash, so machine dependence is
   explicit).
 - `just bench-steady` — feeds `test/perf/scenarios/steady-workload.keys`; A/B only.
-  Workload keys go through the harness PTY; the run fails with
+  Workload keys are paced through the harness PTY; the run fails with
   `FAIL: key injection had no observable effect` if no key dispatch is logged.
   `TG_PERF_DROP_KEYS=1` is the negative control. Result JSON includes `input`
-  (null for idle). The environment drops inherited `THEGN_*` and credential
+  (null for idle). The environment scrubs inherited `THEGN_*` and credential
   variables while keeping `TG_PERF_*`; soak-daemon binds its own daemon socket.
+- The harness disables sandboxing by default; set `TG_PERF_SANDBOX=1` to
+  measure with sandboxing enabled. A separate verify launch checks that the
+  seeded worktree count was collected before the measured launch. Fixed resource
+  ceilings apply to every non-debug run; the CPU ceiling applies to idle runs.
+  Fixture cleanup removes its temporary Podman state and any matching rootless
+  `podman pause` process.
 
 The fixture (`lib/fixture.sh`) and the Rust bench fixture
 (`crates/thegn-svc/benches/support/fixture.rs`) build the same layout — keep

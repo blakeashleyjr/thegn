@@ -193,6 +193,10 @@ other git actions. A current-branch fast-forward uses a locked
 unlocked and locks only the branch update. Pull and fast-forwards on remote
 worktrees stay locked.
 
+An automatic fetch that moves no refs does not trigger a badge refresh. The
+host file watchers ignore opens and reads; creates, modifications and removals
+wake them to refresh the relevant views.
+
 ## Rollback
 
 `rollback` restores a worktree to a prior snapshot when a run goes wrong
