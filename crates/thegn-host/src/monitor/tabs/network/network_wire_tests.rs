@@ -33,7 +33,7 @@ fn telemetry_sample(rx: u64, tx: u64) -> StatsSnapshot {
 #[test]
 fn network_tab_demands_netdev_and_wifi_only_for_placed_panels() {
     let history = TelemetryHistory::default();
-    let overlay = network_overlay(&history);
+    let mut overlay = network_overlay(&history);
     assert_eq!(overlay.tab(), MonitorTab::Network);
     let view = overlay.view();
     let placed = overlay.board.placed(&view, overlay.body_rect());

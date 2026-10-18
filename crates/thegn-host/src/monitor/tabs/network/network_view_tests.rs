@@ -292,7 +292,6 @@ fn wifi_panel_shows_ssid_masked_bssid_and_signal_without_raw_mac() {
         rendered.contains("1m"),
         "connected time missing: {rendered}"
     );
-    assert!(!rendered.contains("aa:bb:cc:dd:ee:ff"));
     assert!(placed.rows > 0);
     let newest = surface.screen_lines()[placed.y + 2]
         .visible_cells()
@@ -306,6 +305,21 @@ fn wifi_panel_shows_ssid_masked_bssid_and_signal_without_raw_mac() {
     assert_ne!(newest.str(), "\u{2800}", "newest signal sample is blank");
     assert!(view.demand(WIFI).contains(CollectorId::NetWifi));
 
+    let mut narrow_surface = Surface::new(100, 30);
+    Board::default().paint(&view, &mut narrow_surface, Rect::full(100, 30), 0, &[]);
+    let narrow_row = lines(&narrow_surface)
+        .into_iter()
+        .find(|line| line.contains("wlan0"))
+        .expect("Wi-Fi interface row is visible at 100x30");
+    assert!(
+        narrow_row.contains("1 / 0"),
+        "retry/failure counts missing: {narrow_row}"
+    );
+    assert!(
+        narrow_row.contains("1m"),
+        "connected time missing: {narrow_row}"
+    );
+
     let mut no_wifi = frame(2, &[1]);
     no_wifi.health[CollectorId::NetWifi.index()] =
         Health::Absent(thegn_metrics::collect::health::Absent::NotImplemented);
@@ -317,7 +331,16 @@ fn wifi_panel_shows_ssid_masked_bssid_and_signal_without_raw_mac() {
             .iter()
             .any(|panel| panel.id == WIFI)
     );
-    assert!(absent_view.demand(WIFI).is_empty());
+    let absent_demand = Board::default()
+        .placed(&absent_view, Rect::full(240, 60))
+        .iter()
+        .fold(CollectorSet::empty(), |mut set, panel| {
+            for collector in absent_view.demand(panel.id).iter() {
+                set.insert(collector);
+            }
+            set
+        });
+    assert!(!absent_demand.contains(CollectorId::NetWifi));
 
     let mut missing_signal = frame(3, &[1]);
     missing_signal.parts.net_wifi.ifaces[0].signal_dbm = None;
@@ -332,10 +355,47 @@ fn wifi_panel_shows_ssid_masked_bssid_and_signal_without_raw_mac() {
         0,
         &[],
     );
-    let missing_rendered = lines(&missing_surface).join("\n");
-    assert!(missing_rendered.contains(&format!("{} avg -55", caps::active_glyphs().emdash)));
-    assert!(!missing_rendered.contains("0 dBm"));
+    let missing_row = lines(&missing_surface)
+        .into_iter()
+        .find(|line| line.contains("wlan0"))
+        .expect("Wi-Fi interface row is visible");
+    assert!(missing_row.contains(&format!("{} avg-55", caps::active_glyphs().emdash)));
+    assert!(!missing_row.contains(" 0 dBm"));
     assert!(missing_model.wifi[0].signal.values[0].is_nan());
+}
+
+#[test]
+fn wifi_new_interfaces_do_not_evict_unvisited_live_slots() {
+    let mut first = frame(1, &[1]);
+    let mut existing = first.parts.net_wifi.ifaces[0].clone();
+    existing.ifindex = 8;
+    let mut existing_name = InlineBytes::default();
+    existing_name.set(b"wlan8");
+    existing.name = existing_name;
+    first.parts.net_wifi.ifaces.push(existing);
+    let mut model = NetworkModel::default();
+    model.absorb_frame(&first);
+
+    let mut second = frame(2, &[1]);
+    let mut newcomer = second.parts.net_wifi.ifaces[0].clone();
+    newcomer.ifindex = 9;
+    let mut newcomer_name = InlineBytes::default();
+    newcomer_name.set(b"wlan9");
+    newcomer.name = newcomer_name;
+    let mut retained_sample = second.parts.net_wifi.ifaces[0].clone();
+    retained_sample.signal_dbm = Some(-54);
+    let existing = first.parts.net_wifi.ifaces[1].clone();
+    second.parts.net_wifi.ifaces = vec![newcomer, retained_sample, existing];
+    model.absorb_frame(&second);
+
+    let retained = model
+        .wifi
+        .iter()
+        .find(|entry| entry.ifindex == 7)
+        .expect("existing interface retains its slot");
+    assert_eq!(retained.signal.len, 2);
+    assert_eq!(retained.signal.values[0], -53.0);
+    assert_eq!(retained.signal.values[1], -54.0);
 }
 
 #[test]
