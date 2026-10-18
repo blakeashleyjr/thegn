@@ -514,7 +514,7 @@ fn busy_area_and_activity_rows_do_not_overlap_with_vcn_present() {
     let graph_rows = 20_usize.saturating_sub(2 + activity_rows.min(18));
     let activity_start = 20 - 1 - activity_rows.min(18);
     let busy_graph_rows = 1..1 + graph_rows;
-    let activity_label_rows = activity_start..19;
+    let mut activity_label_rows = activity_start..19;
     assert!(
         activity_label_rows.all(|row| !busy_graph_rows.contains(&row)),
         "activity labels overlap busy graph rows {busy_graph_rows:?}"
@@ -545,24 +545,54 @@ fn busy_area_and_activity_rows_do_not_overlap_with_vcn_present() {
 }
 
 #[test]
-fn activity_gap_holds_the_last_sample_and_suspended_frames_do_not_push() {
+fn implausible_activity_is_blank_and_suspended_frames_do_not_push() {
     let mut first = fixture(1, GpuKind::Apu, RuntimeStatus::Active);
     first.parts.amd_smu.cards[0].metrics.activity_gfx = Some(64);
     let mut model = GpuModel::default();
     model.absorb_frame(&first);
 
-    let mut gap = fixture(2, GpuKind::Apu, RuntimeStatus::Active);
+    let mut second = fixture(2, GpuKind::Apu, RuntimeStatus::Active);
+    second.parts.amd_smu.cards[0].metrics.activity_gfx = Some(60);
+    model.absorb_frame(&second);
+
+    let mut gap = fixture(3, GpuKind::Apu, RuntimeStatus::Active);
     gap.parts.amd_smu.cards[0].metrics.activity_gfx = Some(101);
     model.absorb_frame(&gap);
     let ring = &model.histories[0].activity[0];
-    assert_eq!(ring.len, 2);
+    assert_eq!(ring.len, 3);
     let previous = ring.values[(ring.next + HISTORY_CAP - 2) % HISTORY_CAP];
-    let held = ring.values[(ring.next + HISTORY_CAP - 1) % HISTORY_CAP];
-    assert_eq!(previous, held);
+    let missing = ring.values[(ring.next + HISTORY_CAP - 1) % HISTORY_CAP];
+    assert_eq!(previous, 0.60);
+    assert!(missing.is_nan(), "implausible activity must remain a gap");
 
-    let suspended = fixture(3, GpuKind::Apu, RuntimeStatus::Suspended);
+    let mut surface = Surface::new(40, 8);
+    let rect = Rect::full(40, 8);
+    GpuView(&model).paint_busy_history(&mut surface, rect, rect);
+    let gfx_row = surface
+        .screen_lines()
+        .iter()
+        .position(|line| {
+            line.visible_cells()
+                .fold(String::new(), |mut row, cell| {
+                    row.push_str(cell.str());
+                    row
+                })
+                .contains("GPU0 gfx 0-100%")
+        })
+        .expect("gfx activity label rendered");
+    let newest_cell = surface.screen_lines()[gfx_row]
+        .visible_cells()
+        .find(|cell| cell.cell_index() == 39)
+        .expect("newest graph cell");
+    assert!(
+        newest_cell.str() == " " || newest_cell.str() == "\u{2800}",
+        "NaN activity cell must remain blank, got {:?}",
+        newest_cell.str()
+    );
+
+    let suspended = fixture(4, GpuKind::Apu, RuntimeStatus::Suspended);
     model.absorb_frame(&suspended);
-    assert_eq!(model.histories[0].activity[0].len, 2);
+    assert_eq!(model.histories[0].activity[0].len, 3);
 }
 
 #[test]

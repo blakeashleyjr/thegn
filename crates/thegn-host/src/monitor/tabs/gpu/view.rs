@@ -327,9 +327,8 @@ impl GpuModel {
                 for (ring, value) in history.activity.iter_mut().zip(activities) {
                     if let Some(value) = value.filter(|value| *value <= 100) {
                         ring.push(f32::from(value) / 100.0);
-                    } else if engine.runtime_status == RuntimeStatus::Active && ring.len > 0 {
-                        let previous = (ring.next + HISTORY_CAP - 1) % HISTORY_CAP;
-                        ring.push(ring.values[previous]);
+                    } else if ring.len > 0 {
+                        ring.push(f32::NAN);
                     }
                 }
                 if let Some(metrics) = metrics

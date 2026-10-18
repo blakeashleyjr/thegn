@@ -47,7 +47,33 @@ fn draw_labelled_spark(
             values.len(),
             crate::monitor::graphs::table().braille,
         );
-        crate::monitor::graphs::paint_sparkline(values, graph.cols, ramp, graph, surface);
+        let mut index = 0;
+        while index < values.len() {
+            while index < values.len() && !values[index].is_finite() {
+                index += 1;
+            }
+            let start = index;
+            while index < values.len() && values[index].is_finite() {
+                index += 1;
+            }
+            if start == index {
+                continue;
+            }
+            let run_start = graph.x + start * graph.cols / values.len();
+            let run_end = graph.x + index * graph.cols / values.len();
+            let run_cols = run_end.saturating_sub(run_start).max(1).min(graph.cols);
+            crate::monitor::graphs::paint_sparkline(
+                &values[start..index],
+                run_cols,
+                ramp,
+                Rect {
+                    x: run_start,
+                    cols: run_cols,
+                    ..graph
+                },
+                surface,
+            );
+        }
     }
 }
 
