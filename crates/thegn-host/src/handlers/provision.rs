@@ -248,6 +248,7 @@ pub(crate) struct SpecDrainCtx<'a> {
     pub current_config: &'a thegn_core::config::Config,
     pub center: Rect,
     pub loading_state: &'a mut crate::loading::track::LoadingTracker,
+    pub loading_retired: &'a std::collections::HashSet<(String, usize)>,
     pub loading_remote: &'a mut std::collections::HashMap<(String, usize), bool>,
     pub materialize_inflight: &'a mut std::collections::HashSet<(String, usize)>,
     pub prewarm_inflight: &'a mut std::collections::HashSet<(String, usize)>,
@@ -361,32 +362,11 @@ pub(crate) fn drain_provision(
     while let Ok((name, ti, steps)) = rx.try_recv() {
         loop_perf.tick(crate::perf::WakeSource::Spec);
         let key = (name, ti);
-        // PTY output may beat the update that moves a live entry into
-        // shell-wait. Keep its live progress visible, then clear the splash on
-        // that terminal update. A missing entry means it was already retired.
-        match crate::loading::provision_splash_update(
-            loading_retired,
-            &key,
-            loading_state.get(&key).map(Vec::as_slice),
-            &steps,
-        ) {
-            crate::loading::ProvisionSplashUpdate::Ignore => continue,
-            crate::loading::ProvisionSplashUpdate::Clear => {
-                let active = session
-                    .worktrees
-                    .iter()
-                    .position(|g| g.name == key.0)
-                    .is_some_and(|gi| {
-                        gi == session.active && session.worktrees[gi].active_tab == key.1
-                    });
-                loading_state.remove(&key);
-                loading_remote.remove(&key);
-                if active {
-                    dirty = true;
-                }
-                continue;
-            }
-            crate::loading::ProvisionSplashUpdate::Apply => {}
+        // A tab whose shell has already spoken has RETIRED its splash: a late
+        // provisioning update (queued before the first-output clear) must not
+        // re-raise it over the live shell — the flash-back-to-splash flicker.
+        if !crate::loading::splash_update_allowed(loading_retired, &key) {
+            continue;
         }
         // Always record this worktree's progress; the splash for whichever
         // worktree is active is derived from `loading_state` below.
@@ -595,9 +575,11 @@ pub(crate) fn drain_specs(
                     .first()
                     .map(|(_, s)| s.backend.clone())
                     .unwrap_or_else(|| "host".into());
-                ctx.loading_remote.insert(tab_key.clone(), tab_remote);
-                ctx.loading_state
-                    .advance_to_shell(tab_key.clone(), &backend);
+                if !ctx.loading_retired.contains(&tab_key) {
+                    ctx.loading_remote.insert(tab_key.clone(), tab_remote);
+                    ctx.loading_state
+                        .advance_to_shell(tab_key.clone(), &backend);
+                }
                 if is_active {
                     *ctx.dirty = true;
                 }
@@ -698,9 +680,11 @@ pub(crate) fn drain_specs(
                 .first()
                 .map(|(_, s)| s.backend.clone())
                 .unwrap_or_else(|| "host".into());
-            ctx.loading_remote.insert(tab_key.clone(), tab_remote);
-            ctx.loading_state
-                .advance_to_shell(tab_key.clone(), &backend);
+            if !ctx.loading_retired.contains(&tab_key) {
+                ctx.loading_remote.insert(tab_key.clone(), tab_remote);
+                ctx.loading_state
+                    .advance_to_shell(tab_key.clone(), &backend);
+            }
         }
         // Attach-on-open (THE-85): plan the worktree's live agent sessions
         // onto the tab's missing leaves BEFORE materialize consumes them (the
@@ -948,6 +932,7 @@ mod tests {
         let mut model = crate::chrome::FrameModel::default();
         let mut active_menu: Option<MenuOverlay> = None;
         let mut loading_state = crate::loading::track::LoadingTracker::default();
+        let loading_retired = std::collections::HashSet::new();
         let mut loading_remote = std::collections::HashMap::new();
         let mut materialize_inflight = std::collections::HashSet::new();
         let mut prewarm_inflight = std::collections::HashSet::new();
@@ -993,6 +978,7 @@ mod tests {
                 current_config: &cfg,
                 center: crate::layout::compute(160, 40, true, true).center,
                 loading_state: &mut loading_state,
+                loading_retired: &loading_retired,
                 loading_remote: &mut loading_remote,
                 materialize_inflight: &mut materialize_inflight,
                 prewarm_inflight: &mut prewarm_inflight,
@@ -1058,6 +1044,7 @@ mod tests {
         let mut model = crate::chrome::FrameModel::default();
         let mut active_menu: Option<MenuOverlay> = None;
         let mut loading_state = crate::loading::track::LoadingTracker::default();
+        let loading_retired = std::collections::HashSet::new();
         let mut loading_remote = std::collections::HashMap::new();
         let mut materialize_inflight = std::collections::HashSet::new();
         let mut prewarm_inflight = std::collections::HashSet::from([("app/home".into(), 0)]);
@@ -1096,6 +1083,7 @@ mod tests {
                 current_config: &cfg,
                 center: crate::layout::compute(160, 40, true, true).center,
                 loading_state: &mut loading_state,
+                loading_retired: &loading_retired,
                 loading_remote: &mut loading_remote,
                 materialize_inflight: &mut materialize_inflight,
                 prewarm_inflight: &mut prewarm_inflight,
@@ -1181,6 +1169,7 @@ mod tests {
         let mut model = crate::chrome::FrameModel::default();
         let mut active_menu: Option<MenuOverlay> = None;
         let mut loading_state = crate::loading::track::LoadingTracker::default();
+        let loading_retired = std::collections::HashSet::new();
         let mut loading_remote = std::collections::HashMap::new();
         let mut materialize_inflight = std::collections::HashSet::new();
         // Model a replacement request that owns the shifted index. A late
@@ -1222,6 +1211,7 @@ mod tests {
                 current_config: &cfg,
                 center: crate::layout::compute(160, 40, true, true).center,
                 loading_state: &mut loading_state,
+                loading_retired: &loading_retired,
                 loading_remote: &mut loading_remote,
                 materialize_inflight: &mut materialize_inflight,
                 prewarm_inflight: &mut prewarm_inflight,
@@ -1274,6 +1264,88 @@ mod tests {
     /// Pane ids are stable and never reused, so the batch's own leaf ids are the
     /// identity check.
     #[test]
+    fn drain_specs_does_not_reseed_a_splash_after_shell_output() {
+        let mut session = Session {
+            id: "s1".into(),
+            worktrees: vec![WorktreeGroup::new("app/home", GroupKind::Home, "")],
+            active: 0,
+        };
+        let leaf = 5;
+        session.worktrees[0].tabs[0].center = crate::center::CenterTree::Leaf(leaf);
+        session.worktrees[0].tabs[0].focused_pane = leaf;
+        let (tx, _rx) = tokio_mpsc::channel::<PaneEvent>(1024);
+        let mut panes = crate::panes::Panes::new(tx);
+        panes.insert_test_pane(leaf);
+
+        let cfg = thegn_core::config::Config::default();
+        let mut model = crate::chrome::FrameModel::default();
+        let mut active_menu = None;
+        let mut loading_state = crate::loading::track::LoadingTracker::default();
+        let key = ("app/home".to_string(), 0);
+        // This is the reachable post-output state: handle_output has removed
+        // the shell-wait entry and recorded its key for late spec batches.
+        let loading_retired = std::collections::HashSet::from([key.clone()]);
+        let mut loading_remote = std::collections::HashMap::new();
+        let mut materialize_inflight = std::collections::HashSet::new();
+        let mut prewarm_inflight = std::collections::HashSet::new();
+        let mut materialize_failed = std::collections::HashSet::new();
+        let mut prewarm_failed = std::collections::HashSet::new();
+        let mut halt_dismissed = std::collections::HashSet::new();
+        let mut last_pool_reconcile = None;
+        let mut center_dormant = false;
+        let mut need_relayout = false;
+        let mut dirty = false;
+        let mut loop_perf = crate::perf::LoopPerf::new();
+        let (spec_tx, mut spec_rx) = tokio::sync::mpsc::unbounded_channel::<SpecBatch>();
+        spec_tx
+            .send(SpecBatch {
+                group: key.0.clone(),
+                worktree: String::new(),
+                tab: key.1,
+                target_leaves: vec![leaf],
+                origin: SpecOrigin::Materialize,
+                specs: Ok(Vec::new()),
+                relaunch: RelaunchOutcome::NotAttempted,
+                attach: Vec::new(),
+            })
+            .unwrap();
+
+        drain_specs(
+            &mut spec_rx,
+            &mut SpecDrainCtx {
+                session: &mut session,
+                panes: &mut panes,
+                model: &mut model,
+                active_menu: &mut active_menu,
+                current_config: &cfg,
+                center: crate::layout::compute(160, 40, true, true).center,
+                loading_state: &mut loading_state,
+                loading_retired: &loading_retired,
+                loading_remote: &mut loading_remote,
+                materialize_inflight: &mut materialize_inflight,
+                prewarm_inflight: &mut prewarm_inflight,
+                materialize_failed: &mut materialize_failed,
+                prewarm_failed: &mut prewarm_failed,
+                halt_dismissed: &mut halt_dismissed,
+                last_pool_reconcile: &mut last_pool_reconcile,
+                center_dormant: &mut center_dormant,
+                need_relayout: &mut need_relayout,
+                dirty: &mut dirty,
+                loop_perf: &mut loop_perf,
+            },
+        );
+
+        assert!(
+            loading_state.get(&key).is_none(),
+            "a spec result arriving after shell output must not restore shell-wait"
+        );
+        assert!(
+            loading_remote.is_empty(),
+            "a retired splash has no watchdog entry"
+        );
+    }
+
+    #[test]
     fn drain_specs_drops_a_batch_whose_target_tab_no_longer_holds_its_leaves() {
         let mut session = Session {
             id: "s1".into(),
@@ -1298,6 +1370,7 @@ mod tests {
         let mut model = crate::chrome::FrameModel::default();
         let mut active_menu: Option<MenuOverlay> = None;
         let mut loading_state = crate::loading::track::LoadingTracker::default();
+        let loading_retired = std::collections::HashSet::new();
         let mut loading_remote = std::collections::HashMap::new();
         let mut materialize_inflight = std::collections::HashSet::new();
         let mut prewarm_inflight = std::collections::HashSet::new();
@@ -1345,6 +1418,7 @@ mod tests {
                 current_config: &cfg,
                 center: crate::layout::compute(160, 40, true, true).center,
                 loading_state: &mut loading_state,
+                loading_retired: &loading_retired,
                 loading_remote: &mut loading_remote,
                 materialize_inflight: &mut materialize_inflight,
                 prewarm_inflight: &mut prewarm_inflight,
@@ -1409,6 +1483,7 @@ mod tests {
         let mut model = crate::chrome::FrameModel::default();
         let mut active_menu: Option<MenuOverlay> = None;
         let mut loading_state = crate::loading::track::LoadingTracker::default();
+        let loading_retired = std::collections::HashSet::new();
         let mut loading_remote = std::collections::HashMap::new();
         let mut materialize_inflight = std::collections::HashSet::new();
         let mut prewarm_inflight = std::collections::HashSet::from([("app/home".into(), 1)]);
@@ -1444,6 +1519,7 @@ mod tests {
                 current_config: &cfg,
                 center: crate::layout::compute(160, 40, true, true).center,
                 loading_state: &mut loading_state,
+                loading_retired: &loading_retired,
                 loading_remote: &mut loading_remote,
                 materialize_inflight: &mut materialize_inflight,
                 prewarm_inflight: &mut prewarm_inflight,
@@ -1489,6 +1565,7 @@ mod tests {
         let mut model = crate::chrome::FrameModel::default();
         let mut active_menu: Option<MenuOverlay> = None;
         let mut loading_state = crate::loading::track::LoadingTracker::default();
+        let loading_retired = std::collections::HashSet::new();
         let mut loading_remote = std::collections::HashMap::new();
         let mut materialize_inflight =
             std::collections::HashSet::from([("removed/group".into(), 0usize)]);
@@ -1526,6 +1603,7 @@ mod tests {
                 current_config: &cfg,
                 center: crate::layout::compute(160, 40, true, true).center,
                 loading_state: &mut loading_state,
+                loading_retired: &loading_retired,
                 loading_remote: &mut loading_remote,
                 materialize_inflight: &mut materialize_inflight,
                 prewarm_inflight: &mut prewarm_inflight,

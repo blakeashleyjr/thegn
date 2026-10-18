@@ -514,6 +514,7 @@ fn automatic_prewarm_drains_host_result_without_spawning_or_evaluating() {
         let mut model = crate::chrome::FrameModel::default();
         let mut active_menu: Option<crate::menu::MenuOverlay> = None;
         let mut loading_state = crate::loading::track::LoadingTracker::default();
+        let loading_retired = std::collections::HashSet::new();
         let mut loading_remote = std::collections::HashMap::new();
         let mut materialize_inflight = std::collections::HashSet::new();
         let mut prewarm_inflight = std::collections::HashSet::from([("app/wt".into(), 0)]);
@@ -549,6 +550,7 @@ fn automatic_prewarm_drains_host_result_without_spawning_or_evaluating() {
                 current_config: &cfg,
                 center: crate::layout::compute(160, 40, true, true).center,
                 loading_state: &mut loading_state,
+                loading_retired: &loading_retired,
                 loading_remote: &mut loading_remote,
                 materialize_inflight: &mut materialize_inflight,
                 prewarm_inflight: &mut prewarm_inflight,
