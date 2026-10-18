@@ -180,18 +180,11 @@ fn snapshot_sizes_capabilities_demand_and_absent_marks() {
         });
         let rail_periods = [5_usize, 7, 9, 11];
         let rail_bases = [9_000_u32, 2_000, 3_000, 20_000];
-        let rail_values = [
-            &mut frame.parts.amd_smu.cards[0].metrics.power_apu,
-            &mut frame.parts.amd_smu.cards[0].metrics.power_gfx,
-            &mut frame.parts.amd_smu.cards[0].metrics.power_all_core,
-            &mut frame.parts.amd_smu.cards[0].metrics.power_sys,
-        ];
-        for (slot, (period, base)) in rail_values
-            .into_iter()
-            .zip(rail_periods.into_iter().zip(rail_bases))
-        {
-            *slot = Some(base + (index % period) as u32 * 250);
-        }
+        let metrics = &mut frame.parts.amd_smu.cards[0].metrics;
+        metrics.power_apu = Some(rail_bases[0] + (index % rail_periods[0]) as u32 * 250);
+        metrics.power_gfx = Some(rail_bases[1] + (index % rail_periods[1]) as u32 * 250);
+        metrics.power_all_core = Some(rail_bases[2] + (index % rail_periods[2]) as u32 * 250);
+        metrics.power_sys = Some(rail_bases[3] + (index % rail_periods[3]) as u32 * 250);
         for (zone_index, zone) in frame.parts.powercap.zones.iter_mut().enumerate() {
             let periods = [7_usize, 11, 13, 17];
             let bases = [18.0_f32, 8.0, 2.0, 3.0];
@@ -924,6 +917,28 @@ fn half_full_battery_energy_graph_uses_capacity_scale() {
         (2..=4).contains(&occupied_rows),
         "half-full energy should occupy about half the graph rows, got {occupied_rows}"
     );
+}
+
+#[test]
+fn telemetry_history_paints_finite_runs_without_turning_nan_into_a_bar() {
+    let values = [0.8, 0.7, f32::NAN, 0.6, 0.9];
+    let mut surface = Surface::new(values.len(), 4);
+    test_override::with_unicode(UnicodeLevel::Ascii, || {
+        super::paint_history_runs(&values, Rect::full(values.len(), 4), &mut surface);
+    });
+    let has_ink = |column| {
+        surface.screen_lines().iter().any(|line| {
+            line.visible_cells().any(|cell| {
+                cell.cell_index() == column && !cell.str().is_empty() && cell.str() != " "
+            })
+        })
+    };
+    assert!(has_ink(0), "finite run before NaN is painted");
+    assert!(
+        !has_ink(2),
+        "NaN gap remains blank instead of becoming a minimum bar"
+    );
+    assert!(has_ink(4), "finite run after NaN is painted");
 }
 
 #[test]
