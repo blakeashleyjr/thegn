@@ -1,4 +1,5 @@
 use super::*;
+use crate::telemetry::{ScaleMode, TelemetryHistory, Window};
 use crate::{
     caps::{self, Glyph},
     compositor::Rect,
@@ -19,7 +20,13 @@ use thegn_metrics::collect::{
     parse::loadavg::Loadavg,
 };
 
-const SNAPSHOT_GOLDENS: [&str; 4] = ["CPU usage", "Cores", "Frequency", "Load & pressure"];
+const SNAPSHOT_GOLDENS: [&str; 5] = [
+    "CPU usage",
+    "Cores (L3)",
+    "Frequency",
+    "Load & pressure",
+    "C states residency",
+];
 
 fn fixture_frame() -> MonitorFrame {
     let mut frame = MonitorFrame::default();
@@ -48,6 +55,35 @@ fn fixture_frame() -> MonitorFrame {
             }),
         })
         .collect();
+    frame.parts.cpu_topology.cpus = (0..24)
+        .map(
+            |id| thegn_metrics::collect::model::cpu_topology::CpuTopologyEntry {
+                id,
+                core_type: if id < 4 || (12..16).contains(&id) {
+                    thegn_metrics::collect::policy::cpu_topology::CoreType::Performance
+                } else {
+                    thegn_metrics::collect::policy::cpu_topology::CoreType::Efficiency
+                },
+                online: true,
+                ..Default::default()
+            },
+        )
+        .collect();
+    frame.parts.cpu_topology.l3_groups = vec![(0..12).collect(), (12..24).collect()];
+    frame.parts.cpu_idle.cores = (0..24)
+        .map(|cpu| thegn_metrics::collect::model::cpu_idle::CpuIdleCore {
+            cpu,
+            c0_pct: Some(30.0 + (cpu % 20) as f32 * 2.0),
+            states: vec![thegn_metrics::collect::model::cpu_idle::CpuIdleState {
+                index: 1,
+                name: Some("C1".into()),
+                residency_pct: Some(70.0 - (cpu % 20) as f32 * 2.0),
+                ..Default::default()
+            }],
+        })
+        .collect();
+    frame.health[CollectorId::CpuTopology.index()] = Health::Ok;
+    frame.health[CollectorId::CpuIdle.index()] = Health::Ok;
     let governor = SysToken::new(b"schedutil").unwrap();
     let epp = SysToken::new(b"balance_performance").unwrap();
     frame.parts.cpu_freq.policies = vec![
@@ -124,6 +160,43 @@ fn fixture_frame() -> MonitorFrame {
     frame
 }
 
+fn fixture_history() -> TelemetryHistory {
+    let mut history = TelemetryHistory::default();
+    for index in 0..120_u64 {
+        let snap = thegn_metrics::StatsSnapshot {
+            cpu_pct: Some(((index * 17) % 100) as u8),
+            load_avg: Some((index as f32 / 10.0, 1.0, 0.5)),
+            ..Default::default()
+        };
+        history.push(&snap, index * 1000);
+    }
+    history
+}
+
+fn absorb_fixture_core_history(model: &mut CpuModel, frame: &MonitorFrame) {
+    for tick in 0..240_u16 {
+        let mut sample = frame.clone();
+        if let Some(total) = &mut sample.parts.cpu_stat.total {
+            total.busy = 450 + tick % 450;
+            total.iowait = tick % 100;
+            total.steal = (tick * 3) % 80;
+        }
+        for core in &mut sample.parts.cpu_stat.cores {
+            if let Some(share) = &mut core.share {
+                share.busy = ((u32::from(core.id) * 31 + u32::from(tick) * 17) % 1000) as u16;
+            }
+        }
+        for policy in &mut sample.parts.cpu_freq.policies {
+            if let (Some(min), Some(max)) = (policy.scaling_min_khz, policy.scaling_max_khz) {
+                let range = max.saturating_sub(min);
+                policy.cur_khz = Some(min + range.saturating_mul(u64::from(tick % 100)) / 100);
+            }
+        }
+        model.absorb_frame(&sample);
+    }
+    model.absorb_frame(frame);
+}
+
 fn lines(surface: &Surface) -> Vec<String> {
     surface
         .screen_lines()
@@ -158,6 +231,7 @@ fn fill_ratio(surface: &Surface, area: Rect) -> f32 {
                 && x.saturating_add(cell.width()) > x0
                 && !cell.str().is_empty()
                 && cell.str() != " "
+                && cell.str() != "\u{2800}"
         })
         .map(|cell| {
             let x = cell.cell_index();
@@ -241,7 +315,9 @@ fn snapshots_cover_sizes_capabilities_demand_absence_and_fill() {
     ];
     let frame = fixture_frame();
     let mut model = CpuModel::default();
-    model.absorb_frame(&frame);
+    absorb_fixture_core_history(&mut model, &frame);
+    let history = fixture_history();
+    model.absorb_history(&history, Window::DEFAULT, ScaleMode::Window, 119_000);
     let view = CpuView(&model);
     for (cols, rows) in sizes {
         for (unicode, depth) in levels {
@@ -254,7 +330,12 @@ fn snapshots_cover_sizes_capabilities_demand_absence_and_fill() {
             let rendered = lines(&surface).join("\n");
             let placed = Board::default().placed(&view, Rect::full(cols, rows));
             for golden in SNAPSHOT_GOLDENS {
-                if golden != "Load & pressure" || placed.iter().any(|panel| panel.id == LOAD) {
+                let should_render = match golden {
+                    "Load & pressure" => placed.iter().any(|panel| panel.id == LOAD),
+                    "C states residency" => placed.iter().any(|panel| panel.id.0 == "cpu.idle"),
+                    _ => true,
+                };
+                if should_render {
                     assert!(
                         rendered.contains(golden),
                         "missing {golden} at {cols}x{rows}"
@@ -271,21 +352,27 @@ fn snapshots_cover_sizes_capabilities_demand_absence_and_fill() {
             assert_eq!(demand.collectors, expected);
             if unicode == UnicodeLevel::Ascii {
                 assert!(rendered.is_ascii());
+                if cols >= 160 {
+                    assert!(rendered.lines().any(|line| line.contains(" 1 P L30")));
+                }
             }
             if cols == 100 {
-                assert!(placed.len() < SPECS.len());
-                assert!(!demand.collectors.contains(CollectorId::CpuIrq));
-                assert!(!demand.collectors.contains(CollectorId::CpuSched));
+                assert!(placed.iter().any(|panel| panel.id == IRQ));
+                assert!(placed.iter().any(|panel| panel.id == SCHED));
+                assert!(demand.collectors.contains(CollectorId::CpuIrq));
+                assert!(demand.collectors.contains(CollectorId::CpuSched));
             }
             if cols >= 160 {
                 assert!(placed.iter().any(|panel| panel.id == IRQ));
                 assert!(rendered.contains("2400MHz"));
                 assert!(rendered.contains("TIMER"));
-                assert!(rendered.contains("io 7% st 2%"));
+                assert!(rendered.contains("io 7"));
+                assert!(rendered.contains("0 P L30"));
+                assert!(rendered.contains("C0 30%"));
             }
             if cols == 240 {
-                // density follow-up in batch 47 (wiring lane)
-                assert!(fill_ratio(&surface, Rect::full(cols, rows)) >= 0.30);
+                let r = fill_ratio(&surface, Rect::full(cols, rows));
+                assert!(r >= 0.55, "fill ratio {r:.3}");
             }
         }
     }
@@ -313,6 +400,163 @@ fn snapshots_cover_sizes_capabilities_demand_absence_and_fill() {
     );
     let rendered = lines(&surface).join("\n");
     assert!(rendered.contains(caps::glyph(Glyph::Lock)));
+}
+
+#[test]
+fn topology_badges_l3_groups_and_idle_residency_are_frame_driven() {
+    let frame = fixture_frame();
+    let mut model = CpuModel::default();
+    absorb_fixture_core_history(&mut model, &frame);
+    let history = fixture_history();
+    model.absorb_history(&history, Window::DEFAULT, ScaleMode::Window, 119_000);
+    let mut surface = Surface::new(240, 60);
+    Board::default().paint(&CpuView(&model), &mut surface, Rect::full(240, 60), 0, &[]);
+    let rendered = lines(&surface).join("\n");
+    assert!(rendered.contains("0 P L30"));
+    assert!(rendered.contains("4 E L30"));
+    assert!(rendered.contains("12 P L31"));
+    assert!(rendered.contains("C0 30%"));
+    assert!(rendered.contains("C1 68%"));
+
+    let mut absent = MonitorFrame::default();
+    absent.health[CollectorId::CpuStat.index()] = Health::Ok;
+    absent
+        .parts
+        .cpu_stat
+        .cores
+        .push(thegn_metrics::collect::model::cpu_stat::CoreSample {
+            id: 0,
+            online: true,
+            share: Some(thegn_metrics::collect::model::cpu_stat::ModeShare {
+                busy: 500,
+                ..Default::default()
+            }),
+        });
+    absent.health[CollectorId::CpuTopology.index()] = Health::Absent(Absent::NoHardware);
+    absent.health[CollectorId::CpuIdle.index()] = Health::Absent(Absent::NoHardware);
+    model.absorb_frame(&absent);
+    let mut absent_surface = Surface::new(240, 60);
+    Board::default().paint(
+        &CpuView(&model),
+        &mut absent_surface,
+        Rect::full(240, 60),
+        0,
+        &[],
+    );
+    let rendered = lines(&absent_surface).join("\n");
+    assert!(!rendered.contains("0 P"));
+    assert!(!rendered.contains("L30"));
+    assert!(rendered.contains(caps::active_glyphs().emdash));
+    assert!(!rendered.contains("C0 0%"));
+}
+
+#[test]
+fn topology_idle_and_history_buffers_keep_capacity_after_warmup() {
+    let frame = fixture_frame();
+    let mut model = CpuModel::default();
+    model.absorb_frame(&frame);
+    let history = fixture_history();
+    model.absorb_history(&history, Window::DEFAULT, ScaleMode::Window, 119_000);
+    let caps = (
+        (
+            model.topology.cpus.capacity(),
+            model.topology.l3_groups.capacity(),
+            model.idle.cores.capacity(),
+            model.cpu_stat.cores.capacity(),
+            model
+                .idle
+                .cores
+                .iter()
+                .map(|core| core.states.capacity())
+                .collect::<Vec<_>>(),
+            model.core_busy_history.capacity(),
+            model
+                .core_busy_history
+                .iter()
+                .map(|history| history.values.capacity())
+                .collect::<Vec<_>>(),
+        ),
+        (
+            model.iowait_history.values.capacity(),
+            model.steal_history.values.capacity(),
+            model.frequency_history.capacity(),
+            model
+                .frequency_history
+                .iter()
+                .map(|history| history.samples.values.capacity())
+                .collect::<Vec<_>>(),
+            model.cpu_history.capacity(),
+            model.load_history.capacity(),
+        ),
+    );
+    for _ in 0..1000 {
+        model.absorb_frame(&frame);
+        model.absorb_history(&history, Window::DEFAULT, ScaleMode::Window, 119_000);
+    }
+    assert_eq!(
+        (
+            (
+                model.topology.cpus.capacity(),
+                model.topology.l3_groups.capacity(),
+                model.idle.cores.capacity(),
+                model.cpu_stat.cores.capacity(),
+                model
+                    .idle
+                    .cores
+                    .iter()
+                    .map(|core| core.states.capacity())
+                    .collect::<Vec<_>>(),
+                model.core_busy_history.capacity(),
+                model
+                    .core_busy_history
+                    .iter()
+                    .map(|history| history.values.capacity())
+                    .collect::<Vec<_>>(),
+            ),
+            (
+                model.iowait_history.values.capacity(),
+                model.steal_history.values.capacity(),
+                model.frequency_history.capacity(),
+                model
+                    .frequency_history
+                    .iter()
+                    .map(|history| history.samples.values.capacity())
+                    .collect::<Vec<_>>(),
+                model.cpu_history.capacity(),
+                model.load_history.capacity(),
+            ),
+        ),
+        caps
+    );
+}
+
+#[test]
+fn heatmap_right_edge_shows_the_newest_core_sample() {
+    let mut frame = fixture_frame();
+    let mut model = CpuModel::default();
+    for tick in 0..240 {
+        for core in &mut frame.parts.cpu_stat.cores {
+            if let Some(share) = &mut core.share {
+                share.busy = if tick == 239 { 1000 } else { 0 };
+            }
+        }
+        model.absorb_frame(&frame);
+    }
+    let view = CpuView(&model);
+    let placed = Board::default().placed(&view, Rect::full(240, 60));
+    let core_panel = placed.iter().find(|panel| panel.id == CORES).unwrap();
+    let graph_x = core_panel.rect.x + 27.min(core_panel.rect.cols.saturating_sub(2));
+    let graph_width = core_panel.rect.cols.saturating_sub(28);
+    let graph_y = core_panel.rect.y + 1;
+    let mut surface = Surface::new(240, 60);
+    caps::test_override::with_unicode(UnicodeLevel::Ascii, || {
+        Board::default().paint(&view, &mut surface, Rect::full(240, 60), 0, &[]);
+        let newest = lines(&surface)[graph_y]
+            .chars()
+            .nth(graph_x + graph_width - 1)
+            .unwrap();
+        assert_eq!(newest, *caps::raster_table().heat.last().unwrap());
+    });
 }
 
 #[test]

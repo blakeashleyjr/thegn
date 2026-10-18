@@ -57,6 +57,8 @@ pub enum Limit {
 pub struct CgroupSample {
     pub cpu: Option<CpuStat>,
     pub mem_current: Option<u64>,
+    pub mem_max: Option<Limit>,
+    pub mem_high: Option<Limit>,
     pub mem_peak: Option<u64>,
     pub swap_current: Option<u64>,
     pub mem_stat: Option<MemStat>,

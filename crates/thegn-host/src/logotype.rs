@@ -878,11 +878,11 @@ mod tests {
 
     #[test]
     fn draw_splash_text_fallback() {
-        let mut s = Surface::new(20, 4);
+        let mut s = Surface::new(24, 4);
         let rect = Rect {
             x: 0,
             y: 0,
-            cols: 20,
+            cols: 24,
             rows: 4,
         };
         let model = crate::chrome::FrameModel::default();

@@ -169,6 +169,48 @@ pub use signal_identity::{ProcStart, SignalError, signal_identity};
 #[allow(dead_code)] // V-PRC-4 wires the renice/ionice prompts.
 mod priority;
 
+#[cfg(target_os = "linux")]
+mod udisks_smart_linux;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct DiskHealth {
+    pub(crate) name: String,
+    pub(crate) serial_last4: Option<String>,
+    pub(crate) health: Option<String>,
+    pub(crate) critical_warning: Option<Vec<String>>,
+    pub(crate) percent_used: Option<u64>,
+    pub(crate) available_spare: Option<u64>,
+    pub(crate) spare_threshold: Option<u64>,
+    pub(crate) data_read_bytes: Option<u64>,
+    pub(crate) data_written_bytes: Option<u64>,
+    pub(crate) power_on_hours: Option<u64>,
+    pub(crate) power_cycles: Option<u64>,
+    pub(crate) unsafe_shutdowns: Option<u64>,
+    pub(crate) media_errors: Option<u64>,
+    pub(crate) ata_bad_sectors: Option<u64>,
+    pub(crate) temperature_c: Option<i64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum DiskHealthReport {
+    Available(Vec<DiskHealth>),
+    Unavailable(String),
+    Degraded {
+        drives: Vec<DiskHealth>,
+        reason: String,
+    },
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) fn disk_health(deadline: std::time::Duration) -> DiskHealthReport {
+    udisks_smart_linux::disk_health(deadline)
+}
+
+#[cfg(not(target_os = "linux"))]
+pub(crate) fn disk_health(_deadline: std::time::Duration) -> DiskHealthReport {
+    DiskHealthReport::Unavailable("unsupported on this platform".to_string())
+}
+
 /// Live per-process introspection (pane cwd / foreground job / argv). Unlike the
 /// rest of this module the split is Linux-vs-macOS-vs-other rather than
 /// unix-vs-windows, because `/proc` is a Linux facility, not a POSIX one.

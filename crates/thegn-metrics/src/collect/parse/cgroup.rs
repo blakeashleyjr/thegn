@@ -49,7 +49,20 @@ pub fn single_u64(input: &[u8]) -> Option<u64> {
 }
 
 pub fn pids_max(input: &[u8]) -> Option<Limit> {
-    let value = fields(input).next()?;
+    limit(input)
+}
+
+/// Parse memory.{max,high}; malformed or empty values remain absent.
+pub fn memory_limit(input: &[u8]) -> Option<Limit> {
+    limit(input)
+}
+
+fn limit(input: &[u8]) -> Option<Limit> {
+    let mut values = fields(input);
+    let value = values.next()?;
+    if values.next().is_some() {
+        return None;
+    }
     if value == b"max" {
         Some(Limit::Max)
     } else {
@@ -119,7 +132,9 @@ pub fn pressure(input: &[u8]) -> Option<Pressure> {
 
 #[cfg(test)]
 mod tests {
-    use super::{cpu_stat, io_stat_sum, maj_min, mem_events, mem_stat, pids_max, single_u64};
+    use super::{
+        cpu_stat, io_stat_sum, maj_min, mem_events, mem_stat, memory_limit, pids_max, single_u64,
+    };
     use crate::collect::model::cgroup::{IoTotals, Limit, Pressure};
 
     const CPU: &[u8] = b"usage_usec 100\nuser_usec 70\nsystem_usec 30\nnr_periods 9\nnr_throttled 2\nthrottled_usec 8\n";
@@ -183,6 +198,11 @@ mod tests {
         assert_eq!(single_u64(b"18446744073709551616"), None);
         assert_eq!(pids_max(b"max\n"), Some(Limit::Max));
         assert_eq!(pids_max(b"32\n"), Some(Limit::Value(32)));
+        assert_eq!(memory_limit(b"8192\n"), Some(Limit::Value(8192)));
+        assert_eq!(memory_limit(b"max\n"), Some(Limit::Max));
+        assert_eq!(memory_limit(b""), None);
+        assert_eq!(memory_limit(b"not-a-limit\n"), None);
+        assert_eq!(memory_limit(b"8192 junk\n"), None);
     }
 
     #[test]

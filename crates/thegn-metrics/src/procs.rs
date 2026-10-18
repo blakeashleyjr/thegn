@@ -25,6 +25,8 @@ use std::{fs::File, io::Read};
 
 use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, RefreshKind, System};
 
+use crate::collect::{ProcSampleRequest as SampleRequest, proc_backend::ProcBackend};
+
 /// Never enumerate faster than this: per-process CPU is a delta over the
 /// interval, and a shorter one measures scheduler jitter rather than load.
 pub const MIN_INTERVAL: Duration = Duration::from_secs(2);
@@ -94,7 +96,7 @@ pub struct ProcSnapshot {
 /// repeated PID hands two rayon workers the same `Process` entry, both can close
 /// its cached `/proc` file descriptor, and std aborts the process over the
 /// double close. See `sample::refresh_pid_list` for the measured failure rates.
-pub fn dedup_pids(mut v: Vec<Pid>) -> Vec<Pid> {
+pub(crate) fn dedup_pids(mut v: Vec<Pid>) -> Vec<Pid> {
     v.sort_unstable();
     v.dedup();
     v
@@ -116,6 +118,7 @@ pub struct ProcSampler {
     self_pid: u32,
     daemon_pid: Option<u32>,
     rows: usize,
+    backend: ProcBackend,
 }
 
 impl Default for ProcSampler {
@@ -141,6 +144,7 @@ impl ProcSampler {
             self_pid: std::process::id(),
             daemon_pid: None,
             rows: rows.clamp(1, 200),
+            backend: ProcBackend::new(),
         }
     }
 
@@ -153,7 +157,8 @@ impl ProcSampler {
         self.daemon_pid = pid;
     }
 
-    /// Release the process table and forget the CPU baseline.
+    /// Release the process table and forget the CPU baseline. The Linux `/proc` root
+    /// directory descriptor remains open with the backend.
     ///
     /// Called when the gate closes, so a monitor the user shut costs exactly
     /// nothing — not a stale few hundred KB of process map.
@@ -162,8 +167,8 @@ impl ProcSampler {
         self.scratch = Vec::new();
         self.start_path = String::new();
         self.start_buf = Vec::new();
-        self.primed = false;
         self.last = None;
+        self.backend.reset(&mut self.primed);
     }
 
     /// Whether enough time has passed for another pass to be meaningful.
@@ -175,6 +180,22 @@ impl ProcSampler {
     /// Take one reading. Blocking — background thread only.
     pub fn sample(&mut self) -> ProcSnapshot {
         self.last = Some(Instant::now());
+        if let Some(snapshot) = self.backend.sample(
+            SampleRequest {
+                rows: self.rows,
+                self_pid: self.self_pid,
+                daemon_pid: self.daemon_pid,
+                pane_pids: &self.pane_pids,
+                primed: false,
+            },
+            &mut self.primed,
+        ) {
+            return snapshot;
+        }
+        self.sample_sysinfo()
+    }
+
+    fn sample_sysinfo(&mut self) -> ProcSnapshot {
         // Only what we display. Every other `with_*` costs a readlink or an
         // extra read per process.
         self.sys.refresh_processes_specifics(

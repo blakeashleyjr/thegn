@@ -4,6 +4,7 @@
 
 use std::fs::File;
 use std::io;
+use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
 
 use super::procfile;
@@ -65,6 +66,83 @@ fn read_bytes<F: CgroupFs>(fs: &mut F, path: &Path, buf: &mut Vec<u8>) -> Option
     fs.read(path, buf).ok()
 }
 
+/// Held cgroup pseudo-files are read from offset zero without reopening them on
+/// each sample. `None` entries remember files absent at discovery.
+#[derive(Debug, Default)]
+pub(super) struct HeldFiles {
+    files: Vec<Option<File>>,
+    present: Vec<bool>,
+    reopen_needed: Vec<bool>,
+    #[cfg(test)]
+    open_attempts: usize,
+}
+
+impl HeldFiles {
+    pub(super) fn discover(&mut self, paths: impl Iterator<Item = PathBuf>) {
+        self.files.clear();
+        self.present.clear();
+        self.reopen_needed.clear();
+        for path in paths {
+            #[cfg(test)]
+            {
+                self.open_attempts = self.open_attempts.saturating_add(1);
+            }
+            let present = path.exists();
+            let file = Result::ok(File::open(&path));
+            self.files.push(file);
+            self.present.push(present);
+            self.reopen_needed.push(false);
+        }
+    }
+
+    pub(super) fn is_present(&self, index: usize) -> bool {
+        self.present.get(index).copied().unwrap_or(false)
+    }
+
+    pub(super) fn read(&mut self, index: usize, buf: &mut Vec<u8>) -> Option<usize> {
+        let file = self.files.get(index)?.as_ref()?;
+        let mut bytes = [0_u8; 64];
+        match file.read_at(&mut bytes, 0) {
+            Ok(length) => {
+                buf.clear();
+                buf.extend_from_slice(&bytes[..length.min(bytes.len())]);
+                Some(length.min(bytes.len()))
+            }
+            Err(error)
+                if matches!(error.kind(), io::ErrorKind::NotFound)
+                    || matches!(error.raw_os_error(), Some(libc::ENODEV)) =>
+            {
+                self.reopen_needed[index] = true;
+                None
+            }
+            Err(_) => None,
+        }
+    }
+
+    pub(super) fn take_reopen_needed(&mut self, index: usize) -> bool {
+        self.reopen_needed
+            .get_mut(index)
+            .is_some_and(std::mem::take)
+    }
+
+    pub(super) fn needs_reopen(&self) -> bool {
+        self.reopen_needed.iter().any(|needed| *needed)
+    }
+
+    #[cfg(test)]
+    pub(super) fn open_attempts(&self) -> usize {
+        self.open_attempts
+    }
+
+    pub(super) fn drop_target(&mut self, target: usize) {
+        for index in target.saturating_mul(2)..target.saturating_mul(2).saturating_add(2) {
+            if let Some(file) = self.files.get_mut(index) {
+                *file = None;
+            }
+        }
+    }
+}
+
 pub fn read_group<F: CgroupFs>(
     fs: &mut F,
     filter: &DeviceFilter,
@@ -118,6 +196,7 @@ pub struct CgroupCollector {
     fs: RealFs,
     buffer: Vec<u8>,
     path_buffer: PathBuf,
+    held: HeldFiles,
 }
 
 impl CgroupCollector {
@@ -137,7 +216,16 @@ impl CgroupCollector {
         );
         if let Some(root) = self.root.as_ref() {
             self.targets.retain(|target| target.starts_with(root));
+            self.discover_held_targets();
         }
+    }
+
+    fn discover_held_targets(&mut self) {
+        self.held.discover(
+            self.targets
+                .iter()
+                .flat_map(|target| [target.join("memory.max"), target.join("memory.high")]),
+        );
     }
 }
 
@@ -157,6 +245,7 @@ impl Collector for CgroupCollector {
     }
 
     fn discover(&mut self, env: &Env) -> Health {
+        self.held = HeldFiles::default();
         let root = env
             .cgroup_root
             .as_deref()
@@ -173,6 +262,7 @@ impl Collector for CgroupCollector {
         }
         self.targets.retain(|target| target.starts_with(&root));
         self.root = Some(root);
+        self.discover_held_targets();
         Health::Ok
     }
 
@@ -198,6 +288,21 @@ impl Collector for CgroupCollector {
                 &mut sample,
                 &mut self.path_buffer,
             );
+            for (offset, field) in [(0, &mut sample.mem_max), (1, &mut sample.mem_high)] {
+                let held_index = index.saturating_mul(2).saturating_add(offset);
+                if let Some(length) = self.held.read(held_index, &mut self.buffer) {
+                    *field = cgroup::memory_limit(&self.buffer[..length]);
+                }
+            }
+            let max_gone = self.held.take_reopen_needed(index.saturating_mul(2));
+            let high_gone = self
+                .held
+                .take_reopen_needed(index.saturating_mul(2).saturating_add(1));
+            if max_gone || high_gone {
+                sample.mem_max = None;
+                sample.mem_high = None;
+                self.held.drop_target(index);
+            }
             frame.parts.cgroup.groups.push(GroupRow {
                 target: index as u16,
                 sample,
@@ -213,12 +318,13 @@ impl Collector for CgroupCollector {
         self.filter.devices.clear();
         self.buffer.clear();
         self.path_buffer.clear();
+        self.held = HeldFiles::default();
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{CgroupCollector, CgroupFs, DeviceFilter, cgroup2_root, read_group};
+    use super::{CgroupCollector, CgroupFs, DeviceFilter, HeldFiles, cgroup2_root, read_group};
     use crate::collect::frame::MonitorFrame;
     use crate::collect::health::{Absent, Health};
     use crate::collect::model::cgroup::{CgroupSample, MAX_GROUPS};
@@ -258,6 +364,42 @@ mod tests {
         assert!(fs.0 <= 12);
         assert_eq!(sample.mem_current, Some(123));
         assert_eq!(sample.cpu, None);
+    }
+
+    #[test]
+    fn held_memory_limit_files_parse_values_and_do_not_reopen_steady_state() {
+        use crate::collect::model::cgroup::Limit;
+
+        let temp = tempfile::tempdir().unwrap();
+        let group = temp.path().join("group");
+        std::fs::create_dir(&group).unwrap();
+        let max = group.join("memory.max");
+        let high = group.join("memory.high");
+        std::fs::write(&max, b"8192\n").unwrap();
+        std::fs::write(&high, b"max\n").unwrap();
+        let mut held = HeldFiles::default();
+        held.discover([max.clone(), high.clone(), group.join("missing")].into_iter());
+        let mut buf = Vec::new();
+        let first_len = held.read(0, &mut buf).unwrap();
+        assert_eq!(
+            crate::collect::parse::cgroup::memory_limit(&buf[..first_len]),
+            Some(Limit::Value(8192))
+        );
+        let high_len = held.read(1, &mut buf).unwrap();
+        assert_eq!(
+            crate::collect::parse::cgroup::memory_limit(&buf[..high_len]),
+            Some(Limit::Max)
+        );
+        assert!(held.read(2, &mut buf).is_none());
+        for _ in 0..20 {
+            let length = held.read(0, &mut buf).unwrap();
+            assert_eq!(
+                crate::collect::parse::cgroup::memory_limit(&buf[..length]),
+                Some(Limit::Value(8192))
+            );
+        }
+        std::fs::rename(&max, group.join("memory.max.old")).unwrap();
+        assert_eq!(held.read(0, &mut buf), Some(5));
     }
 
     #[test]
@@ -348,6 +490,76 @@ mod tests {
             &mut path,
         );
         assert_eq!(sample.io, None);
+    }
+
+    #[test]
+    fn targets_added_after_discovery_receive_held_memory_limit_files() {
+        use crate::collect::model::cgroup::Limit;
+
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::write(temp.path().join("cgroup.controllers"), b"memory").unwrap();
+        let group = temp.path().join("group");
+        std::fs::create_dir(&group).unwrap();
+        std::fs::write(group.join("memory.max"), b"8192\n").unwrap();
+        std::fs::write(group.join("memory.high"), b"max\n").unwrap();
+        let mut collector = CgroupCollector::default();
+        assert_eq!(
+            collector.discover(&Env {
+                cgroup_root: Some(temp.path().to_path_buf()),
+                ..Env::default()
+            }),
+            Health::Ok
+        );
+        collector.set_targets(&[PathBuf::from("group")]);
+        let mut frame = MonitorFrame::default();
+        collector.sample(&TickCtx::default(), &mut frame).unwrap();
+        assert_eq!(frame.parts.cgroup.groups.len(), 1);
+        assert_eq!(
+            frame.parts.cgroup.groups[0].sample.mem_max,
+            Some(Limit::Value(8192))
+        );
+        assert_eq!(
+            frame.parts.cgroup.groups[0].sample.mem_high,
+            Some(Limit::Max)
+        );
+    }
+
+    #[test]
+    fn one_gone_target_degrades_its_limits_without_failing_other_targets() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::write(temp.path().join("cgroup.controllers"), b"memory").unwrap();
+        for (name, max, high) in [
+            ("first", b"8192\n" as &[u8], b"4096\n" as &[u8]),
+            ("second", b"max\n" as &[u8], b"max\n" as &[u8]),
+        ] {
+            let group = temp.path().join(name);
+            std::fs::create_dir(&group).unwrap();
+            std::fs::write(group.join("memory.max"), max).unwrap();
+            std::fs::write(group.join("memory.high"), high).unwrap();
+        }
+        let mut collector = CgroupCollector::default();
+        collector.set_targets(&[PathBuf::from("first"), PathBuf::from("second")]);
+        assert_eq!(
+            collector.discover(&Env {
+                cgroup_root: Some(temp.path().to_path_buf()),
+                ..Env::default()
+            }),
+            Health::Ok
+        );
+        collector.held.reopen_needed[0] = true;
+        let mut frame = MonitorFrame::default();
+        collector.sample(&TickCtx::default(), &mut frame).unwrap();
+        assert_eq!(frame.parts.cgroup.groups.len(), 2);
+        assert_eq!(frame.parts.cgroup.groups[0].sample.mem_max, None);
+        assert_eq!(frame.parts.cgroup.groups[0].sample.mem_high, None);
+        assert_eq!(
+            frame.parts.cgroup.groups[1].sample.mem_max,
+            Some(crate::collect::model::cgroup::Limit::Max)
+        );
+        assert_eq!(
+            frame.parts.cgroup.groups[1].sample.mem_high,
+            Some(crate::collect::model::cgroup::Limit::Max)
+        );
     }
 
     #[test]

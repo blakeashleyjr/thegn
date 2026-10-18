@@ -10,6 +10,20 @@ pub mod health;
 pub mod instances;
 #[cfg(target_os = "linux")]
 pub mod linux;
+#[cfg(target_os = "linux")]
+pub(crate) use linux::proc_backend;
+#[cfg(not(target_os = "linux"))]
+#[path = "proc_backend_stub.rs"]
+pub(crate) mod proc_backend;
+
+pub(crate) struct ProcSampleRequest<'a> {
+    pub rows: usize,
+    pub self_pid: u32,
+    pub daemon_pid: Option<u32>,
+    pub pane_pids: &'a [(u32, u32)],
+    /// Whether a previous pass exists (set by the sampler before projecting).
+    pub primed: bool,
+}
 pub mod model;
 pub mod parse;
 pub mod policy;
@@ -50,10 +64,11 @@ pub enum CollectorId {
     CpuTopology,
     Filesystems,
     GpuDevices,
+    GpuEngines,
 }
 
 impl CollectorId {
-    pub const ALL: [Self; 22] = [
+    pub const ALL: [Self; 23] = [
         Self::Loadavg,
         Self::Uptime,
         Self::Psi,
@@ -76,6 +91,7 @@ impl CollectorId {
         Self::CpuTopology,
         Self::Filesystems,
         Self::GpuDevices,
+        Self::GpuEngines,
     ];
 
     pub const fn slug(self) -> &'static str {
@@ -102,6 +118,7 @@ impl CollectorId {
             Self::CpuTopology => "cpu_topology",
             Self::Filesystems => "filesystems",
             Self::GpuDevices => "gpu_devices",
+            Self::GpuEngines => "gpu_engines",
         }
     }
 
@@ -209,6 +226,7 @@ pub fn default_collectors() -> Vec<Box<dyn Collector>> {
         Box::new(linux::mounts_fs::FilesystemsCollector::new());
     collectors[CollectorId::GpuDevices.index()] =
         Box::new(linux::gpu_discover::GpuDevicesCollector::new());
+    collectors[CollectorId::GpuEngines.index()] = Box::new(linux::gpu_amd::GpuAmdCollector::new());
     collectors[CollectorId::Powercap.index()] = Box::new(linux::powercap::PowercapCollector::at(
         "/sys/class/powercap",
     ));
@@ -247,6 +265,7 @@ mod default_collectors_tests {
             CollectorId::CpuTopology,
             CollectorId::Filesystems,
             CollectorId::GpuDevices,
+            CollectorId::GpuEngines,
             CollectorId::Powercap,
         ] {
             assert_ne!(

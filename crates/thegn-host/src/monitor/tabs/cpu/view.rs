@@ -1,5 +1,4 @@
-#![allow(dead_code)] // wired into the overlay dispatch in batch 47 (see THE-871)
-
+use crate::telemetry::{Metric, ScaleMode, SeriesReq, TelemetryHistory, Window};
 use crate::{
     compositor::Rect,
     monitor::{
@@ -25,6 +24,55 @@ const FREQ: PanelId = PanelId("cpu.freq");
 const LOAD: PanelId = PanelId("cpu.load");
 const IRQ: PanelId = PanelId("cpu.irq");
 const SCHED: PanelId = PanelId("cpu.sched");
+const IDLE: PanelId = PanelId("cpu.idle");
+const CORE_HISTORY_SAMPLES: usize = 240;
+const CORE_HISTORY_LIMIT: usize = 256;
+
+#[derive(Debug, Clone)]
+struct SampleRing {
+    values: Vec<f32>,
+    head: usize,
+    len: usize,
+}
+
+impl Default for SampleRing {
+    fn default() -> Self {
+        Self {
+            values: Vec::with_capacity(CORE_HISTORY_SAMPLES),
+            head: 0,
+            len: 0,
+        }
+    }
+}
+
+impl SampleRing {
+    fn push(&mut self, value: f32) {
+        if self.len < CORE_HISTORY_SAMPLES {
+            self.values.push(value);
+            self.len += 1;
+        } else {
+            self.values[self.head] = value;
+            self.head = (self.head + 1) % CORE_HISTORY_SAMPLES;
+        }
+    }
+
+    fn ordered(&self) -> Vec<f32> {
+        if self.len < CORE_HISTORY_SAMPLES || self.head == 0 {
+            return self.values.clone();
+        }
+        self.values[self.head..]
+            .iter()
+            .chain(&self.values[..self.head])
+            .copied()
+            .collect()
+    }
+}
+
+#[derive(Debug, Clone)]
+struct PolicyHistory {
+    policy: u16,
+    samples: SampleRing,
+}
 
 const FULL_VARIANTS: [Variant; 3] = [
     Variant {
@@ -46,16 +94,16 @@ const FULL_VARIANTS: [Variant; 3] = [
 const MINI_VARIANTS: [Variant; 2] = [
     Variant {
         kind: VariantKind::Compact,
-        min: (24, 6),
+        min: (34, 6),
         pref: (44, 10),
     },
     Variant {
         kind: VariantKind::Mini,
-        min: (16, 4),
+        min: (34, 4),
         pref: (28, 6),
     },
 ];
-const SPECS: [PanelSpec; 6] = [
+const SPECS: [PanelSpec; 7] = [
     PanelSpec {
         id: USAGE,
         priority: 0,
@@ -86,6 +134,11 @@ const SPECS: [PanelSpec; 6] = [
         priority: 5,
         variants: &MINI_VARIANTS,
     },
+    PanelSpec {
+        id: IDLE,
+        priority: 6,
+        variants: &FULL_VARIANTS,
+    },
 ];
 
 #[derive(Debug, Default, Clone)]
@@ -96,19 +149,90 @@ pub(in crate::monitor) struct CpuModel {
     cpu_sched: CpuSchedPart,
     loadavg: LoadavgPart,
     psi: PsiPart,
+    topology: thegn_metrics::collect::model::cpu_topology::CpuTopologyPart,
+    idle: thegn_metrics::collect::model::cpu_idle::CpuIdlePart,
+    cpu_history: Vec<f32>,
+    load_history: Vec<f32>,
+    core_busy_history: Vec<SampleRing>,
+    iowait_history: SampleRing,
+    steal_history: SampleRing,
+    frequency_history: Vec<PolicyHistory>,
     cpu_stat_health: Health,
     cpu_freq_health: Health,
     cpu_irq_health: Health,
     loadavg_health: Health,
     psi_health: Health,
     sched_health: Health,
+    topology_health: Health,
+    idle_health: Health,
 }
 
 impl CpuModel {
+    #[cfg(test)]
+    pub(in crate::monitor) fn procs_running(&self) -> Option<u32> {
+        self.cpu_stat.procs_running
+    }
+
     pub(in crate::monitor) fn absorb_frame(&mut self, frame: &MonitorFrame) {
         let source = &frame.parts.cpu_stat;
         self.cpu_stat.total = source.total;
         self.cpu_stat.cores.clone_from(&source.cores);
+        let core_count = source.cores.len().min(CORE_HISTORY_LIMIT);
+        self.core_busy_history
+            .resize_with(core_count, SampleRing::default);
+        self.core_busy_history.truncate(core_count);
+        for (history, core) in self.core_busy_history.iter_mut().zip(&source.cores) {
+            let value = core
+                .share
+                .map(|share| f32::from(share.busy) / 1000.0)
+                .unwrap_or(f32::NAN);
+            history.push(value);
+        }
+        if let Some(total) = source.total {
+            self.iowait_history.push(f32::from(total.iowait) / 1000.0);
+            self.steal_history.push(f32::from(total.steal) / 1000.0);
+        } else {
+            self.iowait_history.push(f32::NAN);
+            self.steal_history.push(f32::NAN);
+        }
+        for policy in frame
+            .parts
+            .cpu_freq
+            .policies
+            .iter()
+            .take(CORE_HISTORY_LIMIT)
+        {
+            let index = self
+                .frequency_history
+                .iter()
+                .position(|history| history.policy == policy.policy);
+            let history = match index {
+                Some(index) => &mut self.frequency_history[index].samples,
+                None => {
+                    if self.frequency_history.len() >= CORE_HISTORY_LIMIT {
+                        continue;
+                    }
+                    self.frequency_history.push(PolicyHistory {
+                        policy: policy.policy,
+                        samples: SampleRing::default(),
+                    });
+                    &mut self
+                        .frequency_history
+                        .last_mut()
+                        .expect("just inserted")
+                        .samples
+                }
+            };
+            let min = policy.scaling_min_khz.or(policy.hw_min_khz);
+            let max = policy.scaling_max_khz.or(policy.hw_max_khz);
+            let value = match (min, max, policy.cur_khz) {
+                (Some(min), Some(max), Some(current)) => (current.saturating_sub(min) as f32
+                    / max.saturating_sub(min).max(1) as f32)
+                    .clamp(0.0, 1.0),
+                _ => f32::NAN,
+            };
+            history.push(value);
+        }
         self.cpu_stat.ctxt_per_s = source.ctxt_per_s;
         self.cpu_stat.intr_per_s = source.intr_per_s;
         self.cpu_stat.softirq_per_s = source.softirq_per_s;
@@ -136,12 +260,43 @@ impl CpuModel {
         self.cpu_sched.version = source.version;
         self.loadavg.clone_from(&frame.parts.loadavg);
         self.psi.clone_from(&frame.parts.psi);
+        self.topology.clone_from(&frame.parts.cpu_topology);
+        self.idle.clone_from(&frame.parts.cpu_idle);
         self.cpu_stat_health = frame.health[CollectorId::CpuStat.index()];
         self.cpu_freq_health = frame.health[CollectorId::CpuFreq.index()];
         self.cpu_irq_health = frame.health[CollectorId::CpuIrq.index()];
         self.loadavg_health = frame.health[CollectorId::Loadavg.index()];
         self.psi_health = frame.health[CollectorId::Psi.index()];
         self.sched_health = frame.health[CollectorId::CpuSched.index()];
+        self.topology_health = frame.health[CollectorId::CpuTopology.index()];
+        self.idle_health = frame.health[CollectorId::CpuIdle.index()];
+    }
+
+    pub(in crate::monitor) fn absorb_history(
+        &mut self,
+        history: &TelemetryHistory,
+        window: Window,
+        scale: ScaleMode,
+        now_ms: u64,
+    ) {
+        for (metric, slot) in [
+            (Metric::Cpu, &mut self.cpu_history),
+            (Metric::Load, &mut self.load_history),
+        ] {
+            let series = history.series(&SeriesReq {
+                metric,
+                window,
+                scale: TelemetryHistory::scale_for(metric, scale),
+                buckets: 240,
+                agg: thegn_core::series::Agg::Max,
+                now_ms,
+            });
+            if series.empty {
+                slot.clear();
+            } else {
+                slot.clone_from(&series.hi);
+            }
+        }
     }
 
     fn sched_supported(&self) -> bool {
@@ -157,39 +312,46 @@ impl TabView for CpuView<'_> {
     }
 
     fn template(&self) -> Node {
-        let mut rows = vec![
+        let third_row = if matches!(self.0.sched_health, Health::Absent(_)) {
+            Node::Row(vec![
+                (Size::Weight(1), Node::Panel(FREQ)),
+                (Size::Weight(1), Node::Panel(IRQ)),
+            ])
+        } else {
+            Node::Row(vec![
+                (Size::Weight(1), Node::Panel(FREQ)),
+                (Size::Weight(1), Node::Panel(IRQ)),
+                (Size::Weight(1), Node::Panel(SCHED)),
+            ])
+        };
+        Node::Col(vec![
             (
-                Size::Min(12),
+                Size::Weight(2),
                 Node::Row(vec![
-                    (Size::Weight(1), Node::Panel(USAGE)),
-                    (Size::Weight(1), Node::Panel(CORES)),
-                ]),
-            ),
-            (
-                Size::Min(12),
-                Node::Row(vec![
-                    (Size::Weight(1), Node::Panel(FREQ)),
+                    (Size::Weight(2), Node::Panel(USAGE)),
                     (Size::Weight(1), Node::Panel(LOAD)),
                 ]),
             ),
             (
-                Size::Min(12),
+                Size::Weight(2),
                 Node::Row(vec![
-                    (Size::Weight(1), Node::Panel(IRQ)),
-                    (Size::Weight(1), Node::Panel(SCHED)),
+                    (Size::Weight(2), Node::Panel(CORES)),
+                    (Size::Weight(1), Node::Panel(IDLE)),
                 ]),
             ),
-        ];
-        if matches!(self.0.sched_health, Health::Absent(_)) {
-            rows[2].1 = Node::Panel(IRQ);
-        }
-        Node::Col(rows)
+            (Size::Weight(1), third_row),
+        ])
     }
 
     fn demand(&self, panel: PanelId) -> CollectorSet {
         let mut set = CollectorSet::empty();
         match panel {
-            USAGE | CORES => set.insert(CollectorId::CpuStat),
+            USAGE => set.insert(CollectorId::CpuStat),
+            CORES => {
+                set.insert(CollectorId::CpuStat);
+                set.insert(CollectorId::CpuTopology);
+            }
+            IDLE => set.insert(CollectorId::CpuIdle),
             FREQ => set.insert(CollectorId::CpuFreq),
             LOAD => {
                 set.insert(CollectorId::CpuStat);

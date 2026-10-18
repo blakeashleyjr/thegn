@@ -10,6 +10,8 @@ use thegn_core::disk_fill::DiskFillEta;
 use thegn_core::theme::Hue;
 use thegn_core::viz::Unit;
 
+pub(in crate::monitor) mod view;
+
 pub(in crate::monitor) fn disk(
     cx: &Ctx,
     wt_rows: &[DiskWtRow],
