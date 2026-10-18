@@ -1,5 +1,4 @@
-#![allow(dead_code)] // wired in a later batch (V-NET-1b)
-
+use crate::telemetry::{Metric, ScaleMode, SeriesReq, TelemetryHistory, Window};
 use crate::{
     compositor::Rect,
     monitor::{
@@ -24,6 +23,7 @@ pub(super) const THROUGHPUT: PanelId = PanelId("network.throughput");
 pub(super) const INTERFACES: PanelId = PanelId("network.interfaces");
 pub(super) const HEALTH: PanelId = PanelId("network.health");
 const HISTORY: usize = 120;
+const TELEMETRY_HISTORY: usize = HISTORY;
 pub(super) const IFACE_CAP: usize = 8;
 const IFACE_HISTORY: usize = 24;
 const VARIANTS: [Variant; 1] = [Variant {
@@ -127,6 +127,10 @@ pub(in crate::monitor) struct NetworkModel {
     pub(super) total: ScopeTotal,
     pub(super) rx: Ring,
     pub(super) tx: Ring,
+    pub(super) history_rx: Ring,
+    pub(super) history_tx: Ring,
+    pub(super) error_history: Ring,
+    pub(super) drop_history: Ring,
     pub(super) interfaces: Vec<InterfaceHistory>,
     pub(super) overflow: usize,
     pub(super) overflow_rx: Option<f64>,
@@ -142,6 +146,10 @@ impl Default for NetworkModel {
             total: ScopeTotal::default(),
             rx: Ring::new(HISTORY),
             tx: Ring::new(HISTORY),
+            history_rx: Ring::new(TELEMETRY_HISTORY),
+            history_tx: Ring::new(TELEMETRY_HISTORY),
+            error_history: Ring::new(IFACE_HISTORY),
+            drop_history: Ring::new(IFACE_HISTORY),
             interfaces: Vec::with_capacity(IFACE_CAP),
             overflow: 0,
             overflow_rx: None,
@@ -154,6 +162,35 @@ impl Default for NetworkModel {
 }
 
 impl NetworkModel {
+    pub(in crate::monitor) fn absorb_history(
+        &mut self,
+        history: &TelemetryHistory,
+        window: Window,
+        scale: ScaleMode,
+        now_ms: u64,
+    ) {
+        for (metric, ring) in [
+            (Metric::NetRx, &mut self.history_rx),
+            (Metric::NetTx, &mut self.history_tx),
+        ] {
+            let series = history.series(&SeriesReq {
+                metric,
+                window,
+                scale: TelemetryHistory::scale_for(metric, scale),
+                buckets: TELEMETRY_HISTORY,
+                agg: thegn_core::series::Agg::Max,
+                now_ms,
+            });
+            ring.reset();
+            for (index, (value, gap)) in series.hi.iter().zip(series.gap.iter()).enumerate() {
+                let raw = series.raw_hi[index];
+                if !gap && value.is_finite() && raw.is_finite() {
+                    ring.push(raw);
+                }
+            }
+        }
+    }
+
     pub(in crate::monitor) fn absorb_frame(&mut self, frame: &MonitorFrame) {
         let source = &frame.parts.netdev;
         self.health = frame.health[CollectorId::Netdev.index()];
@@ -219,6 +256,8 @@ impl NetworkModel {
                 })
                 .map(|iface| [iface.rx_drop_ps, iface.tx_drop_ps]),
         );
+        push_option(&mut self.error_history, self.error_total);
+        push_option(&mut self.drop_history, self.drop_total);
     }
 }
 
