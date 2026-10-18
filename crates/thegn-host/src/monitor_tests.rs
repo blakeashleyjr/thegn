@@ -2251,7 +2251,8 @@ fn overview_ingest_is_visible_only_and_pause_freezes_its_copy() {
         },
         ..Default::default()
     };
-    assert!(!overlay.ingest_frame(&frame));
+    assert!(overlay.ingest_frame(&frame));
+    assert_eq!(overlay.cpu.procs_running(), Some(7));
     overlay.tab = MonitorTab::Overview;
     assert!(overlay.ingest_frame(&frame));
     assert_eq!(overlay.overview.procs_running(), Some(7));
