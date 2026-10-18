@@ -1315,6 +1315,17 @@ fn monitor_collector_health(
     }
 }
 
+fn denied_hint(id: thegn_metrics::collect::CollectorId) -> &'static str {
+    use thegn_metrics::collect::CollectorId;
+
+    match id {
+        CollectorId::Powercap => {
+            "RAPL energy_uj files are root-only (0400); see the debugging help page for an optional udev rule."
+        }
+        _ => "This reading needs privileges thegn does not request; it never escalates or prompts.",
+    }
+}
+
 fn monitor_collectors_json() -> serde_json::Value {
     monitor_collectors_json_for(monitor_collectors_health())
 }
@@ -1334,7 +1345,10 @@ fn monitor_collectors_json_for(
             serde_json::json!({ "health": status })
         } else {
             match health[id.index()] {
-                Health::Absent(Absent::NoPermission) => serde_json::json!({ "health": status }),
+                Health::Absent(Absent::NoPermission) => serde_json::json!({
+                    "health": status,
+                    "hint": denied_hint(id),
+                }),
                 Health::Absent(reason) => serde_json::json!({
                     "health": "absent",
                     "reason": reason.to_coverage().word(),
@@ -1350,14 +1364,26 @@ fn monitor_collectors_json_for(
 fn monitor_collectors_lines(
     health: &[thegn_metrics::collect::health::Health; thegn_metrics::collect::COLLECTORS],
 ) -> Vec<String> {
-    thegn_metrics::collect::CollectorId::ALL
+    use thegn_metrics::collect::{
+        CollectorId,
+        health::{Absent, Health},
+    };
+
+    CollectorId::ALL
         .into_iter()
-        .map(|id| {
-            format!(
+        .flat_map(|id| {
+            let status = format!(
                 "  {:<16} {}",
                 id.slug(),
                 monitor_collector_health(id, health)
-            )
+            );
+            if !id.visible_only()
+                && matches!(health[id.index()], Health::Absent(Absent::NoPermission))
+            {
+                vec![status, format!("    {}", denied_hint(id))]
+            } else {
+                vec![status]
+            }
         })
         .collect()
 }
@@ -1386,21 +1412,34 @@ fn monitor_collector_formatters_cover_every_id_and_health_state() {
     };
     health[CollectorId::Psi.index()] = Health::Absent(Absent::NoHardware);
     health[CollectorId::CpuStat.index()] = Health::Absent(Absent::NoPermission);
+    health[CollectorId::Powercap.index()] = Health::Absent(Absent::NoPermission);
 
     let expected_status = |id| match id {
         CollectorId::Loadavg => "ok",
         CollectorId::Uptime => "failing",
         CollectorId::Psi => "absent (no such hardware)",
         CollectorId::CpuStat => "denied",
+        CollectorId::Powercap => "denied",
         id if id.visible_only() => "visible-only (not probed)",
         _ => "warming",
     };
+    for id in CollectorId::ALL {
+        let expected_hint = if id == CollectorId::Powercap {
+            "RAPL energy_uj files are root-only (0400); see the debugging help page for an optional udev rule."
+        } else {
+            "This reading needs privileges thegn does not request; it never escalates or prompts."
+        };
+        assert_eq!(denied_hint(id), expected_hint);
+    }
     let expected_text = std::iter::once("Monitor collectors".to_string())
-        .chain(
-            CollectorId::ALL
-                .into_iter()
-                .map(|id| format!("  {:<16} {}", id.slug(), expected_status(id))),
-        )
+        .chain(CollectorId::ALL.into_iter().flat_map(|id| {
+            let status = format!("  {:<16} {}", id.slug(), expected_status(id));
+            if matches!(id, CollectorId::CpuStat | CollectorId::Powercap) {
+                vec![status, format!("    {}", denied_hint(id))]
+            } else {
+                vec![status]
+            }
+        }))
         .collect::<Vec<_>>()
         .join("\n");
     let actual_text = std::iter::once("Monitor collectors".to_string())
@@ -1413,6 +1452,17 @@ fn monitor_collector_formatters_cover_every_id_and_health_state() {
             .iter()
             .any(|line| line.as_str() == "  loadavg          ok")
     );
+    let lines = monitor_collectors_lines(&health);
+    assert!(
+        lines
+            .iter()
+            .any(|line| { line == &format!("    {}", denied_hint(CollectorId::Powercap)) })
+    );
+    assert!(
+        lines
+            .iter()
+            .any(|line| { line == &format!("    {}", denied_hint(CollectorId::CpuStat)) })
+    );
 
     let expected_json: serde_json::Map<String, serde_json::Value> = CollectorId::ALL
         .into_iter()
@@ -1421,6 +1471,10 @@ fn monitor_collector_formatters_cover_every_id_and_health_state() {
                 CollectorId::Psi => serde_json::json!({
                     "health": "absent",
                     "reason": "no such hardware",
+                }),
+                CollectorId::CpuStat | CollectorId::Powercap => serde_json::json!({
+                    "health": "denied",
+                    "hint": denied_hint(id),
                 }),
                 _ => serde_json::json!({ "health": expected_status(id) }),
             };
