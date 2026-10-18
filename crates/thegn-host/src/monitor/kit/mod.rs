@@ -11,5 +11,12 @@ pub(crate) mod meter;
 pub(crate) mod panel;
 pub(crate) mod table;
 
+pub(crate) fn edge_fmt(fmt: thegn_core::numfmt::NumFmt) -> thegn_core::numfmt::NumFmt {
+    thegn_core::numfmt::NumFmt {
+        marks: caps::num_marks(),
+        ..fmt
+    }
+}
+
 #[cfg(test)]
 mod tests;

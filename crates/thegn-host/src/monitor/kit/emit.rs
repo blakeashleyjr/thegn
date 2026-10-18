@@ -5,10 +5,11 @@ use crate::{
     seg::{StyleTok, Tok},
 };
 use std::collections::HashMap;
-use termwiz::cell::{CellAttributes, Intensity, Underline};
+use termwiz::cell::{Cell, CellAttributes, Intensity, Underline};
 use termwiz::color::ColorAttribute;
-use termwiz::surface::{Change, Position, Surface};
+use termwiz::surface::Surface;
 use thegn_core::termcaps::ColorDepth;
+use unicode_width::UnicodeWidthChar;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 struct CacheKey {
@@ -25,7 +26,7 @@ struct StyleCache {
 #[derive(Default)]
 pub struct Emitter {
     cache: StyleCache,
-    scratch: String,
+    attrs: CellAttributes,
     #[cfg(test)]
     text_runs: usize,
 }
@@ -102,69 +103,81 @@ impl Emitter {
             .copied()
             .unwrap_or(ColorAttribute::Default)
     }
+    /// Writes cells directly, bypassing the Surface change log and line seqno.
+    /// Host frame paths diff cells (`diff_region`/`diff_screens` and
+    /// `draw_from_screen`), and image placements in overwritten cells are
+    /// dropped because the host draws images out of band.
     pub fn emit(&mut self, grid: &CellGrid, src: Rect, surface: &mut Surface, x: usize, y: usize) {
         self.rebuild();
-        let cols = src.cols.min(grid.cols().saturating_sub(src.x));
-        let rows = src.rows.min(grid.rows().saturating_sub(src.y));
+        let (surface_cols, surface_rows) = surface.dimensions();
+        let cols = src
+            .cols
+            .min(grid.cols().saturating_sub(src.x))
+            .min(surface_cols.saturating_sub(x));
+        let rows = src
+            .rows
+            .min(grid.rows().saturating_sub(src.y))
+            .min(surface_rows.saturating_sub(y));
+        let mut lines = surface.screen_cells();
         for row in 0..rows {
-            let mut col = 0;
-            while col < cols {
+            let mut previous_style = None;
+            let Some(dest_row) = lines.get_mut(y + row) else {
+                break;
+            };
+            if cols > 0 && x > 0 && dest_row[x - 1].width() > 1 {
+                let old_attrs = dest_row[x - 1].attrs().clone();
+                dest_row[x - 1] = Cell::blank_with_attrs(old_attrs.clone());
+                dest_row[x] = Cell::blank_with_attrs(old_attrs);
+            }
+            for col in 0..cols {
                 let Some(cell) = grid.get(src.x + col, src.y + row) else {
                     break;
                 };
-                if cell.ch == '\0' {
-                    col += 1;
-                    continue;
-                }
                 let style = (cell.fg, cell.bg, cell.attr);
-                self.scratch.clear();
-                let mut end = col;
-                while end < cols {
-                    let Some(next) = grid.get(src.x + end, src.y + row) else {
-                        break;
-                    };
-                    if (next.fg, next.bg, next.attr) != style {
-                        break;
+                if previous_style != Some(style) {
+                    self.attrs.set_foreground(self.color(cell.fg));
+                    self.attrs.set_background(if cell.bg == StyleTok::INHERIT {
+                        self.color(
+                            StyleTok::from_tok(Tok::Slot(chrome::S::Panel))
+                                .unwrap_or(StyleTok::INHERIT),
+                        )
+                    } else {
+                        self.color(cell.bg)
+                    });
+                    self.attrs
+                        .set_intensity(if cell.attr & super::grid::BOLD != 0 {
+                            Intensity::Bold
+                        } else if cell.attr & super::grid::DIM != 0 {
+                            Intensity::Half
+                        } else {
+                            Intensity::Normal
+                        });
+                    self.attrs.set_italic(cell.attr & super::grid::ITALIC != 0);
+                    self.attrs
+                        .set_underline(if cell.attr & super::grid::UNDER != 0 {
+                            Underline::Single
+                        } else {
+                            Underline::None
+                        });
+                    previous_style = Some(style);
+                    #[cfg(test)]
+                    {
+                        self.text_runs += 1;
                     }
-                    if next.ch != '\0' {
-                        self.scratch.push(next.ch);
-                    }
-                    end += 1;
                 }
-                surface.add_change(Change::CursorPosition {
-                    x: Position::Absolute(x + col),
-                    y: Position::Absolute(y + row),
-                });
-                let mut attrs = CellAttributes::default();
-                attrs.set_foreground(self.color(cell.fg));
-                attrs.set_background(if cell.bg == StyleTok::INHERIT {
-                    self.color(
-                        StyleTok::from_tok(Tok::Slot(chrome::S::Panel))
-                            .unwrap_or(StyleTok::INHERIT),
-                    )
-                } else {
-                    self.color(cell.bg)
-                });
-                attrs.set_intensity(if cell.attr & super::grid::BOLD != 0 {
-                    Intensity::Bold
-                } else if cell.attr & super::grid::DIM != 0 {
-                    Intensity::Half
-                } else {
-                    Intensity::Normal
-                });
-                attrs.set_italic(cell.attr & super::grid::ITALIC != 0);
-                attrs.set_underline(if cell.attr & super::grid::UNDER != 0 {
-                    Underline::Single
-                } else {
-                    Underline::None
-                });
-                surface.add_change(Change::AllAttributes(attrs));
-                surface.add_change(Change::Text(self.scratch.clone()));
-                #[cfg(test)]
+                let ch = if cell.ch == '\0'
+                    || (UnicodeWidthChar::width(cell.ch) == Some(2) && col + 1 == cols)
                 {
-                    self.text_runs += 1;
+                    ' '
+                } else {
+                    cell.ch
+                };
+                let mut encoded = [0; 4];
+                let text = ch.encode_utf8(&mut encoded);
+                let dest = &mut dest_row[x + col];
+                if dest.attrs() != &self.attrs || dest.str() != text {
+                    *dest = Cell::new(ch, self.attrs.clone());
                 }
-                col = end;
             }
         }
     }

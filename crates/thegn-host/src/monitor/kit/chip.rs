@@ -1,6 +1,5 @@
 use super::grid::{CellGrid, CellStyle, GridView};
 use crate::{
-    caps,
     compositor::Rect,
     seg::{StyleTok, Tok},
 };
@@ -22,13 +21,8 @@ pub fn draw(
     let mut text = String::with_capacity(label.len() + unit.default_width() + 1);
     text.push_str(label);
     text.push(' ');
-    let value = match reading {
-        Reading::Unknown => caps::num_marks().unknown.to_owned(),
-        Reading::Warming => caps::num_marks().warming.to_owned(),
-        Reading::Denied => caps::num_marks().denied.to_owned(),
-        Reading::NotApplicable => caps::num_marks().unknown.to_owned(),
-        Reading::Value(_) => fmt.reading(reading, unit, v.rect().cols.saturating_sub(text.len())),
-    };
+    let value =
+        super::edge_fmt(fmt).reading(reading, unit, v.rect().cols.saturating_sub(text.len()));
     text.push_str(&value);
     v.put_str(
         0,
