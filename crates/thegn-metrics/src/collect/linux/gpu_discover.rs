@@ -130,7 +130,8 @@ impl<F: GpuFs> GpuDevicesCollector<F> {
             }
             let device_path = card_path.join("device");
             let runtime_path = device_path.join("power/runtime_status");
-            let runtime = self.fs.open(&runtime_path).ok();
+            // An unopenable runtime_status reads as unknown, not as an error.
+            let runtime = Result::ok(self.fs.open(&runtime_path));
             let runtime_status = read_runtime(&mut self.fs, runtime.as_ref());
             self.devices.push(DeviceReader {
                 device: GpuDevice {
