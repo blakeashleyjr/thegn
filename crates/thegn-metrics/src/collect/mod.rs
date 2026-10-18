@@ -209,6 +209,9 @@ pub fn default_collectors() -> Vec<Box<dyn Collector>> {
         Box::new(linux::mounts_fs::FilesystemsCollector::new());
     collectors[CollectorId::GpuDevices.index()] =
         Box::new(linux::gpu_discover::GpuDevicesCollector::new());
+    collectors[CollectorId::Powercap.index()] = Box::new(linux::powercap::PowercapCollector::at(
+        "/sys/class/powercap",
+    ));
     collectors
 }
 
@@ -244,6 +247,7 @@ mod default_collectors_tests {
             CollectorId::CpuTopology,
             CollectorId::Filesystems,
             CollectorId::GpuDevices,
+            CollectorId::Powercap,
         ] {
             assert_ne!(
                 collectors[id.index()].cadence(),
