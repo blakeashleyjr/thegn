@@ -122,7 +122,7 @@ pub(in crate::monitor) struct MemoryModel {
     pub psi_full_avg10: Option<f64>,
     pub psi_full_avg60: Option<f64>,
     psi_history: MemoryHistory,
-    used_history: MemoryHistory,
+    mem_telemetry: MemoryHistory,
     swap_history: MemoryHistory,
     reclaim_history: MemoryHistory,
     pub health: MemHealth,
@@ -155,12 +155,6 @@ impl MemoryHistory {
     fn clear(&mut self) {
         self.next = 0;
         self.len = 0;
-    }
-
-    fn extend_recent(&mut self, values: &[f32]) {
-        for value in values.iter().rev().take(HISTORY_CAPACITY).rev() {
-            self.push(*value);
-        }
     }
 
     fn push(&mut self, value: f32) {
@@ -215,7 +209,7 @@ impl Default for MemoryModel {
             psi_full_avg10: None,
             psi_full_avg60: None,
             psi_history: MemoryHistory::default(),
-            used_history: MemoryHistory::default(),
+            mem_telemetry: MemoryHistory::default(),
             swap_history: MemoryHistory::default(),
             reclaim_history: MemoryHistory::default(),
             health: mem_health::evaluate(&MemHealthInput::default()),
@@ -231,39 +225,43 @@ impl Default for MemoryModel {
 
 impl MemoryModel {
     #[cfg(test)]
-    pub(in crate::monitor) fn history_state(&self) -> (usize, Option<f32>, usize, usize) {
-        let mut recent = [0.0_f32; HISTORY_CAPACITY];
-        let (len, _) = self.used_history.copy_recent(&mut recent);
-        (
-            len,
-            len.checked_sub(1).map(|index| recent[index]),
-            self.used_history.values.len(),
-            self.swap_history.values.len(),
-        )
+    pub(in crate::monitor) fn history_state(&self) -> (usize, Option<f32>, usize, Option<f32>) {
+        fn latest(history: &MemoryHistory) -> (usize, Option<f32>) {
+            let mut recent = [0.0_f32; HISTORY_CAPACITY];
+            let (len, _) = history.copy_recent(&mut recent);
+            (len, len.checked_sub(1).map(|index| recent[index]))
+        }
+        let (mem_len, mem_latest) = latest(&self.mem_telemetry);
+        let (swap_len, swap_latest) = latest(&self.swap_history);
+        (mem_len, mem_latest, swap_len, swap_latest)
     }
 
     pub(in crate::monitor) fn absorb_history(
         &mut self,
         history: &TelemetryHistory,
         window: Window,
-        scale: ScaleMode,
+        _scale: ScaleMode,
         now_ms: u64,
     ) {
         for (metric, slot) in [
-            (Metric::Mem, &mut self.used_history),
+            (Metric::Mem, &mut self.mem_telemetry),
             (Metric::Swap, &mut self.swap_history),
         ] {
             let series = history.series(&SeriesReq {
                 metric,
                 window,
-                scale: TelemetryHistory::scale_for(metric, scale),
+                scale: TelemetryHistory::scale_for(metric, ScaleMode::Fixed),
                 buckets: HISTORY_CAPACITY,
                 agg: thegn_core::series::Agg::Max,
                 now_ms,
             });
             slot.clear();
             if !series.empty {
-                slot.extend_recent(&series.hi);
+                for (raw, gap) in series.raw_hi.iter().zip(&series.gap) {
+                    if !gap && raw.is_finite() {
+                        slot.push((raw / 100.0).clamp(0.0, 1.0));
+                    }
+                }
             }
         }
     }
@@ -333,15 +331,6 @@ impl MemoryModel {
         if let (Some(some), Some(full)) = (self.psi_some_avg10, self.psi_full_avg10) {
             self.psi_history.push((some + full) as f32);
         }
-        if let Some((total, available)) = self
-            .total
-            .zip(self.available)
-            .filter(|(total, _)| *total > 0)
-        {
-            self.used_history
-                .push((total.saturating_sub(available)) as f32 / total as f32);
-        }
-
         let input = MemHealthInput {
             mem_total_bytes: self.total,
             mem_available_bytes: self.available,
@@ -403,7 +392,9 @@ impl TabView for MemoryView<'_> {
 
     fn template(&self) -> Node {
         let mut panels = vec![COMPOSITION, VERDICT, PRESSURE, PAGING];
-        if self.0.swap_total.is_some_and(|total| total > 0) {
+        // Follow-up: gate on meminfo Health::Absent once source health is carried
+        // into this model; SwapTotal presence is the available field today.
+        if self.0.swap_total.is_some() {
             panels.push(SWAP);
         }
         Node::Col(vec![
@@ -783,7 +774,7 @@ impl MemoryView<'_> {
     }
 
     fn paint_used_history(&self, grid: &mut CellGrid, body: Rect) {
-        if self.0.used_history.len == 0 || body.rows < 4 || body.cols == 0 {
+        if self.0.mem_telemetry.len == 0 || body.rows < 4 || body.cols == 0 {
             return;
         }
         let label_y = body.y.saturating_add(16);
@@ -796,7 +787,12 @@ impl MemoryView<'_> {
             cols: body.cols,
             rows: 1,
         })
-        .put_str(0, 0, "used / available history", Default::default());
+        .put_str(
+            0,
+            0,
+            "used / available history (memory total = 100%)",
+            Default::default(),
+        );
         let chart = Rect {
             x: body.x,
             y: label_y + 1,
@@ -807,7 +803,7 @@ impl MemoryView<'_> {
             return;
         }
         let mut used = [0.0_f32; HISTORY_CAPACITY];
-        let (len, _) = self.0.used_history.copy_recent(&mut used);
+        let (len, _) = self.0.mem_telemetry.copy_recent(&mut used);
         if len == 0 {
             return;
         }
@@ -1048,15 +1044,23 @@ impl MemoryView<'_> {
             .put_str(0, 0, &zram_devs, Default::default());
         }
         if self.0.swap_history.len > 0 && body.rows >= 5 {
+            let mut values = [0.0_f32; HISTORY_CAPACITY];
+            let (len, peak) = self.0.swap_history.copy_recent(&mut values);
             grid.view(Rect {
                 x: body.x,
                 y: body.y + 3,
                 cols: body.cols,
                 rows: 1,
             })
-            .put_str(0, 0, "swap history", Default::default());
-            let mut values = [0.0_f32; HISTORY_CAPACITY];
-            let (len, _) = self.0.swap_history.copy_recent(&mut values);
+            .put_str(
+                0,
+                0,
+                &format!(
+                    "swap history (total = 100%, window peak {:.0}%)",
+                    peak * 100.0
+                ),
+                Default::default(),
+            );
             let (start, visible, offset) = right_aligned_window(len, body.cols);
             if visible > 0 && body.rows > 4 {
                 let chart = Rect {

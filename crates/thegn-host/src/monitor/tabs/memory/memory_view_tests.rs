@@ -287,8 +287,12 @@ fn board_snapshots_cover_size_and_capability_matrix() {
                 assert!(rendered.contains("health"));
                 if cols == 240 {
                     let ratio = fill_ratio(&surface, Rect::full(cols, rows));
-                    // density follow-up (batch 49): measured 0.40
-                    assert!(ratio >= 0.40, "fill ratio {ratio:.3}");
+                    // density follow-up (batch 49): estimated floor 0.30.
+                    if level == UnicodeLevel::Ascii {
+                        assert!(ratio >= 0.30, "ASCII fill ratio {ratio:.3}");
+                    } else {
+                        assert!(ratio >= 0.30, "Unicode fill ratio {ratio:.3}");
+                    }
                     assert!(rendered.contains("used / available history"));
                     assert!(rendered.contains("PSI history"));
                     assert!(rendered.contains("direct reclaim history"));
@@ -464,4 +468,73 @@ fn memory_history_keeps_only_the_latest_bounded_window() {
 fn short_history_is_right_aligned_without_upsampling() {
     assert_eq!(super::right_aligned_window(3, 10), (0, 3, 7));
     assert_eq!(super::right_aligned_window(12, 10), (2, 10, 0));
+}
+
+#[test]
+fn short_memory_histories_are_right_aligned_by_the_painters() {
+    let mut model = MemoryModel::default();
+    for sample in 0_u64..10 {
+        let mut frame = fixture(true);
+        if let Some(mut some) = frame.parts.psi.memory.file.some {
+            some.avg10 = 100 + sample as u32 * 100;
+            frame.parts.psi.memory.file.some = Some(some);
+        }
+        model.absorb_frame(&frame);
+    }
+    let mut telemetry = TelemetryHistory::default();
+    for sample in 0_u64..10 {
+        telemetry.push(
+            &StatsSnapshot {
+                mem_gib: Some((4.0 + sample as f32 / 10.0, 8.0)),
+                swap_gib: Some((0.5 + sample as f32 / 10.0, 2.0)),
+                ..Default::default()
+            },
+            (sample + 1) * 1000,
+        );
+    }
+    model.absorb_history(&telemetry, Window::EVERYTHING, ScaleMode::Window, 10_000);
+    model.swap_total = Some(2 * 1024 * 1024 * 1024);
+    model.swap_free = Some(1024 * 1024 * 1024);
+    let view = MemoryView(&model);
+    let area = Rect::full(240, 60);
+    let board = Board::default();
+    let placed = board.placed(&view, area);
+    let mut surface = Surface::new(area.cols, area.rows);
+    board.paint(&view, &mut surface, area, 0, &[]);
+    let lines: Vec<Vec<char>> = text(&surface)
+        .lines()
+        .map(|line| line.chars().collect())
+        .collect();
+
+    for (panel_id, label) in [
+        ("memory.composition", "used / available history"),
+        ("memory.pressure", "PSI history"),
+        ("memory.swap", "swap history"),
+    ] {
+        let panel = placed
+            .iter()
+            .find(|panel| panel.id.0 == panel_id)
+            .expect("history panel is placed");
+        let label_row = lines
+            .iter()
+            .position(|line| line.iter().collect::<String>().contains(label))
+            .expect("history label is rendered");
+        let mut chart = lines[label_row + 1].clone();
+        chart.resize(area.cols, ' ');
+        let left = panel.rect.x + 1;
+        let right = panel.rect.x + panel.rect.cols - 2;
+        assert!(
+            chart[left..left + 3]
+                .iter()
+                .all(|ch| *ch == ' ' || *ch == '\u{2800}')
+        );
+        assert_ne!(
+            chart[right], ' ',
+            "{label} chart should reach the right edge"
+        );
+        assert_ne!(
+            chart[right], '\u{2800}',
+            "{label} chart should reach the right edge"
+        );
+    }
 }

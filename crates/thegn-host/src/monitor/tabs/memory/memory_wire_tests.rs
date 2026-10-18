@@ -79,13 +79,37 @@ fn overlay_rebuild_absorbs_memory_telemetry_and_pause_freezes_it() {
     let frame = thegn_host_frame_model();
     let mut overlay =
         MonitorOverlay::open(MonitorTab::Memory, MonitorPrefs::default(), &frame, &ctx);
-    assert_eq!(overlay.memory.history_state().0, 120);
-    assert_eq!(overlay.memory.history_state().1, Some(1.0));
+    let (mem_len, mem_latest, swap_len, swap_latest) = overlay.memory.history_state();
+    assert_eq!(mem_len, 3);
+    assert!((mem_latest.unwrap() - 0.70).abs() < 0.001);
+    assert_eq!(swap_len, 3);
+    assert!((swap_latest.unwrap() - 0.55).abs() < 0.001);
 
     overlay.paused = true;
     let frozen = overlay.memory.history_state();
-    overlay.rebuild(&frame, &ctx, false);
+    let mut changed_history = TelemetryHistory::default();
+    for (tick, used, swap) in [
+        (1_u64, 20.0, 10.0),
+        (2, 45.0, 30.0),
+        (3, 70.0, 55.0),
+        (4, 90.0, 80.0),
+    ] {
+        changed_history.push(
+            &StatsSnapshot {
+                mem_gib: Some((used, 100.0)),
+                swap_gib: Some((swap, 100.0)),
+                ..Default::default()
+            },
+            tick * 1000,
+        );
+    }
+    let mut changed_ctx = StatusCtx::new_for_test_on(&changed_history, Rect::full(240, 60));
+    changed_ctx.now_ms = 4000;
+    overlay.rebuild(&frame, &changed_ctx, false);
     assert_eq!(overlay.memory.history_state(), frozen);
+    overlay.paused = false;
+    overlay.rebuild(&frame, &changed_ctx, false);
+    assert!((overlay.memory.history_state().1.unwrap() - 0.90).abs() < 0.001);
 }
 
 #[test]
@@ -110,11 +134,11 @@ fn telemetry_history_absorbs_into_fixed_capacity_memory_rings() {
             now_ms,
         );
     }
-    let (len, latest, used_capacity, swap_capacity) = model.history_state();
-    assert_eq!(len, 120);
-    assert_eq!(latest, Some(1.0));
-    assert_eq!(used_capacity, 120);
-    assert_eq!(swap_capacity, 120);
+    let (mem_len, mem_latest, swap_len, swap_latest) = model.history_state();
+    assert!(mem_len <= 120);
+    assert!(swap_len <= 120);
+    assert!((mem_latest.unwrap() - 0.30).abs() < 0.001);
+    assert!((swap_latest.unwrap() - 0.15).abs() < 0.001);
 }
 
 fn thegn_host_frame_model() -> crate::chrome::FrameModel {
