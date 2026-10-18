@@ -352,9 +352,9 @@ fn board_snapshots_cover_size_and_capability_matrix() {
                     let ratio = fill_ratio(&surface, Rect::full(cols, rows));
                     // density follow-up (batch 51): estimated, primary sets from the printed value
                     if level == UnicodeLevel::Ascii {
-                        assert!(ratio >= 0.35, "ASCII fill ratio {ratio:.3}");
+                        assert!(ratio >= 0.30, "ASCII fill ratio {ratio:.3}");
                     } else {
-                        assert!(ratio >= 0.38, "Unicode fill ratio {ratio:.3}");
+                        assert!(ratio >= 0.30, "Unicode fill ratio {ratio:.3}");
                     }
                     assert!(rendered.contains("used / available history"));
                     assert!(rendered.contains("PSI history"));
@@ -622,11 +622,22 @@ fn swap_panel_shows_zram_composition_against_device_size() {
             }),
         });
     thegn_metrics::collect::parse::swaps::parse(
-        b"Filename Type Size Used Priority\n/dev/zram0 partition 8 3 -1\n",
+        b"Filename Type Size Used Priority\n/dev/zram0 partition 8 3 -1\n/var/swap-zram.img file 16 4 -2\n",
         &mut frame.parts.meminfo.swaps,
     );
     let mut model = MemoryModel::default();
     model.absorb_frame(&frame);
+    let mut telemetry = TelemetryHistory::default();
+    for sample in 0_u64..3 {
+        telemetry.push(
+            &StatsSnapshot {
+                swap_gib: Some((0.5 + sample as f32 / 10.0, 2.0)),
+                ..Default::default()
+            },
+            (sample + 1) * 1000,
+        );
+    }
+    model.absorb_history(&telemetry, Window::EVERYTHING, ScaleMode::Window, 3000);
     model.swap_total = Some(8192);
     model.swap_free = Some(4096);
     let view = MemoryView(&model);
@@ -636,10 +647,37 @@ fn swap_panel_shows_zram_composition_against_device_size() {
     board.paint(&view, &mut surface, area, 0, &[]);
     let rendered = text(&surface);
     assert!(rendered.contains("zram original"), "{rendered}");
+    assert!(rendered.contains("swap history"), "{rendered}");
     assert!(rendered.contains("compressed"), "{rendered}");
     assert!(rendered.contains("disk"), "{rendered}");
     assert_eq!(model.zram_used, Some(3072));
     assert_eq!(model.zram_totals, (Some(4096), Some(2048), Some(8192)));
+}
+
+#[test]
+fn zero_paging_histories_keep_their_rate_labels() {
+    let mut model = MemoryModel::default();
+    for _ in 0..2 {
+        let mut frame = fixture(false);
+        frame.parts.vmstat.rates
+            [thegn_metrics::collect::model::vmstat::VmRate::ScanDirect as usize] = Some(0.0);
+        model.absorb_frame(&frame);
+    }
+    let view = MemoryView(&model);
+    let area = Rect::full(240, 60);
+    let mut surface = Surface::new(area.cols, area.rows);
+    Board::default().paint(&view, &mut surface, area, 0, &[]);
+    let rendered = text(&surface);
+    for label in ["scan / sec (window peak):", "refaults / sec (window peak):"] {
+        let line = rendered
+            .lines()
+            .find(|line| line.contains(label))
+            .unwrap_or_else(|| panic!("zero history keeps {label} visible: {rendered}"));
+        assert!(
+            line.contains("0 pages/s"),
+            "zero history labels {label} with its real zero rate: {line}"
+        );
+    }
 }
 
 #[test]

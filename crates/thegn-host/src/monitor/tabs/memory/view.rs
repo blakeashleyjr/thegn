@@ -368,7 +368,7 @@ impl MemoryModel {
                 .meminfo
                 .swaps
                 .iter()
-                .filter(|swap| swap.name.contains("zram"))
+                .filter(|swap| swap.name.starts_with("/dev/zram"))
                 .map(|swap| swap.size_bytes)
                 .reduce(u64::saturating_add);
             (Some(original), Some(compressed), size)
@@ -703,7 +703,7 @@ impl MemoryView<'_> {
                 raster.reset(chart.cols, chart.rows);
                 viz_raster::stacked(
                     &[&used[..len], &available[..len]],
-                    viz_raster::RasterTable::for_level(crate::caps::unicode_level()),
+                    crate::monitor::graphs::table(),
                     &mut raster,
                 );
                 draw_raster(
@@ -898,7 +898,7 @@ impl MemoryView<'_> {
             cols: visible_samples,
             ..chart
         };
-        let table = viz_raster::RasterTable::for_level(crate::caps::unicode_level());
+        let table = crate::monitor::graphs::table();
         let mut column = 0;
         while column < visible_samples {
             while column < visible_samples && !used[start + column].is_finite() {
@@ -1037,6 +1037,7 @@ impl MemoryView<'_> {
         if self.0.psi_history.len == 0 || body.rows < 8 || body.cols == 0 {
             return;
         }
+        let table = crate::monitor::graphs::table();
         let label_y = body.y.saturating_add(5);
         if label_y >= body.y.saturating_add(body.rows) {
             return;
@@ -1077,7 +1078,7 @@ impl MemoryView<'_> {
             grid,
             chart,
             &values[start..start + visible_samples],
-            viz_raster::RasterTable::for_level(crate::caps::unicode_level()),
+            table,
             RampId::Mem,
         );
     }
@@ -1127,21 +1128,7 @@ impl MemoryView<'_> {
                 },
             );
         }
-        let zram_devs = format!(
-            "zram used {}  zswap {}",
-            fmt_bytes(self.0.zram_used),
-            fmt_bytes(self.0.zswap)
-        );
-        if body.rows > 2 {
-            grid.view(Rect {
-                x: body.x,
-                y: body.y + 2,
-                cols: body.cols,
-                rows: body.rows - 2,
-            })
-            .put_str(0, 0, &zram_devs, Default::default());
-        }
-        if body.rows > 3 && self.0.zram_present {
+        if body.rows > 2 && self.0.zram_present {
             let (original, compressed, disk) = self.0.zram_totals;
             let zram_line = match (original, compressed, disk) {
                 (Some(original), Some(compressed), Some(disk)) if original > 0 => format!(
@@ -1165,7 +1152,7 @@ impl MemoryView<'_> {
             };
             grid.view(Rect {
                 x: body.x,
-                y: body.y + 3,
+                y: body.y + 2,
                 cols: body.cols,
                 rows: 1,
             })
@@ -1195,7 +1182,7 @@ impl MemoryView<'_> {
                 cols: body.cols,
                 rows: body.rows - 4,
             };
-            let table = viz_raster::RasterTable::for_level(crate::caps::unicode_level());
+            let table = crate::monitor::graphs::table();
             let visible_samples =
                 len.min(chart.cols.saturating_mul(if table.braille { 2 } else { 1 }));
             let start = len - visible_samples;
@@ -1265,24 +1252,23 @@ impl MemoryView<'_> {
     }
 
     fn paint_paging_histories(&self, grid: &mut CellGrid, body: Rect) {
-        if body.rows < 17 || body.cols == 0 {
+        if body.cols == 0 {
             return;
         }
-        let table = viz_raster::RasterTable::for_level(crate::caps::unicode_level());
+        let table = crate::monitor::graphs::table();
         for (offset, label, history) in [
             (11, "scan / sec (window peak)", &self.0.scan_history),
             (14, "refaults / sec (window peak)", &self.0.refault_history),
         ] {
-            if history.len < 2 || body.rows <= offset + 2 {
+            if history.len < 2 || body.rows < offset + 3 {
                 continue;
             }
             let mut values = [0.0_f32; HISTORY_CAPACITY];
             let (len, peak) = history.copy_recent(&mut values);
-            if peak <= 0.0 {
-                continue;
-            }
-            for value in values.iter_mut().take(len) {
-                *value = (*value / peak).clamp(0.0, 1.0);
+            if peak > 0.0 {
+                for value in values.iter_mut().take(len) {
+                    *value = (*value / peak).clamp(0.0, 1.0);
+                }
             }
             grid.view(Rect {
                 x: body.x,
@@ -1290,7 +1276,18 @@ impl MemoryView<'_> {
                 cols: body.cols,
                 rows: 1,
             })
-            .put_str(0, 0, &format!("{label}: {peak:.0}/s"), Default::default());
+            .put_str(
+                0,
+                0,
+                &format!(
+                    "{label}: {} pages/s",
+                    kit::edge_fmt(NumFmt::default()).fmt(peak as f64, Unit::Count, 8)
+                ),
+                Default::default(),
+            );
+            if peak <= 0.0 {
+                continue;
+            }
             let chart = Rect {
                 x: body.x,
                 y: body.y + offset + 1,
@@ -1314,7 +1311,7 @@ impl MemoryView<'_> {
     }
 
     fn paint_reclaim_history(&self, grid: &mut CellGrid, body: Rect) {
-        if self.0.reclaim_history.len == 0 || body.rows < 12 || body.cols == 0 {
+        if self.0.reclaim_history.len == 0 || body.rows < 10 || body.cols == 0 {
             return;
         }
         let label_y = body.y.saturating_add(8);
@@ -1330,9 +1327,9 @@ impl MemoryView<'_> {
             x: body.x,
             y: label_y + 1,
             cols: body.cols,
-            rows: 2,
+            rows: body.y.saturating_add(body.rows).saturating_sub(label_y + 1),
         };
-        let table = viz_raster::RasterTable::for_level(crate::caps::unicode_level());
+        let table = crate::monitor::graphs::table();
         let visible_samples = len.min(chart.cols.saturating_mul(if table.braille { 2 } else { 1 }));
         let start = len - visible_samples;
         if visible_samples == 0 {
@@ -1350,7 +1347,10 @@ impl MemoryView<'_> {
         .put_str(
             0,
             0,
-            &format!("direct reclaim history / sec (window peak {peak:.0}/s)"),
+            &format!(
+                "direct reclaim history / sec (window peak {} pages/s)",
+                kit::edge_fmt(NumFmt::default()).fmt(peak as f64, Unit::Count, 8)
+            ),
             Default::default(),
         );
         if chart.rows == 0 {
