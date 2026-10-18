@@ -209,24 +209,18 @@ impl GpuModel {
                 history
                     .vcn
                     .push_optional(row.vcn_busy_pct.map(|busy| f32::from(busy) / 100.0));
-                if let (Some(used), Some(total)) = (row.vram_used, row.vram_total)
-                    && total > 0
-                {
-                    history
-                        .memory
-                        .push((used as f64 / total as f64).clamp(0.0, 1.0) as f32);
-                } else if !history.memory.is_empty() {
-                    history.memory.push(f32::NAN);
-                }
-                if let (Some(used), Some(total)) = (row.gtt_used, row.gtt_total)
-                    && total > 0
-                {
-                    history
-                        .gtt
-                        .push((used as f64 / total as f64).clamp(0.0, 1.0) as f32);
-                } else if !history.gtt.is_empty() {
-                    history.gtt.push(f32::NAN);
-                }
+                history.memory.push_optional(
+                    row.vram_used
+                        .zip(row.vram_total)
+                        .filter(|(_, total)| *total > 0)
+                        .map(|(used, total)| (used as f64 / total as f64).clamp(0.0, 1.0) as f32),
+                );
+                history.gtt.push_optional(
+                    row.gtt_used
+                        .zip(row.gtt_total)
+                        .filter(|(_, total)| *total > 0)
+                        .map(|(used, total)| (used as f64 / total as f64).clamp(0.0, 1.0) as f32),
+                );
                 let gfx_max = row
                     .sclk
                     .levels_mhz
@@ -234,15 +228,13 @@ impl GpuModel {
                     .take(usize::from(row.sclk.len).min(row.sclk.levels_mhz.len()))
                     .copied()
                     .max();
-                if let (Some(current), Some(max)) = (row.sclk.current_mhz, gfx_max)
-                    && max > 0
-                {
-                    history
-                        .clocks
-                        .push((current as f32 / max as f32).clamp(0.0, 1.0));
-                } else if !history.clocks.is_empty() {
-                    history.clocks.push(f32::NAN);
-                }
+                history.clocks.push_optional(
+                    row.sclk
+                        .current_mhz
+                        .zip(gfx_max)
+                        .filter(|(_, max)| *max > 0)
+                        .map(|(current, max)| (current as f32 / max as f32).clamp(0.0, 1.0)),
+                );
                 let device_card = self
                     .devices
                     .devices
@@ -267,26 +259,24 @@ impl GpuModel {
                     activities[4..].copy_from_slice(&metrics.activity_ipu);
                 }
                 for (ring, value) in history.activity.iter_mut().zip(activities) {
-                    if let Some(value) = value.filter(|value| *value <= 100) {
-                        ring.push(f32::from(value) / 100.0);
-                    } else if ring.len > 0 {
-                        ring.push(f32::NAN);
-                    }
+                    ring.push_optional(
+                        value
+                            .filter(|value| *value <= 100)
+                            .map(|value| f32::from(value) / 100.0),
+                    );
                 }
-                if let Some(metrics) = metrics
-                    && let (Some(watts_mw), Some(cap_w)) = (
-                        metrics.power_socket,
-                        metrics
-                            .power_current_stapm_limit
-                            .filter(|watts| *watts > 0 && *watts != u32::MAX),
-                    )
-                {
-                    history
-                        .power
-                        .push((watts_mw as f32 / (cap_w as f32 * 1000.0)).clamp(0.0, 1.0));
-                } else if !history.power.is_empty() {
-                    history.power.push(f32::NAN);
-                }
+                history.power.push_optional(metrics.and_then(|metrics| {
+                    metrics
+                        .power_socket
+                        .zip(
+                            metrics
+                                .power_current_stapm_limit
+                                .filter(|watts| *watts > 0 && *watts != u32::MAX),
+                        )
+                        .map(|(watts_mw, cap_w)| {
+                            (watts_mw as f32 / (cap_w as f32 * 1000.0)).clamp(0.0, 1.0)
+                        })
+                }));
             }
         }
     }
