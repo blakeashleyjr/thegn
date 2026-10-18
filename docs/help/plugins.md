@@ -127,6 +127,14 @@ denial is audited. `tools.run` is the current exec-scoped plugin call;
 `launch.preset` remains CLI-first and is not advertised to plugins until its
 generic control route exists.
 
+`host.call` has its own bounded dispatcher, separate from the resident-message
+queue above: at most 64 calls are outstanding across all plugins, with at most
+8 per plugin. Calls over either limit get `rate_limited`; a call that exceeds
+30 seconds gets `timeout`, and a stopped dispatcher replies `other`. If the
+plugin exits before its reply can be delivered, the reply is dropped and
+counted as abandoned. Full or oversized reply frames are counted as
+undelivered. Dispatcher pressure is warned once per plugin per drain.
+
 A plugin is gated when it declares any non-surface capability or any scope.
 An enabled gated plugin is refused unless its user's `[[plugins]]` entry sets
 `trusted_native = true`. A directory plugin cannot trust itself: a
