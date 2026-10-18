@@ -3,7 +3,6 @@
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
-#[cfg(test)]
 use thegn_core::series_store::SeriesId;
 use thegn_core::series_store::{CAP_A, CAP_B, Class, SeriesKey, SeriesStore};
 use thegn_metrics::StatsSnapshot;
@@ -17,7 +16,7 @@ pub(crate) const FAMILY_CPU_STAT: u8 = 3;
 const TOTAL_INSTANCE: u16 = u16::MAX;
 const CORE_ID_WORDS: usize = (u16::MAX as usize + 1).div_ceil(64);
 
-const _: () = assert!(Metric::ALL.len() + 6 + 1 <= CAP_A);
+const _: () = assert!(Metric::ALL.len() + 6 < CAP_A);
 const _: () = assert!(CAP_B <= u16::MAX as usize + 1);
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -297,4 +296,5 @@ pub(crate) fn wall_now_ms() -> u64 {
 }
 
 #[cfg(test)]
+#[path = "history_tests.rs"]
 mod history_tests;
