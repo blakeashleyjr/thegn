@@ -32,10 +32,14 @@ prompts.
 
 If you choose to grant a group read access to RAPL counters, install a udev rule
 manually. For example, create `/etc/udev/rules.d/99-powercap-energy.rules`
-with the following rule, replacing `energy` with a group you control:
+with the following rule, replacing `energy` with a group you control and
+`/absolute/path/to` with the directory containing `chgrp` and `chmod` on your
+system. Both commands must use absolute paths; for example, NixOS users can use
+`${pkgs.coreutils}/bin/chgrp` and `${pkgs.coreutils}/bin/chmod` in
+`services.udev.extraRules`.
 
 ```udev
-SUBSYSTEM=="powercap", ATTR{energy_uj}=="?*", RUN+="/usr/bin/chgrp energy /sys%p/energy_uj", RUN+="/usr/bin/chmod 0440 /sys%p/energy_uj"
+ACTION=="add", SUBSYSTEM=="powercap", ATTR{energy_uj}=="?*", RUN+="/absolute/path/to/chgrp energy /sys%p/energy_uj", RUN+="/absolute/path/to/chmod 0440 /sys%p/energy_uj"
 ```
 
 Then reload the rules and re-trigger the powercap devices, or reboot. This is an
