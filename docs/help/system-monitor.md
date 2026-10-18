@@ -79,10 +79,10 @@ at the normal, non-live rate, so resuming shows no gap; the monitor's detailed
 sampler stops until you resume. That makes a paused monitor cheaper than a live
 one.
 
-On the Overview, CPU and Memory tabs, the sampler reads only what the panels
-on screen need; the other tabs still read every collector. When paused or
-covered, the monitor's detailed sampler parks; nothing runs once the monitor is
-closed.
+On the Overview, CPU, Memory, Thermal and Power tabs, the sampler reads only
+what the panels on screen need; the other tabs still read every collector.
+When paused or covered, the monitor's detailed sampler parks; nothing runs once
+the monitor is closed.
 
 Note two deliberate differences from the other overlays: `Space` is pause here
 (use `PgDn` to page), and `g` cycles the graph style rather than jumping to the
@@ -111,11 +111,12 @@ when their source has a reading; absent readings use the terminal absent mark.
 ## CPU
 
 The CPU board shows total busy history and the current user, system, iowait, and
-steal shares. The `cpu.cores` panel labels known performance and efficiency
-cores and groups them by L3 cache; missing topology stays unlabelled. The
-`cpu.idle` panel shows C0 and reported idle-state residency per core. Frequency,
-load/pressure, IRQ/softirq, and scheduler wait have separate panels. Panel
-focus (`f`/`F`), zoom (`z`), and Escape follow the monitor board controls.
+steal shares, plus per-core heat. The `cpu.cores` panel labels known
+performance/efficiency cores with P/E badges and groups them by L3 cache;
+missing topology stays unlabelled. The `cpu.idle` panel shows C0 and reported
+C-state residency per core. Frequency, load/pressure, IRQ/softirq, and scheduler
+wait have separate panels. Panel focus (`f`/`F`), zoom (`z`), and Escape follow
+the monitor board controls.
 
 ## Memory
 
@@ -169,6 +170,11 @@ projection when the runway drops below a configured number of hours. The Disk
 masthead chip expands into this tab.
 
 The `worktrees filesystem` block reports total, available, and used space.
+`thegn doctor` also reports Disk health from UDisks2 when available, including
+health, critical warnings, wear, spare, read/write totals, power-on time, and
+the last four serial characters. Missing serial or health values show `n/a`.
+If UDisks2 is unavailable, the report says `n/a (udisks2 unavailable)` and
+gives the reason; it does not prompt.
 
 ## GPU
 
