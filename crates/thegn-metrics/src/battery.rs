@@ -190,7 +190,7 @@ mod linux {
 }
 
 #[cfg(target_os = "linux")]
-pub(crate) use linux::Reader as BatteryReader;
+pub(crate) use linux::BatteryReader;
 
 #[cfg(not(target_os = "linux"))]
 pub(crate) struct BatteryReader;
