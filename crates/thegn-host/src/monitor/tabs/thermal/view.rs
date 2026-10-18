@@ -22,6 +22,7 @@ use thegn_metrics::collect::{
 };
 
 const SENSOR_CAP: usize = 256;
+const HISTORY_CAP: usize = 120;
 const PACKAGE: PanelId = PanelId("thermal.package");
 const CORES: PanelId = PanelId("thermal.cores");
 const SENSORS: PanelId = PanelId("thermal.sensors");
@@ -82,6 +83,9 @@ pub(in crate::monitor) struct ThermalModel {
     hotspot_c: Option<f32>,
     soc_c: Option<f32>,
     socket_w: Option<f32>,
+    package_history: [f32; HISTORY_CAP],
+    history_len: usize,
+    history_next: usize,
 }
 
 impl Default for ThermalModel {
@@ -95,6 +99,9 @@ impl Default for ThermalModel {
             hotspot_c: None,
             soc_c: None,
             socket_w: None,
+            package_history: [0.0; HISTORY_CAP],
+            history_len: 0,
+            history_next: 0,
         }
     }
 }
@@ -214,6 +221,12 @@ impl ThermalModel {
             row.alarm_events = zone.alarm_events;
         }
         self.zones.truncate(zone_count);
+
+        if let Some(temp) = self.package().and_then(|sensor| sensor.temp_c) {
+            self.package_history[self.history_next] = temp;
+            self.history_next = (self.history_next + 1) % HISTORY_CAP;
+            self.history_len = self.history_len.saturating_add(1).min(HISTORY_CAP);
+        }
 
         for card in &frame.parts.amd_smu.cards {
             if !matches!(
@@ -363,7 +376,14 @@ impl TabView for ThermalView<'_> {
             body.rect()
         };
         match placed.id {
-            PACKAGE => paint::package(&mut grid, inner, self.0.package()),
+            PACKAGE => paint::package(
+                &mut grid,
+                inner,
+                self.0.package(),
+                &self.0.package_history,
+                self.0.history_len,
+                self.0.history_next,
+            ),
             CORES => paint::cores(&mut grid, inner, &self.0.cores),
             SENSORS => paint::sensors(&mut grid, inner, &self.0.sensors),
             ZONES => paint::zones(&mut grid, inner, &self.0.zones),

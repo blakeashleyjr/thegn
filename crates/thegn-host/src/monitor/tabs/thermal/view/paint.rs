@@ -19,7 +19,14 @@ use thegn_core::{
 };
 use thegn_metrics::collect::model::{hwmon::ChipGroup, thermal_zone::ThermalTrip};
 
-pub(super) fn package(grid: &mut CellGrid, rect: Rect, sensor: Option<&SensorRow>) {
+pub(super) fn package(
+    grid: &mut CellGrid,
+    rect: Rect,
+    sensor: Option<&SensorRow>,
+    history: &[f32; 120],
+    history_len: usize,
+    history_next: usize,
+) {
     let Some(sensor) = sensor else {
         put(
             grid,
@@ -78,6 +85,32 @@ pub(super) fn package(grid: &mut CellGrid, rect: Rect, sensor: Option<&SensorRow
             Tok::Slot(S::Dim),
         );
     }
+    let graph_rows = rect.rows.saturating_sub(3);
+    if graph_rows > 0 && history_len > 0 {
+        let mut values = [0.0_f32; 120];
+        let first = if history_len == values.len() {
+            history_next
+        } else {
+            0
+        };
+        let capacity = values.len();
+        for (index, value) in values.iter_mut().take(history_len).enumerate() {
+            let source = (first + index) % capacity;
+            *value = thermal_level(
+                history[source],
+                sensor.max_c.unwrap_or(80.0),
+                sensor.crit_c.unwrap_or(95.0),
+            );
+        }
+        let mut graph = crate::monitor::graphs::GraphOut::new();
+        crate::monitor::graphs::paint_heatmap(
+            &mut graph,
+            &[&values[..history_len]],
+            RampId::Temp,
+            &crate::chrome::palette_snapshot(),
+        );
+        draw_graph(grid, rect, 0, 3, &graph.lines, graph_rows);
+    }
 }
 
 pub(super) fn cores(grid: &mut CellGrid, rect: Rect, cores: &[Option<f32>; 16]) {
@@ -96,51 +129,83 @@ pub(super) fn cores(grid: &mut CellGrid, rect: Rect, cores: &[Option<f32>; 16]) 
     let width = rect.cols.saturating_sub(2);
     let cell_width = 10;
     let per_row = (width / cell_width).max(1);
-    let values = cores.iter().flatten().copied().collect::<Vec<_>>();
-    let heat_rows: Vec<&[f32]> = values.iter().map(std::slice::from_ref).collect();
-    let mut heatmap = crate::monitor::graphs::GraphOut::new();
-    crate::monitor::graphs::paint_heatmap(
-        &mut heatmap,
-        &heat_rows,
-        RampId::Temp,
-        &crate::chrome::palette_snapshot(),
-    );
-    for (heat_index, (index, temp)) in cores
+    let palette = crate::chrome::palette_snapshot();
+    for (index, temp) in cores
         .iter()
         .enumerate()
         .filter_map(|(index, temp)| temp.map(|value| (index, value)))
-        .enumerate()
     {
         let x = (index % per_row) * cell_width;
         let y = index / per_row;
         if y >= rect.rows {
             break;
         }
-        if let Some(crate::seg::Line::Segs(segs)) = heatmap.lines.get(heat_index) {
+        let normalized = thermal_level(temp, 80.0, 95.0);
+        let row = [normalized];
+        let mut heatmap = crate::monitor::graphs::GraphOut::new();
+        crate::monitor::graphs::paint_heatmap(&mut heatmap, &[&row], RampId::Temp, &palette);
+        if let Some(crate::seg::Line::Segs(segs)) = heatmap.lines.first() {
+            let mut offset = 0;
             for seg in segs {
-                if let Some(fg) = StyleTok::from_tok(seg.fg) {
-                    for (offset, ch) in seg.text.chars().enumerate() {
-                        grid.view(rect).put(
-                            x + offset,
-                            y,
-                            CellStyle {
-                                ch,
-                                fg,
-                                ..CellStyle::default()
-                            },
-                        );
-                    }
+                for ch in seg.text.chars() {
+                    grid.view(rect).put(
+                        x + offset,
+                        y,
+                        CellStyle {
+                            ch,
+                            fg: StyleTok::from_tok(seg.fg).unwrap_or(StyleTok::INHERIT),
+                            bg: seg
+                                .bg
+                                .and_then(StyleTok::from_tok)
+                                .unwrap_or(StyleTok::INHERIT),
+                            ..CellStyle::default()
+                        },
+                    );
+                    offset += 1;
                 }
             }
         }
         put(
             grid,
             rect,
-            x + 1,
+            x + 2,
             y,
             &format!("{index:02} {temp:.0}C"),
             state_tok(temp, Some(80.0), Some(95.0)),
         );
+    }
+}
+
+fn draw_graph(
+    grid: &mut CellGrid,
+    rect: Rect,
+    x: usize,
+    y: usize,
+    lines: &[crate::seg::Line],
+    max_rows: usize,
+) {
+    for (row, line) in lines.iter().enumerate().take(max_rows) {
+        if let crate::seg::Line::Segs(segs) = line {
+            let mut col = x;
+            for seg in segs {
+                for ch in seg.text.chars() {
+                    grid.view(rect).put(
+                        col,
+                        y + row,
+                        CellStyle {
+                            ch,
+                            fg: StyleTok::from_tok(seg.fg).unwrap_or(StyleTok::INHERIT),
+                            bg: seg
+                                .bg
+                                .and_then(StyleTok::from_tok)
+                                .unwrap_or(StyleTok::INHERIT),
+                            ..CellStyle::default()
+                        },
+                    );
+                    col += 1;
+                }
+            }
+        }
     }
 }
 
@@ -165,8 +230,23 @@ pub(super) fn sensors(grid: &mut CellGrid, rect: Rect, sensors: &[SensorRow]) {
             (None, None) => caps::active_glyphs().emdash.to_owned(),
         })
         .collect::<Vec<_>>();
+    let bar_width = rect.cols.saturating_sub(14 + 22 + 7 + 12 + 4).max(8);
+    let bars = sensors
+        .iter()
+        .map(|sensor| {
+            sensor.temp_c.map_or_else(
+                || caps::active_glyphs().emdash.to_owned(),
+                |temp| {
+                    let limit = sensor.crit_c.or(sensor.max_c).unwrap_or(100.0);
+                    let (filled, track) =
+                        caps::bar_track((temp / limit).clamp(0.0, 1.0), bar_width);
+                    format!("{filled}{track}")
+                },
+            )
+        })
+        .collect::<Vec<_>>();
     let mut owned_rows: Vec<Vec<table::TableCell<'_>>> = Vec::with_capacity(sensors.len());
-    for (sensor, limit) in sensors.iter().zip(&limits) {
+    for ((sensor, limit), bar) in sensors.iter().zip(&limits).zip(&bars) {
         owned_rows.push(vec![
             table::TableCell::Text(&sensor.chip),
             table::TableCell::Text(&sensor.label),
@@ -176,6 +256,7 @@ pub(super) fn sensors(grid: &mut CellGrid, rect: Rect, sensors: &[SensorRow]) {
                     .map_or(Reading::Unknown, |temp| Reading::Value(f64::from(temp))),
             ),
             table::TableCell::Text(limit),
+            table::TableCell::Text(bar),
         ]);
     }
     let row_refs = owned_rows.iter().map(Vec::as_slice).collect::<Vec<_>>();
@@ -188,7 +269,7 @@ pub(super) fn sensors(grid: &mut CellGrid, rect: Rect, sensors: &[SensorRow]) {
         },
         table::Col {
             title: "sensor",
-            width: rect.cols.saturating_sub(42).max(8),
+            width: 22,
             align: table::Align::Left,
             unit: None,
         },
@@ -202,6 +283,12 @@ pub(super) fn sensors(grid: &mut CellGrid, rect: Rect, sensors: &[SensorRow]) {
             title: "max/crit",
             width: 12,
             align: table::Align::Right,
+            unit: None,
+        },
+        table::Col {
+            title: "to limit",
+            width: bar_width,
+            align: table::Align::Left,
             unit: None,
         },
     ];
@@ -333,6 +420,15 @@ fn state_tok(temp: f32, max: Option<f32>, crit: Option<f32>) -> Tok {
         Tok::Slot(S::Text)
     }
 }
+
+fn thermal_level(temp: f32, warn: f32, crit: f32) -> f32 {
+    if temp <= warn {
+        (temp / warn * 0.7).clamp(0.0, 0.7)
+    } else {
+        (0.7 + (temp - warn) / (crit - warn) * 0.2).clamp(0.7, 1.0)
+    }
+}
+
 fn put(grid: &mut CellGrid, rect: Rect, x: usize, y: usize, text: &str, tok: Tok) {
     if let Some(style) = StyleTok::from_tok(tok) {
         grid.view(rect).put_str(
