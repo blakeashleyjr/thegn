@@ -28,9 +28,12 @@ use crate::plugins::inbox::{PluginInbox, RejectedRequest};
 use crate::plugins::{LoadedState, OneShotStart, PluginMsg, PluginRx, PluginsHost};
 
 const MAX_PENDING_ALERTS_PER_PLUGIN: usize = 16;
+// The inbox/toast row is display text, so keep its stricter host-side cap.
 const MAX_ALERT_MESSAGE_BYTES: usize = 1024;
+const _: () = assert!(MAX_ALERT_MESSAGE_BYTES <= thegn_core::plugin_api::MAX_ALERT_MESSAGE_BYTES);
 const MAX_FEED_BRIDGES: usize = 8;
-const MAX_SUBSCRIPTIONS_PER_PLUGIN: usize = 64;
+const MAX_SUBSCRIPTIONS_PER_PLUGIN: usize = thegn_core::plugin_api::MAX_PLUGIN_SUBSCRIPTIONS;
+const FEED_BRIDGE_THREAD: &str = "thegn-plugfeed";
 const MAX_PLUGIN_MESSAGES_PER_DRAIN: usize = 256;
 const DISPATCH_QUEUE_CAPACITY: usize = 64;
 const MAX_DISPATCH_IN_FLIGHT_PER_PLUGIN: usize = 8;
@@ -1080,9 +1083,10 @@ fn feed_bridge_admission(state: &PluginsState, plugin: &str) -> Result<bool, Rpc
 /// compositor loop, so a subscribing plugin costs the idle render loop nothing.
 /// The bridge ends when the feed closes or the plugin's session goes away.
 fn spawn_cancellable_bridge(
-    name: &str,
+    name: &'static str,
     fut: impl std::future::Future<Output = ()> + Send + 'static,
 ) -> Option<FeedBridge> {
+    debug_assert!(name.len() <= 15);
     let (cancel_tx, cancel_rx) = tokio::sync::oneshot::channel();
     let spawn = std::thread::Builder::new()
         .name(name.into())
@@ -1121,7 +1125,7 @@ fn spawn_feed_bridge(
     cfg: Arc<thegn_core::config::Config>,
     writer: SessionWriter,
 ) -> Option<FeedBridge> {
-    spawn_cancellable_bridge("thegn-plugin-feed", async move {
+    spawn_feed_bridge_worker(async move {
         let client = match crate::cmd::session::connect(&cfg).await {
             Ok(c) => c,
             Err(e) => {
@@ -1166,6 +1170,12 @@ fn spawn_feed_bridge(
             }
         }
     })
+}
+
+fn spawn_feed_bridge_worker(
+    fut: impl std::future::Future<Output = ()> + Send + 'static,
+) -> Option<FeedBridge> {
+    spawn_cancellable_bridge(FEED_BRIDGE_THREAD, fut)
 }
 
 // ---------------------------------------------------------------------------
@@ -1557,6 +1567,72 @@ mod tests {
     }
 
     #[test]
+    fn apply_host_call_reuses_shared_config_for_multiple_calls() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("test runtime");
+        let supervisor = thegn_svc::plugin::ResidentSupervisor::new(runtime.handle().clone());
+        let executable = std::env::current_exe().expect("test executable");
+        let args = vec![
+            "--exact".to_owned(),
+            format!("{}::resident_fixture_child", module_path!()),
+        ];
+        let mut env = BTreeMap::new();
+        env.insert("THEGN_PLUGIN_TEST_HOLD".to_owned(), "1".to_owned());
+        let session = thegn_svc::plugin::ResidentSession::spawn(
+            &supervisor,
+            "apply-host-call-config-test",
+            &std::iter::once(executable.to_string_lossy().into_owned())
+                .chain(args)
+                .collect::<Vec<_>>(),
+            &env,
+            None,
+            |_| {},
+        )
+        .expect("resident fixture starts");
+
+        let mut state = state_with(vec![spec("p", Vec::new(), vec![Scope::Read])]);
+        state.plugins.get_mut("p").expect("plugin entry").writer = Some(session.writer());
+
+        for id in [1, 2] {
+            let _damage = apply_host_call(
+                &mut state,
+                "p",
+                RpcMessage {
+                    id: Some(id),
+                    method: "host.call".into(),
+                    // The missing route placeholder makes dispatch fail before
+                    // connecting to a daemon, while still exercising admission.
+                    params: serde_json::json!({ "cap": "sessions.snapshot", "params": null }),
+                },
+            );
+        }
+        assert_eq!(Arc::strong_count(&state.cfg), 2);
+
+        session.kill();
+        let mut completion = session.completion();
+        runtime.block_on(async {
+            tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                while completion.borrow().is_none() {
+                    completion.changed().await.expect("session completion");
+                }
+            })
+            .await
+            .expect("resident fixture terminates");
+        });
+    }
+
+    #[test]
+    fn resident_fixture_child() {
+        if std::env::var_os("THEGN_PLUGIN_TEST_HOLD").is_some() {
+            loop {
+                std::thread::park_timeout(std::time::Duration::from_secs(60));
+            }
+        }
+    }
+
+    #[test]
     fn dispatcher_thread_has_a_bounded_attribution_name() {
         let (name_tx, name_rx) = std::sync::mpsc::channel();
         let dispatcher = Dispatcher::spawn_with(std::time::Duration::from_secs(2), move |_, _| {
@@ -1578,6 +1654,25 @@ mod tests {
                 .expect("thread name"),
             "thegn-plugdisp"
         );
+    }
+
+    #[test]
+    fn production_feed_bridge_thread_has_a_bounded_attribution_name() {
+        let (name_tx, name_rx) = std::sync::mpsc::channel();
+        let bridge = spawn_feed_bridge_worker(async move {
+            let name = std::thread::current()
+                .name()
+                .map(str::to_owned)
+                .expect("feed bridge thread has a name");
+            name_tx.send(name).expect("test is listening");
+        })
+        .expect("feed bridge thread starts");
+        let name = name_rx
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .expect("feed bridge thread name");
+        assert_eq!(name, FEED_BRIDGE_THREAD);
+        assert!(name.len() <= 15);
+        drop(bridge);
     }
 
     fn dispatch_request(
@@ -1904,7 +1999,7 @@ mod tests {
     #[test]
     fn feed_bridge_claim_is_limited_to_one_per_entry() {
         let mut entry = build_entry(loaded_state(seg_spec("p")));
-        entry.feed_bridge = spawn_cancellable_bridge("feed-claim-test", async {
+        entry.feed_bridge = spawn_cancellable_bridge("thegn-feedclaim", async {
             std::future::pending::<()>().await;
         });
         assert!(!claim_feed_bridge(&mut entry));
@@ -1928,7 +2023,7 @@ mod tests {
 
     #[test]
     fn dropping_feed_bridge_cancels_idle_worker() {
-        let bridge = spawn_cancellable_bridge("feed-cancel-test", async {
+        let bridge = spawn_cancellable_bridge("thegn-feedcancl", async {
             std::future::pending::<()>().await;
         })
         .expect("worker thread starts");
@@ -1953,7 +2048,7 @@ mod tests {
         );
         for i in 0..MAX_FEED_BRIDGES {
             state.plugins.get_mut(&format!("p{i}")).unwrap().feed_bridge =
-                spawn_cancellable_bridge("feed-cap-test", async {
+                spawn_cancellable_bridge("thegn-feedcap", async {
                     std::future::pending::<()>().await;
                 });
         }
