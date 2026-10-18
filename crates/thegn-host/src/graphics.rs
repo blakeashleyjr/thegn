@@ -11,6 +11,8 @@
 //! terminal. Pure over its inputs (unit-tested on the byte structure); the
 //! actual pixels can only be confirmed on a live kitty/ghostty/wezterm terminal.
 
+use std::sync::Arc;
+
 /// String Terminator (`ESC \`).
 const ST: &[u8] = b"\x1b\\";
 /// Max base64 payload per kitty chunk (protocol limit is 4096).
@@ -37,6 +39,15 @@ pub struct Placement {
     pub rows: u16,
 }
 
+/// Placement-independent, validated kitty image data prepared off the render
+/// loop. Clones share the encoded base64 allocation across placement changes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct KittyPayload {
+    pub w: u32,
+    pub h: u32,
+    pub b64: Arc<str>,
+}
+
 /// Encode `rgba` (`px_w`×`px_h`, 4 bytes/pixel) as a kitty transmit-and-display
 /// APC stream, preceded by an absolute CUP to `place.origin` and scaled to
 /// `place.cols`×`place.rows` cells. `C=1` keeps the cursor put; `q=2` silences
@@ -48,6 +59,12 @@ pub fn kitty_image(
     px_h: u32,
     place: Placement,
 ) -> Result<Vec<u8>, RasterError> {
+    Ok(kitty_place(&kitty_payload(rgba, px_w, px_h)?, place))
+}
+
+/// Validate and encode an RGBA raster once, independently of its screen-cell
+/// placement. The returned payload can be shared by preview revisions.
+pub fn kitty_payload(rgba: &[u8], px_w: u32, px_h: u32) -> Result<KittyPayload, RasterError> {
     if px_w == 0 || px_h == 0 {
         return Err(RasterError::ZeroDimension);
     }
@@ -61,8 +78,17 @@ pub fn kitty_image(
             actual: rgba.len(),
         });
     }
-    let payload = base64(rgba);
-    let chunks: Vec<&[u8]> = payload.as_bytes().chunks(CHUNK).collect();
+    Ok(KittyPayload {
+        w: px_w,
+        h: px_h,
+        b64: Arc::from(base64(rgba)),
+    })
+}
+
+/// Place a previously validated image at `place`, preserving kitty's chunk
+/// framing and control fields. This does no base64 encoding.
+pub fn kitty_place(payload: &KittyPayload, place: Placement) -> Vec<u8> {
+    let chunks: Vec<&[u8]> = payload.b64.as_bytes().chunks(CHUNK).collect();
 
     // Place the image at its cell origin (1-based CUP), like the corner relay.
     let mut out = format!(
@@ -78,7 +104,9 @@ pub fn kitty_image(
         if i == 0 {
             // First chunk carries the full control set.
             let ctrl = format!(
-                "a=T,f=32,s={px_w},v={px_h},c={},r={},i={PREVIEW_IMAGE_ID},C=1,q=2,m={}",
+                "a=T,f=32,s={},v={},c={},r={},i={PREVIEW_IMAGE_ID},C=1,q=2,m={}",
+                payload.w,
+                payload.h,
                 place.cols,
                 place.rows,
                 u8::from(!last)
@@ -91,7 +119,7 @@ pub fn kitty_image(
         out.extend_from_slice(chunk);
         out.extend_from_slice(ST);
     }
-    Ok(out)
+    out
 }
 
 /// Why a raster cannot be encoded as a kitty image.
@@ -222,6 +250,23 @@ mod tests {
         assert_eq!(s.matches("m=0;").count(), 1, "one terminating chunk");
         // continuation chunks carry only m=, not the control set
         assert!(s.contains("\x1b_Gm=1;") || s.contains("\x1b_Gm=0;"));
+    }
+
+    #[test]
+    fn prepared_payload_placement_is_byte_identical() {
+        let boundary = vec![17_u8; 3072]; // 4096 base64 characters exactly.
+        let large = vec![9_u8; 64 * 64 * 4];
+        for (rgba, w, h) in [
+            (&[1_u8, 2, 3, 4][..], 1, 1),
+            (&boundary[..], 24, 32),
+            (&large[..], 64, 64),
+        ] {
+            let payload = kitty_payload(rgba, w, h).unwrap();
+            assert_eq!(
+                kitty_place(&payload, place()),
+                kitty_image(rgba, w, h, place()).unwrap()
+            );
+        }
     }
 
     #[test]
