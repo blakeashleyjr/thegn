@@ -89,6 +89,8 @@ pub struct StatsSampler {
     /// without a predecessor, and reporting the raw total would be meaningless.
     prev_reclaim: Option<(u64, Instant)>,
     vmstat: crate::vmstat::VmstatReader,
+    #[cfg(target_os = "linux")]
+    base_mem: crate::base_mem::BaseMem,
     /// Cached slow-tier results, reused between refreshes.
     last_disks: std::sync::Arc<[DiskInfo]>,
     #[cfg(not(target_os = "linux"))]
@@ -211,6 +213,8 @@ impl StatsSampler {
             prev_disk: now,
             prev_reclaim: None,
             vmstat: crate::vmstat::VmstatReader::new(),
+            #[cfg(target_os = "linux")]
+            base_mem: crate::base_mem::BaseMem::new(),
             last_disks: std::sync::Arc::from([]),
             #[cfg(not(target_os = "linux"))]
             last_disk_io: None,
@@ -295,16 +299,30 @@ impl StatsSampler {
         snap.cpu_freq_mhz = self.last_cpu_freq;
 
         // --- Memory + swap (every tick) ---
-        self.sys.refresh_memory();
         let gib = |b: u64| b as f32 / (1024.0 * 1024.0 * 1024.0);
-        let total = self.sys.total_memory();
-        if total > 0 {
-            snap.mem_gib = Some((gib(self.sys.used_memory()), gib(total)));
-            snap.mem_free_gib = Some(gib(self.sys.free_memory()));
+        #[cfg(target_os = "linux")]
+        {
+            let reading = self.base_mem.fill();
+            if let Some((used, total)) = reading.mem.filter(|(_, total)| *total > 0) {
+                snap.mem_gib = Some((gib(used), gib(total)));
+                snap.mem_free_gib = reading.free.map(gib);
+            }
+            if let Some((used, total)) = reading.swap.filter(|(_, total)| *total > 0) {
+                snap.swap_gib = Some((gib(used), gib(total)));
+            }
         }
-        let swap_total = self.sys.total_swap();
-        if swap_total > 0 {
-            snap.swap_gib = Some((gib(self.sys.used_swap()), gib(swap_total)));
+        #[cfg(not(target_os = "linux"))]
+        {
+            self.sys.refresh_memory();
+            let total = self.sys.total_memory();
+            if total > 0 {
+                snap.mem_gib = Some((gib(self.sys.used_memory()), gib(total)));
+                snap.mem_free_gib = Some(gib(self.sys.free_memory()));
+            }
+            let swap_total = self.sys.total_swap();
+            if swap_total > 0 {
+                snap.swap_gib = Some((gib(self.sys.used_swap()), gib(swap_total)));
+            }
         }
 
         // --- Direct reclaim (every tick, Linux only) ---
