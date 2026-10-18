@@ -1722,6 +1722,7 @@ pub enum DegradeReason {
     Crash,
 }
 
+#[derive(Debug)]
 pub struct UpdateResult {
     pub changed: bool,
 }
