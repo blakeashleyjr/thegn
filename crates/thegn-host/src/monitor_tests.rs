@@ -1171,7 +1171,7 @@ fn process_columns_follow_viewport_not_sample_values_and_keep_visible_identity()
             previous_widths = Some(widths.clone());
             let mut surface = Surface::new(cols, 30);
             ov.render(&mut surface, screen);
-            if cols >= 80 {
+            if cols >= 40 {
                 let text: String = surface
                     .screen_lines()
                     .iter()

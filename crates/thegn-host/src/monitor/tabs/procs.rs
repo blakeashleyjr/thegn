@@ -172,12 +172,15 @@ fn process_columns(cols: usize, tree: bool) -> Vec<(ColId, usize)> {
     );
     let caps = proc_row_caps();
     fitted.retain(|(id, _)| availability(*id, &caps) == Availability::Available);
+    let non_pid_non_command_widths: usize = fitted
+        .iter()
+        .filter(|(id, _)| *id != ColId::Pid && *id != ColId::Command)
+        .map(|(_, width)| *width)
+        .sum();
+    let gutters = fitted.len().saturating_sub(1);
     if let Some((_, pid_width)) = fitted.iter_mut().find(|(id, _)| *id == ColId::Pid) {
-        *pid_width = if cols >= 60 {
-            (*pid_width).max(7)
-        } else {
-            (*pid_width).min(cols.saturating_sub(2))
-        };
+        let room_for_pid = cols.saturating_sub(1 + gutters + non_pid_non_command_widths + 1);
+        *pid_width = (*pid_width).max(7).min(room_for_pid);
     }
     let other_widths: usize = fitted
         .iter()
