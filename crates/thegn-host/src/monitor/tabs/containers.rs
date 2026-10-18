@@ -1,5 +1,8 @@
 //! Containers tab renderer and tab-specific monitor actions.
 
+#[path = "containers/view.rs"]
+pub(in crate::monitor) mod view;
+
 use super::super::build::*;
 use super::super::{
     ContainerReqKind, ContainerRequest, ContainerRowMeta, MonitorAction, MonitorOutcome,
