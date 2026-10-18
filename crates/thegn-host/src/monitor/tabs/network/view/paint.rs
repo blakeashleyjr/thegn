@@ -1,4 +1,6 @@
-use super::{HEALTH, HISTORY, IFACE_HISTORY, INTERFACES, NetworkModel, THROUGHPUT};
+use super::{
+    HEALTH, HISTORY, IFACE_HISTORY, INTERFACES, NetworkModel, TELEMETRY_HISTORY, THROUGHPUT,
+};
 use crate::{
     caps,
     compositor::Rect,
@@ -26,8 +28,16 @@ pub(super) fn paint(model: &NetworkModel, surface: &mut Surface, id: PanelId, re
     let mut grid = CellGrid::new(rect.cols, rect.rows);
     let title = match id {
         THROUGHPUT => format!(
-            "Network throughput (window peak {} B/s)",
-            peak_label(&model.history_rx, &model.history_tx)
+            "Network throughput ({} scale rx {} / tx {} B/s)",
+            model.history_scale.label(),
+            rate(
+                (model.history_rx_axis_max.is_finite() && model.history_rx_axis_max > 0.0)
+                    .then_some(f64::from(model.history_rx_axis_max))
+            ),
+            rate(
+                (model.history_tx_axis_max.is_finite() && model.history_tx_axis_max > 0.0)
+                    .then_some(f64::from(model.history_tx_axis_max))
+            )
         ),
         INTERFACES => format!(
             "Interfaces - rates/errors (spark peak {} B/s)",
@@ -103,14 +113,13 @@ fn paint_throughput(grid: &mut CellGrid, body: Rect, model: &NetworkModel) {
     if half == 0 || body.cols == 0 {
         return;
     }
-    let mut rx = [0.0; HISTORY];
-    let mut tx = [0.0; HISTORY];
+    let mut rx = [0.0; TELEMETRY_HISTORY];
+    let mut tx = [0.0; TELEMETRY_HISTORY];
     let rx_len = model.history_rx.copy_ordered(&mut rx);
     let tx_len = model.history_tx.copy_ordered(&mut tx);
-    let max = peak(&model.history_rx, &model.history_tx);
     for value in rx.iter_mut().take(rx_len).chain(tx.iter_mut().take(tx_len)) {
-        *value = if value.is_finite() && max > 0.0 {
-            (*value / max).clamp(0.0, 1.0)
+        *value = if value.is_finite() {
+            value.clamp(0.0, 1.0)
         } else {
             0.0
         };
@@ -257,7 +266,7 @@ fn paint_rate_history(ring: &super::Ring, peak: f32, rect: Rect, surface: &mut S
     if !ring.has_finite_sample() {
         return;
     }
-    let mut values = [0.0; IFACE_HISTORY];
+    let mut values = [0.0; HISTORY];
     let len = ring.copy_ordered(&mut values);
     for value in values.iter_mut().take(len) {
         if value.is_finite() {
@@ -358,14 +367,6 @@ fn peak(rx: &super::Ring, tx: &super::Ring) -> f32 {
         .copied()
         .filter(|value| value.is_finite())
         .fold(0.0_f32, f32::max)
-}
-
-fn peak_label(rx: &super::Ring, tx: &super::Ring) -> String {
-    if rx.has_finite_sample() || tx.has_finite_sample() {
-        format_rate(f64::from(peak(rx, tx)))
-    } else {
-        caps::active_glyphs().emdash.to_owned()
-    }
 }
 
 fn interface_peak(model: &NetworkModel) -> f32 {
