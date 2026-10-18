@@ -376,7 +376,7 @@ fn battery_history_uses_latest_telemetry_and_empty_history_is_absent() {
         &history,
         crate::telemetry::Window::default(),
         crate::telemetry::ScaleMode::Window,
-        120_000,
+        121_000,
     );
     assert!(!model.telemetry_battery_history.is_empty());
     assert_eq!(model.telemetry_battery_history.len(), 240);
@@ -458,7 +458,7 @@ fn battery_history_uses_latest_telemetry_and_empty_history_is_absent() {
         "newest draw sample reaches the last telemetry graph column"
     );
     let output = text(&mut surface);
-    assert!(output.contains("battery |draw| peak 14.0 W"));
+    assert!(output.contains("battery draw peak 14.0 W"));
     assert!(output.contains("draw direction -14.00W"));
     let absent_line = format!("charge history {}", caps::active_glyphs().emdash);
     assert!(!output.contains(&absent_line));

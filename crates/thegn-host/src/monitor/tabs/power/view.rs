@@ -432,7 +432,7 @@ fn draw_history_label(model: &PowerModel) -> String {
         .telemetry_draw_peak_w
         .map(|watts| format!("{watts:.1} W"))
         .unwrap_or_else(|| paint::mark(model.power_supply_health).to_owned());
-    format!("battery |draw| peak {peak}")
+    format!("battery draw peak {peak}")
 }
 fn rail_title(model: &PowerModel) -> String {
     let ceiling = rail_ceiling(model);
