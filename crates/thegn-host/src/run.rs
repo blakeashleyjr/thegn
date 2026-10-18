@@ -14787,30 +14787,28 @@ async fn event_loop<T: Terminal>(
 
         // -- 23. Log streams
         let log_backlog = {
-            let slice = logs_ingress.take(crate::loop_policy::log_apply_budget(
-                !pending_input.is_empty(),
-            ));
-            if !slice.is_empty() {
+            let track_cursor = panel_ui.open == crate::panel::Section::Logs || panel_ui.logs_tail;
+            let anchor = if track_cursor {
+                crate::panel::sections::logs::cursor_seq(&model.panel, &panel_ui)
+            } else {
+                None
+            };
+            let result = crate::loop_policy::drain_logs(
+                &logs_ingress,
+                &mut model.panel.log_lines_structured,
+                &mut model.panel.log_first_seq,
+                crate::loop_policy::log_budget(!pending_input.is_empty()),
+                want_panel && panel_ui.open == crate::panel::Section::Logs,
+                std::time::Instant::now,
+            );
+            if result.took {
                 loop_perf.tick(crate::perf::WakeSource::Other);
-                // Avoid the render -> own-log -> tail -> render feedback loop.
-                let track_cursor =
-                    panel_ui.open == crate::panel::Section::Logs || panel_ui.logs_tail;
-                let anchor = if track_cursor {
-                    crate::panel::sections::logs::cursor_seq(&model.panel, &panel_ui)
-                } else {
-                    None
-                };
-                dirty |= crate::loop_policy::apply_log_slice(
-                    &mut model.panel.log_lines_structured,
-                    &mut model.panel.log_first_seq,
-                    slice,
-                    want_panel && panel_ui.open == crate::panel::Section::Logs,
-                );
-                if track_cursor {
-                    crate::panel::sections::logs::repin(&model.panel, &mut panel_ui, anchor);
-                }
             }
-            logs_ingress.has_pending()
+            dirty |= result.dirty;
+            if track_cursor && result.took {
+                crate::panel::sections::logs::repin(&model.panel, &mut panel_ui, anchor);
+            }
+            result.backlog
         };
 
         // Ingress-share state from the supervisor threads: persist the row,
