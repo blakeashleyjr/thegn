@@ -14,6 +14,7 @@ use std::sync::atomic::AtomicBool;
 
 /// A decoded raster ready for [`crate::graphics::kitty_image`].
 pub struct Raster {
+    /// Original pixels for the fallback encoder; empty when `kitty` is prepared.
     pub rgba: Vec<u8>,
     pub w: u32,
     pub h: u32,
