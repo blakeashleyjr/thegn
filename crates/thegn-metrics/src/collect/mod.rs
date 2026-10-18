@@ -46,10 +46,12 @@ pub enum CollectorId {
     CpuIrq,
     CpuSched,
     ThermalZone,
+    CpuIdle,
+    CpuTopology,
 }
 
 impl CollectorId {
-    pub const ALL: [Self; 18] = [
+    pub const ALL: [Self; 20] = [
         Self::Loadavg,
         Self::Uptime,
         Self::Psi,
@@ -68,6 +70,8 @@ impl CollectorId {
         Self::CpuIrq,
         Self::CpuSched,
         Self::ThermalZone,
+        Self::CpuIdle,
+        Self::CpuTopology,
     ];
 
     pub const fn slug(self) -> &'static str {
@@ -90,6 +94,8 @@ impl CollectorId {
             Self::CpuIrq => "cpu_irq",
             Self::CpuSched => "cpu_sched",
             Self::ThermalZone => "thermal_zone",
+            Self::CpuIdle => "cpu_idle",
+            Self::CpuTopology => "cpu_topology",
         }
     }
 
@@ -190,6 +196,9 @@ pub fn default_collectors() -> Vec<Box<dyn Collector>> {
         Box::new(linux::cpu_sched::CpuSchedCollector::new());
     collectors[CollectorId::ThermalZone.index()] =
         Box::new(linux::thermal_zones::ThermalZoneCollector::new());
+    collectors[CollectorId::CpuIdle.index()] = Box::new(linux::cpu_idle::CpuIdleCollector::new());
+    collectors[CollectorId::CpuTopology.index()] =
+        Box::new(linux::cpu_topology::CpuTopologyCollector::new());
     collectors
 }
 
@@ -221,6 +230,8 @@ mod default_collectors_tests {
             CollectorId::CpuIrq,
             CollectorId::CpuSched,
             CollectorId::ThermalZone,
+            CollectorId::CpuIdle,
+            CollectorId::CpuTopology,
         ] {
             assert_ne!(
                 collectors[id.index()].cadence(),
