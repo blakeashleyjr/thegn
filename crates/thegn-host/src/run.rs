@@ -912,7 +912,7 @@ pub async fn main(
 
     // Startup orphan GC: remove any thegn containers whose worktrees no
     // longer exist in the DB. Best-effort; runs off-thread so launch is instant.
-    {
+    if crate::sandbox_gc_gate::startup_gc_wanted(&cfg) {
         tokio::task::spawn_blocking(move || {
             let Ok(db) = thegn_core::db::Db::open() else {
                 return;
@@ -940,6 +940,8 @@ pub async fn main(
                 let _ = STARTUP_ORPHANS_REMOVED.set(removed); // best-effort: first-set-wins: the notice renders once
             }
         });
+    } else {
+        tracing::debug!(target: "thegn::sandbox", "orphan GC skipped: sandbox disabled");
     }
 
     // Config reload events ride a tokio channel so the loop drains them on wake;
