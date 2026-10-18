@@ -64,7 +64,9 @@ pub(super) fn paint(model: &CpuModel, surface: &mut Surface, id: PanelId, rect: 
         };
         if model.cpu_history.is_empty() {
             let mut warming = CellGrid::new(graph_rect.cols, graph_rect.rows.min(1));
-            warming.put_str(0, 0, mark(Health::Warming), CellStyle::default());
+            warming
+                .view(Rect::full(graph_rect.cols, graph_rect.rows.min(1)))
+                .put_str(0, 0, mark(Health::Warming), CellStyle::default());
             Emitter::default().emit(
                 &warming,
                 Rect::full(graph_rect.cols, graph_rect.rows.min(1)),
@@ -96,7 +98,9 @@ pub(super) fn paint(model: &CpuModel, surface: &mut Surface, id: PanelId, rect: 
                 } else {
                     "st"
                 };
-                label.put_str(0, 0, name, CellStyle::default());
+                label
+                    .view(Rect::full(3, 1))
+                    .put_str(0, 0, name, CellStyle::default());
                 Emitter::default().emit(
                     &label,
                     Rect::full(3, 1),

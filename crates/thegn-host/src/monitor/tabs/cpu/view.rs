@@ -179,7 +179,7 @@ impl CpuModel {
         self.cpu_stat.cores.clone_from(&source.cores);
         let core_count = source.cores.len().min(CORE_HISTORY_LIMIT);
         self.core_busy_history
-            .resize_with(core_count, || Vec::with_capacity(CORE_HISTORY_SAMPLES));
+            .resize_with(core_count, SampleRing::default);
         self.core_busy_history.truncate(core_count);
         for (history, core) in self.core_busy_history.iter_mut().zip(&source.cores) {
             let value = core
