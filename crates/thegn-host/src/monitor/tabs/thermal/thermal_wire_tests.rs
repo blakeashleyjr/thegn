@@ -90,8 +90,8 @@ fn thermal_overlay_places_board_panels_and_requests_only_their_collectors() {
         "sensor panel was not placed: {text}"
     );
     assert!(
-        text.contains("CPU cores"),
-        "cores panel was not placed: {text}"
+        !text.contains("CPU cores"),
+        "cores panel waits for a discovered core layout: {text}"
     );
     assert!(
         text.contains("GPU thermals"),

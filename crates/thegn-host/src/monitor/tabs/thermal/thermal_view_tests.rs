@@ -284,6 +284,22 @@ fn deterministic_snapshots_cover_sizes_capabilities_and_demand() {
         model.core_history[0][newest],
         model.core_history[0][previous]
     );
+    let mut telemetry = TelemetryHistory::default();
+    for sample in 0..120_u64 {
+        telemetry.push(
+            &thegn_metrics::StatsSnapshot {
+                cpu_temp_c: Some(45.0 + (sample % 30) as f32),
+                ..thegn_metrics::StatsSnapshot::default()
+            },
+            1_000 + sample * 1_000,
+        );
+    }
+    model.absorb_history(
+        &telemetry,
+        Window::from_secs(180),
+        ScaleMode::Fixed,
+        121_000,
+    );
     let view = ThermalView(&model);
     for (cols, rows) in [(100, 30), (160, 45), (240, 60)] {
         for (depth, unicode) in [
@@ -310,6 +326,7 @@ fn deterministic_snapshots_cover_sizes_capabilities_and_demand() {
                         assert!(output.contains("Thermal zones"));
                         assert!(output.contains("GPU thermals"));
                         assert!(output.contains("k10temp"));
+                        assert!(output.contains("ref 100 C"));
                         assert!(output.contains("amdgpu"));
                         assert!(output.contains("spd5118"));
                         assert!(output.contains("alarm 1"));
@@ -411,11 +428,84 @@ fn implausible_transient_keeps_sensor_identity_and_records_a_gap() {
 }
 
 #[test]
+fn telemetry_label_and_graph_paint_without_a_package_sensor() {
+    let mut history = TelemetryHistory::default();
+    for (at_ms, temp_c) in [(1_000, 51.0), (2_000, 58.0), (3_000, 63.0)] {
+        history.push(
+            &thegn_metrics::StatsSnapshot {
+                cpu_temp_c: Some(temp_c),
+                ..thegn_metrics::StatsSnapshot::default()
+            },
+            at_ms,
+        );
+    }
+    let mut model = ThermalModel::default();
+    model.absorb_history(&history, Window::from_secs(10), ScaleMode::Fixed, 3_001);
+    assert!(model.sensors.is_empty());
+    let panel = Placed {
+        id: super::PACKAGE,
+        rect: Rect::full(80, 16),
+        variant: super::FULL.kind,
+    };
+    let mut surface = Surface::new(80, 16);
+    let mut empty_surface = Surface::new(80, 16);
+    test_override::with_unicode(UnicodeLevel::Ascii, || {
+        ThermalView(&model).paint(&mut surface, &panel, Rect::full(80, 16), 0, &[]);
+        ThermalView(&ThermalModel::default()).paint(
+            &mut empty_surface,
+            &panel,
+            Rect::full(80, 16),
+            0,
+            &[],
+        );
+    });
+    let output = text(&mut surface);
+    let empty_output = text(&mut empty_surface);
+    assert!(output.contains("telemetry 80/95 C"));
+    assert_ne!(
+        output.lines().skip(6).take(9).collect::<Vec<_>>(),
+        empty_output.lines().skip(6).take(9).collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn implausible_sensor_gap_keeps_the_newest_spark_cell_blank() {
+    let mut model = ThermalModel::default();
+    let mut frame = fixture();
+    model.absorb_frame(&frame);
+    frame.parts.hwmon.values[0].value = Some(65_261.85);
+    model.absorb_frame(&frame);
+    let package_index = model
+        .sensors
+        .iter()
+        .position(|sensor| sensor.key == "sensor-package")
+        .expect("package sensor row");
+    let panel = Placed {
+        id: super::SENSORS,
+        rect: Rect::full(160, 45),
+        variant: super::FULL.kind,
+    };
+    let mut surface = Surface::new(160, 45);
+    test_override::with_unicode(UnicodeLevel::Ascii, || {
+        ThermalView(&model).paint(&mut surface, &panel, Rect::full(160, 45), 0, &[]);
+    });
+    let output = text(&mut surface);
+    let row = output.lines().nth(package_index + 2).expect("package row");
+    let newest_column =
+        1 + super::paint::SENSOR_HISTORY_X + (160 - 2 - super::paint::SENSOR_HISTORY_X) - 1;
+    assert_eq!(row.chars().nth(newest_column), Some(' '));
+}
+
+#[test]
 fn warm_absorbs_do_not_grow_sensor_or_zone_storage() {
     let frame = fixture();
     let mut model = ThermalModel::default();
     model.absorb_frame(&frame);
     let sensor_capacity = model.sensors.capacity();
+    let package_key_capacity = model
+        .package_history_key
+        .as_ref()
+        .map_or(0, String::capacity);
     let zone_capacity = model.zones.capacity();
     let trip_capacities = model
         .zones
@@ -427,10 +517,27 @@ fn warm_absorbs_do_not_grow_sensor_or_zone_storage() {
         .iter()
         .map(|sensor| (sensor.key.capacity(), sensor.label.capacity()))
         .collect::<Vec<_>>();
-    for _ in 0..1000 {
-        model.absorb_frame(&frame);
-    }
+    let (_, counts) = crate::proc_workload_alloc::measure(|| {
+        for _ in 0..1000 {
+            model.absorb_frame(&frame);
+        }
+    });
+    assert_eq!(
+        counts.allocation_calls, 0,
+        "1000 warm thermal absorbs allocated: {counts:?}"
+    );
+    assert_eq!(
+        counts.realloc_calls, 0,
+        "1000 warm thermal absorbs reallocated: {counts:?}"
+    );
     assert_eq!(model.sensors.capacity(), sensor_capacity);
+    assert_eq!(
+        model
+            .package_history_key
+            .as_ref()
+            .map_or(0, String::capacity),
+        package_key_capacity
+    );
     assert_eq!(model.zones.capacity(), zone_capacity);
     assert_eq!(
         model
@@ -549,7 +656,6 @@ fn telemetry_temp_series_is_separate_from_frame_package_history() {
         &mut with_graph,
         Rect::full(80, 12),
         model.package(),
-        &model.temp_history,
         &model.package_history,
         model.package_history_len,
         model.package_history_next,
@@ -558,7 +664,6 @@ fn telemetry_temp_series_is_separate_from_frame_package_history() {
         &mut without_graph,
         Rect::full(80, 12),
         model.package(),
-        &[],
         &model.package_history,
         model.package_history_len,
         model.package_history_next,

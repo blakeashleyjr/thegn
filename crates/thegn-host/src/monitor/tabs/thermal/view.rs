@@ -112,7 +112,7 @@ impl Default for ThermalModel {
             cores: [None; 16],
             core_layout_generation: None,
             core_source_hwmon: false,
-            core_panel_present: true,
+            core_panel_present: false,
             smu_cores_seen: false,
             core_history: [[0.0; HISTORY_CAP]; 16],
             core_history_len: [0; 16],
@@ -309,13 +309,22 @@ impl ThermalModel {
                 .then_with(|| left.key.cmp(&right.key))
         });
 
-        let (package_key, package_temp) = self.package().map_or((None, None), |sensor| {
-            (Some(sensor.key.clone()), sensor.temp_c)
-        });
-        if package_key.as_deref() != self.package_history_key.as_deref() {
+        let package = self.package();
+        let package_key = package.map(|sensor| sensor.key.as_str());
+        let package_temp = package.and_then(|sensor| sensor.temp_c);
+        if package_key != self.package_history_key.as_deref() {
             self.package_history_len = 0;
             self.package_history_next = 0;
-            self.package_history_key = package_key;
+            match package_key {
+                Some(key) => match &mut self.package_history_key {
+                    Some(current) => {
+                        current.clear();
+                        current.push_str(key);
+                    }
+                    None => self.package_history_key = Some(key.to_owned()),
+                },
+                None => self.package_history_key = None,
+            }
         }
         if let Some(temp) = package_temp {
             self.package_history[self.package_history_next] = temp;
@@ -561,7 +570,6 @@ impl TabView for ThermalView<'_> {
                 &mut grid,
                 inner,
                 self.0.package(),
-                &self.0.temp_history,
                 &self.0.package_history,
                 self.0.package_history_len,
                 self.0.package_history_next,
@@ -578,6 +586,9 @@ impl TabView for ThermalView<'_> {
                 &self.0.core_history_next,
             ),
             _ => {}
+        }
+        if placed.id == PACKAGE && inner.rows > 5 && !self.0.temp_history.is_empty() {
+            paint::telemetry_label(&mut grid, inner);
         }
         Emitter::default().emit(
             &grid,
@@ -622,20 +633,37 @@ impl TabView for ThermalView<'_> {
                 let count = paint::history_into(sensor, spark_width, &mut ordered);
                 let limit = sensor.crit_c.or(sensor.max_c).unwrap_or(100.0);
                 for sample in &mut ordered[..count] {
-                    *sample = (*sample / limit).clamp(0.0, 1.0);
+                    if sample.is_finite() {
+                        *sample = (*sample / limit).clamp(0.0, 1.0);
+                    }
                 }
-                crate::monitor::graphs::paint_sparkline(
-                    &ordered[..count],
-                    count,
-                    thegn_core::theme::RampId::Temp,
-                    Rect {
-                        x: spark_x.saturating_add(spark_width.saturating_sub(count)),
-                        y: rect.y.saturating_add(inner.y).saturating_add(index + 1),
-                        cols: count,
-                        rows: 1,
-                    },
-                    surface,
-                );
+                let row_y = rect.y.saturating_add(inner.y).saturating_add(index + 1);
+                let mut run_start = 0;
+                while run_start < count {
+                    while run_start < count && !ordered[run_start].is_finite() {
+                        run_start += 1;
+                    }
+                    let mut run_end = run_start;
+                    while run_end < count && ordered[run_end].is_finite() {
+                        run_end += 1;
+                    }
+                    if run_start < run_end {
+                        let offset = spark_width.saturating_sub(count).saturating_add(run_start);
+                        crate::monitor::graphs::paint_sparkline(
+                            &ordered[run_start..run_end],
+                            run_end - run_start,
+                            thegn_core::theme::RampId::Temp,
+                            Rect {
+                                x: spark_x.saturating_add(offset),
+                                y: row_y,
+                                cols: run_end - run_start,
+                                rows: 1,
+                            },
+                            surface,
+                        );
+                    }
+                    run_start = run_end.saturating_add(1);
+                }
             }
         }
     }
