@@ -277,7 +277,7 @@ fn deterministic_snapshots_cover_sizes_capabilities_and_demand() {
                     assert_eq!(output.matches("composite").count(), 1);
                     if cols == 240 {
                         assert!(
-                            // Batch 47 floor: real sensor-limit bars and history content define occupancy.
+                            // density follow-up in batch 47 (wiring lane)
                             fill_ratio(&surface, area) >= 0.30,
                             "fill ratio {:.3}",
                             fill_ratio(&surface, area)
