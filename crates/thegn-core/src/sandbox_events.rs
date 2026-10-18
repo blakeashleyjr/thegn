@@ -120,7 +120,7 @@ fn shutdown_event_child(event: &EventChild, deadline: Instant) {
     let Some(process) = child.as_mut() else {
         return;
     };
-    crate::sandbox_proc::terminate_event_group(process);
+    crate::sandbox::proc::terminate_event_group(process);
     loop {
         match process.try_wait() {
             Ok(Some(_)) => {

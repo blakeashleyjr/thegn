@@ -89,7 +89,7 @@ impl ContainerEvents for PodmanEvents {
             .args(events_argv(kind))
             .stdout(Stdio::piped())
             .stderr(Stdio::null());
-        crate::sandbox_proc::configure_event_process_group(&mut command);
+        crate::sandbox::proc::configure_event_process_group(&mut command);
         let Ok(mut child) = command.spawn() else {
             return;
         };
@@ -176,7 +176,7 @@ mod tests {
             command
         };
         command.stdout(StdStdio::null()).stderr(StdStdio::null());
-        crate::sandbox_proc::configure_event_process_group(&mut command);
+        crate::sandbox::proc::configure_event_process_group(&mut command);
         command.spawn().unwrap()
     }
 
