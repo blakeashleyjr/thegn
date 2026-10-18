@@ -64,6 +64,11 @@ Recipes:
 <host-tag>.idle.json`; host-tag = arch + cpu-model hash, so machine dependence is
   explicit).
 - `just bench-steady` — feeds `test/perf/scenarios/steady-workload.keys`; A/B only.
+  Workload keys go through the harness PTY; the run fails with
+  `FAIL: key injection had no observable effect` if no key dispatch is logged.
+  `TG_PERF_DROP_KEYS=1` is the negative control. Result JSON includes `input`
+  (null for idle). The environment drops inherited `THEGN_*` and credential
+  variables while keeping `TG_PERF_*`; soak-daemon binds its own daemon socket.
 
 The fixture (`lib/fixture.sh`) and the Rust bench fixture
 (`crates/thegn-svc/benches/support/fixture.rs`) build the same layout — keep
