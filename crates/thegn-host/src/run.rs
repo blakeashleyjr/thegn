@@ -912,7 +912,9 @@ pub async fn main(
 
     // Startup orphan GC: remove any thegn containers whose worktrees no
     // longer exist in the DB. Best-effort; runs off-thread so launch is instant.
-    if crate::sandbox_gc_gate::startup_gc_wanted(&cfg) {
+    {
+        let gc_wanted_without_repo_overlay = crate::sandbox_gc_gate::startup_gc_wanted(&cfg);
+        let startup_gc_cfg = cfg.clone();
         tokio::task::spawn_blocking(move || {
             let Ok(db) = thegn_core::db::Db::open() else {
                 return;
@@ -926,6 +928,16 @@ pub async fn main(
                 tracing::warn!(target: "thegn::sandbox", "orphan GC skipped: worktrees query failed");
                 return;
             };
+            let repo_roots = rows.iter().map(|row| std::path::Path::new(&row.repo_root));
+            if !gc_wanted_without_repo_overlay
+                && !crate::sandbox_gc_gate::repo_overlay_wants_startup_gc(
+                    &startup_gc_cfg,
+                    repo_roots,
+                )
+            {
+                tracing::debug!(target: "thegn::sandbox", "orphan GC skipped: sandbox disabled");
+                return;
+            }
             let db_worktrees: Vec<String> = rows.into_iter().map(|r| r.worktree).collect();
             let removed = thegn_core::sandbox::run_gc(&db_worktrees);
             if !removed.is_empty() {
@@ -940,8 +952,6 @@ pub async fn main(
                 let _ = STARTUP_ORPHANS_REMOVED.set(removed); // best-effort: first-set-wins: the notice renders once
             }
         });
-    } else {
-        tracing::debug!(target: "thegn::sandbox", "orphan GC skipped: sandbox disabled");
     }
 
     // Config reload events ride a tokio channel so the loop drains them on wake;
@@ -14685,8 +14695,7 @@ async fn event_loop<T: Terminal>(
             monitor.is_some(),
             monitor.as_ref().is_some_and(|m| m.shows_containers()),
             sandbox_section_now,
-            thegn_core::sandbox::Backend::parse(&model.active_sandbox_backend)
-                .is_some_and(|b| b.is_oci()),
+            crate::sandbox_gc_gate::active_oci_wanted(&cfg, &model.active_sandbox_backend),
         );
         container_demand.store(
             container_demand_now.signal(),
