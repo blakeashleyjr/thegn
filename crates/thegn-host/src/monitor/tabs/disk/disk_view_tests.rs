@@ -24,8 +24,10 @@ use thegn_metrics::collect::{
 };
 
 fn frame_fixture() -> MonitorFrame {
-    let mut frame = MonitorFrame::default();
-    frame.dt_ms = 1000;
+    let mut frame = MonitorFrame {
+        dt_ms: 1000,
+        ..MonitorFrame::default()
+    };
     frame.health[CollectorId::Diskstats.index()] = Health::Ok;
     frame.parts.diskstats.physical = 8;
     frame.health[CollectorId::Filesystems.index()] = Health::Ok;
@@ -576,8 +578,8 @@ fn per_device_histories_follow_identity_across_reordering_and_missing_sides() {
         .expect("device identity retained");
     let mut values = [0.0; super::HISTORY];
     let first_read_len = first.read.copy_ordered(&mut values);
-    assert!(values[first_read_len - 1].is_nan());
-    assert_eq!(values[first_read_len - 2], 71_000.0);
+    assert_eq!(values[first_read_len - 1], 71_000.0);
+    assert_eq!(values[first_read_len - 2], 4_500_000.0);
     let first_write_len = first.write.copy_ordered(&mut values);
     assert!(values[first_write_len - 1].is_nan());
     assert_eq!(values[first_write_len - 2], 570_000.0);
@@ -586,6 +588,7 @@ fn per_device_histories_follow_identity_across_reordering_and_missing_sides() {
     assert_eq!(values[second_read_len - 2], 3_000_000.0);
     let second_write_len = second.write.copy_ordered(&mut values);
     assert_eq!(values[second_write_len - 1], 83_000.0);
+    assert_eq!(values[second_write_len - 2], 350_000.0);
     assert!(
         model
             .device_history
