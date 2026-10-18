@@ -13,14 +13,14 @@ use crate::seg::Tok;
 use thegn_core::numfmt::{NumFmt, Reading, Unit};
 use thegn_core::theme::Hue;
 
-pub(super) struct ProcDisplay<'a> {
-    pub(super) filter: &'a str,
-    pub(super) filtering: bool,
-    pub(super) tree: bool,
-    pub(super) sort: ProcSort,
-    pub(super) desc: bool,
-    pub(super) invalid_terms: &'a [procs_view::procs_query::InvalidTerm],
-    pub(super) primed: bool,
+pub(in crate::monitor) struct ProcDisplay<'a> {
+    pub(in crate::monitor) filter: &'a str,
+    pub(in crate::monitor) filtering: bool,
+    pub(in crate::monitor) tree: bool,
+    pub(in crate::monitor) sort: ProcSort,
+    pub(in crate::monitor) desc: bool,
+    pub(in crate::monitor) invalid_terms: &'a [procs_view::procs_query::InvalidTerm],
+    pub(in crate::monitor) primed: bool,
 }
 
 pub(in crate::monitor) fn procs(
