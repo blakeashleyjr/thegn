@@ -16,6 +16,7 @@ pub mod softirqs;
 pub mod softnet;
 pub mod stat;
 pub mod swaps;
+pub mod tcp_proc;
 pub mod upower_history;
 pub mod uptime;
 pub mod vmstat;
