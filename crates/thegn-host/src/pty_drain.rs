@@ -57,10 +57,10 @@ pub(crate) const CRASH_THRESHOLD: Duration = Duration::from_secs(2);
 /// remote" halt on the immediate respawn. Cheap resolution mirroring
 /// `env_halt_reason` (DB effective-env; no network); a no-op for local/host panes
 /// and for the WSS-native providers (whose in-process relay reports its own health).
-fn report_pane_connect_failure(cfg: &thegn_core::config::Config, wt: &str) {
+fn report_pane_connect_failure(cfg: &thegn_core::config::Config, wt: &str, known_local: bool) {
     use std::path::{Path, PathBuf};
     use thegn_core::store::WorkspaceStore;
-    if wt.is_empty() {
+    if wt.is_empty() || known_local {
         return;
     }
     let loc = thegn_core::remote::GitLoc::for_worktree(Path::new(wt));
@@ -1188,7 +1188,14 @@ fn handle_exit(ctx: &mut DrainCtx<'_>, id: u32, exit_code: Option<i32>) -> bool 
         if failed && age < CRASH_THRESHOLD {
             // Resolve with the SAME config the respawn's `env_halt_reason` uses
             // (`keymap_config`), so the mark and the halt check agree.
-            report_pane_connect_failure(ctx.keymap_config, &ctx.session.worktrees[gi].path);
+            let worktree = &ctx.session.worktrees[gi].path;
+            // Hydration already resolved the active worktree's placement. A
+            // local/host placement needs no provider health mark, so skip the
+            // DB-backed lookup entirely on this fast-fail loop path.
+            let known_local = gi == ctx.session.active
+                && (ctx.model.active_placement_kind.is_none()
+                    || crate::agent::force_host_requested(worktree));
+            report_pane_connect_failure(ctx.keymap_config, worktree, known_local);
         }
         {
             let wt = ctx.session.worktrees[gi].path.clone();
@@ -1680,6 +1687,23 @@ mod tests {
     use thegn_core::db::Db;
     use thegn_core::issue::{AgentDispatchStatus, DispatchRunRef, NewDispatch};
     use thegn_core::store::NotificationStore;
+
+    #[test]
+    fn local_fast_exit_respawns_do_not_open_the_database() {
+        let state = thegn_core::testenv::IsolatedState::new();
+        let cfg = thegn_core::config::Config::default();
+        let worktree = state.root().join("local-worktree");
+        let worktree = worktree.to_string_lossy().into_owned();
+
+        for _ in 0..8 {
+            report_pane_connect_failure(&cfg, &worktree, true);
+        }
+
+        assert!(
+            !state.state_home().join("thegn/thegn.db").exists(),
+            "local fast-fail cycles must skip DB-backed provider resolution"
+        );
+    }
 
     fn running_dispatch(db: &Db) -> (i64, DispatchRunRef) {
         let id = db

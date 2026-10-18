@@ -46,6 +46,7 @@ struct SiteEntry {
     file: &'static str,
     line: u32,
     calls: u64,
+    overestimate: u64,
     max_us: u64,
 }
 
@@ -77,6 +78,7 @@ impl SiteTable {
             file: location.file(),
             line: location.line(),
             calls: 1,
+            overestimate: 0,
             max_us: micros,
         };
         if let Some(slot) = self.entries.iter_mut().find(|entry| entry.is_none()) {
@@ -84,16 +86,21 @@ impl SiteTable {
             return;
         }
 
-        // Keep the most frequently observed sites. This lets a repeated hot
-        // call site displace one-off startup sites without growing the table.
+        // Space-Saving replacement keeps observing new hot sites after startup
+        // has filled the fixed table. The displaced minimum is the error bound
+        // for the replacement site's estimated count.
         if let Some(slot) = self
             .entries
             .iter_mut()
             .flatten()
             .min_by_key(|entry| entry.calls)
-            && slot.calls <= 1
         {
-            *slot = new_entry;
+            let minimum = slot.calls;
+            *slot = SiteEntry {
+                calls: minimum.saturating_add(1),
+                overestimate: minimum,
+                ..new_entry
+            };
         }
     }
 }
@@ -143,7 +150,7 @@ pub struct OpenStats {
     /// waiting out the 5s `busy_timeout` averages away against thousands of
     /// fast ones, while being a five-second freeze.
     pub max_us: u64,
-    /// Fixed-size call-site counts, ordered by slot rather than frequency.
+    /// Fixed-size call-site counts since process start, ordered by slot.
     pub sites: [Option<OpenSiteStats>; SITE_CAPACITY],
 }
 
@@ -156,6 +163,8 @@ pub struct OpenSiteStats {
     pub line: u32,
     /// Opens recorded at this site.
     pub calls: u64,
+    /// Maximum count contributed by evicted sites.
+    pub overestimate: u64,
     /// Worst open at this site, microseconds.
     pub max_us: u64,
 }
@@ -184,20 +193,21 @@ pub fn snapshot() -> OpenStats {
                     file: entry.file,
                     line: entry.line,
                     calls: entry.calls,
+                    overestimate: entry.overestimate,
                     max_us: entry.max_us,
                 })
             }),
     };
     tracing::debug!(
         target: "thegn::perf",
-        db_open_loop_top_sites = ?stats.top_sites(),
+        db_open_loop_top_sites_since_start = ?stats.top_sites(),
         "loop-thread database open call sites"
     );
     stats
 }
 
 impl OpenStats {
-    /// The three most frequently observed call sites, for rollup logging.
+    /// The three most frequently observed call sites since process start.
     pub fn top_sites(self) -> [Option<OpenSiteStats>; 3] {
         let mut top: [Option<OpenSiteStats>; 3] = [None; 3];
         for site in self.sites.into_iter().flatten() {
@@ -287,25 +297,71 @@ mod tests {
     }
 
     #[test]
-    fn hot_site_displaces_one_off_entries_when_table_is_full() {
+    fn repeated_site_displaces_startup_entries_when_table_is_full() {
         let location = Location::caller();
         let mut table = SiteTable::new();
         for (index, slot) in table.entries.iter_mut().enumerate() {
             *slot = Some(SiteEntry {
                 file: "startup.rs",
                 line: index as u32,
-                calls: 1,
+                calls: 2,
+                overestimate: 0,
                 max_us: 1,
             });
         }
-        table.record(location, 10);
+        for _ in 0..3 {
+            table.record(location, 10);
+        }
 
-        assert!(
-            table
-                .entries
-                .iter()
-                .flatten()
-                .any(|entry| { entry.file == location.file() && entry.line == location.line() })
+        let site = table
+            .entries
+            .iter()
+            .flatten()
+            .find(|entry| entry.file == location.file() && entry.line == location.line())
+            .expect("repeated call site should be retained");
+        assert_eq!(site.calls, 5);
+        assert_eq!(site.overestimate, 2);
+    }
+
+    #[test]
+    fn top_sites_orders_counts_with_stable_ties_and_fewer_than_three() {
+        let mut stats = OpenStats::default();
+        stats.sites[0] = Some(OpenSiteStats {
+            file: "a.rs",
+            line: 1,
+            calls: 4,
+            overestimate: 0,
+            max_us: 0,
+        });
+        stats.sites[1] = Some(OpenSiteStats {
+            file: "b.rs",
+            line: 2,
+            calls: 8,
+            overestimate: 0,
+            max_us: 0,
+        });
+        assert_eq!(stats.top_sites()[0].map(|site| site.file), Some("b.rs"));
+        assert_eq!(stats.top_sites()[1].map(|site| site.file), Some("a.rs"));
+        assert!(stats.top_sites()[2].is_none());
+
+        stats.sites[2] = Some(OpenSiteStats {
+            file: "c.rs",
+            line: 3,
+            calls: 8,
+            overestimate: 0,
+            max_us: 0,
+        });
+        stats.sites[3] = Some(OpenSiteStats {
+            file: "d.rs",
+            line: 4,
+            calls: 6,
+            overestimate: 0,
+            max_us: 0,
+        });
+        let top = stats.top_sites();
+        assert_eq!(
+            top.map(|site| site.map(|site| site.file)),
+            [Some("b.rs"), Some("c.rs"), Some("d.rs")]
         );
     }
 }
