@@ -4,13 +4,6 @@ use std::cmp::Ordering;
 
 /// A term rejected by the query parser or unavailable in the sampled row.
 #[derive(Debug, Clone, PartialEq, Eq)]
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "header display of invalid terms lands in batch 47 (tabs/procs.rs)"
-    )
-)]
 pub(in crate::monitor) struct InvalidTerm {
     pub text: String,
     pub reason: &'static str,
