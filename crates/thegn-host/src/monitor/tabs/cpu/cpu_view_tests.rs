@@ -278,7 +278,9 @@ fn snapshots_cover_sizes_capabilities_demand_absence_and_fill() {
                 assert!(!demand.collectors.contains(CollectorId::CpuSched));
             }
             if cols >= 160 {
+                assert!(placed.iter().any(|panel| panel.id == IRQ));
                 assert!(rendered.contains("2400MHz"));
+                assert!(rendered.contains("TIMER"));
                 assert!(rendered.contains("io 7% st 2%"));
             }
             if cols == 240 {
@@ -295,7 +297,6 @@ fn snapshots_cover_sizes_capabilities_demand_absence_and_fill() {
     let mut surface = Surface::new(160, 45);
     Board::default().paint(&absent_view, &mut surface, Rect::full(160, 45), 0, &[]);
     let rendered = lines(&surface).join("\n");
-    assert!(rendered.contains("TIMER"));
     assert!(rendered.contains(caps::active_glyphs().emdash));
     assert!(!rendered.contains(caps::glyph(Glyph::Lock)));
     assert!(!rendered.contains("0MHz"));
