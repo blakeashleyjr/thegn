@@ -178,6 +178,13 @@ fn snapshot_sizes_capabilities_demand_and_absent_marks() {
         } else {
             17_400 + ((index % 8) as u32) * 250
         });
+        let rail_periods = [5_usize, 7, 9, 11];
+        let rail_bases = [9_000_u32, 2_000, 3_000, 20_000];
+        let metrics = &mut frame.parts.amd_smu.cards[0].metrics;
+        metrics.power_apu = Some(rail_bases[0] + (index % rail_periods[0]) as u32 * 250);
+        metrics.power_gfx = Some(rail_bases[1] + (index % rail_periods[1]) as u32 * 250);
+        metrics.power_all_core = Some(rail_bases[2] + (index % rail_periods[2]) as u32 * 250);
+        metrics.power_sys = Some(rail_bases[3] + (index % rail_periods[3]) as u32 * 250);
         for (zone_index, zone) in frame.parts.powercap.zones.iter_mut().enumerate() {
             let periods = [7_usize, 11, 13, 17];
             let bases = [18.0_f32, 8.0, 2.0, 3.0];
@@ -225,9 +232,36 @@ fn snapshot_sizes_capabilities_demand_and_absent_marks() {
                     let mut surface = Surface::new(cols, rows);
                     let board = Board::default();
                     let placed = board.placed(&view, area);
+                    let rails_rect = placed
+                        .iter()
+                        .find(|panel| panel.id.0 == "power.rails")
+                        .expect("rails panel is placed")
+                        .rect;
                     board.paint(&view, &mut surface, area, 0, &[]);
                     let output = text(&mut surface);
                     assert!(output.contains("Power rails"));
+                    if cols < 240 {
+                        let graph_left = rails_rect.x + 1;
+                        let graph_right = rails_rect.x + rails_rect.cols - 2;
+                        let socket_row = output
+                            .lines()
+                            .position(|line| {
+                                line.get(graph_left..)
+                                    .is_some_and(|tail| tail.starts_with("socket "))
+                            })
+                            .expect("socket graph label is drawn");
+                        assert!(
+                            surface.screen_lines()[socket_row + 1]
+                                .visible_cells()
+                                .any(|cell| {
+                                    cell.cell_index() == graph_right
+                                        && !cell.str().is_empty()
+                                        && cell.str() != " "
+                                        && cell.str() != "\u{2800}"
+                                }),
+                            "compact socket band needs a plotted row"
+                        );
+                    }
                     assert!(output.contains("BAT1"));
                     assert!(output.contains("17.40 W"));
                     assert!(output.contains("battery draw peak"));
@@ -243,8 +277,7 @@ fn snapshot_sizes_capabilities_demand_and_absent_marks() {
                     assert_eq!(board.demand(&view, area, 1000).collectors, expected);
                     if cols == 240 {
                         let r = fill_ratio(&surface, area);
-                        // density follow-up (batch 50, THE-888): measured 0.196 Unicode, 0.248 ASCII; per-rail and
-                        // powercap history rings are deferred, so the floor stays honest.
+                        // density follow-up (batch 51): estimated, primary sets from the printed value
                         if unicode == UnicodeLevel::Ascii {
                             assert!(r >= 0.24, "ASCII fill ratio {r:.3}, floor 0.24");
                         } else {
@@ -328,13 +361,380 @@ fn history_graph_right_aligns_short_series_and_stapm_overage_is_labeled() {
         .metrics
         .power_current_stapm_limit = Some(30);
     model.absorb_frame(&frame);
-    assert_eq!(model.history.last(), Some(&45.0));
+    assert_eq!(model.rail_history[0].last(), Some(&45.0));
     assert_eq!(super::rail_ceiling(&model), 30.0);
     let view = PowerView(&model);
     let mut surface = Surface::new(240, 60);
     Board::default().paint(&view, &mut surface, Rect::full(240, 60), 0, &[]);
     let output = text(&mut surface);
     assert!(output.contains("30 W STAPM; peak 45 W"));
+}
+
+#[test]
+fn powercap_zone_histories_follow_identity_when_source_order_changes() {
+    let mut model = PowerModel::default();
+    let mut frame = fixture();
+    for (index, zone) in frame.parts.powercap.zones.iter_mut().enumerate() {
+        zone.watts = Some((index + 1) as f32);
+    }
+    model.absorb_frame(&frame);
+    let original_core_len = model
+        .zones
+        .iter()
+        .find(|row| row.domain == Some(PowerDomain::Core))
+        .expect("core zone exists")
+        .history
+        .len();
+    frame.at_ms += 1_000;
+    frame.parts.powercap.zones.swap(1, 3);
+    frame
+        .parts
+        .powercap
+        .zones
+        .retain(|zone| zone.domain != PowerDomain::Core);
+    for zone in &mut frame.parts.powercap.zones {
+        zone.watts = Some(match zone.domain {
+            PowerDomain::Package => 11.0,
+            PowerDomain::Core => 22.0,
+            PowerDomain::Uncore => 33.0,
+            PowerDomain::Dram => 44.0,
+            PowerDomain::Psys | PowerDomain::Other => 55.0,
+        });
+    }
+    model.absorb_frame(&frame);
+    for (domain, expected) in [
+        (PowerDomain::Package, 11.0),
+        (PowerDomain::Uncore, 33.0),
+        (PowerDomain::Dram, 44.0),
+    ] {
+        let row = model
+            .zones
+            .iter()
+            .find(|row| row.domain == Some(domain))
+            .expect("zone identity retained");
+        assert!(row.active);
+        assert_eq!(row.history.last(), Some(&expected));
+    }
+    let dormant_core = model
+        .zones
+        .iter()
+        .find(|row| row.domain == Some(PowerDomain::Core))
+        .expect("dormant core slot retained");
+    assert!(!dormant_core.active);
+    assert_eq!(dormant_core.history.len(), original_core_len);
+    frame.at_ms += 1_000;
+    frame.parts.powercap.zones.push(PowercapZone {
+        name: Arc::from("core"),
+        domain: PowerDomain::Core,
+        watts: Some(22.0),
+        energy_uj: Some(20_000_000),
+    });
+    frame.parts.powercap.zones.reverse();
+    model.absorb_frame(&frame);
+    let restored_core = model
+        .zones
+        .iter()
+        .find(|row| row.domain == Some(PowerDomain::Core))
+        .expect("core identity restored");
+    assert!(restored_core.active);
+    assert_eq!(restored_core.history.len(), original_core_len + 1);
+    assert_eq!(restored_core.history.last(), Some(&22.0));
+}
+
+#[test]
+fn full_zone_slots_match_present_identities_before_reusing_a_dormant_slot() {
+    let mut frame = fixture();
+    frame.parts.powercap.zones.clear();
+    for index in 0..super::INSTANCE_CAP {
+        frame.parts.powercap.zones.push(PowercapZone {
+            name: Arc::from(format!("zone-{index}")),
+            domain: PowerDomain::Package,
+            watts: Some(index as f32 + 1.0),
+            energy_uj: None,
+        });
+    }
+    let mut model = PowerModel::default();
+    model.absorb_frame(&frame);
+
+    frame.at_ms += 1_000;
+    frame.parts.powercap.zones.remove(7);
+    for (index, zone) in frame.parts.powercap.zones.iter_mut().enumerate() {
+        zone.watts = Some(100.0 + index as f32);
+    }
+    model.absorb_frame(&frame);
+    let expected_present = frame
+        .parts
+        .powercap
+        .zones
+        .iter()
+        .map(|zone| (zone.name.to_string(), zone.watts.expect("watts present")))
+        .collect::<Vec<_>>();
+
+    frame.at_ms += 1_000;
+    frame.parts.powercap.zones.insert(
+        0,
+        PowercapZone {
+            name: Arc::from("new-zone"),
+            domain: PowerDomain::Package,
+            watts: Some(65.0),
+            energy_uj: None,
+        },
+    );
+    for (index, zone) in frame.parts.powercap.zones.iter_mut().skip(1).enumerate() {
+        zone.watts = Some(200.0 + index as f32);
+    }
+    model.absorb_frame(&frame);
+
+    for (index, zone) in frame.parts.powercap.zones.iter().skip(1).enumerate() {
+        let row = model
+            .zones
+            .iter()
+            .find(|row| row.name == zone.name.as_ref())
+            .expect("present zone retains its identity");
+        assert!(row.active);
+        assert_eq!(row.history.last(), Some(&(200.0 + index as f32)));
+        let previous = expected_present
+            .iter()
+            .find(|(name, _)| name == zone.name.as_ref())
+            .map(|(_, watts)| *watts)
+            .expect("previous identity recorded");
+        assert_eq!(row.history.get(row.history.len() - 2), Some(&previous));
+    }
+    let new_zone = model
+        .zones
+        .iter()
+        .find(|row| row.name == "new-zone")
+        .expect("new zone occupies the dormant slot");
+    assert_eq!(new_zone.history, [65.0]);
+}
+
+#[test]
+fn power_rail_scale_includes_powercap_only_draw_and_hides_stale_smu_rings() {
+    let mut frame = fixture();
+    frame.parts.amd_smu.cards.clear();
+    frame.parts.powercap.zones = vec![PowercapZone {
+        name: Arc::from("package-65w"),
+        domain: PowerDomain::Package,
+        watts: Some(65.0),
+        energy_uj: None,
+    }];
+    let mut model = PowerModel::default();
+    model.absorb_frame(&frame);
+    let ceiling = super::rail_ceiling(&model);
+    assert!(ceiling >= 70.0, "powercap-only rail ceiling {ceiling}");
+    assert!(
+        model.zones[0]
+            .history
+            .iter()
+            .all(|watts| watts / ceiling <= 1.0)
+    );
+    let output = {
+        let mut surface = Surface::new(240, 60);
+        Board::default().paint(
+            &PowerView(&model),
+            &mut surface,
+            Rect::full(240, 60),
+            0,
+            &[],
+        );
+        text(&mut surface)
+    };
+    assert!(output.contains("Power rails (70 W max)"));
+
+    let mut amd_frame = fixture();
+    model = PowerModel::default();
+    model.absorb_frame(&amd_frame);
+    amd_frame.at_ms += 1_000;
+    amd_frame.parts.amd_smu.cards.clear();
+    model.absorb_frame(&amd_frame);
+    assert!(model.rail_history.iter().all(Vec::is_empty));
+    let mut surface = Surface::new(240, 60);
+    Board::default().paint(
+        &PowerView(&model),
+        &mut surface,
+        Rect::full(240, 60),
+        0,
+        &[],
+    );
+    assert!(!text(&mut surface).contains("socket "));
+}
+
+#[test]
+fn warmed_power_and_telemetry_rings_keep_capacity_over_one_thousand_absorbs() {
+    let mut model = PowerModel::default();
+    let mut frame = fixture();
+    let mut telemetry = TelemetryHistory::default();
+    for tick in 0..8_u64 {
+        telemetry.push(
+            &thegn_metrics::StatsSnapshot {
+                battery: Some((40 + tick as u8, false)),
+                battery_power_w: Some(2.0 + tick as f32),
+                ..thegn_metrics::StatsSnapshot::default()
+            },
+            tick * 1_000,
+        );
+    }
+    for tick in 0..1_000_u64 {
+        frame.at_ms = tick * 1_000;
+        frame.parts.amd_smu.cards[0].metrics.power_socket = Some(12_000 + tick as u32 % 9_000);
+        for (index, zone) in frame.parts.powercap.zones.iter_mut().enumerate() {
+            zone.watts = Some(index as f32 + (tick % 7) as f32 * 0.1);
+        }
+        model.absorb_frame(&frame);
+        model.absorb_history(
+            &telemetry,
+            crate::telemetry::Window::default(),
+            crate::telemetry::ScaleMode::Window,
+            7_000,
+        );
+    }
+    let capacities = (
+        model.rail_history[0].capacity(),
+        model.rail_history.each_ref().map(Vec::capacity),
+        model
+            .zones
+            .iter()
+            .map(|row| row.history.capacity())
+            .collect::<Vec<_>>(),
+        model.telemetry_battery_history.capacity(),
+        model.telemetry_battery_power_history.capacity(),
+    );
+    let series_storage = model.series_storage();
+    let (_, allocations) = crate::proc_workload_alloc::measure(|| {
+        for tick in 1_000..2_000_u64 {
+            frame.at_ms = tick * 1_000;
+            frame.parts.amd_smu.cards[0].metrics.power_socket = Some(12_000 + tick as u32 % 9_000);
+            model.absorb_frame(&frame);
+            model.absorb_history(
+                &telemetry,
+                crate::telemetry::Window::default(),
+                crate::telemetry::ScaleMode::Window,
+                7_000,
+            );
+        }
+    });
+    assert_eq!(
+        (allocations.allocation_calls, allocations.realloc_calls),
+        (0, 0),
+        "warmed Power and SeriesBuf absorbs allocated: {allocations:?}"
+    );
+    assert_eq!(
+        (
+            model.rail_history[0].capacity(),
+            model.rail_history.each_ref().map(Vec::capacity),
+            model
+                .zones
+                .iter()
+                .map(|row| row.history.capacity())
+                .collect::<Vec<_>>(),
+            model.telemetry_battery_history.capacity(),
+            model.telemetry_battery_power_history.capacity(),
+        ),
+        capacities,
+        "warmed Power ring capacity changed after 1,000 absorbs"
+    );
+    assert_eq!(
+        model.series_storage(),
+        series_storage,
+        "SeriesBuf storage moved after warm-up"
+    );
+}
+
+#[test]
+fn absent_battery_keeps_power_rails_and_policy_visible() {
+    let mut frame = fixture();
+    frame
+        .parts
+        .power_supply
+        .supplies
+        .retain(|supply| supply.kind != SupplyKind::Battery);
+    frame.health[CollectorId::PowerSupply.index()] = Health::Absent(Absent::NoHardware);
+    let mut model = PowerModel::default();
+    model.absorb_frame(&frame);
+    let view = PowerView(&model);
+    let mut surface = Surface::new(160, 45);
+    Board::default().paint(&view, &mut surface, Rect::full(160, 45), 0, &[]);
+    let output = text(&mut surface);
+    assert!(output.contains("battery"));
+    assert!(output.contains(caps::active_glyphs().emdash));
+    assert!(output.contains("Power rails"));
+    assert!(output.contains("socket"));
+    assert!(output.contains("Power policy"));
+    assert!(output.contains("profile balanced"));
+}
+
+#[test]
+fn newest_powercap_and_amd_rail_samples_reach_the_last_graph_column() {
+    let mut model = PowerModel::default();
+    let mut frame = fixture();
+    for tick in 0..HISTORY_SEED as u32 {
+        frame.at_ms += 1_000;
+        frame.parts.amd_smu.cards[0].metrics.power_socket = Some(10_000 + tick * 1_000);
+        frame.parts.amd_smu.cards[0].metrics.power_apu = Some(8_000 + tick * 500);
+        frame.parts.amd_smu.cards[0].metrics.power_all_core = Some(5_000 + tick * 400);
+        frame.parts.amd_smu.cards[0].metrics.power_gfx = Some(1_000 + tick * 200);
+        frame.parts.amd_smu.cards[0].metrics.power_sys = Some(20_000 + tick * 1_000);
+        for (index, zone) in frame.parts.powercap.zones.iter_mut().enumerate() {
+            zone.watts = Some(2.0 + index as f32 + tick as f32 * 0.4);
+        }
+        model.absorb_frame(&frame);
+    }
+    let view = PowerView(&model);
+    let area = Rect::full(240, 60);
+    let board = Board::default();
+    let rails = board
+        .placed(&view, area)
+        .into_iter()
+        .find(|panel| panel.id.0 == "power.rails")
+        .expect("rails panel is placed");
+    let graph_right = rails.rect.x + rails.rect.cols - 2;
+    let graph_left = rails.rect.x + 1;
+    let graph_top = rails.rect.y + 1;
+    let mut surface = Surface::new(240, 60);
+    test_override::with_unicode(UnicodeLevel::Full, || {
+        board.paint(&view, &mut surface, area, 0, &[])
+    });
+    let output = text(&mut surface);
+    let output_lines = output.lines().collect::<Vec<_>>();
+    let lines = surface.screen_lines();
+    for label in [
+        "socket",
+        "APU",
+        "core",
+        "gfx",
+        "system",
+        "package-0",
+        "uncore",
+        "dram",
+    ] {
+        let matching_rows = output_lines
+            .iter()
+            .enumerate()
+            .skip(graph_top)
+            .filter(|(_, line)| {
+                line.get(graph_left..)
+                    .is_some_and(|tail| tail.starts_with(&format!("{label} ")))
+            })
+            .map(|(row, _)| row)
+            .collect::<Vec<_>>();
+        assert!(
+            !matching_rows.is_empty(),
+            "missing power graph label {label}"
+        );
+        for label_row in matching_rows {
+            assert!(
+                (label_row + 1..label_row + 3).any(|sample_row| {
+                    lines[sample_row].visible_cells().any(|cell| {
+                        cell.cell_index() == graph_right
+                            && !cell.str().is_empty()
+                            && cell.str() != " "
+                            && cell.str() != "\u{2800}"
+                    })
+                }),
+                "newest {label} sample should occupy last inner graph column"
+            );
+        }
+    }
 }
 
 #[test]
@@ -355,7 +755,7 @@ fn socket_ring_does_not_switch_to_package_power() {
     let mut model = PowerModel::default();
     model.absorb_frame(&frame);
     assert_eq!(model.socket_w, Some(18.0));
-    assert!(model.history.is_empty());
+    assert!(model.rail_history[0].is_empty());
     assert_eq!(model.zones[0].history, [18.0]);
     assert_eq!(model.zones[1].history, [8.0]);
 }
@@ -520,6 +920,28 @@ fn half_full_battery_energy_graph_uses_capacity_scale() {
 }
 
 #[test]
+fn telemetry_history_paints_finite_runs_without_turning_nan_into_a_bar() {
+    let values = [0.8, 0.7, f32::NAN, 0.6, 0.9];
+    let mut surface = Surface::new(values.len(), 4);
+    test_override::with_unicode(UnicodeLevel::Ascii, || {
+        super::paint_history_runs(&values, Rect::full(values.len(), 4), &mut surface);
+    });
+    let has_ink = |column| {
+        surface.screen_lines().iter().any(|line| {
+            line.visible_cells().any(|cell| {
+                cell.cell_index() == column && !cell.str().is_empty() && cell.str() != " "
+            })
+        })
+    };
+    assert!(has_ink(0), "finite run before NaN is painted");
+    assert!(
+        !has_ink(2),
+        "NaN gap remains blank instead of becoming a minimum bar"
+    );
+    assert!(has_ink(4), "finite run after NaN is painted");
+}
+
+#[test]
 fn rail_histories_follow_identity_when_powercap_zones_reorder() {
     let mut frame = fixture();
     let mut model = PowerModel::default();
@@ -620,7 +1042,7 @@ fn demand_is_static_for_each_panel_and_history_reuses_capacity_after_warmup() {
         ),
         capacities
     );
-    assert_eq!(model.history.len(), super::HISTORY_CAP);
+    assert_eq!(model.rail_history[0].len(), super::HISTORY_CAP);
     assert!(model.batteries.iter().all(|battery| {
         battery.charge_history.capacity() == super::HISTORY_CAP
             && battery.energy_history.capacity() == super::HISTORY_CAP

@@ -126,7 +126,7 @@ pub(super) fn paint_battery(grid: &mut CellGrid, rect: Rect, model: &PowerModel)
 }
 pub(super) fn paint_rails(grid: &mut CellGrid, rect: Rect, model: &PowerModel) {
     let values = [
-        ("socket", model.socket_w),
+        ("socket", model.rail_current[0]),
         ("APU", model.apu_w),
         ("core", model.core_w),
         ("gfx", model.gfx_w),
@@ -149,6 +149,9 @@ pub(super) fn paint_rails(grid: &mut CellGrid, rect: Rect, model: &PowerModel) {
     for (label, value) in values {
         if row >= rect.rows {
             break;
+        }
+        if label == "socket" && value.is_none() {
+            continue;
         }
         put_line(
             grid,
@@ -175,7 +178,12 @@ pub(super) fn paint_rails(grid: &mut CellGrid, rect: Rect, model: &PowerModel) {
         );
         row += 1;
     }
-    for zone in model.zones.iter().take(rect.rows.saturating_sub(row)) {
+    for zone in model
+        .zones
+        .iter()
+        .filter(|zone| zone.active)
+        .take(rect.rows.saturating_sub(row))
+    {
         put_line(
             grid,
             rect,
