@@ -172,25 +172,25 @@ fn memory_history_right_aligns_two_samples_in_unicode_and_ascii() {
                 text.contains("VRAM used / total 0-100%")
             })
             .expect("VRAM history label rendered");
-        let graph_y = label_y + 1;
         let inner_left = memory.rect.x + 1;
         let inner_right = memory.rect.x + memory.rect.cols - 2;
-        let graph_cells = surface.screen_lines()[graph_y]
-            .visible_cells()
-            .map(|cell| (cell.cell_index(), cell.str().to_owned()))
-            .collect::<Vec<_>>();
-        let right_is_filled = graph_cells
-            .iter()
-            .find(|(x, _)| *x == inner_right)
-            .is_some_and(|(_, value)| !value.is_empty() && value != " " && value != "\u{2800}");
+        let graph_rows = (label_y + 1)..(memory.rect.y + memory.rect.rows - 1);
+        let lines = surface.screen_lines();
+        let blank = |value: &str| value.is_empty() || value == " " || value == "\u{2800}";
+        let cell_at = |y: usize, x: usize| {
+            lines[y]
+                .visible_cells()
+                .find(|cell| cell.cell_index() == x)
+                .map(|cell| cell.str().to_owned())
+                .unwrap_or_default()
+        };
+        // A low reading lights only the bottom graph row, so look at every row.
+        let right_is_filled = graph_rows.clone().any(|y| !blank(&cell_at(y, inner_right)));
         assert!(
             right_is_filled,
             "rightmost VRAM graph cell is blank: {level:?}"
         );
-        let left_is_blank = graph_cells
-            .iter()
-            .find(|(x, _)| *x == inner_left)
-            .is_none_or(|(_, value)| value.is_empty() || value == " " || value == "\u{2800}");
+        let left_is_blank = graph_rows.clone().all(|y| blank(&cell_at(y, inner_left)));
         assert!(
             left_is_blank,
             "short VRAM history was not right-aligned: {level:?}"
