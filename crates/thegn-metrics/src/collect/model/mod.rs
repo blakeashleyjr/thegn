@@ -11,6 +11,7 @@ pub mod cpu_stat;
 pub mod cpu_topology;
 pub mod diskstats;
 pub mod filesystems;
+pub mod gpu;
 pub mod hwmon;
 pub mod loadavg;
 pub mod meminfo;
