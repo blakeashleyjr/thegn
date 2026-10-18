@@ -432,7 +432,7 @@ pub(crate) fn queue_stopped_share_deletes(worktree: String, stopped: Vec<(u16, u
                     tracing::debug!(target: "thegn::db", %worktree, port, generation, "stale stopped share delete left another generation intact")
                 }
                 Err(error) => {
-                    tracing::debug!(target: "thegn::db", %error, "stopped share cache delete failed")
+                    tracing::warn!(target: "thegn::db", %error, "stopped share cache delete failed")
                 }
             }
         }

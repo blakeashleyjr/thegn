@@ -274,12 +274,20 @@ pub(crate) fn queue_pool_target_adjust(
     let tx = tx.clone();
     let waker = waker.clone();
     crate::db_task::persist_critical(move |db| {
-        let status = crate::handlers::provision::adjust_pool_target(db, &cfg, &wt, delta);
-        send_pool_target_result(status, |result| send_result(&tx, &waker, result));
+        run_pool_target_adjust(db, &cfg, &wt, delta, |result| {
+            send_result(&tx, &waker, result)
+        });
     });
 }
 
-fn send_pool_target_result(status: String, notify: impl FnOnce(PendingDbResult)) {
+fn run_pool_target_adjust(
+    db: &thegn_core::db::Db,
+    cfg: &thegn_core::config::Config,
+    wt: &str,
+    delta: i64,
+    notify: impl FnOnce(PendingDbResult),
+) {
+    let status = crate::handlers::provision::adjust_pool_target(db, cfg, wt, delta);
     notify(PendingDbResult::PoolTarget { status });
 }
 
@@ -743,20 +751,34 @@ mod tests {
 
     #[test]
     fn pool_target_result_is_sent_on_success_and_failure() {
+        use thegn_core::store::WorkspaceStore as _;
+
+        let db = thegn_core::db::Db::open_memory().unwrap();
+        db.put_worktree(
+            "repo/main",
+            "/repo",
+            "/remote/wt",
+            "main",
+            Some(r#"{"control_prefix":["provider"],"path":"/remote/wt"}"#),
+            None,
+        )
+        .unwrap();
+        let cfg = thegn_core::config::Config::default();
         let mut results = Vec::new();
-        send_pool_target_result("warm pool target: 1 spare(s)".into(), |result| {
-            results.push(result)
-        });
-        send_pool_target_result("warm pool: persist failed: locked".into(), |result| {
-            results.push(result)
-        });
+        run_pool_target_adjust(&db, &cfg, "/remote/wt", 1, |result| results.push(result));
         assert!(matches!(
             results.as_slice(),
-            [
-                PendingDbResult::PoolTarget { status: success },
-                PendingDbResult::PoolTarget { status: failure }
-            ] if success == "warm pool target: 1 spare(s)"
-                && failure == "warm pool: persist failed: locked"
+            [PendingDbResult::PoolTarget { status }]
+                if status == "warm pool target: 1 spare(s)"
+        ));
+
+        let db = thegn_core::db::Db::open_memory().unwrap();
+        let mut results = Vec::new();
+        run_pool_target_adjust(&db, &cfg, "/local/wt", 1, |result| results.push(result));
+        assert!(matches!(
+            results.as_slice(),
+            [PendingDbResult::PoolTarget { status }]
+                if status == "warm pool: only for provider (remote) workspaces"
         ));
     }
 }
