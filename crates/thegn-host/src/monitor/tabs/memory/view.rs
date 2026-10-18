@@ -160,6 +160,7 @@ pub(in crate::monitor) struct MemoryModel {
     page_in_kib_per_sec: Option<f64>,
     page_out_kib_per_sec: Option<f64>,
     prior_vm_counters: [Option<u64>; 5],
+    prior_vm_at_ms: Option<u64>,
     pub health: MemHealth,
     pub slice_current: Option<u64>,
     pub slice_high: Option<thegn_metrics::collect::model::cgroup::Limit>,
@@ -281,6 +282,7 @@ impl Default for MemoryModel {
             page_in_kib_per_sec: None,
             page_out_kib_per_sec: None,
             prior_vm_counters: [None; 5],
+            prior_vm_at_ms: None,
             health: mem_health::evaluate(&MemHealthInput::default()),
             slice_current: None,
             slice_high: None,
@@ -474,18 +476,27 @@ impl MemoryModel {
                 .filter(|value| value.is_finite() && *value >= 0.0)
                 .map_or(f32::NAN, |v| v as f32),
         );
-        let counters = [
-            vm.raw.get(VmField::Pgpgin),
-            vm.raw.get(VmField::Pgpgout),
-            vm.raw.get(VmField::ThpFaultAlloc),
-            vm.raw.get(VmField::ThpCollapseAlloc),
-            vm.raw.get(VmField::ThpSplitPage),
-        ];
+        let sampled_vmstat = frame.sampled.contains(CollectorId::Vmstat);
+        let counters = if sampled_vmstat {
+            [
+                vm.raw.get(VmField::Pgpgin),
+                vm.raw.get(VmField::Pgpgout),
+                vm.raw.get(VmField::ThpFaultAlloc),
+                vm.raw.get(VmField::ThpCollapseAlloc),
+                vm.raw.get(VmField::ThpSplitPage),
+            ]
+        } else {
+            [None; 5]
+        };
+        let elapsed_ms = self
+            .prior_vm_at_ms
+            .and_then(|prior_at_ms| frame.at_ms.checked_sub(prior_at_ms));
         let rates: [Option<f64>; 5] = std::array::from_fn(|index| {
-            let rate = counter_rate(counters[index], self.prior_vm_counters[index], frame.dt_ms);
+            let rate = counter_rate(counters[index], self.prior_vm_counters[index], elapsed_ms);
             self.prior_vm_counters[index] = counters[index];
             rate
         });
+        self.prior_vm_at_ms = sampled_vmstat.then_some(frame.at_ms);
         self.page_in_kib_per_sec = rates[0];
         self.page_out_kib_per_sec = rates[1];
         self.thp_fault_history
@@ -558,20 +569,28 @@ impl MemoryModel {
     }
 }
 
-fn counter_rate(current: Option<u64>, previous: Option<u64>, dt_ms: u32) -> Option<f64> {
+fn counter_rate(
+    current: Option<u64>,
+    previous: Option<u64>,
+    elapsed_ms: Option<u64>,
+) -> Option<f64> {
     let (Some(current), Some(previous)) = (current, previous) else {
         return None;
     };
-    if dt_ms == 0 || current < previous {
+    let elapsed_ms = elapsed_ms.filter(|elapsed| *elapsed > 0)?;
+    if current < previous {
         return None;
     }
-    Some((current - previous) as f64 * 1000.0 / f64::from(dt_ms))
+    Some((current - previous) as f64 * 1000.0 / elapsed_ms as f64)
 }
 
-fn rate_text(value: Option<f64>) -> String {
+fn rate_text(value: Option<f64>, unit: Unit) -> String {
     value
         .filter(|rate| rate.is_finite() && *rate >= 0.0)
-        .map_or_else(|| absent_mark().to_owned(), |rate| format!("{rate:.1}"))
+        .map_or_else(
+            || absent_mark().to_owned(),
+            |rate| kit::edge_fmt(NumFmt::default()).fmt(rate, unit, 8),
+        )
 }
 
 fn latest_rate(history: &MemoryHistory) -> Option<f64> {
@@ -582,6 +601,37 @@ fn latest_rate(history: &MemoryHistory) -> Option<f64> {
         .copied()
         .filter(|value| value.is_finite())
         .map(f64::from)
+}
+
+fn paint_rate_sparkline(grid: &mut CellGrid, rect: Rect, history: &MemoryHistory) {
+    if rect.rows == 0 || rect.cols == 0 {
+        return;
+    }
+    let mut values = [f32::NAN; HISTORY_CAPACITY];
+    let (len, peak) = history.copy_recent(&mut values);
+    if len == 0 {
+        return;
+    }
+    if peak > 0.0 {
+        for value in values.iter_mut().take(len) {
+            if value.is_finite() {
+                *value = (*value / peak).clamp(0.0, 1.0);
+            }
+        }
+    }
+    let table = crate::monitor::graphs::table();
+    let visible = len.min(rect.cols.saturating_mul(if table.braille { 2 } else { 1 }));
+    if visible > 0 {
+        let chart = kit::history_rect::graph_rect(rect, visible, table.braille);
+        draw_runs(
+            grid,
+            chart,
+            &values[len - visible..len],
+            table,
+            RampId::Mem,
+            viz_raster::line,
+        );
+    }
 }
 
 fn paint_memory_history(
@@ -607,12 +657,14 @@ fn paint_memory_history(
         ),
         Default::default(),
     );
-    if rect.rows < 2 || len == 0 || peak <= 0.0 {
+    if rect.rows < 2 || len == 0 {
         return;
     }
-    for value in values.iter_mut().take(len) {
-        if value.is_finite() {
-            *value = (*value / peak).clamp(0.0, 1.0);
+    if peak > 0.0 {
+        for value in values.iter_mut().take(len) {
+            if value.is_finite() {
+                *value = (*value / peak).clamp(0.0, 1.0);
+            }
         }
     }
     let table = crate::monitor::graphs::table();
@@ -627,16 +679,24 @@ fn paint_memory_history(
             visible,
             table.braille,
         );
-        draw_line_runs(grid, chart, &values[len - visible..len], table, ramp);
+        draw_runs(
+            grid,
+            chart,
+            &values[len - visible..len],
+            table,
+            ramp,
+            viz_raster::line,
+        );
     }
 }
 
-fn draw_line_runs(
+fn draw_runs(
     grid: &mut CellGrid,
     chart: Rect,
     values: &[f32],
     table: &viz_raster::RasterTable,
     ramp: RampId,
+    rasterize: fn(&[f32], &viz_raster::RasterTable, &mut CellBuf),
 ) {
     let samples_per_cell = if table.braille { 2 } else { 1 };
     let mut sample = 0;
@@ -653,7 +713,7 @@ fn draw_line_runs(
             let end_cell = sample.div_ceil(samples_per_cell);
             let mut raster = CellBuf::new();
             raster.reset(end_cell - first_cell, chart.rows);
-            viz_raster::line(&values[run_start..sample], table, &mut raster);
+            rasterize(&values[run_start..sample], table, &mut raster);
             draw_raster(
                 grid,
                 Rect {
@@ -799,8 +859,8 @@ impl MemoryView<'_> {
                 0,
                 &format!(
                     "faults/s  minor {}  major {}",
-                    rate_text(latest_rate(&self.0.minor_fault_history)),
-                    rate_text(self.0.major_faults)
+                    rate_text(latest_rate(&self.0.minor_fault_history), Unit::Count),
+                    rate_text(self.0.major_faults, Unit::Count)
                 ),
                 Default::default(),
             );
@@ -836,8 +896,8 @@ impl MemoryView<'_> {
                 0,
                 &format!(
                     "page in {} KiB/s  out {} KiB/s",
-                    rate_text(self.0.page_in_kib_per_sec),
-                    rate_text(self.0.page_out_kib_per_sec)
+                    rate_text(self.0.page_in_kib_per_sec, Unit::Count),
+                    rate_text(self.0.page_out_kib_per_sec, Unit::Count)
                 ),
                 Default::default(),
             );
@@ -854,14 +914,38 @@ impl MemoryView<'_> {
                 0,
                 &format!(
                     "THP alloc {}  collapse {}  split {} /s",
-                    rate_text(latest_rate(&self.0.thp_fault_history)),
-                    rate_text(latest_rate(&self.0.thp_collapse_history)),
-                    rate_text(latest_rate(&self.0.thp_split_history))
+                    rate_text(latest_rate(&self.0.thp_fault_history), Unit::Count),
+                    rate_text(latest_rate(&self.0.thp_collapse_history), Unit::Count),
+                    rate_text(latest_rate(&self.0.thp_split_history), Unit::Count)
                 ),
                 Default::default(),
             );
         }
-        if body.rows > 7 && self.0.hugepages_total.is_some_and(|total| total > 0) {
+        if body.rows > 7 {
+            let histories = [
+                &self.0.thp_fault_history,
+                &self.0.thp_collapse_history,
+                &self.0.thp_split_history,
+            ];
+            let cols = body.cols / histories.len();
+            for (index, history) in histories.into_iter().enumerate() {
+                paint_rate_sparkline(
+                    grid,
+                    Rect {
+                        x: body.x + index * cols,
+                        y: body.y + 7,
+                        cols: if index + 1 == 3 {
+                            body.cols - index * cols
+                        } else {
+                            cols
+                        },
+                        rows: 1,
+                    },
+                    history,
+                );
+            }
+        }
+        if body.rows > 8 && !self.0.hugepages_total.is_some_and(|total| total == 0) {
             let hugepages = format!(
                 "hugepages {} total / {} free x {}",
                 reading_text(self.0.hugepages_total, Unit::Count),
@@ -870,13 +954,13 @@ impl MemoryView<'_> {
             );
             grid.view(Rect {
                 x: body.x,
-                y: body.y + 7,
+                y: body.y + 8,
                 cols: body.cols,
                 rows: 1,
             })
             .put_str(0, 0, &hugepages, Default::default());
         }
-        if body.rows > 8 {
+        if body.rows > 9 {
             let thp = format!(
                 "THP anon {}  shmem {}  file {}",
                 fmt_bytes(self.0.thp_anon),
@@ -885,18 +969,18 @@ impl MemoryView<'_> {
             );
             grid.view(Rect {
                 x: body.x,
-                y: body.y + 8,
+                y: body.y + 9,
                 cols: body.cols,
                 rows: 1,
             })
             .put_str(0, 0, &thp, Default::default());
         }
-        if body.rows > 10 {
+        if body.rows > 11 {
             paint_memory_history(
                 grid,
                 Rect {
                     x: body.x,
-                    y: body.y + 9,
+                    y: body.y + 10,
                     cols: body.cols,
                     rows: 2,
                 },
@@ -906,12 +990,12 @@ impl MemoryView<'_> {
                 Unit::Bytes,
             );
         }
-        if body.rows > 12 {
+        if body.rows > 13 {
             paint_memory_history(
                 grid,
                 Rect {
                     x: body.x,
-                    y: body.y + 11,
+                    y: body.y + 12,
                     cols: body.cols,
                     rows: 2,
                 },
@@ -1254,7 +1338,14 @@ impl MemoryView<'_> {
                     if visible > 0 {
                         let normalized = &values[len - visible..len];
                         let chart = kit::history_rect::graph_rect(chart, visible, table.braille);
-                        draw_line_runs(grid, chart, normalized, table, RampId::Mem);
+                        draw_runs(
+                            grid,
+                            chart,
+                            normalized,
+                            table,
+                            RampId::Mem,
+                            viz_raster::line,
+                        );
                     }
                 }
             }
@@ -1484,12 +1575,13 @@ impl MemoryView<'_> {
             return;
         }
         let chart = kit::history_rect::graph_rect(chart, visible_samples, table.braille);
-        draw_area_runs(
+        draw_runs(
             grid,
             chart,
             &values[start..start + visible_samples],
             table,
             RampId::Mem,
+            viz_raster::area,
         );
     }
 
@@ -1598,12 +1690,13 @@ impl MemoryView<'_> {
             let start = len - visible_samples;
             if visible_samples > 0 && body.rows > 4 {
                 let chart = kit::history_rect::graph_rect(chart, visible_samples, table.braille);
-                draw_area_runs(
+                draw_runs(
                     grid,
                     chart,
                     &values[start..start + visible_samples],
                     table,
                     RampId::Mem,
+                    viz_raster::area,
                 );
             }
         }
@@ -1710,12 +1803,13 @@ impl MemoryView<'_> {
                 continue;
             }
             let chart = kit::history_rect::graph_rect(chart, visible_samples, table.braille);
-            draw_area_runs(
+            draw_runs(
                 grid,
                 chart,
                 &values[len - visible_samples..len],
                 table,
                 RampId::Mem,
+                viz_raster::area,
             );
         }
     }
@@ -1767,12 +1861,13 @@ impl MemoryView<'_> {
             return;
         }
         let chart = kit::history_rect::graph_rect(chart, visible_samples, table.braille);
-        draw_area_runs(
+        draw_runs(
             grid,
             chart,
             &values[start..start + visible_samples],
             table,
             RampId::Mem,
+            viz_raster::area,
         );
     }
 }
@@ -1839,43 +1934,6 @@ fn draw_raster(grid: &mut CellGrid, rect: Rect, raster: &CellBuf, style: RasterS
                     bg,
                     ..Default::default()
                 },
-            );
-        }
-    }
-}
-
-fn draw_area_runs(
-    grid: &mut CellGrid,
-    chart: Rect,
-    values: &[f32],
-    table: &viz_raster::RasterTable,
-    ramp: RampId,
-) {
-    let samples_per_cell = if table.braille { 2 } else { 1 };
-    let mut sample = 0;
-    while sample < values.len() {
-        while sample < values.len() && !values[sample].is_finite() {
-            sample += 1;
-        }
-        let run_start = sample;
-        while sample < values.len() && values[sample].is_finite() {
-            sample += 1;
-        }
-        if run_start < sample {
-            let first_cell = run_start / samples_per_cell;
-            let end_cell = sample.div_ceil(samples_per_cell);
-            let mut raster = CellBuf::new();
-            raster.reset(end_cell - first_cell, chart.rows);
-            viz_raster::area(&values[run_start..sample], table, &mut raster);
-            draw_raster(
-                grid,
-                Rect {
-                    x: chart.x + first_cell,
-                    cols: end_cell - first_cell,
-                    ..chart
-                },
-                &raster,
-                RasterStyle::Ramp(ramp),
             );
         }
     }
