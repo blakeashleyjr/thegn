@@ -64,10 +64,11 @@ pub enum CollectorId {
     CpuTopology,
     Filesystems,
     GpuDevices,
+    GpuEngines,
 }
 
 impl CollectorId {
-    pub const ALL: [Self; 22] = [
+    pub const ALL: [Self; 23] = [
         Self::Loadavg,
         Self::Uptime,
         Self::Psi,
@@ -90,6 +91,7 @@ impl CollectorId {
         Self::CpuTopology,
         Self::Filesystems,
         Self::GpuDevices,
+        Self::GpuEngines,
     ];
 
     pub const fn slug(self) -> &'static str {
@@ -116,6 +118,7 @@ impl CollectorId {
             Self::CpuTopology => "cpu_topology",
             Self::Filesystems => "filesystems",
             Self::GpuDevices => "gpu_devices",
+            Self::GpuEngines => "gpu_engines",
         }
     }
 
@@ -223,6 +226,7 @@ pub fn default_collectors() -> Vec<Box<dyn Collector>> {
         Box::new(linux::mounts_fs::FilesystemsCollector::new());
     collectors[CollectorId::GpuDevices.index()] =
         Box::new(linux::gpu_discover::GpuDevicesCollector::new());
+    collectors[CollectorId::GpuEngines.index()] = Box::new(linux::gpu_amd::GpuAmdCollector::new());
     collectors[CollectorId::Powercap.index()] = Box::new(linux::powercap::PowercapCollector::at(
         "/sys/class/powercap",
     ));
@@ -261,6 +265,7 @@ mod default_collectors_tests {
             CollectorId::CpuTopology,
             CollectorId::Filesystems,
             CollectorId::GpuDevices,
+            CollectorId::GpuEngines,
             CollectorId::Powercap,
         ] {
             assert_ne!(
