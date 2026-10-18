@@ -10,6 +10,86 @@ use thegn_metrics::collect::{
     model::{amd_smu::AmdSmuStatus, gpu::GpuKind, gpu::RuntimeStatus},
 };
 
+struct AuxRing<'a> {
+    label: &'a str,
+    values: &'a [f32; HISTORY_CAP],
+    next: usize,
+    len: usize,
+    ramp: thegn_core::theme::RampId,
+}
+
+fn draw_aux_ring(
+    surface: &mut Surface,
+    rect: Rect,
+    body: Rect,
+    row: usize,
+    ring: AuxRing<'_>,
+) -> usize {
+    if ring.len == 0 {
+        return row;
+    }
+    let mut values = [0.0_f32; HISTORY_CAP];
+    let len = super::BusyHistory::ordered_ring(ring.values, ring.next, ring.len, &mut values);
+    let label = format!("{} 0-100%", ring.label);
+    draw_labelled_spark(surface, rect, body, row, &label, &values[..len], ring.ramp);
+    row + 1
+}
+
+fn draw_labelled_spark(
+    surface: &mut Surface,
+    rect: Rect,
+    body: Rect,
+    row: usize,
+    label: &str,
+    values: &[f32],
+    ramp: thegn_core::theme::RampId,
+) {
+    const LABEL_COLS: usize = 28;
+    if values.is_empty() || row >= body.rows || body.cols <= LABEL_COLS {
+        return;
+    }
+    let mut label_grid = CellGrid::new(LABEL_COLS, 1);
+    label_grid
+        .view(Rect::full(LABEL_COLS, 1))
+        .put_str(0, 0, label, Default::default());
+    Emitter::default().emit(
+        &label_grid,
+        Rect::full(LABEL_COLS, 1),
+        surface,
+        rect.x + body.x,
+        rect.y + body.y + row,
+    );
+    let area = Rect {
+        x: rect.x + body.x + LABEL_COLS,
+        y: rect.y + body.y + row,
+        cols: body.cols - LABEL_COLS,
+        rows: 1,
+    };
+    let graph = crate::monitor::kit::history_rect::graph_rect(
+        area,
+        values.len(),
+        crate::monitor::graphs::table().braille,
+    );
+    crate::monitor::graphs::paint_sparkline(values, graph.cols, ramp, graph, surface);
+}
+
+fn activity_label(index: usize) -> &'static str {
+    match index {
+        0 => "gfx",
+        1 => "mm",
+        2 => "vcn",
+        3 => "umc",
+        4 => "ipu0",
+        5 => "ipu1",
+        6 => "ipu2",
+        7 => "ipu3",
+        8 => "ipu4",
+        9 => "ipu5",
+        10 => "ipu6",
+        _ => "ipu7",
+    }
+}
+
 fn mark(health: Health) -> String {
     match health {
         Health::Warming => caps::active_glyphs().ellipsis.to_owned(),
@@ -32,17 +112,6 @@ fn display_health(primary: Health, secondary: Health) -> Health {
     }
 }
 
-fn history_graph_rect(rect: Rect, body: Rect, len: usize, braille: bool) -> Rect {
-    let used = if braille { len.div_ceil(2) } else { len };
-    let cols = body.cols.min(used);
-    Rect {
-        x: rect.x + body.x + body.cols.saturating_sub(cols),
-        y: rect.y + body.y + 1,
-        cols,
-        rows: body.rows.saturating_sub(2),
-    }
-}
-
 impl GpuView<'_> {
     pub(in crate::monitor::tabs::gpu) fn paint_aux_history(
         &self,
@@ -51,128 +120,75 @@ impl GpuView<'_> {
         body: Rect,
         memory: bool,
     ) {
-        let Some(engine) = self
-            .0
-            .engines
-            .devices
-            .iter()
-            .find(|engine| engine.runtime_status == RuntimeStatus::Active)
-        else {
-            return;
-        };
-        let Some(history) = self
-            .0
-            .histories
-            .iter()
-            .find(|item| item.slot == engine.slot.as_str())
-        else {
-            return;
-        };
-        if body.rows < 7 || body.cols < 12 {
+        if body.rows < 4 || body.cols < 28 {
             return;
         }
-        let (
-            first,
-            first_next,
-            first_len,
-            second,
-            second_next,
-            second_len,
-            first_label,
-            second_label,
-        ) = if memory {
-            (
-                &history.memory,
-                history.memory_next,
-                history.memory_len,
-                &history.gtt,
-                history.gtt_next,
-                history.gtt_len,
-                "VRAM used / total 0-100%",
-                "GTT used / total 0-100%",
-            )
-        } else {
-            (
-                &history.clocks,
-                history.clocks_next,
-                history.clocks_len,
-                &history.power,
-                history.power_next,
-                history.power_len,
-                "gfx clock / max 0-100%",
-                "power / cap 0-100%",
-            )
-        };
-        let data_rows = if memory {
-            self.0.devices.devices.len()
-        } else {
-            self.0.engines.devices.len()
-        }
-        .min(body.rows);
-        let graph_rows = body.rows.saturating_sub(data_rows + 4).min(5);
-        if graph_rows == 0 {
-            return;
-        }
-        let graph_cols = body.cols;
-        if first_len > 0 {
-            let mut values = [0.0_f32; HISTORY_CAP];
-            let len = super::BusyHistory::ordered_ring(first, first_next, first_len, &mut values);
-            let mut label = CellGrid::new(body.cols, 1);
-            label
-                .view(Rect::full(body.cols, 1))
-                .put_str(0, 0, first_label, Default::default());
-            Emitter::default().emit(
-                &label,
-                Rect::full(body.cols, 1),
+        let data_rows = self.0.devices.devices.len().min(body.rows);
+        let mut output_row = data_rows;
+        for (device_index, engine) in self.0.engines.devices.iter().take(DEVICE_CAP).enumerate() {
+            if engine.runtime_status != RuntimeStatus::Active || output_row >= body.rows {
+                continue;
+            }
+            let Some(history) = self
+                .0
+                .histories
+                .iter()
+                .find(|item| item.slot == engine.slot.as_str())
+            else {
+                continue;
+            };
+            let (first, first_next, first_len, second, second_next, second_len, labels) = if memory
+            {
+                (
+                    &history.memory,
+                    history.memory_next,
+                    history.memory_len,
+                    &history.gtt,
+                    history.gtt_next,
+                    history.gtt_len,
+                    ["VRAM / total", "GTT / total"],
+                )
+            } else {
+                (
+                    &history.clocks,
+                    history.clocks_next,
+                    history.clocks_len,
+                    &history.power,
+                    history.power_next,
+                    history.power_len,
+                    ["gfx clock / max", "power / cap"],
+                )
+            };
+            let first_label = format!("GPU{device_index} {}", labels[0]);
+            let second_label = format!("GPU{device_index} {}", labels[1]);
+            output_row = draw_aux_ring(
                 surface,
-                rect.x + body.x,
-                rect.y + body.y + data_rows,
-            );
-            let graph_rect = history_graph_rect(
                 rect,
-                Rect {
-                    x: body.x,
-                    y: body.y + data_rows,
-                    cols: graph_cols,
-                    rows: graph_rows,
+                body,
+                output_row,
+                AuxRing {
+                    label: &first_label,
+                    values: first,
+                    next: first_next,
+                    len: first_len,
+                    ramp: thegn_core::theme::RampId::Mem,
                 },
-                len,
-                crate::monitor::graphs::table().braille,
             );
-            crate::monitor::graphs::paint_history_graph(
-                &values[..len],
-                thegn_core::theme::RampId::Mem,
-                graph_rect,
-                surface,
-            );
-        }
-        if second_len > 0 {
-            let mut values = [0.0_f32; HISTORY_CAP];
-            let len =
-                super::BusyHistory::ordered_ring(second, second_next, second_len, &mut values);
-            let mut label = CellGrid::new(body.cols, 1);
-            label
-                .view(Rect::full(body.cols, 1))
-                .put_str(0, 0, second_label, Default::default());
-            Emitter::default().emit(
-                &label,
-                Rect::full(body.cols, 1),
-                surface,
-                rect.x + body.x,
-                rect.y + body.y + data_rows + graph_rows,
-            );
-            crate::monitor::graphs::paint_sparkline(
-                &values[..len],
-                graph_cols,
-                thegn_core::theme::RampId::Util,
-                Rect {
-                    x: rect.x + body.x,
-                    y: rect.y + body.y + data_rows + graph_rows + 1,
-                    cols: graph_cols,
-                    rows: 1,
-                },
-                surface,
-            );
+            if output_row < body.rows {
+                output_row = draw_aux_ring(
+                    surface,
+                    rect,
+                    body,
+                    output_row,
+                    AuxRing {
+                        label: &second_label,
+                        values: second,
+                        next: second_next,
+                        len: second_len,
+                        ramp: thegn_core::theme::RampId::Util,
+                    },
+                );
+            }
         }
     }
 
@@ -206,66 +222,127 @@ impl GpuView<'_> {
                 }
                 let mut values = [0.0_f32; HISTORY_CAP];
                 let len = history.ordered_into(&mut values);
-                crate::monitor::graphs::paint_sparkline(
-                    &values[..len],
-                    body.cols - 36,
-                    thegn_core::theme::RampId::Util,
+                let graph_rect = crate::monitor::kit::history_rect::graph_rect(
                     Rect {
                         x: rect.x + body.x + 36,
                         y: rect.y + body.y + index,
                         cols: body.cols - 36,
                         rows: 1,
                     },
+                    len,
+                    crate::monitor::graphs::table().braille,
+                );
+                crate::monitor::graphs::paint_sparkline(
+                    &values[..len],
+                    graph_rect.cols,
+                    thegn_core::theme::RampId::Util,
+                    graph_rect,
                     surface,
                 );
             }
-            return;
+        } else {
+            if engine.runtime_status != RuntimeStatus::Active {
+                return;
+            }
+            let Some(history) = self
+                .0
+                .histories
+                .iter()
+                .find(|item| item.slot == engine.slot.as_str())
+            else {
+                return;
+            };
+            if history.len > 0 && body.rows >= 3 && body.cols >= 12 {
+                let mut values = [0.0_f32; HISTORY_CAP];
+                let len = history.ordered_into(&mut values);
+                let graph_rect = crate::monitor::kit::history_rect::graph_rect(
+                    Rect {
+                        x: rect.x + body.x,
+                        y: rect.y + body.y + 1,
+                        cols: body.cols,
+                        rows: body.rows.saturating_sub(2),
+                    },
+                    len,
+                    crate::monitor::graphs::table().braille,
+                );
+                crate::monitor::graphs::paint_history_graph(
+                    &values[..len],
+                    thegn_core::theme::RampId::Util,
+                    graph_rect,
+                    surface,
+                );
+                let mut vcn = [0.0_f32; HISTORY_CAP];
+                let vcn_len = history.ordered_vcn_into(&mut vcn);
+                if vcn_len > 0 {
+                    let graph_y = rect.y + body.y + body.rows - 1;
+                    let mut label = CellGrid::new(5, 1);
+                    label
+                        .view(Rect::full(5, 1))
+                        .put_str(0, 0, "vcn %", Default::default());
+                    Emitter::default().emit(
+                        &label,
+                        Rect::full(5, 1),
+                        surface,
+                        rect.x + body.x,
+                        graph_y,
+                    );
+                    let graph_rect = crate::monitor::kit::history_rect::graph_rect(
+                        Rect {
+                            x: rect.x + body.x + 5,
+                            y: graph_y,
+                            cols: body.cols.saturating_sub(5),
+                            rows: 1,
+                        },
+                        vcn_len,
+                        crate::monitor::graphs::table().braille,
+                    );
+                    crate::monitor::graphs::paint_sparkline(
+                        &vcn[..vcn_len],
+                        graph_rect.cols,
+                        thegn_core::theme::RampId::Util,
+                        graph_rect,
+                        surface,
+                    );
+                }
+            }
         }
-        if engine.runtime_status != RuntimeStatus::Active {
-            return;
-        }
-        let Some(history) = self
-            .0
-            .histories
-            .iter()
-            .find(|item| item.slot == engine.slot.as_str())
-        else {
-            return;
-        };
-        if history.len == 0 || body.rows < 3 || body.cols < 12 {
-            return;
-        }
-        let mut values = [0.0_f32; HISTORY_CAP];
-        let len = history.ordered_into(&mut values);
-        let graph_rect =
-            history_graph_rect(rect, body, len, crate::monitor::graphs::table().braille);
-        crate::monitor::graphs::paint_history_graph(
-            &values[..len],
-            thegn_core::theme::RampId::Util,
-            graph_rect,
-            surface,
-        );
-        let mut vcn = [0.0_f32; HISTORY_CAP];
-        let vcn_len = history.ordered_vcn_into(&mut vcn);
-        if vcn_len > 0 {
-            let graph_y = rect.y + body.y + body.rows - 1;
-            let mut label = CellGrid::new(5, 1);
-            label
-                .view(Rect::full(5, 1))
-                .put_str(0, 0, "vcn %", Default::default());
-            Emitter::default().emit(&label, Rect::full(5, 1), surface, rect.x + body.x, graph_y);
-            crate::monitor::graphs::paint_sparkline(
-                &vcn[..vcn_len],
-                body.cols.saturating_sub(5),
-                thegn_core::theme::RampId::Util,
-                Rect {
-                    x: rect.x + body.x + 5,
-                    y: graph_y,
-                    cols: body.cols.saturating_sub(5),
-                    rows: 1,
-                },
-                surface,
-            );
+        let mut output_row = self.0.engines.devices.len().min(body.rows);
+        for (device_index, engine) in self.0.engines.devices.iter().take(DEVICE_CAP).enumerate() {
+            if output_row >= body.rows {
+                break;
+            }
+            if engine.runtime_status != RuntimeStatus::Active {
+                continue;
+            }
+            let Some(history) = self
+                .0
+                .histories
+                .iter()
+                .find(|item| item.slot == engine.slot.as_str())
+            else {
+                continue;
+            };
+            for (index, ring) in history.activity.iter().enumerate() {
+                if output_row >= body.rows {
+                    break;
+                }
+                if ring.len == 0 {
+                    continue;
+                }
+                let label = activity_label(index);
+                let mut values = [0.0_f32; HISTORY_CAP];
+                let len = ring.ordered_into(&mut values);
+                draw_labelled_spark(
+                    surface,
+                    rect,
+                    body,
+                    output_row,
+                    &format!("GPU{device_index} {label} 0-100%"),
+                    &values[..len],
+                    thegn_core::theme::RampId::Util,
+                );
+                output_row += 1;
+            }
         }
     }
 
