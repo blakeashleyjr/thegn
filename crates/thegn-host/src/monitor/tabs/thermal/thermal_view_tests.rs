@@ -267,6 +267,9 @@ fn deterministic_snapshots_cover_sizes_capabilities_and_demand() {
         for (index, reading) in frame.parts.hwmon.values.iter_mut().skip(1).enumerate() {
             reading.value = Some(55.0 + ((sample + index * 3) % 30) as f32);
         }
+        if let Some(card) = frame.parts.amd_smu.cards.first_mut() {
+            card.metrics.temperature_edge = Some(6_000 + (sample % 20) as u16 * 10);
+        }
         model.absorb_frame(&frame);
     }
     assert!(
@@ -456,6 +459,33 @@ fn package_without_threshold_shows_temperature_without_a_meter() {
         .collect::<String>();
     let (filled, _) = caps::bar_track(0.71, 12);
     assert!(!bar_row.contains(&filled));
+
+    let package_index = model
+        .sensors
+        .iter()
+        .position(|sensor| sensor.key == package.key)
+        .expect("package sensor row");
+    model.sensors[package_index].max_c = None;
+    model.sensors[package_index].crit_c = None;
+    let area = Rect::full(160, 45);
+    let placed = Placed {
+        id: super::SENSORS,
+        rect: area,
+        variant: super::FULL.kind,
+    };
+    let mut surface = Surface::new(160, 45);
+    ThermalView(&model).paint(&mut surface, &placed, area, 0, &[]);
+    let output = text(&mut surface);
+    let package_row = output
+        .lines()
+        .nth(package_index + 2)
+        .expect("painted package row");
+    assert!(
+        package_row
+            .chars()
+            .skip(super::paint::SENSOR_HISTORY_X + 1)
+            .all(|cell| cell == ' ' || cell == '\u{2800}')
+    );
 }
 
 #[test]
@@ -838,6 +868,41 @@ fn telemetry_series_storage_stays_warm_across_one_thousand_absorbs() {
     );
     assert_eq!(model.temp_history.capacity(), history_capacity);
     assert_eq!(model.temp_history.last(), Some(&69.0));
+}
+
+#[test]
+fn gpu_temperature_history_is_bounded_and_right_aligned() {
+    let mut frame = fixture();
+    let mut model = ThermalModel::default();
+    for sample in 0..HISTORY_CAP {
+        let card = frame
+            .parts
+            .amd_smu
+            .cards
+            .first_mut()
+            .expect("fixture GPU card");
+        card.metrics.temperature_edge = Some(6_000 + sample as u16 * 10);
+        model.absorb_frame(&frame);
+    }
+    assert_eq!(model.gpu_history_len, HISTORY_CAP);
+    assert_eq!(model.gpu_history_next, 0);
+    assert_eq!(model.gpu_history[HISTORY_CAP - 1], 71.9);
+
+    let area = Rect::full(80, 14);
+    let placed = Placed {
+        id: super::GPU,
+        rect: area,
+        variant: super::FULL.kind,
+    };
+    let mut surface = Surface::new(80, 14);
+    ThermalView(&model).paint(&mut surface, &placed, area, 0, &[]);
+    let output = text(&mut surface);
+    assert!(output.contains("GPU history 80/95 C"));
+    assert!(output.lines().skip(6).take(7).any(|row| {
+        row.chars()
+            .nth(78)
+            .is_some_and(|cell| cell != ' ' && cell != '\u{2800}')
+    }));
 }
 
 #[test]
