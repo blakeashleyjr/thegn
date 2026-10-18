@@ -342,6 +342,12 @@ impl SeriesBuf {
     pub fn gap(&self) -> &[bool] {
         &self.gap
     }
+    pub fn raw_hi(&self) -> &[f32] {
+        &self.raw_hi
+    }
+    pub fn axis_max(&self) -> f32 {
+        self.axis_max
+    }
 }
 
 fn normalize_value(value: f32, scale: Scale, axis_max: f32) -> f32 {
