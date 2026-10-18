@@ -238,7 +238,7 @@ fn mixed_cpu_scopes_all_get_sampled_despite_priority_churn() {
             .is_some_and(|previous| previous.cpu_pct > 0.0)
     );
     let mut observed_cold = std::collections::HashSet::new();
-    let max_ticks = (count - 56).div_ceil(8) + 1;
+    let max_ticks = usize::div_ceil(count - 56, 8) + 1;
     let mut usage = [1_000_000_u64; 24];
     usage[..8].fill(2_000_000);
     for tick in 0..max_ticks {
