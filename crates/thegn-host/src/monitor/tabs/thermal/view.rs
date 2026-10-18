@@ -95,6 +95,9 @@ pub(in crate::monitor) struct ThermalModel {
     edge_c: Option<f32>,
     hotspot_c: Option<f32>,
     soc_c: Option<f32>,
+    gpu_history: [f32; HISTORY_CAP],
+    gpu_history_len: usize,
+    gpu_history_next: usize,
     socket_w: Option<f32>,
     package_history: [f32; HISTORY_CAP],
     package_history_len: usize,
@@ -120,6 +123,9 @@ impl Default for ThermalModel {
             edge_c: None,
             hotspot_c: None,
             soc_c: None,
+            gpu_history: [0.0; HISTORY_CAP],
+            gpu_history_len: 0,
+            gpu_history_next: 0,
             socket_w: None,
             package_history: [0.0; HISTORY_CAP],
             package_history_len: 0,
@@ -418,6 +424,18 @@ impl ThermalModel {
                 .saturating_add(1)
                 .min(HISTORY_CAP);
         }
+        let gpu_temp = self.edge_c.or(self.gfx_c).or_else(|| {
+            self.sensors
+                .iter()
+                .filter(|row| row.group == ChipGroup::Gpu)
+                .filter_map(|row| row.temp_c)
+                .max_by(f32::total_cmp)
+        });
+        if gpu_temp.is_some() || self.gpu_history_len > 0 {
+            self.gpu_history[self.gpu_history_next] = gpu_temp.unwrap_or(f32::NAN);
+            self.gpu_history_next = (self.gpu_history_next + 1) % HISTORY_CAP;
+            self.gpu_history_len = self.gpu_history_len.saturating_add(1).min(HISTORY_CAP);
+        }
     }
 
     fn zone_slot(&mut self, index: usize) -> &mut ZoneRow {
@@ -586,6 +604,9 @@ impl TabView for ThermalView<'_> {
         if placed.id == PACKAGE && inner.rows > 5 && !self.0.temp_history.is_empty() {
             paint::telemetry_label(&mut grid, inner);
         }
+        if placed.id == GPU && inner.rows > 5 && self.0.gpu_history_len > 0 {
+            paint::gpu_history_label(&mut grid, inner);
+        }
         Emitter::default().emit(
             &grid,
             Rect::full(rect.cols, rect.rows),
@@ -599,6 +620,55 @@ impl TabView for ThermalView<'_> {
             let mut normalized = [f32::NAN; HISTORY_CAP];
             for (index, value) in normalized.iter_mut().take(count).enumerate() {
                 let temp = self.0.temp_history[first + index];
+                if temp.is_finite() {
+                    *value = paint::thermal_level(temp, 80.0, 95.0);
+                }
+            }
+            let plot = Rect {
+                x: rect.x.saturating_add(inner.x),
+                y: rect.y.saturating_add(inner.y).saturating_add(5),
+                cols: inner.cols,
+                rows: inner.rows.saturating_sub(5),
+            };
+            let braille = crate::monitor::graphs::table().braille;
+            let graph_rect = crate::monitor::kit::history_rect::graph_rect(plot, count, braille);
+            let mut run_start = 0;
+            while run_start < count {
+                while run_start < count && !normalized[run_start].is_finite() {
+                    run_start += 1;
+                }
+                let mut run_end = run_start;
+                while run_end < count && normalized[run_end].is_finite() {
+                    run_end += 1;
+                }
+                if run_start < run_end {
+                    let start_col = if braille { run_start / 2 } else { run_start };
+                    let end_col = if braille {
+                        run_end.div_ceil(2)
+                    } else {
+                        run_end
+                    };
+                    crate::monitor::graphs::paint_history_graph(
+                        &normalized[run_start..run_end],
+                        thegn_core::theme::RampId::Temp,
+                        Rect {
+                            x: graph_rect.x.saturating_add(start_col),
+                            y: graph_rect.y,
+                            cols: end_col.saturating_sub(start_col),
+                            rows: graph_rect.rows,
+                        },
+                        surface,
+                    );
+                }
+                run_start = run_end.saturating_add(1);
+            }
+        }
+        if placed.id == GPU && inner.rows > 5 && self.0.gpu_history_len > 0 {
+            let count = self.0.gpu_history_len.min(HISTORY_CAP);
+            let first = (self.0.gpu_history_next + HISTORY_CAP - count) % HISTORY_CAP;
+            let mut normalized = [f32::NAN; HISTORY_CAP];
+            for (index, value) in normalized.iter_mut().take(count).enumerate() {
+                let temp = self.0.gpu_history[(first + index) % HISTORY_CAP];
                 if temp.is_finite() {
                     *value = paint::thermal_level(temp, 80.0, 95.0);
                 }

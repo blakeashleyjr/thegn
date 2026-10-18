@@ -441,6 +441,10 @@ pub(super) fn gpu(grid: &mut CellGrid, rect: Rect, model: &ThermalModel) {
     }
 }
 
+pub(super) fn gpu_history_label(grid: &mut CellGrid, rect: Rect) {
+    put(grid, rect, 0, 4, "GPU history 80/95 C", Tok::Slot(S::Dim));
+}
+
 pub(super) fn heatmap(
     grid: &mut CellGrid,
     rect: Rect,

@@ -142,9 +142,9 @@ The Thermal tab shows the CPU package trend, per-core temperatures, the sensor
 table with bounded per-sensor history, GPU temperatures and telemetry, thermal
 zones with trips, and a per-core history heatmap. Temperature bars and sensor
 sparklines use a published max or critical threshold; sensors without one show
-the reading without a bar or sparkline. Missing readings use the absent mark;
-no reading is displayed as zero. Panel demand follows the panels placed on
-screen:
+the reading without a bar or sparkline. GPU temperature history shows its
+80/95 C thermal ramp. Missing readings use the absent mark; no reading is
+displayed as zero. Panel demand follows the panels placed on screen:
 `thermal.package`, `thermal.cores`, `thermal.sensors`, `thermal.zones`,
 `thermal.gpu`, and `thermal.heatmap`. Use `f`/`F` to move panel focus, `z` to
 zoom the focused panel, and `Esc` to unzoom before closing the monitor. The
