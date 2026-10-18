@@ -168,7 +168,6 @@ mod signal_identity;
 pub use signal_identity::{ProcStart, SignalError, signal_identity};
 #[allow(dead_code)] // V-PRC-4 wires the renice/ionice prompts.
 mod priority;
-pub use priority::{IoClass, PriorityError, get_ioprio, get_nice, set_ioprio, set_nice};
 
 /// Live per-process introspection (pane cwd / foreground job / argv). Unlike the
 /// rest of this module the split is Linux-vs-macOS-vs-other rather than
