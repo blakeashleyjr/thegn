@@ -409,7 +409,7 @@ fn right_align_history(area: Rect, len: usize, braille: bool) -> Rect {
 }
 fn draw_graph_label(surface: &mut Surface, x: usize, y: usize, width: usize, label: &str) {
     let line = crate::seg::Line::segs(vec![crate::seg::seg(
-        crate::seg::Tok::Slot(crate::chrome::S::Dim),
+        crate::seg::Tok::Slot(crate::chrome::S::Panel),
         label,
     )]);
     crate::seg::draw_line(
@@ -418,7 +418,7 @@ fn draw_graph_label(surface: &mut Surface, x: usize, y: usize, width: usize, lab
         y,
         width,
         &line,
-        crate::seg::Tok::Slot(crate::chrome::S::Dim),
+        crate::seg::Tok::Slot(crate::chrome::S::Panel),
     );
 }
 fn watts_label(name: &str, watts: Option<f32>) -> String {
