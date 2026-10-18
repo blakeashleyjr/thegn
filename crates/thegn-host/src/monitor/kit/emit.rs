@@ -185,7 +185,7 @@ impl Emitter {
         }
     }
     #[cfg(test)]
-    pub(super) fn rebuilds(&self) -> usize {
+    pub(crate) fn rebuilds(&self) -> usize {
         self.cache.rebuilds
     }
     #[cfg(test)]
@@ -197,5 +197,21 @@ impl Emitter {
         if let Some(key) = &mut self.cache.key {
             key.generation = key.generation.wrapping_add(1);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn repeated_emits_reuse_the_resolved_style_cache() {
+        let grid = CellGrid::new(4, 1);
+        let mut surface = Surface::new(4, 1);
+        let mut emitter = Emitter::default();
+        for _ in 0..2 {
+            emitter.emit(&grid, Rect::full(4, 1), &mut surface, 0, 0);
+        }
+        assert_eq!(emitter.rebuilds(), 1);
     }
 }

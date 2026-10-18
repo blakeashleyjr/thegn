@@ -10,6 +10,7 @@ use crate::{
     sections::Section,
     seg::{StyleTok, Tok},
 };
+use std::cell::RefCell;
 use termwiz::surface::Surface;
 use thegn_core::series::Agg;
 use thegn_core::{
@@ -24,6 +25,16 @@ use thegn_metrics::{
 
 #[path = "overview/panels.rs"]
 mod panels;
+
+#[derive(Default)]
+struct OverviewPaintScratch {
+    grid: CellGrid,
+    emitter: kit::emit::Emitter,
+}
+
+thread_local! {
+    static PAINT_SCRATCH: RefCell<OverviewPaintScratch> = RefCell::new(OverviewPaintScratch::default());
+}
 
 const IDS: [PanelId; 8] = [
     PanelId("overview.cpu"),
@@ -363,57 +374,60 @@ impl TabView for OverviewView<'_> {
         let Some(index) = PANELS.iter().position(|meta| meta.id == placed.id) else {
             return;
         };
-        let mut grid = CellGrid::new(rect.cols, rect.rows);
-        let title = PANELS[index].title;
-        let (badge, lines, tone) = self.panel_content(index);
-        let content_rect;
-        {
-            let mut body = kit::panel::panel(
-                &mut grid,
-                Rect::full(rect.cols, rect.rows),
-                title,
-                badge.as_deref(),
-            );
-            content_rect = body.rect();
-            for (row, line) in lines.iter().take(body.rect().rows).enumerate() {
-                body.put_str(0, row, line, kit_style(tone));
-            }
-        }
-        let mut emitter = kit::emit::Emitter::default();
-        emitter.emit(
-            &grid,
-            Rect::full(rect.cols, rect.rows),
-            surface,
-            rect.x,
-            rect.y,
-        );
-        let graph_y = content_rect.y + lines.len();
-        let graph_rows = content_rect.rows.saturating_sub(lines.len());
-        if graph_rows > 0
-            && let Some(values) = self.0.sparks.get(index)
-        {
-            let series_count = values.iter().filter(|series| !series.is_empty()).count();
-            let rows_per_series = (graph_rows / series_count.max(1)).max(1);
-            let mut series_row = 0;
-            for series in values.iter().filter(|series| !series.is_empty()) {
-                let rows = rows_per_series.min(graph_rows.saturating_sub(series_row));
-                if rows == 0 {
-                    break;
-                }
-                crate::monitor::graphs::paint_history_graph(
-                    series,
-                    PANELS[index].ramp,
-                    Rect {
-                        x: rect.x + content_rect.x,
-                        y: rect.y + graph_y + series_row,
-                        cols: content_rect.cols,
-                        rows,
-                    },
-                    surface,
+        PAINT_SCRATCH.with(|scratch| {
+            let mut scratch = scratch.borrow_mut();
+            scratch.grid.resize(rect.cols, rect.rows);
+            scratch.grid.clear();
+            let title = PANELS[index].title;
+            let (badge, lines, tone) = self.panel_content(index);
+            let content_rect;
+            {
+                let mut body = kit::panel::panel(
+                    &mut scratch.grid,
+                    Rect::full(rect.cols, rect.rows),
+                    title,
+                    badge.as_deref(),
                 );
-                series_row += rows;
+                content_rect = body.rect();
+                for (row, line) in lines.iter().take(body.rect().rows).enumerate() {
+                    body.put_str(0, row, line, kit_style(tone));
+                }
             }
-        }
+            scratch.emitter.emit(
+                &scratch.grid,
+                Rect::full(rect.cols, rect.rows),
+                surface,
+                rect.x,
+                rect.y,
+            );
+            let graph_y = content_rect.y + lines.len();
+            let graph_rows = content_rect.rows.saturating_sub(lines.len());
+            if graph_rows > 0
+                && let Some(values) = self.0.sparks.get(index)
+            {
+                let series_count = values.iter().filter(|series| !series.is_empty()).count();
+                let rows_per_series = (graph_rows / series_count.max(1)).max(1);
+                let mut series_row = 0;
+                for series in values.iter().filter(|series| !series.is_empty()) {
+                    let rows = rows_per_series.min(graph_rows.saturating_sub(series_row));
+                    if rows == 0 {
+                        break;
+                    }
+                    crate::monitor::graphs::paint_history_graph(
+                        series,
+                        PANELS[index].ramp,
+                        Rect {
+                            x: rect.x + content_rect.x,
+                            y: rect.y + graph_y + series_row,
+                            cols: content_rect.cols,
+                            rows,
+                        },
+                        surface,
+                    );
+                    series_row += rows;
+                }
+            }
+        });
     }
 }
 
