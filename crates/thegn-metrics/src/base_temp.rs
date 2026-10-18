@@ -300,7 +300,7 @@ fn format_label(name: &str, label: Option<&str>, model: Option<&str>, channel: u
 
 #[cfg(test)]
 mod tests {
-    use super::{BaseTemp, merge_temperature};
+    use super::BaseTemp;
     use crate::collect::linux::hwmon::HwmonFs;
     use std::collections::BTreeMap;
     use std::io;
@@ -587,7 +587,7 @@ mod tests {
         for (readings, expected) in cases {
             let mut values = Vec::new();
             for (label, value) in readings {
-                merge_temperature(&mut values, label, value);
+                super::merge_temperature(&mut values, label, value);
             }
             assert_eq!(
                 values,
