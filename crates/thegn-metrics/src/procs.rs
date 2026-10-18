@@ -208,17 +208,21 @@ impl ProcSampler {
             .into_iter()
             .filter_map(|pid| {
                 let p = self.sys.process(pid)?;
+                let ppid = p.parent().map(|x| x.as_u32());
+                let name = p.name().to_string_lossy();
                 let start_ticks = if cfg!(target_os = "linux") {
-                    read_start_ticks(pid.as_u32(), &mut start_path, &mut start_buf)
+                    read_start_stat(pid.as_u32(), &mut start_path, &mut start_buf).and_then(
+                        |stat| matching_start_ticks(&stat, pid.as_u32(), ppid.unwrap_or(0), &name),
+                    )
                 } else {
                     None
                 };
                 Some(ProcSample {
                     pid: pid.as_u32(),
-                    ppid: p.parent().map(|x| x.as_u32()),
+                    ppid,
                     start_time: p.start_time(),
                     start_ticks,
-                    name: p.name().to_string_lossy().chars().take(32).collect(),
+                    name: name.chars().take(32).collect(),
                     cpu_pct: p.cpu_usage(),
                     rss_bytes: p.memory(),
                     run_secs: p.run_time(),
@@ -242,7 +246,8 @@ impl ProcSampler {
     /// Read one process's raw Linux start ticks. Useful for identity checks
     /// that need to compare against a fresh `/proc` observation.
     pub fn start_ticks_of(pid: u32) -> Option<u64> {
-        read_start_ticks(pid, &mut String::new(), &mut Vec::new())
+        read_start_stat(pid, &mut String::new(), &mut Vec::new())
+            .and_then(|stat| (stat.pid == pid).then_some(stat.starttime))
     }
 
     /// Attribute a process to thegn, the daemon, or a pane — walking ancestry,
@@ -274,7 +279,11 @@ impl ProcSampler {
     }
 }
 
-fn read_start_ticks(pid: u32, path: &mut String, buf: &mut Vec<u8>) -> Option<u64> {
+fn read_start_stat(
+    pid: u32,
+    path: &mut String,
+    buf: &mut Vec<u8>,
+) -> Option<crate::procs_model::Stat> {
     if !cfg!(target_os = "linux") {
         return None;
     }
@@ -292,8 +301,17 @@ fn read_start_ticks(pid: u32, path: &mut String, buf: &mut Vec<u8>) -> Option<u6
         }
         Err(_) => return None,
     }
-    let stat = crate::procs_parse::parse_stat(buf)?;
-    (stat.pid == pid).then_some(stat.starttime)
+    crate::procs_parse::parse_stat(buf)
+}
+
+fn matching_start_ticks(
+    stat: &crate::procs_model::Stat,
+    pid: u32,
+    ppid: u32,
+    name: &str,
+) -> Option<u64> {
+    (stat.pid == pid && stat.ppid == ppid && stat.comm.to_string_lossy().as_ref() == name)
+        .then_some(stat.starttime)
 }
 
 /// Keep the bounded union deterministically even when the OS process map arrives
@@ -477,6 +495,10 @@ mod start_ticks_tests {
         let pid = std::process::id();
         let actual = ProcSampler::start_ticks_of(pid);
         if cfg!(target_os = "linux") {
+            assert!(
+                actual.is_some(),
+                "Linux sampler should parse this process's stat"
+            );
             let stat = std::fs::read(format!("/proc/{pid}/stat")).unwrap();
             assert_eq!(
                 actual,
@@ -490,6 +512,33 @@ mod start_ticks_tests {
     #[test]
     fn nonexistent_pid_has_no_start_ticks() {
         assert_eq!(ProcSampler::start_ticks_of(u32::MAX), None);
+    }
+
+    #[test]
+    fn mismatched_stat_identity_has_no_start_ticks() {
+        let stat = crate::procs_model::Stat {
+            pid: 17,
+            comm: crate::procs_model::Comm::from_bytes(b"worker"),
+            ppid: 23,
+            starttime: 456,
+            ..Default::default()
+        };
+        assert_eq!(matching_start_ticks(&stat, 17, 23, "worker"), Some(456));
+
+        let mismatched_comm = crate::procs_model::Stat {
+            comm: crate::procs_model::Comm::from_bytes(b"replacement"),
+            ..stat
+        };
+        assert_eq!(
+            matching_start_ticks(&mismatched_comm, 17, 23, "worker"),
+            None
+        );
+
+        let mismatched_ppid = crate::procs_model::Stat { ppid: 29, ..stat };
+        assert_eq!(
+            matching_start_ticks(&mismatched_ppid, 17, 23, "worker"),
+            None
+        );
     }
 
     #[test]
