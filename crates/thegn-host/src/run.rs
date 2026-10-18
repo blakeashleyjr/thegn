@@ -9,7 +9,7 @@
 //! → no flashing).
 
 use anyhow::{Context, Result};
-use notify::{Event, RecursiveMode, Watcher, recommended_watcher};
+use notify::{Event, RecommendedWatcher, RecursiveMode, Watcher};
 
 use std::path::{Path, PathBuf};
 use tokio::sync::mpsc as tokio_mpsc;
@@ -958,20 +958,23 @@ pub async fn main(
             // leading-edge load would read the empty intermediate and drop the
             // trailing complete-content event.
             let (ev_tx, ev_rx) = std::sync::mpsc::channel::<()>();
-            if let Ok(mut watcher) = recommended_watcher(move |res: notify::Result<Event>| {
-                if let Ok(ev) = res
-                    && matches!(
-                        ev.kind,
-                        notify::EventKind::Modify(_)
-                            | notify::EventKind::Create(_)
-                            | notify::EventKind::Remove(_)
-                    )
-                {
-                    // best-effort: the recv loop owns the coalescing/load; a full
-                    // channel already has a pending wake-up, so a drop is fine.
-                    let _ = ev_tx.send(()); // best-effort: send: the consumer may be gone; a closed channel is the consumer going away
-                }
-            }) {
+            if let Ok(mut watcher) = RecommendedWatcher::new(
+                move |res: notify::Result<Event>| {
+                    if let Ok(ev) = res
+                        && matches!(
+                            ev.kind,
+                            notify::EventKind::Modify(_)
+                                | notify::EventKind::Create(_)
+                                | notify::EventKind::Remove(_)
+                        )
+                    {
+                        // best-effort: the recv loop owns the coalescing/load; a full
+                        // channel already has a pending wake-up, so a drop is fine.
+                        let _ = ev_tx.send(()); // best-effort: send: the consumer may be gone; a closed channel is the consumer going away
+                    }
+                },
+                crate::diff_watch::watcher_config(),
+            ) {
                 let _ = watcher.watch(parent, RecursiveMode::NonRecursive); // best-effort: watch: a failed registration just delays session updates until the next poll
                 let debounce = std::time::Duration::from_millis(200);
                 loop {
