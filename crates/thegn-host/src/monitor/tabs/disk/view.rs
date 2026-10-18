@@ -641,7 +641,7 @@ impl TabView for DiskView<'_> {
                 {
                     let mut util = [0.0; HISTORY];
                     let util_len = history.util.copy_ordered(&mut util);
-                    if rect.cols >= 38 + 8 + 1 {
+                    if rect.cols > 38 + 8 {
                         crate::monitor::graphs::paint_sparkline(
                             &util[..util_len],
                             8,
@@ -701,7 +701,12 @@ impl TabView for DiskView<'_> {
                         let peaks = format!("240-sample pk {read_peak} {write_peak}");
                         let label_cols = rect.cols.saturating_sub(2);
                         let mut grid = CellGrid::new(label_cols, 1);
-                        grid.put_str(0, 0, &peaks, CellStyle::default());
+                        grid.view(Rect::full(label_cols, 1)).put_str(
+                            0,
+                            0,
+                            &peaks,
+                            CellStyle::default(),
+                        );
                         Emitter::default().emit(
                             &grid,
                             Rect::full(label_cols, 1),
