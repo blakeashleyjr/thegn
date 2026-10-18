@@ -75,7 +75,7 @@ fn disk_ingest_is_visible_only_and_pause_freezes_its_model() {
     assert!(overlay.ingest_frame(&frame));
     assert_eq!(overlay.disk.test_read_bps(), Some(8_000_000.0));
 
-    overlay.tab = MonitorTab::Cpu;
+    overlay.tab = MonitorTab::Procs;
     frame.parts.diskstats.aggregate.read_bps = Some(55_000_000.0);
     assert!(!overlay.ingest_frame(&frame));
     assert_eq!(overlay.disk.test_read_bps(), Some(8_000_000.0));
@@ -116,8 +116,8 @@ fn disk_rebuild_uses_telemetry_history() {
     let mut ctx = StatusCtx::new_for_test_on(&history, Rect::full(240, 60));
     ctx.now_ms = 3000;
     let mut overlay = MonitorOverlay::open(MonitorTab::Disk, MonitorPrefs::default(), &model, &ctx);
-    assert_eq!(overlay.disk.test_telemetry_state().0, 2);
-    assert_eq!(overlay.disk.test_telemetry_state().1, 2);
+    assert_eq!(overlay.disk.test_telemetry_state().0, 240);
+    assert_eq!(overlay.disk.test_telemetry_state().1, 240);
     assert_eq!(overlay.disk.test_telemetry_state().2, Some(18_000_000.0));
     assert_eq!(overlay.disk.test_telemetry_state().3, Some(4_000_000.0));
     let values = overlay.disk.test_telemetry_read_values();
