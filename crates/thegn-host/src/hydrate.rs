@@ -1810,15 +1810,17 @@ fn collect_sidebar_status(
     // Repo-root / submodule-mode resolution (a `git rev-parse` on a cold memo)
     // happens inside each job, off the hydration thread; the config is cloned
     // once per hydration.
+    // (row, clean, dirty_known) per scanned worktree.
+    type GlyphScanJob = crate::scan_pool::ScanJob<(GlyphRow, bool, bool)>;
     let cfg = std::sync::Arc::new(app_cfg.clone());
-    let jobs: Vec<(bool, crate::scan_pool::ScanJob<(GlyphRow, bool, bool)>)> = to_scan
+    let jobs: Vec<(bool, GlyphScanJob)> = to_scan
         .iter()
         .map(|p| {
             let prior = prior_for_scan.get(p).cloned();
             let urgent = active_path.as_deref() == Some(p.as_str());
             let path = p.clone();
             let cfg = std::sync::Arc::clone(&cfg);
-            let job: crate::scan_pool::ScanJob<(GlyphRow, bool, bool)> = Box::new(move || {
+            let job: GlyphScanJob = Box::new(move || {
                 let wt = std::path::Path::new(&path);
                 let repo_root =
                     thegn_core::repo::main_worktree(wt).unwrap_or_else(|| wt.to_path_buf());
