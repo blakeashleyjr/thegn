@@ -854,6 +854,11 @@ fn recv_by_deadline<T>(
     receiver.recv_timeout(deadline.saturating_duration_since(Instant::now()))
 }
 
+/// One pipe-reader result: the sink, captured stderr, and the truncated, drained
+/// and abandoned flags, or the reader's error text.
+#[cfg(unix)]
+type PipeReadResult<S> = Result<(S, String, bool, bool, bool), String>;
+
 #[cfg(unix)]
 fn read_plugin_pipes<S: NdjsonSink>(
     stdout: Option<std::process::ChildStdout>,
@@ -861,7 +866,7 @@ fn read_plugin_pipes<S: NdjsonSink>(
     sink: S,
     started: Instant,
     deadline_ms: Arc<AtomicU64>,
-    sender: mpsc::Sender<Result<(S, String, bool, bool, bool), String>>,
+    sender: mpsc::Sender<PipeReadResult<S>>,
 ) {
     #[cfg(test)]
     let _reader_guard = LivePipeReaderGuard::new();
