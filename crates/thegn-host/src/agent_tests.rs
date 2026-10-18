@@ -202,7 +202,7 @@ fn prepare_sandbox_env_reuses_failed_podman_probe_and_keeps_warnings() {
     std::fs::write(
         &podman,
         format!(
-            "#!/bin/sh\nif [ \"$1\" = version ]; then exit 0; fi\nif [ \"$1\" = run ]; then echo attempt >> '{}'; fi\nexit 1\n",
+            "#!/bin/sh\nif [ \"$1\" = version ]; then exit 0; fi\necho attempt >> '{}';\nexit 1\n",
             counter.display()
         ),
     )
