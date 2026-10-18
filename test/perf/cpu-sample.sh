@@ -26,6 +26,7 @@
 # Exit status: 0 ok; 2 over a ceiling (CPU or resource); 1 harness error.
 # TG_PERF_DROP_KEYS=1 is a negative control: discard workload keys and verify
 # that the input self-check fails. Workload runs require observable key dispatch.
+# TG_PERF_SANDBOX=1 uses sandboxed panes, which share the live thegn.slice ceiling.
 
 set -euo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -325,10 +326,7 @@ if [ "$SCENARIO" = soak-daemon ]; then
   DAEMON_SOCK_CONFIG="${DAEMON_SOCK_CONFIG//\"/\\\"}"
   printf '[daemon]\nsocket = "%s"\n' "$DAEMON_SOCK_CONFIG" >"$XDG_CONFIG_HOME/thegn/config.toml"
 fi
-if [ "${TG_PERF_SANDBOX:-}" != 1 ]; then
-  mkdir -p "$XDG_CONFIG_HOME/thegn"
-  printf '\n[sandbox]\nenabled = false\n' >>"$XDG_CONFIG_HOME/thegn/config.toml"
-fi
+perf_sandbox_off_default
 perf_seed_fixture_registry "$WORKTREES" "$BIN_ABS" "$REPO"
 LOG_FILE="$XDG_STATE_HOME/thegn/logs/thegn.log"
 rm -f -- "$LOG_FILE"
@@ -346,14 +344,15 @@ if [ -n "$TIMEOUT_BIN" ]; then
   # `$0`/`$1` are the bash -c positionals bound by the arguments below.
   # shellcheck disable=SC2016
   "$TIMEOUT_BIN" "${VERIFY_TIMEOUT_S}s" bash -c 'source "$0"; pty_run "$1"' \
-    "$HERE/../lib/pty.sh" "$VERIFY_INNER" >/dev/null 2>&1 &
+    "$HERE/../lib/pty.sh" "$VERIFY_INNER" </dev/null >/dev/null 2>&1 &
 else
   bash -c 'source "$0"; pty_run "$1"' \
-    "$HERE/../lib/pty.sh" "$VERIFY_INNER" >/dev/null 2>&1 &
+    "$HERE/../lib/pty.sh" "$VERIFY_INNER" </dev/null >/dev/null 2>&1 &
 fi
 VERIFY_LAUNCHER=$!
-perf_track_process_group "$VERIFY_LAUNCHER"
-perf_watch_process_group "$VERIFY_LAUNCHER" "$VERIFY_TIMEOUT_S"
+set +m
+perf_track_process_group "$VERIFY_LAUNCHER" "$VERIFY_PIDFILE"
+perf_watch_process_group "$VERIFY_LAUNCHER" "$VERIFY_TIMEOUT_S" "$VERIFY_PIDFILE"
 EXPECTED_WORKTREES=$((WORKTREES + 1))
 WORKTREES_COLLECTED=0
 VERIFY_POLLS=$(((SETTLE_MAX_MS + 199) / 200))
@@ -367,18 +366,14 @@ for _ in $(seq 1 "$VERIFY_POLLS"); do
   sleep 0.2
 done
 if [ "$WORKTREES_COLLECTED" != "$EXPECTED_WORKTREES" ]; then
-  perf_stop_process_group "$VERIFY_LAUNCHER"
+  perf_stop_process_group "$VERIFY_LAUNCHER" "$VERIFY_PIDFILE"
   echo "FAIL: sidebar status did not collect worktrees=$EXPECTED_WORKTREES in $LOG_FILE" >&2
   if [ "$JSON_ONLY" = 1 ]; then
     printf '{"worktrees_collected":{"status":"failed","expected":%s}}\n' "$EXPECTED_WORKTREES"
   fi
   exit 1
 fi
-VERIFY_PID="$(cat "$VERIFY_PIDFILE" 2>/dev/null || true)"
-if [ -n "$VERIFY_PID" ]; then
-  kill -TERM "$VERIFY_PID" 2>/dev/null || true
-fi
-perf_stop_process_group "$VERIFY_LAUNCHER"
+perf_stop_process_group "$VERIFY_LAUNCHER" "$VERIFY_PIDFILE"
 if [ "$SPAWN_ENABLED" = 1 ] && [ "$SAMPLER" = proc ]; then
   # `$1`/`$@` are the bash -c positionals passed after `$0`, not outer values.
   # shellcheck disable=SC2016
@@ -400,13 +395,14 @@ TIMEOUT_BIN="$(pty_timeout_bin)"
 # Single quotes are deliberate: $0/$1 are the INNER bash's positionals, bound by
 # the two arguments below, not this shell's. (Same idiom as flood.sh.)
 # shellcheck disable=SC2016
+set -m
 if [ -n "$TIMEOUT_BIN" ]; then
   if [ "$WORKLOAD" = 1 ]; then
     "$TIMEOUT_BIN" "${DEADLINE_S}s" bash -c 'source "$0"; pty_run "$1"' \
       "$HERE/../lib/pty.sh" "$INNER" <"$FIFO" >/dev/null 2>&1 &
   else
     "$TIMEOUT_BIN" "${DEADLINE_S}s" bash -c 'source "$0"; pty_run "$1"' \
-      "$HERE/../lib/pty.sh" "$INNER" >/dev/null 2>&1 &
+      "$HERE/../lib/pty.sh" "$INNER" </dev/null >/dev/null 2>&1 &
   fi
 else
   # No timeout binary: the bench window (THEGN_BENCH_RUN_MS) still exits on its
@@ -414,12 +410,13 @@ else
   if [ "$WORKLOAD" = 1 ]; then
     bash -c 'source "$0"; pty_run "$1"' "$HERE/../lib/pty.sh" "$INNER" <"$FIFO" >/dev/null 2>&1 &
   else
-    bash -c 'source "$0"; pty_run "$1"' "$HERE/../lib/pty.sh" "$INNER" >/dev/null 2>&1 &
+    bash -c 'source "$0"; pty_run "$1"' "$HERE/../lib/pty.sh" "$INNER" </dev/null >/dev/null 2>&1 &
   fi
 fi
 LAUNCHER=$!
-perf_track_process_group "$LAUNCHER"
-perf_watch_process_group "$LAUNCHER" "$DEADLINE_S"
+set +m
+perf_track_process_group "$LAUNCHER" "$PIDFILE"
+perf_watch_process_group "$LAUNCHER" "$DEADLINE_S" "$PIDFILE"
 if [ "$WORKLOAD" = 1 ]; then
   exec 3>"$FIFO"
 fi
@@ -437,10 +434,10 @@ if [ "$SCENARIO" = soak-daemon ]; then
     # shellcheck disable=SC2016,SC2086
     "$STRACE_BIN" $SPAWN_STRACE_FLAGS -o "$TRACE_DAEMON_FILE" \
       bash -c 'echo $$ > "$1"; shift; exec "$@"' _ "$DAEMON_PIDFILE" \
-      "$BIN_ABS" daemon --socket "$DAEMON_SOCK" >/dev/null 2>&1 &
+      "$BIN_ABS" daemon --socket "$DAEMON_SOCK" </dev/null >/dev/null 2>&1 &
   else
     DAEMON_PIDFILE=""
-    "$BIN_ABS" daemon --socket "$DAEMON_SOCK" >/dev/null 2>&1 &
+    "$BIN_ABS" daemon --socket "$DAEMON_SOCK" </dev/null >/dev/null 2>&1 &
   fi
   DAEMON_LAUNCHER=$!
   # The socket is the readiness signal; the UI attaches to the same path.
@@ -453,9 +450,8 @@ if [ "$SCENARIO" = soak-daemon ]; then
     if [ "$JSON_ONLY" = 1 ]; then
       printf '%s\n' '{"input":{"status":"failed","error":"daemon never bound"}}'
     fi
-    kill "$LAUNCHER" 2>/dev/null || true
+    perf_stop_process_group "$LAUNCHER" "$PIDFILE"
     exec 3>&-
-    wait "$LAUNCHER" 2>/dev/null || true
     kill "$DAEMON_LAUNCHER" 2>/dev/null || true
     wait "$DAEMON_LAUNCHER" 2>/dev/null || true
     exit 1
@@ -477,9 +473,8 @@ if [ -z "$PID" ] || ! kill -0 "$PID" 2>/dev/null; then
   else
     echo "cpu-sample: thegn did not start" >&2
   fi
-  kill "$LAUNCHER" 2>/dev/null || true
+  perf_stop_process_group "$LAUNCHER" "$PIDFILE"
   if [ "$WORKLOAD" = 1 ]; then exec 3>&-; fi
-  wait "$LAUNCHER" 2>/dev/null || true
   if [ -n "$DAEMON_LAUNCHER" ]; then
     kill "$DAEMON_LAUNCHER" 2>/dev/null || true
     wait "$DAEMON_LAUNCHER" 2>/dev/null || true
@@ -636,9 +631,8 @@ for event in events:
 PY
     echo 'FAIL: could not write keys to the pty master' >&2
     if [ "$JSON_ONLY" = 1 ]; then printf '%s\n' '{"input":{"status":"failed"}}'; fi
-    kill "$PID" 2>/dev/null || true
+    perf_stop_process_group "$LAUNCHER" "$PIDFILE"
     exec 3>&-
-    wait "$LAUNCHER" 2>/dev/null || true
     if [ -n "$DAEMON_LAUNCHER" ]; then
       "$BIN_ABS" daemon stop >/dev/null 2>&1 || kill "$DAEMON_LAUNCHER" 2>/dev/null || true
       wait "$DAEMON_LAUNCHER" 2>/dev/null || true
@@ -661,9 +655,8 @@ PY
     if [ "$JSON_ONLY" = 1 ]; then
       printf '{"input":{"status":"failed","keys_bytes":%s,"dispatch_lines":%s,"matched":%s,"sessions":null}}\n' "$KEYS_BYTES" "$DISPATCH_LINES" "$MATCHED_LINES"
     fi
-    kill "$PID" 2>/dev/null || true
+    perf_stop_process_group "$LAUNCHER" "$PIDFILE"
     exec 3>&-
-    wait "$LAUNCHER" 2>/dev/null || true
     if [ -n "$DAEMON_LAUNCHER" ]; then
       "$BIN_ABS" daemon stop >/dev/null 2>&1 || kill "$DAEMON_LAUNCHER" 2>/dev/null || true
       wait "$DAEMON_LAUNCHER" 2>/dev/null || true
@@ -675,9 +668,8 @@ PY
     if [ "$JSON_ONLY" = 1 ]; then
       printf '{"input":{"status":"failed","keys_bytes":%s,"dispatch_lines":%s,"matched":%s,"sessions":null}}\n' "$KEYS_BYTES" "$DISPATCH_LINES" "$MATCHED_LINES"
     fi
-    kill "$PID" 2>/dev/null || true
+    perf_stop_process_group "$LAUNCHER" "$PIDFILE"
     exec 3>&-
-    wait "$LAUNCHER" 2>/dev/null || true
     "$BIN_ABS" daemon stop >/dev/null 2>&1 || kill "$DAEMON_LAUNCHER" 2>/dev/null || true
     wait "$DAEMON_LAUNCHER" 2>/dev/null || true
     exit 1
@@ -699,9 +691,8 @@ PY
       if [ "$JSON_ONLY" = 1 ]; then
         printf '{"input":{"status":"failed","keys_bytes":%s,"dispatch_lines":%s,"matched":%s,"sessions":0}}\n' "$KEYS_BYTES" "$DISPATCH_LINES" "$MATCHED_LINES"
       fi
-      kill "$PID" 2>/dev/null || true
+      perf_stop_process_group "$LAUNCHER" "$PIDFILE"
       exec 3>&-
-      wait "$LAUNCHER" 2>/dev/null || true
       "$BIN_ABS" daemon stop >/dev/null 2>&1 || kill "$DAEMON_LAUNCHER" 2>/dev/null || true
       wait "$DAEMON_LAUNCHER" 2>/dev/null || true
       exit 1
@@ -899,13 +890,10 @@ fi
 
 # Every measurement is taken. Stop thegn now instead of waiting out the bench
 # window's (deliberately generous) tail, then reap the launcher.
-if [ "$SAMPLER" = proc ] && [ -n "${PID:-}" ]; then
-  kill "$PID" 2>/dev/null || true
-fi
 if [ "$WORKLOAD" = 1 ]; then
   exec 3>&-
 fi
-wait "$LAUNCHER" 2>/dev/null || true
+perf_stop_process_group "$LAUNCHER" "$PIDFILE"
 # Stop the daemon this run started. It lives in an isolated state dir, so a
 # leaked one would not corrupt anything — but it WOULD sit on a socket under a
 # temp dir the EXIT trap is about to delete, and outlive every future run.
