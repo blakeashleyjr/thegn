@@ -186,12 +186,15 @@ fn negative_error_in_done_payload_is_reported() {
 
 #[test]
 fn malformed_diag_rows_are_counted_for_the_dump_result() {
-    let mut bytes = frame(20, 7, &[1, 2, 3]);
-    bytes.extend_from_slice(&frame(libc::NLMSG_DONE as u16, 7, &[]));
     let mut rows = Vec::new();
     let mut stats = super::DumpStats::default();
-    let done = super::consume_and_record(&bytes, 7, &mut rows, &mut stats).unwrap();
+    let first = frame(20, 7, &[1, 2, 3]);
+    let first_done = super::consume_and_record(&first, 7, &mut rows, &mut stats).unwrap();
+    assert!(!first_done);
+    let mut second = frame(20, 7, &[4, 5, 6]);
+    second.extend_from_slice(&frame(libc::NLMSG_DONE as u16, 7, &[]));
+    let done = super::consume_and_record(&second, 7, &mut rows, &mut stats).unwrap();
     assert!(done);
     assert!(rows.is_empty());
-    assert_eq!(stats.malformed, 1);
+    assert_eq!(stats.malformed, 2);
 }
