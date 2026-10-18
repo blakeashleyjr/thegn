@@ -78,6 +78,7 @@ pub(in crate::monitor) struct ThermalModel {
     zones: Vec<ZoneRow>,
     cores: [Option<f32>; 16],
     gfx_c: Option<f32>,
+    edge_c: Option<f32>,
     hotspot_c: Option<f32>,
     soc_c: Option<f32>,
     socket_w: Option<f32>,
@@ -90,6 +91,7 @@ impl Default for ThermalModel {
             zones: Vec::with_capacity(16),
             cores: [None; 16],
             gfx_c: None,
+            edge_c: None,
             hotspot_c: None,
             soc_c: None,
             socket_w: None,
@@ -134,6 +136,7 @@ impl ThermalModel {
         let mut zone_count = 0;
         self.cores.fill(None);
         self.gfx_c = None;
+        self.edge_c = None;
         self.hotspot_c = None;
         self.soc_c = None;
         self.socket_w = None;
@@ -183,13 +186,16 @@ impl ThermalModel {
             }
         }
         self.sensors.truncate(sensor_count);
-        self.sensors.sort_by(|left, right| {
-            left.chip.cmp(&right.chip).then_with(|| {
-                right
-                    .temp_c
-                    .partial_cmp(&left.temp_c)
-                    .unwrap_or(std::cmp::Ordering::Equal)
-            })
+        self.sensors.sort_unstable_by(|left, right| {
+            left.chip
+                .cmp(&right.chip)
+                .then_with(|| {
+                    right
+                        .temp_c
+                        .partial_cmp(&left.temp_c)
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                })
+                .then_with(|| left.label.cmp(&right.label))
         });
 
         for zone in &frame.parts.thermal_zone.zones {
@@ -217,24 +223,45 @@ impl ThermalModel {
                 continue;
             }
             let metrics = &card.metrics;
-            for (dest, source) in self.cores.iter_mut().zip(metrics.temperature_core) {
-                *dest = source
+            let card_cores = metrics.temperature_core.map(|source| {
+                source
                     .map(|value| f32::from(value) / 100.0)
-                    .filter(|value| thermal::plausible_range(*value));
+                    .filter(|value| thermal::plausible_range(*value))
+            });
+            if card_cores.iter().any(Option::is_some) && !self.cores.iter().any(Option::is_some) {
+                self.cores = card_cores;
             }
-            self.gfx_c = metrics
+            let gfx_c = metrics
                 .temperature_gfx
                 .map(|value| f32::from(value) / 100.0)
                 .filter(|value| thermal::plausible_range(*value));
-            self.hotspot_c = metrics
+            let edge_c = metrics
+                .temperature_edge
+                .map(|value| f32::from(value) / 100.0)
+                .filter(|value| thermal::plausible_range(*value));
+            let hotspot_c = metrics
                 .temperature_hotspot
                 .map(|value| f32::from(value) / 100.0)
                 .filter(|value| thermal::plausible_range(*value));
-            self.soc_c = metrics
+            let soc_c = metrics
                 .temperature_soc
                 .map(|value| f32::from(value) / 100.0)
                 .filter(|value| thermal::plausible_range(*value));
-            self.socket_w = metrics.power_socket.map(|value| value as f32 / 1000.0);
+            if self.gfx_c.is_none() {
+                self.gfx_c = gfx_c;
+            }
+            if self.edge_c.is_none() {
+                self.edge_c = edge_c;
+            }
+            if self.hotspot_c.is_none() {
+                self.hotspot_c = hotspot_c;
+            }
+            if self.soc_c.is_none() {
+                self.soc_c = soc_c;
+            }
+            if self.socket_w.is_none() {
+                self.socket_w = metrics.power_socket.map(|value| value as f32 / 1000.0);
+            }
         }
     }
 
@@ -276,10 +303,10 @@ impl TabView for ThermalView<'_> {
 
     fn template(&self) -> Node {
         let model = self.0;
-        let mut row = vec![
-            (Size::Weight(2), Node::Panel(PACKAGE)),
-            (Size::Weight(1), Node::Panel(CORES)),
-        ];
+        let mut row = vec![(Size::Weight(2), Node::Panel(PACKAGE))];
+        if self.0.cores.iter().any(Option::is_some) {
+            row.push((Size::Weight(1), Node::Panel(CORES)));
+        }
         if model.has_gpu() {
             row.push((Size::Weight(1), Node::Panel(GPU)));
         }
@@ -299,7 +326,7 @@ impl TabView for ThermalView<'_> {
             PACKAGE | SENSORS => {
                 set.insert(CollectorId::Hwmon);
             }
-            CORES => {
+            CORES if self.0.cores.iter().any(Option::is_some) => {
                 set.insert(CollectorId::AmdSmu);
             }
             ZONES if !self.0.zones.is_empty() => {
@@ -357,6 +384,7 @@ impl ThermalModel {
     fn has_gpu(&self) -> bool {
         self.sensors.iter().any(|row| row.group == ChipGroup::Gpu)
             || self.gfx_c.is_some()
+            || self.edge_c.is_some()
             || self.hotspot_c.is_some()
     }
 }
