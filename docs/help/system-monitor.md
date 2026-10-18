@@ -22,13 +22,14 @@ Chips that can expand say so in their top-right corner.
 
 ## Tabs
 
-`Tab` and `Shift-Tab` walk the tabs; so do `←`/`→` and `h`/`l`. Each tab in the
-bar carries its own number, and typing that number jumps straight to it —
-`1`–`9`, then `0` for the tenth, so the last tab is reachable too. The numbers
-count the tabs you can actually see, so `2` means the same thing on a laptop and
-on a GPU-less server. On a terminal too narrow for the whole strip, the bar
-scrolls to keep the active tab whole and marks the tabs scrolled off each end,
-rather than clipping the tab you are on.
+`Tab` and `Shift-Tab` walk the tabs; so do `←`/`→` and `h`/`l`. Each of the
+first ten tabs carries its number, and typing that number jumps straight to it —
+`1`–`9`, then `0` for the tenth. If every optional tab appears, Notifications
+is eleventh and has no digit key.
+The numbers count the tabs you can actually see, so `2` means the same thing on
+a laptop and on a GPU-less server. On a terminal too narrow for the whole
+strip, the bar scrolls to keep the active tab whole and marks the tabs scrolled
+off each end, rather than clipping the tab you are on.
 
 Tabs only appear when their source is available — no battery means no Power
 tab, and the GPU tab appears when a GPU reports utilisation. AMD cards and APUs
@@ -73,13 +74,15 @@ log scale while Network stays on a live linear one.
   load average — fall back to `window` under `fixed`, since there is no honest
   number to divide by.
 
-`Space` **pauses**. That freezes the picture, not the recording: samples keep
-accumulating underneath, so resuming shows a continuous timeline with no gap.
-Pausing also drops the sampler back to its normal rate, so a frozen monitor is
-cheaper than a live one.
+`Space` **pauses**. That freezes the picture. The history graphs keep recording
+at the normal, non-live rate, so resuming shows no gap; the monitor's detailed
+sampler stops until you resume. That makes a paused monitor cheaper than a live
+one.
 
-While the monitor is open and live, its sampler reads every available
-collector; paused or covered, it parks, and nothing runs once it is closed.
+On the Overview, CPU and Memory tabs, the sampler reads only what the panels
+on screen need; the other tabs still read every collector. When paused or
+covered, the monitor's detailed sampler parks; nothing runs once the monitor is
+closed.
 
 Note two deliberate differences from the other overlays: `Space` is pause here
 (use `PgDn` to page), and `g` cycles the graph style rather than jumping to the
@@ -104,7 +107,6 @@ Overview is the default landing tab. It summarizes CPU and per-core activity,
 load and pressure, memory health, network rates, disk activity, thermal state,
 power when a battery is present, and process/container counts. Panels appear
 when their source has a reading; absent readings use the terminal absent mark.
-If every optional tab appears, Notifications is eleventh and has no digit key.
 
 ## CPU
 
