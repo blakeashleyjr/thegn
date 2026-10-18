@@ -113,14 +113,14 @@ fn start_secs_for_ticks(ticks: u64) -> Option<u64> {
 }
 
 #[cfg(target_os = "linux")]
-fn read_start_ticks(pid: u32) -> Option<u64> {
+pub(super) fn read_start_ticks(pid: u32) -> Option<u64> {
     let stat = std::fs::read(format!("/proc/{pid}/stat")).ok()?;
     let stat = thegn_metrics::procs_parse::parse_stat(&stat)?;
     (stat.pid == pid).then_some(stat.starttime)
 }
 
 #[cfg(target_os = "linux")]
-fn identity_matches(
+pub(super) fn identity_matches(
     start: ProcStart,
     live_ticks: Option<u64>,
     live_secs: impl FnOnce() -> Option<u64>,
