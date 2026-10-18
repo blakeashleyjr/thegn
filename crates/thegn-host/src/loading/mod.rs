@@ -13,6 +13,23 @@ pub mod track;
 
 use crate::chrome::LoadStep;
 
+/// Derive the active tab's drawn splash and whether the run loop needs periodic
+/// repaint ticks. Keep both decisions here so tests exercise the same ticker
+/// visibility rule used by `run.rs`.
+pub(crate) fn derive_splash(
+    loading_state: &track::LoadingTracker,
+    session: &crate::session::Session,
+) -> (Vec<LoadStep>, bool) {
+    let steps = session
+        .worktrees
+        .get(session.active)
+        .and_then(|group| loading_state.get(&(group.name.clone(), group.active_tab)))
+        .cloned()
+        .unwrap_or_default();
+    let ticker_visible = ticker::is_animating(&steps);
+    (steps, ticker_visible)
+}
+
 /// The startup-shell watchdog deadline: how long a just-attached login shell may
 /// emit no PTY output before it's treated as hung and swapped for a clean rc-free
 /// shell. A LOCAL shell should prompt in ~1-2s, so 8s is snappy-but-safe. A
@@ -167,26 +184,44 @@ pub(crate) fn apply_spec_batch(
 /// `!loading_state.is_empty()` stays true forever — gating the drain on the raw
 /// map emptiness made it rescan every tab (and re-log "first pane output") on
 /// *every* output chunk of *every* pane for the rest of the session. Only a
-/// shell-wait entry is ever clearable here (empty markers and live-provision
-/// steps are not), so when this returns `false` the drain can skip the tab scan
-/// entirely.
+/// shell-wait entry or a fully terminal eager-provision plan is clearable here
+/// (empty markers and live-provision steps are not), so when this returns
+/// `false` the drain can skip the tab scan entirely. Like the existing
+/// shell-wait pre-gate, a terminal eager plan on a background worktree can keep
+/// this true and cause output from unrelated panes to rescan tabs.
 pub(crate) fn any_clearable_splash(
     loading_state: &std::collections::HashMap<(String, usize), Vec<LoadStep>>,
 ) -> bool {
-    loading_state.values().any(|s| is_shell_wait(s))
+    loading_state
+        .values()
+        .any(|steps| is_shell_wait(steps) || is_terminal_splash(steps))
+}
+
+/// Eager provisioning does not append the materialize path's trailing shell
+/// step. Once every streamed row is terminal, the first PTY output is still
+/// proof that the shell is live and can retire that failed splash.
+fn is_terminal_splash(steps: &[LoadStep]) -> bool {
+    !steps.is_empty()
+        && steps.iter().all(|step| {
+            matches!(
+                step.state,
+                crate::chrome::StepState::Done | crate::chrome::StepState::Failed
+            )
+        })
 }
 
 /// Whether a pane's PTY output should clear its worktree/tab's loading splash:
-/// true ONLY when this exact key holds a splash in the terminal shell-wait shape
-/// (provisioning DONE, merely waiting on the login shell to speak). A missing
-/// key, a lingering empty marker, or live-provision steps all return `false` —
-/// so mid-provision output never drops the splash (the premature-shell guard),
-/// and the clear (with its diagnostic log) fires once, not per output chunk.
+/// true when this exact key holds a terminal splash whose shell has spoken: the
+/// shell-wait shape, or a fully terminal eager-provision plan. A missing key,
+/// lingering empty marker, or live-provision steps return `false`, so
+/// mid-provision output never drops the splash (the premature-shell guard).
 pub(crate) fn should_clear_splash_on_output(
     loading_state: &std::collections::HashMap<(String, usize), Vec<LoadStep>>,
     key: &(String, usize),
 ) -> bool {
-    loading_state.get(key).is_some_and(|s| is_shell_wait(s))
+    loading_state
+        .get(key)
+        .is_some_and(|steps| is_shell_wait(steps) || is_terminal_splash(steps))
 }
 
 /// Whether a live provisioning-splash update for `key` should be applied, given
@@ -402,7 +437,14 @@ mod tests {
             !any_clearable_splash(&ls),
             "live-provision steps are held, not cleared, on output"
         );
-        // A single shell-wait entry flips the pre-gate on.
+        // A terminal eager-provision failure is also clearable after its shell
+        // speaks, despite not carrying the materialize path's shell row.
+        ls.insert(
+            ("wt-failed".into(), 0),
+            vec![LoadStep::done("clone"), LoadStep::failed("setup")],
+        );
+        assert!(any_clearable_splash(&ls));
+        // A shell-wait entry flips the pre-gate on too.
         ls.insert(("wt-ready".into(), 0), shell_wait());
         assert!(
             any_clearable_splash(&ls),
@@ -430,18 +472,24 @@ mod tests {
     }
 
     #[test]
-    fn should_clear_splash_on_output_is_keyed_and_shell_wait_only() {
+    fn should_clear_splash_on_output_is_keyed_and_waits_for_terminal_steps() {
         use std::collections::HashMap;
         let mut ls: HashMap<(String, usize), Vec<LoadStep>> = HashMap::new();
         let ready = ("wt-ready".to_string(), 0usize);
         let parked = ("wt-parked".to_string(), 0usize);
         let provisioning = ("wt-provisioning".to_string(), 1usize);
+        let failed = ("wt-failed".to_string(), 0usize);
         ls.insert(ready.clone(), shell_wait());
         ls.insert(parked.clone(), Vec::new());
         ls.insert(provisioning.clone(), vec![LoadStep::active("provisioning")]);
+        ls.insert(
+            failed.clone(),
+            vec![LoadStep::done("clone"), LoadStep::failed("setup")],
+        );
 
-        // Only the shell-wait key clears on its shell's first byte.
+        // Shell-wait and terminal failed plans clear on their shell's first byte.
         assert!(should_clear_splash_on_output(&ls, &ready));
+        assert!(should_clear_splash_on_output(&ls, &failed));
         // A lingering empty marker never clears (it isn't a live splash).
         assert!(!should_clear_splash_on_output(&ls, &parked));
         // Mid-provision output is HELD — clearing here is the premature-shell bug.
