@@ -161,6 +161,8 @@ pub fn default_collectors() -> Vec<Box<dyn Collector>> {
     collectors[CollectorId::CgroupSlice.index()] =
         Box::new(linux::cgroup_slice::CgroupSliceCollector::default());
     collectors[CollectorId::AmdSmu.index()] = Box::new(linux::amd_smu::AmdSmuCollector::new());
+    collectors[CollectorId::Meminfo.index()] = Box::new(linux::meminfo::MeminfoCollector::new());
+    collectors[CollectorId::Vmstat.index()] = Box::new(linux::vmstat::VmstatCollector::new());
     collectors
 }
 

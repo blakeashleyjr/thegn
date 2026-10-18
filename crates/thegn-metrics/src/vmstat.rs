@@ -6,14 +6,7 @@ use std::fs::File;
 /// Parse one whitespace-separated vmstat field by exact key.
 #[cfg(any(target_os = "linux", test))]
 pub(crate) fn parse_field(buf: &[u8], key: &[u8]) -> Option<u64> {
-    buf.split(|byte| *byte == b'\n').find_map(|line| {
-        let separator = line.iter().position(|byte| *byte == b' ')?;
-        let (field, value) = line.split_at(separator);
-        if field != key {
-            return None;
-        }
-        std::str::from_utf8(&value[1..]).ok()?.trim().parse().ok()
-    })
+    crate::collect::parse::vmstat::field(buf, key)
 }
 
 /// Reusable reader for the direct-reclaim counter.
