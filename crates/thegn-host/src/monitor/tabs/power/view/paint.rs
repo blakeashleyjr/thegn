@@ -108,6 +108,14 @@ pub(super) fn paint_battery(grid: &mut CellGrid, rect: Rect, model: &PowerModel)
             );
         }
     }
+    if model.battery_history.is_empty() && rect.rows > 0 {
+        put_line(
+            grid,
+            rect,
+            rect.rows - 1,
+            &format!("charge history {}", mark(model.power_supply_health)),
+        );
+    }
 }
 pub(super) fn paint_rails(grid: &mut CellGrid, rect: Rect, model: &PowerModel) {
     let values = [
