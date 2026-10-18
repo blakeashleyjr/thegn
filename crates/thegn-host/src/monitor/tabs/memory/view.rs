@@ -113,6 +113,7 @@ pub(in crate::monitor) struct MemoryModel {
     pub psi_full_avg60: Option<f64>,
     psi_history: MemoryHistory,
     used_history: MemoryHistory,
+    reclaim_history: MemoryHistory,
     pub health: MemHealth,
 }
 
@@ -187,6 +188,7 @@ impl Default for MemoryModel {
             psi_full_avg60: None,
             psi_history: MemoryHistory::default(),
             used_history: MemoryHistory::default(),
+            reclaim_history: MemoryHistory::default(),
             health: mem_health::evaluate(&MemHealthInput::default()),
         }
     }
@@ -243,6 +245,9 @@ impl MemoryModel {
         self.allocstall = vm.rates[VmRate::Allocstall as usize];
         self.major_faults = vm.rates[VmRate::Pgmajfault as usize];
         self.oom_kill = vm.rates[VmRate::OomKill as usize];
+        if let Some(reclaim) = self.reclaim {
+            self.reclaim_history.push(reclaim as f32);
+        }
         if self.oom_kill.is_some_and(|rate| rate > 0.0) {
             self.last_oom_at_ms = Some(frame.at_ms);
         }
@@ -821,6 +826,54 @@ impl MemoryView<'_> {
                 fmt: NumFmt::default(),
             },
         );
+        self.paint_reclaim_history(grid, body);
+    }
+
+    fn paint_reclaim_history(&self, grid: &mut CellGrid, body: Rect) {
+        if self.0.reclaim_history.len == 0 || body.rows < 10 || body.cols == 0 {
+            return;
+        }
+        let label_y = body.y.saturating_add(8);
+        if label_y >= body.y.saturating_add(body.rows) {
+            return;
+        }
+        let mut values = [0.0_f32; HISTORY_CAPACITY];
+        let (len, peak) = self.0.reclaim_history.copy_recent(&mut values);
+        if len == 0 || peak <= 0.0 {
+            return;
+        }
+        for value in values.iter_mut().take(len) {
+            *value = (*value / peak).clamp(0.0, 1.0);
+        }
+        grid.view(Rect {
+            x: body.x,
+            y: label_y,
+            cols: body.cols,
+            rows: 1,
+        })
+        .put_str(
+            0,
+            0,
+            "direct reclaim history (window peak)",
+            Default::default(),
+        );
+        let chart = Rect {
+            x: body.x,
+            y: label_y + 1,
+            cols: body.cols,
+            rows: body.y.saturating_add(body.rows).saturating_sub(label_y + 1),
+        };
+        if chart.rows == 0 {
+            return;
+        }
+        let mut raster = CellBuf::new();
+        raster.reset(chart.cols, chart.rows);
+        viz_raster::area(
+            &values[..len],
+            viz_raster::RasterTable::for_level(crate::caps::unicode_level()),
+            &mut raster,
+        );
+        draw_raster(grid, chart, &raster, RasterStyle::Ramp(RampId::Mem));
     }
 }
 

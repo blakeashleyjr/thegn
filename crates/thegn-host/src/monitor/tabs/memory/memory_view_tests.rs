@@ -194,6 +194,9 @@ fn board_snapshots_cover_size_and_capability_matrix() {
                 let mut model = MemoryModel::default();
                 for sample in 0_u32..120 {
                     let mut frame = fixture(true);
+                    frame.parts.vmstat.rates
+                        [thegn_metrics::collect::model::vmstat::VmRate::StealDirect as usize] =
+                        Some(1000.0 + (sample % 20) as f64 * 50.0);
                     if let Some(mut some) = frame.parts.psi.memory.file.some {
                         some.avg10 = 100 + (sample % 20) * 25;
                         frame.parts.psi.memory.file.some = Some(some);
@@ -219,11 +222,12 @@ fn board_snapshots_cover_size_and_capability_matrix() {
                 assert!(rendered.contains("Memory"));
                 assert!(rendered.contains("health"));
                 if cols == 240 {
-                    // The two history charts show real retained memory samples. The remaining
-                    // density is intentionally left for batch 47's wiring follow-up.
+                    // These history charts show real bounded model samples. The remaining
+                    // Density follow-up in batch 47 (wiring lane).
                     assert!(fill_ratio(&surface, Rect::full(cols, rows)) >= 0.30);
                     assert!(rendered.contains("used / available history"));
                     assert!(rendered.contains("PSI history"));
+                    assert!(rendered.contains("direct reclaim history"));
                     assert!(rendered.contains("direct reclaim"));
                     assert!(rendered.contains("kswapd steal"));
                     assert!(rendered.contains("refaults"));
