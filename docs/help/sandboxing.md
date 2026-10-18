@@ -407,8 +407,8 @@ environment can keep a **warm spare pool** so new worktrees start
 instantly; raise or lower the active project's pool target with the
 warm-pool actions (`Ctrl-Alt-=` / `Ctrl-Alt--`, also palette-runnable). The
 target update runs in the background: `warm pool: updating target…` appears
-while it is queued, followed by the result, and `+` stops at eight spares for
-the selected environment.
+while it is queued, followed by the result, and raising the target stops at
+eight spares for the workspace's environment.
 Pool state shows on the sidebar's project chip, not in this section.
 `[sandbox] default_env` picks the environment new worktrees use.
 A repo's `env =` setting is only a hint; if that environment would weaken

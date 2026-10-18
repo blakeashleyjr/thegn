@@ -70,10 +70,8 @@ accumulating underneath, so resuming shows a continuous timeline with no gap.
 Pausing also drops the sampler back to its normal rate, so a frozen monitor is
 cheaper than a live one.
 
-The monitor's sampling thread exists only while it is open, waits without
-waking while paused or covered by another overlay, and stops on close.
-While open, its sampler reads the available system metrics; no monitor
-collectors run while it is closed.
+While the monitor is open and live, its sampler reads every available
+collector; paused or covered, it parks, and nothing runs once it is closed.
 
 Note two deliberate differences from the other overlays: `Space` is pause here
 (use `PgDn` to page), and `g` cycles the graph style rather than jumping to the
