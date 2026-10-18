@@ -453,7 +453,11 @@ fn package_without_threshold_shows_temperature_without_a_meter() {
     assert!(reading.contains("71.0 C"));
 
     let mut sensor_grid = CellGrid::new(100, 3);
-    super::paint::sensors(&mut sensor_grid, Rect::full(100, 3), &[package]);
+    super::paint::sensors(
+        &mut sensor_grid,
+        Rect::full(100, 3),
+        std::slice::from_ref(&package),
+    );
     let bar_row = (59..71)
         .map(|x| sensor_grid.get(x, 1).expect("sensor bar cell").ch)
         .collect::<String>();
