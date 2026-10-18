@@ -455,7 +455,7 @@ fn paint_devices(grid: &mut CellGrid, rect: Rect, model: &DiskModel) {
     }
     for (row, device) in model.devices.iter().take(body.rect().rows).enumerate() {
         let text = format!(
-            "{:<12} {:>8} {:>8} {:>5}{}",
+            "{:<12} {:>8} {:>8} {:>5}",
             truncate(&device.name, 12),
             optional_rate(device.read_bps),
             optional_rate(device.write_bps),
