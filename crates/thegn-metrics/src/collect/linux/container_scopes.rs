@@ -1,37 +1,62 @@
 //! Bounded, engine-free discovery of container cgroups from the cgroup v2 tree.
 
-use std::ffi::OsString;
+use std::collections::BTreeSet;
+use std::ffi::{OsStr, OsString};
 use std::io;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use super::containers_stats::ResolvedContainerScope;
 use crate::collect::policy::cgroup_classify::{OwnerKind, classify};
 
 pub const MAX_CONTAINER_SCOPES: usize = 256;
-const MAX_DIRECTORY_LISTINGS: usize = 1024;
-const MAX_DIRECTORY_ENTRIES: usize = 512;
+// Two child directories per accepted scope plus one sentinel directory to detect overflow.
+const MAX_DIRECTORY_DIRECTORIES: usize = MAX_CONTAINER_SCOPES * 2;
+// The entry budget adds one sentinel so listing truncation can be reported without an unbounded read.
+const MAX_DIRECTORY_ENTRIES: usize = MAX_DIRECTORY_DIRECTORIES + 1;
+// Three fixed listings plus every possible user slice, its services, and each service's two slices.
+const MAX_DIRECTORY_LISTINGS: usize = 3 + MAX_DIRECTORY_ENTRIES * (1 + MAX_DIRECTORY_ENTRIES * 3);
+
+#[derive(Debug, Default)]
+pub struct DirectoryListing {
+    pub directories: Vec<OsString>,
+    pub truncated: bool,
+}
 
 pub trait DirectoryFs {
     /// Return direct child directory names. Implementations must not follow symlinks.
-    fn directories(&self, path: &Path) -> io::Result<Vec<OsString>>;
+    fn directories(&self, path: &Path) -> io::Result<DirectoryListing>;
 }
 
 #[derive(Debug, Default)]
 pub struct RealDirectoryFs;
 
 impl DirectoryFs for RealDirectoryFs {
-    fn directories(&self, path: &Path) -> io::Result<Vec<OsString>> {
+    fn directories(&self, path: &Path) -> io::Result<DirectoryListing> {
         if !std::fs::symlink_metadata(path)?.file_type().is_dir() {
-            return Ok(Vec::new());
+            return Ok(DirectoryListing::default());
         }
-        let mut names = Vec::new();
-        for entry in std::fs::read_dir(path)?.take(MAX_DIRECTORY_ENTRIES + 1) {
-            let entry = entry?;
-            if entry.file_type()?.is_dir() {
-                names.push(entry.file_name());
+        let mut listing = DirectoryListing::default();
+        let mut directories = BTreeSet::new();
+        let mut entries_read = 0;
+        for entry in std::fs::read_dir(path)?.take(MAX_DIRECTORY_ENTRIES) {
+            entries_read += 1;
+            let Ok(entry) = entry else { continue };
+            let Ok(file_type) = entry.file_type() else {
+                continue;
+            };
+            if file_type.is_dir() {
+                directories.insert(entry.file_name());
+                if directories.len() > MAX_DIRECTORY_DIRECTORIES {
+                    listing.truncated = true;
+                    directories.pop_last();
+                }
             }
         }
-        Ok(names)
+        if entries_read == MAX_DIRECTORY_ENTRIES {
+            listing.truncated = true;
+        }
+        listing.directories = directories.into_iter().collect();
+        Ok(listing)
     }
 }
 
@@ -39,12 +64,14 @@ impl DirectoryFs for RealDirectoryFs {
 pub struct Discovery {
     pub scopes: Vec<ResolvedContainerScope>,
     pub truncated: bool,
+    pub list_errors: u32,
 }
 
 pub fn discover(fs: &dyn DirectoryFs, root: &Path) -> Discovery {
     let mut discovery = Discovery {
         scopes: Vec::with_capacity(MAX_CONTAINER_SCOPES),
         truncated: false,
+        list_errors: 0,
     };
     let mut listings = 0;
     scan_scope_parent(
@@ -96,15 +123,21 @@ fn list(
     }
     *listings += 1;
     match fs.directories(path) {
-        Ok(mut directories) => {
-            directories.sort_unstable();
-            if directories.len() > MAX_DIRECTORY_ENTRIES {
+        Ok(mut listing) => {
+            discovery.truncated |= listing.truncated;
+            listing.directories.sort_unstable();
+            if listing.directories.len() > MAX_DIRECTORY_DIRECTORIES {
                 discovery.truncated = true;
-                directories.truncate(MAX_DIRECTORY_ENTRIES);
+                listing.directories.truncate(MAX_DIRECTORY_DIRECTORIES);
             }
-            directories
+            listing.directories
         }
-        Err(_) => Vec::new(),
+        Err(error) => {
+            if error.kind() != io::ErrorKind::NotFound {
+                discovery.list_errors = discovery.list_errors.saturating_add(1);
+            }
+            Vec::new()
+        }
     }
 }
 
@@ -143,11 +176,11 @@ fn scan_scope_parent(
     }
 }
 
-fn starts_with(name: &OsString, prefix: &str) -> bool {
+fn starts_with(name: &OsStr, prefix: &str) -> bool {
     name.to_str().is_some_and(|name| name.starts_with(prefix))
 }
 
-fn ends_with(name: &OsString, suffix: &str) -> bool {
+fn ends_with(name: &OsStr, suffix: &str) -> bool {
     name.to_str().is_some_and(|name| name.ends_with(suffix))
 }
 

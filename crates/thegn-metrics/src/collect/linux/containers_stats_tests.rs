@@ -187,19 +187,19 @@ fn caps_reads_at_64_and_round_robins_every_scope_within_three_ticks() {
     assert!(
         second
             .iter()
-            .any(|row| row.id == "container-56" && row.cpu_pct == Some(100.0))
+            .any(|row| &*row.id == "container-56" && row.cpu_pct == Some(100.0))
     );
     assert!(
         second
             .iter()
-            .any(|row| row.id == "container-57" && row.cpu_pct == Some(100.0))
+            .any(|row| &*row.id == "container-57" && row.cpu_pct == Some(100.0))
     );
     let third = sampler.sample(&scopes, start + Duration::from_secs(2));
     let observed: std::collections::HashSet<&str> = first
         .iter()
         .map(String::as_str)
-        .chain(second.iter().map(|row| row.id.as_str()))
-        .chain(third.iter().map(|row| row.id.as_str()))
+        .chain(second.iter().map(|row| row.id.as_ref()))
+        .chain(third.iter().map(|row| row.id.as_ref()))
         .collect();
     assert_eq!(observed.len(), scopes.len());
     assert!(sampler.fs.paths.iter().all(|path| path.starts_with(root())));
@@ -218,26 +218,57 @@ fn mixed_cpu_scopes_all_get_sampled_despite_priority_churn() {
         .collect();
     let mut sampler = ContainerStatsSampler::new(fs, filter(), root());
     let start = Instant::now();
-    let mut observed = std::collections::HashSet::new();
-    let max_ticks = (count - 56).div_ceil(8) + 1;
-    for tick in 0..max_ticks {
-        if tick > 0 {
-            for index in 56..count {
-                set_group(
-                    &mut sampler.fs,
-                    &root().join(format!("mixed-{index}")),
-                    1_000_000 + tick as u64 * 1_000_000 + index as u64 * 100_000,
-                    100,
-                    200,
-                    4096,
-                );
-            }
-        }
-        let rows = sampler.sample(&scopes, start + Duration::from_secs(tick as u64));
-        observed.extend(rows.iter().map(|row| row.id.to_string()));
-        assert!(sampler.fs.reads <= (tick + 1) * MAX_CONTAINER_SCOPES_PER_TICK * 11);
+    let warm_scopes = &scopes[..64];
+    sampler.sample(warm_scopes, start);
+    for index in 56..64 {
+        set_group(
+            &mut sampler.fs,
+            &root().join(format!("mixed-{index}")),
+            2_000_000,
+            100,
+            200,
+            4096,
+        );
     }
-    assert_eq!(observed.len(), scopes.len());
+    sampler.sample(warm_scopes, start + Duration::from_secs(1));
+    assert!(
+        sampler
+            .previous
+            .get(&scopes[56].id)
+            .is_some_and(|previous| previous.cpu_pct > 0.0)
+    );
+    let mut observed_cold = std::collections::HashSet::new();
+    let max_ticks = (count - 56).div_ceil(8) + 1;
+    let mut usage = [1_000_000_u64; 24];
+    usage[..8].fill(2_000_000);
+    for tick in 0..max_ticks {
+        let hot_start = (tick * 8) % usage.len();
+        for offset in 0..8 {
+            let hot_index = (hot_start + offset) % usage.len();
+            usage[hot_index] = usage[hot_index].saturating_add(1_000_000);
+        }
+        for index in 56..80 {
+            set_group(
+                &mut sampler.fs,
+                &root().join(format!("mixed-{index}")),
+                usage[index - 56],
+                100,
+                200,
+                4096,
+            );
+        }
+        let rows = sampler.sample(&scopes, start + Duration::from_secs(tick as u64 + 2));
+        observed_cold.extend(
+            rows.iter()
+                .filter(|row| {
+                    row.id.starts_with("mixed-container-")
+                        && row.id[16..].parse::<usize>().is_ok_and(|index| index >= 80)
+                })
+                .map(|row| row.id.to_string()),
+        );
+        assert!(sampler.fs.reads <= (tick + 3) * MAX_CONTAINER_SCOPES_PER_TICK * 11);
+    }
+    assert_eq!(observed_cold.len(), 40);
 }
 
 #[test]
