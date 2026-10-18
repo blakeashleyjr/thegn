@@ -1,4 +1,4 @@
-use super::view::{GpuModel, GpuView};
+use super::view::{GpuModel, GpuView, HISTORY_CAP};
 use crate::{
     caps,
     compositor::Rect,
@@ -36,8 +36,16 @@ fn fixture(tick: u32, kind: GpuKind, status: RuntimeStatus) -> MonitorFrame {
     frame.parts.gpu_engines.devices.push(GpuEngineRow {
         slot: GpuSlot::new("0000:04:00.0").expect("valid fixture slot"),
         runtime_status: status,
-        gfx_busy_pct: Some((25 + tick % 55) as u8),
-        vcn_busy_pct: Some((tick % 13) as u8),
+        gfx_busy_pct: Some(if status == RuntimeStatus::Suspended {
+            0
+        } else {
+            (25 + tick % 55) as u8
+        }),
+        vcn_busy_pct: Some(if status == RuntimeStatus::Suspended {
+            0
+        } else {
+            (tick % 13) as u8
+        }),
         vram_used: Some(300 * 1024 * 1024 + u64::from(tick) * 1024 * 1024),
         vram_total: Some(512 * 1024 * 1024),
         gtt_used: Some(3 * 1024 * 1024 * 1024 + u64::from(tick) * 2 * 1024 * 1024),
@@ -53,9 +61,11 @@ fn fixture(tick: u32, kind: GpuKind, status: RuntimeStatus) -> MonitorFrame {
             current_mhz: (status == RuntimeStatus::Active).then_some(2400),
         },
     });
-    let mut metrics = GpuMetrics::default();
-    metrics.power_socket = Some(17_300 + tick * 100);
-    metrics.temperature_gfx = Some(8_000 + (tick % 7) as u16 * 100);
+    let metrics = GpuMetrics {
+        power_socket: Some(17_300 + tick * 100),
+        temperature_gfx: Some(8_000 + (tick % 7) as u16 * 100),
+        ..GpuMetrics::default()
+    };
     frame.parts.amd_smu.cards.push(AmdSmuCard {
         card: 0,
         suspended: status == RuntimeStatus::Suspended,
@@ -72,6 +82,20 @@ fn fixture(tick: u32, kind: GpuKind, status: RuntimeStatus) -> MonitorFrame {
 
 fn text(surface: &Surface) -> String {
     surface.screen_chars_to_string()
+}
+
+fn panel_text(surface: &Surface, rect: Rect) -> String {
+    surface
+        .screen_lines()
+        .iter()
+        .enumerate()
+        .filter(|(y, _)| *y >= rect.y && *y < rect.y.saturating_add(rect.rows))
+        .flat_map(|(_, line)| line.visible_cells())
+        .filter(|cell| {
+            cell.cell_index() >= rect.x && cell.cell_index() < rect.x.saturating_add(rect.cols)
+        })
+        .map(|cell| cell.str().to_owned())
+        .collect()
 }
 
 fn fill_ratio(surface: &Surface, area: Rect) -> f32 {
@@ -132,24 +156,24 @@ fn gpu_view_snapshots_cover_size_and_capability_matrix() {
                 assert!(rendered.contains("GPU"));
                 assert!(rendered.contains("Radeon 890M"));
                 assert!(rendered.contains("gfx"));
+                assert!(rendered.contains("vcn %"));
                 assert!(rendered.contains("shared"));
                 assert!(rendered.contains("764 MHz [2/3]"));
                 if cols == 240 {
-                    // density follow-up (batch 49): measured 0.30
-                    assert!(fill_ratio(&surface, Rect::full(cols, rows)) >= 0.30);
+                    // Density floor is an estimate; the reported ratio can replace it.
+                    let ratio = fill_ratio(&surface, Rect::full(cols, rows));
+                    assert!(
+                        ratio >= 0.30,
+                        "fill ratio {ratio:.3} at {cols}x{rows} {level:?}/{depth:?}"
+                    );
                 }
                 if level == UnicodeLevel::Ascii {
                     assert!(rendered.is_ascii());
                 }
-                let expected = board.placed(&view, Rect::full(cols, rows)).iter().fold(
-                    thegn_metrics::collect::CollectorSet::empty(),
-                    |mut set, placed| {
-                        for id in view.demand(placed.id).iter() {
-                            set.insert(id);
-                        }
-                        set
-                    },
-                );
+                let mut expected = thegn_metrics::collect::CollectorSet::empty();
+                expected.insert(CollectorId::GpuDevices);
+                expected.insert(CollectorId::GpuEngines);
+                expected.insert(CollectorId::AmdSmu);
                 assert_eq!(
                     board.demand(&view, Rect::full(cols, rows), 1000).collectors,
                     expected
@@ -164,10 +188,10 @@ fn apu_and_dgpu_memory_labels_are_distinct_and_demand_is_panel_static() {
     let mut model = GpuModel::default();
     model.absorb_frame(&fixture(1, GpuKind::Apu, RuntimeStatus::Active));
     let view = GpuView(&model);
-    let placed = Board::default().placed(&view, Rect::full(160, 45));
+    let board = Board::default();
+    let placed = board.placed(&view, Rect::full(160, 45));
     let mut surface = Surface::new(160, 45);
-    Board::default().paint(&view, &mut surface, Rect::full(160, 45), 0, &[]);
-    assert!(text(&surface).contains("shared"));
+    board.paint(&view, &mut surface, Rect::full(160, 45), 0, &[]);
     let engine_panel = placed
         .iter()
         .find(|panel| panel.id.0 == "gpu.engines")
@@ -193,6 +217,14 @@ fn apu_and_dgpu_memory_labels_are_distinct_and_demand_is_panel_static() {
     expected.insert(CollectorId::GpuDevices);
     expected.insert(CollectorId::GpuEngines);
     assert_eq!(memory_demand, expected);
+    let apu_memory = panel_text(&surface, memory_panel.rect);
+    assert!(apu_memory.contains("shared"), "{apu_memory}");
+    assert!(apu_memory.contains("vram"), "{apu_memory}");
+    assert!(apu_memory.contains("gtt"), "{apu_memory}");
+    assert!(apu_memory.contains("301"), "{apu_memory}");
+    assert!(apu_memory.contains("512"), "{apu_memory}");
+    assert!(apu_memory.contains("3.0"), "{apu_memory}");
+    assert!(apu_memory.contains("46"), "{apu_memory}");
     let clocks_panel = placed
         .iter()
         .find(|panel| panel.id.0 == "gpu.clocks")
@@ -208,7 +240,32 @@ fn apu_and_dgpu_memory_labels_are_distinct_and_demand_is_panel_static() {
     let view = GpuView(&model);
     let mut dedicated = Surface::new(160, 45);
     Board::default().paint(&view, &mut dedicated, Rect::full(160, 45), 0, &[]);
-    assert!(text(&dedicated).contains("VRAM"));
+    let dedicated_memory = panel_text(&dedicated, memory_panel.rect);
+    assert!(dedicated_memory.contains("VRAM"), "{dedicated_memory}");
+    assert!(dedicated_memory.contains("GTT"), "{dedicated_memory}");
+    assert!(!dedicated_memory.contains("shared"), "{dedicated_memory}");
+}
+
+#[test]
+fn memory_uses_device_totals_without_an_engine_row() {
+    let mut frame = fixture(1, GpuKind::Dgpu, RuntimeStatus::Active);
+    frame.parts.gpu_engines.devices.clear();
+    let mut model = GpuModel::default();
+    model.absorb_frame(&frame);
+    let view = GpuView(&model);
+    let board = Board::default();
+    let memory_panel = board
+        .placed(&view, Rect::full(160, 45))
+        .into_iter()
+        .find(|panel| panel.id.0 == "gpu.memory")
+        .expect("memory panel placed");
+    let mut surface = Surface::new(160, 45);
+    board.paint(&view, &mut surface, Rect::full(160, 45), 0, &[]);
+    let memory = panel_text(&surface, memory_panel.rect);
+    assert!(memory.contains("VRAM"), "{memory}");
+    assert!(memory.contains("GTT"), "{memory}");
+    assert!(memory.contains("512"), "{memory}");
+    assert!(memory.contains("46"), "{memory}");
 }
 
 #[test]
@@ -222,8 +279,23 @@ fn suspended_gpu_never_renders_zero_busy_or_clock_and_missing_is_absent() {
     assert!(rendered.contains("suspended"));
     assert!(rendered.contains("not polled"));
     assert!(!rendered.contains("gfx 0%"));
+    assert!(!rendered.contains("vcn 0%"));
     assert!(!rendered.contains("sclk 0 MHz"));
     assert!(rendered.contains(caps::active_glyphs().emdash));
+
+    let mut suspending_model = GpuModel::default();
+    suspending_model.absorb_frame(&fixture(1, GpuKind::Dgpu, RuntimeStatus::Suspending));
+    let mut suspending_surface = Surface::new(160, 45);
+    Board::default().paint(
+        &GpuView(&suspending_model),
+        &mut suspending_surface,
+        Rect::full(160, 45),
+        0,
+        &[],
+    );
+    let suspending = text(&suspending_surface);
+    assert!(!suspending.contains("gfx 26%"));
+    assert!(!suspending.contains("vcn 1%"));
 
     let mut no_marker = fixture(2, GpuKind::Dgpu, RuntimeStatus::Active);
     no_marker.parts.gpu_engines.devices[0].sclk.current_mhz = None;
@@ -231,6 +303,13 @@ fn suspended_gpu_never_renders_zero_busy_or_clock_and_missing_is_absent() {
     let view = GpuView(&model);
     let mut surface = Surface::new(160, 45);
     Board::default().paint(&view, &mut surface, Rect::full(160, 45), 0, &[]);
+    assert!(text(&surface).contains(&format!("sclk {}", caps::active_glyphs().emdash)));
+
+    let mut outside_ladder = fixture(3, GpuKind::Dgpu, RuntimeStatus::Active);
+    outside_ladder.parts.gpu_engines.devices[0].sclk.current_mhz = Some(1_234);
+    model.absorb_frame(&outside_ladder);
+    let mut surface = Surface::new(160, 45);
+    Board::default().paint(&GpuView(&model), &mut surface, Rect::full(160, 45), 0, &[]);
     assert!(text(&surface).contains(&format!("sclk {}", caps::active_glyphs().emdash)));
 }
 
@@ -252,26 +331,27 @@ fn busy_history_is_slot_keyed_bounded_and_reuses_capacity_after_warmup() {
     assert_eq!(model.engines.devices.capacity(), engine_capacity);
     assert_eq!(model.smu.cards.capacity(), smu_capacity);
     assert_eq!(capacity, history_capacity);
-    let first = model.histories[0].values
-        [(model.histories[0].next + HISTORY_CAP_TEST - 1) % HISTORY_CAP_TEST];
+    let first =
+        model.histories[0].values[(model.histories[0].next + HISTORY_CAP - 1) % HISTORY_CAP];
     model.absorb_frame(&fixture(1_001, GpuKind::Apu, RuntimeStatus::Active));
     assert_eq!(model.histories.capacity(), capacity);
-    let last = model.histories[0].values
-        [(model.histories[0].next + HISTORY_CAP_TEST - 1) % HISTORY_CAP_TEST];
+    let last = model.histories[0].values[(model.histories[0].next + HISTORY_CAP - 1) % HISTORY_CAP];
     assert_ne!(first, last);
 
     let mut frame = fixture(1_002, GpuKind::Apu, RuntimeStatus::Active);
     frame.parts.gpu_engines.devices[0].slot =
         GpuSlot::new("0000:05:00.0").expect("valid second slot");
+    frame.parts.gpu_engines.devices[0].runtime_status = RuntimeStatus::Suspended;
     model.absorb_frame(&frame);
-    assert_eq!(model.histories.len(), 2);
-    assert_eq!(model.histories[0].slot, "0000:04:00.0");
-    assert_eq!(model.histories[1].slot, "0000:05:00.0");
+    assert_eq!(model.histories.len(), 1);
+    assert_eq!(model.histories[0].slot, "0000:05:00.0");
+    assert_eq!(model.histories[0].len, 0);
     frame.parts.gpu_engines.devices[0].slot =
         GpuSlot::new("0000:06:00.0").expect("valid replacement slot");
     model.absorb_frame(&frame);
-    assert_eq!(model.histories.len(), 2);
+    assert_eq!(model.histories.len(), 1);
     assert_eq!(model.histories[0].slot, "0000:06:00.0");
+    assert_eq!(model.histories[0].len, 0);
 }
 
 #[test]
@@ -282,7 +362,41 @@ fn absent_collector_renders_unknown_mark() {
     model.absorb_frame(&frame);
     let mut surface = Surface::new(160, 45);
     Board::default().paint(&GpuView(&model), &mut surface, Rect::full(160, 45), 0, &[]);
-    assert!(text(&surface).contains("engine counters unavailable"));
+    let rendered = text(&surface);
+    assert!(rendered.contains(caps::glyph(caps::Glyph::Lock)));
+    assert!(rendered.contains("root-only"));
+    assert!(rendered.contains("engine counters unavailable"));
 }
 
-const HISTORY_CAP_TEST: usize = 480;
+#[test]
+fn warming_gpu_view_uses_ellipsis_without_absent_mark() {
+    let model = GpuModel::default();
+    let mut surface = Surface::new(160, 45);
+    Board::default().paint(&GpuView(&model), &mut surface, Rect::full(160, 45), 0, &[]);
+    let rendered = text(&surface);
+    assert!(rendered.contains(caps::active_glyphs().ellipsis));
+    assert!(!rendered.contains(caps::active_glyphs().emdash));
+}
+
+#[test]
+fn short_engine_history_reaches_the_right_edge() {
+    let mut model = GpuModel::default();
+    for tick in 0_u32..20 {
+        model.absorb_frame(&fixture(tick, GpuKind::Apu, RuntimeStatus::Active));
+    }
+    let mut surface = Surface::new(40, 8);
+    let rect = Rect::full(40, 8);
+    GpuView(&model).paint_busy_history(&mut surface, rect, rect);
+    let rightmost_is_drawn = surface
+        .screen_lines()
+        .iter()
+        .enumerate()
+        .filter(|(row, _)| (1..6).contains(row))
+        .flat_map(|(_, line)| line.visible_cells())
+        .filter(|cell| cell.cell_index() == 39)
+        .any(|cell| !cell.str().is_empty() && cell.str() != " " && cell.str() != "\u{2800}");
+    assert!(
+        rightmost_is_drawn,
+        "short graph did not reach its right edge"
+    );
+}

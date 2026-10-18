@@ -25,7 +25,7 @@ const DEVICES: PanelId = PanelId("gpu.devices");
 const ENGINES: PanelId = PanelId("gpu.engines");
 const MEMORY: PanelId = PanelId("gpu.memory");
 const CLOCKS: PanelId = PanelId("gpu.clocks");
-const HISTORY_CAP: usize = 480;
+pub(super) const HISTORY_CAP: usize = 480;
 const DEVICE_CAP: usize = 32;
 const FULL: [Variant; 1] = [Variant {
     kind: VariantKind::Full,
@@ -135,18 +135,18 @@ impl Default for GpuModel {
 
 impl GpuModel {
     pub(in crate::monitor) fn absorb_frame(&mut self, frame: &MonitorFrame) {
-        self.devices.devices.clear();
-        self.devices.devices.extend_from_slice(
-            &frame.parts.gpu_devices.devices
-                [..frame.parts.gpu_devices.devices.len().min(DEVICE_CAP)],
+        copy_rows(
+            &mut self.devices.devices,
+            &frame.parts.gpu_devices.devices,
+            DEVICE_CAP,
         );
         self.devices.accels.clear();
         self.devices.truncated =
             frame.parts.gpu_devices.truncated || frame.parts.gpu_devices.devices.len() > DEVICE_CAP;
-        self.engines.devices.clear();
-        self.engines.devices.extend_from_slice(
-            &frame.parts.gpu_engines.devices
-                [..frame.parts.gpu_engines.devices.len().min(DEVICE_CAP)],
+        copy_rows(
+            &mut self.engines.devices,
+            &frame.parts.gpu_engines.devices,
+            DEVICE_CAP,
         );
         self.engines.truncated =
             frame.parts.gpu_engines.truncated || frame.parts.gpu_engines.devices.len() > DEVICE_CAP;
@@ -190,6 +190,18 @@ impl GpuModel {
             }
         }
     }
+}
+
+fn copy_rows<T: Clone>(destination: &mut Vec<T>, source: &[T], cap: usize) {
+    let count = source.len().min(cap);
+    for (index, source_row) in source.iter().take(count).enumerate() {
+        if let Some(destination_row) = destination.get_mut(index) {
+            destination_row.clone_from(source_row);
+        } else {
+            destination.push(source_row.clone());
+        }
+    }
+    destination.truncate(count);
 }
 
 pub(in crate::monitor) struct GpuView<'a>(pub &'a GpuModel);
@@ -246,7 +258,7 @@ impl TabView for GpuView<'_> {
         let mut grid = CellGrid::new(rect.cols, rect.rows);
         let title = match placed.id {
             DEVICES => "GPU devices",
-            ENGINES => "GPU engines",
+            ENGINES => "GPU engines  busy % (0-100)",
             MEMORY => "GPU memory",
             CLOCKS => "GPU clocks / power / thermal",
             _ => return,

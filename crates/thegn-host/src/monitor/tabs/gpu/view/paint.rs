@@ -1,12 +1,47 @@
-use super::{GpuView, HISTORY_CAP};
+use super::{DEVICE_CAP, GpuView, HISTORY_CAP};
+use crate::caps::{self, Glyph};
 use crate::compositor::Rect;
 use crate::monitor::kit::emit::Emitter;
 use crate::monitor::kit::grid::CellGrid;
 use termwiz::surface::Surface;
+use thegn_core::numfmt::{NumFmt, Unit};
 use thegn_metrics::collect::{
-    health::Health,
+    health::{Absent, Health},
     model::{amd_smu::AmdSmuStatus, gpu::GpuKind, gpu::RuntimeStatus},
 };
+
+fn mark(health: Health) -> String {
+    match health {
+        Health::Warming => caps::active_glyphs().ellipsis.to_owned(),
+        Health::Absent(Absent::NoPermission) => {
+            format!("{} root-only", caps::glyph(Glyph::Lock))
+        }
+        Health::Absent(_) | Health::Failing { .. } | Health::Ok => {
+            caps::active_glyphs().emdash.to_owned()
+        }
+    }
+}
+
+fn display_health(primary: Health, secondary: Health) -> Health {
+    match (primary, secondary) {
+        (Health::Absent(Absent::NoPermission), _) => primary,
+        (_, Health::Absent(Absent::NoPermission)) => secondary,
+        (Health::Warming, _) => primary,
+        (_, Health::Warming) => secondary,
+        _ => primary,
+    }
+}
+
+fn history_graph_rect(rect: Rect, body: Rect, len: usize, braille: bool) -> Rect {
+    let used = if braille { len.div_ceil(2) } else { len };
+    let cols = body.cols.min(used);
+    Rect {
+        x: rect.x + body.x + body.cols.saturating_sub(cols),
+        y: rect.y + body.y + 1,
+        cols,
+        rows: body.rows.saturating_sub(2),
+    }
+}
 
 impl GpuView<'_> {
     pub(super) fn paint_busy_history(&self, surface: &mut Surface, rect: Rect, body: Rect) {
@@ -65,34 +100,31 @@ impl GpuView<'_> {
         }
         let mut values = [0.0_f32; HISTORY_CAP];
         let len = history.ordered_into(&mut values);
+        let graph_rect =
+            history_graph_rect(rect, body, len, crate::monitor::graphs::table().braille);
         crate::monitor::graphs::paint_history_graph(
             &values[..len],
             thegn_core::theme::RampId::Util,
-            Rect {
-                x: rect.x + body.x,
-                y: rect.y + body.y + 1,
-                cols: body.cols,
-                rows: body.rows - 2,
-            },
+            graph_rect,
             surface,
         );
         let mut vcn = [0.0_f32; HISTORY_CAP];
         let vcn_len = history.ordered_vcn_into(&mut vcn);
         if vcn_len > 0 {
             let graph_y = rect.y + body.y + body.rows - 1;
-            let mut label = CellGrid::new(4, 1);
+            let mut label = CellGrid::new(5, 1);
             label
-                .view(Rect::full(4, 1))
-                .put_str(0, 0, "vcn", Default::default());
-            Emitter::default().emit(&label, Rect::full(4, 1), surface, rect.x + body.x, graph_y);
+                .view(Rect::full(5, 1))
+                .put_str(0, 0, "vcn %", Default::default());
+            Emitter::default().emit(&label, Rect::full(5, 1), surface, rect.x + body.x, graph_y);
             crate::monitor::graphs::paint_sparkline(
                 &vcn[..vcn_len],
-                body.cols.saturating_sub(4),
+                body.cols.saturating_sub(5),
                 thegn_core::theme::RampId::Util,
                 Rect {
-                    x: rect.x + body.x + 4,
+                    x: rect.x + body.x + 5,
                     y: graph_y,
-                    cols: body.cols.saturating_sub(4),
+                    cols: body.cols.saturating_sub(5),
                     rows: 1,
                 },
                 surface,
@@ -106,28 +138,21 @@ impl GpuView<'_> {
             view.put_str(
                 0,
                 0,
-                &format!("{} no GPU device data", crate::caps::active_glyphs().emdash),
+                &format!("{} no GPU device data", mark(self.0.device_health)),
                 Default::default(),
             );
             return;
         }
         if self.0.devices.devices.is_empty() {
-            if matches!(self.0.device_health, Health::Warming) {
-                view.put_str(
-                    0,
-                    0,
-                    &format!(
-                        "{} waiting for GPU devices",
-                        crate::caps::active_glyphs().ellipsis
-                    ),
-                    Default::default(),
-                );
-                return;
-            }
+            let message = if self.0.device_health == Health::Warming {
+                "waiting for GPU devices"
+            } else {
+                "no GPU detected"
+            };
             view.put_str(
                 0,
                 0,
-                &format!("{} no GPU detected", crate::caps::active_glyphs().emdash),
+                &format!("{} {message}", mark(self.0.device_health)),
                 Default::default(),
             );
             return;
@@ -172,10 +197,7 @@ impl GpuView<'_> {
             view.put_str(
                 0,
                 0,
-                &format!(
-                    "{} engine counters unavailable",
-                    crate::caps::active_glyphs().emdash
-                ),
+                &format!("{} engine counters unavailable", mark(self.0.engine_health)),
                 Default::default(),
             );
             return;
@@ -184,10 +206,7 @@ impl GpuView<'_> {
             view.put_str(
                 0,
                 0,
-                &format!(
-                    "{} waiting for engine readings",
-                    crate::caps::active_glyphs().ellipsis
-                ),
+                &format!("{} waiting for engine readings", mark(self.0.engine_health)),
                 Default::default(),
             );
             return;
@@ -197,7 +216,7 @@ impl GpuView<'_> {
             if row >= body.rows {
                 break;
             }
-            let busy = if engine.runtime_status == RuntimeStatus::Suspended {
+            let busy = if engine.runtime_status != RuntimeStatus::Active {
                 format!(
                     "asleep (runtime-suspended) {} not polled to avoid waking it",
                     crate::caps::active_glyphs().middot
@@ -207,10 +226,14 @@ impl GpuView<'_> {
             } else {
                 format!("gfx {}", crate::caps::active_glyphs().emdash)
             };
-            let vcn = engine.vcn_busy_pct.map_or_else(
-                || crate::caps::active_glyphs().emdash.to_owned(),
-                |value| format!("{value}%"),
-            );
+            let vcn = if engine.runtime_status == RuntimeStatus::Active {
+                engine.vcn_busy_pct.map_or_else(
+                    || crate::caps::active_glyphs().emdash.to_owned(),
+                    |value| format!("{value}%"),
+                )
+            } else {
+                crate::caps::active_glyphs().emdash.to_owned()
+            };
             view.put_str(
                 0,
                 row,
@@ -226,13 +249,11 @@ impl GpuView<'_> {
         if matches!(self.0.engine_health, Health::Absent(_))
             && matches!(self.0.device_health, Health::Absent(_))
         {
+            let health = display_health(self.0.device_health, self.0.engine_health);
             view.put_str(
                 0,
                 0,
-                &format!(
-                    "{} memory readings unavailable",
-                    crate::caps::active_glyphs().emdash
-                ),
+                &format!("{} memory readings unavailable", mark(health)),
                 Default::default(),
             );
             return;
@@ -246,7 +267,7 @@ impl GpuView<'_> {
                 .iter()
                 .find(|item| item.slot.as_str() == device.slot);
             let (used_vram, total_vram, used_gtt, total_gtt) =
-                engine.map_or((None, None, None, device.gtt_total), |item| {
+                engine.map_or((None, device.vram_total, None, device.gtt_total), |item| {
                     (
                         item.vram_used,
                         item.vram_total.or(device.vram_total),
@@ -254,25 +275,39 @@ impl GpuView<'_> {
                         item.gtt_total.or(device.gtt_total),
                     )
                 });
-            let shared = device.kind == GpuKind::Apu || device.kind == GpuKind::Igpu;
-            let name = if shared { "shared" } else { "VRAM" };
+            let shared = device.kind == GpuKind::Apu;
+            let name = "VRAM";
             let memory = match (used_vram, total_vram) {
                 (Some(used), Some(total)) => format!("{name} {} / {}", bytes(used), bytes(total)),
                 (_, Some(total)) if shared => format!(
-                    "shared {} / {}",
+                    "VRAM {} / {}",
                     crate::caps::active_glyphs().emdash,
                     bytes(total)
                 ),
                 _ => format!("{name} {}", crate::caps::active_glyphs().emdash),
             };
             let gtt = match (used_gtt, total_gtt) {
-                (Some(used), Some(total)) => format!("GTT {} / {}", bytes(used), bytes(total)),
-                _ => format!("GTT {}", crate::caps::active_glyphs().emdash),
+                (Some(used), Some(total)) => format!("gtt {} / {}", bytes(used), bytes(total)),
+                _ => format!("gtt {}", crate::caps::active_glyphs().emdash),
+            };
+            let memory = if shared {
+                format!(
+                    "shared  vram {}  {}  {gtt}",
+                    memory.trim_start_matches("VRAM "),
+                    caps::active_glyphs().middot
+                )
+            } else {
+                format!(
+                    "{}  {}  GTT {}",
+                    memory,
+                    caps::active_glyphs().middot,
+                    gtt.trim_start_matches("gtt ")
+                )
             };
             view.put_str(
                 0,
                 row,
-                &format!("{}  {}  {}", device.slot, memory, gtt),
+                &format!("{}  {}", device.slot, memory),
                 Default::default(),
             );
             row += 1;
@@ -281,7 +316,10 @@ impl GpuView<'_> {
             view.put_str(
                 0,
                 0,
-                &format!("{} no memory readings", crate::caps::active_glyphs().emdash),
+                &format!(
+                    "{} no memory readings",
+                    mark(display_health(self.0.device_health, self.0.engine_health))
+                ),
                 Default::default(),
             );
         }
@@ -292,13 +330,11 @@ impl GpuView<'_> {
         if matches!(self.0.engine_health, Health::Absent(_))
             && matches!(self.0.smu_health, Health::Absent(_))
         {
+            let health = display_health(self.0.engine_health, self.0.smu_health);
             view.put_str(
                 0,
                 0,
-                &format!(
-                    "{} clock and SMU readings unavailable",
-                    crate::caps::active_glyphs().emdash
-                ),
+                &format!("{} clock and SMU readings unavailable", mark(health)),
                 Default::default(),
             );
             return;
@@ -359,7 +395,7 @@ impl GpuView<'_> {
                 0,
                 &format!(
                     "{} waiting for clock readings",
-                    crate::caps::active_glyphs().ellipsis
+                    mark(display_health(self.0.engine_health, self.0.smu_health))
                 ),
                 Default::default(),
             );
@@ -387,12 +423,5 @@ fn clock_label(current: Option<u32>, levels: &[u32], absent: &str) -> String {
 }
 
 fn bytes(value: u64) -> String {
-    const UNITS: [&str; 5] = ["B", "KiB", "MiB", "GiB", "TiB"];
-    let mut amount = value as f64;
-    let mut index = 0;
-    while amount >= 1024.0 && index + 1 < UNITS.len() {
-        amount /= 1024.0;
-        index += 1;
-    }
-    format!("{amount:.1}{}", UNITS[index])
+    crate::monitor::kit::edge_fmt(NumFmt::default()).fmt(value as f64, Unit::Bytes, 8)
 }
