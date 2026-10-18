@@ -162,13 +162,8 @@ pub fn dump_tcp(
         socket.send(&request)?;
         loop {
             socket.recv(deadline)?;
-            let (done, malformed) = consume_batch(socket.received(), sequence, out)?;
-            if malformed > 0 {
-                tracing::debug!(
-                    malformed_rows = malformed,
-                    "skipped malformed sock_diag rows"
-                );
-            }
+            // thegn-metrics has no logging dependency; malformed rows are skipped and counted by consume_batch.
+            let (done, _malformed) = consume_batch(socket.received(), sequence, out)?;
             if done {
                 break;
             }
