@@ -792,7 +792,7 @@ mod tests {
             ],
         );
         let mut reader = SupplyReader::with_fs(fs, &root);
-        assert_eq!(reader.discover(), Health::Ok);
+        assert_eq!(reader.discover(), Health::Absent(Absent::NoHardware));
         let mut part = PowerSupplyPart::default();
         reader.read_full(&mut part).unwrap();
         assert_eq!(part.supplies.len(), 2);
