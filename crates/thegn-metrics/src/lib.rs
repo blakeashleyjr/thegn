@@ -11,6 +11,8 @@
 //! sysinfo does no background work; cost is paid only when the host calls
 //! [`StatsSampler::sample`], preserving thegn's ~0%-idle invariant.
 
+#[cfg(target_os = "linux")]
+mod base_net;
 mod battery;
 pub mod collect;
 mod coverage;

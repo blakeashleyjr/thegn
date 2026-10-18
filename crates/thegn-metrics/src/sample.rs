@@ -98,6 +98,8 @@ pub struct StatsSampler {
     net_classes: std::collections::BTreeMap<String, crate::net_kind::IfaceClass>,
     net_up: std::collections::BTreeMap<String, bool>,
     net_probed: bool,
+    #[cfg(target_os = "linux")]
+    base_net: crate::base_net::BaseNet,
 }
 
 /// Parse Linux `/proc/net/route`, returning every interface tied for the
@@ -219,6 +221,8 @@ impl StatsSampler {
             net_classes: std::collections::BTreeMap::new(),
             net_up: std::collections::BTreeMap::new(),
             net_probed: false,
+            #[cfg(target_os = "linux")]
+            base_net: crate::base_net::BaseNet::new(),
         }
     }
 
@@ -322,25 +326,45 @@ impl StatsSampler {
         }
 
         // --- Network (every tick): bytes/sec since the previous read ---
-        self.nets.refresh(false);
         let dt_net = now.duration_since(self.prev_net).as_secs_f64().max(0.001);
         self.prev_net = now;
         self.refresh_net_links(slow, probe_net_links);
-        let (ifaces, physical, all) = crate::net_kind::aggregate(
-            self.nets.iter().map(|(name, data)| {
-                (
-                    name.as_str(),
-                    (data.received() as f64 / dt_net) as u64,
-                    (data.transmitted() as f64 / dt_net) as u64,
-                )
-            }),
-            &self.net_classes,
-            &self.net_up,
-            cfg!(target_os = "linux"),
-        );
-        snap.net_ifaces = ifaces;
-        snap.net_bps = Some(physical);
-        snap.net_bps_all = Some(all);
+        let network = {
+            #[cfg(target_os = "linux")]
+            {
+                // Keep the constructor's sysinfo setup until its deferred cfg split.
+                let _legacy_networks = &self.nets;
+                self.base_net.rates(dt_net, slow).map(|rates| {
+                    crate::net_kind::aggregate(
+                        rates.iter().map(|(name, rx, tx)| (name.as_str(), *rx, *tx)),
+                        &self.net_classes,
+                        &self.net_up,
+                        cfg!(target_os = "linux"),
+                    )
+                })
+            }
+            #[cfg(not(target_os = "linux"))]
+            {
+                self.nets.refresh(false);
+                Some(crate::net_kind::aggregate(
+                    self.nets.iter().map(|(name, data)| {
+                        (
+                            name.as_str(),
+                            (data.received() as f64 / dt_net) as u64,
+                            (data.transmitted() as f64 / dt_net) as u64,
+                        )
+                    }),
+                    &self.net_classes,
+                    &self.net_up,
+                    cfg!(target_os = "linux"),
+                ))
+            }
+        };
+        if let Some((ifaces, physical, all)) = network {
+            snap.net_ifaces = ifaces;
+            snap.net_bps = Some(physical);
+            snap.net_bps_all = Some(all);
+        }
 
         // --- Battery + GPU + disk-free ---
         // Battery and disk-free are cheap file reads every tick. GPU depends on
