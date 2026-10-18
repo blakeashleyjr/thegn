@@ -10,10 +10,15 @@ use thegn_metrics::collect::{
     env::Env,
     frame::{FramePool, MonitorFrame, Parts},
     health::Health,
-    schedule::{self, Mode},
+    registry::Registry,
+    schedule::Mode,
 };
 
 const THREAD_NAME: &str = "thegn-monitor";
+
+fn production_factory() -> Factory {
+    Arc::new(thegn_metrics::collect::default_collectors)
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct Demand {
@@ -160,7 +165,7 @@ pub(crate) struct MonitorSampler {
 impl MonitorSampler {
     pub(crate) fn new(waker: termwiz::terminal::TerminalWaker) -> Self {
         Self::with_inputs(SpawnInputs {
-            factory: Arc::new(thegn_metrics::collect::stub::stub_collectors),
+            factory: production_factory(),
             clock: Arc::new(LiveClock),
             wake: Arc::new({
                 let wake = waker.clone();
@@ -363,39 +368,28 @@ impl ExternalPoster {
 }
 
 fn worker(shared: &Shared, clock: &dyn Clock, factory: Factory, wake: &Wake) {
-    let mut collectors = factory();
-    let env = Env::default();
-    let mut cadences = Vec::with_capacity(collectors.len());
-    let mut health = [Health::default(); collect::COLLECTORS];
-    for collector in &mut collectors {
-        let id = collector.id();
-        health[id.index()] = collector.discover(&env);
-        cadences.push((id, collector.cadence()));
-    }
-    let phases = schedule::phases(&cadences);
+    let mut registry = Registry::new(factory());
+    registry.discover(&Env::default());
+    let mut health_overlay = [None; collect::COLLECTORS];
     let mut seq = 0_u64;
     let mut tick = 0_u64;
     let mut last_ms = None;
     let mut next_due = None;
     let mut scheduled_base = None;
     let mut scheduled_generation = None;
-    let mut parts = Parts::default();
-    let mut scratch = MonitorFrame::default();
-    let discover = MonitorFrame {
-        health,
+    let mut scratch = MonitorFrame {
+        health: registry.healths(),
         ..MonitorFrame::default()
     };
     let discover_generation = shared.lock().generation;
-    publish(shared, &discover, discover_generation, wake);
+    publish(shared, &scratch, discover_generation, wake);
 
     loop {
         let mut state = shared.lock();
         if state.stop {
             let failed = state.phase == Phase::Failed;
             drop(state);
-            for collector in &mut collectors {
-                collector.close();
-            }
+            registry.close_all();
             if failed {
                 shared.announce(Phase::Failed);
             } else {
@@ -408,14 +402,7 @@ fn worker(shared: &Shared, clock: &dyn Clock, factory: Factory, wake: &Wake) {
         }
         let demand = state.demand;
         let generation = state.generation;
-        let effective = demand
-            .collectors
-            .iter()
-            .filter(|id| !matches!(health[id.index()], Health::Absent(_)))
-            .fold(CollectorSet::empty(), |mut set, id| {
-                set.insert(id);
-                set
-            });
+        let effective = registry.live(demand.collectors);
         if state.mode != Mode::Open {
             state.phase = Phase::Parked;
             shared.changed.notify_all();
@@ -423,24 +410,23 @@ fn worker(shared: &Shared, clock: &dyn Clock, factory: Factory, wake: &Wake) {
             continue;
         }
         if state.external.iter().any(Option::is_some) {
-            let mut frame = take_frame(&mut state);
             let mut sampled = CollectorSet::empty();
             for id in CollectorId::ALL {
                 if let Some(pending) = state.external[id.index()].take() {
-                    (pending.write)(&mut parts);
-                    health[id.index()] = pending.health;
+                    (pending.write)(&mut scratch.parts);
+                    health_overlay[id.index()] = Some(pending.health);
                     sampled.insert(id);
                 }
             }
             seq = seq.saturating_add(1);
-            frame.seq = seq;
-            frame.at_ms = elapsed_ms(clock.now());
-            frame.demand_gen = generation;
-            frame.sampled = sampled;
-            frame.health = health;
-            frame.parts.clone_from(&parts);
+            scratch.seq = seq;
+            scratch.at_ms = elapsed_ms(clock.now());
+            scratch.demand_gen = generation;
+            scratch.sampled = sampled;
+            scratch.health = registry.healths();
+            apply_health_overlay(&mut scratch.health, &health_overlay);
             drop(state);
-            publish_box(shared, frame, wake);
+            publish(shared, &scratch, generation, wake);
             continue;
         }
         if effective.is_empty() {
@@ -465,33 +451,20 @@ fn worker(shared: &Shared, clock: &dyn Clock, factory: Factory, wake: &Wake) {
         state.phase = Phase::Collecting;
         drop(state);
 
-        let due = schedule::due_set(Mode::Open, effective, &cadences, &phases, tick);
         let now_ms = elapsed_ms(now);
         let dt_ms = last_ms.map_or(0, |last: u64| {
             now_ms.saturating_sub(last).min(u64::from(u32::MAX)) as u32
         });
-        let mut sampled = CollectorSet::empty();
-        scratch.parts.clone_from(&parts);
-        for collector in &mut collectors {
-            let id = collector.id();
-            if due.contains(id) && health[id.index()].retry_due(tick) {
-                match collector.sample(&TickCtx { tick, now_ms }, &mut scratch) {
-                    Ok(()) => {
-                        health[id.index()] = health[id.index()].after_ok();
-                    }
-                    Err(_) => {
-                        restore_collector_part(&mut scratch.parts, &parts, id);
-                        // `after_error` schedules relative to the tick passed in. The
-                        // current tick is still in progress here, so anchor the
-                        // backoff at the completed tick to leave the full interval
-                        // before a retry is eligible.
-                        health[id.index()] = health[id.index()].after_error(tick.saturating_add(1));
-                    }
-                }
-                sampled.insert(id);
-            }
+        let sampled = registry.tick(
+            Mode::Open,
+            effective,
+            &TickCtx { tick, now_ms },
+            &mut scratch,
+        );
+        for id in sampled.iter() {
+            health_overlay[id.index()] = None;
         }
-        parts.clone_from(&scratch.parts);
+        apply_health_overlay(&mut scratch.health, &health_overlay);
         last_ms = Some(now_ms);
         seq = seq.saturating_add(1);
         scratch.seq = seq;
@@ -499,10 +472,20 @@ fn worker(shared: &Shared, clock: &dyn Clock, factory: Factory, wake: &Wake) {
         scratch.dt_ms = dt_ms;
         scratch.demand_gen = generation;
         scratch.sampled = sampled;
-        scratch.health = health;
         next_due = Some(next_deadline(now, demand.base_ms, true));
         publish(shared, &scratch, generation, wake);
         tick = tick.saturating_add(1);
+    }
+}
+
+fn apply_health_overlay(
+    health: &mut [Health; collect::COLLECTORS],
+    overlay: &[Option<Health>; collect::COLLECTORS],
+) {
+    for id in CollectorId::ALL {
+        if let Some(value) = overlay[id.index()] {
+            health[id.index()] = value;
+        }
     }
 }
 
@@ -526,25 +509,6 @@ fn next_deadline(now: Instant, base_ms: u32, strictly_after: bool) -> Instant {
         deadline += Duration::from_millis(u64::from(base_ms.max(1)));
     }
     deadline
-}
-
-fn restore_collector_part(target: &mut Parts, source: &Parts, id: CollectorId) {
-    match id {
-        CollectorId::Loadavg => target.loadavg.clone_from(&source.loadavg),
-        CollectorId::Uptime => target.uptime.clone_from(&source.uptime),
-        CollectorId::Psi => target.psi.clone_from(&source.psi),
-        CollectorId::CpuStat => target.cpu_stat.clone_from(&source.cpu_stat),
-        CollectorId::CpuFreq => target.cpu_freq.clone_from(&source.cpu_freq),
-        CollectorId::Hwmon => target.hwmon.clone_from(&source.hwmon),
-        CollectorId::Cgroup => target.cgroup.clone_from(&source.cgroup),
-        CollectorId::CgroupSlice => target.cgroup_slice.clone_from(&source.cgroup_slice),
-        CollectorId::AmdSmu => target.amd_smu.clone_from(&source.amd_smu),
-        CollectorId::Meminfo => target.meminfo.clone_from(&source.meminfo),
-        CollectorId::Vmstat => target.vmstat.clone_from(&source.vmstat),
-        CollectorId::Netdev => target.netdev.clone_from(&source.netdev),
-        CollectorId::Diskstats => target.diskstats.clone_from(&source.diskstats),
-        CollectorId::Powercap => target.powercap.clone_from(&source.powercap),
-    }
 }
 
 fn take_frame(state: &mut State) -> Box<MonitorFrame> {

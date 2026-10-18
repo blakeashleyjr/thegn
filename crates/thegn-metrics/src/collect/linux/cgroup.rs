@@ -97,6 +97,9 @@ pub fn read_group<F: CgroupFs>(
     );
     read!("memory.swap.current", cgroup::single_u64, swap_current);
     read!("pids.current", cgroup::single_u64, pids_current);
+    read!("cpu.pressure", cgroup::pressure, cpu_pressure);
+    read!("memory.pressure", cgroup::pressure, mem_pressure);
+    read!("io.pressure", cgroup::pressure, io_pressure);
     path.push("io.stat");
     if let Some(length) = read_bytes(fs, path, buf)
         && !filter.devices.is_empty()
@@ -345,5 +348,41 @@ mod tests {
             &mut path,
         );
         assert_eq!(sample.io, None);
+    }
+
+    #[test]
+    fn reads_cgroup_pressure_and_degrades_missing_or_malformed_files() {
+        let temp = tempfile::tempdir().unwrap();
+        let group = temp.path().join("group");
+        std::fs::create_dir(&group).unwrap();
+        std::fs::write(
+            group.join("cpu.pressure"),
+            b"some avg10=1.50 avg60=0.00 avg300=0.00 total=1234\nfull avg10=0.25 avg60=0.00 avg300=0.00 total=99\n",
+        )
+        .unwrap();
+        std::fs::write(group.join("io.pressure"), b"garbage\n").unwrap();
+        let mut fs = CountingFs::default();
+        let mut buf = Vec::new();
+        let mut sample = CgroupSample::default();
+        let mut path = group;
+        read_group(
+            &mut fs,
+            &DeviceFilter::default(),
+            &mut buf,
+            &mut sample,
+            &mut path,
+        );
+        assert_eq!(
+            sample.cpu_pressure,
+            Some(crate::collect::model::cgroup::Pressure {
+                some_avg10: Some(1.5),
+                some_total_us: Some(1234),
+                full_avg10: Some(0.25),
+                full_total_us: Some(99),
+            })
+        );
+        assert_eq!(sample.mem_pressure, None);
+        assert_eq!(sample.io_pressure, None);
+        assert_eq!(fs.0, 11);
     }
 }

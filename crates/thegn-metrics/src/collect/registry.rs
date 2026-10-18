@@ -2,7 +2,7 @@
 use super::{
     COLLECTORS, CollectError, Collector, CollectorId, CollectorSet, TickCtx,
     env::Env,
-    frame::MonitorFrame,
+    frame::{MonitorFrame, Parts},
     health::Health,
     schedule::{self, Cadence, Mode},
     stub::NotImplemented,
@@ -14,6 +14,7 @@ pub struct Registry {
     phases: [u16; COLLECTORS],
     health: [Health; COLLECTORS],
     env: Env,
+    backup: Parts,
 }
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct Rollup {
@@ -51,6 +52,7 @@ impl Registry {
             phases,
             health: [Health::Warming; COLLECTORS],
             env: Env::default(),
+            backup: Parts::default(),
         }
     }
     pub fn discover(&mut self, env: &Env) {
@@ -77,24 +79,30 @@ impl Registry {
         demand: CollectorSet,
         ctx: &TickCtx,
         frame: &mut MonitorFrame,
-    ) {
+    ) -> CollectorSet {
         let due = self.due(mode, demand, ctx.tick);
         for id in due.iter() {
+            copy_part(&mut self.backup, &frame.parts, id);
             let result = self.slots[id.index()].sample(ctx, frame);
             match result {
                 Ok(()) => self.health[id.index()] = self.health[id.index()].after_ok(),
                 Err(CollectError::Gone) => {
+                    copy_part(&mut frame.parts, &self.backup, id);
                     self.slots[id.index()].close();
-                    self.health[id.index()] = self.health[id.index()].after_error(ctx.tick);
+                    self.health[id.index()] = failure_health(self.health[id.index()], ctx.tick);
                     let discovered = self.slots[id.index()].discover(&self.env);
                     if let Health::Absent(absent) = discovered {
                         self.health[id.index()] = Health::Absent(absent);
                     }
                 }
-                Err(_) => self.health[id.index()] = self.health[id.index()].after_error(ctx.tick),
+                Err(_) => {
+                    copy_part(&mut frame.parts, &self.backup, id);
+                    self.health[id.index()] = failure_health(self.health[id.index()], ctx.tick);
+                }
             }
         }
         frame.health = self.health;
+        due
     }
     pub fn close_all(&mut self) {
         for collector in &mut self.slots {
@@ -103,6 +111,18 @@ impl Registry {
     }
     pub fn health(&self, id: CollectorId) -> Health {
         self.health[id.index()]
+    }
+    pub fn healths(&self) -> [Health; COLLECTORS] {
+        self.health
+    }
+    pub fn live(&self, demand: CollectorSet) -> CollectorSet {
+        demand
+            .iter()
+            .filter(|id| !matches!(self.health[id.index()], Health::Absent(_)))
+            .fold(CollectorSet::empty(), |mut live, id| {
+                live.insert(id);
+                live
+            })
     }
     pub fn rollup(&self) -> Rollup {
         let mut r = Rollup::default();
@@ -115,6 +135,40 @@ impl Registry {
             }
         }
         r
+    }
+}
+
+fn failure_health(previous: Health, tick: u64) -> Health {
+    let since_tick = match previous {
+        Health::Failing { since_tick, .. } => since_tick,
+        _ => tick,
+    };
+    match previous.after_error(tick.saturating_add(1)) {
+        Health::Failing { backoff, .. } => Health::Failing {
+            since_tick,
+            backoff,
+            retry_at: tick.saturating_add(1).saturating_add(u64::from(backoff)),
+        },
+        health => health,
+    }
+}
+
+fn copy_part(target: &mut Parts, source: &Parts, id: CollectorId) {
+    match id {
+        CollectorId::Loadavg => target.loadavg.clone_from(&source.loadavg),
+        CollectorId::Uptime => target.uptime.clone_from(&source.uptime),
+        CollectorId::Psi => target.psi.clone_from(&source.psi),
+        CollectorId::CpuStat => target.cpu_stat.clone_from(&source.cpu_stat),
+        CollectorId::CpuFreq => target.cpu_freq.clone_from(&source.cpu_freq),
+        CollectorId::Hwmon => target.hwmon.clone_from(&source.hwmon),
+        CollectorId::Cgroup => target.cgroup.clone_from(&source.cgroup),
+        CollectorId::CgroupSlice => target.cgroup_slice.clone_from(&source.cgroup_slice),
+        CollectorId::AmdSmu => target.amd_smu.clone_from(&source.amd_smu),
+        CollectorId::Meminfo => target.meminfo.clone_from(&source.meminfo),
+        CollectorId::Vmstat => target.vmstat.clone_from(&source.vmstat),
+        CollectorId::Netdev => target.netdev.clone_from(&source.netdev),
+        CollectorId::Diskstats => target.diskstats.clone_from(&source.diskstats),
+        CollectorId::Powercap => target.powercap.clone_from(&source.powercap),
     }
 }
 
@@ -299,10 +353,104 @@ mod tests {
             Health::Failing {
                 since_tick: 0,
                 backoff: 1,
-                retry_at: 1
+                retry_at: 2
             }
         );
         assert_eq!(registry.rollup().failing, 1);
         assert_eq!(registry.rollup().absent, 12);
+    }
+
+    struct WritesThenFails(u8);
+    impl Collector for WritesThenFails {
+        fn id(&self) -> CollectorId {
+            CollectorId::Loadavg
+        }
+        fn cadence(&self) -> Cadence {
+            Cadence::Every(1)
+        }
+        fn discover(&mut self, _env: &Env) -> Health {
+            Health::Ok
+        }
+        fn sample(&mut self, _ctx: &TickCtx, frame: &mut MonitorFrame) -> Result<(), CollectError> {
+            self.0 += 1;
+            frame.parts.loadavg.value = Some(crate::collect::parse::loadavg::Loadavg {
+                load1: if self.0 == 1 { 100 } else { 900 },
+                ..Default::default()
+            });
+            if self.0 == 1 {
+                Ok(())
+            } else {
+                Err(CollectError::Parse("injected"))
+            }
+        }
+        fn close(&mut self) {}
+    }
+
+    #[test]
+    fn failed_sample_restores_its_part_and_reports_attempt_and_anchored_retry() {
+        let mut registry = Registry::new(vec![Box::new(WritesThenFails(0))]);
+        registry.discover(&Env::default());
+        let demand = demand(CollectorId::Loadavg);
+        let mut frame = MonitorFrame::default();
+        assert!(
+            registry
+                .tick(
+                    Mode::Open,
+                    demand,
+                    &TickCtx { tick: 0, now_ms: 0 },
+                    &mut frame
+                )
+                .contains(CollectorId::Loadavg)
+        );
+        assert_eq!(frame.parts.loadavg.value.unwrap().load1, 100);
+        let attempted = registry.tick(
+            Mode::Open,
+            demand,
+            &TickCtx { tick: 1, now_ms: 1 },
+            &mut frame,
+        );
+        assert!(attempted.contains(CollectorId::Loadavg));
+        assert_eq!(frame.parts.loadavg.value.unwrap().load1, 100);
+        assert_eq!(
+            registry.health(CollectorId::Loadavg),
+            Health::Failing {
+                since_tick: 1,
+                backoff: 1,
+                retry_at: 3,
+            }
+        );
+        assert!(
+            !registry
+                .due(Mode::Open, demand, 2)
+                .contains(CollectorId::Loadavg)
+        );
+    }
+
+    #[test]
+    fn live_excludes_absent_demand() {
+        let (available, _, _, _) =
+            fake(CollectorId::Loadavg, Cadence::Every(1), Health::Ok, Ok(()));
+        let (absent, _, _, _) = fake(
+            CollectorId::Uptime,
+            Cadence::Every(1),
+            Health::Absent(Absent::NoHardware),
+            Ok(()),
+        );
+        let mut registry = Registry::new(vec![available, absent]);
+        registry.discover(&Env::default());
+        let requested = [CollectorId::Loadavg, CollectorId::Uptime]
+            .into_iter()
+            .fold(CollectorSet::empty(), |mut set, id| {
+                set.insert(id);
+                set
+            });
+        let live = registry.live(requested);
+        assert_eq!(live.len(), 1);
+        assert!(live.contains(CollectorId::Loadavg));
+        assert!(!live.contains(CollectorId::Uptime));
+        assert_eq!(
+            registry.healths()[CollectorId::Uptime.index()],
+            Health::Absent(Absent::NoHardware)
+        );
     }
 }
