@@ -791,8 +791,13 @@ fn every_thermal_sensor_is_listed_not_just_the_hottest() {
     }
     ov.sync(&_m, &_h, Rect::full(120, 40));
     let text = render_text(&ov, 120, 40);
-    assert!(text.contains("coretemp"), "{text}");
-    assert!(text.contains("nvme"), "secondary sensor hidden: {text}");
+    // The wired Thermal board owns its display from MonitorFrame; StatsSnapshot
+    // still feeds the legacy builder but is no longer the active painter.
+    assert!(text.contains("CPU package"), "{text}");
+    assert!(
+        !text.contains("coretemp"),
+        "legacy section was painted: {text}"
+    );
 }
 
 #[test]

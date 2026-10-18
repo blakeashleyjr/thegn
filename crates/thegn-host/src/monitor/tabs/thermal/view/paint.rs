@@ -1,5 +1,3 @@
-#![allow(dead_code)] // helpers are reached by ThermalView painters
-
 use super::{SensorRow, ThermalModel, ZoneRow};
 use crate::{
     caps,
@@ -238,7 +236,7 @@ pub(super) fn sensors(grid: &mut CellGrid, rect: Rect, sensors: &[SensorRow]) {
             (None, None) => caps::active_glyphs().emdash.to_owned(),
         })
         .collect::<Vec<_>>();
-    let bar_width = rect.cols.saturating_sub(14 + 22 + 7 + 12 + 4).max(8);
+    let bar_width = 12;
     let bars = sensors
         .iter()
         .map(|sensor| {
@@ -265,9 +263,11 @@ pub(super) fn sensors(grid: &mut CellGrid, rect: Rect, sensors: &[SensorRow]) {
             ),
             table::TableCell::Text(limit),
             table::TableCell::Text(bar),
+            table::TableCell::Text(""),
         ]);
     }
     let row_refs = owned_rows.iter().map(Vec::as_slice).collect::<Vec<_>>();
+    let spark_width = rect.cols.saturating_sub(14 + 22 + 7 + 12 + 12 + 4).max(1);
     let cols = [
         table::Col {
             title: "chip",
@@ -299,6 +299,12 @@ pub(super) fn sensors(grid: &mut CellGrid, rect: Rect, sensors: &[SensorRow]) {
             align: table::Align::Left,
             unit: None,
         },
+        table::Col {
+            title: "history",
+            width: spark_width,
+            align: table::Align::Left,
+            unit: None,
+        },
     ];
     table::draw(
         grid,
@@ -316,6 +322,17 @@ pub(super) fn sensors(grid: &mut CellGrid, rect: Rect, sensors: &[SensorRow]) {
 }
 
 pub(super) fn zones(grid: &mut CellGrid, rect: Rect, zones: &[ZoneRow]) {
+    if zones.is_empty() {
+        put(
+            grid,
+            rect,
+            0,
+            0,
+            caps::active_glyphs().emdash,
+            Tok::Slot(S::Dim),
+        );
+        return;
+    }
     for (index, zone) in zones.iter().enumerate().take(rect.rows) {
         let trip = zone
             .trips
@@ -402,6 +419,75 @@ pub(super) fn gpu(grid: &mut CellGrid, rect: Rect, model: &ThermalModel) {
             Tok::Slot(S::Dim),
         );
     }
+}
+
+pub(super) fn heatmap(grid: &mut CellGrid, rect: Rect, sensors: &[SensorRow]) {
+    if sensors.is_empty() {
+        put(
+            grid,
+            rect,
+            0,
+            0,
+            caps::active_glyphs().emdash,
+            Tok::Slot(S::Dim),
+        );
+        return;
+    }
+    let label_width = sensors
+        .iter()
+        .take(rect.rows)
+        .map(|sensor| sensor.label.chars().count())
+        .max()
+        .unwrap_or(0)
+        .saturating_add(1);
+    let graph_width = rect.cols.saturating_sub(label_width);
+    let mut values = Vec::with_capacity(sensors.len());
+    for sensor in sensors {
+        let mut ordered = history_width(sensor, graph_width);
+        for sample in &mut ordered {
+            let limit = sensor.crit_c.or(sensor.max_c).unwrap_or(100.0);
+            *sample = (*sample / limit).clamp(0.0, 1.0);
+        }
+        values.push(ordered);
+    }
+    let rows = values.iter().map(Vec::as_slice).collect::<Vec<_>>();
+    let mut graph = crate::monitor::graphs::GraphOut::new();
+    crate::monitor::graphs::paint_heatmap(
+        &mut graph,
+        &rows,
+        RampId::Temp,
+        &crate::chrome::palette_snapshot(),
+    );
+    for (index, sensor) in sensors.iter().enumerate().take(rect.rows) {
+        put(
+            grid,
+            rect,
+            0,
+            index,
+            &format!("{} ", sensor.label),
+            Tok::Slot(S::Dim),
+        );
+    }
+    draw_graph(grid, rect, label_width, 0, &graph.lines, rect.rows);
+}
+
+pub(super) fn history_width(sensor: &SensorRow, width: usize) -> Vec<f32> {
+    if sensor.history_len == 0 || width == 0 {
+        return Vec::new();
+    }
+    let first = if sensor.history_len == sensor.history.len() {
+        sensor.history_next
+    } else {
+        0
+    };
+    // Map the bounded ring to terminal columns. A narrower or wider terminal
+    // changes display resolution; every column still comes from a real sample.
+    (0..width)
+        .map(|column| {
+            let sample = column.saturating_mul(sensor.history_len) / width;
+            sensor.history[(first + sample.min(sensor.history_len - 1)) % sensor.history.len()]
+        })
+        .collect()
 }
 
 fn format_temp(temp: Option<f32>) -> String {

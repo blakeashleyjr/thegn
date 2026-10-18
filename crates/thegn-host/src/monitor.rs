@@ -467,6 +467,7 @@ pub struct MonitorOverlay {
     body_rows: usize,
     board: board::Board,
     overview: tabs::overview::OverviewModel,
+    thermal: tabs::thermal::view::ThermalModel,
 }
 
 impl MonitorOverlay {
@@ -523,6 +524,7 @@ impl MonitorOverlay {
             body_rows: rows.saturating_sub(CHROME_ROWS),
             board: board::Board::default(),
             overview: tabs::overview::OverviewModel::default(),
+            thermal: tabs::thermal::view::ThermalModel::default(),
         };
         ov.rebuild(model, ctx, false);
         ov
@@ -598,7 +600,12 @@ impl MonitorOverlay {
     }
 
     fn view(&self) -> board::ActiveView<'_> {
-        board::ActiveView::for_tab(self.tab, &self.overview)
+        match self.tab {
+            MonitorTab::Thermal => {
+                board::ActiveView::Thermal(tabs::thermal::view::ThermalView(&self.thermal))
+            }
+            _ => board::ActiveView::for_tab(self.tab, &self.overview),
+        }
     }
 
     /// Copy the latest pooled frame before the sampler reuses it. Pausing freezes
@@ -606,6 +613,10 @@ impl MonitorOverlay {
     pub fn ingest_frame(&mut self, frame: &thegn_metrics::collect::frame::MonitorFrame) -> bool {
         if self.paused {
             return false;
+        }
+        if self.tab == MonitorTab::Thermal {
+            self.thermal.absorb_frame(frame);
+            return true;
         }
         self.overview.absorb_frame(frame);
         self.tab == MonitorTab::Overview
@@ -640,6 +651,11 @@ impl MonitorOverlay {
             self.overview.absorb_container_count(model.containers.len());
             let prefs = self.prefs.tab(MonitorTab::Overview);
             self.overview
+                .absorb_history(ctx.hist, prefs.window, prefs.scale, now);
+        }
+        if !self.paused && self.tab == MonitorTab::Thermal {
+            let prefs = self.prefs.tab(MonitorTab::Thermal);
+            self.thermal
                 .absorb_history(ctx.hist, prefs.window, prefs.scale, now);
         }
         // Only the active list is derived, and navigation/geometry changes do
