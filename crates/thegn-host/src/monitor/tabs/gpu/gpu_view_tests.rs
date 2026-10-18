@@ -66,6 +66,12 @@ fn fixture(tick: u32, kind: GpuKind, status: RuntimeStatus) -> MonitorFrame {
         },
     });
     let metrics = GpuMetrics {
+        layout_verified: true,
+        activity_gfx: Some((20 + tick % 70) as u16),
+        activity_mm: Some((10 + tick % 60) as u16),
+        activity_vcn: Some((tick % 80) as u16),
+        activity_umc: Some((30 + tick % 50) as u16),
+        activity_ipu: std::array::from_fn(|index| Some(((tick + index as u32 * 7) % 100) as u16)),
         power_socket: Some(12_000 + (tick % 60) * 150),
         power_current_stapm_limit: Some(28),
         temperature_gfx: Some(8_000 + (tick % 7) as u16 * 100),
@@ -82,6 +88,35 @@ fn fixture(tick: u32, kind: GpuKind, status: RuntimeStatus) -> MonitorFrame {
     frame.health[CollectorId::GpuDevices.index()] = Health::Ok;
     frame.health[CollectorId::GpuEngines.index()] = Health::Ok;
     frame.health[CollectorId::AmdSmu.index()] = Health::Ok;
+    frame
+}
+
+fn two_device_fixture(tick: u32) -> MonitorFrame {
+    let mut frame = fixture(tick, GpuKind::Dgpu, RuntimeStatus::Active);
+    let mut device = frame.parts.gpu_devices.devices[0].clone();
+    device.slot = "0000:05:00.0".to_owned();
+    device.card = 1;
+    device.family = Some("Second GPU".to_owned());
+    frame.parts.gpu_devices.devices.push(device);
+
+    let mut engine = frame.parts.gpu_engines.devices[0];
+    engine.slot = GpuSlot::new("0000:05:00.0").expect("valid second slot");
+    engine.vram_used = Some(100 * 1024 * 1024);
+    engine.gtt_used = Some(8 * 1024 * 1024 * 1024);
+    frame.parts.gpu_engines.devices.push(engine);
+    frame.parts.amd_smu.cards.push(AmdSmuCard {
+        card: 1,
+        suspended: false,
+        decoded: AmdSmuStatus::Decoded(
+            thegn_metrics::collect::parse::amd_gpu_metrics::Decoded::Full,
+        ),
+        metrics: GpuMetrics {
+            layout_verified: true,
+            power_socket: Some(8_000 + (tick % 20) * 100),
+            power_current_stapm_limit: Some(20),
+            ..GpuMetrics::default()
+        },
+    });
     frame
 }
 
@@ -176,11 +211,12 @@ fn gpu_view_snapshots_cover_size_and_capability_matrix() {
                 assert!(rendered.contains("GPU"));
                 assert!(rendered.contains("Radeon 890M"));
                 assert!(rendered.contains("gfx"));
+                assert!(rendered.contains("GPU0 gfx 0-100%"));
                 assert!(rendered.contains("vcn %"));
                 assert!(rendered.contains("shared"));
                 assert!(rendered.contains("MHz ["));
                 if cols == 240 {
-                    // density follow-up (batch 50): estimated, primary sets from the printed value
+                    // density follow-up (batch 51): estimated, primary sets from the printed value
                     let ratio = fill_ratio(&surface, Rect::full(cols, rows));
                     assert!(
                         ratio >= 0.30,
@@ -219,6 +255,8 @@ fn apu_and_dgpu_memory_labels_are_distinct_and_demand_is_panel_static() {
     let engine_demand = view.demand(engine_panel.id);
     let mut expected = thegn_metrics::collect::CollectorSet::empty();
     expected.insert(CollectorId::GpuEngines);
+    expected.insert(CollectorId::AmdSmu);
+    expected.insert(CollectorId::GpuDevices);
     assert_eq!(engine_demand, expected);
     let device_panel = placed
         .iter()
@@ -304,6 +342,7 @@ fn suspended_gpu_never_renders_zero_busy_or_clock_and_missing_is_absent() {
     assert!(!rendered.contains("sclk 0 MHz"));
     assert!(!rendered.contains("301"));
     assert!(rendered.contains(caps::active_glyphs().emdash));
+    assert!(model.histories[0].activity.iter().all(|ring| ring.len == 0));
 
     let mut suspending_model = GpuModel::default();
     suspending_model.absorb_frame(&fixture(1, GpuKind::Dgpu, RuntimeStatus::Suspending));
@@ -343,15 +382,34 @@ fn busy_history_is_slot_keyed_bounded_and_reuses_capacity_after_warmup() {
     let engine_capacity = model.engines.devices.capacity();
     let smu_capacity = model.smu.cards.capacity();
     let history_capacity = model.histories.capacity();
-    for tick in 0_u32..1_000 {
-        model.absorb_frame(&fixture(tick, GpuKind::Apu, RuntimeStatus::Active));
-    }
+    let frames = (0_u32..1_000)
+        .map(|tick| fixture(tick, GpuKind::Apu, RuntimeStatus::Active))
+        .collect::<Vec<_>>();
+    let (_, counts) = crate::proc_workload_alloc::measure(|| {
+        for frame in &frames {
+            model.absorb_frame(frame);
+        }
+    });
+    assert_eq!(
+        counts.allocation_calls, 0,
+        "1000 warm GPU absorbs allocated: {counts:?}"
+    );
+    assert_eq!(
+        counts.realloc_calls, 0,
+        "1000 warm GPU absorbs reallocated: {counts:?}"
+    );
     assert_eq!(model.histories.len(), 1);
     assert_eq!(model.histories[0].len, 480);
     assert_eq!(model.histories[0].memory_len, 480);
     assert_eq!(model.histories[0].gtt_len, 480);
     assert_eq!(model.histories[0].clocks_len, 480);
     assert_eq!(model.histories[0].power_len, 480);
+    assert!(
+        model.histories[0]
+            .activity
+            .iter()
+            .all(|ring| ring.len == HISTORY_CAP)
+    );
     let capacity = model.histories.capacity();
     assert_eq!(model.devices.devices.capacity(), device_capacity);
     assert_eq!(model.engines.devices.capacity(), engine_capacity);
@@ -372,12 +430,170 @@ fn busy_history_is_slot_keyed_bounded_and_reuses_capacity_after_warmup() {
     assert_eq!(model.histories.len(), 1);
     assert_eq!(model.histories[0].slot, "0000:05:00.0");
     assert_eq!(model.histories[0].len, 0);
+    assert!(model.histories[0].activity.iter().all(|ring| ring.len == 0));
     frame.parts.gpu_engines.devices[0].slot =
         GpuSlot::new("0000:06:00.0").expect("valid replacement slot");
     model.absorb_frame(&frame);
     assert_eq!(model.histories.len(), 1);
     assert_eq!(model.histories[0].slot, "0000:06:00.0");
     assert_eq!(model.histories[0].len, 0);
+}
+
+#[test]
+fn aux_history_draws_each_device_and_activity_rings_require_verified_layout() {
+    let mut model = GpuModel::default();
+    for tick in 0_u32..32 {
+        model.absorb_frame(&two_device_fixture(tick));
+    }
+    let view = GpuView(&model);
+    let rect = Rect::full(100, 18);
+    let body = Rect {
+        x: 1,
+        y: 1,
+        cols: 98,
+        rows: 16,
+    };
+    let mut memory_surface = Surface::new(100, 18);
+    view.paint_aux_history(&mut memory_surface, rect, body, true);
+    let memory = text(&memory_surface);
+    assert!(memory.contains("GPU0 VRAM / total"), "{memory}");
+    assert!(memory.contains("GPU1 VRAM / total"), "{memory}");
+    assert!(memory.contains("GPU0 GTT / total"), "{memory}");
+    assert!(memory.contains("GPU1 GTT / total"), "{memory}");
+    let label_row = |label: &str| {
+        memory_surface
+            .screen_lines()
+            .iter()
+            .position(|line| {
+                line.visible_cells()
+                    .fold(String::new(), |mut row, cell| {
+                        row.push_str(cell.str());
+                        row
+                    })
+                    .contains(label)
+            })
+            .expect("history label rendered")
+    };
+    let vram_row = label_row("GPU0 VRAM / total");
+    let gtt_row = label_row("GPU0 GTT / total");
+    assert!(
+        gtt_row >= vram_row + 3,
+        "VRAM area graph has fewer than two rows: VRAM {vram_row}, GTT {gtt_row}"
+    );
+
+    let mut clocks_surface = Surface::new(100, 18);
+    view.paint_aux_history(&mut clocks_surface, rect, body, false);
+    let clocks = text(&clocks_surface);
+    assert!(clocks.contains("GPU0 gfx clock / max"), "{clocks}");
+    assert!(clocks.contains("GPU1 gfx clock / max"), "{clocks}");
+    assert!(clocks.contains("GPU0 power / cap"), "{clocks}");
+    assert!(clocks.contains("GPU1 power / cap"), "{clocks}");
+
+    let mut unverified = two_device_fixture(33);
+    unverified.parts.amd_smu.cards[0].metrics.layout_verified = false;
+    unverified.parts.amd_smu.cards[0].metrics.activity_gfx = Some(88);
+    let mut unverified_model = GpuModel::default();
+    unverified_model.absorb_frame(&unverified);
+    assert!(
+        unverified_model.histories[0]
+            .activity
+            .iter()
+            .all(|ring| ring.len == 0)
+    );
+    assert_eq!(unverified_model.histories[0].power_len, 1);
+}
+
+#[test]
+fn busy_area_and_activity_rows_do_not_overlap_with_vcn_present() {
+    let mut model = GpuModel::default();
+    for tick in 0_u32..8 {
+        model.absorb_frame(&fixture(tick, GpuKind::Apu, RuntimeStatus::Active));
+    }
+    let history = &model.histories[0];
+    let activity_rows = history.activity.iter().filter(|ring| ring.len > 0).count();
+    let graph_rows = 20_usize.saturating_sub(2 + activity_rows.min(18));
+    let activity_start = 20 - 1 - activity_rows.min(18);
+    let busy_graph_rows = 1..1 + graph_rows;
+    let mut activity_label_rows = activity_start..19;
+    assert!(
+        activity_label_rows.all(|row| !busy_graph_rows.contains(&row)),
+        "activity labels overlap busy graph rows {busy_graph_rows:?}"
+    );
+
+    let mut surface = Surface::new(40, 20);
+    let rect = Rect::full(40, 20);
+    GpuView(&model).paint_busy_history(&mut surface, rect, rect);
+    let rendered = text(&surface);
+    assert!(rendered.contains("GPU0 gfx 0-100%"), "{rendered}");
+    assert!(rendered.contains("vcn %"), "{rendered}");
+    let gfx_label_row = surface
+        .screen_lines()
+        .iter()
+        .position(|line| {
+            line.visible_cells()
+                .fold(String::new(), |mut row, cell| {
+                    row.push_str(cell.str());
+                    row
+                })
+                .contains("GPU0 gfx 0-100%")
+        })
+        .expect("gfx activity label rendered");
+    assert!(
+        !busy_graph_rows.contains(&gfx_label_row),
+        "gfx label row {gfx_label_row} overlaps busy graph {busy_graph_rows:?}"
+    );
+}
+
+#[test]
+fn implausible_activity_is_blank_and_suspended_frames_do_not_push() {
+    let mut first = fixture(1, GpuKind::Apu, RuntimeStatus::Active);
+    first.parts.amd_smu.cards[0].metrics.activity_gfx = Some(64);
+    let mut model = GpuModel::default();
+    model.absorb_frame(&first);
+
+    let mut second = fixture(2, GpuKind::Apu, RuntimeStatus::Active);
+    second.parts.amd_smu.cards[0].metrics.activity_gfx = Some(60);
+    model.absorb_frame(&second);
+
+    let mut gap = fixture(3, GpuKind::Apu, RuntimeStatus::Active);
+    gap.parts.amd_smu.cards[0].metrics.activity_gfx = Some(101);
+    model.absorb_frame(&gap);
+    let ring = &model.histories[0].activity[0];
+    assert_eq!(ring.len, 3);
+    let previous = ring.values[(ring.next + HISTORY_CAP - 2) % HISTORY_CAP];
+    let missing = ring.values[(ring.next + HISTORY_CAP - 1) % HISTORY_CAP];
+    assert_eq!(previous, 0.60);
+    assert!(missing.is_nan(), "implausible activity must remain a gap");
+
+    let mut surface = Surface::new(40, 8);
+    let rect = Rect::full(40, 8);
+    GpuView(&model).paint_busy_history(&mut surface, rect, rect);
+    let gfx_row = surface
+        .screen_lines()
+        .iter()
+        .position(|line| {
+            line.visible_cells()
+                .fold(String::new(), |mut row, cell| {
+                    row.push_str(cell.str());
+                    row
+                })
+                .contains("GPU0 gfx 0-100%")
+        })
+        .expect("gfx activity label rendered");
+    let screen_lines = surface.screen_lines();
+    let newest_cell = screen_lines[gfx_row]
+        .visible_cells()
+        .find(|cell| cell.cell_index() == 39)
+        .expect("newest graph cell");
+    assert!(
+        newest_cell.str() == " " || newest_cell.str() == "\u{2800}",
+        "NaN activity cell must remain blank, got {:?}",
+        newest_cell.str()
+    );
+
+    let suspended = fixture(4, GpuKind::Apu, RuntimeStatus::Suspended);
+    model.absorb_frame(&suspended);
+    assert_eq!(model.histories[0].activity[0].len, 3);
 }
 
 #[test]
@@ -424,5 +640,42 @@ fn short_engine_history_reaches_the_right_edge() {
     assert!(
         rightmost_is_drawn,
         "short graph did not reach its right edge"
+    );
+}
+
+#[test]
+fn activity_history_places_newest_sample_in_last_inner_column() {
+    let mut sample = fixture(1, GpuKind::Apu, RuntimeStatus::Active);
+    sample.parts.gpu_engines.devices[0].gfx_busy_pct = None;
+    let metrics = &mut sample.parts.amd_smu.cards[0].metrics;
+    metrics.activity_gfx = Some(75);
+    metrics.activity_mm = None;
+    metrics.activity_vcn = None;
+    metrics.activity_umc = None;
+    metrics.activity_ipu = [None; 8];
+    let mut model = GpuModel::default();
+    model.absorb_frame(&sample);
+
+    let mut surface = Surface::new(40, 8);
+    let rect = Rect::full(40, 8);
+    GpuView(&model).paint_busy_history(&mut surface, rect, rect);
+    let gfx_row = surface
+        .screen_lines()
+        .iter()
+        .position(|line| {
+            line.visible_cells()
+                .fold(String::new(), |mut row, cell| {
+                    row.push_str(cell.str());
+                    row
+                })
+                .contains("GPU0 gfx 0-100%")
+        })
+        .expect("gfx activity label rendered");
+    let newest_column = surface.screen_lines()[gfx_row]
+        .visible_cells()
+        .any(|cell| cell.cell_index() == 39 && cell.str() != " " && cell.str() != "\u{2800}");
+    assert!(
+        newest_column,
+        "newest activity sample was not right-aligned"
     );
 }
