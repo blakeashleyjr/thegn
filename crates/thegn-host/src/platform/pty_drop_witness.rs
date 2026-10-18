@@ -53,11 +53,6 @@ impl MasterPty for DropWitnessMaster {
     fn tty_name(&self) -> Option<std::path::PathBuf> {
         self.inner().tty_name()
     }
-
-    #[cfg(unix)]
-    fn get_termios(&self) -> Option<nix::sys::termios::Termios> {
-        self.inner().get_termios()
-    }
 }
 
 impl Drop for DropWitnessMaster {
