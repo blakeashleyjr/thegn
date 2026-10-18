@@ -86,6 +86,7 @@ fn rates_prime_then_derive_cpu_and_io_and_counter_rollback_is_a_gap() {
     let start = Instant::now();
     let first = sampler.sample(&scopes, start).to_vec();
     assert_eq!(first.len(), 1);
+    assert!(std::sync::Arc::ptr_eq(&first[0].id, &scopes[0].id));
     assert!(
         sampler
             .fs
@@ -164,7 +165,7 @@ fn caps_reads_at_64_and_round_robins_every_scope_within_three_ticks() {
     let first: Vec<String> = sampler
         .sample(&scopes, start)
         .iter()
-        .map(|row| row.id.clone())
+        .map(|row| row.id.to_string())
         .collect();
     assert_eq!(first.len(), MAX_CONTAINER_SCOPES_PER_TICK);
     assert!(sampler.fs.reads <= MAX_CONTAINER_SCOPES_PER_TICK * 11);
@@ -205,6 +206,41 @@ fn caps_reads_at_64_and_round_robins_every_scope_within_three_ticks() {
 }
 
 #[test]
+fn mixed_cpu_scopes_all_get_sampled_despite_priority_churn() {
+    let count = 120;
+    let mut fs = FakeFs::default();
+    let scopes: Vec<ResolvedContainerScope> = (0..count)
+        .map(|index| {
+            let path = PathBuf::from(format!("mixed-{index}"));
+            set_group(&mut fs, &root().join(&path), 1_000_000, 100, 200, 4096);
+            scope(format!("mixed-container-{index}"), path)
+        })
+        .collect();
+    let mut sampler = ContainerStatsSampler::new(fs, filter(), root());
+    let start = Instant::now();
+    let mut observed = std::collections::HashSet::new();
+    let max_ticks = (count - 56).div_ceil(8) + 1;
+    for tick in 0..max_ticks {
+        if tick > 0 {
+            for index in 56..count {
+                set_group(
+                    &mut sampler.fs,
+                    &root().join(format!("mixed-{index}")),
+                    1_000_000 + tick as u64 * 1_000_000 + index as u64 * 100_000,
+                    100,
+                    200,
+                    4096,
+                );
+            }
+        }
+        let rows = sampler.sample(&scopes, start + Duration::from_secs(tick as u64));
+        observed.extend(rows.iter().map(|row| row.id.to_string()));
+        assert!(sampler.fs.reads <= (tick + 1) * MAX_CONTAINER_SCOPES_PER_TICK * 11);
+    }
+    assert_eq!(observed.len(), scopes.len());
+}
+
+#[test]
 fn buffer_and_previous_table_reuse_capacity_over_steady_ticks() {
     let mut fs = FakeFs::default();
     let scopes: Vec<ResolvedContainerScope> = (0..64)
@@ -222,11 +258,19 @@ fn buffer_and_previous_table_reuse_capacity_over_steady_ticks() {
     }
     let buffer_capacity = sampler.buffer_capacity();
     let previous_capacity = sampler.previous_capacity();
+    let row_capacity = sampler.rows.capacity();
+    let prioritized_capacity = sampler.prioritized.capacity();
+    let selected_capacity = sampler.selected.capacity();
+    let priority_capacity = sampler.priority.capacity();
     for tick in 1000..2000 {
         let rows = sampler.sample(&scopes, start + Duration::from_secs(tick));
         assert_eq!(rows.len(), 64);
     }
     assert_eq!(sampler.buffer_capacity(), buffer_capacity);
     assert_eq!(sampler.previous_capacity(), previous_capacity);
+    assert_eq!(sampler.rows.capacity(), row_capacity);
+    assert_eq!(sampler.prioritized.capacity(), prioritized_capacity);
+    assert_eq!(sampler.selected.capacity(), selected_capacity);
+    assert_eq!(sampler.priority.capacity(), priority_capacity);
     assert_eq!(sampler.fs.reads, 64 * 11 * 2000);
 }

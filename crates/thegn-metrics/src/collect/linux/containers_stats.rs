@@ -1,12 +1,17 @@
 //! Bounded cgroup v2 sampling for container inventory supplied by the caller.
 
 use std::collections::HashMap;
-use std::path::{Component, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::time::Instant;
 
-use super::cgroup::{CgroupFs, DeviceFilter, read_group};
+use super::cgroup::{CgroupFs, DeviceFilter, RealFs, read_group};
+use crate::collect::env::Env;
+use crate::collect::frame::MonitorFrame;
+use crate::collect::health::{Absent, Health};
 use crate::collect::model::cgroup::CgroupSample;
 use crate::collect::model::containers_stats::ContainerStatsRow;
+use crate::collect::schedule::Cadence;
+use crate::collect::{CollectError, Collector, CollectorId, TickCtx};
 
 fn counters_decreased(previous: &CgroupSample, current: &CgroupSample) -> bool {
     let cpu_decreased = previous.cpu.zip(current.cpu).is_some_and(|(before, now)| {
@@ -66,7 +71,7 @@ const SAMPLE_BUFFER_BYTES: usize = 8 * 1024;
 /// A caller-resolved container cgroup path, relative to the cgroup v2 mount.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ResolvedContainerScope {
-    pub id: String,
+    pub id: std::sync::Arc<str>,
     pub path: PathBuf,
 }
 
@@ -83,7 +88,10 @@ impl ResolvedContainerScope {
         {
             return None;
         }
-        Some(Self { id, path })
+        Some(Self {
+            id: std::sync::Arc::from(id),
+            path,
+        })
     }
 }
 
@@ -92,6 +100,7 @@ struct PreviousSample {
     sample: CgroupSample,
     at: Instant,
     cpu_pct: f64,
+    seen_generation: u64,
 }
 
 /// Reads at most 64 caller-resolved cgroup scopes per tick and derives rates.
@@ -102,12 +111,13 @@ pub struct ContainerStatsSampler<F> {
     buffer: Vec<u8>,
     sample: CgroupSample,
     path: PathBuf,
-    previous: HashMap<String, PreviousSample>,
+    previous: HashMap<std::sync::Arc<str>, PreviousSample>,
     rows: Vec<ContainerStatsRow>,
     prioritized: Vec<usize>,
     selected: Vec<usize>,
     priority: Vec<bool>,
     round_robin: usize,
+    generation: u64,
 }
 
 impl<F> ContainerStatsSampler<F> {
@@ -125,6 +135,7 @@ impl<F> ContainerStatsSampler<F> {
             selected: Vec::with_capacity(MAX_CONTAINER_SCOPES_PER_TICK),
             priority: Vec::new(),
             round_robin: 0,
+            generation: 0,
         }
     }
 
@@ -147,8 +158,14 @@ impl<F: CgroupFs> ContainerStatsSampler<F> {
         scopes: &[ResolvedContainerScope],
         at: Instant,
     ) -> &[ContainerStatsRow] {
+        self.generation = self.generation.wrapping_add(1);
+        for scope in scopes {
+            if let Some(previous) = self.previous.get_mut(scope.id.as_ref()) {
+                previous.seen_generation = self.generation;
+            }
+        }
         self.previous
-            .retain(|id, _| scopes.iter().any(|scope| scope.id.as_str() == id.as_str()));
+            .retain(|_, previous| previous.seen_generation == self.generation);
         self.rows.clear();
 
         self.select_scopes(scopes);
@@ -202,7 +219,7 @@ impl<F: CgroupFs> ContainerStatsSampler<F> {
                 };
             let row_gap = counter_decreased;
             self.rows.push(ContainerStatsRow {
-                id: scope.id.clone(),
+                id: std::sync::Arc::clone(&scope.id),
                 cpu_pct,
                 mem_current: self.sample.mem_current,
                 mem_peak: self.sample.mem_peak,
@@ -217,6 +234,7 @@ impl<F: CgroupFs> ContainerStatsSampler<F> {
                 previous.sample.clone_from(&self.sample);
                 previous.at = at;
                 previous.cpu_pct = carried_cpu_pct;
+                previous.seen_generation = self.generation;
             } else {
                 self.previous.insert(
                     scope.id.clone(),
@@ -224,6 +242,7 @@ impl<F: CgroupFs> ContainerStatsSampler<F> {
                         sample: self.sample.clone(),
                         at,
                         cpu_pct: carried_cpu_pct,
+                        seen_generation: self.generation,
                     },
                 );
             }
@@ -270,6 +289,171 @@ impl<F: CgroupFs> ContainerStatsSampler<F> {
     }
 }
 
+const RESCAN_INTERVAL_MS: u64 = 10_000;
+
+pub struct ContainersStatsCollector {
+    root: Option<PathBuf>,
+    scopes: Vec<ResolvedContainerScope>,
+    truncated: bool,
+    rescans: u32,
+    last_rescan_ms: Option<u64>,
+    fs: RealFs,
+    sampler: Option<ContainerStatsSampler<RealFs>>,
+    directory_fs: Box<dyn super::container_scopes::DirectoryFs + Send>,
+}
+
+impl Default for ContainersStatsCollector {
+    fn default() -> Self {
+        Self::with_directory_fs(Box::new(super::container_scopes::RealDirectoryFs))
+    }
+}
+
+impl ContainersStatsCollector {
+    fn with_directory_fs(
+        directory_fs: Box<dyn super::container_scopes::DirectoryFs + Send>,
+    ) -> Self {
+        Self {
+            root: None,
+            scopes: Vec::new(),
+            truncated: false,
+            rescans: 0,
+            last_rescan_ms: None,
+            fs: RealFs::default(),
+            sampler: None,
+            directory_fs,
+        }
+    }
+
+    fn rescan(&mut self, now_ms: u64) {
+        let Some(root) = self.root.as_deref() else {
+            return;
+        };
+        let result = super::container_scopes::discover(self.directory_fs.as_ref(), root);
+        self.scopes = result.scopes;
+        self.truncated = result.truncated;
+        self.last_rescan_ms = Some(now_ms);
+        self.rescans = self.rescans.saturating_add(1);
+    }
+}
+
+impl Collector for ContainersStatsCollector {
+    fn id(&self) -> CollectorId {
+        CollectorId::ContainersStats
+    }
+
+    fn cadence(&self) -> Cadence {
+        Cadence::Every(1)
+    }
+
+    fn discover(&mut self, env: &Env) -> Health {
+        self.close();
+        let root = env
+            .cgroup_root
+            .as_deref()
+            .unwrap_or_else(|| Path::new("/sys/fs/cgroup"));
+        let Ok(root_metadata) = std::fs::symlink_metadata(root) else {
+            return Health::Absent(Absent::NoHardware);
+        };
+        if !root_metadata.file_type().is_dir() {
+            return Health::Absent(Absent::NoHardware);
+        }
+        let Some(root) = super::cgroup::cgroup2_root(root) else {
+            return Health::Absent(Absent::NotOnThisOs);
+        };
+        self.sampler = Some(ContainerStatsSampler::new(
+            std::mem::take(&mut self.fs),
+            DeviceFilter::from_sys_block(Path::new("/sys/block")),
+            root.clone(),
+        ));
+        self.root = Some(root);
+        Health::Ok
+    }
+
+    fn sample(&mut self, ctx: &TickCtx, frame: &mut MonitorFrame) -> Result<(), CollectError> {
+        if self.root.is_none() || self.sampler.is_none() {
+            return Err(CollectError::Gone);
+        }
+        if self
+            .last_rescan_ms
+            .is_none_or(|last| ctx.now_ms.saturating_sub(last) >= RESCAN_INTERVAL_MS)
+        {
+            self.rescan(ctx.now_ms);
+        }
+        let sampler = self.sampler.as_mut().ok_or(CollectError::Gone)?;
+        let rows = sampler.sample(&self.scopes, Instant::now());
+        frame.parts.containers_stats.rows.clear();
+        frame.parts.containers_stats.rows.extend_from_slice(rows);
+        frame.parts.containers_stats.scopes = self.scopes.len().min(u32::MAX as usize) as u32;
+        frame.parts.containers_stats.truncated = self.truncated;
+        frame.parts.containers_stats.rescans = self.rescans;
+        frame.sampled.insert(CollectorId::ContainersStats);
+        Ok(())
+    }
+
+    fn close(&mut self) {
+        self.root = None;
+        self.scopes = Vec::new();
+        self.sampler = None;
+        self.fs = RealFs::default();
+        self.truncated = false;
+        self.rescans = 0;
+        self.last_rescan_ms = None;
+    }
+}
+
 #[cfg(test)]
 #[path = "containers_stats_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+mod collector_tests {
+    use super::ContainersStatsCollector;
+    use crate::collect::env::Env;
+    use crate::collect::frame::MonitorFrame;
+    use crate::collect::health::Health;
+    use crate::collect::linux::container_scopes::DirectoryFs;
+    use crate::collect::{Collector, TickCtx};
+    use std::collections::HashMap;
+    use std::ffi::OsString;
+    use std::io;
+    use std::path::{Path, PathBuf};
+
+    #[derive(Default)]
+    struct FakeDirs(HashMap<PathBuf, Vec<OsString>>);
+
+    impl DirectoryFs for FakeDirs {
+        fn directories(&self, path: &Path) -> io::Result<Vec<OsString>> {
+            self.0
+                .get(path)
+                .cloned()
+                .ok_or_else(|| io::Error::from(io::ErrorKind::NotFound))
+        }
+    }
+
+    #[test]
+    fn rescans_are_limited_by_tick_time() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::write(temp.path().join("cgroup.controllers"), b"cpu memory\n").unwrap();
+        let mut collector =
+            ContainersStatsCollector::with_directory_fs(Box::new(FakeDirs::default()));
+        let env = Env {
+            cgroup_root: Some(temp.path().to_path_buf()),
+            ..Env::default()
+        };
+        assert_eq!(collector.discover(&env), Health::Ok);
+        let mut frame = MonitorFrame::default();
+        for now_ms in [0, 9_999, 10_000, 19_999, 20_000] {
+            collector
+                .sample(&TickCtx { tick: 0, now_ms }, &mut frame)
+                .unwrap();
+            let expected = if now_ms < 10_000 {
+                1
+            } else if now_ms < 20_000 {
+                2
+            } else {
+                3
+            };
+            assert_eq!(frame.parts.containers_stats.rescans, expected);
+        }
+    }
+}
