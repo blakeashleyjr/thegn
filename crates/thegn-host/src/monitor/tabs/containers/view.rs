@@ -31,6 +31,13 @@ const IO: PanelId = PanelId("containers.io");
 const TABLE: PanelId = PanelId("containers.table");
 const HISTORY_CAP: usize = 120;
 const SLOT_CAP: usize = 32;
+const TABLE_ID: usize = 0;
+const TABLE_CPU: usize = 13;
+const TABLE_CPU_SPARK: usize = 20;
+const TABLE_MEM: usize = 34;
+const TABLE_MEM_SPARK: usize = 46;
+const TABLE_PIDS: usize = 60;
+const TABLE_IO: usize = 68;
 const VARIANT: [Variant; 1] = [Variant {
     kind: VariantKind::Full,
     min: (24, 4),
@@ -146,9 +153,12 @@ pub(in crate::monitor) struct ContainersModel {
     memory_total: Ring,
     read_total: Ring,
     write_total: Ring,
+    latest_cpu: Option<f64>,
+    latest_memory: Option<f64>,
     pub(super) health: Health,
     pub(super) scopes: u32,
     pub(super) truncated: bool,
+    pub(super) untracked: usize,
     pub(super) rescans: u32,
     pub(super) list_errors: u32,
 }
@@ -162,9 +172,12 @@ impl Default for ContainersModel {
             memory_total: Ring::default(),
             read_total: Ring::default(),
             write_total: Ring::default(),
+            latest_cpu: None,
+            latest_memory: None,
             health: Health::Warming,
             scopes: 0,
             truncated: false,
+            untracked: 0,
             rescans: 0,
             list_errors: 0,
         }
@@ -179,6 +192,7 @@ impl ContainersModel {
         self.truncated = part.truncated;
         self.rescans = part.rescans;
         self.list_errors = part.list_errors;
+        self.untracked = part.rows.len().saturating_sub(SLOT_CAP);
         if !part.rows.is_empty() && self.slots.capacity() == 0 {
             self.slots.reserve_exact(SLOT_CAP);
             self.slots.resize_with(SLOT_CAP, Slot::default);
@@ -250,31 +264,32 @@ impl ContainersModel {
                         .cmp(&self.slots[*right].id.as_deref())
                 })
         });
-        let has_gap = part.rows.iter().any(|row| row.gap);
-        let cpu = if has_gap {
-            None
-        } else {
-            sum_values(part.rows.iter().map(|row| row.cpu_pct))
-        };
-        let memory = if has_gap {
-            None
-        } else {
-            sum_values(
-                part.rows
-                    .iter()
-                    .map(|row| row.mem_current.map(|v| v as f64)),
-            )
-        };
-        let read = if has_gap {
-            None
-        } else {
-            sum_values(part.rows.iter().map(|row| row.io_read_bps))
-        };
-        let write = if has_gap {
-            None
-        } else {
-            sum_values(part.rows.iter().map(|row| row.io_write_bps))
-        };
+        let cpu = sum_values(
+            part.rows
+                .iter()
+                .filter(|row| !row.gap)
+                .map(|row| row.cpu_pct),
+        );
+        let memory = sum_values(
+            part.rows
+                .iter()
+                .filter(|row| !row.gap)
+                .map(|row| row.mem_current.map(|v| v as f64)),
+        );
+        let read = sum_values(
+            part.rows
+                .iter()
+                .filter(|row| !row.gap)
+                .map(|row| row.io_read_bps),
+        );
+        let write = sum_values(
+            part.rows
+                .iter()
+                .filter(|row| !row.gap)
+                .map(|row| row.io_write_bps),
+        );
+        self.latest_cpu = cpu;
+        self.latest_memory = memory;
         self.cpu_total.push(cpu.map_or(f32::NAN, |v| v as f32));
         self.memory_total
             .push(memory.map_or(f32::NAN, |v| v as f32));
@@ -287,9 +302,10 @@ fn sum_values(values: impl Iterator<Item = Option<f64>>) -> Option<f64> {
     let mut sum = 0.0;
     let mut found = false;
     for value in values {
-        let value = value.filter(|value| value.is_finite() && *value >= 0.0)?;
-        sum += value;
-        found = true;
+        if let Some(value) = value.filter(|value| value.is_finite() && *value >= 0.0) {
+            sum += value;
+            found = true;
+        }
     }
     found.then_some(sum)
 }
@@ -409,27 +425,54 @@ impl TabView for ContainersView<'_> {
             _ => return,
         };
         let body = panel::panel(&mut grid, Rect::full(rect.cols, rect.rows), title, None).rect();
-        if matches!(placed.id, CPU | MEMORY | IO) {
+        let absent = matches!(self.model.health, Health::Absent(_));
+        let has_history = match placed.id {
+            CPU => ring_has_finite(&self.model.cpu_total),
+            MEMORY => ring_has_finite(&self.model.memory_total),
+            IO => {
+                ring_has_finite(&self.model.read_total) || ring_has_finite(&self.model.write_total)
+            }
+            _ => false,
+        };
+        if matches!(placed.id, CPU | MEMORY | IO) && !absent && has_history {
             let label = match placed.id {
                 CPU => format!(
-                    "all-container CPU | window peak {:.1}% core",
-                    max_ring(&self.model.cpu_total)
+                    "all-container CPU | scale {}",
+                    fmt_option(
+                        Some(Reading::Value(
+                            max_ring(&self.model.cpu_total).max(1.0) as f64
+                        )),
+                        Unit::Percent
+                    )
                 ),
                 MEMORY => format!(
                     "window peak {}",
                     fmt_option(ring_peak_reading(&self.model.memory_total), Unit::Bytes)
                 ),
                 _ => format!(
-                    "read / write | window peak {:.0} B/s",
-                    max_pair(&self.model.read_total, &self.model.write_total)
+                    "rd / wr | scale {} B/s",
+                    fmt_option(
+                        Some(Reading::Value(max_pair(
+                            &self.model.read_total,
+                            &self.model.write_total
+                        ) as f64)),
+                        Unit::Bytes
+                    )
                 ),
             };
             grid.view(body).put_str(0, 0, &label, Default::default());
         }
-        if matches!(self.model.health, Health::Absent(_)) {
-            grid.view(body)
-                .put_str(0, 0, absent_mark(self.model.health), Default::default());
-        } else if matches!(self.model.health, Health::Warming) && self.model.order.is_empty() {
+        if absent {
+            if placed.id == ESTATE {
+                self.paint_estate(&mut grid, body);
+            } else {
+                grid.view(body)
+                    .put_str(0, 0, absent_mark(self.model.health), Default::default());
+            }
+        } else if matches!(self.model.health, Health::Warming)
+            && ((matches!(placed.id, CPU | MEMORY | IO) && !has_history)
+                || (self.model.order.is_empty() && placed.id != ESTATE))
+        {
             grid.view(body).put_str(
                 0,
                 0,
@@ -451,7 +494,7 @@ impl TabView for ContainersView<'_> {
             rect.x,
             rect.y,
         );
-        if matches!(placed.id, CPU | MEMORY | IO) {
+        if matches!(placed.id, CPU | MEMORY | IO) && !absent {
             self.paint_history(
                 surface,
                 placed.id,
@@ -486,21 +529,24 @@ impl ContainersView<'_> {
         if body.rows > 1 {
             let totals = format!(
                 "CPU {} | memory {}",
-                fmt_option(
-                    sum_slots(self.model, |slot| slot.cpu).map(Reading::Value),
-                    Unit::Percent
-                ),
-                fmt_option(
-                    sum_slots(self.model, |slot| slot.memory.map(|v| v as f64)).map(Reading::Value),
-                    Unit::Bytes
-                )
+                fmt_option(self.model.latest_cpu.map(Reading::Value), Unit::Percent),
+                fmt_option(self.model.latest_memory.map(Reading::Value), Unit::Bytes)
             );
             grid.view(Rect {
                 y: body.y + 1,
                 rows: body.rows - 1,
                 ..body
             })
-            .put_str(0, 0, &totals, Default::default());
+            .put_str(
+                0,
+                0,
+                if matches!(self.model.health, Health::Absent(_)) {
+                    absent_mark(self.model.health)
+                } else {
+                    &totals
+                },
+                Default::default(),
+            );
         }
         let flags = format!(
             "scopes {}{}{}",
@@ -517,6 +563,11 @@ impl ContainersView<'_> {
             }
         );
         if body.rows > 2 {
+            let flags = if self.model.untracked > 0 {
+                format!("{flags} | +{} untracked", self.model.untracked)
+            } else {
+                flags
+            };
             grid.view(Rect {
                 y: body.y + 2,
                 rows: body.rows - 2,
@@ -611,8 +662,31 @@ impl ContainersView<'_> {
     }
 
     fn paint_table(&self, grid: &mut CellGrid, body: Rect) {
-        let headers = "id           cpu% cpu history       memory mem/peak spark pids io B/s";
-        grid.view(body).put_str(0, 0, headers, Default::default());
+        let mut header = grid.view(body);
+        header.put_str(TABLE_ID, 0, "id", Default::default());
+        header.put_str(TABLE_CPU, 0, "cpu%", Default::default());
+        let cpu_scale = max_slot_cpu(self.model).max(1.0);
+        header.put_str(
+            TABLE_CPU_SPARK,
+            0,
+            &format!(
+                "cpu/core {}",
+                fmt_option(Some(Reading::Value(cpu_scale as f64)), Unit::Percent)
+            ),
+            Default::default(),
+        );
+        header.put_str(TABLE_MEM, 0, "memory", Default::default());
+        header.put_str(TABLE_MEM_SPARK, 0, "mem/peak", Default::default());
+        header.put_str(TABLE_PIDS, 0, "pids", Default::default());
+        header.put_str(TABLE_IO, 0, "io B/s", Default::default());
+        if self.model.untracked > 0 {
+            header.put_str(
+                TABLE_IO + 8,
+                0,
+                &format!("+{} untracked", self.model.untracked),
+                Default::default(),
+            );
+        }
         for (visible, index) in self
             .model
             .order
@@ -628,22 +702,31 @@ impl ContainersView<'_> {
                 slot.memory.map(|value| Reading::Value(value as f64)),
                 Unit::Bytes,
             );
+            let memory_peak = fmt_option(
+                slot.peak.map(|value| Reading::Value(value as f64)),
+                Unit::Bytes,
+            );
             let pids = fmt_option(
                 slot.pids.map(|value| Reading::Value(value as f64)),
                 Unit::Count,
             );
-            let io = match (slot.read, slot.write) {
-                (Some(r), Some(w)) => format!("{r:.0}/{w:.0}"),
-                _ => fmt_option(None, Unit::BitsPerSec),
-            };
-            let row =
-                format!("{short:<12} {cpu:>5}             {memory:>10}             {pids:>4} {io}");
-            grid.view(Rect {
+            let read = fmt_option(slot.read.map(Reading::Value), Unit::Bytes);
+            let write = fmt_option(slot.write.map(Reading::Value), Unit::Bytes);
+            let mut row = grid.view(Rect {
                 y: body.y + visible + 1,
                 rows: body.rows.saturating_sub(visible + 1),
                 ..body
-            })
-            .put_str(0, 0, &row, Default::default());
+            });
+            row.put_str(TABLE_ID, 0, &format!("{short:<12}"), Default::default());
+            row.put_str(TABLE_CPU, 0, &format!("{cpu:>5}"), Default::default());
+            row.put_str(
+                TABLE_MEM,
+                0,
+                &format!("{memory:>5}/{memory_peak:>5}"),
+                Default::default(),
+            );
+            row.put_str(TABLE_PIDS, 0, &format!("{pids:>5}"), Default::default());
+            row.put_str(TABLE_IO, 0, &format!("{read}/{write}"), Default::default());
         }
     }
 
@@ -657,24 +740,31 @@ impl ContainersView<'_> {
         {
             let mut history = [f32::NAN; HISTORY_CAP];
             let len = self.model.slots[*index].cpu_history.ordered(&mut history);
+            let cpu_scale = max_slot_cpu(self.model).max(1.0);
             for value in &mut history[..len] {
                 if value.is_finite() {
-                    *value = (*value / 100.0).clamp(0.0, 1.0);
+                    *value = (*value / cpu_scale).clamp(0.0, 1.0);
                 }
             }
             let area = Rect {
-                x: rect.x + body.x + body.cols.min(20),
+                x: rect.x + body.x + TABLE_CPU_SPARK,
                 y: rect.y + body.y + visible + 1,
-                cols: body.cols.saturating_sub(20).min(14),
+                cols: body
+                    .cols
+                    .saturating_sub(TABLE_CPU_SPARK)
+                    .min(TABLE_MEM - TABLE_CPU_SPARK),
                 rows: 1,
             };
             paint_finite_spark_runs(&history[..len], RampId::Util, area, surface);
             let mut memory = [f32::NAN; HISTORY_CAP];
             let memory_len = self.model.slots[*index].memory_history.ordered(&mut memory);
             let memory_area = Rect {
-                x: rect.x + body.x + body.cols.min(46),
+                x: rect.x + body.x + TABLE_MEM_SPARK,
                 y: rect.y + body.y + visible + 1,
-                cols: body.cols.saturating_sub(46).min(14),
+                cols: body
+                    .cols
+                    .saturating_sub(TABLE_MEM_SPARK)
+                    .min(TABLE_PIDS - TABLE_MEM_SPARK),
                 rows: 1,
             };
             if let Some(peak) = self.model.slots[*index].peak.filter(|peak| *peak > 0) {
@@ -689,20 +779,6 @@ impl ContainersView<'_> {
     }
 }
 
-fn sum_slots(model: &ContainersModel, get: impl Fn(&Slot) -> Option<f64>) -> Option<f64> {
-    let mut total = 0.0;
-    let mut found = false;
-    for slot in &model.slots {
-        if slot.id.is_some()
-            && let Some(value) = get(slot)
-        {
-            total += value;
-            found = true;
-        }
-    }
-    found.then_some(total)
-}
-
 fn absent_mark(health: Health) -> &'static str {
     match health {
         Health::Absent(Absent::NoPermission) => crate::caps::glyph(crate::caps::Glyph::Lock),
@@ -711,42 +787,51 @@ fn absent_mark(health: Health) -> &'static str {
 }
 
 fn paint_finite_spark_runs(values: &[f32], ramp: RampId, area: Rect, surface: &mut Surface) {
-    let braille = graphs::table().braille;
-    let aligned = crate::monitor::kit::history_rect::graph_rect(area, values.len(), braille);
+    let count = values.len().min(area.cols);
+    let tail_start = values.len().saturating_sub(count);
+    let aligned = crate::monitor::kit::history_rect::graph_rect(area, count, false);
     if values.is_empty() || aligned.cols == 0 {
         return;
     }
+    let values = &values[tail_start..];
     let mut start = 0;
-    while start < values.len() {
-        while start < values.len() && !values[start].is_finite() {
+    while start < count {
+        while start < count && !values[start].is_finite() {
             start += 1;
         }
         let mut end = start;
-        while end < values.len() && values[end].is_finite() {
+        while end < count && values[end].is_finite() {
             end += 1;
         }
         if end > start {
-            let left = start * aligned.cols / values.len();
-            let right = (end * aligned.cols)
-                .div_ceil(values.len())
-                .min(aligned.cols);
-            let cols = right.saturating_sub(left);
-            if cols > 0 {
-                graphs::paint_sparkline(
-                    &values[start..end],
+            let cols = end - start;
+            graphs::paint_sparkline(
+                &values[start..end],
+                cols,
+                ramp,
+                Rect {
+                    x: aligned.x + start,
                     cols,
-                    ramp,
-                    Rect {
-                        x: aligned.x + left,
-                        cols,
-                        ..area
-                    },
-                    surface,
-                );
-            }
+                    ..area
+                },
+                surface,
+            );
         }
         start = end.max(start + 1);
     }
+}
+
+fn ring_has_finite(ring: &Ring) -> bool {
+    ring.values.iter().any(|value| value.is_finite())
+}
+
+fn max_slot_cpu(model: &ContainersModel) -> f32 {
+    model
+        .slots
+        .iter()
+        .flat_map(|slot| slot.cpu_history.values.iter().copied())
+        .filter(|value| value.is_finite())
+        .fold(0.0, f32::max)
 }
 
 fn max_ring(ring: &Ring) -> f32 {
