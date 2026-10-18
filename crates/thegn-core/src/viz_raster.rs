@@ -187,13 +187,12 @@ fn sample_offset(len: usize, w: usize) -> usize {
 }
 
 fn aligned_sample(values: &[f32], column: usize, width: usize) -> Option<f32> {
-    let capacity = width;
     let destination = sample_offset(values.len(), width);
-    if column < destination || column - destination >= values.len().min(capacity) {
+    if column < destination || column - destination >= values.len().min(width) {
         return None;
     }
     values
-        .get(values.len().saturating_sub(capacity) + column - destination)
+        .get(values.len().saturating_sub(width) + column - destination)
         .copied()
 }
 
@@ -202,7 +201,7 @@ fn has_braille_sample(len: usize, w: usize, cell: usize) -> bool {
     let start = dot_offset(len, w);
     (0..2).any(|dot| {
         let index = cell.saturating_mul(2).saturating_add(dot);
-        index >= start && index < start.saturating_add(len.min(capacity))
+        (start..start.saturating_add(len.min(capacity))).contains(&index)
     })
 }
 
@@ -241,10 +240,9 @@ fn spans_for(
     let source_other = other.len().saturating_sub(capacity);
     spans.reserve(w.saturating_mul(2));
     spans.extend((0..w.saturating_mul(2)).map(|i| {
-        let sample_i = source.saturating_add(i.saturating_sub(dest));
         let has_value = i >= dest && i - dest < vals.len().min(capacity);
         let v = clamp01(if has_value {
-            vals.get(sample_i).copied().unwrap_or(0.0)
+            vals[source + i - dest]
         } else {
             0.0
         });
@@ -258,26 +256,15 @@ fn spans_for(
                     return (0, -1);
                 }
                 let y = ((v * total as f32).floor() as i32).min(total as i32 - 1);
-                let prev_i = i.saturating_sub(1);
-                let prev_i = if i <= dest { i } else { prev_i };
-                let prev_has_value = prev_i >= dest && prev_i - dest < vals.len().min(capacity);
-                let prev = clamp01(if prev_has_value {
-                    vals.get(source.saturating_add(prev_i.saturating_sub(dest)))
-                        .copied()
-                        .unwrap_or(0.0)
-                } else {
-                    0.0
-                });
+                let prev_i = if i <= dest { i } else { i - 1 };
+                let prev = clamp01(vals[source + prev_i - dest]);
                 let py = ((prev * total as f32).floor() as i32).min(total as i32 - 1);
                 (y.min(py), y.max(py))
             }
             SpanMode::Band => {
                 let has_hi = i >= dest_other && i - dest_other < other.len().min(capacity);
                 let hi = clamp01(if has_hi {
-                    other
-                        .get(source_other.saturating_add(i.saturating_sub(dest_other)))
-                        .copied()
-                        .unwrap_or(0.0)
+                    other[source_other + i - dest_other]
                 } else {
                     0.0
                 });
@@ -680,6 +667,7 @@ pub fn stacked(bands: &[&[f32]], table: &RasterTable, buf: &mut CellBuf) {
 }
 
 /// Draws a time-by-instance heatmap. Unicode packs two instances into each row.
+/// Width is the longest row; shorter rows align their samples to its right edge.
 pub fn heatmap(rows: &[&[f32]], table: &RasterTable, buf: &mut CellBuf) {
     let w = rows.iter().map(|row| row.len()).max().unwrap_or(0);
     let h = if table.braille {
@@ -762,7 +750,8 @@ pub fn sparkline_width(vals: &[f32], w: usize, table: &RasterTable, buf: &mut Ce
         return;
     }
     let off = sample_offset(vals.len(), w);
-    for (index, &v) in vals.iter().enumerate() {
+    let start = vals.len().saturating_sub(w);
+    for (index, &v) in vals[start..].iter().enumerate() {
         let c = off + index;
         let value = clamp01(v);
         let idx = (value * (table.spark.len() - 1) as f32).round() as usize;
@@ -944,11 +933,15 @@ mod tests {
                 &[1.0][..],
             ];
             heatmap(&rows, table, &mut b);
+            let populated_row = if table.braille { 1 } else { 2 };
             assert_eq!(
-                b.row(1)[..3].iter().map(|cell| cell.ch).collect::<String>(),
+                b.row(populated_row)[..3]
+                    .iter()
+                    .map(|cell| cell.ch)
+                    .collect::<String>(),
                 blank.to_string().repeat(3)
             );
-            assert_ne!(b.row(1)[3].ch, blank);
+            assert_ne!(b.row(populated_row)[3].ch, blank);
 
             sparkline_width(&[1.0], 4, table, &mut b);
             assert_eq!(
@@ -957,6 +950,41 @@ mod tests {
             );
             assert_ne!(b.row(0)[3].ch, blank);
         }
+    }
+
+    #[test]
+    fn short_raster_glyphs_are_golden_and_long_inputs_keep_newest_samples() {
+        for table in [&RasterTable::FULL, &RasterTable::BASIC] {
+            let mut b = CellBuf::new();
+            b.reset(1, 1);
+            area(&[1.0], table, &mut b);
+            assert_eq!(chars(&b), ["\u{28b8}"]);
+        }
+
+        let mut b = CellBuf::new();
+        b.reset(4, 1);
+        area(&[0.5, 1.0], &RasterTable::ASCII, &mut b);
+        assert_eq!(chars(&b), ["  :#"]);
+
+        b.reset(2, 1);
+        columns(
+            &[0.0, 0.0, 1.0],
+            &RasterTable::ASCII.ramp8,
+            &RasterTable::ASCII,
+            &mut b,
+        );
+        assert_eq!(chars(&b), [" #"]);
+
+        b.reset(2, 1);
+        stacked(&[&[0.0, 0.0, 1.0]], &RasterTable::ASCII, &mut b);
+        assert_eq!(chars(&b), [" #"]);
+
+        let rows = [&[0.0, 0.0, 1.0][..], &[1.0][..]];
+        heatmap(&rows, &RasterTable::ASCII, &mut b);
+        assert_eq!(chars(&b), ["  @", "  @"]);
+
+        sparkline_width(&[0.0, 0.0, 1.0], 2, &RasterTable::ASCII, &mut b);
+        assert_eq!(chars(&b), ["_#"]);
     }
 
     #[test]
@@ -991,7 +1019,7 @@ mod tests {
             if table.braille {
                 assert_eq!(chars(&b)[0], "▀▀");
             } else {
-                assert_eq!(chars(&b), [" +", "@:", "# "]);
+                assert_eq!(chars(&b), [" +", "@:", " #"]);
             }
         }
     }
