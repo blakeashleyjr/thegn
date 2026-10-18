@@ -132,10 +132,14 @@ swap masthead chips expand into this tab.
 
 ## Thermal
 
-The Thermal tab graphs CPU temperature and lists each available temperature
-sensor, including GPU temperature when reported. When the machine has no
-temperature sensors, the tab says so instead of showing a fabricated reading.
-The temperature masthead chip expands into this tab.
+The Thermal tab shows the CPU package trend, per-core temperatures, the sensor
+table with bounded per-sensor history, GPU temperatures and telemetry, thermal
+zones with trips, and a per-core history heatmap. Missing readings use the
+absent mark; no reading is displayed as zero. Panel demand follows the panels
+placed on screen: `thermal.package`, `thermal.cores`, `thermal.sensors`,
+`thermal.zones`, `thermal.gpu`, and `thermal.heatmap`. Use `f`/`F` to move panel
+focus, `z` to zoom the focused panel, and `Esc` to unzoom before closing the
+monitor. The temperature masthead chip expands into this tab.
 
 ## Network
 
