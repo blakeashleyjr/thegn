@@ -119,13 +119,9 @@ trait TunnelListener: Send + 'static {
 }
 
 impl TunnelListener for TcpListener {
-    fn accept(
-        &mut self,
-    ) -> impl std::future::Future<Output = io::Result<Box<dyn IoStream>>> + Send {
-        async move {
-            let (stream, _) = TcpListener::accept(self).await?;
-            Ok(Box::new(stream) as Box<dyn IoStream>)
-        }
+    async fn accept(&mut self) -> io::Result<Box<dyn IoStream>> {
+        let (stream, _) = TcpListener::accept(self).await?;
+        Ok(Box::new(stream))
     }
 }
 
@@ -645,16 +641,12 @@ mod tests {
     }
 
     impl TunnelListener for DuplexListener {
-        fn accept(
-            &mut self,
-        ) -> impl std::future::Future<Output = io::Result<Box<dyn IoStream>>> + Send {
-            async move {
-                self.accepted
-                    .recv()
-                    .await
-                    .map(|stream| Box::new(stream) as Box<dyn IoStream>)
-                    .ok_or_else(|| io::Error::new(io::ErrorKind::UnexpectedEof, "listener closed"))
-            }
+        async fn accept(&mut self) -> io::Result<Box<dyn IoStream>> {
+            self.accepted
+                .recv()
+                .await
+                .map(|stream| Box::new(stream) as Box<dyn IoStream>)
+                .ok_or_else(|| io::Error::new(io::ErrorKind::UnexpectedEof, "listener closed"))
         }
     }
 
@@ -1088,6 +1080,7 @@ mod tests {
         const GLOBAL: usize = 16;
         const STORM: u32 = 1_000;
 
+        let rejections_before = rejection_total();
         let global = Arc::new(Semaphore::new(GLOBAL));
         let (host, mut peer) = tokio::io::duplex(64 * 1024);
         let calls = Arc::new(AtomicUsize::new(0));
@@ -1108,6 +1101,7 @@ mod tests {
         for id in (PER_TUNNEL as u32 + 1)..=STORM {
             assert_eq!(next_frame(&mut peer, &mut decoder).await, Frame::Close(id));
         }
+        assert!(rejection_total() >= rejections_before + (STORM as u64 - PER_TUNNEL as u64));
         let mut far_ends = Vec::with_capacity(PER_TUNNEL);
         for _ in 0..PER_TUNNEL {
             far_ends.push(
@@ -1152,7 +1146,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn host_peer_disconnect_during_open_storm_aborts_all_admitted_tasks() {
+    async fn host_peer_disconnect_after_open_storm_aborts_all_admitted_tasks() {
         const CAP: usize = 8;
         const GLOBAL: usize = 16;
 
@@ -1246,23 +1240,22 @@ mod tests {
                 }
             }
         }
-        assert_eq!(
-            calls_a.load(Ordering::Relaxed) + calls_b.load(Ordering::Relaxed),
-            GLOBAL
-        );
+        let admitted_a = STORM as usize - rejected_a.len();
+        let admitted_b = STORM as usize - rejected_b.len();
+        assert_eq!(admitted_a + admitted_b, GLOBAL);
         assert_eq!(
             rejected_a,
-            ((calls_a.load(Ordering::Relaxed) as u32 + 1)..=STORM).collect::<Vec<_>>()
+            ((admitted_a as u32 + 1)..=STORM).collect::<Vec<_>>()
         );
         assert_eq!(
             rejected_b,
-            ((calls_b.load(Ordering::Relaxed) as u32 + 1)..=STORM).collect::<Vec<_>>()
+            ((admitted_b as u32 + 1)..=STORM).collect::<Vec<_>>()
         );
         assert_eq!(global.available_permits(), 0);
 
         let mut far_a = Vec::new();
         let mut far_b = Vec::new();
-        for _ in 0..calls_a.load(Ordering::Relaxed) {
+        for _ in 0..admitted_a {
             far_a.push(
                 tokio::time::timeout(std::time::Duration::from_secs(2), far_a_rx.recv())
                     .await
@@ -1270,7 +1263,7 @@ mod tests {
                     .expect("tunnel A dialer closed"),
             );
         }
-        for _ in 0..calls_b.load(Ordering::Relaxed) {
+        for _ in 0..admitted_b {
             far_b.push(
                 tokio::time::timeout(std::time::Duration::from_secs(2), far_b_rx.recv())
                     .await
@@ -1278,6 +1271,8 @@ mod tests {
                     .expect("tunnel B dialer closed"),
             );
         }
+        assert_eq!(calls_a.load(Ordering::Relaxed), admitted_a);
+        assert_eq!(calls_b.load(Ordering::Relaxed), admitted_b);
         let closes: Vec<u8> = ids
             .iter()
             .flat_map(|id| encode(&Frame::Close(*id)))
@@ -1446,9 +1441,15 @@ mod tests {
             .expect("timed out closing sandbox storm connections")
             .unwrap();
         drop(clients);
-        for id in 1..=CAP as u32 {
-            assert_eq!(next_frame(&mut peer, &mut decoder).await, Frame::Close(id));
+        let mut closed_ids = Vec::with_capacity(CAP);
+        for _ in 0..CAP {
+            let Frame::Close(id) = next_frame(&mut peer, &mut decoder).await else {
+                panic!("sandbox sent a non-Close frame while closing storm connections");
+            };
+            closed_ids.push(id);
         }
+        closed_ids.sort_unstable();
+        assert_eq!(closed_ids, (1..=CAP as u32).collect::<Vec<_>>());
 
         let (sandbox_end, mut recovered_client) = tokio::io::duplex(1024);
         accept_tx.send(sandbox_end).unwrap();
