@@ -19,33 +19,68 @@ pub(crate) struct GlyphFingerprint {
     head: Option<GitFileStamp>,
 }
 
-/// Read only the worktree gitdir's index and HEAD metadata. Resolving a linked
-/// worktree's `.git` pointer is text-only; the fingerprint itself is two stats.
-pub(crate) fn glyph_fingerprint(worktree: &Path) -> Option<GlyphFingerprint> {
+/// Read only the cached gitdir's index and HEAD metadata. The `.git` marker is
+/// resolved once per worktree and again only if one of those stats is missing.
+pub(crate) fn glyph_fingerprint(path: &str, worktree: &Path) -> Option<GlyphFingerprint> {
+    let mut fingerprints = glyph_fingerprints()
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    let previous = fingerprints.get(path).cloned();
+    let mut gitdir = previous
+        .map(|(gitdir, _)| gitdir)
+        .or_else(|| resolve_gitdir(worktree))?;
+    let (mut current, index_missing, head_missing) = fingerprint_at(&gitdir);
+    if index_missing || head_missing {
+        if let Some(resolved) = resolve_gitdir(worktree) {
+            if resolved != gitdir {
+                gitdir = resolved;
+                current = fingerprint_at(&gitdir).0;
+            }
+        }
+    }
+    let baseline = previous
+        .map(|(_, fingerprint)| fingerprint)
+        .unwrap_or(current);
+    fingerprints.insert(path.to_string(), (gitdir, baseline));
+    Some(current)
+}
+
+fn resolve_gitdir(worktree: &Path) -> Option<PathBuf> {
     let marker = worktree.join(".git");
-    let gitdir = if let Ok(contents) = std::fs::read_to_string(&marker) {
+    if let Ok(contents) = std::fs::read_to_string(&marker) {
         let target = contents.trim().strip_prefix("gitdir:")?.trim();
         let target = Path::new(target);
-        if target.is_absolute() {
+        Some(if target.is_absolute() {
             target.to_path_buf()
         } else {
             worktree.join(target)
-        }
+        })
     } else {
-        marker
-    };
-    Some(GlyphFingerprint {
-        index: file_stamp(&gitdir.join("index")),
-        head: file_stamp(&gitdir.join("HEAD")),
-    })
+        Some(marker)
+    }
 }
 
-fn file_stamp(path: &Path) -> Option<GitFileStamp> {
-    let metadata = std::fs::metadata(path).ok()?;
-    Some(GitFileStamp {
-        modified: metadata.modified().ok(),
-        len: metadata.len(),
-    })
+fn fingerprint_at(gitdir: &Path) -> (GlyphFingerprint, bool, bool) {
+    let (index, index_missing) = file_stamp(&gitdir.join("index"));
+    let (head, head_missing) = file_stamp(&gitdir.join("HEAD"));
+    (
+        GlyphFingerprint { index, head },
+        index_missing,
+        head_missing,
+    )
+}
+
+fn file_stamp(path: &Path) -> (Option<GitFileStamp>, bool) {
+    match std::fs::metadata(path) {
+        Ok(metadata) => (
+            Some(GitFileStamp {
+                modified: metadata.modified().ok(),
+                len: metadata.len(),
+            }),
+            false,
+        ),
+        Err(error) => (None, error.kind() == std::io::ErrorKind::NotFound),
+    }
 }
 
 /// Compare and remember a gitdir fingerprint when its row is selected for a
@@ -55,21 +90,31 @@ pub(crate) fn glyph_fingerprint_changed(path: &str, current: Option<GlyphFingerp
         .lock()
         .unwrap_or_else(|error| error.into_inner())
         .get(path)
-        .copied();
+        .map(|(_, fingerprint)| *fingerprint);
     matches!((previous, current), (Some(previous), Some(current)) if previous != current)
 }
 
 pub(crate) fn record_glyph_fingerprint(path: &str, current: Option<GlyphFingerprint>) {
     if let Some(current) = current {
-        glyph_fingerprints()
+        let mut fingerprints = glyph_fingerprints()
             .lock()
-            .unwrap_or_else(|error| error.into_inner())
-            .insert(path.to_string(), current);
+            .unwrap_or_else(|error| error.into_inner());
+        if let Some((_, fingerprint)) = fingerprints.get_mut(path) {
+            *fingerprint = current;
+        }
     }
 }
 
-fn glyph_fingerprints() -> &'static Mutex<std::collections::HashMap<String, GlyphFingerprint>> {
-    static SEEN: OnceLock<Mutex<std::collections::HashMap<String, GlyphFingerprint>>> =
+pub(crate) fn retain_glyph_fingerprints(keep: &std::collections::HashSet<String>) {
+    glyph_fingerprints()
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .retain(|path, _| keep.contains(path));
+}
+
+fn glyph_fingerprints()
+-> &'static Mutex<std::collections::HashMap<String, (PathBuf, GlyphFingerprint)>> {
+    static SEEN: OnceLock<Mutex<std::collections::HashMap<String, (PathBuf, GlyphFingerprint)>>> =
         OnceLock::new();
     SEEN.get_or_init(|| Mutex::new(std::collections::HashMap::new()))
 }
@@ -108,6 +153,11 @@ pub(crate) fn glyph_ttls_from(
         Duration::from_millis(busy_ms).max(tick.saturating_add(Duration::from_millis(500)))
     };
     let safety = Duration::from_millis(safety_ms);
+    let safety = if busy.is_zero() {
+        safety
+    } else {
+        safety.max(busy)
+    };
     GlyphTtls {
         busy,
         safety,
@@ -126,6 +176,11 @@ pub(crate) fn glyph_ttls() -> GlyphTtls {
     let safety_ms = std::env::var("THEGN_BG_SAFETY_GLYPH_TTL_MS")
         .ok()
         .and_then(|value| value.parse::<u64>().ok());
+    let safety_ms = safety_ms.or_else(|| {
+        std::env::var("THEGN_BG_IDLE_GLYPH_TTL_MS")
+            .ok()
+            .and_then(|value| value.parse::<u64>().ok())
+    });
     glyph_ttls_from(
         busy_ms,
         safety_ms,
@@ -191,7 +246,7 @@ pub(crate) fn glyph_window(
     } else if touched {
         jittered(ttls.busy, path)
     } else {
-        ttls.safety
+        jittered(ttls.safety, path)
     }
 }
 
@@ -280,8 +335,8 @@ pub(crate) fn warm_stamp(now: Instant, path: &Path, ttls: &GlyphTtls) -> Instant
         / 1000;
     warm_stamp_from_age(
         now,
-        ttls.safety.saturating_sub(Duration::from_millis(
-            stagger.min(u128::from(u64::MAX)) as u64
+        jittered(ttls.safety, path).saturating_sub(Duration::from_millis(
+            stagger.min(u128::from(u64::MAX)) as u64,
         )),
     )
 }
@@ -363,7 +418,7 @@ mod tests {
         let tick = Duration::from_secs(5);
         let clamped = glyph_ttls_from(Some(5000), Some(1000), Duration::from_millis(300), tick);
         assert_eq!(clamped.busy, Duration::from_millis(5500));
-        assert_eq!(clamped.safety, Duration::from_secs(1));
+        assert_eq!(clamped.safety, clamped.busy);
 
         let disabled = glyph_ttls_from(Some(0), Some(120_000), Duration::ZERO, tick);
         let window = glyph_window(false, false, Path::new("/wt/a"), &disabled);
@@ -434,7 +489,7 @@ mod tests {
             &ttls
         ));
         assert!(!glyph_should_rescan(
-            Some(Duration::from_secs(599)),
+            Some(ttls.safety - Duration::from_secs(1)),
             false,
             false,
             false,
@@ -442,7 +497,7 @@ mod tests {
             &ttls
         ));
         assert!(glyph_should_rescan(
-            Some(Duration::from_secs(600) + Duration::from_millis(1)),
+            Some(jittered(ttls.safety, path) + Duration::from_millis(1)),
             false,
             false,
             false,
@@ -494,17 +549,18 @@ mod tests {
     #[test]
     fn gitdir_fingerprint_tracks_index_metadata_without_git() {
         let dir = tempfile::tempdir().unwrap();
+        thegn_core::fsperm::restrict_dir_to_owner(dir.path()).unwrap();
         let gitdir = dir.path().join(".git");
         std::fs::create_dir(&gitdir).unwrap();
         std::fs::write(gitdir.join("HEAD"), "ref: refs/heads/main\n").unwrap();
         std::fs::write(gitdir.join("index"), "one").unwrap();
-        let before = glyph_fingerprint(dir.path()).unwrap();
         let key = dir.path().to_string_lossy().into_owned();
+        let before = glyph_fingerprint(&key, dir.path()).unwrap();
         record_glyph_fingerprint(&key, Some(before));
         assert!(!glyph_fingerprint_changed(&key, Some(before)));
         std::thread::sleep(Duration::from_millis(2));
         std::fs::write(gitdir.join("index"), "two longer").unwrap();
-        let after = glyph_fingerprint(dir.path()).unwrap();
+        let after = glyph_fingerprint(&key, dir.path()).unwrap();
         assert_ne!(before, after);
         assert!(glyph_fingerprint_changed(&key, Some(after)));
 
@@ -519,7 +575,28 @@ mod tests {
         .unwrap();
         std::fs::write(linked_gitdir.join("HEAD"), "ref: refs/heads/linked\n").unwrap();
         std::fs::write(linked_gitdir.join("index"), "linked index").unwrap();
-        assert!(glyph_fingerprint(&linked).unwrap().index.is_some());
+        let linked_key = linked.to_string_lossy().into_owned();
+        assert!(
+            glyph_fingerprint(&linked_key, &linked)
+                .unwrap()
+                .index
+                .is_some()
+        );
+
+        let relative = dir.path().join("relative");
+        let relative_gitdir = dir.path().join("relative-gitdir");
+        std::fs::create_dir(&relative).unwrap();
+        std::fs::create_dir(&relative_gitdir).unwrap();
+        std::fs::write(relative.join(".git"), "gitdir: ../relative-gitdir\n").unwrap();
+        std::fs::write(relative_gitdir.join("HEAD"), "ref: refs/heads/relative\n").unwrap();
+        std::fs::write(relative_gitdir.join("index"), "relative index").unwrap();
+        let relative_key = relative.to_string_lossy().into_owned();
+        assert!(
+            glyph_fingerprint(&relative_key, &relative)
+                .unwrap()
+                .index
+                .is_some()
+        );
     }
 
     #[test]
@@ -581,11 +658,11 @@ mod tests {
         let path = Path::new("/worktrees/warm");
         let stamp = warm_stamp(now, path, &ttls);
         let age = now.duration_since(stamp);
-        let due_after = ttls.safety.saturating_sub(age);
+        let due_after = jittered(ttls.safety, path).saturating_sub(age);
         assert!(due_after <= ttls.busy / 2);
         assert_eq!(
             age,
-            ttls.safety.saturating_sub(Duration::from_millis(
+            jittered(ttls.safety, path).saturating_sub(Duration::from_millis(
                 ttls.busy.as_millis() as u64 * u64::from(path_jitter_permille(path)) / 1000,
             )),
         );
@@ -595,7 +672,7 @@ mod tests {
             .map(|index| {
                 let path = PathBuf::from(format!("/worktrees/warm-{index}"));
                 let stamp = warm_stamp(now, &path, &ttls);
-                ttls.safety.saturating_sub(now.duration_since(stamp))
+                jittered(ttls.safety, &path).saturating_sub(now.duration_since(stamp))
             })
             .collect();
         assert!(offsets.len() >= 6);
