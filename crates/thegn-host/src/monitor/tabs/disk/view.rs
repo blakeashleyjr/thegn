@@ -459,25 +459,30 @@ impl DiskModel {
                 let gaps = self.history_buf.gap();
                 let mut held = f32::NAN;
                 let mut values = [f32::NAN; HISTORY];
-                for index in 0..hi.len().min(HISTORY) {
-                    if gaps[index] {
-                        values[index] = held;
-                    } else if raw_hi[index].is_finite() {
-                        held = hi[index];
-                        values[index] = held;
+                for (slot, ((&hi, &raw), &gap)) in
+                    values.iter_mut().zip(hi.iter().zip(raw_hi).zip(gaps))
+                {
+                    if gap {
+                        *slot = held;
+                    } else if raw.is_finite() {
+                        held = hi;
+                        *slot = held;
                     } else {
                         held = f32::NAN;
                     }
                 }
                 slot.replace_from(&values[..hi.len().min(HISTORY)]);
             }
-            let peak = self
-                .history_buf
-                .raw_hi()
-                .iter()
-                .copied()
-                .filter(|value| value.is_finite())
-                .reduce(f32::max);
+            let peak = if self.history_buf.empty() {
+                None
+            } else {
+                self.history_buf
+                    .raw_hi()
+                    .iter()
+                    .copied()
+                    .filter(|value| value.is_finite())
+                    .reduce(f32::max)
+            };
             if metric == Metric::DiskRead {
                 self.telemetry_read_peak = peak;
             } else {
@@ -579,7 +584,6 @@ impl TabView for DiskView<'_> {
             PRESSURE => set.insert(CollectorId::Psi),
             FILESYSTEMS => set.insert(CollectorId::Filesystems),
             SLICE => set.insert(CollectorId::CgroupSlice),
-            WORKTREES => {}
             _ => {}
         }
         set
@@ -737,14 +741,14 @@ impl TabView for DiskView<'_> {
         }
         if placed.id == DEVICES && !matches!(self.model.disk_health, Health::Absent(_)) {
             for (row, device) in self
-                .0
+                .model
                 .devices
                 .iter()
                 .take(rect.rows.saturating_sub(2) / 3)
                 .enumerate()
             {
                 if let Some(history) = self
-                    .0
+                    .model
                     .device_history
                     .iter()
                     .find(|history| history.id == device.id)
@@ -864,21 +868,11 @@ fn paint_io(grid: &mut CellGrid, rect: Rect, model: &DiskModel) {
         if area.rows > 2 {
             let read_peak = model.telemetry_read_peak.map_or_else(
                 || history_peak(&model.read_history, model.disk_health, area.cols / 2),
-                |peak| {
-                    format!(
-                        "{}",
-                        rate_reading(Some(f64::from(peak)), Health::Ok, area.cols / 2)
-                    )
-                },
+                |peak| rate_reading(Some(f64::from(peak)), Health::Ok, area.cols / 2),
             );
             let write_peak = model.telemetry_write_peak.map_or_else(
                 || history_peak(&model.write_history, model.disk_health, area.cols / 2),
-                |peak| {
-                    format!(
-                        "{}",
-                        rate_reading(Some(f64::from(peak)), Health::Ok, area.cols / 2)
-                    )
-                },
+                |peak| rate_reading(Some(f64::from(peak)), Health::Ok, area.cols / 2),
             );
             let scale = format!("window peak read {read_peak} write {write_peak}");
             body.put_str(0, 2, &scale, CellStyle::default());

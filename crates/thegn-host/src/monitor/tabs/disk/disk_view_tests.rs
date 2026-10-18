@@ -435,6 +435,16 @@ fn io_peak_scale_remains_visible_beside_the_history_graphs() {
 }
 
 #[test]
+fn empty_telemetry_window_has_no_peak() {
+    let mut model = DiskModel::default();
+    let history = TelemetryHistory::default();
+    model.absorb_history(&history, Window::EVERYTHING, ScaleMode::Window, 3000);
+    let state = model.test_telemetry_state();
+    assert_eq!(state.2, None, "empty read window has no telemetry peak");
+    assert_eq!(state.3, None, "empty write window has no telemetry peak");
+}
+
+#[test]
 fn worktree_selection_is_highlighted_and_scrolled_into_view() {
     let rows = (0..12)
         .map(|index| crate::monitor::build::DiskWtRow {
@@ -471,9 +481,13 @@ fn worktree_selection_is_highlighted_and_scrolled_into_view() {
         rendered.contains("worktree-10"),
         "selected row is visible: {rendered}"
     );
+    let first_visible_row = (1..60)
+        .filter_map(|x| grid.get(x, 1))
+        .map(|cell| cell.ch)
+        .collect::<String>();
     assert!(
-        !rendered.contains("worktree-11"),
-        "row after selection stays below viewport: {rendered}"
+        first_visible_row.contains("worktree-7"),
+        "scroll starts at the first visible row: {first_visible_row}"
     );
     grid.clear();
     super::paint_worktrees(&mut grid, Rect::full(60, 6), &[], 0);
@@ -510,11 +524,12 @@ fn absent_collectors_render_absent_marks_and_do_not_change_demand() {
         PanelId("disk.devices"),
         PanelId("disk.filesystems"),
         PanelId("disk.slice"),
-        PanelId("disk.worktrees"),
     ] {
         assert!(!view.demand(id).is_empty());
         assert_eq!(view.demand(id), present_view.demand(id));
     }
+    assert!(view.demand(PanelId("disk.worktrees")).is_empty());
+    assert!(present_view.demand(PanelId("disk.worktrees")).is_empty());
     let (surface, _, _) = render(&model, 160, 45);
     let text = surface.screen_chars_to_string();
     assert!(text.contains(crate::caps::active_glyphs().emdash));
