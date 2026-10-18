@@ -184,17 +184,20 @@ fn footer_names_menu_entries_and_non_legacy_signal_confirmation() {
         board_panels: 0,
         board_zoomed: false,
     });
-    let menu_text = match line {
-        crate::seg::Line::Split { l, r } => l
-            .iter()
-            .chain(r.iter())
-            .flat_map(|segment| segment.text.chars())
-            .collect::<String>(),
+    let (menu_text, menu_hint) = match line {
+        crate::seg::Line::Split { l, r } => (
+            l.iter()
+                .flat_map(|segment| segment.text.chars())
+                .collect::<String>(),
+            r.iter()
+                .flat_map(|segment| segment.text.chars())
+                .collect::<String>(),
+        ),
         _ => panic!("signal menu should own both footer slots"),
     };
     assert!(menu_text.contains(">t TERM"));
     assert!(menu_text.contains(crate::platform::ProcSignal::menu()[0].label()));
-    assert!(menu_text.contains("Up/Down choose · Enter select · Esc cancel"));
+    assert_eq!(menu_hint, "Up/Down choose · Enter select · Esc cancel");
 
     let hangup = Confirm::Signal {
         pid: 4242,
