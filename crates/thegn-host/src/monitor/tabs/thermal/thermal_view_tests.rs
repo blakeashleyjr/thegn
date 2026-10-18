@@ -205,14 +205,14 @@ fn fill_ratio(surface: &Surface, area: Rect) -> f32 {
 fn absorb_frame_groups_and_filters_sensor_and_zone_data() {
     let mut model = ThermalModel::default();
     model.absorb_frame(&fixture());
-    assert_eq!(model.sensors.len(), 22);
+    assert_eq!(model.sensors.len(), 23);
     assert!(model.sensors.iter().any(|sensor| sensor.chip == "nvme"));
     assert!(model.sensors.iter().any(|sensor| sensor.chip == "spd5118"));
     assert!(
-        !model
+        model
             .sensors
             .iter()
-            .any(|sensor| sensor.label == "bad sentinel")
+            .any(|sensor| sensor.label == "bad sentinel" && sensor.temp_c.is_none())
     );
     assert!(
         model
@@ -293,7 +293,11 @@ fn deterministic_snapshots_cover_sizes_capabilities_and_demand() {
                     board.paint(&view, &mut surface, area, 0, &[]);
                     let output = text(&mut surface);
                     assert!(output.contains("CPU package"));
-                    assert!(output.contains("71.0 C"));
+                    let package_temp = model
+                        .package()
+                        .and_then(|sensor| sensor.temp_c)
+                        .expect("fixture package temperature");
+                    assert!(output.contains(&format!("{package_temp:.1} C")));
                     assert!(output.contains("nvme"));
                     assert!(output.contains("socket power"));
                     assert!(output.contains("critical"));
@@ -551,6 +555,9 @@ fn heatmap_labels_name_core_three_in_unicode_and_ascii() {
 #[test]
 fn amd_cards_keep_first_available_cores_and_gpu_readings() {
     let mut frame = fixture();
+    for reading in frame.parts.hwmon.values.iter_mut().skip(7) {
+        reading.value = None;
+    }
     let mut dgpu = GpuMetrics {
         temperature_edge: Some(8_100),
         temperature_gfx: Some(8_200),
@@ -598,7 +605,7 @@ fn amd_cards_keep_first_available_cores_and_gpu_readings() {
 }
 
 #[test]
-fn cores_panel_is_absent_without_core_temperatures() {
+fn cores_panel_still_requests_its_collector_without_core_temperatures() {
     let mut frame = fixture();
     frame.parts.amd_smu.cards.clear();
     if let Some(layout) = frame.parts.hwmon.layout.as_deref() {
@@ -630,13 +637,13 @@ fn cores_panel_is_absent_without_core_temperatures() {
     let board = Board::default();
     let area = Rect::full(160, 45);
     assert!(
-        !board
+        board
             .placed(&view, area)
             .iter()
-            .any(|panel| { panel.id == PanelId("thermal.cores") })
+            .any(|panel| panel.id == PanelId("thermal.cores"))
     );
     assert!(
-        !board
+        board
             .demand(&view, area, 1000)
             .collectors
             .contains(CollectorId::AmdSmu)
