@@ -71,6 +71,41 @@ fn strict_frame_decoder_accepts_only_canonical_rpc_frames() {
 }
 
 #[test]
+fn frame_depth_is_bounded_before_json_materialization() {
+    let at_limit = format!(
+        "{{\"method\":\"x\",\"params\":{}0{}}}",
+        "[".repeat(MAX_FRAME_DEPTH - 1),
+        "]".repeat(MAX_FRAME_DEPTH - 1)
+    );
+    assert!(!json_depth_exceeds(&at_limit, MAX_FRAME_DEPTH));
+    assert!(matches!(decode_frame(&at_limit), Ok(_)));
+
+    let over_limit = format!(
+        "{{\"method\":\"x\",\"params\":{}0{}}}",
+        "[".repeat(MAX_FRAME_DEPTH),
+        "]".repeat(MAX_FRAME_DEPTH)
+    );
+    assert!(json_depth_exceeds(&over_limit, MAX_FRAME_DEPTH));
+    assert!(matches!(decode_frame(&over_limit), Err(FrameReject::Depth)));
+}
+
+#[test]
+fn frame_depth_prescan_stops_early_and_ignores_string_brackets() {
+    let excessive = "[".repeat(10_000);
+    assert!(json_depth_exceeds(&excessive, MAX_FRAME_DEPTH));
+    assert!(matches!(decode_frame(&excessive), Err(FrameReject::Depth)));
+
+    assert!(!json_depth_exceeds(r#"{"text":"[[[["}"#, MAX_FRAME_DEPTH));
+    assert!(!json_depth_exceeds(r#"{"text":"\"[[[["}"#, MAX_FRAME_DEPTH));
+}
+
+#[test]
+fn kill_group_errno_classification_silences_esrch_and_warns_other_errors() {
+    assert!(!kill_errno_should_warn(libc::ESRCH));
+    assert!(kill_errno_should_warn(libc::EPERM));
+}
+
+#[test]
 fn malformed_frames_are_junk_and_do_not_stop_later_messages() {
     for malformed in [
         r#"printf '%s\n' '{"method":"x","result":1}'"#,
