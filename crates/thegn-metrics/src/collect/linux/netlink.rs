@@ -193,12 +193,9 @@ impl NetlinkSocket {
         if fd < 0 {
             return Err(io::Error::last_os_error());
         }
-        let addr = libc::sockaddr_nl {
-            nl_family: libc::AF_NETLINK as libc::sa_family_t,
-            nl_pad: 0,
-            nl_pid: 0,
-            nl_groups: 0,
-        };
+        // SAFETY: sockaddr_nl is plain old data; all-zero is a valid value (libc keeps nl_pad private).
+        let mut addr: libc::sockaddr_nl = unsafe { std::mem::zeroed() };
+        addr.nl_family = libc::AF_NETLINK as libc::sa_family_t;
         // SAFETY: `addr` is a live sockaddr_nl and its exact size is supplied.
         let result = unsafe {
             libc::bind(
@@ -217,12 +214,9 @@ impl NetlinkSocket {
     }
 
     pub fn send(&mut self, request: &[u8]) -> io::Result<()> {
-        let addr = libc::sockaddr_nl {
-            nl_family: libc::AF_NETLINK as libc::sa_family_t,
-            nl_pad: 0,
-            nl_pid: 0,
-            nl_groups: 0,
-        };
+        // SAFETY: sockaddr_nl is plain old data; all-zero is a valid value (libc keeps nl_pad private).
+        let mut addr: libc::sockaddr_nl = unsafe { std::mem::zeroed() };
+        addr.nl_family = libc::AF_NETLINK as libc::sa_family_t;
         // SAFETY: request and destination are valid for the duration of sendto.
         let sent = unsafe {
             libc::sendto(
