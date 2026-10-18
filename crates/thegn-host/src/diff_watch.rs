@@ -694,7 +694,8 @@ fn resolve_git_dirs(cwd: &Path) -> (Option<PathBuf>, Option<PathBuf>) {
     (git_dir, common_dir)
 }
 
-/// Notify configuration shared by the host's filesystem watchers.
+/// Notify configuration shared by the host's filesystem watchers. CORE excludes
+/// access/open events, which should not wake watchers that only need content changes.
 pub(crate) fn watcher_config() -> notify::Config {
     notify::Config::default().with_event_kinds(EventKindMask::CORE)
 }
