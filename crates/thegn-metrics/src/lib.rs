@@ -27,6 +27,8 @@ mod disk_aggregate;
 mod gpu;
 mod gpu_exec;
 mod gpu_monitor;
+#[cfg(target_os = "linux")]
+mod gpu_nvml;
 mod gpu_sysfs;
 mod net_kind;
 mod net_medium;
