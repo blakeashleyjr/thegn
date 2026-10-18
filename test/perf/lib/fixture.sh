@@ -64,3 +64,31 @@ perf_build_fixture() {
 
   echo "$root"
 }
+
+# Run one isolated startup so the thegn DB and the workspace's own registry
+# entry exist, then register each linked fixture worktree for session adoption.
+# Requires the caller to have sourced test/lib/pty.sh and set $HERE.
+perf_seed_fixture_registry() {
+  local count="$1" bin="$2" root="$3" db inner timeout_bin
+  db="$XDG_STATE_HOME/thegn/thegn.db"
+  printf -v inner 'cd %q; stty rows 50 cols 200; env THEGN_NO_DAEMON=1 THEGN_BENCH_RUN_MS=3000 %q' \
+    "$root" "$bin"
+  timeout_bin="$(pty_timeout_bin)"
+  if [ -n "$timeout_bin" ]; then
+    # `$0`/`$1` are the bash -c positionals bound by the arguments below.
+    # shellcheck disable=SC2016
+    if ! "$timeout_bin" 30s bash -c 'source "$0"; pty_run "$1"' \
+      "$HERE/../lib/pty.sh" "$inner" >/dev/null 2>&1; then
+      echo 'FAIL: isolated registry warm-up launch failed or timed out' >&2
+      return 1
+    fi
+  elif ! pty_run "$inner" >/dev/null 2>&1; then
+    echo 'FAIL: isolated registry warm-up launch failed' >&2
+    return 1
+  fi
+  if [ ! -f "$db" ]; then
+    echo "FAIL: warm-up did not create the isolated registry DB: $db" >&2
+    return 1
+  fi
+  python3 "$HERE/lib/seed-registry.py" "$db" "$root" "$count"
+}
