@@ -368,25 +368,30 @@ mod tests {
         let mut previous = vec![
             sample(1, "thegn-rt", 10, 4, 10),
             sample(2, "thegn-rt", 20, 2, 20),
+            sample(5, "x", 100, 50, 100),
         ];
         let current = [
             sample(1, "thegn-rt", 15, 6, 14),
             sample(3, "new-thread", 50, 50, 50),
             sample(4, "thegn-rt", 1, 1, 1),
+            sample(5, "x", 40, 10, 30),
         ];
         let mut ranked = Vec::with_capacity(4);
         let summary = rank_thread_deltas(&current, &mut previous, &mut ranked, 2.0, 100);
 
         assert_eq!(
             ranked.len(),
-            1,
+            2,
             "new tids have no first interval and vanished tids are removed"
         );
         assert_eq!(ranked[0].sample.tid, 1);
         assert_eq!(ranked[0].wakes_per_s, 3.5);
         assert_eq!(ranked[0].cpu_ms_per_s, 20.0);
+        let backwards = ranked.iter().find(|rate| rate.sample.tid == 5).unwrap();
+        assert_eq!(backwards.wakes_per_s, 0.0);
+        assert_eq!(backwards.cpu_ms_per_s, 0.0);
         assert_eq!(previous.as_slice(), current.as_slice());
-        assert_eq!(summary.threads, 3);
+        assert_eq!(summary.threads, 4);
         assert_eq!(summary.rt_threads, 2);
         assert_eq!(summary.rt_wakes_per_s, 3.5);
         assert_eq!(summary.others_wakes_per_s, 0.0);
@@ -394,8 +399,12 @@ mod tests {
 
     #[test]
     fn disabled_perf_does_not_start_the_census_worker() {
+        let _guard = TEST_GUARD
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         assert!(CENSUS_TX.get().is_none());
-        assert!(census_sender(false).is_none());
+        crate::perf::set_enabled(false);
+        report(1.0);
         assert!(CENSUS_TX.get().is_none());
     }
 
