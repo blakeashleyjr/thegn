@@ -264,6 +264,29 @@ fn deduplicates_superblocks_filters_pseudo_keeps_network_without_statvfs_and_reu
 }
 
 #[test]
+fn counts_further_mounts_for_each_kept_superblock_row() {
+    let io = FakeIo {
+        mountinfo: [
+            mount(1, "8:1", "/data", "ext4", "/dev/a", "rw"),
+            mount(2, "8:1", "/bind-a", "ext4", "/dev/a", "rw"),
+            mount(3, "8:1", "/bind-b", "ext4", "/dev/a", "rw"),
+            mount(4, "8:2", "/other", "ext4", "/dev/b", "rw"),
+        ]
+        .concat(),
+        ..FakeIo::default()
+    };
+    let mut collector = make_collector(io);
+    assert_eq!(collector.discover(&Env::default()), Health::Ok);
+
+    let frame = sample(&mut collector, 40_000);
+    assert_eq!(frame.parts.filesystems.rows.len(), 2);
+    assert_eq!(frame.parts.filesystems.rows[0].mount_point, "/data");
+    assert_eq!(frame.parts.filesystems.rows[0].extra_mounts, 2);
+    assert_eq!(frame.parts.filesystems.rows[1].mount_point, "/other");
+    assert_eq!(frame.parts.filesystems.rows[1].extra_mounts, 0);
+}
+
+#[test]
 fn btrfs_unallocated_uses_device_size_minus_allocation_totals_and_missing_tree_is_absent() {
     let uuid = "aabbcc";
     let mountinfo = mount(1, "0:34", "/btrfs", "btrfs", "/dev/mapper/crypted", "rw");
