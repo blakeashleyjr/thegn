@@ -4,6 +4,9 @@ use std::collections::{BTreeMap, VecDeque};
 use std::io;
 
 /// Operations needed by the Linux process-table implementation.
+///
+/// Implementations report a process that has disappeared as `NotFound`; the
+/// table also recognizes Linux `ESRCH` from held stat descriptors.
 pub trait ProcFs {
     /// Open stat handle type kept between sampling passes.
     type Stat;
@@ -53,6 +56,9 @@ pub struct FakeProcess {
 pub struct FakeProcFs {
     processes: BTreeMap<u32, FakeProcess>,
     exits: BTreeMap<u32, VecDeque<usize>>,
+    read_errors: BTreeMap<u32, VecDeque<io::ErrorKind>>,
+    gone_reads: BTreeMap<u32, usize>,
+    small_read_errors: BTreeMap<(u32, String), VecDeque<io::ErrorKind>>,
     list_order: Option<Vec<u32>>,
     ops: ProcFsOps,
 }
@@ -88,6 +94,24 @@ impl FakeProcFs {
         if count > 0 {
             self.exits.entry(pid).or_default().push_back(count);
         }
+    }
+
+    /// Script an error for the next stat read of a PID.
+    pub fn fail_next_read(&mut self, pid: u32, kind: io::ErrorKind) {
+        self.read_errors.entry(pid).or_default().push_back(kind);
+    }
+
+    /// Script a gone error for the next stat read, removing the process before reopen.
+    pub fn gone_on_next_read(&mut self, pid: u32) {
+        *self.gone_reads.entry(pid).or_default() += 1;
+    }
+
+    /// Script an error for the next read of a process's small proc file.
+    pub fn fail_next_small_read(&mut self, pid: u32, name: &str, kind: io::ErrorKind) {
+        self.small_read_errors
+            .entry((pid, name.to_owned()))
+            .or_default()
+            .push_back(kind);
     }
 
     /// Operation counters accumulated since construction.
@@ -152,6 +176,18 @@ impl ProcFs for FakeProcFs {
 
     fn read_stat(&mut self, stat: &mut Self::Stat, buf: &mut [u8]) -> io::Result<usize> {
         self.ops.reads += 1;
+        if let Some(remaining) = self.gone_reads.get_mut(&stat.pid)
+            && *remaining > 0
+        {
+            *remaining -= 1;
+            self.processes.remove(&stat.pid);
+            return Err(io::Error::new(io::ErrorKind::NotFound, "process exited"));
+        }
+        if let Some(errors) = self.read_errors.get_mut(&stat.pid)
+            && let Some(kind) = errors.pop_front()
+        {
+            return Err(io::Error::new(kind, "scripted stat read error"));
+        }
         if let Some(script) = self.exits.get_mut(&stat.pid)
             && let Some(remaining) = script.front_mut()
             && *remaining > 0
@@ -160,6 +196,7 @@ impl ProcFs for FakeProcFs {
             if *remaining == 0 {
                 script.pop_front();
             }
+            self.processes.remove(&stat.pid);
             return Ok(0);
         }
         let process = self
@@ -173,6 +210,12 @@ impl ProcFs for FakeProcFs {
 
     fn read_small(&mut self, pid: u32, name: &str, buf: &mut [u8]) -> io::Result<usize> {
         self.ops.small_reads += 1;
+        let key = (pid, name.to_owned());
+        if let Some(errors) = self.small_read_errors.get_mut(&key)
+            && let Some(kind) = errors.pop_front()
+        {
+            return Err(io::Error::new(kind, "scripted small proc read error"));
+        }
         let process = self
             .processes
             .get(&pid)

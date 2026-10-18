@@ -61,6 +61,8 @@ impl ProcFs for RealProcFs {
     fn open_stat(&mut self, pid: u32) -> io::Result<Self::Stat> {
         let relative = CString::new(format!("{pid}/stat"))
             .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
+        // SAFETY: `root` owns a valid directory fd and `relative` is a live,
+        // NUL-terminated path for the duration of the call.
         let fd = unsafe {
             libc::openat(
                 self.root.as_raw_fd(),
@@ -71,6 +73,8 @@ impl ProcFs for RealProcFs {
         if fd < 0 {
             return Err(io::Error::last_os_error());
         }
+        // SAFETY: `openat` returned a new fd, and ownership is transferred to
+        // exactly one `File` here.
         Ok(unsafe { File::from_raw_fd(fd) })
     }
 
@@ -128,6 +132,7 @@ pub struct ProcTable<F: ProcFs> {
     entries: Vec<ProcEntry<F::Stat>>,
     listed_pids: Vec<u32>,
     kept_max: usize,
+    kept_count: usize,
     ticks_per_second: Option<u64>,
 }
 
@@ -139,6 +144,7 @@ impl<F: ProcFs> ProcTable<F> {
             entries: Vec::new(),
             listed_pids: Vec::new(),
             kept_max: kept_max.min(MAX_KEPT_FDS),
+            kept_count: 0,
             ticks_per_second: clock_ticks_per_second(),
         }
     }
@@ -148,7 +154,7 @@ impl<F: ProcFs> ProcTable<F> {
         &self.entries
     }
 
-    /// Mutable access to the backing filesystem, for diagnostics and tests.
+    /// Shared access to the backing filesystem, for diagnostics and tests.
     pub fn fs(&self) -> &F {
         &self.fs
     }
@@ -165,18 +171,18 @@ impl<F: ProcFs> ProcTable<F> {
                 self.fs.close_stat(handle);
             }
         }
+        self.kept_count = 0;
     }
 
     /// Refresh the process table. `visible` lists rows that have recently been shown.
     pub fn pass(&mut self, now: Duration, visible: &[u32]) -> io::Result<()> {
         self.listed_pids.clear();
         self.fs.list_pids(&mut self.listed_pids)?;
-        let was_sorted = self.listed_pids.windows(2).all(|pair| pair[0] <= pair[1]);
+        let was_sorted = self.listed_pids.windows(2).all(|pair| pair[0] < pair[1]);
         if !was_sorted {
             self.listed_pids.sort_unstable();
             self.listed_pids.dedup();
         }
-        debug_assert!(self.listed_pids.windows(2).all(|pair| pair[0] <= pair[1]));
 
         let mut index = 0;
         let mut listed_index = 0;
@@ -203,19 +209,14 @@ impl<F: ProcFs> ProcTable<F> {
         Ok(())
     }
 
-    fn kept_count(&self) -> usize {
-        self.entries
-            .iter()
-            .filter(|entry| entry.handle.is_some())
-            .count()
-    }
-
     fn mark_ghost(&mut self, index: usize) {
+        // P-2: define a bounded ghost lifetime and prune old rows.
         let entry = &mut self.entries[index];
         entry.ghost = true;
         entry.cpu_delta = None;
         if let Some(handle) = entry.handle.take() {
             self.fs.close_stat(handle);
+            self.kept_count -= 1;
         }
     }
 
@@ -225,23 +226,112 @@ impl<F: ProcFs> ProcTable<F> {
             match self.fs.open_stat(pid) {
                 Ok(mut opened) => {
                     let result = self.refresh_from_handle(index, &mut opened, now, visible);
-                    self.fs.close_stat(opened);
+                    if self.entries[index].ghost {
+                        self.fs.close_stat(opened);
+                        return result;
+                    }
+                    if self.should_keep(now, visible) {
+                        self.entries[index].handle = Some(opened);
+                        self.kept_count += 1;
+                    } else {
+                        self.fs.close_stat(opened);
+                    }
                     return result;
                 }
                 Err(error) if is_process_gone(&error) => {
                     self.mark_ghost(index);
                     return Ok(());
                 }
-                Err(error) => return Err(error),
+                Err(_) => return Ok(()),
             }
         };
+        self.kept_count -= 1;
         let result = self.refresh_from_handle(index, &mut handle, now, visible);
         if self.entries[index].ghost {
             self.fs.close_stat(handle);
+            self.reopen_existing(index, now, visible)?;
         } else {
             self.entries[index].handle = Some(handle);
+            self.kept_count += 1;
         }
         result
+    }
+
+    fn reopen_existing(&mut self, index: usize, now: Duration, visible: bool) -> io::Result<()> {
+        let pid = self.entries[index].id.pid;
+        let mut handle = match self.fs.open_stat(pid) {
+            Ok(handle) => handle,
+            Err(_) => return Ok(()),
+        };
+        let mut buffer = [0; STAT_BUFFER_CAP];
+        let count = match self.fs.read_stat(&mut handle, &mut buffer) {
+            Ok(count) => count,
+            Err(_) => {
+                self.fs.close_stat(handle);
+                return Ok(());
+            }
+        };
+        let Some(stat) = crate::procs_parse::parse_stat(&buffer[..count]) else {
+            self.fs.close_stat(handle);
+            return Ok(());
+        };
+        if stat.pid != pid {
+            self.fs.close_stat(handle);
+            return Ok(());
+        }
+        let metadata = initial_metadata(&mut self.fs, pid, &handle);
+        match metadata {
+            Ok((uid, cmdline, cgroup)) => {
+                {
+                    let entry = &mut self.entries[index];
+                    entry.id = stat.id();
+                    entry.stat = stat;
+                    entry.uid = uid;
+                    entry.cmdline = cmdline;
+                    entry.cgroup = cgroup;
+                    entry.cpu_delta = None;
+                    entry.last_seen = now;
+                    entry.ghost = false;
+                    if visible {
+                        entry.last_visible = now;
+                    }
+                }
+                if self.should_keep(now, visible) {
+                    self.entries[index].handle = Some(handle);
+                    self.kept_count += 1;
+                } else {
+                    self.fs.close_stat(handle);
+                }
+            }
+            Err(_) => self.fs.close_stat(handle),
+        }
+        Ok(())
+    }
+
+    fn should_keep(&mut self, now: Duration, visible: bool) -> bool {
+        if self.kept_count < self.kept_max {
+            return self.kept_max > 0;
+        }
+        if self.kept_max == 0 {
+            return false;
+        }
+        let incoming_visible_at = if visible { now } else { Duration::ZERO };
+        let victim = self
+            .entries
+            .iter()
+            .enumerate()
+            .filter(|(_, entry)| entry.handle.is_some())
+            .min_by_key(|(_, entry)| (entry.last_visible, entry.id.pid))
+            .map(|(victim, _)| victim);
+        if let Some(victim) = victim
+            && incoming_visible_at > self.entries[victim].last_visible
+            && let Some(old_handle) = self.entries[victim].handle.take()
+        {
+            self.fs.close_stat(old_handle);
+            self.kept_count -= 1;
+            return true;
+        }
+        false
     }
 
     fn refresh_from_handle(
@@ -262,7 +352,7 @@ impl<F: ProcFs> ProcTable<F> {
                 self.mark_ghost(index);
                 return Ok(());
             }
-            Err(error) => return Err(error),
+            Err(_) => return Ok(()),
         };
         let Some(stat) = crate::procs_parse::parse_stat(&buffer[..count]) else {
             self.mark_ghost(index);
@@ -274,11 +364,33 @@ impl<F: ProcFs> ProcTable<F> {
         }
         let identity_changed = stat.starttime != self.entries[index].id.start_ticks;
         let identity_fields = if identity_changed {
-            Some((
-                self.fs.uid_of(handle)?,
-                read_small_capped(&mut self.fs, stat.pid, "cmdline")?,
-                read_cgroup(&mut self.fs, stat.pid)?,
-            ))
+            let uid = match self.fs.uid_of(handle) {
+                Ok(uid) => uid,
+                Err(error) if is_process_gone(&error) => {
+                    self.mark_ghost(index);
+                    return Ok(());
+                }
+                Err(_) => return Ok(()),
+            };
+            let cmdline = match read_small_capped(&mut self.fs, stat.pid, "cmdline") {
+                Ok(cmdline) => cmdline,
+                Err(error) if is_process_gone(&error) => {
+                    self.mark_ghost(index);
+                    return Ok(());
+                }
+                Err(error) if is_permission_denied(&error) => Vec::new(),
+                Err(_) => return Ok(()),
+            };
+            let cgroup = match read_cgroup(&mut self.fs, stat.pid) {
+                Ok(cgroup) => cgroup,
+                Err(error) if is_process_gone(&error) => {
+                    self.mark_ghost(index);
+                    return Ok(());
+                }
+                Err(error) if is_permission_denied(&error) => None,
+                Err(_) => return Ok(()),
+            };
+            Some((uid, cmdline, cgroup))
         } else {
             None
         };
@@ -317,7 +429,7 @@ impl<F: ProcFs> ProcTable<F> {
         let mut handle = match self.fs.open_stat(pid) {
             Ok(handle) => handle,
             Err(error) if is_process_gone(&error) => return Ok(()),
-            Err(error) => return Err(error),
+            Err(_) => return Ok(()),
         };
         let mut buffer = [0; STAT_BUFFER_CAP];
         let count = match self.fs.read_stat(&mut handle, &mut buffer) {
@@ -326,9 +438,9 @@ impl<F: ProcFs> ProcTable<F> {
                 self.fs.close_stat(handle);
                 return Ok(());
             }
-            Err(error) => {
+            Err(_) => {
                 self.fs.close_stat(handle);
-                return Err(error);
+                return Ok(());
             }
         };
         let Some(stat) = crate::procs_parse::parse_stat(&buffer[..count]) else {
@@ -342,28 +454,15 @@ impl<F: ProcFs> ProcTable<F> {
         let metadata = initial_metadata(&mut self.fs, pid, &handle);
         let (uid, cmdline, cgroup) = match metadata {
             Ok(metadata) => metadata,
-            Err(error) => {
+            Err(_) => {
                 self.fs.close_stat(handle);
-                return Err(error);
+                return Ok(());
             }
         };
-        let keep = self.kept_count() < self.kept_max;
         let incoming_visible_at = if visible { now } else { Duration::ZERO };
-        if !keep
-            && self.kept_max > 0
-            && let Some(victim) = self
-                .entries
-                .iter()
-                .enumerate()
-                .filter(|(_, entry)| entry.handle.is_some())
-                .min_by_key(|(_, entry)| (entry.last_visible, entry.id.pid))
-                .map(|(victim, _)| victim)
-            && incoming_visible_at > self.entries[victim].last_visible
-            && let Some(old_handle) = self.entries[victim].handle.take()
-        {
-            self.fs.close_stat(old_handle);
-        }
+        let keep = self.should_keep(now, visible);
         let kept_handle = if keep {
+            self.kept_count += 1;
             Some(handle)
         } else {
             self.fs.close_stat(handle);
@@ -389,10 +488,9 @@ impl<F: ProcFs> ProcTable<F> {
 }
 
 fn read_small_capped<F: ProcFs>(fs: &mut F, pid: u32, name: &str) -> io::Result<Vec<u8>> {
-    let mut buf = vec![0; SMALL_FILE_CAP];
+    let mut buf = [0; SMALL_FILE_CAP];
     let count = fs.read_small(pid, name, &mut buf)?;
-    buf.truncate(count.min(buf.len()));
-    Ok(buf)
+    Ok(buf[..count.min(buf.len())].to_vec())
 }
 
 fn initial_metadata<F: ProcFs>(
@@ -400,11 +498,18 @@ fn initial_metadata<F: ProcFs>(
     pid: u32,
     handle: &F::Stat,
 ) -> io::Result<(u32, Vec<u8>, Option<Vec<u8>>)> {
-    Ok((
-        fs.uid_of(handle)?,
-        read_small_capped(fs, pid, "cmdline")?,
-        read_cgroup(fs, pid)?,
-    ))
+    let uid = fs.uid_of(handle)?;
+    let cmdline = match read_small_capped(fs, pid, "cmdline") {
+        Ok(cmdline) => cmdline,
+        Err(error) if is_permission_denied(&error) => Vec::new(),
+        Err(error) => return Err(error),
+    };
+    let cgroup = match read_cgroup(fs, pid) {
+        Ok(cgroup) => cgroup,
+        Err(error) if is_permission_denied(&error) => None,
+        Err(error) => return Err(error),
+    };
+    Ok((uid, cmdline, cgroup))
 }
 
 fn read_cgroup<F: ProcFs>(fs: &mut F, pid: u32) -> io::Result<Option<Vec<u8>>> {
@@ -416,10 +521,16 @@ fn is_process_gone(error: &io::Error) -> bool {
     matches!(
         error.kind(),
         io::ErrorKind::NotFound | io::ErrorKind::UnexpectedEof
-    )
+    ) || error.raw_os_error() == Some(libc::ESRCH)
+}
+
+fn is_permission_denied(error: &io::Error) -> bool {
+    matches!(error.kind(), io::ErrorKind::PermissionDenied)
+        || matches!(error.raw_os_error(), Some(libc::EACCES) | Some(libc::EPERM))
 }
 
 fn clock_ticks_per_second() -> Option<u64> {
+    // SAFETY: `sysconf` reads a process-wide constant and has no pointer arguments.
     let ticks_per_second = unsafe { libc::sysconf(libc::_SC_CLK_TCK) };
     u64::try_from(ticks_per_second)
         .ok()
@@ -440,6 +551,7 @@ pub fn kept_max_from_rlimit() -> usize {
         rlim_cur: 0,
         rlim_max: 0,
     };
+    // SAFETY: `limit` is a valid writable `rlimit` structure for this call.
     let result = unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) };
     if result != 0 {
         return 0;
