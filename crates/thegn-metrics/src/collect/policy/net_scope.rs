@@ -125,6 +125,22 @@ mod tests {
                 IfaceKind::Wifi,
             ),
             (
+                "wlan1",
+                IfaceFacts {
+                    devtype: "wlan".into(),
+                    ..Default::default()
+                },
+                IfaceKind::Wifi,
+            ),
+            (
+                "not-lo",
+                IfaceFacts {
+                    type_code: Some(772),
+                    ..Default::default()
+                },
+                IfaceKind::Loopback,
+            ),
+            (
                 "wg0",
                 IfaceFacts {
                     devtype: "wireguard".into(),
@@ -149,9 +165,25 @@ mod tests {
                 IfaceKind::Bridge,
             ),
             (
+                "br1",
+                IfaceFacts {
+                    devtype: "bridge".into(),
+                    ..Default::default()
+                },
+                IfaceKind::Bridge,
+            ),
+            (
                 "bond0",
                 IfaceFacts {
                     bonding: true,
+                    ..Default::default()
+                },
+                IfaceKind::Bond,
+            ),
+            (
+                "bond1",
+                IfaceFacts {
+                    devtype: "bond".into(),
                     ..Default::default()
                 },
                 IfaceKind::Bond,
@@ -165,6 +197,7 @@ mod tests {
                 IfaceKind::Vlan,
             ),
             ("veth0", IfaceFacts::default(), IfaceKind::Veth),
+            ("mystery0", IfaceFacts::default(), IfaceKind::Unknown),
             (
                 "eth0",
                 IfaceFacts {
@@ -191,8 +224,13 @@ mod tests {
     #[test]
     fn scope_keeps_vlan_virtual_and_bond_slaves_out_of_physical_totals() {
         assert_eq!(scope(IfaceKind::Ethernet, false), Scope::Physical);
+        assert_eq!(scope(IfaceKind::Wifi, false), Scope::Physical);
+        assert_eq!(scope(IfaceKind::Other, false), Scope::Physical);
         assert_eq!(scope(IfaceKind::Bond, true), Scope::Virtual);
+        assert_eq!(scope(IfaceKind::Bridge, false), Scope::Container);
+        assert_eq!(scope(IfaceKind::Wireguard, false), Scope::Vpn);
         assert_eq!(scope(IfaceKind::Vlan, false), Scope::Virtual);
+        assert_eq!(scope(IfaceKind::Unknown, false), Scope::Virtual);
         assert_eq!(scope(IfaceKind::Tun, false), Scope::Vpn);
         assert_eq!(scope(IfaceKind::Veth, false), Scope::Container);
         assert_eq!(scope(IfaceKind::Loopback, false), Scope::Loopback);

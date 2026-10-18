@@ -3,7 +3,8 @@ use super::fields;
 
 pub fn for_each(input: &[u8], mut visit: impl FnMut(&[u8], &[u8], Option<i64>)) {
     let mut lines = input.split(|byte| *byte == b'\n');
-    while let Some(header) = lines.next() {
+    let mut pending = None;
+    while let Some(header) = pending.take().or_else(|| lines.next()) {
         let Some(values) = lines.next() else { break };
         let Some((section, names)) = split_section(header) else {
             continue;
@@ -12,12 +13,17 @@ pub fn for_each(input: &[u8], mut visit: impl FnMut(&[u8], &[u8], Option<i64>)) 
             continue;
         };
         if section != value_section {
+            pending = Some(values);
             continue;
         }
         for (name, number) in fields(names).zip(fields(numbers)) {
             visit(section, name, parse_i64(number));
         }
     }
+}
+
+pub(super) fn non_negative(value: Option<i64>) -> Option<u64> {
+    value.and_then(|number| u64::try_from(number).ok())
 }
 
 fn split_section(line: &[u8]) -> Option<(&[u8], &[u8])> {
@@ -81,13 +87,7 @@ impl SnmpCounters {
     pub fn parse_into(input: &[u8], out: &mut Self) {
         *out = Self::default();
         for_each(input, |section, key, value| {
-            let value = value.and_then(|number| {
-                if number >= 0 {
-                    Some(number as u64)
-                } else {
-                    None
-                }
-            });
+            let value = non_negative(value);
             match (section, key) {
                 (b"Ip", b"Forwarding") => out.ip_forwarding = value,
                 (b"Ip", b"InReceives") => out.ip_in_receives = value,
@@ -139,5 +139,13 @@ mod tests {
         assert_eq!(counts.tcp_active_opens, Some(7));
         assert_eq!(counts.tcp_passive_opens, None);
         assert_eq!(counts.udp_sndbuf_errors, Some(15));
+    }
+
+    #[test]
+    fn mismatched_pair_reuses_second_line_as_next_header() {
+        let input = b"Ip: Forwarding\nTcp: MaxConn ActiveOpens\nTcp: -1 7\n";
+        let mut counters = SnmpCounters::default();
+        SnmpCounters::parse_into(input, &mut counters);
+        assert_eq!(counters.tcp_active_opens, Some(7));
     }
 }
