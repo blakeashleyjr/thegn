@@ -155,7 +155,8 @@ probing — `podman-rootless`, `podman-rootful`, `docker`, `bwrap`, `systemd`,
 
 For local rootless Podman, the first thegn command is the `version` liveness
 probe, before container creation or the events client. The `podman events`
-client runs in its own process group, which thegn kills and reaps at shutdown.
+client runs in its own process group, which thegn kills at shutdown and on
+stream end, reaping it when it exits within the shutdown deadline.
 A surviving `pause` process belongs to rootless Podman's user namespace and
 may outlive thegn by design.
 

@@ -73,7 +73,8 @@ Recipes:
 - The harness disables sandboxing by default; set `TG_PERF_SANDBOX=1` to
   measure with sandboxing enabled. A separate verify launch checks that the
   seeded worktree count was collected before the measured launch. Fixed resource
-  ceilings apply to every non-debug run; the CPU ceiling applies to idle runs.
+  ceilings apply to every non-debug procfs run; the CPU ceiling
+  applies to non-debug idle runs.
   Fixture cleanup removes its temporary Podman state and any matching rootless
   `podman pause` process.
 
