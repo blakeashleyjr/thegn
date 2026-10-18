@@ -73,7 +73,8 @@ Recipes:
 - The harness disables sandboxing by default; set `TG_PERF_SANDBOX=1` to
   measure with sandboxed panes enabled. In that mode it exposes the user
   manager's private socket when available; if only the session bus is available,
-  it exposes that and reports the fallback. The fixture writes
+  it exposes that and reports the fallback, and fails if neither exists. The
+  fixture writes
   `cpu_total = "off"` and `memory_total = "off"` to its sandbox limits in
   either mode. A separate verify launch checks that the seeded worktree count
   was collected before the measured launch. Fixed resource ceilings apply to
