@@ -1,5 +1,5 @@
 use super::{OverviewModel, OverviewView};
-use crate::telemetry::{ScaleMode, Window};
+use crate::telemetry::{Metric, ScaleMode, TelemetryHistory, Window};
 use crate::{
     caps::test_override,
     compositor::Rect,
@@ -127,6 +127,34 @@ fn fixture() -> OverviewModel {
     model
 }
 
+fn sparse_history() -> TelemetryHistory {
+    let mut history = TelemetryHistory::default();
+    for second in 40..60_u64 {
+        let missing_interior_sample = (50..=51).contains(&second);
+        let snap = StatsSnapshot {
+            cpu_pct: (!missing_interior_sample).then_some((40 + second % 20) as u8),
+            load_avg: (!missing_interior_sample).then_some((second as f32 / 10.0, 1.0, 0.5)),
+            mem_gib: (!missing_interior_sample).then_some((4.0, 8.0)),
+            net_bps: (!missing_interior_sample).then_some((second * 1024, 512)),
+            disk_io: (!missing_interior_sample).then_some((second * 2048, second * 1024)),
+            ..Default::default()
+        };
+        history.push(&snap, second * 1000);
+    }
+    history
+}
+
+fn graph_column_has_ink(surface: &Surface, x: usize) -> bool {
+    surface.screen_lines().iter().any(|line| {
+        line.visible_cells().any(|cell| {
+            cell.cell_index() == x
+                && !cell.str().is_empty()
+                && cell.str() != " "
+                && !cell.str().chars().all(|glyph| glyph as u32 == 0x2800)
+        })
+    })
+}
+
 #[test]
 fn empty_overview_demands_its_live_source_collectors() {
     let model = OverviewModel::default();
@@ -147,6 +175,83 @@ fn cpu_core_shares_are_rendered_as_percentages() {
     assert!(
         !text.contains("420%"),
         "raw per-mille leaked into output: {text}"
+    );
+}
+
+#[test]
+fn overview_history_skips_leading_gaps_holds_interior_gaps_and_reuses_capacity() {
+    let history = sparse_history();
+    let mut model = OverviewModel::default();
+    model.absorb_history(&history, Window::from_secs(60), ScaleMode::Window, 60_000);
+
+    // With 160 buckets over 60 s, the first sample at 40 s lands at
+    // floor(40 * 160 / 60) = 106, leaving 54 buckets in each populated slot.
+    for panel in 0..5 {
+        let slots = &model.sparks[panel];
+        let metric_count = if panel == 4 { 2 } else { 1 };
+        for series in slots.iter().take(metric_count) {
+            assert_eq!(series.len(), 54, "panel {panel} {series:?}");
+        }
+    }
+    assert!(model.sparks[5][0].is_empty());
+    assert!(model.sparks[6][0].is_empty());
+    assert!(
+        model.sparks[7]
+            .iter()
+            .all(|slots| slots.iter().all(Vec::is_empty))
+    );
+
+    // The samples at 50 s and 51 s are absent; buckets 133 through 137
+    // retain the 49 s reading for CPU, Memory, Network, and Disk.
+    for metric in [Metric::Cpu, Metric::Mem, Metric::NetRx, Metric::DiskRead] {
+        let (panel, series) = match metric {
+            Metric::Cpu => (0, 0),
+            Metric::Mem => (2, 0),
+            Metric::NetRx => (3, 0),
+            Metric::DiskRead => (4, 0),
+            _ => unreachable!(),
+        };
+        let values = &model.sparks[panel][series];
+        assert!(values[27..32].iter().all(|value| *value == values[26]));
+    }
+
+    let capacities = model
+        .sparks
+        .iter()
+        .map(|slots| [slots[0].capacity(), slots[1].capacity()])
+        .collect::<Vec<_>>();
+    for _ in 0..1000 {
+        model.absorb_history(&history, Window::from_secs(60), ScaleMode::Window, 60_000);
+    }
+    assert_eq!(
+        model
+            .sparks
+            .iter()
+            .map(|slots| [slots[0].capacity(), slots[1].capacity()])
+            .collect::<Vec<_>>(),
+        capacities
+    );
+
+    let mut surface = Surface::new(120, 8);
+    test_override::with_unicode(UnicodeLevel::Full, || {
+        crate::monitor::graphs::paint_history_graph(
+            &model.sparks[0][0],
+            thegn_core::theme::RampId::Util,
+            Rect::full(120, 8),
+            &mut surface,
+        );
+    });
+    assert!(
+        (0..93).all(|x| !graph_column_has_ink(&surface, x)),
+        "the first 106 missing buckets must leave the graph's first 53 braille columns blank"
+    );
+    assert!(
+        graph_column_has_ink(&surface, 93),
+        "the first Overview CPU sample must begin in the column after the 106 leading buckets"
+    );
+    assert!(
+        graph_column_has_ink(&surface, 119),
+        "the newest Overview CPU sample must reach the graph's last inner column"
     );
 }
 

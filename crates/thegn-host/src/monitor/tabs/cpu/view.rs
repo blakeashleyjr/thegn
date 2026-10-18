@@ -311,8 +311,22 @@ impl CpuModel {
                 &mut self.history_buf,
             );
             slot.clear();
-            if !self.history_buf.empty() {
-                slot.extend_from_slice(self.history_buf.hi());
+            let values = self.history_buf.hi();
+            let raw = self.history_buf.raw_hi();
+            let gaps = self.history_buf.gap();
+            if let Some(first_real) = gaps.iter().position(|gap| !gap) {
+                let mut held = None;
+                for ((value, raw), gap) in values.iter().zip(raw).zip(gaps).skip(first_real) {
+                    if *gap {
+                        slot.push(held.unwrap_or(f32::NAN));
+                    } else {
+                        let value = if raw.is_finite() { *value } else { f32::NAN };
+                        slot.push(value);
+                        if value.is_finite() {
+                            held = Some(value);
+                        }
+                    }
+                }
             }
         }
     }
