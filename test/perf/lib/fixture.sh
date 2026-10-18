@@ -64,3 +64,21 @@ perf_build_fixture() {
 
   echo "$root"
 }
+
+# Run one isolated startup so the thegn DB and the workspace's own registry
+# entry exist, then register each linked fixture worktree for session adoption.
+perf_seed_fixture_registry() {
+  local count="$1" bin="$2" root="$3" db inner
+  db="$XDG_STATE_HOME/thegn/thegn.db"
+  printf -v inner 'cd %q; stty rows 50 cols 200; env THEGN_NO_DAEMON=1 THEGN_BENCH_RUN_MS=3000 %q' \
+    "$root" "$bin"
+  if ! pty_run "$inner" >/dev/null 2>&1; then
+    echo 'FAIL: isolated registry warm-up launch failed' >&2
+    return 1
+  fi
+  if [ ! -f "$db" ]; then
+    echo "FAIL: warm-up did not create the isolated registry DB: $db" >&2
+    return 1
+  fi
+  python3 "$HERE/lib/seed-registry.py" "$db" "$root" "$count"
+}

@@ -225,8 +225,8 @@ BIN_ABS="$(cd "$(dirname "$BIN")" && pwd)/$(basename "$BIN")"
   exit 1
 }
 case "$BIN_ABS" in
-*target/release/*) BUILD=release ;;
-*target/debug/*) BUILD=debug ;;
+*/release/*) BUILD=release ;;
+*/debug/*) BUILD=debug ;;
 *) BUILD=unknown ;;
 esac
 
@@ -236,7 +236,7 @@ GIT_SHA="$(git -C "$HERE" rev-parse --short HEAD 2>/dev/null || echo unknown)"
 perf_make_tmp
 perf_trap_cleanup
 PERF_SOCK_DIR=""
-trap 'rm -rf "${PERF_SOCK_DIR:-}"; rm -rf "${PERF_TMP:-}"' EXIT
+trap perf_cleanup EXIT
 HOST_TAG="$(perf_host_tag)"
 REPO="$(perf_build_fixture "$WORKTREES" "$DIRTY")"
 
@@ -263,7 +263,8 @@ SETTLE_MAX_MS=$((SETTLE_MS > 20000 ? SETTLE_MS : 20000))
 # window ended ("thegn exited before the spawn-rate idle window ended") and every
 # number from that run under-measured. The harness SIGTERMs thegn when done, so a
 # long tail costs nothing; 30 s covers any observed lag with room to spare.
-KEY_PHASE_MAX_MS=40000
+# Includes a one-second allowance for the ~700 ms paced seven-key input phase.
+KEY_PHASE_MAX_MS=41000
 if [ "$SCENARIO" = steady-workload ] || [ "$SCENARIO" = soak ] || [ "$SCENARIO" = soak-daemon ]; then
   RUN_MS=$((SETTLE_MAX_MS + 1000 + WINDOW_MS + KEY_PHASE_MAX_MS + 30000))
 else
@@ -300,9 +301,9 @@ if [ "$SCENARIO" = steady-workload ] || [ "$SCENARIO" = soak ] || [ "$SCENARIO" 
   FIFO="$PERF_TMP/input.fifo"
   mkfifo "$FIFO"
 fi
-LOG_ENV=""
+LOG_ENV=THEGN_LOG=thegn::hydrate=debug
 if [ "$WORKLOAD" = 1 ]; then
-  LOG_ENV=THEGN_LOG=thegn::input=debug
+  LOG_ENV=THEGN_LOG=thegn::hydrate=debug,thegn::input=debug
 fi
 
 # Resolve and configure the isolated daemon socket before the UI starts: config
@@ -324,6 +325,12 @@ if [ "$SCENARIO" = soak-daemon ]; then
   DAEMON_SOCK_CONFIG="${DAEMON_SOCK_CONFIG//\"/\\\"}"
   printf '[daemon]\nsocket = "%s"\n' "$DAEMON_SOCK_CONFIG" >"$XDG_CONFIG_HOME/thegn/config.toml"
 fi
+if [ "${TG_PERF_SANDBOX:-}" != 1 ]; then
+  mkdir -p "$XDG_CONFIG_HOME/thegn"
+  printf '\n[sandbox]\nenabled = false\n' >>"$XDG_CONFIG_HOME/thegn/config.toml"
+fi
+perf_seed_fixture_registry "$WORKTREES" "$BIN_ABS" "$REPO"
+LOG_FILE="$XDG_STATE_HOME/thegn/logs/thegn.log"
 if [ "$SPAWN_ENABLED" = 1 ] && [ "$SAMPLER" = proc ]; then
   # `$1`/`$@` are the bash -c positionals passed after `$0`, not outer values.
   # shellcheck disable=SC2016
@@ -333,11 +340,11 @@ if [ "$SPAWN_ENABLED" = 1 ] && [ "$SAMPLER" = proc ]; then
 else
   if [ "$WORKLOAD" = 1 ]; then
     printf -v INNER \
-      'cd %q; stty rows 50 cols 200; env THEGN_BENCH_RUN_MS=%q %s THEGN_LOG=thegn::input=debug %q & echo $! > %q; wait' \
+      'cd %q; stty rows 50 cols 200; env THEGN_BENCH_RUN_MS=%q %s THEGN_LOG=thegn::hydrate=debug,thegn::input=debug %q & echo $! > %q; wait' \
       "$REPO" "$RUN_MS" "$NO_DAEMON" "$BIN_ABS" "$PIDFILE"
   else
     printf -v INNER \
-      'cd %q; stty rows 50 cols 200; env THEGN_BENCH_RUN_MS=%q %s %q & echo $! > %q; wait' \
+      'cd %q; stty rows 50 cols 200; env THEGN_BENCH_RUN_MS=%q %s THEGN_LOG=thegn::hydrate=debug %q & echo $! > %q; wait' \
       "$REPO" "$RUN_MS" "$NO_DAEMON" "$BIN_ABS" "$PIDFILE"
   fi
 fi
@@ -431,6 +438,31 @@ if [ -z "$PID" ] || ! kill -0 "$PID" 2>/dev/null; then
   exit 1
 fi
 
+# The status collector reports the number of paths it actually adopted. Check
+# the live run's log so --worktrees cannot silently describe only git fixtures.
+EXPECTED_WORKTREES=$((WORKTREES + 1))
+for _ in $(seq 1 100); do
+  if [ -f "$LOG_FILE" ] && awk -v expected="$EXPECTED_WORKTREES" \
+    'index($0, "sidebar status collected") && match($0, "(^|[[:space:]])worktrees=" expected "([[:space:]]|$)") { found = 1 } END { exit !found }' \
+    "$LOG_FILE"; then
+    break
+  fi
+  sleep 0.05
+done
+if [ ! -f "$LOG_FILE" ] || ! awk -v expected="$EXPECTED_WORKTREES" \
+  'index($0, "sidebar status collected") && match($0, "(^|[[:space:]])worktrees=" expected "([[:space:]]|$)") { found = 1 } END { exit !found }' \
+  "$LOG_FILE"; then
+  echo "FAIL: sidebar status did not collect worktrees=$EXPECTED_WORKTREES in $LOG_FILE" >&2
+  kill "$PID" 2>/dev/null || true
+  if [ "$WORKLOAD" = 1 ]; then exec 3>&-; fi
+  wait "$LAUNCHER" 2>/dev/null || true
+  if [ -n "$DAEMON_LAUNCHER" ]; then
+    "$BIN_ABS" daemon stop >/dev/null 2>&1 || kill "$DAEMON_LAUNCHER" 2>/dev/null || true
+    wait "$DAEMON_LAUNCHER" 2>/dev/null || true
+  fi
+  exit 1
+fi
+
 # /proc/<pid>/stat fields 14,15 = utime,stime (in CLK_TCK). The comm field (2)
 # may contain spaces/parens, so split on the LAST ')'.
 proc_jiffies() { # $1 = pid -> utime+stime
@@ -510,6 +542,7 @@ proc_syscr() { # $1 = pid -> cumulative read syscalls
 # passes the resolved socket path to the daemon it spawns, so the match is exact.
 find_daemon_pid() {
   local d
+  [ -n "$DAEMON_SOCK" ] || return 1
   for d in /proc/[0-9]*; do
     [ -r "$d/cmdline" ] || continue
     # NUL-separated argv; translate so a plain grep works.
@@ -530,7 +563,7 @@ if [ "$SCENARIO" = steady-workload ] || [ "$SCENARIO" = soak ] || [ "$SCENARIO" 
   # Allow a first frame, then dismiss onboarding before counting dispatcher
   # output: onboarding-consumed keys do not reach the keymap logger.
   KEYS="$HERE/scenarios/steady-workload.keys"
-  MIN_DISPATCH_LINES=7 # Both key files contain at least seven key events; Esc setup is excluded.
+  MIN_DISPATCH_LINES=7 # Esc setup is excluded; spaced events avoid terminal coalescing.
   if [ "$SCENARIO" = soak-daemon ]; then
     KEYS="$HERE/scenarios/soak-daemon.keys"
     MIN_DISPATCH_LINES=7
@@ -547,7 +580,35 @@ if [ "$SCENARIO" = steady-workload ] || [ "$SCENARIO" = soak ] || [ "$SCENARIO" 
   KEYS_BYTES="$(wc -c <"$KEYS" | tr -d ' ')"
   if [ "${TG_PERF_DROP_KEYS:-}" = 1 ]; then
     cat "$KEYS" >/dev/null
-  elif ! cat "$KEYS" >&3; then
+  elif ! python3 - "$KEYS" 3 <<'PY'; then
+import os
+import sys
+import time
+
+data = open(sys.argv[1], "rb").read()
+fd = int(sys.argv[2])
+events = []
+index = 0
+while index < len(data):
+    if data[index] == 0x1B and index + 1 < len(data):
+        end = index + 2
+        if data[index + 1] == ord("["):
+            while end < len(data) and not 0x40 <= data[end] <= 0x7E:
+                end += 1
+            end = min(end + 1, len(data))
+        events.append(data[index:end])
+        index = end
+    else:
+        events.append(data[index : index + 1])
+        index += 1
+
+for event in events:
+    view = memoryview(event)
+    while view:
+        written = os.write(fd, view)
+        view = view[written:]
+    time.sleep(0.1)
+PY
     echo 'FAIL: could not write keys to the pty master' >&2
     if [ "$JSON_ONLY" = 1 ]; then printf '%s\n' '{"input":{"status":"failed"}}'; fi
     kill "$PID" 2>/dev/null || true
@@ -850,7 +911,7 @@ if [ "$SPAWN_ENABLED" = 1 ] && [ "$SAMPLER" = proc ]; then
   if SPAWN_RESULT="$(python3 "$HERE/lib/spawn-trace.py" --pane-shell "$PERF_PANE_SHELL" "$SPAWN_START_EPOCH" "$SPAWN_END_EPOCH" "${TRACE_FILES[@]}" 2>"$PERF_TMP/spawn-trace.err")"; then
     SPAWN_JSON="${SPAWN_RESULT%\}} ,\"roots\":${#TRACE_FILES[@]}}"
     SPAWN_COUNT="$(printf '%s' "$SPAWN_RESULT" | python3 -c 'import json,sys; print(json.load(sys.stdin)["count"])')"
-    if [ "$BUILD" = release ] && [ "$SPAWN_COUNT" -gt "$SPAWN_RATE_CEILING" ]; then
+    if [ "$BUILD" != debug ] && [ "$SPAWN_COUNT" -gt "$SPAWN_RATE_CEILING" ]; then
       echo "FAIL: spawn_rate=$SPAWN_COUNT exceeds fixed ceiling=$SPAWN_RATE_CEILING" >&2
       SPAWN_FAIL=1
       SPAWN_JSON="$(printf '%s' "$SPAWN_JSON" | python3 -c 'import json,sys; d=json.load(sys.stdin); d["status"]="failed"; d["error"]="ceiling exceeded"; print(json.dumps(d,separators=(",",":")))')"
@@ -929,7 +990,7 @@ fi
 
 # The idle scenario encodes the 0%-idle invariant against a FIXED ceiling so a
 # regressed baseline can never silently raise the bar.
-if [ "$SCENARIO" = idle ] && [ "$BUILD" = release ]; then
+if [ "$SCENARIO" = idle ] && [ "$BUILD" != debug ]; then
   if awk "BEGIN{exit !($CORES_TOTAL > $CEILING)}"; then
     echo "FAIL: idle cores_total=$CORES_TOTAL exceeds ceiling=$CEILING cores" >&2
     exit 2
@@ -939,7 +1000,7 @@ fi
 # Resource ceilings. These assert on every procfs scenario, not just `idle`: a
 # leak under a workload is still a leak, and `steady-workload` is where the diff
 # path — the one that leaked 4,408 children — actually runs.
-if [ "$RES_JSON" != "null" ] && [ "$BUILD" = release ]; then
+if [ "$RES_JSON" != "null" ] && [ "$BUILD" != debug ]; then
   RES_FAIL=0
   res_check() { # $1 = label, $2 = measured, $3 = ceiling, $4 = why it matters
     if [ "$2" -gt "$3" ]; then
