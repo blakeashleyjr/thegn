@@ -6,6 +6,7 @@ use crate::{
         layout::{Node, PanelId, PanelSpec, Placed, Size, Variant, VariantKind},
     },
     seg::{StyleTok, Tok},
+    telemetry::{Metric, ScaleMode, SeriesReq, TelemetryHistory, Window},
 };
 use termwiz::surface::Surface;
 use thegn_core::{
@@ -121,7 +122,8 @@ pub(in crate::monitor) struct MemoryModel {
     pub psi_full_avg10: Option<f64>,
     pub psi_full_avg60: Option<f64>,
     psi_history: MemoryHistory,
-    used_history: MemoryHistory,
+    mem_telemetry: MemoryHistory,
+    swap_history: MemoryHistory,
     reclaim_history: MemoryHistory,
     pub health: MemHealth,
     pub slice_current: Option<u64>,
@@ -150,6 +152,11 @@ impl Default for MemoryHistory {
 }
 
 impl MemoryHistory {
+    fn clear(&mut self) {
+        self.next = 0;
+        self.len = 0;
+    }
+
     fn push(&mut self, value: f32) {
         self.values[self.next] = value;
         self.next = (self.next + 1) % HISTORY_CAPACITY;
@@ -202,7 +209,8 @@ impl Default for MemoryModel {
             psi_full_avg10: None,
             psi_full_avg60: None,
             psi_history: MemoryHistory::default(),
-            used_history: MemoryHistory::default(),
+            mem_telemetry: MemoryHistory::default(),
+            swap_history: MemoryHistory::default(),
             reclaim_history: MemoryHistory::default(),
             health: mem_health::evaluate(&MemHealthInput::default()),
             slice_current: None,
@@ -216,6 +224,48 @@ impl Default for MemoryModel {
 }
 
 impl MemoryModel {
+    #[cfg(test)]
+    pub(in crate::monitor) fn history_state(&self) -> (usize, Option<f32>, usize, Option<f32>) {
+        fn latest(history: &MemoryHistory) -> (usize, Option<f32>) {
+            let mut recent = [0.0_f32; HISTORY_CAPACITY];
+            let (len, _) = history.copy_recent(&mut recent);
+            (len, len.checked_sub(1).map(|index| recent[index]))
+        }
+        let (mem_len, mem_latest) = latest(&self.mem_telemetry);
+        let (swap_len, swap_latest) = latest(&self.swap_history);
+        (mem_len, mem_latest, swap_len, swap_latest)
+    }
+
+    pub(in crate::monitor) fn absorb_history(
+        &mut self,
+        history: &TelemetryHistory,
+        window: Window,
+        _scale: ScaleMode,
+        now_ms: u64,
+    ) {
+        for (metric, slot) in [
+            (Metric::Mem, &mut self.mem_telemetry),
+            (Metric::Swap, &mut self.swap_history),
+        ] {
+            let series = history.series(&SeriesReq {
+                metric,
+                window,
+                scale: TelemetryHistory::scale_for(metric, ScaleMode::Fixed),
+                buckets: HISTORY_CAPACITY,
+                agg: thegn_core::series::Agg::Max,
+                now_ms: now_ms.saturating_add(1),
+            });
+            slot.clear();
+            if !series.empty {
+                for (raw, gap) in series.raw_hi.iter().zip(&series.gap) {
+                    if !gap && raw.is_finite() {
+                        slot.push((raw / 100.0).clamp(0.0, 1.0));
+                    }
+                }
+            }
+        }
+    }
+
     pub(in crate::monitor) fn absorb_frame(&mut self, frame: &MonitorFrame) {
         let mem = &frame.parts.meminfo.raw;
         self.total = mem.get(MemField::MemTotal);
@@ -281,15 +331,6 @@ impl MemoryModel {
         if let (Some(some), Some(full)) = (self.psi_some_avg10, self.psi_full_avg10) {
             self.psi_history.push((some + full) as f32);
         }
-        if let Some((total, available)) = self
-            .total
-            .zip(self.available)
-            .filter(|(total, _)| *total > 0)
-        {
-            self.used_history
-                .push((total.saturating_sub(available)) as f32 / total as f32);
-        }
-
         let input = MemHealthInput {
             mem_total_bytes: self.total,
             mem_available_bytes: self.available,
@@ -337,6 +378,32 @@ fn sum_rates(left: Option<f64>, right: Option<f64>) -> Option<f64> {
     }
 }
 
+#[cfg(test)]
+fn right_aligned_window(len: usize, width: usize) -> (usize, usize, usize) {
+    let visible = len.min(width);
+    (len - visible, visible, width - visible)
+}
+
+/// Return the sample slice and cell span needed to show the newest history
+/// without stretching it. Braille cells carry two samples; ASCII columns carry
+/// one.
+fn right_aligned_raster_window(len: usize, width: usize) -> (usize, usize, usize, usize) {
+    let samples_per_cell =
+        if viz_raster::RasterTable::for_level(crate::caps::unicode_level()).braille {
+            2
+        } else {
+            1
+        };
+    let visible_samples = len.min(width.saturating_mul(samples_per_cell));
+    let visible_cells = visible_samples.div_ceil(samples_per_cell);
+    (
+        len - visible_samples,
+        visible_samples,
+        width - visible_cells,
+        visible_cells,
+    )
+}
+
 pub(in crate::monitor) struct MemoryView<'a>(pub &'a MemoryModel);
 
 impl TabView for MemoryView<'_> {
@@ -346,6 +413,8 @@ impl TabView for MemoryView<'_> {
 
     fn template(&self) -> Node {
         let mut panels = vec![COMPOSITION, VERDICT, PRESSURE, PAGING];
+        // Follow-up: gate on meminfo Health::Absent once source health is carried
+        // into this model; SwapTotal presence is the available field today.
         if self.0.swap_total.is_some_and(|total| total > 0) {
             panels.push(SWAP);
         }
@@ -726,7 +795,7 @@ impl MemoryView<'_> {
     }
 
     fn paint_used_history(&self, grid: &mut CellGrid, body: Rect) {
-        if self.0.used_history.len == 0 || body.rows < 4 || body.cols == 0 {
+        if self.0.mem_telemetry.len == 0 || body.rows < 4 || body.cols == 0 {
             return;
         }
         let label_y = body.y.saturating_add(16);
@@ -739,7 +808,12 @@ impl MemoryView<'_> {
             cols: body.cols,
             rows: 1,
         })
-        .put_str(0, 0, "used / available history", Default::default());
+        .put_str(
+            0,
+            0,
+            "used / available history (memory total = 100%)",
+            Default::default(),
+        );
         let chart = Rect {
             x: body.x,
             y: label_y + 1,
@@ -750,15 +824,28 @@ impl MemoryView<'_> {
             return;
         }
         let mut used = [0.0_f32; HISTORY_CAPACITY];
-        let (len, _) = self.0.used_history.copy_recent(&mut used);
+        let (len, _) = self.0.mem_telemetry.copy_recent(&mut used);
         if len == 0 {
             return;
         }
+        let (start, visible_samples, offset, visible_cells) =
+            right_aligned_raster_window(len, chart.cols);
+        if visible_samples == 0 {
+            return;
+        }
+        let chart = Rect {
+            x: chart.x + offset,
+            cols: visible_cells,
+            ..chart
+        };
         let available = used.map(|value| 1.0 - value.clamp(0.0, 1.0));
         let mut raster = CellBuf::new();
         raster.reset(chart.cols, chart.rows);
         viz_raster::stacked(
-            &[&used[..len], &available[..len]],
+            &[
+                &used[start..start + visible_samples],
+                &available[start..start + visible_samples],
+            ],
             viz_raster::RasterTable::for_level(crate::caps::unicode_level()),
             &mut raster,
         );
@@ -881,6 +968,10 @@ impl MemoryView<'_> {
         if len == 0 {
             return;
         }
+        let (start, visible_samples, _, _) = right_aligned_raster_window(len, body.cols);
+        if visible_samples == 0 {
+            return;
+        }
         let scale = if peak > 0.0 { peak * 1.1 } else { 1.0 };
         for value in values.iter_mut().take(len) {
             *value = (*value / scale).clamp(0.0, 1.0);
@@ -902,10 +993,16 @@ impl MemoryView<'_> {
         if chart.rows == 0 {
             return;
         }
+        let (_, _, offset, visible_cells) = right_aligned_raster_window(len, chart.cols);
+        let chart = Rect {
+            x: chart.x + offset,
+            cols: visible_cells,
+            ..chart
+        };
         let mut raster = CellBuf::new();
         raster.reset(chart.cols, chart.rows);
         viz_raster::area(
-            &values[..len],
+            &values[start..start + visible_samples],
             viz_raster::RasterTable::for_level(crate::caps::unicode_level()),
             &mut raster,
         );
@@ -970,6 +1067,43 @@ impl MemoryView<'_> {
                 rows: body.rows - 2,
             })
             .put_str(0, 0, &zram_devs, Default::default());
+        }
+        if self.0.swap_history.len > 0 && body.rows >= 5 {
+            let mut values = [0.0_f32; HISTORY_CAPACITY];
+            let (len, peak) = self.0.swap_history.copy_recent(&mut values);
+            grid.view(Rect {
+                x: body.x,
+                y: body.y + 3,
+                cols: body.cols,
+                rows: 1,
+            })
+            .put_str(
+                0,
+                0,
+                &format!(
+                    "swap history (total = 100%, window peak {:.0}%)",
+                    peak * 100.0
+                ),
+                Default::default(),
+            );
+            let (start, visible_samples, offset, visible_cells) =
+                right_aligned_raster_window(len, body.cols);
+            if visible_samples > 0 && body.rows > 4 {
+                let chart = Rect {
+                    x: body.x + offset,
+                    y: body.y + 4,
+                    cols: visible_cells,
+                    rows: body.rows - 4,
+                };
+                let mut raster = CellBuf::new();
+                raster.reset(chart.cols, chart.rows);
+                viz_raster::area(
+                    &values[start..start + visible_samples],
+                    viz_raster::RasterTable::for_level(crate::caps::unicode_level()),
+                    &mut raster,
+                );
+                draw_raster(grid, chart, &raster, RasterStyle::Ramp(RampId::Mem));
+            }
         }
     }
 
@@ -1037,6 +1171,10 @@ impl MemoryView<'_> {
         if len == 0 || peak <= 0.0 {
             return;
         }
+        let (start, visible_samples, _, _) = right_aligned_raster_window(len, body.cols);
+        if visible_samples == 0 {
+            return;
+        }
         for value in values.iter_mut().take(len) {
             *value = (*value / peak).clamp(0.0, 1.0);
         }
@@ -1061,10 +1199,16 @@ impl MemoryView<'_> {
         if chart.rows == 0 {
             return;
         }
+        let (_, _, offset, visible_cells) = right_aligned_raster_window(len, chart.cols);
+        let chart = Rect {
+            x: chart.x + offset,
+            cols: visible_cells,
+            ..chart
+        };
         let mut raster = CellBuf::new();
         raster.reset(chart.cols, chart.rows);
         viz_raster::area(
-            &values[..len],
+            &values[start..start + visible_samples],
             viz_raster::RasterTable::for_level(crate::caps::unicode_level()),
             &mut raster,
         );
