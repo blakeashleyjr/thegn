@@ -255,6 +255,7 @@ impl PowerModel {
                     .map(|watts| watts as f32)
             });
         }
+        let socket_history_w = self.socket_w;
         self.socket_w = self.socket_w.or_else(|| {
             self.zones
                 .iter()
@@ -277,7 +278,7 @@ impl PowerModel {
         self.session.update(frame.at_ms, ac_state, session_watts);
         self.session_previous = session_watts.map(|watts| (frame.at_ms, watts));
         self.session_ac = ac_state;
-        if let Some(watts) = self.socket_w.or(self.battery_w.map(f32::abs)) {
+        if let Some(watts) = socket_history_w {
             push_history(&mut self.history, watts);
         }
     }
@@ -309,6 +310,7 @@ impl PowerModel {
                     self.telemetry_draw_peak_w = None;
                 }
             } else {
+                let first_sample = series.gap.iter().position(|gap| !gap);
                 let draw_peak = if metric == Metric::BatteryPower {
                     let peak = series
                         .raw_hi
@@ -324,21 +326,33 @@ impl PowerModel {
                     0.0
                 };
                 slot.clear();
-                slot.extend(series.hi.iter().zip(&series.raw_hi).zip(&series.gap).map(
-                    |((value, raw), gap)| {
-                        if *gap {
-                            f32::NAN
-                        } else if metric == Metric::BatteryPower {
-                            if draw_peak > 0.0 {
-                                raw.abs() / draw_peak
+                slot.extend(
+                    series
+                        .hi
+                        .iter()
+                        .zip(&series.raw_hi)
+                        .zip(&series.gap)
+                        .enumerate()
+                        .map(|(index, ((value, raw), _gap))| {
+                            if first_sample.is_none_or(|first| index < first) || !raw.is_finite() {
+                                f32::NAN
+                            } else if metric == Metric::Battery {
+                                if (0.0..=100.0).contains(raw) {
+                                    raw / 100.0
+                                } else {
+                                    f32::NAN
+                                }
+                            } else if metric == Metric::BatteryPower {
+                                if draw_peak > 0.0 {
+                                    raw.abs() / draw_peak
+                                } else {
+                                    0.0
+                                }
                             } else {
-                                0.0
+                                *value
                             }
-                        } else {
-                            *value
-                        }
-                    },
-                ));
+                        }),
+                );
             }
         }
     }
@@ -418,11 +432,7 @@ fn draw_history_label(model: &PowerModel) -> String {
         .telemetry_draw_peak_w
         .map(|watts| format!("{watts:.1} W"))
         .unwrap_or_else(|| paint::mark(model.power_supply_health).to_owned());
-    let now = model
-        .battery_w
-        .map(|watts| format!("{watts:+.1} W now"))
-        .unwrap_or_else(|| paint::mark(model.power_supply_health).to_owned());
-    format!("battery draw peak {peak}; {now}")
+    format!("battery |draw| peak {peak}")
 }
 fn rail_title(model: &PowerModel) -> String {
     let ceiling = rail_ceiling(model);

@@ -85,7 +85,7 @@ pub(super) fn paint_battery(grid: &mut CellGrid, rect: Rect, model: &PowerModel)
             rect,
             row,
             &format!(
-                "signed power {}  ETA {}",
+                "draw direction {}  ETA {}",
                 model
                     .battery_w
                     .map(|v| format!("{v:.2}W"))
@@ -231,8 +231,9 @@ pub(super) fn paint_policy(grid: &mut CellGrid, rect: Rect, model: &PowerModel) 
         .and_then(|policy| policy.epp)
         .map(|token| format!("EPP {}", token.as_str()))
         .unwrap_or_else(|| format!("EPP {}", mark(model.cpu_freq_health)));
-    let chip_width = rect.cols / 3;
-    for (index, (label, state)) in [
+    let mut chip_x = rect.x;
+    let mut chip_y = rect.y;
+    for (label, state) in [
         (
             profile,
             if model.policy.platform_profile.is_some() {
@@ -264,19 +265,21 @@ pub(super) fn paint_policy(grid: &mut CellGrid, rect: Rect, model: &PowerModel) 
         ),
     ]
     .into_iter()
-    .enumerate()
     {
-        let x = rect.x + index * chip_width;
+        let chip_width = label.len().saturating_add(1).min(rect.cols);
+        if chip_x > rect.x && chip_x + chip_width > rect.x + rect.cols {
+            chip_x = rect.x;
+            chip_y += 1;
+        }
+        if chip_y >= rect.y + rect.rows {
+            break;
+        }
         chip::draw(
             grid,
             Rect {
-                x,
-                y: rect.y,
-                cols: if index == 2 {
-                    rect.cols.saturating_sub(chip_width * 2)
-                } else {
-                    chip_width
-                },
+                x: chip_x,
+                y: chip_y,
+                cols: chip_width.min(rect.x + rect.cols - chip_x),
                 rows: 1,
             },
             &label,
@@ -285,17 +288,19 @@ pub(super) fn paint_policy(grid: &mut CellGrid, rect: Rect, model: &PowerModel) 
             NumFmt::default(),
             state,
         );
+        chip_x += chip_width;
     }
+    let chip_rows = chip_y.saturating_sub(rect.y) + 1;
     for (row, policy) in model
         .cpu_policy
         .iter()
-        .take(rect.rows.saturating_sub(1))
+        .take(rect.rows.saturating_sub(chip_rows))
         .enumerate()
     {
         put_line(
             grid,
             rect,
-            row + 1,
+            row + chip_rows,
             &format!(
                 "policy {}  {} / {} / EPP {}",
                 policy.policy,

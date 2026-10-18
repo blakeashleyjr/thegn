@@ -271,6 +271,22 @@ fn snapshot_sizes_capabilities_demand_and_absent_marks() {
 }
 
 #[test]
+fn policy_chips_wrap_without_clipping_the_epp_label() {
+    let mut model = PowerModel::default();
+    model.absorb_frame(&fixture());
+    let mut grid = crate::monitor::kit::grid::CellGrid::new(40, 3);
+    super::paint::paint_policy(&mut grid, Rect::full(40, 3), &model);
+    let line = |row| {
+        (0..40)
+            .map(|col| grid.get(col, row).map_or(' ', |cell| cell.ch))
+            .collect::<String>()
+    };
+    assert!(line(0).contains("profile balanced"));
+    assert!(line(0).contains("boost on"));
+    assert!(line(1).contains("EPP balance_perf"));
+}
+
+#[test]
 fn history_graph_right_aligns_short_series_and_stapm_overage_is_labeled() {
     let mut model = PowerModel::default();
     let mut frame = fixture();
@@ -321,6 +337,29 @@ fn history_graph_right_aligns_short_series_and_stapm_overage_is_labeled() {
 }
 
 #[test]
+fn socket_ring_does_not_switch_to_package_power() {
+    let mut frame = MonitorFrame::default();
+    frame.parts.powercap.zones.push(PowercapZone {
+        name: Arc::from("package-0"),
+        domain: PowerDomain::Package,
+        watts: Some(18.0),
+        energy_uj: Some(20_000_000),
+    });
+    frame.parts.powercap.zones.push(PowercapZone {
+        name: Arc::from("core"),
+        domain: PowerDomain::Core,
+        watts: Some(8.0),
+        energy_uj: Some(10_000_000),
+    });
+    let mut model = PowerModel::default();
+    model.absorb_frame(&frame);
+    assert_eq!(model.socket_w, Some(18.0));
+    assert!(model.history.is_empty());
+    assert_eq!(model.zones[0].history, [18.0]);
+    assert_eq!(model.zones[1].history, [8.0]);
+}
+
+#[test]
 fn battery_history_uses_latest_telemetry_and_empty_history_is_absent() {
     let mut history = TelemetryHistory::default();
     for tick in 0..24_u64 {
@@ -332,6 +371,7 @@ fn battery_history_uses_latest_telemetry_and_empty_history_is_absent() {
         history.push(&stats, 97_000 + tick * 1_000);
     }
     let mut model = PowerModel::default();
+    model.absorb_frame(&fixture());
     model.absorb_history(
         &history,
         crate::telemetry::Window::default(),
@@ -339,13 +379,27 @@ fn battery_history_uses_latest_telemetry_and_empty_history_is_absent() {
         120_000,
     );
     assert!(!model.telemetry_battery_history.is_empty());
+    assert_eq!(model.telemetry_battery_history.len(), 240);
     assert_eq!(model.batteries[0].charge_history.len(), 1);
     assert!(
         model
             .telemetry_battery_history
             .last()
-            .is_some_and(|value| *value > 0.0)
+            .is_some_and(|value| (*value - 0.63).abs() < 0.001),
+        "latest 63% charge stays at 63% of the labelled 100% scale"
     );
+    assert!(model.telemetry_battery_history[0].is_nan());
+    assert!(
+        model.telemetry_battery_history[237..]
+            .iter()
+            .all(|value| (*value - 0.63).abs() < 0.001)
+    );
+    assert!(
+        model.telemetry_battery_power_history[237..]
+            .iter()
+            .all(|value| value.is_finite())
+    );
+    assert_eq!(model.telemetry_draw_peak_w, Some(14.0));
     let mut surface = Surface::new(240, 60);
     Board::default().paint(
         &PowerView(&model),
@@ -404,6 +458,8 @@ fn battery_history_uses_latest_telemetry_and_empty_history_is_absent() {
         "newest draw sample reaches the last telemetry graph column"
     );
     let output = text(&mut surface);
+    assert!(output.contains("battery |draw| peak 14.0 W"));
+    assert!(output.contains("draw direction -14.00W"));
     let absent_line = format!("charge history {}", caps::active_glyphs().emdash);
     assert!(!output.contains(&absent_line));
     let mut no_history = PowerModel::default();
