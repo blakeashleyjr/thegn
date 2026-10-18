@@ -1,0 +1,280 @@
+#![allow(dead_code)] // wired in a later batch (V-NET-1b)
+
+use crate::{
+    compositor::Rect,
+    monitor::{
+        board::TabView,
+        layout::{Node, PanelId, PanelSpec, Placed, Size, Variant, VariantKind},
+    },
+    sections::Section,
+};
+use termwiz::surface::Surface;
+use thegn_metrics::collect::{
+    CollectorId, CollectorSet,
+    frame::MonitorFrame,
+    health::Health,
+    instances::InstanceId,
+    model::netdev::{IfaceSample, ScopeTotal},
+    policy::net_scope::Scope,
+};
+
+mod paint;
+
+pub(super) const THROUGHPUT: PanelId = PanelId("network.throughput");
+pub(super) const INTERFACES: PanelId = PanelId("network.interfaces");
+pub(super) const HEALTH: PanelId = PanelId("network.health");
+const HISTORY: usize = 120;
+pub(super) const IFACE_CAP: usize = 8;
+const IFACE_HISTORY: usize = 24;
+const VARIANTS: [Variant; 1] = [Variant {
+    kind: VariantKind::Full,
+    min: (24, 4),
+    pref: (72, 12),
+}];
+const SPECS: [PanelSpec; 3] = [
+    PanelSpec {
+        id: THROUGHPUT,
+        priority: 0,
+        variants: &VARIANTS,
+    },
+    PanelSpec {
+        id: INTERFACES,
+        priority: 1,
+        variants: &VARIANTS,
+    },
+    PanelSpec {
+        id: HEALTH,
+        priority: 2,
+        variants: &VARIANTS,
+    },
+];
+
+#[derive(Debug, Clone)]
+pub(super) struct Ring {
+    pub(super) values: Vec<f32>,
+    pub(super) head: usize,
+    pub(super) len: usize,
+    capacity: usize,
+}
+
+impl Ring {
+    fn new(capacity: usize) -> Self {
+        Self {
+            values: Vec::with_capacity(capacity),
+            head: 0,
+            len: 0,
+            capacity,
+        }
+    }
+
+    fn push(&mut self, value: f32) {
+        if self.len < self.capacity {
+            self.values.push(value);
+            self.len += 1;
+        } else if !self.values.is_empty() {
+            self.values[self.head] = value;
+            self.head = (self.head + 1) % self.values.len();
+        }
+    }
+
+    pub(super) fn copy_ordered(&self, out: &mut [f32]) -> usize {
+        let len = self.len.min(out.len());
+        let start = if self.len == self.capacity {
+            self.head
+        } else {
+            0
+        };
+        for (index, slot) in out.iter_mut().take(len).enumerate() {
+            *slot = self.values[(start + index) % self.len];
+        }
+        len
+    }
+
+    fn reset(&mut self) {
+        self.values.clear();
+        self.head = 0;
+        self.len = 0;
+    }
+
+    fn has_finite_sample(&self) -> bool {
+        self.values.iter().any(|value| value.is_finite())
+    }
+}
+
+#[derive(Debug, Clone)]
+pub(super) struct InterfaceHistory {
+    pub(super) id: InstanceId,
+    pub(super) sample: IfaceSample,
+    pub(super) rx: Ring,
+    pub(super) tx: Ring,
+    pub(super) live: bool,
+}
+
+impl Default for InterfaceHistory {
+    fn default() -> Self {
+        Self {
+            id: InstanceId::OTHER,
+            sample: IfaceSample::default(),
+            rx: Ring::new(IFACE_HISTORY),
+            tx: Ring::new(IFACE_HISTORY),
+            live: false,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub(in crate::monitor) struct NetworkModel {
+    pub(super) total: ScopeTotal,
+    pub(super) rx: Ring,
+    pub(super) tx: Ring,
+    pub(super) interfaces: Vec<InterfaceHistory>,
+    pub(super) overflow: usize,
+    pub(super) overflow_rx: Option<f64>,
+    pub(super) overflow_tx: Option<f64>,
+    pub(super) health: Health,
+    pub(super) error_total: Option<f64>,
+    pub(super) drop_total: Option<f64>,
+}
+
+impl Default for NetworkModel {
+    fn default() -> Self {
+        Self {
+            total: ScopeTotal::default(),
+            rx: Ring::new(HISTORY),
+            tx: Ring::new(HISTORY),
+            interfaces: Vec::with_capacity(IFACE_CAP),
+            overflow: 0,
+            overflow_rx: None,
+            overflow_tx: None,
+            health: Health::Warming,
+            error_total: None,
+            drop_total: None,
+        }
+    }
+}
+
+impl NetworkModel {
+    pub(in crate::monitor) fn absorb_frame(&mut self, frame: &MonitorFrame) {
+        let source = &frame.parts.netdev;
+        self.health = frame.health[CollectorId::Netdev.index()];
+        self.total = source.physical_or_all();
+        push_option(&mut self.rx, self.total.rx_bps);
+        push_option(&mut self.tx, self.total.tx_bps);
+        self.overflow = 0;
+        self.overflow_rx = Some(0.0);
+        self.overflow_tx = Some(0.0);
+        for history in &mut self.interfaces {
+            history.live = source.ifaces.iter().any(|sample| sample.id == history.id);
+        }
+        for sample in &source.ifaces {
+            let slot = self
+                .interfaces
+                .iter()
+                .position(|entry| entry.id == sample.id)
+                .or_else(|| (self.interfaces.len() < IFACE_CAP).then_some(self.interfaces.len()))
+                .or_else(|| self.interfaces.iter().position(|entry| !entry.live));
+            let Some(slot) = slot else {
+                self.overflow += 1;
+                add(&mut self.overflow_rx, sample.rx_bps);
+                add(&mut self.overflow_tx, sample.tx_bps);
+                continue;
+            };
+            if slot == self.interfaces.len() {
+                self.interfaces.push(InterfaceHistory::default());
+            }
+            let history = &mut self.interfaces[slot];
+            if history.id != sample.id {
+                history.rx.reset();
+                history.tx.reset();
+            }
+            history.id = sample.id;
+            history.sample.clone_from(sample);
+            history.live = true;
+            push_option(&mut history.rx, sample.rx_bps);
+            push_option(&mut history.tx, sample.tx_bps);
+        }
+        self.error_total = sum_rates(
+            source
+                .ifaces
+                .iter()
+                .filter(|iface| {
+                    iface.scope == Scope::Physical
+                        || source
+                            .ifaces
+                            .iter()
+                            .all(|other| other.scope != Scope::Physical)
+                })
+                .map(|iface| [iface.rx_errs_ps, iface.tx_errs_ps]),
+        );
+        self.drop_total = sum_rates(
+            source
+                .ifaces
+                .iter()
+                .filter(|iface| {
+                    iface.scope == Scope::Physical
+                        || source
+                            .ifaces
+                            .iter()
+                            .all(|other| other.scope != Scope::Physical)
+                })
+                .map(|iface| [iface.rx_drop_ps, iface.tx_drop_ps]),
+        );
+    }
+}
+
+fn push_option(ring: &mut Ring, value: Option<f64>) {
+    ring.push(value.map_or(f32::NAN, |rate| rate as f32));
+}
+
+fn add(total: &mut Option<f64>, value: Option<f64>) {
+    *total = total.zip(value).map(|(sum, value)| sum + value);
+}
+
+fn sum_rates(values: impl Iterator<Item = [Option<f64>; 2]>) -> Option<f64> {
+    let mut total = 0.0;
+    let mut found = false;
+    for pair in values {
+        for value in pair.into_iter().flatten() {
+            found = true;
+            total += value;
+        }
+    }
+    found.then_some(total)
+}
+
+pub(in crate::monitor) struct NetworkView<'a>(pub &'a NetworkModel);
+
+impl TabView for NetworkView<'_> {
+    fn specs(&self) -> &'static [PanelSpec] {
+        &SPECS
+    }
+
+    fn template(&self) -> Node {
+        Node::Col(vec![
+            (Size::Weight(2), Node::Panel(THROUGHPUT)),
+            (Size::Weight(3), Node::Panel(INTERFACES)),
+            (Size::Fixed(5), Node::Panel(HEALTH)),
+        ])
+    }
+
+    fn demand(&self, panel: PanelId) -> CollectorSet {
+        let mut demand = CollectorSet::empty();
+        if matches!(panel, THROUGHPUT | INTERFACES | HEALTH)
+            && !matches!(self.0.health, Health::Absent(_))
+        {
+            demand.insert(CollectorId::Netdev);
+        }
+        demand
+    }
+
+    fn paint(
+        &self,
+        surface: &mut Surface,
+        placed: &Placed,
+        rect: Rect,
+        _scroll: usize,
+        _sections: &[Section],
+    ) {
+        paint::paint(self.0, surface, placed.id, rect);
+    }
+}
