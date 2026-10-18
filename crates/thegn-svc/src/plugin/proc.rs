@@ -5,11 +5,13 @@
 //! a CPU, or outlive the fetch that started it.
 
 use std::collections::BTreeMap;
-use std::io::{BufRead, BufReader, Read};
 use std::path::Path;
 use std::process::{Command, Stdio};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
+
+#[cfg(not(unix))]
+use std::io::{BufRead, BufReader, Read};
 
 use thegn_core::plugin_api::{Frame, RpcError, RpcErrorCode, RpcMessage, RpcResponse};
 
@@ -70,6 +72,21 @@ pub struct PluginRun {
     pub stderr: String,
     /// Whether output was cut off by an output limit.
     pub truncated: bool,
+    /// Process and pipe cleanup observed for this run.
+    pub outcome: RunOutcome,
+}
+
+/// Bounded process-tree cleanup result for a one-shot plugin run.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct RunOutcome {
+    /// A process-group termination was requested.
+    pub killed: bool,
+    /// The direct child was reaped by this run.
+    pub reaped: bool,
+    /// Both output pipes reached EOF before the drain cutoff.
+    pub drained: bool,
+    /// A platform reader was abandoned because an inherited pipe stayed open.
+    pub abandoned: bool,
 }
 
 /// Consumes a plugin's stdout one line at a time, on the reader thread.
@@ -339,6 +356,7 @@ pub struct StreamRun<S> {
     pub stderr: String,
     /// Whether output was cut off by an output limit or the sink.
     pub truncated: bool,
+    pub outcome: RunOutcome,
 }
 
 /// Collects every message — the classic [`spawn_ndjson`] behaviour.
@@ -415,6 +433,7 @@ pub fn spawn_ndjson(
     let mut run = out.sink.run;
     run.stderr = out.stderr;
     run.truncated |= out.truncated;
+    run.outcome = out.outcome;
     Ok(run)
 }
 
@@ -461,10 +480,23 @@ pub fn spawn_ndjson_stream<S: NdjsonSink>(
     let stdout = child.stdout.take();
     let stderr = child.stderr.take();
 
-    // Drain both pipes on their own threads: a child that fills the stderr pipe
-    // while we read stdout would otherwise deadlock.
+    let deadline = Instant::now() + timeout;
+    let drain_deadline = deadline + READER_GRACE;
+    #[cfg(unix)]
+    let (pipe_tx, pipe_rx) = mpsc::channel();
+    #[cfg(unix)]
+    let pipe_thread = thegn_core::thread_name::spawn_named("thegn-plug-pipe", move || {
+        read_plugin_pipes(stdout, stderr, sink, drain_deadline, pipe_tx);
+    });
+
+    // Windows keeps separate blocking readers. A descendant can retain an
+    // inherited pipe there; the receiver deadline reports abandonment, while
+    // the detached reader thread can remain blocked until that handle closes.
+    #[cfg(not(unix))]
     let (stdout_tx, stdout_rx) = mpsc::channel();
+    #[cfg(not(unix))]
     let (stderr_tx, stderr_rx) = mpsc::channel();
+    #[cfg(not(unix))]
     thegn_core::thread_name::spawn_named("thegn-plug-out", move || {
         let mut sink = sink;
         let mut truncated = false;
@@ -534,6 +566,7 @@ pub fn spawn_ndjson_stream<S: NdjsonSink>(
         }
     });
 
+    #[cfg(not(unix))]
     thegn_core::thread_name::spawn_named("thegn-plug-err", move || {
         let mut s = String::new();
         if let Some(e) = stderr {
@@ -561,14 +594,15 @@ pub fn spawn_ndjson_stream<S: NdjsonSink>(
 
     // Observe the leader without reaping it, so its pid still pins the process
     // group when descendants are terminated.
-    let deadline = Instant::now() + timeout;
     let mut timed_out = false;
+    let mut kill_requested = false;
     #[cfg(unix)]
     let status = 'run: loop {
         match leader_exited_nowait(pid) {
             Ok(true) => {
                 // A successful one-shot run also kills helpers left in its process group,
                 // matching gh_run; backgrounded helpers do not outlive the plugin run.
+                kill_requested = true;
                 kill_group(pid);
                 break child.wait().ok();
             }
@@ -580,6 +614,7 @@ pub fn spawn_ndjson_stream<S: NdjsonSink>(
         }
         if Instant::now() >= deadline {
             timed_out = true;
+            kill_requested = true;
             kill_group(pid);
             let reap_deadline = Instant::now() + READER_GRACE;
             loop {
@@ -612,6 +647,7 @@ pub fn spawn_ndjson_stream<S: NdjsonSink>(
         }
         if Instant::now() >= deadline {
             timed_out = true;
+            kill_requested = true;
             kill_group(pid);
             hand_off_unreaped_child(child);
             break None;
@@ -619,25 +655,81 @@ pub fn spawn_ndjson_stream<S: NdjsonSink>(
         std::thread::sleep(Duration::from_millis(20));
     };
 
-    let drain_deadline = if timed_out || status.is_none() {
-        deadline + READER_GRACE
-    } else {
-        Instant::now() + READER_GRACE
-    };
-    let stdout_result =
-        recv_by_deadline(&stdout_rx, drain_deadline).map_err(|error| match error {
-            mpsc::RecvTimeoutError::Timeout => PluginError::Timeout(timeout.as_secs()),
-            mpsc::RecvTimeoutError::Disconnected => {
-                PluginError::Protocol("plugin output reader failed".into())
+    #[cfg(unix)]
+    let (stdout_result, stderr, drained) = match recv_by_deadline(&pipe_rx, drain_deadline) {
+        Ok((sink, stderr, truncated, drained)) => {
+            match pipe_thread.join() {
+                Ok(()) => {}
+                Err(_) => {
+                    tracing::warn!(target: "thegn::plugin", program, "plugin pipe reader panicked")
+                }
             }
-        })?;
-    let stderr = recv_by_deadline(&stderr_rx, drain_deadline).map_err(|error| match error {
-        mpsc::RecvTimeoutError::Timeout => PluginError::Timeout(timeout.as_secs()),
-        mpsc::RecvTimeoutError::Disconnected => {
-            PluginError::Protocol("plugin stderr reader failed".into())
+            ((sink, truncated), stderr, drained)
         }
-    })?;
+        Err(error) => {
+            let outcome = RunOutcome {
+                killed: kill_requested,
+                reaped: status.is_some(),
+                drained: false,
+                abandoned: true,
+            };
+            tracing::debug!(target: "thegn::plugin", program, ?outcome, "plugin pipe reader exceeded drain deadline");
+            return match error {
+                mpsc::RecvTimeoutError::Timeout => Err(PluginError::Timeout(timeout.as_secs())),
+                mpsc::RecvTimeoutError::Disconnected => {
+                    Err(PluginError::Protocol("plugin pipe reader failed".into()))
+                }
+            };
+        }
+    };
+    #[cfg(not(unix))]
+    let (stdout_result, stderr, drained) = {
+        let stdout_result = match recv_by_deadline(&stdout_rx, drain_deadline) {
+            Ok(result) => result,
+            Err(error) => {
+                let outcome = RunOutcome {
+                    killed: kill_requested,
+                    reaped: status.is_some(),
+                    drained: false,
+                    abandoned: true,
+                };
+                tracing::debug!(target: "thegn::plugin", program, ?outcome, "Windows plugin stdout reader abandoned");
+                return match error {
+                    mpsc::RecvTimeoutError::Timeout => Err(PluginError::Timeout(timeout.as_secs())),
+                    mpsc::RecvTimeoutError::Disconnected => {
+                        Err(PluginError::Protocol("plugin output reader failed".into()))
+                    }
+                };
+            }
+        };
+        let stderr = match recv_by_deadline(&stderr_rx, drain_deadline) {
+            Ok(stderr) => stderr,
+            Err(error) => {
+                let outcome = RunOutcome {
+                    killed: kill_requested,
+                    reaped: status.is_some(),
+                    drained: false,
+                    abandoned: true,
+                };
+                tracing::debug!(target: "thegn::plugin", program, ?outcome, "Windows plugin stderr reader abandoned");
+                return match error {
+                    mpsc::RecvTimeoutError::Timeout => Err(PluginError::Timeout(timeout.as_secs())),
+                    mpsc::RecvTimeoutError::Disconnected => {
+                        Err(PluginError::Protocol("plugin stderr reader failed".into()))
+                    }
+                };
+            }
+        };
+        (stdout_result, stderr, true)
+    };
     let (sink, truncated) = stdout_result;
+    let outcome = RunOutcome {
+        killed: kill_requested,
+        reaped: status.is_some(),
+        drained,
+        abandoned: !drained,
+    };
+    tracing::debug!(target: "thegn::plugin", program, ?outcome, "plugin run process-tree outcome");
 
     match (timed_out, status) {
         (true, _) | (false, None) => Err(PluginError::Timeout(timeout.as_secs())),
@@ -649,13 +741,15 @@ pub fn spawn_ndjson_stream<S: NdjsonSink>(
             sink,
             stderr,
             truncated,
+            outcome,
         }),
     }
 }
 
 /// Preserve the bounded caller deadline while ensuring every live child is
 /// eventually waited on. `try_wait` also handles the case where another owner
-/// already reaped the child.
+/// already reaped the child. The reaper may wait indefinitely if the OS does
+/// not deliver the requested termination; the run outcome records `reaped: false`.
 pub(super) fn hand_off_unreaped_child(mut child: std::process::Child) {
     match child.try_wait() {
         Ok(Some(_)) => {}
@@ -696,6 +790,217 @@ fn recv_by_deadline<T>(
     deadline: Instant,
 ) -> Result<T, mpsc::RecvTimeoutError> {
     receiver.recv_timeout(deadline.saturating_duration_since(Instant::now()))
+}
+
+#[cfg(unix)]
+fn read_plugin_pipes<S: NdjsonSink>(
+    stdout: Option<std::process::ChildStdout>,
+    stderr: Option<std::process::ChildStderr>,
+    sink: S,
+    deadline: Instant,
+    sender: mpsc::Sender<(S, String, bool, bool)>,
+) {
+    use std::os::fd::AsRawFd;
+
+    let Some(stdout) = stdout else { return };
+    let Some(stderr) = stderr else { return };
+    let stdout_fd = stdout.as_raw_fd();
+    let stderr_fd = stderr.as_raw_fd();
+    if set_nonblocking(stdout_fd).is_err() || set_nonblocking(stderr_fd).is_err() {
+        if let Err(error) = sender.send((sink, String::new(), true, false)) {
+            tracing::debug!(%error, "plugin pipe reader result was not received");
+        }
+        return;
+    }
+
+    let mut framer = OutputFramer::new(sink);
+    let mut stderr_bytes = Vec::with_capacity(MAX_STDERR);
+    let mut stdout_open = true;
+    let mut stderr_open = true;
+    let mut stdout_eof = false;
+    let mut stderr_eof = false;
+    let mut chunk = [0_u8; 8192];
+    while (stdout_open || stderr_open) && Instant::now() < deadline {
+        let mut descriptors = [
+            libc::pollfd {
+                fd: stdout_fd,
+                events: if stdout_open { libc::POLLIN } else { 0 },
+                revents: 0,
+            },
+            libc::pollfd {
+                fd: stderr_fd,
+                events: if stderr_open { libc::POLLIN } else { 0 },
+                revents: 0,
+            },
+        ];
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        let wait_ms = remaining.as_millis().min(50) as i32;
+        // SAFETY: descriptors points to two initialized pollfd entries.
+        let polled =
+            unsafe { libc::poll(descriptors.as_mut_ptr(), descriptors.len() as _, wait_ms) };
+        if polled < 0 {
+            let error = std::io::Error::last_os_error();
+            if error.kind() == std::io::ErrorKind::Interrupted {
+                continue;
+            }
+            break;
+        }
+        if polled == 0 {
+            continue;
+        }
+        for (index, fd) in [stdout_fd, stderr_fd].into_iter().enumerate() {
+            let events = descriptors[index].revents;
+            if events == 0 {
+                continue;
+            }
+            let mut open = if index == 0 { stdout_open } else { stderr_open };
+            if events & (libc::POLLERR | libc::POLLNVAL) != 0 {
+                open = false;
+            } else {
+                while Instant::now() < deadline {
+                    // SAFETY: fd is owned by this thread, chunk is writable, and
+                    // the descriptor is nonblocking.
+                    let count = unsafe { libc::read(fd, chunk.as_mut_ptr().cast(), chunk.len()) };
+                    if count == 0 {
+                        open = false;
+                        if index == 0 {
+                            stdout_eof = true;
+                        } else {
+                            stderr_eof = true;
+                        }
+                        break;
+                    }
+                    if count < 0 {
+                        let error = std::io::Error::last_os_error();
+                        if error.kind() == std::io::ErrorKind::Interrupted {
+                            continue;
+                        }
+                        if error.kind() == std::io::ErrorKind::WouldBlock {
+                            break;
+                        }
+                        open = false;
+                        break;
+                    }
+                    let bytes = &chunk[..count as usize];
+                    if index == 0 {
+                        framer.push(bytes);
+                    } else if stderr_bytes.len() < MAX_STDERR {
+                        let take = bytes.len().min(MAX_STDERR - stderr_bytes.len());
+                        stderr_bytes.extend_from_slice(&bytes[..take]);
+                    }
+                }
+            }
+            if index == 0 {
+                stdout_open = open;
+            } else {
+                stderr_open = open;
+            }
+        }
+    }
+    let drained = stdout_eof && stderr_eof;
+    let (sink, truncated) = framer.finish(stdout_eof);
+    let stderr = String::from_utf8_lossy(&stderr_bytes).into_owned();
+    if let Err(error) = sender.send((sink, stderr, truncated || !drained, drained)) {
+        tracing::debug!(%error, "plugin pipe reader result was not received");
+    }
+}
+
+#[cfg(unix)]
+fn set_nonblocking(fd: std::os::fd::RawFd) -> std::io::Result<()> {
+    // SAFETY: fcntl only reads the descriptor flags for this open fd.
+    let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+    if flags < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: fcntl updates flags on the valid owned fd.
+    if unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) } < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+struct OutputFramer<S> {
+    sink: S,
+    truncated: bool,
+    accepting: bool,
+    lines: usize,
+    line: Vec<u8>,
+    oversized: bool,
+}
+
+#[cfg(unix)]
+impl<S: NdjsonSink> OutputFramer<S> {
+    fn new(sink: S) -> Self {
+        Self {
+            sink,
+            truncated: false,
+            accepting: true,
+            lines: 0,
+            line: Vec::with_capacity(MAX_LINE_BYTES.min(8192)),
+            oversized: false,
+        }
+    }
+
+    fn push(&mut self, mut bytes: &[u8]) {
+        while !bytes.is_empty() {
+            let end = bytes
+                .iter()
+                .position(|byte| *byte == b'\n')
+                .map_or(bytes.len(), |i| i + 1);
+            let newline = bytes[end - 1] == b'\n';
+            let remaining = MAX_LINE_BYTES.saturating_sub(self.line.len());
+            if !self.oversized {
+                if end <= remaining {
+                    self.line.extend_from_slice(&bytes[..end]);
+                } else {
+                    self.line.clear();
+                    self.oversized = true;
+                    self.truncated = true;
+                }
+            }
+            bytes = &bytes[end..];
+            if newline {
+                if self.oversized {
+                    self.truncated = true;
+                    self.oversized = false;
+                    self.line.clear();
+                } else if self.lines >= MAX_LINES {
+                    self.truncated = true;
+                    self.line.clear();
+                } else {
+                    deliver_line(
+                        &mut self.sink,
+                        &self.line,
+                        &mut self.accepting,
+                        &mut self.lines,
+                    );
+                    self.truncated |= !self.accepting;
+                    self.line.clear();
+                }
+            }
+        }
+    }
+
+    fn finish(mut self, eof: bool) -> (S, bool) {
+        if eof
+            && !self.oversized
+            && !self.line.is_empty()
+            && self.accepting
+            && self.lines < MAX_LINES
+        {
+            deliver_line(
+                &mut self.sink,
+                &self.line,
+                &mut self.accepting,
+                &mut self.lines,
+            );
+            self.truncated |= !self.accepting;
+        } else if !self.line.is_empty() || self.oversized {
+            self.truncated = true;
+        }
+        (self.sink, self.truncated)
+    }
 }
 
 #[cfg(unix)]
@@ -821,6 +1126,62 @@ pub(crate) fn kill_group(pid: u32) {
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .status();
+}
+
+#[cfg(all(test, unix))]
+mod process_tree_deadline_tests {
+    use super::{PluginError, spawn_ndjson};
+    use std::collections::BTreeMap;
+    use std::time::{Duration, Instant};
+
+    fn run_holding_pipe(which: &str) -> super::PluginRun {
+        let redirection = match which {
+            "stdout" => "2>/dev/null",
+            "stderr" => ">/dev/null",
+            _ => unreachable!(),
+        };
+        let script =
+            format!("setsid sh -c 'sleep 30 & p=$!; sleep 2; kill $p' {redirection} & sleep 0.1");
+        let started = Instant::now();
+        let run = spawn_ndjson(
+            &["sh".into(), "-c".into(), script],
+            &BTreeMap::new(),
+            None,
+            Duration::from_millis(300),
+        )
+        .unwrap();
+        assert!(started.elapsed() < Duration::from_secs(4));
+        run
+    }
+
+    #[test]
+    fn setsid_descendant_holding_stdout_cannot_outlive_pipe_deadline() {
+        let run = run_holding_pipe("stdout");
+        assert!(run.outcome.abandoned);
+        assert!(!run.outcome.drained);
+        assert!(run.outcome.reaped);
+    }
+
+    #[test]
+    fn setsid_descendant_holding_stderr_cannot_outlive_pipe_deadline() {
+        let run = run_holding_pipe("stderr");
+        assert!(run.outcome.abandoned);
+        assert!(!run.outcome.drained);
+        assert!(run.outcome.reaped);
+    }
+
+    #[test]
+    fn timeout_error_remains_a_timeout_after_bounded_tree_cleanup() {
+        let started = Instant::now();
+        let result = spawn_ndjson(
+            &["sh".into(), "-c".into(), "sleep 30".into()],
+            &BTreeMap::new(),
+            None,
+            Duration::from_millis(300),
+        );
+        assert!(matches!(result, Err(PluginError::Timeout(_))));
+        assert!(started.elapsed() < Duration::from_secs(4));
+    }
 }
 
 #[cfg(test)]
