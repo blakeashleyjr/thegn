@@ -85,7 +85,8 @@ fn encoder_builds_v4_and_v6_dump_requests_with_tcp_info_ext() {
 #[test]
 fn decoder_reads_socket_cookie_and_optional_cgroup_attribute() {
     let mut payload = response(AddressFamily::Ipv4, 0);
-    payload[44..52].copy_from_slice(&0x1122_3344_5566_7788_u64.to_ne_bytes());
+    payload[44..48].copy_from_slice(&0x5566_7788_u32.to_ne_bytes());
+    payload[48..52].copy_from_slice(&0x1122_3344_u32.to_ne_bytes());
     payload.extend_from_slice(&12_u16.to_ne_bytes());
     payload.extend_from_slice(&21_u16.to_ne_bytes());
     payload.extend_from_slice(&42_u64.to_ne_bytes());
@@ -105,6 +106,17 @@ fn truncated_cgroup_attribute_decodes_to_none() {
     payload.extend_from_slice(&[1, 2, 3, 4]);
     let row = decode(&payload);
     assert_eq!(row.cgroup_id, None);
+}
+
+#[test]
+fn short_well_framed_cgroup_attribute_preserves_tcp_info() {
+    let mut payload = response(AddressFamily::Ipv4, 136);
+    payload.extend_from_slice(&8_u16.to_ne_bytes());
+    payload.extend_from_slice(&21_u16.to_ne_bytes());
+    payload.extend_from_slice(&42_u32.to_ne_bytes());
+    let row = decode(&payload);
+    assert_eq!(row.cgroup_id, None);
+    assert_eq!(row.info.as_ref().and_then(|info| info.rtt_us), Some(321));
 }
 
 #[test]
