@@ -13,6 +13,8 @@
 
 #[cfg(target_os = "linux")]
 mod base_cpu;
+#[cfg(target_os = "linux")]
+mod base_mem;
 mod battery;
 pub mod collect;
 mod coverage;
