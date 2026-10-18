@@ -198,6 +198,13 @@ fn graph_column_has_ink(surface: &Surface, x: usize) -> bool {
     })
 }
 
+fn graph_column_is_cell_blank(surface: &Surface, x: usize) -> bool {
+    surface.screen_lines().iter().all(|line| {
+        line.visible_cells()
+            .any(|cell| cell.cell_index() == x && cell.str() == " ")
+    })
+}
+
 fn absorb_fixture_core_history(model: &mut CpuModel, frame: &MonitorFrame) {
     for tick in 0..240_u16 {
         let mut sample = frame.clone();
@@ -565,15 +572,27 @@ fn cpu_and_load_history_skip_leading_gaps_hold_interior_gaps_and_reuse_capacity(
     // the sample starts at bucket floor(40 * 240 / 60) = 160.
     assert_eq!(model.cpu_history.len(), 80);
     assert_eq!(model.load_history.len(), 80);
+    assert!(model.cpu_history.capacity() >= 240);
+    assert!(model.load_history.capacity() >= 240);
+    assert!(
+        model.cpu_history[39].is_finite() && model.cpu_history[39] > 0.0,
+        "the held CPU reference must be the real 49 s reading"
+    );
     assert!(
         model.cpu_history[40..48]
             .iter()
-            .all(|value| *value == model.cpu_history[39])
+            .all(|value| *value == model.cpu_history[39]),
+        "CPU must hold the real 49 s reading across interior gaps"
+    );
+    assert!(
+        model.load_history[39].is_finite() && model.load_history[39] > 0.0,
+        "the held load reference must be the real 49 s reading"
     );
     assert!(
         model.load_history[40..48]
             .iter()
-            .all(|value| *value == model.load_history[39])
+            .all(|value| *value == model.load_history[39]),
+        "load must hold the real 49 s reading across interior gaps"
     );
 
     let capacity = (model.cpu_history.capacity(), model.load_history.capacity());
@@ -595,7 +614,7 @@ fn cpu_and_load_history_skip_leading_gaps_hold_interior_gaps_and_reuse_capacity(
         );
     });
     assert!(
-        (0..80).all(|x| !graph_column_has_ink(&surface, x)),
+        (0..80).all(|x| graph_column_is_cell_blank(&surface, x)),
         "the first 160 missing buckets must leave the graph's first 80 braille columns blank"
     );
     assert!(

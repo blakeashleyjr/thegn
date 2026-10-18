@@ -314,6 +314,7 @@ impl CpuModel {
             let values = self.history_buf.hi();
             let raw = self.history_buf.raw_hi();
             let gaps = self.history_buf.gap();
+            slot.reserve(values.len());
             if let Some(first_real) = gaps.iter().position(|gap| !gap) {
                 let mut held = None;
                 for ((value, raw), gap) in values.iter().zip(raw).zip(gaps).skip(first_real) {

@@ -1,5 +1,5 @@
 use super::{OverviewModel, OverviewView};
-use crate::telemetry::{Metric, ScaleMode, TelemetryHistory, Window};
+use crate::telemetry::{ScaleMode, TelemetryHistory, Window};
 use crate::{
     caps::test_override,
     compositor::Rect,
@@ -155,6 +155,13 @@ fn graph_column_has_ink(surface: &Surface, x: usize) -> bool {
     })
 }
 
+fn graph_column_is_cell_blank(surface: &Surface, x: usize) -> bool {
+    surface.screen_lines().iter().all(|line| {
+        line.visible_cells()
+            .any(|cell| cell.cell_index() == x && cell.str() == " ")
+    })
+}
+
 #[test]
 fn empty_overview_demands_its_live_source_collectors() {
     let model = OverviewModel::default();
@@ -186,11 +193,11 @@ fn overview_history_skips_leading_gaps_holds_interior_gaps_and_reuses_capacity()
 
     // With 160 buckets over 60 s, the first sample at 40 s lands at
     // floor(40 * 160 / 60) = 106, leaving 54 buckets in each populated slot.
-    for panel in 0..5 {
-        let slots = &model.sparks[panel];
+    for (panel, slots) in model.sparks.iter().enumerate().take(5) {
         let metric_count = if panel == 4 { 2 } else { 1 };
         for series in slots.iter().take(metric_count) {
             assert_eq!(series.len(), 54, "panel {panel} {series:?}");
+            assert!(series.capacity() >= 160, "panel {panel} {series:?}");
         }
     }
     assert!(model.sparks[5][0].is_empty());
@@ -198,21 +205,29 @@ fn overview_history_skips_leading_gaps_holds_interior_gaps_and_reuses_capacity()
     assert!(
         model.sparks[7]
             .iter()
-            .all(|slots| slots.iter().all(Vec::is_empty))
+            .all(|slots| slots.iter().all(|series| series.is_empty()))
     );
 
     // The samples at 50 s and 51 s are absent; buckets 133 through 137
     // retain the 49 s reading for CPU, Memory, Network, and Disk.
-    for metric in [Metric::Cpu, Metric::Mem, Metric::NetRx, Metric::DiskRead] {
-        let (panel, series) = match metric {
-            Metric::Cpu => (0, 0),
-            Metric::Mem => (2, 0),
-            Metric::NetRx => (3, 0),
-            Metric::DiskRead => (4, 0),
-            _ => unreachable!(),
-        };
+    for (panel, series) in [(0, 0), (1, 0), (2, 0), (3, 0), (4, 0), (4, 1)] {
         let values = &model.sparks[panel][series];
-        assert!(values[27..32].iter().all(|value| *value == values[26]));
+        assert!(
+            values[26].is_finite() && values[26] > 0.0,
+            "panel {panel} series {series}: held reference must be a real 49 s reading"
+        );
+        assert!(
+            values[27..32].iter().all(|value| *value == values[26]),
+            "panel {panel} series {series}: must hold the 49 s reading across interior gaps"
+        );
+    }
+    for (panel, series) in [(3, 0), (4, 0), (4, 1)] {
+        assert!(
+            model.sparks[panel][series][27..32]
+                .iter()
+                .all(|value| *value > 0.0),
+            "panel {panel} series {series}: zero-gap metric must not dip during interior gaps"
+        );
     }
 
     let capacities = model
@@ -242,8 +257,8 @@ fn overview_history_skips_leading_gaps_holds_interior_gaps_and_reuses_capacity()
         );
     });
     assert!(
-        (0..93).all(|x| !graph_column_has_ink(&surface, x)),
-        "the first 106 missing buckets must leave the graph's first 53 braille columns blank"
+        (0..93).all(|x| graph_column_is_cell_blank(&surface, x)),
+        "the 54 samples, right-aligned in 240 dots, leave the graph's first 93 columns blank"
     );
     assert!(
         graph_column_has_ink(&surface, 93),
