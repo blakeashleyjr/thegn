@@ -325,6 +325,58 @@ fn leading_gap_does_not_create_a_history_sample() {
 }
 
 #[test]
+fn unrepresentable_float_metrics_stay_nan_and_nan_painters_stay_blank() {
+    let mut invalid = frame(0, &["scope-invalid-floats"]);
+    let reading = &mut invalid.parts.containers_stats.rows[0];
+    reading.cpu_pct = Some(f64::MAX);
+    reading.io_read_bps = Some(f64::MAX);
+    reading.io_write_bps = Some(-1.0);
+
+    let mut model = ContainersModel::default();
+    model.absorb_frame(&invalid);
+    let slot = model
+        .slots
+        .iter()
+        .find(|slot| slot.id.as_deref() == Some("scope-invalid-floats"))
+        .unwrap();
+    assert!(slot.cpu.is_none(), "unrepresentable CPU must be unknown");
+    assert!(slot.read.is_none(), "unrepresentable I/O must be unknown");
+    let mut ordered = [f32::NAN; super::HISTORY_CAP];
+    assert_eq!(slot.cpu_history.ordered(&mut ordered), 1);
+    assert!(ordered[0].is_nan(), "CPU overflow must remain NaN");
+    assert_eq!(slot.read_history.ordered(&mut ordered), 1);
+    assert!(ordered[0].is_nan(), "I/O overflow must remain NaN");
+    assert_eq!(slot.write_history.ordered(&mut ordered), 1);
+    assert!(ordered[0].is_nan(), "negative I/O must remain NaN");
+    assert_eq!(model.cpu_total.ordered(&mut ordered), 1);
+    assert!(ordered[0].is_nan(), "total overflow must remain NaN");
+    assert_eq!(model.read_total.ordered(&mut ordered), 1);
+    assert!(ordered[0].is_nan(), "I/O total overflow must remain NaN");
+
+    let mut surface = Surface::new(8, 4);
+    let area = Rect::full(8, 4);
+    super::paint_finite_history_runs(
+        &[f32::NAN],
+        thegn_core::theme::RampId::Util,
+        area,
+        true,
+        &mut surface,
+    );
+    super::paint_finite_spark_runs(
+        &[f32::NAN],
+        thegn_core::theme::RampId::Util,
+        area,
+        &mut surface,
+    );
+    assert!(
+        text(&surface)
+            .lines()
+            .all(|line| line.chars().all(|ch| ch == ' ')),
+        "NaN history cells must remain blank"
+    );
+}
+
+#[test]
 fn absent_health_and_unknown_container_metrics_keep_absent_marks() {
     let mut model = ContainersModel::default();
     let mut absent = MonitorFrame::default();

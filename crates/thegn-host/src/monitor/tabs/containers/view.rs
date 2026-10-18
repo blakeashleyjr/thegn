@@ -303,13 +303,12 @@ impl ContainersModel {
             self.read_total.push_held();
             self.write_total.push_held();
         } else {
-            self.latest_cpu = cpu;
+            self.latest_cpu = cpu.filter(|value| value.is_finite() && (*value as f32).is_finite());
             self.latest_memory = memory;
-            self.cpu_total.push(cpu.map_or(f32::NAN, |v| v as f32));
-            self.memory_total
-                .push(memory.map_or(f32::NAN, |v| v as f32));
-            self.read_total.push(read.map_or(f32::NAN, |v| v as f32));
-            self.write_total.push(write.map_or(f32::NAN, |v| v as f32));
+            self.cpu_total.push(history_value(cpu));
+            self.memory_total.push(history_value(memory));
+            self.read_total.push(history_value(read));
+            self.write_total.push(history_value(write));
         }
     }
 }
@@ -318,12 +317,24 @@ fn sum_values(values: impl Iterator<Item = Option<f64>>) -> Option<f64> {
     let mut sum = 0.0;
     let mut found = false;
     for value in values {
-        if let Some(value) = value.filter(|value| value.is_finite() && *value >= 0.0) {
+        if let Some(value) = value.and_then(valid_metric) {
             sum += value;
             found = true;
         }
     }
     found.then_some(sum)
+}
+
+fn valid_metric(value: f64) -> Option<f64> {
+    (value.is_finite() && value >= 0.0 && (value as f32).is_finite()).then_some(value)
+}
+
+fn history_value(value: Option<f64>) -> f32 {
+    value
+        .filter(|value| value.is_finite() && *value >= 0.0)
+        .map(|value| value as f32)
+        .filter(|value| value.is_finite())
+        .unwrap_or(f32::NAN)
 }
 
 fn fill_slot(slot: &mut Slot, row: &ContainerStatsRow) {
@@ -336,20 +347,17 @@ fn fill_slot(slot: &mut Slot, row: &ContainerStatsRow) {
         return;
     }
 
-    slot.cpu = row.cpu_pct.filter(|v| v.is_finite() && *v >= 0.0);
+    slot.cpu = row.cpu_pct.and_then(valid_metric);
     slot.memory = row.mem_current;
     slot.peak = row.mem_peak;
     slot.pids = row.pids;
-    slot.read = row.io_read_bps.filter(|v| v.is_finite() && *v >= 0.0);
-    slot.write = row.io_write_bps.filter(|v| v.is_finite() && *v >= 0.0);
-    slot.cpu_history
-        .push(slot.cpu.map_or(f32::NAN, |v| v as f32));
+    slot.read = row.io_read_bps.and_then(valid_metric);
+    slot.write = row.io_write_bps.and_then(valid_metric);
+    slot.cpu_history.push(history_value(slot.cpu));
     slot.memory_history
         .push(slot.memory.map_or(f32::NAN, |v| v as f32));
-    slot.read_history
-        .push(slot.read.map_or(f32::NAN, |v| v as f32));
-    slot.write_history
-        .push(slot.write.map_or(f32::NAN, |v| v as f32));
+    slot.read_history.push(history_value(slot.read));
+    slot.write_history.push(history_value(slot.write));
 }
 
 pub(in crate::monitor) struct ContainersView<'a> {
