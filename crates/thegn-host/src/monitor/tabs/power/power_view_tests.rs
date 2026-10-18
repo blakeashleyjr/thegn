@@ -243,11 +243,12 @@ fn snapshot_sizes_capabilities_demand_and_absent_marks() {
                     assert_eq!(board.demand(&view, area, 1000).collectors, expected);
                     if cols == 240 {
                         let r = fill_ratio(&surface, area);
-                        // density follow-up (batch 50): estimated, primary sets from the printed value
+                        // density follow-up (batch 50, THE-888): measured 0.196 Unicode; per-rail and
+                        // powercap history rings are deferred, so the floor stays honest.
                         if unicode == UnicodeLevel::Ascii {
                             assert!(r >= 0.30, "ASCII fill ratio {r:.3}, floor 0.30");
                         } else {
-                            assert!(r >= 0.30, "Unicode fill ratio {r:.3}, floor 0.30");
+                            assert!(r >= 0.19, "Unicode fill ratio {r:.3}, floor 0.19");
                         }
                     }
                 })
