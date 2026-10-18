@@ -446,8 +446,31 @@ impl TabView for NetworkView<'_> {
 
 #[cfg(test)]
 mod tests {
-    use super::NetworkModel;
+    use super::{NetworkModel, Ring};
+    use crate::caps::{self, UnicodeLevel};
     use crate::telemetry::{ScaleMode, TelemetryHistory, Window};
+    use termwiz::surface::Surface;
+
+    #[test]
+    fn sparkline_nan_bucket_stays_blank_between_finite_runs() {
+        let mut ring = Ring::new(3);
+        ring.push(0.5);
+        ring.push(f32::NAN);
+        ring.push(0.5);
+        let mut surface = Surface::new(3, 1);
+        caps::test_override::with_unicode(UnicodeLevel::Ascii, || {
+            super::paint::paint_interface_spark(&ring, 1.0, 0, 0, 3, &mut surface);
+        });
+        let screen_lines = surface.screen_lines();
+        let cells: Vec<_> = screen_lines[0]
+            .visible_cells()
+            .map(|cell| cell.str().to_owned())
+            .collect();
+        assert_eq!(cells.len(), 3);
+        assert_ne!(cells[0], " ");
+        assert_eq!(cells[1], " ", "NaN bucket must remain blank");
+        assert_ne!(cells[2], " ");
+    }
 
     #[test]
     fn telemetry_series_storage_stays_warm_after_one_thousand_rebuilds() {
