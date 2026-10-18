@@ -181,12 +181,20 @@ battery source is available. The battery masthead chip expands into this tab.
 The Processes tab lists the heaviest processes by CPU and by memory, with
 thegn's own panes and its pane daemon called out in the `owner` column.
 
+The table fits its default columns to the available width. Today it shows PID,
+owner, CPU%, the CPU bar, RSS, and the sampled command name; tree indentation
+stays inside the command column. The command is the sampled process name, not
+its argument list.
+
 - `c`, `m`, `n`, `p` sort by CPU, memory, name, or PID.
 - `r` reverses the sort direction.
-- `/` opens an incremental filter over process name, PID, and owner (type to
-  narrow, `Backspace` to edit, `Enter` to apply, `Esc` to clear). `Esc` backs
-  out of the filter first — it does not close the monitor while a filter is
-  open.
+- `/` opens an incremental, space-separated AND filter (type to narrow,
+  `Backspace` to edit, `Enter` to apply, `Esc` to clear). A bare word matches
+  process name, PID, or owner. Field terms include `user:blake`, `wt:feat`,
+  `pane:3`, `ctr:web`, `s:D`, `cpu>10`, `mem>1G`, `io>1M`, `age<5m`, and
+  `thr>50`; `!term` negates a term. Unsupported or malformed terms are ignored
+  and listed in the header. `Esc` backs out of the filter first — it does not
+  close the monitor while a filter is open.
 - `t` toggles a tree view grouped by the sampled parent chain. Because the tab
   only keeps the heaviest processes, a child whose parent fell outside that set
   is hoisted to a top-level row and marked with a leading `…`, rather than

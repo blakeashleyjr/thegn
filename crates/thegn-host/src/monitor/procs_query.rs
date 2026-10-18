@@ -194,13 +194,6 @@ impl Query {
     }
 
     /// Terms to display as invalid. Invalid terms are ignored by `matches`.
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "header display of invalid terms lands in batch 47 (tabs/procs.rs)"
-        )
-    )]
     pub(in crate::monitor) fn invalid(&self) -> &[InvalidTerm] {
         &self.invalid
     }

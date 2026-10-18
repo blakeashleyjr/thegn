@@ -2,8 +2,6 @@
 //!
 //! This module is intentionally pure so the renderer can share the same column
 //! boundaries for every row in a frame.
-#![allow(dead_code)] // V-PRC-3 wires this catalogue into the renderer.
-
 use thegn_core::numfmt::{NumFmt, Reading, Unit};
 use thegn_core::viz::{self, UnitFmt};
 
@@ -503,6 +501,7 @@ pub(crate) fn format_bytes(value: Option<u64>) -> String {
     }
 }
 
+#[cfg(test)]
 pub(crate) fn format_time_plus(seconds: Option<f64>) -> String {
     match seconds {
         Some(seconds) if seconds.is_finite() && seconds >= 0.0 => time_plus(seconds),
@@ -510,6 +509,7 @@ pub(crate) fn format_time_plus(seconds: Option<f64>) -> String {
     }
 }
 
+#[cfg(test)]
 fn time_plus(seconds: f64) -> String {
     let total = seconds.floor() as u64;
     let rendered = if total < 3600 {
@@ -536,6 +536,7 @@ fn time_plus(seconds: f64) -> String {
     }
 }
 
+#[cfg(test)]
 pub(crate) fn format_age(seconds: Option<u64>) -> String {
     let fmt = NumFmt::default();
     match seconds {
