@@ -2629,3 +2629,32 @@ fn glyph_scan_error_with_prior_keeps_typed_counts() {
     assert_eq!(row.branch_diff, prior.branch_diff);
     assert!(!clean);
 }
+
+#[test]
+fn glyph_scan_branch_diff_error_preserves_prior_no_base() {
+    let prior = glyph_row(true, 0, 0, Some("feat"), "/repo", 4, 1, None);
+    let (row, clean) = merge_glyph_scan(
+        Some(&prior),
+        Ok(true),
+        Ok(Some((0, 0))),
+        Ok(Some("feat".into())),
+        "/repo".into(),
+        Ok((
+            thegn_svc::git::DiffCount::Exact(4),
+            thegn_svc::git::DiffCount::Exact(1),
+        )),
+        Err(()),
+        Ok(false),
+    );
+
+    assert_eq!(row.branch_diff, None);
+    assert!(!clean);
+}
+
+#[test]
+fn first_scan_row_requires_truthful_dirty_status() {
+    assert!(keep_glyph_scan_row(false, false, true));
+    assert!(keep_glyph_scan_row(false, true, false));
+    assert!(keep_glyph_scan_row(true, false, false));
+    assert!(!keep_glyph_scan_row(false, false, false));
+}

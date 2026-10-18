@@ -3595,31 +3595,43 @@ mod tests {
                 }
                 _ => Vec::new(),
             })
-            .map(|seg| seg.text)
-            .collect::<String>()
+            .collect::<Vec<_>>()
         };
 
-        let binary = render(DiffCount::Binary, DiffCount::Binary);
+        let text =
+            |segs: &[crate::seg::Seg]| segs.iter().map(|seg| seg.text.as_str()).collect::<String>();
+
+        let binary = text(&render(DiffCount::Binary, DiffCount::Binary));
         assert!(binary.contains("bin"), "{binary:?}");
         assert!(!binary.contains("+0"), "{binary:?}");
 
-        let capped = render(DiffCount::Capped, DiffCount::Capped);
+        let capped = text(&render(DiffCount::Capped, DiffCount::Capped));
         assert!(capped.contains("+capped"), "{capped:?}");
         assert!(capped.contains("-capped"), "{capped:?}");
         assert!(!capped.contains("4294967295"), "{capped:?}");
 
-        let exact = render(DiffCount::Exact(42), DiffCount::Exact(7));
+        let exact = text(&render(DiffCount::Exact(42), DiffCount::Exact(7)));
         assert!(exact.contains("+42"), "{exact:?}");
         assert!(exact.contains("-7"), "{exact:?}");
 
         let unavailable = render(DiffCount::Unavailable, DiffCount::Unavailable);
-        assert!(unavailable.contains('?'), "{unavailable:?}");
-        assert!(!unavailable.contains("+0"), "{unavailable:?}");
-        assert!(!unavailable.contains("-0"), "{unavailable:?}");
+        let unavailable_marks = unavailable
+            .iter()
+            .filter(|seg| seg.text == "?" && seg.fg == crate::seg::Tok::Hue(theme::Hue::Amber))
+            .count();
+        assert_eq!(unavailable_marks, 1, "{unavailable:?}");
+        let unavailable_text = text(&unavailable);
+        assert!(!unavailable_text.contains("+0"), "{unavailable_text:?}");
+        assert!(!unavailable_text.contains("-0"), "{unavailable_text:?}");
 
         let partial = render(DiffCount::Exact(3), DiffCount::Unavailable);
-        assert!(partial.contains('?'), "{partial:?}");
-        assert!(!partial.contains("+3"), "{partial:?}");
-        assert!(!partial.contains("-0"), "{partial:?}");
+        let partial_marks = partial
+            .iter()
+            .filter(|seg| seg.text == "?" && seg.fg == crate::seg::Tok::Hue(theme::Hue::Amber))
+            .count();
+        assert_eq!(partial_marks, 1, "{partial:?}");
+        let partial_text = text(&partial);
+        assert!(!partial_text.contains("+3"), "{partial_text:?}");
+        assert!(!partial_text.contains("-0"), "{partial_text:?}");
     }
 }

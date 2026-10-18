@@ -229,6 +229,12 @@ enum TargetState {
 fn target_state(glyphs: Option<&crate::sidebar::GitGlyphs>) -> TargetState {
     match glyphs {
         None => TargetState::Unknown,
+        Some(gl)
+            if gl.add == thegn_svc::git::DiffCount::Unavailable
+                || gl.del == thegn_svc::git::DiffCount::Unavailable =>
+        {
+            TargetState::Unknown
+        }
         Some(gl) if gl.dirty || gl.submodule_dirty => TargetState::Dirty,
         Some(_) => TargetState::Clean,
     }
@@ -733,6 +739,12 @@ mod tests {
             target_state(Some(&GitGlyphs::default())),
             TargetState::Clean
         );
+        let unavailable = GitGlyphs {
+            add: thegn_svc::git::DiffCount::Unavailable,
+            del: thegn_svc::git::DiffCount::Unavailable,
+            ..GitGlyphs::default()
+        };
+        assert_eq!(target_state(Some(&unavailable)), TargetState::Unknown);
         let dirty = GitGlyphs {
             dirty: true,
             ..GitGlyphs::default()

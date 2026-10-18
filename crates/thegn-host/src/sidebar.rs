@@ -4916,7 +4916,12 @@ mod tests {
         let crate::seg::Line::Segs(segs) = line else {
             panic!("detail line is composed from segments")
         };
-        let text = segs.into_iter().map(|seg| seg.text).collect::<String>();
+        let unavailable_marks = segs
+            .iter()
+            .filter(|seg| seg.text == "diff ?" && seg.fg == crate::seg::Tok::Hue(theme::Hue::Amber))
+            .count();
+        assert_eq!(unavailable_marks, 1, "{segs:?}");
+        let text = segs.iter().map(|seg| seg.text.as_str()).collect::<String>();
         assert!(text.contains("diff ?"), "{text:?}");
         assert!(!text.contains("+0"), "{text:?}");
         assert!(!text.contains("-0"), "{text:?}");
