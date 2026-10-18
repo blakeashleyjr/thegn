@@ -9,6 +9,9 @@
 use super::{ProcSnapshotView, ProcSort};
 use thegn_metrics::{ProcOwner, ProcSample, ProcSnapshot};
 
+#[path = "procs_query.rs"]
+pub(in crate::monitor) mod procs_query;
+
 /// Depth cap for the tree walk — cheap insurance against a malformed / cyclic
 /// parent chain (a pid whose ancestry loops back on itself).
 const MAX_DEPTH: usize = 32;
@@ -52,24 +55,42 @@ pub fn owner_label(o: ProcOwner) -> String {
     }
 }
 
-/// Whether a process matches the (already-lowercased) filter fragment: by name,
-/// pid, or owner attribution. An empty filter matches everything.
-fn matches(p: &ProcSample, filter: &str) -> bool {
-    if filter.is_empty() {
-        return true;
+impl procs_query::QueryRow for ProcSample {
+    fn name(&self) -> &str {
+        &self.name
     }
-    if p.name.to_ascii_lowercase().contains(filter) {
-        return true;
+
+    fn pid(&self) -> u32 {
+        self.pid
     }
-    if p.pid.to_string().contains(filter) {
-        return true;
+
+    fn owner_keywords(&self) -> &str {
+        owner_key(self.owner)
     }
-    // Pane(3) → "pane 3" so both "pane" and the id match.
-    let owner = match p.owner {
-        ProcOwner::Pane(n) => format!("pane {n}"),
-        other => owner_key(other).to_string(),
-    };
-    !owner.is_empty() && owner.contains(filter)
+
+    fn cpu_pct(&self) -> Option<f32> {
+        Some(self.cpu_pct)
+    }
+
+    fn rss_bytes(&self) -> Option<u64> {
+        Some(self.rss_bytes)
+    }
+
+    fn age_secs(&self) -> Option<u64> {
+        Some(self.run_secs)
+    }
+
+    fn owner_id(&self) -> Option<u32> {
+        match self.owner {
+            ProcOwner::Pane(id) => Some(id),
+            ProcOwner::Other | ProcOwner::ThegnSelf | ProcOwner::ThegnDaemon => None,
+        }
+    }
+}
+
+/// Whether a process matches the parsed query.
+fn matches(p: &ProcSample, query: &procs_query::Query) -> bool {
+    query.matches(p)
 }
 
 /// Compare two samples by the active sort key in ascending order; the caller
@@ -116,11 +137,10 @@ pub fn rows(snap: &ProcSnapshot, view: ProcSnapshotView) -> Vec<ProcRow> {
         filter,
         tree,
     } = view;
-    let filter = filter.trim().to_ascii_lowercase();
+    let query = procs_query::Query::parse(filter.trim());
 
     if !tree {
-        let mut kept: Vec<&ProcSample> =
-            snap.procs.iter().filter(|p| matches(p, &filter)).collect();
+        let mut kept: Vec<&ProcSample> = snap.procs.iter().filter(|p| matches(p, &query)).collect();
         kept.sort_by(|a, b| {
             let ord = cmp(a, b, sort);
             (if desc { ord.reverse() } else { ord }).then_with(|| a.pid.cmp(&b.pid))
@@ -128,13 +148,18 @@ pub fn rows(snap: &ProcSnapshot, view: ProcSnapshotView) -> Vec<ProcRow> {
         return kept.iter().map(|p| row_of(p, 0, false)).collect();
     }
 
-    tree_rows(snap, sort, desc, &filter)
+    tree_rows(snap, sort, desc, &query)
 }
 
 /// Tree flatten: build children lists over the kept set, DFS from roots in sort
 /// order, re-root anything the walk could not reach (a cycle has no root), apply
 /// the "row or a descendant matches" filter, and cap depth.
-fn tree_rows(snap: &ProcSnapshot, sort: ProcSort, desc: bool, filter: &str) -> Vec<ProcRow> {
+fn tree_rows(
+    snap: &ProcSnapshot,
+    sort: ProcSort,
+    desc: bool,
+    query: &procs_query::Query,
+) -> Vec<ProcRow> {
     use std::collections::HashMap;
 
     let by_pid: HashMap<u32, &ProcSample> = snap.procs.iter().map(|p| (p.pid, p)).collect();
@@ -164,7 +189,7 @@ fn tree_rows(snap: &ProcSnapshot, sort: ProcSort, desc: bool, filter: &str) -> V
 
     // "Keep if it or a descendant matches" — precompute the retained set so the
     // DFS can prune whole subtrees that contain no match.
-    let retained = retained_set(&by_pid, filter);
+    let retained = retained_set(&by_pid, query);
 
     let mut out = Vec::new();
     let mut visited = std::collections::HashSet::new();
@@ -229,16 +254,16 @@ fn walk<'a>(
 /// empty filter keeps everything.
 fn retained_set(
     by_pid: &std::collections::HashMap<u32, &ProcSample>,
-    filter: &str,
+    query: &procs_query::Query,
 ) -> std::collections::HashSet<u32> {
     let mut keep = std::collections::HashSet::new();
-    if filter.is_empty() {
+    if query.is_empty() {
         keep.extend(by_pid.keys().copied());
         return keep;
     }
     // Any matching process pulls in every ancestor within the kept set.
     for p in by_pid.values() {
-        if matches(p, filter) {
+        if matches(p, query) {
             let mut cur = Some(*p);
             let mut guard = 0;
             while let Some(node) = cur {
@@ -432,6 +457,51 @@ mod tests {
             all.iter().map(|r| r.pid).collect::<Vec<_>>(),
             [100, 4242, 200]
         );
+    }
+
+    #[test]
+    fn field_queries_filter_samples_and_unavailable_fields_are_ignored() {
+        let mut firefox = sample(42, None, "firefox", 10.0, 1024_u64.pow(3));
+        firefox.run_secs = 600;
+        let mut editor = sample(420, None, "helix", 55.0, 2 * 1024_u64.pow(3));
+        editor.run_secs = 299;
+        let mut tiny = sample(7, None, "worker", 1.0, 512);
+        tiny.run_secs = 3600;
+        let snapshot = snap(vec![firefox, editor, tiny]);
+
+        assert_eq!(
+            rows(&snapshot, view("cpu>50", false))
+                .iter()
+                .map(|r| r.pid)
+                .collect::<Vec<_>>(),
+            [420]
+        );
+        assert_eq!(
+            rows(&snapshot, view("mem>1G !firefox", false))
+                .iter()
+                .map(|r| r.pid)
+                .collect::<Vec<_>>(),
+            [420]
+        );
+        assert_eq!(
+            rows(&snapshot, view("age<5m", false))
+                .iter()
+                .map(|r| r.pid)
+                .collect::<Vec<_>>(),
+            [420]
+        );
+        assert_eq!(
+            rows(&snapshot, view("pid:42", false))
+                .iter()
+                .map(|r| r.pid)
+                .collect::<Vec<_>>(),
+            [42]
+        );
+
+        let query = procs_query::Query::parse("thr>50");
+        assert_eq!(query.invalid().len(), 1);
+        assert_eq!(query.invalid()[0].reason, "not available yet");
+        assert_eq!(rows(&snapshot, view("thr>50", false)).len(), 3);
     }
 
     #[test]
