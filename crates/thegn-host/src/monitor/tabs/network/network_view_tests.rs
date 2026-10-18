@@ -360,7 +360,7 @@ fn wifi_panel_shows_ssid_masked_bssid_and_signal_without_raw_mac() {
         .into_iter()
         .find(|line| line.contains("wlan0"))
         .expect("Wi-Fi interface row is visible");
-    assert!(missing_row.contains(&format!("{} avg-55", caps::active_glyphs().emdash)));
+    assert!(missing_row.contains(&format!("{} avg -55", caps::active_glyphs().emdash)));
     assert!(!missing_row.contains(" 0 dBm"));
     assert!(missing_model.wifi[0].signal.values[0].is_nan());
 }
@@ -492,7 +492,15 @@ fn warming_interfaces_show_ellipsis_and_demands_are_static_netdev() {
         0,
         &[],
     );
-    let absent_rendered = lines(&absent_surface).join("\n");
+    let absent_lines = lines(&absent_surface);
+    let absent_rendered = absent_lines.join("\n");
+    let absent_throughput = Board::default()
+        .placed(&absent_view, Rect::full(100, 30))
+        .into_iter()
+        .find(|panel| panel.id == THROUGHPUT)
+        .expect("throughput panel remains placed when Netdev is absent")
+        .rect;
+    let absent_rate_row = &absent_lines[absent_throughput.y + 2];
     assert!(
         absent_rendered.contains("root-only"),
         "root-only chip missing: {absent_rendered}"
@@ -503,8 +511,8 @@ fn warming_interfaces_show_ellipsis_and_demands_are_static_netdev() {
             .lines()
             .any(|line| line.contains("eth0") && line.contains("root-only"))
     );
-    assert!(!absent_rendered.contains("… B/s"));
-    assert!(!absent_rendered.contains("…"));
+    assert!(absent_rate_row.contains(caps::glyph(caps::Glyph::Lock)));
+    assert!(!absent_rate_row.contains(caps::active_glyphs().ellipsis));
 }
 
 #[test]
