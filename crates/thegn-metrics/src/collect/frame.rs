@@ -28,6 +28,7 @@ pub struct Parts {
     pub thermal_zone: super::model::thermal_zone::ThermalZonePart,
     pub cpu_idle: super::model::cpu_idle::CpuIdlePart,
     pub cpu_topology: super::model::cpu_topology::CpuTopologyPart,
+    pub filesystems: super::model::filesystems::FilesystemsPart,
 }
 impl Parts {
     pub fn clear(&mut self) {
@@ -51,6 +52,7 @@ impl Parts {
         self.thermal_zone.clear();
         self.cpu_idle.clear();
         self.cpu_topology.clear();
+        self.filesystems.clear();
     }
 }
 
