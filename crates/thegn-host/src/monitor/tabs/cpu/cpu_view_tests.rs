@@ -173,6 +173,31 @@ fn fixture_history() -> TelemetryHistory {
     history
 }
 
+fn sparse_history() -> TelemetryHistory {
+    let mut history = TelemetryHistory::default();
+    for second in 40..60_u64 {
+        let missing_interior_sample = (50..=51).contains(&second);
+        let snap = thegn_metrics::StatsSnapshot {
+            cpu_pct: (!missing_interior_sample).then_some((40 + second % 20) as u8),
+            load_avg: (!missing_interior_sample).then_some((second as f32 / 10.0, 1.0, 0.5)),
+            ..Default::default()
+        };
+        history.push(&snap, second * 1000);
+    }
+    history
+}
+
+fn graph_column_has_ink(surface: &Surface, x: usize) -> bool {
+    surface.screen_lines().iter().any(|line| {
+        line.visible_cells().any(|cell| {
+            cell.cell_index() == x
+                && !cell.str().is_empty()
+                && cell.str() != " "
+                && !cell.str().chars().all(|glyph| glyph as u32 == 0x2800)
+        })
+    })
+}
+
 fn absorb_fixture_core_history(model: &mut CpuModel, frame: &MonitorFrame) {
     for tick in 0..240_u16 {
         let mut sample = frame.clone();
@@ -527,6 +552,59 @@ fn topology_idle_and_history_buffers_keep_capacity_after_warmup() {
             ),
         ),
         caps
+    );
+}
+
+#[test]
+fn cpu_and_load_history_skip_leading_gaps_hold_interior_gaps_and_reuse_capacity() {
+    let history = sparse_history();
+    let mut model = CpuModel::default();
+    model.absorb_history(&history, Window::from_secs(60), ScaleMode::Window, 60_000);
+
+    // With a 60 s window, 240 buckets, and the first real sample at 40 s,
+    // the sample starts at bucket floor(40 * 240 / 60) = 160.
+    assert_eq!(model.cpu_history.len(), 80);
+    assert_eq!(model.load_history.len(), 80);
+    assert!(
+        model.cpu_history[40..48]
+            .iter()
+            .all(|value| *value == model.cpu_history[39])
+    );
+    assert!(
+        model.load_history[40..48]
+            .iter()
+            .all(|value| *value == model.load_history[39])
+    );
+
+    let capacity = (model.cpu_history.capacity(), model.load_history.capacity());
+    for _ in 0..1000 {
+        model.absorb_history(&history, Window::from_secs(60), ScaleMode::Window, 60_000);
+    }
+    assert_eq!(
+        (model.cpu_history.capacity(), model.load_history.capacity()),
+        capacity
+    );
+
+    let mut surface = Surface::new(120, 8);
+    caps::test_override::with_unicode(UnicodeLevel::Full, || {
+        crate::monitor::graphs::paint_history_graph(
+            &model.cpu_history,
+            thegn_core::theme::RampId::Util,
+            Rect::full(120, 8),
+            &mut surface,
+        );
+    });
+    assert!(
+        (0..80).all(|x| !graph_column_has_ink(&surface, x)),
+        "the first 160 missing buckets must leave the graph's first 80 braille columns blank"
+    );
+    assert!(
+        graph_column_has_ink(&surface, 80),
+        "the first CPU sample must begin in the column after the 160 leading buckets"
+    );
+    assert!(
+        graph_column_has_ink(&surface, 119),
+        "the newest CPU sample must reach the graph's last inner column"
     );
 }
 
