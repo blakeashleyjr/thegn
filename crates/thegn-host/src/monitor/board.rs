@@ -119,7 +119,9 @@ impl TabView for LegacyTab {
     fn demand(&self, _panel: PanelId) -> CollectorSet {
         let mut demand = CollectorSet::empty();
         for id in CollectorId::ALL {
-            demand.insert(id);
+            if !id.visible_only() {
+                demand.insert(id);
+            }
         }
         demand
     }

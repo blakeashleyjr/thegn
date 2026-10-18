@@ -31,6 +31,7 @@ pub struct Parts {
     pub filesystems: super::model::filesystems::FilesystemsPart,
     pub gpu_devices: super::model::gpu::GpuDevicesPart,
     pub gpu_engines: super::model::gpu_engines::GpuEnginesPart,
+    pub gpu_clients: super::model::gpu_clients::GpuClientsPart,
 }
 impl Parts {
     pub fn clear(&mut self) {
@@ -57,6 +58,7 @@ impl Parts {
         self.filesystems.clear();
         self.gpu_devices.clear();
         self.gpu_engines.clear();
+        self.gpu_clients.clear();
     }
 }
 

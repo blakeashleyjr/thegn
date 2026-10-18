@@ -134,9 +134,9 @@ fn demand_unions_placed_panels_and_legacy_demands_every_collector() {
     assert!(!demand.collectors.contains(CollectorId::Psi));
 
     let legacy = board.demand(&LegacyTab, area(), 500);
-    assert_eq!(legacy.collectors.len(), CollectorId::ALL.len());
+    assert_eq!(legacy.collectors.len(), CollectorId::ALL.len() - 1);
     for id in CollectorId::ALL {
-        assert!(legacy.collectors.contains(id));
+        assert_eq!(legacy.collectors.contains(id), !id.visible_only());
     }
 }
 
