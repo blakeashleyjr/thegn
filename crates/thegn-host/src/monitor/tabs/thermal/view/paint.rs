@@ -461,7 +461,12 @@ pub(super) fn heatmap(
         );
         return;
     }
-    let label_width = "core 15 ".len();
+    let braille = crate::monitor::graphs::table().braille;
+    let label_width = if braille {
+        "c00/01 ".len()
+    } else {
+        "core 15 ".len()
+    };
     let graph_width = rect.cols.saturating_sub(label_width);
     let display_width = graph_width.min(HISTORY_CAP);
     let mut values = [[f32::NAN; HISTORY_CAP]; 16];
@@ -490,15 +495,14 @@ pub(super) fn heatmap(
         RampId::Temp,
         &crate::chrome::palette_snapshot(),
     );
-    for index in 0..history.len().min(rect.rows) {
-        put(
-            grid,
-            rect,
-            0,
-            index,
-            &format!("core {index:02} "),
-            Tok::Slot(S::Dim),
-        );
+    let rows_emitted = graph.lines.len().min(rect.rows);
+    for index in 0..rows_emitted {
+        let label = if braille {
+            format!("c{:02}/{:02} ", index * 2, index * 2 + 1)
+        } else {
+            format!("core {index:02} ")
+        };
+        put(grid, rect, 0, index, &label, Tok::Slot(S::Dim));
     }
     draw_graph(
         grid,
