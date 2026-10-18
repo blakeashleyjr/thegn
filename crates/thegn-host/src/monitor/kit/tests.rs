@@ -819,7 +819,10 @@ fn table_zero_dot_uses_active_marks() {
 #[test]
 fn emit_nerfs_a_wide_destination_cell_at_the_left_edge() {
     let mut surface = Surface::new(6, 1);
-    surface.add_change(Change::CursorPosition { x: 2, y: 0 });
+    surface.add_change(Change::CursorPosition {
+        x: termwiz::surface::Position::Absolute(2),
+        y: termwiz::surface::Position::Absolute(0),
+    });
     surface.add_change(Change::Text("界".into()));
 
     let mut grid = CellGrid::new(1, 1);
