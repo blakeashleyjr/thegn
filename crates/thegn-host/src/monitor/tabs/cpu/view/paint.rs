@@ -17,7 +17,7 @@ use crate::{
 use termwiz::surface::Surface;
 use thegn_core::{numfmt::NumFmt, theme::RampId};
 use thegn_metrics::collect::{
-    health::Health,
+    health::{Absent, Health},
     model::{cpu_freq::CpuFreqPart, cpu_sched::CpuSchedPart, cpu_stat::CpuStatPart},
 };
 
@@ -83,25 +83,19 @@ fn paint_heat_panel(
     if !total {
         let core_count = rows.len().min(area.cols);
         if core_count == 0 {
-            body.put_str(
-                0,
-                0,
-                mark(if health == Health::Ok {
-                    Health::Ok
-                } else {
-                    health
-                }),
-                CellStyle::default(),
-            );
+            body.put_str(0, 0, mark(health), CellStyle::default());
             return;
         }
         for (index, core) in rows.iter().take(core_count).enumerate() {
             let left = index * area.cols / core_count;
             let right = (index + 1) * area.cols / core_count;
             let busy = core.share.map(|share| share.busy);
-            let level = busy.map_or(0, |value| (value.saturating_mul(7) / 1000) as usize);
-            let glyph = caps::raster_table().hbar8[level.min(7)];
-            let color = style(Tok::Heat((level / 2).min(4) as u8));
+            let level = busy.map(|value| value.min(1000));
+            let missing = if core.online {
+                health
+            } else {
+                Health::Absent(Absent::NoHardware)
+            };
             let id = format!("{}", core.id);
             if area.rows > 0 {
                 body.put_str(
@@ -114,84 +108,88 @@ fn paint_heat_panel(
                     },
                 );
             }
-            for y in 1..area.rows {
-                for x in left..right {
-                    body.put(
-                        x,
-                        y,
-                        CellStyle {
-                            ch: glyph,
-                            fg: color,
-                            ..CellStyle::default()
-                        },
-                    );
+            let Some(level) = level else {
+                body.put_str(
+                    left,
+                    area.rows.saturating_sub(1),
+                    mark(missing),
+                    CellStyle::default(),
+                );
+                continue;
+            };
+            let height = area.rows.saturating_sub(1);
+            let scaled = height.saturating_mul(usize::from(level));
+            let filled = scaled / 1000;
+            let partial = (scaled % 1000).saturating_mul(7) / 1000;
+            let color = style(Tok::Heat((usize::from(level) / 200).min(4) as u8));
+            for offset in 0..height {
+                let y = area.rows - 1 - offset;
+                let glyph = if offset < filled {
+                    Some(caps::raster_table().hbar8[7])
+                } else if offset == filled && partial > 0 {
+                    Some(caps::raster_table().hbar8[partial - 1])
+                } else {
+                    None
+                };
+                if let Some(glyph) = glyph {
+                    for x in left..right {
+                        body.put(
+                            x,
+                            y,
+                            CellStyle {
+                                ch: glyph,
+                                fg: color,
+                                ..CellStyle::default()
+                            },
+                        );
+                    }
                 }
             }
         }
         return;
     }
     let mut y = 0;
-    if total {
-        let label = "total";
-        body.put_str(0, y, label, CellStyle::default());
-        let value = part.total.map(|share| f32::from(share.busy) / 1000.0);
-        if let Some(value) = value {
-            let width = area.cols.saturating_sub(26);
-            let mut gauge = CellGrid::new(width, 1);
-            Meter::default().paint(
-                &mut gauge,
-                Rect::full(width, 1),
-                MeterSpec {
-                    value,
-                    warn: 0.7,
-                    crit: 0.9,
-                    ramp: RampId::Util,
-                    label: false,
-                    fmt: NumFmt::default(),
-                },
-            );
-            for x in 0..width {
-                if let Some(cell) = gauge.get(x, 0) {
-                    body.put(7 + x, y, cell);
-                }
+    let label = "total";
+    body.put_str(0, y, label, CellStyle::default());
+    let value = part.total.map(|share| f32::from(share.busy) / 1000.0);
+    if let Some(value) = value {
+        let width = area.cols.saturating_sub(26);
+        let mut gauge = CellGrid::new(width, 1);
+        Meter::default().paint(
+            &mut gauge,
+            Rect::full(width, 1),
+            MeterSpec {
+                value,
+                warn: 0.7,
+                crit: 0.9,
+                ramp: RampId::Util,
+                label: false,
+                fmt: NumFmt::default(),
+            },
+        );
+        for x in 0..width {
+            if let Some(cell) = gauge.get(x, 0) {
+                body.put(7 + x, y, cell);
             }
-            let modes = format!(
-                "{:>3}% io{:>2}% st{:>2}%",
-                (value * 100.0).round() as u8,
-                part.total.map_or(0, |share| share.iowait / 10),
-                part.total.map_or(0, |share| share.steal / 10)
-            );
-            body.put_str(
-                area.cols.saturating_sub(modes.len()),
-                y,
-                &modes,
-                CellStyle::default(),
-            );
-        } else {
-            body.put_str(
-                7.min(area.cols),
-                y,
-                mark(if health == Health::Ok {
-                    Health::Ok
-                } else {
-                    health
-                }),
-                CellStyle::default(),
-            );
         }
-        y += 1;
-    }
-    if rows.is_empty() {
+        let modes = format!(
+            "{:>3}% io{:>2}% st{:>2}%",
+            (value * 100.0).round() as u8,
+            part.total.map_or(0, |share| share.iowait / 10),
+            part.total.map_or(0, |share| share.steal / 10)
+        );
         body.put_str(
-            0,
+            area.cols.saturating_sub(modes.len()),
             y,
-            mark(if health == Health::Ok {
-                Health::Ok
-            } else {
-                health
-            }),
+            &modes,
             CellStyle::default(),
         );
+    } else {
+        body.put_str(7.min(area.cols), y, mark(health), CellStyle::default());
+    }
+    y += 1;
+    if rows.is_empty() {
+        body.put_str(0, y, mark(health), CellStyle::default());
         return;
     }
     let visible = area.rows.saturating_sub(y).min(rows.len());
@@ -208,8 +206,13 @@ fn paint_heat_panel(
             },
         );
         let start = 6.min(area.cols);
+        let missing = if core.online {
+            Health::Warming
+        } else {
+            Health::Absent(Absent::NoHardware)
+        };
         let suffix = core.share.map_or_else(
-            || mark(Health::Warming).to_owned(),
+            || mark(missing).to_owned(),
             |share| {
                 format!(
                     "{:>3}% io{:>2}% st{:>2}%",
@@ -248,16 +251,16 @@ fn paint_heat_panel(
                 CellStyle::default(),
             );
         } else {
-            body.put_str(start, y, mark(Health::Warming), CellStyle::default());
+            body.put_str(start, y, mark(missing), CellStyle::default());
         }
     }
 }
 
 fn mark(health: Health) -> &'static str {
     match health {
-        Health::Absent(_) => caps::glyph(Glyph::Lock),
-        Health::Warming | Health::Failing { .. } => caps::active_glyphs().ellipsis,
-        Health::Ok => caps::active_glyphs().emdash,
+        Health::Absent(Absent::NoPermission) => caps::glyph(Glyph::Lock),
+        Health::Absent(_) | Health::Failing { .. } | Health::Ok => caps::active_glyphs().emdash,
+        Health::Warming => caps::active_glyphs().ellipsis,
     }
 }
 
@@ -267,14 +270,11 @@ fn paint_freq(grid: &mut CellGrid, rect: Rect, part: &CpuFreqPart, health: Healt
     if area.cols == 0 || area.rows == 0 {
         return;
     }
-    let missing = if health == Health::Ok {
-        Health::Ok
-    } else {
-        health
-    };
+    let missing = health;
     let profile = part
         .power
         .platform_profile
+        .as_ref()
         .map(|token| token.as_str())
         .unwrap_or(mark(missing));
     let profile_line = format!("profile {profile}");
@@ -284,11 +284,7 @@ fn paint_freq(grid: &mut CellGrid, rect: Rect, part: &CpuFreqPart, health: Healt
         body.put_str(
             0,
             1.min(area.rows.saturating_sub(1)),
-            mark(if health == Health::Ok {
-                Health::Ok
-            } else {
-                health
-            }),
+            mark(health),
             CellStyle::default(),
         );
         return;
@@ -302,10 +298,12 @@ fn paint_freq(grid: &mut CellGrid, rect: Rect, part: &CpuFreqPart, health: Healt
             .unwrap_or_else(|| mark(missing).to_owned());
         let governor = policy
             .governor
+            .as_ref()
             .map(|token| token.as_str())
             .unwrap_or(mark(missing));
         let epp = policy
             .epp
+            .as_ref()
             .map(|token| token.as_str())
             .unwrap_or(mark(missing));
         let minimum = min
@@ -435,10 +433,15 @@ fn paint_sched(grid: &mut CellGrid, rect: Rect, part: &CpuSchedPart, health: Hea
     }
     for (row, core) in part.cores.iter().take(visible).enumerate() {
         let id = format!("CPU{:02}", core.id);
+        let missing = if core.online {
+            health
+        } else {
+            Health::Absent(Absent::NoHardware)
+        };
         let wait = core
             .run_queue_wait_ms_per_s
             .map(|v| format!("{v:.2} ms/s"))
-            .unwrap_or_else(|| mark(health).to_owned());
+            .unwrap_or_else(|| mark(missing).to_owned());
         let line = format!("{id} {wait}");
         body.put_str(0, row, &line, CellStyle::default());
         if let Some(wait) = core.run_queue_wait_ms_per_s {

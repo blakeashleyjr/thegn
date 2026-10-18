@@ -8,7 +8,11 @@ use crate::{
     },
 };
 use thegn_core::numfmt::{NumFmt, Reading, Unit};
-use thegn_metrics::collect::{health::Health, model::cpu_irq::CpuIrqPart};
+use thegn_metrics::collect::parse::{interrupts, softirqs};
+use thegn_metrics::collect::{
+    health::{Absent, Health},
+    model::cpu_irq::CpuIrqPart,
+};
 
 pub(super) fn paint_irq(grid: &mut CellGrid, rect: Rect, part: &CpuIrqPart, health: Health) {
     let area = {
@@ -27,9 +31,13 @@ pub(super) fn paint_irq(grid: &mut CellGrid, rect: Rect, part: &CpuIrqPart, heal
         .softirq_top
         .iter()
         .filter_map(|entry| {
-            entry
-                .total_per_s
-                .map(|rate| (format!("softirq #{:016x}", entry.name_hash), Some(rate)))
+            let rate = entry.total_per_s?;
+            let name = softirqs::TYPES
+                .iter()
+                .find(|name| interrupts::name_hash(name) == entry.name_hash)
+                .map(|name| String::from_utf8_lossy(name).into_owned())
+                .unwrap_or_else(|| mark(Health::Absent(Absent::NotImplemented)).to_owned());
+            Some((name, Some(rate)))
         })
         .collect();
     for (name, field) in [
@@ -55,11 +63,7 @@ pub(super) fn paint_irq(grid: &mut CellGrid, rect: Rect, part: &CpuIrqPart, heal
             .sum::<f64>();
         values.push((name.to_owned(), seen.then_some(rate)));
     }
-    let missing = if health == Health::Ok {
-        Health::Ok
-    } else {
-        health
-    };
+    let missing = health;
     let cells: Vec<[TableCell<'_>; 2]> = values
         .iter()
         .map(|(name, rate)| {
