@@ -165,7 +165,7 @@ fn byte_stream_corpus_matches_messages_and_reject_classes() {
                     .trim()
                     .chars()
                     .take(200)
-                    .collect()
+                    .collect::<String>()
             })
         })
         .collect();
@@ -200,7 +200,7 @@ fn byte_stream_corpus_matches_messages_and_reject_classes() {
 #[test]
 fn response_frame_is_one_shot_junk_but_a_resident_response() {
     let line = br#"{"id":1,"result":1}"#;
-    let argv = shell_stream(&[line, b"\n"].concat());
+    let argv = shell_stream(&[&line[..], b"\n"].concat());
 
     let one_shot = one_shot(&argv);
     let (messages, resident_junk, responses) = resident_events(&argv);
