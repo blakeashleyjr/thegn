@@ -32,9 +32,10 @@ rather than clipping the tab you are on.
 
 Tabs only appear when their source is available — no battery means no Power
 tab, and the GPU tab appears when a GPU reports utilisation. AMD cards and APUs
-use sysfs, NVIDIA uses `nvidia-smi`, and Apple silicon uses its system GPU
-reader. A metric that disappears while you are looking at it (an unplugged
-battery, an unmounted disk) moves you to a tab that still has something to show.
+use sysfs, NVIDIA uses NVML when its library is installed and falls back to
+`nvidia-smi`, and Apple silicon uses its system GPU reader. A metric that
+disappears while you are looking at it (an unplugged battery, an unmounted
+disk) moves you to a tab that still has something to show.
 
 On **Apple silicon**, temperatures come from the machine's HID thermal sensors
 rather than the SMC keys that only exist on Intel Macs — so the temperature tab
@@ -169,6 +170,9 @@ memory is shared system memory and is labelled `gpu mem (shared)`. The GPU
 masthead chip expands into this tab. When several cards are available, it shows
 the busiest awake card. Runtime-suspended cards are not woken to sample them
 and read as 0% utilisation.
+
+On NVIDIA, the masthead uses NVML in process when `libnvidia-ml.so.1` is
+installed; otherwise it reads through `nvidia-smi`.
 
 ## Power
 
