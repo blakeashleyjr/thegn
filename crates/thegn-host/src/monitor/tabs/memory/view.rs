@@ -1341,7 +1341,7 @@ fn draw_area_runs(
     grid: &mut CellGrid,
     chart: Rect,
     values: &[f32],
-    table: viz_raster::RasterTable,
+    table: &viz_raster::RasterTable,
     ramp: RampId,
 ) {
     let samples_per_cell = if table.braille { 2 } else { 1 };
