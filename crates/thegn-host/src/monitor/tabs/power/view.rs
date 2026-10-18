@@ -72,8 +72,8 @@ pub(in crate::monitor) struct PowerModel {
     pub(super) eta_hours: Option<f64>,
     pub(super) session: SessionEnergy,
     ewma: Ewma,
-    history: Vec<f32>,
     rail_history: [Vec<f32>; 5],
+    rail_current: [Option<f32>; 5],
     telemetry_battery_history: Vec<f32>,
     telemetry_battery_power_history: Vec<f32>,
     telemetry_series: PowerSeriesBuf,
@@ -208,25 +208,38 @@ impl PowerModel {
             row.active = false;
         }
         for zone in frame.parts.powercap.zones.iter().take(INSTANCE_CAP) {
+            if let Some(index) = self
+                .zones
+                .iter()
+                .position(|row| row.name == zone.name.as_ref() && row.domain == Some(zone.domain))
+            {
+                let row = &mut self.zones[index];
+                row.active = true;
+                row.watts = zone.watts.filter(|value| value.is_finite());
+                if let Some(watts) = row.watts {
+                    push_history(&mut row.history, watts);
+                }
+            }
+        }
+        for zone in frame.parts.powercap.zones.iter().take(INSTANCE_CAP) {
+            if self.zones.iter().any(|row| {
+                row.active && row.name == zone.name.as_ref() && row.domain == Some(zone.domain)
+            }) {
+                continue;
+            }
             if self.zones.capacity() == 0 {
                 self.zones.reserve_exact(INSTANCE_CAP);
             }
-            let index = self
-                .zones
-                .iter()
-                .position(|row| row.name == zone.name.as_ref() && row.domain == Some(zone.domain));
-            let index = match index {
-                Some(index) => index,
-                None if self.zones.len() < INSTANCE_CAP => {
-                    self.zones.push(ZoneRow::default());
-                    self.zones.len() - 1
-                }
-                None => match self.zones.iter().position(|row| !row.active) {
-                    Some(index) => index,
-                    None => continue,
-                },
+            let index = if self.zones.len() < INSTANCE_CAP {
+                self.zones.push(ZoneRow::default());
+                self.zones.len() - 1
+            } else if let Some(index) = self.zones.iter().position(|row| !row.active) {
+                index
+            } else {
+                continue;
             };
             let row = &mut self.zones[index];
+            row.history.clear();
             row.name.clear();
             row.name.push_str(&zone.name);
             row.domain = Some(zone.domain);
@@ -245,6 +258,7 @@ impl PowerModel {
         self.core_w = None;
         self.system_w = None;
         self.stapm_limit_w = None;
+        let mut decoded_smu = false;
         for card in &frame.parts.amd_smu.cards {
             if !matches!(
                 card.decoded,
@@ -252,6 +266,7 @@ impl PowerModel {
             ) {
                 continue;
             }
+            decoded_smu = true;
             let metrics = &card.metrics;
             self.socket_w = self.socket_w.or_else(|| metric_watts(metrics.power_socket));
             self.apu_w = self.apu_w.or_else(|| metric_watts(metrics.power_apu));
@@ -265,18 +280,23 @@ impl PowerModel {
                     .map(|watts| watts as f32)
             });
         }
-        for (slot, value) in self.rail_history.iter_mut().zip([
+        self.rail_current = [
             self.socket_w,
             self.apu_w,
             self.core_w,
             self.gfx_w,
             self.system_w,
-        ]) {
+        ];
+        if !decoded_smu {
+            for history in &mut self.rail_history {
+                history.clear();
+            }
+        }
+        for (slot, value) in self.rail_history.iter_mut().zip(self.rail_current) {
             if let Some(watts) = value {
                 push_history(slot, watts);
             }
         }
-        let socket_history_w = self.socket_w;
         self.socket_w = self.socket_w.or_else(|| {
             self.zones
                 .iter()
@@ -300,9 +320,6 @@ impl PowerModel {
         self.session.update(frame.at_ms, ac_state, session_watts);
         self.session_previous = session_watts.map(|watts| (frame.at_ms, watts));
         self.session_ac = ac_state;
-        if let Some(watts) = socket_history_w {
-            push_history(&mut self.history, watts);
-        }
     }
     pub(in crate::monitor) fn absorb_history(
         &mut self,
@@ -385,7 +402,7 @@ impl PowerModel {
     }
     #[cfg(test)]
     pub(in crate::monitor) fn history_capacity(&self) -> usize {
-        self.history.capacity()
+        self.rail_history[0].capacity()
     }
     #[cfg(test)]
     fn series_storage(&self) -> (usize, usize, usize) {
@@ -416,8 +433,25 @@ fn rail_ceiling(model: &PowerModel) -> f32 {
     if let Some(limit) = model.stapm_limit_w {
         return limit;
     }
-    let peak = model.history.iter().copied().fold(0.0_f32, f32::max);
+    let peak = rail_drawn_peak(model);
     (peak.max(30.0) / 10.0).ceil() * 10.0
+}
+fn rail_drawn_peak(model: &PowerModel) -> f32 {
+    model
+        .rail_history
+        .iter()
+        .zip(model.rail_current)
+        .filter(|(_, reading)| reading.is_some())
+        .flat_map(|(history, _)| history.iter().copied())
+        .chain(
+            model
+                .zones
+                .iter()
+                .filter(|zone| zone.active)
+                .flat_map(|zone| zone.history.iter().copied()),
+        )
+        .filter(|value| value.is_finite())
+        .fold(0.0_f32, f32::max)
 }
 fn draw_graph_label(surface: &mut Surface, x: usize, y: usize, width: usize, label: &str) {
     let line = crate::seg::Line::segs(vec![crate::seg::seg(
@@ -448,7 +482,7 @@ fn draw_history_label(model: &PowerModel) -> String {
 }
 fn rail_title(model: &PowerModel) -> String {
     let ceiling = rail_ceiling(model);
-    let peak = model.history.iter().copied().fold(0.0_f32, f32::max);
+    let peak = rail_drawn_peak(model);
     match model.stapm_limit_w {
         Some(_) if peak > ceiling => {
             format!("Power rails ({ceiling:.0} W STAPM; peak {peak:.0} W)")
@@ -760,7 +794,10 @@ impl TabView for PowerView<'_> {
                 .0
                 .rail_history
                 .iter()
-                .filter(|history| !history.is_empty())
+                .enumerate()
+                .filter(|(index, history)| {
+                    self.0.rail_current[*index].is_some() && !history.is_empty()
+                })
                 .count()
                 + self
                     .0
@@ -769,20 +806,24 @@ impl TabView for PowerView<'_> {
                     .filter(|zone| zone.active && !zone.history.is_empty())
                     .count();
             if band_count > 0 {
-                let plot_rows = graph_rect.rows / band_count;
+                let drawn_bands = band_count.min(graph_rect.rows / 2);
+                let plot_rows = graph_rect.rows / drawn_bands;
                 let ceiling = rail_ceiling(self.0);
                 let mut band = 0;
                 for (index, history) in self.0.rail_history.iter().enumerate() {
-                    if history.is_empty() || plot_rows == 0 {
+                    if history.is_empty()
+                        || self.0.rail_current[index].is_none()
+                        || band >= drawn_bands
+                    {
                         continue;
                     }
                     let labels = ["socket", "APU", "core", "gfx", "system"];
                     let values = [
-                        self.0.socket_w,
-                        self.0.apu_w,
-                        self.0.core_w,
-                        self.0.gfx_w,
-                        self.0.system_w,
+                        self.0.rail_current[0],
+                        self.0.rail_current[1],
+                        self.0.rail_current[2],
+                        self.0.rail_current[3],
+                        self.0.rail_current[4],
                     ];
                     let band_y = graph_rect.y + band * plot_rows;
                     let mut normalized = [0.0_f32; HISTORY_CAP];
@@ -820,7 +861,7 @@ impl TabView for PowerView<'_> {
                     .iter()
                     .filter(|zone| zone.active && !zone.history.is_empty())
                 {
-                    if plot_rows == 0 {
+                    if band >= drawn_bands {
                         break;
                     }
                     let band_y = graph_rect.y + band * plot_rows;
