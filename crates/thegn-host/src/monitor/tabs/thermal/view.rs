@@ -5,14 +5,13 @@ use crate::{
         kit::{emit::Emitter, grid::CellGrid, panel},
         layout::{Node, PanelId, PanelSpec, Placed, Size, Variant, VariantKind},
     },
-    telemetry::{Metric, ScaleMode, SeriesReq, TelemetryHistory, Window},
+    telemetry::{Metric, ScaleMode, SeriesBuf, SeriesReq, TelemetryHistory, Window},
 };
 use termwiz::surface::Surface;
 use thegn_core::series::Agg;
 use thegn_metrics::collect::{
     CollectorId, CollectorSet,
     frame::MonitorFrame,
-    health::Health,
     model::{
         amd_smu::AmdSmuStatus,
         hwmon::{ChipGroup, SensorKind, SensorRole},
@@ -80,7 +79,7 @@ const SPECS: [PanelSpec; 6] = [
     },
 ];
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone)]
 pub(in crate::monitor) struct ThermalModel {
     sensors: Vec<SensorRow>,
     zones: Vec<ZoneRow>,
@@ -88,7 +87,6 @@ pub(in crate::monitor) struct ThermalModel {
     core_layout_generation: Option<u64>,
     core_source_hwmon: bool,
     core_panel_present: bool,
-    smu_cores_seen: bool,
     core_history: [[f32; HISTORY_CAP]; 16],
     core_history_len: [usize; 16],
     core_history_next: [usize; 16],
@@ -96,12 +94,16 @@ pub(in crate::monitor) struct ThermalModel {
     edge_c: Option<f32>,
     hotspot_c: Option<f32>,
     soc_c: Option<f32>,
+    gpu_history: [f32; HISTORY_CAP],
+    gpu_history_len: usize,
+    gpu_history_next: usize,
     socket_w: Option<f32>,
     package_history: [f32; HISTORY_CAP],
     package_history_len: usize,
     package_history_next: usize,
     package_history_key: Option<String>,
     temp_history: Vec<f32>,
+    history_buf: SeriesBuf,
 }
 
 impl Default for ThermalModel {
@@ -113,7 +115,6 @@ impl Default for ThermalModel {
             core_layout_generation: None,
             core_source_hwmon: false,
             core_panel_present: false,
-            smu_cores_seen: false,
             core_history: [[0.0; HISTORY_CAP]; 16],
             core_history_len: [0; 16],
             core_history_next: [0; 16],
@@ -121,12 +122,16 @@ impl Default for ThermalModel {
             edge_c: None,
             hotspot_c: None,
             soc_c: None,
+            gpu_history: [0.0; HISTORY_CAP],
+            gpu_history_len: 0,
+            gpu_history_next: 0,
             socket_w: None,
             package_history: [0.0; HISTORY_CAP],
             package_history_len: 0,
             package_history_next: 0,
             package_history_key: None,
             temp_history: Vec::with_capacity(HISTORY_CAP),
+            history_buf: SeriesBuf::default(),
         }
     }
 }
@@ -180,19 +185,23 @@ impl ThermalModel {
         scale: ScaleMode,
         now_ms: u64,
     ) {
-        let series = history.series(&SeriesReq {
-            metric: Metric::Temp,
-            window,
-            scale: TelemetryHistory::scale_for(Metric::Temp, scale),
-            buckets: HISTORY_CAP,
-            agg: Agg::Max,
-            now_ms,
-        });
-        if series.empty {
-            self.temp_history.clear();
+        history.series_into(
+            &SeriesReq {
+                metric: Metric::Temp,
+                window,
+                scale: TelemetryHistory::scale_for(Metric::Temp, scale),
+                buckets: HISTORY_CAP,
+                agg: Agg::Max,
+                now_ms,
+            },
+            &mut self.history_buf,
+        );
+        self.temp_history.clear();
+        if self.history_buf.empty() {
             return;
         }
-        self.temp_history.clone_from(&series.raw_hi);
+        self.temp_history
+            .extend_from_slice(self.history_buf.raw_hi());
     }
 
     pub(in crate::monitor) fn absorb_frame(&mut self, frame: &MonitorFrame) {
@@ -362,9 +371,6 @@ impl ThermalModel {
                     .map(|value| f32::from(value) / 100.0)
                     .filter(|value| thermal::plausible_range(*value))
             });
-            if card_cores.iter().any(Option::is_some) {
-                self.smu_cores_seen = true;
-            }
             if card_cores.iter().any(Option::is_some) && smu_cores.is_none() {
                 smu_cores = Some(card_cores);
             }
@@ -400,16 +406,24 @@ impl ThermalModel {
                 self.socket_w = metrics.power_socket.map(|value| value as f32 / 1000.0);
             }
         }
-        self.core_panel_present = self.core_source_hwmon
-            || (self.smu_cores_seen
-                && !matches!(frame.health[CollectorId::AmdSmu.index()], Health::Absent(_)));
+        // temperature_core is present in AMD gpu_metrics format 2 content 0-2
+        // and format 3 content 0; format 1 and other revisions are dGPU layouts.
+        let smu_apu_layout = frame.parts.amd_smu.cards.iter().any(|card| {
+            matches!(
+                card.decoded,
+                thegn_metrics::collect::model::amd_smu::AmdSmuStatus::Decoded(
+                    thegn_metrics::collect::parse::amd_gpu_metrics::Decoded::Full
+                        | thegn_metrics::collect::parse::amd_gpu_metrics::Decoded::Truncated
+                )
+            ) && card.metrics.header.is_some_and(|header| {
+                matches!((header.format, header.content), (2, 0..=2) | (3, 0))
+            })
+        });
+        self.core_panel_present = self.core_source_hwmon || smu_apu_layout;
         if !self.core_source_hwmon
             && let Some(cores) = smu_cores
         {
             self.cores = cores;
-            self.smu_cores_seen = true;
-            self.core_panel_present =
-                !matches!(frame.health[CollectorId::AmdSmu.index()], Health::Absent(_));
         }
         for (index, temp) in self.cores.iter().enumerate() {
             if temp.is_none() && self.core_history_len[index] == 0 {
@@ -420,6 +434,18 @@ impl ThermalModel {
             self.core_history_len[index] = self.core_history_len[index]
                 .saturating_add(1)
                 .min(HISTORY_CAP);
+        }
+        let gpu_temp = self.edge_c.or(self.gfx_c).or_else(|| {
+            self.sensors
+                .iter()
+                .filter(|row| row.group == ChipGroup::Gpu)
+                .filter_map(|row| row.temp_c)
+                .max_by(f32::total_cmp)
+        });
+        if gpu_temp.is_some() || self.gpu_history_len > 0 {
+            self.gpu_history[self.gpu_history_next] = gpu_temp.unwrap_or(f32::NAN);
+            self.gpu_history_next = (self.gpu_history_next + 1) % HISTORY_CAP;
+            self.gpu_history_len = self.gpu_history_len.saturating_add(1).min(HISTORY_CAP);
         }
     }
 
@@ -486,21 +512,61 @@ fn is_package_label(label: &str) -> bool {
     package_label_rank(label) != usize::MAX
 }
 
-fn history_graph_rect(rect: Rect, inner: Rect, len: usize, braille: bool) -> Rect {
-    let used = if braille { len.div_ceil(2) } else { len };
-    let cols = used.min(inner.cols);
-    Rect {
-        x: rect
-            .x
-            .saturating_add(inner.x)
-            .saturating_add(inner.cols.saturating_sub(cols)),
-        y: rect.y.saturating_add(inner.y).saturating_add(5),
-        cols,
-        rows: inner.rows.saturating_sub(5),
+mod paint;
+
+fn paint_history_runs(
+    normalized: &[f32],
+    count: usize,
+    plot: Rect,
+    braille: bool,
+    surface: &mut Surface,
+) {
+    let count = count.min(normalized.len());
+    let graph_rect = crate::monitor::kit::history_rect::graph_rect(plot, count, braille);
+    let slots = if braille {
+        graph_rect.cols.saturating_mul(2)
+    } else {
+        graph_rect.cols
+    };
+    let shown = count.min(slots);
+    let skip = count.saturating_sub(shown);
+    let pad = slots.saturating_sub(shown);
+    let visible = &normalized[skip..count];
+    let mut run_start = 0;
+    while run_start < shown {
+        while run_start < shown && !visible[run_start].is_finite() {
+            run_start += 1;
+        }
+        let mut run_end = run_start;
+        while run_end < shown && visible[run_end].is_finite() {
+            run_end += 1;
+        }
+        if run_start < run_end {
+            let slot_start = pad + run_start;
+            let offset = if braille { slot_start % 2 } else { 0 };
+            let start_col = slot_start / if braille { 2 } else { 1 };
+            let run_cols = (offset + run_end - run_start).div_ceil(if braille { 2 } else { 1 });
+            let x = graph_rect.x.saturating_add(start_col);
+            let right = graph_rect.x.saturating_add(graph_rect.cols);
+            let cols = run_cols.min(right.saturating_sub(x));
+            let mut aligned = [f32::NAN; HISTORY_CAP + 1];
+            let aligned_len = offset + run_end - run_start;
+            aligned[offset..aligned_len].copy_from_slice(&visible[run_start..run_end]);
+            crate::monitor::graphs::paint_history_graph(
+                &aligned[..aligned_len],
+                thegn_core::theme::RampId::Temp,
+                Rect {
+                    x,
+                    y: graph_rect.y,
+                    cols,
+                    rows: graph_rect.rows,
+                },
+                surface,
+            );
+        }
+        run_start = run_end.saturating_add(1);
     }
 }
-
-mod paint;
 
 pub(in crate::monitor) struct ThermalView<'a>(pub &'a ThermalModel);
 
@@ -603,6 +669,9 @@ impl TabView for ThermalView<'_> {
         if placed.id == PACKAGE && inner.rows > 5 && !self.0.temp_history.is_empty() {
             paint::telemetry_label(&mut grid, inner);
         }
+        if placed.id == GPU && inner.rows > 5 && self.0.gpu_history_len > 0 {
+            paint::gpu_history_label(&mut grid, inner);
+        }
         Emitter::default().emit(
             &grid,
             Rect::full(rect.cols, rect.rows),
@@ -620,12 +689,41 @@ impl TabView for ThermalView<'_> {
                     *value = paint::thermal_level(temp, 80.0, 95.0);
                 }
             }
-            let graph_rect =
-                history_graph_rect(rect, inner, count, crate::monitor::graphs::table().braille);
-            crate::monitor::graphs::paint_history_graph(
-                &normalized[..count],
-                thegn_core::theme::RampId::Temp,
-                graph_rect,
+            let plot = Rect {
+                x: rect.x.saturating_add(inner.x),
+                y: rect.y.saturating_add(inner.y).saturating_add(5),
+                cols: inner.cols,
+                rows: inner.rows.saturating_sub(5),
+            };
+            paint_history_runs(
+                &normalized,
+                count,
+                plot,
+                crate::monitor::graphs::table().braille,
+                surface,
+            );
+        }
+        if placed.id == GPU && inner.rows > 5 && self.0.gpu_history_len > 0 {
+            let count = self.0.gpu_history_len.min(HISTORY_CAP);
+            let first = (self.0.gpu_history_next + HISTORY_CAP - count) % HISTORY_CAP;
+            let mut normalized = [f32::NAN; HISTORY_CAP];
+            for (index, value) in normalized.iter_mut().take(count).enumerate() {
+                let temp = self.0.gpu_history[(first + index) % HISTORY_CAP];
+                if temp.is_finite() {
+                    *value = paint::thermal_level(temp, 80.0, 95.0);
+                }
+            }
+            let plot = Rect {
+                x: rect.x.saturating_add(inner.x),
+                y: rect.y.saturating_add(inner.y).saturating_add(5),
+                cols: inner.cols,
+                rows: inner.rows.saturating_sub(5),
+            };
+            paint_history_runs(
+                &normalized,
+                count,
+                plot,
+                crate::monitor::graphs::table().braille,
                 surface,
             );
         }
@@ -643,13 +741,17 @@ impl TabView for ThermalView<'_> {
                 .take(inner.rows.saturating_sub(1))
             {
                 let mut ordered = [0.0_f32; HISTORY_CAP];
-                let count = paint::history_into(sensor, spark_width, &mut ordered);
-                let limit = sensor.crit_c.or(sensor.max_c).unwrap_or(100.0);
-                for sample in &mut ordered[..count] {
-                    if sample.is_finite() {
-                        *sample = (*sample / limit).clamp(0.0, 1.0);
+                let count = if let Some(limit) = sensor.crit_c.or(sensor.max_c) {
+                    let count = paint::history_into(sensor, spark_width, &mut ordered);
+                    for sample in &mut ordered[..count] {
+                        if sample.is_finite() {
+                            *sample = (*sample / limit).clamp(0.0, 1.0);
+                        }
                     }
-                }
+                    count
+                } else {
+                    0
+                };
                 let row_y = rect.y.saturating_add(inner.y).saturating_add(index + 1);
                 let mut run_start = 0;
                 while run_start < count {
