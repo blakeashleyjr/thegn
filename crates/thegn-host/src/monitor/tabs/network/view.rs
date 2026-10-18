@@ -1,5 +1,4 @@
-#![allow(dead_code)] // wired in a later batch (V-NET-1b)
-
+use crate::telemetry::{Metric, ScaleMode, SeriesReq, TelemetryHistory, Window};
 use crate::{
     compositor::Rect,
     monitor::{
@@ -24,8 +23,9 @@ pub(super) const THROUGHPUT: PanelId = PanelId("network.throughput");
 pub(super) const INTERFACES: PanelId = PanelId("network.interfaces");
 pub(super) const HEALTH: PanelId = PanelId("network.health");
 const HISTORY: usize = 120;
+pub(super) const TELEMETRY_HISTORY: usize = 480;
 pub(super) const IFACE_CAP: usize = 8;
-const IFACE_HISTORY: usize = 24;
+const IFACE_HISTORY: usize = 32;
 const VARIANTS: [Variant; 1] = [Variant {
     kind: VariantKind::Full,
     min: (24, 4),
@@ -125,8 +125,13 @@ impl Default for InterfaceHistory {
 #[derive(Debug, Clone)]
 pub(in crate::monitor) struct NetworkModel {
     pub(super) total: ScopeTotal,
-    pub(super) rx: Ring,
-    pub(super) tx: Ring,
+    pub(super) history_rx: Ring,
+    pub(super) history_tx: Ring,
+    pub(super) history_rx_axis_max: f32,
+    pub(super) history_tx_axis_max: f32,
+    pub(super) history_scale: ScaleMode,
+    pub(super) error_history: Ring,
+    pub(super) drop_history: Ring,
     pub(super) interfaces: Vec<InterfaceHistory>,
     pub(super) overflow: usize,
     pub(super) overflow_rx: Option<f64>,
@@ -140,8 +145,13 @@ impl Default for NetworkModel {
     fn default() -> Self {
         Self {
             total: ScopeTotal::default(),
-            rx: Ring::new(HISTORY),
-            tx: Ring::new(HISTORY),
+            history_rx: Ring::new(TELEMETRY_HISTORY),
+            history_tx: Ring::new(TELEMETRY_HISTORY),
+            history_rx_axis_max: 0.0,
+            history_tx_axis_max: 0.0,
+            history_scale: ScaleMode::Window,
+            error_history: Ring::new(HISTORY),
+            drop_history: Ring::new(HISTORY),
             interfaces: Vec::with_capacity(IFACE_CAP),
             overflow: 0,
             overflow_rx: None,
@@ -154,12 +164,57 @@ impl Default for NetworkModel {
 }
 
 impl NetworkModel {
+    pub(in crate::monitor) fn absorb_history(
+        &mut self,
+        history: &TelemetryHistory,
+        window: Window,
+        scale: ScaleMode,
+        now_ms: u64,
+    ) {
+        self.history_scale = scale;
+        for (metric, ring, axis_max) in [
+            (
+                Metric::NetRx,
+                &mut self.history_rx,
+                &mut self.history_rx_axis_max,
+            ),
+            (
+                Metric::NetTx,
+                &mut self.history_tx,
+                &mut self.history_tx_axis_max,
+            ),
+        ] {
+            let series = history.series(&SeriesReq {
+                metric,
+                window,
+                scale: TelemetryHistory::scale_for(metric, scale),
+                buckets: TELEMETRY_HISTORY,
+                agg: thegn_core::series::Agg::Max,
+                now_ms,
+            });
+            ring.reset();
+            *axis_max = series.axis_max;
+            let first_real = series.gap.iter().position(|gap| !gap);
+            if let Some(first_real) = first_real {
+                let mut held = None;
+                for (value, gap) in series.hi.iter().zip(series.gap.iter()).skip(first_real) {
+                    if *gap {
+                        ring.push(held.unwrap_or(f32::NAN));
+                    } else {
+                        ring.push(*value);
+                        if value.is_finite() {
+                            held = Some(*value);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     pub(in crate::monitor) fn absorb_frame(&mut self, frame: &MonitorFrame) {
         let source = &frame.parts.netdev;
         self.health = frame.health[CollectorId::Netdev.index()];
         self.total = source.physical_or_all();
-        push_option(&mut self.rx, self.total.rx_bps);
-        push_option(&mut self.tx, self.total.tx_bps);
         self.overflow = 0;
         self.overflow_rx = Some(0.0);
         self.overflow_tx = Some(0.0);
@@ -219,6 +274,8 @@ impl NetworkModel {
                 })
                 .map(|iface| [iface.rx_drop_ps, iface.tx_drop_ps]),
         );
+        push_option(&mut self.error_history, self.error_total);
+        push_option(&mut self.drop_history, self.drop_total);
     }
 }
 
