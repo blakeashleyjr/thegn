@@ -448,9 +448,9 @@ impl TabView for NetworkView<'_> {
 mod tests {
     use super::{NetworkModel, Ring};
     use crate::caps;
-    use thegn_core::termcaps::UnicodeLevel;
     use crate::telemetry::{ScaleMode, TelemetryHistory, Window};
     use termwiz::surface::Surface;
+    use thegn_core::termcaps::UnicodeLevel;
 
     #[test]
     fn sparkline_nan_bucket_stays_blank_between_finite_runs() {
