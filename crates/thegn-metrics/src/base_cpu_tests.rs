@@ -140,8 +140,8 @@ fn missing_cpu_seven_keeps_cpu_eight_at_index_eight() {
     assert_eq!(reader.fill_bytes(&mut primed, &first), (None, Vec::new()));
     let (_, cores) = reader.fill_bytes(&mut primed, &second);
     assert_eq!(cores.len(), 9);
-    assert_eq!(cores[7], 0);
-    assert_eq!(cores[8], 67);
+    assert_eq!(cores[7], 0.0);
+    assert_eq!(cores[8], 67.0);
 }
 
 #[test]
