@@ -300,7 +300,7 @@ fn format_label(name: &str, label: Option<&str>, model: Option<&str>, channel: u
 
 #[cfg(test)]
 mod tests {
-    use super::BaseTemp;
+    use super::{BaseTemp, merge_temperature};
     use crate::collect::linux::hwmon::HwmonFs;
     use std::collections::BTreeMap;
     use std::io;
@@ -597,6 +597,43 @@ mod tests {
                     .collect::<Vec<_>>()
             );
         }
+    }
+
+    #[test]
+    fn duplicate_hwmon_label_keeps_earlier_value_when_later_reading_is_implausible() {
+        let mut reader = fixture();
+        reader
+            .fs
+            .put("/fake/class/hwmon/hwmon5/name", b"sharedchip\n");
+        reader
+            .fs
+            .put("/fake/class/hwmon/hwmon5/temp1_input", b"42000\n");
+        reader
+            .fs
+            .put("/fake/class/hwmon/hwmon5/temp1_label", b"shared\n");
+        reader
+            .fs
+            .put("/fake/class/hwmon/hwmon6/name", b"sharedchip\n");
+        reader
+            .fs
+            .put("/fake/class/hwmon/hwmon6/temp1_input", b"65261850\n");
+        reader
+            .fs
+            .put("/fake/class/hwmon/hwmon6/temp1_label", b"shared\n");
+
+        let temps = reader.fill();
+        assert_eq!(
+            temps
+                .iter()
+                .filter(|(label, _)| label == "sharedchip shared")
+                .count(),
+            1
+        );
+        assert!(
+            temps
+                .iter()
+                .any(|(label, value)| { label == "sharedchip shared" && *value == 42.0 })
+        );
     }
 
     #[test]

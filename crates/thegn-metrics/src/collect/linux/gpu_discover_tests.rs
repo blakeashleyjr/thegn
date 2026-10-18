@@ -317,7 +317,7 @@ fn rediscovery_remembers_a_deferred_duplicate_without_reinitializing_or_changing
     );
     let generation = collector.generation;
 
-    for (tick, now_ms) in [(2, 60_500), (3, 120_500), (4, 180_500)] {
+    for (tick, now_ms) in [(2, 60_501), (3, 120_502), (4, 180_503)] {
         collector
             .sample(&TickCtx { tick, now_ms }, &mut frame)
             .unwrap();
@@ -330,7 +330,154 @@ fn rediscovery_remembers_a_deferred_duplicate_without_reinitializing_or_changing
             .iter()
             .filter(|path| *path == &duplicate_uevent)
             .count(),
+        4
+    );
+    let duplicate_vram = drm.join("card1/device/mem_info_vram_total");
+    assert_eq!(
+        collector
+            .fs
+            .touched
+            .iter()
+            .filter(|path| *path == &duplicate_vram)
+            .count(),
         1
+    );
+}
+
+#[test]
+fn discovery_duplicate_is_not_reinitialized_on_rediscovery() {
+    let (_root, fake, drm, accel) = fixture();
+    add_card(&drm, "card0", "0000:c1:00.0", "amdgpu");
+    add_card(&drm, "card1", "0000:c1:00.0", "amdgpu");
+    let duplicate_uevent = drm.join("card1/device/uevent");
+    let mut collector = GpuDevicesCollector::with_fs(fake, &drm, &accel);
+    assert_eq!(collector.discover(&Env::default()), Health::Ok);
+    assert_eq!(collector.devices.len(), 1);
+    assert_eq!(collector.devices[0].device.card, 0);
+    let initial_generation = collector.generation;
+    let initial_uevent_reads = collector
+        .fs
+        .touched
+        .iter()
+        .filter(|path| *path == &duplicate_uevent)
+        .count();
+    assert_eq!(initial_uevent_reads, 1);
+    let initial_vram_reads = collector
+        .fs
+        .touched
+        .iter()
+        .filter(|path| *path == &drm.join("card1/device/mem_info_vram_total"))
+        .count();
+    assert_eq!(initial_vram_reads, 1);
+
+    let mut frame = MonitorFrame::default();
+    for (tick, now_ms) in [(0, 500), (1, 60_501), (2, 120_502), (3, 180_503)] {
+        collector
+            .sample(&TickCtx { tick, now_ms }, &mut frame)
+            .unwrap();
+    }
+    assert_eq!(collector.generation, initial_generation);
+    assert_eq!(
+        collector
+            .fs
+            .touched
+            .iter()
+            .filter(|path| *path == &duplicate_uevent)
+            .count(),
+        4
+    );
+    assert_eq!(
+        collector
+            .fs
+            .touched
+            .iter()
+            .filter(|path| *path == &drm.join("card1/device/mem_info_vram_total"))
+            .count(),
+        initial_vram_reads
+    );
+}
+
+#[test]
+fn reused_card_number_with_a_new_slot_is_probed() {
+    let (_root, fake, drm, accel) = fixture();
+    add_card(&drm, "card0", "0000:c1:00.0", "amdgpu");
+    add_card(&drm, "card1", "0000:c1:00.0", "amdgpu");
+    let mut collector = GpuDevicesCollector::with_fs(fake, &drm, &accel);
+    assert_eq!(collector.discover(&Env::default()), Health::Ok);
+
+    fs::remove_dir_all(drm.join("card1")).unwrap();
+    add_card(&drm, "card1", "0000:c2:00.0", "amdgpu");
+    let mut frame = MonitorFrame::default();
+    collector
+        .sample(
+            &TickCtx {
+                tick: 1,
+                now_ms: 500,
+            },
+            &mut frame,
+        )
+        .unwrap();
+    collector
+        .sample(
+            &TickCtx {
+                tick: 2,
+                now_ms: 60_501,
+            },
+            &mut frame,
+        )
+        .unwrap();
+
+    assert_eq!(frame.parts.gpu_devices.devices.len(), 2);
+    assert_eq!(frame.parts.gpu_devices.devices[1].card, 1);
+    assert_eq!(frame.parts.gpu_devices.devices[1].slot, "0000:c2:00.0");
+}
+
+#[test]
+fn deferred_duplicate_is_adopted_when_its_slot_owner_disappears() {
+    let (_root, fake, drm, accel) = fixture();
+    add_card(&drm, "card0", "0000:c1:00.0", "amdgpu");
+    add_card(&drm, "card1", "0000:c1:00.0", "amdgpu");
+    let delayed_status = drm.join("card1/device/power/runtime_status");
+    fs::write(&delayed_status, "suspended\n").unwrap();
+    let duplicate_uevent = drm.join("card1/device/uevent");
+    let mut collector = GpuDevicesCollector::with_fs(fake, &drm, &accel);
+    assert_eq!(collector.discover(&Env::default()), Health::Ok);
+
+    fs::write(&delayed_status, "active\n").unwrap();
+    let mut frame = MonitorFrame::default();
+    collector
+        .sample(
+            &TickCtx {
+                tick: 1,
+                now_ms: 500,
+            },
+            &mut frame,
+        )
+        .unwrap();
+    assert_eq!(frame.parts.gpu_devices.devices.len(), 1);
+    assert_eq!(frame.parts.gpu_devices.devices[0].card, 0);
+
+    fs::remove_dir_all(drm.join("card0")).unwrap();
+    collector
+        .sample(
+            &TickCtx {
+                tick: 2,
+                now_ms: 60_501,
+            },
+            &mut frame,
+        )
+        .unwrap();
+
+    assert_eq!(frame.parts.gpu_devices.devices.len(), 1);
+    assert_eq!(frame.parts.gpu_devices.devices[0].card, 1);
+    assert_eq!(
+        collector
+            .fs
+            .touched
+            .iter()
+            .filter(|path| *path == &duplicate_uevent)
+            .count(),
+        2
     );
 }
 

@@ -120,6 +120,7 @@ fn classifies_remote_filesystems_and_drops_kernel_and_container_mounts() {
         "ocfs2",
         "gfs2",
         "orangefs",
+        "pvfs2",
         "beegfs",
         "fuse",
         "fuseblk",
@@ -151,7 +152,9 @@ fn classifies_remote_filesystems_and_drops_kernel_and_container_mounts() {
 
 #[test]
 fn added_network_filesystems_are_listed_without_statvfs_calls() {
-    let types = ["virtiofs", "coda", "ocfs2", "gfs2", "orangefs", "beegfs"];
+    let types = [
+        "virtiofs", "coda", "ocfs2", "gfs2", "orangefs", "pvfs2", "beegfs",
+    ];
     let io = FakeIo {
         mountinfo: types
             .iter()
