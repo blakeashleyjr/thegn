@@ -5,13 +5,20 @@
 //! behind the [`ContainerEvents`] seam (`sandbox_events.rs`). A future
 //! docker/Apple events adapter is a sibling file plus a profile-table flip —
 //! no other site ever names a container runtime (the `runtime-leak` ratchet).
+//!
+//! Rootless Podman may also leave its `pause` process after an isolated
+//! `XDG_RUNTIME_DIR` is removed. That process belongs to Podman's rootless
+//! user namespace and can outlive every client by design; thegn owns and
+//! reaps its own `events` clients, but cannot safely stop that namespace.
 
 use std::io::{BufRead, BufReader};
 use std::process::{Command, Stdio};
 
 use crate::db::Db;
 use crate::sandbox::Backend;
-use crate::sandbox_events::{ContainerEventSink, ContainerEvents, EventKind, RawEvent, persist};
+use crate::sandbox_events::{
+    ContainerEventSink, ContainerEvents, EventKind, RawEvent, persist, register_event_child,
+};
 
 struct PodmanEvents {
     /// `backend_prefix(backend)`: plain `["podman"]`, or
@@ -76,30 +83,34 @@ impl ContainerEvents for PodmanEvents {
         let Some(program) = prefix.first() else {
             return;
         };
-        let Ok(mut child) = Command::new(program)
+        let mut command = Command::new(program);
+        command
             .args(&prefix[1..])
             .args(events_argv(kind))
             .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            .spawn()
-        else {
+            .stderr(Stdio::null());
+        crate::sandbox_proc::configure_event_process_group(&mut command);
+        let Ok(mut child) = command.spawn() else {
             return;
         };
         let Some(stdout) = child.stdout.take() else {
+            drop(register_event_child(child));
             return;
         };
-        // Account this watcher's footprint to thegn for as long as it runs. Held to
-        // the end of the function so it is dropped after the child is reaped.
+        // Account this watcher's footprint to thegn for as long as it runs.
         let _proc = crate::proc_registry::register(
             crate::proc_registry::GROUP_WATCHER,
             "podman events",
             child.id(),
         );
+        let child_guard = register_event_child(child);
         let reader = BufReader::new(stdout);
         for line in reader.lines().map_while(Result::ok) {
             let Some(ev) = parse_podman_event(&line, kind) else {
                 continue;
             };
+            // Per-event open stays off the event loop; holding a DB handle for
+            // the stream lifetime is deferred separately.
             let Ok(db) = Db::open() else {
                 continue;
             };
@@ -107,14 +118,9 @@ impl ContainerEvents for PodmanEvents {
                 sink.on_batch(1);
             }
         }
-        // Reap the `podman events` child when the stream ends (EOF on daemon
-        // restart / no socket): a dropped `Child` is never waited on, leaving a
-        // zombie for the life of the long-running host. best-effort: the exit
-        // status carries no action, so a failure is only logged — never fatal
-        // (audit run.rs:825).
-        if let Err(error) = child.wait() {
-            tracing::debug!(%error, "podman events: child reap failed");
-        }
+        // Drop kills the complete group and reaps on EOF. The process-wide
+        // registry also uses this guard at host shutdown.
+        drop(child_guard);
     }
 }
 
@@ -149,6 +155,55 @@ fn parse_podman_event(json: &str, kind: EventKind) -> Option<RawEvent> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::process::{Child, Command as StdCommand, Stdio as StdStdio};
+    use std::sync::{Mutex, PoisonError};
+    use std::time::{Duration, Instant};
+
+    static CHILD_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "the regression needs a long-lived fake child"
+    )]
+    fn fake_long_lived_child() -> Child {
+        let mut command = if cfg!(windows) {
+            let mut command = StdCommand::new("cmd");
+            command.args(["/C", "ping -n 600 127.0.0.1 >NUL"]);
+            command
+        } else {
+            let mut command = StdCommand::new("sleep");
+            command.arg("600");
+            command
+        };
+        command.stdout(StdStdio::null()).stderr(StdStdio::null());
+        crate::sandbox_proc::configure_event_process_group(&mut command);
+        command.spawn().unwrap()
+    }
+
+    #[test]
+    fn dropping_event_child_guard_kills_and_reaps_child() {
+        let _lock = CHILD_TEST_LOCK
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        let guard = register_event_child(fake_long_lived_child());
+        let reaped = guard.reap_observer();
+        drop(guard);
+        assert!(reaped.load(std::sync::atomic::Ordering::SeqCst));
+    }
+
+    #[test]
+    fn shutdown_kills_and_reaps_each_registered_child_by_deadline() {
+        let _lock = CHILD_TEST_LOCK
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        let first = register_event_child(fake_long_lived_child());
+        let second = register_event_child(fake_long_lived_child());
+        let deadline = Instant::now() + Duration::from_secs(2);
+        crate::sandbox_events::shutdown_event_streams(deadline);
+        assert!(Instant::now() < deadline);
+        assert!(first.is_reaped());
+        assert!(second.is_reaped());
+    }
 
     #[test]
     fn parse_exec_event_with_exec_id() {
