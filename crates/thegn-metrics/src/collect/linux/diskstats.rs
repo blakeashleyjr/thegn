@@ -778,12 +778,24 @@ mod tests {
             .unwrap();
         assert!(!collector.ids.contains_key("sd00"));
 
-        fs::write(&proc, &rows).unwrap();
         collector
             .sample(
                 &TickCtx {
                     tick: 4,
                     now_ms: 4_000,
+                },
+                &mut frame,
+            )
+            .unwrap();
+        assert!(!collector.ids.contains_key("sd00"));
+        assert!(collector.ids.contains_key("sd64"));
+
+        fs::write(&proc, &rows).unwrap();
+        collector
+            .sample(
+                &TickCtx {
+                    tick: 5,
+                    now_ms: 5_000,
                 },
                 &mut frame,
             )

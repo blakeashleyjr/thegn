@@ -142,7 +142,7 @@ impl PtyProcessOwner {
                 .unwrap_or_else(|poison| poison.into_inner());
             *in_flight += 1;
         }
-        // Share the guard so inline fallback holds the in-flight count through reap and parcel drop.
+        // Share it because either the worker or inline fallback must decrement only after reap and parcel drop.
         let guard = Arc::new(Mutex::new(Some(DetachedReaperGuard)));
         let worker_guard = Arc::clone(&guard);
         let worker = Box::new(move || {

@@ -173,6 +173,10 @@ fn copy_part(target: &mut Parts, source: &Parts, id: CollectorId) {
         CollectorId::CpuIrq => target.cpu_irq.clone_from(&source.cpu_irq),
         CollectorId::CpuSched => target.cpu_sched.clone_from(&source.cpu_sched),
         CollectorId::ThermalZone => target.thermal_zone.clone_from(&source.thermal_zone),
+        CollectorId::CpuIdle => target.cpu_idle.clone_from(&source.cpu_idle),
+        CollectorId::CpuTopology => target.cpu_topology.clone_from(&source.cpu_topology),
+        CollectorId::Filesystems => target.filesystems.clone_from(&source.filesystems),
+        CollectorId::GpuDevices => target.gpu_devices.clone_from(&source.gpu_devices),
     }
 }
 

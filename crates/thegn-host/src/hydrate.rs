@@ -66,6 +66,40 @@ pub(crate) fn invalidate_glyphs(paths: &[String]) {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum GlyphPatch {
+    Patched,
+    Newer,
+    /// No cached row for this path, or the row is for another branch.
+    Missing,
+}
+
+/// Update only the upstream counts of a cached glyph row when its scan and
+/// branch still match the state observed before the ref read. A fetch changes
+/// remote-tracking refs, which cannot change worktree status or diff counts, so
+/// preserve the scan timestamp and avoid scheduling a full glyph rescan.
+pub(crate) fn patch_glyph_ahead_behind(
+    path: &str,
+    branch: &str,
+    ahead: usize,
+    behind: usize,
+    read_at: Instant,
+) -> GlyphPatch {
+    let mut cache = glyph_cache().lock().unwrap_or_else(|e| e.into_inner());
+    let Some((row, scanned_at)) = cache.get_mut(path) else {
+        return GlyphPatch::Missing;
+    };
+    if *scanned_at > read_at {
+        return GlyphPatch::Newer;
+    }
+    if row.branch.as_deref() != Some(branch) {
+        return GlyphPatch::Missing;
+    }
+    row.ahead = ahead;
+    row.behind = behind;
+    GlyphPatch::Patched
+}
+
 /// Combine the registered-worktree paths and the known repo roots into the
 /// set of glyph-cache keys that must stay resident across hydrations (repo
 /// roots back dormant workspaces' *home* rows, which have no registry row).
@@ -892,15 +926,21 @@ pub(crate) fn load_or_seed_session(
     let tombstoned = db.workspace_tombstoned(&session.id).unwrap_or(false);
     if !tombstoned && Path::new(&session.id).is_dir() {
         let (name, kind) = crate::workspace_identity::workspace_identity(&session.id, None);
-        // best-effort: the DB is a cache; git is the source of truth
-        let _ = db.put_workspace(&session.id, &name, kind);
-        let _ = db.touch_repo(&session.id, &name); // best-effort: cache write: the DB is a cache; git/forge stays the source of truth
-    }
-    // Record the resolved workspace as the active pointer so the next cold
-    // start reopens it even on a first run (where no switch has happened yet).
-    // Skipped for a tombstoned workspace so it doesn't re-pin itself active.
-    if !tombstoned {
-        let _ = db.set_active_workspace(&session.id); // best-effort: cache write: the DB is a cache; git/forge stays the source of truth
+        let repo_path = session.id.clone();
+        // These are cache writes; the session returned to startup does not
+        // depend on them. Keep them behind the FIFO writer so a held DB write
+        // lock cannot delay the first frame.
+        crate::db_task::persist_critical(move |db| {
+            if let Err(error) = db.put_workspace(&repo_path, &name, kind) {
+                tracing::debug!(%error, "failed to register startup workspace cache row");
+            }
+            if let Err(error) = db.touch_repo(&repo_path, &name) {
+                tracing::debug!(%error, "failed to touch startup repository cache row");
+            }
+            if let Err(error) = db.set_active_workspace(&repo_path) {
+                tracing::debug!(%error, "failed to persist startup active workspace cache row");
+            }
+        });
     }
     (session, seeded)
 }

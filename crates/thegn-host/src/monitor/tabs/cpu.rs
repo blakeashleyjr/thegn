@@ -8,6 +8,8 @@ use crate::telemetry::Metric;
 use thegn_core::theme::Hue;
 use thegn_core::viz::{self as viz, Unit};
 
+pub(in crate::monitor) mod view;
+
 pub(in crate::monitor) fn cpu(cx: &Ctx) -> Vec<Section> {
     let s = &cx.model.stats;
     let mut out = vec![cx.graph(Metric::Cpu, MAIN_H, Tok::Hue(Hue::Teal))];

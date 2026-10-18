@@ -864,6 +864,18 @@
       "summary": "System monitor framework contract is recorded; implementation lanes remain unstarted."
     },
     {
+      "change": "monitor-overview",
+      "lifecycle": "active",
+      "disposition": "alpha-delivery",
+      "owners": [
+        {
+          "issue": "THE-871",
+          "project": "Workspace Product & Observability"
+        }
+      ],
+      "summary": "Overview tab shipped as the first monitor tab; per-tab view wiring continues in later batches."
+    },
+    {
       "change": "package-shell-completions",
       "lifecycle": "archived",
       "disposition": "superseded-retire",

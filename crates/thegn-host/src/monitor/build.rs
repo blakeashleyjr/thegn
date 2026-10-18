@@ -101,6 +101,7 @@ pub(super) fn tab(input: TabInput) -> TabBuild {
         now_ms: input.now_ms,
     };
     match input.tab {
+        MonitorTab::Overview => plain(Vec::new()),
         MonitorTab::Cpu => plain(super::tabs::cpu::cpu(&cx)),
         MonitorTab::Memory => plain(super::tabs::memory::memory(&cx)),
         MonitorTab::Thermal => plain(super::tabs::thermal::thermal(&cx)),

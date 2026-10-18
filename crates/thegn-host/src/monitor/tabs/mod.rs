@@ -10,6 +10,7 @@ pub(super) mod gpu;
 pub(super) mod memory;
 pub(super) mod network;
 pub(super) mod notifications;
+pub(super) mod overview;
 pub(super) mod power;
 pub(super) mod procs;
 pub(super) mod thermal;
@@ -22,6 +23,7 @@ impl MonitorTab {
     /// device).
     pub(in crate::monitor) fn present(self, s: &StatsSnapshot, has_containers: bool) -> bool {
         match self {
+            MonitorTab::Overview => true,
             MonitorTab::Gpu => s.gpu_pct.is_some(),
             MonitorTab::Power => s.battery.is_some(),
             MonitorTab::Thermal => s.cpu_temp_c.is_some() || !s.temps.is_empty(),
