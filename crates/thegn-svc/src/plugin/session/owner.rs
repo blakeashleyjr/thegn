@@ -23,6 +23,7 @@ struct StderrCapture {
     bytes: u64,
     lines: u64,
     dropped_lines: u64,
+    dropped_in_window: u64,
     truncated_lines: u64,
     window_started: Instant,
     logged_in_window: u64,
@@ -36,6 +37,7 @@ impl StderrCapture {
             bytes: 0,
             lines: 0,
             dropped_lines: 0,
+            dropped_in_window: 0,
             truncated_lines: 0,
             window_started: Instant::now(),
             logged_in_window: 0,
@@ -75,8 +77,16 @@ impl StderrCapture {
         }
         let now = Instant::now();
         if now.duration_since(self.window_started) >= STDERR_LOG_WINDOW {
+            if self.dropped_in_window > 0 {
+                tracing::debug!(
+                    target: "thegn::plugin",
+                    dropped = self.dropped_in_window,
+                    "stderr lines suppressed"
+                );
+            }
             self.window_started = now;
             self.logged_in_window = 0;
+            self.dropped_in_window = 0;
         }
         if self.logged_in_window < STDERR_LOG_LINES_PER_WINDOW {
             self.logged_in_window += 1;
@@ -84,6 +94,7 @@ impl StderrCapture {
             tracing::debug!(target: "thegn::plugin", "stderr: {line}");
         } else {
             self.dropped_lines = self.dropped_lines.saturating_add(1);
+            self.dropped_in_window = self.dropped_in_window.saturating_add(1);
         }
         self.partial.clear();
         self.truncating = false;
@@ -107,16 +118,28 @@ impl StderrCapture {
 }
 
 fn framed_stderr_line(bytes: &[u8], truncated: bool) -> String {
-    let mut line = String::from_utf8_lossy(bytes).into_owned();
-    if truncated {
+    let content = if truncated {
         let content_limit = MAX_STDERR_LINE_BYTES - STDERR_TRUNCATION_MARKER.len();
-        while !line.is_char_boundary(content_limit.min(line.len())) {
-            line.pop();
+        let raw_prefix = &bytes[..bytes.len().min(content_limit)];
+        let mut line = String::from_utf8_lossy(raw_prefix).into_owned();
+        if line.len() > content_limit {
+            let boundary = (0..=content_limit)
+                .rev()
+                .find(|&index| line.is_char_boundary(index))
+                .unwrap_or(0);
+            line.truncate(boundary);
         }
-        line.truncate(content_limit.min(line.len()));
+        line
+    } else {
+        String::from_utf8_lossy(bytes).into_owned()
+    };
+    if truncated {
+        let mut line = content;
         line.push_str(STDERR_TRUNCATION_MARKER);
+        line
+    } else {
+        content
     }
-    line
 }
 
 pub(super) struct HeldProcess {
@@ -568,12 +591,35 @@ mod stderr_tests {
         for _ in 0..8192 {
             capture.feed(&block);
         }
+        assert!(capture.partial.len() <= MAX_STDERR_LINE_BYTES);
         capture.finish_partial();
 
         assert_eq!(capture.bytes, 64 * 1024 * 1024);
         assert_eq!(capture.tail.len(), MAX_STDERR_TAIL_BYTES);
         assert_eq!(capture.lines, 1);
         assert_eq!(capture.truncated_lines, 1);
+    }
+
+    #[test]
+    fn small_chunks_keep_the_exact_last_tail_bytes() {
+        let mut capture = StderrCapture::new();
+        let chunks = [
+            vec![b'a'; 3000],
+            vec![b'b'; 3000],
+            vec![b'c'; 3000],
+            vec![b'd'; 3000],
+        ];
+        let mut fed = Vec::new();
+        for chunk in &chunks {
+            capture.feed(chunk);
+            fed.extend_from_slice(chunk);
+        }
+
+        assert_eq!(capture.tail.len(), MAX_STDERR_TAIL_BYTES);
+        assert_eq!(
+            capture.tail.iter().copied().collect::<Vec<_>>(),
+            fed[fed.len() - MAX_STDERR_TAIL_BYTES..].to_vec()
+        );
     }
 
     #[test]
