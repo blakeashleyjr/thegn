@@ -44,7 +44,12 @@ fn history_graph_rect(rect: Rect, body: Rect, len: usize, braille: bool) -> Rect
 }
 
 impl GpuView<'_> {
-    pub(super) fn paint_busy_history(&self, surface: &mut Surface, rect: Rect, body: Rect) {
+    pub(in crate::monitor::tabs::gpu) fn paint_busy_history(
+        &self,
+        surface: &mut Surface,
+        rect: Rect,
+        body: Rect,
+    ) {
         if matches!(self.0.engine_health, Health::Absent(_)) {
             return;
         }
