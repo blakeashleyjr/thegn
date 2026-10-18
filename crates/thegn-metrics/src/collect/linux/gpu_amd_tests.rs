@@ -39,9 +39,9 @@ impl FakeFs {
         fs.put(device.join("mem_info_gtt_total"), b"16777216\n");
         fs.put(
             device.join("pp_dpm_sclk"),
-            b"0: 600Mhz\n1: 764Mhz *\nS: 0Mhz\n",
+            b"S: 0Mhz \n0: 600Mhz \n1: 764Mhz *\n",
         );
-        fs.put(device.join("pp_dpm_mclk"), b"0: 400Mhz\n1: 800Mhz *\n");
+        fs.put(device.join("pp_dpm_mclk"), b"0: 400Mhz \n1: 800Mhz *\n");
         (fs, root)
     }
 
@@ -165,7 +165,7 @@ fn apu_sampling_stays_under_ten_preads_and_reads_totals_only_at_discovery() {
 
 #[test]
 fn suspended_card_reads_only_runtime_status_and_deduplicates_pci_slot() {
-    let (mut fs, root) = FakeFs::apu(b"suspended\n");
+    let (mut fs, root) = FakeFs::apu(b"active\n");
     let second = root.join("card1/device");
     fs.put(
         second.join("uevent"),
@@ -174,6 +174,12 @@ fn suspended_card_reads_only_runtime_status_and_deduplicates_pci_slot() {
     fs.put(second.join("power/runtime_status"), b"suspended\n");
     let mut collector = GpuAmdCollector::with_fs(fs, root);
     assert_eq!(collector.discover(&Env::default()), Health::Warming);
+    assert!(collector.fs.small_reads.iter().all(|path| {
+        matches!(
+            path.file_name().and_then(|name| name.to_str()),
+            Some("uevent" | "mem_info_vram_total" | "mem_info_gtt_total")
+        )
+    }));
     let mut frame = MonitorFrame::default();
     assert!(
         collector
@@ -181,22 +187,41 @@ fn suspended_card_reads_only_runtime_status_and_deduplicates_pci_slot() {
             .is_ok()
     );
     assert_eq!(frame.parts.gpu_engines.devices.len(), 1);
-    assert_eq!(
-        frame.parts.gpu_engines.devices[0].runtime_status,
-        RuntimeStatus::Suspended
+    let row = &frame.parts.gpu_engines.devices[0];
+    assert_eq!(row.runtime_status, RuntimeStatus::Active);
+    assert_eq!(row.gfx_busy_pct, Some(42));
+    assert_eq!(row.vcn_busy_pct, Some(7));
+    assert_eq!(row.vram_used, Some(1_048_576));
+    assert_eq!(row.gtt_used, Some(2_097_152));
+
+    collector.fs.files.insert(
+        PathBuf::from("/sys/class/drm/card0/device/power/runtime_status"),
+        b"suspended\n".to_vec(),
     );
+    collector.fs.preads.clear();
+    assert!(
+        collector
+            .sample(&TickCtx { tick: 1, now_ms: 1 }, &mut frame)
+            .is_ok()
+    );
+    let row = &frame.parts.gpu_engines.devices[0];
+    assert_eq!(row.runtime_status, RuntimeStatus::Suspended);
+    assert_eq!(row.gfx_busy_pct, None);
+    assert_eq!(row.vcn_busy_pct, None);
+    assert_eq!(row.vram_used, None);
+    assert_eq!(row.gtt_used, None);
     assert_eq!(collector.fs.preads.len(), 1);
     assert!(collector.fs.preads[0].ends_with("power/runtime_status"));
 }
 
 #[test]
 fn no_amdgpu_is_absent_no_hardware_and_collector_id_is_registered() {
-    let mut fs = FakeFs::apu(b"active\n");
+    let (mut fs, root) = FakeFs::apu(b"active\n");
     fs.put(
         PathBuf::from("/sys/class/drm/card0/device/uevent"),
         b"PCI_SLOT_NAME=0000:05:00.0\nDRIVER=i915\n",
     );
-    let mut collector = GpuAmdCollector::with_fs(fs, "/sys/class/drm");
+    let mut collector = GpuAmdCollector::with_fs(fs, root);
     assert_eq!(collector.id(), CollectorId::GpuEngines);
     assert_eq!(
         collector.discover(&Env::default()),
