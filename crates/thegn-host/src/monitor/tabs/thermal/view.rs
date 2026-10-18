@@ -59,7 +59,7 @@ const SPECS: [PanelSpec; 6] = [
     },
     PanelSpec {
         id: SENSORS,
-        priority: 1,
+        priority: 5,
         variants: VARIANTS,
     },
     PanelSpec {
@@ -181,7 +181,7 @@ impl ThermalModel {
             self.temp_history.clear();
             return;
         }
-        self.temp_history.clone_from(&series.hi);
+        self.temp_history.clone_from(&series.raw_hi);
     }
 
     pub(in crate::monitor) fn absorb_frame(&mut self, frame: &MonitorFrame) {
