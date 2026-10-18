@@ -54,6 +54,7 @@ struct DeviceReader<H> {
     device_path: PathBuf,
     runtime: Option<H>,
     initialized: bool,
+    excluded: bool,
 }
 
 pub struct GpuDevicesCollector<F: GpuFs = RealFs> {
@@ -148,9 +149,10 @@ impl<F: GpuFs> GpuDevicesCollector<F> {
                 device_path,
                 runtime,
                 initialized: false,
+                excluded: false,
             });
             changed = true;
-            if runtime_status == RuntimeStatus::Active {
+            if identity_is_readable(runtime_status) {
                 initialize_device(
                     &mut self.fs,
                     self.devices.last_mut().expect("just pushed reader"),
@@ -158,13 +160,12 @@ impl<F: GpuFs> GpuDevicesCollector<F> {
             }
             let last = self.devices.len() - 1;
             if self.devices[last].initialized
-                && self.devices[..last]
-                    .iter()
-                    .any(|known| known.device.slot == self.devices[last].device.slot)
+                && !self.devices[last].excluded
+                && self.devices[..last].iter().any(|known| {
+                    !known.excluded && known.device.slot == self.devices[last].device.slot
+                })
             {
                 self.devices.pop();
-            } else {
-                changed = true;
             }
         }
         self.devices.sort_by_key(|reader| reader.device.card);
@@ -236,7 +237,7 @@ impl<F: GpuFs> Collector for GpuDevicesCollector<F> {
         self.accels.clear();
         self.discover_devices();
         self.discover_accels();
-        if self.devices.is_empty() && self.accels.is_empty() {
+        if !self.devices.iter().any(|reader| !reader.excluded) && self.accels.is_empty() {
             Health::Absent(Absent::NoHardware)
         } else {
             Health::Ok
@@ -255,20 +256,49 @@ impl<F: GpuFs> Collector for GpuDevicesCollector<F> {
         } else if self.last_discovery_ms.is_none() {
             self.last_discovery_ms = Some(ctx.now_ms);
         }
-        for reader in &mut self.devices {
-            reader.device.runtime_status = read_runtime(&mut self.fs, reader.runtime.as_ref());
-            if reader.device.runtime_status == RuntimeStatus::Active && !reader.initialized {
-                initialize_device(&mut self.fs, reader);
-                self.generation = self.generation.wrapping_add(1);
+        let mut index = 0;
+        while index < self.devices.len() {
+            let mut initialized_now = false;
+            {
+                let reader = &mut self.devices[index];
+                reader.device.runtime_status = read_runtime(&mut self.fs, reader.runtime.as_ref());
+                if identity_is_readable(reader.device.runtime_status) && !reader.initialized {
+                    initialize_device(&mut self.fs, reader);
+                    initialized_now = true;
+                }
             }
+            if initialized_now {
+                let slot = self.devices[index].device.slot.clone();
+                self.generation = self.generation.wrapping_add(1);
+                let duplicate = !self.devices[index].excluded
+                    && self.devices.iter().enumerate().any(|(known_index, known)| {
+                        known_index != index
+                            && known.initialized
+                            && !known.excluded
+                            && known.device.slot == slot
+                    });
+                if duplicate {
+                    self.devices.remove(index);
+                    continue;
+                }
+            }
+            index += 1;
         }
-        if self.published_generation != Some(self.generation) {
+        let visible_count = self
+            .devices
+            .iter()
+            .filter(|reader| !reader.excluded)
+            .count();
+        if self.published_generation != Some(self.generation)
+            || frame.parts.gpu_devices.devices.len() != visible_count
+        {
             frame.parts.gpu_devices.devices.clear();
-            frame
-                .parts
-                .gpu_devices
-                .devices
-                .extend(self.devices.iter().map(|reader| reader.device.clone()));
+            frame.parts.gpu_devices.devices.extend(
+                self.devices
+                    .iter()
+                    .filter(|reader| !reader.excluded)
+                    .map(|reader| reader.device.clone()),
+            );
             frame.parts.gpu_devices.accels.clone_from(&self.accels);
             self.published_generation = Some(self.generation);
         } else {
@@ -338,10 +368,16 @@ fn read_runtime<F: GpuFs>(fs: &mut F, handle: Option<&F::Handle>) -> RuntimeStat
         {
             Some("active") => RuntimeStatus::Active,
             Some("suspended") => RuntimeStatus::Suspended,
+            Some("suspending") => RuntimeStatus::Suspending,
+            Some("unsupported") => RuntimeStatus::Unsupported,
             _ => RuntimeStatus::Unknown,
         },
         Err(_) => RuntimeStatus::Unknown,
     }
+}
+
+fn identity_is_readable(status: RuntimeStatus) -> bool {
+    !matches!(status, RuntimeStatus::Suspended | RuntimeStatus::Suspending)
 }
 
 fn initialize_device<F: GpuFs>(fs: &mut F, reader: &mut DeviceReader<F::Handle>) {
@@ -351,6 +387,8 @@ fn initialize_device<F: GpuFs>(fs: &mut F, reader: &mut DeviceReader<F::Handle>)
         .and_then(|text| value(text, "PCI_SLOT_NAME"))
         .map(str::to_owned)
     else {
+        reader.initialized = true;
+        reader.excluded = true;
         return;
     };
     let driver = uevent

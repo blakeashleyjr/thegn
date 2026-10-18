@@ -205,6 +205,85 @@ fn suspended_device_identity_is_filled_after_it_becomes_active() {
 }
 
 #[test]
+fn unsupported_runtime_power_still_discovers_identity() {
+    let (_root, fake, drm, accel) = fixture();
+    add_card(&drm, "card0", "0000:c1:00.0", "amdgpu");
+    let device = drm.join("card0/device");
+    fs::write(device.join("power/runtime_status"), "unsupported\n").unwrap();
+    put(&device.join("mem_info_vram_total"), "2147483648\n");
+    put(&device.join("mem_info_gtt_total"), "8589934592\n");
+    let mut collector = GpuDevicesCollector::with_fs(fake, &drm, &accel);
+    assert_eq!(collector.discover(&Env::default()), Health::Ok);
+    let mut frame = MonitorFrame::default();
+    collector.sample(&TickCtx::default(), &mut frame).unwrap();
+
+    assert_eq!(frame.parts.gpu_devices.devices.len(), 1);
+    let gpu = &frame.parts.gpu_devices.devices[0];
+    assert_eq!(gpu.slot, "0000:c1:00.0");
+    assert_eq!(gpu.driver.as_deref(), Some("amdgpu"));
+    assert_eq!(gpu.kind, GpuKind::Apu);
+    assert_eq!(gpu.runtime_status, RuntimeStatus::Unsupported);
+}
+
+#[test]
+fn active_card_without_pci_slot_is_excluded_and_not_reinitialized() {
+    let (_root, fake, drm, accel) = fixture();
+    let device = drm.join("card0/device");
+    put(&device.join("uevent"), "DRIVER=panfrost\n");
+    put(&device.join("power/runtime_status"), "active\n");
+    let status = device.join("power/runtime_status");
+    let mut collector = GpuDevicesCollector::with_fs(fake, &drm, &accel);
+    assert_eq!(
+        collector.discover(&Env::default()),
+        Health::Absent(Absent::NoHardware)
+    );
+    let touched_after_discovery = collector.fs.touched.len();
+    let mut frame = MonitorFrame::default();
+    for tick in 0..10 {
+        collector
+            .sample(
+                &TickCtx {
+                    tick,
+                    now_ms: tick * 1_000,
+                },
+                &mut frame,
+            )
+            .unwrap();
+    }
+
+    assert!(frame.parts.gpu_devices.devices.is_empty());
+    let touched = &collector.fs.touched[touched_after_discovery..];
+    assert_eq!(touched.len(), 10);
+    assert!(touched.iter().all(|path| path == &status));
+}
+
+#[test]
+fn deferred_initialization_deduplicates_against_already_known_slots() {
+    let (_root, fake, drm, accel) = fixture();
+    add_card(&drm, "card0", "0000:c1:00.0", "amdgpu");
+    add_card(&drm, "card1", "0000:c1:00.0", "amdgpu");
+    let delayed_status = drm.join("card0/device/power/runtime_status");
+    fs::write(&delayed_status, "suspended\n").unwrap();
+    let mut collector = GpuDevicesCollector::with_fs(fake, &drm, &accel);
+    assert_eq!(collector.discover(&Env::default()), Health::Ok);
+
+    fs::write(&delayed_status, "active\n").unwrap();
+    let mut frame = MonitorFrame::default();
+    collector
+        .sample(
+            &TickCtx {
+                tick: 1,
+                now_ms: 500,
+            },
+            &mut frame,
+        )
+        .unwrap();
+
+    assert_eq!(frame.parts.gpu_devices.devices.len(), 1);
+    assert_eq!(frame.parts.gpu_devices.devices[0].card, 1);
+}
+
+#[test]
 fn apu_thresholds_classify_without_uma_directory() {
     let (_root, fake, drm, accel) = fixture();
     add_card(&drm, "card0", "0000:c1:00.0", "amdgpu");
