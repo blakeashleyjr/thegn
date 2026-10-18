@@ -179,7 +179,7 @@ fn switching_tabs_records_where_to_reopen() {
     // reopens — but nothing ever wrote it, so "reopen where you left off"
     // always reopened on CPU.
     let (mut ov, _m, _h) = open();
-    assert_eq!(ov.prefs().last_tab, MonitorTab::Cpu);
+    assert_eq!(ov.prefs().last_tab, MonitorTab::Overview);
 
     // Cycling writes it…
     let out = key(&mut ov, KeyCode::Tab);
@@ -263,7 +263,7 @@ fn digits_index_the_visible_tabs_not_the_full_list() {
     let tabs = ov.tabs.clone();
     ch(&mut ov, '3');
     assert_eq!(ov.tab, tabs[2]);
-    assert_ne!(ov.tab, MonitorTab::ALL[2], "indexed ALL, not visible");
+    assert_ne!(ov.tab, MonitorTab::ALL[3], "indexed ALL, not visible");
     // Out of range is a no-op, never a panic.
     let before = ov.tab;
     ch(&mut ov, '9');
@@ -2214,4 +2214,85 @@ fn gpu_monitor_labels_shared_memory_and_preserves_vram_for_discrete_cards() {
     let discrete = labels(false);
     assert!(discrete.contains(&"vram".to_owned()));
     assert!(discrete.contains(&"vram used".to_owned()));
+}
+
+#[test]
+fn overview_is_the_first_default_tab_and_old_cpu_slug_restores() {
+    assert_eq!(MonitorTab::ALL[0], MonitorTab::Overview);
+    assert_eq!(MonitorTab::default(), MonitorTab::Overview);
+    assert_eq!(MonitorTab::from_key("overview"), Some(MonitorTab::Overview));
+    assert_eq!(MonitorTab::from_key("cpu"), Some(MonitorTab::Cpu));
+    let (mut overlay, _model, _history) = open();
+    ch(&mut overlay, '1');
+    assert_eq!(overlay.tab(), MonitorTab::Overview);
+}
+
+#[test]
+fn overview_ingest_is_visible_only_and_pause_freezes_its_copy() {
+    let (mut overlay, _, _) = open();
+    let frame = thegn_metrics::collect::frame::MonitorFrame {
+        parts: thegn_metrics::collect::frame::Parts {
+            cpu_stat: thegn_metrics::collect::model::cpu_stat::CpuStatPart {
+                procs_running: Some(7),
+                ..Default::default()
+            },
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    assert!(!overlay.ingest_frame(&frame));
+    overlay.tab = MonitorTab::Overview;
+    assert!(overlay.ingest_frame(&frame));
+    assert_eq!(overlay.overview.cpu.procs_running, Some(7));
+    overlay.handle_key(&KeyCode::Char(' '), NONE);
+    assert!(overlay.is_paused());
+    let next_frame = thegn_metrics::collect::frame::MonitorFrame {
+        parts: thegn_metrics::collect::frame::Parts {
+            cpu_stat: thegn_metrics::collect::model::cpu_stat::CpuStatPart {
+                procs_running: Some(99),
+                ..Default::default()
+            },
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    assert!(!overlay.ingest_frame(&next_frame));
+    assert_eq!(overlay.overview.cpu.procs_running, Some(7));
+}
+
+#[test]
+fn overview_demand_omits_absent_power_and_is_not_all_collectors() {
+    let (mut overlay, model, _history) = open_on(Rect::full(160, 48), StatsSnapshot::default());
+    overlay.tab = MonitorTab::Overview;
+    overlay.overview.absorb_stats(&model.stats);
+    let demand = overlay.demand(1000);
+    assert!(
+        !demand
+            .collectors
+            .contains(thegn_metrics::collect::CollectorId::PowerSupply)
+    );
+    assert!(demand.collectors.len() < thegn_metrics::collect::CollectorId::ALL.len());
+    assert!(
+        !overlay
+            .placed_panels()
+            .iter()
+            .any(|panel| panel.id.0 == "overview.power")
+    );
+}
+
+#[test]
+fn overview_is_one_and_cpu_moves_to_two_while_saved_cpu_slug_still_opens() {
+    let (mut overlay, model, history) = open();
+    ch(&mut overlay, '1');
+    assert_eq!(overlay.tab(), MonitorTab::Overview);
+    ch(&mut overlay, '2');
+    assert_eq!(overlay.tab(), MonitorTab::Cpu);
+
+    let prefs = MonitorPrefs {
+        last_tab: MonitorTab::from_key("cpu").unwrap(),
+        ..Default::default()
+    };
+    let ctx = ctx_at(&history, Rect::full(120, 40));
+    let restored = MonitorOverlay::open(prefs.last_tab, prefs, &model, &ctx);
+    assert_eq!(restored.tab(), MonitorTab::Cpu);
 }

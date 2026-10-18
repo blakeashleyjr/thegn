@@ -9,6 +9,7 @@ use crate::{
 use thegn_metrics::collect::{CollectorId, CollectorSet};
 
 use super::layout::{self, Node, PanelId, PanelSpec, Placed, Solution, Variant, VariantKind};
+use super::tabs::overview::{OverviewModel, OverviewView};
 use crate::monitor_sampler::Demand;
 
 /// The small surface a tab exposes to the board. `rows` describes its
@@ -29,8 +30,60 @@ pub(super) trait TabView {
 
 /// A tab that still renders its existing section stack as one full-area panel.
 /// Its all-collector demand intentionally keeps F7 history filling as it does
-/// today, while every monitor tab remains on the legacy data path.
+/// today, while every other monitor tab remains on the legacy data path.
 pub(super) struct LegacyTab;
+
+pub(super) enum ActiveView<'a> {
+    Legacy(LegacyTab),
+    Overview(OverviewView<'a>),
+}
+
+impl TabView for ActiveView<'_> {
+    fn specs(&self) -> &'static [PanelSpec] {
+        match self {
+            Self::Legacy(view) => view.specs(),
+            Self::Overview(view) => view.specs(),
+        }
+    }
+
+    fn template(&self) -> Node {
+        match self {
+            Self::Legacy(view) => view.template(),
+            Self::Overview(view) => view.template(),
+        }
+    }
+
+    fn demand(&self, panel: PanelId) -> CollectorSet {
+        match self {
+            Self::Legacy(view) => view.demand(panel),
+            Self::Overview(view) => view.demand(panel),
+        }
+    }
+
+    fn paint(
+        &self,
+        surface: &mut Surface,
+        placed: &Placed,
+        rect: Rect,
+        scroll: usize,
+        sections: &[Section],
+    ) {
+        match self {
+            Self::Legacy(view) => view.paint(surface, placed, rect, scroll, sections),
+            Self::Overview(view) => view.paint(surface, placed, rect, scroll, sections),
+        }
+    }
+}
+
+impl<'a> ActiveView<'a> {
+    pub(super) fn for_tab(tab: super::MonitorTab, model: &'a OverviewModel) -> Self {
+        if tab == super::MonitorTab::Overview {
+            ActiveView::Overview(OverviewView(model))
+        } else {
+            ActiveView::Legacy(LegacyTab)
+        }
+    }
+}
 
 const LEGACY_PANEL: PanelId = PanelId("legacy");
 const LEGACY_VARIANTS: [Variant; 1] = [Variant {

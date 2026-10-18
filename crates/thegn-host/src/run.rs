@@ -12619,6 +12619,9 @@ async fn event_loop<T: Terminal>(
         if let Some(frame) = monitor_sampler.take_latest() {
             loop_perf.tick(crate::perf::WakeSource::Stats);
             monitor_history.ingest_frame(&frame, crate::monitor::history::wall_now_ms());
+            dirty |= monitor
+                .as_mut()
+                .is_some_and(|overlay| overlay.ingest_frame(&frame));
             monitor_sampler.recycle(frame);
         }
         // Hydration can clear process state while a Processes overlay remains

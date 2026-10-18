@@ -8,8 +8,8 @@ contexts: [overlay:monitor]
 
 # System monitor
 
-A tabbed, live view of what this machine is doing: CPU, memory, temperature,
-network, disk, GPU, power, processes, containers, and notifications.
+A tabbed, live view of what this machine is doing: Overview, CPU, memory,
+temperature, network, disk, GPU, power, processes, containers, and notifications.
 `Ctrl-Alt-Shift-M` opens it (the capital `M` in the binding is the Shift —
 `Ctrl-Alt-m` is the notification-mode cycle), or run **System monitor** from
 the command palette. Pressing the same chord again closes it. `Ctrl-g` still
@@ -89,6 +89,14 @@ can see.
 advertises only the keys the tab in front of you actually has: the graph
 toggles appear on the graph tabs, the row actions on the tab that owns them,
 and `spc` pause on every tab.
+
+## Overview
+
+Overview is the default landing tab. It summarizes CPU and per-core activity,
+load and pressure, memory health, network rates, disk activity, thermal state,
+power when a battery is present, and process/container counts. Panels appear
+when their source has a reading; absent readings use the terminal absent mark.
+If every optional tab appears, Notifications is eleventh and has no digit key.
 
 ## CPU
 
