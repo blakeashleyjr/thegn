@@ -621,7 +621,7 @@ fn render_targets(
     rect: Rect,
     buf: &mut Buffer,
     theme: &Theme,
-    mut context: PanelRenderContext<'_>,
+    context: PanelRenderContext<'_>,
 ) {
     let mut entries = Vec::new();
     for (target_index, target) in targets.iter().enumerate() {
