@@ -272,6 +272,72 @@ fn cookie_and_result_capacities_are_stable_across_one_thousand_dumps() {
 }
 
 #[test]
+fn socket_churn_rebuilds_tombstones_without_changing_live_deltas() {
+    let mut map = CookieDelta::new();
+    let mut owners = table();
+    let mut result = NetAttribution::default();
+    let capacity = 4_096;
+
+    for tick in 0_u64..200 {
+        let mut sockets = Vec::with_capacity(520);
+        for index in 0_u64..20 {
+            sockets.push(socket(index + 1, Some(1_000 + index), tick * 3, tick * 5));
+        }
+        for index in 0_u64..500 {
+            sockets.push(socket(1_000_000 + tick * 500 + index, None, tick, tick));
+        }
+        update(&mut map, &sockets, 0, 0, &mut owners, &mut result);
+
+        assert_eq!(map.capacity(), capacity);
+        assert!(
+            map.tombstone_count() <= capacity / 4,
+            "dump {tick}: {} tombstones exceed the quarter-capacity limit",
+            map.tombstone_count()
+        );
+        assert!(
+            map.probes_last_update() < 64 * sockets.len(),
+            "dump {tick}: {} probes for {} sockets exceeds the hand-derived 64 probes/socket bound",
+            map.probes_last_update(),
+            sockets.len()
+        );
+
+        for index in 0_u64..20 {
+            let owner = result
+                .owners
+                .iter()
+                .find(|owner| owner.cgroup_id == 1_000 + index)
+                .expect("long-lived socket owner remains present");
+            let expected: (u64, u64) = if tick == 0 { (0, 0) } else { (3, 5) };
+            assert_eq!((owner.tx_bytes, owner.rx_bytes), expected);
+        }
+    }
+    map.close();
+    assert_eq!(map.capacity(), 0);
+    assert!(map.scratch.is_none());
+}
+
+#[test]
+fn socket_churn_probe_count_stays_bounded_after_table_warmup() {
+    let mut map = CookieDelta::new();
+    let mut owners = table();
+    let mut result = NetAttribution::default();
+
+    for tick in 0_u64..200 {
+        let sockets: Vec<_> = (0_u64..500)
+            .map(|index| socket(2_000_000 + tick * 500 + index, None, tick, tick))
+            .collect();
+        update(&mut map, &sockets, 0, 0, &mut owners, &mut result);
+    }
+
+    let last_probe_count = map.probes_last_update();
+    assert!(
+        last_probe_count < 64 * 500,
+        "final churn dump used {last_probe_count} probes for 500 sockets; expected fewer than {}",
+        64 * 500
+    );
+}
+
+#[test]
 fn physical_remainder_saturates_at_zero() {
     let mut map = CookieDelta::new();
     let mut owners = table();

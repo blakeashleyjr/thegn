@@ -13,6 +13,8 @@ use crate::collect::{
 };
 
 const COOKIE_CAPACITY: usize = 4_096;
+// Rebuild before tombstones can consume more than one quarter of the probe table.
+const COOKIE_TOMBSTONE_LIMIT: usize = COOKIE_CAPACITY / 4;
 const OWNER_CAPACITY: usize = 64;
 const MAX_STATS_PER_REFRESH: usize = 64;
 const MAX_FRONTIER_PATHS: usize = 4_096;
@@ -31,9 +33,13 @@ struct CookieEntry {
 #[derive(Default)]
 pub struct CookieDelta {
     entries: Option<Box<[CookieEntry]>>,
+    scratch: Option<Box<[CookieEntry]>>,
+    tombstones: usize,
     generation: u64,
     totals: Vec<(u64, u64, u64)>,
     ids: Vec<u64>,
+    #[cfg(test)]
+    probes_last_update: usize,
 }
 
 impl CookieDelta {
@@ -47,6 +53,12 @@ impl CookieDelta {
 
     pub fn close(&mut self) {
         self.entries = None;
+        self.scratch = None;
+        self.tombstones = 0;
+        #[cfg(test)]
+        {
+            self.probes_last_update = 0;
+        }
         self.generation = 0;
         self.totals.clear();
         self.ids.clear();
@@ -66,6 +78,13 @@ impl CookieDelta {
         let entries = self.entries.get_or_insert_with(|| {
             vec![CookieEntry::default(); COOKIE_CAPACITY].into_boxed_slice()
         });
+        self.scratch.get_or_insert_with(|| {
+            vec![CookieEntry::default(); COOKIE_CAPACITY].into_boxed_slice()
+        });
+        #[cfg(test)]
+        {
+            self.probes_last_update = 0;
+        }
         self.generation = self.generation.wrapping_add(1).max(1);
         let generation = self.generation;
         self.totals.clear();
@@ -81,11 +100,19 @@ impl CookieDelta {
                 continue;
             };
             let index = hash_cookie(cookie) % entries.len();
-            let Some(slot) = find_slot(entries, index, cookie) else {
+            let (slot, probes) = find_slot(entries, index, cookie);
+            #[cfg(test)]
+            {
+                self.probes_last_update += probes;
+            }
+            let Some(slot) = slot else {
                 truncated = true;
                 continue;
             };
             let entry = &mut entries[slot];
+            if entry.tombstone {
+                self.tombstones -= 1;
+            }
             let (rx_delta, tx_delta) = if entry.occupied && entry.cookie == cookie {
                 (rx.saturating_sub(entry.rx), tx.saturating_sub(entry.tx))
             } else {
@@ -126,7 +153,17 @@ impl CookieDelta {
             if entry.occupied && entry.generation != generation {
                 entry.occupied = false;
                 entry.tombstone = true;
+                self.tombstones += 1;
             }
+        }
+
+        if self.tombstones > COOKIE_TOMBSTONE_LIMIT {
+            let scratch = self
+                .scratch
+                .as_mut()
+                .expect("scratch allocated with entries");
+            rebuild_cookie_table(entries, scratch);
+            self.tombstones = 0;
         }
 
         self.ids.clear();
@@ -147,6 +184,16 @@ impl CookieDelta {
         out.unattributed_rx = physical_rx.saturating_sub(attributed_rx);
         out.unattributed_tx = physical_tx.saturating_sub(attributed_tx);
         out.truncated = truncated;
+    }
+
+    #[cfg(test)]
+    fn tombstone_count(&self) -> usize {
+        self.tombstones
+    }
+
+    #[cfg(test)]
+    fn probes_last_update(&self) -> usize {
+        self.probes_last_update
     }
 }
 
@@ -175,22 +222,39 @@ fn hash_cookie(cookie: u64) -> usize {
     mixed as usize
 }
 
-fn find_slot(entries: &[CookieEntry], start: usize, cookie: u64) -> Option<usize> {
+fn find_slot(entries: &[CookieEntry], start: usize, cookie: u64) -> (Option<usize>, usize) {
     let mut tombstone = None;
     for offset in 0..entries.len() {
         let index = (start + offset) % entries.len();
         let entry = &entries[index];
         if entry.occupied && entry.cookie == cookie {
-            return Some(index);
+            return (Some(index), offset + 1);
         }
         if entry.tombstone && tombstone.is_none() {
             tombstone = Some(index);
         }
         if !entry.occupied && !entry.tombstone {
-            return Some(tombstone.unwrap_or(index));
+            return (Some(tombstone.unwrap_or(index)), offset + 1);
         }
     }
-    tombstone
+    (tombstone, entries.len())
+}
+
+fn rebuild_cookie_table(entries: &mut [CookieEntry], scratch: &mut [CookieEntry]) {
+    scratch.fill(CookieEntry::default());
+    for entry in entries.iter().filter(|entry| entry.occupied) {
+        let start = hash_cookie(entry.cookie) % scratch.len();
+        let slot = (0..scratch.len())
+            .map(|offset| (start + offset) % scratch.len())
+            .find(|index| !scratch[*index].occupied)
+            .expect("live entries fit in cookie table");
+        scratch[slot] = CookieEntry {
+            tombstone: false,
+            ..*entry
+        };
+    }
+    std::mem::swap(entries, scratch);
+    scratch.fill(CookieEntry::default());
 }
 
 /// Small filesystem seam used by the bounded cgroup-id walk and its tests.
