@@ -1947,68 +1947,54 @@ fn disk_volume_row_displays_collapsed_mount_count() {
 }
 
 #[test]
-fn memory_tab_distinguishes_available_from_truly_free_memory() {
+fn memory_tab_wires_board_demand_and_freezes_frames() {
     let hist = TelemetryHistory::default();
-    let screen = Rect::full(120, 40);
+    let screen = Rect::full(160, 60);
     let stats = StatsSnapshot {
         mem_gib: Some((8.0, 32.0)),
         mem_free_gib: Some(3.0),
         ..full_snap()
     };
     let model = model_with(stats);
-    let ov = open_tab(MonitorTab::Memory, &model, &hist, screen);
-    let cells = ov
-        .body
-        .iter()
-        .find_map(|section| match section {
-            Section::Grid { cells, .. } => Some(cells),
-            _ => None,
-        })
-        .expect("memory breakdown grid");
-    assert!(
-        cells
-            .iter()
-            .any(|(key, value, _)| key == "available" && value == "24.0G")
-    );
-    assert!(
-        cells
-            .iter()
-            .any(|(key, value, _)| key == "free" && value == "3.0G")
-    );
-    assert!(
-        !cells
-            .iter()
-            .any(|(key, value, _)| key == "free" && value == "24.0G")
-    );
-    let text = render_text(&ov, 120, 40);
-    assert!(text.contains("available"), "{text}");
-    assert!(
-        text.contains("24.0G"),
-        "available must be total minus used: {text}"
-    );
-    assert!(text.contains("free"), "{text}");
-    assert!(
-        text.contains("3.0G"),
-        "free must come from mem_free_gib: {text}"
-    );
-    assert!(
-        text.lines()
-            .all(|line| !(line.contains("free") && line.contains("24.0G"))),
-        "available was mislabeled free: {text}"
-    );
-
-    let stats = StatsSnapshot {
-        mem_gib: Some((8.0, 32.0)),
-        mem_free_gib: None,
-        ..full_snap()
+    let mut ov = open_tab(MonitorTab::Memory, &model, &hist, screen);
+    let placed = ov.placed_panels();
+    assert!(placed.iter().any(|panel| panel.id.0.starts_with("memory.")));
+    assert!(!placed.iter().any(|panel| panel.id.0 == "legacy"));
+    assert!(placed.iter().any(|panel| panel.id.0 == "memory.limit"));
+    let demand = {
+        use super::board::TabView as _;
+        let view = ov.view();
+        let demand = ov.board.demand(&view, ov.body_rect(), 1000).collectors;
+        let expected = placed.iter().fold(
+            thegn_metrics::collect::CollectorSet::empty(),
+            |mut set, panel| {
+                for id in view.demand(panel.id).iter() {
+                    set.insert(id);
+                }
+                set
+            },
+        );
+        assert_eq!(demand, expected);
+        demand
     };
-    let model = model_with(stats);
-    let ov = open_tab(MonitorTab::Memory, &model, &hist, screen);
-    let text = render_text(&ov, 120, 40);
-    assert!(
-        !text.contains("free"),
-        "unknown free memory must omit that cell: {text}"
+    assert!(demand.contains(thegn_metrics::collect::CollectorId::CgroupSlice));
+    assert!(!demand.contains(thegn_metrics::collect::CollectorId::CpuStat));
+
+    let mut frame = thegn_metrics::collect::frame::MonitorFrame::default();
+    thegn_metrics::collect::parse::meminfo::parse(
+        b"MemTotal: 32768 kB\nMemAvailable: 24576 kB\nMemFree: 3072 kB\n",
+        &mut frame.parts.meminfo.raw,
     );
+    assert!(ov.ingest_frame(&frame));
+    assert_eq!(ov.memory.total, Some(32 * 1024 * 1024));
+    ov.paused = true;
+    let mut next = thegn_metrics::collect::frame::MonitorFrame::default();
+    thegn_metrics::collect::parse::meminfo::parse(
+        b"MemTotal: 65536 kB\nMemAvailable: 32768 kB\n",
+        &mut next.parts.meminfo.raw,
+    );
+    assert!(!ov.ingest_frame(&next));
+    assert_eq!(ov.memory.total, Some(32 * 1024 * 1024));
 }
 
 #[test]

@@ -468,6 +468,7 @@ pub struct MonitorOverlay {
     board: board::Board,
     overview: tabs::overview::OverviewModel,
     cpu: tabs::cpu::view::CpuModel,
+    memory: tabs::memory::view::MemoryModel,
 }
 
 impl MonitorOverlay {
@@ -525,6 +526,7 @@ impl MonitorOverlay {
             board: board::Board::default(),
             overview: tabs::overview::OverviewModel::default(),
             cpu: tabs::cpu::view::CpuModel::default(),
+            memory: tabs::memory::view::MemoryModel::default(),
         };
         ov.rebuild(model, ctx, false);
         ov
@@ -602,6 +604,9 @@ impl MonitorOverlay {
     fn view(&self) -> board::ActiveView<'_> {
         match self.tab {
             MonitorTab::Cpu => board::ActiveView::Cpu(tabs::cpu::view::CpuView(&self.cpu)),
+            MonitorTab::Memory => {
+                board::ActiveView::Memory(tabs::memory::view::MemoryView(&self.memory))
+            }
             _ => board::ActiveView::for_tab(self.tab, &self.overview),
         }
     }
@@ -614,6 +619,10 @@ impl MonitorOverlay {
         }
         if self.tab == MonitorTab::Cpu {
             self.cpu.absorb_frame(frame);
+            return true;
+        }
+        if self.tab == MonitorTab::Memory {
+            self.memory.absorb_frame(frame);
             return true;
         }
         self.overview.absorb_frame(frame);
