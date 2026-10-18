@@ -34,6 +34,7 @@ mod gpu_nvml;
 mod gpu_sysfs;
 mod net_kind;
 mod net_medium;
+mod power_presence;
 mod procs;
 pub mod procs_fs;
 #[cfg(target_os = "linux")]
@@ -134,6 +135,9 @@ pub struct StatsSnapshot {
     /// from the native energy/charge and power counters. Absent when idle or
     /// unavailable.
     pub battery_eta_secs: Option<u64>,
+    /// Static indication that the machine exposes power rails, a platform
+    /// profile, or an AC/USB power source. Probed once by the sampler.
+    pub power_present: bool,
     /// Free space on the worktrees' filesystem, as a percentage 0–100.
     pub disk_free_pct: Option<u8>,
     /// Worktrees' filesystem capacity as (total bytes, available bytes). Absent

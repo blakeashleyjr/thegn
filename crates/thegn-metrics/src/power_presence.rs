@@ -1,0 +1,99 @@
+use std::path::Path;
+
+/// Probe static sysfs facts that make the Power tab useful without a battery.
+/// Called once when the stats sampler is built, away from the UI loop.
+pub(crate) fn probe(root: &Path) -> bool {
+    has_powercap(root) || root.join("firmware/acpi/platform_profile").exists() || has_mains(root)
+}
+
+fn has_powercap(root: &Path) -> bool {
+    let path = root.join("class/powercap");
+    let Ok(zones) = std::fs::read_dir(path) else {
+        return false;
+    };
+
+    zones.take(64).flatten().any(|zone| {
+        let path = zone.path();
+        path.join("energy_uj").exists() || path.join("power_uw").exists()
+    })
+}
+
+fn has_mains(root: &Path) -> bool {
+    let path = root.join("class/power_supply");
+    let Ok(supplies) = std::fs::read_dir(path) else {
+        return false;
+    };
+
+    supplies.take(64).flatten().any(|supply| {
+        std::fs::read_to_string(supply.path().join("type"))
+            .is_ok_and(|kind| matches!(kind.trim(), "Mains" | "USB"))
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::probe;
+    use std::path::Path;
+
+    fn mkdir(root: &Path, path: &str) {
+        std::fs::create_dir_all(root.join(path)).unwrap();
+    }
+
+    fn write(root: &Path, path: &str, contents: &str) {
+        std::fs::write(root.join(path), contents).unwrap();
+    }
+
+    fn battery_only(root: &Path) {
+        mkdir(root, "class/power_supply/BAT0");
+        write(root, "class/power_supply/BAT0/type", "Battery\n");
+    }
+
+    fn rapl_only(root: &Path) {
+        mkdir(root, "class/powercap/intel-rapl:0");
+        write(root, "class/powercap/intel-rapl:0/energy_uj", "");
+    }
+
+    fn powercap_power_only(root: &Path) {
+        mkdir(root, "class/powercap/package-0");
+        write(root, "class/powercap/package-0/power_uw", "");
+    }
+
+    fn profile_only(root: &Path) {
+        mkdir(root, "firmware/acpi");
+        write(root, "firmware/acpi/platform_profile", "balanced\n");
+    }
+
+    fn mains_only(root: &Path) {
+        mkdir(root, "class/power_supply/AC");
+        write(root, "class/power_supply/AC/type", "Mains\n");
+    }
+
+    fn usb_only(root: &Path) {
+        mkdir(root, "class/power_supply/USB");
+        write(root, "class/power_supply/USB/type", "USB\n");
+    }
+
+    fn empty(root: &Path) {
+        mkdir(root, "class");
+    }
+
+    #[test]
+    fn power_presence_probe_recognizes_static_sources() {
+        let temp = tempfile::tempdir().unwrap();
+        let cases: [(&str, fn(&Path), bool); 7] = [
+            ("battery only", battery_only, false),
+            ("RAPL only", rapl_only, true),
+            ("powercap power only", powercap_power_only, true),
+            ("platform profile only", profile_only, true),
+            ("mains only", mains_only, true),
+            ("USB only", usb_only, true),
+            ("nothing", empty, false),
+        ];
+
+        for (name, setup, expected) in cases {
+            let root = temp.path().join(name.replace(' ', "-"));
+            setup(&root);
+            assert_eq!(probe(&root), expected, "unexpected probe result for {name}");
+        }
+    }
+}

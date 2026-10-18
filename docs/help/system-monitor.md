@@ -214,8 +214,9 @@ against battery capacity, and draw magnitude against its labelled peak with the
 current signed direction shown; and `power.policy` shows profile, boost, and EPP
 as status chips. Frame and telemetry histories use separate scales. Unavailable
 readings use the platform's absent or warming mark.
-Panel focus and zoom use `f`/`F` and `z`. The tab appears when a battery source
-is available; the battery masthead chip opens it.
+Panel focus and zoom use `f`/`F` and `z`. The tab appears when a battery, power
+rail, platform profile, or mains/USB power source is available; the battery
+masthead chip opens it.
 
 ## Processes
 

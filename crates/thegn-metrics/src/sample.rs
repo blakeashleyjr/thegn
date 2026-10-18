@@ -78,6 +78,7 @@ pub struct StatsSampler {
     #[cfg(target_os = "linux")]
     base_temp: crate::base_temp::BaseTemp,
     battery: crate::battery::BatteryReader,
+    power_present: bool,
     disk_path: std::path::PathBuf,
     tick: u64,
     /// CPU usage needs a delta; the first sample only primes it.
@@ -219,6 +220,7 @@ impl StatsSampler {
             battery: crate::battery::BatteryReader::new(std::path::PathBuf::from(
                 "/sys/class/power_supply",
             )),
+            power_present: crate::power_presence::probe(std::path::Path::new("/sys")),
             disk_path,
             tick: 0,
             cpu_primed: false,
@@ -303,6 +305,7 @@ impl StatsSampler {
     /// Take one reading (blocking refreshes — ticker-thread only).
     pub fn sample(&mut self) -> StatsSnapshot {
         let mut snap = StatsSnapshot::default();
+        snap.power_present = self.power_present;
         let now = Instant::now();
         let slow = self.tick.is_multiple_of(SLOW_EVERY);
 
