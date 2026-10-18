@@ -17,6 +17,8 @@ mod base_cpu;
 mod base_mem;
 #[cfg(target_os = "linux")]
 mod base_net;
+#[cfg(target_os = "linux")]
+mod base_temp;
 mod battery;
 pub mod collect;
 mod coverage;
