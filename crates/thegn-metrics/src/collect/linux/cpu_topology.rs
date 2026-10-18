@@ -1,5 +1,6 @@
 //! Linux CPU topology discovery with online-set refreshes.
 
+use crate::collect::frame::Part as _;
 use std::{
     io,
     path::{Path, PathBuf},

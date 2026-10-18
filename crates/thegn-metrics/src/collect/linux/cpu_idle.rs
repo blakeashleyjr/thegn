@@ -2,7 +2,7 @@
 
 use std::{
     fs::File,
-    io::{self, Read},
+    io::Read,
     os::unix::fs::FileExt,
     path::{Path, PathBuf},
 };
