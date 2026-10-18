@@ -238,7 +238,7 @@ fn empty_zone_panel_still_requests_its_collector() {
     let mut model = ThermalModel::default();
     model.absorb_frame(&frame);
     let view = ThermalView(&model);
-    let mut board = Board::default();
+    let board = Board::default();
     let placed = board.placed(&view, Rect::full(160, 45));
     assert!(
         placed
