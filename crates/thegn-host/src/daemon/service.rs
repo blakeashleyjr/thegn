@@ -33,6 +33,7 @@ use super::tombstone::Tombstone;
 /// recording finish, and 500 ms of output drain; the rest is scheduling slack.
 const SHUTDOWN_DRAIN_DEADLINE: std::time::Duration = std::time::Duration::from_secs(5);
 const SHUTDOWN_REAP_DEADLINE: std::time::Duration = std::time::Duration::from_secs(2);
+const SHUTDOWN_ABORT_JOIN_DEADLINE: std::time::Duration = std::time::Duration::from_secs(1);
 
 /// One live session in the daemon's table.
 pub(crate) struct SessionEntry {
@@ -214,8 +215,35 @@ impl DaemonService {
                     "session process reap deadline expired"
                 );
             }
-            for task in tasks {
+            let task_ids = tasks
+                .iter()
+                .map(tokio::task::JoinHandle::id)
+                .collect::<Vec<_>>();
+            for task in &tasks {
                 task.abort();
+            }
+            let abort_join_deadline = tokio::time::Instant::now() + SHUTDOWN_ABORT_JOIN_DEADLINE;
+            let mut still_running = Vec::new();
+            for (index, task) in tasks.into_iter().enumerate() {
+                match tokio::time::timeout_at(abort_join_deadline, task).await {
+                    Ok(Err(error)) if error.is_cancelled() => {}
+                    Ok(Err(error)) => {
+                        tracing::debug!(%error, task_id = ?task_ids[index], "session actor task ended during abort join");
+                    }
+                    Ok(Ok(())) => {
+                        tracing::debug!(task_id = ?task_ids[index], "session actor task completed during abort join");
+                    }
+                    Err(_) => {
+                        still_running.extend_from_slice(&task_ids[index..]);
+                        break;
+                    }
+                }
+            }
+            if !still_running.is_empty() {
+                tracing::warn!(
+                    ?still_running,
+                    "session actor tasks remained after abort-join deadline"
+                );
             }
             self.sessions.lock().await.clear();
         }
@@ -2789,6 +2817,92 @@ mod tests {
             actor_dropped_rx.await.is_err(),
             "the outstanding actor task must be aborted"
         );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn shutdown_joins_aborted_actor_before_returning() {
+        struct DropFlag(std::sync::Arc<std::sync::atomic::AtomicBool>);
+
+        impl Drop for DropFlag {
+            fn drop(&mut self) {
+                self.0.store(true, std::sync::atomic::Ordering::Release);
+            }
+        }
+
+        let (svc, _rx) = service(0);
+        let (msg_tx, _msg_rx) = mpsc::channel(1);
+        assert!(msg_tx.try_send(SessionMsg::Kill).is_ok());
+        svc.sessions
+            .lock()
+            .await
+            .insert("s1".into(), shutdown_test_entry(msg_tx));
+
+        let dropped = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (started_tx, started_rx) = oneshot::channel();
+        let actor_dropped = std::sync::Arc::clone(&dropped);
+        svc.actor_tasks.lock().await.push(tokio::spawn(async move {
+            let _drop_flag = DropFlag(actor_dropped);
+            started_tx.send(()).expect("test observes actor start");
+            std::future::pending::<()>().await;
+        }));
+        started_rx.await.expect("actor started before shutdown");
+
+        svc.shutdown_sessions().await;
+
+        assert!(
+            dropped.load(std::sync::atomic::Ordering::Acquire),
+            "actor drop cleanup must finish before shutdown returns"
+        );
+        assert!(svc.sessions.lock().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn shutdown_bounds_abort_join_for_blocking_actor_task() {
+        let (svc, _rx) = service(0);
+        let (started_tx, started_rx) = oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let (finished_tx, finished_rx) = oneshot::channel();
+        svc.actor_tasks
+            .lock()
+            .await
+            .push(tokio::task::spawn_blocking(move || {
+                started_tx
+                    .send(())
+                    .expect("test observes blocking actor start");
+                release_rx.recv().expect("test releases blocking actor");
+                finished_tx
+                    .send(())
+                    .expect("test observes blocking actor finish");
+            }));
+        started_rx.await.expect("blocking actor started");
+
+        let drain_deadline = std::time::Duration::from_millis(50);
+        let shutdown_budget = drain_deadline
+            + SHUTDOWN_REAP_DEADLINE
+            + SHUTDOWN_ABORT_JOIN_DEADLINE
+            + std::time::Duration::from_secs(1);
+        let shutdown_started = std::time::Instant::now();
+        let result = tokio::time::timeout(
+            shutdown_budget,
+            svc.shutdown_sessions_within(drain_deadline),
+        )
+        .await;
+        assert!(
+            result.is_ok(),
+            "shutdown must return within drain, reap, and abort-join deadlines"
+        );
+        assert!(
+            shutdown_started.elapsed() >= SHUTDOWN_ABORT_JOIN_DEADLINE,
+            "shutdown must wait through the abort-join deadline for the blocked task"
+        );
+        assert!(svc.sessions.lock().await.is_empty());
+
+        release_tx
+            .send(())
+            .expect("blocking actor is still waiting");
+        finished_rx
+            .await
+            .expect("blocking actor finished after release");
     }
 
     #[tokio::test(start_paused = true)]
