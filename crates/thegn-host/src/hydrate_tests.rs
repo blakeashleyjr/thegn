@@ -402,6 +402,51 @@ fn glyph_rescan_tiering() {
 }
 
 #[test]
+fn patching_cached_glyph_counts_preserves_the_scan_age() {
+    let path = format!("/test/patch-glyph-{}", std::process::id());
+    let scanned_at = Instant::now() - Duration::from_secs(1);
+    glyph_cache()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(
+            path.clone(),
+            (
+                crate::glyph_types::GlyphRow {
+                    dirty: true,
+                    ahead: 0,
+                    behind: 0,
+                    branch: Some("main".into()),
+                    repo_root: "/repo".into(),
+                    add: thegn_svc::git::DiffCount::Exact(3),
+                    del: thegn_svc::git::DiffCount::Exact(2),
+                    branch_diff: None,
+                    submodule_dirty: false,
+                },
+                scanned_at,
+            ),
+        );
+
+    assert!(patch_glyph_ahead_behind(&path, 2, 7));
+    {
+        let cache = glyph_cache().lock().unwrap_or_else(|e| e.into_inner());
+        let (row, timestamp) = cache.get(&path).unwrap();
+        assert_eq!((row.ahead, row.behind), (2, 7));
+        assert!(row.dirty);
+        assert_eq!(row.add, thegn_svc::git::DiffCount::Exact(3));
+        assert_eq!(*timestamp, scanned_at);
+        assert!(!should_rescan_glyphs(
+            Some(Instant::now().saturating_duration_since(*timestamp)),
+            Duration::from_secs(120),
+        ));
+    }
+    assert!(!patch_glyph_ahead_behind("/test/missing-glyph-row", 0, 1));
+    glyph_cache()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .remove(&path);
+}
+
+#[test]
 fn glyph_keep_set_unions_registry_and_repo_roots() {
     // Repo roots ride along with registered worktrees — a dormant workspace's
     // home row is keyed by its repo root, which has no registry row, and must
