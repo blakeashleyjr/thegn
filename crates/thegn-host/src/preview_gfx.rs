@@ -399,7 +399,7 @@ mod tests {
         g.set("a.png".to_string(), raster());
         let stale = g.frame(Some(panel()), Some("a.png"), false, true);
         let mut pending = crate::preview_retry::PendingPreviewOob::default();
-        pending.offer(stale, Err);
+        pending.offer(stale.clone(), Err);
 
         g.set(
             "a.png".to_string(),
