@@ -112,10 +112,16 @@ pub const KEYS: &[(&[u8], MemField)] = &[
     (b"DirectMap1G", MemField::DirectMap1g),
 ];
 
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct MeminfoRaw {
     values: [u64; MemField::COUNT],
     present: u64,
+}
+
+impl Default for MeminfoRaw {
+    fn default() -> Self {
+        Self { values: [0; MemField::COUNT], present: 0 }
+    }
 }
 
 impl MeminfoRaw {
