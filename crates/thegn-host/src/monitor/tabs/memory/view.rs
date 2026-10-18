@@ -251,7 +251,11 @@ impl MemoryModel {
         fn latest(history: &MemoryHistory) -> (usize, Option<f32>) {
             let mut recent = [0.0_f32; HISTORY_CAPACITY];
             let (len, _) = history.copy_recent(&mut recent);
-            (len, len.checked_sub(1).map(|index| recent[index]))
+            let samples = recent[..len]
+                .iter()
+                .filter(|value| value.is_finite())
+                .count();
+            (samples, len.checked_sub(1).map(|index| recent[index]))
         }
         let (mem_len, mem_latest) = latest(&self.mem_telemetry);
         let (swap_len, swap_latest) = latest(&self.swap_history);
@@ -271,12 +275,13 @@ impl MemoryModel {
         ] {
             // These charts state total memory/swap = 100%, so keep the fixed
             // metric scale regardless of the selected monitor scale mode.
+            let buckets = history.generation().min(HISTORY_CAPACITY as u64) as usize;
             history.series_into(
                 &SeriesReq {
                     metric,
                     window,
                     scale: TelemetryHistory::scale_for(metric, ScaleMode::Fixed),
-                    buckets: HISTORY_CAPACITY,
+                    buckets,
                     agg: thegn_core::series::Agg::Max,
                     now_ms: now_ms.saturating_add(1),
                 },
@@ -285,10 +290,11 @@ impl MemoryModel {
             slot.clear();
             if !self.telemetry_series.0.empty() {
                 let values = self.telemetry_series.0.hi();
-                // series_into normalizes leading gaps to zero. Treat the prefix
-                // before the first nonzero sample as blank; Hold carries interior
-                // gaps after the first observed value.
-                let first_present = values.iter().position(|value| *value > 0.0);
+                // series_into normalizes leading gaps to zero. Its gap mask
+                // distinguishes those from real zero readings; Hold carries
+                // interior gaps after the first observed value.
+                let gaps = &self.telemetry_series.0.gap;
+                let first_present = gaps.iter().position(|gap| !gap);
                 for (index, &value) in values.iter().enumerate() {
                     slot.push(if first_present.is_some_and(|first| index < first) {
                         f32::NAN
