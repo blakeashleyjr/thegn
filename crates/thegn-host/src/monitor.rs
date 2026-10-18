@@ -41,6 +41,8 @@ mod graphs;
 mod invalidation;
 mod layout;
 pub(crate) mod procs_view;
+#[cfg(test)]
+mod snapshot;
 pub(crate) mod state;
 mod tabbar;
 mod tabs;
