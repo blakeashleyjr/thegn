@@ -286,8 +286,9 @@ Wine also exposes the host's Unix root as drive `Z:`, so a test that checks
 
 Known gap: all crates' test targets compile for `x86_64-pc-windows-gnu`, but
 `thegn-core`, `thegn-svc` and `thegn-host` do not yet have a clean Wine run.
-Many host and svc tests still use runtime `/bin/sh` or `/proc` guards; scope a
-run with `just test-windows-wine -p <crate>`.
+Host and svc process tests that require Linux now skip off Linux; a skipped test
+does not establish Windows behavior. Scope a run with
+`just test-windows-wine -p <crate>`.
 
 ## Testing on other platforms
 

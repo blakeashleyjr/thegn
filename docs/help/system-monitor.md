@@ -72,6 +72,8 @@ cheaper than a live one.
 
 The monitor's sampling thread exists only while it is open, waits without
 waking while paused or covered by another overlay, and stops on close.
+While open, its sampler reads the available system metrics; no monitor
+collectors run while it is closed.
 
 Note two deliberate differences from the other overlays: `Space` is pause here
 (use `PgDn` to page), and `g` cycles the graph style rather than jumping to the
