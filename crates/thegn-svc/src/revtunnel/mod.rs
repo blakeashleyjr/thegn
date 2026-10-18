@@ -216,6 +216,19 @@ async fn stop_sink(task: JoinHandle<()>) -> io::Result<()> {
     }
 }
 
+async fn supervise_sink<F>(read_loop: F, sink_task: &mut JoinHandle<()>) -> (io::Result<()>, bool)
+where
+    F: std::future::Future<Output = io::Result<()>>,
+{
+    tokio::select! {
+        result = read_loop => (result, false),
+        _ = sink_task => (
+            Err(io::Error::new(io::ErrorKind::BrokenPipe, "reverse-tunnel shared sink stopped")),
+            true,
+        ),
+    }
+}
+
 /// Any bidirectional async stream usable as a tunneled connection (a real
 /// `TcpStream`, or an in-memory `DuplexStream` in tests).
 pub trait IoStream: AsyncRead + AsyncWrite + Unpin + Send {}
@@ -345,14 +358,22 @@ fn spawn_sink_with_timeout<W: AsyncWrite + Unpin + Send + 'static>(
     let (tx, mut rx) = channel::<Vec<u8>>(CHANNEL_DEPTH);
     let task = tokio::spawn(async move {
         while let Some(bytes) = rx.recv().await {
-            if !matches!(
-                tokio::time::timeout(write_timeout, wr.write_all(&bytes)).await,
-                Ok(Ok(()))
-            ) {
-                report_global_rejection("tunnel", "write_stall");
-                break;
+            match tokio::time::timeout(write_timeout, async {
+                wr.write_all(&bytes).await?;
+                wr.flush().await
+            })
+            .await
+            {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) => {
+                    tracing::warn!(target: "thegn::revtunnel", %error, "reverse-tunnel shared sink failed");
+                    break;
+                }
+                Err(_) => {
+                    report_global_rejection("tunnel", "write_stall");
+                    break;
+                }
             }
-            let _ = wr.flush().await; // best-effort: sink may be gone
         }
     });
     (tx, task)
@@ -663,7 +684,8 @@ where
     let permits2 = permits.clone();
     let rejections2 = rejections.clone();
     let tasks2 = tasks.clone();
-    let result = read_loop(
+    let mut sink_task = sink_task;
+    let read = read_loop(
         rd,
         conns,
         move |id| {
@@ -749,10 +771,14 @@ where
             }
         },
         Some(SYNC_MAGIC),
-    )
-    .await;
+    );
+    let (result, sink_failed) = supervise_sink(read, &mut sink_task).await;
     abort_tasks(&tasks).await;
-    result.and(stop_sink(sink_task).await)
+    if sink_failed {
+        result
+    } else {
+        result.and(stop_sink(sink_task).await)
+    }
 }
 
 /// SANDBOX endpoint: accept loopback connections on `listener`, open a muxed
@@ -854,9 +880,15 @@ where
     // The sandbox never receives Open; Data/Close route to accepted conns. The
     // host→sandbox direction is thegn's own clean frame stream (no preamble),
     // so no sync marker is expected here.
-    let res = read_loop(rd, conns, |_id| async {}, None).await;
+    let mut sink_task = sink_task;
+    let (res, sink_failed) =
+        supervise_sink(read_loop(rd, conns, |_id| async {}, None), &mut sink_task).await;
     abort_tasks(&tasks).await;
-    res.and(stop_sink(sink_task).await)
+    if sink_failed {
+        res
+    } else {
+        res.and(stop_sink(sink_task).await)
+    }
 }
 
 #[cfg(test)]
@@ -2030,9 +2062,11 @@ mod tests {
         let (local, _client) = tokio::io::duplex(128);
         let (mut peer, sink_stream) = tokio::io::duplex(4096);
         let (sink, sink_task) = spawn_sink(sink_stream);
+        let survivor_sink = sink.clone();
         let (in_tx, in_rx) = channel(CHANNEL_DEPTH);
         let permits = Arc::new(Semaphore::new(1));
         let permit = permits.clone().acquire_owned().await.unwrap();
+        let before = rejection_counts().idle;
         let task = tokio::spawn(async move {
             let _permit = permit;
             pump_conn_with_deadlines(
@@ -2054,6 +2088,12 @@ mod tests {
         );
         task.await.unwrap();
         assert_eq!(permits.available_permits(), 1);
+        assert_eq!(rejection_counts().idle, before + 1);
+        survivor_sink.send(encode(&Frame::Open(191))).await.unwrap();
+        assert_eq!(
+            next_frame(&mut peer, &mut FrameDecoder::new()).await,
+            Frame::Open(191)
+        );
         stop_sink(sink_task).await.unwrap();
         drop(in_tx);
     }
@@ -2063,23 +2103,38 @@ mod tests {
         let (local, _client) = tokio::io::duplex(128);
         let (mut peer, sink_stream) = tokio::io::duplex(4096);
         let (sink, sink_task) = spawn_sink(sink_stream);
+        let survivor_sink = sink.clone();
         let (_in_tx, in_rx) = channel(CHANNEL_DEPTH);
-        let task = tokio::spawn(pump_conn_with_deadlines(
-            92,
-            Box::new(local),
-            in_rx,
-            sink,
-            ConnectionDeadlines {
-                write_stall: Duration::from_secs(1),
-                idle: Duration::from_secs(2),
-                lifetime: Duration::from_millis(20),
-            },
-        ));
+        let permits = Arc::new(Semaphore::new(1));
+        let permit = permits.clone().acquire_owned().await.unwrap();
+        let before = rejection_counts().lifetime;
+        let task = tokio::spawn(async move {
+            let _permit = permit;
+            pump_conn_with_deadlines(
+                92,
+                Box::new(local),
+                in_rx,
+                sink,
+                ConnectionDeadlines {
+                    write_stall: Duration::from_secs(1),
+                    idle: Duration::from_secs(2),
+                    lifetime: Duration::from_millis(20),
+                },
+            )
+            .await;
+        });
         assert_eq!(
             next_frame(&mut peer, &mut FrameDecoder::new()).await,
             Frame::Close(92)
         );
         task.await.unwrap();
+        assert_eq!(permits.available_permits(), 1);
+        assert_eq!(rejection_counts().lifetime, before + 1);
+        survivor_sink.send(encode(&Frame::Open(192))).await.unwrap();
+        assert_eq!(
+            next_frame(&mut peer, &mut FrameDecoder::new()).await,
+            Frame::Open(192)
+        );
         stop_sink(sink_task).await.unwrap();
     }
 
@@ -2088,10 +2143,12 @@ mod tests {
         let (local, _client) = tokio::io::duplex(64);
         let (mut peer, sink_stream) = tokio::io::duplex(4096);
         let (sink, sink_task) = spawn_sink(sink_stream);
+        let survivor_sink = sink.clone();
         let (in_tx, in_rx) = channel(CHANNEL_DEPTH);
         in_tx.send(vec![0xA5; 1024]).await.unwrap();
         let permits = Arc::new(Semaphore::new(1));
         let permit = permits.clone().acquire_owned().await.unwrap();
+        let before = rejection_counts().write_stall;
         let task = tokio::spawn(async move {
             let _permit = permit;
             pump_conn_with_deadlines(
@@ -2113,6 +2170,12 @@ mod tests {
         );
         task.await.unwrap();
         assert_eq!(permits.available_permits(), 1);
+        assert!(rejection_counts().write_stall >= before + 1);
+        survivor_sink.send(encode(&Frame::Open(193))).await.unwrap();
+        assert_eq!(
+            next_frame(&mut peer, &mut FrameDecoder::new()).await,
+            Frame::Open(193)
+        );
         stop_sink(sink_task).await.unwrap();
     }
 
@@ -2122,8 +2185,12 @@ mod tests {
         let (sink, sink_task) = spawn_sink_with_timeout(near, Duration::from_millis(20));
         let before = rejection_counts().write_stall;
         sink.send(vec![0xAB; 1024]).await.unwrap();
-        sink_task.await.unwrap();
-        assert_eq!(rejection_counts().write_stall, before + 1);
+        let mut sink_task = sink_task;
+        let (result, sink_failed) =
+            supervise_sink(std::future::pending::<io::Result<()>>(), &mut sink_task).await;
+        assert!(sink_failed);
+        assert!(matches!(result, Err(error) if error.kind() == io::ErrorKind::BrokenPipe));
+        assert!(rejection_counts().write_stall >= before + 1);
         let mut byte = [0; 1];
         assert_eq!(far.read(&mut byte).await.unwrap(), 0);
     }
