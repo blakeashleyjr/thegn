@@ -432,7 +432,7 @@ impl ThermalModel {
     }
 
     #[cfg(test)]
-    pub(crate) fn package(&self) -> Option<&SensorRow> {
+    fn package(&self) -> Option<&SensorRow> {
         self.package_index().map(|index| &self.sensors[index])
     }
 
