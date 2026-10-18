@@ -467,6 +467,7 @@ pub struct MonitorOverlay {
     body_rows: usize,
     board: board::Board,
     overview: tabs::overview::OverviewModel,
+    memory: tabs::memory::view::MemoryModel,
 }
 
 impl MonitorOverlay {
@@ -523,6 +524,7 @@ impl MonitorOverlay {
             body_rows: rows.saturating_sub(CHROME_ROWS),
             board: board::Board::default(),
             overview: tabs::overview::OverviewModel::default(),
+            memory: tabs::memory::view::MemoryModel::default(),
         };
         ov.rebuild(model, ctx, false);
         ov
@@ -598,14 +600,23 @@ impl MonitorOverlay {
     }
 
     fn view(&self) -> board::ActiveView<'_> {
-        board::ActiveView::for_tab(self.tab, &self.overview)
+        match self.tab {
+            MonitorTab::Memory => {
+                board::ActiveView::Memory(tabs::memory::view::MemoryView(&self.memory))
+            }
+            _ => board::ActiveView::for_tab(self.tab, &self.overview),
+        }
     }
 
     /// Copy the latest pooled frame before the sampler reuses it. Pausing freezes
-    /// the owned Overview snapshot; only a visible live Overview needs repaint.
+    /// the active owned view; only a visible live tab needs repaint.
     pub fn ingest_frame(&mut self, frame: &thegn_metrics::collect::frame::MonitorFrame) -> bool {
         if self.paused {
             return false;
+        }
+        if self.tab == MonitorTab::Memory {
+            self.memory.absorb_frame(frame);
+            return true;
         }
         self.overview.absorb_frame(frame);
         self.tab == MonitorTab::Overview

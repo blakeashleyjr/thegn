@@ -10,6 +10,10 @@ use thegn_core::viz::Unit;
 
 pub(in crate::monitor) mod view;
 
+#[cfg(test)]
+#[path = "memory/memory_wire_tests.rs"]
+mod wire_tests;
+
 pub(in crate::monitor) fn memory(cx: &Ctx) -> Vec<Section> {
     let s = &cx.model.stats;
     let mut out = vec![cx.graph(Metric::Mem, MAIN_H, Tok::Hue(Hue::Purple))];
