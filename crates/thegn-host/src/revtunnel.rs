@@ -26,7 +26,7 @@ use tokio::task::JoinHandle;
 pub(crate) fn report_rejection_counts(interval_seconds: f64) {
     static PREVIOUS: OnceLock<Mutex<thegn_svc::revtunnel::RejectionCounts>> = OnceLock::new();
     let current = thegn_svc::revtunnel::rejection_counts();
-    let previous = PREVIOUS.get_or_init(|| Mutex::new(current));
+    let previous = PREVIOUS.get_or_init(|| Mutex::new(Default::default()));
     let mut previous = match previous.lock() {
         Ok(previous) => previous,
         Err(_) => return,
