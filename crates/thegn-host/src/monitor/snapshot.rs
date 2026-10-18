@@ -171,7 +171,7 @@ fn snapshot(ov: &MonitorOverlay, w: usize, h: usize) -> (String, String) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::caps::{ColorDepth, UnicodeLevel};
+    use thegn_core::termcaps::{ColorDepth, UnicodeLevel};
     use termwiz::color::ColorAttribute;
     use termwiz::surface::{Change, Position};
 
@@ -344,7 +344,7 @@ mod tests {
             let mut surface = Surface::new(2, 1);
             let mut attr = CellAttributes::default();
             attr.set_foreground(ColorAttribute::TrueColorWithDefaultFallback(
-                termwiz::color::SrgbaTuple(1, 2, 3, 255),
+                termwiz::color::SrgbaTuple(0.1, 0.2, 0.3, 1.0),
             ));
             paint(&mut surface, 0, 0, attr, "x");
             assert!(
