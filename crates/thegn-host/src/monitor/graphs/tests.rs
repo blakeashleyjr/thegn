@@ -495,12 +495,21 @@ fn same_size_repaint_reuses_rows_and_emits_exact_width_runs() {
     viz_raster::area(&[0.2, 0.8], table(), &mut out.cells);
     out.emit(&resolved);
     let capacity = out.lines.capacity();
+    let Line::Segs(first_row) = &mut out.lines[0] else {
+        panic!("expected emitted runs")
+    };
+    first_row[0].text.reserve(1_000);
+    let text_capacity = first_row[0].text.capacity();
     out.prepare(12, 3);
     viz_raster::area(&[0.3, 0.7], table(), &mut out.cells);
     out.emit(&resolved);
     assert_eq!(out.cells.width(), 12);
     assert_eq!(out.cells.height(), 3);
     assert_eq!(out.lines.capacity(), capacity);
+    let Line::Segs(first_row) = &out.lines[0] else {
+        panic!("expected emitted runs")
+    };
+    assert_eq!(first_row[0].text.capacity(), text_capacity);
     for line in &out.lines {
         let Line::Segs(segs) = line else {
             panic!("expected emitted runs")

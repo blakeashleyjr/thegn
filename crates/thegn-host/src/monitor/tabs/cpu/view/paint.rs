@@ -44,7 +44,7 @@ thread_local! {
 
 pub(super) fn paint(model: &CpuModel, surface: &mut Surface, id: PanelId, rect: Rect) {
     PAINT_SCRATCH.with(|scratch| {
-        let mut scratch = scratch.borrow_mut();
+        let scratch = &mut *scratch.borrow_mut();
         scratch.grid.resize(rect.cols, rect.rows);
         scratch.grid.clear();
         match id {
@@ -54,7 +54,7 @@ pub(super) fn paint(model: &CpuModel, surface: &mut Surface, id: PanelId, rect: 
                 &model.cpu_stat,
                 model.cpu_stat_health,
                 true,
-                &mut scratch,
+                scratch,
             ),
             CORES => paint_cores(&mut scratch.grid, rect, model),
             FREQ => paint_freq(
@@ -63,7 +63,7 @@ pub(super) fn paint(model: &CpuModel, surface: &mut Surface, id: PanelId, rect: 
                 &model.cpu_freq,
                 model.cpu_freq_health,
             ),
-            LOAD => paint_load(&mut scratch.grid, rect, model),
+            LOAD => paint_load(&mut scratch.grid, rect, model, &mut scratch.aux_grid),
             IRQ => irq::paint_irq(
                 &mut scratch.grid,
                 rect,
@@ -442,12 +442,13 @@ fn paint_heat_panel(
             } else {
                 Health::Absent(Absent::NoHardware)
             };
-            let id = format!("{}", core.id);
+            modes.clear();
+            write!(modes, "{}", core.id).expect("writing CPU core id to String");
             if area.rows > 0 {
                 body.put_str(
                     left,
                     0,
-                    &id,
+                    modes.as_str(),
                     CellStyle {
                         fg: style(Tok::Slot(S::Text)),
                         ..CellStyle::default()
@@ -632,7 +633,7 @@ fn paint_freq(grid: &mut CellGrid, rect: Rect, part: &CpuFreqPart, health: Healt
     }
 }
 
-fn paint_load(grid: &mut CellGrid, rect: Rect, model: &CpuModel) {
+fn paint_load(grid: &mut CellGrid, rect: Rect, model: &CpuModel, gauge: &mut CellGrid) {
     let mut body = panel::panel(
         grid,
         Rect::full(rect.cols, rect.rows),
@@ -679,9 +680,10 @@ fn paint_load(grid: &mut CellGrid, rect: Rect, model: &CpuModel) {
     if let Some(centi_percent) = model.psi.cpu.some_stall_centi {
         let x = psi.len().min(area.cols);
         let width = area.cols.saturating_sub(x);
-        let mut gauge = CellGrid::new(width, 1);
+        gauge.resize(width, 1);
+        gauge.clear();
         Meter::default().paint(
-            &mut gauge,
+            gauge,
             Rect::full(width, 1),
             MeterSpec {
                 value: (centi_percent as f32 / 10_000.0).clamp(0.0, 1.0),
@@ -763,9 +765,11 @@ fn paint_sched(grid: &mut CellGrid, rect: Rect, part: &CpuSchedPart, health: Hea
 fn consecutive_cpu_paints_reuse_the_style_cache() {
     let model = CpuModel::default();
     let mut surface = Surface::new(80, 20);
-    paint(&model, &mut surface, USAGE, Rect::full(80, 20));
-    let after_first = PAINT_SCRATCH.with(|scratch| scratch.borrow().emitter.rebuilds());
-    paint(&model, &mut surface, USAGE, Rect::full(80, 20));
-    let after_second = PAINT_SCRATCH.with(|scratch| scratch.borrow().emitter.rebuilds());
-    assert_eq!(after_second, after_first);
+    crate::caps::test_override::with_color(thegn_core::termcaps::ColorDepth::Truecolor, || {
+        paint(&model, &mut surface, USAGE, Rect::full(80, 20));
+        let after_first = PAINT_SCRATCH.with(|scratch| scratch.borrow().emitter.rebuilds());
+        paint(&model, &mut surface, USAGE, Rect::full(80, 20));
+        let after_second = PAINT_SCRATCH.with(|scratch| scratch.borrow().emitter.rebuilds());
+        assert_eq!(after_second, after_first);
+    });
 }

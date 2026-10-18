@@ -375,7 +375,7 @@ impl TabView for OverviewView<'_> {
             return;
         };
         PAINT_SCRATCH.with(|scratch| {
-            let mut scratch = scratch.borrow_mut();
+            let scratch = &mut *scratch.borrow_mut();
             scratch.grid.resize(rect.cols, rect.rows);
             scratch.grid.clear();
             let title = PANELS[index].title;
