@@ -46,10 +46,14 @@ pub enum CollectorId {
     CpuIrq,
     CpuSched,
     ThermalZone,
+    CpuIdle,
+    CpuTopology,
+    Filesystems,
+    GpuDevices,
 }
 
 impl CollectorId {
-    pub const ALL: [Self; 18] = [
+    pub const ALL: [Self; 22] = [
         Self::Loadavg,
         Self::Uptime,
         Self::Psi,
@@ -68,6 +72,10 @@ impl CollectorId {
         Self::CpuIrq,
         Self::CpuSched,
         Self::ThermalZone,
+        Self::CpuIdle,
+        Self::CpuTopology,
+        Self::Filesystems,
+        Self::GpuDevices,
     ];
 
     pub const fn slug(self) -> &'static str {
@@ -90,6 +98,10 @@ impl CollectorId {
             Self::CpuIrq => "cpu_irq",
             Self::CpuSched => "cpu_sched",
             Self::ThermalZone => "thermal_zone",
+            Self::CpuIdle => "cpu_idle",
+            Self::CpuTopology => "cpu_topology",
+            Self::Filesystems => "filesystems",
+            Self::GpuDevices => "gpu_devices",
         }
     }
 
@@ -190,6 +202,16 @@ pub fn default_collectors() -> Vec<Box<dyn Collector>> {
         Box::new(linux::cpu_sched::CpuSchedCollector::new());
     collectors[CollectorId::ThermalZone.index()] =
         Box::new(linux::thermal_zones::ThermalZoneCollector::new());
+    collectors[CollectorId::CpuIdle.index()] = Box::new(linux::cpu_idle::CpuIdleCollector::new());
+    collectors[CollectorId::CpuTopology.index()] =
+        Box::new(linux::cpu_topology::CpuTopologyCollector::new());
+    collectors[CollectorId::Filesystems.index()] =
+        Box::new(linux::mounts_fs::FilesystemsCollector::new());
+    collectors[CollectorId::GpuDevices.index()] =
+        Box::new(linux::gpu_discover::GpuDevicesCollector::new());
+    collectors[CollectorId::Powercap.index()] = Box::new(linux::powercap::PowercapCollector::at(
+        "/sys/class/powercap",
+    ));
     collectors
 }
 
@@ -221,6 +243,11 @@ mod default_collectors_tests {
             CollectorId::CpuIrq,
             CollectorId::CpuSched,
             CollectorId::ThermalZone,
+            CollectorId::CpuIdle,
+            CollectorId::CpuTopology,
+            CollectorId::Filesystems,
+            CollectorId::GpuDevices,
+            CollectorId::Powercap,
         ] {
             assert_ne!(
                 collectors[id.index()].cadence(),

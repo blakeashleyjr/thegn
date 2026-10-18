@@ -402,6 +402,146 @@ fn glyph_rescan_tiering() {
 }
 
 #[test]
+fn patching_cached_glyph_counts_preserves_the_scan_age() {
+    let path = format!("/test/patch-glyph-{}", std::process::id());
+    let scanned_at = Instant::now() - Duration::from_secs(1);
+    glyph_cache()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(
+            path.clone(),
+            (
+                crate::glyph_types::GlyphRow {
+                    dirty: true,
+                    ahead: 0,
+                    behind: 0,
+                    branch: Some("main".into()),
+                    repo_root: "/repo".into(),
+                    add: thegn_svc::git::DiffCount::Exact(3),
+                    del: thegn_svc::git::DiffCount::Exact(2),
+                    branch_diff: None,
+                    submodule_dirty: false,
+                },
+                scanned_at,
+            ),
+        );
+
+    assert_eq!(
+        patch_glyph_ahead_behind(&path, "main", 2, 7, Instant::now()),
+        GlyphPatch::Patched
+    );
+    {
+        let cache = glyph_cache().lock().unwrap_or_else(|e| e.into_inner());
+        let (row, timestamp) = cache.get(&path).unwrap();
+        assert_eq!((row.ahead, row.behind), (2, 7));
+        assert!(row.dirty);
+        assert_eq!(row.add, thegn_svc::git::DiffCount::Exact(3));
+        assert_eq!(*timestamp, scanned_at);
+        assert!(!should_rescan_glyphs(
+            Some(Instant::now().saturating_duration_since(*timestamp)),
+            Duration::from_secs(120),
+        ));
+    }
+    assert_eq!(
+        patch_glyph_ahead_behind("/test/missing-glyph-row", "main", 0, 1, Instant::now()),
+        GlyphPatch::Missing
+    );
+    glyph_cache()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .remove(&path);
+}
+
+#[test]
+fn patching_a_newer_glyph_scan_evicts_without_changing_its_counts() {
+    let path = format!("/test/newer-patch-glyph-{}", std::process::id());
+    let read_at = Instant::now();
+    let scanned_at = read_at.checked_add(Duration::from_millis(1)).unwrap();
+    glyph_cache()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(
+            path.clone(),
+            (
+                crate::glyph_types::GlyphRow {
+                    dirty: true,
+                    ahead: 4,
+                    behind: 6,
+                    branch: Some("main".into()),
+                    repo_root: "/repo".into(),
+                    add: thegn_svc::git::DiffCount::Exact(3),
+                    del: thegn_svc::git::DiffCount::Exact(2),
+                    branch_diff: None,
+                    submodule_dirty: false,
+                },
+                scanned_at,
+            ),
+        );
+
+    assert_eq!(
+        patch_glyph_ahead_behind(&path, "main", 2, 7, read_at),
+        GlyphPatch::Newer
+    );
+    {
+        let cache = glyph_cache().lock().unwrap_or_else(|e| e.into_inner());
+        let (row, timestamp) = cache.get(&path).unwrap();
+        assert_eq!((row.ahead, row.behind), (4, 6));
+        assert_eq!(*timestamp, scanned_at);
+    }
+    invalidate_glyphs(std::slice::from_ref(&path));
+    assert!(
+        !glyph_cache()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .contains_key(&path)
+    );
+}
+
+#[test]
+fn patching_a_different_branch_is_rejected_without_changing_counts() {
+    let path = format!("/test/branch-patch-glyph-{}", std::process::id());
+    let scanned_at = Instant::now();
+    glyph_cache()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(
+            path.clone(),
+            (
+                crate::glyph_types::GlyphRow {
+                    dirty: true,
+                    ahead: 4,
+                    behind: 6,
+                    branch: Some("old-branch".into()),
+                    repo_root: "/repo".into(),
+                    add: thegn_svc::git::DiffCount::Exact(3),
+                    del: thegn_svc::git::DiffCount::Exact(2),
+                    branch_diff: None,
+                    submodule_dirty: false,
+                },
+                scanned_at,
+            ),
+        );
+
+    assert_eq!(
+        patch_glyph_ahead_behind(&path, "new-branch", 2, 7, Instant::now()),
+        GlyphPatch::Missing
+    );
+    {
+        let cache = glyph_cache().lock().unwrap_or_else(|e| e.into_inner());
+        let (row, timestamp) = cache.get(&path).unwrap();
+        assert_eq!((row.ahead, row.behind), (4, 6));
+        assert_eq!(*timestamp, scanned_at);
+    }
+    invalidate_glyphs(std::slice::from_ref(&path));
+    assert!(
+        !glyph_cache()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .contains_key(&path)
+    );
+}
+
+#[test]
 fn glyph_keep_set_unions_registry_and_repo_roots() {
     // Repo roots ride along with registered worktrees — a dormant workspace's
     // home row is keyed by its repo root, which has no registry row, and must
@@ -793,6 +933,8 @@ fn load_or_seed_session_registers_bootstrap_workspace() {
 
     assert!(seeded);
     assert_eq!(session.id, ws_str);
+    // The bootstrap row is written by the background DB writer now; wait for it.
+    assert!(crate::db_task::flush(std::time::Duration::from_secs(10)));
     let db = thegn_core::db::Db::open_at(&state_home.join("thegn/thegn.db")).unwrap();
     let rows = db.workspaces().unwrap();
     let row = rows
@@ -804,6 +946,73 @@ fn load_or_seed_session_registers_bootstrap_workspace() {
     drop(_env);
     let _ = std::fs::remove_dir_all(&state_home); // best-effort: test cleanup: scratch removal must never fail the test
     let _ = std::fs::remove_dir_all(&ws_dir); // best-effort: test cleanup: scratch removal must never fail the test
+}
+
+#[test]
+fn load_or_seed_session_does_not_block_on_startup_cache_writes() {
+    use std::time::{Duration, Instant};
+    use thegn_core::store::WorkspaceStore;
+
+    let state_home = tempfile::tempdir().unwrap();
+    let ws_dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(state_home.path().join("thegn")).unwrap();
+    let ws_str = ws_dir.path().to_string_lossy().into_owned();
+    let state_str = state_home.path().to_str().unwrap();
+    let _env = crate::testenv::EnvVarGuard::set(&[
+        ("XDG_STATE_HOME", state_str),
+        ("THEGN_SESSION", &ws_str),
+    ]);
+    let db_path = state_home.path().join("thegn/thegn.db");
+
+    // Give resurrection a real layout so this test exercises only the three
+    // startup cache writes, not the separate empty-session seed persist.
+    {
+        let db = thegn_core::db::Db::open_at(&db_path).unwrap();
+        let session = Session {
+            id: ws_str.clone(),
+            worktrees: vec![WorktreeGroup::new(
+                thegn_core::repo::home_tab("workspace"),
+                GroupKind::Home,
+                ws_str.clone(),
+            )],
+            active: 0,
+        };
+        session.persist(&db, &ws_str, 1).unwrap();
+    }
+
+    let lock = rusqlite::Connection::open(&db_path).unwrap();
+    lock.execute_batch("BEGIN IMMEDIATE").unwrap();
+    let started = Instant::now();
+    let (session, seeded) = load_or_seed_session(ws_dir.path(), &Default::default());
+    assert!(!seeded);
+    assert_eq!(session.id, ws_str);
+    assert!(
+        started.elapsed() < Duration::from_millis(500),
+        "startup cache writes must not wait for the held DB write lock"
+    );
+
+    lock.execute_batch("ROLLBACK").unwrap();
+    drop(lock);
+    let (barrier_tx, barrier_rx) = std::sync::mpsc::channel();
+    crate::db_task::persist_critical(move |_| {
+        if barrier_tx.send(()).is_err() {
+            tracing::debug!("startup DB writer barrier receiver closed");
+        }
+    });
+    barrier_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+
+    let db = thegn_core::db::Db::open_at(&db_path).unwrap();
+    assert!(
+        db.workspaces()
+            .unwrap()
+            .iter()
+            .any(|w| w.repo_path == ws_str)
+    );
+    assert!(db.known_repos().unwrap().contains(&ws_str));
+    assert_eq!(
+        db.active_workspace().unwrap().as_deref(),
+        Some(ws_str.as_str())
+    );
 }
 
 #[test]

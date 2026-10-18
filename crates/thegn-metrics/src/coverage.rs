@@ -195,6 +195,9 @@ pub fn collector_families(id: crate::collect::CollectorId) -> &'static [MetricFa
         Id::PowerSupply => &[MetricFamily::Battery],
         Id::CpuIrq | Id::CpuSched => &[],
         Id::ThermalZone => &[],
+        Id::CpuIdle | Id::CpuTopology => &[],
+        Id::Filesystems => &[],
+        Id::GpuDevices => &[],
         Id::Psi | Id::Cgroup | Id::CgroupSlice | Id::Powercap => &[],
     }
 }

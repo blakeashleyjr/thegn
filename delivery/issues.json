@@ -609,6 +609,13 @@
       "changes": [
         "monitor-framework"
       ]
+    },
+    {
+      "issue": "THE-871",
+      "project": "Workspace Product & Observability",
+      "changes": [
+        "monitor-overview"
+      ]
     }
   ]
 }

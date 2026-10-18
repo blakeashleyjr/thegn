@@ -7,10 +7,11 @@
 use std::time::Instant;
 
 #[cfg(not(target_os = "linux"))]
+use sysinfo::Components;
+#[cfg(not(target_os = "linux"))]
 use sysinfo::Disks;
 use sysinfo::{
-    Components, MemoryRefreshKind, Networks, Pid, ProcessRefreshKind, ProcessesToUpdate,
-    RefreshKind, System,
+    MemoryRefreshKind, Networks, Pid, ProcessRefreshKind, ProcessesToUpdate, RefreshKind, System,
 };
 
 #[cfg(not(target_os = "linux"))]
@@ -54,11 +55,14 @@ pub struct StatsSampler {
     disks: Disks,
     #[cfg(target_os = "linux")]
     disk_aggregate: crate::disk_aggregate::DiskAggregate,
+    #[cfg(not(target_os = "linux"))]
     comps: Components,
     gpu: GpuMonitor,
     /// How temperatures are read. `Components` on Linux/Intel; the Apple-vendor
     /// HID sensors on Apple silicon, where `Components` is empty.
     thermal: ThermalProbe,
+    #[cfg(target_os = "linux")]
+    base_temp: crate::base_temp::BaseTemp,
     battery: crate::battery::BatteryReader,
     disk_path: std::path::PathBuf,
     tick: u64,
@@ -195,9 +199,12 @@ impl StatsSampler {
             disks: Disks::new_with_refreshed_list(),
             #[cfg(target_os = "linux")]
             disk_aggregate: crate::disk_aggregate::DiskAggregate::new(),
+            #[cfg(not(target_os = "linux"))]
             comps: Components::new_with_refreshed_list(),
             gpu: GpuMonitor::new(),
             thermal: ThermalProbe::probe(),
+            #[cfg(target_os = "linux")]
+            base_temp: crate::base_temp::BaseTemp::new(),
             battery: crate::battery::BatteryReader::new(std::path::PathBuf::from(
                 "/sys/class/power_supply",
             )),
@@ -424,24 +431,33 @@ impl StatsSampler {
 
         // --- Slow tier (every SLOW_EVERY-th tick): frequency, temps, disks ---
         if slow {
-            // Apple silicon publishes no SMC components, so `Components` comes
-            // back empty there and the temperature row silently vanished. Ask
-            // whichever backend the probe selected; `Components` stays the
-            // answer on Linux and on Intel Macs.
-            self.last_temps = match self.thermal {
-                ThermalProbe::AppleHid => self.thermal.read(),
-                _ => {
-                    self.comps.refresh(false);
-                    self.comps
-                        .iter()
-                        .filter_map(|c| {
-                            c.temperature()
-                                .filter(|t| t.is_finite())
-                                .map(|t| (c.label().to_string(), t))
-                        })
-                        .collect()
-                }
-            };
+            // Linux uses held hwmon reads; other platforms retain sysinfo's
+            // components, with Apple silicon's HID reader where available.
+            #[cfg(target_os = "linux")]
+            {
+                self.last_temps = if matches!(self.thermal, ThermalProbe::AppleHid) {
+                    self.thermal.read()
+                } else {
+                    self.base_temp.fill()
+                };
+            }
+            #[cfg(not(target_os = "linux"))]
+            {
+                self.last_temps = match self.thermal {
+                    ThermalProbe::AppleHid => self.thermal.read(),
+                    _ => {
+                        self.comps.refresh(false);
+                        self.comps
+                            .iter()
+                            .filter_map(|c| {
+                                c.temperature()
+                                    .filter(|t| t.is_finite())
+                                    .map(|t| (c.label().to_string(), t))
+                            })
+                            .collect()
+                    }
+                };
+            }
 
             #[cfg(not(target_os = "linux"))]
             let dt_disk = now.duration_since(self.prev_disk).as_secs_f64().max(0.001);
@@ -663,7 +679,7 @@ fn pct_u8(v: f32) -> u8 {
 
 /// Pick the CPU/package temperature from labelled sensors: the hottest sensor
 /// whose label looks CPU-ish, else the hottest sensor overall.
-fn cpu_temp(temps: &[(String, f32)]) -> Option<f32> {
+pub(crate) fn cpu_temp(temps: &[(String, f32)]) -> Option<f32> {
     // `tdie` is Apple silicon's die-temperature sensor family ("PMU tdie1", …).
     // Without it the Apple path fell through to "hottest of anything", which
     // picks `PMU tcal` — a calibration reference that reads ~15C above the die

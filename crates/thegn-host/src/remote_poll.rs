@@ -385,9 +385,10 @@ fn canon(p: &str) -> std::path::PathBuf {
 /// The session worktrees that live in `loc`'s repo, paired with the branch each
 /// one has checked out. One `git worktree list --porcelain` for the WHOLE repo —
 /// a twenty-worktree repo (the shape thegn is built for) costs what a
-/// single-checkout repo costs. Detached and bare entries carry no branch and are
-/// dropped; so is any checkout this session doesn't show.
-fn session_checkouts(loc: &GitLoc, session_worktrees: &[String]) -> Vec<(String, String)> {
+/// single-checkout repo costs. Entries with no branch (detached or bare) are
+/// retained so their cache rows can be invalidated when the session lists the
+/// path. Checkouts this session does not show are dropped.
+fn session_checkouts(loc: &GitLoc, session_worktrees: &[String]) -> Vec<(String, Option<String>)> {
     let Some(porcelain) = loc.git_out(&["worktree", "list", "--porcelain"]) else {
         return Vec::new();
     };
@@ -397,7 +398,7 @@ fn session_checkouts(loc: &GitLoc, session_worktrees: &[String]) -> Vec<(String,
         .into_iter()
         .filter_map(|(path, branch)| {
             let wt = session.get(&canon(&path))?;
-            Some(((*wt).clone(), branch?))
+            Some(((*wt).clone(), branch))
         })
         .collect()
 }
@@ -405,15 +406,56 @@ fn session_checkouts(loc: &GitLoc, session_worktrees: &[String]) -> Vec<(String,
 /// The default, always-on half of a successful fetch: make the **badge** honest.
 ///
 /// The fetch just moved `refs/remotes/…` under every worktree of this repo, so
-/// each one's `↓N` is now wrong by construction. Background sidebar rows are
-/// glyph-TTL-cached (rightly — a rescan is a `git status` fan-out per row), which
-/// would leave the badge stale for up to one TTL window after an event we KNOW
-/// changed it. Evicting those rows makes the very next hydration rescan them.
-/// The active row already rescans unconditionally, and the panel header reads
-/// ahead/behind live, so this is what closes the loop for the other rows.
-fn refresh_badges(checkouts: &[(String, String)]) {
-    let paths: Vec<String> = checkouts.iter().map(|(wt, _)| wt.clone()).collect();
-    crate::hydrate::invalidate_glyphs(&paths);
+/// each one's `↓N` is now wrong by construction. Patch cached rows with the
+/// fetched counts while preserving their status data and scan timestamp. Rows
+/// missing from cache, on a different branch, or stamped after the ref read are
+/// invalidated so hydration reconstructs them; the timestamp guard prevents an
+/// older ref read from overwriting a newer scan. A failed ref read also
+/// invalidates all relevant rows.
+fn refresh_badges(
+    checkouts: &[(String, Option<String>)],
+    branches: &[thegn_core::gitrefs::BranchInfo],
+    read_at: std::time::Instant,
+) {
+    let (patches, evictions) = ahead_behind_patches(checkouts, branches);
+    for (path, branch, ahead, behind) in patches {
+        if crate::hydrate::patch_glyph_ahead_behind(&path, &branch, ahead, behind, read_at)
+            != crate::hydrate::GlyphPatch::Patched
+        {
+            crate::hydrate::invalidate_glyphs(&[path]);
+        }
+    }
+    crate::hydrate::invalidate_glyphs(&evictions);
+}
+
+/// Match each checked-out branch to the repo-wide ref read. Detached checkouts
+/// and branches absent from the read cannot be patched, so invalidate only
+/// those rows and let normal hydration reconstruct them.
+/// (path, branch, ahead, behind) cache patches for checkouts whose upstream moved.
+type AheadBehindPatch = (String, String, usize, usize);
+
+fn ahead_behind_patches(
+    checkouts: &[(String, Option<String>)],
+    branches: &[thegn_core::gitrefs::BranchInfo],
+) -> (Vec<AheadBehindPatch>, Vec<String>) {
+    let mut patches = Vec::new();
+    let mut evictions = Vec::new();
+    for (path, branch) in checkouts {
+        let Some(info) = branch
+            .as_ref()
+            .and_then(|name| branches.iter().find(|b| &b.name == name))
+        else {
+            evictions.push(path.clone());
+            continue;
+        };
+        let (ahead, behind) = if info.upstream_gone {
+            (0, 0)
+        } else {
+            (info.ahead, info.behind)
+        };
+        patches.push((path.clone(), info.name.clone(), ahead, behind));
+    }
+    (patches, evictions)
 }
 
 /// The opt-in half (`[git] auto_fetch_notify`): an inbox entry for every worktree
@@ -428,16 +470,16 @@ fn refresh_badges(checkouts: &[(String, String)]) {
 /// govern it exactly like every other kind — never a hand-rolled toast that
 /// dodges routing.
 fn notify_behind(
-    loc: &GitLoc,
-    checkouts: &[(String, String)],
+    checkouts: &[(String, Option<String>)],
+    branches: &[thegn_core::gitrefs::BranchInfo],
     notify: &crate::notify::NotifyState,
 ) {
-    let Ok(branches) = crate::git_handle::get().branches_full(loc) else {
-        return;
-    };
     // Opened lazily: a repo that is fully up to date must not pay a DB open.
     let mut db: Option<thegn_core::db::Db> = None;
     for (wt, branch) in checkouts {
+        let Some(branch) = branch else {
+            continue;
+        };
         let Some((upstream, behind)) = branches
             .iter()
             .find(|b| &b.name == branch)
@@ -580,11 +622,37 @@ fn poll_one(
             // unrelated repo's branches, so neither the badge refresh nor the
             // (opt-in) notice can ever touch an unrelated worktree.
             let checkouts = session_checkouts(&loc, all_worktrees);
-            if outcome == FetchOutcome::Changed {
-                refresh_badges(&checkouts);
+            let branches = if !checkouts.is_empty()
+                && (outcome == FetchOutcome::Changed || cfg.auto_fetch_notify)
+            {
+                let read_at = std::time::Instant::now();
+                match crate::git_handle::get().branches_full(&loc) {
+                    Ok(branches) => Some((branches, read_at)),
+                    Err(error) => {
+                        if outcome == FetchOutcome::Changed {
+                            tracing::debug!(target: "thegn::git", repo = %repo, %error, "could not read branch counts after auto-fetch; invalidating cached glyphs");
+                            crate::hydrate::invalidate_glyphs(
+                                &checkouts
+                                    .iter()
+                                    .map(|(path, _)| path.clone())
+                                    .collect::<Vec<_>>(),
+                            );
+                        }
+                        None
+                    }
+                }
+            } else {
+                None
+            };
+            if outcome == FetchOutcome::Changed
+                && let Some((branches, read_at)) = branches.as_ref()
+            {
+                refresh_badges(&checkouts, branches, *read_at);
             }
-            if cfg.auto_fetch_notify {
-                notify_behind(&loc, &checkouts, notify);
+            if cfg.auto_fetch_notify
+                && let Some((branches, _)) = branches.as_ref()
+            {
+                notify_behind(&checkouts, branches, notify);
             }
         }
         Err(e) => {
@@ -684,6 +752,110 @@ mod tests {
         for (outcomes, expected) in cases {
             assert_eq!(should_refresh(outcomes), expected, "{outcomes:?}");
         }
+    }
+
+    #[test]
+    fn checkout_ref_mapping_patches_known_branches_and_evicts_unmapped_rows() {
+        let branches = vec![
+            thegn_core::gitrefs::BranchInfo {
+                name: "main".into(),
+                is_head: true,
+                upstream: Some("origin/main".into()),
+                ahead: 2,
+                behind: 5,
+                upstream_gone: false,
+                sha: "abc".into(),
+                date: 0,
+                subject: String::new(),
+            },
+            thegn_core::gitrefs::BranchInfo {
+                name: "gone-upstream".into(),
+                is_head: false,
+                upstream: None,
+                ahead: 0,
+                behind: 0,
+                upstream_gone: true,
+                sha: "def".into(),
+                date: 0,
+                subject: String::new(),
+            },
+        ];
+        let checkouts = vec![
+            ("/wt/main".into(), Some("main".into())),
+            ("/wt/missing-branch".into(), Some("removed".into())),
+            ("/wt/detached".into(), None),
+            ("/wt/gone-upstream".into(), Some("gone-upstream".into())),
+        ];
+
+        assert_eq!(
+            ahead_behind_patches(&checkouts, &branches),
+            (
+                vec![
+                    ("/wt/main".into(), "main".into(), 2, 5),
+                    ("/wt/gone-upstream".into(), "gone-upstream".into(), 0, 0)
+                ],
+                vec!["/wt/missing-branch".into(), "/wt/detached".into()],
+            )
+        );
+    }
+
+    #[test]
+    fn refresh_invalidates_newer_scans_and_rows_from_another_branch() {
+        let read_at = std::time::Instant::now();
+        let newer_path = format!("/test/newer-refresh-{}", std::process::id());
+        let branch_path = format!("/test/branch-refresh-{}", std::process::id());
+        let new_scan = read_at
+            .checked_add(std::time::Duration::from_millis(1))
+            .unwrap();
+        let old_scan = read_at - std::time::Duration::from_secs(1);
+        for (path, branch, scanned_at) in [
+            (newer_path.as_str(), "main", new_scan),
+            (branch_path.as_str(), "old-branch", old_scan),
+        ] {
+            crate::hydrate::glyph_cache()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .insert(
+                    path.to_string(),
+                    (
+                        crate::glyph_types::GlyphRow {
+                            dirty: true,
+                            ahead: 4,
+                            behind: 6,
+                            branch: Some(branch.into()),
+                            repo_root: "/repo".into(),
+                            add: thegn_svc::git::DiffCount::Exact(3),
+                            del: thegn_svc::git::DiffCount::Exact(2),
+                            branch_diff: None,
+                            submodule_dirty: false,
+                        },
+                        scanned_at,
+                    ),
+                );
+        }
+        let checkouts = vec![
+            (newer_path.clone(), Some("main".into())),
+            (branch_path.clone(), Some("main".into())),
+        ];
+        let branches = vec![thegn_core::gitrefs::BranchInfo {
+            name: "main".into(),
+            is_head: true,
+            upstream: Some("origin/main".into()),
+            ahead: 2,
+            behind: 7,
+            upstream_gone: false,
+            sha: "abc".into(),
+            date: 0,
+            subject: String::new(),
+        }];
+
+        refresh_badges(&checkouts, &branches, read_at);
+
+        let cache = crate::hydrate::glyph_cache()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        assert!(!cache.contains_key(&newer_path));
+        assert!(!cache.contains_key(&branch_path));
     }
 
     #[test]
@@ -808,6 +980,7 @@ mod tests {
     #[expect(clippy::disallowed_methods)] // test-only git plumbing, never on the loop
     fn git(dir: &std::path::Path, args: &[&str]) {
         let ok = thegn_core::util::git_cmd(dir)
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
             .args(args)
             .output()
             .map(|o| o.status.success())
@@ -835,11 +1008,9 @@ mod tests {
 
     #[test]
     fn fetch_moves_the_behind_count_a_stale_clone_could_not_see() {
-        let tag = std::process::id();
-        let origin = std::env::temp_dir().join(format!("thegn-rp-origin-{tag}"));
-        let clone = std::env::temp_dir().join(format!("thegn-rp-clone-{tag}"));
-        let _ = std::fs::remove_dir_all(&origin); // best-effort: cleanup: the target may already be gone; a failed removal never fails the caller
-        let _ = std::fs::remove_dir_all(&clone); // best-effort: cleanup: the target may already be gone; a failed removal never fails the caller
+        let fixture = tempfile::tempdir().unwrap();
+        let origin = fixture.path().join("origin");
+        let clone = fixture.path().join("clone");
         std::fs::create_dir_all(&origin).unwrap();
 
         git(&origin, &["init", "-q", "-b", "main"]);
@@ -869,7 +1040,7 @@ mod tests {
         let session = vec![wt.clone(), "/somewhere/else".to_string()];
         assert_eq!(
             session_checkouts(&loc, &session),
-            vec![(wt.clone(), "main".to_string())],
+            vec![(wt.clone(), Some("main".to_string()))],
             "only THIS repo's session checkouts, paired with their branch"
         );
 
@@ -889,34 +1060,43 @@ mod tests {
         let (upstream, behind) = tracked(&loc, "main").unwrap();
         assert_eq!(behind, 1);
 
-        // …and the row is evicted from the glyph cache, so the next hydration
-        // rescans it instead of serving a TTL-fresh `↓0`. This is the default
-        // surface: no notification, just a badge that stops lying.
-        crate::hydrate::glyph_cache().lock().unwrap().insert(
-            wt.clone(),
-            (
-                crate::glyph_types::GlyphRow {
-                    dirty: false,
-                    ahead: 0,
-                    behind: 0,
-                    branch: None,
-                    repo_root: String::new(),
-                    add: thegn_svc::git::DiffCount::Exact(0),
-                    del: thegn_svc::git::DiffCount::Exact(0),
-                    branch_diff: None,
-                    submodule_dirty: false,
-                },
-                std::time::Instant::now(),
-            ),
-        );
-        refresh_badges(&session_checkouts(&loc, &session));
-        assert!(
-            !crate::hydrate::glyph_cache()
-                .lock()
-                .unwrap()
-                .contains_key(&wt),
-            "a landed fetch must invalidate the fetched repo's cached badges"
-        );
+        // The targeted ref read patches only the counts and preserves the
+        // cached status row and its timestamp, so hydration does not full-scan.
+        let scanned_at = std::time::Instant::now() - std::time::Duration::from_secs(1);
+        crate::hydrate::glyph_cache()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(
+                wt.clone(),
+                (
+                    crate::glyph_types::GlyphRow {
+                        dirty: false,
+                        ahead: 0,
+                        behind: 0,
+                        branch: Some("main".into()),
+                        repo_root: String::new(),
+                        add: thegn_svc::git::DiffCount::Exact(0),
+                        del: thegn_svc::git::DiffCount::Exact(0),
+                        branch_diff: None,
+                        submodule_dirty: false,
+                    },
+                    scanned_at,
+                ),
+            );
+        let read_at = std::time::Instant::now();
+        let branches = crate::git_handle::get().branches_full(&loc).unwrap();
+        refresh_badges(&session_checkouts(&loc, &session), &branches, read_at);
+        let cache = crate::hydrate::glyph_cache()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let (row, timestamp) = cache.get(&wt).unwrap();
+        assert_eq!((row.ahead, row.behind), (0, 1));
+        assert_eq!(*timestamp, scanned_at);
+        assert!(!crate::hydrate::should_rescan_glyphs(
+            Some(std::time::Instant::now().saturating_duration_since(*timestamp)),
+            std::time::Duration::from_secs(120),
+        ));
+        drop(cache);
 
         // The opt-in notice reads the same count off the same branch data.
         assert!(should_notify(None, behind));
@@ -930,15 +1110,10 @@ mod tests {
         assert!(!clone.join("new.txt").exists());
 
         // A repo with no remotes at all resolves to nothing to poll.
-        let bare = std::env::temp_dir().join(format!("thegn-rp-solo-{tag}"));
-        let _ = std::fs::remove_dir_all(&bare); // best-effort: cleanup: the target may already be gone; a failed removal never fails the caller
+        let bare = fixture.path().join("solo");
         std::fs::create_dir_all(&bare).unwrap();
         git(&bare, &["init", "-q", "-b", "main"]);
         assert_eq!(remote_for(&GitLoc::Local(bare.clone())), None);
-
-        let _ = std::fs::remove_dir_all(&origin); // best-effort: cleanup: the target may already be gone; a failed removal never fails the caller
-        let _ = std::fs::remove_dir_all(&clone); // best-effort: cleanup: the target may already be gone; a failed removal never fails the caller
-        let _ = std::fs::remove_dir_all(&bare); // best-effort: cleanup: the target may already be gone; a failed removal never fails the caller
     }
 
     #[test]

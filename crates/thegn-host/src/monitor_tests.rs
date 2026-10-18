@@ -179,7 +179,7 @@ fn switching_tabs_records_where_to_reopen() {
     // reopens — but nothing ever wrote it, so "reopen where you left off"
     // always reopened on CPU.
     let (mut ov, _m, _h) = open();
-    assert_eq!(ov.prefs().last_tab, MonitorTab::Cpu);
+    assert_eq!(ov.prefs().last_tab, MonitorTab::Overview);
 
     // Cycling writes it…
     let out = key(&mut ov, KeyCode::Tab);
@@ -203,13 +203,16 @@ fn switching_tabs_records_where_to_reopen() {
 #[test]
 fn tab_cycles_the_visible_list_and_wraps() {
     let (mut ov, _m, _h) = open();
+    assert_eq!(ch(&mut ov, '1'), MonitorOutcome::PrefsChanged);
+    assert_eq!(ov.tab, MonitorTab::Overview);
     let tabs = ov.tabs.clone();
     assert_eq!(
         tabs.len(),
         MonitorTab::ALL.len() - 1,
         "full snapshot: all metric tabs"
     );
-    for expect in tabs.iter().skip(1).chain(tabs.first()) {
+    let start = tabs.iter().position(|tab| *tab == ov.tab).unwrap();
+    for expect in tabs.iter().cycle().skip(start + 1).take(tabs.len()) {
         key(&mut ov, KeyCode::Tab);
         assert_eq!(ov.tab, *expect);
     }
@@ -263,7 +266,7 @@ fn digits_index_the_visible_tabs_not_the_full_list() {
     let tabs = ov.tabs.clone();
     ch(&mut ov, '3');
     assert_eq!(ov.tab, tabs[2]);
-    assert_ne!(ov.tab, MonitorTab::ALL[2], "indexed ALL, not visible");
+    assert_ne!(ov.tab, MonitorTab::ALL[3], "indexed ALL, not visible");
     // Out of range is a no-op, never a panic.
     let before = ov.tab;
     ch(&mut ov, '9');
@@ -1405,12 +1408,12 @@ fn line_text(l: &Line) -> String {
 #[test]
 fn the_last_tab_is_reachable_by_its_digit() {
     // Every family on this fixture is visible, so the LAST tab is the exact
-    // case where the old `1`-`9` arm ran out: with nine tabs the bar's digits
-    // cover it, and each digit really lands on the tab whose label it prints.
+    // case where the ten visible digit keys cover the tab list, including the
+    // special zero key for the tenth tab.
     let (mut ov, _m, _h) = open();
     assert_eq!(ov.tabs.len(), MonitorTab::ALL.len() - 1);
     let last = *ov.tabs.last().expect("at least one tab");
-    let d = char::from_digit(ov.tabs.len() as u32, 10).expect("a digit");
+    let d = crate::monitor::tabbar::digit(ov.tabs.len() - 1).expect("a digit");
     assert_eq!(ch(&mut ov, d), MonitorOutcome::PrefsChanged);
     assert_eq!(ov.tab, last);
     // …and the bar says so, rather than making the user guess.
@@ -1422,15 +1425,20 @@ fn the_last_tab_is_reachable_by_its_digit() {
 }
 
 #[test]
-fn zero_beyond_the_visible_tabs_is_a_no_op() {
-    // `0` is the TENTH tab's digit (see tabbar). The monitor can no longer
-    // show ten tabs, so on every real machine it must be a silent no-op —
-    // never a wrap-around to tab one, never a panic.
+fn zero_selects_tenth_tab_and_eleventh_remains_keyboard_reachable() {
+    // Zero names the tenth visible tab. Notifications is eleventh and remains
+    // reachable by cycling because there is no eleventh digit.
     let (mut ov, _m, _h) = open();
-    assert!(ov.tabs.len() < 10, "fixture assumed <10 tabs");
-    let before = ov.tab;
-    assert_eq!(ch(&mut ov, '0'), MonitorOutcome::Pending);
-    assert_eq!(ov.tab, before);
+    assert_eq!(ov.tabs.len(), 10);
+    assert_eq!(ch(&mut ov, '0'), MonitorOutcome::PrefsChanged);
+    assert_eq!(ov.tab, ov.tabs[9]);
+    ov.tabs = MonitorTab::visible_for(&full_snap(), true, true);
+    assert_eq!(ov.tabs.last(), Some(&MonitorTab::Notifications));
+    assert_eq!(crate::monitor::tabbar::digit(10), None);
+    while ov.tab != MonitorTab::Notifications {
+        key(&mut ov, KeyCode::Tab);
+    }
+    assert_eq!(ov.tab, MonitorTab::Notifications);
 }
 
 #[test]
@@ -1446,7 +1454,7 @@ fn the_active_tab_is_never_clipped_out_of_the_bar() {
         assert_eq!(
             ch(
                 &mut ov,
-                char::from_digit(i as u32 + 1, 10).expect("a digit")
+                crate::monitor::tabbar::digit(i).expect("a visible tab has a digit")
             ),
             MonitorOutcome::PrefsChanged,
             "digit {i} did not move"
@@ -1692,7 +1700,10 @@ fn has_graphs_matches_what_the_builders_emit() {
     for tab in MonitorTab::ALL {
         let ov = open_tab(tab, &model, &hist, Rect::full(120, 40));
         assert_eq!(ov.tab, tab, "{tab:?} was not present in the fixture");
-        let plots = ov.body.iter().any(|s| matches!(s, Section::Graph(_)));
+        // Overview draws its history sparkline through the board painter,
+        // rather than emitting a legacy Section::Graph.
+        let plots =
+            tab == MonitorTab::Overview || ov.body.iter().any(|s| matches!(s, Section::Graph(_)));
         assert_eq!(
             plots,
             tab.has_graphs(),
@@ -2214,4 +2225,89 @@ fn gpu_monitor_labels_shared_memory_and_preserves_vram_for_discrete_cards() {
     let discrete = labels(false);
     assert!(discrete.contains(&"vram".to_owned()));
     assert!(discrete.contains(&"vram used".to_owned()));
+}
+
+#[test]
+fn overview_is_the_first_default_tab_and_old_cpu_slug_restores() {
+    assert_eq!(MonitorTab::ALL[0], MonitorTab::Overview);
+    assert_eq!(MonitorTab::default(), MonitorTab::Overview);
+    assert_eq!(MonitorTab::from_key("overview"), Some(MonitorTab::Overview));
+    assert_eq!(MonitorTab::from_key("cpu"), Some(MonitorTab::Cpu));
+    let (mut overlay, _model, _history) = open();
+    ch(&mut overlay, '1');
+    assert_eq!(overlay.tab(), MonitorTab::Overview);
+}
+
+#[test]
+fn overview_ingest_is_visible_only_and_pause_freezes_its_copy() {
+    let (mut overlay, _, _) = open();
+    let frame = thegn_metrics::collect::frame::MonitorFrame {
+        parts: thegn_metrics::collect::frame::Parts {
+            cpu_stat: thegn_metrics::collect::model::cpu_stat::CpuStatPart {
+                procs_running: Some(7),
+                ..Default::default()
+            },
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    assert!(!overlay.ingest_frame(&frame));
+    overlay.tab = MonitorTab::Overview;
+    assert!(overlay.ingest_frame(&frame));
+    assert_eq!(overlay.overview.procs_running(), Some(7));
+    overlay.handle_key(&KeyCode::Char(' '), NONE);
+    assert!(overlay.is_paused());
+    let next_frame = thegn_metrics::collect::frame::MonitorFrame {
+        parts: thegn_metrics::collect::frame::Parts {
+            cpu_stat: thegn_metrics::collect::model::cpu_stat::CpuStatPart {
+                procs_running: Some(99),
+                ..Default::default()
+            },
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    assert!(!overlay.ingest_frame(&next_frame));
+    assert_eq!(overlay.overview.procs_running(), Some(7));
+}
+
+#[test]
+fn overview_demand_omits_absent_power_and_is_not_all_collectors() {
+    let (mut overlay, model, _history) = open_on(Rect::full(160, 48), StatsSnapshot::default());
+    overlay.tab = MonitorTab::Overview;
+    overlay.overview.absorb_stats(&model.stats);
+    let mut frame = thegn_metrics::collect::frame::MonitorFrame::default();
+    frame.health[thegn_metrics::collect::CollectorId::PowerSupply.index()] =
+        thegn_metrics::collect::health::Health::Absent(
+            thegn_metrics::collect::health::Absent::NoHardware,
+        );
+    overlay.ingest_frame(&frame);
+    let demand = overlay.demand(1000);
+    assert!(
+        !demand
+            .collectors
+            .contains(thegn_metrics::collect::CollectorId::PowerSupply)
+    );
+    assert!(demand.collectors.len() < thegn_metrics::collect::CollectorId::ALL.len());
+    assert!(
+        !overlay
+            .placed_panels()
+            .iter()
+            .any(|panel| panel.id.0 == "overview.power")
+    );
+}
+
+#[test]
+fn overview_is_one_and_cpu_moves_to_two_while_saved_cpu_slug_still_opens() {
+    let (mut overlay, model, history) = open();
+    ch(&mut overlay, '1');
+    assert_eq!(overlay.tab(), MonitorTab::Overview);
+    ch(&mut overlay, '2');
+    assert_eq!(overlay.tab(), MonitorTab::Cpu);
+
+    let mut prefs = MonitorPrefs::default();
+    prefs.apply("last_tab", "cpu");
+    let ctx = ctx_at(&history, Rect::full(120, 40));
+    let restored = MonitorOverlay::open(prefs.last_tab, prefs, &model, &ctx);
+    assert_eq!(restored.tab(), MonitorTab::Cpu);
 }
