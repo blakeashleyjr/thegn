@@ -475,6 +475,7 @@ pub struct MonitorOverlay {
     network: tabs::network::view::NetworkModel,
     memory: tabs::memory::view::MemoryModel,
     thermal: tabs::thermal::view::ThermalModel,
+    disk: tabs::disk::view::DiskModel,
 }
 
 impl MonitorOverlay {
@@ -539,6 +540,7 @@ impl MonitorOverlay {
             network: tabs::network::view::NetworkModel::default(),
             memory: tabs::memory::view::MemoryModel::default(),
             thermal: tabs::thermal::view::ThermalModel::default(),
+            disk: tabs::disk::view::DiskModel::default(),
         };
         ov.rebuild(model, ctx, false);
         ov
@@ -632,6 +634,11 @@ impl MonitorOverlay {
             MonitorTab::Thermal => {
                 board::ActiveView::Thermal(tabs::thermal::view::ThermalView(&self.thermal))
             }
+            MonitorTab::Disk => board::ActiveView::Disk(tabs::disk::view::DiskView::new(
+                &self.disk,
+                &self.disk_rows,
+                self.sel,
+            )),
             _ => board::ActiveView::for_tab(self.tab, &self.overview),
         }
     }
@@ -664,6 +671,10 @@ impl MonitorOverlay {
         }
         if self.tab == MonitorTab::Thermal {
             self.thermal.absorb_frame(frame);
+            return true;
+        }
+        if self.tab == MonitorTab::Disk {
+            self.disk.absorb_frame(frame);
             return true;
         }
         self.overview.absorb_frame(frame);
@@ -724,6 +735,11 @@ impl MonitorOverlay {
         if !self.paused && self.tab == MonitorTab::Thermal {
             let prefs = self.prefs.tab(MonitorTab::Thermal);
             self.thermal
+                .absorb_history(ctx.hist, prefs.window, prefs.scale, now);
+        }
+        if !self.paused && self.tab == MonitorTab::Disk {
+            let prefs = self.prefs.tab(MonitorTab::Disk);
+            self.disk
                 .absorb_history(ctx.hist, prefs.window, prefs.scale, now);
         }
         // Only the active list is derived, and navigation/geometry changes do
