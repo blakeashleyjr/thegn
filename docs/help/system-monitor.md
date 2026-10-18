@@ -74,6 +74,11 @@ log scale while Network stays on a live linear one.
   load average — fall back to `window` under `fixed`, since there is no honest
   number to divide by.
 
+On the Memory and Network graphs, and the batch-50 density graphs, leading
+gaps before the first reading stay blank; later gaps carry the last reading
+forward. Rate metrics such as network traffic and disk I/O read empty intervals
+as zero.
+
 `Space` **pauses**. That freezes the picture. The history graphs keep recording
 at the normal, non-live rate, so resuming shows no gap; the monitor's detailed
 sampler stops until you resume. That makes a paused monitor cheaper than a live
@@ -307,13 +312,15 @@ leads with the ownership split — how many are owned under that rule, how many
 are foreign — because the list deliberately includes foreign containers. On an
 engine that reports a footprint it continues with images, volumes and the
 engine's on-disk total (marked `≥` when a backend can't report disk usage);
-otherwise with how many are running. The tab only appears when a container
-engine is present.
+otherwise with how many are running. The tab appears while any container is
+listed and, until the first listing arrives, keeps a tab you left open; an
+empty listing hides it.
 
 Sampling those per-container numbers (and the disk total) is the one expensive
-reading here, so — like Processes — it runs **only while this tab is open**;
-close it and the ambient refresh drops back to the cheap listing. The disk
-total refreshes on a slower cadence than the stats.
+reading here, so — like Processes — it runs only while this tab is open and the
+monitor is not paused, or while the panel's Sandbox section is open; close both
+and the ambient refresh drops back to the cheap listing. The disk total
+refreshes on a slower cadence than the stats.
 
 Actions apply only to containers proven to belong to this profile for a
 known worktree on that worktree's launch backend (including recognized
@@ -354,8 +361,9 @@ Separately from this modal, thegn can warn you when a metric crosses a
 threshold — see `[stats.alerts]` in the config reference. A reading has to stay
 past the line for `sustain_secs` before anything fires, a standing alert repeats
 at most every `repeat_secs`, and clearing needs the value to retreat past the
-threshold by `clear_margin`, so nothing flaps. Alerts show as a toast; set
-`notify = true` to also record them to the notification inbox.
+threshold by `clear_margin` and stay there for `sustain_secs`, so nothing flaps.
+Set `toast = true` to pop a toast and `notify = true` to record the alert to the
+notification inbox; both are off by default.
 
 ## Configuration
 
