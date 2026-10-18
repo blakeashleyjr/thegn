@@ -10,9 +10,9 @@ use std::time::Instant;
 use sysinfo::Components;
 #[cfg(not(target_os = "linux"))]
 use sysinfo::Disks;
-use sysinfo::{
-    MemoryRefreshKind, Networks, Pid, ProcessRefreshKind, ProcessesToUpdate, RefreshKind, System,
-};
+#[cfg(not(target_os = "linux"))]
+use sysinfo::Networks;
+use sysinfo::{MemoryRefreshKind, Pid, ProcessRefreshKind, ProcessesToUpdate, RefreshKind, System};
 
 #[cfg(not(target_os = "linux"))]
 use crate::DiskKind;
@@ -24,6 +24,19 @@ use crate::{ChildGroup, DiskInfo, NetMedium, StatsSnapshot, disk_space};
 /// samples. At the host's default ~1s cadence that is roughly every 5s — these
 /// move slowly and the enumeration is the most expensive part of a sample.
 const SLOW_EVERY: u64 = 5;
+
+/// Keep sysinfo's base refresh set aligned with the platform-specific readers.
+/// Linux's base CPU and memory readers supply those values; other platforms
+/// continue to use sysinfo for CPU and memory.
+fn refresh_kind_for_platform(is_linux: bool) -> RefreshKind {
+    if is_linux {
+        RefreshKind::nothing()
+    } else {
+        RefreshKind::nothing()
+            .with_cpu(crate::cpu_freq::cpu_refresh_kind())
+            .with_memory(MemoryRefreshKind::everything())
+    }
+}
 
 /// Static, read-once system identity (hostname / kernel / OS). Cheap but
 /// constant, so the host collects it once rather than per sample.
@@ -50,6 +63,7 @@ impl SystemInfo {
 /// each sysinfo collector plus the GPU probe and timing/caches for rates.
 pub struct StatsSampler {
     sys: System,
+    #[cfg(not(target_os = "linux"))]
     nets: Networks,
     #[cfg(not(target_os = "linux"))]
     disks: Disks,
@@ -186,14 +200,11 @@ impl StatsSampler {
     /// `disk` masthead widget (the worktrees dir).
     pub fn new(disk_path: std::path::PathBuf) -> Self {
         // Only the subsystems we read; processes are deliberately excluded.
-        let sys = System::new_with_specifics(
-            RefreshKind::nothing()
-                .with_cpu(crate::cpu_freq::cpu_refresh_kind())
-                .with_memory(MemoryRefreshKind::everything()),
-        );
+        let sys = System::new_with_specifics(refresh_kind_for_platform(cfg!(target_os = "linux")));
         let now = Instant::now();
         StatsSampler {
             sys,
+            #[cfg(not(target_os = "linux"))]
             nets: Networks::new_with_refreshed_list(),
             #[cfg(not(target_os = "linux"))]
             disks: Disks::new_with_refreshed_list(),
@@ -370,8 +381,6 @@ impl StatsSampler {
         let network = {
             #[cfg(target_os = "linux")]
             {
-                // Silences dead_code until X-1 removes the Linux Networks field.
-                let _legacy_networks = &self.nets;
                 self.base_net.rates(dt_net, slow).map(|rates| {
                     crate::net_kind::aggregate(
                         rates.iter().map(|(name, rx, tx)| (name.as_str(), *rx, *tx)),
@@ -726,6 +735,23 @@ mod tests {
             pid,
             group: group.to_string(),
         }
+    }
+
+    #[test]
+    fn refresh_kind_tracks_platform_base_readers() {
+        for (is_linux, expects_cpu_memory) in [(true, false), (false, true)] {
+            let kind = refresh_kind_for_platform(is_linux);
+            assert_eq!(kind.cpu().is_some(), expects_cpu_memory);
+            assert_eq!(kind.memory().is_some(), expects_cpu_memory);
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_sampler_starts_without_sysinfo_cpu_or_memory_state() {
+        let sampler = StatsSampler::new(std::env::temp_dir());
+        assert!(sampler.sys.cpus().is_empty());
+        assert_eq!(sampler.sys.total_memory(), 0);
     }
 
     #[test]
