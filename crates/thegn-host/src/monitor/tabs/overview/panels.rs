@@ -6,10 +6,9 @@ impl OverviewView<'_> {
         let lines = match index {
             0 => {
                 let cores = model
-                    .cpu
-                    .cores
+                    .cpu_cores
                     .iter()
-                    .filter_map(|core| core.share.map(|share| format!("{}%", share.busy)))
+                    .map(|busy| format!("{}%", busy / 10))
                     .collect::<Vec<_>>();
                 vec![
                     format!("total  {}", pct(model.stats.cpu_pct)),
@@ -26,7 +25,6 @@ impl OverviewView<'_> {
             1 => {
                 let load = model
                     .load
-                    .value
                     .map(|v| {
                         format!(
                             "{:.2}  {:.2}  {:.2}",
@@ -63,8 +61,9 @@ impl OverviewView<'_> {
             }
             2 => {
                 let used = model
-                    .mem
-                    .used_bytes()
+                    .mem_total
+                    .zip(model.mem_available)
+                    .map(|(total, available)| total.saturating_sub(available))
                     .map(format_bytes)
                     .or_else(|| {
                         model
@@ -74,9 +73,7 @@ impl OverviewView<'_> {
                     })
                     .unwrap_or_else(absent);
                 let available = model
-                    .mem
-                    .raw
-                    .get(thegn_metrics::collect::parse::meminfo::MemField::MemAvailable)
+                    .mem_available
                     .map(|v| format!("available  {}", format_bytes(v)))
                     .unwrap_or_else(|| {
                         model
@@ -91,8 +88,7 @@ impl OverviewView<'_> {
                             .unwrap_or_else(|| format!("available  {}", absent()))
                     });
                 let swap = model
-                    .mem
-                    .swap_used_bytes()
+                    .swap_used
                     .or_else(|| {
                         model
                             .stats
@@ -109,7 +105,7 @@ impl OverviewView<'_> {
                     mem_health::Verdict::Ok => StateRole::Ok,
                 };
                 return (
-                    Some(format!("health  {:?}", health.verdict)),
+                    Some(format!("health  {}", health.verdict.label())),
                     vec![format!("used  {used}"), available, format!("swap  {swap}")],
                     tone,
                 );
@@ -133,16 +129,14 @@ impl OverviewView<'_> {
                 ),
                 format!(
                     "interfaces  {}",
-                    model.net.ifaces.len().max(model.stats.net_ifaces.len())
+                    model.net_ifaces.max(model.stats.net_ifaces.len())
                 ),
             ],
             4 => vec![
                 format!(
                     "read  {}/s",
                     model
-                        .disk
-                        .aggregate
-                        .read_bps
+                        .disk_read_bps
                         .map(|v| format_bytes(v.max(0.0) as u64))
                         .or_else(|| model.stats.disk_io.map(|v| format_bytes(v.0)))
                         .unwrap_or_else(absent)
@@ -150,9 +144,7 @@ impl OverviewView<'_> {
                 format!(
                     "write  {}/s",
                     model
-                        .disk
-                        .aggregate
-                        .write_bps
+                        .disk_write_bps
                         .map(|v| format_bytes(v.max(0.0) as u64))
                         .or_else(|| model.stats.disk_io.map(|v| format_bytes(v.1)))
                         .unwrap_or_else(absent)
@@ -167,14 +159,7 @@ impl OverviewView<'_> {
                 ),
             ],
             5 => {
-                let hottest = model
-                    .thermal
-                    .zones
-                    .iter()
-                    .filter_map(|zone| zone.temp_c)
-                    .chain(model.hwmon.values.iter().filter_map(|value| value.value))
-                    .reduce(f32::max)
-                    .or(model.stats.cpu_temp_c);
+                let hottest = model.hottest_c.or(model.stats.cpu_temp_c);
                 vec![
                     format!(
                         "hottest  {}",
@@ -186,21 +171,25 @@ impl OverviewView<'_> {
                             ))
                             .unwrap_or_else(absent)
                     ),
-                    format!("zones  {}", model.thermal.zones.len()),
+                    format!("zones  {}", model.thermal_zones),
                 ]
             }
             6 => {
-                let battery = model.power.supplies.iter().find(|supply| {
-                    supply.kind == thegn_metrics::collect::model::power_supply::SupplyKind::Battery
-                });
-                let charge = battery
-                    .and_then(|supply| supply.capacity_pct)
+                let charge = model
+                    .battery
+                    .and_then(|battery| battery.0)
                     .or_else(|| model.stats.battery.map(|value| value.0))
                     .map(|value| format!("{value}%"))
                     .unwrap_or_else(absent);
-                let state = battery
-                    .and_then(|supply| supply.status)
-                    .map(|status| format!("{status:?}"))
+                let state = model.battery
+                    .and_then(|battery| battery.1)
+                    .map(|status| match status {
+                        thegn_metrics::collect::model::power_supply::SupplyStatus::Charging => "charging",
+                        thegn_metrics::collect::model::power_supply::SupplyStatus::Discharging => "discharging",
+                        thegn_metrics::collect::model::power_supply::SupplyStatus::NotCharging => "not charging",
+                        thegn_metrics::collect::model::power_supply::SupplyStatus::Full => "full",
+                        thegn_metrics::collect::model::power_supply::SupplyStatus::Unknown => "unknown",
+                    }.to_owned())
                     .unwrap_or_else(|| {
                         model
                             .stats
@@ -222,7 +211,6 @@ impl OverviewView<'_> {
                 format!(
                     "running  {}",
                     model
-                        .cpu
                         .procs_running
                         .map(|value| value.to_string())
                         .unwrap_or_else(absent)

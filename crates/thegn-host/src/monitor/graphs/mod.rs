@@ -123,6 +123,36 @@ pub(crate) struct GraphOut {
     pub(crate) lines: Vec<Line>,
 }
 
+pub(crate) fn paint_sparkline(
+    values: &[f32],
+    width: usize,
+    ramp: RampId,
+    rect: crate::compositor::Rect,
+    surface: &mut termwiz::surface::Surface,
+) {
+    if values.is_empty() || rect.rows == 0 || rect.cols == 0 {
+        return;
+    }
+    let mut out = GraphOut::new();
+    spark::paint_spark(
+        &mut out,
+        values,
+        width,
+        ramp,
+        &crate::chrome::palette_snapshot(),
+    );
+    if let Some(line) = out.lines.first() {
+        crate::seg::draw_line(
+            surface,
+            rect.x,
+            rect.y,
+            rect.cols,
+            line,
+            crate::seg::Tok::Slot(crate::chrome::S::Dim),
+        );
+    }
+}
+
 impl GraphOut {
     pub(crate) fn new() -> Self {
         Self::default()

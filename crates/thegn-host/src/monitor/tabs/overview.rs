@@ -1,5 +1,5 @@
 //! First real board view: a compact summary of the latest system frame.
-use crate::telemetry::{Agg, Metric, ScaleMode, SeriesReq, TelemetryHistory, Window};
+use crate::telemetry::{Metric, ScaleMode, SeriesReq, TelemetryHistory, Window};
 use crate::{
     compositor::Rect,
     monitor::{
@@ -11,6 +11,7 @@ use crate::{
     seg::{StyleTok, Tok},
 };
 use termwiz::surface::Surface;
+use thegn_core::series::Agg;
 use thegn_core::{
     mem_health::{self, MemHealthInput},
     numfmt::{NumFmt, Reading, Unit},
@@ -18,15 +19,7 @@ use thegn_core::{
 };
 use thegn_metrics::{
     StatsSnapshot,
-    collect::{
-        CollectorId, CollectorSet,
-        frame::MonitorFrame,
-        model::{
-            cpu_stat::CpuStatPart, diskstats::DiskstatsPart, hwmon::HwmonPart,
-            loadavg::LoadavgPart, meminfo::MeminfoPart, netdev::NetdevPart,
-            power_supply::PowerSupplyPart, psi::PsiPart, thermal_zone::ThermalZonePart,
-        },
-    },
+    collect::{CollectorId, CollectorSet, frame::MonitorFrame, model::psi::PsiPart},
 };
 
 #[path = "overview/panels.rs"]
@@ -42,6 +35,72 @@ const IDS: [PanelId; 8] = [
     PanelId("overview.power"),
     PanelId("overview.activity"),
 ];
+#[derive(Clone, Copy)]
+struct PanelMeta {
+    id: PanelId,
+    title: &'static str,
+    priority: u8,
+    ramp: RampId,
+    metrics: [Option<Metric>; 2],
+}
+const PANELS: [PanelMeta; 8] = [
+    PanelMeta {
+        id: IDS[0],
+        title: "CPU",
+        priority: 0,
+        ramp: RampId::Util,
+        metrics: [Some(Metric::Cpu), None],
+    },
+    PanelMeta {
+        id: IDS[1],
+        title: "Load / pressure",
+        priority: 2,
+        ramp: RampId::Util,
+        metrics: [Some(Metric::Load), None],
+    },
+    PanelMeta {
+        id: IDS[2],
+        title: "Memory",
+        priority: 1,
+        ramp: RampId::Mem,
+        metrics: [Some(Metric::Mem), None],
+    },
+    PanelMeta {
+        id: IDS[3],
+        title: "Network",
+        priority: 3,
+        ramp: RampId::Rx,
+        metrics: [Some(Metric::NetRx), None],
+    },
+    PanelMeta {
+        id: IDS[4],
+        title: "Disk",
+        priority: 4,
+        ramp: RampId::Read,
+        metrics: [Some(Metric::DiskRead), Some(Metric::DiskWrite)],
+    },
+    PanelMeta {
+        id: IDS[5],
+        title: "Thermal",
+        priority: 5,
+        ramp: RampId::Temp,
+        metrics: [Some(Metric::Temp), None],
+    },
+    PanelMeta {
+        id: IDS[6],
+        title: "Power",
+        priority: 6,
+        ramp: RampId::Power,
+        metrics: [Some(Metric::Battery), None],
+    },
+    PanelMeta {
+        id: IDS[7],
+        title: "Processes / containers",
+        priority: 7,
+        ramp: RampId::Util,
+        metrics: [None, None],
+    },
+];
 const VARIANTS: [Variant; 1] = [Variant {
     kind: VariantKind::Full,
     min: (12, 5),
@@ -50,42 +109,42 @@ const VARIANTS: [Variant; 1] = [Variant {
 const SPECS: [PanelSpec; 8] = [
     PanelSpec {
         id: IDS[0],
-        priority: 8,
+        priority: PANELS[0].priority,
         variants: &VARIANTS,
     },
     PanelSpec {
         id: IDS[1],
-        priority: 7,
+        priority: PANELS[1].priority,
         variants: &VARIANTS,
     },
     PanelSpec {
         id: IDS[2],
-        priority: 8,
+        priority: PANELS[2].priority,
         variants: &VARIANTS,
     },
     PanelSpec {
         id: IDS[3],
-        priority: 6,
+        priority: PANELS[3].priority,
         variants: &VARIANTS,
     },
     PanelSpec {
         id: IDS[4],
-        priority: 5,
+        priority: PANELS[4].priority,
         variants: &VARIANTS,
     },
     PanelSpec {
         id: IDS[5],
-        priority: 4,
+        priority: PANELS[5].priority,
         variants: &VARIANTS,
     },
     PanelSpec {
         id: IDS[6],
-        priority: 3,
+        priority: PANELS[6].priority,
         variants: &VARIANTS,
     },
     PanelSpec {
         id: IDS[7],
-        priority: 2,
+        priority: PANELS[7].priority,
         variants: &VARIANTS,
     },
 ];
@@ -93,105 +152,142 @@ const SPECS: [PanelSpec; 8] = [
 #[derive(Debug, Default, Clone)]
 pub(in crate::monitor) struct OverviewModel {
     stats: StatsSnapshot,
-    sparks: Vec<Vec<f32>>,
+    sparks: Vec<[Vec<f32>; 2]>,
     container_count: usize,
-    cpu: CpuStatPart,
-    load: LoadavgPart,
+    cpu_cores: Vec<u16>,
+    procs_running: Option<u32>,
+    load: Option<thegn_metrics::collect::parse::loadavg::Loadavg>,
     psi: PsiPart,
-    mem: MeminfoPart,
-    net: NetdevPart,
-    disk: DiskstatsPart,
-    hwmon: HwmonPart,
-    thermal: ThermalZonePart,
-    power: PowerSupplyPart,
+    mem_total: Option<u64>,
+    mem_available: Option<u64>,
+    swap_used: Option<u64>,
+    net_ifaces: usize,
+    disk_read_bps: Option<f64>,
+    disk_write_bps: Option<f64>,
+    hottest_c: Option<f32>,
+    thermal_zones: usize,
+    battery: Option<(
+        Option<u8>,
+        Option<thegn_metrics::collect::model::power_supply::SupplyStatus>,
+    )>,
+    health: [thegn_metrics::collect::health::Health; thegn_metrics::collect::COLLECTORS],
 }
 impl OverviewModel {
+    #[cfg(test)]
+    pub(in crate::monitor) fn procs_running(&self) -> Option<u32> {
+        self.procs_running
+    }
     pub(in crate::monitor) fn absorb_stats(&mut self, stats: &StatsSnapshot) {
         self.stats.clone_from(stats);
     }
     pub(in crate::monitor) fn absorb_container_count(&mut self, count: usize) {
         self.container_count = count;
     }
-    pub(in crate::monitor) fn absorb_history(&mut self, history: &TelemetryHistory, now_ms: u64) {
-        const METRICS: [Metric; 8] = [
-            Metric::Cpu,
-            Metric::Load,
-            Metric::Mem,
-            Metric::NetRx,
-            Metric::DiskRead,
-            Metric::Temp,
-            Metric::Battery,
-            Metric::DiskWrite,
-        ];
-        self.sparks.resize_with(METRICS.len(), Vec::new);
-        for (slot, metric) in self.sparks.iter_mut().zip(METRICS) {
-            let series = history.series(&SeriesReq {
-                metric,
-                window: Window::from_secs(60),
-                scale: TelemetryHistory::scale_for(metric, ScaleMode::Window),
-                buckets: 64,
-                agg: Agg::Max,
-                now_ms,
-            });
-            if series.empty {
-                slot.clear();
-            } else {
-                slot.clone_from(&series.hi);
+    pub(in crate::monitor) fn absorb_history(
+        &mut self,
+        history: &TelemetryHistory,
+        window: Window,
+        scale: ScaleMode,
+        now_ms: u64,
+    ) {
+        self.sparks
+            .resize_with(PANELS.len(), || std::array::from_fn(|_| Vec::new()));
+        for (index, slots) in self.sparks.iter_mut().enumerate() {
+            for (series_index, slot) in slots.iter_mut().enumerate() {
+                let Some(metric) = PANELS[index].metrics[series_index] else {
+                    slot.clear();
+                    continue;
+                };
+                let series = history.series(&SeriesReq {
+                    metric,
+                    window,
+                    scale: TelemetryHistory::scale_for(metric, scale),
+                    buckets: 64,
+                    agg: Agg::Max,
+                    now_ms,
+                });
+                if series.empty {
+                    slot.clear();
+                } else {
+                    slot.clone_from(&series.hi);
+                }
             }
         }
     }
     pub(in crate::monitor) fn absorb_frame(&mut self, frame: &MonitorFrame) {
-        self.cpu.clone_from(&frame.parts.cpu_stat);
-        self.load.clone_from(&frame.parts.loadavg);
+        let cpu = &frame.parts.cpu_stat;
+        self.cpu_cores.clear();
+        self.cpu_cores.extend(
+            cpu.cores
+                .iter()
+                .filter_map(|core| core.share.map(|share| share.busy)),
+        );
+        self.procs_running = cpu.procs_running;
+        self.load = frame.parts.loadavg.value;
         self.psi.clone_from(&frame.parts.psi);
-        self.mem.clone_from(&frame.parts.meminfo);
-        self.net.clone_from(&frame.parts.netdev);
-        self.disk.clone_from(&frame.parts.diskstats);
-        self.hwmon.clone_from(&frame.parts.hwmon);
-        self.thermal.clone_from(&frame.parts.thermal_zone);
-        self.power.clone_from(&frame.parts.power_supply);
+        let mem = &frame.parts.meminfo;
+        self.mem_total = mem
+            .raw
+            .get(thegn_metrics::collect::parse::meminfo::MemField::MemTotal);
+        self.mem_available = mem
+            .raw
+            .get(thegn_metrics::collect::parse::meminfo::MemField::MemAvailable);
+        self.swap_used = mem.swap_used_bytes();
+        self.net_ifaces = frame.parts.netdev.ifaces.len();
+        self.disk_read_bps = frame.parts.diskstats.aggregate.read_bps;
+        self.disk_write_bps = frame.parts.diskstats.aggregate.write_bps;
+        self.hottest_c = frame
+            .parts
+            .thermal_zone
+            .zones
+            .iter()
+            .filter_map(|z| z.temp_c)
+            .chain(frame.parts.hwmon.values.iter().filter_map(|v| v.value))
+            .reduce(f32::max);
+        self.thermal_zones = frame.parts.thermal_zone.zones.len();
+        self.battery = frame
+            .parts
+            .power_supply
+            .supplies
+            .iter()
+            .find(|s| s.kind == thegn_metrics::collect::model::power_supply::SupplyKind::Battery)
+            .map(|s| (s.capacity_pct, s.status));
+        self.health.copy_from_slice(&frame.health);
+    }
+    fn source_present(&self, ids: &[CollectorId], fallback: bool) -> bool {
+        fallback
+            || ids.iter().any(|id| {
+                !matches!(
+                    self.health[id.index()],
+                    thegn_metrics::collect::health::Health::Absent(_)
+                )
+            })
     }
     fn present(&self, index: usize) -> bool {
         match index {
-            0 => {
-                self.stats.cpu_pct.is_some()
-                    || self.cpu.total.is_some()
-                    || !self.cpu.cores.is_empty()
-            }
-            1 => {
-                self.load.value.is_some()
-                    || self.stats.load_avg.is_some()
-                    || self.psi.cpu.present
-                    || self.psi.memory.present
-            }
-            2 => self.mem.used_bytes().is_some() || self.stats.mem_gib.is_some(),
-            3 => self.stats.net_bps.is_some() || !self.net.ifaces.is_empty(),
-            4 => {
-                self.disk.aggregate.read_bps.is_some()
-                    || self.disk.aggregate.write_bps.is_some()
-                    || self.stats.disk_free_pct.is_some()
-            }
-            5 => {
-                self.hwmon.values.iter().any(|v| v.value.is_some())
-                    || self.thermal.zones.iter().any(|z| z.temp_c.is_some())
-                    || self.stats.cpu_temp_c.is_some()
-            }
-            6 => !self.power.supplies.is_empty() || self.stats.battery.is_some(),
+            0 => self.source_present(&[CollectorId::CpuStat], self.stats.cpu_pct.is_some()),
+            1 => self.source_present(
+                &[CollectorId::Loadavg, CollectorId::Psi],
+                self.stats.load_avg.is_some(),
+            ),
+            2 => self.source_present(&[CollectorId::Meminfo], self.stats.mem_gib.is_some()),
+            3 => self.source_present(&[CollectorId::Netdev], self.stats.net_bps.is_some()),
+            4 => self.source_present(
+                &[CollectorId::Diskstats],
+                self.stats.disk_free_pct.is_some(),
+            ),
+            5 => self.source_present(
+                &[CollectorId::Hwmon, CollectorId::ThermalZone],
+                self.stats.cpu_temp_c.is_some(),
+            ),
+            6 => self.source_present(&[CollectorId::PowerSupply], self.stats.battery.is_some()),
             _ => true,
         }
     }
     fn health(&self) -> mem_health::MemHealth {
-        let total = self
-            .mem
-            .raw
-            .get(thegn_metrics::collect::parse::meminfo::MemField::MemTotal);
-        let available = self
-            .mem
-            .raw
-            .get(thegn_metrics::collect::parse::meminfo::MemField::MemAvailable);
-        mem_health::evaluate(MemHealthInput {
-            mem_total_bytes: total,
-            mem_available_bytes: available,
+        mem_health::evaluate(&MemHealthInput {
+            mem_total_bytes: self.mem_total,
+            mem_available_bytes: self.mem_available,
             psi_some_avg10: self
                 .psi
                 .memory
@@ -229,53 +325,23 @@ impl TabView for OverviewView<'_> {
     }
     fn demand(&self, panel: PanelId) -> CollectorSet {
         let mut set = CollectorSet::empty();
-        let Some(index) = IDS.iter().position(|id| *id == panel) else {
+        let Some(index) = PANELS.iter().position(|meta| meta.id == panel) else {
             return set;
-        };
-        if !self.0.present(index) {
-            return set;
-        }
-        let m = self.0;
-        let mut add = |id| {
-            set.insert(id);
         };
         match index {
-            0 if m.cpu.total.is_some() || !m.cpu.cores.is_empty() => add(CollectorId::CpuStat),
+            0 | 7 => set.insert(CollectorId::CpuStat),
             1 => {
-                if m.load.value.is_some() {
-                    add(CollectorId::Loadavg);
-                }
-                if m.psi.cpu.present || m.psi.memory.present {
-                    add(CollectorId::Psi);
-                }
+                set.insert(CollectorId::Loadavg);
+                set.insert(CollectorId::Psi);
             }
-            2 if m
-                .mem
-                .raw
-                .get(thegn_metrics::collect::parse::meminfo::MemField::MemTotal)
-                .is_some()
-                || m.mem
-                    .raw
-                    .get(thegn_metrics::collect::parse::meminfo::MemField::MemAvailable)
-                    .is_some()
-                || m.mem.swap_used_bytes().is_some() =>
-            {
-                add(CollectorId::Meminfo)
-            }
-            3 if !m.net.ifaces.is_empty() => add(CollectorId::Netdev),
-            4 if m.disk.aggregate.read_bps.is_some() || m.disk.aggregate.write_bps.is_some() => {
-                add(CollectorId::Diskstats)
-            }
+            2 => set.insert(CollectorId::Meminfo),
+            3 => set.insert(CollectorId::Netdev),
+            4 => set.insert(CollectorId::Diskstats),
             5 => {
-                if m.hwmon.values.iter().any(|v| v.value.is_some()) {
-                    add(CollectorId::Hwmon);
-                }
-                if m.thermal.zones.iter().any(|z| z.temp_c.is_some()) {
-                    add(CollectorId::ThermalZone);
-                }
+                set.insert(CollectorId::Hwmon);
+                set.insert(CollectorId::ThermalZone);
             }
-            6 if !m.power.supplies.is_empty() => add(CollectorId::PowerSupply),
-            7 if m.cpu.procs_running.is_some() => add(CollectorId::CpuStat),
+            6 => set.insert(CollectorId::PowerSupply),
             _ => {}
         }
         set
@@ -288,20 +354,11 @@ impl TabView for OverviewView<'_> {
         _scroll: usize,
         _sections: &[Section],
     ) {
-        let Some(index) = IDS.iter().position(|id| *id == placed.id) else {
+        let Some(index) = PANELS.iter().position(|meta| meta.id == placed.id) else {
             return;
         };
         let mut grid = CellGrid::new(rect.cols, rect.rows);
-        let title = [
-            "CPU",
-            "Load / pressure",
-            "Memory",
-            "Network",
-            "Disk",
-            "Thermal",
-            "Power",
-            "Processes / containers",
-        ][index];
+        let title = PANELS[index].title;
         let (badge, lines, tone) = self.panel_content(index);
         let content_rect;
         {
@@ -316,42 +373,19 @@ impl TabView for OverviewView<'_> {
                 body.put_str(0, row, line, kit_style(tone));
             }
         }
-        if let Some(values) = self.0.sparks.get(index).filter(|values| !values.is_empty()) {
-            let ramps = [
-                RampId::Util,
-                RampId::Util,
-                RampId::Mem,
-                RampId::Rx,
-                RampId::Read,
-                RampId::Temp,
-                RampId::Power,
-                RampId::Write,
-            ];
+        let mut sparks = Vec::new();
+        if let Some(values) = self.0.sparks.get(index) {
             let start = lines.len().saturating_add(1);
-            let mut meter = kit::meter::Meter::default();
-            for (row, value) in values
-                .iter()
-                .rev()
-                .take(content_rect.rows.saturating_sub(start))
-                .enumerate()
-            {
-                meter.paint(
-                    &mut grid,
-                    Rect {
-                        x: content_rect.x,
-                        y: content_rect.y + start + row,
-                        cols: content_rect.cols,
-                        rows: 1,
-                    },
-                    kit::meter::MeterSpec {
-                        value: value.clamp(0.0, 1.0),
-                        warn: 0.7,
-                        crit: 0.9,
-                        ramp: ramps[index],
-                        label: false,
-                        fmt: NumFmt::default(),
-                    },
-                );
+            for (series_index, series) in values.iter().enumerate() {
+                let y = start + series_index;
+                if !series.is_empty() && y < content_rect.rows {
+                    sparks.push((
+                        series.as_slice(),
+                        content_rect.x,
+                        content_rect.y + y,
+                        content_rect.cols,
+                    ));
+                }
             }
         }
         let mut emitter = kit::emit::Emitter::default();
@@ -362,6 +396,20 @@ impl TabView for OverviewView<'_> {
             rect.x,
             rect.y,
         );
+        for (values, x, y, cols) in sparks {
+            crate::monitor::graphs::paint_sparkline(
+                values,
+                cols,
+                PANELS[index].ramp,
+                Rect {
+                    x: rect.x + x,
+                    y: rect.y + y,
+                    cols,
+                    rows: 1,
+                },
+                surface,
+            );
+        }
     }
 }
 
