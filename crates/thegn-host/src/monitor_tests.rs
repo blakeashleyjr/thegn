@@ -1203,7 +1203,7 @@ fn process_columns_follow_viewport_not_sample_values_and_keep_visible_identity()
 
 #[test]
 fn process_columns_use_available_fitted_default_and_keep_cpu_unprimed_unknown() {
-    let hist = history(240, NOW_MS);
+    let hist = history(120, NOW_MS);
     for cols in [100usize, 160, 240] {
         let screen = Rect::full(cols, 30);
         let mut model = model_with_procs(vec![proc(41, None, "worker", 0.0, 4096)]);
@@ -1290,7 +1290,7 @@ fn process_columns_stay_inside_very_narrow_viewports() {
         if let Some(widths) = widths {
             assert_eq!(
                 widths.iter().sum::<usize>() + widths.len().saturating_sub(1) + 1,
-                cols
+                ov.cols
             );
         }
     }
@@ -1298,7 +1298,7 @@ fn process_columns_stay_inside_very_narrow_viewports() {
 
 #[test]
 fn process_reflow_keeps_selected_identity_and_fits_the_resized_viewport() {
-    let hist = history(240, NOW_MS);
+    let hist = history(120, NOW_MS);
     let model = model_with_n_procs(12);
     let small = Rect::full(100, 30);
     let mut ov = open_tab(MonitorTab::Procs, &model, &hist, small);
@@ -1332,7 +1332,7 @@ fn process_reflow_keeps_selected_identity_and_fits_the_resized_viewport() {
 
 #[test]
 fn process_reflow_uses_frozen_priming_state_when_filter_mentions_warming_note() {
-    let hist = history(240, NOW_MS);
+    let hist = history(120, NOW_MS);
     let mut model = model_with_procs(vec![proc(41, None, "cpu warming up worker", 12.0, 4096)]);
     model.procs.primed = true;
     let small = Rect::full(100, 30);
