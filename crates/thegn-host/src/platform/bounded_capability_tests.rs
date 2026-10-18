@@ -27,7 +27,7 @@ mod unix {
         absolute
     }
 
-    fn private_shell(dir: &Path, script: &str) -> std::process::Command {
+    fn private_shell(dir: &std::path::Path, script: &str) -> std::process::Command {
         let mut command = std::process::Command::new(fixture_tool("sh"));
         command
             .env_clear()
