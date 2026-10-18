@@ -24,8 +24,7 @@ pub fn effective_state(
             Some(false) => Some(EffectiveState::Discharging),
             Some(true)
                 if capacity_pct
-                    .zip(end_threshold_pct)
-                    .is_some_and(|(capacity, threshold)| capacity >= threshold) =>
+                    .is_some_and(|capacity| capacity >= end_threshold_pct.unwrap_or(95)) =>
             {
                 Some(EffectiveState::Held)
             }
@@ -40,11 +39,11 @@ pub fn effective_state(
     }
 }
 
-/// Apply the state-derived battery sign: discharge is positive, charge negative.
+/// Apply the P5 battery sign: charging is positive, discharging negative.
 pub fn signed_battery_watts(magnitude_watts: f32, state: EffectiveState) -> f32 {
     match state {
-        EffectiveState::Discharging => magnitude_watts.abs(),
-        EffectiveState::Charging => -magnitude_watts.abs(),
+        EffectiveState::Discharging => -magnitude_watts.abs(),
+        EffectiveState::Charging => magnitude_watts.abs(),
         EffectiveState::Held | EffectiveState::Full | EffectiveState::IdleOnAc => 0.0,
     }
 }
@@ -114,7 +113,7 @@ impl SessionEnergy {
         self.energy_wh
     }
 
-    /// Integrate positive discharge watts. Gaps over 30 seconds add no energy.
+    /// Integrate positive best-available system/socket power magnitude. Gaps over 30 seconds add no energy.
     pub fn update(&mut self, now_ms: u64, ac_online: Option<bool>, watts: Option<f32>) -> f64 {
         if self.previous_ac_online == Some(true) && ac_online == Some(false) {
             self.energy_wh = 0.0;
@@ -123,7 +122,7 @@ impl SessionEnergy {
         if let (Some((previous_ms, previous_watts)), Some(watts)) = (self.previous, watts) {
             let dt_ms = now_ms.saturating_sub(previous_ms);
             if dt_ms > 0 && dt_ms <= 30_000 {
-                let average_watts = (previous_watts.max(0.0) + watts.max(0.0)) / 2.0;
+                let average_watts = (previous_watts + watts) / 2.0;
                 self.energy_wh += f64::from(average_watts) * dt_ms as f64 / 3_600_000.0;
             }
         }
@@ -165,6 +164,13 @@ mod tests {
             (
                 Some(SupplyStatus::NotCharging),
                 Some(true),
+                Some(97),
+                None,
+                Some(EffectiveState::Held),
+            ),
+            (
+                Some(SupplyStatus::NotCharging),
+                Some(true),
                 Some(79),
                 Some(80),
                 Some(EffectiveState::IdleOnAc),
@@ -188,8 +194,8 @@ mod tests {
         for (status, ac, capacity, threshold, expected) in cases {
             assert_eq!(effective_state(status, ac, capacity, threshold), expected);
         }
-        assert!((signed_battery_watts(12.0, EffectiveState::Discharging) - 12.0).abs() < 0.001);
-        assert!((signed_battery_watts(12.0, EffectiveState::Charging) + 12.0).abs() < 0.001);
+        assert!((signed_battery_watts(12.0, EffectiveState::Discharging) + 12.0).abs() < 0.001);
+        assert!((signed_battery_watts(12.0, EffectiveState::Charging) - 12.0).abs() < 0.001);
     }
 
     #[test]
@@ -216,8 +222,8 @@ mod tests {
         session.update(10_000, Some(true), Some(10.0));
         assert!((session.energy_wh() - 10.0 / 360.0).abs() < 0.0001);
         session.update(11_000, Some(false), Some(10.0));
-        assert_eq!(session.energy_wh(), 0.0);
+        assert!(session.energy_wh().abs() < 1e-12);
         session.update(51_000, Some(false), Some(10.0));
-        assert_eq!(session.energy_wh(), 0.0);
+        assert!(session.energy_wh().abs() < 1e-12);
     }
 }

@@ -68,6 +68,7 @@ impl PowercapFs for RealFs {
 }
 
 struct Held<H> {
+    path: PathBuf,
     name: Arc<str>,
     domain: PowerDomain,
     max_energy_range_uj: Option<u64>,
@@ -80,6 +81,7 @@ pub struct PowercapCollector<F: PowercapFs = RealFs> {
     root: PathBuf,
     zones: Vec<Held<F::Handle>>,
     last_discovery_ms: Option<u64>,
+    stamp_discovery_on_sample: bool,
 }
 
 impl PowercapCollector<RealFs> {
@@ -95,11 +97,12 @@ impl<F: PowercapFs> PowercapCollector<F> {
             root: root.into(),
             zones: Vec::new(),
             last_discovery_ms: None,
+            stamp_discovery_on_sample: false,
         }
     }
 
     fn discover_zones(&mut self) -> Health {
-        self.zones.clear();
+        let mut previous_zones = std::mem::take(&mut self.zones);
         let entries = match self.fs.list(&self.root) {
             Ok(entries) => entries,
             Err(error) if error.kind() == io::ErrorKind::PermissionDenied => {
@@ -111,9 +114,6 @@ impl<F: PowercapFs> PowercapCollector<F> {
         for entry in &entries {
             if is_zone_path(entry) {
                 paths.push(entry.clone());
-                if let Ok(children) = self.fs.list(entry) {
-                    paths.extend(children.into_iter().filter(|path| is_zone_path(path)));
-                }
             }
         }
         paths.sort();
@@ -126,6 +126,14 @@ impl<F: PowercapFs> PowercapCollector<F> {
         let mut energy_opened = 0;
         let mut permission_denied = 0;
         for path in paths {
+            if let Some(index) = previous_zones.iter().position(|zone| zone.path == path) {
+                let zone = previous_zones.remove(index);
+                if zone.energy.is_some() {
+                    energy_opened += 1;
+                }
+                self.zones.push(zone);
+                continue;
+            }
             let Some(dir_name) = path.file_name() else {
                 continue;
             };
@@ -158,6 +166,7 @@ impl<F: PowercapFs> PowercapCollector<F> {
             };
             if energy.is_some() {
                 self.zones.push(Held {
+                    path,
                     name: Arc::from(name.as_str()),
                     domain: domain_for(&name),
                     max_energy_range_uj,
@@ -191,20 +200,32 @@ impl<F: PowercapFs> Collector for PowercapCollector<F> {
     }
 
     fn discover(&mut self, _env: &Env) -> Health {
-        self.last_discovery_ms = Some(0);
+        self.last_discovery_ms = None;
+        self.stamp_discovery_on_sample = true;
         self.discover_zones()
     }
 
     fn sample(&mut self, ctx: &TickCtx, frame: &mut MonitorFrame) -> Result<(), CollectError> {
-        if self
-            .last_discovery_ms
-            .is_none_or(|last| ctx.now_ms.saturating_sub(last) >= REDISCOVER_AFTER_MS)
-        {
-            let health = self.discover_zones();
-            self.last_discovery_ms = Some(ctx.now_ms);
-            if health != Health::Ok {
-                return Err(CollectError::Gone);
+        match self.last_discovery_ms {
+            None if self.stamp_discovery_on_sample => {
+                self.last_discovery_ms = Some(ctx.now_ms);
+                self.stamp_discovery_on_sample = false;
             }
+            None => {
+                let health = self.discover_zones();
+                self.last_discovery_ms = Some(ctx.now_ms);
+                if health != Health::Ok {
+                    return Err(CollectError::Gone);
+                }
+            }
+            Some(last) if ctx.now_ms.saturating_sub(last) >= REDISCOVER_AFTER_MS => {
+                let health = self.discover_zones();
+                self.last_discovery_ms = Some(ctx.now_ms);
+                if health != Health::Ok {
+                    return Err(CollectError::Gone);
+                }
+            }
+            Some(_) => {}
         }
         frame.parts.powercap.zones.clear();
         let mut buffer = [0_u8; BUFFER_LEN];
@@ -228,13 +249,13 @@ impl<F: PowercapFs> Collector for PowercapCollector<F> {
                 let previous = zone.previous.replace((energy, ctx.now_ms));
                 previous.and_then(|(previous_energy, previous_ms)| {
                     let dt_ms = ctx.now_ms.saturating_sub(previous_ms);
-                    (dt_ms > 0)
-                        .then(|| {
-                            let delta =
-                                wrapped_delta(previous_energy, energy, zone.max_energy_range_uj);
-                            delta as f64 / dt_ms as f64 / 1_000.0
-                        })
-                        .map(|value| value as f32)
+                    let watts = if dt_ms == 0 {
+                        None
+                    } else {
+                        wrapped_delta(previous_energy, energy, zone.max_energy_range_uj)
+                            .map(|delta| delta as f64 / dt_ms as f64 / 1_000.0)
+                    };
+                    watts.map(|value| value as f32)
                 })
             });
             frame.parts.powercap.zones.push(PowercapZone {
@@ -247,6 +268,7 @@ impl<F: PowercapFs> Collector for PowercapCollector<F> {
         if gone {
             self.zones.clear();
             self.last_discovery_ms = None;
+            self.stamp_discovery_on_sample = false;
             return Err(CollectError::Gone);
         }
         frame.sampled.insert(CollectorId::Powercap);
@@ -256,6 +278,7 @@ impl<F: PowercapFs> Collector for PowercapCollector<F> {
     fn close(&mut self) {
         self.zones.clear();
         self.last_discovery_ms = None;
+        self.stamp_discovery_on_sample = false;
     }
 }
 
@@ -304,14 +327,14 @@ fn trim_ascii(mut bytes: &[u8]) -> &[u8] {
     bytes
 }
 
-fn wrapped_delta(previous: u64, current: u64, max_range: Option<u64>) -> u64 {
+fn wrapped_delta(previous: u64, current: u64, max_range: Option<u64>) -> Option<u64> {
     if current >= previous {
-        current - previous
+        Some(current - previous)
     } else if let Some(max_range) = max_range {
         let modulus = u128::from(max_range) + 1;
-        ((u128::from(current) + modulus - u128::from(previous)) % modulus) as u64
+        Some(((u128::from(current) + modulus - u128::from(previous)) % modulus) as u64)
     } else {
-        0
+        None
     }
 }
 
