@@ -308,7 +308,7 @@ impl<F: CgroupFs> OwnerTable<F> {
                 let path_bytes: Arc<[u8]> = Arc::from(path.as_os_str().as_bytes());
                 let classified = cgroup_classify::classify(&path_bytes);
                 let kind = classified.kind;
-                let name: Arc<str> = Arc::from(classified.name);
+                let name: Arc<[u8]> = Arc::from(classified.name);
                 self.paths.push(OwnerLabel {
                     id: inode,
                     path: path.clone(),
