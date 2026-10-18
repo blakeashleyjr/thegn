@@ -1,4 +1,10 @@
 //! Linux base-tier temperatures from held hwmon input files.
+//!
+//! Compared with sysinfo, enumeration order is deterministic (numeric hwmon
+//! order and channel order; sysinfo uses `read_dir` and `HashMap` iteration),
+//! implausible readings are dropped (including NVMe's 65261.85 C sentinel and
+//! disconnected probes' -128 C), and failed sensors are omitted instead of
+//! retaining sysinfo's stale last value indefinitely after `refresh(false)`.
 
 use std::path::{Path, PathBuf};
 
@@ -11,7 +17,18 @@ use crate::collect::{
 #[derive(Debug)]
 struct Slot<H> {
     label: String,
-    handle: H,
+    path: PathBuf,
+    handle: Option<H>,
+    chip: Option<usize>,
+    pending: bool,
+}
+
+struct ChipGate<H> {
+    runtime: Option<H>,
+    state: Option<H>,
+    status: Vec<u8>,
+    scsi_state: Option<Vec<u8>>,
+    gated: bool,
 }
 
 pub(crate) struct BaseTemp<F: HwmonFs = RealFs> {
@@ -19,6 +36,9 @@ pub(crate) struct BaseTemp<F: HwmonFs = RealFs> {
     hwmon: PathBuf,
     hwmon_count: Option<usize>,
     slots: Vec<Slot<F::Handle>>,
+    gates: Vec<ChipGate<F::Handle>>,
+    thermal: Vec<Slot<F::Handle>>,
+    rediscover: bool,
     buffer: Vec<u8>,
     #[cfg(test)]
     reads: usize,
@@ -38,46 +58,114 @@ impl<F: HwmonFs> BaseTemp<F> {
             hwmon: root.join("class/hwmon"),
             hwmon_count: None,
             slots: Vec::new(),
+            gates: Vec::new(),
+            thermal: Vec::new(),
+            rediscover: false,
             buffer: vec![0; 64],
             #[cfg(test)]
             reads: 0,
         }
     }
 
-    /// Discover once, then check the hwmon directory count on each slow tick.
-    /// Input descriptors stay held across steady state; unavailable sensors are
-    /// omitted and failed reads are dropped so a later slow tick can rediscover.
+    /// Check for directory changes and reread held inputs and power gates.
     pub(crate) fn fill(&mut self) -> Vec<(String, f32)> {
         let dirs = self.hwmon_dirs();
-        if self.hwmon_count != Some(dirs.len()) {
+        if self.hwmon_count != Some(dirs.len()) || self.rediscover {
             self.hwmon_count = Some(dirs.len());
+            self.rediscover = false;
             self.discover(&dirs);
         }
-        let mut values = Vec::with_capacity(self.slots.len());
-        let mut failed = Vec::new();
-        for (index, slot) in self.slots.iter().enumerate() {
+        self.refresh_gates();
+        let mut values: Vec<(String, f32)> = Vec::with_capacity(self.slots.len());
+        let mut lost = false;
+        for slot in &mut self.slots {
+            if slot.chip.is_some_and(|chip| self.gates[chip].gated) {
+                continue;
+            }
+            if slot.handle.is_none() && slot.pending {
+                slot.handle = self.fs.open(&slot.path).ok();
+                slot.pending = false;
+            }
+            let Some(handle) = slot.handle.as_ref() else {
+                continue;
+            };
             #[cfg(test)]
             {
                 self.reads += 1;
             }
-            match self.fs.pread(&slot.handle, &mut self.buffer) {
+            match self.fs.pread(handle, &mut self.buffer) {
                 Ok(length) => {
                     if let Some(milli) = parse_milli(&self.buffer[..length])
                         && let Some(value) = plausible_input(SensorKind::Temp, milli)
                     {
-                        values.push((slot.label.clone(), value));
+                        if let Some((_, existing)) =
+                            values.iter_mut().find(|(label, _)| label == &slot.label)
+                        {
+                            *existing = value;
+                        } else {
+                            values.push((slot.label.clone(), value));
+                        }
                     }
                 }
-                Err(_) => failed.push(index),
+                Err(error) if matches!(error.raw_os_error(), Some(2 | 6 | 19)) => {
+                    slot.handle = None;
+                    lost = true;
+                }
+                Err(_) => {}
             }
         }
-        if !failed.is_empty() {
-            for index in failed.into_iter().rev() {
-                self.slots.remove(index);
-            }
-            self.hwmon_count = None;
+        if lost {
+            self.slots
+                .retain(|slot| slot.handle.is_some() || slot.pending);
+            self.rediscover = true;
+        }
+        if self.slots.is_empty() {
+            self.read_thermal(&mut values);
         }
         values
+    }
+
+    fn refresh_gates(&mut self) {
+        for (chip, gate) in self.gates.iter_mut().enumerate() {
+            let mut buf = [0; 32];
+            if let Some(handle) = &gate.runtime {
+                if let Ok(length) = self.fs.pread(handle, &mut buf) {
+                    gate.status = buf[..length].to_vec();
+                }
+            }
+            if let Some(handle) = &gate.state {
+                if let Ok(length) = self.fs.pread(handle, &mut buf) {
+                    gate.scsi_state = Some(buf[..length].to_vec());
+                }
+            }
+            let gated = wake_gate(&gate.status, gate.scsi_state.as_deref());
+            if gate.gated != gated {
+                gate.gated = gated;
+                for slot in self.slots.iter_mut().filter(|slot| slot.chip == Some(chip)) {
+                    if gated {
+                        slot.handle = None;
+                        slot.pending = true;
+                    }
+                }
+            }
+        }
+    }
+
+    fn read_thermal(&mut self, values: &mut Vec<(String, f32)>) {
+        for slot in &mut self.thermal {
+            if let Some(handle) = &slot.handle {
+                #[cfg(test)]
+                {
+                    self.reads += 1;
+                }
+                if let Ok(length) = self.fs.pread(handle, &mut self.buffer)
+                    && let Some(milli) = parse_milli(&self.buffer[..length])
+                    && let Some(value) = plausible_input(SensorKind::Temp, milli)
+                {
+                    values.push((slot.label.clone(), value));
+                }
+            }
+        }
     }
 
     fn hwmon_dirs(&mut self) -> Vec<PathBuf> {
@@ -105,19 +193,25 @@ impl<F: HwmonFs> BaseTemp<F> {
 
     fn discover(&mut self, dirs: &[PathBuf]) {
         self.slots.clear();
-        let mut retry_open = false;
+        self.gates.clear();
+        self.thermal.clear();
         for dir in dirs {
             let name = read_text(&mut self.fs, &dir.join("name")).unwrap_or_default();
-            let runtime = read_text(&mut self.fs, &dir.join("device/power/runtime_status"))
-                .unwrap_or_default();
-            let scsi_state = if name == "drivetemp" {
-                Some(read_text(&mut self.fs, &dir.join("device/state")).unwrap_or_default())
-            } else {
-                None
-            };
-            if wake_gate(runtime.as_bytes(), scsi_state.as_deref().map(str::as_bytes)) {
-                continue;
-            }
+            let runtime_path = dir.join("device/power/runtime_status");
+            let state_path = (name == "drivetemp").then(|| dir.join("device/state"));
+            let runtime = read_text(&mut self.fs, &runtime_path).unwrap_or_default();
+            let scsi_state = state_path
+                .as_ref()
+                .map(|path| read_text(&mut self.fs, path).unwrap_or_default());
+            let gated = wake_gate(runtime.as_bytes(), scsi_state.as_deref().map(str::as_bytes));
+            let chip_index = self.gates.len();
+            self.gates.push(ChipGate {
+                runtime: self.fs.open(&runtime_path).ok(),
+                state: state_path.as_ref().and_then(|path| self.fs.open(path).ok()),
+                status: runtime.into_bytes(),
+                scsi_state: scsi_state.map(String::into_bytes),
+                gated,
+            });
             let device_model = read_text(&mut self.fs, &dir.join("device/model"));
             let Ok(entries) = self.fs.list(dir) else {
                 continue;
@@ -126,13 +220,10 @@ impl<F: HwmonFs> BaseTemp<F> {
                 .into_iter()
                 .filter_map(|path| {
                     let filename = path.file_name()?.to_str()?;
-                    let Some(channel) = filename
+                    let channel = filename
                         .strip_prefix("temp")
                         .and_then(|suffix| suffix.strip_suffix("_input"))
-                        .and_then(|channel| channel.parse::<u32>().ok())
-                    else {
-                        return None;
-                    };
+                        .and_then(|channel| channel.parse::<u32>().ok())?;
                     Some((channel, path))
                 })
                 .collect();
@@ -141,14 +232,51 @@ impl<F: HwmonFs> BaseTemp<F> {
                 let label = read_text(&mut self.fs, &dir.join(format!("temp{channel}_label")))
                     .filter(|label| !label.is_empty());
                 let label = format_label(&name, label.as_deref(), device_model.as_deref(), channel);
-                match self.fs.open(&path) {
-                    Ok(handle) => self.slots.push(Slot { label, handle }),
-                    Err(_) => retry_open = true,
+                if gated {
+                    self.slots.push(Slot {
+                        label,
+                        path,
+                        handle: None,
+                        chip: Some(chip_index),
+                        pending: true,
+                    });
+                } else if let Ok(handle) = self.fs.open(&path) {
+                    self.slots.push(Slot {
+                        label,
+                        path,
+                        handle: Some(handle),
+                        chip: Some(chip_index),
+                        pending: false,
+                    });
                 }
             }
         }
-        if retry_open {
-            self.hwmon_count = None;
+        if self.slots.is_empty() {
+            let thermal = self.hwmon.parent().unwrap_or(&self.hwmon).join("thermal");
+            if let Ok(zones) = self.fs.list(&thermal) {
+                let mut zones = zones;
+                zones.retain(|zone| {
+                    zone.file_name()
+                        .and_then(|name| name.to_str())
+                        .is_some_and(|name| name.starts_with("thermal_"))
+                });
+                zones.sort();
+                for zone in zones {
+                    if read_text(&mut self.fs, &zone.join("type")).is_none() {
+                        continue;
+                    }
+                    let path = zone.join("temp");
+                    if let Ok(handle) = self.fs.open(&path) {
+                        self.thermal.push(Slot {
+                            label: String::new(),
+                            path,
+                            handle: Some(handle),
+                            chip: None,
+                            pending: false,
+                        });
+                    }
+                }
+            }
         }
     }
 }
@@ -156,7 +284,12 @@ impl<F: HwmonFs> BaseTemp<F> {
 fn read_text<F: HwmonFs>(fs: &mut F, path: &Path) -> Option<String> {
     let mut buffer = [0; 256];
     let length = fs.read_small(path, &mut buffer).ok()?;
-    Some(String::from_utf8_lossy(&buffer[..length]).trim().to_owned())
+    Some(
+        String::from_utf8(buffer[..length].to_vec())
+            .ok()?
+            .trim_end()
+            .to_owned(),
+    )
 }
 
 fn format_label(name: &str, label: Option<&str>, model: Option<&str>, channel: u32) -> String {
@@ -182,6 +315,7 @@ mod tests {
         dirs: Vec<PathBuf>,
         opens: Vec<PathBuf>,
         reads: usize,
+        eio: Vec<PathBuf>,
     }
 
     impl FakeFs {
@@ -243,6 +377,9 @@ mod tests {
 
         fn pread(&mut self, handle: &Self::Handle, buffer: &mut [u8]) -> io::Result<usize> {
             self.reads += 1;
+            if self.eio.iter().any(|path| path == handle) {
+                return Err(io::Error::from_raw_os_error(5));
+            }
             let bytes = self
                 .files
                 .get(handle)
@@ -283,6 +420,7 @@ mod tests {
             "/fake/class/hwmon/hwmon4/device/power/runtime_status",
             b"suspended\n",
         );
+        fs.put("/fake/class/hwmon/hwmon4/device/state", b"running\n");
         BaseTemp::with_fs(fs, root)
     }
 
@@ -296,22 +434,14 @@ mod tests {
         assert_eq!(temps[2], ("nvme Composite".to_owned(), 42.0));
         assert_eq!(temps[3], ("spd5118 temp1".to_owned(), 31.0));
         assert!(!temps.iter().any(|(label, _)| label == "nvme Sensor 2"));
-        let cpu_temp = temps
-            .iter()
-            .filter(|(label, _)| {
-                label.to_ascii_lowercase().contains("cpu")
-                    || label.to_ascii_lowercase().contains("k10temp")
-            })
-            .map(|(_, value)| *value)
-            .reduce(f32::max);
-        assert_eq!(cpu_temp, Some(61.0));
+        assert_eq!(crate::sample::cpu_temp(&temps), Some(61.0));
     }
 
     #[test]
     fn suspended_drive_is_not_opened_and_steady_state_reuses_each_slot() {
         let mut reader = fixture();
         let first = reader.fill();
-        assert_eq!(first.len(), 3);
+        assert_eq!(first.len(), 4);
         assert!(
             reader
                 .fs
@@ -319,11 +449,19 @@ mod tests {
                 .iter()
                 .all(|path| !path.ends_with("hwmon4/temp1_input"))
         );
-        assert_eq!(reader.reads, 4);
+        assert_eq!(reader.reads, 5);
         let second = reader.fill();
         assert_eq!(second, first);
-        assert_eq!(reader.reads, 8);
-        assert_eq!(reader.fs.opens.len(), 4);
+        assert_eq!(reader.reads, 10);
+        assert_eq!(
+            reader
+                .fs
+                .opens
+                .iter()
+                .filter(|path| path.ends_with("_input"))
+                .count(),
+            5
+        );
     }
 
     #[test]
@@ -339,6 +477,142 @@ mod tests {
                 .fill()
                 .iter()
                 .any(|(label, value)| label == "acpitz temp1" && *value == 39.0)
+        );
+    }
+
+    #[test]
+    fn duplicate_labels_keep_first_position_and_last_plausible_value() {
+        let mut reader = fixture();
+        reader.fill();
+        reader.fs.put("/fake/class/hwmon/hwmon5/name", b"spd5118\n");
+        reader
+            .fs
+            .put("/fake/class/hwmon/hwmon5/temp1_input", b"33000\n");
+        let temps = reader.fill();
+        let matches: Vec<_> = temps
+            .iter()
+            .filter(|(label, _)| label == "spd5118 temp1")
+            .collect();
+        assert_eq!(matches.len(), 1);
+        assert_eq!(matches[0].1, 33.0);
+        assert_eq!(temps[3].0, "spd5118 temp1");
+    }
+
+    #[test]
+    fn runtime_gate_skips_and_resumes_slot_without_directory_change() {
+        let mut reader = fixture();
+        reader.fill();
+        let drive = Path::new("/fake/class/hwmon/hwmon4/temp1_input");
+        let initial_reads = reader.reads;
+        reader.fs.put(
+            "/fake/class/hwmon/hwmon4/device/power/runtime_status",
+            b"active\n",
+        );
+        assert!(
+            reader
+                .fill()
+                .iter()
+                .any(|(label, _)| label == "drivetemp temp1")
+        );
+        let active_reads = reader.reads;
+        reader.fs.put(
+            "/fake/class/hwmon/hwmon4/device/power/runtime_status",
+            b"suspended\n",
+        );
+        assert!(
+            !reader
+                .fill()
+                .iter()
+                .any(|(label, _)| label == "drivetemp temp1")
+        );
+        assert_eq!(reader.reads, active_reads);
+        reader.fs.put(
+            "/fake/class/hwmon/hwmon4/device/power/runtime_status",
+            b"active\n",
+        );
+        assert!(
+            reader
+                .fill()
+                .iter()
+                .any(|(label, _)| label == "drivetemp temp1")
+        );
+        assert!(
+            reader
+                .fs
+                .opens
+                .iter()
+                .filter(|path| path.as_path() == drive)
+                .count()
+                >= 2
+        );
+        assert!(active_reads > initial_reads);
+    }
+
+    #[test]
+    fn persistent_eio_keeps_slot_open_and_other_values_arrive() {
+        let mut reader = fixture();
+        let failing = PathBuf::from("/fake/class/hwmon/hwmon0/temp1_input");
+        reader.fs.eio.push(failing.clone());
+        let first = reader.fill();
+        let opened = reader
+            .fs
+            .opens
+            .iter()
+            .filter(|path| *path == &failing)
+            .count();
+        assert!(!first.iter().any(|(label, _)| label == "k10temp Tctl"));
+        assert!(first.iter().any(|(label, _)| label == "amdgpu edge Radeon"));
+        for _ in 0..2 {
+            assert!(
+                reader
+                    .fill()
+                    .iter()
+                    .any(|(label, _)| label == "amdgpu edge Radeon")
+            );
+        }
+        assert_eq!(
+            reader
+                .fs
+                .opens
+                .iter()
+                .filter(|path| *path == &failing)
+                .count(),
+            opened
+        );
+        assert_eq!(reader.reads, 15);
+    }
+
+    #[test]
+    fn thermal_zone_is_used_when_hwmon_has_no_inputs() {
+        let mut fs = FakeFs::default();
+        fs.put("/fake/class/thermal/thermal_zone0/type", b"x86_pkg_temp\n");
+        fs.put("/fake/class/thermal/thermal_zone0/temp", b"44000\n");
+        let mut reader = BaseTemp::with_fs(fs, "/fake");
+        assert_eq!(reader.fill(), vec![(String::new(), 44.0)]);
+    }
+
+    #[test]
+    fn drivetemp_active_runtime_still_obeys_offline_scsi_state() {
+        let mut reader = fixture();
+        reader.fs.put(
+            "/fake/class/hwmon/hwmon4/device/power/runtime_status",
+            b"active\n",
+        );
+        reader
+            .fs
+            .put("/fake/class/hwmon/hwmon4/device/state", b"offline\n");
+        assert!(
+            !reader
+                .fill()
+                .iter()
+                .any(|(label, _)| label == "drivetemp temp1")
+        );
+        assert!(
+            !reader
+                .fs
+                .opens
+                .iter()
+                .any(|path| path.ends_with("hwmon4/temp1_input"))
         );
     }
 }
