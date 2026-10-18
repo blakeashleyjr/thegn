@@ -28,10 +28,8 @@ fn text(path: &Path) -> Option<String> {
         .ok()
         .map(|s| s.trim().to_owned())
 }
-fn kind(name: &str, partition: bool) -> DevKind {
-    if partition {
-        DevKind::Partition
-    } else if name.starts_with("dm-") {
+fn kind(name: &str) -> DevKind {
+    if name.starts_with("dm-") {
         DevKind::Dm
     } else if name.starts_with("md") {
         DevKind::Md
@@ -66,7 +64,7 @@ pub fn scan(sys_block: &Path, rev: u32) -> Topology {
             name: Arc::from(name.as_str()),
             major,
             minor,
-            kind: kind(&name, parent_disk),
+            kind: kind(&name),
             physical: !parent_disk
                 && root.join("device").exists()
                 && !is_virtual_name(name.as_bytes()),
@@ -106,20 +104,16 @@ pub fn scan(sys_block: &Path, rev: u32) -> Topology {
         .enumerate()
         .map(|(i, d)| (d.name.to_string(), i))
         .collect();
-    for index in 0..topo.devs.len() {
-        let sys_path = sys_block.join(topo.devs[index].name.as_ref());
+    for dev in &mut topo.devs {
+        let sys_path = sys_block.join(dev.name.as_ref());
         let Ok(slaves) = std::fs::read_dir(sys_path.join("slaves")) else {
             continue;
         };
-        topo.devs[index].slaves = slaves
+        dev.slaves = slaves
             .flatten()
             .filter_map(|e| names.get(e.file_name().to_string_lossy().as_ref()).copied())
             .collect();
-        topo.devs[index].parent = topo.devs[index]
-            .slaves
-            .first()
-            .copied()
-            .or(topo.devs[index].parent);
+        dev.parent = dev.slaves.first().copied().or(dev.parent);
     }
     topo
 }
@@ -193,6 +187,42 @@ mod tests {
         let topology = scan(root.path(), 7);
         assert_eq!(topology.rev, 7);
         assert_eq!(physical_disks(root.path()), vec!["nvme0n1", "sda"]);
+        for (name, expected) in [
+            ("nvme0n1", true),
+            ("sda", true),
+            ("dm-0", false),
+            ("md0", false),
+            ("loop0", false),
+            ("zram0", false),
+            ("nvme0n1p1", false),
+            ("nvme0n1p5", false),
+        ] {
+            assert_eq!(
+                topology
+                    .devs
+                    .iter()
+                    .find(|dev| dev.name.as_ref() == name)
+                    .unwrap()
+                    .physical,
+                expected,
+                "{name} physical flag"
+            );
+        }
+        for (name, expected) in [
+            ("loop0", DevKind::Loop),
+            ("zram0", DevKind::Zram),
+            ("md0", DevKind::Md),
+        ] {
+            assert_eq!(
+                topology
+                    .devs
+                    .iter()
+                    .find(|dev| dev.name.as_ref() == name)
+                    .unwrap()
+                    .kind,
+                expected
+            );
+        }
         let p5 = topology
             .devs
             .iter()
