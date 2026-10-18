@@ -471,7 +471,9 @@ fn telemetry_temp_series_is_separate_from_frame_package_history() {
     }
     let mut model = ThermalModel::default();
     model.absorb_frame(&fixture());
-    model.absorb_history(&history, Window::from_secs(10), ScaleMode::Window, 3_000);
+    // Telemetry windows are [start, now), so put the latest recorded sample
+    // just before the exclusive upper bound.
+    model.absorb_history(&history, Window::from_secs(10), ScaleMode::Window, 3_001);
     assert_eq!(model.temp_history.len(), HISTORY_CAP);
     assert_eq!(model.temp_history.last(), Some(&63.0));
     assert_eq!(model.package_history_len, 1);
