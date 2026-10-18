@@ -572,7 +572,10 @@ const G41: &[(ColId, usize)] = &[
     (Command, 164),
 ];
 
-const GOLDENS: &[(Preset, usize, bool, &[(ColId, usize)])] = &[
+/// (preset, width, tree, expected columns with widths).
+type Golden = (Preset, usize, bool, &'static [(ColId, usize)]);
+
+const GOLDENS: &[Golden] = &[
     (Preset::Default, 40, false, G0),
     (Preset::Default, 60, false, G1),
     (Preset::Default, 100, false, G2),
