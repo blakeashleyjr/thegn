@@ -31,9 +31,9 @@ fn telemetry_sample(rx: u64, tx: u64) -> StatsSnapshot {
 }
 
 #[test]
-fn network_tab_uses_the_board_and_demands_placed_netdev_panels() {
+fn network_tab_demands_netdev_and_wifi_only_for_placed_panels() {
     let history = TelemetryHistory::default();
-    let overlay = network_overlay(&history);
+    let mut overlay = network_overlay(&history);
     assert_eq!(overlay.tab(), MonitorTab::Network);
     let view = overlay.view();
     let placed = overlay.board.placed(&view, overlay.body_rect());
@@ -52,7 +52,12 @@ fn network_tab_uses_the_board_and_demands_placed_netdev_panels() {
         })
         .collect::<Vec<_>>()
         .join("\n");
-    for title in ["Network throughput", "Interfaces", "Network health"] {
+    for title in [
+        "Network throughput",
+        "Interfaces",
+        "Network health",
+        "Wi-Fi interfaces",
+    ] {
         assert!(
             rendered.contains(title),
             "missing board panel {title}: {rendered}"
@@ -60,7 +65,7 @@ fn network_tab_uses_the_board_and_demands_placed_netdev_panels() {
     }
     let demand = overlay.demand(1000);
     assert!(demand.collectors.contains(CollectorId::Netdev));
-    assert_eq!(demand.collectors.iter().count(), 1);
+    assert!(demand.collectors.contains(CollectorId::NetWifi));
     let expected = placed.iter().fold(
         thegn_metrics::collect::CollectorSet::empty(),
         |mut set, panel| {
@@ -71,6 +76,19 @@ fn network_tab_uses_the_board_and_demands_placed_netdev_panels() {
         },
     );
     assert_eq!(demand.collectors, expected);
+
+    let mut absent_wifi = MonitorFrame::default();
+    absent_wifi.health[CollectorId::NetWifi.index()] =
+        thegn_metrics::collect::health::Health::Absent(
+            thegn_metrics::collect::health::Absent::NotImplemented,
+        );
+    assert!(overlay.ingest_frame(&absent_wifi));
+    assert!(
+        !overlay
+            .demand(1000)
+            .collectors
+            .contains(CollectorId::NetWifi)
+    );
 }
 
 #[test]
