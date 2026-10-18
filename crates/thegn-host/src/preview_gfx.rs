@@ -79,7 +79,7 @@ impl PreviewGfx {
             }
         };
         match want {
-            Some((place, raster)) if self.drawn != Some((place, self.rev)) => {
+            Some((place, raster)) if self.cleared || self.drawn != Some((place, self.rev)) => {
                 // (Re)draw: encode first, and commit `drawn` only once there are
                 // real bytes to emit. An invalid raster draws nothing.
                 #[cfg(test)]
@@ -109,7 +109,9 @@ impl PreviewGfx {
                         }
                         // Invalid raster: never claim it is drawn; clear any
                         // stale image that is still on screen.
-                        if self.drawn.take().is_some() {
+                        let should_delete = self.drawn.take().is_some() || self.cleared;
+                        self.cleared = false;
+                        if should_delete {
                             graphics::delete_preview()
                         } else {
                             Vec::new()
@@ -241,6 +243,31 @@ mod tests {
         assert!(
             !g.frame(Some(panel()), Some("a.png"), false, true)
                 .is_empty()
+        );
+    }
+
+    #[test]
+    fn invalid_raster_after_invalidate_deletes_refused_draw() {
+        let mut g = PreviewGfx::new();
+        g.set(
+            "a.png".to_string(),
+            Raster {
+                rgba: vec![1, 2, 3], // 1x1 needs 4 bytes
+                w: 1,
+                h: 1,
+            },
+        );
+        assert!(g.drawn.is_none());
+        g.invalidate();
+
+        assert_eq!(
+            g.frame(Some(panel()), Some("a.png"), false, true),
+            graphics::delete_preview()
+        );
+        assert!(!g.cleared);
+        assert!(
+            g.frame(Some(panel()), None, false, true).is_empty(),
+            "the clear marker is consumed after the delete"
         );
     }
 
