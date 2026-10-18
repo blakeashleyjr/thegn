@@ -193,29 +193,31 @@ mod tests {
         let _lock = CHILD_TEST_LOCK
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
-        let pid_path = std::env::temp_dir().join(format!(
-            "thegn-events-{}-{}.pid",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
+        let temp = tempfile::tempdir().unwrap();
+        crate::fsperm::ensure_private_dir(temp.path()).unwrap();
+        let pid_path = temp.path().join("events.pid");
+        let pid_temp_path = temp.path().join("events.pid.tmp");
         let pid_path_text = pid_path.display().to_string();
+        let pid_temp_path_text = pid_temp_path.display().to_string();
         let prefix = if cfg!(windows) {
             vec![
                 "powershell".to_owned(),
                 "-NoProfile".to_owned(),
                 "-Command".to_owned(),
                 format!(
-                    "$PID | Set-Content -NoNewline '{pid_path_text}'; Start-Sleep -Seconds 600"
+                    "$PID | Set-Content -NoNewline '{pid_temp_path_text}'; \
+                     Move-Item -Force '{pid_temp_path_text}' '{pid_path_text}'; \
+                     Start-Sleep -Seconds 600"
                 ),
             ]
         } else {
             vec![
                 "sh".to_owned(),
                 "-c".to_owned(),
-                format!("echo $$ > '{pid_path_text}'; exec sleep 600"),
+                format!(
+                    "echo $$ > '{pid_temp_path_text}' && \
+                     mv '{pid_temp_path_text}' '{pid_path_text}' && exec sleep 600"
+                ),
             ]
         };
         let subscriber = Box::new(PodmanEvents { prefix });
@@ -238,6 +240,16 @@ mod tests {
             }
         };
         let pid = pid_text.trim().parse::<u32>().unwrap();
+        let registered_by = Instant::now() + Duration::from_secs(5);
+        while !crate::sandbox_events::registered_event_child_pids().contains(&pid)
+            && Instant::now() < registered_by
+        {
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            crate::sandbox_events::registered_event_child_pids().contains(&pid),
+            "subscriber child was not registered before shutdown"
+        );
         let deadline = Instant::now() + Duration::from_secs(2);
         crate::sandbox_events::shutdown_event_streams(deadline);
         while !subscriber_thread.is_finished() && Instant::now() < deadline {
@@ -253,7 +265,6 @@ mod tests {
             !process_is_alive(pid),
             "subscribe left its events process alive"
         );
-        fs::remove_file(pid_path).unwrap();
     }
 
     #[test]

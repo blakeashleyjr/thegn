@@ -167,6 +167,25 @@ impl Drop for EventChildGuard {
 
 static EVENT_CHILDREN: OnceLock<Mutex<Vec<Weak<EventChild>>>> = OnceLock::new();
 
+#[cfg(test)]
+pub(crate) fn registered_event_child_pids() -> Vec<u32> {
+    EVENT_CHILDREN
+        .get_or_init(|| Mutex::new(Vec::new()))
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .iter()
+        .filter_map(Weak::upgrade)
+        .filter_map(|event| {
+            event
+                .child
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .as_ref()
+                .map(Child::id)
+        })
+        .collect()
+}
+
 pub(crate) fn register_event_child(child: Child) -> EventChildGuard {
     let guard = EventChildGuard(Arc::new(EventChild {
         child: Mutex::new(Some(child)),
