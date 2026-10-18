@@ -39,6 +39,9 @@ pub(crate) enum PendingDbResult {
     WriteFailed {
         status: String,
     },
+    PoolTarget {
+        status: String,
+    },
 }
 
 #[derive(Debug, Default)]
@@ -259,6 +262,33 @@ pub(crate) fn queue_reported_write(
     crate::db_task::persist_critical(move |db| {
         report_write_result(job(db), on_err, |result| send_result(&tx, &waker, result));
     });
+}
+
+pub(crate) fn queue_pool_target_adjust(
+    tx: &tokio::sync::mpsc::UnboundedSender<PendingDbResult>,
+    waker: &termwiz::terminal::TerminalWaker,
+    cfg: thegn_core::config::Config,
+    wt: String,
+    delta: i64,
+) {
+    let tx = tx.clone();
+    let waker = waker.clone();
+    crate::db_task::persist_critical(move |db| {
+        run_pool_target_adjust(db, &cfg, &wt, delta, |result| {
+            send_result(&tx, &waker, result)
+        });
+    });
+}
+
+fn run_pool_target_adjust(
+    db: &thegn_core::db::Db,
+    cfg: &thegn_core::config::Config,
+    wt: &str,
+    delta: i64,
+    notify: impl FnOnce(PendingDbResult),
+) {
+    let status = crate::handlers::provision::adjust_pool_target(db, cfg, wt, delta);
+    notify(PendingDbResult::PoolTarget { status });
 }
 
 async fn send_dropped_result(
@@ -717,5 +747,38 @@ mod tests {
         let db = thegn_core::db::Db::open_at(&dir.path().join("thegn.db")).unwrap();
         let error = add_account(&db, "not-a-provider").unwrap_err();
         assert!(error.to_string().contains("unknown account provider"));
+    }
+
+    #[test]
+    fn pool_target_result_is_sent_on_success_and_failure() {
+        use thegn_core::store::WorkspaceStore as _;
+
+        let db = thegn_core::db::Db::open_memory().unwrap();
+        db.put_worktree(
+            "repo/main",
+            "/repo",
+            "/remote/wt",
+            "main",
+            Some(r#"{"control_prefix":["provider"],"path":"/remote/wt"}"#),
+            None,
+        )
+        .unwrap();
+        let cfg = thegn_core::config::Config::default();
+        let mut results = Vec::new();
+        run_pool_target_adjust(&db, &cfg, "/remote/wt", 1, |result| results.push(result));
+        assert!(matches!(
+            results.as_slice(),
+            [PendingDbResult::PoolTarget { status }]
+                if status == "warm pool target: 1 spare(s)"
+        ));
+
+        let db = thegn_core::db::Db::open_memory().unwrap();
+        let mut results = Vec::new();
+        run_pool_target_adjust(&db, &cfg, "/local/wt", 1, |result| results.push(result));
+        assert!(matches!(
+            results.as_slice(),
+            [PendingDbResult::PoolTarget { status }]
+                if status == "warm pool: only for provider (remote) workspaces"
+        ));
     }
 }
