@@ -54,9 +54,9 @@ pub(crate) fn parse_status(status: &str) -> Option<(u64, u64)> {
     let mut nonvoluntary = None;
     for line in status.lines() {
         if let Some(value) = line.strip_prefix("voluntary_ctxt_switches:") {
-            voluntary = value.trim().parse().ok();
+            voluntary = Result::ok(value.trim().parse());
         } else if let Some(value) = line.strip_prefix("nonvoluntary_ctxt_switches:") {
-            nonvoluntary = value.trim().parse().ok();
+            nonvoluntary = Result::ok(value.trim().parse());
         }
     }
     Some((voluntary?, nonvoluntary?))
@@ -72,7 +72,7 @@ pub(crate) fn parse_syscall(raw: &str) -> (Option<i64>, Option<u64>) {
     if number == "running" || number == "-1" {
         return (None, None);
     }
-    let syscall = number.parse().ok();
+    let syscall = Result::ok(number.parse());
     let arg0 = fields.next().and_then(|arg| {
         let hex = arg.strip_prefix("0x").unwrap_or(arg);
         u64::from_str_radix(hex, 16).ok()
