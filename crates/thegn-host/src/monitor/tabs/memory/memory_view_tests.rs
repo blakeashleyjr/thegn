@@ -523,8 +523,53 @@ fn memory_history_keeps_only_the_latest_bounded_window() {
 
 #[test]
 fn short_history_is_right_aligned_without_upsampling() {
-    assert_eq!(super::right_aligned_window(3, 10), (0, 3, 7));
-    assert_eq!(super::right_aligned_window(12, 10), (2, 10, 0));
+    caps::test_override::with_unicode(UnicodeLevel::Full, || {
+        assert_eq!(super::right_aligned_raster_window(3, 10), (0, 3, 8, 2));
+    });
+    caps::test_override::with_unicode(UnicodeLevel::Ascii, || {
+        assert_eq!(super::right_aligned_raster_window(3, 10), (0, 3, 7, 3));
+    });
+}
+
+#[test]
+fn composition_stacked_history_uses_one_unicode_column_per_sample() {
+    caps::test_override::with_unicode(UnicodeLevel::Full, || {
+        let mut model = MemoryModel::default();
+        model.set_mem_history_for_test(&[
+            0.20, 0.25, 0.30, 0.35, 0.40, 0.45, 0.50, 0.55, 0.60, 0.65,
+        ]);
+        let view = MemoryView(&model);
+        let area = Rect::full(240, 60);
+        let board = Board::default();
+        let panel = board
+            .placed(&view, area)
+            .into_iter()
+            .find(|panel| panel.id.0 == "memory.composition")
+            .expect("composition panel is placed");
+        let mut surface = Surface::new(area.cols, area.rows);
+        board.paint(&view, &mut surface, area, 0, &[]);
+        let lines: Vec<Vec<char>> = text(&surface)
+            .lines()
+            .map(|line| line.chars().collect())
+            .collect();
+        let label_row = lines
+            .iter()
+            .position(|line| {
+                line.iter()
+                    .collect::<String>()
+                    .contains("used / available history")
+            })
+            .expect("composition history label is rendered");
+        let bottom_row = panel.rect.y + panel.rect.rows - 2;
+        assert!(bottom_row > label_row);
+        let row = &lines[bottom_row];
+        let chart = &row[panel.rect.x + 1..panel.rect.x + panel.rect.cols - 1];
+        let painted = chart
+            .iter()
+            .filter(|ch| **ch != ' ' && **ch != '\u{2800}')
+            .count();
+        assert_eq!(painted, 10, "composition history painted {painted} columns");
+    });
 }
 
 #[test]

@@ -113,7 +113,7 @@ fn overlay_rebuild_absorbs_memory_telemetry_and_pause_freezes_it() {
 }
 
 #[test]
-fn telemetry_history_absorbs_into_fixed_capacity_memory_rings() {
+fn telemetry_history_rebuilds_memory_rings_from_the_window() {
     let mut history = TelemetryHistory::default();
     for tick in 1_u64..=3 {
         history.push(
@@ -135,8 +135,8 @@ fn telemetry_history_absorbs_into_fixed_capacity_memory_rings() {
         );
     }
     let (mem_len, mem_latest, swap_len, swap_latest) = model.history_state();
-    assert!(mem_len <= 120);
-    assert!(swap_len <= 120);
+    assert_eq!(mem_len, 120);
+    assert_eq!(swap_len, 120);
     assert!((mem_latest.unwrap() - 0.30).abs() < 0.001);
     assert!((swap_latest.unwrap() - 0.15).abs() < 0.001);
 }
