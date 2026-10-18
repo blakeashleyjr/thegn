@@ -10,7 +10,7 @@ use crate::collect::{
     env::Env,
     frame::MonitorFrame,
     health::{Absent, Health},
-    model::thermal_zone::{CoolingAggregate, ThermalTrip, ThermalZone, ThermalZonePart},
+    model::thermal_zone::{CoolingAggregate, ThermalTrip, ThermalZone},
     policy::{
         hwmon_group::plausible_input,
         thermal::{AlarmDetector, Plausibility, classify_trip},
@@ -60,6 +60,7 @@ struct ZoneSlot<H> {
 }
 struct CoolingSlot<H> {
     kind: String,
+    aggregate_index: usize,
     max_state: u64,
     state_path: PathBuf,
     state: Option<H>,
@@ -70,8 +71,11 @@ pub struct ThermalZoneCollector<F: ThermalFs = RealFs> {
     root: PathBuf,
     zones: Vec<ZoneSlot<F::Handle>>,
     cooling: Vec<CoolingSlot<F::Handle>>,
+    cooling_kinds: Vec<String>,
+    cooling_counts: Vec<(u16, u16)>,
     held: usize,
     seen_zone_count: Option<usize>,
+    samples_since_zone_count: u8,
 }
 
 impl ThermalZoneCollector<RealFs> {
@@ -95,8 +99,11 @@ impl<F: ThermalFs> ThermalZoneCollector<F> {
             root: root.into(),
             zones: Vec::new(),
             cooling: Vec::new(),
+            cooling_kinds: Vec::new(),
+            cooling_counts: Vec::new(),
             held: 0,
             seen_zone_count: None,
+            samples_since_zone_count: 0,
         }
     }
     pub fn held_fds(&self) -> usize {
@@ -109,7 +116,9 @@ impl<F: ThermalFs> ThermalZoneCollector<F> {
     fn discover_inner(&mut self) -> Health {
         self.zones.clear();
         self.cooling.clear();
+        self.cooling_kinds.clear();
         self.held = 0;
+        self.samples_since_zone_count = 0;
         let base = self.base();
         let Ok(entries) = self.fs.list(&base) else {
             self.seen_zone_count = Some(0);
@@ -149,7 +158,6 @@ impl<F: ThermalFs> ThermalZoneCollector<F> {
                             .map(index_free_device_path)
                     })
                     .unwrap_or_else(|| "/unknown".to_owned());
-                let key = format!("{zone_type}:{device}");
                 let policy = read_text(&mut self.fs, &path.join("policy"));
                 let mode = read_text(&mut self.fs, &path.join("mode"));
                 let trips = read_trips(&mut self.fs, &path);
@@ -166,7 +174,7 @@ impl<F: ThermalFs> ThermalZoneCollector<F> {
                     index,
                     ZoneSlot {
                         zone: ThermalZone {
-                            key,
+                            key: String::new(),
                             zone_type,
                             device,
                             policy,
@@ -202,6 +210,7 @@ impl<F: ThermalFs> ThermalZoneCollector<F> {
                 };
                 cooling.push(CoolingSlot {
                     kind,
+                    aggregate_index: 0,
                     max_state,
                     state_path: path.join("cur_state"),
                     state,
@@ -209,8 +218,31 @@ impl<F: ThermalFs> ThermalZoneCollector<F> {
             }
         }
         zones.sort_by_key(|(index, _)| *index);
+        let mut device_less_ordinals = std::collections::BTreeMap::<String, usize>::new();
+        for (_, slot) in &mut zones {
+            if slot.zone.device == "/unknown" {
+                let ordinal = device_less_ordinals
+                    .entry(slot.zone.zone_type.clone())
+                    .or_default();
+                // Kernel enumeration is the only identity available when no device link exists.
+                slot.zone.key = format!("{}:{}#{ordinal}", slot.zone.zone_type, slot.zone.device);
+                *ordinal += 1;
+            } else {
+                slot.zone.key = format!("{}:{}", slot.zone.zone_type, slot.zone.device);
+            }
+        }
         self.seen_zone_count = Some(zone_entry_count);
         self.zones = zones.into_iter().map(|(_, zone)| zone).collect();
+        self.cooling_kinds = cooling.iter().map(|slot| slot.kind.clone()).collect();
+        self.cooling_kinds.sort();
+        self.cooling_kinds.dedup();
+        for slot in &mut cooling {
+            slot.aggregate_index = self
+                .cooling_kinds
+                .binary_search(&slot.kind)
+                .expect("cooling kind was collected");
+        }
+        self.cooling_counts.resize(self.cooling_kinds.len(), (0, 0));
         self.cooling = cooling;
         if self.zones.is_empty() && self.cooling.is_empty() {
             Health::Absent(Absent::NoHardware)
@@ -246,26 +278,32 @@ impl<F: ThermalFs> Collector for ThermalZoneCollector<F> {
         self.discover_inner()
     }
     fn sample(&mut self, ctx: &TickCtx, frame: &mut MonitorFrame) -> Result<(), CollectError> {
+        // Recount once every 12 samples (~60 s at the collector's 5 s cadence).
+        let recount_zones = self.samples_since_zone_count >= 11;
+        self.samples_since_zone_count = if recount_zones {
+            0
+        } else {
+            self.samples_since_zone_count + 1
+        };
         if self.seen_zone_count.is_none()
-            || self
-                .current_zone_count()
-                .is_some_and(|count| Some(count) != self.seen_zone_count)
+            || (recount_zones
+                && self
+                    .current_zone_count()
+                    .is_some_and(|count| Some(count) != self.seen_zone_count))
         {
             self.discover_inner();
         }
-        let mut part = ThermalZonePart {
-            reads: 0,
-            held_fds: self.held.min(u16::MAX as usize) as u16,
-            ..ThermalZonePart::default()
-        };
+        let part = &mut frame.parts.thermal_zone;
+        part.reads = 0;
+        part.held_fds = self.held.min(u16::MAX as usize) as u16;
         let mut buffer = [0_u8; 64];
-        for zone in &mut self.zones {
-            if let Some(text) = match zone.temp.as_ref() {
+        for (zone_index, zone) in self.zones.iter_mut().enumerate() {
+            zone.zone.temp_c = None;
+            let text = match zone.temp.as_ref() {
                 Some(handle) => self.fs.pread(handle, &mut buffer).ok().and_then(|len| {
                     std::str::from_utf8(&buffer[..len.min(buffer.len())])
                         .ok()
                         .map(str::trim)
-                        .map(str::to_owned)
                 }),
                 None if !zone.zone.alias => self
                     .fs
@@ -275,20 +313,18 @@ impl<F: ThermalFs> Collector for ThermalZoneCollector<F> {
                         std::str::from_utf8(&buffer[..len.min(buffer.len())])
                             .ok()
                             .map(str::trim)
-                            .map(str::to_owned)
                     }),
                 None => None,
-            } {
+            };
+            if let Some(text) = text {
                 part.reads = part.reads.saturating_add(1);
-                if let Ok(raw) = text.parse::<i64>() {
-                    if let Some(temp_c) = plausible_input(SensorKind::Temp, raw) {
-                        zone.zone.temp_c = zone
-                            .plausibility
-                            .accept(temp_c, ctx.now_ms)
-                            .then_some(temp_c);
-                    } else {
-                        zone.zone.temp_c = None;
-                    }
+                if let Ok(raw) = text.parse::<i64>()
+                    && let Some(temp_c) = plausible_input(SensorKind::Temp, raw)
+                {
+                    zone.zone.temp_c = zone
+                        .plausibility
+                        .accept(temp_c, ctx.now_ms)
+                        .then_some(temp_c);
                 }
             }
             for (index, trip) in zone.zone.trips.iter_mut().enumerate() {
@@ -299,9 +335,16 @@ impl<F: ThermalFs> Collector for ThermalZoneCollector<F> {
                 }
             }
             zone.zone.alarm_events = zone.alarms.iter().map(|alarm| alarm.events()).sum();
-            part.zones.push(zone.zone.clone());
+            if zone_index < part.zones.len() {
+                part.zones[zone_index].clone_from(&zone.zone);
+            } else {
+                part.zones.push(zone.zone.clone());
+            }
         }
-        let mut aggregates = std::collections::BTreeMap::<String, (u16, u16)>::new();
+        part.zones.truncate(self.zones.len());
+        for counts in &mut self.cooling_counts {
+            *counts = (0, 0);
+        }
         for cooling in &mut self.cooling {
             let len = match cooling.state.as_ref() {
                 Some(handle) => self.fs.pread(handle, &mut buffer).ok(),
@@ -311,7 +354,6 @@ impl<F: ThermalFs> Collector for ThermalZoneCollector<F> {
                 std::str::from_utf8(&buffer[..len.min(buffer.len())])
                     .ok()
                     .map(str::trim)
-                    .map(str::to_owned)
             }) else {
                 continue;
             };
@@ -322,22 +364,32 @@ impl<F: ThermalFs> Collector for ThermalZoneCollector<F> {
             if state > cooling.max_state {
                 continue;
             }
-            let counts = aggregates.entry(cooling.kind.clone()).or_default();
+            let counts = &mut self.cooling_counts[cooling.aggregate_index];
             counts.1 = counts.1.saturating_add(1);
             if state > 0 {
                 counts.0 = counts.0.saturating_add(1);
             }
         }
-        part.cooling = aggregates
-            .into_iter()
-            .map(|(kind, (engaged, total))| CoolingAggregate {
-                kind,
-                engaged,
-                total,
-            })
-            .collect();
+        let mut output_index = 0;
+        for (kind, (engaged, total)) in self.cooling_kinds.iter().zip(&self.cooling_counts) {
+            if *total > 0 {
+                if output_index < part.cooling.len() {
+                    let aggregate = &mut part.cooling[output_index];
+                    aggregate.kind.clone_from(kind);
+                    aggregate.engaged = *engaged;
+                    aggregate.total = *total;
+                } else {
+                    part.cooling.push(CoolingAggregate {
+                        kind: kind.clone(),
+                        engaged: *engaged,
+                        total: *total,
+                    });
+                }
+                output_index += 1;
+            }
+        }
+        part.cooling.truncate(output_index);
         part.held_fds = self.held.min(u16::MAX as usize) as u16;
-        frame.parts.thermal_zone = part;
         frame.sampled.insert(CollectorId::ThermalZone);
         Ok(())
     }
@@ -345,6 +397,7 @@ impl<F: ThermalFs> Collector for ThermalZoneCollector<F> {
         self.zones.clear();
         self.cooling.clear();
         self.held = 0;
+        self.seen_zone_count = None;
     }
 }
 
@@ -382,7 +435,7 @@ fn read_trips<F: ThermalFs>(fs: &mut F, zone_path: &Path) -> Vec<ThermalTrip> {
         let prefix = format!("trip_point_{index}_");
         let kind = match read_text(fs, &zone_path.join(format!("{prefix}type"))) {
             Some(kind) => kind,
-            None => continue,
+            None => break,
         };
         trips.push(ThermalTrip {
             index,
