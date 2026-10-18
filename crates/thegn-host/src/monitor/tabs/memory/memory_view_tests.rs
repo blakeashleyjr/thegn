@@ -162,8 +162,43 @@ fn absorb_frame_matches_mem_health_for_healthy_and_pressure_inputs() {
 #[test]
 fn absent_swap_is_hidden_and_limit_panel_demands_cgroup_slice() {
     let mut model = MemoryModel::default();
-    model.absorb_frame(&fixture(false));
-    model.swap_total = Some(0);
+    let mut frame = fixture(false);
+    model.absorb_frame(&frame);
+    assert!(model.swap_present);
+
+    // Exhausting swap does not remove an installed swap device.
+    meminfo::parse(
+        b"MemTotal: 8388608 kB\nMemAvailable: 4194304 kB\nSwapTotal: 2097152 kB\nSwapFree: 0 kB\n",
+        &mut frame.parts.meminfo.raw,
+    );
+    model.absorb_frame(&frame);
+    let view = MemoryView(&model);
+    assert!(
+        Board::default()
+            .placed(&view, Rect::full(160, 45))
+            .iter()
+            .any(|panel| panel.id.0 == "memory.swap")
+    );
+
+    // A missing reading is not a swapoff event; preserve the last known layout.
+    meminfo::parse(
+        b"MemTotal: 8388608 kB\nMemAvailable: 4194304 kB\n",
+        &mut frame.parts.meminfo.raw,
+    );
+    model.absorb_frame(&frame);
+    let view = MemoryView(&model);
+    assert!(
+        Board::default()
+            .placed(&view, Rect::full(160, 45))
+            .iter()
+            .any(|panel| panel.id.0 == "memory.swap")
+    );
+
+    meminfo::parse(
+        b"MemTotal: 8388608 kB\nMemAvailable: 4194304 kB\nSwapTotal: 0 kB\nSwapFree: 0 kB\n",
+        &mut frame.parts.meminfo.raw,
+    );
+    model.absorb_frame(&frame);
     let view = MemoryView(&model);
     let placed = Board::default().placed(&view, Rect::full(160, 45));
     assert!(!placed.iter().any(|panel| panel.id.0 == "memory.swap"));
@@ -172,12 +207,34 @@ fn absent_swap_is_hidden_and_limit_panel_demands_cgroup_slice() {
         .demand(&view, Rect::full(160, 45), 1000)
         .collectors;
     assert!(demand.contains(CollectorId::CgroupSlice));
-    model.swap_total = Some(1);
-    let mut cgroup_frame = fixture(false);
-    cgroup_frame.parts.cgroup_slice.found = true;
-    cgroup_frame.parts.cgroup_slice.sample.mem_current = Some(1024);
-    model.absorb_frame(&cgroup_frame);
+
+    // Changing free space alone does not change the static device layout.
+    meminfo::parse(
+        b"MemTotal: 8388608 kB\nMemAvailable: 4194304 kB\nSwapTotal: 0 kB\nSwapFree: 1 kB\n",
+        &mut frame.parts.meminfo.raw,
+    );
+    model.absorb_frame(&frame);
     let view = MemoryView(&model);
+    assert!(
+        !Board::default()
+            .placed(&view, Rect::full(160, 45))
+            .iter()
+            .any(|panel| panel.id.0 == "memory.swap")
+    );
+
+    // A zero-to-nonzero SwapTotal transition is a swapon layout change.
+    meminfo::parse(
+        b"MemTotal: 8388608 kB\nMemAvailable: 4194304 kB\nSwapTotal: 1 kB\nSwapFree: 0 kB\n",
+        &mut frame.parts.meminfo.raw,
+    );
+    model.absorb_frame(&frame);
+    let view = MemoryView(&model);
+    assert!(
+        Board::default()
+            .placed(&view, Rect::full(160, 45))
+            .iter()
+            .any(|panel| panel.id.0 == "memory.swap")
+    );
     let demand = Board::default()
         .demand(&view, Rect::full(160, 45), 1000)
         .collectors;
@@ -287,7 +344,7 @@ fn board_snapshots_cover_size_and_capability_matrix() {
                 assert!(rendered.contains("health"));
                 if cols == 240 {
                     let ratio = fill_ratio(&surface, Rect::full(cols, rows));
-                    // density follow-up (batch 49): estimated floor 0.30.
+                    // density follow-up (batch 50): estimated, primary sets from the printed value
                     if level == UnicodeLevel::Ascii {
                         assert!(ratio >= 0.30, "ASCII fill ratio {ratio:.3}");
                     } else {
@@ -519,21 +576,27 @@ fn short_memory_histories_are_right_aligned_by_the_painters() {
             .iter()
             .position(|line| line.iter().collect::<String>().contains(label))
             .expect("history label is rendered");
-        let mut chart = lines[label_row + 1].clone();
-        chart.resize(area.cols, ' ');
         let left = panel.rect.x + 1;
         let right = panel.rect.x + panel.rect.cols - 2;
-        assert!(
-            chart[left..left + 3]
-                .iter()
-                .all(|ch| *ch == ' ' || *ch == '\u{2800}')
-        );
+        let last_inner_row = panel.rect.y + panel.rect.rows - 2;
+        for chart_row in label_row + 1..=last_inner_row {
+            let mut chart = lines[chart_row].clone();
+            chart.resize(area.cols, ' ');
+            assert!(
+                chart[left..left + 3]
+                    .iter()
+                    .all(|ch| *ch == ' ' || *ch == '\u{2800}'),
+                "{label} chart should leave its unused left columns blank on row {chart_row}"
+            );
+        }
+        let mut bottom_row = lines[last_inner_row].clone();
+        bottom_row.resize(area.cols, ' ');
         assert_ne!(
-            chart[right], ' ',
+            bottom_row[right], ' ',
             "{label} chart should reach the right edge"
         );
         assert_ne!(
-            chart[right], '\u{2800}',
+            bottom_row[right], '\u{2800}',
             "{label} chart should reach the right edge"
         );
     }
