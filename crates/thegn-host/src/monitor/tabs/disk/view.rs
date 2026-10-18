@@ -67,6 +67,7 @@ const SPECS: [PanelSpec; 5] = [
 const HISTORY: usize = 240;
 const MAX_DEVICES: usize = 32;
 const MAX_DEVICE_HISTORIES: usize = 8;
+const MAX_FILESYSTEM_HISTORIES: usize = 8;
 
 #[derive(Debug, Clone)]
 struct HistoryRing {
@@ -133,6 +134,13 @@ struct DeviceHistory {
     util: HistoryRing,
 }
 
+#[derive(Debug, Clone)]
+struct FilesystemHistory {
+    mount_point: String,
+    source: String,
+    used: HistoryRing,
+}
+
 #[derive(Debug, Default, Clone)]
 pub(in crate::monitor) struct DiskModel {
     devices: Vec<DiskDevice>,
@@ -155,6 +163,7 @@ pub(in crate::monitor) struct DiskModel {
     last_rbytes: Option<u64>,
     last_wbytes: Option<u64>,
     device_history: Vec<DeviceHistory>,
+    filesystem_history: Vec<FilesystemHistory>,
     physical_count: u16,
     disk_health: Health,
     fs_health: Health,
@@ -205,6 +214,55 @@ impl DiskModel {
         }
         self.filesystems
             .truncate(frame.parts.filesystems.rows.len());
+        if self.filesystem_history.capacity() == 0 && !frame.parts.filesystems.rows.is_empty() {
+            self.filesystem_history
+                .reserve_exact(MAX_FILESYSTEM_HISTORIES);
+        }
+        for fs in frame
+            .parts
+            .filesystems
+            .rows
+            .iter()
+            .take(MAX_FILESYSTEM_HISTORIES)
+        {
+            if self
+                .filesystem_history
+                .iter()
+                .all(|history| history.mount_point != fs.mount_point || history.source != fs.source)
+                && self.filesystem_history.len() < MAX_FILESYSTEM_HISTORIES
+            {
+                self.filesystem_history.push(FilesystemHistory {
+                    mount_point: fs.mount_point.clone(),
+                    source: fs.source.clone(),
+                    used: HistoryRing::default(),
+                });
+            }
+            if let Some(history) = self.filesystem_history.iter_mut().find(|history| {
+                history.mount_point == fs.mount_point && history.source == fs.source
+            }) {
+                history.mount_point.clone_from(&fs.mount_point);
+                history.source.clone_from(&fs.source);
+                let ratio = fs
+                    .total_bytes
+                    .filter(|total| *total > 0)
+                    .zip(fs.free_bytes)
+                    .map_or(f32::NAN, |(total, free)| {
+                        total.saturating_sub(free).min(total) as f32 / total as f32
+                    });
+                history.used.push(ratio);
+            }
+        }
+        for history in &mut self.filesystem_history {
+            if !frame
+                .parts
+                .filesystems
+                .rows
+                .iter()
+                .any(|fs| fs.mount_point == history.mount_point && fs.source == history.source)
+            {
+                history.used.push(f32::NAN);
+            }
+        }
         self.io_psi.clone_from(&frame.parts.psi.io);
         self.psi_some_history.push(
             self.io_psi
@@ -384,11 +442,12 @@ impl DiskModel {
     }
 
     #[cfg(test)]
-    pub(in crate::monitor) fn capacities(&self) -> (usize, usize, usize, usize) {
+    pub(in crate::monitor) fn capacities(&self) -> (usize, usize, usize, usize, usize) {
         (
             self.devices.capacity(),
             self.filesystems.capacity(),
             self.device_history.capacity(),
+            self.filesystem_history.capacity(),
             HISTORY,
         )
     }
@@ -454,6 +513,36 @@ impl TabView for DiskView<'_> {
             rect.x,
             rect.y,
         );
+        if placed.id == FILESYSTEMS && !matches!(self.0.fs_health, Health::Absent(_)) {
+            let inner = Rect {
+                x: rect.x + 1,
+                y: rect.y + 1,
+                cols: rect.cols.saturating_sub(2),
+                rows: rect.rows.saturating_sub(2),
+            };
+            for (row, fs) in self.0.filesystems.iter().take(inner.rows / 2).enumerate() {
+                if let Some(history) = self.0.filesystem_history.iter().find(|history| {
+                    history.mount_point == fs.mount_point && history.source == fs.source
+                }) {
+                    let mut values = [0.0; HISTORY];
+                    let len = history.used.copy_ordered(&mut values);
+                    let meter_cols = inner.cols.saturating_mul(2) / 3;
+                    let trend_cols = inner.cols.saturating_sub(meter_cols);
+                    crate::monitor::graphs::paint_sparkline(
+                        &values[..len],
+                        trend_cols,
+                        RampId::Util,
+                        Rect {
+                            x: inner.x + meter_cols,
+                            y: inner.y + row * 2 + 1,
+                            cols: trend_cols,
+                            rows: 1,
+                        },
+                        surface,
+                    );
+                }
+            }
+        }
         if placed.id == PRESSURE
             && !matches!(self.0.psi_health, Health::Absent(_))
             && rect.rows > 5
@@ -533,65 +622,54 @@ impl TabView for DiskView<'_> {
                 .0
                 .devices
                 .iter()
-                .take(rect.rows.saturating_sub(2))
+                .take(rect.rows.saturating_sub(3) / 2)
                 .enumerate()
             {
-                if device.physical
-                    && let Some(history) = self
-                        .0
-                        .device_history
-                        .iter()
-                        .find(|history| history.id == device.id)
+                if let Some(history) = self
+                    .0
+                    .device_history
+                    .iter()
+                    .find(|history| history.id == device.id)
                 {
-                    let spark_x = rect.x + 38;
-                    let spark_cols = rect.x.saturating_add(rect.cols).saturating_sub(spark_x);
-                    if spark_cols >= 8 {
+                    let mut util = [0.0; HISTORY];
+                    let util_len = history.util.copy_ordered(&mut util);
+                    crate::monitor::graphs::paint_sparkline(
+                        &util[..util_len],
+                        8,
+                        RampId::Util,
+                        Rect {
+                            x: rect.x + 38,
+                            y: rect.y + row * 2 + 1,
+                            cols: 8,
+                            rows: 1,
+                        },
+                        surface,
+                    );
+                    if device.physical {
                         let mut read = [0.0; HISTORY];
                         let read_len = history.read.copy_normalized(&mut read).0;
-                        crate::monitor::graphs::paint_sparkline(
+                        let mut write = [0.0; HISTORY];
+                        let write_len = history.write.copy_normalized(&mut write).0;
+                        let plot = Rect {
+                            x: rect.x + 38,
+                            y: rect.y + row * 2 + 2,
+                            cols: rect.cols.saturating_sub(39),
+                            rows: 2,
+                        };
+                        let mut chart = CellGrid::new(plot.cols, plot.rows);
+                        paint_mirrored_history(
+                            &mut chart,
+                            Rect::full(plot.cols, plot.rows),
                             &read[..read_len],
-                            8,
-                            RampId::Read,
-                            Rect {
-                                x: spark_x,
-                                y: rect.y + row + 1,
-                                cols: spark_cols.min(8),
-                                rows: 1,
-                            },
-                            surface,
+                            &write[..write_len],
                         );
-                        if spark_cols > 10 {
-                            let mut write = [0.0; HISTORY];
-                            let write_len = history.write.copy_normalized(&mut write).0;
-                            crate::monitor::graphs::paint_sparkline(
-                                &write[..write_len],
-                                8,
-                                RampId::Write,
-                                Rect {
-                                    x: spark_x + 10,
-                                    y: rect.y + row + 1,
-                                    cols: spark_cols.saturating_sub(10).min(8),
-                                    rows: 1,
-                                },
-                                surface,
-                            );
-                        }
-                        if spark_cols > 20 {
-                            let mut util = [0.0; HISTORY];
-                            let util_len = history.util.copy_ordered(&mut util);
-                            crate::monitor::graphs::paint_sparkline(
-                                &util[..util_len],
-                                8,
-                                RampId::Util,
-                                Rect {
-                                    x: spark_x + 20,
-                                    y: rect.y + row + 1,
-                                    cols: spark_cols.saturating_sub(20).min(8),
-                                    rows: 1,
-                                },
-                                surface,
-                            );
-                        }
+                        Emitter::default().emit(
+                            &chart,
+                            Rect::full(plot.cols, plot.rows),
+                            surface,
+                            plot.x,
+                            plot.y,
+                        );
                     }
                 }
             }
@@ -743,7 +821,12 @@ fn history_plot_rect(rect: Rect, len: usize, braille: bool) -> Rect {
 }
 
 fn paint_pressure(grid: &mut CellGrid, rect: Rect, model: &DiskModel) {
-    let mut body = panel::panel(grid, Rect::full(rect.cols, rect.rows), "I/O pressure", None);
+    let mut body = panel::panel(
+        grid,
+        Rect::full(rect.cols, rect.rows),
+        "I/O pressure 0-100% 60s",
+        None,
+    );
     if matches!(model.psi_health, Health::Absent(_)) {
         let mark = format!("{} root-only", absent_mark(model.psi_health));
         body.put_str(0, 0, &mark, CellStyle::default());
@@ -775,13 +858,23 @@ fn paint_pressure(grid: &mut CellGrid, rect: Rect, model: &DiskModel) {
 }
 
 fn paint_devices(grid: &mut CellGrid, rect: Rect, model: &DiskModel) {
-    let mut body = panel::panel(grid, Rect::full(rect.cols, rect.rows), "Devices", None);
+    let mut body = panel::panel(
+        grid,
+        Rect::full(rect.cols, rect.rows),
+        "Devices 60s trends, each peak=100%",
+        None,
+    );
     if matches!(model.disk_health, Health::Absent(_)) {
         let mark = format!("{} root-only", absent_mark(model.disk_health));
         body.put_str(0, 0, &mark, CellStyle::default());
         return;
     }
-    for (row, device) in model.devices.iter().take(body.rect().rows).enumerate() {
+    for (row, device) in model
+        .devices
+        .iter()
+        .take(body.rect().rows.saturating_sub(1) / 2)
+        .enumerate()
+    {
         let text = format!(
             "{:<12} {:>8} {:>8} {:>5}",
             truncate(&device.name, 12),
@@ -799,7 +892,7 @@ fn paint_devices(grid: &mut CellGrid, rect: Rect, model: &DiskModel) {
                     |value| format!("{value}%")
                 )
         );
-        body.put_str(0, row, &text, CellStyle::default());
+        body.put_str(0, row * 2, &text, CellStyle::default());
     }
     if model.devices.is_empty() && !matches!(model.disk_health, Health::Absent(_)) {
         let mark = if matches!(model.disk_health, Health::Warming) {
@@ -814,7 +907,12 @@ fn paint_devices(grid: &mut CellGrid, rect: Rect, model: &DiskModel) {
 fn paint_filesystems(grid: &mut CellGrid, rect: Rect, model: &DiskModel) {
     let area;
     {
-        let mut body = panel::panel(grid, Rect::full(rect.cols, rect.rows), "Filesystems", None);
+        let mut body = panel::panel(
+            grid,
+            Rect::full(rect.cols, rect.rows),
+            "Filesystems used + trend 0-100%",
+            None,
+        );
         if matches!(model.fs_health, Health::Absent(_)) {
             body.put_str(0, 0, absent_mark(model.fs_health), CellStyle::default());
             return;
@@ -873,7 +971,7 @@ fn paint_filesystems(grid: &mut CellGrid, rect: Rect, model: &DiskModel) {
                 Rect {
                     x: area.x,
                     y: area.y + row * 2 + 1,
-                    cols: area.cols,
+                    cols: area.cols.saturating_mul(2) / 3,
                     rows: 1,
                 },
                 crate::monitor::kit::meter::MeterSpec {
