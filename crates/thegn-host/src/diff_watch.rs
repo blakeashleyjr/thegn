@@ -28,7 +28,7 @@ use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use notify::{Event, RecommendedWatcher, RecursiveMode, Watcher, recommended_watcher};
+use notify::{Config, Event, EventKindMask, RecommendedWatcher, RecursiveMode, Watcher};
 use tokio::sync::mpsc as tokio_mpsc;
 
 use crate::hydrate::RefreshKind;
@@ -830,17 +830,18 @@ pub(crate) fn build_diff_watcher(cwd: &Path, sink: RefreshSink) -> Option<Recomm
     let revive_cwd = cwd.clone();
     let revive_tx = tx.clone();
     let revive_wake = wake.clone();
-    let new_watcher = recommended_watcher(move |res: notify::Result<Event>| {
-        let vouched = guard.cov.vouches();
-        guard.cov.observe(&res, &rules);
-        // The claim was live and this very event withdrew it: re-register once.
-        if vouched
-            && !guard.cov.vouches()
-            && let Some(r) = &revive
-        {
-            r.fire(&revive_cwd, &revive_tx, &revive_wake);
-        }
-        if let Ok(ev) = res
+    let new_watcher = RecommendedWatcher::new(
+        move |res: notify::Result<Event>| {
+            let vouched = guard.cov.vouches();
+            guard.cov.observe(&res, &rules);
+            // The claim was live and this very event withdrew it: re-register once.
+            if vouched
+                && !guard.cov.vouches()
+                && let Some(r) = &revive
+            {
+                r.fire(&revive_cwd, &revive_tx, &revive_wake);
+            }
+            if let Ok(ev) = res
             && matches!(
                 ev.kind,
                 notify::EventKind::Modify(_)
@@ -860,56 +861,58 @@ pub(crate) fn build_diff_watcher(cwd: &Path, sink: RefreshSink) -> Option<Recomm
                     crate::git_watch::watcher_path_triggers_refresh(p, &rules.roots, &rules.ignore)
                 }))
             && last_send.elapsed() > Duration::from_millis(500)
-        {
-            if tx.send(RefreshKind::Model).is_ok() {
-                wake();
-            }
-            // The tree just changed under the ACTIVE worktree, so its line
-            // count is the one that can actually be wrong. `watch: true`
-            // lets the scan bypass the long `[loc] scan_interval_secs` for
-            // that single path — bounded by `watch_invalidate_secs`, so a
-            // save storm still recounts at most once per window.
-            let _ = tx.send(RefreshKind::Loc { watch: true }); // best-effort: send: the consumer may be gone; a closed channel is the consumer going away
-            // A branch-ref move also kicks the guarded main-checkout self-heal
-            // so a checkout sitting on that branch fast-forwards its own tree
-            // (external `update-ref` / a fold-actor CAS land elsewhere) without
-            // waiting for a tab switch or restart.
-            if ev
-                .paths
-                .iter()
-                .any(|p| crate::git_watch::is_ref_move_path(p))
             {
-                let _ = tx.send(RefreshKind::MainRefMoved); // best-effort: send: the consumer may be gone; a closed channel is the consumer going away
+                if tx.send(RefreshKind::Model).is_ok() {
+                    wake();
+                }
+                // The tree just changed under the ACTIVE worktree, so its line
+                // count is the one that can actually be wrong. `watch: true`
+                // lets the scan bypass the long `[loc] scan_interval_secs` for
+                // that single path — bounded by `watch_invalidate_secs`, so a
+                // save storm still recounts at most once per window.
+                let _ = tx.send(RefreshKind::Loc { watch: true }); // best-effort: send: the consumer may be gone; a closed channel is the consumer going away
+                // A branch-ref move also kicks the guarded main-checkout self-heal
+                // so a checkout sitting on that branch fast-forwards its own tree
+                // (external `update-ref` / a fold-actor CAS land elsewhere) without
+                // waiting for a tab switch or restart.
+                if ev
+                    .paths
+                    .iter()
+                    .any(|p| crate::git_watch::is_ref_move_path(p))
+                {
+                    let _ = tx.send(RefreshKind::MainRefMoved); // best-effort: send: the consumer may be gone; a closed channel is the consumer going away
+                }
+                // A checkout changed the branch: the PR cache row is the OLD
+                // branch's, so look the new one up now.
+                if ev
+                    .paths
+                    .iter()
+                    .any(|p| crate::git_watch::is_head_move_path(p))
+                {
+                    let _ = tx.send(RefreshKind::Pr); // best-effort: send: the consumer may be gone; a closed channel is the consumer going away
+                }
+                // A remote-tracking ref moved — the local signature of a push
+                // (or fetch): kick the PR + CI caches now so the just-pushed
+                // branch's checks appear without waiting for the tickers.
+                // Non-forced, so `[ci] ttl_secs` still bounds subprocess churn.
+                if ev
+                    .paths
+                    .iter()
+                    .any(|p| crate::git_watch::is_remote_ref_path(p))
+                {
+                    let _ = tx.send(RefreshKind::Pr); // best-effort: send: the consumer may be gone; a closed channel is the consumer going away
+                    let _ = tx.send(RefreshKind::Ci { force: false }); // best-effort: send: the consumer may be gone; a closed channel is the consumer going away
+                    // The PR queue cares about exactly this event: a push is
+                    // what unblocks a PR (or is the teammate the queue must not
+                    // race), so re-evaluate now rather than up to a minute later.
+                    // Inert when the queue is off — the pass finds no rows.
+                    let _ = tx.send(RefreshKind::PrQueue); // best-effort: send: the consumer may be gone; a closed channel is the consumer going away
+                }
+                last_send = Instant::now();
             }
-            // A checkout changed the branch: the PR cache row is the OLD
-            // branch's, so look the new one up now.
-            if ev
-                .paths
-                .iter()
-                .any(|p| crate::git_watch::is_head_move_path(p))
-            {
-                let _ = tx.send(RefreshKind::Pr); // best-effort: send: the consumer may be gone; a closed channel is the consumer going away
-            }
-            // A remote-tracking ref moved — the local signature of a push
-            // (or fetch): kick the PR + CI caches now so the just-pushed
-            // branch's checks appear without waiting for the tickers.
-            // Non-forced, so `[ci] ttl_secs` still bounds subprocess churn.
-            if ev
-                .paths
-                .iter()
-                .any(|p| crate::git_watch::is_remote_ref_path(p))
-            {
-                let _ = tx.send(RefreshKind::Pr); // best-effort: send: the consumer may be gone; a closed channel is the consumer going away
-                let _ = tx.send(RefreshKind::Ci { force: false }); // best-effort: send: the consumer may be gone; a closed channel is the consumer going away
-                // The PR queue cares about exactly this event: a push is
-                // what unblocks a PR (or is the teammate the queue must not
-                // race), so re-evaluate now rather than up to a minute later.
-                // Inert when the queue is off — the pass finds no rows.
-                let _ = tx.send(RefreshKind::PrQueue); // best-effort: send: the consumer may be gone; a closed channel is the consumer going away
-            }
-            last_send = Instant::now();
-        }
-    });
+        },
+        Config::default().with_event_kinds(EventKindMask::CORE),
+    );
     let Ok(mut nw) = new_watcher else {
         tracing::warn!(
             target: "thegn::hydrate",
