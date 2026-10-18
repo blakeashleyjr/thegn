@@ -2,6 +2,7 @@
 pub mod amd_smu;
 pub mod cgroup;
 pub mod cgroup_slice;
+pub mod containers_stats;
 pub mod cpu_idle;
 pub mod cpu_irq;
 pub mod cpu_sched;
