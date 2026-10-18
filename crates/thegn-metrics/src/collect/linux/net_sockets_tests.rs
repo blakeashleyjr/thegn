@@ -66,6 +66,8 @@ fn socket(state: u8, remote: [u8; 4], rtt_us: u32, last_data_recv_ms: u32) -> Tc
         source_port: 10000,
         destination_port: 443,
         inode: 1,
+        cookie: None,
+        cgroup_id: None,
         uid: 1000,
         rqueue: 0,
         wqueue: 0,

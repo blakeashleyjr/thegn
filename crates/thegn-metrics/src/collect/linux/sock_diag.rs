@@ -10,7 +10,8 @@ const SOCK_DIAG_BY_FAMILY: u16 = 20;
 const INET_DIAG_INFO: u16 = 2;
 // INET_DIAG_CGROUP_ID is a response attribute (21), emitted by kernels that
 // support CONFIG_SOCK_CGROUP_DATA. It is not requestable through idiag_ext:
-// that field only has eight bits. The kernel includes it in each diag row.
+// that field only has eight bits. The kernel includes it in each diag row,
+// possibly preceded by INET_DIAG_PAD (14) on strict-alignment architectures.
 const INET_DIAG_CGROUP_ID: u16 = 21;
 const NLMSG_DONE: u16 = libc::NLMSG_DONE as u16;
 const NLMSG_ERROR: u16 = libc::NLMSG_ERROR as u16;
@@ -142,6 +143,7 @@ pub fn decode_message(message: &NetlinkMessage<'_>) -> io::Result<TcpSock> {
     let mut cgroup_id = None;
     for attribute in AttributeIter::new(&payload[INET_DIAG_MSG_LEN..]) {
         let Ok(attribute) = attribute else {
+            info = None;
             break;
         };
         if attribute.kind == TCP_INFO_KIND {
@@ -150,16 +152,11 @@ pub fn decode_message(message: &NetlinkMessage<'_>) -> io::Result<TcpSock> {
             cgroup_id = get_u64(attribute.payload, 0);
         }
     }
-    let cookie = Some(u64::from_ne_bytes([
-        payload[44],
-        payload[45],
-        payload[46],
-        payload[47],
-        payload[48],
-        payload[49],
-        payload[50],
-        payload[51],
-    ]));
+    let cookie = Some(
+        u64::from(get_u32(payload, 44).ok_or_else(|| invalid("missing cookie low word"))?)
+            | (u64::from(get_u32(payload, 48).ok_or_else(|| invalid("missing cookie high word"))?)
+                << 32),
+    );
     Ok(TcpSock {
         family,
         state: payload[1],
