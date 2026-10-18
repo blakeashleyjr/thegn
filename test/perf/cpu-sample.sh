@@ -327,6 +327,10 @@ if [ "$SCENARIO" = soak-daemon ]; then
   printf '[daemon]\nsocket = "%s"\n' "$DAEMON_SOCK_CONFIG" >"$XDG_CONFIG_HOME/thegn/config.toml"
 fi
 perf_sandbox_off_default
+if [ "$SCENARIO" = soak ] || [ "$SCENARIO" = soak-daemon ]; then
+  # The first auto-fetch's per-worktree remote probes belong outside the soak window.
+  printf '\n[git]\nauto_fetch = false\n' >>"$XDG_CONFIG_HOME/thegn/config.toml"
+fi
 perf_seed_fixture_registry "$WORKTREES" "$BIN_ABS" "$REPO"
 LOG_FILE="$XDG_STATE_HOME/thegn/logs/thegn.log"
 rm -f -- "$LOG_FILE"

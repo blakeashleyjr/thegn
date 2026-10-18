@@ -107,6 +107,9 @@ impl ContainerEventSink for BatchForwarder {
 /// entry; an explicit kind always resolves (a reserved/`No` cap is answered
 /// downstream, after the honest `Reserved` note).
 fn select_backend(cfg: &SandboxConfig) -> Option<Backend> {
+    if !cfg.enabled {
+        return None;
+    }
     match cfg.backend {
         SandboxBackend::Auto => cfg
             .backend_chain
@@ -173,5 +176,16 @@ mod tests {
             select_backend(&cfg(SandboxBackend::None, &[])).expect("none resolves as a backend");
         assert_eq!(backend, Backend::None);
         assert!(backend.events().is_none());
+    }
+
+    #[test]
+    fn disabled_sandbox_selects_no_event_transport() {
+        for backend in [SandboxBackend::Auto, SandboxBackend::Podman] {
+            let cfg = SandboxConfig {
+                enabled: false,
+                ..cfg(backend, &["podman-rootless"])
+            };
+            assert_eq!(select_backend(&cfg), None);
+        }
     }
 }

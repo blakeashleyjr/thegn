@@ -95,6 +95,7 @@ perf_track_process_group() {
 
 perf_sandbox_off_default() {
   mkdir -p "$XDG_CONFIG_HOME/thegn"
+  printf '\n[media]\nenabled = false\n' >>"$XDG_CONFIG_HOME/thegn/config.toml"
   if [ "${TG_PERF_SANDBOX:-}" != 1 ]; then
     printf '\n[sandbox]\nenabled = false\n' >>"$XDG_CONFIG_HOME/thegn/config.toml"
   fi
@@ -212,11 +213,11 @@ perf_watch_process_group() {
   PERF_PROCESS_WATCHFILES["$pgid"]="$watchfile"
 }
 
-# Remove any podman pause process owned by this fixture, then remove its files.
-# Podman overlay layers may be owned by its user namespace, so retry deletion
-# through `podman unshare` when ordinary rm cannot remove the isolated tree.
+# Remove temporary files and any matching podman pause process owned by this
+# fixture. Podman overlay layers may be owned by its user namespace, so remove
+# them through `podman unshare` before trying ordinary rm.
 perf_cleanup() {
-  local d cmdline pgid ppid pidfile
+  local d pgid ppid pidfile pid
   if [ "${#PERF_PROCESS_GROUPS[@]}" -gt 0 ]; then
     for pgid in "${PERF_PROCESS_GROUPS[@]}"; do
       ppid="$(ps -o ppid= -p "$pgid" 2>/dev/null | tr -d ' ' || true)"
@@ -232,25 +233,39 @@ perf_cleanup() {
     rm -rf -- "$PERF_SOCK_DIR" || true
   fi
   if [ -n "${PERF_TMP:-}" ] && [ -e "$PERF_TMP" ]; then
-    if ! rm -rf -- "$PERF_TMP" && command -v podman >/dev/null 2>&1; then
+    # Podman-owned overlay files may be inaccessible outside its user namespace.
+    if [ -d "$PERF_TMP/home/.local/share/containers/storage" ] &&
+      command -v podman >/dev/null 2>&1; then
       podman unshare rm -rf -- "$PERF_TMP" || true
+    fi
+    if [ -e "$PERF_TMP" ]; then
+      rm -rf -- "$PERF_TMP" || true
     fi
   fi
   # `podman unshare` can start a new pause process with this fixture's runtime
-  # environment, so scan after both deletion attempts. Match a path component.
-  if [ -n "${PERF_TMP:-}" ] && [ -d /proc ]; then
-    for d in /proc/[0-9]*; do
-      [ -r "$d/cmdline" ] && [ -r "$d/environ" ] || continue
-      cmdline="$(tr '\0' ' ' <"$d/cmdline" 2>/dev/null || true)"
-      case "$cmdline" in
-      *podman\ pause*)
-        if tr '\0' '\n' <"$d/environ" 2>/dev/null | grep -F -- "$PERF_TMP/" >/dev/null; then
-          kill "${d##*/}" 2>/dev/null || true
-        fi
-        ;;
-      esac
-    done
+  # environment, so scan after both deletion attempts. `/proc/PID/comm` holds
+  # `podman pause`; cmdline contains only `podman`. Read races are silent.
+  if [ -n "${PERF_TMP:-}" ] && [ -d "${PERF_PROC_ROOT:-/proc}" ]; then
+    while IFS= read -r pid; do
+      d="${PERF_PROC_ROOT:-/proc}/$pid"
+      if tr '\0' '\n' 2>/dev/null <"$d/environ" | grep -F -- "$PERF_TMP/" >/dev/null; then
+        kill "$pid" 2>/dev/null || true
+      fi
+    done < <(perf_pause_pids)
   fi
+}
+
+# Print pause-process PIDs using procfs comm (cmdline is only `podman`).
+# Kept separate so the matcher can be exercised against an isolated proc tree.
+perf_pause_pids() {
+  local d comm proc_root="${PERF_PROC_ROOT:-/proc}"
+  [ -d "$proc_root" ] || return 0
+  for d in "$proc_root"/[0-9]*; do
+    [ -d "$d" ] || continue
+    if IFS= read -r comm 2>/dev/null <"$d/comm" && [ "$comm" = 'podman pause' ]; then
+      printf '%s\n' "${d##*/}"
+    fi
+  done
 }
 
 # Install an EXIT trap that removes the temp dir.
