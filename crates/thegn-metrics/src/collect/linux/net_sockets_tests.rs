@@ -202,20 +202,18 @@ fn transient_discovery_open_failure_recovers_on_later_sample() {
     let mut demand = CollectorSet::empty();
     demand.insert(CollectorId::NetSockets);
     let mut frame = MonitorFrame::default();
+    let retry_tick = (1..=5)
+        .find(|tick| {
+            registry
+                .due(Mode::Open, demand, *tick)
+                .contains(CollectorId::NetSockets)
+        })
+        .unwrap();
     registry.tick(
         Mode::Open,
         demand,
         &TickCtx {
-            tick: 0,
-            ..Default::default()
-        },
-        &mut frame,
-    );
-    registry.tick(
-        Mode::Open,
-        demand,
-        &TickCtx {
-            tick: 5,
+            tick: retry_tick,
             ..Default::default()
         },
         &mut frame,
@@ -248,21 +246,29 @@ fn timed_out_dump_is_gone_and_registry_reopens_before_next_sample() {
     let mut demand = CollectorSet::empty();
     demand.insert(CollectorId::NetSockets);
     let mut frame = MonitorFrame::default();
+    let first_sample_tick = (0..5)
+        .find(|tick| {
+            registry
+                .due(Mode::Open, demand, *tick)
+                .contains(CollectorId::NetSockets)
+        })
+        .unwrap();
     registry.tick(
         Mode::Open,
         demand,
         &TickCtx {
-            tick: 0,
+            tick: first_sample_tick,
             ..Default::default()
         },
         &mut frame,
     );
     assert_eq!(opens.load(Ordering::SeqCst), 3);
+    let next_sample_tick = first_sample_tick + 5;
     registry.tick(
         Mode::Open,
         demand,
         &TickCtx {
-            tick: 5,
+            tick: next_sample_tick,
             ..Default::default()
         },
         &mut frame,
