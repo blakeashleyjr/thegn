@@ -23,6 +23,7 @@ impl Plausibility {
             return false;
         }
         if self.previous == Some(temp_c) {
+            // 255 is outside plausible_range today; keep it for T26 parity if that range changes.
             let sentinel = temp_c == 0.0 || temp_c == 127.0 || temp_c == 255.0;
             if now_ms.saturating_sub(self.unchanged_since_ms) >= STUCK_AFTER_MS && sentinel {
                 return false;
@@ -53,7 +54,7 @@ impl AliasDetector {
         zones: &[Option<f32>],
         hwmon_values: &[Option<f32>],
         hwmon_labelled: &[bool],
-    ) -> Vec<bool> {
+    ) -> &[bool] {
         self.runs.resize(zones.len(), 0);
         self.aliases.resize(zones.len(), false);
         for (index, zone_temp) in zones.iter().enumerate() {
@@ -78,7 +79,7 @@ impl AliasDetector {
                 self.aliases[index] = true;
             }
         }
-        self.aliases.clone()
+        &self.aliases
     }
 }
 

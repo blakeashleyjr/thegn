@@ -146,7 +146,13 @@ fn discovery_skips_acpitz_temp_and_sample_parses_trips_and_cooling_aggregate() {
     assert_eq!(part.zones[0].mode.as_deref(), Some("enabled"));
     assert_eq!(part.zones[0].trips[0].temp_c, Some(70.0));
     assert_eq!(part.zones[0].trips[0].hyst_c, Some(2.0));
+    assert_eq!(
+        part.zones[0].trips[0].kind,
+        crate::collect::model::thermal_zone::TripKind::Passive
+    );
     assert_eq!(part.zones[1].temp_c, Some(62.0));
+    assert_eq!(part.zones[1].trips[0].temp_c, Some(95.0));
+    assert_eq!(part.zones[1].trips[0].hyst_c, Some(3.0));
     assert_eq!(
         part.zones[1].trips[0].kind,
         crate::collect::model::thermal_zone::TripKind::Critical
@@ -178,6 +184,55 @@ fn changed_zone_count_triggers_rediscovery() {
         .dirs
         .retain(|path| path.file_name().is_none_or(|name| name != "thermal_zone0"));
     let mut frame = MonitorFrame::default();
+    for tick in (5..=60).step_by(5) {
+        collector
+            .sample(
+                &TickCtx {
+                    tick,
+                    now_ms: u64::from(tick) * 1_000,
+                },
+                &mut frame,
+            )
+            .unwrap();
+    }
+    assert_eq!(frame.parts.thermal_zone.zones.len(), 1);
+    assert_eq!(frame.parts.thermal_zone.zones[0].zone_type, "x86_pkg_temp");
+}
+
+#[test]
+fn failed_second_temperature_read_clears_the_previous_sample() {
+    let (fs, root) = fixture();
+    let mut collector = ThermalZoneCollector::with_fs(fs, &root);
+    collector.discover(&Env::default());
+    let mut frame = MonitorFrame::default();
+    let ctx = TickCtx {
+        tick: 5,
+        now_ms: 5_000,
+    };
+    collector.sample(&ctx, &mut frame).unwrap();
+    assert_eq!(frame.parts.thermal_zone.zones.len(), 2);
+    assert_eq!(frame.parts.thermal_zone.zones[1].temp_c, Some(62.0));
+
+    collector
+        .fs
+        .files
+        .remove(&root.join("class/thermal/thermal_zone1/temp"));
+    collector.sample(&ctx, &mut frame).unwrap();
+    assert_eq!(frame.parts.thermal_zone.zones.len(), 2);
+    assert_eq!(frame.parts.thermal_zone.zones[1].temp_c, None);
+}
+
+#[test]
+fn device_less_zones_of_the_same_type_get_enumeration_ordinals() {
+    let (mut fs, root) = fixture();
+    let zone = root.join("class/thermal/thermal_zone2");
+    fs.dirs.push(zone.clone());
+    put(&mut fs, zone.join("type"), "x86_pkg_temp\n");
+    put(&mut fs, zone.join("temp"), "63000\n");
+
+    let mut collector = ThermalZoneCollector::with_fs(fs, &root);
+    collector.discover(&Env::default());
+    let mut frame = MonitorFrame::default();
     collector
         .sample(
             &TickCtx {
@@ -187,8 +242,30 @@ fn changed_zone_count_triggers_rediscovery() {
             &mut frame,
         )
         .unwrap();
-    assert_eq!(frame.parts.thermal_zone.zones.len(), 1);
-    assert_eq!(frame.parts.thermal_zone.zones[0].zone_type, "x86_pkg_temp");
+    let zones = &frame.parts.thermal_zone.zones;
+    assert_eq!(zones.len(), 3);
+    assert_eq!(zones[1].key, "x86_pkg_temp:/unknown#0");
+    assert_eq!(zones[2].key, "x86_pkg_temp:/unknown#1");
+    assert_ne!(zones[1].key, zones[2].key);
+}
+
+#[test]
+fn sample_after_close_rediscovers_zones() {
+    let (fs, root) = fixture();
+    let mut collector = ThermalZoneCollector::with_fs(fs, &root);
+    collector.discover(&Env::default());
+    collector.close();
+    let mut frame = MonitorFrame::default();
+    collector
+        .sample(
+            &TickCtx {
+                tick: 5,
+                now_ms: 5_000,
+            },
+            &mut frame,
+        )
+        .unwrap();
+    assert_eq!(frame.parts.thermal_zone.zones.len(), 2);
 }
 
 #[test]
