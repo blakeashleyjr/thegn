@@ -21,7 +21,11 @@ pub fn scope_from_cgroup_line(line: &str) -> Option<PathBuf> {
     if !matches!(classify(scope).kind, OwnerKind::Docker | OwnerKind::Podman) {
         return None;
     }
-    Some(PathBuf::from(std::str::from_utf8(scope).ok()?))
+    let relative = scope.strip_prefix(b"/").unwrap_or(scope);
+    if relative.is_empty() {
+        return None;
+    }
+    Some(PathBuf::from(std::str::from_utf8(relative).ok()?))
 }
 
 /// Return engine cgroup locations in the order they should be probed.
@@ -55,16 +59,25 @@ mod tests {
                 "0::/user.slice/user-1000.slice/user@1000.service/user.slice/libpod-{id}.scope/container"
             )),
             Some(PathBuf::from(format!(
-                "/user.slice/user-1000.slice/user@1000.service/user.slice/libpod-{id}.scope"
+                "user.slice/user-1000.slice/user@1000.service/user.slice/libpod-{id}.scope"
             )))
         );
         assert_eq!(
             scope_from_cgroup_line("0::/system.slice/docker-test.scope"),
-            Some(PathBuf::from("/system.slice/docker-test.scope"))
+            Some(PathBuf::from("system.slice/docker-test.scope"))
         );
         assert_eq!(scope_from_cgroup_line("2:cpu,cpuacct:/docker/test"), None);
         assert_eq!(scope_from_cgroup_line("0::/"), None);
         assert_eq!(scope_from_cgroup_line("0::/user.slice/some.service"), None);
+    }
+
+    #[test]
+    fn resolved_scope_accepts_proc_cgroup_path() {
+        let path = scope_from_cgroup_line("0::/system.slice/docker-test.scope").unwrap();
+        assert!(
+            crate::collect::linux::containers_stats::ResolvedContainerScope::new("test", path)
+                .is_some()
+        );
     }
 
     #[test]

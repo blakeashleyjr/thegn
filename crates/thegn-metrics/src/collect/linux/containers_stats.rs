@@ -1,6 +1,6 @@
 //! Bounded cgroup v2 sampling for container inventory supplied by the caller.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::path::{Component, PathBuf};
 use std::time::Instant;
 
@@ -59,6 +59,7 @@ fn counters_decreased(previous: &CgroupSample, current: &CgroupSample) -> bool {
 }
 
 pub const MAX_CONTAINER_SCOPES_PER_TICK: usize = 64;
+// Reserve 56 reads for CPU-ranked scopes and 8 for the rotating remainder.
 const CPU_PRIORITY_SLOTS: usize = 56;
 const SAMPLE_BUFFER_BYTES: usize = 8 * 1024;
 
@@ -97,24 +98,32 @@ struct PreviousSample {
 pub struct ContainerStatsSampler<F> {
     fs: F,
     filter: DeviceFilter,
+    root: PathBuf,
     buffer: Vec<u8>,
     sample: CgroupSample,
     path: PathBuf,
     previous: HashMap<String, PreviousSample>,
     rows: Vec<ContainerStatsRow>,
+    prioritized: Vec<usize>,
+    selected: Vec<usize>,
+    priority: Vec<bool>,
     round_robin: usize,
 }
 
 impl<F> ContainerStatsSampler<F> {
-    pub fn new(fs: F, filter: DeviceFilter) -> Self {
+    pub fn new(fs: F, filter: DeviceFilter, root: PathBuf) -> Self {
         Self {
             fs,
             filter,
+            root,
             buffer: Vec::with_capacity(SAMPLE_BUFFER_BYTES),
             sample: CgroupSample::default(),
             path: PathBuf::new(),
             previous: HashMap::new(),
             rows: Vec::with_capacity(MAX_CONTAINER_SCOPES_PER_TICK),
+            prioritized: Vec::new(),
+            selected: Vec::with_capacity(MAX_CONTAINER_SCOPES_PER_TICK),
+            priority: Vec::new(),
             round_robin: 0,
         }
     }
@@ -138,15 +147,17 @@ impl<F: CgroupFs> ContainerStatsSampler<F> {
         scopes: &[ResolvedContainerScope],
         at: Instant,
     ) -> &[ContainerStatsRow] {
-        let active_ids: HashSet<&str> = scopes.iter().map(|scope| scope.id.as_str()).collect();
         self.previous
-            .retain(|id, _| active_ids.contains(id.as_str()));
+            .retain(|id, _| scopes.iter().any(|scope| scope.id.as_str() == id.as_str()));
         self.rows.clear();
 
-        let selected = self.select_scopes(scopes);
-        for index in selected {
+        self.select_scopes(scopes);
+        for selected_index in 0..self.selected.len() {
+            let index = self.selected[selected_index];
             let scope = &scopes[index];
-            self.path.clone_from(&scope.path);
+            self.path.clear();
+            self.path.push(&self.root);
+            self.path.push(&scope.path);
             read_group(
                 &mut self.fs,
                 &self.filter,
@@ -200,21 +211,30 @@ impl<F: CgroupFs> ContainerStatsSampler<F> {
                 io_write_bps,
                 gap: row_gap,
             });
-            self.previous.insert(
-                scope.id.clone(),
-                PreviousSample {
-                    sample: self.sample.clone(),
-                    at,
-                    cpu_pct: cpu_pct.unwrap_or(0.0),
-                },
-            );
+            let carried_cpu_pct =
+                cpu_pct.unwrap_or_else(|| old.map_or(0.0, |previous| previous.cpu_pct));
+            if let Some(previous) = self.previous.get_mut(&scope.id) {
+                previous.sample = self.sample;
+                previous.at = at;
+                previous.cpu_pct = carried_cpu_pct;
+            } else {
+                self.previous.insert(
+                    scope.id.clone(),
+                    PreviousSample {
+                        sample: self.sample,
+                        at,
+                        cpu_pct: carried_cpu_pct,
+                    },
+                );
+            }
         }
         &self.rows
     }
 
-    fn select_scopes(&mut self, scopes: &[ResolvedContainerScope]) -> Vec<usize> {
-        let mut prioritized: Vec<usize> = (0..scopes.len()).collect();
-        prioritized.sort_by(|left, right| {
+    fn select_scopes(&mut self, scopes: &[ResolvedContainerScope]) {
+        self.prioritized.clear();
+        self.prioritized.extend(0..scopes.len());
+        self.prioritized.sort_unstable_by(|left, right| {
             let left_cpu = self
                 .previous
                 .get(&scopes[*left].id)
@@ -226,28 +246,27 @@ impl<F: CgroupFs> ContainerStatsSampler<F> {
             right_cpu.total_cmp(&left_cpu).then_with(|| left.cmp(right))
         });
         let priority_count = scopes.len().min(CPU_PRIORITY_SLOTS);
-        let priority: HashSet<usize> = prioritized.iter().take(priority_count).copied().collect();
-        let mut selected: Vec<usize> = prioritized.into_iter().take(priority_count).collect();
+        self.priority.resize(scopes.len(), false);
+        self.priority.fill(false);
+        self.selected.clear();
+        self.selected
+            .extend(self.prioritized.iter().take(priority_count).copied());
+        for &index in &self.selected {
+            self.priority[index] = true;
+        }
         let remainder_count = scopes.len().saturating_sub(priority_count);
         if remainder_count > 0 {
-            let needed = MAX_CONTAINER_SCOPES_PER_TICK.saturating_sub(selected.len());
+            let needed = MAX_CONTAINER_SCOPES_PER_TICK.saturating_sub(self.selected.len());
+            self.prioritized.clear();
+            self.prioritized
+                .extend((0..scopes.len()).filter(|index| !self.priority[*index]));
             let start = self.round_robin % remainder_count;
             for offset in 0..remainder_count.min(needed) {
                 let remainder_index = (start + offset) % remainder_count;
-                let mut seen = 0;
-                for index in 0..scopes.len() {
-                    if !priority.contains(&index) && seen == remainder_index {
-                        selected.push(index);
-                        break;
-                    }
-                    if !priority.contains(&index) {
-                        seen += 1;
-                    }
-                }
+                self.selected.push(self.prioritized[remainder_index]);
             }
             self.round_robin = (start + needed.min(remainder_count)) % remainder_count;
         }
-        selected
     }
 }
 
