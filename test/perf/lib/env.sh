@@ -14,7 +14,8 @@ set -euo pipefail
 # Create the throwaway root and export the isolated environment. Caller is
 # responsible for cleanup (or use perf_trap_cleanup).
 perf_make_tmp() {
-  local entry v
+  local entry v real_runtime
+  real_runtime="${XDG_RUNTIME_DIR:-}"
   # A perf run must not inherit the developer's session controls, log routing,
   # or credentials. Keep TG_PERF_* so the harness's own knobs remain available.
   while IFS= read -r -d '' entry; do
@@ -28,6 +29,17 @@ perf_make_tmp() {
       ;;
     esac
   done < <(env -0)
+
+  # A sandbox-on perf run may use the host's user manager, but the harness must
+  # keep its daemon socket private under the isolated runtime dir below.
+  unset DBUS_SESSION_BUS_ADDRESS
+  if [ -n "$real_runtime" ] && [ -S "$real_runtime/bus" ]; then
+    export DBUS_SESSION_BUS_ADDRESS="unix:path=$real_runtime/bus"
+  fi
+  if [ "${TG_PERF_SANDBOX:-}" = 1 ] && [ -z "${DBUS_SESSION_BUS_ADDRESS:-}" ]; then
+    echo 'perf: TG_PERF_SANDBOX=1 requires a user bus at the original XDG_RUNTIME_DIR/bus socket' >&2
+    return 1
+  fi
 
   PERF_TMP="$(mktemp -d "${TMPDIR:-/tmp}/tg-perf.XXXXXX")"
   export PERF_TMP
@@ -65,11 +77,59 @@ perf_make_tmp() {
     >"$GIT_CONFIG_GLOBAL"
 }
 
+# Track background launch process groups so EXIT cleanup can reap descendants
+# even when timeout(1) only reports that its direct child timed out.
+PERF_PROCESS_GROUPS=()
+perf_track_process_group() {
+  PERF_PROCESS_GROUPS+=("$1")
+}
+
+perf_sandbox_off_default() {
+  if [ "${TG_PERF_SANDBOX:-}" != 1 ]; then
+    mkdir -p "$XDG_CONFIG_HOME/thegn"
+    printf '\n[sandbox]\nenabled = false\n' >>"$XDG_CONFIG_HOME/thegn/config.toml"
+  fi
+}
+
+perf_stop_process_group() {
+  local pgid="$1"
+  kill -TERM -- "-$pgid" 2>/dev/null || true
+  sleep 1
+  kill -KILL -- "-$pgid" 2>/dev/null || true
+  wait "$pgid" 2>/dev/null || true
+}
+
+perf_watch_process_group() {
+  local pgid="$1" deadline_s="$2"
+  (
+    for ((tick = 0; tick < deadline_s * 10; tick++)); do
+      kill -0 "$pgid" 2>/dev/null || exit 0
+      sleep 0.1
+    done
+    if kill -0 "$pgid" 2>/dev/null; then
+      kill -TERM -- "-$pgid" 2>/dev/null || true
+      sleep 1
+      kill -KILL -- "-$pgid" 2>/dev/null || true
+    fi
+  ) &
+  perf_track_process_group "$!"
+}
+
 # Remove any podman pause process owned by this fixture, then remove its files.
 # Podman overlay layers may be owned by its user namespace, so retry deletion
 # through `podman unshare` when ordinary rm cannot remove the isolated tree.
 perf_cleanup() {
-  local d cmdline
+  local d cmdline pgid
+  if [ "${#PERF_PROCESS_GROUPS[@]}" -gt 0 ]; then
+    for pgid in "${PERF_PROCESS_GROUPS[@]}"; do
+      kill -TERM -- "-$pgid" 2>/dev/null || true
+    done
+    sleep 1
+    for pgid in "${PERF_PROCESS_GROUPS[@]}"; do
+      kill -KILL -- "-$pgid" 2>/dev/null || true
+      wait "$pgid" 2>/dev/null || true
+    done
+  fi
   if [ -n "${PERF_SOCK_DIR:-}" ]; then
     rm -rf -- "$PERF_SOCK_DIR" || true
   fi

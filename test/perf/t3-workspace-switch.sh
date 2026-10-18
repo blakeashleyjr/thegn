@@ -15,6 +15,7 @@
 #
 # Usage: t3-workspace-switch.sh [--bin PATH] [--workspaces N] [--worktrees N]
 #                               [--switches N] [--json]
+# TG_PERF_SANDBOX=1 opts into measuring sandboxed panes.
 #
 # Exit status: 0 ok (numbers printed); 1 harness error.
 
@@ -73,6 +74,7 @@ esac
 GIT_SHA="$(git -C "$HERE" rev-parse --short HEAD 2>/dev/null || echo unknown)"
 
 perf_make_tmp
+perf_sandbox_off_default
 perf_trap_cleanup
 HOST_TAG="$(perf_host_tag)"
 
