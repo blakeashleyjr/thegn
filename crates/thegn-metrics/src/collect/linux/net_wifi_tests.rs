@@ -291,11 +291,12 @@ fn station_enoent_reresolves_family_and_sample_succeeds_through_registry() {
     let mut demand = CollectorSet::empty();
     demand.insert(CollectorId::NetWifi);
     let mut frame = MonitorFrame::default();
+    let tick = wifi_due_tick(&registry, 0);
     registry.tick(
         Mode::Open,
         demand,
         &TickCtx {
-            tick: 0,
+            tick,
             ..Default::default()
         },
         &mut frame,
@@ -321,11 +322,13 @@ fn sample_permission_error_becomes_absent_after_registry_rediscovery() {
     let mut demand = CollectorSet::empty();
     demand.insert(CollectorId::NetWifi);
     let mut frame = MonitorFrame::default();
+    let tick = wifi_due_tick(&registry, 0);
+    let next_tick = wifi_due_tick(&registry, 1);
     registry.tick(
         Mode::Open,
         demand,
         &TickCtx {
-            tick: 0,
+            tick,
             ..Default::default()
         },
         &mut frame,
@@ -339,12 +342,25 @@ fn sample_permission_error_becomes_absent_after_registry_rediscovery() {
         Mode::Open,
         demand,
         &TickCtx {
-            tick: 5,
+            tick: next_tick,
             ..Default::default()
         },
         &mut frame,
     );
     assert_eq!(opens.load(Ordering::SeqCst), 2);
+}
+
+fn wifi_due_tick(registry: &Registry, occurrence: usize) -> u64 {
+    let mut demand = CollectorSet::empty();
+    demand.insert(CollectorId::NetWifi);
+    (0_u64..30)
+        .filter(|tick| {
+            registry
+                .due(Mode::Open, demand, *tick)
+                .contains(CollectorId::NetWifi)
+        })
+        .nth(occurrence)
+        .unwrap()
 }
 
 #[test]
