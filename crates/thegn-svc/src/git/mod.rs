@@ -3186,9 +3186,11 @@ mod tests {
 
     #[test]
     fn print_validated_entry_survives_a_quiet_row_rescan_gap() {
-        let now = std::time::Instant::now();
-        let print = Some(thegn_core::git_memo::base_refs_print(&repo_root()).unwrap());
         let effective = effective_print_idle_ttl(900_000);
+        let now = std::time::Instant::now()
+            .checked_add(effective + std::time::Duration::from_secs(2))
+            .unwrap();
+        let print = Some(thegn_core::git_memo::base_refs_print(&repo_root()).unwrap());
         let mut bases = std::collections::HashMap::from([
             (
                 RepoExecutionIdentity("quiet-row-gap-kept".into()),
