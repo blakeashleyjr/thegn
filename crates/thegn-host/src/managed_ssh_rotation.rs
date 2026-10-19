@@ -117,6 +117,7 @@ fn rotate_scope(cfg: &Config, key_path: &Path, records: &[AuthorizedKeyRecord]) 
     let old_public_path = public_path(key_path);
     let old_public = std::fs::read_to_string(&old_public_path)
         .with_context(|| format!("read managed public key {}", old_public_path.display()))?;
+    let old_key_id = key_id(&old_public)?;
     let staging = rotation_sibling(key_path, "next");
     let backup = rotation_sibling(key_path, "retiring");
     crate::agent::generate_managed_keypair_at(&staging, "thegn-managed-rotation")?;
@@ -127,6 +128,7 @@ fn rotate_scope(cfg: &Config, key_path: &Path, records: &[AuthorizedKeyRecord]) 
             staging_public_path.display()
         )
     })?;
+    let new_key_id = key_id(&new_public)?;
     let recovery = RotationRecovery {
         key_path: staging.clone(),
         key_fingerprint: thegn_core::managed_ssh::key_fingerprint(&new_public),
@@ -160,7 +162,7 @@ fn rotate_scope(cfg: &Config, key_path: &Path, records: &[AuthorizedKeyRecord]) 
             run_checked(
                 &old,
                 &record.instance,
-                &authorize_script(&new_public),
+                &authorize_script(&new_public, &new_key_id)?,
                 "authorize replacement key",
             )?;
             Ok(())
@@ -291,7 +293,7 @@ fn rotate_scope(cfg: &Config, key_path: &Path, records: &[AuthorizedKeyRecord]) 
         if let Err(error) = run_checked(
             replacement,
             &record.instance,
-            &deauthorize_script(&old_public),
+            &deauthorize_script(&old_key_id)?,
             "de-authorize old key",
         ) {
             // Best effort, across the whole scope rather than only completed
@@ -301,7 +303,7 @@ fn rotate_scope(cfg: &Config, key_path: &Path, records: &[AuthorizedKeyRecord]) 
                 run_checked(
                     &canonical_providers[index],
                     &tracked[index].instance,
-                    &authorize_script(&old_public),
+                    &authorize_script(&old_public, &old_key_id)?,
                     "restore old key after partial failure",
                 )
             })
@@ -563,6 +565,8 @@ fn recover_pending(
                 key_path.display()
             )
         };
+    let primary_key_id = key_id(&primary_public)?;
+    let auxiliary_key_id = key_id(&auxiliary_public)?;
 
     // Once remote retirement may have begun, first restore the primary key on
     // every affected instance using the auxiliary credential. This is
@@ -589,7 +593,7 @@ fn recover_pending(
             run_checked(
                 &auxiliary,
                 &record.instance,
-                &authorize_script(&primary_public),
+                &authorize_script(&primary_public, &primary_key_id)?,
                 "restore primary key during rotation recovery",
             )?;
         }
@@ -607,7 +611,7 @@ fn recover_pending(
         run_checked(
             &primary,
             &record.instance,
-            &deauthorize_script(&auxiliary_public),
+            &deauthorize_script(&auxiliary_key_id)?,
             "remove auxiliary key during rotation recovery",
         )?;
     }
@@ -780,18 +784,92 @@ fn run_checked(
     }
 }
 
-fn authorize_script(public_key: &str) -> String {
-    let key = thegn_core::util::sh_quote(public_key.trim());
+fn key_id(public_key: &str) -> Result<(String, String)> {
+    let mut fields = public_key.split_whitespace();
+    let key_type = fields
+        .next()
+        .ok_or_else(|| anyhow!("public key is missing its type"))?;
+    let body = fields
+        .next()
+        .ok_or_else(|| anyhow!("public key is missing its base64 body"))?;
+    if !key_type
+        .chars()
+        .all(|ch| ch.is_ascii_lowercase() || ch.is_ascii_digit() || "@.-".contains(ch))
+    {
+        bail!("public key has an invalid key type");
+    }
+    if !body
+        .chars()
+        .all(|ch| ch.is_ascii_alphanumeric() || "+/=".contains(ch))
+    {
+        bail!("public key has an invalid base64 body");
+    }
+    Ok((key_type.to_string(), body.to_string()))
+}
+
+fn awk_key_match(key_id: &(String, String), program: &str) -> String {
+    let key_type = thegn_core::util::sh_quote(&key_id.0);
+    let body = thegn_core::util::sh_quote(&key_id.1);
     format!(
-        "set -eu; mkdir -p \"$HOME/.ssh\"; chmod 700 \"$HOME/.ssh\"; touch \"$HOME/.ssh/authorized_keys\"; chmod 600 \"$HOME/.ssh/authorized_keys\"; grep -qF -- {key} \"$HOME/.ssh/authorized_keys\" || printf '%s\\n' {key} >> \"$HOME/.ssh/authorized_keys\""
+        "awk -v key_type={key_type} -v key_body={body} 'function key_matches( i) {{ if ($0 ~ /^[ \\t]*#/) return 0; for (i = 1; i < NF; i++) if ($i ~ /^[a-z0-9@.-]+$/ && $(i + 1) ~ /^[A-Za-z0-9+\\/=]+$/) return ($i == key_type && $(i + 1) == key_body); return 0 }} {program}'"
     )
 }
 
-fn deauthorize_script(public_key: &str) -> String {
+fn authorize_script(public_key: &str, key_id: &(String, String)) -> Result<String> {
+    let matcher = awk_key_match(
+        key_id,
+        "{ if (key_matches()) found = 1 } END { if (found) exit 0; exit 1 }",
+    );
     let key = thegn_core::util::sh_quote(public_key.trim());
-    format!(
-        "set -eu; f=\"$HOME/.ssh/authorized_keys\"; t=\"$f.thegn.$$\"; grep -vF -- {key} \"$f\" > \"$t\" || true; chmod 600 \"$t\"; mv \"$t\" \"$f\""
-    )
+    Ok(format!(
+        "set -eu\n\
+         mkdir -p \"$HOME/.ssh\"\n\
+         chmod 700 \"$HOME/.ssh\"\n\
+         f=\"$HOME/.ssh/authorized_keys\"\n\
+         if [ -L \"$f\" ] || {{ [ -e \"$f\" ] && [ ! -f \"$f\" ]; }}; then printf '%s\\n' 'TG-AUTHKEYS-ERROR:authorized_keys is not a regular file' >&2; exit 1; fi\n\
+         if [ ! -e \"$f\" ] && [ ! -L \"$f\" ]; then (umask 077; : > \"$f\"); fi\n\
+         if [ -L \"$f\" ] || [ ! -f \"$f\" ]; then printf '%s\\n' 'TG-AUTHKEYS-ERROR:authorized_keys is not a regular file' >&2; exit 1; fi\n\
+         cat \"$f\" > /dev/null\n\
+         chmod 600 \"$f\"\n\
+         if {matcher} \"$f\"; then\n\
+             :\n\
+         else\n\
+             status=$?\n\
+             if [ \"$status\" -ne 1 ]; then exit \"$status\"; fi\n\
+             printf '%s\\n' {key} >> \"$f\"\n\
+         fi"
+    ))
+}
+
+fn deauthorize_script(key_id: &(String, String)) -> Result<String> {
+    let filter = awk_key_match(key_id, "{ if (!key_matches()) print $0 }");
+    let count_matches = awk_key_match(key_id, "{ if (key_matches()) n++ } END { print n + 0 }");
+    let probe = awk_key_match(
+        key_id,
+        "{ if (key_matches()) found = 1 } END { if (found) exit 0; exit 1 }",
+    );
+    Ok(format!(
+        "set -eu\n\
+         f=\"$HOME/.ssh/authorized_keys\"\n\
+         if [ -d \"$HOME/.ssh\" ] && [ ! -x \"$HOME/.ssh\" ]; then printf '%s\\n' 'TG-AUTHKEYS-ERROR:.ssh directory is not searchable' >&2; exit 1; fi\n\
+         if [ ! -e \"$f\" ] && [ ! -L \"$f\" ]; then exit 0; fi\n\
+         if [ -L \"$f\" ]; then printf '%s\\n' 'TG-AUTHKEYS-ERROR:authorized_keys is a symlink' >&2; exit 1; fi\n\
+         if [ ! -f \"$f\" ]; then printf '%s\\n' 'TG-AUTHKEYS-ERROR:authorized_keys is not a regular file' >&2; exit 1; fi\n\
+         cat \"$f\" > /dev/null\n\
+         t=$(mktemp \"$f.thegn.XXXXXX\")\n\
+         trap 'rm -f \"$t\"' EXIT\n\
+         total=$(awk 'END {{ print NR }}' \"$f\")\n\
+         removed=$({count_matches} \"$f\")\n\
+         {filter} \"$f\" > \"$t\"\n\
+         kept=$((total - removed))\n\
+         actual=$(awk 'END {{ print NR }}' \"$t\")\n\
+         if [ \"$actual\" -ne \"$kept\" ]; then printf 'TG-AUTHKEYS-ERROR:line count mismatch total=%s removed=%s kept=%s actual=%s\\n' \"$total\" \"$removed\" \"$kept\" \"$actual\" >&2; exit 1; fi\n\
+         if {probe} \"$t\"; then printf '%s\\n' 'TG-AUTHKEYS-ERROR:target key remains after removal' >&2; exit 1; else status=$?; if [ \"$status\" -ne 1 ]; then exit \"$status\"; fi; fi\n\
+         if [ \"$removed\" -eq 0 ]; then exit 0; fi\n\
+         chmod 600 \"$t\"\n\
+         mv -f \"$t\" \"$f\"\n\
+         trap - EXIT"
+    ))
 }
 
 fn public_path(private: &Path) -> PathBuf {
@@ -949,15 +1027,272 @@ fn remove_pair(private: &Path) -> Result<()> {
 mod tests {
     use super::*;
 
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "test runs the generated remote script with a local sh"
+    )]
+    fn run_local_sh(home: &Path, script: &str) -> Option<std::process::Output> {
+        if !Path::new("/bin/sh").exists() {
+            return None;
+        }
+        Some(
+            std::process::Command::new("/bin/sh")
+                .arg("-c")
+                .arg(script)
+                .env("HOME", home)
+                .output()
+                .unwrap(),
+        )
+    }
+
+    #[test]
+    fn deauthorize_keeps_unrelated_keys_options_and_comments() {
+        let temp = tempfile::tempdir().unwrap();
+        let ssh = temp.path().join(".ssh");
+        std::fs::create_dir(&ssh).unwrap();
+        let path = ssh.join("authorized_keys");
+        let contents = "# operator comment\nssh-ed25519 AAAAOTHER unrelated\nfrom=\"10.0.0.1\",command=\"echo hi\" ssh-ed25519 AAAAOPTIONS option-comment\nssh-ed25519 AAAATARGET old-comment\n";
+        std::fs::write(&path, contents).unwrap();
+        let public = "ssh-ed25519 AAAATARGET rotation@test";
+        let id = key_id(public).unwrap();
+        let script = deauthorize_script(&id).unwrap();
+        let Some(output) = run_local_sh(temp.path(), &script) else {
+            return;
+        };
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(
+            std::fs::read_to_string(path).unwrap(),
+            "# operator comment\nssh-ed25519 AAAAOTHER unrelated\nfrom=\"10.0.0.1\",command=\"echo hi\" ssh-ed25519 AAAAOPTIONS option-comment\n"
+        );
+    }
+
+    #[test]
+    fn deauthorize_fails_closed_on_unreadable_file() {
+        let temp = tempfile::tempdir().unwrap();
+        let ssh = temp.path().join(".ssh");
+        std::fs::create_dir(&ssh).unwrap();
+        let path = ssh.join("authorized_keys");
+        let contents = "ssh-ed25519 AAAAOTHER unrelated\nssh-ed25519 AAAATARGET old-comment\n";
+        std::fs::write(&path, contents).unwrap();
+        let public = "ssh-ed25519 AAAATARGET rotation@test";
+        let id = key_id(public).unwrap();
+        let script = deauthorize_script(&id).unwrap();
+        let Some(set_mode) = run_local_sh(temp.path(), "chmod 640 \"$HOME/.ssh/authorized_keys\"")
+        else {
+            return;
+        };
+        assert!(set_mode.status.success());
+        let Some(chmod_output) =
+            run_local_sh(temp.path(), "chmod 000 \"$HOME/.ssh/authorized_keys\"")
+        else {
+            return;
+        };
+        assert!(chmod_output.status.success());
+        if std::fs::read(&path).is_ok() {
+            let restore = run_local_sh(temp.path(), "chmod 640 \"$HOME/.ssh/authorized_keys\"");
+            assert!(restore.is_some_and(|result| result.status.success()));
+            return;
+        }
+        let Some(output) = run_local_sh(temp.path(), &script) else {
+            return;
+        };
+        assert!(!output.status.success());
+        let mode = run_local_sh(
+            temp.path(),
+            "stat -c %a \"$HOME/.ssh/authorized_keys\" 2>/dev/null || stat -f %Lp \"$HOME/.ssh/authorized_keys\"",
+        )
+        .expect("local sh was available");
+        assert_eq!(String::from_utf8_lossy(&mode.stdout).trim(), "0");
+        let restore = run_local_sh(temp.path(), "chmod 640 \"$HOME/.ssh/authorized_keys\"")
+            .expect("local sh was available");
+        assert!(restore.status.success());
+        assert_eq!(std::fs::read_to_string(path).unwrap(), contents);
+        let restored_mode = run_local_sh(
+            temp.path(),
+            "stat -c %a \"$HOME/.ssh/authorized_keys\" 2>/dev/null || stat -f %Lp \"$HOME/.ssh/authorized_keys\"",
+        )
+        .expect("local sh was available");
+        assert_eq!(String::from_utf8_lossy(&restored_mode.stdout).trim(), "640");
+    }
+
+    #[test]
+    fn deauthorize_without_the_key_is_a_noop_success() {
+        let temp = tempfile::tempdir().unwrap();
+        let ssh = temp.path().join(".ssh");
+        std::fs::create_dir(&ssh).unwrap();
+        let path = ssh.join("authorized_keys");
+        let contents = "# comment\nssh-ed25519 AAAAOTHER unrelated\n";
+        std::fs::write(&path, contents).unwrap();
+        let public = "ssh-ed25519 AAAATARGET rotation@test";
+        let script = deauthorize_script(&key_id(public).unwrap()).unwrap();
+        let Some(output) = run_local_sh(temp.path(), &script) else {
+            return;
+        };
+        assert!(output.status.success());
+        assert_eq!(std::fs::read_to_string(path).unwrap(), contents);
+    }
+
+    #[test]
+    fn deauthorize_with_no_file_succeeds() {
+        let temp = tempfile::tempdir().unwrap();
+        let public = "ssh-ed25519 AAAATARGET rotation@test";
+        let script = deauthorize_script(&key_id(public).unwrap()).unwrap();
+        let Some(output) = run_local_sh(temp.path(), &script) else {
+            return;
+        };
+        assert!(output.status.success());
+        assert!(!temp.path().join(".ssh/authorized_keys").exists());
+    }
+
+    #[test]
+    fn authorize_does_not_duplicate_a_key_under_another_comment() {
+        let temp = tempfile::tempdir().unwrap();
+        let ssh = temp.path().join(".ssh");
+        std::fs::create_dir(&ssh).unwrap();
+        let path = ssh.join("authorized_keys");
+        std::fs::write(&path, "ssh-ed25519 AAAATARGET existing-comment\n").unwrap();
+        let public = "ssh-ed25519 AAAATARGET new-comment";
+        let script = authorize_script(public, &key_id(public).unwrap()).unwrap();
+        let Some(output) = run_local_sh(temp.path(), &script) else {
+            return;
+        };
+        assert!(output.status.success());
+        assert_eq!(
+            std::fs::read_to_string(path).unwrap(),
+            "ssh-ed25519 AAAATARGET existing-comment\n"
+        );
+    }
+
+    #[test]
+    fn authorize_ignores_target_pair_in_an_unrelated_comment() {
+        let temp = tempfile::tempdir().unwrap();
+        let ssh = temp.path().join(".ssh");
+        std::fs::create_dir(&ssh).unwrap();
+        let path = ssh.join("authorized_keys");
+        let contents = "ssh-ed25519 AAAAOTHER note ssh-ed25519 AAAATARGET\n";
+        std::fs::write(&path, contents).unwrap();
+        let public = "ssh-ed25519 AAAATARGET rotation@test";
+        let script = authorize_script(public, &key_id(public).unwrap()).unwrap();
+        let Some(output) = run_local_sh(temp.path(), &script) else {
+            return;
+        };
+        assert!(output.status.success());
+        assert_eq!(
+            std::fs::read_to_string(path).unwrap(),
+            format!("{contents}{public}\n")
+        );
+    }
+
+    #[test]
+    fn authorize_appends_key_when_only_a_commented_copy_exists() {
+        let temp = tempfile::tempdir().unwrap();
+        let ssh = temp.path().join(".ssh");
+        std::fs::create_dir(&ssh).unwrap();
+        let path = ssh.join("authorized_keys");
+        std::fs::write(&path, "# ssh-ed25519 AAAATARGET old-comment\n").unwrap();
+        let public = "ssh-ed25519 AAAATARGET new-comment";
+        let script = authorize_script(public, &key_id(public).unwrap()).unwrap();
+        let Some(output) = run_local_sh(temp.path(), &script) else {
+            return;
+        };
+        assert!(output.status.success());
+        assert_eq!(
+            std::fs::read_to_string(path).unwrap(),
+            "# ssh-ed25519 AAAATARGET old-comment\nssh-ed25519 AAAATARGET new-comment\n"
+        );
+    }
+
+    #[test]
+    fn authorize_refuses_symlink_without_creating_its_target() {
+        let temp = tempfile::tempdir().unwrap();
+        let ssh = temp.path().join(".ssh");
+        std::fs::create_dir(&ssh).unwrap();
+        let target = temp.path().join("target");
+        let Some(link_output) = run_local_sh(
+            temp.path(),
+            "ln -s \"$HOME/target\" \"$HOME/.ssh/authorized_keys\"",
+        ) else {
+            return;
+        };
+        assert!(link_output.status.success());
+        let public = "ssh-ed25519 AAAATARGET new-comment";
+        let script = authorize_script(public, &key_id(public).unwrap()).unwrap();
+        let Some(output) = run_local_sh(temp.path(), &script) else {
+            return;
+        };
+        assert!(!output.status.success());
+        assert!(!target.exists());
+    }
+
+    #[test]
+    fn deauthorize_refuses_directory_at_authorized_keys() {
+        let temp = tempfile::tempdir().unwrap();
+        let ssh = temp.path().join(".ssh");
+        std::fs::create_dir(&ssh).unwrap();
+        let path = ssh.join("authorized_keys");
+        std::fs::create_dir(&path).unwrap();
+        let public = "ssh-ed25519 AAAATARGET rotation@test";
+        let script = deauthorize_script(&key_id(public).unwrap()).unwrap();
+        let Some(output) = run_local_sh(temp.path(), &script) else {
+            return;
+        };
+        assert!(!output.status.success());
+        assert!(path.is_dir());
+    }
+
+    #[test]
+    fn deauthorize_fails_when_ssh_directory_is_not_searchable() {
+        let temp = tempfile::tempdir().unwrap();
+        let ssh = temp.path().join(".ssh");
+        std::fs::create_dir(&ssh).unwrap();
+        let path = ssh.join("authorized_keys");
+        let contents = "ssh-ed25519 AAAATARGET rotation@test\n";
+        std::fs::write(&path, contents).unwrap();
+        let public = "ssh-ed25519 AAAATARGET rotation@test";
+        let script = deauthorize_script(&key_id(public).unwrap()).unwrap();
+        let Some(chmod_output) = run_local_sh(temp.path(), "chmod 600 \"$HOME/.ssh\"") else {
+            return;
+        };
+        assert!(chmod_output.status.success());
+        let Some(check_output) = run_local_sh(temp.path(), "[ ! -x \"$HOME/.ssh\" ]") else {
+            return;
+        };
+        if !check_output.status.success() {
+            let restore = run_local_sh(temp.path(), "chmod 700 \"$HOME/.ssh\"");
+            assert!(restore.is_some_and(|output| output.status.success()));
+            return;
+        }
+        let Some(output) = run_local_sh(temp.path(), &script) else {
+            return;
+        };
+        let restore = run_local_sh(temp.path(), "chmod 700 \"$HOME/.ssh\"");
+        assert!(restore.is_some_and(|result| result.status.success()));
+        assert!(!output.status.success());
+        assert_eq!(std::fs::read_to_string(path).unwrap(), contents);
+    }
+
+    #[test]
+    fn invalid_public_keys_are_refused() {
+        assert!(key_id("ssh-ed25519").is_err());
+        assert!(key_id("ssh-ed25519' AAAA").is_err());
+        assert!(key_id("ssh-ed25519 AAAA$(touch)").is_err());
+    }
+
     #[test]
     fn remote_scripts_do_not_embed_private_material_and_are_idempotent() {
         let public = "ssh-ed25519 AAAATEST rotation@test";
-        let add = authorize_script(public);
-        let remove = deauthorize_script(public);
+        let id = key_id(public).unwrap();
+        let add = authorize_script(public, &id).unwrap();
+        let remove = deauthorize_script(&id).unwrap();
         assert!(add.contains(public));
-        assert!(remove.contains(public));
-        assert!(add.contains("grep -qF"));
-        assert!(remove.contains("grep -vF"));
+        assert!(remove.contains("AAAATEST"));
+        assert!(add.contains("key_matches"));
+        assert!(remove.contains("mktemp"));
+        assert!(!remove.contains("||"));
         assert!(!add.contains("PRIVATE"));
         assert!(!remove.contains("PRIVATE"));
     }
