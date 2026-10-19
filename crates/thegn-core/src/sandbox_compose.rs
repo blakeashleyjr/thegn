@@ -202,13 +202,32 @@ fn probe_project(state_home: &Path, spec: &SandboxSpec, target: &ComposeTarget) 
 
 pub(crate) fn teardown_projects_in(state_home: &Path, worktree: &Path) -> Vec<String> {
     let name = crate::sandbox::container_name(&worktree.to_string_lossy());
-    let hashed = hashed_project_name(&name, worktree);
-    let record = adoption_record_path(state_home, &name, worktree);
-    if adoption_record_matches(&record, &name) {
-        vec![hashed, name]
-    } else {
-        vec![hashed]
+    teardown_projects_for(state_home, &name, &[worktree])
+}
+
+/// Return hashed projects for each worktree, plus an adopted legacy project once.
+pub(crate) fn teardown_projects_for(
+    state_home: &Path,
+    name: &str,
+    worktrees: &[&Path],
+) -> Vec<String> {
+    let mut projects = Vec::new();
+    let mut seen_worktrees = Vec::new();
+    let mut adopted_legacy = false;
+    for worktree in worktrees {
+        if seen_worktrees.contains(worktree) {
+            continue;
+        }
+        seen_worktrees.push(*worktree);
+        let hashed = hashed_project_name(name, worktree);
+        let record = adoption_record_path(state_home, name, worktree);
+        adopted_legacy |= adoption_record_matches(&record, name);
+        projects.push(hashed);
     }
+    if adopted_legacy {
+        projects.push(name.to_string());
+    }
+    projects
 }
 
 /// A bounded Compose startup or verification failure.
@@ -809,6 +828,113 @@ pub(crate) fn ps_argv(target: &ComposeTarget, project: &str, c: &ComposeSpec) ->
     v
 }
 
+/// Compose prefix for a pinned effective config.
+fn pinned_prefix(
+    target: &ComposeTarget,
+    project: &str,
+    pinned: &Path,
+    project_dir: &Path,
+) -> Vec<String> {
+    let mut v = target.engine.clone();
+    v.extend([
+        "-f".into(),
+        pinned.to_string_lossy().into_owned(),
+        "--project-directory".into(),
+        project_dir.to_string_lossy().into_owned(),
+        "-p".into(),
+        project.to_string(),
+    ]);
+    v
+}
+
+/// `docker compose … up -d [service runServices…]` using a pinned config.
+fn pinned_up_argv(
+    target: &ComposeTarget,
+    project: &str,
+    c: &ComposeSpec,
+    pinned: &Path,
+    project_dir: &Path,
+) -> Vec<String> {
+    let mut v = pinned_prefix(target, project, pinned, project_dir);
+    v.extend(["up".into(), "-d".into()]);
+    if let Some(svc) = &c.service {
+        v.push(svc.clone());
+    }
+    v.extend(c.run_services.iter().cloned());
+    v
+}
+
+/// `docker compose … ps --status running --quiet [service]` using a pinned config.
+fn pinned_ps_argv(
+    target: &ComposeTarget,
+    project: &str,
+    c: &ComposeSpec,
+    pinned: &Path,
+    project_dir: &Path,
+) -> Vec<String> {
+    let mut v = pinned_prefix(target, project, pinned, project_dir);
+    v.extend([
+        "ps".into(),
+        "--status".into(),
+        "running".into(),
+        "--quiet".into(),
+    ]);
+    if let Some(service) = &c.service {
+        v.push(service.clone());
+    }
+    v
+}
+
+struct PinnedLaunch {
+    up: Vec<String>,
+    ps: Vec<String>,
+    file: Option<PathBuf>,
+}
+
+/// Persist Compose's effective JSON and build the launch commands from it.
+/// Compose config JSON doubles literal `$` as `$$`, so parsing the pinned file
+/// preserves escaped bind sources and command strings instead of interpolating
+/// them again from the shell environment or project `.env`.
+fn pin_inspected_config(
+    state_home: &Path,
+    project: &str,
+    target: &ComposeTarget,
+    compose: &ComposeSpec,
+    output: &str,
+) -> anyhow::Result<PinnedLaunch> {
+    let first_file = compose
+        .files
+        .first()
+        .ok_or_else(|| anyhow::anyhow!("Compose config has no source file"))?;
+    let absolute_file = std::path::absolute(first_file)?;
+    let project_dir = absolute_file
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("Compose source file has no project directory"))?;
+    let directory =
+        crate::fsperm::ensure_private_dir_beneath(state_home, Path::new("thegn/compose-labels"))?;
+    let pinned =
+        directory.write_owner_only_atomic(&format!("{project}.pinned.json"), output.as_bytes())?;
+    let up = target.control_argv(&pinned_up_argv(
+        target,
+        project,
+        compose,
+        &pinned,
+        project_dir,
+    ));
+    let ps = target.control_argv(&pinned_ps_argv(
+        target,
+        project,
+        compose,
+        &pinned,
+        project_dir,
+    ));
+    Ok(PinnedLaunch {
+        up,
+        ps,
+        file: Some(pinned),
+    })
+}
+
 /// Run Compose startup and confirm at least one intended service is running.
 pub(crate) fn run_up_checked(
     up: &[String],
@@ -887,6 +1013,7 @@ fn up_attested(
     ps: &[String],
     guard: &ComposeGuard,
     timeouts: (Duration, Duration, Duration),
+    pin: impl FnOnce(&str) -> anyhow::Result<PinnedLaunch>,
 ) -> anyhow::Result<EnsureReport> {
     use crate::sandbox::proc::{Capture, ProcOutcome, run_bounded};
 
@@ -902,12 +1029,16 @@ fn up_attested(
         ProcOutcome::Exited { status, .. } => Some((status.success(), status.code())),
         ProcOutcome::Timeout | ProcOutcome::Spawn | ProcOutcome::Wait | ProcOutcome::Read => None,
     };
+    let mut inspected_config = None;
     let verified = match status {
         Some((true, _)) => match inspection.into_stdout() {
             Some((true, output)) => {
                 match protected_binds_with_classes(&output, &guard.protected, &guard.classes) {
                     Ok(Some(refusal)) => return Err(anyhow::Error::new(refusal)),
-                    Ok(None) => None,
+                    Ok(None) => {
+                        inspected_config = Some(output);
+                        None
+                    }
                     Err(error) => {
                         return Err(anyhow::anyhow!(
                             "effective Compose config could not be verified: {error}"
@@ -930,7 +1061,22 @@ fn up_attested(
             ProcOutcome::Exited { .. } => Some("Compose config inspection failed".into()),
         },
     };
-    run_up_checked(up, ps, timeouts.1, timeouts.2)?;
+    let (launch_up, launch_ps, pinned_file) =
+        match (verified.is_none(), inspected_config.as_deref()) {
+            (true, Some(output)) => {
+                let pinned = pin(output)?;
+                (pinned.up, pinned.ps, pinned.file)
+            }
+            (true, None) => return Err(anyhow::anyhow!("inspected Compose config missing")),
+            (false, _) => (up.to_vec(), ps.to_vec(), None),
+        };
+    let launch_result = run_up_checked(&launch_up, &launch_ps, timeouts.1, timeouts.2);
+    if let Some(path) = pinned_file
+        && let Err(error) = std::fs::remove_file(path)
+    {
+        tracing::debug!(target: "thegn::sandbox", %error, "unable to remove pinned Compose config");
+    }
+    launch_result?;
     Ok(EnsureReport {
         compose_unverified: verified,
     })
@@ -998,6 +1144,7 @@ pub(crate) fn up_and_verify(
             COMPOSE_UP_TIMEOUT,
             COMPOSE_PS_TIMEOUT,
         ),
+        |output| pin_inspected_config(&state_home, &project, &target, compose, output),
     )
 }
 
@@ -1658,6 +1805,7 @@ mod tests {
                 Duration::from_secs(2),
                 Duration::from_secs(2),
             ),
+            |_| Err(anyhow::anyhow!("pin must not run after bind refusal")),
         );
         let refusal = result.unwrap_err();
         let refusal = refusal
@@ -1675,6 +1823,7 @@ mod tests {
                 Duration::from_secs(2),
                 Duration::from_secs(2),
             ),
+            |_| Err(anyhow::anyhow!("pin must not run when inspection fails")),
         )
         .unwrap();
         assert!(failed.compose_unverified.is_some());
@@ -1691,6 +1840,11 @@ mod tests {
                 Duration::from_secs(2),
                 Duration::from_secs(2),
             ),
+            |_| {
+                Err(anyhow::anyhow!(
+                    "pin must not run when inspection times out"
+                ))
+            },
         )
         .unwrap();
         assert!(timed.compose_unverified.is_some());
@@ -1724,6 +1878,7 @@ mod tests {
                     Duration::from_secs(2),
                     Duration::from_secs(2),
                 ),
+                |_| Err(anyhow::anyhow!("pin must not run for unverifiable config")),
             )
             .expect_err("successful config output that cannot be checked must refuse");
             assert!(error.to_string().contains(expected), "{error:#}");
@@ -1750,6 +1905,214 @@ mod tests {
             ),
             crate::capabilities::IsolationClass::HostProcess
         );
+    }
+
+    #[test]
+    fn pinned_up_and_ps_argv_use_only_the_pinned_file_and_project_directory() {
+        let target = ComposeTarget {
+            engine: vec!["docker".into(), "compose".into()],
+            placement: Placement::Local,
+        };
+        let compose = ComposeSpec {
+            files: vec!["/a/base.yml".into(), "/a/override.yml".into()],
+            service: Some("app".into()),
+            run_services: vec!["db".into()],
+        };
+        let pinned = Path::new("/private/effective.json");
+        let project_dir = Path::new("/a");
+        let up = pinned_up_argv(&target, "proj", &compose, pinned, project_dir);
+        let ps = pinned_ps_argv(&target, "proj", &compose, pinned, project_dir);
+        for argv in [&up, &ps] {
+            assert_eq!(argv.iter().filter(|arg| arg.as_str() == "-f").count(), 1);
+            assert!(
+                argv.windows(2)
+                    .any(|args| args == ["-f", "/private/effective.json"])
+            );
+            assert!(
+                argv.windows(2)
+                    .any(|args| args == ["--project-directory", "/a"])
+            );
+            assert!(argv.windows(2).any(|args| args == ["-p", "proj"]));
+            assert!(
+                !argv
+                    .iter()
+                    .any(|arg| arg == "/a/base.yml" || arg == "/a/override.yml")
+            );
+        }
+        assert_eq!(up.last().map(String::as_str), Some("db"));
+        assert_eq!(ps.last().map(String::as_str), Some("app"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn up_attested_launches_the_inspected_config_not_a_mutated_original() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let root = tempfile::tempdir().expect("private tempdir");
+        std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let original = root.path().join("compose.yml");
+        let pinned = root.path().join("effective.json");
+        let marker = root.path().join("launched.json");
+        let inspected = r#"{"services":{"worker":{}}}"#;
+        std::fs::write(&original, "original compose file").unwrap();
+        let config_script = format!("printf '%s' '{}'", inspected.replace('\'', "'\\''"));
+        let guard = ComposeGuard {
+            protected: Vec::new(),
+            ..Default::default()
+        };
+        let pin_original = original.clone();
+        let pin_pinned = pinned.clone();
+        let pin_marker = marker.clone();
+        let report = up_attested(
+            &shell(&config_script),
+            &shell("false"),
+            &shell("false"),
+            &guard,
+            (
+                Duration::from_secs(2),
+                Duration::from_secs(2),
+                Duration::from_secs(2),
+            ),
+            move |config| {
+                assert_eq!(config, inspected);
+                std::fs::write(&pin_original, "mutated after inspection")?;
+                std::fs::write(&pin_pinned, config)?;
+                let up = shell(&format!(
+                    "cat '{}' > '{}'",
+                    pin_pinned.display(),
+                    pin_marker.display()
+                ));
+                let ps = shell("printf 'container-id\\n'");
+                Ok(PinnedLaunch {
+                    up,
+                    ps,
+                    file: Some(pin_pinned),
+                })
+            },
+        )
+        .expect("pinned effective config launches");
+        assert!(report.compose_unverified.is_none());
+        assert_eq!(std::fs::read_to_string(marker).unwrap(), inspected);
+        assert_eq!(
+            std::fs::read_to_string(original).unwrap(),
+            "mutated after inspection"
+        );
+        assert!(!pinned.exists(), "pinned file is removed after startup");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn pin_failure_refuses_before_up() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let root = tempfile::tempdir().expect("private tempdir");
+        std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let marker = root.path().join("up-ran");
+        let config = r#"{"services":{"worker":{}}}"#;
+        let config_script = format!("printf '%s' '{}'", config.replace('\'', "'\\''"));
+        let up_script = format!("touch '{}'", marker.display());
+        let guard = ComposeGuard {
+            protected: Vec::new(),
+            ..Default::default()
+        };
+        let result = up_attested(
+            &shell(&config_script),
+            &shell(&up_script),
+            &shell("printf 'container-id\\n'"),
+            &guard,
+            (
+                Duration::from_secs(2),
+                Duration::from_secs(2),
+                Duration::from_secs(2),
+            ),
+            |_| Err(anyhow::anyhow!("cannot pin inspected Compose model")),
+        );
+        assert!(result.is_err(), "pin failure must be returned");
+        assert!(!marker.exists(), "up must not run after pin failure");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unverified_inspection_still_launches_the_original_files() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let root = tempfile::tempdir().expect("private tempdir");
+        std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let marker = root.path().join("up-ran");
+        let up_script = format!("touch '{}'", marker.display());
+        let pin_called = std::cell::Cell::new(false);
+        let guard = ComposeGuard {
+            protected: Vec::new(),
+            ..Default::default()
+        };
+        let report = up_attested(
+            &shell("exit 1"),
+            &shell(&up_script),
+            &shell("printf 'container-id\\n'"),
+            &guard,
+            (
+                Duration::from_secs(2),
+                Duration::from_secs(2),
+                Duration::from_secs(2),
+            ),
+            |_| {
+                pin_called.set(true);
+                Err(anyhow::anyhow!("pin must not run"))
+            },
+        )
+        .expect("inspection unavailable keeps the owner decision");
+        assert!(report.compose_unverified.is_some());
+        assert!(marker.exists(), "original up argv must be used");
+        assert!(
+            !pin_called.get(),
+            "pin closure is only used after verified inspection"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn pin_inspected_config_writes_owner_only_file_and_uses_compose_source_directory() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let state = crate::testenv::IsolatedState::new();
+        let target = ComposeTarget {
+            engine: vec!["docker".into(), "compose".into()],
+            placement: Placement::Local,
+        };
+        let compose = ComposeSpec {
+            files: vec![
+                "/workspace/project/compose.yml".into(),
+                "override.yml".into(),
+            ],
+            service: Some("app".into()),
+            run_services: vec!["db".into()],
+        };
+        let output = r#"{"services":{"app":{"volumes":[{"source":"$${X}"}]}}}"#;
+        let state_home = state.state_home();
+        std::fs::create_dir_all(&state_home).expect("isolated state home exists");
+        let pinned = pin_inspected_config(&state_home, "proj", &target, &compose, output)
+            .expect("effective config is pinned");
+        let file = pinned.file.as_ref().expect("pinned file is returned");
+        assert_eq!(std::fs::read_to_string(file).unwrap(), output);
+        assert_eq!(
+            std::fs::metadata(file).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        for argv in [&pinned.up, &pinned.ps] {
+            assert!(
+                argv.windows(2)
+                    .any(|args| args == ["--project-directory", "/workspace/project"])
+            );
+            assert!(
+                argv.windows(2)
+                    .any(|args| args == ["-f", file.to_str().unwrap()])
+            );
+            assert_eq!(argv.iter().filter(|arg| arg.as_str() == "-f").count(), 1);
+        }
+
+        let empty = ComposeSpec::default();
+        let result = pin_inspected_config(&state_home, "empty", &target, &empty, output);
+        match result {
+            Err(error) => assert!(error.to_string().contains("no source file")),
+            Ok(_) => panic!("missing Compose source file must refuse pinning"),
+        }
     }
 
     #[test]
@@ -1787,5 +2150,32 @@ mod tests {
             Path::new("/w/my.repo")
         ));
         assert!(!legacy_owned_by("relative/path\n", Path::new("/w/my.repo")));
+    }
+
+    #[test]
+    fn teardown_projects_for_hashes_every_worktree_path_and_adds_legacy_only_when_adopted() {
+        let state_home = tempfile::tempdir().unwrap();
+        let name = "thegn-feature";
+        let first = Path::new("/host/wt");
+        let second = Path::new("/workspace");
+        let first_hashed = hashed_project_name(name, first);
+        let second_hashed = hashed_project_name(name, second);
+
+        assert_eq!(
+            teardown_projects_for(state_home.path(), name, &[first, second, first]),
+            vec![first_hashed.clone(), second_hashed.clone()]
+        );
+        let directory = crate::fsperm::ensure_private_dir_beneath(
+            state_home.path(),
+            Path::new("thegn/compose-projects"),
+        )
+        .unwrap();
+        directory
+            .write_owner_only_atomic(&format!("{second_hashed}.adopted"), name.as_bytes())
+            .unwrap();
+        assert_eq!(
+            teardown_projects_for(state_home.path(), name, &[first, second]),
+            vec![first_hashed, second_hashed, name.to_string()]
+        );
     }
 }

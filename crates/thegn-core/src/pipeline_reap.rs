@@ -48,6 +48,8 @@ pub struct ReapFacts {
     pub report_verdict: crate::pipeline_report::Verdict,
     /// PASS reports carry a meaningful successful gate citation.
     pub report_gate_valid: bool,
+    /// The clean-worktree probe failed, so its state is unknown.
+    pub worktree_unknown: bool,
 }
 
 /// What the caller can establish about a worker from the daemon and durable
@@ -170,6 +172,11 @@ pub fn classify(row: &AgentDispatch, facts: &ReapFacts) -> ReapVerdict {
         facts.report_present && facts.report_gate_valid,
         facts.report_verdict,
     ) {
+        (true, true, crate::pipeline_report::Verdict::Pass) if facts.worktree_unknown => {
+            ReapVerdict::Unknown {
+                why: "worker is gone but its worktree status could not be observed (git status failed); retry the reap, or reconcile this row by hand",
+            }
+        }
         (true, true, crate::pipeline_report::Verdict::Pass) => ReapVerdict::CloseDone,
         (true, _, verdict)
             if facts.report_present && verdict != crate::pipeline_report::Verdict::Pass =>
@@ -313,6 +320,7 @@ mod tests {
         report_present: true,
         report_verdict: crate::pipeline_report::Verdict::Pass,
         report_gate_valid: true,
+        worktree_unknown: false,
     };
 
     #[test]
@@ -357,6 +365,46 @@ mod tests {
     }
 
     #[test]
+    fn an_exited_worker_with_unknown_worktree_status_is_never_closed_done() {
+        let facts = ReapFacts {
+            worktree_unknown: true,
+            ..GONE_COMMITTED_REPORTED
+        };
+        let verdict = classify(&row(1, S::Running), &facts);
+        assert_eq!(
+            classify(&row(1, S::Running), &GONE_COMMITTED_REPORTED),
+            ReapVerdict::CloseDone
+        );
+        assert!(
+            matches!(&verdict, ReapVerdict::Unknown { .. }),
+            "{verdict:?}"
+        );
+        assert!(!verdict.is_actionable());
+        let ReapVerdict::Unknown { why } = verdict else {
+            unreachable!("asserted unknown verdict above");
+        };
+        assert!(why.contains("retry the reap"), "{why}");
+        assert!(why.contains("reconcile"), "{why}");
+    }
+
+    #[test]
+    fn unknown_worktree_status_does_not_hide_a_missing_artifact_failure() {
+        let facts = ReapFacts {
+            worker: WorkerLiveness::Exited,
+            artifact_exists: false,
+            artifact_tracked: false,
+            report_present: false,
+            report_verdict: crate::pipeline_report::Verdict::None,
+            report_gate_valid: false,
+            worktree_unknown: true,
+        };
+        assert!(matches!(
+            classify(&row(1, S::Running), &facts),
+            ReapVerdict::MarkFailed { why } if why.contains("never written")
+        ));
+    }
+
+    #[test]
     fn committed_artifacts_with_non_pass_verdicts_need_a_lead_decision() {
         for (verdict, label) in [
             (crate::pipeline_report::Verdict::Fail, "FAIL"),
@@ -385,6 +433,7 @@ mod tests {
             report_present: false,
             report_verdict: crate::pipeline_report::Verdict::None,
             report_gate_valid: true,
+            worktree_unknown: false,
             ..GONE_COMMITTED_REPORTED
         };
         let v = classify(&row(1, S::Running), &f);
@@ -404,6 +453,7 @@ mod tests {
             report_present: false,
             report_verdict: crate::pipeline_report::Verdict::None,
             report_gate_valid: true,
+            worktree_unknown: false,
         };
         match classify(&row(1, S::Running), &f) {
             ReapVerdict::MarkFailed { why } => {
@@ -426,6 +476,7 @@ mod tests {
             report_present: false,
             report_verdict: crate::pipeline_report::Verdict::None,
             report_gate_valid: true,
+            worktree_unknown: false,
         };
         match classify(&row(1, S::Running), &f) {
             ReapVerdict::MarkFailed { why } => assert!(why.contains("never written"), "{why}"),
@@ -444,6 +495,7 @@ mod tests {
             report_present: true,
             report_verdict: crate::pipeline_report::Verdict::Pass,
             report_gate_valid: true,
+            worktree_unknown: false,
         };
         assert!(matches!(
             classify(&row(1, S::Running), &f),
@@ -470,6 +522,7 @@ mod tests {
                 report_present: false,
                 report_verdict: crate::pipeline_report::Verdict::None,
                 report_gate_valid: true,
+                worktree_unknown: false,
                 ..GONE_COMMITTED_REPORTED
             },
             _ => ReapFacts {
@@ -479,6 +532,7 @@ mod tests {
                 report_present: false,
                 report_verdict: crate::pipeline_report::Verdict::None,
                 report_gate_valid: true,
+                worktree_unknown: false,
             },
         });
         assert_eq!(out.len(), 5);

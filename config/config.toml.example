@@ -4868,7 +4868,9 @@ routing = "sequential"
 usage_aware = false
 # Enable the cross-route last-resort tier globally (a route may also opt in).
 last_resort = false
-# Streaming tunables (seconds): first-byte/peek budget, idle watchdog, heartbeat.
+# Upstream deadlines (seconds): first-byte budget and idle watchdog for
+# every call (streams too), plus the stream heartbeat.
+# Buffered calls stop after 300 s, streams after 1 hour.
 first_byte_timeout_secs = 45
 idle_timeout_secs = 120
 heartbeat_secs = 10

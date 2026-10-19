@@ -1551,6 +1551,85 @@ pub(crate) fn verify_v83_schema(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
+/// v84: key calendar components by account, UID, and normalized recurrence id.
+/// Existing cache rows become masters; clearing every cursor forces a full
+/// provider snapshot so detached components cannot remain collapsed.
+pub(crate) fn migrate_v84(conn: &Connection) -> Result<()> {
+    if has_column(conn, "calendar_events", "rid") {
+        return Ok(());
+    }
+    let tx = conn.unchecked_transaction()?;
+    tx.execute_batch(
+        "
+         CREATE TABLE calendar_events_v84 (
+             account TEXT NOT NULL,
+             uid TEXT NOT NULL,
+             calendar TEXT NOT NULL DEFAULT '',
+             start_ms INTEGER NOT NULL,
+             end_ms INTEGER NOT NULL,
+             recurring INTEGER NOT NULL DEFAULT 0,
+             json TEXT NOT NULL,
+             fetched_at INTEGER NOT NULL,
+             href TEXT,
+             rid TEXT NOT NULL DEFAULT '',
+             PRIMARY KEY (account, uid, rid)
+         );
+         INSERT INTO calendar_events_v84
+             (account, uid, calendar, start_ms, end_ms, recurring, json, fetched_at, href, rid)
+         SELECT account, uid, calendar, start_ms, end_ms, recurring, json, fetched_at, href, ''
+         FROM calendar_events;
+         DROP TABLE calendar_events;
+         ALTER TABLE calendar_events_v84 RENAME TO calendar_events;
+         CREATE INDEX calendar_events_span ON calendar_events(start_ms, end_ms);
+         CREATE INDEX calendar_events_recurring ON calendar_events(recurring);
+         CREATE INDEX calendar_events_href ON calendar_events(account, href);
+         UPDATE calendar_sync SET sync_token = '', fetched_at = 0;",
+    )?;
+    tx.commit()?;
+    // The table rebuild releases the old calendar table's pages. Reclaim
+    // those pages now so a fresh incremental-mode database does not start
+    // its maintenance cycle with migration-only freelist entries.
+    // `incremental_vacuum` frees one page per step: step it to completion.
+    let mut vacuum = conn.prepare("PRAGMA incremental_vacuum")?;
+    let mut freed = vacuum.query([])?;
+    while freed.next()?.is_some() {}
+    Ok(())
+}
+
+/// Verify the v84 recurrence key and calendar lookup indexes.
+pub(crate) fn verify_v84_schema(conn: &Connection) -> Result<()> {
+    if !has_column(conn, "calendar_events", "rid") {
+        bail!("schema v84 migration did not add calendar_events.rid");
+    }
+    let rid_pk: Option<i64> = conn
+        .query_row(
+            "SELECT pk FROM pragma_table_info('calendar_events') WHERE name = 'rid'",
+            [],
+            |row| row.get(0),
+        )
+        .optional()?;
+    if rid_pk != Some(3) {
+        bail!("schema v84 migration did not put rid in the calendar primary key");
+    }
+    for index_name in [
+        "calendar_events_span",
+        "calendar_events_recurring",
+        "calendar_events_href",
+    ] {
+        let index: Option<String> = conn
+            .query_row(
+                "SELECT name FROM sqlite_master WHERE type='index' AND name=?1",
+                [index_name],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if index.is_none() {
+            bail!("schema v84 migration did not create {index_name}");
+        }
+    }
+    Ok(())
+}
+
 /// Verify the v69 identity ledger before the schema version is stamped. A
 /// missing column/table must never look like a completed migration.
 pub(crate) fn verify_v69_schema(conn: &Connection) -> Result<()> {
@@ -2236,6 +2315,133 @@ mod tests {
             .unwrap();
         assert!(caldav_token.is_empty(), "v75 forces a CalDAV snapshot");
         assert_eq!(ics_token, "etag-1", "non-CalDAV cursors are preserved");
+    }
+
+    #[test]
+    fn v84_rebuilds_calendar_key_idempotently_and_keeps_rows() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "PRAGMA auto_vacuum=INCREMENTAL;
+             VACUUM;
+             CREATE TABLE calendar_events (
+                 account TEXT NOT NULL, uid TEXT NOT NULL, calendar TEXT NOT NULL DEFAULT '',
+                 start_ms INTEGER NOT NULL, end_ms INTEGER NOT NULL,
+                 recurring INTEGER NOT NULL DEFAULT 0, json TEXT NOT NULL,
+                 fetched_at INTEGER NOT NULL, href TEXT,
+                 PRIMARY KEY(account, uid));
+             CREATE INDEX calendar_events_span ON calendar_events(start_ms, end_ms);
+             CREATE INDEX calendar_events_recurring ON calendar_events(recurring);
+             CREATE INDEX calendar_events_href ON calendar_events(account, href);
+             INSERT INTO calendar_events VALUES ('a','one','','1','2',0,'{}',3,NULL);
+             INSERT INTO calendar_events VALUES ('a','two','','4','5',1,'{}',6,'/cal/two.ics');
+             CREATE TABLE calendar_sync (
+                 account TEXT PRIMARY KEY, provider TEXT NOT NULL DEFAULT '',
+                 sync_token TEXT NOT NULL DEFAULT '', fetched_at INTEGER NOT NULL DEFAULT 0);
+             INSERT INTO calendar_sync VALUES ('caldav','caldav','cursor-1',77);
+             INSERT INTO calendar_sync VALUES ('ics','ics_url','etag-1',88);",
+        )
+        .unwrap();
+        assert!(super::verify_v84_schema(&conn).is_err());
+
+        super::migrate_v84(&conn).unwrap();
+        super::migrate_v84(&conn).unwrap();
+        super::verify_v84_schema(&conn).unwrap();
+        let freelist_count: i64 = conn
+            .query_row("PRAGMA freelist_count", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(freelist_count, 0, "v84 migration leaves no rebuild pages");
+        let rows: Vec<(String, String, String)> = {
+            let mut stmt = conn
+                .prepare("SELECT uid, rid, json FROM calendar_events ORDER BY uid")
+                .unwrap();
+            stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+                .unwrap()
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .unwrap()
+        };
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0], ("one".into(), String::new(), "{}".into()));
+        assert_eq!(rows[1], ("two".into(), String::new(), "{}".into()));
+        let sync: Vec<(String, i64)> = {
+            let mut stmt = conn
+                .prepare("SELECT sync_token, fetched_at FROM calendar_sync ORDER BY account")
+                .unwrap();
+            stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+                .unwrap()
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .unwrap()
+        };
+        assert_eq!(sync, vec![(String::new(), 0), (String::new(), 0)]);
+    }
+
+    #[test]
+    fn v84_failure_rolls_back_calendar_rebuild() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE calendar_events (
+                 account TEXT NOT NULL, uid TEXT NOT NULL, calendar TEXT NOT NULL DEFAULT '',
+                 start_ms INTEGER NOT NULL, end_ms INTEGER NOT NULL,
+                 recurring INTEGER NOT NULL DEFAULT 0, json TEXT NOT NULL,
+                 fetched_at INTEGER NOT NULL, href TEXT,
+                 PRIMARY KEY(account, uid));
+             INSERT INTO calendar_events VALUES ('a','one','','1','2',0,'{}',3,NULL);",
+        )
+        .unwrap();
+
+        assert!(super::migrate_v84(&conn).is_err());
+        assert!(conn.is_autocommit());
+        assert!(!super::has_column(&conn, "calendar_events", "rid"));
+        let uid: String = conn
+            .query_row("SELECT uid FROM calendar_events", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(uid, "one");
+    }
+
+    #[test]
+    fn v84_master_and_overrides_survive_full_incremental_and_reload() {
+        let row = |rid: &str, start: i64| CalendarRow {
+            uid: "standup@x".into(),
+            recurrence_key: rid.into(),
+            start_ms: start,
+            end_ms: start + 1,
+            recurring: rid.is_empty(),
+            json: format!("{{\"uid\":\"standup@x\",\"rid\":\"{rid}\"}}"),
+            href: Some("/cal/random-server-key.ics".into()),
+            ..Default::default()
+        };
+        let ordered = [row("", 1), row("20261013T070000Z", 2), row("20261014", 3)];
+        let reversed = [row("20261014", 3), row("20261013T070000Z", 2), row("", 1)];
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("calendar.sqlite");
+        let db = Db::open_at(&path).unwrap();
+        db.replace_calendar_account("a", &ordered).unwrap();
+        let full = db.get_calendar_events(0, 10, &[]).unwrap();
+        assert_eq!(full.len(), 3);
+        db.replace_calendar_account("b", &reversed).unwrap();
+        assert_eq!(
+            db.get_calendar_events(0, 10, &["b".into()]).unwrap(),
+            full.iter()
+                .map(|(_, json)| ("b".to_string(), json.clone()))
+                .collect::<Vec<_>>()
+        );
+
+        db.put_calendar_events("a", &[row("", 1), row("20261013T070000Z", 2)])
+            .unwrap();
+        let incremental = db.get_calendar_events(0, 10, &["a".into()]).unwrap();
+        assert_eq!(incremental.len(), 2);
+        drop(db);
+        let db = Db::open_at(&path).unwrap();
+        assert_eq!(
+            db.get_calendar_events(0, 10, &["a".into()]).unwrap(),
+            incremental
+        );
+        db.delete_calendar_events("a", &["standup@x".into()])
+            .unwrap();
+        assert!(
+            db.get_calendar_events(0, 10, &["a".into()])
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[test]

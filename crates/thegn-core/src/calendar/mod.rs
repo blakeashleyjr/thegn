@@ -110,11 +110,11 @@ use std::sync::Arc;
 /// - Recurrence work is ~32 units per materialized occurrence (period +
 ///   candidate + filter passes).
 /// - Retained bytes are the dimension that actually binds, deliberately: at
-///   the measured ~680 bytes per occurrence a saturated account costs ~66 MB
-///   against this 64 MiB ceiling — about 1% of slack. That is the contract,
-///   not an oversight: memory, rather than an arbitrary count, is what stops
-///   an expansion. Growing [`CalEvent`] eats that slack, which is why the
-///   test above asserts the whole-account total from the MEASURED
+///   the measured 718 bytes per occurrence a saturated account costs
+///   70,364,000 bytes (about 67.1 MiB), within this 72 MiB ceiling. That is
+///   the contract, not an oversight: memory, rather than an arbitrary count,
+///   is what stops an expansion. Growing [`CalEvent`] eats that slack, which
+///   is why the test above asserts the whole-account total from the MEASURED
 ///   per-occurrence cost. When it fails, re-derive this ceiling instead of
 ///   loosening the test, or a saturated account will report its month
 ///   unavailable in production while the suite stays green.
@@ -123,7 +123,7 @@ pub const MAX_EXPANSION_SOURCE_VISITS: usize = 65_536;
 pub const MAX_EXPANSION_RECURRENCE_WORK: usize = 4_194_304;
 pub const MAX_EXPANSION_OCCURRENCES: usize = 131_072;
 pub const MAX_EXPANSION_BUCKET_ENTRIES: usize = 524_288;
-pub const MAX_EXPANSION_BYTES: usize = 64 * 1024 * 1024;
+pub const MAX_EXPANSION_BYTES: usize = 72 * 1024 * 1024;
 pub const MAX_EVENT_PAYLOAD_BYTES: usize = 1024 * 1024;
 pub const MAX_EVENT_CHILD_ENTRIES: usize = 16_384;
 
@@ -632,6 +632,10 @@ pub struct CalEvent {
     /// expander may not act on — so a rule round-trips losslessly.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub recurrence: Option<Recurrence>,
+    /// RFC 5545 `RECURRENCE-ID`: which generated occurrence of the series
+    /// this component overrides.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recurrence_id: Option<EventTime>,
     #[serde(default)]
     pub reminders: Vec<Reminder>,
     /// Provider validator for conditional fetches (an ICS `ETag`).
@@ -669,6 +673,7 @@ impl CalEvent {
             color: None,
             organizer: String::new(),
             recurrence: None,
+            recurrence_id: None,
             reminders: Vec::new(),
             etag: String::new(),
             updated_at_ms: 0,
@@ -676,9 +681,38 @@ impl CalEvent {
         }
     }
 
-    /// The globally unique id for this event.
+    /// The globally unique id for this event. A master keeps `source/uid`;
+    /// an override appends its normalized `RECURRENCE-ID` key.
     pub fn id(&self) -> EventId {
-        EventId::new(self.source.as_str(), &self.uid)
+        let base = EventId::new(self.source.as_str(), &self.uid);
+        match &self.recurrence_id {
+            None => base,
+            Some(_) => EventId(format!(
+                "{};RECURRENCE-ID={}",
+                base.0,
+                self.recurrence_key()
+            )),
+        }
+    }
+
+    /// Stable normalized key for a recurrence instance; empty for a master.
+    pub fn recurrence_key(&self) -> String {
+        let Some(time) = &self.recurrence_id else {
+            return String::new();
+        };
+        match time {
+            EventTime::Date { date } => date.format("%Y%m%d").to_string(),
+            timed => timed
+                .instant_in(chrono_tz::Tz::UTC, GapPolicy::ShiftForward)
+                .map(|at| at.format("%Y%m%dT%H%M%SZ").to_string())
+                .unwrap_or_else(|| match timed {
+                    EventTime::Date { date } => date.format("%Y%m%d").to_string(),
+                    EventTime::Zoned { local, .. } => {
+                        format!("L{}", local.format("%Y%m%dT%H%M%S"))
+                    }
+                    EventTime::Instant { at } => format!("L{}", at.format("%Y%m%dT%H%M%S")),
+                }),
+        }
     }
 
     /// Whether this event occupies whole days rather than a time span.
@@ -739,6 +773,7 @@ impl CalEvent {
             color: self.color,
             organizer: self.organizer.clone(),
             recurrence: None,
+            recurrence_id: self.recurrence_id.clone(),
             reminders: self.reminders.clone(),
             etag: self.etag.clone(),
             updated_at_ms: self.updated_at_ms,

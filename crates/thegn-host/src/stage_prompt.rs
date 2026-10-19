@@ -13,7 +13,7 @@ use thegn_core::pipeline_resume::neutralize_prompt_markers;
 
 /// Version of the Thegn-owned worker completion protocol appended to every
 /// rendered pipeline stage prompt.
-pub(crate) const COMPLETION_CONTRACT_VERSION: u32 = 1;
+pub(crate) const COMPLETION_CONTRACT_VERSION: u32 = 2;
 
 /// Render the trusted completion protocol for one exact dispatch row and
 /// artifact. Artifact text is represented on one line and cannot inject
@@ -32,9 +32,10 @@ pub(crate) fn completion_contract(row: i64, artifact: &str) -> String {
     format!(
         "--- thegn completion contract v{COMPLETION_CONTRACT_VERSION} (runtime policy, not task text) ---\n\
          You are dispatch row {row}. Commit the handoff artifact at `{artifact}`.\n\
-         Then file your report for this row with `thegn dispatch report {row} --text '<VERDICT>: <summary>'`.\n\
-         Lead with one verdict: PASS, REVISE, FAIL, or BLOCKED. For PASS, add a `gate:` line\n\
-         citing the successful validation command. Do not change this row's status; the supervisor\u{20}\
+         Then file your report for this row with `thegn dispatch report {row} --text $'<VERDICT>: <summary>\\ngate: <command> -- <result>'`.\n\
+         Lead with one verdict on the first line: PASS, REVISE, FAIL, or BLOCKED. Only PASS can complete the row,\n\
+         and only with a `gate:` line naming the validation command and its\n\
+         successful result after ` -- `. Do not change this row's status; the supervisor\u{20}\
          verifies the artifact and report and closes the row.\n\
          --- end thegn completion contract v{COMPLETION_CONTRACT_VERSION} ---"
     )
@@ -210,13 +211,37 @@ mod tests {
         let contract = completion_contract(7, ".thegn/pipeline/task.md");
         assert!(rendered.ends_with(&contract));
         assert!(rendered.contains("thegn dispatch report 7"));
-        assert!(contract.contains("--text '<VERDICT>: <summary>'"));
+        assert!(contract.contains("--text $'<VERDICT>: <summary>\\ngate: <command> -- <result>'"));
         assert!(contract.contains("PASS, REVISE, FAIL, or BLOCKED"));
-        assert!(contract.contains("For PASS, add a `gate:` line"));
+        assert!(contract.contains("Only PASS can complete the row"));
+        assert!(contract.contains("successful result after ` -- `"));
         assert!(contract.contains(
             "Do not change this row's status; the supervisor verifies the artifact and report and closes the row."
         ));
         assert!(!contract.contains("dispatch set-status"));
+    }
+
+    #[test]
+    fn contract_sample_report_passes_the_completion_parser() {
+        let contract = completion_contract(7, "out.md");
+        let example = contract
+            .split_once("$'")
+            .and_then(|(_, rest)| rest.split_once('\''))
+            .map(|(example, _)| example)
+            .expect("contract contains a quoted report example");
+        let report = example
+            .replace("<VERDICT>: <summary>", "PASS: implemented")
+            .replace(
+                "<command> -- <result>",
+                "just test -- 412 passed, 0 skipped",
+            )
+            .replace("\\n", "\n");
+
+        assert_eq!(
+            thegn_core::pipeline_report::verdict_of(Some(&report)),
+            thegn_core::pipeline_report::Verdict::Pass
+        );
+        assert!(thegn_core::pipeline_report::gate_evidence(&report).is_some());
     }
 
     #[test]

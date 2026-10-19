@@ -11,11 +11,104 @@ fn sink() -> AdmittingSink {
             mode: None,
             refusal: None,
             invalid_event: None,
+            cursor_conflict: false,
         },
         granted: Vec::new(),
         junk: Vec::new(),
         error: None,
+        saw_events: false,
+        saw_manifest: false,
     }
+}
+
+fn manifest(contributions: &str, capabilities: &str) -> String {
+    format!(
+        r#"{{"method":"manifest","params":{{"id":"p","name":"p","version":"1","api":"0.1.0","capabilities":{capabilities},"contributions":{contributions}}}}}"#
+    )
+}
+
+#[test]
+fn unknown_verb_fails_the_run() {
+    let mut sink = sink();
+    assert!(!sink.line(r#"{"method":"mystery","params":{"secret":"not echoed"}}"#));
+    assert!(
+        matches!(sink.error, Some(CalendarError::Parse(message)) if message.contains("unknown message") && !message.contains("secret"))
+    );
+}
+
+#[test]
+fn manifest_after_events_fails_the_run() {
+    let mut sink = sink();
+    assert!(sink.line(r#"{"method":"events","params":{}}"#));
+    assert!(!sink.line(&manifest("[]", "[]")));
+    assert!(
+        matches!(sink.error, Some(CalendarError::Parse(message)) if message.contains("after events"))
+    );
+}
+
+#[test]
+fn second_manifest_fails_the_run() {
+    let mut sink = sink();
+    let line = manifest("[]", "[]");
+    assert!(sink.line(&line));
+    assert!(!sink.line(&line));
+    assert!(
+        matches!(sink.error, Some(CalendarError::Parse(message)) if message.contains("second manifest"))
+    );
+}
+
+#[test]
+fn denied_capability_fails_the_run() {
+    let mut sink = sink();
+    assert!(!sink.line(&manifest("[]", r#"["network:evil.example.com"]"#)));
+    assert!(
+        matches!(sink.error, Some(CalendarError::Api(message)) if message.contains("network:evil.example.com") && message.contains("not granted"))
+    );
+}
+
+#[test]
+fn unsupported_contribution_fails_the_run() {
+    let mut sink = sink();
+    let contributions = r#"[{"id":"p.sidebar","extension_point":"SidebarTab","label":"p"}]"#;
+    assert!(!sink.line(&manifest(contributions, "[]")));
+    assert!(
+        matches!(sink.error, Some(CalendarError::Api(message)) if message.contains("SidebarTab"))
+    );
+}
+
+#[test]
+fn conflicting_sync_tokens_fail_the_run() {
+    let mut sink = sink();
+    assert!(sink.line(r#"{"method":"events","params":{"sync_token":"first"}}"#));
+    assert!(!sink.line(r#"{"method":"events","params":{"sync_token":"second"}}"#));
+    assert!(
+        matches!(sink.error, Some(CalendarError::Parse(message)) if message.contains("conflicting sync tokens") && !message.contains("first") && !message.contains("second"))
+    );
+}
+
+#[test]
+fn manifest_less_events_still_succeed() {
+    let mut sink = sink();
+    assert!(sink.line(r#"{"method":"events","params":{"sync_token":"cursor"}}"#));
+    assert!(sink.error.is_none());
+}
+
+#[test]
+fn repeated_identical_sync_token_is_accepted() {
+    let mut sink = sink();
+    assert!(sink.line(r#"{"method":"events","params":{"sync_token":"cursor"}}"#));
+    assert!(sink.line(r#"{"method":"events","params":{"sync_token":"cursor"}}"#));
+    assert!(sink.line(r#"{"method":"events","params":{"sync_token":""}}"#));
+    assert_eq!(sink.admitted.sync_token, "cursor");
+    assert!(sink.error.is_none());
+}
+
+#[test]
+fn log_before_manifest_is_fine() {
+    let mut sink = sink();
+    assert!(sink.line(r#"{"method":"log","params":{"message":"ready"}}"#));
+    assert!(sink.line(&manifest("[]", "[]")));
+    assert!(sink.error.is_none());
 }
 
 #[test]

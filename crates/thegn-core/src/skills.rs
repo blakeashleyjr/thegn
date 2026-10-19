@@ -898,6 +898,45 @@ fn classify_removal(
 mod tests {
     use super::*;
 
+    #[test]
+    fn pipeline_skill_report_templates_carry_a_passable_gate_line() {
+        let pipeline = EMBEDDED_MANIFEST
+            .iter()
+            .find(|entry| entry.name == "pipeline")
+            .expect("pipeline skill is embedded")
+            .document;
+        let templates = pipeline
+            .lines()
+            .filter(|line| line.contains("thegn dispatch report {row} --text $'"))
+            .collect::<Vec<_>>();
+        assert!(
+            !templates.is_empty(),
+            "pipeline report templates are present"
+        );
+        for template in &templates {
+            assert!(!template.contains("<done|blocked>"));
+            assert!(template.contains("\\ngate: "), "{template}");
+            assert!(template.contains(" -- "), "{template}");
+        }
+
+        let report = templates[0]
+            .split_once("$'")
+            .and_then(|(_, rest)| rest.split_once('\''))
+            .map(|(example, _)| example)
+            .expect("template contains a quoted report example")
+            .replace("<pass|revise|fail|blocked>", "pass")
+            .replace(
+                "<command> -- <result, e.g. N passed, M skipped>",
+                "just test -- 12 passed",
+            )
+            .replace("\\n", "\n");
+        assert_eq!(
+            crate::pipeline_report::verdict_of(Some(&report)),
+            crate::pipeline_report::Verdict::Pass
+        );
+        assert!(crate::pipeline_report::gate_evidence(&report).is_some());
+    }
+
     fn source(name: &str) -> SkillSource {
         SkillSource::user(format!("fixture/{name}/SKILL.md"))
     }

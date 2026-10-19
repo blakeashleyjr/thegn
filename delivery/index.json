@@ -702,7 +702,8 @@
     },
     {
       "change": "detect-active-network-kind",
-      "lifecycle": "active",
+      "lifecycle": "archived",
+      "archive_path": "openspec/changes/archive/2026-10-19-detect-active-network-kind/",
       "disposition": "alpha-delivery",
       "owners": [
         {

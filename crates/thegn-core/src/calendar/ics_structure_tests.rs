@@ -1,5 +1,55 @@
 use super::*;
 
+#[test]
+fn recurrence_id_parses_for_overrides_and_keeps_the_master() {
+    let input = "BEGIN:VCALENDAR\n\
+BEGIN:VEVENT\n\
+UID:standup@x\n\
+DTSTART;TZID=Europe/Berlin:20261012T090000\n\
+DTEND;TZID=Europe/Berlin:20261012T093000\n\
+RRULE:FREQ=DAILY;COUNT=5\n\
+END:VEVENT\n\
+BEGIN:VEVENT\n\
+UID:standup@x\n\
+RECURRENCE-ID;TZID=Europe/Berlin:20261013T090000\n\
+DTSTART;TZID=Europe/Berlin:20261013T110000\n\
+DTEND;TZID=Europe/Berlin:20261013T113000\n\
+END:VEVENT\n\
+BEGIN:VEVENT\n\
+UID:standup@x\n\
+RECURRENCE-ID;VALUE=DATE:20261014\n\
+DTSTART;VALUE=DATE:20261014\n\
+DTEND;VALUE=DATE:20261015\n\
+END:VEVENT\n\
+END:VCALENDAR";
+    let events = parse_ics(input, "UTC");
+    assert_eq!(events.len(), 3);
+    assert_eq!(events[0].recurrence_id, None);
+    assert_eq!(events[0].recurrence_key(), "");
+    assert_eq!(events[0].id().as_str(), "/standup@x");
+    assert_eq!(events[1].recurrence_key(), "20261013T070000Z");
+    assert_eq!(events[2].recurrence_key(), "20261014");
+    assert!(events[1].recurrence_id.is_some());
+    assert!(events[2].recurrence_id.is_some());
+    assert_ne!(events[0].id(), events[1].id());
+    assert_ne!(events[0].id(), events[2].id());
+    assert_ne!(events[1].id(), events[2].id());
+}
+
+#[test]
+fn duplicate_recurrence_id_quarantines_vevent() {
+    let input = one_event(
+        "UID:x\nDTSTART:20261012T090000Z\nRECURRENCE-ID:20261012T090000Z\nRECURRENCE-ID:20261013T090000Z",
+    );
+    assert!(parse_ics(&input, "UTC").is_empty());
+
+    let positive_control =
+        one_event("UID:x\nDTSTART:20261012T090000Z\nRECURRENCE-ID:20261012T090000Z");
+    let events = parse_ics(&positive_control, "UTC");
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0].recurrence_key(), "20261012T090000Z");
+}
+
 fn parse_report(input: &str) -> (Vec<CalEvent>, IcsReport) {
     let mut meter = AdmissionMeter::isolated(AdmissionBudget::default());
     let mut events = Vec::new();
