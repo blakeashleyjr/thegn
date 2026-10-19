@@ -150,12 +150,20 @@ impl ModelUpstream for OpenAiCompatUpstream {
             let headers = resp.headers().clone();
             let mut stream = resp.bytes_stream();
             let mut bytes = Vec::new();
-            loop {
+            let body_cap = if (200..300).contains(&status) {
+                usize::MAX
+            } else {
+                64 * 1024
+            };
+            while bytes.len() < body_cap {
                 match tokio::time::timeout(deadlines.idle, stream.next()).await {
                     Err(_) => return Err(anyhow::Error::new(DispatchTimeout::Idle)),
                     Ok(None) => break,
                     Ok(Some(Err(error))) => return Err(error).context("read upstream body"),
-                    Ok(Some(Ok(chunk))) => bytes.extend_from_slice(&chunk),
+                    Ok(Some(Ok(chunk))) => {
+                        let remaining = body_cap - bytes.len();
+                        bytes.extend_from_slice(&chunk[..chunk.len().min(remaining)]);
+                    }
                 }
             }
             Ok(BackendResponse {
@@ -236,12 +244,20 @@ impl ModelUpstream for AnthropicUpstream {
             let headers = resp.headers().clone();
             let mut stream = resp.bytes_stream();
             let mut raw = Vec::new();
-            loop {
+            let body_cap = if (200..300).contains(&status) {
+                usize::MAX
+            } else {
+                64 * 1024
+            };
+            while raw.len() < body_cap {
                 match tokio::time::timeout(deadlines.idle, stream.next()).await {
                     Err(_) => return Err(anyhow::Error::new(DispatchTimeout::Idle)),
                     Ok(None) => break,
                     Ok(Some(Err(error))) => return Err(error).context("read anthropic body"),
-                    Ok(Some(Ok(chunk))) => raw.extend_from_slice(&chunk),
+                    Ok(Some(Ok(chunk))) => {
+                        let remaining = body_cap - raw.len();
+                        raw.extend_from_slice(&chunk[..chunk.len().min(remaining)]);
+                    }
                 }
             }
             if !(200..300).contains(&status) {

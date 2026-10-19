@@ -298,6 +298,8 @@ where
         let mut line_buf: Vec<u8> = Vec::new();
         let mut last_data = Instant::now();
         let total_deadline = tokio::time::Instant::now() + total;
+        let total_sleep = tokio::time::sleep_until(total_deadline);
+        tokio::pin!(total_sleep);
         let mut hb = tokio::time::interval(cfg.heartbeat);
         hb.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         hb.tick().await; // consume the immediate first tick
@@ -305,7 +307,7 @@ where
         loop {
             tokio::select! {
                 biased;
-                _ = tokio::time::sleep_until(total_deadline) => {
+                _ = &mut total_sleep => {
                     tracing::warn!("stream total timeout — terminating");
                     break;
                 }
