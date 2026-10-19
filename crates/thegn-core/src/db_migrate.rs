@@ -1630,6 +1630,33 @@ pub(crate) fn verify_v84_schema(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
+/// v85: durable reason and timestamp for a forced dispatch completion.
+pub(crate) fn migrate_v85(conn: &Connection) -> Result<()> {
+    for (column, kind) in [
+        ("override_kind", "TEXT"),
+        ("override_reason", "TEXT"),
+        ("override_at_ms", "INTEGER"),
+    ] {
+        if !has_column(conn, "agent_dispatches", column) {
+            conn.execute(
+                &format!("ALTER TABLE agent_dispatches ADD COLUMN {column} {kind}"),
+                [],
+            )?;
+        }
+    }
+    Ok(())
+}
+
+/// Verify all fields of the v85 forced-completion record.
+pub(crate) fn verify_v85_schema(conn: &Connection) -> Result<()> {
+    for column in ["override_kind", "override_reason", "override_at_ms"] {
+        if !has_column(conn, "agent_dispatches", column) {
+            bail!("schema v85 migration did not add agent_dispatches.{column}");
+        }
+    }
+    Ok(())
+}
+
 /// Verify the v69 identity ledger before the schema version is stamped. A
 /// missing column/table must never look like a completed migration.
 pub(crate) fn verify_v69_schema(conn: &Connection) -> Result<()> {
@@ -2442,6 +2469,29 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn v85_adds_forced_completion_columns_idempotently_and_verifies() {
+        let fresh = Db::open_memory().unwrap();
+        super::verify_v85_schema(fresh.conn()).unwrap();
+
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE agent_dispatches (id INTEGER PRIMARY KEY, status TEXT NOT NULL);
+             PRAGMA user_version = 84;",
+        )
+        .unwrap();
+        for column in ["override_kind", "override_reason", "override_at_ms"] {
+            assert!(!has_column(&conn, "agent_dispatches", column));
+        }
+        assert!(super::verify_v85_schema(&conn).is_err());
+        super::migrate_v85(&conn).unwrap();
+        super::migrate_v85(&conn).unwrap();
+        super::verify_v85_schema(&conn).unwrap();
+        for column in ["override_kind", "override_reason", "override_at_ms"] {
+            assert!(has_column(&conn, "agent_dispatches", column));
+        }
     }
 
     #[test]

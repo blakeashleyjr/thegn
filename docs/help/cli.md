@@ -250,8 +250,10 @@ a finished row's artifact (exists under the worktree, tracked by git — exit
 2 with the reasons when not), `thegn dispatch wait [--row <id>] [--any]
 [--timeout ms]` blocks until a row's session exits (first wake wins with
 `--any`, exit 2 on timeout), and `thegn dispatch set-status <id> done`
-refuses a row whose artifact is missing or untracked unless `--force` — an
-untracked artifact is not a handoff. See [[daemon-and-sessions]] for the
+refuses a row whose artifact is missing or untracked unless you pass
+`--force --why '<reason>'`; that reason is stored on the row and shown by
+`dispatch list` and `dispatch status`. An untracked artifact is not a handoff.
+See [[daemon-and-sessions]] for the
 dispatch door (`session open --stage --issue`) that creates these rows.
 Finished rows (not review tasks) older than 90 days are pruned during
 background maintenance unless their worktree is still registered, an active
