@@ -1203,17 +1203,22 @@ mod tests {
     fn create_admission_fails_closed_when_the_list_errors() {
         let secret_error = "https://secret.example/token=abc";
         let cases = [
-            ("list error", Err(anyhow!("{secret_error}")), false),
-            ("empty list", Ok(0), true),
-            ("under cap", Ok(4), true),
-            ("at cap", Ok(5), false),
-            ("over cap", Ok(6), false),
+            (
+                "provider failure",
+                Err(anyhow!("{secret_error}")),
+                false,
+                true,
+            ),
+            ("empty list", Ok(0), true, false),
+            ("under cap", Ok(4), true, false),
+            ("at cap", Ok(5), false, false),
+            ("over cap", Ok(6), false, false),
         ];
 
-        for (case_name, listed, admits) in cases {
+        for (case_name, listed, admits, expect_list_error) in cases {
             let result = admit_create(listed, 5);
             assert_eq!(result.is_ok(), admits, "{case_name}");
-            if case_name == "list error" {
+            if expect_list_error {
                 match result {
                     Err(error) => {
                         let message = error.to_string();
