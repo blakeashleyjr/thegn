@@ -182,12 +182,22 @@ pub(crate) fn glyph_ttls() -> GlyphTtls {
             .ok()
             .and_then(|value| value.parse::<u64>().ok())
     });
-    glyph_ttls_from(
+    let ttls = glyph_ttls_from(
         busy_ms,
         safety_ms,
         active_glyph_floor(),
         model_refresh_interval(),
-    )
+    );
+    thegn_svc::git::note_glyph_rescan_bound(print_idle_bound(&ttls));
+    ttls
+}
+
+/// Strict upper bound between reads of one quiet row's glyph base: its jittered
+/// safety interval, one busy window for scheduling, and one model tick.
+pub(crate) fn print_idle_bound(ttls: &GlyphTtls) -> Duration {
+    (ttls.safety.saturating_mul(3) / 2)
+        .saturating_add(ttls.busy)
+        .saturating_add(ttls.tick)
 }
 
 /// Stable FNV-1a path hash mapped to a half-open [0, 500) permille range.
@@ -678,5 +688,33 @@ mod tests {
             .collect();
         assert!(offsets.len() >= 6);
         assert!(offsets.iter().all(|offset| *offset <= ttls.busy / 2));
+    }
+
+    #[test]
+    fn print_idle_bound_exceeds_every_jittered_safety_gap() {
+        let default = glyph_ttls_from(
+            None,
+            None,
+            Duration::from_millis(300),
+            Duration::from_secs(5),
+        );
+        assert!(print_idle_bound(&default) > Duration::from_secs(600));
+
+        for safety_ms in [60_000, 3_600_000] {
+            let ttls = glyph_ttls_from(
+                None,
+                Some(safety_ms),
+                Duration::from_millis(300),
+                Duration::from_secs(5),
+            );
+            let bound = print_idle_bound(&ttls);
+            for index in 0..64 {
+                let path = PathBuf::from(format!("/worktrees/print-bound-{index}"));
+                assert!(
+                    bound > jittered(ttls.safety, &path) + ttls.busy,
+                    "bound {bound:?} must exceed jitter and scheduling delay for {path:?}"
+                );
+            }
+        }
     }
 }
