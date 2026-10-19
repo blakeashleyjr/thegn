@@ -196,15 +196,15 @@ pub fn report_commit_binding(
 /// - Otherwise `ok` requires `exists && tracked && report_present`, an explicit
 ///   PASS, successful gate evidence, and a current report/artifact commit
 ///   binding when one is recorded. Each failed condition has a reason. The
-///   worktree status must also be observable for artifact-bearing rows; an
-///   unknown status refuses completion until verification is retried or
-///   explicitly overridden with `--force`. A plain dispatch without an
-///   artifact does not require a worktree observation.
 ///   tracked check is what catches the real pilot failure ("session
 ///   exit ≠ done": the worker wrote the file and never committed it) — git is
 ///   the source of truth, so an uncommitted artifact is not a handoff yet. The
 ///   report check gates on the worker filing a handoff summary via `thegn
 ///   dispatch report` — a row with an artifact set must also deliver a report.
+///   The worktree status must also be observable for artifact-bearing rows; an
+///   unknown status refuses completion until verification is retried or
+///   explicitly overridden with `--force`. A plain dispatch without an
+///   artifact does not require a worktree observation.
 /// - A dirty worktree is **reported, never blocking**: it is legitimate
 ///   mid-review, and the tracked check already holds the line. An unknown
 ///   worktree status does block artifact-bearing completion because cleanliness
@@ -234,7 +234,7 @@ pub fn verify_report(f: &VerifyFacts) -> VerifyReport {
     let mut warnings = Vec::new();
     if f.worktree_state == Some(WorktreeState::Unknown) {
         reasons.push(
-            "could not observe worktree status (`git status --porcelain` failed); retry verification, or `--force` to record it anyway"
+            "could not observe worktree status (`git status --porcelain` failed); retry verification"
                 .into(),
         );
     }

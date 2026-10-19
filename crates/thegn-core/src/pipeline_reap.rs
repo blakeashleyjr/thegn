@@ -167,16 +167,16 @@ pub fn classify(row: &AgentDispatch, facts: &ReapFacts) -> ReapVerdict {
         }
         WorkerLiveness::Exited => {}
     }
-    if facts.worktree_unknown {
-        return ReapVerdict::Unknown {
-            why: "worker is gone but its worktree status could not be observed (git status failed); retry the reap, or reconcile this row by hand",
-        };
-    }
     match (
         facts.artifact_tracked,
         facts.report_present && facts.report_gate_valid,
         facts.report_verdict,
     ) {
+        (true, true, crate::pipeline_report::Verdict::Pass) if facts.worktree_unknown => {
+            ReapVerdict::Unknown {
+                why: "worker is gone but its worktree status could not be observed (git status failed); retry the reap, or reconcile this row by hand",
+            }
+        }
         (true, true, crate::pipeline_report::Verdict::Pass) => ReapVerdict::CloseDone,
         (true, _, verdict)
             if facts.report_present && verdict != crate::pipeline_report::Verdict::Pass =>
@@ -371,6 +371,10 @@ mod tests {
             ..GONE_COMMITTED_REPORTED
         };
         let verdict = classify(&row(1, S::Running), &facts);
+        assert_eq!(
+            classify(&row(1, S::Running), &GONE_COMMITTED_REPORTED),
+            ReapVerdict::CloseDone
+        );
         assert!(
             matches!(&verdict, ReapVerdict::Unknown { .. }),
             "{verdict:?}"
@@ -381,6 +385,23 @@ mod tests {
         };
         assert!(why.contains("retry the reap"), "{why}");
         assert!(why.contains("reconcile"), "{why}");
+    }
+
+    #[test]
+    fn unknown_worktree_status_does_not_hide_a_missing_artifact_failure() {
+        let facts = ReapFacts {
+            worker: WorkerLiveness::Exited,
+            artifact_exists: false,
+            artifact_tracked: false,
+            report_present: false,
+            report_verdict: crate::pipeline_report::Verdict::None,
+            report_gate_valid: false,
+            worktree_unknown: true,
+        };
+        assert!(matches!(
+            classify(&row(1, S::Running), &facts),
+            ReapVerdict::MarkFailed { why } if why.contains("never written")
+        ));
     }
 
     #[test]
