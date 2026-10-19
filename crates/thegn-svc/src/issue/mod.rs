@@ -541,6 +541,7 @@ struct AccountBackend {
 
 /// The explicit provider and optional account that may receive an issue
 /// creation request.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CreateTarget {
     pub provider: String,
     pub account: Option<String>,
@@ -1311,6 +1312,27 @@ mod tests {
             )),
             Err(IssueError::NoCreateTarget { provider, account })
                 if provider == "kaneo" && account.as_deref() == Some("project")
+        ));
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn create_on_missing_provider_without_account_names_provider_and_calls_nothing() {
+        let runtime = create_runtime();
+        let mut router = IssueRouter::from_config(&IssuesConfig::default());
+        let (backend, calls) = create_backend("linear", "THE-1");
+        router
+            .push_backend("linear-account".into(), backend)
+            .unwrap();
+
+        let result = runtime.block_on(
+            router.create_issue_on(&create_target("kaneo", None), &IssueDraft::default()),
+        );
+
+        assert!(matches!(
+            result,
+            Err(IssueError::NoCreateTarget { provider, account })
+                if provider == "kaneo" && account.is_none()
         ));
         assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 0);
     }
