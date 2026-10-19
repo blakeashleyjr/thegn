@@ -13,6 +13,8 @@ pub struct FilesystemRow {
     pub fstype: String,
     pub source: String,
     pub superblock_dev: String,
+    /// Further mount points sharing this superblock that were folded into this row.
+    pub extra_mounts: u32,
     pub kind: FilesystemKind,
     pub total_bytes: Option<u64>,
     pub free_bytes: Option<u64>,
