@@ -2196,7 +2196,9 @@ mod tests {
                 sink,
                 ConnectionDeadlines {
                     write_stall: WRITE_STALL_TIMEOUT,
-                    idle: IDLE_TIMEOUT,
+                    // Advancing past the lifetime in one step would also expire a
+                    // shorter idle deadline, and select! would pick either branch.
+                    idle: LIFETIME_TIMEOUT * 2,
                     lifetime: LIFETIME_TIMEOUT,
                 },
             )
