@@ -14294,8 +14294,8 @@ async fn event_loop<T: Terminal>(
             // vanishes when the user CLICKS it (that click's hydration reaps the
             // DB row underneath, so the tab appears to disappear on click).
             // Running it here — on the coalesced periodic model refresh — clears
-            // the ghost within a tick instead. Cheap and loop-safe: it early-
-            // returns unless a local group's dir is actually gone.
+            // the ghost within a tick instead. Steady state is stat-only on the
+            // background pool; SQLite is opened only when a candidate dir is missing.
             //
             // Gate on no creation in flight: an optimistically-opened tab has a
             // session group before its worktree dir is materialized (the rename/

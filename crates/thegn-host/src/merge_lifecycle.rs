@@ -13,8 +13,10 @@
 //! — nothing in `apply` touches the session.
 
 use anyhow::Result;
+use std::collections::HashMap;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Mutex, OnceLock};
 
 use thegn_core::config::MergeQueueConfig;
 use thegn_core::db::Db;
@@ -74,6 +76,7 @@ impl VanishedTabs {
 }
 
 static RECONCILIATION_IN_FLIGHT: AtomicBool = AtomicBool::new(false);
+static REMOTE_GROUPS: OnceLock<Mutex<HashMap<String, u64>>> = OnceLock::new();
 
 struct ReconciliationCompletionGuard;
 
@@ -84,17 +87,38 @@ impl Drop for ReconciliationCompletionGuard {
 }
 
 fn sample_vanished_tabs(
-    paths: &[String],
+    groups: &[VanishedGroup],
+    is_dir: impl Fn(&str) -> bool,
     load_registry: impl FnOnce() -> anyhow::Result<(
         Vec<thegn_core::models::WorktreeRow>,
         Vec<thegn_core::models::WorkspaceRow>,
     )>,
+    remote_groups: &Mutex<HashMap<String, u64>>,
 ) -> anyhow::Result<Vec<String>> {
+    let current = groups
+        .iter()
+        .map(|group| (group.path.as_str(), group.epoch))
+        .collect::<std::collections::HashSet<_>>();
+    // RECONCILIATION_IN_FLIGHT admits only one sampler, so holding this memo
+    // lock across the registry load cannot block another concurrent sampler.
+    let mut remote = remote_groups
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    remote.retain(|path, epoch| current.contains(&(path.as_str(), *epoch)));
+    let missing: Vec<&VanishedGroup> = groups
+        .iter()
+        .filter(|group| remote.get(&group.path) != Some(&group.epoch))
+        .filter(|group| Path::new(&group.path).is_absolute() && !is_dir(&group.path))
+        .collect();
+    if missing.is_empty() {
+        return Ok(Vec::new());
+    }
     let (rows, workspaces) = load_registry()?;
     let mut gone = Vec::new();
     let mut unregistered_count = 0;
     let mut first_unregistered_path = None;
-    for path in paths {
+    for group in missing {
+        let path = &group.path;
         let is_workspace_root = workspaces
             .iter()
             .any(|workspace| workspace.repo_path == *path);
@@ -112,9 +136,8 @@ fn sample_vanished_tabs(
         };
         if !is_local_worktree {
             tracing::debug!(path, "skipping vanished-tab probe for remote worktree");
-            continue;
-        }
-        if !Path::new(path).is_dir() {
+            remote.insert(path.clone(), group.epoch);
+        } else {
             gone.push(path.clone());
         }
     }
@@ -693,51 +716,56 @@ pub(crate) fn spawn_reconcile_removed_tabs(
             epoch: g.epoch,
         })
         .collect();
-    let paths: Vec<String> = groups.iter().map(|g| g.path.clone()).collect();
-    let spawned = std::thread::Builder::new()
-        .name("thegn-vanished-tab-reconcile".into())
-        .spawn(move || {
-            // Install before any worker operation so every exit releases ownership.
-            let _completion = ReconciliationCompletionGuard;
-            crate::platform::qos::set_self(crate::platform::qos::Qos::Background);
-            let mut sampled_db = None;
-            let sample = sample_vanished_tabs(&paths, || {
+    let admission = crate::sched::spawn_bg(move || {
+        // Install before any worker operation so every exit releases ownership.
+        let _completion = ReconciliationCompletionGuard;
+        let mut sampled_db = None;
+        let remote_groups = REMOTE_GROUPS.get_or_init(|| Mutex::new(HashMap::new()));
+        let sample = sample_vanished_tabs(
+            &groups,
+            |path| Path::new(path).is_dir(),
+            || {
                 let db = Db::open()?;
                 let rows = db.worktrees()?;
                 let workspaces = db.workspaces()?;
                 sampled_db = Some(db);
                 Ok((rows, workspaces))
-            });
-            let gone = match sample {
-                Ok(gone) => gone,
-                Err(error) => {
-                    tracing::warn!(%error, "vanished-tab reconciliation sample unavailable; leaving tabs untouched");
-                    return;
-                }
-            };
-            if let Some(db) = sampled_db {
-                for path in &gone {
-                    if let Err(error) = db.del_worktree(path) {
-                        tracing::warn!(%error, path, "could not clear vanished worktree cache row");
-                    }
+            },
+            remote_groups,
+        );
+        let gone = match sample {
+            Ok(gone) => gone,
+            Err(error) => {
+                tracing::warn!(%error, "vanished-tab reconciliation sample unavailable; leaving tabs untouched");
+                return;
+            }
+        };
+        if let Some(db) = sampled_db {
+            for path in &gone {
+                if let Err(error) = db.del_worktree(path) {
+                    tracing::warn!(%error, path, "could not clear vanished worktree cache row");
                 }
             }
-            let vanished: Vec<VanishedGroup> = groups
-                .into_iter()
-                .filter(|group| gone.iter().any(|path| path == &group.path))
-                .collect();
-            if !vanished.is_empty() {
-                crate::worktree_lifecycle::send_refresh(
-                    crate::hydrate::RefreshKind::VanishedTabs(Box::new(VanishedTabs {
-                        groups: vanished,
-                    })),
-                    waker,
-                );
-            }
-        })
-        .is_ok();
-    if !spawned {
+        }
+        let vanished: Vec<VanishedGroup> = groups
+            .into_iter()
+            .filter(|group| gone.iter().any(|path| path == &group.path))
+            .collect();
+        if !vanished.is_empty() {
+            crate::worktree_lifecycle::send_refresh(
+                crate::hydrate::RefreshKind::VanishedTabs(Box::new(VanishedTabs {
+                    groups: vanished,
+                })),
+                waker,
+            );
+        }
+    });
+    if admission != crate::sched::Admission::Admitted {
         RECONCILIATION_IN_FLIGHT.store(false, Ordering::Release);
+        tracing::debug!(
+            ?admission,
+            "vanished-tab reconciliation deferred by background scheduler"
+        );
     }
 }
 
@@ -813,9 +841,17 @@ mod tests {
     fn failed_registry_sample_emits_no_removals_and_releases_worker_ownership() {
         RECONCILIATION_IN_FLIGHT.store(true, Ordering::Release);
         let _completion = ReconciliationCompletionGuard;
-        let paths = vec!["/definitely/missing/worktree".to_owned()];
-        let sample =
-            sample_vanished_tabs(&paths, || anyhow::bail!("injected database open failure"));
+        let groups = vec![VanishedGroup {
+            path: "/definitely/missing/worktree".to_owned(),
+            epoch: 1,
+        }];
+        let remote = Mutex::new(HashMap::new());
+        let sample = sample_vanished_tabs(
+            &groups,
+            |_| false,
+            || anyhow::bail!("injected database open failure"),
+            &remote,
+        );
         assert!(sample.is_err());
         assert!(
             sample
@@ -837,24 +873,131 @@ mod tests {
 
     #[test]
     fn opaque_unregistered_path_is_skipped_during_vanished_tab_sample() {
-        let sample = sample_vanished_tabs(&["provider:workspace/branch".into()], || {
-            Ok((Vec::new(), Vec::new()))
-        });
-        assert_eq!(sample.unwrap(), Vec::<String>::new());
+        let groups = vec![VanishedGroup {
+            path: "provider:workspace/branch".into(),
+            epoch: 1,
+        }];
+        let remote = Mutex::new(HashMap::new());
+        let loads = std::cell::Cell::new(0);
+        for _ in 0..2 {
+            let sample = sample_vanished_tabs(
+                &groups,
+                |_| false,
+                || {
+                    loads.set(loads.get() + 1);
+                    Ok((Vec::new(), Vec::new()))
+                },
+                &remote,
+            );
+            assert_eq!(sample.unwrap(), Vec::<String>::new());
+        }
+        assert_eq!(loads.get(), 0);
     }
 
     #[test]
-    fn registered_remote_path_is_never_probed_as_a_local_directory() {
+    fn registered_remote_path_is_not_reported_as_gone() {
         let db = Db::open_memory().unwrap();
         db.put_workspace("/repo", "repo", "git").unwrap();
         db.put_worktree("feature", "/repo", "/remote/feature", "feature", None, None)
             .unwrap();
         db.set_worktree_location("/remote/feature", r#"{"host":"build"}"#)
             .unwrap();
-        let paths = vec!["/remote/feature".to_owned()];
-        let gone =
-            sample_vanished_tabs(&paths, || Ok((db.worktrees()?, db.workspaces()?))).unwrap();
+        let groups = vec![VanishedGroup {
+            path: "/remote/feature".to_owned(),
+            epoch: 1,
+        }];
+        let remote = Mutex::new(HashMap::new());
+        let gone = sample_vanished_tabs(
+            &groups,
+            |_| false,
+            || Ok((db.worktrees()?, db.workspaces()?)),
+            &remote,
+        )
+        .unwrap();
         assert!(gone.is_empty());
+    }
+
+    #[test]
+    fn all_present_dirs_never_load_the_registry() {
+        let groups = ["/one", "/two", "/three"]
+            .into_iter()
+            .enumerate()
+            .map(|(epoch, path)| VanishedGroup {
+                path: path.to_owned(),
+                epoch: epoch as u64,
+            })
+            .collect::<Vec<_>>();
+        let remote = Mutex::new(HashMap::new());
+        let loads = std::cell::Cell::new(0);
+        let sample = sample_vanished_tabs(
+            &groups,
+            |_| true,
+            || {
+                loads.set(loads.get() + 1);
+                Ok((Vec::new(), Vec::new()))
+            },
+            &remote,
+        )
+        .unwrap();
+        assert!(sample.is_empty());
+        assert_eq!(loads.get(), 0);
+    }
+
+    #[test]
+    fn remote_group_is_not_reloaded_every_sample() {
+        let db = Db::open_memory().unwrap();
+        db.put_workspace("/repo", "repo", "git").unwrap();
+        db.put_worktree("feature", "/repo", "/remote/feature", "feature", None, None)
+            .unwrap();
+        db.set_worktree_location("/remote/feature", r#"{"host":"build"}"#)
+            .unwrap();
+        let remote = Mutex::new(HashMap::new());
+        let loads = std::cell::Cell::new(0);
+        let sample_group = |epoch| VanishedGroup {
+            path: "/remote/feature".to_owned(),
+            epoch,
+        };
+        let first_group = [sample_group(1)];
+        let first = sample_vanished_tabs(
+            &first_group,
+            |_| false,
+            || {
+                loads.set(loads.get() + 1);
+                Ok((db.worktrees()?, db.workspaces()?))
+            },
+            &remote,
+        )
+        .unwrap();
+        assert!(first.is_empty());
+        assert_eq!(loads.get(), 1);
+
+        let same_group = [sample_group(1)];
+        let second = sample_vanished_tabs(
+            &same_group,
+            |_| false,
+            || {
+                loads.set(loads.get() + 1);
+                Ok((db.worktrees()?, db.workspaces()?))
+            },
+            &remote,
+        )
+        .unwrap();
+        assert!(second.is_empty());
+        assert_eq!(loads.get(), 1);
+
+        let new_epoch = [sample_group(2)];
+        let third = sample_vanished_tabs(
+            &new_epoch,
+            |_| false,
+            || {
+                loads.set(loads.get() + 1);
+                Ok((db.worktrees()?, db.workspaces()?))
+            },
+            &remote,
+        )
+        .unwrap();
+        assert!(third.is_empty());
+        assert_eq!(loads.get(), 2);
     }
 
     #[test]
@@ -875,13 +1018,27 @@ mod tests {
             None,
         )
         .unwrap();
-        let paths = vec![
+        let paths = [
             home.to_string_lossy().into_owned(),
             gone_worktree.to_string_lossy().into_owned(),
         ];
 
-        let gone =
-            sample_vanished_tabs(&paths, || Ok((db.worktrees()?, db.workspaces()?))).unwrap();
+        let groups = paths
+            .iter()
+            .enumerate()
+            .map(|(epoch, path)| VanishedGroup {
+                path: path.clone(),
+                epoch: epoch as u64,
+            })
+            .collect::<Vec<_>>();
+        let remote = Mutex::new(HashMap::new());
+        let gone = sample_vanished_tabs(
+            &groups,
+            |path| Path::new(path).is_dir(),
+            || Ok((db.worktrees()?, db.workspaces()?)),
+            &remote,
+        )
+        .unwrap();
         assert_eq!(gone, [gone_worktree.to_string_lossy().into_owned()]);
     }
 
@@ -903,13 +1060,27 @@ mod tests {
             None,
         )
         .unwrap();
-        let paths = vec![
+        let paths = [
             "opaque:workspace/branch".into(),
             gone_worktree.to_string_lossy().into_owned(),
         ];
 
-        let gone =
-            sample_vanished_tabs(&paths, || Ok((db.worktrees()?, db.workspaces()?))).unwrap();
+        let groups = paths
+            .iter()
+            .enumerate()
+            .map(|(epoch, path)| VanishedGroup {
+                path: path.clone(),
+                epoch: epoch as u64,
+            })
+            .collect::<Vec<_>>();
+        let remote = Mutex::new(HashMap::new());
+        let gone = sample_vanished_tabs(
+            &groups,
+            |path| Path::new(path).is_dir(),
+            || Ok((db.worktrees()?, db.workspaces()?)),
+            &remote,
+        )
+        .unwrap();
         assert_eq!(gone, [gone_worktree.to_string_lossy().into_owned()]);
     }
 
