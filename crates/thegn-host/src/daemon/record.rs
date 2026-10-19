@@ -7,10 +7,11 @@
 //! closes admission. The queue holds at most 64 commands and output is split
 //! into 16 KiB chunks (1 MiB per recording), with an additional 8 MiB global
 //! permit budget covering queued and in-flight output. There is one Background
-//! thread per active recording, at most `MAX_RECORDING_WORKERS`. Timestamps are captured by the actor at
-//! observation; UTF-8 carry belongs to the worker. Queue order defines output
-//! and resize order. If queue or byte admission is full, output is dropped and
-//! a later `m` marker reports the gap; later commands cannot pass that marker.
+//! thread per active recording, at most `MAX_RECORDING_WORKERS`. Timestamps are
+//! captured by the actor at observation; UTF-8 carry belongs to the worker.
+//! Queue order defines output and resize order. If queue or byte admission is
+//! full, output is dropped and a later `m` marker reports the gap; later
+//! commands cannot pass that marker.
 //! Setup, write/flush, disconnect, and size-cap outcomes remain terminal.
 //! `Finished` means the userspace writer flushed, not that data was fsynced.
 //!
@@ -48,6 +49,7 @@ pub(super) const LATE_TIMEOUT_REASON: &str =
     "recording finalization timed out; writer may still be flushing";
 const GLOBAL_INFLIGHT_BYTES: usize = 8 * 1024 * 1024;
 const MAX_RECORDING_WORKERS: usize = 16;
+const RECORDING_THREAD_NAME: &str = "thegn-record";
 
 static RECORDING_INFLIGHT: OnceLock<Arc<AtomicUsize>> = OnceLock::new();
 static RECORDING_WORKERS: OnceLock<Arc<AtomicUsize>> = OnceLock::new();
@@ -114,6 +116,16 @@ impl std::error::Error for StartError {
             Self::Busy { .. } => None,
             Self::Io(error) => Some(error),
         }
+    }
+}
+
+pub(super) fn start_error_to_control(error: StartError) -> thegn_svc::control::ControlError {
+    match error {
+        StartError::Busy { active, limit } => {
+            let error = StartError::Busy { active, limit };
+            thegn_svc::control::ControlError::ResourceExhausted(error.to_string())
+        }
+        StartError::Io(error) => thegn_svc::control::ControlError::Internal(error.into()),
     }
 }
 
@@ -330,7 +342,7 @@ impl Recorder {
         let worker_late = Arc::clone(&late);
         let worker_path = path.clone();
         let worker = thread::Builder::new()
-            .name(format!("record-{safe}"))
+            .name(RECORDING_THREAD_NAME.to_owned())
             .spawn(move || {
                 crate::platform::qos::set_self(crate::platform::qos::Qos::Background);
                 let finished = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -1077,6 +1089,33 @@ mod tests {
         );
     }
 
+    #[test]
+    fn production_recording_thread_name_follows_linux_comm_rule() {
+        assert!(RECORDING_THREAD_NAME.starts_with("thegn-"));
+        assert!(RECORDING_THREAD_NAME.len() <= 15);
+    }
+
+    #[test]
+    fn start_errors_map_to_control_resource_exhausted_or_internal() {
+        let busy = start_error_to_control(StartError::Busy {
+            active: 16,
+            limit: 16,
+        });
+        assert!(matches!(
+            busy,
+            thegn_svc::control::ControlError::ResourceExhausted(message)
+                if message == "16 recordings are already running (limit 16); stop one first"
+        ));
+
+        let io = start_error_to_control(StartError::Io(io::Error::other("setup failed")));
+        match io {
+            thegn_svc::control::ControlError::Internal(error) => {
+                assert_eq!(error.to_string(), "setup failed");
+            }
+            other => panic!("expected Internal for I/O startup error, got {other:?}"),
+        }
+    }
+
     fn recording_config(tmp: &tempfile::TempDir) -> Config {
         Config {
             recording: thegn_core::config::RecordingConfig {
@@ -1472,7 +1511,7 @@ mod tests {
         )
         .expect("stalled worker slot");
         rec.feed(b"block on final flush");
-        let finished = rec.finish_with_timeout(Duration::from_secs(1));
+        let finished = rec.finish_with_timeout(Duration::from_millis(20));
         assert!(
             finished
                 .truncated
