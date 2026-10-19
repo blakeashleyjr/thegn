@@ -99,10 +99,11 @@ pub(crate) fn open_tab(
 /// the best-known name in `progress.branch` — so a slow (remote) host bring-up
 /// doesn't leave the sidebar empty until the off-loop worker reaches
 /// [`crate::wizard::CreateEvent::TabOpened`]. Name derivation is pure (no
-/// git/DB on the loop): `repo_slug` is already resolved at wizard open, and
-/// `branch_tab`/`provisional_worktree_path` are pure. The provisional path is
-/// domain-separated so it never names a real checkout. The worker's authoritative
-/// `TabOpened` later reconciles the name via [`reconcile_name`].
+/// git/DB on the loop): `repo_slug` is a pure prefill from the hydrated sidebar
+/// slug or the path-derived guess. `branch_tab`/`provisional_worktree_path` are
+/// pure. The provisional path is domain-separated so it never names a real
+/// checkout. The worker's authoritative `TabOpened` later corrects the slug
+/// through [`reconcile_name`].
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn open_optimistic(
     session: &mut Session,
@@ -1263,5 +1264,60 @@ mod tests {
             42,
         );
         assert_eq!(key, None);
+    }
+
+    #[test]
+    fn authoritative_slug_reconciles_optimistic_placeholder_in_place() {
+        let mut session = Session::default();
+        let mut model = FrameModel::default();
+        let mut sb = SidebarState::default();
+        let mut loading = LoadingState::default();
+        let mut creating_tabs: HashSet<Key> = HashSet::new();
+        let mut gen_tab: GenTab = HashMap::new();
+        let cfg = thegn_core::config::Config::default();
+        let root = tempfile::tempdir().unwrap();
+        let mut wizard = crate::wizard::NewWorktreeWizard::new_isolated_for_test(
+            root.path().to_path_buf(),
+            &cfg,
+        );
+        wizard.set_repo_slug("app".to_string());
+        let progress = CreationProgress::new("b".to_string());
+        let old_tab = thegn_core::repo::branch_tab("app", "b");
+        let new_tab = thegn_core::repo::branch_tab("app-2", "b");
+        let generation = 17;
+
+        open_optimistic(
+            &mut session,
+            &mut model,
+            &mut sb,
+            &mut loading,
+            &mut creating_tabs,
+            &mut gen_tab,
+            &progress,
+            generation,
+            &wizard,
+            &cfg,
+            "default",
+        );
+        open_or_reconcile(
+            &mut session,
+            &mut model,
+            &mut sb,
+            &mut loading,
+            &mut creating_tabs,
+            &mut gen_tab,
+            Some(&progress),
+            generation,
+            new_tab.clone(),
+            "/actual/worktree".to_string(),
+            "default".to_string(),
+            true,
+        );
+
+        assert_eq!(session.worktrees.len(), 1);
+        assert_eq!(session.worktrees[0].name, new_tab);
+        assert!(creating_tabs.contains(&("app-2/b".to_string(), 0)));
+        assert!(!creating_tabs.contains(&(old_tab, 0)));
+        assert_eq!(gen_tab.get(&generation), Some(&("app-2/b".to_string(), 0)));
     }
 }
