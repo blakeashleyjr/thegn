@@ -243,6 +243,12 @@ fn effective_agent_sandbox_at(
     repo_root: &std::path::Path,
     worktree: &std::path::Path,
 ) -> Result<thegn_core::config::SandboxConfig, String> {
+    if let Some(parse_error) = thegn_core::config::repo_overlay_parse_error(repo_root) {
+        return Err(format!(
+            "{} failed to parse; refusing to run the queued agent without the repo's sandbox policy",
+            parse_error.path.display()
+        ));
+    }
     let loc = thegn_core::remote::GitLoc::Local(worktree.to_path_buf());
     let env = full.resolve_env(repo_root, &loc, worktree, None);
     if env.unresolved_selection || env.is_remote() {
@@ -278,11 +284,16 @@ fn agent_floor_gate_with_effective(
         .map(|spec| scope_agent_spec(spec, worktree));
     // THE-215: a sealed profile whose sandbox could not be established must not
     // run the agent on the host — no spec skips the home gate below, so refuse.
-    if spec.is_none() && effective.profile.hides_home() {
+    if spec.is_none() && (full.sandbox.profile.hides_home() || effective.profile.hides_home()) {
+        let profile = if full.sandbox.profile.hides_home() {
+            full.sandbox.profile
+        } else {
+            effective.profile
+        };
         return AgentDispatch::InfraHold(format!(
             "profile `{}` requires a sandbox that hides $HOME, but none could be established \
              for {worktree}",
-            effective.profile.as_str()
+            profile.as_str()
         ));
     }
     // THE-215: a sealed launch that would expose the host `$HOME` is an
@@ -1133,6 +1144,7 @@ mod tests {
             r#"
                 [sandbox]
                 enabled = true
+                backend = "none"
                 network = "nat"
             "#,
         )
@@ -1140,15 +1152,20 @@ mod tests {
 
         let effective = effective_agent_sandbox_at(&full, repo.path(), repo.path()).unwrap();
         assert_eq!(effective.network, thegn_core::config::Network::None);
-        let loc = thegn_core::remote::GitLoc::Local(repo.path().to_path_buf());
-        if let Some(spec) = thegn_core::sandbox::resolve(&effective, &loc, "x") {
-            assert_eq!(spec.network, thegn_core::config::Network::None);
-        }
+        let dispatch = agent_floor_gate_with_effective(
+            &full,
+            repo.path().to_str().unwrap(),
+            thegn_core::config::IsolationFloor::Off,
+            thegn_core::config::OnFloorMiss::Degrade,
+            Ok(effective),
+        );
+        assert!(matches!(dispatch, AgentDispatch::Run(None)));
     }
 
     #[test]
-    fn remote_effective_env_holds_the_queue_agent() {
+    fn remote_global_default_env_holds_the_queue_agent() {
         let repo = tempfile::tempdir().unwrap();
+        // The global default selects `x`; the repo hint is redundant here.
         std::fs::write(repo.path().join(".thegn.toml"), "env = \"x\"\n").unwrap();
         let full: thegn_core::config::Config = toml::from_str(
             r#"
@@ -1170,6 +1187,69 @@ mod tests {
         );
         assert!(
             matches!(dispatch, AgentDispatch::InfraHold(reason) if reason.contains("effective env `x` is remote/unresolved"))
+        );
+    }
+
+    #[test]
+    fn global_sealed_profile_holds_when_effective_env_disables_backend() {
+        let repo = tempfile::tempdir().unwrap();
+        let full: thegn_core::config::Config = toml::from_str(
+            r#"
+                [sandbox]
+                enabled = true
+                backend = "none"
+                profile = "sealed"
+                isolation_floor = "off"
+                default_env = "x"
+                [env.x.sandbox]
+                backend = "none"
+                profile = "open"
+            "#,
+        )
+        .unwrap();
+        let effective = effective_agent_sandbox_at(&full, repo.path(), repo.path()).unwrap();
+        assert_eq!(effective.profile, thegn_core::config::SandboxProfile::Open);
+        assert_eq!(effective.backend, thegn_core::config::SandboxBackend::None);
+
+        let dispatch = agent_floor_gate_with_effective(
+            &full,
+            repo.path().to_str().unwrap(),
+            thegn_core::config::IsolationFloor::Off,
+            thegn_core::config::OnFloorMiss::Degrade,
+            Ok(effective),
+        );
+        assert!(
+            matches!(dispatch, AgentDispatch::InfraHold(reason) if reason.contains("profile `sealed` requires a sandbox that hides $HOME"))
+        );
+    }
+
+    #[test]
+    fn malformed_repo_overlay_holds_the_queue_agent() {
+        let repo = tempfile::tempdir().unwrap();
+        let overlay = repo.path().join(".thegn.toml");
+        std::fs::write(&overlay, "[sandbox\nnetwork = \"none\"\n").unwrap();
+        let full: thegn_core::config::Config = toml::from_str(
+            r#"
+                [sandbox]
+                enabled = true
+                network = "nat"
+            "#,
+        )
+        .unwrap();
+
+        let effective = effective_agent_sandbox_at(&full, repo.path(), repo.path());
+        assert!(
+            matches!(&effective, Err(reason) if reason.contains("refusing to run the queued agent") && reason.contains(".thegn.toml"))
+        );
+        let dispatch = agent_floor_gate_with_effective(
+            &full,
+            repo.path().to_str().unwrap(),
+            thegn_core::config::IsolationFloor::Off,
+            thegn_core::config::OnFloorMiss::Degrade,
+            effective,
+        );
+        assert!(
+            matches!(dispatch, AgentDispatch::InfraHold(reason) if reason.contains(".thegn.toml"))
         );
     }
 
