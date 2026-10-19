@@ -928,7 +928,10 @@ pub async fn main(
                 tracing::warn!(target: "thegn::sandbox", "orphan GC skipped: worktrees query failed");
                 return;
             };
-            let repo_roots = rows.iter().map(|row| std::path::Path::new(&row.repo_root));
+            let repo_roots = rows
+                .iter()
+                .map(|row| std::path::Path::new(&row.repo_root))
+                .collect::<std::collections::BTreeSet<_>>();
             if !gc_wanted_without_repo_overlay
                 && !crate::sandbox_gc_gate::repo_overlay_wants_startup_gc(
                     &startup_gc_cfg,
