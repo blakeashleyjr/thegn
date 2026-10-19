@@ -99,6 +99,7 @@ pub(in crate::monitor) struct FamilyEntry {
     pub(in crate::monitor) pid: u32,
     pub(in crate::monitor) ppid: Option<u32>,
     pub(in crate::monitor) start: crate::platform::ProcStart,
+    pub(in crate::monitor) owner: thegn_metrics::ProcOwner,
 }
 
 pub(in crate::monitor) fn refill_family(
@@ -113,6 +114,7 @@ pub(in crate::monitor) fn refill_family(
             secs: proc.start_time,
             ticks: proc.start_ticks,
         },
+        owner: proc.owner,
     }));
 }
 
@@ -127,6 +129,7 @@ pub(in crate::monitor) fn term_tree_targets(
     family: &[FamilyEntry],
     root: (u32, u64),
     self_pid: u32,
+    self_parent_pid: Option<u32>,
     out: &mut Vec<FamilyEntry>,
 ) -> TreePlan {
     out.clear();
@@ -143,11 +146,26 @@ pub(in crate::monitor) fn term_tree_targets(
     queue.push_back((root_entry, 0_usize));
     let mut truncated = false;
     let mut excluded = 0;
-    let mut contains_thegn = root_entry.pid == self_pid;
+    let mut ancestors = std::collections::BTreeSet::new();
+    let mut ancestor = self_parent_pid;
+    while let Some(pid) = ancestor {
+        if !ancestors.insert(pid) {
+            break;
+        }
+        ancestor = family
+            .iter()
+            .find(|entry| entry.pid == pid)
+            .and_then(|entry| entry.ppid);
+    }
+    let mut contains_thegn = root_entry.pid == self_pid || ancestors.contains(&root_entry.pid);
     while let Some((parent, depth)) = queue.pop_front() {
         if !visited.insert(parent.pid) {
             continue;
         }
+        contains_thegn |= matches!(
+            parent.owner,
+            thegn_metrics::ProcOwner::ThegnSelf | thegn_metrics::ProcOwner::ThegnDaemon
+        );
         if planned.len() < 256 {
             planned.push((parent, depth));
         } else {
@@ -825,7 +843,7 @@ impl MonitorOverlay {
     }
 
     /// Open a signal confirmation for the selected process. A second signal on
-    /// the just-TERMed pid escalates to KILL (a distinct, explicit second step).
+    /// a just-TERMed pid escalates to KILL where that signal is available.
     pub(in crate::monitor) fn begin_signal(&mut self) -> MonitorOutcome {
         // Copy out of the row first so the immutable borrow of `self.proc_rows`
         // ends before `self.confirm`/`self.status` are written.
@@ -836,7 +854,9 @@ impl MonitorOverlay {
         else {
             return MonitorOutcome::Pending;
         };
-        let stage = if self.last_termed == Some((pid, start_time)) {
+        let stage = if self.last_termed == Some((pid, start_time))
+            && !crate::platform::ProcSignal::Terminate.needs_confirm()
+        {
             crate::platform::ProcSignal::Kill
         } else {
             crate::platform::ProcSignal::Terminate

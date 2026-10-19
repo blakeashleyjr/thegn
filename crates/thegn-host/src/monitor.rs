@@ -1449,6 +1449,7 @@ impl MonitorOverlay {
                             &self.proc_family,
                             (pid, start_time),
                             std::process::id(),
+                            crate::platform::parent_pid(),
                             &mut targets,
                         ) {
                             tabs::procs::TreePlan::MissingRoot => {
@@ -1563,13 +1564,17 @@ impl MonitorOverlay {
                         ));
                     }
                     if excluded > 0 {
-                        status.push_str(" (first 256 only)");
+                        if vanished > 0 || refused > 0 {
+                            status.truncate(status.len() - 1);
+                            status.push_str(", first 256 only)");
+                        } else {
+                            status.push_str(" (first 256 only)");
+                        }
                     }
                     self.status = Some(status);
                 }
                 // The menu returns before this branch, so this arm is unreachable.
                 Some(menu @ Confirm::SignalMenu { .. }) => self.confirm = Some(menu),
-                Some(tree @ Confirm::SignalTree { .. }) => self.confirm = Some(tree),
                 Some(Confirm::Clean { path, label }) => {
                     self.pending_action = Some(MonitorAction::CleanWorktree(path));
                     self.status = Some(format!("cleaning {label}…"));

@@ -178,6 +178,18 @@ pub enum ProcSignal {
     Continue,
 }
 
+/// Return the actual parent pid of this process where the platform exposes it.
+/// The process sampler can omit this process from its bounded top-N snapshot.
+#[cfg(unix)]
+pub(crate) fn parent_pid() -> Option<u32> {
+    Some(std::os::unix::process::parent_id())
+}
+
+#[cfg(not(unix))]
+pub(crate) fn parent_pid() -> Option<u32> {
+    None
+}
+
 impl ProcSignal {
     /// Short signal name without the `SIG` prefix.
     pub fn label(self) -> &'static str {

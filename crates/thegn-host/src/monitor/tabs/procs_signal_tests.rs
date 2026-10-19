@@ -209,6 +209,7 @@ fn family_entry(pid: u32, ppid: Option<u32>, secs: u64) -> super::FamilyEntry {
             secs,
             ticks: Some(secs * 10),
         },
+        owner: thegn_metrics::ProcOwner::Other,
     }
 }
 
@@ -223,7 +224,7 @@ fn term_tree_targets_are_deepest_first_bounded_and_cycle_safe() {
     ];
     let mut targets = Vec::new();
     assert_eq!(
-        super::term_tree_targets(&family, (10, 100), 999, &mut targets),
+        super::term_tree_targets(&family, (10, 100), 999, None, &mut targets),
         super::TreePlan::Ready {
             truncated: false,
             excluded: 0,
@@ -234,7 +235,7 @@ fn term_tree_targets_are_deepest_first_bounded_and_cycle_safe() {
         vec![30, 20, 21, 10]
     );
     assert_eq!(
-        super::term_tree_targets(&family, (10, 100), 20, &mut targets),
+        super::term_tree_targets(&family, (10, 100), 20, None, &mut targets),
         super::TreePlan::ContainsThegn
     );
     assert!(targets.is_empty());
@@ -243,7 +244,7 @@ fn term_tree_targets_are_deepest_first_bounded_and_cycle_safe() {
         family_entry(51, Some(50), 510),
     ];
     assert_eq!(
-        super::term_tree_targets(&cycle, (50, 500), 999, &mut targets),
+        super::term_tree_targets(&cycle, (50, 500), 999, None, &mut targets),
         super::TreePlan::Ready {
             truncated: false,
             excluded: 0,
@@ -254,7 +255,7 @@ fn term_tree_targets_are_deepest_first_bounded_and_cycle_safe() {
     broad.push(family_entry(1, None, 1));
     broad.extend((2..=301).map(|pid| family_entry(pid, Some(1), u64::from(pid))));
     assert_eq!(
-        super::term_tree_targets(&broad, (1, 1), 999, &mut targets),
+        super::term_tree_targets(&broad, (1, 1), 999, None, &mut targets),
         super::TreePlan::Ready {
             truncated: true,
             excluded: 45,
@@ -262,9 +263,30 @@ fn term_tree_targets_are_deepest_first_bounded_and_cycle_safe() {
     );
     assert_eq!(targets.len(), 256);
     assert_eq!(
-        super::term_tree_targets(&family, (99, 99), 999, &mut targets),
+        super::term_tree_targets(&family, (99, 99), 999, None, &mut targets),
         super::TreePlan::MissingRoot
     );
+}
+
+#[test]
+fn term_tree_refuses_daemon_roots_and_thegn_parent_when_self_is_unsampled() {
+    let daemon = [super::FamilyEntry {
+        owner: thegn_metrics::ProcOwner::ThegnDaemon,
+        ..family_entry(10, Some(1), 100)
+    }];
+    let mut targets = Vec::new();
+    assert_eq!(
+        super::term_tree_targets(&daemon, (10, 100), 999, Some(1), &mut targets),
+        super::TreePlan::ContainsThegn
+    );
+    assert!(targets.is_empty());
+
+    let parent_only = [family_entry(10, Some(1), 100)];
+    assert_eq!(
+        super::term_tree_targets(&parent_only, (10, 100), 999, Some(10), &mut targets),
+        super::TreePlan::ContainsThegn
+    );
+    assert!(targets.is_empty());
 }
 
 fn seed_tree(overlay: &mut MonitorOverlay) {
@@ -290,7 +312,7 @@ fn term_tree_confirmation_delivers_sampled_targets_deepest_first() {
     seed_tree(&mut overlay);
     choose_tree(&mut overlay);
     assert!(
-        matches!(overlay.confirm, Some(Confirm::SignalTree { targets, .. }) if targets.len() == 4)
+        matches!(&overlay.confirm, Some(Confirm::SignalTree { targets, .. }) if targets.len() == 4)
     );
     let prefs = crate::monitor::MonitorPrefs::default();
     let line = crate::monitor::footer::line(crate::monitor::footer::FooterInput {
@@ -307,14 +329,19 @@ fn term_tree_confirmation_delivers_sampled_targets_deepest_first() {
         board_panels: 0,
         board_zoomed: false,
     });
-    let text = match line {
-        crate::seg::Line::Split { l, .. } => l
-            .iter()
-            .flat_map(|part| part.text.chars())
-            .collect::<String>(),
+    let (text, hint) = match line {
+        crate::seg::Line::Split { l, r } => (
+            l.iter()
+                .flat_map(|part| part.text.chars())
+                .collect::<String>(),
+            r.iter()
+                .flat_map(|part| part.text.chars())
+                .collect::<String>(),
+        ),
         _ => panic!("tree confirmation should own the footer"),
     };
     assert!(text.contains("4 sampled processes"));
+    assert_eq!(hint, "y yes  n no");
     key(&mut overlay, KeyCode::Char('y'));
     assert_eq!(
         super::test_signal_records(),
@@ -364,9 +391,16 @@ fn missing_selection_does_not_open_and_vanished_identity_is_refused() {
     assert!(empty.confirm.is_none());
 
     let mut vanished = make_overlay();
+    let Some(signal) = crate::platform::ProcSignal::menu()
+        .iter()
+        .copied()
+        .find(|signal| !signal.needs_confirm())
+    else {
+        return;
+    };
     key(&mut vanished, KeyCode::Char('X'));
     vanished.proc_rows.clear();
-    key(&mut vanished, KeyCode::Char('t'));
+    key(&mut vanished, KeyCode::Char(signal.menu_key()));
     assert!(vanished.confirm.is_none());
     assert!(vanished.status.as_deref().is_some_and(|s| {
         s.contains("process changed or left the sampled list; select it again")
@@ -491,6 +525,23 @@ fn signal_confirmation_policy_matches_the_platform_menu() {
             })
         ));
     }
+}
+
+#[test]
+fn repeated_terminate_on_windows_confirms_terminate_without_escalating_to_kill() {
+    if !crate::platform::ProcSignal::Terminate.needs_confirm() {
+        return;
+    }
+    let mut overlay = make_overlay();
+    overlay.last_termed = Some((4242, 17));
+    overlay.begin_signal();
+    assert!(matches!(
+        overlay.confirm,
+        Some(Confirm::Signal {
+            stage: crate::platform::ProcSignal::Terminate,
+            ..
+        })
+    ));
 }
 
 #[test]
