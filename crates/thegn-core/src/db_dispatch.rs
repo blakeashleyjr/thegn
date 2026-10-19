@@ -11,6 +11,16 @@ use rusqlite::OptionalExtension as _;
 
 pub const MIN_LEASE_TTL_SECS: i64 = 5;
 pub const MAX_LEASE_TTL_SECS: i64 = 86_400;
+pub const FORCE_REASON_MAX_CHARS: usize = 512;
+pub const OVERRIDE_FORCE_DONE: &str = "force_done";
+
+/// Durable evidence that a dispatch gate was overridden.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct DispatchOverride {
+    pub kind: String,
+    pub reason: String,
+    pub at_ms: i64,
+}
 
 /// A pipeline lease identity or lifetime violates the admission contract.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -303,6 +313,100 @@ impl Db {
             }));
         }
         Ok(())
+    }
+
+    /// Atomically record a forced completion, its reason, and its status note.
+    pub fn set_dispatch_status_forced(
+        &self,
+        id: i64,
+        expected: AgentDispatchStatus,
+        to: AgentDispatchStatus,
+        reason: &str,
+    ) -> Result<()> {
+        if self.get_dispatch(id)?.is_none() {
+            anyhow::bail!("no dispatch with id {id}");
+        }
+        if !set_status_transition_allowed(expected, to) {
+            return Err(anyhow::Error::new(DispatchTransitionConflict::Illegal {
+                id,
+                from: expected,
+                to,
+            }));
+        }
+        if to != AgentDispatchStatus::Done {
+            anyhow::bail!("dispatch override only supports the done gate");
+        }
+        let reason = crate::pipeline_report::note_text(reason)
+            .map_err(|error| anyhow::anyhow!("invalid force reason: {error}"))?;
+        if reason.chars().count() > FORCE_REASON_MAX_CHARS {
+            anyhow::bail!("force reason exceeds {FORCE_REASON_MAX_CHARS} characters");
+        }
+        let conn = self.conn();
+        let tx = conn.unchecked_transaction()?;
+        let changed = tx.execute(
+            "UPDATE agent_dispatches SET status=?1, override_kind=?2, override_reason=?3, override_at_ms=?4 WHERE id=?5 AND status=?6",
+            rusqlite::params![
+                to.as_str(),
+                OVERRIDE_FORCE_DONE,
+                reason,
+                util::now_ms(),
+                id,
+                expected.as_str()
+            ],
+        )?;
+        if changed == 0 {
+            tx.rollback()?;
+            let actual = self
+                .get_dispatch(id)?
+                .ok_or_else(|| anyhow::anyhow!("no dispatch with id {id}"))?
+                .status;
+            return Err(anyhow::Error::new(DispatchTransitionConflict::Stale {
+                id,
+                expected,
+                actual,
+            }));
+        }
+        tx.execute(
+            "INSERT INTO agent_dispatch_notes (dispatch_id, created_at_ms, text) VALUES (?1, ?2, ?3)",
+            rusqlite::params![
+                id,
+                util::now_ms(),
+                format!("set-status done (forced): {reason}")
+            ],
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Read the durable gate override for one dispatch, if present.
+    pub fn dispatch_override(&self, id: i64) -> Result<Option<DispatchOverride>> {
+        Ok(self.conn().query_row(
+            "SELECT override_kind, override_reason, override_at_ms FROM agent_dispatches WHERE id=?1 AND override_kind IS NOT NULL",
+            [id],
+            |row| Ok(DispatchOverride {
+                kind: row.get(0)?,
+                reason: row.get(1)?,
+                at_ms: row.get(2)?,
+            }),
+        ).optional()?)
+    }
+
+    /// Read all durable dispatch gate overrides in one query.
+    pub fn dispatch_overrides(&self) -> Result<std::collections::HashMap<i64, DispatchOverride>> {
+        let mut stmt = self.conn().prepare(
+            "SELECT id, override_kind, override_reason, override_at_ms FROM agent_dispatches WHERE override_kind IS NOT NULL",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok((
+                row.get(0)?,
+                DispatchOverride {
+                    kind: row.get(1)?,
+                    reason: row.get(2)?,
+                    at_ms: row.get(3)?,
+                },
+            ))
+        })?;
+        Ok(rows.collect::<rusqlite::Result<std::collections::HashMap<_, _>>>()?)
     }
 
     /// Compact indexed projection used while a claim holds SQLite's writer lock.
@@ -3009,6 +3113,120 @@ mod tests {
             db.get_dispatch(unknown).unwrap().unwrap().status,
             AgentDispatchStatus::Abandoned
         );
+    }
+
+    #[test]
+    fn forced_done_is_atomic_bounded_and_survives_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("forced.db");
+        let id;
+        {
+            let db = Db::open_at(&path).unwrap();
+            id = put_row(&db, "linear:THE-270", "/wt/forced");
+            db.set_dispatch_status_forced(
+                id,
+                AgentDispatchStatus::Queued,
+                AgentDispatchStatus::Done,
+                "reviewed exception",
+            )
+            .unwrap();
+            let row = db.get_dispatch(id).unwrap().unwrap();
+            assert_eq!(row.status, AgentDispatchStatus::Done);
+            let override_record = db.dispatch_override(id).unwrap().unwrap();
+            assert_eq!(override_record.kind, OVERRIDE_FORCE_DONE);
+            assert_eq!(override_record.reason, "reviewed exception");
+            assert!(override_record.at_ms > 0);
+            assert_eq!(db.dispatch_note_count(id, None).unwrap(), 1);
+            let note = db.newest_dispatch_notes(id, None, 1).unwrap();
+            assert_eq!(note[0].text, "set-status done (forced): reviewed exception");
+        }
+        let reopened = Db::open_at(&path).unwrap();
+        assert_eq!(
+            reopened.dispatch_override(id).unwrap().unwrap().reason,
+            "reviewed exception"
+        );
+        assert_eq!(reopened.dispatch_overrides().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn forced_done_refuses_bad_reason_wrong_target_and_stale_cas_without_writes() {
+        let db = Db::open_memory().unwrap();
+        let id = put_row(&db, "linear:THE-270-B", "/wt/forced-bad");
+        let oversized_reason = "x".repeat(FORCE_REASON_MAX_CHARS + 1);
+        for reason in ["", "   ", oversized_reason.as_str()] {
+            assert!(
+                db.set_dispatch_status_forced(
+                    id,
+                    AgentDispatchStatus::Queued,
+                    AgentDispatchStatus::Done,
+                    reason,
+                )
+                .is_err()
+            );
+            assert_eq!(
+                db.get_dispatch(id).unwrap().unwrap().status,
+                AgentDispatchStatus::Queued
+            );
+            assert!(db.dispatch_override(id).unwrap().is_none());
+            assert_eq!(db.dispatch_note_count(id, None).unwrap(), 0);
+        }
+        assert!(
+            db.set_dispatch_status_forced(
+                id,
+                AgentDispatchStatus::Queued,
+                AgentDispatchStatus::Running,
+                "wrong gate",
+            )
+            .is_err()
+        );
+        db.update_dispatch_status(id, AgentDispatchStatus::Abandoned)
+            .unwrap();
+        let stale = db.set_dispatch_status_forced(
+            id,
+            AgentDispatchStatus::Running,
+            AgentDispatchStatus::Done,
+            "stale plan",
+        );
+        assert!(matches!(
+            stale,
+            Err(error) if matches!(
+                error.downcast_ref::<DispatchTransitionConflict>(),
+                Some(DispatchTransitionConflict::Stale { .. })
+            )
+        ));
+        assert_eq!(
+            db.get_dispatch(id).unwrap().unwrap().status,
+            AgentDispatchStatus::Abandoned
+        );
+        assert!(db.dispatch_override(id).unwrap().is_none());
+        assert_eq!(db.dispatch_note_count(id, None).unwrap(), 0);
+    }
+
+    #[test]
+    fn forced_done_rolls_back_status_and_override_when_note_insert_fails() {
+        let db = Db::open_memory().unwrap();
+        let id = put_row(&db, "linear:THE-270-ROLLBACK", "/wt/forced-rollback");
+        db.conn()
+            .execute_batch(
+                "CREATE TRIGGER reject_forced_note BEFORE INSERT ON agent_dispatch_notes
+                 BEGIN SELECT RAISE(ABORT, 'forced note rejected'); END;",
+            )
+            .unwrap();
+        assert!(
+            db.set_dispatch_status_forced(
+                id,
+                AgentDispatchStatus::Queued,
+                AgentDispatchStatus::Done,
+                "reason",
+            )
+            .is_err()
+        );
+        assert_eq!(
+            db.get_dispatch(id).unwrap().unwrap().status,
+            AgentDispatchStatus::Queued
+        );
+        assert!(db.dispatch_override(id).unwrap().is_none());
+        assert_eq!(db.dispatch_note_count(id, None).unwrap(), 0);
     }
 
     #[test]

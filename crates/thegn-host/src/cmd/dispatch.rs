@@ -179,14 +179,15 @@ pub enum Action {
         /// A member of the closed set: queued | spawning | running |
         /// waiting_human | pr_open | merged | abandoned | done | failed.
         status: String,
-        /// Record `done` even when the artifact gate refuses it. A forced
-        /// completion is printed as such, in both output modes.
+        /// Record `done` even when the artifact gate refuses it. Requires
+        /// --why; the reason is stored on the row and shown by list/status.
         #[arg(long)]
         force: bool,
-        /// Why — recorded as a note on the row. Strongly wanted for a bad
+        /// Why — required with --force and stored on the row; otherwise it is
+        /// recorded as a note. Strongly wanted for a bad
         /// outcome: 40 of the last run's 45 failed/abandoned rows recorded no
         /// reason at all, which is what made the roster unreadable after the
-        /// fact. Never required: recording a bad outcome must always be
+        /// fact. Otherwise optional: recording a bad outcome must always be
         /// possible (see `set_status`).
         #[arg(long)]
         why: Option<String>,
@@ -372,6 +373,10 @@ pub fn run(cfg: &Config, action: Action) -> Result<()> {
                 }
                 return Ok(());
             }
+            anyhow::ensure!(
+                !force,
+                "dispatch put --force only applies with --chunk (a put without a chunk has no gate to override); drop --force"
+            );
             let row = put(
                 &db,
                 NewDispatch {
@@ -386,19 +391,9 @@ pub fn run(cfg: &Config, action: Action) -> Result<()> {
                 },
             )?;
             if json {
-                let mut v = serde_json::to_value(&row)?;
-                if force {
-                    // A forced dispatch is never invisible (the set-status
-                    // done --force idiom).
-                    v["forced"] = serde_json::json!(true);
-                }
-                return super::emit_json(&v);
+                return super::emit_json(&serde_json::to_value(&row)?);
             }
-            if force {
-                outln!("dispatch {} → {} (forced)", row.id, row.status.as_str());
-            } else {
-                outln!("dispatch {} → {}", row.id, row.status.as_str());
-            }
+            outln!("dispatch {} → {}", row.id, row.status.as_str());
             Ok(())
         }
         Action::SetStatus {
@@ -1034,6 +1029,7 @@ fn lease_renewal_outcome(
 fn list(active: bool, json: bool) -> Result<()> {
     let db = Db::open()?;
     let mut rows = db.list_dispatches()?;
+    let overrides = db.dispatch_overrides()?;
     if active {
         rows.retain(|d| d.status.is_active());
     }
@@ -1044,6 +1040,7 @@ fn list(active: bool, json: bool) -> Result<()> {
         let now_ms = thegn_core::util::now_ms();
         for d in &rows {
             let mut v = serde_json::to_value(d)?;
+            annotate_override(&mut v, overrides.get(&d.id));
             // The derived liveness, so a supervisor need not re-implement the
             // exited-vs-running distinction (and get it wrong, as one did).
             v["liveness"] = serde_json::json!(pipeline_run::row_liveness(d, now_ms).token());
@@ -1111,6 +1108,7 @@ fn list(active: bool, json: bool) -> Result<()> {
             }
             _ => d.status.as_str().to_string(),
         };
+        let status_cell = status_with_override(status_cell, overrides.get(&d.id));
         // What the worker CONCLUDED, which is a different axis from what
         // happened to its row. `!` marks the pair that contradict each other.
         let verdict = pipeline_report::verdict_of(d.report.as_deref());
@@ -1127,6 +1125,7 @@ fn list(active: bool, json: bool) -> Result<()> {
             d.stage.as_deref().unwrap_or("-"),
             d.note.as_deref(),
         );
+        let note = note_with_override(&note, overrides.get(&d.id));
         // The pipeline columns print as `-` when absent rather than collapsing
         // the row's shape, so the table stays column-aligned for a roster that
         // mixes pipeline and plain dispatches.
@@ -1180,6 +1179,41 @@ fn chunk_cell(chunk_path: Option<&str>) -> String {
         })
         .map(|name| pipeline_report::display_cell(&name))
         .unwrap_or_else(|| "-".into())
+}
+
+fn annotate_override(
+    value: &mut serde_json::Value,
+    override_record: Option<&thegn_core::db::DispatchOverride>,
+) {
+    if let Some(record) = override_record {
+        value["forced"] = serde_json::json!(true);
+        value["force_reason"] = serde_json::json!(record.reason);
+        value["forced_at_ms"] = serde_json::json!(record.at_ms);
+    }
+}
+
+fn status_with_override(
+    mut status: String,
+    override_record: Option<&thegn_core::db::DispatchOverride>,
+) -> String {
+    if override_record.is_some() {
+        status.push_str("(forced)");
+    }
+    status
+}
+
+fn note_with_override(
+    note: &str,
+    override_record: Option<&thegn_core::db::DispatchOverride>,
+) -> String {
+    if let Some(record) = override_record {
+        format!(
+            "{note} (forced: {})",
+            pipeline_report::display_cell(&record.reason)
+        )
+    } else {
+        note.to_string()
+    }
 }
 
 /// The trailing `note` column: the daemon's transport-retry ledger (THE-86),
@@ -1266,6 +1300,12 @@ fn set_status_on(
     let row = db
         .get_dispatch(id)?
         .ok_or_else(|| anyhow::anyhow!("no dispatch with id {id}"))?;
+    if force && parsed != AgentDispatchStatus::Done {
+        anyhow::bail!("`--force` only overrides the `done` gate");
+    }
+    if force && why.is_none_or(|reason| reason.trim().is_empty()) {
+        anyhow::bail!("set-status done --force requires --why '<reason>' (recorded on the row)");
+    }
     if !thegn_core::db::set_status_transition_allowed(row.status, parsed) {
         return Err(anyhow::Error::new(
             thegn_core::db::DispatchTransitionConflict::Illegal {
@@ -1283,16 +1323,30 @@ fn set_status_on(
     // A supplied reason is primary audit data, not cache context: commit it
     // atomically with the status so the command cannot claim success after
     // silently losing the explanation.
-    if let Some(w) = why.map(str::trim).filter(|w| !w.is_empty()) {
+    let force_reason = if force {
+        let reason = why.ok_or_else(|| {
+            anyhow::anyhow!(
+                "set-status done --force requires --why '<reason>' (recorded on the row)"
+            )
+        })?;
+        db.set_dispatch_status_forced(id, row.status, AgentDispatchStatus::Done, reason)?;
+        Some(
+            db.dispatch_override(id)?
+                .ok_or_else(|| anyhow::anyhow!("forced completion has no stored override"))?
+                .reason,
+        )
+    } else if let Some(w) = why.map(str::trim).filter(|w| !w.is_empty()) {
         db.set_dispatch_status_checked(
             id,
             row.status,
             parsed,
             Some(&format!("set-status {}: {w}", parsed.as_str())),
         )?;
+        None
     } else {
         db.set_dispatch_status_checked(id, row.status, parsed, None)?;
-    }
+        None
+    };
     let unexplained = wants_a_reason(
         parsed,
         why.is_some_and(|w| !w.trim().is_empty()),
@@ -1304,6 +1358,7 @@ fn set_status_on(
         if force {
             // A forced completion is never invisible.
             v["forced"] = serde_json::json!(true);
+            v["force_reason"] = serde_json::json!(force_reason.as_deref().unwrap_or(""));
         }
         if unexplained {
             v["unexplained"] = serde_json::json!(true);
@@ -1311,7 +1366,11 @@ fn set_status_on(
         return super::emit_json(&v);
     }
     if force {
-        outln!("dispatch {id} → {} (forced)", parsed.as_str());
+        outln!(
+            "dispatch {id} → {} (forced: {})",
+            parsed.as_str(),
+            pipeline_report::display_cell(force_reason.as_deref().unwrap_or(""))
+        );
     } else {
         outln!("dispatch {id} → {}", parsed.as_str());
     }
@@ -2022,6 +2081,7 @@ pub(crate) fn read_status(
     };
 
     let row_mode = row.is_some();
+    let overrides = db.dispatch_overrides()?;
     let mut notes_map: HashMap<i64, Vec<DispatchNote>> = HashMap::new();
     let mut note_counts = HashMap::new();
     for r in &rows {
@@ -2035,7 +2095,7 @@ pub(crate) fn read_status(
     if json {
         if row_mode {
             let digest = digests.into_iter().next().expect("one selected row");
-            let mut v = serde_json::to_value(digest)?;
+            let mut v = serde_json::to_value(&digest)?;
             let notes = newest_status_notes(
                 notes_map
                     .get(&row.expect("row mode"))
@@ -2053,9 +2113,17 @@ pub(crate) fn read_status(
             })
             .collect::<Vec<_>>();
             v["notes"] = serde_json::Value::Array(notes);
+            annotate_override(&mut v, overrides.get(&digest.id));
             super::emit_json(&v)?;
         } else {
-            super::emit_json(&digests)?;
+            let mut values = digests
+                .iter()
+                .map(serde_json::to_value)
+                .collect::<serde_json::Result<Vec<_>>>()?;
+            for (value, digest) in values.iter_mut().zip(&digests) {
+                annotate_override(value, overrides.get(&digest.id));
+            }
+            super::emit_json(&values)?;
         }
     } else {
         for digest in &digests {
@@ -2065,14 +2133,20 @@ pub(crate) fn read_status(
                 .map(|(_, text)| text.as_str())
                 .unwrap_or("-");
             let latest = note_cell(Some(latest));
+            let forced = if let Some(entry) = overrides.get(&digest.id) {
+                format!(" forced={}", pipeline_report::display_cell(&entry.reason))
+            } else {
+                String::new()
+            };
             outln!(
-                "{} {} {} {} notes={} last={}",
+                "{} {} {} {} notes={} last={}{}",
                 digest.id,
                 digest.status,
                 pipeline_report::display_cell(digest.stage.as_deref().unwrap_or("-")),
                 pipeline_report::display_cell(&digest.issue_id),
                 digest.note_count,
-                latest
+                latest,
+                forced
             );
         }
         if row_mode {
@@ -2507,6 +2581,77 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    #[test]
+    fn forced_status_requires_done_and_a_nonblank_reason_before_writing() {
+        let (_dir, db) = db("set-status-force-reason-required");
+        let id = db
+            .put_agent_dispatch(NewDispatch::new(
+                "linear:THE-270",
+                "/wt/force-required",
+                "claude",
+            ))
+            .unwrap();
+        for why in [None, Some("  ")] {
+            assert!(set_status_on(&db, id, AgentDispatchStatus::Done, true, why, true).is_err());
+            assert_eq!(
+                db.get_dispatch(id).unwrap().unwrap().status,
+                AgentDispatchStatus::Queued
+            );
+            assert!(db.dispatch_override(id).unwrap().is_none());
+            assert_eq!(db.dispatch_note_count(id, None).unwrap(), 0);
+        }
+        assert!(
+            set_status_on(&db, id, AgentDispatchStatus::Running, true, Some("x"), true).is_err()
+        );
+        assert_eq!(
+            db.get_dispatch(id).unwrap().unwrap().status,
+            AgentDispatchStatus::Queued
+        );
+        assert!(db.dispatch_override(id).unwrap().is_none());
+    }
+
+    #[test]
+    fn forced_status_writes_reasoned_done_and_json_annotation_is_stable() {
+        let (_dir, db) = db("set-status-force-reason-write");
+        let id = db
+            .put_agent_dispatch(NewDispatch::new(
+                "linear:THE-270-W",
+                "/wt/force-write",
+                "claude",
+            ))
+            .unwrap();
+        set_status_on(
+            &db,
+            id,
+            AgentDispatchStatus::Done,
+            true,
+            Some("reviewed"),
+            true,
+        )
+        .unwrap();
+        let record = db.dispatch_override(id).unwrap().unwrap();
+        assert_eq!(record.reason, "reviewed");
+        assert_eq!(
+            db.get_dispatch(id).unwrap().unwrap().status,
+            AgentDispatchStatus::Done
+        );
+
+        let mut value = serde_json::json!({"id": id});
+        annotate_override(&mut value, Some(&record));
+        assert_eq!(value["forced"], true);
+        assert_eq!(value["force_reason"], "reviewed");
+        assert_eq!(value["forced_at_ms"], record.at_ms);
+        assert_eq!(
+            status_with_override("done".into(), Some(&record)),
+            "done(forced)"
+        );
+        assert!(note_with_override("-", Some(&record)).contains("forced: reviewed"));
+        let mut ordinary = serde_json::json!({"id": 2});
+        annotate_override(&mut ordinary, None);
+        assert!(ordinary.get("forced").is_none());
+        assert_eq!(status_with_override("queued".into(), None), "queued");
     }
 
     #[test]
