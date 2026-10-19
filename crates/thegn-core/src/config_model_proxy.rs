@@ -73,6 +73,7 @@ pub struct ProviderEntry {
     /// Lane rotation strategy: `roundrobin` | `failover` | `random` | `weighted`.
     pub key_strategy: String,
     /// Per-lane weights aligned to the resolved key order (weighted strategy).
+    /// An empty list with `weighted` selects uniform all-ones weights.
     pub key_weights: Vec<u32>,
     /// Requests per minute for this provider's shared-quota identity.
     pub rpm: f64,
@@ -763,8 +764,8 @@ mod tests {
             };
             let mut entry = provider("weighted", "env:KEY_A");
             entry.key_strategy = "weighted".into();
+            let shown = weights.clone();
             entry.key_weights = weights;
-            let weights = entry.key_weights.clone();
             config.providers.push(entry);
             assert!(
                 config
@@ -772,7 +773,7 @@ mod tests {
                     .iter()
                     .any(|error| error.contains("key_weights")),
                 "invalid weights were accepted: {:?}",
-                weights
+                shown
             );
         }
 
