@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 use crate::telemetry::{Metric, ScaleMode, SeriesBuf, SeriesReq, TelemetryHistory, Window};
 use crate::{
     compositor::Rect,
@@ -15,6 +17,7 @@ use thegn_metrics::collect::{
     instances::InstanceId,
     model::net_wifi::WifiRow,
     model::netdev::{IfaceSample, ScopeTotal},
+    policy::cgroup_classify::OwnerKind,
     policy::net_scope::Scope,
 };
 
@@ -24,36 +27,44 @@ pub(super) const THROUGHPUT: PanelId = PanelId("network.throughput");
 pub(super) const INTERFACES: PanelId = PanelId("network.interfaces");
 pub(super) const HEALTH: PanelId = PanelId("network.health");
 pub(super) const WIFI: PanelId = PanelId("network.wifi");
+pub(super) const OWNERS: PanelId = PanelId("network.owners");
 const HISTORY: usize = 120;
 pub(super) const TELEMETRY_HISTORY: usize = 480;
 pub(super) const IFACE_CAP: usize = 8;
 const IFACE_HISTORY: usize = 32;
 const WIFI_CAP: usize = 16;
 const WIFI_HISTORY: usize = 120;
+const OWNER_CAP: usize = 16;
+const OWNER_HISTORY: usize = 60;
 const VARIANTS: [Variant; 1] = [Variant {
     kind: VariantKind::Full,
     min: (24, 4),
     pref: (72, 12),
 }];
-const SPECS: [PanelSpec; 4] = [
+const SPECS: [PanelSpec; 5] = [
     PanelSpec {
         id: THROUGHPUT,
         priority: 0,
         variants: &VARIANTS,
     },
     PanelSpec {
-        id: INTERFACES,
+        id: OWNERS,
         priority: 1,
         variants: &VARIANTS,
     },
     PanelSpec {
-        id: HEALTH,
+        id: INTERFACES,
         priority: 2,
         variants: &VARIANTS,
     },
     PanelSpec {
-        id: WIFI,
+        id: HEALTH,
         priority: 3,
+        variants: &VARIANTS,
+    },
+    PanelSpec {
+        id: WIFI,
+        priority: 4,
         variants: &VARIANTS,
     },
 ];
@@ -139,6 +150,31 @@ pub(super) struct WifiHistory {
     pub(super) live: bool,
 }
 
+#[derive(Debug, Clone)]
+pub(super) struct OwnerSlot {
+    pub(super) cgroup_id: u64,
+    pub(super) kind: OwnerKind,
+    pub(super) name: Arc<[u8]>,
+    pub(super) rx_bps: f32,
+    pub(super) tx_bps: f32,
+    pub(super) history: Ring,
+    pub(super) live: bool,
+}
+
+impl Default for OwnerSlot {
+    fn default() -> Self {
+        Self {
+            cgroup_id: 0,
+            kind: OwnerKind::Other,
+            name: Arc::from([]),
+            rx_bps: 0.0,
+            tx_bps: 0.0,
+            history: Ring::new(OWNER_HISTORY),
+            live: false,
+        }
+    }
+}
+
 impl Default for WifiHistory {
     fn default() -> Self {
         Self {
@@ -163,6 +199,14 @@ pub(in crate::monitor) struct NetworkModel {
     history_buf: SeriesBuf,
     pub(super) interfaces: Vec<InterfaceHistory>,
     pub(super) wifi: Vec<WifiHistory>,
+    pub(super) owners: Vec<OwnerSlot>,
+    pub(super) owners_health: Health,
+    pub(super) owners_truncated: bool,
+    pub(super) owners_primed: bool,
+    pub(super) owners_unattributed_rx: Option<f64>,
+    pub(super) owners_unattributed_tx: Option<f64>,
+    pub(super) owners_physical_known: bool,
+    pub(super) owners_overflow: usize,
     pub(super) overflow: usize,
     pub(super) overflow_rx: Option<f64>,
     pub(super) overflow_tx: Option<f64>,
@@ -186,6 +230,14 @@ impl Default for NetworkModel {
             history_buf: SeriesBuf::default(),
             interfaces: Vec::with_capacity(IFACE_CAP),
             wifi: Vec::with_capacity(WIFI_CAP),
+            owners: Vec::new(),
+            owners_health: Health::Warming,
+            owners_truncated: false,
+            owners_primed: false,
+            owners_unattributed_rx: None,
+            owners_unattributed_tx: None,
+            owners_physical_known: false,
+            owners_overflow: 0,
             overflow: 0,
             overflow_rx: None,
             overflow_tx: None,
@@ -264,6 +316,10 @@ impl NetworkModel {
         let source = &frame.parts.netdev;
         self.health = frame.health[CollectorId::Netdev.index()];
         self.wifi_health = frame.health[CollectorId::NetWifi.index()];
+        self.owners_health = frame.health[CollectorId::NetSockets.index()];
+        if frame.sampled.contains(CollectorId::NetSockets) {
+            self.absorb_owners(frame);
+        }
         let wifi = &frame.parts.net_wifi;
         for entry in &mut self.wifi {
             entry.live = false;
@@ -362,6 +418,114 @@ impl NetworkModel {
         push_option(&mut self.error_history, self.error_total);
         push_option(&mut self.drop_history, self.drop_total);
     }
+
+    fn absorb_owners(&mut self, frame: &MonitorFrame) {
+        let part = &frame.parts.net_sockets;
+        let attribution = &part.attribution;
+        if !attribution.owners.is_empty() && self.owners.capacity() == 0 {
+            self.owners.reserve(OWNER_CAP);
+        }
+        self.owners_truncated = attribution.truncated;
+        self.owners_primed = part
+            .attribution_interval_ms
+            .is_some_and(|interval| interval > 0);
+        self.owners_physical_known = part.physical_known;
+        self.owners_unattributed_rx = if self.owners_primed {
+            rate_bytes(attribution.unattributed_rx, part.attribution_interval_ms)
+        } else {
+            None
+        };
+        self.owners_unattributed_tx = if self.owners_primed {
+            rate_bytes(attribution.unattributed_tx, part.attribution_interval_ms)
+        } else {
+            None
+        };
+        for slot in &mut self.owners {
+            slot.live = false;
+        }
+        let interval = part.attribution_interval_ms;
+        for owner in &attribution.owners {
+            if let Some(slot) = self
+                .owners
+                .iter_mut()
+                .find(|slot| slot.cgroup_id == owner.cgroup_id)
+            {
+                store_owner(
+                    slot,
+                    owner.cgroup_id,
+                    owner.kind,
+                    &owner.name,
+                    owner.rx_bytes,
+                    owner.tx_bytes,
+                    interval,
+                );
+            }
+        }
+        for owner in &attribution.owners {
+            if self
+                .owners
+                .iter()
+                .any(|slot| slot.live && slot.cgroup_id == owner.cgroup_id)
+            {
+                continue;
+            }
+            if self.owners.len() < OWNER_CAP {
+                self.owners.push(OwnerSlot::default());
+            }
+            let Some(slot) = self.owners.iter_mut().find(|slot| !slot.live) else {
+                continue;
+            };
+            store_owner(
+                slot,
+                owner.cgroup_id,
+                owner.kind,
+                &owner.name,
+                owner.rx_bytes,
+                owner.tx_bytes,
+                interval,
+            );
+        }
+        self.owners_overflow = attribution
+            .owners
+            .len()
+            .saturating_sub(self.owners.iter().filter(|slot| slot.live).count());
+    }
+}
+
+fn store_owner(
+    slot: &mut OwnerSlot,
+    cgroup_id: u64,
+    kind: OwnerKind,
+    name: &Arc<[u8]>,
+    rx_bytes: u64,
+    tx_bytes: u64,
+    interval_ms: Option<u32>,
+) {
+    if slot.cgroup_id != cgroup_id {
+        slot.history.reset();
+    }
+    slot.cgroup_id = cgroup_id;
+    slot.kind = kind;
+    slot.name.clone_from(name);
+    slot.live = true;
+    let (rx_bps, tx_bps) = interval_ms
+        .filter(|interval| *interval > 0)
+        .map(|interval| {
+            let scale = 1_000.0 / f64::from(interval);
+            (rx_bytes as f64 * scale, tx_bytes as f64 * scale)
+        })
+        .map_or((0.0, 0.0), |(rx, tx)| (rx as f32, tx as f32));
+    slot.rx_bps = rx_bps;
+    slot.tx_bps = tx_bps;
+    if interval_ms.is_some_and(|interval| interval > 0) {
+        slot.history.push(rx_bps + tx_bps);
+    }
+}
+
+fn rate_bytes(bytes: u64, interval_ms: Option<u32>) -> Option<f64> {
+    interval_ms
+        .filter(|interval| *interval > 0)
+        .map(|interval| bytes as f64 * 1_000.0 / f64::from(interval))
 }
 
 fn store_wifi_sample(entry: &mut WifiHistory, sample: &WifiRow) {
@@ -410,6 +574,7 @@ impl TabView for NetworkView<'_> {
     fn template(&self) -> Node {
         let mut panels = vec![
             (Size::Weight(2), Node::Panel(THROUGHPUT)),
+            (Size::Weight(3), Node::Panel(OWNERS)),
             (Size::Weight(3), Node::Panel(INTERFACES)),
             (Size::Fixed(5), Node::Panel(HEALTH)),
         ];
@@ -428,6 +593,9 @@ impl TabView for NetworkView<'_> {
         }
         if panel == WIFI {
             demand.insert(CollectorId::NetWifi);
+        }
+        if panel == OWNERS && !matches!(self.0.owners_health, Health::Absent(_)) {
+            demand.insert(CollectorId::NetSockets);
         }
         demand
     }
