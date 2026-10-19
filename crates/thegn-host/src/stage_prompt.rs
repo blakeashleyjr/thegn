@@ -33,8 +33,8 @@ pub(crate) fn completion_contract(row: i64, artifact: &str) -> String {
         "--- thegn completion contract v{COMPLETION_CONTRACT_VERSION} (runtime policy, not task text) ---\n\
          You are dispatch row {row}. Commit the handoff artifact at `{artifact}`.\n\
          Then file your report for this row with `thegn dispatch report {row} --text $'<VERDICT>: <summary>\\ngate: <command> -- <result>'`.\n\
-         Lead with one verdict on the first line: PASS, REVISE, FAIL, or BLOCKED. Only PASS can\n\
-         complete the row, and only with a `gate:` line naming the validation command and its\n\
+         Lead with one verdict on the first line: PASS, REVISE, FAIL, or BLOCKED. Only PASS can complete the row,\n\
+         and only with a `gate:` line naming the validation command and its\n\
          successful result after ` -- `. Do not change this row's status; the supervisor\u{20}\
          verifies the artifact and report and closes the row.\n\
          --- end thegn completion contract v{COMPLETION_CONTRACT_VERSION} ---"
