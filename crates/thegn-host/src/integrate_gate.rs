@@ -275,6 +275,19 @@ fn probe(root: &Path, args: &[&str]) -> Result<Vec<u8>> {
     })
 }
 
+fn index_matches(root: &Path, oid: &str) -> Result<()> {
+    let changed = probe(
+        root,
+        &["diff-index", "--cached", "--name-only", "-z", oid, "--"],
+    )?;
+    let paths = changed.iter().filter(|byte| **byte == 0).count();
+    ensure!(
+        paths == 0,
+        "gate changed the checkout's index: {paths} path(s) differ from the pinned commit"
+    );
+    Ok(())
+}
+
 /// A pinned OID must mean its original object, not a mutable replacement ref.
 /// Keep this consistent for probes, preparation and fresh-index materialization.
 fn gate_git(root: &Path) -> std::process::Command {
@@ -837,6 +850,11 @@ impl Workspace {
         self.checkout.verify(Some(&self.oid))
     }
 
+    fn verify_snapshot(&self) -> Result<()> {
+        self.verify()?;
+        index_matches(self.checkout.worktree.path(), &self.oid)
+    }
+
     // Cleanup is filesystem-only: descriptor-relative `remove_tree` calls
     // remove the temporary checkout and registration without spawning a child.
     fn cleanup(&self) -> Result<()> {
@@ -991,6 +1009,11 @@ impl NativeWorkspace {
         Ok(())
     }
 
+    fn verify_snapshot(&self) -> Result<()> {
+        self.verify()?;
+        index_matches(&self.worktree, &self.oid)
+    }
+
     fn command_for(&self, command: &str) -> Result<std::process::Command> {
         self.verify()?;
         let argv = thegn_core::sandbox_cpucap::wrap_background_argv(
@@ -1071,7 +1094,10 @@ fn run_native_isolated(repo: &Path, oid: &str, config: &MergeQueueConfig) -> Res
             if keep {
                 return Ok(setup_verdict);
             }
-            workspace.verify()?;
+            if let Err(error) = workspace.verify_snapshot() {
+                poisoned = true;
+                return Err(error);
+            }
             if !setup_passed {
                 return Ok(setup_verdict);
             }
@@ -1079,8 +1105,9 @@ fn run_native_isolated(repo: &Path, oid: &str, config: &MergeQueueConfig) -> Res
         let output = workspace.spawn(&config.gate_command, config.gate_timeout_secs)?;
         let (verdict, keep) = capture_verdict(output, false);
         poisoned = keep;
-        if !keep {
-            workspace.verify()?;
+        if !keep && let Err(error) = workspace.verify_snapshot() {
+            poisoned = true;
+            return Err(error);
         }
         Ok(verdict)
     })();
@@ -1115,7 +1142,11 @@ pub(super) fn run(repo: &Path, oid: &str, config: &MergeQueueConfig) -> Result<G
                 }
                 return Ok(setup_verdict);
             }
-            workspace.verify()?;
+            if let Err(error) = workspace.verify_snapshot() {
+                poisoned = true;
+                workspace.poison(&format!("{error:#}"));
+                return Err(error);
+            }
             if !setup_passed {
                 return Ok(setup_verdict);
             }
@@ -1127,8 +1158,10 @@ pub(super) fn run(repo: &Path, oid: &str, config: &MergeQueueConfig) -> Result<G
             if let GateVerdict::Error { reason, .. } = &verdict {
                 workspace.poison(reason);
             }
-        } else {
-            workspace.verify()?;
+        } else if let Err(error) = workspace.verify_snapshot() {
+            poisoned = true;
+            workspace.poison(&format!("{error:#}"));
+            return Err(error);
         }
         Ok(verdict)
     })();
