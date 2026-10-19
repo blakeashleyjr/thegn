@@ -139,7 +139,9 @@ impl ProviderBridge {
         }
     }
 
-    /// One non-blocking `provider.call` round-trip.
+    /// One non-blocking `provider.call` round-trip. Must be awaited on a Tokio
+    /// runtime with time enabled (`enable_all`). Dropping this future forgets
+    /// its pending id; any late reply is discarded by `resolve`.
     pub async fn call(
         &self,
         seam: &str,
@@ -524,8 +526,8 @@ done
         (fixture, session, bridge)
     }
 
-    #[tokio::test(flavor = "current_thread")]
-    async fn mutation_with_null_or_missing_result_is_not_success() {
+    #[test]
+    fn mutation_with_null_or_missing_result_is_not_success() {
         let script = r#"
 while read -r line; do
   id=${line#*'"id":'}; id=${id%%,*}
@@ -560,14 +562,21 @@ done
             },
         )
         .unwrap();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
 
         for result in [
-            backend.add_comment("plugin:demo:1", "comment").await,
-            backend.attach_label("plugin:demo:1", "label").await,
+            rt.block_on(backend.add_comment("plugin:demo:1", "comment")),
+            rt.block_on(backend.attach_label("plugin:demo:1", "label")),
         ] {
             assert!(matches!(result, Err(IssueError::Api(_))));
         }
-        assert!(backend.detach_label("plugin:demo:1", "label").await.is_ok());
+        assert!(
+            rt.block_on(backend.detach_label("plugin:demo:1", "label"))
+                .is_ok()
+        );
         session.kill();
     }
 
@@ -586,6 +595,7 @@ done
         .unwrap();
         assert_eq!(backend.provider_id(), "plugin:demo");
         let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
             .build()
             .unwrap();
         let issues = rt
@@ -618,6 +628,7 @@ done
             PluginIssueBackend::new(bridge.clone(), "legacy", IssueCaps::default()).unwrap();
         let before = bridge.next_id.load(std::sync::atomic::Ordering::Relaxed);
         let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
             .build()
             .unwrap();
         let err = rt
@@ -643,6 +654,7 @@ done
             .unwrap();
         let before = bridge.next_id.load(std::sync::atomic::Ordering::Relaxed);
         let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
             .build()
             .unwrap();
         let updated = rt
@@ -748,6 +760,7 @@ done
     fn router_replacement_keeps_dynamic_identity_on_async_route() {
         let (_fixture, _session, bridge) = live_bridge();
         let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
             .build()
             .unwrap();
 
@@ -770,7 +783,7 @@ done
             .unwrap_err();
         assert!(matches!(
             first_error,
-            IssueError::Api(message) if message.contains("bad get_issue reply")
+            IssueError::Api(message) if message.contains("neither result nor error")
         ));
         drop(first);
 
@@ -789,12 +802,12 @@ done
             .unwrap_err();
         assert!(matches!(
             replacement_error,
-            IssueError::Api(message) if message.contains("bad get_issue reply")
+            IssueError::Api(message) if message.contains("neither result nor error")
         ));
     }
 
-    #[tokio::test(flavor = "current_thread")]
-    async fn timeout_and_dead_session_degrade_to_errors() {
+    #[test]
+    fn timeout_and_dead_session_degrade_to_errors() {
         // A plugin that never answers: the call times out.
         let fixture = FixtureSupervisor::new();
         let session = fixture
@@ -806,17 +819,19 @@ done
             )
             .unwrap();
         let bridge = ProviderBridge::new(session.writer(), Duration::from_millis(200));
-        let err = bridge
-            .call("issues", "list_issues", serde_json::json!({}))
-            .await
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let err = rt
+            .block_on(bridge.call("issues", "list_issues", serde_json::json!({})))
             .unwrap_err();
         assert!(matches!(err, BridgeError::Transport(_)), "{err:?}");
         session.kill();
         // A dead session errors on send, not by timeout.
         std::thread::sleep(Duration::from_millis(100));
-        let err = bridge
-            .call("issues", "list_issues", serde_json::json!({}))
-            .await
+        let err = rt
+            .block_on(bridge.call("issues", "list_issues", serde_json::json!({})))
             .unwrap_err();
         assert!(matches!(err, BridgeError::Transport(_)), "{err:?}");
     }
@@ -826,8 +841,8 @@ done
         let (_fixture, _session, bridge) = live_bridge();
         assert!(!bridge.resolve(RpcResponse::ok(424242, serde_json::Value::Null)));
     }
-    #[tokio::test(flavor = "current_thread")]
-    async fn resident_final_reply_before_exit_is_delivered_and_late_call_is_closed() {
+    #[test]
+    fn resident_final_reply_before_exit_is_delivered_and_late_call_is_closed() {
         let fixture = FixtureSupervisor::new();
         let session = fixture
             .spawn(
@@ -838,10 +853,12 @@ done
             )
             .unwrap();
         let bridge = ProviderBridge::new(session.writer(), Duration::from_secs(10));
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
         assert_eq!(
-            bridge
-                .call("fixture", "last", serde_json::Value::Null)
-                .await
+            rt.block_on(bridge.call("fixture", "last", serde_json::Value::Null))
                 .unwrap(),
             serde_json::json!({"final":true})
         );
@@ -849,16 +866,14 @@ done
         assert!(report.is_settled(), "{report:?}");
         let start = std::time::Instant::now();
         assert!(
-            bridge
-                .call("fixture", "late", serde_json::Value::Null)
-                .await
+            rt.block_on(bridge.call("fixture", "late", serde_json::Value::Null))
                 .is_err()
         );
         assert!(start.elapsed() < Duration::from_millis(100));
     }
 
-    #[tokio::test(flavor = "current_thread")]
-    async fn resident_eof_fails_pending_calls_without_waiting_for_rpc_deadline() {
+    #[test]
+    fn resident_eof_fails_pending_calls_without_waiting_for_rpc_deadline() {
         let fixture = FixtureSupervisor::new();
         let session = fixture
             .spawn(
@@ -870,18 +885,20 @@ done
             .unwrap();
         let bridge = ProviderBridge::new(session.writer(), Duration::from_secs(30));
         let start = std::time::Instant::now();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
         assert!(
-            bridge
-                .call("fixture", "eof", serde_json::Value::Null)
-                .await
+            rt.block_on(bridge.call("fixture", "eof", serde_json::Value::Null))
                 .is_err()
         );
         assert!(start.elapsed() < Duration::from_secs(1));
         assert!(bridge.pending.lock().unwrap().calls.is_empty());
     }
 
-    #[tokio::test(flavor = "current_thread")]
-    async fn stalled_call_does_not_block_a_current_thread_runtime() {
+    #[test]
+    fn stalled_call_does_not_block_a_current_thread_runtime() {
         let fixture = FixtureSupervisor::new();
         let session = fixture
             .spawn(
@@ -894,24 +911,31 @@ done
         let bridge = ProviderBridge::new(session.writer(), Duration::from_millis(300));
         let beats = Arc::new(AtomicU64::new(0));
         let heartbeat_beats = beats.clone();
-        let heartbeat = tokio::spawn(async move {
-            loop {
-                tokio::time::sleep(Duration::from_millis(10)).await;
-                heartbeat_beats.fetch_add(1, Ordering::Relaxed);
-            }
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let result = rt.block_on(async {
+            let heartbeat = tokio::spawn(async move {
+                loop {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                    heartbeat_beats.fetch_add(1, Ordering::Relaxed);
+                }
+            });
+            let result = bridge
+                .call("issues", "never", serde_json::Value::Null)
+                .await;
+            heartbeat.abort();
+            result
         });
-        let result = bridge
-            .call("issues", "never", serde_json::Value::Null)
-            .await;
-        heartbeat.abort();
         assert!(matches!(result, Err(BridgeError::Transport(_))));
         assert!(beats.load(Ordering::Relaxed) >= 1);
         assert!(bridge.pending.lock().unwrap().calls.is_empty());
         session.kill();
     }
 
-    #[tokio::test(flavor = "current_thread")]
-    async fn dropped_call_future_leaves_no_pending_entry() {
+    #[test]
+    fn dropped_call_future_leaves_no_pending_entry() {
         let fixture = FixtureSupervisor::new();
         let session = fixture
             .spawn(
@@ -922,12 +946,15 @@ done
             )
             .unwrap();
         let bridge = ProviderBridge::new(session.writer(), Duration::from_secs(30));
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
         assert!(
-            tokio::time::timeout(
+            rt.block_on(tokio::time::timeout(
                 Duration::from_millis(100),
                 bridge.call("issues", "never", serde_json::Value::Null)
-            )
-            .await
+            ))
             .is_err()
         );
         assert!(bridge.pending.lock().unwrap().calls.is_empty());
@@ -942,7 +969,7 @@ done
         let replacement = super::super::session::admission::Shared::new();
         let new_bridge =
             ProviderBridge::new(SessionWriter(replacement.clone()), Duration::from_secs(1));
-        let (sender, mut receiver) = oneshot::channel();
+        let (sender, receiver) = oneshot::channel();
         new_bridge
             .pending
             .lock()
