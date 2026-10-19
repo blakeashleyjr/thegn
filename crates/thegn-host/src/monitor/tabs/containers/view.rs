@@ -9,9 +9,9 @@ use crate::{
             panel,
         },
         layout::{Node, PanelId, PanelSpec, Placed, Size, Variant, VariantKind},
-        seg::StyleTok,
     },
     sections::Section,
+    seg::StyleTok,
 };
 use std::sync::Arc;
 use termwiz::surface::Surface;
@@ -185,8 +185,11 @@ impl Default for ContainersModel {
 
 impl ContainersModel {
     pub(in crate::monitor) fn absorb_frame(&mut self, frame: &MonitorFrame) {
-        let part = &frame.parts.containers_stats;
         self.health = frame.health[CollectorId::ContainersStats.index()];
+        if !frame.sampled.contains(CollectorId::ContainersStats) {
+            return;
+        }
+        let part = &frame.parts.containers_stats;
         self.scopes = part.scopes;
         self.truncated = part.truncated;
         self.rescans = part.rescans;
@@ -425,9 +428,16 @@ impl TabView for ContainersView<'_> {
         };
         let absent = matches!(self.model.health, Health::Absent(_));
         let title = if placed.id == INVENTORY {
+            let glyphs = crate::caps::active_glyphs();
+            let sep = glyphs.middot;
+            let ge = if crate::caps::unicode_level() == thegn_core::termcaps::UnicodeLevel::Ascii {
+                ">="
+            } else {
+                "≥"
+            };
             format!(
-                "containers · {}",
-                super::ownership_note(self.inventory, self.footprint)
+                "containers {sep} {}",
+                super::ownership_note(self.inventory, self.footprint, sep, ge)
             )
         } else {
             title.to_owned()
@@ -457,7 +467,7 @@ impl TabView for ContainersView<'_> {
                     fmt_option(ring_peak_reading(&self.model.memory_total), Unit::Bytes)
                 ),
                 _ => format!(
-                    "rd / wr | scale {} B/s",
+                    "read | scale {} B/s",
                     fmt_option(
                         Some(Reading::Value(max_pair(
                             &self.model.read_total,
@@ -496,6 +506,10 @@ impl TabView for ContainersView<'_> {
                 _ => {}
             }
         }
+        if placed.id == IO && body.rows > 1 && !absent && has_history {
+            grid.view(body)
+                .put_str(0, body.rows - 1, "write", Default::default());
+        }
         Emitter::default().emit(
             &grid,
             Rect::full(rect.cols, rect.rows),
@@ -510,7 +524,9 @@ impl TabView for ContainersView<'_> {
                 Rect {
                     x: rect.x + body.x,
                     y: rect.y + body.y + 1,
-                    rows: body.rows.saturating_sub(1),
+                    rows: body
+                        .rows
+                        .saturating_sub(if placed.id == IO { 2 } else { 1 }),
                     ..body
                 },
             );
@@ -528,7 +544,23 @@ impl ContainersView<'_> {
                 .put_str(0, 0, "no containers", Default::default());
             return;
         }
-        let visible = body.rows;
+        if body.rows == 0 {
+            return;
+        }
+        let mut header = grid.view(body);
+        header.put_str(
+            0,
+            0,
+            &format!(
+                "{:<26}  {:<14}  {:<9}  {:<6}  {:<6}  net",
+                "container", "backend", "health", "cpu", "mem"
+            ),
+            Default::default(),
+        );
+        let visible = body.rows.saturating_sub(1);
+        if visible == 0 {
+            return;
+        }
         let start = self.sel.saturating_sub(visible.saturating_sub(1));
         let end = self.inventory.len().min(start.saturating_add(visible));
         for (line, (index, container)) in self
@@ -572,31 +604,43 @@ impl ContainersView<'_> {
             } else {
                 &container.net
             };
+            let name = format!(
+                "{}{mark}",
+                inventory_truncate(
+                    &container.name,
+                    26_usize.saturating_sub(mark.chars().count())
+                )
+            );
+            let backend = inventory_truncate(&container.backend, 14);
+            let cpu = if container.cpu.is_empty() {
+                crate::caps::active_glyphs().emdash.to_owned()
+            } else {
+                inventory_truncate(&container.cpu, 6)
+            };
+            let mem = if container.mem.is_empty() {
+                crate::caps::active_glyphs().emdash.to_owned()
+            } else {
+                inventory_truncate(&container.mem, 6)
+            };
             let row = format!(
-                "{}{}  {}  {}  {}  {}  {}",
-                inventory_truncate(&container.name, 24),
-                mark,
-                inventory_truncate(&container.backend, 12),
-                health,
-                if container.cpu.is_empty() {
-                    crate::caps::active_glyphs().emdash
-                } else {
-                    &container.cpu
-                },
-                if container.mem.is_empty() {
-                    crate::caps::active_glyphs().emdash
-                } else {
-                    &container.mem
-                },
+                "{}  {}  {}  {}  {}  {}",
+                inventory_pad(&name, 26),
+                inventory_pad(&backend, 14),
+                inventory_pad(health, 9),
+                inventory_pad(&cpu, 6),
+                inventory_pad(&mem, 6),
                 net
             );
-            let y = body.y + line;
-            grid.view(Rect {
-                y,
-                rows: body.rows.saturating_sub(line),
-                ..body
-            })
-            .put_str(0, 0, &row, style);
+            let y = body.y + line + 1;
+            let mut row_view = grid.view(Rect { y, rows: 1, ..body });
+            if index == self.sel {
+                row_view.fill(CellStyle {
+                    bg: style.bg,
+                    attr: style.attr,
+                    ..style
+                });
+            }
+            row_view.put_str(0, 0, &row, style);
         }
     }
 
@@ -655,6 +699,11 @@ impl ContainersView<'_> {
             } else {
                 flags
             };
+            let flags = if self.model.rescans > 0 {
+                format!("{flags} | rescans {}", self.model.rescans)
+            } else {
+                flags
+            };
             grid.view(Rect {
                 y: body.y + 2,
                 rows: body.rows - 2,
@@ -692,42 +741,32 @@ impl ContainersView<'_> {
             }
         }
         if panel_id == IO {
-            let mut down = [f32::NAN; HISTORY_CAP];
-            let write_peak = max_pair(&self.model.read_total, &self.model.write_total);
-            let down_len = self.model.write_total.ordered(&mut down);
-            if write_peak > 0.0 {
-                for val in &mut down[..down_len] {
+            let mut read = [f32::NAN; HISTORY_CAP];
+            let mut write = [f32::NAN; HISTORY_CAP];
+            let read_len = self.model.read_total.ordered(&mut read);
+            let write_len = self.model.write_total.ordered(&mut write);
+            let peak = max_pair(&self.model.read_total, &self.model.write_total);
+            if peak > 0.0 {
+                for val in &mut read[..read_len] {
                     if val.is_finite() {
-                        *val = (*val / write_peak).clamp(0.0, 1.0);
+                        *val = (*val / peak).clamp(0.0, 1.0);
+                    }
+                }
+                for val in &mut write[..write_len] {
+                    if val.is_finite() {
+                        *val = (*val / peak).clamp(0.0, 1.0);
                     }
                 }
             }
-            if len > 0 && down_len > 0 {
-                let half = graph_area.rows / 2;
-                let upper = Rect {
-                    rows: half,
-                    ..graph_area
-                };
-                let lower = Rect {
-                    y: graph_area.y + half,
-                    rows: graph_area.rows - half,
-                    ..graph_area
-                };
-                paint_finite_history_runs(
-                    &values[..len],
-                    ramp,
-                    upper,
-                    graphs::table().braille,
-                    surface,
-                );
-                paint_finite_history_runs(
-                    &down[..down_len],
-                    RampId::Write,
-                    lower,
-                    graphs::table().braille,
-                    surface,
-                );
-            }
+            let scale = if graphs::table().braille { 2 } else { 1 };
+            let visible = read_len
+                .max(write_len)
+                .min(graph_area.cols.saturating_mul(scale));
+            let read_skip = read_len.saturating_sub(visible);
+            let write_skip = write_len.saturating_sub(visible);
+            let read = &read[read_skip..read_len];
+            let write = &write[write_skip..write_len];
+            paint_mirrored_history_runs(read, write, graph_area, graphs::table().braille, surface);
         } else if len > 0 {
             paint_finite_history_runs(
                 &values[..len],
@@ -756,7 +795,7 @@ impl ContainersView<'_> {
         header.put_str(TABLE_MEM, 0, "memory", Default::default());
         header.put_str(TABLE_MEM_SPARK, 0, "mem/peak", Default::default());
         header.put_str(TABLE_PIDS, 0, "pids", Default::default());
-        header.put_str(TABLE_IO, 0, "io B/s", Default::default());
+        header.put_str(TABLE_IO, 0, "rd/wr B/s", Default::default());
         if self.model.untracked > 0 {
             header.put_str(
                 TABLE_IO + 8,
@@ -869,6 +908,11 @@ fn paint_finite_history_runs(
     let start_index = values.len().saturating_sub(max_samples);
     let visible = &values[start_index..];
     let aligned = crate::monitor::kit::history_rect::graph_rect(area, visible.len(), braille);
+    let slots = aligned.cols.saturating_mul(samples_per_cell);
+    let shown = visible.len().min(slots);
+    let skip = visible.len().saturating_sub(shown);
+    let pad = slots.saturating_sub(shown);
+    let visible = &visible[skip..];
     let mut start = 0;
     while start < visible.len() {
         while start < visible.len() && !visible[start].is_finite() {
@@ -879,14 +923,24 @@ fn paint_finite_history_runs(
             end += 1;
         }
         if end > start {
-            let first_col = start / samples_per_cell;
-            let last_col = end.div_ceil(samples_per_cell);
+            let slot_start = pad + start;
+            let offset = if braille { slot_start % 2 } else { 0 };
+            let first_col = slot_start / samples_per_cell;
+            let run_cols = (offset + end - start).div_ceil(samples_per_cell);
+            let mut aligned_run = [f32::NAN; HISTORY_CAP + 2];
+            let used_len = offset + end - start;
+            let run_len = if braille {
+                used_len + used_len % 2
+            } else {
+                used_len
+            };
+            aligned_run[offset..offset + end - start].copy_from_slice(&visible[start..end]);
             graphs::paint_history_graph(
-                &visible[start..end],
+                &aligned_run[..run_len],
                 ramp,
                 Rect {
                     x: aligned.x + first_col,
-                    cols: last_col - first_col,
+                    cols: run_cols,
                     ..area
                 },
                 surface,
@@ -896,14 +950,83 @@ fn paint_finite_history_runs(
     }
 }
 
-fn inventory_truncate(value: &str, max_chars: usize) -> String {
-    let mut chars = value.chars();
-    let text: String = chars.by_ref().take(max_chars).collect();
-    if chars.next().is_some() {
-        format!("{text}{}", crate::caps::active_glyphs().ellipsis)
-    } else {
-        text
+fn paint_mirrored_history_runs(
+    read: &[f32],
+    write: &[f32],
+    area: Rect,
+    braille: bool,
+    surface: &mut Surface,
+) {
+    if area.cols == 0 || area.rows == 0 || read.is_empty() || write.is_empty() {
+        return;
     }
+    let columns = area.cols;
+    let mut raster = thegn_core::viz_raster::CellBuf::new();
+    raster.reset(columns, area.rows);
+    thegn_core::viz_raster::mirrored(read, write, graphs::table(), &mut raster);
+    let mut grid = CellGrid::new(columns, area.rows);
+    let per_cell = if braille { 2 } else { 1 };
+    let mut view = grid.view(Rect::full(columns, area.rows));
+    let upper_rows = area.rows.div_ceil(2);
+    let slots = columns.saturating_mul(per_cell);
+    let offset = slots.saturating_sub(read.len().max(write.len()));
+    for x in 0..columns {
+        let first_slot = x * per_cell;
+        let last_slot = first_slot + per_cell;
+        let has_data = (first_slot..last_slot).any(|slot| {
+            if slot < offset {
+                return false;
+            }
+            let index = slot - offset;
+            read.get(index).is_some_and(|value| value.is_finite())
+                && write.get(index).is_some_and(|value| value.is_finite())
+        });
+        if !has_data {
+            continue;
+        }
+        for y in 0..area.rows {
+            if let Some(cell) = raster.get(x, y) {
+                let ramp = if y < upper_rows {
+                    RampId::Read
+                } else {
+                    RampId::Write
+                };
+                view.put(
+                    x,
+                    y,
+                    CellStyle {
+                        ch: cell.ch,
+                        fg: StyleTok::from_tok(crate::seg::Tok::Ramp(ramp, cell.fg))
+                            .unwrap_or(StyleTok::INHERIT),
+                        ..CellStyle::default()
+                    },
+                );
+            }
+        }
+    }
+    Emitter::default().emit(
+        &grid,
+        Rect::full(columns, area.rows),
+        surface,
+        area.x,
+        area.y,
+    );
+}
+
+fn inventory_truncate(value: &str, max_chars: usize) -> String {
+    if crate::seg::cells(value) <= max_chars {
+        return value.to_owned();
+    }
+    let ellipsis = crate::caps::active_glyphs().ellipsis;
+    let text = crate::seg::take_cols(value, max_chars.saturating_sub(crate::seg::cells(ellipsis)));
+    format!("{text}{ellipsis}")
+}
+
+fn inventory_pad(value: &str, width: usize) -> String {
+    format!(
+        "{value}{}",
+        " ".repeat(width.saturating_sub(crate::seg::cells(value)))
+    )
 }
 
 fn absent_mark(health: Health) -> &'static str {

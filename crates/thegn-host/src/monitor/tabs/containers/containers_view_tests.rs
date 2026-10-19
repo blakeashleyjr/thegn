@@ -30,6 +30,7 @@ fn row(id: &str, tick: usize) -> ContainerStatsRow {
 
 fn frame(tick: usize, ids: &[&str]) -> MonitorFrame {
     let mut frame = MonitorFrame::default();
+    frame.sampled.insert(CollectorId::ContainersStats);
     frame.health[CollectorId::ContainersStats.index()] = Health::Ok;
     frame.parts.containers_stats.scopes = ids.len() as u32;
     frame.parts.containers_stats.rows = ids.iter().map(|id| row(id, tick)).collect();
@@ -147,6 +148,10 @@ fn snapshots_cover_sizes_capabilities_and_static_demand() {
                     );
                     if unicode == UnicodeLevel::Ascii {
                         assert!(output.is_ascii());
+                        assert!(
+                            output.contains("containers - 1 owned - 1 foreign"),
+                            "ASCII inventory title missing: {output}"
+                        );
                     }
                     ratios.push((cols, rows, unicode, depth, fill_ratio(&surface, area)));
                 })
@@ -381,6 +386,7 @@ fn unrepresentable_float_metrics_stay_nan_and_nan_painters_stay_blank() {
 fn absent_health_and_unknown_container_metrics_keep_absent_marks() {
     let mut model = ContainersModel::default();
     let mut absent = MonitorFrame::default();
+    absent.sampled.insert(CollectorId::ContainersStats);
     absent.health[CollectorId::ContainersStats.index()] =
         Health::Absent(thegn_metrics::collect::health::Absent::NoHardware);
     model.absorb_frame(&absent);
@@ -406,4 +412,179 @@ fn absent_health_and_unknown_container_metrics_keep_absent_marks() {
     let output = text(&surface);
     assert!(output.contains("scope-unknow"));
     assert!(output.contains(crate::caps::active_glyphs().emdash));
+}
+
+#[test]
+fn unsampled_frame_updates_health_without_erasing_histories() {
+    let mut model = ContainersModel::default();
+    model.absorb_frame(&frame(0, &["scope-kept"]));
+    let mut ordered = [f32::NAN; super::HISTORY_CAP];
+    assert_eq!(model.cpu_total.ordered(&mut ordered), 1);
+    let previous = ordered[0];
+
+    let mut unsampled = MonitorFrame::default();
+    unsampled.health[CollectorId::ContainersStats.index()] =
+        Health::Absent(thegn_metrics::collect::health::Absent::NotImplemented);
+    model.absorb_frame(&unsampled);
+
+    assert_eq!(model.cpu_total.ordered(&mut ordered), 1);
+    assert_eq!(ordered[0], previous);
+    assert_eq!(
+        model.slots.iter().filter(|slot| slot.id.is_some()).count(),
+        1
+    );
+    assert!(matches!(model.health, Health::Absent(_)));
+}
+
+#[test]
+fn io_panel_mirrors_read_above_and_write_below_midline() {
+    let mut model = ContainersModel::default();
+    for tick in 0..12 {
+        let mut sample = frame(tick, &["scope-io"]);
+        sample.parts.containers_stats.rows[0].io_read_bps = Some(900.0);
+        sample.parts.containers_stats.rows[0].io_write_bps = Some(200.0);
+        model.absorb_frame(&sample);
+    }
+    let inventory = inventory();
+    let view = ContainersView::new(&model, &inventory, None, 0);
+    let area = Rect::full(240, 60);
+    let board = Board::default();
+    let placed = board.placed(&view, area);
+    let io = placed.iter().find(|panel| panel.id == super::IO).unwrap();
+    let mut surface = Surface::new(240, 60);
+    caps::test_override::with_unicode(UnicodeLevel::Ascii, || {
+        board.paint(&view, &mut surface, area, 0, &[])
+    });
+    let output = text(&surface);
+    assert!(
+        output.contains("read | scale"),
+        "read half label missing: {output}"
+    );
+    assert!(
+        output.contains("write"),
+        "write half label missing: {output}"
+    );
+    let graph_top = io.rect.y + 2;
+    let graph_rows = io.rect.rows.saturating_sub(4);
+    assert!(graph_rows >= 4);
+    let lines: Vec<_> = output.lines().collect();
+    let has_ink = |line: &str| {
+        line.chars()
+            .skip(io.rect.x + 1)
+            .take(io.rect.cols.saturating_sub(2))
+            .any(|ch| ch != ' ')
+    };
+    assert!(
+        has_ink(lines[graph_top + graph_rows / 2 - 1]),
+        "read series must rise above the axis: {output}"
+    );
+    assert!(
+        has_ink(lines[graph_top + graph_rows / 2]),
+        "write series must extend below the axis: {output}"
+    );
+}
+
+#[test]
+fn inventory_cursor_keeps_ownership_foreground_and_scrolls_selected_row_into_view() {
+    use termwiz::cell::Intensity;
+
+    let model = ContainersModel::default();
+    let inventory = inventory();
+    let view = ContainersView::new(&model, &inventory, None, 0);
+    let area = Rect::full(240, 60);
+    let board = Board::default();
+    let placed = board.placed(&view, area);
+    let panel = placed
+        .iter()
+        .find(|panel| panel.id == super::INVENTORY)
+        .unwrap();
+    let palette = crate::chrome::palette_snapshot();
+    let selected_bg =
+        crate::seg::Tok::Series(thegn_core::theme::SeriesRole::Selected).resolve(&palette);
+    let ghost_fg = crate::seg::Tok::Slot(crate::chrome::S::Ghost).resolve(&palette);
+
+    let mut before = Surface::new(240, 60);
+    board.paint(&view, &mut before, area, 0, &[]);
+    let owned_line = before.screen_lines()[panel.rect.y + 2].clone();
+    let owned_cell = owned_line
+        .visible_cells()
+        .find(|cell| cell.str() == "o")
+        .unwrap();
+    assert_eq!(owned_cell.attrs().intensity(), Intensity::Bold);
+    assert_eq!(owned_cell.attrs().background(), selected_bg);
+
+    let view = ContainersView::new(&model, &inventory, None, 1);
+    let mut after = Surface::new(240, 60);
+    board.paint(&view, &mut after, area, 0, &[]);
+    let owned_line = after.screen_lines()[panel.rect.y + 2].clone();
+    let owned_cell = owned_line
+        .visible_cells()
+        .find(|cell| cell.str() == "o")
+        .unwrap();
+    assert_ne!(owned_cell.attrs().intensity(), Intensity::Bold);
+    let foreign_line = after.screen_lines()[panel.rect.y + 3].clone();
+    let foreign_cell = foreign_line
+        .visible_cells()
+        .find(|cell| cell.str() == "f")
+        .unwrap();
+    assert_eq!(foreign_cell.attrs().intensity(), Intensity::Bold);
+    assert_eq!(foreign_cell.attrs().background(), selected_bg);
+    assert_eq!(foreign_cell.attrs().foreground(), ghost_fg);
+    let long_inventory: Vec<_> = (0..12)
+        .map(|index| ContainerInfo {
+            name: format!("container-row-{index}"),
+            image: String::new(),
+            status: "Up 1 minute".into(),
+            ours: index.is_multiple_of(2),
+            backend: "podman".into(),
+            cpu: String::new(),
+            mem: String::new(),
+            net: String::new(),
+            containment: String::new(),
+            mounts: String::new(),
+        })
+        .collect();
+    let last_name = long_inventory.last().unwrap().name.clone();
+    let scrolled_view =
+        ContainersView::new(&model, &long_inventory, None, long_inventory.len() - 1);
+    let mut scrolled = Surface::new(100, 30);
+    board.paint(&scrolled_view, &mut scrolled, Rect::full(100, 30), 0, &[]);
+    assert!(
+        text(&scrolled).contains(&last_name),
+        "selected final inventory row was not scrolled into view: {}",
+        text(&scrolled)
+    );
+}
+
+#[test]
+fn odd_index_history_run_keeps_its_braille_half_cell_alignment() {
+    // The visible tail starts at original sample 1; the gap at original odd
+    // sample 3 therefore leaves the following finite run at visible index 3.
+    let values = [0.1, 0.2, 0.4, f32::NAN, 0.9];
+    let area = Rect {
+        x: 0,
+        y: 0,
+        cols: 2,
+        rows: 4,
+    };
+    let mut actual = Surface::new(2, 4);
+    let mut expected = Surface::new(2, 4);
+    super::paint_finite_history_runs(
+        &values,
+        thegn_core::theme::RampId::Util,
+        area,
+        true,
+        &mut actual,
+    );
+    crate::monitor::graphs::paint_history_graph(
+        &values,
+        thegn_core::theme::RampId::Util,
+        area,
+        &mut expected,
+    );
+    assert_eq!(
+        text(&actual),
+        text(&expected),
+        "a finite run after the odd-index gap shifted half a braille cell"
+    );
 }
