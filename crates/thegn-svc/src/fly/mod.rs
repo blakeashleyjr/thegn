@@ -141,22 +141,26 @@ impl fmt::Debug for IrohInject {
 }
 
 impl FlySpec {
-    fn api_base(&self) -> String {
+    fn api_base(&self) -> Result<String> {
         let b = self.api_base.trim().trim_end_matches('/');
-        if b.is_empty() {
-            machines::DEFAULT_API_BASE.to_string()
+        let base = if b.is_empty() {
+            machines::DEFAULT_API_BASE
         } else {
-            b.to_string()
-        }
+            b
+        };
+        crate::provider::validate_api_base(base)
+            .map_err(|error| anyhow!("fly: api_base refused: {error}"))
     }
 
-    fn graphql_url(&self) -> String {
+    fn graphql_url(&self) -> Result<String> {
         let g = self.graphql_url.trim();
-        if g.is_empty() {
-            graphql::DEFAULT_GRAPHQL_URL.to_string()
+        let base = if g.is_empty() {
+            graphql::DEFAULT_GRAPHQL_URL
         } else {
-            g.to_string()
-        }
+            g
+        };
+        crate::provider::validate_api_base(base)
+            .map_err(|error| anyhow!("fly: graphql_url refused: {error}"))
     }
 
     fn max_instances(&self) -> usize {
@@ -246,6 +250,9 @@ impl FlyProvider {
         url: &str,
         timeout: std::time::Duration,
     ) -> Result<serde_json::Value> {
+        let _permit = crate::provider::CONTROL_GATE
+            .acquire(&crate::provider::authority_key(url)?)
+            .await?;
         let resp = self
             .client
             .get(url)
@@ -274,6 +281,9 @@ impl FlyProvider {
         body: &serde_json::Value,
         timeout: std::time::Duration,
     ) -> Result<serde_json::Value> {
+        let _permit = crate::provider::CONTROL_GATE
+            .acquire(&crate::provider::authority_key(url)?)
+            .await?;
         let resp = self
             .client
             .post(url)
@@ -292,13 +302,13 @@ impl FlyProvider {
 
     /// A Fly GraphQL call (IP allocation) — bearer auth, error-surfacing.
     async fn graphql(&self, body: &serde_json::Value) -> Result<serde_json::Value> {
-        self.post_json(&self.spec.graphql_url(), body).await
+        self.post_json(&self.spec.graphql_url()?, body).await
     }
 
     /// Idempotently ensure the app exists (create on 404, tolerate a concurrent
     /// 409/422 uniqueness win).
     async fn ensure_app(&self, app: &str, org_slug: &str) -> Result<()> {
-        let base = self.spec.api_base();
+        let base = self.spec.api_base()?;
         if self.get_json(&machines::app_url(&base, app)).await.is_ok() {
             return Ok(());
         }
@@ -379,7 +389,7 @@ impl FlyProvider {
     /// Poll a freshly-created machine to `started`. 2s poll, bounded.
     async fn wait_started(&self, app: &str, id: &str) -> Result<()> {
         const BUDGET: std::time::Duration = std::time::Duration::from_secs(120);
-        let base = self.spec.api_base();
+        let base = self.spec.api_base()?;
         let start = std::time::Instant::now();
         loop {
             let remaining = BUDGET.saturating_sub(start.elapsed());
@@ -438,7 +448,7 @@ impl FlyProvider {
     }
 
     async fn first_machine(&self, app: &str) -> Result<Option<machines::FlyMachine>> {
-        let base = self.spec.api_base();
+        let base = self.spec.api_base()?;
         let body = self.get_json(&machines::machines_url(&base, app)).await?;
         Ok(machines::parse_machine_list(&body).into_iter().next())
     }
@@ -469,7 +479,7 @@ impl FlyProvider {
             .first_machine(&app)
             .await?
             .ok_or_else(|| anyhow!("fly: machine for {name} not found"))?;
-        let base = self.spec.api_base();
+        let base = self.spec.api_base()?;
         const BUDGET: std::time::Duration = std::time::Duration::from_secs(90);
         let start = std::time::Instant::now();
         self.post_json_timeout(
@@ -535,7 +545,7 @@ impl FlyProvider {
             .context("fly: read persisted managed ownership before age reconciliation")?;
         self.reaper_time_with_custody(name, machine_id, custody, || async {
             self.get_json(&machines::machines_url(
-                &self.spec.api_base(),
+                &self.spec.api_base()?,
                 &app_name(name),
             ))
             .await
@@ -585,22 +595,26 @@ impl FlyProvider {
         let custody_account = thegn_core::managed_ssh::account_label(&self.spec.key_path);
         thegn_core::managed_ssh::read("fly", &custody_account, id)
             .context("fly: validate managed SSH custody before destroy")?;
-        let base = self.spec.api_base();
+        let base = self.spec.api_base()?;
         let url = machines::app_url(&base, &app_name(id));
         const ATTEMPTS: u32 = 3;
         let mut last_status = None;
         for attempt in 0..ATTEMPTS {
-            let resp = self
-                .client
-                .delete(&url)
-                .bearer_auth(&self.spec.token)
-                .timeout(crate::provider::CONTROL_TIMEOUT)
-                .send()
-                .await
-                .map_err(|error| {
-                    crate::provider::redacted_transport_error("fly", "DELETE", &error)
-                })?;
-            let status = resp.status();
+            let status = {
+                let _permit = crate::provider::CONTROL_GATE
+                    .acquire(&crate::provider::authority_key(&url)?)
+                    .await?;
+                self.client
+                    .delete(&url)
+                    .bearer_auth(&self.spec.token)
+                    .timeout(crate::provider::CONTROL_TIMEOUT)
+                    .send()
+                    .await
+                    .map_err(|error| {
+                        crate::provider::redacted_transport_error("fly", "DELETE", &error)
+                    })?
+                    .status()
+            };
             if status.is_success() || status == reqwest::StatusCode::NOT_FOUND {
                 self.ips.lock().unwrap().remove(id);
                 return Ok(());
@@ -691,7 +705,7 @@ impl RemoteProvider for FlyProvider {
 
             let create = async {
                 let ip = self.ensure_ipv4(&app).await?;
-                let base = self.spec.api_base();
+                let base = self.spec.api_base()?;
                 let created = self
                     .post_json(&machines::machines_url(&base, &app), &body)
                     .await?;
@@ -754,7 +768,10 @@ impl RemoteProvider for FlyProvider {
     }
 
     fn list<'a>(&'a self) -> BoxFuture<'a, Result<Vec<String>>> {
-        Box::pin(async move { Ok(self.ledger_names()) })
+        Box::pin(async move {
+            self.spec.api_base()?;
+            Ok(self.ledger_names())
+        })
     }
 }
 
@@ -1021,6 +1038,100 @@ mod tests {
         assert_eq!(reads.get(), 2, "read failure must remain retryable");
     }
 
+    #[tokio::test(start_paused = true)]
+    async fn fly_requests_wait_for_the_shared_control_gate() {
+        let url = "http://127.0.0.1:1/apps";
+        let authority = crate::provider::authority_key(url).unwrap();
+        let mut permits = Vec::new();
+        for _ in 0..crate::provider::CONTROL_PER_AUTHORITY_CONCURRENCY {
+            permits.push(
+                crate::provider::CONTROL_GATE
+                    .try_acquire(&authority)
+                    .unwrap(),
+            );
+        }
+
+        let provider = FlyProvider::new(spec());
+        let error = provider.get_json(url).await.unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("provider concurrency cap reached"),
+            "{error:#}"
+        );
+        drop(permits);
+    }
+
+    #[tokio::test]
+    async fn unvalidated_api_base_is_refused_before_any_request() {
+        let _state = thegn_core::testenv::IsolatedState::new();
+        let cases = [
+            ("http://fly-canary.invalid", "fly-canary.invalid"),
+            (
+                "https://user:token-canary@fly-canary.invalid",
+                "fly-canary.invalid",
+            ),
+            ("https://127.0.0.1:1/?token-canary", "token-canary"),
+        ];
+        for (api_base, host_or_marker) in cases {
+            let provider = FlyProvider::new(FlySpec {
+                api_base: api_base.into(),
+                token: "token-canary".into(),
+                ..spec()
+            });
+            let list_error = provider.list().await.unwrap_err();
+            assert!(
+                list_error.to_string().contains("fly: api_base refused"),
+                "{list_error:#}"
+            );
+            for rendered in [
+                list_error.to_string(),
+                format!("{list_error:#}"),
+                format!("{list_error:?}"),
+            ] {
+                assert!(!rendered.contains(host_or_marker), "{rendered}");
+                assert!(!rendered.contains("token-canary"), "{rendered}");
+            }
+
+            let account = thegn_core::managed_ssh::account_label(&provider.spec.key_path);
+            thegn_core::managed_ssh::record_authorized(
+                "fly",
+                &account,
+                &provider.spec.name,
+                &provider.spec.key_path,
+                TEST_PUBKEY,
+            )
+            .unwrap();
+            let destroy_error = provider
+                .destroy_remote_only(&provider.spec.name)
+                .await
+                .unwrap_err();
+            assert!(
+                destroy_error.to_string().contains("fly: api_base refused"),
+                "{destroy_error:#}"
+            );
+            for rendered in [
+                destroy_error.to_string(),
+                format!("{destroy_error:#}"),
+                format!("{destroy_error:?}"),
+            ] {
+                assert!(!rendered.contains(host_or_marker), "{rendered}");
+                assert!(!rendered.contains("token-canary"), "{rendered}");
+            }
+        }
+
+        let provider = FlyProvider::new(FlySpec {
+            graphql_url: "http://evil-canary.invalid".into(),
+            token: "token-canary".into(),
+            ..spec()
+        });
+        let graphql_error = provider.spec.graphql_url().unwrap_err();
+        let rendered = format!("{graphql_error:#}");
+        assert!(rendered.contains("fly: graphql_url refused"), "{rendered}");
+        assert!(!rendered.contains("evil-canary.invalid"), "{rendered}");
+        assert!(!rendered.contains("token-canary"), "{rendered}");
+    }
+
     fn spec() -> FlySpec {
         FlySpec {
             api_base: String::new(),
@@ -1047,8 +1158,8 @@ mod tests {
     #[test]
     fn spec_defaults() {
         let s = spec();
-        assert_eq!(s.api_base(), machines::DEFAULT_API_BASE);
-        assert_eq!(s.graphql_url(), graphql::DEFAULT_GRAPHQL_URL);
+        assert_eq!(s.api_base().unwrap(), machines::DEFAULT_API_BASE);
+        assert_eq!(s.graphql_url().unwrap(), graphql::DEFAULT_GRAPHQL_URL);
         let admitted = s.admit_static(&s.metadata()).unwrap();
         assert_eq!(admitted.org_slug, "personal");
         assert_eq!(admitted.region, machines::DEFAULT_REGION);
