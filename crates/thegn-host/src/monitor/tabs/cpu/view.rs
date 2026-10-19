@@ -62,6 +62,7 @@ impl SampleRing {
         }
     }
 
+    #[cfg(test)]
     fn ordered(&self) -> Vec<f32> {
         if self.len < CORE_HISTORY_SAMPLES || self.head == 0 {
             return self.values.clone();
@@ -71,6 +72,19 @@ impl SampleRing {
             .chain(&self.values[..self.head])
             .copied()
             .collect()
+    }
+
+    fn copy_ordered_into(&self, out: &mut Vec<f32>) {
+        out.clear();
+        if self.len == 0 {
+            return;
+        }
+        if self.len < CORE_HISTORY_SAMPLES || self.head == 0 {
+            out.extend_from_slice(&self.values[..self.len]);
+            return;
+        }
+        out.extend_from_slice(&self.values[self.head..]);
+        out.extend_from_slice(&self.values[..self.head]);
     }
 }
 
@@ -311,8 +325,23 @@ impl CpuModel {
                 &mut self.history_buf,
             );
             slot.clear();
-            if !self.history_buf.empty() {
-                slot.extend_from_slice(self.history_buf.hi());
+            let values = self.history_buf.hi();
+            let raw = self.history_buf.raw_hi();
+            let gaps = self.history_buf.gap();
+            slot.reserve(values.len());
+            if let Some(first_real) = gaps.iter().position(|gap| !gap) {
+                let mut held = None;
+                for ((value, raw), gap) in values.iter().zip(raw).zip(gaps).skip(first_real) {
+                    if *gap {
+                        slot.push(held.unwrap_or(f32::NAN));
+                    } else {
+                        let value = if raw.is_finite() { *value } else { f32::NAN };
+                        slot.push(value);
+                        if value.is_finite() {
+                            held = Some(value);
+                        }
+                    }
+                }
             }
         }
     }

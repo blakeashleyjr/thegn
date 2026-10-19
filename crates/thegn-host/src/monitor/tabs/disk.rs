@@ -12,6 +12,10 @@ use thegn_core::viz::Unit;
 
 pub(in crate::monitor) mod view;
 
+#[cfg(test)]
+#[path = "disk/disk_wire_tests.rs"]
+mod wire_tests;
+
 pub(in crate::monitor) fn disk(
     cx: &Ctx,
     wt_rows: &[DiskWtRow],

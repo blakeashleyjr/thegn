@@ -229,11 +229,13 @@ impl<F: FilesystemIo> FilesystemsCollector<F> {
             let Some((mut row, mount_path)) = self.make_row(parsed) else {
                 continue;
             };
-            if self
+            if let Some(existing) = self
                 .rows
                 .iter()
-                .any(|existing| existing.row.superblock_dev == row.superblock_dev)
+                .position(|existing| existing.row.superblock_dev == row.superblock_dev)
             {
+                self.rows[existing].row.extra_mounts =
+                    self.rows[existing].row.extra_mounts.saturating_add(1);
                 continue;
             }
             unique_count += 1;
@@ -288,6 +290,7 @@ impl<F: FilesystemIo> FilesystemsCollector<F> {
                 fstype,
                 source,
                 superblock_dev,
+                extra_mounts: 0,
                 kind,
                 total_bytes: None,
                 free_bytes: None,
@@ -589,6 +592,7 @@ fn same_row_identity(left: &FilesystemRow, right: &FilesystemRow) -> bool {
 }
 
 fn copy_numeric(target: &mut FilesystemRow, source: &FilesystemRow) {
+    target.extra_mounts = source.extra_mounts;
     target.total_bytes = source.total_bytes;
     target.free_bytes = source.free_bytes;
     target.avail_bytes = source.avail_bytes;

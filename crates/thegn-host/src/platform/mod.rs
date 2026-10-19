@@ -171,6 +171,8 @@ pub(crate) use priority::{
     IONICE_SUPPORTED, IoClass, PriorityError, get_ioprio, get_nice, set_ioprio, set_nice,
 };
 
+/// Bounded, self-process thread attribution for the opt-in perf rollup.
+pub(crate) mod thread_census;
 #[cfg(target_os = "linux")]
 mod udisks_smart_linux;
 
