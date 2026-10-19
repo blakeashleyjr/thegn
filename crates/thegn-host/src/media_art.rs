@@ -90,17 +90,6 @@ const STRICT_FETCH_POLICY: FetchPolicy = FetchPolicy {
 };
 
 impl FetchPolicy {
-    fn is_strict(&self) -> bool {
-        #[cfg(test)]
-        {
-            self.exempt.is_none()
-        }
-        #[cfg(not(test))]
-        {
-            true
-        }
-    }
-
     fn admits_test_endpoint(&self, _ip: IpAddr, _port: u16) -> bool {
         #[cfg(test)]
         {
@@ -245,10 +234,6 @@ static IN_FLIGHT: Mutex<Option<tokio::task::JoinHandle<()>>> = Mutex::new(None);
 /// Fetch one http(s) body: redirects followed manually (each hop re-admitted,
 /// re-resolved and the connection pinned to the vetted addresses), streamed
 /// under [`MAX_ART_BYTES`]. Proxies are disabled so pinning cannot be bypassed.
-async fn fetch_http(start: &str) -> Result<Vec<u8>, Reject> {
-    fetch_http_with(start, &STRICT_FETCH_POLICY).await
-}
-
 async fn fetch_http_with(start: &str, policy: &FetchPolicy) -> Result<Vec<u8>, Reject> {
     let mut url = reqwest::Url::parse(start).map_err(|_| Reject::Scheme)?;
     for _ in 0..=MAX_REDIRECTS {
@@ -378,14 +363,7 @@ async fn load_raster_with(
     if !(art_url.starts_with("http://") || art_url.starts_with("https://")) {
         return Err(Reject::Scheme);
     }
-    let fetch = async {
-        if policy.is_strict() {
-            fetch_http(art_url).await
-        } else {
-            fetch_http_with(art_url, policy).await
-        }
-    };
-    let bytes = tokio::time::timeout(FETCH_TOTAL_TIMEOUT, fetch)
+    let bytes = tokio::time::timeout(FETCH_TOTAL_TIMEOUT, fetch_http_with(art_url, policy))
         .await
         .map_err(|_| Reject::Network)??;
     admitted_blocking(&DECODE_SLOT, move || {
@@ -566,18 +544,25 @@ mod tests {
     use super::*;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
+    async fn read_request_head(stream: &mut tokio::net::TcpStream) -> bool {
+        let mut request = Vec::new();
+        let mut byte = [0_u8; 1];
+        while !request.ends_with(b"\r\n\r\n") {
+            if stream.read_exact(&mut byte).await.is_err() {
+                return false;
+            }
+            request.push(byte[0]);
+        }
+        true
+    }
+
     async fn test_server(response: Vec<u8>) -> (SocketAddr, tokio::task::JoinHandle<()>) {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let task = tokio::spawn(async move {
             let (mut stream, _) = listener.accept().await.unwrap();
-            let mut request = Vec::new();
-            let mut byte = [0_u8; 1];
-            while !request.ends_with(b"\r\n\r\n") {
-                if stream.read_exact(&mut byte).await.is_err() {
-                    return;
-                }
-                request.push(byte[0]);
+            if !read_request_head(&mut stream).await {
+                return;
             }
             stream.write_all(&response).await.unwrap();
         });
@@ -589,13 +574,8 @@ mod tests {
         let address = listener.local_addr().unwrap();
         let task = tokio::spawn(async move {
             let (mut stream, _) = listener.accept().await.unwrap();
-            let mut request = Vec::new();
-            let mut byte = [0_u8; 1];
-            while !request.ends_with(b"\r\n\r\n") {
-                if stream.read_exact(&mut byte).await.is_err() {
-                    return;
-                }
-                request.push(byte[0]);
+            if !read_request_head(&mut stream).await {
+                return;
             }
             stream
                 .write_all(b"HTTP/1.1 200 OK\r\nContent-Type: image/png\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n")
@@ -652,16 +632,16 @@ mod tests {
         !crc
     }
 
-    fn dimension_bomb_png() -> Vec<u8> {
-        let dimension = crate::rasterize::MEDIA_ART_LIMITS.max_dim + 1;
-        let mut ihdr = Vec::from(&b"IHDR"[..]);
-        ihdr.extend_from_slice(&dimension.to_be_bytes());
-        ihdr.extend_from_slice(&dimension.to_be_bytes());
-        ihdr.extend_from_slice(&[8, 6, 0, 0, 0]);
-        let mut png = Vec::from(&[137, 80, 78, 71, 13, 10, 26, 10][..]);
-        png.extend_from_slice(&13_u32.to_be_bytes());
-        png.extend_from_slice(&ihdr);
-        png.extend_from_slice(&png_crc32(&ihdr).to_be_bytes());
+    fn png_with_dimension(dimension: u32) -> Vec<u8> {
+        let mut encoded = std::io::Cursor::new(Vec::new());
+        image::DynamicImage::ImageRgba8(image::RgbaImage::new(1, 1))
+            .write_to(&mut encoded, image::ImageFormat::Png)
+            .unwrap();
+        let mut png = encoded.into_inner();
+        png[16..20].copy_from_slice(&dimension.to_be_bytes());
+        png[20..24].copy_from_slice(&dimension.to_be_bytes());
+        let crc = png_crc32(&png[12..29]);
+        png[29..33].copy_from_slice(&crc.to_be_bytes());
         png
     }
 
@@ -1114,21 +1094,31 @@ mod tests {
 
     #[tokio::test]
     async fn dimension_bomb_is_refused_by_the_decoder() {
-        let body = dimension_bomb_png();
-        let response = format!(
-            "HTTP/1.1 200 OK\r\nContent-Type: image/png\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-            body.len()
-        );
-        let (address, server) = test_server([response.as_bytes(), &body].concat()).await;
-        let url = format!("http://{address}/bomb.png");
-        let result = tokio::time::timeout(
-            Duration::from_secs(10),
-            load_raster_with(&url, &test_policy(address)),
-        )
-        .await
-        .unwrap();
-        assert!(matches!(result, Err(Reject::Decode)));
-        finish_test_server(server).await;
+        const BOMB_DIM: u32 = 1 << 16; // above MEDIA_ART_LIMITS.max_dim (8192)
+        for (dimension, refused) in [(1, false), (BOMB_DIM, true)] {
+            let body = png_with_dimension(dimension);
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: image/png\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            );
+            let (address, server) = test_server([response.as_bytes(), &body].concat()).await;
+            let url = format!("http://{address}/image.png");
+            let result = tokio::time::timeout(
+                Duration::from_secs(10),
+                load_raster_with(&url, &test_policy(address)),
+            )
+            .await
+            .unwrap();
+            if refused {
+                assert!(matches!(result, Err(Reject::Decode)));
+            } else {
+                assert!(
+                    result.is_ok(),
+                    "valid 1x1 PNG must pass the dimension check"
+                );
+            }
+            finish_test_server(server).await;
+        }
     }
 
     #[tokio::test]
@@ -1137,9 +1127,12 @@ mod tests {
         let address = listener.local_addr().unwrap();
         drop(listener);
         let url = format!("http://{address}/");
-        let result = tokio::time::timeout(Duration::from_secs(10), fetch_http(&url))
-            .await
-            .unwrap();
+        let result = tokio::time::timeout(
+            Duration::from_secs(10),
+            fetch_http_with(&url, &STRICT_FETCH_POLICY),
+        )
+        .await
+        .unwrap();
         assert_eq!(result, Err(Reject::ForbiddenAddress));
     }
 
