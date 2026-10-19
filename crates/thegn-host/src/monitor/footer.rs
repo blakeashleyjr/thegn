@@ -59,10 +59,27 @@ pub(super) fn line(input: FooterInput<'_>) -> Line {
     // happen, so a pane-owned build is recognizably thegn's own.
     if let Some(c) = input.confirm {
         let msg = match c {
+            Confirm::SignalMenu { label, cursor, .. } => {
+                let menu = crate::platform::ProcSignal::menu();
+                let entries = menu
+                    .iter()
+                    .enumerate()
+                    .map(|(index, signal)| {
+                        let marker = if index == *cursor { '>' } else { ' ' };
+                        format!("{marker}{} {}", signal.menu_key(), signal.label())
+                    })
+                    .collect::<Vec<_>>()
+                    .join("  ");
+                return Line::split(
+                    vec![seg(Tok::Slot(S::Accent), format!("{label}: signal {entries}")).bold()],
+                    vec![ghost("Up/Down choose · Enter select · Esc cancel")],
+                );
+            }
             Confirm::Signal { label, stage, .. } => {
                 let verb = match stage {
-                    crate::platform::ProcSignal::Terminate => "terminate",
-                    crate::platform::ProcSignal::Kill => "KILL (no cleanup)",
+                    crate::platform::ProcSignal::Terminate => "terminate".to_string(),
+                    crate::platform::ProcSignal::Kill => "KILL (no cleanup)".to_string(),
+                    signal => format!("send SIG{} to", signal.label()),
                 };
                 format!("{verb} {label}?")
             }
