@@ -231,7 +231,13 @@ fn create(
         project_id: Some(project),
     };
     let r = router(cfg);
-    match block(r.create_issue(&draft)) {
+    match block(r.create_issue_on(
+        &thegn_svc::issue::CreateTarget {
+            provider: "kaneo".into(),
+            account: None,
+        },
+        &draft,
+    )) {
         Ok(issue) => {
             outln!("✓ Created {} — {}", issue.number, issue.title);
             Ok(())

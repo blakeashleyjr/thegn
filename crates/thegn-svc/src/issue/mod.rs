@@ -47,6 +47,10 @@ pub enum IssueError {
         provider: String,
         accounts: Vec<String>,
     },
+    NoCreateTarget {
+        provider: String,
+        account: Option<String>,
+    },
     Unsupported(&'static str),
     UnsupportedPatchFields(Vec<&'static str>),
     EmptyPatch,
@@ -79,6 +83,11 @@ impl std::fmt::Debug for IssueError {
                 .debug_struct("IssueError::AmbiguousAccount")
                 .field("provider", provider)
                 .field("accounts", accounts)
+                .finish(),
+            Self::NoCreateTarget { provider, account } => f
+                .debug_struct("IssueError::NoCreateTarget")
+                .field("provider", provider)
+                .field("account", account)
                 .finish(),
             Self::Unsupported(op) => f.debug_tuple("IssueError::Unsupported").field(op).finish(),
             Self::UnsupportedPatchFields(fields) => f
@@ -130,6 +139,13 @@ impl std::fmt::Display for IssueError {
                 "{provider} issue id is ambiguous across accounts: {}; set enabled = false on all but one [[issues.issue_accounts]] entry for {provider}, or restrict this repo with accounts = [\"<name>\"]",
                 accounts.join(", ")
             ),
+            IssueError::NoCreateTarget { provider, account } => {
+                write!(f, "no configured {provider} issue account")?;
+                if let Some(account) = account {
+                    write!(f, " named {account}")?;
+                }
+                write!(f, " to create on")
+            }
             IssueError::Unsupported(op) => write!(f, "{op} is not supported by this provider"),
             IssueError::UnsupportedPatchFields(fields) => write!(
                 f,
@@ -221,6 +237,7 @@ impl SeamError for IssueError {
             IssueError::Api(_)
             | IssueError::Subprocess(_)
             | IssueError::Parse(_)
+            | IssueError::NoCreateTarget { .. }
             | IssueError::Policy(_)
             | IssueError::BodyLimit(_) => ErrorClass::Other,
         }
@@ -522,6 +539,13 @@ struct AccountBackend {
     inner: Box<dyn IssueBackend>,
 }
 
+/// The explicit provider and optional account that may receive an issue
+/// creation request.
+pub struct CreateTarget {
+    pub provider: String,
+    pub account: Option<String>,
+}
+
 /// Routes issue requests across every configured provider. `list`/`search` fan
 /// out and merge; `get`/`update` dispatch by the `"<provider>:"` id prefix.
 /// Returns empty results (not errors) when nothing is configured — the panel
@@ -779,15 +803,72 @@ impl IssueRouter {
         }
     }
 
-    /// Create an issue on the first configured provider.
+    /// Create an issue only when this router has exactly one configured account.
     pub async fn create_issue(&self, draft: &IssueDraft) -> Result<Issue, IssueError> {
-        match self.inner.first() {
-            Some(b) => b.inner.create_issue(draft).await.and_then(|issue| {
-                validate_issue_identity(&issue)?;
-                Ok(issue)
+        match self.inner.as_slice() {
+            [] => Err(IssueError::NotConfigured),
+            [backend] => {
+                let target = CreateTarget {
+                    provider: backend.inner.provider_id().to_string(),
+                    account: Some(backend.account.clone()),
+                };
+                self.create_issue_on(&target, draft).await
+            }
+            backends => Err(IssueError::AmbiguousAccount {
+                provider: "any".into(),
+                accounts: backends
+                    .iter()
+                    .map(|backend| backend.account.clone())
+                    .collect(),
             }),
-            None => Err(IssueError::NotConfigured),
         }
+    }
+
+    /// Create an issue on the explicitly selected provider account. The
+    /// target must resolve uniquely before the backend is called.
+    pub async fn create_issue_on(
+        &self,
+        target: &CreateTarget,
+        draft: &IssueDraft,
+    ) -> Result<Issue, IssueError> {
+        let matches: Vec<&AccountBackend> = self
+            .inner
+            .iter()
+            .filter(|backend| {
+                backend.inner.provider_id() == target.provider.as_str()
+                    && target
+                        .account
+                        .as_ref()
+                        .is_none_or(|account| backend.account.as_str() == account.as_str())
+            })
+            .collect();
+        let backend = match matches.as_slice() {
+            [backend] => *backend,
+            [] if self.inner.is_empty() => return Err(IssueError::NotConfigured),
+            [] => {
+                return Err(IssueError::NoCreateTarget {
+                    provider: target.provider.clone(),
+                    account: target.account.clone(),
+                });
+            }
+            backends => {
+                return Err(IssueError::AmbiguousAccount {
+                    provider: target.provider.clone(),
+                    accounts: backends
+                        .iter()
+                        .map(|backend| backend.account.clone())
+                        .collect(),
+                });
+            }
+        };
+        let issue = backend.inner.create_issue(draft).await?;
+        if issue.provider != target.provider {
+            return Err(IssueError::Policy(
+                "tracker created the issue on a different provider",
+            ));
+        }
+        validate_issue_identity(&issue)?;
+        Ok(issue)
     }
 
     pub async fn update_issue(&self, id: &str, patch: &IssuePatch) -> Result<Issue, IssueError> {
@@ -961,9 +1042,278 @@ fn validate_patch_capabilities(caps: IssueCaps, patch: &IssuePatch) -> Result<()
 }
 
 #[cfg(test)]
-mod spec {
+mod tests {
     use super::*;
     use thegn_core::config::IssueProviderKind;
+
+    struct CreateBackend {
+        provider: String,
+        issue: Issue,
+        calls: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl IssueBackend for CreateBackend {
+        fn provider_id(&self) -> &str {
+            &self.provider
+        }
+
+        fn caps(&self) -> IssueCaps {
+            IssueCaps::default()
+        }
+
+        fn list_issues<'a>(
+            &'a self,
+            _filter: &'a IssueFilter,
+        ) -> BoxFuture<'a, Result<Vec<Issue>, IssueError>> {
+            Box::pin(async { Ok(Vec::new()) })
+        }
+
+        fn get_issue<'a>(&'a self, _id: &'a str) -> BoxFuture<'a, Result<IssueDetail, IssueError>> {
+            Box::pin(async { Err(IssueError::Api("not used".into())) })
+        }
+
+        fn create_issue<'a>(
+            &'a self,
+            _draft: &'a IssueDraft,
+        ) -> BoxFuture<'a, Result<Issue, IssueError>> {
+            let issue = self.issue.clone();
+            let calls = Arc::clone(&self.calls);
+            Box::pin(async move {
+                calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Ok(issue)
+            })
+        }
+
+        fn update_issue<'a>(
+            &'a self,
+            _id: &'a str,
+            _patch: &'a IssuePatch,
+        ) -> BoxFuture<'a, Result<Issue, IssueError>> {
+            Box::pin(async { Err(IssueError::Api("not used".into())) })
+        }
+
+        fn search<'a>(
+            &'a self,
+            _query: &'a str,
+            _limit: usize,
+        ) -> BoxFuture<'a, Result<Vec<Issue>, IssueError>> {
+            Box::pin(async { Ok(Vec::new()) })
+        }
+    }
+
+    fn create_backend(
+        provider: &str,
+        key: &str,
+    ) -> (Box<dyn IssueBackend>, Arc<std::sync::atomic::AtomicUsize>) {
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let issue = Issue {
+            id: format!("{provider}:{key}"),
+            number: key.into(),
+            provider: provider.into(),
+            title: key.into(),
+            status: thegn_core::issue::IssueStatus::Todo,
+            priority: thegn_core::issue::IssuePriority::Low,
+            url: "https://example.com/issues/item".into(),
+            ..Default::default()
+        };
+        (
+            Box::new(CreateBackend {
+                provider: provider.into(),
+                issue,
+                calls: Arc::clone(&calls),
+            }),
+            calls,
+        )
+    }
+
+    fn create_runtime() -> tokio::runtime::Runtime {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+    }
+
+    fn create_target(provider: &str, account: Option<&str>) -> CreateTarget {
+        CreateTarget {
+            provider: provider.into(),
+            account: account.map(str::to_owned),
+        }
+    }
+
+    #[test]
+    fn create_on_targets_kaneo_even_when_linear_is_first() {
+        let runtime = create_runtime();
+        let mut router = IssueRouter::from_config(&IssuesConfig::default());
+        let (linear, linear_calls) = create_backend("linear", "THE-1");
+        let (kaneo, kaneo_calls) = create_backend("kaneo", "task-1");
+        router
+            .push_backend("linear-account".into(), linear)
+            .unwrap();
+        router.push_backend("kaneo-account".into(), kaneo).unwrap();
+
+        let created = runtime
+            .block_on(router.create_issue_on(&create_target("kaneo", None), &IssueDraft::default()))
+            .unwrap();
+
+        assert_eq!(created.provider, "kaneo");
+        assert_eq!(linear_calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert_eq!(kaneo_calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn create_on_two_kaneo_accounts_without_an_account_is_ambiguous_and_calls_nothing() {
+        let runtime = create_runtime();
+        let mut router = IssueRouter::from_config(&IssuesConfig::default());
+        let (first, first_calls) = create_backend("kaneo", "task-1");
+        let (second, second_calls) = create_backend("kaneo", "task-2");
+        router.push_backend("personal".into(), first).unwrap();
+        router.push_backend("work".into(), second).unwrap();
+
+        let result = runtime.block_on(
+            router.create_issue_on(&create_target("kaneo", None), &IssueDraft::default()),
+        );
+
+        assert!(
+            matches!(result, Err(IssueError::AmbiguousAccount { provider, accounts })
+            if provider == "kaneo"
+                && accounts == vec!["personal".to_string(), "work".to_string()])
+        );
+        assert_eq!(first_calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert_eq!(second_calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn create_on_named_account_picks_that_account_regardless_of_order() {
+        let runtime = create_runtime();
+        for reverse in [false, true] {
+            let mut router = IssueRouter::from_config(&IssuesConfig::default());
+            let (personal, personal_calls) = create_backend("kaneo", "task-personal");
+            let (work, work_calls) = create_backend("kaneo", "task-work");
+            let entries = if reverse {
+                [("work", work), ("personal", personal)]
+            } else {
+                [("personal", personal), ("work", work)]
+            };
+            for (account, backend) in entries {
+                router.push_backend(account.into(), backend).unwrap();
+            }
+
+            let created = runtime
+                .block_on(router.create_issue_on(
+                    &create_target("kaneo", Some("work")),
+                    &IssueDraft::default(),
+                ))
+                .unwrap();
+
+            assert_eq!(created.id, "kaneo:task-work");
+            assert_eq!(personal_calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+            assert_eq!(work_calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        }
+    }
+
+    #[test]
+    fn create_on_rejects_a_wrong_origin_issue() {
+        let runtime = create_runtime();
+        // The backend is registered as Kaneo but incorrectly returns Linear origin.
+        let wrong_origin = Issue {
+            provider: "linear".into(),
+            id: "linear:THE-1".into(),
+            number: "THE-1".into(),
+            ..Default::default()
+        };
+        let mut wrong_router = IssueRouter::from_config(&IssuesConfig::default());
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        wrong_router
+            .push_backend(
+                "kaneo-account".into(),
+                Box::new(CreateBackend {
+                    provider: "kaneo".into(),
+                    issue: wrong_origin,
+                    calls,
+                }),
+            )
+            .unwrap();
+
+        assert!(matches!(
+            runtime.block_on(
+                wrong_router
+                    .create_issue_on(&create_target("kaneo", None), &IssueDraft::default(),)
+            ),
+            Err(IssueError::Policy(
+                "tracker created the issue on a different provider"
+            ))
+        ));
+    }
+
+    #[test]
+    fn create_on_an_empty_router_is_not_configured() {
+        let runtime = create_runtime();
+        let router = IssueRouter::from_config(&IssuesConfig::default());
+        assert!(matches!(
+            runtime.block_on(
+                router.create_issue_on(&create_target("kaneo", None), &IssueDraft::default(),)
+            ),
+            Err(IssueError::NotConfigured)
+        ));
+    }
+
+    #[test]
+    fn bare_create_uses_the_only_configured_account() {
+        let runtime = create_runtime();
+        let mut router = IssueRouter::from_config(&IssuesConfig::default());
+        let (backend, calls) = create_backend("kaneo", "task-1");
+        router
+            .push_backend("kaneo-account".into(), backend)
+            .unwrap();
+
+        let created = runtime
+            .block_on(router.create_issue(&IssueDraft::default()))
+            .unwrap();
+
+        assert_eq!(created.id, "kaneo:task-1");
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn bare_create_with_two_backends_is_ambiguous() {
+        let runtime = create_runtime();
+        let mut router = IssueRouter::from_config(&IssuesConfig::default());
+        let (linear, linear_calls) = create_backend("linear", "THE-1");
+        let (kaneo, kaneo_calls) = create_backend("kaneo", "task-1");
+        router
+            .push_backend("linear-account".into(), linear)
+            .unwrap();
+        router.push_backend("kaneo-account".into(), kaneo).unwrap();
+
+        assert!(matches!(
+            runtime.block_on(router.create_issue(&IssueDraft::default())),
+            Err(IssueError::AmbiguousAccount { provider, accounts })
+                if provider == "any"
+                    && accounts == vec!["linear-account".to_string(), "kaneo-account".to_string()]
+        ));
+        assert_eq!(linear_calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert_eq!(kaneo_calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn create_on_missing_target_names_provider_and_account() {
+        let runtime = create_runtime();
+        let mut router = IssueRouter::from_config(&IssuesConfig::default());
+        let (backend, calls) = create_backend("linear", "THE-1");
+        router
+            .push_backend("linear-account".into(), backend)
+            .unwrap();
+
+        assert!(matches!(
+            runtime.block_on(router.create_issue_on(
+                &create_target("kaneo", Some("project")),
+                &IssueDraft::default(),
+            )),
+            Err(IssueError::NoCreateTarget { provider, account })
+                if provider == "kaneo" && account.as_deref() == Some("project")
+        ));
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
 
     fn cfg_with(providers: Vec<IssueProviderKind>) -> IssuesConfig {
         IssuesConfig {
