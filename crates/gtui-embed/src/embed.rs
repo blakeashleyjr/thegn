@@ -532,7 +532,7 @@ impl SeriesCache {
                     .map(|bits| [f64::from_bits(bits[0]), f64::from_bits(bits[1])]),
                 key.width,
             );
-            self.entries.insert(id, (key, reduced));
+            self.entries.insert(id.clone(), (key, reduced));
             self.reductions = self.reductions.wrapping_add(1);
         }
         &self.entries.get(&id).expect("inserted reduction").1
@@ -724,7 +724,7 @@ fn render_targets(
                 panel_id: context.panel_id,
                 generation: context.generation,
                 window: context.window,
-                series_index: *series_index,
+                series_index: (*series_index).clone(),
                 cache: &mut *context.cache,
             };
             dispatch_renderer(
@@ -936,6 +936,32 @@ mod tests {
         buffer
     }
 
+    fn render_target_updates(
+        cache: &mut SeriesCache,
+        generation: u64,
+        targets: &[gtui_app::engine::TargetUpdate],
+    ) {
+        let area = Rect::new(0, 0, 30, 8);
+        let mut buffer = Buffer::empty(area);
+        cache.begin_pass();
+        render_targets(
+            "timeseries",
+            "Panel",
+            targets,
+            area,
+            &mut buffer,
+            &Theme::prism(),
+            PanelRenderContext {
+                panel_id: 7,
+                generation,
+                window: Some([0.0, 2.0]),
+                series_index: None,
+                cache: &mut *cache,
+            },
+        );
+        cache.finish_pass();
+    }
+
     fn timestamped_frame() -> Frame {
         Frame::new(vec![
             Field::new("time", FieldType::Time, vec![0.0, 1.0, 4.0, 10.0]),
@@ -1043,88 +1069,82 @@ mod tests {
             Field::new("v", FieldType::Float64, vec![9.0, 10.0]),
         ]);
         let mut cache = SeriesCache::default();
-        cache.begin_pass();
-        let _prior = render_cached_series(&mut cache, 7, 1, frame_a, 30, Some([0.0, 2.0]));
-        cache.finish_pass();
-        assert_eq!(cache.reduction_count(), 1);
-
-        let area = Rect::new(0, 0, 30, 8);
-        cache.begin_pass();
-        let mut same_generation = Buffer::empty(area);
-        render_targets(
-            "timeseries",
-            "Panel",
-            &[gtui_app::engine::TargetUpdate {
-                ref_id: "B".into(),
-                label: "B".into(),
-                result: Ok(vec![frame_b.clone()]),
-            }],
-            area,
-            &mut same_generation,
-            &Theme::prism(),
-            PanelRenderContext {
-                panel_id: 7,
-                generation: 1,
-                window: Some([0.0, 2.0]),
-                series_index: None,
-                cache: &mut cache,
-            },
+        render_target_updates(
+            &mut cache,
+            1,
+            &[
+                gtui_app::engine::TargetUpdate {
+                    ref_id: "A".into(),
+                    label: "A".into(),
+                    result: Ok(vec![frame_a.clone()]),
+                },
+                gtui_app::engine::TargetUpdate {
+                    ref_id: "B".into(),
+                    label: "B".into(),
+                    result: Ok(vec![frame_b.clone()]),
+                },
+            ],
         );
-        assert_eq!(cache.reduction_count(), 2, "B must not reuse A's reduction");
-        let expected = render_targets_uncached(frame_b.clone(), "B", 30, Some([0.0, 2.0]));
-        assert_eq!(same_generation, expected);
+        assert_eq!(cache.reduction_count(), 2, "both visible targets reduce");
 
-        cache.begin_pass();
-        let mut repeated_visible_set = Buffer::empty(area);
-        render_targets(
-            "timeseries",
-            "Panel",
-            &[gtui_app::engine::TargetUpdate {
-                ref_id: "B".into(),
-                label: "B".into(),
-                result: Ok(vec![frame_b.clone()]),
-            }],
-            area,
-            &mut repeated_visible_set,
-            &Theme::prism(),
-            PanelRenderContext {
-                panel_id: 7,
-                generation: 1,
-                window: Some([0.0, 2.0]),
-                series_index: None,
-                cache: &mut cache,
-            },
-        );
-        cache.finish_pass();
+        // Hiding A removes it from the delivered vector. B moves to dense index 0,
+        // but its visible-target identity differs from either cached entry.
+        let only_b = [gtui_app::engine::TargetUpdate {
+            ref_id: "B".into(),
+            label: "B".into(),
+            result: Ok(vec![frame_b.clone()]),
+        }];
+        render_target_updates(&mut cache, 1, &only_b);
         assert_eq!(
             cache.reduction_count(),
-            2,
-            "unchanged visible targets must hit"
+            3,
+            "hiding A must not reuse A's cached reduction for B"
         );
-        assert_eq!(repeated_visible_set, expected);
 
-        let mut actual = Buffer::empty(area);
-        render_targets(
-            "timeseries",
-            "Panel",
-            &[gtui_app::engine::TargetUpdate {
-                ref_id: "B".into(),
-                label: "B".into(),
-                result: Ok(vec![frame_b.clone()]),
-            }],
-            area,
-            &mut actual,
-            &Theme::prism(),
-            PanelRenderContext {
-                panel_id: 7,
-                generation: 2,
-                window: Some([0.0, 2.0]),
-                series_index: None,
-                cache: &mut cache,
-            },
+        render_target_updates(&mut cache, 1, &only_b);
+        assert_eq!(
+            cache.reduction_count(),
+            3,
+            "an unchanged visible target set and generation must hit"
         );
-        assert_eq!(cache.reduction_count(), 3, "a generation change must miss");
-        assert_eq!(actual, expected);
+
+        render_target_updates(&mut cache, 2, &only_b);
+        assert_eq!(
+            cache.reduction_count(),
+            4,
+            "a generation change must reduce again"
+        );
+
+        // Keep B at index 0 while changing the visible set. This isolates set
+        // identity from the dense-index shift in the A-then-B case above.
+        let mut set_cache = SeriesCache::default();
+        render_target_updates(
+            &mut set_cache,
+            1,
+            &[
+                gtui_app::engine::TargetUpdate {
+                    ref_id: "B".into(),
+                    label: "B".into(),
+                    result: Ok(vec![frame_b.clone()]),
+                },
+                gtui_app::engine::TargetUpdate {
+                    ref_id: "A".into(),
+                    label: "A".into(),
+                    result: Ok(vec![frame_a]),
+                },
+            ],
+        );
+        assert_eq!(set_cache.reduction_count(), 2);
+        render_target_updates(&mut set_cache, 1, &only_b);
+        assert_eq!(
+            set_cache.reduction_count(),
+            3,
+            "a changed visible set must not reuse the same-index reduction"
+        );
+        render_target_updates(&mut set_cache, 1, &only_b);
+        assert_eq!(set_cache.reduction_count(), 3);
+        render_target_updates(&mut set_cache, 2, &only_b);
+        assert_eq!(set_cache.reduction_count(), 4);
     }
 
     #[test]
