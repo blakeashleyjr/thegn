@@ -1586,6 +1586,10 @@ pub(crate) fn migrate_v84(conn: &Connection) -> Result<()> {
          UPDATE calendar_sync SET sync_token = '', fetched_at = 0;",
     )?;
     tx.commit()?;
+    // The table rebuild releases the old calendar table's pages. Reclaim
+    // those pages now so a fresh incremental-mode database does not start
+    // its maintenance cycle with migration-only freelist entries.
+    conn.execute_batch("PRAGMA incremental_vacuum;")?;
     Ok(())
 }
 
@@ -2314,7 +2318,9 @@ mod tests {
     fn v84_rebuilds_calendar_key_idempotently_and_keeps_rows() {
         let conn = Connection::open_in_memory().unwrap();
         conn.execute_batch(
-            "CREATE TABLE calendar_events (
+            "PRAGMA auto_vacuum=INCREMENTAL;
+             VACUUM;
+             CREATE TABLE calendar_events (
                  account TEXT NOT NULL, uid TEXT NOT NULL, calendar TEXT NOT NULL DEFAULT '',
                  start_ms INTEGER NOT NULL, end_ms INTEGER NOT NULL,
                  recurring INTEGER NOT NULL DEFAULT 0, json TEXT NOT NULL,
@@ -2337,6 +2343,10 @@ mod tests {
         super::migrate_v84(&conn).unwrap();
         super::migrate_v84(&conn).unwrap();
         super::verify_v84_schema(&conn).unwrap();
+        let freelist_count: i64 = conn
+            .query_row("PRAGMA freelist_count", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(freelist_count, 0, "v84 migration leaves no rebuild pages");
         let rows: Vec<(String, String, String)> = {
             let mut stmt = conn
                 .prepare("SELECT uid, rid, json FROM calendar_events ORDER BY uid")

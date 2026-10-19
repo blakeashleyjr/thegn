@@ -110,11 +110,11 @@ use std::sync::Arc;
 /// - Recurrence work is ~32 units per materialized occurrence (period +
 ///   candidate + filter passes).
 /// - Retained bytes are the dimension that actually binds, deliberately: at
-///   the measured ~680 bytes per occurrence a saturated account costs ~66 MB
-///   against this 64 MiB ceiling — about 1% of slack. That is the contract,
-///   not an oversight: memory, rather than an arbitrary count, is what stops
-///   an expansion. Growing [`CalEvent`] eats that slack, which is why the
-///   test above asserts the whole-account total from the MEASURED
+///   the measured 718 bytes per occurrence a saturated account costs
+///   70,364,000 bytes (about 67.1 MiB), within this 72 MiB ceiling. That is
+///   the contract, not an oversight: memory, rather than an arbitrary count,
+///   is what stops an expansion. Growing [`CalEvent`] eats that slack, which
+///   is why the test above asserts the whole-account total from the MEASURED
 ///   per-occurrence cost. When it fails, re-derive this ceiling instead of
 ///   loosening the test, or a saturated account will report its month
 ///   unavailable in production while the suite stays green.
@@ -123,7 +123,7 @@ pub const MAX_EXPANSION_SOURCE_VISITS: usize = 65_536;
 pub const MAX_EXPANSION_RECURRENCE_WORK: usize = 4_194_304;
 pub const MAX_EXPANSION_OCCURRENCES: usize = 131_072;
 pub const MAX_EXPANSION_BUCKET_ENTRIES: usize = 524_288;
-pub const MAX_EXPANSION_BYTES: usize = 64 * 1024 * 1024;
+pub const MAX_EXPANSION_BYTES: usize = 72 * 1024 * 1024;
 pub const MAX_EVENT_PAYLOAD_BYTES: usize = 1024 * 1024;
 pub const MAX_EVENT_CHILD_ENTRIES: usize = 16_384;
 
