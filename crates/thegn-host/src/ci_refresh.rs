@@ -14,6 +14,7 @@ use std::sync::{
 use std::time::{Duration, Instant};
 
 use termwiz::terminal::TerminalWaker;
+use thegn_core::store::WorkspaceStore;
 
 const MAX_LOG_INGEST_CALLS: usize = 32;
 const MAX_LOG_INGEST_BYTES: usize = 8 * 1024 * 1024;
@@ -605,13 +606,17 @@ fn sweep_one_background(
     if others.is_empty() {
         return;
     }
+    let locations = thegn_core::db::Db::open()
+        .and_then(|db| db.worktrees())
+        .map(|rows| thegn_core::remote::WorktreeLocations::from_rows(&rows))
+        .unwrap_or_default();
     let start = SWEEP_CURSOR.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     for i in 0..others.len() {
         let p = std::path::Path::new(others[(start + i) % others.len()]);
         if !p.is_dir() {
             continue;
         }
-        let loc = thegn_core::remote::GitLoc::for_worktree(p);
+        let loc = locations.loc(p);
         // First worktree that actually fetched (fresh ones are skipped by the
         // guard) ends the sweep — one provider subprocess per tick, max.
         if cancel.load(Ordering::Relaxed) {
