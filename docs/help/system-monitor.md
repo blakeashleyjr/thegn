@@ -74,9 +74,9 @@ log scale while Network stays on a live linear one.
   load average — fall back to `window` under `fixed`, since there is no honest
   number to divide by.
 
-On the Memory, Thermal, and Network graphs, leading gaps before the first
-reading stay blank; later gaps carry the last reading forward. In the Overview
-traffic graphs, empty intervals for network and disk I/O rates read as zero.
+On the Overview, CPU, Memory, Thermal, Network, Disk and Power history
+graphs, leading gaps before the first reading stay blank; later gaps carry the
+last reading forward.
 
 `Space` **pauses**. That freezes the picture. The history graphs keep recording
 at the normal, non-live rate, so resuming shows no gap; the monitor's detailed
@@ -195,16 +195,21 @@ The Disk tab is a panel board. `disk.io` shows aggregate read/write throughput
 and its selected-window history with the actual peak values and units. `disk.pressure`
 shows I/O PSI on a 0–100% scale. `disk.devices` shows device rates and utilization
 with each trend's peak labeled. `disk.filesystems` shows each mount point,
-filesystem type, used/total space, and a fill gauge; `+N` marks further mount
-points of the same superblock folded into that row. `disk.slice` shows thegn.slice
-I/O totals, interval rates, and their actual history peaks. Each placed panel
-requests only its own collectors; `disk.worktrees` uses the background `[disk]`
-scanner cache and requests no collector.
+filesystem type, used/total space, and a fill gauge; it does not show available
+space as a separate column; `+N` marks further mount points of the same
+superblock folded into that row. `disk.slice` shows thegn.slice I/O totals,
+interval rates, and their actual history peaks. Each placed panel requests only
+its own collectors; `disk.worktrees` uses the background `[disk]` scanner cache
+and requests no collector.
 
-`disk.worktrees` lists total size, reclaimable `target/` size, and measurement
-age; its title gives the total reclaimable amount. An empty cache says “no cached
-sizes yet”. Opening the tab never starts a `du` walk, and a stale row shows its
-age rather than blocking on a rescan. `j`/`k` and the arrows move the highlighted
+`disk.worktrees` lists each cached worktree's total size, reclaimable `target/`
+size, and measurement age; its title gives the total reclaimable amount. It
+does not show a time-to-full projection. The optional `[stats.alerts] disk_eta`
+rule (off by default) still uses recorded free-space history and fires when its
+runway drops below the configured number of hours. An empty cache says “no
+cached sizes yet”.
+Opening the tab never starts a `du` walk, and a stale row shows its age rather
+than blocking on a rescan. `j`/`k` and the arrows move the highlighted
 worktree, and the panel scrolls to keep that row visible. `x` opens the existing
 clean confirmation for the highlighted row while the Worktrees panel is on
 screen. Cleaning keeps the checkout and removes only regenerable build artifacts
@@ -222,6 +227,12 @@ The Filesystems panel shows each mount point, filesystem type, used/total
 space, and a fill gauge. It does not show available space as a separate
 column. `+N` marks further mount points of the same superblock folded into that
 row.
+clean confirmation for the highlighted row. Cleaning keeps the checkout and
+removes only regenerable build artifacts off the event loop; the row updates
+after the next measurement. Use `f`/`F` to move panel focus, `z` to zoom, and
+`Esc` to unzoom before closing the monitor. The Disk masthead chip expands into
+this tab.
+
 On Linux, `thegn doctor` also reports Disk health from UDisks2 when available,
 including health, critical warnings, wear, spare, read/write totals, power-on
 time, and the last four serial characters. Missing serial or health values
