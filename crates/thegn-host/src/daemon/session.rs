@@ -1171,7 +1171,7 @@ impl SessionActor {
                         let _ = self.events.send(Arc::new(EventFrame::Sessions)); // best-effort: send: the consumer may be gone; a closed channel is the consumer going away
                         Ok(self.record_status())
                     }
-                    Err(e) => Err(ControlError::Internal(e.into())),
+                    Err(error) => Err(super::record::start_error_to_control(error)),
                 }
             }
             RecordSpec::Stop => {
