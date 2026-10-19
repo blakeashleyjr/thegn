@@ -145,9 +145,8 @@
     {
       "issue": "THE-118",
       "project": "Agent & Workflow Platform",
-      "changes": [
-        "add-agent-model-env-selection"
-      ]
+      "changes": [],
+      "no_spec_rationale": "Runtime model selection and pipeline-board presentation delivered and archived as add-agent-model-env-selection (2026-10-19). The residual split has no proposal yet."
     },
     {
       "issue": "THE-119",
