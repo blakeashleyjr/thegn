@@ -141,9 +141,8 @@ impl ScanPool {
             return;
         }
         let me = Arc::clone(self);
-        let spawned = std::thread::Builder::new()
-            .name("thegn-glyph-scan".into())
-            .spawn(move || me.worker_loop());
+        let spawned =
+            thegn_core::thread_name::try_spawn_named("thegn-glyph", move || me.worker_loop());
         if spawned.is_err() {
             // Bounded and visible: undo the reservation. If no worker exists
             // at all, nothing would ever drain the queue, so fail everything
