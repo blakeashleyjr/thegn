@@ -3,6 +3,10 @@
 #[path = "containers/view.rs"]
 pub(in crate::monitor) mod view;
 
+#[cfg(test)]
+#[path = "containers/containers_wire_tests.rs"]
+mod wire_tests;
+
 use super::super::build::*;
 use super::super::{
     ContainerReqKind, ContainerRequest, ContainerRowMeta, MonitorAction, MonitorOutcome,
@@ -14,36 +18,13 @@ use crate::seg::Tok;
 use thegn_core::theme::Hue;
 
 pub(in crate::monitor) fn containers(cx: &Ctx, sel: usize) -> TabBuild {
-    use thegn_core::sandbox_manage::{Health, container_health, human_bytes};
+    use thegn_core::sandbox_manage::{Health, container_health};
     let list = &cx.model.containers;
 
     // Aggregate footprint header. Owned counts are precise (ownership-filtered
     // listings); the byte total is the engine-wide `df` total, marked partial
     // when a detected engine has no `df` op.
-    let owned = list.iter().filter(|c| c.ours).count();
-    // The list deliberately includes containers thegn does not own (each row is
-    // marked "(foreign)"), so the HEADING may not claim them — it used to read
-    // "thegn containers" over a mixed list. The ownership split lives in the
-    // note instead, where both counts are visible.
-    let foreign = list.iter().filter(|c| !c.ours).count();
-    let running = list
-        .iter()
-        .filter(|c| c.ours && thegn_core::sandbox_manage::container_running(&c.status))
-        .count();
-    let split = format!("{owned} owned · {foreign} foreign");
-    let note = match &cx.model.container_footprint {
-        Some(fp) => {
-            let bytes = human_bytes(fp.total_bytes());
-            format!(
-                "{split} · {} img · {} vol · {}{} engine disk",
-                fp.images,
-                fp.volumes,
-                if fp.partial { "≥" } else { "" },
-                bytes,
-            )
-        }
-        None => format!("{split} · {running} running"),
-    };
+    let note = ownership_note(list, cx.model.container_footprint);
     let mut out = vec![heading("containers", Some(note))];
 
     if list.is_empty() {
@@ -119,6 +100,32 @@ pub(in crate::monitor) fn containers(cx: &Ctx, sel: usize) -> TabBuild {
     TabBuild {
         sections: out,
         row_y,
+    }
+}
+
+pub(in crate::monitor) fn ownership_note(
+    list: &[thegn_core::sandbox::ContainerInfo],
+    footprint: Option<thegn_core::sandbox_manage::ContainerFootprint>,
+) -> String {
+    use thegn_core::sandbox_manage::human_bytes;
+    let owned = list.iter().filter(|c| c.ours).count();
+    // The list deliberately includes containers thegn does not own (each row is
+    // marked "(foreign)"), so the heading must show the ownership split.
+    let foreign = list.iter().filter(|c| !c.ours).count();
+    let running = list
+        .iter()
+        .filter(|c| c.ours && thegn_core::sandbox_manage::container_running(&c.status))
+        .count();
+    let split = format!("{owned} owned · {foreign} foreign");
+    match footprint {
+        Some(fp) => format!(
+            "{split} · {} img · {} vol · {}{} engine disk",
+            fp.images,
+            fp.volumes,
+            if fp.partial { "≥" } else { "" },
+            human_bytes(fp.total_bytes()),
+        ),
+        None => format!("{split} · {running} running"),
     }
 }
 
