@@ -484,9 +484,7 @@ pub fn spawn_ndjson_stream<S: NdjsonSink>(
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    for (k, v) in env {
-        cmd.env(k, v);
-    }
+    super::env::apply_plugin_env(&mut cmd, env);
     if let Some(d) = cwd.filter(|d| d.is_dir()) {
         cmd.current_dir(d);
     }

@@ -21,8 +21,12 @@ Two equivalent homes:
 - A directory: `<config dir>/plugins/<name>/plugin.toml` with the same
   fields. Its `cwd` defaults to that directory.
 
-The optional `env` map adds or overrides environment variables for the plugin
-process; other inherited variables remain available. Values may be
+Plugins start with a clean environment: only PATH, HOME, the user, locale,
+time-zone, terminal, and temp-directory variables (plus the Windows system
+variables a process needs) are passed through, along with the plugin's own
+`env` map. Tokens, agent sockets, and thegn's own variables are not passed
+through unless the user's `[[plugins]]` entry sets `trusted_native = true`,
+which keeps the full environment. Values may be
 `keyring:NAME`, `env:VAR`, or `file:PATH` references, resolved just before the
 plugin starts; other values pass verbatim. Only a `[[plugins]]` entry in your
 config may use references: a reference in a directory `plugin.toml` refuses

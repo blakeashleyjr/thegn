@@ -149,6 +149,35 @@ fn rejected_resident_frame_does_not_stop_later_messages() {
 }
 
 #[test]
+fn resident_child_sees_allowlist_but_not_ambient_secrets() {
+    let _env = thegn_core::testenv::EnvGuard::set(&[
+        ("THEGN_B53_PLUGIN_SECRET", "s3cr3t"),
+        ("GH_TOKEN", "b53-token"),
+    ]);
+    let mut env = BTreeMap::new();
+    env.insert("X".into(), "configured".into());
+    let (tx, rx) = mpsc::channel();
+    let fixture = FixtureSupervisor::new();
+    let _session = fixture
+        .spawn(
+            &sh(r#"printf '{"method":"probe","params":{"secret":"%s","gh":"%s","path_set":"%s","x":"%s"}}\n' "${THEGN_B53_PLUGIN_SECRET:-}" "${GH_TOKEN:-}" "${PATH:+yes}" "${X:-}""#),
+            &env,
+            None,
+            move |event| drop(tx.send(event)),
+        )
+        .unwrap();
+
+    let events = collect(&rx);
+    let Some(SessionEvent::Message(message)) = events.first() else {
+        panic!("resident probe message missing: {events:?}");
+    };
+    assert_eq!(message.params["secret"], "");
+    assert_eq!(message.params["gh"], "");
+    assert_eq!(message.params["path_set"], "yes");
+    assert_eq!(message.params["x"], "configured");
+}
+
+#[test]
 fn invalid_utf8_resident_line_is_junk_and_later_message_is_delivered() {
     let (tx, rx) = mpsc::channel();
     let fixture = FixtureSupervisor::new();
