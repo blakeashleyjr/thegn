@@ -1974,75 +1974,33 @@ mod tests {
 
     #[test]
     fn worktree_locations_match_gitloc_from_db_for_persisted_rows_and_misses() {
+        fn row(path: &str, location: &str, position: i64) -> crate::models::WorktreeRow {
+            crate::models::WorktreeRow {
+                worktree: path.into(),
+                branch: String::new(),
+                agent: String::new(),
+                created_at: 0,
+                repo_root: String::new(),
+                tab_name: String::new(),
+                session_name: String::new(),
+                location: location.into(),
+                position,
+                sandbox_backend: None,
+                observed_backend: None,
+                folder_id: None,
+                env_name: None,
+            }
+        }
+
         let ssh = GitLoc::remote_db_string("box", 22, false, "/r/wt");
         let provider =
             GitLoc::provider_db_string(&["sprite".into(), "exec".into()], "/provider/wt");
         let rows = [
-            crate::models::WorktreeRow {
-                worktree: "/r/wt".into(),
-                branch: String::new(),
-                agent: String::new(),
-                created_at: 0,
-                repo_root: String::new(),
-                tab_name: String::new(),
-                session_name: String::new(),
-                location: ssh.clone(),
-                position: 0,
-                sandbox_backend: None,
-                observed_backend: None,
-            },
-            crate::models::WorktreeRow {
-                worktree: "/provider/wt".into(),
-                branch: String::new(),
-                agent: String::new(),
-                created_at: 0,
-                repo_root: String::new(),
-                tab_name: String::new(),
-                session_name: String::new(),
-                location: provider.clone(),
-                position: 1,
-                sandbox_backend: None,
-                observed_backend: None,
-            },
-            crate::models::WorktreeRow {
-                worktree: "/blank".into(),
-                branch: String::new(),
-                agent: String::new(),
-                created_at: 0,
-                repo_root: String::new(),
-                tab_name: String::new(),
-                session_name: String::new(),
-                location: String::new(),
-                position: 2,
-                sandbox_backend: None,
-                observed_backend: None,
-            },
-            crate::models::WorktreeRow {
-                worktree: "/local".into(),
-                branch: String::new(),
-                agent: String::new(),
-                created_at: 0,
-                repo_root: String::new(),
-                tab_name: String::new(),
-                session_name: String::new(),
-                location: "local".into(),
-                position: 3,
-                sandbox_backend: None,
-                observed_backend: None,
-            },
-            crate::models::WorktreeRow {
-                worktree: String::new(),
-                branch: String::new(),
-                agent: String::new(),
-                created_at: 0,
-                repo_root: String::new(),
-                tab_name: String::new(),
-                session_name: String::new(),
-                location: ssh.clone(),
-                position: 4,
-                sandbox_backend: None,
-                observed_backend: None,
-            },
+            row("/r/wt", &ssh, 0),
+            row("/provider/wt", &provider, 1),
+            row("/blank", "", 2),
+            row("/local", "local", 3),
+            row("", &ssh, 4),
         ];
         let locations = WorktreeLocations::from_rows(&rows);
 

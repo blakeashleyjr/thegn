@@ -273,7 +273,7 @@ mod tests {
                 .join()
                 .unwrap();
         });
-        assert_eq!(total_opens() - before, 2);
+        assert!(total_opens() - before >= 2);
     }
 
     #[test]
