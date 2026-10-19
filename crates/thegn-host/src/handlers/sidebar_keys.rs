@@ -1457,7 +1457,7 @@ mod tests {
 
         assert!(matches!(
             model_repo_root(&model, "/r/app"),
-            ModelRepoRoot::Git(path) if path == std::path::PathBuf::from("/r/app")
+            ModelRepoRoot::Git(path) if path == std::path::Path::new("/r/app")
         ));
     }
 
@@ -1509,7 +1509,7 @@ mod tests {
 
         assert!(matches!(
             model_repo_root(&model, "/r/app-wt/feat"),
-            ModelRepoRoot::Git(path) if path == std::path::PathBuf::from("/r/app")
+            ModelRepoRoot::Git(path) if path == std::path::Path::new("/r/app")
         ));
         assert_eq!(
             resolve_repo_root(&model, "/r/app-wt/feat", |_| {
