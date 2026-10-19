@@ -1059,7 +1059,7 @@ impl<'a> Wire<'a> {
 }
 
 /// Strict, bounded standard-alphabet base64 with mandatory canonical padding.
-fn decode_base64(raw: &str) -> Option<Vec<u8>> {
+pub(crate) fn decode_base64(raw: &str) -> Option<Vec<u8>> {
     let bytes = raw.as_bytes();
     if bytes.is_empty() || !bytes.len().is_multiple_of(4) || bytes.len() > MAX_PROVIDER_KEY_BYTES {
         return None;
