@@ -71,7 +71,7 @@ const SPECS: [PanelSpec; 5] = [
     },
 ];
 
-#[derive(Debug, Clone)]
+#[derive(Default, Debug, Clone)]
 struct Ring {
     values: [f32; HISTORY_CAP],
     next: usize,
@@ -134,24 +134,6 @@ struct Slot {
     write_history: Ring,
 }
 
-impl Default for Slot {
-    fn default() -> Self {
-        Self {
-            id: None,
-            matched: false,
-            cpu: None,
-            memory: None,
-            peak: None,
-            pids: None,
-            read: None,
-            write: None,
-            cpu_history: Ring::default(),
-            memory_history: Ring::default(),
-            read_history: Ring::default(),
-            write_history: Ring::default(),
-        }
-    }
-}
 
 #[derive(Debug, Clone)]
 pub(in crate::monitor) struct ContainersModel {
