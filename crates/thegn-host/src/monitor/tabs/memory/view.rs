@@ -1595,22 +1595,18 @@ impl MemoryView<'_> {
             return;
         };
         let used = total.saturating_sub(free);
+        let used_text = compact_bytes(Some(used));
+        let total_text = compact_bytes(Some(total));
+        let zram_used_text = compact_bytes(self.0.zram_used);
+        let zswap_text = compact_bytes(self.0.zswap);
         let label = compact_swap_label(
             body.cols,
-            format!(
-                "used {} / {}  zram {}  zswap {}",
-                compact_bytes(Some(used)),
-                compact_bytes(Some(total)),
-                compact_bytes(self.0.zram_used),
-                compact_bytes(self.0.zswap)
-            ),
-            format!(
-                "used {}/{}  zram {}  zswap {}",
-                compact_bytes(Some(used)),
-                compact_bytes(Some(total)),
-                compact_bytes(self.0.zram_used),
-                compact_bytes(self.0.zswap)
-            ),
+            || {
+                format!(
+                    "used {used_text} / {total_text}  zram {zram_used_text}  zswap {zswap_text}"
+                )
+            },
+            || format!("used {used_text}/{total_text}  zram {zram_used_text}  zswap {zswap_text}"),
         );
         grid.view(Rect {
             x: body.x,
@@ -1646,44 +1642,19 @@ impl MemoryView<'_> {
         }
         if body.rows > 2 && self.0.zram_present {
             let (original, compressed, device) = self.0.zram_totals;
-            let zram_line = match (original, compressed, device) {
-                (Some(original), Some(compressed), Some(device)) if original > 0 => format!(
-                    "zram original {}  compressed {}  device {}",
-                    compact_bytes(Some(original)),
-                    compact_bytes(Some(compressed)),
-                    compact_bytes(Some(device))
-                ),
-                (Some(original), Some(compressed), _) => format!(
-                    "zram original {}  compressed {}  device {}",
-                    compact_bytes(Some(original)),
-                    compact_bytes(Some(compressed)),
-                    absent_mark()
-                ),
-                _ => format!(
-                    "zram original {}  compressed {}  device {}",
-                    absent_mark(),
-                    absent_mark(),
-                    absent_mark()
-                ),
-            };
+            let (original_text, compressed_text, device_text) = (
+                compact_bytes(original),
+                compact_bytes(compressed),
+                compact_bytes(device),
+            );
             let zram_line = compact_swap_label(
                 body.cols,
-                zram_line,
-                format!(
-                    "zram orig {}  comp {}  dev {}",
-                    original.map_or_else(
-                        || absent_mark().to_owned(),
-                        |value| compact_bytes(Some(value))
-                    ),
-                    compressed.map_or_else(
-                        || absent_mark().to_owned(),
-                        |value| compact_bytes(Some(value))
-                    ),
-                    device.map_or_else(
-                        || absent_mark().to_owned(),
-                        |value| compact_bytes(Some(value))
+                || {
+                    format!(
+                        "zram original {original_text}  compressed {compressed_text}  device {device_text}"
                     )
-                ),
+                },
+                || format!("zram orig {original_text}  comp {compressed_text}  dev {device_text}"),
             );
             grid.view(Rect {
                 x: body.x,
@@ -1998,11 +1969,16 @@ fn compact_bytes(value: Option<u64>) -> String {
         },
     )
 }
-fn compact_swap_label(body_cols: usize, full: String, short: String) -> String {
+fn compact_swap_label(
+    body_cols: usize,
+    full: impl FnOnce() -> String,
+    short: impl FnOnce() -> String,
+) -> String {
+    let full = full();
     if full.chars().count() <= body_cols {
         full
     } else {
-        short
+        short()
     }
 }
 fn reading_text(value: Option<u64>, unit: Unit) -> String {
