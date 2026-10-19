@@ -101,9 +101,15 @@ impl TunnelDeadlines {
 }
 
 /// Per-run admission and deadline settings for the host endpoint.
+///
+/// A configured write-stall value of zero maps to 60 seconds; configured idle
+/// and lifetime values of zero map to `None` (disabled).
 pub struct HostLimits {
+    /// Per-run maximum; zero rejects every connection.
     pub max_connections: usize,
+    /// Process-wide permits shared by host tunnel runs.
     pub global_permits: Arc<Semaphore>,
+    /// Deadlines for the run, with configured zero values mapped as above.
     pub deadlines: TunnelDeadlines,
 }
 
@@ -438,6 +444,7 @@ fn decode_err(e: thegn_core::revtunnel::DecodeError) -> io::Error {
 /// task) onto the shared stream write half. Returns the frame sink. The sink is
 /// **bounded** ([`CHANNEL_DEPTH`]) so a producer outracing the stream write
 /// blocks on `send().await` instead of queueing unboundedly (see the constant).
+#[cfg(test)]
 fn spawn_sink<W: AsyncWrite + Unpin + Send + 'static>(
     wr: W,
 ) -> (Sender<Vec<u8>>, JoinHandle<io::Result<()>>) {
@@ -582,10 +589,12 @@ async fn pump_conn_with_deadlines(
             let idle_deadline = deadlines
                 .idle
                 .and_then(|idle| started.checked_add(last_activity)?.checked_add(idle));
+            let lifetime_sleep = sleep_or_pending(lifetime_deadline);
+            let idle_sleep = sleep_or_pending(idle_deadline);
             tokio::select! {
                 _ = &mut directions => break None,
-                _ = async { match lifetime_deadline { Some(at) => tokio::time::sleep_until(at).await, None => std::future::pending::<()>().await } } => break Some(RejectionReason::Lifetime),
-                _ = async { match idle_deadline { Some(at) => tokio::time::sleep_until(at).await, None => std::future::pending::<()>().await } } => break Some(RejectionReason::Idle),
+                _ = lifetime_sleep => break Some(RejectionReason::Lifetime),
+                _ = idle_sleep => break Some(RejectionReason::Idle),
                 _ = activity_notify.notified() => continue,
                 _ = stall_notify.notified() => break Some(RejectionReason::WriteStall),
             }
@@ -607,6 +616,13 @@ async fn pump_conn_with_deadlines(
     }
     if let Err(error) = wr.shutdown().await {
         tracing::debug!(target: "thegn::revtunnel", %error, "local tunnel stream shutdown failed");
+    }
+}
+
+async fn sleep_or_pending(at: Option<tokio::time::Instant>) {
+    match at {
+        Some(at) => tokio::time::sleep_until(at).await,
+        None => std::future::pending::<()>().await,
     }
 }
 
@@ -779,6 +795,8 @@ where
     .await
 }
 
+/// Run a host endpoint with per-run limits. Configured write-stall zero maps to
+/// 60 seconds; configured idle and lifetime zero map to `None` (disabled).
 pub async fn run_host_with_limits<S, D>(stream: S, dialer: D, limits: HostLimits) -> io::Result<()>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
@@ -928,6 +946,8 @@ where
     run_sandbox_with_deadlines(stream, listener, TunnelDeadlines::default()).await
 }
 
+/// Run a sandbox endpoint with per-connection deadlines. Configured write-stall
+/// zero maps to 60 seconds; configured idle and lifetime zero map to `None`.
 pub async fn run_sandbox_with_deadlines<S>(
     stream: S,
     listener: TcpListener,

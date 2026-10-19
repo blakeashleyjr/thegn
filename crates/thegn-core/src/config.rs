@@ -4163,13 +4163,20 @@ impl Default for ForwardConfig {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Normalized reverse-tunnel deadline settings in seconds; write-stall zero is
+/// 60 seconds, while idle and lifetime zero are disabled (`None`).
 pub struct TunnelDeadlineSecs {
+    /// Write-stall limit; zero is normalized to 60 seconds.
     pub write_stall: u64,
+    /// Idle limit; `None` means disabled (configured zero).
     pub idle: Option<u64>,
+    /// Lifetime limit; `None` means disabled (configured zero).
     pub lifetime: Option<u64>,
 }
 
 impl ForwardConfig {
+    /// Return normalized tunnel deadlines: write-stall zero becomes 60, while
+    /// idle and lifetime zero become `None` (disabled).
     pub fn tunnel_deadlines(&self) -> TunnelDeadlineSecs {
         TunnelDeadlineSecs {
             write_stall: if self.reverse_write_stall_secs == 0 {
