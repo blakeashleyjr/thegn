@@ -7971,6 +7971,7 @@ async fn event_loop<T: Terminal>(
     let mut warm_commits_next = false;
     // Input dispatch time; next render measures dispatch→frame latency + drives the input-priority PTY budget.
     let mut input_at: Option<std::time::Instant> = None;
+    let mut input_went_idle = false;
     // Tab/worktree-switch action time; the first post-switch frame records
     // switch→frame latency (`switch_us`) — the perceived switch cost.
     let mut switch_at: Option<(std::time::Instant, crate::perf::SwitchKind)> = None;
@@ -16138,9 +16139,24 @@ async fn event_loop<T: Terminal>(
             // `writer.take_status()` at the next wake. The termwiz debug
             // renderer keeps the old synchronous path (it writes via the
             // BufferedTerminal) with its inline retry handling.
+            let input_close = if crate::perf::enabled() {
+                crate::perf_timing::classify_input(
+                    input_at,
+                    input_went_idle,
+                    std::time::Instant::now(),
+                )
+            } else {
+                crate::perf_timing::InputClose::None
+            };
+            let frame_input_at = match input_close {
+                crate::perf_timing::InputClose::Latency(stamp) => Some(stamp),
+                crate::perf_timing::InputClose::None | crate::perf_timing::InputClose::NoEffect => {
+                    None
+                }
+            };
             let flush_t0 = std::time::Instant::now();
             if use_termwiz_renderer {
-                let stamp = crate::perf_timing::FrameStamp::capture(input_at);
+                let stamp = crate::perf_timing::FrameStamp::capture(frame_input_at);
                 let frame_write = crate::frame_write::emit_frame(
                     true,
                     buf,
@@ -16191,7 +16207,7 @@ async fn event_loop<T: Terminal>(
                 }
                 if !writer.submit_frame(
                     cells.into_bytes(),
-                    crate::perf_timing::FrameStamp::capture(input_at),
+                    crate::perf_timing::FrameStamp::capture(frame_input_at),
                 ) {
                     // Unreachable by construction; if it ever fires, resync
                     // with a full repaint rather than corrupt the diff chain.
@@ -16262,8 +16278,10 @@ async fn event_loop<T: Terminal>(
                 frame_t0.elapsed(),
                 incremental_frame,
                 &mut input_at,
+                input_close,
                 &mut switch_at,
             );
+            input_went_idle = false;
             // Consumed: the next frame is full unless another drag/scroll re-arms it.
             selection_only = false;
             scroll_only = false;
@@ -16365,6 +16383,9 @@ async fn event_loop<T: Terminal>(
             None => {
                 if crate::perf::enabled() {
                     loop_perf.add_busy(active_clock.checkpoint(std::time::Instant::now()));
+                }
+                if timeout.is_none() && input_at.is_some() {
+                    input_went_idle = true;
                 }
                 let event = buf.terminal().poll_input(timeout);
                 // This boundary excludes only the terminal poll wait. Queued
