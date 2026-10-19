@@ -14,7 +14,7 @@
 //! router stays in OpenAI space and never branches on a vendor name.
 
 use anyhow::{Context, Result};
-use futures::future::BoxFuture;
+use futures::{StreamExt, future::BoxFuture};
 use thegn_core::proxy::translate;
 
 use crate::model::{Backend, Wire};
@@ -22,8 +22,27 @@ use crate::shared::now_unix;
 
 /// Anthropic API version pinned for the `/v1/messages` surface.
 const ANTHROPIC_VERSION: &str = "2023-06-01";
-/// Total deadline for buffered upstream requests, including reading the body.
-const UPSTREAM_TOTAL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
+/// Phase budgets for buffered dispatch. The router owns the overall deadline.
+#[derive(Clone, Copy)]
+pub struct DispatchDeadlines {
+    pub first_byte: std::time::Duration,
+    pub idle: std::time::Duration,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DispatchTimeout {
+    FirstByte,
+    Idle,
+}
+impl std::fmt::Display for DispatchTimeout {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::FirstByte => "first-byte timeout",
+            Self::Idle => "idle timeout",
+        })
+    }
+}
+impl std::error::Error for DispatchTimeout {}
 
 /// A normalized backend reply in OpenAI shape. `headers` carries the upstream
 /// response headers for cost / Retry-After extraction (see [`crate::headers`]).
@@ -57,6 +76,7 @@ pub trait ModelUpstream: Send + Sync {
         client: &'a reqwest::Client,
         backend: &'a Backend,
         body_openai: &'a [u8],
+        deadlines: DispatchDeadlines,
     ) -> BoxFuture<'a, Result<BackendResponse>>;
     /// Opens a live streaming upstream response (OpenAI SSE). Adapters without
     /// `caps().streaming` return an error and the router uses buffered synthesis.
@@ -111,30 +131,36 @@ impl ModelUpstream for OpenAiCompatUpstream {
         client: &'a reqwest::Client,
         backend: &'a Backend,
         body: &'a [u8],
+        deadlines: DispatchDeadlines,
     ) -> BoxFuture<'a, Result<BackendResponse>> {
         Box::pin(async move {
             let url = format!(
                 "{}/chat/completions",
                 backend.base_url.trim_end_matches('/')
             );
-            let mut req = client
-                .post(&url)
-                .timeout(UPSTREAM_TOTAL_TIMEOUT)
-                .header("content-type", "application/json");
+            let mut req = client.post(&url).header("content-type", "application/json");
             if !backend.api_key.is_empty() {
                 req = req.bearer_auth(&backend.api_key);
             }
-            let resp = req
-                .body(body.to_vec())
-                .send()
+            let resp = tokio::time::timeout(deadlines.first_byte, req.body(body.to_vec()).send())
                 .await
+                .map_err(|_| anyhow::Error::new(DispatchTimeout::FirstByte))?
                 .with_context(|| format!("POST {url}"))?;
             let status = resp.status().as_u16();
             let headers = resp.headers().clone();
-            let bytes = resp.bytes().await.context("read upstream body")?;
+            let mut stream = resp.bytes_stream();
+            let mut bytes = Vec::new();
+            loop {
+                match tokio::time::timeout(deadlines.idle, stream.next()).await {
+                    Err(_) => return Err(anyhow::Error::new(DispatchTimeout::Idle)),
+                    Ok(None) => break,
+                    Ok(Some(Err(error))) => return Err(error).context("read upstream body"),
+                    Ok(Some(Ok(chunk))) => bytes.extend_from_slice(&chunk),
+                }
+            }
             Ok(BackendResponse {
                 status,
-                body: bytes.to_vec(),
+                body: bytes,
                 headers,
             })
         })
@@ -186,6 +212,7 @@ impl ModelUpstream for AnthropicUpstream {
         client: &'a reqwest::Client,
         backend: &'a Backend,
         body_openai: &'a [u8],
+        deadlines: DispatchDeadlines,
     ) -> BoxFuture<'a, Result<BackendResponse>> {
         Box::pin(async move {
             // OpenAI → Anthropic, forcing non-streaming upstream.
@@ -195,24 +222,33 @@ impl ModelUpstream for AnthropicUpstream {
             )
             .context("translate request to anthropic")?;
             let url = format!("{}/messages", backend.base_url.trim_end_matches('/'));
-            let resp = client
+            let req = client
                 .post(&url)
-                .timeout(UPSTREAM_TOTAL_TIMEOUT)
                 .header("content-type", "application/json")
                 .header("x-api-key", &backend.api_key)
                 .header("anthropic-version", ANTHROPIC_VERSION)
-                .body(serde_json::to_vec(&anthropic_body)?)
-                .send()
+                .body(serde_json::to_vec(&anthropic_body)?);
+            let resp = tokio::time::timeout(deadlines.first_byte, req.send())
                 .await
+                .map_err(|_| anyhow::Error::new(DispatchTimeout::FirstByte))?
                 .with_context(|| format!("POST {url}"))?;
             let status = resp.status().as_u16();
             let headers = resp.headers().clone();
-            let raw = resp.bytes().await.context("read anthropic body")?;
+            let mut stream = resp.bytes_stream();
+            let mut raw = Vec::new();
+            loop {
+                match tokio::time::timeout(deadlines.idle, stream.next()).await {
+                    Err(_) => return Err(anyhow::Error::new(DispatchTimeout::Idle)),
+                    Ok(None) => break,
+                    Ok(Some(Err(error))) => return Err(error).context("read anthropic body"),
+                    Ok(Some(Ok(chunk))) => raw.extend_from_slice(&chunk),
+                }
+            }
             if !(200..300).contains(&status) {
                 // Pass the upstream error through unchanged so the router classifies it.
                 return Ok(BackendResponse {
                     status,
-                    body: raw.to_vec(),
+                    body: raw,
                     headers,
                 });
             }
