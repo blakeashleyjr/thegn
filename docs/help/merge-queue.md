@@ -48,8 +48,10 @@ grace period below. Prefer `thegn merge add`.
 
 - A blocked branch is re-attempted by the next drain automatically. Once
   it has burned its `agent_max_attempts` the agent stops being
-  dispatched for it — `thegn merge retry` (or the section's `r`) re-arms
-  it after you've fixed something.
+  dispatched for it — `thegn merge retry` re-arms held rows only
+  (`deferred`, `gate_failed`, `gate_error`, `agent_blocked`, or `needs_human`)
+  after you've fixed something, and refuses every other state. The section's
+  `r` gesture follows its own retry path.
 
 ## Land strategy, signing, drivers
 
