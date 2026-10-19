@@ -67,7 +67,7 @@ fn should_refund_connect_failure(is_connect: bool, took_token: bool) -> bool {
     is_connect && took_token
 }
 
-fn refund_connect_failure(state: &SharedState, ident: &str, is_connect: bool, took_token: bool) {
+fn refund_connect_failure(state: &AppState, ident: &str, is_connect: bool, took_token: bool) {
     if should_refund_connect_failure(is_connect, took_token) {
         state.limiter.refund(ident, Instant::now());
     }
