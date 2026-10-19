@@ -218,17 +218,17 @@ fn refresh_command(dir: &str, branch: &str, recursive_submodules: bool) -> Strin
     };
     format!(
         "set -e; d={d}; record={record}; git -C \"$d\" fetch -q {bundle} HEAD; \\
-if ! git -C \"$d\" merge-base --is-ancestor HEAD FETCH_HEAD; then \\
-printf '%s\\n' 'remote-only commit; checkout retained for reconciliation' >&2; exit 3; \\
-fi; \\
 if [ -e \"$record\" ]; then \\
 expected_head=$(sed -n '2p' \"$record\"); expected_tree=$(sed -n '1p' \"$record\"); \\
-current_head=$(git -C \"$d\" rev-parse HEAD); \\
-current_tree=$({state_tree_command}); \\
+current_head=$(git -C \"$d\" rev-parse HEAD) || { printf '%s\\n' 'could not compute remote worktree state; checkout retained for reconciliation' >&2; exit 3; }; \\
+current_tree=$({state_tree_command}) || { printf '%s\\n' 'could not compute remote worktree state; checkout retained for reconciliation' >&2; exit 3; }; \\
 if [ -z \"$expected_head\" ] || [ -z \"$expected_tree\" ] || [ \"$current_head\" != \"$expected_head\" ] || [ \"$current_tree\" != \"$expected_tree\" ]; then \\
 printf '%s\\n' 'remote worktree changes differ from last sync; checkout retained for reconciliation' >&2; exit 3; \\
 fi; \\
 else \\
+if ! git -C \"$d\" merge-base --is-ancestor HEAD FETCH_HEAD; then \\
+printf '%s\\n' 'remote-only commit; checkout retained for reconciliation' >&2; exit 3; \\
+fi; \\
 status=$(git -C \"$d\" status --porcelain --untracked-files=all) || { printf '%s\\n' 'could not inspect remote worktree; checkout retained for reconciliation' >&2; exit 3; }; \\
 if [ -n \"$status\" ]; then printf '%s\\n' 'unrecorded remote worktree changes; checkout retained for reconciliation' >&2; exit 3; fi; \\
 fi; \\
@@ -301,7 +301,7 @@ pub(crate) fn retarget_if_remote_oci(
         }
         Err(e) => {
             let warning = format!(
-                "remote worktree sync failed: {e}; after saving any work in it, manual recovery on the remote host: run `rm -rf \"$HOME/thegn-worktrees/{0}\" \"$HOME/thegn-worktrees/{0}.thegn-incomplete\" \"$HOME/thegn-worktrees/{0}.bundle\"`, then retry",
+                "remote worktree sync failed: {e}; after saving any work in it, manual recovery on the remote host: run `rm -rf \"$HOME/thegn-worktrees/{0}\" \"$HOME/thegn-worktrees/{0}.thegn-incomplete\" \"$HOME/thegn-worktrees/{0}.thegn-synced\" \"$HOME/thegn-worktrees/{0}.bundle\"`, then retry",
                 spec.name
             );
             warnings.push(warning.clone());
@@ -847,10 +847,6 @@ mod tests {
     }
 
     #[test]
-    #[expect(
-        clippy::disallowed_methods,
-        reason = "fixture shell runs the refresh guard"
-    )]
     fn refresh_refuses_remote_only_commit_and_keeps_it() {
         let home = temp_home("remote-commit");
         let source = home.join("source");
@@ -903,10 +899,71 @@ mod tests {
     }
 
     #[test]
-    #[expect(
-        clippy::disallowed_methods,
-        reason = "fixture shell runs the refresh guard"
-    )]
+    fn refresh_accepts_amended_local_head_when_remote_state_matches_record() {
+        let home = temp_home("refresh-amend");
+        let source = home.join("source");
+        let checkout = home.join("checkout");
+        std::fs::create_dir_all(&source).unwrap();
+        run_git(&source, &["init", "-q"]);
+        run_git(&source, &["config", "user.email", "thegn@example.invalid"]);
+        run_git(&source, &["config", "user.name", "thegn test"]);
+        std::fs::write(source.join("tracked.txt"), "initial\n").unwrap();
+        run_git(&source, &["add", "tracked.txt"]);
+        run_git(
+            &source,
+            &["-c", "commit.gpgsign=false", "commit", "-qm", "initial"],
+        );
+        run_git(
+            &source,
+            &[
+                "clone",
+                "-q",
+                source.to_str().unwrap(),
+                checkout.to_str().unwrap(),
+            ],
+        );
+        let record = run_sh(&home, &record_command(checkout.to_str().unwrap()));
+        assert!(record.status.success());
+
+        std::fs::write(source.join("tracked.txt"), "amended local commit\n").unwrap();
+        run_git(&source, &["add", "tracked.txt"]);
+        run_git(
+            &source,
+            &[
+                "-c",
+                "commit.gpgsign=false",
+                "commit",
+                "--amend",
+                "-qm",
+                "amended",
+            ],
+        );
+        let source_head = run_git_output(&source, &["rev-parse", "HEAD"]);
+        let bundle = format!("{}.bundle", checkout.display());
+        run_git(&source, &["bundle", "create", &bundle, "HEAD"]);
+        let branch = run_git_output(&source, &["rev-parse", "--abbrev-ref", "HEAD"]);
+        let result = run_sh(
+            &home,
+            &refresh_command(checkout.to_str().unwrap(), &branch, false),
+        );
+
+        assert!(
+            result.status.success(),
+            "{}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+        assert_eq!(
+            run_git_output(&checkout, &["rev-parse", "HEAD"]),
+            source_head
+        );
+        assert_eq!(
+            std::fs::read_to_string(checkout.join("tracked.txt")).unwrap(),
+            "amended local commit\n"
+        );
+        std::fs::remove_dir_all(home).unwrap();
+    }
+
+    #[test]
     fn refresh_refuses_new_remote_edit_and_untracked_file_since_last_sync() {
         let home = temp_home("remote-edits");
         let source = home.join("source");
