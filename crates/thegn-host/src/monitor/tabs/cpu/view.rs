@@ -25,6 +25,7 @@ const LOAD: PanelId = PanelId("cpu.load");
 const IRQ: PanelId = PanelId("cpu.irq");
 const SCHED: PanelId = PanelId("cpu.sched");
 const IDLE: PanelId = PanelId("cpu.idle");
+const CORE: PanelId = PanelId("cpu.core");
 const CORE_HISTORY_SAMPLES: usize = 240;
 const CORE_HISTORY_LIMIT: usize = 256;
 
@@ -123,7 +124,12 @@ const MINI_VARIANTS: [Variant; 2] = [
         pref: (28, 6),
     },
 ];
-const SPECS: [PanelSpec; 7] = [
+const SPECS: [PanelSpec; 8] = [
+    PanelSpec {
+        id: CORE,
+        priority: 0,
+        variants: &FULL_VARIANTS,
+    },
     PanelSpec {
         id: USAGE,
         priority: 0,
@@ -186,9 +192,23 @@ pub(in crate::monitor) struct CpuModel {
     sched_health: Health,
     topology_health: Health,
     idle_health: Health,
+    core_detail: bool,
 }
 
 impl CpuModel {
+    pub(in crate::monitor) fn core_count(&self) -> usize {
+        self.cpu_stat.cores.len()
+    }
+
+    pub(in crate::monitor) fn toggle_core_detail(&mut self) {
+        self.core_detail = !self.core_detail;
+    }
+
+    #[cfg(test)]
+    pub(in crate::monitor) fn core_detail(&self) -> bool {
+        self.core_detail
+    }
+
     #[cfg(test)]
     pub(in crate::monitor) fn procs_running(&self) -> Option<u32> {
         self.cpu_stat.procs_running
@@ -351,7 +371,27 @@ impl CpuModel {
     }
 }
 
-pub(in crate::monitor) struct CpuView<'a>(pub &'a CpuModel);
+pub(in crate::monitor) struct CpuView<'a> {
+    model: &'a CpuModel,
+    cursor: Option<usize>,
+}
+
+impl<'a> CpuView<'a> {
+    #[cfg(test)]
+    pub(in crate::monitor) fn new(model: &'a CpuModel) -> Self {
+        Self {
+            model,
+            cursor: None,
+        }
+    }
+
+    pub(in crate::monitor) fn with_cursor(model: &'a CpuModel, cursor: usize) -> Self {
+        Self {
+            model,
+            cursor: Some(cursor),
+        }
+    }
+}
 
 impl TabView for CpuView<'_> {
     fn specs(&self) -> &'static [PanelSpec] {
@@ -359,7 +399,7 @@ impl TabView for CpuView<'_> {
     }
 
     fn template(&self) -> Node {
-        let third_row = if matches!(self.0.sched_health, Health::Absent(_)) {
+        let third_row = if matches!(self.model.sched_health, Health::Absent(_)) {
             Node::Row(vec![
                 (Size::Weight(1), Node::Panel(FREQ)),
                 (Size::Weight(1), Node::Panel(IRQ)),
@@ -371,6 +411,7 @@ impl TabView for CpuView<'_> {
                 (Size::Weight(1), Node::Panel(SCHED)),
             ])
         };
+        let right_panel = if self.model.core_detail { CORE } else { IDLE };
         Node::Col(vec![
             (
                 Size::Weight(2),
@@ -383,7 +424,7 @@ impl TabView for CpuView<'_> {
                 Size::Weight(2),
                 Node::Row(vec![
                     (Size::Weight(2), Node::Panel(CORES)),
-                    (Size::Weight(1), Node::Panel(IDLE)),
+                    (Size::Weight(1), Node::Panel(right_panel)),
                 ]),
             ),
             (Size::Weight(1), third_row),
@@ -406,7 +447,13 @@ impl TabView for CpuView<'_> {
                 set.insert(CollectorId::Psi);
             }
             IRQ => set.insert(CollectorId::CpuIrq),
-            SCHED if self.0.sched_supported() => set.insert(CollectorId::CpuSched),
+            SCHED if self.model.sched_supported() => set.insert(CollectorId::CpuSched),
+            CORE => {
+                set.insert(CollectorId::CpuStat);
+                set.insert(CollectorId::CpuFreq);
+                set.insert(CollectorId::CpuIdle);
+                set.insert(CollectorId::CpuTopology);
+            }
             _ => {}
         }
         set
@@ -420,7 +467,7 @@ impl TabView for CpuView<'_> {
         _scroll: usize,
         _sections: &[Section],
     ) {
-        paint::paint(self.0, surface, placed.id, rect);
+        paint::paint_view(self.model, self.cursor, surface, placed.id, rect);
     }
 }
 
