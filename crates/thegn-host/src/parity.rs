@@ -6,6 +6,8 @@
 
 use std::path::Path;
 
+use anyhow::Context;
+
 use crate::agent::block_on_provider;
 
 fn lower_hex(bytes: &[u8]) -> String {
@@ -250,9 +252,8 @@ pub(crate) fn apply_local_parity(
     let manifest = manifest_for_artifacts(&artifacts);
     for (name, bytes) in &artifacts {
         let dst = staged_artifact_path(&dir, name);
-        block_on_provider(|| async { provider.write(id, &dst, bytes).await }).map_err(|error| {
-            anyhow::anyhow!("upload to staging directory {dir} failed: {error}")
-        })?;
+        block_on_provider(|| async { provider.write(id, &dst, bytes).await })
+            .with_context(|| format!("upload to staging directory {dir} failed"))?;
     }
 
     // Replay over the clone, in the workdir. Failed stages preserve remote artifacts.
