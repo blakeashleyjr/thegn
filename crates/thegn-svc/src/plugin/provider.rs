@@ -969,7 +969,7 @@ done
         let replacement = super::super::session::admission::Shared::new();
         let new_bridge =
             ProviderBridge::new(SessionWriter(replacement.clone()), Duration::from_secs(1));
-        let (sender, receiver) = oneshot::channel();
+        let (sender, mut receiver) = oneshot::channel();
         new_bridge
             .pending
             .lock()
