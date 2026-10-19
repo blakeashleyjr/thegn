@@ -60,6 +60,7 @@ mod tests {
             targets: vec![Target {
                 ref_id: "A".into(),
                 expr: "x".into(),
+                ..Target::default()
             }],
         }
     }
