@@ -77,6 +77,12 @@ enum Confirm {
         label: String,
         cursor: usize,
     },
+    /// Deliver TERM to the sampled process tree after explicit confirmation.
+    SignalTree {
+        label: String,
+        targets: Vec<tabs::procs::FamilyEntry>,
+        excluded: usize,
+    },
     /// Deliver `stage` to a process.
     Signal {
         pid: u32,
@@ -446,6 +452,8 @@ pub struct MonitorOverlay {
     proc_rows: Vec<procs_view::ProcRow>,
     proc_invalid_terms: Vec<procs_view::procs_query::InvalidTerm>,
     proc_primed: bool,
+    /// Unfiltered sampled process identities used by the TERM tree action.
+    proc_family: Vec<tabs::procs::FamilyEntry>,
     lists: invalidation::Lists,
     /// The last body was Processes with these header/display-only inputs.
     process_body: Option<(u64, crate::model_eq::ProcessViewState, bool, bool)>,
@@ -537,6 +545,7 @@ impl MonitorOverlay {
             proc_rows: Vec::new(),
             proc_invalid_terms: Vec::new(),
             proc_primed: false,
+            proc_family: Vec::new(),
             lists: invalidation::Lists::default(),
             process_body: None,
             disk_rows: Vec::new(),
@@ -1375,7 +1384,6 @@ impl MonitorOverlay {
     /// leaves the prompt standing.
     fn confirm_key(&mut self, key: &KeyCode) -> MonitorOutcome {
         if matches!(self.confirm.as_ref(), Some(Confirm::SignalMenu { .. })) {
-            let menu = crate::platform::ProcSignal::menu();
             let picked = if let Some(Confirm::SignalMenu { cursor, .. }) = self.confirm.as_mut() {
                 match key {
                     KeyCode::UpArrow => {
@@ -1383,64 +1391,88 @@ impl MonitorOverlay {
                         None
                     }
                     KeyCode::DownArrow => {
-                        *cursor = cursor.saturating_add(1).min(menu.len().saturating_sub(1));
+                        *cursor = cursor
+                            .saturating_add(1)
+                            .min(tabs::procs::menu_len().saturating_sub(1));
                         None
                     }
-                    KeyCode::Enter | KeyCode::Char('\r' | '\n') => menu.get(*cursor).copied(),
-                    KeyCode::Char(c) => menu
-                        .iter()
-                        .copied()
-                        .find(|signal| signal.menu_key() == c.to_ascii_lowercase()),
+                    KeyCode::Enter | KeyCode::Char('\r' | '\n') => tabs::procs::menu_pick(*cursor),
+                    KeyCode::Char(c) => tabs::procs::menu_pick_key(*c),
                     _ => None,
                 }
             } else {
                 None
             };
-            if let Some(stage) = picked {
-                if matches!(
-                    stage,
-                    crate::platform::ProcSignal::Kill | crate::platform::ProcSignal::Stop
-                ) && let Some(Confirm::SignalMenu {
+            if let Some(pick) = picked
+                && let Some(Confirm::SignalMenu {
                     pid,
                     start_time,
                     start_ticks,
                     label,
                     ..
                 }) = self.confirm.take()
-                {
-                    self.confirm = Some(Confirm::Signal {
-                        pid,
-                        start_time,
-                        start_ticks,
-                        label,
-                        stage,
-                    });
-                } else if let Some(Confirm::SignalMenu {
-                    pid,
-                    start_time,
-                    start_ticks,
-                    label,
-                    ..
-                }) = self.confirm.take()
-                {
-                    if self
-                        .proc_rows
-                        .iter()
-                        .any(|row| (row.pid, row.start_time) == (pid, start_time))
-                    {
-                        self.perform_signal(
+            {
+                match pick {
+                    tabs::procs::MenuPick::Signal(stage) if stage.needs_confirm() => {
+                        self.confirm = Some(Confirm::Signal {
                             pid,
-                            crate::platform::ProcStart {
-                                secs: start_time,
-                                ticks: start_ticks,
-                            },
-                            &label,
+                            start_time,
+                            start_ticks,
+                            label,
                             stage,
-                        );
-                    } else {
-                        self.status = Some(format!(
-                            "{label}: process changed or left the sampled list; select it again"
-                        ));
+                        });
+                    }
+                    tabs::procs::MenuPick::Signal(stage) => {
+                        if self
+                            .proc_rows
+                            .iter()
+                            .any(|row| (row.pid, row.start_time) == (pid, start_time))
+                        {
+                            self.perform_signal(
+                                pid,
+                                crate::platform::ProcStart {
+                                    secs: start_time,
+                                    ticks: start_ticks,
+                                },
+                                &label,
+                                stage,
+                            );
+                        } else {
+                            self.status = Some(format!(
+                                "{label}: process changed or left the sampled list; select it again"
+                            ));
+                        }
+                    }
+                    tabs::procs::MenuPick::TermTree => {
+                        let mut targets = Vec::with_capacity(256);
+                        match tabs::procs::term_tree_targets(
+                            &self.proc_family,
+                            (pid, start_time),
+                            std::process::id(),
+                            &mut targets,
+                        ) {
+                            tabs::procs::TreePlan::MissingRoot => {
+                                self.status = Some(format!(
+                                    "{label}: process changed or left the sampled list; select it again"
+                                ));
+                            }
+                            tabs::procs::TreePlan::ContainsThegn => {
+                                self.status = Some(format!(
+                                    "{label}: the tree contains thegn itself; not signalled"
+                                ));
+                            }
+                            tabs::procs::TreePlan::Ready {
+                                truncated,
+                                excluded,
+                            } => {
+                                debug_assert_eq!(truncated, excluded > 0);
+                                self.confirm = Some(Confirm::SignalTree {
+                                    label,
+                                    targets,
+                                    excluded,
+                                });
+                            }
+                        }
                     }
                 }
             } else if crate::input::is_escape_key(key) || matches!(key, KeyCode::Char('n' | 'N')) {
@@ -1480,8 +1512,64 @@ impl MonitorOverlay {
                         ));
                     }
                 }
+                Some(Confirm::SignalTree {
+                    label,
+                    targets,
+                    excluded,
+                }) => {
+                    let total = targets.len();
+                    let mut sent = 0;
+                    let mut vanished = 0;
+                    let mut refused = 0;
+                    let mut first_error = None;
+                    for target in &targets {
+                        if !self.proc_family.iter().any(|entry| {
+                            (entry.pid, entry.start.secs) == (target.pid, target.start.secs)
+                        }) {
+                            vanished += 1;
+                            continue;
+                        }
+                        match tabs::procs::deliver_signal(
+                            target.pid,
+                            target.start,
+                            crate::platform::ProcSignal::Terminate,
+                        ) {
+                            Ok(()) => sent += 1,
+                            Err(crate::platform::SignalError::Changed) => vanished += 1,
+                            Err(crate::platform::SignalError::Failed(error)) => {
+                                refused += 1;
+                                if first_error.is_none() {
+                                    first_error = Some(error);
+                                }
+                            }
+                        }
+                    }
+                    let mut status = format!(
+                        "sent SIGTERM to {sent} of {total} processes in the tree of {label}"
+                    );
+                    if vanished > 0 {
+                        status.push_str(&format!(" ({vanished} vanished"));
+                        if refused > 0 {
+                            status.push_str(&format!(
+                                ", {refused} refused: {}",
+                                first_error.as_deref().unwrap_or("unknown error")
+                            ));
+                        }
+                        status.push(')');
+                    } else if refused > 0 {
+                        status.push_str(&format!(
+                            " ({refused} refused: {})",
+                            first_error.as_deref().unwrap_or("unknown error")
+                        ));
+                    }
+                    if excluded > 0 {
+                        status.push_str(" (first 256 only)");
+                    }
+                    self.status = Some(status);
+                }
                 // The menu returns before this branch, so this arm is unreachable.
                 Some(menu @ Confirm::SignalMenu { .. }) => self.confirm = Some(menu),
+                Some(tree @ Confirm::SignalTree { .. }) => self.confirm = Some(tree),
                 Some(Confirm::Clean { path, label }) => {
                     self.pending_action = Some(MonitorAction::CleanWorktree(path));
                     self.status = Some(format!("cleaning {label}…"));

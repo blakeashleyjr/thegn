@@ -286,11 +286,16 @@ and new/exited values unknown until their baselines are available.
   a local, terminal-only action: it is not exposed to the CLI, the control API,
   or any remote surface.
 - `X` opens the platform signal menu: `t` TERM, `i` INT, `h` HUP, `k` KILL,
-  `s` STOP and `c` CONT on Linux and macOS, or `t` TERM on Windows. Choose by
-  its letter or with the arrow keys and Enter. TERM, INT, HUP and CONT are sent
-  immediately; KILL and STOP ask for `y` confirmation (or `n` / `Esc` to
-  cancel). The selected PID and start time are checked again before delivery.
-  STOP pauses a process and CONT resumes it; Windows supports termination only.
+  `s` STOP and `c` CONT on Linux and macOS, or `t` TERM on Windows, followed by
+  `r` TERM tree. Choose by letter or with the arrow keys and Enter. TERM, INT,
+  HUP and CONT are sent immediately; KILL, STOP and TERM tree ask for `y`
+  confirmation (or `n` / `Esc` to cancel). On Windows, TERM is a hard
+  `TerminateProcess` and asks for `y`. The selected PID and start time are
+  checked again before delivery. STOP pauses a process and CONT resumes it.
+  TERM tree sends TERM to the selected process and its descendants in the
+  sampled process list, deepest first, checking each process identity before
+  signalling it. It refuses a tree containing thegn and reports sent, vanished
+  and refused counts. Descendants outside the sampled list are not signalled.
 - `=` opens a renice confirmation showing the current and proposed nice values.
   Use `+` / `-` to adjust within `-20..=19`, `y` to apply, or `n` / `Esc` to
   cancel. The selected PID and start time are checked again before applying;

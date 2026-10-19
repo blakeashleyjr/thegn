@@ -60,13 +60,12 @@ pub(super) fn line(input: FooterInput<'_>) -> Line {
     if let Some(c) = input.confirm {
         let msg = match c {
             Confirm::SignalMenu { label, cursor, .. } => {
-                let menu = crate::platform::ProcSignal::menu();
-                let entries = menu
+                let entries = super::tabs::procs::menu_entries()
                     .iter()
                     .enumerate()
-                    .map(|(index, signal)| {
+                    .map(|(index, (key, name))| {
                         let marker = if index == *cursor { '>' } else { ' ' };
-                        format!("{marker}{} {}", signal.menu_key(), signal.label())
+                        format!("{marker}{key} {name}")
                     })
                     .collect::<Vec<_>>()
                     .join("  ");
@@ -82,6 +81,30 @@ pub(super) fn line(input: FooterInput<'_>) -> Line {
                     signal => format!("send SIG{} to", signal.label()),
                 };
                 format!("{verb} {label}?")
+            }
+            Confirm::SignalTree {
+                label,
+                targets,
+                excluded,
+            } => {
+                let cap = if *excluded > 0 {
+                    ", first 256 only"
+                } else {
+                    ""
+                };
+                return Line::split(
+                    vec![
+                        seg(
+                            Tok::Slot(S::Accent),
+                            format!(
+                                "TERM tree of {label}: {} sampled processes{cap}?",
+                                targets.len()
+                            ),
+                        )
+                        .bold(),
+                    ],
+                    vec![ghost("y confirm · n/Esc cancel")],
+                );
             }
             Confirm::Clean { label, .. } => format!("clean target/ in {label}?"),
             Confirm::Renice {

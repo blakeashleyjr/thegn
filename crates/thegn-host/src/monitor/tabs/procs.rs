@@ -59,9 +59,10 @@ type SignalCall = fn(
 #[cfg(test)]
 thread_local! {
     static TEST_SIGNAL_CALL: std::cell::Cell<Option<SignalCall>> = const { std::cell::Cell::new(None) };
+    static TEST_SIGNAL_RECORDS: std::cell::RefCell<Vec<(u32, crate::platform::ProcSignal)>> = const { std::cell::RefCell::new(Vec::new()) };
 }
 
-fn deliver_signal(
+pub(in crate::monitor) fn deliver_signal(
     pid: u32,
     start: crate::platform::ProcStart,
     signal: crate::platform::ProcSignal,
@@ -74,8 +75,144 @@ fn deliver_signal(
 }
 
 #[cfg(test)]
+pub(super) fn reset_test_signal_records() {
+    TEST_SIGNAL_RECORDS.with(|calls| calls.borrow_mut().clear());
+}
+
+#[cfg(test)]
+pub(super) fn record_test_signal(pid: u32, signal: crate::platform::ProcSignal) {
+    TEST_SIGNAL_RECORDS.with(|calls| calls.borrow_mut().push((pid, signal)));
+}
+
+#[cfg(test)]
+pub(super) fn test_signal_records() -> Vec<(u32, crate::platform::ProcSignal)> {
+    TEST_SIGNAL_RECORDS.with(|calls| calls.borrow().clone())
+}
+
+#[cfg(test)]
 fn set_test_signal_call(call: SignalCall) {
     TEST_SIGNAL_CALL.set(Some(call));
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(in crate::monitor) struct FamilyEntry {
+    pub(in crate::monitor) pid: u32,
+    pub(in crate::monitor) ppid: Option<u32>,
+    pub(in crate::monitor) start: crate::platform::ProcStart,
+}
+
+pub(in crate::monitor) fn refill_family(
+    out: &mut Vec<FamilyEntry>,
+    snap: &thegn_metrics::ProcSnapshot,
+) {
+    out.clear();
+    out.extend(snap.procs.iter().map(|proc| FamilyEntry {
+        pid: proc.pid,
+        ppid: proc.ppid,
+        start: crate::platform::ProcStart {
+            secs: proc.start_time,
+            ticks: proc.start_ticks,
+        },
+    }));
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(in crate::monitor) enum TreePlan {
+    Ready { truncated: bool, excluded: usize },
+    MissingRoot,
+    ContainsThegn,
+}
+
+pub(in crate::monitor) fn term_tree_targets(
+    family: &[FamilyEntry],
+    root: (u32, u64),
+    self_pid: u32,
+    out: &mut Vec<FamilyEntry>,
+) -> TreePlan {
+    out.clear();
+    let Some(root_entry) = family
+        .iter()
+        .find(|entry| (entry.pid, entry.start.secs) == root)
+        .copied()
+    else {
+        return TreePlan::MissingRoot;
+    };
+    let mut queue = std::collections::VecDeque::with_capacity(family.len().min(256));
+    let mut visited = std::collections::BTreeSet::new();
+    let mut planned = Vec::with_capacity(family.len().min(256));
+    queue.push_back((root_entry, 0_usize));
+    let mut truncated = false;
+    let mut excluded = 0;
+    let mut contains_thegn = root_entry.pid == self_pid;
+    while let Some((parent, depth)) = queue.pop_front() {
+        if !visited.insert(parent.pid) {
+            continue;
+        }
+        if planned.len() < 256 {
+            planned.push((parent, depth));
+        } else {
+            truncated = true;
+            excluded += 1;
+        }
+        for child in family
+            .iter()
+            .filter(|entry| entry.ppid == Some(parent.pid) && entry.pid != parent.pid)
+        {
+            if !visited.contains(&child.pid) {
+                contains_thegn |= child.pid == self_pid;
+                queue.push_back((*child, depth + 1));
+            }
+        }
+    }
+    if contains_thegn {
+        out.clear();
+        return TreePlan::ContainsThegn;
+    }
+    planned.sort_by_key(|(_, depth)| std::cmp::Reverse(*depth));
+    out.extend(planned.into_iter().map(|(entry, _)| entry));
+    TreePlan::Ready {
+        truncated,
+        excluded,
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(in crate::monitor) enum MenuPick {
+    Signal(crate::platform::ProcSignal),
+    TermTree,
+}
+
+pub(in crate::monitor) fn menu_len() -> usize {
+    crate::platform::ProcSignal::menu().len() + 1
+}
+
+pub(in crate::monitor) fn menu_pick(cursor: usize) -> Option<MenuPick> {
+    let signals = crate::platform::ProcSignal::menu();
+    if cursor < signals.len() {
+        Some(MenuPick::Signal(signals[cursor]))
+    } else if cursor == signals.len() {
+        Some(MenuPick::TermTree)
+    } else {
+        None
+    }
+}
+
+pub(in crate::monitor) fn menu_pick_key(c: char) -> Option<MenuPick> {
+    let key = c.to_ascii_lowercase();
+    crate::platform::ProcSignal::menu()
+        .iter()
+        .copied()
+        .find(|signal| signal.menu_key() == key)
+        .map(MenuPick::Signal)
+        .or_else(|| (key == 'r').then_some(MenuPick::TermTree))
+}
+
+pub(in crate::monitor) fn menu_entries() -> Vec<(char, &'static str)> {
+    crate::platform::ProcSignal::menu()
+        .iter()
+        .map(|signal| (signal.menu_key(), signal.label()))
+        .chain(std::iter::once(('r', "TERM tree")))
+        .collect()
 }
 
 fn priority_error(label: &str, error: crate::platform::PriorityError, denial_hint: &str) -> String {

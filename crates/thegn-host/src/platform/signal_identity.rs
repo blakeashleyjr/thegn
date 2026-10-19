@@ -193,7 +193,7 @@ fn signal_identity_inner(
 
 #[cfg(windows)]
 fn signal_identity_inner(pid: u32, start: ProcStart, sig: ProcSignal) -> Result<(), SignalError> {
-    if !matches!(sig, ProcSignal::Terminate | ProcSignal::Kill) {
+    if sig != ProcSignal::Terminate {
         return Err(SignalError::Failed(
             "only terminate is available on Windows".into(),
         ));
@@ -563,6 +563,19 @@ mod windows_signal_tests {
                     ticks: None,
                 },
                 ProcSignal::Hangup,
+            ),
+            Err(SignalError::Failed(
+                "only terminate is available on Windows".into()
+            ))
+        );
+        assert_eq!(
+            signal_identity_inner(
+                0,
+                ProcStart {
+                    secs: 1,
+                    ticks: None,
+                },
+                ProcSignal::Kill,
             ),
             Err(SignalError::Failed(
                 "only terminate is available on Windows".into()
