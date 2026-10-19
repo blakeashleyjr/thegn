@@ -10,6 +10,56 @@ pub const ALIAS_TOLERANCE_C: f32 = 0.2;
 pub const ALIAS_SAMPLES: u8 = 3;
 /// T5/T20: alarm re-cross hysteresis.
 pub const ALARM_HYSTERESIS_C: f32 = 2.0;
+/// Minimum paired readings used for the T25 display hint.
+pub const PAIR_MIN_SAMPLES: usize = 30;
+/// Minimum Pearson correlation for suggesting a fan/sensor pair.
+pub const PAIR_MIN_R: f64 = 0.5;
+
+/// Returns the highest-correlated temperature sensor using newest-aligned
+/// finite samples. Ring alignment is approximate when one series skips gaps.
+pub fn pair_fan(fan: &[f32], sensors: &[&[f32]], min_samples: usize) -> Option<usize> {
+    let mut best: Option<(usize, f64)> = None;
+    for (sensor_index, sensor) in sensors.iter().enumerate() {
+        let aligned = fan.len().min(sensor.len());
+        let fan_start = fan.len().saturating_sub(aligned);
+        let sensor_start = sensor.len().saturating_sub(aligned);
+        let mut count = 0_usize;
+        let mut sum_x = 0.0_f64;
+        let mut sum_y = 0.0_f64;
+        let mut sum_xx = 0.0_f64;
+        let mut sum_yy = 0.0_f64;
+        let mut sum_xy = 0.0_f64;
+        for (&x, &y) in fan[fan_start..].iter().zip(&sensor[sensor_start..]) {
+            if !x.is_finite() || !y.is_finite() {
+                continue;
+            }
+            let x = f64::from(x);
+            let y = f64::from(y);
+            count += 1;
+            sum_x += x;
+            sum_y += y;
+            sum_xx += x * x;
+            sum_yy += y * y;
+            sum_xy += x * y;
+        }
+        if count < min_samples {
+            continue;
+        }
+        let n = count as f64;
+        let var_x = n * sum_xx - sum_x * sum_x;
+        let var_y = n * sum_yy - sum_y * sum_y;
+        if var_x <= 0.0 || var_y <= 0.0 {
+            continue;
+        }
+        let correlation = (n * sum_xy - sum_x * sum_y) / (var_x * var_y).sqrt();
+        if correlation >= PAIR_MIN_R
+            && best.is_none_or(|(_, best_correlation)| correlation > best_correlation)
+        {
+            best = Some((sensor_index, correlation));
+        }
+    }
+    best.map(|(index, _)| index)
+}
 
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
 pub struct Plausibility {
@@ -171,5 +221,32 @@ mod tests {
         assert_eq!(alarm.update(81.0, 80.0), 1);
         assert_eq!(alarm.update(77.9, 80.0), 1);
         assert_eq!(alarm.update(81.0, 80.0), 2);
+    }
+
+    #[test]
+    fn fan_pairing_picks_highest_positive_correlation_and_lowest_tie() {
+        let fan = (0..40).map(|value| value as f32).collect::<Vec<_>>();
+        let exact = (0..40).map(|value| value as f32 * 2.0).collect::<Vec<_>>();
+        let tied = exact.clone();
+        let noisy = (0..40)
+            .map(|value| (value as f32 * 1.7) + (value % 3) as f32)
+            .collect::<Vec<_>>();
+        assert_eq!(pair_fan(&fan, &[&noisy, &exact, &tied], 30), Some(1));
+        assert_eq!(pair_fan(&fan, &[&exact, &tied], 30), Some(0));
+    }
+
+    #[test]
+    fn fan_pairing_rejects_anti_correlated_flat_short_and_skips_nan() {
+        let fan = (0..40).map(|value| value as f32).collect::<Vec<_>>();
+        let anti = (0..40).map(|value| -(value as f32)).collect::<Vec<_>>();
+        let flat = vec![4.0; 40];
+        assert_eq!(pair_fan(&fan, &[&anti, &flat], 30), None);
+        assert_eq!(pair_fan(&fan[..29], &[&fan[..29]], 30), None);
+
+        let mut with_gaps = fan.clone();
+        with_gaps[3] = f32::NAN;
+        with_gaps[11] = f32::NAN;
+        assert_eq!(pair_fan(&fan, &[&with_gaps], 38), Some(0));
+        assert_eq!(pair_fan(&fan, &[&with_gaps], 39), None);
     }
 }

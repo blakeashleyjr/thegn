@@ -7,6 +7,7 @@ use crate::{
     },
     telemetry::{Metric, ScaleMode, SeriesBuf, SeriesReq, TelemetryHistory, Window},
 };
+use std::fmt::Write as _;
 use termwiz::surface::Surface;
 use thegn_core::series::Agg;
 use thegn_metrics::collect::{
@@ -15,20 +16,23 @@ use thegn_metrics::collect::{
     model::{
         amd_smu::AmdSmuStatus,
         hwmon::{ChipGroup, SensorKind, SensorRole},
-        thermal_zone::ThermalTrip,
+        thermal_zone::{CoolingAggregate, ThermalTrip},
     },
     parse::amd_gpu_metrics::Decoded,
     policy::{hwmon_group, thermal},
 };
 
 const SENSOR_CAP: usize = 256;
+const FAN_CAP: usize = 16;
 const HISTORY_CAP: usize = 120;
+const PAIR_EVERY: usize = 30;
 const PACKAGE: PanelId = PanelId("thermal.package");
 const CORES: PanelId = PanelId("thermal.cores");
 const SENSORS: PanelId = PanelId("thermal.sensors");
 const ZONES: PanelId = PanelId("thermal.zones");
 const GPU: PanelId = PanelId("thermal.gpu");
 const HEATMAP: PanelId = PanelId("thermal.heatmap");
+const COOLING: PanelId = PanelId("thermal.cooling");
 
 const FULL: Variant = Variant {
     kind: VariantKind::Full,
@@ -46,7 +50,7 @@ const MINI: Variant = Variant {
     pref: (16, 11),
 };
 const VARIANTS: &[Variant] = &[FULL, COMPACT, MINI];
-const SPECS: [PanelSpec; 6] = [
+const SPECS: [PanelSpec; 7] = [
     PanelSpec {
         id: PACKAGE,
         priority: 0,
@@ -77,12 +81,24 @@ const SPECS: [PanelSpec; 6] = [
         priority: 3,
         variants: VARIANTS,
     },
+    PanelSpec {
+        id: COOLING,
+        priority: 3,
+        variants: VARIANTS,
+    },
 ];
 
 #[derive(Debug, Clone)]
 pub(in crate::monitor) struct ThermalModel {
     sensors: Vec<SensorRow>,
+    fans: Vec<FanRow>,
     zones: Vec<ZoneRow>,
+    cooling: Vec<CoolingAggregate>,
+    cooling_layout_generation: Option<u64>,
+    cooling_panel_present: bool,
+    pair_samples: usize,
+    pair_fan_buf: Vec<f32>,
+    pair_sensor_flat: Vec<f32>,
     cores: [Option<f32>; 16],
     core_layout_generation: Option<u64>,
     core_source_hwmon: bool,
@@ -110,7 +126,14 @@ impl Default for ThermalModel {
     fn default() -> Self {
         Self {
             sensors: Vec::with_capacity(SENSOR_CAP),
+            fans: Vec::with_capacity(FAN_CAP),
             zones: Vec::with_capacity(16),
+            cooling: Vec::with_capacity(16),
+            cooling_layout_generation: None,
+            cooling_panel_present: false,
+            pair_samples: 0,
+            pair_fan_buf: Vec::with_capacity(HISTORY_CAP),
+            pair_sensor_flat: Vec::with_capacity(SENSOR_CAP * HISTORY_CAP),
             cores: [None; 16],
             core_layout_generation: None,
             core_source_hwmon: false,
@@ -132,6 +155,39 @@ impl Default for ThermalModel {
             package_history_key: None,
             temp_history: Vec::with_capacity(HISTORY_CAP),
             history_buf: SeriesBuf::default(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+struct FanRow {
+    key: String,
+    chip: String,
+    label: String,
+    rpm: Option<f32>,
+    target: Option<f32>,
+    peak: Option<f32>,
+    history: [f32; HISTORY_CAP],
+    history_len: usize,
+    history_next: usize,
+    pair: Option<String>,
+    seen: bool,
+}
+
+impl Default for FanRow {
+    fn default() -> Self {
+        Self {
+            key: String::new(),
+            chip: String::new(),
+            label: String::new(),
+            rpm: None,
+            target: None,
+            peak: None,
+            history: [0.0; HISTORY_CAP],
+            history_len: 0,
+            history_next: 0,
+            pair: None,
+            seen: false,
         }
     }
 }
@@ -210,6 +266,11 @@ impl ThermalModel {
         for sensor in &mut self.sensors {
             sensor.seen = false;
         }
+        for fan in &mut self.fans {
+            fan.seen = false;
+            fan.rpm = None;
+            fan.target = None;
+        }
         self.cores.fill(None);
         self.gfx_c = None;
         self.edge_c = None;
@@ -238,8 +299,67 @@ impl ThermalModel {
             self.core_history_len = [0; 16];
             self.core_history_next = [0; 16];
         }
+        if let Some(layout) = layout
+            && self.cooling_layout_generation != Some(layout.generation)
+        {
+            self.cooling_layout_generation = Some(layout.generation);
+            self.cooling_panel_present = layout
+                .sensors
+                .iter()
+                .any(|sensor| sensor.kind == SensorKind::Fan && sensor.role == SensorRole::Input);
+        }
         if let Some(layout) = layout {
             for (index, sensor) in layout.sensors.iter().enumerate() {
+                if sensor.kind == SensorKind::Fan && sensor.role == SensorRole::Input {
+                    let Some(chip) = layout.chips.get(usize::from(sensor.chip)) else {
+                        continue;
+                    };
+                    let row_index = self.fans.iter().position(|row| row.key == sensor.key);
+                    if row_index.is_none() && self.fans.len() == FAN_CAP {
+                        continue;
+                    }
+                    let row = if let Some(row_index) = row_index {
+                        &mut self.fans[row_index]
+                    } else {
+                        self.fans.push(FanRow::default());
+                        self.fans.last_mut().expect("fan row was just inserted")
+                    };
+                    row.seen = true;
+                    row.key.clone_from(&sensor.key);
+                    row.chip.clone_from(&chip.name);
+                    row.label.clear();
+                    row.label.push_str(
+                        sensor
+                            .label
+                            .as_deref()
+                            .filter(|label| !label.is_empty())
+                            .unwrap_or(""),
+                    );
+                    if row.label.is_empty() {
+                        row.label.push_str("fan");
+                        write!(row.label, "{}", sensor.channel)
+                            .expect("writing a fan channel to a String cannot fail");
+                    }
+                    let reading = frame
+                        .parts
+                        .hwmon
+                        .values
+                        .get(index)
+                        .and_then(|reading| reading.value)
+                        .filter(|rpm| rpm.is_finite() && (0.0..=30_000.0).contains(rpm));
+                    row.rpm = reading;
+                    if let Some(rpm) = reading {
+                        row.peak = Some(row.peak.map_or(rpm, |peak| peak.max(rpm)));
+                        row.history[row.history_next] = rpm;
+                        row.history_next = (row.history_next + 1) % HISTORY_CAP;
+                        row.history_len = row.history_len.saturating_add(1).min(HISTORY_CAP);
+                    } else if row.history_len > 0 {
+                        row.history[row.history_next] = f32::NAN;
+                        row.history_next = (row.history_next + 1) % HISTORY_CAP;
+                        row.history_len = row.history_len.saturating_add(1).min(HISTORY_CAP);
+                    }
+                    continue;
+                }
                 if sensor.kind != SensorKind::Temp || sensor.role != SensorRole::Input {
                     continue;
                 }
@@ -309,6 +429,28 @@ impl ThermalModel {
                     row.history_len = row.history_len.saturating_add(1).min(HISTORY_CAP);
                 }
             }
+            for (target_index, target) in layout.sensors.iter().enumerate().filter(|(_, sensor)| {
+                sensor.kind == SensorKind::Fan && sensor.role == SensorRole::Target
+            }) {
+                if let Some(input) = layout.sensors.iter().find(|input| {
+                    input.kind == SensorKind::Fan
+                        && input.role == SensorRole::Input
+                        && input.chip == target.chip
+                        && input.channel == target.channel
+                }) && let Some(row) = self
+                    .fans
+                    .iter_mut()
+                    .find(|row| row.seen && row.key == input.key)
+                {
+                    row.target = frame
+                        .parts
+                        .hwmon
+                        .values
+                        .get(target_index)
+                        .and_then(|reading| reading.value)
+                        .filter(|rpm| rpm.is_finite() && (0.0..=30_000.0).contains(rpm));
+                }
+            }
         }
         self.sensors.retain(|sensor| sensor.seen);
         self.sensors.sort_unstable_by(|left, right| {
@@ -317,6 +459,25 @@ impl ThermalModel {
                 .then_with(|| left.label.cmp(&right.label))
                 .then_with(|| left.key.cmp(&right.key))
         });
+        self.fans.retain(|fan| fan.seen);
+        self.fans
+            .sort_unstable_by(|left, right| left.key.cmp(&right.key));
+        for (index, aggregate) in frame.parts.thermal_zone.cooling.iter().take(16).enumerate() {
+            if index == self.cooling.len() {
+                self.cooling.push(aggregate.clone());
+            } else {
+                let row = &mut self.cooling[index];
+                row.kind.clone_from(&aggregate.kind);
+                row.engaged = aggregate.engaged;
+                row.total = aggregate.total;
+            }
+        }
+        self.cooling
+            .truncate(frame.parts.thermal_zone.cooling.len().min(16));
+        self.pair_samples = self.pair_samples.saturating_add(1);
+        if self.pair_samples.is_multiple_of(PAIR_EVERY) {
+            self.recompute_fan_pairs();
+        }
 
         let package_index = self.package_index();
         let package_temp = package_index.and_then(|index| self.sensors[index].temp_c);
@@ -446,6 +607,49 @@ impl ThermalModel {
             self.gpu_history[self.gpu_history_next] = gpu_temp.unwrap_or(f32::NAN);
             self.gpu_history_next = (self.gpu_history_next + 1) % HISTORY_CAP;
             self.gpu_history_len = self.gpu_history_len.saturating_add(1).min(HISTORY_CAP);
+        }
+    }
+
+    fn recompute_fan_pairs(&mut self) {
+        let mut sensor_slices: [&[f32]; SENSOR_CAP] = [&[]; SENSOR_CAP];
+        let mut counts = [0usize; SENSOR_CAP];
+        let sensor_count = self.sensors.len().min(SENSOR_CAP);
+        self.pair_sensor_flat.clear();
+        // Sensor rings skip absent readings, so newest alignment is approximate;
+        // the correlation is only a display hint.
+        for (sensor_index, sensor) in self.sensors.iter().take(sensor_count).enumerate() {
+            let count = sensor.history_len.min(HISTORY_CAP);
+            let first = (sensor.history_next + HISTORY_CAP - count) % HISTORY_CAP;
+            counts[sensor_index] = count;
+            for offset in 0..count {
+                self.pair_sensor_flat
+                    .push(sensor.history[(first + offset) % HISTORY_CAP]);
+            }
+        }
+        let mut offset = 0;
+        for (sensor_index, _) in self.sensors.iter().take(sensor_count).enumerate() {
+            let count = counts[sensor_index];
+            sensor_slices[sensor_index] = &self.pair_sensor_flat[offset..offset + count];
+            offset += count;
+        }
+        let mut pairs: [Option<String>; FAN_CAP] = std::array::from_fn(|_| None);
+        for (fan_index, fan) in self.fans.iter().take(FAN_CAP).enumerate() {
+            let count = fan.history_len.min(HISTORY_CAP);
+            let first = (fan.history_next + HISTORY_CAP - count) % HISTORY_CAP;
+            self.pair_fan_buf.clear();
+            for offset in 0..count {
+                self.pair_fan_buf
+                    .push(fan.history[(first + offset) % HISTORY_CAP]);
+            }
+            pairs[fan_index] = thermal::pair_fan(
+                &self.pair_fan_buf,
+                &sensor_slices[..sensor_count],
+                thermal::PAIR_MIN_SAMPLES,
+            )
+            .map(|sensor_index| self.sensors[sensor_index].key.clone());
+        }
+        for (fan, pair) in self.fans.iter_mut().zip(pairs) {
+            fan.pair = pair;
         }
     }
 
@@ -581,6 +785,9 @@ impl TabView for ThermalView<'_> {
             top.push((Size::Weight(1), Node::Panel(CORES)));
         }
         top.push((Size::Weight(1), Node::Panel(GPU)));
+        if self.0.cooling_panel_present {
+            top.push((Size::Weight(1), Node::Panel(COOLING)));
+        }
         Node::Col(vec![
             (Size::Weight(1), Node::Row(top)),
             (
@@ -615,6 +822,9 @@ impl TabView for ThermalView<'_> {
                 set.insert(CollectorId::Hwmon);
                 set.insert(CollectorId::AmdSmu);
             }
+            COOLING => {
+                set.insert(CollectorId::Hwmon);
+            }
             _ => {}
         }
         set
@@ -636,6 +846,7 @@ impl TabView for ThermalView<'_> {
             ZONES => "Thermal zones",
             GPU => "GPU thermals",
             HEATMAP => "Core history",
+            COOLING => "Cooling",
             _ => return,
         };
         let inner = {
@@ -655,7 +866,7 @@ impl TabView for ThermalView<'_> {
             ),
             CORES => paint::cores(&mut grid, inner, &self.0.cores),
             SENSORS => paint::sensors(&mut grid, inner, &self.0.sensors),
-            ZONES => paint::zones(&mut grid, inner, &self.0.zones),
+            ZONES => paint::zones(&mut grid, inner, &self.0.zones, &self.0.cooling),
             GPU => paint::gpu(&mut grid, inner, self.0),
             HEATMAP => paint::heatmap(
                 &mut grid,
@@ -664,6 +875,7 @@ impl TabView for ThermalView<'_> {
                 &self.0.core_history_len,
                 &self.0.core_history_next,
             ),
+            COOLING => paint::cooling(&mut grid, inner, &self.0.fans, &self.0.sensors),
             _ => {}
         }
         if placed.id == PACKAGE && inner.rows > 5 && !self.0.temp_history.is_empty() {
@@ -679,6 +891,52 @@ impl TabView for ThermalView<'_> {
             rect.x,
             rect.y,
         );
+        if placed.id == COOLING {
+            let rows_per_fan = 2;
+            let fan_count = self.0.fans.len().min(inner.rows / rows_per_fan);
+            let braille = crate::monitor::graphs::table().braille;
+            for (index, fan) in self.0.fans.iter().take(fan_count).enumerate() {
+                let count = fan.history_len.min(HISTORY_CAP);
+                let first = (fan.history_next + HISTORY_CAP - count) % HISTORY_CAP;
+                let mut normalized = [f32::NAN; HISTORY_CAP];
+                for (offset, value) in normalized.iter_mut().take(count).enumerate() {
+                    let rpm = fan.history[(first + offset) % HISTORY_CAP];
+                    if rpm.is_finite()
+                        && let Some(peak) = fan.peak
+                    {
+                        *value = if peak > 0.0 {
+                            (rpm / peak).clamp(0.0, 1.0)
+                        } else {
+                            0.0
+                        };
+                    }
+                }
+                let rpm = fan.rpm.map_or_else(
+                    || crate::caps::active_glyphs().emdash.to_owned(),
+                    |value| format!("{value:.0}rpm"),
+                );
+                let target = fan
+                    .target
+                    .map_or_else(String::new, |value| format!(" target {value:.0}"));
+                let label_width = format!("{} {}  {rpm}{target}", fan.chip, fan.label)
+                    .chars()
+                    .count();
+                let graph_start = label_width.saturating_add(1);
+                if graph_start < inner.cols {
+                    let plot = Rect {
+                        x: rect.x.saturating_add(inner.x).saturating_add(graph_start),
+                        y: rect
+                            .y
+                            .saturating_add(inner.y)
+                            .saturating_add(index * rows_per_fan),
+                        cols: inner.cols.saturating_sub(graph_start),
+                        rows: 1,
+                    };
+                    let plot = crate::monitor::kit::history_rect::graph_rect(plot, count, braille);
+                    paint_history_runs(&normalized, count, plot, braille, surface);
+                }
+            }
+        }
         if placed.id == PACKAGE && inner.rows > 5 && !self.0.temp_history.is_empty() {
             let count = self.0.temp_history.len().min(HISTORY_CAP);
             let first = self.0.temp_history.len().saturating_sub(count);
