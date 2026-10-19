@@ -462,6 +462,8 @@ tunes keepalives, timeouts, and retry backoff for flaky links.
 > Remote worktrees and cloud providers are **dev-channel only** — see
 > [[release-channels]].
 
+A remote checkout with commits or changes made since thegn last synced it is kept for recovery, and thegn shows how to recover it.
+
 ## Inspecting
 
 The panel's **system → sandbox** section shows the live state for the

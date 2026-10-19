@@ -79,6 +79,10 @@ fn sync_once(
     Ok(path)
 }
 
+fn sync_key(canonical_worktree: &str, authority: &str, slug: &str, head: &str) -> String {
+    [canonical_worktree, authority, slug, head].join("\0")
+}
+
 /// Guard a REMOTE placement that resolved to a bare `Backend::None`. A remote
 /// SSH placement has no container to hold the synced worktree, so degrading to
 /// `none` would ship a `cd <local-worktree>` to a bare remote shell (the
@@ -213,9 +217,42 @@ fn refresh_command(dir: &str, branch: &str, recursive_submodules: bool) -> Strin
         String::new()
     };
     format!(
-        "set -e; git -C {d} fetch -q {bundle} HEAD; git -C {d} reset -q --hard; git -C {d} clean -ffdq; {checkout}{init}rm -f {bundle}",
+        "set -e; d={d}; record={record}; git -C \"$d\" fetch -q {bundle} HEAD; \\
+if ! git -C \"$d\" merge-base --is-ancestor HEAD FETCH_HEAD; then \\
+printf '%s\\n' 'remote-only commit; checkout retained for reconciliation' >&2; exit 3; \\
+fi; \\
+if [ -e \"$record\" ]; then \\
+expected_head=$(sed -n '2p' \"$record\"); expected_tree=$(sed -n '1p' \"$record\"); \\
+current_head=$(git -C \"$d\" rev-parse HEAD); \\
+current_tree=$({state_tree_command}); \\
+if [ -z \"$expected_head\" ] || [ -z \"$expected_tree\" ] || [ \"$current_head\" != \"$expected_head\" ] || [ \"$current_tree\" != \"$expected_tree\" ]; then \\
+printf '%s\\n' 'remote worktree changes differ from last sync; checkout retained for reconciliation' >&2; exit 3; \\
+fi; \\
+else \\
+status=$(git -C \"$d\" status --porcelain --untracked-files=all) || { printf '%s\\n' 'could not inspect remote worktree; checkout retained for reconciliation' >&2; exit 3; }; \\
+if [ -n \"$status\" ]; then printf '%s\\n' 'unrecorded remote worktree changes; checkout retained for reconciliation' >&2; exit 3; fi; \\
+fi; \\
+git -C \"$d\" reset -q --hard; git -C \"$d\" clean -ffdq; {checkout}{init}rm -f {bundle}",
         d = q(dir),
         bundle = q(&format!("{dir}.bundle")),
+        record = q(&format!("{dir}.thegn-synced")),
+        state_tree_command = state_tree_command("\"$d\""),
+    )
+}
+
+fn state_tree_command(dir: &str) -> String {
+    format!(
+        "t=$(mktemp) || exit 1; trap 'rm -f \"$t\"' EXIT; GIT_INDEX_FILE=\"$t\" git -C {dir} read-tree HEAD && GIT_INDEX_FILE=\"$t\" git -C {dir} add -A && GIT_INDEX_FILE=\"$t\" git -C {dir} write-tree",
+        dir = dir,
+    )
+}
+
+fn record_command(dir: &str) -> String {
+    format!(
+        "set -e; d={d}; record={record}; tree=$({tree}); head=$(git -C \"$d\" rev-parse HEAD); \\\n         printf '%s\\n%s\\n' \"$tree\" \"$head\" > \"$record.tmp\"; mv -f \"$record.tmp\" \"$record\"",
+        d = q(dir),
+        record = q(&format!("{dir}.thegn-synced")),
+        tree = state_tree_command("\"$d\""),
     )
 }
 
@@ -250,9 +287,11 @@ pub(crate) fn retarget_if_remote_oci(
         return;
     }
     let runner = OciRunner::new(spec.placement.clone());
+    let authority = format!("{}|{}", spec.backend.label(), spec.placement.label());
     match sync_worktree(
         &runner,
         worktree,
+        &authority,
         &spec.name,
         recursive_submodules,
         warnings,
@@ -323,11 +362,20 @@ pub(crate) fn degrade_oci_runtime(spec: &mut thegn_core::sandbox::SandboxSpec) -
 pub(crate) fn sync_worktree(
     runner: &OciRunner,
     worktree: &str,
+    authority: &str,
     slug: &str,
     recursive_submodules: bool,
     warnings: &mut Vec<String>,
 ) -> Result<String, String> {
-    sync_once(&SYNCED, worktree, || {
+    let canonical = std::fs::canonicalize(worktree)
+        .map_err(|error| format!("could not resolve local worktree for remote sync: {error}"))?;
+    let canonical = canonical
+        .to_str()
+        .ok_or_else(|| "local worktree path is not valid UTF-8".to_string())?;
+    let head = local_git(worktree, &["rev-parse", "HEAD"])
+        .ok_or_else(|| "could not determine local HEAD for remote sync".to_string())?;
+    let key = sync_key(canonical, authority, slug, &head);
+    sync_once(&SYNCED, &key, || {
         sync_worktree_uncached(runner, worktree, slug, recursive_submodules, warnings)
     })
 }
@@ -440,6 +488,18 @@ fn sync_worktree_uncached(
         secs(180),
     )?;
     runner
+        .host_exec(&record_command(&dir), secs(30))
+        .and_then(|(ok, _out, err)| {
+            if ok {
+                Ok(())
+            } else {
+                Err(format!(
+                    "remote worktree state record failed: {}",
+                    err.trim()
+                ))
+            }
+        })?;
+    runner
         .host_exec(
             &format!("rm -f {d}.thegn-incomplete", d = q(&dir)),
             secs(30),
@@ -460,8 +520,8 @@ fn sync_worktree_uncached(
 #[cfg(test)]
 mod tests {
     use super::{
-        SyncCache, claim_command, refresh_command, restore_command, should_apply_tracked_diff,
-        sync_once,
+        SyncCache, claim_command, record_command, refresh_command, restore_command,
+        should_apply_tracked_diff, sync_key, sync_once,
     };
     use std::process::Command;
     use std::sync::{
@@ -625,7 +685,10 @@ mod tests {
         let tracked = source.join("tracked.txt");
         std::fs::write(&tracked, "first\n").unwrap();
         run_git(&source, &["add", "tracked.txt"]);
-        run_git(&source, &["commit", "-qm", "first"]);
+        run_git(
+            &source,
+            &["-c", "commit.gpgsign=false", "commit", "-qm", "first"],
+        );
         run_git(
             &source,
             &[
@@ -638,7 +701,10 @@ mod tests {
 
         std::fs::write(&tracked, "second commit\n").unwrap();
         run_git(&source, &["add", "tracked.txt"]);
-        run_git(&source, &["commit", "-qm", "second"]);
+        run_git(
+            &source,
+            &["-c", "commit.gpgsign=false", "commit", "-qm", "second"],
+        );
         let bundle = format!("{}.bundle", checkout.display());
         run_git(&source, &["bundle", "create", &bundle, "HEAD"]);
         let branch = run_git_output(&source, &["rev-parse", "--abbrev-ref", "HEAD"]);
@@ -669,7 +735,10 @@ mod tests {
         let tracked = source.join("tracked.txt");
         std::fs::write(&tracked, "committed\n").unwrap();
         run_git(&source, &["add", "tracked.txt"]);
-        run_git(&source, &["commit", "-qm", "initial"]);
+        run_git(
+            &source,
+            &["-c", "commit.gpgsign=false", "commit", "-qm", "initial"],
+        );
         run_git(
             &source,
             &[
@@ -691,6 +760,9 @@ mod tests {
         let patch_path = home.join("tracked.patch");
         std::fs::write(&patch_path, patch.stdout).unwrap();
         run_git(&checkout, &["apply", patch_path.to_str().unwrap()]);
+
+        let record_result = run_sh(&home, &record_command(checkout.to_str().unwrap()));
+        assert!(record_result.status.success());
 
         let bundle = format!("{}.bundle", checkout.display());
         run_git(&source, &["bundle", "create", &bundle, "HEAD"]);
@@ -721,7 +793,10 @@ mod tests {
         let tracked = home.join("tracked.txt");
         std::fs::write(&tracked, "original\n").unwrap();
         run_git(&home, &["add", "tracked.txt"]);
-        run_git(&home, &["commit", "-qm", "initial"]);
+        run_git(
+            &home,
+            &["-c", "commit.gpgsign=false", "commit", "-qm", "initial"],
+        );
         assert!(!should_apply_tracked_diff(home.to_str().unwrap()).unwrap());
         std::fs::write(&tracked, "changed\n").unwrap();
         assert!(should_apply_tracked_diff(home.to_str().unwrap()).unwrap());
@@ -746,6 +821,140 @@ mod tests {
         assert_eq!(first, "/remote/thegn-worktrees/sandbox");
         assert_eq!(second, first);
         assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn sync_key_changes_with_authority_slug_and_head() {
+        let base = sync_key("/repo", "ssh:host-a", "sandbox-a", "head-a");
+        assert_ne!(base, sync_key("/repo", "ssh:host-b", "sandbox-a", "head-a"));
+        assert_ne!(base, sync_key("/repo", "ssh:host-a", "sandbox-b", "head-a"));
+        assert_ne!(base, sync_key("/repo", "ssh:host-a", "sandbox-a", "head-b"));
+
+        let cache = SyncCache::default();
+        let calls = AtomicUsize::new(0);
+        for key in [
+            base,
+            sync_key("/repo", "ssh:host-b", "sandbox-a", "head-a"),
+            sync_key("/repo", "ssh:host-a", "sandbox-a", "head-b"),
+        ] {
+            sync_once(&cache, &key, || {
+                calls.fetch_add(1, Ordering::SeqCst);
+                Ok("remote path".to_string())
+            })
+            .unwrap();
+        }
+        assert_eq!(calls.load(Ordering::SeqCst), 3);
+    }
+
+    #[test]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "fixture shell runs the refresh guard"
+    )]
+    fn refresh_refuses_remote_only_commit_and_keeps_it() {
+        let home = temp_home("remote-commit");
+        let source = home.join("source");
+        let checkout = home.join("checkout");
+        std::fs::create_dir_all(&source).unwrap();
+        run_git(&source, &["init", "-q"]);
+        run_git(&source, &["config", "user.email", "thegn@example.invalid"]);
+        run_git(&source, &["config", "user.name", "thegn test"]);
+        std::fs::write(source.join("tracked.txt"), "base\n").unwrap();
+        run_git(&source, &["add", "tracked.txt"]);
+        run_git(
+            &source,
+            &["-c", "commit.gpgsign=false", "commit", "-qm", "base"],
+        );
+        run_git(
+            &source,
+            &[
+                "clone",
+                "-q",
+                source.to_str().unwrap(),
+                checkout.to_str().unwrap(),
+            ],
+        );
+        run_git(
+            &checkout,
+            &["config", "user.email", "thegn@example.invalid"],
+        );
+        run_git(&checkout, &["config", "user.name", "thegn test"]);
+        std::fs::write(checkout.join("tracked.txt"), "remote commit\n").unwrap();
+        run_git(&checkout, &["add", "tracked.txt"]);
+        run_git(
+            &checkout,
+            &["-c", "commit.gpgsign=false", "commit", "-qm", "remote"],
+        );
+        let remote_head = run_git_output(&checkout, &["rev-parse", "HEAD"]);
+        let bundle = format!("{}.bundle", checkout.display());
+        run_git(&source, &["bundle", "create", &bundle, "HEAD"]);
+        let branch = run_git_output(&source, &["rev-parse", "--abbrev-ref", "HEAD"]);
+        let result = run_sh(
+            &home,
+            &refresh_command(checkout.to_str().unwrap(), &branch, false),
+        );
+        assert!(!result.status.success());
+        assert!(String::from_utf8_lossy(&result.stderr).contains("remote-only commit"));
+        assert_eq!(
+            run_git_output(&checkout, &["rev-parse", "HEAD"]),
+            remote_head
+        );
+        std::fs::remove_dir_all(home).unwrap();
+    }
+
+    #[test]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "fixture shell runs the refresh guard"
+    )]
+    fn refresh_refuses_new_remote_edit_and_untracked_file_since_last_sync() {
+        let home = temp_home("remote-edits");
+        let source = home.join("source");
+        let checkout = home.join("checkout");
+        std::fs::create_dir_all(&source).unwrap();
+        run_git(&source, &["init", "-q"]);
+        run_git(&source, &["config", "user.email", "thegn@example.invalid"]);
+        run_git(&source, &["config", "user.name", "thegn test"]);
+        std::fs::write(source.join("tracked.txt"), "base\n").unwrap();
+        run_git(&source, &["add", "tracked.txt"]);
+        run_git(
+            &source,
+            &["-c", "commit.gpgsign=false", "commit", "-qm", "base"],
+        );
+        run_git(
+            &source,
+            &[
+                "clone",
+                "-q",
+                source.to_str().unwrap(),
+                checkout.to_str().unwrap(),
+            ],
+        );
+        let bundle = format!("{}.bundle", checkout.display());
+        run_git(&source, &["bundle", "create", &bundle, "HEAD"]);
+        assert!(
+            run_sh(&home, &record_command(checkout.to_str().unwrap()))
+                .status
+                .success()
+        );
+        std::fs::write(checkout.join("tracked.txt"), "remote edit\n").unwrap();
+        std::fs::write(checkout.join("remote-only.txt"), "keep me\n").unwrap();
+        let branch = run_git_output(&source, &["rev-parse", "--abbrev-ref", "HEAD"]);
+        let result = run_sh(
+            &home,
+            &refresh_command(checkout.to_str().unwrap(), &branch, false),
+        );
+        assert!(!result.status.success());
+        assert!(
+            std::fs::read_to_string(checkout.join("tracked.txt"))
+                .unwrap()
+                .contains("remote edit")
+        );
+        assert_eq!(
+            std::fs::read_to_string(checkout.join("remote-only.txt")).unwrap(),
+            "keep me\n"
+        );
+        std::fs::remove_dir_all(home).unwrap();
     }
 
     #[test]
