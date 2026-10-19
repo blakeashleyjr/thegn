@@ -659,6 +659,27 @@ impl Machine0Provider {
     }
 }
 
+/// Refuse creation when the live VM count is unknown or already at the cap.
+/// Provider error text is intentionally excluded because it may contain a
+/// credential or endpoint.
+fn admit_create(listed: Result<usize>, max: usize) -> Result<()> {
+    let managed = match listed {
+        Ok(managed) => managed,
+        Err(_) => {
+            return Err(anyhow!(
+                "machine0: cannot count existing VMs before create (provider/API list error); refusing to create past max_instances"
+            ));
+        }
+    };
+    if managed >= max {
+        return Err(anyhow!(
+            "machine0: {managed} VMs already exist (max_instances = {max}); destroy one or raise \
+             `[env.<name>.provider] max_instances`"
+        ));
+    }
+    Ok(())
+}
+
 impl RemoteProvider for Machine0Provider {
     fn create<'a>(&'a self) -> BoxFuture<'a, Result<SandboxHandle>> {
         Box::pin(async move {
@@ -666,15 +687,11 @@ impl RemoteProvider for Machine0Provider {
             if name.is_empty() {
                 return Err(anyhow!("machine0: the sandbox name is empty"));
             }
-            // Spend guardrail: never mint past the cap.
-            let managed = self.list().await.map(|v| v.len()).unwrap_or(0);
-            if managed >= self.spec.max_instances() {
-                return Err(anyhow!(
-                    "machine0: {managed} VMs already exist (max_instances = {}); destroy one or raise \
-                     `[env.<name>.provider] max_instances`",
-                    self.spec.max_instances()
-                ));
-            }
+            // Spend guardrail: unknown inventory and a reached cap both refuse.
+            admit_create(
+                self.list().await.map(|v| v.len()),
+                self.spec.max_instances(),
+            )?;
             let vm = self.spawn(&name, &self.spec.image).await?;
             // NixOS flake apply (no-op unless `provision_flake` is set). Marker-gated
             // so a failed apply here is re-attempted on the next wake rather than
@@ -1181,6 +1198,33 @@ fn same_pubkey(a: &str, b: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn create_admission_fails_closed_when_the_list_errors() {
+        let secret_error = "https://secret.example/token=abc";
+        let cases = [
+            ("list error", Err(anyhow!("{secret_error}")), false),
+            ("empty list", Ok(0), true),
+            ("under cap", Ok(4), true),
+            ("at cap", Ok(5), false),
+            ("over cap", Ok(6), false),
+        ];
+
+        for (case_name, listed, admits) in cases {
+            let result = admit_create(listed, 5);
+            assert_eq!(result.is_ok(), admits, "{case_name}");
+            if case_name == "list error" {
+                match result {
+                    Err(error) => {
+                        let message = error.to_string();
+                        assert!(message.contains("provider/API list error"));
+                        assert!(!message.contains(secret_error));
+                    }
+                    Ok(()) => panic!("list error must refuse creation"),
+                }
+            }
+        }
+    }
 
     #[test]
     fn vm_create_args_omits_empty_flags() {
