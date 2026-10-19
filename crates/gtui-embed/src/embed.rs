@@ -470,9 +470,11 @@ fn expand_tilde(path: &str) -> String {
     path.to_string()
 }
 
-#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
+#[derive(Clone, Debug, Hash, PartialEq, Eq)]
 struct SeriesId {
     panel_id: u32,
+    target_ref_id: String,
+    visible_targets: Vec<String>,
     target_index: usize,
     frame_index: usize,
 }
@@ -516,7 +518,7 @@ impl SeriesCache {
     }
 
     fn reduced(&mut self, id: SeriesId, key: ReductionKey, frame: &Frame) -> &ReducedSeries {
-        self.touched.insert(id);
+        self.touched.insert(id.clone());
         if self
             .entries
             .get(&id)
@@ -541,7 +543,7 @@ struct PanelRenderContext<'a> {
     panel_id: u32,
     generation: u64,
     window: Option<[f64; 2]>,
-    series_index: Option<(usize, usize)>,
+    series_index: Option<(String, Vec<String>, usize, usize)>,
     cache: &'a mut SeriesCache,
 }
 
@@ -634,6 +636,10 @@ fn render_targets(
     context: PanelRenderContext<'_>,
 ) {
     let mut entries = Vec::new();
+    let visible_targets = targets
+        .iter()
+        .map(|target| target.ref_id.clone())
+        .collect::<Vec<_>>();
     for (target_index, target) in targets.iter().enumerate() {
         match &target.result {
             Err(message) => entries.push((
@@ -674,7 +680,17 @@ fn render_targets(
                     ) {
                         entries.push((label, None, Some("no samples retained yet"), None));
                     } else {
-                        entries.push((label, Some(frame), None, Some((target_index, index))));
+                        entries.push((
+                            label,
+                            Some(frame),
+                            None,
+                            Some((
+                                target.ref_id.clone(),
+                                visible_targets.clone(),
+                                target_index,
+                                index,
+                            )),
+                        ));
                     }
                 }
                 if frames.len() > 32 {
@@ -738,9 +754,14 @@ fn dispatch_renderer(
     let colors = render_colors(theme);
     match kind {
         "timeseries" => {
-            let (target_index, frame_index) = context.series_index.unwrap_or((0, 0));
+            let (target_ref_id, visible_targets, target_index, frame_index) = context
+                .series_index
+                .clone()
+                .unwrap_or_else(|| (String::new(), Vec::new(), 0, 0));
             let id = SeriesId {
                 panel_id: context.panel_id,
+                target_ref_id,
+                visible_targets,
                 target_index,
                 frame_index,
             };
@@ -1025,8 +1046,10 @@ mod tests {
         cache.begin_pass();
         let _prior = render_cached_series(&mut cache, 7, 1, frame_a, 30, Some([0.0, 2.0]));
         cache.finish_pass();
+        assert_eq!(cache.reduction_count(), 1);
 
         let area = Rect::new(0, 0, 30, 8);
+        cache.begin_pass();
         let mut same_generation = Buffer::empty(area);
         render_targets(
             "timeseries",
@@ -1047,8 +1070,38 @@ mod tests {
                 cache: &mut cache,
             },
         );
+        assert_eq!(cache.reduction_count(), 2, "B must not reuse A's reduction");
         let expected = render_targets_uncached(frame_b.clone(), "B", 30, Some([0.0, 2.0]));
-        assert_ne!(same_generation, expected);
+        assert_eq!(same_generation, expected);
+
+        cache.begin_pass();
+        let mut repeated_visible_set = Buffer::empty(area);
+        render_targets(
+            "timeseries",
+            "Panel",
+            &[gtui_app::engine::TargetUpdate {
+                ref_id: "B".into(),
+                label: "B".into(),
+                result: Ok(vec![frame_b.clone()]),
+            }],
+            area,
+            &mut repeated_visible_set,
+            &Theme::prism(),
+            PanelRenderContext {
+                panel_id: 7,
+                generation: 1,
+                window: Some([0.0, 2.0]),
+                series_index: None,
+                cache: &mut cache,
+            },
+        );
+        cache.finish_pass();
+        assert_eq!(
+            cache.reduction_count(),
+            2,
+            "unchanged visible targets must hit"
+        );
+        assert_eq!(repeated_visible_set, expected);
 
         let mut actual = Buffer::empty(area);
         render_targets(
@@ -1070,6 +1123,7 @@ mod tests {
                 cache: &mut cache,
             },
         );
+        assert_eq!(cache.reduction_count(), 3, "a generation change must miss");
         assert_eq!(actual, expected);
     }
 
