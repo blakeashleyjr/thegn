@@ -5,6 +5,7 @@
 //! unsafe `SetNamedSecurityInfoW` plumbing. The ACL is rebuilt from an empty,
 //! inheritance-protected DACL so pre-existing explicit grants cannot survive.
 
+use std::hash::{BuildHasher, Hash, Hasher};
 use std::io::Write;
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -18,11 +19,14 @@ use std::sync::atomic::{AtomicU64, Ordering};
 pub(crate) enum PrivateWriteFault {
     Fchmod,
     Write,
+    DirSync,
 }
 
 #[cfg(test)]
 thread_local! {
     static PRIVATE_WRITE_FAULT: std::cell::Cell<Option<PrivateWriteFault>> = const { std::cell::Cell::new(None) };
+    #[cfg(unix)]
+    static DIR_SYNCS: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
 }
 
 #[cfg(test)]
@@ -74,6 +78,45 @@ fn inject_write() -> std::io::Result<()> {
     } else {
         Ok(())
     }
+}
+
+#[cfg(all(test, unix))]
+fn inject_dir_sync() -> std::io::Result<()> {
+    if take_private_write_fault(PrivateWriteFault::DirSync) {
+        Err(std::io::Error::other("injected directory sync fault"))
+    } else {
+        Ok(())
+    }
+}
+
+#[cfg(all(not(test), unix))]
+#[inline(always)]
+fn inject_dir_sync() -> std::io::Result<()> {
+    Ok(())
+}
+
+fn temp_token() -> String {
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    let counter = NEXT.fetch_add(1, Ordering::Relaxed);
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_nanos());
+    let nanos = nanos.unwrap_or(0);
+    let mut tokens = [0_u64; 2];
+    for (lane, token) in tokens.iter_mut().enumerate() {
+        let state = std::collections::hash_map::RandomState::new();
+        let mut hasher = state.build_hasher();
+        std::process::id().hash(&mut hasher);
+        nanos.hash(&mut hasher);
+        counter.hash(&mut hasher);
+        if lane == 0 {
+            0_u8.hash(&mut hasher);
+        } else {
+            1_u8.hash(&mut hasher);
+        }
+        *token = hasher.finish();
+    }
+    format!("{:016x}{:016x}", tokens[0], tokens[1])
 }
 
 #[cfg(all(not(test), unix))]
@@ -226,14 +269,18 @@ pub fn make_executable_for_test(path: &Path) -> std::io::Result<()> {
 /// Keeping this platform distinction here lets security-sensitive callers stay
 /// substrate-agnostic.
 pub fn write_owner_only_new(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    let _file = write_owner_only_new_handle(path, bytes)?;
+    Ok(())
+}
+
+fn write_owner_only_new_handle(path: &Path, bytes: &[u8]) -> std::io::Result<std::fs::File> {
     let mut file = create_owner_only_exclusive(path)?;
     let result = file.write_all(bytes).and_then(|()| file.sync_all());
     if let Err(error) = result {
-        drop(file);
-        let _ = std::fs::remove_file(path);
+        cleanup_path_if_same(path, file);
         return Err(error);
     }
-    Ok(())
+    Ok(file)
 }
 
 /// Exclusively create (never replacing, never following a final-component
@@ -248,12 +295,108 @@ pub fn create_owner_only_exclusive(path: &Path) -> std::io::Result<std::fs::File
         options.mode(0o600);
     }
     let file = options.open(path)?;
-    if let Err(error) = restrict_to_owner(path) {
-        drop(file);
-        let _ = std::fs::remove_file(path);
+    #[cfg(unix)]
+    let restrict = {
+        use std::os::unix::fs::PermissionsExt;
+        file.set_permissions(std::fs::Permissions::from_mode(0o600))
+    };
+    #[cfg(not(unix))]
+    let restrict = restrict_to_owner(path);
+    if let Err(error) = restrict {
+        cleanup_path_if_same(path, file);
         return Err(error);
     }
     Ok(file)
+}
+
+#[cfg(unix)]
+fn cleanup_path_if_same(path: &Path, file: std::fs::File) {
+    use std::os::unix::fs::MetadataExt;
+    let expected = match file.metadata() {
+        Ok(metadata) => (metadata.dev(), metadata.ino()),
+        Err(error) => {
+            tracing::debug!(%error, path = %path.display(), "unable to identify private temporary for cleanup");
+            return;
+        }
+    };
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) if (metadata.dev(), metadata.ino()) == expected => {
+            if let Err(error) = std::fs::remove_file(path) {
+                tracing::debug!(%error, path = %path.display(), "unable to remove private temporary");
+            }
+        }
+        Ok(_) => {
+            tracing::debug!(path = %path.display(), "private temporary changed before cleanup; leaving entry")
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            tracing::debug!(%error, path = %path.display(), "unable to inspect private temporary for cleanup")
+        }
+    }
+}
+
+#[cfg(not(unix))]
+fn cleanup_path_if_same(path: &Path, file: std::fs::File) {
+    drop(file);
+    if let Err(error) = std::fs::remove_file(path) {
+        if error.kind() != std::io::ErrorKind::NotFound {
+            tracing::debug!(%error, path = %path.display(), "unable to remove private temporary");
+        }
+    }
+}
+
+#[cfg(unix)]
+fn finish_directory_sync(result: std::io::Result<()>) -> std::io::Result<()> {
+    match result {
+        Ok(()) => {
+            #[cfg(test)]
+            DIR_SYNCS.set(DIR_SYNCS.get().saturating_add(1));
+            Ok(())
+        }
+        Err(error)
+            if error.raw_os_error().is_some_and(|code| {
+                [nix::libc::EINVAL, nix::libc::ENOTSUP, nix::libc::EOPNOTSUPP].contains(&code)
+            }) =>
+        {
+            tracing::debug!(%error, "filesystem does not support directory sync");
+            Ok(())
+        }
+        Err(error) => Err(error),
+    }
+}
+
+#[cfg(not(unix))]
+fn finish_directory_sync(result: std::io::Result<()>) -> std::io::Result<()> {
+    result
+}
+
+#[cfg(unix)]
+#[allow(
+    clippy::unnecessary_cast,
+    reason = "stat device and inode fields vary in width across Unix targets"
+)]
+fn unlink_if_same(dir: &std::os::fd::OwnedFd, name: &str, expected: (u64, u64)) {
+    use nix::fcntl::AtFlags;
+    use nix::sys::stat::fstatat;
+    use nix::unistd::{UnlinkatFlags, unlinkat};
+    let inspected = fstatat(dir, name, AtFlags::AT_SYMLINK_NOFOLLOW);
+    match inspected {
+        Ok(stat) if (stat.st_dev as u64, stat.st_ino as u64) == expected => {
+            if let Err(error) = unlinkat(dir, name, UnlinkatFlags::NoRemoveDir) {
+                if error != nix::errno::Errno::ENOENT {
+                    tracing::debug!(%error, name, "unable to remove private temporary");
+                }
+            }
+        }
+        Ok(_) => tracing::debug!(
+            name,
+            "private temporary changed before cleanup; leaving entry"
+        ),
+        Err(nix::errno::Errno::ENOENT) => {}
+        Err(error) => {
+            tracing::debug!(%error, name, "unable to inspect private temporary for cleanup")
+        }
+    }
 }
 
 /// Whether `meta` describes a file owned by the current user (always true on
@@ -547,14 +690,16 @@ impl PrivateDir {
     }
 
     /// Atomically publish owner-only bytes under one filename in this
-    /// directory. Publication uses the held directory descriptor and never
-    /// resolves an ancestor again.
+    /// directory. The unpredictable same-directory temporary is file-synced,
+    /// published through the held directory descriptor, then directory-synced.
+    /// Failure cleanup removes only the object this call created. A directory
+    /// sync error is returned after publication, so the new bytes may already
+    /// be visible even when this method returns an error.
     pub fn write_owner_only_atomic(&self, name: &str, bytes: &[u8]) -> std::io::Result<PathBuf> {
         #[cfg(unix)]
         {
             use nix::fcntl::{OFlag, openat, renameat};
-            use nix::sys::stat::{Mode, fchmod};
-            use nix::unistd::{UnlinkatFlags, unlinkat};
+            use nix::sys::stat::{Mode, fchmod, fstat};
             let name_path = Path::new(name);
             let mut components = name_path.components();
             let Some(Component::Normal(component)) = components.next() else {
@@ -564,16 +709,7 @@ impl PrivateDir {
                 return Err(invalid_private_name());
             }
             let name = Path::new(component);
-            static NEXT: AtomicU64 = AtomicU64::new(0);
-            let nonce = NEXT.fetch_add(1, Ordering::Relaxed);
-            let nanos = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|duration| duration.as_nanos())
-                .unwrap_or(0);
-            let temporary = format!(
-                "{PRIVATE_TEMP_PREFIX}{}-{nanos}-{nonce}",
-                std::process::id()
-            );
+            let temporary = format!("{PRIVATE_TEMP_PREFIX}{}", temp_token());
             let fd = openat(
                 &self.fd,
                 temporary.as_str(),
@@ -585,15 +721,17 @@ impl PrivateDir {
                 Mode::from_bits_truncate(0o600),
             )
             .map_err(nix_io_error)?;
+            let stat = fstat(&fd).map_err(nix_io_error)?;
+            #[allow(
+                clippy::unnecessary_cast,
+                reason = "stat device and inode fields vary in width across Unix targets"
+            )]
+            let expected = (stat.st_dev as u64, stat.st_ino as u64);
             let chmod_result = fchmod(&fd, Mode::from_bits_truncate(0o600))
                 .map_err(nix_io_error)
                 .and_then(|()| inject_fchmod());
             if let Err(error) = chmod_result {
-                if let Err(cleanup_error) =
-                    unlinkat(&self.fd, temporary.as_str(), UnlinkatFlags::NoRemoveDir)
-                {
-                    tracing::debug!(%cleanup_error, "failed to remove unprotected private file");
-                }
+                unlink_if_same(&self.fd, temporary.as_str(), expected);
                 return Err(error);
             }
             let mut file = std::fs::File::from(fd);
@@ -602,11 +740,7 @@ impl PrivateDir {
                 .and_then(|()| inject_write())
                 .and_then(|()| file.sync_all());
             if let Err(error) = write_result {
-                if let Err(cleanup_error) =
-                    unlinkat(&self.fd, temporary.as_str(), UnlinkatFlags::NoRemoveDir)
-                {
-                    tracing::debug!(%cleanup_error, "failed to remove incomplete private file");
-                }
+                unlink_if_same(&self.fd, temporary.as_str(), expected);
                 return Err(error);
             }
             use nix::fcntl::AtFlags;
@@ -631,13 +765,11 @@ impl PrivateDir {
                 }
             }
             if let Err(error) = renameat(&self.fd, temporary.as_str(), &self.fd, name) {
-                if let Err(cleanup_error) =
-                    unlinkat(&self.fd, temporary.as_str(), UnlinkatFlags::NoRemoveDir)
-                {
-                    tracing::debug!(%cleanup_error, "failed to remove unpublished private file");
-                }
+                unlink_if_same(&self.fd, temporary.as_str(), expected);
                 return Err(nix_io_error(error));
             }
+            inject_dir_sync()?;
+            finish_directory_sync(nix::unistd::fsync(&self.fd).map_err(nix_io_error))?;
             Ok(self.path.join(name))
         }
         #[cfg(not(unix))]
@@ -791,7 +923,11 @@ fn map_directory_open_error(error: nix::errno::Errno) -> std::io::Error {
     }
 }
 
-/// Atomically replace `path` with owner-only contents.
+/// Atomically replace `path` with owner-only contents using an unpredictable
+/// same-directory temporary, file and directory sync, and cleanup limited to
+/// the object this call created. A directory sync error is returned after
+/// publication, so the new bytes may already be visible when this returns an
+/// error.
 ///
 /// The temporary file is created in the destination directory with the strict
 /// permissions already applied, so readers can observe either the old private
@@ -799,7 +935,6 @@ fn map_directory_open_error(error: nix::errno::Errno) -> std::io::Error {
 /// uses `MoveFileExW` with replace-existing semantics because Rust's standard
 /// `rename` does not replace there.
 pub fn write_owner_only_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
-    static NEXT: AtomicU64 = AtomicU64::new(0);
     let parent = path.parent().ok_or_else(|| {
         std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
@@ -816,16 +951,8 @@ pub fn write_owner_only_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()>
             )
         })?
         .to_string_lossy();
-    let nonce = NEXT.fetch_add(1, Ordering::Relaxed);
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|duration| duration.as_nanos())
-        .unwrap_or(0);
-    let temporary = parent.join(format!(
-        ".{name}.tmp-{}-{nanos}-{nonce}",
-        std::process::id()
-    ));
-    write_owner_only_new(&temporary, bytes)?;
+    let temporary = parent.join(format!(".{name}.tmp-{}", temp_token()));
+    let file = write_owner_only_new_handle(&temporary, bytes)?;
 
     match std::fs::symlink_metadata(path) {
         Ok(metadata) => {
@@ -845,9 +972,14 @@ pub fn write_owner_only_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()>
     #[cfg(not(windows))]
     let publish = std::fs::rename(&temporary, path);
     if let Err(error) = publish {
-        let _ = std::fs::remove_file(&temporary);
+        cleanup_path_if_same(&temporary, file);
         return Err(error);
     }
+    #[cfg(unix)]
+    {
+        inject_dir_sync()?;
+    }
+    finish_directory_sync(sync_parent_dir(parent))?;
     Ok(())
 }
 
@@ -973,7 +1105,119 @@ Set-Acl -LiteralPath $path -AclObject $acl"#
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
-    use std::os::unix::fs::PermissionsExt;
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+    #[test]
+    fn private_write_temp_names_carry_no_pid_or_time() {
+        let first = temp_token();
+        let second = temp_token();
+        let is_token = |token: &str| {
+            token.len() == 32
+                && token
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        };
+        assert!(is_token(&first));
+        assert!(is_token(&second));
+        assert_ne!(first, second);
+
+        let anchor = tempfile::tempdir().unwrap();
+        let dir = ensure_private_dir_beneath(anchor.path(), Path::new("secrets")).unwrap();
+        let destination = anchor.path().join("secrets/destination");
+        std::fs::create_dir(&destination).unwrap();
+        std::fs::write(destination.join("inner"), b"x").unwrap();
+        assert!(
+            dir.write_owner_only_atomic("destination", b"secret")
+                .is_err()
+        );
+        assert!(
+            std::fs::read_dir(anchor.path().join("secrets"))
+                .unwrap()
+                .all(|entry| !entry
+                    .unwrap()
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(PRIVATE_TEMP_PREFIX))
+        );
+    }
+
+    #[test]
+    fn private_write_syncs_the_directory_after_publish() {
+        DIR_SYNCS.set(0);
+        let anchor = tempfile::tempdir().unwrap();
+        let dir = ensure_private_dir_beneath(anchor.path(), Path::new("secrets")).unwrap();
+        dir.write_owner_only_atomic("secret", b"new").unwrap();
+        assert_eq!(DIR_SYNCS.get(), 1);
+    }
+
+    #[test]
+    fn path_atomic_write_syncs_the_parent_directory() {
+        DIR_SYNCS.set(0);
+        let dir = tempfile::tempdir().unwrap();
+        let destination = dir.path().join("secret");
+        write_owner_only_atomic(destination, b"new").unwrap();
+        assert_eq!(DIR_SYNCS.get(), 1);
+    }
+
+    #[test]
+    fn private_write_dir_sync_failure_is_reported_after_publish() {
+        let anchor = tempfile::tempdir().unwrap();
+        let dir = ensure_private_dir_beneath(anchor.path(), Path::new("secrets")).unwrap();
+        let destination = anchor.path().join("secrets/secret");
+        let result = with_private_write_fault(PrivateWriteFault::DirSync, || {
+            dir.write_owner_only_atomic("secret", b"published")
+        });
+        assert!(result.is_err());
+        assert_eq!(std::fs::read(destination).unwrap(), b"published");
+        assert!(
+            std::fs::read_dir(anchor.path().join("secrets"))
+                .unwrap()
+                .all(|entry| !entry
+                    .unwrap()
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(PRIVATE_TEMP_PREFIX))
+        );
+    }
+
+    #[test]
+    fn path_atomic_write_dir_sync_failure_is_reported_after_publish() {
+        let dir = tempfile::tempdir().unwrap();
+        let destination = dir.path().join("secret");
+        let result = with_private_write_fault(PrivateWriteFault::DirSync, || {
+            write_owner_only_atomic(&destination, b"published")
+        });
+        assert!(result.is_err());
+        assert_eq!(std::fs::read(destination).unwrap(), b"published");
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn cleanup_leaves_a_substituted_temporary_untouched() {
+        let anchor = tempfile::tempdir().unwrap();
+        let dir = ensure_private_dir_beneath(anchor.path(), Path::new("secrets")).unwrap();
+        let original_path = dir.path.join("temporary");
+        let replacement_path = dir.path.join("replacement");
+        std::fs::write(&original_path, b"original").unwrap();
+        std::fs::write(&replacement_path, b"replacement").unwrap();
+        let original = std::fs::metadata(&original_path).unwrap();
+        let expected_original = (original.dev(), original.ino());
+        std::fs::rename(replacement_path, &original_path).unwrap();
+        unlink_if_same(&dir.fd, "temporary", expected_original);
+        assert_eq!(std::fs::read(&original_path).unwrap(), b"replacement");
+
+        let replacement = std::fs::metadata(&original_path).unwrap();
+        unlink_if_same(&dir.fd, "temporary", (replacement.dev(), replacement.ino()));
+        assert!(!original_path.exists());
+    }
+
+    #[test]
+    fn owner_only_exclusive_sets_mode_through_the_handle() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("secret");
+        let _file = create_owner_only_exclusive(&path).unwrap();
+        assert_eq!(mode_bits(&path).unwrap(), Some(0o600));
+    }
 
     #[test]
     fn private_write_fchmod_failure_unlinks_the_temporary() {
