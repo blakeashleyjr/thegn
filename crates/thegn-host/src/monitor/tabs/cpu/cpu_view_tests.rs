@@ -826,7 +826,9 @@ fn selected_core_label_stays_visible_past_the_panel_rows() {
             Some(7),
             &mut String::new(),
         );
-        assert_eq!(grid.get(1, 2).unwrap().bg, selected_bg);
+        // Full Unicode packs two core labels per row. Core 7 is the second
+        // label on the final visible row, after core 6 and the separator.
+        assert_eq!(grid.get(6, 2).unwrap().bg, selected_bg);
         assert_eq!(grid.get(1, 1).unwrap().bg, crate::seg::StyleTok::INHERIT);
     });
 }
@@ -850,7 +852,8 @@ fn braille_highlight_applies_only_to_the_selected_half_of_a_pair() {
             &mut String::new(),
         );
         assert_ne!(grid.get(2, 1).unwrap().bg, selected_bg);
-        assert_eq!(grid.get(6, 1).unwrap().bg, selected_bg);
+        // Core 1 follows core 0's full topology label and the " / " separator.
+        assert_eq!(grid.get(12, 1).unwrap().bg, selected_bg);
     });
 }
 
