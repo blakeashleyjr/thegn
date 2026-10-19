@@ -752,6 +752,8 @@ pub const MAX_AUDIT_STRING_BYTES: usize = 256;
 /// entry owns at most three capped strings (capability, operation, target),
 /// so the count bound also bounds their combined string bytes to
 /// `3 * MAX_AUDIT_STRING_BYTES` per entry, in addition to the plugin id.
+/// If the clock is unavailable, an entry stamped at 0 is treated as maximally
+/// old once the clock recovers.
 pub const MAX_AUDIT_AGE_MS: u64 = 24 * 60 * 60 * 1000;
 pub const MAX_PLUGIN_JSON_DEPTH: usize = 32;
 pub const MAX_STATE_KEYS: usize = 256;
@@ -3580,11 +3582,12 @@ timeout_secs = 5
         );
 
         let entry = &runtime.audit_log_at(10_000)[0];
+        let total_string_bytes = entry.capability.as_str().len()
+            + entry.operation.len()
+            + entry.target.as_ref().map_or(0, String::len);
         assert!(
-            entry.capability.as_str().len()
-                + entry.operation.len()
-                + entry.target.as_ref().map_or(0, String::len)
-                <= 3 * MAX_AUDIT_STRING_BYTES
+            total_string_bytes <= 3 * MAX_AUDIT_STRING_BYTES,
+            "measured audit string bytes: {total_string_bytes}"
         );
     }
 
