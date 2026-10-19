@@ -14,7 +14,7 @@ use thegn_core::db::{Db, MergeQueueRow};
 use thegn_core::merge_lifecycle::LifecycleEvent;
 use thegn_core::models::WorktreeRow;
 use thegn_core::remote::GitLoc;
-use thegn_core::store::{WorkspaceStore, WorktreeAuxStore};
+use thegn_core::store::{MergeClaimView, WorkspaceStore, WorktreeAuxStore};
 use thegn_core::util;
 use thegn_svc::git::{CliGit, GitBackend};
 
@@ -114,6 +114,91 @@ pub fn rows_for_repo(db: &Db, root: &Path) -> Result<Vec<MergeQueueRow>> {
 /// (it may simply not exist — the caller reports that).
 pub fn canonical_worktree(worktree: &Path) -> PathBuf {
     std::fs::canonicalize(worktree).unwrap_or_else(|_| worktree.to_path_buf())
+}
+
+/// Why a queue-aware land cannot proceed for the checked-out branch.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum LandRefusal {
+    NotQueued,
+    NotOnBranch,
+    NotReady { status: String },
+    NoResult,
+    BranchMismatch { queued: String, checked_out: String },
+    Remote,
+    Claimed,
+}
+
+impl std::fmt::Display for LandRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let reason = match self {
+            Self::NotQueued => "worktree has no merge-queue row".to_owned(),
+            Self::NotOnBranch => "worktree is not on a branch".to_owned(),
+            Self::NotReady { status } => format!("merge-queue row is {status}, not ready"),
+            Self::NoResult => "ready merge-queue row has no result OID".to_owned(),
+            Self::BranchMismatch {
+                queued,
+                checked_out,
+            } => format!("checked-out branch {checked_out} does not match queued branch {queued}"),
+            Self::Remote => "merge-queue row is not local".to_owned(),
+            Self::Claimed => "merge-queue row is claimed by a drain".to_owned(),
+        };
+        write!(
+            f,
+            "{reason}; use `thegn land` to land the checked-out branch outside the queue"
+        )
+    }
+}
+
+impl std::error::Error for LandRefusal {}
+
+/// Pure policy check shared by the CLI and panel land paths.
+pub(crate) fn ready_land_check(
+    row: Option<&MergeQueueRow>,
+    claim: Option<&MergeClaimView>,
+    checked_out_branch: &str,
+) -> std::result::Result<(), LandRefusal> {
+    let Some(row) = row else {
+        return Err(LandRefusal::NotQueued);
+    };
+    if row.status != "ready" {
+        return Err(LandRefusal::NotReady {
+            status: row.status.clone(),
+        });
+    }
+    if row.result_oid.as_deref().is_none_or(str::is_empty) {
+        return Err(LandRefusal::NoResult);
+    }
+    if !row.location.trim().is_empty() && row.location.trim() != "local" {
+        return Err(LandRefusal::Remote);
+    }
+    if claim.is_some_and(|claim| claim.phase != "unclaimed") {
+        return Err(LandRefusal::Claimed);
+    }
+    if row.branch != checked_out_branch {
+        return Err(LandRefusal::BranchMismatch {
+            queued: row.branch.clone(),
+            checked_out: checked_out_branch.to_owned(),
+        });
+    }
+    Ok(())
+}
+
+/// Verify that a worktree's local queue row is ready for queue-aware landing.
+pub(crate) fn ready_land_precheck(db: &Db, worktree: &str) -> Result<()> {
+    let row = db
+        .list_merge_queue()?
+        .into_iter()
+        .find(|row| row.worktree == worktree);
+    let claim = db.observe_merge_claim(worktree)?;
+    let Some(branch) = util::git_out(
+        Path::new(worktree),
+        &["symbolic-ref", "--quiet", "--short", "HEAD"],
+    )
+    .map(|branch| branch.trim().to_owned())
+    .filter(|branch| !branch.is_empty()) else {
+        return Err(anyhow::Error::new(LandRefusal::NotOnBranch));
+    };
+    ready_land_check(row.as_ref(), claim.as_ref(), &branch).map_err(anyhow::Error::from)
 }
 
 /// The repo root for a worktree, with an error that names the actual problem.
@@ -350,6 +435,121 @@ pub fn clear_repo(cfg: &Config, db: &Db, root: &Path) -> Result<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn land_row(
+        status: &str,
+        result_oid: Option<&str>,
+        location: &str,
+        branch: &str,
+    ) -> MergeQueueRow {
+        MergeQueueRow {
+            worktree: "/repo/worktree".to_owned(),
+            branch: branch.to_owned(),
+            target_branch: "main".to_owned(),
+            status: status.to_owned(),
+            queued_at: 1,
+            updated_at: 2,
+            result_oid: result_oid.map(str::to_owned),
+            conflict_paths: None,
+            error_detail: None,
+            location: location.to_owned(),
+            agent_attempts: 0,
+        }
+    }
+
+    fn land_claim(phase: &str) -> MergeClaimView {
+        MergeClaimView {
+            worktree: "/repo/worktree".to_owned(),
+            generation: 1,
+            phase: phase.to_owned(),
+            lease_until_ms: None,
+            owner_hint: None,
+        }
+    }
+
+    #[test]
+    fn ready_land_check_refuses_every_non_ready_shape() {
+        let ready = land_row("ready", Some("fold-oid"), "local", "feature");
+        assert_eq!(
+            ready_land_check(None, None, "feature"),
+            Err(LandRefusal::NotQueued)
+        );
+
+        for status in [
+            "queued",
+            "folding",
+            "verifying",
+            "landed",
+            "deferred",
+            "gate_failed",
+            "gate_error",
+            "agent_blocked",
+            "agent_running",
+            "needs_human",
+        ] {
+            assert_eq!(
+                ready_land_check(
+                    Some(&land_row(status, Some("fold-oid"), "local", "feature")),
+                    None,
+                    "feature"
+                ),
+                Err(LandRefusal::NotReady {
+                    status: status.to_owned(),
+                }),
+                "status {status} must refuse"
+            );
+        }
+        assert_eq!(
+            ready_land_check(
+                Some(&land_row("ready", None, "local", "feature")),
+                None,
+                "feature"
+            ),
+            Err(LandRefusal::NoResult)
+        );
+        assert_eq!(
+            ready_land_check(
+                Some(&land_row("ready", Some(""), "local", "feature")),
+                None,
+                "feature"
+            ),
+            Err(LandRefusal::NoResult)
+        );
+        assert_eq!(
+            ready_land_check(
+                Some(&land_row(
+                    "ready",
+                    Some("fold-oid"),
+                    "{remote descriptor}",
+                    "feature"
+                )),
+                None,
+                "feature"
+            ),
+            Err(LandRefusal::Remote)
+        );
+        assert_eq!(
+            ready_land_check(Some(&ready), Some(&land_claim("claimed")), "feature"),
+            Err(LandRefusal::Claimed)
+        );
+        assert_eq!(
+            ready_land_check(Some(&ready), None, "other-branch"),
+            Err(LandRefusal::BranchMismatch {
+                queued: "feature".to_owned(),
+                checked_out: "other-branch".to_owned(),
+            })
+        );
+    }
+
+    #[test]
+    fn ready_land_check_accepts_a_ready_local_row() {
+        let ready = land_row("ready", Some("fold-oid"), "local", "feature");
+        assert_eq!(ready_land_check(Some(&ready), None, "feature"), Ok(()));
+        assert_eq!(
+            ready_land_check(Some(&ready), Some(&land_claim("unclaimed")), "feature"),
+            Ok(())
+        );
+    }
 
     #[expect(clippy::disallowed_methods)] // deterministic real-Git fixture, test only
     fn git(dir: &Path, args: &[&str]) {
