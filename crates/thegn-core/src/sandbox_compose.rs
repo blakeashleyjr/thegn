@@ -866,6 +866,56 @@ fn pinned_ps_argv(
     v
 }
 
+struct PinnedLaunch {
+    up: Vec<String>,
+    ps: Vec<String>,
+    file: Option<PathBuf>,
+}
+
+/// Persist Compose's effective JSON and build the launch commands from it.
+/// Compose config JSON doubles literal `$` as `$$`, so parsing the pinned file
+/// preserves escaped bind sources and command strings instead of interpolating
+/// them again from the shell environment or project `.env`.
+fn pin_inspected_config(
+    state_home: &Path,
+    project: &str,
+    target: &ComposeTarget,
+    compose: &ComposeSpec,
+    output: &str,
+) -> anyhow::Result<PinnedLaunch> {
+    let first_file = compose
+        .files
+        .first()
+        .ok_or_else(|| anyhow::anyhow!("Compose config has no source file"))?;
+    let absolute_file = std::path::absolute(first_file)?;
+    let project_dir = absolute_file
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("Compose source file has no project directory"))?;
+    let directory =
+        crate::fsperm::ensure_private_dir_beneath(state_home, Path::new("thegn/compose-labels"))?;
+    let pinned =
+        directory.write_owner_only_atomic(&format!("{project}.pinned.json"), output.as_bytes())?;
+    let up = target.control_argv(&pinned_up_argv(
+        target,
+        project,
+        compose,
+        &pinned,
+        project_dir,
+    ));
+    let ps = target.control_argv(&pinned_ps_argv(
+        target,
+        project,
+        compose,
+        &pinned,
+        project_dir,
+    ));
+    Ok(PinnedLaunch {
+        up,
+        ps,
+        file: Some(pinned),
+    })
+}
+
 /// Run Compose startup and confirm at least one intended service is running.
 pub(crate) fn run_up_checked(
     up: &[String],
@@ -944,7 +994,7 @@ fn up_attested(
     ps: &[String],
     guard: &ComposeGuard,
     timeouts: (Duration, Duration, Duration),
-    pin: impl FnOnce(&str) -> anyhow::Result<(Vec<String>, Vec<String>, Option<PathBuf>)>,
+    pin: impl FnOnce(&str) -> anyhow::Result<PinnedLaunch>,
 ) -> anyhow::Result<EnsureReport> {
     use crate::sandbox::proc::{Capture, ProcOutcome, run_bounded};
 
@@ -994,8 +1044,12 @@ fn up_attested(
     };
     let (launch_up, launch_ps, pinned_file) =
         match (verified.is_none(), inspected_config.as_deref()) {
-            (true, Some(output)) => pin(output)?,
-            _ => (up.to_vec(), ps.to_vec(), None),
+            (true, Some(output)) => {
+                let pinned = pin(output)?;
+                (pinned.up, pinned.ps, pinned.file)
+            }
+            (true, None) => return Err(anyhow::anyhow!("inspected Compose config missing")),
+            (false, _) => (up.to_vec(), ps.to_vec(), None),
         };
     let launch_result = run_up_checked(&launch_up, &launch_ps, timeouts.1, timeouts.2);
     if let Some(path) = pinned_file
@@ -1071,37 +1125,7 @@ pub(crate) fn up_and_verify(
             COMPOSE_UP_TIMEOUT,
             COMPOSE_PS_TIMEOUT,
         ),
-        |output| {
-            let first_file = labelled
-                .files
-                .first()
-                .ok_or_else(|| anyhow::anyhow!("Compose config has no source file"))?;
-            let absolute_file = std::path::absolute(first_file)?;
-            let project_dir = absolute_file
-                .parent()
-                .ok_or_else(|| anyhow::anyhow!("Compose source file has no project directory"))?;
-            let directory = crate::fsperm::ensure_private_dir_beneath(
-                &state_home,
-                std::path::Path::new("thegn/compose-labels"),
-            )?;
-            let pinned = directory
-                .write_owner_only_atomic(&format!("{project}.pinned.json"), output.as_bytes())?;
-            let pinned_up = target.control_argv(&pinned_up_argv(
-                &target,
-                &project,
-                &labelled,
-                &pinned,
-                project_dir,
-            ));
-            let pinned_ps = target.control_argv(&pinned_ps_argv(
-                &target,
-                &project,
-                &labelled,
-                &pinned,
-                project_dir,
-            ));
-            Ok((pinned_up, pinned_ps, Some(pinned)))
-        },
+        |output| pin_inspected_config(&state_home, &project, &target, compose, output),
     )
 }
 
@@ -1939,7 +1963,11 @@ mod tests {
                     pin_marker.display()
                 ));
                 let ps = shell("printf 'container-id\\n'");
-                Ok((up, ps, Some(pin_pinned)))
+                Ok(PinnedLaunch {
+                    up,
+                    ps,
+                    file: Some(pin_pinned),
+                })
             },
         )
         .expect("pinned effective config launches");
@@ -2017,6 +2045,65 @@ mod tests {
             !pin_called.get(),
             "pin closure is only used after verified inspection"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn pin_inspected_config_writes_owner_only_file_and_uses_compose_source_directory() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let state = crate::testenv::IsolatedState::new();
+        let target = ComposeTarget {
+            engine: vec!["docker".into(), "compose".into()],
+            placement: Placement::Local,
+        };
+        let compose = ComposeSpec {
+            files: vec![
+                "/workspace/project/compose.yml".into(),
+                "override.yml".into(),
+            ],
+            service: Some("app".into()),
+            run_services: vec!["db".into()],
+        };
+        let output = r#"{"services":{"app":{"volumes":[{"source":"$${X}"}]}}}"#;
+        let pinned = pin_inspected_config(
+            state.state_home().as_path(),
+            "proj",
+            &target,
+            &compose,
+            output,
+        )
+        .expect("effective config is pinned");
+        let file = pinned.file.as_ref().expect("pinned file is returned");
+        assert_eq!(std::fs::read_to_string(file).unwrap(), output);
+        assert_eq!(
+            std::fs::metadata(file).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        for argv in [&pinned.up, &pinned.ps] {
+            assert!(
+                argv.windows(2)
+                    .any(|args| args == ["--project-directory", "/workspace/project"])
+            );
+            assert!(
+                argv.windows(2)
+                    .any(|args| args == ["-f", file.to_str().unwrap()])
+            );
+            assert_eq!(argv.iter().filter(|arg| arg.as_str() == "-f").count(), 1);
+        }
+
+        let empty = ComposeSpec::default();
+        let result = pin_inspected_config(
+            state.state_home().as_path(),
+            "empty",
+            &target,
+            &empty,
+            output,
+        );
+        match result {
+            Err(error) => assert!(error.to_string().contains("no source file")),
+            Ok(_) => panic!("missing Compose source file must refuse pinning"),
+        }
     }
 
     #[test]
