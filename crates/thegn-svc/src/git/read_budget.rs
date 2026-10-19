@@ -128,10 +128,9 @@ fn watchdog() -> Option<&'static Arc<Watchdog>> {
         .get_or_init(|| {
             let watchdog = Arc::new(Watchdog::new());
             let worker_watchdog = Arc::clone(&watchdog);
-            match std::thread::Builder::new()
-                .name("git-read-deadline".into())
-                .spawn(move || run_watchdog(worker_watchdog))
-            {
+            match thegn_core::thread_name::try_spawn_named("thegn-git-dl", move || {
+                run_watchdog(worker_watchdog)
+            }) {
                 Ok(thread) => {
                     #[cfg(test)]
                     WATCHDOG_SPAWN_COUNT.fetch_add(1, Ordering::SeqCst);
