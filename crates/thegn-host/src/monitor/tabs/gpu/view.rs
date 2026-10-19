@@ -57,13 +57,13 @@ const SPECS: [PanelSpec; 4] = [
 ];
 
 #[derive(Debug, Clone)]
-pub(super) struct ActivityRing {
+pub(super) struct HistoryRing {
     pub(super) values: [f32; HISTORY_CAP],
     pub(super) next: usize,
     pub(super) len: usize,
 }
 
-impl ActivityRing {
+impl HistoryRing {
     fn new() -> Self {
         Self {
             values: [0.0; HISTORY_CAP],
@@ -73,71 +73,20 @@ impl ActivityRing {
     }
 
     fn push(&mut self, value: f32) {
-        BusyHistory::push_ring(&mut self.values, &mut self.next, &mut self.len, value);
-    }
-
-    pub(super) fn ordered_into(&self, output: &mut [f32; HISTORY_CAP]) -> usize {
-        BusyHistory::ordered_ring(&self.values, self.next, self.len, output)
-    }
-}
-
-#[derive(Debug, Clone)]
-pub(super) struct BusyHistory {
-    pub(super) slot: String,
-    pub(super) values: [f32; HISTORY_CAP],
-    pub(super) next: usize,
-    pub(super) len: usize,
-    pub(super) vcn_values: [f32; HISTORY_CAP],
-    pub(super) vcn_next: usize,
-    pub(super) vcn_len: usize,
-    pub(super) memory: [f32; HISTORY_CAP],
-    pub(super) memory_next: usize,
-    pub(super) memory_len: usize,
-    pub(super) gtt: [f32; HISTORY_CAP],
-    pub(super) gtt_next: usize,
-    pub(super) gtt_len: usize,
-    pub(super) clocks: [f32; HISTORY_CAP],
-    pub(super) clocks_next: usize,
-    pub(super) clocks_len: usize,
-    pub(super) power: [f32; HISTORY_CAP],
-    pub(super) power_next: usize,
-    pub(super) power_len: usize,
-    pub(super) activity: [ActivityRing; ACTIVITY_RING_COUNT],
-}
-
-impl BusyHistory {
-    fn new(slot: &str) -> Self {
-        Self {
-            slot: slot.to_owned(),
-            values: [0.0; HISTORY_CAP],
-            next: 0,
-            len: 0,
-            vcn_values: [0.0; HISTORY_CAP],
-            vcn_next: 0,
-            vcn_len: 0,
-            memory: [0.0; HISTORY_CAP],
-            memory_next: 0,
-            memory_len: 0,
-            gtt: [0.0; HISTORY_CAP],
-            gtt_next: 0,
-            gtt_len: 0,
-            clocks: [0.0; HISTORY_CAP],
-            clocks_next: 0,
-            clocks_len: 0,
-            power: [0.0; HISTORY_CAP],
-            power_next: 0,
-            power_len: 0,
-            activity: std::array::from_fn(|_| ActivityRing::new()),
-        }
-    }
-
-    fn push(&mut self, value: f32) {
         self.values[self.next] = value;
         self.next = (self.next + 1) % HISTORY_CAP;
         self.len = self.len.saturating_add(1).min(HISTORY_CAP);
     }
 
-    fn ordered_into(&self, output: &mut [f32; HISTORY_CAP]) -> usize {
+    fn push_optional(&mut self, value: Option<f32>) {
+        if let Some(value) = value {
+            self.push(value);
+        } else if !self.is_empty() {
+            self.push(f32::NAN);
+        }
+    }
+
+    pub(super) fn ordered_into(&self, output: &mut [f32; HISTORY_CAP]) -> usize {
         let start = (self.next + HISTORY_CAP - self.len) % HISTORY_CAP;
         for (offset, value) in output.iter_mut().take(self.len).enumerate() {
             *value = self.values[(start + offset) % HISTORY_CAP];
@@ -145,37 +94,39 @@ impl BusyHistory {
         self.len
     }
 
-    fn push_vcn(&mut self, value: f32) {
-        self.vcn_values[self.vcn_next] = value;
-        self.vcn_next = (self.vcn_next + 1) % HISTORY_CAP;
-        self.vcn_len = self.vcn_len.saturating_add(1).min(HISTORY_CAP);
+    pub(super) fn len(&self) -> usize {
+        self.len
     }
 
-    fn ordered_vcn_into(&self, output: &mut [f32; HISTORY_CAP]) -> usize {
-        let start = (self.vcn_next + HISTORY_CAP - self.vcn_len) % HISTORY_CAP;
-        for (offset, value) in output.iter_mut().take(self.vcn_len).enumerate() {
-            *value = self.vcn_values[(start + offset) % HISTORY_CAP];
+    pub(super) fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+}
+
+#[derive(Debug, Clone)]
+pub(super) struct BusyHistory {
+    pub(super) slot: String,
+    pub(super) busy: HistoryRing,
+    pub(super) vcn: HistoryRing,
+    pub(super) memory: HistoryRing,
+    pub(super) gtt: HistoryRing,
+    pub(super) clocks: HistoryRing,
+    pub(super) power: HistoryRing,
+    pub(super) activity: [HistoryRing; ACTIVITY_RING_COUNT],
+}
+
+impl BusyHistory {
+    fn new(slot: &str) -> Self {
+        Self {
+            slot: slot.to_owned(),
+            busy: HistoryRing::new(),
+            vcn: HistoryRing::new(),
+            memory: HistoryRing::new(),
+            gtt: HistoryRing::new(),
+            clocks: HistoryRing::new(),
+            power: HistoryRing::new(),
+            activity: std::array::from_fn(|_| HistoryRing::new()),
         }
-        self.vcn_len
-    }
-
-    fn push_ring(values: &mut [f32; HISTORY_CAP], next: &mut usize, len: &mut usize, value: f32) {
-        values[*next] = value;
-        *next = (*next + 1) % HISTORY_CAP;
-        *len = (*len).saturating_add(1).min(HISTORY_CAP);
-    }
-
-    fn ordered_ring(
-        values: &[f32; HISTORY_CAP],
-        next: usize,
-        len: usize,
-        output: &mut [f32; HISTORY_CAP],
-    ) -> usize {
-        let start = (next + HISTORY_CAP - len) % HISTORY_CAP;
-        for (offset, value) in output.iter_mut().take(len).enumerate() {
-            *value = values[(start + offset) % HISTORY_CAP];
-        }
-        len
     }
 }
 
@@ -251,39 +202,25 @@ impl GpuModel {
                     continue;
                 };
             let history = &mut self.histories[history_index];
-            if let Some(busy) = row
-                .gfx_busy_pct
-                .filter(|_| row.runtime_status == RuntimeStatus::Active)
-            {
-                history.push(f32::from(busy) / 100.0);
-            }
-            if let Some(busy) = row
-                .vcn_busy_pct
-                .filter(|_| row.runtime_status == RuntimeStatus::Active)
-            {
-                history.push_vcn(f32::from(busy) / 100.0);
-            }
             if row.runtime_status == RuntimeStatus::Active {
-                if let (Some(used), Some(total)) = (row.vram_used, row.vram_total)
-                    && total > 0
-                {
-                    BusyHistory::push_ring(
-                        &mut history.memory,
-                        &mut history.memory_next,
-                        &mut history.memory_len,
-                        (used as f64 / total as f64).clamp(0.0, 1.0) as f32,
-                    );
-                }
-                if let (Some(used), Some(total)) = (row.gtt_used, row.gtt_total)
-                    && total > 0
-                {
-                    BusyHistory::push_ring(
-                        &mut history.gtt,
-                        &mut history.gtt_next,
-                        &mut history.gtt_len,
-                        (used as f64 / total as f64).clamp(0.0, 1.0) as f32,
-                    );
-                }
+                history
+                    .busy
+                    .push_optional(row.gfx_busy_pct.map(|busy| f32::from(busy) / 100.0));
+                history
+                    .vcn
+                    .push_optional(row.vcn_busy_pct.map(|busy| f32::from(busy) / 100.0));
+                history.memory.push_optional(
+                    row.vram_used
+                        .zip(row.vram_total)
+                        .filter(|(_, total)| *total > 0)
+                        .map(|(used, total)| (used as f64 / total as f64).clamp(0.0, 1.0) as f32),
+                );
+                history.gtt.push_optional(
+                    row.gtt_used
+                        .zip(row.gtt_total)
+                        .filter(|(_, total)| *total > 0)
+                        .map(|(used, total)| (used as f64 / total as f64).clamp(0.0, 1.0) as f32),
+                );
                 let gfx_max = row
                     .sclk
                     .levels_mhz
@@ -291,16 +228,13 @@ impl GpuModel {
                     .take(usize::from(row.sclk.len).min(row.sclk.levels_mhz.len()))
                     .copied()
                     .max();
-                if let (Some(current), Some(max)) = (row.sclk.current_mhz, gfx_max)
-                    && max > 0
-                {
-                    BusyHistory::push_ring(
-                        &mut history.clocks,
-                        &mut history.clocks_next,
-                        &mut history.clocks_len,
-                        (current as f32 / max as f32).clamp(0.0, 1.0),
-                    );
-                }
+                history.clocks.push_optional(
+                    row.sclk
+                        .current_mhz
+                        .zip(gfx_max)
+                        .filter(|(_, max)| *max > 0)
+                        .map(|(current, max)| (current as f32 / max as f32).clamp(0.0, 1.0)),
+                );
                 let device_card = self
                     .devices
                     .devices
@@ -325,27 +259,24 @@ impl GpuModel {
                     activities[4..].copy_from_slice(&metrics.activity_ipu);
                 }
                 for (ring, value) in history.activity.iter_mut().zip(activities) {
-                    if let Some(value) = value.filter(|value| *value <= 100) {
-                        ring.push(f32::from(value) / 100.0);
-                    } else if ring.len > 0 {
-                        ring.push(f32::NAN);
-                    }
-                }
-                if let Some(metrics) = metrics
-                    && let (Some(watts_mw), Some(cap_w)) = (
-                        metrics.power_socket,
-                        metrics
-                            .power_current_stapm_limit
-                            .filter(|watts| *watts > 0 && *watts != u32::MAX),
-                    )
-                {
-                    BusyHistory::push_ring(
-                        &mut history.power,
-                        &mut history.power_next,
-                        &mut history.power_len,
-                        (watts_mw as f32 / (cap_w as f32 * 1000.0)).clamp(0.0, 1.0),
+                    ring.push_optional(
+                        value
+                            .filter(|value| *value <= 100)
+                            .map(|value| f32::from(value) / 100.0),
                     );
                 }
+                history.power.push_optional(metrics.and_then(|metrics| {
+                    metrics
+                        .power_socket
+                        .zip(
+                            metrics
+                                .power_current_stapm_limit
+                                .filter(|watts| *watts > 0 && *watts != u32::MAX),
+                        )
+                        .map(|(watts_mw, cap_w)| {
+                            (watts_mw as f32 / (cap_w as f32 * 1000.0)).clamp(0.0, 1.0)
+                        })
+                }));
             }
         }
     }
