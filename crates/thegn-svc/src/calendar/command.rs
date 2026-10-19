@@ -79,6 +79,8 @@ struct Admitted {
     refusal: Option<AdmissionError>,
     /// Set when an event decoded but failed domain validation.
     invalid_event: Option<(usize, EventDefect)>,
+    /// Set when event messages carry different non-empty sync tokens.
+    cursor_conflict: bool,
 }
 
 impl Admitted {
@@ -192,6 +194,7 @@ impl<'de> Visitor<'de> for EventsParams<'_> {
                     let token = map.next_value::<String>()?;
                     if !token.is_empty() && !sink.sync_token.is_empty() && sink.sync_token != token
                     {
+                        sink.cursor_conflict = true;
                         return Err(de::Error::custom("conflicting sync tokens"));
                     }
                     if !token.is_empty() {
@@ -307,6 +310,9 @@ impl AdmittingSink {
             .and_then(|()| de.end());
         match result {
             Ok(()) => Ok(()),
+            Err(_) if self.admitted.cursor_conflict => Err(CalendarError::Parse(
+                "plugin sent conflicting sync tokens".into(),
+            )),
             Err(e) => Err(match self.admitted.invalid_event.take() {
                 Some((index, defect)) => CalendarError::Parse(format!(
                     "plugin sent an invalid event (element {index}: {defect})"
@@ -454,7 +460,12 @@ fn check_manifest(granted: &[Capability], m: &PluginManifest) -> Result<(), Cale
         .negotiate(m)
         .map_err(|e| CalendarError::Api(format!("plugin {:?}: {e}", m.id.as_str())))?;
 
-    if let Some(denied) = neg.denied.iter().next() {
+    if let Some(denied) = neg
+        .denied
+        .iter()
+        .map(|capability| capability.as_str())
+        .min()
+    {
         return Err(CalendarError::Api(format!(
             "plugin {:?}: capability {} not granted to this account",
             m.id.as_str(),
@@ -547,6 +558,7 @@ impl CommandBackend {
                 mode: None,
                 refusal: None,
                 invalid_event: None,
+                cursor_conflict: false,
             },
             granted: self.granted.clone(),
             junk: Vec::new(),
