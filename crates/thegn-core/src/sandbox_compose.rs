@@ -2066,14 +2066,10 @@ mod tests {
             run_services: vec!["db".into()],
         };
         let output = r#"{"services":{"app":{"volumes":[{"source":"$${X}"}]}}}"#;
-        let pinned = pin_inspected_config(
-            state.state_home().as_path(),
-            "proj",
-            &target,
-            &compose,
-            output,
-        )
-        .expect("effective config is pinned");
+        let state_home = state.state_home();
+        std::fs::create_dir_all(&state_home).expect("isolated state home exists");
+        let pinned = pin_inspected_config(&state_home, "proj", &target, &compose, output)
+            .expect("effective config is pinned");
         let file = pinned.file.as_ref().expect("pinned file is returned");
         assert_eq!(std::fs::read_to_string(file).unwrap(), output);
         assert_eq!(
@@ -2093,13 +2089,7 @@ mod tests {
         }
 
         let empty = ComposeSpec::default();
-        let result = pin_inspected_config(
-            state.state_home().as_path(),
-            "empty",
-            &target,
-            &empty,
-            output,
-        );
+        let result = pin_inspected_config(&state_home, "empty", &target, &empty, output);
         match result {
             Err(error) => assert!(error.to_string().contains("no source file")),
             Ok(_) => panic!("missing Compose source file must refuse pinning"),
