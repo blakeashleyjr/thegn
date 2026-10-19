@@ -193,8 +193,24 @@ fn kind_str(k: thegn_metrics::DiskKind) -> &'static str {
 }
 
 impl MonitorOverlay {
+    pub(in crate::monitor) fn disk_worktrees_placed(&self) -> bool {
+        self.worktrees_placed_in(&self.placed_panels())
+    }
+
+    pub(in crate::monitor) fn worktrees_placed_in(
+        &self,
+        placed: &[super::super::layout::Placed],
+    ) -> bool {
+        self.tab == super::MonitorTab::Disk
+            && placed.iter().any(|panel| panel.id == view::WORKTREES)
+    }
+
     /// Open a clean confirmation for the selected worktree row.
     pub(in crate::monitor) fn begin_clean(&mut self) -> MonitorOutcome {
+        if !self.disk_worktrees_placed() {
+            self.status = Some("worktrees panel hidden: unzoom or enlarge to clean".into());
+            return MonitorOutcome::Pending;
+        }
         let Some(path) = self.disk_rows.get(self.sel).map(|r| r.path.clone()) else {
             return MonitorOutcome::Pending;
         };
