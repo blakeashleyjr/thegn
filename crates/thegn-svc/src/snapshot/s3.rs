@@ -7,6 +7,7 @@
 //! Object layout mirrors the fs backend under the configured key prefix:
 //! `<prefix>/<repo>/<worktree>/<env>/<id>/{manifest.json,bundle,patch,tar}`.
 
+use std::net::IpAddr;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
@@ -23,6 +24,42 @@ use super::SnapshotStore;
 const SIGN_TTL: Duration = Duration::from_secs(600);
 /// One artifact transfer's HTTP budget.
 const HTTP_TIMEOUT: Duration = Duration::from_secs(300);
+
+/// Parse and admit a custom endpoint. Plain HTTP is reserved for local S3
+/// emulators; all other endpoints must protect snapshot contents in transit.
+fn admit_endpoint(raw: &str) -> Result<(reqwest::Url, bool)> {
+    let endpoint = raw.parse::<reqwest::Url>().map_err(|_| {
+        anyhow::anyhow!(
+            "[lifecycle.snapshot] endpoint must use https (http is allowed only for a loopback host)"
+        )
+    })?;
+    let host = endpoint.host_str();
+    let loopback = host.is_some_and(|host| {
+        if host.eq_ignore_ascii_case("localhost") {
+            return true;
+        }
+        let address = host
+            .strip_prefix('[')
+            .and_then(|host| host.strip_suffix(']'))
+            .unwrap_or(host);
+        address
+            .parse::<IpAddr>()
+            .is_ok_and(|address| address.is_loopback())
+    });
+    let admitted_scheme = endpoint.scheme() == "https" || (endpoint.scheme() == "http" && loopback);
+    if !admitted_scheme
+        || host.is_none()
+        || !endpoint.username().is_empty()
+        || endpoint.password().is_some()
+        || endpoint.query().is_some()
+        || endpoint.fragment().is_some()
+    {
+        anyhow::bail!(
+            "[lifecycle.snapshot] endpoint must use https (http is allowed only for a loopback host)"
+        );
+    }
+    Ok((endpoint, loopback))
+}
 
 pub struct S3SnapshotStore {
     bucket: Bucket,
@@ -44,17 +81,18 @@ impl S3SnapshotStore {
         let region = cfg.region.trim();
         // AWS wants virtual-host style; S3-compatibles behind a custom
         // endpoint (R2/B2/MinIO) conventionally use path style.
-        let (endpoint, style) = if cfg.endpoint.trim().is_empty() {
+        let (endpoint, loopback, style) = if cfg.endpoint.trim().is_empty() {
             (
-                format!("https://s3.{region}.amazonaws.com"),
+                format!("https://s3.{region}.amazonaws.com")
+                    .parse::<reqwest::Url>()
+                    .context("[lifecycle.snapshot] AWS endpoint")?,
+                false,
                 UrlStyle::VirtualHost,
             )
         } else {
-            (cfg.endpoint.trim().to_string(), UrlStyle::Path)
+            let (endpoint, loopback) = admit_endpoint(cfg.endpoint.trim())?;
+            (endpoint, loopback, UrlStyle::Path)
         };
-        let endpoint: reqwest::Url = endpoint
-            .parse()
-            .with_context(|| format!("[lifecycle.snapshot] endpoint {endpoint:?}"))?;
         let bucket = Bucket::new(endpoint, style, name.to_string(), region.to_string())
             .map_err(|e| anyhow::anyhow!("[lifecycle.snapshot] bucket config: {e}"))?;
         let access_ref = SecretRef::parse(&cfg.access_key, BareAs::Literal);
@@ -77,6 +115,7 @@ impl S3SnapshotStore {
             .context("snapshot store runtime")?;
         let http = reqwest::Client::builder()
             .timeout(HTTP_TIMEOUT)
+            .https_only(!loopback)
             .build()
             .context("snapshot store http client")?;
         Ok(S3SnapshotStore {
@@ -304,6 +343,60 @@ mod tests {
             .sign(SIGN_TTL);
         assert_eq!(url.host_str(), Some("tg-snaps.s3.auto.amazonaws.com"));
         assert!(url.path().starts_with("/thegn/x"));
+    }
+
+    #[test]
+    fn remote_http_endpoints_are_refused_before_resolving_secrets() {
+        for endpoint in ["http://203.0.113.5:9000", "http://minio.lan"] {
+            let result = S3SnapshotStore::new(&cfg(endpoint), &|_, _| {
+                panic!("endpoint validation must precede secret resolution")
+            });
+            let error = result.err().expect("remote HTTP endpoint must be refused");
+            assert!(error.to_string().contains("must use https"));
+            assert!(
+                error
+                    .to_string()
+                    .starts_with("[lifecycle.snapshot] endpoint")
+            );
+        }
+    }
+
+    #[test]
+    fn loopback_http_endpoints_are_accepted() {
+        for endpoint in [
+            "http://127.0.0.1:9000",
+            "http://127.1.2.3:9000",
+            "http://localhost:9000",
+            "http://LOCALHOST:9000",
+            "http://[::1]:9000",
+        ] {
+            assert!(
+                S3SnapshotStore::new(&cfg(endpoint), &resolver).is_ok(),
+                "loopback endpoint should be accepted: {endpoint}"
+            );
+        }
+    }
+
+    #[test]
+    fn unsafe_or_non_http_custom_endpoints_are_refused_without_echoing_credentials() {
+        for endpoint in [
+            "https://user:pw@minio.local",
+            "https://minio.local/?x=1",
+            "https://minio.local/#f",
+            "ftp://minio.local",
+        ] {
+            let result = S3SnapshotStore::new(&cfg(endpoint), &resolver);
+            let error = result.err().expect("unsafe endpoint must be refused");
+            assert!(error.to_string().contains("must use https"));
+            assert!(
+                error
+                    .to_string()
+                    .starts_with("[lifecycle.snapshot] endpoint")
+            );
+            if endpoint.contains("user:pw") {
+                assert!(!error.to_string().contains("pw"));
+            }
+        }
     }
 
     #[test]
