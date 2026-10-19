@@ -657,7 +657,10 @@ mod tests {
         assert!(feed_mode(&mut parser, b"\x1b[>1u\x1b[=2;2u").is_empty());
         assert!(parser.extended_keys(), "mode 2 ORs flags into the top");
         assert!(feed_mode(&mut parser, b"\x1b[=2;3u").is_empty());
-        assert!(parser.extended_keys(), "clearing flag 2 keeps disambiguation (flag 1)");
+        assert!(
+            parser.extended_keys(),
+            "clearing flag 2 keeps disambiguation (flag 1)"
+        );
         assert!(feed_mode(&mut parser, b"\x1b[=3;3u").is_empty());
         assert!(!parser.extended_keys(), "mode 3 clears flags from the top");
     }
