@@ -10,7 +10,7 @@ use thegn_core::config::{Config, EnvProviderConfig, MergeRemoteMode, ServeExposu
 use thegn_core::control::{RouteToHostTokenBinding, Scope, ScopeSet, TokenKind};
 use thegn_core::db::Db;
 use thegn_core::remote::SshTarget;
-use thegn_core::store::ControlStore;
+use thegn_core::store::{ControlStore, DaemonRow};
 use thegn_svc::provider::Provider;
 
 const LEGACY_CREDENTIAL_PATH: &str = ".config/thegn/route-to-host.env";
@@ -179,6 +179,70 @@ fn revoke_owner(
     revoke_owner_label(store, &owner, Some(&legacy), None, at_ms)
 }
 
+fn normalize_origin(raw: &str, scheme: &str) -> Result<String> {
+    let url =
+        url::Url::parse(raw).context("serving daemon advertised an invalid control origin URL")?;
+    // Keep the raw prefix check case-sensitive; URL parsing alone normalizes scheme case.
+    anyhow::ensure!(
+        url.scheme() == scheme && raw.starts_with(&format!("{scheme}://")),
+        "serving daemon control origin scheme does not exactly match the configured topology"
+    );
+    anyhow::ensure!(
+        url.username().is_empty() && url.password().is_none(),
+        "serving daemon control origin must not contain userinfo"
+    );
+    anyhow::ensure!(
+        url.query().is_none(),
+        "serving daemon control origin must not contain a query"
+    );
+    anyhow::ensure!(
+        url.fragment().is_none(),
+        "serving daemon control origin must not contain a fragment"
+    );
+    anyhow::ensure!(
+        url.path().is_empty() || url.path() == "/",
+        "serving daemon control origin must not contain a path"
+    );
+    anyhow::ensure!(
+        url.host().is_some(),
+        "serving daemon control origin must contain a host"
+    );
+    Ok(url.origin().ascii_serialization())
+}
+
+fn select_control_origin(
+    rows: &[DaemonRow],
+    scopes: &[String],
+    scheme: &str,
+    at_ms: i64,
+    pid_alive: impl Fn(i64) -> bool,
+) -> Result<String> {
+    let local_hostname = thegn_core::util::hostname();
+    let mut origins = Vec::new();
+    for row in rows {
+        if scopes.contains(&row.scope)
+            && row.hostname == local_hostname
+            && at_ms.saturating_sub(row.heartbeat_at)
+                <= thegn_svc::control::client::DAEMON_HEARTBEAT_TTL_MS
+            && pid_alive(row.pid)
+            && let Some(raw) = row.control_origin.as_deref()
+        {
+            origins.push(normalize_origin(raw, scheme)?);
+        }
+    }
+    let Some(origin) = origins.first() else {
+        anyhow::bail!(
+            "route-to-host provisioning needs a live `thegn serve` endpoint; start the secure serving topology and retry"
+        );
+    };
+    anyhow::ensure!(
+        origins.iter().all(|candidate| candidate == origin),
+        "ambiguous: {} live serving daemons in this state scope advertise different origins",
+        origins.len()
+    );
+    Ok(origin.clone())
+}
+
 fn secure_control_origin(cfg: &Config, store: &dyn ControlStore, at_ms: i64) -> Result<String> {
     let transport = cfg
         .serve
@@ -192,27 +256,14 @@ fn secure_control_origin(cfg: &Config, store: &dyn ControlStore, at_ms: i64) -> 
         ),
         "route-to-host provisioning requires [serve] topology = \"tls-terminated\" or \"tunnel\"; plaintext direct endpoints are not eligible"
     );
-    let row = store
-        .daemons()?
-        .into_iter()
-        .filter(|row| row.control_origin.is_some())
-        .filter(|row| {
-            at_ms.saturating_sub(row.heartbeat_at)
-                <= thegn_svc::control::client::DAEMON_HEARTBEAT_TTL_MS
-        })
-        .max_by_key(|row| row.heartbeat_at)
-        .context(
-            "route-to-host provisioning needs a live `thegn serve` endpoint; start the secure serving topology and retry",
-        )?;
-    let origin = row
-        .control_origin
-        .as_deref()
-        .context("live serving daemon has no advertised control origin")?;
-    anyhow::ensure!(
-        origin.starts_with(&format!("{}://", transport.http_scheme())),
-        "live serving daemon's advertised origin does not match the configured confidentiality topology; restart `thegn serve` and reprovision"
-    );
-    Ok(origin.to_string())
+    let rows = store.daemons()?;
+    select_control_origin(
+        &rows,
+        &crate::daemon::scope_aliases(),
+        transport.http_scheme(),
+        at_ms,
+        crate::platform::pid_alive,
+    )
 }
 
 struct RouteCredential {
@@ -666,12 +717,12 @@ mod tests {
         let db = Db::open_at(path).unwrap();
         db.put_daemon(&DaemonRow {
             daemon_id: "serve".into(),
-            pid: 1,
-            scope: "/state".into(),
+            pid: i64::from(std::process::id()),
+            scope: crate::daemon::scope_key(),
             endpoint: "/run/thegn.sock".into(),
             tcp_addr: Some("127.0.0.1:8484".into()),
             control_origin: Some("http://host.example:8443".into()),
-            hostname: "host".into(),
+            hostname: thegn_core::util::hostname(),
             version: "test".into(),
             started_at: at_ms,
             heartbeat_at: at_ms,
@@ -680,12 +731,136 @@ mod tests {
         db
     }
 
+    fn daemon_row(scope: &str, pid: i64, origin: &str, heartbeat_at: i64) -> DaemonRow {
+        DaemonRow {
+            daemon_id: format!("daemon-{pid}"),
+            pid,
+            scope: scope.into(),
+            endpoint: "/run/thegn.sock".into(),
+            tcp_addr: Some("127.0.0.1:8484".into()),
+            control_origin: Some(origin.into()),
+            hostname: thegn_core::util::hostname(),
+            version: "test".into(),
+            started_at: heartbeat_at,
+            heartbeat_at,
+        }
+    }
+
+    fn scopes() -> Vec<String> {
+        vec!["/state".into()]
+    }
+
     fn provider(kind: &str, account_ref: &str) -> EnvProviderConfig {
         EnvProviderConfig {
             provider: kind.into(),
             api_key_env: account_ref.into(),
             ..EnvProviderConfig::default()
         }
+    }
+
+    #[test]
+    fn origin_with_userinfo_is_refused() {
+        let rows = [daemon_row(
+            "/state",
+            41,
+            "https://evil.example@host.example:8443",
+            10_000,
+        )];
+        assert!(select_control_origin(&rows, &scopes(), "https", 10_000, |_| true).is_err());
+    }
+
+    #[test]
+    fn origin_with_path_query_or_fragment_is_refused() {
+        for raw in [
+            "https://host.example/path",
+            "https://host.example?token=secret",
+            "https://host.example#fragment",
+        ] {
+            let rows = [daemon_row("/state", 41, raw, 10_000)];
+            assert!(
+                select_control_origin(&rows, &scopes(), "https", 10_000, |_| true).is_err(),
+                "accepted {raw}"
+            );
+        }
+    }
+
+    #[test]
+    fn origin_scheme_must_match_exactly() {
+        for raw in ["http://host.example", "https:/x"] {
+            let rows = [daemon_row("/state", 41, raw, 10_000)];
+            assert!(
+                select_control_origin(&rows, &scopes(), "https", 10_000, |_| true).is_err(),
+                "accepted {raw}"
+            );
+        }
+    }
+
+    #[test]
+    fn rows_from_another_scope_or_a_dead_pid_are_ignored() {
+        let live = 41;
+        let rows = [
+            daemon_row("/other", live, "https://other.example", 10_000),
+            daemon_row("/state", live + 1, "https://dead.example", 9_999),
+            daemon_row("/state", live, "https://live.example", 9_000),
+        ];
+        let selected =
+            select_control_origin(&rows, &scopes(), "https", 10_000, |pid| pid == live).unwrap();
+        assert_eq!(selected, "https://live.example");
+
+        assert!(
+            select_control_origin(&rows[..2], &scopes(), "https", 10_000, |pid| {
+                pid == live
+            })
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn two_live_daemons_with_different_origins_refuse() {
+        let rows = [
+            daemon_row("/state", 41, "https://one.example", 9_000),
+            daemon_row("/state", 42, "https://two.example", 10_000),
+        ];
+        let result = select_control_origin(&rows, &scopes(), "https", 10_000, |_| true);
+        match result {
+            Err(error) => assert!(error.to_string().contains("ambiguous")),
+            Ok(origin) => panic!("accepted ambiguous origin {origin}"),
+        }
+    }
+
+    #[test]
+    fn equal_origins_are_accepted_in_any_order() {
+        let rows = [
+            daemon_row("/state", 41, "https://HOST.example:443/", 9_000),
+            daemon_row("/state", 42, "https://host.example", 10_000),
+        ];
+        let forward = select_control_origin(&rows, &scopes(), "https", 10_000, |_| true).unwrap();
+        let reverse = select_control_origin(
+            &rows.iter().rev().cloned().collect::<Vec<_>>(),
+            &scopes(),
+            "https",
+            10_000,
+            |_| true,
+        )
+        .unwrap();
+        assert_eq!(forward, "https://host.example");
+        assert_eq!(reverse, forward);
+    }
+
+    #[test]
+    fn default_port_is_normalized() {
+        assert_eq!(
+            normalize_origin("https://host.example:443", "https").unwrap(),
+            "https://host.example"
+        );
+    }
+
+    #[test]
+    fn row_from_another_hostname_is_ignored_even_when_its_pid_is_alive() {
+        let mut row = daemon_row("/state", 41, "https://remote.example", 10_000);
+        row.hostname = format!("{}-remote", thegn_core::util::hostname());
+        let rows = [row];
+        assert!(select_control_origin(&rows, &scopes(), "https", 10_000, |_| true).is_err());
     }
 
     fn ssh_target(host: &str) -> SshTarget {
