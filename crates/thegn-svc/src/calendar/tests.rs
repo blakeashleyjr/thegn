@@ -2190,14 +2190,13 @@ fn several_event_messages_accumulate() {
 }
 
 #[test]
-fn a_manifest_is_negotiated_and_a_denied_capability_is_not_fatal() {
-    // A plugin asking for more than it was granted should still deliver.
-    let page = run_plugin(
+fn a_manifest_asking_for_an_ungranted_capability_fails_the_run() {
+    let err = run_plugin(
         r#"echo '{"method":"manifest","params":{"id":"p","name":"p","version":"1","api":"0.1.0","capabilities":["run:khal","network:evil.example.com"],"contributions":[]}}'
            echo '{"method":"events","params":{"events":[]}}'"#,
     )
-    .unwrap();
-    assert!(page.events().is_empty());
+    .unwrap_err();
+    assert!(matches!(err, CalendarError::Api(_)), "got {err:?}");
 }
 
 #[test]

@@ -29,9 +29,15 @@
 //!
 //! | verb | params |
 //! |---|---|
-//! | `manifest` | a [`PluginManifest`]; optional, but the only way to request capabilities |
+//! | `manifest` | a [`PluginManifest`]; optional, at most once, before `events`; only way to request capabilities |
 //! | `events` | `{events: [...], deleted: [...], sync_token: "...", mode: "..."}`; repeatable |
 //! | `log` | `{level, message}` → tracing, never the UI |
+//!
+//! Protocol rules: a manifest is optional, but when present it must appear at
+//! most once and before any `events` message. Unknown verbs, denied
+//! capabilities, unsupported contributions and conflicting non-empty cursors
+//! fail the whole run, leaving the cache and cursor untouched. `log` messages
+//! are allowed anywhere. Non-JSON lines are reported as junk.
 //!
 //! ```sh
 //! #!/bin/sh
@@ -96,6 +102,8 @@ struct AdmittingSink {
     granted: Vec<Capability>,
     junk: Vec<String>,
     error: Option<CalendarError>,
+    saw_events: bool,
+    saw_manifest: bool,
 }
 
 /// Just the verb, so a line can be routed without building its params.
@@ -180,7 +188,16 @@ impl<'de> Visitor<'de> for EventsParams<'_> {
             match key.as_ref() {
                 "events" => map.next_value_seed(EventList(&mut *sink))?,
                 "deleted" => map.next_value_seed(DeletedList(&mut *sink))?,
-                "sync_token" => sink.sync_token = map.next_value::<String>()?,
+                "sync_token" => {
+                    let token = map.next_value::<String>()?;
+                    if !token.is_empty() && !sink.sync_token.is_empty() && sink.sync_token != token
+                    {
+                        return Err(de::Error::custom("conflicting sync tokens"));
+                    }
+                    if !token.is_empty() {
+                        sink.sync_token = token;
+                    }
+                }
                 "mode" => {
                     let raw = map.next_value::<std::borrow::Cow<'de, str>>()?;
                     let Some(mode) = PageMode::parse(&raw) else {
@@ -308,11 +325,27 @@ impl AdmittingSink {
 
     fn message(&mut self, method: &str, text: &str) -> Result<(), CalendarError> {
         match method {
-            "manifest" => match serde_json::from_str::<ManifestLine>(text) {
-                Ok(m) => check_manifest(&self.granted, &m.params),
-                Err(e) => Err(CalendarError::Parse(format!("bad manifest: {e}"))),
-            },
-            "events" => self.events_line(text),
+            "manifest" => {
+                if self.saw_manifest {
+                    return Err(CalendarError::Parse("plugin sent a second manifest".into()));
+                }
+                if self.saw_events {
+                    return Err(CalendarError::Parse(
+                        "plugin sent its manifest after events".into(),
+                    ));
+                }
+                let result = match serde_json::from_str::<ManifestLine>(text) {
+                    Ok(m) => check_manifest(&self.granted, &m.params),
+                    Err(e) => Err(CalendarError::Parse(format!("bad manifest: {e}"))),
+                };
+                result?;
+                self.saw_manifest = true;
+                Ok(())
+            }
+            "events" => {
+                self.saw_events = true;
+                self.events_line(text)
+            }
             "log" => {
                 // A plugin's own diagnostics belong in the log, never in the
                 // UI — it has no way to know what is on screen.
@@ -328,14 +361,10 @@ impl AdmittingSink {
                 );
                 Ok(())
             }
-            other => {
-                tracing::debug!(
-                    target: "thegn::calendar::plugin",
-                    verb = other,
-                    "ignoring unknown verb"
-                );
-                Ok(())
-            }
+            other => Err(CalendarError::Parse(format!(
+                "plugin sent an unknown message {:?}",
+                other.chars().take(32).collect::<String>()
+            ))),
         }
     }
 }
@@ -413,8 +442,8 @@ impl CommandBackend {
 
 /// Negotiate the manifest against what this account grants.
 ///
-/// Uses [`HostContract::negotiate`] verbatim — it is already written and
-/// tested; this is the first thing to actually call it.
+/// Uses [`HostContract::negotiate`] and refuses denied capabilities or
+/// contributions outside the calendar data-source contract.
 fn check_manifest(granted: &[Capability], m: &PluginManifest) -> Result<(), CalendarError> {
     // A calendar plugin may only contribute a data source; asking for a
     // sidebar tab or a theme here is simply not accepted.
@@ -425,24 +454,19 @@ fn check_manifest(granted: &[Capability], m: &PluginManifest) -> Result<(), Cale
         .negotiate(m)
         .map_err(|e| CalendarError::Api(format!("plugin {:?}: {e}", m.id.as_str())))?;
 
-    for denied in &neg.denied {
-        // Denials are logged, not fatal: a plugin that asks for more than it
-        // was granted should still deliver whatever it can without it. The
-        // log line is the audit trail.
-        tracing::warn!(
-            target: "thegn::calendar::plugin",
-            plugin = m.id.as_str(),
-            capability = %denied,
-            "capability denied — add it to this account's `capabilities` if intended"
-        );
+    if let Some(denied) = neg.denied.iter().next() {
+        return Err(CalendarError::Api(format!(
+            "plugin {:?}: capability {} not granted to this account",
+            m.id.as_str(),
+            denied
+        )));
     }
-    for c in &neg.unsupported_contributions {
-        tracing::warn!(
-            target: "thegn::calendar::plugin",
-            plugin = m.id.as_str(),
-            extension_point = ?c.extension_point,
-            "contribution ignored — a calendar account only accepts DataSource"
-        );
+    if let Some(contribution) = neg.unsupported_contributions.first() {
+        return Err(CalendarError::Api(format!(
+            "plugin {:?}: unsupported contribution extension point {}",
+            m.id.as_str(),
+            contribution.extension_point.wire_name()
+        )));
     }
     Ok(())
 }
@@ -527,6 +551,8 @@ impl CommandBackend {
             granted: self.granted.clone(),
             junk: Vec::new(),
             error: None,
+            saw_events: false,
+            saw_manifest: false,
         };
         // The runner blocks (it polls for exit to enforce the timeout), so it
         // must not sit on an async worker.
