@@ -933,6 +933,109 @@ fn tailscale_serve_default_443() {
     assert_eq!(s.port, 443);
 }
 
+#[test]
+fn serve_down_ok_when_status_lacks_the_port() {
+    let plan = serve_plan(thegn_core::config::TailscaleShareConfig::default(), 3000);
+    let runtimes = [OciRuntime::podman()];
+    let mut calls = Vec::new();
+    let result = serve_down_with(&runtimes, &plan, |runtime, argv| {
+        calls.push((runtime.clone(), argv.to_vec()));
+        if argv == &plan.down_argv {
+            Ok((true, String::new()))
+        } else {
+            Ok((true, r#"{"TCP":{},"Web":{},"AllowFunnel":{}}"#.into()))
+        }
+    });
+    assert!(result.is_ok());
+    assert_eq!(calls.len(), 2);
+    assert_eq!(calls[1].1, vec!["tailscale", "serve", "status", "--json"]);
+}
+
+#[test]
+fn serve_down_errs_when_port_still_served() {
+    let plan = serve_plan(thegn_core::config::TailscaleShareConfig::default(), 3000);
+    let runtimes = [OciRuntime::podman()];
+    let result = serve_down_with(&runtimes, &plan, |_, argv| {
+        if argv == &plan.down_argv {
+            Ok((true, String::new()))
+        } else {
+            Ok((true, r#"{"TCP":{"443":{"HTTPS":true}}}"#.into()))
+        }
+    });
+    let error = result.expect_err("a still-served port is unverified");
+    assert!(error.to_string().contains("teardown unverified"));
+}
+
+#[test]
+fn serve_down_errs_when_down_fails_on_every_runtime() {
+    let plan = serve_plan(thegn_core::config::TailscaleShareConfig::default(), 3000);
+    let runtimes = [OciRuntime::podman(), OciRuntime::docker()];
+    let mut attempts = 0;
+    let result = serve_down_with(&runtimes, &plan, |_, _| {
+        attempts += 1;
+        if attempts == 1 {
+            Err(anyhow::anyhow!("runtime unavailable"))
+        } else {
+            Ok((false, String::new()))
+        }
+    });
+    let error = result.expect_err("all down attempts failed");
+    assert_eq!(attempts, 2);
+    assert!(error.to_string().contains("teardown unverified"));
+}
+
+#[test]
+fn serve_down_errs_on_unparseable_status() {
+    let plan = serve_plan(thegn_core::config::TailscaleShareConfig::default(), 3000);
+    let runtimes = [OciRuntime::podman()];
+    let result = serve_down_with(&runtimes, &plan, |_, argv| {
+        if argv == &plan.down_argv {
+            Ok((true, String::new()))
+        } else {
+            Ok((true, "{not json".into()))
+        }
+    });
+    let error = result.expect_err("malformed status cannot verify teardown");
+    assert!(error.to_string().contains("teardown unverified"));
+}
+
+#[test]
+fn serve_down_errs_when_status_cannot_be_read() {
+    let plan = serve_plan(thegn_core::config::TailscaleShareConfig::default(), 3000);
+    let runtimes = [OciRuntime::podman()];
+    let result = serve_down_with(&runtimes, &plan, |_, argv| {
+        if argv == &plan.down_argv {
+            Ok((true, String::new()))
+        } else {
+            Err(anyhow::anyhow!("runtime unavailable"))
+        }
+    });
+    let error = result.expect_err("unreadable status cannot verify teardown");
+    assert!(error.to_string().contains("teardown unverified"));
+}
+
+#[test]
+fn serve_status_parser_cases() {
+    for (json, expected) in [
+        ("", false),
+        ("{}", false),
+        (r#"{"TCP":{"443":{"HTTPS":true}}}"#, true),
+        (r#"{"Web":{"host.ts.net:443":{}}}"#, true),
+        (r#"{"AllowFunnel":{"host.ts.net:443":true}}"#, true),
+        (
+            r#"{"TCP":{"8443":{"HTTPS":true}},"Web":{"host.ts.net:8443":{}}}"#,
+            false,
+        ),
+    ] {
+        assert_eq!(
+            serve_status_has_port(json, 443).unwrap(),
+            expected,
+            "{json}"
+        );
+    }
+    assert!(serve_status_has_port("{broken", 443).is_err());
+}
+
 // ── iroh / dumbpipe ──────────────────────────────────────────────────────────
 
 #[test]
