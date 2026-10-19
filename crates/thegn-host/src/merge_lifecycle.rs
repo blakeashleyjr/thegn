@@ -1018,7 +1018,7 @@ mod tests {
             None,
         )
         .unwrap();
-        let paths = vec![
+        let paths = [
             home.to_string_lossy().into_owned(),
             gone_worktree.to_string_lossy().into_owned(),
         ];
@@ -1060,7 +1060,7 @@ mod tests {
             None,
         )
         .unwrap();
-        let paths = vec![
+        let paths = [
             "opaque:workspace/branch".into(),
             gone_worktree.to_string_lossy().into_owned(),
         ];
