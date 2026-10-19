@@ -5,12 +5,67 @@
 //! secret broker.
 
 use std::collections::BTreeMap;
+use std::process::Command;
 
 use thegn_core::secretref::{BareAs, SecretRef};
 
 use super::{LoadedPlugin, SpecProblem};
 
-/// Resolve a config-declared plugin's environment using the installed broker.
+/// Ambient names passed to plugins that are not trusted native code.
+///
+/// This excludes credentials, agent sockets, XDG runtime paths, thegn control
+/// endpoints, and proxy settings. A trusted-native config entry receives the
+/// full ambient environment through [`resolve_env`].
+pub(crate) const AMBIENT_ALLOWLIST: &[&str] = &[
+    "PATH",
+    "HOME",
+    "USER",
+    "LOGNAME",
+    "LANG",
+    "LANGUAGE",
+    "LC_ALL",
+    "LC_CTYPE",
+    "LC_MESSAGES",
+    "LC_NUMERIC",
+    "LC_TIME",
+    "LC_COLLATE",
+    "LC_MONETARY",
+    "TZ",
+    "TERM",
+    "TMPDIR",
+    "SYSTEMROOT",
+    "WINDIR",
+    "COMSPEC",
+    "PATHEXT",
+    "TEMP",
+    "TMP",
+    "USERPROFILE",
+    "APPDATA",
+    "LOCALAPPDATA",
+    "PROGRAMDATA",
+    "SYSTEMDRIVE",
+];
+
+pub(crate) fn ambient_allowlisted() -> Vec<(String, String)> {
+    AMBIENT_ALLOWLIST
+        .iter()
+        .filter_map(|name| {
+            std::env::var_os(name).and_then(|value| {
+                value
+                    .into_string()
+                    .ok()
+                    .map(|value| ((*name).to_string(), value))
+            })
+        })
+        .collect()
+}
+
+pub(crate) fn apply_plugin_env(cmd: &mut Command, env: &BTreeMap<String, String>) {
+    cmd.env_clear().envs(ambient_allowlisted()).envs(env);
+}
+
+/// Resolve the complete plugin environment beyond the fixed ambient allowlist.
+/// Trusted-native plugins receive the full ambient environment in this map.
 pub fn resolve_env(plugin: &LoadedPlugin) -> Result<BTreeMap<String, String>, SpecProblem> {
     resolve_env_with(plugin, crate::secret::resolve_ref)
 }
@@ -21,7 +76,18 @@ fn resolve_env_with(
 ) -> Result<BTreeMap<String, String>, SpecProblem> {
     let id = plugin.spec.manifest.id.as_str();
     let consumer = format!("plugin:{id}");
-    let mut env = BTreeMap::new();
+    let mut env = if plugin.spec.trusted_native {
+        std::env::vars_os()
+            .filter_map(
+                |(key, value)| match (key.into_string(), value.into_string()) {
+                    (Ok(key), Ok(value)) => Some((key, value)),
+                    _ => None,
+                },
+            )
+            .collect()
+    } else {
+        BTreeMap::new()
+    };
     for (key, raw) in &plugin.spec.env {
         let reference = SecretRef::parse(raw, BareAs::Literal);
         if reference.is_literal() {
@@ -176,5 +242,32 @@ mod tests {
 
         let keyring = make_plugin(&[("TOKEN", "keyring:thegn-b42-no-resolver")], None);
         assert!(resolve_env(&keyring).is_err());
+    }
+
+    #[test]
+    fn trusted_native_plugin_inherits_the_ambient_environment() {
+        let _env = thegn_core::testenv::EnvGuard::set(&[
+            ("THEGN_B53_PLUGIN_SECRET", "ambient"),
+            ("THEGN_B53_PLUGIN_OVERRIDE", "ambient"),
+        ]);
+        let mut plugin = make_plugin(&[("THEGN_B53_PLUGIN_OVERRIDE", "configured")], None);
+        plugin.spec.trusted_native = true;
+
+        let resolved = resolve_env(&plugin).unwrap();
+        assert_eq!(resolved["THEGN_B53_PLUGIN_SECRET"], "ambient");
+        assert_eq!(resolved["THEGN_B53_PLUGIN_OVERRIDE"], "configured");
+    }
+
+    #[test]
+    fn untrusted_plugin_map_carries_only_configured_entries() {
+        let _env = thegn_core::testenv::EnvGuard::set(&[("THEGN_B53_PLUGIN_SECRET", "ambient")]);
+        let plugin = make_plugin(&[("PLUGIN_SETTING", "configured")], None);
+
+        let resolved = resolve_env(&plugin).unwrap();
+        assert_eq!(
+            resolved,
+            BTreeMap::from([("PLUGIN_SETTING".into(), "configured".into())])
+        );
+        assert!(!resolved.contains_key("THEGN_B53_PLUGIN_SECRET"));
     }
 }
