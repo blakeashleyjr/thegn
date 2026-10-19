@@ -421,7 +421,7 @@ pub fn list_at(dir: &Path) -> Result<Vec<AuthorizedKeyRecord>> {
             continue;
         }
         let body = std::fs::read(&path).with_context(|| format!("read {}", path.display()))?;
-        let record = serde_json::from_slice(&body)
+        let record: AuthorizedKeyRecord = serde_json::from_slice(&body)
             .with_context(|| format!("decode managed SSH custody record {}", path.display()))?;
         let canonical = record_path(dir, &record.provider, &record.account, &record.instance);
         let legacy = legacy_record_path(dir, &record.provider, &record.account, &record.instance);
