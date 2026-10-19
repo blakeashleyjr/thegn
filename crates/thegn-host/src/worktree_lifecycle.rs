@@ -1057,7 +1057,12 @@ fn teardown_runtime(
     crate::agent::deproject(&path);
     crate::agent::checkpoint_on_close(&path);
     crate::bridge_sup::disconnect_path(&path);
-    thegn_core::sandbox::teardown_by_path(&path);
+    if matches!(&env.placement, thegn_core::placement::Placement::Ssh(_)) {
+        let name = thegn_core::sandbox::container_name_for_config_profile(&path, &cfg.profile);
+        thegn_core::sandbox::teardown_placed(&env.sandbox, &env.placement, &loc, &name);
+    } else {
+        thegn_core::sandbox::teardown_by_path(&path);
+    }
     crate::placement_flow::release(&path);
 
     if failures.is_empty() {

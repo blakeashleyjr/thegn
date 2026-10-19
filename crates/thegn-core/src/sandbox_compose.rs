@@ -202,13 +202,32 @@ fn probe_project(state_home: &Path, spec: &SandboxSpec, target: &ComposeTarget) 
 
 pub(crate) fn teardown_projects_in(state_home: &Path, worktree: &Path) -> Vec<String> {
     let name = crate::sandbox::container_name(&worktree.to_string_lossy());
-    let hashed = hashed_project_name(&name, worktree);
-    let record = adoption_record_path(state_home, &name, worktree);
-    if adoption_record_matches(&record, &name) {
-        vec![hashed, name]
-    } else {
-        vec![hashed]
+    teardown_projects_for(state_home, &name, &[worktree])
+}
+
+/// Return hashed projects for each worktree, plus an adopted legacy project once.
+pub(crate) fn teardown_projects_for(
+    state_home: &Path,
+    name: &str,
+    worktrees: &[&Path],
+) -> Vec<String> {
+    let mut projects = Vec::new();
+    let mut seen_worktrees = Vec::new();
+    let mut adopted_legacy = false;
+    for worktree in worktrees {
+        if seen_worktrees.contains(worktree) {
+            continue;
+        }
+        seen_worktrees.push(*worktree);
+        let hashed = hashed_project_name(name, worktree);
+        let record = adoption_record_path(state_home, name, worktree);
+        adopted_legacy |= adoption_record_matches(&record, name);
+        projects.push(hashed);
     }
+    if adopted_legacy {
+        projects.push(name.to_string());
+    }
+    projects
 }
 
 /// A bounded Compose startup or verification failure.
@@ -2131,5 +2150,32 @@ mod tests {
             Path::new("/w/my.repo")
         ));
         assert!(!legacy_owned_by("relative/path\n", Path::new("/w/my.repo")));
+    }
+
+    #[test]
+    fn teardown_projects_for_hashes_every_worktree_path_and_adds_legacy_only_when_adopted() {
+        let state_home = tempfile::tempdir().unwrap();
+        let name = "thegn-feature";
+        let first = Path::new("/host/wt");
+        let second = Path::new("/workspace");
+        let first_hashed = hashed_project_name(name, first);
+        let second_hashed = hashed_project_name(name, second);
+
+        assert_eq!(
+            teardown_projects_for(state_home.path(), name, &[first, second, first]),
+            vec![first_hashed.clone(), second_hashed.clone()]
+        );
+        let directory = crate::fsperm::ensure_private_dir_beneath(
+            state_home.path(),
+            Path::new("thegn/compose-projects"),
+        )
+        .unwrap();
+        directory
+            .write_owner_only_atomic(&format!("{second_hashed}.adopted"), name.as_bytes())
+            .unwrap();
+        assert_eq!(
+            teardown_projects_for(state_home.path(), name, &[first, second]),
+            vec![first_hashed, second_hashed, name.to_string()]
+        );
     }
 }
