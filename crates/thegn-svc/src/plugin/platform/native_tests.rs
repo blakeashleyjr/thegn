@@ -319,12 +319,16 @@ fn resident_native_callback_panic_retains_cleanup() {
 
 #[test]
 fn resident_native_final_reply_and_eof_pending_rpc() {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
     for mode in ["final-reply", "eof-on-request"] {
         let fixture = Fixture::new();
         let session = fixture.spawn(mode, mode);
         let bridge = ProviderBridge::new(session.writer(), Duration::from_secs(15));
         let start = Instant::now();
-        let result = bridge.call("fixture", "last", serde_json::Value::Null);
+        let result = runtime.block_on(bridge.call("fixture", "last", serde_json::Value::Null));
         if mode == "final-reply" {
             assert_eq!(result.unwrap(), serde_json::json!({"final": true}));
         } else {
@@ -337,8 +341,8 @@ fn resident_native_final_reply_and_eof_pending_rpc() {
         assert_owned_settlement(&fixture.outcome(&session));
         let start = Instant::now();
         assert!(
-            bridge
-                .call("fixture", "late", serde_json::Value::Null)
+            runtime
+                .block_on(bridge.call("fixture", "late", serde_json::Value::Null))
                 .is_err()
         );
         assert!(start.elapsed() < Duration::from_millis(100));
