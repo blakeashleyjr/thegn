@@ -71,7 +71,7 @@ const SPECS: [PanelSpec; 5] = [
     },
 ];
 
-#[derive(Default, Debug, Clone)]
+#[derive(Debug, Clone)]
 struct Ring {
     values: [f32; HISTORY_CAP],
     next: usize,
@@ -118,7 +118,7 @@ impl Ring {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Default, Debug, Clone)]
 struct Slot {
     id: Option<Arc<str>>,
     matched: bool,
