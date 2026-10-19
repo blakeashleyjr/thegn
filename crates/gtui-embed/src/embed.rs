@@ -440,6 +440,16 @@ fn validate_dashboard(
                     panel.id
                 )));
             }
+            if let Some(alias) = &target.alias
+                && (alias.len() > MAX_LABEL_BYTES || alias.chars().any(char::is_control))
+            {
+                let message = if alias.len() > MAX_LABEL_BYTES {
+                    format!("panel {} alias exceeds {MAX_LABEL_BYTES} bytes", panel.id)
+                } else {
+                    format!("panel {} alias contains a control character", panel.id)
+                };
+                return Err(DashboardLoadError::Invalid(message));
+            }
             if !ref_ids.insert(&target.ref_id) {
                 return Err(DashboardLoadError::Invalid(format!(
                     "panel {} has duplicate ref_id",
@@ -460,9 +470,11 @@ fn expand_tilde(path: &str) -> String {
     path.to_string()
 }
 
-#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
+#[derive(Clone, Debug, Hash, PartialEq, Eq)]
 struct SeriesId {
     panel_id: u32,
+    target_ref_id: String,
+    visible_targets: Vec<String>,
     target_index: usize,
     frame_index: usize,
 }
@@ -506,7 +518,7 @@ impl SeriesCache {
     }
 
     fn reduced(&mut self, id: SeriesId, key: ReductionKey, frame: &Frame) -> &ReducedSeries {
-        self.touched.insert(id);
+        self.touched.insert(id.clone());
         if self
             .entries
             .get(&id)
@@ -520,7 +532,7 @@ impl SeriesCache {
                     .map(|bits| [f64::from_bits(bits[0]), f64::from_bits(bits[1])]),
                 key.width,
             );
-            self.entries.insert(id, (key, reduced));
+            self.entries.insert(id.clone(), (key, reduced));
             self.reductions = self.reductions.wrapping_add(1);
         }
         &self.entries.get(&id).expect("inserted reduction").1
@@ -531,7 +543,7 @@ struct PanelRenderContext<'a> {
     panel_id: u32,
     generation: u64,
     window: Option<[f64; 2]>,
-    series_index: Option<(usize, usize)>,
+    series_index: Option<(String, Vec<String>, usize, usize)>,
     cache: &'a mut SeriesCache,
 }
 
@@ -624,16 +636,20 @@ fn render_targets(
     context: PanelRenderContext<'_>,
 ) {
     let mut entries = Vec::new();
+    let visible_targets = targets
+        .iter()
+        .map(|target| target.ref_id.clone())
+        .collect::<Vec<_>>();
     for (target_index, target) in targets.iter().enumerate() {
         match &target.result {
             Err(message) => entries.push((
-                format!("{title} · {}", target.ref_id),
+                format!("{title} · {}", target.label),
                 None,
                 Some(message.as_str()),
                 None,
             )),
             Ok(frames) if frames.is_empty() => entries.push((
-                format!("{title} · {}", target.ref_id),
+                format!("{title} · {}", target.label),
                 None,
                 Some("no data"),
                 None,
@@ -641,7 +657,7 @@ fn render_targets(
             Ok(frames) => {
                 for (index, frame) in frames.iter().enumerate().take(32) {
                     let mut label = if frames.len() == 1 {
-                        format!("{title} · {}", target.ref_id)
+                        format!("{title} · {}", target.label)
                     } else {
                         let series = frame
                             .fields
@@ -651,7 +667,7 @@ fn render_targets(
                             .filter(|name| !name.is_empty())
                             .map(str::to_owned)
                             .unwrap_or_else(|| (index + 1).to_string());
-                        format!("{title} · {} · {series}", target.ref_id)
+                        format!("{title} · {} · {series}", target.label)
                     };
                     if let Coverage::Partial { .. } = frame.coverage {
                         label.push_str(" · partial");
@@ -664,12 +680,22 @@ fn render_targets(
                     ) {
                         entries.push((label, None, Some("no samples retained yet"), None));
                     } else {
-                        entries.push((label, Some(frame), None, Some((target_index, index))));
+                        entries.push((
+                            label,
+                            Some(frame),
+                            None,
+                            Some((
+                                target.ref_id.clone(),
+                                visible_targets.clone(),
+                                target_index,
+                                index,
+                            )),
+                        ));
                     }
                 }
                 if frames.len() > 32 {
                     entries.push((
-                        format!("{title} · {}", target.ref_id),
+                        format!("{title} · {}", target.label),
                         None,
                         Some("series limit is 32"),
                         None,
@@ -698,7 +724,7 @@ fn render_targets(
                 panel_id: context.panel_id,
                 generation: context.generation,
                 window: context.window,
-                series_index: *series_index,
+                series_index: series_index.clone(),
                 cache: &mut *context.cache,
             };
             dispatch_renderer(
@@ -728,9 +754,14 @@ fn dispatch_renderer(
     let colors = render_colors(theme);
     match kind {
         "timeseries" => {
-            let (target_index, frame_index) = context.series_index.unwrap_or((0, 0));
+            let (target_ref_id, visible_targets, target_index, frame_index) = context
+                .series_index
+                .take()
+                .unwrap_or_else(|| (String::new(), Vec::new(), 0, 0));
             let id = SeriesId {
                 panel_id: context.panel_id,
+                target_ref_id,
+                visible_targets,
                 target_index,
                 frame_index,
             };
@@ -884,6 +915,7 @@ mod tests {
         let mut buffer = Buffer::empty(area);
         let targets = [gtui_app::engine::TargetUpdate {
             ref_id: "A".into(),
+            label: "A".into(),
             result: Ok(vec![frame]),
         }];
         render_targets(
@@ -902,6 +934,32 @@ mod tests {
             },
         );
         buffer
+    }
+
+    fn render_target_updates(
+        cache: &mut SeriesCache,
+        generation: u64,
+        targets: &[gtui_app::engine::TargetUpdate],
+    ) {
+        let area = Rect::new(0, 0, 30, 8);
+        let mut buffer = Buffer::empty(area);
+        cache.begin_pass();
+        render_targets(
+            "timeseries",
+            "Panel",
+            targets,
+            area,
+            &mut buffer,
+            &Theme::prism(),
+            PanelRenderContext {
+                panel_id: 7,
+                generation,
+                window: Some([0.0, 2.0]),
+                series_index: None,
+                cache: &mut *cache,
+            },
+        );
+        cache.finish_pass();
     }
 
     fn timestamped_frame() -> Frame {
@@ -973,19 +1031,24 @@ mod tests {
                 render_cached_series(&mut cache, index as u32, 1, frame.clone(), 30, window);
             cache.finish_pass();
             let hit = render_cached_series(&mut cache, index as u32, 1, frame.clone(), 30, window);
-            let uncached = render_targets_uncached(frame, 30, window);
+            let uncached = render_targets_uncached(frame, "A", 30, window);
             assert_eq!(cached, hit);
             assert_eq!(hit, uncached);
         }
     }
 
-    fn render_targets_uncached(frame: Frame, width: u16, window: Option<[f64; 2]>) -> Buffer {
+    fn render_targets_uncached(
+        frame: Frame,
+        label: &str,
+        width: u16,
+        window: Option<[f64; 2]>,
+    ) -> Buffer {
         let area = Rect::new(0, 0, width, 8);
         let mut buffer = Buffer::empty(area);
         let bounds = bounds_for(&frame);
         gtui_render::timeseries::TimeseriesRenderer::render_in_window(
             &frame,
-            "Panel · A",
+            &format!("Panel · {label}"),
             bounds,
             window,
             width as usize,
@@ -993,6 +1056,95 @@ mod tests {
         )
         .render(area, &mut buffer);
         buffer
+    }
+
+    #[test]
+    fn hiding_target_a_does_not_reuse_its_cached_reduction_for_b() {
+        let frame_a = Frame::new(vec![
+            Field::new("time", FieldType::Time, vec![0.0, 1.0]),
+            Field::new("v", FieldType::Float64, vec![1.0, 2.0]),
+        ]);
+        let frame_b = Frame::new(vec![
+            Field::new("time", FieldType::Time, vec![0.0, 1.0]),
+            Field::new("v", FieldType::Float64, vec![9.0, 10.0]),
+        ]);
+        let mut cache = SeriesCache::default();
+        render_target_updates(
+            &mut cache,
+            1,
+            &[
+                gtui_app::engine::TargetUpdate {
+                    ref_id: "A".into(),
+                    label: "A".into(),
+                    result: Ok(vec![frame_a.clone()]),
+                },
+                gtui_app::engine::TargetUpdate {
+                    ref_id: "B".into(),
+                    label: "B".into(),
+                    result: Ok(vec![frame_b.clone()]),
+                },
+            ],
+        );
+        assert_eq!(cache.reduction_count(), 2, "both visible targets reduce");
+
+        // Hiding A removes it from the delivered vector. B moves to dense index 0,
+        // but its visible-target identity differs from either cached entry.
+        let only_b = [gtui_app::engine::TargetUpdate {
+            ref_id: "B".into(),
+            label: "B".into(),
+            result: Ok(vec![frame_b.clone()]),
+        }];
+        render_target_updates(&mut cache, 1, &only_b);
+        assert_eq!(
+            cache.reduction_count(),
+            3,
+            "hiding A must not reuse A's cached reduction for B"
+        );
+
+        render_target_updates(&mut cache, 1, &only_b);
+        assert_eq!(
+            cache.reduction_count(),
+            3,
+            "an unchanged visible target set and generation must hit"
+        );
+
+        render_target_updates(&mut cache, 2, &only_b);
+        assert_eq!(
+            cache.reduction_count(),
+            4,
+            "a generation change must reduce again"
+        );
+
+        // Keep B at index 0 while changing the visible set. This isolates set
+        // identity from the dense-index shift in the A-then-B case above.
+        let mut set_cache = SeriesCache::default();
+        render_target_updates(
+            &mut set_cache,
+            1,
+            &[
+                gtui_app::engine::TargetUpdate {
+                    ref_id: "B".into(),
+                    label: "B".into(),
+                    result: Ok(vec![frame_b.clone()]),
+                },
+                gtui_app::engine::TargetUpdate {
+                    ref_id: "A".into(),
+                    label: "A".into(),
+                    result: Ok(vec![frame_a]),
+                },
+            ],
+        );
+        assert_eq!(set_cache.reduction_count(), 2);
+        render_target_updates(&mut set_cache, 1, &only_b);
+        assert_eq!(
+            set_cache.reduction_count(),
+            3,
+            "a changed visible set must not reuse the same-index reduction"
+        );
+        render_target_updates(&mut set_cache, 1, &only_b);
+        assert_eq!(set_cache.reduction_count(), 3);
+        render_target_updates(&mut set_cache, 2, &only_b);
+        assert_eq!(set_cache.reduction_count(), 4);
     }
 
     #[test]
@@ -1086,12 +1238,23 @@ mod tests {
             "ref_id = \"A\"",
             "ref_id = \"A\"\n[[panels.targets]]\nexpr = \"y\"\nref_id = \"A\"",
         );
+        let oversized_alias = valid_toml(1, "host").replace(
+            "expr = \"x\"",
+            &format!(
+                "expr = \"x\"\nalias = \"{}\"",
+                "x".repeat(MAX_LABEL_BYTES + 1)
+            ),
+        );
+        let control_alias = valid_toml(1, "host")
+            .replace("expr = \"x\"", "expr = \"x\"\nalias = \"bad\\u0001label\"");
 
         for (toml, expected) in [
             (too_many_targets, "target count"),
             (oversized_expr, "expression"),
             (oversized_title, "title"),
             (duplicate_ref, "duplicate ref_id"),
+            (oversized_alias, "alias exceeds"),
+            (control_alias, "alias contains a control character"),
         ] {
             let path = dashboard_file(toml.as_bytes());
             let result = load_dashboard(&config_for(path.clone()), &source_ids);
@@ -1284,6 +1447,7 @@ mod tests {
             "CPU",
             &PanelState::Ready(vec![gtui_app::engine::TargetUpdate {
                 ref_id: "A".into(),
+                label: "A".into(),
                 result: Ok(vec![f]),
             }]),
             buf2.area,
@@ -1307,14 +1471,17 @@ mod tests {
         let targets = vec![
             gtui_app::engine::TargetUpdate {
                 ref_id: "A".into(),
+                label: "A".into(),
                 result: Ok(vec![frame]),
             },
             gtui_app::engine::TargetUpdate {
                 ref_id: "B".into(),
+                label: "B".into(),
                 result: Err("source failed".into()),
             },
             gtui_app::engine::TargetUpdate {
                 ref_id: "C".into(),
+                label: "C".into(),
                 result: Ok(Vec::new()),
             },
         ];
@@ -1352,6 +1519,68 @@ mod tests {
     }
 
     #[test]
+    fn alias_is_used_in_target_title_instead_of_ref_id() {
+        let targets = [gtui_app::engine::TargetUpdate {
+            ref_id: "A".into(),
+            label: "p99".into(),
+            result: Err("source failed".into()),
+        }];
+        let area = Rect::new(0, 0, 32, 5);
+        let mut buf = Buffer::empty(area);
+        render_targets(
+            "stat",
+            "Panel",
+            &targets,
+            area,
+            &mut buf,
+            &Theme::prism(),
+            PanelRenderContext {
+                panel_id: 1,
+                generation: 0,
+                window: None,
+                series_index: None,
+                cache: &mut SeriesCache::default(),
+            },
+        );
+        let rendered = buf
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<Vec<_>>()
+            .join("");
+        assert!(rendered.contains("Panel · p99"));
+        assert!(!rendered.contains("Panel · A"));
+    }
+
+    #[test]
+    fn no_delivered_targets_render_the_existing_no_data_message() {
+        let area = Rect::new(0, 0, 24, 5);
+        let mut buf = Buffer::empty(area);
+        render_targets(
+            "stat",
+            "Panel",
+            &[],
+            area,
+            &mut buf,
+            &Theme::prism(),
+            PanelRenderContext {
+                panel_id: 1,
+                generation: 0,
+                window: None,
+                series_index: None,
+                cache: &mut SeriesCache::default(),
+            },
+        );
+        let rendered = buf
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<Vec<_>>()
+            .join("");
+        assert!(rendered.contains("no data"));
+    }
+
+    #[test]
     fn multi_series_target_titles_use_derived_series_names() {
         let frames = ["up{job=\"a\"}", "up{job=\"b\"}"]
             .into_iter()
@@ -1364,6 +1593,7 @@ mod tests {
             .collect();
         let targets = vec![gtui_app::engine::TargetUpdate {
             ref_id: "A".into(),
+            label: "A".into(),
             result: Ok(frames),
         }];
         let area = Rect::new(0, 0, 70, 12);
@@ -1401,6 +1631,7 @@ mod tests {
         ]);
         let targets = vec![gtui_app::engine::TargetUpdate {
             ref_id: "A".into(),
+            label: "A".into(),
             result: Ok(vec![frame]),
         }];
         let mut buf = Buffer::empty(Rect::new(0, 0, 40, 10));
@@ -1471,6 +1702,7 @@ mod tests {
                 "Panel",
                 &[gtui_app::engine::TargetUpdate {
                     ref_id: "A".into(),
+                    label: "A".into(),
                     result: Ok(vec![frame]),
                 }],
                 area,
@@ -1519,14 +1751,17 @@ mod tests {
         let targets = vec![
             gtui_app::engine::TargetUpdate {
                 ref_id: "A".into(),
+                label: "A".into(),
                 result: Ok(vec![partial]),
             },
             gtui_app::engine::TargetUpdate {
                 ref_id: "B".into(),
+                label: "B".into(),
                 result: Ok(vec![complete]),
             },
             gtui_app::engine::TargetUpdate {
                 ref_id: "C".into(),
+                label: "C".into(),
                 result: Ok(vec![empty_partial]),
             },
         ];
