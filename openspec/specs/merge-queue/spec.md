@@ -561,3 +561,50 @@ Cleanup SHALL compare retained parent and leaf identities before removing an ent
 
 - **WHEN** a failure occurs after exclusive creation
 - **THEN** the retained descriptor is closed and cleanup checks ownership without recursive removal or pathname-only fallback
+
+### Requirement: Publish only observed final queue outcomes
+
+The system MUST capture queue and registry observations before folding and MUST
+persist only final outcome states atomically per row. Observable reassignment,
+duplicate contradictory projections, or failed writes MUST NOT trigger lifecycle.
+
+#### Scenario: A failed fold becomes an infrastructure hold
+
+- **WHEN** a prepared fold is held
+- **THEN** another connection cannot observe a synthetic queued state during final
+  persistence, and the final row clears stale result fields without resetting its
+  nomination time or attempt budget.
+
+#### Scenario: Another actor changes the queue during the gate
+
+- **WHEN** the current row differs from the captured pre-fold observation
+- **THEN** the delayed outcome refuses without overwriting that actor or applying
+  lifecycle to the reassigned worktree.
+
+#### Scenario: Pre-fold observation is unavailable
+
+- **WHEN** observation fails before Git work begins
+- **THEN** the Git outcome is reported separately from degraded bookkeeping and no
+  fresh post-fold observation authorizes persistence or lifecycle.
+
+### Requirement: Snapshot only selected and confirmed local candidates
+
+Candidate discovery MUST NOT create snapshots. Queue selection and confirmation
+MUST precede snapshot mutation. The CLI and UI MUST use the same selected-only
+admission and MUST refuse unknown dirty state or changed local Git identity.
+
+#### Scenario: A dirty unqueued worktree exists
+
+- **WHEN** integration selects only queued worktrees with snapshotting enabled
+- **THEN** unqueued worktree refs, index and contents remain untouched.
+
+#### Scenario: Dry-run or missing confirmation
+
+- **WHEN** the CLI previews or refuses an unconfirmed noninteractive integration
+- **THEN** neither queued nor unqueued worktrees are snapshotted, the queue is
+  unchanged, and missing confirmation returns a nonzero exit status.
+
+#### Scenario: Snapshot identity changed
+
+- **WHEN** a selected worktree changes branch, HEAD, repository or placement
+- **THEN** snapshot admission refuses instead of resolving a new mutation target.

@@ -7,7 +7,8 @@
 - [x] Native fixed-binary proof of failed gate, atomic final status, no sweep and retained successful land.
 - [x] Independent source review and scoped gates before component commit.
 - [x] Complete selected-only snapshot/atomic persistence integration and the combined private native gate.
-- [ ] THE-588 destructive cleanup acceptance and actual THE-586 native queue retry remain separate.
+- [x] THE-588 destructive cleanup acceptance and actual THE-586 native queue retry remain separate.
+      Not part of this change: THE-588 (Done) and THE-586 (open) track this work separately.
 
 ## Scoped evidence
 
