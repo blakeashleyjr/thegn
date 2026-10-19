@@ -205,6 +205,7 @@ pub(crate) fn teardown_projects_in(state_home: &Path, worktree: &Path) -> Vec<St
     teardown_projects_for(state_home, &name, &[worktree])
 }
 
+/// Return hashed projects for each worktree, plus an adopted legacy project once.
 pub(crate) fn teardown_projects_for(
     state_home: &Path,
     name: &str,

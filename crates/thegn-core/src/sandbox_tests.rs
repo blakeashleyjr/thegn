@@ -3958,17 +3958,17 @@ fn remote_teardown_downs_the_hashed_project_through_the_placement() {
     let down_commands: Vec<_> = commands
         .iter()
         .filter(|argv| argv.iter().any(|arg| arg == "down"))
-        .map(|argv| placement.control_argv(argv))
         .collect();
     assert_eq!(down_commands.len(), 2);
-    let routed = down_commands
-        .iter()
-        .map(|argv| argv.join(" "))
-        .collect::<Vec<_>>()
-        .join("\n");
-    assert!(routed.contains(&format!("-p {loc_project}")));
-    assert!(routed.contains(&format!("-p {mounted_project}")));
-    assert!(!routed.contains(&format!("-p {name}")));
+    let has_project = |project: &str| {
+        down_commands.iter().any(|argv| {
+            argv.windows(2)
+                .any(|pair| pair[0] == "-p" && pair[1] == project)
+        })
+    };
+    assert!(has_project(&loc_project));
+    assert!(has_project(&mounted_project));
+    assert!(!has_project(&name));
 }
 
 const PODMAN5_STATS: &str = r#"[
