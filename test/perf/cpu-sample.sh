@@ -25,7 +25,8 @@
 #
 # Exit status: 0 ok; 2 over a ceiling (CPU or resource); 1 harness error.
 # TG_PERF_DROP_KEYS=1 is a negative control: discard workload keys and verify
-# that the input self-check fails. Workload runs require observable key dispatch.
+# that the input self-check fails. Every workload event needs a dispatch line;
+# printable characters must be forwarded to the pane rather than consumed by a keymap.
 # TG_PERF_SANDBOX=1 uses sandboxed panes, which share the live thegn.slice ceiling.
 
 set -euo pipefail
@@ -264,7 +265,7 @@ SETTLE_MAX_MS=$((SETTLE_MS > 20000 ? SETTLE_MS : 20000))
 # window ended ("thegn exited before the spawn-rate idle window ended") and every
 # number from that run under-measured. The harness SIGTERMs thegn when done, so a
 # long tail costs nothing; 30 s covers any observed lag with room to spare.
-# Includes a one-second allowance for the ~700 ms paced seven-key input phase.
+# Includes a one-second allowance for the ~1.7 s paced seventeen-key input phase.
 KEY_PHASE_MAX_MS=41000
 if [ "$SCENARIO" = steady-workload ] || [ "$SCENARIO" = soak ] || [ "$SCENARIO" = soak-daemon ]; then
   RUN_MS=$((SETTLE_MAX_MS + 1000 + WINDOW_MS + KEY_PHASE_MAX_MS + 30000))
@@ -594,11 +595,11 @@ if [ "$SCENARIO" = steady-workload ] || [ "$SCENARIO" = soak ] || [ "$SCENARIO" 
   # Allow a first frame, then dismiss onboarding before counting dispatcher
   # output: onboarding-consumed keys do not reach the keymap logger.
   KEYS="$HERE/scenarios/steady-workload.keys"
-  MIN_DISPATCH_LINES=7 # Esc setup is excluded; spaced events avoid terminal coalescing.
   if [ "$SCENARIO" = soak-daemon ]; then
     KEYS="$HERE/scenarios/soak-daemon.keys"
-    MIN_DISPATCH_LINES=7
   fi
+  EXPECTED_EVENTS="$(python3 "$HERE/lib/key-events.py" count "$KEYS")"
+  EXPECTED_CHARS="$(python3 "$HERE/lib/key-events.py" chars "$KEYS")"
   sleep 3
   printf '\033' >&3
   sleep 0.8
@@ -611,35 +612,7 @@ if [ "$SCENARIO" = steady-workload ] || [ "$SCENARIO" = soak ] || [ "$SCENARIO" 
   KEYS_BYTES="$(wc -c <"$KEYS" | tr -d ' ')"
   if [ "${TG_PERF_DROP_KEYS:-}" = 1 ]; then
     cat "$KEYS" >/dev/null
-  elif ! python3 - "$KEYS" 3 <<'PY'; then
-import os
-import sys
-import time
-
-data = open(sys.argv[1], "rb").read()
-fd = int(sys.argv[2])
-events = []
-index = 0
-while index < len(data):
-    if data[index] == 0x1B and index + 1 < len(data):
-        end = index + 2
-        if data[index + 1] == ord("["):
-            while end < len(data) and not 0x40 <= data[end] <= 0x7E:
-                end += 1
-            end = min(end + 1, len(data))
-        events.append(data[index:end])
-        index = end
-    else:
-        events.append(data[index : index + 1])
-        index += 1
-
-for event in events:
-    view = memoryview(event)
-    while view:
-        written = os.write(fd, view)
-        view = view[written:]
-    time.sleep(0.1)
-PY
+  elif ! python3 "$HERE/lib/key-events.py" write "$KEYS" 3; then
     echo 'FAIL: could not write keys to the pty master' >&2
     if [ "$JSON_ONLY" = 1 ]; then printf '%s\n' '{"input":{"status":"failed"}}'; fi
     perf_stop_process_group "$LAUNCHER" "$PIDFILE"
@@ -652,19 +625,36 @@ PY
   fi
   DISPATCH_LINES=0
   MATCHED_LINES=0
+  CHAR_FORWARDED=0
+  CHAR_OTHER=0
   for _ in $(seq 1 150); do
     if [ -f "$LOG_FILE" ]; then
       NEW_LINES="$(tail -n +$((LOG_LINES + 1)) "$LOG_FILE" | sed "s/${ESC}\\[[0-9;]*[[:alpha:]]//g")"
       DISPATCH_LINES="$(printf '%s\n' "$NEW_LINES" | grep -c 'key dispatch' || true)"
       MATCHED_LINES="$(printf '%s\n' "$NEW_LINES" | grep 'key dispatch' | grep -c 'matched' || true)"
+      CHAR_FORWARDED="$(printf '%s\n' "$NEW_LINES" | grep 'key dispatch' | grep -E 'norm_key="?character' | grep -E 'result="?forwarded' | grep -c . || true)"
+      CHAR_OTHER="$(printf '%s\n' "$NEW_LINES" | grep 'key dispatch' | grep -E 'norm_key="?character' | grep -Ev 'result="?forwarded' | grep -c . || true)"
     fi
-    [ "$DISPATCH_LINES" -ge "$MIN_DISPATCH_LINES" ] && break
+    [ "$DISPATCH_LINES" -ge "$EXPECTED_EVENTS" ] && [ "$CHAR_FORWARDED" -ge "$EXPECTED_CHARS" ] && break
     sleep 0.1
   done
-  if [ "$DISPATCH_LINES" -lt "$MIN_DISPATCH_LINES" ]; then
-    echo "FAIL: key injection had no observable effect ($DISPATCH_LINES key dispatch lines; expected at least $MIN_DISPATCH_LINES in $LOG_FILE)" >&2
+  if [ "$DISPATCH_LINES" -lt "$EXPECTED_EVENTS" ]; then
+    echo "FAIL: key injection had no observable effect ($DISPATCH_LINES key dispatch lines; expected $EXPECTED_EVENTS in $LOG_FILE)" >&2
     if [ "$JSON_ONLY" = 1 ]; then
-      printf '{"input":{"status":"failed","keys_bytes":%s,"dispatch_lines":%s,"matched":%s,"sessions":null}}\n' "$KEYS_BYTES" "$DISPATCH_LINES" "$MATCHED_LINES"
+      printf '{"input":{"status":"failed","keys_bytes":%s,"dispatch_lines":%s,"matched":%s,"sessions":null,"forwarded_chars":%s}}\n' "$KEYS_BYTES" "$DISPATCH_LINES" "$MATCHED_LINES" "$CHAR_FORWARDED"
+    fi
+    perf_stop_process_group "$LAUNCHER" "$PIDFILE"
+    exec 3>&-
+    if [ -n "$DAEMON_LAUNCHER" ]; then
+      "$BIN_ABS" daemon stop >/dev/null 2>&1 || kill "$DAEMON_LAUNCHER" 2>/dev/null || true
+      wait "$DAEMON_LAUNCHER" 2>/dev/null || true
+    fi
+    exit 1
+  fi
+  if [ "$EXPECTED_CHARS" -gt 0 ] && { [ "$CHAR_FORWARDED" -lt "$EXPECTED_CHARS" ] || [ "$CHAR_OTHER" -gt 0 ]; }; then
+    echo "FAIL: echo keys did not reach the pane ($CHAR_FORWARDED of $EXPECTED_CHARS forwarded, $CHAR_OTHER consumed by a keymap)" >&2
+    if [ "$JSON_ONLY" = 1 ]; then
+      printf '{"input":{"status":"failed","keys_bytes":%s,"dispatch_lines":%s,"matched":%s,"sessions":null,"forwarded_chars":%s}}\n' "$KEYS_BYTES" "$DISPATCH_LINES" "$MATCHED_LINES" "$CHAR_FORWARDED"
     fi
     perf_stop_process_group "$LAUNCHER" "$PIDFILE"
     exec 3>&-
@@ -709,7 +699,7 @@ PY
       exit 1
     fi
   fi
-  INPUT_JSON="{\"status\":\"ok\",\"keys_bytes\":$KEYS_BYTES,\"dispatch_lines\":$DISPATCH_LINES,\"matched\":$MATCHED_LINES,\"sessions\":$SESSION_COUNT}"
+  INPUT_JSON="{\"status\":\"ok\",\"keys_bytes\":$KEYS_BYTES,\"dispatch_lines\":$DISPATCH_LINES,\"matched\":$MATCHED_LINES,\"sessions\":$SESSION_COUNT,\"expected_events\":$EXPECTED_EVENTS,\"forwarded_chars\":$CHAR_FORWARDED}"
 fi
 
 WINDOW_S="$(awk "BEGIN{print $WINDOW_MS/1000}")"
