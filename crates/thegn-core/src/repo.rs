@@ -240,6 +240,13 @@ fn slug_base(name: &str) -> String {
     if s.is_empty() { "repo".to_string() } else { s }
 }
 
+/// Pure, git-free and DB-free prefill for a repository slug. This is the same
+/// path-derived base that [`repo_slug_with_checked`] passes to `slug_for_repo`;
+/// the DB may add a collision suffix when the repository is registered.
+pub fn repo_slug_guess(root: &Path) -> String {
+    slug_base(&repo_name_from_path(root))
+}
+
 /// Discover git repos under the configured roots (parent dirs of a `.git`
 /// directory). Skips worktrees (whose `.git` is a file). Sorted + deduped.
 pub fn discover_repos(cfg: &Config) -> Vec<String> {
@@ -770,5 +777,21 @@ mod tests {
         }
         assert_eq!(branch_tab("app", "feat/a"), "app/feat/a");
         assert_eq!(branch_tab("app", "home"), "app/home~");
+    }
+
+    #[test]
+    fn repo_slug_guess_is_the_pure_checked_slug_base() {
+        assert_eq!(
+            repo_slug_guess(Path::new("/x/My Repo.git")),
+            slug_base("My Repo")
+        );
+        assert_eq!(repo_slug_guess(Path::new("/")), "repo");
+
+        let db = crate::db::Db::open_memory().unwrap();
+        let root = Path::new("/fresh/My Repo.git");
+        assert_eq!(
+            repo_slug_guess(root),
+            repo_slug_with_checked(&db, root).unwrap()
+        );
     }
 }

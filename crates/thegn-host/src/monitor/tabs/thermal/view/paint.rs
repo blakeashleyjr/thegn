@@ -1,4 +1,4 @@
-use super::{HISTORY_CAP, SensorRow, ThermalModel, ZoneRow};
+use super::{FanRow, HISTORY_CAP, SensorRow, ThermalModel, ZoneRow};
 use crate::{
     caps,
     chrome::S,
@@ -341,8 +341,13 @@ pub(super) fn sensors(grid: &mut CellGrid, rect: Rect, sensors: &[SensorRow]) {
     );
 }
 
-pub(super) fn zones(grid: &mut CellGrid, rect: Rect, zones: &[ZoneRow]) {
-    if zones.is_empty() {
+pub(super) fn zones(
+    grid: &mut CellGrid,
+    rect: Rect,
+    zones: &[ZoneRow],
+    cooling: &[thegn_metrics::collect::model::thermal_zone::CoolingAggregate],
+) {
+    if zones.is_empty() && cooling.is_empty() {
         put(
             grid,
             rect,
@@ -351,7 +356,6 @@ pub(super) fn zones(grid: &mut CellGrid, rect: Rect, zones: &[ZoneRow]) {
             caps::active_glyphs().emdash,
             Tok::Slot(S::Dim),
         );
-        return;
     }
     for (index, zone) in zones.iter().enumerate().take(rect.rows) {
         let trip = zone
@@ -382,6 +386,82 @@ pub(super) fn zones(grid: &mut CellGrid, rect: Rect, zones: &[ZoneRow]) {
             index,
             &format!("{}  {temp}  {trip}{alarm}", zone.label),
             style,
+        );
+    }
+    for (offset, aggregate) in cooling
+        .iter()
+        .enumerate()
+        .take(rect.rows.saturating_sub(zones.len()))
+    {
+        put(
+            grid,
+            rect,
+            0,
+            zones.len() + offset,
+            &format!(
+                "passive cooling {}/{} {}",
+                aggregate.engaged, aggregate.total, aggregate.kind
+            ),
+            Tok::Slot(S::Text),
+        );
+    }
+}
+
+pub(super) fn cooling(grid: &mut CellGrid, rect: Rect, fans: &[FanRow], sensors: &[SensorRow]) {
+    if fans.is_empty() {
+        put(
+            grid,
+            rect,
+            0,
+            0,
+            caps::active_glyphs().emdash,
+            Tok::Slot(S::Dim),
+        );
+        return;
+    }
+    for (index, fan) in fans.iter().take(rect.rows / 2).enumerate() {
+        let rpm = fan.rpm.map_or_else(
+            || caps::active_glyphs().emdash.to_owned(),
+            |value| format!("{value:.0}rpm"),
+        );
+        let target = fan
+            .target
+            .map_or_else(String::new, |value| format!(" target {value:.0}"));
+        put(
+            grid,
+            rect,
+            0,
+            index * 2,
+            &format!("{} {}  {rpm}{target}", fan.chip, fan.label),
+            Tok::Slot(S::Text),
+        );
+        let paired = fan
+            .pair
+            .as_deref()
+            .and_then(|key| sensors.iter().find(|sensor| sensor.key == key))
+            .map_or_else(
+                || caps::active_glyphs().emdash.to_owned(),
+                |sensor| sensor.label.clone(),
+            );
+        put(
+            grid,
+            rect,
+            0,
+            index * 2 + 1,
+            &format!("paired: {paired}"),
+            Tok::Slot(S::Dim),
+        );
+        let peak = fan.peak.map_or_else(
+            || caps::active_glyphs().emdash.to_owned(),
+            |value| format!("peak {value:.0}rpm"),
+        );
+        put(
+            grid,
+            rect,
+            rect.cols.saturating_sub(13),
+            index * 2 + 1,
+            &peak,
+            Tok::Slot(S::Dim),
         );
     }
 }

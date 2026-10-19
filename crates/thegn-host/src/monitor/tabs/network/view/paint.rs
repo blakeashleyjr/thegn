@@ -1,6 +1,6 @@
 use super::{
-    HEALTH, HISTORY, IFACE_HISTORY, INTERFACES, NetworkModel, TELEMETRY_HISTORY, THROUGHPUT, WIFI,
-    WIFI_HISTORY,
+    HEALTH, HISTORY, IFACE_HISTORY, INTERFACES, NetworkModel, OWNER_CAP, OWNERS, TELEMETRY_HISTORY,
+    THROUGHPUT, WIFI, WIFI_HISTORY,
 };
 use crate::{
     caps,
@@ -53,6 +53,15 @@ pub(super) fn paint(model: &NetworkModel, surface: &mut Surface, id: PanelId, re
         ),
         HEALTH => "Network health".to_owned(),
         WIFI => "Wi-Fi interfaces (signal -90..-30 dBm)".to_owned(),
+        OWNERS => format!(
+            "Network owners (top by rx+tx, B/s peak {}){}",
+            format_rate(f64::from(owner_peak(model))),
+            if model.owners_truncated {
+                "  partial"
+            } else {
+                ""
+            }
+        ),
         _ => return,
     };
     let body = panel::panel(&mut grid, Rect::full(rect.cols, rect.rows), &title, None).rect();
@@ -61,6 +70,7 @@ pub(super) fn paint(model: &NetworkModel, surface: &mut Surface, id: PanelId, re
         INTERFACES => paint_interfaces(&mut grid, body, model),
         HEALTH => paint_health(&mut grid, body, model),
         WIFI => paint_wifi(&mut grid, body, model),
+        OWNERS => paint_owners(&mut grid, body, model),
         _ => return,
     }
     Emitter::default().emit(
@@ -76,6 +86,186 @@ pub(super) fn paint(model: &NetworkModel, surface: &mut Surface, id: PanelId, re
         paint_health_history(model, surface, body, rect);
     } else if id == WIFI {
         paint_wifi_histories(model, surface, body, rect);
+    } else if id == OWNERS {
+        paint_owner_histories(model, surface, body, rect);
+    }
+}
+
+fn paint_owners(grid: &mut CellGrid, body: Rect, model: &NetworkModel) {
+    if body.cols == 0 || body.rows == 0 {
+        return;
+    }
+    let mut view = grid.view(body);
+    let glyphs = caps::active_glyphs();
+    view.put_str(
+        0,
+        0,
+        &format!(
+            "kind  owner                         {} B/s       {} B/s",
+            glyphs.arrow_down, glyphs.arrow_up
+        ),
+        CellStyle::default(),
+    );
+    if let thegn_metrics::collect::health::Health::Absent(reason) = model.owners_health {
+        let mark = if reason == thegn_metrics::collect::health::Absent::NoPermission {
+            caps::glyph(caps::Glyph::Lock)
+        } else {
+            caps::active_glyphs().emdash
+        };
+        view.put_str(0, 1, mark, CellStyle::default());
+        return;
+    }
+    if matches!(
+        model.owners_health,
+        thegn_metrics::collect::health::Health::Warming
+    ) || !model.owners_primed
+    {
+        view.put_str(0, 1, caps::active_glyphs().ellipsis, CellStyle::default());
+        return;
+    }
+    let (order, count) = owner_order(model);
+    let reserved_rows = 3;
+    let visible_count = count.min(body.rows.saturating_sub(reserved_rows));
+    for (row, index) in order[..count]
+        .iter()
+        .copied()
+        .take(visible_count)
+        .enumerate()
+    {
+        let owner = &model.owners[index];
+        let name = String::from_utf8_lossy(&owner.name);
+        let name: String = name.chars().take(28).collect();
+        let line = format!(
+            "{:<5} {:<28} {:>10} {:>10}",
+            owner_kind(owner.kind),
+            name,
+            format_rate(f64::from(owner.rx_bps)),
+            format_rate(f64::from(owner.tx_bps)),
+        );
+        view.put_str(0, row + 1, &line, CellStyle::default());
+    }
+    let remainder_row = visible_count + 1;
+    if remainder_row < body.rows {
+        let (rx, tx) = if model.owners_physical_known {
+            (
+                rate(model.owners_unattributed_rx),
+                rate(model.owners_unattributed_tx),
+            )
+        } else {
+            (
+                caps::active_glyphs().emdash.to_owned(),
+                caps::active_glyphs().emdash.to_owned(),
+            )
+        };
+        view.put_str(
+            0,
+            remainder_row,
+            &format!(
+                "{:<5} {:<28} {:>10} {:>10}",
+                "other", "UDP/QUIC/other", rx, tx,
+            ),
+            CellStyle::default(),
+        );
+    }
+    let hidden_count = model.owners_overflow + count.saturating_sub(visible_count);
+    if hidden_count > 0 && remainder_row + 1 < body.rows {
+        view.put_str(
+            0,
+            remainder_row + 1,
+            &format!("+{hidden_count} owners"),
+            CellStyle::default(),
+        );
+    }
+}
+
+fn owner_kind(kind: thegn_metrics::collect::policy::cgroup_classify::OwnerKind) -> &'static str {
+    use thegn_metrics::collect::policy::cgroup_classify::OwnerKind;
+    match kind {
+        OwnerKind::Pane => "pane",
+        OwnerKind::Slice => "slice",
+        OwnerKind::Podman => "podman",
+        OwnerKind::Docker => "docker",
+        OwnerKind::App => "app",
+        OwnerKind::Unit => "unit",
+        OwnerKind::Other => "other",
+    }
+}
+
+fn owner_peak(model: &NetworkModel) -> f32 {
+    model
+        .owners
+        .iter()
+        .filter(|owner| owner.live)
+        .flat_map(|owner| owner.history.values.iter().copied())
+        .filter(|value| value.is_finite())
+        .fold(0.0_f32, f32::max)
+        .max(1.0)
+}
+
+fn owner_order(model: &NetworkModel) -> ([usize; OWNER_CAP], usize) {
+    let mut order = [usize::MAX; OWNER_CAP];
+    let mut count = 0;
+    for (index, owner) in model
+        .owners
+        .iter()
+        .enumerate()
+        .filter(|(_, owner)| owner.live)
+    {
+        let mut position = count;
+        while position > 0 {
+            let prior = &model.owners[order[position - 1]];
+            let current_rate = owner.rx_bps + owner.tx_bps;
+            let prior_rate = prior.rx_bps + prior.tx_bps;
+            if prior_rate > current_rate
+                || (prior_rate == current_rate && prior.cgroup_id < owner.cgroup_id)
+            {
+                break;
+            }
+            order[position] = order[position - 1];
+            position -= 1;
+        }
+        order[position] = index;
+        count += 1;
+    }
+    (order, count)
+}
+
+fn paint_owner_histories(
+    model: &NetworkModel,
+    surface: &mut Surface,
+    body: Rect,
+    panel_rect: Rect,
+) {
+    if matches!(
+        model.owners_health,
+        thegn_metrics::collect::health::Health::Absent(_)
+            | thegn_metrics::collect::health::Health::Warming
+    ) || !model.owners_primed
+    {
+        return;
+    }
+    let peak = owner_peak(model);
+    let spark_width = body.cols.min(12);
+    let x = panel_rect.x + body.x + body.cols.saturating_sub(spark_width);
+    let (order, count) = owner_order(model);
+    for (row, index) in order[..count]
+        .iter()
+        .copied()
+        .take(body.rows.saturating_sub(3))
+        .enumerate()
+    {
+        let owner = &model.owners[index];
+        paint_rate_history(
+            &owner.history,
+            peak,
+            Rect {
+                x,
+                y: panel_rect.y + body.y + row + 1,
+                cols: spark_width,
+                rows: 1,
+            },
+            surface,
+        );
     }
 }
 

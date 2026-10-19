@@ -1,15 +1,24 @@
-use super::{NetSocketsCollector, SocketTransport};
+use super::{
+    IfaceBytes, NetSocketsCollector, PhysicalCounters, ProcNetDev, SocketTransport, physical_delta,
+};
 use crate::collect::{
     CollectError, Collector, CollectorId, CollectorSet, TickCtx,
     env::Env,
     frame::MonitorFrame,
     health::{Absent, Health},
-    linux::sock_diag::{AddressFamily, DumpStats, MAX_TCP_SOCKETS, TcpInfo, TcpSock},
+    linux::{
+        net_attrib::CgroupFs,
+        sock_diag::{AddressFamily, DumpStats, MAX_TCP_SOCKETS, TcpInfo, TcpSock},
+    },
+    model::netdev::IfaceName,
+    policy::net_scope::Scope,
     registry::Registry,
     schedule::{Cadence, Mode},
 };
+use std::collections::VecDeque;
 use std::io;
 use std::net::{IpAddr, Ipv4Addr};
+use std::path::{Path, PathBuf};
 use std::sync::{
     Arc,
     atomic::{AtomicUsize, Ordering},
@@ -23,6 +32,7 @@ struct FakeTransport {
     truncated: bool,
     opened: bool,
     dump_error: Option<io::ErrorKind>,
+    batches: Vec<Vec<TcpSock>>,
 }
 
 impl SocketTransport for FakeTransport {
@@ -45,7 +55,11 @@ impl SocketTransport for FakeTransport {
             return Err(io::Error::new(kind, "scripted dump error"));
         }
         out.clear();
-        out.extend(self.sockets.iter().take(MAX_TCP_SOCKETS).cloned());
+        if self.batches.is_empty() {
+            out.extend(self.sockets.iter().take(MAX_TCP_SOCKETS).cloned());
+        } else {
+            out.extend(self.batches.remove(0).into_iter().take(MAX_TCP_SOCKETS));
+        }
         Ok(DumpStats {
             malformed: self.malformed,
             truncated: self.truncated,
@@ -100,11 +114,62 @@ fn collector_with_dump_error(
         truncated: false,
         opened: false,
         dump_error,
+        batches: Vec::new(),
     };
     (
         NetSocketsCollector::with_transport(Box::new(transport)),
         opens,
     )
+}
+
+#[derive(Default)]
+struct FakeCgroupFs;
+
+impl CgroupFs for FakeCgroupFs {
+    fn children(&self, _path: &Path, _out: &mut Vec<PathBuf>) -> io::Result<()> {
+        Ok(())
+    }
+
+    fn inode(&self, _path: &Path) -> io::Result<u64> {
+        Err(io::ErrorKind::NotFound.into())
+    }
+}
+
+struct FakePhysical {
+    batches: VecDeque<Vec<IfaceBytes>>,
+}
+
+impl PhysicalCounters for FakePhysical {
+    fn read(&mut self, out: &mut Vec<IfaceBytes>) -> io::Result<()> {
+        out.clear();
+        if let Some(rows) = self.batches.pop_front() {
+            out.extend(rows);
+        }
+        Ok(())
+    }
+
+    fn close(&mut self) {}
+}
+
+fn tcp_with_counters(cookie: u64, cgroup_id: u64, rx: u64, tx: u64) -> TcpSock {
+    let mut socket = socket(1, [198, 51, 100, 7], 1_000, 0);
+    socket.cookie = Some(cookie);
+    socket.cgroup_id = Some(cgroup_id);
+    socket.info = Some(TcpInfo {
+        bytes_received: Some(rx),
+        bytes_acked: Some(tx),
+        ..Default::default()
+    });
+    socket
+}
+
+fn iface(name: &[u8], scope: Scope, rx: u64, tx: u64) -> IfaceBytes {
+    IfaceBytes {
+        name: IfaceName::new(name),
+        scope,
+        rx: Some(rx),
+        tx: Some(tx),
+    }
 }
 
 #[test]
@@ -160,6 +225,203 @@ fn collector_passes_through_transport_truncation_and_reuses_sample_buffers() {
     }
     assert_eq!(collector.sockets.capacity(), socket_capacity);
     assert_eq!(collector.rtts.capacity(), rtt_capacity);
+}
+
+#[test]
+fn socket_attribution_and_physical_remainder_share_the_dump_interval() {
+    let opens = Arc::new(AtomicUsize::new(0));
+    let first = vec![
+        tcp_with_counters(11, 101, 1_000, 500),
+        tcp_with_counters(12, 202, 2_000, 900),
+    ];
+    let second = vec![
+        tcp_with_counters(11, 101, 1_125, 560),
+        tcp_with_counters(12, 202, 2_240, 1_000),
+    ];
+    let third = vec![
+        tcp_with_counters(11, 101, 100_000, 100_000),
+        tcp_with_counters(12, 202, 100_000, 100_000),
+    ];
+    let fourth = vec![
+        tcp_with_counters(11, 101, 101_000, 101_000),
+        tcp_with_counters(12, 202, 102_000, 102_000),
+    ];
+    let transport = FakeTransport {
+        sockets: Vec::new(),
+        open_error: None,
+        opens,
+        malformed: 0,
+        truncated: false,
+        opened: false,
+        dump_error: None,
+        batches: vec![first, second, third, fourth],
+    };
+    let physical = FakePhysical {
+        batches: VecDeque::from([
+            vec![iface(b"eth0", Scope::Physical, 10_000, 20_000)],
+            vec![iface(b"eth0", Scope::Physical, 10_500, 20_300)],
+            vec![iface(b"eth0", Scope::Physical, 10_501, 20_301)],
+        ]),
+    };
+    let mut collector = NetSocketsCollector::<FakeCgroupFs>::with_parts(
+        Box::new(transport),
+        Box::new(physical),
+        vec![PathBuf::from("/fake")],
+        Box::new(|| FakeCgroupFs),
+    );
+    let mut frame = MonitorFrame::default();
+    collector
+        .sample(
+            &TickCtx {
+                now_ms: 5_000,
+                ..Default::default()
+            },
+            &mut frame,
+        )
+        .unwrap();
+    let baseline = &frame.parts.net_sockets;
+    assert!(baseline.attribution_interval_ms.is_none());
+    assert!(!baseline.physical_known);
+    assert_eq!(baseline.attribution.owners.len(), 2);
+    assert!(!baseline.attribution.truncated);
+    assert!(
+        baseline
+            .attribution
+            .owners
+            .iter()
+            .all(|owner| owner.rx_bytes == 0 && owner.tx_bytes == 0)
+    );
+
+    collector
+        .sample(
+            &TickCtx {
+                now_ms: 10_000,
+                ..Default::default()
+            },
+            &mut frame,
+        )
+        .unwrap();
+    let part = &frame.parts.net_sockets;
+    assert_eq!(part.attribution_interval_ms, Some(5_000));
+    assert!(part.physical_known);
+    assert!(!part.attribution.truncated);
+    assert_eq!(part.attribution.owners.len(), 2);
+    assert_eq!(
+        (
+            part.attribution.owners[0].rx_bytes,
+            part.attribution.owners[0].tx_bytes
+        ),
+        (125, 60)
+    );
+    assert_eq!(
+        (
+            part.attribution.owners[1].rx_bytes,
+            part.attribution.owners[1].tx_bytes
+        ),
+        (240, 100)
+    );
+    assert_eq!(
+        (
+            part.attribution.unattributed_rx,
+            part.attribution.unattributed_tx
+        ),
+        (135, 140)
+    );
+    let owner_capacity = part.attribution.owners.capacity();
+
+    collector
+        .sample(
+            &TickCtx {
+                now_ms: 15_000,
+                ..Default::default()
+            },
+            &mut frame,
+        )
+        .unwrap();
+    assert_eq!(
+        (
+            frame.parts.net_sockets.attribution.unattributed_rx,
+            frame.parts.net_sockets.attribution.unattributed_tx
+        ),
+        (0, 0)
+    );
+    assert_eq!(
+        frame.parts.net_sockets.attribution.owners.capacity(),
+        owner_capacity,
+        "owner capacity {}",
+        frame.parts.net_sockets.attribution.owners.capacity()
+    );
+
+    collector.close();
+    collector
+        .sample(
+            &TickCtx {
+                now_ms: 20_000,
+                ..Default::default()
+            },
+            &mut frame,
+        )
+        .unwrap();
+    assert!(frame.parts.net_sockets.attribution_interval_ms.is_none());
+    assert!(!frame.parts.net_sockets.physical_known);
+    assert_eq!(frame.parts.net_sockets.attribution.owners.len(), 2);
+    assert!(
+        frame
+            .parts
+            .net_sockets
+            .attribution
+            .owners
+            .iter()
+            .all(|owner| { owner.rx_bytes == 0 && owner.tx_bytes == 0 })
+    );
+}
+
+#[test]
+fn physical_deltas_ignore_loopback_new_links_and_counter_resets() {
+    let previous = [
+        iface(b"eth0", Scope::Physical, 100, 200),
+        iface(b"lo", Scope::Loopback, 500, 600),
+        iface(b"eth1", Scope::Physical, 1_000, 1_000),
+    ];
+    let current = [
+        iface(b"eth0", Scope::Physical, 150, 280),
+        iface(b"lo", Scope::Loopback, 900, 900),
+        iface(b"eth1", Scope::Physical, 20, 30),
+        iface(b"eth2", Scope::Physical, 5_000, 6_000),
+    ];
+    assert_eq!(physical_delta(&previous, &current), (50, 80));
+    let fallback_previous = [iface(b"veth1", Scope::Container, 100, 100)];
+    let fallback_current = [
+        iface(b"veth1", Scope::Container, 140, 150),
+        iface(b"lo", Scope::Loopback, 900, 900),
+    ];
+    assert_eq!(
+        physical_delta(&fallback_previous, &fallback_current),
+        (40, 50)
+    );
+}
+
+#[test]
+fn proc_netdev_reader_uses_the_shared_parser_and_excludes_loopback_scope() {
+    let dir = tempfile::tempdir().unwrap();
+    let proc_path = dir.path().join("net-dev-fixture");
+    let sysfs = dir.path().join("sys-class-net");
+    std::fs::create_dir(&sysfs).unwrap();
+    std::fs::write(
+        &proc_path,
+        b"Inter-| Receive | Transmit\n face |bytes packets errs drop fifo frame compressed multicast|bytes packets errs drop fifo colls carrier compressed\nlo: 100 1 0 0 0 0 0 0 200 1 0 0 0 0 0 0\neth0: 300 1 0 0 0 0 0 0 400 1 0 0 0 0 0 0\n",
+    )
+    .unwrap();
+    let mut reader = ProcNetDev::at(proc_path, sysfs);
+    let mut rows = Vec::with_capacity(2);
+    reader.read(&mut rows).unwrap();
+    assert_eq!(rows.len(), 2);
+    let loopback = rows
+        .iter()
+        .find(|row| row.name.as_str() == "lo")
+        .expect("lo row");
+    assert_eq!(loopback.scope, Scope::Loopback);
+    assert_eq!((loopback.rx, loopback.tx), (Some(100), Some(200)));
 }
 
 #[test]

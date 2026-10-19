@@ -59,12 +59,43 @@ pub(super) fn line(input: FooterInput<'_>) -> Line {
     // happen, so a pane-owned build is recognizably thegn's own.
     if let Some(c) = input.confirm {
         let msg = match c {
+            Confirm::SignalMenu { label, cursor, .. } => {
+                let entries = super::tabs::procs::menu_entries()
+                    .iter()
+                    .enumerate()
+                    .map(|(index, (key, name))| {
+                        let marker = if index == *cursor { '>' } else { ' ' };
+                        format!("{marker}{key} {name}")
+                    })
+                    .collect::<Vec<_>>()
+                    .join("  ");
+                return Line::split(
+                    vec![seg(Tok::Slot(S::Accent), format!("{label}: signal {entries}")).bold()],
+                    vec![ghost("Up/Down choose · Enter select · Esc cancel")],
+                );
+            }
             Confirm::Signal { label, stage, .. } => {
                 let verb = match stage {
-                    crate::platform::ProcSignal::Terminate => "terminate",
-                    crate::platform::ProcSignal::Kill => "KILL (no cleanup)",
+                    crate::platform::ProcSignal::Terminate => "terminate".to_string(),
+                    crate::platform::ProcSignal::Kill => "KILL (no cleanup)".to_string(),
+                    signal => format!("send SIG{} to", signal.label()),
                 };
                 format!("{verb} {label}?")
+            }
+            Confirm::SignalTree {
+                label,
+                targets,
+                excluded,
+            } => {
+                let cap = if *excluded > 0 {
+                    ", first 256 only"
+                } else {
+                    ""
+                };
+                format!(
+                    "TERM tree of {label}: {} sampled processes{cap}?",
+                    targets.len()
+                )
             }
             Confirm::Clean { label, .. } => format!("clean target/ in {label}?"),
             Confirm::Renice {

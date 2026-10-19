@@ -913,6 +913,8 @@ pub async fn main(
     // Startup orphan GC: remove any thegn containers whose worktrees no
     // longer exist in the DB. Best-effort; runs off-thread so launch is instant.
     {
+        let gc_wanted_without_repo_overlay = crate::sandbox_gc_gate::startup_gc_wanted(&cfg);
+        let startup_gc_cfg = cfg.clone();
         tokio::task::spawn_blocking(move || {
             let Ok(db) = thegn_core::db::Db::open() else {
                 return;
@@ -926,6 +928,17 @@ pub async fn main(
                 tracing::warn!(target: "thegn::sandbox", "orphan GC skipped: worktrees query failed");
                 return;
             };
+            if !gc_wanted_without_repo_overlay
+                && !crate::sandbox_gc_gate::repo_overlay_wants_startup_gc(
+                    &startup_gc_cfg,
+                    rows.iter()
+                        .map(|row| std::path::Path::new(&row.repo_root))
+                        .collect::<std::collections::BTreeSet<_>>(),
+                )
+            {
+                tracing::debug!(target: "thegn::sandbox", "orphan GC skipped: sandbox disabled");
+                return;
+            }
             let db_worktrees: Vec<String> = rows.into_iter().map(|r| r.worktree).collect();
             let removed = thegn_core::sandbox::run_gc(&db_worktrees);
             if !removed.is_empty() {
@@ -1101,7 +1114,9 @@ pub async fn main(
     // on PATH.
     let (sandbox_event_tx, sandbox_event_rx) =
         tokio_mpsc::unbounded_channel::<crate::sandbox_events::SandboxEventBatch>();
-    crate::sandbox_events::spawn(&cfg.sandbox, sandbox_event_tx);
+    crate::sandbox_gc_gate::with_startup_sandbox_events(&cfg, || {
+        crate::sandbox_events::spawn(&cfg.sandbox, sandbox_event_tx);
+    });
     // Drained in the event loop below (audit run.rs:825): a container event was
     // written to the DB, so mark the audit panel dirty. Draining also stops the
     // unbounded channel from growing for the process lifetime when the sidecar
@@ -8822,9 +8837,13 @@ async fn event_loop<T: Terminal>(
                 }
                 SidebarOutcome::PromptRename { gi, branch } => {
                     if let Some(g) = session.worktrees.get(gi) {
-                        let repo_root = thegn_core::repo::main_worktree(Path::new(&g.path))
-                            .map(|p| p.to_string_lossy().into_owned())
-                            .unwrap_or_else(|| g.path.clone());
+                        let repo_root = crate::handlers::sidebar_keys::resolve_repo_root(
+                            &model,
+                            &g.path,
+                            thegn_core::repo::main_worktree,
+                        )
+                        .map(|p| p.to_string_lossy().into_owned())
+                        .unwrap_or_else(|| g.path.clone());
                         host_input = Some((
                             menu::InputOverlay::new(format!("rename {branch}"), branch.clone()),
                             HostInputKind::RenameWorktree {
@@ -14275,8 +14294,8 @@ async fn event_loop<T: Terminal>(
             // vanishes when the user CLICKS it (that click's hydration reaps the
             // DB row underneath, so the tab appears to disappear on click).
             // Running it here — on the coalesced periodic model refresh — clears
-            // the ghost within a tick instead. Cheap and loop-safe: it early-
-            // returns unless a local group's dir is actually gone.
+            // the ghost within a tick instead. Steady state is stat-only on the
+            // background pool; SQLite is opened only when a candidate dir is missing.
             //
             // Gate on no creation in flight: an optimistically-opened tab has a
             // session group before its worktree dir is materialized (the rename/
@@ -14679,13 +14698,13 @@ async fn event_loop<T: Terminal>(
             crate::monitor::wants_container_stats(monitor.as_ref(), sandbox_section_now),
             std::sync::atomic::Ordering::Relaxed,
         );
-        let container_demand_now = crate::hydrate::ContainerDemand::resolve(
+        let container_demand_now = crate::sandbox_gc_gate::container_demand(
+            &current_config,
             chrome.panel.is_some(),
             monitor.is_some(),
             monitor.as_ref().is_some_and(|m| m.shows_containers()),
             sandbox_section_now,
-            thegn_core::sandbox::Backend::parse(&model.active_sandbox_backend)
-                .is_some_and(|b| b.is_oci()),
+            &model.active_sandbox_backend,
         );
         container_demand.store(
             container_demand_now.signal(),
@@ -21055,7 +21074,9 @@ async fn event_loop<T: Terminal>(
                     };
                     if let Some(p) = panes.table.get_mut(&target_pane) {
                         let app = p.emulator().application_cursor();
-                        if let Some(bytes) = crate::input::key_bytes_mode(&k.key, k.modifiers, app)
+                        let ext = p.query_parser.extended_keys();
+                        if let Some(bytes) =
+                            crate::input::key_bytes_pane(&k.key, k.modifiers, app, ext)
                         {
                             // best-effort: a locked-keys write to a congested or
                             // dead pane must NEVER tear down the compositor —
@@ -24287,9 +24308,13 @@ async fn event_loop<T: Terminal>(
                                             // (never silently crosses workspaces).
                                             match sb.new_worktree_target(&model, focus.sidebar()) {
                                                 NewWorktreeTarget::Root(root) => {
-                                                    if let Some(root) = thegn_core::repo::main_worktree(
-                                                        Path::new(&root),
-                                                    ) {
+                                                    let repo_root =
+                                                        crate::handlers::sidebar_keys::resolve_repo_root(
+                                                            &model,
+                                                            &root,
+                                                            thegn_core::repo::main_worktree,
+                                                        );
+                                                    if let Some(root) = repo_root {
                                                         begin_worktree_preset(
                                                             root,
                                                             name,
@@ -24322,8 +24347,10 @@ async fn event_loop<T: Terminal>(
                                                         .unwrap_or_default();
                                                     let repo_root = (!src_wt.is_empty())
                                                         .then(|| {
-                                                            thegn_core::repo::main_worktree(
-                                                                Path::new(&src_wt),
+                                                            crate::handlers::sidebar_keys::resolve_repo_root(
+                                                                &model,
+                                                                &src_wt,
+                                                                thegn_core::repo::main_worktree,
                                                             )
                                                         })
                                                         .flatten()
@@ -26080,8 +26107,12 @@ async fn event_loop<T: Terminal>(
                                 match sb.new_worktree_target(&model, focus.sidebar()) {
                                     NewWorktreeTarget::Root(root) => {
                                         let repo_root =
-                                            thegn_core::repo::main_worktree(Path::new(&root))
-                                                .map(|p| p.to_string_lossy().into_owned());
+                                            crate::handlers::sidebar_keys::resolve_repo_root(
+                                                &model,
+                                                &root,
+                                                thegn_core::repo::main_worktree,
+                                            )
+                                            .map(|p| p.to_string_lossy().into_owned());
                                         match (names.is_empty(), repo_root) {
                                             (true, _) => {
                                                 model.status =
@@ -26121,7 +26152,11 @@ async fn event_loop<T: Terminal>(
                                             .unwrap_or_default();
                                         let repo_root = (!src_wt.is_empty())
                                             .then(|| {
-                                                thegn_core::repo::main_worktree(Path::new(&src_wt))
+                                                crate::handlers::sidebar_keys::resolve_repo_root(
+                                                    &model,
+                                                    &src_wt,
+                                                    thegn_core::repo::main_worktree,
+                                                )
                                             })
                                             .flatten()
                                             .map(|p| p.to_string_lossy().into_owned());
@@ -26689,9 +26724,13 @@ async fn event_loop<T: Terminal>(
                                 // silently cross workspaces.
                                 match sb.new_worktree_target(&model, focus.sidebar()) {
                                     NewWorktreeTarget::Root(root) => {
-                                        if let Some(root) =
-                                            thegn_core::repo::main_worktree(Path::new(&root))
-                                        {
+                                        let repo_root =
+                                            crate::handlers::sidebar_keys::resolve_repo_root(
+                                                &model,
+                                                &root,
+                                                thegn_core::repo::main_worktree,
+                                            );
+                                        if let Some(root) = repo_root {
                                             begin_worktree_wizard(
                                                 root,
                                                 None,
@@ -26723,7 +26762,11 @@ async fn event_loop<T: Terminal>(
                                             .unwrap_or_default();
                                         let repo_root = (!src_wt.is_empty())
                                             .then(|| {
-                                                thegn_core::repo::main_worktree(Path::new(&src_wt))
+                                                crate::handlers::sidebar_keys::resolve_repo_root(
+                                                    &model,
+                                                    &src_wt,
+                                                    thegn_core::repo::main_worktree,
+                                                )
                                             })
                                             .flatten()
                                             .or_else(|| {
@@ -27475,13 +27518,19 @@ async fn event_loop<T: Terminal>(
                             .collect()
                     });
                 let target_pane = pty_target;
-                let app_cursor = panes
+                let pane_modes = panes
                     .table
                     .get(&target_pane)
-                    .map(|p| p.emulator().application_cursor())
-                    .unwrap_or(false);
-                let bytes = remapped
-                    .or_else(|| crate::input::key_bytes_mode(&k.key, k.modifiers, app_cursor));
+                    .map(|p| {
+                        (
+                            p.emulator().application_cursor(),
+                            p.query_parser.extended_keys(),
+                        )
+                    })
+                    .unwrap_or((false, false));
+                let bytes = remapped.or_else(|| {
+                    crate::input::key_bytes_pane(&k.key, k.modifiers, pane_modes.0, pane_modes.1)
+                });
                 if let Some(bytes) = bytes {
                     // Held-key autorepeat (typing, or arrow/nav keys consumed by
                     // the program inside the pane) floods the input queue. Without

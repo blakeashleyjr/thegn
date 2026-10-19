@@ -11,15 +11,16 @@ use crate::model::ProxyConfig;
 use crate::shared::SharedDb;
 use crate::upstream::Upstreams;
 
-/// Deadlines applied to upstream operations. TCP connect is capped at 10s.
-/// Buffered dispatches have a 300s total deadline, including response headers
-/// and body. Live streams have the configured first-byte deadline through the
-/// first usable event, then an idle deadline between events; their body is not
-/// subject to a client-wide total timeout.
+/// Upstream timeout policy: TCP connect is capped at 10s; buffered calls must
+/// receive headers within `relay.first_byte`, each body chunk within
+/// `relay.idle`, and finish within 300s total. Streams share `relay.first_byte`
+/// across opening headers and first usable output, then use `relay.idle` between
+/// chunks and terminate after `stream_total` even while data continues.
 #[derive(Debug, Clone, Copy)]
 pub struct UpstreamDeadlines {
     pub connect: std::time::Duration,
     pub buffered_total: std::time::Duration,
+    pub stream_total: std::time::Duration,
 }
 
 impl Default for UpstreamDeadlines {
@@ -27,6 +28,7 @@ impl Default for UpstreamDeadlines {
         Self {
             connect: std::time::Duration::from_secs(10),
             buffered_total: std::time::Duration::from_secs(300),
+            stream_total: std::time::Duration::from_secs(3600),
         }
     }
 }

@@ -281,7 +281,43 @@ impl GitLoc {
             .and_then(|db| db.location_for(&p).ok().flatten());
         Self::from_db(&p, loc.as_deref())
     }
+}
 
+/// Worktree path to persisted `location`, built from rows already loaded so
+/// hot loops can resolve locations without opening the database per row. A path
+/// with no row resolves local, as [`GitLoc::for_worktree`] does on a DB miss.
+#[derive(Debug, Clone, Default)]
+pub struct WorktreeLocations {
+    by_path: std::collections::HashMap<String, String>,
+}
+
+impl WorktreeLocations {
+    /// Build an index from worktree rows, skipping rows without a path.
+    pub fn from_rows(rows: &[crate::models::WorktreeRow]) -> Self {
+        Self::from_pairs(
+            rows.iter()
+                .map(|row| (row.worktree.as_str(), row.location.as_str())),
+        )
+    }
+
+    /// Build an index from path and location pairs, skipping empty paths.
+    pub fn from_pairs<'a>(pairs: impl IntoIterator<Item = (&'a str, &'a str)>) -> Self {
+        let by_path = pairs
+            .into_iter()
+            .filter(|(path, _)| !path.is_empty())
+            .map(|(path, location)| (path.to_owned(), location.to_owned()))
+            .collect();
+        Self { by_path }
+    }
+
+    /// Resolve a path using the indexed DB location, or local on a miss.
+    pub fn loc(&self, path: &Path) -> GitLoc {
+        let path = path.to_string_lossy().into_owned();
+        GitLoc::from_db(&path, self.by_path.get(&path).map(String::as_str))
+    }
+}
+
+impl GitLoc {
     /// Build from a worktree path + its DB `location` column value. Tries the
     /// provider blob first (has `control_prefix`), then the ssh blob (has
     /// `host`), then falls back to local — so existing local/ssh entries are
@@ -1934,5 +1970,63 @@ mod tests {
             .to_string_lossy()
             .into_owned();
         assert!(last.contains("cd /r/wt && gh pr view"));
+    }
+
+    #[test]
+    fn worktree_locations_match_gitloc_from_db_for_persisted_rows_and_misses() {
+        fn row(path: &str, location: &str, position: i64) -> crate::models::WorktreeRow {
+            crate::models::WorktreeRow {
+                worktree: path.into(),
+                branch: String::new(),
+                agent: String::new(),
+                created_at: 0,
+                repo_root: String::new(),
+                tab_name: String::new(),
+                session_name: String::new(),
+                location: location.into(),
+                position,
+                sandbox_backend: None,
+                observed_backend: None,
+                folder_id: None,
+                env_name: None,
+            }
+        }
+
+        let ssh = GitLoc::remote_db_string("box", 22, false, "/r/wt");
+        let provider =
+            GitLoc::provider_db_string(&["sprite".into(), "exec".into()], "/provider/wt");
+        let rows = [
+            row("/r/wt", &ssh, 0),
+            row("/provider/wt", &provider, 1),
+            row("/blank", "", 2),
+            row("/local", "local", 3),
+            row("", &ssh, 4),
+        ];
+        let locations = WorktreeLocations::from_rows(&rows);
+
+        let ssh_loc = locations.loc(Path::new("/r/wt"));
+        assert!(ssh_loc.is_remote());
+        assert_eq!(ssh_loc.path(), GitLoc::from_db("/r/wt", Some(&ssh)).path());
+        let provider_loc = locations.loc(Path::new("/provider/wt"));
+        assert!(provider_loc.is_remote());
+        assert_eq!(
+            provider_loc.path(),
+            GitLoc::from_db("/provider/wt", Some(&provider)).path()
+        );
+        for path in ["/blank", "/local", "/unknown"] {
+            assert!(matches!(locations.loc(Path::new(path)), GitLoc::Local(_)));
+            assert!(matches!(
+                GitLoc::from_db(
+                    path,
+                    match path {
+                        "/blank" => Some(""),
+                        "/local" => Some("local"),
+                        _ => None,
+                    }
+                ),
+                GitLoc::Local(_)
+            ));
+        }
+        assert!(!locations.by_path.contains_key(""));
     }
 }

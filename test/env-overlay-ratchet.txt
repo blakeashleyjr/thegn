@@ -133,8 +133,11 @@ forward.only
 forward.open_on_detect
 forward.poll_secs
 forward.range
+forward.reverse_idle_secs
+forward.reverse_lifetime_secs
 forward.reverse_max_connections
 forward.reverse_max_connections_total
+forward.reverse_write_stall_secs
 git.auto_fetch
 git.auto_fetch_colocated
 git.auto_fetch_interval_secs

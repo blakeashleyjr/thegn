@@ -1,6 +1,7 @@
 //! Cpu tab renderer and tab-specific monitor actions.
 
 use super::super::build::*;
+use super::super::{MonitorOutcome, MonitorOverlay};
 use crate::chrome::S;
 use crate::sections::{Cell, Section, TableSection, spacer};
 use crate::seg::Tok;
@@ -9,6 +10,22 @@ use thegn_core::theme::Hue;
 use thegn_core::viz::{self as viz, Unit};
 
 pub(in crate::monitor) mod view;
+
+impl MonitorOverlay {
+    pub(in crate::monitor) fn cpu_key(&mut self, key: char) -> MonitorOutcome {
+        if matches!(key, '\r' | '\n') {
+            self.cpu.toggle_core_detail();
+        }
+        MonitorOutcome::Pending
+    }
+}
+
+pub(super) fn hints(
+    _input: &super::super::footer::FooterInput<'_>,
+    out: &mut Vec<Vec<crate::seg::Seg>>,
+) {
+    out.push(super::super::footer::hint("↵", " core"));
+}
 
 pub(in crate::monitor) fn cpu(cx: &Ctx) -> Vec<Section> {
     let s = &cx.model.stats;
@@ -90,3 +107,7 @@ fn core_rows(cores: &[u8], cols: usize) -> Vec<Section> {
         sel: None,
     })]
 }
+
+#[cfg(test)]
+#[path = "cpu/cpu_drill_tests.rs"]
+mod drill_tests;

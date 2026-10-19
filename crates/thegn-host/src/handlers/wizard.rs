@@ -10,6 +10,15 @@ use tokio::task;
 use crate::chrome::FrameModel;
 use crate::wizard;
 
+fn known_workspace_slug<'a>(
+    workspaces: &'a [(String, String, String, String)],
+    root: &std::path::Path,
+) -> Option<&'a str> {
+    workspaces.iter().find_map(|(slug, _, _, repo_path)| {
+        (!repo_path.is_empty() && std::path::Path::new(repo_path) == root).then_some(slug.as_str())
+    })
+}
+
 /// Launch the new-worktree wizard + speculative-create worker against `root`.
 /// `base_override` forks from a chosen branch (item 52); `None` uses the
 /// configured/auto-resolved base. Shared by the `NewWorktree` action and the
@@ -40,6 +49,9 @@ pub(crate) fn begin_worktree_wizard(
     // user reads the form.
     *create_gen += 1;
     let mut w = wizard::NewWorktreeWizard::new(root.clone(), cfg);
+    if let Some(slug) = known_workspace_slug(&model.sidebar_workspaces, &root) {
+        w.set_repo_slug(slug.to_string());
+    }
     // Preselect the DB-aware ambient env (workspace layer shadows the repo
     // `.thegn.*` default) so "leave the default" means a clean inherit under
     // the register-time pin rule. One-shot best-effort DB read on a user
@@ -179,4 +191,41 @@ pub(crate) fn store_host_def(
     db.put_host_def(name, hc, now)
         .map_err(|error| error.to_string())?;
     db.host_defs().map_err(|error| format!("state db: {error}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::known_workspace_slug;
+    use std::path::Path;
+
+    #[test]
+    fn known_workspace_slug_matches_nonempty_repo_path() {
+        let workspaces = vec![(
+            "app-2".to_string(),
+            "App".to_string(),
+            "git".to_string(),
+            "/repos/app".to_string(),
+        )];
+
+        assert_eq!(
+            known_workspace_slug(&workspaces, Path::new("/repos/app")),
+            Some("app-2")
+        );
+        assert_eq!(
+            known_workspace_slug(&workspaces, Path::new("/repos/other")),
+            None
+        );
+    }
+
+    #[test]
+    fn known_workspace_slug_skips_empty_paths() {
+        let workspaces = vec![(
+            "stale".to_string(),
+            "Stale".to_string(),
+            "git".to_string(),
+            String::new(),
+        )];
+
+        assert_eq!(known_workspace_slug(&workspaces, Path::new("")), None);
+    }
 }

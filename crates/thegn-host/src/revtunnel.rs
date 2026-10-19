@@ -16,8 +16,11 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
+use thegn_core::config::TunnelDeadlineSecs;
 use thegn_svc::provider::{ExecSpec, Provider};
-use thegn_svc::revtunnel::{TcpDialer, clamp_permits, exec_stream, run_host_with_caps};
+use thegn_svc::revtunnel::{
+    HostLimits, TcpDialer, TunnelDeadlines, clamp_permits, exec_stream, run_host_with_limits,
+};
 use tokio::runtime::Handle;
 use tokio::sync::Semaphore;
 use tokio::task::JoinHandle;
@@ -97,6 +100,48 @@ fn next_backoff(session_lasted: Duration, current: Duration) -> Duration {
     }
 }
 
+pub(crate) struct TunnelRunLimits {
+    max_connections: usize,
+    global_permits: Arc<Semaphore>,
+    deadline_secs: TunnelDeadlineSecs,
+}
+
+fn host_deadlines(deadlines: TunnelDeadlineSecs) -> TunnelDeadlines {
+    TunnelDeadlines {
+        write_stall: Duration::from_secs(deadlines.write_stall),
+        idle: deadlines.idle.map(Duration::from_secs),
+        lifetime: deadlines.lifetime.map(Duration::from_secs),
+    }
+}
+
+fn bridge_argv(bridge_path: String, port: u16, deadlines: &TunnelDeadlineSecs) -> Vec<String> {
+    let defaults = thegn_core::config::ForwardConfig::default().tunnel_deadlines();
+    let mut argv = vec![
+        bridge_path,
+        "bridge-revtunnel".to_string(),
+        port.to_string(),
+    ];
+    if deadlines.write_stall != defaults.write_stall {
+        argv.extend([
+            "--write-stall-secs".to_string(),
+            deadlines.write_stall.to_string(),
+        ]);
+    }
+    if deadlines.idle != defaults.idle {
+        argv.extend([
+            "--idle-secs".to_string(),
+            deadlines.idle.unwrap_or(0).to_string(),
+        ]);
+    }
+    if deadlines.lifetime != defaults.lifetime {
+        argv.extend([
+            "--lifetime-secs".to_string(),
+            deadlines.lifetime.unwrap_or(0).to_string(),
+        ]);
+    }
+    argv
+}
+
 #[derive(Clone, Default)]
 pub struct ReverseTunnelSupervisor {
     tasks: Tasks,
@@ -139,8 +184,7 @@ impl ReverseTunnelSupervisor {
         bridge_path: String,
         sandbox_port: u16,
         host_target: String,
-        max_connections: usize,
-        global_permits: Arc<Semaphore>,
+        limits: TunnelRunLimits,
     ) {
         let key = (worktree.to_string(), sandbox_port);
         let mut tasks = match self.tasks.lock() {
@@ -152,11 +196,7 @@ impl ReverseTunnelSupervisor {
         }
         let task = handle.spawn(async move {
             let spec = ExecSpec {
-                argv: vec![
-                    bridge_path,
-                    "bridge-revtunnel".to_string(),
-                    sandbox_port.to_string(),
-                ],
+                argv: bridge_argv(bridge_path, sandbox_port, &limits.deadline_secs),
                 tty: false,
                 cols: 0,
                 rows: 0,
@@ -175,13 +215,16 @@ impl ReverseTunnelSupervisor {
                 match provider.open_exec(&sandbox_id, &spec).await {
                     Ok(session) => {
                         let stream = exec_stream(session);
-                        if let Err(e) = run_host_with_caps(
+                        if let Err(e) = run_host_with_limits(
                             stream,
                             TcpDialer {
                                 addr: host_target.clone(),
                             },
-                            max_connections,
-                            global_permits.clone(),
+                            HostLimits {
+                                max_connections: limits.max_connections,
+                                global_permits: limits.global_permits.clone(),
+                                deadlines: host_deadlines(limits.deadline_secs),
+                            },
                         )
                         .await
                         {
@@ -253,6 +296,7 @@ impl ReverseTunnelSupervisor {
             _ => return,
         };
         let max_connections = cfg.forward.reverse_max_connections;
+        let deadline_secs = cfg.forward.tunnel_deadlines();
         for (sandbox_port, host_target) in tunnels {
             let Some(provider) = crate::provider_factory::provider_for(pc) else {
                 return;
@@ -266,8 +310,11 @@ impl ReverseTunnelSupervisor {
                 crate::bridge_sup::remote_thegn(),
                 sandbox_port,
                 host_target,
-                max_connections,
-                global_permits.clone(),
+                TunnelRunLimits {
+                    max_connections,
+                    global_permits: global_permits.clone(),
+                    deadline_secs,
+                },
             );
         }
     }
@@ -306,6 +353,95 @@ mod tests {
         assert_eq!(reset, BACKOFF_BASE);
         let reset_longer = next_backoff(Duration::from_secs(300), b2);
         assert_eq!(reset_longer, BACKOFF_BASE);
+    }
+
+    #[test]
+    fn bridge_argv_only_adds_nondefault_deadline_flags() {
+        let defaults = thegn_core::config::ForwardConfig::default().tunnel_deadlines();
+        assert_eq!(
+            bridge_argv("/bridge".to_string(), 8383, &defaults),
+            vec![
+                "/bridge".to_string(),
+                "bridge-revtunnel".to_string(),
+                "8383".to_string(),
+            ]
+        );
+
+        let cases = [
+            (
+                TunnelDeadlineSecs {
+                    write_stall: 5,
+                    ..defaults
+                },
+                vec![
+                    "/bridge",
+                    "bridge-revtunnel",
+                    "8383",
+                    "--write-stall-secs",
+                    "5",
+                ],
+            ),
+            (
+                TunnelDeadlineSecs {
+                    idle: None,
+                    ..defaults
+                },
+                vec!["/bridge", "bridge-revtunnel", "8383", "--idle-secs", "0"],
+            ),
+            (
+                TunnelDeadlineSecs {
+                    lifetime: None,
+                    ..defaults
+                },
+                vec![
+                    "/bridge",
+                    "bridge-revtunnel",
+                    "8383",
+                    "--lifetime-secs",
+                    "0",
+                ],
+            ),
+            (
+                TunnelDeadlineSecs {
+                    write_stall: 5,
+                    idle: None,
+                    lifetime: Some(9),
+                },
+                vec![
+                    "/bridge",
+                    "bridge-revtunnel",
+                    "8383",
+                    "--write-stall-secs",
+                    "5",
+                    "--idle-secs",
+                    "0",
+                    "--lifetime-secs",
+                    "9",
+                ],
+            ),
+        ];
+        for (deadlines, expected) in cases {
+            assert_eq!(
+                bridge_argv("/bridge".to_string(), 8383, &deadlines),
+                expected.into_iter().map(String::from).collect::<Vec<_>>()
+            );
+        }
+    }
+
+    #[test]
+    fn host_deadline_conversion_preserves_config_zero_rules() {
+        assert_eq!(
+            host_deadlines(TunnelDeadlineSecs {
+                write_stall: 60,
+                idle: None,
+                lifetime: Some(9),
+            }),
+            TunnelDeadlines {
+                write_stall: Duration::from_secs(60),
+                idle: None,
+                lifetime: Some(Duration::from_secs(9)),
+            }
+        );
     }
 
     #[test]

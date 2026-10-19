@@ -15,17 +15,18 @@
 //! that, so the conversion can be aimed at the sites that actually stall rather
 //! than applied to all of them on principle.
 //!
-//! # Loop-thread only
+//! # Loop-thread attribution
 //!
-//! Background opens are fine by construction: that is where slow work belongs.
-//! Only an open on the loop can freeze a frame, so only the loop is counted,
-//! which keeps the numbers meaningful instead of being dominated by scanners.
+//! The per-site table and timings attribute only opens on the loop, since those
+//! can freeze a frame. A separate total counter counts opens on every thread
+//! for tests and diagnostics without adding per-open attribution overhead.
 //!
 //! `thegn-core` is substrate-free, so the loop cannot be identified by any
 //! runtime handle — the host marks it once at startup with [`mark_loop_thread`]
 //! and everything here compares `ThreadId`.
 //!
-//! Free when unused: an unmarked process takes one relaxed load and returns.
+//! Every open takes one relaxed increment; an unmarked process does no timing,
+//! locking, or call-site attribution.
 
 use std::panic::Location;
 use std::sync::Mutex;
@@ -37,6 +38,7 @@ const SITE_CAPACITY: usize = 16;
 static LOOP_THREAD: std::sync::OnceLock<std::thread::ThreadId> = std::sync::OnceLock::new();
 
 static CALLS: AtomicU64 = AtomicU64::new(0);
+static ALL_OPENS: AtomicU64 = AtomicU64::new(0);
 static TOTAL_US: AtomicU64 = AtomicU64::new(0);
 static MAX_US: AtomicU64 = AtomicU64::new(0);
 static SITES: Mutex<SiteTable> = Mutex::new(SiteTable::new());
@@ -126,6 +128,7 @@ fn on_loop_thread() -> bool {
 /// Takes the duration rather than timing internally so the caller brackets
 /// exactly the work it means to measure.
 pub fn record_open(micros: u64, location: &'static Location<'static>) {
+    ALL_OPENS.fetch_add(1, Ordering::Relaxed);
     if !on_loop_thread() {
         return;
     }
@@ -136,6 +139,11 @@ pub fn record_open(micros: u64, location: &'static Location<'static>) {
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .record(location, micros);
+}
+
+/// Total database opens observed on all threads since process start.
+pub fn total_opens() -> u64 {
+    ALL_OPENS.load(Ordering::Relaxed)
 }
 
 /// Loop-thread database opens observed so far.
@@ -251,6 +259,21 @@ mod tests {
             before, after,
             "a thread that was never marked as the loop must not be counted"
         );
+    }
+
+    #[test]
+    fn all_thread_counter_counts_opens_from_an_unmarked_thread() {
+        let before = total_opens();
+        std::thread::scope(|scope| {
+            scope
+                .spawn(|| {
+                    record_open(1_000, Location::caller());
+                    record_open(9_999, Location::caller());
+                })
+                .join()
+                .unwrap();
+        });
+        assert!(total_opens() - before >= 2);
     }
 
     #[test]
