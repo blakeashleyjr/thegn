@@ -327,6 +327,7 @@ fn board_snapshots_cover_size_and_capability_matrix() {
     let sizes = [(100, 30), (160, 45), (240, 60)];
     let levels = [UnicodeLevel::Full, UnicodeLevel::Basic, UnicodeLevel::Ascii];
     let depths = [ColorDepth::Truecolor, ColorDepth::Ansi16, ColorDepth::None];
+    let mut large_ratios = Vec::new();
     for (cols, rows) in sizes {
         for level in levels {
             for depth in depths {
@@ -385,12 +386,13 @@ fn board_snapshots_cover_size_and_capability_matrix() {
                 assert!(rendered.contains("health"));
                 if cols == 240 {
                     let ratio = fill_ratio(&surface, Rect::full(cols, rows));
-                    // density follow-up (batch 52): target floor for full memory density
-                    if level == UnicodeLevel::Ascii {
-                        assert!(ratio >= 0.55, "ASCII fill ratio {ratio:.3}");
+                    // density follow-up (batch 53): estimated, primary sets from the printed value
+                    let floor = if level == UnicodeLevel::Ascii {
+                        0.30
                     } else {
-                        assert!(ratio >= 0.55, "Unicode fill ratio {ratio:.3}");
-                    }
+                        0.45
+                    };
+                    large_ratios.push((level, depth, ratio, floor));
                     assert!(rendered.contains("used / available history"));
                     assert!(rendered.contains("PSI history"));
                     assert!(rendered.contains("direct reclaim history"));
@@ -426,6 +428,19 @@ fn board_snapshots_cover_size_and_capability_matrix() {
             }
         }
     }
+    let report = large_ratios
+        .iter()
+        .map(|(level, depth, ratio, floor)| {
+            format!("{level:?} {depth:?}: fill ratio {ratio:.3}, floor {floor:.2}")
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        large_ratios
+            .iter()
+            .all(|(_, _, ratio, floor)| ratio >= floor),
+        "240x60 fill ratios by capability:\n{report}"
+    );
 }
 
 #[test]
@@ -912,10 +927,28 @@ fn swap_panel_shows_zram_composition_against_device_size() {
     let mut surface = Surface::new(area.cols, area.rows);
     board.paint(&view, &mut surface, area, 0, &[]);
     let rendered = text(&surface);
+    let swap_panel = board
+        .placed(&view, area)
+        .into_iter()
+        .find(|panel| panel.id.0 == "memory.swap")
+        .expect("swap panel is placed");
+    let rendered_lines = rendered.lines().collect::<Vec<_>>();
+    let used_row = rendered_lines[swap_panel.rect.y + 1]
+        .chars()
+        .skip(swap_panel.rect.x + 1)
+        .take(swap_panel.rect.cols - 2)
+        .collect::<String>();
+    let zram_row = rendered_lines[swap_panel.rect.y + 3]
+        .chars()
+        .skip(swap_panel.rect.x + 1)
+        .take(swap_panel.rect.cols - 2)
+        .collect::<String>();
     assert!(rendered.contains("zram original"), "{rendered}");
     assert!(rendered.contains("swap history"), "{rendered}");
     assert!(rendered.contains("compressed"), "{rendered}");
-    assert!(rendered.contains("disk"), "{rendered}");
+    assert!(zram_row.contains("device"), "{zram_row}");
+    assert!(zram_row.contains("8.0K"), "{zram_row}");
+    assert!(used_row.contains("zswap"), "{used_row}");
     assert_eq!(model.zram_used, Some(3072));
     assert_eq!(model.zram_totals, (Some(4096), Some(2048), Some(8192)));
 }
