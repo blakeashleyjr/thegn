@@ -31,10 +31,14 @@ pub struct GridPos {
     pub h: u32,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Target {
     pub expr: String,
     pub ref_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub alias: Option<String>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub hide: bool,
 }
 
 /// The zero-config dashboard: live host CPU / memory / load, sampled locally by
@@ -51,6 +55,7 @@ pub fn builtin_host_dashboard() -> Dashboard {
         targets: vec![Target {
             ref_id: "A".to_string(),
             expr: expr.to_string(),
+            ..Target::default()
         }],
     };
     Dashboard {
@@ -146,5 +151,60 @@ expr = "cpu_usage"
         assert_eq!(p.panel_type, "timeseries");
         assert_eq!(p.grid_pos.w, 12);
         assert_eq!(p.targets[0].expr, "cpu_usage");
+        assert_eq!(p.targets[0].alias, None);
+        assert!(!p.targets[0].hide);
+    }
+
+    #[test]
+    fn target_alias_and_hide_round_trip_and_default_fields_are_omitted() {
+        let dashboard: Dashboard = toml::from_str(
+            r#"
+title = "T"
+[[panels]]
+id = 1
+title = "P"
+type = "stat"
+[panels.grid_pos]
+x = 0
+y = 0
+w = 4
+h = 4
+[[panels.targets]]
+ref_id = "A"
+expr = "x"
+alias = "p99"
+hide = true
+"#,
+        )
+        .unwrap();
+        let target = &dashboard.panels[0].targets[0];
+        assert_eq!(target.alias.as_deref(), Some("p99"));
+        assert!(target.hide);
+
+        let omitted: Dashboard = toml::from_str(
+            r#"
+title = "T"
+[[panels]]
+id = 1
+title = "P"
+type = "stat"
+[panels.grid_pos]
+x = 0
+y = 0
+w = 4
+h = 4
+[[panels.targets]]
+ref_id = "A"
+expr = "x"
+"#,
+        )
+        .unwrap();
+        let target = &omitted.panels[0].targets[0];
+        assert_eq!(target.alias, None);
+        assert!(!target.hide);
+
+        let serialized = toml::to_string(&Target::default()).unwrap();
+        assert!(!serialized.contains("alias"));
+        assert!(!serialized.contains("hide"));
     }
 }
