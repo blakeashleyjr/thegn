@@ -86,16 +86,19 @@ fn make_collector(io: FakeIo) -> FilesystemsCollector<FakeIo> {
 }
 fn sample(collector: &mut impl Collector, at_ms: u64) -> MonitorFrame {
     let mut frame = MonitorFrame::default();
+    sample_into(collector, &mut frame, at_ms);
+    frame
+}
+fn sample_into(collector: &mut impl Collector, frame: &mut MonitorFrame, at_ms: u64) {
     collector
         .sample(
             &TickCtx {
                 tick: 0,
                 now_ms: at_ms,
             },
-            &mut frame,
+            frame,
         )
         .unwrap();
-    frame
 }
 
 #[test]
@@ -261,6 +264,41 @@ fn deduplicates_superblocks_filters_pseudo_keeps_network_without_statvfs_and_reu
     assert_eq!(collector.io.reads, 1);
     let _next = sample(&mut collector, 40_200);
     assert_eq!(collector.io.reads, 1);
+}
+
+#[test]
+fn counts_further_mounts_for_each_kept_superblock_row() {
+    let io = FakeIo {
+        mountinfo: [
+            mount(1, "8:1", "/data", "ext4", "/dev/a", "rw"),
+            mount(2, "8:1", "/bind-a", "ext4", "/dev/a", "rw"),
+            mount(3, "8:1", "/bind-b", "ext4", "/dev/a", "rw"),
+            mount(4, "8:2", "/other", "ext4", "/dev/b", "rw"),
+        ]
+        .concat(),
+        ..FakeIo::default()
+    };
+    let mut collector = make_collector(io);
+    assert_eq!(collector.discover(&Env::default()), Health::Ok);
+
+    let mut frame = sample(&mut collector, 40_000);
+    assert_eq!(frame.parts.filesystems.rows.len(), 2);
+    assert_eq!(frame.parts.filesystems.rows[0].mount_point, "/data");
+    assert_eq!(frame.parts.filesystems.rows[0].extra_mounts, 2);
+    assert_eq!(frame.parts.filesystems.rows[1].mount_point, "/other");
+    assert_eq!(frame.parts.filesystems.rows[1].extra_mounts, 0);
+
+    collector.io.mountinfo = [
+        mount(1, "8:1", "/data", "ext4", "/dev/a", "rw"),
+        mount(2, "8:1", "/bind-a", "ext4", "/dev/a", "rw"),
+        mount(3, "8:1", "/bind-b", "ext4", "/dev/a", "rw"),
+        mount(4, "8:1", "/bind-c", "ext4", "/dev/a", "rw"),
+        mount(5, "8:2", "/other", "ext4", "/dev/b", "rw"),
+    ]
+    .concat();
+    collector.io.changed = true;
+    sample_into(&mut collector, &mut frame, 40_100);
+    assert_eq!(frame.parts.filesystems.rows[0].extra_mounts, 3);
 }
 
 #[test]

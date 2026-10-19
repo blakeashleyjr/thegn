@@ -84,7 +84,7 @@ at the normal, non-live rate, so resuming shows no gap; the monitor's detailed
 sampler stops until you resume. That makes a paused monitor cheaper than a live
 one.
 
-On the Overview, CPU, Memory, Thermal, Network and Power tabs, and on the GPU
+On the Overview, CPU, Memory, Thermal, Network, Disk and Power tabs, and on the GPU
 tab when an amdgpu device is present, the sampler reads only what the panels
 on screen need. The other tabs, and the GPU tab on other hardware (where it
 keeps the NVML-backed sections), still read every collector.
@@ -171,30 +171,37 @@ The network masthead chip expands into this tab.
 
 ## Disk
 
-The Disk tab shows live disk I/O and per-volume free space at the top. When
-several mount points belong to one device, `+N` means N additional mount points
-are folded into that row; I/O is counted once per physical disk. Below is a
-**worktree lane**: each worktree's total size and its reclaimable `target/`
-share, biggest first, with how long ago each was measured. The sizes come from
-the background `[disk]` scanner's cache — opening the tab never starts a `du`
-walk, and a stale row shows its age rather than blocking on a rescan.
+The Disk tab is a panel board. `disk.io` shows aggregate read/write throughput
+and its selected-window history with the actual peak values and units. `disk.pressure`
+shows I/O PSI on a 0–100% scale. `disk.devices` shows device rates and utilization
+with each trend's peak labeled. `disk.filesystems` shows each mount point,
+filesystem type, used/total space, and a fill gauge; `+N` marks further mount
+points of the same superblock folded into that row. `disk.slice` shows thegn.slice
+I/O totals, interval rates, and their actual history peaks. Each placed panel
+requests only its own collectors; `disk.worktrees` uses the background `[disk]`
+scanner cache and requests no collector.
 
-`x` cleans the selected worktree's `target/` (the manual sibling of
-`[disk] auto_clean_on_merge`), after a confirmation. The checkout is kept; only
-regenerable build artifacts go, off the event loop, and the row updates after
-the next measurement. As on Processes, the arrows and `j`/`k` move the row
-cursor and the lane scrolls to follow it, so `x` acts on the worktree you can
-see highlighted rather than on one that scrolled away.
+`disk.worktrees` lists total size, reclaimable `target/` size, and measurement
+age; its title gives the total reclaimable amount. An empty cache says “no cached
+sizes yet”. Opening the tab never starts a `du` walk, and a stale row shows its
+age rather than blocking on a rescan. `j`/`k` and the arrows move the highlighted
+worktree, and the panel scrolls to keep that row visible. `x` opens the existing
+clean confirmation for the highlighted row. Cleaning keeps the checkout and
+removes only regenerable build artifacts off the event loop; the row updates
+after the next measurement. Use `f`/`F` to move panel focus, `z` to zoom, and
+`Esc` to unzoom before closing the monitor.
 
-When the recorded free-space trend is clearly downward, the worktrees-filesystem
-heading also shows a **time-to-full projection** ("filling · full in ~2d"). It
-is deliberately conservative: with a flat or growing disk, or too little history
-to extrapolate honestly, it shows nothing rather than a confident wrong number.
-The optional `[stats.alerts] disk_eta` rule (off by default) fires off the same
-projection when the runway drops below a configured number of hours. The Disk
-masthead chip expands into this tab.
+The Worktrees panel lists each cached worktree's total size, reclaimable
+`target/` size, and measurement age, and its title gives the total reclaimable
+amount. It does not show a time-to-full projection. The optional
+`[stats.alerts] disk_eta` rule (off by default) still uses the recorded
+free-space history and fires when its runway drops below the configured number
+of hours. The Disk masthead chip expands into this tab.
 
-The `worktrees filesystem` block reports total, available, and used space.
+The Filesystems panel shows each mount point, filesystem type, used/total
+space, and a fill gauge. It does not show available space as a separate
+column. `+N` marks further mount points of the same superblock folded into that
+row.
 On Linux, `thegn doctor` also reports Disk health from UDisks2 when available,
 including health, critical warnings, wear, spare, read/write totals, power-on
 time, and the last four serial characters. Missing serial or health values
