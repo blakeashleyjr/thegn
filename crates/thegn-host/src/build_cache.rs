@@ -116,18 +116,6 @@ pub(crate) fn sandbox_cache_doctor_json(
     let data_path = sandbox_sccache_dir(cfg, &repo);
     let host_binary = thegn_core::util::which_path("sccache");
     let host_available = host_binary.is_some();
-    let devshell_wrapper = cfg
-        .sandbox
-        .inject_devshell
-        .then(|| thegn_core::devenv::cached(&repo))
-        .flatten()
-        .and_then(|shell| {
-            shell
-                .vars
-                .into_iter()
-                .find(|(key, _)| key == "RUSTC_WRAPPER")
-                .map(|(_, value)| value)
-        });
     let data_exists = data_path.as_ref().is_some_and(|p| Path::new(p).is_dir());
     let data_read_only = data_path
         .as_ref()
@@ -169,7 +157,8 @@ pub(crate) fn sandbox_cache_doctor_json(
         "source_trace": source_trace,
         "candidate_inputs": {
             "disk_sccache": cfg.disk.sccache,
-            "devshell_wrapper": devshell_wrapper,
+            // The devShell sanitizer never passes RUSTC_WRAPPER.
+            "devshell_wrapper": serde_json::Value::Null,
             "process_wrapper": std::env::var("RUSTC_WRAPPER")
                 .ok()
                 .filter(|value| !value.trim().is_empty()),

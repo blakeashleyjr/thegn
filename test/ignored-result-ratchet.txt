@@ -84,7 +84,6 @@ crates/thegn-core/src/db_usage.rs
 crates/thegn-core/src/db_zones.rs
 crates/thegn-core/src/devcontainer_overlay.rs
 crates/thegn-core/src/devcontainer.rs
-crates/thegn-core/src/devenv.rs
 crates/thegn-core/src/diagnostics.rs
 crates/thegn-core/src/diff_highlight.rs
 crates/thegn-core/src/disk.rs
