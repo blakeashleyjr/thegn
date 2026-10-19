@@ -477,7 +477,7 @@ mod tests {
             sha256: "a4895eb44afc336fecbba6e520cd67e178dace0276655d102fceffa8e5f70570".into(),
         }];
         let script = replay_script_verified("/wd", "/tmp/op", &manifest, None, true, true, "done");
-        let manifest_failure = script.rfind("fail artifact_validation;").unwrap();
+        let manifest_failure = script.find("fail artifact_validation; if [ ! -s").unwrap();
         let first_file_check = script.find("[ ! -s").unwrap();
         assert!(manifest_failure < first_file_check);
     }
