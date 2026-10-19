@@ -115,7 +115,8 @@ fn snapshots_cover_sizes_capabilities_and_static_demand() {
         model.absorb_frame(&frame(tick, &current));
     }
     let inventory = inventory();
-    let view = ContainersView::new(&model, &inventory);
+    let view = ContainersView::new(&model, &inventory, None, 0);
+    let mut ratios = Vec::new();
     for (cols, rows) in [(100, 30), (160, 45), (240, 60)] {
         for (unicode, depth) in [
             (UnicodeLevel::Full, ColorDepth::Truecolor),
@@ -147,19 +148,18 @@ fn snapshots_cover_sizes_capabilities_and_static_demand() {
                     if unicode == UnicodeLevel::Ascii {
                         assert!(output.is_ascii());
                     }
-                    if cols == 240 {
-                        let fill = fill_ratio(&surface, area);
-                        // density follow-up (batch 52): measured 0.288 Full (truecolor and
-                        // 16-colour), 0.402 ASCII at 240x60; the floor is the honest minimum.
-                        assert!(
-                            fill >= 0.28,
-                            "fill ratio {fill:.3} at {cols}x{rows} {unicode:?}/{depth:?}"
-                        );
-                    }
+                    ratios.push((cols, rows, unicode, depth, fill_ratio(&surface, area)));
                 })
             });
         }
     }
+    assert!(
+        ratios
+            .iter()
+            .filter(|(cols, _, _, _, _)| *cols == 240)
+            .all(|(_, _, _, _, ratio)| *ratio >= 0.28),
+        "fill ratios by size/colour/unicode: {ratios:?}"
+    );
 }
 
 #[test]
@@ -234,7 +234,7 @@ fn totals_ignore_missing_metric_rows_and_table_pids_keep_their_column() {
         model.absorb_frame(&stats);
     }
     let inventory = inventory();
-    let view = ContainersView::new(&model, &inventory);
+    let view = ContainersView::new(&model, &inventory, None, 0);
     let mut surface = Surface::new(240, 60);
     let board = Board::default();
     let area = Rect::full(240, 60);
@@ -265,7 +265,7 @@ fn history_right_edge_tracks_the_newest_sample_and_holds_an_interior_gap() {
         model.absorb_frame(&frame(tick, &ids));
     }
     let inventory = inventory();
-    let view = ContainersView::new(&model, &inventory);
+    let view = ContainersView::new(&model, &inventory, None, 0);
     let board = Board::default();
     let area = Rect::full(240, 60);
     let placed = board.placed(&view, area);
@@ -297,7 +297,7 @@ fn history_right_edge_tracks_the_newest_sample_and_holds_an_interior_gap() {
     let mut ordered = [f32::NAN; super::HISTORY_CAP];
     let len = model.cpu_total.ordered(&mut ordered);
     assert_eq!(ordered[len - 1], ordered[len - 2]);
-    let gap_view = ContainersView::new(&model, &inventory);
+    let gap_view = ContainersView::new(&model, &inventory, None, 0);
     let mut gap_surface = Surface::new(240, 60);
     caps::test_override::with_unicode(UnicodeLevel::Full, || {
         board.paint(&gap_view, &mut gap_surface, area, 0, &[])
@@ -384,7 +384,7 @@ fn absent_health_and_unknown_container_metrics_keep_absent_marks() {
     absent.health[CollectorId::ContainersStats.index()] =
         Health::Absent(thegn_metrics::collect::health::Absent::NoHardware);
     model.absorb_frame(&absent);
-    let view = ContainersView::new(&model, &[]);
+    let view = ContainersView::new(&model, &[], None, 0);
     let mut surface = Surface::new(100, 30);
     Board::default().paint(&view, &mut surface, Rect::full(100, 30), 0, &[]);
     let output = text(&surface);
@@ -400,7 +400,7 @@ fn absent_health_and_unknown_container_metrics_keep_absent_marks() {
     reading.io_write_bps = None;
     let mut model = ContainersModel::default();
     model.absorb_frame(&unknown);
-    let view = ContainersView::new(&model, &[]);
+    let view = ContainersView::new(&model, &[], None, 0);
     let mut surface = Surface::new(100, 30);
     Board::default().paint(&view, &mut surface, Rect::full(100, 30), 0, &[]);
     let output = text(&surface);

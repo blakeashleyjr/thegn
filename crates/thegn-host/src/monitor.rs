@@ -454,6 +454,8 @@ pub struct MonitorOverlay {
     /// Owned + foreign container rows behind the Containers tab, cached at
     /// rebuild so a key handler can resolve `sel` without a model borrow.
     container_rows: Vec<ContainerRowMeta>,
+    container_inventory: Vec<thegn_core::sandbox::ContainerInfo>,
+    container_footprint: Option<thegn_core::sandbox_manage::ContainerFootprint>,
     /// An action for the loop to perform (clean, or a Containers row action);
     /// drained via [`Self::take_action`]. ONE slot for both families — a key
     /// raises at most one action, and the loop drains after every keystroke.
@@ -492,6 +494,7 @@ pub struct MonitorOverlay {
     memory: tabs::memory::view::MemoryModel,
     thermal: tabs::thermal::view::ThermalModel,
     disk: tabs::disk::view::DiskModel,
+    containers: tabs::containers::view::ContainersModel,
 }
 
 impl MonitorOverlay {
@@ -533,6 +536,8 @@ impl MonitorOverlay {
             process_body: None,
             disk_rows: Vec::new(),
             container_rows: Vec::new(),
+            container_inventory: Vec::new(),
+            container_footprint: None,
             confirm: None,
             last_termed: None,
             status: None,
@@ -557,6 +562,7 @@ impl MonitorOverlay {
             memory: tabs::memory::view::MemoryModel::default(),
             thermal: tabs::thermal::view::ThermalModel::default(),
             disk: tabs::disk::view::DiskModel::default(),
+            containers: tabs::containers::view::ContainersModel::default(),
         };
         ov.rebuild(model, ctx, false);
         ov
@@ -655,6 +661,14 @@ impl MonitorOverlay {
                 &self.disk_rows,
                 self.sel,
             )),
+            MonitorTab::Containers => {
+                board::ActiveView::Containers(tabs::containers::view::ContainersView::new(
+                    &self.containers,
+                    &self.container_inventory,
+                    self.container_footprint,
+                    self.sel,
+                ))
+            }
             _ => board::ActiveView::for_tab(self.tab, &self.overview),
         }
     }
@@ -691,6 +705,10 @@ impl MonitorOverlay {
         }
         if self.tab == MonitorTab::Disk {
             self.disk.absorb_frame(frame);
+            return true;
+        }
+        if self.tab == MonitorTab::Containers {
+            self.containers.absorb_frame(frame);
             return true;
         }
         self.overview.absorb_frame(frame);
@@ -767,6 +785,8 @@ impl MonitorOverlay {
         // without a model borrow.
         if self.tab == MonitorTab::Containers {
             self.container_rows = tabs::containers::row_meta(model);
+            self.container_inventory.clone_from(&model.containers);
+            self.container_footprint = model.container_footprint;
         }
         self.clamp_sel();
         // Bind the build to a local so the immutable borrows of `self.proc_rows`

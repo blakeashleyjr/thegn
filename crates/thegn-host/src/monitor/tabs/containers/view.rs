@@ -1,12 +1,15 @@
-#![allow(dead_code)] // wiring waits for V-CTR-1b
-
 use crate::{
     compositor::Rect,
     monitor::{
         board::TabView,
         graphs,
-        kit::{emit::Emitter, grid::CellGrid, panel},
+        kit::{
+            emit::Emitter,
+            grid::{CellGrid, CellStyle},
+            panel,
+        },
         layout::{Node, PanelId, PanelSpec, Placed, Size, Variant, VariantKind},
+        seg::StyleTok,
     },
     sections::Section,
 };
@@ -15,7 +18,8 @@ use termwiz::surface::Surface;
 use thegn_core::{
     numfmt::{Marks, NumFmt, Reading, Unit, ZeroStyle},
     sandbox::ContainerInfo,
-    theme::RampId,
+    sandbox_manage::{ContainerFootprint, Health as ContainerHealth, container_health},
+    theme::{Hue, RampId, SeriesRole},
 };
 use thegn_metrics::collect::{
     CollectorId, CollectorSet,
@@ -29,6 +33,7 @@ const CPU: PanelId = PanelId("containers.cpu");
 const MEMORY: PanelId = PanelId("containers.memory");
 const IO: PanelId = PanelId("containers.io");
 const TABLE: PanelId = PanelId("containers.table");
+const INVENTORY: PanelId = PanelId("containers.inventory");
 const HISTORY_CAP: usize = 120;
 const SLOT_CAP: usize = 32;
 const TABLE_ID: usize = 0;
@@ -43,30 +48,35 @@ const VARIANT: [Variant; 1] = [Variant {
     min: (24, 4),
     pref: (64, 10),
 }];
-const SPECS: [PanelSpec; 5] = [
+const SPECS: [PanelSpec; 6] = [
     PanelSpec {
         id: ESTATE,
         priority: 0,
         variants: &VARIANT,
     },
     PanelSpec {
-        id: CPU,
+        id: INVENTORY,
         priority: 1,
         variants: &VARIANT,
     },
     PanelSpec {
-        id: MEMORY,
+        id: CPU,
         priority: 2,
         variants: &VARIANT,
     },
     PanelSpec {
-        id: IO,
+        id: MEMORY,
         priority: 3,
         variants: &VARIANT,
     },
     PanelSpec {
-        id: TABLE,
+        id: IO,
         priority: 4,
+        variants: &VARIANT,
+    },
+    PanelSpec {
+        id: TABLE,
+        priority: 5,
         variants: &VARIANT,
     },
 ];
@@ -344,14 +354,23 @@ fn fill_slot(slot: &mut Slot, row: &ContainerStatsRow) {
 pub(in crate::monitor) struct ContainersView<'a> {
     model: &'a ContainersModel,
     inventory: &'a [ContainerInfo],
+    footprint: Option<ContainerFootprint>,
+    sel: usize,
 }
 
 impl<'a> ContainersView<'a> {
     pub(in crate::monitor) fn new(
         model: &'a ContainersModel,
         inventory: &'a [ContainerInfo],
+        footprint: Option<ContainerFootprint>,
+        sel: usize,
     ) -> Self {
-        Self { model, inventory }
+        Self {
+            model,
+            inventory,
+            footprint,
+            sel,
+        }
     }
 }
 
@@ -362,6 +381,7 @@ impl TabView for ContainersView<'_> {
     fn template(&self) -> Node {
         Node::Col(vec![
             (Size::Weight(1), Node::Panel(ESTATE)),
+            (Size::Weight(1), Node::Panel(INVENTORY)),
             (
                 Size::Weight(2),
                 Node::Row(vec![
@@ -378,9 +398,11 @@ impl TabView for ContainersView<'_> {
             ),
         ])
     }
-    fn demand(&self, _panel: PanelId) -> CollectorSet {
+    fn demand(&self, panel: PanelId) -> CollectorSet {
         let mut set = CollectorSet::empty();
-        set.insert(CollectorId::ContainersStats);
+        if panel != INVENTORY {
+            set.insert(CollectorId::ContainersStats);
+        }
         set
     }
     fn paint(
@@ -394,14 +416,23 @@ impl TabView for ContainersView<'_> {
         let mut grid = CellGrid::new(rect.cols, rect.rows);
         let title = match placed.id {
             ESTATE => "Estate",
+            INVENTORY => "containers",
             CPU => "CPU | % of one core",
             MEMORY => "Memory | peak",
             IO => "I/O | window peak",
             TABLE => "Containers",
             _ => return,
         };
-        let body = panel::panel(&mut grid, Rect::full(rect.cols, rect.rows), title, None).rect();
         let absent = matches!(self.model.health, Health::Absent(_));
+        let title = if placed.id == INVENTORY {
+            format!(
+                "containers · {}",
+                super::ownership_note(self.inventory, self.footprint)
+            )
+        } else {
+            title.to_owned()
+        };
+        let body = panel::panel(&mut grid, Rect::full(rect.cols, rect.rows), &title, None).rect();
         let has_history = match placed.id {
             CPU => ring_has_finite(&self.model.cpu_total),
             MEMORY => ring_has_finite(&self.model.memory_total),
@@ -438,7 +469,9 @@ impl TabView for ContainersView<'_> {
             };
             grid.view(body).put_str(0, 0, &label, Default::default());
         }
-        if absent {
+        if placed.id == INVENTORY {
+            self.paint_inventory(&mut grid, body);
+        } else if absent {
             if placed.id == ESTATE {
                 self.paint_estate(&mut grid, body);
             } else {
@@ -489,6 +522,84 @@ impl TabView for ContainersView<'_> {
 }
 
 impl ContainersView<'_> {
+    fn paint_inventory(&self, grid: &mut CellGrid, body: Rect) {
+        if self.inventory.is_empty() {
+            grid.view(body)
+                .put_str(0, 0, "no containers", Default::default());
+            return;
+        }
+        let visible = body.rows;
+        let start = self.sel.saturating_sub(visible.saturating_sub(1));
+        let end = self.inventory.len().min(start.saturating_add(visible));
+        for (line, (index, container)) in self
+            .inventory
+            .iter()
+            .enumerate()
+            .skip(start)
+            .take(end - start)
+            .enumerate()
+        {
+            let ownership = if container.ours {
+                crate::seg::Tok::Hue(Hue::Green)
+            } else {
+                crate::seg::Tok::Slot(crate::chrome::S::Ghost)
+            };
+            let style = CellStyle {
+                fg: StyleTok::from_tok(ownership).unwrap_or(StyleTok::INHERIT),
+                bg: if index == self.sel {
+                    StyleTok::from_tok(crate::seg::Tok::Series(SeriesRole::Selected))
+                        .unwrap_or(StyleTok::INHERIT)
+                } else {
+                    StyleTok::INHERIT
+                },
+                attr: if index == self.sel {
+                    crate::monitor::kit::grid::BOLD
+                } else {
+                    0
+                },
+                ..CellStyle::default()
+            };
+            let mark = if container.ours { "" } else { " (foreign)" };
+            let health = match container_health(&container.status) {
+                ContainerHealth::Healthy => "healthy",
+                ContainerHealth::Unhealthy => "unhealthy",
+                ContainerHealth::Starting => "starting",
+                ContainerHealth::None => "up",
+                ContainerHealth::Stopped => "stopped",
+            };
+            let net = if container.net.is_empty() {
+                crate::caps::active_glyphs().emdash
+            } else {
+                &container.net
+            };
+            let row = format!(
+                "{}{}  {}  {}  {}  {}  {}",
+                inventory_truncate(&container.name, 24),
+                mark,
+                inventory_truncate(&container.backend, 12),
+                health,
+                if container.cpu.is_empty() {
+                    crate::caps::active_glyphs().emdash
+                } else {
+                    &container.cpu
+                },
+                if container.mem.is_empty() {
+                    crate::caps::active_glyphs().emdash
+                } else {
+                    &container.mem
+                },
+                net
+            );
+            let y = body.y + line;
+            grid.view(Rect {
+                y,
+                rows: body.rows.saturating_sub(line),
+                ..body
+            })
+            .put_str(0, 0, &row, style);
+        }
+    }
+
     fn paint_estate(&self, grid: &mut CellGrid, body: Rect) {
         let running = self
             .inventory
@@ -782,6 +893,16 @@ fn paint_finite_history_runs(
             );
         }
         start = end.max(start + 1);
+    }
+}
+
+fn inventory_truncate(value: &str, max_chars: usize) -> String {
+    let mut chars = value.chars();
+    let text: String = chars.by_ref().take(max_chars).collect();
+    if chars.next().is_some() {
+        format!("{text}{}", crate::caps::active_glyphs().ellipsis)
+    } else {
+        text
     }
 }
 
