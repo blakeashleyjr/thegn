@@ -724,7 +724,7 @@ fn render_targets(
                 panel_id: context.panel_id,
                 generation: context.generation,
                 window: context.window,
-                series_index: (*series_index).clone(),
+                series_index: series_index.clone(),
                 cache: &mut *context.cache,
             };
             dispatch_renderer(
@@ -756,7 +756,7 @@ fn dispatch_renderer(
         "timeseries" => {
             let (target_ref_id, visible_targets, target_index, frame_index) = context
                 .series_index
-                .clone()
+                .take()
                 .unwrap_or_else(|| (String::new(), Vec::new(), 0, 0));
             let id = SeriesId {
                 panel_id: context.panel_id,
