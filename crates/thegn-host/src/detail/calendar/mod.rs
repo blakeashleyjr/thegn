@@ -149,6 +149,7 @@ pub(super) fn open(
     if layout::metrics(cols, docs.ui.show_week_numbers).is_none() {
         return Some(fallback(near, ctx));
     }
+
     let st = CalState {
         cursor: CalCursor::new(today),
         today,
@@ -531,11 +532,17 @@ mod request_tests {
         else {
             panic!("calendar overlay expected");
         };
+        calendar.st.pending = None;
+        calendar.st.today = today;
         calendar.st.loaded.insert(key);
 
         let mut refresh = payload(key, 0);
         refresh.request = None;
         assert!(apply_calendar(&mut slot, refresh));
+
+        let mut unknown_month_refresh = payload((2055, 7), 0);
+        unknown_month_refresh.request = None;
+        assert!(!apply_calendar(&mut slot, unknown_month_refresh));
     }
 }
 

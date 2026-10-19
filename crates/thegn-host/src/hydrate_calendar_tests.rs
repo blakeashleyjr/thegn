@@ -36,6 +36,8 @@ fn navigation_a_b_c_only_c_is_current() {
 
     assert!(navigation_superseded(a));
     assert!(navigation_superseded(b));
+    // The current-id assertion relies on nextest's one-process-per-test
+    // isolation; a parallel plain `cargo test` case could register afterward.
     assert!(!navigation_superseded(c));
 }
 
