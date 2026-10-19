@@ -54,9 +54,10 @@ semantics; `plugin check` remains the validation command with failure exits.
   contribution declares (`interval` milliseconds). It reads output until the
   plugin exits, then gives the pipes about half a second to drain; a background
   child cannot keep the run open by holding them. If it has not exited by its
-  timeout, the run times out. Output cut off at the reader deadline is marked
-  incomplete. Each run accepts at most 20,000 lines, 1 MiB per line, 8 MiB of
-  retained stdout, and keeps up to 8 KiB of stderr.
+  timeout, the run times out. Output still unread at the reader deadline is
+  discarded; messages already read are kept. Each run accepts at most 20,000
+  lines, 1 MiB per line, 8 MiB of retained stdout, and keeps up to 8 KiB of
+  stderr.
 - `mode = "resident"`: one long-lived process for the session; thegn sends
   `activate`, then `render` per cadence, and `deactivate` on shutdown.
 
