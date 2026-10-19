@@ -74,7 +74,7 @@ fn refund_connect_failure(state: &SharedState, ident: &str, is_connect: bool, to
 }
 
 fn classify_dispatch_error(
-    state: &SharedState,
+    state: &AppState,
     ident: &str,
     error: &anyhow::Error,
     took_token: bool,
@@ -1955,9 +1955,10 @@ mod tests {
         stalled.base_url = url;
         let cancel_id = stalled.identity();
         let route = route_with(vec![stalled], RoutingStrategy::Sequential);
+        let global = Identity::global();
         let mut future = Box::pin(route_nonstreaming(
             &state,
-            &Identity::global(),
+            &global,
             "openai",
             &route,
             br#"{"model":"m","messages":[]}"#,
