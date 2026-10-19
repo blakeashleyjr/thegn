@@ -74,10 +74,9 @@ log scale while Network stays on a live linear one.
   load average — fall back to `window` under `fixed`, since there is no honest
   number to divide by.
 
-On the Memory and Network graphs, and the batch-50 density graphs, leading
-gaps before the first reading stay blank; later gaps carry the last reading
-forward. Rate metrics such as network traffic and disk I/O read empty intervals
-as zero.
+On the Memory, Thermal, and Network graphs, leading gaps before the first
+reading stay blank; later gaps carry the last reading forward. In the Overview
+traffic graphs, empty intervals for network and disk I/O rates read as zero.
 
 `Space` **pauses**. That freezes the picture. The history graphs keep recording
 at the normal, non-live rate, so resuming shows no gap; the monitor's detailed
@@ -165,8 +164,9 @@ Wi-Fi panel shows the SSID, a masked BSSID, frequency and width, signal and
 average signal, retry/failure counts, and connection time. Its sparkline uses a
 labelled −90 to −30 dBm scale. Totals count physical links only, so VPN traffic
 is not double-counted. Interface rows keep idle and down links visible, and
-fold interfaces beyond the eight history slots into `other`. Use `f`/`F` to
-focus a panel, `z` to zoom it, and `Esc` to step back through focus and zoom.
+fold interfaces beyond the eight tracked interfaces into an `other` row. Use
+`f`/`F` to focus a panel, `z` to zoom it, and `Esc` to step back through focus
+and zoom.
 The network masthead chip expands into this tab.
 
 ## Disk
