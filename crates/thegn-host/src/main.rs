@@ -1144,7 +1144,7 @@ fn run_main() -> anyhow::Result<()> {
     if still_running > 0 {
         tracing::warn!(
             still_running,
-            "background merge work did not stop before exit; its gate may still be running"
+            "background merge work did not stop within the 4-second shutdown bound; its gate may still be running"
         );
     }
     rt.shutdown_background();
