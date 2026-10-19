@@ -862,17 +862,52 @@ impl IssueBackend for JiraBackend {
                 });
             }
 
+            let mut status_mismatch = false;
             if let Some(status) = patch.status {
                 let target_cat = target_status_category(status);
                 if jira_status_category(&ji.fields.status) != Some(target_cat) {
-                    let error = IssueError::Api(format!(
-                        "Jira status verification failed for {key}: expected category {target_cat}"
-                    ));
-                    if unknown_transition.is_some() {
-                        return Err(partial_update(&applied, &["status"], &[], error));
-                    }
-                    return Err(partial_update(&applied, &[], &[], error));
+                    status_mismatch = true;
                 }
+            }
+            let title_mismatch = patch
+                .title
+                .as_deref()
+                .is_some_and(|title| ji.fields.summary.trim() != title.trim());
+            if status_mismatch || title_mismatch {
+                let expected_category = patch
+                    .status
+                    .map(target_status_category)
+                    .unwrap_or("unknown");
+                let status_error = IssueError::Api(format!(
+                    "Jira status verification failed for {key}: expected category {}",
+                    expected_category
+                ));
+                let source = if status_mismatch {
+                    status_error
+                } else {
+                    IssueError::Api("Jira did not apply the requested title".into())
+                };
+                let mut unapplied = Vec::new();
+                let mut unverified = Vec::new();
+                let mut verified_applied = applied.clone();
+                if status_mismatch {
+                    if unknown_transition.is_some() {
+                        unapplied.push("status");
+                    } else {
+                        verified_applied.retain(|field| *field != "status");
+                        unverified.push("status");
+                    }
+                }
+                if title_mismatch {
+                    verified_applied.retain(|field| *field != "title");
+                    unverified.push("title");
+                }
+                return Err(partial_update(
+                    &verified_applied,
+                    &unapplied,
+                    &unverified,
+                    source,
+                ));
             }
             Ok(jira_issue_to_domain(ji, &self.base_url))
         })
@@ -2151,9 +2186,9 @@ mod tests {
                 unverified,
                 source,
             }) => {
-                assert_eq!(applied, vec!["status"]);
+                assert!(applied.is_empty());
                 assert!(unapplied.is_empty());
-                assert!(unverified.is_empty());
+                assert_eq!(unverified, vec!["status"]);
                 assert!(
                     matches!(source.as_ref(), IssueError::Api(message) if message.contains("expected category indeterminate"))
                 );
@@ -2161,6 +2196,44 @@ mod tests {
             other => panic!("expected verification error, got {other:?}"),
         }
         assert_eq!(calls.len(), 3, "verification must fetch the issue");
+    }
+
+    #[tokio::test]
+    async fn title_mismatch_after_refetch_is_unverified() {
+        let (result, calls) = run_update(
+            IssuePatch {
+                title: Some("requested title".into()),
+                ..Default::default()
+            },
+            vec![
+                FixtureResponse::new(StatusCode::NO_CONTENT, ""),
+                issue_fixture("different title", "new"),
+            ],
+        )
+        .await;
+        match result {
+            Err(IssueError::PartialUpdate {
+                applied,
+                unapplied,
+                unverified,
+                source,
+            }) => {
+                assert!(applied.is_empty());
+                assert!(unapplied.is_empty());
+                assert_eq!(unverified, vec!["title"]);
+                assert!(
+                    matches!(source.as_ref(), IssueError::Api(message) if message == "Jira did not apply the requested title")
+                );
+            }
+            other => panic!("expected title verification error, got {other:?}"),
+        }
+        assert_eq!(
+            calls,
+            vec![
+                "PUT /rest/api/3/issue/PROJ-1",
+                "GET /rest/api/3/issue/PROJ-1",
+            ]
+        );
     }
 
     #[tokio::test]
