@@ -13,8 +13,12 @@ pub const MAX_CONTAINER_SCOPES: usize = 256;
 const MAX_DIRECTORY_DIRECTORIES: usize = MAX_CONTAINER_SCOPES * 2;
 // The entry budget adds one sentinel so listing truncation can be reported without an unbounded read.
 const MAX_DIRECTORY_ENTRIES: usize = MAX_DIRECTORY_DIRECTORIES + 1;
-// Three fixed listings plus every possible user slice, its services, and each service's two slices.
-const MAX_DIRECTORY_LISTINGS: usize = 3 + MAX_DIRECTORY_ENTRIES * (1 + MAX_DIRECTORY_ENTRIES * 3);
+// Primary-chosen THE-916 cap: 64 concurrently logged-in uids.
+const MAX_USER_SLICES: usize = 64;
+// systemd has one user@UID.service per logged-in user; allow one stale duplicate.
+const MAX_USER_SERVICES: usize = 2;
+// Three fixed listings plus each user listing and two parent listings per accepted service.
+const MAX_DIRECTORY_LISTINGS: usize = 3 + MAX_USER_SLICES * (1 + MAX_USER_SERVICES * 2);
 
 #[derive(Debug, Default)]
 pub struct DirectoryListing {
@@ -68,6 +72,10 @@ pub struct Discovery {
 }
 
 pub fn discover(fs: &dyn DirectoryFs, root: &Path) -> Discovery {
+    discover_for_uid(fs, root, nix::unistd::geteuid().as_raw())
+}
+
+fn discover_for_uid(fs: &dyn DirectoryFs, root: &Path, current_uid: u32) -> Discovery {
     let mut discovery = Discovery {
         scopes: Vec::with_capacity(MAX_CONTAINER_SCOPES),
         truncated: false,
@@ -90,15 +98,25 @@ pub fn discover(fs: &dyn DirectoryFs, root: &Path) -> Discovery {
     );
 
     let user_slice = root.join("user.slice");
-    for user in list(fs, &user_slice, &mut listings, &mut discovery) {
-        if !starts_with(&user, "user-") || !ends_with(&user, ".slice") {
-            continue;
-        }
+    let mut users = list(fs, &user_slice, &mut listings, &mut discovery);
+    users.retain(|user| starts_with(user, "user-") && ends_with(user, ".slice"));
+    let current_user = OsString::from(format!("user-{current_uid}.slice"));
+    if let Some(index) = users.iter().position(|user| user == &current_user) {
+        users[..=index].rotate_right(1);
+    }
+    if users.len() > MAX_USER_SLICES {
+        discovery.truncated = true;
+        users.truncate(MAX_USER_SLICES);
+    }
+    for user in users {
         let user_slice_path = user_slice.join(user);
-        for service in list(fs, &user_slice_path, &mut listings, &mut discovery) {
-            if !starts_with(&service, "user@") || !ends_with(&service, ".service") {
-                continue;
-            }
+        let mut services = list(fs, &user_slice_path, &mut listings, &mut discovery);
+        services.retain(|service| starts_with(service, "user@") && ends_with(service, ".service"));
+        if services.len() > MAX_USER_SERVICES {
+            discovery.truncated = true;
+            services.truncate(MAX_USER_SERVICES);
+        }
+        for service in services {
             let service_path = user_slice_path.join(service);
             for parent in [
                 service_path.join("user.slice"),
