@@ -347,7 +347,7 @@ pub(super) fn zones(
     zones: &[ZoneRow],
     cooling: &[thegn_metrics::collect::model::thermal_zone::CoolingAggregate],
 ) {
-    if zones.is_empty() {
+    if zones.is_empty() && cooling.is_empty() {
         put(
             grid,
             rect,
@@ -435,17 +435,10 @@ pub(super) fn cooling(grid: &mut CellGrid, rect: Rect, fans: &[FanRow], sensors:
             &format!("{} {}  {rpm}{target}", fan.chip, fan.label),
             Tok::Slot(S::Text),
         );
-        put(
-            grid,
-            rect,
-            rect.cols.saturating_sub(13),
-            index * 2,
-            &format!("peak {:.0}rpm", fan.peak),
-            Tok::Slot(S::Dim),
-        );
         let paired = fan
             .pair
-            .and_then(|sensor_index| sensors.get(sensor_index))
+            .as_deref()
+            .and_then(|key| sensors.iter().find(|sensor| sensor.key == key))
             .map_or_else(
                 || caps::active_glyphs().emdash.to_owned(),
                 |sensor| sensor.label.clone(),
@@ -456,6 +449,18 @@ pub(super) fn cooling(grid: &mut CellGrid, rect: Rect, fans: &[FanRow], sensors:
             0,
             index * 2 + 1,
             &format!("paired: {paired}"),
+            Tok::Slot(S::Dim),
+        );
+        let peak = fan.peak.map_or_else(
+            || caps::active_glyphs().emdash.to_owned(),
+            |value| format!("peak {value:.0}rpm"),
+        );
+        put(
+            grid,
+            rect,
+            rect.cols.saturating_sub(13),
+            index * 2 + 1,
+            &peak,
             Tok::Slot(S::Dim),
         );
     }
