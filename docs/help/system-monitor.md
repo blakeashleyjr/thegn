@@ -306,10 +306,10 @@ and new/exited values unknown until their baselines are available.
   `s` STOP and `c` CONT on Linux and macOS; Windows offers `t` TERM. All
   platforms also offer `r` TERM tree. Choose by letter or with the arrow keys
   and Enter. TERM, INT, HUP and CONT are sent immediately; KILL, STOP and TERM
-  tree ask for `y`
-  confirmation (or `n` / `Esc` to cancel). On Windows, TERM is a hard
-  `TerminateProcess` and asks for `y`. The selected PID and start time are
-  checked again before delivery. STOP pauses a process and CONT resumes it.
+  tree ask for `y` confirmation (or `n` / `Esc` to cancel). On Windows, TERM
+  is a hard `TerminateProcess` and asks for `y`. The selected PID and start
+  time are checked again before delivery. STOP pauses a process and CONT
+  resumes it.
   TERM tree sends TERM to the selected process and its descendants in the
   sampled process list, deepest first, checking each process identity before
   signalling it. It refuses a tree containing thegn and reports sent, vanished

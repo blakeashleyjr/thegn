@@ -44,13 +44,14 @@ write-stall value of 0 uses 60 seconds; idle and lifetime values of 0 disable
 those deadlines. Values are read when a tunnel starts or reconnects, so a
 running tunnel keeps its starting values. The idle, lifetime and write-stall
 deadlines are configurable; the dial timeout and retry behavior stay fixed. A
-local write stall closes that connection, while a stall writing to the shared
-tunnel ends the tunnel run; the host supervisor reconnects it with bounded
-backoff. On the sandbox side, transient accept errors such as running out of
-file descriptors are retried with a short backoff instead of stopping the
-tunnel. Rejection warnings are limited to one per minute per reason across the
-process. With `THEGN_PERF=1`, the perf rollup also reports per-interval
-rejection counts when any have changed.
+local write stall closes that connection, while a stall of
+`reverse_write_stall_secs` writing to the shared tunnel ends the tunnel run;
+the host supervisor reconnects it with bounded backoff. On the sandbox side,
+transient accept errors such as running out of file descriptors are retried
+with a short backoff instead of stopping the tunnel. Rejection warnings are
+limited to one per minute per reason across the process. With `THEGN_PERF=1`,
+the perf rollup also reports per-interval rejection counts when any have
+changed.
 
 ## Frontend preview discovery (`[preview]`)
 
