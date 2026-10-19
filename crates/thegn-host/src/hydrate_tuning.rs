@@ -192,8 +192,10 @@ pub(crate) fn glyph_ttls() -> GlyphTtls {
     ttls
 }
 
-/// Strict upper bound between reads of one quiet row's glyph base: its jittered
-/// safety interval, one busy window for scheduling, and one model tick.
+/// Bound between reads of one quiet row's glyph base: its jittered safety
+/// interval, one busy window for scheduling, and one model tick. This assumes
+/// one hydration per tick; under load, hydrations coalesce and ticks stretch.
+/// The svc adds one `GLYPH_BASE_TTL` (60 s) margin to absorb that delay.
 pub(crate) fn print_idle_bound(ttls: &GlyphTtls) -> Duration {
     (ttls.safety.saturating_mul(3) / 2)
         .saturating_add(ttls.busy)
