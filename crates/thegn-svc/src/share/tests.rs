@@ -940,7 +940,7 @@ fn serve_down_ok_when_status_lacks_the_port() {
     let mut calls = Vec::new();
     let result = serve_down_with(&runtimes, &plan, |runtime, argv| {
         calls.push((runtime.clone(), argv.to_vec()));
-        if argv == &plan.down_argv {
+        if argv == plan.down_argv.as_slice() {
             Ok((true, String::new()))
         } else {
             Ok((true, r#"{"TCP":{},"Web":{},"AllowFunnel":{}}"#.into()))
@@ -956,7 +956,7 @@ fn serve_down_errs_when_port_still_served() {
     let plan = serve_plan(thegn_core::config::TailscaleShareConfig::default(), 3000);
     let runtimes = [OciRuntime::podman()];
     let result = serve_down_with(&runtimes, &plan, |_, argv| {
-        if argv == &plan.down_argv {
+        if argv == plan.down_argv.as_slice() {
             Ok((true, String::new()))
         } else {
             Ok((true, r#"{"TCP":{"443":{"HTTPS":true}}}"#.into()))
@@ -971,16 +971,18 @@ fn serve_down_errs_when_down_fails_on_every_runtime() {
     let plan = serve_plan(thegn_core::config::TailscaleShareConfig::default(), 3000);
     let runtimes = [OciRuntime::podman(), OciRuntime::docker()];
     let mut attempts = 0;
-    let result = serve_down_with(&runtimes, &plan, |_, _| {
+    let result = serve_down_with(&runtimes, &plan, |_, argv| {
         attempts += 1;
-        if attempts == 1 {
+        if argv == plan.down_argv.as_slice() && attempts == 1 {
             Err(anyhow::anyhow!("runtime unavailable"))
-        } else {
+        } else if argv == plan.down_argv.as_slice() {
             Ok((false, String::new()))
+        } else {
+            Err(anyhow::anyhow!("status unavailable"))
         }
     });
     let error = result.expect_err("all down attempts failed");
-    assert_eq!(attempts, 2);
+    assert_eq!(attempts, 4);
     assert!(error.to_string().contains("teardown unverified"));
 }
 
@@ -989,7 +991,7 @@ fn serve_down_errs_on_unparseable_status() {
     let plan = serve_plan(thegn_core::config::TailscaleShareConfig::default(), 3000);
     let runtimes = [OciRuntime::podman()];
     let result = serve_down_with(&runtimes, &plan, |_, argv| {
-        if argv == &plan.down_argv {
+        if argv == plan.down_argv.as_slice() {
             Ok((true, String::new()))
         } else {
             Ok((true, "{not json".into()))
@@ -1004,7 +1006,7 @@ fn serve_down_errs_when_status_cannot_be_read() {
     let plan = serve_plan(thegn_core::config::TailscaleShareConfig::default(), 3000);
     let runtimes = [OciRuntime::podman()];
     let result = serve_down_with(&runtimes, &plan, |_, argv| {
-        if argv == &plan.down_argv {
+        if argv == plan.down_argv.as_slice() {
             Ok((true, String::new()))
         } else {
             Err(anyhow::anyhow!("runtime unavailable"))
@@ -1012,6 +1014,20 @@ fn serve_down_errs_when_status_cannot_be_read() {
     });
     let error = result.expect_err("unreadable status cannot verify teardown");
     assert!(error.to_string().contains("teardown unverified"));
+}
+
+#[test]
+fn serve_down_ok_when_down_fails_but_status_lacks_the_port() {
+    let plan = serve_plan(thegn_core::config::TailscaleShareConfig::default(), 3000);
+    let runtimes = [OciRuntime::podman()];
+    let result = serve_down_with(&runtimes, &plan, |_, argv| {
+        if argv == plan.down_argv.as_slice() {
+            Ok((false, String::new()))
+        } else {
+            Ok((true, "{}".into()))
+        }
+    });
+    assert!(result.is_ok());
 }
 
 #[test]
