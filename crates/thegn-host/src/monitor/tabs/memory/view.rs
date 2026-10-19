@@ -1595,12 +1595,22 @@ impl MemoryView<'_> {
             return;
         };
         let used = total.saturating_sub(free);
-        let label = format!(
-            "used {} / {}  zram {}  zswap {}",
-            fmt_bytes(Some(used)),
-            fmt_bytes(Some(total)),
-            fmt_bytes(self.0.zram_used),
-            fmt_bytes(self.0.zswap)
+        let label = compact_swap_label(
+            body.cols,
+            format!(
+                "used {} / {}  zram {}  zswap {}",
+                compact_bytes(Some(used)),
+                compact_bytes(Some(total)),
+                compact_bytes(self.0.zram_used),
+                compact_bytes(self.0.zswap)
+            ),
+            format!(
+                "used {}/{}  zram {}  zswap {}",
+                compact_bytes(Some(used)),
+                compact_bytes(Some(total)),
+                compact_bytes(self.0.zram_used),
+                compact_bytes(self.0.zswap)
+            ),
         );
         grid.view(Rect {
             x: body.x,
@@ -1635,27 +1645,46 @@ impl MemoryView<'_> {
             );
         }
         if body.rows > 2 && self.0.zram_present {
-            let (original, compressed, disk) = self.0.zram_totals;
-            let zram_line = match (original, compressed, disk) {
-                (Some(original), Some(compressed), Some(disk)) if original > 0 => format!(
-                    "zram original {}  compressed {}  disk {}",
-                    fmt_bytes(Some(original)),
-                    fmt_bytes(Some(compressed)),
-                    fmt_bytes(Some(disk))
+            let (original, compressed, device) = self.0.zram_totals;
+            let zram_line = match (original, compressed, device) {
+                (Some(original), Some(compressed), Some(device)) if original > 0 => format!(
+                    "zram original {}  compressed {}  device {}",
+                    compact_bytes(Some(original)),
+                    compact_bytes(Some(compressed)),
+                    compact_bytes(Some(device))
                 ),
                 (Some(original), Some(compressed), _) => format!(
-                    "zram original {}  compressed {}  disk {}",
-                    fmt_bytes(Some(original)),
-                    fmt_bytes(Some(compressed)),
+                    "zram original {}  compressed {}  device {}",
+                    compact_bytes(Some(original)),
+                    compact_bytes(Some(compressed)),
                     absent_mark()
                 ),
                 _ => format!(
-                    "zram original {}  compressed {}  disk {}",
+                    "zram original {}  compressed {}  device {}",
                     absent_mark(),
                     absent_mark(),
                     absent_mark()
                 ),
             };
+            let zram_line = compact_swap_label(
+                body.cols,
+                zram_line,
+                format!(
+                    "zram orig {}  comp {}  dev {}",
+                    original.map_or_else(
+                        || absent_mark().to_owned(),
+                        |value| compact_bytes(Some(value))
+                    ),
+                    compressed.map_or_else(
+                        || absent_mark().to_owned(),
+                        |value| compact_bytes(Some(value))
+                    ),
+                    device.map_or_else(
+                        || absent_mark().to_owned(),
+                        |value| compact_bytes(Some(value))
+                    )
+                ),
+            );
             grid.view(Rect {
                 x: body.x,
                 y: body.y + 2,
@@ -1957,6 +1986,24 @@ fn fmt_bytes(value: Option<u64>) -> String {
         || absent_mark().to_owned(),
         |value| kit::edge_fmt(NumFmt::default()).fmt(value as f64, Unit::Bytes, 12),
     )
+}
+fn compact_bytes(value: Option<u64>) -> String {
+    value.map_or_else(
+        || absent_mark().to_owned(),
+        |value| {
+            kit::edge_fmt(NumFmt::default())
+                .fmt(value as f64, Unit::Bytes, 6)
+                .trim_start()
+                .to_owned()
+        },
+    )
+}
+fn compact_swap_label(body_cols: usize, full: String, short: String) -> String {
+    if full.chars().count() <= body_cols {
+        full
+    } else {
+        short
+    }
 }
 fn reading_text(value: Option<u64>, unit: Unit) -> String {
     value.map_or_else(
