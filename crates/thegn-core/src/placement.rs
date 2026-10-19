@@ -151,7 +151,7 @@ impl SshPlacement {
         let raw = util::sh_join(backend_argv);
         let session_id = dtach_session_id(&self.host, &raw);
         let remote_cmd = format!(
-            "if command -v dtach >/dev/null 2>&1 && d=\"${{XDG_RUNTIME_DIR:-$HOME/.cache}}/thegn/dtach\" && (umask 077; mkdir -p \"$d\") && [ -d \"$d\" ] && [ ! -L \"$d\" ] && [ -O \"$d\" ] && chmod 700 \"$d\"; then exec dtach -A \"$d/'{session_id}'\" -E -z -r winch {raw}; else exec {raw}; fi"
+            "if command -v dtach >/dev/null 2>&1 && d=\"${{XDG_RUNTIME_DIR:-$HOME/.cache}}/thegn/dtach\" && (umask 077; mkdir -p \"$d\") && [ -d \"$d\" ] && [ ! -L \"$d\" ] && [ -O \"$d\" ] && chmod 700 \"$d\"; then exec dtach -A \"$d/{session_id}\" -E -z -r winch {raw}; else exec {raw}; fi"
         );
 
         match self.kind {
@@ -705,7 +705,7 @@ mod tests {
         let raw = util::sh_join(&argv);
         let session_id = dtach_session_id("dev@box", &raw);
         let remote_cmd = format!(
-            "if command -v dtach >/dev/null 2>&1 && d=\"${{XDG_RUNTIME_DIR:-$HOME/.cache}}/thegn/dtach\" && (umask 077; mkdir -p \"$d\") && [ -d \"$d\" ] && [ ! -L \"$d\" ] && [ -O \"$d\" ] && chmod 700 \"$d\"; then exec dtach -A \"$d/'{session_id}'\" -E -z -r winch {raw}; else exec {raw}; fi"
+            "if command -v dtach >/dev/null 2>&1 && d=\"${{XDG_RUNTIME_DIR:-$HOME/.cache}}/thegn/dtach\" && (umask 077; mkdir -p \"$d\") && [ -d \"$d\" ] && [ ! -L \"$d\" ] && [ -O \"$d\" ] && chmod 700 \"$d\"; then exec dtach -A \"$d/{session_id}\" -E -z -r winch {raw}; else exec {raw}; fi"
         );
         let expected = util::sh_join(&["/bin/sh".to_string(), "-lc".to_string(), remote_cmd]);
         assert_eq!(out[out.len() - 1], expected);
@@ -728,7 +728,7 @@ mod tests {
 
         // Assert the dtach command is well-formed
         assert!(cmd.contains("if command -v dtach"));
-        assert!(cmd.contains("exec dtach -A \"$d/'"));
+        assert!(cmd.contains("exec dtach -A \"$d/"));
         assert!(cmd.contains("-E -z -r winch"));
         // Assert the raw command is in both the dtach execution and the fallback
         assert!(cmd.contains("exec echo hello"));
@@ -753,7 +753,7 @@ mod tests {
         let command = placement.interactive_argv(&argv);
         let remote = command.last().unwrap();
 
-        assert!(remote.contains("$d/'c7502a83e59a8b5c8c0554f0972505b4'"));
+        assert!(remote.contains("$d/c7502a83e59a8b5c8c0554f0972505b4"));
         assert!(remote.contains("XDG_RUNTIME_DIR"));
         assert!(remote.contains("[ ! -L \"$d\" ]") && remote.contains("[ -O \"$d\" ]"));
         assert!(remote.contains("chmod 700 \"$d\""));
@@ -804,7 +804,7 @@ mod tests {
         let remote = command.last().unwrap();
         let session_id = dtach_session_id("dev@box", &raw);
 
-        assert!(remote.contains(&format!("'{session_id}'")));
+        assert!(remote.contains(&format!("$d/{session_id}")));
         assert!(
             session_id
                 .bytes()
