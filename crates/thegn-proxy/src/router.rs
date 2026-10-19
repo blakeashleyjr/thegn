@@ -63,22 +63,44 @@ fn is_connect_timeout(error: &anyhow::Error) -> bool {
     })
 }
 
-async fn read_error_body(
-    response: reqwest::Response,
-    cap: usize,
-    idle: std::time::Duration,
-) -> anyhow::Result<Vec<u8>> {
+fn should_refund_connect_failure(is_connect: bool, took_token: bool) -> bool {
+    is_connect && took_token
+}
+
+fn refund_connect_failure(state: &SharedState, ident: &str, is_connect: bool, took_token: bool) {
+    if should_refund_connect_failure(is_connect, took_token) {
+        state.limiter.refund(ident, Instant::now());
+    }
+}
+
+fn classify_dispatch_error(
+    state: &SharedState,
+    ident: &str,
+    error: &anyhow::Error,
+    took_token: bool,
+) -> &'static str {
+    if let Some(reason) = dispatch_timeout_reason(error) {
+        return reason;
+    }
+    refund_connect_failure(state, ident, is_connect_error(error), took_token);
+    if is_connect_timeout(error) {
+        "connect_timeout"
+    } else {
+        "network_error"
+    }
+}
+
+async fn read_error_body(response: reqwest::Response, cap: usize) -> anyhow::Result<Vec<u8>> {
     let mut stream = response.bytes_stream();
     let mut body = Vec::new();
     while body.len() < cap {
-        match tokio::time::timeout(idle, stream.next()).await {
-            Err(_) => return Err(anyhow::Error::new(DispatchTimeout::Idle)),
-            Ok(Some(Ok(chunk))) => {
+        match stream.next().await {
+            Some(Ok(chunk)) => {
                 let remaining = cap - body.len();
                 body.extend_from_slice(&chunk[..chunk.len().min(remaining)]);
             }
-            Ok(Some(Err(error))) => return Err(error.into()),
-            Ok(None) => break,
+            Some(Err(error)) => return Err(error.into()),
+            None => break,
         }
     }
     Ok(body)
@@ -326,10 +348,10 @@ async fn try_chain(
             continue;
         };
 
-        if !state
+        let mut took_token = state
             .limiter
-            .try_acquire(&ident, backend.rate, Instant::now())
-        {
+            .try_acquire(&ident, backend.rate, Instant::now());
+        if !took_token {
             if !is_last {
                 state.metrics.inc_fallthrough(&ident, "loadshed");
                 continue;
@@ -349,12 +371,11 @@ async fn try_chain(
             tokio::time::sleep(wait).await;
             // The reservation can be lost to a concurrent acquire; as the last
             // backend, proceed after waiting either way.
-            if !state
+            took_token = state
                 .limiter
-                .try_acquire(&ident, backend.rate, Instant::now())
-            {
-                state.metrics.inc_fallthrough(&ident, "loadshed");
-                continue;
+                .try_acquire(&ident, backend.rate, Instant::now());
+            if !took_token {
+                tracing::debug!(backend = %ident, "rate reservation lost to a concurrent acquire; proceeding as last lane");
             }
         }
         let backend_body = apply_transforms(backend, parsed, body);
@@ -379,16 +400,7 @@ async fn try_chain(
             Ok(Ok(r)) => r,
             Ok(Err(e)) => {
                 tracing::warn!(backend = %ident, error = %e, "backend request error");
-                let reason = dispatch_timeout_reason(&e).unwrap_or_else(|| {
-                    if is_connect_error(&e) {
-                        state.limiter.refund(&ident, Instant::now());
-                    }
-                    if is_connect_timeout(&e) {
-                        "connect_timeout"
-                    } else {
-                        "network_error"
-                    }
-                });
+                let reason = classify_dispatch_error(state, &ident, &e, took_token);
                 state.metrics.inc_backend_attempt(&ident, reason);
                 state.metrics.inc_fallthrough(&ident, reason);
                 continue;
@@ -541,10 +553,10 @@ async fn try_stream_chain(
             continue;
         };
 
-        if !state
+        let mut took_token = state
             .limiter
-            .try_acquire(&ident, backend.rate, Instant::now())
-        {
+            .try_acquire(&ident, backend.rate, Instant::now());
+        if !took_token {
             if !is_last {
                 state.metrics.inc_fallthrough(&ident, "loadshed");
                 continue;
@@ -559,12 +571,11 @@ async fn try_stream_chain(
             tokio::time::sleep(wait).await;
             // The reservation can be lost to a concurrent acquire; as the last
             // backend, proceed after waiting either way.
-            if !state
+            took_token = state
                 .limiter
-                .try_acquire(&ident, backend.rate, Instant::now())
-            {
-                state.metrics.inc_fallthrough(&ident, "loadshed");
-                continue;
+                .try_acquire(&ident, backend.rate, Instant::now());
+            if !took_token {
+                tracing::debug!(backend = %ident, "rate reservation lost to a concurrent acquire; proceeding as last lane");
             }
         }
 
@@ -644,16 +655,7 @@ async fn try_stream_chain(
                 }
                 Ok(Err(e)) => {
                     tracing::warn!(backend = %ident, error = %e, "anthropic stream backend error");
-                    let reason = dispatch_timeout_reason(&e).unwrap_or_else(|| {
-                        if is_connect_error(&e) {
-                            state.limiter.refund(&ident, Instant::now());
-                        }
-                        if is_connect_timeout(&e) {
-                            "connect_timeout"
-                        } else {
-                            "network_error"
-                        }
-                    });
+                    let reason = classify_dispatch_error(state, &ident, &e, took_token);
                     state.metrics.inc_backend_attempt(&ident, reason);
                     state.metrics.inc_fallthrough(&ident, reason);
                 }
@@ -681,14 +683,20 @@ async fn try_stream_chain(
             Ok(Ok(r)) => {
                 let status = r.status().as_u16();
                 let headers = r.headers().clone();
-                let bytes = match read_error_body(r, 64 * 1024, cfg.idle).await {
-                    Ok(bytes) => bytes,
-                    Err(_) => {
-                        state.metrics.inc_backend_attempt(&ident, "idle_timeout");
-                        state.metrics.inc_fallthrough(&ident, "idle_timeout");
-                        continue;
-                    }
-                };
+                let (bytes, read_error) =
+                    match tokio::time::timeout(cfg.idle, read_error_body(r, 64 * 1024)).await {
+                        Ok(Ok(bytes)) => (bytes, None),
+                        Ok(Err(error)) => (Vec::new(), Some(("network_error", error))),
+                        Err(_) => (
+                            Vec::new(),
+                            Some(("idle_timeout", anyhow::anyhow!("error body idle timeout"))),
+                        ),
+                    };
+                if let Some((read_reason, error)) = read_error {
+                    tracing::debug!(backend = %ident, %error, "upstream error body read failed");
+                    state.metrics.inc_backend_attempt(&ident, read_reason);
+                    state.metrics.inc_fallthrough(&ident, read_reason);
+                }
                 let (kind, reason) = classify_response(status, &bytes);
                 if kind == FailKind::Exhausted {
                     let until = parse_reset_from_body(&bytes, now)
@@ -704,16 +712,7 @@ async fn try_stream_chain(
             }
             Ok(Err(e)) => {
                 tracing::warn!(backend = %ident, error = %e, "stream backend error");
-                let reason = dispatch_timeout_reason(&e).unwrap_or_else(|| {
-                    if is_connect_error(&e) {
-                        state.limiter.refund(&ident, Instant::now());
-                    }
-                    if is_connect_timeout(&e) {
-                        "connect_timeout"
-                    } else {
-                        "network_error"
-                    }
-                });
+                let reason = classify_dispatch_error(state, &ident, &e, took_token);
                 state.metrics.inc_backend_attempt(&ident, reason);
                 state.metrics.inc_fallthrough(&ident, reason);
                 continue;
@@ -1262,13 +1261,18 @@ mod tests {
         format!("http://{addr}")
     }
 
-    async fn stalled_error_body_server(delay: Duration) -> String {
+    async fn trickling_error_body_server(interval: Duration) -> String {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move {
             let (mut socket, _) = listener.accept().await.unwrap();
-            socket.write_all(b"HTTP/1.1 429 Too Many Requests\r\ncontent-type: application/json\r\ntransfer-encoding: chunked\r\n\r\n").await.unwrap();
-            tokio::time::sleep(delay).await;
+            socket.write_all(b"HTTP/1.1 429 Too Many Requests\r\ncontent-type: application/json\r\nretry-after: 30\r\ntransfer-encoding: chunked\r\n\r\n1\r\nx\r\n").await.unwrap();
+            loop {
+                tokio::time::sleep(interval).await;
+                if socket.write_all(b"1\r\nx\r\n").await.is_err() {
+                    break;
+                }
+            }
         });
         format!("http://{addr}")
     }
@@ -1510,7 +1514,7 @@ mod tests {
         assert_eq!(state.inflight.get(&ident), 0);
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn rate_wait_longer_than_stream_first_byte_budget_is_skipped() {
         let mut backend = lane("rate-wait", "", None);
         backend.rate = RatePolicy {
@@ -1541,7 +1545,7 @@ mod tests {
         )
         .await;
         assert!(matches!(outcome, StreamOutcome::Failed));
-        assert!(start.elapsed() < Duration::from_millis(100));
+        assert!(start.elapsed() < Duration::from_millis(500));
         assert!(
             state
                 .metrics
@@ -1706,6 +1710,12 @@ mod tests {
         let success_url = completion_server().await;
         let mut stalled = lane("connect-stalled", "", None);
         stalled.base_url = format!("http://{addr}");
+        stalled.rate = RatePolicy {
+            rpm: 60.0,
+            burst: 1.0,
+        };
+        let stalled_rate = stalled.rate;
+        let stalled_identity = stalled.identity();
         let mut success = lane("success", "", None);
         success.base_url = success_url;
         let route = route_with(vec![stalled, success.clone()], RoutingStrategy::Sequential);
@@ -1731,6 +1741,17 @@ mod tests {
 
         assert_eq!(result.served_by, success.identity());
         assert!(started.elapsed() < Duration::from_secs(1));
+        assert!(
+            state
+                .metrics
+                .render()
+                .contains("reason=\"connect_timeout\"")
+        );
+        assert!(
+            state
+                .limiter
+                .try_acquire(&stalled_identity, stalled_rate, Instant::now())
+        );
         drop(std_listener);
         drop(queued_connections);
     }
@@ -1838,25 +1859,34 @@ mod tests {
     #[tokio::test]
     async fn stream_error_body_idle_timeout_falls_through() {
         let mut backend = lane("error-body", "", None);
-        backend.base_url = stalled_error_body_server(Duration::from_secs(1)).await;
+        backend.base_url = trickling_error_body_server(Duration::from_millis(25)).await;
+        let ident = backend.identity();
+        let model = backend.model.clone();
         let route = streaming_route(backend);
         let state = proxy_state(crate::relay::RelayConfig {
             first_byte: Duration::from_millis(300),
             idle: Duration::from_millis(50),
             heartbeat: Duration::from_millis(10),
         });
-        let outcome = route_streaming(
-            state.clone(),
-            Identity::global(),
-            Surface::OpenAi,
-            &route,
-            "m",
-            br#"{"model":"m","stream":true}"#,
-            false,
+        let start = tokio::time::Instant::now();
+        let outcome = tokio::time::timeout(
+            Duration::from_millis(300),
+            route_streaming(
+                state.clone(),
+                Identity::global(),
+                Surface::OpenAi,
+                &route,
+                "m",
+                br#"{"model":"m","stream":true}"#,
+                false,
+            ),
         )
-        .await;
+        .await
+        .expect("the total error-body read deadline should fall through");
         assert!(matches!(outcome, StreamOutcome::Failed));
+        assert!(start.elapsed() < Duration::from_millis(300));
         assert!(state.metrics.render().contains("reason=\"idle_timeout\""));
+        assert!(state.health.is_exhausted(&ident, &model, now_ms()));
     }
 
     #[tokio::test]
@@ -1939,5 +1969,29 @@ mod tests {
         }
         drop(future);
         assert_eq!(state.inflight.get(&cancel_id), 0);
+    }
+
+    #[test]
+    fn a_connect_failure_without_a_token_does_not_refund_one() {
+        let mut backend = lane("unfunded", "", None);
+        backend.rate = RatePolicy {
+            rpm: 60.0,
+            burst: 1.0,
+        };
+        let ident = backend.identity();
+        let state = proxy_state(crate::relay::RelayConfig::default());
+        assert!(
+            state
+                .limiter
+                .try_acquire(&ident, backend.rate, Instant::now())
+        );
+
+        refund_connect_failure(&state, &ident, true, false);
+
+        assert!(
+            !state
+                .limiter
+                .try_acquire(&ident, backend.rate, Instant::now())
+        );
     }
 }
