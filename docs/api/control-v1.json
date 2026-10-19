@@ -300,6 +300,17 @@
           ],
           "description": "The repeat rule, if any. Parsed in full — including `BY*` parts the expander may not act on — so a rule round-trips losslessly."
         },
+        "recurrence_id": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/EventTime"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "RFC 5545 `RECURRENCE-ID`: which generated occurrence of the series this component overrides."
+        },
         "reminders": {
           "default": [],
           "items": {
