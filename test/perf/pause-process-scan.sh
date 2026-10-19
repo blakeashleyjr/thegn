@@ -9,6 +9,7 @@ PERF_TMP="$TMP/fixture"
 HOME="$TMP/home"
 XDG_DATA_HOME="$TMP/data"
 mkdir -p "$PERF_TMP"
+mkdir -p "$XDG_DATA_HOME/containers/storage"
 mkdir -p "$PERF_PROC_ROOT/101" "$PERF_PROC_ROOT/102" "$PERF_PROC_ROOT/103"
 printf 'podman pause\n' >"$PERF_PROC_ROOT/101/comm"
 printf 'podman\n' >"$PERF_PROC_ROOT/102/comm"
@@ -24,14 +25,22 @@ source "$HERE/lib/env.sh"
 # called the shell's `kill` directly instead of the overridable hook.
 kill() { return 0; }
 
-PERF_KILL_LOG="$TMP/killed-pids"
+PERF_KILL_LOG="$TMP/cleanup.log"
 PERF_KILL="$TMP/record-kill"
 cat >"$PERF_KILL" <<'SHIM'
 #!/usr/bin/env bash
-printf '%s\n' "$1" >>"$PERF_KILL_LOG"
+printf 'kill %s\n' "$1" >>"$PERF_KILL_LOG"
 SHIM
 chmod +x "$PERF_KILL"
-export PERF_KILL PERF_KILL_LOG
+mkdir -p "$TMP/bin"
+cat >"$TMP/bin/podman" <<'SHIM'
+#!/usr/bin/env bash
+printf 'podman' >>"$PERF_KILL_LOG"
+printf ' <%s>' "$@" >>"$PERF_KILL_LOG"
+printf '\n' >>"$PERF_KILL_LOG"
+SHIM
+chmod +x "$TMP/bin/podman"
+export PERF_KILL PERF_KILL_LOG PATH="$TMP/bin:$PATH"
 
 stderr="$TMP/stderr"
 actual="$(perf_pause_pids 2>"$stderr")"
@@ -46,8 +55,21 @@ if [ -s "$stderr" ]; then
 fi
 
 perf_cleanup 2>"$stderr"
-if [ "$(cat "$PERF_KILL_LOG")" != 101 ]; then
-  printf 'expected cleanup to select only PID 101 for kill, got <%s>\n' \
+# The fake proc tree is static, so the post-delete rescan sees 101 again; its
+# second kill proves that scan ran.
+if [ "$(grep -c '^kill 101$' "$PERF_KILL_LOG")" -ne 2 ]; then
+  printf 'expected both cleanup scans to kill only PID 101; log was <%s>\n' \
+    "$(cat "$PERF_KILL_LOG" 2>/dev/null || true)" >&2
+  exit 1
+fi
+if grep -F 'kill 102' "$PERF_KILL_LOG" >/dev/null; then
+  printf 'cleanup killed PID 102, which does not belong to this fixture\n' >&2
+  exit 1
+fi
+kill_line="$(grep -n -m 1 '^kill 101$' "$PERF_KILL_LOG" | cut -d: -f1)"
+unshare_line="$(grep -n -m 1 '^podman <unshare> ' "$PERF_KILL_LOG" | cut -d: -f1)"
+if [ -z "$unshare_line" ] || [ "$kill_line" -ge "$unshare_line" ]; then
+  printf 'expected fixture pause kill before podman unshare; log was <%s>\n' \
     "$(cat "$PERF_KILL_LOG" 2>/dev/null || true)" >&2
   exit 1
 fi

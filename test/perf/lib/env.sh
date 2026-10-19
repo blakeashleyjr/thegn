@@ -230,7 +230,7 @@ perf_watch_process_group() {
 # fixture. Podman overlay layers may be owned by its user namespace, so remove
 # them through `podman unshare` before trying ordinary rm.
 perf_cleanup() {
-  local d pgid ppid pidfile pid
+  local pgid ppid pidfile
   if [ "${#PERF_PROCESS_GROUPS[@]}" -gt 0 ]; then
     for pgid in "${PERF_PROCESS_GROUPS[@]}"; do
       ppid="$(ps -o ppid= -p "$pgid" 2>/dev/null | tr -d ' ' || true)"
@@ -245,6 +245,9 @@ perf_cleanup() {
   if [ -n "${PERF_SOCK_DIR:-}" ]; then
     rm -rf -- "$PERF_SOCK_DIR" || true
   fi
+  # Release this fixture's rootless Podman mount namespace before asking
+  # `podman unshare` to remove its overlay storage.
+  perf_kill_fixture_pauses wait
   if [ -n "${PERF_TMP:-}" ] && [ -e "$PERF_TMP" ]; then
     # Podman-owned overlay files may be inaccessible outside its user namespace.
     if [ -d "${XDG_DATA_HOME:-$HOME/.local/share}/containers/storage" ] &&
@@ -258,11 +261,25 @@ perf_cleanup() {
   # `podman unshare` can start a new pause process with this fixture's runtime
   # environment, so scan after both deletion attempts. `/proc/PID/comm` holds
   # `podman pause`; cmdline contains only `podman`. Read races are silent.
+  perf_kill_fixture_pauses
+}
+
+# Kill only pause processes whose environment belongs to this fixture. The
+# first cleanup pass waits briefly for the namespace mount to be released;
+# tests override PERF_KILL with a recorder and intentionally skip that wait.
+perf_kill_fixture_pauses() {
+  local d pid tick wait_for_exit="${1:-}"
   if [ -n "${PERF_TMP:-}" ] && [ -d "${PERF_PROC_ROOT:-/proc}" ]; then
     while IFS= read -r pid; do
       d="${PERF_PROC_ROOT:-/proc}/$pid"
       if tr '\0' '\n' 2>/dev/null <"$d/environ" | grep -F -- "$PERF_TMP/" >/dev/null; then
         "${PERF_KILL:-kill}" "$pid" 2>/dev/null || true
+        if [ "$wait_for_exit" = wait ] && [ -z "${PERF_KILL:-}" ]; then
+          for ((tick = 0; tick < 20; tick++)); do
+            kill -0 "$pid" 2>/dev/null || break
+            sleep 0.1
+          done
+        fi
       fi
     done < <(perf_pause_pids)
   fi
