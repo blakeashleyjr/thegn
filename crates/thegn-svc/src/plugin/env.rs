@@ -16,6 +16,7 @@ use super::{LoadedPlugin, SpecProblem};
 /// This excludes credentials, agent sockets, XDG runtime paths, thegn control
 /// endpoints, and proxy settings. A trusted-native config entry receives the
 /// full ambient environment through [`resolve_env`].
+/// `LLVM_PROFILE_FILE` is a coverage-output path present only in instrumented builds, not a credential.
 pub(crate) const AMBIENT_ALLOWLIST: &[&str] = &[
     "PATH",
     "HOME",
@@ -44,6 +45,7 @@ pub(crate) const AMBIENT_ALLOWLIST: &[&str] = &[
     "LOCALAPPDATA",
     "PROGRAMDATA",
     "SYSTEMDRIVE",
+    "LLVM_PROFILE_FILE",
 ];
 
 pub(crate) fn ambient_allowlisted() -> Vec<(String, String)> {
@@ -65,7 +67,10 @@ pub(crate) fn apply_plugin_env(cmd: &mut Command, env: &BTreeMap<String, String>
 }
 
 /// Resolve the complete plugin environment beyond the fixed ambient allowlist.
-/// Trusted-native plugins receive the full ambient environment in this map.
+/// Trusted-native plugins receive a snapshot of the full ambient environment
+/// when this function runs (on plugin load or reload), rather than a live view
+/// at spawn time. In practice the two are equivalent because thegn does not
+/// mutate its own environment after startup.
 pub fn resolve_env(plugin: &LoadedPlugin) -> Result<BTreeMap<String, String>, SpecProblem> {
     resolve_env_with(plugin, crate::secret::resolve_ref)
 }

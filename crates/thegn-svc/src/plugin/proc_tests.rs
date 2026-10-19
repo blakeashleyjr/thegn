@@ -205,12 +205,12 @@ fn the_environment_is_passed_through() {
 fn one_shot_child_sees_allowlist_but_not_ambient_secrets() {
     let _env = thegn_core::testenv::EnvGuard::set(&[
         ("THEGN_B53_PLUGIN_SECRET", "s3cr3t"),
-        ("GH_TOKEN", "b53-token"),
+        ("THEGN_B53_PLUGIN_GH_TOKEN", "b53-token"),
     ]);
     let mut env = BTreeMap::new();
     env.insert("X".into(), "configured".into());
     let out = spawn_ndjson(
-        &sh(r#"printf '{"method":"probe","params":{"secret":"%s","gh":"%s","path_set":"%s","x":"%s"}}\n' "${THEGN_B53_PLUGIN_SECRET:-}" "${GH_TOKEN:-}" "${PATH:+yes}" "${X:-}""#),
+        &sh(r#"printf '{"method":"probe","params":{"secret":"%s","gh":"%s","path_set":"%s","x":"%s"}}\n' "${THEGN_B53_PLUGIN_SECRET:-}" "${THEGN_B53_PLUGIN_GH_TOKEN:-}" "${PATH:+yes}" "${X:-}""#),
         &env,
         None,
         Duration::from_secs(10),
