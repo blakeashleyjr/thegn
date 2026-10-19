@@ -1,4 +1,4 @@
-use super::{DiskModel, DiskView};
+use super::{DiskModel, DiskView, HistoryRing, history_peak};
 use crate::{
     caps::test_override,
     compositor::Rect,
@@ -57,6 +57,7 @@ fn frame_fixture() -> MonitorFrame {
             fstype: "btrfs".into(),
             source: format!("nvme{index}n1"),
             superblock_dev: format!("259:{index}"),
+            extra_mounts: 0,
             kind: FilesystemKind::Local,
             total_bytes: Some(500_000_000_000 + index as u64 * 125_000_000_000),
             free_bytes: Some(40_000_000_000 + index as u64 * 19_000_000_000),
@@ -96,7 +97,7 @@ fn render(
     cols: usize,
     rows: usize,
 ) -> (Surface, Vec<crate::monitor::layout::Placed>, CollectorSet) {
-    let view = DiskView(model);
+    let view = DiskView::new(model, &[], 0);
     let board = Board::default();
     let rect = Rect::full(cols, rows);
     let placed = board.placed(&view, rect);
@@ -141,6 +142,15 @@ fn absorbs_disk_frame_and_reuses_warm_buffers() {
         row.superblock_dev.truncate(5);
     }
     let capacity = model.capacities();
+    let mut telemetry = TelemetryHistory::default();
+    telemetry.push(
+        &thegn_metrics::StatsSnapshot {
+            disk_io: Some((18_000_000, 4_000_000)),
+            ..Default::default()
+        },
+        1000,
+    );
+    let mut history_buffer_ptr = None;
     for tick in 0..1000 {
         frame.parts.diskstats.aggregate.read_bps = Some(48_000_000.0 + f64::from(tick));
         frame.parts.diskstats.aggregate.write_bps = Some(9_000_000.0 + f64::from(tick));
@@ -155,8 +165,24 @@ fn absorbs_disk_frame_and_reuses_warm_buffers() {
             fs.free_bytes = Some(40_000_000_000 + index as u64 * 19_000_000_000 + u64::from(tick));
         }
         model.absorb_frame(&frame);
+        model.absorb_history(
+            &telemetry,
+            Window::EVERYTHING,
+            ScaleMode::Window,
+            2000 + u64::from(tick) * 1000,
+        );
+        let current_ptr = model.history_buf.hi().as_ptr();
+        if let Some(warm_ptr) = history_buffer_ptr {
+            assert_eq!(
+                current_ptr, warm_ptr,
+                "telemetry SeriesBuf storage is reused"
+            );
+        } else {
+            history_buffer_ptr = Some(current_ptr);
+        }
     }
     assert_eq!(model.capacities(), capacity);
+    assert_eq!(model.test_telemetry_rebuilds(), 1000);
     assert_eq!(
         model
             .filesystems
@@ -292,6 +318,7 @@ fn snapshots_cover_target_sizes_capabilities_and_static_panel_demand() {
                         "Devices",
                         "Filesystems",
                         "thegn.slice I/O",
+                        "Worktrees",
                     ] {
                         assert!(
                             text.contains(label),
@@ -327,21 +354,21 @@ fn snapshots_cover_target_sizes_capabilities_and_static_panel_demand() {
                         let ratio = fill_ratio(&surface, Rect::full(cols, rows));
                         match (unicode, depth) {
                             (UnicodeLevel::Full, ColorDepth::Truecolor) => {
-                                // density follow-up (batch 50): estimated, primary sets from the printed value
+                                // density follow-up (batch 52): estimated, primary sets from the printed value
                                 assert!(
                                     ratio >= 0.30,
                                     "{cols}x{rows} {unicode:?}/{depth:?}: fill ratio {ratio:.3}"
                                 );
                             }
                             (UnicodeLevel::Full, ColorDepth::Ansi16) => {
-                                // density follow-up (batch 50): estimated, primary sets from the printed value
+                                // density follow-up (batch 52): estimated, primary sets from the printed value
                                 assert!(
                                     ratio >= 0.30,
                                     "{cols}x{rows} {unicode:?}/{depth:?}: fill ratio {ratio:.3}"
                                 );
                             }
                             (UnicodeLevel::Ascii, ColorDepth::None) => {
-                                // density follow-up (batch 50): estimated, primary sets from the printed value
+                                // density follow-up (batch 52): estimated, primary sets from the printed value
                                 assert!(
                                     ratio >= 0.30,
                                     "{cols}x{rows} {unicode:?}/{depth:?}: fill ratio {ratio:.3}"
@@ -398,10 +425,81 @@ fn io_peak_scale_remains_visible_beside_the_history_graphs() {
         let (surface, _, _) = render(&model, cols, rows);
         let text = surface.screen_chars_to_string();
         assert!(
-            text.contains("peak"),
-            "peak missing at {cols}x{rows}: {text}"
+            text.contains("window peak read"),
+            "peak title missing at {cols}x{rows}: {text}"
+        );
+        assert!(
+            !text.contains("peak=100%"),
+            "unlabelled scale at {cols}x{rows}: {text}"
         );
     }
+}
+
+#[test]
+fn empty_telemetry_window_has_no_peak() {
+    let mut model = DiskModel::default();
+    let history = TelemetryHistory::default();
+    model.absorb_history(&history, Window::EVERYTHING, ScaleMode::Window, 3000);
+    let state = model.test_telemetry_state();
+    assert_eq!(state.2, None, "empty read window has no telemetry peak");
+    assert_eq!(state.3, None, "empty write window has no telemetry peak");
+}
+
+#[test]
+fn worktree_selection_is_highlighted_and_scrolled_into_view() {
+    let rows = (0..12)
+        .map(|index| crate::monitor::build::DiskWtRow {
+            path: std::path::PathBuf::from(format!("/tmp/worktree-{index}")),
+            name: format!("worktree-{index}"),
+            total_bytes: 1_000 + index,
+            target_bytes: 500 + index,
+            age_secs: Some(index),
+            measured_at_secs: None,
+        })
+        .collect::<Vec<_>>();
+    let mut grid = CellGrid::new(60, 6);
+    super::paint_worktrees(&mut grid, Rect::full(60, 6), &rows, 10);
+    let title = (0..60)
+        .filter_map(|x| grid.get(x, 0))
+        .map(|cell| cell.ch)
+        .collect::<String>();
+    assert!(title.contains("12"), "worktree count is in title: {title}");
+    assert!(
+        title.contains("reclaimable"),
+        "reclaimable total is in title: {title}"
+    );
+    let selected_row = 4;
+    assert_ne!(
+        grid.get(1, selected_row).expect("selected row cell").attr,
+        0,
+        "selected worktree row is bold"
+    );
+    let rendered = (1..60)
+        .filter_map(|x| grid.get(x, selected_row))
+        .map(|cell| cell.ch)
+        .collect::<String>();
+    assert!(
+        rendered.contains("worktree-10"),
+        "selected row is visible: {rendered}"
+    );
+    let first_visible_row = (1..60)
+        .filter_map(|x| grid.get(x, 1))
+        .map(|cell| cell.ch)
+        .collect::<String>();
+    assert!(
+        first_visible_row.contains("worktree-7"),
+        "scroll starts at the first visible row: {first_visible_row}"
+    );
+    grid.clear();
+    super::paint_worktrees(&mut grid, Rect::full(60, 6), &[], 0);
+    let empty = (0..60)
+        .filter_map(|x| grid.get(x, 1))
+        .map(|cell| cell.ch)
+        .collect::<String>();
+    assert!(
+        empty.contains("no cached sizes yet"),
+        "empty cache message: {empty}"
+    );
 }
 
 #[test]
@@ -417,10 +515,10 @@ fn absent_collectors_render_absent_marks_and_do_not_change_demand() {
     }
     let mut model = DiskModel::default();
     model.absorb_frame(&frame);
-    let view = DiskView(&model);
+    let view = DiskView::new(&model, &[], 0);
     let mut present = DiskModel::default();
     present.absorb_frame(&frame_fixture());
-    let present_view = DiskView(&present);
+    let present_view = DiskView::new(&present, &[], 0);
     for id in [
         PanelId("disk.io"),
         PanelId("disk.pressure"),
@@ -431,6 +529,8 @@ fn absent_collectors_render_absent_marks_and_do_not_change_demand() {
         assert!(!view.demand(id).is_empty());
         assert_eq!(view.demand(id), present_view.demand(id));
     }
+    assert!(view.demand(PanelId("disk.worktrees")).is_empty());
+    assert!(present_view.demand(PanelId("disk.worktrees")).is_empty());
     let (surface, _, _) = render(&model, 160, 45);
     let text = surface.screen_chars_to_string();
     assert!(text.contains(crate::caps::active_glyphs().emdash));
@@ -471,6 +571,18 @@ fn diskstats_warming_and_no_permission_keep_their_reading_states() {
             .contains(crate::caps::glyph(crate::caps::Glyph::Lock))
     );
     assert!(surface.screen_chars_to_string().contains("root-only"));
+}
+
+#[test]
+fn a_ring_with_no_finite_live_sample_has_no_peak() {
+    let mut history = HistoryRing::default();
+    history.push(f32::NAN);
+
+    assert_eq!(
+        history_peak(&history, Health::Ok, 16).trim_start(),
+        crate::caps::active_glyphs().emdash
+    );
+    assert!(!history_peak(&history, Health::Ok, 16).contains("0B/s"));
 }
 
 #[test]

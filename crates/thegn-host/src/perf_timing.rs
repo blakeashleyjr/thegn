@@ -33,6 +33,34 @@ pub(crate) fn observe_input(pending: &mut Option<Instant>, now: Instant) {
     pending.get_or_insert(now);
 }
 
+pub(crate) const NO_EFFECT_AFTER: Duration = Duration::from_millis(250);
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum InputClose {
+    None,
+    Latency(Instant),
+    NoEffect,
+}
+
+/// Decide how a pending input cohort contributes when the next frame closes it.
+/// An idle wait plus a sufficiently old stamp indicates that nothing visibly
+/// changed; busy loops and quick responses remain latency samples.
+pub(crate) fn classify_input(
+    stamp: Option<Instant>,
+    went_idle: bool,
+    closed_at: Instant,
+) -> InputClose {
+    match stamp {
+        None => InputClose::None,
+        Some(stamp)
+            if went_idle && closed_at.saturating_duration_since(stamp) >= NO_EFFECT_AFTER =>
+        {
+            InputClose::NoEffect
+        }
+        Some(stamp) => InputClose::Latency(stamp),
+    }
+}
+
 #[derive(Clone, Copy)]
 pub(crate) struct FrameStamp {
     pub queued_at: Instant,
@@ -205,5 +233,31 @@ mod tests {
         assert_eq!(metrics.queue_us.count(), 1);
         assert_eq!(metrics.queue_us.percentile_us(0.99), 0);
         assert_eq!(metrics.input_completion_us.count(), 0);
+    }
+
+    #[test]
+    fn input_close_classification_uses_idle_state_and_elapsed_boundary() {
+        let t = Instant::now();
+        assert_eq!(classify_input(None, true, t), InputClose::None);
+        assert_eq!(
+            classify_input(Some(t), false, t + Duration::from_secs(1)),
+            InputClose::Latency(t)
+        );
+        assert_eq!(
+            classify_input(Some(t), true, t + Duration::from_secs(1)),
+            InputClose::NoEffect
+        );
+        assert_eq!(
+            classify_input(Some(t), true, t + Duration::from_millis(5)),
+            InputClose::Latency(t)
+        );
+        assert_eq!(
+            classify_input(Some(t), true, t + NO_EFFECT_AFTER - Duration::from_nanos(1)),
+            InputClose::Latency(t)
+        );
+        assert_eq!(
+            classify_input(Some(t), true, t + NO_EFFECT_AFTER),
+            InputClose::NoEffect
+        );
     }
 }
