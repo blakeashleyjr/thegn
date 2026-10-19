@@ -31,7 +31,7 @@ pub struct GridPos {
     pub h: u32,
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct Target {
     pub expr: String,
     pub ref_id: String,
@@ -181,6 +181,10 @@ hide = true
         assert_eq!(target.alias.as_deref(), Some("p99"));
         assert!(target.hide);
 
+        let serialized = toml::to_string(target).unwrap();
+        let round_trip: Target = toml::from_str(&serialized).unwrap();
+        assert_eq!(round_trip, *target);
+
         let omitted: Dashboard = toml::from_str(
             r#"
 title = "T"
@@ -203,8 +207,8 @@ expr = "x"
         assert_eq!(target.alias, None);
         assert!(!target.hide);
 
-        let serialized = toml::to_string(&Target::default()).unwrap();
-        assert!(!serialized.contains("alias"));
-        assert!(!serialized.contains("hide"));
+        let serialized_default = toml::to_string(&Target::default()).unwrap();
+        assert!(!serialized_default.contains("alias"));
+        assert!(!serialized_default.contains("hide"));
     }
 }
