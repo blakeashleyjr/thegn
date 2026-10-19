@@ -441,20 +441,14 @@ fn validate_dashboard(
                 )));
             }
             if let Some(alias) = &target.alias
-                && alias.len() > MAX_LABEL_BYTES
+                && (alias.len() > MAX_LABEL_BYTES || alias.chars().any(char::is_control))
             {
-                return Err(DashboardLoadError::Invalid(format!(
-                    "panel {} alias exceeds {MAX_LABEL_BYTES} bytes",
-                    panel.id
-                )));
-            }
-            if let Some(alias) = &target.alias
-                && alias.chars().any(char::is_control)
-            {
-                return Err(DashboardLoadError::Invalid(format!(
-                    "panel {} alias contains a control character",
-                    panel.id
-                )));
+                let message = if alias.len() > MAX_LABEL_BYTES {
+                    format!("panel {} alias exceeds {MAX_LABEL_BYTES} bytes", panel.id)
+                } else {
+                    format!("panel {} alias contains a control character", panel.id)
+                };
+                return Err(DashboardLoadError::Invalid(message));
             }
             if !ref_ids.insert(&target.ref_id) {
                 return Err(DashboardLoadError::Invalid(format!(
@@ -1033,6 +1027,29 @@ mod tests {
         cache.finish_pass();
 
         let area = Rect::new(0, 0, 30, 8);
+        let mut same_generation = Buffer::empty(area);
+        render_targets(
+            "timeseries",
+            "Panel",
+            &[gtui_app::engine::TargetUpdate {
+                ref_id: "B".into(),
+                label: "B".into(),
+                result: Ok(vec![frame_b.clone()]),
+            }],
+            area,
+            &mut same_generation,
+            &Theme::prism(),
+            PanelRenderContext {
+                panel_id: 7,
+                generation: 1,
+                window: Some([0.0, 2.0]),
+                series_index: None,
+                cache: &mut cache,
+            },
+        );
+        let expected = render_targets_uncached(frame_b.clone(), "B", 30, Some([0.0, 2.0]));
+        assert_ne!(same_generation, expected);
+
         let mut actual = Buffer::empty(area);
         render_targets(
             "timeseries",
@@ -1053,7 +1070,6 @@ mod tests {
                 cache: &mut cache,
             },
         );
-        let expected = render_targets_uncached(frame_b, "B", 30, Some([0.0, 2.0]));
         assert_eq!(actual, expected);
     }
 
