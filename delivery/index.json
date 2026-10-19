@@ -28,8 +28,8 @@
     },
     {
       "change": "add-agent-model-env-selection",
-      "lifecycle": "delivered-awaiting-archive",
-      "delivered_at": "2026-10-11",
+      "lifecycle": "archived",
+      "archive_path": "openspec/changes/archive/2026-10-19-add-agent-model-env-selection/",
       "disposition": "residual-split",
       "owners": [
         {
