@@ -501,6 +501,10 @@ pub fn signal_pid(pid: u32, sig: super::ProcSignal) -> Result<(), String> {
     let signal = match sig {
         super::ProcSignal::Terminate => nix::sys::signal::Signal::SIGTERM,
         super::ProcSignal::Kill => nix::sys::signal::Signal::SIGKILL,
+        super::ProcSignal::Hangup => nix::sys::signal::Signal::SIGHUP,
+        super::ProcSignal::Interrupt => nix::sys::signal::Signal::SIGINT,
+        super::ProcSignal::Stop => nix::sys::signal::Signal::SIGSTOP,
+        super::ProcSignal::Continue => nix::sys::signal::Signal::SIGCONT,
     };
     nix::sys::signal::kill(pid, signal).map_err(|e| match e {
         Errno::ESRCH => "no such process".to_string(),
