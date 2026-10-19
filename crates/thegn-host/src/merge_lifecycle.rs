@@ -99,6 +99,8 @@ fn sample_vanished_tabs(
         .iter()
         .map(|group| (group.path.as_str(), group.epoch))
         .collect::<std::collections::HashSet<_>>();
+    // RECONCILIATION_IN_FLIGHT admits only one sampler, so holding this memo
+    // lock across the registry load cannot block another concurrent sampler.
     let mut remote = remote_groups
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -106,7 +108,7 @@ fn sample_vanished_tabs(
     let missing: Vec<&VanishedGroup> = groups
         .iter()
         .filter(|group| remote.get(&group.path) != Some(&group.epoch))
-        .filter(|group| !is_dir(&group.path))
+        .filter(|group| Path::new(&group.path).is_absolute() && !is_dir(&group.path))
         .collect();
     if missing.is_empty() {
         return Ok(Vec::new());
@@ -876,9 +878,20 @@ mod tests {
             epoch: 1,
         }];
         let remote = Mutex::new(HashMap::new());
-        let sample =
-            sample_vanished_tabs(&groups, |_| false, || Ok((Vec::new(), Vec::new())), &remote);
-        assert_eq!(sample.unwrap(), Vec::<String>::new());
+        let loads = std::cell::Cell::new(0);
+        for _ in 0..2 {
+            let sample = sample_vanished_tabs(
+                &groups,
+                |_| false,
+                || {
+                    loads.set(loads.get() + 1);
+                    Ok((Vec::new(), Vec::new()))
+                },
+                &remote,
+            );
+            assert_eq!(sample.unwrap(), Vec::<String>::new());
+        }
+        assert_eq!(loads.get(), 0);
     }
 
     #[test]
