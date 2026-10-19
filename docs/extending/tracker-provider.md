@@ -161,6 +161,9 @@ use `add_comment`, `attach_label`, and `detach_label`. An upstream
 which gives the wire a second degradation boundary. Calls run through the
 resident bridge and honor the plugin's `timeout_secs`; a timeout or dead
 process becomes a provider error rather than hanging the UI.
+Each reply must carry exactly one of `result` or `error`; `add_comment`,
+`attach_label`, and `detach_label` must return a non-null success result such as
+`true` (`null` or a missing result is an error).
 
 Check the manifest and negotiated extension point with:
 
