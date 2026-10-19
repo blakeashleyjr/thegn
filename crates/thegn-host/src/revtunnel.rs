@@ -106,13 +106,11 @@ pub(crate) struct TunnelRunLimits {
     deadline_secs: TunnelDeadlineSecs,
 }
 
-impl From<TunnelDeadlineSecs> for TunnelDeadlines {
-    fn from(deadlines: TunnelDeadlineSecs) -> Self {
-        Self {
-            write_stall: Duration::from_secs(deadlines.write_stall),
-            idle: deadlines.idle.map(Duration::from_secs),
-            lifetime: deadlines.lifetime.map(Duration::from_secs),
-        }
+fn host_deadlines(deadlines: TunnelDeadlineSecs) -> TunnelDeadlines {
+    TunnelDeadlines {
+        write_stall: Duration::from_secs(deadlines.write_stall),
+        idle: deadlines.idle.map(Duration::from_secs),
+        lifetime: deadlines.lifetime.map(Duration::from_secs),
     }
 }
 
@@ -225,7 +223,7 @@ impl ReverseTunnelSupervisor {
                             HostLimits {
                                 max_connections: limits.max_connections,
                                 global_permits: limits.global_permits.clone(),
-                                deadlines: limits.deadline_secs.into(),
+                                deadlines: host_deadlines(limits.deadline_secs),
                             },
                         )
                         .await
@@ -433,7 +431,7 @@ mod tests {
     #[test]
     fn host_deadline_conversion_preserves_config_zero_rules() {
         assert_eq!(
-            TunnelDeadlines::from(TunnelDeadlineSecs {
+            host_deadlines(TunnelDeadlineSecs {
                 write_stall: 60,
                 idle: None,
                 lifetime: Some(9),
