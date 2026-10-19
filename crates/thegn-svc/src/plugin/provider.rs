@@ -783,7 +783,7 @@ done
             .unwrap_err();
         assert!(matches!(
             first_error,
-            IssueError::Api(message) if message.contains("neither result nor error")
+            IssueError::Api(message) if message.contains("bad get_issue reply")
         ));
         drop(first);
 
@@ -802,7 +802,7 @@ done
             .unwrap_err();
         assert!(matches!(
             replacement_error,
-            IssueError::Api(message) if message.contains("neither result nor error")
+            IssueError::Api(message) if message.contains("bad get_issue reply")
         ));
     }
 
@@ -951,10 +951,13 @@ done
             .build()
             .unwrap();
         assert!(
-            rt.block_on(tokio::time::timeout(
-                Duration::from_millis(100),
-                bridge.call("issues", "never", serde_json::Value::Null)
-            ))
+            rt.block_on(async {
+                tokio::time::timeout(
+                    Duration::from_secs(1),
+                    bridge.call("issues", "never", serde_json::Value::Null),
+                )
+                .await
+            })
             .is_err()
         );
         assert!(bridge.pending.lock().unwrap().calls.is_empty());
