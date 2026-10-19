@@ -187,6 +187,10 @@ last time, which is how a deletion on the server becomes a deletion here rather
 than an event that lingers until the next full refetch. Syncs are floored at one
 minute apart no matter what `refresh_interval_secs` says.
 
+Each background sync also refreshes the month on screen as well as the current
+month. If you page through months quickly, only the last month you land on is
+fetched and drawn.
+
 Events are cached, so they are there the moment the popup opens and survive a
 restart. A sync that fails leaves the cache alone — you get yesterday's calendar
 rather than an empty one — and a provider that returns an empty calendar when

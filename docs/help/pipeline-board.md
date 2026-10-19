@@ -137,3 +137,11 @@ pipeline-specific hook configuration.
 Control clients use the Git-scoped `folders.assign` capability: pass exactly one
 of `folder` (a name) or `clear: true`; neither, or both, is rejected. Over MCP
 the `folders_assign` tool needs `--scopes git`.
+
+## Finishing a stage
+
+A worker reports with `thegn dispatch report <row>` and text that starts with
+`verdict:` and `gate:` lines (see the pipeline skill). A PASS without a gate
+result is not accepted as proof. Completion of a stage with an artifact is
+refused while thegn cannot read the worktree's git status; retry when it can,
+or record an explicit forced completion.
