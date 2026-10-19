@@ -225,7 +225,7 @@ pub fn record_authorized_with_proxy_worktree(
     public_key: &str,
     proxy_worktree: Option<&str>,
 ) -> Result<()> {
-    record_authorized_with_proxy_worktree_at(
+    let fingerprint = record_authorized_with_proxy_worktree_at(
         &dir(),
         provider,
         account,
@@ -234,7 +234,6 @@ pub fn record_authorized_with_proxy_worktree(
         public_key,
         proxy_worktree,
     )?;
-    let fingerprint = try_key_fingerprint(public_key)?;
     tracing::info!(
         target: "thegn::secret::audit",
         consumer = "managed-ssh:provision",
@@ -256,22 +255,20 @@ fn record_authorized_with_proxy_worktree_at(
     key_path: &Path,
     public_key: &str,
     proxy_worktree: Option<&str>,
-) -> Result<()> {
+) -> Result<String> {
     let fingerprint = try_key_fingerprint(public_key)?;
-    record_authorized_at(
-        dir,
-        &AuthorizedKeyRecord {
-            provider: provider.to_string(),
-            account: account.to_string(),
-            instance: instance.to_string(),
-            key_path: key_path.to_path_buf(),
-            key_fingerprint: fingerprint.clone(),
-            authorized_at: crate::util::now(),
-            proxy_worktree: proxy_worktree.map(str::to_string),
-            rotation_recovery: None,
-        },
-    )?;
-    Ok(())
+    let record = AuthorizedKeyRecord {
+        provider: provider.to_string(),
+        account: account.to_string(),
+        instance: instance.to_string(),
+        key_path: key_path.to_path_buf(),
+        key_fingerprint: fingerprint,
+        authorized_at: crate::util::now(),
+        proxy_worktree: proxy_worktree.map(str::to_string),
+        rotation_recovery: None,
+    };
+    record_authorized_at(dir, &record)?;
+    Ok(record.key_fingerprint)
 }
 
 pub fn record_authorized_at(dir: &Path, record: &AuthorizedKeyRecord) -> Result<()> {
@@ -537,6 +534,30 @@ mod tests {
             .is_err()
         );
         assert_eq!(std::fs::read_dir(temp.path()).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn authorization_helper_returns_the_published_fingerprint() {
+        let temp = tempfile::tempdir().unwrap();
+        let key = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIIgVgF3FLyN2aHUalBpkk3cMVfTgD+7TrbdfTAcSvLvB thegn";
+        let expected = "SHA256:7wNHZPUVQSnbsSe5yU7EEx0GGDS9qo9UK41TH7Cam/g";
+
+        let fingerprint = record_authorized_with_proxy_worktree_at(
+            temp.path(),
+            "fly",
+            "account",
+            "instance",
+            Path::new("/state/key"),
+            key,
+            None,
+        )
+        .unwrap();
+        let published = read_at(temp.path(), "fly", "account", "instance")
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(fingerprint, expected);
+        assert_eq!(published.key_fingerprint, fingerprint);
     }
 
     #[test]
