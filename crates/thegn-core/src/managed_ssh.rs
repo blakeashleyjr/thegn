@@ -779,7 +779,7 @@ mod tests {
             "env:FLY_WORK",
             "instance-1",
             key_path,
-            "ssh-ed25519 AAAATEST do-not-persist",
+            "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIIgVgF3FLyN2aHUalBpkk3cMVfTgD+7TrbdfTAcSvLvB do-not-persist",
         )
         .unwrap();
         let original = read("fly", "env:FLY_WORK", "instance-1").unwrap().unwrap();
@@ -828,7 +828,7 @@ mod tests {
             "account-a",
             "sprite-1",
             key,
-            "ssh-ed25519 AAAAONE",
+            "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIIgVgF3FLyN2aHUalBpkk3cMVfTgD+7TrbdfTAcSvLvB",
             Some("project/feature"),
         )
         .unwrap();
@@ -842,7 +842,7 @@ mod tests {
             "account-b",
             "sprite-1",
             key,
-            "ssh-ed25519 AAAATWO",
+            "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAICXLY4ay5H8w/Ud7QvnU1EtrjkvENKLoy7B0YU17bVzq",
             Some("project/other"),
         )
         .unwrap();
