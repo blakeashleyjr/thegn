@@ -440,7 +440,7 @@ impl QueryEngine {
             });
             let mut target_ids = target_ids;
             if has_more_targets {
-                target_ids.push("…".into());
+                target_ids.push(("…".into(), "…".into()));
             }
             drop(job_ids.insert(abort.id(), (panel_id, target_ids)));
         };
