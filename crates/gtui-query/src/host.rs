@@ -174,9 +174,20 @@ impl HostSource {
     /// earliest retained sample is more than two seconds after `from`. For
     /// recognized metrics, a gap in the retained timestamps clipped to the
     /// requested window is partial when consecutive points are more than one
-    /// sampling interval plus the coverage slack apart. Trailing gaps without
-    /// a retained successor are not inferred.
+    /// sampling interval plus the coverage slack apart. The effective window
+    /// end is `min(to, now_secs())`, using the host wall clock; when no retained
+    /// sample follows the requested end, this live-clock endpoint detects a
+    /// trailing gap without extending coverage into the future.
     fn frame_for(&self, expr: &str, range: &gtui_core::datasource::TimeRange) -> Frame {
+        self.frame_for_at(expr, range, now_secs())
+    }
+
+    fn frame_for_at(
+        &self,
+        expr: &str,
+        range: &gtui_core::datasource::TimeRange,
+        now: f64,
+    ) -> Frame {
         let (extract, recognized): (fn(&HostSample) -> Option<f64>, bool) = match expr {
             "host_cpu_pct" => (|s| s.cpu_pct.map(|v| v as f64), true),
             "host_mem_used" => (|s| s.mem_used.map(|v| v as f64), true),
@@ -197,6 +208,19 @@ impl HostSource {
                     let start = r.partition_point(|(ts, _)| *ts < from);
                     let end = r.partition_point(|(ts, _)| *ts <= to);
                     let sample_start = start.min(end);
+                    let last_point = if end > sample_start {
+                        Some(r[end - 1].0)
+                    } else {
+                        (sample_start > 0).then_some(from)
+                    };
+                    let trailing_point = if end < r.len() {
+                        Some(to)
+                    } else {
+                        let effective_end = to.min(now);
+                        (effective_end >= from
+                            && last_point.is_some_and(|last| effective_end > last))
+                        .then_some(effective_end)
+                    };
                     let has_gap = has_interior_gap(
                         std::iter::once(from)
                             .filter(|_| sample_start > 0)
@@ -206,7 +230,7 @@ impl HostSource {
                                     .take(end - sample_start)
                                     .map(|(ts, _)| *ts),
                             )
-                            .chain(std::iter::once(to).filter(|_| end < r.len())),
+                            .chain(trailing_point),
                     );
                     if has_gap && matches!(coverage, Coverage::Complete) {
                         coverage = Coverage::Partial {
@@ -380,6 +404,13 @@ mod tests {
         }
     }
 
+    fn admit_cpu_range_only(source: &HostSource, ranges: &[std::ops::RangeInclusive<i64>]) {
+        source.set_active(false);
+        wait_for("worker parked", || source.in_park.load(Ordering::Acquire));
+        source.ring.lock().unwrap().clear();
+        admit_cpu_range(source, ranges);
+    }
+
     fn q(expr: &str) -> Query {
         Query {
             ref_id: "A".into(),
@@ -520,6 +551,97 @@ mod tests {
 
         assert_eq!(
             source.frame_for("host_cpu_pct", &range(100, 110)).coverage,
+            Coverage::Complete
+        );
+    }
+
+    #[test]
+    fn trailing_hole_after_the_newest_sample_is_partial() {
+        let source = HostSource::try_new().unwrap();
+        admit_cpu_range_only(&source, &[100..=110]);
+
+        assert_eq!(
+            source
+                .frame_for_at("host_cpu_pct", &range(100, 200), 200.0)
+                .coverage,
+            Coverage::Partial {
+                retained_from: Some(100.0)
+            }
+        );
+    }
+
+    #[test]
+    fn window_ending_at_the_newest_sample_stays_complete() {
+        let source = HostSource::try_new().unwrap();
+        admit_cpu_range_only(&source, &[100..=110]);
+
+        assert_eq!(
+            source
+                .frame_for_at("host_cpu_pct", &range(100, 110), 500.0)
+                .coverage,
+            Coverage::Complete
+        );
+        assert_eq!(
+            source
+                .frame_for_at("host_cpu_pct", &range(100, 113), 113.0)
+                .coverage,
+            Coverage::Complete
+        );
+        assert_eq!(
+            source
+                .frame_for_at("host_cpu_pct", &range(100, 114), 114.0)
+                .coverage,
+            Coverage::Partial {
+                retained_from: Some(100.0)
+            }
+        );
+    }
+
+    #[test]
+    fn future_window_end_is_clamped_to_now() {
+        let source = HostSource::try_new().unwrap();
+        admit_cpu_range_only(&source, &[100..=110]);
+
+        assert_eq!(
+            source
+                .frame_for_at("host_cpu_pct", &range(100, 400), 111.0)
+                .coverage,
+            Coverage::Complete
+        );
+        assert_eq!(
+            source
+                .frame_for_at("host_cpu_pct", &range(100, 400), 300.0)
+                .coverage,
+            Coverage::Partial {
+                retained_from: Some(100.0)
+            }
+        );
+    }
+
+    #[test]
+    fn window_after_all_samples_is_partial() {
+        let source = HostSource::try_new().unwrap();
+        admit_cpu_range_only(&source, &[100..=110]);
+
+        assert_eq!(
+            source
+                .frame_for_at("host_cpu_pct", &range(150, 160), 160.0)
+                .coverage,
+            Coverage::Partial {
+                retained_from: Some(100.0)
+            }
+        );
+    }
+
+    #[test]
+    fn unknown_expression_stays_complete_with_a_trailing_hole() {
+        let source = HostSource::try_new().unwrap();
+        admit_cpu_range_only(&source, &[100..=110]);
+
+        assert_eq!(
+            source
+                .frame_for_at("nope", &range(100, 200), 200.0)
+                .coverage,
             Coverage::Complete
         );
     }
