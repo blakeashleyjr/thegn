@@ -1574,6 +1574,21 @@ fn reap_plan_limited(
     Ok((reap_plan_rows(&rows, live_ids), run_refs, truncated))
 }
 
+fn reap_facts(
+    f: &pipeline_run::VerifyFacts,
+    worker: pipeline_reap::WorkerLiveness,
+) -> pipeline_reap::ReapFacts {
+    pipeline_reap::ReapFacts {
+        worker,
+        artifact_exists: f.exists,
+        artifact_tracked: f.tracked,
+        report_present: f.report_present,
+        report_verdict: f.report_verdict,
+        report_gate_valid: f.report_gate_valid,
+        worktree_unknown: f.worktree_state == Some(pipeline_run::WorktreeState::Unknown),
+    }
+}
+
 /// Plan from a caller-owned row snapshot. The periodic daemon uses this form
 /// so no database mutex is held while `verify_facts` performs filesystem and
 /// git reads for each row.
@@ -1582,25 +1597,19 @@ pub(crate) fn reap_plan_rows(
     live_ids: Option<&[String]>,
 ) -> Vec<pipeline_reap::Reap> {
     pipeline_reap::plan(rows, |r| {
-        let f = verify_facts(r);
-        pipeline_reap::ReapFacts {
-            worker: if r
-                .session_id
-                .as_deref()
-                .is_some_and(|s| live_ids.is_some_and(|ids| ids.iter().any(|live| live == s)))
-            {
-                pipeline_reap::WorkerLiveness::Live
-            } else if r.exit_code.is_some() || r.exited_at_ms.is_some() {
-                pipeline_reap::WorkerLiveness::Exited
-            } else {
-                pipeline_reap::WorkerLiveness::Unknown
-            },
-            artifact_exists: f.exists,
-            artifact_tracked: f.tracked,
-            report_present: f.report_present,
-            report_verdict: f.report_verdict,
-            report_gate_valid: f.report_gate_valid,
-        }
+        let facts = verify_facts(r);
+        let worker = if r
+            .session_id
+            .as_deref()
+            .is_some_and(|s| live_ids.is_some_and(|ids| ids.iter().any(|id| id == s)))
+        {
+            pipeline_reap::WorkerLiveness::Live
+        } else if r.exit_code.is_some() || r.exited_at_ms.is_some() {
+            pipeline_reap::WorkerLiveness::Exited
+        } else {
+            pipeline_reap::WorkerLiveness::Unknown
+        };
+        reap_facts(&facts, worker)
     })
 }
 
@@ -4031,5 +4040,43 @@ mod tests {
             db.get_dispatch(row.id).unwrap().unwrap().status,
             AgentDispatchStatus::Spawning
         );
+    }
+
+    #[test]
+    fn reap_facts_carries_an_unknown_worktree_status() {
+        let facts = pipeline_run::VerifyFacts {
+            stage: Some("code".into()),
+            artifact: Some("artifact.md".into()),
+            exists: true,
+            tracked: true,
+            dirty: false,
+            worktree_state: Some(pipeline_run::WorktreeState::Unknown),
+            report_present: true,
+            report_verdict: pipeline_report::Verdict::Pass,
+            report_gate_valid: true,
+            report_commit_binding: pipeline_run::ReportCommitBinding::Bound,
+        };
+        let reap = reap_facts(&facts, pipeline_reap::WorkerLiveness::Exited);
+        assert!(reap.worktree_unknown);
+        assert_eq!(reap.worker, pipeline_reap::WorkerLiveness::Exited);
+    }
+
+    #[test]
+    fn done_gate_refuses_an_unknown_worktree_status() {
+        let facts = pipeline_run::VerifyFacts {
+            stage: Some("code".into()),
+            artifact: Some("artifact.md".into()),
+            exists: true,
+            tracked: true,
+            dirty: false,
+            worktree_state: Some(pipeline_run::WorktreeState::Unknown),
+            report_present: true,
+            report_verdict: pipeline_report::Verdict::Pass,
+            report_gate_valid: true,
+            report_commit_binding: pipeline_run::ReportCommitBinding::Bound,
+        };
+        let report = pipeline_run::verify_report(&facts);
+        let error = require_done_report(1, report).unwrap_err().to_string();
+        assert!(error.contains("worktree status"), "{error}");
     }
 }
