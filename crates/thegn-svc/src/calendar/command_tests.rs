@@ -11,6 +11,7 @@ fn sink() -> AdmittingSink {
             mode: None,
             refusal: None,
             invalid_event: None,
+            cursor_conflict: false,
         },
         granted: Vec::new(),
         junk: Vec::new(),
