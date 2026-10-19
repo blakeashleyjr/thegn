@@ -1635,6 +1635,7 @@ impl MonitorOverlay {
     /// takes an explicit input struct rather than `&self` so the hint set is
     /// testable without an overlay.
     fn footer(&self) -> Line {
+        let placed = self.placed_panels();
         footer::line(footer::FooterInput {
             tab: self.tab,
             prefs: &self.prefs,
@@ -1645,12 +1646,12 @@ impl MonitorOverlay {
             status: self.status.as_deref(),
             paused: self.paused,
             container_ours: self.container_rows.get(self.sel).is_some_and(|r| r.ours),
-            disk_rows: if self.disk_worktrees_placed() {
+            disk_rows: if self.worktrees_placed_in(&placed) {
                 self.disk_rows.len()
             } else {
                 0
             },
-            board_panels: self.placed_panels().len(),
+            board_panels: placed.len(),
             board_zoomed: self.board.is_zoomed(),
         })
     }

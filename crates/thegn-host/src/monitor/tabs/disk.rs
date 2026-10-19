@@ -194,11 +194,15 @@ fn kind_str(k: thegn_metrics::DiskKind) -> &'static str {
 
 impl MonitorOverlay {
     pub(in crate::monitor) fn disk_worktrees_placed(&self) -> bool {
+        self.worktrees_placed_in(&self.placed_panels())
+    }
+
+    pub(in crate::monitor) fn worktrees_placed_in(
+        &self,
+        placed: &[super::super::layout::Placed],
+    ) -> bool {
         self.tab == super::MonitorTab::Disk
-            && self
-                .placed_panels()
-                .iter()
-                .any(|panel| panel.id == view::WORKTREES)
+            && placed.iter().any(|panel| panel.id == view::WORKTREES)
     }
 
     /// Open a clean confirmation for the selected worktree row.
