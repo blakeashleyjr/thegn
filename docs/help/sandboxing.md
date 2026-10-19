@@ -509,6 +509,10 @@ Cleanup is always explicit — thegn never prunes on a schedule.
   for sidecars it removes, plus staging directories older than an hour whose
   sidecar is gone when at least one runtime could be listed; symlinks are
   never followed.
+  At startup, the sweep runs only when the effective configuration can produce
+  a sandbox container (enabled globally or by the active profile, an env
+  overlay, or a repo overlay for a known worktree); `thegn sandbox gc` runs it
+  regardless.
   Safe to run any time.
 - `thegn sandbox prune` reclaims **thegn-owned (`thegn-` name family) stopped
   containers**, and `thegn.managed` images and volumes. On a terminal it
