@@ -220,8 +220,8 @@ fn refresh_command(dir: &str, branch: &str, recursive_submodules: bool) -> Strin
         "set -e; d={d}; record={record}; git -C \"$d\" fetch -q {bundle} HEAD; \\
 if [ -e \"$record\" ]; then \\
 expected_head=$(sed -n '2p' \"$record\"); expected_tree=$(sed -n '1p' \"$record\"); \\
-current_head=$(git -C \"$d\" rev-parse HEAD) || { printf '%s\\n' 'could not compute remote worktree state; checkout retained for reconciliation' >&2; exit 3; }; \\
-current_tree=$({state_tree_command}) || { printf '%s\\n' 'could not compute remote worktree state; checkout retained for reconciliation' >&2; exit 3; }; \\
+current_head=$(git -C \"$d\" rev-parse HEAD) || {{ printf '%s\\n' 'could not compute remote worktree state; checkout retained for reconciliation' >&2; exit 3; }}; \\
+current_tree=$({state_tree_command}) || {{ printf '%s\\n' 'could not compute remote worktree state; checkout retained for reconciliation' >&2; exit 3; }}; \\
 if [ -z \"$expected_head\" ] || [ -z \"$expected_tree\" ] || [ \"$current_head\" != \"$expected_head\" ] || [ \"$current_tree\" != \"$expected_tree\" ]; then \\
 printf '%s\\n' 'remote worktree changes differ from last sync; checkout retained for reconciliation' >&2; exit 3; \\
 fi; \\
@@ -229,7 +229,7 @@ else \\
 if ! git -C \"$d\" merge-base --is-ancestor HEAD FETCH_HEAD; then \\
 printf '%s\\n' 'remote-only commit; checkout retained for reconciliation' >&2; exit 3; \\
 fi; \\
-status=$(git -C \"$d\" status --porcelain --untracked-files=all) || { printf '%s\\n' 'could not inspect remote worktree; checkout retained for reconciliation' >&2; exit 3; }; \\
+status=$(git -C \"$d\" status --porcelain --untracked-files=all) || {{ printf '%s\\n' 'could not inspect remote worktree; checkout retained for reconciliation' >&2; exit 3; }}; \\
 if [ -n \"$status\" ]; then printf '%s\\n' 'unrecorded remote worktree changes; checkout retained for reconciliation' >&2; exit 3; fi; \\
 fi; \\
 git -C \"$d\" reset -q --hard; git -C \"$d\" clean -ffdq; {checkout}{init}rm -f {bundle}",
