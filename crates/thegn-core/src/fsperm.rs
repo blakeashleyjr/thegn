@@ -321,7 +321,9 @@ fn cleanup_path_if_same(path: &Path, file: std::fs::File) {
     };
     match std::fs::symlink_metadata(path) {
         Ok(metadata) if (metadata.dev(), metadata.ino()) == expected => {
-            if let Err(error) = std::fs::remove_file(path) {
+            if let Err(error) = std::fs::remove_file(path)
+                && error.kind() != std::io::ErrorKind::NotFound
+            {
                 tracing::debug!(%error, path = %path.display(), "unable to remove private temporary");
             }
         }
@@ -338,10 +340,15 @@ fn cleanup_path_if_same(path: &Path, file: std::fs::File) {
 #[cfg(not(unix))]
 fn cleanup_path_if_same(path: &Path, file: std::fs::File) {
     drop(file);
-    if let Err(error) = std::fs::remove_file(path) {
-        if error.kind() != std::io::ErrorKind::NotFound {
-            tracing::debug!(%error, path = %path.display(), "unable to remove private temporary");
-        }
+    cleanup_path(path);
+}
+
+#[cfg(not(unix))]
+fn cleanup_path(path: &Path) {
+    if let Err(error) = std::fs::remove_file(path)
+        && error.kind() != std::io::ErrorKind::NotFound
+    {
+        tracing::debug!(%error, path = %path.display(), "unable to remove private temporary");
     }
 }
 
@@ -382,10 +389,10 @@ fn unlink_if_same(dir: &std::os::fd::OwnedFd, name: &str, expected: (u64, u64)) 
     let inspected = fstatat(dir, name, AtFlags::AT_SYMLINK_NOFOLLOW);
     match inspected {
         Ok(stat) if (stat.st_dev as u64, stat.st_ino as u64) == expected => {
-            if let Err(error) = unlinkat(dir, name, UnlinkatFlags::NoRemoveDir) {
-                if error != nix::errno::Errno::ENOENT {
-                    tracing::debug!(%error, name, "unable to remove private temporary");
-                }
+            if let Err(error) = unlinkat(dir, name, UnlinkatFlags::NoRemoveDir)
+                && error != nix::errno::Errno::ENOENT
+            {
+                tracing::debug!(%error, name, "unable to remove private temporary");
             }
         }
         Ok(_) => tracing::debug!(
@@ -967,12 +974,19 @@ pub fn write_owner_only_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()>
         }
     }
 
+    #[cfg(not(unix))]
+    {
+        drop(file);
+    }
     #[cfg(windows)]
     let publish = replace_file(&temporary, path);
     #[cfg(not(windows))]
     let publish = std::fs::rename(&temporary, path);
     if let Err(error) = publish {
+        #[cfg(unix)]
         cleanup_path_if_same(&temporary, file);
+        #[cfg(not(unix))]
+        cleanup_path(&temporary);
         return Err(error);
     }
     #[cfg(unix)]
@@ -1155,7 +1169,7 @@ mod tests {
         DIR_SYNCS.set(0);
         let dir = tempfile::tempdir().unwrap();
         let destination = dir.path().join("secret");
-        write_owner_only_atomic(destination, b"new").unwrap();
+        write_owner_only_atomic(&destination, b"new").unwrap();
         assert_eq!(DIR_SYNCS.get(), 1);
     }
 
@@ -1209,6 +1223,21 @@ mod tests {
         let replacement = std::fs::metadata(&original_path).unwrap();
         unlink_if_same(&dir.fd, "temporary", (replacement.dev(), replacement.ino()));
         assert!(!original_path.exists());
+    }
+
+    #[test]
+    fn path_cleanup_leaves_a_substituted_temporary_untouched() {
+        let dir = tempfile::tempdir().unwrap();
+        let original_path = dir.path().join("temporary");
+        let replacement_path = dir.path().join("replacement");
+        std::fs::write(&original_path, b"original").unwrap();
+        std::fs::write(&replacement_path, b"replacement").unwrap();
+        let original = std::fs::File::open(&original_path).unwrap();
+        std::fs::rename(replacement_path, &original_path).unwrap();
+
+        cleanup_path_if_same(&original_path, original);
+
+        assert_eq!(std::fs::read(&original_path).unwrap(), b"replacement");
     }
 
     #[test]
