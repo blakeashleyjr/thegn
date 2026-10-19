@@ -153,3 +153,11 @@ budget]`) produce one deduplicated `UsageLimit` notification for each breached
 scope, rolling-window anchor, and token/cost dimension. These configured spend
 caps are separate from the provider quota windows and `[usage.alerts]` warnings
 described above; no new usage-budget key is involved.
+
+Upstream calls have a 10-second connection limit. Buffered calls must receive
+headers within `[model_proxy] first_byte_timeout_secs` (45 seconds by default),
+receive each body chunk within `idle_timeout_secs` (120 seconds by default),
+and finish within 300 seconds total. Streams share the first-byte limit across
+opening headers and the first usable output, then use the idle limit between
+chunks; they end after one hour even while data continues. A timed-out attempt
+can fall through to the next upstream lane.
