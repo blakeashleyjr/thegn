@@ -168,20 +168,21 @@ impl HostSource {
         })
     }
 
+    /// Build a frame using the current host wall clock as the live-clock bound.
+    fn frame_for(&self, expr: &str, range: &gtui_core::datasource::TimeRange) -> Frame {
+        self.frame_for_at(expr, range, now_secs())
+    }
+
     /// Build a `(time, value)` frame for `expr` from the ring, keeping only
     /// samples where the metric is present. Both UTC range endpoints are
     /// inclusive. Coverage uses Unix seconds and marks a leading gap when the
     /// earliest retained sample is more than two seconds after `from`. For
     /// recognized metrics, a gap in the retained timestamps clipped to the
     /// requested window is partial when consecutive points are more than one
-    /// sampling interval plus the coverage slack apart. The effective window
-    /// end is `min(to, now_secs())`, using the host wall clock; when no retained
-    /// sample follows the requested end, this live-clock endpoint detects a
+    /// sampling interval plus the coverage slack apart. `now` is the live host
+    /// wall-clock bound for the effective window end, `min(to, now)`; when no
+    /// retained sample follows the requested end, this endpoint detects a
     /// trailing gap without extending coverage into the future.
-    fn frame_for(&self, expr: &str, range: &gtui_core::datasource::TimeRange) -> Frame {
-        self.frame_for_at(expr, range, now_secs())
-    }
-
     fn frame_for_at(
         &self,
         expr: &str,
