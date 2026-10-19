@@ -94,12 +94,6 @@ impl AppFoldWorkers {
     }
 }
 
-impl Default for AppFoldWorkers {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 struct AppFoldGuard<'a> {
     workers: &'a AppFoldWorkers,
 }
@@ -157,6 +151,7 @@ mod tests {
         let workers = Box::leak(Box::new(AppFoldWorkers::new()));
         let (entered_tx, entered_rx) = mpsc::channel();
         let worker = spawn_named("thegn-fold-wait", move || {
+            crate::platform::qos::set_self(crate::platform::qos::Qos::Background);
             workers.run_worker(|| {
                 entered_tx.send(()).unwrap();
                 while !requested() {
@@ -176,6 +171,7 @@ mod tests {
         let (entered_tx, entered_rx) = mpsc::channel();
         let (release_tx, release_rx) = mpsc::channel();
         let worker = spawn_named("thegn-fold-hold", move || {
+            crate::platform::qos::set_self(crate::platform::qos::Qos::Background);
             workers.run_worker(|| {
                 entered_tx.send(()).unwrap();
                 release_rx.recv().unwrap();
@@ -194,6 +190,7 @@ mod tests {
         let workers = Box::leak(Box::new(AppFoldWorkers::new()));
         let (entered_tx, entered_rx) = mpsc::channel();
         let worker = spawn_named("thegn-fold-nest", move || {
+            crate::platform::qos::set_self(crate::platform::qos::Qos::Background);
             workers.run_worker(|| {
                 entered_tx.send(()).unwrap();
                 while !workers.cancelled() {
