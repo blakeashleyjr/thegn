@@ -2411,24 +2411,45 @@ pub fn teardown_by_path(worktree: &str) {
 /// Remove a worktree's persistent container (OCI backends). Best-effort. Runs on
 /// the worktree's host (local or remote, per its `GitLoc`).
 pub fn teardown(cfg: &SandboxConfig, loc: &GitLoc, name: &str) {
+    let placement = placement_from_loc(cfg, loc);
+    teardown_placed(cfg, &placement, loc, name);
+}
+
+/// Remove a worktree's persistent container using its already-resolved placement.
+/// The worktree destroy path uses this when a named environment selected SSH.
+pub fn teardown_placed(cfg: &SandboxConfig, placement: &Placement, loc: &GitLoc, name: &str) {
     if !cfg.enabled {
         return;
     }
-    let placement = placement_from_loc(cfg, loc);
     // Drive the same remote daemon the create used, or `None` for the local
     // daemon; without this an `[sandbox] oci_host` container is never removed
     // (rm hits the local daemon, which never held it) and leaks forever.
     let oci_host = (!cfg.oci_host.trim().is_empty()).then(|| cfg.oci_host.trim());
+    let state_home = util::xdg_state_home();
+    let projects = teardown_projects_for_loc(&state_home, loc, name, !placement.is_local());
     // Try whichever OCI runtimes are available; the container only exists under one.
     for b in Backend::oci_runtimes() {
-        if available(&placement, b) == RuntimeProbe::Present {
-            run_teardown_argvs(
-                &placement,
-                b,
-                teardown_argvs(b, oci_host, name, &[name.to_string()]),
-            );
+        if available(placement, b) == RuntimeProbe::Present {
+            run_teardown_argvs(placement, b, teardown_argvs(b, oci_host, name, &projects));
         }
     }
+}
+
+/// Resolve teardown project paths from a Git location and its remote mount mode.
+pub(crate) fn teardown_projects_for_loc(
+    state_home: &std::path::Path,
+    loc: &GitLoc,
+    name: &str,
+    remote: bool,
+) -> Vec<String> {
+    let loc_path = loc.path();
+    let mut worktrees = vec![std::path::Path::new(&loc_path)];
+    if remote {
+        // remote_sync::retarget_if_remote_oci calls host::mount_remote_worktree
+        // with remote_sync::REMOTE_WORKTREE_DEST for materialized checkouts.
+        worktrees.push(std::path::Path::new("/workspace"));
+    }
+    crate::sandbox_compose::teardown_projects_for(state_home, name, &worktrees)
 }
 
 fn run_teardown_argvs(placement: &Placement, backend: Backend, argvs: Vec<Vec<String>>) {
