@@ -15,7 +15,8 @@
 //! staged create without authoritative machine identity cannot authorize expiry.
 //!
 //! Runs from the hydration thread ([`tick`] self-throttles to [`TICK_INTERVAL`]);
-//! network work runs on its own spawned thread.
+//! network work runs on its own spawned thread. A pass is single-flight across
+//! processes per provider kind.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
@@ -83,6 +84,20 @@ pub fn tick(cfg: &Config) {
 /// The ledger lacks an environment/account binding. Refuse ambiguous policies
 /// before provider construction, inventory access or local ledger retirement.
 fn reap(envs: &[EnvProviderConfig]) {
+    let lease = match crate::reaper_policy::try_reaper_lease("fly") {
+        Ok(Some(lease)) => lease,
+        Ok(None) => {
+            tracing::debug!(target: "thegn::lifecycle", "another thegn process is reconciling fly");
+            return;
+        }
+        Err(reason) => {
+            thegn_core::msg::warn(&format!(
+                "fly reaper: skipped fly: {reason}; no provider or ledger actions attempted"
+            ));
+            return;
+        }
+    };
+    let _lease = lease;
     if let Err(reason) = crate::reaper_policy::with_unambiguous(envs, reap_unambiguous) {
         thegn_core::msg::warn(&format!(
             "fly reaper: quarantined provider kind: {reason}; no provider or ledger actions attempted"

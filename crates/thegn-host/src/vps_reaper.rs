@@ -14,7 +14,8 @@
 //!   (the hard spend ceiling).
 //!
 //! Runs from the hydration thread ([`tick`] self-throttles to
-//! [`TICK_INTERVAL`]) and does all network work on its own spawned thread.
+//! [`TICK_INTERVAL`]) and does all network work on its own spawned thread. A
+//! pass is single-flight across processes per provider kind.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
@@ -85,6 +86,20 @@ fn reap(envs: &[(String, thegn_core::config::EnvProviderConfig)]) {
     let kinds: std::collections::BTreeSet<&str> =
         envs.iter().map(|(_, pc)| pc.provider.trim()).collect();
     for kind in kinds {
+        let lease = match crate::reaper_policy::try_reaper_lease(kind) {
+            Ok(Some(lease)) => lease,
+            Ok(None) => {
+                tracing::debug!(target: "thegn::lifecycle", "another thegn process is reconciling {kind}");
+                continue;
+            }
+            Err(reason) => {
+                thegn_core::msg::warn(&format!(
+                    "vps reaper: skipped {kind}: {reason}; no provider or ledger actions attempted"
+                ));
+                continue;
+            }
+        };
+        let _lease = lease;
         if let Err(reason) = crate::reaper_policy::with_unambiguous(
             envs.iter()
                 .filter(|(_, pc)| pc.provider.trim() == kind)
