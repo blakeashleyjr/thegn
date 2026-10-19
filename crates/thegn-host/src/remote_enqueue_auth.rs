@@ -182,6 +182,7 @@ fn revoke_owner(
 fn normalize_origin(raw: &str, scheme: &str) -> Result<String> {
     let url =
         url::Url::parse(raw).context("serving daemon advertised an invalid control origin URL")?;
+    // Keep the raw prefix check case-sensitive; URL parsing alone normalizes scheme case.
     anyhow::ensure!(
         url.scheme() == scheme && raw.starts_with(&format!("{scheme}://")),
         "serving daemon control origin scheme does not exactly match the configured topology"
@@ -216,9 +217,11 @@ fn select_control_origin(
     at_ms: i64,
     pid_alive: impl Fn(i64) -> bool,
 ) -> Result<String> {
+    let local_hostname = thegn_core::util::hostname();
     let mut origins = Vec::new();
     for row in rows {
         if scopes.contains(&row.scope)
+            && row.hostname == local_hostname
             && at_ms.saturating_sub(row.heartbeat_at)
                 <= thegn_svc::control::client::DAEMON_HEARTBEAT_TTL_MS
             && pid_alive(row.pid)
@@ -719,7 +722,7 @@ mod tests {
             endpoint: "/run/thegn.sock".into(),
             tcp_addr: Some("127.0.0.1:8484".into()),
             control_origin: Some("http://host.example:8443".into()),
-            hostname: "host".into(),
+            hostname: thegn_core::util::hostname(),
             version: "test".into(),
             started_at: at_ms,
             heartbeat_at: at_ms,
@@ -736,7 +739,7 @@ mod tests {
             endpoint: "/run/thegn.sock".into(),
             tcp_addr: Some("127.0.0.1:8484".into()),
             control_origin: Some(origin.into()),
-            hostname: "host".into(),
+            hostname: thegn_core::util::hostname(),
             version: "test".into(),
             started_at: heartbeat_at,
             heartbeat_at,
@@ -850,6 +853,14 @@ mod tests {
             normalize_origin("https://host.example:443", "https").unwrap(),
             "https://host.example"
         );
+    }
+
+    #[test]
+    fn row_from_another_hostname_is_ignored_even_when_its_pid_is_alive() {
+        let mut row = daemon_row("/state", 41, "https://remote.example", 10_000);
+        row.hostname = format!("{}-remote", thegn_core::util::hostname());
+        let rows = [row];
+        assert!(select_control_origin(&rows, &scopes(), "https", 10_000, |_| true).is_err());
     }
 
     fn ssh_target(host: &str) -> SshTarget {
