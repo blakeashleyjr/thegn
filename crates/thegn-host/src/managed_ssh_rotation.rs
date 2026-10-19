@@ -826,7 +826,7 @@ fn authorize_script(public_key: &str, key_id: &(String, String)) -> Result<Strin
          mkdir -p \"$HOME/.ssh\"\n\
          chmod 700 \"$HOME/.ssh\"\n\
          f=\"$HOME/.ssh/authorized_keys\"\n\
-         if [ -L \"$f\" ] || { [ -e \"$f\" ] && [ ! -f \"$f\" ]; }; then printf '%s\\n' 'TG-AUTHKEYS-ERROR:authorized_keys is not a regular file' >&2; exit 1; fi\n\
+         if [ -L \"$f\" ] || {{ [ -e \"$f\" ] && [ ! -f \"$f\" ]; }}; then printf '%s\\n' 'TG-AUTHKEYS-ERROR:authorized_keys is not a regular file' >&2; exit 1; fi\n\
          if [ ! -e \"$f\" ] && [ ! -L \"$f\" ]; then (umask 077; : > \"$f\"); fi\n\
          if [ -L \"$f\" ] || [ ! -f \"$f\" ]; then printf '%s\\n' 'TG-AUTHKEYS-ERROR:authorized_keys is not a regular file' >&2; exit 1; fi\n\
          cat \"$f\" > /dev/null\n\
