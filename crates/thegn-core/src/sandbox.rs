@@ -608,6 +608,8 @@ pub enum RefusalClass {
     ComposeTarget,
     ComposeServiceMissing,
     HostnamePolicy,
+    /// A local mount source could not be resolved to a stable host path.
+    MountUnresolvable,
 }
 
 /// Structured, safe context for a refused sandbox launch.
@@ -665,6 +667,53 @@ fn refusal(
     })
 }
 
+fn resolve_mount_source(host: &std::path::Path) -> std::io::Result<PathBuf> {
+    if !host.is_absolute() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "local mount source must be absolute",
+        ));
+    }
+    match host.canonicalize() {
+        Ok(source) => Ok(source),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            match std::fs::symlink_metadata(host) {
+                Err(metadata_error) if metadata_error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(metadata_error) => return Err(metadata_error),
+                Ok(_) => return Err(error),
+            }
+
+            let mut ancestor = host.to_path_buf();
+            let mut missing = Vec::new();
+            loop {
+                match std::fs::symlink_metadata(&ancestor) {
+                    Ok(_) => {
+                        let mut resolved = ancestor.canonicalize()?;
+                        for component in missing.iter().rev() {
+                            resolved.push(component);
+                        }
+                        return Ok(resolved);
+                    }
+                    Err(metadata_error)
+                        if metadata_error.kind() == std::io::ErrorKind::NotFound =>
+                    {
+                        let Some(name) = ancestor.file_name() else {
+                            return Err(error);
+                        };
+                        missing.push(name.to_os_string());
+                        let Some(parent) = ancestor.parent() else {
+                            return Err(error);
+                        };
+                        ancestor = parent.to_path_buf();
+                    }
+                    Err(metadata_error) => return Err(metadata_error),
+                }
+            }
+        }
+        Err(error) => Err(error),
+    }
+}
+
 /// The spec as it will actually be launched. For a sealed spec this drops every
 /// mount whose host path or destination lies inside the credential deny list
 /// (or whose allowlist target was retargeted since resolution) — whoever added
@@ -719,15 +768,45 @@ fn launchable(spec: &SandboxSpec) -> Result<std::borrow::Cow<'_, SandboxSpec>, E
         sealed_view(spec)
     };
     let mut canonical_view = view.into_owned();
-    for mount in &mut canonical_view.mounts {
-        if spec.placement.is_local()
-            && let Ok(source) = std::path::Path::new(&mount.host).canonicalize()
-        {
-            // Validate and emit the same host identity while preserving the
-            // path-visible destination used by bwrap, OCI, and systemd.
-            mount.host = source.to_string_lossy().into_owned();
+    let mut keep_mount = vec![true; canonical_view.mounts.len()];
+    if spec.placement.is_local() {
+        for (index, mount) in canonical_view.mounts.iter_mut().enumerate() {
+            match resolve_mount_source(std::path::Path::new(&mount.host)) {
+                Ok(source) => {
+                    // Validate and emit the same host identity while preserving the
+                    // path-visible destination used by bwrap, OCI, and systemd.
+                    mount.host = source.to_string_lossy().into_owned();
+                }
+                Err(error) if mount.cache => {
+                    keep_mount[index] = false;
+                    tracing::warn!(
+                        target: "thegn::sandbox",
+                        source = %mount.host,
+                        dest = %mount.dest,
+                        %error,
+                        "omitting unresolvable cache mount"
+                    );
+                }
+                Err(error) => {
+                    return Err(refusal(
+                        spec,
+                        RefusalClass::MountUnresolvable,
+                        Some(mount.dest.clone()),
+                        format!(
+                            "sandbox mount source `{}` (destination `{}`) cannot be resolved: {error}; refusing to launch with an unverified mount",
+                            mount.host, mount.dest
+                        ),
+                    ));
+                }
+            }
         }
     }
+    let mut index = 0;
+    canonical_view.mounts.retain(|_| {
+        let keep = keep_mount[index];
+        index += 1;
+        keep
+    });
     view = std::borrow::Cow::Owned(canonical_view);
     if let Some(m) = crate::sandbox_floor::home_gate(&view) {
         return Err(refusal(

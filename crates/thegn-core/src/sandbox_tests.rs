@@ -455,6 +455,170 @@ fn sealed_home_refusal_is_structured_and_keeps_its_display() {
     }
 }
 
+#[cfg(unix)]
+#[test]
+fn required_mount_symlink_loop_is_refused() {
+    use std::os::unix::fs::symlink;
+
+    let td = private_tempdir();
+    let a = td.path().join("a");
+    let b = td.path().join("b");
+    symlink(&b, &a).unwrap();
+    symlink(&a, &b).unwrap();
+    let path = a.to_string_lossy().into_owned();
+    let mut s = spec(Backend::Bwrap);
+    s.mounts = vec![Mount {
+        host: path.clone(),
+        dest: path.clone(),
+        ro: false,
+        cache: false,
+    }];
+
+    match enter_argv(&s, "true") {
+        Err(EnterError::Refused(refusal)) => {
+            assert_eq!(refusal.class, RefusalClass::MountUnresolvable);
+            assert_eq!(refusal.path.as_deref(), Some(path.as_str()));
+            assert!(refusal.message.contains(&path));
+        }
+        other => panic!("expected unresolvable-mount refusal, got {other:?}"),
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn required_mount_dangling_symlink_is_refused() {
+    use std::os::unix::fs::symlink;
+
+    let td = private_tempdir();
+    let path = td.path().join("link");
+    symlink(td.path().join("missing"), &path).unwrap();
+    let path = path.to_string_lossy().into_owned();
+    let mut s = spec(Backend::Bwrap);
+    s.mounts = vec![Mount {
+        host: path.clone(),
+        dest: path.clone(),
+        ro: false,
+        cache: false,
+    }];
+
+    match enter_argv(&s, "true") {
+        Err(EnterError::Refused(refusal)) => {
+            assert_eq!(refusal.class, RefusalClass::MountUnresolvable);
+            assert_eq!(refusal.path.as_deref(), Some(path.as_str()));
+        }
+        other => panic!("expected unresolvable-mount refusal, got {other:?}"),
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn required_mount_permission_denied_is_refused() {
+    use std::os::unix::fs::PermissionsExt;
+
+    if nix::unistd::geteuid().as_raw() == 0 {
+        // Root bypasses directory permissions, so this cannot exercise EACCES.
+        return;
+    }
+    let td = private_tempdir();
+    let locked = td.path().join("locked");
+    std::fs::create_dir(&locked).unwrap();
+    let path = locked.join("child");
+    std::fs::write(&path, "child").unwrap();
+    std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
+    let path = path.to_string_lossy().into_owned();
+    let mut s = spec(Backend::Bwrap);
+    s.mounts = vec![Mount {
+        host: path.clone(),
+        dest: path.clone(),
+        ro: false,
+        cache: false,
+    }];
+    let result = enter_argv(&s, "true");
+    std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o700)).unwrap();
+
+    match result {
+        Err(EnterError::Refused(refusal)) => {
+            assert_eq!(refusal.class, RefusalClass::MountUnresolvable);
+            assert_eq!(refusal.path.as_deref(), Some(path.as_str()));
+        }
+        other => panic!("expected unresolvable-mount refusal, got {other:?}"),
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn optional_cache_mount_that_cannot_resolve_is_dropped() {
+    use std::os::unix::fs::symlink;
+
+    let td = private_tempdir();
+    let loop_a = td.path().join("loop-a");
+    let loop_b = td.path().join("loop-b");
+    symlink(&loop_b, &loop_a).unwrap();
+    symlink(&loop_a, &loop_b).unwrap();
+    let worktree = td.path().join("worktree");
+    std::fs::create_dir(&worktree).unwrap();
+    let worktree = worktree.to_string_lossy().into_owned();
+    let loop_a = loop_a.to_string_lossy().into_owned();
+    let mut s = spec(Backend::Bwrap);
+    s.worktree = PathBuf::from(&worktree);
+    s.mounts = vec![
+        Mount {
+            host: worktree.clone(),
+            dest: worktree.clone(),
+            ro: false,
+            cache: false,
+        },
+        Mount {
+            host: loop_a.clone(),
+            dest: loop_a.clone(),
+            ro: true,
+            cache: true,
+        },
+    ];
+
+    let argv = enter_argv(&s, "true").expect("required worktree mount resolves");
+    let joined = argv.join(" ");
+    assert!(joined.contains(&worktree));
+    assert!(!joined.contains(&loop_a));
+}
+
+#[cfg(unix)]
+#[test]
+fn absent_mount_resolves_through_its_existing_ancestor() {
+    use std::os::unix::fs::symlink;
+
+    let td = private_tempdir();
+    let real = td.path().join("real");
+    std::fs::create_dir(&real).unwrap();
+    let alias = td.path().join("alias");
+    symlink(&real, &alias).unwrap();
+    let absent = alias.join("new");
+    let resolved = real.join("new");
+    let absent = absent.to_string_lossy().into_owned();
+    let resolved = resolved.to_string_lossy().into_owned();
+    let mut s = spec(Backend::Bwrap);
+    s.mounts = vec![Mount {
+        host: absent.clone(),
+        dest: "/mnt/absent".into(),
+        ro: false,
+        cache: false,
+    }];
+
+    let argv = enter_argv(&s, "true").expect("an absent leaf resolves via its existing parent");
+    let joined = argv.join(" ");
+    assert!(joined.contains(&resolved));
+    assert!(!argv.contains(&absent));
+}
+
+#[test]
+fn absent_mount_without_symlinks_keeps_its_path() {
+    let argv = enter_argv(&spec(Backend::Bwrap), "true")
+        .expect("the shared fixture's absent paths resolve through existing ancestors");
+    let joined = argv.join(" ");
+    assert!(joined.contains("/wt/feat"));
+    assert!(joined.contains("/repo/.git"));
+}
+
 #[test]
 fn refusal_constructor_preserves_each_class_and_field() {
     let spec = spec(Backend::Docker);
@@ -466,6 +630,7 @@ fn refusal_constructor_preserves_each_class_and_field() {
         RefusalClass::ComposeTarget,
         RefusalClass::ComposeServiceMissing,
         RefusalClass::HostnamePolicy,
+        RefusalClass::MountUnresolvable,
     ] {
         let error = refusal(
             &spec,
