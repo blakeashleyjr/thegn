@@ -1638,6 +1638,78 @@ fn ws_scheme(api_base: &str) -> String {
     }
 }
 
+const EXEC_CWD_NON_TTY_SCRIPT: &str = "cd -- \"$1\" || exit 125; shift; exec \"$@\"";
+const EXEC_CWD_TTY_SCRIPT: &str = "cd -- \"$1\" 2>/dev/null; shift; exec \"$@\"";
+const EXEC_WS_MAX_MESSAGE_SIZE: usize = 16 << 20;
+const EXEC_WS_MAX_FRAME_SIZE: usize = 4 << 20;
+const EXEC_WS_MAX_WRITE_BUFFER_SIZE: usize = 8 << 20;
+const PROXY_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+
+#[derive(Debug)]
+struct ProxyConnectTimeout {
+    deadline: std::time::Duration,
+}
+
+impl std::fmt::Display for ProxyConnectTimeout {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "sprites: proxy connect timed out after {:?}",
+            self.deadline
+        )
+    }
+}
+
+impl std::error::Error for ProxyConnectTimeout {}
+
+/// The wrapper could not enter the requested directory; the command did not run.
+pub const EXEC_CWD_FAILED_STATUS: i32 = 125;
+
+fn exec_argv(spec: &ExecSpec) -> Result<Vec<String>> {
+    let Some(cwd) = spec.cwd.as_deref().filter(|cwd| !cwd.trim().is_empty()) else {
+        return Ok(spec.argv.clone());
+    };
+    anyhow::ensure!(
+        cwd.starts_with('/') && !cwd.contains('\0'),
+        "sprites: exec cwd must be an absolute path without NUL"
+    );
+    anyhow::ensure!(
+        !spec.argv.is_empty(),
+        "sprites: exec argv must not be empty when cwd is set"
+    );
+
+    let script = if spec.tty {
+        EXEC_CWD_TTY_SCRIPT
+    } else {
+        EXEC_CWD_NON_TTY_SCRIPT
+    };
+    let mut argv = Vec::with_capacity(spec.argv.len() + 5);
+    argv.extend([
+        "/bin/sh".to_string(),
+        "-c".to_string(),
+        script.to_string(),
+        "thegn-exec".to_string(),
+        cwd.to_string(),
+    ]);
+    argv.extend(spec.argv.iter().cloned());
+    Ok(argv)
+}
+
+fn exec_ws_config() -> tokio_tungstenite::tungstenite::protocol::WebSocketConfig {
+    tokio_tungstenite::tungstenite::protocol::WebSocketConfig::default()
+        .max_message_size(Some(EXEC_WS_MAX_MESSAGE_SIZE))
+        .max_frame_size(Some(EXEC_WS_MAX_FRAME_SIZE))
+        .max_write_buffer_size(EXEC_WS_MAX_WRITE_BUFFER_SIZE)
+}
+
+fn next_connect_wait(
+    elapsed: std::time::Duration,
+    budget: std::time::Duration,
+    step: std::time::Duration,
+) -> Option<std::time::Duration> {
+    (elapsed < budget).then(|| step.min(budget - elapsed))
+}
+
 /// Build the Sprites open-exec WSS URL: `wss://…/sprites/{id}/exec?cmd=…&tty=…`.
 fn exec_ws_url(api_base: &str, id: &str, spec: &ExecSpec) -> Result<String> {
     let base = ws_scheme(api_base);
@@ -1645,7 +1717,7 @@ fn exec_ws_url(api_base: &str, id: &str, spec: &ExecSpec) -> Result<String> {
         .context("sprites: bad exec url")?;
     {
         let mut q = url.query_pairs_mut();
-        for a in &spec.argv {
+        for a in exec_argv(spec)? {
             q.append_pair("cmd", a);
         }
         q.append_pair("tty", if spec.tty { "true" } else { "false" });
@@ -1860,14 +1932,26 @@ impl SpritesProvider {
                 .into_client_request()
                 .context("sprites: build exec ws request")?;
             req.headers_mut().insert("Authorization", auth.clone());
-            match tokio::time::timeout(ATTEMPT_TIMEOUT, tokio_tungstenite::connect_async(req)).await
+            let Some(attempt_timeout) =
+                next_connect_wait(start.elapsed(), CONNECT_BUDGET, ATTEMPT_TIMEOUT)
+            else {
+                return Err(anyhow!(
+                    "sprites: exec ws connect timed out after {}s",
+                    start.elapsed().as_secs()
+                ));
+            };
+            match tokio::time::timeout(
+                attempt_timeout,
+                tokio_tungstenite::connect_async_with_config(req, Some(exec_ws_config()), false),
+            )
+            .await
             {
                 Ok(Ok((ws, _resp))) => break ws,
                 res => {
                     let permanent = matches!(&res, Ok(Err(tokio_tungstenite::tungstenite::Error::Http(response)))
                         if response.status().is_client_error()
                             && !matches!(response.status().as_u16(), 408 | 429));
-                    if !cold_open || permanent || start.elapsed() >= CONNECT_BUDGET {
+                    if !cold_open || permanent {
                         return match res {
                             Ok(Err(e)) => Err(e).context("sprites: exec ws connect"),
                             _ => Err(anyhow!(
@@ -1881,7 +1965,14 @@ impl SpritesProvider {
                         elapsed_s = start.elapsed().as_secs(),
                         "sprite exec endpoint not ready (cold boot?); retrying connect"
                     );
-                    tokio::time::sleep(BACKOFF).await;
+                    let Some(backoff) = next_connect_wait(start.elapsed(), CONNECT_BUDGET, BACKOFF)
+                    else {
+                        return Err(anyhow!(
+                            "sprites: exec ws connect timed out after {}s",
+                            start.elapsed().as_secs()
+                        ));
+                    };
+                    tokio::time::sleep(backoff).await;
                 }
             }
         };
@@ -1903,8 +1994,6 @@ impl SpritesProvider {
     /// WSS endpoint (bearer auth + a `{host,port}` init frame, then a transparent
     /// byte relay). Used to tunnel an `ssh` connection to an in-sandbox `sshd`.
     pub async fn open_proxy(&self, id: &str, host: &str, port: u16) -> Result<ProxyStream> {
-        use futures_util::SinkExt;
-        use tokio_tungstenite::tungstenite::Message;
         use tokio_tungstenite::tungstenite::client::IntoClientRequest;
         let url = proxy_ws_url(self.base()?, id)?;
         let mut req = url
@@ -1914,13 +2003,7 @@ impl SpritesProvider {
             .parse()
             .context("sprites: proxy auth header")?;
         req.headers_mut().insert("Authorization", auth);
-        let (mut ws, _resp) = tokio_tungstenite::connect_async(req)
-            .await
-            .context("sprites: proxy ws connect")?;
-        // The init frame selects the target; after it, the socket is a raw relay.
-        ws.send(Message::Text(proxy_init_json(host, port).into()))
-            .await
-            .context("sprites: proxy init")?;
+        let ws = connect_proxy_ws(req, proxy_init_json(host, port), PROXY_CONNECT_TIMEOUT).await?;
 
         let (to_srv_tx, to_srv_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(256);
         let (from_srv_tx, from_srv_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(256);
@@ -1929,6 +2012,34 @@ impl SpritesProvider {
             rx: from_srv_rx,
             tx: to_srv_tx,
         })
+    }
+}
+
+async fn connect_proxy_ws(
+    req: tokio_tungstenite::tungstenite::http::Request<()>,
+    init: String,
+    deadline: std::time::Duration,
+) -> Result<
+    tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>,
+> {
+    use futures_util::SinkExt;
+    use tokio_tungstenite::tungstenite::Message;
+
+    let result = tokio::time::timeout(deadline, async move {
+        let (mut ws, _resp) =
+            tokio_tungstenite::connect_async_with_config(req, Some(exec_ws_config()), false)
+                .await
+                .context("sprites: proxy ws connect")?;
+        // The init frame selects the target; after it, the socket is a raw relay.
+        ws.send(Message::Text(init.into()))
+            .await
+            .context("sprites: proxy init")?;
+        Ok::<_, anyhow::Error>(ws)
+    })
+    .await;
+    match result {
+        Ok(result) => result,
+        Err(_) => Err(anyhow::Error::new(ProxyConnectTimeout { deadline })),
     }
 }
 
@@ -2710,6 +2821,163 @@ mod tests {
         assert!(url.contains("cols=120"));
         assert!(url.contains("rows=40"));
         assert!(url.contains("env=FOO%3Dbar+baz"));
+    }
+
+    #[test]
+    fn exec_ws_url_wraps_cwd_as_separate_positional_arguments() {
+        let spec = ExecSpec {
+            argv: vec!["git".into(), "status".into()],
+            tty: false,
+            cols: 0,
+            rows: 0,
+            env: Vec::new(),
+            cwd: Some("/work/a b".into()),
+        };
+        let url =
+            reqwest::Url::parse(&exec_ws_url("https://api.sprites.dev/v1", "dev", &spec).unwrap())
+                .unwrap();
+        let commands = url
+            .query_pairs()
+            .filter(|(key, _)| key == "cmd")
+            .map(|(_, value)| value.into_owned())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            commands,
+            vec![
+                "/bin/sh",
+                "-c",
+                EXEC_CWD_NON_TTY_SCRIPT,
+                "thegn-exec",
+                "/work/a b",
+                "git",
+                "status"
+            ]
+        );
+
+        let tty_spec = ExecSpec { tty: true, ..spec };
+        let tty_url = reqwest::Url::parse(
+            &exec_ws_url("https://api.sprites.dev/v1", "dev", &tty_spec).unwrap(),
+        )
+        .unwrap();
+        let tty_commands = tty_url
+            .query_pairs()
+            .filter(|(key, _)| key == "cmd")
+            .map(|(_, value)| value.into_owned())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            tty_commands,
+            vec![
+                "/bin/sh",
+                "-c",
+                EXEC_CWD_TTY_SCRIPT,
+                "thegn-exec",
+                "/work/a b",
+                "git",
+                "status"
+            ]
+        );
+    }
+
+    #[test]
+    fn exec_cwd_validation_fails_closed_and_blank_cwd_is_unchanged() {
+        let base = ExecSpec {
+            argv: vec!["echo".into(), "ok".into()],
+            tty: false,
+            cols: 0,
+            rows: 0,
+            env: Vec::new(),
+            cwd: Some("relative".into()),
+        };
+        assert!(exec_argv(&base).is_err());
+
+        let nul_cwd = ExecSpec {
+            cwd: Some("/a\0b".into()),
+            ..base.clone()
+        };
+        assert!(exec_argv(&nul_cwd).is_err());
+
+        let blank_cwd = ExecSpec {
+            cwd: Some("  \t".into()),
+            ..base.clone()
+        };
+        assert_eq!(exec_argv(&blank_cwd).unwrap(), base.argv);
+
+        let empty_argv = ExecSpec {
+            argv: Vec::new(),
+            cwd: Some("/work".into()),
+            ..base
+        };
+        assert!(exec_argv(&empty_argv).is_err());
+    }
+
+    #[test]
+    fn exec_websocket_config_has_explicit_limits() {
+        let config = exec_ws_config();
+        assert_eq!(config.max_message_size, Some(16 << 20));
+        assert_eq!(config.max_frame_size, Some(4 << 20));
+        assert_eq!(config.max_write_buffer_size, 8 << 20);
+    }
+
+    #[test]
+    fn connect_waits_never_exceed_the_remaining_budget() {
+        use std::time::Duration;
+
+        assert_eq!(
+            next_connect_wait(
+                Duration::ZERO,
+                Duration::from_secs(90),
+                Duration::from_secs(8)
+            ),
+            Some(Duration::from_secs(8))
+        );
+        assert_eq!(
+            next_connect_wait(
+                Duration::from_secs(88),
+                Duration::from_secs(90),
+                Duration::from_secs(3)
+            ),
+            Some(Duration::from_secs(2))
+        );
+        assert_eq!(
+            next_connect_wait(
+                Duration::from_secs(90),
+                Duration::from_secs(90),
+                Duration::from_secs(3)
+            ),
+            None
+        );
+        assert_eq!(
+            next_connect_wait(
+                Duration::from_secs(95),
+                Duration::from_secs(90),
+                Duration::from_secs(3)
+            ),
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn proxy_connect_deadline_bounds_a_silent_listener() {
+        use std::time::Duration;
+        use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let accept_thread = std::thread::spawn(move || listener.accept().unwrap());
+        let req = format!("ws://{address}/x").into_client_request().unwrap();
+        let result = tokio::time::timeout(
+            Duration::from_secs(2),
+            connect_proxy_ws(req, "{}".into(), Duration::from_millis(200)),
+        )
+        .await;
+        let accepted = accept_thread.join().unwrap().0;
+        assert!(matches!(
+            result,
+            Ok(Err(error))
+                if error.downcast_ref::<ProxyConnectTimeout>().is_some_and(|timeout|
+                    timeout.deadline == Duration::from_millis(200))
+        ));
+        drop(accepted);
     }
 
     #[test]
