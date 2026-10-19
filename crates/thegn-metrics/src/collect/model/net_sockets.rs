@@ -2,7 +2,7 @@
 use super::super::frame::Part;
 use super::net_attrib::NetAttribution;
 
-#[derive(Debug, Default, Clone, PartialEq, Eq)]
+#[derive(Debug, Default, PartialEq, Eq)]
 pub struct NetSocketsPart {
     /// Linux TCP states indexed by the one-based `TCP_*` state number.
     pub states: [u32; 12],
@@ -17,6 +17,34 @@ pub struct NetSocketsPart {
     pub attribution: NetAttribution,
     pub attribution_interval_ms: Option<u32>,
     pub physical_known: bool,
+}
+
+impl Clone for NetSocketsPart {
+    fn clone(&self) -> Self {
+        let mut cloned = Self::default();
+        cloned.clone_from(self);
+        cloned
+    }
+
+    fn clone_from(&mut self, source: &Self) {
+        self.states = source.states;
+        self.listening = source.listening;
+        self.rtt_p50_us = source.rtt_p50_us;
+        self.rtt_p90_us = source.rtt_p90_us;
+        self.rtt_max_us = source.rtt_max_us;
+        self.rtt_hist = source.rtt_hist;
+        self.sockets = source.sockets;
+        self.malformed = source.malformed;
+        self.truncated = source.truncated;
+        self.attribution
+            .owners
+            .clone_from(&source.attribution.owners);
+        self.attribution.unattributed_rx = source.attribution.unattributed_rx;
+        self.attribution.unattributed_tx = source.attribution.unattributed_tx;
+        self.attribution.truncated = source.attribution.truncated;
+        self.attribution_interval_ms = source.attribution_interval_ms;
+        self.physical_known = source.physical_known;
+    }
 }
 
 impl Part for NetSocketsPart {
@@ -70,5 +98,30 @@ mod tests {
         part.clear();
         assert_eq!(part, NetSocketsPart::default());
         assert_eq!(part.attribution.owners.capacity(), capacity);
+    }
+
+    #[test]
+    fn clone_from_reuses_owner_capacity() {
+        let owner = OwnerRates {
+            cgroup_id: 7,
+            path: Arc::from(&b"/user.slice/app.slice"[..]),
+            kind: OwnerKind::App,
+            name: Arc::from(&b"app"[..]),
+            rx_bytes: 10,
+            tx_bytes: 20,
+        };
+        let source = NetSocketsPart {
+            attribution: NetAttribution {
+                owners: vec![owner],
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let mut destination = NetSocketsPart::default();
+        destination.attribution.owners.reserve(8);
+        let capacity = destination.attribution.owners.capacity();
+        destination.clone_from(&source);
+        assert_eq!(destination, source);
+        assert_eq!(destination.attribution.owners.capacity(), capacity);
     }
 }
