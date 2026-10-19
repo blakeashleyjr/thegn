@@ -428,7 +428,8 @@ fn missing_fan_reading_keeps_gap_blank_in_ascii_and_older_samples_visible() {
                 11,
                 braille,
             );
-            let rows = text(&mut surface).lines().collect::<Vec<_>>();
+            let rendered = text(&mut surface);
+            let rows = rendered.lines().collect::<Vec<_>>();
             let graph_row = rows[1];
             let older = graph_row
                 .chars()
