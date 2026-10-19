@@ -234,7 +234,7 @@ fn x_still_confirms_after_unzoom() {
     let (mut overlay, selected) = overlay_with_worktree_rows();
     overlay.handle_key(&KeyCode::Char('f'), Modifiers::NONE);
     overlay.handle_key(&KeyCode::Char('z'), Modifiers::NONE);
-    overlay.handle_key(&KeyCode::Esc, Modifiers::NONE);
+    overlay.handle_key(&KeyCode::Escape, Modifiers::NONE);
     assert!(overlay.disk_worktrees_placed());
 
     overlay.handle_key(&KeyCode::Char('x'), Modifiers::NONE);
