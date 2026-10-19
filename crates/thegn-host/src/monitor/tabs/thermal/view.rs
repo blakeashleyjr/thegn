@@ -98,7 +98,7 @@ pub(in crate::monitor) struct ThermalModel {
     cooling_panel_present: bool,
     pair_samples: usize,
     pair_fan_buf: Vec<f32>,
-    pair_sensor_buf: Vec<f32>,
+    pair_sensor_flat: Vec<f32>,
     cores: [Option<f32>; 16],
     core_layout_generation: Option<u64>,
     core_source_hwmon: bool,
@@ -133,7 +133,7 @@ impl Default for ThermalModel {
             cooling_panel_present: false,
             pair_samples: 0,
             pair_fan_buf: Vec::with_capacity(HISTORY_CAP),
-            pair_sensor_buf: Vec::with_capacity(HISTORY_CAP),
+            pair_sensor_flat: Vec::with_capacity(SENSOR_CAP * HISTORY_CAP),
             cores: [None; 16],
             core_layout_generation: None,
             core_source_hwmon: false,
@@ -166,11 +166,11 @@ struct FanRow {
     label: String,
     rpm: Option<f32>,
     target: Option<f32>,
-    peak: f32,
+    peak: Option<f32>,
     history: [f32; HISTORY_CAP],
     history_len: usize,
     history_next: usize,
-    pair: Option<usize>,
+    pair: Option<String>,
     seen: bool,
 }
 
@@ -182,7 +182,7 @@ impl Default for FanRow {
             label: String::new(),
             rpm: None,
             target: None,
-            peak: 0.0,
+            peak: None,
             history: [0.0; HISTORY_CAP],
             history_len: 0,
             history_next: 0,
@@ -349,7 +349,7 @@ impl ThermalModel {
                         .filter(|rpm| rpm.is_finite() && (0.0..=30_000.0).contains(rpm));
                     row.rpm = reading;
                     if let Some(rpm) = reading {
-                        row.peak = row.peak.max(rpm);
+                        row.peak = Some(row.peak.map_or(rpm, |peak| peak.max(rpm)));
                         row.history[row.history_next] = rpm;
                         row.history_next = (row.history_next + 1) % HISTORY_CAP;
                         row.history_len = row.history_len.saturating_add(1).min(HISTORY_CAP);
@@ -611,37 +611,45 @@ impl ThermalModel {
     }
 
     fn recompute_fan_pairs(&mut self) {
-        let mut ordered_sensors = [[f32::NAN; HISTORY_CAP]; SENSOR_CAP];
         let mut sensor_slices: [&[f32]; SENSOR_CAP] = [&[]; SENSOR_CAP];
+        let mut counts = [0usize; SENSOR_CAP];
         let sensor_count = self.sensors.len().min(SENSOR_CAP);
+        self.pair_sensor_flat.clear();
         // Sensor rings skip absent readings, so newest alignment is approximate;
         // the correlation is only a display hint.
         for (sensor_index, sensor) in self.sensors.iter().take(sensor_count).enumerate() {
             let count = sensor.history_len.min(HISTORY_CAP);
             let first = (sensor.history_next + HISTORY_CAP - count) % HISTORY_CAP;
-            self.pair_sensor_buf.clear();
-            self.pair_sensor_buf.reserve(count);
+            counts[sensor_index] = count;
             for offset in 0..count {
-                self.pair_sensor_buf
+                self.pair_sensor_flat
                     .push(sensor.history[(first + offset) % HISTORY_CAP]);
             }
-            ordered_sensors[sensor_index][..count].copy_from_slice(&self.pair_sensor_buf);
-            sensor_slices[sensor_index] = &ordered_sensors[sensor_index][..count];
         }
-        for fan in &mut self.fans {
+        let mut offset = 0;
+        for (sensor_index, _) in self.sensors.iter().take(sensor_count).enumerate() {
+            let count = counts[sensor_index];
+            sensor_slices[sensor_index] = &self.pair_sensor_flat[offset..offset + count];
+            offset += count;
+        }
+        let mut pairs: [Option<String>; FAN_CAP] = std::array::from_fn(|_| None);
+        for (fan_index, fan) in self.fans.iter().take(FAN_CAP).enumerate() {
             let count = fan.history_len.min(HISTORY_CAP);
             let first = (fan.history_next + HISTORY_CAP - count) % HISTORY_CAP;
             self.pair_fan_buf.clear();
-            self.pair_fan_buf.reserve(count);
             for offset in 0..count {
                 self.pair_fan_buf
                     .push(fan.history[(first + offset) % HISTORY_CAP]);
             }
-            fan.pair = thermal::pair_fan(
+            pairs[fan_index] = thermal::pair_fan(
                 &self.pair_fan_buf,
                 &sensor_slices[..sensor_count],
                 thermal::PAIR_MIN_SAMPLES,
-            );
+            )
+            .map(|sensor_index| self.sensors[sensor_index].key.clone());
+        }
+        for (fan, pair) in self.fans.iter_mut().zip(pairs) {
+            fan.pair = pair;
         }
     }
 
@@ -886,41 +894,47 @@ impl TabView for ThermalView<'_> {
         if placed.id == COOLING {
             let rows_per_fan = 2;
             let fan_count = self.0.fans.len().min(inner.rows / rows_per_fan);
-            let graph_x = rect.x.saturating_add(inner.x).saturating_add(24);
-            let graph_width = inner.cols.saturating_sub(24 + 13);
+            let braille = crate::monitor::graphs::table().braille;
             for (index, fan) in self.0.fans.iter().take(fan_count).enumerate() {
                 let count = fan.history_len.min(HISTORY_CAP);
                 let first = (fan.history_next + HISTORY_CAP - count) % HISTORY_CAP;
                 let mut normalized = [f32::NAN; HISTORY_CAP];
                 for (offset, value) in normalized.iter_mut().take(count).enumerate() {
                     let rpm = fan.history[(first + offset) % HISTORY_CAP];
-                    if rpm.is_finite() && fan.peak > 0.0 {
-                        *value = (rpm / fan.peak).clamp(0.0, 1.0);
+                    if rpm.is_finite()
+                        && let Some(peak) = fan.peak
+                    {
+                        *value = if peak > 0.0 {
+                            (rpm / peak).clamp(0.0, 1.0)
+                        } else {
+                            0.0
+                        };
                     }
                 }
-                if count > 1
-                    && !normalized[count - 1].is_finite()
-                    && crate::monitor::graphs::table().braille
-                {
-                    // Braille packs two samples into one cell; keep the trailing
-                    // missing sample's cell blank instead of showing its older half.
-                    normalized[count - 2] = f32::NAN;
-                }
-                paint_history_runs(
-                    &normalized,
-                    count,
-                    Rect {
-                        x: graph_x,
+                let rpm = fan.rpm.map_or_else(
+                    || crate::caps::active_glyphs().emdash.to_owned(),
+                    |value| format!("{value:.0}rpm"),
+                );
+                let target = fan
+                    .target
+                    .map_or_else(String::new, |value| format!(" target {value:.0}"));
+                let label_width = format!("{} {}  {rpm}{target}", fan.chip, fan.label)
+                    .chars()
+                    .count();
+                let graph_start = label_width.saturating_add(1);
+                if graph_start < inner.cols {
+                    let plot = Rect {
+                        x: rect.x.saturating_add(inner.x).saturating_add(graph_start),
                         y: rect
                             .y
                             .saturating_add(inner.y)
                             .saturating_add(index * rows_per_fan),
-                        cols: graph_width,
+                        cols: inner.cols.saturating_sub(graph_start),
                         rows: 1,
-                    },
-                    crate::monitor::graphs::table().braille,
-                    surface,
-                );
+                    };
+                    let plot = crate::monitor::kit::history_rect::graph_rect(plot, count, braille);
+                    paint_history_runs(&normalized, count, plot, braille, surface);
+                }
             }
         }
         if placed.id == PACKAGE && inner.rows > 5 && !self.0.temp_history.is_empty() {

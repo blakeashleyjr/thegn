@@ -259,6 +259,14 @@ fn cooling_panel_appears_only_when_the_layout_has_a_fan() {
             .iter()
             .any(|panel| panel.id == super::COOLING)
     );
+    let cooling = Placed {
+        id: super::COOLING,
+        rect: area,
+        variant: super::FULL.kind,
+    };
+    let mut surface = Surface::new(240, 60);
+    view.paint(&mut surface, &cooling, area, 0, &[]);
+    assert!(!text(&mut surface).contains("0rpm"));
     assert_eq!(
         view.demand(super::COOLING).iter().collect::<Vec<_>>(),
         [CollectorId::Hwmon]
@@ -278,7 +286,7 @@ fn fan_rows_follow_stable_keys_and_keep_a_bounded_ring() {
         model.fans.capacity(),
         model.sensors.capacity(),
         model.pair_fan_buf.capacity(),
-        model.pair_sensor_buf.capacity(),
+        model.pair_sensor_flat.capacity(),
         model.cooling.capacity(),
     );
     for sample in 0..1_000 {
@@ -294,7 +302,7 @@ fn fan_rows_follow_stable_keys_and_keep_a_bounded_ring() {
             model.fans.capacity(),
             model.sensors.capacity(),
             model.pair_fan_buf.capacity(),
-            model.pair_sensor_buf.capacity(),
+            model.pair_sensor_flat.capacity(),
             model.cooling.capacity(),
         ),
         capacities
@@ -332,16 +340,7 @@ fn cooling_panel_shows_rpm_target_peak_and_pair() {
             assert!(model.fans[0].pair.is_some());
         }
     }
-    assert_eq!(
-        model.fans[0].pair,
-        Some(
-            model
-                .sensors
-                .iter()
-                .position(|sensor| sensor.key == "sensor-package")
-                .expect("package sensor")
-        )
-    );
+    assert_eq!(model.fans[0].pair, Some("sensor-package".to_owned()));
     let view = ThermalView(&model);
     let area = Rect::full(240, 60);
     let placed = Board::default()
@@ -384,7 +383,7 @@ fn zones_panel_lists_engaged_passive_cooling() {
 }
 
 #[test]
-fn missing_fan_reading_paints_a_blank_newest_cell_in_unicode_and_ascii() {
+fn missing_fan_reading_keeps_gap_blank_in_ascii_and_older_samples_visible() {
     let mut model = ThermalModel::default();
     let mut frame = fixture_with_fan();
     let fan_index = frame.parts.hwmon.values.len() - 2;
@@ -405,25 +404,49 @@ fn missing_fan_reading_paints_a_blank_newest_cell_in_unicode_and_ascii() {
             let mut surface = Surface::new(160, 45);
             ThermalView(&model).paint(&mut surface, &placed, area, 0, &[]);
             let braille = crate::monitor::graphs::table().braille;
+            let rpm = model.fans[0].rpm.map_or_else(
+                || caps::active_glyphs().emdash.to_owned(),
+                |value| format!("{value:.0}rpm"),
+            );
+            let target = model.fans[0]
+                .target
+                .map_or_else(String::new, |value| format!(" target {value:.0}"));
+            let label_width = format!(
+                "{} {}  {rpm}{target}",
+                model.fans[0].chip, model.fans[0].label
+            )
+            .chars()
+            .count();
+            let plot_start = label_width + 1;
             let graph_rect = crate::monitor::kit::history_rect::graph_rect(
                 Rect {
-                    x: 25,
+                    x: 1 + plot_start,
                     y: 1,
-                    cols: 160 - 2 - 24 - 13,
+                    cols: (160 - 2).saturating_sub(plot_start),
                     rows: 1,
                 },
                 11,
                 braille,
             );
-            let newest = text(&mut surface)
-                .lines()
-                .nth(1)
-                .and_then(|line| line.chars().nth(graph_rect.x + graph_rect.cols - 1))
-                .expect("newest history cell exists");
+            let rows = text(&mut surface).lines().collect::<Vec<_>>();
+            let graph_row = rows[1];
+            let older = graph_row
+                .chars()
+                .nth(graph_rect.x + graph_rect.cols.saturating_sub(2))
+                .expect("older history cell exists");
             assert!(
-                newest == ' ' || newest == '\u{2800}',
-                "newest cell: {newest:?}"
+                older != ' ' && older != '\u{2800}',
+                "older real sample cell: {older:?}"
             );
+            if !braille {
+                let newest = graph_row
+                    .chars()
+                    .nth(graph_rect.x + graph_rect.cols - 1)
+                    .expect("newest history cell exists");
+                assert!(newest == ' ', "newest ASCII cell: {newest:?}");
+            } else {
+                assert!(graph_rect.cols > 0, "braille graph has a visible cell");
+            }
         });
     }
 }
@@ -450,6 +473,7 @@ fn cooling_panel_fill_reports_every_240_by_60_capability_ratio() {
         (ColorDepth::Truecolor, UnicodeLevel::Full),
         (ColorDepth::Ansi16, UnicodeLevel::Full),
         (ColorDepth::Truecolor, UnicodeLevel::Ascii),
+        (ColorDepth::Ansi16, UnicodeLevel::Ascii),
     ] {
         test_override::with_color(depth, || {
             test_override::with_unicode(unicode, || {
@@ -459,14 +483,12 @@ fn cooling_panel_fill_reports_every_240_by_60_capability_ratio() {
             });
         });
     }
-    for (depth, unicode, ratio) in &ratios {
-        tracing::info!(?depth, ?unicode, ratio, "thermal cooling fill ratio");
-    }
+    let all = format!("{ratios:?}");
     // density follow-up (batch 53): estimated, primary sets from the printed value
     for (depth, unicode, ratio) in ratios {
         assert!(
             ratio >= 0.33,
-            "fill ratio {ratio:.3} for {depth:?} {unicode:?}"
+            "fill ratio {ratio:.3} for {depth:?} {unicode:?}; all ratios: {all}"
         );
     }
 }
