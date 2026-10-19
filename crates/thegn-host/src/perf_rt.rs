@@ -11,6 +11,13 @@
 
 use std::cell::Cell;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{OnceLock, mpsc};
+
+use crate::platform::thread_census::{self, ThreadSample};
+
+static CENSUS_TX: OnceLock<mpsc::SyncSender<f64>> = OnceLock::new();
+const CENSUS_CAP: usize = 256;
+const CENSUS_LOG_LIMIT: usize = 12;
 
 static BLOCKING_THREAD_STARTS: AtomicU64 = AtomicU64::new(0);
 static WORKER_THREAD_STOPS: AtomicU64 = AtomicU64::new(0);
@@ -190,6 +197,147 @@ pub(crate) fn report(interval_seconds: f64) {
         global_queue_depth = rollup.global_queue_depth,
         "Tokio runtime rollup"
     );
+
+    let Some(sender) = census_sender(crate::perf::enabled()) else {
+        return;
+    };
+    if let Err(error) = sender.try_send(interval_seconds) {
+        tracing::debug!(target: "thegn::perf::rt", %error, "thread census interval skipped");
+    }
+}
+
+fn census_sender(enabled: bool) -> Option<&'static mpsc::SyncSender<f64>> {
+    if !enabled {
+        return None;
+    }
+    Some(CENSUS_TX.get_or_init(|| {
+        let (sender, receiver) = mpsc::sync_channel::<f64>(1);
+        let _worker = thegn_core::thread_name::spawn_named("thegn-perf-thr", move || {
+            crate::platform::qos::set_self(crate::platform::qos::Qos::Background);
+            census_loop(receiver);
+        });
+        sender
+    }))
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+struct ThreadRate {
+    sample: ThreadSample,
+    wakes_per_s: f64,
+    cpu_ms_per_s: f64,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+struct CensusSummary {
+    threads: usize,
+    rt_threads: usize,
+    rt_wakes_per_s: f64,
+    others_wakes_per_s: f64,
+}
+
+fn rank_thread_deltas(
+    current: &[ThreadSample],
+    previous: &mut Vec<ThreadSample>,
+    ranked: &mut Vec<ThreadRate>,
+    interval_seconds: f64,
+    clock_ticks_per_second: u64,
+) -> CensusSummary {
+    let seconds = if interval_seconds.is_finite() && interval_seconds > 0.0 {
+        interval_seconds
+    } else {
+        0.0
+    };
+    ranked.clear();
+    let mut summary = CensusSummary {
+        threads: current.len(),
+        ..CensusSummary::default()
+    };
+    for sample in current {
+        if sample.comm_str() == "thegn-rt" {
+            summary.rt_threads += 1;
+        }
+        let Some(old) = previous.iter().find(|old| old.tid == sample.tid) else {
+            continue;
+        };
+        let (Some(voluntary), Some(old_voluntary), Some(nonvoluntary), Some(old_nonvoluntary)) = (
+            sample.voluntary,
+            old.voluntary,
+            sample.nonvoluntary,
+            old.nonvoluntary,
+        ) else {
+            continue;
+        };
+        let wakes = voluntary
+            .saturating_sub(old_voluntary)
+            .saturating_add(nonvoluntary.saturating_sub(old_nonvoluntary));
+        let cpu_ticks = match (sample.utime_ticks, old.utime_ticks) {
+            (Some(current), Some(previous)) => current.saturating_sub(previous),
+            _ => 0,
+        };
+        let wakes_per_s = if seconds > 0.0 {
+            wakes as f64 / seconds
+        } else {
+            0.0
+        };
+        let cpu_ms_per_s = if seconds > 0.0 && clock_ticks_per_second > 0 {
+            cpu_ticks as f64 * 1000.0 / (clock_ticks_per_second as f64 * seconds)
+        } else {
+            0.0
+        };
+        if sample.comm_str() == "thegn-rt" {
+            summary.rt_wakes_per_s += wakes_per_s;
+        } else {
+            summary.others_wakes_per_s += wakes_per_s;
+        }
+        ranked.push(ThreadRate {
+            sample: *sample,
+            wakes_per_s,
+            cpu_ms_per_s,
+        });
+    }
+    previous.clear();
+    previous.extend_from_slice(current);
+    ranked.sort_by(|left, right| right.wakes_per_s.total_cmp(&left.wakes_per_s));
+    ranked.truncate(CENSUS_LOG_LIMIT);
+    summary
+}
+
+fn census_loop(receiver: mpsc::Receiver<f64>) {
+    let mut samples = Vec::with_capacity(CENSUS_CAP);
+    let mut previous = Vec::with_capacity(CENSUS_CAP);
+    let mut ranked = Vec::with_capacity(CENSUS_CAP);
+    let clock_ticks_per_second = thread_census::clock_ticks_per_second();
+    while let Ok(interval_seconds) = receiver.recv() {
+        thread_census::sample_self(&mut samples, CENSUS_CAP);
+        let summary = rank_thread_deltas(
+            &samples,
+            &mut previous,
+            &mut ranked,
+            interval_seconds,
+            clock_ticks_per_second,
+        );
+        tracing::info!(
+            target: "thegn::perf::rt",
+            threads = summary.threads,
+            rt_threads = summary.rt_threads,
+            rt_wakes_per_s = summary.rt_wakes_per_s,
+            others_wakes_per_s = summary.others_wakes_per_s,
+            "thread census summary"
+        );
+        for rate in &ranked {
+            tracing::info!(
+                target: "thegn::perf::rt",
+                tid = rate.sample.tid,
+                comm = rate.sample.comm_str(),
+                wakes_per_s = rate.wakes_per_s,
+                cpu_ms_per_s = rate.cpu_ms_per_s,
+                syscall = rate.sample.syscall,
+                fd_target = rate.sample.fd_target_str(),
+                wchan = rate.sample.wchan_str(),
+                "thread census"
+            );
+        }
+    }
 }
 
 #[cfg(test)]
@@ -200,6 +348,64 @@ mod tests {
 
     fn clear_counts() {
         let _counts = take_counts();
+    }
+
+    fn sample(tid: u32, comm: &str, voluntary: u64, nonvoluntary: u64, utime: u64) -> ThreadSample {
+        let mut sample = ThreadSample {
+            tid,
+            voluntary: Some(voluntary),
+            nonvoluntary: Some(nonvoluntary),
+            utime_ticks: Some(utime),
+            ..ThreadSample::default()
+        };
+        sample.comm_len = comm.len() as u8;
+        sample.comm[..comm.len()].copy_from_slice(comm.as_bytes());
+        sample
+    }
+
+    #[test]
+    fn census_delta_drops_vanished_threads_and_ignores_new_or_wrapped_counters() {
+        let mut previous = vec![
+            sample(1, "thegn-rt", 10, 4, 10),
+            sample(2, "thegn-rt", 20, 2, 20),
+            sample(5, "x", 100, 50, 100),
+        ];
+        let current = [
+            sample(1, "thegn-rt", 15, 6, 14),
+            sample(3, "new-thread", 50, 50, 50),
+            sample(4, "thegn-rt", 1, 1, 1),
+            sample(5, "x", 40, 10, 30),
+        ];
+        let mut ranked = Vec::with_capacity(4);
+        let summary = rank_thread_deltas(&current, &mut previous, &mut ranked, 2.0, 100);
+
+        assert_eq!(
+            ranked.len(),
+            2,
+            "new tids have no first interval and vanished tids are removed"
+        );
+        assert_eq!(ranked[0].sample.tid, 1);
+        assert_eq!(ranked[0].wakes_per_s, 3.5);
+        assert_eq!(ranked[0].cpu_ms_per_s, 20.0);
+        let backwards = ranked.iter().find(|rate| rate.sample.tid == 5).unwrap();
+        assert_eq!(backwards.wakes_per_s, 0.0);
+        assert_eq!(backwards.cpu_ms_per_s, 0.0);
+        assert_eq!(previous.as_slice(), current.as_slice());
+        assert_eq!(summary.threads, 4);
+        assert_eq!(summary.rt_threads, 2);
+        assert_eq!(summary.rt_wakes_per_s, 3.5);
+        assert_eq!(summary.others_wakes_per_s, 0.0);
+    }
+
+    #[test]
+    fn disabled_perf_does_not_start_the_census_worker() {
+        let _guard = TEST_GUARD
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert!(CENSUS_TX.get().is_none());
+        crate::perf::set_enabled(false);
+        report(1.0);
+        assert!(CENSUS_TX.get().is_none());
     }
 
     #[test]
