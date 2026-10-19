@@ -265,7 +265,8 @@ SETTLE_MAX_MS=$((SETTLE_MS > 20000 ? SETTLE_MS : 20000))
 # window ended ("thegn exited before the spawn-rate idle window ended") and every
 # number from that run under-measured. The harness SIGTERMs thegn when done, so a
 # long tail costs nothing; 30 s covers any observed lag with room to spare.
-# Includes a one-second allowance for the ~1.7 s paced seventeen-key input phase.
+# Includes the paced input phase (~1.7 s for the seventeen-event steady file,
+# ~0.7 s for soak-daemon); the 30 s tail absorbs the difference.
 KEY_PHASE_MAX_MS=41000
 if [ "$SCENARIO" = steady-workload ] || [ "$SCENARIO" = soak ] || [ "$SCENARIO" = soak-daemon ]; then
   RUN_MS=$((SETTLE_MAX_MS + 1000 + WINDOW_MS + KEY_PHASE_MAX_MS + 30000))
@@ -598,8 +599,28 @@ if [ "$SCENARIO" = steady-workload ] || [ "$SCENARIO" = soak ] || [ "$SCENARIO" 
   if [ "$SCENARIO" = soak-daemon ]; then
     KEYS="$HERE/scenarios/soak-daemon.keys"
   fi
-  EXPECTED_EVENTS="$(python3 "$HERE/lib/key-events.py" count "$KEYS")"
-  EXPECTED_CHARS="$(python3 "$HERE/lib/key-events.py" chars "$KEYS")"
+  if ! EXPECTED_EVENTS="$(python3 "$HERE/lib/key-events.py" count "$KEYS")"; then
+    echo 'FAIL: could not read workload keys' >&2
+    if [ "$JSON_ONLY" = 1 ]; then printf '%s\n' '{"input":{"status":"failed"}}'; fi
+    perf_stop_process_group "$LAUNCHER" "$PIDFILE"
+    exec 3>&-
+    if [ -n "$DAEMON_LAUNCHER" ]; then
+      "$BIN_ABS" daemon stop >/dev/null 2>&1 || kill "$DAEMON_LAUNCHER" 2>/dev/null || true
+      wait "$DAEMON_LAUNCHER" 2>/dev/null || true
+    fi
+    exit 1
+  fi
+  if ! EXPECTED_CHARS="$(python3 "$HERE/lib/key-events.py" chars "$KEYS")"; then
+    echo 'FAIL: could not read workload keys' >&2
+    if [ "$JSON_ONLY" = 1 ]; then printf '%s\n' '{"input":{"status":"failed"}}'; fi
+    perf_stop_process_group "$LAUNCHER" "$PIDFILE"
+    exec 3>&-
+    if [ -n "$DAEMON_LAUNCHER" ]; then
+      "$BIN_ABS" daemon stop >/dev/null 2>&1 || kill "$DAEMON_LAUNCHER" 2>/dev/null || true
+      wait "$DAEMON_LAUNCHER" 2>/dev/null || true
+    fi
+    exit 1
+  fi
   sleep 3
   printf '\033' >&3
   sleep 0.8
