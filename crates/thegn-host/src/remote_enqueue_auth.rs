@@ -281,17 +281,27 @@ fn rotate_credential(
     at_ms: i64,
 ) -> Result<RouteCredential> {
     let origin = secure_control_origin(cfg, store, at_ms)?;
-    // The immutable worktree binding, rather than today's mutable provider
-    // account reference, retires every prior usable owner. Legacy unbound
-    // labels are unusable at the authorization boundary but are cleaned up by
-    // the current-owner pass as well.
-    revoke_worktree_grants(store, worktree, None, at_ms)?;
-    revoke_owner(store, provider, sandbox_id, at_ms)?;
+    mint_bound_credential(
+        store,
+        origin,
+        provider_owner_label(provider, sandbox_id),
+        worktree,
+        at_ms,
+    )
+}
+
+fn mint_bound_credential(
+    store: &dyn ControlStore,
+    origin: String,
+    owner: String,
+    worktree: &str,
+    at_ms: i64,
+) -> Result<RouteCredential> {
     let minted = thegn_svc::control::auth::mint(
         TokenKind::Control,
         ScopeSet::of(&[Scope::MergeAdd]),
         &RouteToHostTokenBinding {
-            owner: provider_owner_label(provider, sandbox_id),
+            owner,
             worktree: worktree.to_string(),
         }
         .label(),
@@ -305,6 +315,35 @@ fn rotate_credential(
         token: minted.token,
         pairing_id: minted.row.pairing_id,
     })
+}
+
+fn rotate_verified(
+    store: &dyn ControlStore,
+    credential: RouteCredential,
+    install: impl FnOnce(&RouteCredential) -> Result<()>,
+    read_back: impl FnOnce() -> Result<Option<(String, String)>>,
+    retire_others: impl FnOnce(&str) -> Result<usize>,
+) -> Result<()> {
+    let verification = install(&credential).and_then(|()| {
+        let installed = read_back()?;
+        anyhow::ensure!(
+            installed.as_ref().is_some_and(|(origin, token)| {
+                origin == &credential.origin && token == &credential.token
+            }),
+            "route-to-host credential read-back did not match the installed generation"
+        );
+        Ok(())
+    });
+    if let Err(error) = verification {
+        if let Err(revoke_error) = store.revoke_pairing(&credential.pairing_id, now_ms()) {
+            return Err(anyhow::anyhow!(
+                "route-to-host credential installation or verification failed: {error:#}; revoking the new pairing also failed: {revoke_error:#}"
+            ));
+        }
+        return Err(error);
+    }
+    retire_others(&credential.pairing_id)?;
+    Ok(())
 }
 
 fn install_credential(
@@ -442,18 +481,21 @@ pub(crate) fn reconcile_provider_credential(
         )?;
         return Ok(());
     }
-    let credential = rotate_credential(cfg, &db, provider_config, sandbox_id, worktree, now_ms())?;
-    if let Err(error) = install_credential(provider, sandbox_id, worktree, &credential) {
-        // The plaintext is dropped with `credential`; revoke the persisted hash
-        // before returning so a partially-written file never remains useful.
-        if let Err(revoke_error) = db.revoke_pairing(&credential.pairing_id, now_ms()) {
-            return Err(anyhow::anyhow!(
-                "install route-to-host credential failed: {error:#}; revoking the partially-installed credential also failed: {revoke_error:#}"
-            ));
-        }
-        return Err(error.context("install route-to-host credential"));
-    }
-    Ok(())
+    let credential = rotate_credential(cfg, &db, provider_config, sandbox_id, worktree, at_ms)?;
+    let legacy = format!("route-to-host:{owner}");
+    rotate_verified(
+        &db,
+        credential,
+        |credential| install_credential(provider, sandbox_id, worktree, credential),
+        || read_provider_credential(provider, sandbox_id, worktree),
+        |except_pairing_id| {
+            let mut retired =
+                revoke_worktree_grants(&db, worktree, Some(except_pairing_id), at_ms)?;
+            retired +=
+                revoke_owner_label(&db, &owner, Some(&legacy), Some(except_pairing_id), at_ms)?;
+            Ok(retired)
+        },
+    )
 }
 
 /// Revoke every return token owned by a sandbox before it is recycled or
@@ -616,9 +658,9 @@ fn reusable_credential(
 /// Ensure a user-managed SSH worktree has one reusable, worktree-bound return
 /// credential before its pane starts. A valid installed credential is reused so
 /// opening a second pane does not revoke the token already exported by the
-/// first. Any mismatch rotates fail-closed: the old owner grants are revoked
-/// before the replacement is installed, and a failed install revokes the new
-/// token as well.
+/// first. Any mismatch rotates fail-closed: the replacement is installed and
+/// read back before old owner grants are revoked; a failed install or read-back
+/// revokes only the new token.
 pub(crate) fn reconcile_ssh_credential(
     cfg: &Config,
     target: &SshTarget,
@@ -650,31 +692,19 @@ pub(crate) fn reconcile_ssh_credential(
         return Ok(());
     }
 
-    revoke_worktree_grants(&db, worktree, None, at_ms)?;
-    revoke_owner_label(&db, &owner, None, None, at_ms)?;
-    let minted = thegn_svc::control::auth::mint(
-        TokenKind::Control,
-        ScopeSet::of(&[Scope::MergeAdd]),
-        &RouteToHostTokenBinding {
-            owner,
-            worktree: worktree.to_string(),
-        }
-        .label(),
-        None,
-        Some(at_ms.saturating_add(TOKEN_LIFETIME_MS)),
-        at_ms,
-    );
-    db.put_pairing(&minted.row)?;
-    let credential = RouteCredential {
-        origin,
-        token: minted.token,
-        pairing_id: minted.row.pairing_id,
-    };
-    if let Err(error) = install_ssh_credential(target, worktree, &credential) {
-        db.revoke_pairing(&credential.pairing_id, now_ms())?;
-        return Err(error.context("install SSH route-to-host credential"));
-    }
-    Ok(())
+    let credential = mint_bound_credential(&db, origin, owner.clone(), worktree, at_ms)?;
+    rotate_verified(
+        &db,
+        credential,
+        |credential| install_ssh_credential(target, worktree, credential),
+        || read_ssh_credential(target, worktree),
+        |except_pairing_id| {
+            let mut retired =
+                revoke_worktree_grants(&db, worktree, Some(except_pairing_id), at_ms)?;
+            retired += revoke_owner_label(&db, &owner, None, Some(except_pairing_id), at_ms)?;
+            Ok(retired)
+        },
+    )
 }
 
 /// Revoke and remove the return credential while the worktree's SSH ownership
@@ -933,13 +963,148 @@ mod tests {
 
         let second =
             rotate_credential(&cfg, &db, &provider, "sandbox-a", "/remote/a", at_ms + 2).unwrap();
+        assert!(thegn_svc::control::auth::verify(&db, &first.token, at_ms + 3).is_some());
+        let second_origin = second.origin.clone();
+        let second_token = second.token.clone();
+        rotate_verified(
+            &db,
+            second,
+            |_| Ok(()),
+            || Ok(Some((second_origin, second_token.clone()))),
+            |except_pairing_id| {
+                let retired =
+                    revoke_worktree_grants(&db, "/remote/a", Some(except_pairing_id), at_ms + 4)?;
+                Ok(retired
+                    + revoke_owner_label(
+                        &db,
+                        &provider_owner_label(&provider, "sandbox-a"),
+                        Some("route-to-host:legacy"),
+                        Some(except_pairing_id),
+                        at_ms + 4,
+                    )?)
+            },
+        )
+        .unwrap();
         assert!(thegn_svc::control::auth::verify(&db, &first.token, at_ms + 3).is_none());
-        assert!(thegn_svc::control::auth::verify(&db, &second.token, at_ms + 3).is_some());
+        assert!(thegn_svc::control::auth::verify(&db, &second_token, at_ms + 5).is_some());
         assert_eq!(
-            revoke_owner(&db, &provider, "sandbox-a", at_ms + 4).unwrap(),
+            revoke_owner(&db, &provider, "sandbox-a", at_ms + 6).unwrap(),
             1
         );
-        assert!(thegn_svc::control::auth::verify(&db, &second.token, at_ms + 5).is_none());
+        assert!(thegn_svc::control::auth::verify(&db, &second_token, at_ms + 7).is_none());
+    }
+
+    #[test]
+    fn install_failure_keeps_the_old_grant_and_revokes_the_new() {
+        let temp = tempfile::tempdir().unwrap();
+        let at_ms = 10_000;
+        let db = serving_db(&temp.path().join("db.sqlite"), at_ms);
+        let mut cfg = Config::default();
+        cfg.serve.topology = ServeTopology::Tunnel;
+        let provider = provider("sprites", "SPRITES_ACCOUNT_A");
+        let owner = provider_owner_label(&provider, "sandbox-a");
+        let old = put_route_token(&db, owner, "/remote/a", at_ms);
+        let new =
+            rotate_credential(&cfg, &db, &provider, "sandbox-a", "/remote/a", at_ms + 1).unwrap();
+        let new_token = new.token.clone();
+
+        let result = rotate_verified(
+            &db,
+            new,
+            |_| anyhow::bail!("simulated install failure"),
+            || Ok(None),
+            |_| panic!("old grants must not be retired after install failure"),
+        );
+
+        assert!(result.is_err());
+        assert!(thegn_svc::control::auth::verify(&db, &old.token, at_ms + 2).is_some());
+        assert!(thegn_svc::control::auth::verify(&db, &new_token, at_ms + 2).is_none());
+    }
+
+    #[test]
+    fn read_back_mismatch_is_a_failed_install() {
+        let temp = tempfile::tempdir().unwrap();
+        let at_ms = 10_000;
+        let db = serving_db(&temp.path().join("db.sqlite"), at_ms);
+        let mut cfg = Config::default();
+        cfg.serve.topology = ServeTopology::Tunnel;
+        let provider = provider("sprites", "SPRITES_ACCOUNT_A");
+        let owner = provider_owner_label(&provider, "sandbox-a");
+        let old = put_route_token(&db, owner, "/remote/a", at_ms);
+        let new =
+            rotate_credential(&cfg, &db, &provider, "sandbox-a", "/remote/a", at_ms + 1).unwrap();
+        let new_origin = new.origin.clone();
+        let new_token = new.token.clone();
+
+        let result = rotate_verified(
+            &db,
+            new,
+            |_| Ok(()),
+            || Ok(Some((new_origin, "different-token".into()))),
+            |_| panic!("old grants must not be retired after a read-back mismatch"),
+        );
+
+        assert!(matches!(
+            result,
+            Err(ref error) if error.to_string().contains(
+                "route-to-host credential read-back did not match the installed generation"
+            )
+        ));
+        assert!(thegn_svc::control::auth::verify(&db, &old.token, at_ms + 2).is_some());
+        assert!(thegn_svc::control::auth::verify(&db, &new_token, at_ms + 2).is_none());
+    }
+
+    #[test]
+    fn successful_rotation_leaves_exactly_one_live_grant() {
+        let temp = tempfile::tempdir().unwrap();
+        let at_ms = 10_000;
+        let db = serving_db(&temp.path().join("db.sqlite"), at_ms);
+        let mut cfg = Config::default();
+        cfg.serve.topology = ServeTopology::Tunnel;
+        let provider = provider("sprites", "SPRITES_ACCOUNT_A");
+        let owner = provider_owner_label(&provider, "sandbox-a");
+        let old = put_route_token(&db, owner.clone(), "/remote/a", at_ms);
+        let duplicate = put_route_token(&db, "older-owner".into(), "/remote/a", at_ms + 1);
+        let neighbor = put_route_token(&db, "neighbor-owner".into(), "/remote/neighbor", at_ms + 2);
+        let new =
+            rotate_credential(&cfg, &db, &provider, "sandbox-a", "/remote/a", at_ms + 3).unwrap();
+        let new_origin = new.origin.clone();
+        let new_token = new.token.clone();
+        let new_pairing_id = new.pairing_id.clone();
+
+        rotate_verified(
+            &db,
+            new,
+            |_| Ok(()),
+            || Ok(Some((new_origin, new_token.clone()))),
+            |except_pairing_id| {
+                let retired =
+                    revoke_worktree_grants(&db, "/remote/a", Some(except_pairing_id), at_ms + 4)?;
+                Ok(retired
+                    + revoke_owner_label(&db, &owner, None, Some(except_pairing_id), at_ms + 4)?)
+            },
+        )
+        .unwrap();
+
+        let live_worktree_grants: Vec<_> = db
+            .pairings()
+            .unwrap()
+            .into_iter()
+            .filter(|row| {
+                row.kind == "token"
+                    && row.revoked_at.is_none()
+                    && matches!(
+                        RouteToHostTokenBinding::parse_label(&row.label),
+                        Some(Ok(binding)) if binding.worktree == "/remote/a"
+                    )
+            })
+            .collect();
+        assert_eq!(live_worktree_grants.len(), 1);
+        assert_eq!(live_worktree_grants[0].pairing_id, new_pairing_id);
+        assert!(thegn_svc::control::auth::verify(&db, &old.token, at_ms + 5).is_none());
+        assert!(thegn_svc::control::auth::verify(&db, &duplicate.token, at_ms + 5).is_none());
+        assert!(thegn_svc::control::auth::verify(&db, &new_token, at_ms + 5).is_some());
+        assert!(thegn_svc::control::auth::verify(&db, &neighbor.token, at_ms + 5).is_some());
     }
 
     #[test]
@@ -1006,9 +1171,30 @@ mod tests {
             rotate_credential(&cfg, &db, &old_account, "other-id", "/remote/b", at_ms + 1).unwrap();
         let replacement =
             rotate_credential(&cfg, &db, &new_account, "same-id", "/remote/a", at_ms + 2).unwrap();
+        let replacement_origin = replacement.origin.clone();
+        let replacement_token = replacement.token.clone();
+        rotate_verified(
+            &db,
+            replacement,
+            |_| Ok(()),
+            || Ok(Some((replacement_origin, replacement_token.clone()))),
+            |except_pairing_id| {
+                let retired =
+                    revoke_worktree_grants(&db, "/remote/a", Some(except_pairing_id), at_ms + 3)?;
+                Ok(retired
+                    + revoke_owner_label(
+                        &db,
+                        &provider_owner_label(&new_account, "same-id"),
+                        Some("route-to-host:legacy"),
+                        Some(except_pairing_id),
+                        at_ms + 3,
+                    )?)
+            },
+        )
+        .unwrap();
 
         assert!(thegn_svc::control::auth::verify(&db, &old.token, at_ms + 3).is_none());
-        assert!(thegn_svc::control::auth::verify(&db, &replacement.token, at_ms + 3).is_some());
+        assert!(thegn_svc::control::auth::verify(&db, &replacement_token, at_ms + 4).is_some());
         assert!(
             thegn_svc::control::auth::verify(&db, &neighbor.token, at_ms + 3).is_some(),
             "account migration must not revoke another worktree"
