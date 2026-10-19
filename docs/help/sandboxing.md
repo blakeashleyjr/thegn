@@ -77,8 +77,10 @@ runtime/control socket dir, credential dirs under `$HOME` (`.ssh`, `.aws`,
 `.gnupg`, `.config/gh`, `.kube`, `.docker`, `.netrc`, `.git-credentials`) or a
 container-engine socket. This includes binds of a parent directory,
 bind-backed named volumes, and file secrets/configs; there is no per-repo
-opt-out. If the config cannot be inspected, launch proceeds with a warning and
-is reported as host-process isolation. Remote placements are not checked.
+opt-out. The inspected effective config is what thegn launches: edits to the
+Compose files or their environment files take effect on the next launch, which
+inspects them again. If the config cannot be inspected, launch proceeds with a
+warning and is reported as host-process isolation. Remote placements are not checked.
 Queue-agent sandboxes get the same protected-bind check, including the daemon
 control-socket directory; a protected bind is refused and the queue dispatch is
 held. If their Compose config cannot be inspected, the agent runs degraded with
