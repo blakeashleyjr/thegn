@@ -928,14 +928,12 @@ pub async fn main(
                 tracing::warn!(target: "thegn::sandbox", "orphan GC skipped: worktrees query failed");
                 return;
             };
-            let repo_roots = rows
-                .iter()
-                .map(|row| std::path::Path::new(&row.repo_root))
-                .collect::<std::collections::BTreeSet<_>>();
             if !gc_wanted_without_repo_overlay
                 && !crate::sandbox_gc_gate::repo_overlay_wants_startup_gc(
                     &startup_gc_cfg,
-                    repo_roots,
+                    rows.iter()
+                        .map(|row| std::path::Path::new(&row.repo_root))
+                        .collect::<std::collections::BTreeSet<_>>(),
                 )
             {
                 tracing::debug!(target: "thegn::sandbox", "orphan GC skipped: sandbox disabled");
@@ -1116,7 +1114,9 @@ pub async fn main(
     // on PATH.
     let (sandbox_event_tx, sandbox_event_rx) =
         tokio_mpsc::unbounded_channel::<crate::sandbox_events::SandboxEventBatch>();
-    crate::sandbox_events::spawn(&cfg.sandbox, sandbox_event_tx);
+    crate::sandbox_gc_gate::with_startup_sandbox_events(&cfg, || {
+        crate::sandbox_events::spawn(&cfg.sandbox, sandbox_event_tx);
+    });
     // Drained in the event loop below (audit run.rs:825): a container event was
     // written to the DB, so mark the audit panel dirty. Draining also stops the
     // unbounded channel from growing for the process lifetime when the sidecar
