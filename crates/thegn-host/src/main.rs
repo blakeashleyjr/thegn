@@ -741,6 +741,15 @@ pub enum Command {
     BridgeRevtunnel {
         /// Loopback port to listen on inside the sandbox.
         port: u16,
+        /// Write-stall deadline in seconds; 0 runs as 60 seconds.
+        #[arg(long)]
+        write_stall_secs: Option<u64>,
+        /// Idle deadline in seconds; 0 disables it.
+        #[arg(long)]
+        idle_secs: Option<u64>,
+        /// Total lifetime deadline in seconds; 0 disables it.
+        #[arg(long)]
+        lifetime_secs: Option<u64>,
     },
     /// Hidden: ssh `ProxyCommand` for a provider env with `connect = "ssh"`. Opens
     /// the provider's TCP-over-WebSocket proxy to the in-sandbox `sshd`
@@ -1469,14 +1478,28 @@ fn run_subcommand(cli: &Cli, command: Command) -> anyhow::Result<()> {
             thegn_svc::bridge::serve(std::io::stdin().lock(), std::io::stdout());
             Ok(())
         }
-        Command::BridgeRevtunnel { port } => {
+        Command::BridgeRevtunnel {
+            port,
+            write_stall_secs,
+            idle_secs,
+            lifetime_secs,
+        } => {
             // Reverse-tunnel sandbox endpoint: listen on loopback and mux every
             // accepted connection back to the host over stdin/stdout.
             let rt = tokio::runtime::Runtime::new()?;
             rt.block_on(async move {
                 let listener = tokio::net::TcpListener::bind(("127.0.0.1", port)).await?;
                 let stream = tokio::io::join(tokio::io::stdin(), tokio::io::stdout());
-                thegn_svc::revtunnel::run_sandbox(stream, listener).await
+                thegn_svc::revtunnel::run_sandbox_with_deadlines(
+                    stream,
+                    listener,
+                    thegn_svc::revtunnel::TunnelDeadlines::from_secs(
+                        write_stall_secs,
+                        idle_secs,
+                        lifetime_secs,
+                    ),
+                )
+                .await
             })?;
             Ok(())
         }

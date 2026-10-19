@@ -15,6 +15,38 @@ fn forward_reverse_tunnel_caps_default_to_shipped_limits_and_parse() {
 }
 
 #[test]
+fn forward_reverse_tunnel_deadlines_default_parse_and_zero_rules() {
+    let defaults = ForwardConfig::default();
+    assert_eq!(defaults.reverse_write_stall_secs, 60);
+    assert_eq!(defaults.reverse_idle_secs, 7200);
+    assert_eq!(defaults.reverse_lifetime_secs, 86400);
+    assert_eq!(
+        defaults.tunnel_deadlines(),
+        TunnelDeadlineSecs {
+            write_stall: 60,
+            idle: Some(7200),
+            lifetime: Some(86400),
+        }
+    );
+
+    let cfg: Config = toml::from_str(
+        "[forward]\nreverse_write_stall_secs = 5\nreverse_idle_secs = 0\nreverse_lifetime_secs = 9\n",
+    )
+    .unwrap();
+    assert_eq!(
+        cfg.forward.tunnel_deadlines(),
+        TunnelDeadlineSecs {
+            write_stall: 5,
+            idle: None,
+            lifetime: Some(9),
+        }
+    );
+
+    let zero_stall: Config = toml::from_str("[forward]\nreverse_write_stall_secs = 0\n").unwrap();
+    assert_eq!(zero_stall.forward.tunnel_deadlines().write_stall, 60);
+}
+
+#[test]
 fn semantic_defaults_and_round_trip() {
     let s = SemanticConfig::default();
     assert!(s.worktree_index, "index on by default");
