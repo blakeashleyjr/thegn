@@ -202,7 +202,7 @@ pub fn replay_script_verified(
         valid_names.push(artifact.name.as_str());
         let path = sh_quote(&staged_artifact_path(dir, &artifact.name));
         validation.push_str(&format!(
-            "printf '%s  %s\\n' {} {path} | sha256sum -c --status - || fail artifact_validation; ",
+            "printf '%s  %s\\n' {} {path} | sha256sum -c - >/dev/null 2>&1 || fail artifact_validation; ",
             sh_quote(&artifact.sha256)
         ));
     }
@@ -443,18 +443,19 @@ mod tests {
             "done",
         );
         let first_mutation = script.find("git fetch").unwrap();
-        assert_eq!(script.matches("sha256sum -c --status -").count(), 3);
+        assert_eq!(script.matches("sha256sum -c - >/dev/null 2>&1").count(), 3);
         for digest in [
             "b9c72134b48cdc15e7a47f2476a41612d2084b763bea0575f5600b22041db7dc",
             "50d39ba6ed2bd5b854b405fcc2189e9f5f9fbe637f107a7cf31408207d5f6499",
             "52232c0fe139f6b5168632a400c4b67dbc80c112edf952aa7c67bccec57f1dbd",
         ] {
-            assert!(script.contains(&digest));
-            assert!(script.find(&digest).unwrap() < first_mutation);
+            assert!(script.contains(digest));
+            assert!(script.find(digest).unwrap() < first_mutation);
         }
         for mutation in ["git fetch", "git apply", "tar xf"] {
             assert!(
-                script.find("sha256sum -c --status -").unwrap() < script.find(mutation).unwrap()
+                script.find("sha256sum -c - >/dev/null 2>&1").unwrap()
+                    < script.find(mutation).unwrap()
             );
         }
         assert!(script.contains("/tmp/tg-parity-operation/bundle"));
@@ -465,8 +466,65 @@ mod tests {
     #[test]
     fn verified_replay_refuses_a_carried_stage_without_a_manifest_entry() {
         let script = replay_script_verified("/wd", "/tmp/op", &[], None, true, false, "done");
-        let validation = script.find("fail artifact_validation;").unwrap();
-        assert!(validation < script.find("git apply").unwrap());
+        assert!(script.contains("cd /wd || fail checkout; fail artifact_validation; "));
+    }
+
+    #[test]
+    fn verified_replay_refuses_a_missing_manifest_entry_before_stage_file_checks() {
+        let manifest = [CaptureArtifact {
+            name: "patch".into(),
+            bytes: 5,
+            sha256: "a4895eb44afc336fecbba6e520cd67e178dace0276655d102fceffa8e5f70570".into(),
+        }];
+        let script = replay_script_verified("/wd", "/tmp/op", &manifest, None, true, true, "done");
+        let manifest_failure = script.rfind("fail artifact_validation;").unwrap();
+        let first_file_check = script.find("[ ! -s").unwrap();
+        assert!(manifest_failure < first_file_check);
+    }
+
+    #[test]
+    fn verified_replay_digest_mismatch_reports_validation_and_preserves_staging_dir() {
+        use std::process::Command;
+
+        let sh_check = Command::new("sh")
+            .arg("-c")
+            .arg("command -v sha256sum >/dev/null 2>&1")
+            .status();
+        let Ok(available) = sh_check else {
+            return;
+        };
+        if !available.success() {
+            return;
+        }
+
+        let workdir = tempfile::tempdir().unwrap();
+        let staging_dir = workdir.path().join("staging");
+        std::fs::create_dir(&staging_dir).unwrap();
+        let artifact = staging_dir.join("patch");
+        std::fs::write(&artifact, b"real patch bytes").unwrap();
+        let manifest = [CaptureArtifact {
+            name: "patch".into(),
+            bytes: 16,
+            sha256: "0000000000000000000000000000000000000000000000000000000000000000".into(),
+        }];
+        let script = replay_script_verified(
+            workdir.path().to_str().unwrap(),
+            staging_dir.to_str().unwrap(),
+            &manifest,
+            None,
+            true,
+            false,
+            "done",
+        );
+        let output = Command::new("sh").arg("-c").arg(script).output().unwrap();
+        assert_eq!(output.status.code(), Some(70));
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            stdout.contains("TG-PARITY-ERROR:artifact_validation"),
+            "stdout: {stdout}"
+        );
+        assert!(artifact.exists());
+        assert!(staging_dir.exists());
     }
 
     #[test]
