@@ -108,11 +108,10 @@ the work shipped.
 
 ### Alpha Reliability & State Compatibility
 
-| Milestone                                 | Issue                                                 | State / priority | Remaining outcome                                                                                               | Spec/change                                                                               |
-| ----------------------------------------- | ----------------------------------------------------- | ---------------- | --------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------- |
-| R2: Contained toolchain and visible state | [THE-97](https://linear.app/blakeashley/issue/THE-97) | Backlog / Medium | Continuously prove that a staged agent can commit without escaping the configured worktree sandbox.             | [`verify-stage-worker-containment`](../openspec/changes/verify-stage-worker-containment/) |
-| R2: Contained toolchain and visible state | [THE-93](https://linear.app/blakeashley/issue/THE-93) | Backlog / Medium | Render the persisted flat/grouped sidebar mode continuously, including narrow layouts.                          | [`make-sidebar-mode-visible`](../openspec/changes/make-sidebar-mode-visible/)             |
-| R2: Contained toolchain and visible state | [THE-92](https://linear.app/blakeashley/issue/THE-92) | Backlog / Low    | Classify active connectivity and render truthful Ethernet, Wi-Fi, or generic fallback semantics cross-platform. | [`detect-active-network-kind`](../openspec/changes/detect-active-network-kind/)           |
+| Milestone                                 | Issue                                                 | State / priority | Remaining outcome                                                                                   | Spec/change                                                                               |
+| ----------------------------------------- | ----------------------------------------------------- | ---------------- | --------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------- |
+| R2: Contained toolchain and visible state | [THE-97](https://linear.app/blakeashley/issue/THE-97) | Backlog / Medium | Continuously prove that a staged agent can commit without escaping the configured worktree sandbox. | [`verify-stage-worker-containment`](../openspec/changes/verify-stage-worker-containment/) |
+| R2: Contained toolchain and visible state | [THE-93](https://linear.app/blakeashley/issue/THE-93) | Backlog / Medium | Render the persisted flat/grouped sidebar mode continuously, including narrow layouts.              | [`make-sidebar-mode-visible`](../openspec/changes/make-sidebar-mode-visible/)             |
 
 The shared-state safety and sandbox cache remediations are complete. THE-97 is
 the separate continuous worker-containment proof, not a substitute for either.

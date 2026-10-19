@@ -58,6 +58,15 @@ the default instead of failing mid-render. The clock wakes only on minute
 boundaries unless a format actually renders seconds (`%S`, `%T`, `%r`, `%X`), in
 which case it ticks once a second.
 
+The `net` widget's icon follows the active connection: Ethernet or Wi-Fi when
+the default route (or the only active link) is a known wired or wireless
+interface, and a generic network icon for VPN or tunnel routes, several active
+links, an unknown medium, or platforms where thegn cannot read the route
+(currently everything except Linux). Traffic numbers always cover every
+non-loopback interface. `[stats.net_icons]` sets the three glyphs; any other
+`[stats] net_icon` value is a fixed icon. `thegn doctor` shows the selected path
+and why (`net path`).
+
 ## Status bar (bottom)
 
 - **Left:** the `?` help chip (click for the context-sensitive page `F1`

@@ -38,13 +38,6 @@
       ]
     },
     {
-      "issue": "THE-92",
-      "project": "Alpha Reliability & State Compatibility",
-      "changes": [
-        "detect-active-network-kind"
-      ]
-    },
-    {
       "issue": "THE-93",
       "project": "Alpha Reliability & State Compatibility",
       "changes": [
