@@ -602,6 +602,7 @@ pub struct LoopPerf {
     pub input_us: Histo,
     pub input_events: u64,
     pub input_coalesced_events: u64,
+    pub input_no_effect_events: u64,
     pending_input_events: u64,
     pub resync_us: Histo,
     pub(crate) writer: crate::perf_timing::WriterMetrics,
@@ -660,6 +661,7 @@ impl LoopPerf {
             input_us: Histo::new(),
             input_events: 0,
             input_coalesced_events: 0,
+            input_no_effect_events: 0,
             pending_input_events: 0,
             resync_us: Histo::new(),
             writer: crate::perf_timing::WriterMetrics::default(),
@@ -779,7 +781,9 @@ impl LoopPerf {
     /// incremental composition, even if a periodic resync re-emitted the full
     /// surface. `input_since` is the earliest host observation in the pending
     /// cohort, taken once on submission. No causal response/display guarantee
-    /// is implied. Clearing it also releases the input-priority PTY budget.
+    /// is implied. The classified close determines whether it enters latency
+    /// accounting or the no-effect counter. Clearing it also releases the
+    /// input-priority PTY budget.
     /// Switch stamps likewise measure action→next submission, split by kind.
     /// Both cleared even when accounting is off.
     #[inline]
@@ -788,9 +792,10 @@ impl LoopPerf {
         dt: Duration,
         pane_only: bool,
         input_since: &mut Option<Instant>,
+        input_close: crate::perf_timing::InputClose,
         switch_since: &mut Option<(Instant, SwitchKind)>,
     ) {
-        let input = input_since.take();
+        *input_since = None;
         self.pending_input_events = 0;
         let switch = switch_since.take();
         if enabled() {
@@ -805,8 +810,14 @@ impl LoopPerf {
             }
             self.render_us.record_us(us);
             self.render_busy += dt;
-            if let Some(t) = input {
-                self.input_us.record_us(t.elapsed().as_micros() as u64);
+            match input_close {
+                crate::perf_timing::InputClose::None => {}
+                crate::perf_timing::InputClose::Latency(t) => {
+                    self.input_us.record_us(t.elapsed().as_micros() as u64);
+                }
+                crate::perf_timing::InputClose::NoEffect => {
+                    self.input_no_effect_events += 1;
+                }
             }
             if let Some((t, kind)) = switch {
                 match kind {
@@ -881,6 +892,7 @@ impl LoopPerf {
         self.input_us.reset();
         self.input_events = 0;
         self.input_coalesced_events = 0;
+        self.input_no_effect_events = 0;
         self.resync_us.reset();
         self.writer = crate::perf_timing::WriterMetrics::default();
         self.writer_deferred = false;
@@ -919,6 +931,7 @@ pub struct PerfSnapshot {
     pub input_samples: u64,
     pub input_events: u64,
     pub input_coalesced_events: u64,
+    pub input_no_effect_events: u64,
     pub resync_samples: u64,
     pub resync_p99_us: u64,
     pub writer_frames: u64,
@@ -1027,6 +1040,7 @@ impl LoopPerf {
             input_samples: self.input_us.count(),
             input_events: self.input_events,
             input_coalesced_events: self.input_coalesced_events,
+            input_no_effect_events: self.input_no_effect_events,
             resync_samples: self.resync_us.count(),
             resync_p99_us: self.resync_us.percentile_us(0.99),
             writer_frames: self.writer.completion_us.count(),
@@ -1094,6 +1108,7 @@ impl LoopPerf {
             input_samples = snap.input_samples,
             input_events = snap.input_events,
             input_coalesced_events = snap.input_coalesced_events,
+            input_no_effect_events = snap.input_no_effect_events,
             resync_samples = snap.resync_samples,
             resync_p99_us = snap.resync_p99_us,
             writer_metrics_deferred = self.writer_deferred,
@@ -1428,7 +1443,13 @@ mod tests {
         let start = lp.report_t0;
         lp.input_event();
         lp.input_event();
-        lp.render(Duration::from_millis(1), true, &mut Some(start), &mut None);
+        lp.render(
+            Duration::from_millis(1),
+            true,
+            &mut Some(start),
+            crate::perf_timing::InputClose::Latency(start),
+            &mut None,
+        );
         lp.resync(Duration::from_micros(200));
         lp.add_busy(Duration::from_millis(3));
         let boundary = start + Duration::from_millis(10);
@@ -1460,12 +1481,25 @@ mod tests {
         let mut lp = LoopPerf::new();
         lp.wake();
         lp.tick(WakeSource::Model);
-        lp.render(Duration::from_micros(900), false, &mut None, &mut None);
+        lp.render(
+            Duration::from_micros(900),
+            false,
+            &mut None,
+            crate::perf_timing::InputClose::None,
+            &mut None,
+        );
         // Stamps are consumed even while accounting is off (they also gate the
         // input-priority PTY budget, which must not stick).
         let mut input = Some(Instant::now());
+        let t = input.expect("input stamp was set");
         let mut switch = Some((Instant::now(), SwitchKind::Worktree));
-        lp.render(Duration::from_micros(900), false, &mut input, &mut switch);
+        lp.render(
+            Duration::from_micros(900),
+            false,
+            &mut input,
+            crate::perf_timing::InputClose::Latency(t),
+            &mut switch,
+        );
         assert!(input.is_none());
         assert!(switch.is_none());
         assert_eq!(lp.wakes, 0);
@@ -1489,10 +1523,13 @@ mod tests {
         lp.pty(10, 80 * 1024, true);
         lp.drain(Duration::from_micros(300));
         lp.flush(Duration::from_micros(120));
+        let t = Instant::now();
+        let mut input = Some(t);
         lp.render(
             Duration::from_micros(900),
             true,
-            &mut Some(Instant::now()),
+            &mut input,
+            crate::perf_timing::InputClose::Latency(t),
             &mut Some((Instant::now(), SwitchKind::Worktree)),
         );
         lp.render_skip();
@@ -1521,12 +1558,46 @@ mod tests {
     }
 
     #[test]
+    fn no_effect_input_is_counted_and_rolls_up_without_latency_sample() {
+        let _g = TEST_GUARD.lock().unwrap_or_else(|e| e.into_inner());
+        set_enabled(true);
+        let mut lp = LoopPerf::new();
+        let t = Instant::now();
+        let mut input = Some(t);
+        lp.render(
+            Duration::from_micros(900),
+            false,
+            &mut input,
+            crate::perf_timing::InputClose::NoEffect,
+            &mut None,
+        );
+
+        assert!(lp.input_us.is_empty());
+        assert_eq!(lp.input_no_effect_events, 1);
+        assert!(input.is_none(), "render consumes the pending stamp");
+
+        let boundary = t + Duration::from_millis(10);
+        let snapshot = lp.rollup(boundary, 0, 0, 0);
+        assert_eq!(snapshot.input_samples, 0);
+        assert_eq!(snapshot.input_no_effect_events, 1);
+        let next = lp.rollup(boundary + Duration::from_millis(10), 0, 0, 0);
+        assert_eq!(next.input_no_effect_events, 0);
+        set_enabled(false);
+    }
+
+    #[test]
     fn workspace_switch_records_into_its_own_histogram() {
         let _g = TEST_GUARD.lock().unwrap_or_else(|e| e.into_inner());
         set_enabled(true);
         let mut lp = LoopPerf::new();
         let mut switch = Some((Instant::now(), SwitchKind::Workspace));
-        lp.render(Duration::from_micros(500), false, &mut None, &mut switch);
+        lp.render(
+            Duration::from_micros(500),
+            false,
+            &mut None,
+            crate::perf_timing::InputClose::None,
+            &mut switch,
+        );
         assert!(switch.is_none(), "stamp is taken by the first frame");
         assert!(!lp.switch_ws_us.is_empty());
         assert!(lp.switch_us.is_empty());
@@ -1542,12 +1613,24 @@ mod tests {
         set_enabled(true);
         let mut lp = LoopPerf::new();
         let mut switch = Some((Instant::now(), SwitchKind::Worktree));
-        lp.render(Duration::from_micros(500), false, &mut None, &mut switch);
+        lp.render(
+            Duration::from_micros(500),
+            false,
+            &mut None,
+            crate::perf_timing::InputClose::None,
+            &mut switch,
+        );
         assert!(switch.is_none(), "stamp is taken by the first frame");
         assert!(!lp.switch_us.is_empty());
         // A second frame without a fresh stamp records no new switch sample.
         let one = lp.switch_us.percentile_us(1.0);
-        lp.render(Duration::from_micros(500), false, &mut None, &mut switch);
+        lp.render(
+            Duration::from_micros(500),
+            false,
+            &mut None,
+            crate::perf_timing::InputClose::None,
+            &mut switch,
+        );
         assert_eq!(lp.switch_us.percentile_us(1.0), one);
         assert_eq!(lp.renders, 2);
         set_enabled(false);
