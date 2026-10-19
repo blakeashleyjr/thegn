@@ -1645,7 +1645,11 @@ impl MonitorOverlay {
             status: self.status.as_deref(),
             paused: self.paused,
             container_ours: self.container_rows.get(self.sel).is_some_and(|r| r.ours),
-            disk_rows: self.disk_rows.len(),
+            disk_rows: if self.disk_worktrees_placed() {
+                self.disk_rows.len()
+            } else {
+                0
+            },
             board_panels: self.placed_panels().len(),
             board_zoomed: self.board.is_zoomed(),
         })
