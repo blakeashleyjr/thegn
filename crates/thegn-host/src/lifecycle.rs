@@ -21,7 +21,7 @@ use thegn_core::lifecycle::{
     DestroyReason, PoolPolicy, ReadySpare, WarmBudget, WarmCandidate, WarmInputs, decide,
     decide_pool, recyclable,
 };
-use thegn_core::remote::GitLoc;
+use thegn_core::remote::{GitLoc, WorktreeLocations};
 use thegn_core::store::{PoolStore, WorkspaceStore};
 /// Per-worktree "last seen active/busy" timestamps, so the reconcile can apply the
 /// idle TTL (the activity FSM persists state strings but not a host-clock idle
@@ -39,6 +39,7 @@ pub fn reconcile(
     session: &crate::session::Session,
     app_cfg: &thegn_core::config::Config,
     cfg: &LifecycleConfig,
+    locations: &WorktreeLocations,
 ) {
     if !cfg.enabled {
         return;
@@ -48,19 +49,69 @@ pub fn reconcile(
     let active_path: Option<String> = session.active_group().map(|g| g.path.clone());
 
     let mut reg = last_active().lock().unwrap();
+    let (candidates, seen) = warm_candidates(
+        session,
+        locations,
+        &states,
+        active_path.as_deref(),
+        now,
+        &mut reg,
+    );
+    // Prune vanished worktrees from the clock.
+    reg.retain(|p, _| seen.contains(p));
+    drop(reg);
+
+    let decision = decide(&WarmInputs {
+        active_worktree: active_path,
+        budget: WarmBudget {
+            enabled: true,
+            max_warm: cfg.max_warm,
+            idle_ttl_secs: cfg.idle_ttl_secs,
+            keep_active_warm: cfg.keep_active_warm,
+            keep_busy_warm: cfg.keep_busy_warm,
+        },
+        candidates,
+    });
+
+    for wt in &decision.suspend {
+        let loc = locations.loc(Path::new(wt));
+        // Providers that don't self-suspend (machine0/fly) keep billing an idle VM
+        // unless thegn explicitly parks it — dropping the bridge alone (the
+        // sprites path, where Firecracker auto-idles) isn't enough. Do this BEFORE
+        // dropping the bridge so a live control read can't wake it back up.
+        explicit_park(app_cfg, wt, &loc);
+        if let Some(key) = thegn_svc::bridge::bridge_key(&loc) {
+            thegn_svc::bridge::drop_key(&key);
+            tracing::debug!(
+                target: "thegn::lifecycle",
+                worktree = %wt,
+                "suspended idle sandbox (dropped resident bridge)"
+            );
+        }
+    }
+}
+
+fn warm_candidates(
+    session: &crate::session::Session,
+    locations: &WorktreeLocations,
+    states: &std::collections::BTreeMap<String, String>,
+    active_path: Option<&str>,
+    now: Instant,
+    reg: &mut HashMap<String, Instant>,
+) -> (Vec<WarmCandidate>, HashSet<String>) {
     let mut candidates: Vec<WarmCandidate> = Vec::new();
     let mut seen: HashSet<String> = HashSet::new();
     for g in &session.worktrees {
         if g.path.is_empty() || !seen.insert(g.path.clone()) {
             continue;
         }
-        let loc = GitLoc::for_worktree(Path::new(&g.path));
+        let loc = locations.loc(Path::new(&g.path));
         if !loc.is_remote() {
             continue;
         }
         let currently_warm = thegn_svc::bridge::for_loc(&loc).is_some();
-        let busy = states.get(&g.name).map(|s| s == "active").unwrap_or(false);
-        let is_active = active_path.as_deref() == Some(g.path.as_str());
+        let busy = states.get(&g.name).is_some_and(|state| state == "active");
+        let is_active = active_path == Some(g.path.as_str());
         // Refresh the activity clock while active/busy; otherwise let it age.
         if busy || is_active {
             reg.insert(g.path.clone(), now);
@@ -81,38 +132,7 @@ pub fn reconcile(
             currently_warm,
         });
     }
-    // Prune vanished worktrees from the clock.
-    reg.retain(|p, _| seen.contains(p));
-    drop(reg);
-
-    let decision = decide(&WarmInputs {
-        active_worktree: active_path,
-        budget: WarmBudget {
-            enabled: true,
-            max_warm: cfg.max_warm,
-            idle_ttl_secs: cfg.idle_ttl_secs,
-            keep_active_warm: cfg.keep_active_warm,
-            keep_busy_warm: cfg.keep_busy_warm,
-        },
-        candidates,
-    });
-
-    for wt in &decision.suspend {
-        let loc = GitLoc::for_worktree(Path::new(wt));
-        // Providers that don't self-suspend (machine0/fly) keep billing an idle VM
-        // unless thegn explicitly parks it — dropping the bridge alone (the
-        // sprites path, where Firecracker auto-idles) isn't enough. Do this BEFORE
-        // dropping the bridge so a live control read can't wake it back up.
-        explicit_park(app_cfg, wt);
-        if let Some(key) = thegn_svc::bridge::bridge_key(&loc) {
-            thegn_svc::bridge::drop_key(&key);
-            tracing::debug!(
-                target: "thegn::lifecycle",
-                worktree = %wt,
-                "suspended idle sandbox (dropped resident bridge)"
-            );
-        }
-    }
+    (candidates, seen)
 }
 
 /// Explicitly `vm_suspend`/stop an idle worktree's sandbox when its provider is
@@ -121,10 +141,9 @@ pub fn reconcile(
 /// idempotent (a no-op if the provider self-idles, doesn't support it, or is
 /// already parked). Clears the machine0 bridge's endpoint cache so a control read
 /// can't attach to the just-parked VM.
-fn explicit_park(app_cfg: &thegn_core::config::Config, worktree: &str) {
+fn explicit_park(app_cfg: &thegn_core::config::Config, worktree: &str, loc: &GitLoc) {
     use std::path::{Path, PathBuf};
     use thegn_core::store::{PoolStore, WorkspaceStore};
-    let loc = GitLoc::for_worktree(Path::new(worktree));
     if !loc.is_remote() {
         return;
     }
@@ -138,7 +157,7 @@ fn explicit_park(app_cfg: &thegn_core::config::Config, worktree: &str) {
     let selected = thegn_core::db::Db::open()
         .ok()
         .and_then(|db| db.effective_env(worktree, &repo_root.to_string_lossy()));
-    let env = app_cfg.resolve_env(&repo_root, &loc, Path::new(worktree), selected.as_deref());
+    let env = app_cfg.resolve_env(&repo_root, loc, Path::new(worktree), selected.as_deref());
     let Some(envc) = app_cfg.env.get(&env.name) else {
         return;
     };
@@ -563,6 +582,76 @@ pub fn recycle_claimed_on_delete(cfg: &Config, env_name: &str, name: &str) -> bo
 mod tests {
     use super::*;
     use thegn_core::db::Db;
+
+    #[test]
+    fn warm_candidate_scan_uses_index_without_database_opens() {
+        let _state = thegn_core::testenv::IsolatedState::new();
+        let mut session = crate::session::Session::default();
+        let mut pairs = Vec::new();
+        let mut expected_remote = HashSet::new();
+        for index in 0_u32..36 {
+            let path = format!("/fixture/worktree-{index}");
+            session.worktrees.push(crate::session::WorktreeGroup::new(
+                format!("tab-{index}"),
+                crate::session::GroupKind::Branch,
+                path.clone(),
+            ));
+            if index.is_multiple_of(2) {
+                let location = GitLoc::remote_db_string(
+                    "box",
+                    22,
+                    false,
+                    &format!("/remote/worktree-{index}"),
+                );
+                pairs.push((path.clone(), location));
+                expected_remote.insert(path);
+            } else {
+                pairs.push((path, String::new()));
+            }
+        }
+        let locations = WorktreeLocations::from_pairs(
+            pairs
+                .iter()
+                .map(|(path, location)| (path.as_str(), location.as_str())),
+        );
+        let states = std::collections::BTreeMap::new();
+        let mut activity_clock = HashMap::new();
+        let before_scan = thegn_core::db_open_stats::total_opens();
+        let (candidates, _) = warm_candidates(
+            &session,
+            &locations,
+            &states,
+            None,
+            Instant::now(),
+            &mut activity_clock,
+        );
+        let after_scan = thegn_core::db_open_stats::total_opens();
+        assert_eq!(after_scan, before_scan, "indexed scan must open no DBs");
+        assert_eq!(
+            candidates
+                .iter()
+                .map(|candidate| candidate.worktree.clone())
+                .collect::<HashSet<_>>(),
+            expected_remote
+        );
+
+        let before_control = thegn_core::db_open_stats::total_opens();
+        for path in session
+            .worktrees
+            .iter()
+            .take(3)
+            .map(|group| group.path.as_str())
+        {
+            let loc = GitLoc::for_worktree(Path::new(path));
+            assert!(!loc.is_remote());
+        }
+        assert_eq!(
+            thegn_core::db_open_stats::total_opens() - before_control,
+            3,
+            // This exact count relies on nextest running each test in its own process.
+            "three uncached lookups must record three DB opens"
+        );
+    }
 
     /// The DB row transitions around a recycle: ready → claimed → (restore
     /// succeeds) → ready again with the SAME checkpoint + a fresh clock, and the
