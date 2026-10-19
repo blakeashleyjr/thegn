@@ -53,12 +53,141 @@ enum StreamState {
 pub(crate) struct QueryParser {
     state: StreamState,
     body: Vec<u8>,
+    keyboard: KeyboardOptIn,
+}
+
+/// Keyboard modes requested by one pane. Kitty's stack is intentionally
+/// bounded: a misbehaving child cannot make the host retain unbounded state.
+#[derive(Debug, Default)]
+struct KeyboardOptIn {
+    modify_other_keys: u8,
+    kitty: [u8; 8],
+    kitty_len: u8,
+}
+
+impl KeyboardOptIn {
+    fn reset(&mut self) {
+        self.modify_other_keys = 0;
+        self.kitty = [0; 8];
+        self.kitty_len = 0;
+    }
+
+    fn extended_keys(&self) -> bool {
+        self.modify_other_keys >= 1
+            || self.kitty_len > 0 && self.kitty[usize::from(self.kitty_len - 1)] & 1 != 0
+    }
+
+    fn update_csi(&mut self, body: &[u8]) {
+        match body.last() {
+            Some(b'm') => self.update_modify_other_keys(body),
+            Some(b'u') => self.update_kitty(body),
+            _ => {}
+        }
+    }
+
+    fn update_modify_other_keys(&mut self, body: &[u8]) {
+        let Some(params) = body.strip_suffix(b"m") else {
+            return;
+        };
+        let Some(value) = params.strip_prefix(b">4") else {
+            return;
+        };
+        let level = match value {
+            b"" | b";" => Some(0),
+            [b';', rest @ ..] => match parse_decimal(rest) {
+                Some(level) => Some(level.min(3) as u8),
+                None => None,
+            },
+            _ => None,
+        };
+        if let Some(level) = level {
+            self.modify_other_keys = level;
+        }
+    }
+
+    fn update_kitty(&mut self, body: &[u8]) {
+        let Some(params) = body.strip_suffix(b"u") else {
+            return;
+        };
+        if let Some(flags) = params.strip_prefix(b">") {
+            if let Some(flags) = parse_optional_decimal(flags, 0) {
+                let flags = (flags & 0x1f) as u8;
+                if self.kitty_len == self.kitty.len() as u8 {
+                    self.kitty.copy_within(1.., 0);
+                    self.kitty_len -= 1;
+                }
+                self.kitty[usize::from(self.kitty_len)] = flags;
+                self.kitty_len += 1;
+            }
+            return;
+        }
+        if let Some(count) = params.strip_prefix(b"<") {
+            if let Some(count) = parse_optional_decimal(count, 1) {
+                self.kitty_len = self.kitty_len.saturating_sub(count.min(8) as u8);
+            }
+            return;
+        }
+        if let Some(params) = params.strip_prefix(b"=") {
+            let (flags, mode) = match params.split_once(|byte| *byte == b';') {
+                Some((flags, mode)) => (flags, mode),
+                None => (params, &[]),
+            };
+            let Some(flags) = parse_decimal(flags) else {
+                return;
+            };
+            let Some(mode) = parse_optional_decimal(mode, 1) else {
+                return;
+            };
+            let flags = (flags & 0x1f) as u8;
+            let current = if self.kitty_len == 0 {
+                0
+            } else {
+                self.kitty[usize::from(self.kitty_len - 1)]
+            };
+            let updated = match mode {
+                1 => Some(flags),
+                2 => Some(current | flags),
+                3 => Some(current & !flags),
+                _ => None,
+            };
+            if let Some(updated) = updated
+                && self.kitty_len > 0
+            {
+                self.kitty[usize::from(self.kitty_len - 1)] = updated;
+            }
+        }
+    }
+}
+
+fn parse_optional_decimal(value: &[u8], default: u32) -> Option<u32> {
+    if value.is_empty() {
+        Some(default)
+    } else {
+        parse_decimal(value)
+    }
+}
+
+fn parse_decimal(value: &[u8]) -> Option<u32> {
+    if value.is_empty() {
+        return None;
+    }
+    value.iter().try_fold(0_u32, |number, byte| {
+        if !byte.is_ascii_digit() {
+            return None;
+        }
+        number.checked_mul(10)?.checked_add(u32::from(*byte - b'0'))
+    })
 }
 
 impl QueryParser {
     pub(crate) fn reset(&mut self) {
         self.state = StreamState::Text;
         self.body.clear();
+        self.keyboard.reset();
+    }
+
+    pub(crate) fn extended_keys(&self) -> bool {
+        self.keyboard.extended_keys()
     }
 
     pub(crate) fn feed(
@@ -94,12 +223,17 @@ impl QueryParser {
                     }
                     b'P' | b'^' | b'X' => StreamState::DiscardApc { escape: false },
                     0x1b => StreamState::Escape,
+                    b'c' => {
+                        self.keyboard.reset();
+                        StreamState::Text
+                    }
                     _ => StreamState::Text,
                 },
                 StreamState::Csi => {
                     if (0x40..=0x7e).contains(&byte) {
                         if self.body.len() < MAX_QUERY_CONTROL {
                             self.body.push(byte);
+                            self.keyboard.update_csi(&self.body);
                             respond_csi(&self.body, cursor, size, &mut out);
                         }
                         self.body.clear();
@@ -471,6 +605,113 @@ mod tests {
             let mut parser = QueryParser::default();
             assert!(parser.feed(input, (4, 9), (24, 80), COLORS).is_empty());
         }
+    }
+
+    fn feed_mode(parser: &mut QueryParser, mode: &[u8]) -> Vec<u8> {
+        parser.feed(mode, (4, 9), (24, 80), COLORS)
+    }
+
+    #[test]
+    fn xterm_modify_other_keys_opts_in_and_clears() {
+        let mut parser = QueryParser::default();
+        assert!(feed_mode(&mut parser, b"\x1b[>4;2m").is_empty());
+        assert!(parser.extended_keys());
+        assert!(feed_mode(&mut parser, b"\x1b[>4m").is_empty());
+        assert!(!parser.extended_keys());
+        assert!(feed_mode(&mut parser, b"\x1b[>4;2m").is_empty());
+        assert!(parser.extended_keys());
+        assert!(feed_mode(&mut parser, b"\x1b[>4;m").is_empty());
+        assert!(!parser.extended_keys());
+        assert!(feed_mode(&mut parser, b"\x1b[>4;2m").is_empty());
+        assert!(feed_mode(&mut parser, b"\x1b[>4;0m").is_empty());
+        assert!(!parser.extended_keys());
+
+        assert!(feed_mode(&mut parser, b"\x1b[>4;9m").is_empty());
+        assert!(parser.extended_keys(), "levels above 3 clamp to level 3");
+        assert!(feed_mode(&mut parser, b"\x1b[>1;2m").is_empty());
+        assert!(parser.extended_keys(), "other xterm resources are ignored");
+    }
+
+    #[test]
+    fn kitty_push_pop_and_set_modes_track_disambiguation_flag() {
+        let mut parser = QueryParser::default();
+        assert!(feed_mode(&mut parser, b"\x1b[>1u").is_empty());
+        assert!(parser.extended_keys());
+        assert!(feed_mode(&mut parser, b"\x1b[<u").is_empty());
+        assert!(!parser.extended_keys());
+        assert!(feed_mode(&mut parser, b"\x1b[>0u").is_empty());
+        assert!(!parser.extended_keys());
+
+        assert!(feed_mode(&mut parser, b"\x1b[=1;1u").is_empty());
+        assert!(
+            parser.extended_keys(),
+            "set mode on an empty stack is implicit"
+        );
+        assert!(feed_mode(&mut parser, b"\x1b[=1;3u").is_empty());
+        assert!(!parser.extended_keys());
+
+        assert!(feed_mode(&mut parser, b"\x1b[>1u\x1b[=2;2u").is_empty());
+        assert!(parser.extended_keys(), "mode 2 ORs flags into the top");
+        assert!(feed_mode(&mut parser, b"\x1b[=2;3u").is_empty());
+        assert!(!parser.extended_keys(), "mode 3 clears flags from the top");
+    }
+
+    #[test]
+    fn kitty_stack_is_bounded_and_pops_saturate() {
+        let mut parser = QueryParser::default();
+        for _ in 0..9 {
+            assert!(feed_mode(&mut parser, b"\x1b[>1u").is_empty());
+        }
+        assert_eq!(parser.keyboard.kitty_len, 8);
+        assert!(parser.extended_keys());
+        for _ in 0..9 {
+            assert!(feed_mode(&mut parser, b"\x1b[<u").is_empty());
+        }
+        assert_eq!(parser.keyboard.kitty_len, 0);
+        assert!(!parser.extended_keys());
+    }
+
+    #[test]
+    fn keyboard_modes_are_chunk_safe_resettable_and_not_parsed_in_strings() {
+        let mode = b"\x1b[>4;2m";
+        for split in 0..=mode.len() {
+            let mut parser = QueryParser::default();
+            assert!(feed_mode(&mut parser, &mode[..split]).is_empty());
+            assert!(feed_mode(&mut parser, &mode[split..]).is_empty());
+            assert!(parser.extended_keys(), "split {split}");
+        }
+
+        let mut parser = QueryParser::default();
+        assert!(feed_mode(&mut parser, b"\x1b]0;\x1b[>4;2m\x07").is_empty());
+        assert!(!parser.extended_keys());
+        assert!(feed_mode(&mut parser, b"\x1b[>4;2m").is_empty());
+        assert!(parser.extended_keys());
+        assert!(feed_mode(&mut parser, b"\x1bc").is_empty());
+        assert!(!parser.extended_keys());
+        assert!(feed_mode(&mut parser, b"\x1b[>4;2m").is_empty());
+        parser.reset();
+        assert!(!parser.extended_keys());
+    }
+
+    #[test]
+    fn malformed_and_oversized_keyboard_modes_do_not_change_state() {
+        let mut parser = QueryParser::default();
+        assert!(feed_mode(&mut parser, b"\x1b[>4;2m").is_empty());
+        for malformed in [
+            b"\x1b[>4;x m".as_slice(),
+            b"\x1b[>4;4294967296m".as_slice(),
+            b"\x1b[>1xu".as_slice(),
+            b"\x1b[=;1u".as_slice(),
+        ] {
+            assert!(feed_mode(&mut parser, malformed).is_empty());
+            assert!(parser.extended_keys(), "{malformed:?}");
+        }
+        assert!(feed_mode(&mut parser, b"\x1b[>4;0m").is_empty());
+        let mut oversized = b"\x1b[>4;2".to_vec();
+        oversized.extend(std::iter::repeat_n(b'0', MAX_QUERY_CONTROL));
+        oversized.push(b'm');
+        assert!(feed_mode(&mut parser, &oversized).is_empty());
+        assert!(!parser.extended_keys());
     }
 
     #[test]
