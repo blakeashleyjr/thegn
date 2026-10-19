@@ -276,15 +276,16 @@ and new/exited values unknown until their baselines are available.
   and `j`/`k` move and the view follows, so it is always a row on screen. It
   always asks first: the confirmation names
   the PID, process name, and owner, so a pane-owned build is recognizably
-  thegn's own. The first `x` sends a graceful terminate (SIGTERM); pressing `x`
-  again on the same process offers a hard kill (SIGKILL) as a separate,
-  explicit step. A signal whose sampled process changed or left the displayed
-  list is refused with “process changed or left the sampled list; select it
-  again”. A signal that fails — no such process, permission denied — is shown
-  in the footer, never silently swallowed. When process identity cannot be
-  pinned, the signal is refused and the reason is shown in the footer. This is
-  a local, terminal-only action: it is not exposed to the CLI, the control API,
-  or any remote surface.
+  thegn's own. On Unix, the first `x` sends a graceful terminate (SIGTERM);
+  pressing `x` again on the same process offers a hard kill (SIGKILL) as a
+  separate, explicit step. On Windows, each `x` confirms a hard
+  `TerminateProcess`. A signal whose sampled process changed or left the
+  displayed list is refused with “process changed or left the sampled
+  list; select it again”. A signal that fails — no such process, permission
+  denied — is shown in the footer, never silently swallowed. When process
+  identity cannot be pinned, the signal is refused and the reason is shown in
+  the footer. This is a local, terminal-only action: it is not exposed to the
+  CLI, the control API, or any remote surface.
 - `X` opens the platform signal menu: `t` TERM, `i` INT, `h` HUP, `k` KILL,
   `s` STOP and `c` CONT on Linux and macOS, or `t` TERM on Windows, followed by
   `r` TERM tree. Choose by letter or with the arrow keys and Enter. TERM, INT,

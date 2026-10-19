@@ -92,19 +92,10 @@ pub(super) fn line(input: FooterInput<'_>) -> Line {
                 } else {
                     ""
                 };
-                return Line::split(
-                    vec![
-                        seg(
-                            Tok::Slot(S::Accent),
-                            format!(
-                                "TERM tree of {label}: {} sampled processes{cap}?",
-                                targets.len()
-                            ),
-                        )
-                        .bold(),
-                    ],
-                    vec![ghost("y confirm · n/Esc cancel")],
-                );
+                format!(
+                    "TERM tree of {label}: {} sampled processes{cap}?",
+                    targets.len()
+                )
             }
             Confirm::Clean { label, .. } => format!("clean target/ in {label}?"),
             Confirm::Renice {
