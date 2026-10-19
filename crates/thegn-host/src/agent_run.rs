@@ -221,11 +221,52 @@ pub(crate) fn agent_floor_gate(
     floor: thegn_core::config::IsolationFloor,
     on_miss: thegn_core::config::OnFloorMiss,
 ) -> AgentDispatch {
-    use thegn_core::capabilities::IsolationClass;
-    use thegn_core::sandbox_floor::{AgentGate, queue_agent_gate};
     if !sandbox_on {
         return AgentDispatch::Run(None);
     }
+    let effective = effective_agent_sandbox(full, worktree);
+    agent_floor_gate_with_effective(full, worktree, floor, on_miss, effective)
+}
+
+fn effective_agent_sandbox(
+    full: &thegn_core::config::Config,
+    worktree: &str,
+) -> Result<thegn_core::config::SandboxConfig, String> {
+    let worktree_path = std::path::Path::new(worktree);
+    let repo_root = crate::merge_ops::repo_root_of(worktree_path)
+        .ok_or_else(|| format!("could not resolve the repository root for {worktree}"))?;
+    effective_agent_sandbox_at(full, &repo_root, worktree_path)
+}
+
+fn effective_agent_sandbox_at(
+    full: &thegn_core::config::Config,
+    repo_root: &std::path::Path,
+    worktree: &std::path::Path,
+) -> Result<thegn_core::config::SandboxConfig, String> {
+    let loc = thegn_core::remote::GitLoc::Local(worktree.to_path_buf());
+    let env = full.resolve_env(repo_root, &loc, worktree, None);
+    if env.unresolved_selection || env.is_remote() {
+        return Err(format!(
+            "queued agents run only on the local host; the effective env `{}` is remote/unresolved",
+            env.name
+        ));
+    }
+    Ok(env.sandbox)
+}
+
+fn agent_floor_gate_with_effective(
+    full: &thegn_core::config::Config,
+    worktree: &str,
+    floor: thegn_core::config::IsolationFloor,
+    on_miss: thegn_core::config::OnFloorMiss,
+    effective: Result<thegn_core::config::SandboxConfig, String>,
+) -> AgentDispatch {
+    use thegn_core::capabilities::IsolationClass;
+    use thegn_core::sandbox_floor::{AgentGate, queue_agent_gate};
+    let effective = match effective {
+        Ok(effective) => effective,
+        Err(reason) => return AgentDispatch::InfraHold(reason),
+    };
     let loc = thegn_core::remote::GitLoc::Local(std::path::PathBuf::from(worktree));
     let name = std::path::Path::new(worktree)
         .file_name()
@@ -233,15 +274,15 @@ pub(crate) fn agent_floor_gate(
         .unwrap_or("agent-task");
     // `None` ⇒ the sandbox couldn't be established (disabled, or the chain
     // resolved to the host) — a broken boundary under a demanded floor.
-    let spec = thegn_core::sandbox::resolve(&full.sandbox, &loc, name)
+    let spec = thegn_core::sandbox::resolve(&effective, &loc, name)
         .map(|spec| scope_agent_spec(spec, worktree));
     // THE-215: a sealed profile whose sandbox could not be established must not
     // run the agent on the host — no spec skips the home gate below, so refuse.
-    if spec.is_none() && full.sandbox.profile.hides_home() {
+    if spec.is_none() && effective.profile.hides_home() {
         return AgentDispatch::InfraHold(format!(
             "profile `{}` requires a sandbox that hides $HOME, but none could be established \
              for {worktree}",
-            full.sandbox.profile.as_str()
+            effective.profile.as_str()
         ));
     }
     // THE-215: a sealed launch that would expose the host `$HOME` is an
@@ -251,7 +292,9 @@ pub(crate) fn agent_floor_gate(
     }
     let resolved = spec.as_ref().map(|s| s.capabilities().isolation);
     let best = resolved.unwrap_or(IsolationClass::HostProcess);
-    let dispatch = match queue_agent_gate(&full.sandbox, floor, on_miss, resolved, best) {
+    let global_gate = queue_agent_gate(&full.sandbox, floor, on_miss, resolved, best);
+    let effective_gate = queue_agent_gate(&effective, floor, on_miss, resolved, best);
+    let dispatch = match stricter_agent_gate(global_gate, effective_gate) {
         AgentGate::Run => AgentDispatch::Run(spec),
         AgentGate::RunDegraded(w) => AgentDispatch::RunDegraded(spec, w),
         AgentGate::InfraHold(r) => AgentDispatch::InfraHold(r),
@@ -264,6 +307,23 @@ pub(crate) fn agent_floor_gate(
         thegn_core::sandbox_preflight::preflight_exec(spec)?;
         Ok(warning)
     })
+}
+
+fn stricter_agent_gate(
+    global: thegn_core::sandbox_floor::AgentGate,
+    effective: thegn_core::sandbox_floor::AgentGate,
+) -> thegn_core::sandbox_floor::AgentGate {
+    use thegn_core::sandbox_floor::AgentGate;
+    let severity = |gate: &AgentGate| match gate {
+        AgentGate::Run => 0,
+        AgentGate::RunDegraded(_) => 1,
+        AgentGate::InfraHold(_) => 2,
+    };
+    if severity(&effective) > severity(&global) {
+        effective
+    } else {
+        global
+    }
 }
 
 /// Run the agent to completion and report whether it exited zero.
@@ -1059,6 +1119,79 @@ mod tests {
             daemon_persistent: false,
             seal_home: None,
         }
+    }
+
+    #[test]
+    fn queue_agent_sandbox_honours_a_repo_network_none_overlay() {
+        let repo = tempfile::tempdir().unwrap();
+        std::fs::write(
+            repo.path().join(".thegn.toml"),
+            "[sandbox]\nnetwork = \"none\"\n",
+        )
+        .unwrap();
+        let full: thegn_core::config::Config = toml::from_str(
+            r#"
+                [sandbox]
+                enabled = true
+                network = "nat"
+            "#,
+        )
+        .unwrap();
+
+        let effective = effective_agent_sandbox_at(&full, repo.path(), repo.path()).unwrap();
+        assert_eq!(effective.network, thegn_core::config::Network::None);
+        let loc = thegn_core::remote::GitLoc::Local(repo.path().to_path_buf());
+        if let Some(spec) = thegn_core::sandbox::resolve(&effective, &loc, "x") {
+            assert_eq!(spec.network, thegn_core::config::Network::None);
+        }
+    }
+
+    #[test]
+    fn remote_effective_env_holds_the_queue_agent() {
+        let repo = tempfile::tempdir().unwrap();
+        std::fs::write(repo.path().join(".thegn.toml"), "env = \"x\"\n").unwrap();
+        let full: thegn_core::config::Config = toml::from_str(
+            r#"
+                [sandbox]
+                default_env = "x"
+                [env.x]
+                placement = "ssh"
+            "#,
+        )
+        .unwrap();
+
+        let effective = effective_agent_sandbox_at(&full, repo.path(), repo.path());
+        let dispatch = agent_floor_gate_with_effective(
+            &full,
+            repo.path().to_str().unwrap(),
+            thegn_core::config::IsolationFloor::Off,
+            thegn_core::config::OnFloorMiss::Degrade,
+            effective,
+        );
+        assert!(
+            matches!(dispatch, AgentDispatch::InfraHold(reason) if reason.contains("effective env `x` is remote/unresolved"))
+        );
+    }
+
+    #[test]
+    fn stricter_of_global_and_effective_floor_wins() {
+        use thegn_core::sandbox_floor::AgentGate;
+
+        assert!(matches!(
+            stricter_agent_gate(AgentGate::Run, AgentGate::InfraHold("effective".into())),
+            AgentGate::InfraHold(reason) if reason == "effective"
+        ));
+        assert!(matches!(
+            stricter_agent_gate(AgentGate::InfraHold("global".into()), AgentGate::Run),
+            AgentGate::InfraHold(reason) if reason == "global"
+        ));
+        assert!(matches!(
+            stricter_agent_gate(
+                AgentGate::RunDegraded("global".into()),
+                AgentGate::RunDegraded("effective".into())
+            ),
+            AgentGate::RunDegraded(reason) if reason == "global"
+        ));
     }
 
     #[test]
