@@ -1558,8 +1558,9 @@ pub(crate) fn migrate_v84(conn: &Connection) -> Result<()> {
     if has_column(conn, "calendar_events", "rid") {
         return Ok(());
     }
-    conn.execute_batch(
-        "BEGIN;
+    let tx = conn.unchecked_transaction()?;
+    tx.execute_batch(
+        "
          CREATE TABLE calendar_events_v84 (
              account TEXT NOT NULL,
              uid TEXT NOT NULL,
@@ -1582,9 +1583,9 @@ pub(crate) fn migrate_v84(conn: &Connection) -> Result<()> {
          CREATE INDEX calendar_events_span ON calendar_events(start_ms, end_ms);
          CREATE INDEX calendar_events_recurring ON calendar_events(recurring);
          CREATE INDEX calendar_events_href ON calendar_events(account, href);
-         UPDATE calendar_sync SET sync_token = '', fetched_at = 0;
-         COMMIT;",
+         UPDATE calendar_sync SET sync_token = '', fetched_at = 0;",
     )?;
+    tx.commit()?;
     Ok(())
 }
 
@@ -2361,6 +2362,29 @@ mod tests {
     }
 
     #[test]
+    fn v84_failure_rolls_back_calendar_rebuild() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE calendar_events (
+                 account TEXT NOT NULL, uid TEXT NOT NULL, calendar TEXT NOT NULL DEFAULT '',
+                 start_ms INTEGER NOT NULL, end_ms INTEGER NOT NULL,
+                 recurring INTEGER NOT NULL DEFAULT 0, json TEXT NOT NULL,
+                 fetched_at INTEGER NOT NULL, href TEXT,
+                 PRIMARY KEY(account, uid));
+             INSERT INTO calendar_events VALUES ('a','one','','1','2',0,'{}',3,NULL);",
+        )
+        .unwrap();
+
+        assert!(super::migrate_v84(&conn).is_err());
+        assert!(conn.is_autocommit());
+        assert!(!super::has_column(&conn, "calendar_events", "rid"));
+        let uid: String = conn
+            .query_row("SELECT uid FROM calendar_events", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(uid, "one");
+    }
+
+    #[test]
     fn v84_master_and_overrides_survive_full_incremental_and_reload() {
         let row = |rid: &str, start: i64| CalendarRow {
             uid: "standup@x".into(),
@@ -2384,7 +2408,7 @@ mod tests {
         assert_eq!(
             db.get_calendar_events(0, 10, &["b".into()]).unwrap(),
             full.iter()
-                .map(|(_, json)| ("b".into(), json.clone()))
+                .map(|(_, json)| ("b".to_string(), json.clone()))
                 .collect::<Vec<_>>()
         );
 

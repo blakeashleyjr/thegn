@@ -42,6 +42,12 @@ fn duplicate_recurrence_id_quarantines_vevent() {
         "UID:x\nDTSTART:20261012T090000Z\nRECURRENCE-ID:20261012T090000Z\nRECURRENCE-ID:20261013T090000Z",
     );
     assert!(parse_ics(&input, "UTC").is_empty());
+
+    let positive_control =
+        one_event("UID:x\nDTSTART:20261012T090000Z\nRECURRENCE-ID:20261012T090000Z");
+    let events = parse_ics(&positive_control, "UTC");
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0].recurrence_key(), "20261012T090000Z");
 }
 
 fn parse_report(input: &str) -> (Vec<CalEvent>, IcsReport) {
