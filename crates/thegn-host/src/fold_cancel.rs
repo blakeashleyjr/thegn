@@ -148,7 +148,7 @@ mod tests {
 
     #[test]
     fn app_worker_observes_shutdown_and_exits_before_wait_deadline() {
-        let workers = Box::leak(Box::new(AppFoldWorkers::new()));
+        let workers: &'static AppFoldWorkers = Box::leak(Box::new(AppFoldWorkers::new()));
         let (entered_tx, entered_rx) = mpsc::channel();
         let worker = spawn_named("thegn-fold-wait", move || {
             crate::platform::qos::set_self(crate::platform::qos::Qos::Background);
@@ -167,7 +167,7 @@ mod tests {
 
     #[test]
     fn shutdown_wait_reports_workers_that_ignore_the_probe() {
-        let workers = Box::leak(Box::new(AppFoldWorkers::new()));
+        let workers: &'static AppFoldWorkers = Box::leak(Box::new(AppFoldWorkers::new()));
         let (entered_tx, entered_rx) = mpsc::channel();
         let (release_tx, release_rx) = mpsc::channel();
         let worker = spawn_named("thegn-fold-hold", move || {
@@ -187,7 +187,7 @@ mod tests {
 
     #[test]
     fn nested_scope_restores_the_app_worker_probe() {
-        let workers = Box::leak(Box::new(AppFoldWorkers::new()));
+        let workers: &'static AppFoldWorkers = Box::leak(Box::new(AppFoldWorkers::new()));
         let (entered_tx, entered_rx) = mpsc::channel();
         let worker = spawn_named("thegn-fold-nest", move || {
             crate::platform::qos::set_self(crate::platform::qos::Qos::Background);
