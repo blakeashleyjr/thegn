@@ -753,8 +753,12 @@ fn drill_down_shows_the_selected_cores_frequency_idle_and_topology() {
     Board::default().paint(&view, &mut surface, Rect::full(240, 60), 0, &[]);
     let rendered = lines(&surface).join("\n");
     assert!(
-        rendered.contains("1800MHz"),
+        rendered.contains("freq cur/min/max/hw 1800MHz/800MHz/3600MHz/3600MHz"),
         "selected policy must be core 1's: {rendered}"
+    );
+    assert!(
+        !rendered.contains("freq cur/min/max/hw 2400MHz"),
+        "core 0's policy must not be shown for selected core 1: {rendered}"
     );
     assert!(
         rendered.contains("C7-only 77%"),
@@ -798,6 +802,55 @@ fn selected_core_label_is_highlighted_only_with_a_cursor() {
             .unwrap()
         );
         assert_ne!(selected.bg, grid.get(1, 1).unwrap().bg);
+    });
+}
+
+#[test]
+fn selected_core_label_stays_visible_past_the_panel_rows() {
+    let mut model = CpuModel::default();
+    model.cpu_stat.cores.extend((0..8).map(|id| CoreSample {
+        id,
+        online: true,
+        ..CoreSample::default()
+    }));
+    let mut grid = crate::monitor::kit::grid::CellGrid::new(40, 4);
+    let selected_bg = crate::seg::StyleTok::from_tok(crate::seg::Tok::Series(
+        thegn_core::theme::SeriesRole::Selected,
+    ))
+    .unwrap();
+    caps::test_override::with_unicode(UnicodeLevel::Full, || {
+        super::paint::paint_cores(
+            &mut grid,
+            Rect::full(40, 4),
+            &model,
+            Some(7),
+            &mut String::new(),
+        );
+        assert_eq!(grid.get(1, 2).unwrap().bg, selected_bg);
+        assert_eq!(grid.get(1, 1).unwrap().bg, crate::seg::StyleTok::INHERIT);
+    });
+}
+
+#[test]
+fn braille_highlight_applies_only_to_the_selected_half_of_a_pair() {
+    let frame = fixture_frame();
+    let mut model = CpuModel::default();
+    model.absorb_frame(&frame);
+    let mut grid = crate::monitor::kit::grid::CellGrid::new(40, 8);
+    let selected_bg = crate::seg::StyleTok::from_tok(crate::seg::Tok::Series(
+        thegn_core::theme::SeriesRole::Selected,
+    ))
+    .unwrap();
+    caps::test_override::with_unicode(UnicodeLevel::Full, || {
+        super::paint::paint_cores(
+            &mut grid,
+            Rect::full(40, 8),
+            &model,
+            Some(1),
+            &mut String::new(),
+        );
+        assert_ne!(grid.get(2, 1).unwrap().bg, selected_bg);
+        assert_eq!(grid.get(6, 1).unwrap().bg, selected_bg);
     });
 }
 

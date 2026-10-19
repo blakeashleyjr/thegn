@@ -12,6 +12,7 @@ fn overlay() -> MonitorOverlay {
     let screen = crate::compositor::Rect::full(120, 40);
     let ctx = StatusCtx::new_for_test_on(&history, screen);
     let mut overlay = MonitorOverlay::open(MonitorTab::Cpu, MonitorPrefs::default(), &model, &ctx);
+    assert_eq!(overlay.tab, MonitorTab::Cpu);
     let mut frame = MonitorFrame::default();
     frame.parts.cpu_stat.cores = (0..3)
         .map(|id| CoreSample {
@@ -22,6 +23,20 @@ fn overlay() -> MonitorOverlay {
         .collect();
     overlay.cpu.absorb_frame(&frame);
     overlay
+}
+
+#[test]
+fn cpu_without_cores_keeps_home_and_end_in_viewport_navigation_mode() {
+    let history = crate::telemetry::TelemetryHistory::default();
+    let model = FrameModel::default();
+    let screen = crate::compositor::Rect::full(120, 40);
+    let ctx = StatusCtx::new_for_test_on(&history, screen);
+    let mut overlay = MonitorOverlay::open(MonitorTab::Cpu, MonitorPrefs::default(), &model, &ctx);
+    assert_eq!(overlay.tab, MonitorTab::Cpu);
+    assert_eq!(overlay.cpu.core_count(), 0);
+    assert!(!overlay.is_list_tab());
+    key(&mut overlay, KeyCode::End);
+    assert_eq!(overlay.scroll(), overlay.scroll_max());
 }
 
 fn key(overlay: &mut MonitorOverlay, key: KeyCode) -> MonitorOutcome {
