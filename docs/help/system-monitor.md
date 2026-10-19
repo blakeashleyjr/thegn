@@ -187,10 +187,9 @@ sizes yet”. Opening the tab never starts a `du` walk, and a stale row shows it
 age rather than blocking on a rescan. `j`/`k` and the arrows move the highlighted
 worktree, and the panel scrolls to keep that row visible. `x` opens the existing
 clean confirmation for the highlighted row while the Worktrees panel is on
-screen. Cleaning keeps the checkout and
-removes only regenerable build artifacts off the event loop; the row updates
-after the next measurement. Use `f`/`F` to move panel focus, `z` to zoom, and
-`Esc` to unzoom before closing the monitor.
+screen. Cleaning keeps the checkout and removes only regenerable build artifacts
+off the event loop; the row updates after the next measurement. Use `f`/`F` to
+move panel focus, `z` to zoom, and `Esc` to unzoom before closing the monitor.
 
 The Worktrees panel lists each cached worktree's total size, reclaimable
 `target/` size, and measurement age, and its title gives the total reclaimable
