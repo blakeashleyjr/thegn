@@ -7,7 +7,7 @@
 //! closes admission. The queue holds at most 64 commands and output is split
 //! into 16 KiB chunks (1 MiB per recording), with an additional 8 MiB global
 //! permit budget covering queued and in-flight output. There is one Background
-//! thread per active recording. Timestamps are captured by the actor at
+//! thread per active recording, at most `MAX_RECORDING_WORKERS`. Timestamps are captured by the actor at
 //! observation; UTF-8 carry belongs to the worker. Queue order defines output
 //! and resize order. If queue or byte admission is full, output is dropped and
 //! a later `m` marker reports the gap; later commands cannot pass that marker.
@@ -16,7 +16,7 @@
 //!
 //! | Event | Owner and result |
 //! | --- | --- |
-//! | Start | Actor spawns one worker; setup failure is reported asynchronously as truncated. |
+//! | Start | Actor spawns one worker; refused with Busy when `MAX_RECORDING_WORKERS` workers are alive; setup failure is reported asynchronously as truncated. |
 //! | Output/resize admitted | Actor timestamps and queues it; worker writes FIFO order. |
 //! | Queue/budget full | Actor accumulates a gap; recording stays active and status counts dropped bytes. |
 //! | Close | Actor closes admission and hands a pending gap to the worker as its final event. |
@@ -47,8 +47,10 @@ pub(super) const FINISH_TIMEOUT: Duration = Duration::from_secs(2);
 pub(super) const LATE_TIMEOUT_REASON: &str =
     "recording finalization timed out; writer may still be flushing";
 const GLOBAL_INFLIGHT_BYTES: usize = 8 * 1024 * 1024;
+const MAX_RECORDING_WORKERS: usize = 16;
 
 static RECORDING_INFLIGHT: OnceLock<Arc<AtomicUsize>> = OnceLock::new();
+static RECORDING_WORKERS: OnceLock<Arc<AtomicUsize>> = OnceLock::new();
 static NEXT_RECORDING_GENERATION: AtomicU64 = AtomicU64::new(1);
 
 fn next_generation() -> u64 {
@@ -59,6 +61,60 @@ type LateCompletion = Arc<Mutex<Option<tokio::sync::mpsc::WeakUnboundedSender<Fi
 
 fn global_inflight() -> Arc<AtomicUsize> {
     Arc::clone(RECORDING_INFLIGHT.get_or_init(|| Arc::new(AtomicUsize::new(0))))
+}
+
+fn global_workers() -> Arc<AtomicUsize> {
+    Arc::clone(RECORDING_WORKERS.get_or_init(|| Arc::new(AtomicUsize::new(0))))
+}
+
+struct WorkerSlot {
+    active: Arc<AtomicUsize>,
+}
+
+impl WorkerSlot {
+    fn try_acquire(active: &Arc<AtomicUsize>, limit: usize) -> Option<Self> {
+        match active.fetch_update(Ordering::AcqRel, Ordering::Acquire, |workers| {
+            workers.checked_add(1).filter(|next| *next <= limit)
+        }) {
+            Ok(_) => Some(Self {
+                active: Arc::clone(active),
+            }),
+            Err(_) => None,
+        }
+    }
+}
+
+impl Drop for WorkerSlot {
+    fn drop(&mut self) {
+        self.active.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+#[derive(Debug)]
+pub(crate) enum StartError {
+    Busy { active: usize, limit: usize },
+    Io(io::Error),
+}
+
+impl std::fmt::Display for StartError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Busy { active, limit } => write!(
+                f,
+                "{active} recordings are already running (limit {limit}); stop one first"
+            ),
+            Self::Io(error) => std::fmt::Display::fmt(error, f),
+        }
+    }
+}
+
+impl std::error::Error for StartError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Busy { .. } => None,
+            Self::Io(error) => Some(error),
+        }
+    }
 }
 
 struct BytePermit {
@@ -221,7 +277,35 @@ pub(crate) struct Finished {
 impl Recorder {
     /// Start a background writer. File creation and header output happen on
     /// that worker, so even startup filesystem latency cannot stall the actor.
-    pub(crate) fn start(session_id: &str, cols: u16, rows: u16, cfg: &Config) -> io::Result<Self> {
+    pub(crate) fn start(
+        session_id: &str,
+        cols: u16,
+        rows: u16,
+        cfg: &Config,
+    ) -> Result<Self, StartError> {
+        Self::start_with_slots(
+            session_id,
+            cols,
+            rows,
+            cfg,
+            &global_workers(),
+            MAX_RECORDING_WORKERS,
+        )
+    }
+
+    fn start_with_slots(
+        session_id: &str,
+        cols: u16,
+        rows: u16,
+        cfg: &Config,
+        active: &Arc<AtomicUsize>,
+        limit: usize,
+    ) -> Result<Self, StartError> {
+        let worker_slot =
+            WorkerSlot::try_acquire(active, limit).ok_or_else(|| StartError::Busy {
+                active: active.load(Ordering::Acquire),
+                limit,
+            })?;
         let dir = cfg.recording.resolved_dir();
         let stamp = now_ms();
         let safe: String = session_id
@@ -268,7 +352,9 @@ impl Recorder {
                 });
                 dispatch_finished(finished, &result_tx, &worker_late);
                 worker_state.completion_wake.notify_one();
-            })?;
+                drop(worker_slot);
+            })
+            .map_err(StartError::Io)?;
         Ok(Self {
             tx: Some(tx),
             worker: Some(worker),
@@ -732,7 +818,14 @@ fn open_cast_writer(
 
 #[cfg(test)]
 fn start_with_writer<W: Write + Send + 'static>(writer: CastWriter<W>) -> Recorder {
-    start_with_writer_budget(writer, Arc::new(AtomicUsize::new(0)), GLOBAL_INFLIGHT_BYTES)
+    start_with_writer_budget(
+        writer,
+        Arc::new(AtomicUsize::new(0)),
+        GLOBAL_INFLIGHT_BYTES,
+        &Arc::new(AtomicUsize::new(0)),
+        MAX_RECORDING_WORKERS,
+    )
+    .expect("test recording worker slot")
 }
 
 #[cfg(test)]
@@ -740,7 +833,13 @@ fn start_with_writer_budget<W: Write + Send + 'static>(
     writer: CastWriter<W>,
     inflight: Arc<AtomicUsize>,
     inflight_limit: usize,
-) -> Recorder {
+    slots: &Arc<AtomicUsize>,
+    limit: usize,
+) -> Result<Recorder, StartError> {
+    let worker_slot = WorkerSlot::try_acquire(slots, limit).ok_or_else(|| StartError::Busy {
+        active: slots.load(Ordering::Acquire),
+        limit,
+    })?;
     let (tx, rx) = mpsc::sync_channel(QUEUE_COMMANDS);
     let (result_tx, result) = mpsc::channel();
     let generation = next_generation();
@@ -758,8 +857,9 @@ fn start_with_writer_budget<W: Write + Send + 'static>(
         .unwrap_or_else(|_| worker_panic_finished(&worker_path, generation, &worker_state));
         dispatch_finished(finished, &result_tx, &worker_late);
         worker_state.completion_wake.notify_one();
+        drop(worker_slot);
     });
-    Recorder {
+    Ok(Recorder {
         tx: Some(tx),
         worker: Some(worker),
         result,
@@ -771,7 +871,7 @@ fn start_with_writer_budget<W: Write + Send + 'static>(
         pending_gap: None,
         generation,
         late,
-    }
+    })
 }
 
 fn run_writer<W: Write>(
@@ -963,6 +1063,69 @@ mod tests {
             .skip(1)
             .map(|line| serde_json::from_str(line).unwrap())
             .collect()
+    }
+
+    fn wait_for_worker_count(active: &AtomicUsize, expected: usize) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while active.load(Ordering::Acquire) != expected && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(
+            active.load(Ordering::Acquire),
+            expected,
+            "recording worker count did not reach {expected} before the 5 second deadline"
+        );
+    }
+
+    fn recording_config(tmp: &tempfile::TempDir) -> Config {
+        Config {
+            recording: thegn_core::config::RecordingConfig {
+                dir: tmp.path().to_string_lossy().into_owned(),
+                ..Config::default().recording
+            },
+            ..Config::default()
+        }
+    }
+
+    #[test]
+    fn worker_cap_refuses_start_at_the_limit() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cfg = recording_config(&tmp);
+        let limit = 2;
+        let slots = Arc::new(AtomicUsize::new(limit - 1));
+        let recorder = Recorder::start_with_slots("slot-cap", 80, 24, &cfg, &slots, limit)
+            .expect("last worker slot is admitted");
+        assert_eq!(slots.load(Ordering::Acquire), limit);
+        let refused = Recorder::start_with_slots("slot-full", 80, 24, &cfg, &slots, limit);
+        assert!(matches!(
+            refused,
+            Err(StartError::Busy {
+                active: 2,
+                limit: 2
+            })
+        ));
+        let finished = recorder.finish();
+        assert!(finished.truncated.is_none());
+        wait_for_worker_count(&slots, limit - 1);
+    }
+
+    #[test]
+    fn finished_worker_releases_its_slot_for_a_new_start() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cfg = recording_config(&tmp);
+        let initial = 3;
+        let limit = 4;
+        let slots = Arc::new(AtomicUsize::new(initial));
+        let recorder = Recorder::start_with_slots("slot-reuse", 80, 24, &cfg, &slots, limit)
+            .expect("worker starts below limit");
+        let finished = recorder.finish();
+        assert!(finished.truncated.is_none());
+        wait_for_worker_count(&slots, initial);
+        let recorder = Recorder::start_with_slots("slot-reuse-again", 80, 24, &cfg, &slots, limit)
+            .expect("released worker slot admits a new start");
+        let finished = recorder.finish();
+        assert!(finished.truncated.is_none());
+        wait_for_worker_count(&slots, initial);
     }
 
     #[test]
@@ -1211,7 +1374,14 @@ mod tests {
                 &header,
             )
             .expect("buffered header");
-            start_with_writer_budget(writer, Arc::clone(budget), MAX_CHUNK_BYTES)
+            start_with_writer_budget(
+                writer,
+                Arc::clone(budget),
+                MAX_CHUNK_BYTES,
+                &Arc::new(AtomicUsize::new(0)),
+                MAX_RECORDING_WORKERS,
+            )
+            .expect("test recording worker slot")
         }
 
         let budget = Arc::new(AtomicUsize::new(0));
@@ -1249,7 +1419,14 @@ mod tests {
         let writer = CastWriter::new(BufWriter::new(Capture(Arc::clone(&captured))), &header)
             .expect("capture header");
         let budget = Arc::new(AtomicUsize::new(MAX_CHUNK_BYTES));
-        let mut rec = start_with_writer_budget(writer, Arc::clone(&budget), MAX_CHUNK_BYTES);
+        let mut rec = start_with_writer_budget(
+            writer,
+            Arc::clone(&budget),
+            MAX_CHUNK_BYTES,
+            &Arc::new(AtomicUsize::new(0)),
+            MAX_RECORDING_WORKERS,
+        )
+        .expect("test recording worker slot");
 
         rec.feed(b"one");
         rec.feed(b"two");
@@ -1285,9 +1462,17 @@ mod tests {
         let (release_tx, release_rx) = mpsc::channel();
         let writer = CastWriter::new(BufWriter::new(StalledWriter(release_rx)), &header)
             .expect("buffered header");
-        let mut rec = start_with_writer(writer);
+        let slots = Arc::new(AtomicUsize::new(0));
+        let mut rec = start_with_writer_budget(
+            writer,
+            Arc::new(AtomicUsize::new(0)),
+            GLOBAL_INFLIGHT_BYTES,
+            &slots,
+            1,
+        )
+        .expect("stalled worker slot");
         rec.feed(b"block on final flush");
-        let finished = rec.finish_with_timeout(Duration::from_millis(20));
+        let finished = rec.finish_with_timeout(Duration::from_secs(1));
         assert!(
             finished
                 .truncated
@@ -1295,8 +1480,36 @@ mod tests {
                 .is_some_and(|reason| reason.contains("deadline elapsed")),
             "a stalled worker must report the finish timeout"
         );
+        assert_eq!(
+            slots.load(Ordering::Acquire),
+            1,
+            "timed-out worker retains its slot"
+        );
+        let capped = start_with_writer_budget(
+            {
+                let mut header = Header::new(80, 24);
+                header.timestamp = Some(0);
+                CastWriter::new(
+                    BufWriter::new(Capture(Arc::new(Mutex::new(Vec::new())))),
+                    &header,
+                )
+                .expect("capture header")
+            },
+            Arc::new(AtomicUsize::new(0)),
+            GLOBAL_INFLIGHT_BYTES,
+            &slots,
+            1,
+        );
+        assert!(matches!(
+            capped,
+            Err(StartError::Busy {
+                active: 1,
+                limit: 1
+            })
+        ));
         release_tx.send(()).unwrap();
         release_tx.send(()).unwrap();
+        wait_for_worker_count(&slots, 0);
     }
 
     #[tokio::test]
