@@ -1564,7 +1564,6 @@ fn collect_sidebar_status(
         crate::worktree_snapshot::BranchObservation,
     >,
 ) -> crate::sidebar::SidebarStatus {
-    use thegn_core::remote::GitLoc;
     let mut status = crate::sidebar::SidebarStatus::default();
     let t0 = std::time::Instant::now();
     // Worktrees mid-hibernation: drives the sidebar ⏾ badge + render cache.
