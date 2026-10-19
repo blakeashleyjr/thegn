@@ -769,6 +769,7 @@ impl RemoteProvider for FlyProvider {
 
     fn list<'a>(&'a self) -> BoxFuture<'a, Result<Vec<String>>> {
         Box::pin(async move {
+            // Refuse a misconfigured base even though list is ledger-only.
             self.spec.api_base()?;
             Ok(self.ledger_names())
         })
@@ -1040,7 +1041,7 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn fly_requests_wait_for_the_shared_control_gate() {
-        let url = "http://127.0.0.1:1/apps";
+        let url = "http://127.0.0.1:9/apps";
         let authority = crate::provider::authority_key(url).unwrap();
         let mut permits = Vec::new();
         for _ in 0..crate::provider::CONTROL_PER_AUTHORITY_CONCURRENCY {
