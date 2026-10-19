@@ -97,7 +97,7 @@ pub fn run(cfg: &Config, action: Action, config_path: PathBuf) -> Result<()> {
                 secret::ForgetKeyringOutcome::Failed(error) => {
                     bail!("keyring removal failed for `{name}`: {error}")
                 }
-                secret::ForgetKeyringOutcome::Removed => Ok(()),
+                secret::ForgetKeyringOutcome::Removed => report.ensure_file_removed(&name),
             }
         }
         Action::List { json } => list(cfg, json),

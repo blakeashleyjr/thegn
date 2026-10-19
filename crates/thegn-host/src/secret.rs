@@ -198,6 +198,7 @@ pub fn store(name: &str, token: &str) -> Result<String> {
     store_with_dir(name, token, keyring_set, secrets_dir_path)
 }
 
+#[cfg(test)]
 fn store_in(
     dir: &std::path::Path,
     name: &str,
@@ -218,7 +219,9 @@ fn store_with_dir(
         KeyringOutcome::TimedOut => anyhow::bail!(
             "keyring write outcome unknown for `{name}`; nothing was written to a file; retry once the keyring responds"
         ),
-        KeyringOutcome::Completed(Err(_error)) => {}
+        KeyringOutcome::Completed(Err(error)) => {
+            tracing::debug!(target: "thegn::secret", %error, "keyring write failed; using owner-only file")
+        }
     }
     let dir = dir()?;
     secrets_dir_at(&dir)?;
@@ -300,6 +303,15 @@ pub struct ForgetReport {
     pub file: ForgetFileOutcome,
 }
 
+impl ForgetReport {
+    pub(crate) fn ensure_file_removed(&self, name: &str) -> Result<()> {
+        if let ForgetFileOutcome::Failed(error) = &self.file {
+            anyhow::bail!("file-backed secret removal failed for `{name}`: {error}");
+        }
+        Ok(())
+    }
+}
+
 /// Remove a stored secret and retain the outcome from each backend for callers
 /// that need to report uncertainty (notably `thegn secret rm`).
 pub fn forget_with_report(name: &str) -> ForgetReport {
@@ -309,13 +321,7 @@ pub fn forget_with_report(name: &str) -> ForgetReport {
     let dir = match secrets_dir_path() {
         Ok(dir) => dir,
         Err(error) => {
-            let keyring = match keyring_del(name) {
-                KeyringOutcome::Completed(Ok(())) => ForgetKeyringOutcome::Removed,
-                KeyringOutcome::Completed(Err(error)) => {
-                    ForgetKeyringOutcome::Failed(error.to_string())
-                }
-                KeyringOutcome::TimedOut => ForgetKeyringOutcome::OutcomeUnknown,
-            };
+            let keyring = keyring_removal(keyring_del(name));
             return ForgetReport {
                 keyring,
                 file: ForgetFileOutcome::Failed(error.to_string()),
@@ -330,11 +336,7 @@ fn forget_in(
     name: &str,
     del: impl FnOnce(&str) -> KeyringOutcome<Result<()>>,
 ) -> ForgetReport {
-    let keyring = match del(name) {
-        KeyringOutcome::Completed(Ok(())) => ForgetKeyringOutcome::Removed,
-        KeyringOutcome::Completed(Err(error)) => ForgetKeyringOutcome::Failed(error.to_string()),
-        KeyringOutcome::TimedOut => ForgetKeyringOutcome::OutcomeUnknown,
-    };
+    let keyring = keyring_removal(del(name));
     // Do not derive and delete the pre-hash fallback filename. That historical
     // sanitizer was not injective (`a/b` and `a_b` both became `a_b.token`), so
     // automatic legacy cleanup could delete a different account's credential.
@@ -352,6 +354,14 @@ fn forget_in(
         },
     };
     ForgetReport { keyring, file }
+}
+
+fn keyring_removal(outcome: KeyringOutcome<Result<()>>) -> ForgetKeyringOutcome {
+    match outcome {
+        KeyringOutcome::Completed(Ok(())) => ForgetKeyringOutcome::Removed,
+        KeyringOutcome::Completed(Err(error)) => ForgetKeyringOutcome::Failed(error.to_string()),
+        KeyringOutcome::TimedOut => ForgetKeyringOutcome::OutcomeUnknown,
+    }
 }
 
 fn file_entry_exists(dir: &std::path::Path, name: &str) -> Result<bool> {
@@ -1253,7 +1263,7 @@ mod tests {
     }
 
     #[test]
-    fn bounded_operation_returns_without_waiting_for_worker() {
+    fn bounded_operation_times_out_as_typed_outcome() {
         let started = std::time::Instant::now();
         let result =
             run_keyring_op_with_timeout("test", std::time::Duration::from_millis(10), || {
@@ -1313,6 +1323,18 @@ mod tests {
         let report = forget_in(temp.path(), "acct", |_| KeyringOutcome::Completed(Ok(())));
         assert_eq!(report.keyring, ForgetKeyringOutcome::Removed);
         assert_eq!(report.file, ForgetFileOutcome::Absent);
+    }
+
+    #[test]
+    fn failed_file_removal_makes_report_an_error() {
+        let report = ForgetReport {
+            keyring: ForgetKeyringOutcome::Removed,
+            file: ForgetFileOutcome::Failed("permission denied".to_string()),
+        };
+        let result = report.ensure_file_removed("acct");
+        assert!(
+            matches!(result, Err(error) if error.to_string().contains("file-backed secret removal failed for `acct`"))
+        );
     }
 
     #[test]
