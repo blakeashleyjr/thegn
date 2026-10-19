@@ -60,6 +60,53 @@ const ACCEPT_BACKOFF_BASE: Duration = Duration::from_millis(10);
 const ACCEPT_BACKOFF_MAX: Duration = Duration::from_secs(1);
 const REJECTION_LOG_INTERVAL: Duration = Duration::from_secs(60);
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Deadlines captured for one reverse-tunnel run and its connections.
+pub struct TunnelDeadlines {
+    pub write_stall: Duration,
+    pub idle: Option<Duration>,
+    pub lifetime: Option<Duration>,
+}
+
+impl Default for TunnelDeadlines {
+    fn default() -> Self {
+        Self {
+            write_stall: WRITE_STALL_TIMEOUT,
+            idle: Some(IDLE_TIMEOUT),
+            lifetime: Some(LIFETIME_TIMEOUT),
+        }
+    }
+}
+
+impl TunnelDeadlines {
+    /// Convert optional bridge flags to deadlines; zero disables idle/lifetime
+    /// and selects the write-stall default.
+    pub fn from_secs(write_stall: Option<u64>, idle: Option<u64>, lifetime: Option<u64>) -> Self {
+        let defaults = Self::default();
+        Self {
+            write_stall: write_stall
+                .filter(|seconds| *seconds != 0)
+                .map(Duration::from_secs)
+                .unwrap_or(defaults.write_stall),
+            idle: idle
+                .map(Duration::from_secs)
+                .or(defaults.idle)
+                .filter(|duration| !duration.is_zero()),
+            lifetime: lifetime
+                .map(Duration::from_secs)
+                .or(defaults.lifetime)
+                .filter(|duration| !duration.is_zero()),
+        }
+    }
+}
+
+/// Per-run admission and deadline settings for the host endpoint.
+pub struct HostLimits {
+    pub max_connections: usize,
+    pub global_permits: Arc<Semaphore>,
+    pub deadlines: TunnelDeadlines,
+}
+
 static GLOBAL_HOST_PERMITS: LazyLock<Arc<Semaphore>> =
     LazyLock::new(|| Arc::new(Semaphore::new(MAX_GLOBAL_TUNNEL_CONNS)));
 static REJECTIONS_TOTAL: AtomicU64 = AtomicU64::new(0);
@@ -441,27 +488,12 @@ async fn pump_conn(
     local: Box<dyn IoStream>,
     inbound: tokio::sync::mpsc::Receiver<Vec<u8>>,
     sink: Sender<Vec<u8>>,
+    deadlines: TunnelDeadlines,
 ) {
-    pump_conn_with_deadlines(
-        id,
-        local,
-        inbound,
-        sink,
-        ConnectionDeadlines {
-            write_stall: WRITE_STALL_TIMEOUT,
-            idle: IDLE_TIMEOUT,
-            lifetime: LIFETIME_TIMEOUT,
-        },
-    )
-    .await;
+    pump_conn_with_deadlines(id, local, inbound, sink, deadlines).await;
 }
 
-#[derive(Clone, Copy)]
-struct ConnectionDeadlines {
-    write_stall: Duration,
-    idle: Duration,
-    lifetime: Duration,
-}
+type ConnectionDeadlines = TunnelDeadlines;
 
 async fn pump_conn_with_deadlines(
     id: u32,
@@ -472,7 +504,9 @@ async fn pump_conn_with_deadlines(
 ) {
     let (mut rd, mut wr) = tokio::io::split(local);
     let started = tokio::time::Instant::now();
-    let lifetime_deadline = started + deadlines.lifetime;
+    let lifetime_deadline = deadlines
+        .lifetime
+        .and_then(|duration| started.checked_add(duration));
     let activity_ms = Arc::new(AtomicU64::new(0));
     let activity_notify = Arc::new(Notify::new());
     let stall_notify = Arc::new(Notify::new());
@@ -545,11 +579,13 @@ async fn pump_conn_with_deadlines(
         tokio::pin!(directions);
         loop {
             let last_activity = Duration::from_millis(activity_ms.load(Ordering::Acquire));
-            let idle_deadline = started + last_activity + deadlines.idle;
+            let idle_deadline = deadlines
+                .idle
+                .and_then(|idle| started.checked_add(last_activity)?.checked_add(idle));
             tokio::select! {
                 _ = &mut directions => break None,
-                _ = tokio::time::sleep_until(lifetime_deadline) => break Some(RejectionReason::Lifetime),
-                _ = tokio::time::sleep_until(idle_deadline) => break Some(RejectionReason::Idle),
+                _ = async { match lifetime_deadline { Some(at) => tokio::time::sleep_until(at).await, None => std::future::pending::<()>().await } } => break Some(RejectionReason::Lifetime),
+                _ = async { match idle_deadline { Some(at) => tokio::time::sleep_until(at).await, None => std::future::pending::<()>().await } } => break Some(RejectionReason::Idle),
                 _ = activity_notify.notified() => continue,
                 _ = stall_notify.notified() => break Some(RejectionReason::WriteStall),
             }
@@ -715,6 +751,7 @@ where
         max_connections,
         GLOBAL_HOST_PERMITS.clone(),
         DIAL_TIMEOUT,
+        TunnelDeadlines::default(),
     )
     .await
 }
@@ -730,12 +767,30 @@ where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
     D: Dialer,
 {
+    run_host_with_limits(
+        stream,
+        dialer,
+        HostLimits {
+            max_connections,
+            global_permits,
+            deadlines: TunnelDeadlines::default(),
+        },
+    )
+    .await
+}
+
+pub async fn run_host_with_limits<S, D>(stream: S, dialer: D, limits: HostLimits) -> io::Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+    D: Dialer,
+{
     run_host_with_admission(
         stream,
         dialer,
-        max_connections,
-        global_permits,
+        limits.max_connections,
+        limits.global_permits,
         DIAL_TIMEOUT,
+        limits.deadlines,
     )
     .await
 }
@@ -746,13 +801,14 @@ async fn run_host_with_admission<S, D>(
     max_connections: usize,
     global_permits: Arc<Semaphore>,
     dial_timeout: Duration,
+    deadlines: TunnelDeadlines,
 ) -> io::Result<()>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
     D: Dialer,
 {
     let (rd, wr) = tokio::io::split(stream);
-    let (sink, sink_task) = spawn_sink(wr);
+    let (sink, sink_task) = spawn_sink_with_timeout(wr, deadlines.write_stall);
     let conns: Conns = Arc::new(Mutex::new(HashMap::new()));
     let permits = Arc::new(Semaphore::new(clamp_permits(max_connections)));
     let rejections = Arc::new(AtomicUsize::new(0));
@@ -826,7 +882,7 @@ where
                     let dial_result = tokio::time::timeout(dial_timeout, dialer.dial()).await;
                     let dial_failed = match dial_result {
                         Ok(Ok(local)) => {
-                            pump_conn(id, local, in_rx, sink.clone()).await;
+                            pump_conn(id, local, in_rx, sink.clone(), deadlines).await;
                             false
                         }
                         Ok(Err(_)) => true,
@@ -869,19 +925,31 @@ pub async fn run_sandbox<S>(stream: S, listener: TcpListener) -> io::Result<()>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
-    run_sandbox_with_limit(stream, listener, MAX_TUNNEL_CONNS).await
+    run_sandbox_with_deadlines(stream, listener, TunnelDeadlines::default()).await
+}
+
+pub async fn run_sandbox_with_deadlines<S>(
+    stream: S,
+    listener: TcpListener,
+    deadlines: TunnelDeadlines,
+) -> io::Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
+    run_sandbox_with_limit(stream, listener, MAX_TUNNEL_CONNS, deadlines).await
 }
 
 async fn run_sandbox_with_limit<S>(
     stream: S,
     mut listener: impl TunnelListener,
     max_connections: usize,
+    deadlines: TunnelDeadlines,
 ) -> io::Result<()>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
     let (rd, wr) = tokio::io::split(stream);
-    let (sink, sink_task) = spawn_sink(wr);
+    let (sink, sink_task) = spawn_sink_with_timeout(wr, deadlines.write_stall);
     // Emit the sync marker as the FIRST bytes on stdout, before any frame, so the
     // host can skip whatever one-time preamble the exec transport prepended (a
     // runtime banner/MOTD/shell echo) and lock onto the framing. See `SYNC_MAGIC`.
@@ -946,7 +1014,7 @@ where
             let conns = acc_conns.clone();
             acc_tasks.lock().await.spawn(async move {
                 let _permit = permit;
-                pump_conn(id, sock, in_rx, sink).await;
+                pump_conn(id, sock, in_rx, sink, deadlines).await;
                 let mut routes = conns.lock().await;
                 if routes
                     .get(&id)
@@ -1286,6 +1354,7 @@ mod tests {
             1,
             Arc::new(Semaphore::new(1)),
             DIAL_TIMEOUT,
+            TunnelDeadlines::default(),
         ));
         send_opens(&mut peer, &[1]).await;
         tokio::task::yield_now().await;
@@ -1320,6 +1389,7 @@ mod tests {
             1,
             shared_permits.clone(),
             std::time::Duration::from_secs(2),
+            TunnelDeadlines::default(),
         ));
 
         let (host_b, mut peer_b) = tokio::io::duplex(4096);
@@ -1334,6 +1404,7 @@ mod tests {
             1,
             shared_permits,
             std::time::Duration::from_secs(2),
+            TunnelDeadlines::default(),
         ));
 
         send_opens(&mut peer_a, &[1]).await;
@@ -1678,6 +1749,7 @@ mod tests {
             1,
             Arc::new(Semaphore::new(1)),
             std::time::Duration::from_secs(2),
+            TunnelDeadlines::default(),
         ));
         send_opens(&mut peer, &[1, 2]).await;
         let mut decoder = FrameDecoder::new();
@@ -1700,7 +1772,12 @@ mod tests {
         let (sandbox, mut peer) = tokio::io::duplex(4096);
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
-        let task = tokio::spawn(run_sandbox_with_limit(sandbox, listener, 1));
+        let task = tokio::spawn(run_sandbox_with_limit(
+            sandbox,
+            listener,
+            1,
+            TunnelDeadlines::default(),
+        ));
         let mut sync = vec![0u8; SYNC_MAGIC.len()];
         tokio::time::timeout(
             std::time::Duration::from_secs(2),
@@ -1754,7 +1831,12 @@ mod tests {
         let listener = DuplexListener {
             accepted: accept_rx,
         };
-        let task = tokio::spawn(run_sandbox_with_limit(sandbox, listener, CAP));
+        let task = tokio::spawn(run_sandbox_with_limit(
+            sandbox,
+            listener,
+            CAP,
+            TunnelDeadlines::default(),
+        ));
         let mut sync = vec![0u8; SYNC_MAGIC.len()];
         tokio::time::timeout(
             std::time::Duration::from_secs(2),
@@ -2099,7 +2181,12 @@ mod tests {
         let listener = ScriptedListener {
             accepted: accept_rx,
         };
-        let task = tokio::spawn(run_sandbox_with_limit(sandbox, listener, 1));
+        let task = tokio::spawn(run_sandbox_with_limit(
+            sandbox,
+            listener,
+            1,
+            TunnelDeadlines::default(),
+        ));
         let mut sync = vec![0u8; SYNC_MAGIC.len()];
         peer.read_exact(&mut sync).await.unwrap();
         assert_eq!(sync, SYNC_MAGIC);
@@ -2136,6 +2223,7 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn idle_deadline_closes_only_the_stalled_connection() {
+        let _guard = WRITE_STALL_TEST_LOCK.lock().await;
         let (local, _client) = tokio::io::duplex(128);
         let (mut peer, sink_stream) = tokio::io::duplex(4096);
         let (sink, sink_task) = spawn_sink(sink_stream);
@@ -2153,8 +2241,8 @@ mod tests {
                 sink,
                 ConnectionDeadlines {
                     write_stall: WRITE_STALL_TIMEOUT,
-                    idle: IDLE_TIMEOUT,
-                    lifetime: LIFETIME_TIMEOUT,
+                    idle: Some(IDLE_TIMEOUT),
+                    lifetime: Some(LIFETIME_TIMEOUT),
                 },
             )
             .await;
@@ -2178,7 +2266,98 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
+    async fn disabled_idle_deadline_allows_quiet_connection_until_lifetime() {
+        let _guard = WRITE_STALL_TEST_LOCK.lock().await;
+        let (local, _client) = tokio::io::duplex(128);
+        let (mut peer, sink_stream) = tokio::io::duplex(4096);
+        let (sink, sink_task) = spawn_sink(sink_stream);
+        let (_in_tx, in_rx) = channel(CHANNEL_DEPTH);
+        let before = rejection_counts().lifetime;
+        let task = tokio::spawn(pump_conn_with_deadlines(
+            96,
+            Box::new(local),
+            in_rx,
+            sink,
+            TunnelDeadlines {
+                write_stall: WRITE_STALL_TIMEOUT,
+                idle: None,
+                lifetime: Some(Duration::from_secs(3 * 60 * 60)),
+            },
+        ));
+        tokio::task::yield_now().await;
+        tokio::time::advance(IDLE_TIMEOUT + Duration::from_secs(1)).await;
+        tokio::task::yield_now().await;
+        assert!(
+            !task.is_finished(),
+            "disabled idle deadline closed a quiet connection"
+        );
+        tokio::time::advance(Duration::from_secs(60 * 60)).await;
+        assert_eq!(
+            next_frame(&mut peer, &mut FrameDecoder::new()).await,
+            Frame::Close(96)
+        );
+        task.await.unwrap();
+        assert_eq!(rejection_counts().lifetime, before + 1);
+        stop_sink(sink_task).await.unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn disabled_lifetime_still_closes_on_configured_idle_deadline() {
+        let _guard = WRITE_STALL_TEST_LOCK.lock().await;
+        let (local, _client) = tokio::io::duplex(128);
+        let (mut peer, sink_stream) = tokio::io::duplex(4096);
+        let (sink, sink_task) = spawn_sink(sink_stream);
+        let (_in_tx, in_rx) = channel(CHANNEL_DEPTH);
+        let before = rejection_counts().idle;
+        let task = tokio::spawn(pump_conn_with_deadlines(
+            97,
+            Box::new(local),
+            in_rx,
+            sink,
+            TunnelDeadlines {
+                write_stall: WRITE_STALL_TIMEOUT,
+                idle: Some(Duration::from_secs(2)),
+                lifetime: None,
+            },
+        ));
+        tokio::task::yield_now().await;
+        tokio::time::advance(Duration::from_secs(3)).await;
+        assert_eq!(
+            next_frame(&mut peer, &mut FrameDecoder::new()).await,
+            Frame::Close(97)
+        );
+        task.await.unwrap();
+        assert_eq!(rejection_counts().idle, before + 1);
+        stop_sink(sink_task).await.unwrap();
+    }
+
+    #[test]
+    fn deadline_flag_seconds_use_defaults_and_zero_rules() {
+        assert_eq!(
+            TunnelDeadlines::from_secs(None, None, None),
+            TunnelDeadlines::default()
+        );
+        assert_eq!(
+            TunnelDeadlines::from_secs(Some(0), Some(0), Some(0)),
+            TunnelDeadlines {
+                write_stall: WRITE_STALL_TIMEOUT,
+                idle: None,
+                lifetime: None,
+            }
+        );
+        assert_eq!(
+            TunnelDeadlines::from_secs(Some(2), Some(3), Some(4)),
+            TunnelDeadlines {
+                write_stall: Duration::from_secs(2),
+                idle: Some(Duration::from_secs(3)),
+                lifetime: Some(Duration::from_secs(4)),
+            }
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
     async fn lifetime_deadline_closes_only_the_stalled_connection() {
+        let _guard = WRITE_STALL_TEST_LOCK.lock().await;
         let (local, mut client) = tokio::io::duplex(128);
         let (mut peer, sink_stream) = tokio::io::duplex(4096);
         let (sink, sink_task) = spawn_sink(sink_stream);
@@ -2198,8 +2377,8 @@ mod tests {
                     write_stall: WRITE_STALL_TIMEOUT,
                     // Advancing past the lifetime in one step would also expire a
                     // shorter idle deadline, and select! would pick either branch.
-                    idle: LIFETIME_TIMEOUT * 2,
-                    lifetime: LIFETIME_TIMEOUT,
+                    idle: Some(LIFETIME_TIMEOUT * 2),
+                    lifetime: Some(LIFETIME_TIMEOUT),
                 },
             )
             .await;
@@ -2231,6 +2410,7 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn activity_before_idle_deadline_keeps_connection_until_lifetime() {
+        let _guard = WRITE_STALL_TEST_LOCK.lock().await;
         let (local, mut client) = tokio::io::duplex(128);
         let (mut peer, sink_stream) = tokio::io::duplex(4096);
         let (sink, sink_task) = spawn_sink(sink_stream);
@@ -2242,8 +2422,8 @@ mod tests {
             sink,
             ConnectionDeadlines {
                 write_stall: WRITE_STALL_TIMEOUT,
-                idle: IDLE_TIMEOUT,
-                lifetime: LIFETIME_TIMEOUT,
+                idle: Some(IDLE_TIMEOUT),
+                lifetime: Some(LIFETIME_TIMEOUT),
             },
         ));
         tokio::task::yield_now().await;
@@ -2284,15 +2464,15 @@ mod tests {
                 in_rx,
                 sink,
                 ConnectionDeadlines {
-                    write_stall: WRITE_STALL_TIMEOUT,
-                    idle: IDLE_TIMEOUT,
-                    lifetime: LIFETIME_TIMEOUT,
+                    write_stall: Duration::from_secs(2),
+                    idle: None,
+                    lifetime: None,
                 },
             )
             .await;
         });
         tokio::task::yield_now().await;
-        tokio::time::advance(WRITE_STALL_TIMEOUT + Duration::from_secs(1)).await;
+        tokio::time::advance(Duration::from_secs(2) + Duration::from_secs(1)).await;
         assert_eq!(
             next_frame(&mut peer, &mut FrameDecoder::new()).await,
             Frame::Close(93)
@@ -2323,8 +2503,8 @@ mod tests {
             sink,
             ConnectionDeadlines {
                 write_stall: WRITE_STALL_TIMEOUT,
-                idle: IDLE_TIMEOUT,
-                lifetime: LIFETIME_TIMEOUT,
+                idle: Some(IDLE_TIMEOUT),
+                lifetime: Some(LIFETIME_TIMEOUT),
             },
         ));
         drop(client);

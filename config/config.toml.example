@@ -3402,6 +3402,10 @@ auto = true            # auto-detect + forward newly-bound sandbox ports
 range = "8000-8999"    # host-port range for remaps when a port's own number is taken
 reverse_max_connections = 256 # concurrent connections per reverse tunnel run; 0 rejects all
 reverse_max_connections_total = 1024 # process-wide host cap, latched at first start; restart to change
+# Deadlines are read when a tunnel starts or reconnects; a running tunnel keeps its starting values.
+reverse_write_stall_secs = 60 # close a tunnelled connection whose writes stall this long; 0 runs as 60
+reverse_idle_secs = 7200 # close a tunnelled connection after this long without traffic; 0 disables
+reverse_lifetime_secs = 86400 # close a tunnelled connection after this long in total; 0 disables
 ignore = []            # container ports never to forward, e.g. [5432, 22]
 only = []              # if non-empty, ONLY forward these container ports
 bind = "127.0.0.1"     # host interface to bind forwards on (loopback = host-local)

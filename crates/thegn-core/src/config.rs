@@ -4107,6 +4107,21 @@ pub struct ForwardConfig {
     /// rejects all connections; values above Tokio's permit limit are clamped.
     /// Read when the first reverse tunnel starts; restart the process to change.
     pub reverse_max_connections_total: usize,
+    /// Seconds before a stalled reverse-tunnel write closes its connection and
+    /// shared tunnel run. Zero uses the 60-second default. Read when a tunnel
+    /// starts or reconnects; a running tunnel keeps its starting value.
+    #[schemars(range(max = "crate::time_policy::MAX_DURATION_SECS"))]
+    pub reverse_write_stall_secs: u64,
+    /// Seconds without tunnel traffic before closing a connection. Zero
+    /// disables this deadline. Read when a tunnel starts or reconnects; a
+    /// running tunnel keeps its starting value.
+    #[schemars(range(max = "crate::time_policy::MAX_DURATION_SECS"))]
+    pub reverse_idle_secs: u64,
+    /// Maximum total seconds for a tunnelled connection. Zero disables this
+    /// deadline. Read when a tunnel starts or reconnects; a running tunnel
+    /// keeps its starting value.
+    #[schemars(range(max = "crate::time_policy::MAX_DURATION_SECS"))]
+    pub reverse_lifetime_secs: u64,
     /// Container ports never to forward (e.g. an in-sandbox database or sshd).
     pub ignore: Vec<u16>,
     /// If non-empty, an allowlist: ONLY these container ports are forwarded.
@@ -4134,12 +4149,36 @@ impl Default for ForwardConfig {
             range: "8000-8999".into(),
             reverse_max_connections: 256,
             reverse_max_connections_total: 1024,
+            reverse_write_stall_secs: 60,
+            reverse_idle_secs: 7200,
+            reverse_lifetime_secs: 86400,
             ignore: Vec::new(),
             only: Vec::new(),
             bind: "127.0.0.1".into(),
             poll_secs: 2,
             browser: String::new(),
             open_on_detect: false,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TunnelDeadlineSecs {
+    pub write_stall: u64,
+    pub idle: Option<u64>,
+    pub lifetime: Option<u64>,
+}
+
+impl ForwardConfig {
+    pub fn tunnel_deadlines(&self) -> TunnelDeadlineSecs {
+        TunnelDeadlineSecs {
+            write_stall: if self.reverse_write_stall_secs == 0 {
+                60
+            } else {
+                self.reverse_write_stall_secs
+            },
+            idle: (self.reverse_idle_secs != 0).then_some(self.reverse_idle_secs),
+            lifetime: (self.reverse_lifetime_secs != 0).then_some(self.reverse_lifetime_secs),
         }
     }
 }
