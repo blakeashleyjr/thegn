@@ -78,6 +78,30 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const DNS_TIMEOUT: Duration = Duration::from_secs(5);
 /// Redirect hops followed (each re-validated and re-resolved).
 const MAX_REDIRECTS: usize = 3;
+#[derive(Clone, Copy)]
+struct FetchPolicy {
+    #[cfg(test)]
+    exempt: Option<SocketAddr>,
+}
+
+const STRICT_FETCH_POLICY: FetchPolicy = FetchPolicy {
+    #[cfg(test)]
+    exempt: None,
+};
+
+impl FetchPolicy {
+    fn admits_test_endpoint(&self, _ip: IpAddr, _port: u16) -> bool {
+        #[cfg(test)]
+        {
+            self.exempt == Some(SocketAddr::new(_ip, _port))
+        }
+        #[cfg(not(test))]
+        {
+            false
+        }
+    }
+}
+
 /// A blocking image decoder may continue after its async owner is aborted.
 /// Keep its admission permit in the blocking closure so churn cannot queue an
 /// unbounded number of decoder workers.
@@ -210,11 +234,14 @@ static IN_FLIGHT: Mutex<Option<tokio::task::JoinHandle<()>>> = Mutex::new(None);
 /// Fetch one http(s) body: redirects followed manually (each hop re-admitted,
 /// re-resolved and the connection pinned to the vetted addresses), streamed
 /// under [`MAX_ART_BYTES`]. Proxies are disabled so pinning cannot be bypassed.
-async fn fetch_http(start: &str) -> Result<Vec<u8>, Reject> {
+async fn fetch_http_with(start: &str, policy: &FetchPolicy) -> Result<Vec<u8>, Reject> {
     let mut url = reqwest::Url::parse(start).map_err(|_| Reject::Scheme)?;
     for _ in 0..=MAX_REDIRECTS {
-        let host = admit_url(&url)?;
         let port = url.port_or_known_default().ok_or(Reject::Scheme)?;
+        let host = match url.host_str().and_then(|host| host.parse::<IpAddr>().ok()) {
+            Some(ip) if policy.admits_test_endpoint(ip, port) => Host::Ip,
+            _ => admit_url(&url)?,
+        };
         let mut builder = reqwest::Client::builder()
             .redirect(reqwest::redirect::Policy::none())
             .no_proxy()
@@ -311,6 +338,13 @@ where
 
 /// Fetch + decode one art locator to a raster, enforcing every bound.
 async fn load_raster(art_url: &str) -> Result<crate::rasterize::Raster, Reject> {
+    load_raster_with(art_url, &STRICT_FETCH_POLICY).await
+}
+
+async fn load_raster_with(
+    art_url: &str,
+    policy: &FetchPolicy,
+) -> Result<crate::rasterize::Raster, Reject> {
     if art_url.len() > MAX_URL_LEN {
         return Err(Reject::TooLong);
     }
@@ -329,7 +363,7 @@ async fn load_raster(art_url: &str) -> Result<crate::rasterize::Raster, Reject> 
     if !(art_url.starts_with("http://") || art_url.starts_with("https://")) {
         return Err(Reject::Scheme);
     }
-    let bytes = tokio::time::timeout(FETCH_TOTAL_TIMEOUT, fetch_http(art_url))
+    let bytes = tokio::time::timeout(FETCH_TOTAL_TIMEOUT, fetch_http_with(art_url, policy))
         .await
         .map_err(|_| Reject::Network)??;
     admitted_blocking(&DECODE_SLOT, move || {
@@ -383,6 +417,45 @@ pub(crate) fn spawn_fetch(
 
 pub(crate) fn cancel_in_flight() {
     cancel_slot(&LATEST, &IN_FLIGHT);
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ShutdownOutcome {
+    Joined,
+    TimedOut,
+}
+
+async fn shutdown_slot(
+    latest: &Latest,
+    slot: &Mutex<Option<tokio::task::JoinHandle<()>>>,
+    decode: &'static Semaphore,
+    bound: Duration,
+) -> ShutdownOutcome {
+    latest.begin();
+    let mut handle = slot
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .take();
+    let deadline = tokio::time::Instant::now() + bound;
+    if let Some(task) = handle.as_mut() {
+        task.abort();
+        if tokio::time::timeout_at(deadline, task).await.is_err() {
+            return ShutdownOutcome::TimedOut;
+        }
+    }
+    match tokio::time::timeout_at(deadline, decode.acquire()).await {
+        Ok(Ok(permit)) => {
+            drop(permit);
+            ShutdownOutcome::Joined
+        }
+        Ok(Err(_)) | Err(_) => ShutdownOutcome::TimedOut,
+    }
+}
+
+pub(crate) async fn shutdown(bound: Duration) {
+    if shutdown_slot(&LATEST, &IN_FLIGHT, &DECODE_SLOT, bound).await == ShutdownOutcome::TimedOut {
+        tracing::debug!(target: "thegn::media_art", "cover art did not stop within the shutdown bound");
+    }
 }
 
 fn cancel_slot(latest: &Latest, slot: &Mutex<Option<tokio::task::JoinHandle<()>>>) {
@@ -469,6 +542,108 @@ fn admit_local_art(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    async fn read_request_head(stream: &mut tokio::net::TcpStream) -> bool {
+        let mut request = Vec::new();
+        let mut byte = [0_u8; 1];
+        while !request.ends_with(b"\r\n\r\n") {
+            if stream.read_exact(&mut byte).await.is_err() {
+                return false;
+            }
+            request.push(byte[0]);
+        }
+        true
+    }
+
+    async fn test_server(response: Vec<u8>) -> (SocketAddr, tokio::task::JoinHandle<()>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let task = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            if !read_request_head(&mut stream).await {
+                return;
+            }
+            stream.write_all(&response).await.unwrap();
+        });
+        (address, task)
+    }
+
+    async fn test_infinite_server() -> (SocketAddr, tokio::task::JoinHandle<()>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let task = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            if !read_request_head(&mut stream).await {
+                return;
+            }
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Type: image/png\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n")
+                .await
+                .unwrap();
+            let chunk = vec![b'x'; 4096];
+            let mut sent = 0_usize;
+            while sent < MAX_ART_BYTES + 64 * 1024 {
+                if stream.write_all(b"1000\r\n").await.is_err()
+                    || stream.write_all(&chunk).await.is_err()
+                    || stream.write_all(b"\r\n").await.is_err()
+                {
+                    break;
+                }
+                sent += chunk.len();
+            }
+        });
+        (address, task)
+    }
+
+    async fn finish_test_server(mut task: tokio::task::JoinHandle<()>) {
+        match tokio::time::timeout(Duration::from_secs(10), &mut task).await {
+            Ok(result) => result.unwrap(),
+            Err(_) => {
+                task.abort();
+                match task.await {
+                    Ok(()) => {}
+                    Err(error) if error.is_cancelled() => {}
+                    Err(error) => panic!("loopback test server failed while aborting: {error}"),
+                }
+                panic!("loopback test server did not finish");
+            }
+        }
+    }
+
+    fn test_policy(address: SocketAddr) -> FetchPolicy {
+        FetchPolicy {
+            exempt: Some(address),
+        }
+    }
+
+    fn png_crc32(bytes: &[u8]) -> u32 {
+        let mut crc = u32::MAX;
+        for byte in bytes {
+            crc ^= u32::from(*byte);
+            for _ in 0..8 {
+                crc = if crc & 1 == 1 {
+                    (crc >> 1) ^ 0xEDB8_8320
+                } else {
+                    crc >> 1
+                };
+            }
+        }
+        !crc
+    }
+
+    fn png_with_dimension(dimension: u32) -> Vec<u8> {
+        let mut encoded = std::io::Cursor::new(Vec::new());
+        image::DynamicImage::ImageRgba8(image::RgbaImage::new(1, 1))
+            .write_to(&mut encoded, image::ImageFormat::Png)
+            .unwrap();
+        let mut png = encoded.into_inner();
+        png[16..20].copy_from_slice(&dimension.to_be_bytes());
+        png[20..24].copy_from_slice(&dimension.to_be_bytes());
+        let crc = png_crc32(&png[12..29]);
+        png[29..33].copy_from_slice(&crc.to_be_bytes());
+        png
+    }
 
     fn ip(s: &str) -> IpAddr {
         s.parse().unwrap()
@@ -765,6 +940,200 @@ mod tests {
 
         assert!(dropped.load(Ordering::Acquire));
         assert!(!latest.is_current(0));
+    }
+
+    #[tokio::test]
+    async fn shutdown_joins_the_in_flight_task_and_waits_for_the_decode_slot() {
+        static TEST_SHUTDOWN_SLOT: Semaphore = Semaphore::const_new(1);
+        use std::sync::Arc;
+        use std::sync::atomic::AtomicBool;
+
+        struct DropFlag(Arc<AtomicBool>);
+        impl Drop for DropFlag {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::Release);
+            }
+        }
+
+        for (hold, bound, expected) in [
+            (
+                Duration::from_millis(50),
+                Duration::from_secs(2),
+                ShutdownOutcome::Joined,
+            ),
+            (
+                Duration::from_millis(250),
+                Duration::from_millis(100),
+                ShutdownOutcome::TimedOut,
+            ),
+        ] {
+            let latest = Latest::default();
+            let slot = Mutex::new(None);
+            let dropped = Arc::new(AtomicBool::new(false));
+            let guard = DropFlag(dropped.clone());
+            replace_in_flight(
+                &slot,
+                tokio::spawn(async move {
+                    let _guard = guard;
+                    std::future::pending::<()>().await;
+                }),
+            );
+            let permit = TEST_SHUTDOWN_SLOT.acquire().await.unwrap();
+            let (release_tx, release_rx) = std::sync::mpsc::channel();
+            let decode = tokio::task::spawn_blocking(move || {
+                release_rx.recv().unwrap();
+                drop(permit);
+            });
+            let release = tokio::spawn(async move {
+                tokio::time::sleep(hold).await;
+                release_tx.send(()).unwrap();
+            });
+            let started = tokio::time::Instant::now();
+            let outcome = tokio::time::timeout(
+                Duration::from_secs(10),
+                shutdown_slot(&latest, &slot, &TEST_SHUTDOWN_SLOT, bound),
+            )
+            .await
+            .unwrap();
+            assert_eq!(outcome, expected);
+            assert!(slot.lock().unwrap().is_none());
+            assert!(dropped.load(Ordering::Acquire));
+            if expected == ShutdownOutcome::TimedOut {
+                assert!(started.elapsed() < Duration::from_secs(1));
+            } else {
+                assert_eq!(TEST_SHUTDOWN_SLOT.available_permits(), 1);
+            }
+            release.await.unwrap();
+            decode.await.unwrap();
+            if expected == ShutdownOutcome::TimedOut {
+                assert_eq!(TEST_SHUTDOWN_SLOT.available_permits(), 1);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn loopback_redirect_to_another_port_is_refused() {
+        let other_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let other_port = other_listener.local_addr().unwrap().port();
+        drop(other_listener);
+        for target in [
+            format!("http://127.0.0.1:{other_port}/"),
+            "http://169.254.169.254/".to_owned(),
+        ] {
+            let response = format!(
+                "HTTP/1.1 302 Found\r\nLocation: {target}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+            );
+            let (address, server) = test_server(response.into_bytes()).await;
+            let url = format!("http://{address}/start");
+            let result = tokio::time::timeout(
+                Duration::from_secs(10),
+                fetch_http_with(&url, &test_policy(address)),
+            )
+            .await
+            .unwrap();
+            assert_eq!(result, Err(Reject::ForbiddenAddress));
+            finish_test_server(server).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn infinite_body_is_capped() {
+        let (address, server) = test_infinite_server().await;
+        let url = format!("http://{address}/");
+        let result = tokio::time::timeout(
+            Duration::from_secs(10),
+            fetch_http_with(&url, &test_policy(address)),
+        )
+        .await
+        .unwrap();
+        assert_eq!(result, Err(Reject::TooLarge));
+        finish_test_server(server).await;
+    }
+
+    #[tokio::test]
+    async fn declared_oversize_and_bad_mime_are_refused() {
+        for (headers, expected) in [
+            (
+                format!(
+                    "Content-Type: image/png\r\nContent-Length: {}\r\n",
+                    MAX_ART_BYTES + 1
+                ),
+                Reject::TooLarge,
+            ),
+            (
+                "Content-Type: text/html\r\nContent-Length: 0\r\n".to_owned(),
+                Reject::ContentType,
+            ),
+        ] {
+            let response = format!("HTTP/1.1 200 OK\r\n{headers}Connection: close\r\n\r\n");
+            let (address, server) = test_server(response.into_bytes()).await;
+            let url = format!("http://{address}/");
+            let result = tokio::time::timeout(
+                Duration::from_secs(10),
+                fetch_http_with(&url, &test_policy(address)),
+            )
+            .await
+            .unwrap();
+            assert_eq!(result, Err(expected));
+            finish_test_server(server).await;
+        }
+        let (address, server) = test_server(
+            b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_vec(),
+        )
+        .await;
+        let url = format!("http://{address}/missing");
+        let result = tokio::time::timeout(
+            Duration::from_secs(10),
+            fetch_http_with(&url, &test_policy(address)),
+        )
+        .await
+        .unwrap();
+        assert_eq!(result, Err(Reject::Status));
+        finish_test_server(server).await;
+    }
+
+    #[tokio::test]
+    async fn dimension_bomb_is_refused_by_the_decoder() {
+        const BOMB_DIM: u32 = 1 << 16; // above MEDIA_ART_LIMITS.max_dim (8192)
+        for (dimension, refused) in [(1, false), (BOMB_DIM, true)] {
+            let body = png_with_dimension(dimension);
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: image/png\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            );
+            let (address, server) = test_server([response.as_bytes(), &body].concat()).await;
+            let url = format!("http://{address}/image.png");
+            let result = tokio::time::timeout(
+                Duration::from_secs(10),
+                load_raster_with(&url, &test_policy(address)),
+            )
+            .await
+            .unwrap();
+            if refused {
+                assert!(matches!(result, Err(Reject::Decode)));
+            } else {
+                assert!(
+                    result.is_ok(),
+                    "valid 1x1 PNG must pass the dimension check"
+                );
+            }
+            finish_test_server(server).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn strict_policy_still_refuses_the_test_server() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        drop(listener);
+        let url = format!("http://{address}/");
+        let result = tokio::time::timeout(
+            Duration::from_secs(10),
+            fetch_http_with(&url, &STRICT_FETCH_POLICY),
+        )
+        .await
+        .unwrap();
+        assert_eq!(result, Err(Reject::ForbiddenAddress));
     }
 
     #[test]
