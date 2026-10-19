@@ -486,6 +486,7 @@ fn is_retained_property(name: &str) -> bool {
             | "ORGANIZER"
             | "STATUS"
             | "DTSTART"
+            | "RECURRENCE-ID"
             | "DTEND"
             | "DURATION"
             | "RRULE"
@@ -1023,6 +1024,7 @@ struct Builder {
     url: String,
     status: Option<EventStatus>,
     start: Option<EventTime>,
+    recurrence_id: Option<EventTime>,
     end: Option<EventTime>,
     duration: Option<chrono::Duration>,
     duration_seen: bool,
@@ -1042,7 +1044,7 @@ struct Builder {
 fn is_shape_property(name: &str) -> bool {
     matches!(
         name,
-        "DTSTART" | "DTEND" | "DURATION" | "RRULE" | "RDATE" | "EXDATE" | "UID"
+        "DTSTART" | "RECURRENCE-ID" | "DTEND" | "DURATION" | "RRULE" | "RDATE" | "EXDATE" | "UID"
     )
 }
 
@@ -1055,6 +1057,7 @@ fn singleton_property(name: &str) -> Option<&'static str> {
         "URL" => Some("URL"),
         "STATUS" => Some("STATUS"),
         "DTSTART" => Some("DTSTART"),
+        "RECURRENCE-ID" => Some("RECURRENCE-ID"),
         "DTEND" => Some("DTEND"),
         "DURATION" => Some("DURATION"),
         "ORGANIZER" => Some("ORGANIZER"),
@@ -1130,8 +1133,10 @@ impl Builder {
         default_zone: &str,
     ) -> Result<(), AdmissionError> {
         let mut normalized;
-        let line = if matches!(line.name.as_str(), "DTSTART" | "DTEND" | "RDATE" | "EXDATE")
-            && let Some(tzid) = line.params.get("TZID")
+        let line = if matches!(
+            line.name.as_str(),
+            "DTSTART" | "DTEND" | "RECURRENCE-ID" | "RDATE" | "EXDATE"
+        ) && let Some(tzid) = line.params.get("TZID")
             && !tzid.is_empty()
         {
             match timezone_bindings.get(tzid) {
@@ -1200,7 +1205,10 @@ impl Builder {
             && !self.seen_singletons.insert(name)
         {
             report.record(IcsDiagnostic::DuplicateProperty(name));
-            if matches!(name, "UID" | "DTSTART" | "DTEND" | "DURATION") {
+            if matches!(
+                name,
+                "UID" | "DTSTART" | "RECURRENCE-ID" | "DTEND" | "DURATION"
+            ) {
                 self.quarantined = true;
             }
         }
@@ -1254,6 +1262,13 @@ impl Builder {
                 self.start = parse_time(line, "");
                 if self.start.is_none() {
                     report.record(IcsDiagnostic::InvalidEvent);
+                }
+            }
+            "RECURRENCE-ID" => {
+                meter.charge_event(tz + ENTRY_OVERHEAD, 0)?;
+                self.recurrence_id = parse_time(line, "");
+                if self.recurrence_id.is_none() {
+                    self.quarantined = true;
                 }
             }
             "DTEND" => {
@@ -1384,6 +1399,7 @@ impl Builder {
             start,
             end,
         );
+        e.recurrence_id = self.recurrence_id.map(|t| anchor(t, default_zone));
         e.description = self.description;
         e.location = self.location;
         e.url = self.url;

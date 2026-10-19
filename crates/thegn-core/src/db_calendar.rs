@@ -10,6 +10,8 @@
 //! 2. showing one month should not deserialize a year of events;
 //! 3. a "next event" bar widget wants one indexed row, not a whole calendar.
 
+use std::collections::BTreeSet;
+
 use anyhow::Result;
 use rusqlite::{Connection, OptionalExtension, params};
 
@@ -17,7 +19,8 @@ use crate::db::Db;
 use crate::store::{CalendarRow, CalendarStore, CalendarSyncRow};
 use crate::util;
 
-/// Create the calendar cache tables. Idempotent, so re-running is a no-op.
+/// Create the calendar cache tables. Schema v84 rebuilds the calendar key to
+/// include the recurrence instance id.
 pub(crate) fn migrate_v52(conn: &Connection) -> Result<()> {
     conn.execute_batch(
         r#"
@@ -77,7 +80,7 @@ impl CalendarStore for Db {
             }
             sql.push(')');
         }
-        sql.push_str(" ORDER BY start_ms");
+        sql.push_str(" ORDER BY start_ms, uid, rid");
 
         let mut stmt = self.conn().prepare(&sql)?;
         let mut binds: Vec<Box<dyn rusqlite::ToSql>> = vec![Box::new(to_ms), Box::new(from_ms)];
@@ -101,19 +104,26 @@ impl CalendarStore for Db {
         // compositor's session persist needs.
         conn.execute_batch("BEGIN")?;
         let res = (|| -> Result<()> {
+            let hrefs: BTreeSet<&str> = rows.iter().filter_map(|r| r.href.as_deref()).collect();
+            let mut delete_resource = conn
+                .prepare_cached("DELETE FROM calendar_events WHERE account = ?1 AND href = ?2")?;
+            for href in hrefs {
+                delete_resource.execute(params![account, href])?;
+            }
             let now = util::now();
             let mut stmt = conn.prepare_cached(
                 r#"INSERT INTO calendar_events
-                     (account, uid, calendar, start_ms, end_ms, recurring, json, fetched_at, href)
-                   VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
-                   ON CONFLICT(account, uid) DO UPDATE SET
-                     calendar = ?3, start_ms = ?4, end_ms = ?5,
-                     recurring = ?6, json = ?7, fetched_at = ?8, href = ?9"#,
+                     (account, uid, rid, calendar, start_ms, end_ms, recurring, json, fetched_at, href)
+                   VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+                   ON CONFLICT(account, uid, rid) DO UPDATE SET
+                     calendar = ?4, start_ms = ?5, end_ms = ?6,
+                     recurring = ?7, json = ?8, fetched_at = ?9, href = ?10"#,
             )?;
             for r in rows {
                 stmt.execute(params![
                     account,
                     r.uid,
+                    r.recurrence_key,
                     r.calendar,
                     r.start_ms,
                     r.end_ms,
@@ -195,13 +205,14 @@ impl CalendarStore for Db {
             let now = util::now();
             let mut stmt = conn.prepare_cached(
                 r#"INSERT OR REPLACE INTO calendar_events
-                     (account, uid, calendar, start_ms, end_ms, recurring, json, fetched_at, href)
-                   VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)"#,
+                     (account, uid, rid, calendar, start_ms, end_ms, recurring, json, fetched_at, href)
+                   VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)"#,
             )?;
             for r in rows {
                 stmt.execute(params![
                     account,
                     r.uid,
+                    r.recurrence_key,
                     r.calendar,
                     r.start_ms,
                     r.end_ms,

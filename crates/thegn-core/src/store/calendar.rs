@@ -12,6 +12,8 @@ use anyhow::Result;
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct CalendarRow {
     pub uid: String,
+    /// Normalized recurrence instance key; empty for a master or one-shot.
+    pub recurrence_key: String,
     pub calendar: String,
     pub start_ms: i64,
     pub end_ms: i64,
@@ -58,7 +60,8 @@ pub trait CalendarStore {
         accounts: &[String],
     ) -> Result<Vec<(String, String)>>;
 
-    /// Upsert rows for one account (the incremental path).
+    /// Upsert rows for one account (the incremental path), replacing every
+    /// cached row of each resource the batch carries.
     fn put_calendar_events(&self, account: &str, rows: &[CalendarRow]) -> Result<()>;
 
     /// Delete specific uids (tombstones from an incremental sync).

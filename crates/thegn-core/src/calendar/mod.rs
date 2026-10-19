@@ -632,6 +632,10 @@ pub struct CalEvent {
     /// expander may not act on — so a rule round-trips losslessly.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub recurrence: Option<Recurrence>,
+    /// RFC 5545 `RECURRENCE-ID`: which generated occurrence of the series
+    /// this component overrides.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recurrence_id: Option<EventTime>,
     #[serde(default)]
     pub reminders: Vec<Reminder>,
     /// Provider validator for conditional fetches (an ICS `ETag`).
@@ -669,6 +673,7 @@ impl CalEvent {
             color: None,
             organizer: String::new(),
             recurrence: None,
+            recurrence_id: None,
             reminders: Vec::new(),
             etag: String::new(),
             updated_at_ms: 0,
@@ -676,9 +681,38 @@ impl CalEvent {
         }
     }
 
-    /// The globally unique id for this event.
+    /// The globally unique id for this event. A master keeps `source/uid`;
+    /// an override appends its normalized `RECURRENCE-ID` key.
     pub fn id(&self) -> EventId {
-        EventId::new(self.source.as_str(), &self.uid)
+        let base = EventId::new(self.source.as_str(), &self.uid);
+        match &self.recurrence_id {
+            None => base,
+            Some(_) => EventId(format!(
+                "{};RECURRENCE-ID={}",
+                base.0,
+                self.recurrence_key()
+            )),
+        }
+    }
+
+    /// Stable normalized key for a recurrence instance; empty for a master.
+    pub fn recurrence_key(&self) -> String {
+        let Some(time) = &self.recurrence_id else {
+            return String::new();
+        };
+        match time {
+            EventTime::Date { date } => date.format("%Y%m%d").to_string(),
+            timed => timed
+                .instant_in(chrono_tz::Tz::UTC, GapPolicy::ShiftForward)
+                .map(|at| at.format("%Y%m%dT%H%M%SZ").to_string())
+                .unwrap_or_else(|| match timed {
+                    EventTime::Date { date } => date.format("%Y%m%d").to_string(),
+                    EventTime::Zoned { local, .. } => {
+                        format!("L{}", local.format("%Y%m%dT%H%M%S"))
+                    }
+                    EventTime::Instant { at } => format!("L{}", at.format("%Y%m%dT%H%M%S")),
+                }),
+        }
     }
 
     /// Whether this event occupies whole days rather than a time span.
@@ -739,6 +773,7 @@ impl CalEvent {
             color: self.color,
             organizer: self.organizer.clone(),
             recurrence: None,
+            recurrence_id: self.recurrence_id.clone(),
             reminders: self.reminders.clone(),
             etag: self.etag.clone(),
             updated_at_ms: self.updated_at_ms,
