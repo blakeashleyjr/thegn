@@ -51,9 +51,18 @@ fn calendar_requests() -> &'static Mutex<CalendarRequests> {
     REQUESTS.get_or_init(|| Mutex::new(CalendarRequests::default()))
 }
 
+/// Visible month encoded as `year * 12 + month`; zero means no month is known.
+/// Writers use Release and readers use Acquire so periodic workers see the
+/// latest UI-loop update without a lock or another wake source.
 static VISIBLE_MONTH: AtomicU32 = AtomicU32::new(0);
+/// Monotonic id of the latest navigation request; zero means none is registered.
+/// Registration uses Release and workers use Acquire to observe the fence.
 static LATEST_NAVIGATION: AtomicU64 = AtomicU64::new(0);
 
+/// Record the month currently visible in the calendar popup.
+///
+/// Valid months are encoded as `year * 12 + month` (`0` is reserved for none).
+/// The Release store pairs with [`visible_month`]'s Acquire load.
 pub(crate) fn note_visible_month(month: (i32, u32)) {
     let encoded = if (1..=12).contains(&month.1) {
         i64::from(month.0)
@@ -67,6 +76,8 @@ pub(crate) fn note_visible_month(month: (i32, u32)) {
     VISIBLE_MONTH.store(encoded, Ordering::Release);
 }
 
+/// Read the last visible month, pairing with [`note_visible_month`]'s Release
+/// store through an Acquire load.
 fn visible_month() -> Option<(i32, u32)> {
     let encoded = VISIBLE_MONTH.load(Ordering::Acquire);
     if encoded == 0 {
@@ -86,12 +97,14 @@ pub(crate) fn register_month_request(month: (i32, u32)) -> u64 {
         .expect("calendar request id overflow");
     let request = requests.next;
     requests.latest.insert(month, request);
-    // The global navigation fence is only read by workers; Release/Acquire
-    // makes a newly registered navigation visible before they do more work.
+    // The global navigation fence is only read by workers. Release here pairs
+    // with navigation_superseded's Acquire load.
     LATEST_NAVIGATION.store(request, Ordering::Release);
     request
 }
 
+/// Return whether a newer navigation request has been registered. The Acquire
+/// load pairs with the Release store in [`register_month_request`].
 fn navigation_superseded(request: u64) -> bool {
     LATEST_NAVIGATION.load(Ordering::Acquire) > request
 }
@@ -258,9 +271,11 @@ fn run_month_fetch(
                 });
             }
             Err(problem) => {
-                if let Some(waker) = waker.as_ref() {
-                    refuse_horizon(&problem, &mut |m| toast(&tx, waker, m, None));
-                }
+                refuse_horizon(&problem, &mut |m| {
+                    if let Some(waker) = waker.as_ref() {
+                        toast(&tx, waker, m, None);
+                    }
+                });
             }
         }
     }
