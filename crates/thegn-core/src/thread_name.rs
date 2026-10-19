@@ -6,6 +6,7 @@ use std::thread::{self, JoinHandle};
 ///
 /// Linux keeps at most 15 bytes in the task `comm` field, so names are limited
 /// to that length to keep the whole attribution key visible.
+/// Panics if the OS refuses the thread; use `try_spawn_named` where that must degrade.
 pub fn spawn_named<F, T>(name: &'static str, f: F) -> JoinHandle<T>
 where
     F: FnOnce() -> T + Send + 'static,
