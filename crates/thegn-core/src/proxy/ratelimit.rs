@@ -65,6 +65,12 @@ impl TokenBucket {
         }
     }
 
+    /// Returns one token for an attempt that failed before reaching upstream.
+    pub fn refund(&mut self, now: Instant) {
+        self.refill(now);
+        self.tokens = (self.tokens + 1.0).min(self.burst);
+    }
+
     /// How long until at least one whole token is available, measured from
     /// `now`. Returns [`Duration::ZERO`] when a token is already available. The
     /// async layer sleeps for this long, then calls [`try_take`](Self::try_take).
@@ -183,6 +189,13 @@ impl RateLimiter {
                 TokenBucket::new(policy.rps(), policy.burst, now).expect("validated policy")
             })
             .reserve(now)
+    }
+
+    /// Returns one token after a pre-connect failure. Unknown identities are unchanged.
+    pub fn refund(&self, identity: &str, now: Instant) {
+        if let Some(bucket) = self.buckets.lock().unwrap().get_mut(identity) {
+            bucket.refund(now);
+        }
     }
 }
 
@@ -394,6 +407,19 @@ mod tests {
         assert!(rl.try_acquire("id", policy, t0));
         // Now empty: reserve returns a positive wait.
         assert!(rl.reserve("id", policy, t0) > Duration::ZERO);
+    }
+
+    #[test]
+    fn refunds_cap_at_burst_and_unknown_identity_is_unchanged() {
+        let now = Instant::now();
+        let mut bucket = TokenBucket::new(1.0, 1.0, now).unwrap();
+        bucket.refund(now);
+        assert!(bucket.try_take(now));
+        assert!(!bucket.try_take(now));
+
+        let limiter = RateLimiter::new();
+        limiter.refund("missing", now);
+        assert!(limiter.buckets.lock().unwrap().is_empty());
     }
 
     #[test]
