@@ -1251,7 +1251,19 @@ fn parse_ahead_behind(out: &str) -> Option<(usize, usize)> {
 const GLYPH_BASE_TTL: std::time::Duration = std::time::Duration::from_secs(60);
 const GLYPH_BASE_FAILURE_BACKOFF: std::time::Duration = std::time::Duration::from_secs(3);
 const GLYPH_BASE_CACHE_CAPACITY: usize = 256;
+/// Minimum retention for print-validated bases. This must exceed the host's
+/// quiet-row rescan gap so a print hit can reuse the cached base instead of
+/// spawning origin/HEAD and branch probes on every safety rescan.
 const GLYPH_BASE_PRINT_IDLE_TTL: std::time::Duration = std::time::Duration::from_secs(600);
+static GLYPH_BASE_RESCAN_BOUND_MS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// Note the longest gap the host may leave between two reads of one row's
+/// glyph base. The value only adjusts cache retention; it performs no I/O.
+pub fn note_glyph_rescan_bound(bound: std::time::Duration) {
+    let bound_ms = bound.as_millis().min(u128::from(u64::MAX)) as u64;
+    GLYPH_BASE_RESCAN_BOUND_MS.store(bound_ms, std::sync::atomic::Ordering::Relaxed);
+}
 
 /// Process-global cache of [`glyph_base`]'s resolution, keyed by full execution
 /// authority and placement path (with sensitive remote fields hashed).
@@ -1522,7 +1534,22 @@ fn purge_glyph_base_caches(now: std::time::Instant) {
     let mut failures = failed_base_cache()
         .lock()
         .unwrap_or_else(|e| e.into_inner());
-    purge_expired_glyph_bases(&mut bases, &mut failures, now);
+    purge_expired_glyph_bases(
+        &mut bases,
+        &mut failures,
+        now,
+        effective_print_idle_ttl(
+            GLYPH_BASE_RESCAN_BOUND_MS.load(std::sync::atomic::Ordering::Relaxed),
+        ),
+    );
+}
+
+/// Keep print-validated entries through the host's quiet-row rescan gap, with
+/// one glyph-base TTL of margin for the model tick and purge amortisation.
+fn effective_print_idle_ttl(noted_ms: u64) -> std::time::Duration {
+    std::time::Duration::from_millis(noted_ms)
+        .saturating_add(GLYPH_BASE_TTL)
+        .max(GLYPH_BASE_PRINT_IDLE_TTL)
 }
 
 fn purge_expired_glyph_bases(
@@ -1532,10 +1559,11 @@ fn purge_expired_glyph_bases(
     >,
     failures: &mut std::collections::HashMap<RepoExecutionIdentity, std::time::Instant>,
     now: std::time::Instant,
+    print_idle_ttl: std::time::Duration,
 ) {
     bases.retain(|_, (_, at, print)| {
         let max_age = if print.is_some() {
-            GLYPH_BASE_PRINT_IDLE_TTL
+            print_idle_ttl
         } else {
             GLYPH_BASE_TTL
         };
@@ -3124,7 +3152,7 @@ mod tests {
             ),
             (RepoExecutionIdentity("failure-recent".into()), now),
         ]);
-        purge_expired_glyph_bases(&mut bases, &mut failures, now);
+        purge_expired_glyph_bases(&mut bases, &mut failures, now, GLYPH_BASE_PRINT_IDLE_TTL);
         assert!(!bases.contains_key(&RepoExecutionIdentity("no-print-old".into())));
         assert!(!bases.contains_key(&RepoExecutionIdentity("print-old".into())));
         assert!(bases.contains_key(&RepoExecutionIdentity("print-recent".into())));
@@ -3152,8 +3180,42 @@ mod tests {
         );
 
         let mut failures = std::collections::HashMap::new();
-        purge_expired_glyph_bases(&mut bases, &mut failures, now);
+        purge_expired_glyph_bases(&mut bases, &mut failures, now, GLYPH_BASE_PRINT_IDLE_TTL);
         assert!(bases.contains_key(&key));
+    }
+
+    #[test]
+    fn print_validated_entry_survives_a_quiet_row_rescan_gap() {
+        let now = std::time::Instant::now();
+        let print = Some(thegn_core::git_memo::base_refs_print(&repo_root()).unwrap());
+        let effective = effective_print_idle_ttl(900_000);
+        let mut bases = std::collections::HashMap::from([
+            (
+                RepoExecutionIdentity("quiet-row-gap-kept".into()),
+                (
+                    Some("main".into()),
+                    now.checked_sub(std::time::Duration::from_secs(899))
+                        .unwrap(),
+                    print.clone(),
+                ),
+            ),
+            (
+                RepoExecutionIdentity("past-effective-ttl".into()),
+                (
+                    Some("main".into()),
+                    now.checked_sub(effective + std::time::Duration::from_secs(1))
+                        .unwrap(),
+                    print,
+                ),
+            ),
+        ]);
+        let mut failures = std::collections::HashMap::new();
+
+        purge_expired_glyph_bases(&mut bases, &mut failures, now, effective);
+
+        assert!(bases.contains_key(&RepoExecutionIdentity("quiet-row-gap-kept".into())));
+        assert!(!bases.contains_key(&RepoExecutionIdentity("past-effective-ttl".into())));
+        assert_eq!(effective_print_idle_ttl(0), GLYPH_BASE_PRINT_IDLE_TTL);
     }
 
     #[test]
