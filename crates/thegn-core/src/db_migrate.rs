@@ -1589,7 +1589,10 @@ pub(crate) fn migrate_v84(conn: &Connection) -> Result<()> {
     // The table rebuild releases the old calendar table's pages. Reclaim
     // those pages now so a fresh incremental-mode database does not start
     // its maintenance cycle with migration-only freelist entries.
-    conn.execute_batch("PRAGMA incremental_vacuum;")?;
+    // `incremental_vacuum` frees one page per step: step it to completion.
+    let mut vacuum = conn.prepare("PRAGMA incremental_vacuum")?;
+    let mut freed = vacuum.query([])?;
+    while freed.next()?.is_some() {}
     Ok(())
 }
 
