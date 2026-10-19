@@ -134,7 +134,6 @@ struct Slot {
     write_history: Ring,
 }
 
-
 #[derive(Debug, Clone)]
 pub(in crate::monitor) struct ContainersModel {
     slots: Vec<Slot>,
