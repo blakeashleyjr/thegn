@@ -4221,6 +4221,19 @@ pub fn run_gc_detailed(db_worktrees: &[String]) -> GcReport {
         SystemTime::now(),
         SECRET_ENV_FILE_MAX_AGE,
     );
+    let removed_adoption_records = crate::sandbox_compose::sweep_stale_adoption_records_in(
+        &state_home,
+        db_worktrees,
+        SystemTime::now(),
+        SECRET_ENV_FILE_MAX_AGE,
+    );
+    if removed_adoption_records > 0 {
+        tracing::debug!(
+            target: "thegn::sandbox",
+            removed = removed_adoption_records,
+            "swept stale Compose adoption records"
+        );
+    }
     let mut removed_report = Vec::new();
     let mut unverified_report = Vec::new();
     let mut listed_names = std::collections::HashSet::new();
