@@ -422,7 +422,7 @@ fn missing_fan_reading_keeps_gap_blank_in_ascii_and_older_samples_visible() {
                 Rect {
                     x: 1 + plot_start,
                     y: 1,
-                    cols: (160 - 2).saturating_sub(plot_start),
+                    cols: 160_usize.saturating_sub(2).saturating_sub(plot_start),
                     rows: 1,
                 },
                 11,
