@@ -61,6 +61,7 @@ pub(crate) struct QueryParser {
 #[derive(Debug, Default)]
 struct KeyboardOptIn {
     modify_other_keys: u8,
+    base: u8,
     kitty: [u8; 8],
     kitty_len: u8,
 }
@@ -68,13 +69,21 @@ struct KeyboardOptIn {
 impl KeyboardOptIn {
     fn reset(&mut self) {
         self.modify_other_keys = 0;
+        self.base = 0;
         self.kitty = [0; 8];
         self.kitty_len = 0;
     }
 
     fn extended_keys(&self) -> bool {
-        self.modify_other_keys >= 1
-            || self.kitty_len > 0 && self.kitty[usize::from(self.kitty_len - 1)] & 1 != 0
+        self.modify_other_keys >= 1 || self.current_kitty_flags() & 1 != 0
+    }
+
+    fn current_kitty_flags(&self) -> u8 {
+        if self.kitty_len == 0 {
+            self.base
+        } else {
+            self.kitty[usize::from(self.kitty_len - 1)]
+        }
     }
 
     fn update_csi(&mut self, body: &[u8]) {
@@ -94,10 +103,7 @@ impl KeyboardOptIn {
         };
         let level = match value {
             b"" | b";" => Some(0),
-            [b';', rest @ ..] => match parse_decimal(rest) {
-                Some(level) => Some(level.min(3) as u8),
-                None => None,
-            },
+            [b';', rest @ ..] => parse_decimal(rest).map(|level| level.min(3) as u8),
             _ => None,
         };
         if let Some(level) = level {
@@ -128,9 +134,9 @@ impl KeyboardOptIn {
             return;
         }
         if let Some(params) = params.strip_prefix(b"=") {
-            let (flags, mode) = match params.split_once(|byte| *byte == b';') {
-                Some((flags, mode)) => (flags, mode),
-                None => (params, &[]),
+            let (flags, mode) = match params.iter().position(|byte| *byte == b';') {
+                Some(index) => (&params[..index], &params[index + 1..]),
+                None => (params, &[][..]),
             };
             let Some(flags) = parse_decimal(flags) else {
                 return;
@@ -139,21 +145,19 @@ impl KeyboardOptIn {
                 return;
             };
             let flags = (flags & 0x1f) as u8;
-            let current = if self.kitty_len == 0 {
-                0
-            } else {
-                self.kitty[usize::from(self.kitty_len - 1)]
-            };
+            let current = self.current_kitty_flags();
             let updated = match mode {
                 1 => Some(flags),
                 2 => Some(current | flags),
                 3 => Some(current & !flags),
                 _ => None,
             };
-            if let Some(updated) = updated
-                && self.kitty_len > 0
-            {
-                self.kitty[usize::from(self.kitty_len - 1)] = updated;
+            match updated {
+                Some(updated) if self.kitty_len == 0 => self.base = updated,
+                Some(updated) => {
+                    self.kitty[usize::from(self.kitty_len - 1)] = updated;
+                }
+                None => {}
             }
         }
     }
@@ -657,6 +661,17 @@ mod tests {
     }
 
     #[test]
+    fn kitty_set_mode_updates_the_implicit_base_flags() {
+        let mut parser = QueryParser::default();
+        assert!(feed_mode(&mut parser, b"\x1b[=1;1u").is_empty());
+        assert!(parser.extended_keys());
+        assert_eq!(parser.keyboard.kitty_len, 0);
+        assert!(feed_mode(&mut parser, b"\x1b[=1;3u").is_empty());
+        assert!(!parser.extended_keys());
+        assert_eq!(parser.keyboard.kitty_len, 0);
+    }
+
+    #[test]
     fn kitty_stack_is_bounded_and_pops_saturate() {
         let mut parser = QueryParser::default();
         for _ in 0..9 {
@@ -698,18 +713,26 @@ mod tests {
         let mut parser = QueryParser::default();
         assert!(feed_mode(&mut parser, b"\x1b[>4;2m").is_empty());
         for malformed in [
-            b"\x1b[>4;x m".as_slice(),
+            b"\x1b[>4;2:3m".as_slice(),
             b"\x1b[>4;4294967296m".as_slice(),
-            b"\x1b[>1xu".as_slice(),
-            b"\x1b[=;1u".as_slice(),
         ] {
             assert!(feed_mode(&mut parser, malformed).is_empty());
             assert!(parser.extended_keys(), "{malformed:?}");
         }
         assert!(feed_mode(&mut parser, b"\x1b[>4;0m").is_empty());
-        let mut oversized = b"\x1b[>4;2".to_vec();
+
+        assert!(feed_mode(&mut parser, b"\x1b[>0u").is_empty());
+        assert_eq!(parser.keyboard.kitty_len, 1);
+        for malformed in [b"\x1b[>1:2u".as_slice(), b"\x1b[=;1u".as_slice()] {
+            assert!(feed_mode(&mut parser, malformed).is_empty());
+            assert!(!parser.extended_keys(), "{malformed:?}");
+            assert_eq!(parser.keyboard.kitty_len, 1, "{malformed:?}");
+            assert_eq!(parser.keyboard.kitty[0], 0, "{malformed:?}");
+        }
+
+        let mut oversized = b"\x1b[>4;".to_vec();
         oversized.extend(std::iter::repeat_n(b'0', MAX_QUERY_CONTROL));
-        oversized.push(b'm');
+        oversized.extend_from_slice(b"2m");
         assert!(feed_mode(&mut parser, &oversized).is_empty());
         assert!(!parser.extended_keys());
     }
