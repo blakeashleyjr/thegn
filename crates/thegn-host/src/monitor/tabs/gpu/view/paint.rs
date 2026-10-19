@@ -35,6 +35,9 @@ fn draw_labelled_spark(
         rect.x + body.x,
         rect.y + body.y + row,
     );
+    if values.is_empty() {
+        return;
+    }
     let area = Rect {
         x: rect.x + body.x + LABEL_COLS,
         y: rect.y + body.y + row,
