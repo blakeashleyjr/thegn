@@ -171,3 +171,76 @@ fn x_confirms_the_selected_worktree_path() {
         Some(Confirm::Clean { path, .. }) if path == selected
     ));
 }
+
+fn line_text(line: crate::seg::Line) -> String {
+    match line {
+        crate::seg::Line::Segs(segs) => segs.iter().map(|seg| seg.text.as_str()).collect(),
+        crate::seg::Line::Split { l, r } | crate::seg::Line::SplitMinLeft { l, r, .. } => l
+            .iter()
+            .chain(r.iter())
+            .map(|seg| seg.text.as_str())
+            .collect(),
+        _ => String::new(),
+    }
+}
+
+fn overlay_with_worktree_rows() -> (MonitorOverlay, std::path::PathBuf) {
+    let mut overlay = overlay();
+    let selected = std::path::PathBuf::from("/tmp/worktree-selected");
+    overlay.disk_rows = vec![
+        crate::monitor::build::DiskWtRow {
+            path: std::path::PathBuf::from("/tmp/worktree-first"),
+            name: "first".into(),
+            total_bytes: 10,
+            target_bytes: 4,
+            age_secs: Some(30),
+            measured_at_secs: None,
+        },
+        crate::monitor::build::DiskWtRow {
+            path: selected.clone(),
+            name: "selected".into(),
+            total_bytes: 20,
+            target_bytes: 8,
+            age_secs: Some(60),
+            measured_at_secs: None,
+        },
+    ];
+    overlay.sel = 1;
+    (overlay, selected)
+}
+
+#[test]
+fn x_does_nothing_while_the_worktrees_panel_is_zoomed_away() {
+    let (mut overlay, _) = overlay_with_worktree_rows();
+    overlay.handle_key(&KeyCode::Char('f'), Modifiers::NONE);
+    overlay.handle_key(&KeyCode::Char('z'), Modifiers::NONE);
+    assert!(overlay.board.is_zoomed());
+    assert!(!overlay.disk_worktrees_placed());
+
+    overlay.handle_key(&KeyCode::Char('x'), Modifiers::NONE);
+
+    assert!(overlay.confirm.is_none());
+    assert!(
+        overlay
+            .status
+            .as_deref()
+            .is_some_and(|status| status.contains("worktrees panel hidden"))
+    );
+    assert!(!line_text(overlay.footer()).contains("x clean"));
+}
+
+#[test]
+fn x_still_confirms_after_unzoom() {
+    let (mut overlay, selected) = overlay_with_worktree_rows();
+    overlay.handle_key(&KeyCode::Char('f'), Modifiers::NONE);
+    overlay.handle_key(&KeyCode::Char('z'), Modifiers::NONE);
+    overlay.handle_key(&KeyCode::Escape, Modifiers::NONE);
+    assert!(overlay.disk_worktrees_placed());
+
+    overlay.handle_key(&KeyCode::Char('x'), Modifiers::NONE);
+
+    assert!(matches!(
+        overlay.confirm,
+        Some(Confirm::Clean { path, .. }) if path == selected
+    ));
+}

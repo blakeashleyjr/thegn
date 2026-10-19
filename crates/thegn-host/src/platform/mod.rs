@@ -152,16 +152,92 @@ pub fn terminate_proxy_pid(_pid: u32, _expected_start_time: Option<u64>) -> bool
 
 /// A signal the monitor's Processes tab can deliver to a selected pid.
 ///
-/// Two rungs only — a graceful ask, then a hard stop — matching the tab's
-/// confirm flow (SIGTERM first, SIGKILL only on a second explicit confirmation).
-/// Windows has no signals, so both map to `TerminateProcess` (a hard kill) and
-/// the confirm text says so. See [`signal_identity()`].
+/// Unix exposes the supported single-process signals in the menu. Windows
+/// exposes only termination; `signal_identity()` rejects other variants
+/// before opening the target process. See [`signal_identity()`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(
+    windows,
+    allow(
+        dead_code,
+        reason = "the Windows menu offers terminate only; the other variants are unix signals"
+    )
+)]
 pub enum ProcSignal {
     /// Graceful termination request (unix `SIGTERM`; Windows hard terminate).
     Terminate,
     /// Forceful kill (unix `SIGKILL`; Windows hard terminate).
     Kill,
+    /// Hangup (`SIGHUP`).
+    Hangup,
+    /// Interrupt (`SIGINT`).
+    Interrupt,
+    /// Stop (`SIGSTOP`).
+    Stop,
+    /// Continue (`SIGCONT`).
+    Continue,
+}
+
+/// Return the actual parent pid of this process where the platform exposes it.
+/// The process sampler can omit this process from its bounded top-N snapshot.
+#[cfg(unix)]
+pub(crate) fn parent_pid() -> Option<u32> {
+    Some(std::os::unix::process::parent_id())
+}
+
+#[cfg(not(unix))]
+pub(crate) fn parent_pid() -> Option<u32> {
+    None
+}
+
+impl ProcSignal {
+    /// Short signal name without the `SIG` prefix.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Terminate => "TERM",
+            Self::Kill => "KILL",
+            Self::Hangup => "HUP",
+            Self::Interrupt => "INT",
+            Self::Stop => "STOP",
+            Self::Continue => "CONT",
+        }
+    }
+
+    /// Letter used to choose this signal from the monitor menu.
+    pub fn menu_key(self) -> char {
+        match self {
+            Self::Terminate => 't',
+            Self::Interrupt => 'i',
+            Self::Hangup => 'h',
+            Self::Kill => 'k',
+            Self::Stop => 's',
+            Self::Continue => 'c',
+        }
+    }
+
+    /// Signals shown in the monitor menu on the current platform.
+    pub fn menu() -> &'static [ProcSignal] {
+        #[cfg(windows)]
+        const MENU: &[ProcSignal] = &[ProcSignal::Terminate];
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        const MENU: &[ProcSignal] = &[
+            ProcSignal::Terminate,
+            ProcSignal::Interrupt,
+            ProcSignal::Hangup,
+            ProcSignal::Kill,
+            ProcSignal::Stop,
+            ProcSignal::Continue,
+        ];
+        #[cfg(not(any(windows, target_os = "linux", target_os = "macos")))]
+        const MENU: &[ProcSignal] = &[ProcSignal::Terminate];
+        MENU
+    }
+
+    /// Whether choosing this signal requires the monitor's explicit `y`.
+    pub fn needs_confirm(self) -> bool {
+        matches!(self, Self::Kill | Self::Stop)
+            || (cfg!(windows) && matches!(self, Self::Terminate))
+    }
 }
 
 mod signal_identity;

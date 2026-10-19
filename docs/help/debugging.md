@@ -109,6 +109,18 @@ The existing tuning variables are `THEGN_PERF_INTERVAL_MS` and
 `THEGN_INPUT_BUDGET_US` adjust the related guards. A `THEGN_LOG` filter that
 selects `thegn::perf` also enables the accounting.
 
+`input_no_effect_events` counts input keys whose cohort stayed pending while
+the loop went idle and was closed by a frame 250 ms or more after the key,
+including effects that arrive late from background work. Those keys are
+excluded from the input and writer input latency percentiles.
+
+With `THEGN_PERF` enabled, each runtime rollup also writes a thread census to
+`thegn::perf::rt`: a summary reports thread and runtime-thread counts plus wake
+rates, and up to 12 ranked lines show each thread's id, name, wake and CPU
+rates, current syscall, its file-descriptor target, and wait channel. On Linux,
+a background thread reads at most 256 entries from `/proc/self/task`; this
+bounded read burst runs once per rollup. Other platforms log an empty census.
+
 The live-only view is the **LOOP** overlay in System → Telemetry. Opening that
 section enables accounting and rolls it up at its live cadence; it is not a
 snapshot that `doctor` or a bundle can reconstruct later.

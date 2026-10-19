@@ -102,10 +102,12 @@ pub(crate) fn spawn_fold(fold_tx: &FoldTx, waker: &TerminalWaker, cfg: Config, a
     let tx = fold_tx.clone();
     let waker = waker.clone();
     tokio::task::spawn_blocking(move || {
-        let r = integrate::fold_active_repo(&cfg, &any_path);
-        if tx.send(r).is_ok() {
-            let _ = waker.wake(); // best-effort: waker pulse: an input nudge must never fail the calling path
-        }
+        crate::fold_cancel::run_app_worker(|| {
+            let r = integrate::fold_active_repo(&cfg, &any_path);
+            if tx.send(r).is_ok() {
+                let _ = waker.wake(); // best-effort: waker pulse: an input nudge must never fail the calling path
+            }
+        });
     });
 }
 
@@ -122,10 +124,12 @@ pub(crate) fn spawn_drive(
     let tx = drive_tx.clone();
     let waker = waker.clone();
     tokio::task::spawn_blocking(move || {
-        drive_blocking(&cfg, &any_path, |m: DriveMsg| {
-            if tx.send(m).is_ok() {
-                let _ = waker.wake(); // best-effort: waker pulse: an input nudge must never fail the calling path
-            }
+        crate::fold_cancel::run_app_worker(|| {
+            drive_blocking(&cfg, &any_path, |m: DriveMsg| {
+                if tx.send(m).is_ok() {
+                    let _ = waker.wake(); // best-effort: waker pulse: an input nudge must never fail the calling path
+                }
+            });
         });
     });
 }
@@ -904,7 +908,9 @@ pub(crate) fn section_key(key: char, cursor: usize, ctx: MqKeyCtx) -> bool {
             let cfg = ctx.cfg.clone();
             ctx.toasts
                 .success("Landing…".to_string(), std::time::Instant::now());
-            tokio::task::spawn_blocking(move || note.send_msg(land_ready(&cfg, &wt)));
+            tokio::task::spawn_blocking(move || {
+                crate::fold_cancel::run_app_worker(|| note.send_msg(land_ready(&cfg, &wt)));
+            });
         }
         MqAction::Retry => {
             let Some((wt, branch, target)) = row.map(|r| {
@@ -1136,7 +1142,9 @@ pub(crate) fn sidebar_action(action: SidebarMq, ctx: MqKeyCtx) {
             let wt_s = wt.to_string_lossy().to_string();
             ctx.toasts
                 .success("Landing…".to_string(), std::time::Instant::now());
-            tokio::task::spawn_blocking(move || note.send_msg(land_ready(&cfg, &wt_s)));
+            tokio::task::spawn_blocking(move || {
+                crate::fold_cancel::run_app_worker(|| note.send_msg(land_ready(&cfg, &wt_s)));
+            });
         }
         SidebarMq::Clear => {
             ctx.model.status = "Merge queue: clearing…".into();

@@ -342,7 +342,6 @@ crates/thegn-metrics/src/ratchet.rs
 crates/thegn-proxy/src/lib.rs
 crates/thegn-proxy/src/main.rs
 crates/thegn-proxy/src/relay.rs
-crates/thegn-proxy/src/router.rs
 crates/thegn-svc/src/bin/fake_lsp.rs
 crates/thegn-svc/src/bridge/mod.rs
 crates/thegn-svc/src/calendar/tests.rs

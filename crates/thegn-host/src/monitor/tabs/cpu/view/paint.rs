@@ -29,6 +29,7 @@ const LOAD: PanelId = PanelId("cpu.load");
 const IRQ: PanelId = PanelId("cpu.irq");
 const SCHED: PanelId = PanelId("cpu.sched");
 const IDLE: PanelId = PanelId("cpu.idle");
+const CORE: PanelId = PanelId("cpu.core");
 
 #[derive(Default)]
 struct CpuPaintScratch {
@@ -42,13 +43,26 @@ struct CpuPaintScratch {
     freq: Vec<f32>,
     heat_rows: Vec<Vec<f32>>,
     heat_out: crate::monitor::graphs::GraphOut,
+    history: Vec<f32>,
+    aligned_history: Vec<f32>,
 }
 
 thread_local! {
     static PAINT_SCRATCH: RefCell<CpuPaintScratch> = RefCell::new(CpuPaintScratch::default());
 }
 
+#[cfg(test)]
 pub(super) fn paint(model: &CpuModel, surface: &mut Surface, id: PanelId, rect: Rect) {
+    paint_view(model, None, surface, id, rect);
+}
+
+pub(super) fn paint_view(
+    model: &CpuModel,
+    cursor: Option<usize>,
+    surface: &mut Surface,
+    id: PanelId,
+    rect: Rect,
+) {
     PAINT_SCRATCH.with(|scratch| {
         let scratch = &mut *scratch.borrow_mut();
         scratch.grid.resize(rect.cols, rect.rows);
@@ -62,7 +76,7 @@ pub(super) fn paint(model: &CpuModel, surface: &mut Surface, id: PanelId, rect: 
                 true,
                 scratch,
             ),
-            CORES => paint_cores(&mut scratch.grid, rect, model, &mut scratch.label),
+            CORES => paint_cores(&mut scratch.grid, rect, model, cursor, &mut scratch.label),
             FREQ => paint_freq(
                 &mut scratch.grid,
                 rect,
@@ -90,6 +104,15 @@ pub(super) fn paint(model: &CpuModel, surface: &mut Surface, id: PanelId, rect: 
                 &mut scratch.text,
             ),
             IDLE => paint_idle(&mut scratch.grid, rect, model, &mut scratch.text),
+            CORE => paint_core_detail(
+                &mut scratch.grid,
+                rect,
+                model,
+                cursor,
+                &mut scratch.label,
+                &mut scratch.text,
+                &mut scratch.history,
+            ),
             _ => return,
         }
         scratch.emitter.emit(
@@ -176,7 +199,15 @@ pub(super) fn paint(model: &CpuModel, surface: &mut Surface, id: PanelId, rect: 
             }
         }
         if id == CORES && rect.rows > 2 && rect.cols > 24 {
-            paint_core_heatmap(model, rect, surface, scratch);
+            paint_core_heatmap(model, cursor, rect, surface, scratch);
+        }
+        if id == CORE {
+            paint_core_history(
+                rect,
+                surface,
+                &scratch.history,
+                &mut scratch.aligned_history,
+            );
         }
         if id == FREQ && rect.rows > 5 {
             paint_frequency_history(model, rect, surface, scratch);
@@ -232,7 +263,13 @@ fn paint_frequency_history(
     }
 }
 
-fn paint_cores(grid: &mut CellGrid, rect: Rect, model: &CpuModel, label: &mut String) {
+pub(super) fn paint_cores(
+    grid: &mut CellGrid,
+    rect: Rect,
+    model: &CpuModel,
+    cursor: Option<usize>,
+    label: &mut String,
+) {
     let mut body = panel::panel(grid, Rect::full(rect.cols, rect.rows), "Cores (L3)", None);
     let area = body.rect();
     if area.cols == 0 || area.rows == 0 {
@@ -248,15 +285,52 @@ fn paint_cores(grid: &mut CellGrid, rect: Rect, model: &CpuModel, label: &mut St
         1
     };
     let labels = model.cpu_stat.cores.len().div_ceil(per_row).min(area.rows);
+    let selected = cursor.map(|value| value.min(model.cpu_stat.cores.len() - 1));
+    let selected_row = selected.map(|value| value / per_row).unwrap_or(0);
+    let first_row = if cursor.is_some() {
+        selected_row.saturating_sub(labels.saturating_sub(1))
+    } else {
+        0
+    };
     for row in 0..labels {
-        let first = row * per_row;
+        let first = (first_row + row) * per_row;
         label.clear();
         core_label(model, first, label);
+        let first_width = label.chars().count();
+        body.put_str(
+            0,
+            row,
+            label,
+            if selected == Some(first) {
+                selected_style()
+            } else {
+                CellStyle::default()
+            },
+        );
         if per_row == 2 && model.cpu_stat.cores.get(first + 1).is_some() {
-            label.push_str(" / ");
+            body.put_str(first_width, row, " / ", CellStyle::default());
+            label.clear();
             core_label(model, first + 1, label);
+            body.put_str(
+                first_width + 3,
+                row,
+                label,
+                if selected == Some(first + 1) {
+                    selected_style()
+                } else {
+                    CellStyle::default()
+                },
+            );
         }
-        body.put_str(0, row, label, CellStyle::default());
+    }
+}
+
+fn selected_style() -> CellStyle {
+    CellStyle {
+        fg: StyleTok::from_tok(Tok::Slot(S::Text)).unwrap_or(StyleTok::INHERIT),
+        bg: StyleTok::from_tok(Tok::Series(thegn_core::theme::SeriesRole::Selected))
+            .unwrap_or(StyleTok::INHERIT),
+        ..CellStyle::default()
     }
 }
 
@@ -300,6 +374,7 @@ fn core_label(model: &CpuModel, index: usize, out: &mut String) {
 
 fn paint_core_heatmap(
     model: &CpuModel,
+    cursor: Option<usize>,
     rect: Rect,
     surface: &mut Surface,
     scratch: &mut CpuPaintScratch,
@@ -322,9 +397,29 @@ fn paint_core_heatmap(
     if scratch.heat_rows.len() < count {
         scratch.heat_rows.resize_with(count, Vec::new);
     }
+    let per_row = if crate::monitor::graphs::table().braille {
+        2
+    } else {
+        1
+    };
+    let label_rows = model
+        .cpu_stat
+        .cores
+        .len()
+        .div_ceil(per_row)
+        .min(graph_rect.rows);
+    let selected_row = cursor
+        .map(|value| value.min(model.cpu_stat.cores.len().saturating_sub(1)) / per_row)
+        .unwrap_or(0);
+    let first_row = if cursor.is_some() {
+        selected_row.saturating_sub(label_rows.saturating_sub(1))
+    } else {
+        0
+    };
     for (history, row) in model
         .core_busy_history
         .iter()
+        .skip(first_row)
         .zip(&mut scratch.heat_rows[..count])
     {
         history.copy_ordered_into(row);
@@ -425,6 +520,260 @@ fn paint_idle(grid: &mut CellGrid, rect: Rect, model: &CpuModel, text: &mut Stri
                 },
             );
         }
+    }
+}
+
+fn paint_core_detail(
+    grid: &mut CellGrid,
+    rect: Rect,
+    model: &CpuModel,
+    cursor: Option<usize>,
+    title: &mut String,
+    text: &mut String,
+    history: &mut Vec<f32>,
+) {
+    let selected = cursor
+        .unwrap_or(0)
+        .min(model.cpu_stat.cores.len().saturating_sub(1));
+    title.clear();
+    if let Some(core) = model.cpu_stat.cores.get(selected) {
+        write!(title, "Core {} busy %", core.id).expect("write CPU core title");
+    } else {
+        title.push_str("Core");
+    }
+    let mut body = panel::panel(grid, Rect::full(rect.cols, rect.rows), title, None);
+    let area = body.rect();
+    if area.cols == 0 || area.rows == 0 {
+        return;
+    }
+    let Some(core) = model.cpu_stat.cores.get(selected) else {
+        body.put_str(0, 0, mark(model.cpu_stat_health), CellStyle::default());
+        return;
+    };
+    let graph_rows = area.rows.min(6);
+    if let Some(ring) = model.core_busy_history.get(selected) {
+        ring.copy_ordered_into(history);
+        for value in history.iter_mut() {
+            if value.is_finite() {
+                *value = value.clamp(0.0, 1.0);
+            }
+        }
+    } else {
+        history.clear();
+    }
+    if history.is_empty() || !history.iter().any(|value| value.is_finite()) {
+        body.put_str(0, 0, mark(model.cpu_stat_health), CellStyle::default());
+    }
+
+    let mut row = graph_rows;
+    if row < area.rows {
+        text.clear();
+        text.push_str("user/sys/irq/io/steal ");
+        if let Some(share) = core.share {
+            write!(
+                text,
+                "{:.1}/{:.1}/{:.1}/{:.1}/{:.1}%",
+                f32::from(share.user.saturating_add(share.nice)) / 10.0,
+                f32::from(share.system) / 10.0,
+                f32::from(share.irq.saturating_add(share.softirq)) / 10.0,
+                f32::from(share.iowait) / 10.0,
+                f32::from(share.steal) / 10.0,
+            )
+            .expect("write CPU core mode split");
+        } else {
+            text.push_str(mark(model.cpu_stat_health));
+        }
+        body.put_str(0, row, text, CellStyle::default());
+        row += 1;
+    }
+    if row < area.rows {
+        if let Some(share) = core.share {
+            let modes = [
+                share.user.saturating_add(share.nice),
+                share.system,
+                share.irq.saturating_add(share.softirq),
+                share.iowait,
+                share.steal,
+            ];
+            let mut cumulative = 0_usize;
+            for (index, value) in modes.into_iter().enumerate() {
+                let left = cumulative * area.cols / 1000;
+                cumulative = cumulative.saturating_add(usize::from(value)).min(1000);
+                let right = cumulative * area.cols / 1000;
+                for x in left..right {
+                    body.put(
+                        x,
+                        row,
+                        CellStyle {
+                            ch: caps::raster_table().hbar8[7],
+                            fg: style(Tok::Series(match index {
+                                0 => thegn_core::theme::SeriesRole::CpuUser,
+                                1 => thegn_core::theme::SeriesRole::CpuSys,
+                                2 => thegn_core::theme::SeriesRole::CpuIrq,
+                                3 => thegn_core::theme::SeriesRole::CpuIowait,
+                                _ => thegn_core::theme::SeriesRole::CpuSteal,
+                            })),
+                            ..CellStyle::default()
+                        },
+                    );
+                }
+            }
+        }
+        row += 1;
+    }
+    if row < area.rows {
+        text.clear();
+        text.push_str("freq cur/min/max/hw ");
+        if let Some(policy) = model
+            .cpu_freq
+            .policies
+            .iter()
+            .find(|policy| policy.cpus.contains(u32::from(core.id)))
+        {
+            write_frequency(text, policy.cur_khz, model.cpu_freq_health);
+            text.push('/');
+            write_frequency(text, policy.scaling_min_khz, model.cpu_freq_health);
+            text.push('/');
+            write_frequency(text, policy.scaling_max_khz, model.cpu_freq_health);
+            text.push('/');
+            write_frequency(text, policy.hw_max_khz, model.cpu_freq_health);
+        } else {
+            text.push_str(mark(model.cpu_freq_health));
+        }
+        body.put_str(0, row, text, CellStyle::default());
+        row += 1;
+    }
+    if row < area.rows {
+        text.clear();
+        text.push_str("C states ");
+        if let Some(idle) = model.idle.cores.iter().find(|idle| idle.cpu == core.id) {
+            if idle.states.is_empty() {
+                text.push_str(mark(model.idle_health));
+            }
+            for (index, state) in idle.states.iter().enumerate() {
+                if index > 0 {
+                    text.push(' ');
+                }
+                text.push_str(state.name.as_deref().unwrap_or("C?"));
+                text.push(' ');
+                if let Some(residency) = state.residency_pct {
+                    write!(text, "{residency:.0}%").expect("write C-state residency");
+                } else {
+                    text.push_str(mark(model.idle_health));
+                }
+            }
+        } else {
+            text.push_str(mark(model.idle_health));
+        }
+        body.put_str(0, row, text, CellStyle::default());
+        row += 1;
+    }
+    if row < area.rows {
+        text.clear();
+        if let Some(topology) = model.topology.cpus.iter().find(|entry| entry.id == core.id) {
+            let kind = match topology.core_type {
+                thegn_metrics::collect::policy::cpu_topology::CoreType::Performance => "P",
+                thegn_metrics::collect::policy::cpu_topology::CoreType::Efficiency => "E",
+                thegn_metrics::collect::policy::cpu_topology::CoreType::Uniform => "uniform",
+            };
+            write!(text, "topology {kind} pkg/die/core ").expect("write CPU topology");
+            write_option(text, topology.package, model.topology_health);
+            text.push('/');
+            write_option(text, topology.die, model.topology_health);
+            text.push('/');
+            write_option(text, topology.core, model.topology_health);
+            text.push_str(" SMT ");
+            for (index, sibling) in topology.siblings.iter().enumerate() {
+                if index > 0 {
+                    text.push(',');
+                }
+                write!(text, "{sibling}").expect("write SMT sibling");
+            }
+        } else {
+            text.push_str("topology ");
+            text.push_str(mark(model.topology_health));
+        }
+        body.put_str(0, row, text, CellStyle::default());
+    }
+}
+
+fn paint_core_history(
+    rect: Rect,
+    surface: &mut Surface,
+    history: &[f32],
+    aligned_history: &mut Vec<f32>,
+) {
+    if history.is_empty() || rect.cols <= 2 || rect.rows <= 2 {
+        return;
+    }
+    let area = Rect {
+        x: rect.x + 1,
+        y: rect.y + 1,
+        cols: rect.cols.saturating_sub(2),
+        rows: rect.rows.saturating_sub(2).min(6),
+    };
+    let braille = crate::monitor::graphs::table().braille;
+    let graph_area = crate::monitor::kit::history_rect::graph_rect(area, history.len(), braille);
+    let samples_per_cell = if braille { 2 } else { 1 };
+    let visible_start = history
+        .len()
+        .saturating_sub(graph_area.cols * samples_per_cell);
+    let left = graph_area.x;
+    let mut start = visible_start;
+    while start < history.len() {
+        while start < history.len() && !history[start].is_finite() {
+            start += 1;
+        }
+        let run_start = start;
+        while start < history.len() && history[start].is_finite() {
+            start += 1;
+        }
+        if run_start == start {
+            continue;
+        }
+        let aligned_start = if braille {
+            visible_start + (run_start - visible_start) / 2 * 2
+        } else {
+            run_start
+        };
+        let samples = if aligned_start < run_start {
+            aligned_history.clear();
+            aligned_history.push(f32::NAN);
+            aligned_history.extend_from_slice(&history[run_start..start]);
+            aligned_history.as_slice()
+        } else {
+            &history[run_start..start]
+        };
+        let x = left + (aligned_start - visible_start) / samples_per_cell;
+        let end_x = left + (start - visible_start).div_ceil(samples_per_cell);
+        crate::monitor::graphs::paint_history_graph(
+            samples,
+            RampId::Util,
+            Rect {
+                x,
+                cols: end_x
+                    .saturating_sub(x)
+                    .min(graph_area.x + graph_area.cols - x),
+                ..graph_area
+            },
+            surface,
+        );
+    }
+}
+
+fn write_frequency(text: &mut String, khz: Option<u64>, health: Health) {
+    if let Some(khz) = khz {
+        write!(text, "{}MHz", khz / 1000).expect("write CPU frequency");
+    } else {
+        text.push_str(mark(health));
+    }
+}
+
+fn write_option(text: &mut String, value: Option<u16>, health: Health) {
+    if let Some(value) = value {
+        write!(text, "{value}").expect("write CPU topology id");
+    } else {
+        text.push_str(mark(health));
     }
 }
 
@@ -839,7 +1188,13 @@ fn paired_core_labels_keep_the_first_core_on_the_row() {
             },
         ]);
         let mut grid = CellGrid::new(40, 8);
-        paint_cores(&mut grid, Rect::full(40, 8), &model, &mut String::new());
+        paint_cores(
+            &mut grid,
+            Rect::full(40, 8),
+            &model,
+            None,
+            &mut String::new(),
+        );
         let row: String = (1..8)
             .map(|x| grid.get(x, 1).expect("inner row cell").ch)
             .collect();

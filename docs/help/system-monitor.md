@@ -74,19 +74,19 @@ log scale while Network stays on a live linear one.
   load average — fall back to `window` under `fixed`, since there is no honest
   number to divide by.
 
-On the Memory, Thermal, and Network graphs, leading gaps before the first
-reading stay blank; later gaps carry the last reading forward. In the Overview
-traffic graphs, empty intervals for network and disk I/O rates read as zero.
+On the Overview, CPU, Memory, Thermal, Network, Disk and Power history
+graphs, leading gaps before the first reading stay blank; later gaps carry the
+last reading forward.
 
 `Space` **pauses**. That freezes the picture. The history graphs keep recording
 at the normal, non-live rate, so resuming shows no gap; the monitor's detailed
 sampler stops until you resume. That makes a paused monitor cheaper than a live
 one.
 
-On the Overview, CPU, Memory, Thermal, Network, Disk and Power tabs, and on the GPU
-tab when an amdgpu device is present, the sampler reads only what the panels
-on screen need. The other tabs, and the GPU tab on other hardware (where it
-keeps the NVML-backed sections), still read every collector.
+On the Overview, CPU, Memory, Thermal, Network, Disk, Power and Containers tabs,
+and on the GPU tab when an amdgpu device is present, the sampler reads only what
+the panels on screen need. The other tabs, and the GPU tab on other hardware
+(where it keeps the NVML-backed sections), still read every collector.
 When paused or covered, the monitor's detailed sampler parks; nothing runs once
 the monitor is closed.
 
@@ -120,7 +120,12 @@ The CPU board shows total busy history and the current user, system, iowait, and
 steal shares, plus a per-core busy heatmap. The `Cores (L3)` panel labels known
 performance/efficiency cores with P/E badges and adds an `L3<n>` tag (such as
 `L30`) when the cache group is known; missing topology stays unlabelled. The
-`C states residency` panel shows C0 and reported C-state residency per core.
+CPU tab is a list: `j`/`k`, arrows, `PgUp`/`PgDn`, `Home`/`End`, and `G` move the
+core cursor, and the selected core label uses the monitor selection highlight.
+Press `Enter` (`↵ core`) to toggle the `cpu.core` panel in the C-states slot.
+It shows six rows of busy history, current mode shares, that core's frequency
+policy, C-state residencies, and package/die/core topology with SMT siblings.
+The `C states residency` panel shows C0 and reported C-state residency per core.
 Frequency, load/pressure, IRQ/softirq, and scheduler wait have separate panels.
 Panel focus (`f`/`F`), zoom (`z`), and Escape follow the monitor board controls.
 
@@ -129,12 +134,16 @@ Panel focus (`f`/`F`), zoom (`z`), and Escape follow the monitor board controls.
 The Memory tab is a panel board. `memory.composition` shows total, available,
 used, free and the component breakdown with bounded usage history from the
 selected telemetry window, scaled against total memory; frame samples and
-telemetry history use separate rings. `memory.verdict` summarizes memory health;
-`memory.pressure` shows PSI some/full pressure and its history; `memory.swap`
-appears when swap exists and includes selected-window history scaled against
-total swap, plus zram original, compressed and device sizes when available;
-`memory.paging` shows reclaim, scan and refault histories with labelled window
-peaks alongside current rates; and `memory.limit` shows the process cgroup
+telemetry history use separate rings. At large sizes it adds bounded anon,
+cache, slab and free small multiples against total memory. `memory.verdict`
+summarizes memory health; `memory.pressure` shows PSI some/full pressure and its
+history; `memory.swap` appears when swap exists and includes selected-window
+history scaled against total swap, plus zram original, compressed and device
+sizes when available; `memory.paging` shows reclaim, scan and refault histories
+with labelled window peaks alongside current rates; `memory.kernel` shows minor
+and major fault
+histories, page-in/out rates, THP and hugepage details, and dirty/writeback
+histories; and `memory.limit` shows the process cgroup
 limit and thegn.slice usage history. A missing limit is shown as
 `—`; when every cgroup level is unlimited, the panel says `no limit`. Use
 `f`/`F` to focus or unfocus a panel,
@@ -145,15 +154,22 @@ swap masthead chips expand into this tab.
 
 The Thermal tab shows the CPU package trend, per-core temperatures, the sensor
 table with bounded per-sensor history, GPU temperatures and telemetry, thermal
-zones with trips, and a per-core history heatmap. Temperature bars and sensor
-sparklines use a published max or critical threshold; sensors without one show
-the reading without a bar or sparkline. GPU temperature history shows its
-80/95 C thermal ramp. Missing readings use the absent mark; no reading is
-displayed as zero. Panel demand follows the panels placed on screen:
-`thermal.package`, `thermal.cores`, `thermal.sensors`, `thermal.zones`,
-`thermal.gpu`, and `thermal.heatmap`. Use `f`/`F` to move panel focus, `z` to
-zoom the focused panel, and `Esc` to unzoom before closing the monitor. The
-temperature masthead chip expands into this tab.
+zones with trips, and a per-core history heatmap. When hwmon reports a fan, the
+`thermal.cooling` panel shows its rpm, target, bounded history and paired sensor
+hint. Its history is scaled against the labelled session peak, so the plot
+shows relative fan speed when no hardware maximum is available. Pairing is the
+temperature sensor with the strongest recent correlation; it is an approximate
+hint because missing sensor samples can shift the alignment. The zones panel
+also lists passive cooling devices as engaged/total by type. Temperature bars
+and sensor sparklines use a published max or critical threshold; sensors
+without one show the reading without a bar or sparkline. GPU temperature
+history shows its 80/95 C thermal ramp. Missing readings use the absent mark;
+no reading is displayed as zero. Panel demand follows the panels placed on
+screen: `thermal.package`, `thermal.cores`, `thermal.sensors`, `thermal.zones`,
+`thermal.gpu`, `thermal.heatmap`, and `thermal.cooling` when a fan exists. Use
+`f`/`F` to move panel focus, `z` to zoom the focused panel, and `Esc` to unzoom
+before closing the monitor. The temperature masthead chip expands into this
+tab.
 
 ## Network
 
@@ -167,6 +183,10 @@ is not double-counted. Interface rows keep idle and down links visible, and
 fold interfaces beyond the eight tracked interfaces into an `other` row. Use
 `f`/`F` to focus a panel, `z` to zoom it, and `Esc` to step back through focus
 and zoom.
+The Owners panel shows TCP byte rates by pane, container, app or unit from
+socket cgroups, with short history sparks. It refreshes every five seconds while
+the tab is visible and works without elevated privileges; UDP, QUIC and other
+traffic appears as the unattributed remainder.
 The network masthead chip expands into this tab.
 
 ## Disk
@@ -175,21 +195,26 @@ The Disk tab is a panel board. `disk.io` shows aggregate read/write throughput
 and its selected-window history with the actual peak values and units. `disk.pressure`
 shows I/O PSI on a 0–100% scale. `disk.devices` shows device rates and utilization
 with each trend's peak labeled. `disk.filesystems` shows each mount point,
-filesystem type, used/total space, and a fill gauge; `+N` marks further mount
-points of the same superblock folded into that row. `disk.slice` shows thegn.slice
-I/O totals, interval rates, and their actual history peaks. Each placed panel
-requests only its own collectors; `disk.worktrees` uses the background `[disk]`
-scanner cache and requests no collector.
+filesystem type, used/total space, and a fill gauge; it does not show available
+space as a separate column; `+N` marks further mount points of the same
+superblock folded into that row. `disk.slice` shows thegn.slice I/O totals,
+interval rates, and their actual history peaks. Each placed panel requests only
+its own collectors; `disk.worktrees` uses the background `[disk]` scanner cache
+and requests no collector.
 
-`disk.worktrees` lists total size, reclaimable `target/` size, and measurement
-age; its title gives the total reclaimable amount. An empty cache says “no cached
-sizes yet”. Opening the tab never starts a `du` walk, and a stale row shows its
-age rather than blocking on a rescan. `j`/`k` and the arrows move the highlighted
+`disk.worktrees` lists each cached worktree's total size, reclaimable `target/`
+size, and measurement age; its title gives the total reclaimable amount. It
+does not show a time-to-full projection. The optional `[stats.alerts] disk_eta`
+rule (off by default) still uses recorded free-space history and fires when its
+runway drops below the configured number of hours. An empty cache says “no
+cached sizes yet”.
+Opening the tab never starts a `du` walk, and a stale row shows its age rather
+than blocking on a rescan. `j`/`k` and the arrows move the highlighted
 worktree, and the panel scrolls to keep that row visible. `x` opens the existing
-clean confirmation for the highlighted row. Cleaning keeps the checkout and
-removes only regenerable build artifacts off the event loop; the row updates
-after the next measurement. Use `f`/`F` to move panel focus, `z` to zoom, and
-`Esc` to unzoom before closing the monitor.
+clean confirmation for the highlighted row while the Worktrees panel is on
+screen. Cleaning keeps the checkout and removes only regenerable build artifacts
+off the event loop; the row updates after the next measurement. Use `f`/`F` to
+move panel focus, `z` to zoom, and `Esc` to unzoom before closing the monitor.
 
 The Worktrees panel lists each cached worktree's total size, reclaimable
 `target/` size, and measurement age, and its title gives the total reclaimable
@@ -202,6 +227,12 @@ The Filesystems panel shows each mount point, filesystem type, used/total
 space, and a fill gauge. It does not show available space as a separate
 column. `+N` marks further mount points of the same superblock folded into that
 row.
+clean confirmation for the highlighted row. Cleaning keeps the checkout and
+removes only regenerable build artifacts off the event loop; the row updates
+after the next measurement. Use `f`/`F` to move panel focus, `z` to zoom, and
+`Esc` to unzoom before closing the monitor. The Disk masthead chip expands into
+this tab.
+
 On Linux, `thegn doctor` also reports Disk health from UDisks2 when available,
 including health, critical warnings, wear, spare, read/write totals, power-on
 time, and the last four serial characters. Missing serial or health values
@@ -276,15 +307,27 @@ and new/exited values unknown until their baselines are available.
   and `j`/`k` move and the view follows, so it is always a row on screen. It
   always asks first: the confirmation names
   the PID, process name, and owner, so a pane-owned build is recognizably
-  thegn's own. The first `x` sends a graceful terminate (SIGTERM); pressing `x`
-  again on the same process offers a hard kill (SIGKILL) as a separate,
-  explicit step. A signal whose sampled process changed or left the displayed
-  list is refused with “process changed or left the sampled list; select it
-  again”. A signal that fails — no such process, permission denied — is shown
-  in the footer, never silently swallowed. When process identity cannot be
-  pinned, the signal is refused and the reason is shown in the footer. This is
-  a local, terminal-only action: it is not exposed to the CLI, the control API,
-  or any remote surface.
+  thegn's own. On Unix, the first `x` sends a graceful terminate (SIGTERM);
+  pressing `x` again on the same process offers a hard kill (SIGKILL) as a
+  separate, explicit step. On Windows, each `x` confirms a hard
+  `TerminateProcess`. A signal whose sampled process changed or left the
+  displayed list is refused with “process changed or left the sampled
+  list; select it again”. A signal that fails — no such process, permission
+  denied — is shown in the footer, never silently swallowed. When process
+  identity cannot be pinned, the signal is refused and the reason is shown in
+  the footer. This is a local, terminal-only action: it is not exposed to the
+  CLI, the control API, or any remote surface.
+- `X` opens the platform signal menu: `t` TERM, `i` INT, `h` HUP, `k` KILL,
+  `s` STOP and `c` CONT on Linux and macOS, or `t` TERM on Windows, followed by
+  `r` TERM tree. Choose by letter or with the arrow keys and Enter. TERM, INT,
+  HUP and CONT are sent immediately; KILL, STOP and TERM tree ask for `y`
+  confirmation (or `n` / `Esc` to cancel). On Windows, TERM is a hard
+  `TerminateProcess` and asks for `y`. The selected PID and start time are
+  checked again before delivery. STOP pauses a process and CONT resumes it.
+  TERM tree sends TERM to the selected process and its descendants in the
+  sampled process list, deepest first, checking each process identity before
+  signalling it. It refuses a tree containing thegn and reports sent, vanished
+  and refused counts. Descendants outside the sampled list are not signalled.
 - `=` opens a renice confirmation showing the current and proposed nice values.
   Use `+` / `-` to adjust within `-20..=19`, `y` to apply, or `n` / `Esc` to
   cancel. The selected PID and start time are checked again before applying;
@@ -311,6 +354,11 @@ Set `[monitor] processes = false` to disable the tab entirely, and
 `[monitor] proc_rows` to change how many rows it shows.
 
 ## Containers
+
+The tab is a board with estate totals, CPU, memory and I/O history, an inventory
+list with the action cursor, and a per-scope stats table. Cgroup stats are sampled
+only while the tab is visible and unpaused. Without cgroup v2 stats, those panels
+show `—` while the inventory and its actions keep working.
 
 The Containers tab lists every container on the machine across the detected
 backends, containers proven to belong to this profile first (tinted, foreign

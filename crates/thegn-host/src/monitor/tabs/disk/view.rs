@@ -31,7 +31,7 @@ const PRESSURE: PanelId = PanelId("disk.pressure");
 const DEVICES: PanelId = PanelId("disk.devices");
 const FILESYSTEMS: PanelId = PanelId("disk.filesystems");
 const SLICE: PanelId = PanelId("disk.slice");
-const WORKTREES: PanelId = PanelId("disk.worktrees");
+pub(in crate::monitor) const WORKTREES: PanelId = PanelId("disk.worktrees");
 const VARIANT: [Variant; 1] = [Variant {
     kind: VariantKind::Full,
     min: (20, 4),

@@ -177,8 +177,8 @@ pub(crate) fn key_bytes_mode(key: &KeyCode, mods: Modifiers, app_cursor: bool) -
                 Some(meta(c.encode_utf8(&mut buf).as_bytes().to_vec()))
             }
         }
-        // Enter has no xterm modified-key encoding. Preserve the traditional
-        // CR for Shift/Ctrl and use the legacy meta prefix for Alt.
+        // Enter's Shift form needs the per-pane opt-in handled by
+        // `key_bytes_pane`; all other forms preserve the traditional byte.
         KeyCode::Enter => Some(meta(b'\r')),
         // xterm's common Backspace conventions are DEL, Ctrl-H, and ESC+DEL
         // for Alt. Other modifiers do not change the byte.
@@ -231,6 +231,21 @@ pub(crate) fn key_bytes_mode(key: &KeyCode, mods: Modifiers, app_cursor: bool) -
             _ => None,
         },
         _ => None,
+    }
+}
+
+/// Encode a key for one pane, including Shift+Enter when that application
+/// requested a keyboard mode that can distinguish it.
+pub(crate) fn key_bytes_pane(
+    key: &KeyCode,
+    mods: Modifiers,
+    app_cursor: bool,
+    extended_keys: bool,
+) -> Option<Vec<u8>> {
+    if extended_keys && *key == KeyCode::Enter && mods == Modifiers::SHIFT {
+        Some(b"\x1b[13;2u".to_vec())
+    } else {
+        key_bytes_mode(key, mods, app_cursor)
     }
 }
 
@@ -846,6 +861,44 @@ mod tests {
             key_bytes_mode(&KeyCode::Home, Modifiers::NONE, true).unwrap(),
             b"\x1bOH"
         );
+    }
+
+    #[test]
+    fn shift_enter_uses_csi_u_only_when_the_pane_opted_in() {
+        assert_eq!(
+            key_bytes_pane(&KeyCode::Enter, Modifiers::SHIFT, false, true).as_deref(),
+            Some(&b"\x1b[13;2u"[..])
+        );
+        assert_eq!(
+            key_bytes_pane(&KeyCode::Enter, Modifiers::SHIFT, false, false).as_deref(),
+            Some(&b"\r"[..])
+        );
+        for (mods, expected) in [
+            (Modifiers::CTRL, &b"\r"[..]),
+            (Modifiers::ALT, &b"\x1b\r"[..]),
+            (Modifiers::SHIFT | Modifiers::ALT, &b"\x1b\r"[..]),
+            (Modifiers::NONE, &b"\r"[..]),
+        ] {
+            assert_eq!(
+                key_bytes_pane(&KeyCode::Enter, mods, false, true).as_deref(),
+                Some(expected)
+            );
+        }
+    }
+
+    #[test]
+    fn pane_encoder_delegates_non_shift_enter_keys_unchanged() {
+        for key in [KeyCode::UpArrow, KeyCode::Delete, KeyCode::Char('x')] {
+            for app_cursor in [false, true] {
+                for extended_keys in [false, true] {
+                    assert_eq!(
+                        key_bytes_pane(&key, Modifiers::NONE, app_cursor, extended_keys),
+                        key_bytes_mode(&key, Modifiers::NONE, app_cursor),
+                        "{key:?}, app_cursor={app_cursor}, extended_keys={extended_keys}"
+                    );
+                }
+            }
+        }
     }
 
     #[test]

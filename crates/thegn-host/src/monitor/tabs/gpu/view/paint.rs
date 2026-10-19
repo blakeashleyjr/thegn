@@ -35,80 +35,130 @@ fn draw_labelled_spark(
         rect.x + body.x,
         rect.y + body.y + row,
     );
+    if values.is_empty() {
+        return;
+    }
     let area = Rect {
         x: rect.x + body.x + LABEL_COLS,
         y: rect.y + body.y + row,
         cols: body.cols - LABEL_COLS,
         rows: 1,
     };
-    if !values.is_empty() {
-        let graph = crate::monitor::kit::history_rect::graph_rect(
-            area,
-            values.len(),
-            crate::monitor::graphs::table().braille,
-        );
-        let mut index = 0;
-        while index < values.len() {
-            while index < values.len() && !values[index].is_finite() {
-                index += 1;
-            }
-            let start = index;
-            while index < values.len() && values[index].is_finite() {
-                index += 1;
-            }
-            if start == index {
-                continue;
-            }
-            let run_start = graph.x + start * graph.cols / values.len();
-            let run_end = graph.x + index * graph.cols / values.len();
-            let run_cols = run_end.saturating_sub(run_start).max(1).min(graph.cols);
-            crate::monitor::graphs::paint_sparkline(
-                &values[start..index],
-                run_cols,
-                ramp,
-                Rect {
-                    x: run_start,
-                    cols: run_cols,
-                    ..graph
-                },
-                surface,
-            );
-        }
-    }
+    paint_sparkline_runs(values, ramp, area, surface);
 }
 
 fn aux_rings(
     history: &super::BusyHistory,
     memory: bool,
-) -> (
-    &[f32; HISTORY_CAP],
-    usize,
-    usize,
-    &[f32; HISTORY_CAP],
-    usize,
-    usize,
-    [&'static str; 2],
-) {
+) -> (&super::HistoryRing, &super::HistoryRing, [&'static str; 2]) {
     if memory {
         (
             &history.memory,
-            history.memory_next,
-            history.memory_len,
             &history.gtt,
-            history.gtt_next,
-            history.gtt_len,
             ["VRAM / total", "GTT / total"],
         )
     } else {
         (
             &history.clocks,
-            history.clocks_next,
-            history.clocks_len,
             &history.power,
-            history.power_next,
-            history.power_len,
             ["gfx clock / max", "power / cap"],
         )
+    }
+}
+
+fn finite_runs(values: &[f32]) -> impl Iterator<Item = (usize, usize)> + '_ {
+    let mut start = 0;
+    std::iter::from_fn(move || {
+        while start < values.len() && !values[start].is_finite() {
+            start += 1;
+        }
+        if start == values.len() {
+            return None;
+        }
+        let run_start = start;
+        while start < values.len() && values[start].is_finite() {
+            start += 1;
+        }
+        let run_end = start;
+        Some((run_start, run_end))
+    })
+}
+
+fn paint_history_graph_runs(
+    values: &[f32],
+    ramp: thegn_core::theme::RampId,
+    plot: Rect,
+    surface: &mut Surface,
+) {
+    let braille = crate::monitor::graphs::table().braille;
+    let graph = crate::monitor::kit::history_rect::graph_rect(plot, values.len(), braille);
+    if values.iter().all(|value| value.is_finite()) {
+        crate::monitor::graphs::paint_history_graph(values, ramp, graph, surface);
+        return;
+    }
+    let slots = if braille {
+        graph.cols.saturating_mul(2)
+    } else {
+        graph.cols
+    };
+    let shown = values.len().min(slots);
+    let skip = values.len().saturating_sub(shown);
+    let pad = slots.saturating_sub(shown);
+    let visible = &values[skip..];
+    let stride = if braille { 2 } else { 1 };
+    for (start, end) in finite_runs(visible) {
+        let slot_start = pad + start;
+        let offset = if braille { slot_start % stride } else { 0 };
+        let x = graph.x + slot_start / stride;
+        let cols = (offset + end - start).div_ceil(stride);
+        let run_len = end - start;
+        let mut aligned = [f32::NAN; HISTORY_CAP + 2];
+        let mut aligned_len = offset + run_len;
+        aligned[offset..aligned_len].copy_from_slice(&visible[start..end]);
+        if braille && !aligned_len.is_multiple_of(2) {
+            aligned[aligned_len] = f32::NAN;
+            aligned_len += 1;
+        }
+        crate::monitor::graphs::paint_history_graph(
+            &aligned[..aligned_len],
+            ramp,
+            Rect {
+                x,
+                cols: cols.min(graph.x + graph.cols - x),
+                ..graph
+            },
+            surface,
+        );
+    }
+}
+
+fn paint_sparkline_runs(
+    values: &[f32],
+    ramp: thegn_core::theme::RampId,
+    plot: Rect,
+    surface: &mut Surface,
+) {
+    let braille = crate::monitor::graphs::table().braille;
+    let graph = crate::monitor::kit::history_rect::graph_rect(plot, values.len(), braille);
+    if values.iter().all(|value| value.is_finite()) {
+        crate::monitor::graphs::paint_sparkline(values, graph.cols, ramp, graph, surface);
+        return;
+    }
+    let slots = graph.cols;
+    let shown = values.len().min(slots);
+    let skip = values.len().saturating_sub(shown);
+    let pad = slots.saturating_sub(shown);
+    let visible = &values[skip..];
+    for (start, end) in finite_runs(visible) {
+        let x = graph.x + pad + start;
+        let cols = end - start;
+        crate::monitor::graphs::paint_sparkline(
+            &visible[start..end],
+            cols,
+            ramp,
+            Rect { x, cols, ..graph },
+            surface,
+        );
     }
 }
 
@@ -195,30 +245,16 @@ impl GpuView<'_> {
                     .iter()
                     .find(|item| item.slot == engine.slot.as_str())
                 {
-                    let (first, first_next, first_len, second, second_next, second_len, labels) =
-                        aux_rings(history, memory);
-                    for (values, next, len, label, ramp) in [
-                        (
-                            first,
-                            first_next,
-                            first_len,
-                            labels[0],
-                            thegn_core::theme::RampId::Mem,
-                        ),
-                        (
-                            second,
-                            second_next,
-                            second_len,
-                            labels[1],
-                            thegn_core::theme::RampId::Util,
-                        ),
+                    let (first, second, labels) = aux_rings(history, memory);
+                    for (ring, label, ramp) in [
+                        (first, labels[0], thegn_core::theme::RampId::Mem),
+                        (second, labels[1], thegn_core::theme::RampId::Util),
                     ] {
-                        if len == 0 || output_row >= body.rows {
+                        if ring.is_empty() || output_row >= body.rows {
                             continue;
                         }
                         let mut ordered = [0.0_f32; HISTORY_CAP];
-                        let ordered_len =
-                            super::BusyHistory::ordered_ring(values, next, len, &mut ordered);
+                        let ordered_len = ring.ordered_into(&mut ordered);
                         label_text.clear();
                         write!(label_text, "GPU{device_index} {label}").expect("write to String");
                         draw_labelled_spark(
@@ -251,8 +287,7 @@ impl GpuView<'_> {
             else {
                 continue;
             };
-            let (first, first_next, first_len, second, second_next, second_len, labels) =
-                aux_rings(history, memory);
+            let (first, second, labels) = aux_rings(history, memory);
             first_label.clear();
             write!(first_label, "GPU{device_index} {}", labels[0]).expect("write to String");
             second_label.clear();
@@ -270,21 +305,16 @@ impl GpuView<'_> {
                 &[],
                 thegn_core::theme::RampId::Mem,
             );
-            if first_len > 0 {
+            if !first.is_empty() {
                 let mut values = [0.0_f32; HISTORY_CAP];
-                let len =
-                    super::BusyHistory::ordered_ring(first, first_next, first_len, &mut values);
-                let graph = crate::monitor::kit::history_rect::graph_rect(
-                    Rect {
-                        x: rect.x + body.x + 28,
-                        y: rect.y + body.y + output_row + 1,
-                        cols: body.cols - 28,
-                        rows: slot_rows.saturating_sub(3),
-                    },
-                    len,
-                    crate::monitor::graphs::table().braille,
-                );
-                crate::monitor::graphs::paint_history_graph(
+                let len = first.ordered_into(&mut values);
+                let graph = Rect {
+                    x: rect.x + body.x + 28,
+                    y: rect.y + body.y + output_row + 1,
+                    cols: body.cols - 28,
+                    rows: slot_rows.saturating_sub(3),
+                };
+                paint_history_graph_runs(
                     &values[..len],
                     thegn_core::theme::RampId::Mem,
                     graph,
@@ -301,23 +331,17 @@ impl GpuView<'_> {
                 &[],
                 thegn_core::theme::RampId::Util,
             );
-            if second_len > 0 {
+            if !second.is_empty() {
                 let mut values = [0.0_f32; HISTORY_CAP];
-                let len =
-                    super::BusyHistory::ordered_ring(second, second_next, second_len, &mut values);
-                let graph = crate::monitor::kit::history_rect::graph_rect(
-                    Rect {
-                        x: rect.x + body.x + 28,
-                        y: rect.y + body.y + second_row,
-                        cols: body.cols - 28,
-                        rows: 1,
-                    },
-                    len,
-                    crate::monitor::graphs::table().braille,
-                );
-                crate::monitor::graphs::paint_sparkline(
+                let len = second.ordered_into(&mut values);
+                let graph = Rect {
+                    x: rect.x + body.x + 28,
+                    y: rect.y + body.y + second_row,
+                    cols: body.cols - 28,
+                    rows: 1,
+                };
+                paint_sparkline_runs(
                     &values[..len],
-                    graph.cols,
                     thegn_core::theme::RampId::Util,
                     graph,
                     surface,
@@ -352,24 +376,19 @@ impl GpuView<'_> {
                 else {
                     continue;
                 };
-                if history.len == 0 || body.cols <= 36 {
+                if history.busy.is_empty() || body.cols <= 36 {
                     continue;
                 }
                 let mut values = [0.0_f32; HISTORY_CAP];
-                let len = history.ordered_into(&mut values);
-                let graph_rect = crate::monitor::kit::history_rect::graph_rect(
-                    Rect {
-                        x: rect.x + body.x + 36,
-                        y: rect.y + body.y + index,
-                        cols: body.cols - 36,
-                        rows: 1,
-                    },
-                    len,
-                    crate::monitor::graphs::table().braille,
-                );
-                crate::monitor::graphs::paint_sparkline(
+                let len = history.busy.ordered_into(&mut values);
+                let graph_rect = Rect {
+                    x: rect.x + body.x + 36,
+                    y: rect.y + body.y + index,
+                    cols: body.cols - 36,
+                    rows: 1,
+                };
+                paint_sparkline_runs(
                     &values[..len],
-                    graph_rect.cols,
                     thegn_core::theme::RampId::Util,
                     graph_rect,
                     surface,
@@ -387,27 +406,23 @@ impl GpuView<'_> {
             else {
                 return;
             };
-            if history.len > 0 && body.rows >= 3 && body.cols >= 12 {
+            if !history.busy.is_empty() && body.rows >= 3 && body.cols >= 12 {
                 let mut vcn = [0.0_f32; HISTORY_CAP];
-                let vcn_len = history.ordered_vcn_into(&mut vcn);
+                let vcn_len = history.vcn.ordered_into(&mut vcn);
                 let activity_count = history.activity.iter().filter(|ring| ring.len > 0).count();
                 let activity_rows = activity_count.min(
                     body.rows
                         .saturating_sub(2 + if vcn_len > 0 { 1 } else { 0 }),
                 );
                 let mut values = [0.0_f32; HISTORY_CAP];
-                let len = history.ordered_into(&mut values);
-                let graph_rect = crate::monitor::kit::history_rect::graph_rect(
-                    Rect {
-                        x: rect.x + body.x,
-                        y: rect.y + body.y + 1,
-                        cols: body.cols,
-                        rows: body.rows.saturating_sub(2 + activity_rows),
-                    },
-                    len,
-                    crate::monitor::graphs::table().braille,
-                );
-                crate::monitor::graphs::paint_history_graph(
+                let len = history.busy.ordered_into(&mut values);
+                let graph_rect = Rect {
+                    x: rect.x + body.x,
+                    y: rect.y + body.y + 1,
+                    cols: body.cols,
+                    rows: body.rows.saturating_sub(2 + activity_rows),
+                };
+                paint_history_graph_runs(
                     &values[..len],
                     thegn_core::theme::RampId::Util,
                     graph_rect,
@@ -426,19 +441,14 @@ impl GpuView<'_> {
                         rect.x + body.x,
                         graph_y,
                     );
-                    let graph_rect = crate::monitor::kit::history_rect::graph_rect(
-                        Rect {
-                            x: rect.x + body.x + 5,
-                            y: graph_y,
-                            cols: body.cols.saturating_sub(5),
-                            rows: 1,
-                        },
-                        vcn_len,
-                        crate::monitor::graphs::table().braille,
-                    );
-                    crate::monitor::graphs::paint_sparkline(
+                    let graph_rect = Rect {
+                        x: rect.x + body.x + 5,
+                        y: graph_y,
+                        cols: body.cols.saturating_sub(5),
+                        rows: 1,
+                    };
+                    paint_sparkline_runs(
                         &vcn[..vcn_len],
-                        graph_rect.cols,
                         thegn_core::theme::RampId::Util,
                         graph_rect,
                         surface,
@@ -456,7 +466,7 @@ impl GpuView<'_> {
                 .iter()
                 .find(|item| item.slot == engine.slot.as_str())
         {
-            let vcn_len = history.vcn_len;
+            let vcn_len = history.vcn.len();
             let activity_rows = history
                 .activity
                 .iter()
@@ -483,7 +493,7 @@ impl GpuView<'_> {
             else {
                 continue;
             };
-            let activity_end = if self.0.engines.devices.len() == 1 && history.vcn_len > 0 {
+            let activity_end = if self.0.engines.devices.len() == 1 && !history.vcn.is_empty() {
                 body.rows.saturating_sub(1)
             } else {
                 body.rows

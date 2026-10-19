@@ -282,6 +282,7 @@ pub fn spawn_relay<S, F>(
     mut rest: ByteStream,
     mut sink: S,
     cfg: RelayConfig,
+    total: Duration,
     on_finish: F,
 ) -> Body
 where
@@ -296,6 +297,9 @@ where
         }
         let mut line_buf: Vec<u8> = Vec::new();
         let mut last_data = Instant::now();
+        let total_deadline = tokio::time::Instant::now() + total;
+        let total_sleep = tokio::time::sleep_until(total_deadline);
+        tokio::pin!(total_sleep);
         let mut hb = tokio::time::interval(cfg.heartbeat);
         hb.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         hb.tick().await; // consume the immediate first tick
@@ -303,6 +307,10 @@ where
         loop {
             tokio::select! {
                 biased;
+                _ = &mut total_sleep => {
+                    tracing::warn!("stream total timeout — terminating");
+                    break;
+                }
                 next = rest.next() => match next {
                     Some(Ok(chunk)) => {
                         last_data = Instant::now();
@@ -456,7 +464,14 @@ mod tests {
         else {
             panic!("mock upstream should produce a first event");
         };
-        let body = spawn_relay(prefix_out, rest, sink, cfg, |_| {});
+        let body = spawn_relay(
+            prefix_out,
+            rest,
+            sink,
+            cfg,
+            Duration::from_secs(3600),
+            |_| {},
+        );
         let mut data = body.into_data_stream();
         let result = tokio::time::timeout(Duration::from_millis(250), async {
             let mut chunks = Vec::new();

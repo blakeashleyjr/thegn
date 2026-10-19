@@ -157,6 +157,46 @@ fn fixture() -> MonitorFrame {
     frame
 }
 
+fn fixture_with_fan() -> MonitorFrame {
+    let mut frame = fixture();
+    let mut layout = (**frame.parts.hwmon.layout.as_ref().expect("hwmon layout")).clone();
+    layout.generation = 2;
+    layout.sensors.extend([
+        HwmonSensor {
+            key: "fan-stable-key".to_owned(),
+            chip: 0,
+            kind: SensorKind::Fan,
+            channel: 1,
+            role: SensorRole::Input,
+            label: Some("fan1".to_owned()),
+            thresholds: Thresholds::default(),
+            cost: CostClass::Fast,
+        },
+        HwmonSensor {
+            key: "fan-target-key".to_owned(),
+            chip: 0,
+            kind: SensorKind::Fan,
+            channel: 1,
+            role: SensorRole::Target,
+            label: None,
+            thresholds: Thresholds::default(),
+            cost: CostClass::Fast,
+        },
+    ]);
+    frame.parts.hwmon.layout = Some(Arc::new(layout));
+    frame.parts.hwmon.values.extend([
+        HwmonValue {
+            value: None,
+            ..HwmonValue::default()
+        },
+        HwmonValue {
+            value: Some(1_800.0),
+            ..HwmonValue::default()
+        },
+    ]);
+    frame
+}
+
 fn text(surface: &mut Surface) -> String {
     surface.screen_chars_to_string()
 }
@@ -193,6 +233,265 @@ fn fill_ratio(surface: &Surface, area: Rect) -> f32 {
         })
         .sum::<usize>();
     occupied as f32 / area_cells as f32
+}
+
+#[test]
+fn cooling_panel_appears_only_when_the_layout_has_a_fan() {
+    let mut no_fan = ThermalModel::default();
+    no_fan.absorb_frame(&fixture());
+    let no_fan_view = ThermalView(&no_fan);
+    let area = Rect::full(240, 60);
+    assert!(
+        Board::default()
+            .placed(&no_fan_view, area)
+            .iter()
+            .all(|panel| panel.id != super::COOLING)
+    );
+
+    let mut with_fan = ThermalModel::default();
+    with_fan.absorb_frame(&fixture_with_fan());
+    assert_eq!(with_fan.fans.len(), 1);
+    assert_eq!(with_fan.fans[0].rpm, None);
+    let view = ThermalView(&with_fan);
+    assert!(
+        Board::default()
+            .placed(&view, area)
+            .iter()
+            .any(|panel| panel.id == super::COOLING)
+    );
+    let cooling = Placed {
+        id: super::COOLING,
+        rect: area,
+        variant: super::FULL.kind,
+    };
+    let mut surface = Surface::new(240, 60);
+    view.paint(&mut surface, &cooling, area, 0, &[]);
+    assert!(!text(&mut surface).contains("0rpm"));
+    assert_eq!(
+        view.demand(super::COOLING).iter().collect::<Vec<_>>(),
+        [CollectorId::Hwmon]
+    );
+}
+
+#[test]
+fn fan_rows_follow_stable_keys_and_keep_a_bounded_ring() {
+    let mut model = ThermalModel::default();
+    let mut frame = fixture_with_fan();
+    let fan_index = frame.parts.hwmon.values.len() - 2;
+    for sample in 0..150 {
+        frame.parts.hwmon.values[fan_index].value = Some(1_000.0 + sample as f32);
+        model.absorb_frame(&frame);
+    }
+    let capacities = (
+        model.fans.capacity(),
+        model.sensors.capacity(),
+        model.pair_fan_buf.capacity(),
+        model.pair_sensor_flat.capacity(),
+        model.cooling.capacity(),
+    );
+    for sample in 0..1_000 {
+        let fan_index = frame.parts.hwmon.values.len() - 2;
+        frame.parts.hwmon.values[fan_index].value = Some(1_000.0 + (sample % 700) as f32);
+        model.absorb_frame(&frame);
+    }
+    assert_eq!(model.fans.len(), 1);
+    assert_eq!(model.fans[0].key, "fan-stable-key");
+    assert_eq!(model.fans[0].history_len, HISTORY_CAP);
+    assert_eq!(
+        (
+            model.fans.capacity(),
+            model.sensors.capacity(),
+            model.pair_fan_buf.capacity(),
+            model.pair_sensor_flat.capacity(),
+            model.cooling.capacity(),
+        ),
+        capacities
+    );
+
+    frame.parts.hwmon.layout = frame.parts.hwmon.layout.as_ref().map(|layout| {
+        let mut renumbered = (**layout).clone();
+        for sensor in &mut renumbered.sensors {
+            if sensor.key == "fan-stable-key" || sensor.key == "fan-target-key" {
+                sensor.chip = 1;
+            }
+        }
+        Arc::new(renumbered)
+    });
+    model.absorb_frame(&frame);
+    assert_eq!(model.fans.len(), 1);
+    assert_eq!(model.fans[0].key, "fan-stable-key");
+    assert_eq!(model.fans[0].chip, "amdgpu");
+}
+
+#[test]
+fn cooling_panel_shows_rpm_target_peak_and_pair() {
+    let mut model = ThermalModel::default();
+    let mut frame = fixture_with_fan();
+    let fan_index = frame.parts.hwmon.values.len() - 2;
+    for sample in 0..60 {
+        let rpm = 1_000.0 + sample as f32 * 10.0;
+        frame.parts.hwmon.values[0].value = Some(40.0 + sample as f32);
+        frame.parts.hwmon.values[fan_index].value = Some(rpm);
+        model.absorb_frame(&frame);
+        if sample == 28 {
+            assert_eq!(model.fans[0].pair, None);
+        }
+        if sample == 29 {
+            assert!(model.fans[0].pair.is_some());
+        }
+    }
+    assert_eq!(model.fans[0].pair, Some("sensor-package".to_owned()));
+    let view = ThermalView(&model);
+    let area = Rect::full(240, 60);
+    let placed = Board::default()
+        .placed(&view, area)
+        .into_iter()
+        .find(|panel| panel.id == super::COOLING)
+        .expect("cooling panel placed");
+    let mut surface = Surface::new(240, 60);
+    view.paint(&mut surface, &placed, placed.rect, 0, &[]);
+    let output = text(&mut surface);
+    assert!(output.contains("fan1"));
+    assert!(output.contains("1590rpm"));
+    assert!(output.contains("target 1800"));
+    assert!(output.contains("peak 1590rpm"));
+    assert!(output.contains("paired: package"));
+}
+
+#[test]
+fn zones_panel_lists_engaged_passive_cooling() {
+    let mut frame = fixture();
+    frame.parts.thermal_zone.cooling.push(
+        thegn_metrics::collect::model::thermal_zone::CoolingAggregate {
+            kind: "Processor".to_owned(),
+            engaged: 2,
+            total: 4,
+        },
+    );
+    let mut model = ThermalModel::default();
+    model.absorb_frame(&frame);
+    let view = ThermalView(&model);
+    let area = Rect::full(240, 60);
+    let placed = Board::default()
+        .placed(&view, area)
+        .into_iter()
+        .find(|panel| panel.id == PanelId("thermal.zones"))
+        .expect("zones panel placed");
+    let mut surface = Surface::new(240, 60);
+    view.paint(&mut surface, &placed, placed.rect, 0, &[]);
+    assert!(text(&mut surface).contains("passive cooling 2/4 Processor"));
+}
+
+#[test]
+fn missing_fan_reading_keeps_gap_blank_in_ascii_and_older_samples_visible() {
+    let mut model = ThermalModel::default();
+    let mut frame = fixture_with_fan();
+    let fan_index = frame.parts.hwmon.values.len() - 2;
+    for sample in 0..10 {
+        frame.parts.hwmon.values[fan_index].value = Some(1_000.0 + sample as f32 * 20.0);
+        model.absorb_frame(&frame);
+    }
+    frame.parts.hwmon.values[fan_index].value = None;
+    model.absorb_frame(&frame);
+    let area = Rect::full(160, 45);
+    let placed = Placed {
+        id: super::COOLING,
+        rect: area,
+        variant: super::FULL.kind,
+    };
+    for unicode in [UnicodeLevel::Full, UnicodeLevel::Ascii] {
+        test_override::with_unicode(unicode, || {
+            let mut surface = Surface::new(160, 45);
+            ThermalView(&model).paint(&mut surface, &placed, area, 0, &[]);
+            let braille = crate::monitor::graphs::table().braille;
+            let rpm = model.fans[0].rpm.map_or_else(
+                || caps::active_glyphs().emdash.to_owned(),
+                |value| format!("{value:.0}rpm"),
+            );
+            let target = model.fans[0]
+                .target
+                .map_or_else(String::new, |value| format!(" target {value:.0}"));
+            let label_width = format!(
+                "{} {}  {rpm}{target}",
+                model.fans[0].chip, model.fans[0].label
+            )
+            .chars()
+            .count();
+            let plot_start = label_width + 1;
+            let graph_rect = crate::monitor::kit::history_rect::graph_rect(
+                Rect {
+                    x: 1 + plot_start,
+                    y: 1,
+                    cols: 160_usize.saturating_sub(2).saturating_sub(plot_start),
+                    rows: 1,
+                },
+                11,
+                braille,
+            );
+            let rendered = text(&mut surface);
+            let rows = rendered.lines().collect::<Vec<_>>();
+            let graph_row = rows[1];
+            let older = graph_row
+                .chars()
+                .nth(graph_rect.x + graph_rect.cols.saturating_sub(2))
+                .expect("older history cell exists");
+            assert!(
+                older != ' ' && older != '\u{2800}',
+                "older real sample cell: {older:?}"
+            );
+            if !braille {
+                let newest = graph_row
+                    .chars()
+                    .nth(graph_rect.x + graph_rect.cols - 1)
+                    .expect("newest history cell exists");
+                assert!(newest == ' ', "newest ASCII cell: {newest:?}");
+            } else {
+                assert!(graph_rect.cols > 0, "braille graph has a visible cell");
+            }
+        });
+    }
+}
+
+#[test]
+fn cooling_panel_fill_reports_every_240_by_60_capability_ratio() {
+    let mut model = ThermalModel::default();
+    let mut frame = fixture_with_fan();
+    let fan_index = frame.parts.hwmon.values.len() - 2;
+    for sample in 0..HISTORY_CAP {
+        frame.parts.hwmon.values[fan_index].value = Some(900.0 + (sample % 41) as f32 * 30.0);
+        model.absorb_frame(&frame);
+    }
+    let area = Rect::full(240, 60);
+    let view = ThermalView(&model);
+    assert!(
+        Board::default()
+            .placed(&view, area)
+            .iter()
+            .any(|panel| panel.id == super::COOLING)
+    );
+    let mut ratios = Vec::new();
+    for (depth, unicode) in [
+        (ColorDepth::Truecolor, UnicodeLevel::Full),
+        (ColorDepth::Ansi16, UnicodeLevel::Full),
+        (ColorDepth::Truecolor, UnicodeLevel::Ascii),
+        (ColorDepth::Ansi16, UnicodeLevel::Ascii),
+    ] {
+        test_override::with_color(depth, || {
+            test_override::with_unicode(unicode, || {
+                let mut surface = Surface::new(240, 60);
+                Board::default().paint(&view, &mut surface, area, 0, &[]);
+                ratios.push((depth, unicode, fill_ratio(&surface, area)));
+            });
+        });
+    }
+    let all = format!("{ratios:?}");
+    // density follow-up (batch 53): estimated, primary sets from the printed value
+    for (depth, unicode, ratio) in ratios {
+        assert!(
+            ratio >= 0.33,
+            "fill ratio {ratio:.3} for {depth:?} {unicode:?}; all ratios: {all}"
+        );
+    }
 }
 
 #[test]

@@ -69,6 +69,20 @@ pub(crate) struct ProcSnapshotView {
 /// own before anything is signalled.
 #[derive(Debug, Clone)]
 enum Confirm {
+    /// Choose a signal before the usual identity-checked confirmation.
+    SignalMenu {
+        pid: u32,
+        start_time: u64,
+        start_ticks: Option<u64>,
+        label: String,
+        cursor: usize,
+    },
+    /// Deliver TERM to the sampled process tree after explicit confirmation.
+    SignalTree {
+        label: String,
+        targets: Vec<tabs::procs::FamilyEntry>,
+        excluded: usize,
+    },
     /// Deliver `stage` to a process.
     Signal {
         pid: u32,
@@ -438,6 +452,8 @@ pub struct MonitorOverlay {
     proc_rows: Vec<procs_view::ProcRow>,
     proc_invalid_terms: Vec<procs_view::procs_query::InvalidTerm>,
     proc_primed: bool,
+    /// Unfiltered sampled process identities used by the TERM tree action.
+    proc_family: Vec<tabs::procs::FamilyEntry>,
     lists: invalidation::Lists,
     /// The last body was Processes with these header/display-only inputs.
     process_body: Option<(u64, crate::model_eq::ProcessViewState, bool, bool)>,
@@ -454,6 +470,8 @@ pub struct MonitorOverlay {
     /// Owned + foreign container rows behind the Containers tab, cached at
     /// rebuild so a key handler can resolve `sel` without a model borrow.
     container_rows: Vec<ContainerRowMeta>,
+    container_inventory: Vec<thegn_core::sandbox::ContainerInfo>,
+    container_footprint: Option<thegn_core::sandbox_manage::ContainerFootprint>,
     /// An action for the loop to perform (clean, or a Containers row action);
     /// drained via [`Self::take_action`]. ONE slot for both families — a key
     /// raises at most one action, and the loop drains after every keystroke.
@@ -492,6 +510,7 @@ pub struct MonitorOverlay {
     memory: tabs::memory::view::MemoryModel,
     thermal: tabs::thermal::view::ThermalModel,
     disk: tabs::disk::view::DiskModel,
+    containers: tabs::containers::view::ContainersModel,
 }
 
 impl MonitorOverlay {
@@ -529,10 +548,13 @@ impl MonitorOverlay {
             proc_rows: Vec::new(),
             proc_invalid_terms: Vec::new(),
             proc_primed: false,
+            proc_family: Vec::new(),
             lists: invalidation::Lists::default(),
             process_body: None,
             disk_rows: Vec::new(),
             container_rows: Vec::new(),
+            container_inventory: Vec::new(),
+            container_footprint: None,
             confirm: None,
             last_termed: None,
             status: None,
@@ -557,6 +579,7 @@ impl MonitorOverlay {
             memory: tabs::memory::view::MemoryModel::default(),
             thermal: tabs::thermal::view::ThermalModel::default(),
             disk: tabs::disk::view::DiskModel::default(),
+            containers: tabs::containers::view::ContainersModel::default(),
         };
         ov.rebuild(model, ctx, false);
         ov
@@ -633,7 +656,9 @@ impl MonitorOverlay {
 
     fn view(&self) -> board::ActiveView<'_> {
         match self.tab {
-            MonitorTab::Cpu => board::ActiveView::Cpu(tabs::cpu::view::CpuView(&self.cpu)),
+            MonitorTab::Cpu => {
+                board::ActiveView::Cpu(tabs::cpu::view::CpuView::with_cursor(&self.cpu, self.sel))
+            }
             MonitorTab::Gpu if !self.gpu.has_engine_devices() => {
                 board::ActiveView::Legacy(board::LegacyTab)
             }
@@ -655,6 +680,14 @@ impl MonitorOverlay {
                 &self.disk_rows,
                 self.sel,
             )),
+            MonitorTab::Containers => {
+                board::ActiveView::Containers(tabs::containers::view::ContainersView::new(
+                    &self.containers,
+                    &self.container_inventory,
+                    self.container_footprint,
+                    self.sel,
+                ))
+            }
             _ => board::ActiveView::for_tab(self.tab, &self.overview),
         }
     }
@@ -691,6 +724,10 @@ impl MonitorOverlay {
         }
         if self.tab == MonitorTab::Disk {
             self.disk.absorb_frame(frame);
+            return true;
+        }
+        if self.tab == MonitorTab::Containers {
+            self.containers.absorb_frame(frame);
             return true;
         }
         self.overview.absorb_frame(frame);
@@ -767,6 +804,8 @@ impl MonitorOverlay {
         // without a model borrow.
         if self.tab == MonitorTab::Containers {
             self.container_rows = tabs::containers::row_meta(model);
+            self.container_inventory.clone_from(&model.containers);
+            self.container_footprint = model.container_footprint;
         }
         self.clamp_sel();
         // Bind the build to a local so the immutable borrows of `self.proc_rows`
@@ -1366,6 +1405,105 @@ impl MonitorOverlay {
     /// Confirmation sub-mode: `y` performs, `n`/Esc cancels, anything else
     /// leaves the prompt standing.
     fn confirm_key(&mut self, key: &KeyCode) -> MonitorOutcome {
+        if matches!(self.confirm.as_ref(), Some(Confirm::SignalMenu { .. })) {
+            let picked = if let Some(Confirm::SignalMenu { cursor, .. }) = self.confirm.as_mut() {
+                match key {
+                    KeyCode::UpArrow => {
+                        *cursor = cursor.saturating_sub(1);
+                        None
+                    }
+                    KeyCode::DownArrow => {
+                        *cursor = cursor
+                            .saturating_add(1)
+                            .min(tabs::procs::menu_len().saturating_sub(1));
+                        None
+                    }
+                    KeyCode::Enter | KeyCode::Char('\r' | '\n') => tabs::procs::menu_pick(*cursor),
+                    KeyCode::Char(c) => tabs::procs::menu_pick_key(*c),
+                    _ => None,
+                }
+            } else {
+                None
+            };
+            if let Some(pick) = picked
+                && let Some(Confirm::SignalMenu {
+                    pid,
+                    start_time,
+                    start_ticks,
+                    label,
+                    ..
+                }) = self.confirm.take()
+            {
+                match pick {
+                    tabs::procs::MenuPick::Signal(stage) if stage.needs_confirm() => {
+                        self.confirm = Some(Confirm::Signal {
+                            pid,
+                            start_time,
+                            start_ticks,
+                            label,
+                            stage,
+                        });
+                    }
+                    tabs::procs::MenuPick::Signal(stage) => {
+                        if self
+                            .proc_rows
+                            .iter()
+                            .any(|row| (row.pid, row.start_time) == (pid, start_time))
+                        {
+                            self.perform_signal(
+                                pid,
+                                crate::platform::ProcStart {
+                                    secs: start_time,
+                                    ticks: start_ticks,
+                                },
+                                &label,
+                                stage,
+                            );
+                        } else {
+                            self.status = Some(format!(
+                                "{label}: process changed or left the sampled list; select it again"
+                            ));
+                        }
+                    }
+                    tabs::procs::MenuPick::TermTree => {
+                        let mut targets = Vec::with_capacity(256);
+                        match tabs::procs::term_tree_targets(
+                            &self.proc_family,
+                            (pid, start_time),
+                            std::process::id(),
+                            crate::platform::parent_pid(),
+                            &mut targets,
+                        ) {
+                            tabs::procs::TreePlan::MissingRoot => {
+                                self.status = Some(format!(
+                                    "{label}: process changed or left the sampled list; select it again"
+                                ));
+                            }
+                            tabs::procs::TreePlan::ContainsThegn => {
+                                self.status = Some(format!(
+                                    "{label}: the tree contains thegn itself; not signalled"
+                                ));
+                            }
+                            tabs::procs::TreePlan::Ready {
+                                truncated,
+                                excluded,
+                            } => {
+                                debug_assert_eq!(truncated, excluded > 0);
+                                self.confirm = Some(Confirm::SignalTree {
+                                    label,
+                                    targets,
+                                    excluded,
+                                });
+                            }
+                        }
+                    }
+                }
+            } else if crate::input::is_escape_key(key) || matches!(key, KeyCode::Char('n' | 'N')) {
+                self.confirm = None;
+                self.status = Some("cancelled".into());
+            }
+            return MonitorOutcome::Pending;
+        }
         if matches!(key, KeyCode::Char('y' | 'Y')) {
             match self.confirm.take() {
                 Some(Confirm::Signal {
@@ -1397,6 +1535,68 @@ impl MonitorOverlay {
                         ));
                     }
                 }
+                Some(Confirm::SignalTree {
+                    label,
+                    targets,
+                    excluded,
+                }) => {
+                    let total = targets.len();
+                    let mut sent = 0;
+                    let mut vanished = 0;
+                    let mut refused = 0;
+                    let mut first_error = None;
+                    for target in &targets {
+                        if !self.proc_family.iter().any(|entry| {
+                            (entry.pid, entry.start.secs) == (target.pid, target.start.secs)
+                        }) {
+                            vanished += 1;
+                            continue;
+                        }
+                        match tabs::procs::deliver_signal(
+                            target.pid,
+                            target.start,
+                            crate::platform::ProcSignal::Terminate,
+                        ) {
+                            Ok(()) => sent += 1,
+                            Err(crate::platform::SignalError::Changed) => vanished += 1,
+                            Err(crate::platform::SignalError::Failed(error)) => {
+                                refused += 1;
+                                if first_error.is_none() {
+                                    first_error = Some(error);
+                                }
+                            }
+                        }
+                    }
+                    let mut status = format!(
+                        "sent SIGTERM to {sent} of {total} processes in the tree of {label}"
+                    );
+                    if vanished > 0 {
+                        status.push_str(&format!(" ({vanished} vanished"));
+                        if refused > 0 {
+                            status.push_str(&format!(
+                                ", {refused} refused: {}",
+                                first_error.as_deref().unwrap_or("unknown error")
+                            ));
+                        }
+                        status.push(')');
+                    } else if refused > 0 {
+                        status.push_str(&format!(
+                            " ({refused} refused: {})",
+                            first_error.as_deref().unwrap_or("unknown error")
+                        ));
+                    }
+                    if excluded > 0 {
+                        if vanished > 0 || refused > 0 {
+                            status.truncate(status.len() - 1);
+                            status.push_str(", first 256 only)");
+                        } else {
+                            status.push_str(" (first 256 only)");
+                        }
+                    }
+                    self.status = Some(status);
+                }
+                // The menu returns before this branch, so this arm is unreachable.
+                Some(menu @ Confirm::SignalMenu { .. }) => self.confirm = Some(menu),
                 Some(Confirm::Clean { path, label }) => {
                     self.pending_action = Some(MonitorAction::CleanWorktree(path));
                     self.status = Some(format!("cleaning {label}…"));
@@ -1635,6 +1835,7 @@ impl MonitorOverlay {
     /// takes an explicit input struct rather than `&self` so the hint set is
     /// testable without an overlay.
     fn footer(&self) -> Line {
+        let placed = self.placed_panels();
         footer::line(footer::FooterInput {
             tab: self.tab,
             prefs: &self.prefs,
@@ -1645,8 +1846,12 @@ impl MonitorOverlay {
             status: self.status.as_deref(),
             paused: self.paused,
             container_ours: self.container_rows.get(self.sel).is_some_and(|r| r.ours),
-            disk_rows: self.disk_rows.len(),
-            board_panels: self.placed_panels().len(),
+            disk_rows: if self.worktrees_placed_in(&placed) {
+                self.disk_rows.len()
+            } else {
+                0
+            },
+            board_panels: placed.len(),
             board_zoomed: self.board.is_zoomed(),
         })
     }

@@ -73,6 +73,7 @@ pub struct ProviderEntry {
     /// Lane rotation strategy: `roundrobin` | `failover` | `random` | `weighted`.
     pub key_strategy: String,
     /// Per-lane weights aligned to the resolved key order (weighted strategy).
+    /// An empty list with `weighted` selects uniform all-ones weights.
     pub key_weights: Vec<u32>,
     /// Requests per minute for this provider's shared-quota identity.
     pub rpm: f64,
@@ -265,6 +266,13 @@ impl Default for ModelProxyConfig {
 /// The reserved alias value that selects the deterministic `auto` tier classifier.
 pub const AUTO_ALIAS: &str = "@auto";
 
+/// Maximum per-million-token price accepted for a model-proxy provider.
+pub const MAX_PRICE_USD_PER_MTOK: f64 = 1_000_000.0;
+/// Maximum USD ceiling accepted for a model-proxy budget scope.
+pub const MAX_BUDGET_USD: f64 = 1_000_000_000.0;
+/// Maximum individual key weight accepted for weighted key rotation.
+pub const MAX_KEY_WEIGHT: u32 = 1_000_000;
+
 impl ModelProxyConfig {
     /// Whether `listen` binds a loopback (or unspecified-but-local) address.
     pub fn listen_is_loopback(&self) -> bool {
@@ -331,6 +339,42 @@ impl ModelProxyConfig {
                     crate::proxy::ratelimit::MAX_RATE
                 ));
             }
+            for (field, price) in [
+                ("input_usd_per_mtok", p.input_usd_per_mtok),
+                ("output_usd_per_mtok", p.output_usd_per_mtok),
+            ] {
+                if !price.is_finite() || !(0.0..=MAX_PRICE_USD_PER_MTOK).contains(&price) {
+                    errs.push(format!(
+                        "[[model_proxy.providers]] name = {:?}: {field} must be finite and between 0 and {}",
+                        p.name, MAX_PRICE_USD_PER_MTOK
+                    ));
+                }
+            }
+            if !p.key_weights.is_empty() {
+                if crate::proxy::creds::KeyStrategy::parse(&p.key_strategy)
+                    != crate::proxy::creds::KeyStrategy::Weighted
+                {
+                    errs.push(format!(
+                        "[[model_proxy.providers]] name = {:?}: key_weights requires key_strategy = \"weighted\"",
+                        p.name
+                    ));
+                }
+                if p.key_weights.len() != p.secret_refs().len() {
+                    errs.push(format!(
+                        "[[model_proxy.providers]] name = {:?}: key_weights length must match the number of declared secret keys",
+                        p.name
+                    ));
+                }
+                if p.key_weights
+                    .iter()
+                    .any(|weight| !(1..=MAX_KEY_WEIGHT).contains(weight))
+                {
+                    errs.push(format!(
+                        "[[model_proxy.providers]] name = {:?}: every key_weights value must be between 1 and {}",
+                        p.name, MAX_KEY_WEIGHT
+                    ));
+                }
+            }
         }
         if self.listen.parse::<std::net::SocketAddr>().is_err() {
             errs.push(format!(
@@ -358,6 +402,12 @@ impl ModelProxyConfig {
         let known: std::collections::HashSet<&str> =
             self.providers.iter().map(|p| p.name.as_str()).collect();
         for r in &self.routes {
+            if r.auto_max_tokens == Some(0) {
+                errs.push(format!(
+                    "[[model_proxy.routes]] name = {:?}: auto_max_tokens must be at least 1 when set",
+                    r.name
+                ));
+            }
             for b in &r.backends {
                 if !known.contains(b.provider.as_str()) {
                     errs.push(format!(
@@ -366,6 +416,21 @@ impl ModelProxyConfig {
                         r.name, b.provider
                     ));
                 }
+            }
+        }
+        for (scope, limit) in &self.budget.scopes {
+            let section = format!("[model_proxy.budget.scopes.{scope:?}]");
+            if limit.tokens.is_some_and(|tokens| tokens < 1) {
+                errs.push(format!("{section}: tokens must be at least 1 when set"));
+            }
+            if limit
+                .cost_usd
+                .is_some_and(|cost| !cost.is_finite() || cost <= 0.0 || cost > MAX_BUDGET_USD)
+            {
+                errs.push(format!(
+                    "{section}: cost_usd must be finite and in (0, {}] when set",
+                    MAX_BUDGET_USD
+                ));
             }
         }
         // Aliases must target a real route (or the reserved @auto).
@@ -646,6 +711,206 @@ mod tests {
                 "burst {burst:?} was accepted"
             );
         }
+    }
+
+    #[test]
+    fn provider_prices_are_bounded_and_field_specific() {
+        for (field, price) in [
+            ("input_usd_per_mtok", f64::NAN),
+            ("input_usd_per_mtok", f64::INFINITY),
+            ("input_usd_per_mtok", f64::NEG_INFINITY),
+            ("input_usd_per_mtok", -0.01),
+            ("input_usd_per_mtok", MAX_PRICE_USD_PER_MTOK + 1.0),
+            ("output_usd_per_mtok", f64::NAN),
+            ("output_usd_per_mtok", f64::INFINITY),
+            ("output_usd_per_mtok", f64::NEG_INFINITY),
+            ("output_usd_per_mtok", -0.01),
+            ("output_usd_per_mtok", MAX_PRICE_USD_PER_MTOK + 1.0),
+        ] {
+            let mut config = ModelProxyConfig {
+                enabled: true,
+                ..Default::default()
+            };
+            let mut entry = provider("priced", "env:KEY");
+            match field {
+                "input_usd_per_mtok" => entry.input_usd_per_mtok = price,
+                "output_usd_per_mtok" => entry.output_usd_per_mtok = price,
+                _ => unreachable!(),
+            }
+            config.providers.push(entry);
+            assert!(
+                config.validate().iter().any(|error| error.contains(field)),
+                "{field} = {price:?} was accepted"
+            );
+        }
+
+        let mut config = ModelProxyConfig {
+            enabled: true,
+            ..Default::default()
+        };
+        let mut free = provider("free", "env:FREE_KEY");
+        free.input_usd_per_mtok = 0.0;
+        free.output_usd_per_mtok = 0.27;
+        config.providers.push(free);
+        assert!(config.validate().is_empty(), "{:?}", config.validate());
+    }
+
+    #[test]
+    fn key_weights_require_valid_weighted_key_alignment() {
+        for weights in [vec![0], vec![MAX_KEY_WEIGHT + 1]] {
+            let mut config = ModelProxyConfig {
+                enabled: true,
+                ..Default::default()
+            };
+            let mut entry = provider("weighted", "env:KEY_A");
+            entry.key_strategy = "weighted".into();
+            let shown = weights.clone();
+            entry.key_weights = weights;
+            config.providers.push(entry);
+            assert!(
+                config
+                    .validate()
+                    .iter()
+                    .any(|error| error.contains("key_weights")),
+                "invalid weights were accepted: {:?}",
+                shown
+            );
+        }
+
+        let mut wrong_length = ModelProxyConfig {
+            enabled: true,
+            ..Default::default()
+        };
+        let mut entry = provider("weighted", "env:KEY_A");
+        entry.api_keys = vec!["env:KEY_B".into()];
+        entry.key_strategy = "weighted".into();
+        entry.key_weights = vec![3];
+        wrong_length.providers.push(entry);
+        assert!(
+            wrong_length
+                .validate()
+                .iter()
+                .any(|error| error.contains("key_weights length")),
+            "misaligned key_weights were accepted"
+        );
+
+        let mut wrong_strategy = ModelProxyConfig {
+            enabled: true,
+            ..Default::default()
+        };
+        let mut entry = provider("rotating", "env:KEY_A");
+        entry.key_strategy = "roundrobin".into();
+        entry.key_weights = vec![3];
+        wrong_strategy.providers.push(entry);
+        assert!(
+            wrong_strategy
+                .validate()
+                .iter()
+                .any(|error| error.contains("key_weights")),
+            "key_weights with roundrobin were accepted"
+        );
+
+        let mut valid = ModelProxyConfig {
+            enabled: true,
+            ..Default::default()
+        };
+        let mut entry = provider("weighted", "env:KEY_A");
+        entry.api_keys = vec!["env:KEY_B".into()];
+        entry.key_strategy = "weighted".into();
+        entry.key_weights = vec![3, 1];
+        valid.providers.push(entry);
+        assert!(valid.validate().is_empty(), "{:?}", valid.validate());
+    }
+
+    #[test]
+    fn zero_auto_tier_limit_is_rejected_by_route_name() {
+        let mut config = ModelProxyConfig {
+            enabled: true,
+            ..Default::default()
+        };
+        config.routes.push(RouteEntry {
+            name: "empty-tier".into(),
+            auto_max_tokens: Some(0),
+            ..Default::default()
+        });
+        assert!(
+            config
+                .validate()
+                .iter()
+                .any(|error| { error.contains("empty-tier") && error.contains("auto_max_tokens") })
+        );
+    }
+
+    #[test]
+    fn budget_scope_limits_are_validated_even_when_accounting_only() {
+        for tokens in [0, -5] {
+            let mut config = ModelProxyConfig {
+                enabled: true,
+                ..Default::default()
+            };
+            config.budget.scopes.insert(
+                "global".into(),
+                BudgetLimit {
+                    tokens: Some(tokens),
+                    ..Default::default()
+                },
+            );
+            assert!(
+                config.validate().iter().any(|error| {
+                    error.contains("[model_proxy.budget.scopes.\"global\"]")
+                        && error.contains("tokens")
+                }),
+                "tokens = {tokens} was accepted"
+            );
+        }
+
+        for cost in [
+            f64::NAN,
+            f64::INFINITY,
+            f64::NEG_INFINITY,
+            -1.0,
+            0.0,
+            MAX_BUDGET_USD * 2.0,
+        ] {
+            let mut config = ModelProxyConfig {
+                enabled: true,
+                ..Default::default()
+            };
+            config.budget.scopes.insert(
+                "global".into(),
+                BudgetLimit {
+                    cost_usd: Some(cost),
+                    ..Default::default()
+                },
+            );
+            assert!(
+                config.validate().iter().any(|error| {
+                    error.contains("[model_proxy.budget.scopes.\"global\"]")
+                        && error.contains("cost_usd")
+                }),
+                "cost_usd = {cost:?} was accepted"
+            );
+        }
+
+        let mut valid = ModelProxyConfig {
+            enabled: true,
+            ..Default::default()
+        };
+        valid.budget.scopes.insert(
+            "global".into(),
+            BudgetLimit {
+                tokens: None,
+                cost_usd: Some(12.5),
+            },
+        );
+        valid.budget.scopes.insert(
+            "tokens-only".into(),
+            BudgetLimit {
+                tokens: Some(1),
+                cost_usd: None,
+            },
+        );
+        assert!(valid.validate().is_empty(), "{:?}", valid.validate());
     }
 
     #[test]
