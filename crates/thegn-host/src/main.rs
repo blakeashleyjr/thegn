@@ -1139,6 +1139,14 @@ fn run_main() -> anyhow::Result<()> {
     rt.block_on(handlers::daemon_lifecycle::flush_orphan_kills(
         std::time::Duration::from_secs(2),
     ));
+    let still_running =
+        crate::fold_cancel::APP_FOLD_WORKERS.cancel_and_wait(std::time::Duration::from_secs(4));
+    if still_running > 0 {
+        tracing::warn!(
+            still_running,
+            "background merge work did not stop before exit; its gate may still be running"
+        );
+    }
     rt.shutdown_background();
     report_kept_sessions(handlers::daemon_lifecycle::kept_sessions());
     // The outer process wrapper prints the error after the compositor has torn
