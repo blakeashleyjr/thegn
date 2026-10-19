@@ -76,9 +76,29 @@ pub fn run(cfg: &Config, action: Action, config_path: PathBuf) -> Result<()> {
     match action {
         Action::Set { name } => set(&name),
         Action::Rm { name } => {
-            secret::forget(&name);
-            outln!("removed secret {name} (keyring + file, best-effort)");
-            Ok(())
+            let report = secret::forget_with_report(&name);
+            let keyring = match &report.keyring {
+                secret::ForgetKeyringOutcome::Removed => "removed".to_string(),
+                secret::ForgetKeyringOutcome::Failed(error) => format!("failed: {error}"),
+                secret::ForgetKeyringOutcome::OutcomeUnknown => "outcome unknown".to_string(),
+            };
+            let file = match &report.file {
+                secret::ForgetFileOutcome::Removed => "removed".to_string(),
+                secret::ForgetFileOutcome::Absent => "absent".to_string(),
+                secret::ForgetFileOutcome::Failed(error) => format!("failed: {error}"),
+            };
+            outln!("secret {name}: keyring {keyring}; file {file}");
+            match report.keyring {
+                secret::ForgetKeyringOutcome::OutcomeUnknown => {
+                    bail!(
+                        "keyring removal outcome unknown for `{name}`; retry once the keyring responds"
+                    )
+                }
+                secret::ForgetKeyringOutcome::Failed(error) => {
+                    bail!("keyring removal failed for `{name}`: {error}")
+                }
+                secret::ForgetKeyringOutcome::Removed => report.ensure_file_removed(&name),
+            }
         }
         Action::List { json } => list(cfg, json),
         Action::Migrate { dry_run } => migrate(cfg, &config_path, dry_run),
