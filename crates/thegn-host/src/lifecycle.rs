@@ -589,7 +589,7 @@ mod tests {
         let mut session = crate::session::Session::default();
         let mut pairs = Vec::new();
         let mut expected_remote = HashSet::new();
-        for index in 0..36 {
+        for index in 0_u32..36 {
             let path = format!("/fixture/worktree-{index}");
             session.worktrees.push(crate::session::WorktreeGroup::new(
                 format!("tab-{index}"),
@@ -648,6 +648,7 @@ mod tests {
         assert_eq!(
             thegn_core::db_open_stats::total_opens() - before_control,
             3,
+            // This exact count relies on nextest running each test in its own process.
             "three uncached lookups must record three DB opens"
         );
     }

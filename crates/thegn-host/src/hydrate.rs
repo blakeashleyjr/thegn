@@ -1899,6 +1899,7 @@ fn collect_sidebar_status(
             let prior = prior_for_scan.get(p).cloned();
             let urgent = active_path.as_deref() == Some(p.as_str());
             let path = p.clone();
+            let loc = locations.loc(std::path::Path::new(p));
             let cfg = std::sync::Arc::clone(&cfg);
             let job: GlyphScanJob = Box::new(move || {
                 let wt = std::path::Path::new(&path);
@@ -1906,7 +1907,6 @@ fn collect_sidebar_status(
                     thegn_core::repo::main_worktree(wt).unwrap_or_else(|| wt.to_path_buf());
                 let include_submodules =
                     cfg.repo_git(&repo_root).submodules != thegn_core::config::SubmoduleMode::Off;
-                let loc = GitLoc::for_worktree(wt);
                 // One batched round-trip for a bridged loc (status + ahead/
                 // behind + branch), gix/CLI reads for a local one.
                 let reads =
