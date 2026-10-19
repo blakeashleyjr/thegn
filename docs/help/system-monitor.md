@@ -131,12 +131,12 @@ used, free and the component breakdown with bounded usage history from the
 selected telemetry window, scaled against total memory; frame samples and
 telemetry history use separate rings. At large sizes it adds bounded anon,
 cache, slab and free small multiples against total memory. `memory.verdict`
-summarizes memory health;
-`memory.pressure` shows PSI some/full pressure and its history; `memory.swap`
-appears when swap exists and includes selected-window history scaled against
-total swap, plus zram original, compressed and device sizes when available;
-`memory.paging` shows reclaim, scan and refault histories with labelled window
-peaks alongside current rates; `memory.kernel` shows minor and major fault
+summarizes memory health; `memory.pressure` shows PSI some/full pressure and its
+history; `memory.swap` appears when swap exists and includes selected-window
+history scaled against total swap, plus zram original, compressed and device
+sizes when available; `memory.paging` shows reclaim, scan and refault histories
+with labelled window peaks alongside current rates; `memory.kernel` shows minor
+and major fault
 histories, page-in/out rates, THP and hugepage details, and dirty/writeback
 histories; and `memory.limit` shows the process cgroup
 limit and thegn.slice usage history. A missing limit is shown as
