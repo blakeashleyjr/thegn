@@ -23293,8 +23293,12 @@ async fn event_loop<T: Terminal>(
                             match target {
                                 Some((wt, port)) => {
                                     let stopped = share_supervisor.stop(&wt, Some(port));
-                                    let did_stop = !stopped.is_empty();
-                                    crate::handlers::host::queue_stopped_share_deletes(wt, stopped);
+                                    let did_stop =
+                                        !stopped.removed.is_empty() || !stopped.pending.is_empty();
+                                    crate::handlers::host::queue_stopped_share_deletes(
+                                        wt,
+                                        stopped.removed,
+                                    );
                                     model.shares = current_share_views(&share_supervisor, &session);
                                     model.status = if !did_stop {
                                         format!("Share :{port} was already down")

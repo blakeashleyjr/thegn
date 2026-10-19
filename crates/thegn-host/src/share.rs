@@ -45,10 +45,17 @@ pub enum ShareEvent {
         generation: u64,
         provider: &'static str,
         error: String,
+        teardown_unverified: bool,
     },
 }
 
 pub(crate) enum SharePersist {
+    MarkFailed {
+        worktree: String,
+        port: u16,
+        generation: u64,
+        provider: String,
+    },
     Upsert {
         worktree: String,
         port: u16,
@@ -83,8 +90,25 @@ pub(crate) fn share_persist_for(ev: &ShareEvent) -> SharePersist {
             worktree,
             port,
             generation,
-        }
-        | ShareEvent::Failed {
+        } => SharePersist::DeleteIfOwned {
+            worktree: worktree.clone(),
+            port: *port,
+            generation: *generation,
+        },
+        ShareEvent::Failed {
+            worktree,
+            port,
+            generation,
+            provider,
+            teardown_unverified: true,
+            ..
+        } => SharePersist::MarkFailed {
+            worktree: worktree.clone(),
+            port: *port,
+            generation: *generation,
+            provider: (*provider).to_string(),
+        },
+        ShareEvent::Failed {
             worktree,
             port,
             generation,
@@ -99,6 +123,18 @@ pub(crate) fn share_persist_for(ev: &ShareEvent) -> SharePersist {
 
 pub(crate) fn apply_share_persist(db: &thegn_core::db::Db, op: SharePersist) {
     match op {
+        SharePersist::MarkFailed {
+            worktree,
+            port,
+            generation,
+            provider,
+        } => {
+            if let Err(error) =
+                db.upsert_share(&worktree, port, generation, &provider, None, "failed")
+            {
+                tracing::debug!(target: "thegn::db", %error, "share failure persist failed");
+            }
+        }
         SharePersist::Upsert {
             worktree,
             port,
@@ -231,24 +267,37 @@ impl ShareInstance {
         if let Some(td) = self.shared.teardown.lock().unwrap().clone() {
             let tx = self.event_tx.clone();
             let waker = self.event_waker.clone();
+            let worker_tx = tx.clone();
+            let worker_waker = waker.clone();
             let worktree = self.worktree.clone();
             let port = self.port;
             let generation = self.generation;
+            let provider = self.provider;
             let spawn = std::thread::Builder::new()
                 .name("tgshare-down".into())
                 .spawn(move || {
                     crate::platform::qos::set_self(crate::platform::qos::Qos::Background);
-                    thegn_svc::share::serve_down(&td.sidecar, &td.serve);
-                    if let Some(tx) = tx
-                        && let Err(error) = tx.send(ShareEvent::Down {
+                    let event = match thegn_svc::share::serve_down(&td.sidecar, &td.serve) {
+                        Ok(()) => ShareEvent::Down {
                             worktree,
                             port,
                             generation,
-                        })
+                        },
+                        Err(error) => ShareEvent::Failed {
+                            worktree,
+                            port,
+                            generation,
+                            provider,
+                            error: format!("{error}; stop it again to retry"),
+                            teardown_unverified: true,
+                        },
+                    };
+                    if let Some(tx) = worker_tx
+                        && let Err(error) = tx.send(event)
                     {
                         tracing::debug!(%error, "share teardown acknowledgement receiver is gone");
                     }
-                    if let Some(waker) = waker
+                    if let Some(waker) = worker_waker
                         && let Err(error) = waker.wake()
                     {
                         tracing::debug!(%error, "share teardown waker is unavailable");
@@ -256,6 +305,25 @@ impl ShareInstance {
                 });
             if let Err(error) = spawn {
                 tracing::warn!(%error, "could not spawn share teardown worker");
+                if let Some(tx) = tx
+                    && let Err(send_error) = tx.send(ShareEvent::Failed {
+                        worktree: self.worktree.clone(),
+                        port: self.port,
+                        generation: self.generation,
+                        provider: self.provider,
+                        error: format!(
+                            "share: teardown unverified; could not start teardown worker: {error}; stop it again to retry"
+                        ),
+                        teardown_unverified: true,
+                    })
+                {
+                    tracing::debug!(%send_error, "share teardown failure receiver is gone");
+                }
+                if let Some(waker) = waker
+                    && let Err(wake_error) = waker.wake()
+                {
+                    tracing::debug!(%wake_error, "share teardown waker is unavailable");
+                }
             }
         }
     }
@@ -266,6 +334,11 @@ impl ShareInstance {
 #[derive(Default)]
 pub struct ShareSupervisor {
     instances: Vec<ShareInstance>,
+}
+
+pub(crate) struct StopShares {
+    pub(crate) removed: Vec<(u16, u64)>,
+    pub(crate) pending: Vec<(u16, u64)>,
 }
 
 static NEXT_SHARE_GENERATION: AtomicU64 = AtomicU64::new(1);
@@ -342,9 +415,22 @@ impl ShareSupervisor {
         // thread is gone (it never emits `Down`), so without this eviction the
         // port stayed "already sharing" for the rest of the session.
         self.instances.retain(|i| {
-            !(i.worktree == worktree && i.port == port && matches!(i.state, ShareState::Failed(_)))
+            !(i.worktree == worktree
+                && i.port == port
+                && matches!(i.state, ShareState::Failed(_))
+                && i.shared.teardown.lock().unwrap().is_none())
         });
         if self.has(worktree, port) {
+            if self.instances.iter().any(|instance| {
+                instance.worktree == worktree
+                    && instance.port == port
+                    && matches!(instance.state, ShareState::Failed(_))
+                    && instance.shared.teardown.lock().unwrap().is_some()
+            }) {
+                return Err(format!(
+                    "teardown of :{port} is unverified; stop it to retry"
+                ));
+            }
             return Err(format!("already sharing port {port}"));
         }
         let label = thegn_core::share::label_for(worktree);
@@ -424,6 +510,7 @@ impl ShareSupervisor {
                 port,
                 generation,
                 error,
+                teardown_unverified,
                 ..
             } => match self
                 .instances
@@ -431,6 +518,13 @@ impl ShareSupervisor {
                 .find(|i| i.worktree == worktree && i.port == port && i.generation == generation)
                 .map(|i| i.state.clone())
             {
+                Some(_) if teardown_unverified => {
+                    let Some(i) = self.find_mut(&worktree, port, generation) else {
+                        return false;
+                    };
+                    i.state = ShareState::Failed(error);
+                    true
+                }
                 Some(ShareState::Starting | ShareState::Up(_)) => {
                     let Some(i) = self.find_mut(&worktree, port, generation) else {
                         return false;
@@ -467,17 +561,31 @@ impl ShareSupervisor {
         }
     }
 
-    /// Stop shares on `worktree`: a specific `port`, or all (`None`). Returns
-    /// the stopped `(port, generation)` pairs — callers use them for DB cleanup, which must key off
-    /// the supervisor's own state, never a possibly-stale render mirror.
-    pub fn stop(&mut self, worktree: &str, port: Option<u16>) -> Vec<(u16, u64)> {
-        let mut stopped = Vec::new();
-        // Failed instances already received a terminal event and have no
-        // worker left to await. Remove them before mutating the live records.
+    /// Stop shares on `worktree`: a specific `port`, or all (`None`). `removed`
+    /// pairs can be deleted immediately; `pending` pairs have sidecar teardown
+    /// workers whose terminal events own persistence.
+    pub(crate) fn stop(&mut self, worktree: &str, port: Option<u16>) -> StopShares {
+        self.stop_with(worktree, port, ShareInstance::kill)
+    }
+
+    fn stop_with(
+        &mut self,
+        worktree: &str,
+        port: Option<u16>,
+        mut kill: impl FnMut(&ShareInstance),
+    ) -> StopShares {
+        let mut stopped = StopShares {
+            removed: Vec::new(),
+            pending: Vec::new(),
+        };
+        // A failed instance without teardown has no worker left to await.
         self.instances.retain(|i| {
             let matched = i.worktree == worktree && port.is_none_or(|p| p == i.port);
-            if matched && matches!(i.state, ShareState::Failed(_)) {
-                stopped.push((i.port, i.generation));
+            if matched
+                && matches!(i.state, ShareState::Failed(_))
+                && i.shared.teardown.lock().unwrap().is_none()
+            {
+                stopped.removed.push((i.port, i.generation));
                 false
             } else {
                 true
@@ -486,8 +594,14 @@ impl ShareSupervisor {
         for i in &mut self.instances {
             let matched = i.worktree == worktree && port.is_none_or(|p| p == i.port);
             if matched && !matches!(i.state, ShareState::Stopping) {
-                stopped.push((i.port, i.generation));
-                i.kill();
+                let teardown_pending = i.shared.teardown.lock().unwrap().is_some();
+                let pair = (i.port, i.generation);
+                if teardown_pending {
+                    stopped.pending.push(pair);
+                } else {
+                    stopped.removed.push(pair);
+                }
+                kill(i);
                 // Retain this generation until its worker acknowledges teardown.
                 i.state = ShareState::Stopping;
             }
@@ -574,6 +688,7 @@ fn supervise(
             generation,
             provider,
             error: e,
+            teardown_unverified: false,
         }) {
             tracing::debug!(%error, "share failure receiver is gone");
         }
@@ -663,15 +778,24 @@ fn supervise(
                         serve: serve.clone(),
                     });
                     if shared.shutdown.load(Ordering::SeqCst) {
-                        share::serve_down(
+                        match share::serve_down(
                             &shared.teardown.lock().unwrap().as_ref().unwrap().sidecar,
                             &serve,
-                        );
-                        emit(ShareEvent::Down {
-                            worktree,
-                            port,
-                            generation,
-                        });
+                        ) {
+                            Ok(()) => emit(ShareEvent::Down {
+                                worktree,
+                                port,
+                                generation,
+                            }),
+                            Err(error) => emit(ShareEvent::Failed {
+                                worktree,
+                                port,
+                                generation,
+                                provider,
+                                error: format!("{error}; stop it again to retry"),
+                                teardown_unverified: true,
+                            }),
+                        }
                         return;
                     }
                     emit(ShareEvent::Up {
@@ -779,10 +903,108 @@ mod tests {
             generation: 8,
             provider: "bore",
             error: "boom".into(),
+            teardown_unverified: false,
         }));
         let v = sup.views("/wt");
         assert!(v[0].failed);
         assert!(v[0].url.is_none());
+    }
+
+    #[test]
+    fn unverified_teardown_keeps_a_visible_failed_share() {
+        let mut sup = ShareSupervisor::new();
+        sup.instances.push(ShareInstance {
+            worktree: "/wt".into(),
+            port: 443,
+            generation: 9,
+            provider: "tailscale",
+            public: true,
+            state: ShareState::Stopping,
+            shared: Shared::new(),
+            event_tx: None,
+            event_waker: None,
+        });
+        let reason = "teardown unverified: still served; stop it again to retry";
+        assert!(sup.on_event(ShareEvent::Failed {
+            worktree: "/wt".into(),
+            port: 443,
+            generation: 9,
+            provider: "tailscale",
+            error: reason.into(),
+            teardown_unverified: true,
+        }));
+        assert_eq!(sup.instances.len(), 1);
+        assert_eq!(sup.instances[0].state, ShareState::Failed(reason.into()));
+        let views = sup.views("/wt");
+        assert_eq!(views.len(), 1);
+        assert!(views[0].failed);
+        assert_eq!(views[0].error.as_deref(), Some(reason));
+    }
+
+    #[test]
+    fn unverified_teardown_keeps_the_saved_row() {
+        let db = thegn_core::db::Db::open_memory().unwrap();
+        let up = ShareEvent::Up {
+            worktree: "/wt".into(),
+            port: 443,
+            generation: 9,
+            provider: "tailscale",
+            url: PublicEndpoint::parse_url("https://host.ts.net").unwrap(),
+        };
+        apply_share_persist(&db, share_persist_for(&up));
+        let failed = ShareEvent::Failed {
+            worktree: "/wt".into(),
+            port: 443,
+            generation: 9,
+            provider: "tailscale",
+            error: "teardown unverified: still served; stop it again to retry".into(),
+            teardown_unverified: true,
+        };
+        assert!(matches!(
+            share_persist_for(&failed),
+            SharePersist::MarkFailed { .. }
+        ));
+        apply_share_persist(&db, share_persist_for(&failed));
+        let rows = db.list_shares().unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].local_port, 443);
+        assert_eq!(rows[0].generation, 9);
+        assert_eq!(rows[0].state, "failed");
+    }
+
+    #[test]
+    fn stopping_an_unverified_share_retries_the_teardown() {
+        let mut sup = ShareSupervisor::new();
+        let shared = Shared::new();
+        *shared.teardown.lock().unwrap() = Some(ServeTeardown {
+            sidecar: "sidecar".into(),
+            serve: thegn_svc::share::ServePlan {
+                up_argv: vec!["tailscale".into(), "serve".into()],
+                down_argv: vec!["tailscale".into(), "serve".into(), "off".into()],
+                scheme: "https".into(),
+                port: 443,
+            },
+        });
+        sup.instances.push(ShareInstance {
+            worktree: "/wt".into(),
+            port: 443,
+            generation: 9,
+            provider: "tailscale",
+            public: true,
+            state: ShareState::Failed("teardown unverified".into()),
+            shared: shared.clone(),
+            event_tx: None,
+            event_waker: None,
+        });
+        let mut retries = 0;
+        let stopped = sup.stop_with("/wt", Some(443), |instance| {
+            assert!(instance.shared.teardown.lock().unwrap().is_some());
+            retries += 1;
+        });
+        assert_eq!(retries, 1);
+        assert!(stopped.removed.is_empty());
+        assert_eq!(stopped.pending, vec![(443, 9)]);
+        assert!(matches!(sup.instances[0].state, ShareState::Stopping));
     }
 
     #[test]
@@ -814,6 +1036,7 @@ mod tests {
             generation: 21,
             provider: "bore",
             error: "late failure".into(),
+            teardown_unverified: false,
         }));
         assert!(!sup.on_event(ShareEvent::Down {
             worktree: "/wt".into(),
@@ -845,6 +1068,7 @@ mod tests {
             generation: 22,
             provider: "bore",
             error: "provider announced a different public endpoint; share stopped".into(),
+            teardown_unverified: false,
         }));
         let views = sup.views("/wt");
         let view = &views[0];
@@ -866,7 +1090,7 @@ mod tests {
             event_tx: None,
             event_waker: None,
         });
-        assert_eq!(sup.stop("/wt", Some(3000)), vec![(3000, 31)]);
+        assert_eq!(sup.stop("/wt", Some(3000)).removed, vec![(3000, 31)]);
         assert_eq!(sup.generation_of("/wt", 3000), None);
         assert_eq!(sup.instances.len(), 1);
         assert!(matches!(sup.instances[0].state, ShareState::Stopping));
@@ -893,13 +1117,14 @@ mod tests {
             event_tx: None,
             event_waker: None,
         });
-        assert_eq!(sup.stop("/wt", Some(3000)), vec![(3000, 51)]);
+        assert_eq!(sup.stop("/wt", Some(3000)).removed, vec![(3000, 51)]);
         assert!(sup.on_event(ShareEvent::Failed {
             worktree: "/wt".into(),
             port: 3000,
             generation: 51,
             provider: "bore",
             error: "startup failed during stop".into(),
+            teardown_unverified: false,
         }));
         assert!(sup.instances.is_empty());
     }
@@ -991,6 +1216,7 @@ mod tests {
             generation: 2,
             provider: "bore",
             error: "provider failed".into(),
+            teardown_unverified: false,
         };
         apply_share_persist(&db, share_persist_for(&failed));
         assert!(db.list_shares().unwrap().is_empty());
@@ -1011,10 +1237,10 @@ mod tests {
             event_waker: None,
         };
         sup.instances.push(instance(61));
-        assert_eq!(sup.stop("/wt", Some(3000)), vec![(3000, 61)]);
+        assert_eq!(sup.stop("/wt", Some(3000)).removed, vec![(3000, 61)]);
         sup.instances.push(instance(62));
         assert_eq!(sup.generation_of("/wt", 3000), Some(62));
-        assert_eq!(sup.stop("/wt", Some(3000)), vec![(3000, 62)]);
+        assert_eq!(sup.stop("/wt", Some(3000)).removed, vec![(3000, 62)]);
         assert_eq!(sup.generation_of("/wt", 3000), None);
         assert_eq!(
             sup.instances.len(),
