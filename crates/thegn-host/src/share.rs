@@ -50,7 +50,12 @@ pub enum ShareEvent {
 }
 
 pub(crate) enum SharePersist {
-    Keep,
+    MarkFailed {
+        worktree: String,
+        port: u16,
+        generation: u64,
+        provider: String,
+    },
     Upsert {
         worktree: String,
         port: u16,
@@ -91,9 +96,18 @@ pub(crate) fn share_persist_for(ev: &ShareEvent) -> SharePersist {
             generation: *generation,
         },
         ShareEvent::Failed {
+            worktree,
+            port,
+            generation,
+            provider,
             teardown_unverified: true,
             ..
-        } => SharePersist::Keep,
+        } => SharePersist::MarkFailed {
+            worktree: worktree.clone(),
+            port: *port,
+            generation: *generation,
+            provider: (*provider).to_string(),
+        },
         ShareEvent::Failed {
             worktree,
             port,
@@ -109,7 +123,18 @@ pub(crate) fn share_persist_for(ev: &ShareEvent) -> SharePersist {
 
 pub(crate) fn apply_share_persist(db: &thegn_core::db::Db, op: SharePersist) {
     match op {
-        SharePersist::Keep => {}
+        SharePersist::MarkFailed {
+            worktree,
+            port,
+            generation,
+            provider,
+        } => {
+            if let Err(error) =
+                db.upsert_share(&worktree, port, generation, &provider, None, "failed")
+            {
+                tracing::debug!(target: "thegn::db", %error, "share failure persist failed");
+            }
+        }
         SharePersist::Upsert {
             worktree,
             port,
@@ -247,6 +272,7 @@ impl ShareInstance {
             let worktree = self.worktree.clone();
             let port = self.port;
             let generation = self.generation;
+            let provider = self.provider;
             let spawn = std::thread::Builder::new()
                 .name("tgshare-down".into())
                 .spawn(move || {
@@ -261,8 +287,8 @@ impl ShareInstance {
                             worktree,
                             port,
                             generation,
-                            provider: "tailscale",
-                            error: format!("teardown unverified: {error}; stop it again to retry"),
+                            provider,
+                            error: format!("{error}; stop it again to retry"),
                             teardown_unverified: true,
                         },
                     };
@@ -284,9 +310,9 @@ impl ShareInstance {
                         worktree: self.worktree.clone(),
                         port: self.port,
                         generation: self.generation,
-                        provider: "tailscale",
+                        provider: self.provider,
                         error: format!(
-                            "teardown unverified: could not start teardown worker: {error}; stop it again to retry"
+                            "share: teardown unverified; could not start teardown worker: {error}; stop it again to retry"
                         ),
                         teardown_unverified: true,
                     })
@@ -308,6 +334,11 @@ impl ShareInstance {
 #[derive(Default)]
 pub struct ShareSupervisor {
     instances: Vec<ShareInstance>,
+}
+
+pub(crate) struct StopShares {
+    pub(crate) removed: Vec<(u16, u64)>,
+    pub(crate) pending: Vec<(u16, u64)>,
 }
 
 static NEXT_SHARE_GENERATION: AtomicU64 = AtomicU64::new(1);
@@ -390,6 +421,16 @@ impl ShareSupervisor {
                 && i.shared.teardown.lock().unwrap().is_none())
         });
         if self.has(worktree, port) {
+            if self.instances.iter().any(|instance| {
+                instance.worktree == worktree
+                    && instance.port == port
+                    && matches!(instance.state, ShareState::Failed(_))
+                    && instance.shared.teardown.lock().unwrap().is_some()
+            }) {
+                return Err(format!(
+                    "teardown of :{port} is unverified; stop it to retry"
+                ));
+            }
             return Err(format!("already sharing port {port}"));
         }
         let label = thegn_core::share::label_for(worktree);
@@ -520,10 +561,10 @@ impl ShareSupervisor {
         }
     }
 
-    /// Stop shares on `worktree`: a specific `port`, or all (`None`). Returns
-    /// the stopped `(port, generation)` pairs — callers use them for DB cleanup, which must key off
-    /// the supervisor's own state, never a possibly-stale render mirror.
-    pub fn stop(&mut self, worktree: &str, port: Option<u16>) -> Vec<(u16, u64)> {
+    /// Stop shares on `worktree`: a specific `port`, or all (`None`). `removed`
+    /// pairs can be deleted immediately; `pending` pairs have sidecar teardown
+    /// workers whose terminal events own persistence.
+    pub(crate) fn stop(&mut self, worktree: &str, port: Option<u16>) -> StopShares {
         self.stop_with(worktree, port, ShareInstance::kill)
     }
 
@@ -532,8 +573,11 @@ impl ShareSupervisor {
         worktree: &str,
         port: Option<u16>,
         mut kill: impl FnMut(&ShareInstance),
-    ) -> Vec<(u16, u64)> {
-        let mut stopped = Vec::new();
+    ) -> StopShares {
+        let mut stopped = StopShares {
+            removed: Vec::new(),
+            pending: Vec::new(),
+        };
         // A failed instance without teardown has no worker left to await.
         self.instances.retain(|i| {
             let matched = i.worktree == worktree && port.is_none_or(|p| p == i.port);
@@ -541,7 +585,7 @@ impl ShareSupervisor {
                 && matches!(i.state, ShareState::Failed(_))
                 && i.shared.teardown.lock().unwrap().is_none()
             {
-                stopped.push((i.port, i.generation));
+                stopped.removed.push((i.port, i.generation));
                 false
             } else {
                 true
@@ -550,7 +594,13 @@ impl ShareSupervisor {
         for i in &mut self.instances {
             let matched = i.worktree == worktree && port.is_none_or(|p| p == i.port);
             if matched && !matches!(i.state, ShareState::Stopping) {
-                stopped.push((i.port, i.generation));
+                let teardown_pending = i.shared.teardown.lock().unwrap().is_some();
+                let pair = (i.port, i.generation);
+                if teardown_pending {
+                    stopped.pending.push(pair);
+                } else {
+                    stopped.removed.push(pair);
+                }
                 kill(i);
                 // Retain this generation until its worker acknowledges teardown.
                 i.state = ShareState::Stopping;
@@ -742,9 +792,7 @@ fn supervise(
                                 port,
                                 generation,
                                 provider,
-                                error: format!(
-                                    "teardown unverified: {error}; stop it again to retry"
-                                ),
+                                error: format!("{error}; stop it again to retry"),
                                 teardown_unverified: true,
                             }),
                         }
@@ -912,12 +960,16 @@ mod tests {
             error: "teardown unverified: still served; stop it again to retry".into(),
             teardown_unverified: true,
         };
-        assert!(matches!(share_persist_for(&failed), SharePersist::Keep));
+        assert!(matches!(
+            share_persist_for(&failed),
+            SharePersist::MarkFailed { .. }
+        ));
         apply_share_persist(&db, share_persist_for(&failed));
         let rows = db.list_shares().unwrap();
         assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].port, 443);
+        assert_eq!(rows[0].local_port, 443);
         assert_eq!(rows[0].generation, 9);
+        assert_eq!(rows[0].state, "failed");
     }
 
     #[test]
@@ -950,7 +1002,8 @@ mod tests {
             retries += 1;
         });
         assert_eq!(retries, 1);
-        assert_eq!(stopped, vec![(443, 9)]);
+        assert!(stopped.removed.is_empty());
+        assert_eq!(stopped.pending, vec![(443, 9)]);
         assert!(matches!(sup.instances[0].state, ShareState::Stopping));
     }
 
@@ -1037,7 +1090,7 @@ mod tests {
             event_tx: None,
             event_waker: None,
         });
-        assert_eq!(sup.stop("/wt", Some(3000)), vec![(3000, 31)]);
+        assert_eq!(sup.stop("/wt", Some(3000)).removed, vec![(3000, 31)]);
         assert_eq!(sup.generation_of("/wt", 3000), None);
         assert_eq!(sup.instances.len(), 1);
         assert!(matches!(sup.instances[0].state, ShareState::Stopping));
@@ -1064,7 +1117,7 @@ mod tests {
             event_tx: None,
             event_waker: None,
         });
-        assert_eq!(sup.stop("/wt", Some(3000)), vec![(3000, 51)]);
+        assert_eq!(sup.stop("/wt", Some(3000)).removed, vec![(3000, 51)]);
         assert!(sup.on_event(ShareEvent::Failed {
             worktree: "/wt".into(),
             port: 3000,
@@ -1184,10 +1237,10 @@ mod tests {
             event_waker: None,
         };
         sup.instances.push(instance(61));
-        assert_eq!(sup.stop("/wt", Some(3000)), vec![(3000, 61)]);
+        assert_eq!(sup.stop("/wt", Some(3000)).removed, vec![(3000, 61)]);
         sup.instances.push(instance(62));
         assert_eq!(sup.generation_of("/wt", 3000), Some(62));
-        assert_eq!(sup.stop("/wt", Some(3000)), vec![(3000, 62)]);
+        assert_eq!(sup.stop("/wt", Some(3000)).removed, vec![(3000, 62)]);
         assert_eq!(sup.generation_of("/wt", 3000), None);
         assert_eq!(
             sup.instances.len(),

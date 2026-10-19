@@ -867,7 +867,7 @@ pub fn serve_up(sidecar: &str, serve: &ServePlan) -> Result<PublicEndpoint> {
 
 /// Tear a tailscale serve/funnel down and verify it is absent in status JSON.
 /// Status uses `{"TCP":{"443":{"HTTPS":true}},"Web":{"host.ts.net:443":{..}},"AllowFunnel":{"host.ts.net:443":true}}`.
-/// An unsuccessful command, unreadable status, or ambiguous result is an error.
+/// A failed down command is accepted only when readable status confirms the port is absent.
 pub fn serve_down(sidecar: &str, serve: &ServePlan) -> Result<()> {
     serve_down_with(&likely_runtimes(), serve, |rt, argv| {
         exec_in(rt, sidecar, argv)
@@ -879,38 +879,26 @@ fn serve_down_with(
     serve: &ServePlan,
     mut exec: impl FnMut(&OciRuntime, &[String]) -> Result<(bool, String)>,
 ) -> Result<()> {
+    let status_argv = vec![
+        "tailscale".to_string(),
+        "serve".to_string(),
+        "status".to_string(),
+        "--json".to_string(),
+    ];
     for rt in runtimes {
         match exec(rt, &serve.down_argv) {
-            Ok((true, _)) => {
-                let status_argv = vec![
-                    "tailscale".to_string(),
-                    "serve".to_string(),
-                    "status".to_string(),
-                    "--json".to_string(),
-                ];
-                match exec(rt, &status_argv) {
-                    Ok((true, out)) => match serve_status_has_port(&out, serve.port) {
-                        Ok(false) => return Ok(()),
-                        Ok(true) => bail!(
-                            "share: teardown unverified; port {} is still served",
-                            serve.port
-                        ),
-                        Err(error) => bail!(
-                            "share: teardown unverified; could not parse tailscale status: {error}"
-                        ),
-                    },
-                    Ok((false, _)) => {
-                        bail!("share: teardown unverified; tailscale status command failed")
-                    }
-                    Err(error) => bail!(
-                        "share: teardown unverified; could not read tailscale status: {error}"
-                    ),
-                }
+            Ok((true, _)) | Ok((false, _)) => {}
+            Err(error) => {
+                tracing::debug!(%error, "tailscale serve down command failed; checking status")
             }
-            Ok((false, _)) | Err(_) => continue,
+        }
+        if let Ok((true, out)) = exec(rt, &status_argv)
+            && let Ok(false) = serve_status_has_port(&out, serve.port)
+        {
+            return Ok(());
         }
     }
-    bail!("share: teardown unverified; tailscale down failed on every runtime")
+    bail!("share: teardown unverified; no runtime verified tailscale serve is absent")
 }
 
 /// Return whether Tailscale status reports a serve/funnel on `port`.
