@@ -141,6 +141,7 @@ pub struct PanelUpdate {
 #[derive(Debug, Clone)]
 pub struct TargetUpdate {
     pub ref_id: String,
+    pub label: String,
     pub result: Result<Vec<Frame>, String>,
 }
 
@@ -176,8 +177,10 @@ type PanelQueryJob = (
     u32,
     String,
     Option<Arc<dyn DataSource>>,
-    Vec<(String, Query)>,
+    Vec<(String, String, Query)>,
 );
+type TargetIdentity = (String, String);
+type PanelJobIds = HashMap<tokio::task::Id, (u32, Vec<TargetIdentity>)>;
 
 enum QueryOutcome {
     Complete(bool),
@@ -370,9 +373,15 @@ impl QueryEngine {
                 let targets = panel
                     .targets
                     .iter()
+                    .filter(|target| !target.hide)
                     .map(|t| {
                         (
                             t.ref_id.clone(),
+                            t.alias
+                                .as_deref()
+                                .filter(|alias| !alias.is_empty())
+                                .unwrap_or(&t.ref_id)
+                                .to_string(),
                             Query {
                                 ref_id: t.ref_id.clone(),
                                 expr: t.expr.clone(),
@@ -388,14 +397,14 @@ impl QueryEngine {
         let mut job_ids = HashMap::new();
         let mut jobs = jobs.into_iter();
         let spawn_job = |pending: &mut JoinSet<(u32, Vec<TargetUpdate>)>,
-                         job_ids: &mut HashMap<tokio::task::Id, (u32, Vec<String>)>,
+                         job_ids: &mut PanelJobIds,
                          job: PanelQueryJob| {
             let (panel_id, datasource, source, targets) = job;
             let has_more_targets = targets.len() > MAX_TARGETS_PER_PANEL;
             let target_ids = targets
                 .iter()
                 .take(MAX_TARGETS_PER_PANEL)
-                .map(|(ref_id, _)| ref_id.clone())
+                .map(|(ref_id, label, _)| (ref_id.clone(), label.clone()))
                 .collect::<Vec<_>>();
             let targets = targets
                 .into_iter()
@@ -404,7 +413,7 @@ impl QueryEngine {
             let abort = pending.spawn(async move {
                 let mut results = Vec::with_capacity(targets.len());
                 let deadline = tokio::time::Instant::now() + PANEL_DEADLINE;
-                for (ref_id, query) in targets {
+                for (ref_id, label, query) in targets {
                     let result = match &source {
                         Some(source) => {
                             tokio::time::timeout_at(deadline, source.query(vec![query]))
@@ -414,11 +423,16 @@ impl QueryEngine {
                         }
                         None => Err(format!("no datasource '{datasource}'")),
                     };
-                    results.push(TargetUpdate { ref_id, result });
+                    results.push(TargetUpdate {
+                        ref_id,
+                        label,
+                        result,
+                    });
                 }
                 if has_more_targets {
                     results.push(TargetUpdate {
                         ref_id: "…".into(),
+                        label: "…".into(),
                         result: Err(format!(
                             "additional targets omitted (limit {MAX_TARGETS_PER_PANEL})"
                         )),
@@ -428,7 +442,7 @@ impl QueryEngine {
             });
             let mut target_ids = target_ids;
             if has_more_targets {
-                target_ids.push("…".into());
+                target_ids.push(("…".into(), "…".into()));
             }
             drop(job_ids.insert(abort.id(), (panel_id, target_ids)));
         };
@@ -453,8 +467,9 @@ impl QueryEngine {
                             let message = format!("panel query panicked: {join_error}");
                             let targets = target_ids
                                 .into_iter()
-                                .map(|ref_id| TargetUpdate {
+                                .map(|(ref_id, label)| TargetUpdate {
                                     ref_id,
+                                    label,
                                     result: Err(message.clone()),
                                 })
                                 .collect();
@@ -588,6 +603,7 @@ mod tests {
                     targets: vec![Target {
                         ref_id: "A".to_string(),
                         expr: "value".to_string(),
+                        ..Target::default()
                     }],
                 })
                 .collect(),
@@ -891,6 +907,7 @@ mod tests {
             panel_dashboard.panels[0].targets.push(Target {
                 ref_id: ref_id.into(),
                 expr: "hang".into(),
+                ..Target::default()
             });
         }
         panel_dashboard.panels[0].targets[0].expr = "hang".into();
@@ -1046,6 +1063,7 @@ mod tests {
         dashboard.panels[0].targets.push(Target {
             ref_id: "B".into(),
             expr: "other".into(),
+            ..Target::default()
         });
         let sources = HashMap::from([(
             "test".to_string(),
@@ -1074,6 +1092,60 @@ mod tests {
         drop(cmd);
     }
 
+    #[tokio::test]
+    async fn hidden_targets_are_not_queried_and_aliases_are_display_labels() {
+        let mut dashboard = dashboard(1);
+        dashboard.panels[0].targets[0].hide = true;
+        dashboard.panels[0].targets[0].ref_id = "H".into();
+        dashboard.panels[0].targets.push(Target {
+            ref_id: "A".into(),
+            expr: "visible".into(),
+            alias: Some("p99".into()),
+            ..Target::default()
+        });
+        for index in 1..MAX_TARGETS_PER_PANEL {
+            dashboard.panels[0].targets.push(Target {
+                ref_id: format!("T{index}"),
+                expr: "visible".into(),
+                ..Target::default()
+            });
+        }
+        let queries = Arc::new(Mutex::new(Vec::new()));
+        let sources = HashMap::from([(
+            "test".to_string(),
+            Arc::new(RecordingSource {
+                queries: queries.clone(),
+            }) as Arc<dyn DataSource>,
+        )]);
+        let (cmd, mut updates) = QueryEngine::spawn_with_window(
+            Handle::current(),
+            dashboard,
+            sources,
+            RelativeWindow::new(std::time::Duration::from_secs(60)),
+            Duration::from_secs(3600),
+            Arc::new(Utc::now),
+            Arc::new(|| {}),
+            WakeGate::new(true),
+        );
+        let update = tokio::time::timeout(Duration::from_secs(1), updates.recv())
+            .await
+            .expect("target results did not arrive")
+            .expect("query engine exited before target results");
+        let seen = queries.lock().unwrap();
+        let seen_ref_ids = seen
+            .iter()
+            .flatten()
+            .map(|query| query.ref_id.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(seen_ref_ids.len(), MAX_TARGETS_PER_PANEL);
+        assert!(!seen_ref_ids.contains(&"H"));
+        assert_eq!(update.targets.len(), MAX_TARGETS_PER_PANEL);
+        assert_eq!(update.targets[0].ref_id, "A");
+        assert_eq!(update.targets[0].label, "p99");
+        drop(seen);
+        drop(cmd);
+    }
+
     struct CountingTargetSource(Arc<std::sync::atomic::AtomicUsize>);
 
     impl DataSource for CountingTargetSource {
@@ -1093,6 +1165,7 @@ mod tests {
             dashboard.panels[0].targets.push(Target {
                 ref_id: format!("T{index}"),
                 expr: "value".into(),
+                ..Target::default()
             });
         }
         let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
