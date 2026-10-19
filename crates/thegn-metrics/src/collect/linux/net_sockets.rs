@@ -15,7 +15,6 @@ use crate::collect::{
         net_attrib::{CookieDelta, OwnerTable, RealCgroupFs},
         procfile::ProcFile,
     },
-    model::net_sockets::NetSocketsPart,
     model::netdev::IfaceName,
     parse::netdev::parse,
     policy::net_scope::{self, Scope},
