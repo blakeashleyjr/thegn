@@ -865,13 +865,77 @@ pub fn serve_up(sidecar: &str, serve: &ServePlan) -> Result<PublicEndpoint> {
     )
 }
 
-/// Best-effort teardown: run `down_argv` in the sidecar (it also dies with it).
-pub fn serve_down(sidecar: &str, serve: &ServePlan) {
-    for rt in likely_runtimes() {
-        if let Ok((true, _)) = exec_in(&rt, sidecar, &serve.down_argv) {
-            return;
+/// Tear a tailscale serve/funnel down and verify it is absent in status JSON.
+/// Status uses `{"TCP":{"443":{"HTTPS":true}},"Web":{"host.ts.net:443":{..}},"AllowFunnel":{"host.ts.net:443":true}}`.
+/// A failed down command is accepted only when readable status confirms the port is absent.
+pub fn serve_down(sidecar: &str, serve: &ServePlan) -> Result<()> {
+    serve_down_with(&likely_runtimes(), serve, |rt, argv| {
+        exec_in(rt, sidecar, argv)
+    })
+}
+
+fn serve_down_with(
+    runtimes: &[OciRuntime],
+    serve: &ServePlan,
+    mut exec: impl FnMut(&OciRuntime, &[String]) -> Result<(bool, String)>,
+) -> Result<()> {
+    let status_argv = vec![
+        "tailscale".to_string(),
+        "serve".to_string(),
+        "status".to_string(),
+        "--json".to_string(),
+    ];
+    for rt in runtimes {
+        match exec(rt, &serve.down_argv) {
+            Ok((true, _)) | Ok((false, _)) => {}
+            Err(error) => {
+                tracing::debug!(%error, "tailscale serve down command failed; checking status")
+            }
+        }
+        if let Ok((true, out)) = exec(rt, &status_argv)
+            && let Ok(false) = serve_status_has_port(&out, serve.port)
+        {
+            return Ok(());
         }
     }
+    bail!("share: teardown unverified; no runtime verified tailscale serve is absent")
+}
+
+/// Return whether Tailscale status reports a serve/funnel on `port`.
+fn serve_status_has_port(json: &str, port: u16) -> Result<bool> {
+    use serde_json::Value;
+
+    if json.trim().is_empty() || json.trim() == "{}" {
+        return Ok(false);
+    }
+    let status: Value =
+        serde_json::from_str(json).context("share: parse tailscale serve status")?;
+    if !status.is_object() {
+        bail!("share: unexpected tailscale serve status shape")
+    }
+    let port_key = port.to_string();
+    let suffix = format!(":{port}");
+    let mut found_section = false;
+    for section in ["TCP", "Web", "AllowFunnel"] {
+        if let Some(value) = status.get(section) {
+            let entries = value.as_object().ok_or_else(|| {
+                anyhow::anyhow!("share: unexpected tailscale {section} status shape")
+            })?;
+            found_section = true;
+            let has_port = if section == "TCP" {
+                entries.contains_key(&port_key)
+            } else {
+                entries.keys().any(|key| key.ends_with(&suffix))
+            };
+            if has_port {
+                return Ok(true);
+            }
+        }
+    }
+    if !found_section {
+        bail!("share: unexpected tailscale serve status shape")
+    }
+    Ok(false)
 }
 
 /// Read the node's MagicDNS name from `tailscale status --json` in the sidecar.

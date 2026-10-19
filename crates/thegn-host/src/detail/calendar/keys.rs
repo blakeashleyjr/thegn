@@ -43,6 +43,7 @@ fn ensure_loaded(st: &mut CalState) -> DetailOutcome {
 fn nav(st: &mut CalState, n: CalNav) -> DetailOutcome {
     let before = st.cursor.visible_month();
     st.cursor.apply(n, st.today);
+    crate::hydrate_calendar::note_visible_month(st.cursor.visible_month());
     // Moving the day cursor resets the agenda cursor: the old row index means
     // nothing against a different day's event list.
     st.agenda_sel = 0;

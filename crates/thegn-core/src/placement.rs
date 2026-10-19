@@ -17,6 +17,23 @@
 
 use crate::remote::ssh_base;
 use crate::util;
+use sha2::{Digest, Sha256};
+
+/// Compute a host-side dtach session id from the SSH destination and exact
+/// backend command. It is never derived from a remote environment variable;
+/// distinct worktrees and commands get distinct masters, while identical
+/// commands in one worktree still share a master (a known limit of this slice).
+fn dtach_session_id(host: &str, raw_command: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(host.as_bytes());
+    hasher.update([0]);
+    hasher.update(raw_command.as_bytes());
+    let digest = hasher.finalize();
+    digest[..16]
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
 
 /// Interactive-pane transport for an SSH placement. The control plane always
 /// uses plain ssh (mosh can't pipe non-interactive commands); only the pane
@@ -127,15 +144,15 @@ impl SshPlacement {
     fn interactive_wrap(&self, backend_argv: &[String]) -> Vec<String> {
         // dtach wrappers to preserve network persistence without multiplexer
         // corruption (allows sixel/kitty inline images over SSH).
-        // -A: attach or create. -E: copy env. -z: no suspend key. -r winch: force redraw.
-        let dtach_prefix = "if command -v dtach >/dev/null 2>&1; then \
-            exec dtach -A /tmp/tg-socket-$(echo $THEGN_WORKTREE | md5sum | awk '{print $1}') -E -z -r winch ";
-        let dtach_suffix = "; else ";
-        let fallback_suffix = "; fi";
+        // -A: attach or create. -E: disable the detach character. -z: disable
+        // suspend. -r winch: redraw on window-size changes.
 
         // Build the remote command: dtach (if present) else raw backend
         let raw = util::sh_join(backend_argv);
-        let remote_cmd = format!("{dtach_prefix}{raw}{dtach_suffix}exec {raw}{fallback_suffix}");
+        let session_id = dtach_session_id(&self.host, &raw);
+        let remote_cmd = format!(
+            "if command -v dtach >/dev/null 2>&1 && d=\"${{XDG_RUNTIME_DIR:-$HOME/.cache}}/thegn/dtach\" && (umask 077; mkdir -p \"$d\") && [ -d \"$d\" ] && [ ! -L \"$d\" ] && [ -O \"$d\" ] && chmod 700 \"$d\"; then exec dtach -A \"$d/{session_id}\" -E -z -r winch {raw}; else exec {raw}; fi"
+        );
 
         match self.kind {
             TransportKind::Mosh => {
@@ -686,11 +703,10 @@ mod tests {
         assert!(out.last().unwrap().starts_with("/bin/sh -lc "));
 
         let raw = util::sh_join(&argv);
-        let dtach_prefix = "if command -v dtach >/dev/null 2>&1; then \
-            exec dtach -A /tmp/tg-socket-$(echo $THEGN_WORKTREE | md5sum | awk '{print $1}') -E -z -r winch ";
-        let dtach_suffix = "; else ";
-        let fallback_suffix = "; fi";
-        let remote_cmd = format!("{dtach_prefix}{raw}{dtach_suffix}exec {raw}{fallback_suffix}");
+        let session_id = dtach_session_id("dev@box", &raw);
+        let remote_cmd = format!(
+            "if command -v dtach >/dev/null 2>&1 && d=\"${{XDG_RUNTIME_DIR:-$HOME/.cache}}/thegn/dtach\" && (umask 077; mkdir -p \"$d\") && [ -d \"$d\" ] && [ ! -L \"$d\" ] && [ -O \"$d\" ] && chmod 700 \"$d\"; then exec dtach -A \"$d/{session_id}\" -E -z -r winch {raw}; else exec {raw}; fi"
+        );
         let expected = util::sh_join(&["/bin/sh".to_string(), "-lc".to_string(), remote_cmd]);
         assert_eq!(out[out.len() - 1], expected);
         // Plain target adds no -F/-J/-i.
@@ -712,11 +728,90 @@ mod tests {
 
         // Assert the dtach command is well-formed
         assert!(cmd.contains("if command -v dtach"));
-        assert!(cmd.contains("exec dtach -A /tmp/tg-socket"));
+        assert!(cmd.contains("exec dtach -A \"$d/"));
         assert!(cmd.contains("-E -z -r winch"));
         // Assert the raw command is in both the dtach execution and the fallback
         assert!(cmd.contains("exec echo hello"));
         assert!(cmd.contains("; else exec echo hello; fi"));
+    }
+
+    #[test]
+    fn dtach_socket_is_host_computed_and_private() {
+        let argv = vec![
+            "podman".to_string(),
+            "exec".into(),
+            "-it".into(),
+            "thegn-a".into(),
+            "sh".into(),
+        ];
+        let placement = Placement::Ssh(SshPlacement::plain(
+            "dev@box".into(),
+            22,
+            true,
+            TransportKind::Mosh,
+        ));
+        let command = placement.interactive_argv(&argv);
+        let remote = command.last().unwrap();
+
+        assert!(remote.contains("$d/c7502a83e59a8b5c8c0554f0972505b4"));
+        assert!(remote.contains("XDG_RUNTIME_DIR"));
+        assert!(remote.contains("[ ! -L \"$d\" ]") && remote.contains("[ -O \"$d\" ]"));
+        assert!(remote.contains("chmod 700 \"$d\""));
+        assert!(!remote.contains("THEGN_WORKTREE"));
+        assert!(!remote.contains("md5sum"));
+        assert!(!remote.contains("/tmp/tg-socket"));
+    }
+
+    #[test]
+    fn distinct_commands_get_distinct_dtach_sessions() {
+        let command_a = util::sh_join(&[
+            "podman".into(),
+            "exec".into(),
+            "-it".into(),
+            "thegn-a".into(),
+            "sh".into(),
+        ]);
+        let command_b = util::sh_join(&[
+            "podman".into(),
+            "exec".into(),
+            "-it".into(),
+            "thegn-b".into(),
+            "sh".into(),
+        ]);
+        let id = dtach_session_id("dev@box", &command_a);
+
+        assert_ne!(id, dtach_session_id("dev@box", &command_b));
+        assert_ne!(id, dtach_session_id("other@box", &command_a));
+        assert_eq!(id, dtach_session_id("dev@box", &command_a));
+    }
+
+    #[test]
+    fn hostile_worktree_strings_only_appear_sh_quoted() {
+        let argv = vec![
+            "podman".to_string(),
+            "exec".into(),
+            "a b*;$(x)\n".into(),
+            "sh".into(),
+        ];
+        let raw = util::sh_join(&argv);
+        let placement = Placement::Ssh(SshPlacement::plain(
+            "dev@box".into(),
+            22,
+            true,
+            TransportKind::Mosh,
+        ));
+        let command = placement.interactive_argv(&argv);
+        let remote = command.last().unwrap();
+        let session_id = dtach_session_id("dev@box", &raw);
+
+        assert!(remote.contains(&format!("$d/{session_id}")));
+        assert!(
+            session_id
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+        );
+        assert_eq!(remote.matches(&raw).count(), 2);
+        assert!(raw.contains("'a b*;$(x)\n'"));
     }
 
     #[test]

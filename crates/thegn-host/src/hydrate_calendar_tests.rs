@@ -7,6 +7,71 @@ use super::*;
 use thegn_core::calendar::{CalEvent, EventTime, TzRef};
 
 #[test]
+fn periodic_sync_redelivers_the_visible_month_as_well_as_today() {
+    let today = NaiveDate::from_ymd_opt(2026, 10, 19).unwrap();
+    assert_eq!(
+        periodic_months(today, Some((2026, 12))),
+        vec![(2026, 10), (2026, 12)]
+    );
+    assert_eq!(periodic_months(today, Some((2026, 10))), vec![(2026, 10)]);
+    assert_eq!(periodic_months(today, None), vec![(2026, 10)]);
+}
+
+#[test]
+fn visible_month_round_trips_and_resets_on_open() {
+    note_visible_month((2027, 1));
+    assert_eq!(visible_month(), Some((2027, 1)));
+
+    // Opening a popup records its initial month through the same seam used by
+    // detail::calendar::open, replacing the previous popup's navigation.
+    note_visible_month((2027, 2));
+    assert_eq!(visible_month(), Some((2027, 2)));
+}
+
+#[test]
+fn navigation_a_b_c_only_c_is_current() {
+    let a = register_month_request((2071, 1));
+    let b = register_month_request((2071, 2));
+    let c = register_month_request((2071, 3));
+
+    assert!(navigation_superseded(a));
+    assert!(navigation_superseded(b));
+    // The current-id assertion relies on nextest's one-process-per-test
+    // isolation; a parallel plain `cargo test` case could register afterward.
+    assert!(!navigation_superseded(c));
+}
+
+#[test]
+fn a_superseded_month_fetch_delivers_nothing_and_never_opens_db() {
+    let month = (2072, 4);
+    let request = register_month_request(month);
+    register_month_request((2072, 5));
+    let from = NaiveDate::from_ymd_opt(month.0, month.1, 1).unwrap();
+    let to = NaiveDate::from_ymd_opt(month.0, month.1, 30).unwrap();
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut opened = false;
+
+    run_month_fetch(
+        CalendarConfig::default(),
+        MonthCoverage {
+            year: month.0,
+            month: month.1,
+            covered: widen(from, to),
+        },
+        request,
+        tx,
+        None,
+        || {
+            opened = true;
+            None
+        },
+    );
+
+    assert!(!opened);
+    assert!(rx.try_recv().is_err());
+}
+
+#[test]
 fn dropped_month_completion_sends_cache_unavailable_payload() {
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
     let completion = MonthFetchCompletion {

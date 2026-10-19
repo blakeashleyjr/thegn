@@ -3924,6 +3924,53 @@ fn compose_teardown_projects_add_legacy_only_for_adopted_worktree() {
     );
 }
 
+#[test]
+fn remote_teardown_downs_the_hashed_project_through_the_placement() {
+    let state_home = tempfile::tempdir().unwrap();
+    let loc = crate::remote::GitLoc::Remote {
+        ssh: crate::remote::SshTarget::plain("remote.example".into(), 22, false),
+        path: "/remote/wt".into(),
+    };
+    let name = container_name("/host/wt");
+    let projects = teardown_projects_for_loc(state_home.path(), &loc, &name, true);
+    let loc_project =
+        crate::sandbox_compose::hashed_project_name(&name, std::path::Path::new("/remote/wt"));
+    let mounted_project =
+        crate::sandbox_compose::hashed_project_name(&name, std::path::Path::new("/workspace"));
+    assert_eq!(projects, vec![loc_project.clone(), mounted_project.clone()]);
+
+    let placement = Placement::Ssh(SshPlacement::plain(
+        "remote.example".into(),
+        22,
+        false,
+        TransportKind::Ssh,
+    ));
+    let commands = teardown_argvs(Backend::Docker, None, &name, &projects);
+    let routed_commands: Vec<_> = commands
+        .iter()
+        .map(|argv| placement.control_argv(argv))
+        .collect();
+    assert!(
+        routed_commands
+            .iter()
+            .all(|argv| argv.first().is_some_and(|arg| arg == "ssh"))
+    );
+    let down_commands: Vec<_> = commands
+        .iter()
+        .filter(|argv| argv.iter().any(|arg| arg == "down"))
+        .collect();
+    assert_eq!(down_commands.len(), 2);
+    let has_project = |project: &str| {
+        down_commands.iter().any(|argv| {
+            argv.windows(2)
+                .any(|pair| pair[0] == "-p" && pair[1] == project)
+        })
+    };
+    assert!(has_project(&loc_project));
+    assert!(has_project(&mounted_project));
+    assert!(!has_project(&name));
+}
+
 const PODMAN5_STATS: &str = r#"[
   {"id":"a1b2c3d4e5f6","name":"gamehost-mailpit-1","cpu_time":"0.00s","cpu_percent":"0.02%","avg_cpu":"0.02%","mem_usage":"10.19MB / 100.5GB","mem_percent":"0.01%","net_io":"22.22kB / 7.348kB","block_io":"0B / 0B","pids":"3"},
   {"id":"f6e5d4c3b2a1","name":"gamehost-db-1","cpu_time":"0.01s","cpu_percent":"0.80%","avg_cpu":"0.80%","mem_usage":"51.13MB / 100.5GB","mem_percent":"0.05%","net_io":"21.7kB / 7.348kB","block_io":"0B / 0B","pids":"12"}

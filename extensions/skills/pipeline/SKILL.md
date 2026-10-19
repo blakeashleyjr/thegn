@@ -73,7 +73,7 @@ scope collides with an active sibling is refused by the scope gate unless
 --force.
 
 When the work is committed, run:
-  thegn dispatch report {row} --text $'verdict: <done|blocked>\ncommits: <hashes + subjects>\nunverified: <what you did NOT check>\nfindings: <for the next stage>\nnext: <hints>'
+  thegn dispatch report {row} --text $'verdict: <pass|revise|fail|blocked>\ngate: <command> -- <result, e.g. N passed, M skipped>\ncommits: <hashes + subjects>\nunverified: <what you did NOT check>\nfindings: <for the next stage>\nnext: <hints>'
 Progress notes during the run go to `thegn dispatch note {row} --text …`.
 The Lead reads the report and nothing else; the full artifact stays on the
 branch for the next stage."""
@@ -89,7 +89,7 @@ Touch only the files the chunk's `files:` block declares — thegn's chunk-scope
 gate refuses a dispatch whose scope collides with an active sibling.
 Commit on the branch; summarise to {artifact}.
 When the work is committed, run:
-  thegn dispatch report {row} --text $'verdict: <done|blocked>\ncommits: <hashes + subjects>\nunverified: <what you did NOT check>\nfindings: <for the next stage>\nnext: <hints>'
+  thegn dispatch report {row} --text $'verdict: <pass|revise|fail|blocked>\ngate: <command> -- <result, e.g. N passed, M skipped>\ncommits: <hashes + subjects>\nunverified: <what you did NOT check>\nfindings: <for the next stage>\nnext: <hints>'
 Progress notes during the run go to `thegn dispatch note {row} --text …`.
 The Lead reads the report and nothing else; the full artifact stays on the
 branch for the next stage."""
@@ -102,7 +102,7 @@ on_blocked = "escalate"
 prompt = """Review {parent_artifact} in {worktree}. Fix small things, commit them.
 Verdict to {artifact}: APPROVED or REVISE.
 When the work is committed, run:
-  thegn dispatch report {row} --text $'verdict: <done|blocked>\ncommits: <hashes + subjects>\nunverified: <what you did NOT check>\nfindings: <for the next stage>\nnext: <hints>'
+  thegn dispatch report {row} --text $'verdict: <pass|revise|fail|blocked>\ngate: <command> -- <result, e.g. N passed, M skipped>\ncommits: <hashes + subjects>\nunverified: <what you did NOT check>\nfindings: <for the next stage>\nnext: <hints>'
 Progress notes during the run go to `thegn dispatch note {row} --text …`.
 The Lead reads the report and nothing else; the full artifact stays on the
 branch for the next stage."""
@@ -268,7 +268,11 @@ present in the worktree AND tracked by git (exit 2 with the reasons when not)
 — and the worker's REPORT tells the Lead what happened: verdict, commits,
 unverified checks, findings, and next hints. The Lead reads the report and
 nothing else by default; the full artifact stays on the branch for the next
-stage. `set-status done` refuses a report-less row; `--force` is a deliberate
+stage. A row closes `done` only with an explicit PASS verdict on the report's
+first line, a `gate: <command> -- <result>` line citing a successful run, and
+a committed, clean artifact. Any other verdict, or no verdict, is never
+auto-closed: the reaper parks it for the Lead (`NeedsDecision`), and
+`set-status done` refuses it without `--force`. `--force` is a deliberate
 override and is printed as such:
 
 ```bash
@@ -423,10 +427,13 @@ you dispatched them.
   unobserved for 424 of 469 rows, and 99 of those had filed a report anyway.
   `dispatch wait` now says when a gone wake still carries a handoff — run
   `dispatch verify <row>` before you resume anything.
-- **A PASS must cite its gate.** Put `gate: <command> -- <N> passed, <M>
-skipped` on its own line in the report. Scoped suites are not the gate: they
-  skip the workspace-level coverage tests the fold gate rejects branches on,
-  which is how a lane reached the queue whose reconcile had broken `loc_scan`.
+- **Only an explicit PASS can complete a row.** Put PASS on the report's first
+  line and `gate: <command> -- <N> passed, <M> skipped` on its own line; the
+  committed, clean artifact must also be present. Other verdicts are parked
+  for the Lead and cannot be manually marked done without `--force`. Scoped
+  suites are not the gate: they skip the workspace-level coverage tests the
+  fold gate rejects branches on, which is how a lane reached the queue whose
+  reconcile had broken `loc_scan`.
 - **Say why on a bad outcome.** `set-status failed --why '<reason>'`. 40 of the
   last run's 45 failed/abandoned rows recorded no reason at all, which is what
   made the roster unreadable afterwards.

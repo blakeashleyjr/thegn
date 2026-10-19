@@ -221,6 +221,7 @@ mod tests {
         };
         CalendarRow {
             uid: e.uid.clone(),
+            recurrence_key: e.recurrence_key(),
             calendar: String::new(),
             start_ms: ms(&e.start),
             end_ms: ms(&e.end),

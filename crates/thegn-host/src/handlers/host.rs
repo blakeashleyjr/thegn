@@ -412,8 +412,8 @@ pub(crate) fn stop_worktree_share(
     // deleting by it left the real rows behind (a "stopped" tunnel then
     // resurrected on the next launch).
     let stopped = share_supervisor.stop(&wt, None);
-    let stopped_count = stopped.len();
-    queue_stopped_share_deletes(wt, stopped);
+    let stopped_count = stopped.removed.len() + stopped.pending.len();
+    queue_stopped_share_deletes(wt, stopped.removed);
     model.shares = crate::run::current_share_views(share_supervisor, session);
     model.status = if stopped_count == 0 {
         "No active shares on this worktree".into()

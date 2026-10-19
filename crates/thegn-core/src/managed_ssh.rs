@@ -10,6 +10,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AuthorizedKeyRecord {
@@ -61,12 +62,90 @@ pub fn dir() -> PathBuf {
 }
 
 pub fn key_fingerprint(public_key: &str) -> String {
-    let material = public_key
-        .split_whitespace()
-        .take(2)
-        .collect::<Vec<_>>()
-        .join(" ");
-    crate::util::short_hash(&material, 16)
+    try_key_fingerprint(public_key).unwrap_or_else(|_| {
+        let material = public_key
+            .split_whitespace()
+            .take(2)
+            .collect::<Vec<_>>()
+            .join(" ");
+        let digest = Sha256::digest(material.as_bytes());
+        format!("invalid:{}", hex_prefix(&digest, 16))
+    })
+}
+
+/// OpenSSH SHA-256 fingerprint of the decoded public-key wire blob.
+pub fn try_key_fingerprint(public_key: &str) -> Result<String> {
+    let mut fields = public_key.split_whitespace();
+    let key_type = fields.next().context("missing SSH public key type")?;
+    let encoded = fields.next().context("missing SSH public key body")?;
+    let blob = crate::provider_admission::decode_base64(encoded)
+        .context("invalid SSH public key encoding")?;
+    let length = blob
+        .get(..4)
+        .context("SSH public key blob is missing its type string")?;
+    let type_len = u32::from_be_bytes(length.try_into()?) as usize;
+    let type_end = 4usize
+        .checked_add(type_len)
+        .context("SSH public key type length overflow")?;
+    let blob_type = blob
+        .get(4..type_end)
+        .context("SSH public key blob has a truncated type string")?;
+    anyhow::ensure!(
+        blob_type == key_type.as_bytes(),
+        "SSH public key type does not match its blob"
+    );
+    Ok(format!(
+        "SHA256:{}",
+        base64_unpadded(&Sha256::digest(&blob))
+    ))
+}
+
+pub fn fingerprint_is_verified(fingerprint: &str) -> bool {
+    fingerprint.starts_with("SHA256:")
+}
+
+/// Fingerprint text for custody audit output, identifying pre-SHA256 rows.
+pub fn fingerprint_audit_label(fingerprint: &str) -> String {
+    if fingerprint_is_verified(fingerprint) {
+        fingerprint.to_string()
+    } else {
+        format!("{fingerprint} (legacy, unverified)")
+    }
+}
+
+fn base64_unpadded(bytes: &[u8]) -> String {
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut encoded = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    for chunk in bytes.chunks(3) {
+        let first = chunk[0];
+        let second = chunk.get(1).copied().unwrap_or(0);
+        let third = chunk.get(2).copied().unwrap_or(0);
+        encoded.push(char::from(ALPHABET[usize::from(first >> 2)]));
+        encoded.push(char::from(
+            ALPHABET[usize::from(((first & 0x03) << 4) | (second >> 4))],
+        ));
+        if chunk.len() > 1 {
+            encoded.push(char::from(
+                ALPHABET[usize::from(((second & 0x0f) << 2) | (third >> 6))],
+            ));
+        }
+        if chunk.len() > 2 {
+            encoded.push(char::from(ALPHABET[usize::from(third & 0x3f)]));
+        }
+    }
+    encoded
+}
+
+fn hex_prefix(bytes: &[u8], chars: usize) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut out = String::with_capacity(chars);
+    for byte in bytes.iter().take(chars.div_ceil(2)) {
+        out.push(char::from(HEX[usize::from(byte >> 4)]));
+        if out.len() < chars {
+            out.push(char::from(HEX[usize::from(byte & 0x0f)]));
+        }
+    }
+    out
 }
 
 /// Stable value-free account label recoverable by svc providers from the key
@@ -85,8 +164,44 @@ pub fn account_label(key_path: &Path) -> String {
 }
 
 fn record_path(dir: &Path, provider: &str, account: &str, instance: &str) -> PathBuf {
+    let mut tuple = Vec::new();
+    for part in [provider.as_bytes(), account.as_bytes(), instance.as_bytes()] {
+        tuple.extend_from_slice(&(part.len() as u64).to_be_bytes());
+        tuple.extend_from_slice(part);
+    }
+    let digest = Sha256::digest(&tuple);
+    dir.join(format!("{}.json", hex_prefix(&digest, 64)))
+}
+
+fn legacy_record_path(dir: &Path, provider: &str, account: &str, instance: &str) -> PathBuf {
     let id = crate::util::short_hash(&format!("{provider}\0{account}\0{instance}"), 24);
     dir.join(format!("{id}.json"))
+}
+
+fn check_tuple(
+    record: &AuthorizedKeyRecord,
+    provider: &str,
+    account: &str,
+    instance: &str,
+    path: &Path,
+) -> Result<()> {
+    anyhow::ensure!(
+        record.provider == provider && record.account == account && record.instance == instance,
+        "custody collision or corruption at {}",
+        path.display()
+    );
+    Ok(())
+}
+
+fn read_record(path: &Path) -> Result<Option<AuthorizedKeyRecord>> {
+    let body = match std::fs::read(path) {
+        Ok(body) => body,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error).with_context(|| format!("read {}", path.display())),
+    };
+    serde_json::from_slice(&body)
+        .with_context(|| format!("decode managed SSH custody record {}", path.display()))
+        .map(Some)
 }
 
 pub fn record_authorized(
@@ -110,18 +225,14 @@ pub fn record_authorized_with_proxy_worktree(
     public_key: &str,
     proxy_worktree: Option<&str>,
 ) -> Result<()> {
-    record_authorized_at(
+    let fingerprint = record_authorized_with_proxy_worktree_at(
         &dir(),
-        &AuthorizedKeyRecord {
-            provider: provider.to_string(),
-            account: account.to_string(),
-            instance: instance.to_string(),
-            key_path: key_path.to_path_buf(),
-            key_fingerprint: key_fingerprint(public_key),
-            authorized_at: crate::util::now(),
-            proxy_worktree: proxy_worktree.map(str::to_string),
-            rotation_recovery: None,
-        },
+        provider,
+        account,
+        instance,
+        key_path,
+        public_key,
+        proxy_worktree,
     )?;
     tracing::info!(
         target: "thegn::secret::audit",
@@ -129,11 +240,35 @@ pub fn record_authorized_with_proxy_worktree(
         provider,
         account,
         instance,
-        key_fingerprint = %key_fingerprint(public_key),
+        key_fingerprint = %fingerprint,
         outcome = "authorized",
         "managed SSH key authorization recorded",
     );
     Ok(())
+}
+
+fn record_authorized_with_proxy_worktree_at(
+    dir: &Path,
+    provider: &str,
+    account: &str,
+    instance: &str,
+    key_path: &Path,
+    public_key: &str,
+    proxy_worktree: Option<&str>,
+) -> Result<String> {
+    let fingerprint = try_key_fingerprint(public_key)?;
+    let record = AuthorizedKeyRecord {
+        provider: provider.to_string(),
+        account: account.to_string(),
+        instance: instance.to_string(),
+        key_path: key_path.to_path_buf(),
+        key_fingerprint: fingerprint,
+        authorized_at: crate::util::now(),
+        proxy_worktree: proxy_worktree.map(str::to_string),
+        rotation_recovery: None,
+    };
+    record_authorized_at(dir, &record)?;
+    Ok(record.key_fingerprint)
 }
 
 pub fn record_authorized_at(dir: &Path, record: &AuthorizedKeyRecord) -> Result<()> {
@@ -141,8 +276,34 @@ pub fn record_authorized_at(dir: &Path, record: &AuthorizedKeyRecord) -> Result<
     crate::fsperm::restrict_dir_to_owner(dir)
         .with_context(|| format!("restrict {}", dir.display()))?;
     let path = record_path(dir, &record.provider, &record.account, &record.instance);
+    let legacy = legacy_record_path(dir, &record.provider, &record.account, &record.instance);
+    for candidate in [&path, &legacy] {
+        if let Some(existing) = read_record(candidate).with_context(|| {
+            format!("publish managed SSH custody record {}", candidate.display())
+        })? {
+            check_tuple(
+                &existing,
+                &record.provider,
+                &record.account,
+                &record.instance,
+                candidate,
+            )?;
+        }
+    }
     crate::fsperm::write_owner_only_atomic(&path, &serde_json::to_vec_pretty(record)?)
-        .with_context(|| format!("publish managed SSH custody record {}", path.display()))
+        .with_context(|| format!("publish managed SSH custody record {}", path.display()))?;
+    if legacy != path {
+        remove_if_exists(&legacy)?;
+    }
+    Ok(())
+}
+
+fn remove_if_exists(path: &Path) -> Result<()> {
+    match std::fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error).with_context(|| format!("remove {}", path.display())),
+    }
 }
 
 pub fn record_revoked(provider: &str, account: &str, instance: &str) -> Result<()> {
@@ -173,12 +334,19 @@ pub fn record_revoked_at(dir: &Path, provider: &str, account: &str, instance: &s
 }
 
 fn remove_record_path(dir: &Path, provider: &str, account: &str, instance: &str) -> Result<()> {
-    let path = record_path(dir, provider, account, instance);
-    match std::fs::remove_file(&path) {
-        Ok(()) => Ok(()),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(error) => Err(error).with_context(|| format!("remove {}", path.display())),
+    let canonical = record_path(dir, provider, account, instance);
+    let legacy = legacy_record_path(dir, provider, account, instance);
+    for path in [&canonical, &legacy] {
+        if let Some(record) = read_record(path)
+            .with_context(|| format!("remove managed SSH custody record {}", path.display()))?
+        {
+            check_tuple(&record, provider, account, instance, path)?;
+        }
     }
+    for path in [&canonical, &legacy] {
+        remove_if_exists(path)?;
+    }
+    Ok(())
 }
 
 pub fn read(provider: &str, account: &str, instance: &str) -> Result<Option<AuthorizedKeyRecord>> {
@@ -191,15 +359,17 @@ pub fn read_at(
     account: &str,
     instance: &str,
 ) -> Result<Option<AuthorizedKeyRecord>> {
-    let path = record_path(dir, provider, account, instance);
-    let body = match std::fs::read(&path) {
-        Ok(body) => body,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(error) => return Err(error).with_context(|| format!("read {}", path.display())),
+    let canonical = record_path(dir, provider, account, instance);
+    let legacy = legacy_record_path(dir, provider, account, instance);
+    let (path, record) = if let Some(record) = read_record(&canonical)? {
+        (&canonical, record)
+    } else if let Some(record) = read_record(&legacy)? {
+        (&legacy, record)
+    } else {
+        return Ok(None);
     };
-    serde_json::from_slice(&body)
-        .with_context(|| format!("decode managed SSH custody record {}", path.display()))
-        .map(Some)
+    check_tuple(&record, provider, account, instance, path)?;
+    Ok(Some(record))
 }
 
 /// Resolve a provider+instance only when it is unambiguous across account
@@ -243,6 +413,7 @@ pub fn list_at(dir: &Path) -> Result<Vec<AuthorizedKeyRecord>> {
         }
     };
     let mut records = Vec::new();
+    let mut tuples = std::collections::HashMap::new();
     for entry in entries {
         let entry = entry.with_context(|| format!("read entry in {}", dir.display()))?;
         let path = entry.path();
@@ -250,8 +421,27 @@ pub fn list_at(dir: &Path) -> Result<Vec<AuthorizedKeyRecord>> {
             continue;
         }
         let body = std::fs::read(&path).with_context(|| format!("read {}", path.display()))?;
-        let record = serde_json::from_slice(&body)
+        let record: AuthorizedKeyRecord = serde_json::from_slice(&body)
             .with_context(|| format!("decode managed SSH custody record {}", path.display()))?;
+        let canonical = record_path(dir, &record.provider, &record.account, &record.instance);
+        let legacy = legacy_record_path(dir, &record.provider, &record.account, &record.instance);
+        anyhow::ensure!(
+            path == canonical || path == legacy,
+            "custody filename does not match embedded tuple at {}",
+            path.display()
+        );
+        let tuple = (
+            record.provider.clone(),
+            record.account.clone(),
+            record.instance.clone(),
+        );
+        if let Some(previous) = tuples.insert(tuple, path.clone()) {
+            anyhow::bail!(
+                "duplicate managed SSH custody tuple at {} and {}",
+                previous.display(),
+                path.display()
+            );
+        }
         records.push(record);
     }
     records.sort_by(|a: &AuthorizedKeyRecord, b| {
@@ -285,9 +475,89 @@ mod tests {
 
         assert_eq!(plain, different_comment);
         assert_eq!(plain, irregular_whitespace);
-        assert_eq!(plain.len(), 16);
+        assert!(plain.starts_with("invalid:"));
         assert_ne!(plain, key_fingerprint("ssh-ed25519 AAAAOTHER comment"));
         assert!(!plain.contains("AAAATEST"));
+    }
+
+    #[test]
+    fn fingerprint_matches_openssh_sha256_vectors() {
+        let key = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIIgVgF3FLyN2aHUalBpkk3cMVfTgD+7TrbdfTAcSvLvB thegn";
+        let expected = "SHA256:7wNHZPUVQSnbsSe5yU7EEx0GGDS9qo9UK41TH7Cam/g";
+        assert_eq!(try_key_fingerprint(key).unwrap(), expected);
+        assert_eq!(key_fingerprint(key), expected);
+        assert_eq!(
+            try_key_fingerprint("  ssh-ed25519\n\tAAAAC3NzaC1lZDI1NTE5AAAAIIgVgF3FLyN2aHUalBpkk3cMVfTgD+7TrbdfTAcSvLvB   other comment ").unwrap(),
+            expected
+        );
+        assert_eq!(
+            try_key_fingerprint("ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAICXLY4ay5H8w/Ud7QvnU1EtrjkvENKLoy7B0YU17bVzq vec2").unwrap(),
+            "SHA256:pGlFHtaffuJRePHewrYb6Y+zhMDhFIBNiF5SbSOmpug"
+        );
+    }
+
+    #[test]
+    fn legacy_fingerprints_are_labeled_unverified_for_audit() {
+        assert_eq!(
+            fingerprint_audit_label("0123456789abcdef"),
+            "0123456789abcdef (legacy, unverified)"
+        );
+        assert_eq!(fingerprint_audit_label("SHA256:abc"), "SHA256:abc");
+    }
+
+    #[test]
+    fn unparsable_keys_never_get_a_sha256_fingerprint() {
+        let temp = tempfile::tempdir().unwrap();
+        for key in [
+            "",
+            "ssh-ed25519 AAAATEST x",
+            "ssh-ed25519 AAAA",
+            "ssh-ed25519 AAAABXNz",
+            "ssh-rsa AAAAC3NzaC1lZDI1NTE5AAAAIIgVgF3FLyN2aHUalBpkk3cMVfTgD+7TrbdfTAcSvLvB",
+            "ssh-ed25519",
+        ] {
+            assert!(try_key_fingerprint(key).is_err());
+            let fingerprint = key_fingerprint(key);
+            assert!(fingerprint.starts_with("invalid:"));
+            assert!(!fingerprint_is_verified(&fingerprint));
+        }
+        assert!(
+            record_authorized_with_proxy_worktree_at(
+                temp.path(),
+                "fly",
+                "account",
+                "instance",
+                Path::new("/state/key"),
+                "ssh-ed25519 AAAATEST x",
+                None,
+            )
+            .is_err()
+        );
+        assert_eq!(std::fs::read_dir(temp.path()).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn authorization_helper_returns_the_published_fingerprint() {
+        let temp = tempfile::tempdir().unwrap();
+        let key = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIIgVgF3FLyN2aHUalBpkk3cMVfTgD+7TrbdfTAcSvLvB thegn";
+        let expected = "SHA256:7wNHZPUVQSnbsSe5yU7EEx0GGDS9qo9UK41TH7Cam/g";
+
+        let fingerprint = record_authorized_with_proxy_worktree_at(
+            temp.path(),
+            "fly",
+            "account",
+            "instance",
+            Path::new("/state/key"),
+            key,
+            None,
+        )
+        .unwrap();
+        let published = read_at(temp.path(), "fly", "account", "instance")
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(fingerprint, expected);
+        assert_eq!(published.key_fingerprint, fingerprint);
     }
 
     #[test]
@@ -319,6 +589,107 @@ mod tests {
         assert!(!name.contains("fly"));
         assert!(!name.contains("account"));
         assert!(!name.contains("instance"));
+        assert_eq!(name.len(), 69);
+    }
+
+    #[test]
+    fn a_planted_row_with_another_tuple_is_a_collision() {
+        let temp = tempfile::tempdir().unwrap();
+        let requested = record();
+        let mut planted = requested.clone();
+        planted.provider = "other-provider".into();
+        planted.instance = "other-instance".into();
+        let path = record_path(
+            temp.path(),
+            &requested.provider,
+            &requested.account,
+            &requested.instance,
+        );
+        let planted_bytes = serde_json::to_vec(&planted).unwrap();
+        std::fs::write(&path, &planted_bytes).unwrap();
+
+        assert!(
+            read_at(
+                temp.path(),
+                &requested.provider,
+                &requested.account,
+                &requested.instance
+            )
+            .is_err()
+        );
+        assert!(record_authorized_at(temp.path(), &requested).is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), planted_bytes);
+        assert!(
+            record_revoked_at(
+                temp.path(),
+                &requested.provider,
+                &requested.account,
+                &requested.instance
+            )
+            .is_err()
+        );
+        assert!(path.exists());
+        assert!(list_at(temp.path()).is_err());
+    }
+
+    #[test]
+    fn legacy_fnv_rows_are_read_and_migrated_on_write() {
+        let temp = tempfile::tempdir().unwrap();
+        let existing = record();
+        let legacy = legacy_record_path(
+            temp.path(),
+            &existing.provider,
+            &existing.account,
+            &existing.instance,
+        );
+        let canonical = record_path(
+            temp.path(),
+            &existing.provider,
+            &existing.account,
+            &existing.instance,
+        );
+        std::fs::write(&legacy, serde_json::to_vec(&existing).unwrap()).unwrap();
+
+        assert_eq!(
+            read_at(
+                temp.path(),
+                &existing.provider,
+                &existing.account,
+                &existing.instance
+            )
+            .unwrap(),
+            Some(existing.clone())
+        );
+        assert_eq!(list_at(temp.path()).unwrap(), vec![existing.clone()]);
+        let mut updated = existing.clone();
+        updated.authorized_at += 1;
+        record_authorized_at(temp.path(), &updated).unwrap();
+        assert!(canonical.exists());
+        assert!(!legacy.exists());
+        assert_eq!(list_at(temp.path()).unwrap(), vec![updated]);
+    }
+
+    #[test]
+    fn inventory_rejects_duplicate_legacy_and_canonical_tuple_rows() {
+        let temp = tempfile::tempdir().unwrap();
+        let existing = record();
+        let legacy = legacy_record_path(
+            temp.path(),
+            &existing.provider,
+            &existing.account,
+            &existing.instance,
+        );
+        let canonical = record_path(
+            temp.path(),
+            &existing.provider,
+            &existing.account,
+            &existing.instance,
+        );
+        let bytes = serde_json::to_vec(&existing).unwrap();
+        std::fs::write(&legacy, &bytes).unwrap();
+        std::fs::write(&canonical, bytes).unwrap();
+
+        assert!(list_at(temp.path()).is_err());
     }
 
     #[test]
@@ -408,7 +779,7 @@ mod tests {
             "env:FLY_WORK",
             "instance-1",
             key_path,
-            "ssh-ed25519 AAAATEST do-not-persist",
+            "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIIgVgF3FLyN2aHUalBpkk3cMVfTgD+7TrbdfTAcSvLvB do-not-persist",
         )
         .unwrap();
         let original = read("fly", "env:FLY_WORK", "instance-1").unwrap().unwrap();
@@ -457,7 +828,7 @@ mod tests {
             "account-a",
             "sprite-1",
             key,
-            "ssh-ed25519 AAAAONE",
+            "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIIgVgF3FLyN2aHUalBpkk3cMVfTgD+7TrbdfTAcSvLvB",
             Some("project/feature"),
         )
         .unwrap();
@@ -471,7 +842,7 @@ mod tests {
             "account-b",
             "sprite-1",
             key,
-            "ssh-ed25519 AAAATWO",
+            "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAICXLY4ay5H8w/Ud7QvnU1EtrjkvENKLoy7B0YU17bVzq",
             Some("project/other"),
         )
         .unwrap();

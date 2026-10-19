@@ -201,8 +201,14 @@ pub fn report_commit_binding(
 ///   the source of truth, so an uncommitted artifact is not a handoff yet. The
 ///   report check gates on the worker filing a handoff summary via `thegn
 ///   dispatch report` — a row with an artifact set must also deliver a report.
+///   The worktree status must also be observable for artifact-bearing rows; an
+///   unknown status refuses completion until verification is retried or
+///   explicitly overridden with `--force`. A plain dispatch without an
+///   artifact does not require a worktree observation.
 /// - A dirty worktree is **reported, never blocking**: it is legitimate
-///   mid-review, and the tracked check already holds the line.
+///   mid-review, and the tracked check already holds the line. An unknown
+///   worktree status does block artifact-bearing completion because cleanliness
+///   could not be established.
 pub fn verify_report(f: &VerifyFacts) -> VerifyReport {
     let Some(a) = &f.artifact else {
         let reasons = if f.stage.is_some() {
@@ -227,8 +233,8 @@ pub fn verify_report(f: &VerifyFacts) -> VerifyReport {
     let mut reasons = Vec::new();
     let mut warnings = Vec::new();
     if f.worktree_state == Some(WorktreeState::Unknown) {
-        warnings.push(
-            "could not observe worktree status (`git status --porcelain`); retry verification"
+        reasons.push(
+            "could not observe worktree status (`git status --porcelain` failed); retry verification"
                 .into(),
         );
     }
@@ -756,17 +762,14 @@ mod tests {
     }
 
     #[test]
-    fn an_unknown_worktree_status_is_reported_without_changing_the_gate() {
+    fn an_unknown_worktree_status_refuses_completion() {
         let mut f = facts_report(Some("a.md"), true, true, false, true);
         f.worktree_state = Some(WorktreeState::Unknown);
         let r = verify_report(&f);
-        assert!(
-            r.ok,
-            "unknown status remains a warning under today's contract"
-        );
+        assert!(!r.ok);
         assert!(!r.dirty, "legacy boolean remains backward compatible");
         assert_eq!(r.worktree_state, Some(WorktreeState::Unknown));
-        assert!(r.warnings.iter().any(|w| w.contains("retry verification")));
+        assert!(r.reasons.iter().any(|w| w.contains("retry verification")));
     }
 
     #[test]
@@ -1084,5 +1087,14 @@ prompt = "row {row}; thegn dispatch report {row}"
             merged.daemon.idle_exit_secs, 17,
             "daemon policy remains boot-fixed"
         );
+    }
+
+    #[test]
+    fn a_plain_dispatch_with_unknown_status_is_unaffected() {
+        let mut f = facts(None, false, false, false);
+        f.worktree_state = Some(WorktreeState::Unknown);
+        let report = verify_report(&f);
+        assert!(report.ok);
+        assert!(report.reasons.is_empty());
     }
 }

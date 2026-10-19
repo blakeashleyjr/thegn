@@ -861,6 +861,28 @@ fn a_minimal_plugin_event_deserializes_and_unknown_fields_are_ignored() {
 }
 
 #[test]
+fn recurrence_id_is_optional_on_the_plugin_wire() {
+    let json = r#"{
+        "uid": "1",
+        "title": "Standup",
+        "start": {"kind":"zoned","local":"2026-08-21T09:30:00","zone":"UTC"},
+        "end":   {"kind":"zoned","local":"2026-08-21T10:00:00","zone":"UTC"}
+    }"#;
+    let master: CalEvent = serde_json::from_str(json).unwrap();
+    assert_eq!(master.recurrence_id, None);
+    let master_json = serde_json::to_value(&master).unwrap();
+    assert!(master_json.get("recurrence_id").is_none());
+
+    let mut override_event = master.clone();
+    override_event.recurrence_id = Some(EventTime::Date {
+        date: d(2026, 8, 22),
+    });
+    let encoded = serde_json::to_string(&override_event).unwrap();
+    let decoded: CalEvent = serde_json::from_str(&encoded).unwrap();
+    assert_eq!(decoded, override_event);
+}
+
+#[test]
 fn every_event_time_shape_round_trips_through_json() {
     for t in [
         EventTime::Date {

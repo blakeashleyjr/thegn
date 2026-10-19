@@ -183,10 +183,10 @@ is not double-counted. Interface rows keep idle and down links visible, and
 fold interfaces beyond the eight tracked interfaces into an `other` row. Use
 `f`/`F` to focus a panel, `z` to zoom it, and `Esc` to step back through focus
 and zoom.
-The Owners panel shows TCP byte rates by pane, container, app or unit from
-socket cgroups, with short history sparks. It refreshes every five seconds while
-the tab is visible and works without elevated privileges; UDP, QUIC and other
-traffic appears as the unattributed remainder.
+The Owners panel shows TCP byte rates by pane, container, app, unit or slice
+from socket cgroups, with short history sparks. It refreshes every five seconds
+while the tab is visible and works without elevated privileges; UDP, QUIC and
+other traffic appears as the unattributed remainder.
 The network masthead chip expands into this tab.
 
 ## Disk
@@ -215,23 +215,7 @@ clean confirmation for the highlighted row while the Worktrees panel is on
 screen. Cleaning keeps the checkout and removes only regenerable build artifacts
 off the event loop; the row updates after the next measurement. Use `f`/`F` to
 move panel focus, `z` to zoom, and `Esc` to unzoom before closing the monitor.
-
-The Worktrees panel lists each cached worktree's total size, reclaimable
-`target/` size, and measurement age, and its title gives the total reclaimable
-amount. It does not show a time-to-full projection. The optional
-`[stats.alerts] disk_eta` rule (off by default) still uses the recorded
-free-space history and fires when its runway drops below the configured number
-of hours. The Disk masthead chip expands into this tab.
-
-The Filesystems panel shows each mount point, filesystem type, used/total
-space, and a fill gauge. It does not show available space as a separate
-column. `+N` marks further mount points of the same superblock folded into that
-row.
-clean confirmation for the highlighted row. Cleaning keeps the checkout and
-removes only regenerable build artifacts off the event loop; the row updates
-after the next measurement. Use `f`/`F` to move panel focus, `z` to zoom, and
-`Esc` to unzoom before closing the monitor. The Disk masthead chip expands into
-this tab.
+The Disk masthead chip expands into this tab.
 
 On Linux, `thegn doctor` also reports Disk health from UDisks2 when available,
 including health, critical warnings, wear, spare, read/write totals, power-on
@@ -249,7 +233,8 @@ on a labelled 0–100% scale, alongside engine busy history. Memory and clocks
 panels plot each device's VRAM/GTT use, clock level, and power against its
 reported cap on labelled 0–100% scales when readings are available. A runtime-
 suspended card is not woken to sample it; its values are shown as unavailable
-rather than zero. On APUs, shared memory is labelled `shared vram`.
+rather than zero. Missing per-sample readings leave gaps in the history plots
+instead of being drawn as zero. On APUs, shared memory is labelled `shared vram`.
 
 On NVIDIA and Intel, the tab keeps the legacy GPU readings because this board's
 engine counters are AMDGPU-only. The GPU masthead chip expands into the tab. When
@@ -318,12 +303,13 @@ and new/exited values unknown until their baselines are available.
   the footer. This is a local, terminal-only action: it is not exposed to the
   CLI, the control API, or any remote surface.
 - `X` opens the platform signal menu: `t` TERM, `i` INT, `h` HUP, `k` KILL,
-  `s` STOP and `c` CONT on Linux and macOS, or `t` TERM on Windows, followed by
-  `r` TERM tree. Choose by letter or with the arrow keys and Enter. TERM, INT,
-  HUP and CONT are sent immediately; KILL, STOP and TERM tree ask for `y`
-  confirmation (or `n` / `Esc` to cancel). On Windows, TERM is a hard
-  `TerminateProcess` and asks for `y`. The selected PID and start time are
-  checked again before delivery. STOP pauses a process and CONT resumes it.
+  `s` STOP and `c` CONT on Linux and macOS; Windows offers `t` TERM. All
+  platforms also offer `r` TERM tree. Choose by letter or with the arrow keys
+  and Enter. TERM, INT, HUP and CONT are sent immediately; KILL, STOP and TERM
+  tree ask for `y` confirmation (or `n` / `Esc` to cancel). On Windows, TERM
+  is a hard `TerminateProcess` and asks for `y`. The selected PID and start
+  time are checked again before delivery. STOP pauses a process and CONT
+  resumes it.
   TERM tree sends TERM to the selected process and its descendants in the
   sampled process list, deepest first, checking each process identity before
   signalling it. It refuses a tree containing thegn and reports sent, vanished
@@ -355,15 +341,14 @@ Set `[monitor] processes = false` to disable the tab entirely, and
 
 ## Containers
 
-The tab is a board with estate totals, CPU, memory and I/O history, an inventory
-list with the action cursor, and a per-scope stats table. Cgroup stats are sampled
-only while the tab is visible and unpaused. Without cgroup v2 stats, those panels
-show `—` while the inventory and its actions keep working.
-
 The Containers tab lists every container on the machine across the detected
 backends, containers proven to belong to this profile first (tinted, foreign
 ones ghosted), with each one's status/health and — while the tab is open — live
-CPU, memory and network. The heading is just `containers`: the note beside it
+CPU, memory and network. Its board shows estate totals, CPU, memory and I/O
+history, an inventory list with the action cursor, and a per-scope stats table.
+Without cgroup v2 stats, those panels show `—` while the inventory and its
+actions keep working. Cgroup stats are sampled only while the tab is visible
+and unpaused. The heading is just `containers`: the note beside it
 leads with the ownership split — how many are owned under that rule, how many
 are foreign — because the list deliberately includes foreign containers. On an
 engine that reports a footprint it continues with images, volumes and the

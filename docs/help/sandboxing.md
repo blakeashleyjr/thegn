@@ -77,8 +77,10 @@ runtime/control socket dir, credential dirs under `$HOME` (`.ssh`, `.aws`,
 `.gnupg`, `.config/gh`, `.kube`, `.docker`, `.netrc`, `.git-credentials`) or a
 container-engine socket. This includes binds of a parent directory,
 bind-backed named volumes, and file secrets/configs; there is no per-repo
-opt-out. If the config cannot be inspected, launch proceeds with a warning and
-is reported as host-process isolation. Remote placements are not checked.
+opt-out. The inspected service model and mount paths are what thegn launches;
+Compose files and interpolation inputs are inspected again on the next launch.
+If the config cannot be inspected, launch proceeds with a warning and is
+reported as host-process isolation. Remote placements are not checked.
 Queue-agent sandboxes get the same protected-bind check, including the daemon
 control-socket directory; a protected bind is refused and the queue dispatch is
 held. If their Compose config cannot be inspected, the agent runs degraded with
@@ -462,6 +464,8 @@ tunes keepalives, timeouts, and retry backoff for flaky links.
 > Remote worktrees and cloud providers are **dev-channel only** — see
 > [[release-channels]].
 
+A remote checkout with commits or changes made since thegn last synced it is kept for recovery, and thegn shows how to recover it.
+
 ## Inspecting
 
 The panel's **system → sandbox** section shows the live state for the
@@ -505,6 +509,10 @@ Cleanup is always explicit — thegn never prunes on a schedule.
   for sidecars it removes, plus staging directories older than an hour whose
   sidecar is gone when at least one runtime could be listed; symlinks are
   never followed.
+  At startup, the sweep runs only when the effective configuration can produce
+  a sandbox container (enabled globally or by the active profile, an env
+  overlay, or a repo overlay for a known worktree); `thegn sandbox gc` runs it
+  regardless.
   Safe to run any time.
 - `thegn sandbox prune` reclaims **thegn-owned (`thegn-` name family) stopped
   containers**, and `thegn.managed` images and volumes. On a terminal it
