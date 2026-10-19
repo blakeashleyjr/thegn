@@ -42,7 +42,8 @@ it. The `[forward]` deadlines `reverse_write_stall_secs` (default 60),
 apply on both ends of the tunnel. A write-stall value of 0 uses 60 seconds;
 idle and lifetime values of 0 disable those deadlines. Values are read when a
 tunnel starts or reconnects, so a running tunnel keeps its starting values.
-Connection deadline behavior is configurable; retry behavior stays fixed. A
+The idle, lifetime and write-stall deadlines are configurable; the dial timeout
+and retry behavior stay fixed. A
 local write stall closes that connection, while a stall of
 `reverse_write_stall_secs` writing to the shared tunnel ends the tunnel run;
 the host supervisor reconnects it with bounded backoff. On the sandbox side, transient accept errors such as running

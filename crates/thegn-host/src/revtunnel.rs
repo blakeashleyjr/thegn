@@ -100,11 +100,20 @@ fn next_backoff(session_lasted: Duration, current: Duration) -> Duration {
     }
 }
 
-struct TunnelRunLimits {
+pub(crate) struct TunnelRunLimits {
     max_connections: usize,
     global_permits: Arc<Semaphore>,
-    deadlines: TunnelDeadlines,
     deadline_secs: TunnelDeadlineSecs,
+}
+
+impl From<TunnelDeadlineSecs> for TunnelDeadlines {
+    fn from(deadlines: TunnelDeadlineSecs) -> Self {
+        Self {
+            write_stall: Duration::from_secs(deadlines.write_stall),
+            idle: deadlines.idle.map(Duration::from_secs),
+            lifetime: deadlines.lifetime.map(Duration::from_secs),
+        }
+    }
 }
 
 fn bridge_argv(bridge_path: String, port: u16, deadlines: &TunnelDeadlineSecs) -> Vec<String> {
@@ -216,7 +225,7 @@ impl ReverseTunnelSupervisor {
                             HostLimits {
                                 max_connections: limits.max_connections,
                                 global_permits: limits.global_permits.clone(),
-                                deadlines: limits.deadlines,
+                                deadlines: limits.deadline_secs.into(),
                             },
                         )
                         .await
@@ -290,11 +299,6 @@ impl ReverseTunnelSupervisor {
         };
         let max_connections = cfg.forward.reverse_max_connections;
         let deadline_secs = cfg.forward.tunnel_deadlines();
-        let deadlines = TunnelDeadlines {
-            write_stall: Duration::from_secs(deadline_secs.write_stall),
-            idle: deadline_secs.idle.map(Duration::from_secs),
-            lifetime: deadline_secs.lifetime.map(Duration::from_secs),
-        };
         for (sandbox_port, host_target) in tunnels {
             let Some(provider) = crate::provider_factory::provider_for(pc) else {
                 return;
@@ -311,7 +315,6 @@ impl ReverseTunnelSupervisor {
                 TunnelRunLimits {
                     max_connections,
                     global_permits: global_permits.clone(),
-                    deadlines,
                     deadline_secs,
                 },
             );
@@ -425,6 +428,22 @@ mod tests {
                 expected.into_iter().map(String::from).collect::<Vec<_>>()
             );
         }
+    }
+
+    #[test]
+    fn host_deadline_conversion_preserves_config_zero_rules() {
+        assert_eq!(
+            TunnelDeadlines::from(TunnelDeadlineSecs {
+                write_stall: 60,
+                idle: None,
+                lifetime: Some(9),
+            }),
+            TunnelDeadlines {
+                write_stall: Duration::from_secs(60),
+                idle: None,
+                lifetime: Some(Duration::from_secs(9)),
+            }
+        );
     }
 
     #[test]
