@@ -65,11 +65,13 @@ Recipes:
 <host-tag>.idle.json`; host-tag = arch + cpu-model hash, so machine dependence is
   explicit).
 - `just bench-steady` — feeds `test/perf/scenarios/steady-workload.keys`; A/B only.
-  Workload keys are paced through the harness PTY; the run fails with
-  `FAIL: key injection had no observable effect` if no key dispatch is logged.
-  `TG_PERF_DROP_KEYS=1` is the negative control. Result JSON includes `input`
-  (null for idle). The environment scrubs inherited `THEGN_*` and credential
-  variables while keeping `TG_PERF_*`; soak-daemon binds its own daemon socket.
+  Workload keys are paced through the harness PTY and include an echoing word
+  erased with Backspace, so nothing executes. The run fails if any key event has
+  no dispatch line or a typed character is consumed by a keymap instead of
+  reaching the pane. `TG_PERF_DROP_KEYS=1` is the negative control. Result JSON
+  includes `input` (null for idle). The environment scrubs inherited `THEGN_*` and
+  credential variables while keeping `TG_PERF_*`; soak-daemon binds its own daemon
+  socket.
 - The shell perf harness writes `[media] enabled = false` so the media fallback cannot
   spawn `playerctl` when the isolated session has no MPRIS bus. The harness
   disables sandboxing by default; set `TG_PERF_SANDBOX=1` to
