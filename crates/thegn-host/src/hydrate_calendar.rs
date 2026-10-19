@@ -752,6 +752,7 @@ fn row_of(e: &CalEvent, href: Option<&str>) -> CalendarRow {
     };
     CalendarRow {
         uid: e.uid.clone(),
+        recurrence_key: e.recurrence_key(),
         calendar: e.calendar.clone(),
         start_ms: ms(&e.start),
         end_ms: ms(&e.end),
