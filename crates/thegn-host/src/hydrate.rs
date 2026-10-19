@@ -1581,6 +1581,7 @@ fn collect_sidebar_status(
     // pre-gate behaviour — see `activity_step::Agentness`.
     let mut activity_agents = std::collections::BTreeMap::new();
     let db_worktrees = db.worktrees().unwrap_or_default();
+    let locations = thegn_core::remote::WorktreeLocations::from_rows(&db_worktrees);
     let mut devcontainer_probe = None;
     for wt in &db_worktrees {
         if wt.worktree.is_empty() || wt.repo_root.is_empty() {
@@ -1651,7 +1652,7 @@ fn collect_sidebar_status(
     // no worktree is remote / no bridge is connected.
     let mut activity_extra = std::collections::BTreeMap::new();
     for w in &managed {
-        let loc = GitLoc::for_worktree(std::path::Path::new(&w.worktree));
+        let loc = locations.loc(std::path::Path::new(&w.worktree));
         if !loc.is_remote() {
             continue;
         }
@@ -1708,7 +1709,7 @@ fn collect_sidebar_status(
     // Reconcile the warm set now (after fresh activity): drop resident bridges for
     // idle, over-budget remote sandboxes so they suspend — BEFORE the glyph scan
     // below, so the just-suspended ones serve cache instead of being woken.
-    crate::lifecycle::reconcile(session, app_cfg, lifecycle);
+    crate::lifecycle::reconcile(session, app_cfg, lifecycle, &locations);
     let gate_remote_scans = lifecycle.enabled && lifecycle.serve_cached_glyphs;
 
     // Badge counts (item 28): unread + alert notifications grouped by worktree.
