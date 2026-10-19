@@ -1157,6 +1157,11 @@ fn run_main() -> anyhow::Result<()> {
             "background merge work did not stop within the 4-second shutdown bound; its gate may still be running"
         );
     }
+    // Cancel and join the cover-art task and its decoder slot so exit never
+    // strands a blocking decode; this is a no-op when no art is in flight.
+    rt.block_on(crate::media_art::shutdown(
+        std::time::Duration::from_millis(500),
+    ));
     rt.shutdown_background();
     report_kept_sessions(handlers::daemon_lifecycle::kept_sessions());
     // The outer process wrapper prints the error after the compositor has torn
