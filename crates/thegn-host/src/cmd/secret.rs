@@ -178,10 +178,12 @@ fn audit(cfg: &Config, json: bool) -> Result<()> {
                     "instance": &record.instance,
                     "key": record.key_path.file_name().and_then(|name| name.to_str()),
                     "fingerprint": &record.key_fingerprint,
+                    "fingerprint_verified": thegn_core::managed_ssh::fingerprint_is_verified(&record.key_fingerprint),
                     "authorized_at": record.authorized_at,
                     "rotation_recovery": record.rotation_recovery.as_ref().map(|recovery| serde_json::json!({
                         "key": recovery.key_path.file_name().and_then(|name| name.to_str()),
                         "fingerprint": &recovery.key_fingerprint,
+                        "fingerprint_verified": thegn_core::managed_ssh::fingerprint_is_verified(&recovery.key_fingerprint),
                         "authorized": recovery.authorized,
                         "verified": recovery.verified,
                         "retiring_started": recovery.retiring_started,
@@ -201,17 +203,24 @@ fn audit(cfg: &Config, json: bool) -> Result<()> {
     } else {
         outln!("managed ssh authorizations:");
         for record in managed {
+            let fingerprint =
+                thegn_core::managed_ssh::fingerprint_audit_label(&record.key_fingerprint);
             let recovery = record
                 .rotation_recovery
                 .as_ref()
-                .map(|state| format!(" recovery={}", state.key_fingerprint))
+                .map(|state| {
+                    format!(
+                        " recovery={}",
+                        thegn_core::managed_ssh::fingerprint_audit_label(&state.key_fingerprint)
+                    )
+                })
                 .unwrap_or_default();
             outln!(
                 "  {:<12} {:<24} {:<24} {}{}",
                 record.provider,
                 record.account,
                 record.instance,
-                record.key_fingerprint,
+                fingerprint,
                 recovery,
             );
         }
