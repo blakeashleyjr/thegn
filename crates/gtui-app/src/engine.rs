@@ -179,6 +179,8 @@ type PanelQueryJob = (
     Option<Arc<dyn DataSource>>,
     Vec<(String, String, Query)>,
 );
+type TargetIdentity = (String, String);
+type PanelJobIds = HashMap<tokio::task::Id, (u32, Vec<TargetIdentity>)>;
 
 enum QueryOutcome {
     Complete(bool),
@@ -395,7 +397,7 @@ impl QueryEngine {
         let mut job_ids = HashMap::new();
         let mut jobs = jobs.into_iter();
         let spawn_job = |pending: &mut JoinSet<(u32, Vec<TargetUpdate>)>,
-                         job_ids: &mut HashMap<tokio::task::Id, (u32, Vec<(String, String)>)>,
+                         job_ids: &mut PanelJobIds,
                          job: PanelQueryJob| {
             let (panel_id, datasource, source, targets) = job;
             let has_more_targets = targets.len() > MAX_TARGETS_PER_PANEL;
