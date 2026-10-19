@@ -10,6 +10,7 @@ integrate.rs
 integrate_candidate_tests.rs
 integrate_gate_tests.rs
 integrate_persistence.rs
+managed_ssh_rotation.rs
 merge_cleanup.rs
 merge_driver.rs
 merge_ops.rs
