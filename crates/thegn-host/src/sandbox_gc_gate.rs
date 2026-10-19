@@ -6,6 +6,8 @@ use thegn_core::config::Config;
 /// Whether the effective global/profile/env configuration can produce a
 /// thegn container. Repo-root overlays are checked against DB worktree roots
 /// by the startup worker because they can enable sandboxing independently.
+/// Any enabled env overlay keeps the startup sweep wanted, even if no repo
+/// currently selects that env.
 pub(crate) fn startup_gc_wanted(cfg: &Config) -> bool {
     let mut base = cfg.sandbox.enabled;
     if let Some(profile) = cfg.active_profile()
@@ -17,6 +19,14 @@ pub(crate) fn startup_gc_wanted(cfg: &Config) -> bool {
         .env
         .values()
         .any(|env| env.sandbox.enabled == Some(true))
+}
+
+/// Start a startup sandbox subscriber only when the effective configuration
+/// can produce sandbox containers.
+pub(crate) fn with_startup_sandbox_events(cfg: &Config, start: impl FnOnce()) {
+    if startup_gc_wanted(cfg) {
+        start();
+    }
 }
 
 /// Whether a repo overlay enables sandboxing for any DB worktree row.
@@ -91,12 +101,21 @@ mod tests {
         assert!(!startup_gc_wanted(&parsed(
             "profile = \"p\"\n[profiles.p.sandbox]\nenabled = false\n"
         )));
-        assert!(!startup_gc_wanted(&parsed(
-            "[sandbox]\nenabled = false\n[profiles.q.sandbox]\nenabled = true\n"
-        )));
         assert!(startup_gc_wanted(&parsed(
             "profile = \"p\"\n[sandbox]\nenabled = false\n[profiles.p.sandbox]\nenabled = true\n"
         )));
+    }
+
+    #[test]
+    fn startup_events_are_gated_when_active_profile_disables_global_sandbox() {
+        let cfg = parsed(
+            "profile = \"p\"\n[sandbox]\nenabled = true\n[profiles.p.sandbox]\nenabled = false\n",
+        );
+        let started = std::cell::Cell::new(false);
+
+        super::with_startup_sandbox_events(&cfg, || started.set(true));
+
+        assert!(!started.get());
     }
 
     #[test]
