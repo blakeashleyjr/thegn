@@ -1,21 +1,25 @@
-#![allow(dead_code)] // wiring waits for V-CTR-1b
-
 use crate::{
     compositor::Rect,
     monitor::{
         board::TabView,
         graphs,
-        kit::{emit::Emitter, grid::CellGrid, panel},
+        kit::{
+            emit::Emitter,
+            grid::{CellGrid, CellStyle},
+            panel,
+        },
         layout::{Node, PanelId, PanelSpec, Placed, Size, Variant, VariantKind},
     },
     sections::Section,
+    seg::StyleTok,
 };
 use std::sync::Arc;
 use termwiz::surface::Surface;
 use thegn_core::{
     numfmt::{Marks, NumFmt, Reading, Unit, ZeroStyle},
     sandbox::ContainerInfo,
-    theme::RampId,
+    sandbox_manage::{ContainerFootprint, Health as ContainerHealth, container_health},
+    theme::{Hue, RampId, SeriesRole},
 };
 use thegn_metrics::collect::{
     CollectorId, CollectorSet,
@@ -29,6 +33,7 @@ const CPU: PanelId = PanelId("containers.cpu");
 const MEMORY: PanelId = PanelId("containers.memory");
 const IO: PanelId = PanelId("containers.io");
 const TABLE: PanelId = PanelId("containers.table");
+const INVENTORY: PanelId = PanelId("containers.inventory");
 const HISTORY_CAP: usize = 120;
 const SLOT_CAP: usize = 32;
 const TABLE_ID: usize = 0;
@@ -43,30 +48,35 @@ const VARIANT: [Variant; 1] = [Variant {
     min: (24, 4),
     pref: (64, 10),
 }];
-const SPECS: [PanelSpec; 5] = [
+const SPECS: [PanelSpec; 6] = [
     PanelSpec {
         id: ESTATE,
         priority: 0,
         variants: &VARIANT,
     },
     PanelSpec {
-        id: CPU,
+        id: INVENTORY,
         priority: 1,
         variants: &VARIANT,
     },
     PanelSpec {
-        id: MEMORY,
+        id: CPU,
         priority: 2,
         variants: &VARIANT,
     },
     PanelSpec {
-        id: IO,
+        id: MEMORY,
         priority: 3,
         variants: &VARIANT,
     },
     PanelSpec {
-        id: TABLE,
+        id: IO,
         priority: 4,
+        variants: &VARIANT,
+    },
+    PanelSpec {
+        id: TABLE,
+        priority: 5,
         variants: &VARIANT,
     },
 ];
@@ -175,8 +185,11 @@ impl Default for ContainersModel {
 
 impl ContainersModel {
     pub(in crate::monitor) fn absorb_frame(&mut self, frame: &MonitorFrame) {
-        let part = &frame.parts.containers_stats;
         self.health = frame.health[CollectorId::ContainersStats.index()];
+        if !frame.sampled.contains(CollectorId::ContainersStats) {
+            return;
+        }
+        let part = &frame.parts.containers_stats;
         self.scopes = part.scopes;
         self.truncated = part.truncated;
         self.rescans = part.rescans;
@@ -344,14 +357,23 @@ fn fill_slot(slot: &mut Slot, row: &ContainerStatsRow) {
 pub(in crate::monitor) struct ContainersView<'a> {
     model: &'a ContainersModel,
     inventory: &'a [ContainerInfo],
+    footprint: Option<ContainerFootprint>,
+    sel: usize,
 }
 
 impl<'a> ContainersView<'a> {
     pub(in crate::monitor) fn new(
         model: &'a ContainersModel,
         inventory: &'a [ContainerInfo],
+        footprint: Option<ContainerFootprint>,
+        sel: usize,
     ) -> Self {
-        Self { model, inventory }
+        Self {
+            model,
+            inventory,
+            footprint,
+            sel,
+        }
     }
 }
 
@@ -362,6 +384,7 @@ impl TabView for ContainersView<'_> {
     fn template(&self) -> Node {
         Node::Col(vec![
             (Size::Weight(1), Node::Panel(ESTATE)),
+            (Size::Weight(1), Node::Panel(INVENTORY)),
             (
                 Size::Weight(2),
                 Node::Row(vec![
@@ -378,9 +401,11 @@ impl TabView for ContainersView<'_> {
             ),
         ])
     }
-    fn demand(&self, _panel: PanelId) -> CollectorSet {
+    fn demand(&self, panel: PanelId) -> CollectorSet {
         let mut set = CollectorSet::empty();
-        set.insert(CollectorId::ContainersStats);
+        if panel != INVENTORY {
+            set.insert(CollectorId::ContainersStats);
+        }
         set
     }
     fn paint(
@@ -394,14 +419,30 @@ impl TabView for ContainersView<'_> {
         let mut grid = CellGrid::new(rect.cols, rect.rows);
         let title = match placed.id {
             ESTATE => "Estate",
+            INVENTORY => "containers",
             CPU => "CPU | % of one core",
             MEMORY => "Memory | peak",
             IO => "I/O | window peak",
             TABLE => "Containers",
             _ => return,
         };
-        let body = panel::panel(&mut grid, Rect::full(rect.cols, rect.rows), title, None).rect();
         let absent = matches!(self.model.health, Health::Absent(_));
+        let title = if placed.id == INVENTORY {
+            let glyphs = crate::caps::active_glyphs();
+            let sep = glyphs.middot;
+            let ge = if crate::caps::unicode_level() == thegn_core::termcaps::UnicodeLevel::Ascii {
+                ">="
+            } else {
+                "≥"
+            };
+            format!(
+                "containers {sep} {}",
+                super::ownership_note(self.inventory, self.footprint, sep, ge)
+            )
+        } else {
+            title.to_owned()
+        };
+        let body = panel::panel(&mut grid, Rect::full(rect.cols, rect.rows), &title, None).rect();
         let has_history = match placed.id {
             CPU => ring_has_finite(&self.model.cpu_total),
             MEMORY => ring_has_finite(&self.model.memory_total),
@@ -426,7 +467,7 @@ impl TabView for ContainersView<'_> {
                     fmt_option(ring_peak_reading(&self.model.memory_total), Unit::Bytes)
                 ),
                 _ => format!(
-                    "rd / wr | scale {} B/s",
+                    "read | scale {} B/s",
                     fmt_option(
                         Some(Reading::Value(max_pair(
                             &self.model.read_total,
@@ -438,7 +479,9 @@ impl TabView for ContainersView<'_> {
             };
             grid.view(body).put_str(0, 0, &label, Default::default());
         }
-        if absent {
+        if placed.id == INVENTORY {
+            self.paint_inventory(&mut grid, body);
+        } else if absent {
             if placed.id == ESTATE {
                 self.paint_estate(&mut grid, body);
             } else {
@@ -463,6 +506,10 @@ impl TabView for ContainersView<'_> {
                 _ => {}
             }
         }
+        if placed.id == IO && body.rows > 1 && !absent && has_history {
+            grid.view(body)
+                .put_str(0, body.rows - 1, "write", Default::default());
+        }
         Emitter::default().emit(
             &grid,
             Rect::full(rect.cols, rect.rows),
@@ -477,7 +524,9 @@ impl TabView for ContainersView<'_> {
                 Rect {
                     x: rect.x + body.x,
                     y: rect.y + body.y + 1,
-                    rows: body.rows.saturating_sub(1),
+                    rows: body
+                        .rows
+                        .saturating_sub(if placed.id == IO { 2 } else { 1 }),
                     ..body
                 },
             );
@@ -489,6 +538,112 @@ impl TabView for ContainersView<'_> {
 }
 
 impl ContainersView<'_> {
+    fn paint_inventory(&self, grid: &mut CellGrid, body: Rect) {
+        if self.inventory.is_empty() {
+            grid.view(body)
+                .put_str(0, 0, "no containers", Default::default());
+            return;
+        }
+        if body.rows == 0 {
+            return;
+        }
+        let mut header = grid.view(body);
+        header.put_str(
+            0,
+            0,
+            &format!(
+                "{:<26}  {:<14}  {:<9}  {:<6}  {:<6}  net",
+                "container", "backend", "health", "cpu", "mem"
+            ),
+            Default::default(),
+        );
+        let visible = body.rows.saturating_sub(1);
+        if visible == 0 {
+            return;
+        }
+        let start = self.sel.saturating_sub(visible.saturating_sub(1));
+        let end = self.inventory.len().min(start.saturating_add(visible));
+        for (line, (index, container)) in self
+            .inventory
+            .iter()
+            .enumerate()
+            .skip(start)
+            .take(end - start)
+            .enumerate()
+        {
+            let ownership = if container.ours {
+                crate::seg::Tok::Hue(Hue::Green)
+            } else {
+                crate::seg::Tok::Slot(crate::chrome::S::Ghost)
+            };
+            let style = CellStyle {
+                fg: StyleTok::from_tok(ownership).unwrap_or(StyleTok::INHERIT),
+                bg: if index == self.sel {
+                    StyleTok::from_tok(crate::seg::Tok::Series(SeriesRole::Selected))
+                        .unwrap_or(StyleTok::INHERIT)
+                } else {
+                    StyleTok::INHERIT
+                },
+                attr: if index == self.sel {
+                    crate::monitor::kit::grid::BOLD
+                } else {
+                    0
+                },
+                ..CellStyle::default()
+            };
+            let mark = if container.ours { "" } else { " (foreign)" };
+            let health = match container_health(&container.status) {
+                ContainerHealth::Healthy => "healthy",
+                ContainerHealth::Unhealthy => "unhealthy",
+                ContainerHealth::Starting => "starting",
+                ContainerHealth::None => "up",
+                ContainerHealth::Stopped => "stopped",
+            };
+            let net = if container.net.is_empty() {
+                crate::caps::active_glyphs().emdash
+            } else {
+                &container.net
+            };
+            let name = format!(
+                "{}{mark}",
+                inventory_truncate(
+                    &container.name,
+                    26_usize.saturating_sub(mark.chars().count())
+                )
+            );
+            let backend = inventory_truncate(&container.backend, 14);
+            let cpu = if container.cpu.is_empty() {
+                crate::caps::active_glyphs().emdash.to_owned()
+            } else {
+                inventory_truncate(&container.cpu, 6)
+            };
+            let mem = if container.mem.is_empty() {
+                crate::caps::active_glyphs().emdash.to_owned()
+            } else {
+                inventory_truncate(&container.mem, 6)
+            };
+            let row = format!(
+                "{}  {}  {}  {}  {}  {}",
+                inventory_pad(&name, 26),
+                inventory_pad(&backend, 14),
+                inventory_pad(health, 9),
+                inventory_pad(&cpu, 6),
+                inventory_pad(&mem, 6),
+                net
+            );
+            let y = body.y + line + 1;
+            let mut row_view = grid.view(Rect { y, rows: 1, ..body });
+            if index == self.sel {
+                row_view.fill(CellStyle {
+                    bg: style.bg,
+                    attr: style.attr,
+                    ..style
+                });
+            }
+            row_view.put_str(0, 0, &row, style);
+        }
+    }
+
     fn paint_estate(&self, grid: &mut CellGrid, body: Rect) {
         let running = self
             .inventory
@@ -544,6 +699,11 @@ impl ContainersView<'_> {
             } else {
                 flags
             };
+            let flags = if self.model.rescans > 0 {
+                format!("{flags} | rescans {}", self.model.rescans)
+            } else {
+                flags
+            };
             grid.view(Rect {
                 y: body.y + 2,
                 rows: body.rows - 2,
@@ -581,42 +741,32 @@ impl ContainersView<'_> {
             }
         }
         if panel_id == IO {
-            let mut down = [f32::NAN; HISTORY_CAP];
-            let write_peak = max_pair(&self.model.read_total, &self.model.write_total);
-            let down_len = self.model.write_total.ordered(&mut down);
-            if write_peak > 0.0 {
-                for val in &mut down[..down_len] {
+            let mut read = [f32::NAN; HISTORY_CAP];
+            let mut write = [f32::NAN; HISTORY_CAP];
+            let read_len = self.model.read_total.ordered(&mut read);
+            let write_len = self.model.write_total.ordered(&mut write);
+            let peak = max_pair(&self.model.read_total, &self.model.write_total);
+            if peak > 0.0 {
+                for val in &mut read[..read_len] {
                     if val.is_finite() {
-                        *val = (*val / write_peak).clamp(0.0, 1.0);
+                        *val = (*val / peak).clamp(0.0, 1.0);
+                    }
+                }
+                for val in &mut write[..write_len] {
+                    if val.is_finite() {
+                        *val = (*val / peak).clamp(0.0, 1.0);
                     }
                 }
             }
-            if len > 0 && down_len > 0 {
-                let half = graph_area.rows / 2;
-                let upper = Rect {
-                    rows: half,
-                    ..graph_area
-                };
-                let lower = Rect {
-                    y: graph_area.y + half,
-                    rows: graph_area.rows - half,
-                    ..graph_area
-                };
-                paint_finite_history_runs(
-                    &values[..len],
-                    ramp,
-                    upper,
-                    graphs::table().braille,
-                    surface,
-                );
-                paint_finite_history_runs(
-                    &down[..down_len],
-                    RampId::Write,
-                    lower,
-                    graphs::table().braille,
-                    surface,
-                );
-            }
+            let scale = if graphs::table().braille { 2 } else { 1 };
+            let visible = read_len
+                .max(write_len)
+                .min(graph_area.cols.saturating_mul(scale));
+            let read_skip = read_len.saturating_sub(visible);
+            let write_skip = write_len.saturating_sub(visible);
+            let read = &read[read_skip..read_len];
+            let write = &write[write_skip..write_len];
+            paint_mirrored_history_runs(read, write, graph_area, graphs::table().braille, surface);
         } else if len > 0 {
             paint_finite_history_runs(
                 &values[..len],
@@ -645,7 +795,7 @@ impl ContainersView<'_> {
         header.put_str(TABLE_MEM, 0, "memory", Default::default());
         header.put_str(TABLE_MEM_SPARK, 0, "mem/peak", Default::default());
         header.put_str(TABLE_PIDS, 0, "pids", Default::default());
-        header.put_str(TABLE_IO, 0, "io B/s", Default::default());
+        header.put_str(TABLE_IO, 0, "rd/wr B/s", Default::default());
         if self.model.untracked > 0 {
             header.put_str(
                 TABLE_IO + 8,
@@ -758,6 +908,11 @@ fn paint_finite_history_runs(
     let start_index = values.len().saturating_sub(max_samples);
     let visible = &values[start_index..];
     let aligned = crate::monitor::kit::history_rect::graph_rect(area, visible.len(), braille);
+    let slots = aligned.cols.saturating_mul(samples_per_cell);
+    let shown = visible.len().min(slots);
+    let skip = visible.len().saturating_sub(shown);
+    let pad = slots.saturating_sub(shown);
+    let visible = &visible[skip..];
     let mut start = 0;
     while start < visible.len() {
         while start < visible.len() && !visible[start].is_finite() {
@@ -768,14 +923,24 @@ fn paint_finite_history_runs(
             end += 1;
         }
         if end > start {
-            let first_col = start / samples_per_cell;
-            let last_col = end.div_ceil(samples_per_cell);
+            let slot_start = pad + start;
+            let offset = if braille { slot_start % 2 } else { 0 };
+            let first_col = slot_start / samples_per_cell;
+            let run_cols = (offset + end - start).div_ceil(samples_per_cell);
+            let mut aligned_run = [f32::NAN; HISTORY_CAP + 2];
+            let used_len = offset + end - start;
+            let run_len = if braille {
+                used_len + used_len % 2
+            } else {
+                used_len
+            };
+            aligned_run[offset..offset + end - start].copy_from_slice(&visible[start..end]);
             graphs::paint_history_graph(
-                &visible[start..end],
+                &aligned_run[..run_len],
                 ramp,
                 Rect {
                     x: aligned.x + first_col,
-                    cols: last_col - first_col,
+                    cols: run_cols,
                     ..area
                 },
                 surface,
@@ -783,6 +948,85 @@ fn paint_finite_history_runs(
         }
         start = end.max(start + 1);
     }
+}
+
+fn paint_mirrored_history_runs(
+    read: &[f32],
+    write: &[f32],
+    area: Rect,
+    braille: bool,
+    surface: &mut Surface,
+) {
+    if area.cols == 0 || area.rows == 0 || read.is_empty() || write.is_empty() {
+        return;
+    }
+    let columns = area.cols;
+    let mut raster = thegn_core::viz_raster::CellBuf::new();
+    raster.reset(columns, area.rows);
+    thegn_core::viz_raster::mirrored(read, write, graphs::table(), &mut raster);
+    let mut grid = CellGrid::new(columns, area.rows);
+    let per_cell = if braille { 2 } else { 1 };
+    let mut view = grid.view(Rect::full(columns, area.rows));
+    let upper_rows = area.rows.div_ceil(2);
+    let slots = columns.saturating_mul(per_cell);
+    let offset = slots.saturating_sub(read.len().max(write.len()));
+    for x in 0..columns {
+        let first_slot = x * per_cell;
+        let last_slot = first_slot + per_cell;
+        let has_data = (first_slot..last_slot).any(|slot| {
+            if slot < offset {
+                return false;
+            }
+            let index = slot - offset;
+            read.get(index).is_some_and(|value| value.is_finite())
+                && write.get(index).is_some_and(|value| value.is_finite())
+        });
+        if !has_data {
+            continue;
+        }
+        for y in 0..area.rows {
+            if let Some(cell) = raster.get(x, y) {
+                let ramp = if y < upper_rows {
+                    RampId::Read
+                } else {
+                    RampId::Write
+                };
+                view.put(
+                    x,
+                    y,
+                    CellStyle {
+                        ch: cell.ch,
+                        fg: StyleTok::from_tok(crate::seg::Tok::Ramp(ramp, cell.fg))
+                            .unwrap_or(StyleTok::INHERIT),
+                        ..CellStyle::default()
+                    },
+                );
+            }
+        }
+    }
+    Emitter::default().emit(
+        &grid,
+        Rect::full(columns, area.rows),
+        surface,
+        area.x,
+        area.y,
+    );
+}
+
+fn inventory_truncate(value: &str, max_chars: usize) -> String {
+    if crate::seg::cells(value) <= max_chars {
+        return value.to_owned();
+    }
+    let ellipsis = crate::caps::active_glyphs().ellipsis;
+    let text = crate::seg::take_cols(value, max_chars.saturating_sub(crate::seg::cells(ellipsis)));
+    format!("{text}{ellipsis}")
+}
+
+fn inventory_pad(value: &str, width: usize) -> String {
+    format!(
+        "{value}{}",
+        " ".repeat(width.saturating_sub(crate::seg::cells(value)))
+    )
 }
 
 fn absent_mark(health: Health) -> &'static str {
