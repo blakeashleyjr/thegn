@@ -1372,10 +1372,187 @@ impl SidebarState {
     }
 }
 
+/// The hydrated model's knowledge of the git repo owning a path.
+pub(crate) enum ModelRepoRoot {
+    /// A git workspace's main checkout, from the workspace list or a DB worktree row.
+    Git(std::path::PathBuf),
+    /// A plain-directory workspace: there is no git repo to create a worktree in.
+    NotGit,
+    /// The model has no row for this path; the caller may fall back to `main_worktree`.
+    Unknown,
+}
+
+/// Resolve a repo root from hydrated state before considering a git subprocess.
+///
+/// New-worktree actions run on the compositor loop, where a blocking git call
+/// can freeze input and rendering. Use model facts when available; only paths
+/// the model does not know may fall back to `main_worktree`.
+pub(crate) fn model_repo_root(model: &FrameModel, path: &str) -> ModelRepoRoot {
+    if path.is_empty() {
+        return ModelRepoRoot::Unknown;
+    }
+
+    let workspace_root = |repo_path: &str| {
+        model
+            .sidebar_workspaces
+            .iter()
+            .find(|(_, _, _, workspace_path)| workspace_path == repo_path)
+            .map(|(_, _, kind, workspace_path)| {
+                if kind == "dir" {
+                    ModelRepoRoot::NotGit
+                } else {
+                    ModelRepoRoot::Git(std::path::PathBuf::from(workspace_path))
+                }
+            })
+    };
+
+    if let Some((_, _, kind, repo_path)) = model
+        .sidebar_workspaces
+        .iter()
+        .find(|(_, _, _, repo_path)| !repo_path.is_empty() && repo_path == path)
+    {
+        return if kind == "dir" {
+            ModelRepoRoot::NotGit
+        } else {
+            ModelRepoRoot::Git(std::path::PathBuf::from(repo_path))
+        };
+    }
+
+    if let Some(worktree) = model
+        .sidebar_db_worktrees
+        .iter()
+        .find(|worktree| worktree.path == path && !worktree.repo_path.is_empty())
+    {
+        return workspace_root(&worktree.repo_path)
+            .unwrap_or_else(|| ModelRepoRoot::Git(std::path::PathBuf::from(&worktree.repo_path)));
+    }
+
+    ModelRepoRoot::Unknown
+}
+
+/// Resolve from hydrated state, falling back to git only for unknown paths.
+pub(crate) fn resolve_repo_root(
+    model: &FrameModel,
+    path: &str,
+    git: impl FnOnce(&std::path::Path) -> Option<std::path::PathBuf>,
+) -> Option<std::path::PathBuf> {
+    match model_repo_root(model, path) {
+        ModelRepoRoot::Git(path) => Some(path),
+        ModelRepoRoot::NotGit => None,
+        ModelRepoRoot::Unknown => git(std::path::Path::new(path)),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use thegn_core::attention::MqStatus;
+
+    #[test]
+    fn model_repo_root_git_workspace() {
+        let model = FrameModel {
+            sidebar_workspaces: vec![("app".into(), "app".into(), "repo".into(), "/r/app".into())],
+            ..FrameModel::default()
+        };
+
+        assert!(matches!(
+            model_repo_root(&model, "/r/app"),
+            ModelRepoRoot::Git(path) if path == std::path::PathBuf::from("/r/app")
+        ));
+    }
+
+    #[test]
+    fn model_repo_root_dir_workspace_is_not_git() {
+        let model = FrameModel {
+            sidebar_workspaces: vec![(
+                "docs".into(),
+                "Docs".into(),
+                "dir".into(),
+                "/r/docs".into(),
+            )],
+            ..FrameModel::default()
+        };
+        let git_called = std::cell::Cell::new(false);
+
+        assert!(matches!(
+            model_repo_root(&model, "/r/docs"),
+            ModelRepoRoot::NotGit
+        ));
+        assert_eq!(
+            resolve_repo_root(&model, "/r/docs", |_| {
+                git_called.set(true);
+                Some(std::path::PathBuf::from("/unexpected"))
+            }),
+            None
+        );
+        assert!(!git_called.get());
+    }
+
+    #[test]
+    fn model_repo_root_known_worktree_maps_to_its_workspace() {
+        let model = FrameModel {
+            sidebar_workspaces: vec![("app".into(), "app".into(), "repo".into(), "/r/app".into())],
+            sidebar_db_worktrees: vec![crate::sidebar::DbWorktree {
+                slug: "app".into(),
+                branch: "feat".into(),
+                repo_path: "/r/app".into(),
+                tab_name: "app/feat".into(),
+                path: "/r/app-wt/feat".into(),
+                folder_id: None,
+                sandbox_backend: None,
+                env_name: None,
+                env_degraded: false,
+            }],
+            ..FrameModel::default()
+        };
+        let git_called = std::cell::Cell::new(false);
+
+        assert!(matches!(
+            model_repo_root(&model, "/r/app-wt/feat"),
+            ModelRepoRoot::Git(path) if path == std::path::PathBuf::from("/r/app")
+        ));
+        assert_eq!(
+            resolve_repo_root(&model, "/r/app-wt/feat", |_| {
+                git_called.set(true);
+                Some(std::path::PathBuf::from("/unexpected"))
+            }),
+            Some(std::path::PathBuf::from("/r/app"))
+        );
+        assert!(!git_called.get());
+    }
+
+    #[test]
+    fn resolve_repo_root_falls_back_to_git_only_for_unknown_paths() {
+        let model = FrameModel::default();
+        let git_calls = std::cell::Cell::new(0);
+
+        assert_eq!(
+            resolve_repo_root(&model, "/unknown/path", |path| {
+                git_calls.set(git_calls.get() + 1);
+                assert_eq!(path, std::path::Path::new("/unknown/path"));
+                Some(std::path::PathBuf::from("/git/root"))
+            }),
+            Some(std::path::PathBuf::from("/git/root"))
+        );
+        assert_eq!(git_calls.get(), 1);
+    }
+
+    #[test]
+    fn model_repo_root_ignores_live_fallback_rows() {
+        let model = FrameModel {
+            sidebar_workspaces: vec![("live".into(), "Live".into(), "repo".into(), String::new())],
+            ..FrameModel::default()
+        };
+
+        assert!(matches!(
+            model_repo_root(&model, "/live/path"),
+            ModelRepoRoot::Unknown
+        ));
+        assert!(matches!(
+            model_repo_root(&model, ""),
+            ModelRepoRoot::Unknown
+        ));
+    }
 
     /// Create a real git repo dir so `main_worktree` (the OLD code path) would
     /// resolve it to a concrete, DIFFERENT value than the hydrated workspace

@@ -8822,9 +8822,13 @@ async fn event_loop<T: Terminal>(
                 }
                 SidebarOutcome::PromptRename { gi, branch } => {
                     if let Some(g) = session.worktrees.get(gi) {
-                        let repo_root = thegn_core::repo::main_worktree(Path::new(&g.path))
-                            .map(|p| p.to_string_lossy().into_owned())
-                            .unwrap_or_else(|| g.path.clone());
+                        let repo_root = crate::handlers::sidebar_keys::resolve_repo_root(
+                            &model,
+                            &g.path,
+                            thegn_core::repo::main_worktree,
+                        )
+                        .map(|p| p.to_string_lossy().into_owned())
+                        .unwrap_or_else(|| g.path.clone());
                         host_input = Some((
                             menu::InputOverlay::new(format!("rename {branch}"), branch.clone()),
                             HostInputKind::RenameWorktree {
@@ -24287,9 +24291,13 @@ async fn event_loop<T: Terminal>(
                                             // (never silently crosses workspaces).
                                             match sb.new_worktree_target(&model, focus.sidebar()) {
                                                 NewWorktreeTarget::Root(root) => {
-                                                    if let Some(root) = thegn_core::repo::main_worktree(
-                                                        Path::new(&root),
-                                                    ) {
+                                                    let repo_root =
+                                                        crate::handlers::sidebar_keys::resolve_repo_root(
+                                                            &model,
+                                                            &root,
+                                                            thegn_core::repo::main_worktree,
+                                                        );
+                                                    if let Some(root) = repo_root {
                                                         begin_worktree_preset(
                                                             root,
                                                             name,
@@ -24322,8 +24330,10 @@ async fn event_loop<T: Terminal>(
                                                         .unwrap_or_default();
                                                     let repo_root = (!src_wt.is_empty())
                                                         .then(|| {
-                                                            thegn_core::repo::main_worktree(
-                                                                Path::new(&src_wt),
+                                                            crate::handlers::sidebar_keys::resolve_repo_root(
+                                                                &model,
+                                                                &src_wt,
+                                                                thegn_core::repo::main_worktree,
                                                             )
                                                         })
                                                         .flatten()
@@ -26080,8 +26090,12 @@ async fn event_loop<T: Terminal>(
                                 match sb.new_worktree_target(&model, focus.sidebar()) {
                                     NewWorktreeTarget::Root(root) => {
                                         let repo_root =
-                                            thegn_core::repo::main_worktree(Path::new(&root))
-                                                .map(|p| p.to_string_lossy().into_owned());
+                                            crate::handlers::sidebar_keys::resolve_repo_root(
+                                                &model,
+                                                &root,
+                                                thegn_core::repo::main_worktree,
+                                            )
+                                            .map(|p| p.to_string_lossy().into_owned());
                                         match (names.is_empty(), repo_root) {
                                             (true, _) => {
                                                 model.status =
@@ -26121,7 +26135,11 @@ async fn event_loop<T: Terminal>(
                                             .unwrap_or_default();
                                         let repo_root = (!src_wt.is_empty())
                                             .then(|| {
-                                                thegn_core::repo::main_worktree(Path::new(&src_wt))
+                                                crate::handlers::sidebar_keys::resolve_repo_root(
+                                                    &model,
+                                                    &src_wt,
+                                                    thegn_core::repo::main_worktree,
+                                                )
                                             })
                                             .flatten()
                                             .map(|p| p.to_string_lossy().into_owned());
@@ -26689,9 +26707,13 @@ async fn event_loop<T: Terminal>(
                                 // silently cross workspaces.
                                 match sb.new_worktree_target(&model, focus.sidebar()) {
                                     NewWorktreeTarget::Root(root) => {
-                                        if let Some(root) =
-                                            thegn_core::repo::main_worktree(Path::new(&root))
-                                        {
+                                        let repo_root =
+                                            crate::handlers::sidebar_keys::resolve_repo_root(
+                                                &model,
+                                                &root,
+                                                thegn_core::repo::main_worktree,
+                                            );
+                                        if let Some(root) = repo_root {
                                             begin_worktree_wizard(
                                                 root,
                                                 None,
@@ -26723,7 +26745,11 @@ async fn event_loop<T: Terminal>(
                                             .unwrap_or_default();
                                         let repo_root = (!src_wt.is_empty())
                                             .then(|| {
-                                                thegn_core::repo::main_worktree(Path::new(&src_wt))
+                                                crate::handlers::sidebar_keys::resolve_repo_root(
+                                                    &model,
+                                                    &src_wt,
+                                                    thegn_core::repo::main_worktree,
+                                                )
                                             })
                                             .flatten()
                                             .or_else(|| {
