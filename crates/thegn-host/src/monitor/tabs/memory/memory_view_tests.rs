@@ -18,8 +18,10 @@ use thegn_metrics::collect::{
 };
 
 fn fixture(pressure: bool) -> MonitorFrame {
-    let mut frame = MonitorFrame::default();
-    frame.dt_ms = 1_000;
+    let mut frame = MonitorFrame {
+        dt_ms: 1_000,
+        ..MonitorFrame::default()
+    };
     meminfo::parse(
         b"MemTotal: 8388608 kB\nMemAvailable: 4194304 kB\nMemFree: 524288 kB\nBuffers: 262144 kB\nCached: 2097152 kB\nShmem: 131072 kB\nSlab: 131072 kB\nAnonPages: 4194304 kB\nActive(file): 1048576 kB\nInactive(file): 1048576 kB\nDirty: 1024 kB\nWriteback: 512 kB\nSwapTotal: 2097152 kB\nSwapFree: 1048576 kB\nZswap: 32768 kB\nAnonHugePages: 8192 kB\nShmemHugePages: 1024 kB\nFileHugePages: 2048 kB\nHugePages_Total: 4\nHugePages_Free: 2\nHugepagesize: 2048 kB\n",
         &mut frame.parts.meminfo.raw,
