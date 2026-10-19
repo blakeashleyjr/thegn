@@ -35,6 +35,9 @@ pub struct FileLogProvider {
     pub path: PathBuf,
 }
 
+/// The log watcher, its nudge receiver, and the parent-directory reset flag.
+type LogWatch = (notify::RecommendedWatcher, Receiver<()>, Arc<AtomicBool>);
+
 /// Clamp and parse source lines into bounded pushes. `push` returns whether
 /// its queue transitioned from empty and therefore needs a host wake.
 fn push_bounded(
@@ -86,8 +89,7 @@ fn tail_file(
     waker: Arc<dyn Fn() + Send + Sync>,
 ) {
     let mut follower = super::tail::FileFollower::new(path.to_path_buf());
-    let watcher: Mutex<Option<(notify::RecommendedWatcher, Receiver<()>, Arc<AtomicBool>)>> =
-        Mutex::new(None);
+    let watcher: Mutex<Option<LogWatch>> = Mutex::new(None);
     let mut last_read = None;
     tail_loop(
         || {
@@ -198,10 +200,8 @@ fn watch_log_directory(
             let signal = if is_parent_reset {
                 callback_reset.store(true, Ordering::Release);
                 true
-            } else if is_file_change {
-                true
             } else {
-                false
+                is_file_change
             };
             if signal {
                 // best-effort: a full queue records a pending read; a disconnected
