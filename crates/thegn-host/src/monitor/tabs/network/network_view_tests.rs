@@ -1,10 +1,13 @@
-use super::view::{HEALTH, IFACE_CAP, INTERFACES, NetworkModel, NetworkView, THROUGHPUT, WIFI};
+use super::view::{
+    HEALTH, IFACE_CAP, INTERFACES, NetworkModel, NetworkView, OWNERS, THROUGHPUT, WIFI,
+};
 use crate::telemetry::{ScaleMode, TelemetryHistory, Window};
 use crate::{
     caps,
     compositor::Rect,
     monitor::board::{Board, TabView},
 };
+use std::sync::Arc;
 use termwiz::surface::Surface;
 use thegn_core::termcaps::{ColorDepth, UnicodeLevel};
 use thegn_metrics::collect::{
@@ -12,8 +15,10 @@ use thegn_metrics::collect::{
     frame::MonitorFrame,
     health::Health,
     instances::InstanceId,
+    model::net_attrib::{NetAttribution, OwnerRates},
     model::net_wifi::{InlineBytes, WifiRow},
     model::netdev::{IfaceSample, ScopeTotal},
+    policy::cgroup_classify::OwnerKind,
     policy::net_scope::{IfaceKind, Scope},
 };
 
@@ -620,9 +625,28 @@ fn snapshots_cover_view_sizes_capabilities_and_static_demand() {
         (UnicodeLevel::Ascii, ColorDepth::None),
     ];
     let ids: Vec<u16> = (0..8).collect();
+    let mut fill_ratios = Vec::new();
     let mut model = NetworkModel::default();
     for tick in 1..121_u16 {
-        model.absorb_frame(&frame(tick, &ids));
+        let mut sample = frame(tick, &ids);
+        sample.sampled.insert(CollectorId::NetSockets);
+        sample.health[CollectorId::NetSockets.index()] = Health::Ok;
+        sample.parts.net_sockets.attribution_interval_ms = Some(5_000);
+        sample.parts.net_sockets.physical_known = true;
+        sample.parts.net_sockets.attribution = NetAttribution {
+            owners: vec![OwnerRates {
+                cgroup_id: u64::from(tick % 4),
+                path: Arc::from(&b"/user.slice/app.slice"[..]),
+                kind: OwnerKind::App,
+                name: Arc::from(format!("app-{}", tick % 4).into_bytes()),
+                rx_bytes: u64::from(tick) * 30,
+                tx_bytes: u64::from(tick) * 20,
+            }],
+            unattributed_rx: u64::from(tick) * 5,
+            unattributed_tx: u64::from(tick) * 3,
+            truncated: false,
+        };
+        model.absorb_frame(&sample);
     }
     model.absorb_history(
         &telemetry_history(),
@@ -641,12 +665,15 @@ fn snapshots_cover_view_sizes_capabilities_and_static_demand() {
             });
             let rendered = lines(&surface).join("\n");
             assert!(rendered.contains("Network throughput"));
+            let placed = Board::default().placed(&view, Rect::full(cols, rows));
+            if placed.iter().any(|panel| panel.id == OWNERS) {
+                assert!(rendered.contains("Network owners"));
+            }
             assert!(rendered.contains("Interfaces"));
             assert!(rendered.contains("eth"));
             if placed_contains_wifi(&view, Rect::full(cols, rows)) {
                 assert!(rendered.contains("Wi-Fi interfaces"));
             }
-            let placed = Board::default().placed(&view, Rect::full(cols, rows));
             let expected = placed.iter().fold(CollectorSet::empty(), |mut set, panel| {
                 for collector in view.demand(panel.id).iter() {
                     set.insert(collector);
@@ -664,14 +691,179 @@ fn snapshots_cover_view_sizes_capabilities_and_static_demand() {
             }
             if cols == 240 {
                 let fill = fill_ratio(&surface, Rect::full(cols, rows));
-                // density follow-up (batch 51): estimated, primary sets from the printed value
-                assert!(
-                    fill >= 0.30,
-                    "fill ratio {fill:.3} at {cols}x{rows} {unicode:?}/{depth:?}"
-                );
+                fill_ratios.push((cols, rows, unicode, depth, fill));
             }
         }
     }
+    let ratio_report = fill_ratios
+        .iter()
+        .map(|(cols, rows, unicode, depth, fill)| {
+            format!("{fill:.3} at {cols}x{rows} {unicode:?}/{depth:?}")
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    for (cols, rows, unicode, depth, fill) in fill_ratios {
+        // density follow-up (batch 53): estimated, primary sets from the printed value
+        assert!(
+            fill >= 0.30,
+            "fill ratio {fill:.3} at {cols}x{rows} {unicode:?}/{depth:?}; all: {ratio_report}"
+        );
+    }
+}
+
+#[test]
+fn owners_panel_snapshot_demand_and_storage_are_bounded() {
+    let mut model = NetworkModel::default();
+    let mut frame = MonitorFrame::default();
+    frame.sampled.insert(CollectorId::NetSockets);
+    frame.health[CollectorId::NetSockets.index()] = Health::Ok;
+    frame.parts.net_sockets.attribution_interval_ms = Some(5_000);
+    frame.parts.net_sockets.physical_known = true;
+    frame.parts.net_sockets.attribution = NetAttribution {
+        owners: vec![OwnerRates {
+            cgroup_id: 42,
+            path: Arc::from(&b"/user.slice/app.slice"[..]),
+            kind: OwnerKind::App,
+            name: Arc::from(&b"editor"[..]),
+            rx_bytes: 4_000,
+            tx_bytes: 2_000,
+        }],
+        unattributed_rx: 1_000,
+        unattributed_tx: 500,
+        truncated: true,
+    };
+    model.absorb_frame(&frame);
+    let view = NetworkView(&model);
+    let placed = Board::default().placed(&view, Rect::full(240, 60));
+    assert!(placed.iter().any(|panel| panel.id == OWNERS));
+    assert!(view.demand(OWNERS).contains(CollectorId::NetSockets));
+    let mut surface = Surface::new(240, 60);
+    Board::default().paint(&view, &mut surface, Rect::full(240, 60), 0, &[]);
+    let rendered = lines(&surface).join("\n");
+    assert!(rendered.contains("Network owners"), "snapshot: {rendered}");
+    assert!(rendered.contains("partial"), "snapshot: {rendered}");
+    assert!(rendered.contains("editor"), "snapshot: {rendered}");
+    assert!(rendered.contains("UDP/QUIC"), "snapshot: {rendered}");
+
+    frame.parts.net_sockets.attribution.owners.clear();
+    for owner in 0..20_u64 {
+        frame.parts.net_sockets.attribution.owners.push(OwnerRates {
+            cgroup_id: owner,
+            path: Arc::from(&b"/user.slice/app.slice"[..]),
+            kind: OwnerKind::App,
+            name: Arc::from(&b"changing"[..]),
+            rx_bytes: owner + 1,
+            tx_bytes: owner + 2,
+        });
+    }
+    model.absorb_frame(&frame);
+    let owners_capacity = model.owners.capacity();
+    let ring_capacities: Vec<_> = model
+        .owners
+        .iter()
+        .map(|owner| owner.history.values.capacity())
+        .collect();
+    for tick in 0..1_000_u64 {
+        frame.parts.net_sockets.attribution.owners.clear();
+        for owner in 0..20_u64 {
+            frame.parts.net_sockets.attribution.owners.push(OwnerRates {
+                cgroup_id: tick * 20 + owner,
+                path: Arc::from(&b"/user.slice/app.slice"[..]),
+                kind: OwnerKind::App,
+                name: Arc::from(&b"changing"[..]),
+                rx_bytes: tick + owner + 1,
+                tx_bytes: tick + owner + 2,
+            });
+        }
+        model.absorb_frame(&frame);
+        assert!(
+            model.owners.len() <= 16,
+            "owner slot count {}",
+            model.owners.len()
+        );
+    }
+    assert_eq!(
+        model.owners.capacity(),
+        owners_capacity,
+        "owner capacity {}",
+        model.owners.capacity()
+    );
+    assert!(
+        model
+            .owners
+            .iter()
+            .all(|owner| owner.history.values.capacity() >= 60)
+    );
+    assert_eq!(
+        model
+            .owners
+            .iter()
+            .map(|owner| owner.history.values.capacity())
+            .collect::<Vec<_>>(),
+        ring_capacities
+    );
+}
+
+#[test]
+fn owner_history_advances_only_on_a_net_sockets_sample() {
+    let mut model = NetworkModel::default();
+    let mut frame = MonitorFrame::default();
+    frame.health[CollectorId::NetSockets.index()] = Health::Ok;
+    frame.parts.net_sockets.attribution_interval_ms = Some(5_000);
+    frame.parts.net_sockets.attribution.owners.push(OwnerRates {
+        cgroup_id: 9,
+        path: Arc::from(&b"/user.slice/app.slice"[..]),
+        kind: OwnerKind::App,
+        name: Arc::from(&b"sampled"[..]),
+        rx_bytes: 1_000,
+        tx_bytes: 500,
+    });
+    model.absorb_frame(&frame);
+    assert!(model.owners.is_empty());
+    frame.sampled.insert(CollectorId::NetSockets);
+    model.absorb_frame(&frame);
+    assert_eq!(model.owners[0].history.len, 1);
+    model.absorb_frame(&frame);
+    assert_eq!(model.owners[0].history.len, 2);
+}
+
+#[test]
+fn owners_panel_shows_warming_and_denied_states_without_changing_placement() {
+    let mut model = NetworkModel::default();
+    let area = Rect::full(240, 60);
+    {
+        let view = NetworkView(&model);
+        assert!(
+            Board::default()
+                .placed(&view, area)
+                .iter()
+                .any(|panel| panel.id == OWNERS)
+        );
+        let mut warming_surface = Surface::new(240, 60);
+        Board::default().paint(&view, &mut warming_surface, area, 0, &[]);
+        assert!(
+            lines(&warming_surface)
+                .join("\n")
+                .contains(caps::active_glyphs().ellipsis)
+        );
+    }
+
+    model.owners_health = Health::Absent(thegn_metrics::collect::health::Absent::NoPermission);
+    let view = NetworkView(&model);
+    assert!(
+        Board::default()
+            .placed(&view, area)
+            .iter()
+            .any(|panel| panel.id == OWNERS)
+    );
+    assert!(view.demand(OWNERS).is_empty());
+    let mut denied_surface = Surface::new(240, 60);
+    Board::default().paint(&view, &mut denied_surface, area, 0, &[]);
+    assert!(
+        lines(&denied_surface)
+            .join("\n")
+            .contains(caps::glyph(caps::Glyph::Lock))
+    );
 }
 
 fn placed_contains_wifi(view: &NetworkView<'_>, area: Rect) -> bool {

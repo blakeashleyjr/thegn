@@ -1,22 +1,143 @@
 //! Visible-only TCP state and passive RTT collector over sock_diag.
 use std::io;
 use std::net::IpAddr;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use super::{netlink::NetlinkSocket, sock_diag};
+use crate::collect::linux::net_attrib::CgroupFs;
 use crate::collect::{
     CollectError, Collector, CollectorId, TickCtx,
     env::Env,
-    frame::MonitorFrame,
+    frame::{MonitorFrame, Part},
     health::{Absent, Health},
+    linux::{
+        net_attrib::{CookieDelta, OwnerTable, RealCgroupFs},
+        procfile::ProcFile,
+    },
     model::net_sockets::NetSocketsPart,
+    model::netdev::IfaceName,
+    parse::netdev::parse,
+    policy::net_scope::{self, Scope},
     schedule::Cadence,
 };
+use crate::net_kind;
 
 const SOCKET_DUMP_TIMEOUT: Duration = Duration::from_millis(250);
 const RECENT_DATA_MS: u32 = 10_000;
 const TCP_ESTABLISHED: u8 = 1;
 const TCP_LISTEN: u8 = 10;
+const IFACE_CAP: usize = 32;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct IfaceBytes {
+    name: IfaceName,
+    scope: Scope,
+    rx: Option<u64>,
+    tx: Option<u64>,
+}
+
+trait PhysicalCounters: Send {
+    fn read(&mut self, out: &mut Vec<IfaceBytes>) -> io::Result<()>;
+    fn truncated(&self) -> bool;
+    fn close(&mut self);
+}
+
+#[derive(Debug, Clone, Copy)]
+struct CachedScope {
+    name: IfaceName,
+    scope: Scope,
+}
+
+struct ProcNetDev {
+    path: PathBuf,
+    sysfs_root: PathBuf,
+    file: Option<ProcFile>,
+    scopes: Vec<CachedScope>,
+    truncated: bool,
+}
+
+impl ProcNetDev {
+    fn at(path: impl AsRef<Path>, sysfs_root: impl AsRef<Path>) -> Self {
+        Self {
+            path: path.as_ref().to_path_buf(),
+            sysfs_root: sysfs_root.as_ref().to_path_buf(),
+            file: None,
+            scopes: Vec::with_capacity(IFACE_CAP),
+            truncated: false,
+        }
+    }
+}
+
+impl PhysicalCounters for ProcNetDev {
+    fn read(&mut self, out: &mut Vec<IfaceBytes>) -> io::Result<()> {
+        self.truncated = false;
+        if self.file.is_none() {
+            self.file = Some(ProcFile::open(&self.path)?);
+        }
+        let file = self.file.as_mut().expect("opened above");
+        let bytes = match file.read_all() {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                if file.needs_reopen() {
+                    self.file = None;
+                }
+                return Err(error);
+            }
+        };
+        out.clear();
+        let count = parse(bytes, |name, counters| {
+            let interface = IfaceName::new(name);
+            let scope = if let Some(cached) = self.scopes.iter().find(|item| item.name == interface)
+            {
+                cached.scope
+            } else if self.scopes.len() < IFACE_CAP {
+                let name = interface.as_str();
+                let facts = net_kind::facts_at(&self.sysfs_root, name);
+                let kind = net_scope::classify(name, &facts);
+                let scope = net_scope::scope(kind, facts.bonding_slave);
+                self.scopes.push(CachedScope {
+                    name: interface,
+                    scope,
+                });
+                scope
+            } else {
+                self.truncated = true;
+                Scope::Virtual
+            };
+            if out.len() < IFACE_CAP {
+                out.push(IfaceBytes {
+                    name: interface,
+                    scope,
+                    rx: counters.rx_bytes,
+                    tx: counters.tx_bytes,
+                });
+            } else {
+                self.truncated = true;
+            }
+        });
+        if count.is_none() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "netdev: missing header",
+            ));
+        }
+        Ok(())
+    }
+
+    fn close(&mut self) {
+        self.file = None;
+        self.scopes.clear();
+    }
+
+    fn truncated(&self) -> bool {
+        self.truncated
+    }
+}
+
+fn system_physical_counters() -> Box<dyn PhysicalCounters> {
+    Box::new(ProcNetDev::at("/proc/net/dev", "/sys/class/net"))
+}
 
 trait SocketTransport: Send {
     fn open(&mut self) -> io::Result<()>;
@@ -50,33 +171,97 @@ impl SocketTransport for NetlinkTransport {
     }
 }
 
-pub struct NetSocketsCollector {
+pub struct NetSocketsCollector<F: CgroupFs + Send + 'static = RealCgroupFs> {
     transport: Box<dyn SocketTransport>,
     sockets: Vec<sock_diag::TcpSock>,
     rtts: Vec<u32>,
+    physical: Box<dyn PhysicalCounters>,
+    now_ms: u64,
+    delta: CookieDelta,
+    owners: Option<OwnerTable<F>>,
+    owner_roots: Vec<PathBuf>,
+    owner_factory: Box<dyn Fn() -> F + Send>,
+    iface_rows: Vec<IfaceBytes>,
+    prev_ifaces: Vec<IfaceBytes>,
+    prev_physical_known: bool,
+    last_dump_ms: Option<u64>,
 }
 
-impl NetSocketsCollector {
+impl NetSocketsCollector<RealCgroupFs> {
     pub fn new() -> Self {
-        Self::with_transport(Box::<NetlinkTransport>::default())
+        Self::with_parts(
+            Box::<NetlinkTransport>::default(),
+            system_physical_counters(),
+            vec![
+                PathBuf::from("/sys/fs/cgroup/user.slice"),
+                PathBuf::from("/sys/fs/cgroup/system.slice"),
+            ],
+            Box::new(|| RealCgroupFs),
+        )
     }
+}
 
-    fn with_transport(transport: Box<dyn SocketTransport>) -> Self {
+impl<F: CgroupFs + Send + 'static> NetSocketsCollector<F> {
+    fn with_parts(
+        transport: Box<dyn SocketTransport>,
+        physical: Box<dyn PhysicalCounters>,
+        owner_roots: Vec<PathBuf>,
+        owner_factory: Box<dyn Fn() -> F + Send>,
+    ) -> Self {
         Self {
             transport,
             sockets: Vec::new(),
             rtts: Vec::new(),
+            physical,
+            now_ms: 0,
+            delta: CookieDelta::new(),
+            owners: None,
+            owner_roots,
+            owner_factory,
+            iface_rows: Vec::with_capacity(IFACE_CAP),
+            prev_ifaces: Vec::with_capacity(IFACE_CAP),
+            prev_physical_known: false,
+            last_dump_ms: None,
         }
     }
 }
 
-impl Default for NetSocketsCollector {
+#[cfg(test)]
+impl NetSocketsCollector<RealCgroupFs> {
+    fn with_transport(transport: Box<dyn SocketTransport>) -> Self {
+        Self::with_parts(
+            transport,
+            Box::new(EmptyPhysical),
+            Vec::new(),
+            Box::new(|| RealCgroupFs),
+        )
+    }
+}
+
+#[cfg(test)]
+struct EmptyPhysical;
+
+#[cfg(test)]
+impl PhysicalCounters for EmptyPhysical {
+    fn read(&mut self, out: &mut Vec<IfaceBytes>) -> io::Result<()> {
+        out.clear();
+        Ok(())
+    }
+
+    fn truncated(&self) -> bool {
+        false
+    }
+
+    fn close(&mut self) {}
+}
+
+impl Default for NetSocketsCollector<RealCgroupFs> {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl Collector for NetSocketsCollector {
+impl<F: CgroupFs + Send + 'static> Collector for NetSocketsCollector<F> {
     fn id(&self) -> CollectorId {
         CollectorId::NetSockets
     }
@@ -95,7 +280,8 @@ impl Collector for NetSocketsCollector {
         }
     }
 
-    fn sample(&mut self, _ctx: &TickCtx, frame: &mut MonitorFrame) -> Result<(), CollectError> {
+    fn sample(&mut self, ctx: &TickCtx, frame: &mut MonitorFrame) -> Result<(), CollectError> {
+        self.now_ms = ctx.now_ms;
         self.sockets.clear();
         self.rtts.clear();
         if self.sockets.capacity() < sock_diag::MAX_TCP_SOCKETS {
@@ -109,11 +295,9 @@ impl Collector for NetSocketsCollector {
             .dump(&mut self.sockets)
             .map_err(collect_io_error)?;
         let part = &mut frame.parts.net_sockets;
-        *part = NetSocketsPart {
-            malformed: u32::try_from(stats.malformed).unwrap_or(u32::MAX),
-            truncated: stats.truncated,
-            ..NetSocketsPart::default()
-        };
+        part.clear();
+        part.malformed = u32::try_from(stats.malformed).unwrap_or(u32::MAX);
+        part.truncated = stats.truncated;
         for socket in &self.sockets {
             if let Some(count) = socket
                 .state
@@ -160,6 +344,40 @@ impl Collector for NetSocketsCollector {
             part.rtt_p90_us = Some(self.rtts[p90_index]);
             part.rtt_max_us = max;
         }
+        if self.owners.is_none() {
+            self.owners = Some(OwnerTable::new(
+                (self.owner_factory)(),
+                self.owner_roots.clone(),
+            ));
+        }
+        let previous = self.last_dump_ms;
+        let interval_ms = previous.map(|last| self.now_ms.saturating_sub(last));
+        let read_ok = self.physical.read(&mut self.iface_rows).is_ok();
+        let physical_truncated = self.physical.truncated();
+        let physical_known = self.prev_physical_known && read_ok;
+        let (physical_rx, physical_tx) = if physical_known {
+            physical_delta(&self.prev_ifaces, &self.iface_rows)
+        } else {
+            (0, 0)
+        };
+        self.delta.update_into(
+            &self.sockets,
+            physical_rx,
+            physical_tx,
+            self.owners.as_mut().expect("owner table initialized"),
+            &mut part.attribution,
+        );
+        part.attribution.truncated |= physical_truncated || stats.truncated;
+        if !read_ok {
+            self.iface_rows.clear();
+        }
+        self.prev_ifaces.clear();
+        self.prev_ifaces.extend_from_slice(&self.iface_rows);
+        self.prev_physical_known = read_ok;
+        part.attribution_interval_ms =
+            interval_ms.and_then(|interval| u32::try_from(interval).ok());
+        part.physical_known = physical_known;
+        self.last_dump_ms = Some(self.now_ms);
         frame.sampled.insert(CollectorId::NetSockets);
         Ok(())
     }
@@ -168,7 +386,48 @@ impl Collector for NetSocketsCollector {
         self.sockets = Vec::new();
         self.rtts = Vec::new();
         self.transport.close();
+        self.delta.close();
+        self.physical.close();
+        self.prev_ifaces.clear();
+        self.prev_physical_known = false;
+        self.iface_rows.clear();
+        self.owners = None;
+        self.last_dump_ms = None;
     }
+}
+
+fn physical_delta(previous: &[IfaceBytes], current: &[IfaceBytes]) -> (u64, u64) {
+    let physical_now = current.iter().any(|iface| iface.scope == Scope::Physical);
+    let selected = |iface: &IfaceBytes| {
+        if physical_now {
+            iface.scope == Scope::Physical
+        } else {
+            iface.scope != Scope::Loopback
+        }
+    };
+    current
+        .iter()
+        .filter(|iface| selected(iface))
+        .fold((0_u64, 0_u64), |sum, now| {
+            let Some(old) = previous
+                .iter()
+                .find(|old| old.name == now.name && old.scope == now.scope)
+            else {
+                return sum;
+            };
+            (
+                sum.0.saturating_add(
+                    now.rx
+                        .zip(old.rx)
+                        .map_or(0, |(new, old)| new.saturating_sub(old)),
+                ),
+                sum.1.saturating_add(
+                    now.tx
+                        .zip(old.tx)
+                        .map_or(0, |(new, old)| new.saturating_sub(old)),
+                ),
+            )
+        })
 }
 
 fn is_loopback(address: IpAddr) -> bool {

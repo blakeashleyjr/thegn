@@ -167,6 +167,10 @@ is not double-counted. Interface rows keep idle and down links visible, and
 fold interfaces beyond the eight tracked interfaces into an `other` row. Use
 `f`/`F` to focus a panel, `z` to zoom it, and `Esc` to step back through focus
 and zoom.
+The Owners panel shows TCP byte rates by pane, container, app or unit from
+socket cgroups, with short history sparks. It refreshes every five seconds while
+the tab is visible and works without elevated privileges; UDP, QUIC and other
+traffic appears as the unattributed remainder.
 The network masthead chip expands into this tab.
 
 ## Disk

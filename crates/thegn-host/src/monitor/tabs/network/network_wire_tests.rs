@@ -31,7 +31,7 @@ fn telemetry_sample(rx: u64, tx: u64) -> StatsSnapshot {
 }
 
 #[test]
-fn network_tab_demands_netdev_and_wifi_only_for_placed_panels() {
+fn network_tab_demands_netdev_wifi_and_owners_only_for_placed_panels() {
     let history = TelemetryHistory::default();
     let mut overlay = network_overlay(&history);
     assert_eq!(overlay.tab(), MonitorTab::Network);
@@ -54,6 +54,7 @@ fn network_tab_demands_netdev_and_wifi_only_for_placed_panels() {
         .join("\n");
     for title in [
         "Network throughput",
+        "Network owners",
         "Interfaces",
         "Network health",
         "Wi-Fi interfaces",
@@ -66,6 +67,7 @@ fn network_tab_demands_netdev_and_wifi_only_for_placed_panels() {
     let demand = overlay.demand(1000);
     assert!(demand.collectors.contains(CollectorId::Netdev));
     assert!(demand.collectors.contains(CollectorId::NetWifi));
+    assert!(demand.collectors.contains(CollectorId::NetSockets));
     let expected = placed.iter().fold(
         thegn_metrics::collect::CollectorSet::empty(),
         |mut set, panel| {
@@ -88,6 +90,18 @@ fn network_tab_demands_netdev_and_wifi_only_for_placed_panels() {
             .demand(1000)
             .collectors
             .contains(CollectorId::NetWifi)
+    );
+    let mut absent_sockets = MonitorFrame::default();
+    absent_sockets.health[CollectorId::NetSockets.index()] =
+        thegn_metrics::collect::health::Health::Absent(
+            thegn_metrics::collect::health::Absent::NoPermission,
+        );
+    assert!(overlay.ingest_frame(&absent_sockets));
+    assert!(
+        !overlay
+            .demand(1000)
+            .collectors
+            .contains(CollectorId::NetSockets)
     );
 }
 
