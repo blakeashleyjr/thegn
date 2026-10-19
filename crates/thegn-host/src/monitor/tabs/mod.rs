@@ -43,7 +43,7 @@ impl MonitorOverlay {
     pub(in crate::monitor) fn is_list_tab(&self) -> bool {
         matches!(
             self.tab,
-            MonitorTab::Procs | MonitorTab::Disk | MonitorTab::Containers
+            MonitorTab::Cpu | MonitorTab::Procs | MonitorTab::Disk | MonitorTab::Containers
         )
     }
 
@@ -52,6 +52,7 @@ impl MonitorOverlay {
     /// never disagree about where the list ends.
     pub(in crate::monitor) fn row_len(&self) -> usize {
         match self.tab {
+            MonitorTab::Cpu => self.cpu.core_count(),
             MonitorTab::Procs => self.proc_rows.len(),
             MonitorTab::Disk => self.disk_rows.len(),
             MonitorTab::Containers => self.container_rows.len(),
@@ -88,6 +89,9 @@ impl MonitorOverlay {
             // --- Per-tab (last, so it can never shadow the above) ---
             KeyCode::Char(c) if self.tab == MonitorTab::Procs => self.proc_key(*c),
             KeyCode::Enter if self.tab == MonitorTab::Containers => self.container_key('\r'),
+            KeyCode::Enter | KeyCode::Char('\r' | '\n') if self.tab == MonitorTab::Cpu => {
+                self.cpu_key('\r')
+            }
             KeyCode::Char(c) if self.tab == MonitorTab::Containers => self.container_key(*c),
             _ => MonitorOutcome::Pending,
         }
@@ -97,6 +101,7 @@ impl MonitorOverlay {
 pub(super) fn hints(input: &footer::FooterInput<'_>, out: &mut Vec<Vec<Seg>>) {
     match input.tab {
         MonitorTab::Procs => procs::hints(input, out),
+        MonitorTab::Cpu => cpu::hints(input, out),
         MonitorTab::Disk => disk::hints(input, out),
         MonitorTab::Containers => containers::hints(input, out),
         _ => {}

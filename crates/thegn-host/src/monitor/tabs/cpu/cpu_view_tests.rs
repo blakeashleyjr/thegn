@@ -322,7 +322,7 @@ fn absorb_frame_reuses_parts_and_keeps_all_carried_cpu_values() {
     assert_eq!(model.cpu_sched.cores.len(), 24);
 
     let default_model = CpuModel::default();
-    let default_view = CpuView(&default_model);
+    let default_view = CpuView::new(&default_model);
     assert!(default_view.demand(SCHED).contains(CollectorId::CpuSched));
     let default_placed = Board::default().placed(&default_view, Rect::full(160, 45));
     assert!(default_placed.iter().any(|panel| panel.id == SCHED));
@@ -331,7 +331,7 @@ fn absorb_frame_reuses_parts_and_keeps_all_carried_cpu_values() {
     absent.health[CollectorId::CpuSched.index()] = Health::Absent(Absent::NotImplemented);
     let mut model = CpuModel::default();
     model.absorb_frame(&absent);
-    let view = CpuView(&model);
+    let view = CpuView::new(&model);
     let placed = Board::default().placed(&view, Rect::full(160, 45));
     assert!(!placed.iter().any(|panel| panel.id == SCHED));
     assert!(!view.demand(SCHED).contains(CollectorId::CpuSched));
@@ -350,7 +350,7 @@ fn snapshots_cover_sizes_capabilities_demand_absence_and_fill() {
     absorb_fixture_core_history(&mut model, &frame);
     let history = fixture_history();
     model.absorb_history(&history, Window::DEFAULT, ScaleMode::Window, 119_000);
-    let view = CpuView(&model);
+    let view = CpuView::new(&model);
     for (cols, rows) in sizes {
         for (unicode, depth) in levels {
             let mut surface = Surface::new(cols, rows);
@@ -413,7 +413,7 @@ fn snapshots_cover_sizes_capabilities_demand_absence_and_fill() {
     absent_frame.health[CollectorId::CpuFreq.index()] = Health::Absent(Absent::NoHardware);
     let mut absent_model = CpuModel::default();
     absent_model.absorb_frame(&absent_frame);
-    let absent_view = CpuView(&absent_model);
+    let absent_view = CpuView::new(&absent_model);
     let mut surface = Surface::new(160, 45);
     Board::default().paint(&absent_view, &mut surface, Rect::full(160, 45), 0, &[]);
     let rendered = lines(&surface).join("\n");
@@ -424,7 +424,7 @@ fn snapshots_cover_sizes_capabilities_demand_absence_and_fill() {
     absent_frame.health[CollectorId::CpuFreq.index()] = Health::Absent(Absent::NoPermission);
     absent_model.absorb_frame(&absent_frame);
     Board::default().paint(
-        &CpuView(&absent_model),
+        &CpuView::new(&absent_model),
         &mut surface,
         Rect::full(160, 45),
         0,
@@ -442,7 +442,13 @@ fn topology_badges_l3_groups_and_idle_residency_are_frame_driven() {
     let history = fixture_history();
     model.absorb_history(&history, Window::DEFAULT, ScaleMode::Window, 119_000);
     let mut surface = Surface::new(240, 60);
-    Board::default().paint(&CpuView(&model), &mut surface, Rect::full(240, 60), 0, &[]);
+    Board::default().paint(
+        &CpuView::new(&model),
+        &mut surface,
+        Rect::full(240, 60),
+        0,
+        &[],
+    );
     let rendered = lines(&surface).join("\n");
     assert!(rendered.contains("0 P L30"));
     assert!(rendered.contains("4 E L30"));
@@ -469,7 +475,7 @@ fn topology_badges_l3_groups_and_idle_residency_are_frame_driven() {
     model.absorb_frame(&absent);
     let mut absent_surface = Surface::new(240, 60);
     Board::default().paint(
-        &CpuView(&model),
+        &CpuView::new(&model),
         &mut absent_surface,
         Rect::full(240, 60),
         0,
@@ -639,7 +645,7 @@ fn heatmap_right_edge_shows_the_newest_core_sample() {
         }
         model.absorb_frame(&frame);
     }
-    let view = CpuView(&model);
+    let view = CpuView::new(&model);
     let placed = Board::default().placed(&view, Rect::full(240, 60));
     let core_panel = placed.iter().find(|panel| panel.id == CORES).unwrap();
     let graph_x = core_panel.rect.x + 27.min(core_panel.rect.cols.saturating_sub(2));
@@ -663,8 +669,166 @@ fn unknown_softirq_hash_uses_the_absent_mark() {
     let mut model = CpuModel::default();
     model.absorb_frame(&frame);
     let mut surface = Surface::new(160, 45);
-    Board::default().paint(&CpuView(&model), &mut surface, Rect::full(160, 45), 0, &[]);
+    Board::default().paint(
+        &CpuView::new(&model),
+        &mut surface,
+        Rect::full(160, 45),
+        0,
+        &[],
+    );
     let rendered = lines(&surface).join("\n");
     assert!(!rendered.contains("softirq #"));
     assert!(rendered.contains(caps::active_glyphs().emdash));
+}
+
+#[test]
+fn core_panel_is_placed_only_while_detail_is_on() {
+    let frame = fixture_frame();
+    let mut model = CpuModel::default();
+    model.absorb_frame(&frame);
+    let board = Board::default();
+    let area = Rect::full(240, 60);
+    {
+        let view = CpuView::new(&model);
+        let placed_without = board.placed(&view, area);
+        assert!(!placed_without.iter().any(|panel| panel.id == CORE));
+        assert_eq!(
+            placed_demand(&board, &view, area),
+            board.demand(&view, area, 1000).collectors
+        );
+    }
+
+    model.toggle_core_detail();
+    let view = CpuView::new(&model);
+    let placed_with = board.placed(&view, area);
+    assert!(placed_with.iter().any(|panel| panel.id == CORE));
+    assert!(!placed_with.iter().any(|panel| panel.id == IDLE));
+    assert_eq!(
+        placed_demand(&board, &view, area),
+        board.demand(&view, area, 1000).collectors
+    );
+}
+
+fn placed_demand(
+    board: &Board,
+    view: &impl crate::monitor::board::TabView,
+    area: Rect,
+) -> thegn_metrics::collect::CollectorSet {
+    board.placed(view, area).iter().fold(
+        thegn_metrics::collect::CollectorSet::empty(),
+        |mut set, panel| {
+            for collector in view.demand(panel.id).iter() {
+                set.insert(collector);
+            }
+            set
+        },
+    )
+}
+
+#[test]
+fn drill_down_shows_the_selected_cores_frequency_idle_and_topology() {
+    let mut frame = fixture_frame();
+    frame.parts.cpu_stat.cores.truncate(2);
+    frame.parts.cpu_freq.policies[0].cpus.insert(0);
+    frame.parts.cpu_freq.policies[1].cpus.insert(1);
+    frame.parts.cpu_idle.cores.truncate(2);
+    frame.parts.cpu_idle.cores[0].states[0].name = Some("C0-only".into());
+    frame.parts.cpu_idle.cores[1].states[0].name = Some("C7-only".into());
+    frame.parts.cpu_idle.cores[1].states[0].residency_pct = Some(77.0);
+    frame.parts.cpu_topology.cpus.truncate(2);
+    frame.parts.cpu_topology.cpus[0].core_type =
+        thegn_metrics::collect::policy::cpu_topology::CoreType::Performance;
+    frame.parts.cpu_topology.cpus[1].core_type =
+        thegn_metrics::collect::policy::cpu_topology::CoreType::Efficiency;
+    frame.parts.cpu_topology.cpus[0].package = Some(4);
+    frame.parts.cpu_topology.cpus[1].package = Some(9);
+    frame.parts.cpu_topology.cpus[1].die = Some(8);
+    frame.parts.cpu_topology.cpus[1].core = Some(7);
+    frame.parts.cpu_topology.cpus[1].siblings = vec![1, 3];
+    let mut model = CpuModel::default();
+    model.absorb_frame(&frame);
+    model.toggle_core_detail();
+    let view = CpuView::with_cursor(&model, 1);
+    let mut surface = Surface::new(240, 60);
+    Board::default().paint(&view, &mut surface, Rect::full(240, 60), 0, &[]);
+    let rendered = lines(&surface).join("\n");
+    assert!(
+        rendered.contains("1800MHz"),
+        "selected policy must be core 1's: {rendered}"
+    );
+    assert!(
+        rendered.contains("C7-only 77%"),
+        "selected idle data must be core 1's: {rendered}"
+    );
+    assert!(
+        rendered.contains("topology E pkg/die/core 9/8/7 SMT 1,3"),
+        "selected topology must be core 1's: {rendered}"
+    );
+}
+
+#[test]
+fn selected_core_label_is_highlighted_only_with_a_cursor() {
+    let frame = fixture_frame();
+    let mut model = CpuModel::default();
+    model.absorb_frame(&frame);
+    let mut grid = crate::monitor::kit::grid::CellGrid::new(80, 8);
+    caps::test_override::with_unicode(UnicodeLevel::Ascii, || {
+        super::paint::paint_cores(
+            &mut grid,
+            Rect::full(80, 8),
+            &model,
+            None,
+            &mut String::new(),
+        );
+        let default_bg = grid.get(1, 2).unwrap().bg;
+        super::paint::paint_cores(
+            &mut grid,
+            Rect::full(80, 8),
+            &model,
+            Some(1),
+            &mut String::new(),
+        );
+        let selected = grid.get(1, 2).unwrap();
+        assert_eq!(default_bg, crate::seg::StyleTok::INHERIT);
+        assert_eq!(
+            selected.bg,
+            crate::seg::StyleTok::from_tok(crate::seg::Tok::Series(
+                thegn_core::theme::SeriesRole::Selected
+            ))
+            .unwrap()
+        );
+        assert_ne!(selected.bg, grid.get(1, 1).unwrap().bg);
+    });
+}
+
+#[test]
+#[allow(
+    clippy::disallowed_macros,
+    reason = "allocation gate prints observed counts for the primary"
+)]
+fn drill_down_paint_is_allocation_free_when_warm() {
+    const PAINT_ALLOCATION_BUDGET: u64 = 30_300;
+    const PAINT_REALLOC_BUDGET: u64 = 550;
+    let mut model = CpuModel::default();
+    let frame = fixture_frame();
+    absorb_fixture_core_history(&mut model, &frame);
+    model.toggle_core_detail();
+    let view = CpuView::with_cursor(&model, 1);
+    let placed = Board::default().placed(&view, Rect::full(240, 60));
+    let core = placed.iter().find(|panel| panel.id == CORE).unwrap();
+    let mut surface = Surface::new(240, 60);
+    for _ in 0..3 {
+        super::paint::paint_view(&model, Some(1), &mut surface, CORE, core.rect);
+    }
+    let (_, counts) = crate::proc_workload_alloc::measure(|| {
+        super::paint::paint_view(&model, Some(1), &mut surface, CORE, core.rect);
+    });
+    eprintln!("CPU core drill paint observed counts: {counts:?}");
+    assert!(
+        counts.allocation_calls <= PAINT_ALLOCATION_BUDGET
+            && counts.realloc_calls <= PAINT_REALLOC_BUDGET,
+        "CPU core drill paint observed {} allocations ({} reallocations), usage budget {PAINT_ALLOCATION_BUDGET}: {counts:?}",
+        counts.allocation_calls,
+        counts.realloc_calls,
+    );
 }

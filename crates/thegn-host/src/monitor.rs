@@ -633,7 +633,9 @@ impl MonitorOverlay {
 
     fn view(&self) -> board::ActiveView<'_> {
         match self.tab {
-            MonitorTab::Cpu => board::ActiveView::Cpu(tabs::cpu::view::CpuView(&self.cpu)),
+            MonitorTab::Cpu => {
+                board::ActiveView::Cpu(tabs::cpu::view::CpuView::with_cursor(&self.cpu, self.sel))
+            }
             MonitorTab::Gpu if !self.gpu.has_engine_devices() => {
                 board::ActiveView::Legacy(board::LegacyTab)
             }
