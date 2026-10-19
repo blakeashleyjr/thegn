@@ -415,8 +415,8 @@ impl ResidentSession {
             .args(args)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .envs(env);
+            .stderr(Stdio::piped());
+        super::env::apply_plugin_env(&mut command, env);
         if let Some(path) = cwd.filter(|path| path.is_dir()) {
             command.current_dir(path);
         }

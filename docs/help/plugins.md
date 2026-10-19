@@ -21,8 +21,18 @@ Two equivalent homes:
 - A directory: `<config dir>/plugins/<name>/plugin.toml` with the same
   fields. Its `cwd` defaults to that directory.
 
-The optional `env` map adds or overrides environment variables for the plugin
-process; other inherited variables remain available. Values may be
+Plugins start with a clean environment: only PATH, HOME, the user, locale,
+time-zone, terminal, and temp-directory variables (plus the Windows system
+variables a process needs) are passed through, along with the plugin's own
+`env` map. Tokens, agent sockets, and thegn's own variables are not passed
+through unless the user's `[[plugins]]` entry sets `trusted_native = true`,
+which keeps the full environment. In particular, untrusted plugins do not
+receive `XDG_*` config, state, data, or runtime paths; `DISPLAY`,
+`WAYLAND_DISPLAY`, `DBUS_SESSION_BUS_ADDRESS`, `SHELL`, `SSL_CERT_FILE`,
+`NIX_SSL_CERT_FILE`, `RUST_LOG`, or proxy variables. Notification and GUI
+plugins, plugins that need HTTPS certificate configuration on non-NixOS
+systems, and plugins that call back into `thegn` need `trusted_native = true`
+or explicit entries in their `env` map. Values may be
 `keyring:NAME`, `env:VAR`, or `file:PATH` references, resolved just before the
 plugin starts; other values pass verbatim. Only a `[[plugins]]` entry in your
 config may use references: a reference in a directory `plugin.toml` refuses
