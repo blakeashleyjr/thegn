@@ -134,6 +134,7 @@ pub(super) fn open(
     let docs = ctx.cal;
     let now = chrono::Utc::now();
     let today = now.with_timezone(&docs.home).date_naive();
+    crate::hydrate_calendar::note_visible_month((today.year(), today.month()));
     // Snapshotted at open time like everything else here — the popup holds no
     // borrow on the model across frames.
     let weather = model.weather.clone();
@@ -148,7 +149,6 @@ pub(super) fn open(
     if layout::metrics(cols, docs.ui.show_week_numbers).is_none() {
         return Some(fallback(near, ctx));
     }
-
     let st = CalState {
         cursor: CalCursor::new(today),
         today,
@@ -518,6 +518,24 @@ mod request_tests {
             panic!("calendar overlay expected");
         };
         assert_eq!(calendar.st.pending, None);
+    }
+
+    #[test]
+    fn periodic_refresh_of_a_non_current_visible_month_applies() {
+        let key = (2055, 6);
+        let today = NaiveDate::from_ymd_opt(2026, 10, 19).unwrap();
+        let delivered = crate::hydrate_calendar::periodic_months(today, Some(key));
+        assert_eq!(delivered, vec![(2026, 10), key]);
+        let mut slot = Some(overlay(key));
+        let super::super::DetailContent::Calendar(calendar) = &mut slot.as_mut().unwrap().content
+        else {
+            panic!("calendar overlay expected");
+        };
+        calendar.st.loaded.insert(key);
+
+        let mut refresh = payload(key, 0);
+        refresh.request = None;
+        assert!(apply_calendar(&mut slot, refresh));
     }
 }
 

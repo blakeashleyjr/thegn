@@ -18,6 +18,7 @@
 //!    cursor both survive, so a blip degrades to stale data, not no data.
 
 use std::collections::BTreeMap;
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
 use chrono::{Datelike, NaiveDate};
@@ -50,6 +51,31 @@ fn calendar_requests() -> &'static Mutex<CalendarRequests> {
     REQUESTS.get_or_init(|| Mutex::new(CalendarRequests::default()))
 }
 
+static VISIBLE_MONTH: AtomicU32 = AtomicU32::new(0);
+static LATEST_NAVIGATION: AtomicU64 = AtomicU64::new(0);
+
+pub(crate) fn note_visible_month(month: (i32, u32)) {
+    let encoded = if (1..=12).contains(&month.1) {
+        i64::from(month.0)
+            .checked_mul(12)
+            .and_then(|year| year.checked_add(i64::from(month.1)))
+            .and_then(|value| u32::try_from(value).ok())
+            .unwrap_or(0)
+    } else {
+        0
+    };
+    VISIBLE_MONTH.store(encoded, Ordering::Release);
+}
+
+fn visible_month() -> Option<(i32, u32)> {
+    let encoded = VISIBLE_MONTH.load(Ordering::Acquire);
+    if encoded == 0 {
+        return None;
+    }
+    let zero_based = encoded - 1;
+    Some(((zero_based / 12) as i32, zero_based % 12 + 1))
+}
+
 pub(crate) fn register_month_request(month: (i32, u32)) -> u64 {
     let mut requests = calendar_requests()
         .lock()
@@ -60,7 +86,14 @@ pub(crate) fn register_month_request(month: (i32, u32)) -> u64 {
         .expect("calendar request id overflow");
     let request = requests.next;
     requests.latest.insert(month, request);
+    // The global navigation fence is only read by workers; Release/Acquire
+    // makes a newly registered navigation visible before they do more work.
+    LATEST_NAVIGATION.store(request, Ordering::Release);
     request
+}
+
+fn navigation_superseded(request: u64) -> bool {
+    LATEST_NAVIGATION.load(Ordering::Acquire) > request
 }
 
 fn request_is_latest(latest: &BTreeMap<(i32, u32), u64>, month: (i32, u32), request: u64) -> bool {
@@ -162,57 +195,14 @@ pub(crate) fn spawn_month_fetch(
             month,
             covered: widen(from, to),
         };
-        let mut completion = MonthFetchCompletion {
-            tx: worker_tx.clone(),
-            waker: Some(worker_waker.clone()),
+        run_month_fetch(
+            cfg,
             coverage,
             request,
-            sent: false,
-        };
-        let (wide_from, wide_to) = coverage.covered;
-        let home = home_zone(&cfg);
-        let db = Db::open().ok(); // best-effort: cache: the popup falls back to the provider fetch when the DB is out
-
-        // Sync first when anything is stale, so the popup shows current data
-        // rather than yesterday's; `sync_accounts` no-ops when everything is
-        // fresh within `ttl_secs`.
-        //
-        // Note the sync spans the whole configured HORIZON, not the month being
-        // shown. A provider that honours the requested range (CalDAV's
-        // `calendar-query` does) would otherwise return only that month, and a
-        // full fetch replaces the account's cache — silently deleting every
-        // other month. The narrow window is for READING the cache, never for
-        // fetching into it.
-        if let Some(db) = db.as_ref() {
-            let today = chrono::Utc::now().with_timezone(&home).date_naive();
-            match horizon(&cfg, today) {
-                Ok((h_from, h_to)) => {
-                    sync_accounts(db, &cfg, h_from, h_to, false, &mut |m| {
-                        toast(&worker_tx, &worker_waker, m, None)
-                    });
-                }
-                // No provider call and no cache write: the cache stays as it was.
-                Err(problem) => {
-                    refuse_horizon(&problem, &mut |m| toast(&worker_tx, &worker_waker, m, None))
-                }
-            }
-        }
-
-        // No cache is NOT an empty month: without the DB there is nothing to
-        // show, and saying "no events" would be a lie.
-        let month_view = match db.as_ref() {
-            Some(db) => expand_month(db, wide_from, wide_to, home),
-            None => MonthView::failed(CalendarViewError::CacheUnavailable),
-        };
-        deliver(
-            &worker_tx,
-            Some(&worker_waker),
-            coverage,
-            month_view,
-            None,
-            Some(request),
+            worker_tx,
+            Some(worker_waker),
+            || Db::open().ok(),
         );
-        completion.sent = true;
     });
     deliver_unavailable_if_refused(
         admission,
@@ -226,6 +216,72 @@ pub(crate) fn spawn_month_fetch(
         Some(request),
     );
     admission
+}
+
+fn run_month_fetch(
+    cfg: CalendarConfig,
+    coverage: MonthCoverage,
+    request: u64,
+    tx: tokio_mpsc::UnboundedSender<RefreshKind>,
+    waker: Option<TerminalWaker>,
+    open_db: impl FnOnce() -> Option<Db>,
+) {
+    let mut completion = MonthFetchCompletion {
+        tx: tx.clone(),
+        waker: waker.clone(),
+        coverage,
+        request,
+        sent: false,
+    };
+    if navigation_superseded(request) {
+        completion.sent = true;
+        return;
+    }
+    let (wide_from, wide_to) = coverage.covered;
+    let home = home_zone(&cfg);
+    let db = open_db();
+
+    // Sync first when anything is stale, so the popup shows current data
+    // rather than yesterday's; `sync_accounts` no-ops when everything is
+    // fresh within `ttl_secs`.
+    //
+    // The sync spans the whole configured HORIZON, not the month being shown.
+    // The narrow window is for READING the cache, never for fetching into it.
+    if let Some(db) = db.as_ref() {
+        let today = chrono::Utc::now().with_timezone(&home).date_naive();
+        match horizon(&cfg, today) {
+            Ok((h_from, h_to)) => {
+                sync_accounts(db, &cfg, h_from, h_to, false, &mut |m| {
+                    if let Some(waker) = waker.as_ref() {
+                        toast(&tx, waker, m, None);
+                    }
+                });
+            }
+            Err(problem) => {
+                if let Some(waker) = waker.as_ref() {
+                    refuse_horizon(&problem, &mut |m| toast(&tx, waker, m, None));
+                }
+            }
+        }
+    }
+
+    if navigation_superseded(request) {
+        completion.sent = true;
+        return;
+    }
+    let month_view = match db.as_ref() {
+        Some(db) => expand_month(db, wide_from, wide_to, home),
+        None => MonthView::failed(CalendarViewError::CacheUnavailable),
+    };
+    deliver(
+        &tx,
+        waker.as_ref(),
+        coverage,
+        month_view,
+        None,
+        Some(request),
+    );
+    completion.sent = true;
 }
 
 fn deliver_unavailable_if_refused(
@@ -315,8 +371,8 @@ pub(crate) fn expand_month(
     }
 }
 
-/// The periodic sync pass: refresh every account, then push the visible month
-/// back into whatever popup is open.
+/// The periodic sync pass: refresh every account, then push today's and the
+/// popup's visible month back into the shared docs and any open popup.
 #[allow(dead_code)] // retained as the untagged/event-driven entry point
 pub(crate) fn spawn_periodic_sync(
     cfg: CalendarConfig,
@@ -356,25 +412,33 @@ pub(crate) fn spawn_periodic_sync_with_generation(
         if !changed {
             return;
         }
-        // Re-deliver the current month so an open popup picks the change up
-        // without the user having to page away and back.
-        let (m_from, m_to) =
-            thegn_core::calendar::month_bounds(today.year(), today.month()).unwrap_or((from, to));
-        let (wide_from, wide_to) = widen(m_from, m_to);
-        let month_view = expand_month(&db, wide_from, wide_to, home_zone(&cfg));
-        deliver(
-            &tx,
-            Some(&waker),
-            MonthCoverage {
-                year: today.year(),
-                month: today.month(),
-                covered: (wide_from, wide_to),
-            },
-            month_view,
-            generation.as_ref(),
-            None,
-        );
+        for (year, month) in periodic_months(today, visible_month()) {
+            let (m_from, m_to) =
+                thegn_core::calendar::month_bounds(year, month).unwrap_or((from, to));
+            let (wide_from, wide_to) = widen(m_from, m_to);
+            let month_view = expand_month(&db, wide_from, wide_to, home_zone(&cfg));
+            deliver(
+                &tx,
+                Some(&waker),
+                MonthCoverage {
+                    year,
+                    month,
+                    covered: (wide_from, wide_to),
+                },
+                month_view,
+                generation.as_ref(),
+                None,
+            );
+        }
     });
+}
+
+pub(crate) fn periodic_months(today: NaiveDate, visible: Option<(i32, u32)>) -> Vec<(i32, u32)> {
+    let current = (today.year(), today.month());
+    match visible {
+        Some(month) if month != current => vec![current, month],
+        _ => vec![current],
+    }
 }
 
 /// Sync every configured account into the cache. Returns whether anything
