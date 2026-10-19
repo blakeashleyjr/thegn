@@ -24,7 +24,7 @@ pub(in crate::monitor) fn containers(cx: &Ctx, sel: usize) -> TabBuild {
     // Aggregate footprint header. Owned counts are precise (ownership-filtered
     // listings); the byte total is the engine-wide `df` total, marked partial
     // when a detected engine has no `df` op.
-    let note = ownership_note(list, cx.model.container_footprint);
+    let note = ownership_note(list, cx.model.container_footprint, "·", "≥");
     let mut out = vec![heading("containers", Some(note))];
 
     if list.is_empty() {
@@ -106,6 +106,8 @@ pub(in crate::monitor) fn containers(cx: &Ctx, sel: usize) -> TabBuild {
 pub(in crate::monitor) fn ownership_note(
     list: &[thegn_core::sandbox::ContainerInfo],
     footprint: Option<thegn_core::sandbox_manage::ContainerFootprint>,
+    sep: &str,
+    ge: &str,
 ) -> String {
     use thegn_core::sandbox_manage::human_bytes;
     let owned = list.iter().filter(|c| c.ours).count();
@@ -116,16 +118,16 @@ pub(in crate::monitor) fn ownership_note(
         .iter()
         .filter(|c| c.ours && thegn_core::sandbox_manage::container_running(&c.status))
         .count();
-    let split = format!("{owned} owned · {foreign} foreign");
+    let split = format!("{owned} owned {sep} {foreign} foreign");
     match footprint {
         Some(fp) => format!(
-            "{split} · {} img · {} vol · {}{} engine disk",
+            "{split} {sep} {} img {sep} {} vol {sep} {}{} engine disk",
             fp.images,
             fp.volumes,
-            if fp.partial { "≥" } else { "" },
+            if fp.partial { ge } else { "" },
             human_bytes(fp.total_bytes()),
         ),
-        None => format!("{split} · {running} running"),
+        None => format!("{split} {sep} {running} running"),
     }
 }
 
