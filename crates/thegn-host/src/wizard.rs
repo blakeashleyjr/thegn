@@ -283,7 +283,7 @@ impl NewWorktreeWizard {
             .map(|i| (i.key, i.label))
             .collect();
         NewWorktreeWizard {
-            repo_slug: repo::repo_slug(&repo_root),
+            repo_slug: repo::repo_slug_guess(&repo_root),
             root: repo_root.clone(),
             prefix,
             focus: Field::Program,
@@ -302,9 +302,8 @@ impl NewWorktreeWizard {
         }
     }
 
-    /// Construct a wizard in tests without persisting its repo slug to the
-    /// user's state database. The slug lookup happens during construction, so
-    /// the isolated state home only needs to live for this call.
+    /// Construct a wizard in tests with an isolated state home. Construction
+    /// itself uses a pure slug guess and does not touch the state database.
     #[cfg(test)]
     pub(crate) fn new_isolated_for_test(repo_root: PathBuf, cfg: &Config) -> Self {
         let state = crate::testenv::IsolatedState::new();
@@ -315,6 +314,10 @@ impl NewWorktreeWizard {
     /// The repo root this wizard creates worktrees under.
     pub fn root(&self) -> &PathBuf {
         &self.root
+    }
+
+    pub(crate) fn set_repo_slug(&mut self, slug: String) {
+        self.repo_slug = slug;
     }
 
     pub(crate) fn set_failure(&mut self, error: &str) {
@@ -1647,6 +1650,24 @@ mod tests {
     use super::*;
     use thegn_core::config::WorktreeMode;
     use thegn_core::store::RepoTrustStore;
+
+    #[test]
+    fn new_uses_a_pure_slug_guess_without_creating_state_database() {
+        let state = crate::testenv::IsolatedState::new();
+        let root = tempfile::tempdir().unwrap();
+        let cfg = Config::default();
+
+        let w = NewWorktreeWizard::new(root.path().to_path_buf(), &cfg);
+
+        assert_eq!(w.repo_slug, repo::repo_slug_guess(root.path()));
+        assert!(
+            !thegn_core::util::xdg_state_home()
+                .join("thegn/thegn.db")
+                .exists(),
+            "opening the wizard must not create the state database"
+        );
+        assert!(thegn_core::util::xdg_state_home().starts_with(state.root()));
+    }
 
     fn key(w: &mut NewWorktreeWizard, k: KeyCode) -> WizardOutcome {
         w.handle_key(&k, Modifiers::NONE)
