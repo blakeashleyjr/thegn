@@ -212,7 +212,8 @@ pub fn parse_print_dev_env(json: &str) -> Devshell {
 pub fn cache_key(repo_root: &Path) -> Option<String> {
     const MAX_FLAKE_INPUT_BYTES: u64 = 4 * 1024 * 1024;
     let canonical_repo = std::fs::canonicalize(repo_root).ok()?;
-    let flake_src = read_bounded_input(&canonical_repo.join("flake.nix"), MAX_FLAKE_INPUT_BYTES)?;
+    let flake_src =
+        read_bounded_input(&canonical_repo.join("flake.nix"), MAX_FLAKE_INPUT_BYTES).ok()?;
     let lock = match read_bounded_input(&canonical_repo.join("flake.lock"), MAX_FLAKE_INPUT_BYTES) {
         Ok(lock) => Some(lock),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
@@ -239,7 +240,7 @@ fn hash_field(hash: &mut Sha256, value: &[u8]) {
 }
 
 fn read_bounded_input(path: &Path, max_bytes: u64) -> std::io::Result<Vec<u8>> {
-    let file = std::fs::File::open(path)?;
+    let file = crate::fsperm::open_regular_file_nofollow(path)?;
     let mut bytes = Vec::new();
     file.take(max_bytes + 1).read_to_end(&mut bytes)?;
     if bytes.len() as u64 > max_bytes {
@@ -418,7 +419,7 @@ mod tests {
     #[test]
     fn cache_key_is_a_full_sha256_and_binds_the_lock_and_repo_path() {
         let dir = tempfile::tempdir().unwrap();
-        let repo_a = dir.path().join("repo-a\nodd");
+        let repo_a = dir.path().join("repo-a odd#%");
         let repo_b = dir.path().join("repo-b");
         std::fs::create_dir(&repo_a).unwrap();
         std::fs::create_dir(&repo_b).unwrap();
@@ -447,6 +448,23 @@ mod tests {
         )
         .unwrap();
         assert!(cache_key(dir.path()).is_none());
+    }
+
+    #[test]
+    fn cache_key_refuses_a_symlinked_flake_input() {
+        let dir = tempfile::tempdir().unwrap();
+        let real = dir.path().join("real.nix");
+        let flake = dir.path().join("flake.nix");
+        std::fs::write(&real, "{ outputs = _: {}; }").unwrap();
+        match crate::fsperm::create_symlink(&real, &flake, false) {
+            Ok(()) => assert!(cache_key(dir.path()).is_none()),
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::Unsupported | std::io::ErrorKind::PermissionDenied
+                ) => {}
+            Err(error) => panic!("could not create symlink fixture: {error}"),
+        }
     }
 
     #[test]
