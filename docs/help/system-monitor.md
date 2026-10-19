@@ -120,7 +120,12 @@ The CPU board shows total busy history and the current user, system, iowait, and
 steal shares, plus a per-core busy heatmap. The `Cores (L3)` panel labels known
 performance/efficiency cores with P/E badges and adds an `L3<n>` tag (such as
 `L30`) when the cache group is known; missing topology stays unlabelled. The
-`C states residency` panel shows C0 and reported C-state residency per core.
+CPU tab is a list: `j`/`k`, arrows, `PgUp`/`PgDn`, `Home`/`End`, and `G` move the
+core cursor, and the selected core label uses the monitor selection highlight.
+Press `Enter` (`↵ core`) to toggle the `cpu.core` panel in the C-states slot.
+It shows six rows of busy history, current mode shares, that core's frequency
+policy, C-state residencies, and package/die/core topology with SMT siblings.
+The `C states residency` panel shows C0 and reported C-state residency per core.
 Frequency, load/pressure, IRQ/softirq, and scheduler wait have separate panels.
 Panel focus (`f`/`F`), zoom (`z`), and Escape follow the monitor board controls.
 
