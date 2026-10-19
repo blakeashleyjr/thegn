@@ -39,7 +39,6 @@ struct IfaceBytes {
 
 trait PhysicalCounters: Send {
     fn read(&mut self, out: &mut Vec<IfaceBytes>) -> io::Result<()>;
-    fn truncated(&self) -> bool;
     fn close(&mut self);
 }
 
@@ -54,7 +53,6 @@ struct ProcNetDev {
     sysfs_root: PathBuf,
     file: Option<ProcFile>,
     scopes: Vec<CachedScope>,
-    truncated: bool,
 }
 
 impl ProcNetDev {
@@ -64,14 +62,12 @@ impl ProcNetDev {
             sysfs_root: sysfs_root.as_ref().to_path_buf(),
             file: None,
             scopes: Vec::with_capacity(IFACE_CAP),
-            truncated: false,
         }
     }
 }
 
 impl PhysicalCounters for ProcNetDev {
     fn read(&mut self, out: &mut Vec<IfaceBytes>) -> io::Result<()> {
-        self.truncated = false;
         if self.file.is_none() {
             self.file = Some(ProcFile::open(&self.path)?);
         }
@@ -102,7 +98,6 @@ impl PhysicalCounters for ProcNetDev {
                 });
                 scope
             } else {
-                self.truncated = true;
                 Scope::Virtual
             };
             if out.len() < IFACE_CAP {
@@ -112,8 +107,6 @@ impl PhysicalCounters for ProcNetDev {
                     rx: counters.rx_bytes,
                     tx: counters.tx_bytes,
                 });
-            } else {
-                self.truncated = true;
             }
         });
         if count.is_none() {
@@ -128,10 +121,6 @@ impl PhysicalCounters for ProcNetDev {
     fn close(&mut self) {
         self.file = None;
         self.scopes.clear();
-    }
-
-    fn truncated(&self) -> bool {
-        self.truncated
     }
 }
 
@@ -248,10 +237,6 @@ impl PhysicalCounters for EmptyPhysical {
         Ok(())
     }
 
-    fn truncated(&self) -> bool {
-        false
-    }
-
     fn close(&mut self) {}
 }
 
@@ -353,7 +338,6 @@ impl<F: CgroupFs + Send + 'static> Collector for NetSocketsCollector<F> {
         let previous = self.last_dump_ms;
         let interval_ms = previous.map(|last| self.now_ms.saturating_sub(last));
         let read_ok = self.physical.read(&mut self.iface_rows).is_ok();
-        let physical_truncated = self.physical.truncated();
         let physical_known = self.prev_physical_known && read_ok;
         let (physical_rx, physical_tx) = if physical_known {
             physical_delta(&self.prev_ifaces, &self.iface_rows)
@@ -367,7 +351,8 @@ impl<F: CgroupFs + Send + 'static> Collector for NetSocketsCollector<F> {
             self.owners.as_mut().expect("owner table initialized"),
             &mut part.attribution,
         );
-        part.attribution.truncated |= physical_truncated || stats.truncated;
+        // The Owners partial marker describes socket/owner coverage, not physical rows.
+        part.attribution.truncated |= stats.truncated;
         if !read_ok {
             self.iface_rows.clear();
         }

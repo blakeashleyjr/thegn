@@ -148,10 +148,6 @@ impl PhysicalCounters for FakePhysical {
         Ok(())
     }
 
-    fn truncated(&self) -> bool {
-        false
-    }
-
     fn close(&mut self) {}
 }
 
@@ -246,6 +242,10 @@ fn socket_attribution_and_physical_remainder_share_the_dump_interval() {
         tcp_with_counters(11, 101, 100_000, 100_000),
         tcp_with_counters(12, 202, 100_000, 100_000),
     ];
+    let fourth = vec![
+        tcp_with_counters(11, 101, 101_000, 101_000),
+        tcp_with_counters(12, 202, 102_000, 102_000),
+    ];
     let transport = FakeTransport {
         sockets: Vec::new(),
         open_error: None,
@@ -254,7 +254,7 @@ fn socket_attribution_and_physical_remainder_share_the_dump_interval() {
         truncated: false,
         opened: false,
         dump_error: None,
-        batches: vec![first, second, third],
+        batches: vec![first, second, third, fourth],
     };
     let physical = FakePhysical {
         batches: VecDeque::from([
@@ -282,6 +282,8 @@ fn socket_attribution_and_physical_remainder_share_the_dump_interval() {
     let baseline = &frame.parts.net_sockets;
     assert!(baseline.attribution_interval_ms.is_none());
     assert!(!baseline.physical_known);
+    assert_eq!(baseline.attribution.owners.len(), 2);
+    assert!(!baseline.attribution.truncated);
     assert!(
         baseline
             .attribution
@@ -302,6 +304,7 @@ fn socket_attribution_and_physical_remainder_share_the_dump_interval() {
     let part = &frame.parts.net_sockets;
     assert_eq!(part.attribution_interval_ms, Some(5_000));
     assert!(part.physical_known);
+    assert!(!part.attribution.truncated);
     assert_eq!(part.attribution.owners.len(), 2);
     assert_eq!(
         (
@@ -361,6 +364,16 @@ fn socket_attribution_and_physical_remainder_share_the_dump_interval() {
         .unwrap();
     assert!(frame.parts.net_sockets.attribution_interval_ms.is_none());
     assert!(!frame.parts.net_sockets.physical_known);
+    assert_eq!(frame.parts.net_sockets.attribution.owners.len(), 2);
+    assert!(
+        frame
+            .parts
+            .net_sockets
+            .attribution
+            .owners
+            .iter()
+            .all(|owner| { owner.rx_bytes == 0 && owner.tx_bytes == 0 })
+    );
 }
 
 #[test]

@@ -825,6 +825,10 @@ fn owner_history_advances_only_on_a_net_sockets_sample() {
     assert_eq!(model.owners[0].history.len, 1);
     model.absorb_frame(&frame);
     assert_eq!(model.owners[0].history.len, 2);
+    frame.parts.net_sockets.attribution.owners.clear();
+    model.absorb_frame(&frame);
+    assert_eq!(model.owners[0].history.len, 3);
+    assert_eq!(model.owners[0].history.values[2], 0.0);
 }
 
 #[test]
@@ -839,13 +843,17 @@ fn owners_panel_shows_warming_and_denied_states_without_changing_placement() {
                 .iter()
                 .any(|panel| panel.id == OWNERS)
         );
+        let warming_rect = Board::default()
+            .placed(&view, area)
+            .into_iter()
+            .find(|panel| panel.id == OWNERS)
+            .expect("owners panel placed")
+            .rect;
         let mut warming_surface = Surface::new(240, 60);
         Board::default().paint(&view, &mut warming_surface, area, 0, &[]);
-        assert!(
-            lines(&warming_surface)
-                .join("\n")
-                .contains(caps::active_glyphs().ellipsis)
-        );
+        let warming_lines = lines(&warming_surface);
+        let warming_row = &warming_lines[warming_rect.y + 2];
+        assert!(warming_row.contains(caps::active_glyphs().ellipsis));
     }
 
     model.owners_health = Health::Absent(thegn_metrics::collect::health::Absent::NoPermission);
@@ -863,6 +871,82 @@ fn owners_panel_shows_warming_and_denied_states_without_changing_placement() {
         lines(&denied_surface)
             .join("\n")
             .contains(caps::glyph(caps::Glyph::Lock))
+    );
+}
+
+#[test]
+fn owners_first_sample_after_open_shows_unprimed_marker_without_rates_or_sparks() {
+    let mut model = NetworkModel::default();
+    model.owners_health = Health::Ok;
+    let mut frame = MonitorFrame::default();
+    frame.sampled.insert(CollectorId::NetSockets);
+    frame.health[CollectorId::NetSockets.index()] = Health::Ok;
+    frame.parts.net_sockets.attribution.owners.push(OwnerRates {
+        cgroup_id: 71,
+        path: Arc::from(&b"/user.slice/app.slice"[..]),
+        kind: OwnerKind::App,
+        name: Arc::from(&b"warm-owner"[..]),
+        rx_bytes: 0,
+        tx_bytes: 0,
+    });
+    model.absorb_frame(&frame);
+    let area = Rect::full(240, 60);
+    let view = NetworkView(&model);
+    let owners_rect = Board::default()
+        .placed(&view, area)
+        .into_iter()
+        .find(|panel| panel.id == OWNERS)
+        .expect("owners panel placed")
+        .rect;
+    let mut surface = Surface::new(240, 60);
+    Board::default().paint(&view, &mut surface, area, 0, &[]);
+    let rendered = lines(&surface);
+    let body_row = &rendered[owners_rect.y + 2];
+    assert!(body_row.contains(caps::active_glyphs().ellipsis));
+    assert!(!body_row.contains("warm-owner"));
+    assert!(!body_row.contains("0.0"));
+
+    let mut warmed = MonitorFrame::default();
+    warmed.sampled.insert(CollectorId::NetSockets);
+    warmed.health[CollectorId::NetSockets.index()] = Health::Ok;
+    warmed.parts.net_sockets.attribution_interval_ms = Some(5_000);
+    warmed
+        .parts
+        .net_sockets
+        .attribution
+        .owners
+        .push(OwnerRates {
+            cgroup_id: 72,
+            path: Arc::from(&b"/user.slice/app.slice"[..]),
+            kind: OwnerKind::App,
+            name: Arc::from(&b"resident"[..]),
+            rx_bytes: 5_000,
+            tx_bytes: 2_500,
+        });
+    let mut warmed_model = NetworkModel::default();
+    warmed_model.absorb_frame(&warmed);
+    let mut baseline = warmed;
+    baseline.parts.net_sockets.attribution_interval_ms = None;
+    warmed_model.absorb_frame(&baseline);
+    let warmed_view = NetworkView(&warmed_model);
+    let warmed_rect = Board::default()
+        .placed(&warmed_view, area)
+        .into_iter()
+        .find(|panel| panel.id == OWNERS)
+        .expect("owners panel placed")
+        .rect;
+    let mut baseline_surface = Surface::new(240, 60);
+    Board::default().paint(&warmed_view, &mut baseline_surface, area, 0, &[]);
+    let baseline_lines = lines(&baseline_surface);
+    let row = &baseline_lines[warmed_rect.y + 2];
+    assert!(row.contains(caps::active_glyphs().ellipsis));
+    let spark_start = warmed_rect.x + warmed_rect.cols - 13;
+    let spark_end = warmed_rect.x + warmed_rect.cols - 1;
+    assert!(
+        row.chars()
+            .skip(spark_start)
+            .take(spark_end - spark_start)
+            .all(|c| c == ' ')
     );
 }
 

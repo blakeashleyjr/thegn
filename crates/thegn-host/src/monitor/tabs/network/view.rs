@@ -34,7 +34,7 @@ pub(super) const IFACE_CAP: usize = 8;
 const IFACE_HISTORY: usize = 32;
 const WIFI_CAP: usize = 16;
 const WIFI_HISTORY: usize = 120;
-const OWNER_CAP: usize = 16;
+pub(super) const OWNER_CAP: usize = 16;
 const OWNER_HISTORY: usize = 60;
 const VARIANTS: [Variant; 1] = [Variant {
     kind: VariantKind::Full,
@@ -484,6 +484,12 @@ impl NetworkModel {
                 owner.tx_bytes,
                 interval,
             );
+        }
+        if interval.is_some_and(|interval| interval > 0) {
+            // A sampled dump with no sockets for a resident owner is a real zero-rate sample.
+            for slot in self.owners.iter_mut().filter(|slot| !slot.live) {
+                slot.history.push(0.0);
+            }
         }
         self.owners_overflow = attribution
             .owners

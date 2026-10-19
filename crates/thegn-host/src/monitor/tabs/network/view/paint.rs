@@ -1,5 +1,5 @@
 use super::{
-    HEALTH, HISTORY, IFACE_HISTORY, INTERFACES, NetworkModel, OWNERS, TELEMETRY_HISTORY,
+    HEALTH, HISTORY, IFACE_HISTORY, INTERFACES, NetworkModel, OWNER_CAP, OWNERS, TELEMETRY_HISTORY,
     THROUGHPUT, WIFI, WIFI_HISTORY,
 };
 use crate::{
@@ -54,7 +54,7 @@ pub(super) fn paint(model: &NetworkModel, surface: &mut Surface, id: PanelId, re
         HEALTH => "Network health".to_owned(),
         WIFI => "Wi-Fi interfaces (signal -90..-30 dBm)".to_owned(),
         OWNERS => format!(
-            "Network owners (top by rx+tx, B/s peak {}{})",
+            "Network owners (top by rx+tx, B/s peak {}){}",
             format_rate(f64::from(owner_peak(model))),
             if model.owners_truncated {
                 "  partial"
@@ -161,8 +161,8 @@ fn paint_owners(grid: &mut CellGrid, body: Rect, model: &NetworkModel) {
             0,
             remainder_row,
             &format!(
-                "other (UDP/QUIC/other)  {} {rx}  {} {tx}",
-                glyphs.arrow_down, glyphs.arrow_up
+                "{:<5} {:<28} {:>10} {:>10}",
+                "other", "UDP/QUIC/other", rx, tx,
             ),
             CellStyle::default(),
         );
@@ -202,8 +202,8 @@ fn owner_peak(model: &NetworkModel) -> f32 {
         .max(1.0)
 }
 
-fn owner_order(model: &NetworkModel) -> ([usize; 16], usize) {
-    let mut order = [usize::MAX; 16];
+fn owner_order(model: &NetworkModel) -> ([usize; OWNER_CAP], usize) {
+    let mut order = [usize::MAX; OWNER_CAP];
     let mut count = 0;
     for (index, owner) in model
         .owners
@@ -236,6 +236,14 @@ fn paint_owner_histories(
     body: Rect,
     panel_rect: Rect,
 ) {
+    if matches!(
+        model.owners_health,
+        thegn_metrics::collect::health::Health::Absent(_)
+            | thegn_metrics::collect::health::Health::Warming
+    ) || !model.owners_primed
+    {
+        return;
+    }
     let peak = owner_peak(model);
     let spark_width = body.cols.min(12);
     let x = panel_rect.x + body.x + body.cols.saturating_sub(spark_width);
