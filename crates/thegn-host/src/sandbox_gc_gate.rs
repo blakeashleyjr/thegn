@@ -37,8 +37,9 @@ pub(crate) fn active_oci_wanted(cfg: &Config, observed_backend: &str) -> bool {
             .is_some_and(|backend| backend.is_oci())
 }
 
-/// Resolve refresh demand only when the effective base config can create a
-/// container. Visible surfaces alone must not revive Podman after sandbox-off.
+/// Resolve refresh demand from the effective base config. With the base config
+/// off, keep explicitly visible surfaces because a repo overlay can enable
+/// their containers; suppress passive refresh from the panel or other tabs.
 pub(crate) fn container_demand(
     cfg: &Config,
     panel_open: bool,
@@ -48,7 +49,11 @@ pub(crate) fn container_demand(
     observed_backend: &str,
 ) -> crate::hydrate::ContainerDemand {
     if !startup_gc_wanted(cfg) {
-        return crate::hydrate::ContainerDemand::None;
+        return if monitor_containers_visible || sandbox_section_open {
+            crate::hydrate::ContainerDemand::Detail
+        } else {
+            crate::hydrate::ContainerDemand::None
+        };
     }
     crate::hydrate::ContainerDemand::resolve(
         panel_open,
@@ -79,7 +84,8 @@ mod tests {
         assert!(!startup_gc_wanted(&parsed(
             "[sandbox]\nenabled = false\n[env.x.sandbox]\nenabled = false\n"
         )));
-        assert!(startup_gc_wanted(&parsed(
+        // An inactive profile never applies.
+        assert!(!startup_gc_wanted(&parsed(
             "[sandbox]\nenabled = false\n[profiles.x.sandbox]\nenabled = true\n"
         )));
         assert!(!startup_gc_wanted(&parsed(
@@ -106,8 +112,34 @@ mod tests {
             crate::hydrate::ContainerDemand::None
         );
         assert_eq!(
-            super::container_demand(&parsed(""), true, false, false, false, ""),
+            super::container_demand(&parsed(""), true, false, false, false, "podman"),
             crate::hydrate::ContainerDemand::Summary
+        );
+        assert_eq!(
+            super::container_demand(&parsed(""), true, false, false, false, ""),
+            crate::hydrate::ContainerDemand::None
+        );
+    }
+
+    #[test]
+    fn sandbox_off_keeps_only_explicit_container_surface_demand() {
+        let cfg = parsed("[sandbox]\nenabled = false\n");
+
+        assert_eq!(
+            super::container_demand(&cfg, true, false, false, false, "podman"),
+            crate::hydrate::ContainerDemand::None
+        );
+        assert_eq!(
+            super::container_demand(&cfg, false, true, false, false, ""),
+            crate::hydrate::ContainerDemand::None
+        );
+        assert_eq!(
+            super::container_demand(&cfg, false, false, false, true, ""),
+            crate::hydrate::ContainerDemand::Detail
+        );
+        assert_eq!(
+            super::container_demand(&cfg, false, true, true, false, ""),
+            crate::hydrate::ContainerDemand::Detail
         );
     }
 
