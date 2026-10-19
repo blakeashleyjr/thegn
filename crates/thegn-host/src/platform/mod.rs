@@ -220,6 +220,12 @@ impl ProcSignal {
         const MENU: &[ProcSignal] = &[ProcSignal::Terminate];
         MENU
     }
+
+    /// Whether choosing this signal requires the monitor's explicit `y`.
+    pub fn needs_confirm(self) -> bool {
+        matches!(self, Self::Kill | Self::Stop)
+            || (cfg!(windows) && matches!(self, Self::Terminate))
+    }
 }
 
 mod signal_identity;
