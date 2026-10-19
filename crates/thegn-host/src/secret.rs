@@ -14,8 +14,9 @@
 //! - a bare string (`FLY_API_TOKEN`) — an **env var name**, matching the historic
 //!   `api_key_env` meaning, so existing configs keep working untouched.
 //!
-//! [`store`] is the inverse: it persists a UI-entered token to the keyring (best),
-//! else a `0600` file, and returns the SecretRef string to write into config.
+//! [`store`] is the inverse: it persists a UI-entered token to the keyring, or
+//! uses a `0600` file only after a completed keyring failure, and returns the
+//! SecretRef string to write into config.
 
 use std::path::PathBuf;
 
@@ -185,17 +186,43 @@ fn presence_memo()
 }
 
 /// Persist a UI/CLI-entered `token` for `name` (e.g. an env name like `fly-dev`),
-/// preferring the OS keyring and falling back to a `0600` file. Returns the
-/// SecretRef to store in config (`keyring:<name>` or `file:<path>`), so the token
-/// itself never lands in `config.toml`.
+/// preferring the OS keyring and falling back to a `0600` file only after a
+/// completed keyring failure. A timeout is an error because the keyring may
+/// still commit the write. Returns the SecretRef to store in config
+/// (`keyring:<name>` or `file:<path>`), so the token itself never lands in
+/// `config.toml`.
 pub fn store(name: &str, token: &str) -> Result<String> {
     if let Ok(mut m) = presence_memo().lock() {
         m.clear();
     }
-    if keyring_set(name, token).is_ok() {
-        return Ok(format!("keyring:{name}"));
+    store_with_dir(name, token, keyring_set, secrets_dir_path)
+}
+
+fn store_in(
+    dir: &std::path::Path,
+    name: &str,
+    token: &str,
+    set: impl FnOnce(&str, &str) -> KeyringOutcome<Result<()>>,
+) -> Result<String> {
+    store_with_dir(name, token, set, || Ok(dir.to_path_buf()))
+}
+
+fn store_with_dir(
+    name: &str,
+    token: &str,
+    set: impl FnOnce(&str, &str) -> KeyringOutcome<Result<()>>,
+    dir: impl FnOnce() -> Result<PathBuf>,
+) -> Result<String> {
+    match set(name, token) {
+        KeyringOutcome::Completed(Ok(())) => return Ok(format!("keyring:{name}")),
+        KeyringOutcome::TimedOut => anyhow::bail!(
+            "keyring write outcome unknown for `{name}`; nothing was written to a file; retry once the keyring responds"
+        ),
+        KeyringOutcome::Completed(Err(_error)) => {}
     }
-    let path = secrets_file(name)?;
+    let dir = dir()?;
+    secrets_dir_at(&dir)?;
+    let path = resolve_token_path_in(&dir, name)?;
     write_account_sidecar(&path, name)?;
     write_private(&path, token)?;
     thegn_core::fsperm::sync_parent_dir(path.parent().context("secret path has no parent")?)?;
@@ -229,25 +256,119 @@ pub fn store_file(name: &str, token: &str) -> Result<String> {
 /// Remove a stored secret (best-effort, both backends) — used when an env is
 /// deleted. Never errors on a missing entry.
 pub fn forget(name: &str) {
+    let report = forget_with_report(name);
+    match &report.keyring {
+        ForgetKeyringOutcome::Failed(error) => {
+            tracing::warn!(target: "thegn::secret", %error, "keyring secret removal failed")
+        }
+        ForgetKeyringOutcome::OutcomeUnknown => {
+            tracing::warn!(target: "thegn::secret", "keyring secret removal outcome is unknown")
+        }
+        ForgetKeyringOutcome::Removed => {}
+    }
+    if let ForgetFileOutcome::Failed(error) = &report.file {
+        tracing::warn!(target: "thegn::secret", %error, "refused file-backed secret removal");
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ForgetKeyringOutcome {
+    /// The keyring removal call completed successfully.
+    Removed,
+    /// The keyring removal call completed with an error.
+    Failed(String),
+    /// The call timed out, so the keyring may or may not have removed it.
+    OutcomeUnknown,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ForgetFileOutcome {
+    /// A file-backed secret or sidecar was removed.
+    Removed,
+    /// No file-backed secret or sidecar existed.
+    Absent,
+    /// The file backend could not complete the removal.
+    Failed(String),
+}
+
+/// Removal outcomes for both secret backends.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ForgetReport {
+    /// Result from the OS keyring.
+    pub keyring: ForgetKeyringOutcome,
+    /// Result from the owner-only file backend.
+    pub file: ForgetFileOutcome,
+}
+
+/// Remove a stored secret and retain the outcome from each backend for callers
+/// that need to report uncertainty (notably `thegn secret rm`).
+pub fn forget_with_report(name: &str) -> ForgetReport {
     if let Ok(mut m) = presence_memo().lock() {
         m.clear();
     }
-    if let Err(error) = keyring_del(name) {
-        tracing::debug!(target: "thegn::secret", %error, "best-effort keyring secret cleanup failed");
-    }
+    let dir = match secrets_dir_path() {
+        Ok(dir) => dir,
+        Err(error) => {
+            let keyring = match keyring_del(name) {
+                KeyringOutcome::Completed(Ok(())) => ForgetKeyringOutcome::Removed,
+                KeyringOutcome::Completed(Err(error)) => {
+                    ForgetKeyringOutcome::Failed(error.to_string())
+                }
+                KeyringOutcome::TimedOut => ForgetKeyringOutcome::OutcomeUnknown,
+            };
+            return ForgetReport {
+                keyring,
+                file: ForgetFileOutcome::Failed(error.to_string()),
+            };
+        }
+    };
+    forget_in(&dir, name, keyring_del)
+}
+
+fn forget_in(
+    dir: &std::path::Path,
+    name: &str,
+    del: impl FnOnce(&str) -> KeyringOutcome<Result<()>>,
+) -> ForgetReport {
+    let keyring = match del(name) {
+        KeyringOutcome::Completed(Ok(())) => ForgetKeyringOutcome::Removed,
+        KeyringOutcome::Completed(Err(error)) => ForgetKeyringOutcome::Failed(error.to_string()),
+        KeyringOutcome::TimedOut => ForgetKeyringOutcome::OutcomeUnknown,
+    };
     // Do not derive and delete the pre-hash fallback filename. That historical
     // sanitizer was not injective (`a/b` and `a_b` both became `a_b.token`), so
     // automatic legacy cleanup could delete a different account's credential.
     // Existing `file:` refs remain directly resolvable and can be removed by
     // their explicit path during a user-directed migration.
-    match secrets_dir() {
-        Ok(dir) => {
-            if let Err(error) = file_del_at(&dir, name) {
-                tracing::warn!(%error, "refused file-backed secret removal");
-            }
-        }
-        Err(error) => tracing::warn!(%error, "secrets dir unavailable for removal"),
-    }
+    let file = match secrets_dir_at(dir) {
+        Err(error) => ForgetFileOutcome::Failed(error.to_string()),
+        Ok(()) => match file_entry_exists(dir, name) {
+            Err(error) => ForgetFileOutcome::Failed(error.to_string()),
+            Ok(existed) => match file_del_at(dir, name) {
+                Ok(()) if existed => ForgetFileOutcome::Removed,
+                Ok(()) => ForgetFileOutcome::Absent,
+                Err(error) => ForgetFileOutcome::Failed(error.message().to_string()),
+            },
+        },
+    };
+    ForgetReport { keyring, file }
+}
+
+fn file_entry_exists(dir: &std::path::Path, name: &str) -> Result<bool> {
+    let current = token_path_in(dir, name)?;
+    let legacy = legacy_token_path_in(dir, name)?;
+    Ok(path_entry_exists(&current)?
+        || path_entry_exists(&account_path(&current))?
+        || path_entry_exists(&legacy)?
+        || path_entry_exists(&account_path(&legacy))?)
+}
+
+fn secrets_dir_path() -> Result<PathBuf> {
+    let cfg = thegn_core::config::Config::path();
+    std::path::Path::new(&cfg)
+        .parent()
+        .map(|parent| parent.join("secrets"))
+        .context("config path has no parent")
 }
 
 /// Whether an OS keyring is actually usable here (so the UI can tell the user
@@ -307,16 +428,19 @@ const KEYRING_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_sec
 /// for the entire run while every other caller queued behind it, which is what
 /// stopped `cargo test` from ever completing on this Mac.
 ///
-/// A stuck probe is answered "unavailable", which is both true and useful:
-/// [`store`] already falls back to a `0600` file, so the feature degrades
-/// instead of hanging.
+/// A stuck probe is answered "unavailable", which is both true and useful for
+/// discovery; write operations still decide independently whether a completed
+/// keyring failure permits the `0600` file backend.
 ///
 /// The probe thread is deliberately **detached** rather than joined — it may be
 /// blocked in Security.framework indefinitely, and joining it would reintroduce
 /// exactly the hang this removes. Same trade as `sandbox::output_with_timeout`'s
 /// detached reap.
 fn probe_keyring_bounded() -> bool {
-    run_keyring_op_with_timeout("probe", KEYRING_PROBE_TIMEOUT, probe_keyring).unwrap_or(false)
+    matches!(
+        run_keyring_op_with_timeout("probe", KEYRING_PROBE_TIMEOUT, probe_keyring),
+        KeyringOutcome::Completed(true)
+    )
 }
 
 /// The unbounded probe: a round-trip on a throwaway account is the only honest
@@ -334,47 +458,59 @@ fn probe_keyring() -> bool {
         }
         // No entry handle at all (no credential store, or one that refuses to
         // open) — indistinguishable from a store that cannot hold a secret, and
-        // answered the same way: unavailable, so `store` falls back to a file.
+        // answered the same way: unavailable. A later write still requires its
+        // own completed keyring failure before it may use the file backend.
         Err(_) => false,
     }
+}
+
+enum KeyringOutcome<T> {
+    Completed(T),
+    TimedOut,
 }
 
 fn run_keyring_op_with_timeout<T: Send + 'static>(
     operation: &'static str,
     timeout: std::time::Duration,
     op: impl FnOnce() -> T + Send + 'static,
-) -> Result<T> {
+) -> KeyringOutcome<T> {
     let (tx, rx) = std::sync::mpsc::sync_channel(1);
     thegn_core::thread_name::spawn_named("thegn-keyring", move || {
         crate::platform::qos::set_self(crate::platform::qos::Qos::Interactive); // Interactive: synchronous UI callers wait up to 2s.
         // best-effort: the receiver is gone if the operation exceeded its cap.
         let _ = tx.send(op());
     });
-    rx.recv_timeout(timeout).map_err(|_| {
-        tracing::warn!(
-            target: "thegn::secret",
-            operation,
-            cap_ms = timeout.as_millis() as u64,
-            "keyring operation timed out — treating the OS keyring as unavailable"
-        );
-        anyhow::anyhow!(
-            "keyring {operation} timed out after {}ms",
-            timeout.as_millis()
-        )
-    })
+    match rx.recv_timeout(timeout) {
+        Ok(value) => KeyringOutcome::Completed(value),
+        Err(_) => {
+            tracing::warn!(
+                target: "thegn::secret",
+                operation,
+                cap_ms = timeout.as_millis() as u64,
+                "keyring operation timed out — outcome unknown"
+            );
+            KeyringOutcome::TimedOut
+        }
+    }
 }
 
 fn keyring_get(account: &str) -> Result<Option<String>> {
     let account = account.to_string();
-    run_keyring_op_with_timeout("get", KEYRING_PROBE_TIMEOUT, move || {
+    match run_keyring_op_with_timeout("get", KEYRING_PROBE_TIMEOUT, move || {
         keyring::Entry::new(KEYRING_SERVICE, &account)
             .ok()
             .and_then(|entry| entry.get_password().ok())
             .filter(|value| !value.trim().is_empty())
-    })
+    }) {
+        KeyringOutcome::Completed(value) => Ok(value),
+        KeyringOutcome::TimedOut => Err(anyhow::anyhow!(
+            "keyring get timed out after {}ms",
+            KEYRING_PROBE_TIMEOUT.as_millis()
+        )),
+    }
 }
 
-fn keyring_set(account: &str, token: &str) -> Result<()> {
+fn keyring_set(account: &str, token: &str) -> KeyringOutcome<Result<()>> {
     let account = account.to_string();
     let token = token.to_string();
     run_keyring_op_with_timeout("set", KEYRING_PROBE_TIMEOUT, move || {
@@ -382,10 +518,10 @@ fn keyring_set(account: &str, token: &str) -> Result<()> {
             .context("keyring entry")?
             .set_password(&token)
             .context("keyring set")
-    })?
+    })
 }
 
-fn keyring_del(account: &str) -> Result<()> {
+fn keyring_del(account: &str) -> KeyringOutcome<Result<()>> {
     let account = account.to_string();
     run_keyring_op_with_timeout("delete", KEYRING_PROBE_TIMEOUT, move || {
         let entry = keyring::Entry::new(KEYRING_SERVICE, &account).context("keyring entry")?;
@@ -393,7 +529,7 @@ fn keyring_del(account: &str) -> Result<()> {
             Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
             Err(error) => Err(error).context("keyring delete"),
         }
-    })?
+    })
 }
 
 /// `$XDG_CONFIG_HOME/thegn/secrets/<name>.token` — alongside the config file,
@@ -567,7 +703,7 @@ impl Probe for KeyringStore {
         } else {
             Availability::Unavailable(
                 "no usable OS credential store (headless / locked / absent); \
-                 explicit `keyring:` refs are unavailable; broker writes may use an owner-only file"
+                 explicit `keyring:` refs are unavailable; broker writes may use an owner-only file after a completed keyring failure"
                     .into(),
             )
         };
@@ -592,10 +728,24 @@ impl SecretStore for KeyringStore {
         }
     }
     fn set(&self, account: &str, value: &str) -> Result<(), SecretError> {
-        keyring_set(account, value).map_err(|e| SecretError::denied(e.to_string()))
+        match keyring_set(account, value) {
+            KeyringOutcome::Completed(result) => {
+                result.map_err(|error| SecretError::denied(error.to_string()))
+            }
+            KeyringOutcome::TimedOut => Err(SecretError::denied(
+                "keyring outcome unknown: write timed out; retry once the keyring responds",
+            )),
+        }
     }
     fn del(&self, account: &str) -> Result<(), SecretError> {
-        keyring_del(account).map_err(|e| SecretError::denied(e.to_string()))
+        match keyring_del(account) {
+            KeyringOutcome::Completed(result) => {
+                result.map_err(|error| SecretError::denied(error.to_string()))
+            }
+            KeyringOutcome::TimedOut => Err(SecretError::denied(
+                "keyring outcome unknown: removal timed out; retry once the keyring responds",
+            )),
+        }
     }
 }
 
@@ -1110,8 +1260,59 @@ mod tests {
                 std::thread::sleep(std::time::Duration::from_secs(1));
                 true
             });
-        assert!(result.is_err());
+        assert!(matches!(result, KeyringOutcome::TimedOut));
         assert!(started.elapsed() < std::time::Duration::from_millis(250));
+    }
+
+    #[test]
+    fn timed_out_keyring_set_writes_no_file_fallback() {
+        let temp = private_temp();
+        let result = store_in(temp.path(), "acct", "tok", |_, _| KeyringOutcome::TimedOut);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("unknown"));
+        assert_eq!(std::fs::read_dir(temp.path()).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn completed_keyring_set_failure_still_falls_back_to_file() {
+        let temp = private_temp();
+        let result = store_in(temp.path(), "acct", "tok", |_, _| {
+            KeyringOutcome::Completed(Err(anyhow::anyhow!("denied")))
+        })
+        .unwrap();
+        assert!(result.starts_with("file:"));
+        assert_eq!(file_get_in(temp.path(), "acct").unwrap(), "tok");
+    }
+
+    #[test]
+    fn completed_keyring_set_success_returns_keyring_ref() {
+        let temp = private_temp();
+        let result = store_in(temp.path(), "acct", "tok", |_, _| {
+            KeyringOutcome::Completed(Ok(()))
+        })
+        .unwrap();
+        assert_eq!(result, "keyring:acct");
+        assert_eq!(std::fs::read_dir(temp.path()).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn timed_out_keyring_delete_is_reported_unknown() {
+        let temp = private_temp();
+        file_set_at(temp.path(), "acct", "tok").unwrap();
+        let report = forget_in(temp.path(), "acct", |_| KeyringOutcome::TimedOut);
+        assert_eq!(report.keyring, ForgetKeyringOutcome::OutcomeUnknown);
+        assert_eq!(report.file, ForgetFileOutcome::Removed);
+        assert!(
+            matches!(file_get_in(temp.path(), "acct"), Err(error) if error.message() == "acct")
+        );
+    }
+
+    #[test]
+    fn completed_keyring_delete_reports_removed() {
+        let temp = private_temp();
+        let report = forget_in(temp.path(), "acct", |_| KeyringOutcome::Completed(Ok(())));
+        assert_eq!(report.keyring, ForgetKeyringOutcome::Removed);
+        assert_eq!(report.file, ForgetFileOutcome::Absent);
     }
 
     #[test]
