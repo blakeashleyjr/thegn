@@ -2435,6 +2435,7 @@ pub fn teardown_placed(cfg: &SandboxConfig, placement: &Placement, loc: &GitLoc,
     }
 }
 
+/// Resolve teardown project paths from a Git location and its remote mount mode.
 pub(crate) fn teardown_projects_for_loc(
     state_home: &std::path::Path,
     loc: &GitLoc,
@@ -2444,7 +2445,8 @@ pub(crate) fn teardown_projects_for_loc(
     let loc_path = loc.path();
     let mut worktrees = vec![std::path::Path::new(&loc_path)];
     if remote {
-        // remote_sync::mount_remote_worktree mounts materialized checkouts here.
+        // remote_sync::retarget_if_remote_oci calls host::mount_remote_worktree
+        // with remote_sync::REMOTE_WORKTREE_DEST for materialized checkouts.
         worktrees.push(std::path::Path::new("/workspace"));
     }
     crate::sandbox_compose::teardown_projects_for(state_home, name, &worktrees)
