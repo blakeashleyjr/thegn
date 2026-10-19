@@ -10,14 +10,14 @@
 //!    the resolved `PATH` to the pane's environment. The referenced store paths
 //!    are already realized and bind-mounted read-only, so the tools just run.
 //!
-//! Everything degrades silently: no flake or cold cache → `None`, and the pane
-//! gets exactly today's environment.
+//! No flake or cold, invalid cache → `None`, and the pane gets exactly today's
+//! environment. Cache snapshots are treated as untrusted input.
 
-use std::hash::{Hash, Hasher};
 use std::io::Read;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 /// The injectable slice of a devShell's environment. `path` is the devShell's
 /// `PATH` (prepended to the pane's own `PATH`); `vars` are other *safe* exported
@@ -204,22 +204,51 @@ pub fn parse_print_dev_env(json: &str) -> Devshell {
     sanitize(out)
 }
 
-/// Content-addressed cache key for a repo's flake inputs: a hash of the repo
-/// path (to disambiguate repos), `flake.nix`, and `flake.lock`. `None` when the
-/// repo has no `flake.nix`, which is also the "not a nix repo, skip entirely"
-/// signal. Pure-ish (reads two small files); unit-tested.
+/// Domain-separated SHA-256 cache key over the canonical repo path, `flake.nix`,
+/// and the presence and contents of `flake.lock`. It does not bind imported
+/// local Nix files, the resolved closure, or launch policy; those remain
+/// follow-ups. `None` means the repo cannot be safely identified as a flake
+/// with bounded inputs, so callers use a cold cache.
 pub fn cache_key(repo_root: &Path) -> Option<String> {
-    let flake = repo_root.join("flake.nix");
-    let flake_src = std::fs::read(&flake).ok()?; // absent ⇒ not a nix repo
-    let mut h = std::collections::hash_map::DefaultHasher::new();
-    repo_root.to_string_lossy().hash(&mut h);
-    flake_src.hash(&mut h);
-    // flake.lock may be absent (lockless flake); fold it in when present so a
-    // lock bump (e.g. nixpkgs bump → new tool versions) invalidates the cache.
-    if let Ok(lock) = std::fs::read(repo_root.join("flake.lock")) {
-        lock.hash(&mut h);
+    const MAX_FLAKE_INPUT_BYTES: u64 = 4 * 1024 * 1024;
+    let canonical_repo = std::fs::canonicalize(repo_root).ok()?;
+    let flake_src = read_bounded_input(&canonical_repo.join("flake.nix"), MAX_FLAKE_INPUT_BYTES)?;
+    let lock = match read_bounded_input(&canonical_repo.join("flake.lock"), MAX_FLAKE_INPUT_BYTES) {
+        Ok(lock) => Some(lock),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(_) => return None,
+    };
+
+    let mut hash = Sha256::new();
+    hash.update(b"thegn-devenv-cache-key-v2\0");
+    hash_field(&mut hash, canonical_repo.as_os_str().as_encoded_bytes());
+    hash_field(&mut hash, &flake_src);
+    match lock {
+        Some(lock) => {
+            hash.update([1]);
+            hash_field(&mut hash, &lock);
+        }
+        None => hash.update([0]),
     }
-    Some(format!("{:016x}", h.finish()))
+    Some(format!("{:x}", hash.finalize()))
+}
+
+fn hash_field(hash: &mut Sha256, value: &[u8]) {
+    hash.update((value.len() as u64).to_le_bytes());
+    hash.update(value);
+}
+
+fn read_bounded_input(path: &Path, max_bytes: u64) -> std::io::Result<Vec<u8>> {
+    let file = std::fs::File::open(path)?;
+    let mut bytes = Vec::new();
+    file.take(max_bytes + 1).read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > max_bytes {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "Nix input exceeds the cache-key size limit",
+        ));
+    }
+    Ok(bytes)
 }
 
 fn cache_path(key: &str) -> PathBuf {
@@ -239,19 +268,90 @@ pub fn cached(repo_root: &Path) -> Option<Devshell> {
 
 fn read_cache(path: &Path) -> Option<Devshell> {
     const MAX_CACHE_BYTES: u64 = 1024 * 1024;
-    let file = std::fs::File::open(path).ok()?;
-    let mut bytes = Vec::new();
-    file.take(MAX_CACHE_BYTES + 1)
-        .read_to_end(&mut bytes)
-        .ok()?;
-    if bytes.len() as u64 > MAX_CACHE_BYTES {
+    let file = match crate::fsperm::open_regular_file_nofollow(path) {
+        Ok(file) => file,
+        Err(error) => {
+            tracing::debug!(target: "thegn::devenv", path = %path.display(), %error, "rejecting devShell cache file");
+            return None;
+        }
+    };
+    let metadata = match file.metadata() {
+        Ok(metadata) => metadata,
+        Err(error) => {
+            tracing::debug!(target: "thegn::devenv", path = %path.display(), %error, "cannot inspect devShell cache file");
+            return None;
+        }
+    };
+    if let Err(reason) = cache_file_admissible(&metadata) {
+        tracing::debug!(target: "thegn::devenv", path = %path.display(), reason, "rejecting devShell cache file");
         return None;
     }
-    let raw = std::str::from_utf8(&bytes).ok()?;
-    serde_json::from_str::<Devshell>(raw)
-        .ok()
-        .map(sanitize)
-        .filter(|d| !d.is_empty())
+    let parent = match path.parent() {
+        Some(parent) => parent,
+        None => {
+            tracing::debug!(target: "thegn::devenv", path = %path.display(), "rejecting devShell cache file without a parent directory");
+            return None;
+        }
+    };
+    if let Err(reason) = cache_parent_admissible(parent) {
+        tracing::debug!(target: "thegn::devenv", path = %parent.display(), reason, "rejecting devShell cache directory");
+        return None;
+    }
+    let mut bytes = Vec::new();
+    if let Err(error) = file.take(MAX_CACHE_BYTES + 1).read_to_end(&mut bytes) {
+        tracing::debug!(target: "thegn::devenv", path = %path.display(), %error, "cannot read devShell cache file");
+        return None;
+    }
+    if bytes.len() as u64 > MAX_CACHE_BYTES {
+        tracing::debug!(target: "thegn::devenv", path = %path.display(), "rejecting oversized devShell cache file");
+        return None;
+    }
+    let raw = match std::str::from_utf8(&bytes) {
+        Ok(raw) => raw,
+        Err(error) => {
+            tracing::debug!(target: "thegn::devenv", path = %path.display(), %error, "rejecting non-UTF-8 devShell cache file");
+            return None;
+        }
+    };
+    let devshell = match serde_json::from_str::<Devshell>(raw) {
+        Ok(devshell) => devshell,
+        Err(error) => {
+            tracing::debug!(target: "thegn::devenv", path = %path.display(), %error, "rejecting malformed devShell cache file");
+            return None;
+        }
+    };
+    let devshell = sanitize(devshell);
+    if devshell.is_empty() {
+        tracing::debug!(target: "thegn::devenv", path = %path.display(), "rejecting empty devShell cache file");
+        return None;
+    }
+    Some(devshell)
+}
+
+fn cache_file_admissible(meta: &std::fs::Metadata) -> Result<(), &'static str> {
+    if !meta.is_file() {
+        return Err("cache entry is not a regular file");
+    }
+    if !crate::fsperm::owned_by_current_user(meta) {
+        return Err("cache entry is not owned by the current user");
+    }
+    crate::fsperm::ensure_single_link_regular_file(meta)
+        .map_err(|_| "cache entry has multiple hard links")
+}
+
+fn cache_parent_admissible(parent: &Path) -> Result<(), &'static str> {
+    let metadata =
+        std::fs::symlink_metadata(parent).map_err(|_| "cache directory cannot be inspected")?;
+    if metadata.file_type().is_symlink() {
+        return Err("cache directory is a symlink");
+    }
+    if !metadata.is_dir() {
+        return Err("cache parent is not a directory");
+    }
+    if !crate::fsperm::owned_by_current_user(&metadata) {
+        return Err("cache directory is not owned by the current user");
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -302,20 +402,51 @@ mod tests {
 
     #[test]
     fn cache_key_none_without_flake_and_stable_with() {
-        let dir = std::env::temp_dir().join(format!("tg-devenv-key-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir); // best-effort: test cleanup: scratch removal must never fail the test
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = tempfile::tempdir().unwrap();
         // No flake.nix ⇒ not a nix repo.
-        assert!(cache_key(&dir).is_none());
+        assert!(cache_key(dir.path()).is_none());
         // With a flake the key is stable for identical content...
-        std::fs::write(dir.join("flake.nix"), "{ outputs = _: {}; }").unwrap();
-        let k1 = cache_key(&dir).unwrap();
-        assert_eq!(Some(&k1), cache_key(&dir).as_ref());
+        std::fs::write(dir.path().join("flake.nix"), "{ outputs = _: {}; }").unwrap();
+        let k1 = cache_key(dir.path()).unwrap();
+        assert_eq!(Some(&k1), cache_key(dir.path()).as_ref());
         // ...and changes when flake.lock changes (invalidation).
-        std::fs::write(dir.join("flake.lock"), "{\"nodes\":{}}").unwrap();
-        let k2 = cache_key(&dir).unwrap();
+        std::fs::write(dir.path().join("flake.lock"), "{\"nodes\":{}}").unwrap();
+        let k2 = cache_key(dir.path()).unwrap();
         assert_ne!(k1, k2);
-        let _ = std::fs::remove_dir_all(&dir); // best-effort: test cleanup: scratch removal must never fail the test
+    }
+
+    #[test]
+    fn cache_key_is_a_full_sha256_and_binds_the_lock_and_repo_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo_a = dir.path().join("repo-a\nodd");
+        let repo_b = dir.path().join("repo-b");
+        std::fs::create_dir(&repo_a).unwrap();
+        std::fs::create_dir(&repo_b).unwrap();
+        for repo in [&repo_a, &repo_b] {
+            std::fs::write(repo.join("flake.nix"), "{ outputs = _: {}; }").unwrap();
+        }
+        let key_a = cache_key(&repo_a).unwrap();
+        let key_b = cache_key(&repo_b).unwrap();
+        assert_eq!(key_a.len(), 64);
+        assert!(
+            key_a
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        );
+        assert_ne!(key_a, key_b);
+        std::fs::write(repo_a.join("flake.lock"), "{\"nodes\":{}}").unwrap();
+        assert_ne!(key_a, cache_key(&repo_a).unwrap());
+    }
+
+    #[test]
+    fn cache_key_refuses_an_oversized_flake() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("flake.nix"),
+            vec![b'x'; 4 * 1024 * 1024 + 1],
+        )
+        .unwrap();
+        assert!(cache_key(dir.path()).is_none());
     }
 
     #[test]
@@ -431,5 +562,108 @@ mod tests {
         );
         std::fs::write(&path, vec![b' '; 1024 * 1024 + 1]).unwrap();
         assert!(read_cache(&path).is_none());
+    }
+
+    #[test]
+    fn cache_reader_rejects_a_symlinked_cache_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let real = dir.path().join("real.json");
+        let link = dir.path().join("cache.json");
+        std::fs::write(
+            &real,
+            serde_json::to_vec(&Devshell {
+                path: Some("/nix/store/x/bin".into()),
+                vars: Vec::new(),
+            })
+            .unwrap(),
+        )
+        .unwrap();
+        match crate::fsperm::create_symlink(&real, &link, false) {
+            Ok(()) => assert!(read_cache(&link).is_none()),
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::Unsupported | std::io::ErrorKind::PermissionDenied
+                ) => {}
+            Err(error) => panic!("could not create symlink fixture: {error}"),
+        }
+    }
+
+    #[test]
+    fn cache_reader_rejects_a_hard_linked_cache_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let real = dir.path().join("real.json");
+        let alias = dir.path().join("cache.json");
+        std::fs::write(
+            &real,
+            serde_json::to_vec(&Devshell {
+                path: Some("/nix/store/x/bin".into()),
+                vars: Vec::new(),
+            })
+            .unwrap(),
+        )
+        .unwrap();
+        std::fs::hard_link(&real, &alias).unwrap();
+        let metadata = std::fs::metadata(&alias).unwrap();
+        assert_eq!(
+            read_cache(&alias).is_none(),
+            crate::fsperm::ensure_single_link_regular_file(&metadata).is_err()
+        );
+        if crate::fsperm::extra_hard_links(&metadata) == 1 {
+            assert!(read_cache(&alias).is_none());
+        }
+        assert_eq!(
+            cache_file_admissible(&metadata).is_err(),
+            crate::fsperm::extra_hard_links(&metadata) == 1
+        );
+    }
+
+    #[test]
+    fn cache_reader_rejects_a_symlinked_parent_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let real_dir = dir.path().join("real-dir");
+        let linked_dir = dir.path().join("linked-dir");
+        std::fs::create_dir(&real_dir).unwrap();
+        let cache = real_dir.join("cache.json");
+        std::fs::write(
+            &cache,
+            serde_json::to_vec(&Devshell {
+                path: Some("/nix/store/x/bin".into()),
+                vars: Vec::new(),
+            })
+            .unwrap(),
+        )
+        .unwrap();
+        match crate::fsperm::create_symlink(&real_dir, &linked_dir, true) {
+            Ok(()) => assert!(read_cache(&linked_dir.join("cache.json")).is_none()),
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::Unsupported | std::io::ErrorKind::PermissionDenied
+                ) => {}
+            Err(error) => panic!("could not create symlink fixture: {error}"),
+        }
+    }
+
+    #[test]
+    fn cache_file_admissibility_accepts_an_owned_regular_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("cache.json");
+        std::fs::write(&path, b"{}").unwrap();
+        assert_eq!(
+            cache_file_admissible(&std::fs::metadata(path).unwrap()),
+            Ok(())
+        );
+        assert!(cache_file_admissible(&std::fs::metadata(dir.path()).unwrap()).is_err());
+    }
+
+    #[test]
+    fn cache_parent_admissibility_rejects_missing_and_non_directory_paths() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(cache_parent_admissible(dir.path()).is_ok());
+        assert!(cache_parent_admissible(&dir.path().join("missing")).is_err());
+        let file = dir.path().join("file");
+        std::fs::write(&file, b"x").unwrap();
+        assert!(cache_parent_admissible(&file).is_err());
     }
 }
