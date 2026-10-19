@@ -41,10 +41,11 @@ impl MonitorOverlay {
     /// Whether the active tab is a row list (so the cursor, not the viewport, is
     /// what the navigation keys move).
     pub(in crate::monitor) fn is_list_tab(&self) -> bool {
-        matches!(
-            self.tab,
-            MonitorTab::Cpu | MonitorTab::Procs | MonitorTab::Disk | MonitorTab::Containers
-        )
+        match self.tab {
+            MonitorTab::Cpu => self.cpu.core_count() > 0,
+            MonitorTab::Procs | MonitorTab::Disk | MonitorTab::Containers => true,
+            _ => false,
+        }
     }
 
     /// How many rows the active LIST tab is showing — the single source the
