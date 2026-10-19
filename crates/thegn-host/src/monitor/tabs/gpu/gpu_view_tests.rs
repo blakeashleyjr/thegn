@@ -715,15 +715,15 @@ fn missing_aux_readings_keep_time_alignment_and_paint_blank_gaps() {
     spark_model.absorb_frame(&fixture(2, GpuKind::Apu, RuntimeStatus::Active));
     let mut spark_gap = fixture(3, GpuKind::Apu, RuntimeStatus::Active);
     spark_gap.parts.gpu_engines.devices[0].gtt_used = None;
+    spark_gap.parts.gpu_engines.devices[0].vcn_busy_pct = None;
     spark_gap.parts.amd_smu.cards[0].metrics.activity_gfx = None;
     spark_model.absorb_frame(&spark_gap);
 
     for unicode in [UnicodeLevel::Full, UnicodeLevel::Ascii] {
         caps::test_override::with_unicode(unicode, || {
-            let mut surface = Surface::new(160, 45);
             let rect = Rect::full(160, 45);
-            GpuView(&spark_model).paint_aux_history(&mut surface, rect, rect, true);
-            GpuView(&spark_model).paint_busy_history(&mut surface, rect, rect);
+            let mut aux_surface = Surface::new(160, 45);
+            GpuView(&spark_model).paint_aux_history(&mut aux_surface, rect, rect, true);
 
             // The GTT sparkline is on row 44. It has two present samples and a
             // trailing gap; the right-aligned window is one cell shorter in Full.
@@ -733,9 +733,9 @@ fn missing_aux_readings_keep_time_alignment_and_paint_blank_gaps() {
             } else {
                 &[(157, true), (158, true), (159, false)]
             };
-            let lines = surface.screen_lines();
+            let aux_lines = aux_surface.screen_lines();
             for &(col, should_paint) in aux_expected {
-                let cell = lines[44]
+                let cell = aux_lines[44]
                     .visible_cells()
                     .find(|cell| cell.cell_index() == col)
                     .expect("GTT sparkline cell exists");
@@ -746,7 +746,22 @@ fn missing_aux_readings_keep_time_alignment_and_paint_blank_gaps() {
                 );
             }
 
-            let activity_row = lines
+            let mut busy_surface = Surface::new(160, 45);
+            GpuView(&spark_model).paint_busy_history(&mut busy_surface, rect, rect);
+            let busy_lines = busy_surface.screen_lines();
+            for &(col, should_paint) in aux_expected {
+                let cell = busy_lines[44]
+                    .visible_cells()
+                    .find(|cell| cell.cell_index() == col)
+                    .expect("VCN sparkline cell exists");
+                assert_eq!(
+                    cell.str() != " " && cell.str() != "\u{2800}",
+                    should_paint,
+                    "VCN sparkline at column {col} in {unicode:?}"
+                );
+            }
+
+            let activity_row = busy_lines
                 .iter()
                 .position(|line| {
                     line.visible_cells()
@@ -758,7 +773,7 @@ fn missing_aux_readings_keep_time_alignment_and_paint_blank_gaps() {
                 })
                 .expect("activity sparkline row exists");
             for &(col, should_paint) in aux_expected {
-                let cell = lines[activity_row]
+                let cell = busy_lines[activity_row]
                     .visible_cells()
                     .find(|cell| cell.cell_index() == col)
                     .expect("activity sparkline cell exists");
