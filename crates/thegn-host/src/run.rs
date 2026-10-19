@@ -21074,7 +21074,9 @@ async fn event_loop<T: Terminal>(
                     };
                     if let Some(p) = panes.table.get_mut(&target_pane) {
                         let app = p.emulator().application_cursor();
-                        if let Some(bytes) = crate::input::key_bytes_mode(&k.key, k.modifiers, app)
+                        let ext = p.query_parser.extended_keys();
+                        if let Some(bytes) =
+                            crate::input::key_bytes_pane(&k.key, k.modifiers, app, ext)
                         {
                             // best-effort: a locked-keys write to a congested or
                             // dead pane must NEVER tear down the compositor —
@@ -27516,13 +27518,19 @@ async fn event_loop<T: Terminal>(
                             .collect()
                     });
                 let target_pane = pty_target;
-                let app_cursor = panes
+                let pane_modes = panes
                     .table
                     .get(&target_pane)
-                    .map(|p| p.emulator().application_cursor())
-                    .unwrap_or(false);
-                let bytes = remapped
-                    .or_else(|| crate::input::key_bytes_mode(&k.key, k.modifiers, app_cursor));
+                    .map(|p| {
+                        (
+                            p.emulator().application_cursor(),
+                            p.query_parser.extended_keys(),
+                        )
+                    })
+                    .unwrap_or((false, false));
+                let bytes = remapped.or_else(|| {
+                    crate::input::key_bytes_pane(&k.key, k.modifiers, pane_modes.0, pane_modes.1)
+                });
                 if let Some(bytes) = bytes {
                     // Held-key autorepeat (typing, or arrow/nav keys consumed by
                     // the program inside the pane) floods the input queue. Without

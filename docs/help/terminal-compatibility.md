@@ -135,6 +135,11 @@ Two chord families depend on it:
 `Alt-1..9` (jump to a worktree) does **not** — `Alt` has a legacy encoding
 that every terminal sends.
 
+Shift+Enter has no legacy encoding, so thegn sends a plain Enter unless the
+program in that pane requests an extended keyboard mode (`modifyOtherKeys`,
+`CSI > 4 ; 1|2 m`, or kitty disambiguation, `CSI > 1 u`); then it receives
+`ESC [ 13 ; 2 u`. This choice is per pane and resets when the pane resets.
+
 ### When the terminal ignores the request
 
 Alacritty, tmux without `extended-keys on`, the Linux console, older VTE,
