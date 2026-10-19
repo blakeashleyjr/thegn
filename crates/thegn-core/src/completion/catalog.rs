@@ -329,6 +329,27 @@ pub const CATALOG: &[Slot] = &[
         "decision",
         SourceKind::Reserved(Reserved::Freeform),
     ),
+    // Hidden in-sandbox bridge flags: seconds, no enumerable source.
+    slot(
+        "bridge-revtunnel",
+        "idle_secs",
+        SourceKind::Reserved(Reserved::Freeform),
+    ),
+    slot(
+        "bridge-revtunnel",
+        "lifetime_secs",
+        SourceKind::Reserved(Reserved::Freeform),
+    ),
+    slot(
+        "bridge-revtunnel",
+        "port",
+        SourceKind::Reserved(Reserved::Freeform),
+    ),
+    slot(
+        "bridge-revtunnel",
+        "write_stall_secs",
+        SourceKind::Reserved(Reserved::Freeform),
+    ),
     slot("merge rm", "worktree", SourceKind::Worktree),
     slot("merge rm", "worktree_pos", SourceKind::Worktree),
     slot("notify push", "worktree", SourceKind::Worktree),

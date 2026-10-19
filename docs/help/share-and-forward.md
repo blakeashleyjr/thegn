@@ -37,11 +37,15 @@ default 256) and a process-wide host cap
 (`forward.reverse_max_connections_total`, default 1024). Zero rejects all
 connections; values above Tokio's internal permit maximum are clamped. The process-wide
 value is read when the first reverse tunnel starts, so restart thegn to change
-it. These are the only configurable tunnel limits; connection timeouts and
-retry behavior are fixed. A local write stall of 60 seconds, 2 hours without
-traffic, or 24 hours in total closes that one connection. A 60-second stall
-writing to the tunnel itself ends the tunnel run; the host supervisor reconnects
-it with bounded backoff. On the sandbox side, transient accept errors such as running
+it. The `[forward]` deadlines `reverse_write_stall_secs` (default 60),
+`reverse_idle_secs` (default 7200), and `reverse_lifetime_secs` (default 86400)
+apply on both ends of the tunnel. A write-stall value of 0 uses 60 seconds;
+idle and lifetime values of 0 disable those deadlines. Values are read when a
+tunnel starts or reconnects, so a running tunnel keeps its starting values.
+Connection deadline behavior is configurable; retry behavior stays fixed. A
+local write stall closes that connection, while a stall of
+`reverse_write_stall_secs` writing to the shared tunnel ends the tunnel run;
+the host supervisor reconnects it with bounded backoff. On the sandbox side, transient accept errors such as running
 out of file descriptors are retried with a short backoff instead of stopping
 the tunnel. Rejection warnings are limited to one per minute per reason across
 the process. With `THEGN_PERF=1`, the perf rollup also reports per-interval
