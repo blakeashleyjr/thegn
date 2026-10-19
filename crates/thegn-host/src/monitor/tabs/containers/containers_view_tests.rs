@@ -530,7 +530,7 @@ fn inventory_cursor_keeps_ownership_foreground_and_scrolls_selected_row_into_vie
     assert_eq!(foreign_cell.attrs().intensity(), Intensity::Bold);
     assert_eq!(foreign_cell.attrs().background(), selected_bg);
     assert_eq!(foreign_cell.attrs().foreground(), ghost_fg);
-    let long_inventory: Vec<_> = (0..12)
+    let long_inventory: Vec<_> = (0_usize..12)
         .map(|index| ContainerInfo {
             name: format!("container-row-{index}"),
             image: String::new(),
