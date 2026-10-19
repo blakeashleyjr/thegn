@@ -24,6 +24,16 @@ pub fn artifact_path(stem: &str, name: &str) -> String {
     format!("/tmp/{stem}.{name}")
 }
 
+/// Sandbox-side path for an artifact in a per-operation staging directory.
+pub fn staged_artifact_path(dir: &str, name: &str) -> String {
+    format!("{dir}/{name}")
+}
+
+/// Create a private, exclusive sandbox staging directory.
+pub fn stage_dir_script(dir: &str) -> String {
+    format!("umask 077; mkdir -- {}", sh_quote(dir))
+}
+
 /// One artifact reported by a remote capture: its short name plus the size and
 /// sha256 the REMOTE computed — the host re-hashes after download and refuses
 /// a mismatch (integrity across the ssh/WSS hop).
@@ -151,11 +161,104 @@ pub fn replay_script(
     has_tar: bool,
     done_msg: &str,
 ) -> String {
+    replay_script_builder(
+        workdir,
+        ReplayArtifacts {
+            bundle: artifact_path(stem, "bundle"),
+            patch: artifact_path(stem, "patch"),
+            tar: artifact_path(stem, "tar"),
+            dir: None,
+        },
+        ReplayOptions {
+            reset_head,
+            has_patch,
+            has_tar,
+            done_msg,
+            validation: String::new(),
+        },
+    )
+}
+
+/// Build a replay that verifies all carried artifacts against their captured
+/// SHA-256 manifest before any checkout mutation.
+pub fn replay_script_verified(
+    workdir: &str,
+    dir: &str,
+    manifest: &[CaptureArtifact],
+    reset_head: Option<&str>,
+    has_patch: bool,
+    has_tar: bool,
+    done_msg: &str,
+) -> String {
+    let mut validation = String::new();
+    let mut valid_names = Vec::new();
+    for artifact in manifest {
+        if !ARTIFACT_NAMES.contains(&artifact.name.as_str())
+            || valid_names.contains(&artifact.name.as_str())
+        {
+            validation.push_str("fail artifact_validation; ");
+            continue;
+        }
+        valid_names.push(artifact.name.as_str());
+        let path = sh_quote(&staged_artifact_path(dir, &artifact.name));
+        validation.push_str(&format!(
+            "printf '%s  %s\\n' {} {path} | sha256sum -c --status - || fail artifact_validation; ",
+            sh_quote(&artifact.sha256)
+        ));
+    }
+    for (name, carried) in [
+        ("bundle", reset_head.is_some()),
+        ("patch", has_patch),
+        ("tar", has_tar),
+    ] {
+        if carried && !valid_names.contains(&name) {
+            validation.push_str("fail artifact_validation; ");
+        }
+    }
+
+    replay_script_builder(
+        workdir,
+        ReplayArtifacts {
+            bundle: staged_artifact_path(dir, "bundle"),
+            patch: staged_artifact_path(dir, "patch"),
+            tar: staged_artifact_path(dir, "tar"),
+            dir: Some(dir.to_string()),
+        },
+        ReplayOptions {
+            reset_head,
+            has_patch,
+            has_tar,
+            done_msg,
+            validation,
+        },
+    )
+}
+
+struct ReplayArtifacts {
+    bundle: String,
+    patch: String,
+    tar: String,
+    dir: Option<String>,
+}
+
+struct ReplayOptions<'a> {
+    reset_head: Option<&'a str>,
+    has_patch: bool,
+    has_tar: bool,
+    done_msg: &'a str,
+    validation: String,
+}
+
+fn replay_script_builder(
+    workdir: &str,
+    artifacts: ReplayArtifacts,
+    options: ReplayOptions<'_>,
+) -> String {
     let wd = sh_quote(workdir);
-    let bundle = artifact_path(stem, "bundle");
-    let patch = artifact_path(stem, "patch");
-    let tar = artifact_path(stem, "tar");
-    let reset = match reset_head {
+    let bundle = sh_quote(&artifacts.bundle);
+    let patch = sh_quote(&artifacts.patch);
+    let tar = sh_quote(&artifacts.tar);
+    let reset = match options.reset_head {
         Some(h) => format!(
             "if [ ! -s {bundle} ]; then fail artifact_validation; fi; \
              if ! git fetch {bundle} HEAD 2>&1; then \
@@ -166,7 +269,7 @@ pub fn replay_script(
         ),
         None => String::new(),
     };
-    let apply_patch = if has_patch {
+    let apply_patch = if options.has_patch {
         format!(
             "if [ ! -s {patch} ]; then fail artifact_validation; fi; \
              if ! git apply --whitespace=nowarn {patch} 2>&1; then \
@@ -176,7 +279,7 @@ pub fn replay_script(
     } else {
         String::new()
     };
-    let untar = if has_tar {
+    let untar = if options.has_tar {
         format!(
             "if [ ! -s {tar} ]; then fail artifact_validation; fi; \
              if ! tar xf {tar} -C {wd} 2>&1; then fail extraction; fi; "
@@ -184,12 +287,21 @@ pub fn replay_script(
     } else {
         String::new()
     };
+    let cleanup = match artifacts.dir {
+        Some(dir) => format!(
+            "if ! rm -f {bundle} {patch} {tar}; then fail cleanup; fi; \
+             if ! rmdir {}; then fail cleanup; fi; ",
+            sh_quote(&dir)
+        ),
+        None => format!("if ! rm -f {bundle} {patch} {tar}; then fail cleanup; fi; "),
+    };
     format!(
         "fail() {{ printf 'TG-PARITY-ERROR:%s\\n' \"$1\"; exit 70; }}; \
-         cd {wd} || fail checkout; {reset}{apply_patch}{untar}\
-         if ! rm -f {bundle} {patch} {tar}; then fail cleanup; fi; \
+         cd {wd} || fail checkout; {}{reset}{apply_patch}{untar}\
+         {cleanup}\
          echo {}",
-        sh_quote(done_msg)
+        options.validation,
+        sh_quote(options.done_msg)
     )
 }
 
@@ -292,6 +404,127 @@ mod tests {
         assert!(!none.contains("tar xf"));
         // Artifacts are still consumed even when nothing replays.
         assert!(none.contains("rm -f /tmp/tg-parity.bundle"));
+    }
+
+    #[test]
+    fn replay_script_output_is_unchanged() {
+        assert_eq!(
+            replay_script("/wd", "tg-parity", Some("abc123"), true, true, "done"),
+            "fail() { printf 'TG-PARITY-ERROR:%s\\n' \"$1\"; exit 70; }; cd /wd || fail checkout; if [ ! -s /tmp/tg-parity.bundle ]; then fail artifact_validation; fi; if ! git fetch /tmp/tg-parity.bundle HEAD 2>&1; then if ! git fetch /tmp/tg-parity.bundle 2>&1; then fail fetch; fi; fi; if ! git reset --hard abc123 2>&1; then fail reset; fi; if [ ! -s /tmp/tg-parity.patch ]; then fail artifact_validation; fi; if ! git apply --whitespace=nowarn /tmp/tg-parity.patch 2>&1; then if ! git apply --3way --whitespace=nowarn /tmp/tg-parity.patch 2>&1; then fail patch; fi; fi; if [ ! -s /tmp/tg-parity.tar ]; then fail artifact_validation; fi; if ! tar xf /tmp/tg-parity.tar -C /wd 2>&1; then fail extraction; fi; if ! rm -f /tmp/tg-parity.bundle /tmp/tg-parity.patch /tmp/tg-parity.tar; then fail cleanup; fi; echo done"
+        );
+    }
+
+    #[test]
+    fn verified_replay_checks_digests_before_any_mutation() {
+        let manifest = [
+            CaptureArtifact {
+                name: "bundle".into(),
+                bytes: 11,
+                sha256: "b9c72134b48cdc15e7a47f2476a41612d2084b763bea0575f5600b22041db7dc".into(),
+            },
+            CaptureArtifact {
+                name: "patch".into(),
+                bytes: 10,
+                sha256: "50d39ba6ed2bd5b854b405fcc2189e9f5f9fbe637f107a7cf31408207d5f6499".into(),
+            },
+            CaptureArtifact {
+                name: "tar".into(),
+                bytes: 8,
+                sha256: "52232c0fe139f6b5168632a400c4b67dbc80c112edf952aa7c67bccec57f1dbd".into(),
+            },
+        ];
+        let script = replay_script_verified(
+            "/work tree",
+            "/tmp/tg-parity-operation",
+            &manifest,
+            Some("head"),
+            true,
+            true,
+            "done",
+        );
+        let first_mutation = script.find("git fetch").unwrap();
+        assert_eq!(script.matches("sha256sum -c --status -").count(), 3);
+        for digest in [
+            "b9c72134b48cdc15e7a47f2476a41612d2084b763bea0575f5600b22041db7dc",
+            "50d39ba6ed2bd5b854b405fcc2189e9f5f9fbe637f107a7cf31408207d5f6499",
+            "52232c0fe139f6b5168632a400c4b67dbc80c112edf952aa7c67bccec57f1dbd",
+        ] {
+            assert!(script.contains(&digest));
+            assert!(script.find(&digest).unwrap() < first_mutation);
+        }
+        for mutation in ["git fetch", "git apply", "tar xf"] {
+            assert!(
+                script.find("sha256sum -c --status -").unwrap() < script.find(mutation).unwrap()
+            );
+        }
+        assert!(script.contains("/tmp/tg-parity-operation/bundle"));
+        assert!(script.contains("/tmp/tg-parity-operation/patch"));
+        assert!(script.contains("/tmp/tg-parity-operation/tar"));
+    }
+
+    #[test]
+    fn verified_replay_refuses_a_carried_stage_without_a_manifest_entry() {
+        let script = replay_script_verified("/wd", "/tmp/op", &[], None, true, false, "done");
+        let validation = script.find("fail artifact_validation;").unwrap();
+        assert!(validation < script.find("git apply").unwrap());
+    }
+
+    #[test]
+    fn verified_replay_uses_the_staging_dir_and_removes_it() {
+        let manifest = [CaptureArtifact {
+            name: "patch".into(),
+            bytes: 5,
+            sha256: "a4895eb44afc336fecbba6e520cd67e178dace0276655d102fceffa8e5f70570".into(),
+        }];
+        let script = replay_script_verified("/wd", "/tmp/op", &manifest, None, true, false, "done");
+        assert!(script.contains("/tmp/op/patch"));
+        assert!(script.contains("rmdir /tmp/op"));
+        assert!(
+            script
+                .find("rm -f /tmp/op/bundle /tmp/op/patch /tmp/op/tar")
+                .unwrap()
+                < script.find("rmdir /tmp/op").unwrap()
+        );
+    }
+
+    #[test]
+    fn verified_replay_rejects_unknown_and_duplicate_manifest_names() {
+        let unknown = [CaptureArtifact {
+            name: "other".into(),
+            bytes: 0,
+            sha256: "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855".into(),
+        }];
+        let unknown_script =
+            replay_script_verified("/wd", "/tmp/op", &unknown, None, false, false, "done");
+        assert!(unknown_script.contains("fail artifact_validation;"));
+
+        let duplicate = [
+            CaptureArtifact {
+                name: "patch".into(),
+                bytes: 5,
+                sha256: "a4895eb44afc336fecbba6e520cd67e178dace0276655d102fceffa8e5f70570".into(),
+            },
+            CaptureArtifact {
+                name: "patch".into(),
+                bytes: 5,
+                sha256: "a4895eb44afc336fecbba6e520cd67e178dace0276655d102fceffa8e5f70570".into(),
+            },
+        ];
+        let duplicate_script =
+            replay_script_verified("/wd", "/tmp/op", &duplicate, None, false, false, "done");
+        assert!(duplicate_script.contains("fail artifact_validation;"));
+    }
+
+    #[test]
+    fn stage_dir_script_is_private_and_exclusive() {
+        let script = stage_dir_script("/tmp/tg-parity-op");
+        assert!(script.starts_with("umask 077; mkdir -- "));
+        assert!(!script.contains("mkdir -p"));
+        assert!(script.ends_with("/tmp/tg-parity-op"));
+        assert_eq!(
+            staged_artifact_path("/tmp/tg-parity-op", "patch"),
+            "/tmp/tg-parity-op/patch"
+        );
     }
 
     #[test]

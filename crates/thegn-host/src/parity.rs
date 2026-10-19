@@ -8,6 +8,44 @@ use std::path::Path;
 
 use crate::agent::block_on_provider;
 
+fn lower_hex(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    bytes
+        .iter()
+        .flat_map(|byte| {
+            [
+                HEX[(byte >> 4) as usize] as char,
+                HEX[(byte & 0x0f) as usize] as char,
+            ]
+        })
+        .collect()
+}
+
+fn random_staging_dir() -> anyhow::Result<String> {
+    let mut random = [0_u8; 16];
+    getrandom::fill(&mut random)?;
+    Ok(format!("/tmp/tg-parity-{}", lower_hex(&random)))
+}
+
+fn manifest_for_artifacts(
+    artifacts: &[(String, Vec<u8>)],
+) -> Vec<thegn_core::syncstate::CaptureArtifact> {
+    use sha2::{Digest, Sha256};
+
+    artifacts
+        .iter()
+        .map(|(name, bytes)| {
+            let digest = Sha256::digest(bytes);
+            let sha256 = lower_hex(&digest);
+            thegn_core::syncstate::CaptureArtifact {
+                name: name.clone(),
+                bytes: bytes.len() as u64,
+                sha256,
+            }
+        })
+        .collect()
+}
+
 fn nonempty(path: &Path) -> bool {
     std::fs::metadata(path)
         .map(|metadata| metadata.len() > 0)
@@ -91,9 +129,8 @@ pub(crate) fn apply_local_parity(
     workdir: &str,
     exec_env: &[(String, String)],
 ) -> anyhow::Result<()> {
-    use thegn_core::syncstate::{artifact_path, replay_script};
+    use thegn_core::syncstate::{replay_script_verified, stage_dir_script, staged_artifact_path};
     use thegn_core::util::git_cmd;
-    const STEM: &str = "tg-parity";
     let wt = Path::new(wt_host);
     if !wt.join(".git").exists() {
         // No git metadata (a bare directory) — nothing to mirror.
@@ -173,26 +210,56 @@ pub(crate) fn apply_local_parity(
         return Ok(());
     }
 
-    // Upload the captured artifacts into the sandbox /tmp.
+    let mut artifacts = Vec::new();
     if has_bundle {
         let bytes = std::fs::read(bundle_file.path())?;
-        let dst = artifact_path(STEM, "bundle");
-        block_on_provider(|| async { provider.write(id, &dst, &bytes).await })?;
+        artifacts.push(("bundle".to_string(), bytes));
     }
     if let Some(p) = &patch {
-        let dst = artifact_path(STEM, "patch");
-        block_on_provider(|| async { provider.write(id, &dst, p).await })?;
+        artifacts.push(("patch".to_string(), p.clone()));
     }
     if has_tar {
         let bytes = std::fs::read(tar_file.path())?;
-        let dst = artifact_path(STEM, "tar");
-        block_on_provider(|| async { provider.write(id, &dst, &bytes).await })?;
+        artifacts.push(("tar".to_string(), bytes));
+    }
+
+    let dir = random_staging_dir()?;
+    let create_script = stage_dir_script(&dir);
+    let create_argv = vec!["/bin/sh".to_string(), "-lc".to_string(), create_script];
+    let (code, output) =
+        block_on_provider(|| async { provider.run_exec(id, &create_argv, None, exec_env).await })
+            .map_err(|error| {
+            anyhow::Error::new(ReplayFailure {
+                stage: ReplayStage::ArtifactValidation,
+                detail: format!(
+                    "staging directory {dir} could not be created privately: {}",
+                    output_tail(&error.to_string())
+                ),
+            })
+        })?;
+    if code != 0 {
+        return Err(anyhow::Error::new(ReplayFailure {
+            stage: ReplayStage::ArtifactValidation,
+            detail: format!(
+                "staging directory {dir} could not be created privately: {}",
+                output_tail(&output)
+            ),
+        }));
+    }
+
+    let manifest = manifest_for_artifacts(&artifacts);
+    for (name, bytes) in &artifacts {
+        let dst = staged_artifact_path(&dir, name);
+        block_on_provider(|| async { provider.write(id, &dst, bytes).await }).map_err(|error| {
+            anyhow::anyhow!("upload to staging directory {dir} failed: {error}")
+        })?;
     }
 
     // Replay over the clone, in the workdir. Failed stages preserve remote artifacts.
-    let script = replay_script(
+    let script = replay_script_verified(
         workdir,
-        STEM,
+        &dir,
+        &manifest,
         host_head.as_deref().filter(|_| has_bundle),
         patch.is_some(),
         has_tar,
@@ -206,7 +273,7 @@ pub(crate) fn apply_local_parity(
                 anyhow::Error::new(ReplayFailure {
                     stage: ReplayStage::Exec,
                     detail: format!(
-                        "{}; uploaded artifacts retained at /tmp/{STEM}.{{bundle,patch,tar}}",
+                        "{}; uploaded artifacts retained in {dir}",
                         output_tail(&error_detail)
                     ),
                 })
@@ -215,7 +282,7 @@ pub(crate) fn apply_local_parity(
         return Err(anyhow::Error::new(ReplayFailure {
             stage: ReplayStage::from_marker(&output).unwrap_or(ReplayStage::Exec),
             detail: format!(
-                "{}{}; uploaded artifacts retained at /tmp/{STEM}.{{bundle,patch,tar}}",
+                "{}{}; uploaded artifacts retained in {dir}",
                 ReplayStage::from_marker(&output)
                     .and_then(|_| {
                         output
@@ -233,7 +300,7 @@ pub(crate) fn apply_local_parity(
 
 #[cfg(test)]
 mod tests {
-    use super::nonempty;
+    use super::{manifest_for_artifacts, nonempty, random_staging_dir};
 
     #[test]
     #[expect(
@@ -301,5 +368,40 @@ mod tests {
         let tail = super::output_tail(&output);
         assert!(tail.len() <= 2 * 1024);
         assert!(tail.starts_with('b'));
+    }
+
+    #[test]
+    fn staging_dirs_are_random_and_never_the_fixed_stem() {
+        let first = random_staging_dir().unwrap();
+        let second = random_staging_dir().unwrap();
+        for dir in [&first, &second] {
+            let suffix = dir.strip_prefix("/tmp/tg-parity-").unwrap();
+            assert_eq!(suffix.len(), 32);
+            assert!(
+                suffix
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+            );
+            assert_ne!(dir.as_str(), "/tmp/tg-parity");
+        }
+        assert_ne!(first, second);
+    }
+
+    #[test]
+    fn manifest_digests_match_uploaded_bytes() {
+        use sha2::{Digest, Sha256};
+
+        let artifacts = vec![
+            ("patch".to_string(), b"patch bytes".to_vec()),
+            ("tar".to_string(), b"tar bytes".to_vec()),
+        ];
+        let manifest = manifest_for_artifacts(&artifacts);
+        assert_eq!(manifest.len(), artifacts.len());
+        for ((name, bytes), entry) in artifacts.iter().zip(manifest) {
+            assert_eq!(&entry.name, name);
+            assert_eq!(entry.bytes, bytes.len() as u64);
+            let expected = format!("{:x}", Sha256::digest(bytes));
+            assert_eq!(entry.sha256, expected);
+        }
     }
 }
