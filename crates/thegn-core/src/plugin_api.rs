@@ -746,6 +746,13 @@ pub enum AuditTargetClass {
 
 pub const MAX_AUDIT_ENTRIES: usize = 1024;
 pub const MAX_AUDIT_STRING_BYTES: usize = 256;
+/// Audit entries older than this are hidden on reads and removed on writes.
+/// Retention uses wall-clock timestamps, applies without a timer on each write
+/// and read, and keeps only the expired leading run in sequence order. Each
+/// entry owns at most three capped strings (capability, operation, target),
+/// so the count bound also bounds their combined string bytes to
+/// `3 * MAX_AUDIT_STRING_BYTES` per entry, in addition to the plugin id.
+pub const MAX_AUDIT_AGE_MS: u64 = 24 * 60 * 60 * 1000;
 pub const MAX_PLUGIN_JSON_DEPTH: usize = 32;
 pub const MAX_STATE_KEYS: usize = 256;
 pub const MAX_STATE_KEY_BYTES: usize = 256;
@@ -989,6 +996,7 @@ pub struct PluginRuntime {
     audit: Vec<AuditLogEntry>,
     next_audit_seq: u64,
     audit_evicted: u64,
+    audit_expired: u64,
     generation: u64,
     state: BTreeMap<String, (serde_json::Value, usize)>,
     state_bytes: usize,
@@ -1019,6 +1027,7 @@ impl PluginRuntime {
             audit: Vec::new(),
             next_audit_seq: 0,
             audit_evicted: 0,
+            audit_expired: 0,
             generation: 0,
             state: Default::default(),
             state_bytes: 0,
@@ -1418,12 +1427,36 @@ impl PluginRuntime {
         Ok(self.state.get(&state_key).map(|(value, _)| value.clone()))
     }
 
+    /// Visible audit entries. Expired leading entries are hidden on every
+    /// read; physical eviction and its counter update happen on the next write.
     pub fn audit_log(&self) -> &[AuditLogEntry] {
-        &self.audit
+        self.audit_log_at(u64::try_from(crate::util::now_ms()).unwrap_or(0))
+    }
+
+    fn audit_log_at(&self, now_ms: u64) -> &[AuditLogEntry] {
+        &self.audit[self.expired_prefix_len(now_ms)..]
+    }
+
+    fn expired_prefix_len(&self, now_ms: u64) -> usize {
+        self.audit
+            .iter()
+            .take_while(|entry| entry.timestamp_ms.saturating_add(MAX_AUDIT_AGE_MS) < now_ms)
+            .count()
     }
 
     pub fn audit_evicted(&self) -> u64 {
         self.audit_evicted
+    }
+
+    /// Number of entries expired by age, including entries hidden on reads
+    /// that have not yet been physically drained by a write.
+    pub fn audit_expired(&self) -> u64 {
+        self.audit_expired_at(u64::try_from(crate::util::now_ms()).unwrap_or(0))
+    }
+
+    fn audit_expired_at(&self, now_ms: u64) -> u64 {
+        self.audit_expired
+            .saturating_add(self.expired_prefix_len(now_ms) as u64)
     }
 
     pub fn generation(&self) -> u64 {
@@ -1443,6 +1476,25 @@ impl PluginRuntime {
         decision: AuditDecision,
         target: Option<&str>,
     ) {
+        let now_ms = u64::try_from(crate::util::now_ms()).unwrap_or(0);
+        self.push_audit_at(plugin, capability, operation, decision, target, now_ms);
+    }
+
+    fn push_audit_at(
+        &mut self,
+        plugin: PluginId,
+        capability: Capability,
+        operation: &str,
+        decision: AuditDecision,
+        target: Option<&str>,
+        now_ms: u64,
+    ) {
+        let expired = self.expired_prefix_len(now_ms);
+        if expired > 0 {
+            self.audit.drain(..expired);
+            self.audit_expired = self.audit_expired.saturating_add(expired as u64);
+        }
+
         if self.audit.len() == MAX_AUDIT_ENTRIES {
             let evict_count = (MAX_AUDIT_ENTRIES / 4).max(1);
             self.audit.drain(..evict_count);
@@ -1468,7 +1520,7 @@ impl PluginRuntime {
             capability: Capability(bound_audit_string(capability.as_str())),
             operation: bound_audit_string(operation),
             decision,
-            timestamp_ms: u64::try_from(crate::util::now_ms()).unwrap_or(0),
+            timestamp_ms: now_ms,
             seq: self.next_audit_seq,
             generation: self.generation,
             target: target.map(bound_audit_string),
@@ -3265,6 +3317,7 @@ timeout_secs = 5
 
         let audit = runtime.audit_log();
         assert_eq!(audit.len(), 2);
+        assert_eq!(runtime.audit_expired(), 0);
         for entry in audit {
             assert!(entry.timestamp_ms >= u64::try_from(before).unwrap());
             assert!(entry.timestamp_ms <= u64::try_from(after).unwrap());
@@ -3390,6 +3443,149 @@ timeout_secs = 5
         assert!(audit[0].seq > 0);
         assert_eq!(audit.last().map(|entry| entry.seq), Some(total as u64));
         assert_eq!(runtime.audit_evicted(), (MAX_AUDIT_ENTRIES / 4) as u64);
+    }
+
+    #[test]
+    fn audit_age_retention_expires_the_leading_run_only() {
+        let mut runtime = PluginRuntime::new(NegotiatedManifest::default());
+        let plugin = PluginId::new("age-retention-test");
+        for timestamp_ms in [0, 1_000, 2_000] {
+            runtime.push_audit_at(
+                plugin.clone(),
+                Capability::new("host", "sessions.list"),
+                "host.call",
+                AuditDecision::Granted,
+                None,
+                timestamp_ms,
+            );
+        }
+        runtime.push_audit_at(
+            plugin.clone(),
+            Capability::new("host", "sessions.list"),
+            "host.call",
+            AuditDecision::Granted,
+            None,
+            MAX_AUDIT_AGE_MS + 1_500,
+        );
+
+        let visible = runtime.audit_log_at(MAX_AUDIT_AGE_MS + 1_500);
+        assert_eq!(
+            visible.iter().map(|entry| entry.seq).collect::<Vec<_>>(),
+            [3, 4]
+        );
+        assert_eq!(runtime.audit_expired_at(MAX_AUDIT_AGE_MS + 1_500), 2);
+        assert_eq!(runtime.audit_evicted(), 0);
+        assert_eq!(runtime.audit_log_at(MAX_AUDIT_AGE_MS + 2_000)[0].seq, 3);
+        assert_eq!(runtime.audit_log_at(MAX_AUDIT_AGE_MS + 2_001)[0].seq, 4);
+    }
+
+    #[test]
+    fn audit_age_retention_stops_at_a_backwards_clock_step() {
+        let mut runtime = PluginRuntime::new(NegotiatedManifest::default());
+        let plugin = PluginId::new("backwards-clock-test");
+        for timestamp_ms in [10_000, 20_000, 5_000] {
+            runtime.push_audit_at(
+                plugin.clone(),
+                Capability::new("host", "sessions.list"),
+                "host.call",
+                AuditDecision::Granted,
+                None,
+                timestamp_ms,
+            );
+        }
+        runtime.push_audit_at(
+            plugin,
+            Capability::new("host", "sessions.list"),
+            "host.call",
+            AuditDecision::Granted,
+            None,
+            MAX_AUDIT_AGE_MS + 12_000,
+        );
+
+        let visible = runtime.audit_log_at(MAX_AUDIT_AGE_MS + 12_000);
+        assert_eq!(
+            visible.iter().map(|entry| entry.seq).collect::<Vec<_>>(),
+            [2, 3, 4]
+        );
+        assert_eq!(runtime.audit_expired_at(MAX_AUDIT_AGE_MS + 12_000), 1);
+    }
+
+    #[test]
+    fn audit_count_eviction_still_applies_when_nothing_is_old() {
+        let mut runtime = PluginRuntime::new(NegotiatedManifest::default());
+        let plugin = PluginId::new("count-retention-test");
+        for _ in 0..=MAX_AUDIT_ENTRIES {
+            runtime.push_audit_at(
+                plugin.clone(),
+                Capability::new("host", "sessions.list"),
+                "host.call",
+                AuditDecision::Granted,
+                None,
+                10_000,
+            );
+        }
+
+        assert_eq!(
+            runtime.audit_log_at(10_000).len(),
+            MAX_AUDIT_ENTRIES + 1 - MAX_AUDIT_ENTRIES / 4
+        );
+        assert_eq!(runtime.audit_evicted(), (MAX_AUDIT_ENTRIES / 4) as u64);
+        assert_eq!(runtime.audit_expired_at(10_000), 0);
+    }
+
+    #[test]
+    fn audit_read_hides_and_counts_expired_entries_without_a_write() {
+        let mut runtime = PluginRuntime::new(NegotiatedManifest::default());
+        let plugin = PluginId::new("read-expiry-test");
+        for timestamp_ms in [0, 1_000] {
+            runtime.push_audit_at(
+                plugin.clone(),
+                Capability::new("host", "sessions.list"),
+                "host.call",
+                AuditDecision::Granted,
+                None,
+                timestamp_ms,
+            );
+        }
+
+        assert_eq!(runtime.audit_log_at(MAX_AUDIT_AGE_MS + 500)[0].seq, 2);
+        assert_eq!(runtime.audit_expired_at(MAX_AUDIT_AGE_MS + 500), 1);
+        assert!(runtime.audit_log_at(MAX_AUDIT_AGE_MS + 1_001).is_empty());
+        assert_eq!(runtime.audit_expired_at(MAX_AUDIT_AGE_MS + 1_001), 2);
+        assert_eq!(runtime.audit_log_at(500).len(), 2);
+
+        runtime.push_audit_at(
+            plugin,
+            Capability::new("host", "sessions.list"),
+            "host.call",
+            AuditDecision::Granted,
+            None,
+            MAX_AUDIT_AGE_MS + 1_001,
+        );
+        assert_eq!(runtime.audit_expired_at(MAX_AUDIT_AGE_MS + 1_001), 2);
+        assert_eq!(runtime.audit_log_at(MAX_AUDIT_AGE_MS + 1_001).len(), 1);
+        assert_eq!(runtime.audit_log_at(MAX_AUDIT_AGE_MS + 1_001)[0].seq, 3);
+    }
+
+    #[test]
+    fn audit_entry_strings_are_bounded() {
+        let mut runtime = PluginRuntime::new(NegotiatedManifest::default());
+        runtime.push_audit_at(
+            PluginId::new("bounded-strings-test"),
+            Capability::new("h".repeat(MAX_AUDIT_STRING_BYTES * 2), "x"),
+            &"o".repeat(MAX_AUDIT_STRING_BYTES * 2),
+            AuditDecision::Granted,
+            Some(&"t".repeat(MAX_AUDIT_STRING_BYTES * 2)),
+            10_000,
+        );
+
+        let entry = &runtime.audit_log_at(10_000)[0];
+        assert!(
+            entry.capability.as_str().len()
+                + entry.operation.len()
+                + entry.target.as_ref().map_or(0, String::len)
+                <= 3 * MAX_AUDIT_STRING_BYTES
+        );
     }
 
     #[test]
