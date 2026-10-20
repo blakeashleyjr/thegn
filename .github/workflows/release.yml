@@ -478,7 +478,19 @@ jobs:
         with:
           persist-credentials: false
       - uses: DeterminateSystems/nix-installer-action@e50d5f73bfe71c2dd0aa4218de8f4afa59f8f81d # v16
+      - name: Check AUR metadata generation enablement
+        id: srcinfo
+        env:
+          ENABLED: ${{ vars.PACKAGE_PUBLICATION_ENABLED }}
+        run: |
+          if [ "$ENABLED" != true ]; then
+            echo "enabled=false" >> "$GITHUB_OUTPUT"
+            echo "AUR metadata generation skipped; PACKAGE_PUBLICATION_ENABLED is not true."
+            exit 0
+          fi
+          echo "enabled=true" >> "$GITHUB_OUTPUT"
       - name: Download PKGBUILD from published release
+        if: steps.srcinfo.outputs.enabled == 'true'
         env:
           GITHUB_TOKEN: ${{ github.token }}
           TAG: ${{ inputs.tag }}
@@ -493,6 +505,7 @@ jobs:
           gh release download "$TAG" --dir "$source_root" \
             --pattern "thegn-$TAG-PKGBUILD"
       - name: Generate and bound AUR source metadata
+        if: steps.srcinfo.outputs.enabled == 'true'
         env:
           TAG: ${{ inputs.tag }}
         run: |
@@ -517,15 +530,18 @@ jobs:
           mkdir -p "$RUNNER_TEMP/aur-artifact"
           cp "$work_root/PKGBUILD" "$work_root/.SRCINFO" "$RUNNER_TEMP/aur-artifact/"
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: steps.srcinfo.outputs.enabled == 'true'
         with:
           name: aur-metadata
           path: ${{ runner.temp }}/aur-artifact/
           if-no-files-found: error
+          include-hidden-files: true
       - name: Remove temporary source files
         if: always()
         run: |
           set -euo pipefail
-          for path in "${SOURCE_ROOT:-}" "$RUNNER_TEMP"/srcinfo-work.* "$RUNNER_TEMP"/srcinfo-home.*; do
+          for path in "${SOURCE_ROOT:-}" "$RUNNER_TEMP"/srcinfo-work.* "$RUNNER_TEMP"/srcinfo-home.* \
+            "$RUNNER_TEMP/aur-artifact" "$RUNNER_TEMP/aur-metadata-sha256.txt"; do
             if [ -n "$path" ] && [[ "$path" == "$RUNNER_TEMP/"* ]]; then
               rm -rf "$path"
             fi
@@ -683,10 +699,8 @@ jobs:
             exit 1
           }
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
-      - uses: ./.github/actions/ci-setup
         with:
-          nix-token: ${{ secrets.NIX_GITHUB_TOKEN }}
-          cache-lane: release-publication
+          persist-credentials: false
       - name: Check AUR publication enablement
         id: publication
         env:
@@ -711,6 +725,7 @@ jobs:
           fi
           echo "ready=true" >> "$GITHUB_OUTPUT"
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        if: steps.publication.outputs.ready == 'true'
         with:
           name: aur-metadata
           path: ${{ runner.temp }}/aur-metadata
@@ -720,11 +735,13 @@ jobs:
           set -euo pipefail
           mapfile -t artifact_files < <(
             find "$RUNNER_TEMP/aur-metadata" -mindepth 1 -maxdepth 1 \
-              -printf '%f\n' | sort
+              -printf '%f\n' | LC_ALL=C sort
           )
           if [ "${#artifact_files[@]}" -ne 2 ] \
             || [ "${artifact_files[0]}" != .SRCINFO ] \
             || [ "${artifact_files[1]}" != PKGBUILD ] \
+            || [ -L "$RUNNER_TEMP/aur-metadata/.SRCINFO" ] \
+            || [ -L "$RUNNER_TEMP/aur-metadata/PKGBUILD" ] \
             || [ ! -f "$RUNNER_TEMP/aur-metadata/.SRCINFO" ] \
             || [ ! -f "$RUNNER_TEMP/aur-metadata/PKGBUILD" ]; then
             echo "::error::AUR metadata artifact must contain exactly PKGBUILD and .SRCINFO."
