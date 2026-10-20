@@ -98,6 +98,7 @@ mod db_ci;
 pub mod db_compute;
 mod db_control;
 mod db_dispatch;
+mod db_dispatch_capability;
 mod db_glyph;
 mod db_hibernate;
 mod db_intent;
