@@ -1,7 +1,7 @@
 use super::*;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use thegn_core::store::MergeClaimRequest;
+use thegn_core::store::{MergeClaimRequest, MergeClaimView};
 
 fn registered_row(db: &Db, root: &Path, worktree: &str, branch: &str) -> QueueItem {
     let root = root.to_string_lossy().into_owned();
@@ -46,7 +46,10 @@ fn racing_drains_on_two_connections_have_one_owner() {
     let root = dir.path().join("repo");
     std::fs::create_dir(&root).unwrap();
     let db_a = Db::open_at(&db_path).unwrap();
-    let item = registered_row(&db_a, &root, "/worktrees/feature", "feature");
+    let mut item = registered_row(&db_a, &root, "/worktrees/feature", "feature");
+    db_a.set_merge_agent_attempts(&item.worktree, 1).unwrap();
+    item.agent_attempts = 1;
+    let worktree = item.worktree.clone();
     let db_b = Db::open_at(&db_path).unwrap();
     let root_a = root.clone();
     let (started_tx, started_rx) = std::sync::mpsc::channel();
@@ -89,11 +92,17 @@ fn racing_drains_on_two_connections_have_one_owner() {
         }),
     );
     let attempts_after_loser = loser_attempts.load(Ordering::Relaxed);
-    let persisted_attempts = db_b.list_merge_queue().unwrap()[0].agent_attempts;
+    let persisted_attempts = db_b
+        .list_merge_queue()
+        .unwrap()
+        .into_iter()
+        .find(|row| row.worktree == worktree)
+        .unwrap()
+        .agent_attempts;
     release_tx.send(()).unwrap();
     let winner = winner.join().unwrap();
     assert_eq!(attempts_after_loser, 0);
-    assert_eq!(persisted_attempts, 0);
+    assert_eq!(persisted_attempts, 1);
     assert_eq!(loser.warnings.len(), 1);
     assert!(loser.warnings[0].contains("claimed by another drain"));
     assert_eq!(winner.ready, ["feature"]);
@@ -149,7 +158,15 @@ fn row_held_by_another_connection_is_skipped_and_the_next_row_lands() {
             .iter()
             .any(|worktree| worktree == "/worktrees/second")
     );
-    assert_eq!(db.list_merge_queue().unwrap()[0].status, "queued");
+    assert_eq!(
+        db.list_merge_queue()
+            .unwrap()
+            .into_iter()
+            .find(|row| row.worktree == first.worktree)
+            .unwrap()
+            .status,
+        "queued"
+    );
     assert_eq!(outcome.ready, ["second"]);
     assert!(outcome.warnings[0].contains("claimed by another drain"));
 }
@@ -187,7 +204,6 @@ fn budget_is_consumed_through_the_claim() {
     std::fs::create_dir(&root).unwrap();
     let db = Db::open_at(&db_path).unwrap();
     let item = registered_row(&db, &root, "/worktrees/feature", "feature");
-    db.set_merge_agent_attempts(&item.worktree, 1).unwrap();
     let cfg = MergeQueueConfig {
         conflict_handoff: ConflictHandoff::Agent,
         agent_command: "agent".into(),
@@ -196,6 +212,8 @@ fn budget_is_consumed_through_the_claim() {
     };
     let runs = Arc::new(AtomicUsize::new(0));
     let runner_runs = Arc::clone(&runs);
+    let attempt_db_path = db_path.clone();
+    let attempt_worktree = item.worktree.clone();
     let outcome = drive_queue_with(
         &cfg,
         &Config::default(),
@@ -204,7 +222,14 @@ fn budget_is_consumed_through_the_claim() {
         vec![item],
         |_| {},
         DriveActions {
-            attempt: |_, _| Ok(AttemptOutcome::GateFailed { log: "red".into() }),
+            attempt: move |_, _| {
+                let connection = rusqlite::Connection::open(&attempt_db_path)?;
+                connection.execute(
+                    "UPDATE merge_queue SET agent_attempts = 2 WHERE worktree = ?1",
+                    [&attempt_worktree],
+                )?;
+                Ok(AttemptOutcome::GateFailed { log: "red".into() })
+            },
             floor: |_| crate::agent_run::AgentDispatch::Run(None),
             runner: move |_, _, _, _, _, _| {
                 runner_runs.fetch_add(1, Ordering::Relaxed);
@@ -212,7 +237,7 @@ fn budget_is_consumed_through_the_claim() {
             },
         },
     );
-    assert_eq!(runs.load(Ordering::Relaxed), 1);
+    assert_eq!(runs.load(Ordering::Relaxed), 0);
     assert_eq!(outcome.needs_human, ["feature"]);
     let row = db.list_merge_queue().unwrap().remove(0);
     assert_eq!(row.agent_attempts, 2);
@@ -262,4 +287,34 @@ fn stale_folding_row_is_skipped_with_a_warning() {
     );
     assert_eq!(db.list_merge_queue().unwrap()[0].status, "folding");
     assert!(outcome.warnings[0].contains("not claimable"));
+}
+
+#[test]
+fn expired_claim_target_filter_keeps_item_for_claim_recovery() {
+    let expired = MergeClaimView {
+        worktree: "/worktrees/feature".into(),
+        generation: 2,
+        phase: "claimed_no_child".into(),
+        lease_until_ms: Some(99),
+        owner_hint: Some("stale drain".into()),
+    };
+    assert_eq!(
+        target_stamp_action(true, Some(&expired), 100),
+        TargetStampAction::RetryWithoutStamp
+    );
+}
+
+#[test]
+fn live_claim_target_filter_skips_item() {
+    let live = MergeClaimView {
+        worktree: "/worktrees/feature".into(),
+        generation: 2,
+        phase: "claimed_no_child".into(),
+        lease_until_ms: Some(101),
+        owner_hint: Some("active drain".into()),
+    };
+    assert_eq!(
+        target_stamp_action(true, Some(&live), 100),
+        TargetStampAction::SkipHeld
+    );
 }

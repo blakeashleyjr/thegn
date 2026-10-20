@@ -367,6 +367,32 @@ enum PostRelease {
     Landed(String),
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TargetStampAction {
+    SkipHeld,
+    RetryWithoutStamp,
+    Fail,
+}
+
+pub(crate) fn target_stamp_action(
+    claim_active_error: bool,
+    claim: Option<&thegn_core::store::MergeClaimView>,
+    now_ms: i64,
+) -> TargetStampAction {
+    if !claim_active_error {
+        return TargetStampAction::Fail;
+    }
+    match claim {
+        Some(view)
+            if view.phase != "unclaimed"
+                && view.lease_until_ms.is_some_and(|until| until > now_ms) =>
+        {
+            TargetStampAction::SkipHeld
+        }
+        _ => TargetStampAction::RetryWithoutStamp,
+    }
+}
+
 fn drive_queue_with(
     cfg: &MergeQueueConfig,
     full: &Config,
@@ -428,13 +454,6 @@ fn drive_queue_with(
             ));
             continue;
         };
-        if fresh.branch != item.branch || fresh.location != item.location {
-            out.warnings.push(format!(
-                "{}: not admitted (queue identity changed since listing); skipped",
-                item.branch
-            ));
-            continue;
-        }
         let registered_repo = match db.repo_root_for(&item.worktree) {
             Ok(repo) => repo.filter(|repo| !repo.is_empty()),
             Err(error) => {
@@ -446,6 +465,13 @@ fn drive_queue_with(
             }
         };
         let claim = if let Some(repo) = registered_repo.as_deref() {
+            if fresh.branch != item.branch || fresh.location != item.location {
+                out.warnings.push(format!(
+                    "{}: not admitted (queue identity changed since listing); skipped",
+                    item.branch
+                ));
+                continue;
+            }
             if !matches!(
                 fresh.status.as_str(),
                 "queued"
@@ -539,8 +565,9 @@ fn drive_queue_with(
             fields
         };
         macro_rules! stop_on_write_error {
-            () => {
-                if let Some(error) = write_error.borrow_mut().take() {
+            ($label:lifetime) => {
+                let pending = write_error.borrow_mut().take();
+                if let Some(error) = pending {
                     if error.contains("merge claim lost; another drain recovered the row") {
                         out.warnings.push(error);
                     } else {
@@ -548,7 +575,7 @@ fn drive_queue_with(
                         out.persistence_errors.push(error);
                         stop_drain.set(true);
                     }
-                    break 'attempt;
+                    break $label;
                 }
             };
         }
@@ -570,22 +597,25 @@ fn drive_queue_with(
             }
         };
         let fields = set(db, MqStatus::Folding, None, None);
-        if let Some(error) = write_error.borrow_mut().take() {
+        let pending_write_error = write_error.borrow_mut().take();
+        if let Some(error) = pending_write_error {
             let claim_lost = error.contains("merge claim lost; another drain recovered the row");
             if claim_lost {
                 out.warnings.push(error);
             } else {
                 out.persistence_errors.push(error);
             }
-            if let Some(claim) = claim.borrow_mut().take() {
-                if let Err(error) = claim.finish(db) {
-                    if !claim_lost {
-                        out.warnings.push(format!(
-                            "{}: could not release merge claim: {error}",
-                            item.branch
-                        ));
-                    }
-                }
+            if let Some(claim) = claim.borrow_mut().take()
+                && let Err(error) = claim.finish(db)
+                && !claim_lost
+            {
+                out.warnings.push(format!(
+                    "{}: could not release merge claim: {error}",
+                    item.branch
+                ));
+            }
+            if claim_lost {
+                continue 'items;
             }
             break 'items;
         }
@@ -620,7 +650,7 @@ fn drive_queue_with(
                 Err(e) => {
                     let detail = format!("{e}");
                     let fields = set(db, MqStatus::NeedsHuman, None, Some(&detail));
-                    stop_on_write_error!();
+                    stop_on_write_error!('attempt);
                     lifecycle(db, thegn_core::merge_lifecycle::LifecycleEvent::Failed);
                     progress(&DriveStep {
                         fields: &fields,
@@ -644,7 +674,8 @@ fn drive_queue_with(
                     // live checkout of the target left stale by the ref move.
                     out.resyncs.extend(resyncs);
                     let fields = set(db, MqStatus::Landed, Some(&commit), None);
-                    if let Some(error) = write_error.borrow_mut().take() {
+                    let pending_write_error = write_error.borrow_mut().take();
+                    if let Some(error) = pending_write_error {
                         out.bookkeeping_failed.push(RefAdvancedBookkeepingFailed {
                             branch: item.branch.clone(),
                             target: target.clone(),
@@ -680,7 +711,7 @@ fn drive_queue_with(
                 }
                 AttemptOutcome::UpToDate { commit } => {
                     let fields = set(db, MqStatus::Landed, Some(&commit), Some("already merged"));
-                    stop_on_write_error!();
+                    stop_on_write_error!('attempt);
                     lifecycle(db, thegn_core::merge_lifecycle::LifecycleEvent::Landed);
                     progress(&DriveStep {
                         fields: &fields,
@@ -699,7 +730,7 @@ fn drive_queue_with(
                         Some(&tip),
                         Some("gated green — awaiting land"),
                     );
-                    stop_on_write_error!();
+                    stop_on_write_error!('attempt);
                     progress(&DriveStep {
                         fields: &fields,
                         worktree: &item.worktree,
@@ -715,7 +746,7 @@ fn drive_queue_with(
                     // (deferred) with the reason — a transient blip is retried on
                     // the next drain; never silently drop the row.
                     let fields = set(db, MqStatus::Deferred, None, Some(&detail));
-                    stop_on_write_error!();
+                    stop_on_write_error!('attempt);
                     lifecycle(db, thegn_core::merge_lifecycle::LifecycleEvent::Failed);
                     progress(&DriveStep {
                         fields: &fields,
@@ -742,7 +773,7 @@ fn drive_queue_with(
                     // the environment may be fixed.
                     let detail = detail_with_log(&reason, &log);
                     let fields = set(db, MqStatus::GateError, None, Some(&detail));
-                    stop_on_write_error!();
+                    stop_on_write_error!('attempt);
                     lifecycle(db, thegn_core::merge_lifecycle::LifecycleEvent::Failed);
                     progress(&DriveStep {
                         fields: &fields,
@@ -779,7 +810,8 @@ fn drive_queue_with(
                             format!("{reason}\n{paths_text}")
                         });
                         write_fields(db, MqStatus::NeedsHuman, &fields);
-                        if let Some(error) = write_error.borrow_mut().take() {
+                        let pending_write_error = write_error.borrow_mut().take();
+                        if let Some(error) = pending_write_error {
                             if error.contains("merge claim lost; another drain recovered the row") {
                                 out.warnings.push(error);
                                 break 'attempt;
@@ -836,7 +868,7 @@ fn drive_queue_with(
                     );
                     thegn_core::msg::warn(&reason);
                     let fields = set(db, MqStatus::AgentBlocked, None, Some(&reason));
-                    stop_on_write_error!();
+                    stop_on_write_error!('attempt);
                     progress(&DriveStep {
                         fields: &fields,
                         worktree: &item.worktree,
@@ -856,7 +888,7 @@ fn drive_queue_with(
                     crate::agent_run::AgentDispatch::InfraHold(reason) => {
                         thegn_core::msg::warn(&reason);
                         let fields = set(db, MqStatus::AgentBlocked, None, Some(&reason));
-                        stop_on_write_error!();
+                        stop_on_write_error!('attempt);
                         progress(&DriveStep {
                             fields: &fields,
                             worktree: &item.worktree,
@@ -924,7 +956,7 @@ fn drive_queue_with(
                         out.persistence_errors
                             .push(format!("{}: {detail}", item.worktree));
                         set(db, MqStatus::GateError, None, Some(&detail));
-                        stop_on_write_error!();
+                        stop_on_write_error!('attempt);
                         stop_drain.set(true);
                         break 'attempt;
                     }
@@ -933,7 +965,7 @@ fn drive_queue_with(
                 if !budget_exhausted {
                     let note = format!("agent fixing ({agent_runs}/{})", cfg.agent_max_attempts);
                     let fields = set(db, MqStatus::AgentRunning, None, Some(&note));
-                    stop_on_write_error!();
+                    stop_on_write_error!('attempt);
                     progress(&DriveStep {
                         fields: &fields,
                         worktree: &item.worktree,
@@ -981,7 +1013,8 @@ fn drive_queue_with(
                     };
                     let fields = conflict_fields(&paths, &submodule_conflicts);
                     write_fields(db, status, &fields);
-                    if let Some(error) = write_error.borrow_mut().take() {
+                    let pending_write_error = write_error.borrow_mut().take();
+                    if let Some(error) = pending_write_error {
                         if error.contains("merge claim lost; another drain recovered the row") {
                             out.warnings.push(error);
                             break 'attempt;
@@ -990,7 +1023,7 @@ fn drive_queue_with(
                         out.persistence_errors
                             .push(format!("{}: {detail}", item.worktree));
                         set(db, MqStatus::GateError, None, Some(&detail));
-                        stop_on_write_error!();
+                        stop_on_write_error!('attempt);
                         stop_drain.set(true);
                         break 'attempt;
                     }
@@ -1018,7 +1051,7 @@ fn drive_queue_with(
                     // and the log was otherwise discarded entirely.
                     let detail = detail_with_log("breaks build", &log);
                     let fields = set(db, status, None, Some(&detail));
-                    stop_on_write_error!();
+                    stop_on_write_error!('attempt);
                     progress(&DriveStep {
                         fields: &fields,
                         worktree: &item.worktree,
