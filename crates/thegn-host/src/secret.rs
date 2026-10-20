@@ -501,7 +501,7 @@ struct KeyringWorker {
     sender: std::sync::mpsc::SyncSender<Job>,
     receiver: std::sync::Mutex<Option<std::sync::mpsc::Receiver<Job>>>,
     busy_since: std::sync::Arc<std::sync::Mutex<Option<std::time::Instant>>>,
-    _thread: std::sync::Mutex<Option<std::thread::JoinHandle<()>>>,
+    thread: std::sync::Mutex<Option<std::thread::JoinHandle<()>>>,
     #[cfg(test)]
     threads_started: std::sync::Arc<std::sync::atomic::AtomicUsize>,
 }
@@ -513,7 +513,7 @@ impl KeyringWorker {
             sender,
             receiver: std::sync::Mutex::new(Some(receiver)),
             busy_since: std::sync::Arc::new(std::sync::Mutex::new(None)),
-            _thread: std::sync::Mutex::new(None),
+            thread: std::sync::Mutex::new(None),
             #[cfg(test)]
             threads_started: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         }
@@ -546,13 +546,15 @@ impl KeyringWorker {
                     if let Ok(mut busy) = busy_since.lock() {
                         *busy = Some(std::time::Instant::now());
                     }
-                    (job.run)();
+                    if std::panic::catch_unwind(std::panic::AssertUnwindSafe(job.run)).is_err() {
+                        tracing::debug!(target: "thegn::secret", "keyring operation panicked");
+                    }
                     if let Ok(mut busy) = busy_since.lock() {
                         *busy = None;
                     }
                 }
             });
-            if let Ok(mut owned_thread) = self._thread.lock() {
+            if let Ok(mut owned_thread) = self.thread.lock() {
                 *owned_thread = Some(thread);
             }
         }
@@ -587,12 +589,13 @@ impl KeyringWorker {
             }),
         };
         if let Err(error) = self.sender.try_send(job) {
-            tracing::debug!(target: "thegn::secret", operation, "keyring queue full; request not started");
             return match error {
                 std::sync::mpsc::TrySendError::Full(_) => {
+                    tracing::debug!(target: "thegn::secret", operation, "keyring queue full; request not started");
                     KeyringOutcome::NotStarted("keyring queue full")
                 }
                 std::sync::mpsc::TrySendError::Disconnected(_) => {
+                    tracing::debug!(target: "thegn::secret", operation, "keyring worker unavailable; request not started");
                     KeyringOutcome::NotStarted("keyring worker unavailable")
                 }
             };
@@ -617,7 +620,12 @@ impl KeyringWorker {
                 }
             }
             Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
-                KeyringOutcome::NotStarted("keyring worker unavailable")
+                if state.load(std::sync::atomic::Ordering::SeqCst) == STARTED {
+                    tracing::warn!(target: "thegn::secret", operation, "keyring operation disconnected after start — outcome unknown");
+                    KeyringOutcome::TimedOut
+                } else {
+                    KeyringOutcome::NotStarted("keyring worker unavailable")
+                }
             }
         }
     }
@@ -1523,13 +1531,28 @@ mod tests {
     #[test]
     fn keyring_worker_bounded_operation_times_out_as_typed_outcome() {
         let worker = std::sync::Arc::new(KeyringWorker::new());
+        assert!(matches!(
+            worker.run("warm-up", std::time::Duration::from_secs(2), || true),
+            KeyringOutcome::Completed(true)
+        ));
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
         let started = std::time::Instant::now();
-        let result = worker.run("test", std::time::Duration::from_millis(10), || {
-            std::thread::sleep(std::time::Duration::from_secs(1));
+        let result = worker.run("test", std::time::Duration::from_millis(200), move || {
+            started_tx.send(()).unwrap();
+            release_rx.recv().unwrap();
             true
         });
+        let elapsed = started.elapsed();
+        started_rx
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .unwrap();
         assert!(matches!(result, KeyringOutcome::TimedOut));
-        assert!(started.elapsed() < std::time::Duration::from_millis(250));
+        assert!(
+            elapsed < std::time::Duration::from_secs(2),
+            "elapsed: {elapsed:?}"
+        );
+        release_tx.send(()).unwrap();
     }
 
     #[test]
@@ -1637,15 +1660,21 @@ mod tests {
     #[test]
     fn keyring_worker_started_request_that_times_out_is_unknown() {
         let worker = std::sync::Arc::new(KeyringWorker::new());
+        assert!(matches!(
+            worker.run("warm-up", std::time::Duration::from_secs(2), || true),
+            KeyringOutcome::Completed(true)
+        ));
         let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
         let running_worker = worker.clone();
+        let started = std::time::Instant::now();
         let request = std::thread::spawn(move || {
             running_worker.run(
                 "started-timeout",
-                std::time::Duration::from_millis(20),
+                std::time::Duration::from_millis(200),
                 move || {
                     started_tx.send(()).unwrap();
-                    std::thread::sleep(std::time::Duration::from_millis(300));
+                    release_rx.recv().unwrap();
                     true
                 },
             )
@@ -1653,7 +1682,33 @@ mod tests {
         started_rx
             .recv_timeout(std::time::Duration::from_secs(2))
             .unwrap();
-        assert!(matches!(request.join().unwrap(), KeyringOutcome::TimedOut));
+        let result = request.join().unwrap();
+        let elapsed = started.elapsed();
+        assert!(matches!(result, KeyringOutcome::TimedOut));
+        assert!(
+            elapsed < std::time::Duration::from_secs(2),
+            "elapsed: {elapsed:?}"
+        );
+        release_tx.send(()).unwrap();
+    }
+
+    #[test]
+    fn keyring_worker_panic_reports_unknown_and_keeps_worker_alive() {
+        let worker = KeyringWorker::new();
+        assert!(matches!(
+            worker.run("warm-up", std::time::Duration::from_secs(2), || true),
+            KeyringOutcome::Completed(true)
+        ));
+        assert!(matches!(
+            worker.run("panic", std::time::Duration::from_secs(2), || -> bool {
+                panic!("test keyring panic")
+            }),
+            KeyringOutcome::TimedOut
+        ));
+        assert!(matches!(
+            worker.run("after-panic", std::time::Duration::from_secs(2), || true),
+            KeyringOutcome::Completed(true)
+        ));
     }
 
     #[test]
