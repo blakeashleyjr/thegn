@@ -6,6 +6,15 @@ use anyhow::{Result, bail};
 use thegn_core::gitrefs::{parse_git_version, supports_stash_staged};
 use thegn_core::remote::GitLoc;
 
+#[cfg(test)]
+type UnstagedStashStepHook = Box<dyn FnMut(&str)>;
+
+#[cfg(test)]
+thread_local! {
+    static UNSTAGED_STASH_STEP_HOOK: std::cell::RefCell<Option<UnstagedStashStepHook>> =
+        std::cell::RefCell::new(None);
+}
+
 fn at(index: usize) -> String {
     format!("stash@{{{index}}}")
 }
@@ -77,23 +86,7 @@ pub trait StashOps: GitBackend {
     /// stash what remains (incl. untracked), then soft-reset the temp commit
     /// away — the index comes back exactly as it was.
     fn stash_unstaged(&self, loc: &GitLoc, message: &str) -> Result<()> {
-        run_w(
-            loc,
-            &[],
-            &[
-                "commit",
-                "--no-verify",
-                "--allow-empty",
-                "-m",
-                "[thegn] temp index",
-            ],
-        )?;
-        let stashed = run_w(loc, &[], &["stash", "push", "-u", "-m", message]);
-        // Always restore the index, even when the stash failed (e.g. nothing
-        // unstaged to stash).
-        let restored = run_w(loc, &[], &["reset", "--soft", "HEAD^"]);
-        stashed?;
-        restored.map(|_| ())
+        stash_unstaged_within(loc, message, super::MUTATION_LOCK_WAIT)
     }
 
     /// Resolve the stash index at mutation time under the local git lock.
@@ -137,11 +130,50 @@ pub trait StashOps: GitBackend {
 
 impl<T: GitBackend + ?Sized> StashOps for T {}
 
+fn stash_unstaged_within(loc: &GitLoc, message: &str, wait: std::time::Duration) -> Result<()> {
+    let _txn = if !loc.is_remote() && crate::bridge::for_loc(loc).is_none() {
+        super::begin_mutation_txn(loc, &["commit", "--no-verify", "--allow-empty"], wait)?
+    } else {
+        None
+    };
+    run_w(
+        loc,
+        &[],
+        &[
+            "commit",
+            "--no-verify",
+            "--allow-empty",
+            "-m",
+            "[thegn] temp index",
+        ],
+    )?;
+    let stashed = run_w(loc, &[], &["stash", "push", "-u", "-m", message]);
+    // Always restore the index, even when the stash failed (e.g. nothing
+    // unstaged to stash).
+    #[cfg(test)]
+    UNSTAGED_STASH_STEP_HOOK.with(|hook| {
+        if let Some(hook) = hook.borrow_mut().as_mut() {
+            hook("restore");
+        }
+    });
+    let restored = run_w(loc, &[], &["reset", "--soft", "HEAD^"]);
+    match (stashed, restored) {
+        (Ok(_), Ok(_)) => Ok(()),
+        (Err(stash), Ok(_)) => Err(stash),
+        (Ok(_), Err(restore)) => Err(restore.context(
+            "stash saved, but restoring the index failed; the temp commit \"[thegn] temp index\" is still on HEAD",
+        )),
+        (Err(stash), Err(restore)) => Err(stash.context(format!(
+            "restoring the index after a failed stash also failed ({restore}); the temp commit \"[thegn] temp index\" is still on HEAD"
+        ))),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::super::testutil::{TestRepo, git_in};
     use super::super::{CliGit, GitBackend};
-    use super::{StashOps, require_index};
+    use super::{StashOps, UNSTAGED_STASH_STEP_HOOK, require_index, stash_unstaged_within};
     use std::path::Path;
     use thegn_core::gitrefs::{parse_git_version, supports_stash_staged};
 
@@ -290,6 +322,73 @@ mod tests {
         let patch = repo.out(&["stash", "show", "-p", "stash@{0}"]);
         assert!(patch.contains("b.txt"), "{patch}");
         assert!(!patch.contains("a.txt"), "{patch}");
+    }
+
+    #[test]
+    fn stash_unstaged_refuses_whole_sequence_under_a_held_txn() {
+        let repo = TestRepo::new("st-unstaged-txn");
+        ident(&repo.dir);
+        repo.commit_file("f.txt", "base\n", "c0");
+        std::fs::write(repo.dir.join("f.txt"), "dirty\n").unwrap();
+        std::fs::write(repo.dir.join("untracked.txt"), "new\n").unwrap();
+        let loc = repo.loc();
+        let head = repo.head();
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let worktree = repo.dir.clone();
+        let holder = std::thread::spawn(move || {
+            let txn =
+                thegn_core::util::begin_git_mutation(&worktree, std::time::Duration::from_secs(5))
+                    .unwrap();
+            ready_tx.send(()).unwrap();
+            release_rx.recv().unwrap();
+            drop(txn);
+        });
+        ready_rx.recv().unwrap();
+
+        let error =
+            stash_unstaged_within(&loc, "unstaged only", std::time::Duration::from_millis(100))
+                .unwrap_err();
+        assert!(error.to_string().contains("mutation lock"), "{error:#}");
+        assert_eq!(repo.head(), head, "no temp commit was made");
+        assert!(CliGit.stash_list(&loc).unwrap().is_empty());
+
+        release_tx.send(()).unwrap();
+        holder.join().unwrap();
+    }
+
+    #[test]
+    fn stash_unstaged_reports_a_failed_index_restore() {
+        let repo = TestRepo::new("st-unstaged-restore-fails");
+        ident(&repo.dir);
+        repo.commit_file("f.txt", "base\n", "c0");
+        std::fs::write(repo.dir.join("f.txt"), "dirty\n").unwrap();
+        let loc = repo.loc();
+        let head_lock = repo.dir.join(".git/HEAD.lock");
+        let hook_lock = head_lock.clone();
+        UNSTAGED_STASH_STEP_HOOK.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(move |step| {
+                if step == "restore" {
+                    std::fs::write(&hook_lock, b"held by test").unwrap();
+                }
+            }));
+        });
+
+        let result =
+            stash_unstaged_within(&loc, "unstaged only", std::time::Duration::from_millis(100));
+        UNSTAGED_STASH_STEP_HOOK.with(|hook| *hook.borrow_mut() = None);
+        std::fs::remove_file(&head_lock).unwrap();
+
+        let error = result.unwrap_err();
+        let message = format!("{error:#}");
+        assert!(message.contains("restoring the index"), "{message}");
+        assert!(message.contains("[thegn] temp index"), "{message}");
+        assert_ne!(
+            repo.head(),
+            repo.sha_of("c0"),
+            "temp commit remains on HEAD"
+        );
+        assert_eq!(CliGit.stash_list(&loc).unwrap().len(), 1);
     }
 
     #[test]
