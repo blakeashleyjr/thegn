@@ -109,9 +109,10 @@ required source cannot be resolved, the launch is refused with its source and
 destination; an unresolvable cache mount is dropped with a warning. A source
 that does not exist yet can still resolve through its nearest existing parent.
 
-For local OCI containers, thegn records each writable bind source's identity
-before creating the container and checks it again afterward. If the source was
-swapped, thegn removes the container and refuses the launch.
+For local OCI containers that thegn creates directly (not compose), thegn
+records each writable, non-cache bind source's identity before creating the
+container and checks it again afterward. If the source was swapped, thegn
+removes the container and refuses the launch.
 
 **Sealed agent panes need a managed account.** The only exception to the
 deny list is the _managed_ per-account credential dir thegn creates under
@@ -499,10 +500,10 @@ A remote checkout with commits or changes made since thegn last synced it is kep
 
 For remote and provider worktrees, thegn reads `.gitmodules` from the remote
 commit and rechecks approved submodules before initializing them. It validates
-the remote worktree sync plan before uploading anything. Before provisioning
-before its first command, a provider sandbox's network policy is applied and
-read back; a mismatch stops provisioning. If an existing sandbox's policy
-cannot be verified, thegn refuses it and keeps it for recovery.
+the remote worktree sync plan before uploading anything. A provider sandbox's
+network policy is applied and read back before its first command; a mismatch
+stops provisioning. If an existing sandbox's policy cannot be verified, thegn
+refuses to provision it and leaves it in place.
 
 ## Inspecting
 
