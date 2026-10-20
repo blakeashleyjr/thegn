@@ -17,8 +17,9 @@ use serde::Serialize;
 use std::path::{Path, PathBuf};
 use thegn_core::config::Config;
 use thegn_core::outln;
+#[cfg(test)]
 use thegn_svc::plugin::LoadedPlugin;
-use thegn_svc::plugin::{discover, negotiate};
+use thegn_svc::plugin::loader::{AdmittedPlugin, PluginDecision};
 
 const LIVE_HEALTH_UNAVAILABLE: &str = "no attached compositor";
 
@@ -138,35 +139,32 @@ struct PluginListRow {
     trust: &'static str,
     gated_by: Vec<String>,
     status: String,
+    source_digest: String,
     #[serde(flatten)]
     health: PluginHealth,
 }
 
-fn negotiation_status(plugin: &LoadedPlugin) -> String {
-    match negotiate(&plugin.spec) {
-        Ok(n) if n.unsupported_contributions.is_empty() => "ok".to_string(),
-        Ok(n) => format!(
+fn negotiation_status(decision: &PluginDecision) -> String {
+    match decision {
+        PluginDecision::Admitted(n) if n.unsupported_contributions.is_empty() => "ok".to_string(),
+        PluginDecision::Admitted(n) => format!(
             "partial ({} unsupported contribution(s))",
             n.unsupported_contributions.len()
         ),
-        Err(error) => error,
+        PluginDecision::Invalid(problems) => problems.first().map_or_else(
+            || "refused: invalid plugin specification".to_string(),
+            |problem| format!("refused: {}", problem.problem),
+        ),
+        PluginDecision::RefusedUntrusted(problem) => problem.problem.clone(),
+        PluginDecision::Disabled => "disabled (not negotiated)".to_string(),
     }
 }
 
-fn list_row(plugin: &LoadedPlugin) -> PluginListRow {
+fn list_row(admitted: &AdmittedPlugin) -> PluginListRow {
+    let plugin = &admitted.plugin;
     let native_trust = plugin.spec.native_trust();
     let trust = native_trust.status_token();
-    let status = if plugin.spec.enabled
-        && matches!(
-            native_trust,
-            thegn_core::plugin_api::NativeTrust::Refused { .. }
-        ) {
-        thegn_svc::plugin::loader::native_trust_refusal(plugin)
-            .map(|problem| problem.problem)
-            .unwrap_or_else(|| "refused-untrusted".to_string())
-    } else {
-        negotiation_status(plugin)
-    };
+    let status = negotiation_status(&admitted.decision);
     let status = if plugin.trusted_native_ignored {
         format!("{status}; trusted_native in plugin.toml ignored")
     } else {
@@ -182,6 +180,7 @@ fn list_row(plugin: &LoadedPlugin) -> PluginListRow {
         trust,
         gated_by: plugin.spec.gated_by(),
         status,
+        source_digest: admitted.source_digest.clone(),
         health: PluginHealth::from_config(plugin.spec.enabled),
     }
 }
@@ -225,7 +224,8 @@ fn config_dir(config_path: &Path) -> PathBuf {
         .unwrap_or_default()
 }
 
-fn inspection_lines(plugin: &LoadedPlugin) -> Vec<String> {
+fn inspection_lines(admitted: &AdmittedPlugin) -> Vec<String> {
+    let plugin = &admitted.plugin;
     let id = plugin.spec.manifest.id.as_str();
     let gated_by = plugin.spec.gated_by();
     let verdict = match plugin.spec.native_trust() {
@@ -241,24 +241,25 @@ fn inspection_lines(plugin: &LoadedPlugin) -> Vec<String> {
     if plugin.trusted_native_ignored {
         native_line.push_str("; trusted_native in plugin.toml ignored");
     }
-    if !plugin.spec.enabled {
-        return vec![
-            format!("plugin {id}: disabled (not negotiated)"),
-            native_line,
-        ];
-    }
-    let negotiated = match negotiate(&plugin.spec) {
-        Ok(negotiated) => negotiated,
-        Err(error) => {
+    let negotiated = match &admitted.decision {
+        PluginDecision::Disabled => {
             return vec![
-                format!(
-                    "plugin {id}: api {} rejected by host {}: {error}",
-                    plugin.spec.manifest.api,
-                    thegn_core::plugin_api::API_VERSION
-                ),
+                format!("plugin {id}: disabled (not negotiated)"),
                 native_line,
             ];
         }
+        PluginDecision::RefusedUntrusted(problem) => {
+            return vec![format!("plugin {id}: {}", problem.problem), native_line];
+        }
+        PluginDecision::Invalid(problems) => {
+            let mut lines = problems
+                .iter()
+                .map(|problem| format!("plugin {id}: refused: {}", problem.problem))
+                .collect::<Vec<_>>();
+            lines.push(native_line);
+            return lines;
+        }
+        PluginDecision::Admitted(negotiated) => negotiated,
     };
     let mut granted = negotiated
         .granted
@@ -306,20 +307,23 @@ pub fn run(cfg: &Config, action: Action, config_path: &Path) -> Result<()> {
     let dir = config_dir(config_path);
     match action {
         Action::List { json } => {
-            let (loaded, _) = discover(cfg, &dir);
+            let admitted = thegn_svc::plugin::loader::admit(cfg, &dir);
             if json {
-                let rows: Vec<PluginListRow> = loaded.iter().map(list_row).collect();
+                let rows: Vec<PluginListRow> = admitted.plugins.iter().map(list_row).collect();
                 super::emit_json(&rows)?;
                 return Ok(());
             }
-            if loaded.is_empty() {
+            if admitted.plugins.is_empty() {
                 outln!(
                     "no plugins configured (add [[plugins]] or {}/plugins/<dir>/plugin.toml)",
                     dir.display()
                 );
+                for problem in &admitted.set_problems {
+                    outln!("set: {problem}");
+                }
                 return Ok(());
             }
-            for p in &loaded {
+            for p in &admitted.plugins {
                 let row = list_row(p);
                 let source = p
                     .dir
@@ -338,23 +342,25 @@ pub fn run(cfg: &Config, action: Action, config_path: &Path) -> Result<()> {
                     human_health(&row.health),
                 );
             }
+            for problem in &admitted.set_problems {
+                outln!("set: {problem}");
+            }
             Ok(())
         }
         Action::Check => {
-            let (loaded, broken) = discover(cfg, &dir);
-            for plugin in &loaded {
+            let admitted = thegn_svc::plugin::loader::admit(cfg, &dir);
+            for plugin in &admitted.plugins {
                 for line in inspection_lines(plugin) {
                     outln!("{line}");
                 }
             }
-            let mut problems = thegn_svc::plugin::loader::check_loaded(&loaded, broken);
-            problems.extend(
-                loaded
-                    .iter()
-                    .filter_map(thegn_svc::plugin::loader::native_trust_refusal),
-            );
+            let problems = admitted.problems();
             if problems.is_empty() {
-                outln!("plugins: ok ({} discovered)", loaded.len());
+                outln!(
+                    "plugins: ok ({} discovered, set {})",
+                    admitted.plugins.len(),
+                    &admitted.digest[..12]
+                );
                 return Ok(());
             }
             for p in &problems {
@@ -369,8 +375,8 @@ pub fn run(cfg: &Config, action: Action, config_path: &Path) -> Result<()> {
 mod tests {
     use super::*;
     use thegn_core::plugin_api::{
-        API_VERSION, CadenceHint, Contribution, ContributionId, ExtensionPoint, PluginId,
-        PluginManifest, PluginMode, PluginSpec,
+        API_VERSION, ApiVersion, CadenceHint, Contribution, ContributionId, ExtensionPoint,
+        PluginId, PluginManifest, PluginMode, PluginSpec,
     };
 
     #[test]
@@ -418,10 +424,29 @@ mod tests {
         }
     }
 
+    fn admitted_plugin(plugin: LoadedPlugin) -> AdmittedPlugin {
+        let decision = if !plugin.spec.enabled {
+            PluginDecision::Disabled
+        } else if let Some(problem) = thegn_svc::plugin::loader::native_trust_refusal(&plugin) {
+            PluginDecision::RefusedUntrusted(problem)
+        } else {
+            let problems = thegn_svc::plugin::loader::check_spec(&plugin);
+            match thegn_svc::plugin::loader::negotiate(&plugin.spec) {
+                Ok(negotiated) if problems.is_empty() => PluginDecision::Admitted(negotiated),
+                _ => PluginDecision::Invalid(problems),
+            }
+        };
+        AdmittedPlugin {
+            plugin,
+            source_digest: "test-source-digest".into(),
+            decision,
+        }
+    }
+
     #[test]
     fn check_inspection_reports_api_scopes_grants_and_acceptance() {
         let plugin = inspected_plugin(ExtensionPoint::PaletteAction, &["surface:palette"]);
-        let text = inspection_lines(&plugin).join("\n");
+        let text = inspection_lines(&admitted_plugin(plugin)).join("\n");
         assert!(
             text.contains("api 0.3.0 negotiated with host 0.3.0"),
             "{text}"
@@ -434,7 +459,7 @@ mod tests {
     #[test]
     fn check_inspection_reports_stable_reserved_reason() {
         let plugin = inspected_plugin(ExtensionPoint::PanelSection, &["surface:panel"]);
-        let text = inspection_lines(&plugin).join("\n");
+        let text = inspection_lines(&admitted_plugin(plugin)).join("\n");
         assert!(
             text.contains("rejected unsupported extension point PanelSection: reserved by THE-108"),
             "{text}"
@@ -451,7 +476,11 @@ mod tests {
         let mut ungated = inspected_plugin(ExtensionPoint::PaletteAction, &["surface:palette"]);
         ungated.spec.scopes.clear();
 
-        let rows = [list_row(&trusted), list_row(&refused), list_row(&ungated)];
+        let rows = [
+            list_row(&admitted_plugin(trusted)),
+            list_row(&admitted_plugin(refused)),
+            list_row(&admitted_plugin(ungated)),
+        ];
         assert_eq!(rows[0].trust, "trusted-native");
         assert_eq!(rows[1].trust, "refused-untrusted");
         assert!(
@@ -471,7 +500,7 @@ mod tests {
         plugin.spec.scopes.clear();
         plugin.dir = Some(std::path::PathBuf::from("/tmp/plugins/untrusted"));
 
-        let row = list_row(&plugin);
+        let row = list_row(&admitted_plugin(plugin));
 
         assert!(
             row.status
@@ -498,7 +527,7 @@ mod tests {
     #[test]
     fn offline_list_never_claims_enabled_plugin_is_healthy() {
         let plugin = inspected_plugin(ExtensionPoint::PaletteAction, &["surface:palette"]);
-        let row = list_row(&plugin);
+        let row = list_row(&admitted_plugin(plugin));
         assert_eq!(row.health.state, PluginState::Unknown);
         assert_eq!(row.health.live_health, "unavailable");
         assert_eq!(row.health.live_health_reason, LIVE_HEALTH_UNAVAILABLE);
@@ -518,7 +547,7 @@ mod tests {
     fn json_list_row_keeps_config_and_health_fields_in_one_stable_projection() {
         let mut plugin = inspected_plugin(ExtensionPoint::PaletteAction, &["surface:palette"]);
         plugin.spec.trusted_native = true;
-        let json = serde_json::to_value(list_row(&plugin)).unwrap();
+        let json = serde_json::to_value(list_row(&admitted_plugin(plugin))).unwrap();
         assert_eq!(json["id"], "inspect");
         assert_eq!(json["name"], "Inspect");
         assert_eq!(json["version"], "1.0.0");
@@ -528,6 +557,7 @@ mod tests {
         assert_eq!(json["state"], "unknown");
         assert_eq!(json["live_health"], "unavailable");
         assert_eq!(json["live_health_reason"], LIVE_HEALTH_UNAVAILABLE);
+        assert_eq!(json["source_digest"], "test-source-digest");
     }
 
     #[test]
@@ -557,5 +587,33 @@ mod tests {
         assert!(failure.contains(thegn_core::log_redact::REDACTED));
         assert_eq!(health.restart_count, Some(2));
         assert_eq!(health.backoff_ms, Some(5_000));
+    }
+
+    #[test]
+    fn list_and_check_agree_on_a_negotiate_failure() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut plugin = inspected_plugin(ExtensionPoint::PaletteAction, &["surface:palette"]);
+        plugin.spec.manifest.api = ApiVersion::new(9, 0, 0);
+        let cfg = Config {
+            plugins: vec![plugin],
+            ..Default::default()
+        };
+
+        let admitted = thegn_svc::plugin::loader::admit(&cfg, tmp.path());
+        let listed = list_row(&admitted.plugins[0]).status;
+        let checked = admitted.problems();
+
+        assert!(listed.starts_with("refused: incompatible api"), "{listed}");
+        assert!(
+            checked.iter().any(|problem| {
+                problem.plugin == "inspect" && listed == format!("refused: {}", problem.problem)
+            }),
+            "{checked:?}"
+        );
+        assert!(
+            inspection_lines(&admitted.plugins[0])
+                .iter()
+                .any(|line| line == &format!("plugin inspect: {listed}"))
+        );
     }
 }
