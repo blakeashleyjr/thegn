@@ -291,6 +291,8 @@ fn used_filter_runs_only_during_materialization_and_preserves_real_index() {
         &[
             "-c",
             "commit.gpgsign=false",
+            "-c",
+            "filter.canary.clean=cat",
             "commit",
             "-m",
             "filter attribute",
@@ -333,6 +335,8 @@ fn tracked_snapshot_uses_materialized_bytes_without_running_filters() {
         &[
             "-c",
             "commit.gpgsign=false",
+            "-c",
+            "filter.canary.clean=cat",
             "commit",
             "-m",
             "filter attribute",
