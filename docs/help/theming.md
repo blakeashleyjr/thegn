@@ -54,6 +54,10 @@ User themes live under `$XDG_CONFIG_HOME/thegn/themes` (normally
 catalog and reported by the popup's store status. Each file must be named after
 the theme's slug; duplicate theme names are reported and ignored. A local file
 whose name matches a built-in cannot shadow that built-in.
+Saving or importing never replaces a theme file that already exists unless
+the builder loaded that exact file: `thegn theme import` refuses a name that
+is already taken, and **Save as** over an existing theme is refused when the
+file changed on disk after the catalog loaded it (reopen the builder to reload it).
 
 The shipped Gogh importer accepts `name`, optional `variant`,
 `background`, `foreground`, `cursor`, and `color_01` through `color_16`.
