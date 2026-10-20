@@ -24,6 +24,7 @@
 //! verbs and should be validated against a live `tools/list` — they are isolated
 //! in the `tool` consts below for a one-line fix if a name differs.
 
+pub mod attest;
 pub mod mcp;
 
 use std::io::Read;
@@ -180,6 +181,12 @@ pub struct Machine0Vm {
     pub status: String,
     pub address: Option<String>,
     pub user: Option<String>,
+}
+
+struct FlakePlan {
+    identity: String,
+    remote_ref: String,
+    tree: Option<FlakeTree>,
 }
 
 /// The async driver: MCP lifecycle + ssh exec/files for one named VM.
@@ -531,54 +538,62 @@ impl Machine0Provider {
         Ok((ip, self.ssh_user_for(&vm)))
     }
 
-    /// Idempotent NixOS provisioning: (re-)apply the flake unless the VM already
-    /// carries the success marker for *this* flake ref. This is the re-checkable
+    /// Idempotent NixOS provisioning: (re-)apply unless the host attestation
+    /// matches this VM generation and flake identity. This is the re-checkable
     /// entry point (create AND the resume/claim path both call it): if a prior
     /// `nixos-rebuild` failed — transient network blip, flake-fetch error, or the
     /// 1800s timeout — `create()` returned Err but the VM already exists and
     /// billed, and nothing ever re-provisioned it (the ensure-exists retry path
-    /// finds the VM name in `vm_list` and never re-runs create). The marker closes
-    /// that hole: a VM missing the marker is re-provisioned on the next wake.
+    /// finds the VM name in `vm_list` and never re-runs create). The attestation closes
+    /// that hole: an unattested VM is re-provisioned on the next wake.
     async fn ensure_provisioned(&self, name: &str) -> Result<()> {
-        let flake = self.spec.provision_flake.trim();
-        if flake.is_empty() {
+        let Some(plan) = self.plan_flake().await? else {
+            return Ok(());
+        };
+        let vm = self
+            .vm_by_name(name)
+            .await?
+            .filter(|vm| !vm.id.is_empty())
+            .ok_or_else(|| anyhow!("machine0: vm {name} vanished before provisioning"))?;
+        let root = thegn_core::util::thegn_dir();
+        let vm_name = name.to_string();
+        let record = tokio::task::spawn_blocking(move || attest::load_in(&root, &vm_name))
+            .await
+            .context("machine0: attestation read worker failed")?;
+        if attest::attested(record.as_ref(), &vm.id, &plan.identity) {
             return Ok(());
         }
-        let marker = provision_marker_path(flake);
-        // A cheap `test -e <marker>` over ssh; exit 0 ⇒ already provisioned.
-        let shim = self.shim(name).await?;
-        let probe = vec![
-            "/bin/sh".to_string(),
-            "-lc".to_string(),
-            format!("test -e {}", thegn_core::util::sh_quote(&marker)),
-        ];
-        if let Ok((0, _)) = shim.run_exec(&probe, None, &[]).await {
-            return Ok(());
+        self.provision_nixos_with(name, &plan).await?;
+        let attestation = attest::Attestation {
+            version: 1,
+            vm_name: name.to_string(),
+            vm_id: vm.id,
+            flake_identity: plan.identity,
+            attested_at: match std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
+                Ok(duration) => duration.as_secs() as i64,
+                Err(_) => 0,
+            },
+        };
+        let root = thegn_core::util::thegn_dir();
+        match tokio::task::spawn_blocking(move || attest::store_in(&root, &attestation)).await {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => {
+                tracing::warn!(%error, "machine0: provision succeeded but attestation could not be stored; next wake will re-provision")
+            }
+            Err(error) => {
+                tracing::warn!(%error, "machine0: provision succeeded but attestation worker failed; next wake will re-provision")
+            }
         }
-        self.provision_nixos(name).await?;
-        // Best-effort marker write: if this fails the only cost is a redundant
-        // re-provision on the next wake (nixos-rebuild is itself idempotent), so
-        // never fail an otherwise-successful provision on the marker write.
-        let mark = vec![
-            "/bin/sh".to_string(),
-            "-lc".to_string(),
-            format!("touch {}", thegn_core::util::sh_quote(&marker)),
-        ];
-        let _ = shim.run_exec(&mark, None, &[]).await; // best-effort: marker is a cache
         Ok(())
     }
 
-    /// NixOS flake apply over ssh (there is no `provision` MCP tool). A local
-    /// flake is resolved to its canonical root and uploaded into a digest-named
-    /// generation directory; a flake URL is applied verbatim. Bounded — a
-    /// rebuild takes minutes.
-    async fn provision_nixos(&self, name: &str) -> Result<()> {
+    async fn plan_flake(&self) -> Result<Option<FlakePlan>> {
         let flake = self.spec.provision_flake.trim();
         if flake.is_empty() {
-            return Ok(());
+            return Ok(None);
         }
         let (loc, attr) = match flake.split_once('#') {
-            Some((l, a)) => (l, Some(a)),
+            Some((loc, attr)) => (loc, Some(attr.to_string())),
             None => (flake, None),
         };
         let local_ref = loc.to_string();
@@ -590,29 +605,49 @@ impl Machine0Provider {
         })
         .await
         .context("machine0: flake collection worker failed")??;
-        let remote_ref = if let Some(tree) = tree {
-            for rel in &tree.skipped {
-                tracing::warn!(path = %rel, "machine0: skipped non-regular flake upload entry");
-            }
-            let digest = match attr {
+        let (identity, remote_ref) = if let Some(tree) = &tree {
+            let digest = match attr.as_deref() {
                 Some(attribute) => flake_generation_digest(&tree.files, Some(attribute)),
                 None => tree.digest.clone(),
             };
+            let gen_dir = format!("/root/thegn-provision/{}", &digest[..32]);
+            let remote_ref = match attr.as_deref() {
+                Some(attribute) => format!("{gen_dir}#{attribute}"),
+                None => gen_dir,
+            };
+            (flake_identity_for(Some(&digest), flake), remote_ref)
+        } else {
+            (flake_identity_for(None, flake), flake.to_string())
+        };
+        Ok(Some(FlakePlan {
+            identity,
+            remote_ref,
+            tree,
+        }))
+    }
+
+    /// NixOS flake apply over ssh (there is no `provision` MCP tool). A local
+    /// flake is resolved to its canonical root and uploaded into a digest-named
+    /// generation directory; a flake URL is applied verbatim. Bounded — a
+    /// rebuild takes minutes.
+    async fn provision_nixos_with(&self, name: &str, plan: &FlakePlan) -> Result<()> {
+        if let Some(tree) = &plan.tree {
+            for rel in &tree.skipped {
+                tracing::warn!(path = %rel, "machine0: skipped non-regular flake upload entry");
+            }
+            let digest = plan
+                .identity
+                .strip_prefix("tree:")
+                .ok_or_else(|| anyhow!("machine0: local flake plan has an invalid identity"))?;
             let gen_dir = format!("/root/thegn-provision/{}", &digest[..32]);
             for (rel, bytes) in &tree.files {
                 let remote_path = crate::provider::join_remote(&gen_dir, rel);
                 self.write(name, &remote_path, bytes).await?;
             }
-            match attr {
-                Some(a) => format!("{gen_dir}#{a}"),
-                None => gen_dir,
-            }
-        } else {
-            flake.to_string()
-        };
+        }
         let script = format!(
             "nixos-rebuild switch --flake {}",
-            thegn_core::util::sh_quote(&remote_ref)
+            thegn_core::util::sh_quote(&plan.remote_ref)
         );
         let argv = vec!["/bin/sh".to_string(), "-lc".to_string(), script];
         let shim = self.shim(name).await?;
@@ -662,8 +697,8 @@ impl Machine0Provider {
     }
 
     /// Resume a suspended VM and wait until it is reachable again (claim path).
-    /// Re-applies the provisioning flake if the VM never carried the success
-    /// marker (a create-time provision that failed after the VM was already
+    /// Re-applies the provisioning flake if the VM lacks a matching host
+    /// attestation (a create-time provision that failed after the VM was already
     /// billing), so a stock image whose declared environment never applied is
     /// healed on the next claim rather than persisting forever.
     pub async fn resume(&self, name: &str) -> Result<()> {
@@ -672,6 +707,18 @@ impl Machine0Provider {
         // clearing the cache), so this no longer needs an explicit second probe.
         self.awake_endpoint(name).await?;
         self.ensure_provisioned(name).await
+    }
+
+    async fn remove_attestation(&self, name: &str) {
+        let root = thegn_core::util::thegn_dir();
+        let name = name.to_string();
+        match tokio::task::spawn_blocking(move || attest::remove_in(&root, &name)).await {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => {
+                tracing::warn!(%error, "machine0: failed to remove provisioning attestation")
+            }
+            Err(error) => tracing::warn!(%error, "machine0: attestation removal worker failed"),
+        }
     }
 }
 
@@ -709,7 +756,7 @@ impl RemoteProvider for Machine0Provider {
                 self.spec.max_instances(),
             )?;
             let vm = self.spawn(&name, &self.spec.image).await?;
-            // NixOS flake apply (no-op unless `provision_flake` is set). Marker-gated
+            // NixOS flake apply (no-op unless `provision_flake` is set). Attestation-gated
             // so a failed apply here is re-attempted on the next wake rather than
             // leaving a permanently half-provisioned VM.
             self.ensure_provisioned(&name).await?;
@@ -735,20 +782,26 @@ impl RemoteProvider for Machine0Provider {
             thegn_core::managed_ssh::read("machine0", &custody_account, id)
                 .context("machine0: validate managed SSH custody before destroy")?;
             let Some(vm) = self.vm_by_name(id).await? else {
+                self.remove_attestation(id).await;
                 thegn_core::managed_ssh::record_revoked("machine0", &custody_account, id)
                     .context("machine0: retire managed SSH custody")?;
                 return Ok(()); // already gone
             };
             if vm.id.is_empty() {
+                self.remove_attestation(id).await;
                 thegn_core::managed_ssh::record_revoked("machine0", &custody_account, id)
                     .context("machine0: retire managed SSH custody")?;
                 return Ok(());
             }
             *self.endpoint.lock().unwrap() = None;
             match self.call(tool::VM_DESTROY, json!({ "id": vm.id })).await {
-                Ok(_) => thegn_core::managed_ssh::record_revoked("machine0", &custody_account, id)
-                    .context("machine0: retire managed SSH custody"),
+                Ok(_) => {
+                    self.remove_attestation(id).await;
+                    thegn_core::managed_ssh::record_revoked("machine0", &custody_account, id)
+                        .context("machine0: retire managed SSH custody")
+                }
                 Err(e) if is_not_found(&e.to_string()) => {
+                    self.remove_attestation(id).await;
                     thegn_core::managed_ssh::record_revoked("machine0", &custody_account, id)
                         .context("machine0: retire managed SSH custody")
                 }
@@ -951,14 +1004,6 @@ pub fn status_stopped(status: &str) -> bool {
 /// resume state-machine be unit-tested without a live control plane. Pure.
 fn should_attempt_start(id_empty: bool, status: &str) -> bool {
     !id_empty && status_startable(status)
-}
-
-/// The on-VM marker path proving *this* flake ref was applied successfully.
-/// Keyed on a short hash of the (trimmed) flake ref so changing the declared
-/// environment invalidates the marker and forces a re-provision. Pure.
-fn provision_marker_path(flake: &str) -> String {
-    let fp = thegn_core::util::short_hash(flake.trim(), 12);
-    format!("/root/.thegn-provisioned-{fp}")
 }
 
 /// Whether `checkpoint` names an existing image in `available` (matched on the
@@ -1440,6 +1485,13 @@ fn flake_generation_digest(files: &[(String, Vec<u8>)], attr: Option<&str>) -> S
     format!("{:x}", digest.finalize())
 }
 
+fn flake_identity_for(tree_digest: Option<&str>, flake: &str) -> String {
+    match tree_digest {
+        Some(digest) => format!("tree:{digest}"),
+        None => format!("ref:{:x}", Sha256::digest(flake.trim().as_bytes())),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1547,13 +1599,34 @@ mod tests {
     }
 
     #[test]
-    fn provision_marker_path_is_flake_scoped_and_stable() {
-        let a = provision_marker_path("github:me/env#host");
-        // Deterministic + trim-insensitive for the same ref.
-        assert_eq!(a, provision_marker_path("  github:me/env#host  "));
-        // A different flake ref ⇒ a different marker (forces re-provision).
-        assert_ne!(a, provision_marker_path("github:me/env#other"));
-        assert!(a.starts_with("/root/.thegn-provisioned-"));
+    fn attest_flake_identity_tracks_tree_ref_and_attribute() {
+        let files = [("flake.nix".to_string(), b"{ }".to_vec())];
+        let base_tree = flake_generation_digest(&files, None);
+        let host = flake_generation_digest(&files, Some("host"));
+        let other_attr = flake_generation_digest(&files, Some("other"));
+        let changed_tree = flake_generation_digest(
+            &[("flake.nix".to_string(), b"{ changed = true; }".to_vec())],
+            Some("host"),
+        );
+        let host_identity = flake_identity_for(Some(&host), "/local/flake#host");
+        assert!(host_identity.starts_with("tree:"));
+        assert_ne!(
+            host_identity,
+            flake_identity_for(Some(&base_tree), "/local/flake")
+        );
+        assert_ne!(
+            host_identity,
+            flake_identity_for(Some(&other_attr), "/local/flake#other")
+        );
+        assert_ne!(
+            host_identity,
+            flake_identity_for(Some(&changed_tree), "/local/flake#host")
+        );
+
+        let url = flake_identity_for(None, "github:me/env#host");
+        assert!(url.starts_with("ref:"));
+        assert_eq!(url, flake_identity_for(None, "  github:me/env#host  "));
+        assert_ne!(url, flake_identity_for(None, "github:me/env#other"));
     }
 
     #[test]
