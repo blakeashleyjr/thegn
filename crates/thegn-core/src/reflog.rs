@@ -492,7 +492,8 @@ mod tests {
                 parse_reflog(out).expect_err("malformed input must reject the whole reflog");
             let message = error.to_string();
             assert!(
-                message.starts_with("reflog record") || message.starts_with("reflog trailing record"),
+                message.starts_with("reflog record")
+                    || message.starts_with("reflog trailing record"),
                 "{message}"
             );
         }

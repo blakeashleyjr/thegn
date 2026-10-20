@@ -478,7 +478,10 @@ fn first_snapshot_hook_is_fenced_and_cannot_replace_later_git_identity() {
     // planted post-commit hook never runs and cannot swap the later worktree's
     // gitfile; both selected snapshots go through on their own identity.
     f.snapshot_selected(&selected).unwrap();
-    assert!(!marker.exists(), "a repository hook ran during an automatic snapshot");
+    assert!(
+        !marker.exists(),
+        "a repository hook ran during an automatic snapshot"
+    );
     assert_ne!(git(&f.queued, &["rev-parse", "HEAD"]), first_before);
     assert_ne!(Fixture::snapshot(&f.unqueued), later_before);
     assert_eq!(std::fs::read(original).unwrap(), gitfile_before);
