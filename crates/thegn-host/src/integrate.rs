@@ -93,13 +93,14 @@ fn validate_driver_name(name: &str) -> Result<()> {
 
 fn configured_merge_drivers(dir: &Path) -> Result<RefusedDrivers> {
     use thegn_proc::{End, Leader, Limits, Stream};
-    let mut command = util::git_cmd(dir);
+    let mut command = git_fence::cmd(dir);
     command.args(["config", "--null", "--get-regexp", r"^merge\."]);
     let limits = Limits {
         stdout: Stream::HeadOrFail { cap: 64 * 1024 },
         stderr: Stream::Tail { cap: 4096 },
         ..Limits::silent(Duration::from_secs(30))
     };
+    thegn_core::util::note_core_git_spawn();
     let result = thegn_proc::run(&mut command, &limits, &AtomicBool::new(false));
     match (&result.end, &result.leader) {
         (End::LeaderExited, Leader::Reaped(status)) if status.success() => {
@@ -123,6 +124,8 @@ mod persistence;
 pub(crate) use persistence::run_selected_fold;
 #[cfg(test)]
 use persistence::{observe_outcomes, persist};
+#[path = "integrate_git_fence.rs"]
+mod git_fence;
 #[path = "integrate_rerere.rs"]
 mod rerere;
 pub(crate) use rerere::cache_status as rerere_cache_status;
@@ -563,7 +566,7 @@ fn configured_conflict_drivers(
     if paths.is_empty() {
         return Ok(BTreeMap::new());
     }
-    let mut command = util::git_cmd(repo_root);
+    let mut command = git_fence::cmd(repo_root);
     command
         .args(["check-attr", "-z", "merge", "--"])
         .args(paths);
@@ -572,6 +575,7 @@ fn configured_conflict_drivers(
         stderr: Stream::Tail { cap: 4096 },
         ..Limits::silent(Duration::from_secs(30))
     };
+    thegn_core::util::note_core_git_spawn();
     let result = thegn_proc::run(&mut command, &limits, &AtomicBool::new(false));
     anyhow::ensure!(
         matches!((&result.end, &result.leader), (End::LeaderExited, Leader::Reaped(status)) if status.success()),
@@ -640,7 +644,7 @@ fn driver_merge(
     let tmp = scratch.path().to_path_buf();
     let tmp_s = tmp.to_string_lossy().to_string();
     if scratch.verify().is_err()
-        || !util::git_ok(repo_root, &["worktree", "add", "--detach", &tmp_s, ours])
+        || !git_fence::ok(repo_root, &["worktree", "add", "--detach", &tmp_s, ours])
     {
         cleanup_failed_scratch_add(repo_root, scratch);
         return None;
@@ -690,7 +694,7 @@ fn driver_merge(
         }
         // Reject a pre-existing or foreign merge state before trusting the index.
         scratch.verify().ok()?;
-        let merge_head = util::git_out_allow_empty(&tmp, &["rev-parse", "--verify", "MERGE_HEAD"]);
+        let merge_head = git_fence::out_allow_empty(&tmp, &["rev-parse", "--verify", "MERGE_HEAD"]);
         if merge_head.as_deref() != Some(theirs) {
             warn_driver_merge_failure(
                 "merge did not establish the expected MERGE_HEAD",
@@ -713,7 +717,7 @@ fn driver_merge(
                 warn_driver_merge_failure("private rerere left unresolved paths", &remaining);
                 return None;
             }
-            let unmerged = util::git_out_allow_empty(&tmp, &["ls-files", "-u", "-z"])?;
+            let unmerged = git_fence::out_allow_empty(&tmp, &["ls-files", "-u", "-z"])?;
             let mut paths = std::collections::BTreeSet::new();
             for record in unmerged.split('\0').filter(|record| !record.is_empty()) {
                 let (_, path) = record.split_once('\t')?;
@@ -725,7 +729,7 @@ fn driver_merge(
             let paths: Vec<&str> = paths.into_iter().collect();
             let mut add_args = vec!["--literal-pathspecs", "add", "--"];
             add_args.extend(paths.iter().copied());
-            if !paths.is_empty() && !util::git_ok(&tmp, &add_args) {
+            if !paths.is_empty() && !git_fence::ok(&tmp, &add_args) {
                 warn_driver_merge_failure("could not stage rerere paths", &paths.join("\n"));
                 return None;
             }
@@ -739,14 +743,14 @@ fn driver_merge(
                 "--",
             ];
             check_args.extend(paths.iter().copied());
-            if !util::git_ok(&tmp, &check_args) {
+            if !git_fence::ok(&tmp, &check_args) {
                 warn_driver_merge_failure("rerere conflict-marker check failed", &paths.join("\n"));
                 return None;
             }
         }
         // Any remaining unmerged path means we couldn't resolve it here → defer.
         scratch.verify().ok()?;
-        let Some(unmerged) = util::git_out_allow_empty(&tmp, &["ls-files", "-u"]) else {
+        let Some(unmerged) = git_fence::out_allow_empty(&tmp, &["ls-files", "-u"]) else {
             warn_driver_merge_failure(
                 "could not inspect unmerged index entries",
                 "git ls-files -u failed",
@@ -758,7 +762,7 @@ fn driver_merge(
             return None;
         }
         scratch.verify().ok()?;
-        let tree = util::git_out(&tmp, &["write-tree"])?;
+        let tree = git_fence::out(&tmp, &["write-tree"])?;
         let tree = tree.trim().to_string();
         if !tree_changes_confined(&tmp, conflict_tree, &tree, approved_paths) {
             warn_driver_merge_failure(
@@ -785,7 +789,7 @@ fn driver_merge(
 fn run_driver_merge(dir: &Path, args: &[&str], timeout: Duration) -> DriverRun {
     use std::process::Stdio;
 
-    let mut command = util::git_cmd(dir);
+    let mut command = git_fence::cmd(dir);
     command
         .args(args)
         // `git -C` changes Git's repository context but leaves the process
@@ -794,6 +798,7 @@ fn run_driver_merge(dir: &Path, args: &[&str], timeout: Duration) -> DriverRun {
         .current_dir(dir)
         .stdin(Stdio::null())
         .env("GIT_TERMINAL_PROMPT", "0");
+    thegn_core::util::note_core_git_spawn();
     run_driver_command(command, timeout)
 }
 
@@ -869,7 +874,7 @@ fn regenerate_merge(
     let tmp = scratch.path().to_path_buf();
     let tmp_s = tmp.to_string_lossy().to_string();
     if scratch.verify().is_err()
-        || !util::git_ok(repo_root, &["worktree", "add", "--detach", &tmp_s, ours])
+        || !git_fence::ok(repo_root, &["worktree", "add", "--detach", &tmp_s, ours])
     {
         cleanup_failed_scratch_add(repo_root, scratch);
         return None;
@@ -921,7 +926,7 @@ fn regenerate_merge(
             return None;
         }
         scratch.verify().ok()?;
-        let merge_head = util::git_out_allow_empty(&tmp, &["rev-parse", "--verify", "MERGE_HEAD"]);
+        let merge_head = git_fence::out_allow_empty(&tmp, &["rev-parse", "--verify", "MERGE_HEAD"]);
         if merge_head.as_deref() != Some(theirs) {
             warn_driver_merge_failure(
                 "regeneration merge did not establish the expected MERGE_HEAD",
@@ -933,7 +938,8 @@ fn regenerate_merge(
         // (not conflict-marked), then the regen command reconciles it.
         for p in conflict_paths {
             scratch.verify().ok()?;
-            let _ = util::git_cmd(&tmp) // best-effort: regenerate paths are rewritten below; the unmerged check catches the rest
+            thegn_core::util::note_core_git_spawn();
+            let _ = git_fence::cmd(&tmp) // best-effort: regenerate paths are rewritten below; the unmerged check catches the rest
                 .args(["checkout", "--theirs", "--", p])
                 .output();
         }
@@ -941,15 +947,16 @@ fn regenerate_merge(
         // merge baseline before running the configured command.
         let mut add_args = vec!["--literal-pathspecs", "add", "--"];
         add_args.extend(conflict_paths.iter().map(String::as_str));
-        let staged = util::git_cmd(&tmp).args(&add_args).output().ok()?;
+        thegn_core::util::note_core_git_spawn();
+        let staged = git_fence::cmd(&tmp).args(&add_args).output().ok()?;
         if !staged.status.success() {
             return None;
         }
         scratch.verify().ok()?;
-        if !util::git_out_allow_empty(&tmp, &["ls-files", "-u"])?.is_empty() {
+        if !git_fence::out_allow_empty(&tmp, &["ls-files", "-u"])?.is_empty() {
             return None;
         }
-        let baseline_tree = util::git_out(&tmp, &["write-tree"])?;
+        let baseline_tree = git_fence::out(&tmp, &["write-tree"])?;
         // Rebuild the regenerate artifacts from the merged manifests.
         scratch.verify().ok()?;
         use std::process::Stdio;
@@ -984,7 +991,8 @@ fn regenerate_merge(
             return None;
         }
         scratch.verify().ok()?;
-        let staged = util::git_cmd(&tmp).args(&add_args).output().ok()?;
+        thegn_core::util::note_core_git_spawn();
+        let staged = git_fence::cmd(&tmp).args(&add_args).output().ok()?;
         if !staged.status.success() {
             return None;
         }
@@ -994,7 +1002,8 @@ fn regenerate_merge(
         scratch.verify().ok()?;
         // With -z, rename records include a second NUL field containing only
         // the old path. Disable rename detection so every field has a status.
-        let status = util::git_cmd(&tmp)
+        thegn_core::util::note_core_git_spawn();
+        let status = git_fence::cmd(&tmp)
             .args([
                 "status",
                 "--porcelain=v1",
@@ -1024,12 +1033,12 @@ fn regenerate_merge(
         }
         // Bail if any path is still unmerged — we only handle regenerable cases.
         scratch.verify().ok()?;
-        let unmerged = util::git_out_allow_empty(&tmp, &["ls-files", "-u"])?;
+        let unmerged = git_fence::out_allow_empty(&tmp, &["ls-files", "-u"])?;
         if !unmerged.is_empty() {
             return None;
         }
         scratch.verify().ok()?;
-        let tree = util::git_out(&tmp, &["write-tree"])?;
+        let tree = git_fence::out(&tmp, &["write-tree"])?;
         let tree = tree.trim().to_string();
         if !tree_changes_confined(&tmp, &baseline_tree, &tree, conflict_paths) {
             return None;
@@ -1052,7 +1061,8 @@ fn regenerate_merge(
 /// Any invalid tree or failed Git probe rejects the result.
 #[expect(clippy::disallowed_methods)]
 fn tree_changes_confined(dir: &Path, baseline_tree: &str, tree: &str, approved: &[String]) -> bool {
-    let diff = util::git_cmd(dir)
+    thegn_core::util::note_core_git_spawn();
+    let diff = git_fence::cmd(dir)
         .args([
             "diff-tree",
             "--no-commit-id",
@@ -6011,7 +6021,9 @@ mod tests {
             return;
         }
         repo.feature("feature", "feature.txt", "feature\n");
-        let ours = repo.out(&["rev-parse", "main"]);
+        // Keep the add failure independent of hooks: the fence disables hooks,
+        // but Git must still reject a nonexistent commit as the worktree target.
+        let ours = "missing-driver-merge-target";
         let theirs = repo.out(&["rev-parse", "feature"]);
         let tree = repo.out(&["rev-parse", "main^{tree}"]);
         install_failing_post_checkout(&repo);
@@ -6019,7 +6031,7 @@ mod tests {
         assert!(
             driver_merge(
                 &repo.dir,
-                &ours,
+                ours,
                 &theirs,
                 &tree,
                 &[],
@@ -6031,7 +6043,7 @@ mod tests {
             )
             .is_none()
         );
-        assert!(repo.dir.join(".git/post-checkout-marker").is_file());
+        assert!(!repo.dir.join(".git/post-checkout-marker").exists());
         assert!(
             !repo
                 .out(&["worktree", "list", "--porcelain"])
