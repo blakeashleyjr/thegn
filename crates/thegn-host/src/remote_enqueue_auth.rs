@@ -166,6 +166,19 @@ fn revoke_worktree_grants(
     Ok(ids.len())
 }
 
+fn retire_other_grants(
+    store: &dyn ControlStore,
+    worktree: &str,
+    owner: &str,
+    legacy_label: Option<&str>,
+    except_pairing_id: &str,
+    at_ms: i64,
+) -> Result<usize> {
+    let mut retired = revoke_worktree_grants(store, worktree, Some(except_pairing_id), at_ms)?;
+    retired += revoke_owner_label(store, owner, legacy_label, Some(except_pairing_id), at_ms)?;
+    Ok(retired)
+}
+
 fn revoke_owner(
     store: &dyn ControlStore,
     provider: &EnvProviderConfig,
@@ -324,16 +337,22 @@ fn rotate_verified(
     read_back: impl FnOnce() -> Result<Option<(String, String)>>,
     retire_others: impl FnOnce(&str) -> Result<usize>,
 ) -> Result<()> {
-    let verification = install(&credential).and_then(|()| {
-        let installed = read_back()?;
-        anyhow::ensure!(
-            installed.as_ref().is_some_and(|(origin, token)| {
-                origin == &credential.origin && token == &credential.token
-            }),
-            "route-to-host credential read-back did not match the installed generation"
-        );
-        Ok(())
-    });
+    // If installation partially or fully overwrites the remote file before
+    // failing, the old DB grants remain valid but the remote may hold the new
+    // revoked token or garbage. Enqueue can remain unavailable until the next
+    // successful reconcile; remote generations/CAS are outside this slice.
+    let verification = install(&credential)
+        .context("install route-to-host credential")
+        .and_then(|()| {
+            let installed = read_back().context("read back route-to-host credential")?;
+            anyhow::ensure!(
+                installed.as_ref().is_some_and(|(origin, token)| {
+                    origin == &credential.origin && token == &credential.token
+                }),
+                "route-to-host credential read-back did not match the installed generation"
+            );
+            Ok(())
+        });
     if let Err(error) = verification {
         if let Err(revoke_error) = store.revoke_pairing(&credential.pairing_id, now_ms()) {
             return Err(anyhow::anyhow!(
@@ -342,7 +361,7 @@ fn rotate_verified(
         }
         return Err(error);
     }
-    retire_others(&credential.pairing_id)?;
+    retire_others(&credential.pairing_id).context("retire superseded route-to-host grants")?;
     Ok(())
 }
 
@@ -489,11 +508,14 @@ pub(crate) fn reconcile_provider_credential(
         |credential| install_credential(provider, sandbox_id, worktree, credential),
         || read_provider_credential(provider, sandbox_id, worktree),
         |except_pairing_id| {
-            let mut retired =
-                revoke_worktree_grants(&db, worktree, Some(except_pairing_id), at_ms)?;
-            retired +=
-                revoke_owner_label(&db, &owner, Some(&legacy), Some(except_pairing_id), at_ms)?;
-            Ok(retired)
+            retire_other_grants(
+                &db,
+                worktree,
+                &owner,
+                Some(&legacy),
+                except_pairing_id,
+                at_ms,
+            )
         },
     )
 }
@@ -699,10 +721,7 @@ pub(crate) fn reconcile_ssh_credential(
         |credential| install_ssh_credential(target, worktree, credential),
         || read_ssh_credential(target, worktree),
         |except_pairing_id| {
-            let mut retired =
-                revoke_worktree_grants(&db, worktree, Some(except_pairing_id), at_ms)?;
-            retired += revoke_owner_label(&db, &owner, None, Some(except_pairing_id), at_ms)?;
-            Ok(retired)
+            retire_other_grants(&db, worktree, &owner, None, except_pairing_id, at_ms)
         },
     )
 }
@@ -972,16 +991,14 @@ mod tests {
             |_| Ok(()),
             || Ok(Some((second_origin, second_token.clone()))),
             |except_pairing_id| {
-                let retired =
-                    revoke_worktree_grants(&db, "/remote/a", Some(except_pairing_id), at_ms + 4)?;
-                Ok(retired
-                    + revoke_owner_label(
-                        &db,
-                        &provider_owner_label(&provider, "sandbox-a"),
-                        Some("route-to-host:legacy"),
-                        Some(except_pairing_id),
-                        at_ms + 4,
-                    )?)
+                retire_other_grants(
+                    &db,
+                    "/remote/a",
+                    &provider_owner_label(&provider, "sandbox-a"),
+                    Some("route-to-host:legacy"),
+                    except_pairing_id,
+                    at_ms + 4,
+                )
             },
         )
         .unwrap();
@@ -1078,10 +1095,7 @@ mod tests {
             |_| Ok(()),
             || Ok(Some((new_origin, new_token.clone()))),
             |except_pairing_id| {
-                let retired =
-                    revoke_worktree_grants(&db, "/remote/a", Some(except_pairing_id), at_ms + 4)?;
-                Ok(retired
-                    + revoke_owner_label(&db, &owner, None, Some(except_pairing_id), at_ms + 4)?)
+                retire_other_grants(&db, "/remote/a", &owner, None, except_pairing_id, at_ms + 4)
             },
         )
         .unwrap();
@@ -1179,16 +1193,14 @@ mod tests {
             |_| Ok(()),
             || Ok(Some((replacement_origin, replacement_token.clone()))),
             |except_pairing_id| {
-                let retired =
-                    revoke_worktree_grants(&db, "/remote/a", Some(except_pairing_id), at_ms + 3)?;
-                Ok(retired
-                    + revoke_owner_label(
-                        &db,
-                        &provider_owner_label(&new_account, "same-id"),
-                        Some("route-to-host:legacy"),
-                        Some(except_pairing_id),
-                        at_ms + 3,
-                    )?)
+                retire_other_grants(
+                    &db,
+                    "/remote/a",
+                    &provider_owner_label(&new_account, "same-id"),
+                    Some("route-to-host:legacy"),
+                    except_pairing_id,
+                    at_ms + 3,
+                )
             },
         )
         .unwrap();
