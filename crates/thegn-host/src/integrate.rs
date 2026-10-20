@@ -6031,7 +6031,7 @@ mod tests {
         assert!(
             driver_merge(
                 &repo.dir,
-                &ours,
+                ours,
                 &theirs,
                 &tree,
                 &[],
