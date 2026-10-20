@@ -572,12 +572,21 @@ pub trait GitBackend: thegn_core::seam::Probe + Send + Sync {
         thegn_core::gitrefs::parse_stashes(&out)
     }
 
-    /// The last `n` HEAD reflog entries (the undo planner's feed).
+    /// The last `n` HEAD reflog entries (the undo planner's feed). Disable
+    /// signature display because `log.showSignature` can otherwise prepend
+    /// verifier output to the NUL-framed records.
     fn reflog(&self, loc: &GitLoc, n: usize) -> Result<Vec<ReflogEntry>> {
         let n = n.to_string();
         let out = run(
             loc,
-            &["reflog", "-z", "--format=%H%x00%gd%x00%ct%x00%gs", "-n", &n],
+            &[
+                "reflog",
+                "-z",
+                "--no-show-signature",
+                "--format=%H%x00%gd%x00%ct%x00%gs",
+                "-n",
+                &n,
+            ],
         )?;
         thegn_core::reflog::parse_reflog(&out)
     }
@@ -2732,6 +2741,7 @@ mod tests {
     fn reflog_reads_nul_framed_entries_from_a_real_repo() {
         let dir = tempfile::tempdir().unwrap();
         testutil::git_in(dir.path(), &["init", "-q", "-b", "main"]);
+        testutil::git_in(dir.path(), &["config", "log.showSignature", "true"]);
         std::fs::write(dir.path().join("tracked.txt"), "first\n").unwrap();
         testutil::git_in(dir.path(), &["add", "--", "tracked.txt"]);
         testutil::git_in(
@@ -2757,6 +2767,13 @@ mod tests {
             entries
                 .iter()
                 .all(|entry| { entry.action == thegn_core::reflog::ReflogAction::Commit })
+        );
+        assert_eq!(
+            thegn_core::reflog::plan_undo(&entries, &thegn_core::reflog::OurMarks::default()),
+            thegn_core::reflog::UndoPlan::HardResetTo {
+                sha: previous.trim().to_string(),
+                undoing: "commit: second".to_string(),
+            }
         );
     }
 

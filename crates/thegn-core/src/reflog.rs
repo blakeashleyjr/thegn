@@ -2,7 +2,8 @@
 //! entry as a user action, then walk newest→oldest with a bracket counter so
 //! resets *we* issued cancel out instead of being undone themselves.
 //!
-//! Pure — the host runs `git reflog -z --format=%H%x00%gd%x00%ct%x00%gs -n 100`
+//! Pure — the host runs `git reflog -z --no-show-signature
+//! --format=%H%x00%gd%x00%ct%x00%gs -n 100`
 //! off-thread and persists the target of every reset it performs (undo *and*
 //! redo) in [`OurMarks`] (SQLite at the call site). Lazygit tags its resets
 //! with distinct `[lazygit undo]`/`[lazygit redo]` reflog markers; our marks
@@ -144,7 +145,7 @@ pub fn parse_reflog(out: &str) -> anyhow::Result<Vec<ReflogEntry>> {
     let fields: Vec<&str> = out[..out.len() - 1].split('\0').collect();
     anyhow::ensure!(
         fields.len().is_multiple_of(4),
-        "reflog record {}: expected four fields, found {}",
+        "reflog trailing record {} has {} of 4 fields",
         fields.len() / 4,
         fields.len() % 4
     );
@@ -172,11 +173,11 @@ pub fn parse_reflog(out: &str) -> anyhow::Result<Vec<ReflogEntry>> {
             anyhow::anyhow!("reflog record {record_index}: invalid timestamp: {error}")
         })?;
         entries.push(ReflogEntry {
-            sha: (*sha).to_string(),
-            selector: (*selector).to_string(),
+            sha: sha.to_string(),
+            selector: selector.to_string(),
             date,
             action: classify(raw),
-            raw: (*raw).to_string(),
+            raw: raw.to_string(),
         });
     }
     Ok(entries)
@@ -481,7 +482,10 @@ mod tests {
 
         let appended_bad_error = parse_reflog(bad_records.last().unwrap())
             .expect_err("a later malformed row must reject the complete history");
-        assert!(appended_bad_error.to_string().contains("record 1"));
+        assert_eq!(
+            appended_bad_error.to_string(),
+            "reflog trailing record 1 has 3 of 4 fields"
+        );
 
         for out in bad_records {
             let error =
