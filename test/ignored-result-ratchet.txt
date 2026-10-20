@@ -350,7 +350,6 @@ crates/thegn-svc/src/control/tests.rs
 crates/thegn-svc/src/fly/mod.rs
 crates/thegn-svc/src/git/branch.rs
 crates/thegn-svc/src/git/mod.rs
-crates/thegn-svc/src/git/patch.rs
 crates/thegn-svc/src/git/undo.rs
 crates/thegn-svc/src/host/cloud.rs
 crates/thegn-svc/src/host/deliver.rs

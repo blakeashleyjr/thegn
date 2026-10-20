@@ -7,7 +7,7 @@
 
 use super::rebase::{RebaseOps, RebaseOpts, RebaseOutcome};
 use super::{GitBackend, gpg_args, run_stdin, run_w};
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail};
 use thegn_core::rebase_todo::TodoAction;
 use thegn_core::remote::GitLoc;
 
@@ -26,8 +26,13 @@ fn with_edit_stop(
     }
     if let Err(e) = at_stop(loc) {
         // Leave nothing half-applied: a failed stop action aborts the rebase.
-        let _ = backend.rebase_abort(loc); // best-effort: abort may itself fail; the primary error is returned below
-        return Err(e);
+        return match backend.rebase_abort(loc) {
+            Ok(()) => Err(e),
+            Err(abort) => Err(e.context(format!(
+                "rebase --abort also failed ({abort}); the repository is still mid-rebase at the edit stop: run `git rebase --abort` in {}",
+                loc.path()
+            ))),
+        };
     }
     backend.rebase_continue(loc)
 }
@@ -127,6 +132,9 @@ pub trait PatchOps: GitBackend {
             &[],
             &["apply", "--index", "--3way", "--whitespace=nowarn", "-"],
             patch.as_bytes(),
+        )
+        .context(
+            "the patch was removed from the commit but could not be re-applied to the index; undo with `z` (reflog) to restore the commit",
         )?;
         Ok(RebaseOutcome::Done)
     }
@@ -270,5 +278,29 @@ mod tests {
         assert!(CliGit.rebase_status(&r.loc()).unwrap().is_none());
         assert_eq!(r.head(), old_head);
         assert_eq!(r.out(&["status", "--porcelain"]), "");
+    }
+
+    #[test]
+    fn failed_abort_after_failed_stop_action_is_reported() {
+        let r = fixture("abort-fails");
+        let loc = r.loc();
+        let c2 = r.sha_of("c2");
+        let lock = r.dir.join(".git/index.lock");
+        let err = with_edit_stop(&loc, &CliGit, &c2, &opts(), |_| {
+            std::fs::write(&lock, b"locked").unwrap();
+            anyhow::bail!("stop action failed")
+        })
+        .unwrap_err();
+
+        let detail = format!("{err:#}");
+        assert!(detail.contains("stop action failed"), "{detail}");
+        assert!(detail.contains("rebase --abort also failed"), "{detail}");
+        assert!(
+            detail.contains("still mid-rebase at the edit stop"),
+            "{detail}"
+        );
+
+        std::fs::remove_file(lock).unwrap();
+        CliGit.rebase_abort(&loc).unwrap();
     }
 }
