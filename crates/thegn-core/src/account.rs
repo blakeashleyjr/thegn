@@ -646,6 +646,7 @@ mod tests {
 
     #[test]
     fn account_dir_prefers_config_then_db() {
+        let _state = crate::testenv::IsolatedState::new();
         let db = Db::open_memory().unwrap();
         let mut cfg = Config::default();
         cfg.accounts.push(Account {
@@ -1187,9 +1188,15 @@ mod tests {
 
     #[test]
     fn managed_home_refuses_a_foreign_manifest() {
-        let _state = crate::testenv::IsolatedState::new();
-        let home = managed_dir("claude", "primary");
-        std::fs::create_dir_all(&home).unwrap();
+        let state = crate::testenv::IsolatedState::new();
+        let anchor = state.state_home().join("thegn");
+        std::fs::create_dir_all(&anchor).unwrap();
+        let private = crate::fsperm::ensure_private_dir_beneath(
+            &anchor,
+            Path::new("accounts/claude/primary"),
+        )
+        .unwrap();
+        let home = private.path().to_path_buf();
         std::fs::write(home.join(OWNER_MANIFEST), owner_manifest("claude", "other")).unwrap();
         assert!(matches!(
             ensure_managed_home("claude", "primary"),
@@ -1200,9 +1207,13 @@ mod tests {
 
     #[test]
     fn managed_home_refuses_a_malformed_manifest() {
-        let _state = crate::testenv::IsolatedState::new();
-        let home = managed_dir("codex", "primary");
-        std::fs::create_dir_all(&home).unwrap();
+        let state = crate::testenv::IsolatedState::new();
+        let anchor = state.state_home().join("thegn");
+        std::fs::create_dir_all(&anchor).unwrap();
+        let private =
+            crate::fsperm::ensure_private_dir_beneath(&anchor, Path::new("accounts/codex/primary"))
+                .unwrap();
+        let home = private.path();
         std::fs::write(home.join(OWNER_MANIFEST), b"not an owner record\n").unwrap();
         assert!(matches!(
             ensure_managed_home("codex", "primary"),
@@ -1215,10 +1226,14 @@ mod tests {
     fn managed_home_refuses_a_symlinked_manifest() {
         use std::os::unix::fs::symlink;
 
-        let _state = crate::testenv::IsolatedState::new();
-        let home = managed_dir("codex", "primary");
-        std::fs::create_dir_all(&home).unwrap();
-        let outside = _state.root().join("outside-manifest");
+        let state = crate::testenv::IsolatedState::new();
+        let anchor = state.state_home().join("thegn");
+        std::fs::create_dir_all(&anchor).unwrap();
+        let private =
+            crate::fsperm::ensure_private_dir_beneath(&anchor, Path::new("accounts/codex/primary"))
+                .unwrap();
+        let home = private.path();
+        let outside = state.root().join("outside-manifest");
         std::fs::write(&outside, owner_manifest("codex", "primary")).unwrap();
         symlink(&outside, home.join(OWNER_MANIFEST)).unwrap();
         assert!(matches!(
@@ -1238,7 +1253,12 @@ mod tests {
 
         let state = crate::testenv::IsolatedState::new();
         let account_root = state.state_home().join("thegn/accounts");
-        std::fs::create_dir_all(&account_root).unwrap();
+        std::fs::create_dir_all(state.state_home().join("thegn")).unwrap();
+        crate::fsperm::ensure_private_dir_beneath(
+            &state.state_home().join("thegn"),
+            Path::new("accounts"),
+        )
+        .unwrap();
         let outside = state.root().join("outside-provider");
         std::fs::create_dir(&outside).unwrap();
         symlink(&outside, account_root.join("claude")).unwrap();
@@ -1262,10 +1282,14 @@ mod tests {
 
     #[test]
     fn account_dir_refuses_a_managed_home_that_fails_verification() {
-        let _state = crate::testenv::IsolatedState::new();
+        let state = crate::testenv::IsolatedState::new();
         let db = Db::open_memory().unwrap();
-        let home = managed_dir("codex", "primary");
-        std::fs::create_dir_all(&home).unwrap();
+        let anchor = state.state_home().join("thegn");
+        std::fs::create_dir_all(&anchor).unwrap();
+        let private =
+            crate::fsperm::ensure_private_dir_beneath(&anchor, Path::new("accounts/codex/primary"))
+                .unwrap();
+        let home = private.path().to_path_buf();
         std::fs::write(
             home.join(OWNER_MANIFEST),
             owner_manifest("codex", "someone-else"),
