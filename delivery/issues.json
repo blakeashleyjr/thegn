@@ -332,13 +332,6 @@
       ]
     },
     {
-      "issue": "THE-219",
-      "project": "Runtime Security & Host Architecture",
-      "changes": [
-        "preserve-merge-drain-diagnostics"
-      ]
-    },
-    {
       "issue": "THE-286",
       "project": "Alpha Reliability & State Compatibility",
       "changes": [
@@ -429,13 +422,6 @@
       ]
     },
     {
-      "issue": "THE-586",
-      "project": "Spec & Tracker Reconciliation",
-      "changes": [
-        "preserve-config-validation-severity"
-      ]
-    },
-    {
       "issue": "THE-588",
       "project": "Runtime Security & Host Architecture",
       "changes": [
@@ -471,31 +457,10 @@
       ]
     },
     {
-      "issue": "THE-597",
-      "project": "Runtime Security & Host Architecture",
-      "changes": [
-        "verify-gate-workspace"
-      ]
-    },
-    {
       "issue": "THE-600",
       "project": "Runtime Security & Host Architecture",
       "changes": [
         "safe-merged-worktree-cleanup"
-      ]
-    },
-    {
-      "issue": "THE-608",
-      "project": "Runtime Security & Host Architecture",
-      "changes": [
-        "preserve-merge-drain-diagnostics"
-      ]
-    },
-    {
-      "issue": "THE-610",
-      "project": "Runtime Security & Host Architecture",
-      "changes": [
-        "preserve-merge-drain-diagnostics"
       ]
     },
     {
@@ -555,24 +520,10 @@
       ]
     },
     {
-      "issue": "THE-628",
-      "project": "Workspace Product & Observability",
-      "changes": [
-        "stabilize-process-monitor-refresh"
-      ]
-    },
-    {
       "issue": "THE-634",
       "project": "Runtime Security & Host Architecture",
       "changes": [
         "authenticate-pr-agent-authorship"
-      ]
-    },
-    {
-      "issue": "THE-640",
-      "project": "Workspace Product & Observability",
-      "changes": [
-        "stabilize-process-monitor-refresh"
       ]
     },
     {
