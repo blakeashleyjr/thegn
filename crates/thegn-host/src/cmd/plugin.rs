@@ -164,7 +164,9 @@ fn list_row(admitted: &AdmittedPlugin) -> PluginListRow {
     let plugin = &admitted.plugin;
     let native_trust = plugin.spec.native_trust();
     let trust = native_trust.status_token();
-    let status = negotiation_status(&admitted.decision);
+    let status = thegn_svc::plugin::loader::native_trust_refusal(plugin)
+        .map(|problem| problem.problem)
+        .unwrap_or_else(|| negotiation_status(&admitted.decision));
     let status = if plugin.trusted_native_ignored {
         format!("{status}; trusted_native in plugin.toml ignored")
     } else {
