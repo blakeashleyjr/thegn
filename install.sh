@@ -133,92 +133,10 @@ sha256() {
   elif command -v shasum >/dev/null 2>&1; then
     output="$(shasum -a 256 "$1")"
   else
-    echo "install.sh: sha256sum or shasum is required to validate the ownership manifest" >&2
+    echo "install.sh: sha256sum or shasum is required to write the install manifest" >&2
     return 1
   fi
   printf '%s\n' "${output%% *}"
-}
-
-validate_manifest() {
-  local header digest path extra expected
-  local found_thegn=0 found_tg_tui=0 found_tg=0 found_icon=0 found_desktop=0
-  [[ -e $manifest_file || -L $manifest_file ]] || return 0
-  check_file_shape "$manifest_file"
-  if [[ -L $manifest_file || ! -f $manifest_file ]]; then
-    report_conflict "$manifest_file" "is not a readable ownership manifest"
-    return 1
-  fi
-  exec 3<"$manifest_file"
-  if ! IFS= read -r header <&3; then
-    report_conflict "$manifest_file" "is not a readable ownership manifest"
-    return 1
-  fi
-  if [[ $header != 'thegn-install-manifest 1' ]]; then
-    report_conflict "$manifest_file" "has an unsupported ownership manifest"
-    return 1
-  fi
-  while IFS=$'\t' read -r digest path extra || [[ -n ${digest-}${path-}${extra-} ]]; do
-    [[ -n ${digest-} && -n ${path-} && -z ${extra-} && $digest =~ ^[0-9a-f]{64}$ && $path == /* ]] || {
-      report_conflict "$manifest_file" "contains an invalid ownership record"
-      return 1
-    }
-    case "$path" in
-    "$bindir/thegn")
-      if ((found_thegn)); then
-        report_conflict "$manifest_file" "contains a duplicate ownership path"
-        return 1
-      fi
-      expected="$bindir/thegn"
-      found_thegn=1
-      ;;
-    "$tg_tui")
-      if ((found_tg_tui)); then
-        report_conflict "$manifest_file" "contains a duplicate ownership path"
-        return 1
-      fi
-      expected="$tg_tui"
-      found_tg_tui=1
-      ;;
-    "$bindir/tg")
-      if ((found_tg)); then
-        report_conflict "$manifest_file" "contains a duplicate ownership path"
-        return 1
-      fi
-      expected="$bindir/tg"
-      found_tg=1
-      ;;
-    "$icon_file")
-      if ((!desktop_integration)) || ((found_icon)); then
-        report_conflict "$manifest_file" "contains an invalid or duplicate ownership path"
-        return 1
-      fi
-      expected="$icon_file"
-      found_icon=1
-      ;;
-    "$desktop_file")
-      if ((!desktop_integration)) || ((found_desktop)); then
-        report_conflict "$manifest_file" "contains an invalid or duplicate ownership path"
-        return 1
-      fi
-      expected="$desktop_file"
-      found_desktop=1
-      ;;
-    *)
-      report_conflict "$manifest_file" "claims an unexpected path: $path"
-      return 1
-      ;;
-    esac
-    if [[ $path != "$expected" || ! -f $path || -L $path ]] || [[ $(sha256 "$path") != "$digest" ]]; then
-      report_conflict "$path" "does not match the ownership manifest"
-      return 1
-    fi
-  done <&3
-  if [[ -e $bindir/thegn && $found_thegn == 0 ]] || [[ -e $tg_tui && $found_tg_tui == 0 ]] ||
-    [[ -e $bindir/tg && $found_tg == 0 ]] ||
-    ((desktop_integration)) && { [[ -e $icon_file && $found_icon == 0 ]] || [[ -e $desktop_file && $found_desktop == 0 ]]; }; then
-    report_conflict "$manifest_file" "does not cover every installed artifact"
-    return 1
-  fi
 }
 
 preflight() {
@@ -280,7 +198,6 @@ preflight() {
   fi
 
   check_file_shape "$config_file"
-  validate_manifest || preflight_conflict=1
 }
 
 preflight
@@ -316,14 +233,36 @@ if ! mkdir "$install_lock" 2>/dev/null; then
     echo "install.sh: another install is running (pid $lock_pid); lock $install_lock" >&2
     exit 1
   fi
+  if [[ ! -e $install_lock/pid ]]; then
+    if stat -c %Y "$install_lock" >/dev/null 2>&1; then
+      lock_mtime="$(stat -c %Y "$install_lock")"
+    else
+      lock_mtime="$(stat -f %m "$install_lock")"
+    fi
+    lock_age=$(($(date +%s) - lock_mtime))
+    if ((lock_age <= 10)); then
+      echo "install.sh: another install is starting; lock $install_lock" >&2
+      exit 1
+    fi
+  fi
   rm -rf -- "$install_lock"
   if ! mkdir "$install_lock" 2>/dev/null; then
     echo "install.sh: could not reclaim install lock $install_lock" >&2
     exit 1
   fi
 fi
-trap 'rm -rf -- "$install_lock"' EXIT
-printf '%s\n' "$$" >"$install_lock/pid"
+remove_install_lock() {
+  local lock_pid=""
+  if [[ -f $install_lock/pid ]]; then
+    IFS= read -r lock_pid <"$install_lock/pid" || true
+  fi
+  if [[ $lock_pid == "$$" ]]; then
+    rm -rf -- "$install_lock"
+  fi
+}
+trap remove_install_lock EXIT
+printf '%s\n' "$$" >"$install_lock/pid.tmp"
+mv -f -- "$install_lock/pid.tmp" "$install_lock/pid"
 
 preflight
 if ((preflight_conflict)); then
@@ -365,7 +304,7 @@ cleanup_install() {
   if ((${#staged_files[@]} > 0)); then
     rm -f -- "${staged_files[@]}"
   fi
-  rm -rf -- "$install_lock"
+  remove_install_lock
   return "$status"
 }
 trap cleanup_install EXIT
