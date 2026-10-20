@@ -207,7 +207,7 @@ pub fn parse_droplet_list(v: &serde_json::Value) -> Vec<VpsInstance> {
 /// Parse one strict Droplet inventory page. Errors mention row indexes only;
 /// provider row contents may contain addresses or other sensitive data.
 pub fn parse_server_page(v: &serde_json::Value, page: u32) -> Result<InventoryPage<VpsInstance>> {
-    parse_inventory_page(v, page, "droplets", parse_droplet)
+    parse_inventory_page(v, "droplets", parse_droplet)
 }
 
 /// Parse one strict SSH-key inventory page.
@@ -241,7 +241,6 @@ pub fn parse_ssh_key_page(
 
 fn parse_inventory_page<T>(
     v: &serde_json::Value,
-    _page: u32,
     array_name: &str,
     parse_row: fn(&serde_json::Value) -> Option<T>,
 ) -> Result<InventoryPage<T>> {
@@ -387,6 +386,18 @@ mod tests {
         let malformed = droplet_page(serde_json::json!([{"bogus": true}]), true, 1);
         assert!(parse_server_page(&malformed, 1).is_err());
         assert!(parse_server_page(&serde_json::json!({"droplets": []}), 1).is_err());
+        let missing_droplets = serde_json::json!({"meta": {"total": 0}});
+        assert!(parse_server_page(&missing_droplets, 1).is_err());
+    }
+
+    #[test]
+    fn strict_ssh_key_pages_reject_missing_and_malformed_rows() {
+        let page = serde_json::json!({"meta": {"total": 0}});
+        assert!(parse_ssh_key_page(&page, 1).is_err());
+
+        let malformed = serde_json::json!({"ssh_keys": [{"id": "not-an-id", "public_key": "ssh-ed25519 AAA"}],
+            "meta": {"total": 1}});
+        assert!(parse_ssh_key_page(&malformed, 1).is_err());
     }
 
     #[test]
