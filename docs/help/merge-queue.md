@@ -208,6 +208,11 @@ worktree, stale registered location/branch, or failed remote branch lookup is
 an explicit error and never creates a remote-local fallback row. If inbound
 secure serving is unavailable, select `remote_mode = "push"` deliberately.
 
+The control URL handed to a remote environment comes only from a live
+`thegn serve` daemon in this state directory, and must be a plain origin using
+the configured scheme. If live servers advertise different URLs, enqueue
+refuses until only one origin is advertised.
+
 ## The fixing agent
 
 Point the handoff at an agent either by naming one of your `[[agents]]`
