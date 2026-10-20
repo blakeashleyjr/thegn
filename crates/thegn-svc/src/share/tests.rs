@@ -1106,7 +1106,7 @@ fn start_keeps_draining_so_child_survives_post_return() {
     let tmp = std::env::temp_dir().join(format!("thegn-share-test-{}", std::process::id()));
     let _ = std::fs::create_dir_all(&tmp); // best-effort: test setup; later asserts fail loudly if missing
 
-    let mut running = start(&plan, &tmp, Duration::from_secs(5)).expect("start");
+    let running = start(&plan, &tmp, Duration::from_secs(5)).expect("start");
     assert_eq!(running.public_url.canonical(), "http://fixed.example");
 
     // Give the child time to emit several post-return lines: under the old
