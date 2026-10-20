@@ -781,6 +781,7 @@ fn reused_gate_requires_lock_and_preserves_ignored_artifacts() {
     }
     let held = f.prepare(&f.first);
     std::fs::create_dir_all(f.repo.join(".git/info")).unwrap();
+    std::fs::create_dir_all(f.repo.join(".git/info")).unwrap();
     std::fs::write(f.repo.join(".git/info/exclude"), "/artifact\n").unwrap();
     std::fs::write(f.wt().join("artifact"), "warm cache").unwrap();
     assert_eq!(git(&f.wt(), &["check-ignore", "artifact"]), "artifact");
@@ -821,6 +822,7 @@ fn reused_gate_still_preserves_ignored_artifacts_after_clean() {
     if !posix_shell_gate_only() || !f.supported_or_refused() {
         return;
     }
+    std::fs::create_dir_all(f.repo.join(".git/info")).unwrap();
     std::fs::write(f.repo.join(".git/info/exclude"), "/artifact\n").unwrap();
     let first = MergeQueueConfig {
         gate_command: "printf stale > stale.txt; printf warm > artifact".into(),
