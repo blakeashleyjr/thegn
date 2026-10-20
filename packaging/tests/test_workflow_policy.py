@@ -75,6 +75,49 @@ class WorkflowPolicyTests(unittest.TestCase):
         self.assertEqual("sandbox-image-publish", workflow.get("concurrency", {}).get("group"))
         self.assertFalse(workflow["concurrency"].get("cancel-in-progress"))
 
+    def test_sandbox_image_builds_only_the_admitted_sha(self) -> None:
+        jobs = read_workflow("sandbox-image.yml")["jobs"]
+        expected = "${{ needs.admit.outputs.sha }}"
+        build = jobs["build"]
+        build_needs = build["needs"]
+        build_needs = build_needs if isinstance(build_needs, list) else [build_needs]
+        self.assertIn("admit", build_needs)
+        checkouts = [
+            step
+            for step in build["steps"]
+            if step.get("uses", "").startswith("actions/checkout@")
+        ]
+        self.assertTrue(checkouts, "build must check out the admitted source")
+        for step in checkouts:
+            self.assertEqual(expected, step.get("with", {}).get("ref"))
+        manifest_needs = jobs["manifest"]["needs"]
+        manifest_needs = manifest_needs if isinstance(manifest_needs, list) else [manifest_needs]
+        self.assertCountEqual(["admit", "build"], manifest_needs)
+
+    def test_sandbox_image_admit_is_read_only(self) -> None:
+        admit = read_workflow("sandbox-image.yml")["jobs"]["admit"]
+        self.assertEqual({"contents": "read"}, admit["permissions"])
+        scripts = "\n".join(step.get("run", "") for step in admit["steps"])
+        self.assertIn("merge-base --is-ancestor", scripts)
+        self.assertIn("refs/heads/main", scripts)
+
+    def test_sandbox_image_tag_resolved_once(self) -> None:
+        jobs = read_workflow("sandbox-image.yml")["jobs"]
+        expected = "${{ needs.admit.outputs.tag }}"
+        for job_name in ("build", "manifest"):
+            steps = jobs[job_name]["steps"]
+            self.assertFalse(
+                any(step.get("name") == "resolve tag" for step in steps),
+                f"{job_name} must use the admitted tag",
+            )
+            tag_envs = [
+                step.get("env", {})["TAG"]
+                for step in steps
+                if "TAG" in step.get("env", {})
+            ]
+            self.assertTrue(tag_envs, f"{job_name} must pass TAG to publication steps")
+            self.assertTrue(all(tag == expected for tag in tag_envs), tag_envs)
+
 
 if __name__ == "__main__":
     unittest.main()
