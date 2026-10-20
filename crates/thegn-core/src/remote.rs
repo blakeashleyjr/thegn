@@ -884,6 +884,11 @@ impl GitLoc {
         };
         if status.success() {
             Ok(())
+        } else if status.code() == Some(73) {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::AlreadyExists,
+                format!("git path {rel:?} already exists"),
+            ))
         } else {
             Err(std::io::Error::other(format!(
                 "remote exclusive write of {rel:?} failed"
@@ -1168,7 +1173,7 @@ fn atomic_git_path_write_ssh_command(path: &str) -> String {
 fn exclusive_git_path_write_script(path: &str) -> String {
     let quoted = util::sh_quote(path);
     format!(
-        "set -C; umask 077; p={quoted}; [ ! -e \"$p\" ] && [ ! -L \"$p\" ] || exit 1; cat > \"$p\""
+        "set -C; umask 077; p={quoted}; [ ! -e \"$p\" ] && [ ! -L \"$p\" ] || exit 73; cat > \"$p\""
     )
 }
 
@@ -1741,7 +1746,7 @@ mod tests {
     #[test]
     fn exclusive_git_path_ssh_command_is_explicitly_run_by_posix_shell() {
         let command = exclusive_git_path_write_ssh_command("/work tree/todo");
-        let script = "set -C; umask 077; p='/work tree/todo'; [ ! -e \"$p\" ] && [ ! -L \"$p\" ] || exit 1; cat > \"$p\"";
+        let script = "set -C; umask 077; p='/work tree/todo'; [ ! -e \"$p\" ] && [ ! -L \"$p\" ] || exit 73; cat > \"$p\"";
         assert_eq!(command, format!("sh -c {}", util::sh_quote(script)));
     }
 

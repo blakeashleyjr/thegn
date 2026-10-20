@@ -270,9 +270,16 @@ fn rebase_with_todo_inner(
                 cleanup_path = Some(scratch.clone());
             }
             _ => {
-                loc.write_git_path_new(&scratch_name, serialize_todo(todo).as_bytes())
-                    .context("write prepared rebase todo")?;
                 cleanup_path = Some(scratch.clone());
+                if let Err(error) =
+                    loc.write_git_path_new(&scratch_name, serialize_todo(todo).as_bytes())
+                {
+                    if error.kind() == std::io::ErrorKind::AlreadyExists {
+                        cleanup_path = None;
+                    }
+                    tracing::debug!(target: "thegn::git", %error, "could not write prepared rebase todo scratch file");
+                    return Err(error).context("write prepared rebase todo");
+                }
             }
         }
         let editor = format!("cp {}", sh_quote(&scratch));
@@ -311,7 +318,7 @@ fn rebase_with_todo_inner(
             }
         },
         None => {
-            tracing::warn!(target: "thegn::git", "could not resolve prepared rebase todo scratch file for cleanup")
+            tracing::debug!(target: "thegn::git", "prepared rebase todo scratch file was not created; no cleanup needed")
         }
     }
     result
@@ -864,7 +871,12 @@ mod tests {
             Duration::from_millis(100),
         )
         .unwrap_err();
-        assert!(error.to_string().contains("mutation lock"), "{error:#}");
+        assert!(
+            error
+                .to_string()
+                .contains("refusing git rebase -i: repository mutation lock"),
+            "{error:#}"
+        );
         assert_eq!(r.head(), head);
 
         release_tx.send(()).unwrap();
@@ -900,7 +912,12 @@ mod tests {
             Duration::from_millis(100),
         )
         .unwrap_err();
-        assert!(error.to_string().contains("mutation lock"), "{error:#}");
+        assert!(
+            error
+                .to_string()
+                .contains("refusing git rebase -i: repository mutation lock"),
+            "{error:#}"
+        );
         assert_eq!(r.head(), head);
         assert!(CliGit.stash_list(&loc).unwrap().is_empty());
 
