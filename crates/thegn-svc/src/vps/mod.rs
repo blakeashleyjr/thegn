@@ -13,6 +13,7 @@
 //! [`VpsProvider`] driving them.
 
 pub mod cloudinit;
+pub mod controller;
 pub mod digitalocean;
 pub mod hetzner;
 pub mod registry;
@@ -33,10 +34,12 @@ use thegn_core::remote::SshTarget;
 /// The vendor-neutral instance labels every managed VPS carries. Hetzner sends
 /// them as a native `key=value` label object; DigitalOcean (flat tags) encodes
 /// and reconstructs them (see [`digitalocean::tags_from_labels`]). The reaper
-/// scopes on [`HOST_KEY`], so both vendors must round-trip it.
+/// scopes on [`HOST_KEY`], so both vendors must round-trip it. New resources
+/// also carry [`CONTROLLER_KEY`] to distinguish the creating thegn root.
 pub const MANAGED_KEY: &str = "managed-by";
 pub const MANAGED_VAL: &str = "thegn";
 pub const HOST_KEY: &str = "tg-host";
+pub const CONTROLLER_KEY: &str = "tg-ctl";
 
 const MAX_INVENTORY_PAGES: u32 = 50;
 const MAX_INVENTORY_ROWS: usize = 10_000;
@@ -936,7 +939,11 @@ impl RemoteProvider for VpsProvider {
         Box::pin(async move {
             // Every local input is admitted before the ledger is read, the SSH
             // key is looked up or registered, or any server request is made.
-            let labels = self.labels();
+            let controller = tokio::task::spawn_blocking(controller::controller_id)
+                .await
+                .context("vps: controller id worker failed")??;
+            let mut labels = self.labels();
+            labels.insert(CONTROLLER_KEY.into(), controller);
             let resolved = self.spec.admit_resolved(&labels)?;
             let name = self.spec.name.clone();
             let base = self.spec.validated_api_base()?;

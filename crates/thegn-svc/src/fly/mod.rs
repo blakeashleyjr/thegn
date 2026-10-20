@@ -653,7 +653,11 @@ impl RemoteProvider for FlyProvider {
         Box::pin(async move {
             // Every local input is admitted, and the complete machine body is
             // rendered, before the ledger intent, the app, or the billed IPv4.
-            let metadata = self.spec.metadata();
+            let controller = tokio::task::spawn_blocking(crate::vps::controller::controller_id)
+                .await
+                .context("fly: controller id worker failed")??;
+            let mut metadata = self.spec.metadata();
+            metadata.insert(crate::vps::CONTROLLER_KEY.into(), controller);
             let admitted = self.spec.admit_static(&metadata)?;
             let name = self.spec.name.clone();
             let body = machines::create_machine_body(
@@ -1193,6 +1197,17 @@ mod tests {
         let m = s.metadata();
         assert_eq!(m.get("managed-by").map(String::as_str), Some("thegn"));
         assert!(m.contains_key("tg-host"));
+    }
+
+    #[test]
+    fn controller_metadata_passes_admission() {
+        let s = spec();
+        let mut metadata = s.metadata();
+        metadata.insert(
+            crate::vps::CONTROLLER_KEY.into(),
+            "0123456789abcdef0123456789abcdef".into(),
+        );
+        assert!(s.admit_static(&metadata).is_ok());
     }
 
     /// Neither the transport error nor anyhow's alternate/Debug chain may echo
