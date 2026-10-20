@@ -1204,6 +1204,38 @@ pub fn mode_bits(path: &Path) -> std::io::Result<Option<u32>> {
     }
 }
 
+/// Set a directory's mode to the mode a normal `mkdir` would receive under
+/// the current process umask. This uses a sibling directory as a probe, so it
+/// does not need to inspect or temporarily change the process-wide umask.
+pub fn restore_normal_directory_mode(path: &Path) -> std::io::Result<()> {
+    let metadata = std::fs::metadata(path)?;
+    if !metadata.is_dir() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "path is not a directory",
+        ));
+    }
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    let probe = parent.join(format!(".thegn-dir-mode-{}", temp_token()));
+    std::fs::create_dir(&probe)?;
+    let mode_result = mode_bits(&probe);
+    let remove_result = std::fs::remove_dir(&probe);
+    remove_result?;
+    let mode = mode_result?;
+    if let Some(mode) = mode {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode))?;
+        }
+        #[cfg(not(unix))]
+        {
+            let _mode = mode;
+        }
+    }
+    Ok(())
+}
+
 #[cfg_attr(windows, allow(unused_variables))]
 fn restrict(path: &Path, unix_mode: u32) -> std::io::Result<()> {
     #[cfg(unix)]
@@ -1864,6 +1896,18 @@ mod tests {
         assert_eq!(mode_bits(&p).unwrap(), Some(0o600));
         let _ = std::fs::remove_file(&p); // best-effort: test cleanup: scratch removal must never fail the test
         assert!(mode_bits(&p).is_err(), "a missing path is an error");
+    }
+
+    #[test]
+    fn restore_normal_directory_mode_uses_current_umask() {
+        let temp = tempfile::tempdir().unwrap();
+        let normal = temp.path().join("normal");
+        let private = temp.path().join("private");
+        std::fs::create_dir(&normal).unwrap();
+        ensure_private_dir(&private).unwrap();
+        assert_eq!(mode_bits(&private).unwrap(), Some(0o700));
+        restore_normal_directory_mode(&private).unwrap();
+        assert_eq!(mode_bits(&private).unwrap(), mode_bits(&normal).unwrap());
     }
 
     #[test]
