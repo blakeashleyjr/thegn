@@ -81,8 +81,8 @@ fn handle(stream: TcpStream, rec: Arc<Mutex<Vec<Recorded>>>) {
 
     // Seeded responses: documented Hetzner shapes.
     let resp = match (method.as_str(), path.as_str()) {
-        ("GET", "/v1/ssh_keys") => {
-            r#"{"ssh_keys":[{"id":9,"public_key":"ssh-ed25519 OTHERKEY someone"}]}"#.to_string()
+        ("GET", "/v1/ssh_keys?page=1&per_page=50") => {
+            r#"{"ssh_keys":[{"id":9,"public_key":"ssh-ed25519 OTHERKEY someone"}],"meta":{"pagination":{"page":1,"per_page":50,"previous_page":null,"next_page":null,"last_page":1,"total_entries":1}}}"#.to_string()
         }
         ("POST", "/v1/ssh_keys") => r#"{"ssh_key":{"id":42}}"#.to_string(),
         ("POST", "/v1/servers") => {
@@ -91,7 +91,7 @@ fn handle(stream: TcpStream, rec: Arc<Mutex<Vec<Recorded>>>) {
             r#"{"server":{"id":101,"name":"tg-mock-1","status":"initializing","created":"2026-07-01T12:00:00+00:00"}}"#.to_string()
         }
         (m, p) if m == "GET" && p.starts_with("/v1/servers?") => {
-            r#"{"servers":[{"id":101,"name":"tg-mock-1","status":"running","created":"2026-07-01T12:00:00+00:00","public_net":{"ipv4":{"ip":"203.0.113.9"}},"labels":{"managed-by":"thegn","tg-host":"h1"}}]}"#.to_string()
+            r#"{"servers":[{"id":101,"name":"tg-mock-1","status":"running","created":"2026-07-01T12:00:00+00:00","public_net":{"ipv4":{"ip":"203.0.113.9"}},"labels":{"managed-by":"thegn","tg-host":"h1"}}],"meta":{"pagination":{"page":1,"per_page":50,"previous_page":null,"next_page":null,"last_page":1,"total_entries":1}}}"#.to_string()
         }
         ("DELETE", "/v1/servers/101") => r#"{}"#.to_string(),
         _ => {
@@ -226,7 +226,7 @@ fn create_list_destroy_round_trip_with_ledger() {
     let key_list = &reqs[0];
     assert_eq!(
         (key_list.method.as_str(), key_list.path.as_str()),
-        ("GET", "/v1/ssh_keys")
+        ("GET", "/v1/ssh_keys?page=1&per_page=50")
     );
     assert_eq!(key_list.auth, "Bearer mock-token");
     let key_create = &reqs[1];
@@ -262,6 +262,11 @@ fn create_list_destroy_round_trip_with_ledger() {
     assert!(
         last.path.contains("label_selector=managed-by%3Dthegn"),
         "list is label-filtered: {}",
+        last.path
+    );
+    assert!(
+        last.path.contains("per_page=50") && last.path.contains("page=1"),
+        "list requests the first paginated page: {}",
         last.path
     );
 

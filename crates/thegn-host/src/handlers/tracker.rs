@@ -544,7 +544,7 @@ fn dispatch_agent(ctx: &mut TrackerCtx) {
                     .push((thegn_core::issue::DISPATCH_ROW_ENV.into(), row.to_string()));
             }
             // The dispatch lands on the repo's ambient env (no wizard pick).
-            let env = crate::wizard::ambient_env_name_live(&cfg2, &root);
+            let env = crate::wizard::ambient_env_name(Some(&db), &cfg2, &root);
             let payload = crate::wizard::CreatedWorktree {
                 tab: tab.clone(),
                 branch: branch.clone(),

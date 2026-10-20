@@ -550,6 +550,9 @@ pub struct FrameModel {
     /// hydration thread, which has no pane access — and used to compose the
     /// dynamic sidebar row title. Re-filled each frame before rendering.
     pub sidebar_window_titles: std::collections::BTreeMap<String, String>,
+    /// Repo path -> non-empty workspace DB default environment. Hydrated off
+    /// the UI loop and read by the wizard without opening the database.
+    pub workspace_envs: std::collections::BTreeMap<String, String>,
     /// Worktrees registered for workspaces NOT loaded in the session (their
     /// sidebar rows switch workspace on activate).
     pub sidebar_db_worktrees: Vec<crate::sidebar::DbWorktree>,

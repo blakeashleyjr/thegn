@@ -1898,8 +1898,12 @@ gate_ok=1
 [[ $gate_rc -ne 0 ]] && grep -q 'not verifiably finished' <<<"$gate_out" || gate_ok=0
 check "set-status done is refused for a row with a missing artifact" \
   "[[ $gate_ok -eq 1 ]]"
+check "set-status done --force requires a reason" \
+  "! '$SZ' dispatch set-status '$artifact_row' done --force >/dev/null 2>&1"
+check "dispatch put --force without --chunk is refused" \
+  "! '$SZ' dispatch put linear:SMOKE-FORCE '$R' claude --force >/dev/null 2>&1"
 check "set-status done --force overrides and says so" \
-  "'$SZ' dispatch set-status '$artifact_row' done --force | grep -q forced"
+  "'$SZ' dispatch set-status '$artifact_row' done --force --why 'smoke' | grep -q forced"
 # Untracked: the artifact exists but git does not track it — the exact pilot
 # failure ("session exit ≠ done") the gate exists to catch. Committing it
 # flips the gate open; a forced completion stays visible in the output.
@@ -2024,7 +2028,7 @@ sdone_row="$($SZ dispatch put linear:SMOKE-5 "$R" claude --stage code 2>/dev/nul
 # `done` is passed via a variable: a literal `done` inside $() reads as a
 # shell keyword to shellcheck (SC1010).
 sdone_status="done"
-sresumedone_out="$($SZ dispatch set-status "$sdone_row" "$sdone_status" --force >/dev/null 2>&1 && $SZ session open --resume-work "$sdone_row" 2>&1)"
+sresumedone_out="$($SZ dispatch set-status "$sdone_row" "$sdone_status" --force --why 'smoke' >/dev/null 2>&1 && $SZ session open --resume-work "$sdone_row" 2>&1)"
 sresumedone_rc=$?
 set -e
 sresumedone_ok=1
@@ -2102,7 +2106,7 @@ check "an after: chunk whose prerequisite is not done is refused" \
 # order. The forced completion preserves this fixture's intended prerequisite
 # state while pipeline rows without published artifacts remain gated by default.
 check "a done prerequisite satisfies the after gate" \
-  "'$SZ' dispatch set-status '$CA_ROW' done --force >/dev/null && '$SZ' dispatch put linear:SMOKE-6 '$CWT' claude --stage smoke-chunk --chunk .thegn/pipeline/SMOKE-7/code/chunk-3.md | grep -q 'queued'"
+  "'$SZ' dispatch set-status '$CA_ROW' done --force --why 'smoke' >/dev/null && '$SZ' dispatch put linear:SMOKE-6 '$CWT' claude --stage smoke-chunk --chunk .thegn/pipeline/SMOKE-7/code/chunk-3.md | grep -q 'queued'"
 
 # Daemon lifecycle: spawn on an isolated socket, open a marker session over
 # the unix socket, see it in `session list` and its output in `snapshot`,

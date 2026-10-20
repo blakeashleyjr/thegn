@@ -25,6 +25,96 @@ fn row(db: &Db) -> MergeQueueRow {
 }
 
 #[test]
+fn retry_held_rearms_only_held_statuses() {
+    for status in crate::attention::MqStatus::ALL {
+        let db = seeded();
+        db.set_merge_agent_attempts(WORKTREE, 4).unwrap();
+        db.replace_merge_status(
+            WORKTREE,
+            status.as_str(),
+            &MergeStatusFields {
+                result_oid: Some("result-oid".into()),
+                conflict_paths: Some("conflict/path".into()),
+                error_detail: Some("diagnostic".into()),
+            },
+        )
+        .unwrap();
+        let before = row(&db);
+        let outcome = db.retry_held_merge_entry(WORKTREE).unwrap();
+        if status.is_held() {
+            assert_eq!(outcome, MergeRetryOutcome::Rearmed, "{status:?}");
+            let after = row(&db);
+            assert_eq!(after.status, "queued", "{status:?}");
+            assert_eq!(after.agent_attempts, 0, "{status:?}");
+            assert!(after.result_oid.is_none() && after.conflict_paths.is_none());
+            assert!(after.error_detail.is_none());
+        } else {
+            assert_eq!(
+                outcome,
+                MergeRetryOutcome::NotRetryable {
+                    status: status.as_str().into()
+                },
+                "{status:?}"
+            );
+            assert_eq!(row(&db), before, "{status:?}");
+        }
+    }
+}
+
+#[test]
+fn retry_held_reports_missing_rows() {
+    let db = Db::open_memory().unwrap();
+    assert_eq!(
+        db.retry_held_merge_entry(WORKTREE).unwrap(),
+        MergeRetryOutcome::NotQueued
+    );
+}
+
+#[test]
+fn retry_held_refuses_unknown_status_without_mutation() {
+    let db = seeded();
+    db.conn()
+        .execute(
+            "UPDATE merge_queue SET status='future_status' WHERE worktree=?1",
+            [WORKTREE],
+        )
+        .unwrap();
+    let before = row(&db);
+    assert_eq!(
+        db.retry_held_merge_entry(WORKTREE).unwrap(),
+        MergeRetryOutcome::NotRetryable {
+            status: "future_status".into()
+        }
+    );
+    assert_eq!(row(&db), before);
+}
+
+#[test]
+fn retry_held_reports_claimed_rows() {
+    let db = Db::open_memory().unwrap();
+    db.put_worktree("feature", "/private/repo", WORKTREE, "feature", None, None)
+        .unwrap();
+    db.enqueue_merge(WORKTREE, "feature", "main").unwrap();
+    let claim = db
+        .admit_merge_claim(&MergeClaimRequest {
+            worktree: WORKTREE.into(),
+            branch: "feature".into(),
+            repo_root: "/private/repo".into(),
+            target_branch: "main".into(),
+            location: String::new(),
+            expected_status: "queued".into(),
+            lease_until_ms: crate::util::now_ms() + 60_000,
+            owner_hint: Some("retry-test".into()),
+        })
+        .unwrap();
+    assert!(claim.is_some());
+    assert_eq!(
+        db.retry_held_merge_entry(WORKTREE).unwrap(),
+        MergeRetryOutcome::Claimed
+    );
+}
+
+#[test]
 fn exact_replacement_clears_stale_columns_without_renominating() {
     for status in [
         "folding",

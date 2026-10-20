@@ -9,7 +9,9 @@
 
 use std::collections::BTreeMap;
 
-use super::VpsInstance;
+use anyhow::{Result, anyhow};
+
+use super::{InventoryPage, VpsInstance};
 
 pub const DEFAULT_API_BASE: &str = "https://api.hetzner.cloud/v1";
 pub const DEFAULT_TOKEN_ENV: &str = "HCLOUD_TOKEN";
@@ -42,8 +44,16 @@ pub fn list_url(base: &str) -> String {
     )
 }
 
+pub fn list_page_url(base: &str, page: u32) -> String {
+    format!("{}&page={page}", list_url(base))
+}
+
 pub fn ssh_keys_url(base: &str) -> String {
     format!("{}/ssh_keys", base.trim_end_matches('/'))
+}
+
+pub fn ssh_keys_page_url(base: &str, page: u32) -> String {
+    format!("{}?page={page}&per_page=50", ssh_keys_url(base))
 }
 
 pub fn create_image_url(base: &str, id: &str) -> String {
@@ -150,6 +160,81 @@ pub fn parse_server_list(v: &serde_json::Value) -> Vec<VpsInstance> {
         .unwrap_or_default()
 }
 
+/// Parse one strict server inventory page. Errors mention row indexes only;
+/// provider row contents may contain addresses or other sensitive data.
+pub fn parse_server_page(v: &serde_json::Value, page: u32) -> Result<InventoryPage<VpsInstance>> {
+    parse_inventory_page(v, page, "servers", parse_server)
+}
+
+/// Parse one strict SSH-key inventory page.
+pub fn parse_ssh_key_page(
+    v: &serde_json::Value,
+    page: u32,
+) -> Result<InventoryPage<(i64, String)>> {
+    let rows = v
+        .get("ssh_keys")
+        .and_then(serde_json::Value::as_array)
+        .ok_or_else(|| anyhow!("Hetzner inventory page is missing the ssh_keys array"))?;
+    let mut items = Vec::with_capacity(rows.len());
+    for (index, row) in rows.iter().enumerate() {
+        let key = row
+            .get("id")
+            .and_then(serde_json::Value::as_i64)
+            .zip(row.get("public_key").and_then(serde_json::Value::as_str))
+            .map(|(id, key)| (id, key.to_string()))
+            .ok_or_else(|| {
+                anyhow!("Hetzner inventory page has malformed element at index {index}")
+            })?;
+        items.push(key);
+    }
+    let pagination = hetzner_pagination(v, page)?;
+    Ok(InventoryPage {
+        items,
+        has_next: pagination.0,
+        total: pagination.1,
+    })
+}
+
+fn parse_inventory_page<T>(
+    v: &serde_json::Value,
+    page: u32,
+    array_name: &str,
+    parse_row: fn(&serde_json::Value) -> Option<T>,
+) -> Result<InventoryPage<T>> {
+    let rows = v
+        .get(array_name)
+        .and_then(serde_json::Value::as_array)
+        .ok_or_else(|| anyhow!("Hetzner inventory page is missing the {array_name} array"))?;
+    let mut items = Vec::with_capacity(rows.len());
+    for (index, row) in rows.iter().enumerate() {
+        items.push(parse_row(row).ok_or_else(|| {
+            anyhow!("Hetzner inventory page has malformed element at index {index}")
+        })?);
+    }
+    let pagination = hetzner_pagination(v, page)?;
+    Ok(InventoryPage {
+        items,
+        has_next: pagination.0,
+        total: pagination.1,
+    })
+}
+
+fn hetzner_pagination(v: &serde_json::Value, page: u32) -> Result<(bool, Option<u64>)> {
+    let pagination = v
+        .pointer("/meta/pagination")
+        .and_then(serde_json::Value::as_object)
+        .ok_or_else(|| anyhow!("Hetzner inventory page is missing meta.pagination"))?;
+    let has_next = match pagination.get("next_page") {
+        Some(serde_json::Value::Null) => false,
+        Some(value) if value.as_u64() == Some(u64::from(page) + 1) => true,
+        _ => return Err(anyhow!("Hetzner inventory has a non-advancing page")),
+    };
+    let total = pagination
+        .get("total_entries")
+        .and_then(serde_json::Value::as_u64);
+    Ok((has_next, total))
+}
+
 pub fn ssh_key_body(name: &str, pubkey: &str) -> serde_json::Value {
     serde_json::json!({ "name": name, "public_key": pubkey })
 }
@@ -190,6 +275,101 @@ pub fn parse_image_created(v: &serde_json::Value) -> Option<i64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn server_page(
+        rows: serde_json::Value,
+        page: u32,
+        next: serde_json::Value,
+        total: u64,
+    ) -> serde_json::Value {
+        serde_json::json!({
+            "servers": rows,
+            "meta": {"pagination": {
+                "page": page,
+                "per_page": 50,
+                "previous_page": if page == 1 { serde_json::Value::Null } else { serde_json::json!(page - 1) },
+                "next_page": next,
+                "last_page": 2,
+                "total_entries": total
+            }}
+        })
+    }
+
+    #[test]
+    fn strict_server_pages_return_both_pages_and_reject_malformed_shapes() {
+        let first = server_page(
+            serde_json::json!([
+                {"id": 1, "name": "one"}, {"id": 2, "name": "two"}
+            ]),
+            1,
+            serde_json::json!(2),
+            3,
+        );
+        let last = server_page(
+            serde_json::json!([{"id": 3, "name": "three"}]),
+            2,
+            serde_json::Value::Null,
+            3,
+        );
+        let first = parse_server_page(&first, 1).unwrap();
+        let last = parse_server_page(&last, 2).unwrap();
+        assert_eq!(first.items.len(), 2);
+        assert!(first.has_next);
+        assert_eq!(last.items.len(), 1);
+        assert!(!last.has_next);
+        assert_eq!(last.total, Some(3));
+
+        let malformed = server_page(
+            serde_json::json!([{"bogus": true}]),
+            1,
+            serde_json::json!(2),
+            1,
+        );
+        assert!(parse_server_page(&malformed, 1).is_err());
+        let repeated = server_page(serde_json::json!([]), 1, serde_json::json!(1), 0);
+        assert!(parse_server_page(&repeated, 1).is_err());
+        let skipped = server_page(serde_json::json!([]), 1, serde_json::json!(3), 0);
+        assert!(parse_server_page(&skipped, 1).is_err());
+        assert!(parse_server_page(&serde_json::json!({"servers": []}), 1).is_err());
+        let missing_servers = serde_json::json!({"meta": {"pagination": {
+            "next_page": null, "total_entries": 0
+        }}});
+        assert!(parse_server_page(&missing_servers, 1).is_err());
+    }
+
+    #[test]
+    fn strict_ssh_key_pages_reject_missing_and_malformed_rows() {
+        let page = serde_json::json!({"meta": {"pagination": {
+            "next_page": null, "total_entries": 1
+        }}});
+        assert!(parse_ssh_key_page(&page, 1).is_err());
+
+        let malformed = serde_json::json!({"ssh_keys": [{"id": "not-an-id", "public_key": "ssh-ed25519 AAA"}],
+            "meta": {"pagination": {"next_page": null, "total_entries": 1}}});
+        assert!(parse_ssh_key_page(&malformed, 1).is_err());
+    }
+
+    #[test]
+    fn pagination_accepts_optional_vendor_metadata() {
+        for pagination in [
+            serde_json::json!({"next_page": null, "total_entries": 0}),
+            serde_json::json!({"page": null, "per_page": 17, "previous_page": null,
+                "next_page": null, "last_page": null, "total_entries": 0}),
+            serde_json::json!({"per_page": 17, "next_page": null, "last_page": 0,
+                "total_entries": 0}),
+        ] {
+            let body = serde_json::json!({"servers": [], "meta": {"pagination": pagination}});
+            let parsed = parse_server_page(&body, 1).unwrap();
+            assert!(!parsed.has_next);
+            assert_eq!(parsed.total, Some(0));
+        }
+    }
+
+    #[test]
+    fn strict_server_and_key_page_urls_pin_provider_pagination() {
+        assert!(list_page_url(DEFAULT_API_BASE, 2).ends_with("&per_page=50&page=2"));
+        assert!(ssh_keys_page_url(DEFAULT_API_BASE, 2).ends_with("?page=2&per_page=50"));
+    }
 
     #[test]
     fn unknown_and_future_provider_creation_times_never_authorize_reaping() {

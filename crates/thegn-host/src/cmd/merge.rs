@@ -13,7 +13,7 @@ use thegn_core::attention::MqStatus;
 use thegn_core::config::Config;
 use thegn_core::db::Db;
 use thegn_core::outln;
-use thegn_core::store::WorktreeAuxStore;
+use thegn_core::store::{MergeRetryOutcome, WorktreeAuxStore};
 
 use thegn_core::merge_lifecycle::LifecycleEvent;
 
@@ -62,7 +62,7 @@ pub enum Action {
         #[arg(long)]
         json: bool,
     },
-    /// Land a branch that is `ready` (gated green, held by `auto_land = false`).
+    /// Land only a ready merge-queue row; use `thegn land` outside the queue.
     Land {
         #[command(flatten)]
         target: super::target::WorktreeTarget,
@@ -315,24 +315,35 @@ fn parse_conflicted_paths(stdout: &[u8]) -> Result<Vec<PathBuf>> {
         .collect()
 }
 
-/// `merge retry [worktree]` — re-arm a blocked row.
+/// `merge retry [worktree]` — re-arm a held row.
 ///
-/// A plain drain already re-attempts every non-settled row, but the agent budget
-/// is now persisted per branch, so an exhausted `needs_human` row would keep
-/// deferring without ever dispatching again. This resets it — and gives the
-/// gesture a name in `merge --help`, which it never had on the CLI even though
-/// the panel has bound `r` to it all along.
+/// Only held rows may be explicitly retried; other states are reported as
+/// refusals so a completed or active row cannot be reset accidentally.
 fn retry(worktree: Option<String>) -> Result<()> {
     let wt = crate::merge_ops::canonical_worktree(&super::resolve_worktree(worktree));
     let wt_s = wt.to_string_lossy().to_string();
     let db = Db::open()?;
-    if !db.retry_merge_entry(&wt_s)? {
-        // Not queued is a distinct, non-zero outcome — scripting must be able to
-        // tell "re-armed" from "there was nothing to re-arm".
-        anyhow::bail!("{wt_s} is not in the merge queue.");
+    match retry_message(&wt_s, &db.retry_held_merge_entry(&wt_s)?) {
+        Ok(message) => outln!("{message}"),
+        Err(message) => anyhow::bail!("{message}"),
     }
-    outln!("Re-queued for the next drain.");
     Ok(())
+}
+
+fn retry_message(
+    wt: &str,
+    outcome: &MergeRetryOutcome,
+) -> std::result::Result<&'static str, String> {
+    match outcome {
+        MergeRetryOutcome::Rearmed => Ok("Re-queued for the next drain."),
+        MergeRetryOutcome::NotQueued => Err(format!("{wt} is not in the merge queue.")),
+        MergeRetryOutcome::NotRetryable { status } => Err(format!(
+            "cannot retry a {status} row: retry re-arms deferred, gate_failed, gate_error, agent_blocked or needs_human rows"
+        )),
+        MergeRetryOutcome::Claimed => Err(format!(
+            "{wt} is being worked by a drain; retry it after the drain finishes"
+        )),
+    }
 }
 
 /// The repo root (main checkout) reachable from the cwd.
@@ -712,7 +723,6 @@ fn drain(cfg: &Config, all: bool, json: bool) -> Result<()> {
             worktree: r.worktree,
             branch: r.branch,
             location: r.location,
-            agent_attempts: r.agent_attempts,
         })
         .collect();
     if items.is_empty() {
@@ -741,8 +751,33 @@ fn drain(cfg: &Config, all: bool, json: bool) -> Result<()> {
     // The run's effective target may differ from the one frozen on each row at
     // enqueue time (e.g. under `--set merge_queue.target_branch=…`), which is
     // why `merge list` used to keep showing the stale value. Re-stamp it.
-    for it in &items {
+    let mut held_branches = Vec::new();
+    let mut drain_items = Vec::with_capacity(items.len());
+    for it in items {
         if let Err(error) = db.set_merge_target(&it.worktree, &target) {
+            let active_error = error
+                .to_string()
+                .contains(thegn_core::store::MERGE_CLAIM_ACTIVE);
+            let observed = if active_error {
+                Some(db.observe_merge_claim(&it.worktree)?)
+            } else {
+                None
+            };
+            match merge_driver::target_stamp_action(
+                active_error,
+                observed.as_ref().and_then(Option::as_ref),
+                thegn_core::util::now_ms(),
+            ) {
+                merge_driver::TargetStampAction::SkipHeld => {
+                    held_branches.push(it.branch.clone());
+                    continue;
+                }
+                merge_driver::TargetStampAction::RetryWithoutStamp => {
+                    drain_items.push(it);
+                    continue;
+                }
+                merge_driver::TargetStampAction::Fail => {}
+            }
             if json {
                 super::emit_json(&serde_json::json!({
                     "error": {
@@ -754,11 +789,12 @@ fn drain(cfg: &Config, all: bool, json: bool) -> Result<()> {
             }
             return Err(error);
         }
+        drain_items.push(it);
     }
     let mut steps = Vec::new();
     let guard = crate::platform::InterruptGuard::install();
     let _scope = crate::fold_cancel::scope(move || guard.fired());
-    let out = merge_driver::drive_queue(mq, cfg, &root, &db, items, |step: &DriveStep| {
+    let out = merge_driver::drive_queue(mq, cfg, &root, &db, drain_items, |step: &DriveStep| {
         if !crate::merge_notify::collect_step(&mut steps, step, json) {
             return;
         }
@@ -773,6 +809,12 @@ fn drain(cfg: &Config, all: bool, json: bool) -> Result<()> {
             None => outln!("  ? {} unknown queue status '{}'", step.branch, step.status),
         }
     });
+    let mut out = out;
+    out.warnings.extend(
+        held_branches
+            .into_iter()
+            .map(|branch| format!("{branch}: claimed by another drain; target update skipped")),
+    );
     crate::merge_notify::record_cli_drain(cfg, &db, &steps, &out);
 
     // push mode: converge by pushing the advanced target to origin. Done before
@@ -953,6 +995,7 @@ fn land(cfg: &Config, worktree: Option<String>) -> Result<()> {
         // Guard refusal: bail so the exit code is non-zero for scripting/CI.
         anyhow::bail!("{msg}");
     }
+    crate::merge_ops::ready_land_precheck(&guard_db, &wt_s)?;
     let guard = crate::platform::InterruptGuard::install();
     let _scope = crate::fold_cancel::scope(move || guard.fired());
     // Share the fold/gate/CAS core with `thegn land`; this queue-aware path
@@ -1273,5 +1316,38 @@ mod gate_verdict_tests {
         assert_eq!(json["gate_verdicts"][0]["verdict"], "error");
         assert_eq!(json["gate_verdicts"][0]["phase"], "setup");
         assert_eq!(json["gate_verdicts"][0]["class"], "timeout");
+    }
+}
+
+#[cfg(test)]
+mod retry_tests {
+    use super::{MergeRetryOutcome, retry_message};
+
+    #[test]
+    fn retry_messages_are_distinct() {
+        let worktree = "/private/repo/feature";
+        assert_eq!(
+            retry_message(worktree, &MergeRetryOutcome::Rearmed),
+            Ok("Re-queued for the next drain.")
+        );
+        assert_eq!(
+            retry_message(worktree, &MergeRetryOutcome::NotQueued),
+            Err(format!("{worktree} is not in the merge queue."))
+        );
+        assert_eq!(
+            retry_message(
+                worktree,
+                &MergeRetryOutcome::NotRetryable {
+                    status: "ready".into()
+                }
+            ),
+            Err("cannot retry a ready row: retry re-arms deferred, gate_failed, gate_error, agent_blocked or needs_human rows".into())
+        );
+        assert_eq!(
+            retry_message(worktree, &MergeRetryOutcome::Claimed),
+            Err(format!(
+                "{worktree} is being worked by a drain; retry it after the drain finishes"
+            ))
+        );
     }
 }

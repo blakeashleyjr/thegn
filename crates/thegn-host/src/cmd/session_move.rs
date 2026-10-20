@@ -174,7 +174,17 @@ pub async fn run(_cfg: &Config, action: SessionAction) -> Result<()> {
         Ok(plan) => plan,
         Err(conflict) => return fail(&mut audit, json, &conflict.to_string(), false),
     };
-    let refs = referenced_session_ids(&plan.bundle);
+    let refs = match referenced_session_ids(&plan.bundle) {
+        Ok(refs) => refs,
+        Err(error) => {
+            return fail(
+                &mut audit,
+                json,
+                &format!("refusing to move: {error}"),
+                false,
+            );
+        }
+    };
     audit.resumed = plan.resumed;
 
     let (source_client, listed) = source_daemon(&source_db, &refs).await?;
@@ -304,10 +314,19 @@ fn commit_target_then_cleanup(
     Ok(())
 }
 
-fn referenced_session_ids(bundle: &MigrationBundle) -> BTreeSet<String> {
+fn referenced_session_ids(
+    bundle: &MigrationBundle,
+) -> std::result::Result<BTreeSet<String>, String> {
     let mut ids = BTreeSet::new();
-    for tab in bundle.groups.iter().flat_map(|group| &group.tabs) {
-        pane_session_ids(&tab.pane_sessions, &mut ids);
+    for group in &bundle.groups {
+        for tab in &group.tabs {
+            pane_session_ids(&tab.pane_sessions, &mut ids).map_err(|error| {
+                format!(
+                    "group {:?} tab {} has invalid pane_sessions: {error}",
+                    group.name, tab.ordinal
+                )
+            })?;
+        }
     }
     ids.extend(
         bundle
@@ -315,32 +334,46 @@ fn referenced_session_ids(bundle: &MigrationBundle) -> BTreeSet<String> {
             .iter()
             .filter_map(|dispatch| dispatch.session_id.clone()),
     );
-    ids
+    Ok(ids)
 }
 
-fn pane_session_ids(raw: &str, ids: &mut BTreeSet<String>) {
-    let Ok(value) = serde_json::from_str::<Value>(raw) else {
-        return;
-    };
+fn pane_session_ids(raw: &str, ids: &mut BTreeSet<String>) -> std::result::Result<(), String> {
+    if raw.trim().is_empty() {
+        return Ok(());
+    }
+    let value = serde_json::from_str::<Value>(raw)
+        .map_err(|_| "pane_sessions is not valid JSON".to_string())?;
     match value {
         Value::String(id) => {
+            if id.is_empty() {
+                return Err("legacy session id is empty".to_string());
+            }
             ids.insert(id);
         }
         Value::Object(entries) => {
-            for entry in entries.values() {
-                if let Value::Object(session) = entry
-                    && let Some(id) = session.get("session").and_then(Value::as_str)
-                    && session
-                        .get("provider")
-                        .and_then(Value::as_str)
-                        .is_none_or(|provider| provider == "daemon")
-                {
+            for (pane, entry) in entries {
+                let Value::Object(session) = entry else {
+                    return Err(format!("pane {pane:?} entry is not an object"));
+                };
+                let Some(id) = session.get("session").and_then(Value::as_str) else {
+                    return Err(format!("pane {pane:?} session is missing or not a string"));
+                };
+                if id.is_empty() {
+                    return Err(format!("pane {pane:?} session id is empty"));
+                }
+                let provider = match session.get("provider") {
+                    None => None,
+                    Some(Value::String(provider)) => Some(provider.as_str()),
+                    Some(_) => return Err(format!("pane {pane:?} provider is not a string")),
+                };
+                if provider.is_none_or(|provider| provider == "daemon") {
                     ids.insert(id.to_string());
                 }
             }
         }
-        _ => {}
+        _ => return Err("top-level value must be a string or object".to_string()),
     }
+    Ok(())
 }
 
 fn live_session_ids(
@@ -1058,7 +1091,8 @@ mod tests {
         pane_session_ids(
             r#"{"0":{"provider":"daemon","session":"daemon-1"},"1":{"provider":"sprites","session":"remote-1"}}"#,
             &mut ids,
-        );
+        )
+        .unwrap();
         assert_eq!(ids.into_iter().collect::<Vec<_>>(), vec!["daemon-1"]);
     }
 
@@ -1219,5 +1253,102 @@ mod tests {
             !root.exists(),
             "dry-run must not create migration lock files"
         );
+    }
+
+    fn migration_tab(ordinal: i64, pane_sessions: &str) -> MigrationTab {
+        MigrationTab {
+            session_name: "default".into(),
+            group_name: "bad-group".into(),
+            ordinal,
+            title: ordinal.to_string(),
+            pane_tree: String::new(),
+            focused_pane: 0,
+            pane_cwds: String::new(),
+            pane_cmds: String::new(),
+            pane_sessions: pane_sessions.into(),
+            scrollback_snapshot: String::new(),
+        }
+    }
+
+    fn migration_bundle_with_tabs(tabs: Vec<MigrationTab>) -> MigrationBundle {
+        MigrationBundle {
+            source_profile: "source".into(),
+            target_profile: "target".into(),
+            session_name: "default".into(),
+            worktree_path: "/worktree".into(),
+            worktree: None,
+            groups: vec![MigrationGroup {
+                session_name: "default".into(),
+                name: "bad-group".into(),
+                kind: "worktree".into(),
+                worktree: "/worktree".into(),
+                ordinal: 0,
+                active_tab: 0,
+                tabs,
+            }],
+            ui_state: Vec::new(),
+            dispatches: Vec::new(),
+            notes: Vec::new(),
+            pin_state: None,
+            pin_updated_at: None,
+        }
+    }
+
+    #[test]
+    fn malformed_pane_sessions_fail_closed() {
+        for raw in [
+            "{",
+            "[1]",
+            "42",
+            "null",
+            "true",
+            r#"{"0": 5}"#,
+            r#"{"0": {"provider": "daemon"}}"#,
+            r#"{"0": {"session": 7}}"#,
+            r#"{"0": {"session": ""}}"#,
+            r#"{"0": {"session": "id", "provider": 7}}"#,
+            "\"\"",
+        ] {
+            let mut ids = BTreeSet::new();
+            assert!(pane_session_ids(raw, &mut ids).is_err(), "accepted {raw:?}");
+        }
+    }
+
+    #[test]
+    fn valid_pane_sessions_still_parse() {
+        for raw in ["", "   ", "{}"] {
+            let mut ids = BTreeSet::new();
+            pane_session_ids(raw, &mut ids).unwrap();
+            assert!(ids.is_empty(), "unexpected ids for {raw:?}: {ids:?}");
+        }
+
+        let mut legacy_ids = BTreeSet::new();
+        pane_session_ids(r#""daemon-1""#, &mut legacy_ids).unwrap();
+        assert_eq!(legacy_ids, BTreeSet::from(["daemon-1".to_string()]));
+
+        let mut object_ids = BTreeSet::new();
+        pane_session_ids(
+            r#"{"0":{"provider":"daemon","session":"daemon-1"},"1":{"provider":"sprites","session":"remote-1"},"2":{"session":"daemon-2"}}"#,
+            &mut object_ids,
+        )
+        .unwrap();
+        assert_eq!(
+            object_ids,
+            BTreeSet::from(["daemon-1".to_string(), "daemon-2".to_string()])
+        );
+    }
+
+    #[test]
+    fn referenced_ids_refuse_a_bundle_with_one_bad_tab() {
+        let bundle = migration_bundle_with_tabs(vec![
+            migration_tab(0, r#"{"0":{"session":"daemon-1"}}"#),
+            migration_tab(4, "{"),
+        ]);
+        let result = referenced_session_ids(&bundle);
+        assert!(matches!(
+            result,
+            Err(error) if error.contains("bad-group") && error.contains("tab 4")
+                && error.contains("not valid JSON") && !error.contains("{")
+        ));
     }
 }

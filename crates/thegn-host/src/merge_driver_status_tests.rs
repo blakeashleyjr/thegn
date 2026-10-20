@@ -147,7 +147,6 @@ fn busy_landed_write_reports_oids_and_stops_later_rows() {
                 worktree: second_worktree.into(),
                 branch: "later".into(),
                 location: String::new(),
-                agent_attempts: 0,
             },
         ],
         |_| {},
@@ -318,7 +317,6 @@ fn landed_bookkeeping_failure_stops_the_remaining_items() {
                 worktree: second_worktree.into(),
                 branch: "later".into(),
                 location: String::new(),
-                agent_attempts: 0,
             },
         ],
         |_| {},
@@ -427,7 +425,6 @@ fn failed_conflict_write_falls_back_to_gate_error_and_stops_drain() {
                 worktree: "/later/worktree".into(),
                 branch: "later".into(),
                 location: String::new(),
-                agent_attempts: 0,
             },
         ],
         |_| {},
@@ -476,7 +473,6 @@ fn queued(db: &Db, attempts: u32) -> QueueItem {
         worktree: WORKTREE.into(),
         branch: "feature".into(),
         location: String::new(),
-        agent_attempts: attempts,
     }
 }
 
@@ -777,7 +773,6 @@ fn remote_identifier_collision_leaves_local_directory_untouched() {
         worktree: worktree.clone(),
         branch: "feature".into(),
         location: r#"{"control_prefix":["provider","exec"],"path":"/repo"}"#.into(),
-        agent_attempts: 0,
     };
     let mut cfg = config();
     cfg.conflict_handoff = ConflictHandoff::Agent;
@@ -887,7 +882,6 @@ impl AuditFixture {
             worktree: row.worktree,
             branch: row.branch,
             location: row.location,
-            agent_attempts: row.agent_attempts,
         }
     }
 
@@ -1159,7 +1153,6 @@ fn hold_then_recover(failure: RetryFailure) {
     observed.clear();
     let before = fixture.db.list_merge_queue().unwrap();
     let item = fixture.item("held");
-    assert_eq!(item.agent_attempts, 1);
     let repaired = std::cell::Cell::new(false);
     let (mut attempts, mut floors, mut runs) = (0, 0, 0);
     let out = drive_queue_with(
