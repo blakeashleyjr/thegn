@@ -64,6 +64,9 @@ file removal fails; retry once the keyring responds when its outcome is unknown.
 A timed-out keyring write never falls back to the file store. `audit` shows
 managed SSH fingerprints in OpenSSH `SHA256:` form and labels older stored
 forms "legacy, unverified" (`fingerprint_verified` in `--json`).
+Only one `thegn secret ssh rotate` runs per key at a time; a second is refused
+before changes, and a custody record changed mid-rotation stops further remote
+changes.
 
 ### Tailing the event feed
 
@@ -223,6 +226,10 @@ ACLs) or the target's own sshd authorizes at connect time. It reads nothing
 but the local client and runs only when you invoke it; `thegn doctor` shows
 the `host_discovery`/`tailnet` probe. This is unrelated to `[sandbox.vpn]`
 (a sandbox's own egress tunnel).
+
+`thegn host add <target> --name <alias> --replace` takes over an alias with
+stale recorded state from a host no longer defined in configuration and clears
+that state. It refuses while the host has live placement tenants.
 
 `thegn map` prints a **repo map**: the worktree's tree-sitter-indexed
 entities (functions, types, …) grouped by file, ranked by caller

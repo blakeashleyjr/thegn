@@ -98,6 +98,11 @@ user-authored one also warns once per path. The ssh identity-key mounts and
 shell-state XDG write carve-outs are not applied to sealed profiles. Extend the
 allowlist with `[sandbox] mounts` (paths outside the deny list only).
 
+Before launch, every local mount source is resolved to a real path. If a
+required source cannot be resolved, the launch is refused with its source and
+destination; an unresolvable cache mount is dropped with a warning. A source
+that does not exist yet can still resolve through its nearest existing parent.
+
 **Sealed agent panes need a managed account.** The only exception to the
 deny list is the _managed_ per-account credential dir thegn creates under
 its own state (`$XDG_STATE_HOME/thegn/accounts/<provider>/<name>`), which
@@ -513,6 +518,9 @@ Cleanup is always explicit — thegn never prunes on a schedule.
   a sandbox container (enabled globally or by the active profile, an env
   overlay, or a repo overlay for a known worktree); `thegn sandbox gc` runs it
   regardless.
+  It also removes Compose project adoption records older than an hour whose
+  worktree is gone, both during gc and the startup sweep; an empty worktree list
+  leaves those records alone.
   Safe to run any time.
 - `thegn sandbox prune` reclaims **thegn-owned (`thegn-` name family) stopped
   containers**, and `thegn.managed` images and volumes. On a terminal it
