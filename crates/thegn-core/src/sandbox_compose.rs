@@ -1638,12 +1638,8 @@ mod tests {
         );
     }
 
-    fn write_adoption_record(
-        state: &crate::testenv::IsolatedState,
-        file_name: &str,
-        body: &str,
-    ) -> PathBuf {
-        crate::fsperm::ensure_private_dir_beneath(state.path(), Path::new("thegn/compose-projects"))
+    fn write_adoption_record(state_home: &Path, file_name: &str, body: &str) -> PathBuf {
+        crate::fsperm::ensure_private_dir_beneath(state_home, Path::new("thegn/compose-projects"))
             .expect("private adoption directory")
             .write_owner_only_atomic(file_name, body.as_bytes())
             .expect("write adoption record")
@@ -1652,20 +1648,22 @@ mod tests {
     #[test]
     fn adoption_record_sweep_removes_records_of_vanished_worktrees() {
         let state = crate::testenv::IsolatedState::new();
+        let state_home = state.state_home();
+        std::fs::create_dir_all(&state_home).expect("isolated state home exists");
         let live_record = write_adoption_record(
-            &state,
+            &state_home,
             "live.adopted",
             &crate::sandbox::container_name("/live/wt"),
         );
         let gone_record = write_adoption_record(
-            &state,
+            &state_home,
             "gone.adopted",
             &crate::sandbox::container_name("/gone/wt"),
         );
         let now = std::time::SystemTime::now() + Duration::from_secs(7200);
 
         let removed = sweep_stale_adoption_records_in(
-            state.path(),
+            &state_home,
             &["/live/wt".into()],
             now,
             Duration::from_secs(3600),
@@ -1679,14 +1677,16 @@ mod tests {
     #[test]
     fn adoption_record_sweep_keeps_named_profile_records_of_live_worktrees() {
         let state = crate::testenv::IsolatedState::new();
+        let state_home = state.state_home();
+        std::fs::create_dir_all(&state_home).expect("isolated state home exists");
         let record = write_adoption_record(
-            &state,
+            &state_home,
             "profile.adopted",
             &crate::sandbox::container_name_with_profile("/live/wt", Some("work")),
         );
 
         let removed = sweep_stale_adoption_records_in(
-            state.path(),
+            &state_home,
             &["/live/wt".into()],
             std::time::SystemTime::now() + Duration::from_secs(7200),
             Duration::from_secs(3600),
@@ -1699,26 +1699,28 @@ mod tests {
     #[test]
     fn adoption_record_sweep_keeps_young_records_and_does_nothing_without_a_registry() {
         let state = crate::testenv::IsolatedState::new();
-        let live_record = write_adoption_record(
-            &state,
+        let state_home = state.state_home();
+        std::fs::create_dir_all(&state_home).expect("isolated state home exists");
+        let young_record = write_adoption_record(
+            &state_home,
             "young.adopted",
             &crate::sandbox::container_name("/gone/wt"),
         );
         let empty_registry_record = write_adoption_record(
-            &state,
+            &state_home,
             "empty-registry.adopted",
             &crate::sandbox::container_name("/gone/other"),
         );
         let min_age = Duration::from_secs(3600);
 
         let young_removed = sweep_stale_adoption_records_in(
-            state.path(),
+            &state_home,
             &["/live/wt".into()],
             std::time::SystemTime::now(),
             min_age,
         );
         let empty_registry_removed = sweep_stale_adoption_records_in(
-            state.path(),
+            &state_home,
             &[],
             std::time::SystemTime::now() + Duration::from_secs(7200),
             min_age,
@@ -1726,7 +1728,7 @@ mod tests {
 
         assert_eq!(young_removed, 0);
         assert_eq!(empty_registry_removed, 0);
-        assert!(live_record.exists());
+        assert!(young_record.exists());
         assert!(empty_registry_record.exists());
     }
 
@@ -1734,18 +1736,22 @@ mod tests {
     #[test]
     fn adoption_record_sweep_skips_symlinks_and_foreign_files() {
         let state = crate::testenv::IsolatedState::new();
-        let symlink_target = state.path().join("outside.adopted");
+        let state_home = state.state_home();
+        std::fs::create_dir_all(&state_home).expect("isolated state home exists");
+        let symlink_target = state_home.join("outside.adopted");
         std::fs::write(&symlink_target, "thegn-gone").expect("write symlink target");
-        let adoption_dir = state.path().join("thegn/compose-projects");
+        let adoption_dir = state_home.join("thegn/compose-projects");
         std::fs::create_dir_all(&adoption_dir).expect("create adoption directory");
         let symlink_record = adoption_dir.join("link.adopted");
         std::os::unix::fs::symlink(&symlink_target, &symlink_record)
             .expect("create adoption symlink");
-        let notes = write_adoption_record(&state, "notes.txt", "thegn-gone");
-        let foreign = write_adoption_record(&state, "foreign.adopted", "other-gone");
+        let notes = write_adoption_record(&state_home, "notes.txt", "thegn-gone");
+        let foreign = write_adoption_record(&state_home, "foreign.adopted", "other-gone");
+        let oversized_body = format!("thegn-{}", "x".repeat(4096));
+        let oversized = write_adoption_record(&state_home, "oversized.adopted", &oversized_body);
 
         let removed = sweep_stale_adoption_records_in(
-            state.path(),
+            &state_home,
             &["/live/wt".into()],
             std::time::SystemTime::now() + Duration::from_secs(7200),
             Duration::from_secs(3600),
@@ -1759,6 +1765,7 @@ mod tests {
         );
         assert!(notes.exists());
         assert!(foreign.exists());
+        assert!(oversized.exists());
     }
 
     #[test]
