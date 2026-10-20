@@ -65,6 +65,51 @@ perf_build_fixture() {
   echo "$root"
 }
 
+# perf_add_lfs_fixture <repo>
+# Adds same-size stat-dirty LFS-shaped files to the primary worktree and installs
+# a required clean+process filter backed by a canned protocol-v2 server. The
+# config is repo-local because gix's handling of the isolated global config is
+# not guaranteed to match Git's; linked worktrees share this .git/config.
+perf_add_lfs_fixture() {
+  local repo="$1" server_dir="$PERF_TMP/lfs-filter" server_bytes process_cmd
+  server_bytes="$server_dir/server-bytes"
+  mkdir -p "$server_dir"
+  python3 - "$server_bytes" <<'PY'
+import sys
+
+def pkt(payload):
+    return f"{len(payload) + 4:04x}".encode("ascii") + payload
+
+greeting = pkt(b"git-filter-server\n") + pkt(b"version=2\n") + b"0000"
+capabilities = pkt(b"capability=clean\n") + b"0000"
+response = pkt(b"status=success\n") + b"0000" + pkt(b"lfs-clean\n") + b"0000" + pkt(b"status=success\n") + b"0000"
+with open(sys.argv[1], "wb") as server:
+    server.write(greeting)
+    server.write(capabilities)
+    server.write(response * 200000)
+PY
+  if [ "$(head -c 22 "$server_bytes")" != "0016git-filter-server" ]; then
+    echo "FAIL: generated LFS filter server bytes have an invalid greeting: $server_bytes" >&2
+    return 1
+  fi
+
+  printf '%s\n' '*.bin filter=lfs diff=lfs merge=lfs -text' >"$repo/.gitattributes"
+  for i in 1 2 3; do printf 'blob-%s-v0\n' "$i" >"$repo/asset_$i.bin"; done
+  git -C "$repo" add .gitattributes asset_1.bin asset_2.bin asset_3.bin
+  git -C "$repo" -c commit.gpgsign=false commit -q -m "add LFS-shaped soak files"
+
+  # shellcheck disable=SC2016 # The literal $1 is expanded by the configured child shell.
+  printf -v process_cmd 'sh -c %q sh %q' 'cat "$1"; exec cat >/dev/null' "$server_bytes"
+  git -C "$repo" config filter.lfs.process "$process_cmd"
+  git -C "$repo" config filter.lfs.clean cat
+  git -C "$repo" config filter.lfs.required true
+  for i in 1 2 3; do
+    printf 'blob-%s-v1\n' "$i" >"$repo/asset_$i.bin"
+    touch "$repo/asset_$i.bin"
+  done
+  git -C "$repo" push -q origin main
+}
+
 # Run one isolated startup so the thegn DB and the workspace's own registry
 # entry exist, then register each linked fixture worktree for session adoption.
 # Requires the caller to have sourced test/lib/pty.sh and set $HERE.
