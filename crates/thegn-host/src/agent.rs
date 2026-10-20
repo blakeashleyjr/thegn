@@ -2155,14 +2155,6 @@ pub fn provision_provider_env_named(
         progress(&boot);
     }
 
-    // Site the workspace under the sandbox login's real `$HOME` (a property of the
-    // IMAGE: machine0's NixOS image logs in as `nix`/`/home/nix`, others as root) —
-    // a bare `/workspace` at the root fs is not writable by a non-root login and
-    // fails the "Prepare workspace" `mkdir`. Caches the home so the pane, chrome
-    // reads, and marker checks all resolve the SAME path (`provider_workdir`).
-    let (sprite_home, workdir) = crate::provider_workdir::probe_and_resolve(&provider, &id, pc);
-    let marker = EnvPlan::marker_path(&workdir);
-
     // Host-local repository membership is needed both by provisioning and by
     // the post-checkpoint return-credential policy.
     let repo_root: PathBuf = Db::open()
@@ -2172,6 +2164,48 @@ pub fn provision_provider_env_named(
         .map(PathBuf::from)
         .or_else(|| repo::main_worktree(Path::new(worktree)))
         .unwrap_or_else(|| PathBuf::from(worktree));
+    let loc = GitLoc::for_worktree(Path::new(worktree));
+    let resolved = cfg.resolve_env(&repo_root, &loc, Path::new(worktree), Some(env_name));
+    let allow = &resolved.sandbox.network_allow;
+    let block = &resolved.sandbox.network_block;
+    let admission =
+        crate::egress_admit::egress_admission(created, provider.caps().egress, allow, block);
+    let egress_steps = crate::egress_admit::BlockingProviderEgress {
+        provider: &provider,
+    };
+    if admission != crate::egress_admit::EgressAdmission::Skip {
+        let mut network_policy = ProvisionStepView {
+            label: "Network policy".into(),
+            state: ProvisionState::Active,
+            detail: None,
+        };
+        progress(&[network_policy.clone()]);
+        let admission_result = match admission {
+            crate::egress_admit::EgressAdmission::Skip => Ok(()),
+            crate::egress_admit::EgressAdmission::AdmitFresh => {
+                crate::egress_admit::admit_egress(&egress_steps, &id, allow, block)
+            }
+            crate::egress_admit::EgressAdmission::VerifyExisting => {
+                crate::egress_admit::verify_existing_egress(&egress_steps, &id, allow, block)
+            }
+        };
+        if let Err(e) = admission_result {
+            network_policy.state = ProvisionState::Failed;
+            network_policy.detail = Some(format!("{e:#}"));
+            progress(&[network_policy]);
+            return Err(anyhow::anyhow!("sandbox {id}: {e:#}"));
+        }
+        network_policy.state = ProvisionState::Done;
+        progress(&[network_policy]);
+    }
+
+    // Site the workspace under the sandbox login's real `$HOME` (a property of the
+    // IMAGE: machine0's NixOS image logs in as `nix`/`/home/nix`, others as root) —
+    // a bare `/workspace` at the root fs is not writable by a non-root login and
+    // fails the "Prepare workspace" `mkdir`. Caches the home so the pane, chrome
+    // reads, and marker checks all resolve the SAME path (`provider_workdir`).
+    let (sprite_home, workdir) = crate::provider_workdir::probe_and_resolve(&provider, &id, pc);
+    let marker = EnvPlan::marker_path(&workdir);
 
     // Idempotent: already provisioned ⇒ nothing to do (no new checkpoint) — but
     // still refresh auth creds: the host's OAuth token rotates, so the
@@ -2203,11 +2237,7 @@ pub fn provision_provider_env_named(
     // different `strategy`, e.g. host-parity on a big box, clean on a sprite), then
     // resolve which dotfiles to upload under that strategy (drops a non-portable rc
     // with a warning; collects host store roots for host-parity).
-    let loc = GitLoc::for_worktree(Path::new(worktree));
-    let home = cfg
-        .resolve_env(&repo_root, &loc, Path::new(worktree), Some(env_name))
-        .sandbox
-        .home;
+    let home = resolved.sandbox.home;
     let host_home = std::env::var("HOME")
         .map(PathBuf::from)
         .unwrap_or_else(|_| PathBuf::from("/root"));
@@ -2988,6 +3018,27 @@ fn auto_provision_sandbox(cfg: &Config, env_name: &str, worktree: &str) -> anyho
     };
     match block_on_provider(|| async { provider.ensure_exists(&name).await }) {
         Ok(true) => {
+            let repo_root = repo_root_for(worktree);
+            let resolved = cfg.resolve_env(
+                &repo_root,
+                &GitLoc::for_worktree(Path::new(worktree)),
+                Path::new(worktree),
+                Some(env_name),
+            );
+            let allow = &resolved.sandbox.network_allow;
+            let block = &resolved.sandbox.network_block;
+            if crate::egress_admit::egress_admission(true, provider.caps().egress, allow, block)
+                == crate::egress_admit::EgressAdmission::AdmitFresh
+            {
+                crate::egress_admit::admit_egress(
+                    &crate::egress_admit::BlockingProviderEgress {
+                        provider: &provider,
+                    },
+                    &name,
+                    allow,
+                    block,
+                )?;
+            }
             thegn_core::msg::info(&format!("provisioned sandbox {name}"));
             Ok(())
         }
