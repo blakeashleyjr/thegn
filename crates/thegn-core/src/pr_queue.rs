@@ -14,6 +14,7 @@
 use crate::agent_task::TaskKind;
 use crate::config_pr_queue::{PrMergeMode, PrQueueConfig, PrWatchKind};
 use crate::forge::model::{Bucket, CheckRun, PrStatus, check_bucket};
+use std::fmt;
 
 /// Prove that the fetched PR is the same repository and number that was
 /// explicitly bound when the queue row was created.
@@ -468,55 +469,118 @@ pub fn decide(blocker: &Blocker, facts: &PrQueueFacts, cfg: &PrQueueConfig) -> Q
 /// Callers still establish facts that require I/O (such as authorship proof and
 /// current checkout state); this function makes the policy decision from those
 /// facts and the persisted queue row.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AgentAdmissionRefusal {
+    UnknownStatus(String),
+    RowState(&'static str),
+    Disabled,
+    Unwatched(PrWatchKind),
+    ForeignPush,
+    NoAgent,
+    NotOwn,
+    Policy,
+    NeedsHuman(String),
+    Closed,
+    Blocker,
+    PromptInvalid { kind: TaskKind },
+    IsolationRefused(String),
+}
+
+impl fmt::Display for AgentAdmissionRefusal {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::UnknownStatus(status) => write!(
+                f,
+                "unknown PR queue status `{status}`; agent dispatch refused"
+            ),
+            Self::RowState(status) => {
+                write!(f, "PR queue row is `{status}`; agent dispatch refused")
+            }
+            Self::Disabled => f.write_str("PR queue is disabled; agent dispatch refused"),
+            Self::Unwatched(kind) => {
+                let class = match kind {
+                    PrWatchKind::Ci => "CI",
+                    PrWatchKind::Conflict => "conflict",
+                    PrWatchKind::Review => "review",
+                };
+                write!(
+                    f,
+                    "{class} is not in [pr_queue] watch; agent dispatch refused"
+                )
+            }
+            Self::ForeignPush => f.write_str(
+                "someone else pushed to this branch — not running an agent over their work",
+            ),
+            Self::NoAgent => f.write_str("no PR-queue agent is configured; agent dispatch refused"),
+            Self::NotOwn => f.write_str("PR is not authored by this user; agent dispatch refused"),
+            Self::Policy => f.write_str("PR queue policy does not permit agent dispatch"),
+            Self::NeedsHuman(reason) => f.write_str(reason),
+            Self::Closed => f.write_str("PR is closed; agent dispatch refused"),
+            Self::Blocker => f.write_str("PR blocker does not permit agent dispatch"),
+            Self::PromptInvalid { kind } => write!(
+                f,
+                "agent not dispatched: [pr_queue.prompts] template for {kind} is invalid"
+            ),
+            Self::IsolationRefused(reason) => f.write_str(reason),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum IsolationAdmission {
+    Admitted,
+    Degraded(String),
+    Refused(String),
+}
+
+pub fn admit_prepared_dispatch(
+    kind: TaskKind,
+    prompt_ok: bool,
+    isolation: &IsolationAdmission,
+) -> Result<(), AgentAdmissionRefusal> {
+    if let IsolationAdmission::Refused(reason) = isolation {
+        return Err(AgentAdmissionRefusal::IsolationRefused(reason.clone()));
+    }
+    if !prompt_ok {
+        return Err(AgentAdmissionRefusal::PromptInvalid { kind });
+    }
+    Ok(())
+}
+
 pub fn admit_agent_dispatch(
     row_status: &str,
     blocker: &Blocker,
     facts: &PrQueueFacts,
     new_head: &str,
     cfg: &PrQueueConfig,
-) -> Result<TaskKind, String> {
+) -> Result<TaskKind, AgentAdmissionRefusal> {
     let status = PrqStatus::parse(row_status)
-        .ok_or_else(|| format!("unknown PR queue status `{row_status}`; agent dispatch refused"))?;
+        .ok_or_else(|| AgentAdmissionRefusal::UnknownStatus(row_status.to_string()))?;
     if status.is_settled() || matches!(status, PrqStatus::AgentRunning | PrqStatus::Merging) {
-        return Err(format!(
-            "PR queue row is `{}`; agent dispatch refused",
-            status.as_str()
-        ));
+        return Err(AgentAdmissionRefusal::RowState(status.as_str()));
     }
     if !cfg.enabled {
-        return Err("PR queue is disabled; agent dispatch refused".into());
+        return Err(AgentAdmissionRefusal::Disabled);
     }
     if let Some(kind) = blocker.watch_kind().filter(|kind| !cfg.watches(*kind)) {
-        let class = match kind {
-            PrWatchKind::Ci => "CI",
-            PrWatchKind::Conflict => "conflict",
-            PrWatchKind::Review => "review",
-        };
-        return Err(format!(
-            "{class} is not in [pr_queue] watch; agent dispatch refused"
-        ));
+        return Err(AgentAdmissionRefusal::Unwatched(kind));
     }
     match decide(blocker, facts, cfg) {
         QueueAction::DispatchAgent(kind) => {
             if foreign_push(facts.last_head_oid.as_deref(), new_head) && cfg.pause_on_foreign_push {
-                Err(
-                    "someone else pushed to this branch — not running an agent over their work"
-                        .into(),
-                )
+                Err(AgentAdmissionRefusal::ForeignPush)
             } else {
                 Ok(kind)
             }
         }
-        QueueAction::Wait if !facts.agent_available => {
-            Err("no PR-queue agent is configured; agent dispatch refused".into())
-        }
+        QueueAction::Wait if !facts.agent_available => Err(AgentAdmissionRefusal::NoAgent),
         QueueAction::Wait if cfg.own_prs_only && !facts.is_own => {
-            Err("PR is not authored by this user; agent dispatch refused".into())
+            Err(AgentAdmissionRefusal::NotOwn)
         }
-        QueueAction::Wait => Err("PR queue policy does not permit agent dispatch".into()),
-        QueueAction::NeedsHuman(reason) => Err(reason),
-        QueueAction::Drop => Err("PR is closed; agent dispatch refused".into()),
-        _ => Err("PR blocker does not permit agent dispatch".into()),
+        QueueAction::Wait => Err(AgentAdmissionRefusal::Policy),
+        QueueAction::NeedsHuman(reason) => Err(AgentAdmissionRefusal::NeedsHuman(reason)),
+        QueueAction::Drop => Err(AgentAdmissionRefusal::Closed),
+        _ => Err(AgentAdmissionRefusal::Blocker),
     }
 }
 
@@ -937,48 +1001,45 @@ mod tests {
                         status.as_str()
                     );
                     if !status_allows {
-                        assert!(got.as_ref().unwrap_err().contains(status.as_str()));
+                        assert_eq!(got, Err(AgentAdmissionRefusal::RowState(status.as_str())));
                     } else if !watched {
-                        assert!(
-                            got.as_ref()
-                                .unwrap_err()
-                                .contains("CI is not in [pr_queue] watch")
-                        );
+                        assert_eq!(got, Err(AgentAdmissionRefusal::Unwatched(PrWatchKind::Ci)));
                     }
                     if moved && pause && watched && status_allows {
-                        assert!(got.as_ref().unwrap_err().contains("someone else pushed"));
+                        assert_eq!(got, Err(AgentAdmissionRefusal::ForeignPush));
                     }
                 }
             }
         }
-        assert!(admit_agent_dispatch("unknown", &blocker, &facts(), "abc", &cfg()).is_err());
+        assert_eq!(
+            admit_agent_dispatch("unknown", &blocker, &facts(), "abc", &cfg()),
+            Err(AgentAdmissionRefusal::UnknownStatus("unknown".into()))
+        );
         let mut disabled = cfg();
         disabled.enabled = false;
-        assert!(
-            admit_agent_dispatch("blocked_ci", &blocker, &facts(), "abc", &disabled)
-                .unwrap_err()
-                .contains("disabled")
+        assert_eq!(
+            admit_agent_dispatch("blocked_ci", &blocker, &facts(), "abc", &disabled),
+            Err(AgentAdmissionRefusal::Disabled)
         );
 
         let mut unavailable = facts();
         unavailable.agent_available = false;
-        assert!(
-            admit_agent_dispatch("blocked_ci", &blocker, &unavailable, "abc", &cfg())
-                .unwrap_err()
-                .contains("agent is configured")
+        assert_eq!(
+            admit_agent_dispatch("blocked_ci", &blocker, &unavailable, "abc", &cfg()),
+            Err(AgentAdmissionRefusal::NoAgent)
         );
         let mut not_own = facts();
         not_own.is_own = false;
-        assert!(
-            admit_agent_dispatch("blocked_ci", &blocker, &not_own, "abc", &cfg())
-                .unwrap_err()
-                .contains("not authored")
+        assert_eq!(
+            admit_agent_dispatch("blocked_ci", &blocker, &not_own, "abc", &cfg()),
+            Err(AgentAdmissionRefusal::NotOwn)
         );
         let mut no_checkout = facts();
         no_checkout.worktree = None;
         assert!(
             admit_agent_dispatch("blocked_ci", &blocker, &no_checkout, "abc", &cfg())
                 .unwrap_err()
+                .to_string()
                 .contains("worktree")
         );
         let mut over_budget = facts();
@@ -986,16 +1047,19 @@ mod tests {
         assert!(
             admit_agent_dispatch("blocked_ci", &blocker, &over_budget, "abc", &cfg())
                 .unwrap_err()
+                .to_string()
                 .contains("attempt")
         );
         assert!(
             admit_agent_dispatch("watching", &Blocker::Draft, &facts(), "abc", &cfg())
                 .unwrap_err()
+                .to_string()
                 .contains("does not permit")
         );
         assert!(
             admit_agent_dispatch("watching", &Blocker::Closed, &facts(), "abc", &cfg())
                 .unwrap_err()
+                .to_string()
                 .contains("closed")
         );
         assert!(admit_agent_dispatch("ready", &Blocker::None, &facts(), "abc", &cfg()).is_err());
@@ -1011,6 +1075,7 @@ mod tests {
                 &ci_only
             )
             .unwrap_err()
+            .to_string()
             .contains("conflict is not in [pr_queue] watch")
         );
         assert!(
@@ -1022,8 +1087,105 @@ mod tests {
                 &ci_only
             )
             .unwrap_err()
+            .to_string()
             .contains("review is not in [pr_queue] watch")
         );
+    }
+
+    #[test]
+    fn typed_admission_refusal_display_matches_legacy_strings() {
+        let cases = [
+            (
+                AgentAdmissionRefusal::UnknownStatus("mystery".into()),
+                "unknown PR queue status `mystery`; agent dispatch refused",
+            ),
+            (
+                AgentAdmissionRefusal::RowState("merged"),
+                "PR queue row is `merged`; agent dispatch refused",
+            ),
+            (
+                AgentAdmissionRefusal::Disabled,
+                "PR queue is disabled; agent dispatch refused",
+            ),
+            (
+                AgentAdmissionRefusal::Unwatched(PrWatchKind::Ci),
+                "CI is not in [pr_queue] watch; agent dispatch refused",
+            ),
+            (
+                AgentAdmissionRefusal::Unwatched(PrWatchKind::Conflict),
+                "conflict is not in [pr_queue] watch; agent dispatch refused",
+            ),
+            (
+                AgentAdmissionRefusal::Unwatched(PrWatchKind::Review),
+                "review is not in [pr_queue] watch; agent dispatch refused",
+            ),
+            (
+                AgentAdmissionRefusal::ForeignPush,
+                "someone else pushed to this branch — not running an agent over their work",
+            ),
+            (
+                AgentAdmissionRefusal::NoAgent,
+                "no PR-queue agent is configured; agent dispatch refused",
+            ),
+            (
+                AgentAdmissionRefusal::NotOwn,
+                "PR is not authored by this user; agent dispatch refused",
+            ),
+            (
+                AgentAdmissionRefusal::Policy,
+                "PR queue policy does not permit agent dispatch",
+            ),
+            (
+                AgentAdmissionRefusal::NeedsHuman("human review required".into()),
+                "human review required",
+            ),
+            (
+                AgentAdmissionRefusal::Closed,
+                "PR is closed; agent dispatch refused",
+            ),
+            (
+                AgentAdmissionRefusal::Blocker,
+                "PR blocker does not permit agent dispatch",
+            ),
+            (
+                AgentAdmissionRefusal::PromptInvalid {
+                    kind: TaskKind::PrCiFailure,
+                },
+                "agent not dispatched: [pr_queue.prompts] template for pr_ci_failure is invalid",
+            ),
+            (
+                AgentAdmissionRefusal::IsolationRefused("sandbox unavailable".into()),
+                "sandbox unavailable",
+            ),
+        ];
+        for (refusal, expected) in cases {
+            assert_eq!(refusal.to_string(), expected, "{refusal:?}");
+        }
+    }
+
+    #[test]
+    fn prepared_dispatch_table() {
+        let kind = TaskKind::PrCiFailure;
+        for prompt_ok in [true, false] {
+            for isolation in [
+                IsolationAdmission::Admitted,
+                IsolationAdmission::Degraded("degraded".into()),
+                IsolationAdmission::Refused("floor refused".into()),
+            ] {
+                let got = admit_prepared_dispatch(kind, prompt_ok, &isolation);
+                let expected = match (&isolation, prompt_ok) {
+                    (IsolationAdmission::Refused(reason), _) => {
+                        Err(AgentAdmissionRefusal::IsolationRefused(reason.clone()))
+                    }
+                    (_, false) => Err(AgentAdmissionRefusal::PromptInvalid { kind }),
+                    _ => Ok(()),
+                };
+                assert_eq!(
+                    got, expected,
+                    "prompt_ok={prompt_ok}, isolation={isolation:?}"
+                );
+            }
+        }
     }
 
     #[test]
