@@ -197,12 +197,16 @@ jobs:
         with:
           bin: thegn
           target: ${{ matrix.target }}
+          # The binary lives in the thegn-host crate.
           manifest-path: crates/thegn-host/Cargo.toml
           archive: thegn-$tag-$target
+          # Both licenses and the README are included. Keep the binary at the archive
+          # root: the Homebrew formula installs it with `bin.install "thegn"`.
           include: LICENSE-MIT,LICENSE-APACHE,README.md
           checksum: sha256
+          # Build against the committed Cargo.lock.
           locked: true
-          ref: ${{ needs.admit.outputs.sha }}
+          ref: refs/tags/${{ needs.admit.outputs.tag }}
           dry-run: true
           dry-run-intended: true
       - name: Stage archive and verified checksum
@@ -314,6 +318,14 @@ jobs:
             echo "::error::release tag moved after admission"
             exit 1
           }
+      - name: Attest release archive provenance
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: |
+            ${{ runner.temp }}/release/thegn-${{ needs.admit.outputs.tag }}-x86_64-unknown-linux-gnu.tar.gz
+            ${{ runner.temp }}/release/thegn-${{ needs.admit.outputs.tag }}-x86_64-unknown-linux-musl.tar.gz
+            ${{ runner.temp }}/release/thegn-${{ needs.admit.outputs.tag }}-aarch64-apple-darwin.tar.gz
+            ${{ runner.temp }}/release/thegn-${{ needs.admit.outputs.tag }}-completions.tar.gz
       - name: Upload verified release assets
         env:
           TAG: ${{ needs.admit.outputs.tag }}
@@ -323,14 +335,6 @@ jobs:
           release="$RUNNER_TEMP/release"
           assets=("$release"/thegn-"$TAG"-*.tar.gz "$release"/thegn-"$TAG"-*.sha256)
           gh release upload "$TAG" "${assets[@]}" --clobber
-      - name: Attest release archive provenance
-        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
-        with:
-          subject-path: |
-            ${{ runner.temp }}/release/thegn-${{ needs.admit.outputs.tag }}-x86_64-unknown-linux-gnu.tar.gz
-            ${{ runner.temp }}/release/thegn-${{ needs.admit.outputs.tag }}-x86_64-unknown-linux-musl.tar.gz
-            ${{ runner.temp }}/release/thegn-${{ needs.admit.outputs.tag }}-aarch64-apple-darwin.tar.gz
-            ${{ runner.temp }}/release/thegn-${{ needs.admit.outputs.tag }}-completions.tar.gz
       - name: Write and publish release record
         env:
           TAG: ${{ needs.admit.outputs.tag }}
