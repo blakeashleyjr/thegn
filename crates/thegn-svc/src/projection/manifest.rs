@@ -29,7 +29,7 @@ impl std::fmt::Display for ProjectionOwnershipError {
                     .unwrap_or_else(|| path.display().to_string());
                 write!(
                     f,
-                    "no ownership manifest at {manifest}; move {mountpoint} aside and mount again"
+                    "ownership manifest missing for mountpoint {mountpoint} ({manifest}); move {mountpoint} aside and mount again"
                 )
             }
             Self::Malformed(message) => write!(
