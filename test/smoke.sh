@@ -1734,6 +1734,21 @@ check "dispatch list (human) says the roster is empty" \
   "'$SZ' dispatch list | grep -q 'no dispatches'"
 check "dispatch set-status rejects a status outside the closed set" \
   "'$SZ' dispatch set-status 1 bogus >/dev/null 2>&1; [[ \$? -ne 0 ]]"
+queued_matrix_row="$("$SZ" dispatch put linear:SMOKE-MATRIX "$R" claude | sed -n 's/^dispatch \([0-9]*\) .*/\1/p')"
+set +e
+queued_matrix_target="done"
+queued_matrix_done_out="$("$SZ" dispatch set-status "$queued_matrix_row" "$queued_matrix_target" 2>&1)"
+queued_matrix_done_rc=$?
+queued_matrix_target="queued"
+"$SZ" dispatch set-status "$queued_matrix_row" "$queued_matrix_target" >/dev/null 2>&1
+queued_matrix_queued_rc=$?
+set -e
+queued_matrix_done_message_ok=1
+grep -q 'queued to done' <<<"$queued_matrix_done_out" || queued_matrix_done_message_ok=0
+check "dispatch set-status refuses queued directly to done" \
+  "[[ -n '$queued_matrix_row' && $queued_matrix_done_rc -ne 0 && $queued_matrix_done_message_ok -eq 1 ]]"
+check "dispatch set-status never accepts queued as a target" \
+  "[[ $queued_matrix_queued_rc -ne 0 ]]"
 check "dispatch set-status rejects an unknown dispatch id" \
   "'$SZ' dispatch set-status 999999 done >/dev/null 2>&1; [[ \$? -ne 0 ]]"
 # A configured stage backs the `session open --stage` offline refusals below
@@ -1847,8 +1862,8 @@ check "dispatch put creates a stage-less plain row" \
 # --- run-completion contract (THE-76): wait / verify / the gated done --------
 # The wait verbs answer from the local roster alone when the selection has
 # nothing to wait on — they must not require (or contact) a daemon, so the
-# error text is the roster's, never the no-daemon message. Row 1 (from above)
-# is `queued`: not a live worker, so `--any` has nothing to wait on.
+# error text is the roster's, never the no-daemon message. The plain row from
+# above is `queued`: not a live worker, so `--any` has nothing to wait on.
 set +e
 wany_out="$("$SZ" dispatch wait --any --timeout 5 2>&1)"
 wany_rc=$?
@@ -1878,6 +1893,7 @@ check "dispatch verify on a row with no artifact reports ok and exits 0" \
   "[[ $v1_ok -eq 1 ]]"
 artifact_row_json="$("$SZ" dispatch put linear:SMOKE-3 "$R" claude --stage code --artifact .thegn/pipeline/SMOKE-7/missing/2.md --json)"
 artifact_row="$(printf '%s' "$artifact_row_json" | sed -n 's/.*"id":\([0-9]*\).*/\1/p')"
+"$SZ" dispatch set-status "$artifact_row" running >/dev/null
 check "dispatch put records an artifact pointer" \
   "[[ -n '$artifact_row' ]] && printf '%s' '$artifact_row_json' | grep -q '\"artifact_path\":\".thegn/pipeline/SMOKE-7/missing/2.md\"'"
 # A missing artifact is a retryable not-yet (exit 2, the `session wait`
@@ -1908,6 +1924,7 @@ check "set-status done --force overrides and says so" \
 # failure ("session exit ≠ done") the gate exists to catch. Committing it
 # flips the gate open; a forced completion stays visible in the output.
 untracked_row="$("$SZ" dispatch put linear:SMOKE-4 "$R" claude --stage review --artifact .thegn/pipeline/SMOKE-7/untracked/3.md | sed -n 's/^dispatch \([0-9]*\) .*/\1/p')"
+"$SZ" dispatch set-status "$untracked_row" running >/dev/null
 check "dispatch put records an untracked artifact row" \
   "[[ -n '$untracked_row' ]]"
 mkdir -p "$R/.thegn/pipeline/SMOKE-7/untracked"
@@ -2025,6 +2042,7 @@ check "session open --resume-work refuses a non-pipeline row" \
 # pipeline row is refused daemon-free, naming the status.
 set +e
 sdone_row="$($SZ dispatch put linear:SMOKE-5 "$R" claude --stage code 2>/dev/null | sed -n 's/^dispatch \([0-9]*\) .*/\1/p')"
+"$SZ" dispatch set-status "$sdone_row" running >/dev/null
 # `done` is passed via a variable: a literal `done` inside $() reads as a
 # shell keyword to shellcheck (SC1010).
 sdone_status="done"
@@ -2078,6 +2096,7 @@ CA_JSON="$($SZ dispatch put linear:SMOKE-6 "$CWT" claude --stage smoke-chunk --c
 check "dispatch put --chunk records the chunk_path" \
   "printf '%s' \"\$CA_JSON\" | grep -q '\"chunk_path\":\".thegn/pipeline/SMOKE-7/code/chunk-1.md\"'"
 CA_ROW="$(printf '%s' "$CA_JSON" | sed -n 's/.*"id":\([0-9]*\).*/\1/p')"
+"$SZ" dispatch set-status "$CA_ROW" running >/dev/null
 check "dispatch list --json carries the parsed chunk_files" \
   "'$SZ' dispatch list --json | grep -q '\"chunk_files_from_file_at_display_time\"' && '$SZ' dispatch list --json | grep -q 'pipeline_run.rs'"
 set +e
