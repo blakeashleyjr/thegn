@@ -174,8 +174,8 @@ probing — `podman-rootless`, `podman-rootful`, `docker`, `bwrap`, `systemd`,
 The outer `bwrap` and `systemd-run` launchers are resolved to absolute paths
 from thegn's own `PATH`. If either is missing there, launch is refused rather
 than resolving it from the pane environment. Loader variables such as `LD_*`
-and `DYLD_*` are withheld from the outer launcher and passed only inside the
-sandbox.
+and `DYLD_*` are withheld from the outer launcher. Under `bwrap` they are set
+again inside the sandbox; a `systemd-run` launch without `bwrap` drops them.
 
 For local rootless Podman, the first thegn command is the `version` liveness
 probe, before container creation or the events client. The `podman events`

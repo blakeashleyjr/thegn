@@ -33,8 +33,8 @@ exits nonzero and keeps the record so you can retry. A share started by a
 foreground `thegn share start` is stopped by interrupting that command. Use
 `thegn share stop <port> --forget` only to remove the saved record; it does not
 touch the tunnel.
-Stopping a share while it is still starting cancels the start, so the tunnel
-does not come up after the stop request.
+Stopping a share in thegn while it is still starting cancels the start, so
+the tunnel does not come up after the stop request.
 
 ## Auto port forwards (`[forward]`)
 
