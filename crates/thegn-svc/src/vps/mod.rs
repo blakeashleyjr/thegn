@@ -890,7 +890,7 @@ impl VpsProvider {
                         .min(crate::provider::CONTROL_TIMEOUT),
                 )
                 .await?;
-            match hetzner::parse_action_status(&action).as_deref() {
+            match hetzner::parse_action_status(&action, action_id).as_deref() {
                 Some("success") => break,
                 Some("running") => {}
                 Some("error") => {
@@ -1003,25 +1003,44 @@ impl VpsProvider {
             );
             status = polled.status;
         }
-        let remaining = BUDGET.saturating_sub(start.elapsed());
-        anyhow::ensure!(
-            !remaining.is_zero(),
-            "vps: DO snapshot action {action_id} completed at the budget deadline"
-        );
-        let droplet = self
-            .get_json_timeout(
-                &digitalocean::droplet_url(base, id),
-                remaining.min(crate::provider::CONTROL_TIMEOUT),
-            )
-            .await?;
-        let after = digitalocean::parse_snapshot_ids(&droplet).ok_or_else(|| {
-            anyhow!(
-                "vps: malformed DO snapshot inventory for droplet {id} after action {action_id}"
-            )
-        })?;
-        digitalocean::new_snapshot_id(&before, &after).map_err(|error| {
-            anyhow!("vps: cannot bind DO snapshot action {action_id} to a new image: {error:?}")
-        })
+        loop {
+            let remaining = BUDGET.saturating_sub(start.elapsed());
+            if remaining.is_zero() {
+                return Err(anyhow!(
+                    "vps: cannot bind DO snapshot action {action_id} to a new image: {}",
+                    digitalocean::SnapshotBindError::NoNewSnapshot
+                ));
+            }
+            let droplet = self
+                .get_json_timeout(
+                    &digitalocean::droplet_url(base, id),
+                    remaining.min(crate::provider::CONTROL_TIMEOUT),
+                )
+                .await?;
+            let after = digitalocean::parse_snapshot_ids(&droplet).ok_or_else(|| {
+                anyhow!(
+                    "vps: malformed DO snapshot inventory for droplet {id} after action {action_id}"
+                )
+            })?;
+            match digitalocean::new_snapshot_id(&before, &after) {
+                Ok(snapshot_id) => return Ok(snapshot_id),
+                Err(digitalocean::SnapshotBindError::NoNewSnapshot) => {
+                    let remaining = BUDGET.saturating_sub(start.elapsed());
+                    let error = digitalocean::SnapshotBindError::NoNewSnapshot;
+                    if !digitalocean::should_retry_snapshot_bind(&error, remaining) {
+                        return Err(anyhow!(
+                            "vps: cannot bind DO snapshot action {action_id} to a new image: {error}"
+                        ));
+                    }
+                    tokio::time::sleep(std::time::Duration::from_secs(5).min(remaining)).await;
+                }
+                Err(error @ digitalocean::SnapshotBindError::AmbiguousNewSnapshots(_)) => {
+                    return Err(anyhow!(
+                        "vps: cannot bind DO snapshot action {action_id} to a new image: {error}"
+                    ));
+                }
+            }
+        }
     }
 }
 

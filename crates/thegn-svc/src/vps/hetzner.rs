@@ -285,7 +285,12 @@ pub fn parse_create_image(v: &serde_json::Value) -> Option<(i64, i64)> {
     ))
 }
 
-pub fn parse_action_status(v: &serde_json::Value) -> Option<String> {
+pub fn parse_action_status(v: &serde_json::Value, action_id: i64) -> Option<String> {
+    if v.pointer("/action/id")?.as_i64()? != action_id
+        || v.pointer("/action/command")?.as_str()? != "create_image"
+    {
+        return None;
+    }
     match v.pointer("/action/status")?.as_str()? {
         status @ ("running" | "success" | "error") => Some(status.to_string()),
         _ => None,
@@ -634,19 +639,63 @@ mod tests {
     #[test]
     fn snapshot_bind_action_status_parses_terminal_states() {
         assert_eq!(
-            parse_action_status(&serde_json::json!({"action":{"status":"running"}})),
+            parse_action_status(
+                &serde_json::json!({"action":{"id":12,"command":"create_image","status":"running"}}),
+                12
+            ),
             Some("running".into())
         );
         assert_eq!(
-            parse_action_status(&serde_json::json!({"action":{"status":"success"}})),
+            parse_action_status(
+                &serde_json::json!({"action":{"id":12,"command":"create_image","status":"success"}}),
+                12
+            ),
             Some("success".into())
         );
         assert_eq!(
-            parse_action_status(&serde_json::json!({"action":{"status":"error"}})),
+            parse_action_status(
+                &serde_json::json!({"action":{"id":12,"command":"create_image","status":"error"}}),
+                12
+            ),
             Some("error".into())
         );
         assert_eq!(
-            parse_action_status(&serde_json::json!({"action":{"status":"mystery"}})),
+            parse_action_status(
+                &serde_json::json!({"action":{"id":12,"command":"create_image","status":"mystery"}}),
+                12
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn snapshot_bind_action_status_requires_matching_action_identity() {
+        assert_eq!(
+            parse_action_status(
+                &serde_json::json!({"action":{"id":13,"command":"create_image","status":"success"}}),
+                12
+            ),
+            None
+        );
+        assert_eq!(
+            parse_action_status(
+                &serde_json::json!({"action":{"id":12,"command":"reboot","status":"success"}}),
+                12
+            ),
+            None
+        );
+        assert_eq!(
+            parse_action_status(
+                &serde_json::json!({"action":{"command":"create_image","status":"success"}}),
+                12
+            ),
+            None
+        );
+        assert_eq!(
+            parse_action_status(
+                &serde_json::json!({"action":{"id":12,"status":"success"}}),
+                12
+            ),
             None
         );
     }

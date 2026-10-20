@@ -373,6 +373,30 @@ pub enum SnapshotBindError {
     AmbiguousNewSnapshots(usize),
 }
 
+impl std::fmt::Display for SnapshotBindError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NoNewSnapshot => f.write_str("no new snapshot id appeared on the droplet"),
+            Self::AmbiguousNewSnapshots(count) => {
+                write!(
+                    f,
+                    "{count} new snapshot ids appeared (concurrent snapshot?)"
+                )
+            }
+        }
+    }
+}
+
+impl std::error::Error for SnapshotBindError {}
+
+/// No-new-id is the only bind result that can become valid on a later inventory read.
+pub fn should_retry_snapshot_bind(
+    error: &SnapshotBindError,
+    budget_remaining: std::time::Duration,
+) -> bool {
+    matches!(error, SnapshotBindError::NoNewSnapshot) && !budget_remaining.is_zero()
+}
+
 /// Bind a completed snapshot action to the sole id newly visible on the droplet.
 pub fn new_snapshot_id(before: &[String], after: &[String]) -> Result<String, SnapshotBindError> {
     let added: Vec<&String> = after
@@ -650,6 +674,35 @@ mod tests {
             new_snapshot_id(&["111".into()], &["222".into(), "333".into(), "111".into()]),
             Err(SnapshotBindError::AmbiguousNewSnapshots(2))
         );
+    }
+
+    #[test]
+    fn snapshot_bind_errors_are_user_readable() {
+        assert_eq!(
+            SnapshotBindError::NoNewSnapshot.to_string(),
+            "no new snapshot id appeared on the droplet"
+        );
+        assert_eq!(
+            SnapshotBindError::AmbiguousNewSnapshots(2).to_string(),
+            "2 new snapshot ids appeared (concurrent snapshot?)"
+        );
+    }
+
+    #[test]
+    fn snapshot_bind_retries_only_no_new_id_while_budget_remains() {
+        let step = std::time::Duration::from_secs(5);
+        assert!(should_retry_snapshot_bind(
+            &SnapshotBindError::NoNewSnapshot,
+            step
+        ));
+        assert!(!should_retry_snapshot_bind(
+            &SnapshotBindError::AmbiguousNewSnapshots(2),
+            step
+        ));
+        assert!(!should_retry_snapshot_bind(
+            &SnapshotBindError::NoNewSnapshot,
+            std::time::Duration::ZERO
+        ));
     }
 
     #[test]
