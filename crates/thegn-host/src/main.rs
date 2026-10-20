@@ -194,6 +194,7 @@ mod platform_ratchet_tests;
 mod plugin_damage;
 mod plugin_providers;
 mod plugins;
+mod pool_lease;
 mod pr_authorship;
 mod pr_driver;
 mod pr_view;
