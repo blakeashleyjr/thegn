@@ -39,6 +39,7 @@ mod chrome;
 mod ci_refresh;
 mod cli_help;
 mod clipboard;
+mod close_teardown;
 mod cmd;
 mod command_intent;
 mod compat;

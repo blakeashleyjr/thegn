@@ -2418,21 +2418,105 @@ pub fn teardown(cfg: &SandboxConfig, loc: &GitLoc, name: &str) {
 /// Remove a worktree's persistent container using its already-resolved placement.
 /// The worktree destroy path uses this when a named environment selected SSH.
 pub fn teardown_placed(cfg: &SandboxConfig, placement: &Placement, loc: &GitLoc, name: &str) {
+    if let Err(error) = teardown_placed_checked(cfg, placement, loc, name) {
+        tracing::warn!(target: "thegn::sandbox", %error, container = name, "sandbox teardown incomplete");
+    }
+}
+
+/// Why a placed teardown could not reach a remote OCI runtime.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PlacedTeardownError {
+    NoRuntime,
+    Unreachable { commands: usize },
+}
+
+impl std::fmt::Display for PlacedTeardownError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NoRuntime => f.write_str("no OCI runtime answered on the worktree's host"),
+            Self::Unreachable { commands } => write!(
+                f,
+                "{commands} teardown command(s) could not reach the worktree's host or timed out"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for PlacedTeardownError {}
+
+/// Remove a placed container, reporting remote runtime absence or unreachable commands.
+pub fn teardown_placed_checked(
+    cfg: &SandboxConfig,
+    placement: &Placement,
+    loc: &GitLoc,
+    name: &str,
+) -> Result<(), PlacedTeardownError> {
+    let state_home = util::xdg_state_home();
+    teardown_placed_with(
+        cfg,
+        placement,
+        loc,
+        name,
+        &state_home,
+        |backend| available(placement, backend),
+        run_control_t_owned,
+    )
+}
+
+fn teardown_placed_with(
+    cfg: &SandboxConfig,
+    placement: &Placement,
+    loc: &GitLoc,
+    name: &str,
+    state_home: &std::path::Path,
+    mut probe: impl FnMut(Backend) -> RuntimeProbe,
+    mut run: impl FnMut(&Placement, &[String], Duration) -> Option<bool>,
+) -> Result<(), PlacedTeardownError> {
     if !cfg.enabled {
-        return;
+        return Ok(());
     }
     // Drive the same remote daemon the create used, or `None` for the local
     // daemon; without this an `[sandbox] oci_host` container is never removed
     // (rm hits the local daemon, which never held it) and leaks forever.
     let oci_host = (!cfg.oci_host.trim().is_empty()).then(|| cfg.oci_host.trim());
-    let state_home = util::xdg_state_home();
-    let projects = teardown_projects_for_loc(&state_home, loc, name, !placement.is_local());
+    let projects = teardown_projects_for_loc(state_home, loc, name, !placement.is_local());
     // Try whichever OCI runtimes are available; the container only exists under one.
+    let mut present = false;
+    let mut unreachable = 0;
     for b in Backend::oci_runtimes() {
-        if available(placement, b) == RuntimeProbe::Present {
-            run_teardown_argvs(placement, b, teardown_argvs(b, oci_host, name, &projects));
+        if probe(b) == RuntimeProbe::Present {
+            present = true;
+            for argv in teardown_argvs(b, oci_host, name, &projects) {
+                let timeout = if argv.iter().any(|arg| arg == "down") {
+                    crate::sandbox_compose::COMPOSE_DOWN_TIMEOUT
+                } else {
+                    PROBE_TIMEOUT
+                };
+                match run(placement, &argv, timeout) {
+                    Some(true) => {}
+                    Some(false) => {
+                        tracing::debug!(backend = b.label(), "sandbox teardown command failed")
+                    }
+                    None => {
+                        unreachable += 1;
+                        tracing::debug!(
+                            backend = b.label(),
+                            "sandbox teardown command unavailable or timed out"
+                        );
+                    }
+                }
+            }
         }
     }
+    if !placement.is_local() && !present {
+        return Err(PlacedTeardownError::NoRuntime);
+    }
+    if unreachable > 0 {
+        return Err(PlacedTeardownError::Unreachable {
+            commands: unreachable,
+        });
+    }
+    Ok(())
 }
 
 /// Resolve teardown project paths from a Git location and its remote mount mode.
