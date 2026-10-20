@@ -321,14 +321,7 @@ fn drive_claim(
         sandbox: Some(sandbox),
         credential_free: true,
     });
-    if let Err(e) = db.update_dispatch_status(
-        dispatch_id,
-        if ran {
-            AgentDispatchStatus::Done
-        } else {
-            AgentDispatchStatus::Failed
-        },
-    ) {
+    if let Err(e) = record_worker_result(db, dispatch_id, ran) {
         mark_worker_failed(
             db,
             run_id,
@@ -470,15 +463,33 @@ fn drive_claim(
             return;
         }
     }
-    if let Err(e) = db.update_dispatch_status(dispatch_id, AgentDispatchStatus::PrOpen) {
-        mark_needs_human(
-            db,
-            run_id,
-            AutopilotState::PrOpened,
-            Some(dispatch_id),
-            &format!("PR dispatch status update failed: {e}"),
-        );
-        return;
+    match record_pr_open(db, dispatch_id) {
+        Ok(true) => {}
+        Ok(false) => {
+            let now = match db.get_dispatch(dispatch_id) {
+                Ok(Some(row)) => format!("{:?}", row.status),
+                Ok(None) => "missing".to_string(),
+                Err(error) => format!("unreadable after CAS loss: {error}"),
+            };
+            mark_needs_human(
+                db,
+                run_id,
+                AutopilotState::PrOpened,
+                Some(dispatch_id),
+                &format!("dispatch row changed before the PR status was recorded (now {now})"),
+            );
+            return;
+        }
+        Err(e) => {
+            mark_needs_human(
+                db,
+                run_id,
+                AutopilotState::PrOpened,
+                Some(dispatch_id),
+                &format!("PR dispatch status update failed: {e}"),
+            );
+            return;
+        }
     }
     if queue_enabled {
         if let Err(e) = db.enqueue_bound_pr(
@@ -722,6 +733,55 @@ fn autopilot_backend_is_isolated(backend: thegn_core::sandbox::Backend) -> bool 
     )
 }
 
+fn record_worker_result(db: &Db, dispatch_id: i64, ran: bool) -> anyhow::Result<()> {
+    let row = db.get_dispatch(dispatch_id)?.ok_or_else(|| {
+        anyhow::anyhow!("dispatch row changed before worker result (now missing)")
+    })?;
+    if !matches!(
+        row.status,
+        AgentDispatchStatus::Queued | AgentDispatchStatus::Spawning | AgentDispatchStatus::Running
+    ) {
+        anyhow::bail!(
+            "dispatch row changed before worker result (observed {:?})",
+            row.status
+        );
+    }
+    let status = if ran {
+        AgentDispatchStatus::Done
+    } else {
+        AgentDispatchStatus::Failed
+    };
+    if db.compare_and_set_dispatch_status(dispatch_id, row.status, status, None)? {
+        Ok(())
+    } else {
+        anyhow::bail!(
+            "dispatch row changed before worker result (observed {:?})",
+            row.status
+        )
+    }
+}
+
+fn record_pr_open(db: &Db, dispatch_id: i64) -> anyhow::Result<bool> {
+    db.compare_and_set_dispatch_status(
+        dispatch_id,
+        AgentDispatchStatus::Done,
+        AgentDispatchStatus::PrOpen,
+        None,
+    )
+}
+
+fn needs_human_overwrites(status: AgentDispatchStatus) -> bool {
+    matches!(
+        status,
+        AgentDispatchStatus::Queued
+            | AgentDispatchStatus::Spawning
+            | AgentDispatchStatus::Running
+            | AgentDispatchStatus::Done
+            | AgentDispatchStatus::Failed
+            | AgentDispatchStatus::PrOpen
+    )
+}
+
 fn mark_needs_human(
     db: &Db,
     run_id: i64,
@@ -729,16 +789,56 @@ fn mark_needs_human(
     dispatch_id: Option<i64>,
     reason: &str,
 ) {
-    if let Some(dispatch_id) = dispatch_id
-        && let Err(e) = db.update_dispatch_status(dispatch_id, AgentDispatchStatus::WaitingHuman)
-    {
-        tracing::warn!(
-            target: "thegn::autopilot",
-            run_id,
-            dispatch_id,
-            error = %e,
-            "failed to record autopilot dispatch needs-human status"
-        );
+    if let Some(dispatch_id) = dispatch_id {
+        match db.get_dispatch(dispatch_id) {
+            Ok(Some(row)) if row.status == AgentDispatchStatus::WaitingHuman => {}
+            Ok(Some(row)) if needs_human_overwrites(row.status) => {
+                match db.compare_and_set_dispatch_status(
+                    dispatch_id,
+                    row.status,
+                    AgentDispatchStatus::WaitingHuman,
+                    None,
+                ) {
+                    Ok(true) => {}
+                    Ok(false) => tracing::warn!(
+                        target: "thegn::autopilot",
+                        run_id,
+                        dispatch_id,
+                        observed_status = ?row.status,
+                        "dispatch status changed during needs-human update; preserving newer verdict"
+                    ),
+                    Err(error) => tracing::warn!(
+                        target: "thegn::autopilot",
+                        run_id,
+                        dispatch_id,
+                        observed_status = ?row.status,
+                        error = %error,
+                        "failed to record autopilot dispatch needs-human status"
+                    ),
+                }
+            }
+            Ok(Some(row)) => tracing::warn!(
+                target: "thegn::autopilot",
+                run_id,
+                dispatch_id,
+                observed_status = ?row.status,
+                "preserving dispatch status while recording autopilot needs-human state"
+            ),
+            Ok(None) => tracing::warn!(
+                target: "thegn::autopilot",
+                run_id,
+                dispatch_id,
+                observed_status = "missing",
+                "preserving missing dispatch while recording autopilot needs-human state"
+            ),
+            Err(error) => tracing::warn!(
+                target: "thegn::autopilot",
+                run_id,
+                dispatch_id,
+                error = %error,
+                "failed to read dispatch while recording autopilot needs-human state"
+            ),
+        }
     }
     let reason = bounded_reason(Some(reason)).unwrap_or_else(|| "autopilot failure".to_string());
     match db.transition_autopilot(
@@ -868,12 +968,272 @@ pub(crate) fn on_pr_merged(cfg: &Config, repo_root: &Path, number: u64) {
 #[cfg(test)]
 mod tests {
     use super::{
-        autopilot_backend_is_isolated, autopilot_issue_router, issue_prompt, pr_opened_reason,
+        autopilot_backend_is_isolated, autopilot_issue_router, issue_prompt,
+        needs_human_overwrites, pr_opened_reason, record_pr_open, record_worker_result,
         tracker_config_for_account, tracker_in_progress_note, worker_failure, worker_start_reason,
     };
-    use thegn_core::issue::IssueFilter;
+    use std::path::{Path, PathBuf};
+
+    use thegn_core::db::Db;
+    use thegn_core::issue::{AgentDispatchStatus as Status, IssueFilter, NewDispatch};
     use thegn_core::sandbox::Backend;
+    use thegn_core::store::{AutopilotStore, NotificationStore};
     use thegn_svc::issue::{IssueBackend, IssueCaps, IssueError};
+
+    fn dispatch(db: &Db) -> i64 {
+        db.put_agent_dispatch(NewDispatch::new("linear:THE-956", "/wt/956", "claude"))
+            .expect("insert dispatch")
+    }
+
+    fn set_status(db: &Db, id: i64, status: Status) {
+        let row = db.get_dispatch(id).expect("read dispatch").expect("row");
+        assert!(
+            db.compare_and_set_dispatch_status(id, row.status, status, None)
+                .expect("set dispatch status")
+        );
+    }
+
+    #[test]
+    fn autopilot_driver_worker_result_cas_writes_done_and_failed() {
+        let db = Db::open_memory().expect("in-memory database");
+        let done = dispatch(&db);
+        let failed = dispatch(&db);
+
+        record_worker_result(&db, done, true).expect("record done result");
+        record_worker_result(&db, failed, false).expect("record failed result");
+
+        assert_eq!(db.get_dispatch(done).unwrap().unwrap().status, Status::Done);
+        assert_eq!(
+            db.get_dispatch(failed).unwrap().unwrap().status,
+            Status::Failed
+        );
+    }
+
+    #[test]
+    fn autopilot_driver_worker_result_cas_preserves_abandoned_row() {
+        let db = Db::open_memory().expect("in-memory database");
+        let id = dispatch(&db);
+        set_status(&db, id, Status::Abandoned);
+        let key = thegn_core::autopilot::AutopilotIssueKey::new("linear", "work", "THE-956");
+        let run_id = match db
+            .claim_autopilot(&key, "/repo/956", 1, 1, 1)
+            .expect("claim autopilot run")
+        {
+            thegn_core::store::ClaimOutcome::Claimed(run) => run.id,
+            outcome => panic!("expected autopilot run claim, got {outcome:?}"),
+        };
+        assert!(
+            db.transition_autopilot(
+                run_id,
+                thegn_core::autopilot::AutopilotState::Claimed,
+                thegn_core::autopilot::AutopilotState::Working,
+                Some("started"),
+                None,
+                2,
+            )
+            .expect("move run to working")
+        );
+
+        let result = record_worker_result(&db, id, true);
+
+        assert!(result.is_err());
+        let reason = result.expect_err("changed dispatch is refused").to_string();
+        assert!(reason.contains("Abandoned"));
+        super::mark_worker_failed(&db, run_id, id, &reason);
+        assert_eq!(
+            db.get_dispatch(id).unwrap().unwrap().status,
+            Status::Abandoned
+        );
+        let run = db.get_autopilot_run(run_id).unwrap().unwrap();
+        assert_eq!(run.state, thegn_core::autopilot::AutopilotState::NeedsHuman);
+        assert!(run.reason.unwrap().contains("Abandoned"));
+    }
+
+    #[test]
+    fn autopilot_driver_pr_open_cas_writes_only_from_done() {
+        let db = Db::open_memory().expect("in-memory database");
+        let done = dispatch(&db);
+        let abandoned = dispatch(&db);
+        set_status(&db, done, Status::Done);
+        set_status(&db, abandoned, Status::Abandoned);
+        let key = thegn_core::autopilot::AutopilotIssueKey::new("linear", "work", "THE-956");
+        let run_id = match db
+            .claim_autopilot(&key, "/repo/956", 1, 1, 1)
+            .expect("claim autopilot run")
+        {
+            thegn_core::store::ClaimOutcome::Claimed(run) => run.id,
+            outcome => panic!("expected autopilot run claim, got {outcome:?}"),
+        };
+        assert!(
+            db.transition_autopilot(
+                run_id,
+                thegn_core::autopilot::AutopilotState::Claimed,
+                thegn_core::autopilot::AutopilotState::Working,
+                Some("started"),
+                None,
+                2,
+            )
+            .expect("move run to working")
+        );
+        assert!(
+            db.transition_autopilot(
+                run_id,
+                thegn_core::autopilot::AutopilotState::Working,
+                thegn_core::autopilot::AutopilotState::PrOpened,
+                Some("PR opened"),
+                Some(956),
+                3,
+            )
+            .expect("move run to PR opened")
+        );
+
+        assert!(record_pr_open(&db, done).expect("record PR status"));
+        if !record_pr_open(&db, abandoned).expect("stale PR status CAS") {
+            super::mark_needs_human(
+                &db,
+                run_id,
+                thegn_core::autopilot::AutopilotState::PrOpened,
+                Some(abandoned),
+                "dispatch row changed before the PR status was recorded (now Abandoned)",
+            );
+        }
+        assert_eq!(
+            db.get_dispatch(done).unwrap().unwrap().status,
+            Status::PrOpen
+        );
+        assert_eq!(
+            db.get_dispatch(abandoned).unwrap().unwrap().status,
+            Status::Abandoned
+        );
+        let run = db.get_autopilot_run(run_id).unwrap().unwrap();
+        assert_eq!(run.state, thegn_core::autopilot::AutopilotState::NeedsHuman);
+        assert!(run.reason.unwrap().contains("Abandoned"));
+    }
+
+    #[test]
+    fn autopilot_driver_needs_human_preserves_non_owned_dispatch_verdicts() {
+        let db = Db::open_memory().expect("in-memory database");
+        let mut cases = Vec::new();
+        for status in [
+            Status::Queued,
+            Status::Done,
+            Status::PrOpen,
+            Status::Abandoned,
+            Status::Merged,
+        ] {
+            let id = dispatch(&db);
+            if status != Status::Queued {
+                set_status(&db, id, status);
+            }
+            cases.push((id, status));
+        }
+
+        for (id, before) in cases {
+            super::mark_needs_human(
+                &db,
+                -999,
+                thegn_core::autopilot::AutopilotState::Working,
+                Some(id),
+                "test reason",
+            );
+            let expected = if needs_human_overwrites(before) {
+                Status::WaitingHuman
+            } else {
+                before
+            };
+            assert_eq!(db.get_dispatch(id).unwrap().unwrap().status, expected);
+        }
+    }
+
+    #[test]
+    fn autopilot_driver_needs_human_overwrite_table_covers_every_status() {
+        for (status, expected) in [
+            (Status::Queued, true),
+            (Status::Spawning, true),
+            (Status::Running, true),
+            (Status::WaitingHuman, false),
+            (Status::PrOpen, true),
+            (Status::Merged, false),
+            (Status::Abandoned, false),
+            (Status::Done, true),
+            (Status::Failed, true),
+            (Status::Unknown, false),
+        ] {
+            assert_eq!(needs_human_overwrites(status), expected, "{status:?}");
+        }
+    }
+
+    fn collect_rust_files(dir: &Path, files: &mut Vec<PathBuf>) {
+        for entry in std::fs::read_dir(dir).expect("read source directory") {
+            let entry = entry.expect("read directory entry");
+            let path = entry.path();
+            if entry.file_type().expect("read entry type").is_dir() {
+                collect_rust_files(&path, files);
+            } else if path.extension().is_some_and(|extension| extension == "rs") {
+                files.push(path);
+            }
+        }
+    }
+
+    fn production_dispatch_status_writers(root: &Path) -> (Vec<String>, Vec<PathBuf>) {
+        let mut files = Vec::new();
+        collect_rust_files(&root.join("crates"), &mut files);
+        let mut hits = Vec::new();
+        for path in &files {
+            if path
+                .components()
+                .any(|component| component.as_os_str() == "tests")
+                || path
+                    .file_name()
+                    .is_some_and(|name| name.to_string_lossy().ends_with("tests.rs"))
+            {
+                continue;
+            }
+            let source = std::fs::read_to_string(path).expect("read Rust source");
+            let lines: Vec<&str> = source.lines().collect();
+            let test_module_start = lines.windows(2).position(|pair| {
+                pair[0].trim() == "#[cfg(test)]"
+                    && pair[1].trim_start().starts_with("mod ")
+                    && pair[1].trim_end().ends_with('{')
+            });
+            for (index, line) in lines.iter().enumerate() {
+                if test_module_start.is_some_and(|start| index >= start) {
+                    break;
+                }
+                let trimmed = line.trim_start();
+                if trimmed.starts_with("//") || trimmed.contains("fn update_dispatch_status") {
+                    continue;
+                }
+                if line.contains("update_dispatch_status(")
+                    || line.contains("update_dispatch_status_with_note(")
+                {
+                    hits.push(format!("{}:{}", path.display(), index + 1));
+                }
+            }
+        }
+        (hits, files)
+    }
+
+    #[test]
+    fn autopilot_driver_dispatch_status_writer_ratchet_has_no_production_callers() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let (hits, files) = production_dispatch_status_writers(&root);
+        for expected in [
+            "crates/thegn-core/src/db_notification.rs",
+            "crates/thegn-core/src/db_dispatch.rs",
+            "crates/thegn-core/src/store/notification.rs",
+        ] {
+            assert!(
+                files.iter().any(|path| path.ends_with(expected)),
+                "source scan did not find {expected}"
+            );
+        }
+        assert!(
+            hits.is_empty(),
+            "unconditional dispatch status writers:\n{}",
+            hits.join("\n")
+        );
+    }
 
     #[test]
     fn autopilot_tracker_updates_use_shared_tracker_runtime() {
