@@ -55,6 +55,34 @@ fn reenqueue_adopts_the_new_oid() {
 }
 
 #[test]
+fn held_candidate_adoption_is_compare_and_swap_and_requires_folding() {
+    let db = Db::open_memory().unwrap();
+    bound(&db, OID_A);
+    assert!(
+        !db.adopt_merge_candidate(WORKTREE, &candidate(OID_A), OID_B)
+            .unwrap()
+    );
+    db.replace_merge_status(
+        WORKTREE,
+        "folding",
+        &crate::store::MergeStatusFields::default(),
+    )
+    .unwrap();
+    assert!(
+        db.adopt_merge_candidate(WORKTREE, &candidate(OID_A), OID_B)
+            .unwrap()
+    );
+    assert_eq!(
+        db.merge_candidate(WORKTREE).unwrap(),
+        Some(candidate(OID_B))
+    );
+    assert!(
+        !db.adopt_merge_candidate(WORKTREE, &candidate(OID_A), OID_B)
+            .unwrap()
+    );
+}
+
+#[test]
 fn malformed_candidate_is_refused_and_writes_nothing() {
     let db = Db::open_memory().unwrap();
     let uppercase = format!("{}A", "a".repeat(39));
