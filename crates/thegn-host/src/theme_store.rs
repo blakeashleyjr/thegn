@@ -25,6 +25,7 @@ pub(crate) struct ThemeOverrides {
 
 pub const MAX_THEME_FILE_BYTES: usize = 64 * 1024;
 const MAX_THEME_FILES: usize = 256;
+static NEXT_TEMP: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug)]
 enum Request {
@@ -499,14 +500,15 @@ fn process_request(
             publish(result_tx, waker, ThemeStoreResult::Imported(result));
         }
         Request::Save(theme) => {
-            let slug = match valid_slug(&theme.meta.name) {
-                Ok(slug) => Some(slug),
-                Err(_) => None,
+            let (slug, expect) = match valid_slug(&theme.meta.name) {
+                Ok(slug) => {
+                    let expect = loaded
+                        .get(&slug)
+                        .map_or(SaveExpect::New, |hash| SaveExpect::Replace(*hash));
+                    (Some(slug), expect)
+                }
+                Err(_) => (None, SaveExpect::New),
             };
-            let expect = slug
-                .as_ref()
-                .and_then(|slug| loaded.get(slug))
-                .map_or(SaveExpect::New, |hash| SaveExpect::Replace(*hash));
             let result = write_theme_expect(themes_dir, &theme, expect).map(|hash| {
                 if let Some(slug) = slug {
                     loaded.insert(slug, hash);
@@ -972,7 +974,68 @@ impl Drop for PendingTemp {
 }
 
 fn publish_new(destination: &Path, bytes: &[u8]) -> Result<(), String> {
-    static NEXT_TEMP: AtomicU64 = AtomicU64::new(0);
+    publish_new_with(destination, bytes, std::fs::hard_link)
+}
+
+fn publish_new_with<F>(destination: &Path, bytes: &[u8], hard_link: F) -> Result<(), String>
+where
+    F: FnOnce(&Path, &Path) -> std::io::Result<()>,
+{
+    let (pending, mut file) = create_private_temp(destination)?;
+    file.write_all(bytes).map_err(|e| e.to_string())?;
+    file.sync_all().map_err(|e| e.to_string())?;
+    drop(file);
+    let temporary = pending.0.as_ref().expect("temporary path");
+    match hard_link(temporary, destination) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            return Err("already exists".into());
+        }
+        Err(error) if hard_link_unavailable(&error) => {
+            let mut destination_file = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(destination)
+                .map_err(|fallback_error| {
+                    if fallback_error.kind() == std::io::ErrorKind::AlreadyExists {
+                        "already exists".to_string()
+                    } else {
+                        fallback_error.to_string()
+                    }
+                })?;
+            if let Err(error) = destination_file.write_all(bytes) {
+                if let Err(cleanup_error) = std::fs::remove_file(destination) {
+                    tracing::debug!(%cleanup_error, "could not remove incomplete theme after fallback write failure");
+                }
+                return Err(error.to_string());
+            }
+            if let Err(error) = destination_file.sync_all() {
+                if let Err(cleanup_error) = std::fs::remove_file(destination) {
+                    tracing::debug!(%cleanup_error, "could not remove unsynced theme after fallback sync failure");
+                }
+                return Err(error.to_string());
+            }
+        }
+        Err(error) => return Err(error.to_string()),
+    }
+    // Publication succeeded; a failed cleanup must not turn it into a save failure.
+    if let Err(error) = std::fs::remove_file(temporary) {
+        tracing::debug!(%error, "published theme but could not remove its private temporary file");
+    }
+    // PendingTemp retries cleanup best-effort when it is dropped.
+    Ok(())
+}
+
+fn hard_link_unavailable(error: &std::io::Error) -> bool {
+    matches!(
+        error.kind(),
+        std::io::ErrorKind::Unsupported
+            | std::io::ErrorKind::PermissionDenied
+            | std::io::ErrorKind::CrossesDevices
+    )
+}
+
+fn create_private_temp(destination: &Path) -> Result<(PendingTemp, std::fs::File), String> {
     let parent = destination.parent().unwrap_or_else(|| Path::new("."));
     std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
     let base = destination
@@ -997,22 +1060,9 @@ fn publish_new(destination: &Path, bytes: &[u8]) -> Result<(), String> {
             Err(error) => return Err(error.to_string()),
         }
     }
-    let (temporary, mut file) = opened
+    let (temporary, file) = opened
         .ok_or_else(|| "could not allocate a unique temporary file for atomic write".to_string())?;
-    let pending = PendingTemp(Some(temporary));
-    file.write_all(bytes).map_err(|e| e.to_string())?;
-    file.sync_all().map_err(|e| e.to_string())?;
-    drop(file);
-    match std::fs::hard_link(pending.0.as_ref().expect("temporary path"), destination) {
-        Ok(()) => {}
-        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-            return Err("already exists".into());
-        }
-        Err(error) => return Err(error.to_string()),
-    }
-    std::fs::remove_file(pending.0.as_ref().expect("temporary path"))
-        .map_err(|error| error.to_string())?;
-    Ok(())
+    Ok((PendingTemp(Some(temporary)), file))
 }
 
 fn atomic_write(
@@ -1020,34 +1070,7 @@ fn atomic_write(
     bytes: &[u8],
     permissions: Option<std::fs::Permissions>,
 ) -> Result<(), String> {
-    static NEXT_TEMP: AtomicU64 = AtomicU64::new(0);
-    let parent = destination.parent().unwrap_or_else(|| Path::new("."));
-    std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
-    let base = destination
-        .file_name()
-        .ok_or_else(|| "write destination has no file name".to_string())?;
-    let mut opened = None;
-    for _ in 0..128 {
-        let sequence = NEXT_TEMP.fetch_add(1, Ordering::Relaxed);
-        let mut name = base.to_os_string();
-        name.push(format!(".tmp.{}.{sequence}", std::process::id()));
-        let path = parent.join(name);
-        match std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&path)
-        {
-            Ok(file) => {
-                opened = Some((path, file));
-                break;
-            }
-            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
-            Err(error) => return Err(error.to_string()),
-        }
-    }
-    let (temporary, mut file) = opened
-        .ok_or_else(|| "could not allocate a unique temporary file for atomic write".to_string())?;
-    let mut pending = PendingTemp(Some(temporary));
+    let (mut pending, mut file) = create_private_temp(destination)?;
     file.write_all(bytes).map_err(|e| e.to_string())?;
     if let Some(permissions) = permissions {
         file.set_permissions(permissions)
@@ -1572,6 +1595,44 @@ mod tests {
         let error = write_theme(&dir, &theme("night")).unwrap_err();
         assert!(error.contains("already exists"), "{error}");
         assert_eq!(std::fs::read(&path).unwrap(), original.as_bytes());
+    }
+
+    #[test]
+    fn theme_cas_new_save_falls_back_when_hard_links_are_unsupported() {
+        let temp = private_temp_dir();
+        let path = temp.path().join("fallback.toml");
+        let bytes = b"theme bytes";
+
+        publish_new_with(&path, bytes, |_, _| {
+            Err(std::io::Error::from(std::io::ErrorKind::Unsupported))
+        })
+        .unwrap();
+
+        assert_eq!(std::fs::read(&path).unwrap(), bytes);
+        assert!(
+            publish_new_with(&path, b"replacement", |_, _| {
+                Err(std::io::Error::from(std::io::ErrorKind::Unsupported))
+            })
+            .unwrap_err()
+            .contains("already exists")
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), bytes);
+    }
+
+    #[test]
+    fn theme_cas_new_save_succeeds_when_temp_cleanup_fails() {
+        let temp = private_temp_dir();
+        let path = temp.path().join("published.toml");
+        let bytes = b"published bytes";
+
+        publish_new_with(&path, bytes, |temporary, destination| {
+            std::fs::hard_link(temporary, destination)?;
+            std::fs::remove_file(temporary)?;
+            std::fs::create_dir(temporary)
+        })
+        .unwrap();
+
+        assert_eq!(std::fs::read(&path).unwrap(), bytes);
     }
 
     #[test]
