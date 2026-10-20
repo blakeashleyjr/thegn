@@ -377,24 +377,124 @@ fn local_dir(mountpoint: &str) -> String {
     format!("{}/", mountpoint.trim_end_matches('/'))
 }
 
-/// Reference `sync` projection: initial **pull** of the remote tree into the
-/// local working copy (`--delete` mirrors the remote). A changed-files manifest
-/// is what `rsync` computes internally; provider file-API adapters override this.
-/// One-direction-each (pull on mount, push on refresh/close) — true bidirectional
-/// conflict resolution is out of scope for the reference engine.
+/// Reference `sync` projection: stage the initial pull before replacing the
+/// local working copy, so a failed `--delete` mirror cannot damage the live tree.
+/// A changed-files manifest is what `rsync` computes internally; provider
+/// file-API adapters override this. One-direction-each (pull on mount, push on
+/// refresh/close) — true bidirectional conflict resolution is out of scope.
 fn mount_sync(spec: &ProjectionSpec) -> Result<Mounted> {
+    mount_sync_with(spec, run)
+}
+
+fn mount_sync_with(
+    spec: &ProjectionSpec,
+    run: impl FnOnce(&[String]) -> Result<()>,
+) -> Result<Mounted> {
     let Placement::Ssh(s) = &spec.placement else {
         bail!("sync projection requires an ssh placement");
     };
     manifest::claim_or_verify(spec)?;
+
+    let mut nonce = [0_u8; 8];
+    getrandom::fill(&mut nonce)
+        .map_err(|error| anyhow::anyhow!("could not generate projection staging name: {error}"))?;
+    let generation = nonce
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    let mountpoint = std::path::Path::new(&spec.mountpoint);
+    let parent = mountpoint.parent().ok_or_else(|| {
+        anyhow::anyhow!(
+            "mountpoint {} has no parent directory",
+            mountpoint.display()
+        )
+    })?;
+    let name = mountpoint
+        .file_name()
+        .ok_or_else(|| anyhow::anyhow!("mountpoint {} has no file name", mountpoint.display()))?
+        .to_string_lossy();
+    let staging = parent.join(format!("{name}.thegn-stage-{generation}"));
+    let old = parent.join(format!("{name}.thegn-old-{generation}"));
+    std::fs::create_dir(&staging).map_err(|error| {
+        anyhow::anyhow!(
+            "could not create fresh projection staging directory {}: {error}",
+            staging.display()
+        )
+    })?;
+    if let Err(error) = thegn_core::fsperm::ensure_private_dir(&staging) {
+        cleanup_projection_dir(&staging, "staging directory after permission failure");
+        return Err(anyhow::anyhow!(
+            "could not secure projection staging directory {}: {error}",
+            staging.display()
+        ));
+    }
+
     let mut argv = vec!["rsync".into(), "-az".into(), "--delete".into()];
     argv.extend(rsync_ssh_opt(s));
     argv.push(rsync_remote(s, &spec.remote_dir));
-    argv.push(local_dir(&spec.mountpoint));
-    run(&argv)?;
+    argv.push(local_dir(&staging.to_string_lossy()));
+    if let Err(error) = run(&argv) {
+        cleanup_projection_dir(&staging, "staging directory after failed pull");
+        return Err(error);
+    }
+
+    let staging_meta = std::fs::symlink_metadata(&staging).map_err(|error| {
+        anyhow::anyhow!(
+            "could not verify projection staging directory {}: {error}",
+            staging.display()
+        )
+    });
+    match staging_meta {
+        Ok(metadata)
+            if metadata.is_dir()
+                && !metadata.file_type().is_symlink()
+                && thegn_core::fsperm::owned_by_current_user(&metadata) => {}
+        Ok(_) => {
+            cleanup_projection_dir(&staging, "untrusted staging directory");
+            bail!(
+                "projection staging path {} is not a real directory owned by the current user",
+                staging.display()
+            );
+        }
+        Err(error) => {
+            cleanup_projection_dir(&staging, "unverifiable staging directory");
+            return Err(error);
+        }
+    }
+
+    if let Err(error) = std::fs::rename(mountpoint, &old) {
+        cleanup_projection_dir(&staging, "staging directory after failed swap");
+        return Err(anyhow::anyhow!(
+            "could not move current projection {} aside: {error}",
+            mountpoint.display()
+        ));
+    }
+    if let Err(error) = std::fs::rename(&staging, mountpoint) {
+        let restore = std::fs::rename(&old, mountpoint);
+        cleanup_projection_dir(&staging, "staging directory after failed promotion");
+        return match restore {
+            Ok(()) => Err(anyhow::anyhow!(
+                "could not promote projection staging directory {}: {error}",
+                staging.display()
+            )),
+            Err(restore_error) => Err(anyhow::anyhow!(
+                "could not promote projection staging directory {}: {error}; could not restore previous projection {}: {restore_error}",
+                staging.display(),
+                mountpoint.display()
+            )),
+        };
+    }
+    cleanup_projection_dir(&old, "previous projection directory");
+
     Ok(Mounted {
         local_cwd: Some(spec.mountpoint.clone()),
     })
+}
+
+fn cleanup_projection_dir(path: &std::path::Path, description: &str) {
+    if let Err(error) = std::fs::remove_dir_all(path) {
+        tracing::warn!(path = %path.display(), %error, "could not remove {description}");
+    }
 }
 
 /// Push the local working copy back to the remote (no `--delete`: never reaches
@@ -871,5 +971,106 @@ mod tests {
         assert!(
             run_unmount_with_timeout(&["true".into()], std::time::Duration::from_secs(2)).is_ok()
         );
+    }
+
+    #[test]
+    fn staged_pull_never_deletes_into_the_working_copy() {
+        let temp = tempfile::tempdir().unwrap();
+        thegn_core::fsperm::ensure_private_dir(temp.path()).unwrap();
+        let mut projection = spec(DataMode::Sync, ssh());
+        projection.mountpoint = temp.path().join("mount").to_string_lossy().into_owned();
+        let mut captured = Vec::new();
+
+        mount_sync_with(&projection, |argv| {
+            captured = argv.to_vec();
+            Ok(())
+        })
+        .unwrap();
+
+        assert!(captured.iter().any(|arg| arg == "--delete"));
+        let destination = captured.last().unwrap();
+        assert_ne!(destination, &local_dir(&projection.mountpoint));
+        assert!(destination.ends_with('/'));
+        let destination_path = std::path::Path::new(destination.trim_end_matches('/'));
+        assert_eq!(
+            destination_path.parent(),
+            std::path::Path::new(&projection.mountpoint).parent()
+        );
+        assert!(
+            destination_path
+                .file_name()
+                .unwrap()
+                .to_string_lossy()
+                .starts_with("mount.thegn-stage-")
+        );
+    }
+
+    #[test]
+    fn staged_pull_failure_leaves_the_working_copy_untouched() {
+        let temp = tempfile::tempdir().unwrap();
+        thegn_core::fsperm::ensure_private_dir(temp.path()).unwrap();
+        let mut projection = spec(DataMode::Sync, ssh());
+        projection.mountpoint = temp.path().join("mount").to_string_lossy().into_owned();
+
+        mount_sync_with(&projection, |argv| {
+            let destination = std::path::Path::new(argv.last().unwrap().trim_end_matches('/'));
+            std::fs::write(destination.join("keep.txt"), b"keep").unwrap();
+            Ok(())
+        })
+        .unwrap();
+
+        let result = mount_sync_with(&projection, |argv| {
+            let destination = std::path::Path::new(argv.last().unwrap().trim_end_matches('/'));
+            std::fs::write(destination.join("partial.txt"), b"partial").unwrap();
+            Err(anyhow::anyhow!("simulated rsync failure"))
+        });
+
+        assert!(result.is_err());
+        let working_copy = std::path::Path::new(&projection.mountpoint);
+        assert_eq!(
+            std::fs::read(working_copy.join("keep.txt")).unwrap(),
+            b"keep"
+        );
+        assert!(!working_copy.join("partial.txt").exists());
+        assert_eq!(std::fs::read_dir(working_copy).unwrap().count(), 1);
+        assert_eq!(
+            std::fs::read_dir(working_copy.parent().unwrap())
+                .unwrap()
+                .count(),
+            2
+        );
+    }
+
+    #[test]
+    fn staged_pull_success_swaps_in_the_new_tree() {
+        let temp = tempfile::tempdir().unwrap();
+        thegn_core::fsperm::ensure_private_dir(temp.path()).unwrap();
+        let mut projection = spec(DataMode::Sync, ssh());
+        projection.mountpoint = temp.path().join("mount").to_string_lossy().into_owned();
+
+        mount_sync_with(&projection, |argv| {
+            let destination = std::path::Path::new(argv.last().unwrap().trim_end_matches('/'));
+            std::fs::write(destination.join("keep.txt"), b"keep").unwrap();
+            Ok(())
+        })
+        .unwrap();
+        mount_sync_with(&projection, |argv| {
+            let destination = std::path::Path::new(argv.last().unwrap().trim_end_matches('/'));
+            std::fs::write(destination.join("new.txt"), b"new").unwrap();
+            Ok(())
+        })
+        .unwrap();
+
+        let working_copy = std::path::Path::new(&projection.mountpoint);
+        assert_eq!(std::fs::read(working_copy.join("new.txt")).unwrap(), b"new");
+        assert!(!working_copy.join("keep.txt").exists());
+        let siblings = std::fs::read_dir(working_copy.parent().unwrap())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        assert_eq!(siblings.len(), 2);
+        assert!(!siblings.iter().any(|name| name.contains(".thegn-stage-")));
+        assert!(!siblings.iter().any(|name| name.contains(".thegn-old-")));
+        assert!(manifest::verify(&projection).is_ok());
     }
 }
