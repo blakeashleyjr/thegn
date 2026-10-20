@@ -1116,7 +1116,9 @@ fn admit_configured_volume_sources(sb: &thegn_core::config::SandboxConfig) -> an
 fn admit_final_sandbox_spec(spec: &thegn_core::sandbox::SandboxSpec) -> anyhow::Result<()> {
     thegn_core::sandbox::admit_volumes(spec)
         .map_err(anyhow::Error::new)
-        .context("sandbox volume admission failed")
+        .context("sandbox volume admission failed")?;
+    thegn_core::sandbox::tunnel_admission(spec).map_err(anyhow::Error::new)?;
+    Ok(())
 }
 
 /// Run the effectful launch phase only after the final spec passes admission.

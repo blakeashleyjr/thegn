@@ -381,6 +381,7 @@ mod tests {
                 ephemeral: true,
                 sidecar_image: Some("vpn:latest".into()),
                 hostname: "sandbox".into(),
+                tunnel_only: false,
                 params: VpnParams::Custom(Default::default()),
             }),
             ..original.clone()
