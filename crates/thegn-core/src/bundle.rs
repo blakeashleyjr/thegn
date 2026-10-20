@@ -726,6 +726,14 @@ pub fn materialize_dotfiles(
         let Some(base) = from.file_name() else {
             continue;
         };
+        let source_name = base.to_string_lossy();
+        if source_name.starts_with(".thegn-stage-") || source_name.starts_with(".thegn-old-") {
+            first_error = Some(format!(
+                "refusing reserved dotfile source name {}",
+                from.display()
+            ));
+            break;
+        }
         let to = dest_home.join(base);
         let stage = dest_home.join(format!(
             ".thegn-stage-{generation}-{}",
@@ -778,20 +786,30 @@ pub fn materialize_dotfiles(
             ".thegn-old-{generation}-{}",
             target_name.to_string_lossy()
         ));
-        let old_directory = match std::fs::symlink_metadata(target) {
-            Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => {
+        let stage_is_directory = match std::fs::symlink_metadata(stage) {
+            Ok(metadata) => metadata.is_dir() && !metadata.file_type().is_symlink(),
+            Err(error) => {
+                first_error = Some(format!(
+                    "cannot inspect staged dotfile {}: {error}",
+                    stage.display()
+                ));
+                break;
+            }
+        };
+        let old_target_moved = match (stage_is_directory, std::fs::symlink_metadata(target)) {
+            (true, Ok(_)) => {
                 if let Err(error) = std::fs::rename(target, &old) {
                     first_error = Some(format!(
-                        "cannot move dotfile directory {} aside: {error}",
+                        "cannot move dotfile target {} aside: {error}",
                         target.display()
                     ));
                     break;
                 }
                 true
             }
-            Ok(_) => false,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
-            Err(error) => {
+            (_, Ok(_)) => false,
+            (_, Err(error)) if error.kind() == std::io::ErrorKind::NotFound => false,
+            (_, Err(error)) => {
                 first_error = Some(format!(
                     "cannot inspect dotfile target {}: {error}",
                     target.display()
@@ -800,17 +818,20 @@ pub fn materialize_dotfiles(
             }
         };
         if let Err(error) = std::fs::rename(stage, target) {
-            if old_directory && let Err(restore_error) = std::fs::rename(&old, target) {
-                tracing::debug!(target: "thegn::bundle", %restore_error, path = %target.display(), "could not restore dotfile directory after publish failure");
+            let mut publish_error = format!("cannot publish dotfile {}: {error}", from.display());
+            if old_target_moved && let Err(restore_error) = std::fs::rename(&old, target) {
+                tracing::warn!(target: "thegn::bundle", %restore_error, path = %target.display(), old_path = %old.display(), "could not restore dotfile target after publish failure");
+                publish_error.push_str(&format!(
+                    "; also could not restore previous target {} from {}: {restore_error}",
+                    target.display(),
+                    old.display()
+                ));
             }
-            first_error = Some(format!(
-                "cannot publish dotfile {}: {error}",
-                from.display()
-            ));
+            first_error = Some(publish_error);
             break;
         }
         published += 1;
-        if old_directory && let Err(error) = remove_path_nofollow(&old) {
+        if old_target_moved && let Err(error) = remove_path_nofollow(&old) {
             tracing::debug!(target: "thegn::bundle", %error, path = %old.display(), "could not remove replaced dotfile directory");
         }
     }
@@ -1589,8 +1610,8 @@ mod tests {
             mode: DotfileMode::Template,
         };
 
-        assert_eq!(materialize_dotfiles(&spec, &home), 1);
-        assert!(home.join(".bashrc").is_file());
+        assert_eq!(materialize_dotfiles(&spec, &home), 0);
+        assert!(!home.join(".bashrc").exists());
         assert!(!home.join("link/secret.txt").exists());
         assert!(!home.join(".thegn-dotfiles.json").exists());
         assert_eq!(materialize_dotfiles(&spec, &home), 0);
@@ -1638,9 +1659,26 @@ mod tests {
             mode: DotfileMode::Template,
         };
 
-        assert_eq!(materialize_dotfiles(&spec, &home), 1);
+        assert_eq!(materialize_dotfiles(&spec, &home), 0);
+        assert!(!home.join(".bashrc").exists());
         assert!(!home.join(".thegn-dotfiles.json").exists());
-        assert!(materialize_dotfiles(&spec, &home) >= 1);
+        assert!(std::fs::read_dir(&home).unwrap().all(|entry| {
+            !entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .starts_with(".thegn-stage-")
+        }));
+        assert_eq!(materialize_dotfiles(&spec, &home), 0);
+        assert!(!home.join(".bashrc").exists());
+        assert!(!home.join(".thegn-dotfiles.json").exists());
+        assert!(std::fs::read_dir(&home).unwrap().all(|entry| {
+            !entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .starts_with(".thegn-stage-")
+        }));
     }
 
     #[test]
@@ -1822,6 +1860,75 @@ mod tests {
                 .file_name()
                 .to_string_lossy()
                 .starts_with(".thegn-old-")
+        }));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn directory_stage_replaces_a_file_or_symlink_target() {
+        use crate::config::{DotfileMode, DotfilesSpec};
+        let root = tempfile::tempdir().unwrap();
+        let source = root.path().join("source");
+        let home = root.path().join("bundle/home");
+        let outside = root.path().join("outside");
+        std::fs::create_dir_all(source.join("from_file")).unwrap();
+        std::fs::create_dir_all(source.join("from_link")).unwrap();
+        std::fs::write(source.join("from_file/new"), "from file target").unwrap();
+        std::fs::write(source.join("from_link/new"), "from symlink target").unwrap();
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::create_dir(&outside).unwrap();
+        std::fs::write(home.join("from_file"), "old file").unwrap();
+        std::fs::write(outside.join("keep"), "keep").unwrap();
+        symlink(&outside, &home.join("from_link")).unwrap();
+        let spec = DotfilesSpec {
+            source: source.to_string_lossy().into_owned(),
+            mode: DotfileMode::Template,
+        };
+
+        assert_eq!(materialize_dotfiles(&spec, &home), 2);
+        assert_eq!(
+            std::fs::read_to_string(home.join("from_file/new")).unwrap(),
+            "from file target"
+        );
+        assert_eq!(
+            std::fs::read_to_string(home.join("from_link/new")).unwrap(),
+            "from symlink target"
+        );
+        assert_eq!(
+            std::fs::read_to_string(outside.join("keep")).unwrap(),
+            "keep"
+        );
+        assert!(std::fs::read_dir(&home).unwrap().all(|entry| {
+            !entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .starts_with(".thegn-old-")
+        }));
+    }
+
+    #[test]
+    fn reserved_dotfile_source_names_fail_staging() {
+        use crate::config::{DotfileMode, DotfilesSpec};
+        let root = tempfile::tempdir().unwrap();
+        let source = root.path().join("source");
+        let home = root.path().join("bundle/home");
+        std::fs::create_dir(&source).unwrap();
+        std::fs::write(source.join(".thegn-stage-config"), "reserved").unwrap();
+        let spec = DotfilesSpec {
+            source: source.to_string_lossy().into_owned(),
+            mode: DotfileMode::Template,
+        };
+
+        assert_eq!(materialize_dotfiles(&spec, &home), 0);
+        assert!(!home.join(".thegn-stage-config").exists());
+        assert!(!home.join(".thegn-dotfiles.json").exists());
+        assert!(std::fs::read_dir(&home).unwrap().all(|entry| {
+            !entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .starts_with(".thegn-stage-")
         }));
     }
 
