@@ -390,12 +390,15 @@ fn canon(p: &str) -> std::path::PathBuf {
 /// retained so their cache rows can be invalidated when the session lists the
 /// path. Checkouts this session does not show are dropped.
 fn session_checkouts(loc: &GitLoc, session_worktrees: &[String]) -> Vec<(String, Option<String>)> {
-    let Some(porcelain) = loc.git_out(&["worktree", "list", "--porcelain"]) else {
+    let Some(porcelain) = loc.git_out(&["worktree", "list", "--porcelain", "-z"]) else {
+        return Vec::new();
+    };
+    let Some(worktrees) = thegn_core::util::parse_worktree_branches(&porcelain) else {
         return Vec::new();
     };
     let session: HashMap<std::path::PathBuf, &String> =
         session_worktrees.iter().map(|w| (canon(w), w)).collect();
-    thegn_core::util::parse_worktree_branches(&porcelain)
+    worktrees
         .into_iter()
         .filter_map(|(path, branch)| {
             let wt = session.get(&canon(&path))?;
