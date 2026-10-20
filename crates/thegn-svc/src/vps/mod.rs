@@ -18,10 +18,11 @@ pub mod hetzner;
 pub mod registry;
 pub mod ssh_shim;
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::fmt;
 use std::path::PathBuf;
 use std::sync::Mutex;
+use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow};
 use futures_util::future::BoxFuture;
@@ -36,6 +37,71 @@ use thegn_core::remote::SshTarget;
 pub const MANAGED_KEY: &str = "managed-by";
 pub const MANAGED_VAL: &str = "thegn";
 pub const HOST_KEY: &str = "tg-host";
+
+const MAX_INVENTORY_PAGES: u32 = 50;
+const MAX_INVENTORY_ROWS: usize = 10_000;
+const INVENTORY_BUDGET: Duration = Duration::from_secs(120);
+
+/// One validated provider inventory page.
+pub struct InventoryPage<T> {
+    pub items: Vec<T>,
+    pub has_next: bool,
+    pub total: Option<u64>,
+}
+
+async fn collect_pages<'a, T, F, P, I>(mut fetch: F, parse: P, id_of: I) -> Result<Vec<T>>
+where
+    F: FnMut(u32) -> BoxFuture<'a, Result<serde_json::Value>>,
+    P: Fn(&serde_json::Value, u32) -> Result<InventoryPage<T>>,
+    I: Fn(&T) -> String,
+{
+    tokio::time::timeout(INVENTORY_BUDGET, async {
+        let mut all = Vec::new();
+        let mut ids = HashSet::new();
+        let mut page_number = 1_u32;
+        loop {
+            if page_number > MAX_INVENTORY_PAGES {
+                return Err(anyhow!(
+                    "inventory exceeds the page cap; refusing a partial list"
+                ));
+            }
+            let body = fetch(page_number).await?;
+            let page = parse(&body, page_number)?;
+            if all.len().saturating_add(page.items.len()) > MAX_INVENTORY_ROWS {
+                return Err(anyhow!(
+                    "inventory exceeds the row cap; refusing a partial list"
+                ));
+            }
+            for item in page.items {
+                if !ids.insert(id_of(&item)) {
+                    return Err(anyhow!(
+                        "inventory contains a duplicate id; refusing a partial list"
+                    ));
+                }
+                all.push(item);
+            }
+            if !page.has_next {
+                if let Some(total) = page.total
+                    && u64::try_from(all.len()).ok() != Some(total)
+                {
+                    return Err(anyhow!("inventory total does not match collected rows"));
+                }
+                return Ok(all);
+            }
+            page_number += 1;
+        }
+    })
+    .await
+    .map_err(|_| {
+        anyhow!("inventory listing exceeded the 120 second budget; refusing a partial list")
+    })?
+}
+
+fn matching_ssh_key(keys: Vec<(i64, String)>, pubkey: &str) -> Option<i64> {
+    keys.into_iter()
+        .find(|(_, key)| same_pubkey(key, pubkey))
+        .map(|(id, _)| id)
+}
 
 /// Which VPS vendor an env targets. One enum arm per implemented adapter; each
 /// pairs with a pure shaping module ([`hetzner`], [`digitalocean`]) reached via
@@ -125,8 +191,9 @@ pub(crate) trait VpsShaper: Sync {
 
     fn servers_url(&self, base: &str) -> String;
     fn server_url(&self, base: &str, id: &str) -> String;
-    fn list_url(&self, base: &str) -> String;
+    fn list_page_url(&self, base: &str, page: u32) -> String;
     fn ssh_keys_url(&self, base: &str) -> String;
+    fn ssh_keys_page_url(&self, base: &str, page: u32) -> String;
     /// The endpoint + body for a graceful power-off (pre-snapshot quiesce).
     fn shutdown_url(&self, base: &str, id: &str) -> String;
     fn shutdown_body(&self) -> serde_json::Value;
@@ -146,8 +213,16 @@ pub(crate) trait VpsShaper: Sync {
 
     fn parse_create(&self, v: &serde_json::Value) -> Option<VpsInstance>;
     fn parse_get(&self, v: &serde_json::Value) -> Option<VpsInstance>;
-    fn parse_server_list(&self, v: &serde_json::Value) -> Vec<VpsInstance>;
-    fn parse_ssh_keys(&self, v: &serde_json::Value) -> Vec<(i64, String)>;
+    fn parse_server_page(
+        &self,
+        v: &serde_json::Value,
+        page: u32,
+    ) -> Result<InventoryPage<VpsInstance>>;
+    fn parse_ssh_key_page(
+        &self,
+        v: &serde_json::Value,
+        page: u32,
+    ) -> Result<InventoryPage<(i64, String)>>;
     fn parse_ssh_key_created(&self, v: &serde_json::Value) -> Option<i64>;
 }
 
@@ -170,11 +245,14 @@ impl VpsShaper for HetznerShaper {
     fn server_url(&self, base: &str, id: &str) -> String {
         hetzner::server_url(base, id)
     }
-    fn list_url(&self, base: &str) -> String {
-        hetzner::list_url(base)
+    fn list_page_url(&self, base: &str, page: u32) -> String {
+        hetzner::list_page_url(base, page)
     }
     fn ssh_keys_url(&self, base: &str) -> String {
         hetzner::ssh_keys_url(base)
+    }
+    fn ssh_keys_page_url(&self, base: &str, page: u32) -> String {
+        hetzner::ssh_keys_page_url(base, page)
     }
     fn shutdown_url(&self, base: &str, id: &str) -> String {
         hetzner::shutdown_url(base, id)
@@ -203,11 +281,19 @@ impl VpsShaper for HetznerShaper {
     fn parse_get(&self, v: &serde_json::Value) -> Option<VpsInstance> {
         hetzner::parse_get(v)
     }
-    fn parse_server_list(&self, v: &serde_json::Value) -> Vec<VpsInstance> {
-        hetzner::parse_server_list(v)
+    fn parse_server_page(
+        &self,
+        v: &serde_json::Value,
+        page: u32,
+    ) -> Result<InventoryPage<VpsInstance>> {
+        hetzner::parse_server_page(v, page)
     }
-    fn parse_ssh_keys(&self, v: &serde_json::Value) -> Vec<(i64, String)> {
-        hetzner::parse_ssh_keys(v)
+    fn parse_ssh_key_page(
+        &self,
+        v: &serde_json::Value,
+        page: u32,
+    ) -> Result<InventoryPage<(i64, String)>> {
+        hetzner::parse_ssh_key_page(v, page)
     }
     fn parse_ssh_key_created(&self, v: &serde_json::Value) -> Option<i64> {
         hetzner::parse_ssh_key_created(v)
@@ -233,11 +319,14 @@ impl VpsShaper for DigitalOceanShaper {
     fn server_url(&self, base: &str, id: &str) -> String {
         digitalocean::droplet_url(base, id)
     }
-    fn list_url(&self, base: &str) -> String {
-        digitalocean::list_url(base)
+    fn list_page_url(&self, base: &str, page: u32) -> String {
+        digitalocean::list_page_url(base, page)
     }
     fn ssh_keys_url(&self, base: &str) -> String {
         digitalocean::ssh_keys_url(base)
+    }
+    fn ssh_keys_page_url(&self, base: &str, page: u32) -> String {
+        digitalocean::ssh_keys_page_url(base, page)
     }
     fn shutdown_url(&self, base: &str, id: &str) -> String {
         digitalocean::droplet_actions_url(base, id)
@@ -266,11 +355,19 @@ impl VpsShaper for DigitalOceanShaper {
     fn parse_get(&self, v: &serde_json::Value) -> Option<VpsInstance> {
         digitalocean::parse_droplet_envelope(v)
     }
-    fn parse_server_list(&self, v: &serde_json::Value) -> Vec<VpsInstance> {
-        digitalocean::parse_droplet_list(v)
+    fn parse_server_page(
+        &self,
+        v: &serde_json::Value,
+        page: u32,
+    ) -> Result<InventoryPage<VpsInstance>> {
+        digitalocean::parse_server_page(v, page)
     }
-    fn parse_ssh_keys(&self, v: &serde_json::Value) -> Vec<(i64, String)> {
-        digitalocean::parse_ssh_keys(v)
+    fn parse_ssh_key_page(
+        &self,
+        v: &serde_json::Value,
+        page: u32,
+    ) -> Result<InventoryPage<(i64, String)>> {
+        digitalocean::parse_ssh_key_page(v, page)
     }
     fn parse_ssh_key_created(&self, v: &serde_json::Value) -> Option<i64> {
         digitalocean::parse_ssh_key_created(v)
@@ -521,12 +618,16 @@ impl VpsProvider {
     }
 
     /// All thegn-managed instances (label-filtered server-side), with
-    /// ips/creation times — the reaper's view.
+    /// ips/creation times — complete or Err, for the reaper's view.
     pub async fn list_detailed(&self) -> Result<Vec<VpsInstance>> {
-        let body = self
-            .get_json(&self.shaper().list_url(&self.spec.validated_api_base()?))
-            .await?;
-        Ok(self.shaper().parse_server_list(&body))
+        let base = self.spec.validated_api_base()?;
+        let shaper = self.shaper();
+        collect_pages(
+            |page| Box::pin(async { self.get_json(&shaper.list_page_url(&base, page)).await }),
+            |body, page| shaper.parse_server_page(body, page),
+            |server: &VpsInstance| server.id.clone(),
+        )
+        .await
     }
 
     /// Find one managed instance by name.
@@ -539,16 +640,18 @@ impl VpsProvider {
             .find(|s| s.name == name))
     }
 
-    /// Ensure the managed public key is registered, returning its vendor id.
+    /// Ensure the managed public key is registered, returning its vendor id;
+    /// the existing-key lookup sees a complete inventory or returns Err.
     async fn ensure_ssh_key(&self) -> Result<i64> {
         let base = self.spec.validated_api_base()?;
         let shaper = self.shaper();
-        let listed = self.get_json(&shaper.ssh_keys_url(&base)).await?;
-        if let Some((id, _)) = shaper
-            .parse_ssh_keys(&listed)
-            .into_iter()
-            .find(|(_, pk)| same_pubkey(pk, &self.spec.pubkey))
-        {
+        let keys = collect_pages(
+            |page| Box::pin(async { self.get_json(&shaper.ssh_keys_page_url(&base, page)).await }),
+            |body, page| shaper.parse_ssh_key_page(body, page),
+            |key: &(i64, String)| key.0.to_string(),
+        )
+        .await?;
+        if let Some(id) = matching_ssh_key(keys, &self.spec.pubkey) {
             return Ok(id);
         }
         // Name the registered key by its material fingerprint, not a fixed
@@ -1054,6 +1157,127 @@ impl ProviderFiles for VpsProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn hetzner_page(ids: &[i64], page: u32, has_next: bool, total: u64) -> serde_json::Value {
+        let next_page = if has_next {
+            serde_json::json!(page + 1)
+        } else {
+            serde_json::Value::Null
+        };
+        let previous_page = if page == 1 {
+            serde_json::Value::Null
+        } else {
+            serde_json::json!(page - 1)
+        };
+        let rows: Vec<serde_json::Value> = ids
+            .iter()
+            .map(|id| serde_json::json!({"id": id, "name": format!("server-{id}")}))
+            .collect();
+        serde_json::json!({"servers": rows, "meta": {"pagination": {
+            "page": page,
+            "per_page": 50,
+            "previous_page": previous_page,
+            "next_page": next_page,
+            "last_page": if has_next { page + 1 } else { page },
+            "total_entries": total
+        }}})
+    }
+
+    #[tokio::test]
+    async fn inventory_collector_returns_all_rows_from_two_pages() {
+        let pages = vec![
+            hetzner_page(&[1, 2], 1, true, 3),
+            hetzner_page(&[3], 2, false, 3),
+        ];
+        let rows = collect_pages(
+            |page| Box::pin(async { Ok(pages[(page - 1) as usize].clone()) }),
+            hetzner::parse_server_page,
+            |row: &VpsInstance| row.id.clone(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            rows.iter().map(|row| row.id.as_str()).collect::<Vec<_>>(),
+            vec!["1", "2", "3"]
+        );
+    }
+
+    #[tokio::test]
+    async fn inventory_collector_rejects_duplicate_ids_and_total_mismatch() {
+        let duplicate_pages = vec![
+            hetzner_page(&[1], 1, true, 2),
+            hetzner_page(&[1], 2, false, 2),
+        ];
+        let duplicate = collect_pages(
+            |page| Box::pin(async { Ok(duplicate_pages[(page - 1) as usize].clone()) }),
+            hetzner::parse_server_page,
+            |row: &VpsInstance| row.id.clone(),
+        )
+        .await;
+        assert!(duplicate.is_err());
+
+        let mismatch_pages = vec![
+            hetzner_page(&[1], 1, true, 3),
+            hetzner_page(&[2], 2, false, 3),
+        ];
+        let mismatch = collect_pages(
+            |page| Box::pin(async { Ok(mismatch_pages[(page - 1) as usize].clone()) }),
+            hetzner::parse_server_page,
+            |row: &VpsInstance| row.id.clone(),
+        )
+        .await;
+        assert!(mismatch.is_err());
+    }
+
+    #[tokio::test]
+    async fn inventory_collector_rejects_page_cap_and_fetch_error_without_partial_rows() {
+        let capped = collect_pages(
+            |page| Box::pin(async move { Ok(hetzner_page(&[], page, true, 0)) }),
+            hetzner::parse_server_page,
+            |row: &VpsInstance| row.id.clone(),
+        )
+        .await;
+        assert!(capped.is_err());
+
+        let failed = collect_pages(
+            |page| {
+                Box::pin(async move {
+                    if page == 1 {
+                        Ok(hetzner_page(&[1], 1, true, 2))
+                    } else {
+                        Err(anyhow!("fixture fetch failure"))
+                    }
+                })
+            },
+            hetzner::parse_server_page,
+            |row: &VpsInstance| row.id.clone(),
+        )
+        .await;
+        assert!(failed.is_err());
+    }
+
+    #[tokio::test]
+    async fn ssh_key_lookup_finds_key_on_second_page() {
+        let pages = vec![
+            serde_json::json!({"ssh_keys": [{"id": 10, "public_key": "ssh-ed25519 AAAA first"}],
+                "meta": {"pagination": {"page": 1, "per_page": 50, "previous_page": null,
+                    "next_page": 2, "last_page": 2, "total_entries": 2}}}),
+            serde_json::json!({"ssh_keys": [{"id": 11, "public_key": "ssh-ed25519 BBBB managed"}],
+                "meta": {"pagination": {"page": 2, "per_page": 50, "previous_page": 1,
+                    "next_page": null, "last_page": 2, "total_entries": 2}}}),
+        ];
+        let keys = collect_pages(
+            |page| Box::pin(async { Ok(pages[(page - 1) as usize].clone()) }),
+            hetzner::parse_ssh_key_page,
+            |key: &(i64, String)| key.0.to_string(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            matching_ssh_key(keys, "ssh-ed25519 BBBB different-comment"),
+            Some(11)
+        );
+    }
 
     #[test]
     fn kind_parse_and_defaults() {

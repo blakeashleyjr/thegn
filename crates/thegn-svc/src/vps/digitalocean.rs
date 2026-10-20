@@ -16,7 +16,9 @@
 
 use std::collections::BTreeMap;
 
-use super::{HOST_KEY, MANAGED_KEY, MANAGED_VAL, VpsInstance};
+use anyhow::{Result, anyhow};
+
+use super::{HOST_KEY, InventoryPage, MANAGED_KEY, MANAGED_VAL, VpsInstance};
 
 pub const DEFAULT_API_BASE: &str = "https://api.digitalocean.com/v2";
 /// Terraform/`doctl` convention. `doctl` also honours `DIGITALOCEAN_ACCESS_TOKEN`;
@@ -51,8 +53,16 @@ pub fn list_url(base: &str) -> String {
     )
 }
 
+pub fn list_page_url(base: &str, page: u32) -> String {
+    format!("{}&page={page}", list_url(base))
+}
+
 pub fn ssh_keys_url(base: &str) -> String {
     format!("{}/account/keys", base.trim_end_matches('/'))
+}
+
+pub fn ssh_keys_page_url(base: &str, page: u32) -> String {
+    format!("{}?page={page}&per_page=200", ssh_keys_url(base))
 }
 
 /// The per-Droplet action endpoint (snapshot / shutdown live here).
@@ -194,6 +204,102 @@ pub fn parse_droplet_list(v: &serde_json::Value) -> Vec<VpsInstance> {
         .unwrap_or_default()
 }
 
+/// Parse one strict Droplet inventory page. Errors mention row indexes only;
+/// provider row contents may contain addresses or other sensitive data.
+pub fn parse_server_page(v: &serde_json::Value, page: u32) -> Result<InventoryPage<VpsInstance>> {
+    parse_inventory_page(v, page, "droplets", parse_droplet)
+}
+
+/// Parse one strict SSH-key inventory page.
+pub fn parse_ssh_key_page(
+    v: &serde_json::Value,
+    _page: u32,
+) -> Result<InventoryPage<(i64, String)>> {
+    let rows = v
+        .get("ssh_keys")
+        .and_then(serde_json::Value::as_array)
+        .ok_or_else(|| anyhow!("DigitalOcean inventory page is missing the ssh_keys array"))?;
+    let mut items = Vec::with_capacity(rows.len());
+    for (index, row) in rows.iter().enumerate() {
+        let key = row
+            .get("id")
+            .and_then(serde_json::Value::as_i64)
+            .zip(row.get("public_key").and_then(serde_json::Value::as_str))
+            .map(|(id, key)| (id, key.to_string()))
+            .ok_or_else(|| {
+                anyhow!("DigitalOcean inventory page has malformed element at index {index}")
+            })?;
+        items.push(key);
+    }
+    let (has_next, total) = digitalocean_pagination(v)?;
+    Ok(InventoryPage {
+        items,
+        has_next,
+        total,
+    })
+}
+
+fn parse_inventory_page<T>(
+    v: &serde_json::Value,
+    _page: u32,
+    array_name: &str,
+    parse_row: fn(&serde_json::Value) -> Option<T>,
+) -> Result<InventoryPage<T>> {
+    let rows = v
+        .get(array_name)
+        .and_then(serde_json::Value::as_array)
+        .ok_or_else(|| anyhow!("DigitalOcean inventory page is missing the {array_name} array"))?;
+    let mut items = Vec::with_capacity(rows.len());
+    for (index, row) in rows.iter().enumerate() {
+        items.push(parse_row(row).ok_or_else(|| {
+            anyhow!("DigitalOcean inventory page has malformed element at index {index}")
+        })?);
+    }
+    let (has_next, total) = digitalocean_pagination(v)?;
+    Ok(InventoryPage {
+        items,
+        has_next,
+        total,
+    })
+}
+
+fn digitalocean_pagination(v: &serde_json::Value) -> Result<(bool, Option<u64>)> {
+    if v.get("meta")
+        .and_then(serde_json::Value::as_object)
+        .is_none()
+    {
+        return Err(anyhow!("DigitalOcean inventory page is missing meta"));
+    }
+    let has_next = match v.get("links") {
+        None | Some(serde_json::Value::Null) => false,
+        Some(links) => {
+            if links.as_object().is_none() {
+                return Err(anyhow!("DigitalOcean inventory page has malformed links"));
+            }
+            let Some(pages) = links.get("pages") else {
+                return Ok((
+                    false,
+                    v.pointer("/meta/total").and_then(serde_json::Value::as_u64),
+                ));
+            };
+            let pages = pages
+                .as_object()
+                .ok_or_else(|| anyhow!("DigitalOcean inventory page has malformed links.pages"))?;
+            match pages.get("next") {
+                None | Some(serde_json::Value::Null) => false,
+                Some(serde_json::Value::String(_)) => true,
+                _ => {
+                    return Err(anyhow!(
+                        "DigitalOcean inventory page has malformed links.pages.next"
+                    ));
+                }
+            }
+        }
+    };
+    let total = v.pointer("/meta/total").and_then(serde_json::Value::as_u64);
+    Ok((has_next, total))
+}
+
 pub fn ssh_key_body(name: &str, pubkey: &str) -> serde_json::Value {
     serde_json::json!({ "name": name, "public_key": pubkey })
 }
@@ -251,6 +357,43 @@ pub fn parse_latest_snapshot_id(droplet_get: &serde_json::Value) -> Option<Strin
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn droplet_page(rows: serde_json::Value, next: bool, total: u64) -> serde_json::Value {
+        let mut value = serde_json::json!({"droplets": rows, "meta": {"total": total}});
+        if next {
+            value["links"] = serde_json::json!({"pages": {
+                "next": "https://api.digitalocean.com/v2/droplets?page=2"
+            }});
+        }
+        value
+    }
+
+    #[test]
+    fn strict_server_pages_return_both_pages_and_reject_malformed_shapes() {
+        let first = droplet_page(
+            serde_json::json!([{"id": 1, "name": "one"}, {"id": 2, "name": "two"}]),
+            true,
+            3,
+        );
+        let last = droplet_page(serde_json::json!([{"id": 3, "name": "three"}]), false, 3);
+        let first = parse_server_page(&first, 1).unwrap();
+        let last = parse_server_page(&last, 2).unwrap();
+        assert_eq!(first.items.len(), 2);
+        assert!(first.has_next);
+        assert_eq!(last.items.len(), 1);
+        assert!(!last.has_next);
+        assert_eq!(last.total, Some(3));
+
+        let malformed = droplet_page(serde_json::json!([{"bogus": true}]), true, 1);
+        assert!(parse_server_page(&malformed, 1).is_err());
+        assert!(parse_server_page(&serde_json::json!({"droplets": []}), 1).is_err());
+    }
+
+    #[test]
+    fn strict_server_and_key_page_urls_pin_provider_pagination() {
+        assert!(list_page_url(DEFAULT_API_BASE, 2).ends_with("&per_page=200&page=2"));
+        assert!(ssh_keys_page_url(DEFAULT_API_BASE, 2).ends_with("?page=2&per_page=200"));
+    }
 
     #[test]
     fn unknown_and_future_provider_creation_times_never_authorize_reaping() {
