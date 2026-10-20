@@ -1381,6 +1381,32 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn controller_id_load_failure_refuses_create_before_any_request() {
+        let _state = thegn_core::testenv::IsolatedState::new();
+        let hits = std::sync::Arc::new(Mutex::new(Vec::new()));
+        let (base, _srv) = fake_fly_server(hits.clone()).await;
+        let provider = FlyProvider::new(FlySpec {
+            api_base: base.clone(),
+            graphql_url: format!("{base}/"),
+            ..spec()
+        });
+        let id_path =
+            thegn_core::util::thegn_dir().join(crate::vps::controller::CONTROLLER_ID_FILE);
+        std::fs::create_dir_all(id_path.parent().unwrap()).unwrap();
+        std::fs::write(&id_path, b"malformed").unwrap();
+
+        let error = provider.create().await.unwrap_err();
+        assert!(
+            error.to_string().contains(&id_path.display().to_string()),
+            "controller id refusal should identify the file: {error:#}"
+        );
+        assert!(
+            hits.lock().unwrap().is_empty(),
+            "malformed controller id must refuse create before remote calls"
+        );
+    }
+
     #[test]
     fn image_and_size_overrides() {
         let s = FlySpec {
