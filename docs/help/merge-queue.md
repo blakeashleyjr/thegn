@@ -34,6 +34,9 @@ is not shown in rail mode. The bottom-bar summary is opt-in: set
   advances; conflicted branches stay queued.
 - **Drain (agent autopilot)** hands conflicts to a coding agent to
   resolve, then continues.
+  Each eligible row is claimed by the drain working it, so a concurrent drain
+  skips that row with a warning; an expired claim on a still-claimable row can
+  be taken over after about five minutes.
 - `thegn integrate` does the same from any shell. It prints the branches
   it is about to fold and asks before folding any of them; `--dry-run`
   prints that plan and stops, and `--yes` skips the prompt (required to

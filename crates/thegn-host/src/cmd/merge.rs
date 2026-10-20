@@ -741,8 +741,17 @@ fn drain(cfg: &Config, all: bool, json: bool) -> Result<()> {
     // The run's effective target may differ from the one frozen on each row at
     // enqueue time (e.g. under `--set merge_queue.target_branch=…`), which is
     // why `merge list` used to keep showing the stale value. Re-stamp it.
-    for it in &items {
+    let mut held_branches = Vec::new();
+    let mut drain_items = Vec::with_capacity(items.len());
+    for it in items {
         if let Err(error) = db.set_merge_target(&it.worktree, &target) {
+            if error
+                .to_string()
+                .contains(thegn_core::store::MERGE_CLAIM_ACTIVE)
+            {
+                held_branches.push(it.branch.clone());
+                continue;
+            }
             if json {
                 super::emit_json(&serde_json::json!({
                     "error": {
@@ -754,25 +763,32 @@ fn drain(cfg: &Config, all: bool, json: bool) -> Result<()> {
             }
             return Err(error);
         }
+        drain_items.push(it);
     }
     let mut steps = Vec::new();
     let guard = crate::platform::InterruptGuard::install();
     let _scope = crate::fold_cancel::scope(move || guard.fired());
-    let out = merge_driver::drive_queue(mq, cfg, &root, &db, items, |step: &DriveStep| {
-        if !crate::merge_notify::collect_step(&mut steps, step, json) {
-            return;
-        }
-        // Only the settled transitions are worth a CLI line; folding/agent_running
-        // are transient and would just be noise before the outcome.
-        match MqStatus::parse(step.status) {
-            Some(status) => {
-                if let Some(line) = progress_line(status, step.branch, step.detail) {
-                    outln!("{line}");
-                }
+    let mut out =
+        merge_driver::drive_queue(mq, cfg, &root, &db, drain_items, |step: &DriveStep| {
+            if !crate::merge_notify::collect_step(&mut steps, step, json) {
+                return;
             }
-            None => outln!("  ? {} unknown queue status '{}'", step.branch, step.status),
-        }
-    });
+            // Only the settled transitions are worth a CLI line; folding/agent_running
+            // are transient and would just be noise before the outcome.
+            match MqStatus::parse(step.status) {
+                Some(status) => {
+                    if let Some(line) = progress_line(status, step.branch, step.detail) {
+                        outln!("{line}");
+                    }
+                }
+                None => outln!("  ? {} unknown queue status '{}'", step.branch, step.status),
+            }
+        });
+    out.warnings.extend(
+        held_branches
+            .into_iter()
+            .map(|branch| format!("{branch}: claimed by another drain; target update skipped")),
+    );
     crate::merge_notify::record_cli_drain(cfg, &db, &steps, &out);
 
     // push mode: converge by pushing the advanced target to origin. Done before

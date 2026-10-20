@@ -1,0 +1,265 @@
+use super::*;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use thegn_core::store::MergeClaimRequest;
+
+fn registered_row(db: &Db, root: &Path, worktree: &str, branch: &str) -> QueueItem {
+    let root = root.to_string_lossy().into_owned();
+    db.put_worktree(branch, &root, worktree, branch, None, None)
+        .unwrap();
+    db.enqueue_merge(worktree, branch, "main").unwrap();
+    QueueItem {
+        worktree: worktree.to_owned(),
+        branch: branch.to_owned(),
+        location: String::new(),
+        agent_attempts: 0,
+    }
+}
+
+fn ready_actions(
+    attempt: impl FnMut(&str, &thegn_core::remote::GitLoc) -> anyhow::Result<AttemptOutcome>,
+) -> DriveActions<
+    impl FnMut(&str, &thegn_core::remote::GitLoc) -> anyhow::Result<AttemptOutcome>,
+    impl FnMut(&str) -> crate::agent_run::AgentDispatch,
+    impl FnMut(&str, &str, &str, &str, &Failure, Option<thegn_core::sandbox::SandboxSpec>) -> bool,
+> {
+    DriveActions {
+        attempt,
+        floor: |_| panic!("unexpected agent handoff"),
+        runner: |_, _, _, _, _, _| false,
+    }
+}
+
+fn registered_config() -> MergeQueueConfig {
+    MergeQueueConfig {
+        target_branch: "main".into(),
+        organize_folders: false,
+        conflict_handoff: ConflictHandoff::Notify,
+        ..Default::default()
+    }
+}
+
+#[test]
+fn racing_drains_on_two_connections_have_one_owner() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("queue.sqlite");
+    let root = dir.path().join("repo");
+    std::fs::create_dir(&root).unwrap();
+    let db_a = Db::open_at(&db_path).unwrap();
+    let item = registered_row(&db_a, &root, "/worktrees/feature", "feature");
+    let db_b = Db::open_at(&db_path).unwrap();
+    let root_a = root.clone();
+    let (started_tx, started_rx) = std::sync::mpsc::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    let winner = std::thread::spawn(move || {
+        drive_queue_with(
+            &registered_config(),
+            &Config::default(),
+            &root_a,
+            &db_a,
+            vec![item],
+            |_| {},
+            ready_actions(move |_, _| {
+                started_tx.send(()).unwrap();
+                release_rx.recv().unwrap();
+                Ok(AttemptOutcome::Ready { tip: "tip".into() })
+            }),
+        )
+    });
+    started_rx.recv().unwrap();
+    let loser_attempts = Arc::new(AtomicUsize::new(0));
+    let loser_count = Arc::clone(&loser_attempts);
+    let loser = drive_queue_with(
+        &registered_config(),
+        &Config::default(),
+        &root,
+        &db_b,
+        vec![QueueItem {
+            worktree: "/worktrees/feature".into(),
+            branch: "feature".into(),
+            location: String::new(),
+            agent_attempts: 0,
+        }],
+        |_| {},
+        ready_actions(move |_, _| {
+            loser_count.fetch_add(1, Ordering::Relaxed);
+            Ok(AttemptOutcome::Ready {
+                tip: "wrong".into(),
+            })
+        }),
+    );
+    let attempts_after_loser = loser_attempts.load(Ordering::Relaxed);
+    let persisted_attempts = db_b.list_merge_queue().unwrap()[0].agent_attempts;
+    release_tx.send(()).unwrap();
+    let winner = winner.join().unwrap();
+    assert_eq!(attempts_after_loser, 0);
+    assert_eq!(persisted_attempts, 0);
+    assert_eq!(loser.warnings.len(), 1);
+    assert!(loser.warnings[0].contains("claimed by another drain"));
+    assert_eq!(winner.ready, ["feature"]);
+}
+
+#[test]
+fn row_held_by_another_connection_is_skipped_and_the_next_row_lands() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("queue.sqlite");
+    let root = dir.path().join("repo");
+    std::fs::create_dir(&root).unwrap();
+    let db = Db::open_at(&db_path).unwrap();
+    let first = registered_row(&db, &root, "/worktrees/first", "first");
+    let second = registered_row(&db, &root, "/worktrees/second", "second");
+    let holder = Db::open_at(&db_path).unwrap();
+    let root_s = root.to_string_lossy().into_owned();
+    holder
+        .admit_merge_claim(&MergeClaimRequest {
+            worktree: first.worktree.clone(),
+            branch: first.branch.clone(),
+            repo_root: root_s,
+            target_branch: "main".into(),
+            location: String::new(),
+            expected_status: "queued".into(),
+            lease_until_ms: util::now_ms() + 60_000,
+            owner_hint: Some("holder".into()),
+        })
+        .unwrap()
+        .unwrap();
+    let attempted = Arc::new(AtomicUsize::new(0));
+    let called = Arc::clone(&attempted);
+    let mut progressed = Vec::new();
+    let outcome = drive_queue_with(
+        &registered_config(),
+        &Config::default(),
+        &root,
+        &db,
+        vec![first.clone(), second],
+        |step| progressed.push(step.worktree.to_owned()),
+        ready_actions(move |_, _| {
+            called.fetch_add(1, Ordering::Relaxed);
+            Ok(AttemptOutcome::Ready { tip: "tip".into() })
+        }),
+    );
+    assert_eq!(attempted.load(Ordering::Relaxed), 1);
+    assert!(
+        !progressed
+            .iter()
+            .any(|worktree| worktree == &first.worktree)
+    );
+    assert!(
+        progressed
+            .iter()
+            .any(|worktree| worktree == "/worktrees/second")
+    );
+    assert_eq!(db.list_merge_queue().unwrap()[0].status, "queued");
+    assert_eq!(outcome.ready, ["second"]);
+    assert!(outcome.warnings[0].contains("claimed by another drain"));
+}
+
+#[test]
+fn claimed_row_is_released_after_the_drain() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("queue.sqlite");
+    let root = dir.path().join("repo");
+    std::fs::create_dir(&root).unwrap();
+    let db = Db::open_at(&db_path).unwrap();
+    let worktree = root.join("worktree").to_string_lossy().into_owned();
+    let item = registered_row(&db, &root, &worktree, "feature");
+    let before = db.observe_merge_claim(&item.worktree).unwrap().unwrap();
+    drive_queue_with(
+        &registered_config(),
+        &Config::default(),
+        &root,
+        &db,
+        vec![item.clone()],
+        |_| {},
+        ready_actions(|_, _| Ok(AttemptOutcome::Ready { tip: "tip".into() })),
+    );
+    let after = db.observe_merge_claim(&item.worktree).unwrap().unwrap();
+    assert_eq!(after.phase, "unclaimed");
+    assert_eq!(after.generation, before.generation + 1);
+    assert!(claim::heartbeat_joined(&item.worktree));
+}
+
+#[test]
+fn budget_is_consumed_through_the_claim() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("queue.sqlite");
+    let root = dir.path().join("repo");
+    std::fs::create_dir(&root).unwrap();
+    let db = Db::open_at(&db_path).unwrap();
+    let item = registered_row(&db, &root, "/worktrees/feature", "feature");
+    db.set_merge_agent_attempts(&item.worktree, 1).unwrap();
+    let cfg = MergeQueueConfig {
+        conflict_handoff: ConflictHandoff::Agent,
+        agent_command: "agent".into(),
+        agent_max_attempts: 2,
+        ..registered_config()
+    };
+    let runs = Arc::new(AtomicUsize::new(0));
+    let runner_runs = Arc::clone(&runs);
+    let outcome = drive_queue_with(
+        &cfg,
+        &Config::default(),
+        &root,
+        &db,
+        vec![item],
+        |_| {},
+        DriveActions {
+            attempt: |_, _| Ok(AttemptOutcome::GateFailed { log: "red".into() }),
+            floor: |_| crate::agent_run::AgentDispatch::Run(None),
+            runner: move |_, _, _, _, _, _| {
+                runner_runs.fetch_add(1, Ordering::Relaxed);
+                true
+            },
+        },
+    );
+    assert_eq!(runs.load(Ordering::Relaxed), 1);
+    assert_eq!(outcome.needs_human, ["feature"]);
+    let row = db.list_merge_queue().unwrap().remove(0);
+    assert_eq!(row.agent_attempts, 2);
+    assert_eq!(row.status, "needs_human");
+}
+
+#[test]
+fn unregistered_row_still_drains_unfenced() {
+    let db = Db::open_memory().unwrap();
+    db.enqueue_merge("/ad-hoc", "feature", "main").unwrap();
+    let outcome = drive_queue_with(
+        &registered_config(),
+        &Config::default(),
+        Path::new("/repo"),
+        &db,
+        vec![QueueItem {
+            worktree: "/ad-hoc".into(),
+            branch: "feature".into(),
+            location: String::new(),
+            agent_attempts: 0,
+        }],
+        |_| {},
+        ready_actions(|_, _| Ok(AttemptOutcome::Ready { tip: "tip".into() })),
+    );
+    assert!(outcome.warnings.is_empty());
+    assert_eq!(outcome.ready, ["feature"]);
+}
+
+#[test]
+fn stale_folding_row_is_skipped_with_a_warning() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("queue.sqlite");
+    let root = dir.path().join("repo");
+    std::fs::create_dir(&root).unwrap();
+    let db = Db::open_at(&db_path).unwrap();
+    let item = registered_row(&db, &root, "/worktrees/feature", "feature");
+    db.replace_merge_status(&item.worktree, "folding", &MergeStatusFields::default())
+        .unwrap();
+    let outcome = drive_queue_with(
+        &registered_config(),
+        &Config::default(),
+        &root,
+        &db,
+        vec![item],
+        |_| {},
+        ready_actions(|_, _| panic!("stale row must not be attempted")),
+    );
+    assert_eq!(db.list_merge_queue().unwrap()[0].status, "folding");
+    assert!(outcome.warnings[0].contains("not claimable"));
+}

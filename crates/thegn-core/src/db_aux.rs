@@ -821,7 +821,13 @@ impl WorktreeAuxStore for Db {
         anyhow::ensure!(
             matches!(
                 request.expected_status.as_str(),
-                "queued" | "deferred" | "gate_failed" | "gate_error" | "needs_human" | "ready"
+                "queued"
+                    | "deferred"
+                    | "gate_failed"
+                    | "gate_error"
+                    | "needs_human"
+                    | "ready"
+                    | "agent_blocked"
             ),
             "invalid merge claim status"
         );
