@@ -283,6 +283,8 @@ Pressing Ctrl-C or sending SIGTERM during `thegn integrate`, `thegn land`, or
 `thegn merge drain` cancels the fold without blaming a branch. If cancellation
 stops a gate already running for a row, that row is recorded as `gate_error`;
 rows not yet started remain queued.
+The gate also returns `gate_error` if its command moves checkout `HEAD` or changes
+the index from the pinned candidate.
 
 When a red union is being localized, `diagnosis_max_gates` (default `8`) caps
 the total gate attempts and `diagnosis_timeout_secs` (default `3600`) bounds
