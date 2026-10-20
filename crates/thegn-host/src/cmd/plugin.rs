@@ -241,7 +241,7 @@ fn inspection_lines(admitted: &AdmittedPlugin) -> Vec<String> {
     if plugin.trusted_native_ignored {
         native_line.push_str("; trusted_native in plugin.toml ignored");
     }
-    let negotiated = match &admitted.decision {
+    let (negotiated, refusal_line) = match &admitted.decision {
         PluginDecision::Disabled => {
             return vec![
                 format!("plugin {id}: disabled (not negotiated)"),
@@ -249,7 +249,12 @@ fn inspection_lines(admitted: &AdmittedPlugin) -> Vec<String> {
             ];
         }
         PluginDecision::RefusedUntrusted(problem) => {
-            return vec![format!("plugin {id}: {}", problem.problem), native_line];
+            match thegn_svc::plugin::loader::negotiate(&plugin.spec) {
+                Ok(negotiated) => (negotiated, Some(problem.problem.as_str())),
+                Err(_) => {
+                    return vec![format!("plugin {id}: {}", problem.problem), native_line];
+                }
+            }
         }
         PluginDecision::Invalid(problems) => {
             let mut lines = problems
@@ -259,7 +264,7 @@ fn inspection_lines(admitted: &AdmittedPlugin) -> Vec<String> {
             lines.push(native_line);
             return lines;
         }
-        PluginDecision::Admitted(negotiated) => negotiated,
+        PluginDecision::Admitted(negotiated) => (negotiated, None),
     };
     let mut granted = negotiated
         .granted
@@ -300,6 +305,9 @@ fn inspection_lines(admitted: &AdmittedPlugin) -> Vec<String> {
             rejected.reason
         ));
     }
+    if let Some(refusal) = refusal_line {
+        lines.insert(0, format!("plugin {id}: {refusal}"));
+    }
     lines
 }
 
@@ -326,6 +334,7 @@ pub fn run(cfg: &Config, action: Action, config_path: &Path) -> Result<()> {
             for p in &admitted.plugins {
                 let row = list_row(p);
                 let source = p
+                    .plugin
                     .dir
                     .as_ref()
                     .map(|d| d.display().to_string())
@@ -425,22 +434,16 @@ mod tests {
     }
 
     fn admitted_plugin(plugin: LoadedPlugin) -> AdmittedPlugin {
-        let decision = if !plugin.spec.enabled {
-            PluginDecision::Disabled
-        } else if let Some(problem) = thegn_svc::plugin::loader::native_trust_refusal(&plugin) {
-            PluginDecision::RefusedUntrusted(problem)
-        } else {
-            let problems = thegn_svc::plugin::loader::check_spec(&plugin);
-            match thegn_svc::plugin::loader::negotiate(&plugin.spec) {
-                Ok(negotiated) if problems.is_empty() => PluginDecision::Admitted(negotiated),
-                _ => PluginDecision::Invalid(problems),
-            }
+        let tmp = tempfile::tempdir().unwrap();
+        let cfg = Config {
+            plugins: vec![plugin.spec.clone()],
+            ..Default::default()
         };
-        AdmittedPlugin {
-            plugin,
-            source_digest: "test-source-digest".into(),
-            decision,
-        }
+        let mut admitted = thegn_svc::plugin::loader::admit(&cfg, tmp.path());
+        let mut admitted_plugin = admitted.plugins.remove(0);
+        admitted_plugin.plugin = plugin;
+        admitted_plugin.source_digest = "test-source-digest".into();
+        admitted_plugin
     }
 
     #[test]
@@ -594,6 +597,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let mut plugin = inspected_plugin(ExtensionPoint::PaletteAction, &["surface:palette"]);
         plugin.spec.manifest.api = ApiVersion::new(9, 0, 0);
+        plugin.spec.scopes.clear();
         let cfg = Config {
             plugins: vec![plugin],
             ..Default::default()

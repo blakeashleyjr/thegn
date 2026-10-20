@@ -270,12 +270,20 @@ fn discover_with_digests(
         })
         .collect();
     let mut source_digests = Vec::new();
+    let mut problems = Vec::new();
     for plugin in &out {
-        let encoded = serde_json::to_vec(&plugin.spec).expect("PluginSpec serializes to JSON");
-        source_digests.push(digest_bytes(&encoded));
+        match serde_json::to_vec(&plugin.spec) {
+            Ok(encoded) => source_digests.push(digest_bytes(&encoded)),
+            Err(error) => {
+                problems.push(SpecProblem {
+                    plugin: plugin.spec.manifest.id.as_str().to_string(),
+                    problem: format!("could not digest [[plugins]] entry: {error}"),
+                });
+                source_digests.push(String::new());
+            }
+        }
     }
     let plugins_dir = config_dir.join("plugins");
-    let mut problems = Vec::new();
     match std::fs::metadata(&plugins_dir) {
         Ok(metadata) if !metadata.is_dir() => {
             problems.push(discovery_problem(
