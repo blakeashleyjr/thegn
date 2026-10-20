@@ -1257,7 +1257,7 @@ fn group_stop_kills_pipe_holding_grandchild() {
     let state = tempfile::tempdir().expect("private temporary state");
     let pid_path = state.path().join("grandchild.pid");
     let script = format!(
-        "sleep 30 & echo $! > '{}'; echo 'public: grand.example'; wait",
+        "sleep 30 & echo $! > '{}'; echo 'public: grand.example:443'; wait",
         pid_path.display()
     );
     let plan = group_stop_plan(script);
@@ -1299,7 +1299,7 @@ fn group_stop_kills_pipe_holding_grandchild() {
 fn group_stop_escalates_when_the_client_ignores_sigterm() {
     let state = tempfile::tempdir().expect("private temporary state");
     let plan = group_stop_plan(
-        "trap '' TERM; echo 'public: stubborn.example'; while :; do sleep 1; done".into(),
+        "trap '' TERM; echo 'public: stubborn.example:443'; while :; do sleep 1; done".into(),
     );
     let running = start_cancellable(
         &plan,
@@ -1325,7 +1325,7 @@ fn group_stop_escalates_when_the_client_ignores_sigterm() {
 fn group_stop_repeated_stop_arms_one_escalation() {
     let state = tempfile::tempdir().expect("private temporary state");
     let plan = group_stop_plan(
-        "trap '' TERM; echo 'public: stubborn.example'; while :; do sleep 1; done".into(),
+        "trap '' TERM; echo 'public: stubborn.example:443'; while :; do sleep 1; done".into(),
     );
     let running = start_cancellable(
         &plan,
@@ -1360,7 +1360,7 @@ fn group_stop_repeated_stop_arms_one_escalation() {
 fn group_stop_now_kills_term_ignoring_client_immediately() {
     let state = tempfile::tempdir().expect("private temporary state");
     let plan =
-        group_stop_plan("trap '' TERM; echo 'public: stubborn.example'; exec sleep 30".into());
+        group_stop_plan("trap '' TERM; echo 'public: stubborn.example:443'; exec sleep 30".into());
     let running = start_cancellable(
         &plan,
         state.path(),
@@ -1386,7 +1386,7 @@ fn group_stop_foreground_start_keeps_the_callers_group() {
     let state = tempfile::tempdir().expect("private temporary state");
     let foreground_path = state.path().join("foreground-group");
     let script = format!(
-        "if kill -0 -$$ 2>/dev/null; then echo own; else echo inherited; fi > '{}'; echo 'public: foreground.example'; exec sleep 30",
+        "if kill -0 -$$ 2>/dev/null; then echo own; else echo inherited; fi > '{}'; echo 'public: foreground.example:443'; exec sleep 30",
         foreground_path.display()
     );
     let plan = SharePlan {
@@ -1406,7 +1406,7 @@ fn group_stop_foreground_start_keeps_the_callers_group() {
 
     let grouped_path = state.path().join("grouped-group");
     let plan = group_stop_plan(format!(
-        "if kill -0 -$$ 2>/dev/null; then echo own; else echo inherited; fi > '{}'; echo 'public: grouped.example'; exec sleep 30",
+        "if kill -0 -$$ 2>/dev/null; then echo own; else echo inherited; fi > '{}'; echo 'public: grouped.example:443'; exec sleep 30",
         grouped_path.display()
     ));
     let running = start_cancellable(
@@ -1425,7 +1425,7 @@ fn group_stop_foreground_start_keeps_the_callers_group() {
 #[test]
 fn group_stop_supervised_wait_returns_on_exit_without_poll() {
     let state = tempfile::tempdir().expect("private temporary state");
-    let plan = group_stop_plan("echo 'public: quick.example'; sleep 0.3".into());
+    let plan = group_stop_plan("echo 'public: quick.example:443'; sleep 0.3".into());
     let running = start_cancellable(
         &plan,
         state.path(),
