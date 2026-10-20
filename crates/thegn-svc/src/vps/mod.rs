@@ -669,7 +669,7 @@ impl VpsProvider {
         let fp = thegn_core::util::short_hash(self.spec.pubkey.trim(), 8);
         let created = self
             .post_json(
-                &shaper.ssh_keys_url(&base),
+                &shaper.ssh_keys_url(base),
                 &shaper.ssh_key_body(&format!("thegn-managed-{fp}"), self.spec.pubkey.trim()),
             )
             .await?;

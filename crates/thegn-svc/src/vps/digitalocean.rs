@@ -206,7 +206,7 @@ pub fn parse_droplet_list(v: &serde_json::Value) -> Vec<VpsInstance> {
 
 /// Parse one strict Droplet inventory page. Errors mention row indexes only;
 /// provider row contents may contain addresses or other sensitive data.
-pub fn parse_server_page(v: &serde_json::Value, page: u32) -> Result<InventoryPage<VpsInstance>> {
+pub fn parse_server_page(v: &serde_json::Value, _page: u32) -> Result<InventoryPage<VpsInstance>> {
     parse_inventory_page(v, "droplets", parse_droplet)
 }
 
