@@ -4,7 +4,7 @@
 //! (`pool_targets`). Sibling `impl` block (via the `conn()` accessor) so the
 //! pinned `db.rs` only carries the schema DDL, not these bodies.
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use rusqlite::params;
 
 use crate::db::{Db, PoolSpare};
@@ -52,14 +52,14 @@ impl PoolStore for Db {
 
     fn insert_pool_spare(&self, name: &str, repo: &str, env: &str) -> Result<()> {
         let now = util::now();
-        self.conn().execute(
-            "INSERT INTO pool_spares
-               (sandbox_name,repo_path,env_name,state,checkpoint_id,lock_hash,created_at,updated_at)
-             VALUES(?1,?2,?3,'provisioning',NULL,NULL,?4,?4)",
-            params![name, repo, env, now],
-        ).map_err(|error| anyhow::anyhow!(
-            "warm pool: spare {name} already has a ledger row or could not be inserted: {error}"
-        ))?;
+        self.conn()
+            .execute(
+                "INSERT INTO pool_spares
+                   (sandbox_name,repo_path,env_name,state,checkpoint_id,lock_hash,created_at,updated_at)
+                 VALUES(?1,?2,?3,'provisioning',NULL,NULL,?4,?4)",
+                params![name, repo, env, now],
+            )
+            .with_context(|| format!("warm pool: spare {name} already has a ledger row"))?;
         Ok(())
     }
 

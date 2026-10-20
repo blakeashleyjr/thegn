@@ -399,25 +399,18 @@ pub fn provision_spare(
             }
             Ok(name)
         }
-        Ok((false, _)) => Err(rollback_spare_failure(
-            cfg,
-            env_name,
-            &name,
-            anyhow::anyhow!("env '{env_name}' cannot host a pool spare (no configured provider)"),
-        )),
+        Ok((false, _)) => {
+            let error = anyhow::anyhow!(
+                "env '{env_name}' cannot host a pool spare (no configured provider)"
+            );
+            match thegn_core::db::Db::open().and_then(|db| db.delete_pool_spare(&name)) {
+                Ok(()) => Err(error),
+                Err(delete_error) => Err(error.context(format!(
+                    "also failed to delete unprovisioned spare intent row {name}: {delete_error:#}"
+                ))),
+            }
+        }
         Err(error) => Err(rollback_spare_failure(cfg, env_name, &name, error)),
-    }
-}
-
-fn rollback_spare_failure(
-    cfg: &thegn_core::config::Config,
-    env_name: &str,
-    name: &str,
-    error: anyhow::Error,
-) -> anyhow::Error {
-    match destroy_spare(cfg, env_name, name) {
-        Ok(()) => error,
-        Err(rollback) => error.context(format!("rollback also failed: {rollback:#}")),
     }
 }
 
@@ -608,6 +601,18 @@ fn spare_row_after_destroy(outcome: &anyhow::Result<()>) -> SpareRow {
         SpareRow::Drop
     } else {
         SpareRow::Keep
+    }
+}
+
+fn rollback_spare_failure(
+    cfg: &thegn_core::config::Config,
+    env_name: &str,
+    name: &str,
+    error: anyhow::Error,
+) -> anyhow::Error {
+    match destroy_spare(cfg, env_name, name) {
+        Ok(()) => error,
+        Err(rollback) => error.context(format!("rollback also failed: {rollback:#}")),
     }
 }
 
@@ -851,6 +856,42 @@ mod tests {
             db.pool_spare_by_name("ledger-no-provider")
                 .unwrap()
                 .is_some()
+        );
+    }
+
+    #[test]
+    fn spare_ledger_unprovisioned_spare_drops_intent_row() {
+        use thegn_core::config::{EnvConfig, EnvProviderConfig, PlacementMode};
+
+        let _state = thegn_core::testenv::IsolatedState::new();
+        let repo = tempfile::tempdir().unwrap();
+        let mut cfg = thegn_core::config::Config::default();
+        cfg.env.insert(
+            "sprites".into(),
+            EnvConfig {
+                placement: PlacementMode::Provider,
+                provider: EnvProviderConfig {
+                    provider: "sprites".into(),
+                    api_key_env: "TG_TEST_SPARE_LEDGER_NO_TOKEN".into(),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        );
+
+        let result = provision_spare(&cfg, repo.path(), "sprites", |_| {});
+
+        assert!(
+            result.is_err(),
+            "missing provider token must refuse provisioning"
+        );
+        assert!(
+            thegn_core::db::Db::open()
+                .unwrap()
+                .pool_spares_for(&repo.path().to_string_lossy(), "sprites")
+                .unwrap()
+                .is_empty(),
+            "an unprovisioned spare must not leave its intent row behind"
         );
     }
 
