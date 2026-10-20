@@ -92,8 +92,9 @@ show the stash diff, including untracked files. It follows the entry by its
 object ID and can be scrolled at both Half and Full widths.
 Apply, pop, and drop act on the selected entry by object ID even if stashes
 were pushed meanwhile; a stash that no longer exists is refused.
-For local worktrees, nuke, unstaged-only stash, and undo hold the git lock for
-their full multi-command operation. If restoring the index after an
+For local worktrees, nuke (the changes section's Nuke menu choice),
+unstaged-only stash, and undo hold the git lock for their full multi-command
+operation. If restoring the index after an
 unstaged-only stash fails, the error says the temporary `[thegn] temp index`
 commit remains on `HEAD`.
 
