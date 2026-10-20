@@ -26,12 +26,14 @@
 
 pub mod mcp;
 
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
 use anyhow::{Context, Result, anyhow};
 use futures_util::future::BoxFuture;
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 
 use crate::provider::{
     CheckpointInfo, ExecKind, FileEntry, ProviderCheckpoints, ProviderFiles, RemoteProvider,
@@ -96,8 +98,10 @@ pub struct Machine0Spec {
     /// Vendor region (empty ⇒ machine0 default).
     pub region: String,
     /// NixOS only: a flake ref applied post-create via `nixos-rebuild switch
-    /// --flake <ref>` over ssh (empty ⇒ skip). A local `path#attr` is uploaded
-    /// first; a flake URL (`github:…#host`) is used verbatim.
+    /// --flake <ref>` over ssh (empty ⇒ skip). A local `path#attr` is resolved
+    /// to a canonical directory containing a regular `flake.nix`, then uploaded
+    /// into a digest-named generation; a flake URL (`github:…#host`) is used
+    /// verbatim.
     pub provision_flake: String,
     /// SSH username (empty ⇒ [`DEFAULT_USER`]).
     pub ssh_user: String,
@@ -565,8 +569,9 @@ impl Machine0Provider {
     }
 
     /// NixOS flake apply over ssh (there is no `provision` MCP tool). A local
-    /// `path#attr` ref is uploaded first and rebuilt from the uploaded dir; a
-    /// flake URL is applied verbatim. Bounded — a rebuild takes minutes.
+    /// flake is resolved to its canonical root and uploaded into a digest-named
+    /// generation directory; a flake URL is applied verbatim. Bounded — a
+    /// rebuild takes minutes.
     async fn provision_nixos(&self, name: &str) -> Result<()> {
         let flake = self.spec.provision_flake.trim();
         if flake.is_empty() {
@@ -576,20 +581,31 @@ impl Machine0Provider {
             Some((l, a)) => (l, Some(a)),
             None => (flake, None),
         };
-        let remote_ref = if Path::new(loc).exists() {
-            // Upload the flake dir (parent of a flake.nix file, or the dir itself)
-            // and reference it on the VM.
-            let p = Path::new(loc);
-            let dir = if p.is_file() {
-                p.parent().unwrap_or(Path::new("."))
-            } else {
-                p
+        let local_ref = loc.to_string();
+        let limits = FLAKE_UPLOAD_LIMITS;
+        let tree = tokio::task::spawn_blocking(move || {
+            local_flake_root(&local_ref)?
+                .map(|root| collect_flake_tree(&root, &limits))
+                .transpose()
+        })
+        .await
+        .context("machine0: flake collection worker failed")??;
+        let remote_ref = if let Some(tree) = tree {
+            for rel in &tree.skipped {
+                tracing::warn!(path = %rel, "machine0: skipped non-regular flake upload entry");
+            }
+            let digest = match attr {
+                Some(attribute) => flake_generation_digest(&tree.files, Some(attribute)),
+                None => tree.digest.clone(),
             };
-            const REMOTE_DIR: &str = "/root/thegn-provision";
-            self.upload_dir(name, dir, REMOTE_DIR).await?;
+            let gen_dir = format!("/root/thegn-provision/{}", &digest[..32]);
+            for (rel, bytes) in &tree.files {
+                let remote_path = crate::provider::join_remote(&gen_dir, rel);
+                self.write(name, &remote_path, bytes).await?;
+            }
             match attr {
-                Some(a) => format!("{REMOTE_DIR}#{a}"),
-                None => REMOTE_DIR.to_string(),
+                Some(a) => format!("{gen_dir}#{a}"),
+                None => gen_dir,
             }
         } else {
             flake.to_string()
@@ -1227,6 +1243,203 @@ fn same_pubkey(a: &str, b: &str) -> bool {
     !a.is_empty() && !b.is_empty() && norm(a) == norm(b)
 }
 
+#[derive(Clone, Copy)]
+struct UploadLimits {
+    max_depth: usize,
+    max_files: usize,
+    max_file_bytes: u64,
+    max_total_bytes: u64,
+}
+
+const FLAKE_UPLOAD_LIMITS: UploadLimits = UploadLimits {
+    max_depth: crate::provider::DOWNLOAD_MAX_DEPTH,
+    max_files: crate::provider::DOWNLOAD_MAX_FILES,
+    max_file_bytes: crate::provider::DOWNLOAD_MAX_FILE_BYTES,
+    max_total_bytes: crate::provider::DOWNLOAD_MAX_TOTAL_BYTES,
+};
+
+struct FlakeTree {
+    files: Vec<(String, Vec<u8>)>,
+    skipped: Vec<String>,
+    digest: String,
+}
+
+fn local_flake_root(loc: &str) -> Result<Option<PathBuf>> {
+    let path = Path::new(loc);
+    if !path
+        .try_exists()
+        .with_context(|| format!("machine0: inspect local provision flake {loc:?}"))?
+    {
+        return Ok(None);
+    }
+
+    let canonical = std::fs::canonicalize(path)
+        .with_context(|| format!("machine0: canonicalize local provision flake {loc:?}"))?;
+    let root = if canonical.is_file() {
+        if canonical.file_name().is_some_and(|name| name == "flake.nix") {
+            canonical.parent().map(Path::to_path_buf)
+        } else {
+            None
+        }
+    } else if canonical.is_dir() {
+        Some(canonical)
+    } else {
+        None
+    }
+    .ok_or_else(|| anyhow!("machine0: local provision flake {loc:?} is not a directory containing a regular flake.nix"))?;
+
+    let flake_nix = root.join("flake.nix");
+    let metadata = std::fs::symlink_metadata(&flake_nix)
+        .with_context(|| format!("machine0: inspect {}", flake_nix.display()))?;
+    if !metadata.file_type().is_file() {
+        return Err(anyhow!(
+            "machine0: local provision flake {loc:?} is not a directory containing a regular flake.nix"
+        ));
+    }
+    Ok(Some(root))
+}
+
+fn admit_walk_item(
+    item: std::result::Result<ignore::DirEntry, ignore::Error>,
+) -> Result<Option<ignore::DirEntry>> {
+    item.map(Some)
+        .map_err(|error| anyhow!("machine0: flake walk failed: {error}"))
+}
+
+fn collect_flake_tree(root: &Path, limits: &UploadLimits) -> Result<FlakeTree> {
+    let mut files = Vec::new();
+    let mut skipped = Vec::new();
+    let mut total_bytes = 0_u64;
+    let walk = ignore::WalkBuilder::new(root)
+        .hidden(false)
+        .git_ignore(true)
+        .git_exclude(true)
+        .git_global(true)
+        .require_git(false)
+        .follow_links(false)
+        .filter_entry(|entry| entry.file_name() != ".git")
+        .build();
+
+    for item in walk {
+        let Some(entry) = admit_walk_item(item)? else {
+            continue;
+        };
+        if entry.depth() > limits.max_depth {
+            return Err(anyhow!(
+                "machine0: flake upload exceeds depth limit {}",
+                limits.max_depth
+            ));
+        }
+        let file_type = entry.file_type().ok_or_else(|| {
+            anyhow!(
+                "machine0: flake walk entry has no file type: {}",
+                entry.path().display()
+            )
+        })?;
+        if file_type.is_dir() {
+            continue;
+        }
+        let relative = entry.path().strip_prefix(root).with_context(|| {
+            format!(
+                "machine0: flake entry escaped root: {}",
+                entry.path().display()
+            )
+        })?;
+        let relative = relative
+            .to_str()
+            .ok_or_else(|| {
+                anyhow!(
+                    "machine0: flake path is not valid UTF-8: {}",
+                    relative.display()
+                )
+            })?
+            .replace('\\', "/");
+        if !file_type.is_file() {
+            skipped.push(relative);
+            continue;
+        }
+
+        let next_count = files
+            .len()
+            .checked_add(1)
+            .ok_or_else(|| anyhow!("machine0: flake file count overflow"))?;
+        if next_count > limits.max_files {
+            return Err(anyhow!(
+                "machine0: flake upload exceeds file limit {}",
+                limits.max_files
+            ));
+        }
+        let mut file =
+            thegn_core::fsperm::open_regular_file_nofollow(entry.path()).with_context(|| {
+                format!(
+                    "machine0: open flake file without following links: {}",
+                    entry.path().display()
+                )
+            })?;
+        let size = file.metadata()?.len();
+        if size > limits.max_file_bytes {
+            return Err(anyhow!(
+                "machine0: flake file exceeds byte limit {}: {relative}",
+                limits.max_file_bytes
+            ));
+        }
+        let remaining_total = limits
+            .max_total_bytes
+            .checked_sub(total_bytes)
+            .ok_or_else(|| anyhow!("machine0: flake total byte count exceeded limit"))?;
+        if size > remaining_total {
+            return Err(anyhow!(
+                "machine0: flake upload exceeds total byte limit {}",
+                limits.max_total_bytes
+            ));
+        }
+        let allowed_bytes = limits.max_file_bytes.min(remaining_total);
+        let read_limit = allowed_bytes.saturating_add(1);
+        let mut bytes = Vec::new();
+        file.by_ref()
+            .take(read_limit)
+            .read_to_end(&mut bytes)
+            .with_context(|| format!("machine0: read flake file: {relative}"))?;
+        if bytes.len() as u64 > allowed_bytes {
+            return Err(anyhow!(
+                "machine0: flake file grew past upload byte limit: {relative}"
+            ));
+        }
+        total_bytes = total_bytes
+            .checked_add(bytes.len() as u64)
+            .ok_or_else(|| anyhow!("machine0: flake total byte count overflow"))?;
+        if total_bytes > limits.max_total_bytes {
+            return Err(anyhow!(
+                "machine0: flake upload exceeds total byte limit {}",
+                limits.max_total_bytes
+            ));
+        }
+        files.push((relative, bytes));
+    }
+    files.sort_by(|left, right| left.0.cmp(&right.0));
+    let digest = flake_generation_digest(&files, None);
+    Ok(FlakeTree {
+        files,
+        skipped,
+        digest,
+    })
+}
+
+fn flake_generation_digest(files: &[(String, Vec<u8>)], attr: Option<&str>) -> String {
+    let mut digest = Sha256::new();
+    for (relative, contents) in files {
+        digest.update(relative.as_bytes());
+        digest.update([0]);
+        digest.update(contents.len().to_string().as_bytes());
+        digest.update([0]);
+        digest.update(Sha256::digest(contents));
+    }
+    if let Some(attr) = attr {
+        digest.update(attr.as_bytes());
+    }
+    format!("{:x}", digest.finalize())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1341,6 +1554,140 @@ mod tests {
         // A different flake ref ⇒ a different marker (forces re-provision).
         assert_ne!(a, provision_marker_path("github:me/env#other"));
         assert!(a.starts_with("/root/.thegn-provisioned-"));
+    }
+
+    #[test]
+    fn flake_upload_root_must_hold_a_regular_flake_nix() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("missing");
+        std::fs::create_dir(&missing).unwrap();
+        assert!(local_flake_root(missing.to_str().unwrap()).is_err());
+
+        let root = dir.path().join("flake");
+        std::fs::create_dir(&root).unwrap();
+        std::fs::write(root.join("flake.nix"), "{ }").unwrap();
+        let canonical = std::fs::canonicalize(&root).unwrap();
+        assert_eq!(
+            local_flake_root(root.to_str().unwrap()).unwrap(),
+            Some(canonical.clone())
+        );
+        assert_eq!(
+            local_flake_root(root.join("flake.nix").to_str().unwrap()).unwrap(),
+            Some(canonical.clone())
+        );
+        assert_eq!(
+            local_flake_root(dir.path().join("does-not-exist").to_str().unwrap()).unwrap(),
+            None
+        );
+
+        let linked = dir.path().join("flake-link");
+        match thegn_core::fsperm::create_symlink(&root, &linked, true) {
+            Ok(()) => {}
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::Unsupported | std::io::ErrorKind::PermissionDenied
+                ) =>
+            {
+                return;
+            }
+            Err(error) => panic!("create root symlink: {error}"),
+        }
+        assert_eq!(
+            local_flake_root(linked.to_str().unwrap()).unwrap(),
+            Some(canonical)
+        );
+    }
+
+    #[test]
+    fn flake_upload_walk_error_propagates() {
+        let error = ignore::Error::Io(std::io::Error::other("boom"));
+        assert!(admit_walk_item(Err(error)).is_err());
+    }
+
+    #[test]
+    fn flake_upload_enforces_file_and_byte_limits() {
+        let limits = UploadLimits {
+            max_depth: 8,
+            max_files: 2,
+            max_file_bytes: 4,
+            max_total_bytes: 6,
+        };
+        let dir = tempfile::tempdir().unwrap();
+
+        let three_files = dir.path().join("three");
+        std::fs::create_dir(&three_files).unwrap();
+        for name in ["a", "b", "c"] {
+            std::fs::write(three_files.join(name), "x").unwrap();
+        }
+        assert!(collect_flake_tree(&three_files, &limits).is_err());
+
+        let oversized = dir.path().join("oversized");
+        std::fs::create_dir(&oversized).unwrap();
+        std::fs::write(oversized.join("a"), "12345").unwrap();
+        assert!(collect_flake_tree(&oversized, &limits).is_err());
+
+        let aggregate = dir.path().join("aggregate");
+        std::fs::create_dir(&aggregate).unwrap();
+        std::fs::write(aggregate.join("a"), "1234").unwrap();
+        std::fs::write(aggregate.join("b"), "5678").unwrap();
+        assert!(collect_flake_tree(&aggregate, &limits).is_err());
+
+        let within = dir.path().join("within");
+        std::fs::create_dir(&within).unwrap();
+        std::fs::write(within.join("a"), "123").unwrap();
+        std::fs::write(within.join("b"), "45").unwrap();
+        assert_eq!(collect_flake_tree(&within, &limits).unwrap().files.len(), 2);
+
+        let too_deep = dir.path().join("too-deep");
+        std::fs::create_dir_all(too_deep.join("nested")).unwrap();
+        std::fs::write(too_deep.join("nested").join("a"), "x").unwrap();
+        let depth_limits = UploadLimits {
+            max_depth: 1,
+            ..limits
+        };
+        assert!(collect_flake_tree(&too_deep, &depth_limits).is_err());
+    }
+
+    #[test]
+    fn flake_upload_skips_symlinks_without_reading_them() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("root");
+        let outside = dir.path().join("outside");
+        std::fs::create_dir(&root).unwrap();
+        std::fs::write(&outside, "secret").unwrap();
+        let link = root.join("outside-link");
+        match thegn_core::fsperm::create_symlink(&outside, &link, false) {
+            Ok(()) => {}
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::Unsupported | std::io::ErrorKind::PermissionDenied
+                ) =>
+            {
+                return;
+            }
+            Err(error) => panic!("create file symlink: {error}"),
+        }
+        let tree = collect_flake_tree(&root, &FLAKE_UPLOAD_LIMITS).unwrap();
+        assert!(tree.files.is_empty());
+        assert_eq!(tree.skipped, vec!["outside-link".to_string()]);
+    }
+
+    #[test]
+    fn flake_upload_generation_digest_changes_with_content() {
+        let files = vec![("flake.nix".to_string(), b"{ }".to_vec())];
+        let digest = flake_generation_digest(&files, Some("host"));
+        assert_eq!(digest, flake_generation_digest(&files, Some("host")));
+        assert_ne!(
+            digest,
+            flake_generation_digest(&[("flake.nix".to_string(), b"{x}".to_vec())], Some("host"))
+        );
+        assert_ne!(
+            digest,
+            flake_generation_digest(&[("other.nix".to_string(), b"{ }".to_vec())], Some("host"))
+        );
+        assert_ne!(digest, flake_generation_digest(&files, Some("other")));
     }
 
     fn sample_sizes() -> Vec<Machine0Size> {
