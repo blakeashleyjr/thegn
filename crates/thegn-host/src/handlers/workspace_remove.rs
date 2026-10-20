@@ -245,7 +245,7 @@ pub(crate) fn remove_workspace_with_db(
         .collect();
     if let Some(db) = db {
         for group in &groups {
-            forget_worktree_group(db, &session.id, group, true);
+            forget_worktree_group(db, &session.id, group, true, None);
         }
         if let Err(error) = db.delete_tab_groups_with_prefix(slug) {
             tracing::debug!(%error, slug, "workspace removal could not prune matching groups from every persisted session");
