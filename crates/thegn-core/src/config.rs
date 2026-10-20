@@ -597,9 +597,10 @@ impl SandboxProfile {
         Vec::new()
     }
     /// Force `network=none` regardless of the configured network mode. Both
-    /// `sealed` and `sealed-tunnel` impose this floor; for `sealed-tunnel` a
-    /// resolved VPN attachment lifts it back up to a tunnel-only route (handled
-    /// in `sandbox::resolve_scoped`, not here), so with no VPN it stays sealed.
+    /// `sealed` and `sealed-tunnel` impose this floor. With a resolved VPN,
+    /// `sealed-tunnel` asks for a tunnel-only route, which launch refuses
+    /// (`sandbox::tunnel_admission`, `RefusalClass::TunnelUnenforced`) until the
+    /// runtime can enforce it; with no VPN it stays sealed.
     pub fn forces_no_network(self) -> bool {
         matches!(self, SandboxProfile::Sealed | SandboxProfile::SealedTunnel)
     }
