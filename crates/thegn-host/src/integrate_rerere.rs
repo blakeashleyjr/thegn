@@ -130,7 +130,8 @@ impl Cache {
         };
         let gitdir = cache_dir.join("git");
         if !gitdir.join("config").is_file() {
-            let object_format = util::git_out(repo_root, &["rev-parse", "--show-object-format"])?;
+            let object_format =
+                super::git_fence::out(repo_root, &["rev-parse", "--show-object-format"])?;
             let object_format = object_format.trim();
             if !matches!(object_format, "sha1" | "sha256") {
                 return None;
@@ -189,12 +190,12 @@ impl Cache {
     }
 
     fn rerere(&self, scratch: &Path, args: &[&str]) -> anyhow::Result<String> {
-        let index = util::git_out(
+        let index = super::git_fence::out(
             scratch,
             &["rev-parse", "--path-format=absolute", "--git-path", "index"],
         )
         .ok_or_else(|| anyhow::anyhow!("could not locate scratch index"))?;
-        let mut command = util::git_cmd(scratch);
+        let mut command = super::git_fence::cmd(scratch);
         command
             .args([
                 "-c",
@@ -216,6 +217,7 @@ impl Cache {
             stderr: Stream::Tail { cap: 4096 },
             ..Limits::silent(Duration::from_secs(60))
         };
+        thegn_core::util::note_core_git_spawn();
         let result = thegn_proc::run(&mut command, &limits, &AtomicBool::new(false));
         match (&result.end, &result.leader) {
             (End::LeaderExited, Leader::Reaped(status)) if status.success() => {
@@ -283,7 +285,7 @@ pub(super) struct Session<'a> {
 }
 
 pub(super) fn import_shared(cache: &Cache, repo_root: &Path) {
-    let Some(common_dir) = util::git_out(
+    let Some(common_dir) = super::git_fence::out(
         repo_root,
         &["rev-parse", "--path-format=absolute", "--git-common-dir"],
     ) else {
@@ -293,7 +295,7 @@ pub(super) fn import_shared(cache: &Cache, repo_root: &Path) {
     let Ok(entries) = std::fs::read_dir(shared) else {
         return;
     };
-    let object_format = util::git_out(repo_root, &["rev-parse", "--show-object-format"]);
+    let object_format = super::git_fence::out(repo_root, &["rev-parse", "--show-object-format"]);
     let Some(hash_len) = object_format
         .as_deref()
         .map(str::trim)
@@ -437,7 +439,7 @@ impl Drop for Session<'_> {
 }
 
 fn run(dir: &Path, args: &[&str], timeout: Duration) -> anyhow::Result<String> {
-    let mut command = util::git_cmd(dir);
+    let mut command = super::git_fence::cmd(dir);
     command
         .args(args)
         .stdin(Stdio::null())
@@ -447,6 +449,7 @@ fn run(dir: &Path, args: &[&str], timeout: Duration) -> anyhow::Result<String> {
         stderr: Stream::Tail { cap: 4096 },
         ..Limits::silent(timeout)
     };
+    thegn_core::util::note_core_git_spawn();
     let result = thegn_proc::run(&mut command, &limits, &AtomicBool::new(false));
     match (&result.end, &result.leader) {
         (End::LeaderExited, Leader::Reaped(status)) if status.success() => {
@@ -538,7 +541,7 @@ pub(super) fn train_merge(
     let path = scratch.path().to_path_buf();
     let path_s = path.to_string_lossy().to_string();
     if scratch.verify().is_err()
-        || !util::git_ok(
+        || !super::git_fence::ok(
             repo_root,
             &["worktree", "add", "--detach", &path_s, parent1],
         )
@@ -568,7 +571,7 @@ pub(super) fn train_merge(
         {
             anyhow::bail!("historical merge did not reproduce a conflict");
         }
-        let unmerged = util::git_out_allow_empty(&path, &["ls-files", "-u", "-z"])
+        let unmerged = super::git_fence::out_allow_empty(&path, &["ls-files", "-u", "-z"])
             .ok_or_else(|| anyhow::anyhow!("could not inspect training conflict paths"))?;
         let mut paths = std::collections::BTreeSet::new();
         for record in unmerged.split('\0').filter(|record| !record.is_empty()) {
@@ -584,7 +587,7 @@ pub(super) fn train_merge(
             let mut checkout = vec!["--literal-pathspecs", "checkout", merge, "--"];
             checkout.extend(paths.iter().map(String::as_str));
             anyhow::ensure!(
-                util::git_ok(&path, &checkout),
+                super::git_fence::ok(&path, &checkout),
                 "could not restore historical merge resolution"
             );
             session.step(&path, &["rerere"])?;
