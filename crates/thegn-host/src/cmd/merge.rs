@@ -556,7 +556,7 @@ fn add_quiet(cfg: &Config, worktrees: Vec<String>, all: bool, quiet: bool) -> Re
             }
         }
         for (branch, wt) in &cands.worktrees {
-            db.enqueue_merge(wt, branch, &target)?;
+            crate::merge_ops::enqueue_bound_local(&db, wt, branch, &target)?;
             crate::merge_lifecycle::apply(mq, &db, &root, wt, branch, LifecycleEvent::Enqueued);
             if !quiet {
                 outln!("  + queued {branch}");

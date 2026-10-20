@@ -912,11 +912,12 @@ pub(crate) fn section_key(key: char, cursor: usize, ctx: MqKeyCtx) -> bool {
             });
         }
         MqAction::Retry => {
-            let Some((wt, branch, target)) = row.map(|r| {
+            let Some((wt, branch, target, location)) = row.map(|r| {
                 (
                     r.worktree.clone(),
                     r.branch.clone(),
                     r.target_branch.clone(),
+                    r.location.clone(),
                 )
             }) else {
                 return true;
@@ -931,7 +932,13 @@ pub(crate) fn section_key(key: char, cursor: usize, ctx: MqKeyCtx) -> bool {
             );
             tokio::task::spawn_blocking(move || {
                 note.send(
-                    match Db::open().and_then(|db| db.enqueue_merge(&wt, &branch, &target)) {
+                    match Db::open().and_then(|db| {
+                        if location.is_empty() || location == "local" {
+                            crate::merge_ops::enqueue_bound_local(&db, &wt, &branch, &target)
+                        } else {
+                            db.enqueue_merge(&wt, &branch, &target)
+                        }
+                    }) {
                         Ok(()) => format!("Requeued {branch}"),
                         Err(e) => format!("Retry failed: {e}"),
                     },
@@ -1229,7 +1236,7 @@ fn add_worktree(cfg: &Config, wt: &Path) -> String {
         Err(e) => return format!("Add failed: {e}"),
     };
     let wt_s = wt.to_string_lossy();
-    match db.enqueue_merge(&wt_s, &branch, &target) {
+    match crate::merge_ops::enqueue_bound_local(&db, &wt_s, &branch, &target) {
         Ok(()) => {
             crate::merge_lifecycle::apply(mq, &db, &root, &wt_s, &branch, LifecycleEvent::Enqueued);
             format!("Queued {branch}")
@@ -1259,7 +1266,7 @@ fn add_all(cfg: &Config, any_path: &Path) -> String {
     };
     let mut queued = 0usize;
     for (branch, wt) in &cands.worktrees {
-        if db.enqueue_merge(wt, branch, &target).is_ok() {
+        if crate::merge_ops::enqueue_bound_local(&db, wt, branch, &target).is_ok() {
             crate::merge_lifecycle::apply(mq, &db, &root, wt, branch, LifecycleEvent::Enqueued);
             queued += 1;
         }
