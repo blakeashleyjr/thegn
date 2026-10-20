@@ -35,6 +35,8 @@ foreground `thegn share start` is stopped by interrupting that command. Use
 touch the tunnel.
 Stopping a share in thegn while it is still starting cancels the start, so
 the tunnel does not come up after the stop request.
+A share client started by thegn runs in its own process group. Stopping it sends
+TERM to the group, then KILL after a short grace period if processes remain.
 
 ## Auto port forwards (`[forward]`)
 
