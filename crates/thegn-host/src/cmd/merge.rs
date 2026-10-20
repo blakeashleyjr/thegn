@@ -712,7 +712,6 @@ fn drain(cfg: &Config, all: bool, json: bool) -> Result<()> {
             worktree: r.worktree,
             branch: r.branch,
             location: r.location,
-            agent_attempts: r.agent_attempts,
         })
         .collect();
     if items.is_empty() {

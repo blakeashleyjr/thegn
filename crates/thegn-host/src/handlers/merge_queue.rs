@@ -196,7 +196,6 @@ fn drive_blocking(cfg: &Config, any_path: &std::path::Path, send: impl Fn(DriveM
                 worktree: r.worktree,
                 branch: r.branch,
                 location: r.location,
-                agent_attempts: r.agent_attempts,
             })
             .collect();
         if items.is_empty() {

@@ -46,11 +46,6 @@ pub(crate) struct QueueItem {
     /// else an ssh/provider blob. Resolves the branch's `GitLoc` so the drain
     /// knows whether to fetch its tip into the target store (cross-host).
     pub location: String,
-    /// Agent-dispatch cycles already spent on this row (from the queue row).
-    /// The `agent_max_attempts` budget belongs to the BRANCH, not to one drain
-    /// invocation — otherwise a `needs_human` row that had already exhausted it
-    /// got the full budget again on every subsequent drain.
-    pub agent_attempts: u32,
 }
 
 /// One status transition the driver made, handed to the caller's `progress`
@@ -1780,7 +1775,6 @@ mod tests {
                 worktree,
                 branch: "feat".into(),
                 location: String::new(),
-                agent_attempts: 0,
             }
         }
 
@@ -1795,7 +1789,6 @@ mod tests {
                 worktree: "/queued/second".into(),
                 branch: "second".into(),
                 location: String::new(),
-                agent_attempts: 0,
             };
             let _scope = crate::fold_cancel::scope(|| true);
             let outcome = drive_queue(
@@ -1830,7 +1823,6 @@ mod tests {
                 worktree: "/queued/second".into(),
                 branch: "second".into(),
                 location: String::new(),
-                agent_attempts: 0,
             };
             let counter = root.join("gate-count");
             std::fs::write(&counter, "").unwrap();
