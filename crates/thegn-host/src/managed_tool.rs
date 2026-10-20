@@ -413,28 +413,33 @@ where
         let Some(key_text) = key.to_str() else {
             continue;
         };
-        let keep = key_text == "PATH"
-            || key_text == "LANG"
-            || key_text.starts_with("LC_")
-            || key_text == "TERM"
+        let keep = key_text.eq_ignore_ascii_case("PATH")
+            || key_text.eq_ignore_ascii_case("LANG")
+            || key_text
+                .get(..3)
+                .is_some_and(|prefix| prefix.eq_ignore_ascii_case("LC_"))
+            || key_text.eq_ignore_ascii_case("TERM")
             || matches!(
-                key_text,
+                key_text.to_ascii_lowercase().as_str(),
                 "http_proxy"
                     | "https_proxy"
                     | "no_proxy"
-                    | "HTTP_PROXY"
-                    | "HTTPS_PROXY"
-                    | "NO_PROXY"
-                    | "SSL_CERT_FILE"
-                    | "SSL_CERT_DIR"
-                    | "NIX_SSL_CERT_FILE"
-                    | "RUSTUP_HOME"
-                    | "RUSTUP_TOOLCHAIN"
+                    | "ssl_cert_file"
+                    | "ssl_cert_dir"
+                    | "nix_ssl_cert_file"
+                    | "rustup_home"
+                    | "rustup_toolchain"
+                    | "systemroot"
+                    | "pathext"
+                    | "userprofile"
+                    | "appdata"
+                    | "localappdata"
+                    | "comspec"
             );
-        if key_text == "HOME" {
+        if key_text.eq_ignore_ascii_case("HOME") {
             host_home = Some(PathBuf::from(&value));
         }
-        if key_text == "RUSTUP_HOME" {
+        if key_text.eq_ignore_ascii_case("RUSTUP_HOME") {
             rustup_home_present = true;
         }
         if keep {
@@ -530,7 +535,7 @@ fn valid_exact_version(value: &str) -> bool {
         return false;
     }
     let (core, prerelease_valid) = match without_build.split_once('-') {
-        Some((core, prerelease)) => (core, valid_semver_suffix(prerelease)),
+        Some((core, prerelease)) => (core, valid_semver_prerelease(prerelease)),
         None => (without_build, true),
     };
     prerelease_valid && core.split('.').count() == 3 && core.split('.').all(valid_semver_number)
@@ -544,9 +549,24 @@ fn valid_semver_number(value: &str) -> bool {
 
 fn valid_semver_suffix(value: &str) -> bool {
     !value.is_empty()
-        && value
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'-'))
+        && value.split('.').all(|identifier| {
+            !identifier.is_empty()
+                && identifier
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+        })
+}
+
+fn valid_semver_prerelease(value: &str) -> bool {
+    !value.is_empty()
+        && value.split('.').all(|identifier| {
+            !identifier.is_empty()
+                && identifier
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+                && (!identifier.bytes().all(|byte| byte.is_ascii_digit())
+                    || valid_semver_number(identifier))
+        })
 }
 
 fn installer_workspace(managed: &Path, name: &str) -> Result<(TempDir, TempDir)> {
@@ -566,6 +586,20 @@ fn installer_workspace(managed: &Path, name: &str) -> Result<(TempDir, TempDir)>
 }
 
 fn promote_staging(staging: &Path, managed: &Path, bin_rel: &Path) -> Result<()> {
+    promote_staging_with_rename(staging, managed, bin_rel, |from, to| {
+        std::fs::rename(from, to)
+    })
+}
+
+fn promote_staging_with_rename<F>(
+    staging: &Path,
+    managed: &Path,
+    bin_rel: &Path,
+    mut rename: F,
+) -> Result<()>
+where
+    F: FnMut(&Path, &Path) -> std::io::Result<()>,
+{
     let expected = staging.join(bin_rel);
     std::fs::symlink_metadata(&expected).with_context(|| {
         format!(
@@ -584,8 +618,11 @@ fn promote_staging(staging: &Path, managed: &Path, bin_rel: &Path) -> Result<()>
         .prefix(&format!(".{name}.old-"))
         .tempdir_in(parent)
         .with_context(|| format!("reserve old install name in {}", parent.display()))?;
-    let old_path = old.path().to_path_buf();
-    std::fs::remove_dir(&old_path).with_context(|| format!("release {}", old_path.display()))?;
+    let reserved_path = old.path().to_path_buf();
+    std::fs::remove_dir(&reserved_path)
+        .with_context(|| format!("release {}", reserved_path.display()))?;
+    // Any later rename failure must leave the previous install untouched.
+    let old_path = old.keep();
     let had_old = match std::fs::symlink_metadata(managed) {
         Ok(_) => true,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
@@ -595,11 +632,11 @@ fn promote_staging(staging: &Path, managed: &Path, bin_rel: &Path) -> Result<()>
         }
     };
     if had_old {
-        std::fs::rename(managed, &old_path)
+        rename(managed, &old_path)
             .with_context(|| format!("move previous install {}", managed.display()))?;
     }
-    if let Err(error) = std::fs::rename(staging, managed) {
-        if had_old && let Err(restore_error) = std::fs::rename(&old_path, managed) {
+    if let Err(error) = rename(staging, managed) {
+        if had_old && let Err(restore_error) = rename(&old_path, managed) {
             return Err(anyhow::anyhow!(
                 "promote staged install failed: {error}; restoring previous install failed: {restore_error}"
             ));
@@ -609,9 +646,6 @@ fn promote_staging(staging: &Path, managed: &Path, bin_rel: &Path) -> Result<()>
     if had_old && let Err(error) = std::fs::remove_dir_all(&old_path) {
         tracing::warn!(target: "thegn::provision", path = %old_path.display(), %error, "could not remove previous managed-tool install");
     }
-    // The reserved path was removed before it became the old install; prevent
-    // TempDir's guard from attempting to remove the renamed directory again.
-    let _old_path = old.keep();
     Ok(())
 }
 
@@ -1300,6 +1334,27 @@ mod tests {
             (OsString::from("NPM_TOKEN"), OsString::from("secret")),
             (OsString::from("PATH"), OsString::from("/bin")),
             (OsString::from("LANG"), OsString::from("C.UTF-8")),
+            (OsString::from("sYsTeMrOoT"), OsString::from("C:\\Windows")),
+            (
+                OsString::from("pathext"),
+                OsString::from(".COM;.EXE;.BAT;.CMD"),
+            ),
+            (
+                OsString::from("aPpDaTa"),
+                OsString::from("C:\\Users\\User\\AppData\\Roaming"),
+            ),
+            (
+                OsString::from("USERPROFILE"),
+                OsString::from("C:\\Users\\User"),
+            ),
+            (
+                OsString::from("LOCALAPPDATA"),
+                OsString::from("C:\\Users\\User\\AppData\\Local"),
+            ),
+            (
+                OsString::from("ComSpec"),
+                OsString::from("C:\\Windows\\cmd.exe"),
+            ),
             (
                 OsString::from("https_proxy"),
                 OsString::from("https://proxy"),
@@ -1314,6 +1369,12 @@ mod tests {
             "PATH",
             "LANG",
             "https_proxy",
+            "sYsTeMrOoT",
+            "pathext",
+            "aPpDaTa",
+            "USERPROFILE",
+            "LOCALAPPDATA",
+            "ComSpec",
             "RUSTUP_HOME",
             "HOME",
             "CARGO_HOME",
@@ -1362,7 +1423,7 @@ mod tests {
                 OsString::from("THEGN_CONTROL_SOCKET"),
                 OsString::from("/socket"),
             ),
-            (OsString::from("PATH"), OsString::from("/bin")),
+            (OsString::from("PATH"), std::env::var_os("PATH").unwrap()),
         ];
         let mut command = sh("env");
         command.env_clear().envs(installer_env(host, home));
@@ -1405,6 +1466,9 @@ mod tests {
         for (value, expected) in [
             ("0.4.6", true),
             ("1.2.3-rc.1+b5", true),
+            ("1.2.3-rc..1", false),
+            ("1.2.3-01", false),
+            ("1.2.3+build..5", false),
             ("1.2", false),
             ("^1.2.3", false),
             ("latest", false),
@@ -1452,8 +1516,55 @@ mod tests {
         assert!(promote_staging(staging.path(), &managed, Path::new("bin/x")).is_err());
         assert_eq!(std::fs::read(managed.join("bin/old")).unwrap(), b"previous");
         drop(staging);
-        assert!(!root.path().join(".tool.staging-").exists());
         assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn installer_promote_preserves_previous_install_when_restore_fails() {
+        let root = tempfile::tempdir().unwrap();
+        let managed = root.path().join("tool");
+        let staging = tempfile::Builder::new()
+            .prefix(".tool.staging-")
+            .tempdir_in(root.path())
+            .unwrap();
+        std::fs::create_dir_all(managed.join("bin")).unwrap();
+        std::fs::write(managed.join("bin/old"), b"previous").unwrap();
+        std::fs::create_dir_all(staging.path().join("bin")).unwrap();
+        std::fs::write(staging.path().join("bin/x"), b"new").unwrap();
+        let mut rename_calls = 0;
+
+        let result = promote_staging_with_rename(
+            staging.path(),
+            &managed,
+            Path::new("bin/x"),
+            |from, to| {
+                rename_calls += 1;
+                if rename_calls > 1 {
+                    Err(std::io::Error::new(
+                        std::io::ErrorKind::PermissionDenied,
+                        "injected rename failure",
+                    ))
+                } else {
+                    std::fs::rename(from, to)
+                }
+            },
+        );
+        assert!(result.is_err());
+        let entries = std::fs::read_dir(root.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .collect::<Vec<_>>();
+        let preserved = entries
+            .iter()
+            .find(|path| {
+                path.file_name()
+                    .is_some_and(|name| name.to_string_lossy().starts_with(".tool.old-"))
+            })
+            .unwrap();
+        assert_eq!(
+            std::fs::read(preserved.join("bin/old")).unwrap(),
+            b"previous"
+        );
     }
 
     #[test]
