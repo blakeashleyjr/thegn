@@ -67,6 +67,12 @@ fn classify_cas_failure(reread: &RefRead, old: &str, stderr: &str) -> CasOutcome
     }
 }
 
+/// Host-automatic fold plumbing never runs repository hooks or fsmonitor;
+/// local only, like the read fence. User-invoked commits keep their hooks.
+fn fenced<'a>(loc: &GitLoc, args: &[&'a str]) -> Vec<&'a str> {
+    super::read_argv(loc, args)
+}
+
 /// Run git capturing the raw exit code plus both streams. `merge-tree` exits 1
 /// on conflicts and `update-ref` exits 1 on a CAS mismatch — both are normal
 /// outcomes, not errors, so the shared [`run`]/[`run_w`] helpers (which bail on
@@ -84,7 +90,7 @@ fn run_status(loc: &GitLoc, args: &[&str]) -> Result<(i32, String, String)> {
     // update-ref are local object-DB/ref ops that should finish in ms). The
     // exit-code-as-data semantics are unaffected: `output_bounded` only errors on
     // spawn failure or timeout, never on a non-zero exit.
-    let out = super::output_bounded(loc.git_command(args), args)
+    let out = super::output_bounded(loc.git_command(&fenced(loc, args)), args)
         .with_context(|| format!("git {}", args.join(" ")))?;
     Ok((
         out.status.code().unwrap_or(-1),
@@ -462,8 +468,9 @@ pub trait PlumbingOps: GitBackend {
             transaction.push_str(&format!("verify {name} {oid}\n"));
         }
         transaction.push_str(&format!("update {target} {new} {old}\nprepare\ncommit\n"));
+        let args = fenced(loc, &["update-ref", "--stdin"]);
         match super::output_bounded_with_input(
-            loc.git_command(&["update-ref", "--stdin"]),
+            loc.git_command(&args),
             &["update-ref", "--stdin"],
             Some(transaction.as_bytes()),
             super::git_read_timeout(),
@@ -536,10 +543,10 @@ pub trait PlumbingOps: GitBackend {
         if !self.is_dirty(loc)? {
             return Ok(None);
         }
-        run_w(loc, &[], &["add", "-A"])?;
+        run_w(loc, &[], &fenced(loc, &["add", "-A"]))?;
         // `-c commit.gpgSign=false …` must precede the subcommand — prepend it.
         let mut args: Vec<&str> = gpg_args(override_gpg).to_vec();
-        args.extend_from_slice(&["commit", "--no-verify", "-F", "-"]);
+        args.extend(fenced(loc, &["commit", "--no-verify", "-F", "-"]));
         run_background_commit_stdin(loc, &[("GIT_EDITOR", ":")], &args, msg.as_bytes())?;
         Ok(Some(self.rev_parse(loc, "HEAD")?))
     }
@@ -552,11 +559,13 @@ mod tests {
     use super::super::testutil::{TestRepo, git_in};
     use super::super::{CliGit, GitBackend};
     use super::{
-        CasOutcome, MergeTreeOutcome, PlumbingOps, RefRead, classify_cas_failure, is_object_id,
-        parse_commit_metas, parse_merge_base,
+        CasOutcome, MergeTreeOutcome, PlumbingOps, RefRead, classify_cas_failure, fenced,
+        is_object_id, parse_commit_metas, parse_merge_base,
     };
     use std::path::Path;
+    use std::process::Command;
     use thegn_core::fold::{Author, CommitMeta};
+    use thegn_core::remote::GitLoc;
 
     #[test]
     fn plumbing_refuses_option_shaped_operands_before_spawn() {
@@ -633,6 +642,171 @@ mod tests {
         git_in(dir, &["config", "user.name", "t"]);
         git_in(dir, &["config", "user.email", "t@e"]);
         git_in(dir, &["config", "commit.gpgsign", "false"]);
+    }
+
+    fn install_script(path: &Path, marker: &Path) -> bool {
+        let script = format!(
+            "#!/bin/sh\nprintf x >> {}\nprintf 'token\\n'\n",
+            thegn_core::util::sh_quote(&marker.to_string_lossy())
+        );
+        std::fs::write(path, script).unwrap();
+        let status = match Command::new("chmod").arg("+x").arg(path).status() {
+            Ok(status) => status,
+            Err(_) => return false,
+        };
+        assert!(status.success(), "chmod failed for {}", path.display());
+        true
+    }
+
+    fn remove_marker(path: &Path) {
+        match std::fs::remove_file(path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => panic!("remove {}: {error}", path.display()),
+        }
+    }
+
+    #[test]
+    fn fenced_argv_is_local_only() {
+        let local = GitLoc::Local(Path::new("/repo").to_path_buf());
+        let args = ["update-ref", "--stdin"];
+        assert_eq!(
+            fenced(&local, &args),
+            [
+                "-c",
+                "core.fsmonitor=false",
+                "-c",
+                "core.hooksPath=/dev/null",
+                "update-ref",
+                "--stdin"
+            ]
+        );
+
+        let provider = GitLoc::provider(vec!["sh".into()], "/remote/repo");
+        assert_eq!(fenced(&provider, &args), args);
+    }
+
+    #[test]
+    fn update_ref_cas_never_runs_reference_transaction_hook() {
+        let repo = TestRepo::new("plumb-ref-hook");
+        ident(&repo.dir);
+        repo.commit_file("f.txt", "one\n", "c0");
+        let new = repo.head();
+        repo.commit_file("g.txt", "two\n", "c1");
+        let old = repo.head();
+        let loc = repo.loc();
+        let hook = repo.dir.join(".git/hooks/reference-transaction");
+        let marker = repo.dir.join("rt-fired");
+        if !install_script(&hook, &marker) {
+            return;
+        }
+
+        git_in(&repo.dir, &["update-ref", "refs/heads/probe", "HEAD"]);
+        assert!(marker.exists(), "plain update-ref is the positive control");
+        remove_marker(&marker);
+
+        assert!(
+            CliGit
+                .update_ref_cas(&loc, "refs/heads/main", &new, &old)
+                .unwrap()
+        );
+        assert_eq!(repo.out(&["rev-parse", "refs/heads/main"]), new);
+        assert!(!marker.exists(), "fenced update-ref ran the reference hook");
+    }
+
+    #[test]
+    fn update_ref_cas_with_sources_never_runs_reference_transaction_hook() {
+        let repo = TestRepo::new("plumb-ref-sources-hook");
+        ident(&repo.dir);
+        repo.commit_file("f.txt", "one\n", "c0");
+        let source_oid = repo.head();
+        git_in(&repo.dir, &["branch", "side"]);
+        repo.commit_file("g.txt", "two\n", "c1");
+        let old = repo.head();
+        let loc = repo.loc();
+        let hook = repo.dir.join(".git/hooks/reference-transaction");
+        let marker = repo.dir.join("rt-fired");
+        if !install_script(&hook, &marker) {
+            return;
+        }
+
+        git_in(&repo.dir, &["update-ref", "refs/heads/probe", "HEAD"]);
+        assert!(marker.exists(), "plain update-ref is the positive control");
+        remove_marker(&marker);
+
+        let outcome = CliGit
+            .update_ref_cas_with_sources(
+                &loc,
+                "refs/heads/main",
+                &source_oid,
+                &old,
+                &[("refs/heads/side".into(), source_oid.clone())],
+            )
+            .unwrap();
+        assert_eq!(outcome, CasOutcome::Advanced);
+        assert_eq!(repo.out(&["rev-parse", "refs/heads/main"]), source_oid);
+        assert!(
+            !marker.exists(),
+            "fenced ref transaction ran the reference hook"
+        );
+    }
+
+    #[test]
+    fn snapshot_worktree_never_runs_post_commit_or_fsmonitor() {
+        let repo = TestRepo::new("plumb-snapshot-hook");
+        ident(&repo.dir);
+        repo.commit_file("f.txt", "one\n", "c0");
+        let loc = repo.loc();
+        let hook_marker = repo.dir.join("pc-fired");
+        let fsmonitor_marker = repo.dir.join("fsm-fired");
+        let hook = repo.dir.join(".git/hooks/post-commit");
+        if !install_script(&hook, &hook_marker) {
+            return;
+        }
+        let fsmonitor_script = repo.dir.join("fsmonitor.sh");
+        if !install_script(&fsmonitor_script, &fsmonitor_marker) {
+            return;
+        }
+
+        git_in(
+            &repo.dir,
+            &[
+                "config",
+                "core.fsmonitor",
+                &format!(
+                    "sh {}",
+                    thegn_core::util::sh_quote(&fsmonitor_script.to_string_lossy())
+                ),
+            ],
+        );
+        git_in(&repo.dir, &["status", "--short"]);
+        assert!(
+            fsmonitor_marker.exists(),
+            "plain status is the fsmonitor positive control"
+        );
+        remove_marker(&fsmonitor_marker);
+        git_in(
+            &repo.dir,
+            &["commit", "--allow-empty", "-q", "-m", "control"],
+        );
+        assert!(
+            hook_marker.exists(),
+            "plain commit is the post-commit positive control"
+        );
+        remove_marker(&hook_marker);
+        remove_marker(&fsmonitor_marker);
+
+        std::fs::write(repo.dir.join("f.txt"), "edited\n").unwrap();
+        let snapshot = CliGit
+            .snapshot_worktree(&loc, "snap", true)
+            .unwrap()
+            .expect("dirty snapshot commit");
+        assert_eq!(repo.head(), snapshot);
+        assert!(!hook_marker.exists(), "snapshot ran the post-commit hook");
+        assert!(
+            !fsmonitor_marker.exists(),
+            "snapshot ran the fsmonitor command"
+        );
     }
 
     #[test]

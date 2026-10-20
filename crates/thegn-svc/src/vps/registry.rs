@@ -9,7 +9,9 @@
 //! Files, not the DB, because both svc (the provider owns create/destroy) and
 //! the host (attach bridge, reaper) read it — and every create/destroy flows
 //! through the provider, so no call site can forget the bookkeeping.
+//! Count-and-reserve is serialised by a lock file, and unreadable records count as occupied.
 
+use std::fs::OpenOptions;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -18,6 +20,84 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
 static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+pub const RESERVE_LOCK: &str = ".reserve.lock";
+
+#[derive(Debug, Clone, Copy)]
+pub enum ReserveScope {
+    All,
+    Provider(&'static str),
+}
+
+#[derive(Debug)]
+pub enum ReserveError {
+    AtCap { occupied: usize, cap: usize },
+    Store(anyhow::Error),
+}
+
+/// Removes a newly reserved intent if creation exits before a provider-side
+/// resource-creating call can have taken effect.
+pub struct IntentGuard {
+    directory: PathBuf,
+    name: String,
+    armed: bool,
+}
+
+impl IntentGuard {
+    pub fn new(name: &str) -> Self {
+        Self::at(&dir(), name)
+    }
+
+    fn at(directory: &Path, name: &str) -> Self {
+        Self {
+            directory: directory.to_path_buf(),
+            name: name.to_owned(),
+            armed: true,
+        }
+    }
+
+    /// Keep the intent for reconciliation once a remote create may have begun.
+    pub fn preserve(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for IntentGuard {
+    fn drop(&mut self) {
+        if self.armed {
+            remove_at(&self.directory, &self.name);
+        }
+    }
+}
+
+impl std::fmt::Display for ReserveError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::AtCap { occupied, cap } => {
+                write!(
+                    formatter,
+                    "registry capacity reached ({occupied} occupied; cap {cap})"
+                )
+            }
+            Self::Store(error) => write!(formatter, "registry reservation failed: {error}"),
+        }
+    }
+}
+
+impl std::error::Error for ReserveError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::AtCap { .. } => None,
+            Self::Store(error) => Some(error.as_ref()),
+        }
+    }
+}
+
+impl From<anyhow::Error> for ReserveError {
+    fn from(error: anyhow::Error) -> Self {
+        Self::Store(error)
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct VpsRecord {
@@ -71,9 +151,7 @@ fn record_path(d: &Path, name: &str) -> PathBuf {
     d.join(format!("{name}.json"))
 }
 
-/// Write (atomically: tmp + rename) a record into `d`.
-pub fn write_at(d: &Path, rec: &VpsRecord) -> Result<()> {
-    checked_name(&rec.name)?;
+fn ensure_owned_root(d: &Path) -> Result<()> {
     std::fs::create_dir_all(d)?;
     let metadata = std::fs::symlink_metadata(d)?;
     anyhow::ensure!(
@@ -82,6 +160,13 @@ pub fn write_at(d: &Path, rec: &VpsRecord) -> Result<()> {
             && thegn_core::fsperm::owned_by_current_user(&metadata),
         "vps registry: registry root is not an owned real directory"
     );
+    Ok(())
+}
+
+/// Write (atomically: tmp + rename) a record into `d`.
+pub fn write_at(d: &Path, rec: &VpsRecord) -> Result<()> {
+    checked_name(&rec.name)?;
+    ensure_owned_root(d)?;
     let path = record_path(d, &rec.name);
     let counter = TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
     let tmp = d.join(format!(
@@ -125,6 +210,92 @@ pub fn write_at(d: &Path, rec: &VpsRecord) -> Result<()> {
 
 pub fn write(rec: &VpsRecord) -> Result<()> {
     write_at(&dir(), rec)
+}
+
+fn occupied_at(d: &Path, scope: ReserveScope) -> Result<usize> {
+    let entries = match std::fs::read_dir(d) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+        Err(error) => return Err(error.into()),
+    };
+    let mut occupied = 0;
+    for entry in entries {
+        let entry = entry?;
+        let file_name = entry.file_name();
+        if Path::new(&file_name)
+            .extension()
+            .is_none_or(|extension| extension != "json")
+        {
+            continue;
+        }
+        let stem = Path::new(&file_name)
+            .file_stem()
+            .and_then(|stem| stem.to_str());
+        let other_provider = match scope {
+            ReserveScope::All => false,
+            ReserveScope::Provider(provider) => {
+                let parsed = thegn_core::fsperm::open_regular_file_nofollow(&entry.path())
+                    .and_then(|mut file| {
+                        let mut bytes = Vec::new();
+                        file.read_to_end(&mut bytes)?;
+                        Ok(serde_json::from_slice::<VpsRecord>(&bytes))
+                    });
+                matches!(parsed, Ok(Ok(record)) if stem.is_some_and(|name| checked_name(name).is_ok()) && Some(record.name.as_str()) == stem && record.provider != provider)
+            }
+        };
+        if !other_provider {
+            occupied += 1;
+        }
+    }
+    Ok(occupied)
+}
+
+pub fn reserve_at(
+    d: &Path,
+    rec: &VpsRecord,
+    cap: usize,
+    scope: ReserveScope,
+) -> std::result::Result<(), ReserveError> {
+    checked_name(&rec.name).map_err(ReserveError::Store)?;
+    ensure_owned_root(d).map_err(ReserveError::Store)?;
+    let lock_path = d.join(RESERVE_LOCK);
+    match std::fs::symlink_metadata(&lock_path) {
+        Ok(metadata) if !metadata.file_type().is_file() => {
+            return Err(ReserveError::Store(anyhow::anyhow!(
+                "vps registry: reservation lock is not a regular file"
+            )));
+        }
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(ReserveError::Store(error.into())),
+    }
+    // The metadata check rejects an existing symlink; open can still follow a
+    // symlink swapped in between this check and the open. The owned registry
+    // root limits that race to an actor able to mutate this private directory.
+    let lock = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(&lock_path)
+        .map_err(anyhow::Error::from)
+        .map_err(ReserveError::Store)?;
+    lock.lock()
+        .map_err(anyhow::Error::from)
+        .map_err(ReserveError::Store)?;
+    let occupied = occupied_at(d, scope).map_err(ReserveError::Store)?;
+    if occupied >= cap {
+        return Err(ReserveError::AtCap { occupied, cap });
+    }
+    write_at(d, rec).map_err(ReserveError::Store)
+}
+
+pub fn reserve(
+    rec: &VpsRecord,
+    cap: usize,
+    scope: ReserveScope,
+) -> std::result::Result<(), ReserveError> {
+    reserve_at(&dir(), rec, cap, scope)
 }
 
 pub fn read_at(d: &Path, name: &str) -> Option<VpsRecord> {
@@ -444,5 +615,182 @@ mod tests {
         }
         remove_at(&link, "a");
         assert!(victim.join("a.json").exists());
+    }
+
+    #[test]
+    fn concurrent_reserves_never_exceed_the_cap() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().to_path_buf();
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(12));
+        let workers: Vec<_> = (0..12)
+            .map(|index| {
+                let dir = dir.clone();
+                let barrier = std::sync::Arc::clone(&barrier);
+                std::thread::spawn(move || {
+                    let record = rec(&format!("n{index}"), "creating");
+                    barrier.wait();
+                    reserve_at(&dir, &record, 3, ReserveScope::All)
+                })
+            })
+            .collect();
+        let mut reserved = 0;
+        let mut refused = 0;
+        for worker in workers {
+            match worker.join().unwrap() {
+                Ok(()) => reserved += 1,
+                Err(ReserveError::AtCap { .. }) => refused += 1,
+                Err(ReserveError::Store(error)) => panic!("reservation store error: {error}"),
+            }
+        }
+        assert_eq!(reserved, 3);
+        assert_eq!(refused, 9);
+        assert_eq!(list_at(&dir).len(), 3);
+    }
+
+    #[test]
+    fn corrupt_and_unreadable_records_count_as_occupied() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        std::fs::write(dir.join("bad.json"), b"{not json").unwrap();
+        write_at(dir, &rec("valid", "creating")).unwrap();
+
+        assert!(matches!(
+            reserve_at(dir, &rec("blocked", "creating"), 2, ReserveScope::All),
+            Err(ReserveError::AtCap {
+                occupied: 2,
+                cap: 2
+            })
+        ));
+        reserve_at(dir, &rec("allowed", "creating"), 3, ReserveScope::All).unwrap();
+        std::fs::create_dir(dir.join("unreadable.json")).unwrap();
+        let result = reserve_at(
+            dir,
+            &rec("blocked-by-unreadable", "creating"),
+            4,
+            ReserveScope::All,
+        );
+        assert!(
+            matches!(
+                &result,
+                Err(ReserveError::AtCap {
+                    occupied: 4,
+                    cap: 4
+                })
+            ),
+            "unexpected reservation result: {result:?}"
+        );
+    }
+
+    #[test]
+    fn provider_scope_counts_own_and_unknown_records_only() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        write_at(dir, &rec("hetzner", "creating")).unwrap();
+        std::fs::write(dir.join("unknown.json"), b"{not json").unwrap();
+
+        let blocked = reserve_at(
+            dir,
+            &rec("fly-blocked", "creating"),
+            1,
+            ReserveScope::Provider("fly"),
+        );
+        assert!(
+            matches!(
+                &blocked,
+                Err(ReserveError::AtCap {
+                    occupied: 1,
+                    cap: 1
+                })
+            ),
+            "unexpected reservation result: {blocked:?}"
+        );
+        assert_eq!(list_at(dir).len(), 1, "failed reservation wrote a record");
+        reserve_at(
+            dir,
+            &rec("fly-allowed", "creating"),
+            2,
+            ReserveScope::Provider("fly"),
+        )
+        .unwrap();
+        assert_eq!(list_at(dir).len(), 2);
+
+        let only_hetzner = tempfile::tempdir().unwrap();
+        write_at(only_hetzner.path(), &rec("hetzner", "creating")).unwrap();
+        reserve_at(
+            only_hetzner.path(),
+            &rec("fly", "creating"),
+            1,
+            ReserveScope::Provider("fly"),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn reserve_refuses_symlinked_root_and_lock() {
+        let tmp = tempfile::tempdir().unwrap();
+        let real = tmp.path().join("real");
+        let root_link = tmp.path().join("root-link");
+        std::fs::create_dir(&real).unwrap();
+        if let Err(error) = thegn_core::fsperm::create_symlink(&real, &root_link, true) {
+            if matches!(
+                error.kind(),
+                std::io::ErrorKind::Unsupported | std::io::ErrorKind::PermissionDenied
+            ) {
+                return;
+            }
+            panic!("could not create test symlink: {error}");
+        }
+        assert!(matches!(
+            reserve_at(&root_link, &rec("root", "creating"), 1, ReserveScope::All),
+            Err(ReserveError::Store(_))
+        ));
+        assert!(!real.join(RESERVE_LOCK).exists());
+        assert!(!real.join("root.json").exists());
+
+        let dir = tmp.path().join("registry");
+        std::fs::create_dir(&dir).unwrap();
+        let outside = tmp.path().join("outside-lock");
+        std::fs::write(&outside, b"leave unchanged").unwrap();
+        if let Err(error) =
+            thegn_core::fsperm::create_symlink(&outside, &dir.join(RESERVE_LOCK), false)
+        {
+            if matches!(
+                error.kind(),
+                std::io::ErrorKind::Unsupported | std::io::ErrorKind::PermissionDenied
+            ) {
+                return;
+            }
+            panic!("could not create test symlink: {error}");
+        }
+        assert!(matches!(
+            reserve_at(&dir, &rec("lock", "creating"), 1, ReserveScope::All),
+            Err(ReserveError::Store(_))
+        ));
+        assert_eq!(std::fs::read(&outside).unwrap(), b"leave unchanged");
+        assert!(!dir.join("lock.json").exists());
+    }
+
+    #[test]
+    fn list_ignores_the_lock_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        let record = rec("reserved", "creating");
+        reserve_at(dir, &record, 1, ReserveScope::All).unwrap();
+        assert_eq!(list_at(dir), vec![record]);
+    }
+
+    #[test]
+    fn intent_guard_clears_pre_create_failure_and_preserves_ambiguous_intent() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        reserve_at(dir, &rec("cleanup", "creating"), 1, ReserveScope::All).unwrap();
+        drop(IntentGuard::at(dir, "cleanup"));
+        assert!(read_at(dir, "cleanup").is_none());
+
+        reserve_at(dir, &rec("preserve", "creating"), 1, ReserveScope::All).unwrap();
+        let mut guard = IntentGuard::at(dir, "preserve");
+        guard.preserve();
+        drop(guard);
+        assert_eq!(read_at(dir, "preserve").unwrap().state, "creating");
     }
 }

@@ -1,6 +1,6 @@
 # thegn
 
-> **Status: public alpha** (`0.1.0-alpha.17`). **x86_64 Linux is the supported
+> **Status: public alpha** (`0.1.0-alpha.18`). **x86_64 Linux is the supported
 > platform.** macOS on Apple silicon has build/test coverage and a generated
 > `thegn.app` launcher, and rejoins the release matrix from the next tag — treat
 > it as best-effort, not supported: its CI job is opt-in and the interactive

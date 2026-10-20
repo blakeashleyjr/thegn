@@ -196,6 +196,10 @@ restart. A sync that fails leaves the cache alone — you get yesterday's calend
 rather than an empty one — and a provider that returns an empty calendar when
 thegn has events cached is treated as suspect rather than believed.
 
+For a recurring event, an override with its `RECURRENCE-ID` replaces the
+generated occurrence, even if it moves to another day; a cancelled override
+hides that occurrence. Events at the same time are listed in a stable order.
+
 `max_events` (default 2000, allowed 1–10000) is an admission budget per
 account, not a display limit. It counts the events plus deletions that fall in
 the sync horizon (`horizon_past_days` to `horizon_future_days`). For `.ics`

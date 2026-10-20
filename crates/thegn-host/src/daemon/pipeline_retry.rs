@@ -56,13 +56,12 @@
 //! The task blocks on the event broadcast feed; no polling, no tickers. The
 //! only sleep is the backoff between a transport failure and its relaunch.
 //! Retry work runs in bounded per-session tasks, never inline in the receive
-//! loop (THE-266). Attempt counters live in daemon memory (keyed by roster row id,
-//! surviving session-id changes): a daemon restart kills the sessions it
-//! supervised, so there is nothing to retry across a restart — the durable
-//! note column records what happened either way.
+//! loop (THE-266). Attempt counters are durable and fenced by dispatch run
+//! generation, so restart and duplicate exit observations cannot reset or
+//! double-spend a row's budget.
 
 use anyhow::Context as _;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -87,22 +86,13 @@ const MAX_CONCURRENT_RETRIES: usize = 8;
 /// dropped with a warning and the `overflowed` flag, which triggers a durable
 /// reconcile once the stage drains — nothing is silently lost.
 const MAX_PENDING_EXITS: usize = 64;
-/// Attempt-counter entries above which terminal rows are garbage-collected.
-const ATTEMPTS_GC_THRESHOLD: usize = 128;
 /// Bound the durable roster work on a lagged/overflowed exit reconcile.
 const RECONCILE_ROW_LIMIT: usize = 512;
-
-/// Attempt counters, keyed by roster ROW id (a relaunch re-stamps the session
-/// id, so the row id is the stable key). Cleared when the row parks or
-/// exhausts: a human re-drive starts a fresh budget. Locked only for short
-/// map operations, never across an await.
-pub(crate) type Attempts = Mutex<HashMap<i64, u32>>;
 
 /// What the observer shares between its constant-time receive path and the
 /// per-exit retry tasks.
 struct Observer {
     svc: Arc<DaemonService>,
-    attempts: Attempts,
     /// Sessions whose exit is queued or being handled: a duplicate frame for
     /// one of them coalesces instead of launching a second retry.
     pending: Mutex<HashSet<String>>,
@@ -125,7 +115,6 @@ pub(crate) fn spawn(
 ) {
     let obs = Arc::new(Observer {
         svc,
-        attempts: Mutex::new(HashMap::new()),
         pending: Mutex::new(HashSet::new()),
         permits: tokio::sync::Semaphore::new(MAX_CONCURRENT_RETRIES),
         overflowed: AtomicBool::new(false),
@@ -207,9 +196,7 @@ fn observe_exit(obs: &Arc<Observer>, session: String, code: Option<i32>) {
         // The permit is taken inside `handle_exit`, only around backoff and
         // relaunch: classification, parking and persisting the native id never
         // wait behind other rows' retries.
-        if let Err(e) =
-            handle_exit(&obs.svc, &session, code, &obs.attempts, Some(&obs.permits)).await
-        {
+        if let Err(e) = handle_exit(&obs.svc, &session, code, Some(&obs.permits)).await {
             // best-effort: a failed retry cycle must not kill the observer —
             // the note column records what it could.
             tracing::warn!(
@@ -383,7 +370,6 @@ pub(crate) async fn handle_exit(
     svc: &DaemonService,
     session: &str,
     code: i32,
-    attempts: &Attempts,
     permits: Option<&tokio::sync::Semaphore>,
 ) -> anyhow::Result<()> {
     // Associate and stamp first. Classification below uses this exact row/run
@@ -464,14 +450,21 @@ pub(crate) async fn handle_exit(
         return Ok(());
     };
 
-    // 4. Decide. Attempts are 1-based per row, incremented per observed
-    //    transport failure.
-    gc_attempts(svc, attempts).await;
-    let attempt = {
-        let mut map = attempts.lock().unwrap_or_else(|p| p.into_inner());
-        let a = map.entry(row.id).or_insert(0);
-        *a += 1;
-        *a
+    // 4. Count once for this run generation. A duplicate event or moved row
+    //    loses the SQL fence and has no retry side effects.
+    let class_sig = signature_of(&class).to_string();
+    let counted_run = run.clone();
+    let Some(attempt) = svc
+        .with_db(move |db| db.count_dispatch_retry_attempt_run(&counted_run, &class_sig))
+        .await?
+    else {
+        tracing::debug!(
+            target: "thegn::daemon",
+            row = row.id,
+            run_gen = run.run_gen,
+            "transport retry exit was already counted or its run moved"
+        );
+        return Ok(());
     };
     // `run` (read in step 2b) fences the backoff below: a re-drive in that
     // window publishes a newer run and this retry must not touch it.
@@ -479,18 +472,15 @@ pub(crate) async fn handle_exit(
 
     match decision {
         pipeline_exit::RetryDecision::Park { note } => {
-            forget(attempts, row.id);
-            park(svc, &run, row.status, &note).await?;
+            settle(svc, &run, row.status, &note).await?;
         }
         pipeline_exit::RetryDecision::Exhausted { note } => {
-            forget(attempts, row.id);
-            park(svc, &run, row.status, &note).await?;
+            settle(svc, &run, row.status, &note).await?;
         }
         pipeline_exit::RetryDecision::Retry { attempt, delay_ms } => {
             let note = pipeline_exit::retry_note(signature_of(&class), attempt, tr.max_attempts);
             if !park(svc, &run, row.status, &note).await? {
                 // The row moved (verdict or a newer run): leave its budget be.
-                forget_if_current(svc, attempts, &run).await;
                 return Ok(());
             }
             tracing::info!(
@@ -527,7 +517,6 @@ pub(crate) async fn handle_exit(
                 .await?
             };
             if !reserved {
-                forget_if_current(svc, attempts, &run).await;
                 tracing::info!(
                     target: "thegn::daemon",
                     row = row.id,
@@ -551,7 +540,6 @@ pub(crate) async fn handle_exit(
                         })
                         .await;
                     if !matches!(published, Ok(true)) {
-                        forget(attempts, row.id);
                         let publish_error = published.err();
                         // best-effort: either the supervisor won after `open`
                         // or the publish itself failed. In both cases this
@@ -567,7 +555,6 @@ pub(crate) async fn handle_exit(
                     tracing::info!(target: "thegn::daemon", row = row.id, session = %info.id, "relaunched");
                 }
                 Err(e) => {
-                    forget(attempts, row.id);
                     // Provider errors may include arbitrarily long stderr.
                     // The roster ledger is bounded; the artifact/log is where
                     // full diagnostics belong.
@@ -575,7 +562,7 @@ pub(crate) async fn handle_exit(
                         .chars()
                         .take(thegn_core::pipeline_report::NOTE_MAX_CHARS)
                         .collect();
-                    park(svc, &run, AgentDispatchStatus::Spawning, &failed_note).await?;
+                    settle(svc, &run, AgentDispatchStatus::Spawning, &failed_note).await?;
                 }
             }
         }
@@ -594,6 +581,20 @@ async fn park(
     let note = note.to_string();
     let run = run.clone();
     svc.with_db(move |db| db.compare_and_set_dispatch_retry_park_run(&run, expected, &note))
+        .await
+        .map_err(Into::into)
+}
+
+/// Park a terminal retry outcome and clear its budget atomically.
+async fn settle(
+    svc: &DaemonService,
+    run: &thegn_core::issue::DispatchRunRef,
+    expected: AgentDispatchStatus,
+    note: &str,
+) -> anyhow::Result<bool> {
+    let note = note.to_string();
+    let run = run.clone();
+    svc.with_db(move |db| db.compare_and_set_dispatch_retry_settle_run(&run, expected, &note))
         .await
         .map_err(Into::into)
 }
@@ -710,65 +711,6 @@ fn retry_class(
     class
 }
 
-/// Drop a row's retry budget only when the row still carries the run this
-/// task handled, so a stale task can never reset a newer run's budget.
-async fn forget_if_current(
-    svc: &DaemonService,
-    attempts: &Attempts,
-    run: &thegn_core::issue::DispatchRunRef,
-) {
-    let id = run.id;
-    let current = svc.with_db(move |db| db.dispatch_run_ref(id)).await;
-    if matches!(current, Ok(Some(ref c)) if c == run) {
-        forget(attempts, run.id);
-    }
-}
-
-/// Drop a row's retry budget.
-fn forget(attempts: &Attempts, id: i64) {
-    attempts
-        .lock()
-        .unwrap_or_else(|p| p.into_inner())
-        .remove(&id);
-}
-
-/// Garbage-collect counters of rows that reached a terminal state (or no
-/// longer exist), so the map is bounded by the live roster, not daemon uptime.
-async fn gc_attempts(svc: &DaemonService, attempts: &Attempts) {
-    let ids: Vec<i64> = {
-        let map = attempts.lock().unwrap_or_else(|p| p.into_inner());
-        if map.len() < ATTEMPTS_GC_THRESHOLD {
-            return;
-        }
-        map.keys().copied().collect()
-    };
-    let query_ids = ids.clone();
-    let live = svc
-        .with_db(move |db| live_attempt_ids(db, &query_ids))
-        .await;
-    let Ok(live) = live else {
-        return;
-    };
-    let mut map = attempts.lock().unwrap_or_else(|p| p.into_inner());
-    for id in ids {
-        if !live.contains(&id) {
-            map.remove(&id);
-        }
-    }
-}
-
-fn live_attempt_ids(db: &thegn_core::db::Db, ids: &[i64]) -> anyhow::Result<HashSet<i64>> {
-    let mut live = HashSet::with_capacity(ids.len());
-    for id in ids {
-        if let Some(row) = db.get_dispatch(*id)?
-            && !row.status.is_terminal()
-        {
-            live.insert(*id);
-        }
-    }
-    Ok(live)
-}
-
 /// Re-render the row's stage prompt cold — the no-continue-form relaunch.
 /// Issue facts come from the daemon's tracker door, the branch from the DB
 /// worktree registry (the same two-tier lookup the CLI dispatch uses, minus
@@ -851,6 +793,7 @@ mod tests {
     use crate::daemon::service::DaemonService;
     use crate::daemon::session::{IdleTransition, SessionMeta};
     use crate::daemon::tombstone::{MAX_TOMBSTONES, TOMBSTONE_TTL_MS, Tombstone};
+    use std::collections::HashMap;
     use tempfile::TempDir;
     use thegn_core::control_wire::EventFrame;
     use thegn_core::issue::NewDispatch;
@@ -941,22 +884,6 @@ mod tests {
     }
 
     #[test]
-    fn attempt_gc_reads_only_the_requested_ids_and_keeps_nonterminal_rows() {
-        let (svc, _profile) = test_service(thegn_core::config::Config::default());
-        let running = running_row(&svc, "linear:THE-259-live", "aider");
-        let terminal = running_row(&svc, "linear:THE-259-done", "aider");
-        svc.db
-            .lock()
-            .unwrap()
-            .update_dispatch_status(terminal, St::Done)
-            .unwrap();
-
-        let db = svc.db.lock().unwrap();
-        let live = live_attempt_ids(&db, &[running, terminal, 999]).unwrap();
-        assert_eq!(live, HashSet::from([running]));
-    }
-
-    #[test]
     fn reconcile_candidates_are_oldest_first_limited_running_rows_with_sessions() {
         let (svc, _profile) = test_service(thegn_core::config::Config::default());
         let db = svc.db.lock().unwrap();
@@ -987,18 +914,9 @@ mod tests {
         assert!(truncated, "the second running row must set truncation");
     }
 
-    async fn publish_late(
-        svc: &Arc<DaemonService>,
-        row_id: i64,
-        session: &'static str,
-        attempts: &Arc<Attempts>,
-    ) {
+    async fn publish_late(svc: &Arc<DaemonService>, row_id: i64, session: &'static str) {
         let task_svc = svc.clone();
-        let task_attempts = attempts.clone();
-        let task =
-            tokio::spawn(
-                async move { handle_exit(&task_svc, session, 1, &task_attempts, None).await },
-            );
+        let task = tokio::spawn(async move { handle_exit(&task_svc, session, 1, None).await });
         {
             let db = svc.db.lock().unwrap();
             let row = db.get_dispatch(row_id).expect("get row").expect("row");
@@ -1105,9 +1023,7 @@ mod tests {
             1,
         )
         .await;
-        let attempts = Arc::new(Mutex::new(HashMap::new()));
-
-        publish_late(&svc, row_id, session, &attempts).await;
+        publish_late(&svc, row_id, session).await;
 
         let row = svc
             .db
@@ -1128,9 +1044,14 @@ mod tests {
             note.contains("relaunch failed"),
             "failed relaunch is recorded: {note}"
         );
-        assert!(
-            attempts.lock().unwrap().is_empty(),
-            "completed attempt is forgotten"
+        assert_eq!(
+            svc.db
+                .lock()
+                .unwrap()
+                .dispatch_retry_attempt(row_id)
+                .unwrap(),
+            Some(0),
+            "failed relaunch settles and clears the durable budget"
         );
     }
 
@@ -1150,9 +1071,7 @@ mod tests {
             1,
         )
         .await;
-        let attempts = Arc::new(Mutex::new(HashMap::new()));
-
-        publish_late(&svc, row_id, session, &attempts).await;
+        publish_late(&svc, row_id, session).await;
 
         let row = svc
             .db
@@ -1172,6 +1091,134 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn duplicate_exit_for_an_already_counted_running_generation_is_ignored() {
+        let mut config = thegn_core::config::Config::default();
+        config.pipeline.transport_retry.max_attempts = 3;
+        config.pipeline.transport_retry.transport_signatures = vec!["Connection error".into()];
+        let (svc, _profile) = test_service(config);
+        let row_id = running_row(&svc, "linear:THE-976-duplicate", "claude");
+        let session = "s-duplicate-exit";
+        let run = {
+            let db = svc.db.lock().unwrap();
+            assert!(db.bind_dispatch_session(row_id, session).unwrap());
+            db.dispatch_run_ref(row_id).unwrap().unwrap()
+        };
+        {
+            let db = svc.db.lock().unwrap();
+            assert_eq!(
+                db.count_dispatch_retry_attempt_run(&run, "transport:connection error")
+                    .unwrap(),
+                Some(1),
+                "simulate the first observer counting this run"
+            );
+        }
+        bury(&svc, session, b"Connection error", 1).await;
+
+        handle_exit(&svc, session, 1, None).await.unwrap();
+
+        let db = svc.db.lock().unwrap();
+        let row = db.get_dispatch(row_id).unwrap().unwrap();
+        assert_eq!(
+            row.status,
+            St::Running,
+            "duplicate exit does not park the row"
+        );
+        assert_eq!(row.note, None, "duplicate exit leaves the note unchanged");
+        assert_eq!(db.dispatch_retry_attempt(row_id).unwrap(), Some(1));
+        assert_eq!(db.dispatch_run_ref(row_id).unwrap().unwrap(), run);
+    }
+
+    #[tokio::test]
+    async fn duplicate_exit_after_settlement_preserves_the_settled_row() {
+        let mut config = thegn_core::config::Config::default();
+        config.pipeline.transport_retry.max_attempts = 3;
+        config.pipeline.transport_retry.transport_signatures = vec!["Connection error".into()];
+        let (svc, _profile) = test_service(config);
+        let row_id = running_row(&svc, "linear:THE-976-settled-duplicate", "claude");
+        let session = "s-settled-duplicate-exit";
+        let run = {
+            let db = svc.db.lock().unwrap();
+            assert!(db.bind_dispatch_session(row_id, session).unwrap());
+            db.dispatch_run_ref(row_id).unwrap().unwrap()
+        };
+        {
+            let db = svc.db.lock().unwrap();
+            assert_eq!(
+                db.count_dispatch_retry_attempt_run(&run, "transport:connection error")
+                    .unwrap(),
+                Some(1)
+            );
+            assert!(
+                db.compare_and_set_dispatch_retry_settle_run(
+                    &run,
+                    St::Running,
+                    "settled before duplicate exit"
+                )
+                .unwrap()
+            );
+        }
+        bury(&svc, session, b"Connection error", 1).await;
+
+        handle_exit(&svc, session, 1, None).await.unwrap();
+
+        let db = svc.db.lock().unwrap();
+        let row = db.get_dispatch(row_id).unwrap().unwrap();
+        assert_eq!(row.status, St::WaitingHuman);
+        assert_eq!(row.note.as_deref(), Some("settled before duplicate exit"));
+        assert_eq!(db.dispatch_retry_attempt(row_id).unwrap(), Some(0));
+    }
+
+    #[tokio::test]
+    async fn persisted_prior_generation_exhausts_after_observer_restart() {
+        let mut config = thegn_core::config::Config::default();
+        config.pipeline.transport_retry.max_attempts = 1;
+        config.pipeline.transport_retry.transport_signatures = vec!["Connection error".into()];
+        let (svc, _profile) = test_service(config);
+        let row_id = running_row(&svc, "linear:THE-976-restart", "claude");
+        let old_run = {
+            let db = svc.db.lock().unwrap();
+            assert!(
+                db.bind_dispatch_session(row_id, "s-before-restart")
+                    .unwrap()
+            );
+            db.dispatch_run_ref(row_id).unwrap().unwrap()
+        };
+        {
+            let db = svc.db.lock().unwrap();
+            assert_eq!(
+                db.count_dispatch_retry_attempt_run(&old_run, "transport:connection error")
+                    .unwrap(),
+                Some(1)
+            );
+            db.update_dispatch_status(row_id, St::Spawning).unwrap();
+            assert!(
+                db.compare_and_set_dispatch_retry_run(
+                    row_id,
+                    St::Spawning,
+                    "s-after-restart",
+                    "/wt/257/retry",
+                )
+                .unwrap()
+            );
+        }
+        let session = "s-after-restart";
+        bury(&svc, session, b"Connection error", 1).await;
+
+        handle_exit(&svc, session, 1, None).await.unwrap();
+
+        let db = svc.db.lock().unwrap();
+        let row = db.get_dispatch(row_id).unwrap().unwrap();
+        assert_eq!(row.status, St::WaitingHuman);
+        assert!(
+            row.note
+                .as_deref()
+                .unwrap_or_default()
+                .contains("exhausted")
+        );
+        assert_eq!(db.dispatch_retry_attempt(row_id).unwrap(), Some(0));
+    }
+
     /// A usage limit is parked without consuming transport retry budget.
     #[tokio::test]
     async fn limit_exit_before_publication_is_stamped_and_parked() {
@@ -1182,9 +1229,7 @@ mod tests {
         let row_id = running_row(&svc, "linear:THE-257", "aider");
         let session = "s-limit-late";
         bury(&svc, session, b"You have hit your weekly limit", 1).await;
-        let attempts = Arc::new(Mutex::new(HashMap::new()));
-
-        publish_late(&svc, row_id, session, &attempts).await;
+        publish_late(&svc, row_id, session).await;
 
         let row = svc
             .db
@@ -1201,7 +1246,6 @@ mod tests {
                 .starts_with("limit:")
         );
         assert_eq!(row.exit_code, Some(1));
-        assert!(attempts.lock().unwrap().is_empty());
     }
 
     /// An unmatched exit is durably stamped and left to the supervisor.
@@ -1211,9 +1255,7 @@ mod tests {
         let row_id = running_row(&svc, "linear:THE-257", "aider");
         let session = "s-unmatched-late";
         bury(&svc, session, b"segfault", 1).await;
-        let attempts = Arc::new(Mutex::new(HashMap::new()));
-
-        publish_late(&svc, row_id, session, &attempts).await;
+        publish_late(&svc, row_id, session).await;
 
         let row = svc
             .db
@@ -1226,7 +1268,6 @@ mod tests {
         assert!(row.exited_at_ms.is_some());
         assert_eq!(row.status, St::Running);
         assert_eq!(row.note, None);
-        assert!(attempts.lock().unwrap().is_empty());
     }
 
     /// Publication and a terminal verdict in one DB lock leave the row
@@ -1241,14 +1282,9 @@ mod tests {
             .lock()
             .unwrap()
             .insert(session.into(), "native-id".into());
-        let attempts = Arc::new(Mutex::new(HashMap::new()));
         let task_svc = svc.clone();
-        let task_attempts = attempts.clone();
         let started = tokio::time::Instant::now();
-        let task =
-            tokio::spawn(
-                async move { handle_exit(&task_svc, session, 1, &task_attempts, None).await },
-            );
+        let task = tokio::spawn(async move { handle_exit(&task_svc, session, 1, None).await });
         {
             let db = svc.db.lock().unwrap();
             let row = db.get_dispatch(row_id).unwrap().unwrap();
@@ -1292,14 +1328,10 @@ mod tests {
         let row_id = running_row(&svc, "linear:THE-257", "aider");
         let session_a = "s-old-generation";
         bury(&svc, session_a, b"Connection error", 1).await;
-        let attempts = Arc::new(Mutex::new(HashMap::new()));
         let tomb_guard = svc.tombs.lock().await;
         let task_svc = svc.clone();
-        let task_attempts = attempts.clone();
         let started = tokio::time::Instant::now();
-        let task = tokio::spawn(async move {
-            handle_exit(&task_svc, session_a, 1, &task_attempts, None).await
-        });
+        let task = tokio::spawn(async move { handle_exit(&task_svc, session_a, 1, None).await });
         {
             let row = svc
                 .db
@@ -1366,7 +1398,6 @@ mod tests {
         assert_eq!(row.exit_code, None);
         assert_eq!(row.exited_at_ms, None);
         assert_eq!(row.note, None);
-        assert!(attempts.lock().unwrap().is_empty());
     }
 
     /// THE-257: a row that never publishes is unchanged, and association gives
@@ -1386,9 +1417,8 @@ mod tests {
             .lock()
             .unwrap()
             .insert("s-never-published".into(), "native-id".into());
-        let attempts = Mutex::new(HashMap::new());
         let started = tokio::time::Instant::now();
-        handle_exit(&svc, "s-never-published", 1, &attempts, None)
+        handle_exit(&svc, "s-never-published", 1, None)
             .await
             .unwrap();
 

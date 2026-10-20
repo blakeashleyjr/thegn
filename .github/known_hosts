@@ -1,0 +1,4 @@
+# Pinned SSH host keys from operators' published keys.
+# A maintainer adds aur.archlinux.org from the fingerprints published on the AUR home page,
+# then compares the key with `ssh-keygen -lf` before committing it.
+github.com ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOMqqnkVzrm0SdG6UOoqKLsabgH5C9okWi0dh2l9GKJl

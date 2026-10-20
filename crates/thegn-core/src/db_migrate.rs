@@ -1657,6 +1657,33 @@ pub(crate) fn verify_v85_schema(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
+/// v86: durable, run-fenced transport-retry budget for dispatch rows (THE-239).
+pub(crate) fn migrate_v86(conn: &Connection) -> Result<()> {
+    for (column, kind) in [
+        ("retry_attempt", "INTEGER NOT NULL DEFAULT 0"),
+        ("retry_counted_gen", "INTEGER"),
+        ("retry_last_class", "TEXT"),
+    ] {
+        if !has_column(conn, "agent_dispatches", column) {
+            conn.execute(
+                &format!("ALTER TABLE agent_dispatches ADD COLUMN {column} {kind}"),
+                [],
+            )?;
+        }
+    }
+    Ok(())
+}
+
+/// Verify all fields of the v86 durable transport-retry budget.
+pub(crate) fn verify_v86_schema(conn: &Connection) -> Result<()> {
+    for column in ["retry_attempt", "retry_counted_gen", "retry_last_class"] {
+        if !has_column(conn, "agent_dispatches", column) {
+            bail!("schema v86 migration did not add agent_dispatches.{column}");
+        }
+    }
+    Ok(())
+}
+
 /// Verify the v69 identity ledger before the schema version is stamped. A
 /// missing column/table must never look like a completed migration.
 pub(crate) fn verify_v69_schema(conn: &Connection) -> Result<()> {
@@ -2492,6 +2519,46 @@ mod tests {
         for column in ["override_kind", "override_reason", "override_at_ms"] {
             assert!(has_column(&conn, "agent_dispatches", column));
         }
+    }
+
+    #[test]
+    fn v86_adds_retry_budget_columns_idempotently_and_verifies() {
+        let fresh = Db::open_memory().unwrap();
+        super::verify_v86_schema(fresh.conn()).unwrap();
+
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE agent_dispatches (id INTEGER PRIMARY KEY, status TEXT NOT NULL);
+             PRAGMA user_version = 85;",
+        )
+        .unwrap();
+        for column in ["retry_attempt", "retry_counted_gen", "retry_last_class"] {
+            assert!(!has_column(&conn, "agent_dispatches", column));
+        }
+        assert!(super::verify_v86_schema(&conn).is_err());
+        super::migrate_v86(&conn).unwrap();
+        super::migrate_v86(&conn).unwrap();
+        super::verify_v86_schema(&conn).unwrap();
+        for column in ["retry_attempt", "retry_counted_gen", "retry_last_class"] {
+            assert!(has_column(&conn, "agent_dispatches", column));
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("v85.db");
+        {
+            let db = Db::open_at(&path).unwrap();
+            // No index, view, or trigger references these columns, so SQLite can drop them here.
+            db.conn()
+                .execute_batch(
+                    "ALTER TABLE agent_dispatches DROP COLUMN retry_last_class;
+                     ALTER TABLE agent_dispatches DROP COLUMN retry_counted_gen;
+                     ALTER TABLE agent_dispatches DROP COLUMN retry_attempt;
+                     PRAGMA user_version=85;",
+                )
+                .unwrap();
+        }
+        let upgraded = Db::open_at(&path).unwrap();
+        super::verify_v86_schema(upgraded.conn()).unwrap();
     }
 
     #[test]

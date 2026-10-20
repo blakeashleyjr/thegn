@@ -52,8 +52,9 @@ pub fn script_from_argv(argv: &[String]) -> String {
 }
 
 /// The full stdin-streamed script: env exports + optional `cd` + the body.
-/// Exports (not `env` prefixes) so secrets ride stdin, never an argv. Pure.
-pub fn stdin_script(script: &str, cwd: Option<&str>, env: &[(String, String)]) -> String {
+/// Exports (not `env` prefixes) so secrets ride stdin, never an argv. A missing
+/// cwd exits with the shared status and never runs the body elsewhere. Pure.
+pub fn stdin_script(script: &str, cwd: Option<&str>, env: &[(String, String)]) -> Result<String> {
     let mut out = String::new();
     for (k, v) in env {
         // Keys are caller-controlled config (env_passthrough names); values are
@@ -62,15 +63,24 @@ pub fn stdin_script(script: &str, cwd: Option<&str>, env: &[(String, String)]) -
             out.push_str(&format!("export {k}={}\n", thegn_core::util::sh_quote(v)));
         }
     }
-    if let Some(d) = cwd.map(str::trim).filter(|d| !d.is_empty()) {
+    let cwd = cwd.map(str::trim).filter(|d| !d.is_empty());
+    if let Some(d) = cwd
+        && (!d.starts_with('/') || d.chars().any(|c| matches!(c, '\0' | '\r' | '\n')))
+    {
+        return Err(anyhow!(
+            "ssh exec: cwd must be an absolute path without control characters"
+        ));
+    }
+    if let Some(d) = cwd {
         out.push_str(&format!(
-            "cd {} 2>/dev/null\n",
-            thegn_core::util::sh_quote(d)
+            "cd -- {} || {{ printf '%s\\n' 'thegn: remote working directory is missing or not accessible' >&2; exit {}; }}\n",
+            thegn_core::util::sh_quote(d),
+            crate::provider::EXEC_CWD_FAILED_STATUS
         ));
     }
     out.push_str(script);
     out.push('\n');
-    out
+    Ok(out)
 }
 
 impl SshShim {
@@ -163,14 +173,15 @@ impl SshShim {
     }
 
     /// One-shot exec: `(exit_code, combined output)` — the pipeline's
-    /// `run_exec` shape. Secrets ride the stdin-streamed exports preamble.
+    /// `run_exec` shape. Secrets ride the stdin-streamed exports preamble. A
+    /// missing cwd exits with the shared status and never runs the body elsewhere.
     pub async fn run_exec(
         &self,
         argv: &[String],
         cwd: Option<&str>,
         env: &[(String, String)],
     ) -> Result<(i32, String)> {
-        let script = stdin_script(&script_from_argv(argv), cwd, env);
+        let script = stdin_script(&script_from_argv(argv), cwd, env)?;
         let (code, out) = self.run_raw(&script).await?;
         Ok((code, String::from_utf8_lossy(&out).into_owned()))
     }
@@ -317,7 +328,7 @@ mod tests {
             ("GH_TOKEN".to_string(), "s3cr'et".to_string()),
             ("weird-key".to_string(), "dropped".to_string()),
         ];
-        let s = stdin_script("echo hi", Some("/workspace"), &env);
+        let s = stdin_script("echo hi", Some("/workspace"), &env).unwrap();
         // Secrets are quoted exports INSIDE the streamed script — never argv.
         assert!(s.contains("export GH_TOKEN="));
         assert!(s.contains("s3cr"));
@@ -329,7 +340,106 @@ mod tests {
         let body = s.find("echo hi").expect("body present");
         assert!(cd < body, "cd precedes the body");
         // No cwd, no env ⇒ just the body.
-        assert_eq!(stdin_script("true", None, &[]), "true\n");
+        assert_eq!(stdin_script("true", None, &[]).unwrap(), "true\n");
+    }
+
+    #[test]
+    fn stdin_script_cwd_failure_exits_before_body() {
+        let s = stdin_script("echo BODY", Some("/work/a b"), &[]).unwrap();
+        let cd = s.find("cd -- '/work/a b' ||").expect("checked cd present");
+        let body = s.find("echo BODY").expect("body present");
+        assert!(cd < body, "cd check precedes the body");
+        assert!(s.contains(&format!(
+            "exit {};",
+            crate::provider::EXEC_CWD_FAILED_STATUS
+        )));
+        let cd_line = s.lines().find(|line| line.starts_with("cd ")).unwrap();
+        assert!(!cd_line.contains("2>/dev/null"));
+    }
+
+    #[test]
+    fn stdin_script_refuses_relative_or_control_cwd() {
+        for cwd in [
+            Some("relative"),
+            Some("/a\nb"),
+            Some("/a\0b"),
+            Some("/a\rb"),
+        ] {
+            assert!(stdin_script("true", cwd, &[]).is_err(), "accepted {cwd:?}");
+        }
+        for cwd in [None, Some("  ")] {
+            let script = stdin_script("true", cwd, &[]).unwrap();
+            assert!(!script.contains("cd "));
+        }
+    }
+
+    #[test]
+    fn missing_cwd_never_runs_the_body() {
+        use std::io::Write;
+
+        if !cfg!(unix) || !std::path::Path::new("/bin/sh").exists() {
+            return;
+        }
+        let temp = {
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let mut builder = tempfile::Builder::new();
+                builder.permissions(std::fs::Permissions::from_mode(0o700));
+                builder.tempdir().unwrap()
+            }
+            #[cfg(not(unix))]
+            {
+                tempfile::Builder::new().tempdir().unwrap()
+            }
+        };
+        let missing = temp.path().join("missing");
+        let script = stdin_script("echo RAN", Some(missing.to_str().unwrap()), &[]).unwrap();
+        let mut child = std::process::Command::new("/bin/sh")
+            .arg("-s")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(script.as_bytes())
+            .unwrap();
+        let output = child.wait_with_output().unwrap();
+        assert_eq!(
+            output.status.code(),
+            Some(crate::provider::EXEC_CWD_FAILED_STATUS)
+        );
+        assert!(!String::from_utf8_lossy(&output.stdout).contains("RAN"));
+        assert!(
+            String::from_utf8_lossy(&output.stderr)
+                .contains("thegn: remote working directory is missing or not accessible")
+        );
+
+        let existing = temp.path().canonicalize().unwrap();
+        let script = stdin_script("pwd", Some(existing.to_str().unwrap()), &[]).unwrap();
+        let mut child = std::process::Command::new("/bin/sh")
+            .arg("-s")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(script.as_bytes())
+            .unwrap();
+        let output = child.wait_with_output().unwrap();
+        assert_eq!(output.status.code(), Some(0));
+        assert_eq!(
+            String::from_utf8_lossy(&output.stdout).trim(),
+            existing.to_str().unwrap()
+        );
     }
 
     #[test]

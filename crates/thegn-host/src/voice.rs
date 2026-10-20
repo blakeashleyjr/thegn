@@ -452,7 +452,8 @@ fn spawn_capture(
                 .args(&argv[1..])
                 .stdout(Stdio::piped())
                 .stderr(Stdio::piped());
-            let (mut child, group) = match crate::platform::spawn_grouped(&mut command) {
+            let (mut child, group) = match crate::platform::spawn_grouped_best_effort(&mut command)
+            {
                 Ok(children) => children,
                 Err(e) => {
                     send_capture(

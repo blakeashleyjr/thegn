@@ -694,11 +694,18 @@ pub fn materialize_dotfiles(
         crate::msg::warn("bundle: dotfiles signature path is not a regular file; skipping");
         return 0;
     }
+    if let Err(error) = sweep_dotfile_residue(dest_home) {
+        crate::msg::warn(&format!(
+            "bundle: cannot sweep dotfile staging residue: {error}"
+        ));
+        return 0;
+    }
     if std::fs::read_to_string(&meta).ok().as_deref() == Some(sig.as_str()) {
         return 0;
     }
-    let mut n = 0;
-    let mut all_succeeded = true;
+    let generation = dotfile_generation();
+    let mut staged = Vec::new();
+    let mut first_error = None;
     let mut budget = CopyBudget { entries: 0 };
     let entries = match std::fs::read_dir(&source) {
         Ok(e) => e,
@@ -711,72 +718,178 @@ pub fn materialize_dotfiles(
         let entry = match entry {
             Ok(entry) => entry,
             Err(error) => {
-                all_succeeded = false;
-                crate::msg::warn(&format!(
-                    "bundle: cannot read dotfiles source entry: {error}"
-                ));
-                continue;
+                first_error = Some(format!("cannot read dotfiles source entry: {error}"));
+                break;
             }
         };
         let from = entry.path();
         let Some(base) = from.file_name() else {
             continue;
         };
+        let source_name = base.to_string_lossy();
+        if source_name.starts_with(".thegn-stage-") || source_name.starts_with(".thegn-old-") {
+            first_error = Some(format!(
+                "refusing reserved dotfile source name {}",
+                from.display()
+            ));
+            break;
+        }
         let to = dest_home.join(base);
+        let stage = dest_home.join(format!(
+            ".thegn-stage-{generation}-{}",
+            base.to_string_lossy()
+        ));
         if spec.mode == DotfileMode::Template {
             match std::fs::symlink_metadata(&from) {
                 Ok(metadata)
                     if metadata.file_type().is_symlink()
                         || (!metadata.is_file() && !metadata.is_dir()) =>
                 {
-                    all_succeeded = false;
-                    crate::msg::warn(&format!(
-                        "bundle: refusing unsupported template entry {}",
+                    first_error = Some(format!(
+                        "refusing unsupported template entry {}",
                         from.display()
                     ));
-                    continue;
+                    break;
                 }
                 Ok(_) => {}
                 Err(error) => {
-                    all_succeeded = false;
-                    crate::msg::warn(&format!(
-                        "bundle: cannot inspect template entry {}: {error}",
+                    first_error = Some(format!(
+                        "cannot inspect template entry {}: {error}",
                         from.display()
                     ));
-                    continue;
+                    break;
                 }
             }
         }
-        if let Err(error) = std::fs::remove_file(&to).or_else(|_| std::fs::remove_dir_all(&to))
-            && error.kind() != std::io::ErrorKind::NotFound
-        {
-            all_succeeded = false;
-            crate::msg::warn(&format!(
-                "bundle: cannot clear dotfile target {}: {error}",
-                to.display()
-            ));
-            continue;
-        }
+        staged.push((stage.clone(), to, from.clone()));
         let res = match spec.mode {
-            DotfileMode::Symlink => symlink(&from, &to),
-            DotfileMode::Template => copy_tree_bounded(&from, &to, 0, &mut budget),
+            DotfileMode::Symlink => symlink(&from, &stage),
+            DotfileMode::Template => copy_tree_bounded(&from, &stage, 0, &mut budget),
         };
-        match res {
-            Ok(()) => n += 1,
-            Err(e) => {
-                all_succeeded = false;
-                crate::msg::warn(&format!(
-                    "bundle: dotfile {} → {}: {e}",
-                    from.display(),
-                    to.display()
+        if let Err(error) = res {
+            first_error = Some(format!("dotfile {}: {error}", from.display()));
+            break;
+        }
+    }
+    if let Some(error) = first_error.take() {
+        remove_dotfile_stages(&staged);
+        crate::msg::warn(&format!("bundle: dotfiles staging failed: {error}"));
+        return 0;
+    }
+    let mut published = 0;
+    for (stage, target, from) in &staged {
+        let Some(target_name) = target.file_name() else {
+            first_error = Some(format!("dotfile target has no name: {}", target.display()));
+            break;
+        };
+        let old = dest_home.join(format!(
+            ".thegn-old-{generation}-{}",
+            target_name.to_string_lossy()
+        ));
+        let stage_is_directory = match std::fs::symlink_metadata(stage) {
+            Ok(metadata) => metadata.is_dir() && !metadata.file_type().is_symlink(),
+            Err(error) => {
+                first_error = Some(format!(
+                    "cannot inspect staged dotfile {}: {error}",
+                    stage.display()
+                ));
+                break;
+            }
+        };
+        let old_target_moved = match (stage_is_directory, std::fs::symlink_metadata(target)) {
+            (true, Ok(_)) => {
+                if let Err(error) = std::fs::rename(target, &old) {
+                    first_error = Some(format!(
+                        "cannot move dotfile target {} aside: {error}",
+                        target.display()
+                    ));
+                    break;
+                }
+                true
+            }
+            (_, Ok(_)) => false,
+            (_, Err(error)) if error.kind() == std::io::ErrorKind::NotFound => false,
+            (_, Err(error)) => {
+                first_error = Some(format!(
+                    "cannot inspect dotfile target {}: {error}",
+                    target.display()
+                ));
+                break;
+            }
+        };
+        if let Err(error) = std::fs::rename(stage, target) {
+            let mut publish_error = format!("cannot publish dotfile {}: {error}", from.display());
+            if old_target_moved && let Err(restore_error) = std::fs::rename(&old, target) {
+                tracing::warn!(target: "thegn::bundle", %restore_error, path = %target.display(), old_path = %old.display(), "could not restore dotfile target after publish failure");
+                publish_error.push_str(&format!(
+                    "; also could not restore previous target {} from {}: {restore_error}",
+                    target.display(),
+                    old.display()
                 ));
             }
+            first_error = Some(publish_error);
+            break;
+        }
+        published += 1;
+        if old_target_moved && let Err(error) = remove_path_nofollow(&old) {
+            tracing::debug!(target: "thegn::bundle", %error, path = %old.display(), "could not remove replaced dotfile directory");
         }
     }
-    if all_succeeded && let Err(error) = std::fs::write(&meta, sig) {
+    if let Some(error) = first_error.take() {
+        remove_dotfile_stages(&staged);
+        crate::msg::warn(&format!("bundle: dotfiles publish failed: {error}"));
+        return 0;
+    }
+    if let Err(error) = std::fs::write(&meta, sig) {
         tracing::debug!(target: "thegn::bundle", %error, "could not write dotfiles signature");
     }
-    n
+    published
+}
+
+fn dotfile_generation() -> String {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static NEXT_GENERATION: AtomicU64 = AtomicU64::new(0);
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or(0);
+    format!(
+        "{:x}-{:x}-{:x}",
+        std::process::id(),
+        nanos,
+        NEXT_GENERATION.fetch_add(1, Ordering::Relaxed)
+    )
+}
+
+fn remove_path_nofollow(path: &std::path::Path) -> std::io::Result<()> {
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => {
+            std::fs::remove_dir_all(path)
+        }
+        Ok(_) => std::fs::remove_file(path),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error),
+    }
+}
+
+fn sweep_dotfile_residue(home: &std::path::Path) -> std::io::Result<()> {
+    for entry in std::fs::read_dir(home)? {
+        let entry = entry?;
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if name.starts_with(".thegn-stage-") || name.starts_with(".thegn-old-") {
+            remove_path_nofollow(&entry.path())?;
+        }
+    }
+    Ok(())
+}
+
+fn remove_dotfile_stages(staged: &[(std::path::PathBuf, std::path::PathBuf, std::path::PathBuf)]) {
+    for (stage, _, _) in staged {
+        if let Err(error) = remove_path_nofollow(stage) {
+            tracing::debug!(target: "thegn::bundle", %error, path = %stage.display(), "could not remove dotfile staging entry");
+        }
+    }
 }
 
 const MAX_DOTFILE_DEPTH: usize = 32;
@@ -1497,11 +1610,11 @@ mod tests {
             mode: DotfileMode::Template,
         };
 
-        assert_eq!(materialize_dotfiles(&spec, &home), 1);
-        assert!(home.join(".bashrc").is_file());
+        assert_eq!(materialize_dotfiles(&spec, &home), 0);
+        assert!(!home.join(".bashrc").exists());
         assert!(!home.join("link/secret.txt").exists());
         assert!(!home.join(".thegn-dotfiles.json").exists());
-        assert!(materialize_dotfiles(&spec, &home) >= 1);
+        assert_eq!(materialize_dotfiles(&spec, &home), 0);
     }
 
     #[cfg(unix)]
@@ -1522,7 +1635,7 @@ mod tests {
             mode: DotfileMode::Template,
         };
 
-        assert_eq!(materialize_dotfiles(&spec, &home), 1);
+        assert_eq!(materialize_dotfiles(&spec, &home), 0);
         assert_eq!(
             std::fs::read_to_string(home.join("unsupported")).unwrap(),
             "keep"
@@ -1546,9 +1659,26 @@ mod tests {
             mode: DotfileMode::Template,
         };
 
-        assert_eq!(materialize_dotfiles(&spec, &home), 1);
+        assert_eq!(materialize_dotfiles(&spec, &home), 0);
+        assert!(!home.join(".bashrc").exists());
         assert!(!home.join(".thegn-dotfiles.json").exists());
-        assert!(materialize_dotfiles(&spec, &home) >= 1);
+        assert!(std::fs::read_dir(&home).unwrap().all(|entry| {
+            !entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .starts_with(".thegn-stage-")
+        }));
+        assert_eq!(materialize_dotfiles(&spec, &home), 0);
+        assert!(!home.join(".bashrc").exists());
+        assert!(!home.join(".thegn-dotfiles.json").exists());
+        assert!(std::fs::read_dir(&home).unwrap().all(|entry| {
+            !entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .starts_with(".thegn-stage-")
+        }));
     }
 
     #[test]
@@ -1615,6 +1745,191 @@ mod tests {
         // …the second is a no-op (unchanged signature).
         assert_eq!(materialize_dotfiles(&spec, &dest), 0);
         std::fs::remove_dir_all(&root).ok(); // best-effort: test cleanup: scratch removal must never fail the test
+    }
+
+    #[test]
+    fn failed_staging_keeps_the_prior_home() {
+        use crate::config::{DotfileMode, DotfilesSpec};
+        let root = tempfile::tempdir().unwrap();
+        let source = root.path().join("source");
+        let home = root.path().join("bundle/home");
+        std::fs::create_dir(&source).unwrap();
+        std::fs::write(source.join("a.txt"), "one").unwrap();
+        let spec = DotfilesSpec {
+            source: source.to_string_lossy().into_owned(),
+            mode: DotfileMode::Template,
+        };
+        assert_eq!(materialize_dotfiles(&spec, &home), 1);
+        let signature = std::fs::read(home.join(".thegn-dotfiles.json")).unwrap();
+
+        std::fs::write(source.join("a.txt"), "two").unwrap();
+        let mut deep = source.join("deep");
+        std::fs::create_dir(&deep).unwrap();
+        for _ in 0..=MAX_DOTFILE_DEPTH {
+            deep = deep.join("nested");
+            std::fs::create_dir(&deep).unwrap();
+        }
+
+        assert_eq!(materialize_dotfiles(&spec, &home), 0);
+        assert_eq!(std::fs::read_to_string(home.join("a.txt")).unwrap(), "one");
+        assert_eq!(
+            std::fs::read(home.join(".thegn-dotfiles.json")).unwrap(),
+            signature
+        );
+        assert!(std::fs::read_dir(&home).unwrap().all(|entry| {
+            !entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .starts_with(".thegn-stage-")
+        }));
+    }
+
+    #[test]
+    fn publish_replaces_entries_and_keeps_runtime_state() {
+        use crate::config::{DotfileMode, DotfilesSpec};
+        let root = tempfile::tempdir().unwrap();
+        let source = root.path().join("source");
+        let home = root.path().join("bundle/home");
+        std::fs::create_dir(&source).unwrap();
+        std::fs::write(source.join("a.txt"), "one").unwrap();
+        let spec = DotfilesSpec {
+            source: source.to_string_lossy().into_owned(),
+            mode: DotfileMode::Template,
+        };
+        assert_eq!(materialize_dotfiles(&spec, &home), 1);
+        std::fs::write(home.join(".bash_history"), "runtime").unwrap();
+        std::fs::write(source.join("a.txt"), "two").unwrap();
+        let modified = std::fs::File::open(source.join("a.txt")).unwrap();
+        modified
+            .set_modified(std::time::SystemTime::now() + std::time::Duration::from_secs(3))
+            .unwrap();
+
+        assert_eq!(materialize_dotfiles(&spec, &home), 1);
+        assert_eq!(std::fs::read_to_string(home.join("a.txt")).unwrap(), "two");
+        assert_eq!(
+            std::fs::read_to_string(home.join(".bash_history")).unwrap(),
+            "runtime"
+        );
+        assert!(home.join(".thegn-dotfiles.json").is_file());
+    }
+
+    #[test]
+    fn stale_stage_residue_is_swept() {
+        use crate::config::{DotfileMode, DotfilesSpec};
+        let root = tempfile::tempdir().unwrap();
+        let source = root.path().join("source");
+        let home = root.path().join("bundle/home");
+        std::fs::create_dir(&source).unwrap();
+        std::fs::write(source.join("a.txt"), "value").unwrap();
+        let spec = DotfilesSpec {
+            source: source.to_string_lossy().into_owned(),
+            mode: DotfileMode::Template,
+        };
+        assert_eq!(materialize_dotfiles(&spec, &home), 1);
+        std::fs::write(home.join(".thegn-stage-x-a.txt"), "residue").unwrap();
+
+        assert_eq!(materialize_dotfiles(&spec, &home), 0);
+        assert!(!home.join(".thegn-stage-x-a.txt").exists());
+    }
+
+    #[test]
+    fn directory_target_is_replaced_without_a_gap() {
+        use crate::config::{DotfileMode, DotfilesSpec};
+        let root = tempfile::tempdir().unwrap();
+        let source = root.path().join("source");
+        let home = root.path().join("bundle/home");
+        std::fs::create_dir_all(source.join("cfg")).unwrap();
+        std::fs::write(source.join("cfg/new"), "new").unwrap();
+        std::fs::create_dir_all(home.join("cfg")).unwrap();
+        std::fs::write(home.join("cfg/old"), "old").unwrap();
+        let spec = DotfilesSpec {
+            source: source.to_string_lossy().into_owned(),
+            mode: DotfileMode::Template,
+        };
+
+        assert_eq!(materialize_dotfiles(&spec, &home), 1);
+        assert!(!home.join("cfg/old").exists());
+        assert_eq!(
+            std::fs::read_to_string(home.join("cfg/new")).unwrap(),
+            "new"
+        );
+        assert!(std::fs::read_dir(&home).unwrap().all(|entry| {
+            !entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .starts_with(".thegn-old-")
+        }));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn directory_stage_replaces_a_file_or_symlink_target() {
+        use crate::config::{DotfileMode, DotfilesSpec};
+        let root = tempfile::tempdir().unwrap();
+        let source = root.path().join("source");
+        let home = root.path().join("bundle/home");
+        let outside = root.path().join("outside");
+        std::fs::create_dir_all(source.join("from_file")).unwrap();
+        std::fs::create_dir_all(source.join("from_link")).unwrap();
+        std::fs::write(source.join("from_file/new"), "from file target").unwrap();
+        std::fs::write(source.join("from_link/new"), "from symlink target").unwrap();
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::create_dir(&outside).unwrap();
+        std::fs::write(home.join("from_file"), "old file").unwrap();
+        std::fs::write(outside.join("keep"), "keep").unwrap();
+        symlink(&outside, &home.join("from_link")).unwrap();
+        let spec = DotfilesSpec {
+            source: source.to_string_lossy().into_owned(),
+            mode: DotfileMode::Template,
+        };
+
+        assert_eq!(materialize_dotfiles(&spec, &home), 2);
+        assert_eq!(
+            std::fs::read_to_string(home.join("from_file/new")).unwrap(),
+            "from file target"
+        );
+        assert_eq!(
+            std::fs::read_to_string(home.join("from_link/new")).unwrap(),
+            "from symlink target"
+        );
+        assert_eq!(
+            std::fs::read_to_string(outside.join("keep")).unwrap(),
+            "keep"
+        );
+        assert!(std::fs::read_dir(&home).unwrap().all(|entry| {
+            !entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .starts_with(".thegn-old-")
+        }));
+    }
+
+    #[test]
+    fn reserved_dotfile_source_names_fail_staging() {
+        use crate::config::{DotfileMode, DotfilesSpec};
+        let root = tempfile::tempdir().unwrap();
+        let source = root.path().join("source");
+        let home = root.path().join("bundle/home");
+        std::fs::create_dir(&source).unwrap();
+        std::fs::write(source.join(".thegn-stage-config"), "reserved").unwrap();
+        let spec = DotfilesSpec {
+            source: source.to_string_lossy().into_owned(),
+            mode: DotfileMode::Template,
+        };
+
+        assert_eq!(materialize_dotfiles(&spec, &home), 0);
+        assert!(!home.join(".thegn-stage-config").exists());
+        assert!(!home.join(".thegn-dotfiles.json").exists());
+        assert!(std::fs::read_dir(&home).unwrap().all(|entry| {
+            !entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .starts_with(".thegn-stage-")
+        }));
     }
 
     #[test]

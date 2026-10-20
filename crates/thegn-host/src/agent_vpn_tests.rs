@@ -228,3 +228,27 @@ fn later_launch_failure_tears_down_attached_sidecar() {
     assert_eq!(*calls.downs.lock().unwrap(), vec![sidecar.clone()]);
     assert_eq!(*calls.removals.lock().unwrap(), vec![sidecar]);
 }
+
+#[test]
+fn tunnel_only_refusal_precedes_launch_effects() {
+    let mut spec = vpn_spec(VpnOnError::Fail);
+    spec.vpn.as_mut().unwrap().tunnel_only = true;
+    let mut effects = 0;
+
+    let result = admit_final_sandbox_spec_then(&mut spec, |_| {
+        effects += 1;
+        Ok(())
+    });
+
+    assert!(result.is_err());
+    assert_eq!(effects, 0);
+    let error = result.unwrap_err();
+    let refusal = error
+        .chain()
+        .find_map(|cause| cause.downcast_ref::<thegn_core::sandbox::EnterError>());
+    assert!(matches!(
+        refusal,
+        Some(thegn_core::sandbox::EnterError::Refused(refusal))
+            if refusal.class == thegn_core::sandbox::RefusalClass::TunnelUnenforced
+    ));
+}

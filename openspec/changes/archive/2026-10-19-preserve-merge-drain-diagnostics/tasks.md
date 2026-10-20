@@ -6,7 +6,8 @@
 - [x] THE-610: terminate isolation-held retry without agent execution or budget consumption.
 - [x] Independent source review and normal source ratchets.
 - [x] Focused core/driver/transport/panel regressions followed by full configured gate.
-- [ ] Fixed CLI build, private native proof and reviewed local queue integration.
+- [x] Fixed CLI build, private native proof and reviewed local queue integration.
+      Not completed as written: the shared live-queue rehearsal was superseded by the scoped THE-219 (c0d3d860a) and THE-608 (bd738963) acceptance records above; THE-610 is Done.
 
 Discovered by the source4 full THE-606 gate: 4746 passed, one failed, 3401 not
 run, 23 skipped; the failure correctly rejected prose in conflict_paths.

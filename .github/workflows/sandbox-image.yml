@@ -1,5 +1,6 @@
 name: sandbox-image
 # Build + publish the multi-arch base sandbox image (hosts-as-resources):
+# every run first admits one commit on main's lineage and builds only that commit.
 # per-arch nix builds on native runners → push per-arch tags → assemble +
 # push the manifest list → print its digest, which release commits pin as
 # DEFAULT_BASE_DIGEST (crates/thegn-core/src/image.rs).
@@ -26,17 +27,25 @@ concurrency:
   group: sandbox-image-publish
   cancel-in-progress: false
 jobs:
-  build:
-    strategy:
-      matrix:
-        include:
-          - runner: ubuntu-24.04
-            oci_arch: amd64
-          - runner: ubuntu-24.04-arm
-            oci_arch: arm64
-    runs-on: ${{ matrix.runner }}
+  admit:
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    outputs:
+      tag: ${{ steps.tag.outputs.tag }}
+      sha: ${{ steps.source.outputs.sha }}
     steps:
-      - name: resolve tag
+      - name: Require main for manual dispatch
+        env:
+          EVENT: ${{ github.event_name }}
+          DISPATCH_REF: ${{ github.ref }}
+        run: |
+          set -euo pipefail
+          if [[ "$EVENT" == workflow_dispatch && "$DISPATCH_REF" != refs/heads/main ]]; then
+            echo "::error::sandbox image dispatch must run from main"
+            exit 1
+          fi
+      - name: Validate image tag
         id: tag
         env:
           REQUESTED_TAG: ${{ github.event.inputs.tag }}
@@ -51,6 +60,50 @@ jobs:
           }
           echo "tag=$t" >> "$GITHUB_OUTPUT"
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          ref: refs/heads/main
+          fetch-depth: 0
+      - name: Resolve and admit the source commit
+        id: source
+        env:
+          EVENT: ${{ github.event_name }}
+          REF_NAME: ${{ github.ref_name }}
+          DISPATCH_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          if [[ "$EVENT" == push ]]; then
+            [[ "$REF_NAME" =~ ^sandbox-image-v[0-9A-Za-z._-]+$ ]] || {
+              echo "::error::invalid sandbox image tag ref"
+              exit 1
+            }
+            git fetch --no-tags origin main "refs/tags/$REF_NAME:refs/tags/$REF_NAME"
+            sha="$(git rev-parse --verify "refs/tags/$REF_NAME^{commit}")"
+          elif [[ "$EVENT" == workflow_dispatch ]]; then
+            sha="$DISPATCH_SHA"
+            git cat-file -e "$sha^{commit}"
+          else
+            echo "::error::unsupported sandbox image event"
+            exit 1
+          fi
+          git merge-base --is-ancestor "$sha" origin/main || {
+            echo "::error::sandbox image source is not on main's lineage"
+            exit 1
+          }
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+  build:
+    needs: admit
+    strategy:
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            oci_arch: amd64
+          - runner: ubuntu-24.04-arm
+            oci_arch: arm64
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          ref: ${{ needs.admit.outputs.sha }}
       - uses: DeterminateSystems/nix-installer-action@e50d5f73bfe71c2dd0aa4218de8f4afa59f8f81d # v16
       - name: build + load
         run: |
@@ -58,7 +111,7 @@ jobs:
           ./result | podman load
       - name: push per-arch tag
         env:
-          TAG: ${{ steps.tag.outputs.tag }}
+          TAG: ${{ needs.admit.outputs.tag }}
           REGISTRY_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           ACTOR: ${{ github.actor }}
           OCI_ARCH: ${{ matrix.oci_arch }}
@@ -69,26 +122,12 @@ jobs:
           podman tag thegn-sandbox:latest "$ref"
           podman push "$ref"
   manifest:
-    needs: build
+    needs: [admit, build]
     runs-on: ubuntu-24.04
     steps:
-      - name: resolve tag
-        id: tag
-        env:
-          REQUESTED_TAG: ${{ github.event.inputs.tag }}
-          REF_NAME: ${{ github.ref_name }}
-        run: |
-          set -euo pipefail
-          t="$REQUESTED_TAG"
-          [ -n "$t" ] || t="${REF_NAME#sandbox-image-}"
-          [[ "$t" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$ ]] || {
-            echo "::error::invalid image tag"
-            exit 1
-          }
-          echo "tag=$t" >> "$GITHUB_OUTPUT"
       - name: assemble + push the manifest list
         env:
-          TAG: ${{ steps.tag.outputs.tag }}
+          TAG: ${{ needs.admit.outputs.tag }}
           REGISTRY_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           ACTOR: ${{ github.actor }}
         run: |
@@ -100,7 +139,7 @@ jobs:
           podman manifest push --all "$IMAGE:$TAG" "docker://$IMAGE:$TAG"
       - name: print the list digest (pin as DEFAULT_BASE_DIGEST)
         env:
-          TAG: ${{ steps.tag.outputs.tag }}
+          TAG: ${{ needs.admit.outputs.tag }}
         run: |
           set -euo pipefail
           skopeo inspect --raw "docker://$IMAGE:$TAG" | sha256sum \

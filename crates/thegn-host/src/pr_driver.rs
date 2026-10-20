@@ -3106,4 +3106,222 @@ mod tests {
         assert_eq!(second.dropped, vec![7]);
         assert!(second.merged.is_empty());
     }
+
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "driver identity fixtures run hermetic git commands"
+    )]
+    fn git_status(dir: &Path, args: &[&str]) {
+        let status = thegn_core::util::git_cmd(dir)
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .args(args)
+            .status()
+            .unwrap();
+        assert!(status.success(), "git {args:?} failed in {}", dir.display());
+    }
+
+    fn ci_agent_config(sentinel: &Path) -> PrQueueConfig {
+        PrQueueConfig {
+            watch: vec![PrWatchKind::Ci],
+            own_prs_only: false,
+            agent_command: format!("touch {}", sentinel.display()),
+            ..cfg()
+        }
+    }
+
+    fn assert_ci_agent_held_without_effects(
+        checkout: &Path,
+        db: &Db,
+        row: &PrItem,
+        forge: &FakeForge,
+        config: &PrQueueConfig,
+        sentinel: &Path,
+    ) {
+        let out = drive_queue(
+            config,
+            &Config::default(),
+            forge,
+            checkout,
+            db,
+            vec![row.clone()],
+            |_| {},
+        );
+        assert!(out.needs_human.contains(&7), "{out:?}");
+        assert!(
+            forge
+                .calls()
+                .iter()
+                .all(|call| !call.starts_with("rerun") && !call.starts_with("merge")),
+            "unexpected forge mutation: {:?}",
+            forge.calls()
+        );
+        assert!(!sentinel.exists(), "agent callback ran");
+        let held = db.list_pr_queue().unwrap().remove(0);
+        assert_eq!(held.status, PrqStatus::NeedsHuman.as_str());
+        assert_eq!(held.ci_rerun_head, None);
+        assert_eq!(held.agent_attempts, 0);
+    }
+
+    #[test]
+    fn origin_moved_to_another_project_holds_before_any_effect() {
+        let (dir, db) = temp_db("prq-origin-moved-project");
+        let (checkout, row) =
+            enqueue_pr_with_checkout(&dir, &db, 7, "feat", "https://github.com/me/repo/pull/7");
+        git_status(
+            &checkout,
+            &[
+                "remote",
+                "set-url",
+                "origin",
+                "https://github.com/other/repo",
+            ],
+        );
+        let mut moved = failing_ci_pr("abc");
+        moved.url = "https://github.com/other/repo/pull/7".into();
+        let forge = FakeForge::new(Some(failing_ci_pr("abc")))
+            .with_status_sequence(vec![failing_ci_pr("abc"), moved]);
+        let sentinel = dir.path().join("agent-ran");
+        let config = ci_agent_config(&sentinel);
+
+        assert_ci_agent_held_without_effects(&checkout, &db, &row, &forge, &config, &sentinel);
+        assert!(
+            db.list_pr_queue().unwrap()[0]
+                .detail
+                .as_deref()
+                .is_some_and(|detail| detail.contains("identity"))
+        );
+    }
+
+    #[test]
+    fn forge_host_change_holds_before_any_effect() {
+        let (dir, db) = temp_db("prq-forge-host-changed");
+        let (_checkout, row) =
+            enqueue_pr_with_checkout(&dir, &db, 7, "feat", "https://github.com/me/repo/pull/7");
+        let mut changed = green_pr();
+        changed.url = "https://github.example.com/me/repo/pull/7".into();
+        let forge =
+            FakeForge::new(Some(green_pr())).with_status_sequence(vec![green_pr(), changed]);
+        let mut config = cfg();
+        config.merge_mode = thegn_core::config::PrMergeMode::Thegn;
+        db.update_pr_status(&row.key, "ready", None, None, Some("abc"))
+            .unwrap();
+
+        let out = drive_queue(
+            &config,
+            &Config::default(),
+            &forge,
+            Path::new("/repo"),
+            &db,
+            vec![row],
+            |_| {},
+        );
+        assert!(out.needs_human.contains(&7), "{out:?}");
+        assert!(
+            forge
+                .calls()
+                .iter()
+                .all(|call| !call.starts_with("merge") && !call.starts_with("rerun"))
+        );
+        let held = db.list_pr_queue().unwrap().remove(0);
+        assert_eq!(held.status, PrqStatus::NeedsHuman.as_str());
+        assert_eq!(held.agent_attempts, 0);
+        assert_eq!(held.ci_rerun_head, None);
+        assert!(
+            held.detail
+                .as_deref()
+                .is_some_and(|detail| detail.contains("identity"))
+        );
+    }
+
+    #[test]
+    fn deleted_checkout_holds_before_any_effect() {
+        let (dir, db) = temp_db("prq-deleted-checkout");
+        let (checkout, row) =
+            enqueue_pr_with_checkout(&dir, &db, 7, "feat", "https://github.com/me/repo/pull/7");
+        std::fs::remove_dir_all(&checkout).unwrap();
+        let pr = green_pr();
+        let forge = FakeForge::new(Some(pr.clone())).with_status_sequence(vec![pr.clone(), pr]);
+        let sentinel = dir.path().join("agent-ran");
+        let mut config = cfg();
+        config.merge_mode = thegn_core::config::PrMergeMode::Thegn;
+        db.update_pr_status(&row.key, "ready", None, None, Some("abc"))
+            .unwrap();
+
+        let out = drive_queue(
+            &config,
+            &Config::default(),
+            &forge,
+            &checkout,
+            &db,
+            vec![row],
+            |_| {},
+        );
+        assert!(out.needs_human.contains(&7), "{out:?}");
+        assert!(
+            forge
+                .calls()
+                .iter()
+                .all(|call| !call.starts_with("merge") && !call.starts_with("rerun"))
+        );
+        assert!(!sentinel.exists());
+        let held = db.list_pr_queue().unwrap().remove(0);
+        assert_eq!(held.status, PrqStatus::NeedsHuman.as_str());
+        assert_eq!(held.agent_attempts, 0);
+        assert_eq!(held.ci_rerun_head, None);
+        assert!(
+            held.detail
+                .as_deref()
+                .is_some_and(|detail| detail.contains("thegn pr queue rebind --pr 7"))
+        );
+    }
+
+    #[test]
+    fn reused_checkout_path_with_another_repository_holds() {
+        let (dir, db) = temp_db("prq-reused-checkout-other-repo");
+        let (checkout, row) =
+            enqueue_pr_with_checkout(&dir, &db, 7, "feat", "https://github.com/me/repo/pull/7");
+        std::fs::remove_dir_all(&checkout).unwrap();
+        std::fs::create_dir(&checkout).unwrap();
+        git_repo_on_branch(&checkout, "feat");
+        git_status(
+            &checkout,
+            &["remote", "add", "origin", "https://github.com/other/repo"],
+        );
+        let mut moved = failing_ci_pr("abc");
+        moved.url = "https://github.com/other/repo/pull/7".into();
+        let forge = FakeForge::new(Some(failing_ci_pr("abc")))
+            .with_status_sequence(vec![failing_ci_pr("abc"), moved]);
+        let sentinel = dir.path().join("agent-ran");
+        let config = ci_agent_config(&sentinel);
+
+        assert_ci_agent_held_without_effects(&checkout, &db, &row, &forge, &config, &sentinel);
+    }
+
+    #[test]
+    fn renamed_checkout_branch_holds_before_dispatch() {
+        let (dir, db) = temp_db("prq-renamed-checkout-branch");
+        let (checkout, row) =
+            enqueue_pr_with_checkout(&dir, &db, 7, "feat", "https://github.com/me/repo/pull/7");
+        git_status(&checkout, &["branch", "-m", "feat-renamed"]);
+        let pr = failing_ci_pr("abc");
+        let forge = FakeForge::new(Some(pr.clone())).with_status_sequence(vec![pr.clone(), pr]);
+        let sentinel = dir.path().join("agent-ran");
+        let config = ci_agent_config(&sentinel);
+
+        assert_ci_agent_held_without_effects(&checkout, &db, &row, &forge, &config, &sentinel);
+    }
+
+    #[test]
+    fn switched_checkout_branch_holds_before_dispatch() {
+        let (dir, db) = temp_db("prq-switched-checkout-branch");
+        let (checkout, row) =
+            enqueue_pr_with_checkout(&dir, &db, 7, "feat", "https://github.com/me/repo/pull/7");
+        git_status(&checkout, &["checkout", "-b", "other"]);
+        let pr = failing_ci_pr("abc");
+        let forge = FakeForge::new(Some(pr.clone())).with_status_sequence(vec![pr.clone(), pr]);
+        let sentinel = dir.path().join("agent-ran");
+        let config = ci_agent_config(&sentinel);
+
+        assert_ci_agent_held_without_effects(&checkout, &db, &row, &forge, &config, &sentinel);
+    }
 }
