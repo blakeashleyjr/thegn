@@ -1862,8 +1862,8 @@ check "dispatch put creates a stage-less plain row" \
 # --- run-completion contract (THE-76): wait / verify / the gated done --------
 # The wait verbs answer from the local roster alone when the selection has
 # nothing to wait on — they must not require (or contact) a daemon, so the
-# error text is the roster's, never the no-daemon message. Row 1 (from above)
-# is `queued`: not a live worker, so `--any` has nothing to wait on.
+# error text is the roster's, never the no-daemon message. The plain row from
+# above is `queued`: not a live worker, so `--any` has nothing to wait on.
 set +e
 wany_out="$("$SZ" dispatch wait --any --timeout 5 2>&1)"
 wany_rc=$?

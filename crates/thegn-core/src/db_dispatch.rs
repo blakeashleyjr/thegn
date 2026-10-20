@@ -184,7 +184,7 @@ pub fn set_status_transition_allowed(from: AgentDispatchStatus, to: AgentDispatc
             from.is_active()
                 || matches!(
                     (from, to),
-                    (Done, Abandoned) | (Failed, Abandoned) | (Unknown, Failed)
+                    (Done, Abandoned) | (Failed, Abandoned) | (Unknown, Failed | Abandoned)
                 )
         }
     }
@@ -3020,7 +3020,7 @@ mod tests {
                         Spawning | Running | WaitingHuman | PrOpen | Abandoned | Failed
                     ) | (
                         Spawning,
-                        Spawning | Running | WaitingHuman | PrOpen | Abandoned | Failed
+                        Spawning | Running | WaitingHuman | PrOpen | Done | Abandoned | Failed
                     ) | (
                         Running,
                         Spawning | Running | WaitingHuman | PrOpen | Done | Abandoned | Failed
@@ -3224,9 +3224,11 @@ mod tests {
         {
             let db = Db::open_at(&path).unwrap();
             id = put_row(&db, "linear:THE-270", "/wt/forced");
+            db.update_dispatch_status(id, AgentDispatchStatus::Running)
+                .unwrap();
             db.set_dispatch_status_forced(
                 id,
-                AgentDispatchStatus::Queued,
+                AgentDispatchStatus::Running,
                 AgentDispatchStatus::Done,
                 "reviewed exception",
             )
@@ -3253,12 +3255,14 @@ mod tests {
     fn forced_done_refuses_bad_reason_wrong_target_and_stale_cas_without_writes() {
         let db = Db::open_memory().unwrap();
         let id = put_row(&db, "linear:THE-270-B", "/wt/forced-bad");
+        db.update_dispatch_status(id, AgentDispatchStatus::Running)
+            .unwrap();
         let oversized_reason = "x".repeat(FORCE_REASON_MAX_CHARS + 1);
         for reason in ["", "   ", oversized_reason.as_str()] {
             assert!(
                 db.set_dispatch_status_forced(
                     id,
-                    AgentDispatchStatus::Queued,
+                    AgentDispatchStatus::Running,
                     AgentDispatchStatus::Done,
                     reason,
                 )
@@ -3266,7 +3270,7 @@ mod tests {
             );
             assert_eq!(
                 db.get_dispatch(id).unwrap().unwrap().status,
-                AgentDispatchStatus::Queued
+                AgentDispatchStatus::Running
             );
             assert!(db.dispatch_override(id).unwrap().is_none());
             assert_eq!(db.dispatch_note_count(id, None).unwrap(), 0);
@@ -3274,7 +3278,7 @@ mod tests {
         assert!(
             db.set_dispatch_status_forced(
                 id,
-                AgentDispatchStatus::Queued,
+                AgentDispatchStatus::Running,
                 AgentDispatchStatus::Running,
                 "wrong gate",
             )
@@ -3307,6 +3311,8 @@ mod tests {
     fn forced_done_rolls_back_status_and_override_when_note_insert_fails() {
         let db = Db::open_memory().unwrap();
         let id = put_row(&db, "linear:THE-270-ROLLBACK", "/wt/forced-rollback");
+        db.update_dispatch_status(id, AgentDispatchStatus::Running)
+            .unwrap();
         db.conn()
             .execute_batch(
                 "CREATE TRIGGER reject_forced_note BEFORE INSERT ON agent_dispatch_notes
@@ -3316,7 +3322,7 @@ mod tests {
         assert!(
             db.set_dispatch_status_forced(
                 id,
-                AgentDispatchStatus::Queued,
+                AgentDispatchStatus::Running,
                 AgentDispatchStatus::Done,
                 "reason",
             )
@@ -3324,7 +3330,7 @@ mod tests {
         );
         assert_eq!(
             db.get_dispatch(id).unwrap().unwrap().status,
-            AgentDispatchStatus::Queued
+            AgentDispatchStatus::Running
         );
         assert!(db.dispatch_override(id).unwrap().is_none());
         assert_eq!(db.dispatch_note_count(id, None).unwrap(), 0);

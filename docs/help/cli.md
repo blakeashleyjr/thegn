@@ -273,6 +273,7 @@ only `done` → `merged` or `abandoned`, and `failed` → `done` or `abandoned`.
 With `--json`, a classified refusal prints `{"error": ..., "id": ..., "message":
 ...}` with an error kind of `illegal_transition`, `stale`, `missing_evidence` or
 `missing_row` before the command fails.
+
 Finished rows (not review tasks) older than 90 days are pruned during
 background maintenance unless their worktree is still registered, an active
 autopilot run uses them, or a retained child points to them. `thegn db vacuum`
