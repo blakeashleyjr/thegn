@@ -801,6 +801,102 @@ pub(crate) fn sweep_stale_label_files_in(
     }
 }
 
+pub(crate) fn sweep_stale_adoption_records_in(
+    state_home: &Path,
+    live_worktrees: &[String],
+    now: std::time::SystemTime,
+    min_age: Duration,
+) -> usize {
+    if live_worktrees.is_empty() {
+        return 0;
+    }
+
+    let rel = Path::new("thegn/compose-projects");
+    let dir = state_home.join(rel);
+    match std::fs::symlink_metadata(&dir) {
+        Ok(metadata) if metadata.file_type().is_dir() => {}
+        Ok(_) => return 0,
+        Err(error) => {
+            tracing::debug!(target: "thegn::sandbox", %error, "unable to inspect Compose adoption directory");
+            return 0;
+        }
+    }
+    let _directory = match crate::fsperm::ensure_private_dir_beneath(state_home, rel) {
+        Ok(directory) => directory,
+        Err(error) => {
+            tracing::debug!(target: "thegn::sandbox", %error, "unable to pin Compose adoption directory");
+            return 0;
+        }
+    };
+
+    let live_slugs = live_worktrees
+        .iter()
+        .map(|worktree| crate::util::slugify(worktree))
+        .collect::<Vec<_>>();
+    let entries = match std::fs::read_dir(&dir) {
+        Ok(entries) => entries,
+        Err(error) => {
+            tracing::debug!(target: "thegn::sandbox", %error, "unable to enumerate Compose adoption records");
+            return 0;
+        }
+    };
+    let mut removed = 0;
+    for entry in entries {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(error) => {
+                tracing::debug!(target: "thegn::sandbox", %error, "unable to inspect Compose adoption entry");
+                continue;
+            }
+        };
+        if !entry.file_name().to_string_lossy().ends_with(".adopted") {
+            continue;
+        }
+        let path = entry.path();
+        let metadata = match std::fs::symlink_metadata(&path) {
+            Ok(metadata) if metadata.file_type().is_file() => metadata,
+            Ok(_) => continue,
+            Err(error) => {
+                tracing::debug!(target: "thegn::sandbox", %error, "unable to inspect Compose adoption record");
+                continue;
+            }
+        };
+        let Ok(modified) = metadata.modified() else {
+            continue;
+        };
+        let Ok(age) = now.duration_since(modified) else {
+            continue;
+        };
+        if metadata.len() > 4096 || age < min_age {
+            continue;
+        }
+        let body = match std::fs::read_to_string(&path) {
+            Ok(body) => body,
+            Err(error) => {
+                tracing::debug!(target: "thegn::sandbox", %error, "unable to read Compose adoption record");
+                continue;
+            }
+        };
+        let body = body.trim();
+        if !body.starts_with(crate::sandbox::CONTAINER_PREFIX)
+            || !adoption_record_is_stale(body, &live_slugs)
+        {
+            continue;
+        }
+        match std::fs::remove_file(&path) {
+            Ok(()) => removed += 1,
+            Err(error) => {
+                tracing::debug!(target: "thegn::sandbox", %error, "unable to remove stale Compose adoption record")
+            }
+        }
+    }
+    removed
+}
+
+fn adoption_record_is_stale(body: &str, live_slugs: &[String]) -> bool {
+    !live_slugs.iter().any(|slug| body.ends_with(slug))
+}
+
 /// `docker compose … up -d [service runServices…]`. Pure.
 pub(crate) fn up_argv(target: &ComposeTarget, project: &str, c: &ComposeSpec) -> Vec<String> {
     let mut v = project_prefix(target, project, c);
@@ -1540,6 +1636,153 @@ mod tests {
             ),
             Err(ComposeError::Spawn)
         );
+    }
+
+    fn write_adoption_record(state_home: &Path, file_name: &str, body: &str) -> PathBuf {
+        crate::fsperm::ensure_private_dir_beneath(state_home, Path::new("thegn/compose-projects"))
+            .expect("private adoption directory")
+            .write_owner_only_atomic(file_name, body.as_bytes())
+            .expect("write adoption record")
+    }
+
+    #[test]
+    fn adoption_record_sweep_removes_records_of_vanished_worktrees() {
+        let state = crate::testenv::IsolatedState::new();
+        let state_home = state.state_home();
+        std::fs::create_dir_all(&state_home).expect("isolated state home exists");
+        let live_record = write_adoption_record(
+            &state_home,
+            "live.adopted",
+            &crate::sandbox::container_name("/live/wt"),
+        );
+        let gone_record = write_adoption_record(
+            &state_home,
+            "gone.adopted",
+            &crate::sandbox::container_name("/gone/wt"),
+        );
+        let now = std::time::SystemTime::now() + Duration::from_secs(7200);
+
+        let removed = sweep_stale_adoption_records_in(
+            &state_home,
+            &["/live/wt".into()],
+            now,
+            Duration::from_secs(3600),
+        );
+
+        assert_eq!(removed, 1);
+        assert!(live_record.exists());
+        assert!(!gone_record.exists());
+    }
+
+    #[test]
+    fn adoption_record_sweep_keeps_named_profile_records_of_live_worktrees() {
+        let state = crate::testenv::IsolatedState::new();
+        let state_home = state.state_home();
+        std::fs::create_dir_all(&state_home).expect("isolated state home exists");
+        let record = write_adoption_record(
+            &state_home,
+            "profile.adopted",
+            &crate::sandbox::container_name_with_profile("/live/wt", Some("work")),
+        );
+
+        let removed = sweep_stale_adoption_records_in(
+            &state_home,
+            &["/live/wt".into()],
+            std::time::SystemTime::now() + Duration::from_secs(7200),
+            Duration::from_secs(3600),
+        );
+
+        assert_eq!(removed, 0);
+        assert!(record.exists());
+    }
+
+    #[test]
+    fn adoption_record_sweep_keeps_young_records_and_does_nothing_without_a_registry() {
+        let state = crate::testenv::IsolatedState::new();
+        let state_home = state.state_home();
+        std::fs::create_dir_all(&state_home).expect("isolated state home exists");
+        let young_record = write_adoption_record(
+            &state_home,
+            "young.adopted",
+            &crate::sandbox::container_name("/gone/wt"),
+        );
+        let empty_registry_record = write_adoption_record(
+            &state_home,
+            "empty-registry.adopted",
+            &crate::sandbox::container_name("/gone/other"),
+        );
+        let min_age = Duration::from_secs(3600);
+
+        let young_removed = sweep_stale_adoption_records_in(
+            &state_home,
+            &["/live/wt".into()],
+            std::time::SystemTime::now(),
+            min_age,
+        );
+        let empty_registry_removed = sweep_stale_adoption_records_in(
+            &state_home,
+            &[],
+            std::time::SystemTime::now() + Duration::from_secs(7200),
+            min_age,
+        );
+
+        assert_eq!(young_removed, 0);
+        assert_eq!(empty_registry_removed, 0);
+        assert!(young_record.exists());
+        assert!(empty_registry_record.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn adoption_record_sweep_skips_symlinks_and_foreign_files() {
+        let state = crate::testenv::IsolatedState::new();
+        let state_home = state.state_home();
+        std::fs::create_dir_all(&state_home).expect("isolated state home exists");
+        let symlink_target = state_home.join("outside.adopted");
+        std::fs::write(&symlink_target, "thegn-gone").expect("write symlink target");
+        let adoption_dir = state_home.join("thegn/compose-projects");
+        std::fs::create_dir_all(&adoption_dir).expect("create adoption directory");
+        let symlink_record = adoption_dir.join("link.adopted");
+        std::os::unix::fs::symlink(&symlink_target, &symlink_record)
+            .expect("create adoption symlink");
+        let notes = write_adoption_record(&state_home, "notes.txt", "thegn-gone");
+        let foreign = write_adoption_record(&state_home, "foreign.adopted", "other-gone");
+        let oversized_body = format!("thegn-{}", "x".repeat(4096));
+        let oversized = write_adoption_record(&state_home, "oversized.adopted", &oversized_body);
+
+        let removed = sweep_stale_adoption_records_in(
+            &state_home,
+            &["/live/wt".into()],
+            std::time::SystemTime::now() + Duration::from_secs(7200),
+            Duration::from_secs(3600),
+        );
+
+        assert_eq!(removed, 0);
+        assert!(std::fs::symlink_metadata(&symlink_record).is_ok());
+        assert_eq!(
+            std::fs::read_to_string(&symlink_target).unwrap(),
+            "thegn-gone"
+        );
+        assert!(notes.exists());
+        assert!(foreign.exists());
+        assert!(oversized.exists());
+    }
+
+    #[test]
+    fn adoption_record_is_stale_table() {
+        let live_slugs = vec!["live-wt".to_string(), "profile-live-wt".to_string()];
+        for (body, expected) in [
+            ("thegn-gone", true),
+            ("thegn-live-wt", false),
+            ("thegn-profile-live-wt", false),
+            ("thegn-live-wt-extra", true),
+        ] {
+            assert_eq!(
+                adoption_record_is_stale(body, &live_slugs),
+                expected,
+                "{body}"
+            );
+        }
     }
 
     #[cfg(unix)]
