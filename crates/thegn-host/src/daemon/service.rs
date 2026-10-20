@@ -1133,8 +1133,9 @@ impl ControlApi for DaemonService {
                 };
                 if let Some(row) = row {
                     let sid = id.clone();
-                    let (bind_result, row_kind) = self
+                    let (bind_result, row_kind) = match self
                         .with_db(move |db| match db.bind_dispatch_session(row, &sid) {
+                            // The row kind is immaterial for a successful bind.
                             Ok(true) => Ok((Ok(false), BoundRowKind::Unknown)),
                             Ok(false) => match db.get_dispatch(row) {
                                 Ok(stored) => {
@@ -1150,12 +1151,16 @@ impl ControlApi for DaemonService {
                                 Ok((Err(error.to_string()), kind))
                             }
                         })
-                        .await;
-                    let bind_error = bind_result.as_ref().err().map(ToString::to_string);
+                        .await
+                    {
+                        Ok(pair) => pair,
+                        Err(error) => (Err(error.to_string()), BoundRowKind::Unknown),
+                    };
+                    let bind_error = bind_result.as_ref().err().cloned();
                     let action = bind_failure_action(
                         row,
                         effective_stage_launch(stage_launch, row_kind),
-                        bind_result.map_err(|error| error.to_string()),
+                        bind_result,
                     );
                     if let Some(error) = bind_error {
                         tracing::warn!(target: "thegn::dispatch", "bind dispatch row {row}: {error}");
