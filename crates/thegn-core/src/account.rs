@@ -38,6 +38,8 @@ pub enum AccountHomeError {
     ForeignManifest { provider: String, name: String },
     /// The existing manifest is not a valid versioned owner record.
     MalformedManifest { path: PathBuf },
+    /// A managed account row points somewhere other than its canonical home.
+    RelocatedManagedHome { stored: PathBuf, expected: PathBuf },
     /// The requested provider is not account-switchable.
     UnknownProvider { provider: String },
 }
@@ -61,6 +63,12 @@ impl std::fmt::Display for AccountHomeError {
                     path.display()
                 )
             }
+            Self::RelocatedManagedHome { stored, expected } => write!(
+                f,
+                "managed account home {} is not the expected managed home {}; log in to the account again to recreate it (the old directory is left untouched)",
+                stored.display(),
+                expected.display()
+            ),
             Self::UnknownProvider { provider } => {
                 write!(f, "unknown account provider {provider:?}")
             }
@@ -366,7 +374,13 @@ pub fn account_dir(cfg: &Config, db: &Db, provider_id: &str, name: &str) -> Opti
         return None;
     }
     let (_, dir, managed) = entries.into_iter().find(|(n, _, _)| n == name)?;
-    if managed && dir == managed_dir(provider_id, name) {
+    if managed && let Err(error) = managed_home_check(provider_id, name, &dir) {
+        crate::msg::warn(&format!(
+            "account '{name}' has a relocated managed credential home; refusing to use it: {error}"
+        ));
+        return None;
+    }
+    if managed {
         match ensure_managed_home(provider_id, name) {
             Ok(verified) => Some(verified),
             Err(error) => {
@@ -378,6 +392,22 @@ pub fn account_dir(cfg: &Config, db: &Db, provider_id: &str, name: &str) -> Opti
         }
     } else {
         Some(dir)
+    }
+}
+
+fn managed_home_check(
+    provider_id: &str,
+    name: &str,
+    stored: &Path,
+) -> Result<(), AccountHomeError> {
+    let expected = managed_dir(provider_id, name);
+    if stored == expected {
+        Ok(())
+    } else {
+        Err(AccountHomeError::RelocatedManagedHome {
+            stored: stored.to_path_buf(),
+            expected,
+        })
     }
 }
 
@@ -673,10 +703,7 @@ mod tests {
         assert_eq!(account_dir(&cfg, &db, "codex", "db-only"), None);
         db.put_account("codex", "db-only", "/var/creds", true, 1)
             .unwrap();
-        assert_eq!(
-            account_dir(&cfg, &db, "codex", "db-only"),
-            Some(PathBuf::from("/var/creds"))
-        );
+        assert_eq!(account_dir(&cfg, &db, "codex", "db-only"), None);
     }
 
     #[test]
@@ -1311,5 +1338,65 @@ mod tests {
             Err(AccountHomeError::UnknownProvider { provider }) if provider == "../../outside"
         ));
         assert!(!state.state_home().join("thegn").exists());
+    }
+
+    #[test]
+    fn managed_row_pointing_elsewhere_is_refused() {
+        let state = crate::testenv::IsolatedState::new();
+        let db = Db::open_memory().unwrap();
+        let stored = state.root().join("edited-managed-home");
+        std::fs::create_dir(&stored).unwrap();
+        crate::fsperm::restrict_dir_to_owner(&stored).unwrap();
+        db.put_account("codex", "primary", &stored.to_string_lossy(), true, 1)
+            .unwrap();
+
+        assert_eq!(
+            account_dir(&Config::default(), &db, "codex", "primary"),
+            None
+        );
+        assert!(stored.is_dir());
+        assert!(!managed_dir("codex", "primary").exists());
+    }
+
+    #[test]
+    fn managed_row_with_a_legacy_slug_path_is_refused() {
+        let _state = crate::testenv::IsolatedState::new();
+        let db = Db::open_memory().unwrap();
+        let stored = managed_root().join("codex").join("work");
+        std::fs::create_dir_all(&stored).unwrap();
+        crate::fsperm::restrict_dir_to_owner(&stored).unwrap();
+        db.put_account("codex", "Work", &stored.to_string_lossy(), true, 1)
+            .unwrap();
+
+        assert_eq!(account_dir(&Config::default(), &db, "codex", "Work"), None);
+        assert!(stored.is_dir());
+        assert!(!managed_dir("codex", "Work").exists());
+    }
+
+    #[test]
+    fn managed_row_check_reports_both_paths() {
+        let _state = crate::testenv::IsolatedState::new();
+        let stored = Path::new("/elsewhere");
+
+        assert!(matches!(
+            managed_home_check("codex", "primary", stored),
+            Err(AccountHomeError::RelocatedManagedHome { stored: actual, expected })
+                if actual == stored && expected == managed_dir("codex", "primary")
+        ));
+    }
+
+    #[test]
+    fn managed_row_adopted_dir_still_resolves() {
+        let state = crate::testenv::IsolatedState::new();
+        let db = Db::open_memory().unwrap();
+        let adopted = state.root().join("adopted-home");
+        std::fs::create_dir(&adopted).unwrap();
+        db.put_account("codex", "primary", &adopted.to_string_lossy(), false, 1)
+            .unwrap();
+
+        assert_eq!(
+            account_dir(&Config::default(), &db, "codex", "primary"),
+            Some(adopted)
+        );
     }
 }
