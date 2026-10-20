@@ -103,15 +103,15 @@ impl EgressSteps for BlockingProviderEgress<'_> {
     fn apply(&self, id: &str, allow: &[String], block: &[String]) -> Result<()> {
         crate::agent::block_on_provider(|| async {
             self.provider.set_network_policy(id, allow, block).await
-        })?
+        })
     }
 
     fn read_back(&self, id: &str) -> Result<Vec<thegn_svc::provider::PolicyRule>> {
-        crate::agent::block_on_provider(|| async { self.provider.get_network_policy(id).await })?
+        crate::agent::block_on_provider(|| async { self.provider.get_network_policy(id).await })
     }
 
     fn destroy(&self, id: &str) -> Result<()> {
-        crate::agent::block_on_provider(|| async { self.provider.destroy(id).await })?
+        crate::agent::block_on_provider(|| async { self.provider.destroy(id).await })
     }
 }
 
