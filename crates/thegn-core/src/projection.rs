@@ -36,6 +36,37 @@ pub struct ProjectionSpec {
 }
 
 impl ProjectionSpec {
+    /// Stable, domain-separated identity for ownership of this projection.
+    /// This is distinct from the mountpoint component: the manifest binds the
+    /// complete operation identity, including mode and the final local path.
+    pub fn identity_digest(&self) -> String {
+        let mut hasher = Sha256::new();
+        hasher.update(b"thegn/projection-identity/v1");
+        let mode = match self.mode {
+            DataMode::InEnv => "in_env",
+            DataMode::LocalExec => "local_exec",
+            DataMode::Sshfs => "sshfs",
+            DataMode::Sync => "sync",
+        };
+        hash_projection_field(&mut hasher, b"mode", mode.as_bytes());
+        if let Placement::Ssh(ssh) = &self.placement {
+            hash_projection_field(&mut hasher, b"host", ssh.host.as_bytes());
+            hash_projection_field(&mut hasher, b"port", &ssh.port.to_be_bytes());
+            hash_projection_option(&mut hasher, b"ssh_config", ssh.ssh_config.as_deref());
+            hash_projection_option(&mut hasher, b"jump_host", ssh.jump_host.as_deref());
+            hash_projection_option(&mut hasher, b"identity", ssh.identity.as_deref());
+        } else {
+            hash_projection_field(&mut hasher, b"placement", b"other");
+        }
+        hash_projection_field(&mut hasher, b"remote_dir", self.remote_dir.as_bytes());
+        hash_projection_field(&mut hasher, b"mountpoint", self.mountpoint.as_bytes());
+        hasher
+            .finalize()
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect()
+    }
+
     /// Pre-identity mountpoint candidates for ssh placements that are safe to target.
     ///
     /// The legacy slug collapses distinct `(host, path)` pairs, which is why
@@ -532,5 +563,57 @@ mod tests {
         ] {
             assert_eq!(legacy_reap_action(mounted, is_real_dir, is_empty), expected);
         }
+    }
+
+    #[test]
+    fn projection_identity_digest_is_stable_and_covers_identity_fields() {
+        let base = ProjectionSpec {
+            mode: DataMode::Sync,
+            placement: Placement::Ssh(ssh_placement()),
+            remote_dir: "/srv/work".into(),
+            mountpoint: "/tmp/mounts/work".into(),
+        };
+        let digest = base.identity_digest();
+        assert_eq!(digest, base.identity_digest());
+
+        let mut variants = Vec::new();
+        let mut changed = base.clone();
+        changed.mode = DataMode::InEnv;
+        variants.push(changed);
+        let mut changed = base.clone();
+        changed.mode = DataMode::LocalExec;
+        variants.push(changed);
+        let mut changed = base.clone();
+        changed.mode = DataMode::Sshfs;
+        variants.push(changed);
+        let mut changed = base.clone();
+        changed.remote_dir.push_str("-other");
+        variants.push(changed);
+        let mut changed = base.clone();
+        changed.mountpoint.push_str("-other");
+        variants.push(changed);
+        let mut changed = base.clone();
+        changed.placement = Placement::Local;
+        variants.push(changed);
+        let ssh_changes: [fn(&mut SshPlacement); 5] = [
+            |ssh: &mut SshPlacement| ssh.host.push_str("-other"),
+            |ssh: &mut SshPlacement| ssh.port += 1,
+            |ssh: &mut SshPlacement| ssh.ssh_config = Some("/cfg/ssh".into()),
+            |ssh: &mut SshPlacement| ssh.jump_host = Some("bastion".into()),
+            |ssh: &mut SshPlacement| ssh.identity = Some("/keys/id".into()),
+        ];
+        for change_ssh in ssh_changes {
+            let mut changed = base.clone();
+            let Placement::Ssh(ssh) = &mut changed.placement else {
+                unreachable!()
+            };
+            change_ssh(ssh);
+            variants.push(changed);
+        }
+        assert!(
+            variants
+                .iter()
+                .all(|variant| variant.identity_digest() != digest)
+        );
     }
 }
