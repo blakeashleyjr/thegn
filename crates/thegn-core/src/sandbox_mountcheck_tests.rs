@@ -241,6 +241,7 @@ fn reattest_source() -> (tempfile::TempDir, PathBuf) {
 
 fn reattest_mount_spec(source: PathBuf) -> SandboxSpec {
     let mut s = spec(Backend::Podman);
+    let source = source.to_string_lossy().into_owned();
     s.mounts = vec![Mount {
         host: source.clone(),
         dest: source,
@@ -276,14 +277,15 @@ fn reattest_dir_swapped_for_symlink_is_drift() {
     std::os::unix::fs::symlink(&target, &source).unwrap();
 
     let drift = identity_drift(&admitted, &|p| mount_identity(std::path::Path::new(p)));
+    let source_path = source.to_string_lossy().into_owned();
     assert!(
         drift
             .as_ref()
-            .is_some_and(|why| why.contains(&source.to_string_lossy().to_string()))
+            .is_some_and(|(path, why)| path == &source_path && why.contains(&source_path))
     );
     assert!(matches!(
         post_create_verdict(true, true, drift),
-        PostCreate::Drift(_)
+        PostCreate::Drift { .. }
     ));
 }
 
@@ -317,7 +319,7 @@ fn reattest_missing_source_is_drift() {
 fn reattest_inspect_mismatch_is_drift_and_not_running_falls_through() {
     assert!(matches!(
         post_create_verdict(true, false, None),
-        PostCreate::Drift(_)
+        PostCreate::Drift { .. }
     ));
     assert_eq!(
         post_create_verdict(false, false, None),
@@ -335,10 +337,13 @@ fn reattest_ro_and_cache_mounts_are_not_tracked() {
     let writable = root.path().join("rw");
     let read_only = root.path().join("ro");
     let cache = root.path().join("cache");
+    let writable = writable.to_string_lossy().into_owned();
+    let read_only = read_only.to_string_lossy().into_owned();
+    let cache = cache.to_string_lossy().into_owned();
     #[cfg(unix)]
-    let writable_path = writable.to_string_lossy().into_owned();
+    let writable_path = writable.clone();
     for path in [&writable, &read_only, &cache] {
-        std::fs::create_dir(path).unwrap();
+        std::fs::create_dir(std::path::Path::new(path)).unwrap();
     }
     let mut s = spec(Backend::Podman);
     s.mounts = vec![

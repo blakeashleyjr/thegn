@@ -90,6 +90,11 @@ pub fn mount_identity(_path: &std::path::Path) -> Option<MountIdentity> {
 }
 
 /// Snapshot identities for every trackable local writable, non-cache bind.
+///
+/// A writable single-file bind can be atomically replaced (for example by an
+/// editor's rename-over) between admission and post-create. Its new inode is
+/// refused as drift; this fails closed even though the replacement may be
+/// intentional.
 pub fn admitted_identities(spec: &SandboxSpec) -> Vec<(String, MountIdentity)> {
     if !spec.placement.is_local() {
         return Vec::new();
@@ -98,8 +103,8 @@ pub fn admitted_identities(spec: &SandboxSpec) -> Vec<(String, MountIdentity)> {
         .iter()
         .filter(|mount| !mount.ro && !mount.cache)
         .filter_map(|mount| {
-            mount_identity(&mount.host)
-                .map(|identity| (mount.host.to_string_lossy().into_owned(), identity))
+            mount_identity(std::path::Path::new(&mount.host))
+                .map(|identity| (mount.host.clone(), identity))
         })
         .collect()
 }
@@ -108,9 +113,10 @@ pub fn admitted_identities(spec: &SandboxSpec) -> Vec<(String, MountIdentity)> {
 pub fn identity_drift(
     admitted: &[(String, MountIdentity)],
     now: &dyn Fn(&str) -> Option<MountIdentity>,
-) -> Option<String> {
+) -> Option<(String, String)> {
     admitted.iter().find_map(|(path, identity)| {
-        (now(path) != Some(*identity)).then(|| format!("mount source changed: {path}"))
+        (now(path) != Some(*identity))
+            .then(|| (path.clone(), format!("mount source changed: {path}")))
     })
 }
 
@@ -119,17 +125,27 @@ pub fn identity_drift(
 pub enum PostCreate {
     Ready,
     NotRunning,
-    Drift(String),
+    Drift { why: String, path: Option<String> },
 }
 
 /// Combine runtime inspection with the host-side identity re-attestation.
-pub fn post_create_verdict(running: bool, reusable: bool, drift: Option<String>) -> PostCreate {
+pub fn post_create_verdict(
+    running: bool,
+    reusable: bool,
+    drift: Option<(String, String)>,
+) -> PostCreate {
     if !running {
         PostCreate::NotRunning
     } else if !reusable {
-        PostCreate::Drift("inspected bind sources differ from the admitted mounts".to_string())
-    } else if let Some(why) = drift {
-        PostCreate::Drift(why)
+        PostCreate::Drift {
+            why: "inspected bind sources differ from the admitted mounts".to_string(),
+            path: None,
+        }
+    } else if let Some((path, why)) = drift {
+        PostCreate::Drift {
+            why,
+            path: Some(path),
+        }
     } else {
         PostCreate::Ready
     }
