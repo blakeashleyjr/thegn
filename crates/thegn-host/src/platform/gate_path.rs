@@ -13,6 +13,20 @@ use std::path::{Path, PathBuf};
 #[cfg(unix)]
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 
+/// Return whether a regular file has any executable bit on platforms with
+/// Unix mode semantics. Other platforms have no portable Git executable-bit
+/// equivalent, so callers compare content and kind there.
+pub(crate) fn executable_bit(_metadata: &std::fs::Metadata) -> Option<bool> {
+    #[cfg(unix)]
+    {
+        Some(_metadata.mode() & 0o111 != 0)
+    }
+    #[cfg(not(unix))]
+    {
+        None
+    }
+}
+
 pub(crate) struct Directory {
     path: PathBuf,
     #[cfg_attr(not(unix), allow(dead_code))]

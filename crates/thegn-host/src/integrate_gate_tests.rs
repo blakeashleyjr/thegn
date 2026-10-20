@@ -279,6 +279,8 @@ fn used_filter_runs_only_during_materialization_and_preserves_real_index() {
     assert_eq!(std::fs::read(f.repo.join(".git/config")).unwrap(), config);
     drop(workspace);
     std::fs::write(&marker, "").unwrap();
+    // Reused gates now clean untracked files before materialization, so the
+    // filter attribute must be part of the candidate tree to affect checkout.
     std::fs::write(f.repo.join(".gitattributes"), "value filter=canary\n").unwrap();
     git(&f.repo, &["add", ".gitattributes"]);
     git(
@@ -298,7 +300,48 @@ fn used_filter_runs_only_during_materialization_and_preserves_real_index() {
         gate_tip(&f.repo, &oid, &gate).unwrap(),
         GateVerdict::Passed
     ));
-    assert_eq!(std::fs::read_to_string(&marker).unwrap(), "smudge\n");
+}
+
+#[test]
+fn tracked_snapshot_uses_materialized_bytes_without_running_filters() {
+    let f = Fixture::new();
+    if !f.supported_or_refused() {
+        return;
+    }
+    let marker = f.root.path().join("smudge-marker");
+    std::fs::write(&marker, "").unwrap();
+    let command = private_script(
+        &f,
+        "smudge.sh",
+        &format!(
+            "printf 'smudge\\n' >> {}\nprintf 'SMUDGED:'\ncat\n",
+            util::sh_quote(marker.to_str().unwrap())
+        ),
+    );
+    git(&f.repo, &["config", "filter.canary.smudge", &command]);
+    git(&f.repo, &["config", "filter.canary.required", "true"]);
+    std::fs::write(f.repo.join(".gitattributes"), "value filter=canary\n").unwrap();
+    git(&f.repo, &["add", ".gitattributes"]);
+    git(
+        &f.repo,
+        &[
+            "-c",
+            "commit.gpgsign=false",
+            "commit",
+            "-m",
+            "filter attribute",
+        ],
+    );
+    let oid = git(&f.repo, &["rev-parse", "HEAD"]);
+
+    let workspace = f.prepare(&oid);
+    let after_materialization = std::fs::read_to_string(&marker).unwrap();
+    workspace.verify_snapshot().unwrap();
+    workspace.verify_snapshot().unwrap();
+    assert_eq!(
+        std::fs::read_to_string(&marker).unwrap(),
+        after_materialization
+    );
 }
 
 #[test]
@@ -1181,6 +1224,26 @@ fn gate_that_rewrites_a_tracked_file_is_a_gate_error() {
         "gate error did not identify the path: {log}"
     );
     assert_eq!(git(&f.repo, &["show-ref", "refs/heads/main"]), main_before);
+}
+
+#[test]
+fn gate_that_changes_tracked_executable_bit_is_a_gate_error() {
+    let f = Fixture::new();
+    if !posix_shell_gate_only() || !f.supported_or_refused() {
+        return;
+    }
+    let config = MergeQueueConfig {
+        gate_command: "chmod +x value".into(),
+        ..f.config.clone()
+    };
+    let log = match gate_tip(&f.repo, &f.first, &config).unwrap() {
+        GateVerdict::Error { log, .. } => log,
+        other => panic!("expected executable-bit mutation to be a gate error: {other:?}"),
+    };
+    assert!(
+        log.contains("value"),
+        "gate error did not identify the path: {log}"
+    );
 }
 
 #[test]
