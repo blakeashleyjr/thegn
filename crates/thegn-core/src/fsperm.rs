@@ -596,13 +596,7 @@ impl PrivateDir {
     /// Open one regular file without following a leaf symlink, relative to
     /// this held directory handle.
     pub fn open_regular_nofollow(&self, name: &str) -> std::io::Result<std::fs::File> {
-        let name_path = Path::new(name);
-        if !matches!(
-            name_path.components().collect::<Vec<_>>().as_slice(),
-            [Component::Normal(_)]
-        ) {
-            return Err(invalid_private_name());
-        }
+        let name_path = single_component(name)?;
         #[cfg(unix)]
         {
             use nix::fcntl::{OFlag, openat};
@@ -625,19 +619,13 @@ impl PrivateDir {
         }
         #[cfg(not(unix))]
         {
-            open_regular_file_nofollow(&self.path.join(name))
+            open_regular_file_nofollow(&self.path.join(name_path))
         }
     }
 
     /// Check for an entry without following a leaf symlink.
     pub fn entry_exists_nofollow(&self, name: &str) -> std::io::Result<bool> {
-        let name_path = Path::new(name);
-        if !matches!(
-            name_path.components().collect::<Vec<_>>().as_slice(),
-            [Component::Normal(_)]
-        ) {
-            return Err(invalid_private_name());
-        }
+        let name_path = single_component(name)?;
         #[cfg(unix)]
         {
             use nix::fcntl::AtFlags;
@@ -650,7 +638,7 @@ impl PrivateDir {
         }
         #[cfg(not(unix))]
         {
-            match std::fs::symlink_metadata(self.path.join(name)) {
+            match std::fs::symlink_metadata(self.path.join(name_path)) {
                 Ok(_) => Ok(true),
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
                 Err(error) => Err(error),
@@ -661,13 +649,7 @@ impl PrivateDir {
     /// Remove one file entry relative to the held directory, without following
     /// links. Returns false if the entry was already absent.
     pub fn remove_file(&self, name: &str) -> std::io::Result<bool> {
-        let name_path = Path::new(name);
-        if !matches!(
-            name_path.components().collect::<Vec<_>>().as_slice(),
-            [Component::Normal(_)]
-        ) {
-            return Err(invalid_private_name());
-        }
+        let name_path = single_component(name)?;
         #[cfg(unix)]
         {
             use nix::unistd::{UnlinkatFlags, unlinkat};
@@ -679,7 +661,7 @@ impl PrivateDir {
         }
         #[cfg(not(unix))]
         {
-            match std::fs::remove_file(self.path.join(name)) {
+            match std::fs::remove_file(self.path.join(name_path)) {
                 Ok(()) => Ok(true),
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
                 Err(error) => Err(error),
@@ -830,19 +812,12 @@ impl PrivateDir {
     /// sync error is returned after publication, so the new bytes may already
     /// be visible even when this method returns an error.
     pub fn write_owner_only_atomic(&self, name: &str, bytes: &[u8]) -> std::io::Result<PathBuf> {
+        let name_path = single_component(name)?;
         #[cfg(unix)]
         {
             use nix::fcntl::{OFlag, openat, renameat};
             use nix::sys::stat::{Mode, fchmod, fstat};
-            let name_path = Path::new(name);
-            let mut components = name_path.components();
-            let Some(Component::Normal(component)) = components.next() else {
-                return Err(invalid_private_name());
-            };
-            if components.next().is_some() {
-                return Err(invalid_private_name());
-            }
-            let name = Path::new(component);
+            let name = name_path;
             let temporary = format!("{PRIVATE_TEMP_PREFIX}{}", temp_token());
             let fd = openat(
                 &self.fd,
@@ -908,17 +883,22 @@ impl PrivateDir {
         }
         #[cfg(not(unix))]
         {
-            let name_path = Path::new(name);
-            if !matches!(
-                name_path.components().collect::<Vec<_>>().as_slice(),
-                [Component::Normal(_)]
-            ) {
-                return Err(invalid_private_name());
-            }
             let path = self.path.join(name_path);
             write_owner_only_atomic(&path, bytes)?;
             Ok(path)
         }
+    }
+}
+
+fn single_component(name: &str) -> std::io::Result<&Path> {
+    let path = Path::new(name);
+    if matches!(
+        path.components().collect::<Vec<_>>().as_slice(),
+        [Component::Normal(_)]
+    ) {
+        Ok(path)
+    } else {
+        Err(invalid_private_name())
     }
 }
 
@@ -948,6 +928,8 @@ pub fn open_private_dir(path: &Path) -> std::io::Result<PrivateDir> {
         )
         .map_err(map_directory_open_error)?;
         let stat = fstat(&fd).map_err(nix_io_error)?;
+        // O_DIRECTORY already enforces this on supported Unix systems; keep
+        // the metadata check as defence in depth if the open flags ever change.
         if SFlag::from_bits_truncate(stat.st_mode) & SFlag::S_IFMT != SFlag::S_IFDIR {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
@@ -2199,13 +2181,33 @@ mod tests {
         assert!(pinned.open_regular_nofollow("../x").is_err());
         assert!(pinned.entry_exists_nofollow("../x").is_err());
         assert!(pinned.remove_file("../x").is_err());
+        pinned
+            .write_owner_only_atomic("y", b"inside after swap")
+            .unwrap();
+        assert_eq!(
+            std::fs::read(root.path().join("moved/y")).unwrap(),
+            b"inside after swap"
+        );
+        assert!(!outside.path().join("y").exists());
         std::fs::write(outside.path().join("target"), b"outside").unwrap();
         create_symlink(
-            outside.path().join("target"),
+            &outside.path().join("target"),
             &root.path().join("moved/link"),
             false,
         )
         .unwrap();
         assert!(pinned.open_regular_nofollow("link").is_err());
+    }
+
+    #[test]
+    fn open_regular_nofollow_rejects_a_directory_entry() {
+        let root = tempfile::tempdir().unwrap();
+        let private = root.path().join("private");
+        ensure_private_dir(&private).unwrap();
+        std::fs::create_dir(private.join("child")).unwrap();
+        let pinned = open_private_dir(&private).unwrap();
+
+        let error = pinned.open_regular_nofollow("child").unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
     }
 }

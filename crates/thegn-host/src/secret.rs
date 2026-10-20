@@ -372,9 +372,9 @@ fn file_entry_exists(private: &thegn_core::fsperm::PrivateDir, name: &str) -> Re
     let current = token_name(name)?;
     let legacy = legacy_token_name(name)?;
     Ok(private.entry_exists_nofollow(&current)?
-        || private.entry_exists_nofollow(&account_name(&current))?
+        || private.entry_exists_nofollow(&account_name(&current)?)?
         || private.entry_exists_nofollow(&legacy)?
-        || private.entry_exists_nofollow(&account_name(&legacy))?)
+        || private.entry_exists_nofollow(&account_name(&legacy)?)?)
 }
 
 fn secrets_dir_path() -> Result<PathBuf> {
@@ -628,7 +628,7 @@ fn resolve_token_path_in(dir: &std::path::Path, account: &str) -> Result<PathBuf
 
 fn resolve_token_name(private: &thegn_core::fsperm::PrivateDir, account: &str) -> Result<String> {
     let v2 = token_name(account)?;
-    if private.entry_exists_nofollow(&v2)? || private.entry_exists_nofollow(&account_name(&v2))? {
+    if private.entry_exists_nofollow(&v2)? || private.entry_exists_nofollow(&account_name(&v2)?)? {
         return Ok(v2);
     }
     let legacy = legacy_token_name(account)?;
@@ -660,13 +660,13 @@ fn account_path(token: &std::path::Path) -> PathBuf {
     token.with_extension("account")
 }
 
-fn account_name(token: &str) -> String {
+fn account_name(token: &str) -> Result<String> {
     std::path::Path::new(token)
         .with_extension("account")
         .file_name()
         .and_then(std::ffi::OsStr::to_str)
-        .unwrap_or(token)
         .to_owned()
+        .context("secret token path has no sidecar filename")
 }
 
 #[cfg(test)]
@@ -685,7 +685,7 @@ fn write_account_sidecar_with(
     token_name: &str,
     account: &str,
 ) -> Result<()> {
-    let sidecar_name = account_name(token_name);
+    let sidecar_name = account_name(token_name)?;
     match read_account_sidecar_with(private, &sidecar_name) {
         Ok(existing) if existing != account => anyhow::bail!("secret account digest collision"),
         Ok(_) => {}
@@ -736,7 +736,7 @@ fn account_matches_or_missing_with(
     token_name: &str,
     account: &str,
 ) -> Result<()> {
-    match read_account_sidecar_with(private, &account_name(token_name)) {
+    match read_account_sidecar_with(private, &account_name(token_name)?) {
         Ok(existing) if existing != account => anyhow::bail!("secret account digest collision"),
         Ok(_) => Ok(()),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
@@ -982,7 +982,9 @@ fn remove_sidecar_with(
     private: &thegn_core::fsperm::PrivateDir,
     token_name: &str,
 ) -> std::io::Result<()> {
-    private.remove_file(&account_name(token_name)).map(|_| ())
+    let sidecar_name = account_name(token_name)
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidInput, error))?;
+    private.remove_file(&sidecar_name).map(|_| ())
 }
 
 fn file_list_at(dir: &std::path::Path) -> Result<Vec<String>, SecretError> {
@@ -1011,15 +1013,18 @@ fn file_list_with(private: &thegn_core::fsperm::PrivateDir) -> Result<Vec<String
             .map_err(|e| SecretError::denied(format!("invalid secret account sidecar: {e}")))?;
         let v2 = token_name(&account).map_err(|e| SecretError::denied(e.to_string()))?;
         let legacy = legacy_token_name(&account).map_err(|e| SecretError::denied(e.to_string()))?;
-        let token = if account_name(&v2) == sidecar_name {
-            v2
-        } else if account_name(&legacy) == sidecar_name {
-            legacy
-        } else {
-            return Err(SecretError::denied(
-                "secret account sidecar identity mismatch",
-            ));
-        };
+        let token =
+            if account_name(&v2).map_err(|e| SecretError::denied(e.to_string()))? == sidecar_name {
+                v2
+            } else if account_name(&legacy).map_err(|e| SecretError::denied(e.to_string()))?
+                == sidecar_name
+            {
+                legacy
+            } else {
+                return Err(SecretError::denied(
+                    "secret account sidecar identity mismatch",
+                ));
+            };
         match private.open_regular_nofollow(&token) {
             Ok(file)
                 if thegn_core::fsperm::owned_by_current_user(
@@ -1468,6 +1473,11 @@ mod tests {
     }
 
     #[test]
+    fn account_sidecar_name_requires_a_filename() {
+        assert!(account_name("/").is_err());
+    }
+
+    #[test]
     fn token_digest_is_domain_separated_sha256_and_legacy_name_is_retained() {
         let temp = private_temp();
         let v2 = token_path_in(temp.path(), "acct").unwrap();
@@ -1527,7 +1537,8 @@ mod tests {
         assert!(file_get_in(&secrets, "acct").is_err());
         assert!(file_set_at(&secrets, "acct", "replacement").is_err());
         assert!(file_del_at(&secrets, "acct").is_err());
-        assert_eq!(std::fs::read(canary).unwrap(), b"canary");
+        assert_eq!(std::fs::read(&canary).unwrap(), b"canary");
+        assert!(canary.exists());
     }
 
     #[test]
@@ -1550,7 +1561,7 @@ mod tests {
         }
         file_del_with(&private, "acct").unwrap();
 
-        assert_eq!(std::fs::read(canary).unwrap(), b"canary");
+        assert_eq!(std::fs::read(&canary).unwrap(), b"canary");
         assert_eq!(std::fs::read(account_path(&canary)).unwrap(), b"acct");
     }
 
