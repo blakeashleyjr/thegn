@@ -141,16 +141,8 @@ mod tests {
         let record = sample();
         store_in(root.path(), &record).unwrap();
         assert_eq!(load_in(root.path(), "dev"), Some(record));
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let mode = std::fs::metadata(dir_in(root.path()).join("dev.json"))
-                .unwrap()
-                .permissions()
-                .mode()
-                & 0o777;
-            assert_eq!(mode, 0o600);
-        }
+        let mode = thegn_core::fsperm::mode_bits(&dir_in(root.path()).join("dev.json")).unwrap();
+        assert!(mode.is_none() || mode == Some(0o600));
     }
 
     #[test]
@@ -160,14 +152,21 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let target = dir.join("target.json");
         std::fs::write(&target, serde_json::to_vec(&sample()).unwrap()).unwrap();
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::symlink;
-            symlink(target, dir.join("dev.json")).unwrap();
+        if cfg!(unix) {
+            thegn_core::fsperm::create_symlink(&target, &dir.join("dev.json"), false).unwrap();
             assert!(load_in(root.path(), "dev").is_none());
         }
-        #[cfg(not(unix))]
-        {
+    }
+
+    #[test]
+    fn load_refuses_a_hard_linked_record() {
+        if cfg!(unix) {
+            let root = tempfile::tempdir().unwrap();
+            let record = sample();
+            store_in(root.path(), &record).unwrap();
+            let path = dir_in(root.path()).join("dev.json");
+            assert_eq!(load_in(root.path(), "dev"), Some(record));
+            std::fs::hard_link(&path, dir_in(root.path()).join("other.json")).unwrap();
             assert!(load_in(root.path(), "dev").is_none());
         }
     }
