@@ -3569,9 +3569,10 @@ pub fn compose_spec(
                 .into());
             }
         },
-        (Some(spec), _) => sandbox::enter_argv(spec, &cmd)
-            .map_err(anyhow::Error::new)
-            .context("sandbox entry refused")?,
+        (Some(spec), _) => sandbox::enter_argv(spec, &cmd).map_err(|error| {
+            let hint = error.remediation_hint();
+            anyhow::Error::new(error).context(hint)
+        })?,
         (None, None) => {
             // Host fallback: a login shell so PATH/env expand — still CAPPED. There
             // is no sandbox spec here (no container runtime, or one turned off), but

@@ -616,6 +616,60 @@ pub enum RefusalClass {
     MountDrift,
 }
 
+impl RefusalClass {
+    /// Stable machine-readable label for this refusal category.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::ComposePolicy => "compose-policy",
+            Self::SealedHome => "sealed-home",
+            Self::UnsafeMountPath => "unsafe-mount-path",
+            Self::SystemdMountPath => "systemd-mount-path",
+            Self::ComposeTarget => "compose-target",
+            Self::ComposeServiceMissing => "compose-service-missing",
+            Self::HostnamePolicy => "hostname-policy",
+            Self::MountUnresolvable => "mount-unresolvable",
+            Self::TunnelUnenforced => "tunnel-unenforced",
+            Self::MountDrift => "mount-drift",
+        }
+    }
+
+    /// One-line user action that can resolve this refusal.
+    pub fn remediation(self) -> &'static str {
+        match self {
+            Self::ComposePolicy => {
+                "remove the protected host path from the Compose file's binds, or choose a less restrictive [sandbox] profile"
+            }
+            Self::SealedHome => {
+                "sealed profiles hide $HOME: move the mount or worktree out of $HOME, or use profile 'hardened'"
+            }
+            Self::UnsafeMountPath => {
+                "rename the mount path so it has no whitespace, quote, backslash or ':', or use the bwrap backend"
+            }
+            Self::SystemdMountPath => {
+                "rename the mount path so systemd-run can express it, or use the bwrap backend"
+            }
+            Self::ComposeTarget => {
+                "Compose needs the docker or podman backend: set [sandbox] backend to one of them"
+            }
+            Self::ComposeServiceMissing => {
+                "name the service to enter (`service` in the devcontainer or [sandbox] Compose config)"
+            }
+            Self::HostnamePolicy => {
+                "remove the hostname override, or choose a profile that allows it"
+            }
+            Self::MountUnresolvable => {
+                "create the mount source or remove the mount from the config, then relaunch"
+            }
+            Self::TunnelUnenforced => {
+                "use profile 'hardened' with [sandbox.vpn], or 'sealed' for no network"
+            }
+            Self::MountDrift => {
+                "a mount source changed during launch (check for a symlink swap), then relaunch"
+            }
+        }
+    }
+}
+
 /// Structured, safe context for a refused sandbox launch.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Refusal {
@@ -645,6 +699,24 @@ impl std::fmt::Display for EnterError {
         match self {
             EnterError::Volume(e) => e.fmt(f),
             EnterError::Refused(refusal) => refusal.fmt(f),
+        }
+    }
+}
+
+impl EnterError {
+    /// Render a stable refusal category, safe path context, and next action.
+    pub fn remediation_hint(&self) -> String {
+        match self {
+            Self::Refused(refusal) => format!(
+                "sandbox entry refused [{}]{}: {}",
+                refusal.class.label(),
+                match refusal.path.as_deref() {
+                    Some(path) => format!(" at `{path}`"),
+                    None => String::new(),
+                },
+                refusal.class.remediation()
+            ),
+            Self::Volume(_) => "sandbox entry refused [volume-name]: rename the named volume to a plain name (letters, digits, '.', '_', '-')".into(),
         }
     }
 }
