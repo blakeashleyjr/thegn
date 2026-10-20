@@ -2731,8 +2731,7 @@ fn attempt_land_admitted(
     // tip into the target store first and fold that synthetic ref — a bare
     // `refs/heads/<branch>` only exists in the branch host's own object store.
     // A same-store branch just yields `refs/heads/<branch>` (no I/O).
-    let branch_ref = match crate::merge_remote::ensure_tip_in_target(&loc, branch_name, branch_loc)
-    {
+    let ingested = match crate::merge_remote::ingest_tip(&loc, branch_name, branch_loc) {
         Ok(r) => r,
         Err(e) => {
             return Ok(AttemptOutcome::Unreachable {
@@ -2740,6 +2739,7 @@ fn attempt_land_admitted(
             });
         }
     };
+    let branch_ref = ingested.ref_name.clone();
     let refused = match configured_merge_drivers(repo_root) {
         Ok(refused) => refused,
         Err(error) => {
@@ -2778,6 +2778,16 @@ fn attempt_land_admitted(
         source_history.revalidate()?;
         let base = CliGit.rev_parse(&loc, &target_ref)?;
         let branch_tip = CliGit.rev_parse(&loc, &branch_ref)?;
+        if let Some(ingested_oid) = &ingested.oid
+            && branch_tip != *ingested_oid
+        {
+            return Ok(AttemptOutcome::GateError {
+                reason: "ingested source ref changed in the target store; retry".into(),
+                log: format!("ingested ref {branch_ref} moved to {branch_tip}"),
+                phase: GatePhase::Gate,
+                class: GateErrorClass::SourceMoved,
+            });
+        }
         let already_landed =
             util::git_is_ancestor(repo_root, &branch_tip, &base).with_context(|| {
                 format!(
@@ -2895,6 +2905,26 @@ fn attempt_land_admitted(
         adapter.history.revalidate()?;
         source_history.revalidate()?;
         let source_refs = [(branch_ref.clone(), branch_tip.clone())];
+        if let Some(ingested_oid) = &ingested.oid {
+            match crate::merge_remote::verify_source_unchanged(
+                branch_loc,
+                branch_name,
+                ingested_oid,
+            ) {
+                crate::merge_remote::SourceCheck::Unchanged => {}
+                crate::merge_remote::SourceCheck::Moved { actual } => {
+                    return Ok(AttemptOutcome::GateError {
+                        reason: "source moved on its host after the gate; retry".into(),
+                        log: format!("source refs/heads/{branch_name} moved to {actual}"),
+                        phase: GatePhase::Gate,
+                        class: GateErrorClass::SourceMoved,
+                    });
+                }
+                crate::merge_remote::SourceCheck::Unreachable(detail) => {
+                    return Ok(AttemptOutcome::Unreachable { detail });
+                }
+            }
+        }
         match CliGit.update_ref_cas_with_sources(
             &loc,
             &target_ref,
