@@ -11,6 +11,14 @@ pub const MERGE_CLAIM_OWNER_HINT_MAX: usize = 64;
 pub const MERGE_CLAIM_LOST: &str = "merge claim lost";
 pub const MERGE_CLAIM_ACTIVE: &str = "merge row is claimed by an active drain";
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MergeRetryOutcome {
+    Rearmed,
+    NotQueued,
+    NotRetryable { status: String },
+    Claimed,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MergeClaimPhase {
     ClaimedNoChild,
@@ -305,8 +313,14 @@ pub trait WorktreeAuxStore {
 
     /// Re-arm a blocked row for another drain: back to `queued`, attempts reset,
     /// prior failure detail cleared. The "I fixed it, try again" gesture.
-    /// Returns whether a row was actually reset.
+    /// Returns whether a row was actually reset. Production retry uses
+    /// [`Self::retry_held_merge_entry`] to refuse non-held states.
     fn retry_merge_entry(&self, worktree: &str) -> Result<bool>;
+
+    /// Re-arm only a held merge row: deferred, gate_failed, gate_error,
+    /// agent_blocked, or needs_human. Other row states and active claims are
+    /// returned as typed refusals.
+    fn retry_held_merge_entry(&self, worktree: &str) -> Result<MergeRetryOutcome>;
 
     /// Drop a worktree's merge-queue row (e.g. after a clean land is recorded
     /// elsewhere, or the worktree is removed).

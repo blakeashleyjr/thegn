@@ -4,13 +4,14 @@
 //! the live source is truth. A server backend implements this trait against
 //! Postgres for shared, multi-user state.
 
+use crate::attention::MqStatus;
 use crate::db::{Db, ForwardRow, MergeQueueRow, PrQueueRow, ShareRow};
 use crate::models::ContainerEvent;
 use crate::store::{
     MERGE_CLAIM_ACTIVE, MERGE_CLAIM_LOST, MERGE_CLAIM_MAX_LEASE_MS, MERGE_CLAIM_OWNER_HINT_MAX,
     MergeAttemptResult, MergeClaim, MergeClaimPhase, MergeClaimRequest, MergeClaimView,
     MergeFinalOutcome, MergeFinalStatus, MergeOutcomeObservation, MergeOutcomeWrite,
-    MergeRegistryIdentity, MergeStatusFields, WorktreeAuxStore,
+    MergeRegistryIdentity, MergeRetryOutcome, MergeStatusFields, WorktreeAuxStore,
 };
 use crate::util;
 use anyhow::Result;
@@ -754,6 +755,49 @@ impl WorktreeAuxStore for Db {
             params![worktree, util::now()],
         )?;
         Ok(n > 0)
+    }
+
+    fn retry_held_merge_entry(&self, worktree: &str) -> Result<MergeRetryOutcome> {
+        let tx = Transaction::new_unchecked(self.conn(), TransactionBehavior::Immediate)?;
+        let row: Option<(String, Option<String>)> = tx
+            .query_row(
+                "SELECT status, claim_owner FROM merge_queue WHERE worktree=?1",
+                [worktree],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?;
+        let Some((status, claim_owner)) = row else {
+            tx.commit()?;
+            return Ok(MergeRetryOutcome::NotQueued);
+        };
+        if claim_owner.is_some() {
+            tx.commit()?;
+            return Ok(MergeRetryOutcome::Claimed);
+        }
+        if !MqStatus::parse(&status).is_some_and(MqStatus::is_held) {
+            tx.commit()?;
+            return Ok(MergeRetryOutcome::NotRetryable { status });
+        }
+
+        let held = MqStatus::ALL
+            .iter()
+            .filter(|status| status.is_held())
+            .map(|status| format!("'{}'", status.as_str()))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let sql = format!(
+            "UPDATE merge_queue SET status='queued', agent_attempts=0, updated_at=?2, \
+             result_oid=NULL, conflict_paths=NULL, error_detail=NULL \
+             WHERE worktree=?1 AND claim_owner IS NULL AND status IN ({held})"
+        );
+        let changed = tx.execute(&sql, params![worktree, util::now()])?;
+        let outcome = if changed == 1 {
+            MergeRetryOutcome::Rearmed
+        } else {
+            MergeRetryOutcome::NotRetryable { status }
+        };
+        tx.commit()?;
+        Ok(outcome)
     }
 
     /// Drop a worktree's merge-queue row (e.g. after a clean land is recorded
