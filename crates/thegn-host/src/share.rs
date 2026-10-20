@@ -879,7 +879,7 @@ mod tests {
                     "Start-Sleep -Seconds 30".into(),
                 ]
             } else {
-                vec!["-c".into(), "sleep 30".into()]
+                vec!["-c".into(), "exec sleep 30".into()]
             },
             env: Vec::new(),
             files: Vec::new(),
@@ -921,10 +921,10 @@ mod tests {
                 vec![
                     "-NoProfile".into(),
                     "-Command".into(),
-                    "Start-Sleep -Seconds 2".into(),
+                    "Start-Sleep -Seconds 30".into(),
                 ]
             } else {
-                vec!["-c".into(), "sleep 1.7".into()]
+                vec!["-c".into(), "exec sleep 30".into()]
             },
             env: Vec::new(),
             files: Vec::new(),
@@ -932,11 +932,13 @@ mod tests {
         };
         let running =
             thegn_svc::share::start(&plan, state.path(), std::time::Duration::from_secs(2))
-                .expect("start short-lived share");
+                .expect("start share");
         let handle = running.stop_handle();
+        assert_eq!(handle.stop(), thegn_svc::share::StopOutcome::Terminated);
         running.wait();
         let shared = Shared::new();
         *shared.stop.lock().unwrap() = Some(handle.clone());
+        let shared_for_assert = shared.clone();
         let instance = ShareInstance {
             worktree: "/wt".into(),
             port: 3000,
@@ -951,10 +953,11 @@ mod tests {
             event_tx: None,
             event_waker: None,
         };
-        let started = std::time::Instant::now();
         instance.kill();
-        assert!(started.elapsed() < std::time::Duration::from_millis(100));
-        assert_eq!(handle.stop(), thegn_svc::share::StopOutcome::AlreadyExited);
+        assert!(shared_for_assert.shutdown.load(Ordering::SeqCst));
+        // The reaped flag protects against PID reuse; the svc test
+        // `stop_handle_is_idempotent_and_never_signals_a_reaped_child` covers
+        // that behavior directly.
     }
 
     #[test]
