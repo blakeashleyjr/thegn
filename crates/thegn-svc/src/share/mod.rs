@@ -1737,6 +1737,9 @@ fn start_inner(
     grouping: ProcessGrouping,
 ) -> Result<RunningShare> {
     verify_owner_manifest(statedir, owner_manifest)?;
+    if cancel.load(Ordering::Acquire) {
+        return Err(ShareStartCancelled.into());
+    }
     if matches!(&plan.url_rule, UrlRule::Fixed(_)) && plan.url_rule.fixed().is_none() {
         anyhow::bail!("share: invalid fixed public endpoint");
     }
@@ -1761,6 +1764,9 @@ fn start_inner(
     }
     if matches!(grouping, ProcessGrouping::OwnGroup) {
         crate::plugin::proc::set_process_group(&mut cmd);
+    }
+    if cancel.load(Ordering::Acquire) {
+        return Err(ShareStartCancelled.into());
     }
     let mut child = cmd
         .spawn()

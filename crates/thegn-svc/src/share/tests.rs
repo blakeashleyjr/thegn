@@ -1971,3 +1971,30 @@ fn materialize_refuses_symlinked_state_dir() {
     assert!(materialize_files(&plan, &sd).is_err());
     assert_eq!(std::fs::read_dir(&real).unwrap().count(), 0);
 }
+
+#[cfg(unix)]
+#[test]
+fn start_cancelled_before_spawn_starts_nothing_and_removes_credentials() {
+    let tmp = tempfile::tempdir().unwrap();
+    let statedir = tmp.path().join("state");
+    let marker = tmp.path().join("spawned");
+    let plan = file_plan(
+        vec![("credential.txt", "SYNTHETIC-CREDENTIAL")],
+        "sh",
+        vec![
+            "-c".into(),
+            format!("touch {}; exec sleep 30", marker.display()),
+        ],
+    );
+    let cancel = std::sync::atomic::AtomicBool::new(true);
+
+    let result = start_cancellable(&plan, &statedir, Duration::from_secs(10), &cancel);
+
+    assert!(result.is_err_and(|error| { error.downcast_ref::<ShareStartCancelled>().is_some() }));
+    std::thread::sleep(Duration::from_millis(200));
+    assert!(!marker.exists(), "cancelled provider must never be spawned");
+    assert!(
+        !statedir.join("credential.txt").exists(),
+        "cancelled start must not leave credentials"
+    );
+}
