@@ -132,9 +132,9 @@ impl StopHandle {
                             .lock()
                             .unwrap_or_else(std::sync::PoisonError::into_inner);
                         if !state.reaped {
-                            match crate::plugin::proc::leader_exited_nowait(state.pid) {
-                                Ok(false) => crate::plugin::proc::kill_group(state.pid),
-                                Ok(true) | Err(_) => {}
+                            if let Ok(false) = crate::plugin::proc::leader_exited_nowait(state.pid)
+                            {
+                                crate::plugin::proc::kill_group(state.pid);
                             }
                         }
                     });
@@ -1101,8 +1101,10 @@ pub struct RunningShare {
     readers: Vec<std::thread::JoinHandle<()>>,
     pub public_url: PublicEndpoint,
     endpoint_tracker: EndpointTracker,
-    cleanup: Option<(std::path::PathBuf, Vec<String>, Option<Vec<u8>>)>,
+    cleanup: Option<ShareCleanup>,
 }
+
+type ShareCleanup = (std::path::PathBuf, Vec<String>, Option<Vec<u8>>);
 
 impl fmt::Debug for RunningShare {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
