@@ -68,6 +68,7 @@ mod drag_hit;
 mod dragdrop;
 mod drawer_state;
 mod e2e_freeze;
+mod egress_admit;
 mod element;
 mod emulator;
 mod env_halt;
