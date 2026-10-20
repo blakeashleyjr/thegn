@@ -270,32 +270,68 @@ fn local_git(worktree: &str, args: &[&str]) -> Option<String> {
         .then(|| String::from_utf8_lossy(&out.stdout).trim().to_string())
 }
 
-/// If `spec` is a REMOTE-placement OCI spec, materialize its worktree on the
-/// remote host and repoint the container bind at it (`/workspace`). The default
-/// path-preserving worktree + git-common + host-toolchain binds are all LOCAL
-/// paths that don't exist on the remote; this replaces them with a self-contained
-/// remote clone. A sync failure warns and retains the remote destination rather
-/// than silently dropping to a local host shell.
-/// No-op for local placements / non-OCI backends.
-pub(crate) fn retarget_if_remote_oci(
+/// A remote-OCI worktree materialization that admission has not yet approved.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RemoteSyncPlan {
+    pub(crate) authority: String,
+    pub(crate) slug: String,
+    pub(crate) recursive_submodules: bool,
+}
+
+/// Degrade an unavailable strong OCI runtime and plan remote-OCI worktree
+/// materialization without contacting the remote host or changing mounts.
+/// Runtime degradation must happen before sandbox gates because those gates
+/// inspect the effective runtime and capabilities.
+pub(crate) fn plan_spec_before_ensure(
     spec: &mut thegn_core::sandbox::SandboxSpec,
     worktree: &str,
     recursive_submodules: bool,
     warnings: &mut Vec<String>,
-) {
-    if !spec.backend.is_oci() || spec.placement.is_local() {
-        return;
+) -> Option<RemoteSyncPlan> {
+    if let Some(w) = degrade_oci_runtime(spec) {
+        thegn_core::msg::warn(&format!("{w} for {worktree}"));
+        warnings.push(w);
     }
-    let runner = OciRunner::new(spec.placement.clone());
-    let authority = format!("{}|{}", spec.backend.label(), spec.placement.label());
-    match sync_worktree(
-        &runner,
-        worktree,
-        &authority,
-        &spec.name,
+    (spec.backend.is_oci() && !spec.placement.is_local()).then(|| RemoteSyncPlan {
+        authority: format!("{}|{}", spec.backend.label(), spec.placement.label()),
+        slug: spec.name.clone(),
         recursive_submodules,
-        warnings,
-    ) {
+    })
+}
+
+/// Apply a previously admitted remote-OCI worktree plan and repoint the
+/// container bind at `/workspace`. Successful materialization replaces the
+/// local path-preserving mounts with a self-contained remote clone. A sync
+/// failure warns and retains the existing mounts for manual recovery.
+pub(crate) fn apply_remote_sync(
+    spec: &mut thegn_core::sandbox::SandboxSpec,
+    plan: &RemoteSyncPlan,
+    worktree: &str,
+    warnings: &mut Vec<String>,
+) {
+    let runner = OciRunner::new(spec.placement.clone());
+    apply_remote_sync_with(spec, plan, worktree, warnings, |plan, warnings| {
+        sync_worktree(
+            &runner,
+            worktree,
+            &plan.authority,
+            &plan.slug,
+            plan.recursive_submodules,
+            warnings,
+        )
+    });
+}
+
+/// Apply a plan through the supplied sync operation. This seam keeps admission
+/// ordering testable without starting a runner or performing remote I/O.
+pub(crate) fn apply_remote_sync_with(
+    spec: &mut thegn_core::sandbox::SandboxSpec,
+    plan: &RemoteSyncPlan,
+    worktree: &str,
+    warnings: &mut Vec<String>,
+    sync: impl FnOnce(&RemoteSyncPlan, &mut Vec<String>) -> Result<String, String>,
+) {
+    match sync(plan, warnings) {
         Ok(remote_path) => {
             thegn_core::host::mount_remote_worktree(spec, &remote_path, REMOTE_WORKTREE_DEST)
         }
@@ -307,24 +343,6 @@ pub(crate) fn retarget_if_remote_oci(
             warnings.push(warning.clone());
             thegn_core::msg::warn(&format!("{warning} (worktree {worktree})"));
         }
-    }
-}
-
-/// The final adjustments to a resolved spec just before `sandbox::ensure` creates
-/// the container: remote-OCI worktree materialization ([`retarget_if_remote_oci`])
-/// and degrading an unavailable strong OCI runtime to the daemon default
-/// ([`degrade_oci_runtime`]). Both are best-effort and only push human-visible
-/// warnings; neither fails the pane.
-pub(crate) fn finalize_spec_before_ensure(
-    spec: &mut thegn_core::sandbox::SandboxSpec,
-    worktree: &str,
-    recursive_submodules: bool,
-    warnings: &mut Vec<String>,
-) {
-    retarget_if_remote_oci(spec, worktree, recursive_submodules, warnings);
-    if let Some(w) = degrade_oci_runtime(spec) {
-        thegn_core::msg::warn(&format!("{w} for {worktree}"));
-        warnings.push(w);
     }
 }
 
@@ -520,8 +538,8 @@ fn sync_worktree_uncached(
 #[cfg(test)]
 mod tests {
     use super::{
-        SyncCache, claim_command, record_command, refresh_command, restore_command,
-        should_apply_tracked_diff, sync_key, sync_once,
+        SyncCache, apply_remote_sync_with, claim_command, plan_spec_before_ensure, record_command,
+        refresh_command, restore_command, should_apply_tracked_diff, sync_key, sync_once,
     };
     use std::process::Command;
     use std::sync::{
@@ -1043,5 +1061,135 @@ mod tests {
         assert_eq!(paths[0], "/remote/thegn-worktrees/sandbox");
         assert_eq!(paths[1], paths[0]);
         assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    fn sandbox_spec(
+        backend: thegn_core::sandbox::Backend,
+        remote: bool,
+    ) -> thegn_core::sandbox::SandboxSpec {
+        thegn_core::sandbox::SandboxSpec {
+            backend,
+            placement: if remote {
+                thegn_core::placement::Placement::Ssh(thegn_core::placement::SshPlacement::plain(
+                    "user@host".into(),
+                    22,
+                    false,
+                    thegn_core::placement::TransportKind::Ssh,
+                ))
+            } else {
+                thegn_core::placement::Placement::Local
+            },
+            image: Some("img:latest".into()),
+            worktree: std::path::PathBuf::from("/wt/x"),
+            mounts: vec![thegn_core::sandbox::Mount {
+                host: "/wt/x".into(),
+                dest: "/wt/x".into(),
+                ro: false,
+                cache: false,
+            }],
+            env: Vec::new(),
+            env_overrides: std::collections::HashMap::new(),
+            env_block: Vec::new(),
+            network: thegn_core::config::Network::Nat,
+            network_allow: Vec::new(),
+            network_block: Vec::new(),
+            read_only_root: false,
+            no_new_privileges: false,
+            pids_limit: None,
+            drop_capabilities: Vec::new(),
+            add_capabilities: Vec::new(),
+            file_access: thegn_core::config::FileAccess::Worktree,
+            ports: Vec::new(),
+            gpu: None,
+            limits: thegn_core::sandbox::SandboxLimits::default(),
+            volumes: Vec::new(),
+            compose: None,
+            build: None,
+            init_script: None,
+            devenv: false,
+            devenv_path: None,
+            name: "tg-wt".into(),
+            vpn: None,
+            oci_host: None,
+            oci_runtime: None,
+            daemon_persistent: false,
+            seal_home: None,
+        }
+    }
+
+    #[test]
+    fn plan_for_remote_oci_spec_performs_no_upload_and_keeps_mounts() {
+        let mut spec = sandbox_spec(thegn_core::sandbox::Backend::Podman, true);
+        let mounts = spec.mounts.clone();
+        let plan = plan_spec_before_ensure(&mut spec, "/wt/x", false, &mut Vec::new())
+            .expect("remote OCI spec needs a plan");
+
+        assert_eq!(plan.slug, spec.name);
+        assert_eq!(spec.mounts, mounts);
+    }
+
+    #[test]
+    fn plan_is_none_for_local_or_non_oci_specs() {
+        let mut local = sandbox_spec(thegn_core::sandbox::Backend::Podman, false);
+        assert!(plan_spec_before_ensure(&mut local, "/wt/x", false, &mut Vec::new()).is_none());
+
+        let mut non_oci = sandbox_spec(thegn_core::sandbox::Backend::None, true);
+        assert!(plan_spec_before_ensure(&mut non_oci, "/wt/x", false, &mut Vec::new()).is_none());
+    }
+
+    #[test]
+    fn apply_retargets_mounts_after_one_successful_upload() {
+        let mut spec = sandbox_spec(thegn_core::sandbox::Backend::Podman, true);
+        let plan = plan_spec_before_ensure(&mut spec, "/wt/x", false, &mut Vec::new())
+            .expect("remote OCI spec needs a plan");
+        let mut calls = 0;
+        apply_remote_sync_with(&mut spec, &plan, "/wt/x", &mut Vec::new(), |_, _| {
+            calls += 1;
+            Ok("/home/u/thegn-worktrees/x".into())
+        });
+
+        assert_eq!(calls, 1);
+        assert_eq!(spec.worktree, std::path::PathBuf::from("/workspace"));
+        assert_eq!(spec.mounts.len(), 1);
+        assert_eq!(spec.mounts[0].host, "/home/u/thegn-worktrees/x");
+    }
+
+    #[test]
+    fn apply_failure_keeps_mounts_and_pushes_the_recovery_warning() {
+        let mut spec = sandbox_spec(thegn_core::sandbox::Backend::Podman, true);
+        let mounts = spec.mounts.clone();
+        let plan = plan_spec_before_ensure(&mut spec, "/wt/x", false, &mut Vec::new())
+            .expect("remote OCI spec needs a plan");
+        let mut warnings = Vec::new();
+        apply_remote_sync_with(&mut spec, &plan, "/wt/x", &mut warnings, |_, _| {
+            Err("boom".into())
+        });
+
+        assert_eq!(spec.mounts, mounts);
+        assert!(
+            warnings
+                .first()
+                .is_some_and(|warning| warning.starts_with("remote worktree sync failed: boom"))
+        );
+    }
+
+    #[test]
+    fn compose_refused_plan_never_reaches_the_uploader() {
+        let mut spec = sandbox_spec(thegn_core::sandbox::Backend::Podman, true);
+        spec.compose = Some("compose.yml".into());
+        spec.read_only_root = true;
+        let plan = plan_spec_before_ensure(&mut spec, "/wt/x", false, &mut Vec::new());
+        let mut calls = 0;
+        if thegn_core::sandbox::compose_policy_refusal(&spec).is_none()
+            && let Some(plan) = plan.as_ref()
+        {
+            apply_remote_sync_with(&mut spec, plan, "/wt/x", &mut Vec::new(), |_, _| {
+                calls += 1;
+                Ok("/remote/wt".into())
+            });
+        }
+
+        assert!(thegn_core::sandbox::compose_policy_refusal(&spec).is_some());
+        assert_eq!(calls, 0);
     }
 }
