@@ -513,7 +513,8 @@ impl Db {
         let tx = conn.unchecked_transaction()?;
         let changed = tx.execute(
             "UPDATE agent_dispatches SET session_id=?1, artifact_path=?2, status=?3, \
-             run_gen=run_gen+1, exit_code=NULL, exited_at_ms=NULL, native_session_id=NULL, report_head_oid=NULL \
+             run_gen=run_gen+1, exit_code=NULL, exited_at_ms=NULL, native_session_id=NULL, report_head_oid=NULL, \
+             retry_attempt=0, retry_counted_gen=NULL, retry_last_class=NULL \
              WHERE id=?4 AND status IN (?5, ?6)",
             rusqlite::params![
                 session_id,
@@ -730,6 +731,78 @@ impl Db {
                 expected.as_str()
             ],
         )? != 0)
+    }
+
+    /// Count one transport failure for this exact dispatch run generation.
+    /// A duplicate observation, settled row, or moved run returns `None`
+    /// without spending another attempt.
+    pub fn count_dispatch_retry_attempt_run(
+        &self,
+        run: &crate::issue::DispatchRunRef,
+        class: &str,
+    ) -> Result<Option<u32>> {
+        let class: String = class.chars().take(128).collect();
+        let conn = self.conn();
+        let tx = conn.unchecked_transaction()?;
+        let changed = tx.execute(
+            "UPDATE agent_dispatches SET retry_attempt=retry_attempt+1, retry_counted_gen=?1, retry_last_class=?2 \
+             WHERE id=?3 AND status=?5 AND COALESCE(session_id,'')=?4 AND run_gen=?1 \
+             AND (retry_counted_gen IS NULL OR retry_counted_gen<>?1)",
+            rusqlite::params![
+                run.run_gen,
+                class,
+                run.id,
+                run.session_id,
+                AgentDispatchStatus::Running.as_str()
+            ],
+        )?;
+        let count = if changed == 0 {
+            None
+        } else {
+            let value: i64 = tx.query_row(
+                "SELECT retry_attempt FROM agent_dispatches WHERE id=?1",
+                [run.id],
+                |row| row.get(0),
+            )?;
+            Some(u32::try_from(value).unwrap_or(u32::MAX))
+        };
+        tx.commit()?;
+        Ok(count)
+    }
+
+    /// Park a retry row and clear its durable budget in the same update.
+    pub fn compare_and_set_dispatch_retry_settle_run(
+        &self,
+        run: &crate::issue::DispatchRunRef,
+        expected: AgentDispatchStatus,
+        note: &str,
+    ) -> Result<bool> {
+        let note = crate::pipeline_report::note_text(note).map_err(|e| anyhow::anyhow!("{e}"))?;
+        Ok(self.conn().execute(
+            "UPDATE agent_dispatches SET status=?1, note=?2, retry_attempt=0, retry_counted_gen=NULL, retry_last_class=NULL \
+             WHERE id=?3 AND status=?4 AND COALESCE(session_id,'')=?5 AND run_gen=?6",
+            rusqlite::params![
+                AgentDispatchStatus::WaitingHuman.as_str(),
+                note,
+                run.id,
+                expected.as_str(),
+                run.session_id,
+                run.run_gen
+            ],
+        )? != 0)
+    }
+
+    /// Read the durable transport-retry count for a row.
+    pub fn dispatch_retry_attempt(&self, id: i64) -> Result<Option<u32>> {
+        let value = self
+            .conn()
+            .query_row(
+                "SELECT retry_attempt FROM agent_dispatches WHERE id=?1",
+                [id],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()?;
+        Ok(value.map(|n| u32::try_from(n).unwrap_or(u32::MAX)))
     }
 
     /// Store the worker's structured handoff report on a roster row — UPDATE the
@@ -3289,5 +3362,143 @@ mod tests {
             ADMISSION_ACTIVE_STATUSES.as_slice(),
             crate::pipeline_claim::occupying_statuses().as_slice()
         );
+    }
+
+    fn retry_budget_run(db: &Db, issue: &str) -> (i64, crate::issue::DispatchRunRef) {
+        let id = put_row(db, issue, "/wt/retry-budget");
+        assert_eq!(
+            db.publish_dispatch_run(id, "retry-session-1", "artifact.md")
+                .unwrap(),
+            DispatchRunPublishOutcome::Published
+        );
+        (id, db.dispatch_run_ref(id).unwrap().unwrap())
+    }
+
+    #[test]
+    fn retry_budget_counts_once_per_run_generation() {
+        let db = Db::open_memory().unwrap();
+        let (id, first) = retry_budget_run(&db, "linear:THE-976-count");
+        assert_eq!(
+            db.count_dispatch_retry_attempt_run(&first, "transport:x")
+                .unwrap(),
+            Some(1)
+        );
+        assert_eq!(
+            db.count_dispatch_retry_attempt_run(&first, "transport:x")
+                .unwrap(),
+            None
+        );
+        assert_eq!(db.dispatch_retry_attempt(id).unwrap(), Some(1));
+
+        db.update_dispatch_status(id, AgentDispatchStatus::Spawning)
+            .unwrap();
+        assert!(
+            db.compare_and_set_dispatch_retry_run(
+                id,
+                AgentDispatchStatus::Spawning,
+                "retry-session-2",
+                "artifact.md",
+            )
+            .unwrap()
+        );
+        let second = db.dispatch_run_ref(id).unwrap().unwrap();
+        assert_eq!(
+            db.count_dispatch_retry_attempt_run(&second, "transport:y")
+                .unwrap(),
+            Some(2)
+        );
+    }
+
+    #[test]
+    fn retry_budget_survives_a_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("retry-budget.db");
+        let (id, first) = {
+            let db = Db::open_at(&path).unwrap();
+            let (id, first) = retry_budget_run(&db, "linear:THE-976-reopen");
+            assert_eq!(
+                db.count_dispatch_retry_attempt_run(&first, "transport:x")
+                    .unwrap(),
+                Some(1)
+            );
+            db.update_dispatch_status(id, AgentDispatchStatus::Spawning)
+                .unwrap();
+            assert!(
+                db.compare_and_set_dispatch_retry_run(
+                    id,
+                    AgentDispatchStatus::Spawning,
+                    "retry-session-2",
+                    "artifact.md",
+                )
+                .unwrap()
+            );
+            (id, db.dispatch_run_ref(id).unwrap().unwrap())
+        };
+        let reopened = Db::open_at(&path).unwrap();
+        assert_eq!(reopened.dispatch_retry_attempt(id).unwrap(), Some(1));
+        assert_eq!(
+            reopened
+                .count_dispatch_retry_attempt_run(&first, "transport:y")
+                .unwrap(),
+            Some(2)
+        );
+    }
+
+    #[test]
+    fn retry_budget_resets_on_settle_and_on_a_fresh_launch() {
+        let db = Db::open_memory().unwrap();
+        let (id, run) = retry_budget_run(&db, "linear:THE-976-reset");
+        assert_eq!(
+            db.count_dispatch_retry_attempt_run(&run, "transport:x")
+                .unwrap(),
+            Some(1)
+        );
+        assert!(
+            db.compare_and_set_dispatch_retry_settle_run(
+                &run,
+                AgentDispatchStatus::Running,
+                "parked"
+            )
+            .unwrap()
+        );
+        assert_eq!(db.dispatch_retry_attempt(id).unwrap(), Some(0));
+
+        db.update_dispatch_status(id, AgentDispatchStatus::Queued)
+            .unwrap();
+        assert_eq!(
+            db.publish_dispatch_run(id, "human-redrive", "artifact.md")
+                .unwrap(),
+            DispatchRunPublishOutcome::Published
+        );
+        let fresh = db.dispatch_run_ref(id).unwrap().unwrap();
+        assert_eq!(db.dispatch_retry_attempt(id).unwrap(), Some(0));
+        assert_eq!(
+            db.count_dispatch_retry_attempt_run(&fresh, "transport:z")
+                .unwrap(),
+            Some(1)
+        );
+    }
+
+    #[test]
+    fn retry_budget_ignores_a_moved_run() {
+        let db = Db::open_memory().unwrap();
+        let (id, stale) = retry_budget_run(&db, "linear:THE-976-moved");
+        db.update_dispatch_status(id, AgentDispatchStatus::Spawning)
+            .unwrap();
+        assert!(
+            db.compare_and_set_dispatch_retry_run(
+                id,
+                AgentDispatchStatus::Spawning,
+                "replacement",
+                "artifact.md",
+            )
+            .unwrap()
+        );
+        assert_eq!(
+            db.count_dispatch_retry_attempt_run(&stale, "transport:x")
+                .unwrap(),
+            None
+        );
+        assert_eq!(db.dispatch_retry_attempt(id).unwrap(), Some(0));
     }
 }

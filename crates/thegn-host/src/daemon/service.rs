@@ -5585,11 +5585,10 @@ mod tests {
             .insert("s-limit".into(), tomb, now_ms());
 
         // Drive both synthetic exits through the observer's real path.
-        let attempts = std::sync::Mutex::new(std::collections::HashMap::new());
-        pipeline_retry::handle_exit(&svc, "s-retry", 1, &attempts, None)
+        pipeline_retry::handle_exit(&svc, "s-retry", 1, None)
             .await
             .expect("transport exit handled");
-        pipeline_retry::handle_exit(&svc, "s-limit", 1, &attempts, None)
+        pipeline_retry::handle_exit(&svc, "s-limit", 1, None)
             .await
             .expect("limit exit handled");
 
@@ -5680,8 +5679,7 @@ mod tests {
             })
         };
 
-        let attempts = std::sync::Mutex::new(std::collections::HashMap::new());
-        pipeline_retry::handle_exit(&svc, "s-race", 1, &attempts, None)
+        pipeline_retry::handle_exit(&svc, "s-race", 1, None)
             .await
             .expect("transport exit handled");
         flipper.await.unwrap();
@@ -5691,9 +5689,14 @@ mod tests {
             db.get_dispatch(row_id).unwrap().unwrap()
         };
         assert_eq!(row.status, St::Done, "the Lead's verdict must survive");
-        assert!(
-            attempts.lock().unwrap().is_empty(),
-            "a skipped relaunch holds no retry budget"
+        assert_eq!(
+            svc.db
+                .lock()
+                .unwrap()
+                .dispatch_retry_attempt(row_id)
+                .unwrap(),
+            Some(1),
+            "the Lead took the row after this exit spent one durable attempt"
         );
         let note = row.note.unwrap_or_default();
         assert!(note.starts_with("transport: "), "{note}");
@@ -5779,13 +5782,12 @@ mod tests {
             };
             svc.tombs.lock().await.insert(sid.into(), t, now_ms());
         }
-        let attempts = std::sync::Mutex::new(std::collections::HashMap::new());
-        pipeline_retry::handle_exit(&svc, "s-cur", 1, &attempts, None)
+        pipeline_retry::handle_exit(&svc, "s-cur", 1, None)
             .await
             .unwrap();
         // The row `other` has moved on to "s-new-run"; "s-old-run" is stale.
         // (No row carries it, so there is nothing to record against.)
-        pipeline_retry::handle_exit(&svc, "s-old-run", 1, &attempts, None)
+        pipeline_retry::handle_exit(&svc, "s-old-run", 1, None)
             .await
             .unwrap();
         let db = svc.db.lock().unwrap();
