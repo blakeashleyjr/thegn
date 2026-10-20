@@ -93,13 +93,13 @@ fn undo_apply_within<B: GitBackend + ?Sized>(
                 if let Err(pop) = pop {
                     // The stash is kept; say so rather than losing track of it.
                     return match reset {
-                            Err(e) => Err(e.context(format!(
-                                "stash pop also failed ({pop}); your changes remain in the stash"
-                            ))),
-                            Ok(_) => Err(pop.context(
-                                "reset succeeded but stash pop failed; your changes remain in the stash",
-                            )),
-                        };
+                        Err(e) => Err(e.context(format!(
+                            "stash pop also failed ({pop}); your changes remain in the stash"
+                        ))),
+                        Ok(_) => Err(pop.context(
+                            "reset succeeded but stash pop failed; your changes remain in the stash",
+                        )),
+                    };
                 }
             }
             reset?;
@@ -227,6 +227,45 @@ mod tests {
         let mark = CliGit.undo_apply(&loc, &plan, false).unwrap();
         assert!(mark.is_none(), "checkout undos record no mark");
         assert_eq!(CliGit.current_branch(&loc).unwrap(), "main");
+    }
+
+    #[test]
+    fn checkout_undo_refuses_a_held_transaction() {
+        let repo = TestRepo::new("un-checkout-txn");
+        ident(&repo.dir);
+        repo.commit_file("f.txt", "one\n", "c0");
+        git_in(&repo.dir, &["checkout", "-q", "-b", "feat"]);
+        let loc = repo.loc();
+        let plan = UndoPlan::Checkout {
+            branch: "main".into(),
+            undoing: "checkout: moving from main to feat".into(),
+        };
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let worktree = repo.dir.clone();
+        let holder = std::thread::spawn(move || {
+            let txn =
+                thegn_core::util::begin_git_mutation(&worktree, std::time::Duration::from_secs(5))
+                    .unwrap();
+            ready_tx.send(()).unwrap();
+            release_rx.recv().unwrap();
+            drop(txn);
+        });
+        ready_rx.recv().unwrap();
+
+        let error = undo_apply_within(
+            &CliGit,
+            &loc,
+            &plan,
+            false,
+            std::time::Duration::from_millis(100),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("mutation lock"), "{error:#}");
+        assert_eq!(CliGit.current_branch(&loc).unwrap(), "feat");
+
+        release_tx.send(()).unwrap();
+        holder.join().unwrap();
     }
 
     #[test]
