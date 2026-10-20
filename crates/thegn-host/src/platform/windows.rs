@@ -15,6 +15,10 @@ use std::process::{Child, Command};
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 
+#[cfg(test)]
+static FAIL_JOB_ASSIGN_FOR_TEST: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
 impl<R: std::io::Read + std::os::windows::io::AsRawHandle> super::GatePipe for R {
     fn set_nonblocking(&self) -> io::Result<()> {
         gate_pipe_handle_nonblocking(std::os::windows::io::AsRawHandle::as_raw_handle(self))
@@ -790,40 +794,149 @@ pub(crate) fn pty_group(child: &dyn portable_pty::Child) -> Option<GroupHandle> 
     }
 }
 
-/// Spawn `cmd` and assign it to a fresh kill-on-close Job Object. Best-effort:
-/// if job creation/assignment fails the spawn still succeeds with a degraded
-/// (direct-child-only) handle. The spawn→assign window is tiny; grandchildren
-/// spawned inside it escape the job (accepted — same exposure as a unix child
-/// that changes its own pgid).
+/// Spawn `cmd` suspended, assign it to a fresh kill-on-close Job Object, then
+/// resume it. No user code runs before containment succeeds; any setup failure
+/// returns an error and leaves no live child. `CREATE_SUSPENDED` is set through
+/// `CommandExt::creation_flags`, which replaces caller-supplied flags, so
+/// callers of this function must not set creation flags themselves.
 pub fn spawn_grouped(cmd: &mut Command) -> std::io::Result<(std::process::Child, GroupHandle)> {
+    spawn_contained(cmd)
+}
+
+/// Spawn an interactive, non-security-sensitive helper with tree cleanup
+/// when available. Only Job Object setup failures degrade to direct-child
+/// ownership; command spawn failures are returned unchanged.
+pub fn spawn_grouped_best_effort(
+    cmd: &mut Command,
+) -> std::io::Result<(std::process::Child, GroupHandle)> {
+    match spawn_contained_with_stage(cmd) {
+        Ok(children) => Ok(children),
+        Err(failure) if failure.stage == ContainedSpawnStage::Command => Err(failure.error),
+        Err(failure) => {
+            let error = failure.error;
+            tracing::warn!(target: "thegn::platform", %error, "job object containment unavailable; helper runs without tree cleanup");
+            use std::os::windows::process::CommandExt;
+            cmd.creation_flags(0);
+            let child = cmd.spawn()?;
+            let group = GroupHandle {
+                pid: child.id(),
+                job: None,
+            };
+            Ok((child, group))
+        }
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ContainedSpawnStage {
+    Command,
+    Job,
+}
+
+struct ContainedSpawnFailure {
+    stage: ContainedSpawnStage,
+    error: io::Error,
+}
+
+fn spawn_contained(cmd: &mut Command) -> io::Result<(Child, GroupHandle)> {
+    spawn_contained_with_stage(cmd).map_err(|failure| failure.error)
+}
+
+fn spawn_contained_with_stage(
+    cmd: &mut Command,
+) -> Result<(Child, GroupHandle), ContainedSpawnFailure> {
     use std::os::windows::io::AsRawHandle;
-    let child = cmd.spawn()?;
-    let pid = child.id();
-    // SAFETY: standard Job Object setup; every handle is closed on every path
-    // (JobInner owns the success case, the explicit CloseHandle the failure).
+    use std::os::windows::process::CommandExt;
+
+    // SAFETY: the fresh Job Object is either transferred to JobInner or
+    // explicitly closed on every failure path.
     let job = unsafe {
-        let h = CreateJobObjectW(std::ptr::null(), std::ptr::null());
-        if h.is_null() {
-            None
-        } else {
-            let mut info: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = std::mem::zeroed();
-            info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
-            let ok = SetInformationJobObject(
-                h,
-                JobObjectExtendedLimitInformation,
-                (&info as *const JOBOBJECT_EXTENDED_LIMIT_INFORMATION).cast(),
-                std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
-            ) != 0
-                && AssignProcessToJobObject(h, child.as_raw_handle() as HANDLE) != 0;
-            if ok {
-                Some(Arc::new(JobInner(h)))
-            } else {
-                CloseHandle(h);
-                None
-            }
+        let handle = CreateJobObjectW(std::ptr::null(), std::ptr::null());
+        if handle.is_null() {
+            return Err(ContainedSpawnFailure {
+                stage: ContainedSpawnStage::Job,
+                error: io::Error::last_os_error(),
+            });
+        }
+        let mut info: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = std::mem::zeroed();
+        info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+        if SetInformationJobObject(
+            handle,
+            JobObjectExtendedLimitInformation,
+            (&info as *const JOBOBJECT_EXTENDED_LIMIT_INFORMATION).cast(),
+            std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
+        ) == 0
+        {
+            let error = io::Error::last_os_error();
+            CloseHandle(handle);
+            return Err(ContainedSpawnFailure {
+                stage: ContainedSpawnStage::Job,
+                error,
+            });
+        }
+        handle
+    };
+
+    cmd.creation_flags(CREATE_SUSPENDED);
+    let mut child = match cmd.spawn() {
+        Ok(child) => child,
+        Err(error) => {
+            // SAFETY: the configured job is still empty.
+            unsafe { CloseHandle(job) };
+            return Err(ContainedSpawnFailure {
+                stage: ContainedSpawnStage::Command,
+                error,
+            });
         }
     };
-    Ok((child, GroupHandle { pid, job }))
+
+    #[cfg(test)]
+    let force_assignment_failure =
+        FAIL_JOB_ASSIGN_FOR_TEST.swap(false, std::sync::atomic::Ordering::SeqCst);
+    #[cfg(not(test))]
+    let force_assignment_failure = false;
+
+    // SAFETY: the child is suspended and cannot create descendants before
+    // assignment. On success, JobInner takes ownership of `job` below.
+    let assigned = !force_assignment_failure
+        && unsafe { AssignProcessToJobObject(job, child.as_raw_handle() as HANDLE) } != 0;
+    if !assigned {
+        let error = if force_assignment_failure {
+            io::Error::other("forced job assignment failure (test)")
+        } else {
+            io::Error::last_os_error()
+        };
+        let _ = child.kill(); // best-effort: fail-closed spawn cleanup
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "failed containment assignment; reap the suspended child before returning the spawn failure"
+        )]
+        let _ = child.wait();
+        // SAFETY: assignment failed, so the job remains empty.
+        unsafe { CloseHandle(job) };
+        return Err(ContainedSpawnFailure {
+            stage: ContainedSpawnStage::Job,
+            error,
+        });
+    }
+
+    let group = GroupHandle {
+        pid: child.id(),
+        job: Some(Arc::new(JobInner(job))),
+    };
+    if let Err(error) = resume_suspended_gate_process(child.id()) {
+        group.kill();
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "failed to resume only after containment succeeded; reap before refusing spawn"
+        )]
+        let _ = child.wait();
+        return Err(ContainedSpawnFailure {
+            stage: ContainedSpawnStage::Job,
+            error,
+        });
+    }
+    Ok((child, group))
 }
 
 /// Windows' kill-on-close Job Object already ends the tree with thegn.
@@ -833,10 +946,7 @@ pub fn spawn_grouped_die_with_parent(
     spawn_grouped(cmd)
 }
 
-/// Gate spawn is fail-closed: establish a configured kill-on-close Job Object
-/// before creating the command; create the process suspended, assign it to the
-/// job, then resume its sole startup thread. Other callers retain
-/// `spawn_grouped`'s historical degradation.
+/// Gate spawn uses the shared fail-closed suspended-create/assign/resume path.
 fn resume_suspended_gate_process(pid: u32) -> io::Result<()> {
     // SAFETY: snapshot creation takes no borrowed pointers and returns an owned
     // kernel handle which is closed on every path below.
@@ -887,67 +997,7 @@ fn resume_suspended_gate_process(pid: u32) -> io::Result<()> {
 pub fn spawn_gate_grouped(
     cmd: &mut Command,
 ) -> std::io::Result<(std::process::Child, GroupHandle)> {
-    use std::os::windows::io::AsRawHandle;
-    // SAFETY: a fresh Job Object is owned here until transferred to JobInner.
-    let job = unsafe {
-        let handle = CreateJobObjectW(std::ptr::null(), std::ptr::null());
-        if handle.is_null() {
-            return Err(io::Error::last_os_error());
-        }
-        let mut info: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = std::mem::zeroed();
-        info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
-        let configured = SetInformationJobObject(
-            handle,
-            JobObjectExtendedLimitInformation,
-            (&info as *const JOBOBJECT_EXTENDED_LIMIT_INFORMATION).cast(),
-            std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
-        ) != 0;
-        if !configured {
-            let error = io::Error::last_os_error();
-            CloseHandle(handle);
-            return Err(error);
-        }
-        handle
-    };
-    use std::os::windows::process::CommandExt;
-    cmd.creation_flags(CREATE_SUSPENDED);
-    let mut child = match cmd.spawn() {
-        Ok(child) => child,
-        Err(error) => {
-            // SAFETY: release the untransferred, empty Job Object.
-            unsafe { CloseHandle(job) };
-            return Err(error);
-        }
-    };
-    // SAFETY: `child` is suspended and cannot spawn any descendants before its
-    // assignment; on success the retained JobInner owns the job handle.
-    if unsafe { AssignProcessToJobObject(job, child.as_raw_handle() as HANDLE) } == 0 {
-        let error = io::Error::last_os_error();
-        let _ = child.kill(); // best-effort: fail-closed spawn cleanup
-        #[expect(
-            clippy::disallowed_methods,
-            reason = "failed gate containment assignment; reap the direct child before returning the spawn failure"
-        )]
-        let _ = child.wait();
-        // SAFETY: assignment failed, so this remains an empty job.
-        unsafe { CloseHandle(job) };
-        return Err(error);
-    }
-    let pid = child.id();
-    let group = GroupHandle {
-        pid,
-        job: Some(Arc::new(JobInner(job))),
-    };
-    if let Err(error) = resume_suspended_gate_process(pid) {
-        group.kill();
-        #[expect(
-            clippy::disallowed_methods,
-            reason = "failed to resume only after the suspended process was contained; reap before refusing gate spawn"
-        )]
-        let _ = child.wait();
-        return Err(error);
-    }
-    Ok((child, group))
+    spawn_contained(cmd)
 }
 
 /// Query available anonymous-pipe bytes so the gate reader can poll and honor
@@ -1015,10 +1065,10 @@ enum DesktopChildState {
 }
 
 impl DesktopChild {
-    /// Spawn a notifier and retain its Job Object (or degraded direct-child
-    /// ownership when Job Object setup fails).
+    /// Spawn a notifier and retain its Job Object when available; notifiers
+    /// explicitly allow degraded direct-child ownership on Job Object failure.
     pub fn spawn(cmd: &mut Command) -> io::Result<Self> {
-        let (child, group) = spawn_grouped(cmd)?;
+        let (child, group) = spawn_grouped_best_effort(cmd)?;
         Ok(Self {
             child,
             group,
@@ -1195,12 +1245,18 @@ pub fn max_files_per_proc() -> Option<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{Mutex, PoisonError};
+
+    static SPAWN_TEST_LOCK: Mutex<()> = Mutex::new(());
 
     /// The whole tree dies on `terminate()`: spawn `cmd /C ping -n 30 …`
     /// (cmd.exe parent + ping child), terminate the job, and verify the
     /// direct child is gone.
     #[test]
     fn job_terminate_reaps_the_tree() {
+        let _guard = SPAWN_TEST_LOCK
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
         let mut cmd = Command::new("cmd.exe");
         cmd.args(["/C", "ping -n 30 127.0.0.1 > NUL"]);
         let (mut child, group) = spawn_grouped(&mut cmd).expect("spawn under job");
@@ -1214,6 +1270,9 @@ mod tests {
     /// also reaps the tree — the orphan-hygiene guarantee.
     #[test]
     fn dropping_the_last_handle_reaps_the_tree() {
+        let _guard = SPAWN_TEST_LOCK
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
         let mut cmd = Command::new("cmd.exe");
         cmd.args(["/C", "ping -n 30 127.0.0.1 > NUL"]);
         let (child, group) = spawn_grouped(&mut cmd).expect("spawn under job");
@@ -1229,6 +1288,100 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(100));
         }
         panic!("child survived job-handle drop");
+    }
+
+    #[test]
+    fn forced_assignment_failure_returns_err_and_leaves_no_child() {
+        let _guard = SPAWN_TEST_LOCK
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        FAIL_JOB_ASSIGN_FOR_TEST.store(true, std::sync::atomic::Ordering::SeqCst);
+        let mut cmd = Command::new("cmd.exe");
+        cmd.args(["/C", "ping -n 30 127.0.0.1 > NUL"]);
+        assert!(spawn_grouped(&mut cmd).is_err());
+    }
+
+    #[test]
+    fn assignment_failure_marker_child_never_runs() {
+        let _guard = SPAWN_TEST_LOCK
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        let temp = tempfile::tempdir().expect("private marker directory");
+        let marker = temp.path().join("marker");
+        let marker_arg = marker.to_string_lossy().into_owned();
+        let marker_script = format!("echo x> \"{marker_arg}\"");
+        let mut marker_cmd = Command::new("cmd.exe");
+        marker_cmd.args(["/C", marker_script.as_str()]);
+        FAIL_JOB_ASSIGN_FOR_TEST.store(true, std::sync::atomic::Ordering::SeqCst);
+        if let Ok((mut child, group)) = spawn_grouped(&mut marker_cmd) {
+            group.terminate();
+            child
+                .wait()
+                .expect("reap unexpectedly started marker child");
+        }
+        std::thread::sleep(std::time::Duration::from_millis(500));
+        assert!(!marker.exists(), "suspended child must not run user code");
+    }
+
+    #[test]
+    fn best_effort_degrades_on_forced_assignment_failure() {
+        let _guard = SPAWN_TEST_LOCK
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        FAIL_JOB_ASSIGN_FOR_TEST.store(true, std::sync::atomic::Ordering::SeqCst);
+        let mut cmd = Command::new("cmd.exe");
+        cmd.args(["/C", "ping -n 30 127.0.0.1 > NUL"]);
+        let (mut child, group) =
+            spawn_grouped_best_effort(&mut cmd).expect("best-effort helper spawn");
+        assert!(group.job.is_none());
+        group.terminate();
+        child.wait().expect("wait for degraded helper");
+    }
+
+    #[test]
+    fn grandchild_started_immediately_is_in_the_job() {
+        let _guard = SPAWN_TEST_LOCK
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        let mut cmd = Command::new("cmd.exe");
+        cmd.args([
+            "/C",
+            "start /B ping -n 30 127.0.0.1 > NUL & ping -n 30 127.0.0.1 > NUL",
+        ]);
+        let (mut child, group) = spawn_grouped(&mut cmd).expect("spawn under job");
+        let job = group.job.as_ref().expect("job assignment must succeed").0;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        let mut observed_grandchild = false;
+        while std::time::Instant::now() < deadline {
+            let mut info: JOBOBJECT_BASIC_ACCOUNTING_INFORMATION = unsafe { std::mem::zeroed() };
+            // SAFETY: `job` is retained by `group`, and `info` is writable.
+            let queried = unsafe {
+                QueryInformationJobObject(
+                    job,
+                    JobObjectBasicAccountingInformation,
+                    (&mut info as *mut JOBOBJECT_BASIC_ACCOUNTING_INFORMATION).cast(),
+                    std::mem::size_of::<JOBOBJECT_BASIC_ACCOUNTING_INFORMATION>() as u32,
+                    std::ptr::null_mut(),
+                )
+            } != 0;
+            assert!(queried, "query job accounting");
+            if info.ActiveProcesses >= 2 {
+                observed_grandchild = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(25));
+        }
+        assert!(
+            observed_grandchild,
+            "grandchild must be assigned before execution"
+        );
+        group.terminate();
+        child.wait().expect("wait for contained parent");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !group.is_empty() && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(25));
+        }
+        assert!(group.is_empty(), "job tree must be reaped");
     }
 }
 
