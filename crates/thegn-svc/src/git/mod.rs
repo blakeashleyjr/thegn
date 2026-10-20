@@ -780,6 +780,22 @@ fn run_status(loc: &GitLoc, args: &[&str]) -> Result<(i32, String)> {
     ))
 }
 
+/// Run a local, non-bridged git read while preserving arbitrary stdout bytes.
+fn run_status_bytes(loc: &GitLoc, args: &[&str]) -> Result<(i32, Vec<u8>)> {
+    anyhow::ensure!(
+        local_cli(loc),
+        "raw git output is only available for local CLI locations"
+    );
+    let guarded_args = read_argv(loc, args);
+    let out = output_bounded(loc.git_command(&guarded_args), args)
+        .with_context(|| format!("git {}", args.join(" ")))?;
+    Ok((out.status.code().unwrap_or(-1), out.stdout))
+}
+
+fn local_cli(loc: &GitLoc) -> bool {
+    !loc.is_remote() && crate::bridge::for_loc(loc).is_none()
+}
+
 /// Probe whether a rebase is in progress over the persistent bridge, for the
 /// `merge_state` banner. `merge_state`'s other probes are single `rev-parse`s
 /// that ride `run_status`; this one keys off the on-disk `rebase-{merge,apply}/
@@ -1094,6 +1110,110 @@ pub(crate) fn parse_numstat(out: &str) -> Result<Vec<DiffEntry>> {
     Ok(v)
 }
 
+/// Parse NUL-framed `git diff --numstat -z` output without decoding paths lossily.
+pub(crate) fn parse_numstat_z(out: &[u8]) -> Result<Vec<DiffEntry>> {
+    fn count(bytes: &[u8]) -> Option<u32> {
+        if bytes.is_empty() || bytes.len() > 10 || !bytes.iter().all(u8::is_ascii_digit) {
+            return None;
+        }
+        std::str::from_utf8(bytes).ok()?.parse().ok()
+    }
+
+    let mut entries = Vec::new();
+    let mut cursor = 0;
+    while cursor < out.len() {
+        let end = out[cursor..]
+            .iter()
+            .position(|byte| *byte == 0)
+            .map(|offset| cursor + offset)
+            .context("malformed numstat -z record: missing NUL terminator")?;
+        let record = &out[cursor..end];
+        cursor = end + 1;
+        let first = record
+            .iter()
+            .position(|byte| *byte == b'\t')
+            .context("malformed numstat -z record: missing fields")?;
+        let second_rel = record[first + 1..]
+            .iter()
+            .position(|byte| *byte == b'\t')
+            .context("malformed numstat -z record: missing fields")?;
+        let second = first + 1 + second_rel;
+        let (added, deleted) = (&record[..first], &record[first + 1..second]);
+        let mut path = &record[second + 1..];
+        if path.is_empty() {
+            let old_end = out[cursor..]
+                .iter()
+                .position(|byte| *byte == 0)
+                .map(|offset| cursor + offset)
+                .context("malformed numstat -z rename: missing old path")?;
+            anyhow::ensure!(
+                old_end > cursor,
+                "malformed numstat -z rename: empty old path"
+            );
+            cursor = old_end + 1;
+            let new_end = out[cursor..]
+                .iter()
+                .position(|byte| *byte == 0)
+                .map(|offset| cursor + offset)
+                .context("malformed numstat -z rename: missing new path")?;
+            anyhow::ensure!(
+                new_end > cursor,
+                "malformed numstat -z rename: empty new path"
+            );
+            path = &out[cursor..new_end];
+            cursor = new_end + 1;
+        }
+        anyhow::ensure!(!path.is_empty(), "malformed numstat -z record: empty path");
+        let path = match std::str::from_utf8(path) {
+            Ok(path) => path.to_owned(),
+            Err(_) => quote_c_path(path),
+        };
+        if added == b"-" && deleted == b"-" {
+            entries.push(DiffEntry {
+                added: 0,
+                deleted: 0,
+                path,
+                binary: true,
+            });
+        } else {
+            let (Some(added), Some(deleted)) = (count(added), count(deleted)) else {
+                anyhow::bail!("malformed numstat -z record: bad line counts");
+            };
+            entries.push(DiffEntry {
+                added,
+                deleted,
+                path,
+                binary: false,
+            });
+        }
+    }
+    Ok(entries)
+}
+
+fn quote_c_path(bytes: &[u8]) -> String {
+    let mut quoted = String::from("\"");
+    for byte in bytes {
+        match byte {
+            b'"' => quoted.push_str("\\\""),
+            b'\\' => quoted.push_str("\\\\"),
+            b'\x07' => quoted.push_str("\\a"),
+            b'\x08' => quoted.push_str("\\b"),
+            b'\t' => quoted.push_str("\\t"),
+            b'\n' => quoted.push_str("\\n"),
+            b'\x0b' => quoted.push_str("\\v"),
+            b'\x0c' => quoted.push_str("\\f"),
+            b'\r' => quoted.push_str("\\r"),
+            0..=0x1f | 0x7f..=u8::MAX => {
+                use std::fmt::Write as _;
+                write!(quoted, "\\{byte:03o}").unwrap();
+            }
+            _ => quoted.push(char::from(*byte)),
+        }
+    }
+    quoted.push('"');
+    quoted
+}
+
 /// Decode a Git C-quoted numstat path when it is representable as UTF-8.
 /// Invalid byte paths retain Git's quoted ASCII spelling, avoiding lossy
 /// replacement-character aliases in the string-based panel protocol.
@@ -1229,6 +1349,11 @@ pub(crate) fn sum_numstat(out: &str) -> Result<(u32, u32)> {
 /// Parse numstat rows and preserve binary and overflow observations.
 pub(crate) fn typed_numstat(out: &str) -> Result<(DiffCount, DiffCount)> {
     let entries = parse_numstat(out)?;
+    Ok(typed_totals(Ok(&entries)))
+}
+
+pub(crate) fn typed_numstat_z(out: &[u8]) -> Result<(DiffCount, DiffCount)> {
+    let entries = parse_numstat_z(out)?;
     Ok(typed_totals(Ok(&entries)))
 }
 
@@ -1837,21 +1962,53 @@ fn local_glyph_reads(
         dirty: git.is_dirty(loc),
         ahead_behind: git.ahead_behind(loc),
         branch: git.current_branch(loc),
-        uncommitted: run_status(
-            loc,
-            &[
-                "diff",
-                "--no-ext-diff",
-                "--no-textconv",
-                "--numstat",
-                "HEAD",
-            ],
-        )
-        .and_then(|(exit, out)| {
-            anyhow::ensure!(exit == 0, "git diff --numstat HEAD failed");
-            typed_numstat(&out)
-        }),
+        uncommitted: if local_cli(loc) {
+            run_status_bytes(
+                loc,
+                &[
+                    "diff",
+                    "--no-ext-diff",
+                    "--no-textconv",
+                    "--numstat",
+                    "-z",
+                    "--no-renames",
+                    "HEAD",
+                ],
+            )
+            .and_then(|(exit, out)| {
+                anyhow::ensure!(exit == 0, "git diff --numstat HEAD failed");
+                typed_numstat_z(&out)
+            })
+        } else {
+            run_status(
+                loc,
+                &[
+                    "diff",
+                    "--no-ext-diff",
+                    "--no-textconv",
+                    "--numstat",
+                    "HEAD",
+                ],
+            )
+            .and_then(|(exit, out)| {
+                anyhow::ensure!(exit == 0, "git diff --numstat HEAD failed");
+                typed_numstat(&out)
+            })
+        },
         branch_diff: match &base {
+            Some(b) if local_cli(loc) => run_status_bytes(
+                loc,
+                &[
+                    "diff",
+                    "--no-ext-diff",
+                    "--no-textconv",
+                    "--numstat",
+                    "-z",
+                    "--no-renames",
+                    &format!("{b}...HEAD"),
+                ],
+            )
+            .and_then(|(exit, out)| (exit == 0).then(|| typed_numstat_z(&out)).transpose()),
             Some(b) => run_status(
                 loc,
                 &[
@@ -1887,12 +2044,29 @@ fn numstat_totals(loc: &GitLoc, spec: &str) -> Result<(DiffCount, DiffCount)> {
     {
         return Ok(t);
     }
-    let (exit, out) = run_status(
-        loc,
-        &["diff", "--no-ext-diff", "--no-textconv", "--numstat", spec],
-    )?;
-    anyhow::ensure!(exit == 0, "git diff --numstat {spec} failed");
-    typed_numstat(&out)
+    if local_cli(loc) {
+        let (exit, out) = run_status_bytes(
+            loc,
+            &[
+                "diff",
+                "--no-ext-diff",
+                "--no-textconv",
+                "--numstat",
+                "-z",
+                "--no-renames",
+                spec,
+            ],
+        )?;
+        anyhow::ensure!(exit == 0, "git diff --numstat {spec} failed");
+        typed_numstat_z(&out)
+    } else {
+        let (exit, out) = run_status(
+            loc,
+            &["diff", "--no-ext-diff", "--no-textconv", "--numstat", spec],
+        )?;
+        anyhow::ensure!(exit == 0, "git diff --numstat {spec} failed");
+        typed_numstat(&out)
+    }
 }
 
 /// The gix backend's glyph reads: [`local_glyph_reads`]'s shape, but with the
@@ -2155,19 +2329,38 @@ impl GitBackend for CliGit {
         // without passing through String::from_utf8_lossy. Valid UTF-8 quoted
         // paths are decoded by `parse_numstat` for the status join.
         let base = op::revision(base)?;
-        let out = run(
-            loc,
-            &[
-                "-c",
-                "core.quotePath=true",
-                "diff",
-                "--no-ext-diff",
-                "--no-textconv",
-                "--numstat",
-                base,
-            ],
-        )?;
-        parse_numstat(&out)
+        if local_cli(loc) {
+            let (exit, out) = run_status_bytes(
+                loc,
+                &[
+                    "-c",
+                    "core.quotePath=true",
+                    "diff",
+                    "--no-ext-diff",
+                    "--no-textconv",
+                    "--numstat",
+                    "-z",
+                    "--no-renames",
+                    base,
+                ],
+            )?;
+            anyhow::ensure!(exit == 0, "git diff --numstat {base} failed");
+            parse_numstat_z(&out)
+        } else {
+            let out = run(
+                loc,
+                &[
+                    "-c",
+                    "core.quotePath=true",
+                    "diff",
+                    "--no-ext-diff",
+                    "--no-textconv",
+                    "--numstat",
+                    base,
+                ],
+            )?;
+            parse_numstat(&out)
+        }
     }
 
     fn branches(&self, loc: &GitLoc) -> Result<Vec<Branch>> {
@@ -3138,6 +3331,87 @@ mod tests {
         // Two max-sized files overflow the aggregate: saturate, never panic or wrap.
         let out = format!("{max}\t{max}\ta\n1\t1\tb\n");
         assert_eq!(sum_numstat(&out).unwrap(), (max, max));
+    }
+
+    #[test]
+    fn numstat_z_parses_normal_binary_and_rename_records() {
+        let rows = parse_numstat_z(
+            b"2\t1\tfile\twith-tab\0-\t-\timage.png\x003\t4\t\0old\nname\0new\tname\0",
+        )
+        .unwrap();
+        assert_eq!(rows.len(), 3);
+        assert_eq!(
+            (rows[0].added, rows[0].deleted, rows[0].path.as_str()),
+            (2, 1, "file\twith-tab")
+        );
+        assert!(rows[1].binary);
+        assert_eq!(rows[1].path, "image.png");
+        assert_eq!(
+            (rows[2].added, rows[2].deleted, rows[2].path.as_str()),
+            (3, 4, "new\tname")
+        );
+        assert_eq!(
+            parse_numstat_z(b"1\t0\tquote\"and\\slash\0").unwrap()[0].path,
+            "quote\"and\\slash"
+        );
+        assert!(parse_numstat_z(b"").unwrap().is_empty());
+    }
+
+    #[test]
+    fn numstat_z_rejects_truncated_and_malformed_records() {
+        for bad in [
+            &b"1\t2\tpath"[..],
+            &b"1\tpath\0"[..],
+            &b"1\t2\t\0"[..],
+            &b"1\t2\t\0old\0"[..],
+            &b"x\t2\tpath\0"[..],
+            &b"4294967296\t0\tpath\0"[..],
+            &b"-\t2\tpath\0"[..],
+        ] {
+            assert!(parse_numstat_z(bad).is_err(), "{bad:?} must be rejected");
+        }
+    }
+
+    #[test]
+    fn numstat_z_quote_round_trips_invalid_utf8() {
+        let bytes = b"bad\xff\tx";
+        let quoted = quote_c_path(bytes);
+        assert_eq!(quoted, "\"bad\\377\\tx\"");
+        assert_eq!(unquote_c_path(&quoted).as_deref(), Some(bytes.as_slice()));
+    }
+
+    #[test]
+    fn numstat_z_cli_diff_files_round_trips_tab_and_newline_paths() {
+        let repo = testutil::TestRepo::new("numstat-z-paths");
+        let tab_path = "a\tb.txt";
+        let newline_path = "line\nbreak.txt";
+        std::fs::write(repo.dir.join(tab_path), "before\n").unwrap();
+        std::fs::write(repo.dir.join(newline_path), "before\n").unwrap();
+        testutil::git_in(&repo.dir, &["add", "--", tab_path, newline_path]);
+        testutil::git_in(
+            &repo.dir,
+            &[
+                "-c",
+                "commit.gpgsign=false",
+                "commit",
+                "-q",
+                "-m",
+                "initial",
+            ],
+        );
+        std::fs::write(repo.dir.join(tab_path), "after\n").unwrap();
+        std::fs::write(repo.dir.join(newline_path), "after\n").unwrap();
+
+        let mut paths = CliGit
+            .diff_files(&repo.loc(), "HEAD")
+            .unwrap()
+            .into_iter()
+            .map(|entry| entry.path)
+            .collect::<Vec<_>>();
+        paths.sort();
+        let mut expected = vec![tab_path.to_owned(), newline_path.to_owned()];
+        expected.sort();
+        assert_eq!(paths, expected);
     }
 
     #[test]
