@@ -432,7 +432,7 @@ fn later_snapshot_failure_reports_partial_authorized_snapshots_without_rollback(
 }
 
 #[test]
-fn first_snapshot_hook_cannot_replace_later_git_identity_and_readmit_it() {
+fn first_snapshot_hook_is_fenced_and_cannot_replace_later_git_identity() {
     let f = Fixture::new();
     if !f.supported_or_refused() {
         return;
@@ -474,15 +474,13 @@ fn first_snapshot_hook_cannot_replace_later_git_identity_and_readmit_it() {
         &f.repo,
         &["config", "core.hooksPath", hooks.to_str().unwrap()],
     );
-    let error = f.snapshot_selected(&selected).unwrap_err();
-    assert!(
-        error
-            .to_string()
-            .contains("1 earlier authorized snapshots may remain")
-    );
-    assert_eq!(std::fs::read(marker).unwrap(), b"ran");
+    // THE-225: automatic snapshot commits run with hooks disabled, so the
+    // planted post-commit hook never runs and cannot swap the later worktree's
+    // gitfile; both selected snapshots go through on their own identity.
+    f.snapshot_selected(&selected).unwrap();
+    assert!(!marker.exists(), "a repository hook ran during an automatic snapshot");
     assert_ne!(git(&f.queued, &["rev-parse", "HEAD"]), first_before);
-    assert_eq!(Fixture::snapshot(&f.unqueued), later_before);
+    assert_ne!(Fixture::snapshot(&f.unqueued), later_before);
     assert_eq!(std::fs::read(original).unwrap(), gitfile_before);
     assert!(!replacement.exists());
 }
