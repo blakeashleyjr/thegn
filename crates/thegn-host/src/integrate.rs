@@ -126,6 +126,9 @@ pub(crate) use persistence::run_selected_fold;
 use persistence::{observe_outcomes, persist};
 #[path = "integrate_git_fence.rs"]
 mod git_fence;
+pub(crate) fn candidate_is_ancestor(repo_root: &Path, candidate: &str, tip: &str) -> bool {
+    git_fence::ok(repo_root, &["merge-base", "--is-ancestor", candidate, tip])
+}
 #[path = "integrate_rerere.rs"]
 mod rerere;
 pub(crate) use rerere::cache_status as rerere_cache_status;
