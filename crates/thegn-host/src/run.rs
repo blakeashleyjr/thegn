@@ -2005,12 +2005,14 @@ fn connect_worktree_bridge(
         if matches!(env.placement, thegn_core::placement::Placement::Provider(_))
             && let Some(bin) = crate::bridge_sup::bridge_binary_path()
         {
-            crate::agent::ensure_remote_bridge(
+            if !crate::agent::ensure_remote_bridge(
                 &cfg,
                 env_name.as_deref().unwrap_or_default(),
                 &bin,
                 &crate::bridge_sup::remote_thegn(),
-            );
+            ) {
+                return;
+            }
         }
         // Reverse host→sandbox tunnels, all over the resident bridge:
         //  • host services / host-bound MCP: each `[sandbox.home]
