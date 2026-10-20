@@ -59,9 +59,10 @@ snapshot is attached. Both text and `--json` retain exit-zero inspection
 semantics; `plugin check` remains the validation command with failure exits.
 
 Startup, reload, `thegn plugin list` and `thegn plugin check` use the same
-admitted plugin set. Its decisions and reasons, including set-wide problems
-such as duplicate IDs, are shared with inspection, along with the source
-digests recorded when the set was admitted.
+admitted plugin set. `plugin list` therefore shows the same admit or refuse
+decision and reason that `plugin check` reports, including set-wide problems
+such as duplicate IDs, together with the source digest each plugin was
+admitted with.
 
 ## Modes and rendering
 
