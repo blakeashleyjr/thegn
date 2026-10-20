@@ -439,6 +439,20 @@ fn checked_task_id(raw: &str) -> Result<&str, IssueError> {
     checked_id(raw.strip_prefix("kaneo:").unwrap_or(raw), "Kaneo task id")
 }
 
+fn partial_update(
+    applied: &[&'static str],
+    unapplied: &[&'static str],
+    unverified: &[&'static str],
+    source: IssueError,
+) -> IssueError {
+    IssueError::PartialUpdate {
+        applied: applied.to_vec(),
+        unapplied: unapplied.to_vec(),
+        unverified: unverified.to_vec(),
+        source: Box::new(source),
+    }
+}
+
 /// Fetch a project's columns and resolve the column slug whose derived status
 /// matches `target` (used to translate an [`IssueStatus`] update back into the
 /// project-scoped column Kaneo expects). Returns `None` when the project has no
@@ -747,18 +761,38 @@ impl IssueBackend for KaneoBackend {
             op.prepare().await?;
             let task_id = checked_task_id(id)?;
 
+            let mut requested = Vec::new();
+            if patch.title.is_some() {
+                requested.push("title");
+            }
+            if patch.priority.is_some() {
+                requested.push("priority");
+            }
+            if patch.status.is_some() {
+                requested.push("status");
+            }
+            let mut applied = Vec::new();
+
             if let Some(title) = &patch.title {
                 #[derive(Serialize)]
                 struct TitleBody<'a> {
                     title: &'a str,
                 }
-                let _: serde_json::Value = Self::send_body(
+                let result: Result<serde_json::Value, IssueError> = Self::send_body(
                     &mut op,
                     reqwest::Method::PUT,
                     &format!("task/title/{task_id}"),
                     &TitleBody { title },
                 )
-                .await?;
+                .await;
+                if let Err(error) = result {
+                    return Err(if applied.is_empty() {
+                        error
+                    } else {
+                        partial_update(&applied, &requested[applied.len()..], &[], error)
+                    });
+                }
+                applied.push("title");
             }
 
             if let Some(p) = patch.priority {
@@ -766,7 +800,7 @@ impl IssueBackend for KaneoBackend {
                 struct PrioBody {
                     priority: &'static str,
                 }
-                let _: serde_json::Value = Self::send_body(
+                let result: Result<serde_json::Value, IssueError> = Self::send_body(
                     &mut op,
                     reqwest::Method::PUT,
                     &format!("task/priority/{task_id}"),
@@ -774,33 +808,123 @@ impl IssueBackend for KaneoBackend {
                         priority: priority_to_kaneo(p),
                     },
                 )
-                .await?;
+                .await;
+                if let Err(error) = result {
+                    return Err(if applied.is_empty() {
+                        error
+                    } else {
+                        partial_update(&applied, &requested[applied.len()..], &[], error)
+                    });
+                }
+                applied.push("priority");
             }
 
+            let mut status_slug = None;
             if let Some(status) = patch.status {
                 // Resolve the target status to a project column slug first (needs
                 // the task's project id).
-                let task: KaneoTask = Self::get(&mut op, &format!("task/{task_id}")).await?;
-                checked_id(&task.project_id, "Kaneo project id")?;
-                if let Some(slug) = resolve_status_slug(&mut op, &task.project_id, status).await? {
+                let task: KaneoTask = match Self::get(&mut op, &format!("task/{task_id}")).await {
+                    Ok(task) => task,
+                    Err(error) => {
+                        return Err(if applied.is_empty() {
+                            error
+                        } else {
+                            partial_update(&applied, &["status"], &[], error)
+                        });
+                    }
+                };
+                if let Err(error) = checked_id(&task.project_id, "Kaneo project id") {
+                    return Err(if applied.is_empty() {
+                        error
+                    } else {
+                        partial_update(&applied, &["status"], &[], error)
+                    });
+                }
+                let slug = match resolve_status_slug(&mut op, &task.project_id, status).await {
+                    Ok(Some(slug)) => slug,
+                    Ok(None) => {
+                        let error = IssueError::Api("Kaneo status target unavailable".into());
+                        return Err(if applied.is_empty() {
+                            error
+                        } else {
+                            partial_update(&applied, &["status"], &[], error)
+                        });
+                    }
+                    Err(error) => {
+                        return Err(if applied.is_empty() {
+                            error
+                        } else {
+                            partial_update(&applied, &["status"], &[], error)
+                        });
+                    }
+                };
+                {
                     #[derive(Serialize)]
                     struct StatusBody {
                         status: String,
                     }
-                    let _: serde_json::Value = Self::send_body(
+                    let result: Result<serde_json::Value, IssueError> = Self::send_body(
                         &mut op,
                         reqwest::Method::PUT,
                         &format!("task/status/{task_id}"),
-                        &StatusBody { status: slug },
+                        &StatusBody {
+                            status: slug.clone(),
+                        },
                     )
-                    .await?;
-                } else {
-                    return Err(IssueError::Api("Kaneo status target unavailable".into()));
+                    .await;
+                    if let Err(error) = result {
+                        return Err(if applied.is_empty() {
+                            error
+                        } else {
+                            partial_update(&applied, &["status"], &[], error)
+                        });
+                    }
                 }
+                status_slug = Some(slug);
+                applied.push("status");
             }
 
             // Return the refreshed task.
-            let task: KaneoTask = Self::get(&mut op, &format!("task/{task_id}")).await?;
+            let task: KaneoTask = match Self::get(&mut op, &format!("task/{task_id}")).await {
+                Ok(task) => task,
+                Err(error) => {
+                    return Err(if applied.is_empty() {
+                        error
+                    } else {
+                        partial_update(&applied, &[], &[], error)
+                    });
+                }
+            };
+            let mut verified = Vec::new();
+            let mut unverified = Vec::new();
+            for field in applied {
+                let matches = match field {
+                    "title" => patch
+                        .title
+                        .as_deref()
+                        .is_some_and(|title| task.title.trim() == title.trim()),
+                    "priority" => patch
+                        .priority
+                        .is_some_and(|priority| map_priority(&task.priority) == priority),
+                    "status" => status_slug
+                        .as_deref()
+                        .is_some_and(|slug| task.status == slug),
+                    _ => false,
+                };
+                if matches {
+                    verified.push(field);
+                } else {
+                    unverified.push(field);
+                }
+            }
+            if !unverified.is_empty() {
+                return Err(partial_update(
+                    &verified,
+                    &[],
+                    &unverified,
+                    IssueError::Api("Kaneo did not apply the requested fields".into()),
+                ));
+            }
             let status = map_column_status(&task.status, &task.status, false);
             task_to_domain(task, status, &self.base_url, self.workspace_id.as_deref())
         })
@@ -1223,6 +1347,187 @@ mod tests {
             calls.lock().unwrap().as_slice(),
             ["GET /api/task/tasks/p1?limit=100"]
         );
+        server.abort();
+        assert!(server.await.unwrap_err().is_cancelled());
+    }
+
+    #[tokio::test]
+    async fn update_success_is_verified_by_refetch() {
+        let task = json!({
+            "id": "t1", "status": "done", "projectId": "p1", "title": "New title", "priority": "high"
+        });
+        let (backend, server, calls) = kaneo_fixture(
+            vec![
+                ("/api/task/title/t1".into(), StatusCode::OK, "{}".into()),
+                ("/api/task/priority/t1".into(), StatusCode::OK, "{}".into()),
+                ("/api/task/t1".into(), StatusCode::OK, task.to_string()),
+                (
+                    "/api/task/tasks/p1".into(),
+                    StatusCode::OK,
+                    json!({
+                        "data": {"columns": [{"slug": "done", "name": "Done", "isFinal": true}]}
+                    })
+                    .to_string(),
+                ),
+                ("/api/task/status/t1".into(), StatusCode::OK, "{}".into()),
+            ],
+            Some("p1".into()),
+        )
+        .await;
+        let result = backend
+            .update_issue(
+                "t1",
+                &IssuePatch {
+                    title: Some("New title".into()),
+                    priority: Some(IssuePriority::High),
+                    status: Some(IssueStatus::Done),
+                    ..Default::default()
+                },
+            )
+            .await;
+        assert!(
+            result.is_ok(),
+            "matching refetch should verify all writes: {result:?}"
+        );
+        assert_eq!(
+            calls.lock().unwrap().as_slice(),
+            [
+                "PUT /api/task/title/t1",
+                "PUT /api/task/priority/t1",
+                "GET /api/task/t1",
+                "GET /api/task/tasks/p1?limit=1",
+                "PUT /api/task/status/t1",
+                "GET /api/task/t1",
+            ]
+        );
+        server.abort();
+        assert!(server.await.unwrap_err().is_cancelled());
+    }
+
+    #[tokio::test]
+    async fn priority_failure_after_title_reports_partial_update() {
+        let (backend, server, calls) = kaneo_fixture(
+            vec![
+                ("/api/task/title/t1".into(), StatusCode::OK, "{}".into()),
+                (
+                    "/api/task/priority/t1".into(),
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "failure".into(),
+                ),
+            ],
+            Some("p1".into()),
+        )
+        .await;
+        let result = backend
+            .update_issue(
+                "t1",
+                &IssuePatch {
+                    title: Some("New title".into()),
+                    priority: Some(IssuePriority::High),
+                    status: Some(IssueStatus::Done),
+                    ..Default::default()
+                },
+            )
+            .await;
+        match result {
+            Err(IssueError::PartialUpdate {
+                applied,
+                unapplied,
+                unverified,
+                ..
+            }) => {
+                assert_eq!(applied, vec!["title"]);
+                assert_eq!(unapplied, vec!["priority", "status"]);
+                assert!(unverified.is_empty());
+            }
+            other => panic!("expected partial update, got {other:?}"),
+        }
+        assert_eq!(calls.lock().unwrap().len(), 2);
+        server.abort();
+        assert!(server.await.unwrap_err().is_cancelled());
+    }
+
+    #[tokio::test]
+    async fn mismatched_refetch_reports_unverified_fields() {
+        let task = json!({
+            "id": "t1", "status": "backlog", "projectId": "p1", "title": "Old title", "priority": "medium"
+        });
+        let (backend, server, _) = kaneo_fixture(
+            vec![
+                ("/api/task/title/t1".into(), StatusCode::OK, "{}".into()),
+                ("/api/task/priority/t1".into(), StatusCode::OK, "{}".into()),
+                ("/api/task/t1".into(), StatusCode::OK, task.to_string()),
+            ],
+            Some("p1".into()),
+        )
+        .await;
+        let result = backend
+            .update_issue(
+                "t1",
+                &IssuePatch {
+                    title: Some("New title".into()),
+                    priority: Some(IssuePriority::High),
+                    ..Default::default()
+                },
+            )
+            .await;
+        match result {
+            Err(IssueError::PartialUpdate {
+                applied,
+                unapplied,
+                unverified,
+                ..
+            }) => {
+                assert!(applied.is_empty());
+                assert!(unapplied.is_empty());
+                assert_eq!(unverified, vec!["title", "priority"]);
+            }
+            other => panic!("expected unverified fields, got {other:?}"),
+        }
+        server.abort();
+        assert!(server.await.unwrap_err().is_cancelled());
+    }
+
+    #[tokio::test]
+    async fn status_target_unavailable_after_title_is_partial() {
+        let task =
+            json!({"id": "t1", "status": "backlog", "projectId": "p1", "title": "New title"});
+        let (backend, server, _) = kaneo_fixture(
+            vec![
+                ("/api/task/title/t1".into(), StatusCode::OK, "{}".into()),
+                ("/api/task/t1".into(), StatusCode::OK, task.to_string()),
+                (
+                    "/api/task/tasks/p1".into(),
+                    StatusCode::OK,
+                    json!({"data": {"columns": []}}).to_string(),
+                ),
+            ],
+            Some("p1".into()),
+        )
+        .await;
+        let result = backend
+            .update_issue(
+                "t1",
+                &IssuePatch {
+                    title: Some("New title".into()),
+                    status: Some(IssueStatus::InProgress),
+                    ..Default::default()
+                },
+            )
+            .await;
+        match result {
+            Err(IssueError::PartialUpdate {
+                applied,
+                unapplied,
+                unverified,
+                ..
+            }) => {
+                assert_eq!(applied, vec!["title"]);
+                assert_eq!(unapplied, vec!["status"]);
+                assert!(unverified.is_empty());
+            }
+            other => panic!("expected partial update, got {other:?}"),
+        }
         server.abort();
         assert!(server.await.unwrap_err().is_cancelled());
     }

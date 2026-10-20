@@ -81,8 +81,8 @@ fn handle(stream: TcpStream, rec: Arc<Mutex<Vec<Recorded>>>) {
 
     // Seeded responses: documented DigitalOcean shapes.
     let resp = match (method.as_str(), path.as_str()) {
-        ("GET", "/v2/account/keys") => {
-            r#"{"ssh_keys":[{"id":9,"public_key":"ssh-ed25519 OTHERKEY someone"}]}"#.to_string()
+        ("GET", "/v2/account/keys?page=1&per_page=200") => {
+            r#"{"ssh_keys":[{"id":9,"public_key":"ssh-ed25519 OTHERKEY someone"}],"meta":{"total":1}}"#.to_string()
         }
         ("POST", "/v2/account/keys") => r#"{"ssh_key":{"id":42}}"#.to_string(),
         // Created: status "new", no public network yet (skip_ready_wait bypasses
@@ -91,7 +91,7 @@ fn handle(stream: TcpStream, rec: Arc<Mutex<Vec<Recorded>>>) {
             r#"{"droplet":{"id":101,"name":"tg-do-1","status":"new","created_at":"2026-07-01T12:00:00Z"}}"#.to_string()
         }
         (m, p) if m == "GET" && p.starts_with("/v2/droplets?") => {
-            r#"{"droplets":[{"id":101,"name":"tg-do-1","status":"active","created_at":"2026-07-01T12:00:00Z","networks":{"v4":[{"ip_address":"10.1.0.5","type":"private"},{"ip_address":"203.0.113.9","type":"public"}]},"tags":["tg-managed","tg-host:h1"]}]}"#.to_string()
+            r#"{"droplets":[{"id":101,"name":"tg-do-1","status":"active","created_at":"2026-07-01T12:00:00Z","networks":{"v4":[{"ip_address":"10.1.0.5","type":"private"},{"ip_address":"203.0.113.9","type":"public"}]},"tags":["tg-managed","tg-host:h1"]}],"meta":{"total":1}}"#.to_string()
         }
         ("DELETE", "/v2/droplets/101") => String::new(),
         _ => {
@@ -150,7 +150,7 @@ fn create_list_destroy_round_trip_with_ledger() {
     let key_list = &reqs[0];
     assert_eq!(
         (key_list.method.as_str(), key_list.path.as_str()),
-        ("GET", "/v2/account/keys")
+        ("GET", "/v2/account/keys?page=1&per_page=200")
     );
     assert_eq!(key_list.auth, "Bearer mock-token");
     let key_create = &reqs[1];
@@ -199,6 +199,11 @@ fn create_list_destroy_round_trip_with_ledger() {
     assert!(
         last.path.contains("tag_name=tg-managed"),
         "list is tag-filtered: {}",
+        last.path
+    );
+    assert!(
+        last.path.contains("per_page=200") && last.path.contains("page=1"),
+        "list requests the first paginated page: {}",
         last.path
     );
 

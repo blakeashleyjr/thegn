@@ -455,6 +455,170 @@ fn sealed_home_refusal_is_structured_and_keeps_its_display() {
     }
 }
 
+#[cfg(unix)]
+#[test]
+fn required_mount_symlink_loop_is_refused() {
+    use std::os::unix::fs::symlink;
+
+    let td = private_tempdir();
+    let a = td.path().join("a");
+    let b = td.path().join("b");
+    symlink(&b, &a).unwrap();
+    symlink(&a, &b).unwrap();
+    let path = a.to_string_lossy().into_owned();
+    let mut s = spec(Backend::Bwrap);
+    s.mounts = vec![Mount {
+        host: path.clone(),
+        dest: path.clone(),
+        ro: false,
+        cache: false,
+    }];
+
+    match enter_argv(&s, "true") {
+        Err(EnterError::Refused(refusal)) => {
+            assert_eq!(refusal.class, RefusalClass::MountUnresolvable);
+            assert_eq!(refusal.path.as_deref(), Some(path.as_str()));
+            assert!(refusal.message.contains(&path));
+        }
+        other => panic!("expected unresolvable-mount refusal, got {other:?}"),
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn required_mount_dangling_symlink_is_refused() {
+    use std::os::unix::fs::symlink;
+
+    let td = private_tempdir();
+    let path = td.path().join("link");
+    symlink(td.path().join("missing"), &path).unwrap();
+    let path = path.to_string_lossy().into_owned();
+    let mut s = spec(Backend::Bwrap);
+    s.mounts = vec![Mount {
+        host: path.clone(),
+        dest: path.clone(),
+        ro: false,
+        cache: false,
+    }];
+
+    match enter_argv(&s, "true") {
+        Err(EnterError::Refused(refusal)) => {
+            assert_eq!(refusal.class, RefusalClass::MountUnresolvable);
+            assert_eq!(refusal.path.as_deref(), Some(path.as_str()));
+        }
+        other => panic!("expected unresolvable-mount refusal, got {other:?}"),
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn required_mount_permission_denied_is_refused() {
+    use std::os::unix::fs::PermissionsExt;
+
+    if nix::unistd::geteuid().as_raw() == 0 {
+        // Root bypasses directory permissions, so this cannot exercise EACCES.
+        return;
+    }
+    let td = private_tempdir();
+    let locked = td.path().join("locked");
+    std::fs::create_dir(&locked).unwrap();
+    let path = locked.join("child");
+    std::fs::write(&path, "child").unwrap();
+    std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
+    let path = path.to_string_lossy().into_owned();
+    let mut s = spec(Backend::Bwrap);
+    s.mounts = vec![Mount {
+        host: path.clone(),
+        dest: path.clone(),
+        ro: false,
+        cache: false,
+    }];
+    let result = enter_argv(&s, "true");
+    std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o700)).unwrap();
+
+    match result {
+        Err(EnterError::Refused(refusal)) => {
+            assert_eq!(refusal.class, RefusalClass::MountUnresolvable);
+            assert_eq!(refusal.path.as_deref(), Some(path.as_str()));
+        }
+        other => panic!("expected unresolvable-mount refusal, got {other:?}"),
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn optional_cache_mount_that_cannot_resolve_is_dropped() {
+    use std::os::unix::fs::symlink;
+
+    let td = private_tempdir();
+    let loop_a = td.path().join("loop-a");
+    let loop_b = td.path().join("loop-b");
+    symlink(&loop_b, &loop_a).unwrap();
+    symlink(&loop_a, &loop_b).unwrap();
+    let worktree = td.path().join("worktree");
+    std::fs::create_dir(&worktree).unwrap();
+    let worktree = worktree.to_string_lossy().into_owned();
+    let loop_a = loop_a.to_string_lossy().into_owned();
+    let mut s = spec(Backend::Bwrap);
+    s.worktree = PathBuf::from(&worktree);
+    s.mounts = vec![
+        Mount {
+            host: worktree.clone(),
+            dest: worktree.clone(),
+            ro: false,
+            cache: false,
+        },
+        Mount {
+            host: loop_a.clone(),
+            dest: loop_a.clone(),
+            ro: true,
+            cache: true,
+        },
+    ];
+
+    let argv = enter_argv(&s, "true").expect("required worktree mount resolves");
+    let joined = argv.join(" ");
+    assert!(joined.contains(&worktree));
+    assert!(!joined.contains(&loop_a));
+}
+
+#[cfg(unix)]
+#[test]
+fn absent_mount_resolves_through_its_existing_ancestor() {
+    use std::os::unix::fs::symlink;
+
+    let td = private_tempdir();
+    let real = td.path().join("real");
+    std::fs::create_dir(&real).unwrap();
+    let alias = td.path().join("alias");
+    symlink(&real, &alias).unwrap();
+    let absent = alias.join("new");
+    let resolved = real.join("new");
+    let absent = absent.to_string_lossy().into_owned();
+    let resolved = resolved.to_string_lossy().into_owned();
+    let mut s = spec(Backend::Bwrap);
+    s.mounts = vec![Mount {
+        host: absent.clone(),
+        dest: "/mnt/absent".into(),
+        ro: false,
+        cache: false,
+    }];
+
+    let argv = enter_argv(&s, "true").expect("an absent leaf resolves via its existing parent");
+    let joined = argv.join(" ");
+    assert!(joined.contains(&resolved));
+    assert!(!argv.contains(&absent));
+}
+
+#[test]
+fn absent_mount_without_symlinks_keeps_its_path() {
+    let argv = enter_argv(&spec(Backend::Bwrap), "true")
+        .expect("the shared fixture's absent paths resolve through existing ancestors");
+    let joined = argv.join(" ");
+    assert!(joined.contains("/wt/feat"));
+    assert!(joined.contains("/repo/.git"));
+}
+
 #[test]
 fn refusal_constructor_preserves_each_class_and_field() {
     let spec = spec(Backend::Docker);
@@ -466,6 +630,7 @@ fn refusal_constructor_preserves_each_class_and_field() {
         RefusalClass::ComposeTarget,
         RefusalClass::ComposeServiceMissing,
         RefusalClass::HostnamePolicy,
+        RefusalClass::MountUnresolvable,
     ] {
         let error = refusal(
             &spec,
@@ -4040,4 +4205,138 @@ fn container_listing_with_stats_joins_podman5_stats_by_name() {
 #[test]
 fn parse_stats_rows_drops_rows_without_a_name() {
     assert!(parse_stats_rows(r#"[{"cpu_percent":"0.80%","mem_usage":"1MB / 2GB"}]"#).is_empty());
+}
+
+#[test]
+fn placed_teardown_routes_every_command_through_the_ssh_placement() {
+    let state = crate::testenv::IsolatedState::new();
+    let loc = crate::remote::GitLoc::Remote {
+        ssh: crate::remote::SshTarget::plain("remote.example".into(), 22, false),
+        path: "/remote/wt".into(),
+    };
+    let placement = Placement::Ssh(SshPlacement::plain(
+        "remote.example".into(),
+        22,
+        false,
+        TransportKind::Ssh,
+    ));
+    let name = container_name("/host/wt");
+    let expected_projects = [
+        crate::sandbox_compose::hashed_project_name(&name, std::path::Path::new("/remote/wt")),
+        crate::sandbox_compose::hashed_project_name(&name, std::path::Path::new("/workspace")),
+    ];
+    let mut calls = Vec::new();
+    let result = teardown_placed_with(
+        &SandboxConfig {
+            enabled: true,
+            ..SandboxConfig::default()
+        },
+        &placement,
+        &loc,
+        &name,
+        &state.state_home(),
+        |backend| {
+            if backend == Backend::Docker {
+                RuntimeProbe::Present
+            } else {
+                RuntimeProbe::Absent
+            }
+        },
+        |called_placement, argv, timeout| {
+            calls.push((called_placement.clone(), argv.to_vec(), timeout));
+            Some(true)
+        },
+    );
+    assert!(result.is_ok());
+    assert!(!calls.is_empty());
+    assert!(calls.iter().all(|(called_placement, argv, _)| {
+        matches!(called_placement, Placement::Ssh(_))
+            && called_placement
+                .control_argv(argv)
+                .first()
+                .is_some_and(|arg| arg == "ssh")
+    }));
+    let down_commands: Vec<_> = calls
+        .iter()
+        .filter(|(_, argv, _)| argv.iter().any(|arg| arg == "down"))
+        .collect();
+    assert!(!down_commands.is_empty());
+    assert!(down_commands.iter().all(|(_, argv, _)| {
+        argv.windows(2).any(|pair| {
+            pair[0] == "-p"
+                && expected_projects
+                    .iter()
+                    .any(|project| pair[1] == project.as_str())
+                && pair[1] != name.as_str()
+        })
+    }));
+}
+
+#[test]
+fn placed_teardown_reports_an_unreachable_remote_host() {
+    let state = crate::testenv::IsolatedState::new();
+    let loc = crate::remote::GitLoc::Remote {
+        ssh: crate::remote::SshTarget::plain("remote.example".into(), 22, false),
+        path: "/remote/wt".into(),
+    };
+    let placement = Placement::Ssh(SshPlacement::plain(
+        "remote.example".into(),
+        22,
+        false,
+        TransportKind::Ssh,
+    ));
+    let cfg = SandboxConfig {
+        enabled: true,
+        ..SandboxConfig::default()
+    };
+    let name = container_name("/host/wt");
+    let absent = teardown_placed_with(
+        &cfg,
+        &placement,
+        &loc,
+        &name,
+        &state.state_home(),
+        |_| RuntimeProbe::Absent,
+        |_, _, _| Some(true),
+    );
+    assert!(matches!(absent, Err(PlacedTeardownError::NoRuntime)));
+
+    let unreachable = teardown_placed_with(
+        &cfg,
+        &placement,
+        &loc,
+        &name,
+        &state.state_home(),
+        |_| RuntimeProbe::Present,
+        |_, _, _| None,
+    );
+    assert!(matches!(
+        unreachable,
+        Err(PlacedTeardownError::Unreachable { commands }) if commands > 0
+    ));
+
+    let missing_container = teardown_placed_with(
+        &cfg,
+        &placement,
+        &loc,
+        &name,
+        &state.state_home(),
+        |_| RuntimeProbe::Present,
+        |_, _, _| Some(false),
+    );
+    assert!(missing_container.is_ok());
+
+    let disabled = teardown_placed_with(
+        &SandboxConfig {
+            enabled: false,
+            ..SandboxConfig::default()
+        },
+        &placement,
+        &loc,
+        &name,
+        &state.state_home(),
+        |_| panic!("disabled sandbox must not probe runtimes"),
+        |_, _, _| panic!("disabled sandbox must not run teardown commands"),
+    );
+    assert!(disabled.is_ok());
 }

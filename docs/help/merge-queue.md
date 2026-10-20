@@ -34,6 +34,9 @@ is not shown in rail mode. The bottom-bar summary is opt-in: set
   advances; conflicted branches stay queued.
 - **Drain (agent autopilot)** hands conflicts to a coding agent to
   resolve, then continues.
+  Each eligible row is claimed by the drain working it, so a concurrent drain
+  skips that row with a warning; an expired claim on a still-claimable row can
+  be taken over after about five minutes.
 - `thegn integrate` does the same from any shell. It prints the branches
   it is about to fold and asks before folding any of them; `--dry-run`
   prints that plan and stops, and `--yes` skips the prompt (required to
@@ -48,8 +51,10 @@ grace period below. Prefer `thegn merge add`.
 
 - A blocked branch is re-attempted by the next drain automatically. Once
   it has burned its `agent_max_attempts` the agent stops being
-  dispatched for it — `thegn merge retry` (or the section's `r`) re-arms
-  it after you've fixed something.
+  dispatched for it — `thegn merge retry` re-arms held rows only
+  (`deferred`, `gate_failed`, `gate_error`, `agent_blocked`, or `needs_human`)
+  after you've fixed something, and refuses every other state. The section's
+  `r` gesture follows its own retry path.
 
 ## Land strategy, signing, drivers
 
@@ -203,6 +208,11 @@ worktree, stale registered location/branch, or failed remote branch lookup is
 an explicit error and never creates a remote-local fallback row. If inbound
 secure serving is unavailable, select `remote_mode = "push"` deliberately.
 
+The control URL handed to a remote environment comes only from a live
+`thegn serve` daemon in this state directory, and must be a plain origin using
+the configured scheme. If live servers advertise different URLs, enqueue
+refuses until only one origin is advertised.
+
 ## The fixing agent
 
 Point the handoff at an agent either by naming one of your `[[agents]]`
@@ -278,6 +288,8 @@ Pressing Ctrl-C or sending SIGTERM during `thegn integrate`, `thegn land`, or
 `thegn merge drain` cancels the fold without blaming a branch. If cancellation
 stops a gate already running for a row, that row is recorded as `gate_error`;
 rows not yet started remain queued.
+The gate also returns `gate_error` if its command moves checkout `HEAD` or changes
+the index from the pinned candidate.
 
 When a red union is being localized, `diagnosis_max_gates` (default `8`) caps
 the total gate attempts and `diagnosis_timeout_secs` (default `3600`) bounds

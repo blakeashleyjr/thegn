@@ -608,6 +608,8 @@ pub enum RefusalClass {
     ComposeTarget,
     ComposeServiceMissing,
     HostnamePolicy,
+    /// A local mount source could not be resolved to a stable host path.
+    MountUnresolvable,
 }
 
 /// Structured, safe context for a refused sandbox launch.
@@ -665,6 +667,53 @@ fn refusal(
     })
 }
 
+fn resolve_mount_source(host: &std::path::Path) -> std::io::Result<PathBuf> {
+    if !host.is_absolute() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "local mount source must be absolute",
+        ));
+    }
+    match host.canonicalize() {
+        Ok(source) => Ok(source),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            match std::fs::symlink_metadata(host) {
+                Err(metadata_error) if metadata_error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(metadata_error) => return Err(metadata_error),
+                Ok(_) => return Err(error),
+            }
+
+            let mut ancestor = host.to_path_buf();
+            let mut missing = Vec::new();
+            loop {
+                match std::fs::symlink_metadata(&ancestor) {
+                    Ok(_) => {
+                        let mut resolved = ancestor.canonicalize()?;
+                        for component in missing.iter().rev() {
+                            resolved.push(component);
+                        }
+                        return Ok(resolved);
+                    }
+                    Err(metadata_error)
+                        if metadata_error.kind() == std::io::ErrorKind::NotFound =>
+                    {
+                        let Some(name) = ancestor.file_name() else {
+                            return Err(error);
+                        };
+                        missing.push(name.to_os_string());
+                        let Some(parent) = ancestor.parent() else {
+                            return Err(error);
+                        };
+                        ancestor = parent.to_path_buf();
+                    }
+                    Err(metadata_error) => return Err(metadata_error),
+                }
+            }
+        }
+        Err(error) => Err(error),
+    }
+}
+
 /// The spec as it will actually be launched. For a sealed spec this drops every
 /// mount whose host path or destination lies inside the credential deny list
 /// (or whose allowlist target was retargeted since resolution) — whoever added
@@ -719,15 +768,45 @@ fn launchable(spec: &SandboxSpec) -> Result<std::borrow::Cow<'_, SandboxSpec>, E
         sealed_view(spec)
     };
     let mut canonical_view = view.into_owned();
-    for mount in &mut canonical_view.mounts {
-        if spec.placement.is_local()
-            && let Ok(source) = std::path::Path::new(&mount.host).canonicalize()
-        {
-            // Validate and emit the same host identity while preserving the
-            // path-visible destination used by bwrap, OCI, and systemd.
-            mount.host = source.to_string_lossy().into_owned();
+    let mut keep_mount = vec![true; canonical_view.mounts.len()];
+    if spec.placement.is_local() {
+        for (index, mount) in canonical_view.mounts.iter_mut().enumerate() {
+            match resolve_mount_source(std::path::Path::new(&mount.host)) {
+                Ok(source) => {
+                    // Validate and emit the same host identity while preserving the
+                    // path-visible destination used by bwrap, OCI, and systemd.
+                    mount.host = source.to_string_lossy().into_owned();
+                }
+                Err(error) if mount.cache => {
+                    keep_mount[index] = false;
+                    tracing::warn!(
+                        target: "thegn::sandbox",
+                        source = %mount.host,
+                        dest = %mount.dest,
+                        %error,
+                        "omitting unresolvable cache mount"
+                    );
+                }
+                Err(error) => {
+                    return Err(refusal(
+                        spec,
+                        RefusalClass::MountUnresolvable,
+                        Some(mount.dest.clone()),
+                        format!(
+                            "sandbox mount source `{}` (destination `{}`) cannot be resolved: {error}; refusing to launch with an unverified mount",
+                            mount.host, mount.dest
+                        ),
+                    ));
+                }
+            }
         }
     }
+    let mut index = 0;
+    canonical_view.mounts.retain(|_| {
+        let keep = keep_mount[index];
+        index += 1;
+        keep
+    });
     view = std::borrow::Cow::Owned(canonical_view);
     if let Some(m) = crate::sandbox_floor::home_gate(&view) {
         return Err(refusal(
@@ -2418,21 +2497,105 @@ pub fn teardown(cfg: &SandboxConfig, loc: &GitLoc, name: &str) {
 /// Remove a worktree's persistent container using its already-resolved placement.
 /// The worktree destroy path uses this when a named environment selected SSH.
 pub fn teardown_placed(cfg: &SandboxConfig, placement: &Placement, loc: &GitLoc, name: &str) {
+    if let Err(error) = teardown_placed_checked(cfg, placement, loc, name) {
+        tracing::warn!(target: "thegn::sandbox", %error, container = name, "sandbox teardown incomplete");
+    }
+}
+
+/// Why a placed teardown could not reach a remote OCI runtime.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PlacedTeardownError {
+    NoRuntime,
+    Unreachable { commands: usize },
+}
+
+impl std::fmt::Display for PlacedTeardownError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NoRuntime => f.write_str("no OCI runtime answered on the worktree's host"),
+            Self::Unreachable { commands } => write!(
+                f,
+                "{commands} teardown command(s) could not reach the worktree's host or timed out"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for PlacedTeardownError {}
+
+/// Remove a placed container, reporting remote runtime absence or unreachable commands.
+pub fn teardown_placed_checked(
+    cfg: &SandboxConfig,
+    placement: &Placement,
+    loc: &GitLoc,
+    name: &str,
+) -> Result<(), PlacedTeardownError> {
+    let state_home = util::xdg_state_home();
+    teardown_placed_with(
+        cfg,
+        placement,
+        loc,
+        name,
+        &state_home,
+        |backend| available(placement, backend),
+        run_control_t_owned,
+    )
+}
+
+fn teardown_placed_with(
+    cfg: &SandboxConfig,
+    placement: &Placement,
+    loc: &GitLoc,
+    name: &str,
+    state_home: &std::path::Path,
+    mut probe: impl FnMut(Backend) -> RuntimeProbe,
+    mut run: impl FnMut(&Placement, &[String], Duration) -> Option<bool>,
+) -> Result<(), PlacedTeardownError> {
     if !cfg.enabled {
-        return;
+        return Ok(());
     }
     // Drive the same remote daemon the create used, or `None` for the local
     // daemon; without this an `[sandbox] oci_host` container is never removed
     // (rm hits the local daemon, which never held it) and leaks forever.
     let oci_host = (!cfg.oci_host.trim().is_empty()).then(|| cfg.oci_host.trim());
-    let state_home = util::xdg_state_home();
-    let projects = teardown_projects_for_loc(&state_home, loc, name, !placement.is_local());
+    let projects = teardown_projects_for_loc(state_home, loc, name, !placement.is_local());
     // Try whichever OCI runtimes are available; the container only exists under one.
+    let mut present = false;
+    let mut unreachable = 0;
     for b in Backend::oci_runtimes() {
-        if available(placement, b) == RuntimeProbe::Present {
-            run_teardown_argvs(placement, b, teardown_argvs(b, oci_host, name, &projects));
+        if probe(b) == RuntimeProbe::Present {
+            present = true;
+            for argv in teardown_argvs(b, oci_host, name, &projects) {
+                let timeout = if argv.iter().any(|arg| arg == "down") {
+                    crate::sandbox_compose::COMPOSE_DOWN_TIMEOUT
+                } else {
+                    PROBE_TIMEOUT
+                };
+                match run(placement, &argv, timeout) {
+                    Some(true) => {}
+                    Some(false) => {
+                        tracing::debug!(backend = b.label(), "sandbox teardown command failed")
+                    }
+                    None => {
+                        unreachable += 1;
+                        tracing::debug!(
+                            backend = b.label(),
+                            "sandbox teardown command unavailable or timed out"
+                        );
+                    }
+                }
+            }
         }
     }
+    if !placement.is_local() && !present {
+        return Err(PlacedTeardownError::NoRuntime);
+    }
+    if unreachable > 0 {
+        return Err(PlacedTeardownError::Unreachable {
+            commands: unreachable,
+        });
+    }
+    Ok(())
 }
 
 /// Resolve teardown project paths from a Git location and its remote mount mode.
@@ -4221,6 +4384,19 @@ pub fn run_gc_detailed(db_worktrees: &[String]) -> GcReport {
         SystemTime::now(),
         SECRET_ENV_FILE_MAX_AGE,
     );
+    let removed_adoption_records = crate::sandbox_compose::sweep_stale_adoption_records_in(
+        &state_home,
+        db_worktrees,
+        SystemTime::now(),
+        SECRET_ENV_FILE_MAX_AGE,
+    );
+    if removed_adoption_records > 0 {
+        tracing::debug!(
+            target: "thegn::sandbox",
+            removed = removed_adoption_records,
+            "swept stale Compose adoption records"
+        );
+    }
     let mut removed_report = Vec::new();
     let mut unverified_report = Vec::new();
     let mut listed_names = std::collections::HashSet::new();

@@ -272,15 +272,17 @@ stage. A row closes `done` only with an explicit PASS verdict on the report's
 first line, a `gate: <command> -- <result>` line citing a successful run, and
 a committed, clean artifact. Any other verdict, or no verdict, is never
 auto-closed: the reaper parks it for the Lead (`NeedsDecision`), and
-`set-status done` refuses it without `--force`. `--force` is a deliberate
-override and is printed as such:
+`set-status done` refuses it without `--force --why '<reason>'`. The reason is
+stored on the row and shown by `dispatch list` and `dispatch status`; `--force`
+is a deliberate override:
 
 ```bash
 thegn dispatch set-status <row-id> done     # or: failed / waiting_human / abandoned
 ```
 
 Marking `done` is gated on the artifact the same way; a forced completion is
-printed as `(forced)` and carries `"forced": true` in JSON — never invisible.
+printed with its reason and carries `"forced": true` and `"force_reason"` in
+JSON — never invisible.
 Anything short of your genuine "this stage succeeded" is `waiting_human` or
 `failed`, by your judgment.
 

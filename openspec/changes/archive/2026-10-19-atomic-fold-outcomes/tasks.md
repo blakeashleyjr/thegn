@@ -6,7 +6,8 @@
 - [x] Independent source review and coordinated core/host focused gates.
 - [x] THE-589: retain previously passing 39-test fold outcome behavior after integration.
 - [x] Integrate THE-588's commit-bound `apply_landed` call and pass the combined scoped core/host gate.
-- [ ] THE-588: separate destructive cleanup ownership safeguards before native queue retry.
+- [x] THE-588: separate destructive cleanup ownership safeguards before native queue retry.
+      Not part of this change: THE-588 delivered the cleanup ownership safeguards separately (Done).
 - [x] Complete normal native/full workspace gate and user-authorized local-main landing.
 
 Component evidence: core `db_aux::merge_outcome_tests` passed 13/13;
