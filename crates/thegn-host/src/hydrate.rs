@@ -2179,6 +2179,14 @@ pub(crate) fn build_initial_model(
     // so the sidebar shows all registered workspaces on the very first frame
     // instead of only the live session entries.
     let sidebar_workspaces = workspace_list(session, db);
+    let workspace_envs = db.map_or_else(std::collections::BTreeMap::new, |db| {
+        crate::wizard::workspace_envs(
+            db,
+            sidebar_workspaces
+                .iter()
+                .map(|(_, _, _, repo)| repo.as_str()),
+        )
+    });
     // Seed the sidebar's dynamic (OSC) worktree titles from the DB so persisted
     // titles show on the very first frame — before any pane re-emits one. The
     // loop's live-title merge then refreshes them in place.
@@ -2190,6 +2198,7 @@ pub(crate) fn build_initial_model(
         tabs,
         active_tab,
         sidebar_workspaces,
+        workspace_envs,
         sidebar_window_titles,
         active_container_name: thegn_core::sandbox::container_name_with_profile(
             &cwd.to_string_lossy(),
@@ -2671,6 +2680,12 @@ pub(crate) fn build_model(
     // Recover lost repo paths before querying folders: folder rows are keyed by
     // the same repo root and otherwise remain hidden for this pass.
     heal_workspace_paths(&mut sidebar_workspaces, &sidebar_db_worktrees, session);
+    let workspace_envs = crate::wizard::workspace_envs(
+        db,
+        sidebar_workspaces
+            .iter()
+            .map(|(_, _, _, repo)| repo.as_str()),
+    );
     // Folders for every workspace shown in the sidebar (not just the active
     // tab's): the sidebar filters this list per-workspace by `repo_path`, so a
     // worktree filed into a folder stays visible whichever tab is active.
@@ -2841,6 +2856,7 @@ pub(crate) fn build_model(
         tabs,
         active_tab,
         sidebar_workspaces,
+        workspace_envs,
         sidebar_db_worktrees,
         sidebar_db_folders,
         sidebar_db_terminals,
