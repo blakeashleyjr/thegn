@@ -30,6 +30,13 @@ use crate::integrate::{self, AttemptOutcome};
 #[path = "merge_driver_status_tests.rs"]
 mod status_tests;
 
+#[path = "merge_driver_claim.rs"]
+mod claim;
+
+#[cfg(test)]
+#[path = "merge_driver_claim_tests.rs"]
+mod claim_tests;
+
 /// A worktree branch to drain, as read from the `merge_queue` cache.
 #[derive(Debug, Clone)]
 pub(crate) struct QueueItem {
@@ -355,6 +362,11 @@ struct DriveActions<A, F, R> {
     runner: R,
 }
 
+enum PostRelease {
+    Apply(thegn_core::merge_lifecycle::LifecycleEvent),
+    Landed(String),
+}
+
 fn drive_queue_with(
     cfg: &MergeQueueConfig,
     full: &Config,
@@ -396,24 +408,147 @@ fn drive_queue_with(
             ));
             break 'items;
         }
+        let fresh_rows = match db.list_merge_queue() {
+            Ok(rows) => rows,
+            Err(error) => {
+                out.persistence_errors.push(format!(
+                    "{}: could not refresh queue row: {error}",
+                    item.worktree
+                ));
+                break 'items;
+            }
+        };
+        let Some(fresh) = fresh_rows
+            .into_iter()
+            .find(|row| row.worktree == item.worktree)
+        else {
+            out.warnings.push(format!(
+                "{}: queue row disappeared since listing; skipped",
+                item.branch
+            ));
+            continue;
+        };
+        if fresh.branch != item.branch || fresh.location != item.location {
+            out.warnings.push(format!(
+                "{}: not admitted (queue identity changed since listing); skipped",
+                item.branch
+            ));
+            continue;
+        }
+        let registered_repo = match db.repo_root_for(&item.worktree) {
+            Ok(repo) => repo.filter(|repo| !repo.is_empty()),
+            Err(error) => {
+                out.persistence_errors.push(format!(
+                    "{}: could not check merge row registration: {error}",
+                    item.worktree
+                ));
+                break 'items;
+            }
+        };
+        let claim = if let Some(repo) = registered_repo.as_deref() {
+            if !matches!(
+                fresh.status.as_str(),
+                "queued"
+                    | "deferred"
+                    | "gate_failed"
+                    | "gate_error"
+                    | "needs_human"
+                    | "ready"
+                    | "agent_blocked"
+            ) {
+                let active_claim = db.observe_merge_claim(&item.worktree);
+                match active_claim {
+                    Ok(Some(view))
+                        if view.phase != "unclaimed"
+                            && view.lease_until_ms.is_some_and(|until| until > util::now_ms()) =>
+                    {
+                        out.warnings.push(format!(
+                            "{}: claimed by another drain (generation {}, until {}); skipped",
+                            item.branch,
+                            view.generation,
+                            view.lease_until_ms.unwrap_or_default()
+                        ));
+                    }
+                    Ok(_) => out.warnings.push(format!(
+                        "{}: {} row is not claimable (stale in-progress state from an earlier drain?); remove and re-add it",
+                        item.branch, fresh.status
+                    )),
+                    Err(error) => {
+                        out.persistence_errors.push(format!(
+                            "{}: could not observe merge claim: {error}",
+                            item.worktree
+                        ));
+                        break 'items;
+                    }
+                }
+                continue;
+            }
+            match claim::RowClaim::admit(db, &item, repo, &fresh.status, &fresh.target_branch) {
+                Ok(claim::Admission::Claimed(claim)) => Some(claim),
+                Ok(
+                    claim::Admission::HeldElsewhere(warning)
+                    | claim::Admission::NotAdmitted(warning),
+                ) => {
+                    out.warnings.push(warning);
+                    continue;
+                }
+                Err(error) => {
+                    out.persistence_errors.push(format!(
+                        "{}: could not claim merge row: {error}",
+                        item.worktree
+                    ));
+                    break 'items;
+                }
+            }
+        } else {
+            tracing::debug!(target: "thegn::merge", worktree = item.worktree, "draining unregistered local row without merge claim fencing");
+            None
+        };
+        let claim = std::cell::RefCell::new(claim);
         let write_error = std::cell::RefCell::new(None::<String>);
+        let post_release = std::cell::RefCell::new(None::<PostRelease>);
+        let stop_drain = std::cell::Cell::new(false);
+        let write_fields = |db: &Db, status: MqStatus, fields: &MergeStatusFields| {
+            let result = if let Some(claim) = claim.borrow().as_ref() {
+                claim.write(db, status, fields)
+            } else {
+                replace_status(db, &item.worktree, status, fields)
+            };
+            if let Err(error) = result {
+                let message = if error
+                    .to_string()
+                    .contains(thegn_core::store::MERGE_CLAIM_LOST)
+                {
+                    format!(
+                        "{}: merge claim lost; another drain recovered the row",
+                        item.branch
+                    )
+                } else {
+                    format!("{}: {error}", item.worktree)
+                };
+                *write_error.borrow_mut() = Some(message);
+            }
+        };
         let set = |db: &Db, status: MqStatus, oid: Option<&str>, detail: Option<&str>| {
             let fields = MergeStatusFields {
                 result_oid: oid.map(str::to_owned),
                 conflict_paths: None,
                 error_detail: detail.map(str::to_owned),
             };
-            if let Err(error) = replace_status(db, &item.worktree, status, &fields) {
-                *write_error.borrow_mut() = Some(format!("{}: {error}", item.worktree));
-            }
+            write_fields(db, status, &fields);
             fields
         };
         macro_rules! stop_on_write_error {
             () => {
                 if let Some(error) = write_error.borrow_mut().take() {
-                    tracing::error!(target: "thegn::merge", "queue state write failed: {error}");
-                    out.persistence_errors.push(error);
-                    break 'items;
+                    if error.contains("merge claim lost; another drain recovered the row") {
+                        out.warnings.push(error);
+                    } else {
+                        tracing::error!(target: "thegn::merge", "queue state write failed: {error}");
+                        out.persistence_errors.push(error);
+                        stop_drain.set(true);
+                    }
+                    break 'attempt;
                 }
             };
         }
@@ -421,10 +556,39 @@ fn drive_queue_with(
         // (landed ⇒ Merged/cleanup, failure ⇒ the failed folder). No-op unless
         // `[merge_queue] organize_folders` is on.
         let lifecycle = |db: &Db, event: thegn_core::merge_lifecycle::LifecycleEvent| {
-            crate::merge_lifecycle::apply(cfg, db, repo_root, &item.worktree, &item.branch, event);
+            if claim.borrow().is_some() {
+                *post_release.borrow_mut() = Some(PostRelease::Apply(event));
+            } else {
+                crate::merge_lifecycle::apply(
+                    cfg,
+                    db,
+                    repo_root,
+                    &item.worktree,
+                    &item.branch,
+                    event,
+                );
+            }
         };
         let fields = set(db, MqStatus::Folding, None, None);
-        stop_on_write_error!();
+        if let Some(error) = write_error.borrow_mut().take() {
+            let claim_lost = error.contains("merge claim lost; another drain recovered the row");
+            if claim_lost {
+                out.warnings.push(error);
+            } else {
+                out.persistence_errors.push(error);
+            }
+            if let Some(claim) = claim.borrow_mut().take() {
+                if let Err(error) = claim.finish(db) {
+                    if !claim_lost {
+                        out.warnings.push(format!(
+                            "{}: could not release merge claim: {error}",
+                            item.branch
+                        ));
+                    }
+                }
+            }
+            break 'items;
+        }
         progress(&DriveStep {
             fields: &fields,
             worktree: &item.worktree,
@@ -442,8 +606,15 @@ fn drive_queue_with(
 
         // Seeded from the persisted count, so the budget survives the drain that
         // spent it. `merge retry` (or a re-enqueue) resets it to 0.
-        let mut agent_runs = item.agent_attempts;
-        loop {
+        let mut agent_runs = fresh.agent_attempts;
+        'attempt: loop {
+            if claim.borrow().as_ref().is_some_and(claim::RowClaim::lost) {
+                out.warnings.push(format!(
+                    "{}: merge claim lost; another drain recovered the row",
+                    item.branch
+                ));
+                break;
+            }
             let attempt = match (actions.attempt)(&item.branch, &branch_loc) {
                 Ok(a) => a,
                 Err(e) => {
@@ -482,16 +653,21 @@ fn drive_queue_with(
                             error,
                         });
                         out.landed.push(item.branch.clone());
-                        break 'items;
+                        stop_drain.set(true);
+                        break 'attempt;
                     }
-                    crate::merge_lifecycle::apply_landed(
-                        cfg,
-                        db,
-                        repo_root,
-                        &item.worktree,
-                        &item.branch,
-                        &commit,
-                    );
+                    if claim.borrow().is_some() {
+                        *post_release.borrow_mut() = Some(PostRelease::Landed(commit.clone()));
+                    } else {
+                        crate::merge_lifecycle::apply_landed(
+                            cfg,
+                            db,
+                            repo_root,
+                            &item.worktree,
+                            &item.branch,
+                            &commit,
+                        );
+                    }
                     progress(&DriveStep {
                         fields: &fields,
                         worktree: &item.worktree,
@@ -602,14 +778,18 @@ fn drive_queue_with(
                         } else {
                             format!("{reason}\n{paths_text}")
                         });
-                        if let Err(error) =
-                            replace_status(db, &item.worktree, MqStatus::NeedsHuman, &fields)
-                        {
+                        write_fields(db, MqStatus::NeedsHuman, &fields);
+                        if let Some(error) = write_error.borrow_mut().take() {
+                            if error.contains("merge claim lost; another drain recovered the row") {
+                                out.warnings.push(error);
+                                break 'attempt;
+                            }
                             out.persistence_errors.push(format!(
                                 "{}: could not persist driver refusal: {error}",
                                 item.worktree
                             ));
-                            break 'items;
+                            stop_drain.set(true);
+                            break 'attempt;
                         }
                         lifecycle(db, thegn_core::merge_lifecycle::LifecycleEvent::Failed);
                         progress(&DriveStep {
@@ -694,39 +874,95 @@ fn drive_queue_with(
                     }
                     crate::agent_run::AgentDispatch::Run(spec) => spec,
                 };
-                agent_runs += 1;
-                if let Err(error) = db.set_merge_agent_attempts(&item.worktree, agent_runs) {
-                    let detail = format!("could not reserve agent attempt: {error}");
-                    out.persistence_errors
-                        .push(format!("{}: {detail}", item.worktree));
-                    set(db, MqStatus::GateError, None, Some(&detail));
+                let budget_exhausted = if let Some(claim) = claim.borrow().as_ref() {
+                    if claim.lost() {
+                        out.warnings.push(format!(
+                            "{}: merge claim lost; another drain recovered the row",
+                            item.branch
+                        ));
+                        break;
+                    }
+                    match claim.consume_attempt(db, cfg.agent_max_attempts) {
+                        Ok(thegn_core::store::MergeAttemptResult::Consumed) => {
+                            agent_runs += 1;
+                            false
+                        }
+                        Ok(thegn_core::store::MergeAttemptResult::BudgetExhausted) => {
+                            agent_runs = cfg.agent_max_attempts;
+                            true
+                        }
+                        Ok(thegn_core::store::MergeAttemptResult::ClaimLost) => {
+                            out.warnings.push(format!(
+                                "{}: merge claim lost; another drain recovered the row",
+                                item.branch
+                            ));
+                            break;
+                        }
+                        Err(error) => {
+                            if error
+                                .to_string()
+                                .contains(thegn_core::store::MERGE_CLAIM_LOST)
+                            {
+                                out.warnings.push(format!(
+                                    "{}: merge claim lost; another drain recovered the row",
+                                    item.branch
+                                ));
+                                break 'attempt;
+                            }
+                            out.persistence_errors.push(format!(
+                                "{}: could not reserve agent attempt: {error}",
+                                item.worktree
+                            ));
+                            stop_drain.set(true);
+                            break 'attempt;
+                        }
+                    }
+                } else {
+                    agent_runs += 1;
+                    if let Err(error) = db.set_merge_agent_attempts(&item.worktree, agent_runs) {
+                        let detail = format!("could not reserve agent attempt: {error}");
+                        out.persistence_errors
+                            .push(format!("{}: {detail}", item.worktree));
+                        set(db, MqStatus::GateError, None, Some(&detail));
+                        stop_on_write_error!();
+                        stop_drain.set(true);
+                        break 'attempt;
+                    }
+                    false
+                };
+                if !budget_exhausted {
+                    let note = format!("agent fixing ({agent_runs}/{})", cfg.agent_max_attempts);
+                    let fields = set(db, MqStatus::AgentRunning, None, Some(&note));
                     stop_on_write_error!();
-                    break 'items;
+                    progress(&DriveStep {
+                        fields: &fields,
+                        worktree: &item.worktree,
+                        branch: &item.branch,
+                        status: MqStatus::AgentRunning.as_str(),
+                        detail: &note,
+                    });
+                    // Run to completion; the re-attempt (top of loop) is the real
+                    // arbiter of whether the fix worked, so ignore the exit code.
+                    if let Some(template) = agent_cmd.as_deref() {
+                        if claim.borrow().as_ref().is_some_and(claim::RowClaim::lost) {
+                            out.warnings.push(format!(
+                                "{}: merge claim lost; another drain recovered the row",
+                                item.branch
+                            ));
+                            break 'attempt;
+                        }
+                        let _ = (actions.runner)(
+                            // best-effort: the re-attempt at the top of the loop is the real arbiter (comment above)
+                            template,
+                            &item.worktree,
+                            &item.branch,
+                            &target,
+                            &failure,
+                            sandbox,
+                        );
+                    }
+                    continue;
                 }
-                let note = format!("agent fixing ({agent_runs}/{})", cfg.agent_max_attempts);
-                let fields = set(db, MqStatus::AgentRunning, None, Some(&note));
-                stop_on_write_error!();
-                progress(&DriveStep {
-                    fields: &fields,
-                    worktree: &item.worktree,
-                    branch: &item.branch,
-                    status: MqStatus::AgentRunning.as_str(),
-                    detail: &note,
-                });
-                // Run to completion; the re-attempt (top of loop) is the real
-                // arbiter of whether the fix worked, so ignore the exit code.
-                if let Some(template) = agent_cmd.as_deref() {
-                    let _ = (actions.runner)(
-                        // best-effort: the re-attempt at the top of the loop is the real arbiter (comment above)
-                        template,
-                        &item.worktree,
-                        &item.branch,
-                        &target,
-                        &failure,
-                        sandbox,
-                    );
-                }
-                continue;
             }
 
             // Out of attempts (or agent handoff disabled) — record the terminal
@@ -744,13 +980,19 @@ fn drive_queue_with(
                         MqStatus::Deferred
                     };
                     let fields = conflict_fields(&paths, &submodule_conflicts);
-                    if let Err(error) = replace_status(db, &item.worktree, status, &fields) {
+                    write_fields(db, status, &fields);
+                    if let Some(error) = write_error.borrow_mut().take() {
+                        if error.contains("merge claim lost; another drain recovered the row") {
+                            out.warnings.push(error);
+                            break 'attempt;
+                        }
                         let detail = format!("could not persist conflict outcome: {error}");
                         out.persistence_errors
                             .push(format!("{}: {detail}", item.worktree));
                         set(db, MqStatus::GateError, None, Some(&detail));
                         stop_on_write_error!();
-                        break 'items;
+                        stop_drain.set(true);
+                        break 'attempt;
                     }
                     progress(&DriveStep {
                         fields: &fields,
@@ -793,6 +1035,48 @@ fn drive_queue_with(
             }
             lifecycle(db, thegn_core::merge_lifecycle::LifecycleEvent::Failed);
             break;
+        }
+        if let Some(claim) = claim.borrow_mut().take() {
+            let claim_lost = claim.lost();
+            match claim.finish(db) {
+                Ok(()) => match post_release.borrow_mut().take() {
+                    Some(PostRelease::Apply(event)) => crate::merge_lifecycle::apply(
+                        cfg,
+                        db,
+                        repo_root,
+                        &item.worktree,
+                        &item.branch,
+                        event,
+                    ),
+                    Some(PostRelease::Landed(commit)) => crate::merge_lifecycle::apply_landed(
+                        cfg,
+                        db,
+                        repo_root,
+                        &item.worktree,
+                        &item.branch,
+                        &commit,
+                    ),
+                    None => {}
+                },
+                Err(error) if !claim_lost => out.warnings.push(format!(
+                    "{}: could not settle and release merge claim: {error}",
+                    item.branch
+                )),
+                Err(_) => {
+                    if !out.warnings.iter().any(|warning| {
+                        warning.starts_with(&item.branch)
+                            && warning.contains("merge claim lost; another drain recovered the row")
+                    }) {
+                        out.warnings.push(format!(
+                            "{}: merge claim lost; another drain recovered the row",
+                            item.branch
+                        ));
+                    }
+                }
+            }
+        }
+        if stop_drain.get() {
+            break 'items;
         }
     }
     out
