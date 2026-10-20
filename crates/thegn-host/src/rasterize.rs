@@ -8,7 +8,7 @@
 //! No AI/agent dependency anywhere.
 
 use std::ffi::OsString;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::AtomicBool;
 
@@ -56,8 +56,147 @@ const PREVIEW_LIMITS: DecodeLimits = DecodeLimits {
 };
 /// Bound preview file reads to 256 MiB while covering large camera JPEGs.
 const MAX_PREVIEW_FILE_BYTES: u64 = 256 * 1024 * 1024;
+/// Mirrors the 2 MiB text-preview cap in `preview_pane.rs::read_capped`, which
+/// is what users see when Mermaid rendering fails.
+const MAX_MERMAID_INPUT_BYTES: u64 = 2 * 1024 * 1024;
 /// Bound generated Mermaid PNGs independently of the decoder's pixel budget.
 const MAX_MERMAID_OUTPUT_BYTES: u64 = 32 * 1024 * 1024;
+
+/// Owns all files visible to one renderer process. The tempdir is private and
+/// removed when the renderer has returned and this value is dropped.
+struct RenderStage {
+    dir: tempfile::TempDir,
+}
+
+impl RenderStage {
+    fn new() -> Result<Self, String> {
+        let dir = tempfile::Builder::new()
+            .prefix("thegn-preview-")
+            .tempdir()
+            .map_err(|e| format!("preview staging failed: {e}"))?;
+        std::fs::create_dir(dir.path().join("home"))
+            .map_err(|e| format!("preview staging failed: {e}"))?;
+        std::fs::create_dir(dir.path().join("tmp"))
+            .map_err(|e| format!("preview staging failed: {e}"))?;
+        Ok(Self { dir })
+    }
+
+    fn path(&self) -> &Path {
+        self.dir.path()
+    }
+}
+
+/// Copy a previously opened, bounded regular input into a fresh staging file.
+fn stage_input(
+    stage: &RenderStage,
+    source: &Path,
+    name: &str,
+    cap: u64,
+) -> Result<PathBuf, String> {
+    use std::io::Read;
+
+    let file = open_regular_nonblocking(source)?;
+    let metadata = file.metadata().map_err(|e| format!("read failed: {e}"))?;
+    if metadata.len() > cap {
+        return Err(format!("file exceeds the {cap} byte preview cap"));
+    }
+
+    let staged = stage.path().join(name);
+    let mut destination = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&staged)
+        .map_err(|e| format!("staged input create failed: {e}"))?;
+    let copied = std::io::copy(&mut file.take(cap.saturating_add(1)), &mut destination)
+        .map_err(|e| format!("staged input copy failed: {e}"))?;
+    if copied > cap {
+        drop(destination);
+        if let Err(error) = std::fs::remove_file(&staged) {
+            tracing::debug!(%error, path = %staged.display(), "failed to remove over-cap staged input");
+        }
+        return Err(format!(
+            "file exceeds the {cap} byte preview cap (more than {cap} bytes)"
+        ));
+    }
+    Ok(staged)
+}
+
+/// Keep only renderer inputs that are safe and needed. PATH entries must be
+/// absolute so the renderer cannot resolve tools relative to a workspace.
+fn renderer_env<I>(host: I, stage: &Path) -> Vec<(OsString, OsString)>
+where
+    I: IntoIterator<Item = (OsString, OsString)>,
+{
+    let mut allowed = Vec::new();
+    let mut host_home = None;
+    let mut has_puppeteer_cache = false;
+    for (key, value) in host {
+        let key_text = key.to_string_lossy().into_owned();
+        if key_text.eq_ignore_ascii_case("HOME") {
+            host_home = Some(value.clone());
+        }
+        if key_text.eq_ignore_ascii_case("PUPPETEER_CACHE_DIR") {
+            has_puppeteer_cache = true;
+        }
+        if key_text.eq_ignore_ascii_case("PATH") {
+            let absolute: Vec<_> = std::env::split_paths(&value)
+                .filter(|entry| entry.is_absolute())
+                .collect();
+            allowed.push((
+                OsString::from("PATH"),
+                std::env::join_paths(absolute).unwrap_or_default(),
+            ));
+        } else if key_text.eq_ignore_ascii_case("LANG")
+            || key_text.eq_ignore_ascii_case("TZ")
+            || key_text.to_ascii_uppercase().starts_with("LC_")
+            || key_text.eq_ignore_ascii_case("PUPPETEER_EXECUTABLE_PATH")
+            || key_text.eq_ignore_ascii_case("PUPPETEER_CACHE_DIR")
+        {
+            allowed.push((key, value));
+        } else if key_text.eq_ignore_ascii_case("SYSTEMROOT") {
+            allowed.push((OsString::from("SystemRoot"), value));
+        } else if key_text.eq_ignore_ascii_case("PATHEXT") {
+            allowed.push((OsString::from("PATHEXT"), value));
+        } else if key_text.eq_ignore_ascii_case("COMSPEC") {
+            allowed.push((OsString::from("COMSPEC"), value));
+        }
+    }
+
+    if !has_puppeteer_cache && let Some(home) = host_home {
+        allowed.push((
+            OsString::from("PUPPETEER_CACHE_DIR"),
+            Path::new(&home).join(".cache/puppeteer").into_os_string(),
+        ));
+    }
+
+    let home = stage.join("home");
+    allowed.extend([
+        (OsString::from("HOME"), home.clone().into_os_string()),
+        (
+            OsString::from("XDG_CONFIG_HOME"),
+            home.join(".config").into_os_string(),
+        ),
+        (
+            OsString::from("XDG_CACHE_HOME"),
+            home.join(".cache").into_os_string(),
+        ),
+        (
+            OsString::from("XDG_DATA_HOME"),
+            home.join(".local/share").into_os_string(),
+        ),
+        (OsString::from("TMPDIR"), stage.join("tmp").into_os_string()),
+    ]);
+    allowed
+}
+
+fn renderer_command(program: &str, stage: &RenderStage) -> Command {
+    let mut command = Command::new(program);
+    command
+        .env_clear()
+        .envs(renderer_env(std::env::vars_os(), stage.path()))
+        .current_dir(stage.path());
+    command
+}
 
 /// Whether declared source dimensions are within the decode budget. Pure.
 fn check_dimensions(w: u32, h: u32, limits: DecodeLimits) -> Result<(), String> {
@@ -206,8 +345,11 @@ pub(crate) fn image_bytes_with_limits(
 /// deadline or `cancel` is raised; the whole process group is killed and
 /// reaped on every path. Blocking.
 pub fn pdf_page1(path: &Path, cancel: &AtomicBool) -> Result<Raster, String> {
-    let mut cmd = Command::new("pdftoppm");
-    cmd.args(pdftoppm_args(path));
+    let stage = RenderStage::new()?;
+    let staged = stage_input(&stage, path, "input.pdf", MAX_PREVIEW_FILE_BYTES)
+        .map_err(|e| format!("preview staging failed: {e}"))?;
+    let mut cmd = renderer_command("pdftoppm", &stage);
+    cmd.args(pdftoppm_args(&staged));
     let out = crate::preview_jobs::run_renderer(&mut cmd, cancel)
         .map_err(|e| format!("pdftoppm: {}", capture_err(&e)))?;
     decode_and_fit(&out, PREVIEW_LIMITS)
@@ -232,8 +374,11 @@ fn pdftoppm_args(path: &Path) -> Vec<OsString> {
 /// truthful reason (absent tool, failure, timeout, cancel). Blocking.
 pub fn pdf_text(path: &Path, cancel: &AtomicBool) -> Result<String, String> {
     use crate::preview_jobs::CaptureError as C;
-    let mut cmd = Command::new("pdftotext");
-    cmd.arg(path).arg("-"); // text to stdout
+    let stage = RenderStage::new()?;
+    let staged = stage_input(&stage, path, "input.pdf", MAX_PREVIEW_FILE_BYTES)
+        .map_err(|e| format!("preview staging failed: {e}"))?;
+    let mut cmd = renderer_command("pdftotext", &stage);
+    cmd.args(pdftotext_args(&staged));
     match crate::preview_jobs::run_renderer(&mut cmd, cancel) {
         Ok(out) | Err(C::Capped(out)) => Ok(String::from_utf8_lossy(&out).into_owned()),
         Err(C::Spawn(_)) => Err("no text extractor available".to_string()),
@@ -241,26 +386,37 @@ pub fn pdf_text(path: &Path, cancel: &AtomicBool) -> Result<String, String> {
     }
 }
 
+fn pdftotext_args(path: &Path) -> Vec<OsString> {
+    [path.as_os_str().to_os_string(), OsString::from("-")].into()
+}
+
 /// Render a Mermaid file via `mmdc` (mermaid-cli) → PNG → RGBA. Errs (→ source
 /// fallback) when the tool is absent, fails, times out or is cancelled; the
 /// renderer's whole process tree (mmdc spawns a browser) is killed and reaped.
 /// Blocking.
 pub fn mermaid(path: &Path, cancel: &AtomicBool) -> Result<Raster, String> {
-    // Keep the renderer's output in a private, unpredictable directory so an
-    // untrusted user of the shared temp directory cannot pre-place a symlink.
-    let tmp_dir = tempfile::tempdir().map_err(|e| format!("mmd temp directory failed: {e}"))?;
-    let tmp = tmp_dir.path().join("render.png");
-    let mut cmd = Command::new("mmdc");
-    cmd.arg("-i")
-        .arg(path)
-        .arg("-o")
-        .arg(&tmp)
-        .arg("-b")
-        .arg("transparent");
+    let stage = RenderStage::new()?;
+    let staged = stage_input(&stage, path, "input.mmd", MAX_MERMAID_INPUT_BYTES)
+        .map_err(|e| format!("preview staging failed: {e}"))?;
+    let tmp = stage.path().join("render.png");
+    let mut cmd = renderer_command("mmdc", &stage);
+    cmd.args(mermaid_args(&staged, &tmp));
     match crate::preview_jobs::run_renderer_quiet(&mut cmd, cancel) {
         Ok(()) => read_mermaid_output(&tmp, MAX_MERMAID_OUTPUT_BYTES),
         Err(e) => Err(format!("mmdc: {}", capture_err(&e))),
     }
+}
+
+fn mermaid_args(input: &Path, output: &Path) -> Vec<OsString> {
+    [
+        OsString::from("-i"),
+        input.as_os_str().to_os_string(),
+        OsString::from("-o"),
+        output.as_os_str().to_os_string(),
+        OsString::from("-b"),
+        OsString::from("transparent"),
+    ]
+    .into()
 }
 
 fn read_mermaid_output(path: &Path, cap: u64) -> Result<Raster, String> {
@@ -283,6 +439,178 @@ fn capture_err(e: &crate::preview_jobs::CaptureError) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn renderer_env_drops_credentials_and_stages_home() {
+        let stage = tempfile::tempdir().unwrap();
+        let absolute_path = std::env::current_exe()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .to_path_buf();
+        let host_path = std::env::join_paths([
+            OsString::from("relative-bin"),
+            absolute_path.clone().into_os_string(),
+        ])
+        .unwrap();
+        let host = vec![
+            (OsString::from("HOME"), OsString::from("/real/home")),
+            (
+                OsString::from("SSH_AUTH_SOCK"),
+                OsString::from("/secret/socket"),
+            ),
+            (OsString::from("GH_TOKEN"), OsString::from("secret")),
+            (
+                OsString::from("ANTHROPIC_API_KEY"),
+                OsString::from("secret"),
+            ),
+            (
+                OsString::from("THEGN_CONTROL_SOCKET"),
+                OsString::from("secret"),
+            ),
+            (OsString::from("LD_PRELOAD"), OsString::from("evil.so")),
+            (OsString::from("Path"), host_path),
+            (OsString::from("LANG"), OsString::from("en_US.UTF-8")),
+            (OsString::from("LC_ALL"), OsString::from("C")),
+            (OsString::from("SystemRoot"), OsString::from("C:\\Windows")),
+            (OsString::from("PATHEXT"), OsString::from(".COM;.EXE;.BAT")),
+            (
+                OsString::from("COMSPEC"),
+                OsString::from("C:\\Windows\\System32\\cmd.exe"),
+            ),
+        ];
+        let env = renderer_env(host, stage.path());
+        let keys: std::collections::BTreeSet<_> = env
+            .iter()
+            .map(|(key, _)| key.to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(
+            keys,
+            [
+                "PATH",
+                "LANG",
+                "LC_ALL",
+                "SystemRoot",
+                "PATHEXT",
+                "COMSPEC",
+                "PUPPETEER_CACHE_DIR",
+                "HOME",
+                "XDG_CONFIG_HOME",
+                "XDG_CACHE_HOME",
+                "XDG_DATA_HOME",
+                "TMPDIR",
+            ]
+            .into_iter()
+            .map(str::to_string)
+            .collect()
+        );
+        let value = |name: &str| {
+            env.iter()
+                .find(|(key, _)| key == std::ffi::OsStr::new(name))
+                .map(|(_, value)| value)
+                .expect("expected allowlisted environment value")
+        };
+        assert!(Path::new(value("HOME")).starts_with(stage.path()));
+        assert_eq!(value("PATH").as_os_str(), absolute_path.as_os_str());
+        assert_eq!(value("SystemRoot"), std::ffi::OsStr::new("C:\\Windows"));
+        assert_eq!(value("PATHEXT"), std::ffi::OsStr::new(".COM;.EXE;.BAT"));
+        assert_eq!(
+            value("COMSPEC"),
+            std::ffi::OsStr::new("C:\\Windows\\System32\\cmd.exe")
+        );
+        let puppeteer_cache = Path::new("/real/home")
+            .join(".cache/puppeteer")
+            .into_os_string();
+        assert_eq!(
+            value("PUPPETEER_CACHE_DIR").as_os_str(),
+            puppeteer_cache.as_os_str()
+        );
+    }
+
+    #[test]
+    fn renderer_child_sees_only_the_allowlist() {
+        if cfg!(windows) {
+            return;
+        }
+        let stage = RenderStage::new().unwrap();
+        let mut command = renderer_command("sh", &stage);
+        command.arg("-c").arg("pwd; env");
+        let output =
+            crate::preview_jobs::run_renderer(&mut command, &AtomicBool::new(false)).unwrap();
+        let output = String::from_utf8(output).unwrap();
+        assert!(!output.lines().any(|line| {
+            line.starts_with("SSH_AUTH_SOCK=")
+                || line.starts_with("THEGN_")
+                || line.split_once('=').is_some_and(|(key, _)| {
+                    key.starts_with("GPG_") || key.ends_with("_TOKEN") || key.ends_with("_API_KEY")
+                })
+        }));
+        let canonical_stage = stage.path().canonicalize().unwrap();
+        assert_eq!(
+            output.lines().next(),
+            Some(canonical_stage.to_str().unwrap())
+        );
+        let home = format!("HOME={}", stage.path().join("home").display());
+        assert!(output.lines().any(|line| line == home));
+    }
+
+    #[test]
+    fn renderer_input_is_a_staged_copy() {
+        let source_dir = tempfile::tempdir().unwrap();
+        let stage = RenderStage::new().unwrap();
+        let source = source_dir.path().join("document.pdf");
+        let canary = source_dir.path().join("canary.pdf");
+        std::fs::write(&source, b"original document").unwrap();
+        std::fs::write(&canary, b"canary document").unwrap();
+
+        let staged = stage_input(&stage, &source, "input.pdf", 64).unwrap();
+        let staged_os = staged.as_os_str().to_os_string();
+        let source_os = source.as_os_str().to_os_string();
+        let pdf_image_args = pdftoppm_args(&staged);
+        let pdf_text_args = pdftotext_args(&staged);
+        let mermaid_output = stage.path().join("render.png");
+        let mermaid_renderer_args = mermaid_args(&staged, &mermaid_output);
+        for args in [pdf_image_args, pdf_text_args, mermaid_renderer_args] {
+            assert!(args.contains(&staged_os));
+            assert!(!args.contains(&source_os));
+        }
+        std::fs::remove_file(&source).unwrap();
+        if crate::platform::symlink_file_for_test(&canary, &source).is_err() {
+            return;
+        }
+        let bytes = std::fs::read(&staged).unwrap();
+        assert_eq!(bytes, b"original document");
+        assert!(staged.starts_with(stage.path()));
+        assert!(
+            !bytes
+                .windows(b"canary document".len())
+                .any(|window| { window == b"canary document" })
+        );
+    }
+
+    #[test]
+    fn renderer_input_over_cap_is_refused() {
+        let source_dir = tempfile::tempdir().unwrap();
+        let stage = RenderStage::new().unwrap();
+        let source = source_dir.path().join("too-large.mmd");
+        std::fs::write(&source, [b'x'; 17]).unwrap();
+        assert!(stage_input(&stage, &source, "input.mmd", 16).is_err());
+        assert!(std::fs::read_dir(stage.path()).unwrap().all(|entry| {
+            !entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .starts_with("input.")
+        }));
+    }
+
+    #[test]
+    fn renderer_stage_is_removed_after_drop() {
+        let stage = RenderStage::new().unwrap();
+        let path = stage.path().to_path_buf();
+        drop(stage);
+        assert!(!path.exists());
+    }
 
     #[test]
     fn decodes_a_generated_png_to_rgba() {
