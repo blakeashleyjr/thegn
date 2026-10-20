@@ -1056,7 +1056,13 @@ impl RemoteProvider for VpsProvider {
             // Resolve name → vendor instance id (registry first, then the API).
             let instance_id = match registry::read(id).filter(|r| !r.instance_id.is_empty()) {
                 Some(r) => Some(r.instance_id),
-                None => self.find_by_name(id).await.ok().flatten().map(|s| s.id),
+                None => self
+                    .find_by_name(id)
+                    .await
+                    .context(
+                        "vps: cannot confirm whether the instance still exists (provider inventory lookup failed); keeping the ledger record and SSH custody",
+                    )?
+                    .map(|s| s.id),
             };
             let Some(iid) = instance_id else {
                 // Nothing at the provider — clear any lingering ledger entry.
@@ -1577,5 +1583,54 @@ mod tests {
             std::io::ErrorKind::WouldBlock
         );
         drop(permits);
+    }
+
+    #[tokio::test]
+    async fn destroy_lookup_failure_keeps_ledger_and_custody() {
+        let _state = thegn_core::testenv::IsolatedState::new();
+        let name = "tg-vps-lost";
+        registry::write(&registry::VpsRecord {
+            name: name.into(),
+            provider: "hetzner".into(),
+            state: "creating".into(),
+            instance_id: String::new(),
+            ip: String::new(),
+            created_at: 1,
+        })
+        .unwrap();
+        let spec_key_path = std::path::Path::new("/tmp/nonexistent-managed-key");
+        let provider = VpsProvider::new(VpsSpec {
+            kind: VpsKind::Hetzner,
+            api_base: "http://127.0.0.1:1".into(),
+            token: "unused".into(),
+            name: name.into(),
+            region: String::new(),
+            size: String::new(),
+            image: String::new(),
+            max_instances: 0,
+            max_lifetime_secs: 0,
+            key_path: spec_key_path.into(),
+            pubkey: TEST_PUBKEY.into(),
+            skip_ready_wait: true,
+        });
+
+        let error = match provider.destroy(name).await {
+            Ok(()) => panic!("inventory failure must refuse destroy"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("cannot confirm"));
+        assert_eq!(
+            registry::read(name).map(|record| record.state),
+            Some("creating".into())
+        );
+        assert!(
+            thegn_core::managed_ssh::read(
+                "hetzner",
+                &thegn_core::managed_ssh::account_label(spec_key_path),
+                name,
+            )
+            .unwrap()
+            .is_none()
+        );
     }
 }
