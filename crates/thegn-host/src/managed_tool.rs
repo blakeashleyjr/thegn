@@ -11,12 +11,13 @@
 use anyhow::{Context, Result};
 use sha2::{Digest, Sha256};
 use std::collections::VecDeque;
+use std::ffi::{OsStr, OsString};
 use std::io::{Read, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus, Stdio};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
-use tempfile::NamedTempFile;
+use tempfile::{NamedTempFile, TempDir};
 use thegn_core::managed_tool::{Arch, ManagedTool, Os, Source};
 use thegn_core::{msg, util};
 
@@ -398,6 +399,222 @@ pub fn run_setup_cmd(mut cmd: Command, ctx: &str, fail: &str) -> Result<()> {
     }
 }
 
+/// Keep installer subprocesses away from credentials and control variables
+/// inherited by thegn. The explicit HOME-backed locations keep package-manager
+/// configuration and caches inside the private install workspace.
+fn installer_env<I>(host: I, home: &Path) -> Vec<(OsString, OsString)>
+where
+    I: IntoIterator<Item = (OsString, OsString)>,
+{
+    let mut env = Vec::new();
+    let mut host_home = None;
+    let mut rustup_home_present = false;
+    for (key, value) in host {
+        let Some(key_text) = key.to_str() else {
+            continue;
+        };
+        let keep = key_text == "PATH"
+            || key_text == "LANG"
+            || key_text.starts_with("LC_")
+            || key_text == "TERM"
+            || matches!(
+                key_text,
+                "http_proxy"
+                    | "https_proxy"
+                    | "no_proxy"
+                    | "HTTP_PROXY"
+                    | "HTTPS_PROXY"
+                    | "NO_PROXY"
+                    | "SSL_CERT_FILE"
+                    | "SSL_CERT_DIR"
+                    | "NIX_SSL_CERT_FILE"
+                    | "RUSTUP_HOME"
+                    | "RUSTUP_TOOLCHAIN"
+            );
+        if key_text == "HOME" {
+            host_home = Some(PathBuf::from(&value));
+        }
+        if key_text == "RUSTUP_HOME" {
+            rustup_home_present = true;
+        }
+        if keep {
+            env.push((key, value));
+        }
+    }
+    if !rustup_home_present && let Some(real_home) = host_home {
+        env.push((
+            OsString::from("RUSTUP_HOME"),
+            real_home.join(".rustup").into_os_string(),
+        ));
+    }
+    env.extend([
+        (OsString::from("HOME"), home.as_os_str().to_owned()),
+        (
+            OsString::from("CARGO_HOME"),
+            home.join("cargo").into_os_string(),
+        ),
+        (
+            OsString::from("npm_config_userconfig"),
+            home.join("npmrc").into_os_string(),
+        ),
+        (
+            OsString::from("npm_config_cache"),
+            home.join("npm-cache").into_os_string(),
+        ),
+        (OsString::from("GIT_TERMINAL_PROMPT"), OsString::from("0")),
+        (
+            OsString::from("SSH_ASKPASS_REQUIRE"),
+            OsString::from("never"),
+        ),
+        (OsString::from("GIT_ASKPASS"), OsString::from("true")),
+        (
+            OsString::from("npm_config_progress"),
+            OsString::from("false"),
+        ),
+    ]);
+    env
+}
+
+fn valid_tool_name(value: &str) -> bool {
+    (1..=64).contains(&value.len())
+        && value != "."
+        && value != ".."
+        && !matches!(value.as_bytes()[0], b'-' | b'.')
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+}
+
+fn valid_npm_package(value: &str) -> bool {
+    if value.len() > 214 || value.is_empty() {
+        return false;
+    }
+    let name = if let Some(scoped) = value.strip_prefix('@') {
+        let Some((scope, package)) = scoped.split_once('/') else {
+            return false;
+        };
+        if !valid_npm_component(scope) {
+            return false;
+        }
+        package
+    } else {
+        value
+    };
+    valid_npm_component(name) && !name.contains('/')
+}
+
+fn valid_npm_component(value: &str) -> bool {
+    !value.is_empty()
+        && (value.as_bytes()[0].is_ascii_lowercase() || value.as_bytes()[0].is_ascii_digit())
+        && value.bytes().all(|byte| {
+            byte.is_ascii_lowercase()
+                || byte.is_ascii_digit()
+                || matches!(byte, b'.' | b'_' | b'~' | b'-')
+        })
+}
+
+fn valid_crate_name(value: &str) -> bool {
+    (1..=64).contains(&value.len())
+        && value.as_bytes()[0].is_ascii_alphabetic()
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
+}
+
+fn valid_exact_version(value: &str) -> bool {
+    let (without_build, build_valid) = match value.split_once('+') {
+        Some((before, build)) => (before, valid_semver_suffix(build)),
+        None => (value, true),
+    };
+    if !build_valid {
+        return false;
+    }
+    let (core, prerelease_valid) = match without_build.split_once('-') {
+        Some((core, prerelease)) => (core, valid_semver_suffix(prerelease)),
+        None => (without_build, true),
+    };
+    prerelease_valid && core.split('.').count() == 3 && core.split('.').all(valid_semver_number)
+}
+
+fn valid_semver_number(value: &str) -> bool {
+    !value.is_empty()
+        && (value == "0" || !value.starts_with('0'))
+        && value.bytes().all(|byte| byte.is_ascii_digit())
+}
+
+fn valid_semver_suffix(value: &str) -> bool {
+    !value.is_empty()
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'-'))
+}
+
+fn installer_workspace(managed: &Path, name: &str) -> Result<(TempDir, TempDir)> {
+    let parent = managed
+        .parent()
+        .context("managed tool directory has no parent")?;
+    std::fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
+    let home = tempfile::Builder::new()
+        .prefix(".thegn-install-home-")
+        .tempdir_in(parent)
+        .with_context(|| format!("create private installer home in {}", parent.display()))?;
+    let staging = tempfile::Builder::new()
+        .prefix(&format!(".{name}.staging-"))
+        .tempdir_in(parent)
+        .with_context(|| format!("create staging directory in {}", parent.display()))?;
+    Ok((home, staging))
+}
+
+fn promote_staging(staging: &Path, managed: &Path, bin_rel: &Path) -> Result<()> {
+    let expected = staging.join(bin_rel);
+    std::fs::symlink_metadata(&expected).with_context(|| {
+        format!(
+            "installer did not produce expected binary {}",
+            expected.display()
+        )
+    })?;
+    let parent = managed
+        .parent()
+        .context("managed tool directory has no parent")?;
+    let name = managed
+        .file_name()
+        .and_then(OsStr::to_str)
+        .context("managed tool directory has no valid name")?;
+    let old = tempfile::Builder::new()
+        .prefix(&format!(".{name}.old-"))
+        .tempdir_in(parent)
+        .with_context(|| format!("reserve old install name in {}", parent.display()))?;
+    let old_path = old.path().to_path_buf();
+    std::fs::remove_dir(&old_path).with_context(|| format!("release {}", old_path.display()))?;
+    let had_old = match std::fs::symlink_metadata(managed) {
+        Ok(_) => true,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+        Err(error) => {
+            return Err(anyhow::Error::new(error)
+                .context(format!("inspect managed install {}", managed.display())));
+        }
+    };
+    if had_old {
+        std::fs::rename(managed, &old_path)
+            .with_context(|| format!("move previous install {}", managed.display()))?;
+    }
+    if let Err(error) = std::fs::rename(staging, managed) {
+        if had_old && let Err(restore_error) = std::fs::rename(&old_path, managed) {
+            return Err(anyhow::anyhow!(
+                "promote staged install failed: {error}; restoring previous install failed: {restore_error}"
+            ));
+        }
+        return Err(anyhow::Error::new(error).context("promote staged managed-tool install"));
+    }
+    if had_old && let Err(error) = std::fs::remove_dir_all(&old_path) {
+        tracing::warn!(target: "thegn::provision", path = %old_path.display(), %error, "could not remove previous managed-tool install");
+    }
+    // The reserved path was removed before it became the old install; prevent
+    // TempDir's guard from attempting to remove the renamed directory again.
+    let _old_path = old.keep();
+    Ok(())
+}
+
 /// The managed tools thegn knows about, for `doctor` reporting and (later)
 /// pre-provisioning.
 pub fn known() -> Vec<ManagedTool> {
@@ -416,6 +633,27 @@ pub fn acquire(tool: &ManagedTool) -> Result<()> {
     match &tool.source {
         Source::Npm { package } => {
             anyhow::ensure!(
+                valid_tool_name(&tool.name),
+                "invalid tool name: {:?}",
+                tool.name
+            );
+            anyhow::ensure!(
+                valid_npm_package(package),
+                "invalid npm package: {package:?}"
+            );
+            anyhow::ensure!(
+                valid_exact_version(&tool.version),
+                "invalid version: {:?}",
+                tool.version
+            );
+            let managed = tool.managed_dir();
+            let bin_rel = tool
+                .bin_path()
+                .strip_prefix(&managed)
+                .context("managed binary is outside its install directory")?
+                .to_path_buf();
+            let (home, staging) = installer_workspace(&managed, &tool.name)?;
+            anyhow::ensure!(
                 util::have("npm"),
                 "npm not found — needed to install {package}@{}. \
                  Install Node/npm, or put the tool on PATH.",
@@ -423,15 +661,42 @@ pub fn acquire(tool: &ManagedTool) -> Result<()> {
             );
             let mut cmd = Command::new("npm");
             cmd.args(["install", "--prefix"])
-                .arg(tool.managed_dir())
+                .arg(staging.path())
                 .arg(format!("{package}@{}", tool.version));
+            cmd.env_clear()
+                .envs(installer_env(std::env::vars_os(), home.path()));
             run_setup_cmd(
                 cmd,
                 &format!("npm install {package}@{}", tool.version),
                 &format!("npm install {package}@{} failed", tool.version),
-            )
+            )?;
+            promote_staging(staging.path(), &managed, &bin_rel)?;
+            let _staging_path = staging.keep();
+            drop(home);
+            Ok(())
         }
         Source::Cargo { crate_name } => {
+            anyhow::ensure!(
+                valid_tool_name(&tool.name),
+                "invalid tool name: {:?}",
+                tool.name
+            );
+            anyhow::ensure!(
+                valid_crate_name(crate_name),
+                "invalid crate name: {crate_name:?}"
+            );
+            anyhow::ensure!(
+                valid_exact_version(&tool.version),
+                "invalid version: {:?}",
+                tool.version
+            );
+            let managed = tool.managed_dir();
+            let bin_rel = tool
+                .bin_path()
+                .strip_prefix(&managed)
+                .context("managed binary is outside its install directory")?
+                .to_path_buf();
+            let (home, staging) = installer_workspace(&managed, &tool.name)?;
             anyhow::ensure!(
                 util::have("cargo"),
                 "cargo not found — needed to install {crate_name} {}. \
@@ -440,13 +705,19 @@ pub fn acquire(tool: &ManagedTool) -> Result<()> {
             );
             let mut cmd = Command::new("cargo");
             cmd.args(["install", crate_name, "--version", &tool.version, "--root"])
-                .arg(tool.managed_dir())
+                .arg(staging.path())
                 .arg("--locked");
+            cmd.env_clear()
+                .envs(installer_env(std::env::vars_os(), home.path()));
             run_setup_cmd(
                 cmd,
                 &format!("cargo install {crate_name} --version {}", tool.version),
                 &format!("cargo install {crate_name} {} failed", tool.version),
-            )
+            )?;
+            promote_staging(staging.path(), &managed, &bin_rel)?;
+            let _staging_path = staging.keep();
+            drop(home);
+            Ok(())
         }
         Source::GithubRelease { repo, .. } => {
             let os = Os::current().context("unsupported OS for a managed download")?;
@@ -1009,6 +1280,204 @@ mod tests {
         let mut c = Command::new("sh");
         c.args(["-c", script]);
         c
+    }
+
+    #[test]
+    fn installer_env_drops_credentials_and_uses_synthetic_home() {
+        let home = Path::new("/private/install-home");
+        let host = vec![
+            (OsString::from("HOME"), OsString::from("/real")),
+            (OsString::from("GH_TOKEN"), OsString::from("secret")),
+            (OsString::from("SSH_AUTH_SOCK"), OsString::from("/socket")),
+            (
+                OsString::from("ANTHROPIC_API_KEY"),
+                OsString::from("secret"),
+            ),
+            (
+                OsString::from("THEGN_CONTROL_SOCKET"),
+                OsString::from("/socket"),
+            ),
+            (OsString::from("NPM_TOKEN"), OsString::from("secret")),
+            (OsString::from("PATH"), OsString::from("/bin")),
+            (OsString::from("LANG"), OsString::from("C.UTF-8")),
+            (
+                OsString::from("https_proxy"),
+                OsString::from("https://proxy"),
+            ),
+        ];
+        let env = installer_env(host, home);
+        let keys = env
+            .iter()
+            .map(|(key, _)| key.to_string_lossy().into_owned())
+            .collect::<std::collections::BTreeSet<_>>();
+        let expected = [
+            "PATH",
+            "LANG",
+            "https_proxy",
+            "RUSTUP_HOME",
+            "HOME",
+            "CARGO_HOME",
+            "npm_config_userconfig",
+            "npm_config_cache",
+            "GIT_TERMINAL_PROMPT",
+            "SSH_ASKPASS_REQUIRE",
+            "GIT_ASKPASS",
+            "npm_config_progress",
+        ]
+        .into_iter()
+        .map(str::to_owned)
+        .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(keys, expected);
+        let values = env
+            .into_iter()
+            .map(|(key, value)| (key.to_string_lossy().into_owned(), value))
+            .collect::<std::collections::BTreeMap<_, _>>();
+        assert_eq!(values["HOME"].as_os_str(), home.as_os_str());
+        assert_eq!(
+            values["CARGO_HOME"].as_os_str(),
+            home.join("cargo").as_os_str()
+        );
+        assert_eq!(
+            values["npm_config_userconfig"].as_os_str(),
+            home.join("npmrc").as_os_str()
+        );
+        assert_eq!(
+            values["npm_config_cache"].as_os_str(),
+            home.join("npm-cache").as_os_str()
+        );
+        assert_eq!(
+            values["RUSTUP_HOME"].as_os_str(),
+            Path::new("/real/.rustup").as_os_str()
+        );
+    }
+
+    #[test]
+    fn installer_child_sees_only_the_allowlist() {
+        let home = Path::new("/synthetic-home");
+        let host = vec![
+            (OsString::from("HOME"), OsString::from("/real")),
+            (OsString::from("GH_TOKEN"), OsString::from("secret")),
+            (OsString::from("SSH_AUTH_SOCK"), OsString::from("/socket")),
+            (
+                OsString::from("THEGN_CONTROL_SOCKET"),
+                OsString::from("/socket"),
+            ),
+            (OsString::from("PATH"), OsString::from("/bin")),
+        ];
+        let mut command = sh("env");
+        command.env_clear().envs(installer_env(host, home));
+        let output = run_bounded(&mut command, fast(), false).unwrap();
+        let stdout = String::from_utf8_lossy(&output.stdout.head);
+        assert!(stdout.lines().any(|line| line == "HOME=/synthetic-home"));
+        assert!(!stdout.lines().any(|line| line.starts_with("GH_TOKEN=")));
+        assert!(
+            !stdout
+                .lines()
+                .any(|line| line.starts_with("SSH_AUTH_SOCK="))
+        );
+        assert!(!stdout.lines().any(|line| line.starts_with("THEGN_")));
+    }
+
+    #[test]
+    fn installer_grammar_refuses_bad_sources() {
+        for (value, expected) in [
+            ("@scope/srv", true),
+            ("@2scope/4srv", true),
+            ("left-pad", true),
+            ("--registry=x", false),
+            ("../x", false),
+            ("a b", false),
+            ("@scope/", false),
+            ("UPPER", false),
+        ] {
+            assert_eq!(valid_npm_package(value), expected, "npm package {value:?}");
+        }
+        for (value, expected) in [
+            ("bugstalker", true),
+            ("Crate_2-name", true),
+            ("--help", false),
+            ("../x", false),
+            ("a b", false),
+            ("", false),
+        ] {
+            assert_eq!(valid_crate_name(value), expected, "crate name {value:?}");
+        }
+        for (value, expected) in [
+            ("0.4.6", true),
+            ("1.2.3-rc.1+b5", true),
+            ("1.2", false),
+            ("^1.2.3", false),
+            ("latest", false),
+            ("01.2.3", false),
+            ("1.2.3-", false),
+            ("1.2.3+build+extra", false),
+        ] {
+            assert_eq!(valid_exact_version(value), expected, "version {value:?}");
+        }
+        for (value, expected) in [
+            ("bugstalker", true),
+            ("tool_1.test", true),
+            ("..", false),
+            ("a/b", false),
+            ("-x", false),
+            (".hidden", false),
+            ("", false),
+        ] {
+            assert_eq!(valid_tool_name(value), expected, "tool name {value:?}");
+        }
+    }
+
+    #[test]
+    fn installer_refuses_before_spawn() {
+        let path = tempfile::tempdir().unwrap();
+        let path_text = path.path().to_str().unwrap();
+        let _path = crate::testenv::EnvVarGuard::set(&[("PATH", path_text)]);
+        let mut tool = ManagedTool::npm("debugger", "left-pad", "left-pad", "1.2.3");
+        tool.version = "latest".to_string();
+        let error = acquire(&tool).unwrap_err();
+        assert!(error.to_string().contains("invalid version"));
+    }
+
+    #[test]
+    fn installer_promote_keeps_previous_install_on_missing_binary() {
+        let root = tempfile::tempdir().unwrap();
+        let managed = root.path().join("tool");
+        let staging = tempfile::Builder::new()
+            .prefix(".tool.staging-")
+            .tempdir_in(root.path())
+            .unwrap();
+        std::fs::create_dir_all(managed.join("bin")).unwrap();
+        std::fs::write(managed.join("bin/old"), b"previous").unwrap();
+        std::fs::create_dir_all(staging.path().join("bin")).unwrap();
+        assert!(promote_staging(staging.path(), &managed, Path::new("bin/x")).is_err());
+        assert_eq!(std::fs::read(managed.join("bin/old")).unwrap(), b"previous");
+        drop(staging);
+        assert!(!root.path().join(".tool.staging-").exists());
+        assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn installer_promote_swaps_in_the_staged_install() {
+        let root = tempfile::tempdir().unwrap();
+        let managed = root.path().join("tool");
+        let staging = tempfile::Builder::new()
+            .prefix(".tool.staging-")
+            .tempdir_in(root.path())
+            .unwrap();
+        std::fs::create_dir_all(managed.join("bin")).unwrap();
+        std::fs::write(managed.join("bin/old"), b"previous").unwrap();
+        std::fs::create_dir_all(staging.path().join("bin")).unwrap();
+        std::fs::write(staging.path().join("bin/x"), b"new").unwrap();
+        promote_staging(staging.path(), &managed, Path::new("bin/x")).unwrap();
+        assert_eq!(std::fs::read(managed.join("bin/x")).unwrap(), b"new");
+        assert!(!managed.join("bin/old").exists());
+        assert!(std::fs::read_dir(root.path()).unwrap().all(|entry| {
+            !entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .starts_with(".tool.old-")
+        }));
     }
 
     /// Alive means present and not a zombie awaiting an (init) reaper.
