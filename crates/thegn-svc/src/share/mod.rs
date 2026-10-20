@@ -54,18 +54,91 @@ pub enum StopOutcome {
 
 struct ShareChild {
     child: Child,
+    pid: u32,
+    grouped: bool,
+    stop_requested: bool,
+    #[cfg(test)]
+    escalation_count: Arc<std::sync::atomic::AtomicUsize>,
     reaped: bool,
 }
 
 impl StopHandle {
     /// Request termination without waiting for the supervisor to reap.
     pub fn stop(&self) -> StopOutcome {
+        self.stop_with_grace(SHARE_STOP_GRACE)
+    }
+
+    /// Kill the child immediately when the host is exiting.
+    pub fn stop_now(&self) -> StopOutcome {
         let mut state = self
             .child
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         if state.reaped {
             return StopOutcome::AlreadyExited;
+        }
+        if state.grouped {
+            let exited = crate::plugin::proc::leader_exited_nowait(state.pid);
+            crate::plugin::proc::kill_group(state.pid);
+            return match exited {
+                Ok(true) => StopOutcome::AlreadyExited,
+                Ok(false) => StopOutcome::Terminated,
+                Err(error) => StopOutcome::Failed(error.to_string()),
+            };
+        }
+        match state.child.try_wait() {
+            Ok(Some(_)) => {
+                state.reaped = true;
+                StopOutcome::AlreadyExited
+            }
+            Err(_) => match state.child.kill() {
+                Ok(()) => StopOutcome::Terminated,
+                Err(error) => StopOutcome::Failed(error.to_string()),
+            },
+            Ok(None) => match state.child.kill() {
+                Ok(()) => StopOutcome::Terminated,
+                Err(error) => StopOutcome::Failed(error.to_string()),
+            },
+        }
+    }
+
+    fn stop_with_grace(&self, grace: Duration) -> StopOutcome {
+        let mut state = self
+            .child
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if state.reaped {
+            return StopOutcome::AlreadyExited;
+        }
+        if state.grouped {
+            match crate::plugin::proc::leader_exited_nowait(state.pid) {
+                Ok(true) => {
+                    crate::plugin::proc::kill_group(state.pid);
+                    return StopOutcome::AlreadyExited;
+                }
+                Err(error) => return StopOutcome::Failed(error.to_string()),
+                Ok(false) => {}
+            }
+            crate::plugin::proc::term_group(state.pid);
+            if !state.stop_requested {
+                state.stop_requested = true;
+                #[cfg(test)]
+                state.escalation_count.fetch_add(1, Ordering::Relaxed);
+                let child = Arc::clone(&self.child);
+                let _escalation =
+                    thegn_core::thread_name::spawn_named("thegn-share-esc", move || {
+                        std::thread::sleep(grace);
+                        let state = child
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner);
+                        if !state.reaped
+                            && let Ok(false) = crate::plugin::proc::leader_exited_nowait(state.pid)
+                        {
+                            crate::plugin::proc::kill_group(state.pid);
+                        }
+                    });
+            }
+            return StopOutcome::Terminated;
         }
         match state.child.try_wait() {
             Ok(Some(_)) => {
@@ -1024,10 +1097,13 @@ fn serve_dns_name(rt: &OciRuntime, sidecar: &str) -> Result<String> {
 /// A live share: the running tunnel-client child and its public URL.
 pub struct RunningShare {
     child: StopHandle,
+    readers: Vec<std::thread::JoinHandle<()>>,
     pub public_url: PublicEndpoint,
     endpoint_tracker: EndpointTracker,
-    cleanup: Option<(std::path::PathBuf, Vec<String>, Option<Vec<u8>>)>,
+    cleanup: Option<ShareCleanup>,
 }
+
+type ShareCleanup = (std::path::PathBuf, Vec<String>, Option<Vec<u8>>);
 
 impl fmt::Debug for RunningShare {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -1043,7 +1119,7 @@ impl RunningShare {
         self.child.clone()
     }
 
-    /// Poll and reap the child if it has exited.
+    /// Check and reap the child if it has exited.
     pub fn has_exited(&self) -> bool {
         let mut state = self
             .child
@@ -1052,6 +1128,16 @@ impl RunningShare {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         if state.reaped {
             return true;
+        }
+        if state.grouped {
+            match crate::plugin::proc::leader_exited_nowait(state.pid) {
+                Ok(true) => crate::plugin::proc::kill_group(state.pid),
+                Ok(false) => return false,
+                Err(error) => {
+                    tracing::debug!(%error, "share child exit check failed");
+                    return false;
+                }
+            }
         }
         match state.child.try_wait() {
             Ok(Some(_)) => {
@@ -1086,21 +1172,89 @@ impl RunningShare {
     }
 
     /// Best-effort terminate the child.
-    pub fn stop(mut self) {
-        match self.child.stop() {
-            StopOutcome::Failed(error) => tracing::debug!(%error, "share child stop failed"),
-            StopOutcome::Terminated | StopOutcome::AlreadyExited => {}
+    pub fn stop(self) {
+        let report = self.stop_verified();
+        if report.leaked_readers > 0 || matches!(report.outcome, StopOutcome::Failed(_)) {
+            tracing::warn!(?report, "share teardown was incomplete");
         }
-        self.reap();
-        self.cleanup_files();
     }
 
-    pub fn wait(mut self) {
-        self.reap();
-        self.cleanup_files();
+    pub fn wait(self) {
+        let report = self.wait_verified();
+        if report.leaked_readers > 0 || matches!(report.outcome, StopOutcome::Failed(_)) {
+            tracing::warn!(?report, "share teardown was incomplete");
+        }
     }
 
-    fn reap(&self) {
+    pub fn stop_verified(mut self) -> ShareTeardown {
+        let outcome = self.child.stop();
+        let outcome = self.reap(outcome);
+        let leaked_readers = self.join_readers();
+        self.cleanup_files();
+        ShareTeardown {
+            outcome,
+            leaked_readers,
+        }
+    }
+
+    pub fn wait_verified(mut self) -> ShareTeardown {
+        let outcome = self.reap(StopOutcome::AlreadyExited);
+        let leaked_readers = self.join_readers();
+        self.cleanup_files();
+        ShareTeardown {
+            outcome,
+            leaked_readers,
+        }
+    }
+
+    fn reap(&self, outcome: StopOutcome) -> StopOutcome {
+        let grouped = {
+            let state = self
+                .child
+                .child
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if state.reaped {
+                return if matches!(&outcome, StopOutcome::Failed(_)) {
+                    outcome
+                } else {
+                    StopOutcome::AlreadyExited
+                };
+            }
+            state.grouped
+        };
+        if grouped {
+            let pid = self
+                .child
+                .child
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .pid;
+            if matches!(&outcome, StopOutcome::Failed(_)) {
+                crate::plugin::proc::kill_group(pid);
+            }
+            if let Err(error) = crate::plugin::proc::wait_leader_exit_nowait(pid) {
+                tracing::debug!(%error, "share no-wait leader wait failed; using blocking reap");
+                crate::plugin::proc::kill_group(pid);
+            }
+            let mut state = self
+                .child
+                .child
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if let Err(error) = state.child.wait() {
+                tracing::debug!(%error, "share child reap failed");
+                return StopOutcome::Failed(error.to_string());
+            }
+            state.reaped = true;
+            return outcome;
+        }
+        self.reap_foreground(outcome)
+    }
+
+    fn reap_foreground(&self, outcome: StopOutcome) -> StopOutcome {
+        // Foreground CLI and non-Unix fallback retain polling. Supervised Unix
+        // shares use WNOWAIT above.
         loop {
             {
                 let mut state = self
@@ -1109,19 +1263,41 @@ impl RunningShare {
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner);
                 if state.reaped {
-                    return;
+                    return if matches!(&outcome, StopOutcome::Failed(_)) {
+                        outcome
+                    } else {
+                        StopOutcome::AlreadyExited
+                    };
                 }
                 match state.child.try_wait() {
                     Ok(Some(_)) => {
                         state.reaped = true;
-                        return;
+                        return outcome;
                     }
                     Ok(None) => {}
                     Err(error) => tracing::debug!(%error, "share child wait failed"),
                 }
             }
-            std::thread::sleep(SHARE_REAP_POLL);
+            std::thread::sleep(Duration::from_millis(200));
         }
+    }
+
+    fn join_readers(&mut self) -> usize {
+        let deadline = Instant::now() + SHARE_READER_JOIN;
+        while Instant::now() < deadline && self.readers.iter().any(|reader| !reader.is_finished()) {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let mut leaked = 0;
+        for reader in self.readers.drain(..) {
+            if !reader.is_finished() {
+                leaked += 1;
+                continue;
+            }
+            if reader.join().is_err() {
+                tracing::debug!("share reader panicked");
+            }
+        }
+        leaked
     }
 
     fn cleanup_files(&mut self) {
@@ -1131,7 +1307,14 @@ impl RunningShare {
     }
 }
 
-const SHARE_REAP_POLL: Duration = Duration::from_millis(200);
+const SHARE_STOP_GRACE: Duration = Duration::from_secs(3);
+const SHARE_READER_JOIN: Duration = Duration::from_secs(2);
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ShareTeardown {
+    pub outcome: StopOutcome,
+    pub leaked_readers: usize,
+}
 
 #[derive(Clone, Default)]
 struct EndpointTracker {
@@ -1411,7 +1594,14 @@ pub fn start(
     timeout: Duration,
 ) -> Result<RunningShare> {
     let cancel = AtomicBool::new(false);
-    start_cancellable(plan, statedir, timeout, &cancel)
+    start_with_ambient(
+        plan,
+        statedir,
+        timeout,
+        std::env::vars_os(),
+        &cancel,
+        ProcessGrouping::Foreground,
+    )
 }
 
 pub fn start_cancellable(
@@ -1420,7 +1610,20 @@ pub fn start_cancellable(
     timeout: Duration,
     cancel: &AtomicBool,
 ) -> Result<RunningShare> {
-    start_with_ambient(plan, statedir, timeout, std::env::vars_os(), cancel)
+    start_with_ambient(
+        plan,
+        statedir,
+        timeout,
+        std::env::vars_os(),
+        cancel,
+        ProcessGrouping::OwnGroup,
+    )
+}
+
+#[derive(Clone, Copy)]
+enum ProcessGrouping {
+    Foreground,
+    OwnGroup,
 }
 
 fn start_with_ambient(
@@ -1429,6 +1632,7 @@ fn start_with_ambient(
     timeout: Duration,
     ambient: impl IntoIterator<Item = (OsString, OsString)>,
     cancel: &AtomicBool,
+    grouping: ProcessGrouping,
 ) -> Result<RunningShare> {
     let manifest = read_owner_manifest(statedir)?;
     match start_inner(
@@ -1438,6 +1642,7 @@ fn start_with_ambient(
         manifest.as_deref(),
         ambient,
         cancel,
+        grouping,
     ) {
         Ok(mut running) => {
             running.cleanup = Some((
@@ -1529,6 +1734,7 @@ fn start_inner(
     owner_manifest: Option<&[u8]>,
     ambient: impl IntoIterator<Item = (OsString, OsString)>,
     cancel: &AtomicBool,
+    grouping: ProcessGrouping,
 ) -> Result<RunningShare> {
     verify_owner_manifest(statedir, owner_manifest)?;
     if matches!(&plan.url_rule, UrlRule::Fixed(_)) && plan.url_rule.fixed().is_none() {
@@ -1553,6 +1759,9 @@ fn start_inner(
     for (k, v) in &plan.env {
         cmd.env(k, v);
     }
+    if matches!(grouping, ProcessGrouping::OwnGroup) {
+        crate::plugin::proc::set_process_group(&mut cmd);
+    }
     let mut child = cmd
         .spawn()
         .with_context(|| format!("share: failed to spawn '{}'", plan.program))?;
@@ -1562,6 +1771,7 @@ fn start_inner(
     // consume the only startup result.
     let (url_tx, url_rx) = mpsc::sync_channel::<PublicEndpoint>(2);
     let endpoint_tracker = EndpointTracker::default();
+    let mut readers = Vec::new();
     for stream in [
         child.stdout.take().map(Streamable::Out),
         child.stderr.take().map(Streamable::Err),
@@ -1573,9 +1783,12 @@ fn start_inner(
         let url_tx = url_tx.clone();
         let endpoint_tracker = endpoint_tracker.clone();
         let url_rule = plan.url_rule.clone();
-        thegn_core::thread_name::spawn_named("thegn-share-rd", move || {
-            drain_stream(stream, tx, url_tx, url_rule, endpoint_tracker);
-        });
+        readers.push(thegn_core::thread_name::spawn_named(
+            "thegn-share-rd",
+            move || {
+                drain_stream(stream, tx, url_tx, url_rule, endpoint_tracker);
+            },
+        ));
     }
     drop(tx);
     drop(url_tx);
@@ -1587,11 +1800,18 @@ fn start_inner(
         let deadline = Instant::now() + grace;
         while Instant::now() < deadline {
             if cancel.load(Ordering::Acquire) {
-                abort_child(child);
+                abort_child(child, grouping);
                 return Err(ShareStartCancelled.into());
             }
-            if child.try_wait()?.is_some() {
-                abort_child(child);
+            let exited = if matches!(grouping, ProcessGrouping::OwnGroup)
+                && crate::plugin::proc::bounded_group_termination_supported()
+            {
+                crate::plugin::proc::leader_exited_nowait(child.id())?
+            } else {
+                child.try_wait()?.is_some()
+            };
+            if exited {
+                abort_child(child, grouping);
                 if cancel.load(Ordering::Acquire) {
                     return Err(ShareStartCancelled.into());
                 }
@@ -1600,12 +1820,19 @@ fn start_inner(
             std::thread::sleep(Duration::from_millis(100));
         }
         if cancel.load(Ordering::Acquire) {
-            abort_child(child);
+            abort_child(child, grouping);
             return Err(ShareStartCancelled.into());
         }
         return Ok(RunningShare {
+            readers,
             child: StopHandle {
                 child: Arc::new(Mutex::new(ShareChild {
+                    pid: child.id(),
+                    grouped: matches!(grouping, ProcessGrouping::OwnGroup)
+                        && crate::plugin::proc::bounded_group_termination_supported(),
+                    stop_requested: false,
+                    #[cfg(test)]
+                    escalation_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
                     child,
                     reaped: false,
                 })),
@@ -1619,12 +1846,12 @@ fn start_inner(
     let deadline = Instant::now() + timeout;
     loop {
         if cancel.load(Ordering::Acquire) {
-            abort_child(child);
+            abort_child(child, grouping);
             return Err(ShareStartCancelled.into());
         }
         let remaining = deadline.saturating_duration_since(Instant::now());
         if remaining.is_zero() {
-            abort_child(child);
+            abort_child(child, grouping);
             if cancel.load(Ordering::Acquire) {
                 return Err(ShareStartCancelled.into());
             }
@@ -1636,20 +1863,27 @@ fn start_inner(
         }
         if let Ok(url) = url_rx.try_recv() {
             if let Err(error) = reject_duplicate_announcement(&url_rx, &url) {
-                abort_child(child);
+                abort_child(child, grouping);
                 return Err(error);
             }
             if endpoint_tracker.conflict.load(Ordering::Acquire) {
-                abort_child(child);
+                abort_child(child, grouping);
                 anyhow::bail!("share: provider reported multiple public endpoints");
             }
             if cancel.load(Ordering::Acquire) {
-                abort_child(child);
+                abort_child(child, grouping);
                 return Err(ShareStartCancelled.into());
             }
             return Ok(RunningShare {
+                readers,
                 child: StopHandle {
                     child: Arc::new(Mutex::new(ShareChild {
+                        pid: child.id(),
+                        grouped: matches!(grouping, ProcessGrouping::OwnGroup)
+                            && crate::plugin::proc::bounded_group_termination_supported(),
+                        stop_requested: false,
+                        #[cfg(test)]
+                        escalation_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
                         child,
                         reaped: false,
                     })),
@@ -1668,20 +1902,27 @@ fn start_inner(
                 // the already-published priority signal one final check.
                 if let Ok(url) = url_rx.try_recv() {
                     if let Err(error) = reject_duplicate_announcement(&url_rx, &url) {
-                        abort_child(child);
+                        abort_child(child, grouping);
                         return Err(error);
                     }
                     if endpoint_tracker.conflict.load(Ordering::Acquire) {
-                        abort_child(child);
+                        abort_child(child, grouping);
                         anyhow::bail!("share: provider reported multiple public endpoints");
                     }
                     if cancel.load(Ordering::Acquire) {
-                        abort_child(child);
+                        abort_child(child, grouping);
                         return Err(ShareStartCancelled.into());
                     }
                     return Ok(RunningShare {
+                        readers,
                         child: StopHandle {
                             child: Arc::new(Mutex::new(ShareChild {
+                                pid: child.id(),
+                                grouped: matches!(grouping, ProcessGrouping::OwnGroup)
+                                    && crate::plugin::proc::bounded_group_termination_supported(),
+                                stop_requested: false,
+                                #[cfg(test)]
+                                escalation_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
                                 child,
                                 reaped: false,
                             })),
@@ -1692,10 +1933,10 @@ fn start_inner(
                     });
                 }
                 if cancel.load(Ordering::Acquire) {
-                    abort_child(child);
+                    abort_child(child, grouping);
                     return Err(ShareStartCancelled.into());
                 }
-                abort_child(child);
+                abort_child(child, grouping);
                 anyhow::bail!("share: '{}' exited before reporting a URL", plan.program);
             }
         }
@@ -1724,11 +1965,20 @@ fn reject_duplicate_announcement(
     }
 }
 
-/// Perform best-effort terminal startup cleanup. Process-tree settlement is
-/// owned by THE-331; this helper provides no such guarantee.
-fn abort_child(mut child: Child) {
-    let _ = child.kill();
-    let _ = child.wait();
+/// Perform best-effort startup cleanup, including the supervised group when
+/// one was created. Startup reader joins remain outside this teardown path.
+fn abort_child(mut child: Child, grouping: ProcessGrouping) {
+    let pid = child.id();
+    if matches!(grouping, ProcessGrouping::OwnGroup)
+        && crate::plugin::proc::bounded_group_termination_supported()
+    {
+        crate::plugin::proc::kill_group(pid);
+    } else if let Err(error) = child.kill() {
+        tracing::debug!(%error, "share startup abort kill failed");
+    }
+    if let Err(error) = child.wait() {
+        tracing::debug!(%error, "share startup abort reap failed");
+    }
 }
 
 /// Longest accepted `SharePlanFile::dest`, in bytes. Well under the common

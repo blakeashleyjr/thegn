@@ -116,6 +116,11 @@ is mounted read-write. The ambient `~/.claude` / `~/.codex` fallback and
 adopted account dirs are never mounted into a sealed pane, so without a
 managed account the agent runs without host auth.
 
+Managed account homes are created without following symlinks, restricted to
+their owner, and stamped with an owner manifest for the provider and account.
+Thegn refuses a home that is a symlink, is not a directory, is owned by
+another user, or has a malformed or mismatched manifest, and reports why.
+
 The automatic build caches (`~/.cargo/registry`, sccache, nix, `~/.m2`,
 gradle) stay writable: that is an _integrity_ exposure (a sealed pane could
 poison a shared cache), not a confidentiality one. The allowlist and every
@@ -165,6 +170,12 @@ including runtime paths; those modes do not hide the control socket.
 sandboxed launch is refused under the default floor. Pin one to skip the
 probing — `podman-rootless`, `podman-rootful`, `docker`, `bwrap`, `systemd`,
 `apple`, `wsl`, `none`.
+
+The outer `bwrap` and `systemd-run` launchers are resolved to absolute paths
+from thegn's own `PATH`. If either is missing there, launch is refused rather
+than resolving it from the pane environment. Loader variables such as `LD_*`
+and `DYLD_*` are withheld from the outer launcher. Under `bwrap` they are set
+again inside the sandbox; a `systemd-run` launch without `bwrap` drops them.
 
 For local rootless Podman, the first thegn command is the `version` liveness
 probe, before container creation or the events client. The `podman events`

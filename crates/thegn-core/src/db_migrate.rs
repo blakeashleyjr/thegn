@@ -1684,6 +1684,29 @@ pub(crate) fn verify_v86_schema(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
+/// v87: merge_queue.branch_ref + candidate_oid, the identity captured at enqueue (THE-230).
+pub(crate) fn migrate_v87(conn: &Connection) -> Result<()> {
+    for column in ["branch_ref", "candidate_oid"] {
+        if !has_column(conn, "merge_queue", column) {
+            conn.execute(
+                &format!("ALTER TABLE merge_queue ADD COLUMN {column} TEXT"),
+                [],
+            )?;
+        }
+    }
+    Ok(())
+}
+
+/// Verify all fields of the v87 merge candidate identity.
+pub(crate) fn verify_v87_schema(conn: &Connection) -> Result<()> {
+    for column in ["branch_ref", "candidate_oid"] {
+        if !has_column(conn, "merge_queue", column) {
+            bail!("schema v87 migration did not add merge_queue.{column}");
+        }
+    }
+    Ok(())
+}
+
 /// Verify the v69 identity ledger before the schema version is stamped. A
 /// missing column/table must never look like a completed migration.
 pub(crate) fn verify_v69_schema(conn: &Connection) -> Result<()> {
@@ -2559,6 +2582,44 @@ mod tests {
         }
         let upgraded = Db::open_at(&path).unwrap();
         super::verify_v86_schema(upgraded.conn()).unwrap();
+    }
+
+    #[test]
+    fn v87_adds_merge_candidate_columns_idempotently_and_verifies() {
+        let fresh = Db::open_memory().unwrap();
+        super::verify_v87_schema(fresh.conn()).unwrap();
+
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE merge_queue (worktree TEXT PRIMARY KEY, branch TEXT NOT NULL);
+             PRAGMA user_version = 86;",
+        )
+        .unwrap();
+        for column in ["branch_ref", "candidate_oid"] {
+            assert!(!has_column(&conn, "merge_queue", column));
+        }
+        assert!(super::verify_v87_schema(&conn).is_err());
+        super::migrate_v87(&conn).unwrap();
+        super::migrate_v87(&conn).unwrap();
+        super::verify_v87_schema(&conn).unwrap();
+        for column in ["branch_ref", "candidate_oid"] {
+            assert!(has_column(&conn, "merge_queue", column));
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("v86.db");
+        {
+            let db = Db::open_at(&path).unwrap();
+            db.conn()
+                .execute_batch(
+                    "ALTER TABLE merge_queue DROP COLUMN candidate_oid;
+                     ALTER TABLE merge_queue DROP COLUMN branch_ref;
+                     PRAGMA user_version=86;",
+                )
+                .unwrap();
+        }
+        let upgraded = Db::open_at(&path).unwrap();
+        super::verify_v87_schema(upgraded.conn()).unwrap();
     }
 
     #[test]

@@ -543,11 +543,24 @@ pub trait PlumbingOps: GitBackend {
         if !self.is_dirty(loc)? {
             return Ok(None);
         }
+        let index_tree = run_w(loc, &[], &fenced(loc, &["write-tree"])).context(
+            "could not capture the index tree before snapshot; refusing to stage changes",
+        )?;
+        let index_tree = index_tree.trim();
         run_w(loc, &[], &fenced(loc, &["add", "-A"]))?;
         // `-c commit.gpgSign=false …` must precede the subcommand — prepend it.
         let mut args: Vec<&str> = gpg_args(override_gpg).to_vec();
         args.extend(fenced(loc, &["commit", "--no-verify", "-F", "-"]));
-        run_background_commit_stdin(loc, &[("GIT_EDITOR", ":")], &args, msg.as_bytes())?;
+        if let Err(commit_error) =
+            run_background_commit_stdin(loc, &[("GIT_EDITOR", ":")], &args, msg.as_bytes())
+        {
+            return match run_w(loc, &[], &fenced(loc, &["read-tree", index_tree])) {
+                Ok(_) => Err(commit_error),
+                Err(restore_error) => Err(commit_error.context(format!(
+                    "restoring pre-snapshot index tree {index_tree} also failed ({restore_error:#}); the index now has every change staged"
+                ))),
+            };
+        }
         Ok(Some(self.rev_parse(loc, "HEAD")?))
     }
 }
@@ -1216,5 +1229,90 @@ mod tests {
             before_failed_snapshot,
             "a failed ambient signature must not advance the branch"
         );
+    }
+
+    #[test]
+    fn snapshot_commit_failure_restores_the_partially_staged_index() {
+        let repo = TestRepo::new("plumb-snap-restore-index");
+        ident(&repo.dir);
+        git_in(&repo.dir, &["config", "commit.gpgsign", "false"]);
+        std::fs::write(repo.dir.join("f.txt"), "before f\n").unwrap();
+        git_in(&repo.dir, &["add", "f.txt"]);
+        git_in(
+            &repo.dir,
+            &["-c", "commit.gpgsign=false", "commit", "-q", "-m", "f seed"],
+        );
+        std::fs::write(repo.dir.join("g.txt"), "before g\n").unwrap();
+        git_in(&repo.dir, &["add", "g.txt"]);
+        git_in(
+            &repo.dir,
+            &["-c", "commit.gpgsign=false", "commit", "-q", "-m", "g seed"],
+        );
+        let loc = repo.loc();
+
+        std::fs::write(repo.dir.join("f.txt"), "staged f\n").unwrap();
+        git_in(&repo.dir, &["add", "f.txt"]);
+        std::fs::write(repo.dir.join("g.txt"), "unstaged g\n").unwrap();
+        git_in(&repo.dir, &["config", "commit.gpgsign", "true"]);
+        git_in(&repo.dir, &["config", "gpg.program", "false"]);
+        let head_before = repo.head();
+
+        assert!(
+            CliGit
+                .snapshot_worktree(&loc, "snap failure", false)
+                .is_err()
+        );
+
+        assert_eq!(repo.head(), head_before);
+        assert_eq!(repo.out(&["status", "--porcelain"]), "M  f.txt\n M g.txt");
+    }
+
+    #[test]
+    fn snapshot_refuses_before_add_when_the_index_cannot_be_captured() {
+        let repo = TestRepo::new("plumb-snap-unmerged-index");
+        ident(&repo.dir);
+        std::fs::write(repo.dir.join("f.txt"), "base f\n").unwrap();
+        git_in(&repo.dir, &["add", "f.txt"]);
+        git_in(
+            &repo.dir,
+            &["-c", "commit.gpgsign=false", "commit", "-q", "-m", "base"],
+        );
+        std::fs::write(repo.dir.join("g.txt"), "base g\n").unwrap();
+        git_in(&repo.dir, &["add", "g.txt"]);
+        git_in(
+            &repo.dir,
+            &["-c", "commit.gpgsign=false", "commit", "-q", "-m", "g seed"],
+        );
+        let base = repo.head();
+        git_in(&repo.dir, &["checkout", "-q", "-b", "side"]);
+        std::fs::write(repo.dir.join("f.txt"), "side f\n").unwrap();
+        git_in(&repo.dir, &["add", "f.txt"]);
+        git_in(
+            &repo.dir,
+            &["-c", "commit.gpgsign=false", "commit", "-q", "-m", "side"],
+        );
+        let theirs = repo.head();
+        git_in(&repo.dir, &["checkout", "-q", "main"]);
+        std::fs::write(repo.dir.join("f.txt"), "main f\n").unwrap();
+        git_in(&repo.dir, &["add", "f.txt"]);
+        git_in(
+            &repo.dir,
+            &["-c", "commit.gpgsign=false", "commit", "-q", "-m", "main"],
+        );
+        let ours = repo.head();
+        git_in(&repo.dir, &["read-tree", "-m", &base, &ours, &theirs]);
+        assert!(!repo.out(&["ls-files", "-u"]).is_empty());
+        std::fs::write(repo.dir.join("g.txt"), "unstaged g\n").unwrap();
+        let loc = repo.loc();
+
+        assert!(
+            CliGit
+                .snapshot_worktree(&loc, "must refuse", false)
+                .is_err()
+        );
+
+        let status = repo.out(&["status", "--porcelain"]);
+        assert!(status.lines().any(|line| line == " M g.txt"), "{status}");
+        assert!(!status.lines().any(|line| line == "M  g.txt"), "{status}");
     }
 }

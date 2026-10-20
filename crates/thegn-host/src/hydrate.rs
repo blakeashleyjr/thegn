@@ -46,6 +46,9 @@ pub(crate) fn glyph_cache()
     CACHE.get_or_init(|| std::sync::Mutex::new(crate::warmcache::load_glyphs()))
 }
 
+/// THE-999: the diff-watch print at which the active glyph row last completed a clean scan.
+static GLYPHS_SEEN: crate::diff_watch::Seen = crate::diff_watch::Seen::new();
+
 /// Drop the cached glyph rows for `paths`, so the next hydration rescans them
 /// instead of serving a row that is merely younger than its configured glyph
 /// window from [`crate::hydrate_tuning::glyph_ttls`].
@@ -131,6 +134,8 @@ pub(crate) fn glyph_keep_set(
 /// diff fs-watcher already forcing immediate refreshes; that is circular, since
 /// the watcher is what fires, and each rescan is a git fan-out including a
 /// `<base>...HEAD` three-dot diff. See [`crate::hydrate_tuning::active_glyph_floor`].
+/// A cached active row with an unchanged diff-watch print (`GLYPHS_SEEN`) is
+/// reused instead of rescanning at that floor (THE-999).
 ///
 /// A background worktree rescans when it has no cached row yet or the selected
 /// activity-sensitive window has elapsed.
@@ -145,6 +150,7 @@ pub(crate) fn should_rescan_glyphs(cached_age: Option<Duration>, window: Duratio
 /// bridge lookups are resolved before the shared cache lock is acquired.
 struct GlyphPartitionConfig<'a> {
     active_path: Option<&'a str>,
+    active_print_unchanged: bool,
     gate_remote_scans: bool,
     now: Instant,
     ttls: &'a GlyphTtls,
@@ -208,7 +214,15 @@ fn partition_glyph_paths(
             config.fingerprint_changed.contains(p),
             window,
         );
-        if should_rescan_glyphs(age, window) {
+        let active_print_reusable = is_active
+            && config.active_print_unchanged
+            && cached.is_some()
+            && !config.fingerprint_changed.contains(p);
+        if active_print_reusable {
+            if let Some((row, _)) = cached {
+                reused.push((p.clone(), row.clone()));
+            }
+        } else if should_rescan_glyphs(age, window) {
             if let Some((row, _)) = cached {
                 prior_for_scan.insert(p.clone(), row.clone());
             }
@@ -1795,6 +1809,13 @@ fn collect_sidebar_status(
 
     // Partition into paths that must be rescanned now vs. served from cache.
     let active_path: Option<String> = session.active_group().map(|g| g.path.clone());
+    // Read before any scan: a watcher event during the scan must leave this mark stale.
+    let active_print = active_path
+        .as_deref()
+        .and_then(|p| crate::diff_watch::current_print(Path::new(p)));
+    let active_print_unchanged = active_path
+        .as_deref()
+        .is_some_and(|p| GLYPHS_SEEN.matches(Path::new(p), active_print));
     let ttls = glyph_ttls();
     let now = Instant::now();
     let ref_path = active_tab_path(session);
@@ -1856,6 +1877,7 @@ fn collect_sidebar_status(
             &may_live_scan,
             GlyphPartitionConfig {
                 active_path: active_path.as_deref(),
+                active_print_unchanged,
                 gate_remote_scans,
                 now,
                 ttls: &ttls,
@@ -1969,6 +1991,9 @@ fn collect_sidebar_status(
         for (p, row, clean, _) in &scanned {
             if *clean {
                 cache.insert(p.clone(), (row.clone(), scan_completed_at));
+                if active_path.as_deref() == Some(p.as_str()) {
+                    GLYPHS_SEEN.mark(Path::new(p), active_print);
+                }
                 persist.push(glyph_persist_entry(p, row));
             }
         }

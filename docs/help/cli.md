@@ -281,6 +281,12 @@ With `--json`, a classified refusal prints `{"error": ..., "id": ..., "message":
 ...}` with an error kind of `illegal_transition`, `stale`, `missing_evidence` or
 `missing_row` before the command fails.
 
+The `[pipeline.transport_retry]` budget is stored on each dispatch row and
+counted once per run. It survives daemon restarts without exceeding the
+configured budget; a human re-drive starts a fresh budget. If a stage launch
+cannot bind its session to its dispatch row, the worker is stopped and the
+launch is refused.
+
 Finished rows (not review tasks) older than 90 days are pruned during
 background maintenance unless their worktree is still registered, an active
 autopilot run uses them, or a retained child points to them. `thegn db vacuum`

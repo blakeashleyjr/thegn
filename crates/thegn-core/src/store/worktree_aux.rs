@@ -148,6 +148,13 @@ pub struct MergeFinalOutcome<'a> {
     pub error_detail: Option<&'a str>,
 }
 
+/// Branch identity captured by a deliberate local merge-queue enqueue.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MergeCandidate {
+    pub branch_ref: String,
+    pub candidate_oid: String,
+}
+
 /// Registry facts relevant to outcome routing. NULL is retained, not fabricated
 /// into a repository/branch identity. These strings are cache metadata, not Git
 /// or filesystem identity proof.
@@ -245,10 +252,25 @@ pub trait WorktreeAuxStore {
     /// Remove the forward record for `(worktree, container_port)`.
     fn delete_forward(&self, worktree: &str, container_port: u16) -> Result<()>;
 
-    /// Enqueue (or re-enqueue) a worktree branch for the next fold. Re-enqueueing
-    /// resets the row to `queued` and clears any prior result/conflict/error, so
-    /// a branch that was deferred and then rebased starts fresh.
+    /// Enqueue (or re-enqueue) an unbound worktree branch for the next fold. Re-enqueueing
+    /// resets the row to `queued` and clears any prior result/conflict/error. The `location`
+    /// value mirrors `worktrees.location` through a correlated subquery; NULL when unregistered
+    /// is treated as local. This clears any previously captured candidate pair.
     fn enqueue_merge(&self, worktree: &str, branch: &str, target_branch: &str) -> Result<()>;
+
+    /// Enqueue a deliberate local branch and capture its full ref and tip OID.
+    fn enqueue_merge_candidate(
+        &self,
+        worktree: &str,
+        branch: &str,
+        target_branch: &str,
+        candidate: &MergeCandidate,
+    ) -> Result<()>;
+
+    /// Read a captured candidate. `None` means the row is unbound (legacy,
+    /// remote, or enqueued through `enqueue_merge`); incomplete pairs are also
+    /// treated as unbound.
+    fn merge_candidate(&self, worktree: &str) -> Result<Option<MergeCandidate>>;
 
     /// Read registry and queue state consistently BEFORE starting a fold. No
     /// reservation is created and no lock may be retained across external work.

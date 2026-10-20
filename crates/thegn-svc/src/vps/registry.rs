@@ -23,6 +23,12 @@ static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 pub const RESERVE_LOCK: &str = ".reserve.lock";
 
+#[derive(Debug, Default)]
+pub struct LedgerView {
+    pub records: Vec<VpsRecord>,
+    pub unreadable: Vec<String>,
+}
+
 #[derive(Debug, Clone, Copy)]
 pub enum ReserveScope {
     All,
@@ -300,6 +306,10 @@ pub fn reserve(
 
 pub fn read_at(d: &Path, name: &str) -> Option<VpsRecord> {
     checked_name(name).ok()?;
+    let root = std::fs::symlink_metadata(d).ok()?;
+    if root.file_type().is_symlink() || !root.is_dir() {
+        return None;
+    }
     let mut file = thegn_core::fsperm::open_regular_file_nofollow(&record_path(d, name)).ok()?;
     let mut bytes = Vec::new();
     file.read_to_end(&mut bytes).ok()?;
@@ -336,7 +346,7 @@ pub fn remove(name: &str) {
     remove_at(&dir(), name)
 }
 
-/// All records in `d` (unreadable/foreign files skipped).
+/// Lenient view for display; reapers use `list_checked`.
 pub fn list_at(d: &Path) -> Vec<VpsRecord> {
     let Ok(entries) = std::fs::read_dir(d) else {
         return Vec::new();
@@ -357,6 +367,57 @@ pub fn list_at(d: &Path) -> Vec<VpsRecord> {
         .collect()
 }
 
+/// Strict ledger view for lifecycle decisions. A root or directory traversal
+/// error invalidates the complete view; individual malformed records are named.
+pub fn list_checked_at(d: &Path) -> Result<LedgerView> {
+    let metadata = match std::fs::symlink_metadata(d) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(LedgerView::default());
+        }
+        Err(error) => return Err(error).context("vps registry: could not inspect registry root"),
+    };
+    anyhow::ensure!(
+        !metadata.file_type().is_symlink()
+            && metadata.is_dir()
+            && thegn_core::fsperm::owned_by_current_user(&metadata),
+        "vps registry: registry root is not an owned real directory; refusing to list the ledger"
+    );
+
+    let entries =
+        std::fs::read_dir(d).context("vps registry: could not read registry directory")?;
+    let mut view = LedgerView::default();
+    for entry in entries {
+        let entry = entry.context("vps registry: could not read registry directory entry")?;
+        let path = entry.path();
+        if path.extension().is_none_or(|extension| extension != "json") {
+            continue;
+        }
+        let Some(stem) = path.file_stem().and_then(|stem| stem.to_str()) else {
+            continue;
+        };
+        if checked_name(stem).is_err() {
+            continue;
+        }
+        let record = (|| -> Option<VpsRecord> {
+            let mut file = thegn_core::fsperm::open_regular_file_nofollow(&path).ok()?;
+            let mut bytes = Vec::new();
+            file.read_to_end(&mut bytes).ok()?;
+            let record: VpsRecord = serde_json::from_slice(&bytes).ok()?;
+            (record.name == stem).then_some(record)
+        })();
+        match record {
+            Some(record) => view.records.push(record),
+            None => view.unreadable.push(stem.to_owned()),
+        }
+    }
+    Ok(view)
+}
+
+pub fn list_checked() -> Result<LedgerView> {
+    list_checked_at(&dir())
+}
+
 pub fn list() -> Vec<VpsRecord> {
     list_at(&dir())
 }
@@ -374,6 +435,65 @@ mod tests {
             ip: String::new(),
             created_at: 1_700_000_000,
         }
+    }
+
+    #[test]
+    fn checked_ledger_refuses_symlinked_root() {
+        let tmp = tempfile::tempdir().unwrap();
+        let real = tmp.path().join("real");
+        let link = tmp.path().join("link");
+        std::fs::create_dir(&real).unwrap();
+        write_at(&real, &rec("a", "ready")).unwrap();
+        if let Err(error) = thegn_core::fsperm::create_symlink(&real, &link, true) {
+            if matches!(
+                error.kind(),
+                std::io::ErrorKind::Unsupported | std::io::ErrorKind::PermissionDenied
+            ) {
+                return;
+            }
+            panic!("could not create test symlink: {error}");
+        }
+        assert!(list_checked_at(&link).is_err());
+        assert!(read_at(&link, "a").is_none());
+        let listed = list_checked_at(&real).unwrap();
+        assert_eq!(listed.records, vec![rec("a", "ready")]);
+        assert!(listed.unreadable.is_empty());
+    }
+
+    #[test]
+    fn checked_ledger_reports_corrupt_records() {
+        let tmp = tempfile::tempdir().unwrap();
+        let d = tmp.path();
+        write_at(d, &rec("a", "ready")).unwrap();
+        std::fs::write(d.join("junk.json"), b"not json").unwrap();
+        std::fs::write(
+            d.join("b.json"),
+            serde_json::to_vec(&rec("c", "ready")).unwrap(),
+        )
+        .unwrap();
+        std::fs::write(
+            d.join("d.json"),
+            serde_json::to_vec(&rec("../x", "ready")).unwrap(),
+        )
+        .unwrap();
+        std::fs::write(d.join("readme.txt"), b"x").unwrap();
+        std::fs::write(d.join(RESERVE_LOCK), b"").unwrap();
+
+        let mut view = list_checked_at(d).unwrap();
+        assert_eq!(view.records, vec![rec("a", "ready")]);
+        view.unreadable.sort();
+        assert_eq!(
+            view.unreadable,
+            vec!["b".to_owned(), "d".to_owned(), "junk".to_owned()]
+        );
+    }
+
+    #[test]
+    fn checked_ledger_missing_root_is_empty() {
+        let tmp = tempfile::tempdir().unwrap();
+        let view = list_checked_at(&tmp.path().join("missing")).unwrap();
+        assert!(view.records.is_empty());
+        assert!(view.unreadable.is_empty());
     }
 
     #[test]

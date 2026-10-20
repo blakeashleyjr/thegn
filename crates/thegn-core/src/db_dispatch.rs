@@ -346,7 +346,7 @@ impl Db {
         reason: &str,
     ) -> Result<()> {
         if self.get_dispatch(id)?.is_none() {
-            anyhow::bail!("no dispatch with id {id}");
+            return Err(anyhow::Error::new(MissingDispatch { id }));
         }
         if !set_status_transition_allowed(expected, to) {
             return Err(anyhow::Error::new(DispatchTransitionConflict::Illegal {
@@ -380,7 +380,7 @@ impl Db {
             tx.rollback()?;
             let actual = self
                 .get_dispatch(id)?
-                .ok_or_else(|| anyhow::anyhow!("no dispatch with id {id}"))?
+                .ok_or_else(|| anyhow::Error::new(MissingDispatch { id }))?
                 .status;
             return Err(anyhow::Error::new(DispatchTransitionConflict::Stale {
                 id,
@@ -3401,6 +3401,30 @@ mod tests {
         );
         assert!(db.dispatch_override(id).unwrap().is_none());
         assert_eq!(db.dispatch_note_count(id, None).unwrap(), 0);
+    }
+
+    #[test]
+    fn forced_set_status_missing_row_is_typed() {
+        let db = Db::open_memory().unwrap();
+        let result = db.set_dispatch_status_forced(
+            99_999,
+            AgentDispatchStatus::Running,
+            AgentDispatchStatus::Done,
+            "reason",
+        );
+
+        assert!(matches!(
+            &result,
+            Err(error)
+                if error.downcast_ref::<MissingDispatch>()
+                    == Some(&MissingDispatch { id: 99_999 })
+        ));
+        assert!(
+            result
+                .as_ref()
+                .err()
+                .is_some_and(|error| { error.to_string().contains("no dispatch with id 99999") })
+        );
     }
 
     #[test]

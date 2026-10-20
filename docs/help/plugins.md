@@ -58,6 +58,12 @@ restart-count, and backoff fields are `null` when no authoritative supervisor
 snapshot is attached. Both text and `--json` retain exit-zero inspection
 semantics; `plugin check` remains the validation command with failure exits.
 
+Startup, reload, `thegn plugin list` and `thegn plugin check` use the same
+admitted plugin set. `plugin list` therefore shows the same admit or refuse
+decision and reason that `plugin check` reports, including set-wide problems
+such as duplicate IDs, together with the source digest each plugin was
+admitted with.
+
 ## Modes and rendering
 
 - `mode = "one_shot"` (default): thegn runs the command on the cadence its

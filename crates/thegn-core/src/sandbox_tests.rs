@@ -2499,6 +2499,99 @@ fn systemd_cleanup_refusal_removes_env_file() {
 }
 
 #[test]
+fn secret_env_guard_drop_unlinks_unspawned_systemd_env_file() {
+    let state = tempfile::tempdir().unwrap();
+    let state_home = state.path().to_string_lossy().into_owned();
+    let _env = crate::testenv::EnvGuard::mutate_pairs(&[
+        ("API_KEY", Some("sk_secret")),
+        ("THEGN_SANDBOX", None),
+        ("XDG_STATE_HOME", Some(&state_home)),
+    ]);
+    let mut s = spec(Backend::Systemd);
+    s.image = None;
+    s.name = "thegn-test-envfile-guard-drop".into();
+    s.env = vec![("API_KEY".into(), "sk_secret".into())];
+
+    let guarded = backend_enter_argv_guarded(&s, "exec true").unwrap();
+    let property = guarded
+        .argv()
+        .iter()
+        .find(|arg| arg.starts_with("EnvironmentFile="))
+        .expect("EnvironmentFile property")
+        .clone();
+    let path = std::path::PathBuf::from(property.trim_start_matches("EnvironmentFile="));
+    assert!(path.is_file());
+    drop(guarded);
+    assert!(!path.exists());
+}
+
+#[test]
+fn secret_env_guard_into_spawned_keeps_env_file() {
+    let state = tempfile::tempdir().unwrap();
+    let state_home = state.path().to_string_lossy().into_owned();
+    let _env = crate::testenv::EnvGuard::mutate_pairs(&[
+        ("API_KEY", Some("sk_secret")),
+        ("THEGN_SANDBOX", None),
+        ("XDG_STATE_HOME", Some(&state_home)),
+    ]);
+    let mut s = spec(Backend::Systemd);
+    s.image = None;
+    s.name = "thegn-test-envfile-guard-spawned".into();
+    s.env = vec![("API_KEY".into(), "sk_secret".into())];
+
+    let guarded = backend_enter_argv_guarded(&s, "exec true").unwrap();
+    let property = guarded
+        .argv()
+        .iter()
+        .find(|arg| arg.starts_with("EnvironmentFile="))
+        .expect("EnvironmentFile property")
+        .clone();
+    let path = std::path::PathBuf::from(property.trim_start_matches("EnvironmentFile="));
+    assert!(path.is_file());
+    let argv = guarded.into_spawned();
+    assert!(argv.iter().any(|arg| arg == &property));
+    assert!(path.is_file());
+    std::fs::remove_file(&path).unwrap();
+}
+
+#[test]
+fn secret_env_guard_never_unlinks_outside_the_env_dir() {
+    let parent = tempfile::tempdir().unwrap();
+    let other_parent = tempfile::tempdir().unwrap();
+    let dir = parent.path().join("sandbox-env");
+    std::fs::create_dir(&dir).unwrap();
+    let outside = other_parent.path().join("outside.env");
+    let inside_non_env = dir.join("keep.txt");
+    std::fs::write(&outside, b"secret").unwrap();
+    std::fs::write(&inside_non_env, b"secret").unwrap();
+
+    drop(SecretEnvFile::adopt(dir.clone(), outside.clone()));
+    drop(SecretEnvFile::adopt(dir, inside_non_env.clone()));
+    assert!(outside.is_file());
+    assert!(inside_non_env.is_file());
+}
+
+#[test]
+fn secret_env_guard_absent_without_host_secrets() {
+    let state = tempfile::tempdir().unwrap();
+    let state_home = state.path().to_string_lossy().into_owned();
+    let _env = crate::testenv::EnvGuard::mutate_pairs(&[
+        ("API_KEY", Some("host-secret")),
+        ("THEGN_SANDBOX", None),
+        ("XDG_STATE_HOME", Some(&state_home)),
+    ]);
+    let mut s = spec(Backend::Systemd);
+    s.image = None;
+    s.name = "thegn-test-envfile-guard-absent".into();
+    s.env = vec![("API_KEY".into(), "synthetic-value".into())];
+
+    let guarded = backend_enter_argv_guarded(&s, "exec true").unwrap();
+    let (argv, guard) = guarded.into_parts();
+    assert!(guard.is_none());
+    assert!(argv.iter().all(|arg| !arg.starts_with("EnvironmentFile=")));
+}
+
+#[test]
 fn stale_env_file_sweep_removes_only_old_env_entries_without_following_links() {
     use std::time::{Duration, SystemTime};
     let parent = tempfile::tempdir().unwrap();
