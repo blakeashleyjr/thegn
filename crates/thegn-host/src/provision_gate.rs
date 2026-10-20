@@ -30,6 +30,7 @@
 use std::collections::HashMap;
 use std::sync::{Condvar, LazyLock, Mutex, MutexGuard, PoisonError};
 
+use sha2::{Digest, Sha256};
 use thegn_core::store::{PoolStore, WorkspaceStore};
 /// A name registry with a hold-count per name. Exclusive acquires wait for the
 /// count to reach zero; shared acquires just increment. One registry per use
@@ -131,20 +132,22 @@ pub(crate) fn worktree_live(worktree: &str) -> bool {
     LIVE.count(worktree) > 0
 }
 
-/// A stable-ish generic name for a new warm-pool spare: `<repo>-pool-<hash>`. The
-/// hash varies per process+counter so concurrent mints never collide.
-pub(crate) fn mint_spare_name(repo: &str) -> String {
-    use std::sync::atomic::{AtomicU64, Ordering};
-    static N: AtomicU64 = AtomicU64::new(0);
-    let n = N.fetch_add(1, Ordering::Relaxed);
+/// A generic name for a new warm-pool spare with a collision-resistant random suffix.
+pub(crate) fn mint_spare_name(repo: &str) -> anyhow::Result<String> {
     let slug = std::path::Path::new(repo)
         .file_name()
         .and_then(|s| s.to_str())
         .map(thegn_core::util::slugify)
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| "tg".to_string());
-    let h = thegn_core::util::short_hash(&format!("{repo}-{}-{n}", std::process::id()), 6);
-    format!("{slug}-pool-{h}")
+    let mut random = [0_u8; 6];
+    getrandom::fill(&mut random)
+        .map_err(|_| anyhow::anyhow!("warm pool: cannot mint a spare name: no OS randomness"))?;
+    let suffix = random
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    Ok(format!("{slug}-pool-{suffix}"))
 }
 
 /// Whether `env_name` may host (or hand over) warm-pool spares at all: only a
@@ -160,13 +163,45 @@ pub(crate) fn poolable_env(cfg: &thegn_core::config::Config, env_name: &str) -> 
         .is_some_and(|e| matches!(e.placement, thegn_core::config::PlacementMode::Provider))
 }
 
-/// Hash of the repo's `flake.lock` (staleness key for a spare's seeded devShell);
-/// empty when the repo has no lockfile.
+/// Staleness key for a spare's seeded devShell: `""` when `flake.lock` is absent,
+/// a SHA-256 hash when it is readable, and a per-call `unreadable:` value when
+/// another read error occurs. Unreadable values are never persisted as match keys,
+/// so repeated calls compare unequal and lifecycle checks treat the spare as stale.
+/// The old FNV key makes existing spares and base checkpoints stale once, so they rotate.
 pub(crate) fn flake_lock_hash(repo_root: &std::path::Path) -> String {
-    std::fs::read(repo_root.join("flake.lock"))
-        .ok()
-        .map(|b| thegn_core::util::short_hash(&String::from_utf8_lossy(&b), 16))
-        .unwrap_or_default()
+    let lock_path = repo_root.join("flake.lock");
+    match std::fs::read(&lock_path) {
+        Ok(bytes) => {
+            let digest = Sha256::digest(bytes);
+            digest.iter().map(|byte| format!("{byte:02x}")).collect()
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(error) => {
+            tracing::warn!(
+                target: "thegn::lifecycle",
+                path = %lock_path.display(),
+                error = %error,
+                "flake.lock unreadable; treating every warm-pool spare and base checkpoint as stale"
+            );
+            let mut random = [0_u8; 6];
+            match getrandom::fill(&mut random) {
+                Ok(()) => {
+                    let suffix = random
+                        .iter()
+                        .map(|byte| format!("{byte:02x}"))
+                        .collect::<String>();
+                    format!("unreadable:{suffix}")
+                }
+                Err(_) => {
+                    let nanos = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|duration| duration.as_nanos())
+                        .unwrap_or(0);
+                    format!("unreadable:{nanos}")
+                }
+            }
+        }
+    }
 }
 
 /// The materialize warm-claim fast path: bind a ready pool spare to `worktree`
@@ -310,7 +345,7 @@ pub fn provision_spare(
     mut progress: impl FnMut(&[crate::agent::ProvisionStepView]),
 ) -> anyhow::Result<String> {
     let repo = repo_root.to_string_lossy().to_string();
-    let name = mint_spare_name(&repo);
+    let name = mint_spare_name(&repo)?;
     if let Ok(db) = thegn_core::db::Db::open() {
         let _ = db.insert_pool_spare(&name, &repo, env_name); // best-effort: cache write: the DB is a cache; git/forge stays the source of truth
     }
@@ -669,16 +704,68 @@ mod tests {
 
     #[test]
     fn mint_spare_name_is_repo_slugged_and_unique() {
-        let a = mint_spare_name("/home/u/code/thegn");
-        let b = mint_spare_name("/home/u/code/thegn");
+        let a = mint_spare_name("/home/u/code/thegn").unwrap();
+        let b = mint_spare_name("/home/u/code/thegn").unwrap();
         assert!(a.starts_with("thegn-pool-"), "{a}");
-        assert_ne!(a, b, "concurrent mints must never collide");
+        assert_ne!(a, b, "independent random mints should differ");
+        for name in [&a, &b] {
+            let suffix = name.strip_prefix("thegn-pool-").unwrap();
+            assert_eq!(suffix.len(), 12, "{name}");
+            assert!(
+                suffix
+                    .bytes()
+                    .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase()),
+                "{name}"
+            );
+        }
     }
 
     #[test]
     fn flake_lock_hash_empty_without_lockfile() {
-        let dir = std::env::temp_dir().join("tg-gate-no-flake");
-        let _ = std::fs::create_dir_all(&dir); // best-effort: dir prep: a later write reports the real failure
-        assert_eq!(flake_lock_hash(&dir), "");
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(flake_lock_hash(dir.path()), "");
+    }
+
+    #[test]
+    fn flake_lock_hash_uses_sha256_of_exact_bytes() {
+        let dir = tempfile::tempdir().unwrap();
+        let lock = dir.path().join("flake.lock");
+        std::fs::write(&lock, b"abc").unwrap();
+        let hash = flake_lock_hash(dir.path());
+        assert_eq!(
+            hash,
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
+        assert_eq!(hash.len(), 64);
+        assert!(
+            hash.bytes()
+                .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+        );
+
+        std::fs::write(&lock, b"abd").unwrap();
+        assert_ne!(flake_lock_hash(dir.path()), hash);
+    }
+
+    #[test]
+    fn flake_lock_hash_preserves_invalid_utf8_bytes() {
+        let dir = tempfile::tempdir().unwrap();
+        let lock = dir.path().join("flake.lock");
+        std::fs::write(&lock, [0xff, 0xfe]).unwrap();
+        let first = flake_lock_hash(dir.path());
+        std::fs::write(&lock, [0xff, 0xfd]).unwrap();
+        assert_ne!(first, flake_lock_hash(dir.path()));
+    }
+
+    #[test]
+    fn flake_lock_hash_marks_unreadable_lockfile_and_changes_per_call() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("flake.lock")).unwrap();
+        let first = flake_lock_hash(dir.path());
+        let second = flake_lock_hash(dir.path());
+        assert!(first.starts_with("unreadable:"), "{first}");
+        assert_ne!(
+            first, second,
+            "unreadable lockfiles must never reuse a stored key"
+        );
     }
 }
