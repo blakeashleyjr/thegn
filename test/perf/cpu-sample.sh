@@ -94,11 +94,11 @@ CHILD_GROWTH_CEILING=4
 FD_GROWTH_CEILING=8
 THREAD_GROWTH_CEILING=2
 # Absolute ceilings across the window (the incident: 74 descriptors on thegn.db
-# and its WAL, threads 53 -> 71 in 10 s). These provisional values were set by
-# the planner; the primary confirms or replaces them from a measured
-# `just bench-soak` before the land — do not tune them.
+# and its WAL, threads 53 -> 71 in 10 s). Measured on 2026-10-20 (release,
+# 40 worktrees, LFS fixture on): db fds 13, thread peak 51 (alpha.12: 15, 52).
+# The thread ceiling sits under the incident's 71 so it would have caught it.
 DB_FD_CEILING=16
-THREAD_PEAK_CEILING=96
+THREAD_PEAK_CEILING=64
 LFS_FIXTURE=0
 NO_LFS_FIXTURE=0
 # Reads per second. The incident sustained 26,063/s from the disk-size walk.
