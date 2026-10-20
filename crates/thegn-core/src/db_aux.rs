@@ -594,6 +594,27 @@ impl WorktreeAuxStore for Db {
         ))
     }
 
+    fn adopt_merge_candidate(
+        &self,
+        worktree: &str,
+        expected: &MergeCandidate,
+        candidate_oid: &str,
+    ) -> Result<bool> {
+        let changed = self.conn().execute(
+            "UPDATE merge_queue SET status='folding', candidate_oid=?1, updated_at=?2 \
+             WHERE worktree=?3 AND branch_ref=?4 AND candidate_oid=?5 \
+             AND status='folding'",
+            params![
+                candidate_oid,
+                util::now(),
+                worktree,
+                expected.branch_ref,
+                expected.candidate_oid
+            ],
+        )?;
+        Ok(changed == 1)
+    }
+
     fn observe_merge_outcome(&self, worktree: &str) -> Result<MergeOutcomeObservation> {
         let tx = self.conn().unchecked_transaction()?;
         let observed = merge_outcome_observation(&tx, worktree)?;

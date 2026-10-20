@@ -134,6 +134,8 @@ fn candidate_drift(
     candidate: Option<&MergeCandidate>,
     adopted: Option<&str>,
     live_tip: Option<&str>,
+    held: bool,
+    fast_forward: bool,
 ) -> Result<(), String> {
     let Some(candidate) = candidate else {
         return Ok(());
@@ -142,7 +144,7 @@ fn candidate_drift(
     let Some(live_tip) = live_tip else {
         return Err("branch deleted since enqueue".into());
     };
-    if expected == live_tip {
+    if expected == live_tip || (held && fast_forward) {
         Ok(())
     } else {
         Err(format!(
@@ -257,7 +259,7 @@ pub(crate) fn drive_queue(
         items,
         progress,
         DriveActions {
-            attempt: |branch: &str, location: &thegn_core::remote::GitLoc| {
+            attempt: |branch: &str, location: &thegn_core::remote::GitLoc, held: bool| {
                 if let thegn_core::remote::GitLoc::Local(worktree) = location {
                     let key = worktree.to_string_lossy().into_owned();
                     let candidate = db.merge_candidate(&key)?;
@@ -272,6 +274,7 @@ pub(crate) fn drive_queue(
                             }));
                         }
                         let adopted = adopted_oids.borrow().get(&key).cloned();
+                        let fixer_adopted = adopted.is_some();
                         if let Some(Err(reason)) = adopted.as_ref() {
                             return Err(anyhow::Error::new(CandidateDrift {
                                 reason: format!(
@@ -284,10 +287,31 @@ pub(crate) fn drive_queue(
                             repo_root,
                             &["rev-parse", "--verify", "-q", &candidate.branch_ref],
                         );
+                        let fast_forward = held
+                            && !fixer_adopted
+                            && live_tip.as_deref().is_some_and(|tip| {
+                                integrate::candidate_is_ancestor(
+                                    repo_root,
+                                    &candidate.candidate_oid,
+                                    tip,
+                                )
+                            });
+                        if fast_forward
+                            && let Some(tip) = live_tip.as_deref()
+                            && !db.adopt_merge_candidate(&key, candidate, tip)?
+                        {
+                            return Err(anyhow::Error::new(CandidateDrift {
+                                reason:
+                                    "queued candidate changed while adopting held-branch repair"
+                                        .into(),
+                            }));
+                        }
                         if let Err(reason) = candidate_drift(
                             Some(candidate),
                             adopted_tip.as_deref(),
                             live_tip.as_deref(),
+                            held,
+                            fast_forward,
                         ) {
                             return Err(anyhow::Error::new(CandidateDrift { reason }));
                         }
@@ -501,7 +525,7 @@ fn drive_queue_with(
     items: Vec<QueueItem>,
     mut progress: impl FnMut(&DriveStep),
     mut actions: DriveActions<
-        impl FnMut(&str, &thegn_core::remote::GitLoc) -> anyhow::Result<AttemptOutcome>,
+        impl FnMut(&str, &thegn_core::remote::GitLoc, bool) -> anyhow::Result<AttemptOutcome>,
         impl FnMut(&str) -> crate::agent_run::AgentDispatch,
         impl FnMut(&str, &str, &str, &str, &Failure, Option<thegn_core::sandbox::SandboxSpec>) -> bool,
     >,
@@ -745,7 +769,11 @@ fn drive_queue_with(
                 ));
                 break;
             }
-            let attempt = match (actions.attempt)(&item.branch, &branch_loc) {
+            let held = matches!(
+                fresh.status.as_str(),
+                "agent_blocked" | "needs_human" | "gate_failed" | "gate_error" | "deferred"
+            );
+            let attempt = match (actions.attempt)(&item.branch, &branch_loc, held) {
                 Ok(a) => a,
                 Err(e) => {
                     if let Some(drift) = e.downcast_ref::<CandidateDrift>() {
@@ -1365,44 +1393,71 @@ mod tests {
         };
         let moved = "b".repeat(40);
         let cases = [
-            (None, None, Some(moved.as_str()), None),
+            (None, None, Some(moved.as_str()), false, false, None),
             (
                 Some(&candidate),
                 None,
                 Some(candidate.candidate_oid.as_str()),
+                false,
+                false,
                 None,
             ),
             (
                 Some(&candidate),
                 None,
                 Some(moved.as_str()),
+                false,
+                false,
                 Some("branch moved since enqueue (expected aaaaaaaaaaaa, found bbbbbbbbbbbb)"),
             ),
             (
                 Some(&candidate),
                 None,
                 None,
+                false,
+                false,
                 Some("branch deleted since enqueue"),
             ),
             (
                 Some(&candidate),
                 Some(moved.as_str()),
                 Some(moved.as_str()),
+                false,
+                false,
                 None,
             ),
             (
                 Some(&candidate),
                 Some(moved.as_str()),
                 Some(candidate.candidate_oid.as_str()),
+                false,
+                false,
                 Some("branch moved since enqueue (expected bbbbbbbbbbbb, found aaaaaaaaaaaa)"),
             ),
         ];
-        for (candidate, adopted, live, expected) in cases {
+        for (candidate, adopted, live, held, fast_forward, expected) in cases {
             assert_eq!(
-                candidate_drift(candidate, adopted, live).err().as_deref(),
+                candidate_drift(candidate, adopted, live, held, fast_forward)
+                    .err()
+                    .as_deref(),
                 expected
             );
         }
+    }
+
+    #[test]
+    fn candidate_drift_held_fast_forward_is_adoptable_but_rewrite_is_held() {
+        let candidate = MergeCandidate {
+            branch_ref: "refs/heads/feat".into(),
+            candidate_oid: "a".repeat(40),
+        };
+        let repaired = "b".repeat(40);
+        assert!(candidate_drift(Some(&candidate), None, Some(&repaired), true, true,).is_ok());
+        assert!(
+            candidate_drift(Some(&candidate), None, Some(&repaired), true, false,)
+                .unwrap_err()
+                .contains("branch moved since enqueue")
+        );
     }
 
     // Substitution and template rendering themselves are covered in
@@ -2055,6 +2110,96 @@ mod tests {
                 |_| {},
             );
             assert_eq!(outcome.landed, ["feat"]);
+        }
+
+        #[test]
+        fn candidate_drift_held_fast_forward_is_adopted_and_lands_same_row() {
+            let (_fixture, root, feat_wt) = clean_repo("held-fast-forward");
+            let db = Db::open_memory().unwrap();
+            let queued = bound_item(&db, &feat_wt);
+            let before = db.list_merge_queue().unwrap().remove(0);
+            db.replace_merge_status(
+                &queued.worktree,
+                "agent_blocked",
+                &MergeStatusFields::default(),
+            )
+            .unwrap();
+            std::fs::write(feat_wt.join("repair.txt"), "human repair\n").unwrap();
+            git(&feat_wt, &["add", "repair.txt"]);
+            git(
+                &feat_wt,
+                &[
+                    "-c",
+                    "commit.gpgsign=false",
+                    "commit",
+                    "-q",
+                    "-m",
+                    "human repair",
+                ],
+            );
+            let repaired_tip = out(&feat_wt, &["rev-parse", "HEAD"]);
+
+            let outcome = drive_queue(
+                &cfg("true", 2),
+                &Config::default(),
+                &root,
+                &db,
+                vec![queued],
+                |_| {},
+            );
+
+            assert_eq!(outcome.landed, ["feat"]);
+            let row = db.list_merge_queue().unwrap().remove(0);
+            assert_eq!(row.queued_at, before.queued_at);
+            assert_eq!(row.agent_attempts, 0);
+            assert_eq!(
+                db.merge_candidate(&row.worktree)
+                    .unwrap()
+                    .unwrap()
+                    .candidate_oid,
+                repaired_tip
+            );
+        }
+
+        #[test]
+        fn candidate_drift_held_rewrite_stays_held() {
+            let (_fixture, root, feat_wt) = clean_repo("held-rewrite");
+            let db = Db::open_memory().unwrap();
+            let queued = bound_item(&db, &feat_wt);
+            db.replace_merge_status(
+                &queued.worktree,
+                "agent_blocked",
+                &MergeStatusFields::default(),
+            )
+            .unwrap();
+            std::fs::write(feat_wt.join("repair.txt"), "human repair\n").unwrap();
+            git(&feat_wt, &["add", "repair.txt"]);
+            git(
+                &feat_wt,
+                &[
+                    "-c",
+                    "commit.gpgsign=false",
+                    "commit",
+                    "-q",
+                    "-m",
+                    "human repair",
+                ],
+            );
+            git(&feat_wt, &["reset", "--hard", "main"]);
+
+            let outcome = drive_queue(
+                &cfg("true", 2),
+                &Config::default(),
+                &root,
+                &db,
+                vec![queued],
+                |_| {},
+            );
+
+            assert_eq!(outcome.agent_blocked, ["feat"]);
+            let row = db.list_merge_queue().unwrap().remove(0);
+            assert_eq!(row.agent_attempts, 0);
+            assert!(row.error_detail.unwrap().contains("identity drift"));
         }
 
         #[test]
