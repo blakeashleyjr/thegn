@@ -597,18 +597,8 @@ pub fn prepare_sandbox_env(
         explicit_choice = false;
         sb.backend = thegn_core::config::SandboxBackend::None;
     }
-    if let Some(pspec) = &projection {
-        let backend = thegn_svc::projection::for_data_mode(pspec);
-        match backend.mount(pspec) {
-            // Record the live projection so the worktree-close thread (which only
-            // has the path) can unmount it without re-resolving the env.
-            Ok(_) => register_projection(worktree, pspec.clone()),
-            Err(e) => {
-                warnings.push(format!("projection ({}) failed: {e}", backend.kind()));
-                thegn_core::msg::warn(&format!("projection mount failed for {worktree}: {e}"));
-            }
-        }
-    }
+    // Acquire the projection only after admission.
+    let mut projection_lease: Option<ProjectionLease> = None;
     // Provider file-sync (`data = "sync"` on a managed provider): push the local
     // worktree into the sandbox fs before the pane execs (the pane runs IN the
     // sandbox, so there's no local cwd override). Best-effort: a failure warns,
@@ -821,6 +811,12 @@ pub fn prepare_sandbox_env(
             // VPN attachment and container ensure/exec are reached only after
             // the fully composed spec has passed the admission gate.
             let launch = admit_final_sandbox_spec_then(&mut spec, |spec| {
+                if projection_lease.is_none()
+                    && let Some(pspec) = &projection
+                {
+                    projection_lease =
+                        ProjectionLease::acquire(worktree, pspec.clone(), &mut warnings);
+                }
                 // VPN up BEFORE the container (joins the sidecar netns); failure bails.
                 if let Err(e) = attach_vpn(spec) {
                     return Err(anyhow::Error::new(VpnAttachFailed(e.to_string())));
@@ -857,6 +853,9 @@ pub fn prepare_sandbox_env(
             })?;
             match launch {
                 Ok(()) => {
+                    if let Some(lease) = projection_lease.take() {
+                        lease.commit();
+                    }
                     return Ok(SandboxOutcome {
                         backend_label: spec.backend.label().to_string(),
                         spec: Some(spec),
@@ -1082,6 +1081,14 @@ pub fn prepare_sandbox_env(
         warnings.push("sandbox auto selected host".to_string());
     } else if sb.enabled && auto_choice {
         warnings.push("running on host after sandbox fallback".to_string());
+    }
+    if projection_lease.is_none()
+        && let Some(pspec) = &projection
+    {
+        projection_lease = ProjectionLease::acquire(worktree, pspec.clone(), &mut warnings);
+    }
+    if let Some(lease) = projection_lease.take() {
+        lease.commit();
     }
     Ok(SandboxOutcome {
         spec: None,
@@ -1363,6 +1370,99 @@ fn projection_registry() -> &'static std::sync::Mutex<
 fn register_projection(worktree: &str, spec: thegn_core::projection::ProjectionSpec) {
     if let Ok(mut reg) = projection_registry().lock() {
         reg.insert(worktree.to_string(), spec);
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ProjectionRollback {
+    Unmount,
+    Nothing,
+}
+
+pub(crate) fn rollback_action(mode: thegn_core::config::DataMode) -> ProjectionRollback {
+    match mode {
+        thegn_core::config::DataMode::InEnv => ProjectionRollback::Nothing,
+        thegn_core::config::DataMode::LocalExec => ProjectionRollback::Nothing,
+        thegn_core::config::DataMode::Sshfs => ProjectionRollback::Unmount,
+        thegn_core::config::DataMode::Sync => ProjectionRollback::Nothing,
+    }
+}
+
+pub(crate) struct ProjectionLease {
+    worktree: String,
+    spec: thegn_core::projection::ProjectionSpec,
+    rollback: Option<
+        Box<dyn FnOnce(&thegn_core::projection::ProjectionSpec) -> anyhow::Result<()> + Send>,
+    >,
+}
+
+impl ProjectionLease {
+    fn acquire_with(
+        worktree: &str,
+        spec: thegn_core::projection::ProjectionSpec,
+        mount: impl FnOnce(&thegn_core::projection::ProjectionSpec) -> anyhow::Result<()>,
+        rollback: Box<
+            dyn FnOnce(&thegn_core::projection::ProjectionSpec) -> anyhow::Result<()> + Send,
+        >,
+        kind: &str,
+        warnings: &mut Vec<String>,
+    ) -> Option<Self> {
+        if let Err(error) = mount(&spec) {
+            warnings.push(format!("projection ({kind}) failed: {error}"));
+            thegn_core::msg::warn(&format!("projection mount failed for {worktree}: {error}"));
+            return None;
+        }
+        Some(Self {
+            worktree: worktree.to_string(),
+            spec,
+            rollback: Some(rollback),
+        })
+    }
+
+    fn acquire(
+        worktree: &str,
+        spec: thegn_core::projection::ProjectionSpec,
+        warnings: &mut Vec<String>,
+    ) -> Option<Self> {
+        let backend = thegn_svc::projection::for_data_mode(&spec);
+        let kind = backend.kind();
+        Self::acquire_with(
+            worktree,
+            spec,
+            |spec| {
+                thegn_svc::projection::for_data_mode(spec)
+                    .mount(spec)
+                    .map(|_| ())
+            },
+            Box::new(|spec| match rollback_action(spec.mode) {
+                ProjectionRollback::Unmount => {
+                    thegn_svc::projection::for_data_mode(spec).unmount(spec)
+                }
+                ProjectionRollback::Nothing => Ok(()),
+            }),
+            kind,
+            warnings,
+        )
+    }
+
+    fn commit(mut self) {
+        register_projection(&self.worktree, self.spec.clone());
+        drop(self.rollback.take());
+    }
+}
+
+impl Drop for ProjectionLease {
+    fn drop(&mut self) {
+        if let Some(rollback) = self.rollback.take()
+            && let Err(error) = rollback(&self.spec)
+        {
+            tracing::warn!(
+                target: "thegn::sandbox",
+                %error,
+                worktree = %self.worktree,
+                "projection rollback failed"
+            );
+        }
     }
 }
 
@@ -4101,3 +4201,7 @@ pub(crate) mod cleanup_fixture;
 #[cfg(test)]
 #[path = "agent_vpn_tests.rs"]
 mod vpn_tests;
+
+#[cfg(test)]
+#[path = "agent_projection_tests.rs"]
+mod projection_tests;
