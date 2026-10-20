@@ -53,7 +53,8 @@ this with a grep guardrail.
 5. **Sandbox: GIT\_\* env strip** — the sandbox `env_block` carries `GIT_ENV_VARS`,
    so the wrapped script `unset`s them before the shell/agent runs (bwrap/systemd
    inherit the host env; OCI already passes only a whitelist).
-6. **Cross-process git lock** — `lock_git_mutations(worktree)` takes a `flock` on
+6. **Cross-process git lock** — `try_lock_git_mutations{,_within}` and
+   `begin_git_mutation(worktree, wait)` take a `flock` on
    `<git-common>/thegn-git.lock` (advisory, auto-released on Drop and process
    death — no stale locks). The svc write runners (`run_w`/`run_stdin`/`run_root`
    in `thegn-svc/src/git/mod.rs`) and `worktree::{add_checked,remove}` hold it

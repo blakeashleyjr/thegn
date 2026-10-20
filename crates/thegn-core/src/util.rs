@@ -1420,12 +1420,11 @@ pub struct GitLock(
 );
 
 thread_local! {
-    static GIT_MUTATION_TXNS: std::cell::RefCell<Vec<(PathBuf, usize)>> = const { std::cell::RefCell::new(Vec::new()) };
-    static GIT_MUTATION_TXN_LOCKS: std::cell::RefCell<Vec<(PathBuf, std::rc::Rc<GitLock>)>> = const { std::cell::RefCell::new(Vec::new()) };
+    static GIT_MUTATION_TXNS: std::cell::RefCell<Vec<(PathBuf, usize, std::rc::Rc<GitLock>)>> = const { std::cell::RefCell::new(Vec::new()) };
 }
 
 fn mutation_txn_is_active(key: &Path) -> bool {
-    GIT_MUTATION_TXNS.with_borrow(|txns| txns.iter().any(|(held, _)| held == key))
+    GIT_MUTATION_TXNS.with_borrow(|txns| txns.iter().any(|(held, _, _)| held == key))
 }
 
 /// Acquire the per-repo git-mutation lock at `<git-common>/thegn-git.lock`.
@@ -1619,34 +1618,26 @@ impl MutationTxn {
 /// on this thread and canonical repository key share the outer lock.
 pub fn begin_git_mutation(worktree: &Path, wait: Duration) -> std::io::Result<MutationTxn> {
     let key = git_lock_key(worktree)?;
-    let nested = GIT_MUTATION_TXNS.with_borrow_mut(|txns| {
-        if let Some((_, depth)) = txns.iter_mut().find(|(held, _)| held == &key) {
+    let nested_lock = GIT_MUTATION_TXNS.with_borrow_mut(|txns| {
+        if let Some((_, depth, lock)) = txns.iter_mut().find(|(held, _, _)| held == &key) {
             *depth += 1;
-            true
+            Some(std::rc::Rc::clone(lock))
         } else {
-            false
+            None
         }
     });
-    let lock = if nested {
-        GIT_MUTATION_TXN_LOCKS.with_borrow(|locks| {
-            locks
-                .iter()
-                .find(|(held, _)| held == &key)
-                .map(|(_, lock)| std::rc::Rc::clone(lock))
-        })
-    } else {
-        let lock = std::rc::Rc::new(try_lock_git_mutations_within(worktree, wait)?);
-        GIT_MUTATION_TXNS.with_borrow_mut(|txns| txns.push((key.clone(), 1)));
-        GIT_MUTATION_TXN_LOCKS
-            .with_borrow_mut(|locks| locks.push((key.clone(), std::rc::Rc::clone(&lock))));
-        Some(lock)
+    let lock = match nested_lock {
+        Some(lock) => lock,
+        None => {
+            let lock = std::rc::Rc::new(try_lock_git_mutations_within(worktree, wait)?);
+            GIT_MUTATION_TXNS
+                .with_borrow_mut(|txns| txns.push((key.clone(), 1, std::rc::Rc::clone(&lock))));
+            lock
+        }
     };
-    let lock = lock.ok_or_else(|| {
-        std::io::Error::other("git-mutation transaction registry lost its held lock")
-    })?;
     Ok(MutationTxn {
         key,
-        lock,
+        lock: Some(lock),
         _not_send: std::marker::PhantomData,
     })
 }
@@ -1654,21 +1645,26 @@ pub fn begin_git_mutation(worktree: &Path, wait: Duration) -> std::io::Result<Mu
 impl Drop for MutationTxn {
     fn drop(&mut self) {
         let release_outer = GIT_MUTATION_TXNS.with_borrow_mut(|txns| {
-            match txns.iter().position(|(held, _)| held == &self.key) {
+            match txns.iter().position(|(held, _, _)| held == &self.key) {
                 Some(index) if txns[index].1 > 1 => {
                     txns[index].1 -= 1;
-                    false
+                    Some(false)
                 }
                 Some(index) => {
                     txns.remove(index);
-                    true
+                    Some(true)
                 }
-                None => false,
+                None => None,
             }
         });
+        let Some(release_outer) = release_outer else {
+            debug_assert!(
+                false,
+                "mutation transaction missing from its thread registry"
+            );
+            return;
+        };
         if release_outer {
-            GIT_MUTATION_TXN_LOCKS
-                .with_borrow_mut(|locks| locks.retain(|(held, _)| held != &self.key));
             drop(self.lock.take());
         }
     }
