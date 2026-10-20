@@ -924,6 +924,268 @@ pub(crate) fn ps_argv(target: &ComposeTarget, project: &str, c: &ComposeSpec) ->
     v
 }
 
+/// List every container in a Compose project, including stopped containers.
+fn project_containers_argv(target: &ComposeTarget, project: &str, c: &ComposeSpec) -> Vec<String> {
+    let mut argv = project_prefix(target, project, c);
+    argv.extend(["ps".into(), "--all".into(), "--quiet".into()]);
+    argv
+}
+
+/// Inspect concrete container ids with the engine prefix (without `compose`).
+fn inspect_argv(engine_prefix: &[String], ids: &[String]) -> Vec<String> {
+    let mut argv = engine_prefix.to_vec();
+    argv.push("inspect".into());
+    argv.extend(ids.iter().cloned());
+    argv
+}
+
+fn runtime_down_argv(
+    target: &ComposeTarget,
+    backend: Backend,
+    oci_host: Option<&str>,
+    project: &str,
+) -> Option<Vec<String>> {
+    down_argv_for(backend, oci_host, project).map(|argv| target.control_argv(&argv))
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ComposeRuntimeRefusal {
+    pub service: String,
+    pub container: String,
+    pub setting: String,
+}
+
+impl fmt::Display for ComposeRuntimeRefusal {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "Compose service '{}' (container '{}') runs with {}, which can reach thegn's protected host state; the project was stopped. Remove it from the Compose file.",
+            self.service, self.container, self.setting
+        )
+    }
+}
+
+impl std::error::Error for ComposeRuntimeRefusal {}
+
+/// Check the engine's inspect JSON against the protected host paths.
+fn judge_runtime_inspect(
+    json: &str,
+    guard: &ComposeGuard,
+) -> Result<Option<ComposeRuntimeRefusal>, ConfigParseError> {
+    let containers: serde_json::Value =
+        serde_json::from_str(json).map_err(|error| ConfigParseError(error.to_string()))?;
+    let containers = containers
+        .as_array()
+        .ok_or_else(|| ConfigParseError("container inspect output is not an array".into()))?;
+    for container in containers {
+        let object = container
+            .as_object()
+            .ok_or_else(|| ConfigParseError("container inspect entry is not an object".into()))?;
+        let name = object
+            .get("Name")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("?")
+            .trim_start_matches('/');
+        let service = object
+            .get("Config")
+            .and_then(|value| value.get("Labels"))
+            .and_then(|value| value.get("com.docker.compose.service"))
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("?");
+        let host = object.get("HostConfig");
+        let refusal = if host
+            .and_then(|value| value.get("Privileged"))
+            .and_then(serde_json::Value::as_bool)
+            == Some(true)
+        {
+            Some("privileged: true".to_owned())
+        } else if host
+            .and_then(|value| value.get("NetworkMode"))
+            .and_then(serde_json::Value::as_str)
+            == Some("host")
+        {
+            Some("network_mode: host".to_owned())
+        } else if host
+            .and_then(|value| value.get("PidMode"))
+            .and_then(serde_json::Value::as_str)
+            == Some("host")
+        {
+            Some("pid: host".to_owned())
+        } else {
+            host.and_then(|value| value.get("CapAdd"))
+                .and_then(serde_json::Value::as_array)
+                .and_then(|caps| {
+                    caps.iter()
+                        .filter_map(serde_json::Value::as_str)
+                        .find(|cap| {
+                            let normalized = cap.to_ascii_uppercase();
+                            matches!(
+                                normalized.strip_prefix("CAP_").unwrap_or(&normalized),
+                                "ALL"
+                                    | "SYS_ADMIN"
+                                    | "SYS_MODULE"
+                                    | "SYS_RAWIO"
+                                    | "SYS_PTRACE"
+                                    | "DAC_READ_SEARCH"
+                            )
+                        })
+                })
+                .map(|capability| format!("cap_add: {}", capability.to_ascii_uppercase()))
+        };
+        if let Some(setting) = refusal {
+            return Ok(Some(ComposeRuntimeRefusal {
+                service: service.to_owned(),
+                container: name.to_owned(),
+                setting,
+            }));
+        }
+        if let Some(mount) = object
+            .get("Mounts")
+            .and_then(serde_json::Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter(|mount| mount.get("Type").and_then(serde_json::Value::as_str) == Some("bind"))
+            .find_map(|mount| {
+                let source = mount.get("Source").and_then(serde_json::Value::as_str)?;
+                let file = Path::new(source).file_name().and_then(|name| name.to_str());
+                let engine_socket = matches!(
+                    file,
+                    Some("docker.sock" | "podman.sock" | "containerd.sock")
+                );
+                (engine_socket
+                    || crate::sandbox_mounts::path_reaches_protected(
+                        Path::new(source),
+                        &guard.protected,
+                    ))
+                .then_some(source)
+            })
+        {
+            return Ok(Some(ComposeRuntimeRefusal {
+                service: service.to_owned(),
+                container: name.to_owned(),
+                setting: format!("a bind of protected path '{mount}'"),
+            }));
+        }
+    }
+    Ok(None)
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum RuntimeAttestation {
+    Clean,
+    Refused(ComposeRuntimeRefusal),
+    Unverified(String),
+}
+
+fn runtime_attestation(
+    ps: Option<String>,
+    inspect: Option<String>,
+    guard: &ComposeGuard,
+) -> RuntimeAttestation {
+    let Some(ps) = ps else {
+        return RuntimeAttestation::Unverified("container listing could not be verified".into());
+    };
+    let ids = ps.split_whitespace().map(str::to_owned).collect::<Vec<_>>();
+    if ids.is_empty() {
+        return RuntimeAttestation::Unverified("container listing was empty".into());
+    }
+    let Some(inspect) = inspect else {
+        return RuntimeAttestation::Unverified("container inspect could not be verified".into());
+    };
+    match judge_runtime_inspect(&inspect, guard) {
+        Ok(Some(refusal)) => RuntimeAttestation::Refused(refusal),
+        Ok(None) => RuntimeAttestation::Clean,
+        Err(error) => RuntimeAttestation::Unverified(format!(
+            "container inspect could not be parsed: {error}"
+        )),
+    }
+}
+
+fn attest_runtime(
+    target: &ComposeTarget,
+    spec: &SandboxSpec,
+    compose: &ComposeSpec,
+    project: &str,
+    guard: &ComposeGuard,
+    mut report: EnsureReport,
+) -> anyhow::Result<EnsureReport> {
+    use crate::sandbox::proc::{Capture, ProcOutcome, run_bounded};
+
+    let ps = run_bounded(
+        &target.control_argv(&project_containers_argv(target, project, compose)),
+        COMPOSE_PS_TIMEOUT,
+        Capture {
+            stdout: Some(64 * 1024),
+            stderr: Some(COMPOSE_CONFIG_STDERR_LIMIT),
+        },
+    );
+    let ps_success = matches!(&ps, ProcOutcome::Exited { status, .. } if status.success());
+    let ps = if ps_success {
+        match ps.into_stdout() {
+            Some((true, stdout)) => Some(stdout),
+            _ => None,
+        }
+    } else {
+        None
+    };
+    let ids = match ps.as_deref() {
+        Some(output) => output
+            .split_whitespace()
+            .map(str::to_owned)
+            .collect::<Vec<_>>(),
+        None => Vec::new(),
+    };
+    let inspect = if ids.is_empty() {
+        None
+    } else {
+        let prefix = oci_prefix(spec);
+        let outcome = run_bounded(
+            &target.control_argv(&inspect_argv(&prefix, &ids)),
+            COMPOSE_CONFIG_TIMEOUT,
+            Capture {
+                stdout: Some(COMPOSE_CONFIG_STDOUT_LIMIT),
+                stderr: Some(COMPOSE_CONFIG_STDERR_LIMIT),
+            },
+        );
+        let success = matches!(&outcome, ProcOutcome::Exited { status, .. } if status.success());
+        if success {
+            match outcome.into_stdout() {
+                Some((true, stdout)) => Some(stdout),
+                _ => None,
+            }
+        } else {
+            None
+        }
+    };
+    match runtime_attestation(ps, inspect, guard) {
+        RuntimeAttestation::Clean => Ok(report),
+        RuntimeAttestation::Unverified(reason) => {
+            if report.compose_unverified.is_none() {
+                report.compose_unverified = Some(format!("Compose runtime inspection {reason}"));
+            }
+            Ok(report)
+        }
+        RuntimeAttestation::Refused(refusal) => {
+            if let Some(argv) =
+                runtime_down_argv(target, spec.backend, spec.oci_host.as_deref(), project)
+            {
+                let outcome = run_bounded(
+                    &argv,
+                    COMPOSE_DOWN_TIMEOUT,
+                    Capture {
+                        stdout: Some(4096),
+                        stderr: Some(COMPOSE_CONFIG_STDERR_LIMIT),
+                    },
+                );
+                if !matches!(outcome, ProcOutcome::Exited { status, .. } if status.success()) {
+                    tracing::warn!(target: "thegn::sandbox", project, "failed to stop refused Compose project");
+                }
+            }
+            Err(anyhow::Error::new(refusal))
+        }
+    }
+}
+
 /// Compose prefix for a pinned effective config.
 fn pinned_prefix(
     target: &ComposeTarget,
@@ -1230,7 +1492,7 @@ pub(crate) fn up_and_verify(
     let config = target.control_argv(&config_json_argv(&target, &project, &labelled));
     let up = target.control_argv(&up_argv(&target, &project, &labelled));
     let ps = target.control_argv(&ps_argv(&target, &project, &labelled));
-    up_attested(
+    let report = up_attested(
         &config,
         &up,
         &ps,
@@ -1241,7 +1503,8 @@ pub(crate) fn up_and_verify(
             COMPOSE_PS_TIMEOUT,
         ),
         |output| pin_inspected_config(&state_home, &project, &target, compose, output),
-    )
+    )?;
+    attest_runtime(&target, spec, &labelled, &project, guard, report)
 }
 
 /// `docker compose … exec [-it] [--workdir wd] <service> /bin/sh -lc <script>`.
@@ -2147,6 +2410,141 @@ mod tests {
                 }
             ),
             crate::capabilities::IsolationClass::HostProcess
+        );
+    }
+
+    #[test]
+    fn runtime_inspect_refuses_escape_settings_and_protected_binds() {
+        let protected = tempfile::tempdir().expect("protected path tempdir");
+        let guard = ComposeGuard {
+            protected: vec![protected.path().to_path_buf()],
+            classes: Vec::new(),
+        };
+        for (host, setting) in [
+            (r#"{"Privileged":true}"#, "privileged: true"),
+            (r#"{"NetworkMode":"host"}"#, "network_mode: host"),
+            (r#"{"PidMode":"host"}"#, "pid: host"),
+            (r#"{"CapAdd":["CAP_SYS_ADMIN"]}"#, "cap_add: CAP_SYS_ADMIN"),
+            (r#"{"CapAdd":["cap_sys_admin"]}"#, "cap_add: CAP_SYS_ADMIN"),
+            (r#"{"CapAdd":["sys_module"]}"#, "cap_add: SYS_MODULE"),
+        ] {
+            let json = format!(
+                r#"[{{"Name":"/container-1","Config":{{"Labels":{{"com.docker.compose.service":"app"}}}},"HostConfig":{host}}}]"#
+            );
+            let refusal = judge_runtime_inspect(&json, &guard)
+                .expect("valid inspect JSON")
+                .expect("escape setting refused");
+            assert_eq!(refusal.service, "app");
+            assert_eq!(refusal.container, "container-1");
+            assert_eq!(refusal.setting, setting);
+        }
+        let protected_bind = format!("{}/x", protected.path().display());
+        for source in [protected_bind, "/var/run/docker.sock".to_owned()] {
+            let source_json = serde_json::to_string(&source).unwrap();
+            let json = format!(
+                r#"[{{"Name":"/container-1","Config":{{"Labels":{{"com.docker.compose.service":"app"}}}},"Mounts":[{{"Type":"bind","Source":{source_json}}}]}}]"#
+            );
+            let refusal = judge_runtime_inspect(&json, &guard)
+                .expect("valid inspect JSON")
+                .expect("protected runtime bind refused");
+            assert!(refusal.setting.contains(&source), "{}", refusal.setting);
+        }
+    }
+
+    #[test]
+    fn runtime_inspect_allows_other_caps_null_caps_and_unprotected_binds() {
+        let unprotected = tempfile::tempdir().expect("unprotected path tempdir");
+        let protected = tempfile::tempdir().expect("protected path tempdir");
+        let guard = ComposeGuard {
+            protected: vec![protected.path().to_path_buf()],
+            classes: Vec::new(),
+        };
+        for host in [r#"{"CapAdd":["NET_ADMIN"]}"#, r#"{"CapAdd":null}"#] {
+            let source_json = serde_json::to_string(&unprotected.path().to_string_lossy()).unwrap();
+            let json = format!(
+                r#"[{{"Name":"/okay","HostConfig":{host},"Mounts":[{{"Type":"bind","Source":{source_json}}}]}}]"#
+            );
+            assert_eq!(judge_runtime_inspect(&json, &guard).unwrap(), None);
+        }
+    }
+
+    #[test]
+    fn runtime_attestation_fails_closed_for_missing_or_malformed_inspection() {
+        let guard = ComposeGuard::default();
+        assert!(matches!(
+            runtime_attestation(None, None, &guard),
+            RuntimeAttestation::Unverified(_)
+        ));
+        assert!(matches!(
+            runtime_attestation(Some(" \n".into()), None, &guard),
+            RuntimeAttestation::Unverified(_)
+        ));
+        assert!(matches!(
+            runtime_attestation(Some("id".into()), Some("not-json".into()), &guard),
+            RuntimeAttestation::Unverified(_)
+        ));
+        assert_eq!(
+            runtime_attestation(Some("id".into()), Some(r#"[{}]"#.into()), &guard),
+            RuntimeAttestation::Clean
+        );
+        assert!(matches!(
+            judge_runtime_inspect("{}", &guard),
+            Err(ConfigParseError(_))
+        ));
+        assert!(matches!(
+            judge_runtime_inspect(r#"[null]"#, &guard),
+            Err(ConfigParseError(_))
+        ));
+        assert!(matches!(
+            runtime_attestation(
+                Some("id".into()),
+                Some(r#"[{"HostConfig":{"Privileged":true}}]"#.into()),
+                &guard
+            ),
+            RuntimeAttestation::Refused(_)
+        ));
+    }
+
+    #[test]
+    fn runtime_attestation_argv_is_exact() {
+        let target = ComposeTarget {
+            engine: vec!["docker".into(), "compose".into()],
+            placement: Placement::Local,
+        };
+        let compose = ComposeSpec {
+            files: vec!["/a/c.yml".into()],
+            service: None,
+            run_services: Vec::new(),
+        };
+        assert_eq!(
+            project_containers_argv(&target, "proj", &compose),
+            vec![
+                "docker", "compose", "-f", "/a/c.yml", "-p", "proj", "ps", "--all", "--quiet"
+            ]
+            .into_iter()
+            .map(str::to_owned)
+            .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            inspect_argv(&["docker".into()], &["id1".into(), "id2".into()]),
+            vec!["docker", "inspect", "id1", "id2"]
+                .into_iter()
+                .map(str::to_owned)
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            runtime_down_argv(&target, Backend::Docker, None, "proj").unwrap(),
+            vec![
+                "docker",
+                "compose",
+                "-p",
+                "proj",
+                "down",
+                "--remove-orphans"
+            ]
+            .into_iter()
+            .map(str::to_owned)
+            .collect::<Vec<_>>()
         );
     }
 

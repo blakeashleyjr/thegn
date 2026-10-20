@@ -82,6 +82,11 @@ opt-out. The inspected service model and mount paths are what thegn launches;
 Compose files and interpolation inputs are inspected again on the next launch.
 If the config cannot be inspected, launch proceeds with a warning and is
 reported as host-process isolation. Remote placements are not checked.
+After `up`, thegn inspects the running project containers and stops the project
+(`compose down`) if any is privileged, uses the host network or PID namespace,
+adds `SYS_ADMIN`, `SYS_MODULE`, `SYS_RAWIO`, `SYS_PTRACE`, `DAC_READ_SEARCH` or
+`ALL`, or bind-mounts a protected path. If the containers cannot be inspected,
+the launch is reported as host-process isolation.
 Queue-agent sandboxes get the same protected-bind check, including the daemon
 control-socket directory; a protected bind is refused and the queue dispatch is
 held. If their Compose config cannot be inspected, the agent runs degraded with
