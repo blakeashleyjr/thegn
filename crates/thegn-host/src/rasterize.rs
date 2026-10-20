@@ -111,7 +111,9 @@ fn stage_input(
         .map_err(|e| format!("staged input copy failed: {e}"))?;
     if copied > cap {
         drop(destination);
-        std::fs::remove_file(&staged).map_err(|e| format!("staged input cleanup failed: {e}"))?;
+        if let Err(error) = std::fs::remove_file(&staged) {
+            tracing::debug!(%error, path = %staged.display(), "failed to remove over-cap staged input");
+        }
         return Err(format!(
             "file exceeds the {cap} byte preview cap (more than {cap} bytes)"
         ));
@@ -130,28 +132,33 @@ where
     let mut has_puppeteer_cache = false;
     for (key, value) in host {
         let key_text = key.to_string_lossy().into_owned();
-        if key_text == "HOME" {
+        if key_text.eq_ignore_ascii_case("HOME") {
             host_home = Some(value.clone());
         }
-        if key_text == "PUPPETEER_CACHE_DIR" {
+        if key_text.eq_ignore_ascii_case("PUPPETEER_CACHE_DIR") {
             has_puppeteer_cache = true;
         }
-        if key_text == "PATH" {
+        if key_text.eq_ignore_ascii_case("PATH") {
             let absolute: Vec<_> = std::env::split_paths(&value)
                 .filter(|entry| entry.is_absolute())
                 .collect();
-            let path_value = match std::env::join_paths(absolute) {
-                Ok(joined) => joined,
-                Err(_) => OsString::new(),
-            };
-            allowed.push((key, path_value));
-        } else if key_text == "LANG"
-            || key_text == "TZ"
-            || key_text.starts_with("LC_")
-            || key_text == "PUPPETEER_EXECUTABLE_PATH"
-            || key_text == "PUPPETEER_CACHE_DIR"
+            allowed.push((
+                OsString::from("PATH"),
+                std::env::join_paths(absolute).unwrap_or_default(),
+            ));
+        } else if key_text.eq_ignore_ascii_case("LANG")
+            || key_text.eq_ignore_ascii_case("TZ")
+            || key_text.to_ascii_uppercase().starts_with("LC_")
+            || key_text.eq_ignore_ascii_case("PUPPETEER_EXECUTABLE_PATH")
+            || key_text.eq_ignore_ascii_case("PUPPETEER_CACHE_DIR")
         {
             allowed.push((key, value));
+        } else if key_text.eq_ignore_ascii_case("SYSTEMROOT") {
+            allowed.push((OsString::from("SystemRoot"), value));
+        } else if key_text.eq_ignore_ascii_case("PATHEXT") {
+            allowed.push((OsString::from("PATHEXT"), value));
+        } else if key_text.eq_ignore_ascii_case("COMSPEC") {
+            allowed.push((OsString::from("COMSPEC"), value));
         }
     }
 
@@ -371,12 +378,16 @@ pub fn pdf_text(path: &Path, cancel: &AtomicBool) -> Result<String, String> {
     let staged = stage_input(&stage, path, "input.pdf", MAX_PREVIEW_FILE_BYTES)
         .map_err(|e| format!("preview staging failed: {e}"))?;
     let mut cmd = renderer_command("pdftotext", &stage);
-    cmd.arg(staged).arg("-"); // text to stdout
+    cmd.args(pdftotext_args(&staged));
     match crate::preview_jobs::run_renderer(&mut cmd, cancel) {
         Ok(out) | Err(C::Capped(out)) => Ok(String::from_utf8_lossy(&out).into_owned()),
         Err(C::Spawn(_)) => Err("no text extractor available".to_string()),
         Err(e) => Err(format!("text extraction {}", capture_err(&e))),
     }
+}
+
+fn pdftotext_args(path: &Path) -> Vec<OsString> {
+    [path.as_os_str().to_os_string(), OsString::from("-")].into()
 }
 
 /// Render a Mermaid file via `mmdc` (mermaid-cli) → PNG → RGBA. Errs (→ source
@@ -389,16 +400,23 @@ pub fn mermaid(path: &Path, cancel: &AtomicBool) -> Result<Raster, String> {
         .map_err(|e| format!("preview staging failed: {e}"))?;
     let tmp = stage.path().join("render.png");
     let mut cmd = renderer_command("mmdc", &stage);
-    cmd.arg("-i")
-        .arg(staged)
-        .arg("-o")
-        .arg(&tmp)
-        .arg("-b")
-        .arg("transparent");
+    cmd.args(mermaid_args(&staged, &tmp));
     match crate::preview_jobs::run_renderer_quiet(&mut cmd, cancel) {
         Ok(()) => read_mermaid_output(&tmp, MAX_MERMAID_OUTPUT_BYTES),
         Err(e) => Err(format!("mmdc: {}", capture_err(&e))),
     }
+}
+
+fn mermaid_args(input: &Path, output: &Path) -> Vec<OsString> {
+    [
+        OsString::from("-i"),
+        input.as_os_str().to_os_string(),
+        OsString::from("-o"),
+        output.as_os_str().to_os_string(),
+        OsString::from("-b"),
+        OsString::from("transparent"),
+    ]
+    .into()
 }
 
 fn read_mermaid_output(path: &Path, cap: u64) -> Result<Raster, String> {
@@ -451,9 +469,15 @@ mod tests {
                 OsString::from("secret"),
             ),
             (OsString::from("LD_PRELOAD"), OsString::from("evil.so")),
-            (OsString::from("PATH"), host_path),
+            (OsString::from("Path"), host_path),
             (OsString::from("LANG"), OsString::from("en_US.UTF-8")),
             (OsString::from("LC_ALL"), OsString::from("C")),
+            (OsString::from("SystemRoot"), OsString::from("C:\\Windows")),
+            (OsString::from("PATHEXT"), OsString::from(".COM;.EXE;.BAT")),
+            (
+                OsString::from("COMSPEC"),
+                OsString::from("C:\\Windows\\System32\\cmd.exe"),
+            ),
         ];
         let env = renderer_env(host, stage.path());
         let keys: std::collections::BTreeSet<_> = env
@@ -466,6 +490,9 @@ mod tests {
                 "PATH",
                 "LANG",
                 "LC_ALL",
+                "SystemRoot",
+                "PATHEXT",
+                "COMSPEC",
                 "PUPPETEER_CACHE_DIR",
                 "HOME",
                 "XDG_CONFIG_HOME",
@@ -485,6 +512,12 @@ mod tests {
         };
         assert!(Path::new(value("HOME")).starts_with(stage.path()));
         assert_eq!(value("PATH").as_os_str(), absolute_path.as_os_str());
+        assert_eq!(value("SystemRoot"), std::ffi::OsStr::new("C:\\Windows"));
+        assert_eq!(value("PATHEXT"), std::ffi::OsStr::new(".COM;.EXE;.BAT"));
+        assert_eq!(
+            value("COMSPEC"),
+            std::ffi::OsStr::new("C:\\Windows\\System32\\cmd.exe")
+        );
         let puppeteer_cache = Path::new("/real/home")
             .join(".cache/puppeteer")
             .into_os_string();
@@ -512,7 +545,11 @@ mod tests {
                     key.starts_with("GPG_") || key.ends_with("_TOKEN") || key.ends_with("_API_KEY")
                 })
         }));
-        assert_eq!(output.lines().next(), Some(stage.path().to_str().unwrap()));
+        let canonical_stage = stage.path().canonicalize().unwrap();
+        assert_eq!(
+            output.lines().next(),
+            Some(canonical_stage.to_str().unwrap())
+        );
         let home = format!("HOME={}", stage.path().join("home").display());
         assert!(output.lines().any(|line| line == home));
     }
@@ -527,6 +564,16 @@ mod tests {
         std::fs::write(&canary, b"canary document").unwrap();
 
         let staged = stage_input(&stage, &source, "input.pdf", 64).unwrap();
+        let staged_os = staged.as_os_str().to_os_string();
+        let source_os = source.as_os_str().to_os_string();
+        let pdf_image_args = pdftoppm_args(&staged);
+        let pdf_text_args = pdftotext_args(&staged);
+        let mermaid_output = stage.path().join("render.png");
+        let mermaid_renderer_args = mermaid_args(&staged, &mermaid_output);
+        for args in [pdf_image_args, pdf_text_args, mermaid_renderer_args] {
+            assert!(args.contains(&staged_os));
+            assert!(!args.contains(&source_os));
+        }
         std::fs::remove_file(&source).unwrap();
         if crate::platform::symlink_file_for_test(&canary, &source).is_err() {
             return;
