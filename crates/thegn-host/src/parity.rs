@@ -211,6 +211,9 @@ fn capture(wt: &Path, tmp: &Path) -> anyhow::Result<Capture> {
         .suffix(".list")
         .tempfile_in(tmp)?;
 
+    // 1. Unpushed commits -> a thin bundle (prerequisites = the remote-tracking
+    //    tips the sandbox clone already has). An empty bundle (nothing unpushed)
+    //    exits non-zero; treat that as "no commits to carry".
     let has_bundle = git_cmd(wt)
         .args(["bundle", "create"])
         .arg(bundle_file.path())
@@ -219,6 +222,7 @@ fn capture(wt: &Path, tmp: &Path) -> anyhow::Result<Capture> {
         .map(|output| output.status.success())
         .unwrap_or(false)
         && nonempty(bundle_file.path());
+    // 2. Uncommitted tracked changes (staged + unstaged vs HEAD), incl. deletions.
     let patch = git_cmd(wt)
         .args(["diff", "HEAD", "--binary"])
         .output()
@@ -226,6 +230,7 @@ fn capture(wt: &Path, tmp: &Path) -> anyhow::Result<Capture> {
         .filter(|output| output.status.success())
         .map(|output| output.stdout)
         .filter(|patch| !patch.is_empty());
+    // 3. Untracked, non-ignored files -> a tar (paths relative to the worktree).
     let untracked = git_cmd(wt)
         .args(["ls-files", "--others", "--exclude-standard", "-z"])
         .output()
@@ -295,7 +300,6 @@ pub(crate) fn failure_note(error: &anyhow::Error) -> &'static str {
 /// leave sandbox artifacts in place for diagnosis. Staged checkout promotion
 /// remains deferred.
 // off-loop: provisioning path — reached only via spawn_blocking / the pool thread / CLI.
-#[expect(clippy::disallowed_methods)]
 pub(crate) fn apply_local_parity(
     provider: &thegn_svc::provider::Provider,
     id: &str,
