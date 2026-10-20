@@ -216,9 +216,7 @@ enum One {
         paths: Vec<String>,
         submodule_conflicts: Vec<crate::submodule::SubmoduleConflict>,
     },
-    UnsupportedMergeHistory {
-        merges: Vec<String>,
-    },
+    UnsupportedMergeHistory,
 }
 
 /// Fold `branches` onto `start_tip` in order under `opts.strategy`. Each clean
@@ -258,7 +256,7 @@ pub fn fold(
                     submodule_conflicts,
                 });
             }
-            One::UnsupportedMergeHistory { merges: _ } => {
+            One::UnsupportedMergeHistory => {
                 deferred.push(Deferred {
                     branch: b,
                     paths: Vec::new(),
@@ -325,13 +323,8 @@ fn rebase_replay(git: &impl FoldGit, tip: &str, b: &Branch) -> Result<One> {
         .merge_base(tip, &b.tip)?
         .unwrap_or_else(|| tip.to_string());
     let commits = git.commits(&base, &b.tip)?;
-    let merges: Vec<String> = commits
-        .iter()
-        .filter(|commit| commit.parents.len() > 1)
-        .map(|commit| commit.oid.clone())
-        .collect();
-    if !merges.is_empty() {
-        return Ok(One::UnsupportedMergeHistory { merges });
+    if commits.iter().any(|commit| commit.parents.len() > 1) {
+        return Ok(One::UnsupportedMergeHistory);
     }
     let mut running = tip.to_string();
     for c in commits {
@@ -488,11 +481,7 @@ mod tests {
                 metas.push(CommitMeta {
                     oid: (*oid).to_string(),
                     parent: parent.clone(),
-                    parents: if parent.is_empty() {
-                        Vec::new()
-                    } else {
-                        vec![parent.clone()]
-                    },
+                    parents: vec![parent.clone()],
                     message: (*subject).to_string(),
                     author: Author {
                         name: "orig".into(),
