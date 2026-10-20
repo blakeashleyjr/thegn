@@ -162,24 +162,32 @@ impl std::fmt::Display for ParentDispatchConflict {
 impl std::error::Error for ParentDispatchConflict {}
 
 /// Whether an ordinary `dispatch set-status` transition is permitted.
-/// Active states may move to any recognized state; idempotent writes are
-/// allowed. Terminal transitions are `Done -> Merged|Abandoned`,
-/// `Failed -> Done|Abandoned`, and `Unknown -> Failed|Abandoned`. All other
-/// terminal transitions, including resurrection to an active state, are
-/// refused. `Failed -> Done` remains legal so a fixed artifact can be
-/// re-verified by the existing completion gate.
+/// Idempotent writes are allowed for every recognized state except `Unknown`,
+/// and `Queued` is never a target. Active states may move to
+/// `Spawning|Running|WaitingHuman|PrOpen|Abandoned|Failed`; `Done` is reachable
+/// only from `Running|Spawning|WaitingHuman|Failed`; and `Merged` only from
+/// `Done|PrOpen`. Terminal transitions also include `Done -> Abandoned`,
+/// `Failed -> Abandoned`, and `Unknown -> Failed|Abandoned`. All other
+/// transitions, including resurrection to an active state, are refused.
 pub fn set_status_transition_allowed(from: AgentDispatchStatus, to: AgentDispatchStatus) -> bool {
     use AgentDispatchStatus::*;
+    if to == Unknown || to == Queued {
+        return false;
+    }
     if from == to {
-        return from != Unknown;
+        return true;
     }
-    if from.is_active() {
-        return to != Unknown;
+    match to {
+        Merged => matches!(from, Done | PrOpen),
+        Done => matches!(from, Running | Spawning | WaitingHuman | Failed),
+        _ => {
+            from.is_active()
+                || matches!(
+                    (from, to),
+                    (Done, Abandoned) | (Failed, Abandoned) | (Unknown, Failed)
+                )
+        }
     }
-    matches!(
-        (from, to),
-        (Done, Merged | Abandoned) | (Failed, Done | Abandoned) | (Unknown, Failed | Abandoned)
-    )
 }
 
 /// A checked set-status operation was illegal or lost its expected-status CAS.
@@ -221,6 +229,20 @@ impl std::fmt::Display for DispatchTransitionConflict {
 }
 
 impl std::error::Error for DispatchTransitionConflict {}
+
+/// A dispatch row required by an operation was not present.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MissingDispatch {
+    pub id: i64,
+}
+
+impl std::fmt::Display for MissingDispatch {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "no dispatch with id {}", self.id)
+    }
+}
+
+impl std::error::Error for MissingDispatch {}
 
 const ADMISSION_ACTIVE_STATUSES: [AgentDispatchStatus; 5] = [
     AgentDispatchStatus::Queued,
@@ -292,7 +314,7 @@ impl Db {
         note: Option<&str>,
     ) -> Result<()> {
         if self.get_dispatch(id)?.is_none() {
-            anyhow::bail!("no dispatch with id {id}");
+            return Err(anyhow::Error::new(MissingDispatch { id }));
         }
         if !set_status_transition_allowed(expected, to) {
             return Err(anyhow::Error::new(DispatchTransitionConflict::Illegal {
@@ -304,7 +326,7 @@ impl Db {
         if !self.cas_dispatch_status(id, None, expected, to, note)? {
             let actual = self
                 .get_dispatch(id)?
-                .ok_or_else(|| anyhow::anyhow!("no dispatch with id {id}"))?
+                .ok_or_else(|| anyhow::Error::new(MissingDispatch { id }))?
                 .status;
             return Err(anyhow::Error::new(DispatchTransitionConflict::Stale {
                 id,
@@ -2991,18 +3013,29 @@ mod tests {
         ];
         for from in statuses {
             for to in statuses {
-                let expected = if from.is_active() {
-                    to != Unknown
-                } else {
-                    matches!(
-                        (from, to),
-                        (Merged, Merged)
-                            | (Abandoned, Abandoned)
-                            | (Done, Done | Merged | Abandoned)
-                            | (Failed, Failed | Done | Abandoned)
-                            | (Unknown, Failed | Abandoned)
-                    )
-                };
+                let expected = matches!(
+                    (from, to),
+                    (
+                        Queued,
+                        Spawning | Running | WaitingHuman | PrOpen | Abandoned | Failed
+                    ) | (
+                        Spawning,
+                        Spawning | Running | WaitingHuman | PrOpen | Abandoned | Failed
+                    ) | (
+                        Running,
+                        Spawning | Running | WaitingHuman | PrOpen | Done | Abandoned | Failed
+                    ) | (
+                        WaitingHuman,
+                        Spawning | Running | WaitingHuman | PrOpen | Done | Abandoned | Failed
+                    ) | (
+                        PrOpen,
+                        Spawning | Running | WaitingHuman | PrOpen | Merged | Abandoned | Failed
+                    ) | (Merged, Merged)
+                        | (Abandoned, Abandoned)
+                        | (Done, Done | Merged | Abandoned)
+                        | (Failed, Failed | Done | Abandoned)
+                        | (Unknown, Failed | Abandoned)
+                );
                 assert_eq!(
                     set_status_transition_allowed(from, to),
                     expected,
@@ -3074,6 +3107,74 @@ mod tests {
             )
             .unwrap_err();
         assert!(missing.to_string().contains("no dispatch with id 99999"));
+    }
+
+    #[test]
+    fn set_status_matrix_refuses_queued_target_and_early_done() {
+        let db = Db::open_memory().unwrap();
+        let queued = put_row(&db, "linear:THE-242-Q", "/wt/queued");
+        let running = put_row(&db, "linear:THE-242-R", "/wt/running");
+        db.update_dispatch_status(running, AgentDispatchStatus::Running)
+            .unwrap();
+
+        for (id, from, to) in [
+            (
+                queued,
+                AgentDispatchStatus::Queued,
+                AgentDispatchStatus::Done,
+            ),
+            (
+                running,
+                AgentDispatchStatus::Running,
+                AgentDispatchStatus::Merged,
+            ),
+            (
+                running,
+                AgentDispatchStatus::Running,
+                AgentDispatchStatus::Queued,
+            ),
+        ] {
+            let result = db.set_dispatch_status_checked(id, from, to, None);
+            assert!(matches!(
+                result,
+                Err(ref error)
+                    if matches!(
+                        error.downcast_ref::<DispatchTransitionConflict>(),
+                        Some(DispatchTransitionConflict::Illegal { .. })
+                    )
+            ));
+        }
+
+        db.set_dispatch_status_checked(
+            running,
+            AgentDispatchStatus::Running,
+            AgentDispatchStatus::Done,
+            None,
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn set_status_matrix_missing_row_is_typed() {
+        let db = Db::open_memory().unwrap();
+        let result = db.set_dispatch_status_checked(
+            99_999,
+            AgentDispatchStatus::Queued,
+            AgentDispatchStatus::Running,
+            None,
+        );
+        assert!(matches!(
+            &result,
+            Err(error)
+                if error.downcast_ref::<MissingDispatch>()
+                    == Some(&MissingDispatch { id: 99_999 })
+        ));
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("no dispatch with id 99999")
+        );
     }
 
     #[test]

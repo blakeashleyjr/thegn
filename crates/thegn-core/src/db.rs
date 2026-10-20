@@ -1080,7 +1080,9 @@ impl PrQueueRow {
 pub use crate::db_dispatch::DispatchAdmissionDecision;
 pub use crate::db_dispatch::ResumeDispatchConflict;
 pub use crate::db_dispatch::{DispatchOverride, FORCE_REASON_MAX_CHARS};
-pub use crate::db_dispatch::{DispatchTransitionConflict, set_status_transition_allowed};
+pub use crate::db_dispatch::{
+    DispatchTransitionConflict, MissingDispatch, set_status_transition_allowed,
+};
 pub use crate::db_dispatch::{
     LeaseInputError, MAX_LEASE_TTL_SECS, MIN_LEASE_TTL_SECS, ParentDispatchConflict,
 };
