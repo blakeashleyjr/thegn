@@ -46,6 +46,8 @@ local player, without leaving the compositor. Hidden unless
   and live under the `Alt-m` chord prefix by default.
 - A corner video pin (`mpv --vo=tct`) pairs well with this — see
   [[drawer-and-corner]].
+- If listing playlists or players fails, the picker reports the error in the
+  status line; an empty list means there is nothing to pick.
 
 Spotify remains a reserved backend kind: the supported desktop route is the
 existing MPRIS integration (or SMTC/AppleScript on their platforms), with no
