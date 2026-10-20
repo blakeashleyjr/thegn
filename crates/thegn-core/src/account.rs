@@ -1360,7 +1360,7 @@ mod tests {
 
     #[test]
     fn managed_row_with_a_legacy_slug_path_is_refused() {
-        let state = crate::testenv::IsolatedState::new();
+        let _state = crate::testenv::IsolatedState::new();
         let db = Db::open_memory().unwrap();
         let stored = managed_root().join("codex").join("work");
         std::fs::create_dir_all(&stored).unwrap();
