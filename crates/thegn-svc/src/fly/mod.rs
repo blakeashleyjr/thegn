@@ -666,25 +666,42 @@ impl RemoteProvider for FlyProvider {
                 admitted.image.is_prebaked(),
                 self.spec.iroh.as_ref(),
             );
-            // Spend guardrail (ledger-based, covers in-flight creates).
-            let managed = self.ledger_names().len();
-            if managed >= self.spec.max_instances() {
-                return Err(anyhow!(
-                    "fly: {managed} managed machines already exist (max_instances = {}); \
-                     destroy one or raise `[env.<name>.provider] max_instances`",
-                    self.spec.max_instances()
-                ));
-            }
-            let app = app_name(&name);
-            // Intent BEFORE create — the crash-leak window closes here.
-            registry::write(&registry::VpsRecord {
+            // Atomically reserve capacity and publish the intent before a
+            // resource-creating call. Locking and ledger I/O stay off the runtime.
+            let intent = registry::VpsRecord {
                 name: name.clone(),
                 provider: LEDGER_PROVIDER.into(),
                 state: "creating".into(),
                 instance_id: String::new(),
                 ip: String::new(),
                 created_at: thegn_core::util::now(),
-            })?;
+            };
+            let reserve_record = intent.clone();
+            let cap = self.spec.max_instances();
+            let reserve_result = tokio::task::spawn_blocking(move || {
+                registry::reserve(
+                    &reserve_record,
+                    cap,
+                    registry::ReserveScope::Provider(LEDGER_PROVIDER),
+                )
+            })
+            .await
+            .context("fly: reservation worker failed")?;
+            match reserve_result {
+                Ok(()) => {}
+                Err(registry::ReserveError::AtCap { occupied, cap }) => {
+                    return Err(anyhow!(
+                        "fly: {occupied} managed machines already exist (max_instances = {cap}); \
+                         destroy one or raise `[env.<name>.provider] max_instances`"
+                    ));
+                }
+                Err(registry::ReserveError::Store(error)) => {
+                    return Err(
+                        error.context("fly: could not reserve ledger capacity; refusing to create")
+                    );
+                }
+            }
+            let app = app_name(&name);
 
             // `ensure_app` is the FIRST resource-creating call: until it succeeds no
             // billable resource exists, so a 4xx there ⇒ "nothing created" and the
