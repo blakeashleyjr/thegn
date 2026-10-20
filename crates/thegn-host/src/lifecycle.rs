@@ -30,7 +30,6 @@ enum LeaseProbe {
     Free(crate::pool_lease::Lease),
     Busy,
     Error,
-    NotProbed,
 }
 
 enum StaleAction {
@@ -38,13 +37,13 @@ enum StaleAction {
     Destroy(crate::pool_lease::Lease),
 }
 
-fn stale_provisioning_action(age: Option<u64>, lease: LeaseProbe) -> StaleAction {
+fn stale_provisioning_action(age: Option<u64>, probe: impl FnOnce() -> LeaseProbe) -> StaleAction {
     if age.is_none_or(|age| age < PROVISION_STALE_SECS) {
         return StaleAction::Keep;
     }
-    match lease {
+    match probe() {
         LeaseProbe::Free(lease) => StaleAction::Destroy(lease),
-        LeaseProbe::Busy | LeaseProbe::Error | LeaseProbe::NotProbed => StaleAction::Keep,
+        LeaseProbe::Busy | LeaseProbe::Error => StaleAction::Keep,
     }
 }
 /// Per-worktree "last seen active/busy" timestamps, so the reconcile can apply the
@@ -399,7 +398,7 @@ where
             provisioning += 1;
             continue;
         };
-        let probe = if age >= PROVISION_STALE_SECS {
+        match stale_provisioning_action(Some(age), || {
             match crate::pool_lease::spare_lease(&s.sandbox_name) {
                 Ok(lease) => LeaseProbe::Free(lease),
                 Err(crate::pool_lease::LeaseError::Busy) => LeaseProbe::Busy,
@@ -411,10 +410,7 @@ where
                     LeaseProbe::Error
                 }
             }
-        } else {
-            LeaseProbe::NotProbed
-        };
-        match stale_provisioning_action(Some(age), probe) {
+        }) {
             StaleAction::Keep => provisioning += 1,
             StaleAction::Destroy(_spare_lease) => {
                 thegn_core::msg::warn(&format!(
@@ -673,7 +669,7 @@ mod tests {
     #[test]
     fn pool_lease_stale_busy_spare_is_kept() {
         assert!(matches!(
-            stale_provisioning_action(Some(PROVISION_STALE_SECS), LeaseProbe::Busy),
+            stale_provisioning_action(Some(PROVISION_STALE_SECS), || LeaseProbe::Busy),
             StaleAction::Keep
         ));
     }
@@ -681,7 +677,7 @@ mod tests {
     #[test]
     fn pool_lease_stale_free_spare_is_destroyed() {
         assert!(matches!(
-            stale_provisioning_action(Some(PROVISION_STALE_SECS), free_spare_probe()),
+            stale_provisioning_action(Some(PROVISION_STALE_SECS), free_spare_probe),
             StaleAction::Destroy(_)
         ));
     }
@@ -689,15 +685,24 @@ mod tests {
     #[test]
     fn pool_lease_stale_probe_error_is_kept() {
         assert!(matches!(
-            stale_provisioning_action(Some(PROVISION_STALE_SECS), LeaseProbe::Error),
+            stale_provisioning_action(Some(PROVISION_STALE_SECS), || LeaseProbe::Error),
             StaleAction::Keep
         ));
     }
 
     #[test]
     fn pool_lease_young_spare_never_probes() {
+        let mut probed = false;
         assert!(matches!(
-            stale_provisioning_action(Some(PROVISION_STALE_SECS - 1), LeaseProbe::NotProbed),
+            stale_provisioning_action(Some(PROVISION_STALE_SECS - 1), || {
+                probed = true;
+                free_spare_probe()
+            }),
+            StaleAction::Keep
+        ));
+        assert!(!probed);
+        assert!(matches!(
+            stale_provisioning_action(Some(PROVISION_STALE_SECS - 1), free_spare_probe),
             StaleAction::Keep
         ));
     }
