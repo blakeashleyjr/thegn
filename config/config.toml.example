@@ -3266,9 +3266,10 @@ dns = "tunnel"
 # NetBird) so the device auto-deregisters from the control plane on teardown.
 ephemeral = true
 #
-# Tip: pair `provider` with the `sealed-tunnel` (alias `tunnel-only`) hardening
-# profile for a worktree that is fully cap-dropped AND has no host egress — its
-# only route is the tunnel. Plain `sealed` refuses a VPN (network=none).
+# Tip: `sealed-tunnel` (alias `tunnel-only`) currently refuses to launch while
+# a VPN is configured; thegn cannot yet enforce an exclusive tunnel route. Use
+# `hardened` with `[sandbox.vpn]` for a non-exclusive tunnel, or `sealed` for no
+# network. With no VPN, `sealed-tunnel` behaves like `sealed`.
 #
 # Secrets: auth keys / configs accept a secrets-ref so they never sit in plain
 # text here — "env:VAR_NAME" reads an env var, "file:~/path" reads a file. The

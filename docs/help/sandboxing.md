@@ -21,11 +21,12 @@ while the process is contained.
 per repo via a `.thegn.toml` overlay, or per run with
 `THEGN_SANDBOX_PROFILE`.
 
-| Profile    | What it does                                                                                   |
-| ---------- | ---------------------------------------------------------------------------------------------- |
-| `open`     | no hardening — the escape hatch                                                                |
-| `hardened` | **default.** read-only root, no-new-privileges, a process cap; network and capabilities intact |
-| `sealed`   | full lockdown: `network=none`, drop ALL caps, tighter pids cap. For untrusted work             |
+| Profile         | What it does                                                                                                                                                                                                |
+| --------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `open`          | no hardening — the escape hatch                                                                                                                                                                             |
+| `hardened`      | **default.** read-only root, no-new-privileges, a process cap; network and capabilities intact                                                                                                              |
+| `sealed`        | full lockdown: `network=none`, drop ALL caps, tighter pids cap. For untrusted work                                                                                                                          |
+| `sealed-tunnel` | `sealed` plus a `[sandbox.vpn]` tunnel as the only route. **Refuses to launch while a VPN is configured**: thegn cannot yet enforce that the tunnel is the only route. With no VPN it behaves like `sealed` |
 
 Under `hardened`, **everything outside the worktree is read-only —
 including your `$HOME`**, so a sandboxed agent cannot `cd` out and modify
