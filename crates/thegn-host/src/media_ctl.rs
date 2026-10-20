@@ -7,7 +7,6 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, LazyLock, Mutex};
 use std::time::Duration;
 use termwiz::terminal::TerminalWaker;
-use tokio::sync::mpsc as tokio_mpsc;
 
 use crate::panel::media::{MediaQueueDelivery, MediaRequest, MediaSourcesDelivery};
 
@@ -26,6 +25,34 @@ static MEDIA_PICK_IN_FLIGHT: Mutex<Option<tokio::task::JoinHandle<()>>> = Mutex:
 static MEDIA_QUEUE_IN_FLIGHT: Mutex<Option<tokio::task::JoinHandle<()>>> = Mutex::new(None);
 static MEDIA_SOURCES_IN_FLIGHT: Mutex<Option<tokio::task::JoinHandle<()>>> = Mutex::new(None);
 static MEDIA_OP_OUTCOME: Mutex<Option<MediaOpOutcome>> = Mutex::new(None);
+
+pub(crate) struct Latest<T>(Arc<Mutex<Option<T>>>);
+
+impl<T> Clone for Latest<T> {
+    fn clone(&self) -> Self {
+        Self(Arc::clone(&self.0))
+    }
+}
+
+impl<T> Latest<T> {
+    pub(crate) fn new() -> Self {
+        Self(Arc::new(Mutex::new(None)))
+    }
+
+    pub(crate) fn put(&self, value: T) {
+        *self
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(value);
+    }
+
+    pub(crate) fn take(&self) -> Option<T> {
+        self.0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum MediaOpOutcome {
@@ -345,8 +372,41 @@ fn op_supported(
 
 /// An async result that opens a secondary media picker palette.
 pub(crate) enum MediaPick {
-    Playlists(Vec<thegn_core::media::Playlist>),
-    Players(Vec<String>),
+    Playlists(Result<Vec<thegn_core::media::Playlist>, String>),
+    Players(Result<Vec<String>, String>),
+}
+
+pub(crate) fn pick_palette(pick: MediaPick) -> Result<Vec<crate::palette::PaletteItem>, String> {
+    match pick {
+        MediaPick::Playlists(Ok(playlists)) if playlists.is_empty() => {
+            Err("Media: nothing to pick".into())
+        }
+        MediaPick::Players(Ok(players)) if players.is_empty() => {
+            Err("Media: nothing to pick".into())
+        }
+        MediaPick::Playlists(Ok(playlists)) => Ok(playlists
+            .into_iter()
+            .map(|playlist| {
+                crate::palette::PaletteItem::new(
+                    format!("media-playlist:{}", playlist.id),
+                    format!("\u{1f3b5} {}", playlist.name),
+                )
+            })
+            .collect()),
+        MediaPick::Players(Ok(players)) => Ok(players
+            .into_iter()
+            .map(|player| {
+                crate::palette::PaletteItem::new(
+                    format!("media-player:{player}"),
+                    format!("\u{25b6} {player}"),
+                )
+            })
+            .collect()),
+        MediaPick::Playlists(Err(error)) => {
+            Err(format!("Media: could not list playlists: {error}"))
+        }
+        MediaPick::Players(Err(error)) => Err(format!("Media: could not list players: {error}")),
+    }
 }
 
 /// The effective media config: the configured `[media]` with the runtime player
@@ -598,23 +658,33 @@ pub(crate) fn spawn_media_playlist(
 pub(crate) fn spawn_media_pick(
     cfg: thegn_core::config::MediaConfig,
     players: bool,
-    tx: tokio_mpsc::UnboundedSender<MediaPick>,
+    slot: Latest<MediaPick>,
     waker: TerminalWaker,
 ) {
     let handle = tokio::spawn(async move {
-        let Some(client) = crate::media_secret::client_for(&cfg).await else {
-            return;
-        };
-        let pick = within_media_budget(async {
-            if players {
-                MediaPick::Players(client.players().await)
-            } else {
-                MediaPick::Playlists(client.playlists().await.unwrap_or_default())
+        let result = within_media_budget(async {
+            match crate::media_secret::client_for(&cfg).await {
+                Some(client) if players => MediaPick::Players(Ok(client.players().await)),
+                Some(client) => match client.playlists().await {
+                    Ok(playlists) => MediaPick::Playlists(Ok(playlists)),
+                    Err(error) => {
+                        tracing::debug!(target: "thegn::media", error = %error, "media playlist fetch failed");
+                        MediaPick::Playlists(Err(error.to_string()))
+                    }
+                },
+                None if players => {
+                    MediaPick::Players(Err("media provider unavailable".into()))
+                }
+                None => MediaPick::Playlists(Err("media provider unavailable".into())),
             }
         })
         .await;
-        let Some(pick) = pick else { return };
-        let _ = tx.send(pick); // best-effort: send: the consumer may be gone; a closed channel is the consumer going away
+        let pick = match result {
+            Some(pick) => pick,
+            None if players => MediaPick::Players(Err("timed out".into())),
+            None => MediaPick::Playlists(Err("timed out".into())),
+        };
+        slot.put(pick);
         let _ = waker.wake(); // best-effort: waker pulse: an input nudge must never fail the calling path
     });
     replace_in_flight(&MEDIA_PICK_IN_FLIGHT, handle);
@@ -624,7 +694,7 @@ pub(crate) fn spawn_media_pick(
 pub(crate) fn spawn_media_queue(
     cfg: thegn_core::config::MediaConfig,
     request: MediaRequest,
-    tx: tokio_mpsc::UnboundedSender<MediaQueueDelivery>,
+    slot: Latest<MediaQueueDelivery>,
     waker: TerminalWaker,
 ) {
     let handle = tokio::spawn(async move {
@@ -642,7 +712,7 @@ pub(crate) fn spawn_media_queue(
         })
         .await
         .unwrap_or_else(|| Err("media queue fetch timed out".to_string()));
-        let _ = tx.send(MediaQueueDelivery { request, queue }); // best-effort: send: the consumer may be gone; a closed channel is the consumer going away
+        slot.put(MediaQueueDelivery { request, queue });
         let _ = waker.wake(); // best-effort: waker pulse: an input nudge must never fail the calling path
     });
     replace_in_flight(&MEDIA_QUEUE_IN_FLIGHT, handle);
@@ -654,7 +724,7 @@ pub(crate) fn spawn_media_queue(
 pub(crate) fn spawn_media_sources(
     cfg: thegn_core::config::MediaConfig,
     request: MediaRequest,
-    tx: tokio_mpsc::UnboundedSender<MediaSourcesDelivery>,
+    slot: Latest<MediaSourcesDelivery>,
     waker: TerminalWaker,
 ) {
     let handle = tokio::spawn(async move {
@@ -664,7 +734,7 @@ pub(crate) fn spawn_media_sources(
         let Some(sources) = within_media_budget(client.players()).await else {
             return;
         };
-        let _ = tx.send(MediaSourcesDelivery { request, sources });
+        slot.put(MediaSourcesDelivery { request, sources });
         let _ = waker.wake();
     });
     replace_in_flight(&MEDIA_SOURCES_IN_FLIGHT, handle);
@@ -673,16 +743,62 @@ pub(crate) fn spawn_media_sources(
 #[cfg(test)]
 mod tests {
     use super::{
-        MediaGeneration, MediaOp, MediaOpOutcome, MediaPreflightError, chain_op,
+        Latest, MediaGeneration, MediaOp, MediaOpOutcome, MediaPick, MediaPreflightError, chain_op,
         chain_op_with_outcome, delivery_from_read, generation_is_current, loop_target,
-        op_supported, record_refusal, replace_in_flight, shuffle_target, take_outcome,
-        within_media_budget,
+        op_supported, pick_palette, record_refusal, replace_in_flight, shuffle_target,
+        take_outcome, within_media_budget,
     };
     use std::sync::atomic::AtomicUsize;
     use std::sync::{Arc, Mutex};
     use thegn_core::media::{LoopMode, MediaCaps, MediaSnapshot, MediaState};
 
     type GatedOperation = (MediaOp, fn(&mut MediaCaps));
+
+    #[test]
+    fn pick_palette_distinguishes_error_from_empty() {
+        assert!(matches!(
+            pick_palette(MediaPick::Playlists(Err("boom".into()))),
+            Err(text) if text.contains("could not list playlists") && text.contains("boom")
+        ));
+        assert!(matches!(
+            pick_palette(MediaPick::Playlists(Ok(Vec::new()))),
+            Err(text) if text == "Media: nothing to pick"
+        ));
+        assert!(matches!(
+            pick_palette(MediaPick::Players(Err("boom".into()))),
+            Err(text) if text.contains("could not list players") && text.contains("boom")
+        ));
+        assert!(matches!(
+            pick_palette(MediaPick::Players(Ok(Vec::new()))),
+            Err(text) if text == "Media: nothing to pick"
+        ));
+
+        let playlists = pick_palette(MediaPick::Playlists(Ok(vec![
+            thegn_core::media::Playlist {
+                id: "playlist-id".into(),
+                name: "Favorites".into(),
+                ..Default::default()
+            },
+        ])))
+        .unwrap();
+        assert_eq!(playlists.len(), 1);
+        assert_eq!(playlists[0].key, "media-playlist:playlist-id");
+
+        let items = pick_palette(MediaPick::Players(Ok(vec!["mpv".into()]))).unwrap();
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].key, "media-player:mpv");
+    }
+
+    #[test]
+    fn latest_mailbox_keeps_only_the_newest_value() {
+        let mailbox = Latest::new();
+        let clone = mailbox.clone();
+        mailbox.put(1);
+        clone.put(2);
+
+        assert_eq!(mailbox.take(), Some(2));
+        assert_eq!(clone.take(), None);
+    }
 
     #[test]
     fn capability_gated_operations_follow_player_caps() {
