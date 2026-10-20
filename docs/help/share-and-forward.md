@@ -27,6 +27,13 @@ The bottom status bar shows a `⇅` chip while anything is
 shared; activating it opens a detail popup listing the shares (the
 `open-shares` action opens the panel section instead).
 
+From the command line, `thegn share stop <port>` tears down a Tailscale share
+and removes its saved record only after teardown is confirmed; on failure it
+exits nonzero and keeps the record so you can retry. A share started by a
+foreground `thegn share start` is stopped by interrupting that command. Use
+`thegn share stop <port> --forget` only to remove the saved record; it does not
+touch the tunnel.
+
 ## Auto port forwards (`[forward]`)
 
 For sandboxed worktrees ([[sandboxing]]), dev-server ports detected
