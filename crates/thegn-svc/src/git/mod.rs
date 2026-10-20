@@ -572,14 +572,23 @@ pub trait GitBackend: thegn_core::seam::Probe + Send + Sync {
         thegn_core::gitrefs::parse_stashes(&out)
     }
 
-    /// The last `n` HEAD reflog entries (the undo planner's feed).
+    /// The last `n` HEAD reflog entries (the undo planner's feed). Disable
+    /// signature display because `log.showSignature` can otherwise prepend
+    /// verifier output to the NUL-framed records.
     fn reflog(&self, loc: &GitLoc, n: usize) -> Result<Vec<ReflogEntry>> {
         let n = n.to_string();
         let out = run(
             loc,
-            &["reflog", "--format=%H%x1f%gd%x1f%ct%x1f%gs", "-n", &n],
+            &[
+                "reflog",
+                "-z",
+                "--no-show-signature",
+                "--format=%H%x00%gd%x00%ct%x00%gs",
+                "-n",
+                &n,
+            ],
         )?;
-        Ok(thegn_core::reflog::parse_reflog(&out))
+        thegn_core::reflog::parse_reflog(&out)
     }
 
     /// Diffstat between two arbitrary refs (`diff_files` with an `A..B`
@@ -2819,6 +2828,46 @@ mod tests {
                 "status",
                 "--porcelain=v1"
             ]
+        );
+    }
+
+    #[test]
+    fn reflog_reads_nul_framed_entries_from_a_real_repo() {
+        let dir = tempfile::tempdir().unwrap();
+        testutil::git_in(dir.path(), &["init", "-q", "-b", "main"]);
+        testutil::git_in(dir.path(), &["config", "log.showSignature", "true"]);
+        std::fs::write(dir.path().join("tracked.txt"), "first\n").unwrap();
+        testutil::git_in(dir.path(), &["add", "--", "tracked.txt"]);
+        testutil::git_in(
+            dir.path(),
+            &["-c", "commit.gpgsign=false", "commit", "-q", "-m", "first"],
+        );
+        std::fs::write(dir.path().join("tracked.txt"), "second\n").unwrap();
+        testutil::git_in(dir.path(), &["add", "--", "tracked.txt"]);
+        testutil::git_in(
+            dir.path(),
+            &["-c", "commit.gpgsign=false", "commit", "-q", "-m", "second"],
+        );
+        let loc = GitLoc::for_worktree(dir.path());
+
+        let entries = super::CliGit.reflog(&loc, 10).unwrap();
+        let head = super::run(&loc, &["rev-parse", "HEAD"]).unwrap();
+        let previous = super::run(&loc, &["rev-parse", "HEAD~1"]).unwrap();
+
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].sha, head.trim());
+        assert_eq!(entries[1].sha, previous.trim());
+        assert!(
+            entries
+                .iter()
+                .all(|entry| { entry.action == thegn_core::reflog::ReflogAction::Commit })
+        );
+        assert_eq!(
+            thegn_core::reflog::plan_undo(&entries, &thegn_core::reflog::OurMarks::default()),
+            thegn_core::reflog::UndoPlan::HardResetTo {
+                sha: previous.trim().to_string(),
+                undoing: "commit: second".to_string(),
+            }
         );
     }
 
