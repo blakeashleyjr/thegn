@@ -1904,10 +1904,7 @@ fn build_report(
             kind: d.kind,
             submodule_conflicts: d.submodule_conflicts.clone(),
             gate_failed: false,
-            driver_refusal: (d.kind == ConflictKind::UnsupportedMergeHistory).then(|| {
-                "branch history contains merge commits; the rebase land strategy only replays linear history: land it with the merge or squash strategy, or linearize the branch"
-                    .to_string()
-            }),
+            driver_refusal: deferral_refusal(d),
         })
         .collect();
     for off in gate_offenders {
@@ -2062,6 +2059,13 @@ fn refusal_summary(paths: &[String], refusals: &BTreeMap<String, String>) -> Opt
             "custom merge driver not run by folds: {}; resolve by hand",
             details.join(", ")
         )
+    })
+}
+
+fn deferral_refusal(deferred: &fold::Deferred) -> Option<String> {
+    (deferred.kind == ConflictKind::UnsupportedMergeHistory).then(|| {
+        "branch history contains merge commits; the rebase land strategy only replays linear history: land it with the merge or squash strategy, or linearize the branch"
+            .to_string()
     })
 }
 
@@ -2837,7 +2841,8 @@ fn attempt_land_admitted(
                 .refusals
                 .lock()
                 .ok()
-                .and_then(|refusals| refusal_summary(&paths, &refusals));
+                .and_then(|refusals| refusal_summary(&paths, &refusals))
+                .or_else(|| deferred.and_then(deferral_refusal));
             return Ok(AttemptOutcome::Conflict {
                 paths,
                 submodule_conflicts,
@@ -3556,6 +3561,7 @@ mod tests {
                 "main",
             ],
         );
+        git(&repo.dir, &["checkout", "-q", "main"]);
 
         let mut c = cfg("");
         c.land_strategy = thegn_core::config::LandStrategy::Rebase;
@@ -3574,6 +3580,41 @@ mod tests {
                 .as_deref()
                 .is_some_and(|reason| reason.contains("merge commits"))
         );
+    }
+
+    #[test]
+    fn rebase_merge_history_attempt_land_is_a_refusal() {
+        let repo = Repo::new("rebase-merge-history-attempt");
+        if !repo.history_supported_or_refused() {
+            return;
+        }
+        repo.feature("feat", "feat.txt", "feature\n");
+        repo.commit("main.txt", "main\n", "main moves");
+        git(&repo.dir, &["checkout", "-q", "feat"]);
+        git(
+            &repo.dir,
+            &[
+                "-c",
+                "commit.gpgsign=false",
+                "merge",
+                "--no-ff",
+                "-q",
+                "-m",
+                "merge main",
+                "main",
+            ],
+        );
+        git(&repo.dir, &["checkout", "-q", "main"]);
+
+        let mut c = cfg("");
+        c.land_strategy = thegn_core::config::LandStrategy::Rebase;
+        match attempt_land(&c, &repo.dir, "feat", &GitLoc::Local(repo.dir.clone())).unwrap() {
+            AttemptOutcome::Conflict {
+                driver_refusal: Some(reason),
+                ..
+            } => assert!(reason.contains("merge commits"), "{reason}"),
+            outcome => panic!("expected typed merge-history refusal, got {outcome:?}"),
+        }
     }
 
     #[test]

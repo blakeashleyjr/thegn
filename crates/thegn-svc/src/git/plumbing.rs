@@ -997,33 +997,13 @@ mod tests {
             ],
         );
         let merge_oid = repo.head();
-        let merge_parents = repo.out(&["rev-list", "--parents", "-n", "1", &merge_oid]);
-        let mut merge_parent_iter = merge_parents.split_ascii_whitespace();
-        assert_eq!(merge_parent_iter.next(), Some(merge_oid.as_str()));
-        let parents = merge_parent_iter.collect::<Vec<_>>().join(" ");
-        assert_eq!(
-            parents.split_ascii_whitespace().collect::<Vec<_>>(),
-            [first_parent.as_str(), side.as_str()]
-        );
-        let date = repo.out(&["show", "-s", "--format=%aI", &merge_oid]);
-        let record = |oid: &str, parents: &str| {
-            [
-                oid,
-                parents,
-                "merge",
-                "author@example.test",
-                &date,
-                "message",
-            ]
-            .join("\0")
-                + "\0"
-        };
-        let parsed =
-            parse_commit_metas(&(record(&root, "") + &record(&merge_oid, &parents))).unwrap();
-
-        assert!(parsed[0].parents.is_empty(), "root commit has no parents");
-        assert_eq!(parsed[1].parents, [first_parent.clone(), side]);
-        assert_eq!(parsed[1].parent, first_parent);
+        let commits = CliGit.commits(&repo.loc(), &root, &merge_oid).unwrap();
+        let merge = commits
+            .iter()
+            .find(|commit| commit.oid == merge_oid)
+            .expect("range includes merge commit");
+        assert_eq!(merge.parents, [first_parent.clone(), side]);
+        assert_eq!(merge.parent, first_parent);
     }
 
     #[test]
