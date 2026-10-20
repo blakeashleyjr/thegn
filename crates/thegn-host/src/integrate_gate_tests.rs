@@ -1020,6 +1020,75 @@ fn posix_shell_gate_only() -> bool {
     thegn_core::sandbox_backend::host_os() != thegn_core::sandbox_backend::HostOs::Windows
 }
 
+fn assert_gate_command_is_error_and_main_is_unchanged(f: &Fixture, command: &str, reuse: bool) {
+    let main_before = git(&f.repo, &["show-ref", "refs/heads/main"]);
+    let mut config = f.config.clone();
+    config.gate_reuse_worktree = reuse;
+    config.gate_command = command.into();
+    assert!(matches!(
+        gate_tip(&f.repo, &f.second, &config).unwrap(),
+        GateVerdict::Error { .. }
+    ));
+    assert_eq!(git(&f.repo, &["show-ref", "refs/heads/main"]), main_before);
+}
+
+#[test]
+fn gate_that_rewrites_the_index_is_a_gate_error() {
+    let f = Fixture::new();
+    if !posix_shell_gate_only() || !f.supported_or_refused() {
+        return;
+    }
+    assert_gate_command_is_error_and_main_is_unchanged(&f, "git read-tree HEAD~1", true);
+}
+
+#[test]
+fn gate_that_detaches_head_elsewhere_is_a_gate_error() {
+    let f = Fixture::new();
+    if !posix_shell_gate_only() || !f.supported_or_refused() {
+        return;
+    }
+    assert_gate_command_is_error_and_main_is_unchanged(&f, "git checkout -q --detach HEAD~1", true);
+}
+
+#[test]
+fn gate_that_checks_out_a_branch_is_a_gate_error() {
+    let f = Fixture::new();
+    if !posix_shell_gate_only() || !f.supported_or_refused() {
+        return;
+    }
+    assert_gate_command_is_error_and_main_is_unchanged(&f, "git checkout -q -B moved HEAD~1", true);
+}
+
+#[test]
+fn gate_that_only_refreshes_the_index_still_passes() {
+    let f = Fixture::new();
+    if !posix_shell_gate_only() || !f.supported_or_refused() {
+        return;
+    }
+    assert!(matches!(
+        gate_tip(
+            &f.repo,
+            &f.second,
+            &MergeQueueConfig {
+                gate_command: "git status --porcelain >/dev/null && git update-index --refresh -q"
+                    .into(),
+                ..f.config.clone()
+            }
+        )
+        .unwrap(),
+        GateVerdict::Passed
+    ));
+}
+
+#[test]
+fn throwaway_gate_that_rewrites_the_index_is_a_gate_error() {
+    let f = Fixture::new();
+    if !posix_shell_gate_only() || !f.supported_or_refused() {
+        return;
+    }
+    assert_gate_command_is_error_and_main_is_unchanged(&f, "git read-tree HEAD~1", false);
+}
+
 #[test]
 fn timeout_is_a_public_hold_and_a_live_group_quarantines_the_reused_lease() {
     if !posix_shell_gate_only() {
