@@ -1340,20 +1340,18 @@ pub fn main_checkout(start: &Path) -> Option<PathBuf> {
             // off-loop: callers are merge-queue / CLI paths already off the loop
             // (this was `util::git_out`, which the lint cannot see through).
             #[expect(clippy::disallowed_methods)]
-            let out = util::git_cmd(start)
-                .args(["worktree", "list", "--porcelain"])
-                .output();
+            let out = util::git_cmd(start).args(util::WORKTREE_LIST_Z).output();
             let Ok(out) = out else {
                 return (None, false); // could not spawn git: transient, never memoised
             };
-            let porc = String::from_utf8_lossy(&out.stdout).trim().to_string();
-            let first = (out.status.success() && !porc.is_empty())
-                .then(|| {
-                    porc.lines()
-                        .find_map(|l| l.strip_prefix("worktree ").map(PathBuf::from))
-                })
-                .flatten();
-            (first, true)
+            if !out.status.success() {
+                return (None, true);
+            }
+            let porc = String::from_utf8_lossy(&out.stdout);
+            let Some(worktrees) = util::parse_worktree_branches(&porc) else {
+                return (None, true);
+            };
+            (worktrees.first().map(|(path, _)| PathBuf::from(path)), true)
         },
     )
 }
@@ -1443,46 +1441,42 @@ pub fn candidate_branches(
     target_branch: &str,
 ) -> Result<Candidates> {
     let (_, history) = CanonicalHistory::worktree_loc(repo_root)?;
-    let porc = util::git_out(repo_root, &["worktree", "list", "--porcelain"])
-        .context("git worktree list")?;
+    let listed_worktrees = util::worktree_branches(repo_root).context("git worktree list")?;
     let main = repo_root.to_string_lossy().to_string();
     let mut branches = Vec::new();
     let mut skipped_dirty = Vec::new();
     let mut worktrees = HashMap::new();
     let mut identities = HashMap::new();
     let mut pending_snapshots = HashSet::new();
-    let mut wt_path = String::new();
-    for line in porc.lines().chain(std::iter::once("")) {
-        if let Some(p) = line.strip_prefix("worktree ") {
-            wt_path = p.to_string();
-        } else if let Some(b) = line.strip_prefix("branch refs/heads/") {
-            let branch = b.to_string();
-            if wt_path != main && branch != target_branch {
-                let loc = GitLoc::Local(PathBuf::from(&wt_path));
-                let dirty = CliGit
-                    .is_dirty(&loc)
-                    .context("candidate dirty-state lookup failed")?;
-                if dirty && !cfg.snapshot_dirty {
-                    skipped_dirty.push(branch.clone());
-                    continue;
-                }
-                if dirty {
-                    pending_snapshots.insert(branch.clone());
-                }
-                let tip = if cfg.snapshot_dirty {
-                    let identity =
-                        candidates::LocalIdentity::read(repo_root, Path::new(&wt_path), &branch)?;
-                    let tip = identity.tip.clone();
-                    identities.insert(branch.clone(), identity);
-                    tip
-                } else {
-                    // Existing snapshot-disabled discovery stays a read-only
-                    // local tip lookup; it never needs snapshot-only authority.
-                    CliGit.rev_parse(&loc, "HEAD")?
-                };
-                worktrees.insert(branch.clone(), wt_path.clone());
-                branches.push(Branch { name: branch, tip });
+    for (wt_path, branch) in listed_worktrees
+        .into_iter()
+        .filter_map(|(path, branch)| branch.map(|branch| (path, branch)))
+    {
+        if wt_path != main && branch != target_branch {
+            let loc = GitLoc::Local(PathBuf::from(&wt_path));
+            let dirty = CliGit
+                .is_dirty(&loc)
+                .context("candidate dirty-state lookup failed")?;
+            if dirty && !cfg.snapshot_dirty {
+                skipped_dirty.push(branch.clone());
+                continue;
             }
+            if dirty {
+                pending_snapshots.insert(branch.clone());
+            }
+            let tip = if cfg.snapshot_dirty {
+                let identity =
+                    candidates::LocalIdentity::read(repo_root, Path::new(&wt_path), &branch)?;
+                let tip = identity.tip.clone();
+                identities.insert(branch.clone(), identity);
+                tip
+            } else {
+                // Existing snapshot-disabled discovery stays a read-only
+                // local tip lookup; it never needs snapshot-only authority.
+                CliGit.rev_parse(&loc, "HEAD")?
+            };
+            worktrees.insert(branch.clone(), wt_path.clone());
+            branches.push(Branch { name: branch, tip });
         }
     }
     history.revalidate()?;

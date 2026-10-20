@@ -572,14 +572,23 @@ pub trait GitBackend: thegn_core::seam::Probe + Send + Sync {
         thegn_core::gitrefs::parse_stashes(&out)
     }
 
-    /// The last `n` HEAD reflog entries (the undo planner's feed).
+    /// The last `n` HEAD reflog entries (the undo planner's feed). Disable
+    /// signature display because `log.showSignature` can otherwise prepend
+    /// verifier output to the NUL-framed records.
     fn reflog(&self, loc: &GitLoc, n: usize) -> Result<Vec<ReflogEntry>> {
         let n = n.to_string();
         let out = run(
             loc,
-            &["reflog", "--format=%H%x1f%gd%x1f%ct%x1f%gs", "-n", &n],
+            &[
+                "reflog",
+                "-z",
+                "--no-show-signature",
+                "--format=%H%x00%gd%x00%ct%x00%gs",
+                "-n",
+                &n,
+            ],
         )?;
-        Ok(thegn_core::reflog::parse_reflog(&out))
+        thegn_core::reflog::parse_reflog(&out)
     }
 
     /// Diffstat between two arbitrary refs (`diff_files` with an `A..B`
@@ -2091,6 +2100,41 @@ fn require_mutation_lock_within(
     })
 }
 
+/// Slice b moves multi-step operations onto this transaction; nested `run_w`
+/// calls reuse its thread-local lock grant.
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "THE-372 slice b wires nuke/stash/undo onto it")
+)]
+pub(crate) fn begin_mutation_txn(
+    loc: &GitLoc,
+    args: &[&str],
+    wait: Duration,
+) -> Result<Option<thegn_core::util::MutationTxn>> {
+    if loc.is_remote() {
+        return Ok(None);
+    }
+    let path = loc.path();
+    let worktree = Path::new(&path);
+    thegn_core::util::begin_git_mutation(worktree, wait)
+        .map(Some)
+        .map_err(|error| {
+            tracing::warn!(
+                target: "thegn::git",
+                worktree = %worktree.display(),
+                git_args = %args.join(" "),
+                error = %error,
+                "could not acquire required git-mutation lock"
+            );
+            anyhow::anyhow!(
+                "refusing git {}: repository mutation lock is unavailable for {}: {} (see thegn log)",
+                args.join(" "),
+                worktree.display(),
+                error
+            )
+        })
+}
+
 fn parse_commit_times(out: &str) -> Result<Vec<i64>> {
     out.lines()
         .filter(|line| !line.trim().is_empty())
@@ -2693,6 +2737,65 @@ mod tests {
     }
 
     #[test]
+    fn mutation_txn_lets_nested_run_w_proceed() {
+        let dir = tempfile::tempdir().unwrap();
+        testutil::git_in(dir.path(), &["init", "-q", "-b", "main"]);
+        std::fs::write(dir.path().join("tracked.txt"), "before\n").unwrap();
+        testutil::git_in(dir.path(), &["add", "--", "tracked.txt"]);
+        testutil::git_in(
+            dir.path(),
+            &[
+                "-c",
+                "commit.gpgsign=false",
+                "commit",
+                "-q",
+                "-m",
+                "initial",
+            ],
+        );
+        let loc = GitLoc::for_worktree(dir.path());
+        let worker_loc = loc.clone();
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let started = std::time::Instant::now();
+            let txn = super::begin_mutation_txn(
+                &worker_loc,
+                &["branch", "inside-txn"],
+                Duration::from_secs(1),
+            )
+            .unwrap()
+            .unwrap();
+            let result = super::run_w(&worker_loc, &[], &["branch", "inside-txn"]);
+            let elapsed = started.elapsed();
+            drop(txn);
+            sender.send((elapsed, result.map(|_| ()))).unwrap();
+        });
+
+        let (elapsed, result) = receiver
+            .recv_timeout(Duration::from_secs(5))
+            .expect("nested run_w must not wait for its own transaction lock");
+        result.unwrap();
+        assert!(elapsed < Duration::from_secs(5));
+        assert!(
+            !super::run(&loc, &["branch", "--list", "inside-txn"])
+                .unwrap()
+                .is_empty(),
+            "the nested write must create the branch"
+        );
+        worker.join().unwrap();
+    }
+
+    #[test]
+    fn mutation_txn_is_none_for_remote_locations() {
+        let loc = GitLoc::provider(vec!["sh".into()], "/remote/repo");
+        assert!(
+            super::begin_mutation_txn(&loc, &["branch", "x"], Duration::ZERO)
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
     fn expired_dirty_probe_is_an_error_not_clean() {
         assert!(super::dirty_or_expired(true, true).unwrap());
         assert!(super::dirty_or_expired(false, true).is_err());
@@ -2725,6 +2828,46 @@ mod tests {
                 "status",
                 "--porcelain=v1"
             ]
+        );
+    }
+
+    #[test]
+    fn reflog_reads_nul_framed_entries_from_a_real_repo() {
+        let dir = tempfile::tempdir().unwrap();
+        testutil::git_in(dir.path(), &["init", "-q", "-b", "main"]);
+        testutil::git_in(dir.path(), &["config", "log.showSignature", "true"]);
+        std::fs::write(dir.path().join("tracked.txt"), "first\n").unwrap();
+        testutil::git_in(dir.path(), &["add", "--", "tracked.txt"]);
+        testutil::git_in(
+            dir.path(),
+            &["-c", "commit.gpgsign=false", "commit", "-q", "-m", "first"],
+        );
+        std::fs::write(dir.path().join("tracked.txt"), "second\n").unwrap();
+        testutil::git_in(dir.path(), &["add", "--", "tracked.txt"]);
+        testutil::git_in(
+            dir.path(),
+            &["-c", "commit.gpgsign=false", "commit", "-q", "-m", "second"],
+        );
+        let loc = GitLoc::for_worktree(dir.path());
+
+        let entries = super::CliGit.reflog(&loc, 10).unwrap();
+        let head = super::run(&loc, &["rev-parse", "HEAD"]).unwrap();
+        let previous = super::run(&loc, &["rev-parse", "HEAD~1"]).unwrap();
+
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].sha, head.trim());
+        assert_eq!(entries[1].sha, previous.trim());
+        assert!(
+            entries
+                .iter()
+                .all(|entry| { entry.action == thegn_core::reflog::ReflogAction::Commit })
+        );
+        assert_eq!(
+            thegn_core::reflog::plan_undo(&entries, &thegn_core::reflog::OurMarks::default()),
+            thegn_core::reflog::UndoPlan::HardResetTo {
+                sha: previous.trim().to_string(),
+                undoing: "commit: second".to_string(),
+            }
         );
     }
 

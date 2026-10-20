@@ -20,6 +20,8 @@ use thegn_core::config::DataMode;
 use thegn_core::placement::{Placement, SshPlacement};
 use thegn_core::projection::ProjectionSpec;
 
+mod manifest;
+
 /// The result of projecting a worktree.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Mounted {
@@ -99,9 +101,7 @@ fn mount_sshfs(spec: &ProjectionSpec) -> Result<Mounted> {
     if !s.extra_args.is_empty() {
         bail!("sshfs projection does not support ssh extra_args");
     }
-    if let Err(error) = std::fs::create_dir_all(&spec.mountpoint) {
-        tracing::debug!(%error, path = %spec.mountpoint, "could not create sshfs projection mountpoint");
-    }
+    manifest::claim_or_verify(spec)?;
     let argv = sshfs_mount_argv_for(s, &spec.remote_dir, &spec.mountpoint);
     run(&argv)?;
     Ok(Mounted {
@@ -121,13 +121,12 @@ fn sshfs_mount_argv_for(s: &SshPlacement, remote: &str, mountpoint: &str) -> Vec
 }
 
 fn unmount_sshfs(spec: &ProjectionSpec) -> Result<()> {
-    let candidates = spec.legacy_mountpoints();
-    let slug_legacy_path = match &spec.placement {
-        Placement::Ssh(ssh) => {
-            thegn_core::projection::legacy_mountpoint(&ssh.host, &spec.remote_dir)
-        }
-        _ => None,
+    let Placement::Ssh(ssh) = &spec.placement else {
+        bail!("sshfs projection requires an ssh placement");
     };
+    manifest::verify(spec)?;
+    let candidates = spec.legacy_mountpoints();
+    let slug_legacy_path = thegn_core::projection::legacy_mountpoint(&ssh.host, &spec.remote_dir);
     let legacy_paths: Vec<_> = candidates
         .into_iter()
         .filter(|path| std::fs::symlink_metadata(path).is_ok_and(|metadata| metadata.is_dir()))
@@ -387,9 +386,7 @@ fn mount_sync(spec: &ProjectionSpec) -> Result<Mounted> {
     let Placement::Ssh(s) = &spec.placement else {
         bail!("sync projection requires an ssh placement");
     };
-    if let Err(error) = std::fs::create_dir_all(&spec.mountpoint) {
-        tracing::debug!(%error, path = %spec.mountpoint, "could not create sync projection mountpoint");
-    }
+    manifest::claim_or_verify(spec)?;
     let mut argv = vec!["rsync".into(), "-az".into(), "--delete".into()];
     argv.extend(rsync_ssh_opt(s));
     argv.push(rsync_remote(s, &spec.remote_dir));
@@ -406,6 +403,7 @@ fn push_sync(spec: &ProjectionSpec) -> Result<()> {
     let Placement::Ssh(s) = &spec.placement else {
         bail!("sync projection requires an ssh placement");
     };
+    manifest::verify(spec)?;
     let mut argv = vec!["rsync".into(), "-az".into()];
     argv.extend(rsync_ssh_opt(s));
     argv.push(local_dir(&spec.mountpoint));

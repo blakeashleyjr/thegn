@@ -106,13 +106,10 @@ jobs:
   # Draft so a maintainer writes notes by hand before publishing (RELEASING.md
   # step 4); no `changelog:` input — notes are pasted manually.
   #
-  # CAUTION: create-gh-release-action deletes any existing release for the tag
-  # before recreating it. Re-dispatching this workflow for a tag whose release
-  # already exists (even a published one) wipes that release — notes included —
-  # and replaces it with an empty draft. To retry a partially failed matrix,
-  # use "Re-run failed jobs" on the original run instead: create-release is not
-  # re-run, the draft and its assets survive, and the upload's `--clobber`
-  # makes the retried leg safe.
+  # Re-dispatching a build resumes an existing draft without changing its
+  # notes or assets, and creates a draft only when the tag has no release.
+  # A published release refuses the build and is never deleted. The upload
+  # legs use `--clobber` for assets they retry; see RELEASING.md before reruns.
   create-release:
     if: github.event_name == 'push' || inputs.operation == 'build'
     needs: admit
@@ -120,15 +117,39 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
-        with:
-          ref: refs/tags/${{ needs.admit.outputs.tag }}
-      - uses: taiki-e/create-gh-release-action@eba8ea96c86cca8a37f1b56e94b4d13301fba651 # v1.11.0
-        with:
-          # Prerelease tags (e.g. v0.1.0-alpha.1) are auto-marked prerelease.
-          draft: true
-          ref: refs/tags/${{ needs.admit.outputs.tag }}
-          token: ${{ secrets.GITHUB_TOKEN }}
+      - name: Create the draft release only if absent
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ needs.admit.outputs.tag }}
+        run: |
+          set -euo pipefail
+          rows="$(gh api --paginate "repos/$GH_REPO/releases?per_page=100" \
+            --jq '.[] | [.tag_name, (.draft | tostring)] | @tsv')"
+          matches="$(printf '%s\n' "$rows" | awk -F '\t' -v tag="$TAG" '$1 == tag')"
+          if [ -n "$matches" ]; then
+            count="$(printf '%s\n' "$matches" | awk 'END {print NR}')"
+          else
+            count=0
+          fi
+          if [ "$count" -eq 0 ]; then
+            create_args=("$TAG" --draft --verify-tag --title "$TAG" --notes "")
+            if [[ "$TAG" == *-* ]]; then
+              create_args+=(--prerelease)
+            fi
+            gh release create "${create_args[@]}"
+          elif [ "$count" -gt 1 ]; then
+            echo "::error::found $count releases for tag $TAG; refusing to choose one"
+            exit 1
+          else
+            draft="$(printf '%s\n' "$matches" | awk -F '\t' 'NR == 1 {print $2}')"
+            if [ "$draft" = true ]; then
+              echo "::notice::resuming the existing draft release for $TAG"
+            else
+              echo "::error::release $TAG is already published; refusing to recreate it (see RELEASING.md)"
+              exit 1
+            fi
+          fi
   upload:
     if: github.event_name == 'push' || inputs.operation == 'build'
     name: ${{ matrix.target }}
@@ -474,6 +495,8 @@ jobs:
             || missing+=("HOMEBREW_TAP_REPOSITORY=<owner>/homebrew-tap")
           [ -n "$TAP_DEPLOY_KEY" ] || missing+=("HOMEBREW_TAP_DEPLOY_KEY")
           [ -n "$AUR_DEPLOY_KEY" ] || missing+=("AUR_DEPLOY_KEY")
+          grep -q '^aur\.archlinux\.org ' "$GITHUB_WORKSPACE/.github/known_hosts" \
+            || missing+=("an aur.archlinux.org host key in .github/known_hosts")
           if [ "${#missing[@]}" -ne 0 ]; then
             echo "ready=false" >> "$GITHUB_OUTPUT"
             echo "::warning title=External publication pending::Nothing was pushed; missing: ${missing[*]}"
@@ -482,7 +505,9 @@ jobs:
             checklist+=" (4) configure the package-publication GitHub environment"
             checklist+=" with a required reviewer and both key secrets;"
             checklist+=" (5) set HOMEBREW_TAP_REPOSITORY; (6) rehearse a local tap and makepkg;"
-            checklist+=" (7) set PACKAGE_PUBLICATION_ENABLED=true."
+            checklist+=" (7) commit the AUR host key to .github/known_hosts after checking"
+            checklist+=" it against the AUR's published fingerprints with ssh-keygen -lf;"
+            checklist+=" (8) set PACKAGE_PUBLICATION_ENABLED=true."
             echo "::warning::$checklist"
             exit 0
           fi
@@ -521,8 +546,13 @@ jobs:
           TAP_REPOSITORY: ${{ vars.HOMEBREW_TAP_REPOSITORY }}
         run: |
           set -euo pipefail
-          tap_ssh="ssh -i $PUBLISH_ROOT/keys/homebrew -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new"
-          aur_ssh="ssh -i $PUBLISH_ROOT/keys/aur -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new"
+          known_hosts="$GITHUB_WORKSPACE/.github/known_hosts"
+          ssh_options="-o UserKnownHostsFile=\"$known_hosts\""
+          ssh_options+=" -o GlobalKnownHostsFile=/dev/null"
+          ssh_options+=" -o StrictHostKeyChecking=yes"
+          ssh_options+=" -o HostKeyAlgorithms=ssh-ed25519"
+          tap_ssh="ssh -i $PUBLISH_ROOT/keys/homebrew -o IdentitiesOnly=yes $ssh_options"
+          aur_ssh="ssh -i $PUBLISH_ROOT/keys/aur -o IdentitiesOnly=yes $ssh_options"
 
           GIT_SSH_COMMAND="$tap_ssh" git clone \
             "git@github.com:$TAP_REPOSITORY.git" "$PUBLISH_ROOT/tap"

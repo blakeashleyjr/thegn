@@ -610,6 +610,8 @@ pub enum RefusalClass {
     HostnamePolicy,
     /// A local mount source could not be resolved to a stable host path.
     MountUnresolvable,
+    /// A tunnel-only profile was requested but thegn cannot enforce that the tunnel is the only route.
+    TunnelUnenforced,
 }
 
 /// Structured, safe context for a refused sandbox launch.
@@ -760,6 +762,7 @@ fn launchable(spec: &SandboxSpec) -> Result<std::borrow::Cow<'_, SandboxSpec>, E
     if let Some(message) = hostname_policy_refusal_with(HOSTNAME_RULES, spec) {
         return Err(refusal(spec, RefusalClass::HostnamePolicy, None, message));
     }
+    tunnel_admission(spec)?;
     let mut view = if !spec.backend.is_oci() && spec.compose.is_some() {
         let mut owned = spec.clone();
         owned.compose = None;
@@ -1029,6 +1032,9 @@ pub struct VpnSpec {
     pub sidecar_image: Option<String>,
     /// Node/peer name in the overlay (defaults to the container name).
     pub hostname: String,
+    /// The profile asked for the tunnel to be the ONLY route (`sealed-tunnel`); thegn cannot enforce
+    /// that yet, so launch admission refuses such a spec.
+    pub tunnel_only: bool,
     /// The selected provider's configuration (still carrying secrets-refs).
     pub params: VpnParams,
 }
@@ -1051,7 +1057,8 @@ pub enum VpnParams {
 ///
 /// Returns `None` when no provider is configured, or when the active profile
 /// refuses a tunnel (plain `sealed`: a tunnel would contradict its no-network /
-/// no-caps contract — the user is told to use `sealed-tunnel` or `hardened`).
+/// no-caps contract). A `sealed-tunnel` request is recorded as tunnel-only and
+/// refused at launch admission until thegn can enforce an exclusive tunnel route.
 pub fn build_vpn_spec(cfg: &VpnConfig, name: &str, profile: SandboxProfile) -> Option<VpnSpec> {
     if !cfg.is_enabled() {
         return None;
@@ -1093,8 +1100,23 @@ pub fn build_vpn_spec(cfg: &VpnConfig, name: &str, profile: SandboxProfile) -> O
             (!t.is_empty()).then(|| t.to_string())
         },
         hostname,
+        tunnel_only: profile == SandboxProfile::SealedTunnel,
         params,
     })
+}
+
+/// Refuse a tunnel-only VPN request until the runtime can enforce that no
+/// direct egress route exists beside the VPN tunnel.
+pub fn tunnel_admission(spec: &SandboxSpec) -> Result<(), EnterError> {
+    if spec.vpn.as_ref().is_some_and(|vpn| vpn.tunnel_only) {
+        return Err(refusal(
+            spec,
+            RefusalClass::TunnelUnenforced,
+            None,
+            "sandbox profile 'sealed-tunnel' promises the VPN tunnel is the only network route, but thegn cannot enforce a tunnel-only datapath yet (direct egress would remain possible beside the sidecar or proxy); refusing to launch. Use profile 'hardened' with [sandbox.vpn] for a tunnel that is not exclusive, or 'sealed' for no network.".into(),
+        ));
+    }
+    Ok(())
 }
 
 /// Build the sandbox spec for a worktree (described by its `GitLoc`), or `None`
@@ -3240,10 +3262,21 @@ fn backend_enter_argv_with_env(
                 match util::which_path("rm").and_then(|rm| systemd_env_cleanup_prop(&rm, &envfile))
                 {
                     Some(property) => v.extend(["-p".into(), property]),
-                    None => tracing::debug!(
-                        target: "thegn::sandbox",
-                        "skipping systemd secret env-file cleanup property; path is unavailable or requires systemd escaping"
-                    ),
+                    None => {
+                        if let Err(error) = std::fs::remove_file(&envfile) {
+                            tracing::warn!(
+                                target: "thegn::sandbox",
+                                %error,
+                                "unable to remove systemd secret env file after cleanup property refusal"
+                            );
+                        }
+                        return Err(refusal(
+                            spec,
+                            RefusalClass::SystemdMountPath,
+                            Some(envfile.display().to_string()),
+                            "the systemd secret env file path cannot be expressed in an ExecStopPost cleanup (it contains $, % , ; or a control character, or rm was not found as a plain absolute path); refusing to launch rather than leave the secret file behind".into(),
+                        ));
+                    }
                 }
             } else if !secret_env.is_empty() {
                 // Never put host-sourced secrets back on argv if the protected
@@ -3449,15 +3482,25 @@ fn systemd_env_cleanup_prop(rm: &str, path: &std::path::Path) -> Option<String> 
         return None;
     }
     let path = path.to_str()?;
-    let unsafe_char = |value: &str| {
-        value
+    let rm_is_plain = rm
+        .chars()
+        .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '/' | '.' | '_' | '+' | '-'));
+    if !rm_is_plain
+        || path
             .chars()
-            .any(|ch| ch.is_whitespace() || matches!(ch, '"' | '\'' | '\\' | '$' | '%' | ';'))
-    };
-    if unsafe_char(rm) || unsafe_char(path) {
+            .any(|ch| ch.is_control() || matches!(ch, '$' | '%' | ';'))
+    {
         return None;
     }
-    Some(format!("ExecStopPost=-+{rm} -f -- {path}"))
+    let path_is_plain = path
+        .chars()
+        .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '/' | '.' | '_' | '+' | '-'));
+    if path_is_plain {
+        Some(format!("ExecStopPost=-+{rm} -f -- {path}"))
+    } else {
+        let escaped = path.replace('\\', "\\\\").replace('"', "\\\"");
+        Some(format!("ExecStopPost=-+{rm} -f -- \"{escaped}\""))
+    }
 }
 
 /// Remove secret env-file residue older than this bound. A crash can therefore

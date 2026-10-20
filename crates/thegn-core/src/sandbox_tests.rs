@@ -114,6 +114,48 @@ fn build_vpn_spec_sealed_refuses_but_sealed_tunnel_attaches() {
 }
 
 #[test]
+fn tunnel_only_profiles_refuse_only_when_vpn_is_configured() {
+    let cfg = vpn_cfg(VpnProviderKind::Tailscale);
+    let tunnel = build_vpn_spec(&cfg, "wt", SandboxProfile::SealedTunnel).unwrap();
+    assert!(tunnel.tunnel_only);
+    let hardened = build_vpn_spec(&cfg, "wt", SandboxProfile::Hardened).unwrap();
+    assert!(!hardened.tunnel_only);
+
+    for profile in [
+        SandboxProfile::Open,
+        SandboxProfile::Hardened,
+        SandboxProfile::Sealed,
+        SandboxProfile::SealedTunnel,
+    ] {
+        for vpn_configured in [false, true] {
+            let mut sandbox = spec(Backend::Podman);
+            sandbox.vpn = if vpn_configured {
+                build_vpn_spec(&cfg, "wt", profile)
+            } else {
+                None
+            };
+            let result = enter_argv(&sandbox, "sh");
+            if profile == SandboxProfile::SealedTunnel && vpn_configured {
+                match result {
+                    Err(EnterError::Refused(refusal)) => {
+                        assert_eq!(refusal.class, RefusalClass::TunnelUnenforced);
+                        assert!(refusal.message.contains("sealed-tunnel"));
+                        assert!(refusal.message.contains("hardened"));
+                    }
+                    other => panic!("expected tunnel-only refusal, got {other:?}"),
+                }
+            } else {
+                assert!(!matches!(
+                    result,
+                    Err(EnterError::Refused(refusal))
+                        if refusal.class == RefusalClass::TunnelUnenforced
+                ));
+            }
+        }
+    }
+}
+
+#[test]
 fn build_vpn_spec_maps_each_provider_to_its_params() {
     for provider in [
         VpnProviderKind::Tailscale,
@@ -631,6 +673,7 @@ fn refusal_constructor_preserves_each_class_and_field() {
         RefusalClass::ComposeServiceMissing,
         RefusalClass::HostnamePolicy,
         RefusalClass::MountUnresolvable,
+        RefusalClass::TunnelUnenforced,
     ] {
         let error = refusal(
             &spec,
@@ -2380,7 +2423,79 @@ fn systemd_cleanup_property_rejects_systemd_expansion_and_quoting_chars() {
     }
     assert!(systemd_env_cleanup_prop("bin/rm", path).is_none());
     assert!(systemd_env_cleanup_prop("/bin/rm", std::path::Path::new("state/name.env")).is_none());
-    assert!(systemd_env_cleanup_prop("/bin/rm", std::path::Path::new("/state/a b.env")).is_none());
+    assert_eq!(
+        systemd_env_cleanup_prop("/bin/rm", std::path::Path::new("/state/a b.env")).as_deref(),
+        Some("ExecStopPost=-+/bin/rm -f -- \"/state/a b.env\"")
+    );
+}
+
+#[test]
+fn systemd_cleanup_property_quotes_and_escapes_paths() {
+    for (path, expected) in [
+        (
+            "/state/it's.env",
+            "ExecStopPost=-+/bin/rm -f -- \"/state/it's.env\"",
+        ),
+        (
+            "/state/q\"x.env",
+            "ExecStopPost=-+/bin/rm -f -- \"/state/q\\\"x.env\"",
+        ),
+        (
+            "/state/b\\x.env",
+            "ExecStopPost=-+/bin/rm -f -- \"/state/b\\\\x.env\"",
+        ),
+    ] {
+        assert_eq!(
+            systemd_env_cleanup_prop("/bin/rm", std::path::Path::new(path)).as_deref(),
+            Some(expected),
+            "path: {path}"
+        );
+    }
+    for path in [
+        "/state/$HOME.env",
+        "/state/100%.env",
+        "/state/a;b.env",
+        "/state/line\nbreak.env",
+    ] {
+        assert!(
+            systemd_env_cleanup_prop("/bin/rm", std::path::Path::new(path)).is_none(),
+            "unsafe path accepted: {path:?}"
+        );
+    }
+}
+
+#[test]
+fn systemd_cleanup_refusal_removes_env_file() {
+    let temp = tempfile::tempdir().unwrap();
+    let state = temp.path().join("st%ate");
+    std::fs::create_dir(&state).unwrap();
+    let state_home = state.to_string_lossy().into_owned();
+    let _env = crate::testenv::EnvGuard::mutate_pairs(&[
+        ("API_KEY", Some("sk_secret")),
+        ("THEGN_SANDBOX", None),
+        ("XDG_STATE_HOME", Some(&state_home)),
+    ]);
+    let mut s = spec(Backend::Systemd);
+    s.image = None;
+    s.name = "thegn-test-envfile-systemd-refusal".into();
+    s.env = vec![("API_KEY".into(), "sk_secret".into())];
+
+    assert!(matches!(
+        backend_enter_argv(&s, "exec true"),
+        Err(EnterError::Refused(r)) if r.class == RefusalClass::SystemdMountPath
+    ));
+    let env_dir = state.join("thegn/sandbox-env");
+    let entries = std::fs::read_dir(env_dir)
+        .unwrap()
+        .collect::<std::io::Result<Vec<_>>>()
+        .unwrap();
+    assert!(
+        entries.iter().all(|entry| entry
+            .path()
+            .extension()
+            .is_none_or(|extension| extension != "env")),
+        "refused launch left a secret env file behind"
+    );
 }
 
 #[test]

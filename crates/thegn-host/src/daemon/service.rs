@@ -547,6 +547,29 @@ fn map_dispatch_status_error(error: anyhow::Error) -> ControlError {
     ControlError::Internal(error)
 }
 
+enum BindAction {
+    Proceed,
+    Refuse(String),
+}
+
+fn bind_failure_action(row: i64, stage_launch: bool, outcome: Result<bool, String>) -> BindAction {
+    match outcome {
+        Ok(false) => BindAction::Proceed,
+        Ok(true) => BindAction::Refuse(format!("dispatch row {row} is no longer launchable")),
+        Err(error) if stage_launch => BindAction::Refuse(format!(
+            "could not bind dispatch row {row} to the new worker: {error}"
+        )),
+        Err(_) => BindAction::Proceed,
+    }
+}
+
+fn dispatch_row_of(spec: &OpenSpec) -> Option<Result<i64, String>> {
+    spec.env
+        .iter()
+        .find(|(key, _)| key == thegn_core::issue::DISPATCH_ROW_ENV)
+        .map(|(_, value)| value.parse::<i64>().map_err(|error| error.to_string()))
+}
+
 impl DaemonService {
     /// Run `f` against the shared DB on a blocking thread.
     pub(crate) async fn with_db<T, F>(&self, f: F) -> ControlResult<T>
@@ -1059,38 +1082,63 @@ impl ControlApi for DaemonService {
             // session existed; bind the fresh session id to it NOW, in the
             // daemon, so the row has an identity even when no UI is attached
             // at exit. One write per launch, off the runtime threads.
-            if let Some(row) = spec
-                .env
-                .iter()
-                .find(|(k, _)| k == thegn_core::issue::DISPATCH_ROW_ENV)
-                .and_then(|(_, v)| v.parse::<i64>().ok())
-            {
-                let sid = id.clone();
-                match self
-                    .with_db(move |db| {
-                        if db.bind_dispatch_session(row, &sid)? {
-                            return Ok(false);
-                        }
-                        // Tracker rows have no stage and retain their historic
-                        // best-effort binding behaviour. A pipeline row must
-                        // refuse a second or late worker once binding fails.
-                        let stored = db.get_dispatch(row)?;
-                        Ok(stored.is_none_or(|dispatch| dispatch.stage.is_some()))
-                    })
-                    .await
-                {
-                    Ok(true) => {
+            let stage_launch = spec
+                .agent
+                .as_ref()
+                .is_some_and(|agent| agent.stage.is_some());
+            if let Some(row_result) = dispatch_row_of(&spec) {
+                let row = match row_result {
+                    Ok(row) => Some(row),
+                    Err(_) if !stage_launch => {
+                        // Tracker launches retain their historical silent skip for malformed ids.
+                        None
+                    }
+                    Err(_) => {
                         let detail = match self.kill(&id).await {
                             Ok(()) => "stop requested for the unbound worker".to_string(),
-                            Err(error) => format!("stopping the unbound worker failed: {error}"),
+                            Err(error) => {
+                                format!("stopping the unbound worker failed: {error}")
+                            }
                         };
                         return Err(ControlError::Conflict(format!(
-                            "dispatch row {row} is no longer launchable; {detail}"
+                            "stage launch names an invalid dispatch row; {detail}"
                         )));
                     }
-                    Ok(false) => {}
-                    Err(e) => {
-                        tracing::warn!(target: "thegn::dispatch", "bind dispatch row {row}: {e}");
+                };
+                if let Some(row) = row {
+                    let sid = id.clone();
+                    let bind_result = self
+                        .with_db(move |db| {
+                            if db.bind_dispatch_session(row, &sid)? {
+                                return Ok(false);
+                            }
+                            // Tracker rows have no stage and retain their historic
+                            // best-effort binding behaviour. A pipeline row must
+                            // refuse a second or late worker once binding fails.
+                            let stored = db.get_dispatch(row)?;
+                            Ok(stored.is_none_or(|dispatch| dispatch.stage.is_some()))
+                        })
+                        .await;
+                    let bind_error = bind_result.as_ref().err().map(ToString::to_string);
+                    let action = bind_failure_action(
+                        row,
+                        stage_launch,
+                        bind_result.map_err(|error| error.to_string()),
+                    );
+                    if let Some(error) = bind_error {
+                        tracing::warn!(target: "thegn::dispatch", "bind dispatch row {row}: {error}");
+                    }
+                    match action {
+                        BindAction::Refuse(message) => {
+                            let detail = match self.kill(&id).await {
+                                Ok(()) => "stop requested for the unbound worker".to_string(),
+                                Err(error) => {
+                                    format!("stopping the unbound worker failed: {error}")
+                                }
+                            };
+                            return Err(ControlError::Conflict(format!("{message}; {detail}")));
+                        }
+                        BindAction::Proceed => {}
                     }
                 }
             }
@@ -3559,6 +3607,63 @@ mod tests {
         .expect("insert dispatch")
     }
 
+    #[test]
+    fn dispatch_bind_failure_action_table() {
+        for (stage_launch, outcome, expected) in [
+            (false, Ok(false), None),
+            (
+                false,
+                Ok(true),
+                Some("dispatch row 12 is no longer launchable"),
+            ),
+            (false, Err("db unavailable".to_string()), None),
+            (true, Ok(false), None),
+            (
+                true,
+                Ok(true),
+                Some("dispatch row 12 is no longer launchable"),
+            ),
+            (
+                true,
+                Err("db unavailable".to_string()),
+                Some("could not bind dispatch row 12 to the new worker: db unavailable"),
+            ),
+        ] {
+            match (bind_failure_action(12, stage_launch, outcome), expected) {
+                (BindAction::Proceed, None) => {}
+                (BindAction::Refuse(actual), Some(expected)) => assert_eq!(actual, expected),
+                (BindAction::Proceed, Some(expected)) => {
+                    panic!("expected refusal {expected:?}, got Proceed")
+                }
+                (BindAction::Refuse(actual), None) => {
+                    panic!("expected Proceed, got refusal {actual:?}")
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn dispatch_bind_row_env_parsing() {
+        let make_spec = |env: Vec<(String, String)>| OpenSpec {
+            env,
+            ..Default::default()
+        };
+        let absent = make_spec(Vec::new());
+        assert_eq!(dispatch_row_of(&absent), None);
+
+        let valid = make_spec(vec![(
+            thegn_core::issue::DISPATCH_ROW_ENV.into(),
+            "12".into(),
+        )]);
+        assert_eq!(dispatch_row_of(&valid), Some(Ok(12)));
+
+        let invalid = make_spec(vec![(
+            thegn_core::issue::DISPATCH_ROW_ENV.into(),
+            "x".into(),
+        )]);
+        assert!(matches!(dispatch_row_of(&invalid), Some(Err(_))));
+    }
+
     async fn wait_for_live_sessions(
         svc: &DaemonService,
         expected: impl Fn(&[SessionInfo]) -> bool,
@@ -4491,6 +4596,9 @@ mod tests {
             child.artifact_path.as_deref(),
             Some(".thegn/pipeline/architect/1.md")
         );
+        svc.dispatch_set_status(child.id, St::Running)
+            .await
+            .unwrap();
         svc.dispatch_set_status(child.id, St::Done).await.unwrap();
         assert!(matches!(
             svc.dispatch_set_status(child.id, St::Running).await,
@@ -5585,11 +5693,10 @@ mod tests {
             .insert("s-limit".into(), tomb, now_ms());
 
         // Drive both synthetic exits through the observer's real path.
-        let attempts = std::sync::Mutex::new(std::collections::HashMap::new());
-        pipeline_retry::handle_exit(&svc, "s-retry", 1, &attempts, None)
+        pipeline_retry::handle_exit(&svc, "s-retry", 1, None)
             .await
             .expect("transport exit handled");
-        pipeline_retry::handle_exit(&svc, "s-limit", 1, &attempts, None)
+        pipeline_retry::handle_exit(&svc, "s-limit", 1, None)
             .await
             .expect("limit exit handled");
 
@@ -5680,8 +5787,7 @@ mod tests {
             })
         };
 
-        let attempts = std::sync::Mutex::new(std::collections::HashMap::new());
-        pipeline_retry::handle_exit(&svc, "s-race", 1, &attempts, None)
+        pipeline_retry::handle_exit(&svc, "s-race", 1, None)
             .await
             .expect("transport exit handled");
         flipper.await.unwrap();
@@ -5691,9 +5797,14 @@ mod tests {
             db.get_dispatch(row_id).unwrap().unwrap()
         };
         assert_eq!(row.status, St::Done, "the Lead's verdict must survive");
-        assert!(
-            attempts.lock().unwrap().is_empty(),
-            "a skipped relaunch holds no retry budget"
+        assert_eq!(
+            svc.db
+                .lock()
+                .unwrap()
+                .dispatch_retry_attempt(row_id)
+                .unwrap(),
+            Some(1),
+            "the Lead took the row after this exit spent one durable attempt"
         );
         let note = row.note.unwrap_or_default();
         assert!(note.starts_with("transport: "), "{note}");
@@ -5779,13 +5890,12 @@ mod tests {
             };
             svc.tombs.lock().await.insert(sid.into(), t, now_ms());
         }
-        let attempts = std::sync::Mutex::new(std::collections::HashMap::new());
-        pipeline_retry::handle_exit(&svc, "s-cur", 1, &attempts, None)
+        pipeline_retry::handle_exit(&svc, "s-cur", 1, None)
             .await
             .unwrap();
         // The row `other` has moved on to "s-new-run"; "s-old-run" is stale.
         // (No row carries it, so there is nothing to record against.)
-        pipeline_retry::handle_exit(&svc, "s-old-run", 1, &attempts, None)
+        pipeline_retry::handle_exit(&svc, "s-old-run", 1, None)
             .await
             .unwrap();
         let db = svc.db.lock().unwrap();

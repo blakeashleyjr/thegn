@@ -64,6 +64,9 @@ file removal fails; retry once the keyring responds when its outcome is unknown.
 A timed-out keyring write never falls back to the file store. `audit` shows
 managed SSH fingerprints in OpenSSH `SHA256:` form and labels older stored
 forms "legacy, unverified" (`fingerprint_verified` in `--json`).
+Only one `thegn secret ssh rotate` runs per key at a time; a second is refused
+before changes, and a custody record changed mid-rotation stops further remote
+changes.
 
 ### Tailing the event feed
 
@@ -224,6 +227,10 @@ but the local client and runs only when you invoke it; `thegn doctor` shows
 the `host_discovery`/`tailnet` probe. This is unrelated to `[sandbox.vpn]`
 (a sandbox's own egress tunnel).
 
+`thegn host add <target> --name <alias> --replace` takes over an alias with
+stale recorded state from a host no longer defined in configuration and clears
+that state. It refuses while the host has live placement tenants.
+
 `thegn map` prints a **repo map**: the worktree's tree-sitter-indexed
 entities (functions, types, …) grouped by file, ranked by caller
 in-degree, under a line budget (`--budget`, default `[semantic]
@@ -265,6 +272,15 @@ refuses a row whose artifact is missing or untracked unless you pass
 `dispatch list` and `dispatch status`. An untracked artifact is not a handoff.
 See [[daemon-and-sessions]] for the
 dispatch door (`session open --stage --issue`) that creates these rows.
+
+`dispatch set-status` follows a transition table: `merged` is reachable only
+from `done` or `pr_open`; `done` only from `running`, `spawning`,
+`waiting_human` or `failed`; and `queued` is never a target. Terminal rows move
+only `done` → `merged` or `abandoned`, and `failed` → `done` or `abandoned`.
+With `--json`, a classified refusal prints `{"error": ..., "id": ..., "message":
+...}` with an error kind of `illegal_transition`, `stale`, `missing_evidence` or
+`missing_row` before the command fails.
+
 Finished rows (not review tasks) older than 90 days are pruned during
 background maintenance unless their worktree is still registered, an active
 autopilot run uses them, or a retained child points to them. `thegn db vacuum`

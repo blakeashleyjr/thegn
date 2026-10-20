@@ -1154,24 +1154,82 @@ pub fn resync_ff_checkout(root: &Path, branch: &str, old: &str, new: &str) -> Re
     }
 }
 
-/// Parse `git worktree list --porcelain` into `(path, branch)` pairs.
+/// Parse `git worktree list --porcelain -z` into `(path, branch)` pairs.
 ///
-/// Porcelain emits a blank-line-separated record per worktree, opening with
-/// `worktree <path>` and carrying `branch refs/heads/<name>` only when a branch
-/// is checked out (a detached or bare entry has none). Kept pure so the
-/// selection below is unit-tested rather than inferred from a live repo.
-pub fn parse_worktree_branches(porcelain: &str) -> Vec<(String, Option<String>)> {
-    let mut out: Vec<(String, Option<String>)> = Vec::new();
-    for line in porcelain.lines() {
-        if let Some(p) = line.strip_prefix("worktree ") {
-            out.push((p.trim().to_string(), None));
-        } else if let Some(b) = line.strip_prefix("branch ")
-            && let Some(last) = out.last_mut()
-        {
-            last.1 = Some(b.trim().trim_start_matches("refs/heads/").to_string());
+/// THE-376 slice b: non-`-z` porcelain cannot frame a newline in a path.
+/// Each record opens with `worktree <path>` and carries a branch only when one
+/// is checked out (a detached or bare entry has none). Kept pure so malformed
+/// framing and exact path preservation are unit-tested.
+pub fn parse_worktree_branches(porcelain: &str) -> Option<Vec<(String, Option<String>)>> {
+    if porcelain.is_empty() {
+        return Some(Vec::new());
+    }
+    // Every field is NUL-terminated and every record ends with an empty field,
+    // so a complete listing ends with two NULs.
+    if !porcelain.ends_with("\0\0") {
+        return None;
+    }
+
+    let mut out = Vec::new();
+    let mut record: Option<(String, Option<String>)> = None;
+    // A bare entry has no `HEAD`; a `branch` line needs one before it.
+    let mut has_head = false;
+    for field in porcelain.split('\0') {
+        if field.is_empty() {
+            if let Some(entry) = record.take() {
+                out.push(entry);
+                has_head = false;
+            }
+        } else if let Some(path) = field.strip_prefix("worktree ") {
+            if record.is_some() || path.is_empty() {
+                return None;
+            }
+            record = Some((path.to_string(), None));
+        } else if let Some(head) = field.strip_prefix("HEAD ") {
+            if record.is_none() || head.is_empty() || has_head {
+                return None;
+            }
+            has_head = true;
+        } else if let Some(branch) = field.strip_prefix("branch ") {
+            let (_, current_branch) = record.as_mut()?;
+            if !has_head {
+                return None;
+            }
+            if current_branch.is_some() {
+                return None;
+            }
+            *current_branch = Some(
+                branch
+                    .strip_prefix("refs/heads/")
+                    .unwrap_or(branch)
+                    .to_string(),
+            );
+        } else if record.is_none() {
+            return None;
         }
     }
-    out
+    if record.is_some() {
+        return None;
+    }
+    Some(out)
+}
+
+/// The exact Git argv for the NUL-framed worktree listing protocol.
+pub const WORKTREE_LIST_Z: [&str; 4] = ["worktree", "list", "--porcelain", "-z"];
+
+/// Read and strictly parse the repository's NUL-framed worktree listing.
+///
+/// This uses `git worktree list --porcelain -z`, which requires Git 2.36 or
+/// later. Older Git versions fail closed for callers of this helper.
+pub fn worktree_branches(root: &Path) -> Option<Vec<(String, Option<String>)>> {
+    let porcelain = git_out_allow_empty(root, &WORKTREE_LIST_Z)?;
+    match parse_worktree_branches(&porcelain) {
+        Some(branches) => Some(branches),
+        None => {
+            tracing::debug!(target: "thegn::git", "malformed git worktree list --porcelain -z output");
+            None
+        }
+    }
 }
 
 /// The worktree paths with `branch` checked out.
@@ -1239,10 +1297,9 @@ pub fn resync_branch_checkouts(
     old: &str,
     new: &str,
 ) -> Vec<CheckoutResync> {
-    let Some(porc) = git_out(root, &["worktree", "list", "--porcelain"]) else {
+    let Some(pairs) = worktree_branches(root) else {
         return Vec::new();
     };
-    let pairs = parse_worktree_branches(&porc);
     checkouts_of_branch(&pairs, branch)
         .into_iter()
         .map(|p| {
@@ -1370,6 +1427,10 @@ pub fn git_common_dir(worktree: &Path) -> PathBuf {
     dot_git
 }
 
+fn git_lock_key(worktree: &Path) -> std::io::Result<PathBuf> {
+    std::fs::canonicalize(git_common_dir(worktree))
+}
+
 static GIT_WRITE_EPOCH: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// A process-wide counter that advances every time thegn finishes a git
@@ -1412,8 +1473,16 @@ impl Drop for GitWriteScope {
 pub struct GitLock(
     // Held purely for RAII: the unix Drop unlocks explicitly; on Windows the
     // exclusive share mode releases when the handle closes (field unread).
-    #[cfg_attr(windows, allow(dead_code))] std::fs::File,
+    #[cfg_attr(windows, allow(dead_code))] Option<std::fs::File>,
 );
+
+thread_local! {
+    static GIT_MUTATION_TXNS: std::cell::RefCell<Vec<(PathBuf, usize, std::rc::Rc<GitLock>)>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+fn mutation_txn_is_active(key: &Path) -> bool {
+    GIT_MUTATION_TXNS.with_borrow(|txns| txns.iter().any(|(held, _, _)| held == key))
+}
 
 /// Acquire the per-repo git-mutation lock at `<git-common>/thegn-git.lock`.
 /// This typed API reports failure so a required mutation can refuse to run.
@@ -1425,14 +1494,18 @@ pub struct GitLock(
 #[allow(deprecated)]
 #[cfg(not(windows))]
 pub fn try_lock_git_mutations(worktree: &Path) -> std::io::Result<GitLock> {
-    let (_, file) = open_git_mutation_lock_file(worktree)?;
+    let key = git_lock_key(worktree)?;
+    if mutation_txn_is_active(&key) {
+        return Ok(GitLock(None));
+    }
+    let (_, file) = open_git_mutation_lock_file(&key)?;
     file.lock()?;
-    Ok(GitLock(file))
+    Ok(GitLock(Some(file)))
 }
 
 #[cfg(not(windows))]
-fn open_git_mutation_lock_file(worktree: &Path) -> std::io::Result<(PathBuf, std::fs::File)> {
-    let path = git_common_dir(worktree).join("thegn-git.lock");
+fn open_git_mutation_lock_file(key: &Path) -> std::io::Result<(PathBuf, std::fs::File)> {
+    let path = key.join("thegn-git.lock");
     let file = match crate::fsperm::open_regular_file_nofollow(&path) {
         Ok(file) => file,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
@@ -1453,7 +1526,11 @@ fn open_git_mutation_lock_file(worktree: &Path) -> std::io::Result<(PathBuf, std
 /// Acquire the per-repo git-mutation lock using an exclusive Windows handle.
 /// This reports failures so required mutations can refuse to run.
 pub fn try_lock_git_mutations(worktree: &Path) -> std::io::Result<GitLock> {
-    let path = git_common_dir(worktree).join("thegn-git.lock");
+    let key = git_lock_key(worktree)?;
+    if mutation_txn_is_active(&key) {
+        return Ok(GitLock(None));
+    }
+    let path = key.join("thegn-git.lock");
     // On Windows, opening a file with `share_read=false` and `share_write=false`
     // creates an exclusive lock at the filesystem level.
     // However, Rust's stdlib doesn't expose sharing modes directly in OpenOptions without `std::os::windows::fs::OpenOptionsExt`.
@@ -1468,7 +1545,7 @@ pub fn try_lock_git_mutations(worktree: &Path) -> std::io::Result<GitLock> {
         .truncate(false)
         .share_mode(0) // 0 = exclusive lock
         .open(&path)?;
-    Ok(GitLock(file))
+    Ok(GitLock(Some(file)))
 }
 
 /// Acquire the git-mutation lock, waiting at most `wait` for another thegn
@@ -1477,7 +1554,11 @@ pub fn try_lock_git_mutations(worktree: &Path) -> std::io::Result<GitLock> {
 #[allow(deprecated)]
 #[cfg(not(windows))]
 pub fn try_lock_git_mutations_within(worktree: &Path, wait: Duration) -> std::io::Result<GitLock> {
-    let (path, file) = open_git_mutation_lock_file(worktree)?;
+    let key = git_lock_key(worktree)?;
+    if mutation_txn_is_active(&key) {
+        return Ok(GitLock(None));
+    }
+    let (path, file) = open_git_mutation_lock_file(&key)?;
     let deadline = Instant::now().checked_add(wait).ok_or_else(|| {
         std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
@@ -1487,7 +1568,7 @@ pub fn try_lock_git_mutations_within(worktree: &Path, wait: Duration) -> std::io
     let mut backoff = Duration::from_millis(5);
     loop {
         match file.try_lock() {
-            Ok(()) => return Ok(GitLock(file)),
+            Ok(()) => return Ok(GitLock(Some(file))),
             Err(std::fs::TryLockError::Error(error)) => return Err(error),
             Err(std::fs::TryLockError::WouldBlock) => {
                 let now = Instant::now();
@@ -1512,7 +1593,11 @@ pub fn try_lock_git_mutations_within(worktree: &Path, wait: Duration) -> std::io
 pub fn try_lock_git_mutations_within(worktree: &Path, wait: Duration) -> std::io::Result<GitLock> {
     use std::os::windows::fs::OpenOptionsExt;
 
-    let path = git_common_dir(worktree).join("thegn-git.lock");
+    let key = git_lock_key(worktree)?;
+    if mutation_txn_is_active(&key) {
+        return Ok(GitLock(None));
+    }
+    let path = key.join("thegn-git.lock");
     let deadline = Instant::now().checked_add(wait).ok_or_else(|| {
         std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
@@ -1529,7 +1614,7 @@ pub fn try_lock_git_mutations_within(worktree: &Path, wait: Duration) -> std::io
             .share_mode(0)
             .open(&path);
         match result {
-            Ok(file) => return Ok(GitLock(file)),
+            Ok(file) => return Ok(GitLock(Some(file))),
             Err(error) if error.raw_os_error() == Some(32) => {
                 let now = Instant::now();
                 if now >= deadline {
@@ -1550,31 +1635,16 @@ pub fn try_lock_git_mutations_within(worktree: &Path, wait: Duration) -> std::io
     }
 }
 
-/// Legacy best-effort wrapper. New required mutations should use
-/// [`try_lock_git_mutations`] and refuse to proceed when acquisition fails.
-/// The lock is advisory among thegn callers; ordinary Git does not honor it.
-pub fn lock_git_mutations(worktree: &Path) -> Option<GitLock> {
-    match try_lock_git_mutations(worktree) {
-        Ok(lock) => Some(lock),
-        Err(error) => {
-            tracing::warn!(
-                target: "thegn::git",
-                worktree = %worktree.display(),
-                error = %error,
-                "could not acquire git-mutation lock"
-            );
-            None
-        }
-    }
-}
-
 #[cfg(not(windows))]
 impl Drop for GitLock {
-    #[allow(deprecated)] // see lock_git_mutations — migrate to fcntl::Flock together
+    #[allow(deprecated)] // explicit unlock preserves the existing raw-lock release behavior
     fn drop(&mut self) {
         note_git_write();
-        // best-effort: closing the fd releases the lock anyway.
-        let _ = self.0.unlock();
+        if let Some(file) = &self.0
+            && let Err(error) = file.unlock()
+        {
+            tracing::debug!(target: "thegn::git", %error, "failed to explicitly unlock git-mutation file");
+        }
     }
 }
 
@@ -1583,6 +1653,77 @@ impl Drop for GitLock {
     fn drop(&mut self) {
         note_git_write();
         // Just closing the file releases the share mode lock on Windows.
+    }
+}
+
+/// THE-372 slice a: the cross-process git-mutation lock held for one logical
+/// operation; reentrant for this thread only.
+#[must_use = "the transaction releases its lock when dropped"]
+pub struct MutationTxn {
+    key: PathBuf,
+    lock: Option<std::rc::Rc<GitLock>>,
+    _not_send: std::marker::PhantomData<*const ()>,
+}
+
+impl MutationTxn {
+    pub fn key(&self) -> &Path {
+        &self.key
+    }
+}
+
+/// Begin a transaction that holds the repository mutation lock. Nested calls
+/// on this thread and canonical repository key share the outer lock.
+pub fn begin_git_mutation(worktree: &Path, wait: Duration) -> std::io::Result<MutationTxn> {
+    let key = git_lock_key(worktree)?;
+    let nested_lock = GIT_MUTATION_TXNS.with_borrow_mut(|txns| {
+        if let Some((_, depth, lock)) = txns.iter_mut().find(|(held, _, _)| held == &key) {
+            *depth += 1;
+            Some(std::rc::Rc::clone(lock))
+        } else {
+            None
+        }
+    });
+    let lock = match nested_lock {
+        Some(lock) => lock,
+        None => {
+            let lock = std::rc::Rc::new(try_lock_git_mutations_within(worktree, wait)?);
+            GIT_MUTATION_TXNS
+                .with_borrow_mut(|txns| txns.push((key.clone(), 1, std::rc::Rc::clone(&lock))));
+            lock
+        }
+    };
+    Ok(MutationTxn {
+        key,
+        lock: Some(lock),
+        _not_send: std::marker::PhantomData,
+    })
+}
+
+impl Drop for MutationTxn {
+    fn drop(&mut self) {
+        let release_outer = GIT_MUTATION_TXNS.with_borrow_mut(|txns| {
+            match txns.iter().position(|(held, _, _)| held == &self.key) {
+                Some(index) if txns[index].1 > 1 => {
+                    txns[index].1 -= 1;
+                    Some(false)
+                }
+                Some(index) => {
+                    txns.remove(index);
+                    Some(true)
+                }
+                None => None,
+            }
+        });
+        let Some(release_outer) = release_outer else {
+            debug_assert!(
+                false,
+                "mutation transaction missing from its thread registry"
+            );
+            return;
+        };
+        if release_outer {
+            drop(self.lock.take());
+        }
     }
 }
 
@@ -1943,7 +2084,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&tmp);
         std::fs::create_dir_all(tmp.join(".git")).unwrap();
         let mid = git_write_epoch();
-        drop(lock_git_mutations(&tmp));
+        drop(try_lock_git_mutations(&tmp).unwrap());
         assert!(git_write_epoch() > mid, "releasing the lock marks a write");
         // best-effort: test cleanup: scratch removal must never fail the test
         let _ = std::fs::remove_dir_all(&tmp);
@@ -2328,11 +2469,10 @@ mod tests {
         let tmp = std::env::temp_dir().join(format!("tg-glock-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&tmp); // best-effort: test setup: fresh scratch dir
         std::fs::create_dir_all(tmp.join(".git")).unwrap();
-        let guard = lock_git_mutations(&tmp);
-        assert!(guard.is_some(), "first acquire succeeds");
+        let guard = try_lock_git_mutations(&tmp).unwrap();
         drop(guard); // releases (flock auto-drops); no stale lock left behind
         assert!(
-            lock_git_mutations(&tmp).is_some(),
+            try_lock_git_mutations(&tmp).is_ok(),
             "re-acquire after drop succeeds"
         );
         let _ = std::fs::remove_dir_all(&tmp); // best-effort: test cleanup: scratch removal must never fail the test
@@ -2468,8 +2608,11 @@ mod tests {
             !outside.exists(),
             "lock acquisition must not follow the link"
         );
-        assert!(lock_git_mutations(&worktree).is_none());
-        assert!(!outside.exists(), "legacy wrapper must also fail closed");
+        assert!(try_lock_git_mutations(&worktree).is_err());
+        assert!(
+            !outside.exists(),
+            "lock acquisition must remain fail closed"
+        );
     }
 
     #[cfg(unix)]
@@ -2748,25 +2891,10 @@ mod tests {
 
     #[test]
     fn parse_worktree_branches_pairs_paths_with_their_branch() {
-        // Real porcelain shape: blank-line-separated records, `branch` absent on
-        // a detached or bare entry.
-        let porc = "\
-worktree /repo
-HEAD aaaa
-branch refs/heads/main
-
-worktree /wt/feature
-HEAD bbbb
-branch refs/heads/ba/rearch
-
-worktree /wt/detached
-HEAD cccc
-detached
-
-worktree /repo/bare
-bare
-";
-        let pairs = parse_worktree_branches(porc);
+        // Deliberately use Git's NUL-framed `-z` form, including empty record
+        // separators; `branch` is absent on a detached or bare entry.
+        let porc = "worktree /repo\0HEAD aaaa\0branch refs/heads/main\0\0worktree /wt/feature\0HEAD bbbb\0branch refs/heads/ba/rearch\0\0worktree /wt/detached\0HEAD cccc\0detached\0\0worktree /repo/bare\0bare\0\0";
+        let pairs = parse_worktree_branches(porc).unwrap();
         assert_eq!(
             pairs,
             vec![
@@ -2776,14 +2904,15 @@ bare
                 ("/repo/bare".to_string(), None),
             ]
         );
-        assert!(parse_worktree_branches("").is_empty());
+        assert!(parse_worktree_branches("").unwrap().is_empty());
     }
 
     #[test]
     fn checkouts_of_branch_finds_linked_worktrees_not_just_the_main_one() {
         let pairs = parse_worktree_branches(
-            "worktree /repo\nbranch refs/heads/main\n\nworktree /wt/x\nbranch refs/heads/ba/rearch\n",
-        );
+            "worktree /repo\0HEAD aaaa\0branch refs/heads/main\0\0worktree /wt/x\0HEAD bbbb\0branch refs/heads/ba/rearch\0\0",
+        )
+        .unwrap();
         // The regression this exists for: the target branch is checked out in a
         // LINKED worktree while the main checkout sits on another branch.
         assert_eq!(checkouts_of_branch(&pairs, "ba/rearch"), vec!["/wt/x"]);
@@ -2791,6 +2920,78 @@ bare
         assert!(checkouts_of_branch(&pairs, "nope").is_empty());
         // A branch-shaped prefix must not match by accident.
         assert!(checkouts_of_branch(&pairs, "ba").is_empty());
+    }
+
+    #[test]
+    fn parse_worktree_branches_keeps_exact_paths() {
+        let pairs = parse_worktree_branches(
+            "worktree /wt/a\nb \0HEAD deadbeef\0branch refs/heads/feat\0\0",
+        )
+        .unwrap();
+        assert_eq!(
+            pairs,
+            vec![("/wt/a\nb ".to_string(), Some("feat".to_string()))]
+        );
+    }
+
+    #[test]
+    fn parse_worktree_branches_rejects_malformed_framing() {
+        for malformed in [
+            "worktree /repo\0HEAD deadbeef\0branch refs/heads/main\0",
+            "worktree /repo\0branch refs/heads/main\0\0",
+            "branch refs/heads/main\0\0",
+            "worktree /repo\0HEAD deadbeef\0branch refs/heads/main\0branch refs/heads/other\0\0",
+            "worktree \0\0",
+        ] {
+            assert!(
+                parse_worktree_branches(malformed).is_none(),
+                "accepted malformed listing {malformed:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn worktree_branches_reads_a_linked_worktree_with_a_newline_in_its_path() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("repo");
+        std::fs::create_dir(&root).unwrap();
+        let linked = temp.path().join("wt\nnl");
+        let run = |args: &[&str]| {
+            git_cmd(&root)
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .args(args)
+                .output()
+                .unwrap()
+        };
+        for args in [
+            &["init", "-q", "-b", "main"][..],
+            &["config", "user.name", "test"],
+            &["config", "user.email", "test@example.invalid"],
+            &[
+                "-c",
+                "commit.gpgsign=false",
+                "commit",
+                "-q",
+                "--allow-empty",
+                "-m",
+                "init",
+            ],
+        ] {
+            assert!(run(args).status.success(), "git {args:?}");
+        }
+        let linked_arg = linked.to_string_lossy().into_owned();
+        let added = run(&["worktree", "add", "-q", "-b", "feat", &linked_arg]);
+        if !added.status.success() {
+            return;
+        }
+
+        let canonical = std::fs::canonicalize(&linked).unwrap();
+        let expected = (
+            canonical.to_string_lossy().into_owned(),
+            Some("feat".to_string()),
+        );
+        let branches = worktree_branches(&root).unwrap();
+        assert!(branches.contains(&expected), "listing: {branches:?}");
     }
 
     #[test]
@@ -2930,6 +3131,118 @@ bare
                 || shell.ends_with("powershell.exe")
                 || shell.ends_with("cmd.exe")
         );
+    }
+
+    fn mutation_txn_test_worktree() -> (tempfile::TempDir, PathBuf) {
+        let temp = tempfile::tempdir().unwrap();
+        let worktree = temp.path().join("repo");
+        std::fs::create_dir_all(worktree.join(".git")).unwrap();
+        (temp, worktree)
+    }
+
+    #[test]
+    fn mutation_txn_grants_nested_locks_on_its_own_thread() {
+        let (_temp, worktree) = mutation_txn_test_worktree();
+        let txn = begin_git_mutation(&worktree, Duration::from_secs(1)).unwrap();
+        let nested_lock = try_lock_git_mutations_within(&worktree, Duration::from_millis(100));
+        assert!(
+            nested_lock.is_ok(),
+            "a transaction holder gets a reentrant lock grant"
+        );
+        let inner = begin_git_mutation(&worktree, Duration::from_millis(100));
+        assert!(inner.is_ok(), "a nested transaction reuses the outer lock");
+        drop(inner);
+        drop(nested_lock);
+        assert_eq!(txn.key(), git_lock_key(&worktree).unwrap());
+        let still_held = try_lock_git_mutations_within(&worktree, Duration::from_millis(100));
+        assert!(
+            still_held.is_ok(),
+            "nested guard drops must leave the outer txn registered"
+        );
+        drop(still_held);
+        drop(txn);
+    }
+
+    #[test]
+    fn mutation_txn_still_excludes_other_threads() {
+        let (_temp, worktree) = mutation_txn_test_worktree();
+        let txn = begin_git_mutation(&worktree, Duration::from_secs(1)).unwrap();
+        let contender = worktree.clone();
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let result = try_lock_git_mutations_within(&contender, Duration::from_millis(100))
+                .map(|_| ())
+                .map_err(|error| error.kind());
+            sender.send(result).unwrap();
+        });
+        assert_eq!(
+            receiver.recv_timeout(Duration::from_secs(2)).unwrap(),
+            Err(std::io::ErrorKind::TimedOut),
+            "another thread must not inherit the transaction's reentrant grant"
+        );
+        worker.join().unwrap();
+        drop(txn);
+
+        let contender = worktree.clone();
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let acquired =
+                try_lock_git_mutations_within(&contender, Duration::from_secs(1)).is_ok();
+            sender.send(acquired).unwrap();
+        });
+        assert_eq!(receiver.recv_timeout(Duration::from_secs(2)), Ok(true));
+        worker.join().unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn mutation_txn_key_is_canonical_across_symlinked_paths() {
+        use std::os::unix::fs::symlink;
+
+        let (temp, worktree) = mutation_txn_test_worktree();
+        let alias = temp.path().join("alias");
+        symlink(&worktree, &alias).unwrap();
+        let txn = begin_git_mutation(&worktree, Duration::from_secs(1)).unwrap();
+        let lock = try_lock_git_mutations_within(&alias, Duration::from_millis(100));
+        assert!(
+            lock.is_ok(),
+            "the symlink alias shares the canonical transaction key"
+        );
+        drop(lock);
+        drop(txn);
+    }
+
+    #[test]
+    fn plain_git_lock_is_not_reentrant() {
+        let (_temp, worktree) = mutation_txn_test_worktree();
+        let held = try_lock_git_mutations(&worktree).unwrap();
+        let nested = try_lock_git_mutations_within(&worktree, Duration::from_millis(100));
+        assert!(matches!(nested, Err(ref error) if error.kind() == std::io::ErrorKind::TimedOut));
+        drop(held);
+    }
+
+    #[test]
+    fn mutation_txn_releases_after_outermost_drop() {
+        let (_temp, worktree) = mutation_txn_test_worktree();
+        let outer = begin_git_mutation(&worktree, Duration::from_secs(1)).unwrap();
+        let inner = begin_git_mutation(&worktree, Duration::from_millis(100)).unwrap();
+        drop(inner);
+        let contender = worktree.clone();
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let result = try_lock_git_mutations_within(&contender, Duration::from_millis(100))
+                .map(|_| ())
+                .map_err(|error| error.kind());
+            sender.send(result).unwrap();
+        });
+        assert_eq!(
+            receiver.recv_timeout(Duration::from_secs(2)).unwrap(),
+            Err(std::io::ErrorKind::TimedOut),
+            "dropping an inner txn must leave the outer lock held"
+        );
+        worker.join().unwrap();
+        drop(outer);
+        assert!(try_lock_git_mutations_within(&worktree, Duration::from_millis(100)).is_ok());
     }
 
     #[test]

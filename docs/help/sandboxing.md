@@ -21,11 +21,12 @@ while the process is contained.
 per repo via a `.thegn.toml` overlay, or per run with
 `THEGN_SANDBOX_PROFILE`.
 
-| Profile    | What it does                                                                                   |
-| ---------- | ---------------------------------------------------------------------------------------------- |
-| `open`     | no hardening — the escape hatch                                                                |
-| `hardened` | **default.** read-only root, no-new-privileges, a process cap; network and capabilities intact |
-| `sealed`   | full lockdown: `network=none`, drop ALL caps, tighter pids cap. For untrusted work             |
+| Profile         | What it does                                                                                                                                                                                                |
+| --------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `open`          | no hardening — the escape hatch                                                                                                                                                                             |
+| `hardened`      | **default.** read-only root, no-new-privileges, a process cap; network and capabilities intact                                                                                                              |
+| `sealed`        | full lockdown: `network=none`, drop ALL caps, tighter pids cap. For untrusted work                                                                                                                          |
+| `sealed-tunnel` | `sealed` plus a `[sandbox.vpn]` tunnel as the only route. **Refuses to launch while a VPN is configured**: thegn cannot yet enforce that the tunnel is the only route. With no VPN it behaves like `sealed` |
 
 Under `hardened`, **everything outside the worktree is read-only —
 including your `$HOME`**, so a sandboxed agent cannot `cd` out and modify
@@ -81,6 +82,11 @@ opt-out. The inspected service model and mount paths are what thegn launches;
 Compose files and interpolation inputs are inspected again on the next launch.
 If the config cannot be inspected, launch proceeds with a warning and is
 reported as host-process isolation. Remote placements are not checked.
+After `up`, thegn inspects the running project containers and stops the project
+(`compose down`) if any is privileged, uses the host network or PID namespace,
+adds `SYS_ADMIN`, `SYS_MODULE`, `SYS_RAWIO`, `SYS_PTRACE`, `DAC_READ_SEARCH` or
+`ALL`, or bind-mounts a protected path. If the containers cannot be inspected,
+the launch is reported as host-process isolation.
 Queue-agent sandboxes get the same protected-bind check, including the daemon
 control-socket directory; a protected bind is refused and the queue dispatch is
 held. If their Compose config cannot be inspected, the agent runs degraded with
@@ -97,6 +103,11 @@ trusted. Dropped `[sandbox] mounts` are listed by `thegn doctor`; a
 user-authored one also warns once per path. The ssh identity-key mounts and
 shell-state XDG write carve-outs are not applied to sealed profiles. Extend the
 allowlist with `[sandbox] mounts` (paths outside the deny list only).
+
+Before launch, every local mount source is resolved to a real path. If a
+required source cannot be resolved, the launch is refused with its source and
+destination; an unresolvable cache mount is dropped with a warning. A source
+that does not exist yet can still resolve through its nearest existing parent.
 
 **Sealed agent panes need a managed account.** The only exception to the
 deny list is the _managed_ per-account credential dir thegn creates under
@@ -513,6 +524,9 @@ Cleanup is always explicit — thegn never prunes on a schedule.
   a sandbox container (enabled globally or by the active profile, an env
   overlay, or a repo overlay for a known worktree); `thegn sandbox gc` runs it
   regardless.
+  It also removes Compose project adoption records older than an hour whose
+  worktree is gone, both during gc and the startup sweep; an empty worktree list
+  leaves those records alone.
   Safe to run any time.
 - `thegn sandbox prune` reclaims **thegn-owned (`thegn-` name family) stopped
   containers**, and `thegn.managed` images and volumes. On a terminal it

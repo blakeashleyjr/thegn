@@ -162,24 +162,32 @@ impl std::fmt::Display for ParentDispatchConflict {
 impl std::error::Error for ParentDispatchConflict {}
 
 /// Whether an ordinary `dispatch set-status` transition is permitted.
-/// Active states may move to any recognized state; idempotent writes are
-/// allowed. Terminal transitions are `Done -> Merged|Abandoned`,
-/// `Failed -> Done|Abandoned`, and `Unknown -> Failed|Abandoned`. All other
-/// terminal transitions, including resurrection to an active state, are
-/// refused. `Failed -> Done` remains legal so a fixed artifact can be
-/// re-verified by the existing completion gate.
+/// Idempotent writes are allowed for every recognized state except `Unknown`,
+/// and `Queued` is never a target. Active states may move to
+/// `Spawning|Running|WaitingHuman|PrOpen|Abandoned|Failed`; `Done` is reachable
+/// only from `Running|Spawning|WaitingHuman|Failed`; and `Merged` only from
+/// `Done|PrOpen`. Terminal transitions also include `Done -> Abandoned`,
+/// `Failed -> Abandoned`, and `Unknown -> Failed|Abandoned`. All other
+/// transitions, including resurrection to an active state, are refused.
 pub fn set_status_transition_allowed(from: AgentDispatchStatus, to: AgentDispatchStatus) -> bool {
     use AgentDispatchStatus::*;
+    if to == Unknown || to == Queued {
+        return false;
+    }
     if from == to {
-        return from != Unknown;
+        return true;
     }
-    if from.is_active() {
-        return to != Unknown;
+    match to {
+        Merged => matches!(from, Done | PrOpen),
+        Done => matches!(from, Running | Spawning | WaitingHuman | Failed),
+        _ => {
+            from.is_active()
+                || matches!(
+                    (from, to),
+                    (Done, Abandoned) | (Failed, Abandoned) | (Unknown, Failed | Abandoned)
+                )
+        }
     }
-    matches!(
-        (from, to),
-        (Done, Merged | Abandoned) | (Failed, Done | Abandoned) | (Unknown, Failed | Abandoned)
-    )
 }
 
 /// A checked set-status operation was illegal or lost its expected-status CAS.
@@ -221,6 +229,20 @@ impl std::fmt::Display for DispatchTransitionConflict {
 }
 
 impl std::error::Error for DispatchTransitionConflict {}
+
+/// A dispatch row required by an operation was not present.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MissingDispatch {
+    pub id: i64,
+}
+
+impl std::fmt::Display for MissingDispatch {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "no dispatch with id {}", self.id)
+    }
+}
+
+impl std::error::Error for MissingDispatch {}
 
 const ADMISSION_ACTIVE_STATUSES: [AgentDispatchStatus; 5] = [
     AgentDispatchStatus::Queued,
@@ -292,7 +314,7 @@ impl Db {
         note: Option<&str>,
     ) -> Result<()> {
         if self.get_dispatch(id)?.is_none() {
-            anyhow::bail!("no dispatch with id {id}");
+            return Err(anyhow::Error::new(MissingDispatch { id }));
         }
         if !set_status_transition_allowed(expected, to) {
             return Err(anyhow::Error::new(DispatchTransitionConflict::Illegal {
@@ -304,7 +326,7 @@ impl Db {
         if !self.cas_dispatch_status(id, None, expected, to, note)? {
             let actual = self
                 .get_dispatch(id)?
-                .ok_or_else(|| anyhow::anyhow!("no dispatch with id {id}"))?
+                .ok_or_else(|| anyhow::Error::new(MissingDispatch { id }))?
                 .status;
             return Err(anyhow::Error::new(DispatchTransitionConflict::Stale {
                 id,
@@ -513,7 +535,8 @@ impl Db {
         let tx = conn.unchecked_transaction()?;
         let changed = tx.execute(
             "UPDATE agent_dispatches SET session_id=?1, artifact_path=?2, status=?3, \
-             run_gen=run_gen+1, exit_code=NULL, exited_at_ms=NULL, native_session_id=NULL, report_head_oid=NULL \
+             run_gen=run_gen+1, exit_code=NULL, exited_at_ms=NULL, native_session_id=NULL, report_head_oid=NULL, \
+             retry_attempt=0, retry_counted_gen=NULL, retry_last_class=NULL \
              WHERE id=?4 AND status IN (?5, ?6)",
             rusqlite::params![
                 session_id,
@@ -730,6 +753,72 @@ impl Db {
                 expected.as_str()
             ],
         )? != 0)
+    }
+
+    /// Count one transport failure for this exact dispatch run generation.
+    /// A duplicate observation, settled row, or moved run returns `None`
+    /// without spending another attempt.
+    pub fn count_dispatch_retry_attempt_run(
+        &self,
+        run: &crate::issue::DispatchRunRef,
+        class: &str,
+    ) -> Result<Option<u32>> {
+        let class: String = class.chars().take(128).collect();
+        let conn = self.conn();
+        let tx = conn.unchecked_transaction()?;
+        let changed = tx.execute(
+            "UPDATE agent_dispatches SET retry_attempt=retry_attempt+1, retry_counted_gen=?1, retry_last_class=?2 \
+             WHERE id=?3 AND COALESCE(session_id,'')=?4 AND run_gen=?1 \
+             AND (retry_counted_gen IS NULL OR retry_counted_gen<>?1)",
+            rusqlite::params![run.run_gen, class, run.id, run.session_id],
+        )?;
+        let count = if changed == 0 {
+            None
+        } else {
+            let value: i64 = tx.query_row(
+                "SELECT retry_attempt FROM agent_dispatches WHERE id=?1",
+                [run.id],
+                |row| row.get(0),
+            )?;
+            Some(u32::try_from(value).unwrap_or(u32::MAX))
+        };
+        tx.commit()?;
+        Ok(count)
+    }
+
+    /// Park a retry row and clear its durable budget in the same update.
+    pub fn compare_and_set_dispatch_retry_settle_run(
+        &self,
+        run: &crate::issue::DispatchRunRef,
+        expected: AgentDispatchStatus,
+        note: &str,
+    ) -> Result<bool> {
+        let note = crate::pipeline_report::note_text(note).map_err(|e| anyhow::anyhow!("{e}"))?;
+        Ok(self.conn().execute(
+            "UPDATE agent_dispatches SET status=?1, note=?2, retry_attempt=0, retry_counted_gen=?6, retry_last_class=NULL \
+             WHERE id=?3 AND status=?4 AND COALESCE(session_id,'')=?5 AND run_gen=?6",
+            rusqlite::params![
+                AgentDispatchStatus::WaitingHuman.as_str(),
+                note,
+                run.id,
+                expected.as_str(),
+                run.session_id,
+                run.run_gen
+            ],
+        )? != 0)
+    }
+
+    /// Read the durable transport-retry count for a row.
+    pub fn dispatch_retry_attempt(&self, id: i64) -> Result<Option<u32>> {
+        let value = self
+            .conn()
+            .query_row(
+                "SELECT retry_attempt FROM agent_dispatches WHERE id=?1",
+                [id],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()?;
+        Ok(value.map(|n| u32::try_from(n).unwrap_or(u32::MAX)))
     }
 
     /// Store the worker's structured handoff report on a roster row — UPDATE the
@@ -2991,18 +3080,29 @@ mod tests {
         ];
         for from in statuses {
             for to in statuses {
-                let expected = if from.is_active() {
-                    to != Unknown
-                } else {
-                    matches!(
-                        (from, to),
-                        (Merged, Merged)
-                            | (Abandoned, Abandoned)
-                            | (Done, Done | Merged | Abandoned)
-                            | (Failed, Failed | Done | Abandoned)
-                            | (Unknown, Failed | Abandoned)
-                    )
-                };
+                let expected = matches!(
+                    (from, to),
+                    (
+                        Queued,
+                        Spawning | Running | WaitingHuman | PrOpen | Abandoned | Failed
+                    ) | (
+                        Spawning,
+                        Spawning | Running | WaitingHuman | PrOpen | Done | Abandoned | Failed
+                    ) | (
+                        Running,
+                        Spawning | Running | WaitingHuman | PrOpen | Done | Abandoned | Failed
+                    ) | (
+                        WaitingHuman,
+                        Spawning | Running | WaitingHuman | PrOpen | Done | Abandoned | Failed
+                    ) | (
+                        PrOpen,
+                        Spawning | Running | WaitingHuman | PrOpen | Merged | Abandoned | Failed
+                    ) | (Merged, Merged)
+                        | (Abandoned, Abandoned)
+                        | (Done, Done | Merged | Abandoned)
+                        | (Failed, Failed | Done | Abandoned)
+                        | (Unknown, Failed | Abandoned)
+                );
                 assert_eq!(
                     set_status_transition_allowed(from, to),
                     expected,
@@ -3077,6 +3177,74 @@ mod tests {
     }
 
     #[test]
+    fn set_status_matrix_refuses_queued_target_and_early_done() {
+        let db = Db::open_memory().unwrap();
+        let queued = put_row(&db, "linear:THE-242-Q", "/wt/queued");
+        let running = put_row(&db, "linear:THE-242-R", "/wt/running");
+        db.update_dispatch_status(running, AgentDispatchStatus::Running)
+            .unwrap();
+
+        for (id, from, to) in [
+            (
+                queued,
+                AgentDispatchStatus::Queued,
+                AgentDispatchStatus::Done,
+            ),
+            (
+                running,
+                AgentDispatchStatus::Running,
+                AgentDispatchStatus::Merged,
+            ),
+            (
+                running,
+                AgentDispatchStatus::Running,
+                AgentDispatchStatus::Queued,
+            ),
+        ] {
+            let result = db.set_dispatch_status_checked(id, from, to, None);
+            assert!(matches!(
+                result,
+                Err(ref error)
+                    if matches!(
+                        error.downcast_ref::<DispatchTransitionConflict>(),
+                        Some(DispatchTransitionConflict::Illegal { .. })
+                    )
+            ));
+        }
+
+        db.set_dispatch_status_checked(
+            running,
+            AgentDispatchStatus::Running,
+            AgentDispatchStatus::Done,
+            None,
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn set_status_matrix_missing_row_is_typed() {
+        let db = Db::open_memory().unwrap();
+        let result = db.set_dispatch_status_checked(
+            99_999,
+            AgentDispatchStatus::Queued,
+            AgentDispatchStatus::Running,
+            None,
+        );
+        assert!(matches!(
+            &result,
+            Err(error)
+                if error.downcast_ref::<MissingDispatch>()
+                    == Some(&MissingDispatch { id: 99_999 })
+        ));
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("no dispatch with id 99999")
+        );
+    }
+
+    #[test]
     fn checked_set_status_allows_failed_reverification_and_unknown_reconciliation() {
         let db = Db::open_memory().unwrap();
         let failed = put_row(&db, "linear:THE-242-F", "/wt/failed");
@@ -3123,9 +3291,11 @@ mod tests {
         {
             let db = Db::open_at(&path).unwrap();
             id = put_row(&db, "linear:THE-270", "/wt/forced");
+            db.update_dispatch_status(id, AgentDispatchStatus::Running)
+                .unwrap();
             db.set_dispatch_status_forced(
                 id,
-                AgentDispatchStatus::Queued,
+                AgentDispatchStatus::Running,
                 AgentDispatchStatus::Done,
                 "reviewed exception",
             )
@@ -3152,12 +3322,14 @@ mod tests {
     fn forced_done_refuses_bad_reason_wrong_target_and_stale_cas_without_writes() {
         let db = Db::open_memory().unwrap();
         let id = put_row(&db, "linear:THE-270-B", "/wt/forced-bad");
+        db.update_dispatch_status(id, AgentDispatchStatus::Running)
+            .unwrap();
         let oversized_reason = "x".repeat(FORCE_REASON_MAX_CHARS + 1);
         for reason in ["", "   ", oversized_reason.as_str()] {
             assert!(
                 db.set_dispatch_status_forced(
                     id,
-                    AgentDispatchStatus::Queued,
+                    AgentDispatchStatus::Running,
                     AgentDispatchStatus::Done,
                     reason,
                 )
@@ -3165,7 +3337,7 @@ mod tests {
             );
             assert_eq!(
                 db.get_dispatch(id).unwrap().unwrap().status,
-                AgentDispatchStatus::Queued
+                AgentDispatchStatus::Running
             );
             assert!(db.dispatch_override(id).unwrap().is_none());
             assert_eq!(db.dispatch_note_count(id, None).unwrap(), 0);
@@ -3173,7 +3345,7 @@ mod tests {
         assert!(
             db.set_dispatch_status_forced(
                 id,
-                AgentDispatchStatus::Queued,
+                AgentDispatchStatus::Running,
                 AgentDispatchStatus::Running,
                 "wrong gate",
             )
@@ -3206,6 +3378,8 @@ mod tests {
     fn forced_done_rolls_back_status_and_override_when_note_insert_fails() {
         let db = Db::open_memory().unwrap();
         let id = put_row(&db, "linear:THE-270-ROLLBACK", "/wt/forced-rollback");
+        db.update_dispatch_status(id, AgentDispatchStatus::Running)
+            .unwrap();
         db.conn()
             .execute_batch(
                 "CREATE TRIGGER reject_forced_note BEFORE INSERT ON agent_dispatch_notes
@@ -3215,7 +3389,7 @@ mod tests {
         assert!(
             db.set_dispatch_status_forced(
                 id,
-                AgentDispatchStatus::Queued,
+                AgentDispatchStatus::Running,
                 AgentDispatchStatus::Done,
                 "reason",
             )
@@ -3223,7 +3397,7 @@ mod tests {
         );
         assert_eq!(
             db.get_dispatch(id).unwrap().unwrap().status,
-            AgentDispatchStatus::Queued
+            AgentDispatchStatus::Running
         );
         assert!(db.dispatch_override(id).unwrap().is_none());
         assert_eq!(db.dispatch_note_count(id, None).unwrap(), 0);
@@ -3289,5 +3463,149 @@ mod tests {
             ADMISSION_ACTIVE_STATUSES.as_slice(),
             crate::pipeline_claim::occupying_statuses().as_slice()
         );
+    }
+
+    fn retry_budget_run(db: &Db, issue: &str) -> (i64, crate::issue::DispatchRunRef) {
+        let id = put_row(db, issue, "/wt/retry-budget");
+        assert_eq!(
+            db.publish_dispatch_run(id, "retry-session-1", "artifact.md")
+                .unwrap(),
+            DispatchRunPublishOutcome::Published
+        );
+        (id, db.dispatch_run_ref(id).unwrap().unwrap())
+    }
+
+    #[test]
+    fn retry_budget_counts_once_per_run_generation() {
+        let db = Db::open_memory().unwrap();
+        let (id, first) = retry_budget_run(&db, "linear:THE-976-count");
+        assert_eq!(
+            db.count_dispatch_retry_attempt_run(&first, "transport:x")
+                .unwrap(),
+            Some(1)
+        );
+        assert_eq!(
+            db.count_dispatch_retry_attempt_run(&first, "transport:x")
+                .unwrap(),
+            None
+        );
+        assert_eq!(db.dispatch_retry_attempt(id).unwrap(), Some(1));
+
+        db.update_dispatch_status(id, AgentDispatchStatus::Spawning)
+            .unwrap();
+        assert!(
+            db.compare_and_set_dispatch_retry_run(
+                id,
+                AgentDispatchStatus::Spawning,
+                "retry-session-2",
+                "artifact.md",
+            )
+            .unwrap()
+        );
+        let second = db.dispatch_run_ref(id).unwrap().unwrap();
+        assert_eq!(
+            db.count_dispatch_retry_attempt_run(&second, "transport:y")
+                .unwrap(),
+            Some(2)
+        );
+    }
+
+    #[test]
+    fn retry_budget_survives_a_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("retry-budget.db");
+        let (id, first) = {
+            let db = Db::open_at(&path).unwrap();
+            let (id, first) = retry_budget_run(&db, "linear:THE-976-reopen");
+            assert_eq!(
+                db.count_dispatch_retry_attempt_run(&first, "transport:x")
+                    .unwrap(),
+                Some(1)
+            );
+            db.update_dispatch_status(id, AgentDispatchStatus::Spawning)
+                .unwrap();
+            assert!(
+                db.compare_and_set_dispatch_retry_run(
+                    id,
+                    AgentDispatchStatus::Spawning,
+                    "retry-session-2",
+                    "artifact.md",
+                )
+                .unwrap()
+            );
+            (id, db.dispatch_run_ref(id).unwrap().unwrap())
+        };
+        let reopened = Db::open_at(&path).unwrap();
+        assert_eq!(reopened.dispatch_retry_attempt(id).unwrap(), Some(1));
+        assert_eq!(
+            reopened
+                .count_dispatch_retry_attempt_run(&first, "transport:y")
+                .unwrap(),
+            Some(2)
+        );
+    }
+
+    #[test]
+    fn retry_budget_resets_on_settle_and_on_a_fresh_launch() {
+        let db = Db::open_memory().unwrap();
+        let (id, run) = retry_budget_run(&db, "linear:THE-976-reset");
+        assert_eq!(
+            db.count_dispatch_retry_attempt_run(&run, "transport:x")
+                .unwrap(),
+            Some(1)
+        );
+        assert!(
+            db.compare_and_set_dispatch_retry_settle_run(
+                &run,
+                AgentDispatchStatus::Running,
+                "parked"
+            )
+            .unwrap()
+        );
+        assert_eq!(db.dispatch_retry_attempt(id).unwrap(), Some(0));
+        assert_eq!(
+            db.count_dispatch_retry_attempt_run(&run, "transport:duplicate-after-settle")
+                .unwrap(),
+            None,
+            "settling clears the count but preserves this run's generation fence"
+        );
+
+        db.update_dispatch_status(id, AgentDispatchStatus::Queued)
+            .unwrap();
+        assert_eq!(
+            db.publish_dispatch_run(id, "human-redrive", "artifact.md")
+                .unwrap(),
+            DispatchRunPublishOutcome::Published
+        );
+        let fresh = db.dispatch_run_ref(id).unwrap().unwrap();
+        assert_eq!(db.dispatch_retry_attempt(id).unwrap(), Some(0));
+        assert_eq!(
+            db.count_dispatch_retry_attempt_run(&fresh, "transport:z")
+                .unwrap(),
+            Some(1)
+        );
+    }
+
+    #[test]
+    fn retry_budget_ignores_a_moved_run() {
+        let db = Db::open_memory().unwrap();
+        let (id, stale) = retry_budget_run(&db, "linear:THE-976-moved");
+        db.update_dispatch_status(id, AgentDispatchStatus::Spawning)
+            .unwrap();
+        assert!(
+            db.compare_and_set_dispatch_retry_run(
+                id,
+                AgentDispatchStatus::Spawning,
+                "replacement",
+                "artifact.md",
+            )
+            .unwrap()
+        );
+        assert_eq!(
+            db.count_dispatch_retry_attempt_run(&stale, "transport:x")
+                .unwrap(),
+            None
+        );
+        assert_eq!(db.dispatch_retry_attempt(id).unwrap(), Some(0));
     }
 }

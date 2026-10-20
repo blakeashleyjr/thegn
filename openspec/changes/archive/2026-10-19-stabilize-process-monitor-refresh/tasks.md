@@ -10,7 +10,8 @@
 - [x] Run actual-source sampler/view harness; demonstrate old tie comparators fail.
 - [x] Run combined host monitor and model equality tests in coordinated build graph.
 - [x] Complete primary code review and independent adversarial review/revisions.
-- [ ] Complete combined source/spec/format gates and reviewed local-main landing.
+- [x] Complete combined source/spec/format gates and reviewed local-main landing.
+      Superseded by the THE-640 reviewed local-main landing recorded below; THE-628 and THE-640 are Done.
 - [x] THE-640: Run the focused native host monitor/view checks and record no live process actions.
 - [x] THE-640: Run and retain the old-comparator counterfactual in its separate private clone.
 - [x] THE-640: Complete independent adversarial review of the direction, tree, filter, and confirmation evidence.

@@ -74,6 +74,169 @@ pub struct SpecProblem {
     pub problem: String,
 }
 
+/// Admission decision for one discovered plugin specification.
+#[derive(Debug, Clone)]
+pub enum PluginDecision {
+    Admitted(NegotiatedManifest),
+    Disabled,
+    RefusedUntrusted(SpecProblem),
+    Invalid(Vec<SpecProblem>),
+}
+
+/// A plugin together with the exact source bytes and admission decision.
+#[derive(Debug, Clone)]
+pub struct AdmittedPlugin {
+    pub plugin: LoadedPlugin,
+    pub source_digest: String,
+    pub decision: PluginDecision,
+}
+
+/// One immutable discovery and validation result shared by every plugin surface.
+#[derive(Debug, Clone)]
+pub struct AdmittedPluginSet {
+    pub plugins: Vec<AdmittedPlugin>,
+    pub set_problems: Vec<SpecProblem>,
+    pub digest: String,
+}
+
+impl AdmittedPluginSet {
+    /// Return negotiated plugins only when all set-wide and enabled-plugin
+    /// validation passed. Disabled and untrusted plugins remain non-startable.
+    pub fn startable(&self) -> Result<Vec<(&LoadedPlugin, &NegotiatedManifest)>, Vec<SpecProblem>> {
+        let mut problems = self.set_problems.clone();
+        for admitted in &self.plugins {
+            if let PluginDecision::Invalid(invalid) = &admitted.decision {
+                problems.extend(invalid.iter().cloned());
+            }
+        }
+        if !problems.is_empty() {
+            return Err(problems);
+        }
+        Ok(self
+            .plugins
+            .iter()
+            .filter_map(|admitted| {
+                if let PluginDecision::Admitted(manifest) = &admitted.decision {
+                    Some((&admitted.plugin, manifest))
+                } else {
+                    None
+                }
+            })
+            .collect())
+    }
+
+    /// All visible problems in deterministic set, plugin, then refusal order.
+    pub fn problems(&self) -> Vec<SpecProblem> {
+        let mut problems = self.set_problems.clone();
+        for admitted in &self.plugins {
+            if let PluginDecision::Invalid(invalid) = &admitted.decision {
+                problems.extend(invalid.iter().cloned());
+            }
+        }
+        for admitted in &self.plugins {
+            if let PluginDecision::RefusedUntrusted(problem) = &admitted.decision {
+                problems.push(problem.clone());
+            }
+        }
+        problems
+    }
+}
+
+/// Discover and admit a plugin set once. Every decision and digest refers to
+/// the same manifest bytes read during discovery.
+pub fn admit(cfg: &Config, config_dir: &Path) -> AdmittedPluginSet {
+    let (loaded, broken, source_digests) = discover_with_digests(cfg, config_dir);
+    let mut seen = HashSet::new();
+    let mut set_problems = broken;
+    for plugin in &loaded {
+        let id = plugin.spec.manifest.id.as_str().to_string();
+        if !seen.insert(id.clone()) {
+            set_problems.push(SpecProblem {
+                plugin: id,
+                problem: "duplicate plugin id".into(),
+            });
+        }
+    }
+    set_problems
+        .sort_by(|left, right| (&left.plugin, &left.problem).cmp(&(&right.plugin, &right.problem)));
+
+    let mut plugins = Vec::with_capacity(loaded.len());
+    for (plugin, source_digest) in loaded.into_iter().zip(source_digests) {
+        let id = plugin.spec.manifest.id.as_str().to_string();
+        let decision = if !plugin.spec.enabled {
+            PluginDecision::Disabled
+        } else if let Some(problem) = native_trust_refusal(&plugin) {
+            PluginDecision::RefusedUntrusted(problem)
+        } else {
+            let negotiated = negotiate(&plugin.spec);
+            let mut problems = check_spec_fields(&plugin);
+            match negotiated {
+                Ok(manifest) => {
+                    problems.extend(manifest.rejected_contributions.iter().map(|rejected| {
+                        SpecProblem {
+                            plugin: id.clone(),
+                            problem: format!(
+                                "contribution {:?} rejected: {}",
+                                rejected.contribution.id.as_str(),
+                                rejected.reason
+                            ),
+                        }
+                    }));
+                    if problems.is_empty() {
+                        PluginDecision::Admitted(manifest)
+                    } else {
+                        PluginDecision::Invalid(problems)
+                    }
+                }
+                Err(problem) => {
+                    problems.push(SpecProblem {
+                        plugin: id,
+                        problem,
+                    });
+                    PluginDecision::Invalid(problems)
+                }
+            }
+        };
+        plugins.push(AdmittedPlugin {
+            plugin,
+            source_digest,
+            decision,
+        });
+    }
+    let mut digest_rows = plugins
+        .iter()
+        .map(|admitted| {
+            let id = admitted.plugin.spec.manifest.id.as_str();
+            format!(
+                "{id}\t{}\t{}",
+                admitted.source_digest,
+                decision_kind(&admitted.decision)
+            )
+        })
+        .collect::<Vec<_>>();
+    digest_rows.sort();
+    let digest = digest_bytes(digest_rows.join("\n").as_bytes());
+    AdmittedPluginSet {
+        plugins,
+        set_problems,
+        digest,
+    }
+}
+
+fn decision_kind(decision: &PluginDecision) -> &'static str {
+    match decision {
+        PluginDecision::Admitted(_) => "admitted",
+        PluginDecision::Disabled => "disabled",
+        PluginDecision::RefusedUntrusted(_) => "refused-untrusted",
+        PluginDecision::Invalid(_) => "invalid",
+    }
+}
+
+fn digest_bytes(bytes: &[u8]) -> String {
+    use sha2::Digest;
+    format!("{:x}", sha2::Sha256::digest(bytes))
+}
+
 impl std::fmt::Display for SpecProblem {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{}: {}", self.plugin, self.problem)
@@ -88,6 +251,14 @@ impl std::fmt::Display for SpecProblem {
 /// Parse failures are returned from the same directory pass as the loaded
 /// plugins, so callers can validate the exact snapshot they discovered.
 pub fn discover(cfg: &Config, config_dir: &Path) -> (Vec<LoadedPlugin>, Vec<SpecProblem>) {
+    let (plugins, problems, _) = discover_with_digests(cfg, config_dir);
+    (plugins, problems)
+}
+
+fn discover_with_digests(
+    cfg: &Config,
+    config_dir: &Path,
+) -> (Vec<LoadedPlugin>, Vec<SpecProblem>, Vec<String>) {
     let mut out: Vec<LoadedPlugin> = cfg
         .plugins
         .iter()
@@ -98,30 +269,47 @@ pub fn discover(cfg: &Config, config_dir: &Path) -> (Vec<LoadedPlugin>, Vec<Spec
             trusted_native_ignored: false,
         })
         .collect();
-    let plugins_dir = config_dir.join("plugins");
+    let mut source_digests = Vec::new();
     let mut problems = Vec::new();
+    for plugin in &out {
+        match serde_json::to_vec(&plugin.spec) {
+            Ok(encoded) => source_digests.push(digest_bytes(&encoded)),
+            Err(error) => {
+                problems.push(SpecProblem {
+                    plugin: plugin.spec.manifest.id.as_str().to_string(),
+                    problem: format!("could not digest [[plugins]] entry: {error}"),
+                });
+                source_digests.push(String::new());
+            }
+        }
+    }
+    let plugins_dir = config_dir.join("plugins");
     match std::fs::metadata(&plugins_dir) {
         Ok(metadata) if !metadata.is_dir() => {
             problems.push(discovery_problem(
                 &plugins_dir,
                 "plugins path is not a directory".into(),
             ));
-            return (out, problems);
+            return (out, problems, source_digests);
         }
         Ok(_) => {}
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return (out, problems),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return (out, problems, source_digests);
+        }
         Err(error) => {
             problems.push(discovery_problem(&plugins_dir, error.to_string()));
-            return (out, problems);
+            return (out, problems, source_digests);
         }
     }
 
     let entries = match std::fs::read_dir(&plugins_dir) {
         Ok(entries) => entries,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return (out, problems),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return (out, problems, source_digests);
+        }
         Err(error) => {
             problems.push(discovery_problem(&plugins_dir, error.to_string()));
-            return (out, problems);
+            return (out, problems, source_digests);
         }
     };
     let mut dirs = Vec::new();
@@ -166,7 +354,7 @@ pub fn discover(cfg: &Config, config_dir: &Path) -> (Vec<LoadedPlugin>, Vec<Spec
         problems.sort_by(|left, right| {
             (&left.plugin, &left.problem).cmp(&(&right.plugin, &right.problem))
         });
-        return (out, problems);
+        return (out, problems, source_digests);
     }
     for (dir, metadata) in manifests {
         let manifest_path = dir.join("plugin.toml");
@@ -197,15 +385,21 @@ pub fn discover(cfg: &Config, config_dir: &Path) -> (Vec<LoadedPlugin>, Vec<Spec
                 if bytes.len() > MAX_MANIFEST_BYTES {
                     return Err(format!("plugin.toml exceeds {MAX_MANIFEST_BYTES} bytes"));
                 }
-                String::from_utf8(bytes).map_err(|error| error.to_string())
+                let source_digest = digest_bytes(&bytes);
+                String::from_utf8(bytes)
+                    .map(|text| (text, source_digest))
+                    .map_err(|error| error.to_string())
             })
-            .and_then(|text| {
-                toml::from_str::<PluginSpec>(&text).map_err(|error| error.to_string())
+            .and_then(|(text, source_digest)| {
+                toml::from_str::<PluginSpec>(&text)
+                    .map(|spec| (spec, source_digest))
+                    .map_err(|error| error.to_string())
             });
         match parsed {
-            Ok(mut spec) => {
+            Ok((mut spec, source_digest)) => {
                 let trusted_native_ignored = spec.trusted_native;
                 spec.trusted_native = false;
+                source_digests.push(source_digest);
                 out.push(LoadedPlugin {
                     spec,
                     dir: Some(dir),
@@ -223,7 +417,7 @@ pub fn discover(cfg: &Config, config_dir: &Path) -> (Vec<LoadedPlugin>, Vec<Spec
     }
     problems
         .sort_by(|left, right| (&left.plugin, &left.problem).cmp(&(&right.plugin, &right.problem)));
-    (out, problems)
+    (out, problems, source_digests)
 }
 
 fn discovery_problem(path: &Path, problem: String) -> SpecProblem {
@@ -252,6 +446,29 @@ pub fn negotiate(spec: &PluginSpec) -> Result<NegotiatedManifest, String> {
 
 /// Validate one loaded plugin; empty = clean.
 pub fn check_spec(p: &LoadedPlugin) -> Vec<SpecProblem> {
+    let mut out = check_spec_fields(p);
+    match negotiate(&p.spec) {
+        Err(e) => out.push(SpecProblem {
+            plugin: p.spec.manifest.id.as_str().to_string(),
+            problem: e,
+        }),
+        Ok(neg) => {
+            for rejected in &neg.rejected_contributions {
+                out.push(SpecProblem {
+                    plugin: p.spec.manifest.id.as_str().to_string(),
+                    problem: format!(
+                        "contribution {:?} rejected: {}",
+                        rejected.contribution.id.as_str(),
+                        rejected.reason
+                    ),
+                });
+            }
+        }
+    }
+    out
+}
+
+fn check_spec_fields(p: &LoadedPlugin) -> Vec<SpecProblem> {
     let id = p.spec.manifest.id.as_str().to_string();
     let mut out = Vec::new();
     let mut push = |problem: String| {
@@ -325,18 +542,6 @@ pub fn check_spec(p: &LoadedPlugin) -> Vec<SpecProblem> {
                 }
             } else if thegn_core::util::which_path(program).is_none() {
                 push(format!("command not on PATH: {program}"));
-            }
-        }
-    }
-    match negotiate(&p.spec) {
-        Err(e) => push(e),
-        Ok(neg) => {
-            for rejected in &neg.rejected_contributions {
-                push(format!(
-                    "contribution {:?} rejected: {}",
-                    rejected.contribution.id.as_str(),
-                    rejected.reason
-                ));
             }
         }
     }
@@ -917,5 +1122,83 @@ mod tests {
         assert!(check_loaded(&loaded, Vec::new()).is_empty());
         assert!(native_trust_refusal(&loaded[0]).is_some());
         assert!(native_trust_refusal(&loaded[1]).is_none());
+    }
+
+    #[test]
+    fn admit_marks_a_negotiate_failure_invalid_and_blocks_startable() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut invalid = spec("future", vec!["true".into()]);
+        invalid.manifest.api = ApiVersion::new(9, 0, 0);
+        let cfg = Config {
+            plugins: vec![invalid],
+            ..Default::default()
+        };
+
+        let admitted = admit(&cfg, tmp.path());
+        let PluginDecision::Invalid(problems) = &admitted.plugins[0].decision else {
+            panic!("incompatible api must be invalid");
+        };
+        assert!(
+            problems
+                .iter()
+                .any(|problem| problem.problem.contains("incompatible api"))
+        );
+        assert_eq!(admitted.startable().unwrap_err(), admitted.problems());
+    }
+
+    #[test]
+    fn admit_records_stable_digests_that_change_with_manifest_bytes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("plugins/digest");
+        std::fs::create_dir_all(&dir).unwrap();
+        let manifest = dir.join("plugin.toml");
+        let source = toml::to_string(&spec("digest", vec!["true".into()])).unwrap();
+        std::fs::write(&manifest, &source).unwrap();
+
+        let first = admit(&Config::default(), tmp.path());
+        let same = admit(&Config::default(), tmp.path());
+        assert_eq!(
+            first.plugins[0].source_digest,
+            same.plugins[0].source_digest
+        );
+        assert_eq!(first.digest, same.digest);
+
+        std::fs::write(&manifest, format!("{source}\n")).unwrap();
+        let changed = admit(&Config::default(), tmp.path());
+        assert_ne!(
+            first.plugins[0].source_digest,
+            changed.plugins[0].source_digest
+        );
+        assert_ne!(first.digest, changed.digest);
+    }
+
+    #[test]
+    fn admit_set_problems_include_duplicate_ids_and_discovery_errors() {
+        let tmp = tempfile::tempdir().unwrap();
+        let bad_dir = tmp.path().join("plugins/broken");
+        std::fs::create_dir_all(&bad_dir).unwrap();
+        std::fs::write(bad_dir.join("plugin.toml"), "not = [valid").unwrap();
+        let cfg = Config {
+            plugins: vec![
+                spec("same", vec!["true".into()]),
+                spec("same", vec!["true".into()]),
+            ],
+            ..Default::default()
+        };
+
+        let admitted = admit(&cfg, tmp.path());
+        assert!(
+            admitted
+                .set_problems
+                .iter()
+                .any(|problem| problem.problem == "duplicate plugin id")
+        );
+        assert!(
+            admitted
+                .set_problems
+                .iter()
+                .any(|problem| problem.problem.contains("plugin.toml does not parse"))
+        );
+        assert_eq!(admitted.problems(), admitted.startable().unwrap_err());
     }
 }
