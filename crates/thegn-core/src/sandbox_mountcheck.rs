@@ -40,6 +40,101 @@ use crate::config::FileAccess;
 use crate::sandbox::{Backend, SandboxSpec};
 use crate::sandbox_backend::HostOs;
 
+/// Filesystem identity captured for a local writable bind source.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MountIdentity {
+    pub dev: u64,
+    pub ino: u64,
+    pub kind: MountKind,
+    pub uid: u32,
+}
+
+/// The leaf type of a mount source, including symlinks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MountKind {
+    Dir,
+    File,
+    Symlink,
+    Other,
+}
+
+/// Read a leaf's identity without following it. Unsupported platforms cannot
+/// attest the Unix identity tuple and rely on the runtime inspect check.
+pub fn mount_identity(_path: &std::path::Path) -> Option<MountIdentity> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+
+        let metadata = std::fs::symlink_metadata(_path).ok()?;
+        let file_type = metadata.file_type();
+        let kind = if file_type.is_dir() {
+            MountKind::Dir
+        } else if file_type.is_file() {
+            MountKind::File
+        } else if file_type.is_symlink() {
+            MountKind::Symlink
+        } else {
+            MountKind::Other
+        };
+        Some(MountIdentity {
+            dev: metadata.dev(),
+            ino: metadata.ino(),
+            kind,
+            uid: metadata.uid(),
+        })
+    }
+    #[cfg(not(unix))]
+    {
+        None
+    }
+}
+
+/// Snapshot identities for every trackable local writable, non-cache bind.
+pub fn admitted_identities(spec: &SandboxSpec) -> Vec<(String, MountIdentity)> {
+    if !spec.placement.is_local() {
+        return Vec::new();
+    }
+    spec.mounts
+        .iter()
+        .filter(|mount| !mount.ro && !mount.cache)
+        .filter_map(|mount| {
+            mount_identity(&mount.host)
+                .map(|identity| (mount.host.to_string_lossy().into_owned(), identity))
+        })
+        .collect()
+}
+
+/// Return the first admitted source that disappeared or changed identity.
+pub fn identity_drift(
+    admitted: &[(String, MountIdentity)],
+    now: &dyn Fn(&str) -> Option<MountIdentity>,
+) -> Option<String> {
+    admitted.iter().find_map(|(path, identity)| {
+        (now(path) != Some(*identity)).then(|| format!("mount source changed: {path}"))
+    })
+}
+
+/// Outcome of checking the newly-created container and its bind sources.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PostCreate {
+    Ready,
+    NotRunning,
+    Drift(String),
+}
+
+/// Combine runtime inspection with the host-side identity re-attestation.
+pub fn post_create_verdict(running: bool, reusable: bool, drift: Option<String>) -> PostCreate {
+    if !running {
+        PostCreate::NotRunning
+    } else if !reusable {
+        PostCreate::Drift("inspected bind sources differ from the admitted mounts".to_string())
+    } else if let Some(why) = drift {
+        PostCreate::Drift(why)
+    } else {
+        PostCreate::Ready
+    }
+}
+
 /// Printed to stderr by the in-container probe for the one failure a runtime
 /// cannot report. Matched by [`parse_missing_sentinel`].
 ///

@@ -227,6 +227,161 @@ fn probe<'a>(os: HostOs, backend: Backend, worktree: &'a str, missing: &'a str) 
     }
 }
 
+fn reattest_source() -> (tempfile::TempDir, PathBuf) {
+    let root = tempfile::tempdir().unwrap();
+    let source = root.path().join("source");
+    std::fs::create_dir(&source).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&source, std::fs::Permissions::from_mode(0o700)).unwrap();
+    }
+    (root, source)
+}
+
+fn reattest_mount_spec(source: PathBuf) -> SandboxSpec {
+    let mut s = spec(Backend::Podman);
+    s.mounts = vec![Mount {
+        host: source.clone(),
+        dest: source,
+        ro: false,
+        cache: false,
+    }];
+    s
+}
+
+#[test]
+fn reattest_identity_unchanged_is_ready() {
+    let (_root, source) = reattest_source();
+    let s = reattest_mount_spec(source);
+    let admitted = admitted_identities(&s);
+    #[cfg(unix)]
+    assert_eq!(admitted.len(), 1);
+    assert_eq!(
+        identity_drift(&admitted, &|p| mount_identity(std::path::Path::new(p))),
+        None
+    );
+    assert_eq!(post_create_verdict(true, true, None), PostCreate::Ready);
+}
+
+#[cfg(unix)]
+#[test]
+fn reattest_dir_swapped_for_symlink_is_drift() {
+    let (root, source) = reattest_source();
+    let (_target_root, target) = reattest_source();
+    let s = reattest_mount_spec(source.clone());
+    let admitted = admitted_identities(&s);
+    let held = root.path().join("source-held");
+    std::fs::rename(&source, &held).unwrap();
+    std::os::unix::fs::symlink(&target, &source).unwrap();
+
+    let drift = identity_drift(&admitted, &|p| mount_identity(std::path::Path::new(p)));
+    assert!(
+        drift
+            .as_ref()
+            .is_some_and(|why| why.contains(&source.to_string_lossy().to_string()))
+    );
+    assert!(matches!(
+        post_create_verdict(true, true, drift),
+        PostCreate::Drift(_)
+    ));
+}
+
+#[cfg(unix)]
+#[test]
+fn reattest_replaced_dir_is_drift() {
+    let (root, source) = reattest_source();
+    let s = reattest_mount_spec(source.clone());
+    let admitted = admitted_identities(&s);
+    let held = root.path().join("source-held");
+    std::fs::rename(&source, &held).unwrap();
+    std::fs::create_dir(&source).unwrap();
+
+    assert!(identity_drift(&admitted, &|p| mount_identity(std::path::Path::new(p))).is_some());
+}
+
+#[test]
+fn reattest_missing_source_is_drift() {
+    let (_root, source) = reattest_source();
+    let s = reattest_mount_spec(source.clone());
+    let admitted = admitted_identities(&s);
+    std::fs::remove_dir(&source).unwrap();
+
+    #[cfg(unix)]
+    assert!(identity_drift(&admitted, &|p| mount_identity(std::path::Path::new(p))).is_some());
+    #[cfg(not(unix))]
+    assert!(admitted.is_empty());
+}
+
+#[test]
+fn reattest_inspect_mismatch_is_drift_and_not_running_falls_through() {
+    assert!(matches!(
+        post_create_verdict(true, false, None),
+        PostCreate::Drift(_)
+    ));
+    assert_eq!(
+        post_create_verdict(false, false, None),
+        PostCreate::NotRunning
+    );
+    assert_eq!(
+        post_create_verdict(false, true, None),
+        PostCreate::NotRunning
+    );
+}
+
+#[test]
+fn reattest_ro_and_cache_mounts_are_not_tracked() {
+    let root = tempfile::tempdir().unwrap();
+    let writable = root.path().join("rw");
+    let read_only = root.path().join("ro");
+    let cache = root.path().join("cache");
+    #[cfg(unix)]
+    let writable_path = writable.to_string_lossy().into_owned();
+    for path in [&writable, &read_only, &cache] {
+        std::fs::create_dir(path).unwrap();
+    }
+    let mut s = spec(Backend::Podman);
+    s.mounts = vec![
+        Mount {
+            host: writable.clone(),
+            dest: writable,
+            ro: false,
+            cache: false,
+        },
+        Mount {
+            host: read_only.clone(),
+            dest: read_only,
+            ro: true,
+            cache: false,
+        },
+        Mount {
+            host: cache.clone(),
+            dest: cache,
+            ro: false,
+            cache: true,
+        },
+    ];
+    let admitted = admitted_identities(&s);
+    #[cfg(unix)]
+    assert_eq!(
+        admitted
+            .iter()
+            .map(|(path, _)| path.as_str())
+            .collect::<Vec<_>>(),
+        vec![writable_path.as_str()]
+    );
+    #[cfg(not(unix))]
+    assert!(admitted.is_empty());
+
+    s.placement = Placement::Ssh(crate::placement::SshPlacement::plain(
+        "box".into(),
+        22,
+        false,
+        crate::placement::TransportKind::Ssh,
+    ));
+    assert!(admitted_identities(&s).is_empty());
+}
+
 #[test]
 fn remedy_is_runtime_and_os_specific() {
     let no_colima = |_: &str| false;
