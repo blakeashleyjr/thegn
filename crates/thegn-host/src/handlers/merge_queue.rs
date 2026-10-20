@@ -1283,15 +1283,22 @@ fn conflict_row_status(driver_refusal: Option<&str>) -> MqStatus {
     }
 }
 
-/// Land a `ready` row (the section's `l`): the same fold/gate/CAS core as
-/// `thegn merge land`, recording the outcome on the queue row. Returns the
-/// terminal `DriveMsg` (a `Done` clears the inflight flag).
+/// Land a ready, local, unclaimed queue row (the section's `l`): the same
+/// fold/gate/CAS core as `thegn merge land`, recording the outcome on the queue
+/// row. Returns the terminal `DriveMsg` (a `Done` clears the inflight flag).
 fn land_ready(cfg: &thegn_core::config::Config, wt: &str) -> DriveMsg {
+    let db = Db::open().map_err(|error| error.to_string());
+    let db_ref = match &db {
+        Ok(db) => db,
+        Err(error) => return DriveMsg::Failed(format!("land: {error}")),
+    };
+    if let Err(error) = crate::merge_ops::ready_land_precheck(db_ref, wt) {
+        return DriveMsg::Failed(format!("land: {error}"));
+    }
     let (branch, target, outcome) = match crate::cmd::land::land_branch(cfg, Path::new(wt)) {
         Ok(r) => r,
         Err(e) => return DriveMsg::Failed(format!("land: {e}")),
     };
-    let db = Db::open().map_err(|error| error.to_string());
     let record = |status: MqStatus,
                   oid: Option<&str>,
                   conflict_paths: Option<&str>,
