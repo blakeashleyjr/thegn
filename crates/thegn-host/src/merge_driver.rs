@@ -279,12 +279,11 @@ pub(crate) fn drive_queue(
                                 ),
                             }));
                         }
-                        let adopted_tip = match adopted {
-                            Some(Ok(tip)) => Some(tip),
-                            Some(Err(_)) | None => None,
-                        };
-                        let live_tip =
-                            util::git_out(repo_root, &["rev-parse", &candidate.branch_ref]);
+                        let adopted_tip = adopted.and_then(Result::ok);
+                        let live_tip = util::git_out(
+                            repo_root,
+                            &["rev-parse", "--verify", "-q", &candidate.branch_ref],
+                        );
                         if let Err(reason) = candidate_drift(
                             Some(candidate),
                             adopted_tip.as_deref(),
@@ -348,10 +347,11 @@ pub(crate) fn drive_queue(
                                             "worktree HEAD is unavailable".to_string()
                                         })?;
                                 let branch_ref = format!("refs/heads/{branch}");
-                                let tip = util::git_out(repo_root, &["rev-parse", &branch_ref])
-                                    .ok_or_else(|| {
-                                        "queued branch tip is unavailable".to_string()
-                                    })?;
+                                let tip = util::git_out(
+                                    repo_root,
+                                    &["rev-parse", "--verify", "-q", &branch_ref],
+                                )
+                                .ok_or_else(|| "queued branch tip is unavailable".to_string())?;
                                 if head != tip {
                                     return Err(format!(
                                         "worktree HEAD {head} differs from branch tip {tip}"
@@ -2065,21 +2065,35 @@ mod tests {
             let queued = bound_item(&db, &feat_wt);
             let sentinel = root.join("fixer-ran");
             let fixer = format!("touch {} && git switch -q -c other", sentinel.display());
+            let mut statuses = Vec::new();
             let outcome = drive_queue(
                 &cfg(&fixer, 2),
                 &Config::default(),
                 &root,
                 &db,
                 vec![queued],
-                |_| {},
+                |step| statuses.push(step.status.to_string()),
             );
             assert_eq!(out(&root, &["rev-parse", "main"]), main_before);
             assert_eq!(outcome.agent_blocked, ["feat"]);
             assert!(sentinel.exists());
+            assert_eq!(
+                statuses
+                    .iter()
+                    .filter(|status| status.as_str() == "folding")
+                    .count(),
+                1,
+                "the drift hold must happen before a second fold"
+            );
             let row = db.list_merge_queue().unwrap().remove(0);
             assert_eq!(row.status, "agent_blocked");
             assert_eq!(row.agent_attempts, 1);
-            assert!(row.error_detail.unwrap().contains("identity drift"));
+            let detail = row.error_detail.unwrap();
+            assert!(
+                detail.contains("fixer left the worktree off the queued branch"),
+                "{detail}"
+            );
+            assert!(detail.contains("re-enqueue"), "{detail}");
         }
 
         #[test]
