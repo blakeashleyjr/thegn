@@ -53,11 +53,13 @@ impl PoolStore for Db {
     fn insert_pool_spare(&self, name: &str, repo: &str, env: &str) -> Result<()> {
         let now = util::now();
         self.conn().execute(
-            "INSERT OR REPLACE INTO pool_spares
+            "INSERT INTO pool_spares
                (sandbox_name,repo_path,env_name,state,checkpoint_id,lock_hash,created_at,updated_at)
              VALUES(?1,?2,?3,'provisioning',NULL,NULL,?4,?4)",
             params![name, repo, env, now],
-        )?;
+        ).map_err(|error| anyhow::anyhow!(
+            "warm pool: spare {name} already has a ledger row or could not be inserted: {error}"
+        ))?;
         Ok(())
     }
 
@@ -67,11 +69,16 @@ impl PoolStore for Db {
         checkpoint_id: Option<&str>,
         lock_hash: &str,
     ) -> Result<()> {
-        self.conn().execute(
+        let changed = self.conn().execute(
             "UPDATE pool_spares SET state='ready', checkpoint_id=?2, lock_hash=?3, updated_at=?4
              WHERE sandbox_name=?1",
             params![name, checkpoint_id, lock_hash, util::now()],
         )?;
+        if changed != 1 {
+            return Err(anyhow::anyhow!(
+                "warm pool: spare {name} has no ledger row to mark ready"
+            ));
+        }
         Ok(())
     }
 
@@ -131,10 +138,16 @@ impl PoolStore for Db {
             }
         };
         if let Some((ref name, _)) = picked {
-            tx.execute(
-                "UPDATE pool_spares SET state='claimed', updated_at=?2 WHERE sandbox_name=?1",
+            let changed = tx.execute(
+                "UPDATE pool_spares SET state='claimed', updated_at=?2
+                 WHERE sandbox_name=?1 AND state='ready'",
                 params![name, util::now()],
             )?;
+            if changed != 1 {
+                return Err(anyhow::anyhow!(
+                    "warm pool: spare {name} was not exactly one ready ledger row to claim"
+                ));
+            }
             tx.execute(
                 "UPDATE worktrees SET provider_sandbox_id=?2 WHERE worktree=?1",
                 params![worktree, name],
@@ -251,6 +264,78 @@ mod tests {
 
         db.delete_pool_spare("repo-pool-1").unwrap();
         assert!(db.pool_spare_by_name("repo-pool-1").unwrap().is_none());
+    }
+
+    #[test]
+    fn spare_ledger_insert_refuses_existing_name() {
+        let db = Db::open_memory().unwrap();
+        db.insert_pool_spare("x", "/repo", "sprites").unwrap();
+        db.set_pool_spare_ready("x", Some("checkpoint-x"), "lock-x")
+            .unwrap();
+
+        assert!(db.insert_pool_spare("x", "/other", "other-env").is_err());
+
+        let row = db.pool_spare_by_name("x").unwrap().unwrap();
+        assert_eq!(row.state, "ready");
+        assert_eq!(row.repo_path, "/repo");
+        assert_eq!(row.env_name, "sprites");
+        assert_eq!(row.checkpoint_id.as_deref(), Some("checkpoint-x"));
+        assert_eq!(row.lock_hash.as_deref(), Some("lock-x"));
+    }
+
+    #[test]
+    fn spare_ledger_ready_requires_one_row() {
+        let db = Db::open_memory().unwrap();
+        assert!(
+            db.set_pool_spare_ready("missing", Some("cp"), "lock")
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn spare_ledger_claim_updates_exactly_one_ready_row() {
+        let db = Db::open_memory().unwrap();
+        db.insert_pool_spare("first", "/repo", "sprites").unwrap();
+        db.insert_pool_spare("second", "/repo", "sprites").unwrap();
+        db.set_pool_spare_ready("first", Some("cp-first"), "lock")
+            .unwrap();
+        db.set_pool_spare_ready("second", Some("cp-second"), "lock")
+            .unwrap();
+
+        let claimed = db
+            .claim_pool_spare("/repo", "sprites", "/wt/x")
+            .unwrap()
+            .unwrap();
+
+        let first = db.pool_spare_by_name("first").unwrap().unwrap();
+        let second = db.pool_spare_by_name("second").unwrap().unwrap();
+        let claimed_count = [&first.state, &second.state]
+            .into_iter()
+            .filter(|state| state.as_str() == "claimed")
+            .count();
+        assert_eq!(claimed_count, 1);
+        let other = if claimed.0 == "first" { second } else { first };
+        assert_eq!(other.state, "ready");
+    }
+
+    #[test]
+    fn spare_ledger_claim_refuses_when_update_changes_no_rows() {
+        let db = Db::open_memory().unwrap();
+        db.insert_pool_spare("held", "/repo", "sprites").unwrap();
+        db.set_pool_spare_ready("held", Some("cp"), "lock").unwrap();
+        db.conn()
+            .execute_batch(
+                "CREATE TRIGGER keep_spare_ready BEFORE UPDATE ON pool_spares
+                 WHEN OLD.sandbox_name = 'held'
+                 BEGIN SELECT RAISE(IGNORE); END;",
+            )
+            .unwrap();
+
+        assert!(db.claim_pool_spare("/repo", "sprites", "/wt/x").is_err());
+        assert_eq!(
+            db.pool_spare_by_name("held").unwrap().unwrap().state,
+            "ready"
+        );
     }
 
     #[test]
