@@ -601,7 +601,7 @@ impl WorktreeAuxStore for Db {
         candidate_oid: &str,
     ) -> Result<bool> {
         let changed = self.conn().execute(
-            "UPDATE merge_queue SET status='folding', candidate_oid=?1, updated_at=?2 \
+            "UPDATE merge_queue SET candidate_oid=?1, updated_at=?2 \
              WHERE worktree=?3 AND branch_ref=?4 AND candidate_oid=?5 \
              AND status='folding'",
             params![
