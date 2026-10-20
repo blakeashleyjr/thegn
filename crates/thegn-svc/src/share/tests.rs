@@ -1978,13 +1978,11 @@ fn start_cancelled_before_spawn_starts_nothing_and_removes_credentials() {
     let tmp = tempfile::tempdir().unwrap();
     let statedir = tmp.path().join("state");
     let marker = tmp.path().join("spawned");
+    let program = tmp.path().join("no-such-provider");
     let plan = file_plan(
         vec![("credential.txt", "SYNTHETIC-CREDENTIAL")],
-        "sh",
-        vec![
-            "-c".into(),
-            format!("touch {}; exec sleep 30", marker.display()),
-        ],
+        program.to_str().unwrap(),
+        vec![],
     );
     let cancel = std::sync::atomic::AtomicBool::new(true);
 

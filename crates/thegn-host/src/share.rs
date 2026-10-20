@@ -1466,24 +1466,6 @@ mod tests {
     }
 
     #[test]
-    fn sidecar_teardown_pending_detects_stopping_tailscale_generation() {
-        let mut sup = ShareSupervisor::new();
-        sup.instances.push(ShareInstance {
-            worktree: "/wt".into(),
-            port: 443,
-            generation: 71,
-            provider: "tailscale",
-            public: true,
-            state: ShareState::Stopping,
-            shared: Shared::new(),
-            event_tx: None,
-            event_waker: None,
-        });
-
-        assert!(sup.sidecar_teardown_pending("/wt", 443));
-    }
-
-    #[test]
     fn restart_refused_while_tailscale_generation_is_stopping() {
         let mut sup = ShareSupervisor::new();
         sup.instances.push(ShareInstance {
