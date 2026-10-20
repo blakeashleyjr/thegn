@@ -1320,6 +1320,14 @@ impl Db {
         }
     }
 
+    /// File path used by the merge drain's lease heartbeat to open its own connection.
+    pub fn file_path(&self) -> Option<PathBuf> {
+        self.conn()
+            .path()
+            .filter(|path| !path.is_empty())
+            .map(PathBuf::from)
+    }
+
     /// Open the canonical state DB for one explicitly cataloged operation,
     /// without creating it and without running initialization, migrations,
     /// startup pruning, journal pragmas, or a `user_version` write.

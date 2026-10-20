@@ -371,3 +371,14 @@ fn expired_claim_recovers_after_owner_writes_active_status() {
     assert_eq!(recovered.generation, 2);
     assert_eq!(db.list_merge_queue().unwrap()[0].status, "folding");
 }
+
+#[test]
+fn agent_blocked_rows_are_admissible() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = fixture(&dir.path().join("claims.sqlite"));
+    db.replace_merge_status(WT, "agent_blocked", &MergeStatusFields::default())
+        .unwrap();
+    let mut expected = request();
+    expected.expected_status = "agent_blocked".into();
+    assert!(db.admit_merge_claim(&expected).unwrap().is_some());
+}
