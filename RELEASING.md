@@ -70,18 +70,16 @@ install github:blakeashleyjr/thegn` gives users `.#default`, bridge included,
    by the workflow — no manual checkbox needed.
 
    > **Warning — retrying a failed run.** If some matrix legs fail, use
-   > **"Re-run failed jobs" on the original workflow run**. Do NOT re-dispatch
-   > the workflow for a tag whose release already exists: the create-release
-   > step deletes the existing release (draft notes included — even a
-   > _published_ release) and recreates it as an empty draft. Reserve
-   > `workflow_dispatch` for full from-scratch rebuilds where losing the
-   > release is acceptable.
+   > **"Re-run failed jobs" on the original workflow run**. Re-dispatching a
+   > build for a tag with an existing draft resumes that draft without changing
+   > its notes or assets. A published release makes `create-release` fail before
+   > uploads and is never deleted; cut a new tag to rebuild a published version.
 
 7. **Publish generated external metadata only after the draft is published.**
    In Actions, dispatch the `release` workflow from `main`, enter the already
    published tag, and choose `publish-external`. This operation is isolated
-   from `create-release`, so it cannot trigger the destructive release-recreate
-   path described above or change any release asset. Approve the protected
+   from `create-release`, so it cannot change any release asset. Approve the
+   protected
    `package-publication` environment when prompted.
 
    The job downloads the generated formula and `PKGBUILD` from the published
@@ -104,6 +102,9 @@ install github:blakeashleyjr/thegn` gives users `.#default`, bridge included,
    - Rehearse both generated outputs locally: install from a disposable local
      tap and run `makepkg --printsrcinfo` plus `makepkg` in a disposable AUR
      checkout.
+   - Add the `aur.archlinux.org` host key to `.github/known_hosts` after
+     checking it against the fingerprints published on the AUR home page with
+     `ssh-keygen -lf`.
    - Only after the rehearsal passes, set repository variable
      `PACKAGE_PUBLICATION_ENABLED=true` and dispatch `publish-external`.
 
