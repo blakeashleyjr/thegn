@@ -3,7 +3,7 @@
 //! pre-warms neighbor tabs, replaces dead sole center panes, and resolves the
 //! shell/tool argv new panes run.
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use tokio::sync::mpsc as tokio_mpsc;
 
 use termwiz::terminal::TerminalWaker;
