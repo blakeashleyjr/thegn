@@ -41,7 +41,16 @@ pub fn tick(cfg: &Config) {
     if envs.is_empty() {
         return;
     }
-    if !registry::list().iter().any(|r| r.provider == "fly") {
+    let view = match registry::list_checked() {
+        Ok(view) => view,
+        Err(error) => {
+            thegn_core::msg::warn(&format!(
+                "fly reaper: skipped fly: ledger unreadable ({error:#}); no provider or ledger actions attempted"
+            ));
+            return;
+        }
+    };
+    if !has_fly_work(&view) {
         return;
     }
     static LAST: std::sync::Mutex<Option<Instant>> = std::sync::Mutex::new(None);
@@ -106,8 +115,22 @@ fn reap(envs: &[EnvProviderConfig]) {
 }
 
 fn reap_unambiguous(pc: &EnvProviderConfig) {
+    let view = match registry::list_checked() {
+        Ok(view) => view,
+        Err(error) => {
+            thegn_core::msg::warn(&format!(
+                "fly reaper: skipped fly: ledger unreadable ({error:#}); no provider or ledger actions attempted"
+            ));
+            return;
+        }
+    };
+    for name in &view.unreadable {
+        thegn_core::msg::warn(&format!(
+            "fly reaper: quarantined {name}: ledger record unreadable; reconcile ownership; no deletion attempted"
+        ));
+    }
     let now = thegn_core::util::now();
-    for rec in registry::list().into_iter().filter(|r| r.provider == "fly") {
+    for rec in view.records.into_iter().filter(|r| r.provider == "fly") {
         // Legacy created_at is local intent/finalization time, not provider
         // machine age. Never promote it into destructive age evidence.
         if pc.max_lifetime_secs == 0 && rec.state != "creating" {
@@ -183,6 +206,10 @@ fn reap_unambiguous(pc: &EnvProviderConfig) {
         // destroyed out-of-band leaves only a harmless (non-billing) stale record
         // that the next attach re-resolves — not worth an extra API call here.
     }
+}
+
+fn has_fly_work(view: &registry::LedgerView) -> bool {
+    view.records.iter().any(|record| record.provider == "fly") || !view.unreadable.is_empty()
 }
 
 /// Ordered fail-closed lifecycle: provider capability, route-token revocation,
@@ -268,6 +295,15 @@ mod tests {
             assert!(result.is_err());
             assert_eq!(calls.get(), 0);
         }
+    }
+
+    #[test]
+    fn checked_ledger_unreadable_entry_is_reported() {
+        let view = registry::LedgerView {
+            records: Vec::new(),
+            unreadable: vec!["broken".into()],
+        };
+        assert!(has_fly_work(&view));
     }
 
     #[test]
