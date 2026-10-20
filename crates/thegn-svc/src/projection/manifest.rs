@@ -20,12 +20,18 @@ pub enum ProjectionOwnershipError {
 impl std::fmt::Display for ProjectionOwnershipError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Missing(path) => write!(
-                f,
-                "projection manifest {} is missing; move {} aside and mount again",
-                path.display(),
-                path.display()
-            ),
+            Self::Missing(path) => {
+                let manifest = path.display();
+                let mountpoint = path
+                    .to_string_lossy()
+                    .strip_suffix(".thegn-projection")
+                    .map(str::to_owned)
+                    .unwrap_or_else(|| path.display().to_string());
+                write!(
+                    f,
+                    "no ownership manifest at {manifest}; move {mountpoint} aside and mount again"
+                )
+            }
             Self::Malformed(message) => write!(
                 f,
                 "malformed projection manifest: {message}; move the manifest aside and mount again"
@@ -69,7 +75,34 @@ pub(super) fn claim_or_verify(spec: &ProjectionSpec) -> Result<(), ProjectionOwn
 
     let manifest = manifest_path(spec);
     match std::fs::symlink_metadata(&manifest) {
-        Ok(_) => return verify(spec),
+        Ok(_) => {
+            verify(spec)?;
+            match std::fs::symlink_metadata(mountpoint) {
+                Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_dir() => {
+                    return Err(ProjectionOwnershipError::Unsafe(format!(
+                        "{} is not a real directory",
+                        mountpoint.display()
+                    )));
+                }
+                Ok(_) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    fsperm::ensure_private_dir(mountpoint).map_err(|error| {
+                        ProjectionOwnershipError::Unsafe(format!(
+                            "{}: {error}",
+                            mountpoint.display()
+                        ))
+                    })?;
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotConnected => {}
+                Err(error) => {
+                    return Err(ProjectionOwnershipError::Unsafe(format!(
+                        "{}: {error}",
+                        mountpoint.display()
+                    )));
+                }
+            }
+            return Ok(());
+        }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
         Err(error) => {
             return Err(ProjectionOwnershipError::Unsafe(format!(
@@ -127,7 +160,6 @@ pub(super) fn claim_or_verify(spec: &ProjectionSpec) -> Result<(), ProjectionOwn
 }
 
 pub(super) fn verify(spec: &ProjectionSpec) -> Result<(), ProjectionOwnershipError> {
-    let mountpoint = Path::new(&spec.mountpoint);
     let manifest = manifest_path(spec);
     let metadata = match std::fs::symlink_metadata(&manifest) {
         Ok(metadata) => metadata,
@@ -221,15 +253,6 @@ pub(super) fn verify(spec: &ProjectionSpec) -> Result<(), ProjectionOwnershipErr
     if identity != Some(spec.identity_digest().as_str()) {
         return Err(ProjectionOwnershipError::Mismatch(manifest));
     }
-    let mountpoint_metadata = std::fs::symlink_metadata(mountpoint).map_err(|error| {
-        ProjectionOwnershipError::Unsafe(format!("{}: {error}", mountpoint.display()))
-    })?;
-    if mountpoint_metadata.file_type().is_symlink() || !mountpoint_metadata.is_dir() {
-        return Err(ProjectionOwnershipError::Unsafe(format!(
-            "{} is not a real directory",
-            mountpoint.display()
-        )));
-    }
     Ok(())
 }
 
@@ -310,6 +333,35 @@ mod tests {
     }
 
     #[test]
+    fn matching_manifest_verifies_without_mountpoint() {
+        let (_root, spec) = fixture(DataMode::Sync);
+        claim_or_verify(&spec).expect("claim projection");
+        std::fs::remove_dir(&spec.mountpoint).expect("remove empty mountpoint");
+
+        verify(&spec).expect("manifest proves ownership without a live mountpoint");
+    }
+
+    #[test]
+    fn claim_recreates_removed_mountpoint_for_matching_manifest() {
+        let (_root, spec) = fixture(DataMode::Sync);
+        claim_or_verify(&spec).expect("claim projection");
+        std::fs::remove_dir(&spec.mountpoint).expect("remove empty mountpoint");
+
+        claim_or_verify(&spec).expect("recreate owned mountpoint");
+        assert!(Path::new(&spec.mountpoint).is_dir());
+    }
+
+    #[test]
+    fn missing_manifest_error_names_mountpoint_recovery_path() {
+        let (_root, spec) = fixture(DataMode::Sync);
+        let error = verify(&spec).expect_err("manifest is absent");
+        let message = error.to_string();
+
+        assert!(message.contains(&manifest_path(&spec).display().to_string()));
+        assert!(message.contains(&format!("move {} aside", spec.mountpoint)));
+    }
+
+    #[test]
     fn stale_manifest_for_another_identity_refuses() {
         let (_root, mut spec) = fixture(DataMode::Sync);
         claim_or_verify(&spec).expect("claim first identity");
@@ -332,7 +384,7 @@ mod tests {
     }
 
     #[test]
-    fn symlinked_or_group_readable_manifest_refuses() {
+    fn symlinked_manifest_refuses() {
         let (_root, spec) = fixture(DataMode::Sync);
         claim_or_verify(&spec).expect("claim projection");
         let manifest = manifest_path(&spec);
@@ -342,6 +394,33 @@ mod tests {
         if fsperm::create_symlink(&target, &manifest, false).is_err() {
             return;
         }
+        assert!(matches!(
+            verify(&spec),
+            Err(ProjectionOwnershipError::Unsafe(_))
+        ));
+    }
+
+    #[test]
+    fn group_or_other_readable_manifest_refuses() {
+        let (_root, spec) = fixture(DataMode::Sync);
+        claim_or_verify(&spec).expect("claim projection");
+        let manifest = manifest_path(&spec);
+        let mut permissions = std::fs::metadata(&manifest)
+            .expect("read manifest metadata")
+            .permissions();
+        #[expect(
+            clippy::permissions_set_readonly_false,
+            reason = "fixture makes the manifest group/world-writable"
+        )]
+        permissions.set_readonly(false);
+        std::fs::set_permissions(&manifest, permissions).expect("make manifest writable");
+        let Some(bits) = fsperm::mode_bits(&manifest).expect("read manifest permissions") else {
+            return;
+        };
+        if bits & 0o077 == 0 {
+            return;
+        }
+
         assert!(matches!(
             verify(&spec),
             Err(ProjectionOwnershipError::Unsafe(_))
