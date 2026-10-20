@@ -1388,12 +1388,13 @@ pub(crate) fn rollback_action(mode: thegn_core::config::DataMode) -> ProjectionR
     }
 }
 
+type ProjectionRollbackFn =
+    Box<dyn FnOnce(&thegn_core::projection::ProjectionSpec) -> anyhow::Result<()> + Send>;
+
 pub(crate) struct ProjectionLease {
     worktree: String,
     spec: thegn_core::projection::ProjectionSpec,
-    rollback: Option<
-        Box<dyn FnOnce(&thegn_core::projection::ProjectionSpec) -> anyhow::Result<()> + Send>,
-    >,
+    rollback: Option<ProjectionRollbackFn>,
 }
 
 impl ProjectionLease {
@@ -1401,9 +1402,7 @@ impl ProjectionLease {
         worktree: &str,
         spec: thegn_core::projection::ProjectionSpec,
         mount: impl FnOnce(&thegn_core::projection::ProjectionSpec) -> anyhow::Result<()>,
-        rollback: Box<
-            dyn FnOnce(&thegn_core::projection::ProjectionSpec) -> anyhow::Result<()> + Send,
-        >,
+        rollback: ProjectionRollbackFn,
         kind: &str,
         warnings: &mut Vec<String>,
     ) -> Option<Self> {
