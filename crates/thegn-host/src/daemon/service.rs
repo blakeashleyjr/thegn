@@ -570,6 +570,32 @@ fn dispatch_row_of(spec: &OpenSpec) -> Option<Result<i64, String>> {
         .map(|(_, value)| value.parse::<i64>().map_err(|error| error.to_string()))
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BoundRowKind {
+    Stage,
+    Tracker,
+    Missing,
+    Unknown,
+}
+
+/// The daemon trusts the dispatch row over the client stage flag; an unreadable
+/// row falls back to the client flag so tracker launches stay best-effort when
+/// the database is down.
+fn effective_stage_launch(client_stage: bool, kind: BoundRowKind) -> bool {
+    client_stage || matches!(kind, BoundRowKind::Stage | BoundRowKind::Missing)
+}
+
+fn classify_bound_row(
+    read: anyhow::Result<Option<thegn_core::issue::AgentDispatch>>,
+) -> BoundRowKind {
+    match read {
+        Ok(Some(dispatch)) if dispatch.stage.is_some() => BoundRowKind::Stage,
+        Ok(Some(_)) => BoundRowKind::Tracker,
+        Ok(None) => BoundRowKind::Missing,
+        Err(_) => BoundRowKind::Unknown,
+    }
+}
+
 impl DaemonService {
     /// Run `f` against the shared DB on a blocking thread.
     pub(crate) async fn with_db<T, F>(&self, f: F) -> ControlResult<T>
@@ -1107,23 +1133,34 @@ impl ControlApi for DaemonService {
                 };
                 if let Some(row) = row {
                     let sid = id.clone();
-                    let bind_result = self
-                        .with_db(move |db| {
-                            if db.bind_dispatch_session(row, &sid)? {
-                                return Ok(false);
+                    let (bind_result, row_kind) = match self
+                        .with_db(move |db| match db.bind_dispatch_session(row, &sid) {
+                            // The row kind is immaterial for a successful bind.
+                            Ok(true) => Ok((Ok(false), BoundRowKind::Unknown)),
+                            Ok(false) => match db.get_dispatch(row) {
+                                Ok(stored) => {
+                                    let kind = classify_bound_row(Ok(stored));
+                                    let no_longer_launchable =
+                                        matches!(kind, BoundRowKind::Stage | BoundRowKind::Missing);
+                                    Ok((Ok(no_longer_launchable), kind))
+                                }
+                                Err(error) => Ok((Err(error.to_string()), BoundRowKind::Unknown)),
+                            },
+                            Err(error) => {
+                                let kind = classify_bound_row(db.get_dispatch(row));
+                                Ok((Err(error.to_string()), kind))
                             }
-                            // Tracker rows have no stage and retain their historic
-                            // best-effort binding behaviour. A pipeline row must
-                            // refuse a second or late worker once binding fails.
-                            let stored = db.get_dispatch(row)?;
-                            Ok(stored.is_none_or(|dispatch| dispatch.stage.is_some()))
                         })
-                        .await;
-                    let bind_error = bind_result.as_ref().err().map(ToString::to_string);
+                        .await
+                    {
+                        Ok(pair) => pair,
+                        Err(error) => (Err(error.to_string()), BoundRowKind::Unknown),
+                    };
+                    let bind_error = bind_result.as_ref().err().cloned();
                     let action = bind_failure_action(
                         row,
-                        stage_launch,
-                        bind_result.map_err(|error| error.to_string()),
+                        effective_stage_launch(stage_launch, row_kind),
+                        bind_result,
                     );
                     if let Some(error) = bind_error {
                         tracing::warn!(target: "thegn::dispatch", "bind dispatch row {row}: {error}");
@@ -3662,6 +3699,47 @@ mod tests {
             "x".into(),
         )]);
         assert!(matches!(dispatch_row_of(&invalid), Some(Err(_))));
+    }
+
+    #[test]
+    fn dispatch_bind_row_kind_effective_stage_table() {
+        for (client_stage, kind, expected) in [
+            (false, BoundRowKind::Stage, true),
+            (false, BoundRowKind::Missing, true),
+            (false, BoundRowKind::Tracker, false),
+            (false, BoundRowKind::Unknown, false),
+            (true, BoundRowKind::Stage, true),
+            (true, BoundRowKind::Missing, true),
+            (true, BoundRowKind::Tracker, true),
+            (true, BoundRowKind::Unknown, true),
+        ] {
+            assert_eq!(
+                effective_stage_launch(client_stage, kind),
+                expected,
+                "client_stage={client_stage}, kind={kind:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn dispatch_bind_row_kind_classifies_rows() {
+        let db = Db::open_memory().unwrap();
+        let stage_id = staged_dispatch(&db, Some("code"));
+        let tracker_id = staged_dispatch(&db, None);
+
+        assert_eq!(
+            classify_bound_row(db.get_dispatch(stage_id)),
+            BoundRowKind::Stage
+        );
+        assert_eq!(
+            classify_bound_row(db.get_dispatch(tracker_id)),
+            BoundRowKind::Tracker
+        );
+        assert_eq!(classify_bound_row(Ok(None)), BoundRowKind::Missing);
+        assert_eq!(
+            classify_bound_row(Err(anyhow::anyhow!("db down"))),
+            BoundRowKind::Unknown
+        );
     }
 
     async fn wait_for_live_sessions(
