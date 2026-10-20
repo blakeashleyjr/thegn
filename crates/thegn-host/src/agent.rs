@@ -2170,24 +2170,22 @@ pub fn provision_provider_env_named(
     let block = &resolved.sandbox.network_block;
     let admission =
         crate::egress_admit::egress_admission(created, provider.caps().egress, allow, block);
-    let egress_steps = crate::egress_admit::BlockingProviderEgress {
-        provider: &provider,
-    };
-    if admission != crate::egress_admit::EgressAdmission::Skip {
+    if let crate::egress_admit::EgressAdmission::AdmitFresh
+    | crate::egress_admit::EgressAdmission::VerifyExisting = admission
+    {
+        let egress_steps = crate::egress_admit::BlockingProviderEgress {
+            provider: &provider,
+        };
         let mut network_policy = ProvisionStepView {
             label: "Network policy".into(),
             state: ProvisionState::Active,
             detail: None,
         };
         progress(&[network_policy.clone()]);
-        let admission_result = match admission {
-            crate::egress_admit::EgressAdmission::Skip => Ok(()),
-            crate::egress_admit::EgressAdmission::AdmitFresh => {
-                crate::egress_admit::admit_egress(&egress_steps, &id, allow, block)
-            }
-            crate::egress_admit::EgressAdmission::VerifyExisting => {
-                crate::egress_admit::verify_existing_egress(&egress_steps, &id, allow, block)
-            }
+        let admission_result = if admission == crate::egress_admit::EgressAdmission::AdmitFresh {
+            crate::egress_admit::admit_egress(&egress_steps, &id, allow, block)
+        } else {
+            crate::egress_admit::verify_existing_egress(&egress_steps, &id, allow, block)
         };
         if let Err(e) = admission_result {
             network_policy.state = ProvisionState::Failed;
@@ -3018,7 +3016,13 @@ fn auto_provision_sandbox(cfg: &Config, env_name: &str, worktree: &str) -> anyho
     };
     match block_on_provider(|| async { provider.ensure_exists(&name).await }) {
         Ok(true) => {
-            let repo_root = repo_root_for(worktree);
+            let repo_root: PathBuf = Db::open()
+                .ok()
+                .and_then(|db| db.repo_root_for(worktree).ok().flatten())
+                .filter(|s| !s.is_empty())
+                .map(PathBuf::from)
+                .or_else(|| repo::main_worktree(Path::new(worktree)))
+                .unwrap_or_else(|| PathBuf::from(worktree));
             let resolved = cfg.resolve_env(
                 &repo_root,
                 &GitLoc::for_worktree(Path::new(worktree)),
