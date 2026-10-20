@@ -114,6 +114,16 @@ fn reap(envs: &[(String, thegn_core::config::EnvProviderConfig)]) {
 }
 
 fn reap_unambiguous(pc: &thegn_core::config::EnvProviderConfig) {
+    let view = match registry::list_checked() {
+        Ok(view) => view,
+        Err(error) => {
+            thegn_core::msg::warn(&format!(
+                "vps reaper: skipped {}: ledger unreadable ({error:#}); no provider or ledger actions attempted",
+                pc.provider.trim()
+            ));
+            return;
+        }
+    };
     let ours = vps::host_label();
     let kind = pc.provider.trim();
     // The outer gate permits exactly one account/policy per provider kind.
@@ -129,7 +139,6 @@ fn reap_unambiguous(pc: &thegn_core::config::EnvProviderConfig) {
             return;
         }
     };
-    let records = registry::list();
     let now = thegn_core::util::now();
     let mut live_anywhere = std::collections::HashSet::new();
     for inst in instances
@@ -137,7 +146,18 @@ fn reap_unambiguous(pc: &thegn_core::config::EnvProviderConfig) {
         .filter(|i| i.labels.get("tg-host").map(String::as_str) == Some(ours.as_str()))
     {
         live_anywhere.insert(inst.name.clone());
-        let record = records.iter().find(|r| r.name == inst.name);
+        let state = ledger_state_for(&view, &inst.name);
+        let record = match state {
+            LedgerState::Recorded(record) => Some(record),
+            LedgerState::Unreadable => {
+                thegn_core::msg::warn(&format!(
+                    "vps reaper: quarantined {}: ledger record unreadable; reconcile ownership; no deletion attempted",
+                    inst.name
+                ));
+                continue;
+            }
+            LedgerState::Absent => None,
+        };
         if record.is_some_and(|record| !recorded_identity_matches(record, kind, &inst.id)) {
             thegn_core::msg::warn(&format!(
                 "vps reaper: quarantined {}: inventory identity differs from the ledger; reconcile ownership; no deletion attempted",
@@ -149,7 +169,7 @@ fn reap_unambiguous(pc: &thegn_core::config::EnvProviderConfig) {
             now,
             inst.created,
             pc.max_lifetime_secs,
-            record.is_none().then_some(ORPHAN_AGE_SECS),
+            orphan_age_for(state),
         );
         if !admit_reap(decision, |reason| {
             thegn_core::msg::warn(&format!(
@@ -191,8 +211,33 @@ fn reap_unambiguous(pc: &thegn_core::config::EnvProviderConfig) {
         }
     }
     // Only this successfully reconciled kind can retire absent ledger rows.
-    let records: Vec<_> = records.into_iter().filter(|r| r.provider == kind).collect();
+    let records: Vec<_> = view
+        .records
+        .into_iter()
+        .filter(|r| r.provider == kind)
+        .collect();
     cleanup_ledger(&records, &live_anywhere);
+}
+
+#[derive(Clone, Copy)]
+enum LedgerState<'a> {
+    Recorded(&'a registry::VpsRecord),
+    Unreadable,
+    Absent,
+}
+
+fn ledger_state_for<'a>(view: &'a registry::LedgerView, name: &str) -> LedgerState<'a> {
+    if let Some(record) = view.records.iter().find(|record| record.name == name) {
+        LedgerState::Recorded(record)
+    } else if view.unreadable.iter().any(|unreadable| unreadable == name) {
+        LedgerState::Unreadable
+    } else {
+        LedgerState::Absent
+    }
+}
+
+fn orphan_age_for(state: LedgerState<'_>) -> Option<u64> {
+    matches!(state, LedgerState::Absent).then_some(ORPHAN_AGE_SECS)
 }
 
 /// A staged intent is not an observed provider identity. It may participate in
@@ -319,6 +364,33 @@ mod tests {
             ip: String::new(),
             created_at,
         }
+    }
+
+    #[test]
+    fn checked_ledger_unreadable_record_is_never_an_orphan() {
+        let record = rec("recorded", "ready", 1);
+        let view = registry::LedgerView {
+            records: vec![record],
+            unreadable: vec!["broken".into()],
+        };
+        assert!(matches!(
+            ledger_state_for(&view, "broken"),
+            LedgerState::Unreadable
+        ));
+        assert!(matches!(
+            ledger_state_for(&view, "recorded"),
+            LedgerState::Recorded(_)
+        ));
+        assert!(matches!(
+            ledger_state_for(&view, "missing"),
+            LedgerState::Absent
+        ));
+        assert_eq!(orphan_age_for(ledger_state_for(&view, "broken")), None);
+        assert_eq!(orphan_age_for(ledger_state_for(&view, "recorded")), None);
+        assert_eq!(
+            orphan_age_for(ledger_state_for(&view, "missing")),
+            Some(ORPHAN_AGE_SECS)
+        );
     }
 
     #[test]
