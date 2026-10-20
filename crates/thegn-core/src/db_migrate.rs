@@ -2547,6 +2547,7 @@ mod tests {
         let path = dir.path().join("v85.db");
         {
             let db = Db::open_at(&path).unwrap();
+            // No index, view, or trigger references these columns, so SQLite can drop them here.
             db.conn()
                 .execute_batch(
                     "ALTER TABLE agent_dispatches DROP COLUMN retry_last_class;
