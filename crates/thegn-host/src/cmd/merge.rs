@@ -13,7 +13,7 @@ use thegn_core::attention::MqStatus;
 use thegn_core::config::Config;
 use thegn_core::db::Db;
 use thegn_core::outln;
-use thegn_core::store::WorktreeAuxStore;
+use thegn_core::store::{MergeRetryOutcome, WorktreeAuxStore};
 
 use thegn_core::merge_lifecycle::LifecycleEvent;
 
@@ -315,24 +315,35 @@ fn parse_conflicted_paths(stdout: &[u8]) -> Result<Vec<PathBuf>> {
         .collect()
 }
 
-/// `merge retry [worktree]` — re-arm a blocked row.
+/// `merge retry [worktree]` — re-arm a held row.
 ///
-/// A plain drain already re-attempts every non-settled row, but the agent budget
-/// is now persisted per branch, so an exhausted `needs_human` row would keep
-/// deferring without ever dispatching again. This resets it — and gives the
-/// gesture a name in `merge --help`, which it never had on the CLI even though
-/// the panel has bound `r` to it all along.
+/// Only held rows may be explicitly retried; other states are reported as
+/// refusals so a completed or active row cannot be reset accidentally.
 fn retry(worktree: Option<String>) -> Result<()> {
     let wt = crate::merge_ops::canonical_worktree(&super::resolve_worktree(worktree));
     let wt_s = wt.to_string_lossy().to_string();
     let db = Db::open()?;
-    if !db.retry_merge_entry(&wt_s)? {
-        // Not queued is a distinct, non-zero outcome — scripting must be able to
-        // tell "re-armed" from "there was nothing to re-arm".
-        anyhow::bail!("{wt_s} is not in the merge queue.");
+    match retry_message(&wt_s, &db.retry_held_merge_entry(&wt_s)?) {
+        Ok(message) => outln!("{message}"),
+        Err(message) => anyhow::bail!("{message}"),
     }
-    outln!("Re-queued for the next drain.");
     Ok(())
+}
+
+fn retry_message(
+    wt: &str,
+    outcome: &MergeRetryOutcome,
+) -> std::result::Result<&'static str, String> {
+    match outcome {
+        MergeRetryOutcome::Rearmed => Ok("Re-queued for the next drain."),
+        MergeRetryOutcome::NotQueued => Err(format!("{wt} is not in the merge queue.")),
+        MergeRetryOutcome::NotRetryable { status } => Err(format!(
+            "cannot retry a {status} row: retry re-arms deferred, gate_failed, gate_error, agent_blocked or needs_human rows"
+        )),
+        MergeRetryOutcome::Claimed => Err(format!(
+            "{wt} is being worked by a drain; retry it after the drain finishes"
+        )),
+    }
 }
 
 /// The repo root (main checkout) reachable from the cwd.
@@ -1304,5 +1315,38 @@ mod gate_verdict_tests {
         assert_eq!(json["gate_verdicts"][0]["verdict"], "error");
         assert_eq!(json["gate_verdicts"][0]["phase"], "setup");
         assert_eq!(json["gate_verdicts"][0]["class"], "timeout");
+    }
+}
+
+#[cfg(test)]
+mod retry_tests {
+    use super::{MergeRetryOutcome, retry_message};
+
+    #[test]
+    fn retry_messages_are_distinct() {
+        let worktree = "/private/repo/feature";
+        assert_eq!(
+            retry_message(worktree, &MergeRetryOutcome::Rearmed),
+            Ok("Re-queued for the next drain.")
+        );
+        assert_eq!(
+            retry_message(worktree, &MergeRetryOutcome::NotQueued),
+            Err(format!("{worktree} is not in the merge queue."))
+        );
+        assert_eq!(
+            retry_message(
+                worktree,
+                &MergeRetryOutcome::NotRetryable {
+                    status: "ready".into()
+                }
+            ),
+            Err("cannot retry a ready row: retry re-arms deferred, gate_failed, gate_error, agent_blocked or needs_human rows".into())
+        );
+        assert_eq!(
+            retry_message(worktree, &MergeRetryOutcome::Claimed),
+            Err(format!(
+                "{worktree} is being worked by a drain; retry it after the drain finishes"
+            ))
+        );
     }
 }

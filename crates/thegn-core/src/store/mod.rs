@@ -87,6 +87,6 @@ pub use worktree_aux::{
     MERGE_CLAIM_ACTIVE, MERGE_CLAIM_LOST, MERGE_CLAIM_MAX_LEASE_MS, MERGE_CLAIM_OWNER_HINT_MAX,
     MergeAttemptResult, MergeClaim, MergeClaimPhase, MergeClaimRequest, MergeClaimView,
     MergeFinalOutcome, MergeFinalStatus, MergeOutcomeObservation, MergeOutcomeWrite,
-    MergeRegistryIdentity, MergeStatusFields, WorktreeAuxStore,
+    MergeRegistryIdentity, MergeRetryOutcome, MergeStatusFields, WorktreeAuxStore,
 };
 pub use zone::{ZoneDeleteOutcome, ZoneRow, ZoneStore};
