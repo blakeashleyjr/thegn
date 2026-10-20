@@ -154,12 +154,13 @@ const MAX_INCLUDE_DEPTH: usize = 8;
 /// folded in, whether or not the condition holds, so a change to any of them
 /// invalidates), the legacy `remotes/origin` file, and the config-bearing
 /// environment.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct OriginInputs {
     // Content is folded in as (len, hash), not stored: a large global config
     // would otherwise be held in every memo entry.
     files: Vec<(PathBuf, Option<(usize, u64)>)>,
     env: Vec<(String, String)>,
+    conditional: bool,
 }
 
 fn read_config(path: &Path) -> Option<String> {
@@ -236,6 +237,7 @@ fn push_config(
     home: Option<&Path>,
     depth: usize,
     files: &mut Vec<(PathBuf, Option<(usize, u64)>)>,
+    conditional: &mut bool,
 ) -> Option<()> {
     if files.iter().any(|(p, _)| *p == path) {
         return Some(());
@@ -253,6 +255,13 @@ fn push_config(
     {
         return None;
     }
+    *conditional |= content.as_deref().is_some_and(|text| {
+        text.lines().any(|line| {
+            line.trim_start()
+                .to_ascii_lowercase()
+                .starts_with("[includeif")
+        })
+    });
     let includes = content.as_deref().map(include_paths).unwrap_or_default();
     files.push((path.clone(), content.as_deref().map(hash_text)));
     if includes.is_empty() {
@@ -276,7 +285,7 @@ fn push_config(
         } else {
             path.parent()?.join(&inc)
         };
-        push_config(target, home, depth + 1, files)?;
+        push_config(target, home, depth + 1, files, conditional)?;
     }
     Some(())
 }
@@ -319,25 +328,26 @@ fn global_config_files(
     env: &dyn Fn(&str) -> Option<String>,
     home: Option<&Path>,
     files: &mut Vec<(PathBuf, Option<(usize, u64)>)>,
+    conditional: &mut bool,
 ) -> Option<()> {
     if !env("GIT_CONFIG_NOSYSTEM").is_some_and(|v| git_bool(&v)) {
         let sys = match env("GIT_CONFIG_SYSTEM") {
             Some(s) => PathBuf::from(s),
             None => system_config_path()?,
         };
-        push_config(sys, home, 0, files)?;
+        push_config(sys, home, 0, files, conditional)?;
     }
     match env("GIT_CONFIG_GLOBAL") {
-        Some(g) => push_config(PathBuf::from(g), home, 0, files)?,
+        Some(g) => push_config(PathBuf::from(g), home, 0, files, conditional)?,
         None => {
             let xdg = env("XDG_CONFIG_HOME")
                 .map(PathBuf::from)
                 .or_else(|| home.map(|h| h.join(".config")));
             if let Some(x) = xdg {
-                push_config(x.join("git/config"), home, 0, files)?;
+                push_config(x.join("git/config"), home, 0, files, conditional)?;
             }
             if let Some(h) = home {
-                push_config(h.join(".gitconfig"), home, 0, files)?;
+                push_config(h.join(".gitconfig"), home, 0, files, conditional)?;
             }
         }
     }
@@ -520,19 +530,33 @@ fn global_git_print_inner(
     }
     let home = env("HOME").map(PathBuf::from);
     let mut files = Vec::new();
-    global_config_files(env, home.as_deref(), &mut files)?;
+    let mut conditional = false;
+    global_config_files(env, home.as_deref(), &mut files, &mut conditional)?;
     // The repo's own configs can name files outside the repo.
     if let Some(dir) = dir {
         let common = crate::util::git_common_dir(dir);
-        push_config(common.join("config"), home.as_deref(), 0, &mut files)?;
+        push_config(
+            common.join("config"),
+            home.as_deref(),
+            0,
+            &mut files,
+            &mut conditional,
+        )?;
         push_config(
             common.join("config.worktree"),
             home.as_deref(),
             0,
             &mut files,
+            &mut conditional,
         )?;
         if let Some(gd) = git_dir(dir) {
-            push_config(gd.join("config.worktree"), home.as_deref(), 0, &mut files)?;
+            push_config(
+                gd.join("config.worktree"),
+                home.as_deref(),
+                0,
+                &mut files,
+                &mut conditional,
+            )?;
         }
     }
     let xdg = env("XDG_CONFIG_HOME")
@@ -587,23 +611,38 @@ pub fn origin_inputs(dir: &Path, env: &dyn Fn(&str) -> Option<String>) -> Option
     let home = env("HOME").map(PathBuf::from);
     let common = crate::util::git_common_dir(dir);
     let mut files = Vec::new();
-    global_config_files(env, home.as_deref(), &mut files)?;
+    let mut conditional = false;
+    global_config_files(env, home.as_deref(), &mut files, &mut conditional)?;
     // repo: shared config, per-worktree config, legacy remotes file
-    push_config(common.join("config"), home.as_deref(), 0, &mut files)?;
+    push_config(
+        common.join("config"),
+        home.as_deref(),
+        0,
+        &mut files,
+        &mut conditional,
+    )?;
     push_config(
         common.join("config.worktree"),
         home.as_deref(),
         0,
         &mut files,
+        &mut conditional,
     )?;
     if let Some(gd) = git_dir(dir) {
-        push_config(gd.join("config.worktree"), home.as_deref(), 0, &mut files)?;
+        push_config(
+            gd.join("config.worktree"),
+            home.as_deref(),
+            0,
+            &mut files,
+            &mut conditional,
+        )?;
     }
     push_config(
         common.join("remotes/origin"),
         home.as_deref(),
         0,
         &mut files,
+        &mut conditional,
     )?;
     let mut envs: Vec<(String, String)> = [
         "HOME",
@@ -629,7 +668,11 @@ pub fn origin_inputs(dir: &Path, env: &dyn Fn(&str) -> Option<String>) -> Option
             }
         }
     }
-    Some(OriginInputs { files, env: envs })
+    Some(OriginInputs {
+        files,
+        env: envs,
+        conditional,
+    })
 }
 
 /// What `git rev-parse --abbrev-ref HEAD` is derived from: the worktree's HEAD,
@@ -860,14 +903,124 @@ pub fn origin_fingerprint(dir: &Path, env: &dyn Fn(&str) -> Option<String>) -> O
 
 const ORIGIN_MEMO_CAP: usize = 512;
 
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+struct SharedOriginKey {
+    common_dir: PathBuf,
+    inputs: OriginInputs,
+}
+
+#[derive(Default)]
+struct SharedOriginMemo {
+    values: HashMap<SharedOriginKey, Option<String>>,
+    order: VecDeque<SharedOriginKey>,
+}
+
+impl SharedOriginMemo {
+    fn get(&self, key: &SharedOriginKey) -> Option<Option<String>> {
+        self.values.get(key).cloned()
+    }
+
+    fn put(&mut self, key: SharedOriginKey, value: Option<String>) {
+        if self.values.insert(key.clone(), value).is_none() {
+            self.order.push_back(key);
+            while self.values.len() > ORIGIN_MEMO_CAP {
+                if let Some(old) = self.order.pop_front() {
+                    self.values.remove(&old);
+                } else {
+                    break;
+                }
+            }
+        }
+    }
+}
+
+fn shared_origin_key(dir: &Path, inputs: &OriginInputs) -> Option<SharedOriginKey> {
+    if inputs.conditional {
+        return None;
+    }
+    let common_dir = std::fs::canonicalize(crate::util::git_common_dir(dir)).ok()?;
+    let own_git_dir = git_dir(dir)?;
+    let own_worktree_config = own_git_dir.join("config.worktree");
+    let common_worktree_config = common_dir.join("config.worktree");
+    let own_config = inputs
+        .files
+        .iter()
+        .find(|(path, _)| path == &own_worktree_config)?;
+    if own_config.1.is_some() {
+        return None;
+    }
+    let mut shared_inputs = inputs.clone();
+    if own_worktree_config != common_worktree_config {
+        shared_inputs
+            .files
+            .retain(|(path, _)| path != &own_worktree_config);
+    }
+    Some(SharedOriginKey {
+        common_dir,
+        inputs: shared_inputs,
+    })
+}
+
 /// `git remote get-url origin` for a LOCAL worktree, memoised under
 /// [`origin_fingerprint`] (THE-718: 45 forks/min on an idle one-repo session).
 /// `compute` is the subprocess; it runs only on a miss or when the inputs
 /// cannot be fingerprinted completely.
 pub fn origin_url(dir: &Path, compute: impl FnOnce() -> (Option<String>, bool)) -> Option<String> {
     static MEMO: Mutex<Option<Memo<Option<String>>>> = Mutex::new(None);
-    let fp = origin_fingerprint(dir, &|k| std::env::var(k).ok());
-    memoised_checked(&MEMO, ORIGIN_MEMO_CAP, dir, fp, compute)
+    origin_url_with(dir, &|k| std::env::var(k).ok(), compute)
+}
+
+/// Injectable form of [`origin_url`] for deterministic configuration tests.
+fn origin_url_with(
+    dir: &Path,
+    env: &dyn Fn(&str) -> Option<String>,
+    compute: impl FnOnce() -> (Option<String>, bool),
+) -> Option<String> {
+    static MEMO: Mutex<Option<Memo<Option<String>>>> = Mutex::new(None);
+    static SHARED: Mutex<Option<SharedOriginMemo>> = Mutex::new(None);
+    let fp = origin_fingerprint(dir, env);
+    let Some(fp) = fp else {
+        return compute().0;
+    };
+    {
+        let guard = MEMO.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(value) = guard.as_ref().and_then(|memo| memo.get(dir, &fp)) {
+            return value;
+        }
+    }
+    let key = match &fp {
+        Fingerprint::Origin { inputs, .. } => shared_origin_key(dir, inputs),
+        _ => None,
+    };
+    if let Some(key) = key.as_ref() {
+        let shared_value = SHARED
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_ref()
+            .and_then(|memo| memo.get(key));
+        if let Some(value) = shared_value {
+            MEMO.lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .get_or_insert_with(|| Memo::new(ORIGIN_MEMO_CAP))
+                .put(dir, fp, value.clone());
+            return value;
+        }
+    }
+    let (value, cacheable) = compute();
+    if cacheable {
+        MEMO.lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get_or_insert_with(|| Memo::new(ORIGIN_MEMO_CAP))
+            .put(dir, fp, value.clone());
+        if let Some(key) = key {
+            SHARED
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .get_or_insert_with(SharedOriginMemo::default)
+                .put(key, value.clone());
+        }
+    }
+    value
 }
 
 #[cfg(test)]
@@ -969,6 +1122,34 @@ mod tests {
         std::fs::write(repo.join(".git/HEAD"), "ref: refs/heads/main\n").unwrap();
         std::fs::write(repo.join(".git/config"), config).unwrap();
         repo
+    }
+
+    fn linked_worktree_pair(base: &Path, config: &str) -> (PathBuf, PathBuf, PathBuf) {
+        let main = repo_with_config(base, config);
+        let common_git = main.join(".git");
+        let make_worktree = |name: &str| {
+            let worktree = base.join(format!("wt-{name}"));
+            let gitdir = common_git.join("worktrees").join(name);
+            std::fs::create_dir_all(&worktree).unwrap();
+            std::fs::create_dir_all(&gitdir).unwrap();
+            std::fs::write(
+                worktree.join(".git"),
+                format!("gitdir: {}\n", gitdir.display()),
+            )
+            .unwrap();
+            std::fs::write(gitdir.join("commondir"), "../..\n").unwrap();
+            worktree
+        };
+        (main, make_worktree("a"), make_worktree("b"))
+    }
+
+    fn isolated_origin_env(base: &Path) -> impl Fn(&str) -> Option<String> + use<> {
+        let home = base.join("home");
+        std::fs::create_dir_all(&home).unwrap();
+        env_of(&[
+            ("HOME", home.to_str().unwrap()),
+            ("GIT_CONFIG_NOSYSTEM", "1"),
+        ])
     }
 
     #[test]
@@ -1103,6 +1284,147 @@ mod tests {
         assert_eq!(run().as_deref(), Some("https://example.test/c/d.git"));
         git(&["remote", "remove", "origin"]);
         assert_eq!(run(), None, "removal is seen, not served from the memo");
+    }
+
+    #[test]
+    fn origin_shared_across_linked_worktrees_runs_compute_once() {
+        let base = tmp("origin-shared");
+        let (main, a, b) = linked_worktree_pair(
+            &base,
+            "[remote \"origin\"]\n\turl = https://example.test/repo.git\n",
+        );
+        let env = isolated_origin_env(&base);
+        let computes = std::cell::Cell::new(0);
+        let run = |dir: &Path| {
+            origin_url_with(dir, &env, || {
+                computes.set(computes.get() + 1);
+                (Some("https://example.test/repo.git".into()), true)
+            })
+        };
+        assert_eq!(run(&main).as_deref(), Some("https://example.test/repo.git"));
+        assert_eq!(run(&a).as_deref(), Some("https://example.test/repo.git"));
+        assert_eq!(run(&b).as_deref(), Some("https://example.test/repo.git"));
+        assert_eq!(computes.get(), 1);
+    }
+
+    #[test]
+    fn origin_spawn_failure_is_not_shared() {
+        let base = tmp("origin-spawn-failure");
+        let (_, a, b) = linked_worktree_pair(&base, "[remote \"origin\"]\n\turl = x\n");
+        let env = isolated_origin_env(&base);
+        let computes = std::cell::Cell::new(0);
+        assert_eq!(
+            origin_url_with(&a, &env, || {
+                computes.set(computes.get() + 1);
+                (None, false)
+            }),
+            None
+        );
+        assert_eq!(
+            origin_url_with(&b, &env, || {
+                computes.set(computes.get() + 1);
+                (Some("url".into()), true)
+            })
+            .as_deref(),
+            Some("url")
+        );
+        assert_eq!(
+            origin_url_with(&a, &env, || panic!("cached shared value expected")).as_deref(),
+            Some("url")
+        );
+        assert_eq!(computes.get(), 2);
+    }
+
+    #[test]
+    fn origin_not_shared_when_a_worktree_has_config_worktree() {
+        let base = tmp("origin-private-config");
+        let (_, a, b) = linked_worktree_pair(&base, "[remote \"origin\"]\n\turl = x\n");
+        std::fs::write(
+            crate::git_memo::git_dir(&b)
+                .unwrap()
+                .join("config.worktree"),
+            "[remote \"origin\"]\n\turl = y\n",
+        )
+        .unwrap();
+        let env = isolated_origin_env(&base);
+        let computes = std::cell::Cell::new(0);
+        for dir in [&a, &b] {
+            assert_eq!(
+                origin_url_with(dir, &env, || {
+                    computes.set(computes.get() + 1);
+                    (Some("url".into()), true)
+                })
+                .as_deref(),
+                Some("url")
+            );
+        }
+        assert_eq!(computes.get(), 2);
+    }
+
+    #[test]
+    fn origin_not_shared_when_config_has_include_if() {
+        let base = tmp("origin-include-if");
+        let (_, a, b) = linked_worktree_pair(
+            &base,
+            "[remote \"origin\"]\n\turl = x\n[includeIf \"gitdir:/x/\"]\n",
+        );
+        let env = isolated_origin_env(&base);
+        let computes = std::cell::Cell::new(0);
+        for dir in [&a, &b] {
+            assert_eq!(
+                origin_url_with(dir, &env, || {
+                    computes.set(computes.get() + 1);
+                    (Some("url".into()), true)
+                })
+                .as_deref(),
+                Some("url")
+            );
+        }
+        assert_eq!(computes.get(), 2);
+    }
+
+    #[test]
+    fn origin_shared_entry_invalidated_by_a_common_config_edit() {
+        let base = tmp("origin-shared-edit");
+        let (main, a, b) = linked_worktree_pair(&base, "[remote \"origin\"]\n\turl = x\n");
+        let env = isolated_origin_env(&base);
+        let computes = std::cell::Cell::new(0);
+        let run = |dir: &Path| {
+            origin_url_with(dir, &env, || {
+                computes.set(computes.get() + 1);
+                (Some("url".into()), true)
+            })
+        };
+        assert_eq!(run(&a).as_deref(), Some("url"));
+        assert_eq!(run(&b).as_deref(), Some("url"));
+        assert_eq!(computes.get(), 1);
+        std::fs::write(
+            main.join(".git/config"),
+            "[remote \"origin\"]\n\turl = changed\n",
+        )
+        .unwrap();
+        assert_eq!(run(&b).as_deref(), Some("url"));
+        assert_eq!(computes.get(), 2);
+    }
+
+    #[test]
+    fn origin_not_shared_across_repositories() {
+        let base = tmp("origin-separate-repos");
+        let repo_a = repo_with_config(&base.join("a"), "[remote \"origin\"]\n\turl = same\n");
+        let repo_b = repo_with_config(&base.join("b"), "[remote \"origin\"]\n\turl = same\n");
+        let env = isolated_origin_env(&base);
+        let computes = std::cell::Cell::new(0);
+        for dir in [&repo_a, &repo_b] {
+            assert_eq!(
+                origin_url_with(dir, &env, || {
+                    computes.set(computes.get() + 1);
+                    (Some("url".into()), true)
+                })
+                .as_deref(),
+                Some("url")
+            );
+        }
+        assert_eq!(computes.get(), 2);
     }
 
     #[test]
@@ -1430,7 +1752,8 @@ mod tests {
             ("GIT_CONFIG_NOSYSTEM", "1"),
         ]);
         let mut files = Vec::new();
-        global_config_files(&env, Some(&home), &mut files).unwrap();
+        let mut conditional = false;
+        global_config_files(&env, Some(&home), &mut files, &mut conditional).unwrap();
         let order: Vec<_> = files.iter().map(|(p, _)| p.clone()).collect();
         assert_eq!(
             order,
