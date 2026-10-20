@@ -1164,19 +1164,19 @@ pub fn parse_worktree_branches(porcelain: &str) -> Option<Vec<(String, Option<St
     if porcelain.is_empty() {
         return Some(Vec::new());
     }
-    if !porcelain.ends_with('\0') {
+    // Every field is NUL-terminated and every record ends with an empty field,
+    // so a complete listing ends with two NULs.
+    if !porcelain.ends_with("\0\0") {
         return None;
     }
 
     let mut out = Vec::new();
     let mut record: Option<(String, Option<String>)> = None;
+    // A bare entry has no `HEAD`; a `branch` line needs one before it.
     let mut has_head = false;
     for field in porcelain.split('\0') {
         if field.is_empty() {
             if let Some(entry) = record.take() {
-                if !has_head {
-                    return None;
-                }
                 out.push(entry);
                 has_head = false;
             }
