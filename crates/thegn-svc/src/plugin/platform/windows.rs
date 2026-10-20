@@ -19,6 +19,21 @@ pub(crate) fn platform_is_executable_file(_metadata: &std::fs::Metadata) -> bool
     true
 }
 
+pub(crate) fn platform_executable_trust(_metadata: &std::fs::Metadata) -> Result<(), String> {
+    Ok(())
+}
+
+pub(crate) fn platform_executable_identity_metadata(
+    _metadata: &std::fs::Metadata,
+) -> (Option<u32>, Option<u32>) {
+    (None, None)
+}
+
+#[cfg(test)]
+pub(crate) fn platform_set_mode_for_test(_path: &std::path::Path, _mode: u32) -> io::Result<()> {
+    Ok(())
+}
+
 pub(crate) fn platform_is_transient_accept_resource_error(raw_os_error: Option<i32>) -> bool {
     matches!(raw_os_error, Some(10024) | Some(10055)) // WSAEMFILE, WSAENOBUFS
 }

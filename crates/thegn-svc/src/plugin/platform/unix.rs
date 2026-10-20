@@ -15,6 +15,39 @@ pub(crate) fn platform_is_executable_file(metadata: &std::fs::Metadata) -> bool 
     metadata.permissions().mode() & 0o111 != 0
 }
 
+pub(crate) fn platform_executable_trust(metadata: &std::fs::Metadata) -> Result<(), String> {
+    use std::os::unix::fs::MetadataExt;
+
+    if metadata.permissions().mode() & 0o022 != 0 {
+        return Err("is group- or world-writable".to_string());
+    }
+    let uid = metadata.uid();
+    // SAFETY: geteuid has no preconditions and returns the calling process uid.
+    let current_uid = unsafe { libc::geteuid() };
+    if uid != current_uid && uid != 0 {
+        return Err(format!("is owned by uid {uid}, not by you or root"));
+    }
+    Ok(())
+}
+
+pub(crate) fn platform_executable_identity_metadata(
+    metadata: &std::fs::Metadata,
+) -> (Option<u32>, Option<u32>) {
+    use std::os::unix::fs::MetadataExt;
+
+    (
+        Some(metadata.uid()),
+        Some(metadata.permissions().mode() & 0o7777),
+    )
+}
+
+#[cfg(test)]
+pub(crate) fn platform_set_mode_for_test(path: &std::path::Path, mode: u32) -> io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode))
+}
+
 pub(crate) fn platform_is_transient_accept_resource_error(raw_os_error: Option<i32>) -> bool {
     matches!(
         raw_os_error,
