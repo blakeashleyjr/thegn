@@ -1507,8 +1507,7 @@ pub(crate) fn up_and_verify(
     attest_runtime(&target, spec, &labelled, &project, guard, report)
 }
 
-/// `docker compose … exec [-it] --index 1 [--workdir wd] <service> /bin/sh -lc
-/// <script>`.
+/// `docker compose … exec [-it] --index 1 [--workdir wd] <service> /bin/sh -lc <script>`.
 /// Pin the replica so pane entry and preflight always enter the same container.
 /// Pure. `interactive` toggles `-it` (a pane) vs a one-shot exec.
 pub(crate) fn exec_argv(
