@@ -1908,11 +1908,11 @@ mod tests {
 
     #[test]
     fn policy_recreate_decision_table() {
-        let ids = vec!["one".into()];
+        let ids = ["one".into()];
         let matching = r#"[{"Config":{"Labels":{"thegn.policy":"fp1"}}}]"#;
         let different = r#"[{"Config":{"Labels":{"thegn.policy":"fp2"}}}]"#;
         let missing = r#"[{"Config":{"Labels":null}}]"#;
-        let two_ids = vec!["one".into(), "two".into()];
+        let two_ids = ["one".into(), "two".into()];
         let one_matching_one_missing =
             r#"[{"Config":{"Labels":{"thegn.policy":"fp1"}}},{"Config":{"Labels":null}}]"#;
         let cases = [
