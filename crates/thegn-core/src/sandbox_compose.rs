@@ -1507,7 +1507,9 @@ pub(crate) fn up_and_verify(
     attest_runtime(&target, spec, &labelled, &project, guard, report)
 }
 
-/// `docker compose … exec [-it] [--workdir wd] <service> /bin/sh -lc <script>`.
+/// `docker compose … exec [-it] --index 1 [--workdir wd] <service> /bin/sh -lc
+/// <script>`.
+/// Pin the replica so pane entry and preflight always enter the same container.
 /// Pure. `interactive` toggles `-it` (a pane) vs a one-shot exec.
 pub(crate) fn exec_argv(
     target: &ComposeTarget,
@@ -1523,6 +1525,7 @@ pub(crate) fn exec_argv(
     if interactive {
         v.push("-it".into());
     }
+    v.extend(["--index".into(), "1".into()]);
     if let Some(wd) = workdir {
         v.push("--workdir".into());
         v.push(wd.to_string());
@@ -2151,6 +2154,8 @@ mod tests {
                 "proj",
                 "exec",
                 "-it",
+                "--index",
+                "1",
                 "--workdir",
                 "/work",
                 "app",
@@ -2172,6 +2177,25 @@ mod tests {
             ..Default::default()
         };
         assert!(exec_argv(&target, "proj", &c, None, "s", true).is_none());
+    }
+
+    #[test]
+    fn exec_argv_pins_first_replica_for_one_shot_exec() {
+        let target = ComposeTarget {
+            engine: vec!["docker".into(), "compose".into()],
+            placement: Placement::Local,
+        };
+        let c = ComposeSpec {
+            service: Some("app".into()),
+            ..Default::default()
+        };
+        let argv = exec_argv(&target, "proj", &c, None, "true", false).unwrap();
+        let exec = argv.iter().position(|arg| arg == "exec").unwrap();
+        let after_exec: Vec<&str> = argv[exec + 1..].iter().map(String::as_str).collect();
+        assert_eq!(
+            after_exec,
+            vec!["--index", "1", "app", "/bin/sh", "-lc", "true"]
+        );
     }
 
     fn protected_json(volume: serde_json::Value) -> String {

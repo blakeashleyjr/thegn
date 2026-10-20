@@ -337,6 +337,22 @@ mod tests {
     }
 
     #[test]
+    fn compose_preflight_pins_first_replica() {
+        let compose = crate::sandbox_compose::ComposeSpec {
+            files: vec!["compose.yml".into()],
+            service: Some("worker".into()),
+            run_services: Vec::new(),
+        };
+        let mut spec = base_spec(Backend::Docker);
+        spec.compose = Some(compose.encode());
+        let argv = preflight_exec_argv_with(&spec, "true").unwrap();
+        let exec = argv.iter().position(|arg| arg == "exec").unwrap();
+        assert_eq!(argv.get(exec + 1).map(String::as_str), Some("--index"));
+        assert_eq!(argv.get(exec + 2).map(String::as_str), Some("1"));
+        assert_eq!(argv.get(exec + 3).map(String::as_str), Some("worker"));
+    }
+
+    #[test]
     fn compose_preflight_runner_targets_service_not_container_name() {
         let compose = crate::sandbox_compose::ComposeSpec {
             files: vec!["compose.yml".into()],
