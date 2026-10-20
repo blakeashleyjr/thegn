@@ -413,16 +413,19 @@ fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 /// Validate the complete plugin set before setup is allowed to start any
 /// plugin process. Any enabled-spec problem rejects the whole set; run
 /// `thegn plugin check` for the diagnostics.
+#[cfg(test)]
 fn admitted_plugins(
     cfg: &thegn_core::config::Config,
     config_dir: &std::path::Path,
 ) -> Result<Vec<LoadedPlugin>, Vec<thegn_svc::plugin::loader::SpecProblem>> {
-    let (loaded, broken) = thegn_svc::plugin::discover(cfg, config_dir);
-    let problems = thegn_svc::plugin::loader::check_loaded(&loaded, broken);
-    if !problems.is_empty() {
-        return Err(problems);
-    }
-    Ok(loaded)
+    thegn_svc::plugin::loader::admit(cfg, config_dir)
+        .startable()
+        .map(|plugins| {
+            plugins
+                .into_iter()
+                .map(|(plugin, _)| plugin.clone())
+                .collect()
+        })
 }
 
 /// Spawn one resident session whose events are tagged with the plugin id,
@@ -550,7 +553,9 @@ fn setup_and_schedule_with_waker(
         plugins: specs,
         ..Default::default()
     };
-    let discovered = match admitted_plugins(&cfg, &config_dir) {
+    let admitted = thegn_svc::plugin::loader::admit(&cfg, &config_dir);
+    tracing::debug!(target: "thegn::plugin", digest = %admitted.digest, "plugin set admitted");
+    let discovered = match admitted.startable() {
         Ok(discovered) => discovered,
         Err(problems) => {
             for problem in problems {
@@ -565,26 +570,29 @@ fn setup_and_schedule_with_waker(
             return;
         }
     };
-    let (discovered, mut refusals) = partition_native_trust(discovered);
+    let mut refusals = admitted
+        .plugins
+        .iter()
+        .filter_map(|entry| {
+            if let thegn_svc::plugin::loader::PluginDecision::RefusedUntrusted(problem) =
+                &entry.decision
+            {
+                Some(problem.clone())
+            } else {
+                None
+            }
+        })
+        .collect::<Vec<_>>();
     for problem in &refusals {
         tracing::warn!(target: "thegn::plugin", error = %problem, "native plugin refused without explicit trust");
     }
     let mut loaded: Vec<LoadedState> = Vec::new();
     let mut resolved_envs: BTreeMap<String, BTreeMap<String, String>> = BTreeMap::new();
     let now = Instant::now();
-    for plugin in discovered {
+    for (plugin, negotiated) in discovered {
+        let plugin = plugin.clone();
+        let negotiated = negotiated.clone();
         let id = plugin.spec.manifest.id.as_str().to_string();
-        if !plugin.spec.enabled {
-            tracing::debug!(target: "thegn::plugin", plugin = %id, "disabled in config; skipped");
-            continue;
-        }
-        let negotiated = match thegn_svc::plugin::loader::negotiate(&plugin.spec) {
-            Ok(n) => n,
-            Err(e) => {
-                tracing::warn!(target: "thegn::plugin", plugin = %id, error = %e, "negotiate failed; plugin skipped");
-                continue;
-            }
-        };
         let env = match thegn_svc::plugin::resolve_env(&plugin) {
             Ok(env) => env,
             Err(problem) => {
@@ -757,6 +765,7 @@ fn setup_and_schedule_with_waker(
     }
 }
 
+#[cfg(test)]
 fn partition_native_trust(
     plugins: Vec<LoadedPlugin>,
 ) -> (
@@ -791,7 +800,9 @@ fn initial_run_ids(loaded: &[LoadedState], sched: &[SchedEntry]) -> BTreeSet<Str
 #[cfg(test)]
 mod tests {
     use super::*;
-    use thegn_core::plugin_api::{ContributionId, MAX_PLUGIN_TIMEOUT_SECS, PluginId, PluginSpec};
+    use thegn_core::plugin_api::{
+        ApiVersion, ContributionId, MAX_PLUGIN_TIMEOUT_SECS, PluginId, PluginSpec,
+    };
 
     #[test]
     fn plugin_send_error_keeps_result_variant_small() {
@@ -1062,6 +1073,49 @@ mod tests {
         setup_and_schedule_with_waker(
             supervisor,
             cfg_specs,
+            tmp.path().to_path_buf(),
+            sessions.clone(),
+            disabled,
+            stop,
+            tx,
+            None,
+        );
+
+        assert!(matches!(rx.try_recv().unwrap(), PluginMsg::Loaded(loaded) if loaded.is_empty()));
+        assert!(lock(&sessions).is_empty());
+        assert!(!marker.exists());
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn startup_uses_the_admitted_set_and_spawns_nothing_on_a_negotiate_failure() {
+        let tmp = tempfile::tempdir().unwrap();
+        let marker = tmp.path().join("ran");
+        let mut invalid = example_spec();
+        invalid.manifest.id = PluginId::new("incompatible-api");
+        invalid.manifest.api = ApiVersion::new(9, 0, 0);
+        invalid.manifest.contributions.clear();
+        invalid.command = vec![
+            "sh".into(),
+            "-c".into(),
+            "touch \"$1\"".into(),
+            "plugin".into(),
+            marker.display().to_string(),
+        ];
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let supervisor = ResidentSupervisor::new(runtime.handle().clone());
+        let sessions: Sessions = Arc::new(Mutex::new(BTreeMap::new()));
+        let disabled: Disabled = Arc::new(Mutex::new(Default::default()));
+        let stop = Arc::new(AtomicBool::new(false));
+        let (tx, mut rx) = plugin_channel();
+
+        setup_and_schedule_with_waker(
+            supervisor,
+            vec![invalid],
             tmp.path().to_path_buf(),
             sessions.clone(),
             disabled,
