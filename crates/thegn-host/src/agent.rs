@@ -707,10 +707,10 @@ pub fn prepare_sandbox_env(
             // A Ready host's assets (digest-pinned image, warm volumes, remote
             // OCI url) pin the spec; explicit user values win inside.
             crate::host_flow::apply_ready(worktree, &mut spec);
-            // Final pre-create spec fixups: remote-OCI worktree sync + runtime degrade.
+            // Plan remote-OCI worktree sync only; the upload runs after admission.
             let recursive_submodules =
                 crate::git_worktree::recursive_submodules_allowed(cfg, Path::new(worktree));
-            crate::remote_sync::finalize_spec_before_ensure(
+            let remote_plan = crate::remote_sync::plan_spec_before_ensure(
                 &mut spec,
                 worktree,
                 recursive_submodules,
@@ -806,6 +806,18 @@ pub fn prepare_sandbox_env(
                     spec.backend.label()
                 ));
                 continue;
+            }
+            if let Some(plan) = remote_plan.as_ref() {
+                crate::remote_sync::apply_remote_sync(&mut spec, plan, worktree, &mut warnings);
+                // The retarget replaced the mounts: re-run the sealed-$HOME gate on what will be entered.
+                if let Some(m) = thegn_core::sandbox_floor::home_gate(&spec) {
+                    if explicit_choice {
+                        anyhow::bail!("{m} for {worktree}");
+                    }
+                    thegn_core::msg::warn(&format!("{m} for {worktree}; trying next backend"));
+                    home_miss = Some(m);
+                    continue;
+                }
             }
             // Keep the final validation adjacent to the effects it protects:
             // VPN attachment and container ensure/exec are reached only after
