@@ -52,11 +52,14 @@ pub(crate) fn begin_worktree_wizard(
     if let Some(slug) = known_workspace_slug(&model.sidebar_workspaces, &root) {
         w.set_repo_slug(slug.to_string());
     }
-    // Preselect the DB-aware ambient env (workspace layer shadows the repo
-    // `.thegn.*` default) so "leave the default" means a clean inherit under
-    // the register-time pin rule. One-shot best-effort DB read on a user
-    // action — the form itself stays pure.
-    w.preselect_host(&wizard::ambient_env_name_live(cfg, &root));
+    // Preselect the hydrated DB-aware ambient env (workspace layer shadows the
+    // repo `.thegn.*` default) so "leave the default" means a clean inherit
+    // under the register-time pin rule. No DB I/O runs on the UI loop.
+    w.preselect_host(&wizard::ambient_env_name_from(
+        &model.workspace_envs,
+        cfg,
+        &root,
+    ));
     // Host-readiness badges on the env rows (hosts-as-resources): built from
     // the already-hydrated panel snapshot — no I/O on the loop.
     w.set_host_badges(crate::host_ui::wizard_host_badges(cfg, &model.panel.hosts));
