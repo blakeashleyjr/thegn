@@ -593,8 +593,7 @@ fn add_account(db: &thegn_core::db::Db, provider: &str) -> anyhow::Result<(Strin
     }
     let count = db.list_accounts(provider)?.len();
     let name = format!("acct{}", count + 1);
-    let dir = thegn_core::account::managed_dir(provider, &name);
-    std::fs::create_dir_all(&dir)?;
+    let dir = thegn_core::account::ensure_managed_home(provider, &name)?;
     let dir_string = dir.to_string_lossy().into_owned();
     db.put_account(provider, &name, &dir_string, true, thegn_core::util::now())?;
     Ok((name, dir_string))

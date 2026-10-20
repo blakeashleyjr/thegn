@@ -23,7 +23,189 @@ use crate::store::{AccountStore, WorkspaceStore};
 use crate::util;
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
-use std::path::PathBuf;
+use std::io::Read;
+use std::path::{Path, PathBuf};
+
+const OWNER_MANIFEST: &str = ".thegn-account-owner";
+const OWNER_MANIFEST_LIMIT: u64 = 4 * 1024;
+
+/// A managed credential home could not be safely established or verified.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AccountHomeError {
+    /// A managed path component or manifest could not be safely opened or written.
+    UnsafePath { path: PathBuf, error: String },
+    /// The existing manifest belongs to another exact provider/account pair.
+    ForeignManifest { provider: String, name: String },
+    /// The existing manifest is not a valid versioned owner record.
+    MalformedManifest { path: PathBuf },
+    /// The requested provider is not account-switchable.
+    UnknownProvider { provider: String },
+}
+
+impl std::fmt::Display for AccountHomeError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::UnsafePath { path, error } => {
+                write!(f, "unsafe managed account path {}: {error}", path.display())
+            }
+            Self::ForeignManifest { provider, name } => {
+                write!(
+                    f,
+                    "managed account home belongs to {provider} account {name:?}"
+                )
+            }
+            Self::MalformedManifest { path } => {
+                write!(
+                    f,
+                    "malformed managed account owner manifest at {}",
+                    path.display()
+                )
+            }
+            Self::UnknownProvider { provider } => {
+                write!(f, "unknown account provider {provider:?}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for AccountHomeError {}
+
+fn owner_manifest(provider_id: &str, name: &str) -> Vec<u8> {
+    format!(
+        "thegn-account-home v1\nprovider={provider_id}\nname={}\n",
+        encode_hex(name.as_bytes())
+    )
+    .into_bytes()
+}
+
+fn encode_hex(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut encoded = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        encoded.push(char::from(HEX[usize::from(byte >> 4)]));
+        encoded.push(char::from(HEX[usize::from(byte & 0x0f)]));
+    }
+    encoded
+}
+
+fn decode_hex(value: &str) -> Option<Vec<u8>> {
+    if !value.len().is_multiple_of(2) {
+        return None;
+    }
+    value
+        .as_bytes()
+        .chunks_exact(2)
+        .map(|pair| {
+            let digit = |byte| match byte {
+                b'0'..=b'9' => Some(byte - b'0'),
+                b'a'..=b'f' => Some(byte - b'a' + 10),
+                _ => None,
+            };
+            Some(digit(pair[0])? * 16 + digit(pair[1])?)
+        })
+        .collect()
+}
+
+fn parse_owner_manifest(bytes: &[u8]) -> Option<(&str, String)> {
+    if !bytes.ends_with(b"\n") {
+        return None;
+    }
+    let text = std::str::from_utf8(bytes).ok()?;
+    let mut lines = text.split_terminator('\n');
+    if lines.next()? != "thegn-account-home v1" {
+        return None;
+    }
+    let provider = lines.next()?.strip_prefix("provider=")?;
+    let name_hex = lines.next()?.strip_prefix("name=")?;
+    if lines.next().is_some() {
+        return None;
+    }
+    let name = String::from_utf8(decode_hex(name_hex)?).ok()?;
+    Some((provider, name))
+}
+
+/// Establish or verify the private, owner-bound credential home for an account.
+/// Legacy managed homes without a manifest are claimed on first use.
+pub fn ensure_managed_home(provider_id: &str, name: &str) -> Result<PathBuf, AccountHomeError> {
+    if provider(provider_id).is_none() {
+        return Err(AccountHomeError::UnknownProvider {
+            provider: provider_id.to_owned(),
+        });
+    }
+    let anchor = util::xdg_state_home().join("thegn");
+    let anchor_error = |error: std::io::Error| AccountHomeError::UnsafePath {
+        path: anchor.clone(),
+        error: error.to_string(),
+    };
+    std::fs::create_dir_all(&anchor).map_err(anchor_error)?;
+    let rel = Path::new("accounts")
+        .join(provider_id)
+        .join(home_component(name));
+    let private = crate::fsperm::ensure_private_dir_beneath(&anchor, &rel).map_err(|error| {
+        AccountHomeError::UnsafePath {
+            path: anchor.join(rel),
+            error: error.to_string(),
+        }
+    })?;
+    let path = private.path().to_path_buf();
+    let manifest = match private.open_regular_nofollow(OWNER_MANIFEST) {
+        Ok(file) => {
+            let mut bytes = Vec::new();
+            file.take(OWNER_MANIFEST_LIMIT + 1)
+                .read_to_end(&mut bytes)
+                .map_err(|error| AccountHomeError::UnsafePath {
+                    path: path.join(OWNER_MANIFEST),
+                    error: error.to_string(),
+                })?;
+            if bytes.len() > OWNER_MANIFEST_LIMIT as usize {
+                return Err(AccountHomeError::MalformedManifest {
+                    path: path.join(OWNER_MANIFEST),
+                });
+            }
+            Some(bytes)
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => {
+            if private
+                .entry_exists_nofollow(OWNER_MANIFEST)
+                .map_err(|exists_error| AccountHomeError::UnsafePath {
+                    path: path.join(OWNER_MANIFEST),
+                    error: exists_error.to_string(),
+                })?
+            {
+                return Err(AccountHomeError::UnsafePath {
+                    path: path.join(OWNER_MANIFEST),
+                    error: error.to_string(),
+                });
+            }
+            None
+        }
+    };
+    match manifest {
+        Some(bytes) => {
+            let Some((manifest_provider, manifest_name)) = parse_owner_manifest(&bytes) else {
+                return Err(AccountHomeError::MalformedManifest {
+                    path: path.join(OWNER_MANIFEST),
+                });
+            };
+            if manifest_provider != provider_id || manifest_name != name {
+                return Err(AccountHomeError::ForeignManifest {
+                    provider: manifest_provider.to_owned(),
+                    name: manifest_name,
+                });
+            }
+        }
+        None => {
+            private
+                .write_owner_only_atomic(OWNER_MANIFEST, &owner_manifest(provider_id, name))
+                .map_err(|error| AccountHomeError::UnsafePath {
+                    path: path.join(OWNER_MANIFEST),
+                    error: error.to_string(),
+                })?;
+        }
+    }
+    Ok(path)
+}
 
 /// A `[[accounts]]` entry — one credential home for a coding-agent provider
 /// (`codex`/`claude`), used by client-side account switching. thegn points
@@ -183,10 +365,20 @@ pub fn account_dir(cfg: &Config, db: &Db, provider_id: &str, name: &str) -> Opti
         ));
         return None;
     }
-    entries
-        .into_iter()
-        .find(|(n, _, _)| n == name)
-        .map(|(_, dir, _)| dir)
+    let (_, dir, managed) = entries.into_iter().find(|(n, _, _)| n == name)?;
+    if managed && dir == managed_dir(provider_id, name) {
+        match ensure_managed_home(provider_id, name) {
+            Ok(verified) => Some(verified),
+            Err(error) => {
+                crate::msg::warn(&format!(
+                    "account '{name}' has an unsafe credential home; refusing to use it: {error}"
+                ));
+                None
+            }
+        }
+    } else {
+        Some(dir)
+    }
 }
 
 fn resolved_entries(cfg: &Config, db: &Db, provider_id: &str) -> Vec<(String, PathBuf, bool)> {
@@ -962,5 +1154,138 @@ mod tests {
                 .to_string_lossy()
                 .starts_with("my-work_")
         );
+    }
+
+    #[test]
+    fn managed_home_claims_then_verifies() {
+        let _state = crate::testenv::IsolatedState::new();
+        let home = ensure_managed_home("claude", "primary").unwrap();
+        let manifest = std::fs::read(home.join(OWNER_MANIFEST)).unwrap();
+        assert_eq!(manifest, owner_manifest("claude", "primary"));
+        assert_eq!(ensure_managed_home("claude", "primary").unwrap(), home);
+        assert_ne!(
+            managed_dir("claude", "primary"),
+            managed_dir("claude", "different")
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                std::fs::metadata(&home).unwrap().permissions().mode() & 0o777,
+                0o700
+            );
+            assert_eq!(
+                std::fs::metadata(home.join(OWNER_MANIFEST))
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o600
+            );
+        }
+    }
+
+    #[test]
+    fn managed_home_refuses_a_foreign_manifest() {
+        let _state = crate::testenv::IsolatedState::new();
+        let home = managed_dir("claude", "primary");
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::write(home.join(OWNER_MANIFEST), owner_manifest("claude", "other")).unwrap();
+        assert!(matches!(
+            ensure_managed_home("claude", "primary"),
+            Err(AccountHomeError::ForeignManifest { provider, name })
+                if provider == "claude" && name == "other"
+        ));
+    }
+
+    #[test]
+    fn managed_home_refuses_a_malformed_manifest() {
+        let _state = crate::testenv::IsolatedState::new();
+        let home = managed_dir("codex", "primary");
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::write(home.join(OWNER_MANIFEST), b"not an owner record\n").unwrap();
+        assert!(matches!(
+            ensure_managed_home("codex", "primary"),
+            Err(AccountHomeError::MalformedManifest { .. })
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn managed_home_refuses_a_symlinked_manifest() {
+        use std::os::unix::fs::symlink;
+
+        let _state = crate::testenv::IsolatedState::new();
+        let home = managed_dir("codex", "primary");
+        std::fs::create_dir_all(&home).unwrap();
+        let outside = _state.root().join("outside-manifest");
+        std::fs::write(&outside, owner_manifest("codex", "primary")).unwrap();
+        symlink(&outside, home.join(OWNER_MANIFEST)).unwrap();
+        assert!(matches!(
+            ensure_managed_home("codex", "primary"),
+            Err(AccountHomeError::UnsafePath { .. })
+        ));
+        assert_eq!(
+            std::fs::read(outside).unwrap(),
+            owner_manifest("codex", "primary")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn managed_home_refuses_a_symlinked_provider_dir() {
+        use std::os::unix::fs::symlink;
+
+        let state = crate::testenv::IsolatedState::new();
+        let account_root = state.state_home().join("thegn/accounts");
+        std::fs::create_dir_all(&account_root).unwrap();
+        let outside = state.root().join("outside-provider");
+        std::fs::create_dir(&outside).unwrap();
+        symlink(&outside, account_root.join("claude")).unwrap();
+        assert!(matches!(
+            ensure_managed_home("claude", "primary"),
+            Err(AccountHomeError::UnsafePath { .. })
+        ));
+        assert_eq!(std::fs::read_dir(&outside).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn managed_home_refuses_creation_failure() {
+        let state = crate::testenv::IsolatedState::new();
+        std::fs::create_dir_all(state.state_home().join("thegn")).unwrap();
+        std::fs::write(state.state_home().join("thegn/accounts"), b"blocker").unwrap();
+        assert!(matches!(
+            ensure_managed_home("codex", "primary"),
+            Err(AccountHomeError::UnsafePath { .. })
+        ));
+    }
+
+    #[test]
+    fn account_dir_refuses_a_managed_home_that_fails_verification() {
+        let _state = crate::testenv::IsolatedState::new();
+        let db = Db::open_memory().unwrap();
+        let home = managed_dir("codex", "primary");
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::write(
+            home.join(OWNER_MANIFEST),
+            owner_manifest("codex", "someone-else"),
+        )
+        .unwrap();
+        db.put_account("codex", "primary", &home.to_string_lossy(), true, 1)
+            .unwrap();
+        assert_eq!(
+            account_dir(&Config::default(), &db, "codex", "primary"),
+            None
+        );
+    }
+
+    #[test]
+    fn unknown_provider_is_refused_before_any_effect() {
+        let state = crate::testenv::IsolatedState::new();
+        assert!(matches!(
+            ensure_managed_home("../../outside", "primary"),
+            Err(AccountHomeError::UnknownProvider { provider }) if provider == "../../outside"
+        ));
+        assert!(!state.state_home().join("thegn").exists());
     }
 }
