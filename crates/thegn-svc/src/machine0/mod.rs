@@ -1482,7 +1482,7 @@ mod tests {
         for response in cases {
             let result = parse_vm_list(&response);
             assert!(result.is_err(), "accepted response shape: {response}");
-            let error = result.err().expect("response should have been rejected");
+            let error = result.expect_err("response should have been rejected");
             assert!(
                 !error.to_string().contains(&response.to_string()),
                 "error exposed response body: {error}"
