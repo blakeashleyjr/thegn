@@ -444,7 +444,8 @@ pub fn claim_spare(
                 crate::parity::apply_local_parity(&provider, &name, worktree, &workdir, &[])
         {
             thegn_core::msg::warn(&format!(
-                "local parity on claimed spare {name}: {e}; using the origin checkout."
+                "local parity on claimed spare {name}: {e}; {}.",
+                crate::parity::failure_note(&e)
             ));
         }
         // The worktree's DERIVED sandbox may exist as a bare husk (auto-created

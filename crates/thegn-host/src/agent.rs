@@ -2608,11 +2608,12 @@ pub fn provision_provider_env_named(
             } => {
                 // Host-executed: capture the local worktree's unpushed commits +
                 // uncommitted + untracked state and replay it over the clone.
-                // Best-effort — a failure leaves the pristine origin checkout.
+                // Best-effort — the failure note reflects the replay stage.
                 if let Err(e) = crate::parity::apply_local_parity(&provider, &id, wt, wd, &exec_env)
                 {
                     thegn_core::msg::warn(&format!(
-                        "local parity: {e}; the sandbox keeps the origin checkout."
+                        "local parity: {e}; {}.",
+                        crate::parity::failure_note(&e)
                     ));
                 }
                 Ok(())
