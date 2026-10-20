@@ -1170,20 +1170,31 @@ pub fn parse_worktree_branches(porcelain: &str) -> Option<Vec<(String, Option<St
 
     let mut out = Vec::new();
     let mut record: Option<(String, Option<String>)> = None;
+    let mut has_head = false;
     for field in porcelain.split('\0') {
         if field.is_empty() {
             if let Some(entry) = record.take() {
+                if !has_head {
+                    return None;
+                }
                 out.push(entry);
+                has_head = false;
             }
         } else if let Some(path) = field.strip_prefix("worktree ") {
             if record.is_some() || path.is_empty() {
                 return None;
             }
             record = Some((path.to_string(), None));
-        } else if let Some(branch) = field.strip_prefix("branch ") {
-            let Some((_, current_branch)) = record.as_mut() else {
+        } else if let Some(head) = field.strip_prefix("HEAD ") {
+            if record.is_none() || head.is_empty() || has_head {
                 return None;
-            };
+            }
+            has_head = true;
+        } else if let Some(branch) = field.strip_prefix("branch ") {
+            let (_, current_branch) = record.as_mut()?;
+            if !has_head {
+                return None;
+            }
             if current_branch.is_some() {
                 return None;
             }
@@ -2813,7 +2824,7 @@ mod tests {
     #[test]
     fn checkouts_of_branch_finds_linked_worktrees_not_just_the_main_one() {
         let pairs = parse_worktree_branches(
-            "worktree /repo\0branch refs/heads/main\0\0worktree /wt/x\0branch refs/heads/ba/rearch\0\0",
+            "worktree /repo\0HEAD aaaa\0branch refs/heads/main\0\0worktree /wt/x\0HEAD bbbb\0branch refs/heads/ba/rearch\0\0",
         )
         .unwrap();
         // The regression this exists for: the target branch is checked out in a
@@ -2827,8 +2838,10 @@ mod tests {
 
     #[test]
     fn parse_worktree_branches_keeps_exact_paths() {
-        let pairs =
-            parse_worktree_branches("worktree /wt/a\nb \0branch refs/heads/feat\0\0").unwrap();
+        let pairs = parse_worktree_branches(
+            "worktree /wt/a\nb \0HEAD deadbeef\0branch refs/heads/feat\0\0",
+        )
+        .unwrap();
         assert_eq!(
             pairs,
             vec![("/wt/a\nb ".to_string(), Some("feat".to_string()))]
@@ -2838,9 +2851,10 @@ mod tests {
     #[test]
     fn parse_worktree_branches_rejects_malformed_framing() {
         for malformed in [
-            "worktree /repo\0branch refs/heads/main\0",
+            "worktree /repo\0HEAD deadbeef\0branch refs/heads/main\0",
+            "worktree /repo\0branch refs/heads/main\0\0",
             "branch refs/heads/main\0\0",
-            "worktree /repo\0branch refs/heads/main\0branch refs/heads/other\0\0",
+            "worktree /repo\0HEAD deadbeef\0branch refs/heads/main\0branch refs/heads/other\0\0",
             "worktree \0\0",
         ] {
             assert!(
