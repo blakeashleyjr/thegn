@@ -41,7 +41,7 @@ class WorkflowPolicyTests(unittest.TestCase):
     def test_release_source_checkouts_use_admitted_sha(self) -> None:
         workflow = read_workflow("release.yml")
         expected = "${{ needs.admit.outputs.sha }}"
-        for job_name in ("upload", "completions", "package"):
+        for job_name in ("build", "upload", "completions", "package"):
             checkouts = [
                 step
                 for step in workflow["jobs"][job_name]["steps"]
@@ -221,6 +221,60 @@ class WorkflowPolicyTests(unittest.TestCase):
             'git archive "$TRUSTED_WORKFLOW_SHA" .github/actions/ci-setup', script
         )
         self.assertIn("rm -rf .github/actions/ci-setup", script)
+
+    def test_build_jobs_are_read_only(self) -> None:
+        jobs = read_workflow("release.yml")["jobs"]
+        for job_name in ("build", "completions"):
+            with self.subTest(job=job_name):
+                self.assertEqual({"contents": "read"}, jobs[job_name].get("permissions"))
+        build = jobs["build"]
+        action = next(
+            step for step in build["steps"]
+            if step.get("uses", "").startswith("taiki-e/upload-rust-binary-action@")
+        )
+        self.assertIs(action.get("with", {}).get("dry-run"), True)
+        self.assertIs(action.get("with", {}).get("dry-run-intended"), True)
+        self.assertNotIn("GITHUB_TOKEN", action.get("env", {}))
+
+    def test_no_privileged_job_builds_release_code(self) -> None:
+        jobs = read_workflow("release.yml")["jobs"]
+        for job_name, job in jobs.items():
+            permissions = job.get("permissions", {})
+            privileged = any(
+                permissions.get(scope) == "write"
+                for scope in ("contents", "id-token", "attestations")
+            )
+            if privileged:
+                with self.subTest(job=job_name):
+                    job_text = yaml.safe_dump(job)
+                    for forbidden in (
+                        "cargo build",
+                        "upload-rust-binary-action",
+                        "rust-toolchain",
+                    ):
+                        self.assertNotIn(forbidden, job_text)
+
+    def test_upload_broker_publishes_only_verified_artifacts(self) -> None:
+        job = read_workflow("release.yml")["jobs"]["upload"]
+        self.assertIn("build", job.get("needs", []))
+        self.assertIn("completions", job.get("needs", []))
+        steps = job.get("steps", [])
+        self.assertTrue(
+            any(step.get("uses", "").startswith("actions/download-artifact@") for step in steps)
+        )
+        self.assertTrue(
+            any(step.get("uses", "").startswith("actions/attest-build-provenance@") for step in steps)
+        )
+        job_text = yaml.safe_dump(job)
+        self.assertIn("gh release upload", job_text)
+        self.assertIn("sha256sum", job_text)
+
+    def test_release_record_asset(self) -> None:
+        job = read_workflow("release.yml")["jobs"]["upload"]
+        scripts = "\n".join(step.get("run", "") for step in job.get("steps", []))
+        for expected in ("release.json", "tag_object", "workflow_sha", "jq"):
+            with self.subTest(expected=expected):
+                self.assertIn(expected, scripts)
 
     def test_no_job_holds_both_deploy_keys(self) -> None:
         jobs = read_workflow("release.yml")["jobs"]
