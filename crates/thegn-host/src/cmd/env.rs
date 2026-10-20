@@ -66,8 +66,8 @@ pub enum Action {
     },
     /// Create a new managed-sandbox via the env's API provider (Daytona/Sprites)
     /// and print its id. Requires `[env.<name>.provider]` (+ `api_key_env`); on
-    /// create it also applies the env's network allow/block as the sandbox's
-    /// egress policy when the provider supports it.
+    /// create it applies and verifies the env's network egress policy when the
+    /// provider supports it, and destroys the sandbox if verification fails.
     Provision {
         #[command(flatten)]
         target: super::target::WorktreeTarget,
@@ -521,13 +521,25 @@ fn api_provider(cfg: &Config, worktree: Option<String>) -> Result<thegn_svc::pro
 
 /// Create a managed sandbox via the API provider and print its id. When the
 /// provider can translate egress and the env declares a network allow/block
-/// list, lower it to the provider's network policy so the new sandbox comes up
-/// already governed. (Destroy lives in [`deprovision`].)
+/// list, verify the lowered policy before admitting the sandbox.
 fn provision(cfg: &Config, worktree: Option<String>) -> Result<()> {
     let env = resolve_for(cfg, worktree.clone());
     let provider = api_provider(cfg, worktree)?;
     let rt = tokio::runtime::Runtime::new()?;
     let handle = rt.block_on(provider.create())?;
+    let allow = &env.sandbox.network_allow;
+    let block = &env.sandbox.network_block;
+    if provider.caps().egress && (!allow.is_empty() || !block.is_empty()) {
+        admit_egress(
+            &ProviderEgressSteps {
+                provider: &provider,
+                runtime: &rt,
+            },
+            &handle.id,
+            allow,
+            block,
+        )?;
+    }
     outln!("created sandbox: {}", handle.id);
     match handle.exec {
         thegn_svc::provider::ExecKind::Command(argv) => {
@@ -537,24 +549,77 @@ fn provision(cfg: &Config, worktree: Option<String>) -> Result<()> {
             outln!("exec via ssh: {}:{}", t.host, t.port);
         }
     }
-    // Egress translate: lower the env's allow/block lists onto the sandbox.
-    let allow = &env.sandbox.network_allow;
-    let block = &env.sandbox.network_block;
     if provider.caps().egress && (!allow.is_empty() || !block.is_empty()) {
-        match rt.block_on(provider.set_network_policy(&handle.id, allow, block)) {
-            Ok(()) => outln!(
-                "applied network policy: {} allow, {} block",
-                allow.len(),
-                block.len()
-            ),
-            Err(e) => msg::warn(&format!("could not apply network policy: {e}")),
-        }
+        outln!(
+            "applied and verified network policy: {} allow, {} block",
+            allow.len(),
+            block.len()
+        );
     }
     outln!(
         "set `[env.<name>.provider] id = \"{}\"` to attach.",
         handle.id
     );
     Ok(())
+}
+
+trait EgressSteps {
+    fn apply(&self, id: &str, allow: &[String], block: &[String]) -> Result<()>;
+    fn read_back(&self, id: &str) -> Result<Vec<thegn_svc::provider::PolicyRule>>;
+    fn destroy(&self, id: &str) -> Result<()>;
+}
+
+struct ProviderEgressSteps<'a> {
+    provider: &'a thegn_svc::provider::Provider,
+    runtime: &'a tokio::runtime::Runtime,
+}
+
+impl EgressSteps for ProviderEgressSteps<'_> {
+    fn apply(&self, id: &str, allow: &[String], block: &[String]) -> Result<()> {
+        self.runtime
+            .block_on(self.provider.set_network_policy(id, allow, block))
+    }
+
+    fn read_back(&self, id: &str) -> Result<Vec<thegn_svc::provider::PolicyRule>> {
+        self.runtime.block_on(self.provider.get_network_policy(id))
+    }
+
+    fn destroy(&self, id: &str) -> Result<()> {
+        self.runtime.block_on(self.provider.destroy(id))
+    }
+}
+
+fn admit_egress(
+    steps: &dyn EgressSteps,
+    id: &str,
+    allow: &[String],
+    block: &[String],
+) -> Result<()> {
+    let expected = thegn_svc::provider::rules_from(allow, block);
+    let verification = steps.apply(id, allow, block).and_then(|()| {
+        steps.read_back(id).and_then(|observed| {
+            if observed == expected {
+                Ok(())
+            } else {
+                Err(anyhow::anyhow!(
+                    "rule count mismatch: expected {}, observed {}",
+                    expected.len(),
+                    observed.len()
+                ))
+            }
+        })
+    });
+    match verification {
+        Ok(()) => Ok(()),
+        Err(reason) => match steps.destroy(id) {
+            Ok(()) => Err(anyhow::anyhow!(
+                "network policy for sandbox {id} could not be verified ({reason}); the sandbox was destroyed"
+            )),
+            Err(destroy_error) => Err(anyhow::anyhow!(
+                "network policy for sandbox {id} could not be verified ({reason}) and destroying it failed ({destroy_error}): it is running WITHOUT the declared egress policy; destroy it with `thegn env deprovision {id}`"
+            )),
+        },
+    }
 }
 
 /// Resolve `(provider, sandbox_id)` for checkpoint ops — the sandbox id is the
@@ -886,4 +951,183 @@ fn repo_root_for(wt: &str) -> PathBuf {
         .map(PathBuf::from)
         .or_else(|| repo::main_worktree(Path::new(wt)))
         .unwrap_or_else(|| PathBuf::from(wt))
+}
+
+#[cfg(test)]
+mod egress_tests {
+    use super::{EgressSteps, admit_egress};
+    use std::cell::RefCell;
+    use thegn_svc::provider::{PolicyRule, rules_from};
+
+    struct ScriptedEgress {
+        calls: RefCell<Vec<String>>,
+        apply_result: RefCell<Option<anyhow::Result<()>>>,
+        read_result: RefCell<Option<anyhow::Result<Vec<PolicyRule>>>>,
+        destroy_result: RefCell<Option<anyhow::Result<()>>>,
+    }
+
+    impl ScriptedEgress {
+        fn new(
+            apply_result: anyhow::Result<()>,
+            read_result: anyhow::Result<Vec<PolicyRule>>,
+            destroy_result: anyhow::Result<()>,
+        ) -> Self {
+            Self {
+                calls: RefCell::new(Vec::new()),
+                apply_result: RefCell::new(Some(apply_result)),
+                read_result: RefCell::new(Some(read_result)),
+                destroy_result: RefCell::new(Some(destroy_result)),
+            }
+        }
+
+        fn calls(&self) -> Vec<String> {
+            self.calls.borrow().clone()
+        }
+    }
+
+    impl EgressSteps for ScriptedEgress {
+        fn apply(&self, id: &str, _allow: &[String], _block: &[String]) -> anyhow::Result<()> {
+            self.calls.borrow_mut().push(format!("apply:{id}"));
+            self.apply_result
+                .borrow_mut()
+                .take()
+                .expect("apply result is scripted once")
+        }
+
+        fn read_back(&self, id: &str) -> anyhow::Result<Vec<PolicyRule>> {
+            self.calls.borrow_mut().push(format!("read:{id}"));
+            self.read_result
+                .borrow_mut()
+                .take()
+                .expect("read result is scripted once")
+        }
+
+        fn destroy(&self, id: &str) -> anyhow::Result<()> {
+            self.calls.borrow_mut().push(format!("destroy:{id}"));
+            self.destroy_result
+                .borrow_mut()
+                .take()
+                .expect("destroy result is scripted once")
+        }
+    }
+
+    fn policy_lists() -> (Vec<String>, Vec<String>) {
+        (vec!["allowed.test".into()], vec!["blocked.test".into()])
+    }
+
+    #[test]
+    fn matching_readback_admits_without_destroy() {
+        let (allow, block) = policy_lists();
+        let steps = ScriptedEgress::new(Ok(()), Ok(rules_from(&allow, &block)), Ok(()));
+
+        assert!(admit_egress(&steps, "sandbox-1", &allow, &block).is_ok());
+        assert_eq!(steps.calls(), ["apply:sandbox-1", "read:sandbox-1"]);
+    }
+
+    #[test]
+    fn apply_failure_destroys_and_errs() {
+        let (allow, block) = policy_lists();
+        let steps =
+            ScriptedEgress::new(Err(anyhow::anyhow!("apply failed")), Ok(Vec::new()), Ok(()));
+
+        let result = admit_egress(&steps, "sandbox-1", &allow, &block);
+        assert!(result.is_err());
+        assert!(
+            result
+                .err()
+                .map(|error| error.to_string())
+                .is_some_and(|message| { message.contains("was destroyed") })
+        );
+        assert_eq!(steps.calls(), ["apply:sandbox-1", "destroy:sandbox-1"]);
+    }
+
+    #[test]
+    fn readback_error_destroys_and_errs() {
+        let (allow, block) = policy_lists();
+        let steps = ScriptedEgress::new(Ok(()), Err(anyhow::anyhow!("read failed")), Ok(()));
+
+        let result = admit_egress(&steps, "sandbox-1", &allow, &block);
+        assert!(result.is_err());
+        assert!(
+            result
+                .err()
+                .map(|error| error.to_string())
+                .is_some_and(|message| { message.contains("was destroyed") })
+        );
+        assert_eq!(
+            steps.calls(),
+            ["apply:sandbox-1", "read:sandbox-1", "destroy:sandbox-1"]
+        );
+    }
+
+    #[test]
+    fn empty_readback_mismatch_destroys_and_errs() {
+        let (allow, block) = policy_lists();
+        let steps = ScriptedEgress::new(Ok(()), Ok(Vec::new()), Ok(()));
+
+        let result = admit_egress(&steps, "sandbox-1", &allow, &block);
+        assert!(result.is_err());
+        assert!(
+            result
+                .err()
+                .map(|error| error.to_string())
+                .is_some_and(|message| {
+                    message.contains("was destroyed") && message.contains("expected 3, observed 0")
+                })
+        );
+        assert_eq!(
+            steps.calls(),
+            ["apply:sandbox-1", "read:sandbox-1", "destroy:sandbox-1"]
+        );
+    }
+
+    #[test]
+    fn reordered_readback_mismatch_destroys_and_errs() {
+        let (allow, block) = policy_lists();
+        let expected = rules_from(&allow, &block);
+        let observed = vec![
+            expected[1].clone(),
+            expected[0].clone(),
+            expected[2].clone(),
+        ];
+        let steps = ScriptedEgress::new(Ok(()), Ok(observed), Ok(()));
+
+        let result = admit_egress(&steps, "sandbox-1", &allow, &block);
+        assert!(result.is_err());
+        assert!(
+            result
+                .err()
+                .map(|error| error.to_string())
+                .is_some_and(|message| {
+                    message.contains("was destroyed") && message.contains("expected 3, observed 3")
+                })
+        );
+        assert_eq!(
+            steps.calls(),
+            ["apply:sandbox-1", "read:sandbox-1", "destroy:sandbox-1"]
+        );
+    }
+
+    #[test]
+    fn destroy_failure_is_reported_as_unrestricted() {
+        let (allow, block) = policy_lists();
+        let steps = ScriptedEgress::new(
+            Err(anyhow::anyhow!("apply failed")),
+            Ok(Vec::new()),
+            Err(anyhow::anyhow!("destroy failed")),
+        );
+
+        let result = admit_egress(&steps, "sandbox-1", &allow, &block);
+        assert!(result.is_err());
+        assert!(
+            result
+                .err()
+                .map(|error| error.to_string())
+                .is_some_and(|message| {
+                    message.contains("WITHOUT the declared egress policy")
+                        && message.contains("thegn env deprovision sandbox-1")
+                })
+        );
+        assert_eq!(steps.calls(), ["apply:sandbox-1", "destroy:sandbox-1"]);
+    }
 }
