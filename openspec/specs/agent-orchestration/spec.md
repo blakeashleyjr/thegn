@@ -361,3 +361,30 @@ command execution from configuration.
 - **WHEN** a stage's validation step is written as a shell command line rather
   than the name of a configured task
 - **THEN** validation fails, naming the task that would have to be defined
+
+### Requirement: A dispatch status changes only along the set-status transition table
+
+The `dispatch set-status` operation MUST refuse transitions to `queued` and
+`unknown`. It MUST allow `merged` only from `done` or `pr_open`, and `done`
+only from `running`, `spawning`, `waiting_human` or `failed`. Other recognized
+active-status transitions and idempotent writes remain allowed except where
+the terminal rules apply: `done` may move to `merged` or `abandoned`, `failed`
+to `done` or `abandoned`, and `unknown` to `failed` or `abandoned`. With
+`--json`, classified failures MUST print an object with `error`, `id` and
+`message`, where `error` is `illegal_transition`, `stale`, `missing_evidence`
+or `missing_row`.
+
+#### Scenario: Running cannot move directly to merged
+
+- **WHEN** `dispatch set-status` requests `running` → `merged`
+- **THEN** the transition is refused as illegal
+
+#### Scenario: Queued cannot complete before running
+
+- **WHEN** `dispatch set-status` requests `queued` → `done`
+- **THEN** the transition is refused, while `running` → `done` is allowed when the completion gate passes
+
+#### Scenario: JSON refusal names its typed kind
+
+- **WHEN** a `--json` set-status request is refused for an illegal transition, stale status, missing evidence or missing row
+- **THEN** stdout contains the matching error kind, row id and unchanged refusal message before the command exits unsuccessfully

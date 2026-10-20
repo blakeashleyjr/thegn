@@ -1286,7 +1286,41 @@ fn set_status(id: i64, status: &str, force: bool, why: Option<&str>, json: bool)
         );
     }
     let db = Db::open()?;
-    set_status_on(&db, id, parsed, force, why, json)
+    let result = if db.get_dispatch(id)?.is_none() {
+        Err(anyhow::Error::new(thegn_core::db::MissingDispatch { id }))
+    } else {
+        set_status_on(&db, id, parsed, force, why, json)
+    };
+    if json
+        && let Err(error) = &result
+        && let Some(kind) = set_status_error_kind(error)
+    {
+        super::emit_json(&serde_json::json!({
+            "error": kind,
+            "id": id,
+            "message": error.to_string(),
+        }))?;
+    }
+    result
+}
+
+fn set_status_error_kind(err: &anyhow::Error) -> Option<&'static str> {
+    if let Some(conflict) = err.downcast_ref::<thegn_core::db::DispatchTransitionConflict>() {
+        return Some(match conflict {
+            thegn_core::db::DispatchTransitionConflict::Illegal { .. } => "illegal_transition",
+            thegn_core::db::DispatchTransitionConflict::Stale { .. } => "stale",
+        });
+    }
+    if err.downcast_ref::<DoneGateRefused>().is_some() {
+        return Some("missing_evidence");
+    }
+    if err
+        .downcast_ref::<thegn_core::db::MissingDispatch>()
+        .is_some()
+    {
+        return Some("missing_row");
+    }
+    None
 }
 
 fn set_status_on(
@@ -1413,16 +1447,34 @@ fn done_gate_bound(db: &Db, row: &AgentDispatch) -> Result<()> {
     require_done_report(row.id, pipeline_run::verify_report(&facts))
 }
 
+#[derive(Debug)]
+struct DoneGateRefused {
+    id: i64,
+    reasons: Vec<String>,
+}
+
+impl std::fmt::Display for DoneGateRefused {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "dispatch {} is not verifiably finished:\n  - {}\nrun `thegn dispatch verify {}` for detail, or `--force` to record it anyway",
+            self.id,
+            self.reasons.join("\n  - "),
+            self.id
+        )
+    }
+}
+
+impl std::error::Error for DoneGateRefused {}
+
 fn require_done_report(id: i64, report: pipeline_run::VerifyReport) -> Result<()> {
     if report.ok {
         return Ok(());
     }
-    anyhow::bail!(
-        "dispatch {} is not verifiably finished:\n  - {}\nrun `thegn dispatch verify {}` for detail, or `--force` to record it anyway",
+    Err(anyhow::Error::new(DoneGateRefused {
         id,
-        report.reasons.join("\n  - "),
-        id
-    );
+        reasons: report.reasons,
+    }))
 }
 
 /// Gather the filesystem/git facts for one roster row — the single
@@ -2561,6 +2613,63 @@ mod tests {
     }
 
     #[test]
+    fn set_status_json_error_kind_classifies_typed_refusals() {
+        use thegn_core::db::DispatchTransitionConflict as Conflict;
+
+        let illegal = anyhow::Error::new(Conflict::Illegal {
+            id: 7,
+            from: AgentDispatchStatus::Running,
+            to: AgentDispatchStatus::Merged,
+        });
+        let stale = anyhow::Error::new(Conflict::Stale {
+            id: 7,
+            expected: AgentDispatchStatus::Running,
+            actual: AgentDispatchStatus::Done,
+        });
+        let evidence = anyhow::Error::new(DoneGateRefused {
+            id: 7,
+            reasons: vec!["missing artifact".into()],
+        });
+        let missing = anyhow::Error::new(thegn_core::db::MissingDispatch { id: 7 });
+        let plain = anyhow::anyhow!("unclassified");
+
+        assert_eq!(set_status_error_kind(&illegal), Some("illegal_transition"));
+        assert_eq!(set_status_error_kind(&stale), Some("stale"));
+        assert_eq!(set_status_error_kind(&evidence), Some("missing_evidence"));
+        assert_eq!(set_status_error_kind(&missing), Some("missing_row"));
+        assert_eq!(set_status_error_kind(&plain), None);
+    }
+
+    #[test]
+    fn set_status_json_classifies_queued_to_done_as_illegal_transition() {
+        let (_dir, db) = db("set-status-json-queued");
+        let id = db
+            .put_agent_dispatch(NewDispatch::new("linear:THE-977", "/wt/queued", "claude"))
+            .unwrap();
+        let error =
+            set_status_on(&db, id, AgentDispatchStatus::Done, false, None, true).unwrap_err();
+        assert_eq!(set_status_error_kind(&error), Some("illegal_transition"));
+        assert!(error.to_string().contains("queued to done"));
+    }
+
+    #[test]
+    fn set_status_json_classifies_missing_artifact_as_missing_evidence() {
+        let (_dir, db) = db("set-status-json-evidence");
+        let id = db
+            .put_agent_dispatch(NewDispatch {
+                artifact_path: Some("missing-handoff.md"),
+                ..NewDispatch::new("linear:THE-977", "/wt/missing", "claude")
+            })
+            .unwrap();
+        db.update_dispatch_status(id, AgentDispatchStatus::Running)
+            .unwrap();
+        let error =
+            set_status_on(&db, id, AgentDispatchStatus::Done, false, None, true).unwrap_err();
+        assert_eq!(set_status_error_kind(&error), Some("missing_evidence"));
+        assert!(error.to_string().contains("not verifiably finished"));
+    }
+
+    #[test]
     fn set_status_reports_illegal_transition_before_done_artifact_gate() {
         let (_dir, db) = db("set-status-illegal-before-gate");
         let id = db
@@ -2621,6 +2730,8 @@ mod tests {
                 "/wt/force-write",
                 "claude",
             ))
+            .unwrap();
+        db.update_dispatch_status(id, AgentDispatchStatus::Running)
             .unwrap();
         set_status_on(
             &db,
