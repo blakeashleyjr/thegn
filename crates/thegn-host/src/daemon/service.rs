@@ -5369,7 +5369,7 @@ mod tests {
         let _state = crate::testenv::IsolatedState::new();
         let (svc, _events) = service(0);
         let sh = thegn_core::util::which_path("sh").unwrap_or_else(|| "/bin/sh".into());
-        let script = "i=0; while [ $i -lt 2005 ]; do printf 'source-line-%s\\n' $i; i=$((i+1)); done; if [ -n \"$THEGN_FORKED_FROM\" ]; then printf 'forked=%s\\nscrollback=%s\\n' \"$THEGN_FORKED_FROM\" \"$THEGN_FORK_SCROLLBACK\"; fi; while :; do sleep 1; done";
+        let script = "i=0; while [ $i -lt 2005 ]; do printf 'source-line-%s\\n' $i; i=$((i+1)); done; if [ -n \"$THEGN_FORKED_FROM\" ]; then printf 'forked=%s\\n' \"$THEGN_FORKED_FROM\"; printf 'scrollback-name=%s\\n' \"${THEGN_FORK_SCROLLBACK##*/}\"; printf 'scrollback-len=%s\\n' \"${#THEGN_FORK_SCROLLBACK}\"; printf 'fork-env-end\\n'; fi; while :; do sleep 1; done";
         let source = svc
             .open(OpenSpec {
                 argv: vec![sh, "-c".into(), script.into()],
@@ -5440,18 +5440,32 @@ mod tests {
 
         let mut child_text = String::new();
         let child_deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-        while !child_text.contains(&format!("forked={}", source.id)) {
+        while !child_text.contains("fork-env-end") {
             if let EventFrame::PaneSnapshot { bytes, .. } =
                 svc.snapshot(&child.id).await.expect("child lives")
             {
                 child_text = String::from_utf8_lossy(&bytes).into_owned();
             }
+            let tail: String = child_text
+                .chars()
+                .rev()
+                .take(400)
+                .collect::<Vec<_>>()
+                .into_iter()
+                .rev()
+                .collect();
             assert!(
                 std::time::Instant::now() < child_deadline,
-                "child identity output arrived"
+                "child fork environment end marker arrived; last output tail: {tail:?}"
             );
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
         }
-        assert!(child_text.contains(&format!("scrollback={}", handoff.display())));
+        assert!(child_text.contains(&format!("forked={}", source.id)));
+        assert!(child_text.contains(&format!("scrollback-name={}.txt", child.id)));
+        assert!(child_text.contains(&format!(
+            "scrollback-len={}",
+            handoff.to_string_lossy().chars().count()
+        )));
         svc.kill(&child.id).await.expect("kill child");
         let cleanup_deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
         while handoff.exists() {
