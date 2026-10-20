@@ -612,6 +612,8 @@ pub enum RefusalClass {
     MountUnresolvable,
     /// A tunnel-only profile was requested but thegn cannot enforce that the tunnel is the only route.
     TunnelUnenforced,
+    /// A mounted bind source no longer matches the identity admitted before create.
+    MountDrift,
 }
 
 /// Structured, safe context for a refused sandbox launch.
@@ -2406,6 +2408,7 @@ fn ensure_noncompose(spec: &SandboxSpec) -> anyhow::Result<()> {
     // Build the image now (synchronous, correct ordering) when a Dockerfile
     // build was requested — the tag is `spec.image`, so the run below finds it.
     crate::sandbox_build::build_image(spec)?;
+    let admitted = crate::sandbox_mountcheck::admitted_identities(spec);
     use crate::progress::{SandboxPhase, emit};
     emit(SandboxPhase::ContainerCreate {
         backend: spec.backend.label(),
@@ -2427,9 +2430,35 @@ fn ensure_noncompose(spec: &SandboxSpec) -> anyhow::Result<()> {
     // Don't trust the exit code of `podman run -d`: on NixOS with broken
     // --userns keep-id, crun exits 0 but leaves the container in "created"
     // state. Verify it is actually running before declaring success.
-    if container_status(spec).0 {
-        emit(SandboxPhase::PhaseDone);
-        return Ok(());
+    let (running, reusable) = container_status(spec);
+    match crate::sandbox_mountcheck::post_create_verdict(
+        running,
+        reusable,
+        crate::sandbox_mountcheck::identity_drift(&admitted, &|p| {
+            crate::sandbox_mountcheck::mount_identity(std::path::Path::new(p))
+        }),
+    ) {
+        crate::sandbox_mountcheck::PostCreate::Ready => {
+            emit(SandboxPhase::PhaseDone);
+            return Ok(());
+        }
+        crate::sandbox_mountcheck::PostCreate::NotRunning => {}
+        crate::sandbox_mountcheck::PostCreate::Drift(why) => {
+            remove_container(spec);
+            let path = why
+                .strip_prefix("mount source changed: ")
+                .map(str::to_string);
+            let err = format!(
+                "sandbox mount drift after create: {why}; the container was removed and the launch refused"
+            );
+            emit(SandboxPhase::PhaseFailed { err: err.clone() });
+            return Err(anyhow::Error::new(refusal(
+                spec,
+                RefusalClass::MountDrift,
+                path,
+                err,
+            )));
+        }
     }
 
     // A refused bind is terminal for this spec: the mount set is what the runtime
@@ -2470,12 +2499,38 @@ fn ensure_noncompose(spec: &SandboxSpec) -> anyhow::Result<()> {
             None => drop(stderr_with_timeout(&retry, RUN_TIMEOUT)),
         }
         cleanup_oci_env_file(&envfile_dir, retry_envfile.as_deref());
-        if container_status(spec).0 {
-            msg::warn(
-                "podman --userns keep-id failed; continuing with rootless podman default user namespace",
-            );
-            emit(SandboxPhase::PhaseDone);
-            return Ok(());
+        let (running, reusable) = container_status(spec);
+        match crate::sandbox_mountcheck::post_create_verdict(
+            running,
+            reusable,
+            crate::sandbox_mountcheck::identity_drift(&admitted, &|p| {
+                crate::sandbox_mountcheck::mount_identity(std::path::Path::new(p))
+            }),
+        ) {
+            crate::sandbox_mountcheck::PostCreate::Ready => {
+                msg::warn(
+                    "podman --userns keep-id failed; continuing with rootless podman default user namespace",
+                );
+                emit(SandboxPhase::PhaseDone);
+                return Ok(());
+            }
+            crate::sandbox_mountcheck::PostCreate::NotRunning => {}
+            crate::sandbox_mountcheck::PostCreate::Drift(why) => {
+                remove_container(spec);
+                let path = why
+                    .strip_prefix("mount source changed: ")
+                    .map(str::to_string);
+                let err = format!(
+                    "sandbox mount drift after create: {why}; the container was removed and the launch refused"
+                );
+                emit(SandboxPhase::PhaseFailed { err: err.clone() });
+                return Err(anyhow::Error::new(refusal(
+                    spec,
+                    RefusalClass::MountDrift,
+                    path,
+                    err,
+                )));
+            }
         }
     }
 
