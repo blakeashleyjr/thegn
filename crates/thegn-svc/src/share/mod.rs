@@ -131,11 +131,10 @@ impl StopHandle {
                         let state = child
                             .lock()
                             .unwrap_or_else(std::sync::PoisonError::into_inner);
-                        if !state.reaped {
-                            if let Ok(false) = crate::plugin::proc::leader_exited_nowait(state.pid)
-                            {
-                                crate::plugin::proc::kill_group(state.pid);
-                            }
+                        if !state.reaped
+                            && let Ok(false) = crate::plugin::proc::leader_exited_nowait(state.pid)
+                        {
+                            crate::plugin::proc::kill_group(state.pid);
                         }
                     });
             }
