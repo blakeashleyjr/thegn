@@ -35,6 +35,10 @@ pub enum Action {
         /// Base-image override (`name[:tag][@sha256:…]`).
         #[arg(long)]
         image: Option<String>,
+        /// Take over an alias holding recorded state from a host no longer defined (clears that state).
+        /// Refused while the host has live placement tenants.
+        #[arg(long)]
+        replace: bool,
     },
     /// Remove a DB-added host definition (config-defined hosts are read-only
     /// here) plus its recorded state + inventory. With live placement tenants
@@ -106,6 +110,7 @@ pub fn run(cfg: &Config, action: Action) -> Result<()> {
             user,
             install,
             image,
+            replace,
         } => add(
             cfg,
             &target,
@@ -113,6 +118,7 @@ pub fn run(cfg: &Config, action: Action) -> Result<()> {
             user.as_deref(),
             &install,
             image.as_deref(),
+            replace,
         ),
         Action::Rm { name, force } => rm(cfg, &name, force),
         Action::Drain { name } => drain(cfg, &name),
@@ -189,6 +195,7 @@ fn add(
     user: Option<&str>,
     install: &str,
     image: Option<&str>,
+    replace: bool,
 ) -> Result<()> {
     use thegn_core::host_config::{InstallConsent, parse_host_target};
     let (derived, mut hc) = parse_host_target(target, user).map_err(|e| anyhow::anyhow!(e))?;
@@ -204,12 +211,38 @@ fn add(
         hc.image = img.to_string();
     }
     let db = Db::open()?;
-    db.put_host_def(name, &hc, now())?;
-    outln!(
-        "host {name} added ({}) — it is now a selectable env; provision with \
-         `thegn host provision {name}` or just open a worktree on it",
-        hc.reach.as_str()
-    );
+    if replace {
+        use thegn_core::store::PlacementStore;
+        // This short guard can race with a placement admitted before the
+        // replace transaction starts; the transaction still clears atomically.
+        let tenants = db.tenants_of(&thegn_core::host::HostId::named(name))?;
+        if !tenants.is_empty() {
+            anyhow::bail!(
+                "cannot replace host {name}: it has {} live placement tenant(s)",
+                tenants.len()
+            );
+        }
+        if db.put_host_def_replacing(name, &hc, now())? {
+            outln!(
+                "host {name} replaced ({}) — it is now a selectable env; provision with \
+                 `thegn host provision {name}` or just open a worktree on it",
+                hc.reach.as_str()
+            );
+        } else {
+            outln!(
+                "host {name} added ({}) — it is now a selectable env; provision with \
+                 `thegn host provision {name}` or just open a worktree on it",
+                hc.reach.as_str()
+            );
+        }
+    } else {
+        db.put_host_def(name, &hc, now())?;
+        outln!(
+            "host {name} added ({}) — it is now a selectable env; provision with \
+             `thegn host provision {name}` or just open a worktree on it",
+            hc.reach.as_str()
+        );
+    }
     Ok(())
 }
 
@@ -645,6 +678,19 @@ fn promote_candidate(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use clap::Parser;
+
+    #[derive(clap::Parser)]
+    struct Cli {
+        #[command(subcommand)]
+        action: Action,
+    }
+
+    #[test]
+    fn add_accepts_replace_flag() {
+        let cli = Cli::try_parse_from(["t", "add", "me@box", "--replace"]).unwrap();
+        assert!(matches!(cli.action, Action::Add { replace: true, .. }));
+    }
 
     #[test]
     fn state_labels_and_ages_render() {
