@@ -21,7 +21,8 @@
 #                 [--ceiling CORES] [--record] [--json] [--baseline-dir DIR]
 #                 [--zombie-ceiling N] [--child-growth-ceiling N]
 #                 [--fd-growth-ceiling N] [--thread-growth-ceiling N]
-#                 [--syscr-rate-ceiling N]
+#                 [--syscr-rate-ceiling N] [--db-fd-ceiling N]
+#                 [--thread-peak-ceiling N] [--no-lfs-fixture]
 #
 # Exit status: 0 ok; 2 over a ceiling (CPU or resource); 1 harness error.
 # TG_PERF_DROP_KEYS=1 is a negative control: discard workload keys and verify
@@ -92,6 +93,14 @@ CHILD_GROWTH_CEILING=4
 # not accumulation (a real leak would scale with the window, not shrink).
 FD_GROWTH_CEILING=8
 THREAD_GROWTH_CEILING=2
+# Absolute ceilings across the window (the incident: 74 descriptors on thegn.db
+# and its WAL, threads 53 -> 71 in 10 s). These provisional values were set by
+# the planner; the primary confirms or replaces them from a measured
+# `just bench-soak` before the land — do not tune them.
+DB_FD_CEILING=16
+THREAD_PEAK_CEILING=96
+LFS_FIXTURE=0
+NO_LFS_FIXTURE=0
 # Reads per second. The incident sustained 26,063/s from the disk-size walk.
 # Measured idle here: ~900/s over a 45s window, ~2,100/s over 8s — the cost is
 # front-loaded just after the settle, so the ceiling has to clear the short-window
@@ -171,6 +180,19 @@ while [ $# -gt 0 ]; do
     SYSCR_RATE_CEILING="$2"
     shift 2
     ;;
+  --db-fd-ceiling)
+    DB_FD_CEILING="$2"
+    shift 2
+    ;;
+  --thread-peak-ceiling)
+    THREAD_PEAK_CEILING="$2"
+    shift 2
+    ;;
+  --no-lfs-fixture)
+    LFS_FIXTURE=0
+    NO_LFS_FIXTURE=1
+    shift
+    ;;
   --record)
     RECORD=1
     shift
@@ -217,6 +239,7 @@ fi
 # and enough worktrees exist to keep the scan lanes busy. Scenario defaults apply
 # only where the caller did not ask for a value, so an explicit flag always wins.
 if [ "$SCENARIO" = soak ] || [ "$SCENARIO" = soak-daemon ]; then
+  [ "$NO_LFS_FIXTURE" = 1 ] || LFS_FIXTURE=1
   [ "$WORKTREES" = "${TG_PERF_WORKTREES:-14}" ] && WORKTREES=40
   [ "$WINDOW_MS" = 8000 ] && WINDOW_MS=60000
 fi
@@ -241,6 +264,7 @@ PERF_SOCK_DIR=""
 trap perf_cleanup EXIT
 HOST_TAG="$(perf_host_tag)"
 REPO="$(perf_build_fixture "$WORKTREES" "$DIRTY")"
+if [ "$LFS_FIXTURE" = 1 ]; then perf_add_lfs_fixture "$REPO"; fi
 
 command -v script >/dev/null 2>&1 || {
   echo "cpu-sample: script(1) not found" >&2
@@ -1001,6 +1025,7 @@ else
     echo "  fds=$FD0 -> $FD1 (peak $FD_PEAK)"
     echo "    db=$FDDB0 -> $FDDB1   procfs=$FDPR0 -> $FDPR1   sock=$FDSK0 -> $FDSK1   pipe=$FDPI0 -> $FDPI1"
     echo "  threads=$TH0 -> $TH1 (peak $THREAD_PEAK)"
+    echo "  ceilings: db fd=$DB_FD_CEILING  thread peak=$THREAD_PEAK_CEILING  lfs fixture=$LFS_FIXTURE"
     echo "  read syscalls=${SYSCR_RATE}/s"
     if [ -n "${DPID:-}" ]; then
       echo "  daemon pid=$DPID comm=${DCOMM:-?}: children=${DC0:-?} -> ${DC1:-?}   zombies=${DZ0:-?} -> ${DZ1:-?}   fds=${DFD0:-?} -> ${DFD1:-?}   threads=${DTH0:-?} -> ${DTH1:-?}"
@@ -1052,6 +1077,10 @@ if [ "$RES_JSON" != "null" ] && [ "$BUILD" != debug ]; then
     "descriptors accumulating across a settled window (db $FDDB0->$FDDB1, procfs $FDPR0->$FDPR1, sock $FDSK0->$FDSK1, pipe $FDPI0->$FDPI1)"
   res_check thread_growth "$THREAD_GROWTH" "$THREAD_GROWTH_CEILING" \
     "threads accumulating across a settled window (THE-448 leaks one per launch)"
+  res_check db_fds "$((FDDB0 > FDDB1 ? FDDB0 : FDDB1))" "$DB_FD_CEILING" \
+    "thegn.db descriptors (main + WAL + shm) over the absolute ceiling (THE-700: 74 in the incident)"
+  res_check thread_peak "$THREAD_PEAK" "$THREAD_PEAK_CEILING" \
+    "thread high-water over the absolute ceiling (THE-700)"
   if awk "BEGIN{exit !($SYSCR_RATE > $SYSCR_RATE_CEILING)}"; then
     echo "FAIL: syscr_per_s=$SYSCR_RATE exceeds ceiling=$SYSCR_RATE_CEILING — a scan lane is probably saturated" >&2
     RES_FAIL=1
