@@ -2433,6 +2433,19 @@ impl Provider {
             .await
     }
 
+    /// Read back the provider-native network policy for a sandbox.
+    pub async fn get_network_policy(&self, id: &str) -> Result<Vec<PolicyRule>> {
+        self.egress_ops()
+            .ok_or_else(|| {
+                anyhow!(
+                    "provider '{}' does not support egress translation",
+                    self.name()
+                )
+            })?
+            .get_network_policy(id)
+            .await
+    }
+
     /// Create a checkpoint of the sandbox, returning its id.
     pub async fn checkpoint(&self, id: &str, label: Option<&str>) -> Result<String> {
         self.checkpoint_ops()
