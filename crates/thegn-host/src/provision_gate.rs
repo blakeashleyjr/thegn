@@ -346,8 +346,18 @@ pub fn provision_spare(
 ) -> anyhow::Result<String> {
     let repo = repo_root.to_string_lossy().to_string();
     let name = mint_spare_name(&repo)?;
-    if let Ok(db) = thegn_core::db::Db::open() {
-        let _ = db.insert_pool_spare(&name, &repo, env_name); // best-effort: cache write: the DB is a cache; git/forge stays the source of truth
+    {
+        let db = thegn_core::db::Db::open().map_err(|error| {
+            anyhow::anyhow!(
+                "warm pool: cannot open ledger before provisioning spare {name}: {error:#}"
+            )
+        })?;
+        db.insert_pool_spare(&name, &repo, env_name)
+            .map_err(|error| {
+                anyhow::anyhow!(
+                    "warm pool: cannot record provisioning intent for spare {name}: {error:#}"
+                )
+            })?;
     }
     // The repo's main worktree gives env-resolution + origin context; the name is
     // overridden to the generic spare name (the clone is branch-less either way).
@@ -370,21 +380,37 @@ pub fn provision_spare(
         // paths (stale reconcile / worktree delete) can restore from it.
         Ok((true, checkpoint)) => {
             let lock = flake_lock_hash(repo_root);
-            if let Ok(db) = thegn_core::db::Db::open() {
-                let _ = db.set_pool_spare_ready(&name, checkpoint.as_deref(), &lock); // best-effort: cache write: the DB is a cache; git/forge stays the source of truth
+            let ready_result = thegn_core::db::Db::open()
+                .map_err(|error| {
+                    anyhow::anyhow!(
+                        "warm pool: cannot open ledger to publish spare {name}: {error:#}"
+                    )
+                })
+                .and_then(|db| {
+                    db.set_pool_spare_ready(&name, checkpoint.as_deref(), &lock)
+                        .map_err(|error| {
+                            anyhow::anyhow!(
+                                "warm pool: cannot publish spare {name} as ready: {error:#}"
+                            )
+                        })
+                });
+            if let Err(error) = ready_result {
+                return Err(rollback_spare_failure(cfg, env_name, &name, error));
             }
             Ok(name)
         }
         Ok((false, _)) => {
-            let _ = destroy_spare(cfg, env_name, &name); // best-effort: rollback: the original error is returned below
-            Err(anyhow::anyhow!(
+            let error = anyhow::anyhow!(
                 "env '{env_name}' cannot host a pool spare (no configured provider)"
-            ))
+            );
+            match thegn_core::db::Db::open().and_then(|db| db.delete_pool_spare(&name)) {
+                Ok(()) => Err(error),
+                Err(delete_error) => Err(error.context(format!(
+                    "also failed to delete unprovisioned spare intent row {name}: {delete_error:#}"
+                ))),
+            }
         }
-        Err(e) => {
-            let _ = destroy_spare(cfg, env_name, &name); // best-effort: rollback: the original error is returned below
-            Err(e)
-        }
+        Err(error) => Err(rollback_spare_failure(cfg, env_name, &name, error)),
     }
 }
 
@@ -523,13 +549,13 @@ pub(crate) fn rebind_resolved_location(
     fresh
 }
 
-/// Destroy a spare sandbox + drop its DB row. Best-effort (idempotent).
+/// Destroy a spare sandbox and drop its ledger row only after provider success.
 pub fn destroy_spare(
     cfg: &thegn_core::config::Config,
     env_name: &str,
     name: &str,
 ) -> anyhow::Result<()> {
-    if let Some(env) = cfg.env.get(env_name)
+    let destroy_result = if let Some(env) = cfg.env.get(env_name)
         && let Some(provider) = crate::agent::provider_for_named(&env.provider, name)
     {
         crate::remote_enqueue_auth::revoke_for_sandbox(&env.provider, name, None).map_err(|error| {
@@ -537,15 +563,58 @@ pub fn destroy_spare(
                 "refusing to destroy spare {name}: route-to-host credential revocation failed: {error:#}"
             )
         })?;
-        let _ = crate::agent::block_on_provider(|| async { provider.destroy(name).await }); // best-effort: spare teardown: a failed destroy is reaped by the reconcile scan
+        crate::agent::block_on_provider(|| async { provider.destroy(name).await })
+    } else {
+        Err(anyhow::anyhow!(
+            "warm pool: cannot destroy spare {name}: env '{env_name}' has no usable provider; keeping its ledger row"
+        ))
+    };
+    if spare_row_after_destroy(&destroy_result) == SpareRow::Keep {
+        return destroy_result;
     }
-    if let Ok(db) = thegn_core::db::Db::open() {
-        let _ = db.delete_pool_spare(name); // best-effort: cache write: the DB is a cache; git/forge stays the source of truth
-        // Free any placement-engine slot the spare held (no-op otherwise).
-        use thegn_core::store::PlacementStore;
-        let _ = db.tenancy_release(name, unix_now_secs()); // best-effort: cache write: the DB is a cache; git/forge stays the source of truth
+
+    match thegn_core::db::Db::open() {
+        Ok(db) => {
+            if let Err(error) = db.delete_pool_spare(name) {
+                tracing::warn!(target: "thegn::db", %error, spare = name, "failed to delete destroyed spare ledger row");
+            }
+            // Free any placement-engine slot the spare held (no-op otherwise).
+            use thegn_core::store::PlacementStore;
+            if let Err(error) = db.tenancy_release(name, unix_now_secs()) {
+                tracing::warn!(target: "thegn::db", %error, spare = name, "failed to release destroyed spare tenancy");
+            }
+        }
+        Err(error) => {
+            tracing::warn!(target: "thegn::db", %error, spare = name, "could not open ledger after spare destroy");
+        }
     }
     Ok(())
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum SpareRow {
+    Drop,
+    Keep,
+}
+
+fn spare_row_after_destroy(outcome: &anyhow::Result<()>) -> SpareRow {
+    if outcome.is_ok() {
+        SpareRow::Drop
+    } else {
+        SpareRow::Keep
+    }
+}
+
+fn rollback_spare_failure(
+    cfg: &thegn_core::config::Config,
+    env_name: &str,
+    name: &str,
+    error: anyhow::Error,
+) -> anyhow::Error {
+    match destroy_spare(cfg, env_name, name) {
+        Ok(()) => error,
+        Err(rollback) => error.context(format!("rollback also failed: {rollback:#}")),
+    }
 }
 
 fn unix_now_secs() -> i64 {
@@ -768,5 +837,70 @@ mod tests {
             first, second,
             "unreadable lockfiles must never reuse a stored key"
         );
+    }
+
+    #[test]
+    fn spare_ledger_destroy_without_provider_keeps_row() {
+        let _state = thegn_core::testenv::IsolatedState::new();
+        let db = thegn_core::db::Db::open().unwrap();
+        db.insert_pool_spare("ledger-no-provider", "/repo", "missing-env")
+            .unwrap();
+
+        let result = destroy_spare(
+            &thegn_core::config::Config::default(),
+            "missing-env",
+            "ledger-no-provider",
+        );
+
+        assert!(result.is_err());
+        assert!(
+            db.pool_spare_by_name("ledger-no-provider")
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn spare_ledger_unprovisioned_spare_drops_intent_row() {
+        use thegn_core::config::{EnvConfig, EnvProviderConfig, PlacementMode};
+
+        let _state = thegn_core::testenv::IsolatedState::new();
+        let repo = tempfile::tempdir().unwrap();
+        let mut cfg = thegn_core::config::Config::default();
+        cfg.env.insert(
+            "sprites".into(),
+            EnvConfig {
+                placement: PlacementMode::Provider,
+                provider: EnvProviderConfig {
+                    provider: "sprites".into(),
+                    api_key_env: "TG_TEST_SPARE_LEDGER_NO_TOKEN".into(),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        );
+
+        let result = provision_spare(&cfg, repo.path(), "sprites", |_| {});
+
+        assert!(
+            result.is_err(),
+            "missing provider token must refuse provisioning"
+        );
+        assert!(
+            thegn_core::db::Db::open()
+                .unwrap()
+                .pool_spares_for(&repo.path().to_string_lossy(), "sprites")
+                .unwrap()
+                .is_empty(),
+            "an unprovisioned spare must not leave its intent row behind"
+        );
+    }
+
+    #[test]
+    fn spare_ledger_failed_destroy_keeps_row() {
+        let failed = Err(anyhow::anyhow!("provider destroy failed"));
+        let succeeded = Ok(());
+        assert_eq!(spare_row_after_destroy(&failed), SpareRow::Keep);
+        assert_eq!(spare_row_after_destroy(&succeeded), SpareRow::Drop);
     }
 }
