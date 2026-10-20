@@ -30,6 +30,24 @@ fn authority_blob(loc: &GitLoc) -> Result<Option<String>, String> {
     Ok(Some(oid))
 }
 
+fn authority_check(loc: &GitLoc, approved: &Option<String>) -> Result<(), String> {
+    let changed = || {
+        "submodules not initialized: .gitmodules changed at the execution authority after approval; retry"
+            .to_string()
+    };
+    if authority_blob(loc)?.as_ref() != approved.as_ref() {
+        return Err(changed());
+    }
+    if loc
+        .git_out(&["hash-object", "--", ".gitmodules"])
+        .as_deref()
+        != approved.as_deref()
+    {
+        return Err(changed());
+    }
+    Ok(())
+}
+
 fn authority_metadata(
     worktree: &Path,
     loc: Option<&GitLoc>,
@@ -44,6 +62,8 @@ fn authority_metadata(
             }
             return Err("submodule metadata unavailable at the execution authority".into());
         };
+        // `git_out` treats empty stdout as unavailable; an empty committed
+        // .gitmodules therefore fails closed here.
         let text = location
             .git_out(&["cat-file", "blob", &blob])
             .ok_or_else(|| {
@@ -158,13 +178,8 @@ pub(crate) fn initialize(
             "submodules not initialized: trust approval required (repo trust request {id})"
         ));
     }
-    if let Some(location) = loc.filter(|location| location.is_remote())
-        && authority_blob(location)? != metadata.blob
-    {
-        return Err(
-            "submodules not initialized: .gitmodules changed at the execution authority after approval; retry"
-                .into(),
-        );
+    if let Some(location) = loc.filter(|location| location.is_remote()) {
+        authority_check(location, &metadata.blob)?;
     }
     let location = loc
         .cloned()
@@ -202,7 +217,7 @@ pub(crate) fn recursive_submodules_allowed(cfg: &Config, repo_root: &Path) -> bo
 
 #[cfg(test)]
 mod tests {
-    use super::{authority_blob, authority_metadata, direct_submodule_request};
+    use super::{authority_blob, authority_check, authority_metadata, direct_submodule_request};
     use std::path::Path;
     use thegn_core::remote::GitLoc;
 
@@ -283,11 +298,30 @@ mod tests {
     #[test]
     fn submodule_authority_unreadable_provider_is_an_error() {
         let missing = tempfile::tempdir().expect("provider fixture dir");
+        let absent_provider = missing.path().join("absent");
         let result = authority_metadata(
             &missing.path().join("unreadable"),
-            Some(&provider(missing.path())),
+            Some(&provider(&absent_provider)),
         );
         assert!(matches!(result, Err(message) if message.contains("execution authority")));
+    }
+
+    #[test]
+    fn submodule_authority_dirty_worktree_metadata_is_refused() {
+        let provider_dir = tempfile::tempdir().expect("provider fixture dir");
+        committed_repo(provider_dir.path(), Some(MODULES_A));
+        let location = provider(provider_dir.path());
+        let metadata = authority_metadata(provider_dir.path(), Some(&location))
+            .expect("provider metadata is readable")
+            .expect("fixture has metadata");
+
+        std::fs::write(provider_dir.path().join(".gitmodules"), MODULES_B)
+            .expect("write uncommitted metadata");
+
+        let result = authority_check(&location, &metadata.blob);
+        assert!(
+            matches!(result, Err(message) if message.contains("changed at the execution authority"))
+        );
     }
 
     #[test]
