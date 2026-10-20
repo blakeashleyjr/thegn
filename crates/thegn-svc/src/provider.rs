@@ -1670,7 +1670,14 @@ fn exec_argv(spec: &ExecSpec) -> Result<Vec<String>> {
         return Ok(spec.argv.clone());
     };
     anyhow::ensure!(
-        cwd.starts_with('/') && !cwd.contains('\0'),
+        !cwd.contains('\0'),
+        "sprites: exec cwd must be an absolute path without NUL"
+    );
+    if spec.tty && !cwd.starts_with('/') {
+        return Ok(spec.argv.clone());
+    }
+    anyhow::ensure!(
+        cwd.starts_with('/'),
         "sprites: exec cwd must be an absolute path without NUL"
     );
     anyhow::ensure!(
@@ -1718,7 +1725,7 @@ fn exec_ws_url(api_base: &str, id: &str, spec: &ExecSpec) -> Result<String> {
     {
         let mut q = url.query_pairs_mut();
         for a in exec_argv(spec)? {
-            q.append_pair("cmd", a);
+            q.append_pair("cmd", &a);
         }
         q.append_pair("tty", if spec.tty { "true" } else { "false" });
         q.append_pair("stdin", "true");
@@ -1967,10 +1974,13 @@ impl SpritesProvider {
                     );
                     let Some(backoff) = next_connect_wait(start.elapsed(), CONNECT_BUDGET, BACKOFF)
                     else {
-                        return Err(anyhow!(
-                            "sprites: exec ws connect timed out after {}s",
-                            start.elapsed().as_secs()
-                        ));
+                        return match res {
+                            Ok(Err(e)) => Err(e).context("sprites: exec ws connect"),
+                            _ => Err(anyhow!(
+                                "sprites: exec ws connect timed out after {}s",
+                                start.elapsed().as_secs()
+                            )),
+                        };
                     };
                     tokio::time::sleep(backoff).await;
                 }
@@ -2908,6 +2918,20 @@ mod tests {
             ..base
         };
         assert!(exec_argv(&empty_argv).is_err());
+    }
+
+    #[test]
+    fn exec_tty_with_relative_cwd_keeps_original_argv() {
+        let spec = ExecSpec {
+            argv: vec!["sh".into(), "-lc".into(), "exec app".into()],
+            tty: true,
+            cols: 80,
+            rows: 24,
+            env: Vec::new(),
+            cwd: Some("~/code".into()),
+        };
+
+        assert_eq!(exec_argv(&spec).unwrap(), spec.argv);
     }
 
     #[test]
