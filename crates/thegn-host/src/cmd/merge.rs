@@ -745,12 +745,28 @@ fn drain(cfg: &Config, all: bool, json: bool) -> Result<()> {
     let mut drain_items = Vec::with_capacity(items.len());
     for it in items {
         if let Err(error) = db.set_merge_target(&it.worktree, &target) {
-            if error
+            let active_error = error
                 .to_string()
-                .contains(thegn_core::store::MERGE_CLAIM_ACTIVE)
-            {
-                held_branches.push(it.branch.clone());
-                continue;
+                .contains(thegn_core::store::MERGE_CLAIM_ACTIVE);
+            let observed = if active_error {
+                Some(db.observe_merge_claim(&it.worktree)?)
+            } else {
+                None
+            };
+            match merge_driver::target_stamp_action(
+                active_error,
+                observed.as_ref().and_then(Option::as_ref),
+                thegn_core::util::now_ms(),
+            ) {
+                merge_driver::TargetStampAction::SkipHeld => {
+                    held_branches.push(it.branch.clone());
+                    continue;
+                }
+                merge_driver::TargetStampAction::RetryWithoutStamp => {
+                    drain_items.push(it);
+                    continue;
+                }
+                merge_driver::TargetStampAction::Fail => {}
             }
             if json {
                 super::emit_json(&serde_json::json!({
@@ -768,22 +784,22 @@ fn drain(cfg: &Config, all: bool, json: bool) -> Result<()> {
     let mut steps = Vec::new();
     let guard = crate::platform::InterruptGuard::install();
     let _scope = crate::fold_cancel::scope(move || guard.fired());
-    let mut out =
-        merge_driver::drive_queue(mq, cfg, &root, &db, drain_items, |step: &DriveStep| {
-            if !crate::merge_notify::collect_step(&mut steps, step, json) {
-                return;
-            }
-            // Only the settled transitions are worth a CLI line; folding/agent_running
-            // are transient and would just be noise before the outcome.
-            match MqStatus::parse(step.status) {
-                Some(status) => {
-                    if let Some(line) = progress_line(status, step.branch, step.detail) {
-                        outln!("{line}");
-                    }
+    let out = merge_driver::drive_queue(mq, cfg, &root, &db, drain_items, |step: &DriveStep| {
+        if !crate::merge_notify::collect_step(&mut steps, step, json) {
+            return;
+        }
+        // Only the settled transitions are worth a CLI line; folding/agent_running
+        // are transient and would just be noise before the outcome.
+        match MqStatus::parse(step.status) {
+            Some(status) => {
+                if let Some(line) = progress_line(status, step.branch, step.detail) {
+                    outln!("{line}");
                 }
-                None => outln!("  ? {} unknown queue status '{}'", step.branch, step.status),
             }
-        });
+            None => outln!("  ? {} unknown queue status '{}'", step.branch, step.status),
+        }
+    });
+    let mut out = out;
     out.warnings.extend(
         held_branches
             .into_iter()
