@@ -361,8 +361,8 @@ mod tests {
         repo.commit_file("f.txt", "base\n", "c0");
         std::fs::write(repo.dir.join("f.txt"), "dirty\n").unwrap();
         let loc = repo.loc();
-        let index_lock = repo.dir.join(".git/index.lock");
-        let hook_lock = index_lock.clone();
+        let head_lock = repo.dir.join(".git/HEAD.lock");
+        let hook_lock = head_lock.clone();
         UNSTAGED_STASH_STEP_HOOK.with(|hook| {
             *hook.borrow_mut() = Some(Box::new(move |step| {
                 if step == "restore" {
@@ -374,7 +374,7 @@ mod tests {
         let result =
             stash_unstaged_within(&loc, "unstaged only", std::time::Duration::from_millis(100));
         UNSTAGED_STASH_STEP_HOOK.with(|hook| *hook.borrow_mut() = None);
-        std::fs::remove_file(&index_lock).unwrap();
+        std::fs::remove_file(&head_lock).unwrap();
 
         let error = result.unwrap_err();
         let message = format!("{error:#}");
