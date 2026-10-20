@@ -1,9 +1,10 @@
 name: sandbox-image
 # Build + publish the multi-arch base sandbox image (hosts-as-resources):
 # every run first admits one commit on main's lineage and builds only that commit.
-# per-arch nix builds on native runners → push per-arch tags → assemble +
-# push the manifest list → print its digest, which release commits pin as
-# DEFAULT_BASE_DIGEST (crates/thegn-core/src/image.rs).
+# per-arch nix builds on native runners → generation-qualified pushes recorded
+# by digest → assemble + verify the manifest list from those frozen digests →
+# print its digest, which release commits pin as DEFAULT_BASE_DIGEST
+# (crates/thegn-core/src/image.rs).
 #
 # Registry pull is the ALTERNATE delivery route (the default is registry-less
 # transfer from the dev machine), so this publishes on demand / on tag — it is
@@ -20,7 +21,6 @@ on:
     tags: ["sandbox-image-v*"]
 permissions:
   contents: read
-  packages: write
 env:
   IMAGE: ghcr.io/${{ github.repository_owner }}/thegn-sandbox
 concurrency:
@@ -92,6 +92,9 @@ jobs:
           echo "sha=$sha" >> "$GITHUB_OUTPUT"
   build:
     needs: admit
+    permissions:
+      contents: read
+      packages: write
     strategy:
       matrix:
         include:
@@ -109,7 +112,7 @@ jobs:
         run: |
           nix build .#sandbox-image
           ./result | podman load
-      - name: push per-arch tag
+      - name: push generation-qualified per-arch image
         env:
           TAG: ${{ needs.admit.outputs.tag }}
           REGISTRY_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -118,14 +121,39 @@ jobs:
         run: |
           set -euo pipefail
           printf '%s' "$REGISTRY_TOKEN" | podman login ghcr.io -u "$ACTOR" --password-stdin
-          ref="$IMAGE:$TAG-$OCI_ARCH"
+          ref="$IMAGE:$TAG-$OCI_ARCH-g$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
+          digest_file=arch-digest.txt
           podman tag thegn-sandbox:latest "$ref"
-          podman push "$ref"
+          podman push --digestfile "$digest_file" "$ref"
+          digest="$(cat "$digest_file")"
+          [[ "$digest" =~ ^sha256:[a-f0-9]{64}$ ]] || {
+            echo "::error::registry returned an invalid image digest"
+            exit 1
+          }
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: digest-${{ matrix.oci_arch }}
+          path: arch-digest.txt
+          if-no-files-found: error
   manifest:
     needs: [admit, build]
     runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+      attestations: write
     steps:
-      - name: assemble + push the manifest list
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: digest-amd64
+          path: digests/amd64
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: digest-arm64
+          path: digests/arm64
+      - name: assemble + push manifest list from frozen digests
+        id: push
         env:
           TAG: ${{ needs.admit.outputs.tag }}
           REGISTRY_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -133,14 +161,58 @@ jobs:
         run: |
           set -euo pipefail
           printf '%s' "$REGISTRY_TOKEN" | podman login ghcr.io -u "$ACTOR" --password-stdin
+          amd64_digest="$(cat digests/amd64/arch-digest.txt)"
+          arm64_digest="$(cat digests/arm64/arch-digest.txt)"
+          for digest in "$amd64_digest" "$arm64_digest"; do
+            [[ "$digest" =~ ^sha256:[a-f0-9]{64}$ ]] || {
+              echo "::error::artifact contains an invalid image digest"
+              exit 1
+            }
+          done
           podman manifest create "$IMAGE:$TAG" \
-            "docker://$IMAGE:$TAG-amd64" \
-            "docker://$IMAGE:$TAG-arm64"
-          podman manifest push --all "$IMAGE:$TAG" "docker://$IMAGE:$TAG"
-      - name: print the list digest (pin as DEFAULT_BASE_DIGEST)
+            "docker://$IMAGE@$amd64_digest" \
+            "docker://$IMAGE@$arm64_digest"
+          list_digest_file=manifest-digest.txt
+          podman manifest push --all --digestfile "$list_digest_file" \
+            "$IMAGE:$TAG" "docker://$IMAGE:$TAG"
+          list_digest="$(cat "$list_digest_file")"
+          [[ "$list_digest" =~ ^sha256:[a-f0-9]{64}$ ]] || {
+            echo "::error::registry returned an invalid manifest digest"
+            exit 1
+          }
+          echo "amd64_digest=$amd64_digest" >> "$GITHUB_OUTPUT"
+          echo "arm64_digest=$arm64_digest" >> "$GITHUB_OUTPUT"
+          echo "digest=$list_digest" >> "$GITHUB_OUTPUT"
+      - name: verify pushed manifest by digest
+        id: verify
         env:
-          TAG: ${{ needs.admit.outputs.tag }}
+          AMD64_DIGEST: ${{ steps.push.outputs.amd64_digest }}
+          ARM64_DIGEST: ${{ steps.push.outputs.arm64_digest }}
+          LIST_DIGEST: ${{ steps.push.outputs.digest }}
         run: |
           set -euo pipefail
-          skopeo inspect --raw "docker://$IMAGE:$TAG" | sha256sum \
-            | awk '{print "DEFAULT_BASE_DIGEST = sha256:" $1}'
+          # Re-read the registry object by its immutable digest and verify its bytes.
+          skopeo inspect --raw "docker://$IMAGE@$LIST_DIGEST" > manifest.json
+          actual_digest="sha256:$(sha256sum manifest.json | cut -d ' ' -f1)"
+          [[ "$actual_digest" == "$LIST_DIGEST" ]] || {
+            echo "::error::pushed manifest bytes do not match the reported digest"
+            exit 1
+          }
+          python3 -c 'import json, os, sys
+          with open("manifest.json", encoding="utf-8") as source:
+              manifest = json.load(source)
+          actual = [item.get("digest") for item in manifest.get("manifests", [])]
+          expected = [os.environ["AMD64_DIGEST"], os.environ["ARM64_DIGEST"]]
+          if len(actual) != 2 or set(actual) != set(expected):
+              print("::error::pushed manifest children do not match the frozen architecture digests", file=sys.stderr)
+              sys.exit(1)'
+      - name: Attest manifest build provenance
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-name: ${{ env.IMAGE }}
+          subject-digest: ${{ steps.push.outputs.digest }}
+          push-to-registry: true
+      - name: print the list digest (pin as DEFAULT_BASE_DIGEST)
+        env:
+          LIST_DIGEST: ${{ steps.push.outputs.digest }}
+        run: echo "DEFAULT_BASE_DIGEST = $LIST_DIGEST"
