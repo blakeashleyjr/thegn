@@ -1999,18 +1999,18 @@ fn connect_worktree_bridge(
             .ok()
             .and_then(|db| db.worktree_env(&wt.to_string_lossy()).ok().flatten());
         let env = cfg.resolve_env(&repo_root, &loc, &wt, env_name.as_deref());
-        // For a managed provider, install the resident bridge binary first (8-B.3,
-        // idempotent content handshake) so the connect below finds it in the env.
-        // No-op when no local binary is configured or the env isn't a provider.
+        // For a managed provider, install and verify the resident bridge before
+        // tunneling or connecting; a failed or unverified install skips both.
         if matches!(env.placement, thegn_core::placement::Placement::Provider(_))
             && let Some(bin) = crate::bridge_sup::bridge_binary_path()
-        {
-            crate::agent::ensure_remote_bridge(
+            && !crate::agent::ensure_remote_bridge(
                 &cfg,
                 env_name.as_deref().unwrap_or_default(),
                 &bin,
                 &crate::bridge_sup::remote_thegn(),
-            );
+            )
+        {
+            return;
         }
         // Reverse host→sandbox tunnels, all over the resident bridge:
         //  • host services / host-bound MCP: each `[sandbox.home]
