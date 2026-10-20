@@ -378,10 +378,12 @@ fn local_dir(mountpoint: &str) -> String {
 }
 
 /// Reference `sync` projection: stage the initial pull before replacing the
-/// local working copy, so a failed `--delete` mirror cannot damage the live tree.
-/// A changed-files manifest is what `rsync` computes internally; provider
-/// file-API adapters override this. One-direction-each (pull on mount, push on
-/// refresh/close) — true bidirectional conflict resolution is out of scope.
+/// empty local working copy, so a failed `--delete` mirror cannot damage the
+/// live tree. Later pulls sync in place to keep existing pane working
+/// directories valid. A changed-files manifest is what `rsync` computes
+/// internally; provider file-API adapters override this. One-direction-each
+/// (pull on mount, push on refresh/close) — true bidirectional conflict
+/// resolution is out of scope.
 fn mount_sync(spec: &ProjectionSpec) -> Result<Mounted> {
     mount_sync_with(spec, run)
 }
@@ -393,7 +395,26 @@ fn mount_sync_with(
     let Placement::Ssh(s) = &spec.placement else {
         bail!("sync projection requires an ssh placement");
     };
+    let was_claimed = std::fs::symlink_metadata(manifest::manifest_path(spec)).is_ok();
     manifest::claim_or_verify(spec)?;
+
+    let mountpoint = std::path::Path::new(&spec.mountpoint);
+    let mut entries = std::fs::read_dir(mountpoint).map_err(|error| {
+        anyhow::anyhow!(
+            "could not inspect projection mountpoint {}: {error}",
+            mountpoint.display()
+        )
+    })?;
+    if was_claimed || entries.next().is_some() {
+        let mut argv = vec!["rsync".into(), "-az".into(), "--delete".into()];
+        argv.extend(rsync_ssh_opt(s));
+        argv.push(rsync_remote(s, &spec.remote_dir));
+        argv.push(local_dir(&spec.mountpoint));
+        run(&argv)?;
+        return Ok(Mounted {
+            local_cwd: Some(spec.mountpoint.clone()),
+        });
+    }
 
     let mut nonce = [0_u8; 8];
     getrandom::fill(&mut nonce)
@@ -402,7 +423,6 @@ fn mount_sync_with(
         .iter()
         .map(|byte| format!("{byte:02x}"))
         .collect::<String>();
-    let mountpoint = std::path::Path::new(&spec.mountpoint);
     let parent = mountpoint.parent().ok_or_else(|| {
         anyhow::anyhow!(
             "mountpoint {} has no parent directory",
@@ -1012,13 +1032,6 @@ mod tests {
         let mut projection = spec(DataMode::Sync, ssh());
         projection.mountpoint = temp.path().join("mount").to_string_lossy().into_owned();
 
-        mount_sync_with(&projection, |argv| {
-            let destination = std::path::Path::new(argv.last().unwrap().trim_end_matches('/'));
-            std::fs::write(destination.join("keep.txt"), b"keep").unwrap();
-            Ok(())
-        })
-        .unwrap();
-
         let result = mount_sync_with(&projection, |argv| {
             let destination = std::path::Path::new(argv.last().unwrap().trim_end_matches('/'));
             std::fs::write(destination.join("partial.txt"), b"partial").unwrap();
@@ -1027,12 +1040,7 @@ mod tests {
 
         assert!(result.is_err());
         let working_copy = std::path::Path::new(&projection.mountpoint);
-        assert_eq!(
-            std::fs::read(working_copy.join("keep.txt")).unwrap(),
-            b"keep"
-        );
-        assert!(!working_copy.join("partial.txt").exists());
-        assert_eq!(std::fs::read_dir(working_copy).unwrap().count(), 1);
+        assert_eq!(std::fs::read_dir(working_copy).unwrap().count(), 0);
         assert_eq!(
             std::fs::read_dir(working_copy.parent().unwrap())
                 .unwrap()
@@ -1042,7 +1050,7 @@ mod tests {
     }
 
     #[test]
-    fn staged_pull_success_swaps_in_the_new_tree() {
+    fn staged_pull_second_pull_keeps_mountpoint_inode() {
         let temp = tempfile::tempdir().unwrap();
         thegn_core::fsperm::ensure_private_dir(temp.path()).unwrap();
         let mut projection = spec(DataMode::Sync, ssh());
@@ -1054,7 +1062,11 @@ mod tests {
             Ok(())
         })
         .unwrap();
+        let mountpoint = std::path::Path::new(&projection.mountpoint);
+        let before = thegn_core::util::file_identity(mountpoint).unwrap();
+        let mut second_destination = String::new();
         mount_sync_with(&projection, |argv| {
+            second_destination = argv.last().unwrap().clone();
             let destination = std::path::Path::new(argv.last().unwrap().trim_end_matches('/'));
             std::fs::write(destination.join("new.txt"), b"new").unwrap();
             Ok(())
@@ -1062,8 +1074,16 @@ mod tests {
         .unwrap();
 
         let working_copy = std::path::Path::new(&projection.mountpoint);
+        assert_eq!(second_destination, local_dir(&projection.mountpoint));
+        assert_eq!(
+            thegn_core::util::file_identity(working_copy).unwrap(),
+            before
+        );
         assert_eq!(std::fs::read(working_copy.join("new.txt")).unwrap(), b"new");
-        assert!(!working_copy.join("keep.txt").exists());
+        assert_eq!(
+            std::fs::read(working_copy.join("keep.txt")).unwrap(),
+            b"keep"
+        );
         let siblings = std::fs::read_dir(working_copy.parent().unwrap())
             .unwrap()
             .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
