@@ -2731,6 +2731,8 @@ mod tests {
                 "claude",
             ))
             .unwrap();
+        db.update_dispatch_status(id, AgentDispatchStatus::Running)
+            .unwrap();
         set_status_on(
             &db,
             id,
