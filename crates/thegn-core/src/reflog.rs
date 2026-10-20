@@ -490,7 +490,11 @@ mod tests {
         for out in bad_records.iter().take(bad_records.len() - 1) {
             let error =
                 parse_reflog(out).expect_err("malformed input must reject the whole reflog");
-            assert!(error.to_string().contains("reflog record"), "{error}");
+            let message = error.to_string();
+            assert!(
+                message.starts_with("reflog record") || message.starts_with("reflog trailing record"),
+                "{message}"
+            );
         }
     }
 
