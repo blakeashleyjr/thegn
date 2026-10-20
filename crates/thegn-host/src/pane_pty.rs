@@ -9,6 +9,7 @@
 
 use anyhow::{Context, Result};
 use portable_pty::{CommandBuilder, MasterPty, PtySize};
+use std::ffi::OsStr;
 use std::io::Write;
 use std::sync::{Arc, Mutex};
 use termwiz::terminal::TerminalWaker;
@@ -320,6 +321,120 @@ pub(crate) fn drain_detached_reapers(timeout: std::time::Duration) -> bool {
     true
 }
 
+#[derive(Debug, PartialEq, Eq)]
+enum LauncherError {
+    NotOnHostPath(&'static str),
+}
+
+impl std::fmt::Display for LauncherError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NotOnHostPath(name) => write!(
+                formatter,
+                "sandbox launcher `{name}` is not on thegn's own PATH; refusing to resolve it from the pane environment"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for LauncherError {}
+
+fn host_launcher_path(
+    name: &'static str,
+    host_path: Option<&OsStr>,
+) -> Result<String, LauncherError> {
+    let current_dir = match std::env::current_dir() {
+        Ok(directory) => Some(directory),
+        Err(_) => None,
+    };
+    host_path
+        .into_iter()
+        .flat_map(std::env::split_paths)
+        .filter_map(|directory| {
+            let directory = if directory.is_absolute() {
+                directory
+            } else {
+                current_dir.as_ref()?.join(directory)
+            };
+            Some(directory.join(name))
+        })
+        .find(|path| path.is_file())
+        .map(|path| path.to_string_lossy().into_owned())
+        .ok_or(LauncherError::NotOnHostPath(name))
+}
+
+fn is_loader_var(key: &str) -> bool {
+    key.starts_with("LD_") || key.starts_with("DYLD_")
+}
+
+fn pin_outer_launcher(
+    argv: &[String],
+    env: Vec<(String, String)>,
+    host_path: Option<&OsStr>,
+) -> Result<(Vec<String>, Vec<(String, String)>), LauncherError> {
+    let mut pinned_argv = argv.to_vec();
+    let mut bwrap_index = None;
+    let outer_name = match argv.first().map(String::as_str) {
+        Some("bwrap") => Some("bwrap"),
+        Some("systemd-run") => Some("systemd-run"),
+        _ => None,
+    };
+
+    if let Some(name) = outer_name {
+        pinned_argv[0] = host_launcher_path(name, host_path)?;
+        if name == "bwrap" {
+            bwrap_index = Some(0);
+        } else if let Some(index) = argv
+            .windows(2)
+            .position(|pair| pair[0] == "--" && pair[1] == "bwrap")
+            .map(|index| index + 1)
+        {
+            pinned_argv[index] = host_launcher_path("bwrap", host_path)?;
+            bwrap_index = Some(index);
+        }
+    }
+
+    if outer_name.is_none() {
+        return Ok((pinned_argv, env));
+    }
+
+    let mut loader_vars = Vec::new();
+    let mut filtered_env = Vec::with_capacity(env.len());
+    for (key, value) in env {
+        if is_loader_var(&key) {
+            loader_vars.push((key, value));
+        } else {
+            filtered_env.push((key, value));
+        }
+    }
+
+    if let Some(index) = bwrap_index {
+        let last_occurrences: Vec<usize> = loader_vars
+            .iter()
+            .enumerate()
+            .filter_map(|(index, (key, _))| {
+                (!loader_vars[index + 1..]
+                    .iter()
+                    .any(|(later, _)| later == key))
+                .then_some(index)
+            })
+            .collect();
+        let setenv_args: Vec<String> = last_occurrences
+            .into_iter()
+            .flat_map(|index| {
+                let (key, value) = &loader_vars[index];
+                ["--setenv".to_owned(), key.clone(), value.clone()]
+            })
+            .collect();
+        pinned_argv.splice(index + 1..index + 1, setenv_args);
+    } else if !loader_vars.is_empty() {
+        let keys: Vec<&str> = loader_vars.iter().map(|(key, _)| key.as_str()).collect();
+        tracing::debug!(target: "thegn::pty", keys = ?keys, "dropped loader variables from systemd-run environment");
+    }
+
+    Ok((pinned_argv, filtered_env))
+}
+
 /// Spawn `argv` (already composed by `sandbox::enter_argv`) in `cwd` on a fresh
 /// PTY of `rows`x`cols`, injecting `env` (key/value pairs) into the child.
 /// Reader-thread events arrive on `tx`, tagged with `id` so a shared channel
@@ -350,6 +465,15 @@ pub(crate) fn open_pty(
         std::sync::Arc<std::sync::atomic::AtomicBool>,
     )>,
 ) -> Result<PtyHandle> {
+    let mut launch_env = thegn_core::util::host_base_env();
+    // Match the existing CommandBuilder environment layering exactly.
+    launch_env.push(("TERM".to_owned(), "xterm-256color".to_owned()));
+    launch_env.push(("COLORTERM".to_owned(), "truecolor".to_owned()));
+    launch_env.extend(env.iter().cloned());
+    let (argv, launch_env) =
+        pin_outer_launcher(argv, launch_env, std::env::var_os("PATH").as_deref())
+            .map_err(anyhow::Error::new)?;
+
     let pty = portable_pty::native_pty_system();
     let pair = pty
         .openpty(PtySize {
@@ -376,15 +500,7 @@ pub(crate) fn open_pty(
     // secret VALUES reach the container via the wrapper argv (`-e K=V` /
     // `--setenv`), so clearing the launcher's own env is safe.
     cmd.env_clear();
-    for (k, v) in thegn_core::util::host_base_env() {
-        cmd.env(k, v);
-    }
-    // Terminal defaults, unless the caller (or base env) already set them.
-    cmd.env("TERM", "xterm-256color");
-    // The emulator parses 24-bit SGR; advertise it so apps (btop, modern
-    // CLIs) pick truecolor instead of degraded 256-color ramps.
-    cmd.env("COLORTERM", "truecolor");
-    for (k, v) in env {
+    for (k, v) in launch_env {
         cmd.env(k, v);
     }
     let child = pair.slave.spawn_command(cmd).context("spawn child")?;
@@ -495,6 +611,183 @@ pub(crate) fn open_pty(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct LauncherFixture {
+        _root: tempfile::TempDir,
+        host: std::path::PathBuf,
+        agent: std::path::PathBuf,
+        host_path: std::ffi::OsString,
+    }
+
+    impl LauncherFixture {
+        fn new(with_host_bwrap: bool) -> Self {
+            let root = tempfile::tempdir().expect("private tempdir");
+            let host = root.path().join("host");
+            let agent = root.path().join("agent");
+            std::fs::create_dir(&host).expect("create host bin dir");
+            std::fs::create_dir(&agent).expect("create agent bin dir");
+            if with_host_bwrap {
+                std::fs::write(host.join("bwrap"), b"").expect("create host bwrap");
+            }
+            std::fs::write(host.join("systemd-run"), b"").expect("create host systemd-run");
+            std::fs::write(agent.join("bwrap"), b"").expect("create agent bwrap");
+            let host_path = std::env::join_paths([&host]).expect("join host PATH");
+            Self {
+                _root: root,
+                host,
+                agent,
+                host_path,
+            }
+        }
+
+        fn host_path(&self) -> &OsStr {
+            &self.host_path
+        }
+    }
+
+    #[test]
+    fn bwrap_is_pinned_to_host_path_and_loader_vars_are_contained() {
+        let fixture = LauncherFixture::new(true);
+        let argv = ["bwrap", "--", "sh"].map(str::to_owned).to_vec();
+        let env = vec![
+            (
+                "PATH".to_owned(),
+                fixture.agent.to_string_lossy().into_owned(),
+            ),
+            ("LD_PRELOAD".to_owned(), "/x/evil.so".to_owned()),
+            ("LD_LIBRARY_PATH".to_owned(), "/y".to_owned()),
+        ];
+
+        let (pinned, filtered) =
+            pin_outer_launcher(&argv, env, Some(fixture.host_path())).expect("host bwrap resolves");
+
+        assert_eq!(
+            pinned[0],
+            fixture.host.join("bwrap").to_string_lossy().into_owned()
+        );
+        assert_eq!(
+            pinned[1..7].iter().map(String::as_str).collect::<Vec<_>>(),
+            vec![
+                "--setenv",
+                "LD_PRELOAD",
+                "/x/evil.so",
+                "--setenv",
+                "LD_LIBRARY_PATH",
+                "/y"
+            ]
+        );
+        assert_eq!(
+            pinned[7..].iter().map(String::as_str).collect::<Vec<_>>(),
+            vec!["--", "sh"]
+        );
+        assert!(!filtered.iter().any(|(key, _)| is_loader_var(key)));
+        let agent_path = fixture.agent.to_string_lossy().into_owned();
+        assert!(
+            filtered
+                .iter()
+                .any(|(key, value)| { key == "PATH" && value == &agent_path })
+        );
+    }
+
+    #[test]
+    fn systemd_scope_pins_outer_and_inner_bwrap() {
+        let fixture = LauncherFixture::new(true);
+        let argv = [
+            "systemd-run",
+            "--user",
+            "--scope",
+            "--",
+            "bwrap",
+            "--",
+            "sh",
+        ]
+        .map(str::to_owned)
+        .to_vec();
+        let env = vec![("LD_PRELOAD".to_owned(), "/x/evil.so".to_owned())];
+
+        let (pinned, filtered) = pin_outer_launcher(&argv, env, Some(fixture.host_path()))
+            .expect("both host launchers resolve");
+
+        assert_eq!(
+            pinned[0],
+            fixture
+                .host
+                .join("systemd-run")
+                .to_string_lossy()
+                .into_owned()
+        );
+        let pinned_bwrap = fixture.host.join("bwrap").to_string_lossy().into_owned();
+        let inner = pinned
+            .iter()
+            .position(|arg| arg == &pinned_bwrap)
+            .expect("pinned inner bwrap is present");
+        assert_eq!(
+            pinned[inner + 1..inner + 4]
+                .iter()
+                .map(String::as_str)
+                .collect::<Vec<_>>(),
+            vec!["--setenv", "LD_PRELOAD", "/x/evil.so"]
+        );
+        assert_eq!(
+            pinned[inner + 4..]
+                .iter()
+                .map(String::as_str)
+                .collect::<Vec<_>>(),
+            vec!["--", "sh"]
+        );
+        assert!(filtered.is_empty());
+    }
+
+    #[test]
+    fn systemd_without_bwrap_drops_loader_vars() {
+        let fixture = LauncherFixture::new(true);
+        let argv = ["systemd-run", "--user", "--pty", "sh"]
+            .map(str::to_owned)
+            .to_vec();
+        let env = vec![("LD_PRELOAD".to_owned(), "/x/evil.so".to_owned())];
+
+        let (pinned, filtered) = pin_outer_launcher(&argv, env, Some(fixture.host_path()))
+            .expect("host systemd-run resolves");
+
+        assert_eq!(
+            pinned[0],
+            fixture
+                .host
+                .join("systemd-run")
+                .to_string_lossy()
+                .into_owned()
+        );
+        assert_eq!(
+            pinned[1..].iter().map(String::as_str).collect::<Vec<_>>(),
+            vec!["--user", "--pty", "sh"]
+        );
+        assert!(filtered.is_empty());
+    }
+
+    #[test]
+    fn missing_host_bwrap_refuses_resolution() {
+        let fixture = LauncherFixture::new(false);
+        let argv = ["bwrap", "--", "sh"].map(str::to_owned).to_vec();
+        let result = pin_outer_launcher(&argv, Vec::new(), Some(fixture.host_path()));
+
+        assert!(matches!(result, Err(LauncherError::NotOnHostPath("bwrap"))));
+    }
+
+    #[test]
+    fn other_programs_and_explicit_paths_keep_argv_and_env_unchanged() {
+        let fixture = LauncherFixture::new(true);
+        let env = vec![("LD_PRELOAD".to_owned(), "/x/evil.so".to_owned())];
+        for argv in [
+            ["podman", "exec", "x"].map(str::to_owned).to_vec(),
+            ["/abs/bwrap", "x"].map(str::to_owned).to_vec(),
+        ] {
+            let (result_argv, result_env) =
+                pin_outer_launcher(&argv, env.clone(), Some(fixture.host_path()))
+                    .expect("unmanaged command remains unchanged");
+            assert_eq!(result_argv, argv);
+            assert_eq!(result_env, env);
+        }
+    }
 
     /// Our own child processes, in any state. A leaked child is a leak whether
     /// it is still running or already a zombie, so this counts both.
