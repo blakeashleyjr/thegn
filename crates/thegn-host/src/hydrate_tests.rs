@@ -1587,7 +1587,7 @@ fn git_repo_with_linked_worktree(
             .iter()
             .find(|(_, b)| b.as_deref() == Some(branch))
             .map(|(p, _)| p.clone())
-            .unwrap_or_else(|| panic!("git lists a {branch} worktree: {porcelain}"))
+            .unwrap_or_else(|| panic!("git lists a {branch} worktree: {pairs:?}"))
     };
     (of("main"), of("feat"))
 }
