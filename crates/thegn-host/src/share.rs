@@ -363,6 +363,12 @@ pub(crate) struct StopShares {
 static NEXT_SHARE_GENERATION: AtomicU64 = AtomicU64::new(1);
 static SHARE_PROCESS_NONCE: OnceLock<u64> = OnceLock::new();
 
+fn provider_teardown_is_shared(provider: &str) -> bool {
+    // `BuiltinProvider::kind` and `launch` in thegn-svc map tailscale alone to
+    // SidecarServe; its route state is shared by port across generations.
+    provider == "tailscale"
+}
+
 impl ShareSupervisor {
     pub fn new() -> Self {
         Self::default()
@@ -373,6 +379,20 @@ impl ShareSupervisor {
         self.instances.iter().any(|i| {
             i.worktree == worktree && i.port == port && !matches!(i.state, ShareState::Stopping)
         })
+    }
+
+    fn sidecar_teardown_pending(&self, worktree: &str, port: u16) -> bool {
+        self.instances.iter().any(|instance| {
+            instance.worktree == worktree
+                && instance.port == port
+                && matches!(instance.state, ShareState::Stopping)
+                && provider_teardown_is_shared(instance.provider)
+        })
+    }
+
+    fn sidecar_restart_refusal(&self, worktree: &str, port: u16) -> Option<String> {
+        self.sidecar_teardown_pending(worktree, port)
+            .then(|| format!("port {port} is still stopping; wait for its teardown to finish"))
     }
 
     pub fn has_other_generation(&self, worktree: &str, port: u16, generation: u64) -> bool {
@@ -439,6 +459,9 @@ impl ShareSupervisor {
                 && matches!(i.state, ShareState::Failed(_))
                 && i.shared.teardown.lock().unwrap().is_none())
         });
+        if let Some(error) = self.sidecar_restart_refusal(worktree, port) {
+            return Err(error);
+        }
         if self.has(worktree, port) {
             if self.instances.iter().any(|instance| {
                 instance.worktree == worktree
@@ -716,6 +739,15 @@ fn supervise(
         }
     };
 
+    if shared.shutdown.load(Ordering::SeqCst) {
+        emit(ShareEvent::Down {
+            worktree,
+            port,
+            generation,
+        });
+        return;
+    }
+
     let launch = match share::for_provider(&spec).launch() {
         Ok(l) => l,
         Err(e) => return fail(e.to_string()),
@@ -791,6 +823,14 @@ fn supervise(
         // There is no child to wait on; the serve persists until `stop`/shutdown
         // runs `down_argv` (held in `shared.teardown`) or the sidecar dies.
         ShareLaunch::SidecarServe(serve) => {
+            if shared.shutdown.load(Ordering::SeqCst) {
+                emit(ShareEvent::Down {
+                    worktree,
+                    port,
+                    generation,
+                });
+                return;
+            }
             // Profile-aware — the sidecar rides the container's real name.
             let sidecar = thegn_core::sandbox::vpn_sidecar_name(
                 &thegn_core::sandbox::container_name_with_profile(
@@ -1423,5 +1463,69 @@ mod tests {
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].worktree, "/wt/b");
         assert_eq!(rows[0].generation, 20);
+    }
+
+    #[test]
+    fn restart_refused_while_tailscale_generation_is_stopping() {
+        let mut sup = ShareSupervisor::new();
+        sup.instances.push(ShareInstance {
+            worktree: "/wt".into(),
+            port: 443,
+            generation: 74,
+            provider: "tailscale",
+            public: true,
+            state: ShareState::Stopping,
+            shared: Shared::new(),
+            event_tx: None,
+            event_waker: None,
+        });
+
+        // `start` delegates its pre-launch refusal to this predicate; using
+        // it avoids opening a real terminal merely to construct its waker.
+        assert_eq!(
+            sup.sidecar_restart_refusal("/wt", 443).as_deref(),
+            Some("port 443 is still stopping; wait for its teardown to finish")
+        );
+    }
+
+    #[test]
+    fn restart_allowed_after_tailscale_down_ack() {
+        let mut sup = ShareSupervisor::new();
+        sup.instances.push(ShareInstance {
+            worktree: "/wt".into(),
+            port: 443,
+            generation: 72,
+            provider: "tailscale",
+            public: true,
+            state: ShareState::Stopping,
+            shared: Shared::new(),
+            event_tx: None,
+            event_waker: None,
+        });
+
+        assert!(sup.on_event(ShareEvent::Down {
+            worktree: "/wt".into(),
+            port: 443,
+            generation: 72,
+        }));
+        assert!(!sup.sidecar_teardown_pending("/wt", 443));
+    }
+
+    #[test]
+    fn process_provider_restart_is_not_fenced() {
+        let mut sup = ShareSupervisor::new();
+        sup.instances.push(ShareInstance {
+            worktree: "/wt".into(),
+            port: 443,
+            generation: 73,
+            provider: "bore",
+            public: true,
+            state: ShareState::Stopping,
+            shared: Shared::new(),
+            event_tx: None,
+            event_waker: None,
+        });
+
+        assert!(!sup.sidecar_teardown_pending("/wt", 443));
     }
 }
