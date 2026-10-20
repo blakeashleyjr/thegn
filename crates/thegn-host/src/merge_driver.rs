@@ -21,7 +21,7 @@ use std::path::{Path, PathBuf};
 use thegn_core::attention::MqStatus;
 use thegn_core::config::{Config, ConflictHandoff, MergeQueueConfig};
 use thegn_core::db::Db;
-use thegn_core::store::{MergeStatusFields, WorkspaceStore, WorktreeAuxStore};
+use thegn_core::store::{MergeCandidate, MergeStatusFields, WorkspaceStore, WorktreeAuxStore};
 use thegn_core::util;
 
 use crate::integrate::{self, AttemptOutcome};
@@ -115,6 +115,42 @@ enum Failure {
         submodule_conflicts: Vec<thegn_core::submodule::SubmoduleConflict>,
     },
     Gate(String),
+}
+
+#[derive(Debug)]
+struct CandidateDrift {
+    reason: String,
+}
+
+impl std::fmt::Display for CandidateDrift {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.reason)
+    }
+}
+
+impl std::error::Error for CandidateDrift {}
+
+fn candidate_drift(
+    candidate: Option<&MergeCandidate>,
+    adopted: Option<&str>,
+    live_tip: Option<&str>,
+) -> Result<(), String> {
+    let Some(candidate) = candidate else {
+        return Ok(());
+    };
+    let expected = adopted.unwrap_or(&candidate.candidate_oid);
+    let Some(live_tip) = live_tip else {
+        return Err("branch deleted since enqueue".into());
+    };
+    if expected == live_tip {
+        Ok(())
+    } else {
+        Err(format!(
+            "branch moved since enqueue (expected {}, found {})",
+            &expected[..expected.len().min(12)],
+            &live_tip[..live_tip.len().min(12)]
+        ))
+    }
 }
 
 fn conflict_detail(
@@ -212,6 +248,7 @@ pub(crate) fn drive_queue(
         .map(|item| (item.worktree.clone(), item.branch.clone()))
         .collect();
     let expected_oids = RefCell::new(HashMap::<String, String>::new());
+    let adopted_oids = RefCell::new(HashMap::<String, Result<String, String>>::new());
     drive_queue_with(
         cfg,
         full,
@@ -222,8 +259,41 @@ pub(crate) fn drive_queue(
         DriveActions {
             attempt: |branch: &str, location: &thegn_core::remote::GitLoc| {
                 if let thegn_core::remote::GitLoc::Local(worktree) = location {
-                    let ref_name = format!("refs/heads/{branch}");
                     let key = worktree.to_string_lossy().into_owned();
+                    let candidate = db.merge_candidate(&key)?;
+                    if let Some(candidate) = candidate.as_ref() {
+                        let expected_ref = format!("refs/heads/{branch}");
+                        if candidate.branch_ref != expected_ref {
+                            return Err(anyhow::Error::new(CandidateDrift {
+                                reason: format!(
+                                    "queued branch ref changed (expected {expected_ref}, found {})",
+                                    candidate.branch_ref
+                                ),
+                            }));
+                        }
+                        let adopted = adopted_oids.borrow().get(&key).cloned();
+                        if let Some(Err(reason)) = adopted.as_ref() {
+                            return Err(anyhow::Error::new(CandidateDrift {
+                                reason: format!(
+                                    "fixer left the worktree off the queued branch: {reason}"
+                                ),
+                            }));
+                        }
+                        let adopted_tip = match adopted {
+                            Some(Ok(tip)) => Some(tip),
+                            Some(Err(_)) | None => None,
+                        };
+                        let live_tip =
+                            util::git_out(repo_root, &["rev-parse", &candidate.branch_ref]);
+                        if let Err(reason) = candidate_drift(
+                            Some(candidate),
+                            adopted_tip.as_deref(),
+                            live_tip.as_deref(),
+                        ) {
+                            return Err(anyhow::Error::new(CandidateDrift { reason }));
+                        }
+                    }
+                    let ref_name = format!("refs/heads/{branch}");
                     if let Some(oid) = util::git_out(repo_root, &["rev-parse", &ref_name]) {
                         expected_oids.borrow_mut().insert(key, oid);
                     } else {
@@ -266,7 +336,42 @@ pub(crate) fn drive_queue(
                      target: &str,
                      failure: &Failure,
                      sandbox: Option<thegn_core::sandbox::SandboxSpec>| {
-                run_agent(cfg, template, worktree, branch, target, failure, sandbox)
+                let result = run_agent(cfg, template, worktree, branch, target, failure, sandbox);
+                let key = worktree.to_string();
+                match db.merge_candidate(&key) {
+                    Ok(Some(_)) => {
+                        let verified = verify_fixer_checkout(repo_root, worktree, branch, None)
+                            .and_then(|()| {
+                                let head =
+                                    util::git_out(Path::new(worktree), &["rev-parse", "HEAD"])
+                                        .ok_or_else(|| {
+                                            "worktree HEAD is unavailable".to_string()
+                                        })?;
+                                let branch_ref = format!("refs/heads/{branch}");
+                                let tip = util::git_out(repo_root, &["rev-parse", &branch_ref])
+                                    .ok_or_else(|| {
+                                        "queued branch tip is unavailable".to_string()
+                                    })?;
+                                if head != tip {
+                                    return Err(format!(
+                                        "worktree HEAD {head} differs from branch tip {tip}"
+                                    ));
+                                }
+                                Ok(tip)
+                            });
+                        adopted_oids.borrow_mut().insert(key, verified);
+                    }
+                    Ok(None) => {}
+                    Err(error) => {
+                        adopted_oids.borrow_mut().insert(
+                            key,
+                            Err(format!(
+                                "could not read queued candidate after fixer: {error}"
+                            )),
+                        );
+                    }
+                }
+                result
             },
         },
     )
@@ -643,6 +748,23 @@ fn drive_queue_with(
             let attempt = match (actions.attempt)(&item.branch, &branch_loc) {
                 Ok(a) => a,
                 Err(e) => {
+                    if let Some(drift) = e.downcast_ref::<CandidateDrift>() {
+                        let detail = format!(
+                            "identity drift: {}; re-enqueue with `thegn merge add` to adopt the new tip",
+                            drift.reason
+                        );
+                        let fields = set(db, MqStatus::AgentBlocked, None, Some(&detail));
+                        stop_on_write_error!('attempt);
+                        progress(&DriveStep {
+                            fields: &fields,
+                            worktree: &item.worktree,
+                            branch: &item.branch,
+                            status: MqStatus::AgentBlocked.as_str(),
+                            detail: &detail,
+                        });
+                        out.agent_blocked.push(item.branch.clone());
+                        break;
+                    }
                     let detail = format!("{e}");
                     let fields = set(db, MqStatus::NeedsHuman, None, Some(&detail));
                     stop_on_write_error!('attempt);
@@ -1235,6 +1357,54 @@ fn tail_line(log: &str) -> String {
 mod tests {
     use super::*;
 
+    #[test]
+    fn candidate_drift_table() {
+        let candidate = MergeCandidate {
+            branch_ref: "refs/heads/feat".into(),
+            candidate_oid: "a".repeat(40),
+        };
+        let moved = "b".repeat(40);
+        let cases = [
+            (None, None, Some(moved.as_str()), None),
+            (
+                Some(&candidate),
+                None,
+                Some(candidate.candidate_oid.as_str()),
+                None,
+            ),
+            (
+                Some(&candidate),
+                None,
+                Some(moved.as_str()),
+                Some("branch moved since enqueue (expected aaaaaaaaaaaa, found bbbbbbbbbbbb)"),
+            ),
+            (
+                Some(&candidate),
+                None,
+                None,
+                Some("branch deleted since enqueue"),
+            ),
+            (
+                Some(&candidate),
+                Some(moved.as_str()),
+                Some(moved.as_str()),
+                None,
+            ),
+            (
+                Some(&candidate),
+                Some(moved.as_str()),
+                Some(candidate.candidate_oid.as_str()),
+                Some("branch moved since enqueue (expected bbbbbbbbbbbb, found aaaaaaaaaaaa)"),
+            ),
+        ];
+        for (candidate, adopted, live, expected) in cases {
+            assert_eq!(
+                candidate_drift(candidate, adopted, live).err().as_deref(),
+                expected
+            );
+        }
+    }
+
     // Substitution and template rendering themselves are covered in
     // `thegn_core::agent_task`; what these cover is the merge queue's own
     // mapping from a `Failure` onto a task kind and its variables.
@@ -1776,6 +1946,169 @@ mod tests {
                 branch: "feat".into(),
                 location: String::new(),
             }
+        }
+
+        fn bound_item(db: &Db, feat_wt: &Path) -> QueueItem {
+            let worktree = feat_wt.to_string_lossy().into_owned();
+            db.enqueue_merge_candidate(
+                &worktree,
+                "feat",
+                "main",
+                &MergeCandidate {
+                    branch_ref: "refs/heads/feat".into(),
+                    candidate_oid: out(feat_wt, &["rev-parse", "HEAD"]),
+                },
+            )
+            .unwrap();
+            QueueItem {
+                worktree,
+                branch: "feat".into(),
+                location: String::new(),
+            }
+        }
+
+        #[test]
+        fn candidate_drift_force_update_holds_without_fold_or_agent() {
+            for force_back in [false, true] {
+                let tag = if force_back { "force-back" } else { "advance" };
+                let (_fixture, root, feat_wt) = conflicting_repo(tag);
+                let main_before = out(&root, &["rev-parse", "main"]);
+                let db = Db::open_memory().unwrap();
+                let queued = bound_item(&db, &feat_wt);
+                if force_back {
+                    git(&feat_wt, &["reset", "--hard", "HEAD~1"]);
+                } else {
+                    std::fs::write(feat_wt.join("extra.txt"), "advanced\n").unwrap();
+                    git(&feat_wt, &["add", "-A"]);
+                    git(
+                        &feat_wt,
+                        &[
+                            "-c",
+                            "commit.gpgsign=false",
+                            "commit",
+                            "-q",
+                            "-m",
+                            "advanced",
+                        ],
+                    );
+                }
+                let sentinel = root.join("fixer-ran");
+                let outcome = drive_queue(
+                    &cfg(&format!("touch {} && {FIXER}", sentinel.display()), 2),
+                    &Config::default(),
+                    &root,
+                    &db,
+                    vec![queued],
+                    |_| {},
+                );
+                assert_eq!(out(&root, &["rev-parse", "main"]), main_before);
+                assert_eq!(outcome.agent_blocked, ["feat"]);
+                assert!(outcome.landed.is_empty());
+                assert!(!sentinel.exists());
+                let row = db.list_merge_queue().unwrap().remove(0);
+                assert_eq!(row.status, "agent_blocked");
+                assert_eq!(row.agent_attempts, 0);
+                let detail = row.error_detail.unwrap();
+                assert!(detail.contains("identity drift"), "{detail}");
+                assert!(detail.contains("re-enqueue"), "{detail}");
+            }
+        }
+
+        #[test]
+        fn candidate_drift_deleted_branch_holds() {
+            let (_fixture, root, feat_wt) = conflicting_repo("deleted-branch");
+            let main_before = out(&root, &["rev-parse", "main"]);
+            let db = Db::open_memory().unwrap();
+            let queued = bound_item(&db, &feat_wt);
+            git(&feat_wt, &["checkout", "-q", "--detach"]);
+            git(&root, &["branch", "-D", "feat"]);
+            let sentinel = root.join("fixer-ran");
+            let outcome = drive_queue(
+                &cfg(&format!("touch {} && {FIXER}", sentinel.display()), 2),
+                &Config::default(),
+                &root,
+                &db,
+                vec![queued],
+                |_| {},
+            );
+            assert_eq!(out(&root, &["rev-parse", "main"]), main_before);
+            assert_eq!(outcome.agent_blocked, ["feat"]);
+            assert!(outcome.landed.is_empty());
+            assert!(!sentinel.exists());
+            let row = db.list_merge_queue().unwrap().remove(0);
+            assert_eq!(row.status, "agent_blocked");
+            assert_eq!(row.agent_attempts, 0);
+            assert!(row.error_detail.unwrap().contains("identity drift"));
+        }
+
+        #[test]
+        fn candidate_drift_fixer_commit_is_adopted_and_lands() {
+            let (_fixture, root, feat_wt) = conflicting_repo("candidate-fixer-commit");
+            let db = Db::open_memory().unwrap();
+            let queued = bound_item(&db, &feat_wt);
+            let outcome = drive_queue(
+                &cfg(FIXER, 2),
+                &Config::default(),
+                &root,
+                &db,
+                vec![queued],
+                |_| {},
+            );
+            assert_eq!(outcome.landed, ["feat"]);
+        }
+
+        #[test]
+        fn candidate_drift_fixer_that_switches_branch_holds_before_next_fold() {
+            let (_fixture, root, feat_wt) = conflicting_repo("candidate-fixer-switch");
+            let main_before = out(&root, &["rev-parse", "main"]);
+            let db = Db::open_memory().unwrap();
+            let queued = bound_item(&db, &feat_wt);
+            let sentinel = root.join("fixer-ran");
+            let fixer = format!("touch {} && git switch -q -c other", sentinel.display());
+            let outcome = drive_queue(
+                &cfg(&fixer, 2),
+                &Config::default(),
+                &root,
+                &db,
+                vec![queued],
+                |_| {},
+            );
+            assert_eq!(out(&root, &["rev-parse", "main"]), main_before);
+            assert_eq!(outcome.agent_blocked, ["feat"]);
+            assert!(sentinel.exists());
+            let row = db.list_merge_queue().unwrap().remove(0);
+            assert_eq!(row.status, "agent_blocked");
+            assert_eq!(row.agent_attempts, 1);
+            assert!(row.error_detail.unwrap().contains("identity drift"));
+        }
+
+        #[test]
+        fn candidate_drift_unbound_row_keeps_old_behaviour() {
+            let (_fixture, root, feat_wt) = clean_repo("candidate-unbound");
+            let db = Db::open_memory().unwrap();
+            let queued = item(&db, &feat_wt);
+            std::fs::write(feat_wt.join("extra.txt"), "advanced\n").unwrap();
+            git(&feat_wt, &["add", "-A"]);
+            git(
+                &feat_wt,
+                &[
+                    "-c",
+                    "commit.gpgsign=false",
+                    "commit",
+                    "-q",
+                    "-m",
+                    "advanced",
+                ],
+            );
+            let outcome = drive_queue(
+                &cfg("true", 1),
+                &Config::default(),
+                &root,
+                &db,
+                vec![queued],
+                |_| {},
+            );
+            assert_eq!(outcome.landed, ["feat"]);
         }
 
         #[test]
