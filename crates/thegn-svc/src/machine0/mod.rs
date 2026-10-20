@@ -1261,6 +1261,8 @@ mod tests {
                 }
             }
         }
+
+        assert!(admit_create(parse_vm_list(&json!({ "data": [] })).map(|v| v.len()), 5).is_err());
     }
 
     #[test]
@@ -1498,19 +1500,22 @@ mod tests {
     #[test]
     fn parse_vm_list_accepts_known_shapes_and_empty() {
         assert_eq!(parse_vm_list(&json!([])).unwrap(), Vec::<String>::new());
-        for response in [
-            json!({ "machines": [{ "name": "machine" }] }),
-            json!({ "vms": [{ "name": "vm" }] }),
-            json!({ "items": [{ "name": "item" }] }),
+        for (response, expected) in [
+            (json!({ "machines": [{ "name": "machine" }] }), "machine"),
+            (json!({ "vms": [{ "name": "vm" }] }), "vm"),
+            (json!({ "items": [{ "name": "item" }] }), "item"),
         ] {
-            assert_eq!(parse_vm_list(&response).unwrap().len(), 1);
+            assert_eq!(
+                parse_vm_list(&response).unwrap(),
+                vec![expected.to_string()]
+            );
         }
         assert_eq!(
             parse_vm_list(&json!({ "machines": [] })).unwrap(),
             Vec::<String>::new()
         );
         assert_eq!(
-            parse_vm_list(&json!({ "vm": { "id": "vm-id" } })).unwrap(),
+            parse_vm_list(&json!([{ "vm": { "id": "vm-id" } }])).unwrap(),
             vec!["vm-id"]
         );
         assert_eq!(
