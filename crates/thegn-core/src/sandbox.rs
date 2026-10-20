@@ -2150,9 +2150,9 @@ fn emits_nix_bind(spec: &SandboxSpec) -> bool {
 /// profile, so reuse must compare it or a `hardened` container (ro `$HOME`,
 /// `~/.gnupg` rw) would be reused by a later `sealed` launch.
 const SEAL_LABEL: &str = "thegn.seal_home";
-const POLICY_LABEL: &str = "thegn.policy";
+pub(crate) const POLICY_LABEL: &str = "thegn.policy";
 
-fn expected_policy(spec: &SandboxSpec) -> String {
+pub(crate) fn expected_policy(spec: &SandboxSpec) -> String {
     let sealed = sealed_view(spec);
     crate::sandbox_policy_fp::policy_fingerprint(&sealed, vpn_sidecar_join(&sealed).is_some())
 }
