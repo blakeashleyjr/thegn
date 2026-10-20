@@ -12,27 +12,35 @@ fn registered_row(db: &Db, root: &Path, worktree: &str, branch: &str) -> QueueIt
         worktree: worktree.to_owned(),
         branch: branch.to_owned(),
         location: String::new(),
-        agent_attempts: 0,
     }
 }
 
-fn ready_actions(
-    attempt: impl FnMut(&str, &thegn_core::remote::GitLoc) -> anyhow::Result<AttemptOutcome>,
-) -> DriveActions<
-    impl FnMut(&str, &thegn_core::remote::GitLoc) -> anyhow::Result<AttemptOutcome>,
-    impl FnMut(&str) -> crate::agent_run::AgentDispatch,
-    impl FnMut(&str, &str, &str, &str, &Failure, Option<thegn_core::sandbox::SandboxSpec>) -> bool,
-> {
+fn ready_actions<A, F, R>(attempt: A, floor: F, runner: R) -> DriveActions<A, F, R>
+where
+    A: FnMut(&str, &thegn_core::remote::GitLoc) -> anyhow::Result<AttemptOutcome>,
+    F: FnMut(&str) -> crate::agent_run::AgentDispatch,
+    R: FnMut(&str, &str, &str, &str, &Failure, Option<thegn_core::sandbox::SandboxSpec>) -> bool,
+{
     DriveActions {
         attempt,
-        floor: |_: &str| panic!("unexpected agent handoff"),
-        runner: |_: &str,
-                 _: &str,
-                 _: &str,
-                 _: &str,
-                 _: &Failure,
-                 _: Option<thegn_core::sandbox::SandboxSpec>| false,
+        floor,
+        runner,
     }
+}
+
+fn unexpected_agent_handoff(_: &str) -> crate::agent_run::AgentDispatch {
+    panic!("unexpected agent handoff")
+}
+
+fn unused_agent_runner(
+    _: &str,
+    _: &str,
+    _: &str,
+    _: &str,
+    _: &Failure,
+    _: Option<thegn_core::sandbox::SandboxSpec>,
+) -> bool {
+    false
 }
 
 fn registered_config() -> MergeQueueConfig {
@@ -51,9 +59,8 @@ fn racing_drains_on_two_connections_have_one_owner() {
     let root = dir.path().join("repo");
     std::fs::create_dir(&root).unwrap();
     let db_a = Db::open_at(&db_path).unwrap();
-    let mut item = registered_row(&db_a, &root, "/worktrees/feature", "feature");
+    let item = registered_row(&db_a, &root, "/worktrees/feature", "feature");
     db_a.set_merge_agent_attempts(&item.worktree, 1).unwrap();
-    item.agent_attempts = 1;
     let worktree = item.worktree.clone();
     let db_b = Db::open_at(&db_path).unwrap();
     let root_a = root.clone();
@@ -67,11 +74,15 @@ fn racing_drains_on_two_connections_have_one_owner() {
             &db_a,
             vec![item],
             |_| {},
-            ready_actions(move |_, _| {
-                started_tx.send(()).unwrap();
-                release_rx.recv().unwrap();
-                Ok(AttemptOutcome::Ready { tip: "tip".into() })
-            }),
+            ready_actions(
+                move |_, _| {
+                    started_tx.send(()).unwrap();
+                    release_rx.recv().unwrap();
+                    Ok(AttemptOutcome::Ready { tip: "tip".into() })
+                },
+                unexpected_agent_handoff,
+                unused_agent_runner,
+            ),
         )
     });
     started_rx.recv().unwrap();
@@ -86,15 +97,18 @@ fn racing_drains_on_two_connections_have_one_owner() {
             worktree: "/worktrees/feature".into(),
             branch: "feature".into(),
             location: String::new(),
-            agent_attempts: 0,
         }],
         |_| {},
-        ready_actions(move |_, _| {
-            loser_count.fetch_add(1, Ordering::Relaxed);
-            Ok(AttemptOutcome::Ready {
-                tip: "wrong".into(),
-            })
-        }),
+        ready_actions(
+            move |_, _| {
+                loser_count.fetch_add(1, Ordering::Relaxed);
+                Ok(AttemptOutcome::Ready {
+                    tip: "wrong".into(),
+                })
+            },
+            unexpected_agent_handoff,
+            unused_agent_runner,
+        ),
     );
     let attempts_after_loser = loser_attempts.load(Ordering::Relaxed);
     let persisted_attempts = db_b
@@ -147,10 +161,14 @@ fn row_held_by_another_connection_is_skipped_and_the_next_row_lands() {
         &db,
         vec![first.clone(), second],
         |step| progressed.push(step.worktree.to_owned()),
-        ready_actions(move |_, _| {
-            called.fetch_add(1, Ordering::Relaxed);
-            Ok(AttemptOutcome::Ready { tip: "tip".into() })
-        }),
+        ready_actions(
+            move |_, _| {
+                called.fetch_add(1, Ordering::Relaxed);
+                Ok(AttemptOutcome::Ready { tip: "tip".into() })
+            },
+            unexpected_agent_handoff,
+            unused_agent_runner,
+        ),
     );
     assert_eq!(attempted.load(Ordering::Relaxed), 1);
     assert!(
@@ -193,7 +211,11 @@ fn claimed_row_is_released_after_the_drain() {
         &db,
         vec![item.clone()],
         |_| {},
-        ready_actions(|_, _| Ok(AttemptOutcome::Ready { tip: "tip".into() })),
+        ready_actions(
+            |_, _| Ok(AttemptOutcome::Ready { tip: "tip".into() }),
+            unexpected_agent_handoff,
+            unused_agent_runner,
+        ),
     );
     let after = db.observe_merge_claim(&item.worktree).unwrap().unwrap();
     assert_eq!(after.phase, "unclaimed");
@@ -267,10 +289,13 @@ fn unregistered_row_still_drains_unfenced() {
             worktree: "/ad-hoc".into(),
             branch: "feature".into(),
             location: String::new(),
-            agent_attempts: 0,
         }],
         |_| {},
-        ready_actions(|_, _| Ok(AttemptOutcome::Ready { tip: "tip".into() })),
+        ready_actions(
+            |_, _| Ok(AttemptOutcome::Ready { tip: "tip".into() }),
+            unexpected_agent_handoff,
+            unused_agent_runner,
+        ),
     );
     assert!(outcome.warnings.is_empty());
     assert_eq!(outcome.ready, ["feature"]);
@@ -293,7 +318,11 @@ fn stale_folding_row_is_skipped_with_a_warning() {
         &db,
         vec![item],
         |_| {},
-        ready_actions(|_, _| panic!("stale row must not be attempted")),
+        ready_actions(
+            |_, _| panic!("stale row must not be attempted"),
+            unexpected_agent_handoff,
+            unused_agent_runner,
+        ),
     );
     assert_eq!(db.list_merge_queue().unwrap()[0].status, "folding");
     assert!(outcome.warnings[0].contains("not claimable"));

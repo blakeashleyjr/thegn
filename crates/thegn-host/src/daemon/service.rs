@@ -4091,7 +4091,6 @@ mod tests {
                 worktree: rows[0].worktree.clone(),
                 branch: rows[0].branch.clone(),
                 location: rows[0].location.clone(),
-                agent_attempts: rows[0].agent_attempts,
             };
             let outcome = crate::merge_driver::drive_queue(
                 &config.merge_queue,
