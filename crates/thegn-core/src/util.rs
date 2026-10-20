@@ -1154,24 +1154,82 @@ pub fn resync_ff_checkout(root: &Path, branch: &str, old: &str, new: &str) -> Re
     }
 }
 
-/// Parse `git worktree list --porcelain` into `(path, branch)` pairs.
+/// Parse `git worktree list --porcelain -z` into `(path, branch)` pairs.
 ///
-/// Porcelain emits a blank-line-separated record per worktree, opening with
-/// `worktree <path>` and carrying `branch refs/heads/<name>` only when a branch
-/// is checked out (a detached or bare entry has none). Kept pure so the
-/// selection below is unit-tested rather than inferred from a live repo.
-pub fn parse_worktree_branches(porcelain: &str) -> Vec<(String, Option<String>)> {
-    let mut out: Vec<(String, Option<String>)> = Vec::new();
-    for line in porcelain.lines() {
-        if let Some(p) = line.strip_prefix("worktree ") {
-            out.push((p.trim().to_string(), None));
-        } else if let Some(b) = line.strip_prefix("branch ")
-            && let Some(last) = out.last_mut()
-        {
-            last.1 = Some(b.trim().trim_start_matches("refs/heads/").to_string());
+/// THE-376 slice b: non-`-z` porcelain cannot frame a newline in a path.
+/// Each record opens with `worktree <path>` and carries a branch only when one
+/// is checked out (a detached or bare entry has none). Kept pure so malformed
+/// framing and exact path preservation are unit-tested.
+pub fn parse_worktree_branches(porcelain: &str) -> Option<Vec<(String, Option<String>)>> {
+    if porcelain.is_empty() {
+        return Some(Vec::new());
+    }
+    // Every field is NUL-terminated and every record ends with an empty field,
+    // so a complete listing ends with two NULs.
+    if !porcelain.ends_with("\0\0") {
+        return None;
+    }
+
+    let mut out = Vec::new();
+    let mut record: Option<(String, Option<String>)> = None;
+    // A bare entry has no `HEAD`; a `branch` line needs one before it.
+    let mut has_head = false;
+    for field in porcelain.split('\0') {
+        if field.is_empty() {
+            if let Some(entry) = record.take() {
+                out.push(entry);
+                has_head = false;
+            }
+        } else if let Some(path) = field.strip_prefix("worktree ") {
+            if record.is_some() || path.is_empty() {
+                return None;
+            }
+            record = Some((path.to_string(), None));
+        } else if let Some(head) = field.strip_prefix("HEAD ") {
+            if record.is_none() || head.is_empty() || has_head {
+                return None;
+            }
+            has_head = true;
+        } else if let Some(branch) = field.strip_prefix("branch ") {
+            let (_, current_branch) = record.as_mut()?;
+            if !has_head {
+                return None;
+            }
+            if current_branch.is_some() {
+                return None;
+            }
+            *current_branch = Some(
+                branch
+                    .strip_prefix("refs/heads/")
+                    .unwrap_or(branch)
+                    .to_string(),
+            );
+        } else if record.is_none() {
+            return None;
         }
     }
-    out
+    if record.is_some() {
+        return None;
+    }
+    Some(out)
+}
+
+/// The exact Git argv for the NUL-framed worktree listing protocol.
+pub const WORKTREE_LIST_Z: [&str; 4] = ["worktree", "list", "--porcelain", "-z"];
+
+/// Read and strictly parse the repository's NUL-framed worktree listing.
+///
+/// This uses `git worktree list --porcelain -z`, which requires Git 2.36 or
+/// later. Older Git versions fail closed for callers of this helper.
+pub fn worktree_branches(root: &Path) -> Option<Vec<(String, Option<String>)>> {
+    let porcelain = git_out_allow_empty(root, &WORKTREE_LIST_Z)?;
+    match parse_worktree_branches(&porcelain) {
+        Some(branches) => Some(branches),
+        None => {
+            tracing::debug!(target: "thegn::git", "malformed git worktree list --porcelain -z output");
+            None
+        }
+    }
 }
 
 /// The worktree paths with `branch` checked out.
@@ -1239,10 +1297,9 @@ pub fn resync_branch_checkouts(
     old: &str,
     new: &str,
 ) -> Vec<CheckoutResync> {
-    let Some(porc) = git_out(root, &["worktree", "list", "--porcelain"]) else {
+    let Some(pairs) = worktree_branches(root) else {
         return Vec::new();
     };
-    let pairs = parse_worktree_branches(&porc);
     checkouts_of_branch(&pairs, branch)
         .into_iter()
         .map(|p| {
@@ -2834,25 +2891,10 @@ mod tests {
 
     #[test]
     fn parse_worktree_branches_pairs_paths_with_their_branch() {
-        // Real porcelain shape: blank-line-separated records, `branch` absent on
-        // a detached or bare entry.
-        let porc = "\
-worktree /repo
-HEAD aaaa
-branch refs/heads/main
-
-worktree /wt/feature
-HEAD bbbb
-branch refs/heads/ba/rearch
-
-worktree /wt/detached
-HEAD cccc
-detached
-
-worktree /repo/bare
-bare
-";
-        let pairs = parse_worktree_branches(porc);
+        // Deliberately use Git's NUL-framed `-z` form, including empty record
+        // separators; `branch` is absent on a detached or bare entry.
+        let porc = "worktree /repo\0HEAD aaaa\0branch refs/heads/main\0\0worktree /wt/feature\0HEAD bbbb\0branch refs/heads/ba/rearch\0\0worktree /wt/detached\0HEAD cccc\0detached\0\0worktree /repo/bare\0bare\0\0";
+        let pairs = parse_worktree_branches(porc).unwrap();
         assert_eq!(
             pairs,
             vec![
@@ -2862,14 +2904,15 @@ bare
                 ("/repo/bare".to_string(), None),
             ]
         );
-        assert!(parse_worktree_branches("").is_empty());
+        assert!(parse_worktree_branches("").unwrap().is_empty());
     }
 
     #[test]
     fn checkouts_of_branch_finds_linked_worktrees_not_just_the_main_one() {
         let pairs = parse_worktree_branches(
-            "worktree /repo\nbranch refs/heads/main\n\nworktree /wt/x\nbranch refs/heads/ba/rearch\n",
-        );
+            "worktree /repo\0HEAD aaaa\0branch refs/heads/main\0\0worktree /wt/x\0HEAD bbbb\0branch refs/heads/ba/rearch\0\0",
+        )
+        .unwrap();
         // The regression this exists for: the target branch is checked out in a
         // LINKED worktree while the main checkout sits on another branch.
         assert_eq!(checkouts_of_branch(&pairs, "ba/rearch"), vec!["/wt/x"]);
@@ -2877,6 +2920,78 @@ bare
         assert!(checkouts_of_branch(&pairs, "nope").is_empty());
         // A branch-shaped prefix must not match by accident.
         assert!(checkouts_of_branch(&pairs, "ba").is_empty());
+    }
+
+    #[test]
+    fn parse_worktree_branches_keeps_exact_paths() {
+        let pairs = parse_worktree_branches(
+            "worktree /wt/a\nb \0HEAD deadbeef\0branch refs/heads/feat\0\0",
+        )
+        .unwrap();
+        assert_eq!(
+            pairs,
+            vec![("/wt/a\nb ".to_string(), Some("feat".to_string()))]
+        );
+    }
+
+    #[test]
+    fn parse_worktree_branches_rejects_malformed_framing() {
+        for malformed in [
+            "worktree /repo\0HEAD deadbeef\0branch refs/heads/main\0",
+            "worktree /repo\0branch refs/heads/main\0\0",
+            "branch refs/heads/main\0\0",
+            "worktree /repo\0HEAD deadbeef\0branch refs/heads/main\0branch refs/heads/other\0\0",
+            "worktree \0\0",
+        ] {
+            assert!(
+                parse_worktree_branches(malformed).is_none(),
+                "accepted malformed listing {malformed:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn worktree_branches_reads_a_linked_worktree_with_a_newline_in_its_path() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("repo");
+        std::fs::create_dir(&root).unwrap();
+        let linked = temp.path().join("wt\nnl");
+        let run = |args: &[&str]| {
+            git_cmd(&root)
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .args(args)
+                .output()
+                .unwrap()
+        };
+        for args in [
+            &["init", "-q", "-b", "main"][..],
+            &["config", "user.name", "test"],
+            &["config", "user.email", "test@example.invalid"],
+            &[
+                "-c",
+                "commit.gpgsign=false",
+                "commit",
+                "-q",
+                "--allow-empty",
+                "-m",
+                "init",
+            ],
+        ] {
+            assert!(run(args).status.success(), "git {args:?}");
+        }
+        let linked_arg = linked.to_string_lossy().into_owned();
+        let added = run(&["worktree", "add", "-q", "-b", "feat", &linked_arg]);
+        if !added.status.success() {
+            return;
+        }
+
+        let canonical = std::fs::canonicalize(&linked).unwrap();
+        let expected = (
+            canonical.to_string_lossy().into_owned(),
+            Some("feat".to_string()),
+        );
+        let branches = worktree_branches(&root).unwrap();
+        assert!(branches.contains(&expected), "listing: {branches:?}");
     }
 
     #[test]
