@@ -712,7 +712,6 @@ fn drain(cfg: &Config, all: bool, json: bool) -> Result<()> {
             worktree: r.worktree,
             branch: r.branch,
             location: r.location,
-            agent_attempts: r.agent_attempts,
         })
         .collect();
     if items.is_empty() {
@@ -741,8 +740,33 @@ fn drain(cfg: &Config, all: bool, json: bool) -> Result<()> {
     // The run's effective target may differ from the one frozen on each row at
     // enqueue time (e.g. under `--set merge_queue.target_branch=…`), which is
     // why `merge list` used to keep showing the stale value. Re-stamp it.
-    for it in &items {
+    let mut held_branches = Vec::new();
+    let mut drain_items = Vec::with_capacity(items.len());
+    for it in items {
         if let Err(error) = db.set_merge_target(&it.worktree, &target) {
+            let active_error = error
+                .to_string()
+                .contains(thegn_core::store::MERGE_CLAIM_ACTIVE);
+            let observed = if active_error {
+                Some(db.observe_merge_claim(&it.worktree)?)
+            } else {
+                None
+            };
+            match merge_driver::target_stamp_action(
+                active_error,
+                observed.as_ref().and_then(Option::as_ref),
+                thegn_core::util::now_ms(),
+            ) {
+                merge_driver::TargetStampAction::SkipHeld => {
+                    held_branches.push(it.branch.clone());
+                    continue;
+                }
+                merge_driver::TargetStampAction::RetryWithoutStamp => {
+                    drain_items.push(it);
+                    continue;
+                }
+                merge_driver::TargetStampAction::Fail => {}
+            }
             if json {
                 super::emit_json(&serde_json::json!({
                     "error": {
@@ -754,11 +778,12 @@ fn drain(cfg: &Config, all: bool, json: bool) -> Result<()> {
             }
             return Err(error);
         }
+        drain_items.push(it);
     }
     let mut steps = Vec::new();
     let guard = crate::platform::InterruptGuard::install();
     let _scope = crate::fold_cancel::scope(move || guard.fired());
-    let out = merge_driver::drive_queue(mq, cfg, &root, &db, items, |step: &DriveStep| {
+    let out = merge_driver::drive_queue(mq, cfg, &root, &db, drain_items, |step: &DriveStep| {
         if !crate::merge_notify::collect_step(&mut steps, step, json) {
             return;
         }
@@ -773,6 +798,12 @@ fn drain(cfg: &Config, all: bool, json: bool) -> Result<()> {
             None => outln!("  ? {} unknown queue status '{}'", step.branch, step.status),
         }
     });
+    let mut out = out;
+    out.warnings.extend(
+        held_branches
+            .into_iter()
+            .map(|branch| format!("{branch}: claimed by another drain; target update skipped")),
+    );
     crate::merge_notify::record_cli_drain(cfg, &db, &steps, &out);
 
     // push mode: converge by pushing the advanced target to origin. Done before
