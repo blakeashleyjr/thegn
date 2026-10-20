@@ -577,9 +577,9 @@ pub trait GitBackend: thegn_core::seam::Probe + Send + Sync {
         let n = n.to_string();
         let out = run(
             loc,
-            &["reflog", "--format=%H%x1f%gd%x1f%ct%x1f%gs", "-n", &n],
+            &["reflog", "-z", "--format=%H%x00%gd%x00%ct%x00%gs", "-n", &n],
         )?;
-        Ok(thegn_core::reflog::parse_reflog(&out))
+        thegn_core::reflog::parse_reflog(&out)
     }
 
     /// Diffstat between two arbitrary refs (`diff_files` with an `A..B`
@@ -2725,6 +2725,38 @@ mod tests {
                 "status",
                 "--porcelain=v1"
             ]
+        );
+    }
+
+    #[test]
+    fn reflog_reads_nul_framed_entries_from_a_real_repo() {
+        let dir = tempfile::tempdir().unwrap();
+        testutil::git_in(dir.path(), &["init", "-q", "-b", "main"]);
+        std::fs::write(dir.path().join("tracked.txt"), "first\n").unwrap();
+        testutil::git_in(dir.path(), &["add", "--", "tracked.txt"]);
+        testutil::git_in(
+            dir.path(),
+            &["-c", "commit.gpgsign=false", "commit", "-q", "-m", "first"],
+        );
+        std::fs::write(dir.path().join("tracked.txt"), "second\n").unwrap();
+        testutil::git_in(dir.path(), &["add", "--", "tracked.txt"]);
+        testutil::git_in(
+            dir.path(),
+            &["-c", "commit.gpgsign=false", "commit", "-q", "-m", "second"],
+        );
+        let loc = GitLoc::for_worktree(dir.path());
+
+        let entries = super::CliGit.reflog(&loc, 10).unwrap();
+        let head = super::run(&loc, &["rev-parse", "HEAD"]).unwrap();
+        let previous = super::run(&loc, &["rev-parse", "HEAD~1"]).unwrap();
+
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].sha, head.trim());
+        assert_eq!(entries[1].sha, previous.trim());
+        assert!(
+            entries
+                .iter()
+                .all(|entry| { entry.action == thegn_core::reflog::ReflogAction::Commit })
         );
     }
 

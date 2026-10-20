@@ -2,7 +2,7 @@
 //! entry as a user action, then walk newest→oldest with a bracket counter so
 //! resets *we* issued cancel out instead of being undone themselves.
 //!
-//! Pure — the host runs `git reflog --format=%H%x1f%gd%x1f%ct%x1f%gs -n 100`
+//! Pure — the host runs `git reflog -z --format=%H%x00%gd%x00%ct%x00%gs -n 100`
 //! off-thread and persists the target of every reset it performs (undo *and*
 //! redo) in [`OurMarks`] (SQLite at the call site). Lazygit tags its resets
 //! with distinct `[lazygit undo]`/`[lazygit redo]` reflog markers; our marks
@@ -126,29 +126,60 @@ fn classify(raw: &str) -> ReflogAction {
     ReflogAction::Other
 }
 
-/// Parse `git reflog --format=%H%x1f%gd%x1f%ct%x1f%gs -n 100` output (newest
-/// first). Tolerant of malformed input: rows missing fields, with an empty
-/// sha, or with a non-numeric timestamp are skipped.
-pub fn parse_reflog(out: &str) -> Vec<ReflogEntry> {
-    out.lines()
-        .filter_map(|line| {
-            let mut fields = line.splitn(4, '\u{1f}');
-            let sha = fields.next()?;
-            let selector = fields.next()?;
-            let date = fields.next()?.parse::<i64>().ok()?;
-            let raw = fields.next()?;
-            if sha.is_empty() {
-                return None;
-            }
-            Some(ReflogEntry {
-                sha: sha.to_string(),
-                selector: selector.to_string(),
-                date,
-                action: classify(raw),
-                raw: raw.to_string(),
-            })
-        })
-        .collect()
+/// Parse `git reflog -z --format=%H%x00%gd%x00%ct%x00%gs -n 100` output
+/// (newest first). The NUL framing makes each field unambiguous, including
+/// subjects containing other control characters. Malformed output is rejected
+/// as a whole so positional undo planning can never use a shortened history.
+pub fn parse_reflog(out: &str) -> anyhow::Result<Vec<ReflogEntry>> {
+    if out.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let record_count = out.bytes().filter(|byte| *byte == b'\0').count() / 4;
+    anyhow::ensure!(
+        out.ends_with('\0'),
+        "reflog record {record_count}: missing final NUL terminator"
+    );
+
+    let fields: Vec<&str> = out[..out.len() - 1].split('\0').collect();
+    anyhow::ensure!(
+        fields.len().is_multiple_of(4),
+        "reflog record {}: expected four fields, found {}",
+        fields.len() / 4,
+        fields.len() % 4
+    );
+
+    let mut entries = Vec::with_capacity(fields.len() / 4);
+    for (record_index, record) in fields.chunks_exact(4).enumerate() {
+        let sha = record[0];
+        let selector = record[1];
+        let timestamp = record[2];
+        let raw = record[3];
+        anyhow::ensure!(
+            (sha.len() == 40 || sha.len() == 64)
+                && sha.bytes().all(|byte| byte.is_ascii_hexdigit()),
+            "reflog record {record_index}: object id must be 40 or 64 hexadecimal characters"
+        );
+        anyhow::ensure!(
+            !selector.is_empty(),
+            "reflog record {record_index}: selector is empty"
+        );
+        anyhow::ensure!(
+            !timestamp.is_empty() && timestamp.bytes().all(|byte| byte.is_ascii_digit()),
+            "reflog record {record_index}: timestamp must contain decimal digits only"
+        );
+        let date = timestamp.parse::<i64>().map_err(|error| {
+            anyhow::anyhow!("reflog record {record_index}: invalid timestamp: {error}")
+        })?;
+        entries.push(ReflogEntry {
+            sha: (*sha).to_string(),
+            selector: (*selector).to_string(),
+            date,
+            action: classify(raw),
+            raw: (*raw).to_string(),
+        });
+    }
+    Ok(entries)
 }
 
 /// Full-or-prefix sha equality, either direction — reflog targets may be
@@ -388,8 +419,8 @@ mod tests {
             ("total junk", ReflogAction::Other),
         ];
         for (gs, want) in cases {
-            let out = format!("abc\u{1f}HEAD@{{0}}\u{1f}1700000000\u{1f}{gs}\n");
-            let parsed = parse_reflog(&out);
+            let out = format!("{}\0HEAD@{{0}}\01700000000\0{gs}\0", "a".repeat(40));
+            let parsed = parse_reflog(&out).unwrap();
             assert_eq!(parsed.len(), 1, "one row for {gs:?}");
             assert_eq!(parsed[0].action, want, "classification of {gs:?}");
             assert_eq!(parsed[0].raw, gs, "raw preserved verbatim");
@@ -398,12 +429,15 @@ mod tests {
 
     #[test]
     fn parse_preserves_fields() {
-        let out = "deadbeef\u{1f}HEAD@{3}\u{1f}1712345678\u{1f}commit: hello\n";
-        let parsed = parse_reflog(out);
+        let out = format!(
+            "{}\0HEAD@{{3}}\01712345678\0commit: hello\0",
+            "a".repeat(40)
+        );
+        let parsed = parse_reflog(&out).unwrap();
         assert_eq!(
             parsed,
             vec![ReflogEntry {
-                sha: "deadbeef".into(),
+                sha: "a".repeat(40),
                 selector: "HEAD@{3}".into(),
                 date: 1_712_345_678,
                 action: ReflogAction::Commit,
@@ -414,21 +448,69 @@ mod tests {
 
     #[test]
     fn parse_empty_input() {
-        assert!(parse_reflog("").is_empty());
-        assert!(parse_reflog("\n\n").is_empty());
+        assert!(parse_reflog("").unwrap().is_empty());
+        assert!(parse_reflog("\n\n").is_err());
     }
 
     #[test]
-    fn parse_skips_malformed_rows() {
-        let out = concat!(
-            "onlysha\n",                                           // missing fields
-            "sha\u{1f}HEAD@{0}\u{1f}notadate\u{1f}commit: x\n",    // bad timestamp
-            "\u{1f}HEAD@{1}\u{1f}1700000000\u{1f}commit: y\n",     // empty sha
-            "good\u{1f}HEAD@{2}\u{1f}1700000000\u{1f}commit: z\n"  // survives
-        );
-        let parsed = parse_reflog(out);
+    fn parse_rejects_any_malformed_record() {
+        let good_sha = "a".repeat(40);
+        let good = format!("{good_sha}\0HEAD@{{0}}\01700000000\0commit: good\0");
+        let bad_records = [
+            format!("{good_sha}\0HEAD@{{0}}\01700000000\0commit: no final terminator"),
+            format!("{good_sha}\0HEAD@{{0}}\01700000000\0"),
+            format!(
+                "{}\0HEAD@{{0}}\01700000000\0commit: short\0",
+                "a".repeat(39)
+            ),
+            format!(
+                "{}g\0HEAD@{{0}}\01700000000\0commit: non-hex\0",
+                "a".repeat(39)
+            ),
+            format!("{good_sha}\0\01700000000\0commit: empty selector\0"),
+            format!("{good_sha}\0HEAD@{{0}}\0not-a-date\0commit: bad timestamp\0"),
+            format!(
+                "{good_sha}\0HEAD@{{0}}\0{}\0commit: overflowing timestamp\0",
+                "9".repeat(30)
+            ),
+            format!(
+                "{good}{short}\0HEAD@{{1}}\01700000000\0commit: bad second record\0",
+                short = "b".repeat(39)
+            ),
+        ];
+
+        let appended_bad_error = parse_reflog(bad_records.last().unwrap())
+            .expect_err("a later malformed row must reject the complete history");
+        assert!(appended_bad_error.to_string().contains("record 1"));
+
+        for out in bad_records {
+            let error =
+                parse_reflog(&out).expect_err("malformed input must reject the whole reflog");
+            assert!(error.to_string().contains("reflog record"), "{error}");
+        }
+    }
+
+    #[test]
+    fn parse_keeps_unit_separator_in_subject() {
+        let sha = "b".repeat(40);
+        let subject = "commit: a\u{1f}b";
+        let out = format!("{sha}\0HEAD@{{0}}\01700000000\0{subject}\0");
+
+        let parsed = parse_reflog(&out).unwrap();
+
         assert_eq!(parsed.len(), 1);
-        assert_eq!(parsed[0].sha, "good");
+        assert_eq!(parsed[0].raw, subject);
+    }
+
+    #[test]
+    fn parse_accepts_sha256_ids() {
+        let sha = "c".repeat(64);
+        let out = format!("{sha}\0HEAD@{{0}}\01700000000\0commit: sha256\0");
+
+        let parsed = parse_reflog(&out).unwrap();
+
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0].sha, sha);
     }
 
     // ── OurMarks ────────────────────────────────────────────────────────
