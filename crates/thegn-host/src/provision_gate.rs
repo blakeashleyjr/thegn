@@ -334,15 +334,14 @@ pub(crate) fn guard_unprovisioned_attach(
 // Warm-pool spare lifecycle (mint / claim / destroy) — the flows the guards
 // above arbitrate. Extracted from the pinned `agent.rs`.
 
-/// Mint + fully provision a NEW warm-pool spare for `(repo, env)`: a generically-
-/// named sandbox, cloned + devShell-seeded + tooled + checkpointed (so it suspends
-/// for free), recorded `ready` so a worktree can claim it. Returns the spare name.
-/// On failure the half-built sandbox + DB row are torn down.
+/// A reserved provisioning row and its spare lease. Dropping it releases the
+/// lease and leaves the row for the stale sweep.
 pub(crate) struct ReservedSpare {
     pub(crate) name: String,
     lease: crate::pool_lease::Lease,
 }
 
+/// Reserve a name, hold its lease, and record the provisioning row.
 pub(crate) fn reserve_spare(
     repo_root: &std::path::Path,
     env_name: &str,
@@ -367,6 +366,11 @@ pub(crate) fn reserve_spare(
     Ok(ReservedSpare { name, lease })
 }
 
+/// Mint + fully provision a NEW warm-pool spare for `(repo, env)`: a generically-
+/// named sandbox, cloned + devShell-seeded + tooled + checkpointed (so it suspends
+/// for free), recorded `ready` so a worktree can claim it. Returns the spare name.
+/// On failure the half-built sandbox + DB row are torn down.
+#[cfg(test)]
 pub fn provision_spare(
     cfg: &thegn_core::config::Config,
     repo_root: &std::path::Path,
@@ -377,6 +381,7 @@ pub fn provision_spare(
     provision_reserved(cfg, repo_root, env_name, spare, progress)
 }
 
+/// Provision a reserved spare and hold its lease through publish or rollback.
 pub(crate) fn provision_reserved(
     cfg: &thegn_core::config::Config,
     repo_root: &std::path::Path,
