@@ -25,63 +25,85 @@ pub trait UndoOps: GitBackend {
     /// user first. Returns the reset target sha (for `undo_marks`) when the
     /// plan was a reset.
     fn undo_apply(&self, loc: &GitLoc, plan: &UndoPlan, autostash: bool) -> Result<Option<String>> {
-        match plan {
-            UndoPlan::Nothing => bail!("nothing to undo"),
-            UndoPlan::Checkout { branch, .. } => {
-                let branch = op::branch_name(branch)?;
-                run_w(loc, &[], &["checkout", branch])?;
-                Ok(None)
-            }
-            UndoPlan::HardResetTo { sha, .. } => {
-                // Validate before the autostash so a refusal changes nothing.
-                let target = op::revision(sha)?;
-                let unknown = || {
-                    format!(
-                        "worktree state unknown \u{2014} nothing was changed; run `git status` in {} to diagnose",
-                        loc.path()
-                    )
-                };
-                // With autostash the dirty probe is racy (edits can land after
-                // it), so always attempt the push; `stash push` is a no-op
-                // when there is nothing to save, and the ref comparison below
-                // is what tells us whether it saved anything. Without
-                // autostash, unknown dirtiness must never read as clean.
-                let pushed = if autostash {
-                    let before = stash_top(loc).with_context(unknown)?;
-                    run_w(
-                        loc,
-                        &[],
-                        &["stash", "push", "-u", "-m", "[thegn] undo autostash"],
-                    )
-                    .with_context(unknown)?;
-                    let after = stash_top(loc).with_context(unknown)?;
-                    // exit 0 with "No local changes to save" leaves the ref
-                    // alone; popping then would apply an unrelated older stash.
-                    if after != before { after } else { None }
-                } else {
-                    self.is_dirty(loc).with_context(unknown)?;
-                    None
-                };
-                let reset = run_w(loc, &[], &["reset", "--hard", target]);
-                if let Some(entry) = pushed {
-                    // Pop even when the reset failed; a pop conflict surfaces
-                    // through the normal conflict UX. Pop exactly our entry.
-                    let pop = pop_entry(loc, &entry);
-                    if let Err(pop) = pop {
-                        // The stash is kept; say so rather than losing track of it.
-                        return match reset {
-                            Err(e) => Err(e.context(format!(
-                                "stash pop also failed ({pop}); your changes remain in the stash"
-                            ))),
-                            Ok(_) => Err(pop.context(
-                                "reset succeeded but stash pop failed; your changes remain in the stash",
-                            )),
-                        };
-                    }
+        undo_apply_within(self, loc, plan, autostash, super::MUTATION_LOCK_WAIT)
+    }
+}
+
+impl<T: GitBackend + ?Sized> UndoOps for T {}
+
+fn undo_apply_within<B: GitBackend + ?Sized>(
+    backend: &B,
+    loc: &GitLoc,
+    plan: &UndoPlan,
+    autostash: bool,
+    wait: std::time::Duration,
+) -> Result<Option<String>> {
+    match plan {
+        UndoPlan::Nothing => bail!("nothing to undo"),
+        UndoPlan::Checkout { branch, .. } => {
+            let _txn = if !loc.is_remote() && crate::bridge::for_loc(loc).is_none() {
+                super::begin_mutation_txn(loc, &["checkout", branch], wait)?
+            } else {
+                None
+            };
+            let branch = op::branch_name(branch)?;
+            run_w(loc, &[], &["checkout", branch])?;
+            Ok(None)
+        }
+        UndoPlan::HardResetTo { sha, .. } => {
+            let _txn = if !loc.is_remote() && crate::bridge::for_loc(loc).is_none() {
+                super::begin_mutation_txn(loc, &["reset", "--hard", sha], wait)?
+            } else {
+                None
+            };
+            // Validate before the autostash so a refusal changes nothing.
+            let target = op::revision(sha)?;
+            let unknown = || {
+                format!(
+                    "worktree state unknown \u{2014} nothing was changed; run `git status` in {} to diagnose",
+                    loc.path()
+                )
+            };
+            // With autostash the dirty probe is racy (edits can land after
+            // it), so always attempt the push; `stash push` is a no-op
+            // when there is nothing to save, and the ref comparison below
+            // is what tells us whether it saved anything. Without
+            // autostash, unknown dirtiness must never read as clean.
+            let pushed = if autostash {
+                let before = stash_top(loc).with_context(unknown)?;
+                run_w(
+                    loc,
+                    &[],
+                    &["stash", "push", "-u", "-m", "[thegn] undo autostash"],
+                )
+                .with_context(unknown)?;
+                let after = stash_top(loc).with_context(unknown)?;
+                // exit 0 with "No local changes to save" leaves the ref
+                // alone; popping then would apply an unrelated older stash.
+                if after != before { after } else { None }
+            } else {
+                backend.is_dirty(loc).with_context(unknown)?;
+                None
+            };
+            let reset = run_w(loc, &[], &["reset", "--hard", target]);
+            if let Some(entry) = pushed {
+                // Pop even when the reset failed; a pop conflict surfaces
+                // through the normal conflict UX. Pop exactly our entry.
+                let pop = pop_entry(loc, &entry);
+                if let Err(pop) = pop {
+                    // The stash is kept; say so rather than losing track of it.
+                    return match reset {
+                        Err(e) => Err(e.context(format!(
+                            "stash pop also failed ({pop}); your changes remain in the stash"
+                        ))),
+                        Ok(_) => Err(pop.context(
+                            "reset succeeded but stash pop failed; your changes remain in the stash",
+                        )),
+                    };
                 }
-                reset?;
-                Ok(Some(sha.clone()))
             }
+            reset?;
+            Ok(Some(sha.clone()))
         }
     }
 }
@@ -111,13 +133,11 @@ fn pop_entry(loc: &GitLoc, entry: &str) -> Result<()> {
     run_w(loc, &[], &["stash", "pop", &format!("stash@{{{idx}}}")]).map(|_| ())
 }
 
-impl<T: GitBackend + ?Sized> UndoOps for T {}
-
 #[cfg(test)]
 mod tests {
     use super::super::testutil::{TestRepo, git_in};
     use super::super::{BranchOps, CliGit, GitBackend};
-    use super::UndoOps;
+    use super::{UndoOps, undo_apply_within};
     use std::path::Path;
     use thegn_core::reflog::{OurMarks, UndoPlan};
 
@@ -210,6 +230,45 @@ mod tests {
     }
 
     #[test]
+    fn checkout_undo_refuses_a_held_transaction() {
+        let repo = TestRepo::new("un-checkout-txn");
+        ident(&repo.dir);
+        repo.commit_file("f.txt", "one\n", "c0");
+        git_in(&repo.dir, &["checkout", "-q", "-b", "feat"]);
+        let loc = repo.loc();
+        let plan = UndoPlan::Checkout {
+            branch: "main".into(),
+            undoing: "checkout: moving from main to feat".into(),
+        };
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let worktree = repo.dir.clone();
+        let holder = std::thread::spawn(move || {
+            let txn =
+                thegn_core::util::begin_git_mutation(&worktree, std::time::Duration::from_secs(5))
+                    .unwrap();
+            ready_tx.send(()).unwrap();
+            release_rx.recv().unwrap();
+            drop(txn);
+        });
+        ready_rx.recv().unwrap();
+
+        let error = undo_apply_within(
+            &CliGit,
+            &loc,
+            &plan,
+            false,
+            std::time::Duration::from_millis(100),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("mutation lock"), "{error:#}");
+        assert_eq!(CliGit.current_branch(&loc).unwrap(), "feat");
+
+        release_tx.send(()).unwrap();
+        holder.join().unwrap();
+    }
+
+    #[test]
     fn undo_apply_autostash_preserves_dirty_changes() {
         let repo = TestRepo::new("un-autostash");
         ident(&repo.dir);
@@ -235,6 +294,84 @@ mod tests {
             CliGit.stash_list(&loc).unwrap().is_empty(),
             "the autostash was popped, not left behind"
         );
+    }
+
+    #[test]
+    fn undo_apply_holds_one_transaction_across_autostash_and_reset() {
+        let repo = TestRepo::new("un-autostash-txn");
+        ident(&repo.dir);
+        repo.commit_file("f.txt", "one\n", "c1");
+        repo.commit_file("g.txt", "g\n", "c2");
+        let c1 = repo.sha_of("c1");
+        std::fs::write(repo.dir.join("f.txt"), "dirty\n").unwrap();
+        let loc = repo.loc();
+        let head = repo.head();
+        let plan = UndoPlan::HardResetTo {
+            sha: c1,
+            undoing: "reset: HEAD@{1}".into(),
+        };
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let worktree = repo.dir.clone();
+        let holder = std::thread::spawn(move || {
+            let txn =
+                thegn_core::util::begin_git_mutation(&worktree, std::time::Duration::from_secs(5))
+                    .unwrap();
+            ready_tx.send(()).unwrap();
+            release_rx.recv().unwrap();
+            drop(txn);
+        });
+        ready_rx.recv().unwrap();
+
+        let error = undo_apply_within(
+            &CliGit,
+            &loc,
+            &plan,
+            true,
+            std::time::Duration::from_millis(100),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("mutation lock"), "{error:#}");
+        assert_eq!(repo.head(), head);
+        assert!(!repo.dir.join(".git/refs/stash").exists());
+        assert_eq!(
+            std::fs::read_to_string(repo.dir.join("f.txt")).unwrap(),
+            "dirty\n"
+        );
+
+        release_tx.send(()).unwrap();
+        holder.join().unwrap();
+    }
+
+    #[test]
+    fn nested_steps_reuse_the_grant() {
+        let repo = TestRepo::new("un-nested-txn");
+        ident(&repo.dir);
+        repo.commit_file("f.txt", "one\n", "c1");
+        repo.commit_file("g.txt", "g\n", "c2");
+        let c1 = repo.sha_of("c1");
+        std::fs::write(repo.dir.join("f.txt"), "dirty\n").unwrap();
+        let loc = repo.loc();
+        let plan = UndoPlan::HardResetTo {
+            sha: c1.clone(),
+            undoing: "reset: HEAD@{1}".into(),
+        };
+
+        let result = undo_apply_within(
+            &CliGit,
+            &loc,
+            &plan,
+            true,
+            std::time::Duration::from_millis(100),
+        );
+
+        assert_eq!(result.unwrap().as_deref(), Some(c1.as_str()));
+        assert_eq!(repo.head(), c1);
+        assert_eq!(
+            std::fs::read_to_string(repo.dir.join("f.txt")).unwrap(),
+            "dirty\n"
+        );
+        assert!(CliGit.stash_list(&loc).unwrap().is_empty());
     }
 
     #[test]

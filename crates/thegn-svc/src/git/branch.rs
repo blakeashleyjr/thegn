@@ -123,30 +123,39 @@ pub trait BranchOps: GitBackend {
     /// ignored, dirs), recursing into submodules. Kidpix style — confirm
     /// hard at the call site; this is NOT undoable via reflog.
     fn nuke_working_tree(&self, loc: &GitLoc) -> Result<()> {
-        run_w(loc, &[], &["reset", "--hard", "HEAD"])?;
-        run_w(loc, &[], &["clean", "-fdx"])?;
-        // Dirty submodules survive a top-level reset/clean; recurse when any
-        // are configured (.gitmodules at the worktree root).
-        let has_submodules = loc
-            .git_out(&["ls-files", "--error-unmatch", ".gitmodules"])
-            .is_some();
-        if has_submodules {
-            run_w(
-                loc,
-                &[],
-                &[
-                    "submodule",
-                    "foreach",
-                    "--recursive",
-                    "git reset --hard && git clean -fdx",
-                ],
-            )?;
-        }
-        Ok(())
+        nuke_working_tree_within(loc, super::MUTATION_LOCK_WAIT)
     }
 }
 
 impl<T: GitBackend + ?Sized> BranchOps for T {}
+
+fn nuke_working_tree_within(loc: &GitLoc, wait: std::time::Duration) -> Result<()> {
+    let _txn = if !loc.is_remote() && crate::bridge::for_loc(loc).is_none() {
+        super::begin_mutation_txn(loc, &["reset", "--hard", "HEAD"], wait)?
+    } else {
+        None
+    };
+    run_w(loc, &[], &["reset", "--hard", "HEAD"])?;
+    run_w(loc, &[], &["clean", "-fdx"])?;
+    // Dirty submodules survive a top-level reset/clean; recurse when any
+    // are configured (.gitmodules at the worktree root).
+    let has_submodules = loc
+        .git_out(&["ls-files", "--error-unmatch", ".gitmodules"])
+        .is_some();
+    if has_submodules {
+        run_w(
+            loc,
+            &[],
+            &[
+                "submodule",
+                "foreach",
+                "--recursive",
+                "git reset --hard && git clean -fdx",
+            ],
+        )?;
+    }
+    Ok(())
+}
 
 fn after_ref_mutation(loc: &GitLoc) {
     super::invalidate_glyph_base(loc);
@@ -610,6 +619,44 @@ mod tests {
             "clean -fdx removes ignored"
         );
         assert!(CliGit.status(&loc).unwrap().is_empty());
+    }
+
+    #[test]
+    fn nuke_holds_one_transaction_across_steps() {
+        let repo = TestRepo::new("br-nuke-txn");
+        ident(&repo.dir);
+        repo.commit_file("tracked.txt", "clean\n", "c0");
+        std::fs::write(repo.dir.join("tracked.txt"), "dirty\n").unwrap();
+        std::fs::write(repo.dir.join("untracked.txt"), "new\n").unwrap();
+        let loc = repo.loc();
+        let worktree = repo.dir.clone();
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let holder = std::thread::spawn(move || {
+            let txn =
+                thegn_core::util::begin_git_mutation(&worktree, std::time::Duration::from_secs(5))
+                    .unwrap();
+            ready_tx.send(()).unwrap();
+            release_rx.recv().unwrap();
+            drop(txn);
+        });
+        ready_rx.recv().unwrap();
+
+        let error = super::nuke_working_tree_within(&loc, std::time::Duration::from_millis(100))
+            .unwrap_err();
+        assert!(error.to_string().contains("mutation lock"), "{error:#}");
+        assert_eq!(read_file(&repo.dir.join("tracked.txt")), "dirty\n");
+        assert!(repo.dir.join("untracked.txt").exists());
+
+        release_tx.send(()).unwrap();
+        holder.join().unwrap();
+        super::nuke_working_tree_within(&loc, std::time::Duration::from_millis(100)).unwrap();
+        assert_eq!(read_file(&repo.dir.join("tracked.txt")), "clean\n");
+        assert!(!repo.dir.join("untracked.txt").exists());
+    }
+
+    fn read_file(path: &Path) -> String {
+        std::fs::read_to_string(path).unwrap()
     }
 
     #[test]

@@ -2100,12 +2100,8 @@ fn require_mutation_lock_within(
     })
 }
 
-/// Slice b moves multi-step operations onto this transaction; nested `run_w`
-/// calls reuse its thread-local lock grant.
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "THE-372 slice b wires nuke/stash/undo onto it")
-)]
+/// Multi-step nuke, unstaged-stash, and undo operations retain this transaction;
+/// nested `run_w` calls reuse its thread-local lock grant.
 pub(crate) fn begin_mutation_txn(
     loc: &GitLoc,
     args: &[&str],
