@@ -377,10 +377,22 @@ mod tests {
     fn missing_cwd_never_runs_the_body() {
         use std::io::Write;
 
-        if !std::path::Path::new("/bin/sh").exists() {
+        if !cfg!(unix) || !std::path::Path::new("/bin/sh").exists() {
             return;
         }
-        let temp = tempfile::tempdir().unwrap();
+        let temp = {
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let mut builder = tempfile::Builder::new();
+                builder.permissions(std::fs::Permissions::from_mode(0o700));
+                builder.tempdir().unwrap()
+            }
+            #[cfg(not(unix))]
+            {
+                tempfile::Builder::new().tempdir().unwrap()
+            }
+        };
         let missing = temp.path().join("missing");
         let script = stdin_script("echo RAN", Some(missing.to_str().unwrap()), &[]).unwrap();
         let mut child = std::process::Command::new("/bin/sh")
