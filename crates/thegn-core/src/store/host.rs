@@ -69,8 +69,9 @@ pub trait HostStore {
 
     /// Explicitly take over an alias whose recorded state no longer has a
     /// matching declarative host definition. A stored DB authority may not be
-    /// rebound; remove it with `host rm` first.
-    fn put_host_def_replacing(&self, name: &str, hc: &HostConfig, now: i64) -> Result<()>;
+    /// rebound; remove it with `host rm` first. Returns whether recorded state
+    /// was cleared.
+    fn put_host_def_replacing(&self, name: &str, hc: &HostConfig, now: i64) -> Result<bool>;
 
     /// All user-added host definitions (rows carrying a `config_json`).
     fn host_defs(&self) -> Result<Vec<(String, HostConfig)>>;

@@ -213,6 +213,8 @@ fn add(
     let db = Db::open()?;
     if replace {
         use thegn_core::store::PlacementStore;
+        // This short guard can race with a placement admitted before the
+        // replace transaction starts; the transaction still clears atomically.
         let tenants = db.tenants_of(&thegn_core::host::HostId::named(name))?;
         if !tenants.is_empty() {
             anyhow::bail!(
@@ -220,12 +222,19 @@ fn add(
                 tenants.len()
             );
         }
-        db.put_host_def_replacing(name, &hc, now())?;
-        outln!(
-            "host {name} replaced ({}) — it is now a selectable env; provision with \
-             `thegn host provision {name}` or just open a worktree on it",
-            hc.reach.as_str()
-        );
+        if db.put_host_def_replacing(name, &hc, now())? {
+            outln!(
+                "host {name} replaced ({}) — it is now a selectable env; provision with \
+                 `thegn host provision {name}` or just open a worktree on it",
+                hc.reach.as_str()
+            );
+        } else {
+            outln!(
+                "host {name} added ({}) — it is now a selectable env; provision with \
+                 `thegn host provision {name}` or just open a worktree on it",
+                hc.reach.as_str()
+            );
+        }
     } else {
         db.put_host_def(name, &hc, now())?;
         outln!(
