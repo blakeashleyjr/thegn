@@ -781,15 +781,18 @@ fn run_status(loc: &GitLoc, args: &[&str]) -> Result<(i32, String)> {
 }
 
 /// Run a local, non-bridged git read while preserving arbitrary stdout bytes.
-fn run_status_bytes(loc: &GitLoc, args: &[&str]) -> Result<(i32, Vec<u8>)> {
+fn run_status_bytes(
+    loc: &GitLoc,
+    args: &[&str],
+    use_local_cli: bool,
+) -> Result<std::process::Output> {
     anyhow::ensure!(
-        local_cli(loc),
+        use_local_cli,
         "raw git output is only available for local CLI locations"
     );
     let guarded_args = read_argv(loc, args);
-    let out = output_bounded(loc.git_command(&guarded_args), args)
-        .with_context(|| format!("git {}", args.join(" ")))?;
-    Ok((out.status.code().unwrap_or(-1), out.stdout))
+    output_bounded(loc.git_command(&guarded_args), args)
+        .with_context(|| format!("git {}", args.join(" ")))
 }
 
 fn local_cli(loc: &GitLoc) -> bool {
@@ -1974,10 +1977,15 @@ fn local_glyph_reads(
                     "--no-renames",
                     "HEAD",
                 ],
+                true,
             )
-            .and_then(|(exit, out)| {
-                anyhow::ensure!(exit == 0, "git diff --numstat HEAD failed");
-                typed_numstat_z(&out)
+            .and_then(|out| {
+                anyhow::ensure!(
+                    out.status.success(),
+                    "git diff --numstat HEAD failed: {}",
+                    String::from_utf8_lossy(&out.stderr).trim()
+                );
+                typed_numstat_z(&out.stdout)
             })
         } else {
             run_status(
@@ -2007,8 +2015,14 @@ fn local_glyph_reads(
                     "--no-renames",
                     &format!("{b}...HEAD"),
                 ],
+                true,
             )
-            .and_then(|(exit, out)| (exit == 0).then(|| typed_numstat_z(&out)).transpose()),
+            .and_then(|out| {
+                out.status
+                    .success()
+                    .then(|| typed_numstat_z(&out.stdout))
+                    .transpose()
+            }),
             Some(b) => run_status(
                 loc,
                 &[
@@ -2045,7 +2059,7 @@ fn numstat_totals(loc: &GitLoc, spec: &str) -> Result<(DiffCount, DiffCount)> {
         return Ok(t);
     }
     if local_cli(loc) {
-        let (exit, out) = run_status_bytes(
+        let out = run_status_bytes(
             loc,
             &[
                 "diff",
@@ -2056,9 +2070,14 @@ fn numstat_totals(loc: &GitLoc, spec: &str) -> Result<(DiffCount, DiffCount)> {
                 "--no-renames",
                 spec,
             ],
+            true,
         )?;
-        anyhow::ensure!(exit == 0, "git diff --numstat {spec} failed");
-        typed_numstat_z(&out)
+        anyhow::ensure!(
+            out.status.success(),
+            "git diff --numstat {spec} failed: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
+        typed_numstat_z(&out.stdout)
     } else {
         let (exit, out) = run_status(
             loc,
@@ -2330,7 +2349,7 @@ impl GitBackend for CliGit {
         // paths are decoded by `parse_numstat` for the status join.
         let base = op::revision(base)?;
         if local_cli(loc) {
-            let (exit, out) = run_status_bytes(
+            let out = run_status_bytes(
                 loc,
                 &[
                     "-c",
@@ -2343,9 +2362,14 @@ impl GitBackend for CliGit {
                     "--no-renames",
                     base,
                 ],
+                true,
             )?;
-            anyhow::ensure!(exit == 0, "git diff --numstat {base} failed");
-            parse_numstat_z(&out)
+            anyhow::ensure!(
+                out.status.success(),
+                "git diff --numstat {base} failed: {}",
+                String::from_utf8_lossy(&out.stderr).trim()
+            );
+            parse_numstat_z(&out.stdout)
         } else {
             let out = run(
                 loc,
@@ -3382,12 +3406,21 @@ mod tests {
 
     #[test]
     fn numstat_z_cli_diff_files_round_trips_tab_and_newline_paths() {
+        if cfg!(windows) {
+            return;
+        }
         let repo = testutil::TestRepo::new("numstat-z-paths");
         let tab_path = "a\tb.txt";
         let newline_path = "line\nbreak.txt";
+        let rename_old_path = "rename-old.txt";
+        let rename_new_path = "rename-new.txt";
         std::fs::write(repo.dir.join(tab_path), "before\n").unwrap();
         std::fs::write(repo.dir.join(newline_path), "before\n").unwrap();
-        testutil::git_in(&repo.dir, &["add", "--", tab_path, newline_path]);
+        std::fs::write(repo.dir.join(rename_old_path), "unchanged\n").unwrap();
+        testutil::git_in(
+            &repo.dir,
+            &["add", "--", tab_path, newline_path, rename_old_path],
+        );
         testutil::git_in(
             &repo.dir,
             &[
@@ -3401,6 +3434,7 @@ mod tests {
         );
         std::fs::write(repo.dir.join(tab_path), "after\n").unwrap();
         std::fs::write(repo.dir.join(newline_path), "after\n").unwrap();
+        testutil::git_in(&repo.dir, &["mv", rename_old_path, rename_new_path]);
 
         let mut paths = CliGit
             .diff_files(&repo.loc(), "HEAD")
@@ -3409,9 +3443,23 @@ mod tests {
             .map(|entry| entry.path)
             .collect::<Vec<_>>();
         paths.sort();
-        let mut expected = vec![tab_path.to_owned(), newline_path.to_owned()];
+        let mut expected = vec![
+            tab_path.to_owned(),
+            newline_path.to_owned(),
+            rename_old_path.to_owned(),
+            rename_new_path.to_owned(),
+        ];
         expected.sort();
         assert_eq!(paths, expected);
+    }
+
+    #[test]
+    fn numstat_z_cli_diff_files_preserves_git_stderr() {
+        let repo = testutil::TestRepo::new("numstat-z-stderr");
+        repo.commit_file("tracked.txt", "content\n", "initial");
+
+        let error = CliGit.diff_files(&repo.loc(), "bad-revision").unwrap_err();
+        assert!(error.to_string().contains("bad revision"), "{error:#}");
     }
 
     #[test]
