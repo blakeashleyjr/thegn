@@ -443,7 +443,10 @@ fn sandbox_wrap_shell(
     let isolation = spec.capabilities().isolation;
     let network_note = thegn_core::sandbox::hostname_rules_note(&spec);
     Ok(Some(WrappedShell {
-        argv: thegn_core::sandbox::enter_argv(&spec, &inner)?,
+        argv: thegn_core::sandbox::enter_argv(&spec, &inner).map_err(|error| {
+            let hint = error.remediation_hint();
+            anyhow::Error::new(error).context(hint)
+        })?,
         isolation,
         network_note,
     }))
