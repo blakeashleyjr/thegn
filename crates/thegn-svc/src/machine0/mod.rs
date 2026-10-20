@@ -614,7 +614,7 @@ impl Machine0Provider {
             let gen_dir = format!("/root/thegn-provision/{}", &digest[..32]);
             let remote_ref = match attr.as_deref() {
                 Some(attribute) => format!("{gen_dir}#{attribute}"),
-                None => gen_dir,
+                None => gen_dir.clone(),
             };
             (
                 flake_identity_for(Some(&digest), flake),
@@ -668,7 +668,8 @@ impl Machine0Provider {
             .context("machine0: nixos-rebuild over ssh")?;
         if code != 0 {
             return Err(anyhow!(
-                "machine0: nixos-rebuild --flake {remote_ref} failed (exit {code}):\n{out}"
+                "machine0: nixos-rebuild --flake {} failed (exit {code}):\n{out}",
+                plan.remote_ref
             ));
         }
         Ok(())
