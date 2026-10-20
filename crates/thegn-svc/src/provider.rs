@@ -1608,8 +1608,8 @@ where
         return Err(ExecInstallError::StageWrite(error).into());
     }
 
-    let staged = match files.read(id, &stage).await {
-        Ok(bytes) if bytes.len() == data.len() && sha256_hex(&bytes) == want => bytes,
+    match files.read(id, &stage).await {
+        Ok(bytes) if bytes.len() == data.len() && sha256_hex(&bytes) == want => {}
         Ok(bytes) => {
             if let Err(error) = files.delete(id, &stage).await {
                 tracing::debug!(target: "thegn::provider", %error, "best-effort staged executable cleanup failed");
@@ -1629,7 +1629,6 @@ where
             return Err(ExecInstallError::StageRead(error).into());
         }
     };
-    debug_assert_eq!(staged.len(), data.len());
 
     if let Err(error) = publish(stage.clone(), path.to_string()).await {
         if let Err(error) = files.delete(id, &stage).await {
@@ -1638,8 +1637,8 @@ where
         return Err(ExecInstallError::Publish(error).into());
     }
 
-    let published = match files.read(id, path).await {
-        Ok(bytes) if bytes.len() == data.len() && sha256_hex(&bytes) == want => bytes,
+    match files.read(id, path).await {
+        Ok(bytes) if bytes.len() == data.len() && sha256_hex(&bytes) == want => {}
         Ok(bytes) => {
             if let Err(error) = files.delete(id, &stage).await {
                 tracing::debug!(target: "thegn::provider", %error, "best-effort staged executable cleanup failed");
@@ -1662,7 +1661,6 @@ where
             .into());
         }
     };
-    debug_assert_eq!(published.len(), data.len());
 
     let fp_path = format!("{path}.fp");
     if let Err(error) = files.delete(id, &fp_path).await {
@@ -2942,10 +2940,12 @@ mod tests {
         initial.insert(format!("{path}.fp"), legacy_fnv_hex(b"good").into_bytes());
         let files = MemFiles::new(initial, false);
         let published = std::sync::atomic::AtomicBool::new(false);
+        let mem = &files;
+        let ran = &published;
         let result =
             install_executable_verified(&files, "id", path, b"good", |stage, dest| async move {
-                published.store(true, std::sync::atomic::Ordering::SeqCst);
-                files.publish(&stage, &dest)
+                ran.store(true, std::sync::atomic::Ordering::SeqCst);
+                mem.publish(&stage, &dest)
             })
             .await
             .unwrap();
@@ -2966,8 +2966,9 @@ mod tests {
         let path = "/w/.tg/thegn";
         let files = MemFiles::new(HashMap::from([(path.into(), b"same".to_vec())]), false);
         let published = std::sync::atomic::AtomicBool::new(false);
+        let ran = &published;
         let result = install_executable_verified(&files, "id", path, b"same", |_, _| async move {
-            published.store(true, std::sync::atomic::Ordering::SeqCst);
+            ran.store(true, std::sync::atomic::Ordering::SeqCst);
             Ok(())
         })
         .await
@@ -2980,12 +2981,13 @@ mod tests {
     async fn exec_install_missing_remote_uploads() {
         let path = "/w/.tg/thegn";
         let files = MemFiles::new(HashMap::new(), false);
+        let mem = &files;
         let result = install_executable_verified(
             &files,
             "id",
             path,
             b"new binary",
-            |stage, dest| async move { files.publish(&stage, &dest) },
+            |stage, dest| async move { mem.publish(&stage, &dest) },
         )
         .await
         .unwrap();
@@ -3006,14 +3008,16 @@ mod tests {
         let path = "/w/.tg/thegn";
         let files = MemFiles::new(HashMap::from([(path.into(), b"prior".to_vec())]), true);
         let published = std::sync::atomic::AtomicBool::new(false);
+        let mem = &files;
+        let ran = &published;
         let result = install_executable_verified(
             &files,
             "id",
             path,
             b"new binary",
             |stage, dest| async move {
-                published.store(true, std::sync::atomic::Ordering::SeqCst);
-                files.publish(&stage, &dest)
+                ran.store(true, std::sync::atomic::Ordering::SeqCst);
+                mem.publish(&stage, &dest)
             },
         )
         .await;
@@ -3036,9 +3040,10 @@ mod tests {
         let path = "/w/.tg/thegn";
         let files = MemFiles::new(HashMap::from([(path.into(), b"prior".to_vec())]), false);
         let published = std::sync::atomic::AtomicBool::new(false);
+        let ran = &published;
         let result =
             install_executable_verified(&files, "id", path, b"new binary", |_, _| async move {
-                published.store(true, std::sync::atomic::Ordering::SeqCst);
+                ran.store(true, std::sync::atomic::Ordering::SeqCst);
                 Err(anyhow!("publish refused"))
             })
             .await;
