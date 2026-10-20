@@ -264,7 +264,7 @@ fn inspection_lines(admitted: &AdmittedPlugin) -> Vec<String> {
             lines.push(native_line);
             return lines;
         }
-        PluginDecision::Admitted(negotiated) => (negotiated, None),
+        PluginDecision::Admitted(negotiated) => (negotiated.clone(), None),
     };
     let mut granted = negotiated
         .granted
@@ -599,7 +599,7 @@ mod tests {
         plugin.spec.manifest.api = ApiVersion::new(9, 0, 0);
         plugin.spec.scopes.clear();
         let cfg = Config {
-            plugins: vec![plugin],
+            plugins: vec![plugin.spec],
             ..Default::default()
         };
 
