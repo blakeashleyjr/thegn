@@ -391,16 +391,20 @@ pub(crate) fn run(task: &AgentTaskRun<'_>) -> bool {
     // one thing on the box with no ceiling. When the queue opted into the sandbox
     // (floor already cleared by `agent_floor_gate`), run the command INSIDE the
     // resolved sandbox first, then join the slice on top.
-    let inner_argv = match &task.sandbox {
-        Some(spec) => match thegn_core::sandbox::enter_argv(spec, &command) {
-            Ok(argv) => argv,
+    let (inner_argv, _secret_env_file) = match &task.sandbox {
+        Some(spec) => match thegn_core::sandbox::enter_argv_guarded(spec, &command) {
+            Ok(guarded) => guarded.into_parts(),
             Err(error) => {
                 tracing::error!("{error}; refusing queued agent sandbox launch");
                 return false;
             }
         },
-        None => vec![util::shell(), "-lc".to_string(), command.clone()],
+        None => (
+            vec![util::shell(), "-lc".to_string(), command.clone()],
+            None,
+        ),
     };
+    // Keep a secret env-file until the bounded runner has waited for the child.
     let argv = thegn_core::sandbox_cpucap::wrap_background_argv(inner_argv);
 
     let mut cmd = Command::new(&argv[0]);
