@@ -325,32 +325,69 @@ pub fn parse_ssh_key_created(v: &serde_json::Value) -> Option<i64> {
     v.pointer("/ssh_key/id").and_then(|i| i.as_i64())
 }
 
-/// Parse `(action_id, status)` from an action response (`{ "action": { id,
-/// status } }`). Snapshot returns `in-progress`; `snapshot()` polls until
-/// `completed`.
-pub fn parse_action(v: &serde_json::Value) -> Option<(String, String)> {
-    let a = v.get("action")?;
-    let id = a.get("id").and_then(|i| {
-        i.as_i64()
-            .map(|n| n.to_string())
-            .or_else(|| i.as_str().map(str::to_string))
-    })?;
-    let status = a.get("status").and_then(|s| s.as_str())?.to_string();
-    Some((id, status))
+#[derive(Debug, PartialEq, Eq)]
+pub struct DoAction {
+    pub id: String,
+    pub status: String,
+    pub kind: String,
+    pub resource_id: String,
 }
 
-/// The newest snapshot id off a Droplet get (`droplet.snapshot_ids[]`) — the
-/// `template = "snapshot:<id>"` value `env ln` prints once the action completes.
-pub fn parse_latest_snapshot_id(droplet_get: &serde_json::Value) -> Option<String> {
+fn parse_id(v: &serde_json::Value) -> Option<String> {
+    v.as_i64()
+        .map(|n| n.to_string())
+        .or_else(|| v.as_str().filter(|id| !id.is_empty()).map(str::to_string))
+}
+
+/// Parse the complete action identity needed to bind a snapshot to its droplet.
+pub fn parse_action_detail(v: &serde_json::Value) -> Option<DoAction> {
+    let a = v.get("action")?;
+    Some(DoAction {
+        id: parse_id(a.get("id")?)?,
+        status: a.get("status")?.as_str()?.to_string(),
+        kind: a.get("type")?.as_str()?.to_string(),
+        resource_id: parse_id(a.get("resource_id")?)?,
+    })
+}
+
+/// Parse the legacy action id and status pair used by non-snapshot callers.
+pub fn parse_action(v: &serde_json::Value) -> Option<(String, String)> {
+    let action = v.get("action")?;
+    Some((
+        parse_id(action.get("id")?)?,
+        action.get("status")?.as_str()?.to_string(),
+    ))
+}
+
+/// Parse every snapshot id off a Droplet get (`droplet.snapshot_ids[]`).
+pub fn parse_snapshot_ids(droplet_get: &serde_json::Value) -> Option<Vec<String>> {
     droplet_get
         .pointer("/droplet/snapshot_ids")
         .and_then(|a| a.as_array())
-        .and_then(|a| a.last())
-        .and_then(|v| {
-            v.as_i64()
-                .map(|n| n.to_string())
-                .or_else(|| v.as_str().map(str::to_string))
-        })
+        .map(|ids| ids.iter().map(parse_id).collect())?
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum SnapshotBindError {
+    NoNewSnapshot,
+    AmbiguousNewSnapshots(usize),
+}
+
+/// Bind a completed snapshot action to the sole id newly visible on the droplet.
+pub fn new_snapshot_id(before: &[String], after: &[String]) -> Result<String, SnapshotBindError> {
+    let added: Vec<&String> = after
+        .iter()
+        .enumerate()
+        .filter(|(index, id)| !before.contains(id) && !after[..*index].contains(id))
+        .map(|(_, id)| id)
+        .collect();
+    let Some(id) = added.first() else {
+        return Err(SnapshotBindError::NoNewSnapshot);
+    };
+    if added.len() != 1 {
+        return Err(SnapshotBindError::AmbiguousNewSnapshots(added.len()));
+    }
+    Ok((*id).clone())
 }
 
 #[cfg(test)]
@@ -579,12 +616,72 @@ mod tests {
             Some(("36804636".to_string(), "in-progress".to_string()))
         );
         assert_eq!(
-            parse_latest_snapshot_id(&serde_json::json!({
+            parse_snapshot_ids(&serde_json::json!({
                 "droplet": { "snapshot_ids": [111, 222] }
             })),
-            Some("222".to_string())
+            Some(vec!["111".to_string(), "222".to_string()])
         );
         assert_eq!(snapshot_image("snapshot:777"), Some("777"));
         assert_eq!(snapshot_image("ubuntu-24-04-x64"), None);
+    }
+
+    #[test]
+    fn snapshot_bind_picks_the_single_new_id_regardless_of_order() {
+        assert_eq!(
+            new_snapshot_id(
+                &["111".into(), "222".into()],
+                &["333".into(), "111".into(), "222".into()]
+            ),
+            Ok("333".into())
+        );
+    }
+
+    #[test]
+    fn snapshot_bind_refuses_no_new_id() {
+        assert_eq!(
+            new_snapshot_id(&["111".into(), "222".into()], &["222".into(), "111".into()]),
+            Err(SnapshotBindError::NoNewSnapshot)
+        );
+    }
+
+    #[test]
+    fn snapshot_bind_refuses_two_new_ids() {
+        assert_eq!(
+            new_snapshot_id(&["111".into()], &["222".into(), "333".into(), "111".into()]),
+            Err(SnapshotBindError::AmbiguousNewSnapshots(2))
+        );
+    }
+
+    #[test]
+    fn snapshot_bind_strict_snapshot_ids_reject_non_ids() {
+        assert_eq!(
+            parse_snapshot_ids(&serde_json::json!({"droplet":{"snapshot_ids":[1,"2"]}})),
+            Some(vec!["1".into(), "2".into()])
+        );
+        assert_eq!(
+            parse_snapshot_ids(&serde_json::json!({"droplet":{"snapshot_ids":[1,null]}})),
+            None
+        );
+    }
+
+    #[test]
+    fn snapshot_bind_action_detail_requires_type_and_resource() {
+        assert_eq!(
+            parse_action_detail(
+                &serde_json::json!({"action":{"id":1,"status":"completed","type":"snapshot","resource_id":7}})
+            ),
+            Some(DoAction {
+                id: "1".into(),
+                status: "completed".into(),
+                kind: "snapshot".into(),
+                resource_id: "7".into()
+            })
+        );
+        assert_eq!(
+            parse_action_detail(
+                &serde_json::json!({"action":{"id":1,"status":"completed","resource_id":7}})
+            ),
+            None
+        );
     }
 }
