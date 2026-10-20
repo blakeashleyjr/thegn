@@ -14,6 +14,8 @@ use thegn_core::db::{Db, MergeQueueRow};
 use thegn_core::merge_lifecycle::LifecycleEvent;
 use thegn_core::models::WorktreeRow;
 use thegn_core::remote::GitLoc;
+#[cfg(test)]
+use thegn_core::store::MergeClaimRequest;
 use thegn_core::store::{MergeClaimView, WorkspaceStore, WorktreeAuxStore};
 use thegn_core::util;
 use thegn_svc::git::{CliGit, GitBackend};
@@ -140,12 +142,19 @@ impl std::fmt::Display for LandRefusal {
                 checked_out,
             } => format!("checked-out branch {checked_out} does not match queued branch {queued}"),
             Self::Remote => "merge-queue row is not local".to_owned(),
-            Self::Claimed => "merge-queue row is claimed by a drain".to_owned(),
+            Self::Claimed => {
+                "merge-queue row is claimed by a drain; run `thegn merge drain` to reclaim it"
+                    .to_owned()
+            }
         };
-        write!(
-            f,
-            "{reason}; use `thegn land` to land the checked-out branch outside the queue"
-        )
+        if matches!(self, Self::Claimed) {
+            write!(f, "{reason}")
+        } else {
+            write!(
+                f,
+                "{reason}; use `thegn land` to land the checked-out branch outside the queue"
+            )
+        }
     }
 }
 
@@ -185,17 +194,17 @@ pub(crate) fn ready_land_check(
 
 /// Verify that a worktree's local queue row is ready for queue-aware landing.
 pub(crate) fn ready_land_precheck(db: &Db, worktree: &str) -> Result<()> {
+    let canonical = canonical_worktree(Path::new(worktree));
+    let canonical_s = canonical.to_string_lossy().into_owned();
     let row = db
         .list_merge_queue()?
         .into_iter()
-        .find(|row| row.worktree == worktree);
-    let claim = db.observe_merge_claim(worktree)?;
-    let Some(branch) = util::git_out(
-        Path::new(worktree),
-        &["symbolic-ref", "--quiet", "--short", "HEAD"],
-    )
-    .map(|branch| branch.trim().to_owned())
-    .filter(|branch| !branch.is_empty()) else {
+        .find(|row| row.worktree == canonical_s);
+    let claim = db.observe_merge_claim(&canonical_s)?;
+    let Some(branch) = util::git_out(&canonical, &["symbolic-ref", "--quiet", "--short", "HEAD"])
+        .map(|branch| branch.trim().to_owned())
+        .filter(|branch| !branch.is_empty())
+    else {
         return Err(anyhow::Error::new(LandRefusal::NotOnBranch));
     };
     ready_land_check(row.as_ref(), claim.as_ref(), &branch).map_err(anyhow::Error::from)
@@ -549,6 +558,52 @@ mod tests {
             ready_land_check(Some(&ready), Some(&land_claim("unclaimed")), "feature"),
             Ok(())
         );
+    }
+
+    #[test]
+    fn ready_land_precheck_resolves_symlinked_worktree_for_row_and_claim() {
+        let _git_config = crate::testenv::EnvVarGuard::set(&[
+            ("GIT_CONFIG_GLOBAL", "/dev/null"),
+            ("GIT_CONFIG_NOSYSTEM", "1"),
+        ]);
+        let temp = thegn_core::testenv::symlinked_tempdir();
+        if temp.path() == temp.real_path() {
+            // Directory symlinks are unavailable to unprivileged Windows tests.
+            return;
+        }
+        init_repo(temp.real_path());
+
+        let db = Db::open_memory().unwrap();
+        let worktree = temp.real_path().to_string_lossy().into_owned();
+        db.put_worktree("main", &worktree, &worktree, "main", None, None)
+            .unwrap();
+        db.enqueue_merge(&worktree, "main", "main").unwrap();
+        db.update_merge_status(&worktree, "ready", Some("fold-oid"), None, None)
+            .unwrap();
+
+        let alias = temp.path().to_string_lossy().into_owned();
+        ready_land_precheck(&db, &alias).unwrap();
+
+        assert!(
+            db.admit_merge_claim(&MergeClaimRequest {
+                worktree,
+                branch: "main".to_owned(),
+                repo_root: temp.real_path().to_string_lossy().into_owned(),
+                target_branch: "main".to_owned(),
+                location: String::new(),
+                expected_status: "ready".to_owned(),
+                lease_until_ms: util::now_ms() + 60_000,
+                owner_hint: Some("test-drain".to_owned()),
+            })
+            .unwrap()
+            .is_some()
+        );
+        let error = ready_land_precheck(&db, &alias).unwrap_err();
+        assert!(error.to_string().contains("claimed by a drain"), "{error}");
+
+        let refusal = LandRefusal::Claimed.to_string();
+        assert!(refusal.contains("thegn merge drain"), "{refusal}");
+        assert!(!refusal.contains("thegn land"), "{refusal}");
     }
 
     #[expect(clippy::disallowed_methods)] // deterministic real-Git fixture, test only
