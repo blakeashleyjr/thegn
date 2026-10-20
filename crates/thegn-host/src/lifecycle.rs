@@ -23,6 +23,30 @@ use thegn_core::lifecycle::{
 };
 use thegn_core::remote::{GitLoc, WorktreeLocations};
 use thegn_core::store::{PoolStore, WorkspaceStore};
+
+const PROVISION_STALE_SECS: u64 = 20 * 60;
+
+enum LeaseProbe {
+    Free(crate::pool_lease::Lease),
+    Busy,
+    Error,
+    NotProbed,
+}
+
+enum StaleAction {
+    Keep,
+    Destroy(crate::pool_lease::Lease),
+}
+
+fn stale_provisioning_action(age: Option<u64>, lease: LeaseProbe) -> StaleAction {
+    if age.is_none_or(|age| age < PROVISION_STALE_SECS) {
+        return StaleAction::Keep;
+    }
+    match lease {
+        LeaseProbe::Free(lease) => StaleAction::Destroy(lease),
+        LeaseProbe::Busy | LeaseProbe::Error | LeaseProbe::NotProbed => StaleAction::Keep,
+    }
+}
 /// Per-worktree "last seen active/busy" timestamps, so the reconcile can apply the
 /// idle TTL (the activity FSM persists state strings but not a host-clock idle
 /// duration). Process-global, mirroring `hydrate::glyph_cache`.
@@ -313,10 +337,26 @@ pub fn reconcile_pool<N>(cfg: &Config, repo_root: &Path, env_name: &str, notify:
 where
     N: Fn() + Clone + Send + 'static,
 {
+    let repo = repo_root.to_string_lossy().into_owned();
+    let _pool_lease = match crate::pool_lease::pool_lease(&repo, env_name) {
+        Ok(lease) => lease,
+        Err(crate::pool_lease::LeaseError::Busy) => {
+            tracing::debug!(target: "thegn::lifecycle", %repo, %env_name, "warm pool reconcile skipped: lease busy");
+            return;
+        }
+        Err(crate::pool_lease::LeaseError::Io(error)) => {
+            thegn_core::msg::warn(&format!(
+                "warm pool: cannot establish reconcile lease for {repo} ({env_name}): {error}"
+            ));
+            return;
+        }
+    };
     let Ok(db) = thegn_core::db::Db::open() else {
+        thegn_core::msg::warn(
+            "warm pool: cannot open ledger for reconciliation; no pool changes made",
+        );
         return;
     };
-    let repo = repo_root.to_string_lossy().into_owned();
     let target = effective_pool_target(&db, cfg, &repo, env_name);
     let max_idle = cfg.lifecycle.pool.max_idle_secs;
 
@@ -349,7 +389,6 @@ where
     // and no warm spare appears. Destroy stale ones so a replacement is created; a
     // genuinely in-flight provision (clone + nix + seeded devShell) finishes well
     // under this ceiling. (`provisioning` rows don't heartbeat, so age = created_at.)
-    const PROVISION_STALE_SECS: u64 = 20 * 60;
     let mut provisioning = 0usize;
     for s in spares.iter().filter(|s| s.state == "provisioning") {
         let Some(age) = thegn_core::time_policy::age_seconds(now, s.created_at) else {
@@ -360,16 +399,41 @@ where
             provisioning += 1;
             continue;
         };
-        if age >= PROVISION_STALE_SECS {
-            thegn_core::msg::warn(&format!(
-                "warm pool: clearing stale provisioning spare {} (orphaned by a prior \
-                 session or hung) so the pool refills",
-                s.sandbox_name
-            ));
-            let _ = crate::provision_gate::destroy_spare(cfg, env_name, &s.sandbox_name); // best-effort: stale-spare cleanup: a failed destroy is retried on the next reconcile
-            notify();
+        let probe = if age >= PROVISION_STALE_SECS {
+            match crate::pool_lease::spare_lease(&s.sandbox_name) {
+                Ok(lease) => LeaseProbe::Free(lease),
+                Err(crate::pool_lease::LeaseError::Busy) => LeaseProbe::Busy,
+                Err(crate::pool_lease::LeaseError::Io(error)) => {
+                    thegn_core::msg::warn(&format!(
+                        "warm pool: cannot check provision lease for stale spare {}: {error}; keeping row",
+                        s.sandbox_name
+                    ));
+                    LeaseProbe::Error
+                }
+            }
         } else {
-            provisioning += 1;
+            LeaseProbe::NotProbed
+        };
+        match stale_provisioning_action(Some(age), probe) {
+            StaleAction::Keep => provisioning += 1,
+            StaleAction::Destroy(_spare_lease) => {
+                thegn_core::msg::warn(&format!(
+                    "warm pool: clearing stale provisioning spare {} (orphaned by a prior \
+                     session or hung) so the pool refills",
+                    s.sandbox_name
+                ));
+                if let Err(error) =
+                    crate::provision_gate::destroy_spare(cfg, env_name, &s.sandbox_name)
+                {
+                    // best-effort: stale-spare cleanup: a failed destroy is retried on the next reconcile
+                    thegn_core::msg::warn(&format!(
+                        "warm pool: stale spare {} destroy failed; keeping it for retry: {error:#}",
+                        s.sandbox_name
+                    ));
+                    provisioning += 1;
+                }
+                notify();
+            }
         }
     }
     let ready: Vec<ReadySpare> = spares
@@ -413,16 +477,34 @@ where
         }
         notify();
     }
+    let mut reservations = Vec::new();
     for _ in 0..action.create {
+        match crate::provision_gate::reserve_spare(repo_root, env_name) {
+            Ok(spare) => reservations.push(spare),
+            Err(error) => {
+                thegn_core::msg::warn(&format!(
+                    "warm pool: cannot reserve spare before provisioning: {error:#}"
+                ));
+                break;
+            }
+        }
+    }
+    for spare in reservations {
         let cfg = cfg.clone();
         let repo_root = repo_root.to_path_buf();
         let env_name = env_name.to_string();
         let notify = notify.clone();
-        // Concurrent build: provision_spare inserts a `provisioning` row first
-        // (so this tick + the next don't double-count), then builds + checkpoints.
+        // Reservation and its lease precede this thread, so concurrent ticks see
+        // every create in the ledger before any provider work begins.
         thegn_core::thread_name::spawn_named("thegn-pool-new", move || {
             crate::platform::qos::set_self(crate::platform::qos::Qos::Background); // Background: warm-spare provisioning.
-            match crate::provision_gate::provision_spare(&cfg, &repo_root, &env_name, |_| {}) {
+            match crate::provision_gate::provision_reserved(
+                &cfg,
+                &repo_root,
+                &env_name,
+                spare,
+                |_| {},
+            ) {
                 Ok(name) => {
                     tracing::debug!(target: "thegn::lifecycle", %name, "warm spare ready");
                     notify();
@@ -582,6 +664,65 @@ pub fn recycle_claimed_on_delete(cfg: &Config, env_name: &str, name: &str) -> bo
 mod tests {
     use super::*;
     use thegn_core::db::Db;
+
+    fn free_spare_probe() -> LeaseProbe {
+        let lease = crate::pool_lease::spare_lease("stale-action-test").unwrap();
+        LeaseProbe::Free(lease)
+    }
+
+    #[test]
+    fn pool_lease_stale_busy_spare_is_kept() {
+        assert!(matches!(
+            stale_provisioning_action(Some(PROVISION_STALE_SECS), LeaseProbe::Busy),
+            StaleAction::Keep
+        ));
+    }
+
+    #[test]
+    fn pool_lease_stale_free_spare_is_destroyed() {
+        assert!(matches!(
+            stale_provisioning_action(Some(PROVISION_STALE_SECS), free_spare_probe()),
+            StaleAction::Destroy(_)
+        ));
+    }
+
+    #[test]
+    fn pool_lease_stale_probe_error_is_kept() {
+        assert!(matches!(
+            stale_provisioning_action(Some(PROVISION_STALE_SECS), LeaseProbe::Error),
+            StaleAction::Keep
+        ));
+    }
+
+    #[test]
+    fn pool_lease_young_spare_never_probes() {
+        assert!(matches!(
+            stale_provisioning_action(Some(PROVISION_STALE_SECS - 1), LeaseProbe::NotProbed),
+            StaleAction::Keep
+        ));
+    }
+
+    #[test]
+    fn pool_lease_reserve_inserts_row_and_holds_the_spare_lease() {
+        let _state = thegn_core::testenv::IsolatedState::new();
+        let repo = tempfile::tempdir().unwrap();
+        let reserved = crate::provision_gate::reserve_spare(repo.path(), "pool-lease-test")
+            .expect("reserve provisioning row");
+        let name = reserved.name.clone();
+        let db = Db::open().unwrap();
+        let rows = db
+            .pool_spares_for(&repo.path().to_string_lossy(), "pool-lease-test")
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].sandbox_name, name);
+        assert_eq!(rows[0].state, "provisioning");
+        assert!(matches!(
+            crate::pool_lease::spare_lease(&name),
+            Err(crate::pool_lease::LeaseError::Busy)
+        ));
+        drop(reserved);
+        assert!(crate::pool_lease::spare_lease(&name).is_ok());
+    }
 
     #[test]
     fn warm_candidate_scan_uses_index_without_database_opens() {

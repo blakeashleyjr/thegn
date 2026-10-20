@@ -338,14 +338,19 @@ pub(crate) fn guard_unprovisioned_attach(
 /// named sandbox, cloned + devShell-seeded + tooled + checkpointed (so it suspends
 /// for free), recorded `ready` so a worktree can claim it. Returns the spare name.
 /// On failure the half-built sandbox + DB row are torn down.
-pub fn provision_spare(
-    cfg: &thegn_core::config::Config,
+pub(crate) struct ReservedSpare {
+    pub(crate) name: String,
+    lease: crate::pool_lease::Lease,
+}
+
+pub(crate) fn reserve_spare(
     repo_root: &std::path::Path,
     env_name: &str,
-    mut progress: impl FnMut(&[crate::agent::ProvisionStepView]),
-) -> anyhow::Result<String> {
+) -> anyhow::Result<ReservedSpare> {
     let repo = repo_root.to_string_lossy().to_string();
     let name = mint_spare_name(&repo)?;
+    let lease = crate::pool_lease::spare_lease(&name)
+        .map_err(|error| anyhow::anyhow!("warm pool: cannot lease new spare {name}: {error}"))?;
     {
         let db = thegn_core::db::Db::open().map_err(|error| {
             anyhow::anyhow!(
@@ -359,6 +364,28 @@ pub fn provision_spare(
                 )
             })?;
     }
+    Ok(ReservedSpare { name, lease })
+}
+
+pub fn provision_spare(
+    cfg: &thegn_core::config::Config,
+    repo_root: &std::path::Path,
+    env_name: &str,
+    progress: impl FnMut(&[crate::agent::ProvisionStepView]),
+) -> anyhow::Result<String> {
+    let spare = reserve_spare(repo_root, env_name)?;
+    provision_reserved(cfg, repo_root, env_name, spare, progress)
+}
+
+pub(crate) fn provision_reserved(
+    cfg: &thegn_core::config::Config,
+    repo_root: &std::path::Path,
+    env_name: &str,
+    spare: ReservedSpare,
+    mut progress: impl FnMut(&[crate::agent::ProvisionStepView]),
+) -> anyhow::Result<String> {
+    let name = spare.name;
+    let _lease = spare.lease;
     // The repo's main worktree gives env-resolution + origin context; the name is
     // overridden to the generic spare name (the clone is branch-less either way).
     let ctx = thegn_core::repo::main_worktree(repo_root)
