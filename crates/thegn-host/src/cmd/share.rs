@@ -88,22 +88,13 @@ fn start(cfg: &Config, port: u16, worktree: Option<String>, reach: Option<String
     }
     let provider = share::for_provider(&spec);
     let kind = provider.kind().to_string();
-    let launch = match provider.launch() {
-        Ok(l) => l,
-        Err(e) => return Err(e),
-    };
+    let launch = provider.launch()?;
     let generation = cli_generation()?;
 
     match launch {
         ShareLaunch::Process(plan) => {
-            let statedir = match share::share_state_dir(&wt_path, &kind, port, generation) {
-                Ok(path) => path,
-                Err(e) => return Err(e),
-            };
-            let running = match share::start(&plan, &statedir, spec.ready_timeout) {
-                Ok(r) => r,
-                Err(e) => return Err(e),
-            };
+            let statedir = share::share_state_dir(&wt_path, &kind, port, generation)?;
+            let running = share::start(&plan, &statedir, spec.ready_timeout)?;
             let endpoint = display_endpoint(&running.public_url, &kind);
             let display_endpoint = thegn_svc::lsp::sanitize_for_terminal(&endpoint);
             outln!("share: 127.0.0.1:{port} → {}", display_endpoint);
@@ -134,10 +125,7 @@ fn start(cfg: &Config, port: u16, worktree: Option<String>, reach: Option<String
                     Some(&thegn_core::profile::name()),
                 ),
             );
-            let url = match share::serve_up(&sidecar, &serve) {
-                Ok(u) => u,
-                Err(e) => return Err(e),
-            };
+            let url = share::serve_up(&sidecar, &serve)?;
             let url = url.canonical();
             let display_endpoint = thegn_svc::lsp::sanitize_for_terminal(&url);
             outln!("share: 127.0.0.1:{port} → {display_endpoint}");
@@ -220,21 +208,18 @@ fn stop_with_store(
         .into_iter()
         .find(|row| row.worktree == wt && row.local_port == port)
         .ok_or_else(|| anyhow::anyhow!("share: no recorded share on port {port}"))?;
-    match stop_plan(&row, forget, None, None) {
-        StopPlan::Forget => {
-            if !store.delete_share_generation(wt, port, row.generation)? {
-                bail!("share: record changed before it could be forgotten");
-            }
-            outln!("share: forgot record for port {port}; tunnel was NOT touched");
-            return Ok(());
+    if forget {
+        if !store.delete_share_generation(wt, port, row.generation)? {
+            bail!("share: record changed before it could be forgotten");
         }
-        StopPlan::RefuseProcess if row.provider != "tailscale" => {
-            bail!(
-                "share: share on port {port} is owned by a running `thegn share start` (provider {}); interrupt that process, or use --forget to drop a stale record",
-                row.provider
-            );
-        }
-        _ => {}
+        outln!("share: forgot record for port {port}; tunnel was NOT touched");
+        return Ok(());
+    }
+    if row.provider != "tailscale" {
+        bail!(
+            "share: share on port {port} is owned by a running `thegn share start` (provider {}); interrupt that process, or use --forget to drop a stale record",
+            row.provider
+        );
     }
     let label = thegn_core::share::label_for(wt);
     let share_cfg = thegn_core::config::ShareConfig {
@@ -309,7 +294,9 @@ fn finish_stop(
     row: &ShareRow,
     teardown: impl FnOnce() -> Result<()>,
 ) -> Result<()> {
-    teardown().context("share: verified teardown failed; record retained for retry")?;
+    teardown().context(
+        "share: verified teardown failed; record retained for retry; if the sidecar/worktree is gone, confirm the funnel is off and use `--forget`",
+    )?;
     if !store
         .delete_share_generation(&row.worktree, row.local_port, row.generation)
         .context("share: teardown verified but could not remove the record")?
@@ -320,11 +307,24 @@ fn finish_stop(
 }
 
 fn url_port(url: &str) -> Option<u16> {
-    let authority = url.split_once("://")?.1.split('/').next()?;
-    if let Some((_, host_port)) = authority.rsplit_once(':') {
-        return host_port.parse().ok();
+    let (scheme, rest) = url.split_once("://")?;
+    let authority = rest.split(|c| matches!(c, '/' | '?' | '#')).next()?;
+    if authority.is_empty() {
+        return None;
     }
-    (url.starts_with("https://") && !authority.is_empty()).then_some(443)
+    let default_port = (scheme == "https").then_some(443);
+    if let Some(bracketed) = authority.strip_prefix('[') {
+        let (_, suffix) = bracketed.split_once(']')?;
+        return match suffix {
+            "" => default_port,
+            suffix => suffix.strip_prefix(':')?.parse().ok(),
+        };
+    }
+    match authority.rsplit_once(':') {
+        Some((host, port)) if !host.is_empty() => port.parse().ok(),
+        Some(_) => None,
+        None => default_port,
+    }
 }
 
 #[cfg(test)]
@@ -462,6 +462,9 @@ mod tests {
             StopPlan::TeardownTailscale
         );
         assert_eq!(url_port("https://demo.ts.net"), Some(443));
+        assert_eq!(url_port("https://[fd7a::1]"), Some(443));
+        assert_eq!(url_port("https://[fd7a::1]:8443/path"), Some(8443));
+        assert_eq!(url_port("http://[fd7a::1]"), None);
     }
 
     #[test]
