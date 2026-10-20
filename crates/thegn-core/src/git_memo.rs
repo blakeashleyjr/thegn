@@ -939,17 +939,30 @@ fn shared_origin_key(dir: &Path, inputs: &OriginInputs) -> Option<SharedOriginKe
         return None;
     }
     let common_dir = std::fs::canonicalize(crate::util::git_common_dir(dir)).ok()?;
-    let own_git_dir = git_dir(dir)?;
+    let textual_common_dir = crate::util::git_common_dir(dir);
+    let own_git_dir = std::fs::canonicalize(git_dir(dir)?).ok()?;
     let own_worktree_config = own_git_dir.join("config.worktree");
     let common_worktree_config = common_dir.join("config.worktree");
-    let own_config = inputs
+    let mut shared_inputs = inputs.clone();
+    for (path, _) in &mut shared_inputs.files {
+        *path = if let Ok(remainder) = path.strip_prefix(&textual_common_dir) {
+            common_dir.join(remainder)
+        } else if let (Some(parent), Some(file_name)) = (path.parent(), path.file_name()) {
+            match std::fs::canonicalize(parent) {
+                Ok(parent) => parent.join(file_name),
+                Err(_) => path.clone(),
+            }
+        } else {
+            path.clone()
+        };
+    }
+    let own_config = shared_inputs
         .files
         .iter()
         .find(|(path, _)| path == &own_worktree_config)?;
     if own_config.1.is_some() {
         return None;
     }
-    let mut shared_inputs = inputs.clone();
     if own_worktree_config != common_worktree_config {
         shared_inputs
             .files
@@ -966,7 +979,6 @@ fn shared_origin_key(dir: &Path, inputs: &OriginInputs) -> Option<SharedOriginKe
 /// `compute` is the subprocess; it runs only on a miss or when the inputs
 /// cannot be fingerprinted completely.
 pub fn origin_url(dir: &Path, compute: impl FnOnce() -> (Option<String>, bool)) -> Option<String> {
-    static MEMO: Mutex<Option<Memo<Option<String>>>> = Mutex::new(None);
     origin_url_with(dir, &|k| std::env::var(k).ok(), compute)
 }
 
@@ -1218,6 +1230,21 @@ mod tests {
     }
 
     #[test]
+    fn origin_nested_mixed_case_include_if_disables_shared_memo() {
+        let base = tmp("origin-nested-include-if");
+        let repo = repo_with_config(&base, "[include]\n\tpath = nested.cfg\n");
+        std::fs::write(
+            repo.join(".git/nested.cfg"),
+            "[IncludeIf \"gitdir:/some/path/\"]\n\tpath = conditional.cfg\n",
+        )
+        .unwrap();
+        let env = isolated_origin_env(&base);
+        let inputs = origin_inputs(&repo, &env).expect("config inputs are modelled");
+        assert!(inputs.conditional);
+        assert!(shared_origin_key(&repo, &inputs).is_none());
+    }
+
+    #[test]
     fn origin_inputs_bypass_when_not_modelled() {
         let base = tmp("origin-bypass");
         let repo = repo_with_config(&base, "");
@@ -1294,6 +1321,13 @@ mod tests {
             "[remote \"origin\"]\n\turl = https://example.test/repo.git\n",
         );
         let env = isolated_origin_env(&base);
+        let main_inputs = origin_inputs(&main, &env).unwrap();
+        let linked_inputs = origin_inputs(&a, &env).unwrap();
+        assert_eq!(
+            shared_origin_key(&main, &main_inputs),
+            shared_origin_key(&a, &linked_inputs),
+            "main checkout and linked worktree share a canonical key"
+        );
         let computes = std::cell::Cell::new(0);
         let run = |dir: &Path| {
             origin_url_with(dir, &env, || {
