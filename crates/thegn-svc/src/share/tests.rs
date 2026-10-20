@@ -1357,11 +1357,36 @@ fn group_stop_repeated_stop_arms_one_escalation() {
 
 #[cfg(unix)]
 #[test]
+fn group_stop_now_kills_term_ignoring_client_immediately() {
+    let state = tempfile::tempdir().expect("private temporary state");
+    let plan =
+        group_stop_plan("trap '' TERM; echo 'public: stubborn.example'; exec sleep 30".into());
+    let running = start_cancellable(
+        &plan,
+        state.path(),
+        Duration::from_secs(3),
+        &AtomicBool::new(false),
+    )
+    .expect("start grouped client");
+    let handle = running.stop_handle();
+    let pid = handle
+        .child
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .pid;
+    assert_eq!(handle.stop_now(), StopOutcome::Terminated);
+    assert!(crate::plugin::proc::leader_exited_nowait(pid).expect("check stopped leader"));
+    let report = running.wait_verified();
+    assert_eq!(report.leaked_readers, 0);
+}
+
+#[cfg(unix)]
+#[test]
 fn group_stop_foreground_start_keeps_the_callers_group() {
     let state = tempfile::tempdir().expect("private temporary state");
-    let foreground_path = state.path().join("foreground.pgid");
+    let foreground_path = state.path().join("foreground-group");
     let script = format!(
-        "ps -o pgid= -p $$ > '{}'; echo 'public: foreground.example'; sleep 30",
+        "if kill -0 -$$ 2>/dev/null; then echo own; else echo inherited; fi > '{}'; echo 'public: foreground.example'; exec sleep 30",
         foreground_path.display()
     );
     let plan = SharePlan {
@@ -1375,18 +1400,13 @@ fn group_stop_foreground_start_keeps_the_callers_group() {
         },
     };
     let running = start(&plan, state.path(), Duration::from_secs(3)).expect("foreground start");
-    let pgid: i32 = std::fs::read_to_string(foreground_path)
-        .expect("foreground pgid")
-        .trim()
-        .parse()
-        .expect("pgid number");
-    // SAFETY: getpgrp has no pointer arguments or side effects.
-    assert_eq!(pgid, unsafe { libc::getpgrp() });
+    let group = std::fs::read_to_string(foreground_path).expect("foreground group check");
+    assert_eq!(group.trim(), "inherited");
     running.stop();
 
-    let grouped_path = state.path().join("grouped.pgid");
+    let grouped_path = state.path().join("grouped-group");
     let plan = group_stop_plan(format!(
-        "ps -o pgid= -p $$ > '{}'; echo 'public: grouped.example'; sleep 30",
+        "if kill -0 -$$ 2>/dev/null; then echo own; else echo inherited; fi > '{}'; echo 'public: grouped.example'; exec sleep 30",
         grouped_path.display()
     ));
     let running = start_cancellable(
@@ -1396,20 +1416,8 @@ fn group_stop_foreground_start_keeps_the_callers_group() {
         &AtomicBool::new(false),
     )
     .expect("grouped start");
-    let pgid: i32 = std::fs::read_to_string(grouped_path)
-        .expect("grouped pgid")
-        .trim()
-        .parse()
-        .expect("pgid number");
-    assert_eq!(
-        pgid,
-        running
-            .stop_handle()
-            .child
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .pid as i32
-    );
+    let group = std::fs::read_to_string(grouped_path).expect("grouped group check");
+    assert_eq!(group.trim(), "own");
     running.stop();
 }
 
