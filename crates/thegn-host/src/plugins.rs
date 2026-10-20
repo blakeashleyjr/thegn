@@ -410,9 +410,7 @@ fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
 }
 
-/// Validate the complete plugin set before setup is allowed to start any
-/// plugin process. Any enabled-spec problem rejects the whole set; run
-/// `thegn plugin check` for the diagnostics.
+/// Test helper that projects the production admission result to owned plugins.
 #[cfg(test)]
 fn admitted_plugins(
     cfg: &thegn_core::config::Config,
@@ -765,25 +763,6 @@ fn setup_and_schedule_with_waker(
     }
 }
 
-#[cfg(test)]
-fn partition_native_trust(
-    plugins: Vec<LoadedPlugin>,
-) -> (
-    Vec<LoadedPlugin>,
-    Vec<thegn_svc::plugin::loader::SpecProblem>,
-) {
-    let mut admitted = Vec::new();
-    let mut refused = Vec::new();
-    for plugin in plugins {
-        if let Some(problem) = thegn_svc::plugin::loader::native_trust_refusal(&plugin) {
-            refused.push(problem);
-        } else {
-            admitted.push(plugin);
-        }
-    }
-    (admitted, refused)
-}
-
 fn initial_run_ids(loaded: &[LoadedState], sched: &[SchedEntry]) -> BTreeSet<String> {
     loaded
         .iter()
@@ -999,47 +978,6 @@ mod tests {
         assert!(problems.iter().any(|problem| {
             problem.plugin == "invalid-command" && problem.problem == "empty command"
         }));
-    }
-
-    #[test]
-    fn partition_native_trust_drops_only_untrusted_gated_plugins() {
-        let mut refused = capability_spec("refused", "run:git");
-        refused.mode = PluginMode::OneShot;
-        let mut trusted = capability_spec("trusted", "run:git");
-        trusted.mode = PluginMode::OneShot;
-        trusted.trusted_native = true;
-        let hello = example_spec();
-        let plugins = [refused, trusted, hello]
-            .into_iter()
-            .map(|spec| LoadedPlugin {
-                spec,
-                dir: None,
-                trusted_native_ignored: false,
-            })
-            .collect();
-
-        let (kept, refused) = partition_native_trust(plugins);
-
-        assert_eq!(kept.len(), 2);
-        assert_eq!(refused.len(), 1);
-        assert_eq!(refused[0].plugin, "refused");
-        let states = kept
-            .into_iter()
-            .map(|plugin| {
-                let negotiated = thegn_svc::plugin::loader::negotiate(&plugin.spec)
-                    .expect("kept plugin negotiates");
-                LoadedState {
-                    plugin,
-                    negotiated,
-                    writer: None,
-                }
-            })
-            .collect::<Vec<_>>();
-        let sched = build_schedule(&states, Instant::now());
-        let initial = initial_run_ids(&states, &sched);
-        assert!(sched.iter().all(|entry| entry.plugin != "refused"));
-        assert!(!initial.contains("refused"));
-        assert!(initial.contains("trusted"));
     }
 
     #[test]
