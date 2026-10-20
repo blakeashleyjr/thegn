@@ -95,13 +95,13 @@ impl ProjectionBackend for BuiltinProjection<'_> {
 }
 
 fn mount_sshfs(spec: &ProjectionSpec) -> Result<Mounted> {
-    manifest::claim_or_verify(spec)?;
     let Placement::Ssh(s) = &spec.placement else {
         bail!("sshfs projection requires an ssh placement");
     };
     if !s.extra_args.is_empty() {
         bail!("sshfs projection does not support ssh extra_args");
     }
+    manifest::claim_or_verify(spec)?;
     let argv = sshfs_mount_argv_for(s, &spec.remote_dir, &spec.mountpoint);
     run(&argv)?;
     Ok(Mounted {
@@ -121,14 +121,12 @@ fn sshfs_mount_argv_for(s: &SshPlacement, remote: &str, mountpoint: &str) -> Vec
 }
 
 fn unmount_sshfs(spec: &ProjectionSpec) -> Result<()> {
+    let Placement::Ssh(ssh) = &spec.placement else {
+        bail!("sshfs projection requires an ssh placement");
+    };
     manifest::verify(spec)?;
     let candidates = spec.legacy_mountpoints();
-    let slug_legacy_path = match &spec.placement {
-        Placement::Ssh(ssh) => {
-            thegn_core::projection::legacy_mountpoint(&ssh.host, &spec.remote_dir)
-        }
-        _ => None,
-    };
+    let slug_legacy_path = thegn_core::projection::legacy_mountpoint(&ssh.host, &spec.remote_dir);
     let legacy_paths: Vec<_> = candidates
         .into_iter()
         .filter(|path| std::fs::symlink_metadata(path).is_ok_and(|metadata| metadata.is_dir()))
@@ -385,10 +383,10 @@ fn local_dir(mountpoint: &str) -> String {
 /// One-direction-each (pull on mount, push on refresh/close) — true bidirectional
 /// conflict resolution is out of scope for the reference engine.
 fn mount_sync(spec: &ProjectionSpec) -> Result<Mounted> {
-    manifest::claim_or_verify(spec)?;
     let Placement::Ssh(s) = &spec.placement else {
         bail!("sync projection requires an ssh placement");
     };
+    manifest::claim_or_verify(spec)?;
     let mut argv = vec!["rsync".into(), "-az".into(), "--delete".into()];
     argv.extend(rsync_ssh_opt(s));
     argv.push(rsync_remote(s, &spec.remote_dir));
@@ -402,10 +400,10 @@ fn mount_sync(spec: &ProjectionSpec) -> Result<Mounted> {
 /// Push the local working copy back to the remote (no `--delete`: never reaches
 /// in and removes remote files the local copy lacks).
 fn push_sync(spec: &ProjectionSpec) -> Result<()> {
-    manifest::verify(spec)?;
     let Placement::Ssh(s) = &spec.placement else {
         bail!("sync projection requires an ssh placement");
     };
+    manifest::verify(spec)?;
     let mut argv = vec!["rsync".into(), "-az".into()];
     argv.extend(rsync_ssh_opt(s));
     argv.push(local_dir(&spec.mountpoint));

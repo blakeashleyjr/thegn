@@ -578,6 +578,12 @@ mod tests {
 
         let mut variants = Vec::new();
         let mut changed = base.clone();
+        changed.mode = DataMode::InEnv;
+        variants.push(changed);
+        let mut changed = base.clone();
+        changed.mode = DataMode::LocalExec;
+        variants.push(changed);
+        let mut changed = base.clone();
         changed.mode = DataMode::Sshfs;
         variants.push(changed);
         let mut changed = base.clone();
