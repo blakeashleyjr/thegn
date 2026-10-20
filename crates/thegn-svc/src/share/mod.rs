@@ -68,6 +68,40 @@ impl StopHandle {
         self.stop_with_grace(SHARE_STOP_GRACE)
     }
 
+    /// Kill the child immediately when the host is exiting.
+    pub fn stop_now(&self) -> StopOutcome {
+        let mut state = self
+            .child
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if state.reaped {
+            return StopOutcome::AlreadyExited;
+        }
+        if state.grouped {
+            let exited = crate::plugin::proc::leader_exited_nowait(state.pid);
+            crate::plugin::proc::kill_group(state.pid);
+            return match exited {
+                Ok(true) => StopOutcome::AlreadyExited,
+                Ok(false) => StopOutcome::Terminated,
+                Err(error) => StopOutcome::Failed(error.to_string()),
+            };
+        }
+        match state.child.try_wait() {
+            Ok(Some(_)) => {
+                state.reaped = true;
+                StopOutcome::AlreadyExited
+            }
+            Err(_) => match state.child.kill() {
+                Ok(()) => StopOutcome::Terminated,
+                Err(error) => StopOutcome::Failed(error.to_string()),
+            },
+            Ok(None) => match state.child.kill() {
+                Ok(()) => StopOutcome::Terminated,
+                Err(error) => StopOutcome::Failed(error.to_string()),
+            },
+        }
+    }
+
     fn stop_with_grace(&self, grace: Duration) -> StopOutcome {
         let mut state = self
             .child
@@ -1180,7 +1214,11 @@ impl RunningShare {
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             if state.reaped {
-                return StopOutcome::AlreadyExited;
+                return if matches!(&outcome, StopOutcome::Failed(_)) {
+                    outcome
+                } else {
+                    StopOutcome::AlreadyExited
+                };
             }
             state.grouped
         };
@@ -1191,16 +1229,18 @@ impl RunningShare {
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .pid;
+            if matches!(&outcome, StopOutcome::Failed(_)) {
+                crate::plugin::proc::kill_group(pid);
+            }
             if let Err(error) = crate::plugin::proc::wait_leader_exit_nowait(pid) {
-                tracing::debug!(%error, "share no-wait leader wait failed; using fallback reap");
-                return self.reap_foreground(outcome);
+                tracing::debug!(%error, "share no-wait leader wait failed; using blocking reap");
+                crate::plugin::proc::kill_group(pid);
             }
             let mut state = self
                 .child
                 .child
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            crate::plugin::proc::kill_group(pid);
             if let Err(error) = state.child.wait() {
                 tracing::debug!(%error, "share child reap failed");
                 return StopOutcome::Failed(error.to_string());
@@ -1222,7 +1262,11 @@ impl RunningShare {
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner);
                 if state.reaped {
-                    return StopOutcome::AlreadyExited;
+                    return if matches!(&outcome, StopOutcome::Failed(_)) {
+                        outcome
+                    } else {
+                        StopOutcome::AlreadyExited
+                    };
                 }
                 match state.child.try_wait() {
                     Ok(Some(_)) => {
@@ -1248,8 +1292,8 @@ impl RunningShare {
                 leaked += 1;
                 continue;
             }
-            if let Err(error) = reader.join() {
-                tracing::debug!(%error, "share reader panicked");
+            if reader.join().is_err() {
+                tracing::debug!("share reader panicked");
             }
         }
         leaked
