@@ -1106,19 +1106,68 @@ fn start_keeps_draining_so_child_survives_post_return() {
     let tmp = std::env::temp_dir().join(format!("thegn-share-test-{}", std::process::id()));
     let _ = std::fs::create_dir_all(&tmp); // best-effort: test setup; later asserts fail loudly if missing
 
-    let mut running = start(&plan, &tmp, Duration::from_secs(5)).expect("start");
+    let running = start(&plan, &tmp, Duration::from_secs(5)).expect("start");
     assert_eq!(running.public_url.canonical(), "http://fixed.example");
 
     // Give the child time to emit several post-return lines: under the old
     // break-on-send-fail behavior it would SIGPIPE and exit here.
     std::thread::sleep(Duration::from_millis(800));
     assert!(
-        running.child.try_wait().expect("try_wait").is_none(),
+        !running.has_exited(),
         "child must still be running — a closed stdout would have SIGPIPE-killed it"
     );
 
     running.stop();
     let _ = std::fs::remove_dir_all(&tmp); // best-effort: test tmp cleanup
+}
+
+#[cfg(unix)]
+#[test]
+fn start_cancellable_aborts_a_child_that_never_reports_a_url() {
+    let state = tempfile::tempdir().expect("private temporary state");
+    let plan = SharePlan {
+        program: "sh".into(),
+        args: vec!["-c".into(), "exec sleep 30".into()],
+        env: Vec::new(),
+        files: Vec::new(),
+        url_rule: UrlRule::AfterMarker {
+            marker: "public: ".into(),
+            scheme: "https".into(),
+        },
+    };
+    let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let signal = cancel.clone();
+    let canceller = std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(200));
+        signal.store(true, std::sync::atomic::Ordering::Release);
+    });
+    let started = std::time::Instant::now();
+    let result = start_cancellable(&plan, state.path(), Duration::from_secs(10), &cancel);
+    assert!(
+        result.is_err_and(|error| error.downcast_ref::<ShareStartCancelled>().is_some()),
+        "startup cancellation must retain its typed error"
+    );
+    assert!(started.elapsed() < Duration::from_secs(2));
+    canceller.join().expect("canceller thread");
+}
+
+#[cfg(unix)]
+#[test]
+fn stop_handle_is_idempotent_and_never_signals_a_reaped_child() {
+    let state = tempfile::tempdir().expect("private temporary state");
+    let plan = SharePlan {
+        program: "sh".into(),
+        args: vec!["-c".into(), "exec sleep 30".into()],
+        env: Vec::new(),
+        files: Vec::new(),
+        url_rule: UrlRule::Fixed("http://fixed.example".into()),
+    };
+    let running = start(&plan, state.path(), Duration::from_secs(1)).expect("start share");
+    let handle = running.stop_handle();
+    assert_eq!(handle.stop(), StopOutcome::Terminated);
+    running.wait();
+    assert_eq!(handle.stop(), StopOutcome::AlreadyExited);
+    assert_eq!(handle.stop(), StopOutcome::AlreadyExited);
 }
 
 #[cfg(unix)]
@@ -1151,7 +1200,8 @@ fn spawned_client_sees_only_allowlisted_env() {
         ("THEGN_TEST_CANARY_SECRET".into(), "canary-value".into()),
         ("GITHUB_TOKEN".into(), "github-value".into()),
     ];
-    let running = start_with_ambient(&plan, temp.path(), Duration::from_secs(1), ambient)
+    let cancel = AtomicBool::new(false);
+    let running = start_with_ambient(&plan, temp.path(), Duration::from_secs(1), ambient, &cancel)
         .expect("start fake client");
     let dumped_env = std::fs::read_to_string(&dump_path).expect("read child environment");
 

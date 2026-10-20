@@ -34,6 +34,64 @@ use crate::vpn::{OciRuntime, exec_in};
 
 pub type ConflictHook = Box<dyn FnOnce() + Send>;
 
+#[derive(Clone)]
+pub struct StopHandle {
+    child: Arc<Mutex<ShareChild>>,
+}
+
+impl fmt::Debug for StopHandle {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("StopHandle").finish_non_exhaustive()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StopOutcome {
+    Terminated,
+    AlreadyExited,
+    Failed(String),
+}
+
+struct ShareChild {
+    child: Child,
+    reaped: bool,
+}
+
+impl StopHandle {
+    /// Request termination without waiting for the supervisor to reap.
+    pub fn stop(&self) -> StopOutcome {
+        let mut state = self
+            .child
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if state.reaped {
+            return StopOutcome::AlreadyExited;
+        }
+        match state.child.try_wait() {
+            Ok(Some(_)) => {
+                state.reaped = true;
+                StopOutcome::AlreadyExited
+            }
+            Err(error) => StopOutcome::Failed(error.to_string()),
+            Ok(None) => match state.child.kill() {
+                Ok(()) => StopOutcome::Terminated,
+                Err(error) => StopOutcome::Failed(error.to_string()),
+            },
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ShareStartCancelled;
+
+impl fmt::Display for ShareStartCancelled {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("share: start cancelled")
+    }
+}
+
+impl std::error::Error for ShareStartCancelled {}
+
 #[cfg(test)]
 mod tests;
 
@@ -965,7 +1023,7 @@ fn serve_dns_name(rt: &OciRuntime, sidecar: &str) -> Result<String> {
 
 /// A live share: the running tunnel-client child and its public URL.
 pub struct RunningShare {
-    pub child: Child,
+    child: StopHandle,
     pub public_url: PublicEndpoint,
     endpoint_tracker: EndpointTracker,
     cleanup: Option<(std::path::PathBuf, Vec<String>, Option<Vec<u8>>)>,
@@ -981,6 +1039,33 @@ impl fmt::Debug for RunningShare {
 }
 
 impl RunningShare {
+    pub fn stop_handle(&self) -> StopHandle {
+        self.child.clone()
+    }
+
+    /// Poll and reap the child if it has exited.
+    pub fn has_exited(&self) -> bool {
+        let mut state = self
+            .child
+            .child
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if state.reaped {
+            return true;
+        }
+        match state.child.try_wait() {
+            Ok(Some(_)) => {
+                state.reaped = true;
+                true
+            }
+            Ok(None) => false,
+            Err(error) => {
+                tracing::debug!(%error, "share child exit check failed");
+                false
+            }
+        }
+    }
+
     /// Whether the provider announced a different public endpoint after its
     /// first accepted endpoint. This remains sticky for the share lifetime.
     pub fn endpoint_conflict(&self) -> bool {
@@ -1002,16 +1087,41 @@ impl RunningShare {
 
     /// Best-effort terminate the child.
     pub fn stop(mut self) {
-        let _ = self.child.kill(); // best-effort: child may already have exited
-        let _ = self.child.wait(); // best-effort: reap-or-not is terminal here
+        match self.child.stop() {
+            StopOutcome::Failed(error) => tracing::debug!(%error, "share child stop failed"),
+            StopOutcome::Terminated | StopOutcome::AlreadyExited => {}
+        }
+        self.reap();
         self.cleanup_files();
     }
 
     pub fn wait(mut self) {
-        if let Err(error) = self.child.wait() {
-            tracing::debug!(%error, "share child wait failed");
-        }
+        self.reap();
         self.cleanup_files();
+    }
+
+    fn reap(&self) {
+        loop {
+            {
+                let mut state = self
+                    .child
+                    .child
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                if state.reaped {
+                    return;
+                }
+                match state.child.try_wait() {
+                    Ok(Some(_)) => {
+                        state.reaped = true;
+                        return;
+                    }
+                    Ok(None) => {}
+                    Err(error) => tracing::debug!(%error, "share child wait failed"),
+                }
+            }
+            std::thread::sleep(SHARE_REAP_POLL);
+        }
     }
 
     fn cleanup_files(&mut self) {
@@ -1020,6 +1130,8 @@ impl RunningShare {
         }
     }
 }
+
+const SHARE_REAP_POLL: Duration = Duration::from_millis(200);
 
 #[derive(Clone, Default)]
 struct EndpointTracker {
@@ -1298,7 +1410,17 @@ pub fn start(
     statedir: &std::path::Path,
     timeout: Duration,
 ) -> Result<RunningShare> {
-    start_with_ambient(plan, statedir, timeout, std::env::vars_os())
+    let cancel = AtomicBool::new(false);
+    start_cancellable(plan, statedir, timeout, &cancel)
+}
+
+pub fn start_cancellable(
+    plan: &SharePlan,
+    statedir: &std::path::Path,
+    timeout: Duration,
+    cancel: &AtomicBool,
+) -> Result<RunningShare> {
+    start_with_ambient(plan, statedir, timeout, std::env::vars_os(), cancel)
 }
 
 fn start_with_ambient(
@@ -1306,9 +1428,17 @@ fn start_with_ambient(
     statedir: &std::path::Path,
     timeout: Duration,
     ambient: impl IntoIterator<Item = (OsString, OsString)>,
+    cancel: &AtomicBool,
 ) -> Result<RunningShare> {
     let manifest = read_owner_manifest(statedir)?;
-    match start_inner(plan, statedir, timeout, manifest.as_deref(), ambient) {
+    match start_inner(
+        plan,
+        statedir,
+        timeout,
+        manifest.as_deref(),
+        ambient,
+        cancel,
+    ) {
         Ok(mut running) => {
             running.cleanup = Some((
                 statedir.to_path_buf(),
@@ -1398,6 +1528,7 @@ fn start_inner(
     timeout: Duration,
     owner_manifest: Option<&[u8]>,
     ambient: impl IntoIterator<Item = (OsString, OsString)>,
+    cancel: &AtomicBool,
 ) -> Result<RunningShare> {
     verify_owner_manifest(statedir, owner_manifest)?;
     if matches!(&plan.url_rule, UrlRule::Fixed(_)) && plan.url_rule.fixed().is_none() {
@@ -1455,14 +1586,30 @@ fn start_inner(
         let grace = Duration::from_millis(1500).min(timeout);
         let deadline = Instant::now() + grace;
         while Instant::now() < deadline {
+            if cancel.load(Ordering::Acquire) {
+                abort_child(child);
+                return Err(ShareStartCancelled.into());
+            }
             if child.try_wait()?.is_some() {
                 abort_child(child);
+                if cancel.load(Ordering::Acquire) {
+                    return Err(ShareStartCancelled.into());
+                }
                 anyhow::bail!("share: '{}' exited early", plan.program);
             }
             std::thread::sleep(Duration::from_millis(100));
         }
+        if cancel.load(Ordering::Acquire) {
+            abort_child(child);
+            return Err(ShareStartCancelled.into());
+        }
         return Ok(RunningShare {
-            child,
+            child: StopHandle {
+                child: Arc::new(Mutex::new(ShareChild {
+                    child,
+                    reaped: false,
+                })),
+            },
             public_url: url,
             endpoint_tracker,
             cleanup: None,
@@ -1471,9 +1618,16 @@ fn start_inner(
 
     let deadline = Instant::now() + timeout;
     loop {
+        if cancel.load(Ordering::Acquire) {
+            abort_child(child);
+            return Err(ShareStartCancelled.into());
+        }
         let remaining = deadline.saturating_duration_since(Instant::now());
         if remaining.is_zero() {
             abort_child(child);
+            if cancel.load(Ordering::Acquire) {
+                return Err(ShareStartCancelled.into());
+            }
             anyhow::bail!(
                 "share: '{}' did not report a URL within {}s",
                 plan.program,
@@ -1489,8 +1643,17 @@ fn start_inner(
                 abort_child(child);
                 anyhow::bail!("share: provider reported multiple public endpoints");
             }
+            if cancel.load(Ordering::Acquire) {
+                abort_child(child);
+                return Err(ShareStartCancelled.into());
+            }
             return Ok(RunningShare {
-                child,
+                child: StopHandle {
+                    child: Arc::new(Mutex::new(ShareChild {
+                        child,
+                        reaped: false,
+                    })),
+                },
                 public_url: url,
                 endpoint_tracker,
                 cleanup: None,
@@ -1512,12 +1675,25 @@ fn start_inner(
                         abort_child(child);
                         anyhow::bail!("share: provider reported multiple public endpoints");
                     }
+                    if cancel.load(Ordering::Acquire) {
+                        abort_child(child);
+                        return Err(ShareStartCancelled.into());
+                    }
                     return Ok(RunningShare {
-                        child,
+                        child: StopHandle {
+                            child: Arc::new(Mutex::new(ShareChild {
+                                child,
+                                reaped: false,
+                            })),
+                        },
                         public_url: url,
                         endpoint_tracker,
                         cleanup: None,
                     });
+                }
+                if cancel.load(Ordering::Acquire) {
+                    abort_child(child);
+                    return Err(ShareStartCancelled.into());
                 }
                 abort_child(child);
                 anyhow::bail!("share: '{}' exited before reporting a URL", plan.program);
