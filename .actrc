@@ -5,8 +5,12 @@
 # `ci-setup` action + the DeterminateSystems nix installer expect. The medium
 # catthehacker image is ~1G; the full image (`:full-latest`, ~18G) is only
 # needed if a step wants a GitHub-preinstalled tool we don't (we don't — every
-# stage runs through `nix develop`).
--P ubuntu-latest=catthehacker/ubuntu:act-latest
+# stage runs through `nix develop`). This image is pinned by its index digest,
+# resolved 2026-10-20. To update it, resolve the tag's new digest (for example,
+# `docker buildx imagetools inspect catthehacker/ubuntu:act-latest` or
+# `skopeo inspect --raw docker://catthehacker/ubuntu:act-latest | sha256sum`),
+# review the image change, and replace the digest in one commit.
+-P ubuntu-latest=catthehacker/ubuntu:act-latest@sha256:c58e2b364da03b0c804c7d660f2ecbedf2f221a382b9baa0b344b0144780ff43
 
 # Force amd64 so runs are identical on Apple-silicon hosts (the image + nix
 # binary cache are amd64). Drop this line if you want native arm64.
