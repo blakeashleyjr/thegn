@@ -18,7 +18,7 @@ use std::collections::BTreeMap;
 
 use anyhow::{Result, anyhow};
 
-use super::{HOST_KEY, InventoryPage, MANAGED_KEY, MANAGED_VAL, VpsInstance};
+use super::{CONTROLLER_KEY, HOST_KEY, InventoryPage, MANAGED_KEY, MANAGED_VAL, VpsInstance};
 
 pub const DEFAULT_API_BASE: &str = "https://api.digitalocean.com/v2";
 /// Terraform/`doctl` convention. `doctl` also honours `DIGITALOCEAN_ACCESS_TOKEN`;
@@ -35,6 +35,7 @@ pub const MANAGED_TAG: &str = "tg-managed";
 /// Host scoping is a `tg-host:<hash>` tag (DO tags allow colons); the reaper
 /// filters on the reconstructed `tg-host` label.
 pub const HOST_TAG_PREFIX: &str = "tg-host:";
+pub const CONTROLLER_TAG_PREFIX: &str = "tg-ctl:";
 
 pub fn droplets_url(base: &str) -> String {
     format!("{}/droplets", base.trim_end_matches('/'))
@@ -93,6 +94,9 @@ pub fn tags_from_labels(labels: &BTreeMap<String, String>) -> Vec<String> {
     if let Some(host) = labels.get(HOST_KEY) {
         tags.push(format!("{HOST_TAG_PREFIX}{host}"));
     }
+    if let Some(controller) = labels.get(CONTROLLER_KEY) {
+        tags.push(format!("{CONTROLLER_TAG_PREFIX}{controller}"));
+    }
     tags
 }
 
@@ -105,6 +109,8 @@ pub fn labels_from_tags(tags: &[String]) -> BTreeMap<String, String> {
             labels.insert(MANAGED_KEY.to_string(), MANAGED_VAL.to_string());
         } else if let Some(host) = t.strip_prefix(HOST_TAG_PREFIX) {
             labels.insert(HOST_KEY.to_string(), host.to_string());
+        } else if let Some(controller) = t.strip_prefix(CONTROLLER_TAG_PREFIX) {
+            labels.insert(CONTROLLER_KEY.to_string(), controller.to_string());
         }
     }
     labels
@@ -473,6 +479,38 @@ mod tests {
         let back = labels_from_tags(&mixed);
         assert_eq!(back.get("managed-by").map(String::as_str), Some("thegn"));
         assert_eq!(back.get("tg-host").map(String::as_str), Some("h9"));
+    }
+
+    #[test]
+    fn controller_tag_round_trips() {
+        let mut labels = BTreeMap::new();
+        labels.insert(MANAGED_KEY.to_string(), MANAGED_VAL.to_string());
+        labels.insert(HOST_KEY.to_string(), "abc123".to_string());
+        labels.insert(
+            CONTROLLER_KEY.to_string(),
+            "0123456789abcdef0123456789abcdef".to_string(),
+        );
+        let tags = tags_from_labels(&labels);
+        assert_eq!(
+            tags,
+            vec![
+                "tg-managed",
+                "tg-host:abc123",
+                "tg-ctl:0123456789abcdef0123456789abcdef"
+            ]
+        );
+        assert_eq!(labels_from_tags(&tags), labels);
+    }
+
+    #[test]
+    fn controller_tag_absent_keeps_the_old_tags() {
+        let mut labels = BTreeMap::new();
+        labels.insert(MANAGED_KEY.to_string(), MANAGED_VAL.to_string());
+        labels.insert(HOST_KEY.to_string(), "abc123".to_string());
+        assert_eq!(
+            tags_from_labels(&labels),
+            vec!["tg-managed", "tg-host:abc123"]
+        );
     }
 
     #[test]

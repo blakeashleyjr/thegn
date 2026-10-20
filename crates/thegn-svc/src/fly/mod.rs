@@ -653,7 +653,11 @@ impl RemoteProvider for FlyProvider {
         Box::pin(async move {
             // Every local input is admitted, and the complete machine body is
             // rendered, before the ledger intent, the app, or the billed IPv4.
-            let metadata = self.spec.metadata();
+            let controller = tokio::task::spawn_blocking(crate::vps::controller::controller_id)
+                .await
+                .context("fly: controller id worker failed")??;
+            let mut metadata = self.spec.metadata();
+            metadata.insert(crate::vps::CONTROLLER_KEY.into(), controller);
             let admitted = self.spec.admit_static(&metadata)?;
             let name = self.spec.name.clone();
             let body = machines::create_machine_body(
@@ -1195,6 +1199,17 @@ mod tests {
         assert!(m.contains_key("tg-host"));
     }
 
+    #[test]
+    fn controller_metadata_passes_admission() {
+        let s = spec();
+        let mut metadata = s.metadata();
+        metadata.insert(
+            crate::vps::CONTROLLER_KEY.into(),
+            "0123456789abcdef0123456789abcdef".into(),
+        );
+        assert!(s.admit_static(&metadata).is_ok());
+    }
+
     /// Neither the transport error nor anyhow's alternate/Debug chain may echo
     /// the request URL (a canary in its query stands in for a secret).
     #[tokio::test]
@@ -1363,6 +1378,32 @@ mod tests {
         assert!(
             registry::read("tg-fly-leak").is_none(),
             "record must be gone after a successful teardown, not orphaned"
+        );
+    }
+
+    #[tokio::test]
+    async fn controller_id_load_failure_refuses_create_before_any_request() {
+        let _state = thegn_core::testenv::IsolatedState::new();
+        let hits = std::sync::Arc::new(Mutex::new(Vec::new()));
+        let (base, _srv) = fake_fly_server(hits.clone()).await;
+        let provider = FlyProvider::new(FlySpec {
+            api_base: base.clone(),
+            graphql_url: format!("{base}/"),
+            ..spec()
+        });
+        let id_path =
+            thegn_core::util::thegn_dir().join(crate::vps::controller::CONTROLLER_ID_FILE);
+        std::fs::create_dir_all(id_path.parent().unwrap()).unwrap();
+        std::fs::write(&id_path, b"malformed").unwrap();
+
+        let error = provider.create().await.unwrap_err();
+        assert!(
+            error.to_string().contains(&id_path.display().to_string()),
+            "controller id refusal should identify the file: {error:#}"
+        );
+        assert!(
+            hits.lock().unwrap().is_empty(),
+            "malformed controller id must refuse create before remote calls"
         );
     }
 
