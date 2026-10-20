@@ -458,7 +458,12 @@ pub(crate) async fn handle_exit(
         .with_db(move |db| db.count_dispatch_retry_attempt_run(&counted_run, &class_sig))
         .await?
     else {
-        tracing::debug!(target: "thegn::daemon", row = row.id, run_gen = run.run_gen, "transport retry exit was already counted or its run moved");
+        tracing::debug!(
+            target: "thegn::daemon",
+            row = row.id,
+            run_gen = run.run_gen,
+            "transport retry exit was already counted or its run moved"
+        );
         return Ok(());
     };
     // `run` (read in step 2b) fences the backoff below: a re-drive in that
@@ -1087,36 +1092,80 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn duplicate_exit_after_settlement_does_not_spend_the_run_twice() {
+    async fn duplicate_exit_for_an_already_counted_running_generation_is_ignored() {
         let mut config = thegn_core::config::Config::default();
-        config.pipeline.transport_retry.max_attempts = 0;
+        config.pipeline.transport_retry.max_attempts = 3;
         config.pipeline.transport_retry.transport_signatures = vec!["Connection error".into()];
         let (svc, _profile) = test_service(config);
         let row_id = running_row(&svc, "linear:THE-976-duplicate", "claude");
         let session = "s-duplicate-exit";
-        {
+        let run = {
             let db = svc.db.lock().unwrap();
             assert!(db.bind_dispatch_session(row_id, session).unwrap());
+            db.dispatch_run_ref(row_id).unwrap().unwrap()
+        };
+        {
+            let db = svc.db.lock().unwrap();
+            assert_eq!(
+                db.count_dispatch_retry_attempt_run(&run, "transport:connection error")
+                    .unwrap(),
+                Some(1),
+                "simulate the first observer counting this run"
+            );
         }
         bury(&svc, session, b"Connection error", 1).await;
 
-        handle_exit(&svc, session, 1, None).await.unwrap();
-        let first_note = svc
-            .db
-            .lock()
-            .unwrap()
-            .get_dispatch(row_id)
-            .unwrap()
-            .unwrap()
-            .note;
         handle_exit(&svc, session, 1, None).await.unwrap();
 
         let db = svc.db.lock().unwrap();
         let row = db.get_dispatch(row_id).unwrap().unwrap();
         assert_eq!(
-            row.note, first_note,
-            "duplicate exit leaves the parked row alone"
+            row.status,
+            St::Running,
+            "duplicate exit does not park the row"
         );
+        assert_eq!(row.note, None, "duplicate exit leaves the note unchanged");
+        assert_eq!(db.dispatch_retry_attempt(row_id).unwrap(), Some(1));
+        assert_eq!(db.dispatch_run_ref(row_id).unwrap().unwrap(), run);
+    }
+
+    #[tokio::test]
+    async fn duplicate_exit_after_settlement_preserves_the_settled_row() {
+        let mut config = thegn_core::config::Config::default();
+        config.pipeline.transport_retry.max_attempts = 3;
+        config.pipeline.transport_retry.transport_signatures = vec!["Connection error".into()];
+        let (svc, _profile) = test_service(config);
+        let row_id = running_row(&svc, "linear:THE-976-settled-duplicate", "claude");
+        let session = "s-settled-duplicate-exit";
+        let run = {
+            let db = svc.db.lock().unwrap();
+            assert!(db.bind_dispatch_session(row_id, session).unwrap());
+            db.dispatch_run_ref(row_id).unwrap().unwrap()
+        };
+        {
+            let db = svc.db.lock().unwrap();
+            assert_eq!(
+                db.count_dispatch_retry_attempt_run(&run, "transport:connection error")
+                    .unwrap(),
+                Some(1)
+            );
+            assert!(
+                db.compare_and_set_dispatch_retry_settle_run(
+                    &run,
+                    St::Running,
+                    "settled before duplicate exit"
+                )
+                .unwrap()
+            );
+        }
+        bury(&svc, session, b"Connection error", 1).await;
+
+        handle_exit(&svc, session, 1, None).await.unwrap();
+
+        let db = svc.db.lock().unwrap();
+        let row = db.get_dispatch(row_id).unwrap().unwrap();
+        assert_eq!(row.status, St::WaitingHuman);
+        assert_eq!(row.note.as_deref(), Some("settled before duplicate exit"));
         assert_eq!(db.dispatch_retry_attempt(row_id).unwrap(), Some(0));
     }
 

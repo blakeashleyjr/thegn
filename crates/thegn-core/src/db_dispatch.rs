@@ -746,15 +746,9 @@ impl Db {
         let tx = conn.unchecked_transaction()?;
         let changed = tx.execute(
             "UPDATE agent_dispatches SET retry_attempt=retry_attempt+1, retry_counted_gen=?1, retry_last_class=?2 \
-             WHERE id=?3 AND status=?5 AND COALESCE(session_id,'')=?4 AND run_gen=?1 \
+             WHERE id=?3 AND COALESCE(session_id,'')=?4 AND run_gen=?1 \
              AND (retry_counted_gen IS NULL OR retry_counted_gen<>?1)",
-            rusqlite::params![
-                run.run_gen,
-                class,
-                run.id,
-                run.session_id,
-                AgentDispatchStatus::Running.as_str()
-            ],
+            rusqlite::params![run.run_gen, class, run.id, run.session_id],
         )?;
         let count = if changed == 0 {
             None
@@ -779,7 +773,7 @@ impl Db {
     ) -> Result<bool> {
         let note = crate::pipeline_report::note_text(note).map_err(|e| anyhow::anyhow!("{e}"))?;
         Ok(self.conn().execute(
-            "UPDATE agent_dispatches SET status=?1, note=?2, retry_attempt=0, retry_counted_gen=NULL, retry_last_class=NULL \
+            "UPDATE agent_dispatches SET status=?1, note=?2, retry_attempt=0, retry_counted_gen=?6, retry_last_class=NULL \
              WHERE id=?3 AND status=?4 AND COALESCE(session_id,'')=?5 AND run_gen=?6",
             rusqlite::params![
                 AgentDispatchStatus::WaitingHuman.as_str(),
@@ -3462,6 +3456,12 @@ mod tests {
             .unwrap()
         );
         assert_eq!(db.dispatch_retry_attempt(id).unwrap(), Some(0));
+        assert_eq!(
+            db.count_dispatch_retry_attempt_run(&run, "transport:duplicate-after-settle")
+                .unwrap(),
+            None,
+            "settling clears the count but preserves this run's generation fence"
+        );
 
         db.update_dispatch_status(id, AgentDispatchStatus::Queued)
             .unwrap();
