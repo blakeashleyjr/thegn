@@ -308,7 +308,7 @@ fn finish_stop(
 
 fn url_port(url: &str) -> Option<u16> {
     let (scheme, rest) = url.split_once("://")?;
-    let authority = rest.split(|c| matches!(c, '/' | '?' | '#')).next()?;
+    let authority = rest.split(['/', '?', '#']).next()?;
     if authority.is_empty() {
         return None;
     }
