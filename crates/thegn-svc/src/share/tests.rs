@@ -1375,7 +1375,15 @@ fn group_stop_now_kills_term_ignoring_client_immediately() {
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .pid;
     assert_eq!(handle.stop_now(), StopOutcome::Terminated);
-    assert!(crate::plugin::proc::leader_exited_nowait(pid).expect("check stopped leader"));
+    // SIGKILL is delivered asynchronously: poll briefly instead of racing the kernel.
+    let deadline = std::time::Instant::now() + Duration::from_secs(2);
+    while !crate::plugin::proc::leader_exited_nowait(pid).expect("check stopped leader") {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "a TERM-ignoring leader survived stop_now"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
     let report = running.wait_verified();
     assert_eq!(report.leaked_readers, 0);
 }
