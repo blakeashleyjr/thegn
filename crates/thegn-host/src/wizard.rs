@@ -116,21 +116,45 @@ pub(crate) fn default_env_name(cfg: &Config, repo_root: &Path) -> String {
 /// explicit choice whenever a DB workspace env shadowed it (the "machine0
 /// worktree launched on sprites" bug).
 pub(crate) fn ambient_env_name(db: Option<&Db>, cfg: &Config, repo_root: &Path) -> String {
-    db.and_then(|db| {
-        db.workspace_env(&repo_root.to_string_lossy())
-            .ok()
-            .flatten()
-    })
-    .filter(|s| !s.trim().is_empty())
-    .unwrap_or_else(|| default_env_name(cfg, repo_root))
+    let repo_path = repo_root.to_string_lossy().into_owned();
+    let envs = db.map_or_else(std::collections::BTreeMap::new, |db| {
+        workspace_envs(db, [repo_path.as_str()])
+    });
+    ambient_env_name_from(&envs, cfg, repo_root)
 }
 
-/// [`ambient_env_name`] for loop-side call sites with no `Db` in scope (wizard
-/// launch, headless preset): a one-shot best-effort open. Not for tests — the
-/// pure form/`default_env_name` paths stay DB-free.
-pub(crate) fn ambient_env_name_live(cfg: &Config, repo_root: &Path) -> String {
-    let db = Db::open().ok(); // best-effort: best-effort open (doc above): ambient env resolution falls back to pure config
-    ambient_env_name(db.as_ref(), cfg, repo_root)
+/// Read each distinct non-empty workspace path once. Missing, empty, and
+/// unreadable workspace values are omitted so callers can use the config chain.
+pub(crate) fn workspace_envs<'a>(
+    db: &Db,
+    repo_paths: impl IntoIterator<Item = &'a str>,
+) -> std::collections::BTreeMap<String, String> {
+    let mut envs = std::collections::BTreeMap::new();
+    let mut seen = std::collections::BTreeSet::new();
+    for repo_path in repo_paths {
+        if repo_path.is_empty() || !seen.insert(repo_path) {
+            continue;
+        }
+        if let Ok(Some(env)) = db.workspace_env(repo_path)
+            && !env.trim().is_empty()
+        {
+            envs.insert(repo_path.to_string(), env);
+        }
+    }
+    envs
+}
+
+/// Resolve the workspace DB environment from the hydrated model, falling back
+/// to the same config chain used by `ambient_env_name`.
+pub(crate) fn ambient_env_name_from(
+    envs: &std::collections::BTreeMap<String, String>,
+    cfg: &Config,
+    repo_root: &Path,
+) -> String {
+    envs.get(repo_root.to_string_lossy().as_ref())
+        .filter(|env| !env.trim().is_empty())
+        .cloned()
+        .unwrap_or_else(|| default_env_name(cfg, repo_root))
 }
 
 /// Persist a worktree's registry row plus its explicit sandbox/agent/env pins.
@@ -331,7 +355,7 @@ impl NewWorktreeWizard {
     }
 
     /// Re-point the Host row at `key` when it exists — the launch path passes
-    /// the DB-aware ambient ([`ambient_env_name_live`]) so the preselect shows
+    /// the DB-aware ambient (`ambient_env_name_from`) so the preselect shows
     /// what the worktree will actually inherit; `new` itself stays DB-free
     /// (pure prefill, unit-testable).
     pub fn preselect_host(&mut self, key: &str) {
@@ -1727,6 +1751,40 @@ mod tests {
         // A cleared workspace env falls back through the config chain.
         db.set_workspace_env(&root.to_string_lossy(), "").unwrap();
         assert_eq!(ambient_env_name(Some(&db), &cfg, &root), "cfgdefault");
+    }
+
+    #[test]
+    fn ambient_env_from_model_prefers_the_workspace_env() {
+        let mut cfg = test_cfg();
+        cfg.sandbox.default_env = "cfgdefault".into();
+        let root = std::env::temp_dir().join("tg-wiz-ambient-model");
+        let envs = std::collections::BTreeMap::from([(
+            root.to_string_lossy().into_owned(),
+            "sprites".into(),
+        )]);
+
+        assert_eq!(ambient_env_name_from(&envs, &cfg, &root), "sprites");
+        assert_eq!(
+            ambient_env_name_from(&std::collections::BTreeMap::new(), &cfg, &root),
+            "cfgdefault"
+        );
+    }
+
+    #[test]
+    fn workspace_envs_reads_each_repo_once_and_skips_empty() {
+        let db = Db::open_memory().unwrap();
+        let configured = "/workspace/configured";
+        let cleared = "/workspace/cleared";
+        db.put_workspace(configured, "t", "git").unwrap();
+        db.set_workspace_env(configured, "sprites").unwrap();
+        db.put_workspace(cleared, "t", "git").unwrap();
+        db.set_workspace_env(cleared, "").unwrap();
+
+        let envs = workspace_envs(&db, [configured, configured, cleared, cleared, ""]);
+
+        assert_eq!(envs.len(), 1);
+        assert_eq!(envs.get(configured).map(String::as_str), Some("sprites"));
+        assert!(!envs.contains_key(cleared));
     }
 
     // test code: fixture setup, never on the event loop.

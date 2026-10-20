@@ -112,6 +112,7 @@ impl FrameModel {
             && self.tabs == other.tabs
             && self.active_tab == other.active_tab
             && self.sidebar_workspaces == other.sidebar_workspaces
+            && self.workspace_envs == other.workspace_envs
             && self.sidebar_db_worktrees == other.sidebar_db_worktrees
             && self.sidebar_db_folders == other.sidebar_db_folders
             && self.sidebar_db_terminals == other.sidebar_db_terminals
@@ -225,6 +226,20 @@ mod tests {
         let mut loc_changed = base.clone();
         loc_changed.loc = Some(thegn_core::loc::LocReport::total_only(42));
         assert!(!base.hydration_eq(&loc_changed), "loc change must repaint");
+    }
+
+    #[test]
+    fn hydration_eq_detects_workspace_env_change() {
+        let base = FrameModel::default();
+        let mut env_changed = base.clone();
+        env_changed
+            .workspace_envs
+            .insert("/repo".into(), "sprites".into());
+
+        assert!(
+            !base.hydration_eq(&env_changed),
+            "workspace environment change must repaint and apply hydration"
+        );
     }
 
     /// Regression: folders + terminals ARE build_rows inputs that build_model
