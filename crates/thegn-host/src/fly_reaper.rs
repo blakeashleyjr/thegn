@@ -32,6 +32,7 @@ const CREATING_STALE_SECS: u64 = 10 * 60;
 /// Throttled entry: schedule one reconcile pass when due. Cheap (and free) when
 /// no `provider = "fly"` env is configured or the ledger has no Fly records.
 pub fn tick(cfg: &Config) {
+    static LEDGER_WARNED: AtomicBool = AtomicBool::new(false);
     let envs: Vec<EnvProviderConfig> = cfg
         .env
         .values()
@@ -41,7 +42,21 @@ pub fn tick(cfg: &Config) {
     if envs.is_empty() {
         return;
     }
-    if !registry::list().iter().any(|r| r.provider == "fly") {
+    let view = match registry::list_checked() {
+        Ok(view) => {
+            reset_ledger_warning(&LEDGER_WARNED);
+            view
+        }
+        Err(error) => {
+            if should_warn_ledger_error(&LEDGER_WARNED) {
+                thegn_core::msg::warn(&format!(
+                    "fly reaper: skipped fly: ledger unreadable ({error:#}); no provider or ledger actions attempted"
+                ));
+            }
+            return;
+        }
+    };
+    if !has_fly_work(&view) {
         return;
     }
     static LAST: std::sync::Mutex<Option<Instant>> = std::sync::Mutex::new(None);
@@ -106,8 +121,22 @@ fn reap(envs: &[EnvProviderConfig]) {
 }
 
 fn reap_unambiguous(pc: &EnvProviderConfig) {
+    let view = match registry::list_checked() {
+        Ok(view) => view,
+        Err(error) => {
+            thegn_core::msg::warn(&format!(
+                "fly reaper: skipped fly: ledger unreadable ({error:#}); no provider or ledger actions attempted"
+            ));
+            return;
+        }
+    };
+    for name in &view.unreadable {
+        thegn_core::msg::warn(&format!(
+            "fly reaper: ledger record {name} unreadable (provider unknown); reconcile ownership; no deletion attempted"
+        ));
+    }
     let now = thegn_core::util::now();
-    for rec in registry::list().into_iter().filter(|r| r.provider == "fly") {
+    for rec in view.records.into_iter().filter(|r| r.provider == "fly") {
         // Legacy created_at is local intent/finalization time, not provider
         // machine age. Never promote it into destructive age evidence.
         if pc.max_lifetime_secs == 0 && rec.state != "creating" {
@@ -183,6 +212,18 @@ fn reap_unambiguous(pc: &EnvProviderConfig) {
         // destroyed out-of-band leaves only a harmless (non-billing) stale record
         // that the next attach re-resolves — not worth an extra API call here.
     }
+}
+
+fn has_fly_work(view: &registry::LedgerView) -> bool {
+    view.records.iter().any(|record| record.provider == "fly") || !view.unreadable.is_empty()
+}
+
+fn should_warn_ledger_error(warned: &AtomicBool) -> bool {
+    !warned.swap(true, Ordering::AcqRel)
+}
+
+fn reset_ledger_warning(warned: &AtomicBool) {
+    warned.store(false, Ordering::Release);
 }
 
 /// Ordered fail-closed lifecycle: provider capability, route-token revocation,
@@ -268,6 +309,26 @@ mod tests {
             assert!(result.is_err());
             assert_eq!(calls.get(), 0);
         }
+    }
+
+    #[test]
+    fn checked_ledger_unreadable_entry_is_reported() {
+        let view = registry::LedgerView {
+            records: Vec::new(),
+            unreadable: vec!["broken".into()],
+        };
+        assert!(has_fly_work(&view));
+    }
+
+    #[test]
+    fn checked_ledger_error_warns_once_until_a_successful_listing() {
+        let warned = AtomicBool::new(false);
+        assert!(should_warn_ledger_error(&warned));
+        assert!(!should_warn_ledger_error(&warned));
+
+        reset_ledger_warning(&warned);
+
+        assert!(should_warn_ledger_error(&warned));
     }
 
     #[test]
