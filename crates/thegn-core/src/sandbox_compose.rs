@@ -1011,29 +1011,26 @@ fn judge_runtime_inspect(
             == Some("host")
         {
             Some("pid: host".to_owned())
-        } else if let Some(capability) = host
-            .and_then(|value| value.get("CapAdd"))
-            .and_then(serde_json::Value::as_array)
-            .and_then(|caps| {
-                caps.iter()
-                    .filter_map(serde_json::Value::as_str)
-                    .find(|cap| {
-                        let normalized = cap.to_ascii_uppercase();
-                        matches!(
-                            normalized.strip_prefix("CAP_").unwrap_or(&normalized),
-                            "ALL"
-                                | "SYS_ADMIN"
-                                | "SYS_MODULE"
-                                | "SYS_RAWIO"
-                                | "SYS_PTRACE"
-                                | "DAC_READ_SEARCH"
-                        )
-                    })
-            })
-        {
-            Some(format!("cap_add: {}", capability.to_ascii_uppercase()))
         } else {
-            None
+            host.and_then(|value| value.get("CapAdd"))
+                .and_then(serde_json::Value::as_array)
+                .and_then(|caps| {
+                    caps.iter()
+                        .filter_map(serde_json::Value::as_str)
+                        .find(|cap| {
+                            let normalized = cap.to_ascii_uppercase();
+                            matches!(
+                                normalized.strip_prefix("CAP_").unwrap_or(&normalized),
+                                "ALL"
+                                    | "SYS_ADMIN"
+                                    | "SYS_MODULE"
+                                    | "SYS_RAWIO"
+                                    | "SYS_PTRACE"
+                                    | "DAC_READ_SEARCH"
+                            )
+                        })
+                })
+                .map(|capability| format!("cap_add: {}", capability.to_ascii_uppercase()))
         };
         if let Some(setting) = refusal {
             return Ok(Some(ComposeRuntimeRefusal {
