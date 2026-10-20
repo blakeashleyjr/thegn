@@ -343,23 +343,25 @@ fn host_launcher_path(
     name: &'static str,
     host_path: Option<&OsStr>,
 ) -> Result<String, LauncherError> {
-    let current_dir = match std::env::current_dir() {
-        Ok(directory) => Some(directory),
-        Err(_) => None,
-    };
-    host_path
+    let directories = host_path.into_iter().flat_map(std::env::split_paths);
+    host_launcher_path_in(name, directories)
+}
+
+fn host_launcher_path_in(
+    name: &'static str,
+    directories: impl IntoIterator<Item = std::path::PathBuf>,
+) -> Result<String, LauncherError> {
+    directories
         .into_iter()
-        .flat_map(std::env::split_paths)
-        .filter_map(|directory| {
-            let directory = if directory.is_absolute() {
-                directory
+        .filter(|directory| directory.is_absolute())
+        .map(|directory| directory.join(name))
+        .find_map(|path| {
+            if path.is_file() {
+                path.to_str().map(str::to_owned)
             } else {
-                current_dir.as_ref()?.join(directory)
-            };
-            Some(directory.join(name))
+                None
+            }
         })
-        .find(|path| path.is_file())
-        .map(|path| path.to_string_lossy().into_owned())
         .ok_or(LauncherError::NotOnHostPath(name))
 }
 
@@ -412,17 +414,14 @@ fn pin_outer_launcher(
         let last_occurrences: Vec<usize> = loader_vars
             .iter()
             .enumerate()
-            .filter_map(|(index, (key, _))| {
-                (!loader_vars[index + 1..]
-                    .iter()
-                    .any(|(later, _)| later == key))
-                .then_some(index)
+            .filter_map(|(i, (key, _))| {
+                (!loader_vars[i + 1..].iter().any(|(later, _)| later == key)).then_some(i)
             })
             .collect();
         let setenv_args: Vec<String> = last_occurrences
             .into_iter()
-            .flat_map(|index| {
-                let (key, value) = &loader_vars[index];
+            .flat_map(|pos| {
+                let (key, value) = &loader_vars[pos];
                 ["--setenv".to_owned(), key.clone(), value.clone()]
             })
             .collect();
@@ -467,7 +466,10 @@ pub(crate) fn open_pty(
 ) -> Result<PtyHandle> {
     let mut launch_env = thegn_core::util::host_base_env();
     // Match the existing CommandBuilder environment layering exactly.
+    // Terminal defaults, unless the caller (or base env) already set them.
     launch_env.push(("TERM".to_owned(), "xterm-256color".to_owned()));
+    // The emulator parses 24-bit SGR; advertise it so apps (btop, modern
+    // CLIs) pick truecolor instead of degraded 256-color ramps.
     launch_env.push(("COLORTERM".to_owned(), "truecolor".to_owned()));
     launch_env.extend(env.iter().cloned());
     let (argv, launch_env) =
@@ -771,6 +773,45 @@ mod tests {
         let result = pin_outer_launcher(&argv, Vec::new(), Some(fixture.host_path()));
 
         assert!(matches!(result, Err(LauncherError::NotOnHostPath("bwrap"))));
+    }
+
+    #[test]
+    fn relative_empty_and_dot_host_path_entries_cannot_select_cwd_launchers() {
+        let fixture = LauncherFixture::new(true);
+        let cwd = std::env::current_dir().expect("current directory");
+        let target_components: Vec<_> = fixture.agent.components().collect();
+        let cwd_components: Vec<_> = cwd.components().collect();
+        let common = cwd_components
+            .iter()
+            .zip(&target_components)
+            .take_while(|(left, right)| left == right)
+            .count();
+        let mut relative_agent = std::path::PathBuf::new();
+        for _ in &cwd_components[common..] {
+            relative_agent.push("..");
+        }
+        for component in &target_components[common..] {
+            relative_agent.push(component.as_os_str());
+        }
+        assert!(relative_agent.join("bwrap").is_file());
+
+        let host_path = std::env::join_paths([
+            relative_agent.as_os_str(),
+            OsStr::new(""),
+            OsStr::new("."),
+            fixture.host.as_os_str(),
+        ])
+        .expect("join hostile and host PATH entries");
+        let result = host_launcher_path("bwrap", Some(&host_path));
+
+        assert_eq!(
+            result.expect("relative entries are skipped"),
+            fixture
+                .host
+                .join("bwrap")
+                .to_str()
+                .expect("UTF-8 fixture path")
+        );
     }
 
     #[test]
