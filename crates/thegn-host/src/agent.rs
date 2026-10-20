@@ -4076,8 +4076,9 @@ pub(crate) fn dotfiles_launch_gate(
         .chain(cfg.tools.iter())
         .any(|entry| entry.name == choice);
     if configured {
+        let detail = format!("{failure:#}");
         return Err(failure.context(format!(
-            "refusing to launch `{choice}`: its bundle HOME could not be prepared"
+            "refusing to launch `{choice}`: its bundle HOME could not be prepared: {detail}"
         )));
     }
     thegn_core::msg::warn(&format!("{failure:#}; the shell launches without it"));
@@ -4133,9 +4134,9 @@ mod tests;
 pub(crate) mod cleanup_fixture;
 
 #[cfg(test)]
-#[path = "agent_vpn_tests.rs"]
-mod vpn_tests;
-
-#[cfg(test)]
 #[path = "agent_dotfiles_tests.rs"]
 mod dotfiles_tests;
+
+#[cfg(test)]
+#[path = "agent_vpn_tests.rs"]
+mod vpn_tests;
