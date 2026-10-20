@@ -5,6 +5,7 @@ name: sandbox-image
 # by digest → assemble + verify the manifest list from those frozen digests →
 # print its digest, which release commits pin as DEFAULT_BASE_DIGEST
 # (crates/thegn-core/src/image.rs).
+# Per-run architecture tags remain in GHCR; retention cleanup is tracked under THE-502.
 #
 # Registry pull is the ALTERNATE delivery route (the default is registry-less
 # transfer from the dev machine), so this publishes on demand / on tag — it is
@@ -160,7 +161,8 @@ jobs:
           ACTOR: ${{ github.actor }}
         run: |
           set -euo pipefail
-          printf '%s' "$REGISTRY_TOKEN" | podman login ghcr.io -u "$ACTOR" --password-stdin
+          printf '%s' "$REGISTRY_TOKEN" | podman login ghcr.io -u "$ACTOR" \
+            --authfile "$HOME/.docker/config.json" --password-stdin
           amd64_digest="$(cat digests/amd64/arch-digest.txt)"
           arm64_digest="$(cat digests/arm64/arch-digest.txt)"
           for digest in "$amd64_digest" "$arm64_digest"; do
@@ -202,8 +204,23 @@ jobs:
           with open("manifest.json", encoding="utf-8") as source:
               manifest = json.load(source)
           actual = [item.get("digest") for item in manifest.get("manifests", [])]
-          expected = [os.environ["AMD64_DIGEST"], os.environ["ARM64_DIGEST"]]
-          if len(actual) != 2 or set(actual) != set(expected):
+          expected = {
+              "amd64": os.environ["AMD64_DIGEST"],
+              "arm64": os.environ["ARM64_DIGEST"],
+          }
+          descriptors = manifest.get("manifests", [])
+          if len(set(expected.values())) != 2:
+              print("::error::frozen architecture digests must be distinct", file=sys.stderr)
+              sys.exit(1)
+          if len(actual) != 2 or {
+              item.get("platform", {}).get("architecture") for item in descriptors
+          } != set(expected):
+              print("::error::pushed manifest platforms do not match amd64 and arm64", file=sys.stderr)
+              sys.exit(1)
+          if any(
+              expected.get(item.get("platform", {}).get("architecture")) != item.get("digest")
+              for item in descriptors
+          ):
               print("::error::pushed manifest children do not match the frozen architecture digests", file=sys.stderr)
               sys.exit(1)'
       - name: Attest manifest build provenance
