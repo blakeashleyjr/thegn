@@ -741,6 +741,16 @@ fn refusal_remediation_hint_names_class_path_and_fix() {
     assert!(hint.contains(RefusalClass::UnsafeMountPath.remediation()));
 
     let error = refusal(
+        &spec(Backend::Docker),
+        RefusalClass::UnsafeMountPath,
+        Some("/a\nb".into()),
+        "safe message".into(),
+    );
+    let hint = error.remediation_hint();
+    assert!(hint.contains("`/a\\nb`"));
+    assert!(!hint.contains('\n'));
+
+    let error = refusal(
         &spec,
         RefusalClass::UnsafeMountPath,
         None,

@@ -711,7 +711,7 @@ impl EnterError {
                 "sandbox entry refused [{}]{}: {}",
                 refusal.class.label(),
                 match refusal.path.as_deref() {
-                    Some(path) => format!(" at `{path}`"),
+                    Some(path) => format!(" at `{}`", path.escape_debug()),
                     None => String::new(),
                 },
                 refusal.class.remediation()
