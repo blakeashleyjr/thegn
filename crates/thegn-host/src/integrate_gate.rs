@@ -478,6 +478,7 @@ struct TrackedPathSnapshot {
     path: PathBuf,
     kind: TrackedKind,
     digest: Option<[u8; 32]>,
+    executable: Option<bool>,
 }
 
 #[derive(Debug)]
@@ -492,6 +493,9 @@ impl TrackedSnapshot {
             entries.is_empty() || entries.ends_with(&[0]),
             "tracked-path probe returned an incomplete record"
         );
+        if entries.is_empty() {
+            return Ok(Self { paths: Vec::new() });
+        }
         let mut paths = Vec::new();
         for record in entries[..entries.len().saturating_sub(1)].split(|byte| *byte == 0) {
             ensure!(
@@ -527,13 +531,18 @@ impl TrackedSnapshot {
                 "160000" => true,
                 _ => anyhow::bail!("unsupported tracked path mode {mode}"),
             };
-            let (kind, digest) = tracked_path_digest(root, &path, gitlink)?;
+            let (kind, digest, executable) = tracked_path_digest(root, &path, gitlink)?;
             ensure!(
                 kind != TrackedKind::Other && (!gitlink || kind == TrackedKind::Gitlink),
                 "tracked path has an unexpected filesystem type: {}",
                 path.display()
             );
-            paths.push(TrackedPathSnapshot { path, kind, digest });
+            paths.push(TrackedPathSnapshot {
+                path,
+                kind,
+                digest,
+                executable,
+            });
         }
         Ok(Self { paths })
     }
@@ -542,7 +551,10 @@ impl TrackedSnapshot {
         let mut changed = Vec::new();
         for expected in &self.paths {
             match tracked_path_digest(root, &expected.path, expected.kind == TrackedKind::Gitlink) {
-                Ok((kind, digest)) if kind == expected.kind && digest == expected.digest => {}
+                Ok((kind, digest, executable))
+                    if kind == expected.kind
+                        && digest == expected.digest
+                        && executable == expected.executable => {}
                 _ => changed.push(format!("{:?}", expected.path)),
             }
         }
@@ -565,7 +577,7 @@ fn tracked_path_digest(
     root: &Path,
     path: &Path,
     gitlink: bool,
-) -> Result<(TrackedKind, Option<[u8; 32]>)> {
+) -> Result<(TrackedKind, Option<[u8; 32]>, Option<bool>)> {
     let mut current = root.to_path_buf();
     let mut components = path.components().peekable();
     while let Some(component) = components.next() {
@@ -585,7 +597,7 @@ fn tracked_path_digest(
     let metadata = std::fs::symlink_metadata(&current)?;
     let file_type = metadata.file_type();
     if file_type.is_dir() && gitlink {
-        return Ok((TrackedKind::Gitlink, None));
+        return Ok((TrackedKind::Gitlink, None, None));
     }
     if file_type.is_file() && !gitlink {
         let mut file = std::fs::File::open(&current)?;
@@ -603,16 +615,21 @@ fn tracked_path_digest(
             }
             hash.update(&buffer[..count]);
         }
-        return Ok((TrackedKind::Regular, Some(hash.finalize().into())));
+        return Ok((
+            TrackedKind::Regular,
+            Some(hash.finalize().into()),
+            crate::platform::gate_path::executable_bit(&metadata),
+        ));
     }
     if file_type.is_symlink() && !gitlink {
         let target = std::fs::read_link(&current)?;
         return Ok((
             TrackedKind::Symlink,
             Some(Sha256::digest(target.as_os_str().as_encoded_bytes()).into()),
+            None,
         ));
     }
-    Ok((TrackedKind::Other, None))
+    Ok((TrackedKind::Other, None, None))
 }
 
 impl Workspace {
