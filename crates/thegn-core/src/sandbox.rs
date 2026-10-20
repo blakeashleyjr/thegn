@@ -3262,10 +3262,21 @@ fn backend_enter_argv_with_env(
                 match util::which_path("rm").and_then(|rm| systemd_env_cleanup_prop(&rm, &envfile))
                 {
                     Some(property) => v.extend(["-p".into(), property]),
-                    None => tracing::debug!(
-                        target: "thegn::sandbox",
-                        "skipping systemd secret env-file cleanup property; path is unavailable or requires systemd escaping"
-                    ),
+                    None => {
+                        if let Err(error) = std::fs::remove_file(&envfile) {
+                            tracing::warn!(
+                                target: "thegn::sandbox",
+                                %error,
+                                "unable to remove systemd secret env file after cleanup property refusal"
+                            );
+                        }
+                        return Err(refusal(
+                            spec,
+                            RefusalClass::SystemdMountPath,
+                            Some(envfile.display().to_string()),
+                            "the systemd secret env file path cannot be expressed in an ExecStopPost cleanup (it contains $, % , ; or a control character, or rm was not found as a plain absolute path); refusing to launch rather than leave the secret file behind".into(),
+                        ));
+                    }
                 }
             } else if !secret_env.is_empty() {
                 // Never put host-sourced secrets back on argv if the protected
@@ -3471,15 +3482,25 @@ fn systemd_env_cleanup_prop(rm: &str, path: &std::path::Path) -> Option<String> 
         return None;
     }
     let path = path.to_str()?;
-    let unsafe_char = |value: &str| {
-        value
+    let rm_is_plain = rm
+        .chars()
+        .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '/' | '.' | '_' | '+' | '-'));
+    if !rm_is_plain
+        || path
             .chars()
-            .any(|ch| ch.is_whitespace() || matches!(ch, '"' | '\'' | '\\' | '$' | '%' | ';'))
-    };
-    if unsafe_char(rm) || unsafe_char(path) {
+            .any(|ch| ch.is_control() || matches!(ch, '$' | '%' | ';'))
+    {
         return None;
     }
-    Some(format!("ExecStopPost=-+{rm} -f -- {path}"))
+    let path_is_plain = path
+        .chars()
+        .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '/' | '.' | '_' | '+' | '-'));
+    if path_is_plain {
+        Some(format!("ExecStopPost=-+{rm} -f -- {path}"))
+    } else {
+        let escaped = path.replace('\\', "\\\\").replace('"', "\\\"");
+        Some(format!("ExecStopPost=-+{rm} -f -- \"{escaped}\""))
+    }
 }
 
 /// Remove secret env-file residue older than this bound. A crash can therefore
