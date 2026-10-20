@@ -92,6 +92,11 @@ show the stash diff, including untracked files. It follows the entry by its
 object ID and can be scrolled at both Half and Full widths.
 Apply, pop, and drop act on the selected entry by object ID even if stashes
 were pushed meanwhile; a stash that no longer exists is refused.
+For local worktrees, nuke (the changes section's Nuke menu choice),
+unstaged-only stash, and undo hold the git lock for their full multi-command
+operation. If restoring the index after an
+unstaged-only stash fails, the error says the temporary `[thegn] temp index`
+commit remains on `HEAD`.
 
 ### files
 
@@ -207,6 +212,10 @@ rescanned instead).
 `rollback` restores a worktree to a prior snapshot when a run goes wrong
 — the undo for "the agent made a mess". It is palette-runnable and
 bindable like the sync actions.
+If snapshot creation fails, thegn restores the index; if that restoration also
+fails, the error says the changes are staged. If a patch cannot be reapplied
+after it is moved, the error says to undo with `z`; if `rebase --abort` fails
+after an edit stop, the error gives the command to run.
 
 ## Which git does what
 
