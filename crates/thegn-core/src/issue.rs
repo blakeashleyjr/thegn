@@ -40,7 +40,95 @@ pub struct Issue {
     /// `None` when the provider has no due-date concept (GitHub) or none set.
     #[serde(default)]
     pub due_at_ms: Option<i64>,
+    /// The configured tracker account that produced this row. Written ONLY by the svc IssueRouter; never trusted from a backend.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub account: Option<String>,
 }
+
+/// Versioned identity binding an issue to the configured account that produced it.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct IssueRef {
+    pub v: u8,
+    pub provider: String,
+    pub account: String,
+    pub id: String,
+}
+
+pub const ISSUE_REF_VERSION: u8 = 1;
+
+impl IssueRef {
+    pub fn new(
+        provider: impl Into<String>,
+        account: impl Into<String>,
+        id: impl Into<String>,
+    ) -> Result<Self, IssueRefError> {
+        let issue_ref = Self {
+            v: ISSUE_REF_VERSION,
+            provider: provider.into(),
+            account: account.into(),
+            id: id.into(),
+        };
+        issue_ref.validate_fields()?;
+        Ok(issue_ref)
+    }
+
+    pub fn of(issue: &Issue) -> Option<Self> {
+        let account = issue.account.as_ref()?;
+        Self::new(issue.provider.as_str(), account.as_str(), issue.id.as_str()).ok()
+    }
+
+    pub fn validate(&self) -> Result<(), IssueRefError> {
+        if self.v != ISSUE_REF_VERSION {
+            return Err(IssueRefError::UnsupportedVersion(self.v));
+        }
+        self.validate_fields()
+    }
+
+    fn validate_fields(&self) -> Result<(), IssueRefError> {
+        if self.provider.is_empty() || self.provider.chars().any(char::is_control) {
+            return Err(IssueRefError::Invalid("provider"));
+        }
+        if self.account.is_empty()
+            || self.account.len() > 128
+            || self
+                .account
+                .chars()
+                .any(|c| c.is_control() || c.is_whitespace())
+        {
+            return Err(IssueRefError::Invalid("account"));
+        }
+        if self.id.len() > 512
+            || self.id.chars().any(char::is_control)
+            || !(self.id == self.provider
+                || self
+                    .id
+                    .strip_prefix(&self.provider)
+                    .is_some_and(|rest| rest.starts_with(':')))
+        {
+            return Err(IssueRefError::Invalid("id"));
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum IssueRefError {
+    UnsupportedVersion(u8),
+    Invalid(&'static str),
+}
+
+impl std::fmt::Display for IssueRefError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::UnsupportedVersion(version) => {
+                write!(f, "unsupported issue ref version {version}")
+            }
+            Self::Invalid(field) => write!(f, "invalid issue ref {field}"),
+        }
+    }
+}
+
+impl std::error::Error for IssueRefError {}
 
 /// Workflow state of an issue.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -627,6 +715,103 @@ impl AgentDispatchStatus {
 #[cfg(test)]
 mod spec {
     use super::*;
+
+    #[test]
+    fn issue_ref_round_trips_through_serde_and_validates() {
+        let issue_ref = IssueRef::new("github", "work", "github:owner/repo#1").unwrap();
+        let json = serde_json::to_string(&issue_ref).unwrap();
+        let decoded: IssueRef = serde_json::from_str(&json).unwrap();
+        assert_eq!(decoded, issue_ref);
+        assert_eq!(decoded.validate(), Ok(()));
+    }
+
+    #[test]
+    fn issue_ref_rejects_unknown_version_and_foreign_id_prefix() {
+        let mut issue_ref = IssueRef::new("github", "work", "github:1").unwrap();
+        issue_ref.v = 2;
+        assert_eq!(
+            issue_ref.validate(),
+            Err(IssueRefError::UnsupportedVersion(2))
+        );
+
+        let mut issue_ref = IssueRef::new("github", "work", "github:1").unwrap();
+        issue_ref.id = "linear:ABC-1".into();
+        assert!(matches!(
+            issue_ref.validate(),
+            Err(IssueRefError::Invalid("id"))
+        ));
+        issue_ref.id = "githubx:1".into();
+        assert!(matches!(
+            issue_ref.validate(),
+            Err(IssueRefError::Invalid("id"))
+        ));
+    }
+
+    #[test]
+    fn issue_ref_of_unstamped_issue_is_none() {
+        assert!(IssueRef::of(&Issue::default()).is_none());
+        let issue = Issue {
+            id: "github:1".into(),
+            provider: "github".into(),
+            account: Some("work".into()),
+            ..Default::default()
+        };
+        assert_eq!(
+            IssueRef::of(&issue),
+            Some(IssueRef::new("github", "work", "github:1").unwrap())
+        );
+    }
+
+    #[test]
+    fn issue_ref_validates_provider_account_and_id_bounds() {
+        assert!(matches!(
+            IssueRef::new("", "work", "github:1"),
+            Err(IssueRefError::Invalid("provider"))
+        ));
+        assert!(matches!(
+            IssueRef::new("github\n", "work", "github:1"),
+            Err(IssueRefError::Invalid("provider"))
+        ));
+        assert!(matches!(
+            IssueRef::new("github", "", "github:1"),
+            Err(IssueRefError::Invalid("account"))
+        ));
+        assert!(matches!(
+            IssueRef::new("github", "two words", "github:1"),
+            Err(IssueRefError::Invalid("account"))
+        ));
+        assert!(matches!(
+            IssueRef::new("github", "x".repeat(129), "github:1"),
+            Err(IssueRefError::Invalid("account"))
+        ));
+        assert!(matches!(
+            IssueRef::new("github", "work", format!("github:{}", "x".repeat(506))),
+            Err(IssueRefError::Invalid("id"))
+        ));
+        assert!(matches!(
+            IssueRef::new("github", "work", "github:\u{7}"),
+            Err(IssueRefError::Invalid("id"))
+        ));
+        assert_eq!(
+            IssueRefError::UnsupportedVersion(2).to_string(),
+            "unsupported issue ref version 2"
+        );
+        assert_eq!(
+            IssueRefError::Invalid("id").to_string(),
+            "invalid issue ref id"
+        );
+    }
+
+    #[test]
+    fn issue_without_account_serializes_without_the_field() {
+        let issue: Issue = serde_json::from_str(
+            r#"{"id":"github:1","number":"1","provider":"github","title":"","status":"backlog","priority":"low","url":"","updated_at_ms":0}"#,
+        )
+        .unwrap();
+        assert_eq!(issue.account, None);
+        let value = serde_json::to_value(issue).unwrap();
+        assert!(value.get("account").is_none());
+    }
 
     #[test]
     fn issue_default_is_valid() {
