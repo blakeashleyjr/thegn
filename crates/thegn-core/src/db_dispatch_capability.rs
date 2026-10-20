@@ -201,27 +201,14 @@ impl Db {
                     },
                 )
                 .optional()?;
-            let refusal = match &row {
-                None => Some(CapabilityRefusal::RowMissing),
-                Some((status, _, _)) if !AgentDispatchStatus::parse(status).is_active() => {
-                    Some(CapabilityRefusal::RowNotLive)
-                }
-                Some((_, None, _)) => Some(CapabilityRefusal::MissingSession),
-                Some((_, Some(session), _)) if session.is_empty() => {
-                    Some(CapabilityRefusal::MissingSession)
-                }
-                _ => None,
+            let Some((status, session, run_gen)) = row else {
+                return Ok(Err(CapabilityRefusal::RowMissing));
             };
-            if let Some(refusal) = refusal {
-                return Ok(Err(refusal));
+            if !AgentDispatchStatus::parse(&status).is_active() {
+                return Ok(Err(CapabilityRefusal::RowNotLive));
             }
-            let (_status, session, run_gen) = match row {
-                Some(row) => row,
-                None => return Ok(Err(CapabilityRefusal::RowMissing)),
-            };
-            let session_id = match session {
-                Some(session_id) if !session_id.is_empty() => session_id,
-                _ => return Ok(Err(CapabilityRefusal::MissingSession)),
+            let Some(session_id) = session.filter(|session_id| !session_id.is_empty()) else {
+                return Ok(Err(CapabilityRefusal::MissingSession));
             };
             let expires_at_ms = mint.now_ms.saturating_add(mint.ttl_ms);
             let grant = CapabilityGrant {

@@ -208,6 +208,32 @@ fn capability_refusal_order_is_pinned() {
         Refusal::RowMissing,
     );
 
+    let tail_order_secret = [0x4f; 32];
+    let tail_order_id = row(&db, "linear:CAP-16", "session-a");
+    mint(&db, tail_order_id, &tail_order_secret, &REPORT);
+    db.stamp_dispatch_run(tail_order_id, "session-b", "relaunch.md")
+        .unwrap();
+    db.update_dispatch_status(tail_order_id, AgentDispatchStatus::Done)
+        .unwrap();
+    refusal(
+        &db,
+        &tail_order_secret,
+        tail_order_id,
+        Verb::Report,
+        101,
+        Refusal::RowNotLive,
+    );
+    db.update_dispatch_status(tail_order_id, AgentDispatchStatus::Running)
+        .unwrap();
+    refusal(
+        &db,
+        &tail_order_secret,
+        tail_order_id,
+        Verb::Report,
+        101,
+        Refusal::SessionChanged,
+    );
+
     let invalid_verbs_secret = [0x4b; 32];
     let invalid_verbs_id = row(&db, "linear:CAP-14", "session-invalid-verbs");
     mint(&db, invalid_verbs_id, &invalid_verbs_secret, &REPORT);
