@@ -62,7 +62,7 @@ pub enum Action {
         #[arg(long)]
         json: bool,
     },
-    /// Land a branch that is `ready` (gated green, held by `auto_land = false`).
+    /// Land only a ready merge-queue row; use `thegn land` outside the queue.
     Land {
         #[command(flatten)]
         target: super::target::WorktreeTarget,
@@ -995,6 +995,7 @@ fn land(cfg: &Config, worktree: Option<String>) -> Result<()> {
         // Guard refusal: bail so the exit code is non-zero for scripting/CI.
         anyhow::bail!("{msg}");
     }
+    crate::merge_ops::ready_land_precheck(&guard_db, &wt_s)?;
     let guard = crate::platform::InterruptGuard::install();
     let _scope = crate::fold_cancel::scope(move || guard.fired());
     // Share the fold/gate/CAS core with `thegn land`; this queue-aware path
