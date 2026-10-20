@@ -3459,7 +3459,8 @@ mod tests {
         repo.commit_file("tracked.txt", "content\n", "initial");
 
         let error = CliGit.diff_files(&repo.loc(), "bad-revision").unwrap_err();
-        assert!(error.to_string().contains("bad revision"), "{error:#}");
+        // git's own stderr must survive into the error.
+        assert!(error.to_string().contains("'bad-revision'"), "{error:#}");
     }
 
     #[test]
