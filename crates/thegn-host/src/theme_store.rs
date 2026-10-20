@@ -974,7 +974,7 @@ impl Drop for PendingTemp {
 }
 
 fn publish_new(destination: &Path, bytes: &[u8]) -> Result<(), String> {
-    publish_new_with(destination, bytes, std::fs::hard_link)
+    publish_new_with(destination, bytes, |from: &Path, to: &Path| std::fs::hard_link(from, to))
 }
 
 fn publish_new_with<F>(destination: &Path, bytes: &[u8], hard_link: F) -> Result<(), String>
