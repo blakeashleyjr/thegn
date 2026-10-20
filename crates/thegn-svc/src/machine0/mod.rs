@@ -186,6 +186,7 @@ pub struct Machine0Vm {
 struct FlakePlan {
     identity: String,
     remote_ref: String,
+    gen_dir: Option<String>,
     tree: Option<FlakeTree>,
 }
 
@@ -605,7 +606,7 @@ impl Machine0Provider {
         })
         .await
         .context("machine0: flake collection worker failed")??;
-        let (identity, remote_ref) = if let Some(tree) = &tree {
+        let (identity, remote_ref, gen_dir) = if let Some(tree) = &tree {
             let digest = match attr.as_deref() {
                 Some(attribute) => flake_generation_digest(&tree.files, Some(attribute)),
                 None => tree.digest.clone(),
@@ -615,13 +616,18 @@ impl Machine0Provider {
                 Some(attribute) => format!("{gen_dir}#{attribute}"),
                 None => gen_dir,
             };
-            (flake_identity_for(Some(&digest), flake), remote_ref)
+            (
+                flake_identity_for(Some(&digest), flake),
+                remote_ref,
+                Some(gen_dir),
+            )
         } else {
-            (flake_identity_for(None, flake), flake.to_string())
+            (flake_identity_for(None, flake), flake.to_string(), None)
         };
         Ok(Some(FlakePlan {
             identity,
             remote_ref,
+            gen_dir,
             tree,
         }))
     }
@@ -632,16 +638,15 @@ impl Machine0Provider {
     /// rebuild takes minutes.
     async fn provision_nixos_with(&self, name: &str, plan: &FlakePlan) -> Result<()> {
         if let Some(tree) = &plan.tree {
+            let gen_dir = plan
+                .gen_dir
+                .as_deref()
+                .ok_or_else(|| anyhow!("machine0: local flake plan has no generation directory"))?;
             for rel in &tree.skipped {
                 tracing::warn!(path = %rel, "machine0: skipped non-regular flake upload entry");
             }
-            let digest = plan
-                .identity
-                .strip_prefix("tree:")
-                .ok_or_else(|| anyhow!("machine0: local flake plan has an invalid identity"))?;
-            let gen_dir = format!("/root/thegn-provision/{}", &digest[..32]);
             for (rel, bytes) in &tree.files {
-                let remote_path = crate::provider::join_remote(&gen_dir, rel);
+                let remote_path = crate::provider::join_remote(gen_dir, rel);
                 self.write(name, &remote_path, bytes).await?;
             }
         }
