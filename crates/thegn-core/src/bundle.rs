@@ -658,32 +658,76 @@ fn fold_identity(
     }
 }
 
+#[derive(Debug)]
+pub enum DotfilesError {
+    SourceNotDirectory {
+        path: std::path::PathBuf,
+    },
+    HomeUnusable {
+        path: std::path::PathBuf,
+        error: std::io::Error,
+    },
+    SignatureNotRegular {
+        path: std::path::PathBuf,
+    },
+    Sweep(std::io::Error),
+    ReadSource(std::io::Error),
+    Stage(String),
+    Publish(String),
+}
+
+impl std::fmt::Display for DotfilesError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::SourceNotDirectory { path } => write!(
+                f,
+                "bundle: dotfiles source {} is not a directory; skipping",
+                path.display()
+            ),
+            Self::HomeUnusable { path, error } => {
+                write!(
+                    f,
+                    "bundle: cannot create managed HOME {}: {error}",
+                    path.display()
+                )
+            }
+            Self::SignatureNotRegular { path } => write!(
+                f,
+                "bundle: dotfiles signature {} is not a regular file",
+                path.display()
+            ),
+            Self::Sweep(error) => {
+                write!(f, "bundle: cannot sweep dotfile staging residue: {error}")
+            }
+            Self::ReadSource(error) => write!(f, "bundle: cannot read dotfiles source: {error}"),
+            Self::Stage(detail) => write!(f, "bundle: dotfiles staging failed: {detail}"),
+            Self::Publish(detail) => write!(f, "bundle: dotfiles publish failed: {detail}"),
+        }
+    }
+}
+
+impl std::error::Error for DotfilesError {}
+
 /// Materialize a bundle's Tier-2 dotfiles into its managed HOME, idempotently.
 /// I/O — call off the event loop (launch time). Symlinks (or copies, for
 /// `template` mode) each top-level entry of `source` into `dest_home`; a
 /// `meta.json` records the source content-signature so an unchanged source is a
-/// no-op. Best-effort: returns the count materialized, warns and continues on
-/// per-entry errors so a launch never fails on a dotfile glitch.
+/// no-op. A caller must refuse a configured agent/tool launch if this returns
+/// an error.
 pub fn materialize_dotfiles(
     spec: &crate::config::DotfilesSpec,
     dest_home: &std::path::Path,
-) -> usize {
+    residue_owner_alive: &dyn Fn(u32) -> bool,
+) -> Result<usize, DotfilesError> {
     use crate::config::DotfileMode;
     let source = std::path::PathBuf::from(util::expand_tilde(&spec.source));
     if !source.is_dir() {
-        crate::msg::warn(&format!(
-            "bundle: dotfiles source {} is not a directory; skipping",
-            source.display()
-        ));
-        return 0;
+        return Err(DotfilesError::SourceNotDirectory { path: source });
     }
-    if let Err(e) = ensure_managed_home_directories(dest_home) {
-        crate::msg::warn(&format!(
-            "bundle: cannot create managed HOME {}: {e}",
-            dest_home.display()
-        ));
-        return 0;
-    }
+    ensure_managed_home_directories(dest_home).map_err(|error| DotfilesError::HomeUnusable {
+        path: dest_home.to_path_buf(),
+        error,
+    })?;
     // Idempotency: skip when the source signature (entry names + mtimes) is
     // unchanged since the last materialization.
     let sig = dotfiles_signature(&source, spec.mode);
@@ -691,17 +735,11 @@ pub fn materialize_dotfiles(
     if let Ok(metadata) = std::fs::symlink_metadata(&meta)
         && (!metadata.is_file() || metadata.file_type().is_symlink())
     {
-        crate::msg::warn("bundle: dotfiles signature path is not a regular file; skipping");
-        return 0;
+        return Err(DotfilesError::SignatureNotRegular { path: meta });
     }
-    if let Err(error) = sweep_dotfile_residue(dest_home) {
-        crate::msg::warn(&format!(
-            "bundle: cannot sweep dotfile staging residue: {error}"
-        ));
-        return 0;
-    }
+    sweep_dotfile_residue(dest_home, residue_owner_alive).map_err(DotfilesError::Sweep)?;
     if std::fs::read_to_string(&meta).ok().as_deref() == Some(sig.as_str()) {
-        return 0;
+        return Ok(0);
     }
     let generation = dotfile_generation();
     let mut staged = Vec::new();
@@ -709,10 +747,7 @@ pub fn materialize_dotfiles(
     let mut budget = CopyBudget { entries: 0 };
     let entries = match std::fs::read_dir(&source) {
         Ok(e) => e,
-        Err(e) => {
-            crate::msg::warn(&format!("bundle: cannot read dotfiles source: {e}"));
-            return 0;
-        }
+        Err(e) => return Err(DotfilesError::ReadSource(e)),
     };
     for entry in entries {
         let entry = match entry {
@@ -773,8 +808,7 @@ pub fn materialize_dotfiles(
     }
     if let Some(error) = first_error.take() {
         remove_dotfile_stages(&staged);
-        crate::msg::warn(&format!("bundle: dotfiles staging failed: {error}"));
-        return 0;
+        return Err(DotfilesError::Stage(error));
     }
     let mut published = 0;
     for (stage, target, from) in &staged {
@@ -837,13 +871,12 @@ pub fn materialize_dotfiles(
     }
     if let Some(error) = first_error.take() {
         remove_dotfile_stages(&staged);
-        crate::msg::warn(&format!("bundle: dotfiles publish failed: {error}"));
-        return 0;
+        return Err(DotfilesError::Publish(error));
     }
     if let Err(error) = std::fs::write(&meta, sig) {
         tracing::debug!(target: "thegn::bundle", %error, "could not write dotfiles signature");
     }
-    published
+    Ok(published)
 }
 
 fn dotfile_generation() -> String {
@@ -872,12 +905,24 @@ fn remove_path_nofollow(path: &std::path::Path) -> std::io::Result<()> {
     }
 }
 
-fn sweep_dotfile_residue(home: &std::path::Path) -> std::io::Result<()> {
+fn sweep_dotfile_residue(
+    home: &std::path::Path,
+    residue_owner_alive: &dyn Fn(u32) -> bool,
+) -> std::io::Result<()> {
     for entry in std::fs::read_dir(home)? {
         let entry = entry?;
         let name = entry.file_name();
         let name = name.to_string_lossy();
-        if name.starts_with(".thegn-stage-") || name.starts_with(".thegn-old-") {
+        let generation = name
+            .strip_prefix(".thegn-stage-")
+            .or_else(|| name.strip_prefix(".thegn-old-"));
+        if let Some(generation) = generation {
+            let owner_pid = generation
+                .split_once('-')
+                .and_then(|(pid, _)| u32::from_str_radix(pid, 16).ok());
+            if owner_pid.is_some_and(residue_owner_alive) {
+                continue;
+            }
             remove_path_nofollow(&entry.path())?;
         }
     }
@@ -1182,10 +1227,10 @@ mod tests {
             source: "/no/such/dotfiles/dir".into(),
             mode: DotfileMode::Template,
         };
-        assert_eq!(
-            materialize_dotfiles(&missing, std::path::Path::new("/tmp/tg-none")),
-            0
-        );
+        assert!(matches!(
+            materialize_dotfiles(&missing, std::path::Path::new("/tmp/tg-none"), &|_| false),
+            Err(DotfilesError::SourceNotDirectory { .. })
+        ));
 
         // Template mode copies a nested tree into the managed HOME.
         let root = std::env::temp_dir().join(format!("tg-tmpl-{}", util::now()));
@@ -1197,7 +1242,7 @@ mod tests {
             source: src.to_string_lossy().into_owned(),
             mode: DotfileMode::Template,
         };
-        assert_eq!(materialize_dotfiles(&spec, &dest), 1);
+        assert_eq!(materialize_dotfiles(&spec, &dest, &|_| false).unwrap(), 1);
         assert_eq!(std::fs::read(dest.join("nested").join("f")).unwrap(), b"hi");
         std::fs::remove_dir_all(&root).ok(); // best-effort: test cleanup: scratch removal must never fail the test
     }
@@ -1496,7 +1541,10 @@ mod tests {
             mode: DotfileMode::Template,
         };
 
-        assert_eq!(materialize_dotfiles(&spec, &home), 0);
+        assert!(matches!(
+            materialize_dotfiles(&spec, &home, &|_| false),
+            Err(DotfilesError::HomeUnusable { .. })
+        ));
         assert!(std::fs::read_dir(&outside).unwrap().next().is_none());
     }
 
@@ -1518,7 +1566,7 @@ mod tests {
             mode: DotfileMode::Template,
         };
 
-        assert_eq!(materialize_dotfiles(&spec, &home), 1);
+        assert_eq!(materialize_dotfiles(&spec, &home, &|_| false).unwrap(), 1);
         assert_eq!(
             std::fs::read_to_string(real.join("bundles/work/home/.bashrc")).unwrap(),
             "test"
@@ -1541,7 +1589,7 @@ mod tests {
             mode: DotfileMode::Template,
         };
 
-        assert_eq!(materialize_dotfiles(&spec, &home), 1);
+        assert_eq!(materialize_dotfiles(&spec, &home, &|_| false).unwrap(), 1);
         assert_eq!(
             std::fs::read_to_string(home.join(".bashrc")).unwrap(),
             "test"
@@ -1566,7 +1614,10 @@ mod tests {
             mode: DotfileMode::Template,
         };
 
-        assert_eq!(materialize_dotfiles(&spec, &home), 0);
+        assert!(matches!(
+            materialize_dotfiles(&spec, &home, &|_| false),
+            Err(DotfilesError::SignatureNotRegular { .. })
+        ));
         assert_eq!(std::fs::read_to_string(&target).unwrap(), "keep");
         assert!(!home.join(".bashrc").exists());
     }
@@ -1588,7 +1639,10 @@ mod tests {
             mode: DotfileMode::Template,
         };
 
-        assert_eq!(materialize_dotfiles(&spec, &home), 0);
+        assert!(matches!(
+            materialize_dotfiles(&spec, &home, &|_| false),
+            Err(DotfilesError::HomeUnusable { .. })
+        ));
         assert_eq!(std::fs::read_to_string(&slug).unwrap(), "keep");
     }
 
@@ -1610,11 +1664,17 @@ mod tests {
             mode: DotfileMode::Template,
         };
 
-        assert_eq!(materialize_dotfiles(&spec, &home), 0);
+        assert!(matches!(
+            materialize_dotfiles(&spec, &home, &|_| false),
+            Err(DotfilesError::Stage(_))
+        ));
         assert!(!home.join(".bashrc").exists());
         assert!(!home.join("link/secret.txt").exists());
         assert!(!home.join(".thegn-dotfiles.json").exists());
-        assert_eq!(materialize_dotfiles(&spec, &home), 0);
+        assert!(matches!(
+            materialize_dotfiles(&spec, &home, &|_| false),
+            Err(DotfilesError::Stage(_))
+        ));
     }
 
     #[cfg(unix)]
@@ -1635,7 +1695,10 @@ mod tests {
             mode: DotfileMode::Template,
         };
 
-        assert_eq!(materialize_dotfiles(&spec, &home), 0);
+        assert!(matches!(
+            materialize_dotfiles(&spec, &home, &|_| false),
+            Err(DotfilesError::Stage(_))
+        ));
         assert_eq!(
             std::fs::read_to_string(home.join("unsupported")).unwrap(),
             "keep"
@@ -1659,7 +1722,10 @@ mod tests {
             mode: DotfileMode::Template,
         };
 
-        assert_eq!(materialize_dotfiles(&spec, &home), 0);
+        assert!(matches!(
+            materialize_dotfiles(&spec, &home, &|_| false),
+            Err(DotfilesError::Stage(_))
+        ));
         assert!(!home.join(".bashrc").exists());
         assert!(!home.join(".thegn-dotfiles.json").exists());
         assert!(std::fs::read_dir(&home).unwrap().all(|entry| {
@@ -1669,7 +1735,10 @@ mod tests {
                 .to_string_lossy()
                 .starts_with(".thegn-stage-")
         }));
-        assert_eq!(materialize_dotfiles(&spec, &home), 0);
+        assert!(matches!(
+            materialize_dotfiles(&spec, &home, &|_| false),
+            Err(DotfilesError::Stage(_))
+        ));
         assert!(!home.join(".bashrc").exists());
         assert!(!home.join(".thegn-dotfiles.json").exists());
         assert!(std::fs::read_dir(&home).unwrap().all(|entry| {
@@ -1740,10 +1809,10 @@ mod tests {
             mode: DotfileMode::Symlink,
         };
         // First run materializes one entry…
-        assert_eq!(materialize_dotfiles(&spec, &dest), 1);
+        assert_eq!(materialize_dotfiles(&spec, &dest, &|_| false).unwrap(), 1);
         assert!(dest.join(".bashrc").exists());
         // …the second is a no-op (unchanged signature).
-        assert_eq!(materialize_dotfiles(&spec, &dest), 0);
+        assert_eq!(materialize_dotfiles(&spec, &dest, &|_| false).unwrap(), 0);
         std::fs::remove_dir_all(&root).ok(); // best-effort: test cleanup: scratch removal must never fail the test
     }
 
@@ -1759,7 +1828,7 @@ mod tests {
             source: source.to_string_lossy().into_owned(),
             mode: DotfileMode::Template,
         };
-        assert_eq!(materialize_dotfiles(&spec, &home), 1);
+        assert_eq!(materialize_dotfiles(&spec, &home, &|_| false).unwrap(), 1);
         let signature = std::fs::read(home.join(".thegn-dotfiles.json")).unwrap();
 
         std::fs::write(source.join("a.txt"), "two").unwrap();
@@ -1770,7 +1839,10 @@ mod tests {
             std::fs::create_dir(&deep).unwrap();
         }
 
-        assert_eq!(materialize_dotfiles(&spec, &home), 0);
+        assert!(matches!(
+            materialize_dotfiles(&spec, &home, &|_| false),
+            Err(DotfilesError::Stage(_))
+        ));
         assert_eq!(std::fs::read_to_string(home.join("a.txt")).unwrap(), "one");
         assert_eq!(
             std::fs::read(home.join(".thegn-dotfiles.json")).unwrap(),
@@ -1797,7 +1869,7 @@ mod tests {
             source: source.to_string_lossy().into_owned(),
             mode: DotfileMode::Template,
         };
-        assert_eq!(materialize_dotfiles(&spec, &home), 1);
+        assert_eq!(materialize_dotfiles(&spec, &home, &|_| false).unwrap(), 1);
         std::fs::write(home.join(".bash_history"), "runtime").unwrap();
         std::fs::write(source.join("a.txt"), "two").unwrap();
         let modified = std::fs::File::open(source.join("a.txt")).unwrap();
@@ -1805,7 +1877,7 @@ mod tests {
             .set_modified(std::time::SystemTime::now() + std::time::Duration::from_secs(3))
             .unwrap();
 
-        assert_eq!(materialize_dotfiles(&spec, &home), 1);
+        assert_eq!(materialize_dotfiles(&spec, &home, &|_| false).unwrap(), 1);
         assert_eq!(std::fs::read_to_string(home.join("a.txt")).unwrap(), "two");
         assert_eq!(
             std::fs::read_to_string(home.join(".bash_history")).unwrap(),
@@ -1826,10 +1898,13 @@ mod tests {
             source: source.to_string_lossy().into_owned(),
             mode: DotfileMode::Template,
         };
-        assert_eq!(materialize_dotfiles(&spec, &home), 1);
+        assert_eq!(materialize_dotfiles(&spec, &home, &|_| false).unwrap(), 1);
         std::fs::write(home.join(".thegn-stage-x-a.txt"), "residue").unwrap();
 
-        assert_eq!(materialize_dotfiles(&spec, &home), 0);
+        assert!(matches!(
+            materialize_dotfiles(&spec, &home, &|_| false),
+            Ok(0)
+        ));
         assert!(!home.join(".thegn-stage-x-a.txt").exists());
     }
 
@@ -1848,7 +1923,7 @@ mod tests {
             mode: DotfileMode::Template,
         };
 
-        assert_eq!(materialize_dotfiles(&spec, &home), 1);
+        assert_eq!(materialize_dotfiles(&spec, &home, &|_| false).unwrap(), 1);
         assert!(!home.join("cfg/old").exists());
         assert_eq!(
             std::fs::read_to_string(home.join("cfg/new")).unwrap(),
@@ -1885,7 +1960,7 @@ mod tests {
             mode: DotfileMode::Template,
         };
 
-        assert_eq!(materialize_dotfiles(&spec, &home), 2);
+        assert_eq!(materialize_dotfiles(&spec, &home, &|_| false).unwrap(), 2);
         assert_eq!(
             std::fs::read_to_string(home.join("from_file/new")).unwrap(),
             "from file target"
@@ -1920,7 +1995,10 @@ mod tests {
             mode: DotfileMode::Template,
         };
 
-        assert_eq!(materialize_dotfiles(&spec, &home), 0);
+        assert!(matches!(
+            materialize_dotfiles(&spec, &home, &|_| false),
+            Err(DotfilesError::Stage(_))
+        ));
         assert!(!home.join(".thegn-stage-config").exists());
         assert!(!home.join(".thegn-dotfiles.json").exists());
         assert!(std::fs::read_dir(&home).unwrap().all(|entry| {
@@ -2396,5 +2474,130 @@ mod tests {
         set_active(&db, Bind::Global, "/wt", None, "b").unwrap();
         let r = compose(&cfg, &db, "/wt", None, None);
         assert!(get(&r.overrides, "GIT_CONFIG_GLOBAL").is_none());
+    }
+
+    #[test]
+    fn sweep_keeps_live_owner_residue_and_removes_dead_owner_residue() {
+        let root = tempfile::tempdir().unwrap();
+        let home = root.path().join("home");
+        std::fs::create_dir(&home).unwrap();
+        let live = home.join(".thegn-stage-1a2b-0-0-.bashrc");
+        let dead = home.join(".thegn-old-3c4d-0-0-.vimrc");
+        let malformed = home.join(".thegn-stage-zz-junk");
+        for path in [&live, &dead, &malformed] {
+            std::fs::write(path, "residue").unwrap();
+        }
+
+        sweep_dotfile_residue(&home, &|pid| pid == 0x1a2b).unwrap();
+
+        assert!(live.exists());
+        assert!(!dead.exists());
+        assert!(!malformed.exists());
+    }
+
+    #[test]
+    fn materialize_reports_a_typed_error_for_a_non_directory_source() {
+        use crate::config::{DotfileMode, DotfilesSpec};
+        let root = tempfile::tempdir().unwrap();
+        let source_file = root.path().join("source");
+        std::fs::write(&source_file, "not a directory").unwrap();
+        let spec = DotfilesSpec {
+            source: source_file.to_string_lossy().into_owned(),
+            mode: DotfileMode::Template,
+        };
+
+        assert!(matches!(
+            materialize_dotfiles(&spec, &root.path().join("home"), &|_| false),
+            Err(DotfilesError::SourceNotDirectory { .. })
+        ));
+    }
+
+    #[test]
+    fn materialize_reports_publish_failure_instead_of_zero() {
+        use crate::config::{DotfileMode, DotfilesSpec};
+        let root = tempfile::tempdir().unwrap();
+        let source = root.path().join("source");
+        let home = root.path().join("bundle/home");
+        std::fs::create_dir(&source).unwrap();
+        std::fs::write(source.join("entry"), "new file").unwrap();
+        std::fs::create_dir_all(home.join("entry")).unwrap();
+        std::fs::write(home.join("entry/old"), "preserve").unwrap();
+        let spec = DotfilesSpec {
+            source: source.to_string_lossy().into_owned(),
+            mode: DotfileMode::Template,
+        };
+
+        assert!(matches!(
+            materialize_dotfiles(&spec, &home, &|_| false),
+            Err(DotfilesError::Publish(_))
+        ));
+        assert_eq!(
+            std::fs::read_to_string(home.join("entry/old")).unwrap(),
+            "preserve"
+        );
+        assert!(!home.join(".thegn-dotfiles.json").exists());
+    }
+
+    #[test]
+    fn unchanged_source_is_ok_zero() {
+        use crate::config::{DotfileMode, DotfilesSpec};
+        let root = tempfile::tempdir().unwrap();
+        let source = root.path().join("source");
+        let home = root.path().join("bundle/home");
+        std::fs::create_dir(&source).unwrap();
+        std::fs::write(source.join("entry"), "value").unwrap();
+        let spec = DotfilesSpec {
+            source: source.to_string_lossy().into_owned(),
+            mode: DotfileMode::Template,
+        };
+
+        let first = materialize_dotfiles(&spec, &home, &|_| false).unwrap();
+        assert!(first > 0);
+        assert_eq!(materialize_dotfiles(&spec, &home, &|_| false).unwrap(), 0);
+    }
+
+    #[test]
+    fn dotfiles_error_display_prefixes_each_variant() {
+        let path = std::path::PathBuf::from("/bundle/home");
+        let errors = [
+            (
+                DotfilesError::SourceNotDirectory { path: path.clone() },
+                "bundle: dotfiles source",
+            ),
+            (
+                DotfilesError::HomeUnusable {
+                    path: path.clone(),
+                    error: std::io::Error::other("denied"),
+                },
+                "bundle: cannot create managed HOME",
+            ),
+            (
+                DotfilesError::SignatureNotRegular { path },
+                "bundle: dotfiles signature",
+            ),
+            (
+                DotfilesError::Sweep(std::io::Error::other("denied")),
+                "bundle: cannot sweep dotfile staging residue:",
+            ),
+            (
+                DotfilesError::ReadSource(std::io::Error::other("denied")),
+                "bundle: cannot read dotfiles source:",
+            ),
+            (
+                DotfilesError::Stage("denied".into()),
+                "bundle: dotfiles staging failed:",
+            ),
+            (
+                DotfilesError::Publish("denied".into()),
+                "bundle: dotfiles publish failed:",
+            ),
+        ];
+
+        for (error, prefix) in errors {
+            assert!(
+                error.to_string().starts_with(prefix),
+                "{error:?} should display with prefix {prefix:?}"
+            );
+        }
     }
 }

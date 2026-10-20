@@ -3875,13 +3875,28 @@ pub fn launch_spec_full(
         .unwrap_or_default();
     // Credential/HOME dirs the child writes into must exist before launch.
     for dir in &resolved.ensure_dirs {
-        let _ = std::fs::create_dir_all(dir); // best-effort: dir prep: a later write reports the real failure
+        if let Err(error) = std::fs::create_dir_all(dir) {
+            dotfiles_launch_gate(
+                cfg,
+                choice,
+                anyhow::Error::new(error).context(format!("cannot create {dir}")),
+            )?;
+        }
     }
     // Tier-2 dotfiles: materialize each active bundle's dotfile tree into its
     // managed HOME (idempotent, off the event loop — launch_spec is blocking).
     if !loc.is_remote() {
         for (spec, home) in bundle::dotfile_targets(cfg, &resolved) {
-            bundle::materialize_dotfiles(&spec, &home);
+            if let Err(error) = bundle::materialize_dotfiles(&spec, &home, &|pid| {
+                crate::platform::pid_alive(i64::from(pid))
+            }) {
+                dotfiles_launch_gate(
+                    cfg,
+                    choice,
+                    anyhow::Error::new(error)
+                        .context(format!("bundle dotfiles into {}", home.display())),
+                )?;
+            }
         }
     }
     if let Some(spec) = outcome.spec.as_mut() {
@@ -4217,6 +4232,26 @@ pub(crate) fn credential_overlay_gate(
     Ok(())
 }
 
+pub(crate) fn dotfiles_launch_gate(
+    cfg: &Config,
+    choice: &str,
+    failure: anyhow::Error,
+) -> anyhow::Result<()> {
+    let configured = cfg
+        .agents
+        .iter()
+        .chain(cfg.tools.iter())
+        .any(|entry| entry.name == choice);
+    if configured {
+        let detail = format!("{failure:#}");
+        return Err(failure.context(format!(
+            "refusing to launch `{choice}`: its bundle HOME could not be prepared: {detail}"
+        )));
+    }
+    thegn_core::msg::warn(&format!("{failure:#}; the shell launches without it"));
+    Ok(())
+}
+
 /// The persisted slug for a repo root (for per-workspace account defaults), or
 /// `None` if the DB has no slug yet.
 pub(crate) fn repo_slug(db: &Db, repo_root: &Path) -> Option<String> {
@@ -4264,6 +4299,10 @@ mod tests;
 #[cfg(test)]
 #[path = "agent_cleanup_fixture.rs"]
 pub(crate) mod cleanup_fixture;
+
+#[cfg(test)]
+#[path = "agent_dotfiles_tests.rs"]
+mod dotfiles_tests;
 
 #[cfg(test)]
 #[path = "agent_vpn_tests.rs"]
