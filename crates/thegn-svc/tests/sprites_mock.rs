@@ -9,7 +9,7 @@
 //! Run: `cargo test -p thegn-svc --test sprites_mock`.
 
 use std::collections::HashMap;
-use std::io::{BufReader, Read, Write};
+use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -20,10 +20,8 @@ use thegn_svc::provider::{
 };
 
 /// A tiny stateful fs the mock serves so `/fs/write` → `/fs/read` round-trips
-/// (needed for the content-handshake `ensure_executable`). Keyed by the raw
-/// (still-percent-encoded) `path=` query value — `write` and `read` encode the
-/// same logical path identically (same reqwest serialization), so they match
-/// without decoding.
+/// (needed for SHA-256 verification in `ensure_executable`). Paths are decoded
+/// from the query string so exec commands and fs requests address the same file.
 type FsState = Arc<Mutex<HashMap<String, Vec<u8>>>>;
 
 #[derive(Clone, Debug)]
@@ -59,19 +57,18 @@ fn start_mock() -> Mock {
     }
 }
 
-/// The raw (encoded) value of the `path=` query param, if present.
+/// The decoded value of the `path=` query param, if present.
 fn query_path(target: &str) -> Option<String> {
-    let q = target.split('?').nth(1)?;
-    q.split('&')
-        .find_map(|kv| kv.strip_prefix("path=").map(str::to_string))
+    let q = target.split_once('?')?.1;
+    url::form_urlencoded::parse(q.as_bytes())
+        .find_map(|(key, value)| (key == "path").then(|| value.into_owned()))
 }
 
 fn handle(stream: TcpStream, rec: Arc<Mutex<Vec<Recorded>>>, fs: FsState) {
-    let mut writer = stream.try_clone().unwrap();
-    let mut reader = BufReader::new(stream);
     // Request line.
     let mut line = String::new();
-    if read_line(&mut reader, &mut line).is_none() {
+    let mut stream = stream;
+    if read_line(&mut stream, &mut line).is_none() {
         return;
     }
     let mut parts = line.split_whitespace();
@@ -80,9 +77,10 @@ fn handle(stream: TcpStream, rec: Arc<Mutex<Vec<Recorded>>>, fs: FsState) {
     // Headers.
     let mut content_length = 0usize;
     let mut auth = String::new();
+    let mut headers = HashMap::new();
     loop {
         let mut h = String::new();
-        if read_line(&mut reader, &mut h).is_none() {
+        if read_line(&mut stream, &mut h).is_none() {
             break;
         }
         let t = h.trim_end();
@@ -90,6 +88,9 @@ fn handle(stream: TcpStream, rec: Arc<Mutex<Vec<Recorded>>>, fs: FsState) {
             break;
         }
         let lower = t.to_ascii_lowercase();
+        if let Some((name, value)) = t.split_once(':') {
+            headers.insert(name.trim().to_ascii_lowercase(), value.trim().to_string());
+        }
         if let Some(v) = lower.strip_prefix("content-length:") {
             content_length = v.trim().parse().unwrap_or(0);
         }
@@ -99,7 +100,9 @@ fn handle(stream: TcpStream, rec: Arc<Mutex<Vec<Recorded>>>, fs: FsState) {
     }
     let mut body = vec![0u8; content_length];
     if content_length > 0 {
-        let _ = reader.read_exact(&mut body); // best-effort: client may have disconnected
+        if stream.read_exact(&mut body).is_err() {
+            return;
+        }
     }
     rec.lock().unwrap().push(Recorded {
         method: method.clone(),
@@ -107,6 +110,10 @@ fn handle(stream: TcpStream, rec: Arc<Mutex<Vec<Recorded>>>, fs: FsState) {
         body: body.clone(),
         auth,
     });
+    if method == "GET" && path.starts_with("/v1/sprites/tgtest1/exec?") {
+        handle_exec_websocket(stream, &headers, &path, &fs);
+        return;
+    }
     // Stateful fs: writes store by the `path=` query, reads serve them back (404
     // when absent). Everything else falls to the recorded-response router.
     let (status, ctype, resp) = if method == "PUT" && path.contains("/fs/write") {
@@ -130,14 +137,14 @@ fn handle(stream: TcpStream, rec: Arc<Mutex<Vec<Recorded>>>, fs: FsState) {
         "HTTP/1.1 {status}\r\nContent-Type: {ctype}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
         resp.len()
     );
-    let _ = writer.write_all(head.as_bytes()); // best-effort: client may have disconnected
-    let _ = writer.write_all(&resp); // best-effort: client may have disconnected
-    let _ = writer.flush(); // best-effort: client may have disconnected
+    let _ = stream.write_all(head.as_bytes()); // best-effort: client may have disconnected
+    let _ = stream.write_all(&resp); // best-effort: client may have disconnected
+    let _ = stream.flush(); // best-effort: client may have disconnected
 }
 
 /// Read a single CRLF-terminated line from the reader (byte at a time — the
 /// bodies are binary, so we can't wrap the whole stream in line-buffered text).
-fn read_line(reader: &mut BufReader<TcpStream>, out: &mut String) -> Option<()> {
+fn read_line(reader: &mut TcpStream, out: &mut String) -> Option<()> {
     let mut byte = [0u8; 1];
     loop {
         match reader.read(&mut byte) {
@@ -150,6 +157,73 @@ fn read_line(reader: &mut BufReader<TcpStream>, out: &mut String) -> Option<()> 
             }
             Err(_) => return None,
         }
+    }
+}
+
+/// Complete the Sprites exec WebSocket handshake and emulate the `mv -f --`
+/// used to publish a staged executable. The two binary frames mirror the
+/// provider's non-tty stdout and exit-status framing.
+fn handle_exec_websocket(
+    mut stream: TcpStream,
+    headers: &HashMap<String, String>,
+    target: &str,
+    fs: &FsState,
+) {
+    let Some(key) = headers.get("sec-websocket-key") else {
+        return;
+    };
+    let accept = tokio_tungstenite::tungstenite::handshake::derive_accept_key(key.as_bytes());
+    let response = format!(
+        "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: {accept}\r\n\r\n"
+    );
+    if stream.write_all(response.as_bytes()).is_err() {
+        return;
+    }
+
+    use tokio_tungstenite::tungstenite::protocol::{Role, WebSocket};
+    let mut socket = WebSocket::from_raw_socket(stream, Role::Server, None);
+    let args: Vec<String> = target
+        .split_once('?')
+        .map(|(_, query)| {
+            url::form_urlencoded::parse(query.as_bytes())
+                .filter_map(|(key, value)| (key == "cmd").then(|| value.into_owned()))
+                .collect()
+        })
+        .unwrap_or_default();
+    let (code, output) = if args.len() == 5 && args[0] == "mv" && args[1] == "-f" && args[2] == "--"
+    {
+        let stage = &args[3];
+        let destination = &args[4];
+        let mut files = fs.lock().unwrap();
+        match files.remove(stage) {
+            Some(bytes) => {
+                files.insert(destination.clone(), bytes);
+                (0, String::new())
+            }
+            None => (1, "missing staging file".to_string()),
+        }
+    } else {
+        (1, format!("unexpected exec command: {args:?}"))
+    };
+    if !output.is_empty() {
+        let mut frame = vec![1];
+        frame.extend_from_slice(output.as_bytes());
+        if socket
+            .send(tokio_tungstenite::tungstenite::Message::Binary(
+                frame.into(),
+            ))
+            .is_err()
+        {
+            return;
+        }
+    }
+    let mut exit = vec![3];
+    exit.extend_from_slice(code.to_string().as_bytes());
+    if socket
+        .send(tokio_tungstenite::tungstenite::Message::Binary(exit.into()))
+        .is_err()
+    {
+        return;
     }
 }
 
@@ -661,27 +735,27 @@ fn ensure_executable_pushes_once_then_idempotent() {
     let bin = b"fake-thegn-musl-binary";
     let path = "/workspace/.tg/thegn";
 
-    // First install: no fingerprint stored → pushes the binary + .fp, returns true.
+    // First install: missing remote binary → stages, verifies, and publishes it.
     assert!(
         rt.block_on(prov.ensure_executable("tgtest1", path, bin))
             .unwrap(),
         "first ensure should push"
     );
-    // Second with identical bytes: the stored .fp matches → no-op, returns false.
+    // Second with identical bytes: the verified remote SHA-256 matches, so no upload.
     assert!(
         !rt.block_on(prov.ensure_executable("tgtest1", path, bin))
             .unwrap(),
         "second ensure (same bytes) should be a no-op"
     );
-    // Changed bytes → fingerprint mismatch → re-pushes.
+    // Changed bytes → SHA-256 mismatch → re-stages and publishes.
     assert!(
         rt.block_on(prov.ensure_executable("tgtest1", path, b"different-bytes"))
             .unwrap(),
         "changed bytes should re-push"
     );
 
-    // The 0755 binary write happened exactly twice (first + after change), never
-    // on the idempotent no-op.
+    // The 0755 staged binary write happened exactly twice (first + after
+    // change), never on the idempotent no-op.
     let reqs = mock.recorded.lock().unwrap().clone();
     let exec_writes = reqs
         .iter()
