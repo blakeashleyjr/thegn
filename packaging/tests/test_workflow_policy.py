@@ -3,6 +3,7 @@ from __future__ import annotations
 import base64
 import hashlib
 import os
+import re
 import shutil
 import subprocess
 import tempfile
@@ -52,13 +53,15 @@ class WorkflowPolicyTests(unittest.TestCase):
 
     def test_external_publication_uses_trusted_workflow_checkout(self) -> None:
         workflow = read_workflow("release.yml")
-        checkouts = [
-            step
-            for step in workflow["jobs"]["publish-external"]["steps"]
-            if step.get("uses", "").startswith("actions/checkout@")
-        ]
-        self.assertEqual(1, len(checkouts))
-        self.assertNotIn("ref", checkouts[0].get("with", {}))
+        for job_name in ("publish-homebrew", "publish-aur", "aur-srcinfo"):
+            checkouts = [
+                step
+                for step in workflow["jobs"][job_name]["steps"]
+                if step.get("uses", "").startswith("actions/checkout@")
+            ]
+            with self.subTest(job=job_name):
+                self.assertEqual(1, len(checkouts))
+                self.assertNotIn("ref", checkouts[0].get("with", {}))
 
     def test_no_workflow_trusts_first_seen_host_keys(self) -> None:
         for path in sorted((ROOT / ".github" / "workflows").rglob("*.yml")):
@@ -68,22 +71,25 @@ class WorkflowPolicyTests(unittest.TestCase):
                 self.assertNotIn("StrictHostKeyChecking=no", content)
 
     def test_external_publication_pins_host_keys(self) -> None:
-        steps = read_workflow("release.yml")["jobs"]["publish-external"]["steps"]
-        ssh_scripts = [
-            step.get("run", "")
-            for step in steps
-            if "ssh -i" in step.get("run", "")
-        ]
-        self.assertTrue(ssh_scripts, "publication must contain SSH commands")
-        for script in ssh_scripts:
-            for required in (
-                "StrictHostKeyChecking=yes",
-                "UserKnownHostsFile=",
-                ".github/known_hosts",
-                "GlobalKnownHostsFile=/dev/null",
-            ):
-                with self.subTest(required=required):
-                    self.assertIn(required, script)
+        jobs = read_workflow("release.yml")["jobs"]
+        for job_name in ("publish-homebrew", "publish-aur"):
+            steps = jobs[job_name]["steps"]
+            ssh_scripts = [
+                step.get("run", "")
+                for step in steps
+                if "ssh -i" in step.get("run", "")
+            ]
+            with self.subTest(job=job_name):
+                self.assertTrue(ssh_scripts, "publication must contain SSH commands")
+                for script in ssh_scripts:
+                    for required in (
+                        "StrictHostKeyChecking=yes",
+                        "UserKnownHostsFile=",
+                        ".github/known_hosts",
+                        "GlobalKnownHostsFile=/dev/null",
+                    ):
+                        with self.subTest(required=required):
+                            self.assertIn(required, script)
 
     def test_committed_known_hosts_match_published_fingerprints(self) -> None:
         known_hosts = ROOT / ".github" / "known_hosts"
@@ -215,6 +221,89 @@ class WorkflowPolicyTests(unittest.TestCase):
             'git archive "$TRUSTED_WORKFLOW_SHA" .github/actions/ci-setup', script
         )
         self.assertIn("rm -rf .github/actions/ci-setup", script)
+
+    def test_no_job_holds_both_deploy_keys(self) -> None:
+        jobs = read_workflow("release.yml")["jobs"]
+        serialized = {name: yaml.safe_dump(job) for name, job in jobs.items()}
+        for name, job_text in serialized.items():
+            with self.subTest(job=name):
+                self.assertFalse(
+                    "HOMEBREW_TAP_DEPLOY_KEY" in job_text
+                    and "AUR_DEPLOY_KEY" in job_text
+                )
+        for key_name in ("HOMEBREW_TAP_DEPLOY_KEY", "AUR_DEPLOY_KEY"):
+            containing_jobs = [
+                name for name, job_text in serialized.items() if key_name in job_text
+            ]
+            expected = "publish-homebrew" if key_name.startswith("HOMEBREW") else "publish-aur"
+            self.assertEqual([expected], containing_jobs)
+
+    def test_makepkg_runs_only_in_credential_free_job(self) -> None:
+        jobs = read_workflow("release.yml")["jobs"]
+        makepkg_jobs = {
+            name
+            for name, job in jobs.items()
+            if "makepkg" in yaml.safe_dump(job)
+        }
+        self.assertEqual({"aur-srcinfo"}, makepkg_jobs)
+        job = jobs["aur-srcinfo"]
+        self.assertNotIn("environment", job)
+        self.assertEqual({"contents": "read"}, job.get("permissions"))
+        self.assertNotIn("secrets.", yaml.safe_dump(job))
+
+    def test_publish_jobs_use_distinct_environments(self) -> None:
+        jobs = read_workflow("release.yml")["jobs"]
+        homebrew_environment = jobs["publish-homebrew"].get("environment")
+        aur_environment = jobs["publish-aur"].get("environment")
+        self.assertTrue(homebrew_environment)
+        self.assertTrue(aur_environment)
+        self.assertNotEqual(homebrew_environment, aur_environment)
+
+    def test_publish_aur_consumes_srcinfo_artifact(self) -> None:
+        job = read_workflow("release.yml")["jobs"]["publish-aur"]
+        self.assertIn("aur-srcinfo", job.get("needs", []))
+        steps = job.get("steps", [])
+        downloads = [
+            step for step in steps
+            if step.get("uses", "").startswith("actions/download-artifact@")
+        ]
+        self.assertEqual(1, len(downloads))
+        self.assertEqual("aur-metadata", downloads[0].get("with", {}).get("name"))
+        srcinfo_job = read_workflow("release.yml")["jobs"]["aur-srcinfo"]
+        uploads = [
+            step for step in srcinfo_job.get("steps", [])
+            if step.get("uses", "").startswith("actions/upload-artifact@")
+        ]
+        self.assertEqual(1, len(uploads))
+        self.assertEqual("aur-metadata", uploads[0].get("with", {}).get("name"))
+        self.assertIs(uploads[0].get("with", {}).get("include-hidden-files"), True)
+        job_text = yaml.safe_dump(job)
+        self.assertNotIn("makepkg", job_text)
+        self.assertNotRegex(job_text, r"(?m)\bsource\s+[^\n]*PKGBUILD")
+        validation = next(
+            step for step in steps
+            if step.get("name") == "Require exactly the generated AUR metadata files"
+        )
+        validation_script = validation.get("run", "")
+        self.assertIn("LC_ALL=C sort", validation_script)
+        self.assertIn('[ -L "$RUNNER_TEMP/aur-metadata/.SRCINFO" ]', validation_script)
+        self.assertIn('[ -L "$RUNNER_TEMP/aur-metadata/PKGBUILD" ]', validation_script)
+
+    def test_publish_roots_live_under_runner_temp(self) -> None:
+        jobs = read_workflow("release.yml")["jobs"]
+        for name in ("publish-homebrew", "publish-aur", "aur-srcinfo"):
+            job = jobs[name]
+            for step in job.get("steps", []):
+                script = step.get("run", "")
+                if "mktemp -d" in script:
+                    with self.subTest(job=name, step=step.get("name")):
+                        for match in re.findall(
+                            r'mktemp -d(?:\s+("?[^\s)]+))?', script
+                        ):
+                            self.assertTrue(
+                                match.lstrip('"').startswith("$RUNNER_TEMP/"),
+                                f"mktemp directory must be under RUNNER_TEMP: {match!r}",
+                            )
 
     def test_sandbox_publication_is_serialized(self) -> None:
         workflow = read_workflow("sandbox-image.yml")
