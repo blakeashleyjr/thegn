@@ -1742,6 +1742,14 @@ pub(crate) fn verify_v88_schema(conn: &Connection) -> Result<()> {
             bail!("schema v88 migration did not add dispatch_capabilities.{column}");
         }
     }
+    let dispatch_index_exists: bool = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='index' AND name=?1)",
+        ["idx_dispatch_capabilities_dispatch"],
+        |row| row.get(0),
+    )?;
+    if !dispatch_index_exists {
+        bail!("schema v88 migration did not add idx_dispatch_capabilities_dispatch");
+    }
     Ok(())
 }
 
@@ -2675,6 +2683,11 @@ mod tests {
             |row| row.get(0),
         ).unwrap();
         assert_eq!(index_exists, 1);
+        conn.execute_batch("DROP INDEX idx_dispatch_capabilities_dispatch;")
+            .unwrap();
+        assert!(super::verify_v88_schema(&conn).is_err());
+        super::migrate_v88(&conn).unwrap();
+        super::verify_v88_schema(&conn).unwrap();
 
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("upgrade-v87.db");
