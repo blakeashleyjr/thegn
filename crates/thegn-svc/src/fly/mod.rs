@@ -666,25 +666,43 @@ impl RemoteProvider for FlyProvider {
                 admitted.image.is_prebaked(),
                 self.spec.iroh.as_ref(),
             );
-            // Spend guardrail (ledger-based, covers in-flight creates).
-            let managed = self.ledger_names().len();
-            if managed >= self.spec.max_instances() {
-                return Err(anyhow!(
-                    "fly: {managed} managed machines already exist (max_instances = {}); \
-                     destroy one or raise `[env.<name>.provider] max_instances`",
-                    self.spec.max_instances()
-                ));
-            }
-            let app = app_name(&name);
-            // Intent BEFORE create — the crash-leak window closes here.
-            registry::write(&registry::VpsRecord {
+            // Atomically reserve capacity and publish the intent before a
+            // resource-creating call. Locking and ledger I/O stay off the runtime.
+            let intent = registry::VpsRecord {
                 name: name.clone(),
                 provider: LEDGER_PROVIDER.into(),
                 state: "creating".into(),
                 instance_id: String::new(),
                 ip: String::new(),
                 created_at: thegn_core::util::now(),
-            })?;
+            };
+            let cap = self.spec.max_instances();
+            let reservation_name = name.clone();
+            let reserve_result = tokio::task::spawn_blocking(move || {
+                registry::reserve(
+                    &intent,
+                    cap,
+                    registry::ReserveScope::Provider(LEDGER_PROVIDER),
+                )
+                .map(|()| registry::IntentGuard::new(&reservation_name))
+            })
+            .await
+            .context("fly: reservation worker failed")?;
+            let mut intent_guard = match reserve_result {
+                Ok(guard) => guard,
+                Err(registry::ReserveError::AtCap { occupied, cap }) => {
+                    return Err(anyhow!(
+                        "fly: {occupied} managed machines already exist (max_instances = {cap}); \
+                         destroy one or raise `[env.<name>.provider] max_instances`"
+                    ));
+                }
+                Err(registry::ReserveError::Store(error)) => {
+                    return Err(
+                        error.context("fly: could not reserve ledger capacity; refusing to create")
+                    );
+                }
+            };
+            let app = app_name(&name);
 
             // `ensure_app` is the FIRST resource-creating call: until it succeeds no
             // billable resource exists, so a 4xx there ⇒ "nothing created" and the
@@ -696,6 +714,7 @@ impl RemoteProvider for FlyProvider {
             // best-effort delete the app (cascading machine + IP) and only clear the
             // record if that delete succeeds; otherwise the record stays so destroy/
             // the reaper can reconcile the leak.
+            intent_guard.preserve();
             if let Err(e) = self.ensure_app(&app, &admitted.org_slug).await {
                 if e.to_string().contains("failed (4") {
                     registry::remove(&name);
