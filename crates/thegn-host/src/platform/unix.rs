@@ -154,15 +154,6 @@ pub fn pid_alive(pid: i64) -> bool {
         && nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid as i32), None).is_ok()
 }
 
-/// Best-effort graceful termination of a single process (`SIGTERM`).
-pub fn terminate_pid(pid: u32) {
-    let Some(pid) = checked_positive_pid(pid) else {
-        return;
-    };
-    // best-effort: signal: the process may already be gone
-    nix::sys::signal::kill(pid, nix::sys::signal::Signal::SIGTERM).ok();
-}
-
 /// Read Linux's process-start identity (`/proc/<pid>/stat`, field 22).
 ///
 /// The `comm` field is parenthesized and may contain spaces or `)`, so parse
@@ -484,8 +475,8 @@ pub fn terminate_proxy_pid(pid: u32, expected_start_time: Option<u64>) -> bool {
 }
 
 /// Deliver `sig` to `pid` after the caller's identity check, surfacing the
-/// outcome. Unlike [`terminate_pid`] the
-/// result is returned rather than swallowed, so the monitor's Processes tab can
+/// outcome. Unlike the legacy best-effort termination helper, the result is
+/// returned rather than swallowed, so the monitor's Processes tab can
 /// show a `no such process` / `permission denied` failure instead of pretending
 /// the signal landed. Refuses pid 0 (`kill(0, …)` would hit the whole process
 /// group — never the intent of a single-row action).
