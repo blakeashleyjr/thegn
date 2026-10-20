@@ -171,6 +171,31 @@ fn rebase_with_todo(
     todo: &[TodoEntry],
     opts: &RebaseOpts,
 ) -> Result<RebaseOutcome> {
+    with_rebase_txn(loc, &["rebase", "-i"], super::MUTATION_LOCK_WAIT, || {
+        rebase_with_todo_inner(loc, base, todo, opts)
+    })
+}
+
+fn with_rebase_txn<T>(
+    loc: &GitLoc,
+    args: &[&str],
+    wait: Duration,
+    f: impl FnOnce() -> Result<T>,
+) -> Result<T> {
+    let _txn = if !loc.is_remote() && crate::bridge::for_loc(loc).is_none() {
+        super::begin_mutation_txn(loc, args, wait)?
+    } else {
+        None
+    };
+    f()
+}
+
+fn rebase_with_todo_inner(
+    loc: &GitLoc,
+    base: &str,
+    todo: &[TodoEntry],
+    opts: &RebaseOpts,
+) -> Result<RebaseOutcome> {
     if let Some(entry) = todo.iter().find(|entry| entry.action.is_commit())
         && matches!(
             &entry.action,
@@ -245,9 +270,9 @@ fn rebase_with_todo(
                 cleanup_path = Some(scratch.clone());
             }
             _ => {
-                cleanup_path = Some(scratch.clone());
-                loc.write_git_path(&scratch_name, serialize_todo(todo).as_bytes())
+                loc.write_git_path_new(&scratch_name, serialize_todo(todo).as_bytes())
                     .context("write prepared rebase todo")?;
+                cleanup_path = Some(scratch.clone());
             }
         }
         let editor = format!("cp {}", sh_quote(&scratch));
@@ -419,42 +444,14 @@ pub trait RebaseOps: GitBackend {
         action: TodoAction,
         opts: &RebaseOpts,
     ) -> Result<RebaseOutcome> {
-        let is_fold = matches!(
-            &action,
-            TodoAction::Squash | TodoAction::Fixup | TodoAction::FixupC
-        );
-        let is_target = if is_fold {
-            let oldest_id = run_read(
-                loc,
-                &["rev-parse", "--verify", &format!("{oldest_sha}^{{commit}}")],
-            )?;
-            let mut found = false;
-            for target in targets {
-                let target_id = run_read(
-                    loc,
-                    &["rev-parse", "--verify", &format!("{target}^{{commit}}")],
-                )?;
-                if target_id.trim() == oldest_id.trim() {
-                    found = true;
-                    break;
-                }
-            }
-            found
-        } else {
-            false
-        };
-        let base = if is_target {
-            let parent = base_for(loc, oldest_sha)?;
-            if parent == "--root" {
-                bail!("cannot squash/fixup the root commit: it has no previous commit");
-            }
-            base_for(loc, &parent)?
-        } else {
-            base_for(loc, oldest_sha)?
-        };
-        let todo = todo_for(loc, &base)?;
-        let todo = retag(&todo, targets, action)?;
-        rebase_with_todo(loc, &base, &todo, opts)
+        rebase_retag_within(
+            loc,
+            oldest_sha,
+            targets,
+            action,
+            opts,
+            super::MUTATION_LOCK_WAIT,
+        )
     }
 
     /// Once-off: move `sha` one position up (older) or down (newer).
@@ -465,17 +462,19 @@ pub trait RebaseOps: GitBackend {
         up: bool,
         opts: &RebaseOpts,
     ) -> Result<RebaseOutcome> {
-        // Span one commit further back than the target so an upward move has
-        // somewhere to go.
-        let parent = base_for(loc, sha)?;
-        let base = if parent == "--root" {
-            parent
-        } else {
-            base_for(loc, &parent)?
-        };
-        let todo = todo_for(loc, &base)?;
-        let todo = thegn_core::rebase_todo::move_entry(&todo, sha, up)?;
-        rebase_with_todo(loc, &base, &todo, opts)
+        with_rebase_txn(loc, &["rebase", "-i"], super::MUTATION_LOCK_WAIT, || {
+            // Span one commit further back than the target so an upward move has
+            // somewhere to go.
+            let parent = base_for(loc, sha)?;
+            let base = if parent == "--root" {
+                parent
+            } else {
+                base_for(loc, &parent)?
+            };
+            let todo = todo_for(loc, &base)?;
+            let todo = thegn_core::rebase_todo::move_entry(&todo, sha, up)?;
+            rebase_with_todo(loc, &base, &todo, opts)
+        })
     }
 
     /// Reword a commit. HEAD rewords amend in place; older commits stop at
@@ -485,64 +484,7 @@ pub trait RebaseOps: GitBackend {
     /// parked in a staged-only stash for the duration and restored — still
     /// staged — via `stash pop --index`.
     fn reword(&self, loc: &GitLoc, sha: &str, message: &str, opts: &RebaseOpts) -> Result<()> {
-        op::revision(sha)?;
-        let head = loc
-            .git_out(&["rev-parse", "HEAD"])
-            .ok_or_else(|| anyhow!("no HEAD"))?;
-        let is_head = head.starts_with(sha) || sha.starts_with(&head);
-        let amend = |loc: &GitLoc| -> Result<()> {
-            let mut args = gpg_args(opts.override_gpg).to_vec();
-            args.extend([
-                "commit",
-                "--amend",
-                "--only",
-                "--allow-empty",
-                "--no-verify",
-                "-m",
-                message,
-            ]);
-            run_w(loc, &[], &args).map(|_| ())
-        };
-        if is_head {
-            return amend(loc);
-        }
-        let staged = loc
-            .git_command(&["diff", "--cached", "--quiet"])
-            .output()
-            .map(|o| !o.status.success())
-            .unwrap_or(false);
-        if staged {
-            let args = ["stash", "push", "--staged", "--quiet", "-m", "thegn reword"];
-            run_w(loc, &[], &args).context("park staged changes for the reword rebase")?;
-        }
-        let rewrite = || -> Result<()> {
-            let base = base_for(loc, sha)?;
-            let todo = todo_for(loc, &base)?;
-            let todo = retag(&todo, &[sha], TodoAction::Edit)?;
-            match rebase_with_todo(loc, &base, &todo, opts)? {
-                RebaseOutcome::Paused => {}
-                RebaseOutcome::Conflict => bail!("rebase hit a conflict before the reword stop"),
-                RebaseOutcome::Done => bail!("rebase did not stop at the commit to reword"),
-            }
-            amend(loc)?;
-            match self.rebase_continue(loc)? {
-                RebaseOutcome::Done => Ok(()),
-                RebaseOutcome::Conflict => {
-                    bail!("conflict while replaying commits after the reword")
-                }
-                RebaseOutcome::Paused => bail!("rebase paused unexpectedly after the reword"),
-            }
-        };
-        let res = rewrite();
-        if staged {
-            // Best-effort on the error path (a conflicted worktree cannot
-            // take the pop); the stash stays recoverable either way.
-            let pop = run_w(loc, &[], &["stash", "pop", "--index", "--quiet"]);
-            if res.is_ok() {
-                pop.context("restore parked staged changes after the reword")?;
-            }
-        }
-        res
+        reword_within(self, loc, sha, message, opts, super::MUTATION_LOCK_WAIT)
     }
 
     /// Amend an old commit with the currently staged changes: a fixup commit
@@ -554,25 +496,32 @@ pub trait RebaseOps: GitBackend {
         target: &str,
         opts: &RebaseOpts,
     ) -> Result<RebaseOutcome> {
-        let staged = loc
-            .git_command(&["diff", "--cached", "--quiet"])
-            .output()
-            .map(|o| !o.status.success())
-            .unwrap_or(false);
-        if !staged {
-            bail!("nothing staged to amend into the commit");
-        }
-        let mut args = gpg_args(opts.override_gpg).to_vec();
-        let fixup = format!("--fixup={target}");
-        args.extend(["commit", "--no-verify", &fixup]);
-        run_w(loc, &[], &args)?;
-        let fixup_sha = loc
-            .git_out(&["rev-parse", "HEAD"])
-            .ok_or_else(|| anyhow!("no HEAD after fixup commit"))?;
-        let base = base_for(loc, target)?;
-        let todo = todo_for(loc, &base)?;
-        let todo = place_fixup(&todo, &fixup_sha, target)?;
-        rebase_with_todo(loc, &base, &todo, opts)
+        with_rebase_txn(
+            loc,
+            &["commit", "--fixup"],
+            super::MUTATION_LOCK_WAIT,
+            || {
+                let staged = loc
+                    .git_command(&["diff", "--cached", "--quiet"])
+                    .output()
+                    .map(|o| !o.status.success())
+                    .unwrap_or(false);
+                if !staged {
+                    bail!("nothing staged to amend into the commit");
+                }
+                let mut args = gpg_args(opts.override_gpg).to_vec();
+                let fixup = format!("--fixup={target}");
+                args.extend(["commit", "--no-verify", &fixup]);
+                run_w(loc, &[], &args)?;
+                let fixup_sha = loc
+                    .git_out(&["rev-parse", "HEAD"])
+                    .ok_or_else(|| anyhow!("no HEAD after fixup commit"))?;
+                let base = base_for(loc, target)?;
+                let todo = todo_for(loc, &base)?;
+                let todo = place_fixup(&todo, &fixup_sha, target)?;
+                rebase_with_todo(loc, &base, &todo, opts)
+            },
+        )
     }
 
     /// Rebase the current branch onto `target`, replaying only the commits
@@ -682,6 +631,124 @@ pub trait RebaseOps: GitBackend {
     }
 }
 
+fn rebase_retag_within(
+    loc: &GitLoc,
+    oldest_sha: &str,
+    targets: &[&str],
+    action: TodoAction,
+    opts: &RebaseOpts,
+    wait: Duration,
+) -> Result<RebaseOutcome> {
+    with_rebase_txn(loc, &["rebase", "-i"], wait, || {
+        let is_fold = matches!(
+            &action,
+            TodoAction::Squash | TodoAction::Fixup | TodoAction::FixupC
+        );
+        let is_target = if is_fold {
+            let oldest_id = run_read(
+                loc,
+                &["rev-parse", "--verify", &format!("{oldest_sha}^{{commit}}")],
+            )?;
+            let mut found = false;
+            for target in targets {
+                let target_id = run_read(
+                    loc,
+                    &["rev-parse", "--verify", &format!("{target}^{{commit}}")],
+                )?;
+                if target_id.trim() == oldest_id.trim() {
+                    found = true;
+                    break;
+                }
+            }
+            found
+        } else {
+            false
+        };
+        let base = if is_target {
+            let parent = base_for(loc, oldest_sha)?;
+            if parent == "--root" {
+                bail!("cannot squash/fixup the root commit: it has no previous commit");
+            }
+            base_for(loc, &parent)?
+        } else {
+            base_for(loc, oldest_sha)?
+        };
+        let todo = todo_for(loc, &base)?;
+        let todo = retag(&todo, targets, action)?;
+        rebase_with_todo(loc, &base, &todo, opts)
+    })
+}
+
+fn reword_within<T: RebaseOps + ?Sized>(
+    backend: &T,
+    loc: &GitLoc,
+    sha: &str,
+    message: &str,
+    opts: &RebaseOpts,
+    wait: Duration,
+) -> Result<()> {
+    with_rebase_txn(loc, &["rebase", "-i"], wait, || {
+        op::revision(sha)?;
+        let head = loc
+            .git_out(&["rev-parse", "HEAD"])
+            .ok_or_else(|| anyhow!("no HEAD"))?;
+        let is_head = head.starts_with(sha) || sha.starts_with(&head);
+        let amend = |loc: &GitLoc| -> Result<()> {
+            let mut args = gpg_args(opts.override_gpg).to_vec();
+            args.extend([
+                "commit",
+                "--amend",
+                "--only",
+                "--allow-empty",
+                "--no-verify",
+                "-m",
+                message,
+            ]);
+            run_w(loc, &[], &args).map(|_| ())
+        };
+        if is_head {
+            return amend(loc);
+        }
+        let staged = loc
+            .git_command(&["diff", "--cached", "--quiet"])
+            .output()
+            .map(|o| !o.status.success())
+            .unwrap_or(false);
+        if staged {
+            let args = ["stash", "push", "--staged", "--quiet", "-m", "thegn reword"];
+            run_w(loc, &[], &args).context("park staged changes for the reword rebase")?;
+        }
+        let rewrite = || -> Result<()> {
+            let base = base_for(loc, sha)?;
+            let todo = todo_for(loc, &base)?;
+            let todo = retag(&todo, &[sha], TodoAction::Edit)?;
+            match rebase_with_todo(loc, &base, &todo, opts)? {
+                RebaseOutcome::Paused => {}
+                RebaseOutcome::Conflict => bail!("rebase hit a conflict before the reword stop"),
+                RebaseOutcome::Done => bail!("rebase did not stop at the commit to reword"),
+            }
+            amend(loc)?;
+            match backend.rebase_continue(loc)? {
+                RebaseOutcome::Done => Ok(()),
+                RebaseOutcome::Conflict => {
+                    bail!("conflict while replaying commits after the reword")
+                }
+                RebaseOutcome::Paused => bail!("rebase paused unexpectedly after the reword"),
+            }
+        };
+        let res = rewrite();
+        if staged {
+            // Best-effort on the error path (a conflicted worktree cannot
+            // take the pop); the stash stays recoverable either way.
+            let pop = run_w(loc, &[], &["stash", "pop", "--index", "--quiet"]);
+            if res.is_ok() {
+                pop.context("restore parked staged changes after the reword")?;
+            }
+        }
+        res
+    })
+}
+
 fn rewrite_live_todo_within(
     loc: &GitLoc,
     todo: &[TodoEntry],
@@ -768,6 +835,77 @@ mod tests {
 
     fn opts() -> RebaseOpts {
         RebaseOpts::default()
+    }
+
+    #[test]
+    fn rebase_txn_retag_refuses_while_another_thread_holds_the_lock() {
+        let r = linear("rebase-retag-txn");
+        let loc = r.loc();
+        let head = r.head();
+        let target = r.out(&["rev-parse", "HEAD~1"]).trim().to_owned();
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let worktree = r.dir.clone();
+        let holder = std::thread::spawn(move || {
+            let txn =
+                thegn_core::util::begin_git_mutation(&worktree, Duration::from_secs(5)).unwrap();
+            ready_tx.send(()).unwrap();
+            release_rx.recv().unwrap();
+            drop(txn);
+        });
+        ready_rx.recv().unwrap();
+
+        let error = rebase_retag_within(
+            &loc,
+            &target,
+            &[&target],
+            TodoAction::Drop,
+            &opts(),
+            Duration::from_millis(100),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("mutation lock"), "{error:#}");
+        assert_eq!(r.head(), head);
+
+        release_tx.send(()).unwrap();
+        holder.join().unwrap();
+    }
+
+    #[test]
+    fn rebase_txn_reword_refuses_while_another_thread_holds_the_lock() {
+        let r = linear("rebase-reword-txn");
+        let loc = r.loc();
+        std::fs::write(r.dir.join("staged.txt"), "staged\n").unwrap();
+        git_in(&r.dir, &["add", "staged.txt"]);
+        let head = r.head();
+        let target = r.out(&["rev-parse", "HEAD~1"]).trim().to_owned();
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let worktree = r.dir.clone();
+        let holder = std::thread::spawn(move || {
+            let txn =
+                thegn_core::util::begin_git_mutation(&worktree, Duration::from_secs(5)).unwrap();
+            ready_tx.send(()).unwrap();
+            release_rx.recv().unwrap();
+            drop(txn);
+        });
+        ready_rx.recv().unwrap();
+
+        let error = reword_within(
+            &CliGit,
+            &loc,
+            &target,
+            "rewritten",
+            &opts(),
+            Duration::from_millis(100),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("mutation lock"), "{error:#}");
+        assert_eq!(r.head(), head);
+        assert!(CliGit.stash_list(&loc).unwrap().is_empty());
+
+        release_tx.send(()).unwrap();
+        holder.join().unwrap();
     }
 
     fn flock_available() -> bool {

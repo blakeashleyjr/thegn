@@ -845,6 +845,52 @@ impl GitLoc {
         }
     }
 
+    /// Create a private gitdir file only when no entry already exists.
+    /// Unlike `write_git_path`, this never replaces an existing file.
+    pub fn write_git_path_new(&self, rel: &str, bytes: &[u8]) -> std::io::Result<()> {
+        let p = self
+            .resolve_git_path(rel)
+            .ok_or_else(|| std::io::Error::other(format!("cannot resolve git path {rel:?}")))?;
+        if let GitLoc::Local(_) = self {
+            return crate::fsperm::write_owner_only_new(Path::new(&p), bytes);
+        }
+        let mut cmd = match self {
+            GitLoc::Remote { ssh, .. } => {
+                self.ssh_command(ssh, exclusive_git_path_write_ssh_command(&p))
+            }
+            GitLoc::Provider { control_prefix, .. } => {
+                self.provider_command(control_prefix, exclusive_git_path_write_script(&p))
+            }
+            GitLoc::Local(_) => unreachable!("handled above"),
+        };
+        cmd.stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null());
+        let mut child = cmd.spawn()?;
+        let write_result = match child.stdin.take() {
+            Some(mut sink) => std::io::Write::write_all(&mut sink, bytes),
+            None => Err(std::io::Error::other("git path writer has no stdin pipe")),
+        };
+        if let Err(error) = write_result {
+            reap_child(&mut child);
+            return Err(error);
+        }
+        let status = match child.wait() {
+            Ok(status) => status,
+            Err(error) => {
+                reap_child(&mut child);
+                return Err(error);
+            }
+        };
+        if status.success() {
+            Ok(())
+        } else {
+            Err(std::io::Error::other(format!(
+                "remote exclusive write of {rel:?} failed"
+            )))
+        }
+    }
+
     /// Replace a gitdir file only while its exact current bytes still match
     /// `expected`. The file must already exist. This takes the bounded
     /// git-mutation lock and callers must not already hold it. The lock
@@ -1116,6 +1162,18 @@ fn atomic_git_path_write_script(path: &str) -> String {
 
 fn atomic_git_path_write_ssh_command(path: &str) -> String {
     let script = atomic_git_path_write_script(path);
+    format!("sh -c {}", util::sh_quote(&script))
+}
+
+fn exclusive_git_path_write_script(path: &str) -> String {
+    let quoted = util::sh_quote(path);
+    format!(
+        "set -C; umask 077; p={quoted}; [ ! -e \"$p\" ] && [ ! -L \"$p\" ] || exit 1; cat > \"$p\""
+    )
+}
+
+fn exclusive_git_path_write_ssh_command(path: &str) -> String {
+    let script = exclusive_git_path_write_script(path);
     format!("sh -c {}", util::sh_quote(&script))
 }
 
@@ -1616,6 +1674,75 @@ mod tests {
         let local = GitLoc::Local(dir.path().to_path_buf());
         assert!(local.write_git_path("local-link", b"overwrite").is_err());
         assert_eq!(std::fs::read(&outside).unwrap(), b"protected");
+    }
+
+    #[test]
+    fn exclusive_git_path_write_refuses_an_existing_regular_file() {
+        let (dir, loc) = provider_repo();
+        let target = dir.path().join(".git/existing-exclusive");
+        std::fs::write(&target, b"planted").unwrap();
+
+        assert!(
+            loc.write_git_path_new("existing-exclusive", b"replacement")
+                .is_err()
+        );
+        assert_eq!(std::fs::read(target).unwrap(), b"planted");
+    }
+
+    #[test]
+    fn exclusive_git_path_write_refuses_a_dangling_symlink() {
+        let (dir, provider) = provider_repo();
+        let provider_link = dir.path().join(".git/provider-dangling");
+        let local_link = dir.path().join(".git/local-dangling");
+        for link in [&provider_link, &local_link] {
+            if let Err(error) =
+                crate::fsperm::create_symlink(std::path::Path::new("missing-target"), link, false)
+            {
+                if cfg!(unix) {
+                    panic!("symlink fixture: {error}");
+                }
+                return;
+            }
+        }
+        let local = GitLoc::Local(dir.path().to_path_buf());
+        assert!(
+            provider
+                .write_git_path_new("provider-dangling", b"x")
+                .is_err()
+        );
+        assert!(local.write_git_path_new("local-dangling", b"x").is_err());
+        assert!(
+            std::fs::symlink_metadata(provider_link)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert!(
+            std::fs::symlink_metadata(local_link)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+    }
+
+    #[test]
+    fn exclusive_git_path_write_creates_owner_only_file() {
+        let (dir, loc) = provider_repo();
+        let target = dir.path().join(".git/new-exclusive");
+
+        loc.write_git_path_new("new-exclusive", b"prepared todo")
+            .unwrap();
+        assert_eq!(std::fs::read(&target).unwrap(), b"prepared todo");
+        if let Some(mode) = crate::fsperm::mode_bits(&target).unwrap() {
+            assert_eq!(mode, 0o600);
+        }
+    }
+
+    #[test]
+    fn exclusive_git_path_ssh_command_is_explicitly_run_by_posix_shell() {
+        let command = exclusive_git_path_write_ssh_command("/work tree/todo");
+        let script = "set -C; umask 077; p='/work tree/todo'; [ ! -e \"$p\" ] && [ ! -L \"$p\" ] || exit 1; cat > \"$p\"";
+        assert_eq!(command, format!("sh -c {}", util::sh_quote(script)));
     }
 
     #[test]
