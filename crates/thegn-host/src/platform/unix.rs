@@ -795,6 +795,13 @@ pub fn spawn_gate_grouped(
     spawn_grouped(cmd)
 }
 
+/// Unix process groups do not have a separate setup step that can degrade.
+pub fn spawn_grouped_best_effort(
+    cmd: &mut Command,
+) -> std::io::Result<(std::process::Child, GroupHandle)> {
+    spawn_grouped(cmd)
+}
+
 /// Observe direct-child exit without reaping it. Keeping the child waitable
 /// pins its pid while a gate may still need to terminate the owned process
 /// group; the gate calls `Child::wait` only after group/output settlement.
