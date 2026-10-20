@@ -259,9 +259,22 @@ struct ShareInstance {
 
 impl ShareInstance {
     fn kill(&self) {
+        self.kill_with(false);
+    }
+
+    fn kill_now(&self) {
+        self.kill_with(true);
+    }
+
+    fn kill_with(&self, immediate: bool) {
         self.shared.shutdown.store(true, Ordering::SeqCst);
         if let Some(handle) = self.shared.stop.lock().unwrap().as_ref() {
-            match handle.stop() {
+            let outcome = if immediate {
+                handle.stop_now()
+            } else {
+                handle.stop()
+            };
+            match outcome {
                 thegn_svc::share::StopOutcome::Failed(error) => {
                     tracing::warn!(%error, worktree = %self.worktree, port = self.port, "share child termination failed");
                 }
@@ -615,10 +628,10 @@ impl ShareSupervisor {
         stopped
     }
 
-    /// SIGTERM every child (teardown on quit).
+    /// Immediately kill every child (teardown on quit).
     pub fn shutdown_all(&mut self) {
         for i in &self.instances {
-            i.kill();
+            i.kill_now();
         }
         self.instances.clear();
     }
@@ -646,7 +659,7 @@ impl ShareSupervisor {
 impl Drop for ShareSupervisor {
     fn drop(&mut self) {
         for i in &self.instances {
-            i.kill();
+            i.kill_now();
         }
     }
 }
