@@ -92,11 +92,6 @@ fn ingest_tip_with_expected(
         ref_name: ref_name.clone(),
         oid: expected.clone(),
     };
-    let actual = CliGit.rev_parse(target, &ref_name)?;
-    if actual != expected {
-        drop(guard);
-        anyhow::bail!("bundled tip differs from the branch-host tip; retry");
-    }
     Ok(IngestedTip {
         ref_name: ref_name.clone(),
         oid: Some(expected.clone()),
@@ -105,16 +100,20 @@ fn ingest_tip_with_expected(
 }
 
 fn generation_ref(branch_loc: &GitLoc, branch: &str) -> Result<String> {
+    let row = row_key(branch_loc, branch);
+    let mut generation = [0_u8; 8];
+    getrandom::fill(&mut generation).context("mint merge-queue ingest generation")?;
+    Ok(format!("refs/thegn/mq/{row}/{}", hex_prefix(&generation)))
+}
+
+fn row_key(branch_loc: &GitLoc, branch: &str) -> String {
     let mut row_hash = Sha256::new();
     row_hash.update(host_id(branch_loc).as_bytes());
     row_hash.update([0]);
     row_hash.update(loc_path(branch_loc).as_bytes());
     row_hash.update([0]);
     row_hash.update(branch.as_bytes());
-    let row = hex_prefix(&row_hash.finalize()[..8]);
-    let mut generation = [0_u8; 8];
-    getrandom::fill(&mut generation).context("mint merge-queue ingest generation")?;
-    Ok(format!("refs/thegn/mq/{row}/{}", hex_prefix(&generation)))
+    hex_prefix(&row_hash.finalize()[..8])
 }
 
 fn hex_prefix(bytes: &[u8]) -> String {
@@ -129,30 +128,26 @@ fn loc_path(loc: &GitLoc) -> String {
 }
 
 fn prune_refs(target: &GitLoc, branch_loc: &GitLoc, branch: &str) -> Result<()> {
-    let mut hasher = Sha256::new();
-    hasher.update(host_id(branch_loc).as_bytes());
-    hasher.update([0]);
-    hasher.update(loc_path(branch_loc).as_bytes());
-    hasher.update([0]);
-    hasher.update(branch.as_bytes());
-    let prefix = format!("refs/thegn/mq/{}/", hex_prefix(&hasher.finalize()[..8]));
-    let listed = target.git_out(&["for-each-ref", "--count=64", "--format=%(refname)", &prefix]);
-    if let Some(refs) = listed {
-        let refs: Vec<_> = refs.lines().map(str::to_string).collect();
-        if refs.len() >= 64 {
-            anyhow::bail!(
-                "merge-queue ingest ref prune found at least {} refs under {prefix}; refusing more",
-                refs.len()
-            );
-        } else {
-            for ref_name in refs {
-                if !target.git_ok(&["update-ref", "-d", &ref_name]) {
-                    tracing::warn!(ref_name = %ref_name, "failed to prune stale merge-queue ingest ref");
-                }
-            }
+    const PRUNE_LIMIT: usize = 64;
+    let prefix = format!("refs/thegn/mq/{}/", row_key(branch_loc, branch));
+    let refs = match enumerate_stale_refs(target, &prefix) {
+        Ok(refs) => refs,
+        Err(error) => {
+            tracing::warn!(ref_prefix = %prefix, %error, "failed to enumerate stale merge-queue ingest refs");
+            Vec::new()
         }
-    } else {
-        tracing::warn!(ref_prefix = %prefix, "failed to enumerate stale merge-queue ingest refs");
+    };
+    if refs.len() == PRUNE_LIMIT {
+        tracing::warn!(
+            ref_prefix = %prefix,
+            count = refs.len(),
+            "merge-queue ingest ref prune reached its per-attempt limit"
+        );
+    }
+    for ref_name in refs {
+        if !target.git_ok(&["update-ref", "-d", &ref_name]) {
+            tracing::warn!(ref_name = %ref_name, "failed to prune stale merge-queue ingest ref");
+        }
     }
     let legacy = format!("refs/thegn/mq/{branch}");
     if target
@@ -163,6 +158,28 @@ fn prune_refs(target: &GitLoc, branch_loc: &GitLoc, branch: &str) -> Result<()> 
         tracing::warn!(ref_name = %legacy, "failed to prune legacy merge-queue ingest ref");
     }
     Ok(())
+}
+
+fn parse_ref_listing(stdout: &[u8]) -> Result<Vec<String>> {
+    Ok(String::from_utf8_lossy(stdout)
+        .lines()
+        .map(str::to_string)
+        .collect())
+}
+
+#[expect(clippy::disallowed_methods)] // off-loop: merge-queue drain (spawn_blocking / CLI)
+fn enumerate_stale_refs(target: &GitLoc, prefix: &str) -> Result<Vec<String>> {
+    let output = target
+        .git_command(&["for-each-ref", "--count=64", "--format=%(refname)", prefix])
+        .output()
+        .context("spawn git for-each-ref")?;
+    if !output.status.success() {
+        anyhow::bail!(
+            "git for-each-ref failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    parse_ref_listing(&output.stdout)
 }
 
 /// Result of comparing the live source host branch to the ingested OID.
@@ -369,6 +386,11 @@ mod tests {
     }
 
     #[test]
+    fn empty_stale_ref_listing_is_successful_and_empty() {
+        assert_eq!(parse_ref_listing(b"").unwrap(), Vec::<String>::new());
+    }
+
+    #[test]
     fn same_store_needs_no_ingest() {
         let local = GitLoc::Local(PathBuf::from("/repo"));
         assert!(!needs_ingest(&local, &GitLoc::Local(PathBuf::from("/wt"))));
@@ -455,7 +477,7 @@ mod tests {
     }
 
     fn list_refs(target: &std::path::Path) -> Vec<String> {
-        thegn_core::util::git_out(
+        thegn_core::util::git_out_allow_empty(
             target,
             &["for-each-ref", "--format=%(refname)", "refs/thegn/mq/"],
         )
