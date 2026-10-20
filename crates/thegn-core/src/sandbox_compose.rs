@@ -1235,6 +1235,7 @@ fn attest_runtime(
     guard: &ComposeGuard,
     mut report: EnsureReport,
 ) -> anyhow::Result<EnsureReport> {
+    use crate::sandbox::proc::{Capture, ProcOutcome, run_bounded};
     let inspection = inspect_project(target, spec, compose, project);
     match runtime_attestation(inspection.ps, inspection.inspect, guard) {
         RuntimeAttestation::Clean => Ok(report),
