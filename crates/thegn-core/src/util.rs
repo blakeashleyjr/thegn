@@ -1207,6 +1207,9 @@ pub fn parse_worktree_branches(porcelain: &str) -> Option<Vec<(String, Option<St
 pub const WORKTREE_LIST_Z: [&str; 4] = ["worktree", "list", "--porcelain", "-z"];
 
 /// Read and strictly parse the repository's NUL-framed worktree listing.
+///
+/// This uses `git worktree list --porcelain -z`, which requires Git 2.36 or
+/// later. Older Git versions fail closed for callers of this helper.
 pub fn worktree_branches(root: &Path) -> Option<Vec<(String, Option<String>)>> {
     let porcelain = git_out_allow_empty(root, &WORKTREE_LIST_Z)?;
     match parse_worktree_branches(&porcelain) {
@@ -2848,10 +2851,6 @@ mod tests {
     }
 
     #[test]
-    #[expect(
-        clippy::disallowed_methods,
-        reason = "real git worktree regression fixture"
-    )]
     fn worktree_branches_reads_a_linked_worktree_with_a_newline_in_its_path() {
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path().join("repo");

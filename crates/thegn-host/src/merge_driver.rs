@@ -312,11 +312,13 @@ fn verify_fixer_checkout(
     if actual_common != expected_common {
         return Err("worktree belongs to a different Git repository".into());
     }
-    let registered = util::worktree_branches(repo_root).is_some_and(|worktrees| {
-        worktrees
-            .iter()
-            .any(|(path, _)| path == canonical_worktree.to_string_lossy().as_ref())
-    });
+    let registered =
+        util::git_out(repo_root, &["worktree", "list", "--porcelain"]).is_some_and(|list| {
+            list.lines().any(|line| {
+                line.strip_prefix("worktree ")
+                    == Some(canonical_worktree.to_string_lossy().as_ref())
+            })
+        });
     if !registered {
         return Err("path is not a registered worktree of the queued repository".into());
     }

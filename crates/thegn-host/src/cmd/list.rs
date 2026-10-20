@@ -47,8 +47,8 @@ pub fn collect(cfg: &Config) -> Result<Vec<WorktreeView>> {
         };
         for (wt_path, wt_branch) in worktrees {
             let wt_branch = wt_branch.as_deref().unwrap_or("");
-            if wt_path != repo_path && is_managed(&wt_path, &wt_branch, cfg) {
-                out.push(view(&wt_path, &wt_branch, &name, &repo_path, &base, &meta));
+            if wt_path != repo_path && is_managed(&wt_path, wt_branch, cfg) {
+                out.push(view(&wt_path, wt_branch, &name, &repo_path, &base, &meta));
             }
         }
     }
