@@ -353,6 +353,95 @@ class WorkflowPolicyTests(unittest.TestCase):
             self.assertTrue(tag_envs, f"{job_name} must pass TAG to publication steps")
             self.assertTrue(all(tag == expected for tag in tag_envs), tag_envs)
 
+    def test_sandbox_image_manifest_uses_digests_only(self) -> None:
+        manifest = read_workflow("sandbox-image.yml")["jobs"]["manifest"]
+        script = next(
+            step["run"]
+            for step in manifest["steps"]
+            if step.get("name") == "assemble + push manifest list from frozen digests"
+        )
+        following_lines = script.replace("\\\n", " ").splitlines()
+        create_line = next(
+            line for line in following_lines if "podman manifest create" in line
+        )
+        create_command = create_line
+        self.assertIn("@$amd64_digest", create_command)
+        self.assertIn("@$arm64_digest", create_command)
+        self.assertNotIn("$TAG-amd64", create_command)
+        self.assertNotIn("$TAG-arm64", create_command)
+
+    def test_sandbox_image_pushes_are_generation_qualified(self) -> None:
+        build = read_workflow("sandbox-image.yml")["jobs"]["build"]
+        scripts = "\n".join(step.get("run", "") for step in build["steps"])
+        self.assertIn("$GITHUB_RUN_ID", scripts)
+        self.assertIn("$GITHUB_RUN_ATTEMPT", scripts)
+        self.assertIn('podman push --digestfile "$digest_file"', scripts)
+        artifact = next(
+            step
+            for step in build["steps"]
+            if step.get("uses", "").startswith("actions/upload-artifact@")
+        )
+        self.assertEqual("digest-${{ matrix.oci_arch }}", artifact["with"]["name"])
+        self.assertEqual("arch-digest.txt", artifact["with"]["path"])
+        self.assertEqual("error", artifact["with"]["if-no-files-found"])
+
+    def test_sandbox_image_packages_write_is_per_job(self) -> None:
+        workflow = read_workflow("sandbox-image.yml")
+        jobs = workflow["jobs"]
+        self.assertEqual({"contents": "read"}, workflow["permissions"])
+        self.assertNotIn("packages", jobs["admit"]["permissions"])
+        for job_name in ("build", "manifest"):
+            with self.subTest(job=job_name):
+                self.assertEqual("write", jobs[job_name]["permissions"]["packages"])
+        self.assertEqual("write", jobs["manifest"]["permissions"]["id-token"])
+        self.assertEqual("write", jobs["manifest"]["permissions"]["attestations"])
+
+    def test_sandbox_image_list_is_verified_and_attested(self) -> None:
+        manifest = read_workflow("sandbox-image.yml")["jobs"]["manifest"]
+        steps = manifest["steps"]
+        verify_index = next(
+            index
+            for index, step in enumerate(steps)
+            if step.get("name") == "verify pushed manifest by digest"
+        )
+        verify_script = steps[verify_index]["run"]
+        self.assertIn(
+            'skopeo inspect --raw "docker://$IMAGE@$LIST_DIGEST"', verify_script
+        )
+        self.assertIn("len(set(expected.values())) != 2", verify_script)
+        self.assertIn('item.get("platform", {}).get("architecture")', verify_script)
+        self.assertIn('expected.get(item.get("platform", {}).get("architecture"))', verify_script)
+        push_script = steps[
+            next(
+                index
+                for index, step in enumerate(steps)
+                if step.get("name") == "assemble + push manifest list from frozen digests"
+            )
+        ]["run"]
+        self.assertIn('--authfile "$HOME/.docker/config.json"', push_script)
+        attest_index = next(
+            index
+            for index, step in enumerate(steps)
+            if step.get("uses", "").startswith(
+                "actions/attest-build-provenance@"
+            )
+        )
+        attestation = steps[attest_index]
+        self.assertGreater(attest_index, verify_index)
+        self.assertEqual("${{ env.IMAGE }}", attestation["with"]["subject-name"])
+        self.assertEqual(
+            "${{ steps.push.outputs.digest }}",
+            attestation["with"]["subject-digest"],
+        )
+        self.assertIs(attestation["with"]["push-to-registry"], True)
+        print_index = next(
+            index
+            for index, step in enumerate(steps)
+            if step.get("name") == "print the list digest (pin as DEFAULT_BASE_DIGEST)"
+        )
+        self.assertGreater(print_index, attest_index)
+        self.assertGreater(print_index, verify_index)
+
 
 if __name__ == "__main__":
     unittest.main()
