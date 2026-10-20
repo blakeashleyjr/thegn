@@ -927,7 +927,8 @@
     },
     {
       "change": "preserve-config-validation-severity",
-      "lifecycle": "active",
+      "archive_path": "openspec/changes/archive/2026-10-19-preserve-config-validation-severity/",
+      "lifecycle": "archived",
       "disposition": "residual-split",
       "owners": [
         {
@@ -939,7 +940,8 @@
     },
     {
       "change": "preserve-merge-drain-diagnostics",
-      "lifecycle": "active",
+      "archive_path": "openspec/changes/archive/2026-10-19-preserve-merge-drain-diagnostics/",
+      "lifecycle": "archived",
       "disposition": "verification-gated",
       "owners": [
         {
@@ -1215,7 +1217,8 @@
     },
     {
       "change": "stabilize-process-monitor-refresh",
-      "lifecycle": "active",
+      "archive_path": "openspec/changes/archive/2026-10-19-stabilize-process-monitor-refresh/",
+      "lifecycle": "archived",
       "disposition": "alpha-delivery",
       "owners": [
         {
@@ -1283,7 +1286,8 @@
     },
     {
       "change": "verify-gate-workspace",
-      "lifecycle": "active",
+      "archive_path": "openspec/changes/archive/2026-10-19-verify-gate-workspace/",
+      "lifecycle": "archived",
       "disposition": "alpha-delivery",
       "owners": [
         {
