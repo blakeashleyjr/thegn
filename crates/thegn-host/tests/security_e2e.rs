@@ -166,7 +166,9 @@ fn required_prerequisites() -> bool {
         print_skip();
         return false;
     }
-    assert!(cfg!(target_os = "linux"), "security-e2e requires Linux");
+    if !cfg!(target_os = "linux") {
+        panic!("security-e2e requires Linux");
+    }
     let Some(path) = std::env::var_os("PATH") else {
         panic!("security-e2e requires PATH to locate bwrap");
     };
