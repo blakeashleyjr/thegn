@@ -25,8 +25,13 @@ fn ready_actions(
 > {
     DriveActions {
         attempt,
-        floor: |_| panic!("unexpected agent handoff"),
-        runner: |_, _, _, _, _, _| false,
+        floor: |_: &str| panic!("unexpected agent handoff"),
+        runner: |_: &str,
+                 _: &str,
+                 _: &str,
+                 _: &str,
+                 _: &Failure,
+                 _: Option<thegn_core::sandbox::SandboxSpec>| false,
     }
 }
 
@@ -222,7 +227,7 @@ fn budget_is_consumed_through_the_claim() {
         vec![item],
         |_| {},
         DriveActions {
-            attempt: move |_, _| {
+            attempt: move |_: &str, _: &thegn_core::remote::GitLoc| {
                 let connection = rusqlite::Connection::open(&attempt_db_path)?;
                 connection.execute(
                     "UPDATE merge_queue SET agent_attempts = 2 WHERE worktree = ?1",
@@ -230,8 +235,13 @@ fn budget_is_consumed_through_the_claim() {
                 )?;
                 Ok(AttemptOutcome::GateFailed { log: "red".into() })
             },
-            floor: |_| crate::agent_run::AgentDispatch::Run(None),
-            runner: move |_, _, _, _, _, _| {
+            floor: |_: &str| crate::agent_run::AgentDispatch::Run(None),
+            runner: move |_: &str,
+                          _: &str,
+                          _: &str,
+                          _: &str,
+                          _: &Failure,
+                          _: Option<thegn_core::sandbox::SandboxSpec>| {
                 runner_runs.fetch_add(1, Ordering::Relaxed);
                 true
             },
