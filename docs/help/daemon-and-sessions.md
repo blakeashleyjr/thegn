@@ -111,6 +111,11 @@ sessions. If a process stops after target confirmation, rerun the command;
 the identical import is adopted and only pending source deletion is retried.
 That partial result is retryable (exit 2).
 
+Before listing or stopping sessions, `thegn session move` validates every
+stored pane-session record. Malformed data refuses the move, including with
+`--dry-run`; the error names the group and tab without printing the stored
+payload.
+
 The source daemon is optional for a cold move. If live sessions are found for
 the exact path, or referenced by its persisted pane/dispatch rows, the move
 refuses without `--kill`. With `--kill`, every live source ID is killed and a
