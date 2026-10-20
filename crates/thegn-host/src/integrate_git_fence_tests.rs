@@ -5,7 +5,7 @@ use std::time::Duration;
 use thegn_core::util;
 
 struct Fixture {
-    _env: crate::testenv::EnvVarGuard,
+    _env: crate::testenv::IsolatedState,
     root: tempfile::TempDir,
     repo: PathBuf,
     ours: String,
@@ -62,16 +62,14 @@ impl Fixture {
         make_private(root.path());
         let global = root.path().join("gitconfig");
         let template = root.path().join("template");
-        let state = root.path().join("state");
         std::fs::write(&global, "").unwrap();
         std::fs::create_dir(&template).unwrap();
-        let _env = crate::testenv::EnvVarGuard::set(&[
+        let _env = crate::testenv::IsolatedState::with_env(&[
             ("GIT_CONFIG_GLOBAL", global.to_str().unwrap()),
             ("GIT_CONFIG_NOSYSTEM", "1"),
             ("GIT_CONFIG_COUNT", "0"),
             ("GIT_CONFIG_PARAMETERS", ""),
             ("GIT_TEMPLATE_DIR", template.to_str().unwrap()),
-            ("XDG_STATE_HOME", state.to_str().unwrap()),
         ]);
         let repo = root.path().join("repo");
         std::fs::create_dir(&repo).unwrap();

@@ -3888,7 +3888,7 @@ mod tests {
         assert!(
             driver_merge(
                 &repo.dir,
-                &ours,
+                ours,
                 &theirs,
                 &tree,
                 &paths,
@@ -6021,7 +6021,9 @@ mod tests {
             return;
         }
         repo.feature("feature", "feature.txt", "feature\n");
-        let ours = repo.out(&["rev-parse", "main"]);
+        // Keep the add failure independent of hooks: the fence disables hooks,
+        // but Git must still reject a nonexistent commit as the worktree target.
+        let ours = "missing-driver-merge-target";
         let theirs = repo.out(&["rev-parse", "feature"]);
         let tree = repo.out(&["rev-parse", "main^{tree}"]);
         install_failing_post_checkout(&repo);
@@ -6041,7 +6043,7 @@ mod tests {
             )
             .is_none()
         );
-        assert!(repo.dir.join(".git/post-checkout-marker").is_file());
+        assert!(!repo.dir.join(".git/post-checkout-marker").exists());
         assert!(
             !repo
                 .out(&["worktree", "list", "--porcelain"])
