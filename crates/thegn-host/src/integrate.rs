@@ -1345,11 +1345,11 @@ pub fn main_checkout(start: &Path) -> Option<PathBuf> {
                 return (None, false); // could not spawn git: transient, never memoised
             };
             if !out.status.success() {
-                return (None, false);
+                return (None, true);
             }
             let porc = String::from_utf8_lossy(&out.stdout);
             let Some(worktrees) = util::parse_worktree_branches(&porc) else {
-                return (None, false);
+                return (None, true);
             };
             (worktrees.first().map(|(path, _)| PathBuf::from(path)), true)
         },
