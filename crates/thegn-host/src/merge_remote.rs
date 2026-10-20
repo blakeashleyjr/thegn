@@ -583,12 +583,30 @@ mod tests {
     #[test]
     fn ingest_prunes_legacy_branch_ref() {
         let fixture = stores("source");
+        let target_oid =
+            thegn_core::util::git_out(&fixture.target, &["rev-parse", "HEAD"]).unwrap();
+        let branch_loc = GitLoc::Local(fixture.source.clone());
+        let stale_generation = format!(
+            "refs/thegn/mq/{}/0000000000000000",
+            row_key(&branch_loc, "feat")
+        );
+        let legacy_ref = "refs/thegn/mq/feat";
+        // Both layouts can coexist: the generation namespace is below its
+        // hexadecimal row key, while legacy refs remain direct children.
         git(
             &fixture.target,
-            &["update-ref", "refs/thegn/mq/feat", &fixture.oid],
+            &["update-ref", &stale_generation, &target_oid],
         );
+        git(&fixture.target, &["update-ref", legacy_ref, &target_oid]);
+        let refs_before_ingest = list_refs(&fixture.target);
+        assert!(refs_before_ingest.contains(&stale_generation));
+        assert!(refs_before_ingest.contains(&legacy_ref.to_string()));
+
         let ingested = ingest(&fixture, None).unwrap();
-        assert!(!list_refs(&fixture.target).contains(&"refs/thegn/mq/feat".to_string()));
+        let refs_after_ingest = list_refs(&fixture.target);
+        assert!(!refs_after_ingest.contains(&legacy_ref.to_string()));
+        assert!(!refs_after_ingest.contains(&stale_generation));
+        assert_eq!(refs_after_ingest, vec![ingested.ref_name.clone()]);
         drop(ingested);
     }
 
