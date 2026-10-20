@@ -10,7 +10,8 @@
 - [x] THE-597: preserve gate-authorized filters; used/unused/failure regressions.
 - [x] Independent source review and scoped host regression gate.
 - [x] Combined scoped THE-588/THE-589/THE-591/THE-595 gate and fixed private CLI proof.
-- [ ] THE-601: separately bound initial process capture and gate cancellation.
+- [x] THE-601: separately bound initial process capture and gate cancellation.
+      Not part of this change: THE-601 (Done) delivered the separate capture/cancellation bound.
 
 Source6 diagnostic host gate passed 139/139 (Nextest
 20d042e9-199b-43c0-a477-56e9981a5926); later fsmonitor/stat-cache findings prevent
