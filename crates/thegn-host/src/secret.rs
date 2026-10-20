@@ -665,7 +665,7 @@ fn account_name(token: &str) -> Result<String> {
         .with_extension("account")
         .file_name()
         .and_then(std::ffi::OsStr::to_str)
-        .to_owned()
+        .map(str::to_owned)
         .context("secret token path has no sidecar filename")
 }
 
@@ -762,6 +762,7 @@ fn write_private_with(
 ) -> Result<()> {
     private
         .write_owner_only_atomic(name, token.trim().as_bytes())
+        .map(|_| ())
         .with_context(|| {
             format!(
                 "write owner-only secret {}",
