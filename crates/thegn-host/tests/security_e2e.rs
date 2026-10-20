@@ -235,8 +235,8 @@ impl Fixture {
             .env_remove("THEGN_DATABASE_MIGRATION_EXECUTABLE")
             .env_remove("THEGN_DATABASE_MIGRATION_AUTHORITY");
         let child = spawn_quiet(&mut daemon_cmd);
-        let daemon = RunningDaemon { child };
-        let socket = wait_for_socket(runtime.path(), &daemon);
+        let mut daemon = RunningDaemon { child };
+        let socket = wait_for_socket(runtime.path(), &mut daemon);
 
         Self {
             state,
@@ -340,7 +340,7 @@ impl Fixture {
     }
 }
 
-fn wait_for_socket(runtime: &Path, daemon: &RunningDaemon) -> PathBuf {
+fn wait_for_socket(runtime: &Path, daemon: &mut RunningDaemon) -> PathBuf {
     let deadline = Instant::now() + PROCESS_TIMEOUT;
     loop {
         if let Some(socket) = find_socket(runtime) {
