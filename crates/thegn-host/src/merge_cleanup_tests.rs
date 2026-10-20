@@ -815,7 +815,7 @@ fn locked_worktree_busy_repository_and_symlink_alias_are_refused() {
     let _isolation = TestIsolation::new();
     let fixture = Fixture::new();
     let verified = fixture.probe().unwrap();
-    let lock = util::lock_git_mutations(&fixture.root).unwrap();
+    let lock = util::try_lock_git_mutations(&fixture.root).unwrap();
     assert!(
         verified.remove().is_err(),
         "busy lock must refuse, never wait indefinitely"
