@@ -777,7 +777,6 @@ mod tests {
             thegn_core::media::Playlist {
                 id: "playlist-id".into(),
                 name: "Favorites".into(),
-                ..Default::default()
             },
         ])))
         .unwrap();
