@@ -541,7 +541,8 @@ impl WorktreeAuxStore for Db {
     /// and then rebased starts fresh with a full agent budget (same as `merge
     /// retry`). Every caller is a deliberate user/API enqueue; internal outcome
     /// persistence goes through `persist_merge_outcome`, which preserves the
-    /// counter.
+    /// counter. `location` mirrors `worktrees.location` via a correlated subquery;
+    /// NULL when the worktree is unregistered is treated as local.
     fn enqueue_merge(&self, worktree: &str, branch: &str, target_branch: &str) -> Result<()> {
         enqueue_merge_row(self, worktree, branch, target_branch, None)
     }

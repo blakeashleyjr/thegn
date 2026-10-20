@@ -933,7 +933,7 @@ pub(crate) fn section_key(key: char, cursor: usize, ctx: MqKeyCtx) -> bool {
             tokio::task::spawn_blocking(move || {
                 note.send(
                     match Db::open().and_then(|db| {
-                        if location.is_empty() || location == "local" {
+                        if location.trim().is_empty() || location.trim() == "local" {
                             crate::merge_ops::enqueue_bound_local(&db, &wt, &branch, &target)
                         } else {
                             db.enqueue_merge(&wt, &branch, &target)
