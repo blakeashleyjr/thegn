@@ -597,18 +597,8 @@ pub fn prepare_sandbox_env(
         explicit_choice = false;
         sb.backend = thegn_core::config::SandboxBackend::None;
     }
-    if let Some(pspec) = &projection {
-        let backend = thegn_svc::projection::for_data_mode(pspec);
-        match backend.mount(pspec) {
-            // Record the live projection so the worktree-close thread (which only
-            // has the path) can unmount it without re-resolving the env.
-            Ok(_) => register_projection(worktree, pspec.clone()),
-            Err(e) => {
-                warnings.push(format!("projection ({}) failed: {e}", backend.kind()));
-                thegn_core::msg::warn(&format!("projection mount failed for {worktree}: {e}"));
-            }
-        }
-    }
+    // Acquire the projection only after admission.
+    let mut projection_lease: Option<ProjectionLease> = None;
     // Provider file-sync (`data = "sync"` on a managed provider): push the local
     // worktree into the sandbox fs before the pane execs (the pane runs IN the
     // sandbox, so there's no local cwd override). Best-effort: a failure warns,
@@ -717,10 +707,10 @@ pub fn prepare_sandbox_env(
             // A Ready host's assets (digest-pinned image, warm volumes, remote
             // OCI url) pin the spec; explicit user values win inside.
             crate::host_flow::apply_ready(worktree, &mut spec);
-            // Final pre-create spec fixups: remote-OCI worktree sync + runtime degrade.
+            // Plan remote-OCI worktree sync only; the upload runs after admission.
             let recursive_submodules =
                 crate::git_worktree::recursive_submodules_allowed(cfg, Path::new(worktree));
-            crate::remote_sync::finalize_spec_before_ensure(
+            let remote_plan = crate::remote_sync::plan_spec_before_ensure(
                 &mut spec,
                 worktree,
                 recursive_submodules,
@@ -817,10 +807,28 @@ pub fn prepare_sandbox_env(
                 ));
                 continue;
             }
+            if let Some(plan) = remote_plan.as_ref() {
+                crate::remote_sync::apply_remote_sync(&mut spec, plan, worktree, &mut warnings);
+                // The retarget replaced the mounts: re-run the sealed-$HOME gate on what will be entered.
+                if let Some(m) = thegn_core::sandbox_floor::home_gate(&spec) {
+                    if explicit_choice {
+                        anyhow::bail!("{m} for {worktree}");
+                    }
+                    thegn_core::msg::warn(&format!("{m} for {worktree}; trying next backend"));
+                    home_miss = Some(m);
+                    continue;
+                }
+            }
             // Keep the final validation adjacent to the effects it protects:
             // VPN attachment and container ensure/exec are reached only after
             // the fully composed spec has passed the admission gate.
             let launch = admit_final_sandbox_spec_then(&mut spec, |spec| {
+                if projection_lease.is_none()
+                    && let Some(pspec) = &projection
+                {
+                    projection_lease =
+                        ProjectionLease::acquire(worktree, pspec.clone(), &mut warnings);
+                }
                 // VPN up BEFORE the container (joins the sidecar netns); failure bails.
                 if let Err(e) = attach_vpn(spec) {
                     return Err(anyhow::Error::new(VpnAttachFailed(e.to_string())));
@@ -857,6 +865,9 @@ pub fn prepare_sandbox_env(
             })?;
             match launch {
                 Ok(()) => {
+                    if let Some(lease) = projection_lease.take() {
+                        lease.commit();
+                    }
                     return Ok(SandboxOutcome {
                         backend_label: spec.backend.label().to_string(),
                         spec: Some(spec),
@@ -1082,6 +1093,14 @@ pub fn prepare_sandbox_env(
         warnings.push("sandbox auto selected host".to_string());
     } else if sb.enabled && auto_choice {
         warnings.push("running on host after sandbox fallback".to_string());
+    }
+    if projection_lease.is_none()
+        && let Some(pspec) = &projection
+    {
+        projection_lease = ProjectionLease::acquire(worktree, pspec.clone(), &mut warnings);
+    }
+    if let Some(lease) = projection_lease.take() {
+        lease.commit();
     }
     Ok(SandboxOutcome {
         spec: None,
@@ -1363,6 +1382,98 @@ fn projection_registry() -> &'static std::sync::Mutex<
 fn register_projection(worktree: &str, spec: thegn_core::projection::ProjectionSpec) {
     if let Ok(mut reg) = projection_registry().lock() {
         reg.insert(worktree.to_string(), spec);
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ProjectionRollback {
+    Unmount,
+    Nothing,
+}
+
+pub(crate) fn rollback_action(mode: thegn_core::config::DataMode) -> ProjectionRollback {
+    match mode {
+        thegn_core::config::DataMode::InEnv => ProjectionRollback::Nothing,
+        thegn_core::config::DataMode::LocalExec => ProjectionRollback::Nothing,
+        thegn_core::config::DataMode::Sshfs => ProjectionRollback::Unmount,
+        thegn_core::config::DataMode::Sync => ProjectionRollback::Nothing,
+    }
+}
+
+type ProjectionRollbackFn =
+    Box<dyn FnOnce(&thegn_core::projection::ProjectionSpec) -> anyhow::Result<()> + Send>;
+
+pub(crate) struct ProjectionLease {
+    worktree: String,
+    spec: thegn_core::projection::ProjectionSpec,
+    rollback: Option<ProjectionRollbackFn>,
+}
+
+impl ProjectionLease {
+    fn acquire_with(
+        worktree: &str,
+        spec: thegn_core::projection::ProjectionSpec,
+        mount: impl FnOnce(&thegn_core::projection::ProjectionSpec) -> anyhow::Result<()>,
+        rollback: ProjectionRollbackFn,
+        kind: &str,
+        warnings: &mut Vec<String>,
+    ) -> Option<Self> {
+        if let Err(error) = mount(&spec) {
+            warnings.push(format!("projection ({kind}) failed: {error}"));
+            thegn_core::msg::warn(&format!("projection mount failed for {worktree}: {error}"));
+            return None;
+        }
+        Some(Self {
+            worktree: worktree.to_string(),
+            spec,
+            rollback: Some(rollback),
+        })
+    }
+
+    fn acquire(
+        worktree: &str,
+        spec: thegn_core::projection::ProjectionSpec,
+        warnings: &mut Vec<String>,
+    ) -> Option<Self> {
+        let backend = thegn_svc::projection::for_data_mode(&spec);
+        let kind = backend.kind();
+        Self::acquire_with(
+            worktree,
+            spec,
+            |spec| {
+                thegn_svc::projection::for_data_mode(spec)
+                    .mount(spec)
+                    .map(|_| ())
+            },
+            Box::new(|spec| match rollback_action(spec.mode) {
+                ProjectionRollback::Unmount => {
+                    thegn_svc::projection::for_data_mode(spec).unmount(spec)
+                }
+                ProjectionRollback::Nothing => Ok(()),
+            }),
+            kind,
+            warnings,
+        )
+    }
+
+    fn commit(mut self) {
+        register_projection(&self.worktree, self.spec.clone());
+        drop(self.rollback.take());
+    }
+}
+
+impl Drop for ProjectionLease {
+    fn drop(&mut self) {
+        if let Some(rollback) = self.rollback.take()
+            && let Err(error) = rollback(&self.spec)
+        {
+            tracing::warn!(
+                target: "thegn::sandbox",
+                %error,
+                worktree = %self.worktree,
+                "projection rollback failed"
+            );
+        }
     }
 }
 
@@ -2155,14 +2266,6 @@ pub fn provision_provider_env_named(
         progress(&boot);
     }
 
-    // Site the workspace under the sandbox login's real `$HOME` (a property of the
-    // IMAGE: machine0's NixOS image logs in as `nix`/`/home/nix`, others as root) —
-    // a bare `/workspace` at the root fs is not writable by a non-root login and
-    // fails the "Prepare workspace" `mkdir`. Caches the home so the pane, chrome
-    // reads, and marker checks all resolve the SAME path (`provider_workdir`).
-    let (sprite_home, workdir) = crate::provider_workdir::probe_and_resolve(&provider, &id, pc);
-    let marker = EnvPlan::marker_path(&workdir);
-
     // Host-local repository membership is needed both by provisioning and by
     // the post-checkpoint return-credential policy.
     let repo_root: PathBuf = Db::open()
@@ -2172,6 +2275,46 @@ pub fn provision_provider_env_named(
         .map(PathBuf::from)
         .or_else(|| repo::main_worktree(Path::new(worktree)))
         .unwrap_or_else(|| PathBuf::from(worktree));
+    let loc = GitLoc::for_worktree(Path::new(worktree));
+    let resolved = cfg.resolve_env(&repo_root, &loc, Path::new(worktree), Some(env_name));
+    let allow = &resolved.sandbox.network_allow;
+    let block = &resolved.sandbox.network_block;
+    let admission =
+        crate::egress_admit::egress_admission(created, provider.caps().egress, allow, block);
+    if let crate::egress_admit::EgressAdmission::AdmitFresh
+    | crate::egress_admit::EgressAdmission::VerifyExisting = admission
+    {
+        let egress_steps = crate::egress_admit::BlockingProviderEgress {
+            provider: &provider,
+        };
+        let mut network_policy = ProvisionStepView {
+            label: "Network policy".into(),
+            state: ProvisionState::Active,
+            detail: None,
+        };
+        progress(&[network_policy.clone()]);
+        let admission_result = if admission == crate::egress_admit::EgressAdmission::AdmitFresh {
+            crate::egress_admit::admit_egress(&egress_steps, &id, allow, block)
+        } else {
+            crate::egress_admit::verify_existing_egress(&egress_steps, &id, allow, block)
+        };
+        if let Err(e) = admission_result {
+            network_policy.state = ProvisionState::Failed;
+            network_policy.detail = Some(format!("{e:#}"));
+            progress(&[network_policy]);
+            return Err(anyhow::anyhow!("sandbox {id}: {e:#}"));
+        }
+        network_policy.state = ProvisionState::Done;
+        progress(&[network_policy]);
+    }
+
+    // Site the workspace under the sandbox login's real `$HOME` (a property of the
+    // IMAGE: machine0's NixOS image logs in as `nix`/`/home/nix`, others as root) —
+    // a bare `/workspace` at the root fs is not writable by a non-root login and
+    // fails the "Prepare workspace" `mkdir`. Caches the home so the pane, chrome
+    // reads, and marker checks all resolve the SAME path (`provider_workdir`).
+    let (sprite_home, workdir) = crate::provider_workdir::probe_and_resolve(&provider, &id, pc);
+    let marker = EnvPlan::marker_path(&workdir);
 
     // Idempotent: already provisioned ⇒ nothing to do (no new checkpoint) — but
     // still refresh auth creds: the host's OAuth token rotates, so the
@@ -2203,11 +2346,7 @@ pub fn provision_provider_env_named(
     // different `strategy`, e.g. host-parity on a big box, clean on a sprite), then
     // resolve which dotfiles to upload under that strategy (drops a non-portable rc
     // with a warning; collects host store roots for host-parity).
-    let loc = GitLoc::for_worktree(Path::new(worktree));
-    let home = cfg
-        .resolve_env(&repo_root, &loc, Path::new(worktree), Some(env_name))
-        .sandbox
-        .home;
+    let home = resolved.sandbox.home;
     let host_home = std::env::var("HOME")
         .map(PathBuf::from)
         .unwrap_or_else(|_| PathBuf::from("/root"));
@@ -2469,11 +2608,12 @@ pub fn provision_provider_env_named(
             } => {
                 // Host-executed: capture the local worktree's unpushed commits +
                 // uncommitted + untracked state and replay it over the clone.
-                // Best-effort — a failure leaves the pristine origin checkout.
+                // Best-effort — the failure note reflects the replay stage.
                 if let Err(e) = crate::parity::apply_local_parity(&provider, &id, wt, wd, &exec_env)
                 {
                     thegn_core::msg::warn(&format!(
-                        "local parity: {e}; the sandbox keeps the origin checkout."
+                        "local parity: {e}; {}.",
+                        crate::parity::failure_note(&e)
                     ));
                 }
                 Ok(())
@@ -2988,6 +3128,33 @@ fn auto_provision_sandbox(cfg: &Config, env_name: &str, worktree: &str) -> anyho
     };
     match block_on_provider(|| async { provider.ensure_exists(&name).await }) {
         Ok(true) => {
+            let repo_root: PathBuf = Db::open()
+                .ok()
+                .and_then(|db| db.repo_root_for(worktree).ok().flatten())
+                .filter(|s| !s.is_empty())
+                .map(PathBuf::from)
+                .or_else(|| repo::main_worktree(Path::new(worktree)))
+                .unwrap_or_else(|| PathBuf::from(worktree));
+            let resolved = cfg.resolve_env(
+                &repo_root,
+                &GitLoc::for_worktree(Path::new(worktree)),
+                Path::new(worktree),
+                Some(env_name),
+            );
+            let allow = &resolved.sandbox.network_allow;
+            let block = &resolved.sandbox.network_block;
+            if crate::egress_admit::egress_admission(true, provider.caps().egress, allow, block)
+                == crate::egress_admit::EgressAdmission::AdmitFresh
+            {
+                crate::egress_admit::admit_egress(
+                    &crate::egress_admit::BlockingProviderEgress {
+                        provider: &provider,
+                    },
+                    &name,
+                    allow,
+                    block,
+                )?;
+            }
             thegn_core::msg::info(&format!("provisioned sandbox {name}"));
             Ok(())
         }
@@ -3708,13 +3875,28 @@ pub fn launch_spec_full(
         .unwrap_or_default();
     // Credential/HOME dirs the child writes into must exist before launch.
     for dir in &resolved.ensure_dirs {
-        let _ = std::fs::create_dir_all(dir); // best-effort: dir prep: a later write reports the real failure
+        if let Err(error) = std::fs::create_dir_all(dir) {
+            dotfiles_launch_gate(
+                cfg,
+                choice,
+                anyhow::Error::new(error).context(format!("cannot create {dir}")),
+            )?;
+        }
     }
     // Tier-2 dotfiles: materialize each active bundle's dotfile tree into its
     // managed HOME (idempotent, off the event loop — launch_spec is blocking).
     if !loc.is_remote() {
         for (spec, home) in bundle::dotfile_targets(cfg, &resolved) {
-            bundle::materialize_dotfiles(&spec, &home);
+            if let Err(error) = bundle::materialize_dotfiles(&spec, &home, &|pid| {
+                crate::platform::pid_alive(i64::from(pid))
+            }) {
+                dotfiles_launch_gate(
+                    cfg,
+                    choice,
+                    anyhow::Error::new(error)
+                        .context(format!("bundle dotfiles into {}", home.display())),
+                )?;
+            }
         }
     }
     if let Some(spec) = outcome.spec.as_mut() {
@@ -4050,6 +4232,26 @@ pub(crate) fn credential_overlay_gate(
     Ok(())
 }
 
+pub(crate) fn dotfiles_launch_gate(
+    cfg: &Config,
+    choice: &str,
+    failure: anyhow::Error,
+) -> anyhow::Result<()> {
+    let configured = cfg
+        .agents
+        .iter()
+        .chain(cfg.tools.iter())
+        .any(|entry| entry.name == choice);
+    if configured {
+        let detail = format!("{failure:#}");
+        return Err(failure.context(format!(
+            "refusing to launch `{choice}`: its bundle HOME could not be prepared: {detail}"
+        )));
+    }
+    thegn_core::msg::warn(&format!("{failure:#}; the shell launches without it"));
+    Ok(())
+}
+
 /// The persisted slug for a repo root (for per-workspace account defaults), or
 /// `None` if the DB has no slug yet.
 pub(crate) fn repo_slug(db: &Db, repo_root: &Path) -> Option<String> {
@@ -4099,5 +4301,13 @@ mod tests;
 pub(crate) mod cleanup_fixture;
 
 #[cfg(test)]
+#[path = "agent_dotfiles_tests.rs"]
+mod dotfiles_tests;
+
+#[cfg(test)]
 #[path = "agent_vpn_tests.rs"]
 mod vpn_tests;
+
+#[cfg(test)]
+#[path = "agent_projection_tests.rs"]
+mod projection_tests;

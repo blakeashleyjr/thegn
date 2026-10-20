@@ -604,10 +604,11 @@ impl SandboxProfile {
     pub fn forces_no_network(self) -> bool {
         matches!(self, SandboxProfile::Sealed | SandboxProfile::SealedTunnel)
     }
-    /// Whether this profile permits a VPN attachment. Plain `sealed` refuses
-    /// (its contract is "no network, no caps"); `sealed-tunnel` is the explicit
-    /// posture for "locked down, but on its own tunnel". Non-sealed profiles
-    /// permit it freely.
+    /// Whether this profile accepts a VPN attachment in configuration. Plain
+    /// `sealed` refuses it. `sealed-tunnel` accepts the configuration, but
+    /// launch refuses while a VPN resolves (`RefusalClass::TunnelUnenforced`)
+    /// until the runtime can enforce a deny-first tunnel datapath. Non-sealed
+    /// profiles permit it.
     pub fn permits_vpn(self) -> bool {
         !matches!(self, SandboxProfile::Sealed)
     }

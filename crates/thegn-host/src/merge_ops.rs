@@ -16,9 +16,9 @@ use thegn_core::models::WorktreeRow;
 use thegn_core::remote::GitLoc;
 #[cfg(test)]
 use thegn_core::store::MergeClaimRequest;
-use thegn_core::store::{MergeClaimView, WorkspaceStore, WorktreeAuxStore};
+use thegn_core::store::{MergeCandidate, MergeClaimView, WorkspaceStore, WorktreeAuxStore};
 use thegn_core::util;
-use thegn_svc::git::{CliGit, GitBackend};
+use thegn_svc::git::{CliGit, GitBackend, PlumbingOps};
 
 use crate::{integrate, merge_driver};
 
@@ -27,6 +27,26 @@ pub fn branch_of(worktree: &Path) -> Option<String> {
     util::git_out(worktree, &["symbolic-ref", "--quiet", "--short", "HEAD"])
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
+}
+
+/// Capture the current local branch tip before writing a deliberate enqueue.
+pub(crate) fn enqueue_bound_local(
+    db: &Db,
+    worktree: &str,
+    branch: &str,
+    target: &str,
+) -> Result<()> {
+    let branch_ref = format!("refs/heads/{branch}");
+    let candidate_oid = CliGit.rev_parse(&GitLoc::from_db(worktree, None), &branch_ref)?;
+    db.enqueue_merge_candidate(
+        worktree,
+        branch,
+        target,
+        &MergeCandidate {
+            branch_ref,
+            candidate_oid,
+        },
+    )
 }
 
 /// The repo root (main checkout) a worktree belongs to.
@@ -241,7 +261,7 @@ pub fn enqueue_worktree(cfg: &Config, db: &Db, worktree: &Path) -> Result<String
     if branch == target {
         return Ok(format!("skipped {branch} (that's the target branch)"));
     }
-    db.enqueue_merge(&wt_s, &branch, &target)?;
+    enqueue_bound_local(db, &wt_s, &branch, &target)?;
     crate::merge_lifecycle::apply(mq, db, &root, &wt_s, &branch, LifecycleEvent::Enqueued);
     Ok(format!("queued {branch}"))
 }
@@ -608,7 +628,12 @@ mod tests {
 
     #[expect(clippy::disallowed_methods)] // deterministic real-Git fixture, test only
     fn git(dir: &Path, args: &[&str]) {
-        let output = util::git_cmd(dir).args(args).output().unwrap();
+        let output = util::git_cmd(dir)
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .args(args)
+            .output()
+            .unwrap();
         assert!(
             output.status.success(),
             "git {} failed: {}",
@@ -626,6 +651,99 @@ mod tests {
         std::fs::write(path.join("base.txt"), "base\n").unwrap();
         git(path, &["add", "-A"]);
         git(path, &["commit", "-q", "-m", "base"]);
+    }
+
+    fn local_candidate_fixture() -> (tempfile::TempDir, PathBuf, PathBuf, Db, Config) {
+        let temp = tempfile::tempdir().unwrap();
+        let repo = temp.path().join("repo");
+        init_repo(&repo);
+        let worktree = temp.path().join("feat");
+        let worktree_s = worktree.to_string_lossy().into_owned();
+        git(&repo, &["worktree", "add", "-q", "-b", "feat", &worktree_s]);
+        std::fs::write(worktree.join("feat.txt"), "first\n").unwrap();
+        git(&worktree, &["add", "-A"]);
+        git(
+            &worktree,
+            &[
+                "-c",
+                "commit.gpgsign=false",
+                "commit",
+                "-q",
+                "-m",
+                "feature one",
+            ],
+        );
+        let db = Db::open_at(&temp.path().join("host.db")).unwrap();
+        let mut cfg = Config::default();
+        cfg.merge_queue.organize_folders = false;
+        cfg.merge_queue.gate_command.clear();
+        (temp, repo, worktree, db, cfg)
+    }
+
+    #[expect(clippy::disallowed_methods)] // read the real fixture branch tip
+    fn branch_tip(path: &Path) -> String {
+        let output = util::git_cmd(path)
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .args(["rev-parse", "refs/heads/feat"])
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        String::from_utf8(output.stdout).unwrap().trim().to_owned()
+    }
+
+    #[test]
+    fn candidate_enqueue_records_branch_tip() {
+        let (_temp, _repo, worktree, db, cfg) = local_candidate_fixture();
+        let tip = branch_tip(&worktree);
+        assert_eq!(
+            enqueue_worktree(&cfg, &db, &worktree).unwrap(),
+            "queued feat"
+        );
+        let wt = crate::merge_ops::canonical_worktree(&worktree)
+            .to_string_lossy()
+            .into_owned();
+        assert_eq!(
+            db.merge_candidate(&wt).unwrap(),
+            Some(MergeCandidate {
+                branch_ref: "refs/heads/feat".into(),
+                candidate_oid: tip,
+            })
+        );
+    }
+
+    #[test]
+    fn candidate_moved_branch_keeps_stored_oid_until_reenqueue() {
+        let (_temp, _repo, worktree, db, cfg) = local_candidate_fixture();
+        let wt = crate::merge_ops::canonical_worktree(&worktree)
+            .to_string_lossy()
+            .into_owned();
+        enqueue_worktree(&cfg, &db, &worktree).unwrap();
+        let stored = db.merge_candidate(&wt).unwrap().unwrap();
+        std::fs::write(worktree.join("feat.txt"), "second\n").unwrap();
+        git(&worktree, &["add", "-A"]);
+        git(
+            &worktree,
+            &[
+                "-c",
+                "commit.gpgsign=false",
+                "commit",
+                "-q",
+                "-m",
+                "feature two",
+            ],
+        );
+        let moved_tip = branch_tip(&worktree);
+        assert_ne!(stored.candidate_oid, moved_tip);
+        assert_eq!(db.merge_candidate(&wt).unwrap(), Some(stored));
+        enqueue_worktree(&cfg, &db, &worktree).unwrap();
+        assert_eq!(
+            db.merge_candidate(&wt).unwrap(),
+            Some(MergeCandidate {
+                branch_ref: "refs/heads/feat".into(),
+                candidate_oid: moved_tip,
+            })
+        );
     }
 
     #[test]

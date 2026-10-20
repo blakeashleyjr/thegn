@@ -450,12 +450,106 @@ jobs:
             echo "External publication enabled: \`$PUBLICATION_ENABLED\`"
           } >> "$GITHUB_STEP_SUMMARY"
   # Publication is deliberately a separate manual operation. It cannot reach
-  # create-release or mutate release assets, and the protected environment is
-  # the review boundary for the two narrowly scoped deploy keys.
-  publish-external:
+  # create-release or mutate release assets. A credential-free worker renders
+  # AUR metadata before isolated, separately protected publishers receive keys.
+  aur-srcinfo:
     if: github.event_name == 'workflow_dispatch' && inputs.operation == 'publish-external'
     runs-on: ubuntu-latest
-    environment: package-publication
+    permissions:
+      contents: read
+    steps:
+      - name: Require a main-branch dispatch
+        env:
+          DISPATCH_REF: ${{ github.ref }}
+        run: |
+          if [ "$DISPATCH_REF" != refs/heads/main ]; then
+            echo "::error::External publication must be dispatched from the main branch."
+            exit 1
+          fi
+      - name: Validate release tag syntax
+        env:
+          TAG: ${{ inputs.tag }}
+        run: |
+          [[ "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.]+)?$ ]] || {
+            echo "::error::invalid release tag"
+            exit 1
+          }
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      - uses: DeterminateSystems/nix-installer-action@e50d5f73bfe71c2dd0aa4218de8f4afa59f8f81d # v16
+      - name: Check AUR metadata generation enablement
+        id: srcinfo
+        env:
+          ENABLED: ${{ vars.PACKAGE_PUBLICATION_ENABLED }}
+        run: |
+          if [ "$ENABLED" != true ]; then
+            echo "enabled=false" >> "$GITHUB_OUTPUT"
+            echo "AUR metadata generation skipped; PACKAGE_PUBLICATION_ENABLED is not true."
+            exit 0
+          fi
+          echo "enabled=true" >> "$GITHUB_OUTPUT"
+      - name: Download PKGBUILD from published release
+        if: steps.srcinfo.outputs.enabled == 'true'
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          TAG: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+          if [ "$(gh release view "$TAG" --json isDraft --jq .isDraft)" = true ]; then
+            echo "::error::Publish the draft release before external publication."
+            exit 1
+          fi
+          source_root="$(mktemp -d "$RUNNER_TEMP/srcinfo.XXXXXX")"
+          echo "SOURCE_ROOT=$source_root" >> "$GITHUB_ENV"
+          gh release download "$TAG" --dir "$source_root" \
+            --pattern "thegn-$TAG-PKGBUILD"
+      - name: Generate and bound AUR source metadata
+        if: steps.srcinfo.outputs.enabled == 'true'
+        env:
+          TAG: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+          work_root="$(mktemp -d "$RUNNER_TEMP/srcinfo-work.XXXXXX")"
+          home_root="$(mktemp -d "$RUNNER_TEMP/srcinfo-home.XXXXXX")"
+          cp "$SOURCE_ROOT/thegn-$TAG-PKGBUILD" "$work_root/PKGBUILD"
+          pacman_store="$(nix build --no-link --print-out-paths --inputs-from . nixpkgs#pacman)"
+          (
+            cd "$work_root"
+            env -i PATH="$pacman_store/bin:/usr/bin:/bin" HOME="$home_root" \
+              makepkg --printsrcinfo > .SRCINFO
+          )
+          srcinfo_size="$(wc -c < "$work_root/.SRCINFO")"
+          if [ "$srcinfo_size" -eq 0 ] || [ "$srcinfo_size" -gt 65536 ]; then
+            echo "::error::.SRCINFO must be nonempty and at most 64 KiB."
+            exit 1
+          fi
+          sha256sum "$work_root/PKGBUILD" "$work_root/.SRCINFO" | tee "$RUNNER_TEMP/aur-metadata-sha256.txt"
+          echo "AUR metadata SHA-256 checksums:" >> "$GITHUB_STEP_SUMMARY"
+          cat "$RUNNER_TEMP/aur-metadata-sha256.txt" >> "$GITHUB_STEP_SUMMARY"
+          mkdir -p "$RUNNER_TEMP/aur-artifact"
+          cp "$work_root/PKGBUILD" "$work_root/.SRCINFO" "$RUNNER_TEMP/aur-artifact/"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: steps.srcinfo.outputs.enabled == 'true'
+        with:
+          name: aur-metadata
+          path: ${{ runner.temp }}/aur-artifact/
+          if-no-files-found: error
+          include-hidden-files: true
+      - name: Remove temporary source files
+        if: always()
+        run: |
+          set -euo pipefail
+          for path in "${SOURCE_ROOT:-}" "$RUNNER_TEMP"/srcinfo-work.* "$RUNNER_TEMP"/srcinfo-home.* \
+            "$RUNNER_TEMP/aur-artifact" "$RUNNER_TEMP/aur-metadata-sha256.txt"; do
+            if [ -n "$path" ] && [[ "$path" == "$RUNNER_TEMP/"* ]]; then
+              rm -rf "$path"
+            fi
+          done
+  publish-homebrew:
+    if: github.event_name == 'workflow_dispatch' && inputs.operation == 'publish-external'
+    runs-on: ubuntu-latest
+    environment: package-publication-homebrew
     permissions:
       contents: read
     steps:
@@ -480,13 +574,12 @@ jobs:
         with:
           nix-token: ${{ secrets.NIX_GITHUB_TOKEN }}
           cache-lane: release-publication
-      - name: Check publication enablement
+      - name: Check Homebrew publication enablement
         id: publication
         env:
           ENABLED: ${{ vars.PACKAGE_PUBLICATION_ENABLED }}
           TAP_REPOSITORY: ${{ vars.HOMEBREW_TAP_REPOSITORY }}
           TAP_DEPLOY_KEY: ${{ secrets.HOMEBREW_TAP_DEPLOY_KEY }}
-          AUR_DEPLOY_KEY: ${{ secrets.AUR_DEPLOY_KEY }}
         run: |
           set -euo pipefail
           missing=()
@@ -494,25 +587,18 @@ jobs:
           [[ "$TAP_REPOSITORY" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]] \
             || missing+=("HOMEBREW_TAP_REPOSITORY=<owner>/homebrew-tap")
           [ -n "$TAP_DEPLOY_KEY" ] || missing+=("HOMEBREW_TAP_DEPLOY_KEY")
-          [ -n "$AUR_DEPLOY_KEY" ] || missing+=("AUR_DEPLOY_KEY")
-          grep -q '^aur\.archlinux\.org ' "$GITHUB_WORKSPACE/.github/known_hosts" \
-            || missing+=("an aur.archlinux.org host key in .github/known_hosts")
           if [ "${#missing[@]}" -ne 0 ]; then
             echo "ready=false" >> "$GITHUB_OUTPUT"
-            echo "::warning title=External publication pending::Nothing was pushed; missing: ${missing[*]}"
-            checklist="Setup checklist: (1) create public homebrew-tap; (2) create AUR thegn-bin;"
-            checklist+=" (3) add write-scoped deploy keys for only those repositories;"
-            checklist+=" (4) configure the package-publication GitHub environment"
-            checklist+=" with a required reviewer and both key secrets;"
-            checklist+=" (5) set HOMEBREW_TAP_REPOSITORY; (6) rehearse a local tap and makepkg;"
-            checklist+=" (7) commit the AUR host key to .github/known_hosts after checking"
-            checklist+=" it against the AUR's published fingerprints with ssh-keygen -lf;"
-            checklist+=" (8) set PACKAGE_PUBLICATION_ENABLED=true."
+            echo "::warning title=Homebrew publication pending::Nothing was pushed; missing: ${missing[*]}"
+            checklist="Setup checklist: (1) create public homebrew-tap;"
+            checklist+=" (2) add its write-scoped deploy key to package-publication-homebrew"
+            checklist+=" with a required reviewer; (3) set HOMEBREW_TAP_REPOSITORY;"
+            checklist+=" (4) set PACKAGE_PUBLICATION_ENABLED=true."
             echo "::warning::$checklist"
             exit 0
           fi
           echo "ready=true" >> "$GITHUB_OUTPUT"
-      - name: Require a published release and download generated metadata
+      - name: Download formula from published release
         if: steps.publication.outputs.ready == 'true'
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -523,23 +609,20 @@ jobs:
             echo "::error::Publish the draft release before external publication."
             exit 1
           fi
-          publish_root="$(mktemp -d)"
+          publish_root="$(mktemp -d "$RUNNER_TEMP/publish.XXXXXX")"
           echo "PUBLISH_ROOT=$publish_root" >> "$GITHUB_ENV"
           mkdir -p "$publish_root/metadata" "$publish_root/keys"
           gh release download "$TAG" --dir "$publish_root/metadata" \
-            --pattern "thegn-$TAG-homebrew.rb" \
-            --pattern "thegn-$TAG-PKGBUILD"
-      - name: Configure scoped deploy keys
+            --pattern "thegn-$TAG-homebrew.rb"
+      - name: Materialize Homebrew deploy key
         if: steps.publication.outputs.ready == 'true'
         env:
           TAP_DEPLOY_KEY: ${{ secrets.HOMEBREW_TAP_DEPLOY_KEY }}
-          AUR_DEPLOY_KEY: ${{ secrets.AUR_DEPLOY_KEY }}
         run: |
           set -euo pipefail
           printf '%s\n' "$TAP_DEPLOY_KEY" > "$PUBLISH_ROOT/keys/homebrew"
-          printf '%s\n' "$AUR_DEPLOY_KEY" > "$PUBLISH_ROOT/keys/aur"
-          chmod 600 "$PUBLISH_ROOT/keys/homebrew" "$PUBLISH_ROOT/keys/aur"
-      - name: Publish identical Homebrew and AUR commits
+          chmod 600 "$PUBLISH_ROOT/keys/homebrew"
+      - name: Publish Homebrew formula
         if: steps.publication.outputs.ready == 'true'
         env:
           TAG: ${{ inputs.tag }}
@@ -552,8 +635,6 @@ jobs:
           ssh_options+=" -o StrictHostKeyChecking=yes"
           ssh_options+=" -o HostKeyAlgorithms=ssh-ed25519"
           tap_ssh="ssh -i $PUBLISH_ROOT/keys/homebrew -o IdentitiesOnly=yes $ssh_options"
-          aur_ssh="ssh -i $PUBLISH_ROOT/keys/aur -o IdentitiesOnly=yes $ssh_options"
-
           GIT_SSH_COMMAND="$tap_ssh" git clone \
             "git@github.com:$TAP_REPOSITORY.git" "$PUBLISH_ROOT/tap"
           mkdir -p "$PUBLISH_ROOT/tap/Formula"
@@ -567,15 +648,151 @@ jobs:
               commit -m "thegn $TAG"
             GIT_SSH_COMMAND="$tap_ssh" git -C "$PUBLISH_ROOT/tap" push origin HEAD
           fi
-
+      - name: Summarize Homebrew publication
+        if: always()
+        env:
+          JOB_STATUS: ${{ job.status }}
+          READY: ${{ steps.publication.outputs.ready }}
+          TAG: ${{ inputs.tag }}
+        run: |
+          {
+            echo "## Homebrew publication for $TAG"
+            echo
+            if [ "$READY" = true ] && [ "$JOB_STATUS" = success ]; then
+              echo "The Homebrew formula was published or was already identical."
+              echo "An unchanged tap was left untouched."
+            elif [ "$READY" = true ]; then
+              echo "Homebrew publication was enabled but failed; no success claim is being made."
+            else
+              echo "Homebrew publication remains pending; see the actionable warning above."
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+      - name: Remove temporary Homebrew deploy key
+        if: always()
+        run: |
+          set -euo pipefail
+          if [ -n "${PUBLISH_ROOT:-}" ] && [[ "$PUBLISH_ROOT" == "$RUNNER_TEMP/"* ]]; then
+            rm -rf "$PUBLISH_ROOT"
+          fi
+  publish-aur:
+    if: github.event_name == 'workflow_dispatch' && inputs.operation == 'publish-external'
+    needs: aur-srcinfo
+    runs-on: ubuntu-latest
+    environment: package-publication-aur
+    permissions:
+      contents: read
+    steps:
+      - name: Require a main-branch dispatch
+        env:
+          DISPATCH_REF: ${{ github.ref }}
+        run: |
+          if [ "$DISPATCH_REF" != refs/heads/main ]; then
+            echo "::error::External publication must be dispatched from the main branch."
+            exit 1
+          fi
+      - name: Validate release tag syntax
+        env:
+          TAG: ${{ inputs.tag }}
+        run: |
+          [[ "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.]+)?$ ]] || {
+            echo "::error::invalid release tag"
+            exit 1
+          }
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      - name: Check AUR publication enablement
+        id: publication
+        env:
+          ENABLED: ${{ vars.PACKAGE_PUBLICATION_ENABLED }}
+          AUR_DEPLOY_KEY: ${{ secrets.AUR_DEPLOY_KEY }}
+        run: |
+          set -euo pipefail
+          missing=()
+          [ "$ENABLED" = true ] || missing+=("PACKAGE_PUBLICATION_ENABLED=true")
+          [ -n "$AUR_DEPLOY_KEY" ] || missing+=("AUR_DEPLOY_KEY")
+          grep -q '^aur\.archlinux\.org ' "$GITHUB_WORKSPACE/.github/known_hosts" \
+            || missing+=("an aur.archlinux.org host key in .github/known_hosts")
+          if [ "${#missing[@]}" -ne 0 ]; then
+            echo "ready=false" >> "$GITHUB_OUTPUT"
+            echo "::warning title=AUR publication pending::Nothing was pushed; missing: ${missing[*]}"
+            checklist="Setup checklist: (1) create the AUR thegn-bin package repository;"
+            checklist+=" (2) add its write-scoped deploy key to package-publication-aur"
+            checklist+=" with a required reviewer; (3) add the verified AUR host key"
+            checklist+=" to .github/known_hosts; (4) set PACKAGE_PUBLICATION_ENABLED=true."
+            echo "::warning::$checklist"
+            exit 0
+          fi
+          echo "ready=true" >> "$GITHUB_OUTPUT"
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        if: steps.publication.outputs.ready == 'true'
+        with:
+          name: aur-metadata
+          path: ${{ runner.temp }}/aur-metadata
+      - name: Require exactly the generated AUR metadata files
+        if: steps.publication.outputs.ready == 'true'
+        run: |
+          set -euo pipefail
+          mapfile -t artifact_files < <(
+            find "$RUNNER_TEMP/aur-metadata" -mindepth 1 -maxdepth 1 \
+              -printf '%f\n' | LC_ALL=C sort
+          )
+          if [ "${#artifact_files[@]}" -ne 2 ] \
+            || [ "${artifact_files[0]}" != .SRCINFO ] \
+            || [ "${artifact_files[1]}" != PKGBUILD ] \
+            || [ -L "$RUNNER_TEMP/aur-metadata/.SRCINFO" ] \
+            || [ -L "$RUNNER_TEMP/aur-metadata/PKGBUILD" ] \
+            || [ ! -f "$RUNNER_TEMP/aur-metadata/.SRCINFO" ] \
+            || [ ! -f "$RUNNER_TEMP/aur-metadata/PKGBUILD" ]; then
+            echo "::error::AUR metadata artifact must contain exactly PKGBUILD and .SRCINFO."
+            exit 1
+          fi
+      - name: Download release PKGBUILD and compare with generated metadata
+        if: steps.publication.outputs.ready == 'true'
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+          if [ "$(gh release view "$TAG" --json isDraft --jq .isDraft)" = true ]; then
+            echo "::error::Publish the draft release before external publication."
+            exit 1
+          fi
+          publish_root="$(mktemp -d "$RUNNER_TEMP/publish.XXXXXX")"
+          echo "PUBLISH_ROOT=$publish_root" >> "$GITHUB_ENV"
+          mkdir -p "$publish_root/metadata" "$publish_root/keys"
+          gh release download "$TAG" --dir "$publish_root/metadata" \
+            --pattern "thegn-$TAG-PKGBUILD"
+          artifact_sha="$(sha256sum "$RUNNER_TEMP/aur-metadata/PKGBUILD" | cut -d ' ' -f 1)"
+          release_sha="$(sha256sum "$publish_root/metadata/thegn-$TAG-PKGBUILD" | cut -d ' ' -f 1)"
+          if [ "$artifact_sha" != "$release_sha" ]; then
+            echo "::error::The generated AUR metadata does not match the release PKGBUILD."
+            exit 1
+          fi
+      - name: Materialize AUR deploy key
+        if: steps.publication.outputs.ready == 'true'
+        env:
+          AUR_DEPLOY_KEY: ${{ secrets.AUR_DEPLOY_KEY }}
+        run: |
+          set -euo pipefail
+          printf '%s\n' "$AUR_DEPLOY_KEY" > "$PUBLISH_ROOT/keys/aur"
+          chmod 600 "$PUBLISH_ROOT/keys/aur"
+      - name: Publish generated AUR metadata
+        if: steps.publication.outputs.ready == 'true'
+        env:
+          TAG: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+          known_hosts="$GITHUB_WORKSPACE/.github/known_hosts"
+          ssh_options="-o UserKnownHostsFile=\"$known_hosts\""
+          ssh_options+=" -o GlobalKnownHostsFile=/dev/null"
+          ssh_options+=" -o StrictHostKeyChecking=yes"
+          ssh_options+=" -o HostKeyAlgorithms=ssh-ed25519"
+          aur_ssh="ssh -i $PUBLISH_ROOT/keys/aur -o IdentitiesOnly=yes $ssh_options"
           GIT_SSH_COMMAND="$aur_ssh" git clone \
             ssh://aur@aur.archlinux.org/thegn-bin.git "$PUBLISH_ROOT/aur"
-          cp "$PUBLISH_ROOT/metadata/thegn-$TAG-PKGBUILD" "$PUBLISH_ROOT/aur/PKGBUILD"
-          pacman_store="$(nix build --no-link --print-out-paths --inputs-from . nixpkgs#pacman)"
-          (
-            cd "$PUBLISH_ROOT/aur"
-            "$pacman_store/bin/makepkg" --printsrcinfo > .SRCINFO
-          )
+          cp "$RUNNER_TEMP/aur-metadata/PKGBUILD" "$PUBLISH_ROOT/aur/PKGBUILD"
+          cp "$RUNNER_TEMP/aur-metadata/.SRCINFO" "$PUBLISH_ROOT/aur/.SRCINFO"
           git -C "$PUBLISH_ROOT/aur" add PKGBUILD .SRCINFO
           if ! git -C "$PUBLISH_ROOT/aur" diff --cached --quiet; then
             git -C "$PUBLISH_ROOT/aur" \
@@ -584,7 +801,7 @@ jobs:
               commit -m "thegn $TAG"
             GIT_SSH_COMMAND="$aur_ssh" git -C "$PUBLISH_ROOT/aur" push origin HEAD
           fi
-      - name: Summarize publication
+      - name: Summarize AUR publication
         if: always()
         env:
           JOB_STATUS: ${{ job.status }}
@@ -592,18 +809,18 @@ jobs:
           TAG: ${{ inputs.tag }}
         run: |
           {
-            echo "## External publication for $TAG"
+            echo "## AUR publication for $TAG"
             echo
             if [ "$READY" = true ] && [ "$JOB_STATUS" = success ]; then
-              echo "Generated Homebrew and AUR metadata was published or was already identical."
-              echo "Unchanged repositories were left untouched."
+              echo "Generated AUR metadata was published or was already identical."
+              echo "An unchanged repository was left untouched."
             elif [ "$READY" = true ]; then
-              echo "Publication was enabled but failed; no success claim is being made."
+              echo "AUR publication was enabled but failed; no success claim is being made."
             else
-              echo "Publication remains pending; see the actionable warning above."
+              echo "AUR publication remains pending; see the actionable warning above."
             fi
           } >> "$GITHUB_STEP_SUMMARY"
-      - name: Remove temporary deploy keys
+      - name: Remove temporary AUR deploy key
         if: always()
         run: |
           set -euo pipefail

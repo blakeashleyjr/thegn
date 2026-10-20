@@ -612,6 +612,8 @@ pub enum RefusalClass {
     MountUnresolvable,
     /// A tunnel-only profile was requested but thegn cannot enforce that the tunnel is the only route.
     TunnelUnenforced,
+    /// A mounted bind source no longer matches the identity admitted before create.
+    MountDrift,
 }
 
 /// Structured, safe context for a refused sandbox launch.
@@ -2382,6 +2384,41 @@ fn ensure_noncompose(spec: &SandboxSpec) -> anyhow::Result<()> {
         return Ok(());
     }
 
+    fn post_create_check(
+        spec: &SandboxSpec,
+        admitted: &[(String, crate::sandbox_mountcheck::MountIdentity)],
+    ) -> Result<bool, anyhow::Error> {
+        use crate::progress::{SandboxPhase, emit};
+
+        let (running, reusable) = container_status(spec);
+        match crate::sandbox_mountcheck::post_create_verdict(
+            running,
+            reusable,
+            crate::sandbox_mountcheck::identity_drift(admitted, &|path| {
+                crate::sandbox_mountcheck::mount_identity(std::path::Path::new(path))
+            }),
+        ) {
+            crate::sandbox_mountcheck::PostCreate::Ready => {
+                emit(SandboxPhase::PhaseDone);
+                Ok(true)
+            }
+            crate::sandbox_mountcheck::PostCreate::NotRunning => Ok(false),
+            crate::sandbox_mountcheck::PostCreate::Drift { why, path } => {
+                remove_container(spec);
+                let err = format!(
+                    "sandbox mount drift after create: {why}; the container was removed and the launch refused"
+                );
+                emit(SandboxPhase::PhaseFailed { err: err.clone() });
+                Err(anyhow::Error::new(refusal(
+                    spec,
+                    RefusalClass::MountDrift,
+                    path,
+                    err,
+                )))
+            }
+        }
+    }
+
     // A local Dockerfile build (devcontainer `build`) produces a tag no registry
     // has — skip the pull-prefetch; it's built below, right before create.
     if spec.build.is_none() {
@@ -2406,6 +2443,7 @@ fn ensure_noncompose(spec: &SandboxSpec) -> anyhow::Result<()> {
     // Build the image now (synchronous, correct ordering) when a Dockerfile
     // build was requested — the tag is `spec.image`, so the run below finds it.
     crate::sandbox_build::build_image(spec)?;
+    let admitted = crate::sandbox_mountcheck::admitted_identities(spec);
     use crate::progress::{SandboxPhase, emit};
     emit(SandboxPhase::ContainerCreate {
         backend: spec.backend.label(),
@@ -2427,8 +2465,7 @@ fn ensure_noncompose(spec: &SandboxSpec) -> anyhow::Result<()> {
     // Don't trust the exit code of `podman run -d`: on NixOS with broken
     // --userns keep-id, crun exits 0 but leaves the container in "created"
     // state. Verify it is actually running before declaring success.
-    if container_status(spec).0 {
-        emit(SandboxPhase::PhaseDone);
+    if post_create_check(spec, &admitted)? {
         return Ok(());
     }
 
@@ -2470,11 +2507,10 @@ fn ensure_noncompose(spec: &SandboxSpec) -> anyhow::Result<()> {
             None => drop(stderr_with_timeout(&retry, RUN_TIMEOUT)),
         }
         cleanup_oci_env_file(&envfile_dir, retry_envfile.as_deref());
-        if container_status(spec).0 {
+        if post_create_check(spec, &admitted)? {
             msg::warn(
                 "podman --userns keep-id failed; continuing with rootless podman default user namespace",
             );
-            emit(SandboxPhase::PhaseDone);
             return Ok(());
         }
     }
@@ -2751,11 +2787,18 @@ pub fn run_prepare(worktree: &std::path::Path, cmds: &[String]) {
 /// volume refusal; it must never become host fallback or a shell shim. The
 /// backend invocation is wrapped in mosh/ssh when the placement is remote.
 pub fn enter_argv(spec: &SandboxSpec, inner: &str) -> Result<Vec<String>, EnterError> {
+    enter_argv_guarded(spec, inner).map(EnterArgv::into_spawned)
+}
+
+/// Build an interactive pane argv while retaining ownership of any systemd
+/// secret env-file until the caller hands the argv to a spawned unit. Callers
+/// that may fail or decline to spawn after building should use this function.
+pub fn enter_argv_guarded(spec: &SandboxSpec, inner: &str) -> Result<EnterArgv, EnterError> {
     let spec = &*launchable(spec)?;
     let script = wrap_script(spec, inner);
     // A compose-backed spec with a named service attaches through
     // `docker compose exec <service>` — no container-name guessing.
-    let backend_argv = if let Some(compose) = spec
+    let mut entered = if let Some(compose) = spec
         .compose_spec()
         .filter(|c| spec.backend.is_oci() && c.has_service())
     {
@@ -2763,7 +2806,7 @@ pub fn enter_argv(spec: &SandboxSpec, inner: &str) -> Result<Vec<String>, EnterE
             .map_err(|error| refusal(spec, RefusalClass::ComposeTarget, None, error.to_string()))?;
         let workdir = (spec.file_access != FileAccess::None)
             .then(|| spec.worktree.to_string_lossy().into_owned());
-        crate::sandbox_compose::exec_argv(
+        let argv = crate::sandbox_compose::exec_argv(
             &target,
             &crate::sandbox_compose::project_for(spec),
             &compose,
@@ -2778,14 +2821,19 @@ pub fn enter_argv(spec: &SandboxSpec, inner: &str) -> Result<Vec<String>, EnterE
                 None,
                 "Compose service is missing".into(),
             )
-        })?
+        })?;
+        EnterArgv {
+            argv,
+            env_file: None,
+        }
     } else {
-        backend_enter_argv(spec, &script)?
+        backend_enter_argv_guarded(spec, &script)?
     };
     // Cap the pane's CPU on host-toolchain backends (no-op unless configured; see
     // [`crate::sandbox_cpucap`]). OCI/Systemd cap inline in their backend argv.
-    let backend_argv = crate::sandbox_cpucap::wrap_pane_argv(spec, backend_argv);
-    Ok(spec.placement.interactive_argv(&backend_argv))
+    entered.argv = crate::sandbox_cpucap::wrap_pane_argv(spec, entered.argv);
+    entered.argv = spec.placement.interactive_argv(&entered.argv);
+    Ok(entered)
 }
 
 /// Compose init-script + safe.directory + devenv into the `sh -lc` body that the
@@ -2970,8 +3018,20 @@ fn bwrap_mount_covered(mount: &Mount, hardcoded_parents: &[&str]) -> bool {
 }
 
 /// The backend-specific argv that runs `/bin/sh -lc <script>` in the sandbox.
+#[cfg(test)]
 fn backend_enter_argv(spec: &SandboxSpec, script: &str) -> Result<Vec<String>, EnterError> {
     backend_enter_argv_with_env(
+        spec,
+        script,
+        SandboxArgvEnv {
+            resolver_dir: None,
+            runtime_dir: systemd_runtime_dir(std::env::var_os("XDG_RUNTIME_DIR")),
+        },
+    )
+}
+
+fn backend_enter_argv_guarded(spec: &SandboxSpec, script: &str) -> Result<EnterArgv, EnterError> {
+    backend_enter_argv_guarded_with_env(
         spec,
         script,
         SandboxArgvEnv {
@@ -3012,15 +3072,25 @@ struct SandboxArgvEnv {
     runtime_dir: Option<std::path::PathBuf>,
 }
 
+#[cfg(test)]
 fn backend_enter_argv_with_env(
     spec: &SandboxSpec,
     script: &str,
     env: SandboxArgvEnv,
 ) -> Result<Vec<String>, EnterError> {
+    backend_enter_argv_guarded_with_env(spec, script, env).map(EnterArgv::into_spawned)
+}
+
+fn backend_enter_argv_guarded_with_env(
+    spec: &SandboxSpec,
+    script: &str,
+    env: SandboxArgvEnv,
+) -> Result<EnterArgv, EnterError> {
     let wt = spec.worktree.to_string_lossy().into_owned();
+    let mut env_file: Option<SecretEnvFile> = None;
     // Keyed on the backend *family* (one arm per way of driving a sandbox),
     // so a new OCI runtime is a profile row, not a new arm here.
-    Ok(match spec.backend.profile().family {
+    let argv = match spec.backend.profile().family {
         BackendFamily::Oci => {
             let mut v = oci_prefix(spec);
             v.extend(["exec".into(), "-it".into()]);
@@ -3254,30 +3324,34 @@ fn backend_enter_argv_with_env(
             // stay inline as `--setenv K=V`. (Remote specs keep everything
             // inline — see `partition_secret_env`.)
             let (inline_env, secret_env) = partition_secret_env(spec);
-            if let Some(envfile) = write_secret_env_file(&spec.name, &secret_env, true) {
+            let state_home = util::xdg_state_home();
+            if let Some(envfile) = write_secret_env_file_in(
+                &state_home,
+                std::path::Path::new("thegn/sandbox-env"),
+                &spec.name,
+                &secret_env,
+                true,
+            ) {
+                let dir = state_home.join("thegn/sandbox-env");
+                let guard = SecretEnvFile::adopt(dir, envfile);
                 v.extend([
                     "-p".into(),
-                    format!("EnvironmentFile={}", envfile.display()),
+                    format!("EnvironmentFile={}", guard.path().display()),
                 ]);
-                match util::which_path("rm").and_then(|rm| systemd_env_cleanup_prop(&rm, &envfile))
+                match util::which_path("rm")
+                    .and_then(|rm| systemd_env_cleanup_prop(&rm, guard.path()))
                 {
                     Some(property) => v.extend(["-p".into(), property]),
                     None => {
-                        if let Err(error) = std::fs::remove_file(&envfile) {
-                            tracing::warn!(
-                                target: "thegn::sandbox",
-                                %error,
-                                "unable to remove systemd secret env file after cleanup property refusal"
-                            );
-                        }
                         return Err(refusal(
                             spec,
                             RefusalClass::SystemdMountPath,
-                            Some(envfile.display().to_string()),
+                            Some(guard.path().display().to_string()),
                             "the systemd secret env file path cannot be expressed in an ExecStopPost cleanup (it contains $, % , ; or a control character, or rm was not found as a plain absolute path); refusing to launch rather than leave the secret file behind".into(),
                         ));
                     }
                 }
+                env_file = Some(guard);
             } else if !secret_env.is_empty() {
                 // Never put host-sourced secrets back on argv if the protected
                 // file cannot be created. A failed tool is safer than a
@@ -3316,7 +3390,8 @@ fn backend_enter_argv_with_env(
             };
             vec!["/bin/sh".into(), "-lc".into(), body]
         }
-    })
+    };
+    Ok(EnterArgv { argv, env_file })
 }
 
 /// Borrowed `(key, value)` env pairs from a spec's `env` map.
@@ -3701,6 +3776,74 @@ fn cleanup_oci_env_file(dir: &std::path::Path, path: Option<&std::path::Path>) {
         && let Err(error) = remove_oci_env_file_in(dir, path)
     {
         tracing::debug!(target: "thegn::sandbox", %error, "unable to remove OCI secret env-file");
+    }
+}
+
+/// Owns a systemd secret env-file until its unit is spawned.
+#[derive(Debug)]
+pub struct SecretEnvFile {
+    dir: PathBuf,
+    path: PathBuf,
+    armed: bool,
+}
+
+impl SecretEnvFile {
+    pub fn path(&self) -> &std::path::Path {
+        &self.path
+    }
+
+    /// Transfer cleanup ownership to the spawned systemd unit's ExecStopPost.
+    pub fn keep(mut self) -> PathBuf {
+        self.armed = false;
+        self.path.clone()
+    }
+
+    pub(crate) fn adopt(dir: PathBuf, path: PathBuf) -> Self {
+        Self {
+            dir,
+            path,
+            armed: true,
+        }
+    }
+}
+
+impl Drop for SecretEnvFile {
+    fn drop(&mut self) {
+        if self.armed
+            && let Err(error) = remove_oci_env_file_in(&self.dir, &self.path)
+        {
+            tracing::debug!(
+                target: "thegn::sandbox",
+                %error,
+                path = %self.path.display(),
+                "unable to remove unspawned systemd secret env-file"
+            );
+        }
+    }
+}
+
+/// Backend argv plus any secret env-file whose lifetime follows that argv.
+#[derive(Debug)]
+pub struct EnterArgv {
+    argv: Vec<String>,
+    env_file: Option<SecretEnvFile>,
+}
+
+impl EnterArgv {
+    pub fn argv(&self) -> &[String] {
+        &self.argv
+    }
+
+    /// Mark a launch as handed off; systemd's ExecStopPost removes its file.
+    pub fn into_spawned(self) -> Vec<String> {
+        if let Some(env_file) = self.env_file {
+            env_file.keep();
+        }
+        self.argv
+    }
+
+    pub fn into_parts(self) -> (Vec<String>, Option<SecretEnvFile>) {
+        (self.argv, self.env_file)
     }
 }
 

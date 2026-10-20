@@ -4,6 +4,8 @@
 //! and a *data* mode. Selection layers worktree → workspace → repo `.thegn.*`
 //! → global `[sandbox] default_env` → the implicit `default`.
 
+use crate::egress_admit::EgressSteps;
+use crate::egress_admit::admit_egress;
 use anyhow::{Context, Result};
 use std::path::{Path, PathBuf};
 use thegn_core::config::Config;
@@ -563,12 +565,6 @@ fn provision(cfg: &Config, worktree: Option<String>) -> Result<()> {
     Ok(())
 }
 
-trait EgressSteps {
-    fn apply(&self, id: &str, allow: &[String], block: &[String]) -> Result<()>;
-    fn read_back(&self, id: &str) -> Result<Vec<thegn_svc::provider::PolicyRule>>;
-    fn destroy(&self, id: &str) -> Result<()>;
-}
-
 struct ProviderEgressSteps<'a> {
     provider: &'a thegn_svc::provider::Provider,
     runtime: &'a tokio::runtime::Runtime,
@@ -586,39 +582,6 @@ impl EgressSteps for ProviderEgressSteps<'_> {
 
     fn destroy(&self, id: &str) -> Result<()> {
         self.runtime.block_on(self.provider.destroy(id))
-    }
-}
-
-fn admit_egress(
-    steps: &dyn EgressSteps,
-    id: &str,
-    allow: &[String],
-    block: &[String],
-) -> Result<()> {
-    let expected = thegn_svc::provider::rules_from(allow, block);
-    let verification = steps.apply(id, allow, block).and_then(|()| {
-        steps.read_back(id).and_then(|observed| {
-            if observed == expected {
-                Ok(())
-            } else {
-                Err(anyhow::anyhow!(
-                    "rule count mismatch: expected {}, observed {}",
-                    expected.len(),
-                    observed.len()
-                ))
-            }
-        })
-    });
-    match verification {
-        Ok(()) => Ok(()),
-        Err(reason) => match steps.destroy(id) {
-            Ok(()) => Err(anyhow::anyhow!(
-                "network policy for sandbox {id} could not be verified ({reason}); the sandbox was destroyed"
-            )),
-            Err(destroy_error) => Err(anyhow::anyhow!(
-                "network policy for sandbox {id} could not be verified ({reason}) and destroying it failed ({destroy_error}): it is running WITHOUT the declared egress policy; destroy it with `thegn env deprovision {id}`"
-            )),
-        },
     }
 }
 

@@ -995,6 +995,10 @@ sandbox-e2e-full: build
       echo "sandbox-e2e-full: podman not found — skipping Tier 2 tests"; \
     fi
 
+# THE-307 security gate; requires Linux, bwrap, and working user namespaces.
+security-e2e:
+    THEGN_REQUIRE_SECURITY_TESTS=1 cargo nextest run -p thegn-host --test security_e2e
+
 # Same, but against the built Nix package (verifies the wrapper + injected deps).
 smoke-pkg:
     ./test/smoke.sh "$(nix build .#default --no-link --print-out-paths)/bin/thegn"
