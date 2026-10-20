@@ -1048,10 +1048,10 @@ pub struct FileEntry {
     pub size: u64,
 }
 
-const DOWNLOAD_MAX_DEPTH: usize = 64;
-const DOWNLOAD_MAX_FILES: usize = 10_000;
-const DOWNLOAD_MAX_FILE_BYTES: u64 = 64 * 1024 * 1024;
-const DOWNLOAD_MAX_TOTAL_BYTES: u64 = 512 * 1024 * 1024;
+pub(crate) const DOWNLOAD_MAX_DEPTH: usize = 64;
+pub(crate) const DOWNLOAD_MAX_FILES: usize = 10_000;
+pub(crate) const DOWNLOAD_MAX_FILE_BYTES: u64 = 64 * 1024 * 1024;
+pub(crate) const DOWNLOAD_MAX_TOTAL_BYTES: u64 = 512 * 1024 * 1024;
 
 fn valid_remote_component(name: &str) -> bool {
     !name.is_empty()
@@ -1143,7 +1143,7 @@ fn publish_download_file(path: &Path, bytes: &[u8]) -> Result<()> {
 }
 
 /// Join a remote base dir and a relative path into a clean remote path.
-fn join_remote(base: &str, rel: &str) -> String {
+pub(crate) fn join_remote(base: &str, rel: &str) -> String {
     let base = base.trim_end_matches('/');
     let rel = rel.trim_start_matches('/');
     if rel.is_empty() {
