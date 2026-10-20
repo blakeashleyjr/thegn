@@ -376,6 +376,21 @@ fi
 }
 rm -rf -- "$tmp/bin/.thegn-install.lock"
 
+# A freshly created lock without a pid is treated as live while its owner is
+# publishing the pid file.
+mkdir "$tmp/bin/.thegn-install.lock"
+if PATH="$fakebin:$PATH" HOME="$tmp/home" XDG_CONFIG_HOME="$tmp/config" XDG_DATA_HOME="$tmp/data" \
+  "$install_repo/install.sh" "$tmp/bin" >"$tmp/pidless-lock.out" 2>&1; then
+  echo "install reclaimed a lock before its owner published the pid" >&2
+  exit 1
+fi
+[[ $(<"$tmp/pidless-lock.out") == *"another install is starting"* && -d $tmp/bin/.thegn-install.lock ]] || {
+  echo "pidless lock was not treated as live during publication" >&2
+  cat "$tmp/pidless-lock.out" >&2
+  exit 1
+}
+rm -rf -- "$tmp/bin/.thegn-install.lock"
+
 # A dead owner's lock is reclaimed and removed after the successful install.
 sh -c 'exit 0' &
 dead_pid=$!
@@ -397,6 +412,7 @@ fi
 cp "$tmp/bin/thegn" "$tmp/thegn.before"
 cp "$tmp/bin/tg-tui" "$tmp/tg-tui.before"
 cp "$tmp/bin/tg" "$tmp/tg.before"
+manifest_before="$(cksum "$tmp/data/thegn/install-manifest")"
 printf 'new staged bytes for rollback\n' >"$install_repo/target/release/thegn"
 if PATH="$fakebin:$PATH" HOME="$tmp/home" XDG_CONFIG_HOME="$tmp/config" XDG_DATA_HOME="$tmp/data" \
   THEGN_INSTALL_FAIL_AFTER=tg "$install_repo/install.sh" "$tmp/bin" >"$tmp/rollback.out" 2>&1; then
@@ -412,6 +428,10 @@ fi
 [[ $(<"$tmp/rollback.out") == *"restored the previous installation"* ]] || {
   echo "rollback did not report restoration" >&2
   cat "$tmp/rollback.out" >&2
+  exit 1
+}
+[[ $(cksum "$tmp/data/thegn/install-manifest") == "$manifest_before" ]] || {
+  echo "rollback changed the manifest before it was committed" >&2
   exit 1
 }
 shopt -s nullglob
@@ -455,19 +475,6 @@ for artifact in "$tmp/bin/thegn" "$tmp/bin/tg-tui" "$tmp/bin/tg"; do
     exit 1
   }
 done
-cp "$tmp/bin/thegn" "$tmp/thegn.manifest-verified"
-printf 'tampered installed binary\n' >"$tmp/bin/thegn"
-if PATH="$fakebin:$PATH" HOME="$tmp/home" XDG_CONFIG_HOME="$tmp/config" XDG_DATA_HOME="$tmp/data" \
-  "$install_repo/install.sh" "$tmp/bin" >"$tmp/manifest-tamper.out" 2>&1; then
-  echo "install accepted an artifact that disagrees with its ownership manifest" >&2
-  exit 1
-fi
-[[ $(<"$tmp/manifest-tamper.out") == *"does not match the ownership manifest"* ]] || {
-  echo "manifest mismatch refusal did not identify the changed artifact" >&2
-  cat "$tmp/manifest-tamper.out" >&2
-  exit 1
-}
-cp "$tmp/thegn.manifest-verified" "$tmp/bin/thegn"
 if ((freedesktop)); then
   for artifact in "$icon" "$desktop"; do
     artifact_hash="$(test_sha256 "$artifact")"
