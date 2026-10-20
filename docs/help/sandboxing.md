@@ -109,6 +109,10 @@ required source cannot be resolved, the launch is refused with its source and
 destination; an unresolvable cache mount is dropped with a warning. A source
 that does not exist yet can still resolve through its nearest existing parent.
 
+For local OCI containers, thegn records each writable bind source's identity
+before creating the container and checks it again afterward. If the source was
+swapped, thegn removes the container and refuses the launch.
+
 **Sealed agent panes need a managed account.** The only exception to the
 deny list is the _managed_ per-account credential dir thegn creates under
 its own state (`$XDG_STATE_HOME/thegn/accounts/<provider>/<name>`), which
@@ -120,6 +124,11 @@ Managed account homes are created without following symlinks, restricted to
 their owner, and stamped with an owner manifest for the provider and account.
 Thegn refuses a home that is a symlink, is not a directory, is owned by
 another user, or has a malformed or mismatched manifest, and reports why.
+
+If a managed account points to a different home, thegn refuses it and asks you
+to log in again; the old directory is left untouched. A configured agent or
+tool also refuses to launch if its bundle HOME cannot be prepared. A plain
+shell warns and launches without the bundle HOME.
 
 The automatic build caches (`~/.cargo/registry`, sccache, nix, `~/.m2`,
 gradle) stay writable: that is an _integrity_ exposure (a sealed pane could
@@ -487,6 +496,13 @@ tunes keepalives, timeouts, and retry backoff for flaky links.
 > [[release-channels]].
 
 A remote checkout with commits or changes made since thegn last synced it is kept for recovery, and thegn shows how to recover it.
+
+For remote and provider worktrees, thegn reads `.gitmodules` from the remote
+commit and rechecks approved submodules before initializing them. It validates
+the remote worktree sync plan before uploading anything. Before provisioning
+before its first command, a provider sandbox's network policy is applied and
+read back; a mismatch stops provisioning. If an existing sandbox's policy
+cannot be verified, thegn refuses it and keeps it for recovery.
 
 ## Inspecting
 

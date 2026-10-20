@@ -67,6 +67,8 @@ forms "legacy, unverified" (`fingerprint_verified` in `--json`).
 Only one `thegn secret ssh rotate` runs per key at a time; a second is refused
 before changes, and a custody record changed mid-rotation stops further remote
 changes.
+Keyring operations use one worker and a bounded queue. If the worker is stuck
+and the queue fills, another operation fails immediately without starting.
 
 ### Tailing the event feed
 
@@ -286,6 +288,10 @@ counted once per run. It survives daemon restarts without exceeding the
 configured budget; a human re-drive starts a fresh budget. If a stage launch
 cannot bind its session to its dispatch row, the worker is stopped and the
 launch is refused.
+The daemon also trusts the dispatch row when deciding whether an unbound launch
+is a pipeline stage: it stops and refuses a stage row or a vanished row even if
+the client did not mark the launch as a stage. `dispatch set-status --force` on
+a missing row reports `missing_row`, including with `--json`.
 
 Finished rows (not review tasks) older than 90 days are pruned during
 background maintenance unless their worktree is still registered, an active
