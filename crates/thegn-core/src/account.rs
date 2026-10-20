@@ -1376,7 +1376,6 @@ mod tests {
     #[test]
     fn managed_row_check_reports_both_paths() {
         let _state = crate::testenv::IsolatedState::new();
-        let _db = Db::open_memory().unwrap();
         let stored = Path::new("/elsewhere");
 
         assert!(matches!(
