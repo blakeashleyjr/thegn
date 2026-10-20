@@ -99,10 +99,8 @@ fn handle(stream: TcpStream, rec: Arc<Mutex<Vec<Recorded>>>, fs: FsState) {
         }
     }
     let mut body = vec![0u8; content_length];
-    if content_length > 0 {
-        if stream.read_exact(&mut body).is_err() {
-            return;
-        }
+    if content_length > 0 && stream.read_exact(&mut body).is_err() {
+        return;
     }
     rec.lock().unwrap().push(Recorded {
         method: method.clone(),
@@ -219,12 +217,8 @@ fn handle_exec_websocket(
     }
     let mut exit = vec![3];
     exit.extend_from_slice(code.to_string().as_bytes());
-    if socket
-        .send(tokio_tungstenite::tungstenite::Message::Binary(exit.into()))
-        .is_err()
-    {
-        return;
-    }
+    // best-effort: test mock: the client may already have hung up.
+    let _ = socket.send(tokio_tungstenite::tungstenite::Message::Binary(exit.into()));
 }
 
 /// The recorded real responses, keyed by (method, path-without-query).
