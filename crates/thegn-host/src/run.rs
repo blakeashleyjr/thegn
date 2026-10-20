@@ -1928,6 +1928,7 @@ pub(crate) fn forget_worktree_group(
     session_id: &str,
     group: &crate::session::WorktreeGroup,
     cleanup_runtime: bool,
+    cfg: Option<&thegn_core::config::Config>,
 ) {
     if !group.path.is_empty() {
         // `del_worktree` cascades the per-worktree caches + merge-queue row
@@ -1961,22 +1962,10 @@ pub(crate) fn forget_worktree_group(
     // is never blocked by a slow container runtime).
     if !group.path.is_empty() {
         let path = group.path.clone();
+        let cfg = cfg.cloned();
         thegn_core::thread_name::spawn_named("thegn-teardown", move || {
             crate::platform::qos::set_self(crate::platform::qos::Qos::Background);
-            // De-register the ephemeral VPN node (if any) before its sidecar is
-            // removed, unmount any worktree projection (sshfs/sync), then tear
-            // down the worktree's containers (which `rm -f`s the `-tgvpn`
-            // sidecar too).
-            crate::agent::deregister_vpn(&path);
-            crate::agent::deproject(&path);
-            if let Err(error) = crate::agent::deprovision_sync(&path) {
-                tracing::warn!(target: "thegn::lifecycle", worktree = %path, %error, "provider sync failed during background close");
-            }
-            // Suspend-on-close: checkpoint the sandbox (8-E) before disconnecting
-            // the bridge + tearing down. No-op unless the env sets auto_checkpoint.
-            crate::agent::checkpoint_on_close(&path);
-            crate::bridge_sup::disconnect_path(&path);
-            thegn_core::sandbox::teardown_by_path(&path);
+            crate::close_teardown::background_close(cfg.as_ref(), &path);
         });
     }
 }

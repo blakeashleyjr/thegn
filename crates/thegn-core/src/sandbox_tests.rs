@@ -4206,3 +4206,137 @@ fn container_listing_with_stats_joins_podman5_stats_by_name() {
 fn parse_stats_rows_drops_rows_without_a_name() {
     assert!(parse_stats_rows(r#"[{"cpu_percent":"0.80%","mem_usage":"1MB / 2GB"}]"#).is_empty());
 }
+
+#[test]
+fn placed_teardown_routes_every_command_through_the_ssh_placement() {
+    let state = crate::testenv::IsolatedState::new();
+    let loc = crate::remote::GitLoc::Remote {
+        ssh: crate::remote::SshTarget::plain("remote.example".into(), 22, false),
+        path: "/remote/wt".into(),
+    };
+    let placement = Placement::Ssh(SshPlacement::plain(
+        "remote.example".into(),
+        22,
+        false,
+        TransportKind::Ssh,
+    ));
+    let name = container_name("/host/wt");
+    let expected_projects = [
+        crate::sandbox_compose::hashed_project_name(&name, std::path::Path::new("/remote/wt")),
+        crate::sandbox_compose::hashed_project_name(&name, std::path::Path::new("/workspace")),
+    ];
+    let mut calls = Vec::new();
+    let result = teardown_placed_with(
+        &SandboxConfig {
+            enabled: true,
+            ..SandboxConfig::default()
+        },
+        &placement,
+        &loc,
+        &name,
+        &state.state_home(),
+        |backend| {
+            if backend == Backend::Docker {
+                RuntimeProbe::Present
+            } else {
+                RuntimeProbe::Absent
+            }
+        },
+        |called_placement, argv, timeout| {
+            calls.push((called_placement.clone(), argv.to_vec(), timeout));
+            Some(true)
+        },
+    );
+    assert!(result.is_ok());
+    assert!(!calls.is_empty());
+    assert!(calls.iter().all(|(called_placement, argv, _)| {
+        matches!(called_placement, Placement::Ssh(_))
+            && called_placement
+                .control_argv(argv)
+                .first()
+                .is_some_and(|arg| arg == "ssh")
+    }));
+    let down_commands: Vec<_> = calls
+        .iter()
+        .filter(|(_, argv, _)| argv.iter().any(|arg| arg == "down"))
+        .collect();
+    assert!(!down_commands.is_empty());
+    assert!(down_commands.iter().all(|(_, argv, _)| {
+        argv.windows(2).any(|pair| {
+            pair[0] == "-p"
+                && expected_projects
+                    .iter()
+                    .any(|project| pair[1] == project.as_str())
+                && pair[1] != name.as_str()
+        })
+    }));
+}
+
+#[test]
+fn placed_teardown_reports_an_unreachable_remote_host() {
+    let state = crate::testenv::IsolatedState::new();
+    let loc = crate::remote::GitLoc::Remote {
+        ssh: crate::remote::SshTarget::plain("remote.example".into(), 22, false),
+        path: "/remote/wt".into(),
+    };
+    let placement = Placement::Ssh(SshPlacement::plain(
+        "remote.example".into(),
+        22,
+        false,
+        TransportKind::Ssh,
+    ));
+    let cfg = SandboxConfig {
+        enabled: true,
+        ..SandboxConfig::default()
+    };
+    let name = container_name("/host/wt");
+    let absent = teardown_placed_with(
+        &cfg,
+        &placement,
+        &loc,
+        &name,
+        &state.state_home(),
+        |_| RuntimeProbe::Absent,
+        |_, _, _| Some(true),
+    );
+    assert!(matches!(absent, Err(PlacedTeardownError::NoRuntime)));
+
+    let unreachable = teardown_placed_with(
+        &cfg,
+        &placement,
+        &loc,
+        &name,
+        &state.state_home(),
+        |_| RuntimeProbe::Present,
+        |_, _, _| None,
+    );
+    assert!(matches!(
+        unreachable,
+        Err(PlacedTeardownError::Unreachable { commands }) if commands > 0
+    ));
+
+    let missing_container = teardown_placed_with(
+        &cfg,
+        &placement,
+        &loc,
+        &name,
+        &state.state_home(),
+        |_| RuntimeProbe::Present,
+        |_, _, _| Some(false),
+    );
+    assert!(missing_container.is_ok());
+
+    let disabled = teardown_placed_with(
+        &SandboxConfig {
+            enabled: false,
+            ..SandboxConfig::default()
+        },
+        &placement,
+        &loc,
+        &name,
+        &state.state_home(),
+        |_| panic!("disabled sandbox must not probe runtimes"),
+        |_, _, _| panic!("disabled sandbox must not run teardown commands"),
+    );
+    assert!(disabled.is_ok());
+}
