@@ -32,6 +32,7 @@ const CREATING_STALE_SECS: u64 = 10 * 60;
 /// Throttled entry: schedule one reconcile pass when due. Cheap (and free) when
 /// no `provider = "fly"` env is configured or the ledger has no Fly records.
 pub fn tick(cfg: &Config) {
+    static LEDGER_WARNED: AtomicBool = AtomicBool::new(false);
     let envs: Vec<EnvProviderConfig> = cfg
         .env
         .values()
@@ -42,11 +43,16 @@ pub fn tick(cfg: &Config) {
         return;
     }
     let view = match registry::list_checked() {
-        Ok(view) => view,
+        Ok(view) => {
+            reset_ledger_warning(&LEDGER_WARNED);
+            view
+        }
         Err(error) => {
-            thegn_core::msg::warn(&format!(
-                "fly reaper: skipped fly: ledger unreadable ({error:#}); no provider or ledger actions attempted"
-            ));
+            if should_warn_ledger_error(&LEDGER_WARNED) {
+                thegn_core::msg::warn(&format!(
+                    "fly reaper: skipped fly: ledger unreadable ({error:#}); no provider or ledger actions attempted"
+                ));
+            }
             return;
         }
     };
@@ -126,7 +132,7 @@ fn reap_unambiguous(pc: &EnvProviderConfig) {
     };
     for name in &view.unreadable {
         thegn_core::msg::warn(&format!(
-            "fly reaper: quarantined {name}: ledger record unreadable; reconcile ownership; no deletion attempted"
+            "fly reaper: ledger record {name} unreadable (provider unknown); reconcile ownership; no deletion attempted"
         ));
     }
     let now = thegn_core::util::now();
@@ -210,6 +216,14 @@ fn reap_unambiguous(pc: &EnvProviderConfig) {
 
 fn has_fly_work(view: &registry::LedgerView) -> bool {
     view.records.iter().any(|record| record.provider == "fly") || !view.unreadable.is_empty()
+}
+
+fn should_warn_ledger_error(warned: &AtomicBool) -> bool {
+    !warned.swap(true, Ordering::AcqRel)
+}
+
+fn reset_ledger_warning(warned: &AtomicBool) {
+    warned.store(false, Ordering::Release);
 }
 
 /// Ordered fail-closed lifecycle: provider capability, route-token revocation,
@@ -304,6 +318,17 @@ mod tests {
             unreadable: vec!["broken".into()],
         };
         assert!(has_fly_work(&view));
+    }
+
+    #[test]
+    fn checked_ledger_error_warns_once_until_a_successful_listing() {
+        let warned = AtomicBool::new(false);
+        assert!(should_warn_ledger_error(&warned));
+        assert!(!should_warn_ledger_error(&warned));
+
+        reset_ledger_warning(&warned);
+
+        assert!(should_warn_ledger_error(&warned));
     }
 
     #[test]
