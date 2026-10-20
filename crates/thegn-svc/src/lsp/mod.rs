@@ -35,7 +35,7 @@ use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, AtomicUsize, Ordering}
 use std::sync::mpsc::{self, Receiver, Sender, SyncSender, TrySendError};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
 use std::thread::{self, JoinHandle};
-use std::time::Duration;
+use std::time::{Duration, Instant, UNIX_EPOCH};
 
 use serde_json::{Value, json};
 
@@ -83,6 +83,62 @@ const SERVER_ENV_ALLOWLIST: &[&str] = &[
     "COMSPEC",
 ];
 
+static LEAKED_LSP_READERS: AtomicUsize = AtomicUsize::new(0);
+
+/// Stable metadata recorded for the executable selected for a language server.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExecutableIdentity {
+    pub canonical: PathBuf,
+    pub uid: Option<u32>,
+    pub mode: Option<u32>,
+    pub size: u64,
+    pub mtime_unix_s: Option<i64>,
+}
+
+/// Number of reader threads detached because their transport did not settle
+/// within the owning client's shutdown grace period.
+pub fn leaked_reader_count() -> usize {
+    LEAKED_LSP_READERS.load(Ordering::SeqCst)
+}
+
+fn executable_identity(canonical: PathBuf, metadata: &std::fs::Metadata) -> ExecutableIdentity {
+    let (uid, mode) = crate::plugin::platform::executable_identity_metadata(metadata);
+    let mtime_unix_s =
+        metadata
+            .modified()
+            .ok()
+            .map(|mtime| match mtime.duration_since(UNIX_EPOCH) {
+                Ok(duration) => i64::try_from(duration.as_secs()).unwrap_or(i64::MAX),
+                Err(error) => -i64::try_from(error.duration().as_secs()).unwrap_or(i64::MAX),
+            });
+    ExecutableIdentity {
+        canonical,
+        uid,
+        mode,
+        size: metadata.len(),
+        mtime_unix_s,
+    }
+}
+
+/// Resolve and attest a language-server executable before it is spawned.
+pub fn server_executable_identity(path: &Path) -> Result<ExecutableIdentity, LspError> {
+    let canonical = path
+        .canonicalize()
+        .map_err(|_| LspError::Spawn(format!("{} is not an executable file", path.display())))?;
+    let metadata = canonical
+        .metadata()
+        .map_err(|_| LspError::Spawn(format!("{} is not an executable file", path.display())))?;
+    if !metadata.is_file() || !crate::plugin::platform::is_executable_file(&metadata) {
+        return Err(LspError::Spawn(format!(
+            "{} is not an executable file",
+            path.display()
+        )));
+    }
+    crate::plugin::platform::executable_trust(&metadata)
+        .map_err(|reason| LspError::Spawn(format!("{} {reason}", path.display())))?;
+    Ok(executable_identity(canonical, &metadata))
+}
+
 fn server_env<I>(vars: I) -> Vec<(OsString, OsString)>
 where
     I: IntoIterator<Item = (OsString, OsString)>,
@@ -122,19 +178,15 @@ pub fn resolve_server_command(cmd: &str, path: Option<&OsStr>) -> Result<PathBuf
                 "language server command must be an absolute path or a bare name: {cmd}"
             )));
         }
-        let canonical = configured
-            .canonicalize()
-            .map_err(|_| LspError::Spawn(format!("{cmd} is not an executable file")))?;
-        let metadata = canonical
-            .metadata()
-            .map_err(|_| LspError::Spawn(format!("{cmd} is not an executable file")))?;
-        if !metadata.is_file() || !crate::plugin::platform::is_executable_file(&metadata) {
-            return Err(LspError::Spawn(format!("{cmd} is not an executable file")));
-        }
+        let identity = server_executable_identity(configured)?;
         tracing::debug!(
             target: "thegn::lsp",
             command = %configured.display(),
-            canonical_path = %canonical.display(),
+            canonical_path = %identity.canonical.display(),
+            uid = ?identity.uid,
+            mode = ?identity.mode,
+            size = identity.size,
+            mtime_unix_s = ?identity.mtime_unix_s,
             "resolved language server executable"
         );
         return Ok(configured.to_path_buf());
@@ -153,10 +205,17 @@ pub fn resolve_server_command(cmd: &str, path: Option<&OsStr>) -> Result<PathBuf
             continue;
         };
         if metadata.is_file() && crate::plugin::platform::is_executable_file(&metadata) {
+            crate::plugin::platform::executable_trust(&metadata)
+                .map_err(|reason| LspError::Spawn(format!("{cmd} {reason}")))?;
+            let identity = executable_identity(canonical, &metadata);
             tracing::debug!(
                 target: "thegn::lsp",
                 command = %candidate.display(),
-                canonical_path = %canonical.display(),
+                canonical_path = %identity.canonical.display(),
+                uid = ?identity.uid,
+                mode = ?identity.mode,
+                size = identity.size,
+                mtime_unix_s = ?identity.mtime_unix_s,
                 "resolved language server executable"
             );
             // Preserve the candidate's final path component for argv[0]-based
@@ -1562,7 +1621,8 @@ pub struct LspClient {
     /// gated off rather than sent blind.
     caps: OnceLock<ServerCapabilities>,
     timeout: Duration,
-    _reader: JoinHandle<()>,
+    reader: Mutex<Option<JoinHandle<()>>>,
+    reader_leaked: AtomicBool,
 }
 
 enum WriterCommand {
@@ -1984,7 +2044,8 @@ impl LspClient {
             generation,
             caps: OnceLock::new(),
             timeout: Duration::from_secs(10),
-            _reader: reader_thread,
+            reader: Mutex::new(Some(reader_thread)),
+            reader_leaked: AtomicBool::new(false),
             _proc: None,
         })
     }
@@ -2001,6 +2062,16 @@ impl LspClient {
     /// Whether the reader or writer observed a terminal transport failure.
     pub fn is_closed(&self) -> bool {
         self.closed.load(Ordering::SeqCst)
+    }
+
+    #[cfg(test)]
+    fn reader_state(&self) -> (bool, bool) {
+        let present = self
+            .reader
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .is_some();
+        (present, self.reader_leaked.load(Ordering::SeqCst))
     }
 
     /// The server's negotiated capabilities (all-`false` until `initialize`).
@@ -2477,8 +2548,38 @@ impl LspClient {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .take();
+        let reader_deadline = Instant::now() + grace;
         if let Some(mut child) = child {
-            terminate_tree(&mut child, Some(std::time::Instant::now() + grace));
+            terminate_tree(&mut child, Some(reader_deadline));
+        }
+
+        let reader = self
+            .reader
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        if let Some(reader) = reader {
+            while !reader.is_finished() && Instant::now() < reader_deadline {
+                thread::sleep(
+                    Duration::from_millis(5)
+                        .min(reader_deadline.saturating_duration_since(Instant::now())),
+                );
+            }
+            if reader.is_finished() {
+                if reader.join().is_err() {
+                    tracing::debug!(target: "thegn::lsp", server = %self.server_identity, "LSP reader thread panicked");
+                }
+            } else {
+                drop(reader);
+                if !self.reader_leaked.swap(true, Ordering::SeqCst) {
+                    LEAKED_LSP_READERS.fetch_add(1, Ordering::SeqCst);
+                    tracing::warn!(
+                        target: "thegn::lsp",
+                        server = %self.server_identity,
+                        "reader still blocked after shutdown; a process outside the server's group holds its stdout"
+                    );
+                }
+            }
         }
     }
 }
@@ -2586,6 +2687,20 @@ impl Drop for LspClient {
             .take();
         if let Some(mut child) = child {
             terminate_tree(&mut child, None);
+        }
+        let reader = self
+            .reader
+            .get_mut()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        if let Some(reader) = reader {
+            if reader.is_finished() {
+                if reader.join().is_err() {
+                    tracing::debug!(target: "thegn::lsp", server = %self.server_identity, "LSP reader thread panicked during drop");
+                }
+            } else {
+                drop(reader);
+            }
         }
         // Idempotent: only retires this exact generation, never a successor.
         let _ = self
@@ -2900,6 +3015,93 @@ mod tests {
         )
         .unwrap();
         (client, captured, server_writer)
+    }
+
+    #[test]
+    fn lifecycle_shutdown_joins_reader_after_eof() {
+        let (client, _, server_writer) = capturing_client();
+        drop(server_writer);
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while !client.is_closed() && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(5));
+        }
+        assert!(client.is_closed(), "reader observes EOF");
+        client.shutdown(Duration::from_millis(100));
+        assert_eq!(client.reader_state(), (false, false));
+    }
+
+    #[test]
+    fn lifecycle_shutdown_detaches_a_reader_held_open() {
+        let (client, _, _server_writer) = capturing_client();
+        let before = leaked_reader_count();
+        let started = Instant::now();
+        client.shutdown(Duration::from_millis(100));
+        assert!(started.elapsed() < Duration::from_secs(1));
+        assert_eq!(client.reader_state(), (false, true));
+        assert!(leaked_reader_count() >= before + 1);
+    }
+
+    #[test]
+    fn lifecycle_repeated_shutdown_is_a_noop() {
+        let (client, _, _server_writer) = capturing_client();
+        client.shutdown(Duration::from_millis(100));
+        let after_first = leaked_reader_count();
+        let started = Instant::now();
+        client.shutdown(Duration::from_millis(100));
+        assert!(started.elapsed() < Duration::from_millis(50));
+        assert_eq!(leaked_reader_count(), after_first);
+    }
+
+    #[test]
+    fn lifecycle_world_writable_server_is_refused() {
+        if !cfg!(unix) {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let executable = dir.path().join("srv");
+        std::fs::write(&executable, "#!/bin/sh\nexit 0\n").unwrap();
+        crate::plugin::platform::set_mode_for_test(&executable, 0o777).unwrap();
+        let refused = resolve_server_command(executable.to_str().unwrap(), None);
+        assert!(matches!(refused, Err(LspError::Spawn(message)) if message.contains("writable")));
+
+        crate::plugin::platform::set_mode_for_test(&executable, 0o755).unwrap();
+        assert!(resolve_server_command(executable.to_str().unwrap(), None).is_ok());
+    }
+
+    #[test]
+    fn lifecycle_writable_path_candidate_is_not_skipped() {
+        if !cfg!(unix) {
+            return;
+        }
+        let first = tempfile::tempdir().unwrap();
+        let second = tempfile::tempdir().unwrap();
+        let shadow = first.path().join("srv");
+        let trusted = second.path().join("srv");
+        std::fs::write(&shadow, "#!/bin/sh\nexit 0\n").unwrap();
+        std::fs::write(&trusted, "#!/bin/sh\nexit 0\n").unwrap();
+        crate::plugin::platform::set_mode_for_test(&shadow, 0o777).unwrap();
+        crate::plugin::platform::set_mode_for_test(&trusted, 0o755).unwrap();
+        let path =
+            std::env::join_paths([first.path().as_os_str(), second.path().as_os_str()]).unwrap();
+        assert!(matches!(
+            resolve_server_command("srv", Some(&path)),
+            Err(LspError::Spawn(message)) if message.contains("writable")
+        ));
+    }
+
+    #[test]
+    fn lifecycle_identity_records_canonical_path_and_mode() {
+        let dir = tempfile::tempdir().unwrap();
+        let executable = dir.path().join("srv");
+        let contents = "#!/bin/sh\nexit 0\n";
+        std::fs::write(&executable, contents).unwrap();
+        crate::plugin::platform::set_mode_for_test(&executable, 0o750).unwrap();
+        let identity = server_executable_identity(&executable).unwrap();
+        assert_eq!(identity.canonical, executable.canonicalize().unwrap());
+        assert_eq!(identity.size, contents.len() as u64);
+        if cfg!(unix) {
+            assert_eq!(identity.mode, Some(0o750));
+        }
     }
 
     #[test]
