@@ -4491,6 +4491,9 @@ mod tests {
             child.artifact_path.as_deref(),
             Some(".thegn/pipeline/architect/1.md")
         );
+        svc.dispatch_set_status(child.id, St::Running)
+            .await
+            .unwrap();
         svc.dispatch_set_status(child.id, St::Done).await.unwrap();
         assert!(matches!(
             svc.dispatch_set_status(child.id, St::Running).await,
