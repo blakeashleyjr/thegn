@@ -1325,14 +1325,8 @@ pub(crate) fn row_is_git_listed(
     let listed = cache.entry(repo_root.to_string()).or_insert_with(|| {
         // `None` is cached too, so a broken repo root is probed at most once
         // per pass rather than once per missing row.
-        thegn_core::util::git_out(Path::new(repo_root), &["worktree", "list", "--porcelain"]).map(
-            |porc| {
-                thegn_core::util::parse_worktree_branches(&porc)
-                    .into_iter()
-                    .map(|(path, _branch)| path)
-                    .collect()
-            },
-        )
+        thegn_core::util::worktree_branches(Path::new(repo_root))
+            .map(|worktrees| worktrees.into_iter().map(|(path, _branch)| path).collect())
     });
     match listed {
         // git could not be asked (repo root gone, not a repo, git missing).

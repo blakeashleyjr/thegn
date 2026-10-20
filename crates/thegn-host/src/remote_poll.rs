@@ -389,13 +389,28 @@ fn canon(p: &str) -> std::path::PathBuf {
 /// single-checkout repo costs. Entries with no branch (detached or bare) are
 /// retained so their cache rows can be invalidated when the session lists the
 /// path. Checkouts this session does not show are dropped.
+fn parse_remote_worktree_branches(porcelain: &str) -> Vec<(String, Option<String>)> {
+    let mut out: Vec<(String, Option<String>)> = Vec::new();
+    for line in porcelain.lines() {
+        if let Some(path) = line.strip_prefix("worktree ") {
+            out.push((path.trim().to_string(), None));
+        } else if let Some(branch) = line.strip_prefix("branch ")
+            && let Some((_, current_branch)) = out.last_mut()
+        {
+            *current_branch = Some(branch.trim().trim_start_matches("refs/heads/").to_string());
+        }
+    }
+    out
+}
+
 fn session_checkouts(loc: &GitLoc, session_worktrees: &[String]) -> Vec<(String, Option<String>)> {
     let Some(porcelain) = loc.git_out(&["worktree", "list", "--porcelain"]) else {
         return Vec::new();
     };
+    let worktrees = parse_remote_worktree_branches(&porcelain);
     let session: HashMap<std::path::PathBuf, &String> =
         session_worktrees.iter().map(|w| (canon(w), w)).collect();
-    thegn_core::util::parse_worktree_branches(&porcelain)
+    worktrees
         .into_iter()
         .filter_map(|(path, branch)| {
             let wt = session.get(&canon(&path))?;

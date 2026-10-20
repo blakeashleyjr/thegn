@@ -42,23 +42,13 @@ pub fn collect(cfg: &Config) -> Result<Vec<WorktreeView>> {
             .cloned()
             .unwrap_or_else(|| repo::repo_name_from_path(Path::new(&repo_path)));
         let base = thegn_core::worktree::default_branch(Path::new(&repo_path));
-        let Some(porc) = util::git_out(Path::new(&repo_path), &["worktree", "list", "--porcelain"])
-        else {
+        let Some(worktrees) = util::worktree_branches(Path::new(&repo_path)) else {
             continue;
         };
-        let mut wt_path = String::new();
-        let mut wt_branch = String::new();
-        for line in porc.lines().chain(std::iter::once("")) {
-            if let Some(p) = line.strip_prefix("worktree ") {
-                wt_path = p.to_string();
-            } else if let Some(b) = line.strip_prefix("branch refs/heads/") {
-                wt_branch = b.to_string();
-            } else if line.is_empty() && !wt_path.is_empty() {
-                if wt_path != repo_path && is_managed(&wt_path, &wt_branch, cfg) {
-                    out.push(view(&wt_path, &wt_branch, &name, &repo_path, &base, &meta));
-                }
-                wt_path.clear();
-                wt_branch.clear();
+        for (wt_path, wt_branch) in worktrees {
+            let wt_branch = wt_branch.as_deref().unwrap_or("");
+            if wt_path != repo_path && is_managed(&wt_path, wt_branch, cfg) {
+                out.push(view(&wt_path, wt_branch, &name, &repo_path, &base, &meta));
             }
         }
     }
