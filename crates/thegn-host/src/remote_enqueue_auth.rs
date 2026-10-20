@@ -1018,6 +1018,7 @@ mod tests {
         let db = serving_db(&temp.path().join("db.sqlite"), at_ms);
         let mut cfg = Config::default();
         cfg.serve.topology = ServeTopology::Tunnel;
+        cfg.serve.advertise_host = "host.example".into();
         let provider = provider("sprites", "SPRITES_ACCOUNT_A");
         let owner = provider_owner_label(&provider, "sandbox-a");
         let old = put_route_token(&db, owner, "/remote/a", at_ms);
@@ -1045,6 +1046,7 @@ mod tests {
         let db = serving_db(&temp.path().join("db.sqlite"), at_ms);
         let mut cfg = Config::default();
         cfg.serve.topology = ServeTopology::Tunnel;
+        cfg.serve.advertise_host = "host.example".into();
         let provider = provider("sprites", "SPRITES_ACCOUNT_A");
         let owner = provider_owner_label(&provider, "sandbox-a");
         let old = put_route_token(&db, owner, "/remote/a", at_ms);
@@ -1078,6 +1080,7 @@ mod tests {
         let db = serving_db(&temp.path().join("db.sqlite"), at_ms);
         let mut cfg = Config::default();
         cfg.serve.topology = ServeTopology::Tunnel;
+        cfg.serve.advertise_host = "host.example".into();
         let provider = provider("sprites", "SPRITES_ACCOUNT_A");
         let owner = provider_owner_label(&provider, "sandbox-a");
         let old = put_route_token(&db, owner.clone(), "/remote/a", at_ms);
