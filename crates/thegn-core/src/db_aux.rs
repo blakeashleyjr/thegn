@@ -9,9 +9,10 @@ use crate::db::{Db, ForwardRow, MergeQueueRow, PrQueueRow, ShareRow};
 use crate::models::ContainerEvent;
 use crate::store::{
     MERGE_CLAIM_ACTIVE, MERGE_CLAIM_LOST, MERGE_CLAIM_MAX_LEASE_MS, MERGE_CLAIM_OWNER_HINT_MAX,
-    MergeAttemptResult, MergeClaim, MergeClaimPhase, MergeClaimRequest, MergeClaimView,
-    MergeFinalOutcome, MergeFinalStatus, MergeOutcomeObservation, MergeOutcomeWrite,
-    MergeRegistryIdentity, MergeRetryOutcome, MergeStatusFields, WorktreeAuxStore,
+    MergeAttemptResult, MergeCandidate, MergeClaim, MergeClaimPhase, MergeClaimRequest,
+    MergeClaimView, MergeFinalOutcome, MergeFinalStatus, MergeOutcomeObservation,
+    MergeOutcomeWrite, MergeRegistryIdentity, MergeRetryOutcome, MergeStatusFields,
+    WorktreeAuxStore,
 };
 use crate::util;
 use anyhow::Result;
@@ -28,6 +29,10 @@ mod merge_outcome_tests;
 #[cfg(test)]
 #[path = "db_merge_status_tests.rs"]
 mod merge_status_tests;
+
+#[cfg(test)]
+#[path = "db_merge_candidate_tests.rs"]
+mod merge_candidate_tests;
 
 fn merge_queue_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<MergeQueueRow> {
     Ok(MergeQueueRow {
@@ -304,8 +309,8 @@ impl Db {
             let changed = conn.execute(
                 r#"INSERT INTO merge_queue
                      (worktree,branch,target_branch,status,queued_at,updated_at,
-                      result_oid,conflict_paths,error_detail,location)
-                   VALUES(?1,?2,?3,'queued',?4,?4,NULL,NULL,NULL,?5)
+                      result_oid,conflict_paths,error_detail,location,branch_ref,candidate_oid)
+                   VALUES(?1,?2,?3,'queued',?4,?4,NULL,NULL,NULL,?5,NULL,NULL)
                    ON CONFLICT(worktree) DO UPDATE SET
                      branch=?2, target_branch=?3, status='queued',
                      queued_at=?4, updated_at=?4,
@@ -313,7 +318,7 @@ impl Db {
                      agent_attempts=CASE WHEN merge_queue.status IN
                        ('queued','folding','verifying','agent_running')
                      THEN merge_queue.agent_attempts ELSE 0 END,
-                     location=?5
+                     location=?5, branch_ref=NULL, candidate_oid=NULL
                    WHERE merge_queue.claim_owner IS NULL"#,
                 params![worktree, branch, target_branch, now, location],
             )?;
@@ -326,6 +331,43 @@ impl Db {
         }
         result
     }
+}
+
+fn enqueue_merge_row(
+    db: &Db,
+    worktree: &str,
+    branch: &str,
+    target_branch: &str,
+    candidate: Option<&MergeCandidate>,
+) -> Result<()> {
+    let now = util::now();
+    let changed = db.conn().execute(
+        r#"INSERT INTO merge_queue
+             (worktree,branch,target_branch,status,queued_at,updated_at,
+              result_oid,conflict_paths,error_detail,location,branch_ref,candidate_oid)
+           VALUES(?1,?2,?3,'queued',?4,?4,NULL,NULL,NULL,
+              (SELECT location FROM worktrees WHERE worktree=?1),?5,?6)
+           ON CONFLICT(worktree) DO UPDATE SET
+             branch=?2, target_branch=?3, status='queued',
+             queued_at=?4, updated_at=?4,
+             result_oid=NULL, conflict_paths=NULL, error_detail=NULL,
+             agent_attempts=CASE WHEN merge_queue.status IN
+                   ('queued','folding','verifying','agent_running')
+                 THEN merge_queue.agent_attempts ELSE 0 END,
+             location=(SELECT location FROM worktrees WHERE worktree=?1),
+             branch_ref=?5, candidate_oid=?6
+           WHERE merge_queue.claim_owner IS NULL"#,
+        params![
+            worktree,
+            branch,
+            target_branch,
+            now,
+            candidate.map(|value| value.branch_ref.as_str()),
+            candidate.map(|value| value.candidate_oid.as_str())
+        ],
+    )?;
+    anyhow::ensure!(changed == 1, MERGE_CLAIM_ACTIVE);
+    Ok(())
 }
 
 impl WorktreeAuxStore for Db {
@@ -501,30 +543,54 @@ impl WorktreeAuxStore for Db {
     /// persistence goes through `persist_merge_outcome`, which preserves the
     /// counter.
     fn enqueue_merge(&self, worktree: &str, branch: &str, target_branch: &str) -> Result<()> {
-        let now = util::now();
-        // `location` mirrors `worktrees.location` at enqueue time via a
-        // correlated subquery (NULL when the worktree isn't registered → treated
-        // as local), so the queue self-describes each row's host without a
-        // separate write path.
-        let changed = self.conn().execute(
-            r#"INSERT INTO merge_queue
-                 (worktree,branch,target_branch,status,queued_at,updated_at,
-                  result_oid,conflict_paths,error_detail,location)
-               VALUES(?1,?2,?3,'queued',?4,?4,NULL,NULL,NULL,
-                  (SELECT location FROM worktrees WHERE worktree=?1))
-               ON CONFLICT(worktree) DO UPDATE SET
-                 branch=?2, target_branch=?3, status='queued',
-                 queued_at=?4, updated_at=?4,
-                 result_oid=NULL, conflict_paths=NULL, error_detail=NULL,
-                 agent_attempts=CASE WHEN merge_queue.status IN
-                       ('queued','folding','verifying','agent_running')
-                     THEN merge_queue.agent_attempts ELSE 0 END,
-                 location=(SELECT location FROM worktrees WHERE worktree=?1)
-               WHERE merge_queue.claim_owner IS NULL"#,
-            params![worktree, branch, target_branch, now],
-        )?;
-        anyhow::ensure!(changed == 1, MERGE_CLAIM_ACTIVE);
-        Ok(())
+        enqueue_merge_row(self, worktree, branch, target_branch, None)
+    }
+
+    fn enqueue_merge_candidate(
+        &self,
+        worktree: &str,
+        branch: &str,
+        target_branch: &str,
+        candidate: &MergeCandidate,
+    ) -> Result<()> {
+        anyhow::ensure!(
+            candidate.branch_ref == format!("refs/heads/{branch}"),
+            "invalid merge candidate branch_ref"
+        );
+        anyhow::ensure!(
+            matches!(candidate.candidate_oid.len(), 40 | 64)
+                && candidate
+                    .candidate_oid
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)),
+            "invalid merge candidate candidate_oid"
+        );
+        enqueue_merge_row(self, worktree, branch, target_branch, Some(candidate))
+    }
+
+    fn merge_candidate(&self, worktree: &str) -> Result<Option<MergeCandidate>> {
+        let pair = self
+            .conn()
+            .query_row(
+                "SELECT branch_ref, candidate_oid FROM merge_queue WHERE worktree=?1",
+                [worktree],
+                |row| {
+                    Ok((
+                        row.get::<_, Option<String>>(0)?,
+                        row.get::<_, Option<String>>(1)?,
+                    ))
+                },
+            )
+            .optional()?;
+        Ok(pair.and_then(
+            |(branch_ref, candidate_oid)| match (branch_ref, candidate_oid) {
+                (Some(branch_ref), Some(candidate_oid)) => Some(MergeCandidate {
+                    branch_ref,
+                    candidate_oid,
+                }),
+                _ => None,
+            },
+        ))
     }
 
     fn observe_merge_outcome(&self, worktree: &str) -> Result<MergeOutcomeObservation> {
