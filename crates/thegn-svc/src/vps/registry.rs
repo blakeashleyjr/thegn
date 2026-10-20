@@ -35,6 +35,41 @@ pub enum ReserveError {
     Store(anyhow::Error),
 }
 
+/// Removes a newly reserved intent if creation exits before a provider-side
+/// resource-creating call can have taken effect.
+pub struct IntentGuard {
+    directory: PathBuf,
+    name: String,
+    armed: bool,
+}
+
+impl IntentGuard {
+    pub fn new(name: &str) -> Self {
+        Self::at(&dir(), name)
+    }
+
+    fn at(directory: &Path, name: &str) -> Self {
+        Self {
+            directory: directory.to_path_buf(),
+            name: name.to_owned(),
+            armed: true,
+        }
+    }
+
+    /// Keep the intent for reconciliation once a remote create may have begun.
+    pub fn preserve(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for IntentGuard {
+    fn drop(&mut self) {
+        if self.armed {
+            remove_at(&self.directory, &self.name);
+        }
+    }
+}
+
 impl std::fmt::Display for ReserveError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -234,6 +269,9 @@ pub fn reserve_at(
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
         Err(error) => return Err(ReserveError::Store(error.into())),
     }
+    // The metadata check rejects an existing symlink; open can still follow a
+    // symlink swapped in between this check and the open. The owned registry
+    // root limits that race to an actor able to mutate this private directory.
     let lock = OpenOptions::new()
         .read(true)
         .write(true)
@@ -625,18 +663,22 @@ mod tests {
         ));
         reserve_at(dir, &rec("allowed", "creating"), 3, ReserveScope::All).unwrap();
         std::fs::create_dir(dir.join("unreadable.json")).unwrap();
-        assert!(matches!(
-            reserve_at(
-                dir,
-                &rec("blocked-by-unreadable", "creating"),
-                3,
-                ReserveScope::All
+        let result = reserve_at(
+            dir,
+            &rec("blocked-by-unreadable", "creating"),
+            4,
+            ReserveScope::All,
+        );
+        assert!(
+            matches!(
+                &result,
+                Err(ReserveError::AtCap {
+                    occupied: 4,
+                    cap: 4
+                })
             ),
-            Err(ReserveError::AtCap {
-                occupied: 3,
-                cap: 3
-            })
-        ));
+            "unexpected reservation result: {result:?}"
+        );
     }
 
     #[test]
@@ -646,25 +688,31 @@ mod tests {
         write_at(dir, &rec("hetzner", "creating")).unwrap();
         std::fs::write(dir.join("unknown.json"), b"{not json").unwrap();
 
-        assert!(matches!(
-            reserve_at(
-                dir,
-                &rec("fly-blocked", "creating"),
-                2,
-                ReserveScope::Provider("fly")
+        let blocked = reserve_at(
+            dir,
+            &rec("fly-blocked", "creating"),
+            1,
+            ReserveScope::Provider("fly"),
+        );
+        assert!(
+            matches!(
+                &blocked,
+                Err(ReserveError::AtCap {
+                    occupied: 1,
+                    cap: 1
+                })
             ),
-            Err(ReserveError::AtCap {
-                occupied: 2,
-                cap: 2
-            })
-        ));
+            "unexpected reservation result: {blocked:?}"
+        );
+        assert_eq!(list_at(dir).len(), 1, "failed reservation wrote a record");
         reserve_at(
             dir,
             &rec("fly-allowed", "creating"),
-            3,
+            2,
             ReserveScope::Provider("fly"),
         )
         .unwrap();
+        assert_eq!(list_at(dir).len(), 2);
 
         let only_hetzner = tempfile::tempdir().unwrap();
         write_at(only_hetzner.path(), &rec("hetzner", "creating")).unwrap();
@@ -729,5 +777,20 @@ mod tests {
         let record = rec("reserved", "creating");
         reserve_at(dir, &record, 1, ReserveScope::All).unwrap();
         assert_eq!(list_at(dir), vec![record]);
+    }
+
+    #[test]
+    fn intent_guard_clears_pre_create_failure_and_preserves_ambiguous_intent() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        reserve_at(dir, &rec("cleanup", "creating"), 1, ReserveScope::All).unwrap();
+        drop(IntentGuard::at(dir, "cleanup"));
+        assert!(read_at(dir, "cleanup").is_none());
+
+        reserve_at(dir, &rec("preserve", "creating"), 1, ReserveScope::All).unwrap();
+        let mut guard = IntentGuard::at(dir, "preserve");
+        guard.preserve();
+        drop(guard);
+        assert_eq!(read_at(dir, "preserve").unwrap().state, "creating");
     }
 }

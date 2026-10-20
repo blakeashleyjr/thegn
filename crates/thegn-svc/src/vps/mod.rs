@@ -939,6 +939,7 @@ impl RemoteProvider for VpsProvider {
             let labels = self.labels();
             let resolved = self.spec.admit_resolved(&labels)?;
             let name = self.spec.name.clone();
+            let base = self.spec.validated_api_base()?;
             let user_data = cloudinit::user_data(&self.spec.pubkey, !resolved.is_snapshot);
             // Reserve capacity and publish the intent before key setup or any
             // server request. File locking and ledger I/O stay off the runtime.
@@ -950,15 +951,16 @@ impl RemoteProvider for VpsProvider {
                 ip: String::new(),
                 created_at: thegn_core::util::now(),
             };
-            let reserve_record = intent.clone();
             let cap = self.spec.max_instances();
+            let reservation_name = name.clone();
             let reserve_result = tokio::task::spawn_blocking(move || {
-                registry::reserve(&reserve_record, cap, registry::ReserveScope::All)
+                registry::reserve(&intent, cap, registry::ReserveScope::All)
+                    .map(|()| registry::IntentGuard::new(&reservation_name))
             })
             .await
             .context("vps: reservation worker failed")?;
-            match reserve_result {
-                Ok(()) => {}
+            let mut intent_guard = match reserve_result {
+                Ok(guard) => guard,
                 Err(registry::ReserveError::AtCap { occupied, cap }) => {
                     return Err(anyhow!(
                         "vps: {occupied} managed instances already exist (max_instances = {cap}); \
@@ -970,16 +972,12 @@ impl RemoteProvider for VpsProvider {
                         error.context("vps: could not reserve ledger capacity; refusing to create")
                     );
                 }
-            }
+            };
             let key_id = match self.ensure_ssh_key().await {
                 Ok(key_id) => key_id,
-                Err(error) => {
-                    registry::remove(&name);
-                    return Err(error);
-                }
+                Err(error) => return Err(error),
             };
 
-            let base = self.spec.validated_api_base()?;
             let shaper = self.shaper();
             let body = shaper.create_body(
                 &name,
@@ -990,6 +988,7 @@ impl RemoteProvider for VpsProvider {
                 &user_data,
                 &labels,
             );
+            intent_guard.preserve();
             let created = match self.post_json(&shaper.servers_url(&base), &body).await {
                 Ok(v) => v,
                 Err(e) => {

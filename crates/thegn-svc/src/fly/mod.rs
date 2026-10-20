@@ -676,19 +676,20 @@ impl RemoteProvider for FlyProvider {
                 ip: String::new(),
                 created_at: thegn_core::util::now(),
             };
-            let reserve_record = intent.clone();
             let cap = self.spec.max_instances();
+            let reservation_name = name.clone();
             let reserve_result = tokio::task::spawn_blocking(move || {
                 registry::reserve(
-                    &reserve_record,
+                    &intent,
                     cap,
                     registry::ReserveScope::Provider(LEDGER_PROVIDER),
                 )
+                .map(|()| registry::IntentGuard::new(&reservation_name))
             })
             .await
             .context("fly: reservation worker failed")?;
-            match reserve_result {
-                Ok(()) => {}
+            let mut intent_guard = match reserve_result {
+                Ok(guard) => guard,
                 Err(registry::ReserveError::AtCap { occupied, cap }) => {
                     return Err(anyhow!(
                         "fly: {occupied} managed machines already exist (max_instances = {cap}); \
@@ -700,7 +701,7 @@ impl RemoteProvider for FlyProvider {
                         error.context("fly: could not reserve ledger capacity; refusing to create")
                     );
                 }
-            }
+            };
             let app = app_name(&name);
 
             // `ensure_app` is the FIRST resource-creating call: until it succeeds no
@@ -713,6 +714,7 @@ impl RemoteProvider for FlyProvider {
             // best-effort delete the app (cascading machine + IP) and only clear the
             // record if that delete succeeds; otherwise the record stays so destroy/
             // the reaper can reconcile the leak.
+            intent_guard.preserve();
             if let Err(e) = self.ensure_app(&app, &admitted.org_slug).await {
                 if e.to_string().contains("failed (4") {
                     registry::remove(&name);
