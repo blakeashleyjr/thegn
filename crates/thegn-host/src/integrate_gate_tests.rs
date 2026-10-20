@@ -282,7 +282,10 @@ fn used_filter_runs_only_during_materialization_and_preserves_real_index() {
     // Reused gates now clean untracked files before materialization, so the
     // filter attribute must be part of the candidate tree to affect checkout.
     std::fs::write(f.repo.join(".gitattributes"), "value filter=canary\n").unwrap();
-    git(&f.repo, &["add", ".gitattributes"]);
+    git(
+        &f.repo,
+        &["-c", "filter.canary.clean=cat", "add", ".gitattributes"],
+    );
     git(
         &f.repo,
         &[
@@ -321,7 +324,10 @@ fn tracked_snapshot_uses_materialized_bytes_without_running_filters() {
     git(&f.repo, &["config", "filter.canary.smudge", &command]);
     git(&f.repo, &["config", "filter.canary.required", "true"]);
     std::fs::write(f.repo.join(".gitattributes"), "value filter=canary\n").unwrap();
-    git(&f.repo, &["add", ".gitattributes"]);
+    git(
+        &f.repo,
+        &["-c", "filter.canary.clean=cat", "add", ".gitattributes"],
+    );
     git(
         &f.repo,
         &[
@@ -817,6 +823,9 @@ fn reused_gate_still_preserves_ignored_artifacts_after_clean() {
         ..f.config.clone()
     };
     assert!(gate_tip(&f.repo, &f.first, &first).unwrap().passed());
+    // Seed the ignored cache at the reused worktree path after the first gate;
+    // the next invocation cleans untracked files before it checks this path.
+    std::fs::write(f.wt().join("artifact"), "warm").unwrap();
 
     let second = MergeQueueConfig {
         gate_command: "test ! -e stale.txt && test \"$(cat artifact)\" = warm".into(),
