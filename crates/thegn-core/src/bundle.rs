@@ -2555,4 +2555,49 @@ mod tests {
         assert!(first > 0);
         assert_eq!(materialize_dotfiles(&spec, &home, &|_| false).unwrap(), 0);
     }
+
+    #[test]
+    fn dotfiles_error_display_prefixes_each_variant() {
+        let path = std::path::PathBuf::from("/bundle/home");
+        let errors = [
+            (
+                DotfilesError::SourceNotDirectory { path: path.clone() },
+                "bundle: dotfiles source",
+            ),
+            (
+                DotfilesError::HomeUnusable {
+                    path: path.clone(),
+                    error: std::io::Error::other("denied"),
+                },
+                "bundle: cannot create managed HOME",
+            ),
+            (
+                DotfilesError::SignatureNotRegular { path },
+                "bundle: dotfiles signature",
+            ),
+            (
+                DotfilesError::Sweep(std::io::Error::other("denied")),
+                "bundle: cannot sweep dotfile staging residue:",
+            ),
+            (
+                DotfilesError::ReadSource(std::io::Error::other("denied")),
+                "bundle: cannot read dotfiles source:",
+            ),
+            (
+                DotfilesError::Stage("denied".into()),
+                "bundle: dotfiles staging failed:",
+            ),
+            (
+                DotfilesError::Publish("denied".into()),
+                "bundle: dotfiles publish failed:",
+            ),
+        ];
+
+        for (error, prefix) in errors {
+            assert!(
+                error.to_string().starts_with(prefix),
+                "{error:?} should display with prefix {prefix:?}"
+            );
+        }
+    }
 }

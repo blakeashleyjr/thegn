@@ -25,10 +25,15 @@ fn configured_agent() -> Config {
 fn dotfiles_failure_refuses_a_configured_agent() {
     let cfg = configured_agent();
 
-    let error = dotfiles_launch_gate(&cfg, "claude", anyhow::anyhow!("x"))
-        .expect_err("configured agents must not launch with an unprepared HOME");
+    let error = dotfiles_launch_gate(
+        &cfg,
+        "claude",
+        anyhow::anyhow!("cannot create HOME").context("bundle dotfiles into /tmp/bundle-home"),
+    )
+    .expect_err("configured agents must not launch with an unprepared HOME");
 
     assert!(error.to_string().contains("refusing to launch `claude`"));
+    assert!(error.to_string().contains("/tmp/bundle-home"));
 }
 
 #[test]
