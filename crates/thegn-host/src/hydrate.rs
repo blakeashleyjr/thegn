@@ -134,6 +134,8 @@ pub(crate) fn glyph_keep_set(
 /// diff fs-watcher already forcing immediate refreshes; that is circular, since
 /// the watcher is what fires, and each rescan is a git fan-out including a
 /// `<base>...HEAD` three-dot diff. See [`crate::hydrate_tuning::active_glyph_floor`].
+/// A cached active row with an unchanged diff-watch print (`GLYPHS_SEEN`) is
+/// reused instead of rescanning at that floor (THE-999).
 ///
 /// A background worktree rescans when it has no cached row yet or the selected
 /// activity-sensitive window has elapsed.

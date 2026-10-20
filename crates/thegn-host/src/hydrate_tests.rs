@@ -3029,25 +3029,28 @@ fn idle_glyph_unchanged_flag_never_affects_background_rows() {
     let row = glyph_row(true, 0, 0, Some("main"), "/repo", 0, 0, None);
     let cache = HashMap::from([(background.clone(), (row, now - Duration::from_secs(10)))]);
     let ttls = crate::hydrate_tuning::glyph_ttls_from(
-        None,
+        Some(0),
         None,
         Duration::from_millis(300),
         Duration::from_secs(5),
     );
-    let (to_scan, _, _) = partition_glyph_paths(
-        std::slice::from_ref(&background),
-        &cache,
-        &HashMap::new(),
-        GlyphPartitionConfig {
-            active_path: Some(&active),
-            active_print_unchanged: true,
-            gate_remote_scans: false,
-            now,
-            ttls: &ttls,
-            since_active: &HashMap::new(),
-            fingerprint_changed: &HashSet::new(),
-            since_ref_move: None,
-        },
-    );
-    assert_eq!(to_scan, vec![background]);
+    for active_print_unchanged in [false, true] {
+        let (to_scan, reused, _) = partition_glyph_paths(
+            std::slice::from_ref(&background),
+            &cache,
+            &HashMap::new(),
+            GlyphPartitionConfig {
+                active_path: Some(&active),
+                active_print_unchanged,
+                gate_remote_scans: false,
+                now,
+                ttls: &ttls,
+                since_active: &HashMap::new(),
+                fingerprint_changed: &HashSet::new(),
+                since_ref_move: None,
+            },
+        );
+        assert_eq!(to_scan, vec![background.clone()]);
+        assert!(reused.is_empty());
+    }
 }
