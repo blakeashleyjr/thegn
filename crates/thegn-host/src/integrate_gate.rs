@@ -9,6 +9,8 @@ use super::gate_base_for_repo;
 use super::{GateErrorClass, GatePhase, GateVerdict, gate_base, tail};
 use crate::platform::gate_path::{Directory, Lock, Regular, read_regular};
 use anyhow::{Context, Result, ensure};
+use sha2::{Digest, Sha256};
+use std::io::Read;
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use thegn_core::config::MergeQueueConfig;
@@ -457,9 +459,160 @@ struct Workspace {
     lock: Option<Lock>,
     checkout: Checkout,
     oid: String,
+    tracked_snapshot: Option<TrackedSnapshot>,
     target: Option<PathBuf>,
     target_private: bool,
     temporary_parent: Option<PathBuf>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum TrackedKind {
+    Regular,
+    Symlink,
+    Gitlink,
+    Other,
+}
+
+#[derive(Debug, Eq, PartialEq)]
+struct TrackedPathSnapshot {
+    path: PathBuf,
+    kind: TrackedKind,
+    digest: Option<[u8; 32]>,
+}
+
+#[derive(Debug)]
+struct TrackedSnapshot {
+    paths: Vec<TrackedPathSnapshot>,
+}
+
+impl TrackedSnapshot {
+    fn capture(root: &Path) -> Result<Self> {
+        let entries = probe(root, &["ls-files", "-z", "--stage"])?;
+        ensure!(
+            entries.is_empty() || entries.ends_with(&[0]),
+            "tracked-path probe returned an incomplete record"
+        );
+        let mut paths = Vec::new();
+        for record in entries[..entries.len().saturating_sub(1)].split(|byte| *byte == 0) {
+            ensure!(
+                !record.is_empty(),
+                "tracked-path probe returned an empty record"
+            );
+            let tab = record
+                .iter()
+                .position(|byte| *byte == b'\t')
+                .context("tracked-path probe returned a malformed index entry")?;
+            let metadata = std::str::from_utf8(&record[..tab])
+                .context("tracked-path probe returned invalid index metadata")?;
+            let mut fields = metadata.split(' ');
+            let mode = fields.next().context("tracked index mode unavailable")?;
+            let _oid = fields.next().context("tracked index object unavailable")?;
+            let stage = fields.next().context("tracked index stage unavailable")?;
+            ensure!(
+                fields.next().is_none() && stage == "0",
+                "tracked-path probe returned a non-stage-zero index entry"
+            );
+            let path = std::str::from_utf8(&record[tab + 1..])
+                .context("tracked path is not valid UTF-8; refusing ambiguous snapshot")?;
+            let path = PathBuf::from(path);
+            ensure!(
+                !path.as_os_str().is_empty()
+                    && path
+                        .components()
+                        .all(|component| matches!(component, Component::Normal(_))),
+                "tracked path is not a safe worktree-relative path"
+            );
+            let gitlink = match mode {
+                "100644" | "100755" | "120000" => false,
+                "160000" => true,
+                _ => anyhow::bail!("unsupported tracked path mode {mode}"),
+            };
+            let (kind, digest) = tracked_path_digest(root, &path, gitlink)?;
+            ensure!(
+                kind != TrackedKind::Other && (!gitlink || kind == TrackedKind::Gitlink),
+                "tracked path has an unexpected filesystem type: {}",
+                path.display()
+            );
+            paths.push(TrackedPathSnapshot { path, kind, digest });
+        }
+        Ok(Self { paths })
+    }
+
+    fn verify(&self, root: &Path) -> Result<()> {
+        let mut changed = Vec::new();
+        for expected in &self.paths {
+            match tracked_path_digest(root, &expected.path, expected.kind == TrackedKind::Gitlink) {
+                Ok((kind, digest)) if kind == expected.kind && digest == expected.digest => {}
+                _ => changed.push(format!("{:?}", expected.path)),
+            }
+        }
+        ensure!(
+            changed.is_empty(),
+            "gate changed {} tracked file(s) under test: {}",
+            changed.len(),
+            changed
+                .iter()
+                .take(5)
+                .cloned()
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+        Ok(())
+    }
+}
+
+fn tracked_path_digest(
+    root: &Path,
+    path: &Path,
+    gitlink: bool,
+) -> Result<(TrackedKind, Option<[u8; 32]>)> {
+    let mut current = root.to_path_buf();
+    let mut components = path.components().peekable();
+    while let Some(component) = components.next() {
+        let Component::Normal(name) = component else {
+            anyhow::bail!("tracked path is not worktree-relative")
+        };
+        current.push(name);
+        if components.peek().is_some() {
+            let metadata = std::fs::symlink_metadata(&current)?;
+            ensure!(
+                metadata.file_type().is_dir(),
+                "tracked path parent is not a directory: {}",
+                current.display()
+            );
+        }
+    }
+    let metadata = std::fs::symlink_metadata(&current)?;
+    let file_type = metadata.file_type();
+    if file_type.is_dir() && gitlink {
+        return Ok((TrackedKind::Gitlink, None));
+    }
+    if file_type.is_file() && !gitlink {
+        let mut file = std::fs::File::open(&current)?;
+        ensure!(
+            file.metadata()?.file_type().is_file(),
+            "tracked path changed kind while being read: {}",
+            path.display()
+        );
+        let mut hash = Sha256::new();
+        let mut buffer = [0_u8; 16 * 1024];
+        loop {
+            let count = file.read(&mut buffer)?;
+            if count == 0 {
+                break;
+            }
+            hash.update(&buffer[..count]);
+        }
+        return Ok((TrackedKind::Regular, Some(hash.finalize().into())));
+    }
+    if file_type.is_symlink() && !gitlink {
+        let target = std::fs::read_link(&current)?;
+        return Ok((
+            TrackedKind::Symlink,
+            Some(Sha256::digest(target.as_os_str().as_encoded_bytes()).into()),
+        ));
+    }
+    Ok((TrackedKind::Other, None))
 }
 
 impl Workspace {
@@ -731,6 +884,21 @@ impl Workspace {
                     "gate checkout failed; existing path retained without repair"
                 );
                 previous.verify(Some(oid))?;
+                ensure!(
+                    gate_git_ok(
+                        &wt,
+                        &[
+                            "-c",
+                            "core.fsmonitor=false",
+                            "-c",
+                            "core.hooksPath=/dev/null",
+                            "clean",
+                            "-ffd",
+                            "-q"
+                        ]
+                    ),
+                    "gate cleanup of untracked files failed; existing path retained"
+                );
             }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
                 // No --force and no global prune: an orphaned registration holds
@@ -761,12 +929,17 @@ impl Workspace {
             lock,
             checkout,
             oid: oid.into(),
+            tracked_snapshot: None,
             target,
             target_private,
             temporary_parent,
         };
         workspace.verify()?;
-        workspace.materialize(poisoned, wait)
+        let mut workspace = workspace.materialize(poisoned, wait)?;
+        workspace.tracked_snapshot = Some(TrackedSnapshot::capture(
+            workspace.checkout.worktree.path(),
+        )?);
+        Ok(workspace)
     }
 
     /// Fresh index entries have no inherited stat-cache trust. Blocking waits
@@ -852,6 +1025,10 @@ impl Workspace {
 
     fn verify_snapshot(&self) -> Result<()> {
         self.verify()?;
+        self.tracked_snapshot
+            .as_ref()
+            .context("gate tracked-path snapshot unavailable")?
+            .verify(self.checkout.worktree.path())?;
         index_matches(self.checkout.worktree.path(), &self.oid)
     }
 

@@ -278,12 +278,27 @@ fn used_filter_runs_only_during_materialization_and_preserves_real_index() {
     assert_eq!(git(&f.repo, &["show-ref"]), refs);
     assert_eq!(std::fs::read(f.repo.join(".git/config")).unwrap(), config);
     drop(workspace);
+    std::fs::write(&marker, "").unwrap();
+    std::fs::write(f.repo.join(".gitattributes"), "value filter=canary\n").unwrap();
+    git(&f.repo, &["add", ".gitattributes"]);
+    git(
+        &f.repo,
+        &[
+            "-c",
+            "commit.gpgsign=false",
+            "commit",
+            "-m",
+            "filter attribute",
+        ],
+    );
+    let oid = git(&f.repo, &["rev-parse", "HEAD"]);
     let mut gate = f.config.clone();
     gate.gate_command = "test \"$(cat value)\" = SMUDGED:one".into();
     assert!(matches!(
-        gate_tip(&f.repo, &f.first, &gate).unwrap(),
+        gate_tip(&f.repo, &oid, &gate).unwrap(),
         GateVerdict::Passed
     ));
+    assert_eq!(std::fs::read_to_string(&marker).unwrap(), "smudge\n");
 }
 
 #[test]
@@ -729,6 +744,50 @@ fn reused_gate_requires_lock_and_preserves_ignored_artifacts() {
 }
 
 #[test]
+fn reused_gate_removes_stale_untracked_files_from_a_prior_candidate() {
+    let f = Fixture::new();
+    if !posix_shell_gate_only() || !f.supported_or_refused() {
+        return;
+    }
+    let mut first = f.config.clone();
+    first.gate_command = "printf stale > stale.txt".into();
+    assert!(gate_tip(&f.repo, &f.first, &first).unwrap().passed());
+    assert!(f.wt().join("stale.txt").exists());
+
+    let second = MergeQueueConfig {
+        gate_command: "test ! -e stale.txt".into(),
+        ..f.config.clone()
+    };
+    assert!(gate_tip(&f.repo, &f.second, &second).unwrap().passed());
+    assert!(!f.wt().join("stale.txt").exists());
+}
+
+#[test]
+fn reused_gate_still_preserves_ignored_artifacts_after_clean() {
+    let f = Fixture::new();
+    if !posix_shell_gate_only() || !f.supported_or_refused() {
+        return;
+    }
+    std::fs::write(f.repo.join(".git/info/exclude"), "/artifact\n").unwrap();
+    let first = MergeQueueConfig {
+        gate_command: "printf stale > stale.txt; printf warm > artifact".into(),
+        ..f.config.clone()
+    };
+    assert!(gate_tip(&f.repo, &f.first, &first).unwrap().passed());
+
+    let second = MergeQueueConfig {
+        gate_command: "test ! -e stale.txt && test \"$(cat artifact)\" = warm".into(),
+        ..f.config.clone()
+    };
+    assert!(gate_tip(&f.repo, &f.second, &second).unwrap().passed());
+    assert!(!f.wt().join("stale.txt").exists());
+    assert_eq!(
+        std::fs::read_to_string(f.wt().join("artifact")).unwrap(),
+        "warm"
+    );
+}
+
+#[test]
 fn lock_acquisition_failure_isolates_without_touching_reused_worktree() {
     let f = Fixture::new();
     if !f.supported_or_refused() {
@@ -1078,6 +1137,114 @@ fn gate_that_only_refreshes_the_index_still_passes() {
         .unwrap(),
         GateVerdict::Passed
     ));
+}
+
+#[test]
+fn setup_that_rewrites_a_tracked_file_is_a_gate_error() {
+    let f = Fixture::new();
+    if !posix_shell_gate_only() || !f.supported_or_refused() {
+        return;
+    }
+    let main_before = git(&f.repo, &["show-ref", "refs/heads/main"]);
+    let config = MergeQueueConfig {
+        gate_setup_command: "printf fixed > value".into(),
+        ..f.config.clone()
+    };
+    let log = match gate_tip(&f.repo, &f.first, &config).unwrap() {
+        GateVerdict::Error { log, .. } => log,
+        other => panic!("expected tracked-file mutation to be an infrastructure error: {other:?}"),
+    };
+    assert!(
+        log.contains("value"),
+        "gate error did not identify the path: {log}"
+    );
+    assert_eq!(git(&f.repo, &["show-ref", "refs/heads/main"]), main_before);
+}
+
+#[test]
+fn gate_that_rewrites_a_tracked_file_is_a_gate_error() {
+    let f = Fixture::new();
+    if !posix_shell_gate_only() || !f.supported_or_refused() {
+        return;
+    }
+    let main_before = git(&f.repo, &["show-ref", "refs/heads/main"]);
+    let config = MergeQueueConfig {
+        gate_command: "printf fixed > value".into(),
+        ..f.config.clone()
+    };
+    let log = match gate_tip(&f.repo, &f.first, &config).unwrap() {
+        GateVerdict::Error { log, .. } => log,
+        other => panic!("expected tracked-file mutation to be an infrastructure error: {other:?}"),
+    };
+    assert!(
+        log.contains("value"),
+        "gate error did not identify the path: {log}"
+    );
+    assert_eq!(git(&f.repo, &["show-ref", "refs/heads/main"]), main_before);
+}
+
+#[test]
+fn gate_that_deletes_a_tracked_file_is_a_gate_error() {
+    let f = Fixture::new();
+    if !posix_shell_gate_only() || !f.supported_or_refused() {
+        return;
+    }
+    let main_before = git(&f.repo, &["show-ref", "refs/heads/main"]);
+    let config = MergeQueueConfig {
+        gate_command: "rm value".into(),
+        ..f.config.clone()
+    };
+    let log = match gate_tip(&f.repo, &f.first, &config).unwrap() {
+        GateVerdict::Error { log, .. } => log,
+        other => panic!("expected tracked-file deletion to be an infrastructure error: {other:?}"),
+    };
+    assert!(
+        log.contains("value"),
+        "gate error did not identify the path: {log}"
+    );
+    assert_eq!(git(&f.repo, &["show-ref", "refs/heads/main"]), main_before);
+}
+
+#[test]
+fn gate_that_retypes_a_tracked_file_is_a_gate_error() {
+    let f = Fixture::new();
+    if !posix_shell_gate_only() || !f.supported_or_refused() {
+        return;
+    }
+    let main_before = git(&f.repo, &["show-ref", "refs/heads/main"]);
+    let config = MergeQueueConfig {
+        gate_command: "rm value && mkdir value".into(),
+        ..f.config.clone()
+    };
+    let log = match gate_tip(&f.repo, &f.first, &config).unwrap() {
+        GateVerdict::Error { log, .. } => log,
+        other => panic!("expected tracked-file retype to be an infrastructure error: {other:?}"),
+    };
+    assert!(
+        log.contains("value"),
+        "gate error did not identify the path: {log}"
+    );
+    assert_eq!(git(&f.repo, &["show-ref", "refs/heads/main"]), main_before);
+}
+
+#[test]
+fn gate_creating_untracked_outputs_still_passes() {
+    let f = Fixture::new();
+    if !posix_shell_gate_only() || !f.supported_or_refused() {
+        return;
+    }
+    let config = MergeQueueConfig {
+        gate_command: "mkdir -p out && echo x > out/build.log".into(),
+        ..f.config.clone()
+    };
+    assert!(matches!(
+        gate_tip(&f.repo, &f.first, &config).unwrap(),
+        GateVerdict::Passed
+    ));
+    assert_eq!(
+        std::fs::read_to_string(f.wt().join("out/build.log")).unwrap(),
+        "x\n"
+    );
 }
 
 #[test]
