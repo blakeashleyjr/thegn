@@ -5,7 +5,7 @@ use std::process::{Child, Command, ExitStatus, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use thegn_core::config::{Config, SandboxBackend, SandboxProfile};
+use thegn_core::config::{SandboxBackend, SandboxProfile};
 use thegn_core::placement::Placement;
 use thegn_core::remote::GitLoc;
 use thegn_core::sandbox::{self, Backend};
@@ -26,14 +26,40 @@ struct RunningDaemon {
 
 impl Drop for RunningDaemon {
     fn drop(&mut self) {
-        stop_child_bounded(&mut self.child, Duration::from_secs(2));
+        let timeout = Duration::from_secs(2);
+        if let Err(error) = self.child.kill()
+            && error.kind() != std::io::ErrorKind::InvalidInput
+        {
+            let _write_result = writeln!(
+                std::io::stderr().lock(),
+                "security_e2e: could not kill daemon during cleanup: {error}"
+            );
+            return;
+        }
+        let deadline = Instant::now() + timeout;
+        loop {
+            match self.child.try_wait() {
+                Ok(Some(_)) => return,
+                Ok(None) if Instant::now() < deadline => thread::sleep(Duration::from_millis(20)),
+                Ok(None) => {
+                    let _write_result = writeln!(
+                        std::io::stderr().lock(),
+                        "security_e2e: daemon did not exit after kill within {timeout:?}"
+                    );
+                    return;
+                }
+                Err(error) => {
+                    let _write_result = writeln!(
+                        std::io::stderr().lock(),
+                        "security_e2e: could not poll daemon during cleanup: {error}"
+                    );
+                    return;
+                }
+            }
+        }
     }
 }
 
-#[expect(
-    clippy::disallowed_methods,
-    reason = "the security integration test needs to spawn a bounded prerequisite probe"
-)]
 fn spawn_captured(command: &mut Command, stdout: &Path, stderr: &Path) -> Child {
     let stdout_file = File::create(stdout).expect("create bounded stdout capture");
     let stderr_file = File::create(stderr).expect("create bounded stderr capture");
@@ -44,10 +70,6 @@ fn spawn_captured(command: &mut Command, stdout: &Path, stderr: &Path) -> Child 
         .expect("spawn bounded child process")
 }
 
-#[expect(
-    clippy::disallowed_methods,
-    reason = "the isolated daemon has no output capture and is owned by a bounded cleanup guard"
-)]
 fn spawn_quiet(command: &mut Command) -> Child {
     command
         .stdout(Stdio::null())
@@ -78,10 +100,6 @@ fn enforce_capture_cap(path: &Path) {
     }
 }
 
-#[expect(
-    clippy::disallowed_methods,
-    reason = "the fixture must terminate and reap its daemon under a bounded cleanup deadline"
-)]
 fn stop_child_bounded(child: &mut Child, timeout: Duration) {
     if let Err(error) = child.kill()
         && error.kind() != std::io::ErrorKind::InvalidInput
@@ -101,10 +119,6 @@ fn stop_child_bounded(child: &mut Child, timeout: Duration) {
     }
 }
 
-#[expect(
-    clippy::disallowed_methods,
-    reason = "the security integration test polls and reaps a child under a total deadline"
-)]
 fn wait_bounded(mut child: Child, stdout: &Path, stderr: &Path, timeout: Duration) -> Captured {
     let deadline = Instant::now() + timeout;
     loop {
@@ -245,19 +259,6 @@ impl Fixture {
             .env_remove("THEGN_DATABASE_MIGRATION_AUTHORITY");
     }
 
-    fn host_sessions(&self, label: &str) -> Captured {
-        let mut command = Command::new(env!("CARGO_BIN_EXE_thegn"));
-        command.args(["session", "list", "--json"]);
-        self.child_env(&mut command);
-        let result = run_bounded(&mut command, self.captures.path(), label, PROCESS_TIMEOUT);
-        assert!(
-            result.status.success(),
-            "host session list failed: {}",
-            String::from_utf8_lossy(&result.stderr)
-        );
-        result
-    }
-
     fn assert_no_sessions(&self, captured: &Captured) {
         let sessions: Vec<serde_json::Value> =
             serde_json::from_slice(&captured.stdout).expect("session list emits a JSON array");
@@ -268,11 +269,13 @@ impl Fixture {
     }
 
     fn hardened_argv(&self, inner: &str) -> Vec<String> {
-        let mut config = Config::default();
-        config.sandbox.enabled = true;
-        config.sandbox.backend = SandboxBackend::Bwrap;
-        config.sandbox.backend_chain = vec!["bwrap".to_string()];
-        config.sandbox.profile = SandboxProfile::Hardened;
+        let sandbox_config = thegn_core::config::SandboxConfig {
+            enabled: true,
+            backend: SandboxBackend::Bwrap,
+            backend_chain: vec!["bwrap".into()],
+            profile: SandboxProfile::Hardened,
+            ..Default::default()
+        };
         let location = GitLoc::from_db(
             self.worktree
                 .path()
@@ -281,7 +284,7 @@ impl Fixture {
             None,
         );
         let spec = sandbox::resolve_placed_exact(
-            &config.sandbox,
+            &sandbox_config,
             &location,
             "security-e2e",
             SandboxProfile::Hardened,
@@ -308,6 +311,32 @@ impl Fixture {
         command.args(args).current_dir(self.worktree.path());
         self.child_env(&mut command);
         run_bounded(&mut command, self.captures.path(), label, PROCESS_TIMEOUT)
+    }
+
+    fn probe_config(&self) -> (PathBuf, PathBuf) {
+        let config_home = self.worktree.path().join("probe-config");
+        let config_dir = config_home.join("thegn");
+        fs::create_dir_all(&config_dir).expect("create in-worktree config directory");
+        let config_path = config_dir.join("config.toml");
+        let socket = self.socket.to_string_lossy();
+        fs::write(&config_path, format!("[daemon]\nsocket = {socket:?}\n"))
+            .expect("write probe config");
+        (config_home, config_path)
+    }
+
+    fn host_sessions_with_config(&self, label: &str, config_home: &Path) -> Captured {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_thegn"));
+        command.args(["session", "list", "--json"]);
+        self.child_env(&mut command);
+        command.env("XDG_CONFIG_HOME", config_home);
+        let result = run_bounded(&mut command, self.captures.path(), label, PROCESS_TIMEOUT);
+        assert!(
+            result.status.success(),
+            "host session list with probe config failed: stdout: {} stderr: {}",
+            String::from_utf8_lossy(&result.stdout),
+            String::from_utf8_lossy(&result.stderr)
+        );
+        result
     }
 }
 
@@ -349,21 +378,37 @@ fn security_e2e_hardened_pane_cannot_stop_daemon() {
         return;
     }
     let fixture = Fixture::new();
-    let inner = concat!(
-        "output=$(./thegn daemon stop 2>&1); status=$?; ",
-        "printf '%s\\n' \"$output\"; ",
-        "if [ \"$status\" -ne 0 ]; then exit \"$status\"; fi; ",
-        "case \"$output\" in ",
-        "*'no thegn pane daemon is running'*) exit 1;; *) exit 0;; esac"
+    let (config_home, _) = fixture.probe_config();
+    let inner = format!(
+        "XDG_CONFIG_HOME={} ./thegn daemon stop",
+        shell_quote(config_home.to_str().expect("config home path is UTF-8"))
     );
-    let probe = fixture.run_pane("stop-probe", inner);
+    let host = fixture.host_sessions_with_config("host-stop-control", &config_home);
+    fixture.assert_no_sessions(&host);
+    let version = fixture.run_pane("version-control", "./thegn --version");
+    assert!(
+        version.status.success(),
+        "in-pane thegn --version failed: stdout: {} stderr: {}",
+        String::from_utf8_lossy(&version.stdout),
+        String::from_utf8_lossy(&version.stderr)
+    );
+    let probe = fixture.run_pane("stop-probe", &inner);
     assert!(
         !probe.status.success(),
         "hardened pane reached the daemon control socket; stdout: {} stderr: {}",
         String::from_utf8_lossy(&probe.stdout),
         String::from_utf8_lossy(&probe.stderr)
     );
-    let host = fixture.host_sessions("sessions-after-stop");
+    let probe_output = format!(
+        "{}{}",
+        String::from_utf8_lossy(&probe.stdout),
+        String::from_utf8_lossy(&probe.stderr)
+    );
+    assert!(
+        probe_output.contains("no thegn pane daemon is running"),
+        "probe failed for an unrelated reason: {probe_output}"
+    );
+    let host = fixture.host_sessions_with_config("sessions-after-stop", &config_home);
     fixture.assert_no_sessions(&host);
 }
 
@@ -373,10 +418,7 @@ fn security_e2e_hardened_pane_cannot_open_host_session() {
         return;
     }
     let fixture = Fixture::new();
-    let config_home = fixture.worktree.path().join("probe-config");
-    let config_dir = config_home.join("thegn");
-    fs::create_dir_all(&config_dir).expect("create in-worktree config directory");
-    let config_path = config_dir.join("config.toml");
+    let (config_home, config_path) = fixture.probe_config();
     let socket = fixture.socket.to_string_lossy();
     let command = format!(
         "touch {}",
@@ -389,6 +431,15 @@ fn security_e2e_hardened_pane_cannot_open_host_session() {
         ),
     )
     .expect("write attack config");
+    let host = fixture.host_sessions_with_config("host-open-control", &config_home);
+    fixture.assert_no_sessions(&host);
+    let version = fixture.run_pane("open-version-control", "./thegn --version");
+    assert!(
+        version.status.success(),
+        "in-pane thegn --version failed: stdout: {} stderr: {}",
+        String::from_utf8_lossy(&version.stdout),
+        String::from_utf8_lossy(&version.stderr)
+    );
     let inner = format!(
         "XDG_CONFIG_HOME={} ./thegn session open --agent probe --worktree . --prompt x",
         shell_quote(config_home.to_str().expect("config home path is UTF-8"))
@@ -400,9 +451,21 @@ fn security_e2e_hardened_pane_cannot_open_host_session() {
         String::from_utf8_lossy(&probe.stdout),
         String::from_utf8_lossy(&probe.stderr)
     );
-    thread::sleep(Duration::from_millis(100));
+    let probe_output = format!(
+        "{}{}",
+        String::from_utf8_lossy(&probe.stdout),
+        String::from_utf8_lossy(&probe.stderr)
+    );
+    assert!(
+        probe_output.contains("no thegn pane daemon is running"),
+        "probe failed for an unrelated reason: {probe_output}"
+    );
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while fixture.marker.exists() && Instant::now() < deadline {
+        thread::sleep(Duration::from_millis(20));
+    }
     assert!(!fixture.marker.exists(), "host-only marker was created");
-    let host = fixture.host_sessions("sessions-after-open");
+    let host = fixture.host_sessions_with_config("sessions-after-open", &config_home);
     fixture.assert_no_sessions(&host);
 }
 
