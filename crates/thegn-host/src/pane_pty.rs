@@ -339,6 +339,8 @@ impl std::fmt::Display for LauncherError {
 
 impl std::error::Error for LauncherError {}
 
+type PinnedLaunch = (Vec<String>, Vec<(String, String)>);
+
 fn host_launcher_path(
     name: &'static str,
     host_path: Option<&OsStr>,
@@ -373,7 +375,7 @@ fn pin_outer_launcher(
     argv: &[String],
     env: Vec<(String, String)>,
     host_path: Option<&OsStr>,
-) -> Result<(Vec<String>, Vec<(String, String)>), LauncherError> {
+) -> Result<PinnedLaunch, LauncherError> {
     let mut pinned_argv = argv.to_vec();
     let mut bwrap_index = None;
     let outer_name = match argv.first().map(String::as_str) {
