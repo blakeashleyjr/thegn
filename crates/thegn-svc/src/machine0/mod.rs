@@ -744,7 +744,7 @@ impl RemoteProvider for Machine0Provider {
     fn list<'a>(&'a self) -> BoxFuture<'a, Result<Vec<String>>> {
         Box::pin(async move {
             let v = self.call(tool::VM_LIST, json!({})).await?;
-            Ok(parse_vm_list(&v))
+            parse_vm_list(&v)
         })
     }
 }
@@ -1047,16 +1047,26 @@ pub fn parse_vm(v: &Value) -> Option<Machine0Vm> {
 }
 
 /// Parse a `vm_list` response (array, or `{machines|vms|items: [...]}`) into
-/// names (falling back to ids). Pure.
-pub fn parse_vm_list(v: &Value) -> Vec<String> {
-    array_field(v, &["machines", "vms", "items"])
-        .iter()
-        .filter_map(|e| {
-            let obj = e.get("machine").or_else(|| e.get("vm")).unwrap_or(e);
-            obj.get("name")
-                .or_else(|| obj.get("id"))
+/// names (falling back to ids). Refuses unknown shapes and unidentifiable rows.
+pub fn parse_vm_list(v: &Value) -> Result<Vec<String>> {
+    let rows = strict_array_field(v, &["machines", "vms", "items"]).map_err(|_| {
+        anyhow!("machine0: vm_list returned an unrecognised response shape; refusing to treat it as an empty VM list")
+    })?;
+    rows.iter()
+        .enumerate()
+        .map(|(index, row)| {
+            let obj = row.get("machine").or_else(|| row.get("vm")).unwrap_or(row);
+            let name = obj
+                .get("name")
                 .and_then(Value::as_str)
+                .filter(|s| !s.is_empty());
+            let id = obj
+                .get("id")
+                .and_then(Value::as_str)
+                .filter(|s| !s.is_empty());
+            name.or(id)
                 .map(str::to_string)
+                .ok_or_else(|| anyhow!("machine0: vm_list element {index} has no name or id"))
         })
         .collect()
 }
@@ -1183,6 +1193,28 @@ fn array_field(v: &Value, keys: &[&str]) -> Vec<Value> {
         }
     }
     Vec::new()
+}
+
+/// Borrow the VM rows only when the response has one recognized list shape.
+fn strict_array_field<'a>(v: &'a Value, keys: &[&str]) -> Result<&'a [Value]> {
+    if let Some(rows) = v.as_array() {
+        return Ok(rows);
+    }
+    let Some(object) = v.as_object() else {
+        return Err(anyhow!("unrecognised list shape"));
+    };
+    let mut present = keys.iter().filter(|key| object.contains_key(**key));
+    let Some(key) = present.next() else {
+        return Err(anyhow!("unrecognised list shape"));
+    };
+    if present.next().is_some() {
+        return Err(anyhow!("unrecognised list shape"));
+    }
+    object
+        .get(*key)
+        .and_then(Value::as_array)
+        .map(Vec::as_slice)
+        .ok_or_else(|| anyhow!("unrecognised list shape"))
 }
 
 /// Whether two OpenSSH public keys are the same material (compare `type base64`,
@@ -1428,10 +1460,63 @@ mod tests {
     #[test]
     fn parse_vm_list_names_or_ids() {
         let arr = json!([{ "name": "a" }, { "id": "b" }, { "vm": { "name": "c" } }]);
-        assert_eq!(parse_vm_list(&arr), vec!["a", "b", "c"]);
+        assert_eq!(parse_vm_list(&arr).unwrap(), vec!["a", "b", "c"]);
         let env = json!({ "machines": [{ "name": "x" }] });
-        assert_eq!(parse_vm_list(&env), vec!["x"]);
-        assert!(parse_vm_list(&json!({})).is_empty());
+        assert_eq!(parse_vm_list(&env).unwrap(), vec!["x"]);
+    }
+
+    #[test]
+    fn parse_vm_list_refuses_unknown_shapes() {
+        let cases = [
+            json!({}),
+            json!(null),
+            json!("x"),
+            json!({ "data": [{ "name": "a" }] }),
+            json!({ "machines": null }),
+            json!({ "machines": { "name": "a" } }),
+            json!({ "machines": [], "vms": [] }),
+        ];
+
+        for response in cases {
+            let result = parse_vm_list(&response);
+            assert!(result.is_err(), "accepted response shape: {response}");
+            let error = result.err().expect("response should have been rejected");
+            assert!(
+                !error.to_string().contains(&response.to_string()),
+                "error exposed response body: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn parse_vm_list_refuses_unidentifiable_rows() {
+        let result = parse_vm_list(&json!([{ "name": "a" }, { "vmName": "b" }]));
+        assert!(matches!(result, Err(error) if error.to_string().contains("element 1")));
+        assert!(parse_vm_list(&json!([{ "name": "" }])).is_err());
+    }
+
+    #[test]
+    fn parse_vm_list_accepts_known_shapes_and_empty() {
+        assert_eq!(parse_vm_list(&json!([])).unwrap(), Vec::<String>::new());
+        for response in [
+            json!({ "machines": [{ "name": "machine" }] }),
+            json!({ "vms": [{ "name": "vm" }] }),
+            json!({ "items": [{ "name": "item" }] }),
+        ] {
+            assert_eq!(parse_vm_list(&response).unwrap().len(), 1);
+        }
+        assert_eq!(
+            parse_vm_list(&json!({ "machines": [] })).unwrap(),
+            Vec::<String>::new()
+        );
+        assert_eq!(
+            parse_vm_list(&json!({ "vm": { "id": "vm-id" } })).unwrap(),
+            vec!["vm-id"]
+        );
+        assert_eq!(
+            parse_vm_list(&json!([{ "name": "", "id": "fallback-id" }])).unwrap(),
+            vec!["fallback-id"]
+        );
     }
 
     #[test]
