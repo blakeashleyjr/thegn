@@ -3,6 +3,7 @@ from __future__ import annotations
 import base64
 import hashlib
 import os
+import re
 import shutil
 import subprocess
 import tempfile
@@ -261,15 +262,32 @@ class WorkflowPolicyTests(unittest.TestCase):
     def test_publish_aur_consumes_srcinfo_artifact(self) -> None:
         job = read_workflow("release.yml")["jobs"]["publish-aur"]
         self.assertIn("aur-srcinfo", job.get("needs", []))
-        self.assertTrue(
-            any(
-                step.get("uses", "").startswith("actions/download-artifact@")
-                for step in job.get("steps", [])
-            )
-        )
+        steps = job.get("steps", [])
+        downloads = [
+            step for step in steps
+            if step.get("uses", "").startswith("actions/download-artifact@")
+        ]
+        self.assertEqual(1, len(downloads))
+        self.assertEqual("aur-metadata", downloads[0].get("with", {}).get("name"))
+        srcinfo_job = read_workflow("release.yml")["jobs"]["aur-srcinfo"]
+        uploads = [
+            step for step in srcinfo_job.get("steps", [])
+            if step.get("uses", "").startswith("actions/upload-artifact@")
+        ]
+        self.assertEqual(1, len(uploads))
+        self.assertEqual("aur-metadata", uploads[0].get("with", {}).get("name"))
+        self.assertIs(uploads[0].get("with", {}).get("include-hidden-files"), True)
         job_text = yaml.safe_dump(job)
         self.assertNotIn("makepkg", job_text)
         self.assertNotRegex(job_text, r"(?m)\bsource\s+[^\n]*PKGBUILD")
+        validation = next(
+            step for step in steps
+            if step.get("name") == "Require exactly the generated AUR metadata files"
+        )
+        validation_script = validation.get("run", "")
+        self.assertIn("LC_ALL=C sort", validation_script)
+        self.assertIn('[ -L "$RUNNER_TEMP/aur-metadata/.SRCINFO" ]', validation_script)
+        self.assertIn('[ -L "$RUNNER_TEMP/aur-metadata/PKGBUILD" ]', validation_script)
 
     def test_publish_roots_live_under_runner_temp(self) -> None:
         jobs = read_workflow("release.yml")["jobs"]
@@ -279,10 +297,13 @@ class WorkflowPolicyTests(unittest.TestCase):
                 script = step.get("run", "")
                 if "mktemp -d" in script:
                     with self.subTest(job=name, step=step.get("name")):
-                        self.assertRegex(
-                            script,
-                            r'mktemp -d "?\$RUNNER_TEMP/',
-                        )
+                        for match in re.findall(
+                            r'mktemp -d(?:\s+("?[^\s)]+))?', script
+                        ):
+                            self.assertTrue(
+                                match.lstrip('"').startswith("$RUNNER_TEMP/"),
+                                f"mktemp directory must be under RUNNER_TEMP: {match!r}",
+                            )
 
     def test_sandbox_publication_is_serialized(self) -> None:
         workflow = read_workflow("sandbox-image.yml")
