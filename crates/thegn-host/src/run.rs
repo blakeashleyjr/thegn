@@ -6580,7 +6580,7 @@ async fn ensure_app_loaded(
 // `media_ctl` sibling module (run.rs is line-ratcheted); import them by name so
 // the event-loop call sites read unchanged.
 use crate::media_ctl::{
-    MediaGeneration, MediaOp, MediaPick, media_effective_cfg, restart_media_watch, spawn_media_op,
+    Latest, MediaGeneration, MediaOp, media_effective_cfg, restart_media_watch, spawn_media_op,
     spawn_media_pick, spawn_media_sources,
 };
 
@@ -7683,7 +7683,7 @@ async fn event_loop<T: Terminal>(
     // "Select player" choice.
     let (media_tx, mut media_rx) =
         tokio::sync::watch::channel::<Option<crate::media_watch::MediaSnapshotDelivery>>(None);
-    let (media_pick_tx, mut media_pick_rx) = tokio_mpsc::unbounded_channel::<MediaPick>();
+    let media_pick_slot = Latest::new();
     // Explicit clipboard-image paste (THE-24): the off-loop worker reads/gates/
     // drops the image and sends the pane + path to paste (or a status message).
     let (paste_img_tx, mut paste_img_rx) =
@@ -7693,10 +7693,8 @@ async fn event_loop<T: Terminal>(
     let (font_tx, mut font_rx) = tokio_mpsc::unbounded_channel::<crate::font::DiscoveryResult>();
     let mut font_discovery = crate::font::DiscoveryOwner::default();
     // The docked Media section's async up-next queue and cover-art feeds.
-    let (media_queue_tx, mut media_queue_rx) =
-        tokio_mpsc::unbounded_channel::<crate::panel::media::MediaQueueDelivery>();
-    let (media_sources_tx, mut media_sources_rx) =
-        tokio_mpsc::unbounded_channel::<crate::panel::media::MediaSourcesDelivery>();
+    let media_queue_slot = Latest::new();
+    let media_sources_slot = Latest::new();
     let mut media_caps: Option<thegn_core::media::MediaCaps> = None;
     let (media_art_tx, mut media_art_rx) =
         tokio::sync::watch::channel::<Option<crate::media_art::ArtMosaic>>(None);
@@ -13412,7 +13410,7 @@ async fn event_loop<T: Terminal>(
                 crate::media_ctl::spawn_media_queue(
                     cfg.clone(),
                     request,
-                    media_queue_tx.clone(),
+                    media_queue_slot.clone(),
                     waker.clone(),
                 );
             }
@@ -13420,7 +13418,7 @@ async fn event_loop<T: Terminal>(
                 .media
                 .take_sources_request(model.panel.media.as_ref())
             {
-                spawn_media_sources(cfg, request, media_sources_tx.clone(), waker.clone());
+                spawn_media_sources(cfg, request, media_sources_slot.clone(), waker.clone());
             }
         }
         if let Some(url) = crate::handlers::media_panel::art_request(
@@ -13435,44 +13433,25 @@ async fn event_loop<T: Terminal>(
         bars_dirty |= media_bars;
         dirty |= crate::handlers::voice::drain(&mut voice, &mut panes, focused, &mut model, &waker);
         // Media picker results: open a secondary palette of playlists / players.
-        while let Ok(pick) = media_pick_rx.try_recv() {
+        if let Some(pick) = media_pick_slot.take() {
             loop_perf.tick(crate::perf::WakeSource::Refresh);
-            let items: Vec<crate::palette::PaletteItem> = match pick {
-                MediaPick::Playlists(pls) => pls
-                    .into_iter()
-                    .map(|p| {
-                        crate::palette::PaletteItem::new(
-                            format!("media-playlist:{}", p.id),
-                            format!("\u{1f3b5} {}", p.name),
-                        )
-                    })
-                    .collect(),
-                MediaPick::Players(players) => players
-                    .into_iter()
-                    .map(|p| {
-                        crate::palette::PaletteItem::new(
-                            format!("media-player:{p}"),
-                            format!("\u{25b6} {p}"),
-                        )
-                    })
-                    .collect(),
-            };
-            if items.is_empty() {
-                model.status = "Media: nothing to pick".into();
-            } else {
-                palette = Some(crate::search_everywhere::PaletteSession::new(items));
+            match crate::media_ctl::pick_palette(pick) {
+                Ok(items) => {
+                    palette = Some(crate::search_everywhere::PaletteSession::new(items));
+                }
+                Err(text) => model.status = text,
             }
             dirty = true;
         }
         // Docked Media section feeds: up-next queue + decoded cover art.
-        while let Ok(delivery) = media_queue_rx.try_recv() {
+        if let Some(delivery) = media_queue_slot.take() {
             loop_perf.tick(crate::perf::WakeSource::Refresh);
             panel_ui
                 .media
                 .set_queue(delivery.request, model.panel.media.as_ref(), delivery.queue);
             dirty = true;
         }
-        while let Ok(delivery) = media_sources_rx.try_recv() {
+        if let Some(delivery) = media_sources_slot.take() {
             loop_perf.tick(crate::perf::WakeSource::Refresh);
             panel_ui.media.set_sources(
                 delivery.request,
@@ -27351,7 +27330,7 @@ async fn event_loop<T: Terminal>(
                                             &media_player_override,
                                         ),
                                         players,
-                                        media_pick_tx.clone(),
+                                        media_pick_slot.clone(),
                                         waker.clone(),
                                     );
                                 } else {
