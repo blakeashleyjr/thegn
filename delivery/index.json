@@ -510,7 +510,8 @@
     },
     {
       "change": "atomic-fold-outcomes",
-      "lifecycle": "active",
+      "archive_path": "openspec/changes/archive/2026-10-19-atomic-fold-outcomes/",
+      "lifecycle": "archived",
       "disposition": "alpha-delivery",
       "owners": [
         {
@@ -1188,7 +1189,8 @@
     },
     {
       "change": "select-before-snapshot",
-      "lifecycle": "active",
+      "archive_path": "openspec/changes/archive/2026-10-19-select-before-snapshot/",
+      "lifecycle": "archived",
       "disposition": "alpha-delivery",
       "owners": [
         {
