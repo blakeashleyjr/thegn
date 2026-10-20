@@ -2657,7 +2657,7 @@ mod tests {
         let (_dir, db) = db("set-status-json-evidence");
         let id = db
             .put_agent_dispatch(NewDispatch {
-                artifact_path: Some("missing-handoff.md".into()),
+                artifact_path: Some("missing-handoff.md"),
                 ..NewDispatch::new("linear:THE-977", "/wt/missing", "claude")
             })
             .unwrap();
