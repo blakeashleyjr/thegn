@@ -100,7 +100,7 @@ fn busy_status_write_before_attempt_stops_without_git_attempt() {
         vec![item],
         |_| {},
         DriveActions {
-            attempt: |_: &str, _: &thegn_core::remote::GitLoc| {
+            attempt: |_: &str, _: &thegn_core::remote::GitLoc, _: bool| {
                 called = true;
                 Ok(AttemptOutcome::Ready { tip: "tip".into() })
             },
@@ -151,7 +151,7 @@ fn busy_landed_write_reports_oids_and_stops_later_rows() {
         ],
         |_| {},
         DriveActions {
-            attempt: |_: &str, _: &thegn_core::remote::GitLoc| {
+            attempt: |_: &str, _: &thegn_core::remote::GitLoc, _: bool| {
                 attempts.set(attempts.get() + 1);
                 let connection = rusqlite::Connection::open(&path).unwrap();
                 connection
@@ -238,7 +238,7 @@ fn folding_write_failure_stops_before_git_attempt() {
         vec![item],
         |_| {},
         DriveActions {
-            attempt: |_: &str, _: &thegn_core::remote::GitLoc| {
+            attempt: |_: &str, _: &thegn_core::remote::GitLoc, _: bool| {
                 called = true;
                 Ok(AttemptOutcome::Ready { tip: "tip".into() })
             },
@@ -270,7 +270,7 @@ fn landed_ref_with_terminal_write_failure_is_reported_as_degraded() {
         vec![item],
         |_| {},
         DriveActions {
-            attempt: |_: &str, _: &thegn_core::remote::GitLoc| {
+            attempt: |_: &str, _: &thegn_core::remote::GitLoc, _: bool| {
                 Ok(AttemptOutcome::Landed {
                     commit: new_oid.into(),
                     old_oid: old_oid.into(),
@@ -321,7 +321,7 @@ fn landed_bookkeeping_failure_stops_the_remaining_items() {
         ],
         |_| {},
         DriveActions {
-            attempt: |_: &str, _: &thegn_core::remote::GitLoc| {
+            attempt: |_: &str, _: &thegn_core::remote::GitLoc, _: bool| {
                 attempts.set(attempts.get() + 1);
                 Ok(AttemptOutcome::Landed {
                     commit: "1234567890123456789012345678901234567890".into(),
@@ -367,7 +367,7 @@ fn failed_attempt_reservation_prevents_agent_dispatch() {
         vec![item],
         |_| {},
         DriveActions {
-            attempt: |_: &str, _: &thegn_core::remote::GitLoc| {
+            attempt: |_: &str, _: &thegn_core::remote::GitLoc, _: bool| {
                 Ok(AttemptOutcome::GateFailed {
                     log: "failure".into(),
                 })
@@ -429,7 +429,7 @@ fn failed_conflict_write_falls_back_to_gate_error_and_stops_drain() {
         ],
         |_| {},
         DriveActions {
-            attempt: |branch: &str, _: &thegn_core::remote::GitLoc| {
+            attempt: |branch: &str, _: &thegn_core::remote::GitLoc, _: bool| {
                 assert_eq!(branch, "feature", "persistence failure aborts later rows");
                 Ok(AttemptOutcome::Conflict {
                     paths: vec!["src/a.rs".into()],
@@ -521,7 +521,7 @@ fn one_outcome(
             steps.push(step.status.to_owned());
         },
         DriveActions {
-            attempt: |_branch: &str, _location: &thegn_core::remote::GitLoc| {
+            attempt: |_branch: &str, _location: &thegn_core::remote::GitLoc, _: bool| {
                 result.take().expect("one attempt only")
             },
             floor: |_worktree: &str| panic!("notify-only never attempts agent admission"),
@@ -673,7 +673,7 @@ fn infrastructure_hold_stops_after_one_attempt_and_admission_without_spending_bu
             assert_fields(&saved, step.fields);
         },
         DriveActions {
-            attempt: |_branch: &str, _location: &thegn_core::remote::GitLoc| {
+            attempt: |_branch: &str, _location: &thegn_core::remote::GitLoc, _: bool| {
                 attempts += 1;
                 assert_eq!(attempts, 1, "hold must not retry the fold");
                 Ok(AttemptOutcome::Conflict {
@@ -732,7 +732,7 @@ fn remote_and_unparseable_locations_hold_before_local_fixer_dispatch() {
             vec![item],
             |_| {},
             DriveActions {
-                attempt: |_branch: &str, _location: &thegn_core::remote::GitLoc| {
+                attempt: |_branch: &str, _location: &thegn_core::remote::GitLoc, _: bool| {
                     attempts += 1;
                     Ok(AttemptOutcome::Conflict {
                         paths: vec!["conflict.rs".into()],
@@ -786,7 +786,7 @@ fn remote_identifier_collision_leaves_local_directory_untouched() {
         vec![item],
         |_| {},
         DriveActions {
-            attempt: |_branch: &str, _location: &thegn_core::remote::GitLoc| {
+            attempt: |_branch: &str, _location: &thegn_core::remote::GitLoc, _: bool| {
                 Ok(AttemptOutcome::Conflict {
                     paths: vec!["conflict.rs".into()],
                     submodule_conflicts: vec![],
@@ -1104,7 +1104,7 @@ fn hold_then_recover(failure: RetryFailure) {
         vec![held.clone(), fixture.item("next")],
         |step| fixture.progress(step, &mut panel, &mut observed),
         DriveActions {
-            attempt: |branch: &str, _location: &thegn_core::remote::GitLoc| {
+            attempt: |branch: &str, _location: &thegn_core::remote::GitLoc, _: bool| {
                 if branch == "held" {
                     held_attempts += 1;
                     assert_eq!(held_attempts, 1, "hold must not retry the fold");
@@ -1163,7 +1163,7 @@ fn hold_then_recover(failure: RetryFailure) {
         vec![item.clone()],
         |step| fixture.progress(step, &mut panel, &mut observed),
         DriveActions {
-            attempt: |branch: &str, _location: &thegn_core::remote::GitLoc| {
+            attempt: |branch: &str, _location: &thegn_core::remote::GitLoc, _: bool| {
                 assert_eq!(branch, "held");
                 attempts += 1;
                 assert!(attempts <= 2, "recovery fold bound");
@@ -1266,7 +1266,7 @@ fn unchanged_agent_result_exhausts_only_remaining_budget_for_conflict_and_red_ga
             vec![item.clone()],
             |step| fixture.progress(step, &mut panel, &mut observed),
             DriveActions {
-                attempt: |branch: &str, _location: &thegn_core::remote::GitLoc| {
+                attempt: |branch: &str, _location: &thegn_core::remote::GitLoc, _: bool| {
                     assert_eq!(branch, "budget");
                     attempts += 1;
                     assert!(attempts <= 3, "finite remaining-budget fold bound");
@@ -1355,7 +1355,7 @@ fn gate_error_never_admits_agent_and_next_item_still_reaches_ready() {
         vec![fixture.item("error"), fixture.item("next")],
         |step| fixture.progress(step, &mut panel, &mut observed),
         DriveActions {
-            attempt: |branch: &str, _location: &thegn_core::remote::GitLoc| {
+            attempt: |branch: &str, _location: &thegn_core::remote::GitLoc, _: bool| {
                 attempts += 1;
                 assert!(attempts <= 2);
                 assert_eq!(branch, if attempts == 1 { "error" } else { "next" });
@@ -1418,7 +1418,7 @@ fn driver_refusal_goes_to_needs_human_without_the_agent() {
         vec![fixture.item("refused")],
         |step| fixture.progress(step, &mut panel, &mut observed),
         DriveActions {
-            attempt: |branch: &str, _location: &thegn_core::remote::GitLoc| {
+            attempt: |branch: &str, _location: &thegn_core::remote::GitLoc, _: bool| {
                 if branch == "refused" {
                     Ok(AttemptOutcome::Conflict {
                         paths: vec!["data.txt".into()],
