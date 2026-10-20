@@ -603,7 +603,7 @@ impl PrivateDir {
             use nix::sys::stat::{SFlag, fstat};
             let fd = openat(
                 &self.fd,
-                name,
+                name_path,
                 OFlag::O_RDONLY | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC | OFlag::O_NONBLOCK,
                 nix::sys::stat::Mode::empty(),
             )
