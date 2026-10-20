@@ -79,14 +79,18 @@ install github:blakeashleyjr/thegn` gives users `.#default`, bridge included,
    In Actions, dispatch the `release` workflow from `main`, enter the already
    published tag, and choose `publish-external`. This operation is isolated
    from `create-release`, so it cannot change any release asset. Approve the
-   protected
-   `package-publication` environment when prompted.
+   protected `package-publication-homebrew` and `package-publication-aur`
+   environments when prompted. Each has a required reviewer and only its
+   matching deploy key.
 
-   The job downloads the generated formula and `PKGBUILD` from the published
-   release. It pushes `Formula/thegn.rb` to the configured Homebrew tap, runs
-   `makepkg --printsrcinfo`, and pushes `PKGBUILD` plus `.SRCINFO` to the AUR
-   `thegn-bin` repository. Re-dispatching the same tag makes no commit when the
-   repositories already contain identical output.
+   The credential-free `aur-srcinfo` job downloads `PKGBUILD` from the
+   published release and runs `makepkg --printsrcinfo`, then passes `PKGBUILD`
+   and `.SRCINFO` to the AUR publisher as an artifact. The Homebrew publisher
+   pushes `Formula/thegn.rb` to the configured tap. The AUR publisher checks
+   the artifact's `PKGBUILD` against the release asset and pushes both files to
+   the AUR `thegn-bin` repository without interpreting the PKGBUILD.
+   Re-dispatching the same tag makes no commit when the repositories already
+   contain identical output.
 
    Publication remains visibly pending until this one-time checklist is done:
    - Create a public repository named `homebrew-tap`, initially with a `main`
@@ -94,11 +98,13 @@ install github:blakeashleyjr/thegn` gives users `.#default`, bridge included,
    - Add separate write-enabled deploy keys scoped only to the tap and AUR
      package repositories. They are not artifact-signing keys and have no write
      access to this source repository.
-   - Create a protected GitHub environment named `package-publication`, add a
-     required reviewer, and store the keys as `HOMEBREW_TAP_DEPLOY_KEY` and
-     `AUR_DEPLOY_KEY` environment secrets.
-   - Set repository variable `HOMEBREW_TAP_REPOSITORY` to
-     `<owner>/homebrew-tap`, but leave `PACKAGE_PUBLICATION_ENABLED` unset.
+   - Create protected GitHub environments `package-publication-homebrew` and
+     `package-publication-aur`, each with a required reviewer. Store only
+     `HOMEBREW_TAP_DEPLOY_KEY` in the Homebrew environment and only
+     `AUR_DEPLOY_KEY` in the AUR environment.
+   - Set `HOMEBREW_TAP_REPOSITORY` to `<owner>/homebrew-tap` in the
+     `package-publication-homebrew` environment, but leave
+     `PACKAGE_PUBLICATION_ENABLED` unset.
    - Rehearse both generated outputs locally: install from a disposable local
      tap and run `makepkg --printsrcinfo` plus `makepkg` in a disposable AUR
      checkout.
