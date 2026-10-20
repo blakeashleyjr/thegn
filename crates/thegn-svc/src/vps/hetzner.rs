@@ -224,46 +224,11 @@ fn hetzner_pagination(v: &serde_json::Value, page: u32) -> Result<(bool, Option<
         .pointer("/meta/pagination")
         .and_then(serde_json::Value::as_object)
         .ok_or_else(|| anyhow!("Hetzner inventory page is missing meta.pagination"))?;
-    if pagination.get("page").and_then(serde_json::Value::as_u64) != Some(u64::from(page))
-        || pagination
-            .get("per_page")
-            .and_then(serde_json::Value::as_u64)
-            != Some(50)
-    {
-        return Err(anyhow!(
-            "Hetzner inventory page has inconsistent pagination metadata"
-        ));
-    }
-    let expected_previous = if page == 1 {
-        None
-    } else {
-        Some(u64::from(page - 1))
-    };
-    let previous = pagination
-        .get("previous_page")
-        .and_then(serde_json::Value::as_u64);
-    let previous_is_null = pagination.get("previous_page") == Some(&serde_json::Value::Null);
-    let last_page = pagination
-        .get("last_page")
-        .and_then(serde_json::Value::as_u64);
-    if (expected_previous.is_none() && !previous_is_null)
-        || (expected_previous.is_some() && previous != expected_previous)
-        || last_page.is_none_or(|last| last < u64::from(page))
-    {
-        return Err(anyhow!(
-            "Hetzner inventory page has inconsistent pagination metadata"
-        ));
-    }
     let has_next = match pagination.get("next_page") {
         Some(serde_json::Value::Null) => false,
         Some(value) if value.as_u64() == Some(u64::from(page) + 1) => true,
         _ => return Err(anyhow!("Hetzner inventory has a non-advancing page")),
     };
-    if has_next != last_page.is_some_and(|last| last > u64::from(page)) {
-        return Err(anyhow!(
-            "Hetzner inventory page has inconsistent pagination metadata"
-        ));
-    }
     let total = pagination
         .get("total_entries")
         .and_then(serde_json::Value::as_u64);
@@ -366,6 +331,38 @@ mod tests {
         let skipped = server_page(serde_json::json!([]), 1, serde_json::json!(3), 0);
         assert!(parse_server_page(&skipped, 1).is_err());
         assert!(parse_server_page(&serde_json::json!({"servers": []}), 1).is_err());
+        let missing_servers = serde_json::json!({"meta": {"pagination": {
+            "next_page": null, "total_entries": 0
+        }}});
+        assert!(parse_server_page(&missing_servers, 1).is_err());
+    }
+
+    #[test]
+    fn strict_ssh_key_pages_reject_missing_and_malformed_rows() {
+        let page = serde_json::json!({"meta": {"pagination": {
+            "next_page": null, "total_entries": 1
+        }}});
+        assert!(parse_ssh_key_page(&page, 1).is_err());
+
+        let malformed = serde_json::json!({"ssh_keys": [{"id": "not-an-id", "public_key": "ssh-ed25519 AAA"}],
+            "meta": {"pagination": {"next_page": null, "total_entries": 1}}});
+        assert!(parse_ssh_key_page(&malformed, 1).is_err());
+    }
+
+    #[test]
+    fn pagination_accepts_optional_vendor_metadata() {
+        for pagination in [
+            serde_json::json!({"next_page": null, "total_entries": 0}),
+            serde_json::json!({"page": null, "per_page": 17, "previous_page": null,
+                "next_page": null, "last_page": null, "total_entries": 0}),
+            serde_json::json!({"per_page": 17, "next_page": null, "last_page": 0,
+                "total_entries": 0}),
+        ] {
+            let body = serde_json::json!({"servers": [], "meta": {"pagination": pagination}});
+            let parsed = parse_server_page(&body, 1).unwrap();
+            assert!(!parsed.has_next);
+            assert_eq!(parsed.total, Some(0));
+        }
     }
 
     #[test]

@@ -621,9 +621,12 @@ impl VpsProvider {
     /// ips/creation times — complete or Err, for the reaper's view.
     pub async fn list_detailed(&self) -> Result<Vec<VpsInstance>> {
         let base = self.spec.validated_api_base()?;
+        let base = base.as_str();
         let shaper = self.shaper();
         collect_pages(
-            |page| Box::pin(async { self.get_json(&shaper.list_page_url(&base, page)).await }),
+            move |page| {
+                Box::pin(async move { self.get_json(&shaper.list_page_url(base, page)).await })
+            },
             |body, page| shaper.parse_server_page(body, page),
             |server: &VpsInstance| server.id.clone(),
         )
@@ -644,9 +647,12 @@ impl VpsProvider {
     /// the existing-key lookup sees a complete inventory or returns Err.
     async fn ensure_ssh_key(&self) -> Result<i64> {
         let base = self.spec.validated_api_base()?;
+        let base = base.as_str();
         let shaper = self.shaper();
         let keys = collect_pages(
-            |page| Box::pin(async { self.get_json(&shaper.ssh_keys_page_url(&base, page)).await }),
+            move |page| {
+                Box::pin(async move { self.get_json(&shaper.ssh_keys_page_url(base, page)).await })
+            },
             |body, page| shaper.parse_ssh_key_page(body, page),
             |key: &(i64, String)| key.0.to_string(),
         )
@@ -1189,8 +1195,9 @@ mod tests {
             hetzner_page(&[1, 2], 1, true, 3),
             hetzner_page(&[3], 2, false, 3),
         ];
+        let pages = &pages;
         let rows = collect_pages(
-            |page| Box::pin(async { Ok(pages[(page - 1) as usize].clone()) }),
+            |page| Box::pin(async move { Ok(pages[(page - 1) as usize].clone()) }),
             hetzner::parse_server_page,
             |row: &VpsInstance| row.id.clone(),
         )
@@ -1208,8 +1215,9 @@ mod tests {
             hetzner_page(&[1], 1, true, 2),
             hetzner_page(&[1], 2, false, 2),
         ];
+        let duplicate_pages = &duplicate_pages;
         let duplicate = collect_pages(
-            |page| Box::pin(async { Ok(duplicate_pages[(page - 1) as usize].clone()) }),
+            |page| Box::pin(async move { Ok(duplicate_pages[(page - 1) as usize].clone()) }),
             hetzner::parse_server_page,
             |row: &VpsInstance| row.id.clone(),
         )
@@ -1220,8 +1228,9 @@ mod tests {
             hetzner_page(&[1], 1, true, 3),
             hetzner_page(&[2], 2, false, 3),
         ];
+        let mismatch_pages = &mismatch_pages;
         let mismatch = collect_pages(
-            |page| Box::pin(async { Ok(mismatch_pages[(page - 1) as usize].clone()) }),
+            |page| Box::pin(async move { Ok(mismatch_pages[(page - 1) as usize].clone()) }),
             hetzner::parse_server_page,
             |row: &VpsInstance| row.id.clone(),
         )
@@ -1266,8 +1275,9 @@ mod tests {
                 "meta": {"pagination": {"page": 2, "per_page": 50, "previous_page": 1,
                     "next_page": null, "last_page": 2, "total_entries": 2}}}),
         ];
+        let pages = &pages;
         let keys = collect_pages(
-            |page| Box::pin(async { Ok(pages[(page - 1) as usize].clone()) }),
+            |page| Box::pin(async move { Ok(pages[(page - 1) as usize].clone()) }),
             hetzner::parse_ssh_key_page,
             |key: &(i64, String)| key.0.to_string(),
         )
