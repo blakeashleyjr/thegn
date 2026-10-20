@@ -940,28 +940,44 @@ impl RemoteProvider for VpsProvider {
             let resolved = self.spec.admit_resolved(&labels)?;
             let name = self.spec.name.clone();
             let user_data = cloudinit::user_data(&self.spec.pubkey, !resolved.is_snapshot);
-            // Spend guardrail: never mint past the cap. Ledger-based (covers
-            // in-flight creates the API can't see yet).
-            let managed = registry::list().len();
-            if managed >= self.spec.max_instances() {
-                return Err(anyhow!(
-                    "vps: {managed} managed instances already exist (max_instances = {}); \
-                     destroy one or raise `[env.<name>.provider] max_instances`",
-                    self.spec.max_instances()
-                ));
-            }
-            let key_id = self.ensure_ssh_key().await?;
-
-            // Intent BEFORE the POST — the crash-between-create-and-record leak
-            // window closes here; the reaper reconciles `creating` records.
-            registry::write(&registry::VpsRecord {
+            // Reserve capacity and publish the intent before key setup or any
+            // server request. File locking and ledger I/O stay off the runtime.
+            let intent = registry::VpsRecord {
                 name: name.clone(),
                 provider: self.spec.kind.as_str().into(),
                 state: "creating".into(),
                 instance_id: String::new(),
                 ip: String::new(),
                 created_at: thegn_core::util::now(),
-            })?;
+            };
+            let reserve_record = intent.clone();
+            let cap = self.spec.max_instances();
+            let reserve_result = tokio::task::spawn_blocking(move || {
+                registry::reserve(&reserve_record, cap, registry::ReserveScope::All)
+            })
+            .await
+            .context("vps: reservation worker failed")?;
+            match reserve_result {
+                Ok(()) => {}
+                Err(registry::ReserveError::AtCap { occupied, cap }) => {
+                    return Err(anyhow!(
+                        "vps: {occupied} managed instances already exist (max_instances = {cap}); \
+                         destroy one or raise `[env.<name>.provider] max_instances`"
+                    ));
+                }
+                Err(registry::ReserveError::Store(error)) => {
+                    return Err(
+                        error.context("vps: could not reserve ledger capacity; refusing to create")
+                    );
+                }
+            }
+            let key_id = match self.ensure_ssh_key().await {
+                Ok(key_id) => key_id,
+                Err(error) => {
+                    registry::remove(&name);
+                    return Err(error);
+                }
+            };
 
             let base = self.spec.validated_api_base()?;
             let shaper = self.shaper();
