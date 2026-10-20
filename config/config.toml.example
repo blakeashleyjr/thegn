@@ -4022,8 +4022,8 @@ open_on_detect = false # auto-open the browser (via `browser` above) when a new 
 # max_artifact_mb = 512       # abort the hibernate (keep the VM, warn) if any
 #                             #   single artifact exceeds this; 0 ⇒ no ceiling
 # bucket = ""                 # s3: bucket name (required for backend = "s3")
-# endpoint = ""               # s3: endpoint URL for S3-compatibles (R2/B2/
-#                             #   MinIO…); empty ⇒ AWS S3
+# endpoint = ""               # s3: https URL for S3-compatibles (R2/B2/
+#                             #   MinIO…); http only for loopback; empty ⇒ AWS S3
 # region = "us-east-1"        # s3: region
 # prefix = "thegn"         # s3: key prefix inside the bucket
 # access_key = "env:AWS_ACCESS_KEY_ID"      # secret ref: env:VAR | keyring:<n>
