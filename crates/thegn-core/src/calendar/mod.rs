@@ -84,7 +84,7 @@ pub use chrono_tz::Tz;
 
 use chrono::{DateTime, Days, NaiveDate, NaiveDateTime, Utc};
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt;
 use std::sync::Arc;
 
@@ -700,6 +700,11 @@ impl CalEvent {
         let Some(time) = &self.recurrence_id else {
             return String::new();
         };
+        Self::recurrence_key_of(time)
+    }
+
+    /// Normalize an event time as a recurrence-instance key.
+    pub(crate) fn recurrence_key_of(time: &EventTime) -> String {
         match time {
             EventTime::Date { date } => date.format("%Y%m%d").to_string(),
             timed => timed
@@ -923,7 +928,7 @@ impl CalEvent {
         }
         let cost = source_cost(self)?;
         Ok(self
-            .place(from, to, home, budget, &cost)?
+            .place(from, to, home, budget, &cost, None)?
             .into_iter()
             .map(|p| p.occurrence)
             .collect())
@@ -936,6 +941,7 @@ impl CalEvent {
         home: chrono_tz::Tz,
         budget: &mut ExpansionBudget,
         cost: &SourceCost,
+        overridden: Option<&HashSet<String>>,
     ) -> Result<Vec<Placed>, ExpansionError> {
         let Some(rec) = self.recurrence.as_ref().filter(|r| !r.is_empty()) else {
             // Not recurring: it occurs once, if its span touches the window.
@@ -987,6 +993,11 @@ impl CalEvent {
             // One transient instance at a time: nothing is retained (or
             // charged) until it is known to overlap the window.
             let start = recur::instance_time(local, &self.start);
+            if let Some(keys) = overridden
+                && keys.contains(&CalEvent::recurrence_key_of(&start))
+            {
+                continue;
+            }
             if !start.is_all_day() && start.instant_in(home, GapPolicy::ShiftForward).is_none() {
                 continue;
             }
@@ -1228,12 +1239,31 @@ pub fn expand_calendar_with_budget(
     let mut out: BTreeMap<NaiveDate, Vec<Arc<CalEvent>>> = BTreeMap::new();
     let mut unique = Vec::new();
     let mut skipped = 0usize;
+    let mut overrides: HashMap<(&str, &str), HashSet<String>> = HashMap::new();
+    for event in events {
+        if let Some(recurrence_id) = &event.recurrence_id {
+            overrides
+                .entry((event.source.as_str(), event.uid.as_str()))
+                .or_default()
+                .insert(CalEvent::recurrence_key_of(recurrence_id));
+        }
+    }
     for e in events {
         budget.source_visit()?;
+        if e.recurrence_id.is_some() && e.status == EventStatus::Cancelled {
+            continue;
+        }
+        let overridden = if e.recurrence_id.is_none() {
+            overrides.get(&(e.source.as_str(), e.uid.as_str()))
+        } else {
+            None
+        };
         // A row-local defect costs that row, not the call: it is skipped and
         // counted, so the caller can report an incomplete view instead of
         // losing the month (and the reminders) to one bad event.
-        let placed = match source_cost(e).and_then(|cost| e.place(from, to, home, budget, &cost)) {
+        let placed = match source_cost(e)
+            .and_then(|cost| e.place(from, to, home, budget, &cost, overridden))
+        {
             Ok(placed) => placed,
             Err(error) if error.is_row_local() => {
                 skipped = skipped.checked_add(1).ok_or(ExpansionError::Arithmetic)?;
@@ -1260,21 +1290,32 @@ pub fn expand_calendar_with_budget(
         }
     }
     for v in out.values_mut() {
-        // All-day first, then by start time — the order an agenda reads in.
-        v.sort_by(|a, b| {
-            b.all_day().cmp(&a.all_day()).then_with(|| {
-                a.start
-                    .instant_in(home, GapPolicy::ShiftForward)
-                    .cmp(&b.start.instant_in(home, GapPolicy::ShiftForward))
-                    .then_with(|| a.title.cmp(&b.title))
-            })
-        });
+        v.sort_by(|a, b| occurrence_order(a, b, home));
     }
+    unique.sort_by(|a, b| occurrence_order(a, b, home));
     Ok(ExpandedCalendar {
         by_date: out,
         occurrences: unique,
         skipped,
     })
+}
+
+fn occurrence_order(a: &CalEvent, b: &CalEvent, home: chrono_tz::Tz) -> std::cmp::Ordering {
+    b.all_day()
+        .cmp(&a.all_day())
+        .then_with(|| {
+            a.start
+                .instant_in(home, GapPolicy::ShiftForward)
+                .cmp(&b.start.instant_in(home, GapPolicy::ShiftForward))
+        })
+        .then_with(|| a.title.cmp(&b.title))
+        .then_with(|| a.uid.cmp(&b.uid))
+        .then_with(|| {
+            a.recurrence_id
+                .as_ref()
+                .map(CalEvent::recurrence_key_of)
+                .cmp(&b.recurrence_id.as_ref().map(CalEvent::recurrence_key_of))
+        })
 }
 
 /// Date buckets only, for callers that do not need the unique list.

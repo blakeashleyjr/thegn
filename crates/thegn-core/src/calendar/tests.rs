@@ -1570,6 +1570,214 @@ fn recurring(start: EventTime, end: EventTime, rule: &str) -> CalEvent {
     e
 }
 
+fn daily_master() -> CalEvent {
+    let mut master = recurring(
+        EventTime::Instant {
+            at: utc(2026, 8, 1, 9, 0),
+        },
+        EventTime::Instant {
+            at: utc(2026, 8, 1, 10, 0),
+        },
+        "FREQ=DAILY;COUNT=5",
+    );
+    master.uid = "series".to_owned();
+    master.source = SourceId("account".to_owned());
+    master.title = "Master".to_owned();
+    master
+}
+
+fn timed_override(start: DateTime<Utc>, title: &str) -> CalEvent {
+    let mut event = CalEvent::new(
+        "series",
+        title,
+        EventTime::Instant { at: start },
+        EventTime::Instant {
+            at: start + chrono::Duration::hours(1),
+        },
+    );
+    event.source = SourceId("account".to_owned());
+    event.recurrence_id = Some(EventTime::Instant {
+        at: utc(2026, 8, 3, 9, 0),
+    });
+    event
+}
+
+#[test]
+fn override_replaces_its_generated_slot() {
+    let master = daily_master();
+    let override_event = timed_override(utc(2026, 8, 3, 11, 0), "Replacement");
+    let expanded = expand_calendar(
+        &[master, override_event],
+        d(2026, 8, 1),
+        d(2026, 8, 5),
+        Tz::UTC,
+    )
+    .unwrap();
+
+    for day in [1, 2, 4, 5] {
+        let bucket = &expanded.by_date[&d(2026, 8, day)];
+        assert_eq!(bucket.len(), 1, "day {day}");
+        assert_eq!(bucket[0].title, "Master");
+    }
+    let replacement_day = &expanded.by_date[&d(2026, 8, 3)];
+    assert_eq!(replacement_day.len(), 1);
+    assert_eq!(replacement_day[0].title, "Replacement");
+}
+
+#[test]
+fn override_moved_to_another_day_hides_the_original_slot() {
+    let master = daily_master();
+    let override_event = timed_override(utc(2026, 8, 4, 11, 0), "Moved");
+    let expanded = expand_calendar(
+        &[master, override_event],
+        d(2026, 8, 1),
+        d(2026, 8, 5),
+        Tz::UTC,
+    )
+    .unwrap();
+
+    assert!(!expanded.by_date.contains_key(&d(2026, 8, 3)));
+    assert_eq!(expanded.by_date[&d(2026, 8, 4)].len(), 2);
+}
+
+#[test]
+fn cancelled_override_suppresses_its_slot_and_is_not_shown() {
+    let master = daily_master();
+    let mut cancelled = timed_override(utc(2026, 8, 3, 9, 0), "Cancelled");
+    cancelled.status = EventStatus::Cancelled;
+    let expanded =
+        expand_calendar(&[master, cancelled], d(2026, 8, 1), d(2026, 8, 5), Tz::UTC).unwrap();
+
+    assert!(!expanded.by_date.contains_key(&d(2026, 8, 3)));
+    assert_eq!(expanded.occurrences.len(), 4);
+}
+
+#[test]
+fn date_override_matches_a_date_master() {
+    let mut master = recurring(
+        EventTime::Date {
+            date: d(2026, 8, 1),
+        },
+        EventTime::Date {
+            date: d(2026, 8, 2),
+        },
+        "FREQ=DAILY;COUNT=3",
+    );
+    master.uid = "date-series".to_owned();
+    master.source = SourceId("account".to_owned());
+    let mut override_event = all_day(d(2026, 8, 2), d(2026, 8, 3));
+    override_event.uid = master.uid.clone();
+    override_event.source = master.source.clone();
+    override_event.title = "Date replacement".to_owned();
+    override_event.recurrence_id = Some(EventTime::Date {
+        date: d(2026, 8, 2),
+    });
+
+    let expanded = expand_calendar(
+        &[master, override_event],
+        d(2026, 8, 1),
+        d(2026, 8, 3),
+        Tz::UTC,
+    )
+    .unwrap();
+    assert_eq!(expanded.by_date[&d(2026, 8, 2)].len(), 1);
+    assert_eq!(
+        expanded.by_date[&d(2026, 8, 2)][0].title,
+        "Date replacement"
+    );
+}
+
+#[test]
+fn tzid_override_matches_a_tzid_master() {
+    let start = zoned(2026, 8, 1, 9, 0, "Europe/Berlin");
+    let end = zoned(2026, 8, 1, 10, 0, "Europe/Berlin");
+    let mut master = recurring(start, end, "FREQ=DAILY;COUNT=3");
+    master.uid = "berlin-series".to_owned();
+    master.source = SourceId("account".to_owned());
+    let override_start = zoned(2026, 8, 2, 11, 0, "Europe/Berlin");
+    let override_end = zoned(2026, 8, 2, 12, 0, "Europe/Berlin");
+    let mut override_event = CalEvent::new(
+        master.uid.clone(),
+        "Berlin replacement",
+        override_start,
+        override_end,
+    );
+    override_event.source = master.source.clone();
+    override_event.recurrence_id = Some(zoned(2026, 8, 2, 9, 0, "Europe/Berlin"));
+
+    let expanded = expand_calendar(
+        &[master, override_event],
+        d(2026, 8, 1),
+        d(2026, 8, 3),
+        Tz::UTC,
+    )
+    .unwrap();
+    let target_day = &expanded.by_date[&d(2026, 8, 2)];
+    assert_eq!(target_day.len(), 1);
+    assert_eq!(target_day[0].title, "Berlin replacement");
+}
+
+#[test]
+fn expansion_is_identical_for_reversed_input() {
+    let master = daily_master();
+    let override_event = timed_override(utc(2026, 8, 3, 11, 0), "Same title");
+    let mut unrelated = CalEvent::new(
+        "other-series",
+        "Same title",
+        EventTime::Instant {
+            at: utc(2026, 8, 3, 11, 0),
+        },
+        EventTime::Instant {
+            at: utc(2026, 8, 3, 12, 0),
+        },
+    );
+    unrelated.source = SourceId("account".to_owned());
+    let events = [master, override_event, unrelated];
+    let forward = expand_calendar(&events, d(2026, 8, 1), d(2026, 8, 5), Tz::UTC).unwrap();
+    let reversed = expand_calendar(
+        &events.iter().rev().cloned().collect::<Vec<_>>(),
+        d(2026, 8, 1),
+        d(2026, 8, 5),
+        Tz::UTC,
+    )
+    .unwrap();
+    let bucket_ids = |expanded: &ExpandedCalendar| {
+        expanded
+            .by_date
+            .iter()
+            .map(|(date, events)| {
+                (
+                    *date,
+                    events.iter().map(|event| event.id().0).collect::<Vec<_>>(),
+                )
+            })
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(bucket_ids(&forward), bucket_ids(&reversed));
+    assert_eq!(
+        forward
+            .occurrences
+            .iter()
+            .map(|event| event.id().0.clone())
+            .collect::<Vec<_>>(),
+        reversed
+            .occurrences
+            .iter()
+            .map(|event| event.id().0.clone())
+            .collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn override_without_master_is_shown() {
+    let override_event = timed_override(utc(2026, 8, 4, 11, 0), "Orphan override");
+    let expanded =
+        expand_calendar(&[override_event], d(2026, 8, 4), d(2026, 8, 4), Tz::UTC).unwrap();
+
+    assert_eq!(expanded.occurrences.len(), 1);
+    assert_eq!(expanded.occurrences[0].title, "Orphan override");
+}
+
 fn expand_with(
     events: &[CalEvent],
     from: NaiveDate,
