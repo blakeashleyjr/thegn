@@ -96,12 +96,24 @@ pub fn controller_id_in(root: &Path) -> Result<String, ControllerIdError> {
             }
             let mut file_bytes = id.as_bytes().to_vec();
             file_bytes.push(b'\n');
-            match thegn_core::fsperm::write_owner_only_new(&path, &file_bytes) {
-                Ok(()) => Ok(id),
-                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-                    read_existing(&path)
+            let temporary = root.join(format!(".{CONTROLLER_ID_FILE}.tmp-{id}"));
+            thegn_core::fsperm::write_owner_only_new(&temporary, &file_bytes)?;
+            let publish = std::fs::hard_link(&temporary, &path);
+            let cleanup = std::fs::remove_file(&temporary);
+            match (publish, cleanup) {
+                (Ok(()), Ok(())) => {
+                    thegn_core::fsperm::sync_parent_dir(root)?;
+                    Ok(id)
                 }
-                Err(error) => Err(ControllerIdError::Io(error)),
+                (Ok(()), Err(error)) => Err(ControllerIdError::Io(error)),
+                (Err(publish_error), cleanup_result) => {
+                    cleanup_result?;
+                    if publish_error.kind() == std::io::ErrorKind::AlreadyExists {
+                        read_existing(&path)
+                    } else {
+                        Err(ControllerIdError::Io(publish_error))
+                    }
+                }
             }
         }
         Err(error) => Err(error),
@@ -110,8 +122,14 @@ pub fn controller_id_in(root: &Path) -> Result<String, ControllerIdError> {
 
 /// Load the controller id for provider creation from this thegn root.
 pub fn controller_id() -> anyhow::Result<String> {
-    controller_id_in(&thegn_core::util::thegn_dir())
-        .context("vps: cannot load the controller id; refusing to create")
+    let root = thegn_core::util::thegn_dir();
+    let path = root.join(CONTROLLER_ID_FILE);
+    controller_id_in(&root).with_context(|| {
+        format!(
+            "vps: cannot load the controller id at {}; refusing to create",
+            path.display()
+        )
+    })
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -175,19 +193,21 @@ mod tests {
 
     #[test]
     fn controller_id_refuses_a_symlinked_file() {
-        let root = tempfile::tempdir().unwrap();
-        let target = root.path().join("target");
-        std::fs::write(&target, b"0123456789abcdef0123456789abcdef\n").unwrap();
-        let id_path = root.path().join(CONTROLLER_ID_FILE);
-        thegn_core::fsperm::create_symlink(&target, &id_path, false).unwrap();
-        assert!(matches!(
-            controller_id_in(root.path()),
-            Err(ControllerIdError::Linked)
-        ));
-        assert_eq!(
-            std::fs::read(&target).unwrap(),
-            b"0123456789abcdef0123456789abcdef\n"
-        );
+        if cfg!(unix) {
+            let root = tempfile::tempdir().unwrap();
+            let target = root.path().join("target");
+            std::fs::write(&target, b"0123456789abcdef0123456789abcdef\n").unwrap();
+            let id_path = root.path().join(CONTROLLER_ID_FILE);
+            thegn_core::fsperm::create_symlink(&target, &id_path, false).unwrap();
+            assert!(matches!(
+                controller_id_in(root.path()),
+                Err(ControllerIdError::Linked)
+            ));
+            assert_eq!(
+                std::fs::read(&target).unwrap(),
+                b"0123456789abcdef0123456789abcdef\n"
+            );
+        }
     }
 
     #[test]
