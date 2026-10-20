@@ -356,6 +356,172 @@ fi
   exit 1
 }
 
+# A live per-bindir lock refuses before build or destination mutation.
+lock_snapshot="$(cksum "$tmp/bin/thegn" "$tmp/bin/tg-tui" "$tmp/bin/tg")"
+mkdir "$tmp/bin/.thegn-install.lock"
+printf '%s\n' "$$" >"$tmp/bin/.thegn-install.lock/pid"
+if PATH="$fakebin:$PATH" HOME="$tmp/home" XDG_CONFIG_HOME="$tmp/config" XDG_DATA_HOME="$tmp/data" \
+  "$install_repo/install.sh" "$tmp/bin" >"$tmp/live-lock.out" 2>&1; then
+  echo "install did not refuse a live lock" >&2
+  exit 1
+fi
+[[ $(<"$tmp/live-lock.out") == *"another install is running"* ]] || {
+  echo "live lock refusal did not identify another installer" >&2
+  cat "$tmp/live-lock.out" >&2
+  exit 1
+}
+[[ $(cksum "$tmp/bin/thegn" "$tmp/bin/tg-tui" "$tmp/bin/tg") == "$lock_snapshot" ]] || {
+  echo "live lock refusal changed installed files" >&2
+  exit 1
+}
+rm -rf -- "$tmp/bin/.thegn-install.lock"
+
+# A freshly created lock without a pid is treated as live while its owner is
+# publishing the pid file.
+mkdir "$tmp/bin/.thegn-install.lock"
+if PATH="$fakebin:$PATH" HOME="$tmp/home" XDG_CONFIG_HOME="$tmp/config" XDG_DATA_HOME="$tmp/data" \
+  "$install_repo/install.sh" "$tmp/bin" >"$tmp/pidless-lock.out" 2>&1; then
+  echo "install reclaimed a lock before its owner published the pid" >&2
+  exit 1
+fi
+[[ $(<"$tmp/pidless-lock.out") == *"another install is starting"* && -d $tmp/bin/.thegn-install.lock ]] || {
+  echo "pidless lock was not treated as live during publication" >&2
+  cat "$tmp/pidless-lock.out" >&2
+  exit 1
+}
+rm -rf -- "$tmp/bin/.thegn-install.lock"
+
+# A dead owner's lock is reclaimed and removed after the successful install.
+sh -c 'exit 0' &
+dead_pid=$!
+wait "$dead_pid"
+mkdir "$tmp/bin/.thegn-install.lock"
+printf '%s\n' "$dead_pid" >"$tmp/bin/.thegn-install.lock/pid"
+if ! PATH="$fakebin:$PATH" HOME="$tmp/home" XDG_CONFIG_HOME="$tmp/config" XDG_DATA_HOME="$tmp/data" \
+  "$install_repo/install.sh" "$tmp/bin" >"$tmp/stale-lock.out" 2>&1; then
+  echo "install did not reclaim a stale lock" >&2
+  cat "$tmp/stale-lock.out" >&2
+  exit 1
+fi
+[[ ! -e $tmp/bin/.thegn-install.lock ]] || {
+  echo "successful install left its lock directory" >&2
+  exit 1
+}
+
+# An injected failure after tg restores all three replaced command artifacts.
+cp "$tmp/bin/thegn" "$tmp/thegn.before"
+cp "$tmp/bin/tg-tui" "$tmp/tg-tui.before"
+cp "$tmp/bin/tg" "$tmp/tg.before"
+manifest_before="$(cksum "$tmp/data/thegn/install-manifest")"
+printf 'new staged bytes for rollback\n' >"$install_repo/target/release/thegn"
+if PATH="$fakebin:$PATH" HOME="$tmp/home" XDG_CONFIG_HOME="$tmp/config" XDG_DATA_HOME="$tmp/data" \
+  THEGN_INSTALL_FAIL_AFTER=tg "$install_repo/install.sh" "$tmp/bin" >"$tmp/rollback.out" 2>&1; then
+  echo "injected tg failure unexpectedly succeeded" >&2
+  exit 1
+fi
+if ! cmp -s "$tmp/thegn.before" "$tmp/bin/thegn" || ! cmp -s "$tmp/tg-tui.before" "$tmp/bin/tg-tui" ||
+  ! cmp -s "$tmp/tg.before" "$tmp/bin/tg"; then
+  echo "injected tg failure did not restore the previous command files" >&2
+  cat "$tmp/rollback.out" >&2
+  exit 1
+fi
+[[ $(<"$tmp/rollback.out") == *"restored the previous installation"* ]] || {
+  echo "rollback did not report restoration" >&2
+  cat "$tmp/rollback.out" >&2
+  exit 1
+}
+[[ $(cksum "$tmp/data/thegn/install-manifest") == "$manifest_before" ]] || {
+  echo "rollback changed the manifest before it was committed" >&2
+  exit 1
+}
+shopt -s nullglob
+install_leftovers=("$tmp/bin"/.thegn-install-backup.* "$tmp/bin"/.thegn-install.*)
+shopt -u nullglob
+if ((${#install_leftovers[@]} > 0)); then
+  echo "rollback left a backup, staging file, or lock in bindir" >&2
+  printf '%s\n' "${install_leftovers[@]}" >&2
+  exit 1
+fi
+
+# A clean install failing after its first commit removes that new artifact.
+clean_fail_bin="$tmp/clean-fail-bin"
+if PATH="$fakebin:$PATH" HOME="$tmp/home" XDG_CONFIG_HOME="$tmp/clean-fail-config" XDG_DATA_HOME="$tmp/clean-fail-data" \
+  THEGN_INSTALL_FAIL_AFTER=thegn "$install_repo/install.sh" "$clean_fail_bin" >"$tmp/clean-fail.out" 2>&1; then
+  echo "injected first-artifact failure unexpectedly succeeded" >&2
+  exit 1
+fi
+[[ ! -e $clean_fail_bin/thegn && ! -e $clean_fail_bin/.thegn-install.lock ]] || {
+  echo "failed clean install left a binary or lock" >&2
+  exit 1
+}
+
+# The versioned manifest is published last and hashes the installed artifacts.
+manifest="$tmp/data/thegn/install-manifest"
+[[ $(head -n 1 "$manifest") == 'thegn-install-manifest 1' ]] || {
+  echo "manifest is missing its version header" >&2
+  exit 1
+}
+test_sha256() {
+  if command -v sha256sum >/dev/null 2>&1; then
+    sha256sum "$1" | cut -d ' ' -f 1
+  else
+    shasum -a 256 "$1" | cut -d ' ' -f 1
+  fi
+}
+for artifact in "$tmp/bin/thegn" "$tmp/bin/tg-tui" "$tmp/bin/tg"; do
+  artifact_hash="$(test_sha256 "$artifact")"
+  grep -Fqx -- "$artifact_hash$(printf '\t')$artifact" "$manifest" || {
+    echo "manifest does not contain the installed hash and path for $artifact" >&2
+    exit 1
+  }
+done
+if ((freedesktop)); then
+  for artifact in "$icon" "$desktop"; do
+    artifact_hash="$(test_sha256 "$artifact")"
+    grep -Fqx -- "$artifact_hash$(printf '\t')$artifact" "$manifest" || {
+      echo "manifest does not contain the installed hash and path for $artifact" >&2
+      exit 1
+    }
+  done
+
+  manifest_fail_bin="$tmp/manifest-fail-bin"
+  manifest_fail_data="$tmp/manifest-fail-data"
+  if PATH="$fakebin:$PATH" HOME="$tmp/home" XDG_CONFIG_HOME="$tmp/manifest-fail-config" XDG_DATA_HOME="$manifest_fail_data" \
+    THEGN_INSTALL_FAIL_AFTER=desktop "$install_repo/install.sh" "$manifest_fail_bin" >"$tmp/manifest-fail.out" 2>&1; then
+    echo "injected desktop failure unexpectedly succeeded" >&2
+    exit 1
+  fi
+  [[ ! -e $manifest_fail_data/thegn/install-manifest ]] || {
+    echo "installer wrote a manifest before the desktop artifact completed" >&2
+    exit 1
+  }
+fi
+
+# Destination bindir symlinks are refused by both dry-run and real preflight.
+mkdir "$tmp/real-bin"
+ln -s "$tmp/real-bin" "$tmp/link-bin"
+if PATH="$fakebin:$PATH" HOME="$tmp/home" XDG_CONFIG_HOME="$tmp/link-config" XDG_DATA_HOME="$tmp/link-data" \
+  "$install_repo/install.sh" --dry-run "$tmp/link-bin" >"$tmp/link-dry.out" 2>&1; then
+  echo "dry-run accepted a symlinked bindir" >&2
+  exit 1
+fi
+[[ $(<"$tmp/link-dry.out") == *"is a symlink"* ]] || {
+  echo "dry-run symlink refusal did not name the conflict" >&2
+  cat "$tmp/link-dry.out" >&2
+  exit 1
+}
+if PATH="$fakebin:$PATH" HOME="$tmp/home" XDG_CONFIG_HOME="$tmp/link-config" XDG_DATA_HOME="$tmp/link-data" \
+  "$install_repo/install.sh" "$tmp/link-bin" >"$tmp/link-real.out" 2>&1; then
+  echo "real install accepted a symlinked bindir" >&2
+  exit 1
+fi
+[[ $(<"$tmp/link-real.out") == *"is a symlink"* && ! -e $tmp/real-bin/thegn && ! -e $tmp/real-bin/tg &&
+! -e $tmp/real-bin/tg-tui ]] || {
+  echo "real symlink refusal wrote through the bindir" >&2
+  cat "$tmp/link-real.out" >&2
+  exit 1
+}
+
 # Exercise make-app input checks on Linux with a temporary Darwin platform shim.
 mac_test_bin="$tmp/mac-bin"
 mkdir -p "$mac_test_bin"
