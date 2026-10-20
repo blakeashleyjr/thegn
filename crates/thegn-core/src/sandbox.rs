@@ -2982,6 +2982,7 @@ fn bwrap_mount_covered(mount: &Mount, hardcoded_parents: &[&str]) -> bool {
 }
 
 /// The backend-specific argv that runs `/bin/sh -lc <script>` in the sandbox.
+#[cfg(test)]
 fn backend_enter_argv(spec: &SandboxSpec, script: &str) -> Result<Vec<String>, EnterError> {
     backend_enter_argv_with_env(
         spec,
@@ -3035,6 +3036,7 @@ struct SandboxArgvEnv {
     runtime_dir: Option<std::path::PathBuf>,
 }
 
+#[cfg(test)]
 fn backend_enter_argv_with_env(
     spec: &SandboxSpec,
     script: &str,
@@ -3286,8 +3288,15 @@ fn backend_enter_argv_guarded_with_env(
             // stay inline as `--setenv K=V`. (Remote specs keep everything
             // inline — see `partition_secret_env`.)
             let (inline_env, secret_env) = partition_secret_env(spec);
-            if let Some(envfile) = write_secret_env_file(&spec.name, &secret_env, true) {
-                let dir = util::xdg_state_home().join("thegn/sandbox-env");
+            let state_home = util::xdg_state_home();
+            if let Some(envfile) = write_secret_env_file_in(
+                &state_home,
+                std::path::Path::new("thegn/sandbox-env"),
+                &spec.name,
+                &secret_env,
+                true,
+            ) {
+                let dir = state_home.join("thegn/sandbox-env");
                 let guard = SecretEnvFile::adopt(dir, envfile);
                 v.extend([
                     "-p".into(),
