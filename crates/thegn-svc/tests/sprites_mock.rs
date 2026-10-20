@@ -9,7 +9,7 @@
 //! Run: `cargo test -p thegn-svc --test sprites_mock`.
 
 use std::collections::HashMap;
-use std::io::{Read, Write};
+use std::io::{BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::sync::{Arc, Mutex};
 use std::thread;
