@@ -192,6 +192,7 @@ fn glyph_partition_keeps_suspended_cache_skips_uncached_and_scans_active() {
         &may_scan,
         GlyphPartitionConfig {
             active_path: Some(&active),
+            active_print_unchanged: false,
             gate_remote_scans: true,
             now,
             ttls: &crate::hydrate_tuning::glyph_ttls_from(
@@ -2777,6 +2778,7 @@ fn an_idle_tick_with_no_event_rescans_nothing() {
             &no_locations,
             GlyphPartitionConfig {
                 active_path: None,
+                active_print_unchanged: false,
                 gate_remote_scans: false,
                 now: started + elapsed,
                 ttls: &ttls,
@@ -2823,6 +2825,7 @@ fn partition_scans_only_rows_with_a_changed_fingerprint_before_safety() {
         &may_scan,
         GlyphPartitionConfig {
             active_path: None,
+            active_print_unchanged: false,
             gate_remote_scans: false,
             now,
             ttls: &ttls,
@@ -2843,6 +2846,7 @@ fn partition_scans_only_rows_with_a_changed_fingerprint_before_safety() {
         &may_scan,
         GlyphPartitionConfig {
             active_path: None,
+            active_print_unchanged: false,
             gate_remote_scans: false,
             now,
             ttls: &ttls,
@@ -2938,4 +2942,115 @@ fn first_scan_row_requires_truthful_dirty_status() {
     assert!(keep_glyph_scan_row(false, true, false));
     assert!(keep_glyph_scan_row(true, false, false));
     assert!(!keep_glyph_scan_row(false, false, false));
+}
+
+fn idle_glyph_partition(
+    active_print_unchanged: bool,
+    changed: bool,
+    cached: bool,
+) -> (Vec<String>, Vec<(String, GlyphRow)>) {
+    use std::collections::{HashMap, HashSet};
+    use std::time::{Duration, Instant};
+
+    let active = "/worktree/active".to_string();
+    let now = Instant::now();
+    let row = glyph_row(true, 0, 0, Some("main"), "/repo", 0, 0, None);
+    let cache = if cached {
+        HashMap::from([(active.clone(), (row, now - Duration::from_secs(10)))])
+    } else {
+        HashMap::new()
+    };
+    let fingerprint_changed = if changed {
+        HashSet::from([active.clone()])
+    } else {
+        HashSet::new()
+    };
+    let ttls = crate::hydrate_tuning::glyph_ttls_from(
+        None,
+        None,
+        Duration::from_millis(300),
+        Duration::from_secs(5),
+    );
+    let (to_scan, reused, _) = partition_glyph_paths(
+        std::slice::from_ref(&active),
+        &cache,
+        &HashMap::new(),
+        GlyphPartitionConfig {
+            active_path: Some(&active),
+            active_print_unchanged,
+            gate_remote_scans: false,
+            now,
+            ttls: &ttls,
+            since_active: &HashMap::new(),
+            fingerprint_changed: &fingerprint_changed,
+            since_ref_move: None,
+        },
+    );
+    (to_scan, reused)
+}
+
+#[test]
+fn idle_glyph_active_row_is_reused_while_the_print_is_unchanged() {
+    let (to_scan, reused) = idle_glyph_partition(true, false, true);
+    assert!(to_scan.is_empty());
+    assert_eq!(reused.len(), 1);
+    assert_eq!(reused[0].0, "/worktree/active");
+}
+
+#[test]
+fn idle_glyph_active_row_rescans_when_the_print_moved() {
+    let (to_scan, reused) = idle_glyph_partition(false, false, true);
+    assert_eq!(to_scan, vec!["/worktree/active"]);
+    assert!(reused.is_empty());
+}
+
+#[test]
+fn idle_glyph_active_row_rescans_on_fingerprint_change_even_if_print_unchanged() {
+    let (to_scan, reused) = idle_glyph_partition(true, true, true);
+    assert_eq!(to_scan, vec!["/worktree/active"]);
+    assert!(reused.is_empty());
+}
+
+#[test]
+fn idle_glyph_active_row_without_a_cached_row_is_scanned() {
+    let (to_scan, reused) = idle_glyph_partition(true, false, false);
+    assert_eq!(to_scan, vec!["/worktree/active"]);
+    assert!(reused.is_empty());
+}
+
+#[test]
+fn idle_glyph_unchanged_flag_never_affects_background_rows() {
+    use std::collections::{HashMap, HashSet};
+    use std::time::{Duration, Instant};
+
+    let active = "/worktree/active".to_string();
+    let background = "/worktree/background".to_string();
+    let now = Instant::now();
+    let row = glyph_row(true, 0, 0, Some("main"), "/repo", 0, 0, None);
+    let cache = HashMap::from([(background.clone(), (row, now - Duration::from_secs(10)))]);
+    let ttls = crate::hydrate_tuning::glyph_ttls_from(
+        Some(0),
+        None,
+        Duration::from_millis(300),
+        Duration::from_secs(5),
+    );
+    for active_print_unchanged in [false, true] {
+        let (to_scan, reused, _) = partition_glyph_paths(
+            std::slice::from_ref(&background),
+            &cache,
+            &HashMap::new(),
+            GlyphPartitionConfig {
+                active_path: Some(&active),
+                active_print_unchanged,
+                gate_remote_scans: false,
+                now,
+                ttls: &ttls,
+                since_active: &HashMap::new(),
+                fingerprint_changed: &HashSet::new(),
+                since_ref_move: None,
+            },
+        );
+        assert_eq!(to_scan, vec![background.clone()]);
+        assert!(reused.is_empty());
+    }
 }
