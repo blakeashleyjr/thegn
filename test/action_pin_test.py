@@ -142,20 +142,43 @@ def comment_problems(root: Path = ROOT) -> list[str]:
     return problems
 
 
+def actrc_problems(root: Path) -> list[str]:
+    """Check the runner image pin and keep credentials/reuse opt-in per run."""
+    actrc = root / ".actrc"
+    if not actrc.exists():
+        return []
+
+    problems: list[str] = []
+    digest = re.compile(r"@sha256:[0-9a-f]{64}(?:\s|$)")
+    for number, line in enumerate(actrc.read_text().splitlines(), start=1):
+        stripped = line.lstrip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        if stripped.startswith("-P") and not digest.search(stripped):
+            problems.append(f".actrc:{number}: runner image is not pinned by digest")
+        first_token = stripped.split(maxsplit=1)[0]
+        if first_token in {"--secret-file", "--reuse"}:
+            problems.append(
+                f".actrc:{number}: {first_token} must stay a per-invocation opt-in"
+            )
+    return problems
+
+
 def validate(root: Path = ROOT) -> tuple[set[Path], list[str]]:
     """Return scanned files and policy violations for a repository root."""
     github = root / ".github"
+    problems = actrc_problems(root)
     if not github.is_dir():
-        return set(), []
+        return set(), problems
     allowlist = load_allowlist(root)
     workflows = sorted((github / "workflows").glob("*.yml")) + sorted(
         (github / "workflows").glob("*.yaml")
     )
     if not workflows:
-        return set(), ["no workflows found; the scan would vacuously pass"]
+        problems.append("no workflows found; the scan would vacuously pass")
+        return set(), problems
 
     seen: set[Path] = set()
-    problems: list[str] = []
     for workflow in workflows:
         problems.extend(scan(workflow, allowlist, seen, root))
     # Composite actions no workflow happens to call are still checked, so an
@@ -176,7 +199,7 @@ def main(root: Path = ROOT) -> int:
     seen, problems = validate(root)
 
     if problems:
-        print("FAIL: mutable or unreadable GitHub Action references:\n")
+        print("FAIL: CI pinning policy violations:\n")
         for problem in problems:
             print(f"  {problem}")
         print(
@@ -190,7 +213,7 @@ def main(root: Path = ROOT) -> int:
 
     print(
         f"OK: {len(seen)} workflow/action files; every external reference is "
-        "SHA-pinned with a version comment"
+        "SHA-pinned with a version comment, and .actrc policy checks passed"
     )
     return 0
 
@@ -283,9 +306,50 @@ def self_test() -> int:
             print("SELF-TEST FAIL: pinned ref without version comment was accepted")
             return 1
 
+        pinned_actrc = fixture(
+            root / "pinned-actrc", f"actions/checkout@{sha} # v4.2.2"
+        )
+        (pinned_actrc / ".actrc").write_text(
+            "-P ubuntu-latest=catthehacker/ubuntu:act-latest@sha256:"
+            "c58e2b364da03b0c804c7d660f2ecbedf2f221a382b9baa0b344b0144780ff43\n"
+        )
+        _, problems = validate(pinned_actrc)
+        if problems:
+            print(f"SELF-TEST FAIL: pinned .actrc image rejected: {problems}")
+            return 1
+
+        unpinned_actrc = fixture(
+            root / "unpinned-actrc", f"actions/checkout@{sha} # v4.2.2"
+        )
+        (unpinned_actrc / ".actrc").write_text(
+            "-P ubuntu-latest=catthehacker/ubuntu:act-latest\n"
+        )
+        _, problems = validate(unpinned_actrc)
+        if not any(
+            ".actrc:1: runner image is not pinned by digest" in p for p in problems
+        ):
+            print("SELF-TEST FAIL: unpinned .actrc image was accepted")
+            return 1
+
+        opt_in_actrc = fixture(
+            root / "opt-in-actrc", f"actions/checkout@{sha} # v4.2.2"
+        )
+        (opt_in_actrc / ".actrc").write_text("--reuse\n--secret-file .secrets\n")
+        _, problems = validate(opt_in_actrc)
+        if not any(
+            "--reuse must stay a per-invocation opt-in" in p for p in problems
+        ):
+            print("SELF-TEST FAIL: default --reuse was accepted")
+            return 1
+        if not any(
+            "--secret-file must stay a per-invocation opt-in" in p for p in problems
+        ):
+            print("SELF-TEST FAIL: default --secret-file was accepted")
+            return 1
+
     print(
         "SELF-TEST OK: SHA comments, local actions, recursive callees, "
-        "and missing comments"
+        "missing comments, and .actrc digest/opt-in policy"
     )
     return 0
 
