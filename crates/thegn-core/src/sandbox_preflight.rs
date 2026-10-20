@@ -337,6 +337,22 @@ mod tests {
     }
 
     #[test]
+    fn compose_preflight_pins_first_replica() {
+        let compose = crate::sandbox_compose::ComposeSpec {
+            files: vec!["compose.yml".into()],
+            service: Some("worker".into()),
+            run_services: Vec::new(),
+        };
+        let mut spec = base_spec(Backend::Docker);
+        spec.compose = Some(compose.encode());
+        let argv = preflight_exec_argv_with(&spec, "true").unwrap();
+        let exec = argv.iter().position(|arg| arg == "exec").unwrap();
+        assert_eq!(&argv[exec + 1..exec + 3], ["--index", "1"]);
+        let service = argv.iter().position(|arg| arg == "worker").unwrap();
+        assert!(service > exec + 2);
+    }
+
+    #[test]
     fn compose_preflight_runner_targets_service_not_container_name() {
         let compose = crate::sandbox_compose::ComposeSpec {
             files: vec!["compose.yml".into()],
@@ -361,13 +377,15 @@ mod tests {
         assert_ne!(observed[exec - 1], spec.name);
         let after_exec = &observed[exec + 1..];
         assert!(!after_exec.iter().any(|arg| arg == "thegn-x"));
-        let service_index = if after_exec.first().is_some_and(|arg| arg == "--workdir") {
+        assert_eq!(&after_exec[..2], ["--index", "1"]);
+        let after_index = &after_exec[2..];
+        let service_index = if after_index.first().is_some_and(|arg| arg == "--workdir") {
             2
         } else {
             0
         };
         assert_eq!(
-            after_exec.get(service_index).map(String::as_str),
+            after_index.get(service_index).map(String::as_str),
             Some("app")
         );
     }
