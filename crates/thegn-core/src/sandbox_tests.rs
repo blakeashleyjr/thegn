@@ -2380,7 +2380,79 @@ fn systemd_cleanup_property_rejects_systemd_expansion_and_quoting_chars() {
     }
     assert!(systemd_env_cleanup_prop("bin/rm", path).is_none());
     assert!(systemd_env_cleanup_prop("/bin/rm", std::path::Path::new("state/name.env")).is_none());
-    assert!(systemd_env_cleanup_prop("/bin/rm", std::path::Path::new("/state/a b.env")).is_none());
+    assert_eq!(
+        systemd_env_cleanup_prop("/bin/rm", std::path::Path::new("/state/a b.env")).as_deref(),
+        Some("ExecStopPost=-+/bin/rm -f -- \"/state/a b.env\"")
+    );
+}
+
+#[test]
+fn systemd_cleanup_property_quotes_and_escapes_paths() {
+    for (path, expected) in [
+        (
+            "/state/it's.env",
+            "ExecStopPost=-+/bin/rm -f -- \"/state/it's.env\"",
+        ),
+        (
+            "/state/q\"x.env",
+            "ExecStopPost=-+/bin/rm -f -- \"/state/q\\\"x.env\"",
+        ),
+        (
+            "/state/b\\x.env",
+            "ExecStopPost=-+/bin/rm -f -- \"/state/b\\\\x.env\"",
+        ),
+    ] {
+        assert_eq!(
+            systemd_env_cleanup_prop("/bin/rm", std::path::Path::new(path)).as_deref(),
+            Some(expected),
+            "path: {path}"
+        );
+    }
+    for path in [
+        "/state/$HOME.env",
+        "/state/100%.env",
+        "/state/a;b.env",
+        "/state/line\nbreak.env",
+    ] {
+        assert!(
+            systemd_env_cleanup_prop("/bin/rm", std::path::Path::new(path)).is_none(),
+            "unsafe path accepted: {path:?}"
+        );
+    }
+}
+
+#[test]
+fn systemd_cleanup_refusal_removes_env_file() {
+    let temp = tempfile::tempdir().unwrap();
+    let state = temp.path().join("st%ate");
+    std::fs::create_dir(&state).unwrap();
+    let state_home = state.to_string_lossy().into_owned();
+    let _env = crate::testenv::EnvGuard::mutate_pairs(&[
+        ("API_KEY", Some("sk_secret")),
+        ("THEGN_SANDBOX", None),
+        ("XDG_STATE_HOME", Some(&state_home)),
+    ]);
+    let mut s = spec(Backend::Systemd);
+    s.image = None;
+    s.name = "thegn-test-envfile-systemd-refusal".into();
+    s.env = vec![("API_KEY".into(), "sk_secret".into())];
+
+    assert!(matches!(
+        backend_enter_argv(&s, "exec true"),
+        Err(EnterError::Refused(r)) if r.class == RefusalClass::SystemdMountPath
+    ));
+    let env_dir = state.join("thegn/sandbox-env");
+    let entries = std::fs::read_dir(env_dir)
+        .unwrap()
+        .collect::<std::io::Result<Vec<_>>>()
+        .unwrap();
+    assert!(
+        entries.iter().all(|entry| entry
+            .path()
+            .extension()
+            .is_none_or(|extension| extension != "env")),
+        "refused launch left a secret env file behind"
+    );
 }
 
 #[test]
