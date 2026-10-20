@@ -474,13 +474,9 @@ config_enum! {
     ///                debuggers, ping) keeps working. The default.
     /// - `sealed`   — full lockdown: `network=none`, read-only root, drop ALL
     ///                capabilities, no-new-privileges, tighter pids cap.
-    /// - `sealed-tunnel` — the same lockdown as `sealed` (read-only root, drop
-    ///                ALL capabilities on the worktree, no-new-privileges, tight
-    ///                pids cap) EXCEPT the worktree has no *direct* host egress
-    ///                but is attached to its `[sandbox.vpn]` overlay: its only
-    ///                route is the tunnel (the sidecar holds NET_ADMIN/TUN, not
-    ///                the worktree). With no VPN configured it degrades to
-    ///                `network=none`, i.e. behaves exactly like `sealed`.
+    /// - `sealed-tunnel` — refuses to launch when a VPN is configured, because
+    ///                thegn cannot yet enforce an exclusive tunnel route. With
+    ///                no VPN configured it behaves exactly like `sealed`.
     pub enum SandboxProfile: "sandbox profile" {
         Open = "open" | "off" | "none",
         Hardened = "hardened" | "guarded",
