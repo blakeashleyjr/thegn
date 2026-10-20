@@ -239,6 +239,7 @@ pub mod pipeline_approval;
 pub mod pipeline_chunk;
 pub mod pipeline_claim;
 pub mod pipeline_exit;
+pub mod pipeline_gate_attest;
 pub mod pipeline_reap;
 pub mod pipeline_report;
 pub mod pipeline_resume;
