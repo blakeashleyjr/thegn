@@ -1904,7 +1904,10 @@ fn build_report(
             kind: d.kind,
             submodule_conflicts: d.submodule_conflicts.clone(),
             gate_failed: false,
-            driver_refusal: None,
+            driver_refusal: (d.kind == ConflictKind::UnsupportedMergeHistory).then(|| {
+                "branch history contains merge commits; the rebase land strategy only replays linear history: land it with the merge or squash strategy, or linearize the branch"
+                    .to_string()
+            }),
         })
         .collect();
     for off in gate_offenders {
@@ -2065,7 +2068,8 @@ fn refusal_summary(paths: &[String], refusals: &BTreeMap<String, String>) -> Opt
 fn attach_driver_refusals(report: &mut FoldReport, refusals: &Mutex<BTreeMap<String, String>>) {
     if let Ok(refusals) = refusals.lock() {
         for deferred in &mut report.deferred {
-            deferred.driver_refusal = refusal_summary(&deferred.paths, &refusals);
+            deferred.driver_refusal = refusal_summary(&deferred.paths, &refusals)
+                .or_else(|| deferred.driver_refusal.take());
         }
     }
 }
@@ -3527,6 +3531,49 @@ mod tests {
         assert!(authors.contains("Ada"), "author not preserved: {authors}");
         let files = repo.out(&["ls-tree", "-r", "--name-only", "main"]);
         assert!(files.contains("a.txt") && files.contains("b.txt") && files.contains("main.txt"));
+    }
+
+    #[test]
+    fn rebase_merge_history_holds_without_moving_main() {
+        let repo = Repo::new("rebase-merge-history");
+        if !repo.history_supported_or_refused() {
+            return;
+        }
+        repo.feature("feat", "feat.txt", "feature\n");
+        repo.commit("main.txt", "main\n", "main moves");
+        let before = repo.out(&["rev-parse", "main"]);
+        git(&repo.dir, &["checkout", "-q", "feat"]);
+        git(
+            &repo.dir,
+            &[
+                "-c",
+                "commit.gpgsign=false",
+                "merge",
+                "--no-ff",
+                "-q",
+                "-m",
+                "merge main",
+                "main",
+            ],
+        );
+
+        let mut c = cfg("");
+        c.land_strategy = thegn_core::config::LandStrategy::Rebase;
+        let report = run_fold(&c, &repo.dir, repo.branch_set()).unwrap();
+
+        assert!(!report.advanced, "merge history must hold: {report:?}");
+        assert_eq!(repo.out(&["rev-parse", "main"]), before, "target unmoved");
+        assert_eq!(report.deferred.len(), 1, "branch has a typed hold");
+        assert_eq!(
+            report.deferred[0].kind,
+            ConflictKind::UnsupportedMergeHistory
+        );
+        assert!(
+            report.deferred[0]
+                .driver_refusal
+                .as_deref()
+                .is_some_and(|reason| reason.contains("merge commits"))
+        );
     }
 
     #[test]
