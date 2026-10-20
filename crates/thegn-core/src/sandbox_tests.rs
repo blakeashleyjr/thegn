@@ -114,6 +114,48 @@ fn build_vpn_spec_sealed_refuses_but_sealed_tunnel_attaches() {
 }
 
 #[test]
+fn tunnel_only_profiles_refuse_only_when_vpn_is_configured() {
+    let cfg = vpn_cfg(VpnProviderKind::Tailscale);
+    let tunnel = build_vpn_spec(&cfg, "wt", SandboxProfile::SealedTunnel).unwrap();
+    assert!(tunnel.tunnel_only);
+    let hardened = build_vpn_spec(&cfg, "wt", SandboxProfile::Hardened).unwrap();
+    assert!(!hardened.tunnel_only);
+
+    for profile in [
+        SandboxProfile::Open,
+        SandboxProfile::Hardened,
+        SandboxProfile::Sealed,
+        SandboxProfile::SealedTunnel,
+    ] {
+        for vpn_configured in [false, true] {
+            let mut sandbox = spec(Backend::Podman);
+            sandbox.vpn = if vpn_configured {
+                build_vpn_spec(&cfg, "wt", profile)
+            } else {
+                None
+            };
+            let result = enter_argv(&sandbox, "sh");
+            if profile == SandboxProfile::SealedTunnel && vpn_configured {
+                match result {
+                    Err(EnterError::Refused(refusal)) => {
+                        assert_eq!(refusal.class, RefusalClass::TunnelUnenforced);
+                        assert!(refusal.message.contains("sealed-tunnel"));
+                        assert!(refusal.message.contains("hardened"));
+                    }
+                    other => panic!("expected tunnel-only refusal, got {other:?}"),
+                }
+            } else {
+                assert!(!matches!(
+                    result,
+                    Err(EnterError::Refused(refusal))
+                        if refusal.class == RefusalClass::TunnelUnenforced
+                ));
+            }
+        }
+    }
+}
+
+#[test]
 fn build_vpn_spec_maps_each_provider_to_its_params() {
     for provider in [
         VpnProviderKind::Tailscale,
@@ -631,6 +673,7 @@ fn refusal_constructor_preserves_each_class_and_field() {
         RefusalClass::ComposeServiceMissing,
         RefusalClass::HostnamePolicy,
         RefusalClass::MountUnresolvable,
+        RefusalClass::TunnelUnenforced,
     ] {
         let error = refusal(
             &spec,

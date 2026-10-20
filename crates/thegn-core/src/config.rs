@@ -474,13 +474,9 @@ config_enum! {
     ///                debuggers, ping) keeps working. The default.
     /// - `sealed`   — full lockdown: `network=none`, read-only root, drop ALL
     ///                capabilities, no-new-privileges, tighter pids cap.
-    /// - `sealed-tunnel` — the same lockdown as `sealed` (read-only root, drop
-    ///                ALL capabilities on the worktree, no-new-privileges, tight
-    ///                pids cap) EXCEPT the worktree has no *direct* host egress
-    ///                but is attached to its `[sandbox.vpn]` overlay: its only
-    ///                route is the tunnel (the sidecar holds NET_ADMIN/TUN, not
-    ///                the worktree). With no VPN configured it degrades to
-    ///                `network=none`, i.e. behaves exactly like `sealed`.
+    /// - `sealed-tunnel` — refuses to launch when a VPN is configured, because
+    ///                thegn cannot yet enforce an exclusive tunnel route. With
+    ///                no VPN configured it behaves exactly like `sealed`.
     pub enum SandboxProfile: "sandbox profile" {
         Open = "open" | "off" | "none",
         Hardened = "hardened" | "guarded",
@@ -601,9 +597,10 @@ impl SandboxProfile {
         Vec::new()
     }
     /// Force `network=none` regardless of the configured network mode. Both
-    /// `sealed` and `sealed-tunnel` impose this floor; for `sealed-tunnel` a
-    /// resolved VPN attachment lifts it back up to a tunnel-only route (handled
-    /// in `sandbox::resolve_scoped`, not here), so with no VPN it stays sealed.
+    /// `sealed` and `sealed-tunnel` impose this floor. With a resolved VPN,
+    /// `sealed-tunnel` asks for a tunnel-only route, which launch refuses
+    /// (`sandbox::tunnel_admission`, `RefusalClass::TunnelUnenforced`) until the
+    /// runtime can enforce it; with no VPN it stays sealed.
     pub fn forces_no_network(self) -> bool {
         matches!(self, SandboxProfile::Sealed | SandboxProfile::SealedTunnel)
     }
