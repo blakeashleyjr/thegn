@@ -28,10 +28,11 @@ pub trait PoolStore {
     fn base_snapshot(&self, repo_path: &str, env_name: &str) -> Result<Option<(String, String)>>;
 
     /// Insert a freshly-minted spare (state `"provisioning"`) for `(repo, env)`.
+    /// Refuses an existing sandbox name so ownership rows are never replaced.
     fn insert_pool_spare(&self, name: &str, repo: &str, env: &str) -> Result<()>;
 
     /// Mark a spare `ready` with its checkpoint id + the `flake.lock` hash it was
-    /// built against (for staleness checks).
+    /// built against (for staleness checks). Refuses when no ledger row exists.
     fn set_pool_spare_ready(
         &self,
         name: &str,
@@ -39,14 +40,15 @@ pub trait PoolStore {
         lock_hash: &str,
     ) -> Result<()>;
 
-    /// Drop a spare row (destroyed or claimed-and-finalized).
+    /// Drop a spare row after destruction or claim finalization.
     fn delete_pool_spare(&self, name: &str) -> Result<()>;
 
     /// All spares for `(repo, env)`, any state, newest first.
     fn pool_spares_for(&self, repo: &str, env: &str) -> Result<Vec<PoolSpare>>;
 
     /// Atomically claim a `ready` spare for `(repo, env)` and bind it to
-    /// `worktree`. Returns the claimed `(sandbox_name, checkpoint_id)` or `None`.
+    /// `worktree`. The claim refuses unless exactly one ready ledger row is
+    /// updated. Returns the claimed `(sandbox_name, checkpoint_id)` or `None`.
     fn claim_pool_spare(
         &self,
         repo: &str,
