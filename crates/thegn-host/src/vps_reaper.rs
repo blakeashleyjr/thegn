@@ -147,16 +147,15 @@ fn reap_unambiguous(pc: &thegn_core::config::EnvProviderConfig) {
     {
         live_anywhere.insert(inst.name.clone());
         let state = ledger_state_for(&view, &inst.name);
-        if matches!(state, LedgerState::Unreadable) {
-            thegn_core::msg::warn(&format!(
-                "vps reaper: quarantined {}: ledger record unreadable; reconcile ownership; no deletion attempted",
-                inst.name
-            ));
-            continue;
-        }
         let record = match state {
             LedgerState::Recorded(record) => Some(record),
-            LedgerState::Unreadable => unreachable!("unreadable ledger entry continued above"),
+            LedgerState::Unreadable => {
+                thegn_core::msg::warn(&format!(
+                    "vps reaper: quarantined {}: ledger record unreadable; reconcile ownership; no deletion attempted",
+                    inst.name
+                ));
+                continue;
+            }
             LedgerState::Absent => None,
         };
         if record.is_some_and(|record| !recorded_identity_matches(record, kind, &inst.id)) {
