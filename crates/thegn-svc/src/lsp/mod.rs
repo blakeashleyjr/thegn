@@ -3038,18 +3038,19 @@ mod tests {
         client.shutdown(Duration::from_millis(100));
         assert!(started.elapsed() < Duration::from_secs(1));
         assert_eq!(client.reader_state(), (false, true));
-        assert!(leaked_reader_count() >= before + 1);
+        assert!(leaked_reader_count() > before);
     }
 
     #[test]
     fn lifecycle_repeated_shutdown_is_a_noop() {
         let (client, _, _server_writer) = capturing_client();
         client.shutdown(Duration::from_millis(100));
-        let after_first = leaked_reader_count();
+        let state_after_first = client.reader_state();
+        assert_eq!(state_after_first, (false, true));
         let started = Instant::now();
         client.shutdown(Duration::from_millis(100));
         assert!(started.elapsed() < Duration::from_millis(50));
-        assert_eq!(leaked_reader_count(), after_first);
+        assert_eq!(client.reader_state(), state_after_first);
     }
 
     #[test]
@@ -3065,6 +3066,9 @@ mod tests {
         assert!(matches!(refused, Err(LspError::Spawn(message)) if message.contains("writable")));
 
         crate::plugin::platform::set_mode_for_test(&executable, 0o755).unwrap();
+        assert!(resolve_server_command(executable.to_str().unwrap(), None).is_ok());
+
+        crate::plugin::platform::set_mode_for_test(&executable, 0o775).unwrap();
         assert!(resolve_server_command(executable.to_str().unwrap(), None).is_ok());
     }
 
@@ -3091,13 +3095,17 @@ mod tests {
 
     #[test]
     fn lifecycle_identity_records_canonical_path_and_mode() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = thegn_core::testenv::symlinked_tempdir();
         let executable = dir.path().join("srv");
         let contents = "#!/bin/sh\nexit 0\n";
         std::fs::write(&executable, contents).unwrap();
         crate::plugin::platform::set_mode_for_test(&executable, 0o750).unwrap();
         let identity = server_executable_identity(&executable).unwrap();
-        assert_eq!(identity.canonical, executable.canonicalize().unwrap());
+        let expected = dir.real_path().join("srv").canonicalize().unwrap();
+        assert_eq!(identity.canonical, expected);
+        if dir.path() != dir.real_path() {
+            assert_ne!(identity.canonical, executable);
+        }
         assert_eq!(identity.size, contents.len() as u64);
         if cfg!(unix) {
             assert_eq!(identity.mode, Some(0o750));

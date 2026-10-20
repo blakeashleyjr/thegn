@@ -18,8 +18,8 @@ pub(crate) fn platform_is_executable_file(metadata: &std::fs::Metadata) -> bool 
 pub(crate) fn platform_executable_trust(metadata: &std::fs::Metadata) -> Result<(), String> {
     use std::os::unix::fs::MetadataExt;
 
-    if metadata.permissions().mode() & 0o022 != 0 {
-        return Err("is group- or world-writable".to_string());
+    if metadata.mode() & 0o002 != 0 {
+        return Err("is world-writable".to_string());
     }
     let uid = metadata.uid();
     // SAFETY: geteuid has no preconditions and returns the calling process uid.
@@ -35,10 +35,7 @@ pub(crate) fn platform_executable_identity_metadata(
 ) -> (Option<u32>, Option<u32>) {
     use std::os::unix::fs::MetadataExt;
 
-    (
-        Some(metadata.uid()),
-        Some(metadata.permissions().mode() & 0o7777),
-    )
+    (Some(metadata.uid()), Some(metadata.mode() & 0o7777))
 }
 
 #[cfg(test)]
