@@ -1559,8 +1559,10 @@ impl GitlabCi {
     }
 
     /// Construct a `glab` command with credentials in the child environment,
-    /// never in argv. Keeping this at one chokepoint prevents a new operation
-    /// from accidentally falling back to an unaudited/config-ignored path.
+    /// never in argv. Remote authority reaches glab only through argv; the
+    /// token never does. Keeping this at one chokepoint prevents a new
+    /// operation from accidentally falling back to an unaudited/config-ignored
+    /// path.
     fn command(
         &self,
         loc: &GitLoc,
@@ -1581,7 +1583,20 @@ impl GitlabCi {
                 "configured GitLab token cannot be forwarded to a remote/provider worktree".into(),
             ));
         }
-        let mut cmd = loc.cli_command("glab", args);
+        if loc.is_remote() && args.first() != Some(&"api") {
+            return Err(CiError::Other(
+                "glab on a remote/provider worktree supports only `api` calls with a pinned host"
+                    .into(),
+            ));
+        }
+        let mut cmd = if loc.is_remote() {
+            let hostname = format!("--hostname={}", remote.host);
+            let mut remote_args = vec!["api", hostname.as_str()];
+            remote_args.extend_from_slice(&args[1..]);
+            loc.cli_command("glab", &remote_args)
+        } else {
+            loc.cli_command("glab", args)
+        };
         if let GitlabCredential::Configured { token, explicit } = &self.credential
             && (!loc.is_remote() || *explicit)
         {
@@ -3148,6 +3163,155 @@ esac
             env.get("GITLAB_HOST").and_then(Option::as_deref),
             Some("gitlab.example.test")
         );
+    }
+
+    #[test]
+    fn gitlab_authority_is_pinned_in_argv_for_ssh_remote_worktrees() {
+        let client = GitlabCi {
+            credential: GitlabCredential::CliManaged,
+            host: None,
+            ..GitlabCi::default()
+        };
+        let loc = GitLoc::Remote {
+            ssh: thegn_core::remote::SshTarget::plain("build.example.test".into(), 22, false),
+            path: "/workspace".into(),
+        };
+        let remote = GitlabRemote {
+            host: "gitlab.example.test".into(),
+            project: "g/r".into(),
+        };
+        let command = client
+            .command(&loc, &remote, &["api", "projects/g%2Fr/pipelines"])
+            .unwrap();
+        let args = command
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert!(args.contains("--hostname=gitlab.example.test"), "{args}");
+        assert!(!args.contains("GITLAB_TOKEN"), "{args}");
+        assert!(!args.contains("fixture-secret-token"), "{args}");
+    }
+
+    #[test]
+    fn gitlab_authority_is_pinned_in_argv_for_provider_worktrees() {
+        let client = GitlabCi {
+            credential: GitlabCredential::CliManaged,
+            host: None,
+            ..GitlabCi::default()
+        };
+        let loc = GitLoc::Provider {
+            control_prefix: vec![
+                "sprite".into(),
+                "exec".into(),
+                "-s".into(),
+                "x".into(),
+                "--".into(),
+            ],
+            path: "/workspace".into(),
+        };
+        let remote = GitlabRemote {
+            host: "gitlab.example.test".into(),
+            project: "g/r".into(),
+        };
+        let command = client
+            .command(&loc, &remote, &["api", "projects/g%2Fr/pipelines"])
+            .unwrap();
+        let args = command
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert!(args.contains("--hostname=gitlab.example.test"), "{args}");
+        assert!(!args.contains("GITLAB_TOKEN"), "{args}");
+        assert!(!args.contains("fixture-secret-token"), "{args}");
+    }
+
+    #[test]
+    fn gitlab_local_argv_is_unchanged_and_uses_env_host() {
+        let client = GitlabCi {
+            credential: GitlabCredential::CliManaged,
+            host: None,
+            ..GitlabCi::default()
+        };
+        let loc = GitLoc::Local(std::path::PathBuf::from("/workspace"));
+        let remote = GitlabRemote {
+            host: "gitlab.example.test".into(),
+            project: "g/r".into(),
+        };
+        let command = client
+            .command(&loc, &remote, &["api", "projects/g%2Fr/pipelines"])
+            .unwrap();
+        let args = command
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        assert_eq!(args, ["api", "projects/g%2Fr/pipelines"]);
+        assert_eq!(
+            command
+                .get_envs()
+                .find(|(key, _)| *key == std::ffi::OsStr::new("GITLAB_HOST"))
+                .and_then(|(_, value)| value)
+                .map(|value| value.to_string_lossy().into_owned())
+                .as_deref(),
+            Some("gitlab.example.test")
+        );
+    }
+
+    #[test]
+    fn gitlab_remote_non_api_call_is_refused() {
+        let client = GitlabCi {
+            credential: GitlabCredential::CliManaged,
+            host: None,
+            ..GitlabCi::default()
+        };
+        let loc = GitLoc::Provider {
+            control_prefix: vec!["sprite".into(), "exec".into(), "--".into()],
+            path: "/workspace".into(),
+        };
+        let remote = GitlabRemote {
+            host: "gitlab.example.test".into(),
+            project: "g/r".into(),
+        };
+        let error = match client.command(&loc, &remote, &["ci", "view"]) {
+            Err(error) => error.to_string(),
+            Ok(_) => panic!("remote non-api glab call was allowed"),
+        };
+        assert!(error.contains("only `api` calls with a pinned host"));
+        assert!(!error.contains("fixture-secret-token"));
+    }
+
+    #[test]
+    fn gitlab_resolved_default_token_never_reaches_remote_argv() {
+        let default = thegn_core::config::GitLabCiConfig::default().token;
+        let credential = GitlabCredential::from_resolution(
+            &default,
+            crate::secret::SecretResolution::Resolved("ambient-token".into()),
+        );
+        let client = GitlabCi {
+            credential,
+            host: None,
+            ..GitlabCi::default()
+        };
+        let loc = GitLoc::Provider {
+            control_prefix: vec!["sprite".into(), "exec".into(), "--".into()],
+            path: "/workspace".into(),
+        };
+        let remote = GitlabRemote {
+            host: "gitlab.example.test".into(),
+            project: "g/r".into(),
+        };
+        let command = client
+            .command(&loc, &remote, &["api", "projects/g%2Fr/pipelines"])
+            .unwrap();
+        let args = command
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert!(args.contains("--hostname=gitlab.example.test"), "{args}");
+        assert!(!args.contains("ambient-token"), "{args}");
+        assert!(!args.contains("GITLAB_TOKEN"), "{args}");
     }
 
     #[test]
