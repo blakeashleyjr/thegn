@@ -252,8 +252,10 @@ pub trait WorktreeAuxStore {
     /// Remove the forward record for `(worktree, container_port)`.
     fn delete_forward(&self, worktree: &str, container_port: u16) -> Result<()>;
 
-    /// Enqueue (or re-enqueue) an unbound worktree branch for the next fold.
-    /// This clears any previously captured candidate pair.
+    /// Enqueue (or re-enqueue) an unbound worktree branch for the next fold. Re-enqueueing
+    /// resets the row to `queued` and clears any prior result/conflict/error. The `location`
+    /// value mirrors `worktrees.location` through a correlated subquery; NULL when unregistered
+    /// is treated as local. This clears any previously captured candidate pair.
     fn enqueue_merge(&self, worktree: &str, branch: &str, target_branch: &str) -> Result<()>;
 
     /// Enqueue a deliberate local branch and capture its full ref and tip OID.

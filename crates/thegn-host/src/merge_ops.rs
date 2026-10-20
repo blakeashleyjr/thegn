@@ -700,8 +700,11 @@ mod tests {
             enqueue_worktree(&cfg, &db, &worktree).unwrap(),
             "queued feat"
         );
+        let wt = crate::merge_ops::canonical_worktree(&worktree)
+            .to_string_lossy()
+            .into_owned();
         assert_eq!(
-            db.merge_candidate(&worktree.to_string_lossy()).unwrap(),
+            db.merge_candidate(&wt).unwrap(),
             Some(MergeCandidate {
                 branch_ref: "refs/heads/feat".into(),
                 candidate_oid: tip,
@@ -712,7 +715,9 @@ mod tests {
     #[test]
     fn candidate_moved_branch_keeps_stored_oid_until_reenqueue() {
         let (_temp, _repo, worktree, db, cfg) = local_candidate_fixture();
-        let wt = worktree.to_string_lossy().into_owned();
+        let wt = crate::merge_ops::canonical_worktree(&worktree)
+            .to_string_lossy()
+            .into_owned();
         enqueue_worktree(&cfg, &db, &worktree).unwrap();
         let stored = db.merge_candidate(&wt).unwrap().unwrap();
         std::fs::write(worktree.join("feat.txt"), "second\n").unwrap();
