@@ -2,13 +2,16 @@
 //! unstaged-only (temp-commit dance) variants.
 
 use super::{GitBackend, run_w, run_w_locked};
-use anyhow::{Context, Result, bail};
+use anyhow::{Result, bail};
 use thegn_core::gitrefs::{parse_git_version, supports_stash_staged};
 use thegn_core::remote::GitLoc;
 
 #[cfg(test)]
+type UnstagedStashStepHook = Box<dyn FnMut(&str)>;
+
+#[cfg(test)]
 thread_local! {
-    static UNSTAGED_STASH_STEP_HOOK: std::cell::RefCell<Option<Box<dyn FnMut(&str)>>> =
+    static UNSTAGED_STASH_STEP_HOOK: std::cell::RefCell<Option<UnstagedStashStepHook>> =
         std::cell::RefCell::new(None);
 }
 
