@@ -55,6 +55,16 @@ stable releases and warns with the replacement. Likewise, `wt new --program`
 is canonical while `wt new --project` remains accepted as a deprecated alias;
 the warning is kept off JSON stdout.
 
+### Secrets
+
+`thegn secret set|rm|list|migrate|audit|ssh rotate` manage the credential
+broker without printing secret values. `rm` reports the keyring and file
+outcomes and exits nonzero if keyring removal fails, its outcome is unknown, or
+file removal fails; retry once the keyring responds when its outcome is unknown.
+A timed-out keyring write never falls back to the file store. `audit` shows
+managed SSH fingerprints in OpenSSH `SHA256:` form and labels older stored
+forms "legacy, unverified" (`fingerprint_verified` in `--json`).
+
 ### Tailing the event feed
 
 `thegn events tail` is a read-only thin client for the daemon's live control
