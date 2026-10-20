@@ -230,7 +230,7 @@ struct ServeTeardown {
 struct Shared {
     shutdown: AtomicBool,
     endpoint_conflict: AtomicBool,
-    pid: Mutex<Option<u32>>,
+    stop: Mutex<Option<thegn_svc::share::StopHandle>>,
     teardown: Mutex<Option<ServeTeardown>>,
 }
 
@@ -239,7 +239,7 @@ impl Shared {
         Arc::new(Shared {
             shutdown: AtomicBool::new(false),
             endpoint_conflict: AtomicBool::new(false),
-            pid: Mutex::new(None),
+            stop: Mutex::new(None),
             teardown: Mutex::new(None),
         })
     }
@@ -260,8 +260,14 @@ struct ShareInstance {
 impl ShareInstance {
     fn kill(&self) {
         self.shared.shutdown.store(true, Ordering::SeqCst);
-        if let Some(pid) = *self.shared.pid.lock().unwrap() {
-            crate::platform::terminate_pid(pid);
+        if let Some(handle) = self.shared.stop.lock().unwrap().as_ref() {
+            match handle.stop() {
+                thegn_svc::share::StopOutcome::Failed(error) => {
+                    tracing::warn!(%error, worktree = %self.worktree, port = self.port, "share child termination failed");
+                }
+                thegn_svc::share::StopOutcome::Terminated
+                | thegn_svc::share::StopOutcome::AlreadyExited => {}
+            }
         }
         // Sidecar-serve teardown shells into the VPN sidecar; do it off the loop.
         if let Some(td) = self.shared.teardown.lock().unwrap().clone() {
@@ -715,16 +721,17 @@ fn supervise(
                 Ok(path) => path,
                 Err(e) => return fail(e.to_string()),
             };
-            match share::start(&plan, &statedir, spec.ready_timeout) {
+            match share::start_cancellable(&plan, &statedir, spec.ready_timeout, &shared.shutdown) {
                 Ok(running) => {
-                    *shared.pid.lock().unwrap() = Some(running.child.id());
+                    let stop_handle = running.stop_handle();
+                    *shared.stop.lock().unwrap() = Some(stop_handle.clone());
                     let conflict_shared = shared.clone();
                     running.on_endpoint_conflict(Box::new(move || {
                         conflict_shared
                             .endpoint_conflict
                             .store(true, Ordering::Release);
-                        if let Some(pid) = *conflict_shared.pid.lock().unwrap() {
-                            crate::platform::terminate_pid(pid);
+                        if let thegn_svc::share::StopOutcome::Failed(error) = stop_handle.stop() {
+                            tracing::warn!(%error, "share endpoint-conflict termination failed");
                         }
                     }));
                     if shared.shutdown.load(Ordering::SeqCst) {
@@ -744,7 +751,7 @@ fn supervise(
                         url: running.public_url.clone(),
                     });
                     running.wait();
-                    *shared.pid.lock().unwrap() = None;
+                    *shared.stop.lock().unwrap() = None;
                     if shared.endpoint_conflict.load(Ordering::Acquire) {
                         fail(
                             "provider announced a different public endpoint; share stopped".into(),
@@ -756,6 +763,13 @@ fn supervise(
                             generation,
                         });
                     }
+                }
+                Err(e) if e.downcast_ref::<share::ShareStartCancelled>().is_some() => {
+                    emit(ShareEvent::Down {
+                        worktree,
+                        port,
+                        generation,
+                    });
                 }
                 Err(e) => fail(e.to_string()),
             }
@@ -835,6 +849,113 @@ pub(crate) fn seed_failed_instance_for_test(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn kill_during_bring_up_sets_the_cancellation_flag() {
+        let shared = Shared::new();
+        let instance = ShareInstance {
+            worktree: "/wt".into(),
+            port: 3000,
+            generation: 41,
+            provider: "bore",
+            public: true,
+            state: ShareState::Starting,
+            shared: shared.clone(),
+            event_tx: None,
+            event_waker: None,
+        };
+        let state = tempfile::tempdir().expect("private temporary state");
+        let plan = thegn_svc::share::SharePlan {
+            program: if cfg!(windows) {
+                "powershell.exe"
+            } else {
+                "sh"
+            }
+            .into(),
+            args: if cfg!(windows) {
+                vec![
+                    "-NoProfile".into(),
+                    "-Command".into(),
+                    "Start-Sleep -Seconds 30".into(),
+                ]
+            } else {
+                vec!["-c".into(), "sleep 30".into()]
+            },
+            env: Vec::new(),
+            files: Vec::new(),
+            url_rule: thegn_svc::share::UrlRule::AfterMarker {
+                marker: "public: ".into(),
+                scheme: "https".into(),
+            },
+        };
+        let startup_shared = shared.clone();
+        let state_path = state.path().to_path_buf();
+        let starter = std::thread::spawn(move || {
+            thegn_svc::share::start_cancellable(
+                &plan,
+                &state_path,
+                std::time::Duration::from_secs(10),
+                &startup_shared.shutdown,
+            )
+        });
+        instance.kill();
+        let result = starter.join().expect("startup thread");
+        assert!(result.is_err_and(|error| {
+            error
+                .downcast_ref::<thegn_svc::share::ShareStartCancelled>()
+                .is_some()
+        }));
+    }
+
+    #[test]
+    fn kill_with_a_reaped_child_handle_does_not_signal_a_pid() {
+        let state = tempfile::tempdir().expect("private temporary state");
+        let plan = thegn_svc::share::SharePlan {
+            program: if cfg!(windows) {
+                "powershell.exe"
+            } else {
+                "sh"
+            }
+            .into(),
+            args: if cfg!(windows) {
+                vec![
+                    "-NoProfile".into(),
+                    "-Command".into(),
+                    "Start-Sleep -Seconds 2".into(),
+                ]
+            } else {
+                vec!["-c".into(), "sleep 1.7".into()]
+            },
+            env: Vec::new(),
+            files: Vec::new(),
+            url_rule: thegn_svc::share::UrlRule::Fixed("http://fixed.example".into()),
+        };
+        let running =
+            thegn_svc::share::start(&plan, state.path(), std::time::Duration::from_secs(2))
+                .expect("start short-lived share");
+        let handle = running.stop_handle();
+        running.wait();
+        let shared = Shared::new();
+        *shared.stop.lock().unwrap() = Some(handle.clone());
+        let instance = ShareInstance {
+            worktree: "/wt".into(),
+            port: 3000,
+            generation: 42,
+            provider: "bore",
+            public: true,
+            state: ShareState::Up(
+                thegn_svc::share::PublicEndpoint::parse_url("http://fixed.example")
+                    .expect("valid URL"),
+            ),
+            shared,
+            event_tx: None,
+            event_waker: None,
+        };
+        let started = std::time::Instant::now();
+        instance.kill();
+        assert!(started.elapsed() < std::time::Duration::from_millis(100));
+        assert_eq!(handle.stop(), thegn_svc::share::StopOutcome::AlreadyExited);
+    }
 
     #[test]
     fn on_event_transitions_and_views() {
