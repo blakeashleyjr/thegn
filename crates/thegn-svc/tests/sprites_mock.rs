@@ -9,7 +9,7 @@
 //! Run: `cargo test -p thegn-svc --test sprites_mock`.
 
 use std::collections::HashMap;
-use std::io::{BufReader, Read, Write};
+use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -309,7 +309,7 @@ fn start_delete_mock(fail_first: usize) -> (String, Arc<Mutex<usize>>) {
             let d = d.clone();
             thread::spawn(move || {
                 let mut writer = stream.try_clone().unwrap();
-                let mut reader = BufReader::new(stream);
+                let mut reader = stream;
                 let mut line = String::new();
                 if read_line(&mut reader, &mut line).is_none() {
                     return;
@@ -364,7 +364,7 @@ fn start_create_mock(fail_first: usize) -> (String, Arc<Mutex<usize>>) {
             let p = p.clone();
             thread::spawn(move || {
                 let mut writer = stream.try_clone().unwrap();
-                let mut reader = BufReader::new(stream);
+                let mut reader = stream;
                 let mut line = String::new();
                 if read_line(&mut reader, &mut line).is_none() {
                     return;
@@ -426,7 +426,7 @@ fn start_flaky_list_mock(fail_first: usize) -> (String, Arc<Mutex<usize>>) {
             let l = l.clone();
             thread::spawn(move || {
                 let mut writer = stream.try_clone().unwrap();
-                let mut reader = BufReader::new(stream);
+                let mut reader = stream;
                 let mut line = String::new();
                 if read_line(&mut reader, &mut line).is_none() {
                     return;
