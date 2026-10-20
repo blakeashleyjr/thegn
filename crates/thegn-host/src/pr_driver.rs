@@ -675,35 +675,52 @@ pub(crate) fn drive_queue(
                     cfg.agent_isolation_floor,
                     cfg.agent_on_floor_miss,
                 );
-                let sandbox = match dispatch {
-                    crate::agent_run::AgentDispatch::InfraHold(reason) => {
-                        // best-effort: cache write: the DB is a cache; git/forge stays the source of truth
-                        let _ = db.update_pr_status(
-                            &item.key,
-                            PrqStatus::BlockedCi.as_str(),
-                            Some(blocker.as_str()),
-                            Some(&reason),
-                            Some(&head),
-                        );
-                        step(PrqStatus::BlockedCi.as_str(), &reason, &mut progress);
-                        out.blocked.push(item.number);
-                        continue;
-                    }
+                let (sandbox, isolation) = match dispatch {
+                    crate::agent_run::AgentDispatch::InfraHold(reason) => (
+                        None,
+                        thegn_core::pr_queue::IsolationAdmission::Refused(reason),
+                    ),
                     crate::agent_run::AgentDispatch::RunDegraded(spec, warning) => {
                         thegn_core::msg::warn(&warning);
-                        spec
+                        (
+                            Some(spec),
+                            thegn_core::pr_queue::IsolationAdmission::Degraded(warning),
+                        )
                     }
-                    crate::agent_run::AgentDispatch::Run(spec) => spec,
+                    crate::agent_run::AgentDispatch::Run(spec) => (
+                        Some(spec),
+                        thegn_core::pr_queue::IsolationAdmission::Admitted,
+                    ),
                 };
+                if let Err(refusal) =
+                    thegn_core::pr_queue::admit_prepared_dispatch(kind, true, &isolation)
+                {
+                    let reason = refusal.to_string();
+                    // best-effort: cache write: the DB is a cache; git/forge stays the source of truth
+                    let _ = db.update_pr_status(
+                        &item.key,
+                        PrqStatus::BlockedCi.as_str(),
+                        Some(blocker.as_str()),
+                        Some(&reason),
+                        Some(&head),
+                    );
+                    step(PrqStatus::BlockedCi.as_str(), &reason, &mut progress);
+                    out.blocked.push(item.number);
+                    continue;
+                }
+                let sandbox = sandbox.expect("admitted isolation carries a sandbox spec");
 
                 let (Some(wt), Some(template)) = (item.worktree.as_deref(), agent_cmd.as_deref())
                 else {
                     continue;
                 };
-                let Some((vars, prompt)) = compose(cfg, kind, wt, &item, &fetched, &blocker) else {
-                    let reason = format!(
-                        "agent not dispatched: [pr_queue.prompts] template for {kind} is invalid"
-                    );
+                let prepared = compose(cfg, kind, wt, &item, &fetched, &blocker);
+                if let Err(refusal) = thegn_core::pr_queue::admit_prepared_dispatch(
+                    kind,
+                    prepared.is_some(),
+                    &thegn_core::pr_queue::IsolationAdmission::Admitted,
+                ) {
+                    let reason = refusal.to_string();
                     if let Err(error) = db.update_pr_status(
                         &item.key,
                         PrqStatus::for_blocker(&blocker).as_str(),
@@ -721,7 +738,9 @@ pub(crate) fn drive_queue(
                         &mut progress,
                     );
                     continue;
-                };
+                }
+                let (vars, prompt) =
+                    prepared.expect("prepared dispatch admitted only with a prompt");
                 // Preparation can block. Recheck author/account/head before
                 // consuming the attempt; unknown or changed evidence holds.
                 if let Err(reason) = crate::pr_authorship::revalidate(
@@ -2668,6 +2687,42 @@ mod tests {
         assert_eq!(row.status, "blocked_ci");
         assert!(row.detail.unwrap().contains("template"));
         assert_eq!(row.agent_attempts, 0);
+    }
+
+    #[test]
+    fn isolation_refusal_is_a_durable_blocked_ci_without_attempt_spend() {
+        let (dir, db) = temp_db("prq-isolation-refusal");
+        let mut config = cfg();
+        config.watch = vec![PrWatchKind::Ci];
+        config.own_prs_only = false;
+        config.agent_sandbox = true;
+        let sentinel = dir.path().join("agent-was-run");
+        config.agent_command = format!("touch {}", sentinel.display());
+        let (checkout, row) =
+            enqueue_pr_with_checkout(&dir, &db, 7, "feat", "https://github.com/me/repo/pull/7");
+        std::fs::write(
+            checkout.join(".thegn.toml"),
+            "[sandbox\nnetwork = \"none\"\n",
+        )
+        .unwrap();
+        let forge = FakeForge::new(Some(failing_ci_pr("abc"))).with_rerun_count(0);
+
+        let out = drive_queue(
+            &config,
+            &Config::default(),
+            &forge,
+            &checkout,
+            &db,
+            vec![row],
+            |_| {},
+        );
+
+        assert_eq!(out.blocked, vec![7]);
+        let row = db.list_pr_queue().unwrap().remove(0);
+        assert_eq!(row.status, "blocked_ci");
+        assert_eq!(row.agent_attempts, 0);
+        assert!(row.detail.unwrap().contains(".thegn.toml"));
+        assert!(!sentinel.exists());
     }
 
     #[test]
