@@ -149,6 +149,27 @@ fn host_authority_summary(config: &crate::host_config::HostConfig) -> String {
     }
 }
 
+fn check_stored_authority(
+    name: &str,
+    existing_json: &str,
+    hc: &crate::host_config::HostConfig,
+) -> Result<()> {
+    let existing_config = serde_json::from_str::<crate::host_config::HostConfig>(existing_json)
+        .map_err(|_| {
+            anyhow::anyhow!(
+                "host alias {name:?} has an unreadable stored authority; remove it with `thegn host rm {name}` or choose `--name <other>`"
+            )
+        })?;
+    if !crate::host_config::same_host_authority(&existing_config, hc) {
+        anyhow::bail!(
+            "host alias {name:?} is already bound to {} and cannot be rebound to {}; remove it with `thegn host rm {name}` or choose `--name <other>`",
+            host_authority_summary(&existing_config),
+            host_authority_summary(hc),
+        );
+    }
+    Ok(())
+}
+
 impl HostStore for Db {
     fn host_get(&self, id: &HostId) -> Result<Option<HostRow>> {
         let got = self
@@ -319,25 +340,16 @@ impl HostStore for Db {
             )
             .optional()?;
         if let Some(Some(existing_json)) = &existing {
-            let existing_config = serde_json::from_str::<crate::host_config::HostConfig>(
-                existing_json,
-            )
-            .map_err(|_| {
-                anyhow::anyhow!(
-                    "host alias {name:?} has an unreadable stored authority; remove it with `thegn host rm {name}` or choose `--name <other>`"
-                )
-            })?;
-            if !crate::host_config::same_host_authority(&existing_config, hc) {
-                anyhow::bail!(
-                    "host alias {name:?} is already bound to {} and cannot be rebound to {}; remove it with `thegn host rm {name}` or choose `--name <other>`",
-                    host_authority_summary(&existing_config),
-                    host_authority_summary(hc),
-                );
-            }
+            check_stored_authority(name, existing_json, hc)?;
         } else if existing == Some(None) {
             let occupied: bool = tx.query_row(
                 "SELECT state != 'unknown'
                         OR heartbeat IS NOT NULL
+                        OR install_consent IS NOT NULL
+                        OR caps_json IS NOT NULL
+                        OR last_probe IS NOT NULL
+                        OR last_used IS NOT NULL
+                        OR headroom_json IS NOT NULL
                         OR EXISTS (SELECT 1 FROM host_inventory WHERE host_id=?1)
                         OR EXISTS (SELECT 1 FROM host_events WHERE host_id=?1)
                    FROM hosts WHERE host_id=?1",
@@ -369,7 +381,7 @@ impl HostStore for Db {
         name: &str,
         hc: &crate::host_config::HostConfig,
         now: i64,
-    ) -> Result<()> {
+    ) -> Result<bool> {
         let id = HostId::named(name);
         let json = serde_json::to_string(hc)?;
         let tx = self.conn().unchecked_transaction()?;
@@ -380,23 +392,29 @@ impl HostStore for Db {
                 |row| row.get(0),
             )
             .optional()?;
+        let mut cleared_state = false;
         if let Some(Some(existing_json)) = &existing {
-            let existing_config = serde_json::from_str::<crate::host_config::HostConfig>(
-                existing_json,
-            )
-            .map_err(|_| {
-                anyhow::anyhow!(
-                    "host alias {name:?} has an unreadable stored authority; remove it with `thegn host rm {name}` or choose `--name <other>`"
-                )
-            })?;
-            if !crate::host_config::same_host_authority(&existing_config, hc) {
-                anyhow::bail!(
-                    "host alias {name:?} is already bound to {} and cannot be rebound to {}; remove it with `thegn host rm {name}` or choose `--name <other>`",
-                    host_authority_summary(&existing_config),
-                    host_authority_summary(hc),
-                );
-            }
+            check_stored_authority(name, existing_json, hc)?;
         } else if existing.is_some() {
+            cleared_state = tx.query_row(
+                "SELECT state != 'unknown'
+                        OR state_meta IS NOT NULL
+                        OR caps_json IS NOT NULL
+                        OR arch IS NOT NULL
+                        OR install_consent IS NOT NULL
+                        OR consented_at IS NOT NULL
+                        OR heartbeat IS NOT NULL
+                        OR active_step IS NOT NULL
+                        OR last_probe IS NOT NULL
+                        OR last_used IS NOT NULL
+                        OR headroom_json IS NOT NULL
+                        OR last_headroom IS NOT NULL
+                        OR EXISTS (SELECT 1 FROM host_inventory WHERE host_id=?1)
+                        OR EXISTS (SELECT 1 FROM host_events WHERE host_id=?1)
+                   FROM hosts WHERE host_id=?1",
+                params![id.as_str()],
+                |row| row.get(0),
+            )?;
             tx.execute(
                 "DELETE FROM host_inventory WHERE host_id=?1",
                 params![id.as_str()],
@@ -418,7 +436,7 @@ impl HostStore for Db {
             params![id.as_str(), name, hc.reach.as_str(), json, now],
         )?;
         tx.commit()?;
-        Ok(())
+        Ok(cleared_state)
     }
 
     /// All user-added host definitions (rows carrying a config_json).
@@ -1039,6 +1057,59 @@ mod tests {
     }
 
     #[test]
+    fn put_host_def_refuses_unknown_row_with_persisted_install_grant() {
+        let db = db();
+        let id = HostId::named("box");
+        db.host_checkpoint(&id, "box", "ssh", &HostState::Unknown, None, 1)
+            .unwrap();
+        db.host_set_consent(&id, true, 2).unwrap();
+        let before: (String, String, String, bool, Option<String>, Option<i64>, i64) = db
+            .conn()
+            .query_row(
+                "SELECT host_id, name, state, config_json IS NULL, install_consent, consented_at, updated_at
+                   FROM hosts WHERE host_id=?1",
+                params![id.as_str()],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                        row.get(6)?,
+                    ))
+                },
+            )
+            .unwrap();
+
+        let error = db
+            .put_host_def("box", &ssh_host("me@new", 22), 9)
+            .unwrap_err();
+        assert!(error.to_string().contains("--replace"));
+        let after: (String, String, String, bool, Option<String>, Option<i64>, i64) = db
+            .conn()
+            .query_row(
+                "SELECT host_id, name, state, config_json IS NULL, install_consent, consented_at, updated_at
+                   FROM hosts WHERE host_id=?1",
+                params![id.as_str()],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                        row.get(6)?,
+                    ))
+                },
+            )
+            .unwrap();
+        assert_eq!(after, before);
+    }
+
+    #[test]
     fn replace_clears_state_inventory_and_events_atomically() {
         let db = db();
         let id = HostId::named("box");
@@ -1061,7 +1132,7 @@ mod tests {
         .unwrap();
 
         let replacement = ssh_host("me@new", 22);
-        db.put_host_def_replacing("box", &replacement, 9).unwrap();
+        assert!(db.put_host_def_replacing("box", &replacement, 9).unwrap());
         let row = db.host_get(&id).unwrap().unwrap();
         assert_eq!(row.state, HostState::Unknown);
         assert_eq!(row.heartbeat, None);
@@ -1083,9 +1154,22 @@ mod tests {
         assert!(db.host_events_recent(&id, 10).unwrap().is_empty());
         assert_eq!(db.host_defs().unwrap()[0].1.ssh.host, "me@new");
 
-        db.put_host_def_replacing("fresh", &ssh_host("me@fresh", 22), 10)
+        assert!(
+            !db.put_host_def_replacing("fresh", &ssh_host("me@fresh", 22), 10)
+                .unwrap()
+        );
+        let placeholder_id = HostId::named("placeholder");
+        db.conn()
+            .execute(
+                "INSERT INTO hosts (host_id, name) VALUES (?1, ?2)",
+                params![placeholder_id.as_str(), "placeholder"],
+            )
             .unwrap();
-        assert_eq!(db.host_defs().unwrap().len(), 2);
+        assert!(
+            !db.put_host_def_replacing("placeholder", &ssh_host("me@placeholder", 22), 11)
+                .unwrap()
+        );
+        assert_eq!(db.host_defs().unwrap().len(), 3);
     }
 
     #[test]
