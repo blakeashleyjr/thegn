@@ -235,6 +235,10 @@ class WorkflowPolicyTests(unittest.TestCase):
         self.assertIs(action.get("with", {}).get("dry-run"), True)
         self.assertIs(action.get("with", {}).get("dry-run-intended"), True)
         self.assertNotIn("GITHUB_TOKEN", action.get("env", {}))
+        self.assertEqual(
+            "refs/tags/${{ needs.admit.outputs.tag }}",
+            action.get("with", {}).get("ref"),
+        )
 
     def test_no_privileged_job_builds_release_code(self) -> None:
         jobs = read_workflow("release.yml")["jobs"]
