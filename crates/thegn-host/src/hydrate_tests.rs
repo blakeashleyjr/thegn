@@ -1580,9 +1580,8 @@ fn git_repo_with_linked_worktree(
     let linked_arg = linked.to_string_lossy().into_owned();
     run(root, &["worktree", "add", "-q", "-b", "feat", &linked_arg]);
 
-    let porcelain = thegn_core::util::git_out(root, &["worktree", "list", "--porcelain"])
-        .expect("porcelain from a freshly built fixture");
-    let pairs = thegn_core::util::parse_worktree_branches(&porcelain);
+    let pairs = thegn_core::util::worktree_branches(root)
+        .expect("worktree listing from a freshly built fixture");
     let of = |branch: &str| {
         pairs
             .iter()

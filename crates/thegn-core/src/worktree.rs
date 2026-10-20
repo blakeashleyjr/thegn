@@ -366,12 +366,8 @@ impl BranchSet {
         ) {
             taken.extend(out.lines().map(str::to_string).filter(|l| !l.is_empty()));
         }
-        if let Some(out) = util::git_out(root, &["worktree", "list", "--porcelain"]) {
-            taken.extend(
-                out.lines()
-                    .filter_map(|l| l.strip_prefix("branch refs/heads/"))
-                    .map(str::to_string),
-            );
+        if let Some(worktrees) = util::worktree_branches(root) {
+            taken.extend(worktrees.into_iter().filter_map(|(_, branch)| branch));
         }
         Self { taken }
     }
@@ -889,15 +885,16 @@ pub fn remove_detailed(
 /// permission to recursively delete a directory.
 fn git_worktree_registration(root: &Path, path: &Path) -> Option<bool> {
     let output = util::git_cmd(root)
-        .args(["worktree", "list", "--porcelain"])
+        .args(util::WORKTREE_LIST_Z)
         .output()
         .ok()?;
     if !output.status.success() {
         return None;
     }
     let porcelain = String::from_utf8_lossy(&output.stdout);
+    let worktrees = util::parse_worktree_branches(&porcelain)?;
     Some(
-        util::parse_worktree_branches(&porcelain)
+        worktrees
             .iter()
             .any(|(listed, _)| worktree_paths_equal(Path::new(listed), path)),
     )
