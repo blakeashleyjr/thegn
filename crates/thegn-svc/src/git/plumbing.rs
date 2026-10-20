@@ -149,11 +149,11 @@ fn parse_commit_metas(out: &str) -> Result<Vec<CommitMeta>> {
             anyhow::bail!("git log returned duplicate commit object id: {oid}");
         }
         let parents = record[1];
-        let mut parent_iter = parents.split_ascii_whitespace();
-        let parent = parent_iter.next().unwrap_or("");
-        if parents.split_ascii_whitespace().any(|p| !is_object_id(p)) {
+        let parent_ids: Vec<&str> = parents.split_ascii_whitespace().collect();
+        if parent_ids.iter().any(|p| !is_object_id(p)) {
             anyhow::bail!("git log returned invalid parent object ids for {oid}");
         }
+        let parent = parent_ids.first().copied().unwrap_or("");
         let date = record[4];
         if date.is_empty() || date.bytes().any(|byte| byte.is_ascii_whitespace()) {
             anyhow::bail!("git log returned invalid author date for {oid}: {date:?}");
@@ -161,6 +161,10 @@ fn parse_commit_metas(out: &str) -> Result<Vec<CommitMeta>> {
         commits.push(CommitMeta {
             oid: oid.to_string(),
             parent: parent.to_string(),
+            parents: parent_ids
+                .iter()
+                .map(|parent| (*parent).to_string())
+                .collect(),
             // `-z` replaces the usual pretty-format record newline with NUL.
             // Restore it so this matches `git log -1 --format=%B <oid>`.
             message: format!("{}\n", record[5]),
@@ -923,6 +927,7 @@ mod tests {
                 CommitMeta {
                     oid: oid_a.clone(),
                     parent: String::new(),
+                    parents: vec![],
                     message: "one\u{1f}\u{1e}\n".into(),
                     author: Author {
                         name: "first".into(),
@@ -933,6 +938,7 @@ mod tests {
                 CommitMeta {
                     oid: oid_b.clone(),
                     parent: oid_a.clone(),
+                    parents: vec![oid_a.clone()],
                     message: "two\n".into(),
                     author: Author {
                         name: "second".into(),
@@ -955,6 +961,49 @@ mod tests {
         ] {
             assert!(parse_commit_metas(&malformed).is_err(), "{malformed:?}");
         }
+    }
+
+    #[test]
+    fn commit_metas_carry_every_parent() {
+        let repo = TestRepo::new("plumb-commit-parents");
+        ident(&repo.dir);
+        let commit_file = |path: &str, content: &str, message: &str| {
+            std::fs::write(repo.dir.join(path), content).unwrap();
+            git_in(&repo.dir, &["add", path]);
+            git_in(
+                &repo.dir,
+                &["-c", "commit.gpgsign=false", "commit", "-q", "-m", message],
+            );
+        };
+        commit_file("first.txt", "first\n", "root");
+        let root = repo.head();
+        git_in(&repo.dir, &["checkout", "-q", "-b", "side"]);
+        commit_file("side.txt", "side\n", "side");
+        let side = repo.head();
+        git_in(&repo.dir, &["checkout", "-q", "main"]);
+        commit_file("main.txt", "main\n", "main");
+        let first_parent = repo.head();
+        git_in(
+            &repo.dir,
+            &[
+                "-c",
+                "commit.gpgsign=false",
+                "merge",
+                "--no-ff",
+                "-q",
+                "-m",
+                "merge side",
+                "side",
+            ],
+        );
+        let merge_oid = repo.head();
+        let commits = CliGit.commits(&repo.loc(), &root, &merge_oid).unwrap();
+        let merge = commits
+            .iter()
+            .find(|commit| commit.oid == merge_oid)
+            .expect("range includes merge commit");
+        assert_eq!(merge.parents, [first_parent.clone(), side]);
+        assert_eq!(merge.parent, first_parent);
     }
 
     #[test]
