@@ -1201,8 +1201,15 @@ fn spawned_client_sees_only_allowlisted_env() {
         ("GITHUB_TOKEN".into(), "github-value".into()),
     ];
     let cancel = AtomicBool::new(false);
-    let running = start_with_ambient(&plan, temp.path(), Duration::from_secs(1), ambient, &cancel)
-        .expect("start fake client");
+    let running = start_with_ambient(
+        &plan,
+        temp.path(),
+        Duration::from_secs(1),
+        ambient,
+        &cancel,
+        ProcessGrouping::Foreground,
+    )
+    .expect("start fake client");
     let dumped_env = std::fs::read_to_string(&dump_path).expect("read child environment");
 
     assert!(
@@ -1228,6 +1235,204 @@ fn spawned_client_sees_only_allowlisted_env() {
         );
     }
     running.stop();
+}
+
+#[cfg(unix)]
+fn group_stop_plan(script: String) -> SharePlan {
+    SharePlan {
+        program: "sh".into(),
+        args: vec!["-c".into(), script],
+        env: Vec::new(),
+        files: Vec::new(),
+        url_rule: UrlRule::AfterMarker {
+            marker: "public: ".into(),
+            scheme: "https".into(),
+        },
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn group_stop_kills_pipe_holding_grandchild() {
+    let state = tempfile::tempdir().expect("private temporary state");
+    let pid_path = state.path().join("grandchild.pid");
+    let script = format!(
+        "sleep 30 & echo $! > '{}'; echo 'public: grand.example'; wait",
+        pid_path.display()
+    );
+    let plan = group_stop_plan(script);
+    let running = start_cancellable(
+        &plan,
+        state.path(),
+        Duration::from_secs(3),
+        &AtomicBool::new(false),
+    )
+    .expect("start grouped client");
+    let pid: i32 = std::fs::read_to_string(&pid_path)
+        .expect("grandchild pid")
+        .trim()
+        .parse()
+        .expect("pid number");
+    assert_eq!(running.stop_handle().stop(), StopOutcome::Terminated);
+    let started = Instant::now();
+    let report = running.wait_verified();
+    assert!(started.elapsed() < Duration::from_secs(5));
+    assert_eq!(report.leaked_readers, 0);
+    let mut gone = false;
+    for _ in 0..100 {
+        // SAFETY: signal zero checks process existence and does not deliver a signal.
+        let rc = unsafe { libc::kill(pid, 0) };
+        if rc == -1 && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH) {
+            gone = true;
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert!(
+        gone,
+        "pipe-holding grandchild must be gone after group stop"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn group_stop_escalates_when_the_client_ignores_sigterm() {
+    let state = tempfile::tempdir().expect("private temporary state");
+    let plan = group_stop_plan(
+        "trap '' TERM; echo 'public: stubborn.example'; while :; do sleep 1; done".into(),
+    );
+    let running = start_cancellable(
+        &plan,
+        state.path(),
+        Duration::from_secs(3),
+        &AtomicBool::new(false),
+    )
+    .expect("start grouped client");
+    let started = Instant::now();
+    assert_eq!(
+        running
+            .stop_handle()
+            .stop_with_grace(Duration::from_millis(200)),
+        StopOutcome::Terminated
+    );
+    let report = running.wait_verified();
+    assert!(started.elapsed() < Duration::from_secs(5));
+    assert_eq!(report.leaked_readers, 0);
+}
+
+#[cfg(unix)]
+#[test]
+fn group_stop_repeated_stop_arms_one_escalation() {
+    let state = tempfile::tempdir().expect("private temporary state");
+    let plan = group_stop_plan(
+        "trap '' TERM; echo 'public: stubborn.example'; while :; do sleep 1; done".into(),
+    );
+    let running = start_cancellable(
+        &plan,
+        state.path(),
+        Duration::from_secs(3),
+        &AtomicBool::new(false),
+    )
+    .expect("start grouped client");
+    let handle = running.stop_handle();
+    let counter = Arc::clone(
+        &handle
+            .child
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .escalation_count,
+    );
+    assert_eq!(
+        handle.stop_with_grace(Duration::from_secs(1)),
+        StopOutcome::Terminated
+    );
+    assert_eq!(
+        handle.stop_with_grace(Duration::from_secs(1)),
+        StopOutcome::Terminated
+    );
+    assert_eq!(counter.load(Ordering::Relaxed), 1);
+    running.wait_verified();
+    assert_eq!(handle.stop(), StopOutcome::AlreadyExited);
+}
+
+#[cfg(unix)]
+#[test]
+fn group_stop_foreground_start_keeps_the_callers_group() {
+    let state = tempfile::tempdir().expect("private temporary state");
+    let foreground_path = state.path().join("foreground.pgid");
+    let script = format!(
+        "ps -o pgid= -p $$ > '{}'; echo 'public: foreground.example'; sleep 30",
+        foreground_path.display()
+    );
+    let plan = SharePlan {
+        program: "sh".into(),
+        args: vec!["-c".into(), script],
+        env: Vec::new(),
+        files: Vec::new(),
+        url_rule: UrlRule::AfterMarker {
+            marker: "public: ".into(),
+            scheme: "https".into(),
+        },
+    };
+    let running = start(&plan, state.path(), Duration::from_secs(3)).expect("foreground start");
+    let pgid: i32 = std::fs::read_to_string(foreground_path)
+        .expect("foreground pgid")
+        .trim()
+        .parse()
+        .expect("pgid number");
+    // SAFETY: getpgrp has no pointer arguments or side effects.
+    assert_eq!(pgid, unsafe { libc::getpgrp() });
+    running.stop();
+
+    let grouped_path = state.path().join("grouped.pgid");
+    let plan = group_stop_plan(format!(
+        "ps -o pgid= -p $$ > '{}'; echo 'public: grouped.example'; sleep 30",
+        grouped_path.display()
+    ));
+    let running = start_cancellable(
+        &plan,
+        state.path(),
+        Duration::from_secs(3),
+        &AtomicBool::new(false),
+    )
+    .expect("grouped start");
+    let pgid: i32 = std::fs::read_to_string(grouped_path)
+        .expect("grouped pgid")
+        .trim()
+        .parse()
+        .expect("pgid number");
+    assert_eq!(
+        pgid,
+        running
+            .stop_handle()
+            .child
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .pid as i32
+    );
+    running.stop();
+}
+
+#[cfg(unix)]
+#[test]
+fn group_stop_supervised_wait_returns_on_exit_without_poll() {
+    let state = tempfile::tempdir().expect("private temporary state");
+    let plan = group_stop_plan("echo 'public: quick.example'; sleep 0.3".into());
+    let running = start_cancellable(
+        &plan,
+        state.path(),
+        Duration::from_secs(3),
+        &AtomicBool::new(false),
+    )
+    .expect("start grouped client");
+    let started = Instant::now();
+    let report = running.wait_verified();
+    assert!(started.elapsed() < Duration::from_secs(2));
+    assert!(matches!(
+        report.outcome,
+        StopOutcome::AlreadyExited | StopOutcome::Terminated
+    ));
+    assert_eq!(report.leaked_readers, 0);
 }
 
 #[cfg(unix)]
