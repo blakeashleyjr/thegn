@@ -11,6 +11,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use anyhow::{Context, Result, anyhow, bail};
+use sha2::{Digest, Sha256};
 use thegn_core::config::Config;
 use thegn_core::managed_ssh::{AuthorizedKeyRecord, RotationRecovery};
 
@@ -20,6 +21,89 @@ pub struct RotationSummary {
     pub scopes: usize,
     pub instances: usize,
     pub dry_run: bool,
+}
+
+struct ScopeLease {
+    _file: std::fs::File,
+}
+
+#[derive(Debug)]
+struct CustodyChanged {
+    provider: String,
+    instance: String,
+}
+
+impl std::fmt::Display for CustodyChanged {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "managed SSH custody row {}/{} changed since this rotation read it; no further remote change was made",
+            self.provider, self.instance
+        )
+    }
+}
+
+impl std::error::Error for CustodyChanged {}
+
+#[derive(Debug)]
+struct RotationLeaseHeld {
+    key_name: String,
+}
+
+impl std::fmt::Display for RotationLeaseHeld {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "another `thegn secret ssh rotate` is already rotating {}; nothing was changed",
+            self.key_name
+        )
+    }
+}
+
+impl std::error::Error for RotationLeaseHeld {}
+
+#[allow(deprecated)]
+fn acquire_scope_lease_in(lock_dir: &Path, key_path: &Path) -> Result<ScopeLease> {
+    thegn_core::fsperm::ensure_private_dir(lock_dir).with_context(|| {
+        format!(
+            "secure managed SSH rotation lease directory {}",
+            lock_dir.display()
+        )
+    })?;
+    let mut digest = Sha256::new();
+    digest.update(b"thegn-ssh-rotation-lease-v1\0");
+    digest.update(key_path.as_os_str().as_encoded_bytes());
+    let path = lock_dir.join(format!("{:x}.lock", digest.finalize()));
+    let file = match thegn_core::fsperm::open_regular_file_nofollow(&path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            match thegn_core::fsperm::create_owner_only_exclusive(&path) {
+                Ok(file) => file,
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                    thegn_core::fsperm::open_regular_file_nofollow(&path)?
+                }
+                Err(error) => return Err(error.into()),
+            }
+        }
+        Err(error) => return Err(error.into()),
+    };
+    match file.try_lock() {
+        Ok(()) => Ok(ScopeLease { _file: file }),
+        Err(std::fs::TryLockError::WouldBlock) => Err(RotationLeaseHeld {
+            key_name: key_path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or("managed key")
+                .to_string(),
+        }
+        .into()),
+        Err(std::fs::TryLockError::Error(error)) => Err(error.into()),
+    }
+}
+
+fn acquire_scope_lease(key_path: &Path) -> Result<ScopeLease> {
+    let lock_dir = thegn_core::managed_ssh::dir().with_file_name("rotation-leases");
+    acquire_scope_lease_in(&lock_dir, key_path)
 }
 
 pub fn rotate(cfg: &Config, account: Option<&str>, dry_run: bool) -> Result<RotationSummary> {
@@ -74,6 +158,26 @@ pub fn rotate(cfg: &Config, account: Option<&str>, dry_run: bool) -> Result<Rota
     }
 
     for (key_path, records) in &scopes {
+        let _lease = acquire_scope_lease(key_path)?;
+        let mut current = thegn_core::managed_ssh::list()
+            .context("re-read managed SSH custody inventory under rotation lease")?
+            .into_iter()
+            .filter(|record| {
+                record.key_path == *key_path
+                    && account.is_none_or(|account| record.account == account)
+            })
+            .collect::<Vec<_>>();
+        let mut snapshot = records.clone();
+        sort_scope_rows(&mut current);
+        sort_scope_rows(&mut snapshot);
+        anyhow::ensure!(
+            current == snapshot,
+            "managed SSH custody for {} changed while this rotation was starting; re-run",
+            key_path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or("managed key")
+        );
         rotate_scope(cfg, key_path, records)?;
     }
     Ok(RotationSummary {
@@ -81,6 +185,16 @@ pub fn rotate(cfg: &Config, account: Option<&str>, dry_run: bool) -> Result<Rota
         instances,
         dry_run: false,
     })
+}
+
+fn sort_scope_rows(records: &mut [AuthorizedKeyRecord]) {
+    records.sort_by(|left, right| {
+        (&left.provider, &left.account, &left.instance).cmp(&(
+            &right.provider,
+            &right.account,
+            &right.instance,
+        ))
+    });
 }
 
 fn rotate_scope(cfg: &Config, key_path: &Path, records: &[AuthorizedKeyRecord]) -> Result<()> {
@@ -139,6 +253,9 @@ fn rotate_scope(cfg: &Config, key_path: &Path, records: &[AuthorizedKeyRecord]) 
         retiring_completed: false,
     };
     if let Err(error) = persist_recovery_for_all(&mut tracked, &recovery) {
+        if error.downcast_ref::<CustodyChanged>().is_some() {
+            return Err(error.context("record replacement-key recovery plan"));
+        }
         let cleanup = clear_unstarted_recovery(&mut tracked, &staging);
         return Err(combine_recovery_error(
             error.context("record replacement-key recovery plan"),
@@ -177,6 +294,9 @@ fn rotate_scope(cfg: &Config, key_path: &Path, records: &[AuthorizedKeyRecord]) 
             .expect("recovery plan was persisted before remote mutation");
         recovery.authorized = true;
         if let Err(error) = update_recovery(&mut tracked[index], recovery) {
+            if error.downcast_ref::<CustodyChanged>().is_some() {
+                return Err(error.context("record replacement authorization"));
+            }
             let cleanup = recover_pending(cfg, key_path, &mut tracked);
             return Err(combine_recovery_error(
                 error.context("record replacement authorization"),
@@ -220,6 +340,9 @@ fn rotate_scope(cfg: &Config, key_path: &Path, records: &[AuthorizedKeyRecord]) 
             .expect("authorized recovery plan remains present");
         recovery.verified = true;
         if let Err(error) = update_recovery(&mut tracked[index], recovery) {
+            if error.downcast_ref::<CustodyChanged>().is_some() {
+                return Err(error.context("record replacement verification"));
+            }
             let cleanup = recover_pending(cfg, key_path, &mut tracked);
             return Err(combine_recovery_error(
                 error.context("record replacement verification"),
@@ -267,6 +390,9 @@ fn rotate_scope(cfg: &Config, key_path: &Path, records: &[AuthorizedKeyRecord]) 
             .expect("verified recovery plan remains present");
         recovery.retiring_started = true;
         if let Err(error) = update_recovery(&mut tracked[index], recovery) {
+            if error.downcast_ref::<CustodyChanged>().is_some() {
+                return Err(error.context("record old-key retirement boundary"));
+            }
             let cleanup = recover_pending(cfg, key_path, &mut tracked);
             return Err(combine_recovery_error(
                 error.context("record old-key retirement boundary"),
@@ -343,19 +469,24 @@ fn rotate_scope(cfg: &Config, key_path: &Path, records: &[AuthorizedKeyRecord]) 
     // Mark the all-remotes-retired boundary durably before clearing individual
     // recovery rows. If a later custody write fails partway, any surviving row
     // proves it is safe to complete forward to the canonical replacement.
+    let mut completion_errors = Vec::new();
     for record in &mut tracked {
-        if let Some(recovery) = &mut record.rotation_recovery {
-            recovery.retiring_completed = true;
+        let Some(mut recovery) = record.rotation_recovery.clone() else {
+            continue;
+        };
+        recovery.retiring_completed = true;
+        if let Err(error) = update_recovery(record, recovery) {
+            let custody_changed = error.downcast_ref::<CustodyChanged>().is_some();
+            completion_errors.push(error);
+            if custody_changed {
+                break;
+            }
         }
     }
-    let completion_errors = tracked
-        .iter()
-        .filter_map(|record| {
-            thegn_core::managed_ssh::record_authorized_at(&thegn_core::managed_ssh::dir(), record)
-                .err()
-        })
-        .collect::<Vec<_>>();
     if let Some(error) = completion_errors.into_iter().next() {
+        if error.downcast_ref::<CustodyChanged>().is_some() {
+            return Err(error.context("record completed remote retirement boundary"));
+        }
         let cleanup = recover_pending(cfg, key_path, &mut tracked);
         return Err(combine_recovery_error(
             error.context("record completed remote retirement boundary"),
@@ -365,6 +496,7 @@ fn rotate_scope(cfg: &Config, key_path: &Path, records: &[AuthorizedKeyRecord]) 
     }
 
     for record in &tracked {
+        ensure_unchanged(&thegn_core::managed_ssh::dir(), record)?;
         thegn_core::managed_ssh::record_authorized_with_proxy_worktree(
             &record.provider,
             &record.account,
@@ -408,14 +540,48 @@ fn rotation_sibling(key_path: &Path, label: &str) -> PathBuf {
     key_path.with_extension(format!("{label}-{identity}"))
 }
 
+fn publish_if_unchanged_in(
+    dir: &Path,
+    expected: &AuthorizedKeyRecord,
+    next: &AuthorizedKeyRecord,
+) -> Result<()> {
+    ensure_unchanged(dir, expected)?;
+    thegn_core::managed_ssh::record_authorized_at(dir, next)
+}
+
+fn ensure_unchanged(dir: &Path, expected: &AuthorizedKeyRecord) -> Result<()> {
+    let actual = thegn_core::managed_ssh::read_at(
+        dir,
+        &expected.provider,
+        &expected.account,
+        &expected.instance,
+    )?;
+    if actual.as_ref() != Some(expected) {
+        return Err(CustodyChanged {
+            provider: expected.provider.clone(),
+            instance: expected.instance.clone(),
+        }
+        .into());
+    }
+    Ok(())
+}
+
 fn update_recovery(record: &mut AuthorizedKeyRecord, recovery: RotationRecovery) -> Result<()> {
-    record.rotation_recovery = Some(recovery);
-    thegn_core::managed_ssh::record_authorized_at(&thegn_core::managed_ssh::dir(), record)
+    let expected = record.clone();
+    let mut next = expected.clone();
+    next.rotation_recovery = Some(recovery);
+    publish_if_unchanged_in(&thegn_core::managed_ssh::dir(), &expected, &next)?;
+    *record = next;
+    Ok(())
 }
 
 fn clear_recovery(record: &mut AuthorizedKeyRecord) -> Result<()> {
-    record.rotation_recovery = None;
-    thegn_core::managed_ssh::record_authorized_at(&thegn_core::managed_ssh::dir(), record)
+    let expected = record.clone();
+    let mut next = expected.clone();
+    next.rotation_recovery = None;
+    publish_if_unchanged_in(&thegn_core::managed_ssh::dir(), &expected, &next)?;
+    *record = next;
+    Ok(())
 }
 
 fn persist_recovery_for_all(
@@ -466,6 +632,9 @@ fn recover_pending(
     let Some(&first_index) = pending.first() else {
         return Ok(());
     };
+    for &index in &pending {
+        ensure_unchanged(&thegn_core::managed_ssh::dir(), &records[index])?;
+    }
     let recovery = records[first_index]
         .rotation_recovery
         .clone()
@@ -507,6 +676,7 @@ fn recover_pending(
         );
         for &index in &pending {
             let record = &records[index];
+            ensure_unchanged(&thegn_core::managed_ssh::dir(), record)?;
             thegn_core::managed_ssh::record_authorized_with_proxy_worktree(
                 &record.provider,
                 &record.account,
@@ -601,6 +771,7 @@ fn recover_pending(
 
     for &index in &pending {
         let record = &records[index];
+        ensure_unchanged(&thegn_core::managed_ssh::dir(), record)?;
         let pc = provider_config(cfg, record, key_path)?;
         let primary = crate::provider_factory::provider_for_named_with_key(
             pc,
@@ -1026,6 +1197,95 @@ fn remove_pair(private: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn custody_record(instance: &str, recovery: Option<RotationRecovery>) -> AuthorizedKeyRecord {
+        AuthorizedKeyRecord {
+            provider: "test-provider".to_string(),
+            account: "test-account".to_string(),
+            instance: instance.to_string(),
+            key_path: PathBuf::from("/keys/managed"),
+            key_fingerprint: "SHA256:test".to_string(),
+            authorized_at: 1,
+            proxy_worktree: None,
+            rotation_recovery: recovery,
+        }
+    }
+
+    fn recovery_marker(marker: &str) -> RotationRecovery {
+        RotationRecovery {
+            key_path: PathBuf::from(format!("/keys/{marker}")),
+            key_fingerprint: format!("SHA256:{marker}"),
+            backup_key_path: None,
+            authorized: false,
+            verified: false,
+            retiring_started: false,
+            retiring_completed: false,
+        }
+    }
+
+    #[test]
+    fn second_lease_on_a_scope_is_refused_and_released_on_drop() {
+        let temp = tempfile::tempdir().unwrap();
+        let lock_dir = temp.path().join("rotation-leases");
+        let key_path = temp.path().join("managed-key");
+        let first = acquire_scope_lease_in(&lock_dir, &key_path).unwrap();
+        let second = acquire_scope_lease_in(&lock_dir, &key_path);
+        let refusal = match second {
+            Err(error) => error,
+            Ok(_) => panic!("a second lease for the same key scope must be refused"),
+        };
+        assert!(refusal.downcast_ref::<RotationLeaseHeld>().is_some());
+        assert!(refusal.to_string().contains("managed-key"));
+        let independent = acquire_scope_lease_in(&lock_dir, &temp.path().join("other-key"));
+        assert!(independent.is_ok());
+        drop(first);
+        assert!(acquire_scope_lease_in(&lock_dir, &key_path).is_ok());
+    }
+
+    #[test]
+    fn lease_dir_symlink_is_refused() {
+        let temp = tempfile::tempdir().unwrap();
+        let target = temp.path().join("target");
+        std::fs::create_dir(&target).unwrap();
+        let link = temp.path().join("link");
+        if thegn_core::fsperm::create_symlink(&target, &link, true).is_err() {
+            return;
+        }
+        assert!(acquire_scope_lease_in(&link, Path::new("managed-key")).is_err());
+    }
+
+    #[test]
+    fn stale_recovery_write_is_refused_and_leaves_the_row() {
+        let temp = tempfile::tempdir().unwrap();
+        let dir = temp.path().join("authorized.d");
+        let a = custody_record("instance-a", Some(recovery_marker("a")));
+        let b = custody_record("instance-a", Some(recovery_marker("b")));
+        let c = custody_record("instance-a", Some(recovery_marker("c")));
+        thegn_core::managed_ssh::record_authorized_at(&dir, &a).unwrap();
+        thegn_core::managed_ssh::record_authorized_at(&dir, &b).unwrap();
+
+        let result = publish_if_unchanged_in(&dir, &a, &c);
+        assert!(matches!(result, Err(error) if error.downcast_ref::<CustodyChanged>().is_some()));
+        assert_eq!(
+            thegn_core::managed_ssh::read_at(&dir, &b.provider, &b.account, &b.instance).unwrap(),
+            Some(b)
+        );
+    }
+
+    #[test]
+    fn unchanged_row_is_published() {
+        let temp = tempfile::tempdir().unwrap();
+        let dir = temp.path().join("authorized.d");
+        let a = custody_record("instance-a", Some(recovery_marker("a")));
+        let c = custody_record("instance-a", Some(recovery_marker("c")));
+        thegn_core::managed_ssh::record_authorized_at(&dir, &a).unwrap();
+
+        publish_if_unchanged_in(&dir, &a, &c).unwrap();
+        assert_eq!(
+            thegn_core::managed_ssh::read_at(&dir, &c.provider, &c.account, &c.instance).unwrap(),
+            Some(c)
+        );
+    }
 
     #[expect(
         clippy::disallowed_methods,
