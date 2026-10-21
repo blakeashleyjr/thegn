@@ -89,6 +89,9 @@ fn handle_loaded(
     if task.status != AgentDispatchStatus::Queued {
         return format!("review task is {}, not queued", task.status.as_str());
     }
+    if let Some(reason) = crate::agent_run::headless_unsupported() {
+        return format!("review handoff held: {reason}");
+    }
     if task.worktree_path.trim().is_empty() {
         return "review task has no worktree to handle".into();
     }
@@ -581,6 +584,29 @@ mod tests {
             task.clone(),
         );
         assert!(message.contains("could not be resolved"));
+        assert_eq!(
+            db.get_review_task(task.id).unwrap().unwrap().status,
+            AgentDispatchStatus::Queued
+        );
+        assert!(db.get_unread_notifications().unwrap().is_empty());
+    }
+
+    #[test]
+    fn unsupported_platform_holds_review_task_before_claim() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open_at(&dir.path().join("handle.db")).unwrap();
+        let task = task(&db);
+        let _unsupported = crate::agent_run::force_headless_unsupported();
+        let message = handle_loaded(
+            &db,
+            &Config::default(),
+            &PrQueueConfig::default(),
+            &FakeForge,
+            &GitLoc::Local(dir.path().to_path_buf()),
+            &context(&task),
+            task.clone(),
+        );
+        assert!(message.contains("THE-235"));
         assert_eq!(
             db.get_review_task(task.id).unwrap().unwrap().status,
             AgentDispatchStatus::Queued
