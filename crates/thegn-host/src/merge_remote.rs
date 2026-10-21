@@ -622,7 +622,7 @@ fn stream_bundle(
 fn fetch_from_custody(
     target: &GitLoc,
     branch: &str,
-    mut tmp: BundleTemp,
+    tmp: BundleTemp,
     target_ref: &str,
     expected: &str,
 ) -> Result<()> {
