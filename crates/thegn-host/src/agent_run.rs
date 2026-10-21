@@ -89,6 +89,53 @@ fn fit_command(
     }
 }
 
+#[cfg(any(unix, test))]
+fn uses_prompt_file(template: &str) -> bool {
+    thegn_core::agent_task::template_vars(template)
+        .is_ok_and(|vars| vars.iter().any(|name| name == "prompt_file"))
+}
+
+#[cfg(unix)]
+fn prompt_file_dir(
+    worktree: &str,
+    sandbox: Option<&thegn_core::sandbox::SandboxSpec>,
+) -> Result<std::path::PathBuf, String> {
+    if sandbox.is_some_and(|spec| !spec.placement.is_local()) {
+        return Err(
+            "{prompt_file} needs a local sandbox: the prompt file cannot reach a remote placement"
+                .into(),
+        );
+    }
+    let worktree = std::path::Path::new(worktree);
+    let git_dir = thegn_core::git_memo::git_dir(worktree).ok_or_else(|| {
+        "{prompt_file}: the worktree has no git dir to hold the prompt file".to_string()
+    })?;
+    let dir = git_dir.join("thegn-task");
+    thegn_core::fsperm::ensure_private_dir(&dir)
+        .map_err(|error| format!("{{prompt_file}}: {dir}: {error}"))?;
+    Ok(dir)
+}
+
+#[cfg(unix)]
+fn write_prompt_file(
+    dir: &std::path::Path,
+    prompt: &str,
+) -> Result<tempfile::NamedTempFile, String> {
+    use std::io::Write;
+    use std::os::unix::fs::PermissionsExt;
+
+    let mut file = tempfile::Builder::new()
+        .prefix("prompt-")
+        .permissions(std::fs::Permissions::from_mode(0o600))
+        .tempfile_in(dir)
+        .map_err(|error| format!("{{prompt_file}}: create prompt file in {dir}: {error}"))?;
+    file.write_all(prompt.as_bytes())
+        .map_err(|error| format!("{{prompt_file}}: write prompt file: {error}"))?;
+    file.flush()
+        .map_err(|error| format!("{{prompt_file}}: flush prompt file: {error}"))?;
+    Ok(file)
+}
+
 /// One dispatch: where to run, what to say, and how long to allow.
 #[cfg_attr(
     not(unix),
@@ -106,7 +153,8 @@ pub(crate) struct AgentTaskRun<'a> {
     /// The command template, already resolved (`agent_command`, or an
     /// `[[agents]]` entry's headless form). Placeholders are bare.
     pub command_template: &'a str,
-    /// Variables the command template may reference, minus `{prompt}`.
+    /// Variables the command template may reference, minus runner-supplied
+    /// `{prompt}` and `{prompt_file}`.
     pub vars: &'a TaskVars,
     /// Deadline for this invocation, in seconds. 0 is not "unbounded": it maps
     /// to a finite ceiling ([`bounded::AGENT_CEILING`]).
@@ -467,10 +515,39 @@ pub(crate) fn run_outcome(task: &AgentTaskRun<'_>) -> AgentRunVerdict {
     use std::process::{Command, Stdio};
     use thegn_core::util;
 
+    let prompt_file = if uses_prompt_file(task.command_template) {
+        let dir = match prompt_file_dir(task.worktree, task.sandbox.as_ref()) {
+            Ok(dir) => dir,
+            Err(reason) => {
+                tracing::warn!(target: "thegn::agent", kind = %task.kind, %reason, "cannot prepare prompt file; not dispatching");
+                return AgentRunVerdict::NotStarted(reason);
+            }
+        };
+        match write_prompt_file(&dir, task.prompt) {
+            Ok(file) => Some(file),
+            Err(reason) => {
+                tracing::warn!(target: "thegn::agent", kind = %task.kind, %reason, "cannot write prompt file; not dispatching");
+                return AgentRunVerdict::NotStarted(reason);
+            }
+        }
+    } else {
+        None
+    };
+    let prompt_vars = match &prompt_file {
+        Some(file) => {
+            let Some(path) = file.path().to_str() else {
+                return AgentRunVerdict::NotStarted(
+                    "{prompt_file}: prompt file path is not valid UTF-8".into(),
+                );
+            };
+            task.vars.clone().set("prompt_file", path)
+        }
+        None => task.vars.clone(),
+    };
     let (command, kept_prompt_bytes) = match fit_command(
         task.command_template,
         task.prompt,
-        task.vars,
+        &prompt_vars,
     ) {
         Ok(Some(fit)) => fit,
         Ok(None) => {
@@ -575,6 +652,9 @@ pub(crate) fn run_outcome(task: &AgentTaskRun<'_>) -> AgentRunVerdict {
         bounded::effective_timeout(task.timeout_secs),
         &NEVER,
     );
+    // Remove the ephemeral prompt after the bounded runner has reaped the child,
+    // on every outcome (exit, failure, timeout, or cancellation).
+    drop(prompt_file);
     let stderr_tail = {
         let t = &result.stderr.bytes;
         let from = t.len().saturating_sub(2048);
@@ -1215,7 +1295,7 @@ pub(crate) mod bounded {
 }
 
 /// Back-compat env for merge kinds. The legacy prompt alias is emitted only
-/// when the command template does not consume `{prompt}`.
+/// when the command template uses neither `{prompt}` nor `{prompt_file}`.
 #[cfg(any(unix, test))]
 fn legacy_env(task: &AgentTaskRun<'_>) -> Vec<(&'static str, String)> {
     let mut out = Vec::new();
@@ -1234,11 +1314,12 @@ fn legacy_env(task: &AgentTaskRun<'_>) -> Vec<(&'static str, String)> {
 }
 
 /// Keep rendered prose out of argv-backed command templates. When a command
-/// does not consume `{prompt}`, expose it once under the generalized task key.
+/// uses neither `{prompt}` nor `{prompt_file}`, expose it under the task key.
 #[cfg(any(unix, test))]
 fn prompt_env<'a>(task: &'a AgentTaskRun<'_>) -> Option<(&'static str, &'a str)> {
-    if thegn_core::agent_task::template_vars(task.command_template)
-        .is_ok_and(|vars| vars.iter().any(|name| name == "prompt"))
+    if uses_prompt_file(task.command_template)
+        || thegn_core::agent_task::template_vars(task.command_template)
+            .is_ok_and(|vars| vars.iter().any(|name| name == "prompt"))
     {
         return None;
     }
@@ -1786,6 +1867,136 @@ mod tests {
                 .map(|(_, value)| value.as_str()),
             Some("fix it")
         );
+    }
+
+    #[test]
+    fn prompt_file_template_keeps_the_prompt_out_of_the_environment() {
+        let v = vars();
+        let t = AgentTaskRun {
+            command_template: "agent --prompt-file {prompt_file}",
+            ..task(TaskKind::MergeConflict, &v)
+        };
+        assert_eq!(prompt_env(&t), None);
+        let env = legacy_env(&t);
+        assert!(env.iter().all(|(key, _)| *key != "THEGN_MERGE_PROMPT"));
+        assert!(env.iter().any(|(key, _)| *key == "THEGN_BRANCH"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn prompt_file_is_owner_only_and_removed_after_the_run() {
+        let worktree = tempfile::tempdir().unwrap();
+        std::fs::create_dir(worktree.path().join(".git")).unwrap();
+        let prompt = "SECRET-PROMPT-b63";
+        let v = vars();
+        let t = AgentTaskRun {
+            worktree: worktree.path().to_str().unwrap(),
+            prompt,
+            command_template: "cat {prompt_file} > got && find {prompt_file} -perm 600 -print > mode && echo {prompt_file} > path && env > envdump",
+            ..task(TaskKind::MergeConflict, &v)
+        };
+
+        assert_eq!(run_outcome(&t), AgentRunVerdict::Exited(Some(0)));
+        assert_eq!(
+            std::fs::read_to_string(worktree.path().join("got")).unwrap(),
+            prompt
+        );
+        assert!(
+            !std::fs::read_to_string(worktree.path().join("mode"))
+                .unwrap()
+                .trim()
+                .is_empty()
+        );
+        let path = std::fs::read_to_string(worktree.path().join("path")).unwrap();
+        assert!(!std::path::Path::new(path.trim()).exists());
+        let task_dir = worktree.path().join(".git/thegn-task");
+        let metadata = std::fs::symlink_metadata(&task_dir).unwrap();
+        assert!(metadata.is_dir());
+        use std::os::unix::fs::PermissionsExt;
+        assert_eq!(metadata.permissions().mode() & 0o777, 0o700);
+        assert_eq!(std::fs::read_dir(task_dir).unwrap().count(), 0);
+        let env = std::fs::read_to_string(worktree.path().join("envdump")).unwrap();
+        assert!(!env.contains(prompt));
+        assert!(!env.contains("THEGN_TASK_PROMPT"));
+        assert!(!env.contains("THEGN_MERGE_PROMPT"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn prompt_file_is_removed_after_a_failed_or_timed_out_run() {
+        let worktree = tempfile::tempdir().unwrap();
+        std::fs::create_dir(worktree.path().join(".git")).unwrap();
+        let v = vars();
+        let base = AgentTaskRun {
+            worktree: worktree.path().to_str().unwrap(),
+            command_template: "test -s {prompt_file} && exit 3",
+            ..task(TaskKind::MergeConflict, &v)
+        };
+        assert_eq!(run_outcome(&base), AgentRunVerdict::Exited(Some(3)));
+        let task_dir = worktree.path().join(".git/thegn-task");
+        assert_eq!(std::fs::read_dir(&task_dir).unwrap().count(), 0);
+
+        let timed_out = AgentTaskRun {
+            command_template: "test -s {prompt_file} && sleep 30",
+            timeout_secs: 1,
+            ..base
+        };
+        assert!(matches!(
+            run_outcome(&timed_out),
+            AgentRunVerdict::Interrupted(_)
+        ));
+        assert_eq!(std::fs::read_dir(task_dir).unwrap().count(), 0);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn prompt_file_refuses_missing_git_dir_symlinked_task_dir_and_remote_placement() {
+        use std::os::unix::fs::symlink;
+
+        let missing = tempfile::tempdir().unwrap();
+        let v = vars();
+        let missing_task = AgentTaskRun {
+            worktree: missing.path().to_str().unwrap(),
+            command_template: "agent --prompt-file {prompt_file}",
+            ..task(TaskKind::MergeConflict, &v)
+        };
+        assert!(matches!(
+            run_outcome(&missing_task),
+            AgentRunVerdict::NotStarted(reason) if reason.contains("git dir")
+        ));
+
+        let worktree = tempfile::tempdir().unwrap();
+        let git_dir = worktree.path().join(".git");
+        std::fs::create_dir(&git_dir).unwrap();
+        let target = tempfile::tempdir().unwrap();
+        symlink(target.path(), git_dir.join("thegn-task")).unwrap();
+        let symlinked_task = AgentTaskRun {
+            worktree: worktree.path().to_str().unwrap(),
+            command_template: "agent --prompt-file {prompt_file}",
+            ..task(TaskKind::MergeConflict, &v)
+        };
+        assert!(matches!(
+            run_outcome(&symlinked_task),
+            AgentRunVerdict::NotStarted(_)
+        ));
+        assert_eq!(std::fs::read_dir(target.path()).unwrap().count(), 0);
+
+        let remote = thegn_core::sandbox::SandboxSpec {
+            placement: thegn_core::placement::Placement::Ssh(
+                thegn_core::placement::SshPlacement::plain(
+                    "u@h".into(),
+                    22,
+                    false,
+                    thegn_core::placement::TransportKind::Ssh,
+                ),
+            ),
+            ..sandbox_spec()
+        };
+        assert!(matches!(
+            prompt_file_dir(worktree.path().to_str().unwrap(), Some(&remote)),
+            Err(reason) if reason.contains("local sandbox")
+        ));
+        assert!(prompt_file_dir(worktree.path().to_str().unwrap(), Some(&sandbox_spec())).is_ok());
     }
 
     #[test]

@@ -278,6 +278,11 @@ so a drain says so out loud when `agent` names nothing that exists.
 `-p {prompt}` is right and `-p "{prompt}"` hands the agent a prompt
 wrapped in literal quote characters. `thegn config validate` catches it.
 
+`{prompt_file}` (for example, `my-agent --prompt-file {prompt_file}`) passes
+the agent an owner-only file under the worktree's git directory instead of
+putting the prompt on the command line or in `$THEGN_TASK_PROMPT`. thegn deletes
+the file when the run ends; a remote sandbox placement refuses the run.
+
 What the agent is _told_ is yours to change. Leave a prompt empty for
 thegn's built-in instructions, or override one per blocker kind:
 
