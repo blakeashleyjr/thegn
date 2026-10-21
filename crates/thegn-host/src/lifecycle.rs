@@ -1044,7 +1044,7 @@ mod tests {
         ));
         assert!(!probed);
         assert!(matches!(
-            orphaned_claim_action(None, || free_spare_probe()),
+            orphaned_claim_action(None, free_spare_probe),
             ClaimingAction::Keep
         ));
     }
