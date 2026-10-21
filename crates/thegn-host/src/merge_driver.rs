@@ -1166,7 +1166,7 @@ fn drive_queue_with(
                             let mut refund_failed = false;
                             if let Some(row_claim) = claim.borrow().as_ref() {
                                 match row_claim.refund_attempt(db) {
-                                    Ok(true) => agent_runs = agent_runs.saturating_sub(1),
+                                    Ok(true) => {}
                                     Ok(false) => {
                                         out.warnings.push(format!(
                                             "{}: merge claim lost; another drain recovered the row",
@@ -1203,8 +1203,6 @@ fn drive_queue_with(
                                         item.worktree
                                     ));
                                     refund_failed = true;
-                                } else {
-                                    agent_runs = refunded_runs;
                                 }
                             }
                             let detail = agent_not_started_detail(reason, refund_failed);
