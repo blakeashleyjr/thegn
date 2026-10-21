@@ -157,7 +157,11 @@ repo other people push to:
 - **`reset_attempts_on_push`** — a new commit refills the attempt
   budget, because a pull request lives for days and a one-shot budget
   would exhaust once and stick forever. Only a commit thegn did _not_
-  create counts, so an agent cannot top up its own budget.
+  create counts: after an agent run, thegn records the run's own push when the
+  worktree's HEAD descends from the head the agent started on and matches the PR
+  head on the forge, so an agent cannot top up its own budget or trip
+  `pause_on_foreign_push`. Anything it cannot verify (a remote worktree, a
+  teammate's push) still counts as someone else's.
 
 ## Watching
 
