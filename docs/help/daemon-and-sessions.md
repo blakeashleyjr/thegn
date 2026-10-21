@@ -108,11 +108,13 @@ human, or PR open) arrive as `abandoned` with a `migrated while <status>: not
 resumed` note. Every row's artifact and chunk paths are dropped, so work is
 neither resumed nor re-dispatched under the target profile. Current layout groups/tabs are moved;
 named global layouts, caches, active transports, and whole-session focus are
-not. Opaque pane commands, scrollback, and dispatch reports remain unchanged
-in the target; notes remain unchanged apart from the migration prefix on parked
-rows. These values are omitted from human and JSON audit output.
-Credentials, tokens, identities, config overlays, accounts, pairings, and
-secrets never cross the profile boundary.
+not. By default, pane relaunch commands, scrollback, dispatch reports,
+free-form notes, and note rows are not moved; parked rows keep only the
+migration prefix. `--include-history` carries them unchanged into the target
+as plain text that may contain anything a tool printed. These values are
+omitted from human and JSON audit output. Thegn never reads or copies
+credentials, tokens, identities, accounts, pairings, or profile configuration;
+content history crosses only with `--include-history`.
 
 The move is target-first: the target rows are committed and read back under a
 sanitized fingerprint before exact source rows are deleted. Dispatch IDs are

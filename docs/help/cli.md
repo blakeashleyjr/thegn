@@ -183,13 +183,15 @@ collapse/pin state, and dispatch ledger (including notes). Active dispatch
 rows (queued, spawning, running, waiting for a human, or PR open) arrive as
 `abandoned` with a `migrated while <status>: not resumed` note; every row's
 artifact and chunk paths are dropped, so work is neither resumed nor
-re-dispatched under the target profile. Pane commands, scrollback, and reports
-are opaque text and are carried unchanged; notes are carried unchanged apart
-from the migration prefix on parked rows. These values are never printed by
-the audit. Named global layouts,
+re-dispatched under the target profile. By default, pane relaunch commands,
+scrollback, dispatch reports, free-form notes, and note rows are not moved;
+parked rows keep only the migration prefix. `--include-history` carries them
+unchanged into the target as plain text that may contain anything a tool
+printed. These values are never printed by the audit. Named global layouts,
 global caches, transports, git files/objects, branches, and worktree disk
-locations are not moved. Neither profile configuration nor credentials,
-tokens, identities, accounts, pairings, or secrets are read or copied.
+locations are not moved. Thegn never reads or copies credentials, tokens,
+identities, accounts, pairings, or profile configuration; content history
+crosses only with `--include-history`.
 
 The target transaction commits first and is read back using a sanitized
 fingerprint. Only after confirmation are the selected source rows deleted;
