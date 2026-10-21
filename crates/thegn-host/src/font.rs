@@ -913,7 +913,9 @@ fn config_read_error(path: &Path, error: std::io::Error) -> String {
 }
 
 /// Publish only if the no-follow destination still has the bytes we observed.
-/// The staged write is private, same-directory, synced and atomically renamed.
+/// Existing destinations must be owned by this user and have one link; refuse
+/// ambiguity instead of breaking a hard link. The staged write is private,
+/// same-directory, synced and atomically renamed.
 fn replace_config(
     path: &Path,
     observed: &[u8],
@@ -943,6 +945,22 @@ fn replace_config(
         .is_some_and(|metadata| metadata.permissions().readonly())
     {
         return Err(format!("{} is read-only; not modified", path.display()));
+    }
+    if let Some(metadata) = metadata.as_ref()
+        && !thegn_core::fsperm::owned_by_current_user(metadata)
+    {
+        return Err(format!(
+            "{} is owned by another user; not modified (edit it as its owner)",
+            path.display()
+        ));
+    }
+    if let Some(metadata) = metadata.as_ref()
+        && thegn_core::fsperm::ensure_single_link_regular_file(metadata).is_err()
+    {
+        return Err(format!(
+            "{} has other hard links; not modified (edit it directly, or remove the extra link)",
+            path.display()
+        ));
     }
 
     static NEXT_TEMP: AtomicU64 = AtomicU64::new(0);
@@ -1314,6 +1332,54 @@ mod tests {
             std::fs::metadata(&config).unwrap().permissions(),
             expected_permissions
         );
+    }
+
+    #[test]
+    fn config_replacement_refuses_a_hardlinked_destination() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config = tmp.path().join("kitty.conf");
+        let other = tmp.path().join("kitty-copy.conf");
+        let observed = b"font_family Menlo\n";
+        std::fs::write(&config, observed).unwrap();
+        std::fs::hard_link(&config, &other).unwrap();
+        if thegn_core::fsperm::extra_hard_links(&std::fs::metadata(&config).unwrap()) == 0 {
+            return;
+        }
+
+        let error = replace_config(&config, observed, true, b"font_family Hack\n").unwrap_err();
+
+        assert!(error.contains("has other hard links"), "{error}");
+        assert_eq!(std::fs::read(&config).unwrap(), observed);
+        assert_eq!(std::fs::read(&other).unwrap(), observed);
+        assert!(std::fs::read_dir(tmp.path()).unwrap().all(|entry| {
+            !entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .contains(".tmp-")
+        }));
+    }
+
+    #[test]
+    fn config_replacement_refuses_a_destination_owned_by_another_user() {
+        let path = Path::new("/etc/passwd");
+        let Ok(mut file) = thegn_core::fsperm::open_regular_file_nofollow(path) else {
+            return;
+        };
+        let Ok(metadata) = file.metadata() else {
+            return;
+        };
+        if thegn_core::fsperm::owned_by_current_user(&metadata) {
+            return;
+        }
+        let mut observed = Vec::new();
+        if file.read_to_end(&mut observed).is_err() {
+            return;
+        }
+
+        let result = replace_config(path, &observed, true, b"x");
+
+        assert!(matches!(result, Err(ref error) if error.contains("owned by another user")));
     }
 
     #[test]
