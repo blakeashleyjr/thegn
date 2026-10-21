@@ -478,6 +478,7 @@ mod tests {
         use crate::placement::Placement;
         use crate::sandbox::{Mount, SandboxLimits, SandboxSpec};
         SandboxSpec {
+            volume_owners: Vec::new(),
             backend,
             placement: Placement::Local,
             image: Some("img:latest".into()),
