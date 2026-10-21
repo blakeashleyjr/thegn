@@ -44,18 +44,33 @@ impl PendingPreviewOob {
 
 /// A must-deliver corner delete followed by at most one replaceable draw.
 /// Draws are complete, self-contained relay units; replacing one requires a
-/// delete first so partially visible prior graphics cannot survive.
+/// delete first so partially visible prior graphics cannot survive. The shown
+/// and spare buffers retain at most two copies, each bounded by the coalesced
+/// draw size (`OOB_QUEUE_BYTES` at the caller).
 #[derive(Debug, Default)]
 pub(crate) struct PendingCornerOob {
     delete_pending: bool,
     draw: Option<Vec<u8>>,
+    shown: Option<Vec<u8>>,
+    spare: Option<Vec<u8>>,
 }
 
 impl PendingCornerOob {
-    /// Keep a host delete ahead of every later draw and discard stale geometry.
+    /// Keep a host delete ahead of every later draw and discard stale geometry
+    /// for resize, truncation, dismiss and child exit.
     pub(crate) fn require_delete(&mut self) {
         self.delete_pending = true;
         self.draw = None;
+        self.shown = None;
+    }
+
+    /// The corner was covered: delete it now and replay the last shown draw
+    /// once it is visible again.
+    pub(crate) fn occlude(&mut self) {
+        self.delete_pending = true;
+        if self.draw.is_none() {
+            self.draw = self.shown.take();
+        }
     }
 
     #[cfg(test)]
@@ -100,9 +115,20 @@ impl PendingCornerOob {
         if visible
             && !self.delete_pending
             && let Some(bytes) = self.draw.take()
-            && let Err(bytes) = submit(bytes)
         {
-            self.draw = Some(bytes);
+            let mut copy = match self.spare.take() {
+                Some(copy) => copy,
+                None => Vec::new(),
+            };
+            copy.clear();
+            copy.extend_from_slice(&bytes);
+            match submit(bytes) {
+                Ok(()) => self.spare = self.shown.replace(copy),
+                Err(bytes) => {
+                    self.draw = Some(bytes);
+                    self.spare = Some(copy);
+                }
+            }
         }
     }
 
@@ -372,6 +398,131 @@ mod tests {
     }
 
     #[test]
+    fn occluded_static_corner_is_redrawn_once_after_clear() {
+        let mut slot = PendingCornerOob::default();
+        let submitted = RefCell::new(Vec::new());
+        slot.offer_draw(vec![1], true, |bytes| {
+            submitted.borrow_mut().push(bytes);
+            Ok(())
+        });
+        slot.occlude();
+        slot.retry(false, |bytes| {
+            submitted.borrow_mut().push(bytes);
+            Ok(())
+        });
+        slot.retry(true, |bytes| {
+            submitted.borrow_mut().push(bytes);
+            Ok(())
+        });
+        slot.retry(true, |bytes| {
+            submitted.borrow_mut().push(bytes);
+            Ok(())
+        });
+        assert_eq!(
+            *submitted.borrow(),
+            vec![vec![1], kitty_relay::delete_all().to_vec(), vec![1]]
+        );
+    }
+
+    #[test]
+    fn newer_hidden_draw_wins_over_the_occlusion_replay() {
+        let mut slot = PendingCornerOob::default();
+        let submitted = RefCell::new(Vec::new());
+        slot.offer_draw(vec![1], true, |bytes| {
+            submitted.borrow_mut().push(bytes);
+            Ok(())
+        });
+        slot.occlude();
+        slot.retry(false, |bytes| {
+            submitted.borrow_mut().push(bytes);
+            Ok(())
+        });
+        slot.offer_draw(vec![2], false, |bytes| {
+            submitted.borrow_mut().push(bytes);
+            Ok(())
+        });
+        slot.retry(true, |bytes| {
+            submitted.borrow_mut().push(bytes);
+            Ok(())
+        });
+        assert_eq!(
+            *submitted.borrow(),
+            vec![vec![1], kitty_relay::delete_all().to_vec(), vec![2]]
+        );
+    }
+
+    #[test]
+    fn refused_replay_is_retained_for_a_later_wake() {
+        let mut slot = PendingCornerOob::default();
+        let submitted = RefCell::new(Vec::new());
+        slot.offer_draw(vec![1], true, |bytes| {
+            submitted.borrow_mut().push(bytes);
+            Ok(())
+        });
+        slot.occlude();
+        slot.retry(true, |bytes| {
+            if bytes == kitty_relay::delete_all() {
+                submitted.borrow_mut().push(bytes);
+                Ok(())
+            } else {
+                Err(bytes)
+            }
+        });
+        assert_eq!(slot.state(), (false, Some([1].as_slice())));
+        slot.retry(true, |bytes| {
+            submitted.borrow_mut().push(bytes);
+            Ok(())
+        });
+        assert_eq!(
+            *submitted.borrow(),
+            vec![kitty_relay::delete_all().to_vec(), vec![1]]
+        );
+    }
+
+    #[test]
+    fn geometry_delete_never_replays_the_old_draw() {
+        let mut slot = PendingCornerOob::default();
+        let submitted = RefCell::new(Vec::new());
+        slot.offer_draw(vec![1], true, |bytes| {
+            submitted.borrow_mut().push(bytes);
+            Ok(())
+        });
+        slot.require_delete();
+        slot.retry(true, |bytes| {
+            submitted.borrow_mut().push(bytes);
+            Ok(())
+        });
+        slot.retry(true, |bytes| {
+            submitted.borrow_mut().push(bytes);
+            Ok(())
+        });
+        assert_eq!(
+            *submitted.borrow(),
+            vec![vec![1], kitty_relay::delete_all().to_vec()]
+        );
+    }
+
+    #[test]
+    fn occlude_then_require_delete_discards_the_replay() {
+        let mut slot = PendingCornerOob::default();
+        let submitted = RefCell::new(Vec::new());
+        slot.offer_draw(vec![1], true, |bytes| {
+            submitted.borrow_mut().push(bytes);
+            Ok(())
+        });
+        slot.occlude();
+        slot.require_delete();
+        slot.retry(true, |bytes| {
+            submitted.borrow_mut().push(bytes);
+            Ok(())
+        });
+        assert_eq!(
+            *submitted.borrow(),
+            vec![vec![1], kitty_relay::delete_all().to_vec()]
+        );
+    }
+
+    #[test]
     fn refused_clipboard_is_retained_and_retried_once() {
         let mut slot = PendingClipboardOob::default();
         slot.offer(vec![1, 2], Err);
@@ -547,7 +698,7 @@ mod tests {
         for draw in [vec![1], vec![2]] {
             let occluded = corner_occluded(popup_covers, false, false, false);
             if occluded && !was_occluded {
-                slot.require_delete();
+                slot.occlude();
             }
             slot.offer_draw(draw, !occluded, |bytes| {
                 submitted.borrow_mut().push(bytes);
@@ -560,7 +711,7 @@ mod tests {
         popup_covers = true;
         let occluded = corner_occluded(popup_covers, false, false, false);
         if occluded && !was_occluded {
-            slot.require_delete();
+            slot.occlude();
         }
         slot.retry(!occluded, |bytes| {
             submitted.borrow_mut().push(bytes);
@@ -585,7 +736,7 @@ mod tests {
         popup_covers = false;
         let occluded = corner_occluded(popup_covers, false, false, false);
         if occluded && !was_occluded {
-            slot.require_delete();
+            slot.occlude();
         }
         slot.retry(!occluded, |bytes| {
             submitted.borrow_mut().push(bytes);
