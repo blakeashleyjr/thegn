@@ -27,9 +27,9 @@ ignore = [
   # bincode 1; unmaintained-notice only. Drop when syntect moves off it.
   "RUSTSEC-2025-0141",
   # paste 1.0.15 is unmaintained (author archived it); reached only through
-  # iroh's netlink stack (netlink-packet-core, the call-home reach). A
-  # proc-macro with no runtime surface and no safe upgrade. Drop when the
-  # netlink crates move off paste.
+  # iroh's netlink stack (netlink-packet-core) when the opt-in iroh feature is
+  # enabled by release and Nix builds. A proc-macro with no runtime surface and
+  # no safe upgrade. Drop when the netlink crates move off paste.
   "RUSTSEC-2024-0436", # paste unmaintained (via iroh → netlink-packet-core)
 ]
 

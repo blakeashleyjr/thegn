@@ -20,6 +20,10 @@ pub mod host;
 pub mod host_discovery;
 pub(crate) mod http;
 pub mod ipc;
+#[cfg(feature = "iroh")]
+pub mod iroh_reach;
+#[cfg(not(feature = "iroh"))]
+#[path = "iroh_reach_off.rs"]
 pub mod iroh_reach;
 pub mod issue;
 pub mod log;

@@ -500,6 +500,14 @@ class WorkflowPolicyTests(unittest.TestCase):
         self.assertGreater(print_index, attest_index)
         self.assertGreater(print_index, verify_index)
 
+    def test_release_build_enables_the_iroh_feature(self) -> None:
+        steps = read_workflow("release.yml")["jobs"]["build"]["steps"]
+        action = next(
+            step for step in steps
+            if step.get("uses", "").startswith("taiki-e/upload-rust-binary-action@")
+        )
+        self.assertIn("iroh", action["with"]["features"].split(","))
+
 
 if __name__ == "__main__":
     unittest.main()
