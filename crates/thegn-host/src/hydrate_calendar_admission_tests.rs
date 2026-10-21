@@ -1,6 +1,64 @@
 use super::*;
+use thegn_core::calendar::conformance::{FIXTURES, Verdict};
 use thegn_core::calendar::{EventTime, TzRef};
 use thegn_core::store::CalendarStore;
+
+#[test]
+#[allow(
+    clippy::disallowed_macros,
+    reason = "conformance matrix prints every fixture x seam verdict before asserting"
+)]
+fn conformance_cache_decode_matches_every_fixture() {
+    let mut table = Vec::new();
+    for fixture in FIXTURES {
+        if let Some((json, expected)) = fixture.json {
+            let event = serde_json::from_str::<CalEvent>(json).unwrap();
+            let db = Db::open_memory().unwrap();
+            let start = NaiveDate::from_ymd_opt(2026, 8, 10).unwrap();
+            let end = NaiveDate::from_ymd_opt(2026, 8, 20).unwrap();
+            let mut row = row_of(&event, None);
+            // Unknown-zone times have no index timestamps, so the window query would hide the row.
+            if row.start_ms == 0 && row.end_ms == 0 {
+                let index_time = start
+                    .and_hms_opt(9, 0, 0)
+                    .unwrap()
+                    .and_utc()
+                    .timestamp_millis();
+                row.start_ms = index_time;
+                row.end_ms = index_time;
+            }
+            db.replace_calendar_account("conformance", &[row]).unwrap();
+            let cached = load_cached_window(
+                &db,
+                CalendarWindow::new(start, end, chrono_tz::UTC).unwrap(),
+            )
+            .unwrap();
+            let actual = if cached.events.len() == 1 && cached.skipped == 0 {
+                Verdict::Admit
+            } else {
+                Verdict::Reject
+            };
+            let shape_ok = match expected {
+                Verdict::Admit => cached.events.len() == 1 && cached.skipped == 0,
+                Verdict::Reject => cached.events.is_empty() && cached.skipped == 1,
+            };
+            table.push((
+                fixture.name,
+                "host cache decode",
+                expected,
+                actual,
+                shape_ok,
+            ));
+        }
+    }
+    eprintln!("calendar conformance host cache table: {table:#?}");
+    assert!(
+        table
+            .iter()
+            .all(|(_, _, expected, actual, shape_ok)| expected == actual && *shape_ok),
+        "calendar conformance disagreement: {table:#?}"
+    );
+}
 
 #[test]
 fn cache_load_skips_decodable_events_that_fail_domain_validation() {
