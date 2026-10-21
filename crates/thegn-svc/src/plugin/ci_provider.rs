@@ -335,15 +335,12 @@ impl CiProvider for PluginCiProvider {
     }
 
     fn rerun(&self, loc: &GitLoc, run_id: &str, scope: RerunScope) -> Result<(), CiError> {
-        Self::require_cap(self.caps.rerun, "rerun")?;
+        Self::require_cap(self.caps.supports(scope), "rerun")?;
         validate_ci_id(run_id)?;
-        let scope = if scope == RerunScope::All {
-            "all"
-        } else if scope == RerunScope::Failed {
-            Self::require_cap(self.caps.rerun_failed, "rerun")?;
-            "failed"
-        } else {
-            return Err(unsupported("rerun"));
+        let scope = match scope {
+            RerunScope::All => "all",
+            RerunScope::Failed => "failed",
+            RerunScope::FailedOrCanceled => "failed_or_canceled",
         };
         let mut args = Self::loc_args(loc);
         args["run_id"] = serde_json::json!(run_id);
@@ -425,6 +422,7 @@ mod tests {
             logs: true,
             trigger: true,
             rerun: true,
+            rerun_all: true,
             rerun_failed: true,
             cancel: true,
             ..CiCaps::default()
