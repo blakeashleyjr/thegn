@@ -33,12 +33,11 @@ pub fn canonical_issue_id(raw: &str) -> Result<String, IssueIdentityError> {
     let invalid = || IssueIdentityError::Invalid {
         raw: raw.to_string(),
     };
+    if raw.chars().any(char::is_control) {
+        return Err(invalid());
+    }
     let trimmed = raw.trim();
-    if trimmed.is_empty()
-        || trimmed
-            .chars()
-            .any(|ch| ch.is_control() || ch.is_whitespace())
-    {
+    if trimmed.is_empty() || trimmed.chars().any(char::is_whitespace) {
         return Err(invalid());
     }
     if trimmed.ends_with(':') {
