@@ -41,6 +41,8 @@ profiling = ["dep:pprof"]
 # The regular build omits this (default = stable); Nix builds `.#dev` with it.
 # See `src/channel_state.rs` and `thegn_core::channel`.
 dev = []
+# Optional call-home transport; release and Nix builds enable it explicitly (THE-672).
+iroh = ["thegn-svc/iroh"]
 
 [dependencies]
 url.workspace = true
@@ -60,9 +62,8 @@ tracing.workspace = true
 # in a GzEncoder). Already vendored transitively; pure-Rust miniz_oxide backend
 # (default features), so it stays cross-compilable.
 flate2 = "1"
-# CSPRNG for the iroh home secret key + per-sandbox auth tokens (src/iroh_home.rs).
+# CSPRNG for the home key bytes + per-sandbox auth tokens (src/iroh_home.rs).
 getrandom = "0.4"
-iroh.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 # `config show` round-trips the effective config as TOML; `config schema` emits
@@ -155,6 +156,9 @@ zbus.workspace = true
 windows-sys = { workspace = true }
 [dev-dependencies]
 crc32fast = "1"
+# Paused-clock tests (`start_paused`, `time::advance`). This used to arrive only through
+# feature unification with iroh; declare it so the default (iroh-off) test build has it.
+tokio = { workspace = true, features = ["test-util"] }
 sysinfo.workspace = true
 tracing-subscriber.workspace = true
 # The architecture ratchets (`test/*-ratchet.txt`) share one helper.

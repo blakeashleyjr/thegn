@@ -537,6 +537,9 @@ check-features:
     cargo check -p thegn-svc --features control-grpc
     cargo check -p thegn-core --features test-utils
     cargo check -p thegn-host --features profiling
+    cargo check -p thegn-host --features iroh
+    cargo clippy -p thegn-svc -p thegn-host --features thegn-host/iroh --all-targets -- -D warnings
+    cargo nextest run -p thegn-svc --features iroh -E 'test(iroh_reach::)'
     cargo check -p tg-kit --features standalone
 
 # The declared MSRV (`rust-version` in Cargo.toml) actually builds. `cargo-1.89`
@@ -1437,7 +1440,7 @@ release-artifacts tag:
     archive="thegn-{{tag}}-$target"
     out="$PWD/target/release-artifacts"
     echo "building ${archive}…"
-    cargo build --release --locked -p thegn-host --bin thegn --target "$target"
+    cargo build --release --locked -p thegn-host --bin thegn --features iroh --target "$target"
     rm -rf "$out/stage"; mkdir -p "$out/stage"
     cp "target/$target/release/thegn" "$out/stage/thegn"
     # Same `include:` set as the release workflow — a dual-licensed artifact

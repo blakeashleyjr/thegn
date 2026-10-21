@@ -31,6 +31,8 @@ workspace = true
 # optional if EVERY first-party consumer's code is cfg-guarded behind it.
 # Declaring the feature is the easy half.
 control-grpc = ["dep:tonic", "dep:prost"]
+# Optional call-home transport; release and Nix builds enable it through the host feature (THE-672).
+iroh = ["dep:iroh"]
 
 [package.metadata.cargo-machete]
 # prost is referenced only by tonic-build's GENERATED proto bindings
@@ -76,7 +78,7 @@ tokio-tungstenite.workspace = true
 rusty-s3 = "0.10"
 # iroh call-home reach: the compositor's home Endpoint (accept loop + per-sandbox
 # connection registry) and the exec surface bridged over iroh bi-streams.
-iroh.workspace = true
+iroh = { workspace = true, optional = true }
 # Control plane (src/control/): the daemon's HTTP+WS surface (axum) + the CLI
 # client (hyper one-shot requests over unix/TCP). sha2 hashes token secrets;
 # getrandom is the mint-time CSPRNG. hyper/hyper-util/http-body-util are
