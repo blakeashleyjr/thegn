@@ -1,6 +1,44 @@
 # Design — plugin UI extension boundary decisions
 
+## Evaluation inputs
+
 ## Common evaluation gate
+
+For each surface record: user value, stable identity, negotiation/versioning,
+required capabilities/scopes, host-versus-plugin state ownership, placement and
+visibility config, render/input budget, failure degradation, accessibility/help,
+compatibility, and an explicit reason to adopt, defer, or reject.
+
+## SidebarTab questions
+
+- Is the contribution a whole tab, bounded rows in an existing native tab, or a
+  provider whose native host renderer owns the rows?
+- Who owns selection, scrolling, row identity, hit actions, narrow layout, and
+  user placement/order?
+- How do disabled/crashed plugins disappear without corrupting sidebar mode?
+
+Arbitrary retained UI or terminal byte output is never an option.
+
+## Theme questions
+
+- Does a plugin contribute immutable token data, a named theme provider, or
+  executable runtime styling?
+- How are complete token coverage, contrast audit, terminal capability degrade,
+  name collisions, persistence, reload, and untrusted values handled?
+- Can equivalent value be served by ordinary user theme files without executing
+  a plugin? Prefer the data-only path unless runtime value is demonstrated.
+
+Plugins never supply terminal escape sequences or bypass host token resolution.
+
+## Key-zone questions
+
+- Are plugins allowed only actions inside their own focused surface, or global
+  chords? Default evaluation is surface-local only.
+- The host owns chord conflict resolution, focus/zone attribution, which-key and
+  help projections, dispatch, and user overrides.
+- Plugin input maps to versioned plugin action ids, never arbitrary host actions.
+
+## Inventory and evaluation
 
 The inventory at this change's base has two reserved wire names,
 `SidebarTab` and `Theme`, but no host runtime for either; their support rows
@@ -159,8 +197,8 @@ versioned wire contracts before negotiation can change.
 - **Sidebar boundary:** A sidebar key zone may operate only while its own
   plugin rows are focused; it cannot replace native navigation, change
   sidebar geometry, or act on another plugin's rows.
-- **Bounds and capability:** Require a distinct `surface:keyzone`
-  capability, to be added by the implementation change. Apply existing
+- **Bounds and capability:** Require a distinct key-zone capability, named by
+  the implementation change. Apply existing
   plugin queue, rate, mode, sandbox, and audit limits; invalid declarations
   and conflicts receive typed refusals and audit events. The capability
   grants no subprocess or I/O authority by itself.
@@ -188,10 +226,11 @@ decision change makes none of them.
   Reserved to Wired with `surface:theme`, define a contribution payload using
   the closed `UserTheme` shape and namespaced name, and specify one-shot
   contribution plus resident refresh/removal behavior and cadences.
-- **Key zones:** the implementation change will add the `surface:keyzone`
-  capability, define a versioned action/chord declaration payload, and
-  change the key-zone support row from Reserved to Wired with focused-surface
-  resident updates and one-shot declaration modes and cadences.
+- **Key zones:** the implementation change will add a key-zone `ExtensionPoint`
+  variant and its support row (Wired), define a versioned action/chord
+  declaration payload, add a distinct key-zone capability named by the
+  implementation change, and specify focused-surface resident updates plus
+  one-shot declaration modes and cadences.
 
 Each child change must specify typed negotiation refusals and bind its
 declared modes/cadences to existing queue and audit limits. All three remain
@@ -201,6 +240,7 @@ documentation, snapshots, and tests together.
 ## Output
 
 This record answers the THE-107 questions and publishes the owner decision.
-Adopted surfaces receive separate OpenSpec implementation changes. Nothing
-here duplicates THE-108 PanelSection behavior. No public documentation may
-claim that the whole UI is plugin-editable.
+Adopted surfaces receive separate OpenSpec implementation changes; deferred
+and rejected surfaces remain negotiation failures. Nothing here duplicates
+THE-108 PanelSection behavior. No public documentation may claim that the
+whole UI is plugin-editable.

@@ -10,7 +10,7 @@
       safe user-theme files and define token/contrast/persistence constraints.
 - [x] Decide adopt/defer/reject for plugin key zones; default to focused-surface
       actions and host-owned conflict/dispatch/help behavior.
-- [x] Publish the decisions in the plugin support matrix and ensure reserved/
+- [ ] Publish the decisions in the plugin support matrix and ensure reserved/
       absent surfaces remain rejected by negotiation.
 - [ ] Create one separate implementation change per adopted surface with code,
       schema, config, docs, compatibility, security, and test acceptance.
