@@ -230,6 +230,15 @@ fn list_page_query_escapes_cursor_and_uses_requested_page_size() {
 }
 
 #[test]
+fn search_page_query_selects_page_info_and_escapes_cursor() {
+    let query = build_search_page_query("hello", Some("cursor\"x"), 17);
+    assert!(query.contains("first: 17"), "{query}");
+    assert!(query.contains(r#"after: "cursor\"x""#), "{query}");
+    assert!(query.contains("pageInfo { hasNextPage endCursor }"));
+    assert!(braces_balanced(&query), "{query}");
+}
+
+#[test]
 fn create_mutation_selects_the_same_fields_as_issue_fields() {
     let mutation = build_create_mutation();
     assert!(
