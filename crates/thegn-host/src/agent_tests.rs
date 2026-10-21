@@ -2673,6 +2673,8 @@ fn permissioned_launch_is_command_scoped_and_never_touches_the_repository() {
                 "do it".into(),
                 "--permission-mode".into(),
                 "acceptEdits".into(),
+                "--setting-sources".into(),
+                "user".into(),
                 "--settings".into(),
                 grant("review"),
             ]

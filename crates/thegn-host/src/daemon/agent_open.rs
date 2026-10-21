@@ -183,7 +183,18 @@ fn resolve_inner(
         };
         // A fork is a new process: it carries the same command-scoped grant
         // as any other launch of this agent (THE-440).
-        format!("{fork}{}", session_grant(cfg, agent, stage)?)
+        let autonomous = if stage.is_some() {
+            match harness_for_agent(cfg, agent).and_then(|h| h.autonomous_args()) {
+                Some(args) => args
+                    .iter()
+                    .map(|arg| format!(" {}", thegn_core::util::sh_quote(arg)))
+                    .collect(),
+                None => String::new(),
+            }
+        } else {
+            String::new()
+        };
+        format!("{fork}{}{}", autonomous, session_grant(cfg, agent, stage)?)
     } else {
         command_for(
             cfg,
@@ -360,7 +371,18 @@ pub(crate) fn command_for(
         let cmd = harness
             .resume_command(id)
             .with_context(|| format!("agent `{agent}` does not support resume"))?;
-        let cmd = format!("{cmd}{}", session_grant(cfg, agent, stage)?);
+        let autonomous = if stage.is_some() {
+            match harness_for_agent(cfg, agent).and_then(|h| h.autonomous_args()) {
+                Some(args) => args
+                    .iter()
+                    .map(|arg| format!(" {}", thegn_core::util::sh_quote(arg)))
+                    .collect(),
+                None => String::new(),
+            }
+        } else {
+            String::new()
+        };
+        let cmd = format!("{cmd}{}{}", autonomous, session_grant(cfg, agent, stage)?);
         // A prompt alongside resume is handed over as an opening message, the
         // same way an interactive launch-with-task does.
         if prompt.trim().is_empty() {
@@ -378,7 +400,18 @@ pub(crate) fn command_for(
         let cmd = harness
             .continue_command()
             .with_context(|| format!("agent `{agent}` does not support continue"))?;
-        let cmd = format!("{cmd}{}", session_grant(cfg, agent, stage)?);
+        let autonomous = if stage.is_some() {
+            match harness_for_agent(cfg, agent).and_then(|h| h.autonomous_args()) {
+                Some(args) => args
+                    .iter()
+                    .map(|arg| format!(" {}", thegn_core::util::sh_quote(arg)))
+                    .collect(),
+                None => String::new(),
+            }
+        } else {
+            String::new()
+        };
+        let cmd = format!("{cmd}{}{}", autonomous, session_grant(cfg, agent, stage)?);
         if prompt.trim().is_empty() {
             return Ok(cmd);
         }
@@ -390,9 +423,18 @@ pub(crate) fn command_for(
     let eff = effective_agent(cfg, agent, stage).map_err(|e| anyhow::anyhow!("{e}"))?;
 
     if !headless {
-        let cmd = eff
-            .interactive_command()
-            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        let cmd =
+            thegn_core::agent_task::with_model(&eff.command, &eff.harness, eff.model.as_deref())
+                .map_err(|e| anyhow::anyhow!("{e}"))?;
+        let autonomous = if stage.is_some() {
+            eff.autonomous_args()
+        } else {
+            String::new()
+        };
+        let cmd = format!(
+            "{cmd}{autonomous}{}",
+            eff.permission_args().map_err(|e| anyhow::anyhow!("{e}"))?
+        );
         if prompt.trim().is_empty() {
             return Ok(cmd);
         }
@@ -501,6 +543,78 @@ mod tests {
     }
 
     #[test]
+    fn autonomous_stage_launches_load_only_user_settings() {
+        let mut c = cfg();
+        c.agents.push(named("worker", "claude"));
+        c.pipeline
+            .stages
+            .push(thegn_core::config_pipeline::PipelineStage {
+                name: "review".into(),
+                agent: "worker".into(),
+                ..Default::default()
+            });
+        let stage_commands = [
+            command_for(&c, "worker", "", false, None, false, Some("review"))
+                .expect("stage interactive resolves"),
+            command_for(
+                &c,
+                "worker",
+                "",
+                false,
+                Some("sess-1"),
+                false,
+                Some("review"),
+            )
+            .expect("stage resume resolves"),
+            command_for(&c, "worker", "", false, None, true, Some("review"))
+                .expect("stage continue resolves"),
+        ];
+        for command in stage_commands {
+            assert_eq!(
+                command.matches("--setting-sources user").count(),
+                1,
+                "{command}"
+            );
+        }
+
+        let plain_commands = [
+            command_for(&c, "worker", "", false, None, false, None)
+                .expect("plain interactive resolves"),
+            command_for(&c, "worker", "", false, Some("sess-1"), false, None)
+                .expect("plain resume resolves"),
+            command_for(&c, "worker", "", false, None, true, None)
+                .expect("plain continue resolves"),
+        ];
+        for command in plain_commands {
+            assert!(!command.contains("--setting-sources user"), "{command}");
+        }
+    }
+
+    #[test]
+    fn autonomous_suffix_precedes_the_grant() {
+        let mut c = cfg();
+        c.agents.push(named("worker", "claude"));
+        c.pipeline
+            .stages
+            .push(thegn_core::config_pipeline::PipelineStage {
+                name: "review".into(),
+                agent: "worker".into(),
+                permissions: vec!["Read".into()],
+                ..Default::default()
+            });
+        let command = command_for(&c, "worker", "", false, None, false, Some("review"))
+            .expect("stage interactive resolves");
+        assert!(
+            command.ends_with("--settings '{\"permissions\":{\"allow\":[\"Read\"]}}'"),
+            "{command}"
+        );
+        assert!(
+            command.contains("--setting-sources user --settings"),
+            "{command}"
+        );
+    }
+
+    #[test]
     fn a_headless_claude_launch_carries_the_prompt() {
         let cmd = command_for(&cfg(), "claude", "write a test", true, None, false, None)
             .expect("resolves");
@@ -558,7 +672,10 @@ mod tests {
         assert!(staged.ends_with("--model claude-opus-5"), "got {staged}");
         let interactive =
             command_for(&c, "worker", "", false, None, false, Some("review")).unwrap();
-        assert_eq!(interactive, "claude --model claude-opus-5");
+        assert_eq!(
+            interactive,
+            "claude --model claude-opus-5 --setting-sources user"
+        );
         let err = command_for(&c, "worker", "", false, None, false, Some("ghost")).unwrap_err();
         assert!(err.to_string().contains("stage"), "{err}");
     }

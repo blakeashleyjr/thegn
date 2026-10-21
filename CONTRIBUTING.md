@@ -89,6 +89,21 @@ and `snap`/`send`/`wait` it. [`docs/testing-with-muse.md`](docs/testing-with-mus
 is the full guide (environment, spec anatomy, the traps, artifacts, baselines,
 macOS); the `tui-check` skill under `extensions/skills/` is the agent recipe.
 
+### Committed Claude Code hooks
+
+This repository commits `.claude/settings.json` `PreToolUse` hooks for
+`test/heavy-guard.sh` and `test/heredoc-guard.py` as the dev-loop policy.
+Claude Code's directory trust is a one-time decision: after a branch switch,
+the next Bash call runs the hook files in that checkout before any permission
+prompt. The accepted risk is that those files can change with the branch and
+run with the interactive Claude process's authority. Review `.claude/` and
+`test/*-guard*` when checking out a branch from someone else. Inspect effective
+hooks with `/hooks` in Claude Code, or start it with
+`claude --setting-sources user` to skip project settings. Thegn's autonomous
+launches use that setting source. See the
+[configuration help](docs/help/configuration.md) for the settings and
+permissions that apply to autonomous launches.
+
 ### Cross-platform path semantics
 
 Core path tests can exercise Linux, macOS, Windows, and fallback conventions
