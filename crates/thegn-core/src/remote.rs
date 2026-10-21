@@ -1073,7 +1073,8 @@ impl GitLoc {
         policy: &crate::git_run::GitPolicy,
         cancel: &std::sync::atomic::AtomicBool,
     ) -> crate::git_run::GitOutcome {
-        self.git_run_env(&[], args, policy, cancel)
+        crate::util::note_core_git_spawn();
+        crate::git_run::run_command(&mut self.git_command(args), policy, cancel)
     }
 
     /// Read trimmed UTF-8 output with the named 60-second read deadline; empty
