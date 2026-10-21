@@ -1127,17 +1127,23 @@ mod tests {
     fn host_alias_suffix_collision_and_overlong_default_refuse() {
         let (_, hc) = parse_host_target("me@example.test", None).unwrap();
         let suffix = format!("example-test-{}", &host_authority_digest(&hc)[..12]);
-        let defs = vec![(suffix.clone(), HostConfig::default())];
+        let (_, other_authority) = parse_host_target("me@other.test", None).unwrap();
+        let defs = vec![
+            ("example-test".into(), other_authority.clone()),
+            (suffix.clone(), other_authority),
+        ];
         assert!(
             default_host_alias("example-test", &hc, &defs, &|_| false)
                 .is_err_and(|error| error.contains("--name"))
         );
         assert!(
-            default_host_alias("example-test", &hc, &[], &|name| name == suffix.as_str())
-                .is_err_and(|error| error.contains("--name"))
+            default_host_alias("example-test", &hc, &[], &|name| {
+                name == "example-test" || name == suffix.as_str()
+            })
+            .is_err_and(|error| error.contains("--name"))
         );
         assert!(
-            default_host_alias(&"a".repeat(HOST_ALIAS_MAX_BYTES), &hc, &[], &|_| false)
+            default_host_alias(&"a".repeat(HOST_ALIAS_MAX_BYTES + 1), &hc, &[], &|_| false)
                 .is_err_and(|error| error.contains("--name"))
         );
     }
@@ -1145,7 +1151,7 @@ mod tests {
     #[test]
     fn host_alias_iroh_digest_is_full_strength() {
         let (name, first) = parse_host_target("dumbpipe:ticket-one", Some("me")).unwrap();
-        let (other_name, other) = parse_host_target("dumbpipe:ticket-two", Some("me")).unwrap();
+        let (other_name, _) = parse_host_target("dumbpipe:ticket-two", Some("me")).unwrap();
         assert!(name.starts_with("iroh-"));
         assert_eq!(name.len(), "iroh-".len() + 32);
         assert_eq!(
