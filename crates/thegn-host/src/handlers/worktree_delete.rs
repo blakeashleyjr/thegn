@@ -174,7 +174,10 @@ pub(crate) fn perform_close(cx: &mut DeleteCtx<'_>, targets: Vec<usize>) {
     // earlier in-memory indices stay valid without opening SQLite on the loop.
     let cfg = cx.cfg.clone();
     crate::db_task::persist_critical(move |db| {
-        close_groups_durably(db, &session_id, &removed_groups, Some(&cfg));
+        let failures = close_groups_durably(db, &session_id, &removed_groups, Some(&cfg));
+        if let Some(notice) = close_failure_notice(&failures) {
+            crate::db_task::alert(&notice);
+        }
     });
 
     // Plan the landing against the rows still on screen, then close from the
@@ -249,6 +252,29 @@ pub(crate) fn close_groups_durably(
         }
     }
     failures
+}
+
+pub(crate) fn close_failure_notice(failures: &[String]) -> Option<String> {
+    if failures.is_empty() {
+        return None;
+    }
+
+    let shown = failures
+        .iter()
+        .take(3)
+        .map(|failure| crate::merge_sweep::safe_display(failure))
+        .collect::<Vec<_>>()
+        .join("; ");
+    let more = failures.len().saturating_sub(3);
+    let suffix = if more == 0 {
+        String::new()
+    } else {
+        format!(" (+{more} more)")
+    };
+    Some(format!(
+        "Close not recorded for {} worktree(s); they stay registered and reappear on the next refresh: {shown}{suffix}",
+        failures.len()
+    ))
 }
 
 /// What the cached sidebar status says about a delete target's working tree.
@@ -683,9 +709,9 @@ fn landing_for_slug(session: &crate::session::Session, slug: Option<&str>) -> Op
 #[cfg(test)]
 mod tests {
     use super::{
-        TargetState, close_groups_durably, group_names_for, hide_pending_deletes, landing_for_slug,
-        next_or_prev, pending_delete_refusal, pending_target_refusal, resolve_group_indices,
-        target_state,
+        TargetState, close_failure_notice, close_groups_durably, group_names_for,
+        hide_pending_deletes, landing_for_slug, next_or_prev, pending_delete_refusal,
+        pending_target_refusal, resolve_group_indices, target_state,
     };
     use crate::session::{GroupKind, Session, WorktreeGroup};
     use std::collections::HashSet;
@@ -1073,5 +1099,47 @@ mod tests {
         assert_eq!(failures.len(), 1);
         assert!(failures[0].contains(path));
         assert!(db.worktree_record(path).unwrap().is_some());
+    }
+
+    #[test]
+    fn close_failure_notice_names_every_failed_close() {
+        assert!(close_failure_notice(&[]).is_none());
+
+        let failures = vec![
+            "/worktrees/one: refused".into(),
+            "/worktrees/two: refused".into(),
+        ];
+        let notice = close_failure_notice(&failures).unwrap();
+        assert!(notice.contains("/worktrees/one"));
+        assert!(notice.contains("/worktrees/two"));
+        assert!(notice.contains("stay registered"));
+
+        let unsafe_failure = vec!["/worktrees/unsafe\u{1b}[2J: refused".into()];
+        let notice = close_failure_notice(&unsafe_failure).unwrap();
+        assert!(!notice.contains('\u{1b}'));
+
+        let failures = (1..=5)
+            .map(|index| format!("/worktrees/{index}: refused"))
+            .collect::<Vec<_>>();
+        let notice = close_failure_notice(&failures).unwrap();
+        assert!(notice.contains("/worktrees/1"));
+        assert!(notice.contains("/worktrees/2"));
+        assert!(notice.contains("/worktrees/3"));
+        assert!(!notice.contains("/worktrees/4"));
+        assert!(notice.contains("(+2 more)"));
+    }
+
+    #[test]
+    fn close_failure_notice_reports_the_relative_path_refusal() {
+        let db = thegn_core::db::Db::open_memory().unwrap();
+        use thegn_core::store::WorkspaceStore;
+        let path = "rel/wt";
+        db.put_worktree("repo/feature", "/repo", path, "feature", None, None)
+            .unwrap();
+        let group = WorktreeGroup::new("repo/feature".to_string(), GroupKind::Branch, path);
+        let failures = close_groups_durably(&db, "session", &[group], None);
+
+        let notice = close_failure_notice(&failures).unwrap();
+        assert!(notice.contains("rel/wt"));
     }
 }
