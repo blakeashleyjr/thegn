@@ -6,6 +6,8 @@ use anyhow::{Context, Result};
 use sha2::{Digest, Sha256};
 use std::io::Write as _;
 use std::process::{Command, Stdio};
+use std::sync::atomic::AtomicBool;
+use std::time::Duration;
 use thegn_core::config::{Config, EnvProviderConfig, MergeRemoteMode, ServeExposure};
 use thegn_core::control::{RouteToHostTokenBinding, Scope, ScopeSet, TokenKind};
 use thegn_core::db::Db;
@@ -16,6 +18,11 @@ use thegn_svc::provider::Provider;
 const LEGACY_CREDENTIAL_PATH: &str = ".config/thegn/route-to-host.env";
 const CREDENTIAL_DIR: &str = ".config/thegn/route-to-host";
 const TOKEN_LIFETIME_MS: i64 = 30 * 24 * 60 * 60 * 1000;
+const CREDENTIAL_READ_CAP: usize = 4096;
+const CREDENTIAL_LINE_MAX: usize = 2048;
+/// Keep a reused token usable for at least a week of its 30-day life.
+const MIN_REMAINING_MS: i64 = 7 * 24 * 60 * 60 * 1000;
+const SSH_CREDENTIAL_TIMEOUT: Duration = Duration::from_secs(60);
 
 fn now_ms() -> i64 {
     std::time::SystemTime::now()
@@ -375,16 +382,7 @@ fn install_credential(
     // SSH-backed providers stream an exports preamble on stdin). The argv and
     // script contain variable names only. `umask 077` makes the runtime file
     // private from creation; it is written after base checkpointing.
-    let path = credential_path(worktree);
-    let script = format!(
-        "umask 077; d=\"$HOME/{CREDENTIAL_DIR}\"; p=\"$HOME/{path}\"; \
-         mkdir -p \"$d\" && chmod 700 \"$d\" || exit 73; t=\"$p.tmp.$$\"; \
-         trap 'rm -f \"$t\"' EXIT HUP INT TERM; \
-         printf '%s\\n%s\\n' \
-         \"$THEGN_ROUTE_ORIGIN\" \"$THEGN_ROUTE_TOKEN\" > \"$t\" && \
-         chmod 600 \"$t\" && mv -f \"$t\" \"$p\"; rc=$?; \
-         trap - EXIT HUP INT TERM; [ $rc -eq 0 ] || {{ rm -f \"$t\"; exit $rc; }}"
-    );
+    let script = provider_install_script(worktree);
     let argv = vec!["/bin/sh".into(), "-lc".into(), script];
     let env = vec![
         ("THEGN_ROUTE_ORIGIN".into(), credential.origin.clone()),
@@ -398,6 +396,30 @@ fn install_credential(
         "provider rejected route-to-host credential installation (exit {code})"
     );
     Ok(())
+}
+
+fn provider_install_script(worktree: &str) -> String {
+    let path = credential_path(worktree);
+    format!(
+        "umask 077; d=\"$HOME/{CREDENTIAL_DIR}\"; p=\"$HOME/{path}\"; \
+         mkdir -p \"$d\" && chmod 700 \"$d\" || exit 73; \
+         t=$(mktemp \"$p.tmp.XXXXXX\") || exit 74; \
+         trap 'rm -f \"$t\"' EXIT HUP INT TERM; \
+         printf '%s\\n%s\\n' \
+         \"$THEGN_ROUTE_ORIGIN\" \"$THEGN_ROUTE_TOKEN\" > \"$t\" && \
+         chmod 600 \"$t\" && mv -f \"$t\" \"$p\"; rc=$?; \
+         trap - EXIT HUP INT TERM; [ $rc -eq 0 ] || {{ rm -f \"$t\"; exit $rc; }}"
+    )
+}
+
+fn read_script(worktree: &str) -> String {
+    let path = credential_path(worktree);
+    format!(
+        "p=\"$HOME/{path}\"; [ -r \"$p\" ] || exit 44; \
+         printf '%s\\n' __THEGN_ROUTE_V1__; head -c {} -- \"$p\"; \
+         printf '%s\\n' __THEGN_ROUTE_END__",
+        CREDENTIAL_READ_CAP + 1
+    )
 }
 
 fn remove_credential_file(provider: &Provider, sandbox_id: &str, worktree: &str) -> Result<()> {
@@ -421,11 +443,7 @@ fn read_provider_credential(
     sandbox_id: &str,
     worktree: &str,
 ) -> Result<Option<(String, String)>> {
-    let path = credential_path(worktree);
-    let script = format!(
-        "p=\"$HOME/{path}\"; [ -r \"$p\" ] || exit 44; \
-         printf '%s\\n' __THEGN_ROUTE_V1__; cat -- \"$p\""
-    );
+    let script = read_script(worktree);
     let argv = vec!["/bin/sh".into(), "-lc".into(), script];
     let (code, output) = crate::agent::block_on_provider(|| async {
         provider.run_exec(sandbox_id, &argv, None, &[]).await
@@ -441,20 +459,40 @@ fn read_provider_credential(
 }
 
 fn parse_credential_response(text: &str) -> Result<Option<(String, String)>> {
-    let Some(payload) = text
-        .split_once("__THEGN_ROUTE_V1__\n")
-        .map(|(_, tail)| tail)
-    else {
+    let Some((_, tail)) = text.split_once("__THEGN_ROUTE_V1__\n") else {
         anyhow::bail!("route-to-host credential response was missing its protocol marker");
     };
-    let mut lines = payload.lines();
-    let origin = lines.next().unwrap_or_default().to_string();
-    let token = lines.next().unwrap_or_default().to_string();
+    let search_len = CREDENTIAL_READ_CAP + 1 + "\n__THEGN_ROUTE_END__\n".len();
+    let Some(end) = tail.find("\n__THEGN_ROUTE_END__\n") else {
+        anyhow::bail!("route-to-host credential file was oversized or malformed");
+    };
     anyhow::ensure!(
-        !origin.is_empty() && !token.is_empty(),
-        "route-to-host credential file was incomplete"
+        end + "\n__THEGN_ROUTE_END__\n".len() <= search_len,
+        "route-to-host credential file was oversized or malformed"
     );
-    Ok(Some((origin, token)))
+    let payload = &tail[..end + 1];
+    anyhow::ensure!(
+        payload.len() <= CREDENTIAL_READ_CAP,
+        "route-to-host credential file was oversized or malformed"
+    );
+    let Some(contents) = payload.strip_suffix('\n') else {
+        anyhow::bail!("route-to-host credential file was oversized or malformed");
+    };
+    let Some((origin, token)) = contents.split_once('\n') else {
+        anyhow::bail!("route-to-host credential file was oversized or malformed");
+    };
+    anyhow::ensure!(
+        !origin.is_empty()
+            && !token.is_empty()
+            && origin.len() <= CREDENTIAL_LINE_MAX
+            && token.len() <= CREDENTIAL_LINE_MAX
+            && !origin.chars().any(char::is_control)
+            && !token.chars().any(char::is_control)
+            && !origin.contains('\u{fffd}')
+            && !token.contains('\u{fffd}'),
+        "route-to-host credential file was oversized or malformed"
+    );
+    Ok(Some((origin.to_string(), token.to_string())))
 }
 
 /// Reconcile the route-to-host credential after provider provisioning. A valid
@@ -553,28 +591,22 @@ fn ssh_command(target: &SshTarget, remote_script: &str) -> Command {
     command
 }
 
-#[expect(
-    clippy::disallowed_methods,
-    reason = "SSH credential reconciliation runs only on provisioning/CLI blocking workers"
-)]
 fn read_ssh_credential(target: &SshTarget, worktree: &str) -> Result<Option<(String, String)>> {
-    let path = credential_path(worktree);
-    let script = format!(
-        "p=\"$HOME/{path}\"; [ -r \"$p\" ] || exit 44; \
-         printf '%s\\n' __THEGN_ROUTE_V1__; cat -- \"$p\""
-    );
-    let output = ssh_command(target, &script)
-        .output()
-        .context("read existing route-to-host credential over SSH")?;
-    if output.status.code() == Some(44) {
+    let (code, output, stderr) = run_ssh_bounded(
+        ssh_command(target, &read_script(worktree)),
+        SSH_CREDENTIAL_TIMEOUT,
+    )
+    .context("read existing route-to-host credential over SSH")?;
+    if code == Some(44) {
         return Ok(None);
     }
     anyhow::ensure!(
-        output.status.success(),
-        "SSH rejected route-to-host credential read (exit {})",
-        output.status.code().unwrap_or(-1)
+        code == Some(0),
+        "SSH rejected route-to-host credential read (exit {}): {}",
+        code.unwrap_or(-1),
+        String::from_utf8_lossy(&stderr).trim()
     );
-    let text = String::from_utf8(output.stdout).context("SSH credential response was not UTF-8")?;
+    let text = String::from_utf8(output).context("SSH credential response was not UTF-8")?;
     parse_credential_response(&text)
 }
 
@@ -595,11 +627,55 @@ fn ssh_install_script(worktree: &str) -> String {
     format!(
         "umask 077; d=\"$HOME/{CREDENTIAL_DIR}\"; p=\"$HOME/{path}\"; \
          mkdir -p \"$d\" && chmod 700 \"$d\" || exit 73; \
-         t=\"$p.tmp.$$\"; trap 'rm -f \"$t\"' EXIT HUP INT TERM; \
+         t=$(mktemp \"$p.tmp.XXXXXX\") || exit 74; trap 'rm -f \"$t\"' EXIT HUP INT TERM; \
          IFS= read -r origin && IFS= read -r token && [ -n \"$origin\" ] && [ -n \"$token\" ] || exit 65; \
          printf '%s\\n%s\\n' \"$origin\" \"$token\" > \"$t\" && chmod 600 \"$t\" && mv -f \"$t\" \"$p\"; \
          rc=$?; trap - EXIT HUP INT TERM; [ $rc -eq 0 ] || {{ rm -f \"$t\"; exit $rc; }}"
     )
+}
+
+fn run_ssh_bounded(
+    mut command: Command,
+    timeout: Duration,
+) -> Result<(Option<i32>, Vec<u8>, Vec<u8>)> {
+    let output_cap = CREDENTIAL_READ_CAP + 64;
+    let limits = thegn_proc::Limits {
+        stdout: thegn_proc::Stream::HeadOrFail { cap: output_cap },
+        stderr: thegn_proc::Stream::Tail { cap: 1024 },
+        quiesce_after_leader: Some(Duration::ZERO),
+        ..thegn_proc::Limits::silent(timeout)
+    };
+    let run = thegn_proc::run(&mut command, &limits, &AtomicBool::new(false));
+    let stderr = String::from_utf8_lossy(&run.stderr.bytes)
+        .trim()
+        .to_string();
+    let detail = if stderr.is_empty() {
+        String::new()
+    } else {
+        format!(": {stderr}")
+    };
+    match &run.end {
+        thegn_proc::End::LeaderExited => Ok((
+            run.exit_status().and_then(|status| status.code()),
+            run.stdout.bytes,
+            run.stderr.bytes,
+        )),
+        thegn_proc::End::TimedOut => {
+            anyhow::bail!("SSH credential command timed out after {timeout:?}{detail}")
+        }
+        thegn_proc::End::OutputLimit(_) => {
+            anyhow::bail!("SSH credential command output over {output_cap} bytes{detail}")
+        }
+        thegn_proc::End::Spawn(error) => {
+            anyhow::bail!("start SSH credential command: {error}{detail}")
+        }
+        thegn_proc::End::Supervise(error) => {
+            anyhow::bail!("supervise SSH credential command: {error}{detail}")
+        }
+        thegn_proc::End::Cancelled => {
+            anyhow::bail!("SSH credential command was cancelled{detail}")
+        }
+    }
 }
 
 #[expect(
@@ -633,19 +709,18 @@ fn stream_credential(mut command: Command, credential: &RouteCredential) -> Resu
     Ok(())
 }
 
-#[expect(
-    clippy::disallowed_methods,
-    reason = "SSH credential removal runs only on provisioning/teardown/CLI blocking workers"
-)]
 fn remove_ssh_credential(target: &SshTarget, worktree: &str) -> Result<()> {
     let path = credential_path(worktree);
-    let output = ssh_command(target, &format!("rm -f \"$HOME/{path}\""))
-        .output()
-        .context("remove route-to-host credential over SSH")?;
+    let (code, _, stderr) = run_ssh_bounded(
+        ssh_command(target, &format!("rm -f \"$HOME/{path}\"")),
+        SSH_CREDENTIAL_TIMEOUT,
+    )
+    .context("remove route-to-host credential over SSH")?;
     anyhow::ensure!(
-        output.status.success(),
-        "SSH rejected route-to-host credential removal (exit {})",
-        output.status.code().unwrap_or(-1)
+        code == Some(0),
+        "SSH rejected route-to-host credential removal (exit {}): {}",
+        code.unwrap_or(-1),
+        String::from_utf8_lossy(&stderr).trim()
     );
     Ok(())
 }
@@ -663,6 +738,7 @@ fn reusable_credential(
         return None;
     }
     let auth = thegn_svc::control::auth::verify(store, &token, at_ms)?;
+    thegn_svc::control::auth::verify(store, &token, at_ms.saturating_add(MIN_REMAINING_MS))?;
     if auth.scopes != ScopeSet::of(&[Scope::MergeAdd]) {
         return None;
     }
@@ -1309,6 +1385,138 @@ mod tests {
     }
 
     #[test]
+    fn credential_parser_accepts_only_two_bounded_lines() {
+        assert_eq!(
+            parse_credential_response(
+                "banner\n__THEGN_ROUTE_V1__\nhttps://o\ntok\n__THEGN_ROUTE_END__\n"
+            )
+            .unwrap(),
+            Some(("https://o".into(), "tok".into()))
+        );
+        assert_eq!(
+            parse_credential_response(
+                "__THEGN_ROUTE_V1__\nhttps://o\ntok\n__THEGN_ROUTE_END__\nprofile warning\n"
+            )
+            .unwrap(),
+            Some(("https://o".into(), "tok".into()))
+        );
+        assert!(
+            parse_credential_response(
+                "__THEGN_ROUTE_V1__\nhttps://o\ntok\njunk\n__THEGN_ROUTE_END__\n"
+            )
+            .is_err()
+        );
+        for payload in [
+            "https://o\ntok\nextra\n".to_string(),
+            "https://o\ntok".to_string(),
+            "https://o\r\ntok\r\n".to_string(),
+            "\n\ntok\n".to_string(),
+            format!("{}\ntok\n", "o".repeat(CREDENTIAL_LINE_MAX + 1)),
+            format!("{}\n", "x".repeat(CREDENTIAL_READ_CAP + 1)),
+        ] {
+            let response = format!("__THEGN_ROUTE_V1__\n{payload}__THEGN_ROUTE_END__\n");
+            assert!(
+                parse_credential_response(&response).is_err(),
+                "accepted malformed payload with {} bytes",
+                payload.len()
+            );
+        }
+    }
+
+    #[test]
+    fn install_scripts_use_mktemp_not_the_pid() {
+        for script in [
+            provider_install_script("/host/worktree-a"),
+            ssh_install_script("/host/worktree-a"),
+        ] {
+            assert!(script.contains("mktemp \"$p.tmp.XXXXXX\""));
+            assert!(!script.contains("$$"));
+        }
+    }
+
+    #[test]
+    fn read_scripts_cap_the_remote_read() {
+        let script = read_script("/host/worktree-a");
+        assert!(script.contains("head -c 4097"));
+        assert!(script.contains("__THEGN_ROUTE_END__"));
+        assert!(!script.contains("cat --"));
+    }
+
+    #[test]
+    fn near_expiry_credential_is_not_reused() {
+        let temp = tempfile::tempdir().unwrap();
+        let db = Db::open_at(&temp.path().join("db.sqlite")).unwrap();
+        let target = ssh_target("alice@build.example");
+        let owner = ssh_owner_label(&target, "/host/worktree-a");
+        let at_ms = 10_000;
+        let mint = |expires_at| {
+            thegn_svc::control::auth::mint(
+                TokenKind::Control,
+                ScopeSet::of(&[Scope::MergeAdd]),
+                &RouteToHostTokenBinding {
+                    owner: owner.clone(),
+                    worktree: "/host/worktree-a".into(),
+                }
+                .label(),
+                None,
+                Some(expires_at),
+                at_ms,
+            )
+        };
+        let near = mint(at_ms + MIN_REMAINING_MS - 1);
+        let safe = mint(at_ms + MIN_REMAINING_MS + 1_000);
+        db.put_pairing(&near.row).unwrap();
+        db.put_pairing(&safe.row).unwrap();
+
+        let installed = |token: String| Some(("https://control.example".into(), token));
+        assert!(
+            reusable_credential(
+                &db,
+                &owner,
+                "/host/worktree-a",
+                "https://control.example",
+                installed(near.token),
+                at_ms,
+            )
+            .is_none()
+        );
+        assert!(
+            reusable_credential(
+                &db,
+                &owner,
+                "/host/worktree-a",
+                "https://control.example",
+                installed(safe.token),
+                at_ms,
+            )
+            .is_some()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn bounded_ssh_run_caps_output_and_deadline() {
+        let mut exits = Command::new("/bin/sh");
+        exits.args(["-c", "exit 44"]);
+        assert_eq!(
+            run_ssh_bounded(exits, Duration::from_secs(2)).unwrap().0,
+            Some(44)
+        );
+
+        let mut noisy = Command::new("/bin/sh");
+        noisy.args(["-c", "head -c 4300 /dev/zero"]);
+        let cap_error = run_ssh_bounded(noisy, Duration::from_secs(2)).unwrap_err();
+        assert!(cap_error.to_string().contains("output over 4160 bytes"));
+
+        let mut sleeper = Command::new("/bin/sh");
+        sleeper.args(["-c", "sleep 5"]);
+        let started = std::time::Instant::now();
+        let timeout_error = run_ssh_bounded(sleeper, Duration::from_millis(200)).unwrap_err();
+        assert!(timeout_error.to_string().contains("timed out"));
+        assert!(started.elapsed() < Duration::from_secs(5));
+    }
+
+    #[test]
     fn valid_ssh_credential_is_reused_without_revoking_live_panes() {
         let temp = tempfile::tempdir().unwrap();
         let db = Db::open_at(&temp.path().join("db.sqlite")).unwrap();
@@ -1323,7 +1531,7 @@ mod tests {
             }
             .label(),
             None,
-            Some(20_000),
+            Some(10_000 + MIN_REMAINING_MS + 10_000),
             10_000,
         );
         db.put_pairing(&minted.row).unwrap();
@@ -1369,7 +1577,7 @@ mod tests {
                 }
                 .label(),
                 None,
-                Some(20_000),
+                Some(10_000 + MIN_REMAINING_MS + 10_000),
                 at_ms,
             )
         };
