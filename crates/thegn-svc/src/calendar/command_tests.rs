@@ -23,6 +23,10 @@ fn sink() -> AdmittingSink {
 }
 
 #[test]
+#[allow(
+    clippy::disallowed_macros,
+    reason = "conformance matrix prints every fixture x seam verdict before asserting"
+)]
 fn conformance_command_plugin_matches_every_fixture() {
     let mut table = Vec::new();
     for fixture in FIXTURES {

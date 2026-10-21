@@ -5,6 +5,10 @@ use crate::calendar::{CalEvent, validate::validate_event};
 use std::collections::HashSet;
 
 #[test]
+#[allow(
+    clippy::disallowed_macros,
+    reason = "conformance matrix prints every fixture x seam verdict before asserting"
+)]
 fn conformance_core_parser_matches_every_fixture() {
     let mut table = Vec::new();
     for fixture in FIXTURES {
@@ -45,6 +49,10 @@ fn conformance_core_parser_matches_every_fixture() {
 }
 
 #[test]
+#[allow(
+    clippy::disallowed_macros,
+    reason = "conformance matrix prints every fixture x seam verdict before asserting"
+)]
 fn conformance_fixture_names_are_unique() {
     let mut names = HashSet::new();
     let table: Vec<_> = FIXTURES
