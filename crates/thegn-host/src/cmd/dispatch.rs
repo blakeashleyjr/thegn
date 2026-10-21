@@ -944,20 +944,25 @@ fn lead_proof<'a>(
 pub(crate) fn dispatch_identity(issue_id: &str, worktree: &str) -> Result<(String, String)> {
     let issue =
         thegn_core::pipeline_identity::canonical_issue_id(issue_id).map_err(anyhow::Error::new)?;
-    let canonical = std::fs::canonicalize(worktree).map_err(|_| {
+    let canonical = std::fs::canonicalize(worktree).map_err(|error| {
         anyhow::anyhow!(
-            "worktree {worktree:?} does not exist on this host; a pipeline row needs a local git worktree root"
+            "worktree '{}' is not usable on this host ({error}); a pipeline row needs a local git worktree root",
+            worktree
         )
     })?;
     let root = thegn_core::repo::worktree_root_for_cwd(&canonical);
     if root.as_deref() != Some(canonical.as_path()) {
         if let Some(root) = root {
             anyhow::bail!(
-                "worktree {worktree:?} resolves inside git worktree root {}; a pipeline row needs the root",
+                "worktree '{}' resolves inside git worktree root {}; a pipeline row needs the root",
+                worktree,
                 root.display()
             );
         }
-        anyhow::bail!("worktree {worktree:?} is not the root of a local git worktree");
+        anyhow::bail!(
+            "worktree '{}' is not the root of a local git worktree",
+            worktree
+        );
     }
     Ok((issue, canonical.to_string_lossy().into_owned()))
 }

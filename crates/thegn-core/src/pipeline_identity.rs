@@ -45,9 +45,6 @@ pub fn canonical_issue_id(raw: &str) -> Result<String, IssueIdentityError> {
         return Err(invalid());
     }
     let (provider, key) = split_issue_id(trimmed);
-    if key.is_empty() {
-        return Err(invalid());
-    }
     if let Some(provider) = provider {
         if provider.is_empty()
             || !provider
