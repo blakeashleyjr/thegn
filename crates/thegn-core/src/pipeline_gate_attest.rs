@@ -182,6 +182,104 @@ pub enum AttestationVerdict {
     Refused(AttestationRefusal),
 }
 
+/// Operator-facing state of the latest stored gate record for a dispatch.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TrustedGate {
+    /// Latest passing attestation matches the current repository and worktree facts.
+    Satisfied { attestation_id: i64 },
+    /// No attestation has been recorded for this dispatch.
+    Missing,
+    /// Latest record ended in a failed or errored outcome.
+    NotPassed {
+        attestation_id: i64,
+        outcome: GateOutcome,
+        reason: String,
+    },
+    /// Latest passing record fails one of the attestation checks.
+    Refused {
+        attestation_id: i64,
+        refusal: AttestationRefusal,
+    },
+    /// Current repository or worktree facts could not be read.
+    Unobservable { reason: String },
+}
+
+impl TrustedGate {
+    /// Whether this state permits trusted completion.
+    pub fn is_satisfied(&self) -> bool {
+        matches!(self, Self::Satisfied { .. })
+    }
+
+    /// Stable short state for CLI and JSON output.
+    pub const fn token(&self) -> &'static str {
+        match self {
+            Self::Satisfied { .. } => "satisfied",
+            Self::Missing => "missing",
+            Self::NotPassed { .. } => "not_passed",
+            Self::Refused { .. } => "refused",
+            Self::Unobservable { .. } => "unobservable",
+        }
+    }
+
+    /// Explain this state and, when unsatisfied, give the operator's next step.
+    pub fn detail(&self, row: i64) -> String {
+        let state = match self {
+            Self::Satisfied { attestation_id } => {
+                return format!("attestation {attestation_id} satisfies the current HEAD");
+            }
+            Self::Missing => "no trusted gate attestation is recorded".to_string(),
+            Self::NotPassed {
+                outcome, reason, ..
+            } => format!(
+                "latest gate attestation did not pass ({}){}",
+                outcome.as_str(),
+                if reason.is_empty() {
+                    String::new()
+                } else {
+                    format!(": {reason}")
+                }
+            ),
+            Self::Refused { refusal, .. } => refusal.to_string(),
+            Self::Unobservable { reason } => {
+                format!("current gate facts could not be observed: {reason}")
+            }
+        };
+        format!("{state}; run `thegn dispatch gate {row}` on the committed HEAD")
+    }
+}
+
+/// Evaluate the newest stored record against current worktree facts.
+pub fn evaluate_latest(
+    latest: Option<(i64, &GateAttestation, GateOutcome, &str)>,
+    ctx: Result<&AttestationContext, &str>,
+) -> TrustedGate {
+    let Some((attestation_id, attestation, outcome, reason)) = latest else {
+        return TrustedGate::Missing;
+    };
+    if outcome != GateOutcome::Passed {
+        return TrustedGate::NotPassed {
+            attestation_id,
+            outcome,
+            reason: reason.to_string(),
+        };
+    }
+    let ctx = match ctx {
+        Ok(ctx) => ctx,
+        Err(reason) => {
+            return TrustedGate::Unobservable {
+                reason: reason.to_string(),
+            };
+        }
+    };
+    match attestation_satisfies(attestation, ctx) {
+        AttestationVerdict::Satisfied => TrustedGate::Satisfied { attestation_id },
+        AttestationVerdict::Refused(refusal) => TrustedGate::Refused {
+            attestation_id,
+            refusal,
+        },
+    }
+}
+
 /// Decide whether trusted gate evidence still satisfies the current context.
 ///
 /// Checks are ordered so callers receive the first refusal consistently.
@@ -253,7 +351,7 @@ fn valid_oid(oid: &str) -> bool {
 mod tests {
     use super::{
         AttestationContext, AttestationRefusal, AttestationVerdict, GateAttestation, GateOutcome,
-        GateRunner, attestation_satisfies,
+        GateRunner, TrustedGate, attestation_satisfies, evaluate_latest,
     };
 
     #[test]
@@ -302,6 +400,108 @@ mod tests {
             log_present: true,
         };
         (att, ctx)
+    }
+
+    #[test]
+    fn trusted_gate_missing_without_attestation() {
+        assert_eq!(
+            evaluate_latest(None, Err("not observed")),
+            TrustedGate::Missing
+        );
+    }
+
+    #[test]
+    fn trusted_gate_failed_record_is_not_passed() {
+        let (att, ctx) = good();
+        let gate = evaluate_latest(
+            Some((9, &att, GateOutcome::Failed, "tests failed")),
+            Ok(&ctx),
+        );
+        assert!(matches!(
+            gate,
+            TrustedGate::NotPassed {
+                attestation_id: 9,
+                outcome: GateOutcome::Failed,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn trusted_gate_stale_commit_is_refused() {
+        let (att, mut ctx) = good();
+        ctx.head_oid = "c".repeat(40);
+        let gate = evaluate_latest(Some((9, &att, GateOutcome::Passed, "")), Ok(&ctx));
+        assert!(matches!(
+            gate,
+            TrustedGate::Refused {
+                refusal: AttestationRefusal::StaleCommit { .. },
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn trusted_gate_unobservable_context_is_not_satisfied() {
+        let (att, _) = good();
+        assert!(matches!(
+            evaluate_latest(
+                Some((9, &att, GateOutcome::Passed, "")),
+                Err("git status failed")
+            ),
+            TrustedGate::Unobservable { .. }
+        ));
+    }
+
+    #[test]
+    fn trusted_gate_satisfied_for_current_head() {
+        let (att, ctx) = good();
+        let gate = evaluate_latest(Some((9, &att, GateOutcome::Passed, "")), Ok(&ctx));
+        assert_eq!(gate, TrustedGate::Satisfied { attestation_id: 9 });
+        assert!(gate.is_satisfied());
+        assert_eq!(gate.token(), "satisfied");
+        assert!(gate.detail(17).contains("attestation 9"));
+    }
+
+    #[test]
+    fn trusted_gate_states_have_operator_details_and_tokens() {
+        let refusal = TrustedGate::Refused {
+            attestation_id: 8,
+            refusal: AttestationRefusal::MissingLog,
+        };
+        let states = [
+            (TrustedGate::Missing, "missing"),
+            (
+                TrustedGate::NotPassed {
+                    attestation_id: 7,
+                    outcome: GateOutcome::Error,
+                    reason: "runner unavailable".to_string(),
+                },
+                "not_passed",
+            ),
+            (refusal, "refused"),
+            (
+                TrustedGate::Unobservable {
+                    reason: "git status failed".to_string(),
+                },
+                "unobservable",
+            ),
+        ];
+        for (gate, token) in states {
+            assert!(!gate.is_satisfied());
+            assert_eq!(gate.token(), token);
+            let detail = gate.detail(17);
+            assert!(detail.ends_with("run `thegn dispatch gate 17` on the committed HEAD"));
+        }
+        assert!(
+            TrustedGate::NotPassed {
+                attestation_id: 7,
+                outcome: GateOutcome::Failed,
+                reason: String::new(),
+            }
+            .detail(17)
+            .contains("failed")
+        );
     }
 
     #[test]
