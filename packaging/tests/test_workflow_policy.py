@@ -8,6 +8,7 @@ import re
 import shutil
 import subprocess
 import tempfile
+import tomllib
 import unittest
 from pathlib import Path
 
@@ -997,6 +998,118 @@ class WorkflowPolicyTests(unittest.TestCase):
                 result = run_case()
                 self.assertNotEqual(0, result.returncode)
                 self.assertIn(f"{asset_name} does not match the release manifest", result.stdout)
+
+    def test_upload_publishes_trusted_asset_digests(self) -> None:
+        job = read_workflow("release.yml")["jobs"]["upload"]
+        self.assertEqual("${{ steps.record.outputs.asset_digests }}", job["outputs"]["asset_digests"])
+        step = next(item for item in job["steps"] if item.get("name") == "Write and publish release record")
+        self.assertEqual("record", step["id"])
+        self.assertIn('echo "asset_digests=$asset_digests" >> "$GITHUB_OUTPUT"', step["run"])
+        self.assertIn('sha256sum "$asset"', step["run"])
+        self.assertIn('thegn-$TAG-release.json', step["run"])
+
+    def test_package_checks_producer_digests_first(self) -> None:
+        job = read_workflow("release.yml")["jobs"]["package"]
+        names = [item.get("name", "") for item in job["steps"]]
+        verify_index = names.index("Verify assets against the upload broker's digests")
+        self.assertLess(names.index("Download this tag's source assets"), verify_index)
+        self.assertLess(verify_index, names.index("Verify archive provenance"))
+        self.assertLess(
+            names.index("Verify archive provenance"),
+            names.index("Validate all active inputs and render metadata"),
+        )
+        verify = job["steps"][verify_index]
+        self.assertEqual(
+            "${{ needs.upload.outputs.asset_digests }}", verify["env"]["TRUSTED_DIGESTS"]
+        )
+        self.assertIn("release.py verify-digests", verify["run"])
+        self.assertEqual(
+            "${{ steps.packages.outputs.package_digests }}", job["outputs"]["package_digests"]
+        )
+        packages = next(
+            item
+            for item in job["steps"]
+            if item.get("name") == "Upload packages and rendered metadata"
+        )
+        self.assertEqual("packages", packages["id"])
+        self.assertLess(
+            packages["run"].index('echo "package_digests='),
+            packages["run"].index('gh release upload'),
+        )
+
+    def test_verify_manifest_binds_producer_digests(self) -> None:
+        job = read_workflow("release.yml")["jobs"]["verify-manifest"]
+        step = next(
+            item for item in job["steps"] if item.get("name") == "Build the release manifest"
+        )
+        self.assertEqual(
+            "${{ needs.upload.outputs.asset_digests }}", step["env"]["UPLOAD_DIGESTS"]
+        )
+        self.assertEqual(
+            "${{ needs.package.outputs.package_digests }}", step["env"]["PACKAGE_DIGESTS"]
+        )
+        self.assertEqual(2, step["run"].count("--trusted-digests"))
+        self.assertIn('"$RUNNER_TEMP/manifest-input/', step["run"])
+        self.assertNotIn("$VERIFY_ROOT/assets/manifest-input", step["run"])
+
+    def test_trusted_digest_step_rehearsal(self) -> None:
+        if shutil.which("bash") is None:
+            self.skipTest("bash is required for the trusted digest rehearsal")
+        job = read_workflow("release.yml")["jobs"]["package"]
+        step = next(
+            candidate
+            for candidate in job["steps"]
+            if candidate.get("name") == "Verify assets against the upload broker's digests"
+        )
+        script = step["run"]
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            package_root = root / "package"
+            assets = package_root / "assets"
+            assets.mkdir(parents=True)
+            with (ROOT / "packaging" / "release.json").open(encoding="utf-8") as handle:
+                manifest = json.load(handle)
+            with (ROOT / "Cargo.toml").open("rb") as handle:
+                version = tomllib.load(handle)["workspace"]["package"]["version"]
+            tag = f"v{version}"
+            names: list[str] = []
+            archive = manifest["archive"]
+            for target, config in manifest["targets"].items():
+                if config["enabled"]:
+                    stem = archive["stem"].format(tag=tag, target=target)
+                    extension = archive["formats"][config["platform"]]
+                    names.extend((f"{stem}.{extension}", f"{stem}{archive['checksum_suffix']}"))
+            completions = f"thegn-{tag}-completions.tar.gz"
+            names.extend((completions, f"{completions}.sha256"))
+            trusted: dict[str, str] = {}
+            for name in names:
+                content = f"fixture:{name}".encode()
+                (assets / name).write_bytes(content)
+                trusted[name] = hashlib.sha256(content).hexdigest()
+
+            def run_case(digests: dict[str, str] | None) -> subprocess.CompletedProcess[str]:
+                env = os.environ.copy()
+                env.update(
+                    {
+                        "PACKAGE_ROOT": str(package_root),
+                        "TAG": tag,
+                        "TRUSTED_DIGESTS": "" if digests is None else json.dumps(digests),
+                    }
+                )
+                return subprocess.run(
+                    ["bash", "-c", script],
+                    cwd=ROOT,
+                    env=env,
+                    check=False,
+                    capture_output=True,
+                    text=True,
+                )
+
+            self.assertEqual(0, run_case(trusted).returncode)
+            wrong = dict(trusted)
+            wrong[names[0]] = "0" * 64
+            self.assertNotEqual(0, run_case(wrong).returncode)
+            self.assertNotEqual(0, run_case(None).returncode)
 
 
 if __name__ == "__main__":

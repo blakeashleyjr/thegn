@@ -253,6 +253,8 @@ jobs:
       contents: write
       id-token: write
       attestations: write
+    outputs:
+      asset_digests: ${{ steps.record.outputs.asset_digests }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
@@ -338,6 +340,7 @@ jobs:
           assets=("$release"/thegn-"$TAG"-*.tar.gz "$release"/thegn-"$TAG"-*.sha256)
           gh release upload "$TAG" "${assets[@]}" --clobber
       - name: Write and publish release record
+        id: record
         env:
           TAG: ${{ needs.admit.outputs.tag }}
           TAG_OBJECT: ${{ needs.admit.outputs.tag_object }}
@@ -368,6 +371,22 @@ jobs:
               workflow_sha: $workflow_sha, run_id: $run_id,
               assets: ($assets | sort_by(.name))}' \
             > "$release/thegn-$TAG-release.json"
+          : > "$RUNNER_TEMP/trusted-asset-digests.jsonl"
+          for asset in "$release"/thegn-"$TAG"-*.tar.gz "$release"/thegn-"$TAG"-*.sha256 \
+            "$release/thegn-$TAG-release.json"; do
+            [ -f "$asset" ] || continue
+            name="${asset##*/}"
+            digest="$(sha256sum "$asset" | awk '{print $1}')"
+            jq -cn --arg name "$name" --arg sha256 "$digest" \
+              '{name: $name, sha256: $sha256}' >> "$RUNNER_TEMP/trusted-asset-digests.jsonl"
+          done
+          asset_digests="$(jq -cs 'map({(.name): .sha256}) | add' \
+            "$RUNNER_TEMP/trusted-asset-digests.jsonl")"
+          [ -n "$asset_digests" ] && [ "$asset_digests" != "null" ] || {
+            echo "::error::could not compute trusted release asset digests"
+            exit 1
+          }
+          echo "asset_digests=$asset_digests" >> "$GITHUB_OUTPUT"
           gh release upload "$TAG" "$release/thegn-$TAG-release.json" --clobber
   # Read-only completion build ships ONCE, as a single arch-independent artifact, rather than
   # riding inside each per-target archive. Three reasons:
@@ -460,6 +479,8 @@ jobs:
     permissions:
       contents: write
       attestations: read
+    outputs:
+      package_digests: ${{ steps.packages.outputs.package_digests }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
@@ -496,6 +517,20 @@ jobs:
           gh release download "$TAG" --dir "$PACKAGE_ROOT/assets" \
             --pattern "thegn-$TAG-*.tar.gz" \
             --pattern "thegn-$TAG-*.sha256"
+      - name: Verify assets against the upload broker's digests
+        env:
+          TRUSTED_DIGESTS: ${{ needs.upload.outputs.asset_digests }}
+        run: |
+          set -euo pipefail
+          [ -n "$TRUSTED_DIGESTS" ] || {
+            echo "::error::upload broker published no asset digests"
+            exit 1
+          }
+          printf '%s' "$TRUSTED_DIGESTS" > "$PACKAGE_ROOT/trusted-digests.json"
+          python3 packaging/release.py verify-digests \
+            --tag "$TAG" \
+            --assets-dir "$PACKAGE_ROOT/assets" \
+            --trusted-digests "$PACKAGE_ROOT/trusted-digests.json"
       - name: Verify archive provenance
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -568,6 +603,7 @@ jobs:
           cp "$PACKAGE_ROOT/rendered/nfpm/thegn-rpm.yaml" \
             "$PACKAGE_ROOT/release-assets/thegn-$TAG-rpm.nfpm.yaml"
       - name: Upload packages and rendered metadata
+        id: packages
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           ADMITTED_SHA: ${{ needs.admit.outputs.sha }}
@@ -584,6 +620,21 @@ jobs:
           }
           # This directory contains no source archive, so --clobber cannot
           # retract or overwrite any matrix output.
+          : > "$PACKAGE_ROOT/package-digests.jsonl"
+          for asset in "$PACKAGE_ROOT/release-assets/"*; do
+            [ -f "$asset" ] || continue
+            name="${asset##*/}"
+            digest="$(sha256sum "$asset" | awk '{print $1}')"
+            jq -cn --arg name "$name" --arg sha256 "$digest" \
+              '{name: $name, sha256: $sha256}' >> "$PACKAGE_ROOT/package-digests.jsonl"
+          done
+          package_digests="$(jq -cs 'map({(.name): .sha256}) | add' \
+            "$PACKAGE_ROOT/package-digests.jsonl")"
+          [ -n "$package_digests" ] && [ "$package_digests" != "null" ] || {
+            echo "::error::package job produced no trusted asset digests"
+            exit 1
+          }
+          echo "package_digests=$package_digests" >> "$GITHUB_OUTPUT"
           gh release upload "$TAG" "$PACKAGE_ROOT/release-assets/"* --clobber
       - name: Summarize package outputs
         env:
@@ -664,13 +715,28 @@ jobs:
         env:
           TAG: ${{ needs.admit.outputs.tag }}
           ADMITTED_SHA: ${{ needs.admit.outputs.sha }}
+          UPLOAD_DIGESTS: ${{ needs.upload.outputs.asset_digests }}
+          PACKAGE_DIGESTS: ${{ needs.package.outputs.package_digests }}
         run: |
           set -euo pipefail
+          [ -n "$UPLOAD_DIGESTS" ] || {
+            echo "::error::upload job published no asset digests"
+            exit 1
+          }
+          [ -n "$PACKAGE_DIGESTS" ] || {
+            echo "::error::package job published no asset digests"
+            exit 1
+          }
+          mkdir -p "$RUNNER_TEMP/manifest-input"
+          printf '%s' "$UPLOAD_DIGESTS" > "$RUNNER_TEMP/manifest-input/upload.json"
+          printf '%s' "$PACKAGE_DIGESTS" > "$RUNNER_TEMP/manifest-input/package.json"
           python3 packaging/release.py manifest \
             --tag "$TAG" \
             --assets-dir "$VERIFY_ROOT/assets" \
             --record "$VERIFY_ROOT/assets/thegn-$TAG-release.json" \
             --commit "$ADMITTED_SHA" \
+            --trusted-digests "$RUNNER_TEMP/manifest-input/upload.json" \
+            --trusted-digests "$RUNNER_TEMP/manifest-input/package.json" \
             --output "$RUNNER_TEMP/manifest/thegn-$TAG-manifest.json"
       - name: Verify tag still names the admitted commit
         env:
