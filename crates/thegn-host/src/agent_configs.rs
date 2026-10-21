@@ -601,11 +601,24 @@ fn account_upload_ready(
 }
 
 fn account_publish_script(dest_root: &str, stage_root: &str) -> String {
+    let state_dirs = AGENT_STATE_SKIP_DIRS
+        .iter()
+        .map(|name| thegn_core::util::sh_quote(name))
+        .collect::<Vec<_>>()
+        .join(" ");
     format!(
         "set -u; exec 2>&1; d={}; s={}; o=\"$d.thegn-old-$$\"; \
+         restore() {{ for n in {state_dirs}; do \
+             if [ -e \"$s/$n\" ] || [ -L \"$s/$n\" ]; then mv -- \"$s/$n\" \"$o/$n\" || :; fi; \
+         done; if [ -e \"$o\" ] || [ -L \"$o\" ]; then mv -- \"$o\" \"$d\" || :; fi; }}; \
          [ -d \"$s\" ] && [ ! -L \"$s\" ] || exit 41; \
          if [ -e \"$d\" ] || [ -L \"$d\" ]; then mv -- \"$d\" \"$o\" || exit 42; fi; \
-         if ! mv -- \"$s\" \"$d\"; then [ -e \"$o\" ] && mv -- \"$o\" \"$d\"; exit 43; fi; \
+         for n in {state_dirs}; do \
+             if [ -d \"$o/$n\" ] && [ ! -L \"$o/$n\" ] && [ ! -e \"$s/$n\" ]; then \
+                 mv -- \"$o/$n\" \"$s/$n\" || {{ restore; exit 45; }}; \
+             fi; \
+         done; \
+         if ! mv -- \"$s\" \"$d\"; then restore; exit 43; fi; \
          rm -rf -- \"$o\" 2>&1 || exit 44",
         thegn_core::util::sh_quote(dest_root),
         thegn_core::util::sh_quote(stage_root),
@@ -617,6 +630,23 @@ fn account_discard_script(stage_root: &str) -> String {
         "exec 2>&1; rm -rf -- {}",
         thegn_core::util::sh_quote(stage_root)
     )
+}
+
+fn account_cleanup_timeout(deadline: std::time::Instant) -> Option<std::time::Duration> {
+    let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+    (remaining > std::time::Duration::ZERO).then_some(AGENT_CONFIG_UPLOAD_TIMEOUT.min(remaining))
+}
+
+fn account_publish_timeout(deadline: std::time::Instant) -> std::time::Duration {
+    AGENT_CONFIG_UPLOAD_TIMEOUT.min(
+        deadline
+            .saturating_duration_since(std::time::Instant::now())
+            .max(std::time::Duration::from_secs(5)),
+    )
+}
+
+fn account_file_vanished(error: &std::io::Error) -> bool {
+    error.kind() == std::io::ErrorKind::NotFound
 }
 
 /// Deploy each declared coding-agent ACCOUNT's credential home into the sandbox
@@ -677,6 +707,7 @@ pub(crate) fn upload_agent_accounts(
                         };
                         files.push((rel, data, exec));
                     }
+                    Err(error) if account_file_vanished(&error) => {}
                     Err(error) => {
                         read_failure = Some(format!("read {}: {error}", abs.display()));
                         break;
@@ -698,8 +729,9 @@ pub(crate) fn upload_agent_accounts(
         return;
     }
     let deadline = std::time::Instant::now() + AGENT_CONFIG_STEP_BUDGET;
+    let mut written_by_upload = vec![0; uploads.len()];
     let result = block_on_provider(|| async {
-        for upload in &uploads {
+        for (upload_index, upload) in uploads.iter().enumerate() {
             let identity = upload.dest_root.rsplit('/').next().unwrap_or("unknown");
             let mut failure = upload.read_failure.clone();
             let mut written = 0;
@@ -724,7 +756,10 @@ pub(crate) fn upload_agent_accounts(
                     )
                     .await
                     {
-                        Ok(Ok(())) => written += 1,
+                        Ok(Ok(())) => {
+                            written += 1;
+                            written_by_upload[upload_index] = written;
+                        }
                         Ok(Err(error)) => {
                             failure = Some(format!("write {rel}: {error}"));
                             break;
@@ -742,14 +777,11 @@ pub(crate) fn upload_agent_accounts(
                 failure.is_some(),
                 std::time::Instant::now() < deadline,
             ) {
-                let now = std::time::Instant::now();
                 let script = account_publish_script(&upload.dest_root, &upload.stage_root);
                 let argv = vec!["/bin/sh".to_string(), "-c".to_string(), script];
-                match tokio::time::timeout(
-                    deadline.saturating_duration_since(now),
-                    provider.run_exec(id, &argv, None, &[]),
-                )
-                .await
+                let publish_timeout = account_publish_timeout(deadline);
+                match tokio::time::timeout(publish_timeout, provider.run_exec(id, &argv, None, &[]))
+                    .await
                 {
                     Ok(Ok((0, _))) => continue,
                     Ok(Ok((code, output))) => {
@@ -764,19 +796,27 @@ pub(crate) fn upload_agent_accounts(
                         failure = Some(format!("publish exited {code}: {tail}"));
                     }
                     Ok(Err(error)) => failure = Some(format!("publish failed: {error}")),
-                    Err(_) => failure = Some("publish timed out".to_string()),
+                    Err(_) => failure = Some("publish outcome unknown: timed out".to_string()),
                 }
             } else if failure.is_none() {
                 failure = Some("account upload incomplete or step budget exhausted".to_string());
             }
             let reason = failure.unwrap_or_else(|| "account upload failed".to_string());
+            let Some(cleanup_timeout) = account_cleanup_timeout(deadline) else {
+                tracing::warn!(target: "thegn::startup", provider = %upload.provider_id, account = %identity, reason = %reason, "account home publish failed or outcome unknown");
+                continue;
+            };
+            if written == 0 {
+                tracing::warn!(target: "thegn::startup", provider = %upload.provider_id, account = %identity, reason = %reason, "account home publish failed or outcome unknown");
+                continue;
+            }
             let discard_argv = vec![
                 "/bin/sh".to_string(),
                 "-c".to_string(),
                 account_discard_script(&upload.stage_root),
             ];
             let reason = match tokio::time::timeout(
-                AGENT_CONFIG_UPLOAD_TIMEOUT,
+                cleanup_timeout,
                 provider.run_exec(id, &discard_argv, None, &[]),
             )
             .await
@@ -788,12 +828,19 @@ pub(crate) fn upload_agent_accounts(
                 Ok(Err(error)) => format!("{reason}; stage cleanup failed: {error}"),
                 Err(_) => format!("{reason}; stage cleanup timed out"),
             };
-            tracing::warn!(target: "thegn::startup", provider = %upload.provider_id, account = %identity, reason = %reason, "account home not published; previous generation kept");
+            tracing::warn!(target: "thegn::startup", provider = %upload.provider_id, account = %identity, reason = %reason, "account home publish failed or outcome unknown");
         }
         Ok::<(), anyhow::Error>(())
     });
     if let Err(error) = result {
-        for upload in &uploads {
+        for (upload_index, upload) in uploads.iter().enumerate() {
+            if written_by_upload[upload_index] == 0 {
+                continue;
+            }
+            let Some(cleanup_timeout) = account_cleanup_timeout(deadline) else {
+                tracing::warn!(target: "thegn::startup", provider = %upload.provider_id, account = %upload.dest_root.rsplit('/').next().unwrap_or("unknown"), reason = %error, "account home publish failed or outcome unknown");
+                continue;
+            };
             let identity = upload.dest_root.rsplit('/').next().unwrap_or("unknown");
             let discard_argv = vec![
                 "/bin/sh".to_string(),
@@ -802,7 +849,7 @@ pub(crate) fn upload_agent_accounts(
             ];
             let reason = match block_on_provider(|| async {
                 match tokio::time::timeout(
-                    AGENT_CONFIG_UPLOAD_TIMEOUT,
+                    cleanup_timeout,
                     provider.run_exec(id, &discard_argv, None, &[]),
                 )
                 .await
@@ -815,7 +862,7 @@ pub(crate) fn upload_agent_accounts(
                 Ok((code, output)) => format!("{error}; stage cleanup exited {code}: {output}"),
                 Err(cleanup_error) => format!("{error}; stage cleanup failed: {cleanup_error}"),
             };
-            tracing::warn!(target: "thegn::startup", provider = %upload.provider_id, account = %identity, reason = %reason, "account home not published; previous generation kept");
+            tracing::warn!(target: "thegn::startup", provider = %upload.provider_id, account = %identity, reason = %reason, "account home publish failed or outcome unknown");
         }
     }
 }
@@ -1270,6 +1317,28 @@ mod tests {
     }
 
     #[test]
+    fn account_file_vanished_only_ignores_not_found() {
+        assert!(account_file_vanished(&std::io::Error::from(
+            std::io::ErrorKind::NotFound
+        )));
+        assert!(!account_file_vanished(&std::io::Error::from(
+            std::io::ErrorKind::PermissionDenied
+        )));
+    }
+
+    #[test]
+    fn account_cleanup_timeout_stays_within_remaining_budget() {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        let timeout = account_cleanup_timeout(deadline).unwrap();
+        assert!(timeout <= std::time::Duration::from_secs(2));
+        assert!(account_cleanup_timeout(std::time::Instant::now()).is_none());
+        assert!(account_publish_timeout(std::time::Instant::now()) <= AGENT_CONFIG_UPLOAD_TIMEOUT);
+        assert!(
+            account_publish_timeout(std::time::Instant::now()) >= std::time::Duration::from_secs(5)
+        );
+    }
+
+    #[test]
     #[expect(
         clippy::disallowed_methods,
         reason = "test drives the publish script in a real shell"
@@ -1284,6 +1353,8 @@ mod tests {
         std::fs::create_dir(&home).unwrap();
         std::fs::create_dir(&stage).unwrap();
         std::fs::write(home.join("old.txt"), b"old").unwrap();
+        std::fs::create_dir(home.join("projects")).unwrap();
+        std::fs::write(home.join("projects/t.jsonl"), b"transcript").unwrap();
         std::fs::write(stage.join("new.txt"), b"new").unwrap();
 
         let home = home.to_string_lossy().into_owned();
@@ -1295,6 +1366,10 @@ mod tests {
             .unwrap();
         assert!(status.success());
         assert!(std::path::Path::new(&home).join("new.txt").exists());
+        assert_eq!(
+            std::fs::read(std::path::Path::new(&home).join("projects/t.jsonl")).unwrap(),
+            b"transcript"
+        );
         assert!(!std::path::Path::new(&home).join("old.txt").exists());
         assert!(!std::path::Path::new(&stage).exists());
         assert!(std::fs::read_dir(root.path()).unwrap().all(|entry| {
@@ -1304,6 +1379,41 @@ mod tests {
                 .to_string_lossy()
                 .starts_with("home.thegn-old-")
         }));
+
+        let second_stage = root.path().join(".home.thegn-stage-second");
+        std::fs::create_dir(&second_stage).unwrap();
+        std::fs::write(second_stage.join("second.txt"), b"second").unwrap();
+        let second_stage = second_stage.to_string_lossy().into_owned();
+        let second_script = account_publish_script(&home, &second_stage);
+        let second_status = std::process::Command::new("/bin/sh")
+            .args(["-c", &second_script])
+            .status()
+            .unwrap();
+        assert!(second_status.success());
+        assert!(std::path::Path::new(&home).join("second.txt").exists());
+        assert_eq!(
+            std::fs::read(std::path::Path::new(&home).join("projects/t.jsonl")).unwrap(),
+            b"transcript"
+        );
+
+        let failed_stage = root.path().join(".home.thegn-stage-failed");
+        std::fs::create_dir(&failed_stage).unwrap();
+        std::fs::write(failed_stage.join("failed.txt"), b"failed").unwrap();
+        let failed_stage = failed_stage.to_string_lossy().into_owned();
+        let failed_script = account_publish_script(&home, &failed_stage);
+        let fail_promotion = format!(
+            "mv() {{ if [ \"$1\" = \"$s\" ]; then return 1; fi; command mv \"$@\"; }}; {failed_script}"
+        );
+        let failed_status = std::process::Command::new("/bin/sh")
+            .args(["-c", &fail_promotion])
+            .status()
+            .unwrap();
+        assert!(!failed_status.success());
+        assert!(std::path::Path::new(&home).join("second.txt").exists());
+        assert_eq!(
+            std::fs::read(std::path::Path::new(&home).join("projects/t.jsonl")).unwrap(),
+            b"transcript"
+        );
 
         let missing_stage = root
             .path()
