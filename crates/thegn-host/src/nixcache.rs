@@ -5,16 +5,15 @@
 //! reaches it over the per-worktree reverse tunnel (a sandbox loopback port →
 //! this server) and adds it as a nix substituter, so an in-sprite `nix develop`
 //! *substitutes* prebuilt store paths from the host instead of building from
-//! source. This generalizes the one-shot, per-devShell `file://` push
-//! (the removed host-side devShell transfer) into a substituter covering the whole host
-//! store.
+//! source. It generalizes the one-shot, per-devShell `file://` push (the removed
+//! host-side devShell transfer) into a substituter for deliberately signed host
+//! store closures.
 //!
-//! Trust: paths are served UNSIGNED. The sandbox keeps Nix signature verification
-//! enabled (see `envplan::nix_install_script`), so it ignores this cache until an
-//! authenticated signing key and scoped closure are available. A narinfo's
-//! `NarHash` can detect transfer corruption, but does not authenticate the unsigned
-//! narinfo that supplied that hash. The loopback tunnel limits reachability; it is
-//! not an authenticity boundary.
+//! Trust: only store paths carrying this installation's exact signing-key name
+//! are served. Narinfos include the matching `Sig:` line copied from the host
+//! store, and sandboxes trust the installation public key while keeping Nix
+//! signature verification enabled. Unsigned host objects are not reachable by
+//! hash. The key is loaded lazily on the first cache request.
 //!
 //! Everything is async (`tokio::process` + streamed bodies) so a multi-GB NAR
 //! never blocks the event loop; concurrent dumps are bounded by a semaphore.
@@ -28,12 +27,13 @@ use std::task::{Context, Poll};
 use axum::Router;
 use axum::body::{Body, Bytes};
 use axum::extract::Path as AxumPath;
+use axum::extract::State;
 use axum::http::{StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use futures::Stream;
 use tokio::process::{Child, Command};
-use tokio::sync::Semaphore;
+use tokio::sync::{OnceCell, Semaphore};
 use tokio_util::io::ReaderStream;
 
 const STORE_DIR: &str = "/nix/store";
@@ -45,6 +45,35 @@ pub const SANDBOX_PORT: u16 = 8484;
 /// Bound concurrent `nix-store --dump` subprocesses so a burst of substitutions
 /// can't fork-bomb the host. Each held permit rides its NAR stream's lifetime.
 static NAR_SEM: Semaphore = Semaphore::const_new(8);
+
+#[derive(Default)]
+struct CacheTrust {
+    install_key_name: OnceCell<Option<String>>,
+}
+
+impl CacheTrust {
+    async fn install_key_name(&self) -> Option<String> {
+        self.install_key_name
+            .get_or_init(|| async {
+                match tokio::task::spawn_blocking(crate::nix_signing::ensure_install_key).await {
+                    Ok(Ok(key)) => crate::nix_signing::install_key_name(&key).or_else(|| {
+                        tracing::warn!(target: "thegn::nixcache", "installation signing key has no valid key name; host cache is closed");
+                        None
+                    }),
+                    Ok(Err(error)) => {
+                        tracing::warn!(target: "thegn::nixcache", %error, "installation signing key unavailable; host cache is closed");
+                        None
+                    }
+                    Err(error) => {
+                        tracing::warn!(target: "thegn::nixcache", %error, "installation signing key worker failed; host cache is closed");
+                        None
+                    }
+                }
+            })
+            .await
+            .clone()
+    }
+}
 
 /// A running cache server. Holding it keeps the background task alive; the bound
 /// `port` is wired into the per-sprite reverse tunnel as the host target.
@@ -73,20 +102,23 @@ pub async fn serve(addr: SocketAddr) -> anyhow::Result<NixCacheHandle> {
         );
     }
     let task = tokio::spawn(async move {
-        if let Err(e) = axum::serve(listener, router()).await {
+        if let Err(e) =
+            axum::serve(listener, router(std::sync::Arc::new(CacheTrust::default()))).await
+        {
             tracing::warn!(target: "thegn::nixcache", error = %e, "nix cache server exited");
         }
     });
-    tracing::info!(target: "thegn::nixcache", port, "embedded host nix cache serving {STORE_DIR}");
+    tracing::info!(target: "thegn::nixcache", port, "embedded host nix cache serving signed paths from {STORE_DIR}");
     Ok(NixCacheHandle { port, _task: task })
 }
 
-fn router() -> Router {
+fn router(trust: std::sync::Arc<CacheTrust>) -> Router {
     // One root handler dispatches `nix-cache-info` + `<hash>.narinfo` (avoids any
     // static-vs-param route conflict); `/nar/{name}` is a deeper path, no overlap.
     Router::new()
         .route("/{file}", get(root_file))
         .route("/nar/{name}", get(nar))
+        .with_state(trust)
 }
 
 /// Advertise the store + a priority BELOW cache.nixos.org (40) so nix prefers the
@@ -127,7 +159,10 @@ fn resolve_hash(hash: &str) -> Option<PathBuf> {
 }
 
 /// Root dispatch: `GET /nix-cache-info` or `GET /{hash}.narinfo`.
-async fn root_file(AxumPath(file): AxumPath<String>) -> Response {
+async fn root_file(
+    State(trust): State<std::sync::Arc<CacheTrust>>,
+    AxumPath(file): AxumPath<String>,
+) -> Response {
     if file == "nix-cache-info" {
         return nix_cache_info();
     }
@@ -137,7 +172,10 @@ async fn root_file(AxumPath(file): AxumPath<String>) -> Response {
     let Some(path) = resolve_hash(hash) else {
         return StatusCode::NOT_FOUND.into_response();
     };
-    match narinfo_text(hash, &path).await {
+    let Some(key_name) = trust.install_key_name().await else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    match narinfo_text(hash, &path, &key_name).await {
         Ok(text) => ([(header::CONTENT_TYPE, "text/x-nix-narinfo")], text).into_response(),
         Err(e) => {
             tracing::debug!(target: "thegn::nixcache", %hash, error = %e, "narinfo failed");
@@ -146,11 +184,13 @@ async fn root_file(AxumPath(file): AxumPath<String>) -> Response {
     }
 }
 
-/// Build the narinfo text from `nix path-info --json`. References are emitted as
-/// basenames (the narinfo format), the NAR is served uncompressed, and the
-/// `NarHash` lets the client detect content corruption; it does not authenticate
-/// this unsigned narinfo or the source of its claimed hash.
-async fn narinfo_text(hash: &str, path: &std::path::Path) -> anyhow::Result<String> {
+/// Build a signed narinfo from `nix path-info --json`. Only signatures whose
+/// key name exactly matches the installation key are emitted.
+async fn narinfo_text(
+    hash: &str,
+    path: &std::path::Path,
+    key_name: &str,
+) -> anyhow::Result<String> {
     let out = Command::new("nix")
         .args(["--extra-experimental-features", "nix-command"])
         .arg("path-info")
@@ -160,23 +200,64 @@ async fn narinfo_text(hash: &str, path: &std::path::Path) -> anyhow::Result<Stri
         .await?;
     anyhow::ensure!(out.status.success(), "nix path-info exited nonzero");
     let v: serde_json::Value = serde_json::from_slice(&out.stdout)?;
+    narinfo_for(path, hash, &v, key_name).map_err(anyhow::Error::msg)
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum NarinfoRefusal {
+    NotSigned,
+    Malformed(&'static str),
+}
+
+impl std::fmt::Display for NarinfoRefusal {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NotSigned => {
+                formatter.write_str("path has no signature from the installation key")
+            }
+            Self::Malformed(field) => write!(formatter, "path-info record has no valid {field}"),
+        }
+    }
+}
+
+fn narinfo_for(
+    path: &std::path::Path,
+    hash: &str,
+    info: &serde_json::Value,
+    key_name: &str,
+) -> Result<String, NarinfoRefusal> {
     // Newer nix returns an object keyed by path; older returns a single-element
     // array. Take the one record either way.
-    let rec = match &v {
+    let rec = match info {
         serde_json::Value::Object(m) => m.values().next(),
         serde_json::Value::Array(a) => a.first(),
         _ => None,
     }
-    .ok_or_else(|| anyhow::anyhow!("empty path-info"))?;
+    .ok_or(NarinfoRefusal::Malformed("record"))?;
 
     let nar_hash = rec
         .get("narHash")
         .and_then(|x| x.as_str())
-        .ok_or_else(|| anyhow::anyhow!("no narHash"))?;
+        .ok_or(NarinfoRefusal::Malformed("narHash"))?;
     let nar_size = rec
         .get("narSize")
         .and_then(serde_json::Value::as_u64)
-        .ok_or_else(|| anyhow::anyhow!("no narSize"))?;
+        .ok_or(NarinfoRefusal::Malformed("narSize"))?;
+    let signatures: Vec<&str> = rec
+        .get("signatures")
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(serde_json::Value::as_str)
+        .filter(|signature| {
+            signature
+                .split_once(':')
+                .is_some_and(|(name, _)| name == key_name)
+        })
+        .collect();
+    if signatures.is_empty() {
+        return Err(NarinfoRefusal::NotSigned);
+    }
     let basename = |p: &str| p.rsplit('/').next().unwrap_or(p).to_string();
     let refs: Vec<String> = rec
         .get("references")
@@ -198,16 +279,29 @@ async fn narinfo_text(hash: &str, path: &std::path::Path) -> anyhow::Result<Stri
     {
         s.push_str(&format!("Deriver: {}\n", basename(d)));
     }
+    for signature in signatures {
+        s.push_str(&format!("Sig: {signature}\n"));
+    }
     Ok(s)
 }
 
-/// `GET /nar/{hash}.nar` — stream the NAR for a host store path via
-/// `nix-store --dump`, with constant memory (the tunnel applies backpressure).
-async fn nar(AxumPath(name): AxumPath<String>) -> Response {
+/// `GET /nar/{hash}.nar` — stream an admitted NAR via `nix-store --dump`, with
+/// constant memory (the tunnel applies backpressure).
+async fn nar(
+    State(trust): State<std::sync::Arc<CacheTrust>>,
+    AxumPath(name): AxumPath<String>,
+) -> Response {
     let hash = name.strip_suffix(".nar").unwrap_or(&name);
     let Some(path) = resolve_hash(hash) else {
         return StatusCode::NOT_FOUND.into_response();
     };
+    let Some(key_name) = trust.install_key_name().await else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    if let Err(error) = narinfo_text(hash, &path, &key_name).await {
+        tracing::debug!(target: "thegn::nixcache", %hash, %error, "NAR refused by cache admission");
+        return StatusCode::NOT_FOUND.into_response();
+    }
     // Bound concurrent dumps; the permit lives as long as the stream.
     let Ok(permit) = NAR_SEM.acquire().await else {
         return StatusCode::INTERNAL_SERVER_ERROR.into_response();
@@ -262,6 +356,102 @@ impl Stream for NarStream {
 mod tests {
     use super::*;
 
+    const INSTALL_KEY_NAME: &str = "thegn-0123456789abcdef-1";
+
+    fn signed_record() -> serde_json::Value {
+        serde_json::json!({
+            "narHash": "sha256-raw-hash-from-fixture",
+            "narSize": 42,
+            "references": ["/nix/store/11111111111111111111111111111111-reference"],
+            "signatures": [
+                "cache.nixos.org-1:AAAA",
+                "thegn-0123456789abcdef-1:BBBB"
+            ]
+        })
+    }
+
+    fn narinfo(info: serde_json::Value) -> Result<String, NarinfoRefusal> {
+        narinfo_for(
+            std::path::Path::new("/nix/store/0123456789abcdef0123456789abcdef-package"),
+            "0123456789abcdef0123456789abcdef",
+            &info,
+            INSTALL_KEY_NAME,
+        )
+    }
+
+    #[test]
+    fn narinfo_carries_only_the_install_key_signature() {
+        let info = serde_json::json!({
+            "/nix/store/0123456789abcdef0123456789abcdef-package": signed_record()
+        });
+        let text = narinfo(info).unwrap();
+        for line in [
+            "StorePath: /nix/store/0123456789abcdef0123456789abcdef-package\n",
+            "NarHash: sha256-raw-hash-from-fixture\n",
+            "NarSize: 42\n",
+            "References: 11111111111111111111111111111111-reference\n",
+            "Sig: thegn-0123456789abcdef-1:BBBB\n",
+        ] {
+            assert!(text.contains(line), "missing {line:?} in {text}");
+        }
+        assert!(
+            !text.contains("cache.nixos.org-1"),
+            "foreign signature leaked: {text}"
+        );
+    }
+
+    #[test]
+    fn narinfo_refuses_a_path_without_the_install_key_signature() {
+        for signatures in [
+            None,
+            Some(vec![]),
+            Some(vec!["cache.nixos.org-1:AAAA"]),
+            Some(vec!["thegn-0123456789abcdef-1x:CCCC"]),
+        ] {
+            let mut record = serde_json::json!({
+                "narHash": "sha256-raw-hash-from-fixture",
+                "narSize": 42
+            });
+            if let Some(signatures) = signatures {
+                record["signatures"] = serde_json::json!(signatures);
+            }
+            let info = serde_json::json!({
+                "/nix/store/0123456789abcdef0123456789abcdef-package": record
+            });
+            assert_eq!(narinfo(info), Err(NarinfoRefusal::NotSigned));
+        }
+    }
+
+    #[test]
+    fn narinfo_accepts_both_path_info_shapes() {
+        let object = serde_json::json!({
+            "/nix/store/0123456789abcdef0123456789abcdef-package": signed_record()
+        });
+        let array = serde_json::json!([signed_record()]);
+        assert_eq!(narinfo(object).unwrap(), narinfo(array).unwrap());
+    }
+
+    #[test]
+    fn narinfo_refuses_malformed_records() {
+        let missing_hash =
+            serde_json::json!({"narSize": 42, "signatures": ["thegn-0123456789abcdef-1:BBBB"]});
+        let missing_size = serde_json::json!({"narHash": "sha256-raw-hash-from-fixture", "signatures": ["thegn-0123456789abcdef-1:BBBB"]});
+        let missing_hash = serde_json::json!({
+            "/nix/store/0123456789abcdef0123456789abcdef-package": missing_hash
+        });
+        let missing_size = serde_json::json!({
+            "/nix/store/0123456789abcdef0123456789abcdef-package": missing_size
+        });
+        assert_eq!(
+            narinfo(missing_hash),
+            Err(NarinfoRefusal::Malformed("narHash"))
+        );
+        assert_eq!(
+            narinfo(missing_size),
+            Err(NarinfoRefusal::Malformed("narSize"))
+        );
+    }
+
     #[test]
     fn valid_hash_accepts_real_and_rejects_junk() {
         // 32-char nix base32 (real-looking).
@@ -278,13 +468,13 @@ mod tests {
         assert_eq!(nix_cache_info().status(), StatusCode::OK);
     }
 
-    async fn curl(url: &str) -> Vec<u8> {
-        Command::new("curl")
-            .args(["-fsS", url])
+    async fn curl_status(url: &str) -> String {
+        let output = Command::new("curl")
+            .args(["-sS", "-o", "/dev/null", "-w", "%{http_code}", url])
             .output()
             .await
-            .unwrap()
-            .stdout
+            .unwrap();
+        String::from_utf8(output.stdout).unwrap()
     }
 
     /// End-to-end against the REAL host /nix/store (needs nix + curl). Manual:
@@ -292,31 +482,57 @@ mod tests {
     #[tokio::test]
     #[ignore = "needs the host nix store + curl"]
     async fn serves_real_store_path() {
+        let _state = thegn_core::testenv::IsolatedState::new();
         let h = serve("127.0.0.1:0".parse().unwrap()).await.unwrap();
         let base = format!("http://127.0.0.1:{}", h.port);
 
-        let info = String::from_utf8(curl(&format!("{base}/nix-cache-info")).await).unwrap();
-        assert!(info.contains("StoreDir: /nix/store"), "cache-info: {info}");
+        assert_eq!(curl_status(&format!("{base}/nix-cache-info")).await, "200");
 
-        // Pick a real `<hash>-<name>` store entry.
-        let entry = std::fs::read_dir(STORE_DIR)
+        let key_name = crate::nix_signing::install_key_name(
+            &crate::nix_signing::ensure_install_key().unwrap(),
+        )
+        .unwrap();
+        // Pick a real store entry that is not signed by this installation key.
+        let entries = std::fs::read_dir(STORE_DIR)
             .unwrap()
             .filter_map(|e| e.ok())
             .filter_map(|e| e.file_name().into_string().ok())
-            .find(|n| {
+            .filter(|n| {
                 n.as_bytes().get(32) == Some(&b'-') && valid_hash(&n[..32]) && !n.ends_with(".drv")
             })
-            .expect("a store entry");
+            .collect::<Vec<_>>();
+        let mut unsigned_entry = None;
+        for candidate in entries {
+            let hash = &candidate[..32];
+            let path = PathBuf::from(format!("{STORE_DIR}/{candidate}"));
+            let output = Command::new("nix")
+                .args([
+                    "--extra-experimental-features",
+                    "nix-command",
+                    "path-info",
+                    "--json",
+                ])
+                .arg(&path)
+                .output()
+                .await
+                .unwrap();
+            if !output.status.success() {
+                continue;
+            }
+            let Ok(info) = serde_json::from_slice::<serde_json::Value>(&output.stdout) else {
+                continue;
+            };
+            if matches!(
+                narinfo_for(&path, hash, &info, &key_name),
+                Err(NarinfoRefusal::NotSigned)
+            ) {
+                unsigned_entry = Some(candidate);
+                break;
+            }
+        }
+        let entry = unsigned_entry.expect("an unsigned host store entry");
         let hash = &entry[..32];
-
-        let ni = String::from_utf8(curl(&format!("{base}/{hash}.narinfo")).await).unwrap();
-        assert!(ni.contains("NarHash:"), "narinfo missing NarHash: {ni}");
-        assert!(
-            ni.contains(&format!("StorePath: /nix/store/{entry}")),
-            "narinfo path: {ni}"
-        );
-
-        let nar = curl(&format!("{base}/nar/{hash}.nar")).await;
-        assert!(!nar.is_empty(), "nar body empty for {entry}");
+        assert_eq!(curl_status(&format!("{base}/{hash}.narinfo")).await, "404");
+        assert_eq!(curl_status(&format!("{base}/nar/{hash}.nar")).await, "404");
     }
 }

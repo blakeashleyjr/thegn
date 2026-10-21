@@ -250,16 +250,37 @@ impl std::error::Error for SigningFailed {}
 /// reinterpret a leading dash as an option.
 pub(crate) fn resolve_commit_oid(repo_root: &Path, reference: &str) -> Result<String> {
     let spec = format!("{reference}^{{commit}}");
-    let oid = util::git_out(
+    let cancel = std::sync::atomic::AtomicBool::new(false);
+    let outcome = thegn_core::git_run::git_run(
         repo_root,
         &["rev-parse", "--verify", "--end-of-options", &spec],
-    )
-    .with_context(|| format!("could not resolve commit {reference}"))?;
+        &thegn_core::git_run::GitPolicy::read(DRIVER_SUBPROCESS_TIMEOUT),
+        &cancel,
+    );
+    let oid = outcome
+        .into_text()
+        .map_err(|error| anyhow::anyhow!("could not resolve commit {reference}: {error}"))?
+        .trim()
+        .to_string();
     anyhow::ensure!(
         matches!(oid.len(), 40 | 64) && oid.bytes().all(|byte| byte.is_ascii_hexdigit()),
         "invalid commit identity resolved for {reference}"
     );
     Ok(oid)
+}
+
+fn is_ancestor(repo_root: &Path, ancestor: &str, descendant: &str) -> Result<bool> {
+    let cancel = std::sync::atomic::AtomicBool::new(false);
+    match thegn_core::git_run::git_run(
+        repo_root,
+        &["merge-base", "--is-ancestor", ancestor, descendant],
+        &thegn_core::git_run::GitPolicy::read(DRIVER_SUBPROCESS_TIMEOUT),
+        &cancel,
+    ) {
+        outcome if outcome.is_success() => Ok(true),
+        thegn_core::git_run::GitOutcome::Exit { code: Some(1), .. } => Ok(false),
+        outcome => anyhow::bail!("could not prove ancestry: {outcome}"),
+    }
 }
 
 /// Reconstruct the landed commit identity for a branch already integrated into
@@ -297,10 +318,7 @@ pub(crate) fn derive_landed_commit(
     let branch_tip = resolve_commit_oid(repo_root, branch_tip)?;
     let target_tip = resolve_commit_oid(repo_root, target_tip)?;
     anyhow::ensure!(
-        util::git_ok(
-            repo_root,
-            &["merge-base", "--is-ancestor", &branch_tip, &target_tip],
-        ),
+        is_ancestor(repo_root, &branch_tip, &target_tip)?,
         "branch tip is not an ancestor of target"
     );
     let range = format!("{branch_tip}..{target_tip}");
@@ -315,23 +333,32 @@ pub(crate) fn derive_landed_commit(
     // `--parents` prints `<commit> <parent>...` per line. The first line whose
     // parent list contains the tip — in ANY slot, so octopus merges are covered —
     // is the merge that integrated it.
-    let integrated_by = match util::git_out(repo_root, &args) {
-        Some(history) => history.lines().find_map(|line| {
-            let mut fields = line.split_whitespace();
-            let commit = fields.next()?;
-            fields
-                .any(|parent| parent == branch_tip)
-                .then(|| commit.to_owned())
-        }),
-        None if util::git_ok(repo_root, &args) => None,
-        None => anyhow::bail!("could not walk target ancestry"),
+    let cancel = std::sync::atomic::AtomicBool::new(false);
+    let outcome = thegn_core::git_run::git_run(
+        repo_root,
+        &args,
+        &thegn_core::git_run::GitPolicy::read(DRIVER_SUBPROCESS_TIMEOUT),
+        &cancel,
+    );
+    let integrated_by = match outcome {
+        thegn_core::git_run::GitOutcome::Ok(bytes) => {
+            let history = String::from_utf8(bytes).map_err(|_| {
+                anyhow::anyhow!("could not walk target ancestry: Git output is not valid UTF-8")
+            })?;
+            history.lines().find_map(|line| {
+                let mut fields = line.split_whitespace();
+                let commit = fields.next()?;
+                fields
+                    .any(|parent| parent == branch_tip)
+                    .then(|| commit.to_owned())
+            })
+        }
+        thegn_core::git_run::GitOutcome::EmptyOk => None,
+        outcome => anyhow::bail!("could not walk target ancestry: {outcome}"),
     };
     let candidate = resolve_commit_oid(repo_root, &integrated_by.unwrap_or(branch_tip))?;
     anyhow::ensure!(
-        util::git_ok(
-            repo_root,
-            &["merge-base", "--is-ancestor", &candidate, &target_tip],
-        ),
+        is_ancestor(repo_root, &candidate, &target_tip)?,
         "derived landed commit is not an ancestor of target"
     );
     Ok(candidate)

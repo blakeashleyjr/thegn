@@ -42,6 +42,14 @@ guessed: none of it applies, that repo's queues, CI autofix and autopilot are
 held off, `thegn land`/`integrate` refuse, and `config explain` and
 `thegn repo trust` print why.
 
+When two checkouts share a directory name, give each its own block with
+`repo_path = "<absolute path>"` (`~` is allowed). A bound block is chosen by
+path and never applies to another checkout; that checkout's trusted settings
+are refused with the bound path named. Two blocks may not bind the same path.
+Use the same path spelling that thegn shows for the repo.
+Workspace keybinds and the workspace editor setting are not applied from a
+bound block.
+
 The canonical root for repositories is `projects_dir`; the former
 `workspaces_dir` spelling remains accepted for three stable releases. The
 same compatibility window applies to `[workspace.<slug>]`,
@@ -450,9 +458,10 @@ when those files exist; missing optional layers are quiet. The generated
 config reference contains every documented key with its example value; those
 values are illustrative and are not promised to equal code defaults.
 
-The home-manager module (`programs.thegn.*`) renders a `config.toml` with
-the same keys; its options are checked against the schema in CI, so it
-cannot offer a value the binary rejects.
+The home-manager module (`programs.thegn.*`) renders only options you set; unset
+options fall through to the binary's defaults. Its option names and value types
+are checked against the schema in CI, so it cannot offer a value the binary
+rejects.
 
 `keys list` covers the keymap registry **and** the zone-local tables — the
 sidebar's row keys and each panel section's row-mode keys. Those are handled

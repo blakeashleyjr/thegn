@@ -29,15 +29,18 @@
 //!
 //! | verb | params |
 //! |---|---|
-//! | `manifest` | a [`PluginManifest`]; optional, at most once, before `events`; only way to request capabilities |
+//! | `manifest` | a [`PluginManifest`]; optional, at most once, before `events`; declares capabilities, checked against the account's list |
 //! | `events` | `{events: [...], deleted: [...], sync_token: "...", mode: "..."}`; repeatable |
 //! | `log` | `{level, message}` → tracing, never the UI |
 //!
 //! Protocol rules: a manifest is optional, but when present it must appear at
-//! most once and before any `events` message. Unknown verbs, denied
+//! most once and before any `events` message. Unknown verbs, unlisted
 //! capabilities, unsupported contributions and conflicting non-empty cursors
 //! fail the whole run, leaving the cache and cursor untouched. `log` messages
-//! are allowed anywhere. Non-JSON lines are reported as junk.
+//! are allowed anywhere. Non-JSON lines are reported as junk. The command is a
+//! trusted program: it runs with the user's filesystem, network and executable
+//! authority (environment limited to the plugin allowlist plus the account's
+//! `env`), and capability checks are declaration checks, not containment.
 //!
 //! ```sh
 //! #!/bin/sh

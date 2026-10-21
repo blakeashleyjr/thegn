@@ -32,9 +32,18 @@ use thegn_core::pipeline_report;
 use thegn_core::pipeline_run::{self, WaitTarget};
 use thegn_core::store::NotificationStore;
 use thegn_core::util::{git_ok, git_out_allow_empty};
+#[path = "dispatch_gate.rs"]
+mod gate;
 
 /// Bound the active roster rows examined by the CLI reaper.
 const CLI_REAP_ROW_LIMIT: usize = 4096;
+const ACTIVE_STATUSES: [AgentDispatchStatus; 5] = [
+    AgentDispatchStatus::Queued,
+    AgentDispatchStatus::Spawning,
+    AgentDispatchStatus::Running,
+    AgentDispatchStatus::WaitingHuman,
+    AgentDispatchStatus::PrOpen,
+];
 
 #[derive(clap::Subcommand, Clone)]
 pub enum Action {
@@ -208,6 +217,18 @@ pub enum Action {
         #[arg(long)]
         json: bool,
     },
+    /// Run the repo's merge-queue gate on a pipeline row's committed HEAD in
+    /// the isolated gate worktree and record a trusted, commit-bound
+    /// attestation (Lead-only). This explicit verb runs even when
+    /// `[merge_queue].gate_on = false`; that switch controls automatic fold
+    /// gating only.
+    Gate {
+        /// The dispatch row id (see `dispatch list`).
+        id: i64,
+        /// Emit the attestation as JSON.
+        #[arg(long)]
+        json: bool,
+    },
     /// Block until an active roster row's daemon session exits (the supervisor
     /// wake primitive). A session that already exited answers immediately from
     /// the daemon's tombstone; one reaped past the tombstone TTL reports as
@@ -306,6 +327,7 @@ fn worker_route(action: &Action, token: Option<&str>) -> WorkerRoute {
         Action::Put { .. } => WorkerRoute::Refused("put"),
         Action::SetStatus { .. } => WorkerRoute::Refused("set-status"),
         Action::Lease { .. } => WorkerRoute::Refused("lease"),
+        Action::Gate { .. } => WorkerRoute::Refused("gate"),
         Action::Reap { apply: true, .. } => WorkerRoute::Refused("reap --apply"),
         Action::List { .. }
         | Action::Reap { apply: false, .. }
@@ -525,6 +547,7 @@ pub fn run(cfg: &Config, action: Action) -> Result<()> {
             json,
         } => set_status(id, &status, force, why.as_deref(), json),
         Action::Verify { id, json } => verify(id, json),
+        Action::Gate { id, json } => gate::run(cfg, id, json),
         Action::Wait {
             row,
             any,
@@ -763,7 +786,7 @@ fn prepare_chunk_admission(
     let scope = pipeline_chunk::parse_frontmatter(&body)
         .map_err(|e| anyhow::anyhow!("chunk file {chunk_path} is not a valid scope ({e})"))?;
     let mut siblings = Vec::new();
-    for row in db.list_dispatches()? {
+    for row in db.admission_rows(issue_id, worktree)? {
         if row.issue_id != issue_id || row.worktree_path != worktree || !row.status.is_active() {
             continue;
         }
@@ -1147,13 +1170,38 @@ fn lease_renewal_outcome(
     }
 }
 
+fn bounded_rows(
+    db: &Db,
+    statuses: &[AgentDispatchStatus],
+    what: &str,
+) -> Result<(Vec<AgentDispatch>, bool)> {
+    let (mut rows, truncated) =
+        db.list_dispatches_with_status(statuses, Db::ROSTER_ACTIVE_LIMIT)?;
+    rows.sort_by(|a, b| {
+        b.dispatched_at_ms
+            .cmp(&a.dispatched_at_ms)
+            .then_with(|| b.id.cmp(&a.id))
+    });
+    if truncated {
+        thegn_core::msg::warn(&format!(
+            "{what} only the oldest {} active rows",
+            Db::ROSTER_ACTIVE_LIMIT
+        ));
+    }
+    Ok((rows, truncated))
+}
+
+fn list_rows(db: &Db, active: bool) -> Result<(Vec<AgentDispatch>, bool)> {
+    if !active {
+        return Ok((db.list_dispatches()?, false));
+    }
+    bounded_rows(db, &ACTIVE_STATUSES, "dispatch list --active shows")
+}
+
 fn list(active: bool, json: bool) -> Result<()> {
     let db = Db::open()?;
-    let mut rows = db.list_dispatches()?;
+    let (rows, _) = list_rows(&db, active)?;
     let overrides = db.dispatch_overrides()?;
-    if active {
-        rows.retain(|d| d.status.is_active());
-    }
     if json {
         // One value per row: stored fields, the admitted ownership snapshot,
         // and a display-time read used only to report source-file drift.
@@ -2301,12 +2349,10 @@ pub(crate) fn read_status(
                 anyhow::bail!("no dispatch with id {id}");
             }
         }
+    } else if all {
+        db.list_dispatches()?
     } else {
-        let mut rows = db.list_dispatches()?;
-        if !all {
-            rows.retain(|d| d.status.is_active());
-        }
-        rows
+        bounded_rows(db, &ACTIVE_STATUSES, "dispatch status shows")?.0
     };
 
     let row_mode = row.is_some();
@@ -2419,11 +2465,23 @@ fn yes_no(b: bool) -> &'static str {
 fn wait(cfg: &Config, row: Option<i64>, any: bool, timeout: Option<i64>, json: bool) -> Result<()> {
     validate_wait_timeout(row, any, timeout)?;
     let db = Db::open()?;
-    let rows = db.list_dispatches()?;
+    let rows = wait_rows(&db, row)?;
     let targets = pipeline_run::wait_candidates(&rows, row).map_err(|e| anyhow::anyhow!("{e}"))?;
     let targets = fence_wait_targets(&db, targets)?;
     let rt = tokio::runtime::Runtime::new()?;
     rt.block_on(wait_wake(cfg, targets, timeout, json))
+}
+
+fn wait_rows(db: &Db, row: Option<i64>) -> Result<Vec<AgentDispatch>> {
+    if let Some(id) = row {
+        return Ok(db.get_dispatch(id)?.into_iter().collect());
+    }
+    bounded_rows(
+        db,
+        &[AgentDispatchStatus::Spawning, AgentDispatchStatus::Running],
+        "dispatch wait --any covers",
+    )
+    .map(|(rows, _)| rows)
 }
 
 fn fence_wait_targets(db: &Db, targets: Vec<WaitTarget>) -> Result<Vec<FencedWaitTarget>> {
@@ -4686,6 +4744,10 @@ mod tests {
             ),
             (Action::Verify { id: 1, json: false }, WorkerRoute::Local),
             (
+                Action::Gate { id: 1, json: false },
+                WorkerRoute::Refused("gate"),
+            ),
+            (
                 Action::Wait {
                     row: Some(1),
                     any: false,
@@ -4858,5 +4920,162 @@ mod tests {
             !matches!(&plan[0].verdict, pipeline_reap::ReapVerdict::CloseDone),
             "a committed non-canonical artifact must not be reaped done"
         );
+    }
+
+    fn poison_terminal_report(path: &std::path::Path, id: i64) {
+        let conn = rusqlite::Connection::open(path).unwrap();
+        conn.execute(
+            "UPDATE agent_dispatches SET status='done', report=X'FF' WHERE id=?1",
+            rusqlite::params![id],
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn active_readers_status_skips_terminal_history() {
+        let (_dir, db) = db("active-readers-status");
+        let active = put(
+            &db,
+            NewDispatch::new("linear:THE-1107", "/wt/active", "coder"),
+        )
+        .unwrap();
+        let terminal = put(
+            &db,
+            NewDispatch::new("linear:THE-1107", "/wt/done", "coder"),
+        )
+        .unwrap();
+        poison_terminal_report(&db.file_path().unwrap(), terminal.id);
+
+        assert_eq!(active.status, AgentDispatchStatus::Queued);
+        assert!(read_status(&db, None, None, false, true).is_ok());
+    }
+
+    #[test]
+    fn active_readers_list_active_skips_terminal_history() {
+        let (_dir, db) = db("active-readers-list-active");
+        let older = put(
+            &db,
+            NewDispatch::new("linear:THE-1107", "/wt/older", "coder"),
+        )
+        .unwrap();
+        let newer = put(
+            &db,
+            NewDispatch::new("linear:THE-1107", "/wt/newer", "coder"),
+        )
+        .unwrap();
+        let terminal = put(
+            &db,
+            NewDispatch::new("linear:THE-1107", "/wt/done", "coder"),
+        )
+        .unwrap();
+        let path = db.file_path().unwrap();
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        conn.execute(
+            "UPDATE agent_dispatches SET dispatched_at_ms=20 WHERE id=?1",
+            rusqlite::params![older.id],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE agent_dispatches SET dispatched_at_ms=10 WHERE id=?1",
+            rusqlite::params![newer.id],
+        )
+        .unwrap();
+        drop(conn);
+        poison_terminal_report(&path, terminal.id);
+
+        let (rows, truncated) = list_rows(&db, true).unwrap();
+        assert_eq!(
+            rows.iter().map(|row| row.id).collect::<Vec<_>>(),
+            [older.id, newer.id]
+        );
+        assert!(!truncated);
+    }
+
+    #[test]
+    fn active_readers_wait_any_skips_terminal_history() {
+        let (_dir, db) = db("active-readers-wait-any");
+        let running = put(
+            &db,
+            NewDispatch {
+                session_id: Some("session-running"),
+                ..NewDispatch::new("linear:THE-1107", "/wt/running", "coder")
+            },
+        )
+        .unwrap();
+        db.update_dispatch_status(running.id, AgentDispatchStatus::Running)
+            .unwrap();
+        let terminal = put(
+            &db,
+            NewDispatch::new("linear:THE-1107", "/wt/done", "coder"),
+        )
+        .unwrap();
+        poison_terminal_report(&db.file_path().unwrap(), terminal.id);
+
+        let rows = wait_rows(&db, None).unwrap();
+        let targets = pipeline_run::wait_candidates(&rows, None).unwrap();
+        assert_eq!(targets.len(), 1);
+        assert_eq!(targets[0].id, running.id);
+    }
+
+    #[test]
+    fn active_readers_chunk_admission_skips_terminal_history() {
+        let (_dir, root) = git_repo("active-readers-chunk-admission");
+        commit_test_file(&root, "chunk.md", "---\nfiles: [src/shared.rs]\n---\n");
+        let wt = root.to_string_lossy().into_owned();
+        let (_db_dir, db) = db("active-readers-chunk-db");
+        let sibling = put(
+            &db,
+            NewDispatch {
+                chunk_path: Some("chunk.md"),
+                ..NewDispatch::new("linear:THE-1107", &wt, "coder")
+            },
+        )
+        .unwrap();
+        let terminal = put(
+            &db,
+            NewDispatch::new("linear:OTHER-ISSUE", "/wt/terminal", "coder"),
+        )
+        .unwrap();
+        poison_terminal_report(&db.file_path().unwrap(), terminal.id);
+
+        let prepared = prepare_chunk_admission(&db, &wt, "linear:THE-1107", "chunk.md").unwrap();
+        assert_eq!(prepared.siblings.len(), 1);
+        assert_eq!(prepared.siblings[0].row, sibling.id);
+    }
+
+    #[test]
+    fn active_readers_wait_row_reports_missing_and_inactive_rows() {
+        let (_dir, db) = db("active-readers-wait-row-controls");
+        let missing_rows = wait_rows(&db, Some(99)).unwrap();
+        assert!(matches!(
+            pipeline_run::wait_candidates(&missing_rows, Some(99)),
+            Err(pipeline_run::WaitSelectError::NoSuchRow(99))
+        ));
+
+        let done = put(
+            &db,
+            NewDispatch::new("linear:THE-1107", "/wt/done", "coder"),
+        )
+        .unwrap();
+        db.update_dispatch_status(done.id, AgentDispatchStatus::Done)
+            .unwrap();
+        let done_rows = wait_rows(&db, Some(done.id)).unwrap();
+        assert!(matches!(
+            pipeline_run::wait_candidates(&done_rows, Some(done.id)),
+            Err(pipeline_run::WaitSelectError::NotActive(id, _)) if id == done.id
+        ));
+    }
+
+    #[test]
+    fn active_readers_list_without_active_still_reads_history() {
+        let (_dir, db) = db("active-readers-list-history-control");
+        let terminal = put(
+            &db,
+            NewDispatch::new("linear:THE-1107", "/wt/done", "coder"),
+        )
+        .unwrap();
+        poison_terminal_report(&db.file_path().unwrap(), terminal.id);
+
+        assert!(list_rows(&db, false).is_err());
     }
 }

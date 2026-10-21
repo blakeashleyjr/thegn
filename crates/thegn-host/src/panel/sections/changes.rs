@@ -618,6 +618,13 @@ fn hunk_preview(c: &ChangeRow, ui: &PanelUi, deep: bool, cols: usize) -> Vec<Pan
         ])));
         return rows;
     }
+    if ui.hunks_unavailable.contains(&c.path) {
+        rows.push(PanelRow::plain(Line::segs(vec![
+            sp(1),
+            seg(g2(), "▾ diff unavailable (git failed)"),
+        ])));
+        return rows;
+    }
     match ui.hunks.get(&c.path) {
         Some(hunks) if !hunks.is_empty() => {
             for h in hunks.iter().take(hunk_cap) {
@@ -658,8 +665,8 @@ fn hunk_preview(c: &ChangeRow, ui: &PanelUi, deep: bool, cols: usize) -> Vec<Pan
             }
         }
         // A FETCHED-but-empty entry is a real answer, not a pending one: a
-        // binary file, a mode-only change (`chmod +x`), or a diff error all
-        // yield zero textual hunks. Rendering those as "loading…" spun forever.
+        // binary file or a mode-only change (`chmod +x`) yields zero textual
+        // hunks. Diff failures are rendered as unavailable in the row above.
         Some(_) => rows.push(PanelRow::plain(Line::segs(vec![
             sp(1),
             seg(g2(), "▾ no textual diff (binary or mode-only change)"),
@@ -1374,5 +1381,57 @@ mod tests {
         };
         let plain = flat(&content(&context(&plain, &ui)));
         assert!(!plain.contains("jj colocated:"));
+    }
+
+    #[test]
+    fn hunk_preview_failed_fetch_says_unavailable_not_binary() {
+        let mut ui = PanelUi::default();
+        ui.bank_hunks("src/a.rs".into(), Err(()));
+
+        let rendered = flat(&hunk_preview(&chg("src/a.rs", false, 1), &ui, false, 44));
+        assert!(
+            rendered.contains("diff unavailable"),
+            "rendered: {rendered}"
+        );
+        assert!(
+            !rendered.contains("binary or mode-only"),
+            "rendered: {rendered}"
+        );
+    }
+
+    #[test]
+    fn hunk_preview_banked_failure_counts_as_banked_until_cleared() {
+        let mut ui = PanelUi::default();
+        ui.bank_hunks("src/a.rs".into(), Err(()));
+        assert!(ui.hunks_banked("src/a.rs"));
+
+        ui.bank_hunks("src/a.rs".into(), Ok(Vec::new()));
+        assert!(ui.hunks_banked("src/a.rs"));
+        let rendered = flat(&hunk_preview(&chg("src/a.rs", false, 1), &ui, false, 44));
+        assert!(rendered.contains("no textual diff"), "rendered: {rendered}");
+
+        ui.clear_hunks();
+        assert!(!ui.hunks_banked("src/a.rs"));
+        let rendered = flat(&hunk_preview(&chg("src/a.rs", false, 1), &ui, false, 44));
+        assert!(rendered.contains("loading hunks"), "rendered: {rendered}");
+    }
+
+    #[test]
+    fn hunk_preview_success_after_failure_replaces_the_unavailable_mark() {
+        let mut ui = PanelUi::default();
+        ui.bank_hunks("src/a.rs".into(), Err(()));
+        ui.bank_hunks(
+            "src/a.rs".into(),
+            Ok(vec![thegn_svc::git::Hunk {
+                header: "@@ -1 +1 @@".into(),
+                func: "fn example".into(),
+                lines: vec![('+', "new".into())],
+                truncated: false,
+            }]),
+        );
+
+        let rendered = flat(&hunk_preview(&chg("src/a.rs", false, 1), &ui, false, 44));
+        assert!(rendered.contains("@@ -1 +1 @@"), "rendered: {rendered}");
+        assert!(!rendered.contains("unavailable"), "rendered: {rendered}");
     }
 }

@@ -102,6 +102,35 @@ pub struct CiRunList {
 pub struct CiRunDetail {
     pub run: CiRun,
     pub discarded_jobs: usize,
+    /// None when the provider returned every job; Some when a budget stopped
+    /// the listing early, so `run.jobs` is a prefix and must not be treated as
+    /// the whole run.
+    pub incomplete: Option<CiDetailIncomplete>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CiDetailIncomplete {
+    PageBudget { pages: usize },
+    RowBudget { rows: usize },
+}
+
+impl CiDetailIncomplete {
+    pub fn reason(&self) -> String {
+        match self {
+            Self::PageBudget { pages } => {
+                format!("job list stopped after {pages} pages (page budget)")
+            }
+            Self::RowBudget { rows } => {
+                format!("job list stopped after {rows} rows (row budget)")
+            }
+        }
+    }
+}
+
+impl CiRunDetail {
+    pub fn is_complete(&self) -> bool {
+        self.incomplete.is_none()
+    }
 }
 
 // === provider selection ====================================================
@@ -993,6 +1022,57 @@ pub fn validate_workflow_selector(value: &str) -> Result<&str, CiError> {
     }
 }
 
+/// Validate the inputs passed to a manually triggered workflow.
+/// Error messages identify keys only and never include input values.
+pub fn validate_trigger_inputs(inputs: &[(String, String)]) -> Result<(), CiError> {
+    let mut seen = std::collections::HashSet::with_capacity(inputs.len());
+    for (key, value) in inputs {
+        let mut chars = key.chars();
+        let valid_key = chars
+            .next()
+            .is_some_and(|first| first.is_ascii_alphabetic() || first == '_')
+            && chars.all(|ch| ch.is_ascii_alphanumeric() || ch == '_' || ch == '-');
+        let reason = if key.is_empty() {
+            Some("key is empty")
+        } else if key.len() > 256 {
+            Some("key exceeds 256 bytes")
+        } else if !valid_key {
+            Some("key has invalid syntax")
+        } else if !seen.insert(key.as_str()) {
+            Some("duplicate key")
+        } else if value.len() > MAX_PROVIDER_FIELD_BYTES {
+            Some("value exceeds provider field limit")
+        } else if value.chars().any(char::is_control) {
+            Some("value contains a control character")
+        } else {
+            None
+        };
+        if let Some(reason) = reason {
+            return Err(CiError::Other(format!(
+                "invalid workflow input {key:?}: {reason}"
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// Parse `KEY=VALUE` workflow inputs, rejecting malformed entries instead of
+/// silently dropping them. Values may contain further `=` characters.
+pub fn parse_trigger_inputs(raw: &[String]) -> Result<Vec<(String, String)>, CiError> {
+    let mut inputs = Vec::with_capacity(raw.len());
+    for entry in raw {
+        let Some((key, value)) = entry.split_once('=') else {
+            let excerpt: String = entry.chars().take(64).collect();
+            return Err(CiError::Other(format!(
+                "invalid workflow input {excerpt:?}: expected KEY=VALUE"
+            )));
+        };
+        inputs.push((key.to_string(), value.to_string()));
+    }
+    validate_trigger_inputs(&inputs)?;
+    Ok(inputs)
+}
+
 /// Validate a Git branch ref using the forbidden forms from git-check-ref-format.
 /// Query-reserved characters such as `&`, `=`, `%` and `#` remain valid data.
 pub fn validate_branch_ref(value: &str) -> Result<&str, CiError> {
@@ -1263,6 +1343,7 @@ impl CiProvider for GithubCi {
         Ok(CiRunDetail {
             run,
             discarded_jobs,
+            incomplete: None,
         })
     }
 
@@ -1290,6 +1371,7 @@ impl CiProvider for GithubCi {
         workflow: &str,
         inputs: &[(String, String)],
     ) -> Result<(), CiError> {
+        validate_trigger_inputs(inputs)?;
         let args = github_workflow_argv(workflow, inputs)?;
         let argv: Vec<&str> = args.iter().map(String::as_str).collect();
         run_cli(self.command(loc, &argv)?, &self.cancel).map(|_| ())
@@ -1455,13 +1537,12 @@ pub fn parse_gh_workflows(json: &str) -> Result<Vec<CiWorkflow>, String> {
                 id: json_id(v, "id")?,
                 name: nonempty(v, "name")?,
                 path: nonempty(v, "path")?,
-                // `gh workflow list` doesn't expose the trigger set; treat
-                // active workflows as dispatchable (trigger degrades with a
-                // readable error if a given one isn't). Input prompting +
-                // accurate dispatchability come in Phase B.
+                // `gh workflow list` exposes neither the trigger set nor the
+                // input schema. Only an active reported state is dispatchable;
+                // missing or unknown state is not evidence of a manual trigger.
                 dispatchable: nonempty(v, "state")
                     .map(|s| s.eq_ignore_ascii_case("active"))
-                    .unwrap_or(true),
+                    .unwrap_or(false),
                 inputs: Vec::new(),
             })
         })
@@ -1697,6 +1778,7 @@ impl CiProvider for GitlabCi {
         let mut discarded_jobs = 0usize;
         let mut bytes = 0usize;
         let mut complete = false;
+        let mut incomplete = None;
         for page in 1..=GITLAB_JOBS_MAX_PAGES {
             let endpoint = format!("{jobs_endpoint}?per_page={GITLAB_JOBS_PAGE_SIZE}&page={page}");
             let remaining = GITLAB_JOBS_MAX_BYTES.saturating_sub(bytes);
@@ -1711,38 +1793,44 @@ impl CiProvider for GitlabCi {
                     .map_err(CiError::Other)?;
             let page_length = page_rows.len();
             let (parsed, discarded) = parse_provider_row(&page_rows, gitlab_job_from_value);
-            for job in parsed {
+            for job in &parsed {
                 if !ids.insert(job.id.clone()) {
                     return Err(CiError::Other(format!(
                         "duplicate GitLab job id {:?}",
                         job.id
                     )));
                 }
-                jobs.push(job);
             }
-            discarded_jobs += discarded;
-            if jobs.len() + discarded_jobs > GITLAB_JOBS_MAX_ROWS {
-                return Err(CiError::Other(
-                    "GitLab jobs pagination row budget exhausted".into(),
-                ));
+            jobs.extend(parsed);
+            discarded_jobs = discarded_jobs.saturating_add(discarded);
+            if jobs.len().saturating_add(discarded_jobs) > GITLAB_JOBS_MAX_ROWS {
+                jobs.truncate(GITLAB_JOBS_MAX_ROWS.saturating_sub(discarded_jobs));
+                incomplete = Some(CiDetailIncomplete::RowBudget {
+                    rows: GITLAB_JOBS_MAX_ROWS,
+                });
+                break;
             }
             if page_length < GITLAB_JOBS_PAGE_SIZE {
                 complete = true;
                 break;
             }
         }
-        if !complete {
-            return Err(CiError::Other(
-                "GitLab jobs pagination page budget exhausted".into(),
-            ));
+        if !complete && incomplete.is_none() {
+            incomplete = Some(CiDetailIncomplete::PageBudget {
+                pages: GITLAB_JOBS_MAX_PAGES,
+            });
         }
         if discarded_jobs > 0 {
             tracing::warn!(target: "thegn::ci", discarded_rows = discarded_jobs, "discarded malformed GitLab job rows");
         }
         run.jobs = jobs;
+        if let Some(reason) = incomplete.map(|detail| detail.reason()) {
+            tracing::warn!(target: "thegn::ci", %reason, "GitLab job list incomplete");
+        }
         Ok(CiRunDetail {
             run,
             discarded_jobs,
+            incomplete,
         })
     }
 
@@ -1771,6 +1859,7 @@ impl CiProvider for GitlabCi {
         inputs: &[(String, String)],
     ) -> Result<(), CiError> {
         validate_workflow_selector(workflow)?;
+        validate_trigger_inputs(inputs)?;
         let remote = self.remote(loc)?;
         let proj = Self::project_seg(&remote);
         let mut args = vec!["api".to_string(), "-X".into(), "POST".into()];
@@ -2747,15 +2836,16 @@ mod tests {
 endpoint=
 for arg in "$@"; do endpoint=$arg; done
 case "$endpoint" in
-  *"/pipelines/123/jobs?"*|*"/pipelines/124/jobs?"*|*"/pipelines/125/jobs?"*|*"/pipelines/126/jobs?"*)
-    case "$endpoint" in *pipelines/123/jobs?*) run=123 ;; *pipelines/124/jobs?*) run=124 ;; *pipelines/125/jobs?*) run=125 ;; *) run=126 ;; esac
+  *"/pipelines/123/jobs?"*|*"/pipelines/124/jobs?"*|*"/pipelines/125/jobs?"*|*"/pipelines/126/jobs?"*|*"/pipelines/127/jobs?"*)
+    case "$endpoint" in *pipelines/123/jobs?*) run=123 ;; *pipelines/124/jobs?*) run=124 ;; *pipelines/125/jobs?*) run=125 ;; *pipelines/126/jobs?*) run=126 ;; *) run=127 ;; esac
     page=${endpoint##*page=}
     if [ "$run" = 126 ]; then printf '{}\n'; exit 0; fi
     if [ "$page" = 1 ] || [ "$run" = 125 ]; then
       printf '['
       i=1
       base=$(( (page - 1) * 100 ))
-      while [ "$i" -le 100 ]; do
+      if [ "$run" = 127 ]; then page_rows=5001; else page_rows=100; fi
+      while [ "$i" -le "$page_rows" ]; do
         [ "$i" -gt 1 ] && printf ','
         id=$((base + i))
         printf '{"id":%s,"name":"job-%s","status":"success"}' "$id" "$id"
@@ -2808,6 +2898,7 @@ esac
         let detail = client.run_detail(&loc, "123").unwrap();
         assert_eq!(detail.run.jobs.len(), 101);
         assert_eq!(detail.run.jobs[100].state, CiState::Fail);
+        assert!(detail.is_complete());
         assert!(
             client
                 .run_detail(&loc, "124")
@@ -2815,12 +2906,21 @@ esac
                 .to_string()
                 .contains("duplicate GitLab job id")
         );
-        assert!(
-            client
-                .run_detail(&loc, "125")
-                .unwrap_err()
-                .to_string()
-                .contains("page budget exhausted")
+        let partial = client.run_detail(&loc, "125").unwrap();
+        assert_eq!(partial.run.jobs.len(), 5_000);
+        assert_eq!(
+            partial.incomplete,
+            Some(CiDetailIncomplete::PageBudget { pages: 50 })
+        );
+        assert!(!partial.is_complete());
+        let row_limited = client.run_detail(&loc, "127").unwrap();
+        assert_eq!(
+            row_limited.run.jobs.len() + row_limited.discarded_jobs,
+            5_000
+        );
+        assert_eq!(
+            row_limited.incomplete,
+            Some(CiDetailIncomplete::RowBudget { rows: 5_000 })
         );
         assert!(
             client
@@ -2828,6 +2928,20 @@ esac
                 .unwrap_err()
                 .to_string()
                 .contains("invalid GitLab jobs response")
+        );
+    }
+
+    #[test]
+    fn gitlab_detail_incomplete_reason_names_the_budget() {
+        assert!(
+            CiDetailIncomplete::PageBudget { pages: 50 }
+                .reason()
+                .contains("50 pages (page budget)")
+        );
+        assert!(
+            CiDetailIncomplete::RowBudget { rows: 5_000 }
+                .reason()
+                .contains("5000 rows (row budget)")
         );
     }
 
@@ -3631,13 +3745,76 @@ esac
     fn parse_gh_workflow_list() {
         let json = r#"[
           {"id":1,"name":"CI","path":".github/workflows/ci.yml","state":"active"},
-          {"id":2,"name":"Stale","path":".github/workflows/stale.yml","state":"disabled_manually"}
+          {"id":2,"name":"Stale","path":".github/workflows/stale.yml","state":"disabled_manually"},
+          {"id":3,"name":"NoState","path":".github/workflows/x.yml"}
         ]"#;
         let wfs = parse_gh_workflows(json).unwrap();
-        assert_eq!(wfs.len(), 2);
+        assert_eq!(wfs.len(), 3);
         assert_eq!(wfs[0].id, "1");
         assert!(wfs[0].dispatchable);
         assert!(!wfs[1].dispatchable);
+        assert!(!wfs[2].dispatchable);
+    }
+
+    #[test]
+    fn trigger_inputs_parse_table() {
+        let valid = [
+            (vec!["k=v"], vec![("k", "v")]),
+            (vec!["k="], vec![("k", "")]),
+            (vec!["a=b=c"], vec![("a", "b=c")]),
+            (vec!["_x-1=v"], vec![("_x-1", "v")]),
+        ];
+        for (raw, expected) in valid {
+            let raw: Vec<String> = raw.into_iter().map(str::to_string).collect();
+            let expected: Vec<(String, String)> = expected
+                .into_iter()
+                .map(|(key, value)| (key.to_string(), value.to_string()))
+                .collect();
+            assert_eq!(parse_trigger_inputs(&raw).unwrap(), expected);
+        }
+
+        let oversized = "sensitive-value".repeat(MAX_PROVIDER_FIELD_BYTES / 15 + 2);
+        let invalid = [
+            vec!["novalue".to_string()],
+            vec!["=v".to_string()],
+            vec![format!("{}=v", "k".repeat(257))],
+            vec!["-k=v".to_string()],
+            vec!["1k=v".to_string()],
+            vec!["k k=v".to_string()],
+            vec!["k=1".to_string(), "k=2".to_string()],
+            vec!["k=a\u{1b}b".to_string()],
+            vec![format!("k={oversized}")],
+        ];
+        for raw in invalid {
+            let error = parse_trigger_inputs(&raw).unwrap_err().to_string();
+            assert!(error.contains("invalid workflow input"), "{error}");
+            assert!(!error.contains(&oversized));
+        }
+    }
+
+    #[test]
+    fn trigger_inputs_refused_before_any_provider_lookup() {
+        let temp = tempfile::tempdir().unwrap();
+        let loc = GitLoc::Local(temp.path().to_path_buf());
+        let invalid_control = [("k".to_string(), "a\u{7}".to_string())];
+        let gitlab_error = GitlabCi::default()
+            .trigger(&loc, "ci", &invalid_control)
+            .unwrap_err()
+            .to_string();
+        assert!(gitlab_error.contains("invalid workflow input"));
+
+        let duplicate = [
+            ("k".to_string(), "one".to_string()),
+            ("k".to_string(), "two".to_string()),
+        ];
+        let github_error = GithubCi {
+            remote: None,
+            cancel: Arc::new(AtomicBool::new(false)),
+        }
+        .trigger(&loc, "ci", &duplicate)
+        .unwrap_err()
+        .to_string();
+        assert!(github_error.contains("invalid workflow input"));
     }
 
     #[test]

@@ -7,13 +7,13 @@
 //! a repository must be decided in exactly one place, and an ambiguous choice
 //! must be refused rather than resolved by first match.
 //!
-//! Every production consumer goes through [`resolve`] (via
+//! Every production consumer goes through [`resolve`] or [`resolve_for_root`] (via
 //! [`crate::config::Config::workspace_overlay`] /
 //! [`crate::config::Config::workspace_overlay_for_key`]); nothing reads
 //! `Config::workspace` directly. Today the key is still the legacy lossy
-//! basename slug; the canonical binding to THE-516's `RepositoryId` (and the
-//! admitted-config revision from THE-505) replaces the key input here without
-//! touching the consumers. See THE-515.
+//! basename slug. An optional `repo_path` is the explicit path mapping asked
+//! for by THE-515; the canonical binding to THE-516's `RepositoryId` (and the
+//! admitted-config revision from THE-505) is still to come. See THE-515.
 //!
 //! What this module refuses now, independent of repository identity:
 //!
@@ -22,6 +22,7 @@
 //!   same block would govern different authorities depending on the path;
 //! * two or more table keys that normalize to the requested key (`foo` and
 //!   `Foo`) — the user's intent is ambiguous;
+//! * a block bound to another checkout, or multiple blocks bound to this one;
 //! * an empty key.
 //!
 //! A repository whose name has no slug (empty after normalization) selects no
@@ -55,6 +56,13 @@ pub enum OverlayRefusal {
         key: String,
         repositories: Vec<String>,
     },
+    /// A key-matched block is explicitly bound to another checkout.
+    BoundToOtherCheckout { key: String, repo_path: String },
+    /// Several blocks explicitly claim the same checkout path.
+    RepoPathCollision {
+        repo_path: String,
+        keys: Vec<String>,
+    },
 }
 
 impl fmt::Display for OverlayRefusal {
@@ -81,6 +89,21 @@ impl fmt::Display for OverlayRefusal {
                  `{key}`, and the block cannot tell them apart yet. Rename or delete the checkout \
                  the block is NOT for (it stops counting as soon as it is gone)",
                 repositories.join(" and ")
+            ),
+            Self::BoundToOtherCheckout { key, repo_path } => write!(
+                f,
+                "trusted [project.{key}] overlay refused: the block is bound to `{repo_path}` \
+                 (`repo_path`), which is not this checkout; add a block bound to this checkout, \
+                 or fix `repo_path` if it names this checkout by another spelling"
+            ),
+            Self::RepoPathCollision { repo_path, keys } => write!(
+                f,
+                "trusted workspace overlays refused: blocks {} are bound to `{repo_path}`; \
+                 keep only one block bound to this checkout",
+                keys.iter()
+                    .map(|key| format!("[project.{key}]"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
             ),
         }
     }
@@ -148,10 +171,55 @@ fn is_canonical(key: &str) -> bool {
     !key.is_empty() && crate::util::slugify(key) == key
 }
 
-/// Select the trusted overlay for `key` (already derived by the caller; a
-/// non-normalized key is normalized first). This is the only selection
-/// algorithm; see the module docs for what it refuses.
+/// Expand `~` and normalize an absolute repo path without filesystem access.
+/// Empty, relative, or parent-traversing paths are invalid.
+pub fn normalize_repo_path(raw: &str) -> Option<std::path::PathBuf> {
+    let expanded = crate::util::expand_tilde(raw.trim());
+    normalize_path(Path::new(&expanded))
+}
+
+fn normalize_path(path: &Path) -> Option<std::path::PathBuf> {
+    use std::path::Component;
+
+    if !path.is_absolute()
+        || path
+            .components()
+            .any(|component| component == Component::ParentDir)
+    {
+        return None;
+    }
+    let mut normalized = std::path::PathBuf::new();
+    for component in path.components() {
+        if component != Component::CurDir {
+            normalized.push(component.as_os_str());
+        }
+    }
+    Some(normalized)
+}
+
+/// Compare paths after the same purely lexical normalization used for bindings.
+pub fn lexical_same_path(bound: &Path, root: &Path) -> bool {
+    let Some(bound) = normalize_path(bound) else {
+        return false;
+    };
+    let Some(root) = normalize_path(root) else {
+        return false;
+    };
+    bound == root
+}
+
+/// Select by legacy key. Key-only consumers cannot prove a checkout, so bound
+/// blocks are intentionally invisible to them.
 pub fn resolve<'a>(table: &'a OverlayTable, key: Option<&str>) -> WorkspaceOverlay<'a> {
+    match resolve_by_key(table, key) {
+        WorkspaceOverlay::Selected { overlay, .. } if overlay.repo_path.is_some() => {
+            WorkspaceOverlay::Unconfigured
+        }
+        result => result,
+    }
+}
+
+fn resolve_by_key<'a>(table: &'a OverlayTable, key: Option<&str>) -> WorkspaceOverlay<'a> {
     if table.is_empty() {
         return WorkspaceOverlay::Unconfigured;
     }
@@ -164,6 +232,79 @@ pub fn resolve<'a>(table: &'a OverlayTable, key: Option<&str>) -> WorkspaceOverl
     match table.get_key_value(key.as_str()) {
         Some((key, overlay)) => WorkspaceOverlay::Selected { key, overlay },
         None => WorkspaceOverlay::Unconfigured,
+    }
+}
+
+/// Select a trusted overlay for a repository root using explicit path bindings
+/// first, then today's legacy key behavior.
+pub fn resolve_for_root<'a>(
+    table: &'a OverlayTable,
+    root: &Path,
+    same_checkout: impl Fn(&Path, &Path) -> bool,
+) -> WorkspaceOverlay<'a> {
+    if table.is_empty() {
+        return WorkspaceOverlay::Unconfigured;
+    }
+    let mut bound = Vec::new();
+    for (key, overlay) in table {
+        if let Some(raw) = overlay.repo_path.as_deref()
+            && let Some(path) = normalize_repo_path(raw)
+            && same_checkout(&path, root)
+        {
+            bound.push((key.as_str(), overlay));
+        }
+    }
+    match bound.as_slice() {
+        [one] => {
+            let (key, overlay) = *one;
+            if let Some(refusal) = refusal(table, key) {
+                WorkspaceOverlay::Refused(refusal)
+            } else {
+                WorkspaceOverlay::Selected { key, overlay }
+            }
+        }
+        [_, _, ..] => {
+            let mut keys: Vec<String> = bound.iter().map(|(key, _)| (*key).to_string()).collect();
+            keys.sort();
+            WorkspaceOverlay::Refused(OverlayRefusal::RepoPathCollision {
+                repo_path: root.display().to_string(),
+                keys,
+            })
+        }
+        [] => {
+            let key = legacy_key_for_root(root);
+            match resolve_by_key(table, key.as_deref()) {
+                WorkspaceOverlay::Selected { key, overlay } => {
+                    if let Some(repo_path) = overlay.repo_path.as_ref() {
+                        WorkspaceOverlay::Refused(OverlayRefusal::BoundToOtherCheckout {
+                            key: key.to_string(),
+                            repo_path: repo_path.clone(),
+                        })
+                    } else {
+                        WorkspaceOverlay::Selected { key, overlay }
+                    }
+                }
+                result => result,
+            }
+        }
+    }
+}
+
+/// Whether refusing this overlay also requires refusing credential-bearing
+/// agent launches.
+pub fn refusal_carries_credentials(table: &OverlayTable, refusal: &OverlayRefusal) -> bool {
+    match refusal {
+        OverlayRefusal::AliasCollision { key, .. }
+        | OverlayRefusal::NonCanonicalKey { canonical: key, .. }
+        | OverlayRefusal::AmbiguousRepositories { key, .. }
+        | OverlayRefusal::BoundToOtherCheckout { key, .. } => {
+            candidates_carry_credentials(table, key)
+        }
+        OverlayRefusal::RepoPathCollision { keys, .. } => keys.iter().any(|key| {
+            table
+                .get(key)
+                .is_some_and(|overlay| !overlay.accounts.is_empty() || overlay.env_bundle.is_some())
+        }),
     }
 }
 
@@ -243,6 +384,13 @@ pub fn validate(table: &OverlayTable) -> Vec<String> {
     let mut errors = Vec::new();
     let mut groups: BTreeMap<String, Vec<&str>> = BTreeMap::new();
     for key in table.keys() {
+        if let Some(raw) = table[key].repo_path.as_deref()
+            && normalize_repo_path(raw).is_none()
+        {
+            errors.push(format!(
+                "project.{key}.repo_path: must be an absolute path without `..` components"
+            ));
+        }
         if is_canonical(key) {
             groups.entry(key.clone()).or_default().push(key);
             continue;
@@ -261,6 +409,27 @@ pub fn validate(table: &OverlayTable) -> Vec<String> {
             errors.push(format!("project.{canonical}: {refusal}"));
         }
     }
+    let mut paths: BTreeMap<std::path::PathBuf, Vec<&str>> = BTreeMap::new();
+    for (key, overlay) in table {
+        if let Some(raw) = overlay.repo_path.as_deref()
+            && let Some(path) = normalize_repo_path(raw)
+        {
+            paths.entry(path).or_default().push(key);
+        }
+    }
+    for (path, mut keys) in paths {
+        if keys.len() > 1 {
+            keys.sort_unstable();
+            errors.push(format!(
+                "project.repo_path: `{}` is bound by keys {}; keep only one block for this path",
+                path.display(),
+                keys.iter()
+                    .map(|key| format!("`{key}`"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ));
+        }
+    }
     errors
 }
 
@@ -272,6 +441,22 @@ mod tests {
         keys.iter()
             .map(|key| (key.to_string(), WorkspaceConfig::default()))
             .collect()
+    }
+
+    #[test]
+    fn repo_path_defaults_to_none_and_parses_from_toml() {
+        assert!(WorkspaceConfig::default().repo_path.is_none());
+
+        for source in [
+            "[project.foo]\nrepo_path = \"/a/foo\"\n",
+            "[workspace.foo]\nrepo_path = \"/a/foo\"\n",
+        ] {
+            let cfg = toml::from_str::<crate::config::Config>(source).unwrap();
+            assert_eq!(cfg.workspace["foo"].repo_path.as_deref(), Some("/a/foo"));
+        }
+
+        let serialized = serde_json::to_value(WorkspaceConfig::default()).unwrap();
+        assert!(serialized.get("repo_path").is_none());
     }
 
     #[test]
@@ -433,5 +618,183 @@ mod tests {
         // Mixed names normalize their ASCII part only; that is the legacy key
         // and remains ambiguous across repositories until THE-516 binding.
         assert!(resolve(&t, Some("café")).overlay().is_some());
+    }
+
+    #[test]
+    fn repo_path_binding_selects_each_same_basename_checkout_its_own_block() {
+        let mut t = table(&["foo", "foo-oss"]);
+        t.get_mut("foo").unwrap().repo_path = Some("/a/foo".into());
+        t.get_mut("foo-oss").unwrap().repo_path = Some("/b/foo".into());
+        for (root, expected) in [("/a/foo", "foo"), ("/b/foo/", "foo-oss")] {
+            match resolve_for_root(&t, Path::new(root), lexical_same_path) {
+                WorkspaceOverlay::Selected { key, .. } => assert_eq!(key, expected),
+                other => panic!("expected {expected} selection, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn a_bound_block_is_refused_for_another_checkout_by_key() {
+        let mut t = table(&["foo"]);
+        t.get_mut("foo").unwrap().repo_path = Some("/a/foo".into());
+        let result = resolve_for_root(&t, Path::new("/c/foo"), lexical_same_path);
+        assert!(matches!(
+            &result,
+            WorkspaceOverlay::Refused(OverlayRefusal::BoundToOtherCheckout {
+                key,
+                repo_path
+            }) if key == "foo" && repo_path == "/a/foo"
+        ));
+        assert!(result.refusal().unwrap().to_string().contains("/a/foo"));
+    }
+
+    #[test]
+    fn two_blocks_bound_to_one_path_are_refused_and_invalid() {
+        let mut t = table(&["foo", "bar"]);
+        t.get_mut("foo").unwrap().repo_path = Some("/a/foo".into());
+        t.get_mut("bar").unwrap().repo_path = Some("/a/foo".into());
+        let result = resolve_for_root(&t, Path::new("/a/foo"), lexical_same_path);
+        assert!(matches!(
+            &result,
+            WorkspaceOverlay::Refused(OverlayRefusal::RepoPathCollision { keys, .. })
+                if keys.iter().map(String::as_str).eq(["bar", "foo"])
+        ));
+        assert!(result.refusal().unwrap().to_string().contains("/a/foo"));
+        let errors = validate(&t);
+        assert_eq!(errors.len(), 1, "{errors:#?}");
+        assert!(errors[0].contains("/a/foo"));
+        assert!(errors[0].contains("bar") && errors[0].contains("foo"));
+    }
+
+    #[test]
+    fn malformed_repo_paths_fail_validation_and_never_match() {
+        for raw in ["relative/foo", "", "/a/../foo"] {
+            let mut t = table(&["foo"]);
+            t.get_mut("foo").unwrap().repo_path = Some(raw.into());
+            let errors = validate(&t);
+            assert_eq!(errors.len(), 1, "{raw:?}: {errors:#?}");
+            assert!(errors[0].contains("project.foo.repo_path"));
+            assert!(matches!(
+                resolve_for_root(&t, Path::new("/a/foo"), lexical_same_path),
+                WorkspaceOverlay::Refused(OverlayRefusal::BoundToOtherCheckout { .. })
+            ));
+        }
+    }
+
+    #[test]
+    fn key_only_lookup_never_selects_a_bound_block() {
+        let mut t = table(&["foo"]);
+        t.get_mut("foo").unwrap().repo_path = Some("/a/foo".into());
+        assert!(resolve(&t, Some("foo")).is_unconfigured());
+    }
+
+    #[test]
+    fn tab_slug_binding_resolves_two_live_same_named_checkouts() {
+        use crate::store::WorkspaceStore;
+
+        fn checkout(dir: &Path, name: &str) -> String {
+            let path = dir.join(name);
+            std::fs::create_dir_all(path.join(".git")).unwrap();
+            path.to_string_lossy().into_owned()
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let db = crate::db::Db::open_memory().unwrap();
+        let a = checkout(dir.path(), "a/foo");
+        let b = checkout(dir.path(), "b/foo");
+        assert_eq!(db.slug_for_repo(&a, "foo").unwrap(), "foo");
+        assert_eq!(db.slug_for_repo(&b, "foo").unwrap(), "foo-2");
+
+        let mut cfg = crate::config::Config::default();
+        cfg.workspace.entry("foo".into()).or_default().repo_path = Some(a);
+        assert!(matches!(
+            cfg.workspace_overlay_for_tab_slug(&db, "foo"),
+            WorkspaceOverlay::Selected { key: "foo", .. }
+        ));
+        assert!(matches!(
+            cfg.workspace_overlay_for_tab_slug(&db, "foo-2"),
+            WorkspaceOverlay::Refused(OverlayRefusal::BoundToOtherCheckout { .. })
+        ));
+        cfg.workspace.entry("foo-b".into()).or_default().repo_path = Some(b);
+        assert!(matches!(
+            cfg.workspace_overlay_for_tab_slug(&db, "foo-2"),
+            WorkspaceOverlay::Selected { key: "foo-b", .. }
+        ));
+    }
+
+    #[test]
+    fn refusal_carries_credentials_covers_every_variant() {
+        let credentialed = |keys: &[&str]| {
+            let mut t = table(keys);
+            for key in keys {
+                t.get_mut(*key)
+                    .unwrap()
+                    .accounts
+                    .insert("codex".into(), "work".into());
+            }
+            t
+        };
+        let t = credentialed(&["foo", "FOO"]);
+        for refusal in [
+            OverlayRefusal::AliasCollision {
+                key: "foo".into(),
+                aliases: vec!["FOO".into()],
+            },
+            OverlayRefusal::NonCanonicalKey {
+                key: "FOO".into(),
+                canonical: "foo".into(),
+            },
+            OverlayRefusal::AmbiguousRepositories {
+                key: "foo".into(),
+                repositories: vec![],
+            },
+            OverlayRefusal::BoundToOtherCheckout {
+                key: "foo".into(),
+                repo_path: "/a/foo".into(),
+            },
+            OverlayRefusal::RepoPathCollision {
+                repo_path: "/a/foo".into(),
+                keys: vec!["foo".into()],
+            },
+        ] {
+            assert!(refusal_carries_credentials(&t, &refusal), "{refusal:?}");
+        }
+        let empty = table(&["foo", "FOO"]);
+        for refusal in [
+            OverlayRefusal::AliasCollision {
+                key: "foo".into(),
+                aliases: vec!["FOO".into()],
+            },
+            OverlayRefusal::NonCanonicalKey {
+                key: "FOO".into(),
+                canonical: "foo".into(),
+            },
+            OverlayRefusal::AmbiguousRepositories {
+                key: "foo".into(),
+                repositories: vec![],
+            },
+            OverlayRefusal::BoundToOtherCheckout {
+                key: "foo".into(),
+                repo_path: "/a/foo".into(),
+            },
+            OverlayRefusal::RepoPathCollision {
+                repo_path: "/a/foo".into(),
+                keys: vec!["foo".into()],
+            },
+        ] {
+            assert!(
+                !refusal_carries_credentials(&empty, &refusal),
+                "{refusal:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_unbound_block_still_selects_by_key_through_resolve_for_root() {
+        let t = table(&["foo"]);
+        assert!(matches!(
+            resolve_for_root(&t, Path::new("/x/foo"), lexical_same_path),
+            WorkspaceOverlay::Selected { key: "foo", .. }
+        ));
     }
 }
