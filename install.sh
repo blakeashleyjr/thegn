@@ -56,6 +56,8 @@ done
 bindir="${bindir:-$HOME/.local/bin}"
 : "${XDG_CONFIG_HOME:=$HOME/.config}"
 : "${XDG_DATA_HOME:=$HOME/.local/share}"
+[[ $XDG_CONFIG_HOME == /* ]] || XDG_CONFIG_HOME="$PWD/$XDG_CONFIG_HOME"
+[[ $XDG_DATA_HOME == /* ]] || XDG_DATA_HOME="$PWD/$XDG_DATA_HOME"
 
 if [[ $bindir != /* ]]; then
   echo "install.sh: bindir must be an absolute path: $bindir" >&2
@@ -72,6 +74,8 @@ icon_dir="$XDG_DATA_HOME/icons/hicolor/scalable/apps"
 icon_file="$icon_dir/thegn.svg"
 config_dir="$XDG_CONFIG_HOME/thegn"
 config_file="$config_dir/config.toml"
+manifest_dir="$XDG_DATA_HOME/thegn"
+manifest_file="$manifest_dir/install-manifest"
 
 # Launcher integration is per-platform, because the registry is:
 #
@@ -122,7 +126,51 @@ wrapper_execs_installed_binary() {
   [[ -f $tg_tui ]] && grep -Fqx -- "$expected_exec" "$tg_tui"
 }
 
+sha256() {
+  local output
+  if command -v sha256sum >/dev/null 2>&1; then
+    output="$(sha256sum "$1")"
+  elif command -v shasum >/dev/null 2>&1; then
+    output="$(shasum -a 256 "$1")"
+  else
+    echo "install.sh: sha256sum or shasum is required to write the install manifest" >&2
+    return 1
+  fi
+  printf '%s\n' "${output%% *}"
+}
+
 preflight() {
+  preflight_conflict=0
+  local dir
+  for dir in "$bindir" "$config_dir"; do
+    if [[ -L $dir ]]; then
+      report_conflict "$dir" "is a symlink"
+    elif [[ -e $dir && ! -d $dir ]]; then
+      report_conflict "$dir" "is not a directory"
+    fi
+  done
+  if ((desktop_integration)); then
+    for dir in "$apps_dir" "$icon_dir" "$manifest_dir"; do
+      if [[ -L $dir ]]; then
+        report_conflict "$dir" "is a symlink"
+      elif [[ -e $dir && ! -d $dir ]]; then
+        report_conflict "$dir" "is not a directory"
+      fi
+    done
+  else
+    if [[ -L $manifest_dir ]]; then
+      report_conflict "$manifest_dir" "is a symlink"
+    elif [[ -e $manifest_dir && ! -d $manifest_dir ]]; then
+      report_conflict "$manifest_dir" "is not a directory"
+    fi
+  fi
+  if ((macos_app)); then
+    if [[ -L $macos_app_dir ]]; then
+      report_conflict "$macos_app_dir" "is a symlink"
+    elif [[ -e $macos_app_dir && ! -d $macos_app_dir ]]; then
+      report_conflict "$macos_app_dir" "is not a directory"
+    fi
+  fi
   if ((desktop_integration)) && [[ ! $bindir =~ ^[A-Za-z0-9/._+@-]+$ ]]; then
     report_conflict "$bindir" "contains characters unsafe in a freedesktop Exec field"
   fi
@@ -173,6 +221,139 @@ if ((dry_run)); then
   exit 0
 fi
 
+# mkdir is the portable atomic per-bindir lock primitive (including macOS).
+mkdir -p "$bindir"
+install_lock="$bindir/.thegn-install.lock"
+if ! mkdir "$install_lock" 2>/dev/null; then
+  lock_pid=""
+  if [[ -f $install_lock/pid ]]; then
+    IFS= read -r lock_pid <"$install_lock/pid" || true
+  fi
+  if [[ $lock_pid =~ ^[0-9]+$ ]] && kill -0 "$lock_pid" 2>/dev/null; then
+    echo "install.sh: another install is running (pid $lock_pid); lock $install_lock" >&2
+    exit 1
+  fi
+  if [[ ! -e $install_lock/pid ]]; then
+    if stat -c %Y "$install_lock" >/dev/null 2>&1; then
+      lock_mtime="$(stat -c %Y "$install_lock")"
+    else
+      lock_mtime="$(stat -f %m "$install_lock")"
+    fi
+    lock_age=$(($(date +%s) - lock_mtime))
+    if ((lock_age <= 10)); then
+      echo "install.sh: another install is starting; lock $install_lock" >&2
+      exit 1
+    fi
+  fi
+  rm -rf -- "$install_lock"
+  if ! mkdir "$install_lock" 2>/dev/null; then
+    echo "install.sh: could not reclaim install lock $install_lock" >&2
+    exit 1
+  fi
+fi
+remove_install_lock() {
+  local lock_pid=""
+  if [[ -f $install_lock/pid ]]; then
+    IFS= read -r lock_pid <"$install_lock/pid" || true
+  fi
+  if [[ $lock_pid == "$$" ]]; then
+    rm -rf -- "$install_lock"
+  fi
+}
+trap remove_install_lock EXIT
+printf '%s\n' "$$" >"$install_lock/pid.tmp"
+mv -f -- "$install_lock/pid.tmp" "$install_lock/pid"
+
+preflight
+if ((preflight_conflict)); then
+  exit 1
+fi
+
+declare -a journal_targets=() journal_backups=() staged_files=()
+backup_dir=""
+rollback_install() {
+  local i target backup failed=0
+  for ((i = ${#journal_targets[@]} - 1; i >= 0; i--)); do
+    target="${journal_targets[i]}"
+    backup="${journal_backups[i]}"
+    if [[ $backup == new ]]; then
+      if ! rm -f -- "$target"; then
+        failed=1
+      fi
+    elif [[ -n $backup ]]; then
+      if ! rm -f -- "$target" || ! mv -f -- "$backup" "$target"; then
+        failed=1
+      fi
+    fi
+  done
+  return "$failed"
+}
+cleanup_install() {
+  local status=$?
+  trap - EXIT
+  if ((status != 0)) && ((${#journal_targets[@]} > 0)); then
+    if rollback_install; then
+      echo "install.sh: install failed; restored the previous installation" >&2
+    else
+      echo "install.sh: install failed; rollback was incomplete" >&2
+    fi
+  fi
+  if [[ -n $backup_dir ]]; then
+    rm -rf -- "$backup_dir"
+  fi
+  if ((${#staged_files[@]} > 0)); then
+    rm -f -- "${staged_files[@]}"
+  fi
+  remove_install_lock
+  return "$status"
+}
+trap cleanup_install EXIT
+
+assert_destination_dirs() {
+  local dir
+  for dir in "$bindir" "$config_dir" "$manifest_dir"; do
+    if [[ -L $dir || (-e $dir && ! -d $dir) ]]; then
+      echo "install.sh: refusing $dir: destination directory changed" >&2
+      return 1
+    fi
+  done
+  if ((desktop_integration)); then
+    for dir in "$apps_dir" "$icon_dir"; do
+      if [[ -L $dir || (-e $dir && ! -d $dir) ]]; then
+        echo "install.sh: refusing $dir: destination directory changed" >&2
+        return 1
+      fi
+    done
+  fi
+  if ((macos_app)) && [[ -L $macos_app_dir || (-e $macos_app_dir && ! -d $macos_app_dir) ]]; then
+    echo "install.sh: refusing $macos_app_dir: destination directory changed" >&2
+    return 1
+  fi
+}
+
+commit_file() {
+  local tmp="$1" target="$2" backup="new"
+  assert_destination_dirs
+  if [[ -e $target || -L $target ]]; then
+    if [[ -z $backup_dir ]]; then
+      backup_dir="$(mktemp -d "$bindir/.thegn-install-backup.XXXXXXXX")"
+    fi
+    backup="$backup_dir/${#journal_targets[@]}"
+    mv -f -- "$target" "$backup"
+  fi
+  journal_targets+=("$target")
+  journal_backups+=("$backup")
+  mv -f -- "$tmp" "$target"
+}
+
+# THEGN_INSTALL_FAIL_AFTER is a test-only fault-injection seam.
+maybe_inject_failure() {
+  if [[ ${THEGN_INSTALL_FAIL_AFTER-} == "$1" ]]; then
+    echo "install.sh: injected failure after $1" >&2
+    exit 1
+  fi
+}
+
 command -v cargo >/dev/null || {
   echo "cargo not found — install Rust or use 'nix profile install'." >&2
   exit 1
@@ -186,22 +367,23 @@ if [[ ! -f $release_bin ]]; then
   exit 1
 fi
 
-mkdir -p "$bindir"
 # COPY, don't symlink into target/. A symlink to $here/target/release/thegn
 # breaks the moment you `cargo clean`, prune the worktree, or move the repo —
 # silently, and only when you next try to launch. An installed binary should
 # survive the source tree it came from. Re-run install.sh to pick up a rebuild.
 stage_file() {
-  local target="$1" mode="$2" tmp
+  local target="$1" mode="$2"
   mkdir -p "$(dirname "$target")"
-  tmp="$(mktemp "$(dirname "$target")/.thegn-install.XXXXXXXX")"
-  chmod "$mode" "$tmp"
-  printf '%s\n' "$tmp"
+  staged_path="$(mktemp "$(dirname "$target")/.thegn-install.XXXXXXXX")"
+  staged_files+=("$staged_path")
+  chmod "$mode" "$staged_path"
 }
 
-binary_tmp="$(stage_file "$bindir/thegn" 0755)"
+stage_file "$bindir/thegn" 0755
+binary_tmp="$staged_path"
 install -m755 "$release_bin" "$binary_tmp"
-mv -f "$binary_tmp" "$bindir/thegn"
+commit_file "$binary_tmp" "$bindir/thegn"
+maybe_inject_failure thegn
 installed_bin="$bindir/thegn"
 
 installed_bin_q="$(shell_quote "$installed_bin")"
@@ -211,7 +393,8 @@ tg_tui_q="$(shell_quote "$tg_tui")"
 # tg-tui: always the current terminal. THEGN_ALACRITTY_CONFIG points the in-app
 # font picker at the alacritty profile it patches — the same bundled profile
 # `tg --standalone` launches, so a font switch applies to both.
-tg_tui_tmp="$(stage_file "$tg_tui" 0755)"
+stage_file "$tg_tui" 0755
+tg_tui_tmp="$staged_path"
 cat >"$tg_tui_tmp" <<EOF
 #!/usr/bin/env bash
 # generated by thegn install.sh
@@ -220,14 +403,16 @@ export THEGN_ALACRITTY_CONFIG=$alacritty_config_q
 exec $installed_bin_q "\$@"
 EOF
 chmod 0755 "$tg_tui_tmp"
-mv -f "$tg_tui_tmp" "$tg_tui"
+commit_file "$tg_tui_tmp" "$tg_tui"
+maybe_inject_failure tg-tui
 
 # tg: current terminal by default; `-s`/`--standalone` (must be the first arg)
 # opens a dedicated alacritty window running the bundled, hermetic profile
 # (`--config-file` replaces alacritty's default config search entirely, so your
 # personal alacritty.toml stays out). Any other args (CLI verbs like `tg list`)
 # run in the current terminal.
-tg_tmp="$(stage_file "$bindir/tg" 0755)"
+stage_file "$bindir/tg" 0755
+tg_tmp="$staged_path"
 cat >"$tg_tmp" <<EOF
 #!/usr/bin/env bash
 # generated by thegn install.sh
@@ -245,7 +430,8 @@ fi
 exec $tg_tui_q "\$@"
 EOF
 chmod 0755 "$tg_tmp"
-mv -f "$tg_tmp" "$bindir/tg"
+commit_file "$tg_tmp" "$bindir/tg"
+maybe_inject_failure tg
 
 if ((desktop_integration)); then
   # Owl app icon: the same perched-sentinel mascot the loading splash draws
@@ -253,10 +439,12 @@ if ((desktop_integration)); then
   # into the user's hicolor icon theme so `Icon=thegn` resolves in any launcher.
   mkdir -p "$icon_dir"
   if [[ -f $icon_src ]]; then
-    icon_tmp="$(stage_file "$icon_file" 0644)"
+    stage_file "$icon_file" 0644
+    icon_tmp="$staged_path"
     cp "$icon_src" "$icon_tmp"
     printf '\n<!-- generated by thegn install.sh -->\n' >>"$icon_tmp"
-    mv -f "$icon_tmp" "$icon_file"
+    commit_file "$icon_tmp" "$icon_file"
+    maybe_inject_failure icon
     echo "wrote app icon: $icon_file"
   else
     echo "warning: $icon_src missing — desktop entry will fall back to a generic icon" >&2
@@ -267,7 +455,8 @@ if ((desktop_integration)); then
   # runs `tg --standalone` to open thegn's OWN alacritty window (`Terminal=false`).
   tg_launcher="$bindir/tg"
   mkdir -p "$apps_dir"
-  desktop_tmp="$(stage_file "$desktop_file" 0644)"
+  stage_file "$desktop_file" 0644
+  desktop_tmp="$staged_path"
   cat >"$desktop_tmp" <<EOF
 [Desktop Entry]
 Type=Application
@@ -285,7 +474,8 @@ Keywords=git;worktree;terminal;ide;multiplexer;thegn;
 StartupNotify=true
 EOF
   chmod 0644 "$desktop_tmp"
-  mv -f "$desktop_tmp" "$desktop_file"
+  commit_file "$desktop_tmp" "$desktop_file"
+  maybe_inject_failure desktop
   # Refresh the launcher + icon caches so the entry/icon show up without a
   # re-login (best-effort — not all environments ship the tools).
   command -v update-desktop-database >/dev/null 2>&1 && update-desktop-database "$apps_dir" 2>/dev/null || true
@@ -297,6 +487,7 @@ if ((macos_app)); then
   # macOS launcher: a generated `thegn.app` in ~/Applications. Generated here
   # rather than shipped so it carries no `com.apple.quarantine` xattr — a
   # downloaded .app would need Developer ID signing + notarization to open.
+  # The app bundle is not included in the file rollback journal.
   if [[ -x $make_app ]]; then
     "$make_app" --bin "$bindir/thegn" --dest "$macos_app_dir" \
       --alacritty-config "$alacritty_config"
@@ -306,15 +497,51 @@ if ((macos_app)); then
 fi
 
 if [[ ! -e $config_file && ! -L $config_file ]]; then
-  config_tmp="$(stage_file "$config_file" 0600)"
+  stage_file "$config_file" 0600
+  config_tmp="$staged_path"
   cp "$here/config/config.toml.example" "$config_tmp"
   chmod 0600 "$config_tmp"
-  mv -n "$config_tmp" "$config_file"
-  if [[ -e $config_tmp || -L $config_tmp ]]; then
-    rm -f -- "$config_tmp"
+  if mv -n "$config_tmp" "$config_file"; then
+    if [[ -e $config_tmp || -L $config_tmp ]]; then
+      rm -f -- "$config_tmp"
+    else
+      journal_targets+=("$config_file")
+      journal_backups+=(new)
+      echo "wrote default config: $config_file"
+    fi
   else
-    echo "wrote default config: $config_file"
+    exit 1
   fi
+fi
+
+mkdir -p "$manifest_dir"
+stage_file "$manifest_file" 0644
+manifest_tmp="$staged_path"
+{
+  printf 'thegn-install-manifest 1\n'
+  for artifact in "$bindir/thegn" "$tg_tui" "$bindir/tg"; do
+    artifact_absolute="$artifact"
+    [[ $artifact_absolute == /* ]] || artifact_absolute="$PWD/$artifact_absolute"
+    printf '%s\t%s\n' "$(sha256 "$artifact")" "$artifact_absolute"
+  done
+  if ((desktop_integration)); then
+    if [[ -f $icon_file ]]; then
+      artifact_absolute="$icon_file"
+      [[ $artifact_absolute == /* ]] || artifact_absolute="$PWD/$artifact_absolute"
+      printf '%s\t%s\n' "$(sha256 "$icon_file")" "$artifact_absolute"
+    fi
+    if [[ -f $desktop_file ]]; then
+      artifact_absolute="$desktop_file"
+      [[ $artifact_absolute == /* ]] || artifact_absolute="$PWD/$artifact_absolute"
+      printf '%s\t%s\n' "$(sha256 "$desktop_file")" "$artifact_absolute"
+    fi
+  fi
+} >"$manifest_tmp"
+commit_file "$manifest_tmp" "$manifest_file"
+maybe_inject_failure manifest
+if [[ -n $backup_dir ]]; then
+  rm -rf -- "$backup_dir"
+  backup_dir=""
 fi
 
 # Warn about missing runtime deps (delta is used for diff output; alacritty backs

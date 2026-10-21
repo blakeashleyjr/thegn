@@ -63,6 +63,17 @@ pub fn create_image_url(base: &str, id: &str) -> String {
     )
 }
 
+pub fn server_action_url(base: &str, server_id: &str, action_id: i64) -> String {
+    format!(
+        "{}/servers/{server_id}/actions/{action_id}",
+        base.trim_end_matches('/')
+    )
+}
+
+pub fn image_url(base: &str, image_id: i64) -> String {
+    format!("{}/images/{image_id}", base.trim_end_matches('/'))
+}
+
 pub fn shutdown_url(base: &str, id: &str) -> String {
     format!(
         "{}/servers/{id}/actions/shutdown",
@@ -266,10 +277,37 @@ pub fn create_image_body(description: &str) -> serde_json::Value {
     serde_json::json!({ "type": "snapshot", "description": description })
 }
 
-/// Parse the snapshot image id from a create-image response
-/// (`{ "action": …, "image": { id } }`).
-pub fn parse_image_created(v: &serde_json::Value) -> Option<i64> {
-    v.pointer("/image/id").and_then(|i| i.as_i64())
+/// Parse both operation and result ids from a create-image response.
+pub fn parse_create_image(v: &serde_json::Value) -> Option<(i64, i64)> {
+    Some((
+        v.pointer("/action/id")?.as_i64()?,
+        v.pointer("/image/id")?.as_i64()?,
+    ))
+}
+
+pub fn parse_action_status(v: &serde_json::Value, action_id: i64) -> Option<String> {
+    if v.pointer("/action/id")?.as_i64()? != action_id
+        || v.pointer("/action/command")?.as_str()? != "create_image"
+    {
+        return None;
+    }
+    match v.pointer("/action/status")?.as_str()? {
+        status @ ("running" | "success" | "error") => Some(status.to_string()),
+        _ => None,
+    }
+}
+
+pub fn parse_image_state(v: &serde_json::Value) -> Option<(String, Option<i64>)> {
+    let status = v.pointer("/image/status")?.as_str()?.to_string();
+    let source = match v.pointer("/image/created_from/id") {
+        Some(id) => Some(id.as_i64()?),
+        None => None,
+    };
+    Some((status, source))
+}
+
+pub fn image_belongs_to_server(created_from: Option<i64>, server_id: &str) -> bool {
+    matches!(server_id.parse::<i64>(), Ok(id) if created_from == Some(id))
 }
 
 #[cfg(test)]
@@ -535,11 +573,130 @@ mod tests {
     fn image_bake_shaping() {
         assert_eq!(create_image_body("thegn-base")["type"], "snapshot");
         assert_eq!(
-            parse_image_created(
-                &serde_json::json!({ "action": {"id": 1}, "image": { "id": 777 } })
-            ),
-            Some(777)
+            parse_create_image(&serde_json::json!({ "action": {"id": 1}, "image": { "id": 777 } })),
+            Some((1, 777))
         );
-        assert_eq!(parse_image_created(&serde_json::json!({})), None);
+        assert_eq!(parse_create_image(&serde_json::json!({})), None);
+        assert_eq!(
+            parse_create_image(&serde_json::json!({"action":{"id":1}})),
+            None
+        );
+    }
+
+    #[test]
+    fn snapshot_bind_create_image_requires_action_and_image() {
+        assert_eq!(
+            parse_create_image(&serde_json::json!({"action":{"id":4},"image":{"id":8}})),
+            Some((4, 8))
+        );
+        assert_eq!(
+            parse_create_image(&serde_json::json!({"image":{"id":8}})),
+            None
+        );
+        assert_eq!(
+            parse_create_image(&serde_json::json!({"action":{"id":4}})),
+            None
+        );
+    }
+
+    #[test]
+    fn snapshot_bind_image_state_reads_created_from() {
+        assert_eq!(
+            parse_image_state(
+                &serde_json::json!({"image":{"status":"available","created_from":{"id":7}}})
+            ),
+            Some(("available".into(), Some(7)))
+        );
+        assert_eq!(
+            parse_image_state(&serde_json::json!({"image":{"status":"creating"}})),
+            Some(("creating".into(), None))
+        );
+        assert_eq!(parse_image_state(&serde_json::json!({"image":{}})), None);
+    }
+
+    #[test]
+    fn snapshot_bind_action_success_refuses_image_from_another_server() {
+        let (status, created_from) = parse_image_state(
+            &serde_json::json!({"image":{"status":"available","created_from":{"id":8}}}),
+        )
+        .unwrap();
+        assert_eq!(status, "available");
+        assert!(!image_belongs_to_server(created_from, "7"));
+    }
+
+    #[test]
+    fn snapshot_bind_urls() {
+        assert_eq!(
+            server_action_url(DEFAULT_API_BASE, "7", 12),
+            "https://api.hetzner.cloud/v1/servers/7/actions/12"
+        );
+        assert_eq!(
+            image_url(DEFAULT_API_BASE, 99),
+            "https://api.hetzner.cloud/v1/images/99"
+        );
+    }
+
+    #[test]
+    fn snapshot_bind_action_status_parses_terminal_states() {
+        assert_eq!(
+            parse_action_status(
+                &serde_json::json!({"action":{"id":12,"command":"create_image","status":"running"}}),
+                12
+            ),
+            Some("running".into())
+        );
+        assert_eq!(
+            parse_action_status(
+                &serde_json::json!({"action":{"id":12,"command":"create_image","status":"success"}}),
+                12
+            ),
+            Some("success".into())
+        );
+        assert_eq!(
+            parse_action_status(
+                &serde_json::json!({"action":{"id":12,"command":"create_image","status":"error"}}),
+                12
+            ),
+            Some("error".into())
+        );
+        assert_eq!(
+            parse_action_status(
+                &serde_json::json!({"action":{"id":12,"command":"create_image","status":"mystery"}}),
+                12
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn snapshot_bind_action_status_requires_matching_action_identity() {
+        assert_eq!(
+            parse_action_status(
+                &serde_json::json!({"action":{"id":13,"command":"create_image","status":"success"}}),
+                12
+            ),
+            None
+        );
+        assert_eq!(
+            parse_action_status(
+                &serde_json::json!({"action":{"id":12,"command":"reboot","status":"success"}}),
+                12
+            ),
+            None
+        );
+        assert_eq!(
+            parse_action_status(
+                &serde_json::json!({"action":{"command":"create_image","status":"success"}}),
+                12
+            ),
+            None
+        );
+        assert_eq!(
+            parse_action_status(
+                &serde_json::json!({"action":{"id":12,"status":"success"}}),
+                12
+            ),
+            None
+        );
     }
 }

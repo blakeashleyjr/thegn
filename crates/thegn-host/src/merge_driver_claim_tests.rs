@@ -17,7 +17,7 @@ fn registered_row(db: &Db, root: &Path, worktree: &str, branch: &str) -> QueueIt
 
 fn ready_actions<A, F, R>(attempt: A, floor: F, runner: R) -> DriveActions<A, F, R>
 where
-    A: FnMut(&str, &thegn_core::remote::GitLoc) -> anyhow::Result<AttemptOutcome>,
+    A: FnMut(&str, &thegn_core::remote::GitLoc, bool) -> anyhow::Result<AttemptOutcome>,
     F: FnMut(&str) -> crate::agent_run::AgentDispatch,
     R: FnMut(&str, &str, &str, &str, &Failure, Option<thegn_core::sandbox::SandboxSpec>) -> bool,
 {
@@ -75,7 +75,7 @@ fn racing_drains_on_two_connections_have_one_owner() {
             vec![item],
             |_| {},
             ready_actions(
-                move |_, _| {
+                move |_, _, _| {
                     started_tx.send(()).unwrap();
                     release_rx.recv().unwrap();
                     Ok(AttemptOutcome::Ready { tip: "tip".into() })
@@ -100,7 +100,7 @@ fn racing_drains_on_two_connections_have_one_owner() {
         }],
         |_| {},
         ready_actions(
-            move |_, _| {
+            move |_, _, _| {
                 loser_count.fetch_add(1, Ordering::Relaxed);
                 Ok(AttemptOutcome::Ready {
                     tip: "wrong".into(),
@@ -162,7 +162,7 @@ fn row_held_by_another_connection_is_skipped_and_the_next_row_lands() {
         vec![first.clone(), second],
         |step| progressed.push(step.worktree.to_owned()),
         ready_actions(
-            move |_, _| {
+            move |_, _, _| {
                 called.fetch_add(1, Ordering::Relaxed);
                 Ok(AttemptOutcome::Ready { tip: "tip".into() })
             },
@@ -212,7 +212,7 @@ fn claimed_row_is_released_after_the_drain() {
         vec![item.clone()],
         |_| {},
         ready_actions(
-            |_, _| Ok(AttemptOutcome::Ready { tip: "tip".into() }),
+            |_, _, _| Ok(AttemptOutcome::Ready { tip: "tip".into() }),
             unexpected_agent_handoff,
             unused_agent_runner,
         ),
@@ -249,7 +249,7 @@ fn budget_is_consumed_through_the_claim() {
         vec![item],
         |_| {},
         DriveActions {
-            attempt: move |_: &str, _: &thegn_core::remote::GitLoc| {
+            attempt: move |_: &str, _: &thegn_core::remote::GitLoc, _: bool| {
                 let connection = rusqlite::Connection::open(&attempt_db_path)?;
                 connection.execute(
                     "UPDATE merge_queue SET agent_attempts = 2 WHERE worktree = ?1",
@@ -292,7 +292,7 @@ fn unregistered_row_still_drains_unfenced() {
         }],
         |_| {},
         ready_actions(
-            |_, _| Ok(AttemptOutcome::Ready { tip: "tip".into() }),
+            |_, _, _| Ok(AttemptOutcome::Ready { tip: "tip".into() }),
             unexpected_agent_handoff,
             unused_agent_runner,
         ),
@@ -319,7 +319,7 @@ fn stale_folding_row_is_skipped_with_a_warning() {
         vec![item],
         |_| {},
         ready_actions(
-            |_, _| panic!("stale row must not be attempted"),
+            |_, _, _| panic!("stale row must not be attempted"),
             unexpected_agent_handoff,
             unused_agent_runner,
         ),

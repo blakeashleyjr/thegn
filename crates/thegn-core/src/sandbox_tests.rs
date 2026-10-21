@@ -674,6 +674,7 @@ fn refusal_constructor_preserves_each_class_and_field() {
         RefusalClass::HostnamePolicy,
         RefusalClass::MountUnresolvable,
         RefusalClass::TunnelUnenforced,
+        RefusalClass::MountDrift,
     ] {
         let error = refusal(
             &spec,
@@ -692,6 +693,86 @@ fn refusal_constructor_preserves_each_class_and_field() {
             other => panic!("expected structured refusal, got {other:?}"),
         }
     }
+}
+
+#[test]
+fn refusal_remediation_every_class_has_label_and_text() {
+    let mut labels = std::collections::HashSet::new();
+    for class in [
+        RefusalClass::ComposePolicy,
+        RefusalClass::SealedHome,
+        RefusalClass::UnsafeMountPath,
+        RefusalClass::SystemdMountPath,
+        RefusalClass::ComposeTarget,
+        RefusalClass::ComposeServiceMissing,
+        RefusalClass::HostnamePolicy,
+        RefusalClass::MountUnresolvable,
+        RefusalClass::TunnelUnenforced,
+        RefusalClass::MountDrift,
+    ] {
+        let label = class.label();
+        assert!(!label.is_empty());
+        assert!(label.is_ascii());
+        assert!(
+            label
+                .bytes()
+                .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
+        );
+        assert!(labels.insert(label), "duplicate refusal label: {label}");
+
+        let remediation = class.remediation();
+        assert!(!remediation.is_empty());
+        assert!(!remediation.ends_with('.'));
+    }
+}
+
+#[test]
+fn refusal_remediation_hint_names_class_path_and_fix() {
+    let spec = spec(Backend::Docker);
+    let error = refusal(
+        &spec,
+        RefusalClass::UnsafeMountPath,
+        Some("/a b".into()),
+        "safe message".into(),
+    );
+    let hint = error.remediation_hint();
+    assert!(hint.contains("[unsafe-mount-path]"));
+    assert!(hint.contains("`/a b`"));
+    assert!(hint.contains(RefusalClass::UnsafeMountPath.remediation()));
+
+    let error = refusal(
+        &spec,
+        RefusalClass::UnsafeMountPath,
+        Some("/a\nb".into()),
+        "safe message".into(),
+    );
+    let hint = error.remediation_hint();
+    assert!(hint.contains("`/a\\nb`"));
+    assert!(!hint.contains('\n'));
+
+    let error = refusal(
+        &spec,
+        RefusalClass::UnsafeMountPath,
+        None,
+        "safe message".into(),
+    );
+    assert!(!error.remediation_hint().contains(" at "));
+
+    let mut spec = spec;
+    spec.volumes = vec![("/tmp/state".into(), "/mnt/state".into())];
+    let error = enter_argv(&spec, "true").expect_err("invalid volume name must refuse");
+    assert!(error.remediation_hint().contains("[volume-name]"));
+}
+
+#[test]
+fn refusal_remediation_display_is_unchanged() {
+    let error = refusal(
+        &spec(Backend::Docker),
+        RefusalClass::UnsafeMountPath,
+        Some("/a b".into()),
+        "safe message".into(),
+    );
+    assert_eq!(error.to_string(), "safe message");
 }
 
 #[test]

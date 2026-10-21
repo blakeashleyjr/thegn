@@ -690,7 +690,16 @@ pub(crate) fn config_json_argv(
 }
 
 /// Render deterministic Compose labels for safe service identifiers only.
+#[cfg(test)]
 pub(crate) fn owner_label_override(services: &[String], owner: &str) -> Option<String> {
+    owner_label_override_with_policy(services, owner, None)
+}
+
+pub(crate) fn owner_label_override_with_policy(
+    services: &[String],
+    owner: &str,
+    policy: Option<&str>,
+) -> Option<String> {
     let (managed_key, managed_value) = OWNED_LABEL.split_once('=')?;
     let mut labelled = serde_json::Map::new();
     for service in services.iter().filter(|service| {
@@ -708,6 +717,12 @@ pub(crate) fn owner_label_override(services: &[String], owner: &str) -> Option<S
             OWNER_LABEL_KEY.into(),
             serde_json::Value::String(owner.into()),
         );
+        if let Some(policy) = policy {
+            labels.insert(
+                crate::sandbox::POLICY_LABEL.into(),
+                serde_json::Value::String(policy.into()),
+            );
+        }
         labelled.insert(service.clone(), serde_json::json!({"labels": labels}));
     }
     (!labelled.is_empty()).then(|| serde_json::json!({"services": labelled}).to_string())
@@ -716,11 +731,23 @@ pub(crate) fn owner_label_override(services: &[String], owner: &str) -> Option<S
 /// Add a private owner-label override when bounded service enumeration and
 /// the private-file writer both succeed. Failure is fail-safe: Compose remains
 /// usable, and GC keeps the resulting unverified containers.
+#[cfg(test)]
 fn labelled_compose(
     compose: &ComposeSpec,
     services_stdout: Option<&str>,
     owner: &str,
     existing: Option<PathBuf>,
+    write: impl FnOnce(&str) -> std::io::Result<PathBuf>,
+) -> ComposeSpec {
+    labelled_compose_with_policy(compose, services_stdout, owner, existing, None, write)
+}
+
+fn labelled_compose_with_policy(
+    compose: &ComposeSpec,
+    services_stdout: Option<&str>,
+    owner: &str,
+    existing: Option<PathBuf>,
+    policy: Option<&str>,
     write: impl FnOnce(&str) -> std::io::Result<PathBuf>,
 ) -> ComposeSpec {
     let with_existing = || {
@@ -741,7 +768,7 @@ fn labelled_compose(
         .filter(|service| !service.is_empty())
         .map(str::to_owned)
         .collect::<Vec<_>>();
-    let Some(body) = owner_label_override(&services, owner) else {
+    let Some(body) = owner_label_override_with_policy(&services, owner, policy) else {
         return with_existing();
     };
     match write(&body) {
@@ -1101,14 +1128,54 @@ fn runtime_attestation(
     }
 }
 
-fn attest_runtime(
+struct ProjectInspection {
+    ps: Option<String>,
+    ids: Vec<String>,
+    inspect: Option<String>,
+}
+
+fn recreate_for_policy(ids: &[String], inspect: Option<&str>, expected: &str) -> bool {
+    if ids.is_empty() {
+        return false;
+    }
+    let Some(inspect) = inspect else {
+        return true;
+    };
+    let Ok(containers) = serde_json::from_str::<serde_json::Value>(inspect) else {
+        return true;
+    };
+    let Some(containers) = containers.as_array() else {
+        return true;
+    };
+    if containers.len() != ids.len() {
+        return true;
+    }
+    containers.iter().any(|container| {
+        container
+            .get("Config")
+            .and_then(|config| config.get("Labels"))
+            .and_then(|labels| labels.get(crate::sandbox::POLICY_LABEL))
+            .and_then(serde_json::Value::as_str)
+            != Some(expected)
+    })
+}
+
+fn with_force_recreate(mut argv: Vec<String>) -> Vec<String> {
+    if let Some(index) = argv
+        .windows(2)
+        .position(|pair| pair[0] == "up" && pair[1] == "-d")
+    {
+        argv.insert(index + 2, "--force-recreate".into());
+    }
+    argv
+}
+
+fn inspect_project(
     target: &ComposeTarget,
     spec: &SandboxSpec,
     compose: &ComposeSpec,
     project: &str,
-    guard: &ComposeGuard,
-    mut report: EnsureReport,
-) -> anyhow::Result<EnsureReport> {
+) -> ProjectInspection {
     use crate::sandbox::proc::{Capture, ProcOutcome, run_bounded};
 
     let ps = run_bounded(
@@ -1157,7 +1224,20 @@ fn attest_runtime(
             None
         }
     };
-    match runtime_attestation(ps, inspect, guard) {
+    ProjectInspection { ps, ids, inspect }
+}
+
+fn attest_runtime(
+    target: &ComposeTarget,
+    spec: &SandboxSpec,
+    compose: &ComposeSpec,
+    project: &str,
+    guard: &ComposeGuard,
+    mut report: EnsureReport,
+) -> anyhow::Result<EnsureReport> {
+    use crate::sandbox::proc::{Capture, ProcOutcome, run_bounded};
+    let inspection = inspect_project(target, spec, compose, project);
+    match runtime_attestation(inspection.ps, inspection.inspect, guard) {
         RuntimeAttestation::Clean => Ok(report),
         RuntimeAttestation::Unverified(reason) => {
             if report.compose_unverified.is_none() {
@@ -1450,6 +1530,7 @@ pub(crate) fn up_and_verify(
     let state_home = crate::util::xdg_state_home();
     let project = probe_project(&state_home, spec, &target);
     let labelled = if matches!(&spec.placement, Placement::Local) {
+        let policy = crate::sandbox::expected_policy(spec);
         let existing_path = state_home
             .join("thegn/compose-labels")
             .join(format!("{project}.json"));
@@ -1463,11 +1544,12 @@ pub(crate) fn up_and_verify(
             }
         };
         let services = enumerate_services(&target, &services_argv(&target, &project, compose));
-        labelled_compose(
+        labelled_compose_with_policy(
             compose,
             services.as_deref(),
             &owner_identity(),
             existing,
+            Some(&policy),
             |body| {
                 let directory = crate::fsperm::ensure_private_dir_beneath(
                     &state_home,
@@ -1480,6 +1562,7 @@ pub(crate) fn up_and_verify(
         compose.clone()
     };
     if !matches!(&spec.placement, Placement::Local) {
+        // Deferred: remote Compose placements do not receive local policy labels.
         let up = target.control_argv(&up_argv(&target, &project, &labelled));
         let ps = target.control_argv(&ps_argv(&target, &project, &labelled));
         run_up_checked(&up, &ps, COMPOSE_UP_TIMEOUT, COMPOSE_PS_TIMEOUT)?;
@@ -1489,8 +1572,15 @@ pub(crate) fn up_and_verify(
             ),
         });
     }
+    let policy = crate::sandbox::expected_policy(spec);
+    let pre = inspect_project(&target, spec, &labelled, &project);
+    let force = recreate_for_policy(&pre.ids, pre.inspect.as_deref(), &policy);
+    if force {
+        tracing::info!(target: "thegn::sandbox", project, "Compose services carry a stale sandbox policy; recreating");
+    }
     let config = target.control_argv(&config_json_argv(&target, &project, &labelled));
     let up = target.control_argv(&up_argv(&target, &project, &labelled));
+    let up = if force { with_force_recreate(up) } else { up };
     let ps = target.control_argv(&ps_argv(&target, &project, &labelled));
     let report = up_attested(
         &config,
@@ -1502,12 +1592,24 @@ pub(crate) fn up_and_verify(
             COMPOSE_UP_TIMEOUT,
             COMPOSE_PS_TIMEOUT,
         ),
-        |output| pin_inspected_config(&state_home, &project, &target, compose, output),
+        |output| {
+            pin_inspected_config(&state_home, &project, &target, compose, output).map(|pinned| {
+                PinnedLaunch {
+                    up: if force {
+                        with_force_recreate(pinned.up)
+                    } else {
+                        pinned.up
+                    },
+                    ..pinned
+                }
+            })
+        },
     )?;
     attest_runtime(&target, spec, &labelled, &project, guard, report)
 }
 
-/// `docker compose … exec [-it] [--workdir wd] <service> /bin/sh -lc <script>`.
+/// `docker compose … exec [-it] --index 1 [--workdir wd] <service> /bin/sh -lc <script>`.
+/// Pin the replica so pane entry and preflight always enter the same container.
 /// Pure. `interactive` toggles `-it` (a pane) vs a one-shot exec.
 pub(crate) fn exec_argv(
     target: &ComposeTarget,
@@ -1523,6 +1625,7 @@ pub(crate) fn exec_argv(
     if interactive {
         v.push("-it".into());
     }
+    v.extend(["--index".into(), "1".into()]);
     if let Some(wd) = workdir {
         v.push("--workdir".into());
         v.push(wd.to_string());
@@ -1781,6 +1884,94 @@ mod tests {
                 Err(std::io::Error::other("transient write failure"))
             });
         assert_eq!(write_failed, expected);
+    }
+
+    #[test]
+    fn policy_recreate_override_stamps_policy_for_every_service() {
+        let services = vec!["web".into(), "db".into()];
+        let body = owner_label_override_with_policy(&services, "owner", Some("fp1"))
+            .expect("valid services");
+        let parsed: serde_json::Value = serde_json::from_str(&body).expect("valid JSON");
+        for service in ["web", "db"] {
+            assert_eq!(
+                parsed["services"][service]["labels"][crate::sandbox::POLICY_LABEL],
+                "fp1"
+            );
+            assert_eq!(
+                parsed["services"][service]["labels"][OWNER_LABEL_KEY],
+                "owner"
+            );
+        }
+        assert_eq!(
+            owner_label_override_with_policy(&services, "owner", None),
+            owner_label_override(&services, "owner")
+        );
+    }
+
+    #[test]
+    fn policy_recreate_decision_table() {
+        let ids = ["one".into()];
+        let matching = r#"[{"Config":{"Labels":{"thegn.policy":"fp1"}}}]"#;
+        let different = r#"[{"Config":{"Labels":{"thegn.policy":"fp2"}}}]"#;
+        let missing = r#"[{"Config":{"Labels":null}}]"#;
+        let two_ids = ["one".into(), "two".into()];
+        let one_matching_one_missing =
+            r#"[{"Config":{"Labels":{"thegn.policy":"fp1"}}},{"Config":{"Labels":null}}]"#;
+        let cases = [
+            (&[][..], None, false),
+            (&ids[..], None, true),
+            (&ids[..], Some("not json"), true),
+            (&ids[..], Some("{}"), true),
+            (&ids[..], Some(matching), false),
+            (&ids[..], Some(different), true),
+            (&ids[..], Some(missing), true),
+            (&ids[..], Some(r#"[{"Config":{"Labels":{}}}]"#), true),
+            (&two_ids[..], Some(one_matching_one_missing), true),
+        ];
+        for (ids, inspect, expected) in cases {
+            assert_eq!(recreate_for_policy(ids, inspect, "fp1"), expected);
+        }
+    }
+
+    #[test]
+    fn policy_recreate_inserts_flag_after_up_d() {
+        let target = ComposeTarget {
+            engine: vec!["docker".into(), "compose".into()],
+            placement: Placement::Local,
+        };
+        let compose = ComposeSpec {
+            files: vec!["compose.yml".into()],
+            service: Some("web".into()),
+            run_services: vec!["db".into()],
+        };
+        let plain = with_force_recreate(up_argv(&target, "proj", &compose));
+        let up_index = plain.iter().position(|arg| arg == "up").expect("up arg");
+        assert_eq!(
+            plain[up_index..up_index + 5]
+                .iter()
+                .map(String::as_str)
+                .collect::<Vec<_>>(),
+            vec!["up", "-d", "--force-recreate", "web", "db"]
+        );
+
+        let pinned = with_force_recreate(pinned_up_argv(
+            &target,
+            "proj",
+            &compose,
+            Path::new("/private/pinned.yml"),
+            Path::new("/private"),
+        ));
+        let up_index = pinned.iter().position(|arg| arg == "up").expect("up arg");
+        assert_eq!(
+            pinned[up_index..up_index + 5]
+                .iter()
+                .map(String::as_str)
+                .collect::<Vec<_>>(),
+            vec!["up", "-d", "--force-recreate", "web", "db"]
+        );
+
+        let without_pair = vec!["docker".into(), "compose".into(), "up".into(), "web".into()];
+        assert_eq!(with_force_recreate(without_pair.clone()), without_pair);
     }
 
     #[test]
@@ -2151,6 +2342,8 @@ mod tests {
                 "proj",
                 "exec",
                 "-it",
+                "--index",
+                "1",
                 "--workdir",
                 "/work",
                 "app",
@@ -2172,6 +2365,25 @@ mod tests {
             ..Default::default()
         };
         assert!(exec_argv(&target, "proj", &c, None, "s", true).is_none());
+    }
+
+    #[test]
+    fn exec_argv_pins_first_replica_for_one_shot_exec() {
+        let target = ComposeTarget {
+            engine: vec!["docker".into(), "compose".into()],
+            placement: Placement::Local,
+        };
+        let c = ComposeSpec {
+            service: Some("app".into()),
+            ..Default::default()
+        };
+        let argv = exec_argv(&target, "proj", &c, None, "true", false).unwrap();
+        let exec = argv.iter().position(|arg| arg == "exec").unwrap();
+        let after_exec: Vec<&str> = argv[exec + 1..].iter().map(String::as_str).collect();
+        assert_eq!(
+            after_exec,
+            vec!["--index", "1", "app", "/bin/sh", "-lc", "true"]
+        );
     }
 
     fn protected_json(volume: serde_json::Value) -> String {

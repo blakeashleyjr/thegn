@@ -272,6 +272,15 @@ pub trait WorktreeAuxStore {
     /// treated as unbound.
     fn merge_candidate(&self, worktree: &str) -> Result<Option<MergeCandidate>>;
 
+    /// Adopt a verified fast-forward repair for an already held merge candidate.
+    /// The expected pair makes this a compare-and-swap against concurrent edits.
+    fn adopt_merge_candidate(
+        &self,
+        worktree: &str,
+        expected: &MergeCandidate,
+        candidate_oid: &str,
+    ) -> Result<bool>;
+
     /// Read registry and queue state consistently BEFORE starting a fold. No
     /// reservation is created and no lock may be retained across external work.
     fn observe_merge_outcome(&self, worktree: &str) -> Result<MergeOutcomeObservation>;

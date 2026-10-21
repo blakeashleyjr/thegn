@@ -13,6 +13,7 @@
 //! [`VpsProvider`] driving them.
 
 pub mod cloudinit;
+pub mod controller;
 pub mod digitalocean;
 pub mod hetzner;
 pub mod registry;
@@ -33,10 +34,12 @@ use thegn_core::remote::SshTarget;
 /// The vendor-neutral instance labels every managed VPS carries. Hetzner sends
 /// them as a native `key=value` label object; DigitalOcean (flat tags) encodes
 /// and reconstructs them (see [`digitalocean::tags_from_labels`]). The reaper
-/// scopes on [`HOST_KEY`], so both vendors must round-trip it.
+/// scopes on [`HOST_KEY`], so both vendors must round-trip it. New resources
+/// also carry [`CONTROLLER_KEY`] to distinguish the creating thegn root.
 pub const MANAGED_KEY: &str = "managed-by";
 pub const MANAGED_VAL: &str = "thegn";
 pub const HOST_KEY: &str = "tg-host";
+pub const CONTROLLER_KEY: &str = "tg-ctl";
 
 const MAX_INVENTORY_PAGES: u32 = 50;
 const MAX_INVENTORY_ROWS: usize = 10_000;
@@ -843,10 +846,7 @@ impl VpsProvider {
         }
     }
 
-    /// Snapshot the (stopped) instance, returning the vendor image id — the
-    /// `template = "snapshot:<id>"` value `image bake` prints. Hetzner returns
-    /// the id synchronously; DigitalOcean's snapshot is an async action (see
-    /// `Self::snapshot_do`).
+    /// Snapshot the (stopped) instance, returning a verified vendor image id.
     pub async fn snapshot(&self, name: &str, description: &str) -> Result<String> {
         let inst = self
             .find_by_name(name)
@@ -854,51 +854,138 @@ impl VpsProvider {
             .ok_or_else(|| anyhow!("vps: instance {name} not found"))?;
         let base = self.spec.validated_api_base()?;
         match self.spec.kind {
-            VpsKind::Hetzner => {
-                let body = self
-                    .post_json(
-                        &hetzner::create_image_url(&base, &inst.id),
-                        &hetzner::create_image_body(description),
-                    )
-                    .await?;
-                hetzner::parse_image_created(&body)
-                    .map(|id| id.to_string())
-                    .ok_or_else(|| anyhow!("vps: no image id in snapshot response"))
-            }
+            VpsKind::Hetzner => self.snapshot_hetzner(&base, &inst.id, description).await,
             VpsKind::DigitalOcean => self.snapshot_do(&base, &inst.id, description).await,
         }
     }
 
-    /// DigitalOcean snapshots are asynchronous: POST the snapshot action, poll it
-    /// to completion, then read the newest `snapshot_ids` off the Droplet.
+    async fn snapshot_hetzner(
+        &self,
+        base: &str,
+        server_id: &str,
+        description: &str,
+    ) -> Result<String> {
+        const BUDGET: std::time::Duration = std::time::Duration::from_secs(600);
+        let start = std::time::Instant::now();
+        let body = self
+            .post_json_timeout(
+                &hetzner::create_image_url(base, server_id),
+                &hetzner::create_image_body(description),
+                BUDGET.min(crate::provider::CONTROL_TIMEOUT),
+            )
+            .await?;
+        let (action_id, image_id) = hetzner::parse_create_image(&body).ok_or_else(|| {
+            anyhow!("vps: malformed Hetzner create_image response for server {server_id}")
+        })?;
+        let action_url = hetzner::server_action_url(base, server_id, action_id);
+        loop {
+            let remaining = BUDGET.saturating_sub(start.elapsed());
+            anyhow::ensure!(
+                !remaining.is_zero(),
+                "vps: Hetzner create_image action {action_id} timed out"
+            );
+            tokio::time::sleep(std::time::Duration::from_secs(5).min(remaining)).await;
+            let action = self
+                .get_json_timeout(
+                    &action_url,
+                    BUDGET
+                        .saturating_sub(start.elapsed())
+                        .min(crate::provider::CONTROL_TIMEOUT),
+                )
+                .await?;
+            match hetzner::parse_action_status(&action, action_id).as_deref() {
+                Some("success") => break,
+                Some("running") => {}
+                Some("error") => {
+                    return Err(anyhow!(
+                        "vps: Hetzner create_image action {action_id} failed"
+                    ));
+                }
+                _ => return Err(anyhow!("vps: malformed Hetzner action {action_id} poll")),
+            }
+        }
+        loop {
+            let remaining = BUDGET.saturating_sub(start.elapsed());
+            anyhow::ensure!(
+                !remaining.is_zero(),
+                "vps: Hetzner image {image_id} not available after {}s",
+                BUDGET.as_secs()
+            );
+            tokio::time::sleep(std::time::Duration::from_secs(5).min(remaining)).await;
+            let image = self
+                .get_json_timeout(
+                    &hetzner::image_url(base, image_id),
+                    BUDGET
+                        .saturating_sub(start.elapsed())
+                        .min(crate::provider::CONTROL_TIMEOUT),
+                )
+                .await?;
+            let (status, created_from) = hetzner::parse_image_state(&image)
+                .ok_or_else(|| anyhow!("vps: malformed Hetzner image {image_id} poll"))?;
+            anyhow::ensure!(
+                hetzner::image_belongs_to_server(created_from, server_id),
+                "vps: Hetzner image {image_id} is not bound to source server {server_id}"
+            );
+            match status.as_str() {
+                "available" => return Ok(image_id.to_string()),
+                "creating" => {}
+                _ => {
+                    return Err(anyhow!(
+                        "vps: Hetzner image {image_id} has unexpected status {status}"
+                    ));
+                }
+            }
+        }
+    }
+
+    /// Bind the completed action to this droplet and prove exactly one new id appeared.
     async fn snapshot_do(&self, base: &str, id: &str, name: &str) -> Result<String> {
         const BUDGET: std::time::Duration = std::time::Duration::from_secs(600);
         let start = std::time::Instant::now();
+        let before_response = self
+            .get_json_timeout(
+                &digitalocean::droplet_url(base, id),
+                BUDGET.min(crate::provider::CONTROL_TIMEOUT),
+            )
+            .await?;
+        let before = digitalocean::parse_snapshot_ids(&before_response)
+            .ok_or_else(|| anyhow!("vps: malformed DO snapshot inventory for droplet {id}"))?;
         let action = self
             .post_json_timeout(
                 &digitalocean::droplet_actions_url(base, id),
                 &digitalocean::snapshot_body(name),
-                BUDGET.min(crate::provider::CONTROL_TIMEOUT),
+                BUDGET
+                    .saturating_sub(start.elapsed())
+                    .min(crate::provider::CONTROL_TIMEOUT),
             )
             .await?;
-        let (action_id, mut status) = digitalocean::parse_action(&action)
-            .ok_or_else(|| anyhow!("vps: no action in DO snapshot response"))?;
-        // Snapshotting a fresh dev image takes minutes; poll bounded.
+        let detail = digitalocean::parse_action_detail(&action).ok_or_else(|| {
+            anyhow!("vps: malformed DO snapshot action response for droplet {id}")
+        })?;
+        anyhow::ensure!(
+            detail.kind == "snapshot" && detail.resource_id == id,
+            "vps: DO action {} is not a snapshot of droplet {id}",
+            detail.id
+        );
+        let action_id = detail.id;
+        let mut status = detail.status;
         while status != "completed" {
             if status == "errored" {
                 return Err(anyhow!("vps: DO snapshot action {action_id} errored"));
             }
-            if start.elapsed() >= BUDGET {
+            if status != "in-progress" {
                 return Err(anyhow!(
-                    "vps: DO snapshot action {action_id} not complete after {}s",
-                    BUDGET.as_secs()
+                    "vps: DO snapshot action {action_id} has unexpected status {status}"
                 ));
             }
-            tokio::time::sleep(
-                std::time::Duration::from_secs(5).min(BUDGET.saturating_sub(start.elapsed())),
-            )
-            .await;
-            let a = self
+            let remaining = BUDGET.saturating_sub(start.elapsed());
+            anyhow::ensure!(
+                !remaining.is_zero(),
+                "vps: DO snapshot action {action_id} not complete after {}s",
+                BUDGET.as_secs()
+            );
+            tokio::time::sleep(std::time::Duration::from_secs(5).min(remaining)).await;
+            let poll = self
                 .get_json_timeout(
                     &digitalocean::action_url(base, &action_id),
                     BUDGET
@@ -906,24 +993,57 @@ impl VpsProvider {
                         .min(crate::provider::CONTROL_TIMEOUT),
                 )
                 .await?;
-            status = digitalocean::parse_action(&a)
-                .map(|(_, s)| s)
-                .unwrap_or(status);
+            let polled = digitalocean::parse_action_detail(&poll)
+                .ok_or_else(|| anyhow!("vps: malformed DO snapshot action {action_id} poll"))?;
+            anyhow::ensure!(
+                polled.id == action_id,
+                "vps: DO snapshot action id changed from {action_id} to {}",
+                polled.id
+            );
+            anyhow::ensure!(
+                polled.kind == "snapshot" && polled.resource_id == id,
+                "vps: DO action {action_id} is not a snapshot of droplet {id}"
+            );
+            status = polled.status;
         }
-        let remaining = BUDGET.saturating_sub(start.elapsed());
-        anyhow::ensure!(
-            !remaining.is_zero(),
-            "vps: DO snapshot action {action_id} not complete after {}s",
-            BUDGET.as_secs()
-        );
-        let droplet = self
-            .get_json_timeout(
-                &digitalocean::droplet_url(base, id),
-                remaining.min(crate::provider::CONTROL_TIMEOUT),
-            )
-            .await?;
-        digitalocean::parse_latest_snapshot_id(&droplet)
-            .ok_or_else(|| anyhow!("vps: no snapshot id on droplet {id} after snapshot"))
+        loop {
+            let remaining = BUDGET.saturating_sub(start.elapsed());
+            if remaining.is_zero() {
+                return Err(anyhow!(
+                    "vps: cannot bind DO snapshot action {action_id} to a new image: {}",
+                    digitalocean::SnapshotBindError::NoNewSnapshot
+                ));
+            }
+            let droplet = self
+                .get_json_timeout(
+                    &digitalocean::droplet_url(base, id),
+                    remaining.min(crate::provider::CONTROL_TIMEOUT),
+                )
+                .await?;
+            let after = digitalocean::parse_snapshot_ids(&droplet).ok_or_else(|| {
+                anyhow!(
+                    "vps: malformed DO snapshot inventory for droplet {id} after action {action_id}"
+                )
+            })?;
+            match digitalocean::new_snapshot_id(&before, &after) {
+                Ok(snapshot_id) => return Ok(snapshot_id),
+                Err(digitalocean::SnapshotBindError::NoNewSnapshot) => {
+                    let remaining = BUDGET.saturating_sub(start.elapsed());
+                    let error = digitalocean::SnapshotBindError::NoNewSnapshot;
+                    if !digitalocean::should_retry_snapshot_bind(&error, remaining) {
+                        return Err(anyhow!(
+                            "vps: cannot bind DO snapshot action {action_id} to a new image: {error}"
+                        ));
+                    }
+                    tokio::time::sleep(std::time::Duration::from_secs(5).min(remaining)).await;
+                }
+                Err(error @ digitalocean::SnapshotBindError::AmbiguousNewSnapshots(_)) => {
+                    return Err(anyhow!(
+                        "vps: cannot bind DO snapshot action {action_id} to a new image: {error}"
+                    ));
+                }
+            }
+        }
     }
 }
 
@@ -936,7 +1056,11 @@ impl RemoteProvider for VpsProvider {
         Box::pin(async move {
             // Every local input is admitted before the ledger is read, the SSH
             // key is looked up or registered, or any server request is made.
-            let labels = self.labels();
+            let controller = tokio::task::spawn_blocking(controller::controller_id)
+                .await
+                .context("vps: controller id worker failed")??;
+            let mut labels = self.labels();
+            labels.insert(CONTROLLER_KEY.into(), controller);
             let resolved = self.spec.admit_resolved(&labels)?;
             let name = self.spec.name.clone();
             let base = self.spec.validated_api_base()?;

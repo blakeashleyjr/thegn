@@ -1542,17 +1542,131 @@ pub fn exec_api_by_name(provider: &str) -> bool {
     thegn_core::config::EnvProviderKind::of(provider).exec_api()
 }
 
-/// A cheap, dependency-free content fingerprint (FNV-1a 64-bit, hex). Used by
-/// [`Provider::ensure_executable`] to decide whether a pushed binary needs
-/// re-uploading — collision-resistance isn't security-critical here, only
-/// change-detection, so a fast non-crypto hash is the right tool.
-pub fn fingerprint(data: &[u8]) -> String {
-    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
-    for &b in data {
-        h ^= b as u64;
-        h = h.wrapping_mul(0x0000_0100_0000_01b3);
+fn sha256_hex(data: &[u8]) -> String {
+    use sha2::Digest;
+    format!("{:x}", sha2::Sha256::digest(data))
+}
+
+#[derive(Debug)]
+enum ExecInstallError {
+    StageWrite(anyhow::Error),
+    StageRead(anyhow::Error),
+    StageVerification(String),
+    Publish(anyhow::Error),
+    PublishedVerification(String),
+}
+
+impl std::fmt::Display for ExecInstallError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::StageWrite(error) => write!(f, "stage bridge executable: {error:#}"),
+            Self::StageRead(error) => write!(
+                f,
+                "staged bridge executable failed verification ({error:#})"
+            ),
+            Self::StageVerification(reason) => {
+                write!(f, "staged bridge executable failed verification ({reason})")
+            }
+            Self::Publish(error) => write!(f, "publish bridge executable: {error:#}"),
+            Self::PublishedVerification(reason) => write!(
+                f,
+                "published bridge executable failed verification ({reason})"
+            ),
+        }
     }
-    format!("{h:016x}")
+}
+
+impl std::error::Error for ExecInstallError {}
+
+async fn install_executable_verified<P, Fut>(
+    files: &dyn ProviderFiles,
+    id: &str,
+    path: &str,
+    data: &[u8],
+    publish: P,
+) -> Result<bool>
+where
+    P: FnOnce(String, String) -> Fut,
+    Fut: std::future::Future<Output = Result<()>>,
+{
+    let want = sha256_hex(data);
+    if let Ok(remote) = files.read(id, path).await
+        && remote.len() == data.len()
+        && sha256_hex(&remote) == want
+    {
+        return Ok(false);
+    }
+
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |duration| duration.as_nanos());
+    let stage = format!("{path}.tg-stage-{}-{nanos}", std::process::id());
+    if let Err(error) = files.write_exec(id, &stage, data).await {
+        if let Err(error) = files.delete(id, &stage).await {
+            tracing::debug!(target: "thegn::provider", %error, "best-effort staged executable cleanup failed");
+        }
+        return Err(ExecInstallError::StageWrite(error).into());
+    }
+
+    match files.read(id, &stage).await {
+        Ok(bytes) if bytes.len() == data.len() && sha256_hex(&bytes) == want => {}
+        Ok(bytes) => {
+            if let Err(error) = files.delete(id, &stage).await {
+                tracing::debug!(target: "thegn::provider", %error, "best-effort staged executable cleanup failed");
+            }
+            return Err(ExecInstallError::StageVerification(format!(
+                "expected {} bytes with SHA-256 {want}, got {} bytes with SHA-256 {}",
+                data.len(),
+                bytes.len(),
+                sha256_hex(&bytes)
+            ))
+            .into());
+        }
+        Err(error) => {
+            if let Err(error) = files.delete(id, &stage).await {
+                tracing::debug!(target: "thegn::provider", %error, "best-effort staged executable cleanup failed");
+            }
+            return Err(ExecInstallError::StageRead(error).into());
+        }
+    };
+
+    if let Err(error) = publish(stage.clone(), path.to_string()).await {
+        if let Err(error) = files.delete(id, &stage).await {
+            tracing::debug!(target: "thegn::provider", %error, "best-effort staged executable cleanup failed");
+        }
+        return Err(ExecInstallError::Publish(error).into());
+    }
+
+    match files.read(id, path).await {
+        Ok(bytes) if bytes.len() == data.len() && sha256_hex(&bytes) == want => {}
+        Ok(bytes) => {
+            if let Err(error) = files.delete(id, &stage).await {
+                tracing::debug!(target: "thegn::provider", %error, "best-effort staged executable cleanup failed");
+            }
+            return Err(ExecInstallError::PublishedVerification(format!(
+                "expected {} bytes with SHA-256 {want}, got {} bytes with SHA-256 {}",
+                data.len(),
+                bytes.len(),
+                sha256_hex(&bytes)
+            ))
+            .into());
+        }
+        Err(error) => {
+            if let Err(error) = files.delete(id, &stage).await {
+                tracing::debug!(target: "thegn::provider", %error, "best-effort staged executable cleanup failed");
+            }
+            return Err(ExecInstallError::PublishedVerification(format!(
+                "read-back failed: {error:#}"
+            ))
+            .into());
+        }
+    };
+
+    let fp_path = format!("{path}.fp");
+    if let Err(error) = files.delete(id, &fp_path).await {
+        tracing::debug!(target: "thegn::provider", %error, "best-effort legacy executable fingerprint cleanup failed");
+    }
+    Ok(true)
 }
 
 // ===========================================================================
@@ -2492,29 +2606,36 @@ impl Provider {
             .await
     }
 
-    /// Idempotently install the executable `data` at `path` in the sandbox: a
-    /// content-addressed handshake. Compares a fingerprint stored at `<path>.fp`
-    /// and (re)uploads only on mismatch, returning whether it pushed (`true`) or
-    /// the env was already current (`false`). This is the resident-bridge binary
-    /// push — content-addressed so a rebuilt binary re-pushes, an unchanged one
-    /// does not. Requires the provider's file API (`caps().files`).
+    /// Idempotently install the executable `data` at `path` in the sandbox.
+    /// SHA-256 is checked against the remote bytes themselves; uploads go to a
+    /// staging sibling, are read back and verified, then published with `mv -f`.
+    /// The legacy `<path>.fp` sidecar is ignored and best-effort removed. Returns
+    /// whether it pushed (`true`) or the remote executable was already current
+    /// (`false`). Requires the provider's file API (`caps().files`).
     pub async fn ensure_executable(&self, id: &str, path: &str, data: &[u8]) -> Result<bool> {
         if !self.caps().files {
             return Err(anyhow!("provider does not support a file push"));
         }
-        let want = fingerprint(data);
-        let fp_path = format!("{path}.fp");
-        let current = self
-            .read(id, &fp_path)
-            .await
-            .ok()
-            .and_then(|b| String::from_utf8(b).ok());
-        if current.as_deref() == Some(want.as_str()) {
-            return Ok(false);
-        }
-        self.write_exec(id, path, data).await?;
-        self.write(id, &fp_path, want.as_bytes()).await?;
-        Ok(true)
+        let files = self.files_ops().ok_or_else(|| self.no_files())?;
+        install_executable_verified(files, id, path, data, |stage, dest| async move {
+            let (code, output) = self
+                .run_exec(
+                    id,
+                    &["mv".into(), "-f".into(), "--".into(), stage, dest],
+                    None,
+                    &[],
+                )
+                .await?;
+            if code != 0 {
+                let mut tail_start = output.len().saturating_sub(200);
+                while !output.is_char_boundary(tail_start) {
+                    tail_start += 1;
+                }
+                return Err(anyhow!("mv exited {code}: {}", &output[tail_start..]));
+            }
+            Ok(())
+        })
+        .await
     }
 
     /// Push a local directory into the sandbox fs (provider `sync` projection).
@@ -2717,17 +2838,229 @@ mod tests {
         assert!(CONTROL_GATE.try_acquire(authority).is_ok());
     }
 
-    #[test]
-    fn fingerprint_is_stable_and_change_sensitive() {
-        let a = fingerprint(b"thegn-binary-bytes");
-        assert_eq!(a, fingerprint(b"thegn-binary-bytes"), "stable");
-        assert_eq!(a.len(), 16, "16 hex chars (64-bit)");
-        assert_ne!(
-            a,
-            fingerprint(b"thegn-binary-bytez"),
-            "1-byte change differs"
+    struct MemFiles {
+        files: std::sync::Mutex<HashMap<String, Vec<u8>>>,
+        corrupt_stage: bool,
+    }
+
+    impl MemFiles {
+        fn new(files: HashMap<String, Vec<u8>>, corrupt_stage: bool) -> Self {
+            Self {
+                files: std::sync::Mutex::new(files),
+                corrupt_stage,
+            }
+        }
+
+        fn publish(&self, stage: &str, dest: &str) -> Result<()> {
+            let mut files = self
+                .files
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let bytes = files
+                .remove(stage)
+                .ok_or_else(|| anyhow!("missing staging file"))?;
+            files.insert(dest.to_string(), bytes);
+            Ok(())
+        }
+
+        fn contains_stage(&self) -> bool {
+            self.files
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .keys()
+                .any(|path| path.contains(".tg-stage-"))
+        }
+    }
+
+    impl ProviderFiles for MemFiles {
+        fn read<'a>(&'a self, _id: &'a str, path: &'a str) -> BoxFuture<'a, Result<Vec<u8>>> {
+            Box::pin(async move {
+                self.files
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .get(path)
+                    .cloned()
+                    .ok_or_else(|| anyhow!("missing file"))
+            })
+        }
+
+        fn write<'a>(
+            &'a self,
+            _id: &'a str,
+            path: &'a str,
+            data: &'a [u8],
+        ) -> BoxFuture<'a, Result<()>> {
+            Box::pin(async move {
+                let bytes = if self.corrupt_stage && path.contains(".tg-stage-") {
+                    data[..data.len().saturating_sub(1)].to_vec()
+                } else {
+                    data.to_vec()
+                };
+                self.files
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .insert(path.to_string(), bytes);
+                Ok(())
+            })
+        }
+
+        fn list_dir<'a>(
+            &'a self,
+            _id: &'a str,
+            _path: &'a str,
+        ) -> BoxFuture<'a, Result<Vec<FileEntry>>> {
+            Box::pin(async { Ok(Vec::new()) })
+        }
+
+        fn delete<'a>(&'a self, _id: &'a str, path: &'a str) -> BoxFuture<'a, Result<()>> {
+            Box::pin(async move {
+                self.files
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .remove(path);
+                Ok(())
+            })
+        }
+    }
+
+    fn legacy_fnv_hex(data: &[u8]) -> String {
+        let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+        for byte in data {
+            hash ^= u64::from(*byte);
+            hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+        }
+        format!("{hash:016x}")
+    }
+
+    #[tokio::test]
+    async fn exec_install_planted_fp_with_different_bytes_reuploads() {
+        let path = "/w/.tg/thegn";
+        let mut initial = HashMap::new();
+        initial.insert(path.into(), b"evil".to_vec());
+        initial.insert(format!("{path}.fp"), legacy_fnv_hex(b"good").into_bytes());
+        let files = MemFiles::new(initial, false);
+        let published = std::sync::atomic::AtomicBool::new(false);
+        let mem = &files;
+        let ran = &published;
+        let result =
+            install_executable_verified(&files, "id", path, b"good", |stage, dest| async move {
+                ran.store(true, std::sync::atomic::Ordering::SeqCst);
+                mem.publish(&stage, &dest)
+            })
+            .await
+            .unwrap();
+        let stored = files
+            .files
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert!(result);
+        assert!(published.load(std::sync::atomic::Ordering::SeqCst));
+        assert_eq!(stored.get(path).map(Vec::as_slice), Some(&b"good"[..]));
+        assert!(!stored.contains_key(&format!("{path}.fp")));
+        drop(stored);
+        assert!(!files.contains_stage());
+    }
+
+    #[tokio::test]
+    async fn exec_install_matching_bytes_is_current() {
+        let path = "/w/.tg/thegn";
+        let files = MemFiles::new(HashMap::from([(path.into(), b"same".to_vec())]), false);
+        let published = std::sync::atomic::AtomicBool::new(false);
+        let ran = &published;
+        let result = install_executable_verified(&files, "id", path, b"same", |_, _| async move {
+            ran.store(true, std::sync::atomic::Ordering::SeqCst);
+            Ok(())
+        })
+        .await
+        .unwrap();
+        assert!(!result);
+        assert!(!published.load(std::sync::atomic::Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn exec_install_missing_remote_uploads() {
+        let path = "/w/.tg/thegn";
+        let files = MemFiles::new(HashMap::new(), false);
+        let mem = &files;
+        let result = install_executable_verified(
+            &files,
+            "id",
+            path,
+            b"new binary",
+            |stage, dest| async move { mem.publish(&stage, &dest) },
+        )
+        .await
+        .unwrap();
+        assert!(result);
+        assert_eq!(
+            files
+                .files
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .get(path)
+                .map(Vec::as_slice),
+            Some(&b"new binary"[..])
         );
-        assert_ne!(a, fingerprint(b""), "empty differs");
+    }
+
+    #[tokio::test]
+    async fn exec_install_truncated_stage_is_never_published() {
+        let path = "/w/.tg/thegn";
+        let files = MemFiles::new(HashMap::from([(path.into(), b"prior".to_vec())]), true);
+        let published = std::sync::atomic::AtomicBool::new(false);
+        let mem = &files;
+        let ran = &published;
+        let result = install_executable_verified(
+            &files,
+            "id",
+            path,
+            b"new binary",
+            |stage, dest| async move {
+                ran.store(true, std::sync::atomic::Ordering::SeqCst);
+                mem.publish(&stage, &dest)
+            },
+        )
+        .await;
+        assert!(matches!(result, Err(error) if error.to_string().contains("failed verification")));
+        assert!(!published.load(std::sync::atomic::Ordering::SeqCst));
+        assert_eq!(
+            files
+                .files
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .get(path)
+                .map(Vec::as_slice),
+            Some(&b"prior"[..])
+        );
+        assert!(!files.contains_stage());
+    }
+
+    #[tokio::test]
+    async fn exec_install_publish_failure_removes_stage() {
+        let path = "/w/.tg/thegn";
+        let files = MemFiles::new(HashMap::from([(path.into(), b"prior".to_vec())]), false);
+        let published = std::sync::atomic::AtomicBool::new(false);
+        let ran = &published;
+        let result =
+            install_executable_verified(&files, "id", path, b"new binary", |_, _| async move {
+                ran.store(true, std::sync::atomic::Ordering::SeqCst);
+                Err(anyhow!("publish refused"))
+            })
+            .await;
+        assert!(
+            matches!(result, Err(error) if error.to_string().contains("publish bridge executable"))
+        );
+        assert!(published.load(std::sync::atomic::Ordering::SeqCst));
+        assert_eq!(
+            files
+                .files
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .get(path)
+                .map(Vec::as_slice),
+            Some(&b"prior"[..])
+        );
+        assert!(!files.contains_stage());
     }
 
     #[test]

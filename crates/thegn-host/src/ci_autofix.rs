@@ -297,22 +297,37 @@ fn consider_candidate_with_forge(
         pq.agent_isolation_floor,
         pq.agent_on_floor_miss,
     );
-    let sandbox = match dispatch {
-        crate::agent_run::AgentDispatch::InfraHold(reason) => {
-            notify(format!("CI autofix for PR #{} held: {reason}", item.number));
-            return;
-        }
+    let (sandbox, isolation) = match dispatch {
+        crate::agent_run::AgentDispatch::InfraHold(reason) => (
+            None,
+            thegn_core::pr_queue::IsolationAdmission::Refused(reason),
+        ),
         crate::agent_run::AgentDispatch::RunDegraded(spec, warning) => {
             tracing::warn!(target: "thegn::ci_autofix", "{warning}");
-            spec
+            (
+                Some(spec),
+                thegn_core::pr_queue::IsolationAdmission::Degraded(warning),
+            )
         }
-        crate::agent_run::AgentDispatch::Run(spec) => spec,
+        crate::agent_run::AgentDispatch::Run(spec) => (
+            Some(spec),
+            thegn_core::pr_queue::IsolationAdmission::Admitted,
+        ),
     };
+    if let Err(reason) = thegn_core::pr_queue::admit_prepared_dispatch(
+        thegn_core::agent_task::TaskKind::PrCiFailure,
+        true,
+        &isolation,
+    ) {
+        notify(format!("CI autofix for PR #{} held: {reason}", item.number));
+        return;
+    }
+    let sandbox = sandbox.expect("admitted isolation carries a sandbox spec");
     let template = agent.as_deref().expect("agent checked above");
     let item = crate::pr_driver::PrItem::from(&item);
     let log_text = thegn_core::ci_log::redact(&entry.text);
     let log = Some(log_text.as_str());
-    let Some((vars, prompt)) = crate::pr_driver::compose_with_log(
+    let prepared = crate::pr_driver::compose_with_log(
         &pq,
         thegn_core::agent_task::TaskKind::PrCiFailure,
         worktree,
@@ -320,13 +335,19 @@ fn consider_candidate_with_forge(
         &fetched,
         &blocker,
         log,
-    ) else {
+    );
+    if let Err(_reason) = thegn_core::pr_queue::admit_prepared_dispatch(
+        thegn_core::agent_task::TaskKind::PrCiFailure,
+        prepared.is_some(),
+        &thegn_core::pr_queue::IsolationAdmission::Admitted,
+    ) {
         notify(format!(
             "CI autofix for PR #{} was not dispatched: prompt is invalid",
             item.number
         ));
         return;
-    };
+    }
+    let (vars, prompt) = prepared.expect("prepared dispatch admitted only with a prompt");
     // Claim only after every safety and prompt gate has passed, immediately
     // before consuming the attempt and spawning. A refresh race therefore
     // spends at most one dispatch without permanently suppressing a candidate
@@ -1145,5 +1166,73 @@ mod authorship_tests {
         assert!(prompt.contains(thegn_core::ci_log::REDACTION_MARKER));
         assert!(!prompt.contains("SYNTHETIC_PEM_BODY"));
         assert!(!prompt.contains("SYNTHETIC_TOKEN"));
+    }
+
+    #[test]
+    fn invalid_prompt_holds_without_claim_spawn_or_spend() {
+        let fixture = Fixture::new();
+        let (mut handoff, prompt_path) =
+            handoff_with_prompt_capture(&fixture, &fixture.pr.head_ref_oid);
+        handoff.config.pr_queue.prompts.ci_failure = "{nope}".into();
+
+        consider(&handoff, false);
+
+        assert!(!prompt_path.exists());
+        assert!(!handoff.sentinel.exists());
+        assert_eq!(handoff.db.list_pr_queue().unwrap()[0].agent_attempts, 0);
+        assert!(
+            handoff
+                .db
+                .claim_ci_autofix(&handoff.entry.candidate())
+                .unwrap()
+        );
+        assert!(
+            handoff
+                .db
+                .get_unread_notifications()
+                .unwrap()
+                .iter()
+                .any(|notification| {
+                    notification
+                        .message
+                        .contains("was not dispatched: prompt is invalid")
+                })
+        );
+    }
+
+    #[test]
+    fn isolation_refusal_holds_without_claim_spawn_or_spend() {
+        let fixture = Fixture::new();
+        let (mut handoff, prompt_path) =
+            handoff_with_prompt_capture(&fixture, &fixture.pr.head_ref_oid);
+        handoff.config.pr_queue.agent_sandbox = true;
+        std::fs::write(
+            fixture.dir.path().join(".thegn.toml"),
+            "[sandbox\nnetwork = \"none\"\n",
+        )
+        .unwrap();
+
+        consider(&handoff, false);
+
+        assert!(!prompt_path.exists());
+        assert!(!handoff.sentinel.exists());
+        assert_eq!(handoff.db.list_pr_queue().unwrap()[0].agent_attempts, 0);
+        assert!(
+            handoff
+                .db
+                .claim_ci_autofix(&handoff.entry.candidate())
+                .unwrap()
+        );
+        assert!(
+            handoff
+                .db
+                .get_unread_notifications()
+                .unwrap()
+                .iter()
+                .any(|notification| {
+                    notification.message.contains("held:")
+                        && notification.message.contains(".thegn.toml")
+                })
+        );
     }
 }

@@ -9,6 +9,7 @@ use std::thread::JoinHandle;
 use std::time::Duration;
 
 use notify::{Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
+use sha2::{Digest, Sha256};
 use termwiz::terminal::TerminalWaker;
 use tokio::sync::mpsc as tokio_mpsc;
 
@@ -24,6 +25,7 @@ pub(crate) struct ThemeOverrides {
 
 pub const MAX_THEME_FILE_BYTES: usize = 64 * 1024;
 const MAX_THEME_FILES: usize = 256;
+static NEXT_TEMP: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug)]
 enum Request {
@@ -35,6 +37,12 @@ enum Request {
         theme: UserTheme,
         overrides: Option<Box<ThemeOverrides>>,
     },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SaveExpect {
+    New,
+    Replace([u8; 32]),
 }
 
 #[derive(Debug)]
@@ -253,6 +261,7 @@ fn worker(
     state: WorkerState,
 ) {
     let WorkerState { shutdown, active } = state;
+    let mut loaded: HashMap<String, [u8; 32]> = HashMap::new();
     if let Err(error) = std::fs::create_dir_all(&themes_dir) {
         tracing::warn!(target: "thegn::theme", error = %error, "theme directory unavailable");
     }
@@ -286,7 +295,13 @@ fn worker(
         tracing::warn!(target: "thegn::theme", error = %error, "theme directory watch unavailable");
     }
 
-    publish_catalog(&themes_dir, &result_tx, waker.as_ref(), &active);
+    publish_catalog(
+        &themes_dir,
+        &result_tx,
+        waker.as_ref(),
+        &active,
+        &mut loaded,
+    );
     'run: while let Ok(work) = request_rx.recv() {
         if shutdown.load(Ordering::Acquire) {
             finish_shutdown(
@@ -298,6 +313,7 @@ fn worker(
                 &config_path,
                 &result_tx,
                 waker.as_ref(),
+                &mut loaded,
             );
             break;
         }
@@ -321,6 +337,7 @@ fn worker(
                             &config_path,
                             &result_tx,
                             waker.as_ref(),
+                            &mut loaded,
                         );
                         break 'run;
                     }
@@ -342,10 +359,17 @@ fn worker(
                         &config_path,
                         &result_tx,
                         waker.as_ref(),
+                        &mut loaded,
                     );
                     break 'run;
                 }
-                publish_catalog(&themes_dir, &result_tx, waker.as_ref(), &active);
+                publish_catalog(
+                    &themes_dir,
+                    &result_tx,
+                    waker.as_ref(),
+                    &active,
+                    &mut loaded,
+                );
                 let mut deferred = deferred.into_iter();
                 while let Some(request) = deferred.next() {
                     if shutdown.load(Ordering::Acquire) {
@@ -358,6 +382,7 @@ fn worker(
                             &config_path,
                             &result_tx,
                             waker.as_ref(),
+                            &mut loaded,
                         );
                         break 'run;
                     }
@@ -368,6 +393,7 @@ fn worker(
                         &result_tx,
                         waker.as_ref(),
                         Some(&active),
+                        &mut loaded,
                     );
                 }
             }
@@ -378,6 +404,7 @@ fn worker(
                 &result_tx,
                 waker.as_ref(),
                 Some(&active),
+                &mut loaded,
             ),
             Work::Shutdown => {
                 finish_shutdown(
@@ -389,6 +416,7 @@ fn worker(
                     &config_path,
                     &result_tx,
                     waker.as_ref(),
+                    &mut loaded,
                 );
                 break;
             }
@@ -406,18 +434,19 @@ fn finish_shutdown(
     config_path: &Path,
     result_tx: &tokio_mpsc::UnboundedSender<ThemeStoreResult>,
     waker: Option<&TerminalWaker>,
+    loaded: &mut HashMap<String, [u8; 32]>,
 ) {
     // Stop notifications before draining, so an event storm cannot keep the
     // queue nonempty. Accepted user mutations remain lossless through shutdown.
     drop(watcher.take());
     if let Some(work) = first {
-        process_shutdown_work(work, themes_dir, config_path, result_tx, waker);
+        process_shutdown_work(work, themes_dir, config_path, result_tx, waker, loaded);
     }
     for work in deferred {
-        process_shutdown_work(work, themes_dir, config_path, result_tx, waker);
+        process_shutdown_work(work, themes_dir, config_path, result_tx, waker, loaded);
     }
     while let Ok(work) = request_rx.try_recv() {
-        process_shutdown_work(work, themes_dir, config_path, result_tx, waker);
+        process_shutdown_work(work, themes_dir, config_path, result_tx, waker, loaded);
     }
 }
 
@@ -427,6 +456,7 @@ fn process_shutdown_work(
     config_path: &Path,
     result_tx: &tokio_mpsc::UnboundedSender<ThemeStoreResult>,
     waker: Option<&TerminalWaker>,
+    loaded: &mut HashMap<String, [u8; 32]>,
 ) {
     let Work::Request(request) = work else {
         return;
@@ -441,6 +471,7 @@ fn process_shutdown_work(
         result_tx,
         waker,
         None,
+        loaded,
     );
 }
 
@@ -451,6 +482,7 @@ fn process_request(
     result_tx: &tokio_mpsc::UnboundedSender<ThemeStoreResult>,
     waker: Option<&TerminalWaker>,
     active: Option<&Mutex<String>>,
+    loaded: &mut HashMap<String, [u8; 32]>,
 ) {
     let Work::Request(request) = work else {
         return;
@@ -458,7 +490,7 @@ fn process_request(
     match *request {
         Request::Scan => {
             if let Some(active) = active {
-                publish_catalog(themes_dir, result_tx, waker, active);
+                publish_catalog(themes_dir, result_tx, waker, active, loaded);
             }
         }
         Request::Import(path) => {
@@ -468,7 +500,21 @@ fn process_request(
             publish(result_tx, waker, ThemeStoreResult::Imported(result));
         }
         Request::Save(theme) => {
-            let result = write_theme(themes_dir, &theme).map(|_| theme);
+            let (slug, expect) = match valid_slug(&theme.meta.name) {
+                Ok(slug) => {
+                    let expect = loaded
+                        .get(&slug)
+                        .map_or(SaveExpect::New, |hash| SaveExpect::Replace(*hash));
+                    (Some(slug), expect)
+                }
+                Err(_) => (None, SaveExpect::New),
+            };
+            let result = write_theme_expect(themes_dir, &theme, expect).map(|hash| {
+                if let Some(slug) = slug {
+                    loaded.insert(slug, hash);
+                }
+                theme
+            });
             publish(result_tx, waker, ThemeStoreResult::Saved(result));
         }
         Request::Apply {
@@ -488,6 +534,7 @@ fn publish_catalog(
     tx: &tokio_mpsc::UnboundedSender<ThemeStoreResult>,
     waker: Option<&TerminalWaker>,
     active: &Mutex<String>,
+    loaded: &mut HashMap<String, [u8; 32]>,
 ) {
     let preset = match active.lock() {
         Ok(preset) => Some(preset.clone()),
@@ -500,7 +547,8 @@ fn publish_catalog(
             None
         }
     };
-    let (themes, warnings) = scan_dir(dir, preset.as_deref());
+    let (themes, warnings, hashes) = scan_dir_hashed(dir, preset.as_deref());
+    *loaded = hashes;
     publish(tx, waker, ThemeStoreResult::Catalog { themes, warnings });
 }
 
@@ -516,11 +564,20 @@ fn publish(
 }
 
 pub(crate) fn scan_dir(dir: &Path, active: Option<&str>) -> (Vec<UserTheme>, Vec<String>) {
+    let (themes, warnings, _) = scan_dir_hashed(dir, active);
+    (themes, warnings)
+}
+
+pub(crate) fn scan_dir_hashed(
+    dir: &Path,
+    active: Option<&str>,
+) -> (Vec<UserTheme>, Vec<String>, HashMap<String, [u8; 32]>) {
     let mut themes = Vec::new();
     let mut warnings = Vec::new();
+    let mut hashes = HashMap::new();
     if let Err(e) = std::fs::create_dir_all(dir) {
         warnings.push(format!("theme directory unavailable: {e}"));
-        return (themes, warnings);
+        return (themes, warnings, hashes);
     }
     let pinned = active.and_then(|name| {
         let slug = thegn_core::util::slugify(name);
@@ -535,43 +592,48 @@ pub(crate) fn scan_dir(dir: &Path, active: Option<&str>) -> (Vec<UserTheme>, Vec
     let mut exact = HashMap::<String, usize>::new();
     let mut normalized = HashMap::<String, usize>::new();
     for path in paths {
-        match read_bounded(&path).and_then(|bytes| {
-            let text = std::str::from_utf8(&bytes).map_err(|_| "not UTF-8".to_string())?;
-            UserTheme::from_toml(text).map_err(|e| e.to_string())
-        }) {
-            Ok(theme) => {
-                *exact.entry(theme.meta.name.clone()).or_default() += 1;
-                let identity = thegn_core::util::slugify(&theme.meta.name);
-                *normalized.entry(identity.clone()).or_default() += 1;
-                if identity.is_empty() || identity.len() > 80 {
-                    warnings.push(format!(
-                        "{}: theme name has an empty or overlong storage identity",
-                        path.display()
-                    ));
-                    continue;
+        match read_bounded(&path) {
+            Ok(bytes) => match std::str::from_utf8(&bytes)
+                .map_err(|_| "not UTF-8".to_string())
+                .and_then(|text| UserTheme::from_toml(text).map_err(|e| e.to_string()))
+            {
+                Ok(theme) => {
+                    let content_hash: [u8; 32] = Sha256::digest(&bytes).into();
+                    *exact.entry(theme.meta.name.clone()).or_default() += 1;
+                    let identity = thegn_core::util::slugify(&theme.meta.name);
+                    *normalized.entry(identity.clone()).or_default() += 1;
+                    if identity.is_empty() || identity.len() > 80 {
+                        warnings.push(format!(
+                            "{}: theme name has an empty or overlong storage identity",
+                            path.display()
+                        ));
+                        continue;
+                    }
+                    if thegn_core::theme::PRESETS
+                        .iter()
+                        .any(|preset| thegn_core::util::slugify(preset) == identity)
+                    {
+                        warnings.push(format!(
+                            "{}: user theme `{}` conflicts with a built-in preset identity",
+                            path.display(),
+                            theme.meta.name
+                        ));
+                        continue;
+                    }
+                    let expected = format!("{identity}.toml");
+                    if path.file_name().and_then(|name| name.to_str()) != Some(expected.as_str()) {
+                        warnings.push(format!(
+                            "{}: filename does not match theme name `{}` (expected `{expected}`)",
+                            path.display(),
+                            theme.meta.name
+                        ));
+                        continue;
+                    }
+                    hashes.insert(identity, content_hash);
+                    themes.push(theme);
                 }
-                if thegn_core::theme::PRESETS
-                    .iter()
-                    .any(|preset| thegn_core::util::slugify(preset) == identity)
-                {
-                    warnings.push(format!(
-                        "{}: user theme `{}` conflicts with a built-in preset identity",
-                        path.display(),
-                        theme.meta.name
-                    ));
-                    continue;
-                }
-                let expected = format!("{identity}.toml");
-                if path.file_name().and_then(|name| name.to_str()) != Some(expected.as_str()) {
-                    warnings.push(format!(
-                        "{}: filename does not match theme name `{}` (expected `{expected}`)",
-                        path.display(),
-                        theme.meta.name
-                    ));
-                    continue;
-                }
-                themes.push(theme);
-            }
+                Err(e) => warnings.push(format!("{}: {e}", path.display())),
+            },
             Err(e) => warnings.push(format!("{}: {e}", path.display())),
         }
     }
@@ -595,9 +657,14 @@ pub(crate) fn scan_dir(dir: &Path, active: Option<&str>) -> (Vec<UserTheme>, Vec
             .unwrap_or(0);
         exact_count <= 1 && normalized_count <= 1
     });
+    hashes.retain(|slug, _| {
+        themes
+            .iter()
+            .any(|theme| thegn_core::util::slugify(&theme.meta.name) == *slug)
+    });
     themes.sort_by(|a, b| a.meta.name.cmp(&b.meta.name));
     warnings.sort();
-    (themes, warnings)
+    (themes, warnings, hashes)
 }
 
 fn bounded_theme_paths(
@@ -706,6 +773,14 @@ fn valid_slug(name: &str) -> Result<String, String> {
 }
 
 pub(crate) fn write_theme(dir: &Path, theme: &UserTheme) -> Result<(), String> {
+    write_theme_expect(dir, theme, SaveExpect::New).map(|_| ())
+}
+
+pub(crate) fn write_theme_expect(
+    dir: &Path,
+    theme: &UserTheme,
+    expect: SaveExpect,
+) -> Result<[u8; 32], String> {
     theme.validate().map_err(|e| e.to_string())?;
     if thegn_core::theme::PRESETS.iter().any(|preset| {
         thegn_core::util::slugify(preset) == thegn_core::util::slugify(&theme.meta.name)
@@ -736,7 +811,45 @@ pub(crate) fn write_theme(dir: &Path, theme: &UserTheme) -> Result<(), String> {
         Err(error) => return Err(format!("cannot verify existing theme identity: {error}")),
     }
     let text = theme.to_toml().map_err(|e| e.to_string())?;
-    atomic_write(&destination, text.as_bytes(), None)
+    let bytes = text.as_bytes();
+    match expect {
+        SaveExpect::New => match publish_new(&destination, bytes) {
+            Ok(()) => {}
+            Err(error) if error == "already exists" => {
+                return Err(format!(
+                    "theme `{}` already exists on disk; it was not overwritten",
+                    theme.meta.name
+                ));
+            }
+            Err(error) => return Err(error),
+        },
+        SaveExpect::Replace(expected) => {
+            let existing = match read_bounded(&destination) {
+                Ok(bytes) => bytes,
+                Err(_) => {
+                    return match std::fs::symlink_metadata(&destination) {
+                        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Err(format!(
+                            "theme `{}` was removed on disk since it was loaded; nothing was written",
+                            theme.meta.name
+                        )),
+                        _ => Err(format!(
+                            "cannot verify theme `{}` on disk; nothing was written",
+                            theme.meta.name
+                        )),
+                    };
+                }
+            };
+            let actual: [u8; 32] = Sha256::digest(&existing).into();
+            if actual != expected {
+                return Err(format!(
+                    "theme `{}` changed on disk since it was loaded; reopen the theme builder to reload it (nothing was written)",
+                    theme.meta.name
+                ));
+            }
+            atomic_write(&destination, bytes, None)?;
+        }
+    }
+    Ok(Sha256::digest(bytes).into())
 }
 
 pub(crate) fn write_theme_selection(
@@ -860,12 +973,71 @@ impl Drop for PendingTemp {
     }
 }
 
-fn atomic_write(
-    destination: &Path,
-    bytes: &[u8],
-    permissions: Option<std::fs::Permissions>,
-) -> Result<(), String> {
-    static NEXT_TEMP: AtomicU64 = AtomicU64::new(0);
+fn publish_new(destination: &Path, bytes: &[u8]) -> Result<(), String> {
+    publish_new_with(destination, bytes, |from: &Path, to: &Path| {
+        std::fs::hard_link(from, to)
+    })
+}
+
+fn publish_new_with<F>(destination: &Path, bytes: &[u8], hard_link: F) -> Result<(), String>
+where
+    F: FnOnce(&Path, &Path) -> std::io::Result<()>,
+{
+    let (pending, mut file) = create_private_temp(destination)?;
+    file.write_all(bytes).map_err(|e| e.to_string())?;
+    file.sync_all().map_err(|e| e.to_string())?;
+    drop(file);
+    let temporary = pending.0.as_ref().expect("temporary path");
+    match hard_link(temporary, destination) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            return Err("already exists".into());
+        }
+        Err(error) if hard_link_unavailable(&error) => {
+            let mut destination_file = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(destination)
+                .map_err(|fallback_error| {
+                    if fallback_error.kind() == std::io::ErrorKind::AlreadyExists {
+                        "already exists".to_string()
+                    } else {
+                        fallback_error.to_string()
+                    }
+                })?;
+            if let Err(error) = destination_file.write_all(bytes) {
+                if let Err(cleanup_error) = std::fs::remove_file(destination) {
+                    tracing::debug!(%cleanup_error, "could not remove incomplete theme after fallback write failure");
+                }
+                return Err(error.to_string());
+            }
+            if let Err(error) = destination_file.sync_all() {
+                if let Err(cleanup_error) = std::fs::remove_file(destination) {
+                    tracing::debug!(%cleanup_error, "could not remove unsynced theme after fallback sync failure");
+                }
+                return Err(error.to_string());
+            }
+        }
+        Err(error) => return Err(error.to_string()),
+    }
+    // Publication succeeded; a failed cleanup must not turn it into a save failure.
+    if let Err(error) = std::fs::remove_file(temporary) {
+        tracing::debug!(%error, "published theme but could not remove its private temporary file");
+    }
+    // PendingTemp retries cleanup best-effort when it is dropped.
+    Ok(())
+}
+
+fn hard_link_unavailable(error: &std::io::Error) -> bool {
+    matches!(
+        error.kind(),
+        std::io::ErrorKind::Unsupported
+            | std::io::ErrorKind::PermissionDenied
+            | std::io::ErrorKind::CrossesDevices
+    )
+}
+
+fn create_private_temp(destination: &Path) -> Result<(PendingTemp, std::fs::File), String> {
     let parent = destination.parent().unwrap_or_else(|| Path::new("."));
     std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
     let base = destination
@@ -890,9 +1062,17 @@ fn atomic_write(
             Err(error) => return Err(error.to_string()),
         }
     }
-    let (temporary, mut file) = opened
+    let (temporary, file) = opened
         .ok_or_else(|| "could not allocate a unique temporary file for atomic write".to_string())?;
-    let mut pending = PendingTemp(Some(temporary));
+    Ok((PendingTemp(Some(temporary)), file))
+}
+
+fn atomic_write(
+    destination: &Path,
+    bytes: &[u8],
+    permissions: Option<std::fs::Permissions>,
+) -> Result<(), String> {
+    let (mut pending, mut file) = create_private_temp(destination)?;
     file.write_all(bytes).map_err(|e| e.to_string())?;
     if let Some(permissions) = permissions {
         file.set_permissions(permissions)
@@ -1403,5 +1583,235 @@ mod tests {
         let (themes, warnings) = runtime.block_on(store.initial_catalog());
         assert!(themes.is_empty());
         assert!(warnings.iter().any(|warning| warning.contains("stopped")));
+    }
+
+    #[test]
+    fn theme_cas_new_save_never_replaces_an_existing_file() {
+        let temp = private_temp_dir();
+        let dir = temp.path().join("themes");
+        std::fs::create_dir_all(&dir).unwrap();
+        let original = theme("night").to_toml().unwrap();
+        let path = dir.join("night.toml");
+        std::fs::write(&path, original.as_bytes()).unwrap();
+
+        let error = write_theme(&dir, &theme("night")).unwrap_err();
+        assert!(error.contains("already exists"), "{error}");
+        assert_eq!(std::fs::read(&path).unwrap(), original.as_bytes());
+    }
+
+    #[test]
+    fn theme_cas_new_save_falls_back_when_hard_links_are_unsupported() {
+        let temp = private_temp_dir();
+        let path = temp.path().join("fallback.toml");
+        let bytes = b"theme bytes";
+
+        publish_new_with(&path, bytes, |_, _| {
+            Err(std::io::Error::from(std::io::ErrorKind::Unsupported))
+        })
+        .unwrap();
+
+        assert_eq!(std::fs::read(&path).unwrap(), bytes);
+        assert!(
+            publish_new_with(&path, b"replacement", |_, _| {
+                Err(std::io::Error::from(std::io::ErrorKind::Unsupported))
+            })
+            .unwrap_err()
+            .contains("already exists")
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), bytes);
+    }
+
+    #[test]
+    fn theme_cas_new_save_succeeds_when_temp_cleanup_fails() {
+        let temp = private_temp_dir();
+        let path = temp.path().join("published.toml");
+        let bytes = b"published bytes";
+
+        publish_new_with(&path, bytes, |temporary, destination| {
+            std::fs::hard_link(temporary, destination)?;
+            std::fs::remove_file(temporary)?;
+            std::fs::create_dir(temporary)
+        })
+        .unwrap();
+
+        assert_eq!(std::fs::read(&path).unwrap(), bytes);
+    }
+
+    #[test]
+    fn theme_cas_concurrent_new_saves_have_one_winner() {
+        let temp = private_temp_dir();
+        let dir = temp.path().join("themes");
+        std::fs::create_dir_all(&dir).unwrap();
+        let barrier = Arc::new(std::sync::Barrier::new(2));
+        let mut candidates = Vec::new();
+        let mut handles = Vec::new();
+        for color in ["#111111", "#222222"] {
+            let mut candidate = theme("racing");
+            candidate.colors.text = color.into();
+            let bytes = candidate.to_toml().unwrap().into_bytes();
+            candidates.push(bytes.clone());
+            let worker_dir = dir.clone();
+            let worker_barrier = Arc::clone(&barrier);
+            handles.push(std::thread::spawn(move || {
+                worker_barrier.wait();
+                (
+                    write_theme_expect(&worker_dir, &candidate, SaveExpect::New),
+                    bytes,
+                )
+            }));
+        }
+        let outcomes = handles
+            .into_iter()
+            .map(|handle| handle.join().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            outcomes.iter().filter(|(result, _)| result.is_ok()).count(),
+            1
+        );
+        assert_eq!(
+            outcomes
+                .iter()
+                .filter(|(result, _)| result.is_err())
+                .count(),
+            1
+        );
+        let error = outcomes
+            .iter()
+            .find_map(|(result, _)| result.as_ref().err())
+            .unwrap();
+        assert!(error.contains("already exists"), "{error}");
+        let winner_bytes = outcomes
+            .iter()
+            .find_map(|(result, bytes)| result.is_ok().then_some(bytes))
+            .unwrap();
+        assert_eq!(
+            std::fs::read(dir.join("racing.toml")).unwrap(),
+            *winner_bytes
+        );
+        assert!(candidates.iter().any(|bytes| bytes == winner_bytes));
+    }
+
+    #[test]
+    fn theme_cas_stale_hash_overwrite_is_refused() {
+        let temp = private_temp_dir();
+        let dir = temp.path().join("themes");
+        std::fs::create_dir_all(&dir).unwrap();
+        write_theme(&dir, &theme("mutable")).unwrap();
+        let (themes, _, hashes) = scan_dir_hashed(&dir, None);
+        assert_eq!(themes.len(), 1);
+        let expected = hashes.get("mutable").copied().unwrap();
+        let mut external = theme("mutable");
+        external.colors.text = "#123456".into();
+        let external_bytes = external.to_toml().unwrap();
+        let path = dir.join("mutable.toml");
+        std::fs::write(&path, external_bytes.as_bytes()).unwrap();
+
+        let mut replacement = theme("mutable");
+        replacement.colors.text = "#abcdef".into();
+        let error =
+            write_theme_expect(&dir, &replacement, SaveExpect::Replace(expected)).unwrap_err();
+        assert!(error.contains("changed on disk"), "{error}");
+        assert_eq!(std::fs::read(&path).unwrap(), external_bytes.as_bytes());
+    }
+
+    #[test]
+    fn theme_cas_fresh_hash_overwrite_succeeds() {
+        let temp = private_temp_dir();
+        let dir = temp.path().join("themes");
+        std::fs::create_dir_all(&dir).unwrap();
+        write_theme(&dir, &theme("mutable")).unwrap();
+        let (themes, _, hashes) = scan_dir_hashed(&dir, None);
+        assert_eq!(themes.len(), 1);
+        let expected = hashes.get("mutable").copied().unwrap();
+        let mut replacement = theme("mutable");
+        replacement.colors.text = "#abcdef".into();
+        let bytes = replacement.to_toml().unwrap();
+
+        let actual = write_theme_expect(&dir, &replacement, SaveExpect::Replace(expected)).unwrap();
+        let expected_hash: [u8; 32] = Sha256::digest(bytes.as_bytes()).into();
+        assert_eq!(actual, expected_hash);
+        assert_eq!(
+            std::fs::read(dir.join("mutable.toml")).unwrap(),
+            bytes.as_bytes()
+        );
+    }
+
+    #[test]
+    fn theme_cas_worker_save_after_scan_replaces_and_tracks_hash() {
+        let temp = private_temp_dir();
+        let themes_dir = temp.path().join("themes");
+        std::fs::create_dir_all(&themes_dir).unwrap();
+        let config_path = temp.path().join("config.toml");
+        let mut first = theme("tracked");
+        first.colors.text = "#111111".into();
+        write_theme(&themes_dir, &first).unwrap();
+        let (request_tx, request_rx) = mpsc::channel();
+        let (watcher_tx, watcher_rx) = mpsc::channel();
+        drop(watcher_rx);
+        let (result_tx, mut result_rx) = tokio_mpsc::unbounded_channel();
+        let worker = std::thread::spawn(move || {
+            worker(
+                request_rx,
+                result_tx,
+                None,
+                themes_dir,
+                config_path,
+                watcher_tx,
+                WorkerState {
+                    shutdown: Arc::new(AtomicBool::new(false)),
+                    active: Arc::new(Mutex::new(String::new())),
+                },
+            );
+        });
+        assert!(matches!(
+            result_rx.blocking_recv(),
+            Some(ThemeStoreResult::Catalog { .. })
+        ));
+
+        let mut second = theme("tracked");
+        second.colors.text = "#222222".into();
+        request_tx
+            .send(Work::Request(Box::new(Request::Save(second))))
+            .unwrap();
+        assert!(matches!(
+            result_rx.blocking_recv(),
+            Some(ThemeStoreResult::Saved(Ok(_)))
+        ));
+
+        let mut third = theme("tracked");
+        third.colors.text = "#333333".into();
+        request_tx
+            .send(Work::Request(Box::new(Request::Save(third))))
+            .unwrap();
+        assert!(matches!(
+            result_rx.blocking_recv(),
+            Some(ThemeStoreResult::Saved(Ok(_)))
+        ));
+
+        let mut external = theme("tracked");
+        external.colors.text = "#444444".into();
+        let external_bytes = external.to_toml().unwrap();
+        std::fs::write(
+            temp.path().join("themes/tracked.toml"),
+            external_bytes.as_bytes(),
+        )
+        .unwrap();
+        let mut stale = theme("tracked");
+        stale.colors.text = "#555555".into();
+        request_tx
+            .send(Work::Request(Box::new(Request::Save(stale))))
+            .unwrap();
+        match result_rx.blocking_recv() {
+            Some(ThemeStoreResult::Saved(Err(error))) => {
+                assert!(error.contains("changed on disk"), "{error}");
+            }
+            result => panic!("expected stale-save refusal, received {result:?}"),
+        }
+        drop(request_tx);
+        worker.join().unwrap();
+        assert_eq!(
+            std::fs::read(temp.path().join("themes/tracked.toml")).unwrap(),
+            external_bytes.as_bytes()
+        );
     }
 }
