@@ -280,7 +280,8 @@ fn open_bridge_native(
 }
 
 /// Adapts an [`ExecSession`]'s stdout frames into a blocking [`Read`] for the
-/// `BridgeClient` reader thread. EOF on an `Exit` frame or a closed channel.
+/// `BridgeClient` reader thread. `Exit(0)` is EOF; nonzero exits and a closed
+/// channel without an exit status are read errors.
 /// Uses `blocking_recv` — only sound off a runtime worker (the bridge reader is
 /// a dedicated std::thread, which satisfies that).
 struct FramesReader {
@@ -325,9 +326,22 @@ impl Read for FramesReader {
                     self.buf = d;
                     self.pos = 0;
                 }
-                Some(ExecFrame::Exit(_)) | None => {
+                Some(ExecFrame::Exit(0)) => {
                     self.done = true;
                     return Ok(0);
+                }
+                Some(ExecFrame::Exit(code)) => {
+                    self.done = true;
+                    return Err(io::Error::other(format!(
+                        "bridge exited with status {code}"
+                    )));
+                }
+                None => {
+                    self.done = true;
+                    return Err(io::Error::new(
+                        io::ErrorKind::UnexpectedEof,
+                        "bridge stream ended without an exit status",
+                    ));
                 }
             }
         }
@@ -424,6 +438,39 @@ mod tests {
             out.extend_from_slice(&tmp[..n]);
         }
         assert_eq!(out, b"abcd");
+    }
+
+    #[test]
+    fn frames_reader_reports_a_nonzero_exit_as_an_error() {
+        let (frames_tx, frames_rx) = tokio::sync::mpsc::channel::<ExecFrame>(8);
+        let mut reader = FramesReader::new(frames_rx);
+
+        frames_tx
+            .blocking_send(ExecFrame::Stdout(b"ab".to_vec()))
+            .unwrap();
+        frames_tx.blocking_send(ExecFrame::Exit(3)).unwrap();
+        let mut out = [0u8; 8];
+        assert_eq!(reader.read(&mut out).unwrap(), 2);
+        assert_eq!(&out[..2], b"ab");
+        let error = reader.read(&mut out).unwrap_err();
+        assert!(error.to_string().contains("status 3"));
+        assert_eq!(reader.read(&mut out).unwrap(), 0);
+    }
+
+    #[test]
+    fn frames_reader_reports_a_dropped_stream_as_unexpected_eof() {
+        let (frames_tx, frames_rx) = tokio::sync::mpsc::channel::<ExecFrame>(8);
+        let mut reader = FramesReader::new(frames_rx);
+
+        frames_tx
+            .blocking_send(ExecFrame::Stdout(b"x".to_vec()))
+            .unwrap();
+        drop(frames_tx);
+        let mut out = [0u8; 8];
+        assert_eq!(reader.read(&mut out).unwrap(), 1);
+        assert_eq!(&out[..1], b"x");
+        let error = reader.read(&mut out).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::UnexpectedEof);
     }
 
     #[test]
