@@ -512,6 +512,32 @@ fn events_without_a_start_are_not_admitted_or_charged() {
 }
 
 #[test]
+fn a_windowed_parse_reports_an_event_without_a_start() {
+    let doc = "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:no-start\r\nSUMMARY:no start\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n";
+    let mut meter = AdmissionMeter::isolated(AdmissionBudget::new(1).unwrap());
+    let mut out = Vec::new();
+    let mut report = IcsReport::default();
+
+    parse_ics_window_reported(
+        doc,
+        "UTC",
+        Some((d(2026, 8, 1), d(2026, 8, 31))),
+        &mut meter,
+        &mut out,
+        || Ok(()),
+        &mut report,
+    )
+    .unwrap();
+
+    assert!(out.is_empty());
+    assert!(
+        report
+            .diagnostics()
+            .contains(&IcsDiagnostic::EventWithoutStart)
+    );
+}
+
+#[test]
 fn an_oversized_retained_property_refuses_its_event() {
     let big = "x".repeat(MAX_EVENT_BYTES);
     let doc = format!(
