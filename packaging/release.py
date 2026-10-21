@@ -34,6 +34,7 @@ PLACEHOLDER_RE = re.compile(r"@@([A-Z][A-Z0-9_]*)@@")
 FORBIDDEN_OUTPUT = ("REPLACE_WITH_", "thegn-dev", ".SRCINFO")
 WINDOWS_ERROR = "Windows release lane is not enabled"
 MAX_ARCHIVE_BYTES = 512 * 1024 * 1024
+RELEASE_MANIFEST_NAME = "thegn-{tag}-manifest.json"
 MAX_MEMBERS = 64
 MAX_MEMBER_BYTES = 256 * 1024 * 1024
 MAX_EXPANDED_BYTES = 512 * 1024 * 1024
@@ -477,6 +478,154 @@ def validate_assets(
     return assets
 
 
+def expected_release_assets(manifest: Mapping[str, Any], tag: str) -> list[str]:
+    names: list[str] = []
+    for target, config in manifest["targets"].items():
+        if config["enabled"]:
+            names.extend(_asset_names(manifest, tag, target))
+    names.extend(
+        (
+            f"thegn-{tag}-completions.tar.gz",
+            f"thegn-{tag}-completions.tar.gz.sha256",
+            f"thegn-{tag}-release.json",
+            f"thegn-{tag}-homebrew.rb",
+            f"thegn-{tag}-PKGBUILD",
+            f"thegn-{tag}-deb.nfpm.yaml",
+            f"thegn-{tag}-rpm.nfpm.yaml",
+        )
+    )
+    version = tag[1:]
+    names.extend((f"thegn_{version}_amd64.deb", f"thegn-{version}-1.x86_64.rpm"))
+    return sorted(names)
+
+
+def build_release_manifest(
+    manifest: Mapping[str, Any],
+    tag: str,
+    commit: str,
+    assets_dir: Path,
+    record_path: Path,
+) -> dict[str, Any]:
+    record_name = f"thegn-{tag}-release.json"
+    if record_path.name != record_name or record_path.parent.resolve() != assets_dir.resolve():
+        raise ReleaseError(f"upload release record must be {record_name} inside the assets directory")
+    if record_path.is_symlink():
+        raise ReleaseError(f"upload release record is not a regular file: {record_name}")
+    assets_dir = assets_dir.resolve()
+    if not assets_dir.is_dir():
+        raise ReleaseError(f"release asset directory does not exist: {assets_dir}")
+    found: dict[str, Path] = {}
+    try:
+        entries = list(os.scandir(assets_dir))
+    except OSError as error:
+        raise ReleaseError(f"cannot list release asset directory {assets_dir}: {error}") from error
+    ignored_manifest = RELEASE_MANIFEST_NAME.format(tag=tag)
+    for entry in entries:
+        path = Path(entry.path)
+        try:
+            metadata = entry.stat(follow_symlinks=False)
+        except OSError as error:
+            raise ReleaseError(f"cannot inspect release asset {path}: {error}") from error
+        if not stat.S_ISREG(metadata.st_mode):
+            raise ReleaseError(f"release asset is not a regular file: {path.name}")
+        if entry.name != ignored_manifest:
+            found[entry.name] = path
+
+    expected = expected_release_assets(manifest, tag)
+    missing = sorted(set(expected) - set(found))
+    unexpected = sorted(set(found) - set(expected))
+    if missing or unexpected:
+        raise ReleaseError(
+            f"release asset set mismatch; missing: {', '.join(missing) or '(none)'}; "
+            f"unexpected: {', '.join(unexpected) or '(none)'}"
+        )
+
+    archive_names: list[str] = []
+    for target, config in manifest["targets"].items():
+        if config["enabled"]:
+            archive_name, checksum_name = _asset_names(manifest, tag, target)
+            archive_names.extend((archive_name, checksum_name))
+    completions_name = f"thegn-{tag}-completions.tar.gz"
+    completions_checksum = f"{completions_name}.sha256"
+    archive_names.extend((completions_name, completions_checksum))
+    for archive_name, checksum_name in zip(archive_names[::2], archive_names[1::2]):
+        actual = _sha256(found[archive_name])
+        recorded = _read_checksum(found[checksum_name], archive_name)
+        if recorded != actual:
+            raise ReleaseError(
+                f"checksum mismatch for {archive_name}: expected {recorded}, got {actual}"
+            )
+
+    try:
+        record = json.loads(record_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as error:
+        raise ReleaseError(f"cannot read upload release record {record_path}: {error}") from error
+    record = _object(record, "upload release record")
+    if record.get("tag") != tag:
+        raise ReleaseError("upload release record tag does not match")
+    if record.get("commit") != commit:
+        raise ReleaseError("upload release record commit does not match admitted commit")
+    tag_object = _string(record.get("tag_object"), "record.tag_object")
+    workflow_sha = _string(record.get("workflow_sha"), "record.workflow_sha")
+    run_id = _string(record.get("run_id"), "record.run_id")
+    record_assets = record.get("assets")
+    if not isinstance(record_assets, list):
+        raise ReleaseError("upload release record assets must be a list")
+    expected_archives = sorted(archive_names)
+    recorded_assets: dict[str, str] = {}
+    for item in record_assets:
+        asset = _object(item, "record asset")
+        name = _string(asset.get("name"), "record asset name")
+        digest = _string(asset.get("sha256"), "record asset sha256")
+        if name in recorded_assets:
+            raise ReleaseError(f"upload release record has duplicate asset {name}")
+        if SHA256_RE.fullmatch(digest) is None:
+            raise ReleaseError(f"record asset {name} sha256 must be lowercase 64-hex SHA-256")
+        recorded_assets[name] = digest
+    if sorted(recorded_assets) != expected_archives:
+        raise ReleaseError("upload release record assets do not exactly match archive/checksum names")
+    for name in expected_archives:
+        if recorded_assets[name] != _sha256(found[name]):
+            raise ReleaseError(f"upload release record digest mismatch for {name}")
+
+    managers = selected_managers(manifest, None)
+    validate_assets(manifest, tag, assets_dir, managers)
+    for target, config in manifest["targets"].items():
+        if config["enabled"]:
+            archive_name, _ = _asset_names(manifest, tag, target)
+            required = list(manifest["archive"]["root_files"])
+            required[0] = config.get("binary", manifest["project"]["binary"])
+            _validate_archive_layout(found[archive_name], config["platform"], required)
+
+    result_assets = []
+    for name in expected:
+        path = found[name]
+        result_assets.append({"name": name, "sha256": _sha256(path), "size": path.stat().st_size})
+    return {
+        "schema_version": 1,
+        "tag": tag,
+        "commit": commit,
+        "tag_object": tag_object,
+        "workflow_sha": workflow_sha,
+        "run_id": run_id,
+        "assets": result_assets,
+    }
+
+
+def write_release_manifest(output: Path, assets_dir: Path, value: Mapping[str, Any]) -> None:
+    try:
+        assets_root = assets_dir.resolve()
+        if output.is_symlink():
+            raise ReleaseError(f"refusing to write release manifest through symlink: {output}")
+        output_parent = output.parent.resolve()
+        output_resolved = output_parent / output.name
+        if output_resolved == assets_root or assets_root in output_resolved.parents:
+            raise ReleaseError("release manifest output must be outside the assets directory")
+        output.write_text(json.dumps(value, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    except OSError as error:
+        raise ReleaseError(f"cannot write release manifest {output}: {error}") from error
+
+
 def _render_template(path: Path, values: Mapping[str, str]) -> str:
     template = path.read_text(encoding="utf-8")
     placeholders = set(PLACEHOLDER_RE.findall(template))
@@ -638,6 +787,13 @@ def _run(args: argparse.Namespace) -> None:
     manifest = load_manifest(manifest_path)
     version = workspace_version(root)
     require_matching_tag(args.tag, version)
+    if args.command == "manifest":
+        value = build_release_manifest(
+            manifest, args.tag, args.commit, args.assets_dir, args.record
+        )
+        write_release_manifest(args.output, args.assets_dir, value)
+        print(args.output.as_posix())
+        return
     managers = selected_managers(manifest, args.manager)
     assets = validate_assets(manifest, args.tag, args.assets_dir.resolve(), managers)
     if args.command == "render":
@@ -666,6 +822,14 @@ def build_parser() -> argparse.ArgumentParser:
         )
         if command == "render":
             subparser.add_argument("--output-dir", required=True, type=Path)
+    manifest_parser = subparsers.add_parser("manifest")
+    manifest_parser.add_argument("--tag", required=True, help="release tag, exactly v<workspace version>")
+    manifest_parser.add_argument("--assets-dir", required=True, type=Path)
+    manifest_parser.add_argument("--record", required=True, type=Path)
+    manifest_parser.add_argument("--commit", required=True)
+    manifest_parser.add_argument("--output", required=True, type=Path)
+    manifest_parser.add_argument("--manifest", type=Path, default=MANIFEST_PATH)
+    manifest_parser.add_argument("--repo-root", type=Path, default=REPOSITORY_ROOT)
     return parser
 
 

@@ -1941,6 +1941,51 @@ pub struct ProxyStream {
     /// Client→server bytes (data to the in-sandbox service). Dropping it (or
     /// sending nothing) and draining `rx` to `None` ends the stream.
     pub tx: tokio::sync::mpsc::Sender<Vec<u8>>,
+    /// Resolves once the driver stops; a dropped sender means it ended abnormally.
+    pub end: tokio::sync::oneshot::Receiver<ProxyEnd>,
+}
+
+/// The terminal condition reported by a provider TCP proxy driver.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ProxyEnd {
+    LocalClosed,
+    PeerClosed,
+    RemoteRejected { code: u16, reason: String },
+    TransportDropped,
+    TransportError(String),
+}
+
+impl ProxyEnd {
+    /// Convert a terminal condition into the result expected by a proxy client.
+    pub fn into_result(self) -> anyhow::Result<()> {
+        let message = match self {
+            Self::LocalClosed | Self::PeerClosed => return Ok(()),
+            Self::RemoteRejected { code, reason } => {
+                let prefix = format!("provider proxy closed by the remote: code {code} (");
+                let suffix = ")";
+                let reason = truncate_proxy_text(reason, 256 - prefix.len() - suffix.len());
+                format!("{prefix}{reason}{suffix}")
+            }
+            Self::TransportDropped => {
+                "provider proxy connection dropped without a close frame".to_string()
+            }
+            Self::TransportError(error) => format!("provider proxy transport error: {error}"),
+        };
+        Err(anyhow::anyhow!(truncate_proxy_text(message, 256)))
+    }
+}
+
+fn truncate_proxy_text(mut text: String, max_bytes: usize) -> String {
+    if text.len() > max_bytes {
+        let boundary = text
+            .char_indices()
+            .map(|(index, _)| index)
+            .take_while(|index| *index <= max_bytes)
+            .last()
+            .unwrap_or(0);
+        text.truncate(boundary);
+    }
+    text
 }
 
 /// Rewrite an `http(s)` API base to its `ws(s)` scheme for the WebSocket handshake.
@@ -2333,10 +2378,12 @@ impl SpritesProvider {
 
         let (to_srv_tx, to_srv_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(256);
         let (from_srv_tx, from_srv_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(256);
-        tokio::spawn(drive_proxy(ws, to_srv_rx, from_srv_tx));
+        let (end_tx, end_rx) = tokio::sync::oneshot::channel();
+        tokio::spawn(drive_proxy(ws, to_srv_rx, from_srv_tx, end_tx));
         Ok(ProxyStream {
             rx: from_srv_rx,
             tx: to_srv_tx,
+            end: end_rx,
         })
     }
 }
@@ -2375,6 +2422,7 @@ async fn drive_proxy<S>(
     ws: S,
     mut to_srv: tokio::sync::mpsc::Receiver<Vec<u8>>,
     from_srv: tokio::sync::mpsc::Sender<Vec<u8>>,
+    end: tokio::sync::oneshot::Sender<ProxyEnd>,
 ) where
     S: futures_util::Sink<tokio_tungstenite::tungstenite::Message>
         + futures_util::Stream<
@@ -2383,33 +2431,53 @@ async fn drive_proxy<S>(
                 tokio_tungstenite::tungstenite::Error,
             >,
         > + Unpin,
+    S::Error: std::fmt::Debug,
 {
     use futures_util::{SinkExt, StreamExt};
-    use tokio_tungstenite::tungstenite::Message;
+    use tokio_tungstenite::tungstenite::{Message, protocol::frame::coding::CloseCode};
     let (mut write, mut read) = ws.split();
-    loop {
+    let terminal = loop {
         tokio::select! {
             out = to_srv.recv() => match out {
                 Some(b) => {
-                    if write.send(Message::Binary(b.into())).await.is_err() {
-                        break;
+                    if let Err(error) = write.send(Message::Binary(b.into())).await {
+                        break ProxyEnd::TransportError(truncate_proxy_text(format!("{error:?}"), 256));
                     }
                 }
-                None => break, // client closed
+                None => break ProxyEnd::LocalClosed,
             },
             msg = read.next() => match msg {
                 Some(Ok(Message::Binary(b))) => {
                     if from_srv.send(b.into()).await.is_err() {
-                        break;
+                        break ProxyEnd::LocalClosed;
                     }
                 }
-                Some(Ok(Message::Close(_))) | None => break,
+                Some(Ok(Message::Close(frame))) => {
+                    break match frame {
+                        None => ProxyEnd::PeerClosed,
+                        Some(frame) => {
+                            let code = u16::from(frame.code);
+                            if matches!(frame.code, CloseCode::Normal | CloseCode::Away) {
+                                ProxyEnd::PeerClosed
+                            } else {
+                                ProxyEnd::RemoteRejected { code, reason: truncate_proxy_text(frame.reason.to_string(), 256) }
+                            }
+                        }
+                    };
+                }
+                None => break ProxyEnd::TransportDropped,
                 Some(Ok(_)) => {} // ignore text/ping/pong
-                Some(Err(_)) => break,
+                Some(Err(error)) => {
+                    break ProxyEnd::TransportError(truncate_proxy_text(error.to_string(), 256));
+                }
             },
         }
-    }
+    };
     let _ = write.send(Message::Close(None)).await; // best-effort: close handshake; peer may be gone
+    match end.send(terminal) {
+        Ok(()) => {}
+        Err(_) => tracing::debug!("provider proxy terminal receiver was dropped"),
+    }
 }
 
 /// The exec bridge task: pump WebSocket frames ⇄ the [`ExecSession`] channels.
@@ -3715,6 +3783,164 @@ mod tests {
         );
         assert_eq!(frames_rx.recv().await, None);
         driver.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn drive_proxy_reports_a_peer_close_as_a_clean_end() {
+        use futures_util::SinkExt;
+        use tokio_tungstenite::tungstenite::{Message, protocol::Role};
+
+        let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+        let client =
+            tokio_tungstenite::WebSocketStream::from_raw_socket(client_io, Role::Client, None)
+                .await;
+        let mut server =
+            tokio_tungstenite::WebSocketStream::from_raw_socket(server_io, Role::Server, None)
+                .await;
+        let (_to_srv_tx, to_srv_rx) = tokio::sync::mpsc::channel(4);
+        let (from_srv_tx, mut from_srv_rx) = tokio::sync::mpsc::channel(4);
+        let (end_tx, end_rx) = tokio::sync::oneshot::channel();
+        let driver = tokio::spawn(drive_proxy(client, to_srv_rx, from_srv_tx, end_tx));
+
+        server
+            .send(Message::Binary(b"ok".to_vec().into()))
+            .await
+            .unwrap();
+        server.send(Message::Close(None)).await.unwrap();
+
+        assert_eq!(from_srv_rx.recv().await, Some(b"ok".to_vec()));
+        assert_eq!(from_srv_rx.recv().await, None);
+        let end = end_rx.await.unwrap();
+        assert_eq!(end, ProxyEnd::PeerClosed);
+        assert!(end.into_result().is_ok());
+        driver.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn drive_proxy_reports_an_abrupt_drop_as_transport_dropped() {
+        use tokio_tungstenite::tungstenite::protocol::Role;
+
+        let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+        let client =
+            tokio_tungstenite::WebSocketStream::from_raw_socket(client_io, Role::Client, None)
+                .await;
+        let server =
+            tokio_tungstenite::WebSocketStream::from_raw_socket(server_io, Role::Server, None)
+                .await;
+        let (_to_srv_tx, to_srv_rx) = tokio::sync::mpsc::channel(4);
+        let (from_srv_tx, mut from_srv_rx) = tokio::sync::mpsc::channel(4);
+        let (end_tx, end_rx) = tokio::sync::oneshot::channel();
+        let driver = tokio::spawn(drive_proxy(client, to_srv_rx, from_srv_tx, end_tx));
+        drop(server);
+
+        assert_eq!(from_srv_rx.recv().await, None);
+        let end = end_rx.await.unwrap();
+        assert!(matches!(
+            end,
+            ProxyEnd::TransportDropped | ProxyEnd::TransportError(_)
+        ));
+        assert!(end.into_result().is_err());
+        driver.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn drive_proxy_reports_an_abnormal_close_code_as_a_rejection() {
+        use futures_util::SinkExt;
+        use tokio_tungstenite::tungstenite::{
+            Message,
+            protocol::{CloseFrame, Role, frame::coding::CloseCode},
+        };
+
+        let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+        let client =
+            tokio_tungstenite::WebSocketStream::from_raw_socket(client_io, Role::Client, None)
+                .await;
+        let mut server =
+            tokio_tungstenite::WebSocketStream::from_raw_socket(server_io, Role::Server, None)
+                .await;
+        let (_to_srv_tx, to_srv_rx) = tokio::sync::mpsc::channel(4);
+        let (from_srv_tx, mut from_srv_rx) = tokio::sync::mpsc::channel(4);
+        let (end_tx, end_rx) = tokio::sync::oneshot::channel();
+        let driver = tokio::spawn(drive_proxy(client, to_srv_rx, from_srv_tx, end_tx));
+
+        server
+            .send(Message::Close(Some(CloseFrame {
+                code: CloseCode::Policy,
+                reason: "denied".into(),
+            })))
+            .await
+            .unwrap();
+
+        assert_eq!(from_srv_rx.recv().await, None);
+        let end = end_rx.await.unwrap();
+        assert_eq!(
+            end,
+            ProxyEnd::RemoteRejected {
+                code: 1008,
+                reason: "denied".to_string()
+            }
+        );
+        assert!(end.into_result().unwrap_err().to_string().contains("1008"));
+        driver.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn drive_proxy_reports_a_local_close() {
+        use tokio_tungstenite::tungstenite::protocol::Role;
+
+        let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+        let client =
+            tokio_tungstenite::WebSocketStream::from_raw_socket(client_io, Role::Client, None)
+                .await;
+        let _server =
+            tokio_tungstenite::WebSocketStream::from_raw_socket(server_io, Role::Server, None)
+                .await;
+        let (to_srv_tx, to_srv_rx) = tokio::sync::mpsc::channel(4);
+        let (from_srv_tx, _from_srv_rx) = tokio::sync::mpsc::channel(4);
+        let (end_tx, end_rx) = tokio::sync::oneshot::channel();
+        let driver = tokio::spawn(drive_proxy(client, to_srv_rx, from_srv_tx, end_tx));
+        drop(to_srv_tx);
+
+        assert_eq!(end_rx.await.unwrap(), ProxyEnd::LocalClosed);
+        driver.await.unwrap();
+    }
+
+    #[test]
+    fn proxy_end_into_result_is_ok_only_for_clean_ends() {
+        let cases = [
+            (ProxyEnd::LocalClosed, true),
+            (ProxyEnd::PeerClosed, true),
+            (
+                ProxyEnd::RemoteRejected {
+                    code: 1008,
+                    reason: "denied".to_string(),
+                },
+                false,
+            ),
+            (ProxyEnd::TransportDropped, false),
+            (ProxyEnd::TransportError("broken".to_string()), false),
+        ];
+        for (end, is_ok) in cases {
+            assert_eq!(end.into_result().is_ok(), is_ok);
+        }
+
+        let long_reason = "é".repeat(1_000);
+        let error = ProxyEnd::RemoteRejected {
+            code: 1008,
+            reason: long_reason,
+        }
+        .into_result()
+        .unwrap_err()
+        .to_string();
+        assert!(error.len() <= 256);
+        assert!(error.ends_with("é)"));
+
+        let transport_error = ProxyEnd::TransportError("界".repeat(1_000))
+            .into_result()
+            .unwrap_err()
+            .to_string();
+        assert!(transport_error.len() <= 256);
+        assert!(transport_error.ends_with('界'));
     }
 
     #[tokio::test]

@@ -11,6 +11,7 @@
 //! MPD `idle`) concurrently, so the ~0%-idle contract holds — poll-only children
 //! just contribute nothing to the stream and ride the host's safety poll.
 
+use std::collections::HashSet;
 use std::sync::Mutex;
 
 use futures::future::{BoxFuture, join_all, select_all};
@@ -128,6 +129,7 @@ impl MediaBackend for Aggregate {
             }))
             .await;
             let mut out = Vec::new();
+            let mut seen = HashSet::new();
             let mut failures = Vec::new();
             for (i, result) in players {
                 let source_players = match result {
@@ -144,7 +146,10 @@ impl MediaBackend for Aggregate {
                     }
                 };
                 for p in source_players {
-                    if !out.contains(&p) {
+                    if out.len() == crate::model::MAX_PLAYERS {
+                        break;
+                    }
+                    if seen.insert(p.clone()) {
                         out.push(p);
                     }
                 }
@@ -561,6 +566,35 @@ mod tests {
             Vec::new(),
         );
         assert!(aggregate.players().await.is_err());
+    }
+
+    #[tokio::test]
+    async fn players_union_is_deduplicated_in_order_and_capped() {
+        // Positive control: ordered deduplication also passes on the uncapped implementation.
+        let aggregate = Aggregate::new(
+            vec![
+                players_backend(Ok(vec!["a".into(), "b".into()]), Ok(None)),
+                players_backend(Ok(vec!["b".into(), "c".into()]), Ok(None)),
+            ],
+            Vec::new(),
+        );
+        assert_eq!(
+            aggregate.players().await,
+            Ok(vec!["a".into(), "b".into(), "c".into()])
+        );
+
+        let first_players = (0..crate::model::MAX_PLAYERS + 5)
+            .map(|index| format!("player-{index}"))
+            .collect::<Vec<_>>();
+        let expected = first_players[..crate::model::MAX_PLAYERS].to_vec();
+        let aggregate = Aggregate::new(
+            vec![
+                players_backend(Ok(first_players), Ok(None)),
+                players_backend(Ok(vec!["after-cap".into()]), Ok(None)),
+            ],
+            Vec::new(),
+        );
+        assert_eq!(aggregate.players().await, Ok(expected));
     }
 
     #[tokio::test]

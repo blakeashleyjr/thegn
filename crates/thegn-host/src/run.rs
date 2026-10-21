@@ -7389,6 +7389,7 @@ async fn event_loop<T: Terminal>(
         std::collections::HashSet::new();
     // Bumped per root-set change; orders the off-loop reconcile tasks.
     let mut lsp_reconcile_epoch: u64 = 0;
+    let mut lsp_config_epoch: u64 = 0;
     let mut lsp_evict_due = std::time::Instant::now();
     {
         let wake_rx = lsp_diag_rx.clone();
@@ -11276,7 +11277,9 @@ async fn event_loop<T: Terminal>(
         // Bank a hunk preview only while its ownership token still owns the
         // path and its generation passes the acceptance cutoff. Completions
         // from before a refresh or worktree switch are dropped.
+        let mut preview_slot_freed = false;
         while let Ok((generation, token, path, hunks)) = hunk_rx.try_recv() {
+            preview_slot_freed = true;
             loop_perf.tick(crate::perf::WakeSource::Hunk);
             let owns_path = hunk_inflight.finish(&path, token);
             if owns_path && generation >= panel_ui.hunks_gen {
@@ -11337,6 +11340,7 @@ async fn event_loop<T: Terminal>(
             }
         }
         while let Ok((generation, token, path, summary)) = submodule_preview_rx.try_recv() {
+            preview_slot_freed = true;
             loop_perf.tick(crate::perf::WakeSource::Hunk);
             let owns_path = submodule_preview_inflight.finish(&path, token);
             if owns_path
@@ -11351,6 +11355,19 @@ async fn event_loop<T: Terminal>(
                 submodule.summary = Some(summary);
                 dirty = true;
             }
+        }
+        if preview_slot_freed {
+            crate::handlers::panel_changes::start_selected_preview(
+                &panel_ui,
+                &model,
+                &session,
+                &mut hunk_inflight,
+                &hunk_tx,
+                &mut submodule_preview_inflight,
+                &submodule_preview_tx,
+                &waker,
+                hydration_gen,
+            );
         }
 
         // Rasterized preview images (document-viewer graphics path) land in the
@@ -12320,7 +12337,8 @@ async fn event_loop<T: Terminal>(
             // rebase-merge/" saw no banner, cleared the flow, destroyed the
             // edited TODO list, and printed "rebase finished" before the
             // rebase started.
-            if panel_ui.git.pending.is_none() {
+            // A failed merge probe also cannot establish that a flow ended.
+            if gitui::mirror_external_flows(&panel_ui.git, model.panel.merge_unknown) {
                 let banner = model
                     .panel
                     .merge
@@ -13747,6 +13765,20 @@ async fn event_loop<T: Terminal>(
                     if let Some(picker) = workspace_picker.as_mut() {
                         picker.config_reloaded(new_cfg.clone(), waker.clone());
                     }
+                    lsp_config_epoch += 1;
+                    let epoch = lsp_config_epoch;
+                    let (enabled, servers) = (new_cfg.lsp.enabled, new_cfg.lsp.servers.clone());
+                    let lsp = lsp_supervisor.handle();
+                    tokio::task::spawn_blocking(move || {
+                        let released = lsp.reconfigure(epoch, enabled, &servers);
+                        if released > 0 {
+                            tracing::debug!(
+                                target: "thegn::lsp",
+                                released,
+                                "reconciled LSP servers after config reload"
+                            );
+                        }
+                    });
                     current_config = new_cfg;
                     // Rebuild only the effective hydration schedule. This is
                     // intentionally after successful config admission; the
@@ -14002,6 +14034,7 @@ async fn event_loop<T: Terminal>(
                     want_pr_refresh |= !skip_net;
                     want_model_refresh = true;
                 }
+                RefreshKind::PrActionStatus(status) => model.status = status,
                 RefreshKind::Issues => {
                     want_issue_refresh |= !skip_net;
                     want_model_refresh = true;

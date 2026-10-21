@@ -219,6 +219,10 @@ server does not hold up the others.
 For a recurring event, an override with its `RECURRENCE-ID` replaces the
 generated occurrence, even if it moves to another day; a cancelled override
 hides that occurrence. Events at the same time are listed in a stable order.
+A cancellation-only update with no new start time is applied too: with a
+`RECURRENCE-ID` it hides that occurrence, and without one it removes the series.
+When a calendar carries two versions of the same event, the higher `SEQUENCE`
+wins, so an older cancellation cannot remove a newer confirmed event.
 
 An event marked free (`TRANSP:TRANSPARENT` in iCalendar, `"busy": "free"` from
 a command plugin) is shown dimmed in the agenda. It is still listed and its

@@ -23,6 +23,34 @@ use thegn_svc::git::{CliGit, GitBackend, PlumbingOps};
 
 use crate::{integrate, merge_driver};
 
+#[derive(Debug)]
+pub(crate) struct PipelineWorktreeRefusals {
+    pub(crate) details: Vec<String>,
+}
+
+impl fmt::Display for PipelineWorktreeRefusals {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "{} pipeline worktree(s) refused merge admission: {}",
+            self.details.len(),
+            self.details.join("; ")
+        )
+    }
+}
+
+impl std::error::Error for PipelineWorktreeRefusals {}
+
+pub(crate) fn drain_add_result(result: Result<()>) -> Result<Option<String>> {
+    match result {
+        Ok(()) => Ok(None),
+        Err(error) if error.downcast_ref::<PipelineWorktreeRefusals>().is_some() => {
+            Ok(Some(error.to_string()))
+        }
+        Err(error) => Err(error),
+    }
+}
+
 /// The branch a worktree is currently on (`None` when detached).
 pub fn branch_of(worktree: &Path) -> Option<String> {
     util::git_out(worktree, &["symbolic-ref", "--quiet", "--short", "HEAD"])
@@ -37,8 +65,19 @@ pub(crate) fn enqueue_bound_local(
     branch: &str,
     target: &str,
 ) -> Result<()> {
+    enqueue_bound_local_with(db, worktree, branch, target, None)
+}
+
+pub(crate) fn enqueue_bound_local_with(
+    db: &Db,
+    worktree: &str,
+    branch: &str,
+    target: &str,
+    admin_why: Option<&str>,
+) -> Result<()> {
     let branch_ref = format!("refs/heads/{branch}");
     let candidate_oid = CliGit.rev_parse(&GitLoc::from_db(worktree, None), &branch_ref)?;
+    crate::cmd::dispatch::gate::pipeline_merge_admission(db, worktree, &candidate_oid, admin_why)?;
     db.enqueue_merge_candidate(
         worktree,
         branch,
@@ -250,6 +289,15 @@ fn resolve_repo_root(worktree: &Path) -> Result<PathBuf> {
 /// outcome (queued / skipped). Errors only on a genuinely broken worktree
 /// (detached HEAD, not a repo) or a DB write failure.
 pub fn enqueue_worktree(cfg: &Config, db: &Db, worktree: &Path) -> Result<String> {
+    enqueue_worktree_with(cfg, db, worktree, None)
+}
+
+pub fn enqueue_worktree_with(
+    cfg: &Config,
+    db: &Db,
+    worktree: &Path,
+    admin_why: Option<&str>,
+) -> Result<String> {
     let worktree = &canonical_worktree(worktree);
     let root = resolve_repo_root(worktree)?;
     // Takes the whole `Config` rather than a `MergeQueueConfig`: only here is the
@@ -262,7 +310,7 @@ pub fn enqueue_worktree(cfg: &Config, db: &Db, worktree: &Path) -> Result<String
     if branch == target {
         return Ok(format!("skipped {branch} (that's the target branch)"));
     }
-    enqueue_bound_local(db, &wt_s, &branch, &target)?;
+    enqueue_bound_local_with(db, &wt_s, &branch, &target, admin_why)?;
     crate::merge_lifecycle::apply(mq, db, &root, &wt_s, &branch, LifecycleEvent::Enqueued);
     Ok(format!("queued {branch}"))
 }
@@ -520,6 +568,20 @@ pub fn clear_repo(cfg: &Config, db: &Db, root: &Path) -> Result<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn drain_add_continues_after_pipeline_refusals_but_propagates_other_errors() {
+        let refusal: Result<()> = Err(PipelineWorktreeRefusals {
+            details: vec!["branch-a: pipeline row 12 refused".to_string()],
+        }
+        .into());
+        let warning = drain_add_result(refusal).unwrap().unwrap();
+        assert!(warning.contains("branch-a"));
+
+        let other_error = anyhow::anyhow!("database unavailable");
+        let result = drain_add_result(Err(other_error));
+        assert!(matches!(result, Err(error) if error.to_string().contains("database unavailable")));
+    }
 
     fn land_row(
         status: &str,

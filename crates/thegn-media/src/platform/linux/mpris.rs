@@ -359,7 +359,12 @@ impl MediaBackend for MprisZbus {
                     MPRIS_PATH,
                     Some(PLAYLISTS_IFACE),
                     "GetPlaylists",
-                    &(0u32, 100u32, "Alphabetical", false),
+                    &(
+                        0u32,
+                        u32::try_from(crate::model::MAX_PLAYLISTS).unwrap_or(u32::MAX),
+                        "Alphabetical",
+                        false,
+                    ),
                 )
                 .await
                 .map_err(|e| MediaError::Backend(e.to_string()))?;
@@ -369,6 +374,7 @@ impl MediaBackend for MprisZbus {
                 .map_err(|e| MediaError::Backend(e.to_string()))?;
             Ok(lists
                 .into_iter()
+                .take(crate::model::MAX_PLAYLISTS)
                 .map(|(path, name, _icon)| Playlist {
                     id: path.as_str().to_string(),
                     name,

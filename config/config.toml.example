@@ -4361,7 +4361,9 @@ conflict_handoff = "agent"    # agent | notify | manual — fate of a deferred b
 # dispatching a headless CLI agent INSIDE the branch's own worktree to rebase onto
 # the target, resolve conflicts, and fix a red gate, then re-attempting the fold
 # and auto-landing on green. The agent never touches main; thegn does the
-# object-DB fold + CAS itself. {prompt}/{branch}/{target} are substituted.
+# object-DB fold + CAS itself. {prompt}/{prompt_file}/{branch}/{target} are substituted.
+# {prompt} puts the prompt in argv, where other local processes can read it;
+# {prompt_file} passes the path of an owner-only file (deleted when the run ends) instead.
 #
 # WRITE PLACEHOLDERS BARE. Every substituted value is shell-quoted for you, so
 # `-p {prompt}` is correct and `-p "{prompt}"` is not — quoting it yourself hands
@@ -4473,9 +4475,9 @@ failed_folder = "Needs attention"  # folder for a branch that fails to land ("" 
 # object-DB coherence guarantee). Override a key to add your repo's conventions.
 #
 # These are PROSE templates, not shell — they are not quoted, and the rendered
-# rendered text reaches the agent once: as {prompt} in the command when its
-# template uses that placeholder, otherwise as $THEGN_TASK_PROMPT. In that env
-# case, merge kinds also receive the legacy $THEGN_MERGE_PROMPT alias.
+# rendered text reaches the agent once: as {prompt} in the command, as the file
+# named by {prompt_file}, otherwise as $THEGN_TASK_PROMPT (merge kinds then also
+# get $THEGN_MERGE_PROMPT).
 # Placeholders are per kind and an unknown one is a `config validate` error,
 # not a silent blank:
 #   conflict     — {branch} {target} {worktree} {paths}   (one "  - path" line each)

@@ -13,11 +13,14 @@
 //! ACCESS_DENIED (see the comment there).
 //!
 //! Pipe names are derived from the same per-state-dir socket *path* the unix
-//! side uses (`\\.\pipe\thegn-<hex(sha256(path))[..16]>`), so the
-//! one-daemon-per-`$XDG_STATE_HOME` isolation (`just start`, smoke tests, the
-//! "this shell runs inside a live thegn" gotcha) carries over unchanged. The
+//! side uses (`\\.\pipe\thegn-v2-<hex(sha256(identity))[..32]>`). The
+//! `thegn/daemon-pipe/v2\0` domain and 128-bit digest prefix bind the name to a
+//! normalized Windows path identity (Unix callers use the socket path itself);
+//! display strings are diagnostic only and are never identity keys. The
 //! derivation and endpoint classification are pure and unit-tested on every
 //! platform; only the syscalls are `#[cfg]`-gated.
+//! A pre-upgrade Windows daemon keeps its old pipe name and is reached through
+//! its registry row; after it stops, new daemons use the v2 name.
 //!
 //! Unix endpoint authenticity is bound to the daemon's effective uid and the
 //! filesystem namespace containing its owner-only socket parent. Other
@@ -83,14 +86,41 @@ pub fn effective_uid() -> Option<u32> {
 /// The Windows named-pipe namespace prefix.
 pub const PIPE_PREFIX: &str = r"\\.\pipe\";
 
-/// Deterministic pipe name for a daemon socket path. Hashed (not sanitized)
-/// so arbitrarily long/exotic state-dir paths always yield a valid, collision-
-/// resistant pipe name.
+/// Deterministic pipe name for a daemon socket path. Its SHA-256 digest is
+/// domain-separated with `thegn/daemon-pipe/v2\0` and truncated to 128 bits.
+/// Valid UTF-8 paths use normalized Windows spelling and Unicode lowercase;
+/// non-UTF-8 paths retain their raw encoded bytes. Display strings are
+/// diagnostic only and are never identity keys.
 pub fn pipe_name_for_path(path: &Path) -> String {
     use sha2::{Digest, Sha256};
-    let digest = Sha256::digest(path.to_string_lossy().as_bytes());
-    let hex: String = digest[..8].iter().map(|b| format!("{b:02x}")).collect();
-    format!("{PIPE_PREFIX}thegn-{hex}")
+    let mut hasher = Sha256::new();
+    hasher.update(b"thegn/daemon-pipe/v2\0");
+    hasher.update(pipe_identity_bytes(path));
+    let digest = hasher.finalize();
+    let hex: String = digest[..16].iter().map(|b| format!("{b:02x}")).collect();
+    format!("{PIPE_PREFIX}thegn-v2-{hex}")
+}
+
+/// Lossless identity bytes with Windows path spelling normalized where the
+/// encoded path is valid UTF-8. Raw encoded bytes preserve non-UTF-8 identities.
+fn pipe_identity_bytes(path: &Path) -> Vec<u8> {
+    let encoded = path.as_os_str().as_encoded_bytes();
+    let Ok(path) = std::str::from_utf8(encoded) else {
+        return encoded.to_vec();
+    };
+
+    let path = path.replace('/', "\\");
+    let path = if let Some(verbatim_path) = path.strip_prefix(r"\\?\") {
+        let bytes = verbatim_path.as_bytes();
+        if bytes.len() >= 4 && bytes[..3].eq_ignore_ascii_case(b"UNC") && bytes[3] == b'\\' {
+            format!(r"\\{}", &verbatim_path[4..])
+        } else {
+            verbatim_path.to_owned()
+        }
+    } else {
+        path
+    };
+    path.to_lowercase().into_bytes()
 }
 
 /// Where local daemon IPC lives.
@@ -974,10 +1004,56 @@ mod tests {
         let c = pipe_name_for_path(Path::new("/tmp/other/thegn/daemon.sock"));
         assert_eq!(a, b, "same path ⇒ same pipe name");
         assert_ne!(a, c, "different state dirs ⇒ different pipes (isolation)");
-        assert!(a.starts_with(r"\\.\pipe\thegn-"), "{a}");
-        // prefix + "thegn-" + 16 hex chars — comfortably inside the 256-char
+        assert!(a.starts_with(r"\\.\pipe\thegn-v2-"), "{a}");
+        // prefix + "thegn-v2-" + 32 hex chars — comfortably inside the 256-char
         // pipe-name limit regardless of the input path length.
-        assert_eq!(a.len(), PIPE_PREFIX.len() + "thegn-".len() + 16);
+        assert_eq!(a.len(), PIPE_PREFIX.len() + "thegn-v2-".len() + 32);
+    }
+
+    #[test]
+    fn pipe_name_normalizes_case_separators_and_verbatim_prefix() {
+        let paths = [
+            r"C:\Users\U\AppData\Local\thegn\daemon.sock",
+            r"\\?\C:\Users\U\AppData\Local\thegn\daemon.sock",
+            "C:/Users/U/AppData/Local/thegn/daemon.sock",
+            r"c:\users\u\appdata\local\thegn\daemon.sock",
+        ];
+        let names: Vec<_> = paths
+            .iter()
+            .map(|path| pipe_name_for_path(Path::new(path)))
+            .collect();
+        let expected = r"\\.\pipe\thegn-v2-416b942e44eb25df62f1699da9543710";
+        for name in &names {
+            assert_eq!(name, expected, "normalized pipe name differs: {name}");
+        }
+    }
+
+    #[test]
+    fn pipe_name_unc_verbatim_prefix_matches_plain_unc() {
+        let verbatim = pipe_name_for_path(Path::new(r"\\?\UNC\server\share\thegn\daemon.sock"));
+        let plain = pipe_name_for_path(Path::new(r"\\server\share\thegn\daemon.sock"));
+        let other = pipe_name_for_path(Path::new(r"\\server\share\other\daemon.sock"));
+        assert_eq!(verbatim, plain);
+        assert_ne!(plain, other);
+    }
+
+    #[test]
+    fn pipe_name_tolerates_multibyte_after_verbatim_prefix() {
+        for path in [r"\\?\a界\x", r"\\?\abé\x"] {
+            let name = pipe_name_for_path(Path::new(path));
+            assert!(name.starts_with(r"\\.\pipe\thegn-v2-"), "{name}");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn pipe_name_keeps_non_utf8_paths_distinct() {
+        use std::ffi::OsStr;
+        use std::os::unix::ffi::OsStrExt as _;
+
+        let first = Path::new(OsStr::from_bytes(b"/s/\xff"));
+        let second = Path::new(OsStr::from_bytes(b"/s/\xfe"));
+        assert_ne!(pipe_name_for_path(first), pipe_name_for_path(second));
     }
 
     #[test]

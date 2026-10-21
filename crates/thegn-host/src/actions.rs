@@ -992,7 +992,7 @@ pub(crate) fn run_pr_view_action(
         return;
     }
     let (label, status): (&'static str, &'static str) = match &action {
-        A::Merge { method } => (
+        A::Merge { method, .. } => (
             "pr merge",
             match method {
                 thegn_core::forge::model::MergeMethod::Squash => "Merging PR (squash)…",
@@ -1019,7 +1019,37 @@ pub(crate) fn run_pr_view_action(
         let forge = forges.for_loc(&loc);
         let cur = PrRef::Current;
         let res: Result<(), ForgeError> = match action {
-            A::Merge { method } => forge.merge_pr(&loc, cur, method, false, None, false),
+            A::Merge {
+                method,
+                number,
+                expected_head,
+            } => {
+                let outcome = crate::cmd::pr::merge_reviewed_head(
+                    forge,
+                    &loc,
+                    &crate::cmd::pr::ReviewedPr {
+                        number,
+                        head: &expected_head,
+                    },
+                    method,
+                    false,
+                    false,
+                );
+                let outcome_text = crate::cmd::pr::merge_outcome_text(&outcome);
+                let status = match &outcome_text {
+                    Ok(text) | Err(text) => text.clone(),
+                };
+                if let Err(error) = tx.send(RefreshKind::PrActionStatus(status)) {
+                    tracing::debug!(%error, "PR merge outcome status was not delivered");
+                }
+                match outcome_text {
+                    Ok(text) => {
+                        thegn_core::msg::info(&text);
+                        Ok(())
+                    }
+                    Err(text) => Err(ForgeError::Other(text)),
+                }
+            }
             A::Approve => forge.submit_review(
                 &loc,
                 cur,
@@ -1151,13 +1181,27 @@ pub(crate) fn run_pr_merge(
     model: &mut FrameModel,
     method: thegn_core::forge::model::MergeMethod,
 ) {
-    run_pr_view_action(
-        session,
-        refresh_tx,
-        waker,
-        model,
-        crate::pr_view::PrViewAction::Merge { method },
-    );
+    match pr_merge_request(&model.panel, method) {
+        Ok(action) => run_pr_view_action(session, refresh_tx, waker, model, action),
+        Err(reason) => model.status = reason.into(),
+    }
+}
+
+pub(crate) fn pr_merge_request(
+    panel: &crate::panel::PanelData,
+    method: thegn_core::forge::model::MergeMethod,
+) -> std::result::Result<crate::pr_view::PrViewAction, &'static str> {
+    let Some(pr) = panel.pr.as_ref() else {
+        return Err("PR head unknown; refresh the panel before merging");
+    };
+    if pr.number == 0 || panel.pr_head_oid.is_empty() {
+        return Err("PR head unknown; refresh the panel before merging");
+    }
+    Ok(crate::pr_view::PrViewAction::Merge {
+        method,
+        number: pr.number,
+        expected_head: panel.pr_head_oid.clone(),
+    })
 }
 
 pub(crate) fn run_pr_create(
@@ -2311,6 +2355,57 @@ mod tests {
         assert_eq!(
             pr_rerun_refusal(&crate::panel::PanelData::default()),
             Some("No pull request: nothing to re-run")
+        );
+    }
+
+    #[test]
+    fn pr_merge_request_pins_panel_number_and_head() {
+        let panel = crate::panel::PanelData {
+            pr: Some(crate::panel::PrSummary {
+                number: 17,
+                title: "Review".into(),
+                state: "OPEN".into(),
+                url: "https://github.com/acme/repo/pull/17".into(),
+                is_draft: false,
+                review_decision: None,
+            }),
+            pr_head_oid: "0123456789abcdef0123456789abcdef01234567".into(),
+            ..Default::default()
+        };
+        assert_eq!(
+            pr_merge_request(&panel, thegn_core::forge::model::MergeMethod::Squash),
+            Ok(crate::pr_view::PrViewAction::Merge {
+                method: thegn_core::forge::model::MergeMethod::Squash,
+                number: 17,
+                expected_head: "0123456789abcdef0123456789abcdef01234567".into(),
+            })
+        );
+    }
+
+    #[test]
+    fn pr_merge_request_without_head_is_refused() {
+        let refusal = "PR head unknown; refresh the panel before merging";
+        assert_eq!(
+            pr_merge_request(
+                &crate::panel::PanelData::default(),
+                thegn_core::forge::model::MergeMethod::Squash
+            ),
+            Err(refusal)
+        );
+        let panel = crate::panel::PanelData {
+            pr: Some(crate::panel::PrSummary {
+                number: 17,
+                title: "Review".into(),
+                state: "OPEN".into(),
+                url: "https://github.com/acme/repo/pull/17".into(),
+                is_draft: false,
+                review_decision: None,
+            }),
+            ..Default::default()
+        };
+        assert_eq!(
+            pr_merge_request(&panel, thegn_core::forge::model::MergeMethod::Squash),
+            Err(refusal)
         );
     }
 

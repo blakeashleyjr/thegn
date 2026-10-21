@@ -200,6 +200,7 @@ mod plugin_damage;
 mod plugin_providers;
 mod plugins;
 mod pool_lease;
+mod pr_agent_lease;
 mod pr_authorship;
 mod pr_driver;
 mod pr_view;
@@ -831,7 +832,8 @@ pub enum DoctorAction {
 
 /// Relay a local `ssh` client's stdin/stdout to an in-sandbox `sshd` over the
 /// provider's TCP-over-WebSocket proxy (the `sprite-proxy` ProxyCommand). Pumps
-/// until either side closes; stdout carries the ssh transport verbatim.
+/// until either side closes; stdout carries the ssh transport verbatim. The
+/// ProxyCommand exits nonzero when the remote stream drops, fails, or rejects it.
 async fn sprite_proxy_relay(
     provider: thegn_svc::provider::Provider,
     id: String,
@@ -850,32 +852,43 @@ async fn sprite_proxy_relay(
             &[],
         )
         .await;
-    let mut stream = provider
+    let thegn_svc::provider::ProxyStream { mut rx, tx, end } = provider
         .open_proxy(&id, "127.0.0.1", agent::SPRITE_SSHD_PORT)
         .await?;
     let mut stdin = tokio::io::stdin();
     let mut stdout = tokio::io::stdout();
     let mut buf = vec![0u8; 32 * 1024];
+    let mut server_ended = false;
     loop {
         tokio::select! {
             n = stdin.read(&mut buf) => match n {
                 Ok(0) | Err(_) => break, // client EOF / error
                 Ok(n) => {
-                    if stream.tx.send(buf[..n].to_vec()).await.is_err() {
+                    if tx.send(buf[..n].to_vec()).await.is_err() {
                         break; // relay closed
                     }
                 }
             },
-            msg = stream.rx.recv() => match msg {
+            msg = rx.recv() => match msg {
                 Some(b) => {
                     stdout.write_all(&b).await?;
                     stdout.flush().await?;
                 }
-                None => break, // server closed
+                None => {
+                    server_ended = true;
+                    break; // server closed
+                }
             },
         }
     }
-    Ok(())
+    if server_ended {
+        let end = end
+            .await
+            .map_err(|_| anyhow::anyhow!("provider proxy driver ended without a terminal state"))?;
+        end.into_result()
+    } else {
+        Ok(())
+    }
 }
 
 /// The quit-detached exit line. Printed AFTER the compositor tore down the

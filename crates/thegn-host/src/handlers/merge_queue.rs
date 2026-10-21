@@ -1275,20 +1275,38 @@ fn add_all(cfg: &Config, any_path: &Path) -> String {
         Err(e) => return format!("Add failed: {e}"),
     };
     let mut queued = 0usize;
+    let mut pipeline_refusals = Vec::new();
     for (branch, wt) in &cands.worktrees {
-        if crate::merge_ops::enqueue_bound_local(&db, wt, branch, &target).is_ok() {
-            crate::merge_lifecycle::apply(mq, &db, &root, wt, branch, LifecycleEvent::Enqueued);
-            queued += 1;
+        match crate::merge_ops::enqueue_bound_local(&db, wt, branch, &target) {
+            Ok(()) => {
+                crate::merge_lifecycle::apply(mq, &db, &root, wt, branch, LifecycleEvent::Enqueued);
+                queued += 1;
+            }
+            Err(error) => {
+                if let Some(refusal) = error
+                    .downcast_ref::<thegn_core::pipeline_merge_admission::PipelineMergeRefused>(
+                ) {
+                    pipeline_refusals.push(format!("{branch}: {refusal}"));
+                }
+            }
         }
     }
-    if cands.skipped_dirty.is_empty() {
+    let mut message = if cands.skipped_dirty.is_empty() {
         format!("Queued {queued} branch(es)")
     } else {
         format!(
             "Queued {queued} branch(es); skipped {} dirty (set [merge_queue] snapshot_dirty = true)",
             cands.skipped_dirty.len()
         )
+    };
+    if !pipeline_refusals.is_empty() {
+        message.push_str(&format!(
+            "; {} refused (pipeline gate): {}",
+            pipeline_refusals.len(),
+            pipeline_refusals.join("; ")
+        ));
     }
+    message
 }
 
 /// Keep this aligned with `drive_queue_with` when classifying refused conflicts.
