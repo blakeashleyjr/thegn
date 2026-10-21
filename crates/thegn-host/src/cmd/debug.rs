@@ -1,4 +1,4 @@
-//! `thegn debug <action>` — the BugStalker debugger integration.
+//! `thegn debug <action>` — the debugger adapter seam and BugStalker adapter.
 //!
 //! BugStalker (`bs`) is acquired + pinned via the shared managed-tool resolver
 //! (a `Cargo` source) and launched as an ordinary interactive program. Started
@@ -8,7 +8,7 @@
 
 use anyhow::{Result, bail};
 use thegn_core::config::Config;
-use thegn_core::debug::{self, attach_argv, bs_tool, launch_argv};
+use thegn_core::debug::{self, bs_tool};
 use thegn_core::{msg, outln};
 
 #[derive(clap::Subcommand, Clone)]
@@ -43,11 +43,11 @@ pub fn run(cfg: &Config, action: Action) -> Result<()> {
         Action::Path => path(cfg),
         Action::Run { program, args } => {
             let bin = ensure_bin(cfg)?;
-            exec_replace(launch_argv(&bin, &program, &args))
+            exec_replace(debug::adapter_for(cfg).launch_argv(&bin, &program, &args)?)
         }
         Action::Attach { pid } => {
             let bin = ensure_bin(cfg)?;
-            exec_replace(attach_argv(&bin, pid))
+            exec_replace(debug::adapter_for(cfg).attach_argv(&bin, pid)?)
         }
     }
 }
