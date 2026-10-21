@@ -28,10 +28,10 @@ use crate::MediaWatch;
 
 use crate::model::{LoopMode, MediaKind, MediaState};
 use crate::smtc_decode::{
-    accepted, duration_from_ticks, loop_from_repeat, loop_to_repeat, playback_state_from_status,
-    seek_target,
+    ControlFlags, accepted, loop_from_repeat, loop_to_repeat, manager_unavailable,
+    playback_state_from_status, seek_target, session_caps, snapshot_caps, timeline,
 };
-use crate::{MediaBackend, MediaCaps, MediaError};
+use crate::{MediaBackend, MediaCaps, MediaError, MediaSnapshot};
 
 /// Stateless SMTC controller — the session manager is opened fresh per call
 /// (cheap, and avoids holding a COM object across `.await`).
@@ -58,7 +58,7 @@ impl Smtc {
     /// The current session's source app id (SMTC's notion of "player").
     pub async fn list_players(&self) -> Result<Vec<String>, MediaError> {
         run_blocking(|| {
-            let mgr = manager().map_err(win_err)?;
+            let mgr = manager().map_err(|error| manager_unavailable(&error.to_string()))?;
             let session = match session_if_present(mgr.GetCurrentSession()) {
                 Some(session) => session,
                 None => return Ok(Vec::new()),
@@ -79,7 +79,15 @@ fn session_if_present<T, E>(session: Result<T, E>) -> Option<T> {
 
 impl MediaBackend for Smtc {
     fn snapshot(&self) -> BoxFuture<'_, Result<Option<MediaState>, MediaError>> {
-        Box::pin(async move { run_blocking(snapshot_blocking).await })
+        Box::pin(async move {
+            self.snapshot_with_caps()
+                .await
+                .map(|snapshot| snapshot.map(|snapshot| snapshot.state))
+        })
+    }
+
+    fn snapshot_with_caps(&self) -> BoxFuture<'_, Result<Option<MediaSnapshot>, MediaError>> {
+        Box::pin(async move { run_blocking(snapshot_with_caps_blocking).await })
     }
 
     fn play_pause(&self) -> BoxFuture<'_, Result<(), MediaError>> {
@@ -226,6 +234,8 @@ impl MediaBackend for Smtc {
         })
     }
 
+    /// Static pre-snapshot upper bound; `snapshot_with_caps` reports live
+    /// session shuffle, repeat and seek support.
     fn caps(&self) -> MediaCaps {
         MediaCaps {
             shuffle: true,
@@ -361,19 +371,18 @@ fn manager() -> windows::core::Result<GlobalSystemMediaTransportControlsSessionM
 }
 
 fn current_session() -> Result<Session, MediaError> {
-    manager()
-        .and_then(|m| m.GetCurrentSession())
-        .map_err(|_| MediaError::NoPlayer)
+    let mgr = manager().map_err(|error| manager_unavailable(&error.to_string()))?;
+    mgr.GetCurrentSession().map_err(|_| MediaError::NoPlayer)
 }
 
 fn win_err(e: windows::core::Error) -> MediaError {
     MediaError::Backend(e.to_string())
 }
 
-/// Fold the current SMTC session into a [`MediaState`]. `Ok(None)` when no app
-/// owns the media session.
-fn snapshot_blocking() -> Result<Option<MediaState>, MediaError> {
-    let mgr = manager().map_err(win_err)?;
+/// Fold the current SMTC session and its live capabilities into a snapshot.
+/// `Ok(None)` when no app owns the media session.
+fn snapshot_with_caps_blocking() -> Result<Option<MediaSnapshot>, MediaError> {
+    let mgr = manager().map_err(|error| manager_unavailable(&error.to_string()))?;
     let session = match mgr.GetCurrentSession() {
         Ok(s) => s,
         Err(_) => return Ok(None),
@@ -387,15 +396,14 @@ fn snapshot_blocking() -> Result<Option<MediaState>, MediaError> {
         .ok()
         .and_then(|r| r.Value().ok())
         .map(|m| loop_from_repeat(m.0));
-    let controls = info.Controls().ok(); // best-effort: optional read; absence is a normal condition
-    let can_go_next = controls
-        .as_ref()
-        .and_then(|c| c.IsNextEnabled().ok())
-        .unwrap_or(true);
-    let can_go_previous = controls
-        .as_ref()
-        .and_then(|c| c.IsPreviousEnabled().ok())
-        .unwrap_or(true);
+    let flags = info.Controls().ok().map(|c| ControlFlags {
+        next: c.IsNextEnabled().ok(), // best-effort: optional read; absence is a normal condition
+        previous: c.IsPreviousEnabled().ok(), // best-effort: optional read; absence is a normal condition
+        position: c.IsPlaybackPositionEnabled().ok(), // best-effort: optional read; absence is a normal condition
+        shuffle: c.IsShuffleEnabled().ok(), // best-effort: optional read; absence is a normal condition
+        repeat: c.IsRepeatEnabled().ok(), // best-effort: optional read; absence is a normal condition
+    });
+    let caps = session_caps(flags);
 
     let props = session
         .TryGetMediaPropertiesAsync()
@@ -408,15 +416,16 @@ fn snapshot_blocking() -> Result<Option<MediaState>, MediaError> {
         .map(|h| h.to_string())
         .unwrap_or_default();
 
-    let timeline = session.GetTimelineProperties().ok(); // best-effort: optional read; absence is a normal condition
-    let position = timeline
-        .as_ref()
-        .and_then(|t| t.Position().ok())
-        .and_then(|ts| duration_from_ticks(ts.Duration));
-    let length = timeline
-        .as_ref()
-        .and_then(|t| t.EndTime().ok())
-        .and_then(|ts| duration_from_ticks(ts.Duration));
+    let (position, length) = session
+        .GetTimelineProperties()
+        .ok() // best-effort: optional read; absence is a normal condition
+        .map(|t| {
+            timeline(
+                t.Position().ok().map(|ts| ts.Duration),
+                t.EndTime().ok().map(|ts| ts.Duration),
+            )
+        })
+        .unwrap_or((None, None));
 
     let player = session
         .SourceAppUserModelId()
@@ -431,7 +440,7 @@ fn snapshot_blocking() -> Result<Option<MediaState>, MediaError> {
         _ => MediaKind::from_hints(&player, None, None),
     };
 
-    Ok(Some(MediaState {
+    let state = MediaState {
         player,
         title,
         artist,
@@ -442,12 +451,17 @@ fn snapshot_blocking() -> Result<Option<MediaState>, MediaError> {
         shuffle,
         loop_mode,
         volume: None, // SMTC has no volume
-        can_go_next,
-        can_go_previous,
+        can_go_next: caps.can_go_next,
+        can_go_previous: caps.can_go_previous,
         art_url: None, // thumbnail is a stream, not fetched in v1
         kind,
-        can_seek: true, // SMTC position change is generally available
+        can_seek: caps.can_seek,
         track_id: None,
+    };
+
+    Ok(Some(MediaSnapshot {
+        state,
+        caps: snapshot_caps(MediaBackend::caps(&Smtc), caps),
     }))
 }
 
