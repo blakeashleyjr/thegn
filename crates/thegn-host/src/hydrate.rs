@@ -350,6 +350,9 @@ pub(crate) enum RefreshKind {
     },
     Model,
     Pr,
+    /// The outcome text from a completed PR merge action, applied to the
+    /// event-loop-owned status line.
+    PrActionStatus(String),
     /// The wall clock crossed a display boundary, so the `date`/`clock` bar
     /// widgets now render different text.
     ///
