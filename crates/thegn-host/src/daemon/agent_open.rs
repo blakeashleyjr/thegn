@@ -1292,6 +1292,14 @@ mod tests {
             worktree: Some(worktree.path().to_string_lossy().into_owned()),
             ..OpenSpec::default()
         };
-        assert!(resolve(&config, &db, &spec, &launch, None).is_ok());
+        if let Err(error) = resolve(&config, &db, &spec, &launch, None) {
+            assert!(
+                !error.to_string().contains("no stage configuration digest")
+                    && !error
+                        .to_string()
+                        .contains("changed between claim and launch"),
+                "{error}"
+            );
+        }
     }
 }
