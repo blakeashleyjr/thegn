@@ -52,6 +52,10 @@ local player, without leaving the compositor. Hidden unless
   changed” if the selected player went away or another process took over its
   MPRIS name. Changing media configuration or player selection cancels waiting
   controls from before the change.
+- When reading the player fails, the last track stays visible with a dim
+  `stale` marker for up to three poll periods or ten seconds, whichever is
+  longer; after that the section shows “provider unavailable” instead of “no
+  player”.
 
 Spotify remains a reserved backend kind: the supported desktop route is the
 existing MPRIS integration (or SMTC/AppleScript on their platforms), with no

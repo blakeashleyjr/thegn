@@ -30,9 +30,10 @@ is reported as unknown and makes the command exit non-zero naming it. It prints
 "no thegn pane daemon is running" only when every listener was checked and none
 is running.
 
-When the UI exits, in-flight custom git commands and CI refreshes are cancelled.
-Thegn waits up to two seconds for them before exiting; work still running after
-that is logged.
+When the UI exits, in-flight custom git commands, CI refreshes, and CI rerun or
+cancel actions are cancelled. Thegn waits up to two seconds for them before
+exiting; work still running after that is logged. A CI action requested while
+thegn is quitting is not started.
 
 The status bar's daemon chip shows whether the focused pane is
 daemon-backed; select it for the full session rollup. See [[bars]].
