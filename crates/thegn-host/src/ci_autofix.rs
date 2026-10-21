@@ -788,7 +788,7 @@ mod tests {
     }
 
     #[test]
-    fn completed_agent_does_not_rearm_a_settled_row_or_replace_its_head() {
+    fn live_lease_fences_concurrent_status_writes_until_release() {
         let fixture = Fixture::new();
         let path = fixture.dir.path().to_str().unwrap();
         let db = thegn_core::db::Db::open_at(&fixture.dir.path().join("ci.db")).unwrap();
@@ -819,6 +819,10 @@ mod tests {
         )
         .unwrap();
 
+        let during_lease = db.list_pr_queue().unwrap().remove(0);
+        assert_eq!(during_lease.status, PrqStatus::AgentRunning.as_str());
+        assert_eq!(during_lease.last_head_oid.as_deref(), Some("initial-head"));
+
         assert!(
             guard
                 .finish(&db, Some((PrqStatus::BlockedCi.as_str(), "finished")))
@@ -826,17 +830,9 @@ mod tests {
         );
 
         let current = db.list_pr_queue().unwrap().remove(0);
-        assert_eq!(current.status, PrqStatus::Merged.as_str());
-        assert_eq!(current.last_head_oid.as_deref(), Some("newer-head"));
+        assert_eq!(current.status, PrqStatus::BlockedCi.as_str());
+        assert_eq!(current.last_head_oid.as_deref(), Some("initial-head"));
 
-        db.update_pr_status(
-            &row.key,
-            PrqStatus::BlockedCi.as_str(),
-            Some("ci"),
-            None,
-            None,
-        )
-        .unwrap();
         let request = thegn_core::pr_queue::PrAgentAdmit {
             key: &row.key,
             expected_attempts: current.agent_attempts,
@@ -860,6 +856,9 @@ mod tests {
             Some("newer-head"),
         )
         .unwrap();
+        let during_lease = db.list_pr_queue().unwrap().remove(0);
+        assert_eq!(during_lease.status, PrqStatus::AgentRunning.as_str());
+        assert_eq!(during_lease.last_head_oid.as_deref(), Some("admitted-head"));
         assert!(
             guard
                 .finish(&db, Some((PrqStatus::BlockedCi.as_str(), "finished")))
@@ -868,7 +867,7 @@ mod tests {
 
         let current = db.list_pr_queue().unwrap().remove(0);
         assert_eq!(current.status, PrqStatus::BlockedCi.as_str());
-        assert_eq!(current.last_head_oid.as_deref(), Some("newer-head"));
+        assert_eq!(current.last_head_oid.as_deref(), Some("admitted-head"));
     }
 
     #[test]
@@ -1293,7 +1292,7 @@ mod tests {
                 .iter()
                 .any(|notification| {
                     notification.message.contains("held:")
-                        && notification.message.contains("another PR agent holds")
+                        && notification.message.contains("agent_running")
                 })
         );
     }

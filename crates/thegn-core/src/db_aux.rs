@@ -168,6 +168,10 @@ mod merge_claim_tests;
 #[path = "db_pr_agent_lease_tests.rs"]
 mod pr_agent_lease_tests;
 
+#[cfg(test)]
+#[path = "db_pr_lease_fence_tests.rs"]
+mod pr_lease_fence_tests;
+
 static MERGE_CLAIM_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 /// The token is a row ownership identity, not a secret: any database writer can rewrite the row.
@@ -1365,18 +1369,61 @@ impl WorktreeAuxStore for Db {
                                   THEN NULL ELSE ci_rerun_head END,
                last_head_oid=COALESCE(?5, last_head_oid),
                updated_at=?6
-             WHERE key=?1",
-            params![key, status, blocker, detail, last_head_oid, util::now()],
+             WHERE key=?1
+               AND (agent_claim_owner IS NULL OR agent_claim_lease_until_ms IS NULL
+                    OR agent_claim_lease_until_ms < ?7)",
+            params![
+                key,
+                status,
+                blocker,
+                detail,
+                last_head_oid,
+                util::now(),
+                util::now_ms()
+            ],
         )?;
         Ok(())
     }
 
     fn set_pr_agent_attempts(&self, key: &str, attempts: u32) -> Result<()> {
         self.conn().execute(
-            "UPDATE pr_queue SET agent_attempts=?2, updated_at=?3 WHERE key=?1",
-            params![key, attempts, util::now()],
+            "UPDATE pr_queue SET agent_attempts=?2, updated_at=?3 WHERE key=?1
+             AND (agent_claim_owner IS NULL OR agent_claim_lease_until_ms IS NULL
+                  OR agent_claim_lease_until_ms < ?4)",
+            params![key, attempts, util::now(), util::now_ms()],
         )?;
         Ok(())
+    }
+
+    fn pr_agent_lease_view(&self, key: &str) -> Result<Option<crate::pr_queue::PrAgentLeaseView>> {
+        let view = self
+            .conn()
+            .query_row(
+                "SELECT agent_claim_owner IS NOT NULL, agent_claim_generation,
+                        agent_claim_lease_until_ms, agent_claim_owner_hint
+                 FROM pr_queue WHERE key=?1",
+                [key],
+                |row| {
+                    let has_owner: bool = row.get(0)?;
+                    let generation: i64 = row.get(1)?;
+                    let lease_until_ms: Option<i64> = row.get(2)?;
+                    let owner_hint: Option<String> = row.get(3)?;
+                    Ok((has_owner, generation, lease_until_ms, owner_hint))
+                },
+            )
+            .optional()?
+            .and_then(|(has_owner, generation, lease_until_ms, owner_hint)| {
+                if has_owner {
+                    lease_until_ms.map(|lease_until_ms| crate::pr_queue::PrAgentLeaseView {
+                        generation,
+                        lease_until_ms,
+                        owner_hint,
+                    })
+                } else {
+                    None
+                }
+            });
+        Ok(view)
     }
 
     fn admit_pr_agent(
