@@ -43,6 +43,10 @@ pub enum SessionAction {
         /// Emit one redacted audit JSON document instead of human text.
         #[arg(long)]
         json: bool,
+        /// Also carry content history (scrollback, pane relaunch commands,
+        /// dispatch reports and notes) unchanged. Off by default.
+        #[arg(long)]
+        include_history: bool,
     },
     /// List the daemon's sessions — including recently exited ones (the
     /// daemon's tombstones), each marked with a liveness token.

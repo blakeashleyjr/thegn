@@ -14,7 +14,9 @@ use thegn_core::config::Config;
 use thegn_core::db::Db;
 use thegn_core::outln;
 use thegn_core::profile::{self, ProfilePaths};
-use thegn_core::session_migration::{MigrationBundle, MigrationCounts, plan_migration};
+use thegn_core::session_migration::{
+    HistoryPolicy, MigrationBundle, MigrationCounts, plan_migration,
+};
 use thegn_core::store::{ControlStore, DaemonRow, SessionMigrationStore};
 use thegn_svc::control::SessionInfo;
 use thegn_svc::control::client::ControlClient;
@@ -22,6 +24,7 @@ use thegn_svc::control::client::ControlClient;
 use super::session::SessionAction;
 
 const OPAQUE_PAYLOAD_WARNING: &str = "opaque pane commands, scrollback, dispatch reports, and notes are carried unchanged and are not included in this audit";
+const HISTORY_DROPPED_NOTICE: &str = "pane commands, scrollback, dispatch reports, and notes are not carried (pass --include-history to carry them unchanged); they are not included in this audit";
 const KILL_CONFIRM_TIMEOUT: Duration = Duration::from_secs(5);
 const KILL_CONFIRM_POLL: Duration = Duration::from_millis(25);
 
@@ -52,8 +55,8 @@ impl MigrationControl for ControlClient {
     }
 }
 
-/// The stable, payload-free audit emitted by a move. Opaque commands,
-/// scrollback, reports, notes, and credentials are deliberately absent.
+/// The stable, payload-free audit emitted by a move. Opaque content history
+/// and credentials are deliberately absent.
 #[derive(Debug, Serialize)]
 struct MigrationAudit {
     source_profile: String,
@@ -69,6 +72,7 @@ struct MigrationAudit {
     target_confirmed: bool,
     source_deleted: bool,
     resumed: bool,
+    include_history: bool,
     opaque_payload_warning: String,
     notification: NotificationAudit,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -98,7 +102,8 @@ impl MigrationAudit {
             target_confirmed: false,
             source_deleted: false,
             resumed: false,
-            opaque_payload_warning: OPAQUE_PAYLOAD_WARNING.to_string(),
+            include_history: false,
+            opaque_payload_warning: HISTORY_DROPPED_NOTICE.to_string(),
             notification: NotificationAudit {
                 status: "not_attempted".to_string(),
                 warning: None,
@@ -116,6 +121,7 @@ pub async fn run(_cfg: &Config, action: SessionAction) -> Result<()> {
         kill,
         dry_run,
         json,
+        include_history,
     } = action
     else {
         unreachable!("session_move::run called for a non-move action")
@@ -124,6 +130,10 @@ pub async fn run(_cfg: &Config, action: SessionAction) -> Result<()> {
     let source = profile::active();
     let target = profile::resolve_active_target(&to_profile)?;
     let mut audit = MigrationAudit::new(&source.name, &target.name, &worktree, dry_run);
+    audit.include_history = include_history;
+    if include_history {
+        audit.opaque_payload_warning = OPAQUE_PAYLOAD_WARNING.to_string();
+    }
 
     let target_db_path = profile_db_path(&target, &profile::default_state_home());
     // A real move holds both source-owner fences and the daemon's per-worktree
@@ -170,7 +180,12 @@ pub async fn run(_cfg: &Config, action: SessionAction) -> Result<()> {
         .map(|db| db.migration_target_snapshot(&session, &worktree))
         .transpose()?
         .unwrap_or_default();
-    let plan = match plan_migration(bundle, target_state) {
+    let history = if include_history {
+        HistoryPolicy::Include
+    } else {
+        HistoryPolicy::Drop
+    };
+    let plan = match plan_migration(bundle, target_state, history) {
         Ok(plan) => plan,
         Err(conflict) => return fail(&mut audit, json, &conflict.to_string(), false),
     };
@@ -642,6 +657,7 @@ fn human_report(audit: &MigrationAudit) -> String {
     lines.push(format!("  target confirmed: {}", audit.target_confirmed));
     lines.push(format!("  source deleted: {}", audit.source_deleted));
     lines.push(format!("  resumed: {}", audit.resumed));
+    lines.push(format!("  include history: {}", audit.include_history));
     lines.push(format!(
         "  opaque payload warning: {}",
         audit.opaque_payload_warning
@@ -852,6 +868,7 @@ mod tests {
             bundle,
             target: MigrationTarget::default(),
             resumed: false,
+            history: HistoryPolicy::Drop,
         }
     }
 
@@ -1170,18 +1187,43 @@ mod tests {
     fn dry_run_reports_opaque_payload_warning_in_human_and_json_modes() {
         let audit = MigrationAudit::new("source", "target", "/worktree", true);
         let human = human_report(&audit);
-        assert!(human.contains(OPAQUE_PAYLOAD_WARNING));
+        assert!(human.contains(HISTORY_DROPPED_NOTICE));
 
         let json = serde_json::to_value(&audit).unwrap();
         assert_eq!(
             json["opaque_payload_warning"].as_str(),
-            Some(OPAQUE_PAYLOAD_WARNING)
+            Some(HISTORY_DROPPED_NOTICE)
         );
         assert!(
             json["opaque_payload_warning"]
                 .as_str()
                 .unwrap()
-                .contains("carried unchanged")
+                .contains("not carried")
+        );
+
+        let mut include_audit = MigrationAudit::new("source", "target", "/worktree", true);
+        include_audit.include_history = true;
+        include_audit.opaque_payload_warning = OPAQUE_PAYLOAD_WARNING.to_string();
+        assert!(human_report(&include_audit).contains(OPAQUE_PAYLOAD_WARNING));
+    }
+
+    #[test]
+    fn audit_names_the_history_mode() {
+        let mut audit = MigrationAudit::new("source", "target", "/worktree", true);
+        let dropped = serde_json::to_value(&audit).unwrap();
+        assert_eq!(dropped["include_history"], false);
+        assert_eq!(
+            dropped["opaque_payload_warning"].as_str(),
+            Some(HISTORY_DROPPED_NOTICE)
+        );
+
+        audit.include_history = true;
+        audit.opaque_payload_warning = OPAQUE_PAYLOAD_WARNING.to_string();
+        let included = serde_json::to_value(&audit).unwrap();
+        assert_eq!(included["include_history"], true);
+        assert_eq!(
+            included["opaque_payload_warning"].as_str(),
+            Some(OPAQUE_PAYLOAD_WARNING)
         );
     }
 

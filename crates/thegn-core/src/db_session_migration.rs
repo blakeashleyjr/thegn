@@ -7,10 +7,10 @@ use crate::db::Db;
 use crate::issue::DispatchNote;
 use crate::models::{GroupTabRow, TabGroupRow};
 use crate::session_migration::{
-    MigrationBundle, MigrationCleanupResult, MigrationCounts, MigrationDispatch, MigrationGroup,
-    MigrationImportResult, MigrationNote, MigrationPlan, MigrationTarget, MigrationUiState,
-    MigrationWorktree, imported_dispatch, make_bundle, migration_tab, persisted_group,
-    persisted_tab, select_groups, select_sidebar_state,
+    HistoryPolicy, MigrationBundle, MigrationCleanupResult, MigrationCounts, MigrationDispatch,
+    MigrationGroup, MigrationImportResult, MigrationNote, MigrationPlan, MigrationTarget,
+    MigrationUiState, MigrationWorktree, imported_bundle, make_bundle, migration_tab,
+    persisted_group, persisted_tab, select_groups, select_sidebar_state,
 };
 use crate::store::SessionMigrationStore;
 use anyhow::Result;
@@ -146,8 +146,11 @@ impl SessionMigrationStore for Db {
             // into a partial import.
             let current_target =
                 db.migration_target_snapshot(&bundle.session_name, &bundle.worktree_path)?;
-            let current_plan =
-                crate::session_migration::plan_migration(bundle.clone(), current_target)?;
+            let current_plan = crate::session_migration::plan_migration(
+                bundle.clone(),
+                current_target,
+                plan.history,
+            )?;
             // The fingerprint deliberately excludes target-owned worktree
             // metadata. An otherwise resumed import may therefore still need
             // to restore a missing registration before source cleanup.
@@ -171,10 +174,11 @@ impl SessionMigrationStore for Db {
             if worktree_ready && db.confirm_migration(&current_plan)? {
                 return Ok(());
             }
+            let imported = imported_bundle(bundle, plan.history);
             if let Some(worktree) = &bundle.worktree {
                 result.counts.worktrees = insert_worktree(db, worktree)?;
             }
-            for group in &bundle.groups {
+            for group in &imported.groups {
                 let row = persisted_group(group);
                 result.counts.tab_groups += db.conn().execute(
                     "INSERT OR IGNORE INTO tab_groups
@@ -225,8 +229,7 @@ impl SessionMigrationStore for Db {
                     params![bundle.session_name, pin, bundle.pin_updated_at],
                 )?;
             }
-            for dispatch in &bundle.dispatches {
-                let row = imported_dispatch(dispatch);
+            for (dispatch, row) in bundle.dispatches.iter().zip(&imported.dispatches) {
                 db.conn().execute(
                     "INSERT INTO agent_dispatches
                        (issue_id,worktree_path,agent_name,dispatched_at_ms,status,stage,
@@ -242,8 +245,8 @@ impl SessionMigrationStore for Db {
                         row.artifact_path,
                         row.note,
                         row.chunk_path,
-                        dispatch.report,
-                        dispatch.chunk_scope,
+                        row.report,
+                        row.chunk_scope,
                     ],
                 )?;
                 result
@@ -263,7 +266,7 @@ impl SessionMigrationStore for Db {
                     params![parent, target_id],
                 )?;
             }
-            for note in &bundle.notes {
+            for note in &imported.notes {
                 let Some(dispatch_id) = result.dispatch_id_map.get(&note.dispatch_id) else {
                     continue;
                 };
@@ -517,6 +520,47 @@ mod tests {
     use crate::session_migration::{MigrationConflict, plan_migration};
     use crate::store::SessionMigrationStore;
 
+    fn history_fixture() -> (Db, Db, MigrationBundle) {
+        let source = Db::open_memory().unwrap();
+        let target = Db::open_memory().unwrap();
+        source.conn().execute(
+            "INSERT INTO worktrees(worktree,session_name,tab_name,repo_path,branch,agent,created_at,location,position)
+             VALUES('/history','source','tab','/repo','feature','agent',1,'',3)",
+            [],
+        ).unwrap();
+        source
+            .conn()
+            .execute(
+                "INSERT INTO tab_groups(session_name,name,kind,worktree,ordinal,active_tab)
+             VALUES('source','history','branch','/history',0,0)",
+                [],
+            )
+            .unwrap();
+        source.conn().execute(
+            "INSERT INTO group_tabs(session_name,group_name,ordinal,title,pane_tree,pane_cwds,pane_cmds,scrollback_snapshot)
+             VALUES('source','history',0,'tab','{}','{}','SECRET_COMMAND','SECRET_SCROLLBACK')",
+            [],
+        ).unwrap();
+        source.conn().execute(
+            "INSERT INTO agent_dispatches(issue_id,worktree_path,agent_name,dispatched_at_ms,status,note,report)
+             VALUES('THE-1167','/history','agent',1,'running','SECRET_NOTE','SECRET_REPORT')",
+            [],
+        ).unwrap();
+        let source_id = source.conn().last_insert_rowid();
+        source
+            .conn()
+            .execute(
+                "INSERT INTO agent_dispatch_notes(dispatch_id,created_at_ms,text)
+             VALUES(?1,2,'SECRET_NOTE_ROW')",
+                params![source_id],
+            )
+            .unwrap();
+        let bundle = source
+            .migration_snapshot("default", "target", "source", "/history")
+            .unwrap();
+        (source, target, bundle)
+    }
+
     #[test]
     fn db_import_clears_ephemeral_ids_remaps_dispatches_and_cleans_exact_rows() {
         let source = Db::open_memory().unwrap();
@@ -605,7 +649,7 @@ mod tests {
             .migration_snapshot("default", "target", "source", "/w")
             .unwrap();
         let target_state = target.migration_target_snapshot("source", "/w").unwrap();
-        let plan = plan_migration(bundle.clone(), target_state).unwrap();
+        let plan = plan_migration(bundle.clone(), target_state, HistoryPolicy::Include).unwrap();
         let imported = target.import_migration(&plan).unwrap();
         assert_eq!(imported.counts.dispatches, 2);
         assert_eq!(imported.counts.dispatch_notes, 1);
@@ -661,6 +705,77 @@ mod tests {
     }
 
     #[test]
+    fn db_import_drops_content_history_by_default() {
+        let (source, target, bundle) = history_fixture();
+        let plan = plan_migration(
+            bundle.clone(),
+            target
+                .migration_target_snapshot("source", "/history")
+                .unwrap(),
+            HistoryPolicy::Drop,
+        )
+        .unwrap();
+        target.import_migration(&plan).unwrap();
+
+        let tabs = session_tabs(&target, "source").unwrap();
+        assert_eq!(tabs[0].scrollback_snapshot, "");
+        assert_eq!(tabs[0].pane_cmds, "");
+        let dispatches = dispatches_for_worktree(&target, "/history").unwrap();
+        assert_eq!(dispatches[0].report, None);
+        assert_eq!(
+            dispatches[0].note.as_deref(),
+            Some("[migrated while running: not resumed]")
+        );
+        let note_rows: i64 = target
+            .conn()
+            .query_row("SELECT COUNT(*) FROM agent_dispatch_notes", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(note_rows, 0);
+        assert!(target.confirm_migration(&plan).unwrap());
+        assert_eq!(
+            target.import_migration(&plan).unwrap().counts,
+            MigrationCounts::default()
+        );
+        assert!(source.cleanup_migration(&bundle).unwrap().source_deleted);
+    }
+
+    #[test]
+    fn db_import_include_history_carries_content_unchanged() {
+        let (_source, target, bundle) = history_fixture();
+        let plan = plan_migration(
+            bundle,
+            target
+                .migration_target_snapshot("source", "/history")
+                .unwrap(),
+            HistoryPolicy::Include,
+        )
+        .unwrap();
+        target.import_migration(&plan).unwrap();
+
+        let tabs = session_tabs(&target, "source").unwrap();
+        assert_eq!(tabs[0].scrollback_snapshot, "SECRET_SCROLLBACK");
+        assert_eq!(tabs[0].pane_cmds, "SECRET_COMMAND");
+        let dispatches = dispatches_for_worktree(&target, "/history").unwrap();
+        assert_eq!(dispatches[0].report.as_deref(), Some("SECRET_REPORT"));
+        assert!(
+            dispatches[0]
+                .note
+                .as_deref()
+                .unwrap()
+                .ends_with("SECRET_NOTE")
+        );
+        let note: String = target
+            .conn()
+            .query_row("SELECT text FROM agent_dispatch_notes", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(note, "SECRET_NOTE_ROW");
+    }
+
+    #[test]
     fn db_import_does_not_skip_a_worktree_only_bundle() {
         let source = Db::open_memory().unwrap();
         let target = Db::open_memory().unwrap();
@@ -679,6 +794,7 @@ mod tests {
         let plan = plan_migration(
             bundle,
             target.migration_target_snapshot("source", "/only").unwrap(),
+            HistoryPolicy::Include,
         )
         .unwrap();
         let imported = target.import_migration(&plan).unwrap();
@@ -724,6 +840,7 @@ mod tests {
             target
                 .migration_target_snapshot("default", "/resume")
                 .unwrap(),
+            HistoryPolicy::Include,
         )
         .unwrap();
         assert!(plan.resumed, "matching presentation rows form a resume");
@@ -765,6 +882,7 @@ mod tests {
             target
                 .migration_target_snapshot("default", "/future")
                 .unwrap(),
+            HistoryPolicy::Include,
         )
         .unwrap();
         target.import_migration(&plan).unwrap();
@@ -810,6 +928,7 @@ mod tests {
             target
                 .migration_target_snapshot("default", "/scope")
                 .unwrap(),
+            HistoryPolicy::Include,
         )
         .unwrap();
         target.import_migration(&plan).unwrap();
@@ -862,7 +981,7 @@ mod tests {
         let target_state = target.migration_target_snapshot("default", "/w").unwrap();
 
         assert_eq!(
-            plan_migration(bundle, target_state),
+            plan_migration(bundle, target_state, HistoryPolicy::Include),
             Err(MigrationConflict::UiState("pin:stale".into()))
         );
     }
@@ -920,6 +1039,7 @@ mod tests {
         let plan = plan_migration(
             bundle,
             target.migration_target_snapshot("default", "/w").unwrap(),
+            HistoryPolicy::Include,
         )
         .unwrap();
 
@@ -978,6 +1098,7 @@ mod tests {
             target
                 .migration_target_snapshot("default", "/park")
                 .unwrap(),
+            HistoryPolicy::Include,
         )
         .unwrap();
         target.import_migration(&plan).unwrap();

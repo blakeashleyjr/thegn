@@ -152,8 +152,8 @@ impl From<DispatchNote> for MigrationNote {
 }
 
 /// The source snapshot. Every field in this type is either a selected cache row
-/// or the one permitted session-state field; credentials and global caches have
-/// no carrier by construction.
+/// or explicitly selected session state; import policy decides whether content
+/// history is copied. Credentials and global caches have no carrier here.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MigrationBundle {
     pub source_profile: String,
@@ -184,6 +184,15 @@ pub struct MigrationTarget {
     pub updated_at: Option<i64>,
 }
 
+/// Content history includes tab scrollback, pane relaunch commands, dispatch
+/// reports, free-form dispatch notes, and dispatch note rows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum HistoryPolicy {
+    #[default]
+    Drop,
+    Include,
+}
+
 /// A pure, validated import decision.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MigrationPlan {
@@ -191,6 +200,7 @@ pub struct MigrationPlan {
     pub target: MigrationTarget,
     pub fingerprint: String,
     pub resumed: bool,
+    pub history: HistoryPolicy,
 }
 
 /// A strict target conflict. Worktree registration is intentionally absent:
@@ -375,11 +385,15 @@ pub fn make_bundle(
 }
 
 /// Produce the pure target-first decision, including strict collision checks.
+/// A target imported under the other history policy is refused; rerun with the
+/// policy used for that import rather than silently merging the two forms.
 pub fn plan_migration(
     bundle: MigrationBundle,
     target: MigrationTarget,
+    history: HistoryPolicy,
 ) -> Result<MigrationPlan, MigrationConflict> {
-    for source_group in &bundle.groups {
+    let imported = imported_bundle(&bundle, history);
+    for source_group in &imported.groups {
         if target
             .groups
             .iter()
@@ -411,7 +425,7 @@ pub fn plan_migration(
     // A matching target is compared with the form this importer writes. A raw
     // pre-change copy of active rows or source-local paths is not an adopted
     // import and must be resolved by the operator before migration can proceed.
-    let fingerprint = imported_bundle(&bundle).fingerprint();
+    let fingerprint = imported.fingerprint();
     let resumed = target_subset.fingerprint() == fingerprint && has_prior_rows(&target_subset);
     if !resumed
         && (!target_subset.dispatches.is_empty()
@@ -425,6 +439,7 @@ pub fn plan_migration(
         target,
         fingerprint,
         resumed,
+        history,
     })
 }
 
@@ -543,12 +558,44 @@ fn migrated_note(status: &str, note: Option<&str>) -> String {
     }
 }
 
-/// Return a copy of a migration bundle in the exact dispatch form imported by
-/// the target, preserving row order and source ids for parent/note remapping.
-pub fn imported_bundle(bundle: &MigrationBundle) -> MigrationBundle {
+/// Return a copy of a migration bundle in the exact form imported by the
+/// target, preserving row order and source ids for parent/note remapping.
+pub fn imported_bundle(bundle: &MigrationBundle, history: HistoryPolicy) -> MigrationBundle {
     let mut imported = bundle.clone();
     imported.dispatches = bundle.dispatches.iter().map(imported_dispatch).collect();
+    if history == HistoryPolicy::Drop {
+        for group in &mut imported.groups {
+            for tab in &mut group.tabs {
+                tab.scrollback_snapshot.clear();
+                tab.pane_cmds.clear();
+            }
+        }
+        for (source, target) in bundle.dispatches.iter().zip(&mut imported.dispatches) {
+            target.report = None;
+            target.note = if crate::issue::AgentDispatchStatus::parse(&source.status).is_active() {
+                Some(migrated_note(&source.status, None))
+            } else if source.status == crate::issue::AgentDispatchStatus::Abandoned.as_str()
+                && source.note.as_deref().is_some_and(is_migration_prefix)
+            {
+                source.note.clone()
+            } else {
+                None
+            };
+        }
+        imported.notes.clear();
+    }
     imported
+}
+
+fn is_migration_prefix(note: &str) -> bool {
+    let Some(status) = note
+        .strip_prefix("[migrated while ")
+        .and_then(|value| value.strip_suffix(": not resumed]"))
+    else {
+        return false;
+    };
+    crate::issue::AgentDispatchStatus::parse(status).is_active()
+        && migrated_note(status, None) == note
 }
 
 /// A stable SHA-256 over sanitized rows. A migration plan computes this over
@@ -890,12 +937,12 @@ mod tests {
             pin_state: source.pin_state.clone(),
             ..Default::default()
         };
-        let plan = plan_migration(source.clone(), target.clone()).unwrap();
+        let plan = plan_migration(source.clone(), target.clone(), HistoryPolicy::Include).unwrap();
         assert!(plan.resumed);
 
         target.ui_state[0].value = Some("different".into());
         assert_eq!(
-            plan_migration(source, target),
+            plan_migration(source, target, HistoryPolicy::Include),
             Err(MigrationConflict::UiState("pin:api".into()))
         );
     }
@@ -911,7 +958,7 @@ mod tests {
             ..Default::default()
         };
 
-        let plan = plan_migration(source, target).unwrap();
+        let plan = plan_migration(source, target, HistoryPolicy::Include).unwrap();
         assert!(plan.resumed);
     }
 
@@ -939,7 +986,7 @@ mod tests {
             chunk_scope: None,
         });
         assert_eq!(
-            plan_migration(source, target),
+            plan_migration(source, target, HistoryPolicy::Include),
             Err(MigrationConflict::PriorImport)
         );
     }
@@ -1082,8 +1129,8 @@ mod tests {
             pin_state: source.pin_state.clone(),
             ..Default::default()
         };
-        imported_target.dispatches = imported_bundle(&source).dispatches;
-        let plan = plan_migration(source.clone(), imported_target).unwrap();
+        imported_target.dispatches = imported_bundle(&source, HistoryPolicy::Include).dispatches;
+        let plan = plan_migration(source.clone(), imported_target, HistoryPolicy::Include).unwrap();
         assert!(plan.resumed);
 
         let mut raw_target = MigrationTarget {
@@ -1094,8 +1141,168 @@ mod tests {
         };
         raw_target.dispatches = source.dispatches.clone();
         assert_eq!(
-            plan_migration(source, raw_target),
+            plan_migration(source, raw_target, HistoryPolicy::Include),
             Err(MigrationConflict::PriorImport)
         );
+    }
+
+    #[test]
+    fn history_drop_empties_scrollback_commands_reports_and_notes() {
+        let mut source = bundle();
+        source.groups[0].tabs[0].scrollback_snapshot = "SECRET_SCROLLBACK".into();
+        source.groups[0].tabs[0].pane_cmds = "SECRET_COMMAND".into();
+        source.dispatches = vec![
+            MigrationDispatch {
+                source_id: 1,
+                issue_id: "running".into(),
+                worktree_path: source.worktree_path.clone(),
+                agent_name: "agent".into(),
+                dispatched_at_ms: 1,
+                status: "running".into(),
+                stage: None,
+                parent_id: None,
+                session_id: None,
+                artifact_path: None,
+                note: Some("SECRET_NOTE".into()),
+                chunk_path: None,
+                report: Some("SECRET_REPORT".into()),
+                chunk_scope: None,
+            },
+            MigrationDispatch {
+                source_id: 2,
+                issue_id: "done".into(),
+                worktree_path: source.worktree_path.clone(),
+                agent_name: "agent".into(),
+                dispatched_at_ms: 2,
+                status: "done".into(),
+                stage: None,
+                parent_id: None,
+                session_id: None,
+                artifact_path: None,
+                note: Some("SECRET_DONE_NOTE".into()),
+                chunk_path: None,
+                report: Some("SECRET_DONE_REPORT".into()),
+                chunk_scope: None,
+            },
+            MigrationDispatch {
+                source_id: 3,
+                issue_id: "abandoned".into(),
+                worktree_path: source.worktree_path.clone(),
+                agent_name: "agent".into(),
+                dispatched_at_ms: 3,
+                status: "abandoned".into(),
+                stage: None,
+                parent_id: None,
+                session_id: None,
+                artifact_path: None,
+                note: Some("SECRET_ABANDONED_NOTE".into()),
+                chunk_path: None,
+                report: Some("SECRET_ABANDONED_REPORT".into()),
+                chunk_scope: None,
+            },
+        ];
+        source.notes.push(MigrationNote {
+            source_id: 3,
+            dispatch_id: 1,
+            created_at_ms: 3,
+            text: "SECRET_TEXT".into(),
+        });
+
+        let imported = imported_bundle(&source, HistoryPolicy::Drop);
+        assert!(imported.groups[0].tabs[0].scrollback_snapshot.is_empty());
+        assert!(imported.groups[0].tabs[0].pane_cmds.is_empty());
+        assert_eq!(imported.dispatches[0].report, None);
+        assert_eq!(imported.dispatches[1].report, None);
+        assert_eq!(imported.dispatches[2].report, None);
+        assert_eq!(
+            imported.dispatches[0].note.as_deref(),
+            Some("[migrated while running: not resumed]")
+        );
+        assert_eq!(imported.dispatches[1].note, None);
+        assert_eq!(imported.dispatches[2].note, None);
+        assert!(imported.notes.is_empty());
+        assert!(
+            !serde_json::to_string(&imported)
+                .unwrap()
+                .contains("SECRET_")
+        );
+    }
+
+    #[test]
+    fn history_include_keeps_todays_imported_form_and_drop_is_idempotent() {
+        let mut source = bundle();
+        source.groups[0].tabs[0].scrollback_snapshot = "SECRET_SCROLLBACK".into();
+        source.groups[0].tabs[0].pane_cmds = "SECRET_COMMAND".into();
+        source.dispatches.push(MigrationDispatch {
+            source_id: 1,
+            issue_id: "running".into(),
+            worktree_path: source.worktree_path.clone(),
+            agent_name: "agent".into(),
+            dispatched_at_ms: 1,
+            status: "running".into(),
+            stage: None,
+            parent_id: None,
+            session_id: Some("SECRET_SESSION".into()),
+            artifact_path: Some("SECRET_ARTIFACT".into()),
+            note: Some("SECRET_NOTE".into()),
+            chunk_path: Some("SECRET_CHUNK".into()),
+            report: Some("SECRET_REPORT".into()),
+            chunk_scope: None,
+        });
+        source.notes.push(MigrationNote {
+            source_id: 2,
+            dispatch_id: 1,
+            created_at_ms: 2,
+            text: "SECRET_TEXT".into(),
+        });
+
+        let included = imported_bundle(&source, HistoryPolicy::Include);
+        assert_eq!(
+            included.groups[0].tabs[0].scrollback_snapshot,
+            "SECRET_SCROLLBACK"
+        );
+        assert_eq!(included.groups[0].tabs[0].pane_cmds, "SECRET_COMMAND");
+        assert_eq!(
+            included.dispatches[0].note.as_deref(),
+            Some("[migrated while running: not resumed] SECRET_NOTE")
+        );
+        assert_eq!(
+            included.dispatches[0].report.as_deref(),
+            Some("SECRET_REPORT")
+        );
+        assert_eq!(included.notes[0].text, "SECRET_TEXT");
+        assert_eq!(included.dispatches[0].session_id, None);
+        assert_eq!(included.dispatches[0].artifact_path, None);
+        assert_eq!(included.dispatches[0].chunk_path, None);
+
+        let dropped = imported_bundle(&source, HistoryPolicy::Drop);
+        assert_eq!(imported_bundle(&dropped, HistoryPolicy::Drop), dropped);
+    }
+
+    #[test]
+    fn drop_plan_resumes_against_its_own_import_and_refuses_a_with_history_target() {
+        let source = bundle();
+        let dropped = imported_bundle(&source, HistoryPolicy::Drop);
+        let drop_target = MigrationTarget {
+            groups: dropped.groups.clone(),
+            ui_state: dropped.ui_state.clone(),
+            pin_state: dropped.pin_state.clone(),
+            dispatches: dropped.dispatches.clone(),
+            ..Default::default()
+        };
+        let plan = plan_migration(source.clone(), drop_target, HistoryPolicy::Drop).unwrap();
+        assert!(plan.resumed);
+
+        let include_target = MigrationTarget {
+            groups: source.groups.clone(),
+            ui_state: source.ui_state.clone(),
+            pin_state: source.pin_state.clone(),
+            dispatches: imported_bundle(&source, HistoryPolicy::Include).dispatches,
+            ..Default::default()
+        };
+        assert!(matches!(
+            plan_migration(source, include_target, HistoryPolicy::Drop),
+            Err(MigrationConflict::Group(_))
+        ));
     }
 }
