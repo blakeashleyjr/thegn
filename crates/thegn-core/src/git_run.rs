@@ -288,9 +288,12 @@ mod tests {
     #[test]
     fn invalid_utf8_is_reported_not_replaced() {
         let dir = repo();
-        let mut cmd = git_alias(dir.path(), "!printf \\377\\376", "badutf8");
+        let mut cmd = git_alias(dir.path(), "!printf '\\377\\376'", "badutf8");
         let outcome = run_command(&mut cmd, &policy(), &AtomicBool::new(false));
-        assert!(matches!(outcome, GitOutcome::Ok(_)));
+        assert!(matches!(
+            &outcome,
+            GitOutcome::Ok(bytes) if bytes == &[0xff, 0xfe]
+        ));
         assert!(matches!(
             outcome.into_text(),
             Err(GitTextError::InvalidUtf8)
