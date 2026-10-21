@@ -665,8 +665,8 @@ fn hunk_preview(c: &ChangeRow, ui: &PanelUi, deep: bool, cols: usize) -> Vec<Pan
             }
         }
         // A FETCHED-but-empty entry is a real answer, not a pending one: a
-        // binary file, a mode-only change (`chmod +x`), or a diff error all
-        // yield zero textual hunks. Rendering those as "loading…" spun forever.
+        // binary file or a mode-only change (`chmod +x`) yields zero textual
+        // hunks. Diff failures are rendered as unavailable in the row above.
         Some(_) => rows.push(PanelRow::plain(Line::segs(vec![
             sp(1),
             seg(g2(), "▾ no textual diff (binary or mode-only change)"),
