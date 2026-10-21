@@ -423,7 +423,8 @@ Queue agents (merge and PR fixers, CI autofix, headless review and review
 tasks) run credential-free, like autopilot. Their environment and sandbox
 passthrough drop credential-shaped variables plus `GH_CONFIG_DIR`, `GNUPGHOME`,
 `GIT_SSH_COMMAND`, `GPG_TTY`, `DBUS_SESSION_BUS_ADDRESS` and inherited `THEGN_*`
-variables. Autonomous sandbox specs also lose SSH identity mounts and mounts at
+variables (the resolver's `THEGN_SANDBOX` marker is retained). Autonomous
+sandbox specs also lose SSH identity mounts and mounts at
 or below `~/.ssh`, `~/.gnupg` and `~/.config/gh`; Git credential helpers are
 reset. `XDG_RUNTIME_DIR` and `GIT_CONFIG_GLOBAL` are kept for launcher plumbing
 and commit identity. A broad `[sandbox] mounts` entry that exposes the whole
