@@ -18,6 +18,89 @@
 //! Kept pure and substrate-free so the classification is unit-tested rather
 //! than inferred from a live gate run.
 
+/// A route that runs candidate-controlled code on the host until THE-794's
+/// admission handle exists.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HostExecutionRoute {
+    /// Stable route identifier used by doctor output.
+    pub id: &'static str,
+    /// The candidate-controlled code that runs.
+    pub runs: &'static str,
+    /// The configuration key or action that selects the route.
+    pub selected_by: &'static str,
+}
+
+/// Every route that runs candidate-controlled code on the host until
+/// THE-794's admission handle exists.
+pub const HOST_EXECUTION_ROUTES: &[HostExecutionRoute] = &[
+    HostExecutionRoute {
+        id: "gate_setup",
+        runs: "the candidate's setup command, through sh -c",
+        selected_by: "[merge_queue] gate_setup_command",
+    },
+    HostExecutionRoute {
+        id: "gate",
+        runs: "the candidate's gate command, through sh -c",
+        selected_by: "[merge_queue] gate_command",
+    },
+    HostExecutionRoute {
+        id: "regenerate",
+        runs: "the candidate's regenerate command during a fold",
+        selected_by: "[merge_queue] regenerate_command",
+    },
+    HostExecutionRoute {
+        id: "merge_drivers",
+        runs: "custom git merge drivers and rerere during a fold",
+        selected_by: "custom git merge drivers and rerere during a fold",
+    },
+    HostExecutionRoute {
+        id: "tests_panel",
+        runs: "the selected test command from the Tests panel",
+        selected_by: "Tests panel runs",
+    },
+    HostExecutionRoute {
+        id: "test_discovery",
+        runs: "the configured command used to discover tests",
+        selected_by: "command-based test discovery",
+    },
+];
+
+/// Shared user-facing label for candidate code that runs without isolation.
+pub const HOST_EXECUTION_LABEL: &str = "host execution (no isolation)";
+
+/// Header prepended to every merge-gate failure or error log.
+pub const HOST_EXECUTION_LOG_HEADER: &str = "[thegn] this gate ran as host execution (no isolation): candidate code had this user's environment, files and network\n";
+
+/// JSON doctor representation of every host-executed candidate-code route.
+pub fn host_execution_json() -> serde_json::Value {
+    serde_json::Value::Array(
+        HOST_EXECUTION_ROUTES
+            .iter()
+            .map(|route| {
+                serde_json::json!({
+                    "route": route.id,
+                    "runs": route.runs,
+                    "selected_by": route.selected_by,
+                    "isolation": "none",
+                })
+            })
+            .collect(),
+    )
+}
+
+/// Human-readable doctor lines for every host-executed candidate-code route.
+pub fn host_execution_lines() -> Vec<String> {
+    let mut lines = Vec::with_capacity(HOST_EXECUTION_ROUTES.len() + 2);
+    lines.push("Host execution (no isolation)".into());
+    lines.extend(
+        HOST_EXECUTION_ROUTES
+            .iter()
+            .map(|route| format!("  {}  {}: {}", route.id, route.selected_by, route.runs)),
+    );
+    lines.push("THE-794's admission handle is the planned isolated-runner fix.".into());
+    lines
+}
+
 /// What a gate invocation actually established.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GateClass {
@@ -181,5 +264,66 @@ mod tests {
         }
         assert!(!run_error_reason(true, RunEnd::Exited(1)).is_empty());
         assert!(run_error_reason(false, RunEnd::Unknown).contains("did not start"));
+    }
+
+    #[test]
+    fn host_execution_routes_name_every_candidate_code_route() {
+        let ids: Vec<_> = HOST_EXECUTION_ROUTES.iter().map(|route| route.id).collect();
+        assert_eq!(
+            ids,
+            [
+                "gate_setup",
+                "gate",
+                "regenerate",
+                "merge_drivers",
+                "tests_panel",
+                "test_discovery",
+            ]
+        );
+        for (index, route) in HOST_EXECUTION_ROUTES.iter().enumerate() {
+            assert!(
+                !route.runs.is_empty(),
+                "{} has no runs description",
+                route.id
+            );
+            assert!(
+                !route.selected_by.is_empty(),
+                "{} has no selector description",
+                route.id
+            );
+            assert!(
+                !ids[..index].contains(&route.id),
+                "{} is duplicated",
+                route.id
+            );
+        }
+    }
+
+    #[test]
+    fn host_execution_json_marks_every_route_unisolated() {
+        let value = host_execution_json();
+        let entries = value.as_array().expect("route list should be an array");
+        assert_eq!(entries.len(), HOST_EXECUTION_ROUTES.len());
+        for (entry, route) in entries.iter().zip(HOST_EXECUTION_ROUTES) {
+            assert_eq!(entry["route"], route.id);
+            assert_eq!(entry["isolation"], "none");
+        }
+    }
+
+    #[test]
+    fn host_execution_lines_start_with_the_label_heading() {
+        let lines = host_execution_lines();
+        assert!(lines[0].contains("Host execution (no isolation)"));
+        for route in HOST_EXECUTION_ROUTES {
+            assert_eq!(
+                lines
+                    .iter()
+                    .filter(|line| line.starts_with(&format!("  {}  ", route.id)))
+                    .count(),
+                1,
+                "missing doctor line for {}",
+                route.id
+            );
+        }
     }
 }
