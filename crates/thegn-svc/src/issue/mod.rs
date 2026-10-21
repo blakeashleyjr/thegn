@@ -24,7 +24,7 @@ use std::future::Future;
 use std::sync::Arc;
 use std::time::Duration;
 use thegn_core::config::{IssueAccount, IssueProviderKind, IssuesConfig, expand_env_ref};
-use thegn_core::issue::{Issue, IssueDetail, IssueDraft, IssueFilter, IssuePatch};
+use thegn_core::issue::{Issue, IssueDetail, IssueDraft, IssueFilter, IssuePatch, IssueRef};
 use thegn_core::seam::{ErrorClass, SeamError};
 
 /// Four account reads bound network fan-out without serializing normal configs.
@@ -46,6 +46,10 @@ pub enum IssueError {
     AmbiguousAccount {
         provider: String,
         accounts: Vec<String>,
+    },
+    UnknownAccount {
+        provider: String,
+        account: String,
     },
     NoCreateTarget {
         provider: String,
@@ -86,6 +90,11 @@ impl std::fmt::Debug for IssueError {
                 .finish(),
             Self::NoCreateTarget { provider, account } => f
                 .debug_struct("IssueError::NoCreateTarget")
+                .field("provider", provider)
+                .field("account", account)
+                .finish(),
+            Self::UnknownAccount { provider, account } => f
+                .debug_struct("IssueError::UnknownAccount")
                 .field("provider", provider)
                 .field("account", account)
                 .finish(),
@@ -145,6 +154,9 @@ impl std::fmt::Display for IssueError {
                     write!(f, " named {account}")?;
                 }
                 write!(f, " to create on")
+            }
+            IssueError::UnknownAccount { provider, account } => {
+                write!(f, "no configured {provider} issue account named {account}")
             }
             IssueError::Unsupported(op) => write!(f, "{op} is not supported by this provider"),
             IssueError::UnsupportedPatchFields(fields) => write!(
@@ -220,6 +232,7 @@ impl SeamError for IssueError {
             }
             IssueError::NotConfigured => ErrorClass::NotConfigured,
             IssueError::AmbiguousAccount { .. } => ErrorClass::Other,
+            IssueError::UnknownAccount { .. } => ErrorClass::Other,
             IssueError::Auth(_) => ErrorClass::Auth,
             IssueError::Network(e) if e.is_connect() || e.is_timeout() => ErrorClass::Transient,
             IssueError::Timeout(_) => ErrorClass::Transient,
@@ -548,7 +561,7 @@ pub struct CreateTarget {
 }
 
 /// Routes issue requests across every configured provider. `list`/`search` fan
-/// out and merge; `get`/`update` dispatch by the `"<provider>:"` id prefix.
+/// out and merge; by-id routing refuses ambiguity, while by-ref routing is exact.
 /// Returns empty results (not errors) when nothing is configured — the panel
 /// renders gracefully regardless. A single provider failing never breaks the
 /// others: it logs and contributes nothing to the merged result.
@@ -638,7 +651,7 @@ impl IssueRouter {
     /// longest registered prefix so `plugin:demo:key` reaches `plugin:demo`.
     /// A bare legacy id is accepted only when there is exactly one backend;
     /// namespaced ids never fall through to another provider.
-    fn backend_for_id(&self, id: &str) -> Result<Option<&dyn IssueBackend>, IssueError> {
+    fn backend_for_id(&self, id: &str) -> Result<Option<&AccountBackend>, IssueError> {
         let matches = |b: &&AccountBackend| {
             id == b.inner.provider_id()
                 || id
@@ -663,14 +676,39 @@ impl IssueRouter {
                     accounts: matching.iter().map(|b| b.account.clone()).collect(),
                 });
             }
-            return Ok(matching.first().map(|b| b.inner.as_ref()));
+            return Ok(matching.first().copied());
         }
         // Preserve the audited legacy bare-id compatibility only at the
         // unambiguous sole-backend boundary. A namespaced id never falls back.
         if !id.contains(':') && self.inner.len() == 1 {
-            return Ok(self.inner.first().map(|b| b.inner.as_ref()));
+            return Ok(self.inner.first());
         }
         Ok(None)
+    }
+
+    fn backend_for_ref(&self, issue_ref: &IssueRef) -> Result<&AccountBackend, IssueError> {
+        let matching: Vec<&AccountBackend> = self
+            .inner
+            .iter()
+            .filter(|backend| {
+                backend.inner.provider_id() == issue_ref.provider
+                    && backend.account == issue_ref.account
+            })
+            .collect();
+        match matching.as_slice() {
+            [backend] => Ok(*backend),
+            [] => Err(IssueError::UnknownAccount {
+                provider: issue_ref.provider.clone(),
+                account: issue_ref.account.clone(),
+            }),
+            backends => Err(IssueError::AmbiguousAccount {
+                provider: issue_ref.provider.clone(),
+                accounts: backends
+                    .iter()
+                    .map(|backend| backend.account.clone())
+                    .collect(),
+            }),
+        }
     }
 
     /// The error for an id that routed nowhere. An empty router is genuinely
@@ -726,7 +764,7 @@ impl IssueRouter {
             };
             match result {
                 Ok(issues) => match validate_issues(issues) {
-                    Ok(valid) => per_account.push(valid),
+                    Ok(valid) => per_account.push(stamp_issues(valid, &b.account)),
                     Err(e) => {
                         tracing::warn!(provider = b.inner.provider_id(), error = %e, "issue identity rejected")
                     }
@@ -735,7 +773,7 @@ impl IssueRouter {
                     let valid = issues
                         .into_iter()
                         .filter_map(|issue| match validate_issue_identity(&issue) {
-                            Ok(()) => Some(issue),
+                            Ok(()) => Some(stamp_issue(issue, &b.account)),
                             Err(error) => {
                                 tracing::warn!(
                                     account = %b.account,
@@ -776,9 +814,21 @@ impl IssueRouter {
             .iter()
             .map(|b| {
                 let metadata = (b.account.clone(), b.inner.provider_id());
+                let account = b.account.clone();
                 (metadata, async move {
                     // Keep PartialList as an error so cache refreshes never persist it as complete.
-                    b.inner.list_issues(filter).await.and_then(validate_issues)
+                    match b.inner.list_issues(filter).await {
+                        Ok(issues) => {
+                            validate_issues(issues).map(|issues| stamp_issues(issues, &account))
+                        }
+                        Err(IssueError::PartialList { issues, reason }) => {
+                            Err(IssueError::PartialList {
+                                issues: stamp_issues(issues, &account),
+                                reason,
+                            })
+                        }
+                        Err(error) => Err(error),
+                    }
                 })
             })
             .collect();
@@ -795,13 +845,82 @@ impl IssueRouter {
     pub async fn get_issue(&self, id: &str) -> Result<IssueDetail, IssueError> {
         validate_control_issue_id(id)?;
         match self.backend_for_id(id) {
-            Ok(Some(b)) => b.get_issue(id).await.and_then(|detail| {
+            Ok(Some(b)) => b.inner.get_issue(id).await.and_then(|mut detail| {
                 validate_issue_identity(&detail.issue)?;
+                detail.issue.account = Some(b.account.clone());
                 Ok(detail)
             }),
             Ok(None) => Err(self.id_miss(id)),
             Err(error) => Err(error),
         }
+    }
+
+    pub async fn get_issue_ref(&self, issue_ref: &IssueRef) -> Result<IssueDetail, IssueError> {
+        validate_issue_ref(issue_ref)?;
+        let backend = self.backend_for_ref(issue_ref)?;
+        let mut detail = backend.inner.get_issue(&issue_ref.id).await?;
+        validate_issue_identity(&detail.issue)?;
+        if detail.issue.id != issue_ref.id {
+            return Err(IssueError::Policy(
+                "tracker returned a different issue than the ref",
+            ));
+        }
+        detail.issue.account = Some(issue_ref.account.clone());
+        Ok(detail)
+    }
+
+    pub async fn update_issue_ref(
+        &self,
+        issue_ref: &IssueRef,
+        patch: &IssuePatch,
+    ) -> Result<Issue, IssueError> {
+        validate_issue_ref(issue_ref)?;
+        let backend = self.backend_for_ref(issue_ref)?;
+        validate_patch_capabilities(backend.inner.caps(), patch)?;
+        let issue = backend.inner.update_issue(&issue_ref.id, patch).await?;
+        validate_issue_identity(&issue)?;
+        if issue.id != issue_ref.id {
+            return Err(IssueError::Policy(
+                "tracker returned a different issue than the ref",
+            ));
+        }
+        Ok(stamp_issue(issue, &issue_ref.account))
+    }
+
+    pub async fn add_comment_ref(
+        &self,
+        issue_ref: &IssueRef,
+        body: &str,
+    ) -> Result<(), IssueError> {
+        validate_issue_ref(issue_ref)?;
+        self.backend_for_ref(issue_ref)?
+            .inner
+            .add_comment(&issue_ref.id, body)
+            .await
+    }
+
+    pub async fn attach_label_ref(
+        &self,
+        issue_ref: &IssueRef,
+        label: &str,
+    ) -> Result<(), IssueError> {
+        validate_issue_ref(issue_ref)?;
+        self.backend_for_ref(issue_ref)?
+            .inner
+            .attach_label(&issue_ref.id, label)
+            .await
+    }
+
+    pub async fn detach_label_ref(
+        &self,
+        issue_ref: &IssueRef,
+        label: &str,
+    ) -> Result<(), IssueError> {
+        validate_issue_ref(issue_ref)?;
+        self.backend_for_ref(issue_ref)?
+            .inner
+            .detach_label(&issue_ref.id, label)
+            .await
     }
 
     /// Create an issue only when this router has exactly one configured account.
@@ -869,17 +988,17 @@ impl IssueRouter {
             ));
         }
         validate_issue_identity(&issue)?;
-        Ok(issue)
+        Ok(stamp_issue(issue, &backend.account))
     }
 
     pub async fn update_issue(&self, id: &str, patch: &IssuePatch) -> Result<Issue, IssueError> {
         validate_control_issue_id(id)?;
         match self.backend_for_id(id) {
             Ok(Some(b)) => {
-                validate_patch_capabilities(b.caps(), patch)?;
-                b.update_issue(id, patch).await.and_then(|issue| {
+                validate_patch_capabilities(b.inner.caps(), patch)?;
+                b.inner.update_issue(id, patch).await.and_then(|issue| {
                     validate_issue_identity(&issue)?;
-                    Ok(issue)
+                    Ok(stamp_issue(issue, &b.account))
                 })
             }
             Ok(None) => Err(self.id_miss(id)),
@@ -891,7 +1010,7 @@ impl IssueRouter {
     pub async fn add_comment(&self, id: &str, body: &str) -> Result<(), IssueError> {
         validate_control_issue_id(id)?;
         match self.backend_for_id(id) {
-            Ok(Some(b)) => b.add_comment(id, body).await,
+            Ok(Some(b)) => b.inner.add_comment(id, body).await,
             Ok(None) => Err(IssueError::NotConfigured),
             Err(error) => Err(error),
         }
@@ -901,7 +1020,7 @@ impl IssueRouter {
     pub async fn attach_label(&self, id: &str, label: &str) -> Result<(), IssueError> {
         validate_control_issue_id(id)?;
         match self.backend_for_id(id) {
-            Ok(Some(b)) => b.attach_label(id, label).await,
+            Ok(Some(b)) => b.inner.attach_label(id, label).await,
             Ok(None) => Err(IssueError::NotConfigured),
             Err(error) => Err(error),
         }
@@ -911,7 +1030,7 @@ impl IssueRouter {
     pub async fn detach_label(&self, id: &str, label: &str) -> Result<(), IssueError> {
         validate_control_issue_id(id)?;
         match self.backend_for_id(id) {
-            Ok(Some(b)) => b.detach_label(id, label).await,
+            Ok(Some(b)) => b.inner.detach_label(id, label).await,
             Ok(None) => Err(IssueError::NotConfigured),
             Err(error) => Err(error),
         }
@@ -942,7 +1061,7 @@ impl IssueRouter {
             };
             match result {
                 Ok(issues) => match validate_issues(issues) {
-                    Ok(valid) => per_account.push(valid),
+                    Ok(valid) => per_account.push(stamp_issues(valid, &b.account)),
                     Err(e) => {
                         tracing::warn!(provider = b.inner.provider_id(), error = %e, "issue identity rejected")
                     }
@@ -954,6 +1073,25 @@ impl IssueRouter {
         }
         Ok(merge_fair(per_account, limit))
     }
+}
+
+fn validate_issue_ref(issue_ref: &IssueRef) -> Result<(), IssueError> {
+    issue_ref
+        .validate()
+        .map_err(|error| IssueError::Parse(error.to_string()))?;
+    validate_control_issue_id(&issue_ref.id)
+}
+
+fn stamp_issue(mut issue: Issue, account: &str) -> Issue {
+    issue.account = Some(account.to_string());
+    issue
+}
+
+fn stamp_issues(issues: Vec<Issue>, account: &str) -> Vec<Issue> {
+    issues
+        .into_iter()
+        .map(|issue| stamp_issue(issue, account))
+        .collect()
 }
 
 async fn fan_out_until<M, T, Fut>(
@@ -1157,6 +1295,7 @@ mod tests {
             .unwrap();
 
         assert_eq!(created.provider, "kaneo");
+        assert_eq!(created.account.as_deref(), Some("kaneo-account"));
         assert_eq!(linear_calls.load(std::sync::atomic::Ordering::SeqCst), 0);
         assert_eq!(kaneo_calls.load(std::sync::atomic::Ordering::SeqCst), 1);
     }
@@ -1207,6 +1346,7 @@ mod tests {
                 .unwrap();
 
             assert_eq!(created.id, "kaneo:task-work");
+            assert_eq!(created.account.as_deref(), Some("work"));
             assert_eq!(personal_calls.load(std::sync::atomic::Ordering::SeqCst), 0);
             assert_eq!(work_calls.load(std::sync::atomic::Ordering::SeqCst), 1);
         }
@@ -1415,19 +1555,19 @@ mod tests {
         assert_eq!(
             r.backend_for_id("jira:PROJ-1")
                 .unwrap()
-                .map(|b| b.provider_id()),
+                .map(|b| b.inner.provider_id()),
             Some("jira")
         );
         assert_eq!(
             r.backend_for_id("linear:ABC-9")
                 .unwrap()
-                .map(|b| b.provider_id()),
+                .map(|b| b.inner.provider_id()),
             Some("linear")
         );
         assert_eq!(
             r.backend_for_id("kaneo:abc123")
                 .unwrap()
-                .map(|b| b.provider_id()),
+                .map(|b| b.inner.provider_id()),
             Some("kaneo")
         );
         // An id for a provider that isn't configured routes nowhere.
@@ -1442,14 +1582,16 @@ mod tests {
         let r = IssueRouter::from_config(&cfg_with(vec![IssueProviderKind::Linear]));
         // `wt new --from-issue THE-72` on a single-tracker machine.
         assert_eq!(
-            r.backend_for_id("THE-72").unwrap().map(|b| b.provider_id()),
+            r.backend_for_id("THE-72")
+                .unwrap()
+                .map(|b| b.inner.provider_id()),
             Some("linear")
         );
         // An explicit prefix still wins outright (same backend here).
         assert_eq!(
             r.backend_for_id("linear:THE-72")
                 .unwrap()
-                .map(|b| b.provider_id()),
+                .map(|b| b.inner.provider_id()),
             Some("linear")
         );
     }
@@ -1466,7 +1608,7 @@ mod tests {
         assert_eq!(
             r.backend_for_id("jira:THE-72")
                 .unwrap()
-                .map(|b| b.provider_id()),
+                .map(|b| b.inner.provider_id()),
             Some("jira")
         );
     }
@@ -2103,10 +2245,12 @@ mod tests {
             .unwrap();
         assert_eq!(issues.len(), 1);
         assert_eq!(issues[0].title, "partial row");
+        assert_eq!(issues[0].account.as_deref(), Some("partial"));
         let per_provider = runtime.block_on(router.list_per_provider(&IssueFilter::default()));
         assert!(matches!(
             &per_provider[0].2,
-            Err(IssueError::PartialList { issues, .. }) if issues.len() == 1
+            Err(IssueError::PartialList { issues, .. })
+                if issues.len() == 1 && issues[0].account.as_deref() == Some("partial")
         ));
     }
 
@@ -2177,14 +2321,14 @@ mod tests {
             router
                 .backend_for_id("plugin:demo:opaque/key#7")
                 .unwrap()
-                .map(|b| b.provider_id()),
+                .map(|b| b.inner.provider_id()),
             Some("plugin:demo")
         );
         assert_eq!(
             router
                 .backend_for_id("plugin:demo:opaque:key")
                 .unwrap()
-                .map(|b| b.provider_id()),
+                .map(|b| b.inner.provider_id()),
             Some("plugin:demo")
         );
         assert!(
@@ -2516,5 +2660,227 @@ mod tests {
             message.contains("restrict this repo with accounts = [\"<name>\"]"),
             "{message}"
         );
+    }
+
+    struct RefCallBackend {
+        issue: Issue,
+        calls: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl IssueBackend for RefCallBackend {
+        fn provider_id(&self) -> &str {
+            "github"
+        }
+        fn caps(&self) -> IssueCaps {
+            IssueCaps {
+                patch_status: true,
+                comments: true,
+                labels: true,
+                ..Default::default()
+            }
+        }
+        fn list_issues<'a>(
+            &'a self,
+            _filter: &'a IssueFilter,
+        ) -> BoxFuture<'a, Result<Vec<Issue>, IssueError>> {
+            Box::pin(async move { Ok(vec![self.issue.clone()]) })
+        }
+        fn get_issue<'a>(&'a self, _id: &'a str) -> BoxFuture<'a, Result<IssueDetail, IssueError>> {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let issue = self.issue.clone();
+            Box::pin(async move {
+                Ok(IssueDetail {
+                    issue,
+                    ..Default::default()
+                })
+            })
+        }
+        fn create_issue<'a>(
+            &'a self,
+            _draft: &'a IssueDraft,
+        ) -> BoxFuture<'a, Result<Issue, IssueError>> {
+            Box::pin(async { Err(IssueError::Api("unused".into())) })
+        }
+        fn update_issue<'a>(
+            &'a self,
+            _id: &'a str,
+            _patch: &'a IssuePatch,
+        ) -> BoxFuture<'a, Result<Issue, IssueError>> {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let issue = self.issue.clone();
+            Box::pin(async move { Ok(issue) })
+        }
+        fn search<'a>(
+            &'a self,
+            _query: &'a str,
+            _limit: usize,
+        ) -> BoxFuture<'a, Result<Vec<Issue>, IssueError>> {
+            Box::pin(async move { Ok(vec![self.issue.clone()]) })
+        }
+        fn add_comment<'a>(
+            &'a self,
+            _id: &'a str,
+            _body: &'a str,
+        ) -> BoxFuture<'a, Result<(), IssueError>> {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Box::pin(async { Ok(()) })
+        }
+        fn attach_label<'a>(
+            &'a self,
+            _id: &'a str,
+            _label: &'a str,
+        ) -> BoxFuture<'a, Result<(), IssueError>> {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Box::pin(async { Ok(()) })
+        }
+        fn detach_label<'a>(
+            &'a self,
+            _id: &'a str,
+            _label: &'a str,
+        ) -> BoxFuture<'a, Result<(), IssueError>> {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Box::pin(async { Ok(()) })
+        }
+    }
+
+    fn ref_issue(id: &str) -> Issue {
+        Issue {
+            id: id.into(),
+            number: "1".into(),
+            provider: "github".into(),
+            title: "issue".into(),
+            url: "https://github.com/owner/repo/issues/1".into(),
+            account: Some("spoofed".into()),
+            ..Default::default()
+        }
+    }
+
+    fn ref_router(
+        order: &[&str],
+        id: &str,
+    ) -> (IssueRouter, Vec<Arc<std::sync::atomic::AtomicUsize>>) {
+        let mut router = IssueRouter::from_config(&IssuesConfig::default());
+        let calls = (0..2)
+            .map(|_| Arc::new(std::sync::atomic::AtomicUsize::new(0)))
+            .collect::<Vec<_>>();
+        for account in order {
+            let slot = if *account == "personal" { 0 } else { 1 };
+            router
+                .push_backend(
+                    (*account).into(),
+                    Box::new(RefCallBackend {
+                        issue: ref_issue(id),
+                        calls: Arc::clone(&calls[slot]),
+                    }),
+                )
+                .unwrap();
+        }
+        (router, calls)
+    }
+
+    #[test]
+    fn issue_ref_routes_colliding_ids_to_the_exact_account() {
+        use std::sync::atomic::Ordering;
+        let (router, calls) = ref_router(&["personal", "work"], "github:owner/repo#1");
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let patch = IssuePatch {
+            status: Some(thegn_core::issue::IssueStatus::Todo),
+            ..Default::default()
+        };
+        for account in ["work", "personal"] {
+            let issue_ref = IssueRef::new("github", account, "github:owner/repo#1").unwrap();
+            runtime.block_on(async {
+                router.get_issue_ref(&issue_ref).await.unwrap();
+                let updated = router.update_issue_ref(&issue_ref, &patch).await.unwrap();
+                assert_eq!(updated.account.as_deref(), Some(account));
+                router.add_comment_ref(&issue_ref, "hello").await.unwrap();
+                router.attach_label_ref(&issue_ref, "bug").await.unwrap();
+                router.detach_label_ref(&issue_ref, "bug").await.unwrap();
+            });
+            let expected = if account == "personal" { 0 } else { 1 };
+            let other = 1 - expected;
+            assert_eq!(calls[expected].load(Ordering::SeqCst), 5);
+            assert_eq!(calls[other].load(Ordering::SeqCst), 0);
+            calls[expected].store(0, Ordering::SeqCst);
+        }
+    }
+
+    #[test]
+    fn issue_ref_routing_survives_account_reorder() {
+        let (router, calls) = ref_router(&["work", "personal"], "github:owner/repo#1");
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let issue_ref = IssueRef::new("github", "work", "github:owner/repo#1").unwrap();
+        runtime.block_on(router.get_issue_ref(&issue_ref)).unwrap();
+        assert_eq!(calls[1].load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(calls[0].load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn issue_ref_unknown_account_is_typed_and_calls_nothing() {
+        let (router, calls) = ref_router(&["personal", "work"], "github:owner/repo#1");
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let issue_ref = IssueRef::new("github", "gone", "github:owner/repo#1").unwrap();
+        let result = runtime.block_on(router.get_issue_ref(&issue_ref));
+        assert!(
+            matches!(result, Err(IssueError::UnknownAccount { provider, account }) if provider == "github" && account == "gone")
+        );
+        assert!(
+            calls
+                .iter()
+                .all(|count| count.load(std::sync::atomic::Ordering::SeqCst) == 0)
+        );
+    }
+
+    #[test]
+    fn issue_ref_router_stamps_the_producing_account_on_reads() {
+        let (router, _) = ref_router(&["work"], "github:owner/repo#1");
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let listed = runtime
+            .block_on(router.list_issues(&IssueFilter::default()))
+            .unwrap();
+        assert_eq!(listed[0].account.as_deref(), Some("work"));
+        let per_provider = runtime.block_on(router.list_per_provider(&IssueFilter::default()));
+        assert_eq!(
+            per_provider[0].2.as_ref().unwrap()[0].account.as_deref(),
+            Some("work")
+        );
+        let searched = runtime.block_on(router.search("q", 10)).unwrap();
+        assert_eq!(searched[0].account.as_deref(), Some("work"));
+        let issue_ref = IssueRef::new("github", "work", "github:owner/repo#1").unwrap();
+        let detail = runtime.block_on(router.get_issue_ref(&issue_ref)).unwrap();
+        assert_eq!(detail.issue.account.as_deref(), Some("work"));
+        let detail = runtime
+            .block_on(router.get_issue("github:owner/repo#1"))
+            .unwrap();
+        assert_eq!(detail.issue.account.as_deref(), Some("work"));
+    }
+
+    #[test]
+    fn issue_ref_mismatched_returned_id_is_refused() {
+        let (router, _) = ref_router(&["work"], "github:owner/repo#2");
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let issue_ref = IssueRef::new("github", "work", "github:owner/repo#1").unwrap();
+        let result = runtime.block_on(router.get_issue_ref(&issue_ref));
+        assert!(matches!(
+            result,
+            Err(IssueError::Policy(
+                "tracker returned a different issue than the ref"
+            ))
+        ));
     }
 }

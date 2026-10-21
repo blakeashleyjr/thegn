@@ -126,6 +126,9 @@ pub(crate) use persistence::run_selected_fold;
 use persistence::{observe_outcomes, persist};
 #[path = "integrate_git_fence.rs"]
 mod git_fence;
+pub(crate) fn candidate_is_ancestor(repo_root: &Path, candidate: &str, tip: &str) -> bool {
+    git_fence::ok(repo_root, &["merge-base", "--is-ancestor", candidate, tip])
+}
 #[path = "integrate_rerere.rs"]
 mod rerere;
 pub(crate) use rerere::cache_status as rerere_cache_status;
@@ -1904,7 +1907,7 @@ fn build_report(
             kind: d.kind,
             submodule_conflicts: d.submodule_conflicts.clone(),
             gate_failed: false,
-            driver_refusal: None,
+            driver_refusal: deferral_refusal(d),
         })
         .collect();
     for off in gate_offenders {
@@ -2062,10 +2065,18 @@ fn refusal_summary(paths: &[String], refusals: &BTreeMap<String, String>) -> Opt
     })
 }
 
+fn deferral_refusal(deferred: &fold::Deferred) -> Option<String> {
+    (deferred.kind == ConflictKind::UnsupportedMergeHistory).then(|| {
+        "branch history contains merge commits; the rebase land strategy only replays linear history: land it with the merge or squash strategy, or linearize the branch"
+            .to_string()
+    })
+}
+
 fn attach_driver_refusals(report: &mut FoldReport, refusals: &Mutex<BTreeMap<String, String>>) {
     if let Ok(refusals) = refusals.lock() {
         for deferred in &mut report.deferred {
-            deferred.driver_refusal = refusal_summary(&deferred.paths, &refusals);
+            deferred.driver_refusal = refusal_summary(&deferred.paths, &refusals)
+                .or_else(|| deferred.driver_refusal.take());
         }
     }
 }
@@ -2731,8 +2742,7 @@ fn attempt_land_admitted(
     // tip into the target store first and fold that synthetic ref — a bare
     // `refs/heads/<branch>` only exists in the branch host's own object store.
     // A same-store branch just yields `refs/heads/<branch>` (no I/O).
-    let branch_ref = match crate::merge_remote::ensure_tip_in_target(&loc, branch_name, branch_loc)
-    {
+    let ingested = match crate::merge_remote::ingest_tip(&loc, branch_name, branch_loc) {
         Ok(r) => r,
         Err(e) => {
             return Ok(AttemptOutcome::Unreachable {
@@ -2740,6 +2750,7 @@ fn attempt_land_admitted(
             });
         }
     };
+    let branch_ref = ingested.ref_name.clone();
     let refused = match configured_merge_drivers(repo_root) {
         Ok(refused) => refused,
         Err(error) => {
@@ -2778,6 +2789,16 @@ fn attempt_land_admitted(
         source_history.revalidate()?;
         let base = CliGit.rev_parse(&loc, &target_ref)?;
         let branch_tip = CliGit.rev_parse(&loc, &branch_ref)?;
+        if let Some(ingested_oid) = &ingested.oid
+            && branch_tip != *ingested_oid
+        {
+            return Ok(AttemptOutcome::GateError {
+                reason: "ingested source ref changed in the target store; retry".into(),
+                log: format!("ingested ref {branch_ref} moved to {branch_tip}"),
+                phase: GatePhase::Gate,
+                class: GateErrorClass::SourceMoved,
+            });
+        }
         let already_landed =
             util::git_is_ancestor(repo_root, &branch_tip, &base).with_context(|| {
                 format!(
@@ -2833,7 +2854,8 @@ fn attempt_land_admitted(
                 .refusals
                 .lock()
                 .ok()
-                .and_then(|refusals| refusal_summary(&paths, &refusals));
+                .and_then(|refusals| refusal_summary(&paths, &refusals))
+                .or_else(|| deferred.and_then(deferral_refusal));
             return Ok(AttemptOutcome::Conflict {
                 paths,
                 submodule_conflicts,
@@ -2895,6 +2917,26 @@ fn attempt_land_admitted(
         adapter.history.revalidate()?;
         source_history.revalidate()?;
         let source_refs = [(branch_ref.clone(), branch_tip.clone())];
+        if let Some(ingested_oid) = &ingested.oid {
+            match crate::merge_remote::verify_source_unchanged(
+                branch_loc,
+                branch_name,
+                ingested_oid,
+            ) {
+                crate::merge_remote::SourceCheck::Unchanged => {}
+                crate::merge_remote::SourceCheck::Moved { actual } => {
+                    return Ok(AttemptOutcome::GateError {
+                        reason: "source moved on its host after the gate; retry".into(),
+                        log: format!("source refs/heads/{branch_name} moved to {actual}"),
+                        phase: GatePhase::Gate,
+                        class: GateErrorClass::SourceMoved,
+                    });
+                }
+                crate::merge_remote::SourceCheck::Unreachable(detail) => {
+                    return Ok(AttemptOutcome::Unreachable { detail });
+                }
+            }
+        }
         match CliGit.update_ref_cas_with_sources(
             &loc,
             &target_ref,
@@ -3527,6 +3569,85 @@ mod tests {
         assert!(authors.contains("Ada"), "author not preserved: {authors}");
         let files = repo.out(&["ls-tree", "-r", "--name-only", "main"]);
         assert!(files.contains("a.txt") && files.contains("b.txt") && files.contains("main.txt"));
+    }
+
+    #[test]
+    fn rebase_merge_history_holds_without_moving_main() {
+        let repo = Repo::new("rebase-merge-history");
+        if !repo.history_supported_or_refused() {
+            return;
+        }
+        repo.feature("feat", "feat.txt", "feature\n");
+        repo.commit("main.txt", "main\n", "main moves");
+        let before = repo.out(&["rev-parse", "main"]);
+        git(&repo.dir, &["checkout", "-q", "feat"]);
+        git(
+            &repo.dir,
+            &[
+                "-c",
+                "commit.gpgsign=false",
+                "merge",
+                "--no-ff",
+                "-q",
+                "-m",
+                "merge main",
+                "main",
+            ],
+        );
+        git(&repo.dir, &["checkout", "-q", "main"]);
+
+        let mut c = cfg("");
+        c.land_strategy = thegn_core::config::LandStrategy::Rebase;
+        let report = run_fold(&c, &repo.dir, repo.branch_set()).unwrap();
+
+        assert!(!report.advanced, "merge history must hold: {report:?}");
+        assert_eq!(repo.out(&["rev-parse", "main"]), before, "target unmoved");
+        assert_eq!(report.deferred.len(), 1, "branch has a typed hold");
+        assert_eq!(
+            report.deferred[0].kind,
+            ConflictKind::UnsupportedMergeHistory
+        );
+        assert!(
+            report.deferred[0]
+                .driver_refusal
+                .as_deref()
+                .is_some_and(|reason| reason.contains("merge commits"))
+        );
+    }
+
+    #[test]
+    fn rebase_merge_history_attempt_land_is_a_refusal() {
+        let repo = Repo::new("rebase-merge-history-attempt");
+        if !repo.history_supported_or_refused() {
+            return;
+        }
+        repo.feature("feat", "feat.txt", "feature\n");
+        repo.commit("main.txt", "main\n", "main moves");
+        git(&repo.dir, &["checkout", "-q", "feat"]);
+        git(
+            &repo.dir,
+            &[
+                "-c",
+                "commit.gpgsign=false",
+                "merge",
+                "--no-ff",
+                "-q",
+                "-m",
+                "merge main",
+                "main",
+            ],
+        );
+        git(&repo.dir, &["checkout", "-q", "main"]);
+
+        let mut c = cfg("");
+        c.land_strategy = thegn_core::config::LandStrategy::Rebase;
+        match attempt_land(&c, &repo.dir, "feat", &GitLoc::Local(repo.dir.clone())).unwrap() {
+            AttemptOutcome::Conflict {
+                driver_refusal: Some(reason),
+                ..
+            } => assert!(reason.contains("merge commits"), "{reason}"),
+            outcome => panic!("expected typed merge-history refusal, got {outcome:?}"),
+        }
     }
 
     #[test]

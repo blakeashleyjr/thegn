@@ -103,17 +103,16 @@ just act-clean          # remove act containers if one wedges
 ```
 
 Defaults live in `.actrc`: the `catthehacker/ubuntu:act-latest` runner image
-and `linux/amd64` (identical on Apple silicon). The default run does not load a
-secret file and does not reuse its job container. `--secret-file .secrets` is
-an explicit credential opt-in: it gives the checked-out branch's workflow and
-composite-action code access to the token, so use it only when you trust that
-code. The token is unnecessary for anonymous access to current public flake
-inputs. `--reuse` explicitly retains the container and its mutable `/nix`
-state; avoid carrying it across revisions or trust domains. Both modes execute
-workflow and local composite-action files from the checked-out revision, and
-`.actrc` still selects the mutable `act-latest` image tag. These defaults do not
-admit a reviewed workflow revision or authenticate the runner image; use only
-branches you trust. Image digest admission is tracked separately by THE-413.
+is pinned by its index digest, and `linux/amd64` keeps runs identical on Apple
+silicon. To update the image, resolve and review the tag's new digest, then
+replace the pin in `.actrc` in one commit. The default run does not load a
+secret file and does not reuse its job container. The anonymous default plus
+an explicit per-invocation `--secret-file .secrets` is the credential boundary:
+it gives the checked-out branch's workflow and composite-action code access to
+the token, so use it only on code you trust. Credentialed runs are not bound to
+a reviewed workflow revision. The token is unnecessary for anonymous access to
+current public flake inputs. `--reuse` explicitly retains the container and its
+mutable `/nix` state; avoid carrying it across revisions or trust domains.
 
 ### Caveats
 

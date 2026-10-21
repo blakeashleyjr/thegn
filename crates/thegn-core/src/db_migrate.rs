@@ -1707,6 +1707,52 @@ pub(crate) fn verify_v87_schema(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
+/// v88: hashed per-row report/note worker capabilities (THE-206).
+pub(crate) fn migrate_v88(conn: &Connection) -> Result<()> {
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS dispatch_capabilities (
+             token_sha256 TEXT PRIMARY KEY,
+             dispatch_id INTEGER NOT NULL,
+             session_id TEXT NOT NULL,
+             run_gen INTEGER NOT NULL,
+             verbs TEXT NOT NULL,
+             created_at_ms INTEGER NOT NULL,
+             expires_at_ms INTEGER NOT NULL,
+             revoked_at_ms INTEGER
+         );
+         CREATE INDEX IF NOT EXISTS idx_dispatch_capabilities_dispatch
+             ON dispatch_capabilities(dispatch_id);",
+    )?;
+    Ok(())
+}
+
+/// Verify the v88 per-row worker capability table (THE-206).
+pub(crate) fn verify_v88_schema(conn: &Connection) -> Result<()> {
+    for column in [
+        "token_sha256",
+        "dispatch_id",
+        "session_id",
+        "run_gen",
+        "verbs",
+        "created_at_ms",
+        "expires_at_ms",
+        "revoked_at_ms",
+    ] {
+        if !has_column(conn, "dispatch_capabilities", column) {
+            bail!("schema v88 migration did not add dispatch_capabilities.{column}");
+        }
+    }
+    let dispatch_index_exists: bool = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='index' AND name=?1)",
+        ["idx_dispatch_capabilities_dispatch"],
+        |row| row.get(0),
+    )?;
+    if !dispatch_index_exists {
+        bail!("schema v88 migration did not add idx_dispatch_capabilities_dispatch");
+    }
+    Ok(())
+}
+
 /// Verify the v69 identity ledger before the schema version is stamped. A
 /// missing column/table must never look like a completed migration.
 pub(crate) fn verify_v69_schema(conn: &Connection) -> Result<()> {
@@ -2620,6 +2666,39 @@ mod tests {
         }
         let upgraded = Db::open_at(&path).unwrap();
         super::verify_v87_schema(upgraded.conn()).unwrap();
+    }
+
+    #[test]
+    fn v88_creates_dispatch_capabilities_idempotently_and_verifies() {
+        let fresh = Db::open_memory().unwrap();
+        super::verify_v88_schema(fresh.conn()).unwrap();
+        let conn = Connection::open_in_memory().unwrap();
+        assert!(super::verify_v88_schema(&conn).is_err());
+        super::migrate_v88(&conn).unwrap();
+        super::migrate_v88(&conn).unwrap();
+        super::verify_v88_schema(&conn).unwrap();
+        let index_exists: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name='idx_dispatch_capabilities_dispatch'",
+            [],
+            |row| row.get(0),
+        ).unwrap();
+        assert_eq!(index_exists, 1);
+        conn.execute_batch("DROP INDEX idx_dispatch_capabilities_dispatch;")
+            .unwrap();
+        assert!(super::verify_v88_schema(&conn).is_err());
+        super::migrate_v88(&conn).unwrap();
+        super::verify_v88_schema(&conn).unwrap();
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("upgrade-v87.db");
+        {
+            let db = Db::open_at(&path).unwrap();
+            db.conn()
+                .execute_batch("DROP TABLE dispatch_capabilities; PRAGMA user_version=87;")
+                .unwrap();
+        }
+        let upgraded = Db::open_at(&path).unwrap();
+        super::verify_v88_schema(upgraded.conn()).unwrap();
     }
 
     #[test]

@@ -39,11 +39,14 @@ install github:blakeashleyjr/thegn` gives users `.#default`, bridge included,
    ```
 
    The [`release`](.github/workflows/release.yml) workflow builds the `thegn`
-   binary for **x86_64 linux (gnu + musl)** and **aarch64-apple-darwin**, and
-   attaches per-target archives + `.sha256` checksums (named
-   `thegn-<tag>-<target>.sha256` — no `.tar.gz` infix) to a **draft** GitHub
-   Release. Each archive also receives keyless GitHub build-provenance
-   attestation; verify a downloaded archive with:
+   binary for **x86_64 linux (gnu + musl)** and **aarch64-apple-darwin** in
+   read-only jobs. One upload broker receives the workflow artifacts, verifies
+   the exact expected asset set and every SHA-256 checksum, rechecks the
+   admitted tag, then publishes the archives and checksums to a **draft**
+   GitHub Release. The broker also adds `thegn-<tag>-release.json`, recording
+   the tag, tag object, commit, workflow SHA, run id, and sorted asset digests.
+   Each archive receives keyless GitHub build-provenance attestation; verify a
+   downloaded archive with:
 
    ```sh
    gh attestation verify thegn-v<version>-<target>.tar.gz \
@@ -59,9 +62,8 @@ install github:blakeashleyjr/thegn` gives users `.#default`, bridge included,
    **standalone release assets**; there is no hosted apt or rpm update
    repository.
 
-   windows-msvc is still out: that CI job has never executed, and
-   `fail-fast: false` means an unbuilt target silently produces a partial asset
-   set. Add a target only once its CI job is green. Check the package job's
+   windows-msvc is still out: that CI job has never executed. Add a target only
+   once its CI job is green. Check the package job's
    summary for its exact outputs and target/checksum mapping. Only after every
    archive, checksum, attestation, and generated package is present should the
    install channel be advertised. Write the release notes (crib from the
@@ -69,11 +71,13 @@ install github:blakeashleyjr/thegn` gives users `.#default`, bridge included,
    Pre-release tags (`-alpha.N` / `-beta.N`) are auto-marked as a prerelease
    by the workflow — no manual checkbox needed.
 
-   > **Warning — retrying a failed run.** If some matrix legs fail, use
-   > **"Re-run failed jobs" on the original workflow run**. Re-dispatching a
-   > build for a tag with an existing draft resumes that draft without changing
-   > its notes or assets. A published release makes `create-release` fail before
-   > uploads and is never deleted; cut a new tag to rebuild a published version.
+   > **Warning — retrying a failed run.** If a build leg fails, the broker does
+   > not publish any archives. Use **"Re-run failed jobs" on the original
+   > workflow run** so the leg and then the broker run against the same admitted
+   > revision. Re-dispatching a build for a tag with an existing draft resumes
+   > that draft without changing its notes or existing assets. A published
+   > release makes `create-release` fail before uploads and is never deleted;
+   > cut a new tag to rebuild a published version.
 
 7. **Publish generated external metadata only after the draft is published.**
    In Actions, dispatch the `release` workflow from `main`, enter the already

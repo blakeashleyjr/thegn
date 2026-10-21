@@ -386,14 +386,15 @@ fn parse_workspace_url(input: &str) -> Result<ParsedWorkspaceUrl> {
     })
 }
 
-fn configured_origin(dest: &std::path::Path) -> Result<Option<String>> {
+fn configured_origin(dest: &std::path::Path, remote_name: &str) -> Result<Option<String>> {
     let config = std::fs::read_to_string(dest.join(".git/config"))?;
-    let mut in_origin = false;
+    let remote_section = format!("remote \"{remote_name}\"");
+    let mut in_remote = false;
     for line in config.lines() {
         let line = line.trim();
         if line.starts_with('[') && line.ends_with(']') {
-            in_origin = line[1..line.len() - 1].trim() == "remote \"origin\"";
-        } else if in_origin
+            in_remote = line[1..line.len() - 1].trim() == remote_section;
+        } else if in_remote
             && let Some((key, value)) = line.split_once('=')
             && key.trim().eq_ignore_ascii_case("url")
         {
@@ -410,12 +411,62 @@ fn configured_origin(dest: &std::path::Path) -> Result<Option<String>> {
     Ok(None)
 }
 
+fn configured_clone_remote_name(dest: &std::path::Path) -> Result<String> {
+    let mut command = thegn_core::util::git_cmd(dest);
+    command
+        .arg("config")
+        .arg("--get")
+        .arg("clone.defaultRemoteName")
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null());
+    let (mut child, _group) = crate::platform::spawn_grouped(&mut command)
+        .context("read configured clone remote name")?;
+    let mut output = String::new();
+    let read_result = if let Some(mut stdout) = child.stdout.take() {
+        std::io::Read::read_to_string(&mut stdout, &mut output)
+            .context("read configured clone remote name output")
+    } else {
+        Ok(0)
+    };
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "wait for the owned git config child"
+    )]
+    let status = child
+        .wait()
+        .context("wait for configured clone remote name")?;
+    read_result?;
+    if status.success() {
+        let name = output.trim();
+        anyhow::ensure!(
+            !name.is_empty() && !name.contains(['[', ']', '\n', '\r']),
+            "configured clone.defaultRemoteName is invalid"
+        );
+        Ok(name.to_string())
+    } else if status.code() == Some(1) {
+        Ok("origin".to_string())
+    } else {
+        anyhow::bail!("could not read clone.defaultRemoteName")
+    }
+}
+
 fn existing_origin_matches(dest: &std::path::Path, expected: &str) -> bool {
     dest.join(".git").is_dir()
-        && configured_origin(dest)
+        && std::fs::symlink_metadata(dest.join(".git/HEAD"))
+            .is_ok_and(|metadata| metadata.file_type().is_file())
+        && configured_origin(dest, "origin")
             .ok()
             .flatten()
             .is_some_and(|origin| origin == expected)
+}
+
+fn has_expected_origin_without_head(dest: &std::path::Path, expected: &str) -> bool {
+    configured_origin(dest, "origin")
+        .ok()
+        .flatten()
+        .is_some_and(|origin| origin == expected)
+        && !std::fs::symlink_metadata(dest.join(".git/HEAD"))
+            .is_ok_and(|metadata| metadata.file_type().is_file())
 }
 
 fn workspace_repo_display(input: &str) -> String {
@@ -444,20 +495,51 @@ pub(crate) fn workspace_clone_dest(
 fn clone_workspace_repo_with_deadline(
     url: &str,
     dest: &std::path::Path,
+    generation: u64,
+    expected_origin: Option<&str>,
     limits: CloneLimits,
     mut cancelled: impl FnMut() -> bool,
     on_progress: impl FnMut(String) + Send + 'static,
 ) -> Result<()> {
-    let mut dest_existed = None;
+    let mut staging = None;
     let result = (|| {
         anyhow::ensure!(!cancelled(), "git clone cancelled");
         if let Some(parent) = dest.parent() {
             std::fs::create_dir_all(parent)
                 .with_context(|| format!("create {}", parent.display()))?;
         }
+        let parent = dest.parent().unwrap_or(std::path::Path::new("."));
+        let name = dest
+            .file_name()
+            .unwrap_or_else(|| std::ffi::OsStr::new("workspace"))
+            .to_string_lossy();
+        let staging_path =
+            parent.join(format!(".{name}.clone-{generation}-{}", std::process::id()));
+        match std::fs::symlink_metadata(&staging_path) {
+            Ok(_) => anyhow::bail!(
+                "workspace clone staging path already exists: {}",
+                staging_path.display()
+            ),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!(
+                        "inspect workspace clone staging path {}",
+                        staging_path.display()
+                    )
+                });
+            }
+        }
+        thegn_core::fsperm::ensure_private_dir(&staging_path).with_context(|| {
+            format!(
+                "create private workspace clone staging directory {}",
+                staging_path.display()
+            )
+        })?;
+        staging = Some(staging_path.clone());
         // Via the scrubbed git_cmd so a stray GIT_DIR can't redirect the
-        // clone; dest is absolute, so the `-C` only sets the working dir.
-        let cwd = dest.parent().unwrap_or(std::path::Path::new("."));
+        // clone; the staging path is absolute, so the `-C` only sets the working dir.
+        let cwd = parent;
         // `--progress` forces git to emit its transfer counters even though stderr
         // is a pipe, not a TTY; we stream them to the picker's cloning panel.
         let mut command = thegn_core::util::git_cmd(cwd);
@@ -465,12 +547,11 @@ fn clone_workspace_repo_with_deadline(
             .arg("clone")
             .arg("--progress")
             .arg(url)
-            .arg(dest)
+            .arg(&staging_path)
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::piped());
-        dest_existed = Some(std::fs::symlink_metadata(dest).is_ok());
         let (mut child, group) = crate::platform::spawn_grouped(&mut command)
-            .with_context(|| format!("git clone into {}", dest.display()))?;
+            .with_context(|| format!("git clone into {}", staging_path.display()))?;
         let started = Instant::now();
         let last_output_ms = std::sync::Arc::new(AtomicU64::new(0));
         let mut reader = if let Some(stderr) = child.stderr.take() {
@@ -591,12 +672,84 @@ fn clone_workspace_repo_with_deadline(
         if !status.success() {
             anyhow::bail!("git clone failed");
         }
+        validate_staged_clone(&staging_path, expected_origin)?;
+        staging = None;
+        promote_staged_clone(&staging_path, dest)?;
         Ok(())
     })();
     if result.is_err()
-        && let Some(dest_existed) = dest_existed
+        && let Some(staging) = staging
     {
-        remove_partial_clone_dest(dest, dest_existed);
+        remove_partial_clone_dest(&staging, false);
+    }
+    result
+}
+
+fn validate_staged_clone(staging: &std::path::Path, expected_origin: Option<&str>) -> Result<()> {
+    let head = std::fs::symlink_metadata(staging.join(".git/HEAD"))
+        .with_context(|| format!("staged clone has no .git/HEAD: {}", staging.display()))?;
+    anyhow::ensure!(
+        head.file_type().is_file(),
+        "staged clone .git/HEAD is not a regular file: {}",
+        staging.display()
+    );
+    let mut command = thegn_core::util::git_cmd(staging);
+    command
+        .arg("rev-parse")
+        .arg("--is-inside-work-tree")
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null());
+    let (mut child, _group) =
+        crate::platform::spawn_grouped(&mut command).context("validate staged clone worktree")?;
+    let mut output = String::new();
+    let read_result = if let Some(mut stdout) = child.stdout.take() {
+        std::io::Read::read_to_string(&mut stdout, &mut output)
+            .context("read staged clone validation output")
+    } else {
+        Ok(0)
+    };
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "wait for the owned validation git child"
+    )]
+    let status = child.wait().context("wait for staged clone validation")?;
+    read_result?;
+    anyhow::ensure!(
+        status.success() && output.trim() == "true",
+        "staged clone is not a git work tree: {}",
+        staging.display()
+    );
+    if let Some(expected) = expected_origin {
+        let remote_name = configured_clone_remote_name(staging)?;
+        anyhow::ensure!(
+            configured_origin(staging, &remote_name)?.as_deref() == Some(expected),
+            "staged clone origin does not match the requested origin: {}",
+            staging.display()
+        );
+    }
+    Ok(())
+}
+
+fn promote_staged_clone(staging: &std::path::Path, dest: &std::path::Path) -> Result<()> {
+    let result = (|| {
+        match std::fs::symlink_metadata(dest) {
+            Ok(_) => anyhow::bail!(
+                "workspace destination appeared while cloning: {}; not replaced",
+                dest.display()
+            ),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(error)
+                    .with_context(|| format!("inspect workspace destination {}", dest.display()));
+            }
+        }
+        thegn_core::fsperm::restore_normal_directory_mode(staging)
+            .with_context(|| format!("restore workspace directory mode {}", staging.display()))?;
+        std::fs::rename(staging, dest)
+            .with_context(|| format!("promote staged clone to {}", dest.display()))
+    })();
+    if result.is_err() {
+        remove_partial_clone_dest(staging, false);
     }
     result
 }
@@ -719,6 +872,12 @@ pub(crate) fn plan_new_workspace_input(
             if existing_origin_matches(&dest, &parsed.canonical_origin) {
                 return SubmitPlan::Local(input.to_string());
             }
+            if has_expected_origin_without_head(&dest, &parsed.canonical_origin) {
+                return SubmitPlan::Invalid(format!(
+                    "workspace destination is an incomplete clone (no HEAD): {}; remove it and retry",
+                    dest.display()
+                ));
+            }
             return SubmitPlan::Invalid(format!(
                 "workspace destination already exists with a different or unreadable origin: {}",
                 dest.display()
@@ -729,6 +888,12 @@ pub(crate) fn plan_new_workspace_input(
         if legacy.exists() {
             if existing_origin_matches(&legacy, &parsed.canonical_origin) {
                 return SubmitPlan::Local(input.to_string());
+            }
+            if has_expected_origin_without_head(&legacy, &parsed.canonical_origin) {
+                return SubmitPlan::Invalid(format!(
+                    "workspace destination is an incomplete clone (no HEAD): {}; remove it and retry",
+                    legacy.display()
+                ));
             }
             return SubmitPlan::Invalid(format!(
                 "workspace destination already exists with a different or unreadable origin: {}",
@@ -876,33 +1041,37 @@ fn run_clone_job(job: CloneJob) {
     let reader_throttle = throttle.clone();
     let reader_tx = progress_tx.clone();
     let reader_waker = progress_waker.clone();
-    let result = clone_workspace_repo_with_deadline(
-        &url,
-        &dest,
-        CloneLimits {
-            total: CLONE_TOTAL_TIMEOUT,
-            connect: CLONE_CONNECT_TIMEOUT,
-            idle: CLONE_IDLE_TIMEOUT,
-        },
-        || !clone_event_is_current(generation, CLONE_GENERATION.load(Ordering::SeqCst)),
-        move |line| {
-            let pending = reader_throttle
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .offer(line, Instant::now());
-            if let Some(line) = pending {
-                send_clone_event_best_effort(
-                    &reader_tx,
-                    CloneEvent::Progress {
-                        generation,
-                        url: reader_url.clone(),
-                        line,
-                    },
-                );
-                wake_clone_loop_best_effort(&reader_waker);
-            }
-        },
-    );
+    let result = parse_workspace_url(&url).and_then(|parsed| {
+        clone_workspace_repo_with_deadline(
+            &url,
+            &dest,
+            generation,
+            Some(&parsed.canonical_origin),
+            CloneLimits {
+                total: CLONE_TOTAL_TIMEOUT,
+                connect: CLONE_CONNECT_TIMEOUT,
+                idle: CLONE_IDLE_TIMEOUT,
+            },
+            || !clone_event_is_current(generation, CLONE_GENERATION.load(Ordering::SeqCst)),
+            move |line| {
+                let pending = reader_throttle
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .offer(line, Instant::now());
+                if let Some(line) = pending {
+                    send_clone_event_best_effort(
+                        &reader_tx,
+                        CloneEvent::Progress {
+                            generation,
+                            url: reader_url.clone(),
+                            line,
+                        },
+                    );
+                    wake_clone_loop_best_effort(&reader_waker);
+                }
+            },
+        )
+    });
     let pending = throttle
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -1506,6 +1675,8 @@ Receiving objects: 100% (10/10)\rdone.\n";
         let error = clone_workspace_repo_with_deadline(
             "https://example.invalid/repo.git",
             &temp.path().join("clone"),
+            1,
+            None,
             CloneLimits {
                 total: Duration::from_secs(60),
                 connect: Duration::from_secs(1),
@@ -1567,6 +1738,8 @@ Receiving objects: 100% (10/10)\rdone.\n";
             let result = clone_workspace_repo_with_deadline(
                 &url,
                 &dest,
+                2,
+                None,
                 CloneLimits {
                     total: Duration::from_secs(60),
                     connect: Duration::from_millis(300),
@@ -1591,6 +1764,7 @@ Receiving objects: 100% (10/10)\rdone.\n";
             "clone process group took {elapsed:?} to reap"
         );
         assert!(!temp.path().join("clone").exists());
+        assert_no_clone_staging(temp.path());
         assert!(
             accept_thread.join().unwrap().is_some(),
             "git contacted local peer"
@@ -1626,6 +1800,8 @@ Receiving objects: 100% (10/10)\rdone.\n";
             let result = clone_workspace_repo_with_deadline(
                 &url,
                 &dest,
+                3,
+                None,
                 CloneLimits {
                     total: Duration::from_millis(300),
                     connect: Duration::from_secs(60),
@@ -1650,6 +1826,7 @@ Receiving objects: 100% (10/10)\rdone.\n";
             "clone process group took {elapsed:?} to reap"
         );
         assert!(!temp.path().join("clone").exists());
+        assert_no_clone_staging(temp.path());
         assert!(
             accept_thread.join().unwrap().is_some(),
             "git contacted local peer"
@@ -1728,6 +1905,7 @@ Receiving objects: 100% (10/10)\rdone.\n";
             "[remote \"origin\"]\n\turl = https://github.com/acme/repo.git\n",
         )
         .unwrap();
+        std::fs::write(dest.join(".git/HEAD"), "ref: refs/heads/main\n").unwrap();
         assert!(matches!(
             plan_new_workspace_input(url, &cfg),
             SubmitPlan::Local(ref path) if path == url
@@ -1751,11 +1929,214 @@ Receiving objects: 100% (10/10)\rdone.\n";
             "[remote \"origin\"]\n\turl = https://github.com/acme/repo.git\n",
         )
         .unwrap();
+        std::fs::write(legacy.join(".git/HEAD"), "ref: refs/heads/main\n").unwrap();
         assert!(matches!(
             plan_new_workspace_input(url, &cfg),
             SubmitPlan::Local(ref path) if path == url
         ));
         std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "run git commands in isolated temporary fixture repositories"
+    )]
+    fn fixture_git(cwd: &std::path::Path, args: &[&str]) -> std::process::Output {
+        let mut command = thegn_core::util::git_cmd(cwd);
+        command.args(args).env("GIT_CONFIG_GLOBAL", "/dev/null");
+        command.output().unwrap()
+    }
+
+    fn committed_fixture_repo(root: &std::path::Path) -> std::path::PathBuf {
+        let repo = root.join("source");
+        std::fs::create_dir(&repo).unwrap();
+        let output = fixture_git(&repo, &["init"]);
+        assert!(
+            output.status.success(),
+            "git init: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let output = fixture_git(&repo, &["config", "user.name", "Test User"]);
+        assert!(output.status.success());
+        let output = fixture_git(&repo, &["config", "user.email", "test@example.invalid"]);
+        assert!(output.status.success());
+        std::fs::write(repo.join("tracked.txt"), b"fixture\n").unwrap();
+        let output = fixture_git(&repo, &["add", "tracked.txt"]);
+        assert!(output.status.success());
+        let output = fixture_git(
+            &repo,
+            &["-c", "commit.gpgsign=false", "commit", "-m", "fixture"],
+        );
+        assert!(
+            output.status.success(),
+            "git commit: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        repo
+    }
+
+    fn assert_no_clone_staging(parent: &std::path::Path) {
+        let entries = std::fs::read_dir(parent).unwrap();
+        for entry in entries {
+            let name = entry.unwrap().file_name();
+            assert!(
+                !name.to_string_lossy().contains(".clone-"),
+                "staging entry remains: {}",
+                name.to_string_lossy()
+            );
+        }
+    }
+
+    #[test]
+    fn staged_clone_promotes_a_validated_clone_into_dest() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = committed_fixture_repo(temp.path());
+        let source_url = source.to_string_lossy().into_owned();
+        let dest = temp.path().join("workspace");
+        let normal_dir = temp.path().join("normal-dir");
+        std::fs::create_dir(&normal_dir).unwrap();
+        clone_workspace_repo_with_deadline(
+            &source_url,
+            &dest,
+            41,
+            None,
+            CloneLimits {
+                total: Duration::from_secs(30),
+                connect: Duration::from_secs(5),
+                idle: Duration::from_secs(5),
+            },
+            || false,
+            |_| {},
+        )
+        .unwrap();
+        assert!(dest.join(".git/HEAD").is_file());
+        assert_eq!(
+            thegn_core::fsperm::mode_bits(&dest).unwrap(),
+            thegn_core::fsperm::mode_bits(&normal_dir).unwrap()
+        );
+        assert_no_clone_staging(temp.path());
+    }
+
+    #[test]
+    fn staged_clone_failure_leaves_no_dest_and_no_staging() {
+        let temp = tempfile::tempdir().unwrap();
+        let dest = temp.path().join("workspace");
+        let missing = temp.path().join("does-not-exist");
+        let result = clone_workspace_repo_with_deadline(
+            &missing.to_string_lossy(),
+            &dest,
+            42,
+            None,
+            CloneLimits {
+                total: Duration::from_secs(30),
+                connect: Duration::from_secs(5),
+                idle: Duration::from_secs(5),
+            },
+            || false,
+            |_| {},
+        );
+        assert!(result.is_err());
+        assert!(!dest.exists());
+        assert_no_clone_staging(temp.path());
+    }
+
+    #[test]
+    fn staged_clone_refuses_when_dest_appears_before_promotion() {
+        let temp = tempfile::tempdir().unwrap();
+        let staging = temp.path().join("staging");
+        let dest = temp.path().join("dest");
+        std::fs::create_dir(&staging).unwrap();
+        std::fs::write(staging.join("from-stage"), b"staged").unwrap();
+        std::fs::create_dir(&dest).unwrap();
+        std::fs::write(dest.join("keep"), b"existing").unwrap();
+        let result = promote_staged_clone(&staging, &dest);
+        assert!(result.is_err());
+        assert_eq!(std::fs::read(dest.join("keep")).unwrap(), b"existing");
+        assert!(!staging.exists());
+    }
+
+    #[test]
+    fn staged_clone_validation_rejects_an_origin_mismatch() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = committed_fixture_repo(temp.path());
+        let source_url = source.to_string_lossy().into_owned();
+        let staging = temp.path().join("staging");
+        let staging_path = staging.to_string_lossy().into_owned();
+        let output = fixture_git(
+            temp.path(),
+            &["clone", "--progress", &source_url, &staging_path],
+        );
+        assert!(
+            output.status.success(),
+            "git clone: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let output = fixture_git(&staging, &["config", "clone.defaultRemoteName", "origin"]);
+        assert!(output.status.success());
+        assert!(validate_staged_clone(&staging, None).is_ok());
+        let other_origin = parse_workspace_url("https://github.com/other/repo.git")
+            .unwrap()
+            .canonical_origin;
+        let acme_origin = parse_workspace_url("https://github.com/acme/repo.git")
+            .unwrap()
+            .canonical_origin;
+        let output = fixture_git(
+            &staging,
+            &[
+                "config",
+                "remote.origin.url",
+                "https://github.com/other/repo.git",
+            ],
+        );
+        assert!(output.status.success());
+        assert!(validate_staged_clone(&staging, Some(&other_origin)).is_ok());
+        let error = validate_staged_clone(&staging, Some(&acme_origin)).unwrap_err();
+        assert!(error.to_string().contains("origin does not match"));
+        let output = fixture_git(&staging, &["config", "clone.defaultRemoteName", "upstream"]);
+        assert!(output.status.success());
+        let output = fixture_git(
+            &staging,
+            &[
+                "config",
+                "remote.upstream.url",
+                "https://github.com/acme/repo.git",
+            ],
+        );
+        assert!(output.status.success());
+        assert!(validate_staged_clone(&staging, Some(&acme_origin)).is_ok());
+    }
+
+    #[test]
+    fn staged_clone_incomplete_destination_is_not_reused() {
+        let temp = tempfile::tempdir().unwrap();
+        let cfg = thegn_core::config::Config {
+            workspaces_dir: temp.path().to_string_lossy().into_owned(),
+            ..thegn_core::config::Config::default()
+        };
+        let url = "https://github.com/acme/incomplete.git";
+        let dest = workspace_clone_dest(url, &cfg).unwrap();
+        std::fs::create_dir_all(dest.join(".git")).unwrap();
+        std::fs::write(
+            dest.join(".git/config"),
+            "[remote \"origin\"]\n\turl = https://github.com/acme/incomplete.git\n",
+        )
+        .unwrap();
+        match plan_new_workspace_input(url, &cfg) {
+            SubmitPlan::Invalid(message) => assert!(message.contains("incomplete clone")),
+            other => panic!("expected incomplete clone refusal, got {other:?}"),
+        }
+        std::fs::remove_dir_all(&dest).unwrap();
+        let legacy = temp.path().join("incomplete");
+        std::fs::create_dir_all(legacy.join(".git")).unwrap();
+        std::fs::write(
+            legacy.join(".git/config"),
+            "[remote \"origin\"]\n\turl = https://github.com/acme/incomplete.git\n",
+        )
+        .unwrap();
+        match plan_new_workspace_input(url, &cfg) {
+            SubmitPlan::Invalid(message) => assert!(message.contains("incomplete clone")),
+            other => panic!("expected incomplete legacy clone refusal, got {other:?}"),
+        }
     }
 
     #[test]

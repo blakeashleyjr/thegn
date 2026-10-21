@@ -98,6 +98,11 @@ mod db_ci;
 pub mod db_compute;
 mod db_control;
 mod db_dispatch;
+mod db_dispatch_capability;
+pub use db_dispatch_capability::{
+    CapabilityGrant, CapabilityMint, CapabilityRefusal, CapabilityVerb, MAX_CAPABILITY_TTL_MS,
+    capability_token_digest, parse_capability_token,
+};
 mod db_glyph;
 mod db_hibernate;
 mod db_intent;

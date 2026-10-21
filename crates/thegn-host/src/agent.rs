@@ -3031,15 +3031,18 @@ fn tail_lines(out: &str, n: usize) -> String {
 // `env_halt_reason` (cheap pre-spawn HALT check) lives in the `env_halt` sibling.
 pub use crate::env_halt::env_halt_reason;
 
-/// Idempotently install the resident bridge binary into a provider env so a
-/// `Placement::Provider` bridge connect finds it at `remote_path`. Content-
-/// addressed handshake (push only on fingerprint mismatch). Best-effort and
-/// off-loop (its own runtime via `block_on_provider`): a failure warns and leaves
-/// the per-op git path as the fallback. No-op for envs without a file-capable
-/// provider. Called from `run.rs::connect_worktree_bridge` before `sup.connect`.
-pub fn ensure_remote_bridge(cfg: &Config, env_name: &str, binary: &Path, remote_path: &str) {
+/// Idempotently install and verify the resident bridge binary in a provider env
+/// before connecting to it. Work runs off-loop via `block_on_provider`; `false`
+/// means the caller must skip bridge setup because no unverified binary may be
+/// launched. No-op success for envs without a file-capable provider.
+pub fn ensure_remote_bridge(
+    cfg: &Config,
+    env_name: &str,
+    binary: &Path,
+    remote_path: &str,
+) -> bool {
     let Some((provider, id, _)) = provider_sync_target(cfg, env_name) else {
-        return;
+        return true;
     };
     let data = match std::fs::read(binary) {
         Ok(d) => d,
@@ -3048,7 +3051,7 @@ pub fn ensure_remote_bridge(cfg: &Config, env_name: &str, binary: &Path, remote_
                 "bridge binary unreadable ({}): {e}",
                 binary.display()
             ));
-            return;
+            return false;
         }
     };
     match block_on_provider(|| async { provider.ensure_executable(&id, remote_path, &data).await })
@@ -3058,8 +3061,14 @@ pub fn ensure_remote_bridge(cfg: &Config, env_name: &str, binary: &Path, remote_
             data.len()
         )),
         Ok(false) => {} // already current — no re-push
-        Err(e) => thegn_core::msg::warn(&format!("bridge binary push failed: {e}")),
+        Err(e) => {
+            thegn_core::msg::warn(&format!(
+                "bridge binary install failed; not connecting the resident bridge: {e:#}"
+            ));
+            return false;
+        }
     }
+    true
 }
 
 /// Whether a worktree's persisted remote `location` should be healed back to
@@ -3569,9 +3578,10 @@ pub fn compose_spec(
                 .into());
             }
         },
-        (Some(spec), _) => sandbox::enter_argv(spec, &cmd)
-            .map_err(anyhow::Error::new)
-            .context("sandbox entry refused")?,
+        (Some(spec), _) => sandbox::enter_argv(spec, &cmd).map_err(|error| {
+            let hint = error.remediation_hint();
+            anyhow::Error::new(error).context(hint)
+        })?,
         (None, None) => {
             // Host fallback: a login shell so PATH/env expand — still CAPPED. There
             // is no sandbox spec here (no container runtime, or one turned off), but
