@@ -444,6 +444,22 @@ mod tests {
     }
 
     #[test]
+    fn repo_path_defaults_to_none_and_parses_from_toml() {
+        assert!(WorkspaceConfig::default().repo_path.is_none());
+
+        for source in [
+            "[project.foo]\nrepo_path = \"/a/foo\"\n",
+            "[workspace.foo]\nrepo_path = \"/a/foo\"\n",
+        ] {
+            let cfg = toml::from_str::<crate::config::Config>(source).unwrap();
+            assert_eq!(cfg.workspace["foo"].repo_path.as_deref(), Some("/a/foo"));
+        }
+
+        let serialized = serde_json::to_value(&WorkspaceConfig::default()).unwrap();
+        assert!(serialized.get("repo_path").is_none());
+    }
+
+    #[test]
     fn empty_table_and_underivable_keys_select_nothing() {
         assert!(resolve(&table(&[]), Some("foo")).is_unconfigured());
         let t = table(&["repo"]);
@@ -637,11 +653,13 @@ mod tests {
         let mut t = table(&["foo", "bar"]);
         t.get_mut("foo").unwrap().repo_path = Some("/a/foo".into());
         t.get_mut("bar").unwrap().repo_path = Some("/a/foo".into());
+        let result = resolve_for_root(&t, Path::new("/a/foo"), lexical_same_path);
         assert!(matches!(
-            resolve_for_root(&t, Path::new("/a/foo"), lexical_same_path),
+            &result,
             WorkspaceOverlay::Refused(OverlayRefusal::RepoPathCollision { ref keys, .. })
                 if keys.iter().map(String::as_str).eq(["bar", "foo"])
         ));
+        assert!(result.refusal().unwrap().to_string().contains("/a/foo"));
         let errors = validate(&t);
         assert_eq!(errors.len(), 1, "{errors:#?}");
         assert!(errors[0].contains("/a/foo"));

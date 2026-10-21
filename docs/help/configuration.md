@@ -46,6 +46,7 @@ When two checkouts share a directory name, give each its own block with
 `repo_path = "<absolute path>"` (`~` is allowed). A bound block is chosen by
 path and never applies to another checkout; that checkout's trusted settings
 are refused with the bound path named. Two blocks may not bind the same path.
+Use the same path spelling that thegn shows for the repo.
 Workspace keybinds and the workspace editor setting are not applied from a
 bound block.
 
