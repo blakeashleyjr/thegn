@@ -54,13 +54,15 @@ pub enum Action {
         #[arg(long)]
         json: bool,
     },
-    /// Re-run a run (`--failed` for only the failed jobs).
+    /// Re-run a run: every job by default, `--failed` for only the failed jobs, `--failed-or-canceled` for a retry of failed and canceled jobs (GitLab).
     Rerun {
         run_id: String,
         #[command(flatten)]
         target: super::target::WorktreeFlag,
         #[arg(long)]
         failed: bool,
+        #[arg(long, conflicts_with = "failed")]
+        failed_or_canceled: bool,
     },
     /// Trigger a workflow with `-i key=value` inputs (workflow_dispatch).
     Trigger {
@@ -102,7 +104,8 @@ pub fn run(cfg: &Config, action: Action) -> Result<()> {
             run_id,
             target,
             failed,
-        } => rerun(cfg, target.worktree, &run_id, failed),
+            failed_or_canceled,
+        } => rerun(cfg, target.worktree, &run_id, failed, failed_or_canceled),
         Action::Trigger {
             workflow,
             target,
@@ -460,26 +463,53 @@ fn log(
     Ok(())
 }
 
-fn rerun(cfg: &Config, worktree: Option<String>, run_id: &str, failed: bool) -> Result<()> {
-    validate_id_at_cli(run_id)?;
-    let (loc, client) = client(cfg, worktree)?;
-    if !client.caps().rerun {
-        msg::die("this provider can't re-run runs");
-    }
-    if failed && !client.caps().rerun_failed {
-        // Don't silently retry everything when the user asked for failed-only.
-        msg::die("this provider can't re-run only failed jobs — drop --failed to retry all");
-    }
-    let scope = if failed {
+fn rerun_scope(
+    caps: &ci::CiCaps,
+    failed: bool,
+    failed_or_canceled: bool,
+) -> Result<RerunScope, &'static str> {
+    let scope = if failed_or_canceled {
+        RerunScope::FailedOrCanceled
+    } else if failed {
         RerunScope::Failed
     } else {
         RerunScope::All
     };
+    if caps.supports(scope) {
+        return Ok(scope);
+    }
+    Err(match scope {
+        RerunScope::All if caps.supports(RerunScope::FailedOrCanceled) => {
+            "this provider can't re-run every job — its retry re-runs failed and canceled jobs: use --failed-or-canceled"
+        }
+        RerunScope::Failed if caps.supports(RerunScope::FailedOrCanceled) => {
+            "this provider can't re-run only failed jobs — its retry includes canceled jobs: use --failed-or-canceled"
+        }
+        RerunScope::FailedOrCanceled => {
+            "this provider can't retry failed and canceled jobs together — use --failed or omit the flag for a full rerun"
+        }
+        _ => "this provider can't re-run runs",
+    })
+}
+
+fn rerun(
+    cfg: &Config,
+    worktree: Option<String>,
+    run_id: &str,
+    failed: bool,
+    failed_or_canceled: bool,
+) -> Result<()> {
+    validate_id_at_cli(run_id)?;
+    let (loc, client) = client(cfg, worktree)?;
+    let scope = match rerun_scope(&client.caps(), failed, failed_or_canceled) {
+        Ok(scope) => scope,
+        Err(message) => msg::die(message),
+    };
     match client.rerun(&loc, run_id, scope) {
-        Ok(()) => msg::info(if failed {
-            "re-running failed jobs"
-        } else {
-            "re-running"
+        Ok(()) => msg::info(match scope {
+            RerunScope::All => "re-running",
+            RerunScope::Failed => "re-running failed jobs",
+            RerunScope::FailedOrCanceled => "retrying failed and canceled jobs",
         }),
         Err(e) => msg::die(&format!(
             "ci rerun failed: {}",
@@ -662,7 +692,7 @@ mod tests {
         );
         assert!(bad_ref.unwrap_err().to_string().contains("bad ref"));
 
-        let rerun_result = rerun(&config, None, "01", false);
+        let rerun_result = rerun(&config, None, "01", false, false);
         assert!(rerun_result.unwrap_err().to_string().contains("01"));
 
         let cancel_result = cancel(&config, None, "--help");
@@ -670,5 +700,29 @@ mod tests {
 
         let trigger_result = trigger(&config, None, "--help", Vec::new());
         assert!(trigger_result.unwrap_err().to_string().contains("--help"));
+    }
+
+    #[test]
+    fn rerun_scope_cli_refuses_unsupported_scopes_with_guidance() {
+        let gitlab = ci::CiCaps {
+            rerun: true,
+            rerun_failed_or_canceled: true,
+            ..ci::CiCaps::default()
+        };
+        let refused_all = rerun_scope(&gitlab, false, false);
+        assert!(matches!(refused_all, Err(message) if message.contains("--failed-or-canceled")));
+        assert_eq!(
+            rerun_scope(&gitlab, false, true),
+            Ok(RerunScope::FailedOrCanceled)
+        );
+
+        let github = ci::CiCaps {
+            rerun: true,
+            rerun_all: true,
+            rerun_failed: true,
+            ..ci::CiCaps::default()
+        };
+        assert_eq!(rerun_scope(&github, false, false), Ok(RerunScope::All));
+        assert_eq!(rerun_scope(&github, true, false), Ok(RerunScope::Failed));
     }
 }

@@ -385,6 +385,8 @@ pub enum RerunScope {
     All,
     /// Re-run only the failed jobs.
     Failed,
+    /// Re-run the failed and canceled jobs (GitLab pipeline retry).
+    FailedOrCanceled,
 }
 
 /// Which trait operations a provider actually supports — so a provider can
@@ -394,13 +396,33 @@ pub struct CiCaps {
     pub logs: bool,
     pub steps: bool,
     pub trigger: bool,
+    /// Supports at least one rerun scope.
     pub rerun: bool,
+    /// Can re-run every job ([`RerunScope::All`]).
+    #[serde(default)]
+    pub rerun_all: bool,
     /// Can re-run *only the failed jobs* ([`RerunScope::Failed`]). GitHub can
-    /// (`gh run rerun --failed`); GitLab's pipeline `retry` has no scope, so
-    /// offering "rerun failed" there would silently retry everything.
+    /// (`gh run rerun --failed`); GitLab's pipeline `retry` also retries
+    /// canceled jobs, so it is exposed separately as
+    /// [`RerunScope::FailedOrCanceled`].
     #[serde(default)]
     pub rerun_failed: bool,
+    /// Can retry failed and canceled jobs together ([`RerunScope::FailedOrCanceled`]).
+    #[serde(default)]
+    pub rerun_failed_or_canceled: bool,
     pub cancel: bool,
+}
+
+impl CiCaps {
+    /// Whether this provider supports the exact requested rerun operation.
+    pub fn supports(&self, scope: RerunScope) -> bool {
+        self.rerun
+            && match scope {
+                RerunScope::All => self.rerun_all,
+                RerunScope::Failed => self.rerun_failed,
+                RerunScope::FailedOrCanceled => self.rerun_failed_or_canceled,
+            }
+    }
 }
 
 // --- provider errors (mirrors github::GhError) ----------------------------
@@ -423,6 +445,8 @@ pub enum CiError {
     /// unreachable, distinct from a config/auth issue. Feeds the connectivity
     /// holder + lets the UI show "CI unreachable" rather than a hard error.
     Offline,
+    /// The provider cannot perform this exact operation.
+    Unsupported(String),
     Other(String),
 }
 
@@ -435,6 +459,7 @@ impl CiError {
             CiError::NotFound => "no CI runs found".into(),
             CiError::RateLimited => "CI provider API rate limited".into(),
             CiError::Offline => "CI provider unreachable".into(),
+            CiError::Unsupported(message) => message.clone(),
             CiError::Other(m) => m.clone(),
         }
     }
@@ -960,6 +985,7 @@ mod tests {
             CiError::NotFound,
             CiError::RateLimited,
             CiError::Offline,
+            CiError::Unsupported("x".into()),
             CiError::Other("x".into()),
         ] {
             assert!(!e.message().is_empty());
@@ -1076,5 +1102,56 @@ mod tests {
         let back: CiRun = serde_json::from_str(&s).unwrap();
         assert_eq!(back.id, "42");
         assert_eq!(back.jobs[0].steps[0].state, CiState::Fail);
+    }
+
+    #[test]
+    fn rerun_scope_caps_supports_reads_each_flag() {
+        let scopes = [
+            RerunScope::All,
+            RerunScope::Failed,
+            RerunScope::FailedOrCanceled,
+        ];
+        assert!(
+            scopes
+                .iter()
+                .all(|scope| !CiCaps::default().supports(*scope))
+        );
+        for scope in scopes {
+            let caps = match scope {
+                RerunScope::All => CiCaps {
+                    rerun: true,
+                    rerun_all: true,
+                    ..CiCaps::default()
+                },
+                RerunScope::Failed => CiCaps {
+                    rerun: true,
+                    rerun_failed: true,
+                    ..CiCaps::default()
+                },
+                RerunScope::FailedOrCanceled => CiCaps {
+                    rerun: true,
+                    rerun_failed_or_canceled: true,
+                    ..CiCaps::default()
+                },
+            };
+            assert!(caps.supports(scope), "{scope:?}");
+            assert!(
+                !CiCaps {
+                    rerun: false,
+                    ..caps
+                }
+                .supports(scope)
+            );
+        }
+    }
+
+    #[test]
+    fn rerun_scope_caps_deserialize_old_json_without_new_flags() {
+        let caps: CiCaps = serde_json::from_str(
+            r#"{"logs":true,"steps":true,"trigger":false,"rerun":true,"rerun_failed":true,"cancel":false}"#,
+        )
+        .unwrap();
+        assert!(!caps.rerun_all);
+        assert!(!caps.rerun_failed_or_canceled);
     }
 }

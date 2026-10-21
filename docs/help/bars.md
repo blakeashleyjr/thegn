@@ -174,7 +174,8 @@ configured it reports `default`), `Alt-Shift-R` marks everything read
 (`attention-next`). While do-not-disturb or a non-default mode is on, a
 `● dnd` / `◉ <mode>` chip appears at the head of the badge cluster.
 Activating the CI badge opens a **CI runs** popup (`↵` view, `o` open, `r`
-reruns failed jobs, `R` reruns all jobs, `c` cancels after a second press); the
+reruns failed jobs, `R` reruns all jobs, `c` cancels after a second press; on
+GitLab, `r` retries failed and canceled jobs and `R` is refused); the
 palette's `open-ci` action opens the Work ▸ CI
 panel section instead.
 
