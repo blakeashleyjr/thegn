@@ -380,7 +380,7 @@ fn todo_for(loc: &GitLoc, base: &str) -> Result<Vec<TodoEntry>> {
         format!("{base}..HEAD")
     };
     let out = run_read(loc, &["log", "--reverse", "--format=%x1f%H%x1f%s", &range])?;
-    let todo = todo_from_log(&out);
+    let todo = todo_from_log(&out)?;
     if todo.is_empty() {
         bail!("no commits to rebase");
     }
