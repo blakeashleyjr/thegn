@@ -103,6 +103,8 @@ pub use db_dispatch_capability::{
     CapabilityGrant, CapabilityMint, CapabilityRefusal, CapabilityVerb, MAX_CAPABILITY_TTL_MS,
     capability_token_digest, parse_capability_token,
 };
+mod db_gate_attest;
+pub use db_gate_attest::{GateAttestationRefusal, StoredGateAttestation};
 mod db_glyph;
 mod db_hibernate;
 mod db_intent;

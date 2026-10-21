@@ -213,6 +213,10 @@ impl Db {
                 "DELETE FROM pipeline_validations WHERE dispatch_id=?1",
                 params![id],
             )?;
+            tx.execute(
+                "DELETE FROM pipeline_gate_attestations WHERE dispatch_id=?1",
+                params![id],
+            )?;
             tx.execute("DELETE FROM agent_dispatches WHERE id=?1", params![id])?;
         }
         tx.commit()?;
@@ -826,6 +830,42 @@ mod tests {
             })
             .unwrap();
         assert_eq!((notes, validations), (1, 1));
+    }
+
+    #[test]
+    fn pruned_dispatch_takes_gate_attestations() {
+        let (_dir, db) = temp_db();
+        let now = 2_000_000_000_000_i64;
+        let old = now - 91 * 24 * 60 * 60 * 1000;
+        let expired = dispatch(&db, "/gone/expired-gate", "failed", old, None, None, None);
+        db.conn()
+            .execute(
+                "INSERT INTO worktrees(worktree) VALUES('/registered/retained-gate')",
+                [],
+            )
+            .unwrap();
+        let retained = dispatch(
+            &db,
+            "/registered/retained-gate",
+            "failed",
+            old,
+            None,
+            None,
+            None,
+        );
+        for id in [expired, retained] {
+            db.conn().execute("INSERT INTO pipeline_gate_attestations(dispatch_id,repo,worktree,branch_ref,commit_oid,tree_oid,command,started_ms,ended_ms,outcome,log_path,runner) VALUES(?1,'/repo/.git','/wt','refs/heads/x',?2,?3,'gate',1,2,'passed','/log','lead_runner')", params![id, "a".repeat(40), "b".repeat(40)]).unwrap();
+        }
+        assert_eq!(db.prune_terminal_dispatches(now).unwrap(), 1);
+        let rows: Vec<i64> = db
+            .conn()
+            .prepare("SELECT dispatch_id FROM pipeline_gate_attestations ORDER BY dispatch_id")
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        assert_eq!(rows, vec![retained]);
     }
 
     #[test]

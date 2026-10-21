@@ -1753,6 +1753,77 @@ pub(crate) fn verify_v88_schema(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
+/// v89: append-only pipeline gate attestations (THE-207).
+pub(crate) fn migrate_v89(conn: &Connection) -> Result<()> {
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS pipeline_gate_attestations (
+             id INTEGER PRIMARY KEY AUTOINCREMENT,
+             dispatch_id INTEGER NOT NULL,
+             repo TEXT NOT NULL,
+             worktree TEXT NOT NULL,
+             branch_ref TEXT NOT NULL,
+             commit_oid TEXT NOT NULL,
+             tree_oid TEXT NOT NULL,
+             command TEXT NOT NULL,
+             started_ms INTEGER NOT NULL,
+             ended_ms INTEGER NOT NULL,
+             exit_code INTEGER,
+             outcome TEXT NOT NULL CHECK (outcome IN ('passed','failed','error')),
+             reason TEXT NOT NULL DEFAULT '',
+             log_path TEXT NOT NULL,
+             runner TEXT NOT NULL
+         );
+         CREATE INDEX IF NOT EXISTS idx_pipeline_gate_attestations_dispatch
+             ON pipeline_gate_attestations(dispatch_id, id);
+         CREATE TRIGGER IF NOT EXISTS pipeline_gate_attestations_append_only
+             BEFORE UPDATE ON pipeline_gate_attestations
+             BEGIN SELECT RAISE(ABORT, 'gate attestations are append-only'); END;",
+    )?;
+    Ok(())
+}
+
+/// Verify the v89 append-only trusted gate evidence store (THE-207).
+pub(crate) fn verify_v89_schema(conn: &Connection) -> Result<()> {
+    for column in [
+        "id",
+        "dispatch_id",
+        "repo",
+        "worktree",
+        "branch_ref",
+        "commit_oid",
+        "tree_oid",
+        "command",
+        "started_ms",
+        "ended_ms",
+        "exit_code",
+        "outcome",
+        "reason",
+        "log_path",
+        "runner",
+    ] {
+        if !has_column(conn, "pipeline_gate_attestations", column) {
+            bail!("schema v89 migration did not add pipeline_gate_attestations.{column}");
+        }
+    }
+    let index_exists: bool = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='index' AND name=?1)",
+        ["idx_pipeline_gate_attestations_dispatch"],
+        |row| row.get(0),
+    )?;
+    if !index_exists {
+        bail!("schema v89 migration did not add idx_pipeline_gate_attestations_dispatch");
+    }
+    let trigger_exists: bool = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='trigger' AND name=?1)",
+        ["pipeline_gate_attestations_append_only"],
+        |row| row.get(0),
+    )?;
+    if !trigger_exists {
+        bail!("schema v89 migration did not add pipeline_gate_attestations_append_only");
+    }
+    Ok(())
+}
+
 /// Verify the v69 identity ledger before the schema version is stamped. A
 /// missing column/table must never look like a completed migration.
 pub(crate) fn verify_v69_schema(conn: &Connection) -> Result<()> {
@@ -2628,6 +2699,49 @@ mod tests {
         }
         let upgraded = Db::open_at(&path).unwrap();
         super::verify_v86_schema(upgraded.conn()).unwrap();
+    }
+
+    #[test]
+    fn v89_creates_gate_attestations_append_only_and_verifies() {
+        let fresh = Db::open_memory().unwrap();
+        super::verify_v89_schema(fresh.conn()).unwrap();
+
+        let conn = Connection::open_in_memory().unwrap();
+        assert!(super::verify_v89_schema(&conn).is_err());
+        super::migrate_v89(&conn).unwrap();
+        super::migrate_v89(&conn).unwrap();
+        super::verify_v89_schema(&conn).unwrap();
+        conn.execute("INSERT INTO pipeline_gate_attestations(dispatch_id,repo,worktree,branch_ref,commit_oid,tree_oid,command,started_ms,ended_ms,outcome,log_path,runner) VALUES(1,'r','w','b','a','t','cmd',1,2,'passed','log','lead_runner')", []).unwrap();
+        let error = conn
+            .execute(
+                "UPDATE pipeline_gate_attestations SET reason='changed' WHERE id=1",
+                [],
+            )
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("gate attestations are append-only")
+        );
+
+        conn.execute_batch("DROP INDEX idx_pipeline_gate_attestations_dispatch;")
+            .unwrap();
+        assert!(super::verify_v89_schema(&conn).is_err());
+        super::migrate_v89(&conn).unwrap();
+        conn.execute_batch("DROP TRIGGER pipeline_gate_attestations_append_only;")
+            .unwrap();
+        assert!(super::verify_v89_schema(&conn).is_err());
+        super::migrate_v89(&conn).unwrap();
+        super::verify_v89_schema(&conn).unwrap();
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("v88.db");
+        {
+            let db = Db::open_at(&path).unwrap();
+            db.conn().execute_batch("DROP TRIGGER pipeline_gate_attestations_append_only; DROP INDEX idx_pipeline_gate_attestations_dispatch; DROP TABLE pipeline_gate_attestations; PRAGMA user_version=88;").unwrap();
+        }
+        let upgraded = Db::open_at(&path).unwrap();
+        super::verify_v89_schema(upgraded.conn()).unwrap();
     }
 
     #[test]
