@@ -1187,7 +1187,14 @@ fn clear_repo_note(any_path: &Path, cfg: &Config) -> String {
     match crate::merge_ops::clear_repo(cfg, &db, &root) {
         Ok(0) => "Merge queue already empty".into(),
         Ok(n) => format!("Cleared {n} queued branch(es)"),
-        Err(e) => format!("Clear failed: {e}"),
+        Err(e) => match e.downcast_ref::<crate::merge_ops::ClearKeptClaimed>() {
+            Some(kept) => format!(
+                "Cleared {} queued branch(es); kept {} claimed by an active drain",
+                kept.removed,
+                kept.kept.len()
+            ),
+            None => format!("Clear failed: {e}"),
+        },
     }
 }
 
