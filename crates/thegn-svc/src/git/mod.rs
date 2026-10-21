@@ -406,13 +406,12 @@ pub trait GitBackend: thegn_core::seam::Probe + Send + Sync {
     fn remove_worktree(&self, root: &Path, path: &Path, delete_branch: bool) -> Result<()>;
 
     /// A merge/rebase/cherry-pick in progress, or `None` when every required
-    /// probe successfully observed absence. Probe failures are `Err`, preserving
-    /// the caller's last-known state, except the non-bridged remote rebase probe;
-    /// see `remote.rs` for its absence/unreadable ambiguity. Merge/cherry-pick/
+    /// probe successfully observed absence. Every required probe failure is
+    /// `Err`, preserving the caller's last-known state. Merge/cherry-pick/
     /// revert are probed via `rev-parse --verify` of their `*_HEAD` pseudo-refs
     /// (git clears those on commit/abort); rebase is probed via the on-disk
     /// state dir, since `REBASE_HEAD` survives a completed rebase. Both work for
-    /// remote locs (`rev-parse` over ssh, `read_git_path` cats the file).
+    /// remote locs (`rev-parse` over ssh, `read_git_path_checked` cats the file).
     fn merge_state(&self, loc: &GitLoc) -> Result<Option<MergeInfo>> {
         // Route through the persistent bridge when connected, so each probe is a
         // cheap RPC on the live connection rather than a per-op `sprite exec`/ssh
@@ -459,8 +458,7 @@ pub trait GitBackend: thegn_core::seam::Probe + Send + Sync {
         } else if crate::bridge::for_loc(loc).is_some() {
             bridged_rebase_in_progress(loc)?
         } else {
-            loc.read_git_path("rebase-merge/onto").is_some()
-                || loc.read_git_path("rebase-apply/onto").is_some()
+            remote_rebase_marker(|rel| loc.read_git_path_checked(rel))?
         };
         let kind = if exists("MERGE_HEAD")? {
             Some((MergeKind::Merge, "MERGE_HEAD"))
@@ -870,6 +868,21 @@ fn bridged_rebase_in_progress(loc: &GitLoc) -> Result<bool> {
         .exec_read(&["test", "-e", &merge, "-o", "-e", &apply], None, &[])
         .context("probe bridged rebase state files")?;
     classify_presence_exit(result.exit, "rebase state files")
+}
+
+fn remote_rebase_marker(read: impl Fn(&str) -> std::io::Result<Option<Vec<u8>>>) -> Result<bool> {
+    for rel in ["rebase-merge/onto", "rebase-apply/onto"] {
+        match read(rel) {
+            Ok(Some(_)) => return Ok(true),
+            Ok(None) => {}
+            Err(error) => {
+                return Err(
+                    anyhow::Error::new(error).context(format!("read rebase state file {rel}"))
+                );
+            }
+        }
+    }
+    Ok(false)
 }
 
 /// Classify Git's expected absence exit (1) separately from transport,
@@ -4766,6 +4779,43 @@ mod tests {
             typed_numstat(&out).unwrap(),
             (DiffCount::Capped, DiffCount::Exact(0))
         );
+    }
+
+    #[test]
+    fn remote_rebase_marker_read_error_is_err() {
+        let result = super::remote_rebase_marker(|rel| {
+            assert_eq!(rel, "rebase-merge/onto");
+            Err(std::io::Error::other("read git path failed"))
+        });
+        assert!(result.is_err());
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("rebase-merge/onto")
+        );
+    }
+
+    #[test]
+    fn remote_rebase_marker_absent_is_false() {
+        let result = super::remote_rebase_marker(|rel| {
+            assert!(matches!(rel, "rebase-merge/onto" | "rebase-apply/onto"));
+            Ok(None)
+        });
+        assert!(!result.unwrap());
+    }
+
+    #[test]
+    fn remote_rebase_marker_present_is_true() {
+        let result = super::remote_rebase_marker(|rel| {
+            if rel == "rebase-merge/onto" {
+                Ok(None)
+            } else {
+                assert_eq!(rel, "rebase-apply/onto");
+                Ok(Some(b"abc".to_vec()))
+            }
+        });
+        assert!(result.unwrap());
     }
 }
 
