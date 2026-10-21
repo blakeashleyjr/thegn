@@ -196,8 +196,10 @@ An enabled gated plugin is refused unless its user's `[[plugins]]` entry sets
 `gated_by` capabilities; its JSON report includes the same rows.
 
 Crashed resident plugins restart with backoff (three attempts, then disabled
-until config reload). That crash/backoff state is process-lifetime supervisor
-state: it is not persisted across a daemon or compositor restart. After such a
+until config reload). A pending restart is cancelled when the plugin is
+disabled, on config reload and on shutdown; restarts wait on one background
+timer rather than a thread each. That crash/backoff state is process-lifetime
+supervisor state: it is not persisted across a daemon or compositor restart. After such a
 restart, the offline `plugin list` command cannot reconcile live state and
 reports an enabled plugin as `unknown` with `live_health = unavailable` until a
 future attached-snapshot surface exists. Resident-plugin stderr is drained and,
