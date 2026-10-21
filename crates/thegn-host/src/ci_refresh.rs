@@ -15,7 +15,7 @@ use std::time::{Duration, Instant};
 
 use termwiz::terminal::TerminalWaker;
 use thegn_core::store::WorkspaceStore;
-use thegn_svc::git::{GitBackend, GixGit};
+use thegn_svc::git::GitBackend;
 
 const MAX_LOG_INGEST_CALLS: usize = 32;
 const MAX_LOG_INGEST_BYTES: usize = 8 * 1024 * 1024;
@@ -460,7 +460,7 @@ fn local_ci_cache_branch(loc: &thegn_core::remote::GitLoc) -> Option<String> {
     if loc.is_remote() {
         return None;
     }
-    let branch = GixGit::new().current_branch(loc).ok()?;
+    let branch = crate::git_handle::get().current_branch(loc).ok()?;
     (!branch.is_empty() && branch != "HEAD").then_some(branch)
 }
 
