@@ -222,10 +222,7 @@ async fn probe_before_deadline<F: Future>(
     deadline: tokio::time::Instant,
     future: F,
 ) -> Option<F::Output> {
-    match tokio::time::timeout_at(deadline, future).await {
-        Ok(output) => Some(output),
-        Err(_) => None,
-    }
+    tokio::time::timeout_at(deadline, future).await.ok()
 }
 
 #[cfg(test)]
