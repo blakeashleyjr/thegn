@@ -828,12 +828,7 @@ mod tests {
         }
 
         fn queue_page(&self) -> BoxFuture<'_, Result<crate::model::QueuePage, MediaError>> {
-            Box::pin(async move {
-                match self.queue_page.clone() {
-                    Some(page) => Ok(page),
-                    None => Ok(crate::model::QueuePage::default()),
-                }
-            })
+            Box::pin(async move { Ok(self.queue_page.clone().unwrap_or_default()) })
         }
     }
 
