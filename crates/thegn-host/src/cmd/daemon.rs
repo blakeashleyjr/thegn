@@ -79,37 +79,41 @@ where
     }
 }
 
-fn now_ms() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|duration| thegn_core::time_policy::saturating_i64(duration.as_millis()))
-        .unwrap_or(0)
-}
-
 fn stop(cfg: &Config) -> Result<()> {
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()?;
     rt.block_on(async {
+        let stop_deadline =
+            tokio::time::Instant::now() + crate::daemon::service::SHUTDOWN_TOTAL_DEADLINE;
         let scopes = crate::daemon::scope_aliases();
-        let registry = match tokio::task::spawn_blocking({
-            let scopes = scopes.clone();
-            move || match thegn_core::db::Db::open() {
-                Ok(db) => scopes
-                    .iter()
-                    .filter_map(|scope| thegn_svc::control::client::discover(&db, scope, now_ms()))
-                    .filter_map(|addr| match addr {
-                        ControlAddr::Unix(path) => Some(path),
-                        ControlAddr::Tcp { .. } | ControlAddr::HttpOrigin { .. } => None,
-                    })
-                    .collect::<Vec<_>>(),
-                Err(_) => Vec::new(),
-            }
-        })
+        let registry = match probe_before_deadline(
+            stop_deadline,
+            tokio::task::spawn_blocking({
+                let scopes = scopes.clone();
+                move || match thegn_core::db::Db::open() {
+                    Ok(db) => scopes
+                        .iter()
+                        .filter_map(|scope| {
+                            thegn_svc::control::client::discover(
+                                &db,
+                                scope,
+                                crate::daemon::now_ms(),
+                            )
+                        })
+                        .filter_map(|addr| match addr {
+                            ControlAddr::Unix(path) => Some(path),
+                            ControlAddr::Tcp { .. } | ControlAddr::HttpOrigin { .. } => None,
+                        })
+                        .collect::<Vec<_>>(),
+                    Err(_) => Vec::new(),
+                }
+            }),
+        )
         .await
         {
-            Ok(paths) => paths,
-            Err(_) => Vec::new(),
+            Some(Ok(paths)) => paths,
+            Some(Err(_)) | None => Vec::new(),
         };
         let configured = crate::daemon::socket_path(&cfg.daemon);
         let legacy_path = thegn_core::config_daemon::legacy_socket_path(
@@ -124,10 +128,21 @@ fn stop(cfg: &Config) -> Result<()> {
         for path in targets {
             let client = ControlClient::new(ControlAddr::Unix(path.clone()));
             let label = crate::daemon::client::socket_label(&client);
-            match crate::daemon::client::probe_stop_target(&client, &scopes).await {
-                crate::daemon::client::StopProbe::NotRunning => {}
-                crate::daemon::client::StopProbe::Ours => ours.push(path),
-                crate::daemon::client::StopProbe::Foreign(scope) => {
+            let probe = probe_before_deadline(
+                stop_deadline,
+                crate::daemon::client::probe_stop_target(&client, &scopes),
+            )
+            .await;
+            match probe {
+                None => {
+                    outln!(
+                        "skipped {}: stop deadline reached while checking listener",
+                        label
+                    );
+                }
+                Some(crate::daemon::client::StopProbe::NotRunning) => {}
+                Some(crate::daemon::client::StopProbe::Ours) => ours.push(path),
+                Some(crate::daemon::client::StopProbe::Foreign(scope)) => {
                     outln!(
                         "skipped {}: belongs to a different state directory (scope {})",
                         label,
@@ -145,16 +160,24 @@ fn stop(cfg: &Config) -> Result<()> {
         let mut waiting = Vec::new();
         for path in &ours {
             let client = ControlClient::new(ControlAddr::Unix(path.clone()));
-            match client.call_raw("POST", "/v1/daemon/shutdown", None).await {
-                Ok(_) => waiting.push(path.clone()),
-                Err(error) => {
+            match probe_before_deadline(
+                stop_deadline,
+                client.call_raw("POST", "/v1/daemon/shutdown", None),
+            )
+            .await
+            {
+                Some(Ok(_)) => waiting.push(path.clone()),
+                Some(Err(error)) => {
                     refused.insert(path.clone(), error.to_string());
+                }
+                None => {
+                    refused.insert(path.clone(), "stop deadline reached before shutdown".into());
                 }
             }
         }
         let survivors = wait_until_stopped(
             waiting,
-            crate::daemon::service::SHUTDOWN_TOTAL_DEADLINE,
+            stop_deadline.saturating_duration_since(tokio::time::Instant::now()),
             |path| async move {
                 ControlClient::new(ControlAddr::Unix(path))
                     .health()
@@ -166,18 +189,20 @@ fn stop(cfg: &Config) -> Result<()> {
         let survivors = survivors.into_iter().collect::<HashSet<_>>();
         let mut failures = Vec::new();
         for path in &ours {
+            let client = ControlClient::new(ControlAddr::Unix(path.clone()));
+            let label = crate::daemon::client::socket_label(&client);
             if let Some(error) = refused.get(path) {
-                outln!("shutdown refused for {}: {}", path.display(), error);
-                failures.push(format!("{} ({})", path.display(), error));
+                outln!("shutdown refused for {}: {}", label, error);
+                failures.push(format!("{} ({})", label, error));
             } else if survivors.contains(path) {
                 outln!(
                     "still running after {}s: {}",
                     crate::daemon::service::SHUTDOWN_TOTAL_DEADLINE.as_secs(),
-                    path.display()
+                    label
                 );
-                failures.push(path.display().to_string());
+                failures.push(label);
             } else {
-                outln!("stopped {}", path.display());
+                outln!("stopped {}", label);
             }
         }
         if failures.is_empty() {
@@ -193,9 +218,19 @@ fn stop(cfg: &Config) -> Result<()> {
     })
 }
 
+async fn probe_before_deadline<F: Future>(
+    deadline: tokio::time::Instant,
+    future: F,
+) -> Option<F::Output> {
+    match tokio::time::timeout_at(deadline, future).await {
+        Ok(output) => Some(output),
+        Err(_) => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{stop_targets, wait_until_stopped};
+    use super::{probe_before_deadline, stop_targets, wait_until_stopped};
     use std::collections::HashMap;
     use std::path::PathBuf;
     use std::sync::{Arc, Mutex};
@@ -246,13 +281,14 @@ mod tests {
     async fn wait_until_stopped_returns_survivors_after_one_total_deadline() {
         let a = PathBuf::from("a");
         let b = PathBuf::from("b");
+        let b_probe = b.clone();
         let polls = Arc::new(Mutex::new(HashMap::<PathBuf, usize>::new()));
         let started = tokio::time::Instant::now();
         let survivors = wait_until_stopped(vec![a.clone(), b.clone()], Duration::from_secs(3), {
             let polls = Arc::clone(&polls);
             move |path| {
                 let polls = Arc::clone(&polls);
-                let is_b = path == b;
+                let is_b = path == b_probe;
                 async move {
                     let mut polls = polls
                         .lock()
@@ -268,6 +304,29 @@ mod tests {
         assert_eq!(survivors, vec![b]);
         assert!(elapsed >= Duration::from_secs(3));
         assert!(elapsed < Duration::from_secs(4));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn probe_before_deadline_shares_one_budget_across_probes() {
+        let started = tokio::time::Instant::now();
+        let deadline = started + Duration::from_secs(1);
+        assert_eq!(
+            probe_before_deadline(deadline, async {
+                tokio::time::sleep(Duration::from_millis(800)).await;
+                true
+            })
+            .await,
+            Some(true)
+        );
+        assert_eq!(
+            probe_before_deadline(deadline, async {
+                tokio::time::sleep(Duration::from_millis(800)).await;
+                true
+            })
+            .await,
+            None
+        );
+        assert_eq!(tokio::time::Instant::now(), deadline);
     }
 
     #[tokio::test(start_paused = true)]
