@@ -67,6 +67,11 @@ refuse with the reason; use `thegn land` to land that branch outside the queue.
   worktree off that branch, the row is held `agent_blocked` with an
   `identity drift:` reason and no attempt spent. `thegn merge add` re-enqueues
   it against the current tip.
+- `thegn merge clear` removes unclaimed rows. Rows held by an active drain
+  stay queued, are named in the error, and require another clear after the
+  drain finishes.
+- An unrecognised stored queue status is shown as such and has no land or
+  retry key.
 
 ## Land strategy, signing, drivers
 
@@ -115,6 +120,13 @@ chooses a pointer automatically and never sends that path through lockfile
 regeneration, rerere, or the throwaway merge's blanket stage step. The same
 structured message is available to the conflict handoff; ordinary text
 conflicts retain the usual fold behavior.
+
+Lockfile regeneration accepts content changes and deletions only within the
+conflicted paths. Added or replaced outputs must be regular files; a mode
+change, symlink or submodule pointer replacement, or a change to another path,
+defers the branch. Each accepted regeneration prints one audit line: “merge
+queue: regenerated <paths> (approved outputs: exactly the conflict set) with
+command `<command>` (timeout Ns) -> tree <oid>”.
 
 ## After it lands
 

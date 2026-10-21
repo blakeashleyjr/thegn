@@ -181,6 +181,12 @@ There's deliberately no Google or Outlook integration: both need an OAuth client
 registration and a consent flow, and both hand out a secret `.ics` URL that
 `ics_url` already reads. Fastmail, Nextcloud and Proton do too.
 
+An account `token` is resolved as a secret reference before its request.
+`env:`, `file:` and `keyring:` references are supported; a bare value is used
+literally. An unresolved reference fails that account's sync with an
+authentication error and sends no request. With no token, the request is
+unauthenticated.
+
 Subscribed URLs are re-fetched conditionally, so an unchanged calendar costs one
 `304` and no parsing. CalDAV goes further and asks only for what changed since
 last time, which is how a deletion on the server becomes a deletion here rather

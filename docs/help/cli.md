@@ -143,6 +143,9 @@ discovery will not bring it back. Run `thegn wt reopen <path>` to clear that
 record and register it again without starting a pane. Worktrees closed before
 this release have no close record.
 
+If thegn cannot record a close, a notice says “Close not recorded for N
+worktree(s); they stay registered and reappear on the next refresh: …”.
+
 To put an agent in it without a pane on screen:
 
 ```sh

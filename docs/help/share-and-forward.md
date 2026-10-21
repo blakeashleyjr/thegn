@@ -40,6 +40,12 @@ TERM to the group, then KILL after a short grace period if processes remain.
 A Tailscale share cannot restart on a port whose previous share is still
 stopping; wait for teardown to finish first.
 
+Share clients receive secrets outside their command line. bore receives its
+secret through `BORE_SECRET`; frp reads its token from a generated `frpc.toml`
+in the share's private state directory (directory mode 0700, file mode 0600).
+Clients start with a minimal environment that omits HOME, D-Bus, `IROH_SECRET`
+and provider credentials.
+
 ## Auto port forwards (`[forward]`)
 
 For sandboxed worktrees ([[sandboxing]]), dev-server ports detected
