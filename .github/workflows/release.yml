@@ -459,6 +459,7 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: write
+      attestations: read
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
@@ -495,6 +496,22 @@ jobs:
           gh release download "$TAG" --dir "$PACKAGE_ROOT/assets" \
             --pattern "thegn-$TAG-*.tar.gz" \
             --pattern "thegn-$TAG-*.sha256"
+      - name: Verify archive provenance
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          ADMITTED_SHA: ${{ needs.admit.outputs.sha }}
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          archives=("$PACKAGE_ROOT/assets"/thegn-"$TAG"-*.tar.gz)
+          [ "${#archives[@]}" -gt 0 ] || { echo "::error::no release archives to verify"; exit 1; }
+          for archive in "${archives[@]}"; do
+            gh attestation verify "$archive" \
+              --repo "$GITHUB_REPOSITORY" \
+              --signer-workflow "$GITHUB_REPOSITORY/.github/workflows/release.yml" \
+              --source-digest "$ADMITTED_SHA" \
+              --deny-self-hosted-runners
+          done
       - name: Validate all active inputs and render metadata
         run: |
           set -euo pipefail
@@ -577,7 +594,7 @@ jobs:
             sed 's/^/  /' "$PACKAGE_ROOT/validation.txt"
             echo '```'
             echo
-            echo "Verify provenance after downloading an archive:"
+            echo "This job verified every archive's attestation against the admitted commit before packaging."
             echo '```sh'
             echo "gh attestation verify thegn-$TAG-<target>.tar.gz --repo $GITHUB_REPOSITORY"
             echo '```'
