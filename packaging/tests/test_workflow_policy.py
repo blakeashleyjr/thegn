@@ -295,6 +295,9 @@ class WorkflowPolicyTests(unittest.TestCase):
             "--signer-workflow",
             "--source-digest",
             "--deny-self-hosted-runners",
+            "--format json",
+            "runInvocationURI",
+            "$GITHUB_RUN_ID",
         ):
             with self.subTest(expected=expected):
                 self.assertIn(expected, script)
@@ -311,6 +314,8 @@ class WorkflowPolicyTests(unittest.TestCase):
         )
         script = step["run"]
         admitted_sha = "38ea6674e95abc580c473ed708332cd3d14e97ea"
+        signing_sha = "e45b37fb590f7aac8d3580ab22be6cd2b450c43f"
+        self.assertNotEqual(admitted_sha, signing_sha)
         with tempfile.TemporaryDirectory() as temporary_directory:
             temporary_path = Path(temporary_directory)
             assets = temporary_path / "assets"
@@ -328,13 +333,21 @@ class WorkflowPolicyTests(unittest.TestCase):
                 "#!/bin/sh\n"
                 'printf \'%s\\n\' "$*" >> "$GH_LOG"\n'
                 'if [ -n "$GH_FAIL" ]; then\n'
-                '  case "$*" in *"$GH_FAIL"*) exit 1;; esac\n'
-                "fi\n",
+                '  case "$*" in *"/$GH_FAIL "*) exit 1;; esac\n'
+                "fi\n"
+                'if [ "$GH_FOREIGN_RUN" = 1 ]; then\n'
+                '  run_uri="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/other/attempts/1"\n'
+                "else\n"
+                '  run_uri="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID/attempts/1"\n'
+                "fi\n"
+                'printf \'[{"verificationResult":{"signature":{"certificate":{"runInvocationURI":"%s"}}}}]\\n\' "$run_uri"\n',
                 encoding="utf-8",
             )
             stub.chmod(0o755)
 
-            def run_case(*, fail: str, empty: bool = False) -> subprocess.CompletedProcess[str]:
+            def run_case(
+                *, fail: str = "", foreign_run: bool = False, empty: bool = False
+            ) -> subprocess.CompletedProcess[str]:
                 log_path.write_text("", encoding="utf-8")
                 if empty:
                     for archive in assets.glob("*.tar.gz"):
@@ -347,9 +360,13 @@ class WorkflowPolicyTests(unittest.TestCase):
                         "TAG": "v1.2.3",
                         "GITHUB_REPOSITORY": "o/r",
                         "ADMITTED_SHA": admitted_sha,
+                        "GITHUB_SHA": signing_sha,
+                        "GITHUB_SERVER_URL": "https://github.com",
+                        "GITHUB_RUN_ID": "12345",
                         "GITHUB_TOKEN": "x",
                         "GH_LOG": str(log_path),
                         "GH_FAIL": fail,
+                        "GH_FOREIGN_RUN": "1" if foreign_run else "0",
                     }
                 )
                 return subprocess.run(
@@ -366,14 +383,19 @@ class WorkflowPolicyTests(unittest.TestCase):
             self.assertEqual(2, len(calls))
             for call in calls:
                 self.assertTrue(call.startswith("attestation verify "))
-                self.assertIn(f"--source-digest {admitted_sha}", call)
+                self.assertIn(f"--source-digest {signing_sha}", call)
                 self.assertIn("--repo o/r", call)
+                self.assertIn("--format json", call)
             self.assertTrue(any("thegn-v1.2.3-a.tar.gz" in call for call in calls))
             self.assertTrue(any("thegn-v1.2.3-b.tar.gz" in call for call in calls))
             self.assertFalse(any(".sha256" in call for call in calls))
 
-            result = run_case(fail="b.tar.gz")
+            result = run_case(fail="thegn-v1.2.3-b.tar.gz")
             self.assertNotEqual(0, result.returncode)
+
+            result = run_case(foreign_run=True)
+            self.assertNotEqual(0, result.returncode)
+            self.assertIn("not bound to this workflow run", result.stdout)
 
             result = run_case(fail="", empty=True)
             self.assertNotEqual(0, result.returncode)

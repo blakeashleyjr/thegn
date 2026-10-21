@@ -499,18 +499,27 @@ jobs:
       - name: Verify archive provenance
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          ADMITTED_SHA: ${{ needs.admit.outputs.sha }}
         run: |
           set -euo pipefail
           shopt -s nullglob
           archives=("$PACKAGE_ROOT/assets"/thegn-"$TAG"-*.tar.gz)
           [ "${#archives[@]}" -gt 0 ] || { echo "::error::no release archives to verify"; exit 1; }
           for archive in "${archives[@]}"; do
-            gh attestation verify "$archive" \
+            verification="$(gh attestation verify "$archive" \
               --repo "$GITHUB_REPOSITORY" \
               --signer-workflow "$GITHUB_REPOSITORY/.github/workflows/release.yml" \
-              --source-digest "$ADMITTED_SHA" \
-              --deny-self-hosted-runners
+              --source-digest "$GITHUB_SHA" \
+              --deny-self-hosted-runners \
+              --format json)"
+            if ! jq -e \
+              --arg run_uri_prefix "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID/" \
+              'type == "array" and length > 0 and all(.[];
+                ((.verificationResult.signature.certificate.runInvocationURI // "")
+                  | startswith($run_uri_prefix)))' \
+              <<< "$verification" >/dev/null; then
+              echo "::error::archive attestation is not bound to this workflow run"
+              exit 1
+            fi
           done
       - name: Validate all active inputs and render metadata
         run: |
@@ -594,7 +603,8 @@ jobs:
             sed 's/^/  /' "$PACKAGE_ROOT/validation.txt"
             echo '```'
             echo
-            echo "This job verified every archive's attestation against the admitted commit before packaging."
+            echo "Every archive's attestation matched this signing run and was bound to"
+            echo "this workflow run before packaging."
             echo '```sh'
             echo "gh attestation verify thegn-$TAG-<target>.tar.gz --repo $GITHUB_REPOSITORY"
             echo '```'
