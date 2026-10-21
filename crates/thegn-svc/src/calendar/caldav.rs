@@ -287,6 +287,7 @@ fn page_from_multistatus(
             || Ok(()),
             &mut report,
         );
+        let href = r.href.clone();
         event_hrefs.extend(std::iter::repeat_n(r.href, events.len() - before));
         drop(ics);
         meter.release_transient(copy);
@@ -297,6 +298,13 @@ fn page_from_multistatus(
             ));
         }
         diagnostics.absorb(PageDiagnostics::from_report(&report));
+        if mode == PageMode::Delta && events.len() == before && !report.cancelled_uids().is_empty()
+        {
+            let id = uid_from_href(&href);
+            meter.admit_deletion(id.len())?;
+            deleted.push(id);
+            deleted_hrefs.push(href);
+        }
         Ok(())
     })?;
     let token = scope_token(calendar_ids, zone, &token);
@@ -825,6 +833,49 @@ END:VCALENDAR</c:calendar-data></d:prop><d:status>HTTP/1.1 200 OK</d:status></d:
             page.event_hrefs,
             ["/cal/random-server-key.ics", "/cal/random-server-key.ics"]
         );
+    }
+
+    #[test]
+    fn cancel_only_resource_in_a_delta_deletes_its_href() {
+        let data =
+            "BEGIN:VCALENDAR\nBEGIN:VEVENT\nUID:x\nSTATUS:CANCELLED\nEND:VEVENT\nEND:VCALENDAR";
+        let xml = format!(
+            "<d:multistatus xmlns:d=\"DAV:\" xmlns:c=\"urn:ietf:params:xml:ns:caldav\">{}</d:multistatus>",
+            resource("/cal/x.ics", data)
+        );
+        let page = page_from_multistatus(&xml, "UTC", &[], PageMode::Delta, test_meter()).unwrap();
+        assert!(page.events.is_empty());
+        assert_eq!(page.deleted_hrefs, ["/cal/x.ics"]);
+        assert_eq!(page.deleted, [uid_from_href("/cal/x.ics")]);
+    }
+
+    #[test]
+    fn cancel_only_resource_in_a_snapshot_adds_no_deletion() {
+        let data =
+            "BEGIN:VCALENDAR\nBEGIN:VEVENT\nUID:x\nSTATUS:CANCELLED\nEND:VEVENT\nEND:VCALENDAR";
+        let xml = format!(
+            "<d:multistatus xmlns:d=\"DAV:\" xmlns:c=\"urn:ietf:params:xml:ns:caldav\">{}</d:multistatus>",
+            resource("/cal/x.ics", data)
+        );
+        let page =
+            page_from_multistatus(&xml, "UTC", &[], PageMode::Snapshot, test_meter()).unwrap();
+        assert!(page.events.is_empty());
+        assert!(page.deleted_hrefs.is_empty());
+        assert!(page.deleted.is_empty());
+    }
+
+    #[test]
+    fn cancel_resource_with_surviving_events_is_not_deleted() {
+        let data = "BEGIN:VCALENDAR\nBEGIN:VEVENT\nUID:x\nSEQUENCE:3\nDTSTART:20300101T100000Z\nEND:VEVENT\nBEGIN:VEVENT\nUID:x\nSTATUS:CANCELLED\nSEQUENCE:2\nEND:VEVENT\nEND:VCALENDAR";
+        let xml = format!(
+            "<d:multistatus xmlns:d=\"DAV:\" xmlns:c=\"urn:ietf:params:xml:ns:caldav\">{}</d:multistatus>",
+            resource("/cal/x.ics", data)
+        );
+        let page = page_from_multistatus(&xml, "UTC", &[], PageMode::Delta, test_meter()).unwrap();
+        assert_eq!(page.events.len(), 1);
+        assert!(page.deleted_hrefs.is_empty());
+        assert!(page.deleted.is_empty());
+        assert_eq!(page.diagnostics.quarantined_events, 0);
     }
 
     #[test]
