@@ -182,12 +182,15 @@ async fn calendar_errors_never_echo_url_or_credential_sentinels() {
         .await;
     assert_eq!(result.len(), 1, "invalid URL");
     match result[0].result.as_ref() {
-        Err(error) => record_error("invalid-url", error, &mut rows),
+        Err(error) => {
+            assert!(matches!(error, CalendarError::Policy(_)), "{error:?}");
+            record_error("invalid-url", error, &mut rows);
+        }
         Ok(_) => panic!("invalid URL unexpectedly succeeded"),
     }
 
     let unresolved = CalendarAccount {
-        url: format!("http://{address}/unauthorized?sig=url-sentinel-2b8"),
+        url: format!("http://{address}/html?sig=url-sentinel-2b8"),
         username: "user-sentinel-5d0".into(),
         token: "env:THEGN_TEST_CALENDAR_SENTINEL_UNSET_6a2".into(),
         allow_private_network: true,
@@ -198,7 +201,13 @@ async fn calendar_errors_never_echo_url_or_credential_sentinels() {
         .await;
     assert_eq!(result.len(), 1, "unresolved token");
     match result[0].result.as_ref() {
-        Err(error) => record_error("unresolved-token", error, &mut rows),
+        Err(error) => {
+            assert!(
+                matches!(error, CalendarError::Auth(message) if message.contains("could not be resolved")),
+                "{error:?}"
+            );
+            record_error("unresolved-token", error, &mut rows);
+        }
         Ok(_) => panic!("unresolved token unexpectedly succeeded"),
     }
 
@@ -280,38 +289,34 @@ async fn concurrent_accounts_each_send_only_their_own_credential() {
         ..Default::default()
     };
 
+    let mut passes = Vec::new();
     for (a_token, b_token) in [("token-a", "token-b"), ("token-b", "token-a")] {
         let cfg = build_config(a_token, b_token);
         let results = router(&cfg).list_events(from, to, &BTreeMap::new()).await;
         assert!(results.iter().all(|row| row.result.is_ok()));
+
+        let mut pass = std::mem::take(
+            &mut *observed
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+        );
+        pass.sort_unstable();
+        passes.push(pass);
     }
     server.abort();
     assert!(server.await.is_err());
 
-    let records = observed
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .clone();
-    let expected = [
-        ("/a", "Bearer token-a"),
-        ("/b", "Bearer token-b"),
-        ("/a", "Bearer token-b"),
-        ("/b", "Bearer token-a"),
-    ];
-    assert_eq!(records.len(), expected.len(), "{records:?}");
-    for (path, authorization) in expected {
-        let found: Vec<_> = records
-            .iter()
-            .filter(|(seen_path, _)| seen_path == path)
-            .map(|(_, seen_auth)| seen_auth.as_str())
-            .collect();
-        let expected_auths: Vec<_> = expected
-            .iter()
-            .filter(|(expected_path, _)| *expected_path == path)
-            .map(|(_, expected_auth)| *expected_auth)
-            .collect();
-        assert_eq!(found.len(), 2, "{records:?}");
-        assert!(expected_auths.contains(&authorization));
-        assert!(found.contains(&authorization), "{path}: {records:?}");
-    }
+    assert_eq!(
+        passes,
+        vec![
+            vec![
+                ("/a".to_string(), "Bearer token-a".to_string()),
+                ("/b".to_string(), "Bearer token-b".to_string()),
+            ],
+            vec![
+                ("/a".to_string(), "Bearer token-b".to_string()),
+                ("/b".to_string(), "Bearer token-a".to_string()),
+            ],
+        ]
+    );
 }
