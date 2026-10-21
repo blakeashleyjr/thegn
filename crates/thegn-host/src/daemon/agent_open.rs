@@ -961,6 +961,7 @@ mod tests {
             headless: Some(false),
             ..headless
         };
+        config.sandbox.enabled = false;
         let interactive_error = match resolve(&config, &db, &spec, &interactive, None) {
             Ok(_) => None,
             Err(error) => Some(error.to_string()),
