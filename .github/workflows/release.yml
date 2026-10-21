@@ -374,7 +374,10 @@ jobs:
           : > "$RUNNER_TEMP/trusted-asset-digests.jsonl"
           for asset in "$release"/thegn-"$TAG"-*.tar.gz "$release"/thegn-"$TAG"-*.sha256 \
             "$release/thegn-$TAG-release.json"; do
-            [ -f "$asset" ] || continue
+            [ -f "$asset" ] || {
+              echo "::error::expected release asset file is missing: $asset"
+              exit 1
+            }
             name="${asset##*/}"
             digest="$(sha256sum "$asset" | awk '{print $1}')"
             jq -cn --arg name "$name" --arg sha256 "$digest" \
@@ -622,7 +625,10 @@ jobs:
           # retract or overwrite any matrix output.
           : > "$PACKAGE_ROOT/package-digests.jsonl"
           for asset in "$PACKAGE_ROOT/release-assets/"*; do
-            [ -f "$asset" ] || continue
+            [ -f "$asset" ] || {
+              echo "::error::expected package asset file is missing: $asset"
+              exit 1
+            }
             name="${asset##*/}"
             digest="$(sha256sum "$asset" | awk '{print $1}')"
             jq -cn --arg name "$name" --arg sha256 "$digest" \

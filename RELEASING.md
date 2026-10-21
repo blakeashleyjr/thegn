@@ -86,12 +86,12 @@ install github:blakeashleyjr/thegn` gives users `.#default`, bridge included,
    windows-msvc is still out: that CI job has never executed. Add a target only
    once its CI job is green. Check the package job's
    summary for its exact outputs and target/checksum mapping. The
-   `verify-manifest` job is the completeness proof: it requires every release
-   asset to match the digest output of its producer, then checks the exact asset
-   set, archive attestations, checksums, and upload record, and attaches the
-   deterministic `thegn-<tag>-manifest.json`. Write the release notes (crib
-   from the changelog) and publish the draft only after `verify-manifest` is
-   green and that manifest is attached.
+   `verify-manifest` job is the completeness proof: it checks the exact asset
+   set, then requires every release asset to match the digest output of its
+   producer. It also checks archive attestations, checksums, and the upload
+   record, then attaches the deterministic `thegn-<tag>-manifest.json`. Write
+   the release notes (crib from the changelog) and publish the draft only after
+   `verify-manifest` is green and that manifest is attached.
    Pre-release tags (`-alpha.N` / `-beta.N`) are auto-marked as a prerelease
    by the workflow — no manual checkbox needed.
 
