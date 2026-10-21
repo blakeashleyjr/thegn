@@ -73,9 +73,10 @@ pub trait StashOps: GitBackend {
     /// Stash only the staged changes (`--staged`, git ≥ 2.35 — probed via
     /// `git version` so older gits get a clear error, not a flag complaint).
     fn stash_staged(&self, loc: &GitLoc, message: &str) -> Result<()> {
-        let v = loc
-            .git_out(&["version"])
-            .and_then(|s| parse_git_version(&s));
+        let version = loc.git_text(&["version"]).map_err(|e| {
+            anyhow::anyhow!("could not determine the git version for `stash push --staged`: {e}")
+        })?;
+        let v = parse_git_version(&version);
         if !v.is_some_and(supports_stash_staged) {
             bail!("`git stash push --staged` needs git >= 2.35");
         }
