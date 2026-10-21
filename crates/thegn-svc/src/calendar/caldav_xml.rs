@@ -159,12 +159,12 @@ impl<'a> Reader<'a> {
         }
         let has_namespace_decl = attrs
             .iter()
-            .any(|(key, _)| key == "xmlns" || key.starts_with("xmlns:"));
+            .any(|(key, _)| *key == "xmlns" || key.starts_with("xmlns:"));
         let mut owned_scope = None;
         for (key, value) in &attrs {
-            if has_namespace_decl && (key == "xmlns" || key.starts_with("xmlns:")) {
+            if has_namespace_decl && (*key == "xmlns" || key.starts_with("xmlns:")) {
                 let scope = owned_scope.get_or_insert_with(|| inherited.clone());
-                if key == "xmlns" {
+                if *key == "xmlns" {
                     scope.insert(String::new(), decode_text(value)?.into_owned());
                 } else if let Some(prefix) = key.strip_prefix("xmlns:") {
                     scope.insert(prefix.to_string(), decode_text(value)?.into_owned());
@@ -177,7 +177,7 @@ impl<'a> Reader<'a> {
         }
         let (prefix, local) = qname
             .split_once(':')
-            .map_or((None, qname.as_str()), |(p, l)| (Some(p), l));
+            .map_or((None, &*qname), |(p, l)| (Some(p), l));
         if prefix.is_some_and(str::is_empty) || local.is_empty() || local.len() > MAX_XML_NAME_BYTES
         {
             return self.fail();
@@ -452,7 +452,7 @@ fn process_response<'a>(
                 "location",
                 "error",
             ]
-            .contains(&e.local.as_str())
+            .contains(&&*e.local)
     }) {
         return Err(CalendarError::Parse("unexpected DAV response child".into()));
     }
@@ -547,7 +547,7 @@ fn process_response<'a>(
         }
         if propstat.children.iter().any(|e| {
             e.ns == DAV_NS
-                && !["prop", "status", "responsedescription", "error"].contains(&e.local.as_str())
+                && !["prop", "status", "responsedescription", "error"].contains(&&*e.local)
         }) {
             return Err(CalendarError::Parse("unexpected DAV propstat child".into()));
         }
