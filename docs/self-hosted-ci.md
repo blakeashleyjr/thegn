@@ -24,27 +24,52 @@ policy from repository visibility or collaborator status.
 
 ## One-time setup
 
-The runner setup script is in `scripts/ci/ageless-runner-setup.sh`. Before
-running it, satisfy the security prerequisites above. Run **on ageless-studio,
-as `targe`** (SSH over Tailscale or use a thegn `env=ageless` shell):
+The runner setup script is in `scripts/ci/ageless-runner-setup.sh`. Run it on
+ageless-studio as an operator account, never as root or `thegn-ci`. The runner
+uses a dedicated system account named `thegn-ci`, with no login shell and no
+sudo access. On NixOS, add the declaration printed by the script to
+`configuration.nix` and rebuild; the script does not use `useradd` there.
+
+Place a repository administration PAT in `/etc/thegn-ci/registration.token`
+with owner `root:root` and mode `0600`, or provide `GH_PAT` once in the setup
+environment. The script writes that environment value directly to the
+root-only token file and removes it from its environment. The operator's `gh`
+login is not used, and the token is never stored in the runner account or
+passed to a job. Do not set `NIX_GITHUB_TOKEN`: setup refuses it, and it is not
+written to a runner `nix.conf`.
+
+To enter the token without putting it in shell history, run:
 
 ```sh
-git clone https://github.com/blakeashleyjr/thegn   # or cd an existing checkout
-cd thegn
-
-NIX_GITHUB_TOKEN="<optional PAT>" \
-GH_PAT="<PAT with repo admin>" \
-  bash scripts/ci/ageless-runner-setup.sh
+sudo install -d -m 0700 -o root -g root /etc/thegn-ci
+read -rsp 'GitHub administration PAT: ' registration_token; printf '\n'
+printf '%s' "$registration_token" | sudo install -m 0600 -o root -g root /dev/stdin /etc/thegn-ci/registration.token
+unset registration_token
+bash scripts/ci/ageless-runner-setup.sh
 ```
 
-`NIX_GITHUB_TOKEN` is optional. All flake inputs are public; this token only
-raises GitHub's anonymous API rate limit during flake fetches. `GH_PAT` is used
-to mint runner registration tokens. If `gh` is already logged in as a repo
-admin on the host, it can be omitted.
+Setup refuses an unsafe runner account when it is the operator or root, belongs
+to `sudo`, `wheel`, `admin`, `docker`, `podman`, `libvirt`, `kvm`, or `lxd`, has
+sudo rights or an uncheckable sudo policy, has an interactive shell, or has
+GitHub, SSH, GPG, Git, Docker, or Nix access-token credentials in its HOME.
+Remove the credentials or group membership, remove sudo grants, and set the
+shell to `/usr/sbin/nologin` before retrying.
 
-The script defaults to four runners, three CPUs each, labels
-`self-hosted,linux,x64,ageless,nix`, and persistent warm caches. Review its
-current settings and isolation before enabling the repository variable.
+The root-owned systemd template starts a root-owned loop for each runner. Each
+iteration deletes and recreates that runner's `_work` directory and HOME with
+mode `0700`, asks GitHub for an encoded JIT configuration, and launches exactly
+one ephemeral job in a transient systemd unit as `thegn-ci`. The unit applies
+CPU and memory limits; its cgroup owns the job's descendants. GitHub removes
+the ephemeral runner after its single job, and the loop obtains a fresh JIT
+configuration for the next job. The JIT value is single-use and appears in the
+argv of the `thegn-ci`-owned runner process.
+
+The Nix multi-user daemon and `/nix/store` remain shared. There is no shared
+writable Cargo registry or sccache, no runner cache bin directory on PATH, and
+each job's HOME is wiped before use. Authenticated runner/Nix installer bytes
+are not yet pinned and verified (THE-413); untrusted-event rejection,
+task-bound short-lived credentials for protected jobs, authenticated shared
+caches, and canary jobs also remain open on THE-414.
 
 ## Verify runners
 
@@ -53,8 +78,8 @@ current settings and isolation before enabling the repository variable.
 gh api repos/blakeashleyjr/thegn/actions/runners --jq '.runners[]|{name,status}'
 
 # On the host
-systemctl list-units 'actions.runner.*' --no-pager
-journalctl -u 'actions.runner.*' -f
+systemctl list-units 'thegn-ci-runner@*.service' --no-pager
+journalctl -u 'thegn-ci-runner@*.service' -f
 ```
 
 The `workflow_dispatch` trigger is the only enabled trigger: CI does not run on
@@ -100,22 +125,21 @@ The `macos-15` and `windows-latest` jobs do not use `CI_RUNS_ON`.
 ## Host operations
 
 ```sh
-# Restart a runner
-sudo systemctl restart actions.runner.blakeashleyjr-thegn.ageless-1.service
+# Restart a root-owned runner loop; its next iteration starts a fresh JIT job
+sudo systemctl restart thegn-ci-runner@1.service
 
-# Update the runner binary
+# Refresh the runner payload and loop configuration
 bash scripts/ci/ageless-runner-setup.sh
 
-# Inspect or clear the shared cache (clearing it affects every runner)
-du -sh /home/targe/gha-cache/*
-sccache --stop-server; rm -rf /home/targe/gha-cache/sccache/*
+# Inspect the shared Nix store
 nix-collect-garbage -d
 
-# Remove the runner services
-GH_PAT=<admin PAT> bash scripts/ci/ageless-runner-uninstall.sh
+# Remove runner loops, their root-only token, and runner data
+bash scripts/ci/ageless-runner-uninstall.sh
+
+# Also remove the dedicated account (not available for a NixOS-declared user)
+REMOVE_USER=1 bash scripts/ci/ageless-runner-uninstall.sh
 ```
 
-The Linux `test` job sets global git identity on its runner account. Use a
-dedicated account so this does not affect interactive work. Self-hosted jobs
-queue while the runner is offline; see the rollback section above to restore
-GitHub-hosted Linux runners.
+Self-hosted jobs queue while the runner loop is offline; see the rollback
+section above to restore GitHub-hosted Linux runners.
