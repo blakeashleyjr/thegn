@@ -212,7 +212,9 @@ pub enum Action {
     },
     /// Run the repo's merge-queue gate on a pipeline row's committed HEAD in
     /// the isolated gate worktree and record a trusted, commit-bound
-    /// attestation (Lead-only).
+    /// attestation (Lead-only). This explicit verb runs even when
+    /// `[merge_queue].gate_on = false`; that switch controls automatic fold
+    /// gating only.
     Gate {
         /// The dispatch row id (see `dispatch list`).
         id: i64,

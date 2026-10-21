@@ -286,10 +286,11 @@ dispatch door (`session open --stage --issue`) that creates these rows.
 
 `thegn dispatch gate <row>` runs the repo's configured `[merge_queue] gate_command`
 through the isolated fold-gate executor and records a trusted attestation bound
-to that worktree's committed HEAD. It is refused under a worker dispatch
-capability, when no gate is configured, or when the row's worktree is missing,
-detached, or dirty. `dispatch verify` and `dispatch set-status done` do not
-consume this attestation yet.
+to that worktree's committed HEAD. This explicit Lead-only invocation runs even
+when `[merge_queue] gate_on = false`; that switch controls automatic fold gating.
+It is refused under a worker dispatch capability, when no gate is configured,
+or when the row's worktree is missing, detached, or dirty. `dispatch verify` and
+`dispatch set-status done` do not consume this attestation yet.
 
 `dispatch set-status` follows a transition table: `merged` is reachable only
 from `done` or `pr_open`; `done` only from `running`, `spawning`,
