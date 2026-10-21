@@ -579,15 +579,57 @@ pub(crate) fn upload_agent_configs(
     Ok(())
 }
 
+struct AccountUpload {
+    provider_id: String,
+    dest_root: String,
+    stage_root: String,
+    files: Vec<(String, Vec<u8>, bool)>,
+    read_failure: Option<String>,
+}
+
+fn account_stage_root(parent: &str, identity: &str, nonce: &str) -> String {
+    format!("{parent}/.{identity}.thegn-stage-{nonce}")
+}
+
+fn account_upload_ready(
+    expected: usize,
+    written: usize,
+    failed: bool,
+    within_budget: bool,
+) -> bool {
+    !failed && expected == written && within_budget
+}
+
+fn account_publish_script(dest_root: &str, stage_root: &str) -> String {
+    format!(
+        "set -u; exec 2>&1; d={}; s={}; o=\"$d.thegn-old-$$\"; \
+         [ -d \"$s\" ] && [ ! -L \"$s\" ] || exit 41; \
+         if [ -e \"$d\" ] || [ -L \"$d\" ]; then mv -- \"$d\" \"$o\" || exit 42; fi; \
+         if ! mv -- \"$s\" \"$d\"; then [ -e \"$o\" ] && mv -- \"$o\" \"$d\"; exit 43; fi; \
+         rm -rf -- \"$o\" 2>&1 || exit 44",
+        thegn_core::util::sh_quote(dest_root),
+        thegn_core::util::sh_quote(stage_root),
+    )
+}
+
+fn account_discard_script(stage_root: &str) -> String {
+    format!(
+        "exec 2>&1; rm -rf -- {}",
+        thegn_core::util::sh_quote(stage_root)
+    )
+}
+
 /// Deploy each declared coding-agent ACCOUNT's credential home into the sandbox
 /// under a stable per-account path (`$HOME/.thegn/accounts/<provider>/<slug>/`),
 /// so a provider pane can point the agent's home env var (`CLAUDE_CONFIG_DIR` /
 /// `CODEX_HOME`) at the selected one (see [`account_pane_env_exports`]). This is
 /// how client-side account switching (`[[accounts]]`) reaches a REMOTE provider:
 /// path-preserving bind-mounting the host dir (what the local path does) can't
-/// cross to a sprite, so we upload the dir's contents instead. Only *authed*
-/// accounts are shipped. Best-effort + budget-bounded; a missing/unreadable dir
-/// is skipped. No-op when no `[[accounts]]`/managed accounts exist — the default
+/// cross to a sprite, so we upload the dir's contents instead. Each account is
+/// staged separately and its remote home is published all-or-nothing only after
+/// every file succeeds within the step budget. Only *authed* accounts are
+/// shipped. Best-effort + budget-bounded; a missing/unreadable dir is skipped.
+/// No-op when no `[[accounts]]`/managed accounts exist — the default
 /// `~/.claude` upload in [`upload_agent_configs`] still covers the single-home case.
 pub(crate) fn upload_agent_accounts(
     provider: &thegn_svc::provider::Provider,
@@ -599,7 +641,7 @@ pub(crate) fn upload_agent_accounts(
         return;
     };
     let base = sprite_home.trim_end_matches('/');
-    let mut uploads: Vec<(String, Vec<u8>, bool)> = Vec::new();
+    let mut uploads: Vec<AccountUpload> = Vec::new();
     for p in thegn_core::account::providers() {
         for acct in thegn_core::account::list(cfg, &db, p.id) {
             // Only ship accounts that are actually logged in (auth marker present)
@@ -609,21 +651,46 @@ pub(crate) fn upload_agent_accounts(
             }
             let identity = thegn_core::account::home_component(&acct.name);
             let dest_root = format!("{base}/.thegn/accounts/{}/{}", p.id, identity);
+            let parent = format!("{base}/.thegn/accounts/{}", p.id);
+            let mut nonce = [0_u8; 8];
+            if let Err(error) = getrandom::fill(&mut nonce) {
+                tracing::warn!(target: "thegn::startup", provider = p.id, account = %identity, reason = %error, "account home not published; previous generation kept");
+                continue;
+            }
+            let nonce = nonce
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>();
+            let stage_root = account_stage_root(&parent, &identity, &nonce);
             let is_claude = p.id == "claude";
+            let mut files = Vec::new();
+            let mut read_failure = None;
             for (abs, rel, exec) in collect_agent_config_files(&acct.dir) {
-                if let Ok(data) = std::fs::read(&abs) {
-                    // An account dir IS the claude config dir, so its settings.json
-                    // has a BARE rel (not `.claude/settings.json`) — normalize before
-                    // the strip so the host `hooks` block (which shells out to host-
-                    // only services and errors on every Claude event in-sprite) is
-                    // dropped here too, not just on the default-home upload paths.
-                    let data = if is_claude {
-                        strip_sandbox_hooks(&format!(".claude/{rel}"), data)
-                    } else {
-                        data
-                    };
-                    uploads.push((format!("{dest_root}/{rel}"), data, exec));
+                match std::fs::read(&abs) {
+                    Ok(data) => {
+                        // Account settings have a bare rel; normalize before stripping
+                        // host-only hooks, as in the prior account upload path.
+                        let data = if is_claude {
+                            strip_sandbox_hooks(&format!(".claude/{rel}"), data)
+                        } else {
+                            data
+                        };
+                        files.push((rel, data, exec));
+                    }
+                    Err(error) => {
+                        read_failure = Some(format!("read {}: {error}", abs.display()));
+                        break;
+                    }
                 }
+            }
+            if !files.is_empty() || read_failure.is_some() {
+                uploads.push(AccountUpload {
+                    provider_id: p.id.to_string(),
+                    dest_root,
+                    stage_root,
+                    files,
+                    read_failure,
+                });
             }
         }
     }
@@ -631,21 +698,126 @@ pub(crate) fn upload_agent_accounts(
         return;
     }
     let deadline = std::time::Instant::now() + AGENT_CONFIG_STEP_BUDGET;
-    let _ = block_on_provider(|| async {
-        // best-effort: config sync within its step budget: a missed upload is retried on the next sync
-        for (dest, data, exec) in &uploads {
-            if std::time::Instant::now() >= deadline {
-                break;
+    let result = block_on_provider(|| async {
+        for upload in &uploads {
+            let identity = upload.dest_root.rsplit('/').next().unwrap_or("unknown");
+            let mut failure = upload.read_failure.clone();
+            let mut written = 0;
+            if failure.is_none() {
+                for (rel, data, exec) in &upload.files {
+                    let now = std::time::Instant::now();
+                    if now >= deadline {
+                        failure = Some("account upload step budget exhausted".to_string());
+                        break;
+                    }
+                    let remaining = deadline.saturating_duration_since(now);
+                    let write_timeout = AGENT_CONFIG_UPLOAD_TIMEOUT.min(remaining);
+                    match tokio::time::timeout(
+                        write_timeout,
+                        write_preserving_mode(
+                            provider,
+                            id,
+                            &format!("{}/{rel}", upload.stage_root),
+                            data,
+                            *exec,
+                        ),
+                    )
+                    .await
+                    {
+                        Ok(Ok(())) => written += 1,
+                        Ok(Err(error)) => {
+                            failure = Some(format!("write {rel}: {error}"));
+                            break;
+                        }
+                        Err(_) => {
+                            failure = Some(format!("write {rel} timed out"));
+                            break;
+                        }
+                    }
+                }
             }
-            let _ = tokio::time::timeout(
-                // best-effort: config upload within its timeout: a missed upload is retried on the next sync
+            if account_upload_ready(
+                upload.files.len(),
+                written,
+                failure.is_some(),
+                std::time::Instant::now() < deadline,
+            ) {
+                let now = std::time::Instant::now();
+                let script = account_publish_script(&upload.dest_root, &upload.stage_root);
+                let argv = vec!["/bin/sh".to_string(), "-c".to_string(), script];
+                match tokio::time::timeout(
+                    deadline.saturating_duration_since(now),
+                    provider.run_exec(id, &argv, None, &[]),
+                )
+                .await
+                {
+                    Ok(Ok((0, _))) => continue,
+                    Ok(Ok((code, output))) => {
+                        let tail = output
+                            .chars()
+                            .rev()
+                            .take(512)
+                            .collect::<String>()
+                            .chars()
+                            .rev()
+                            .collect::<String>();
+                        failure = Some(format!("publish exited {code}: {tail}"));
+                    }
+                    Ok(Err(error)) => failure = Some(format!("publish failed: {error}")),
+                    Err(_) => failure = Some("publish timed out".to_string()),
+                }
+            } else if failure.is_none() {
+                failure = Some("account upload incomplete or step budget exhausted".to_string());
+            }
+            let reason = failure.unwrap_or_else(|| "account upload failed".to_string());
+            let discard_argv = vec![
+                "/bin/sh".to_string(),
+                "-c".to_string(),
+                account_discard_script(&upload.stage_root),
+            ];
+            let reason = match tokio::time::timeout(
                 AGENT_CONFIG_UPLOAD_TIMEOUT,
-                write_preserving_mode(provider, id, dest, data, *exec),
+                provider.run_exec(id, &discard_argv, None, &[]),
             )
-            .await;
+            .await
+            {
+                Ok(Ok((0, _))) => reason,
+                Ok(Ok((code, output))) => {
+                    format!("{reason}; stage cleanup exited {code}: {output}")
+                }
+                Ok(Err(error)) => format!("{reason}; stage cleanup failed: {error}"),
+                Err(_) => format!("{reason}; stage cleanup timed out"),
+            };
+            tracing::warn!(target: "thegn::startup", provider = %upload.provider_id, account = %identity, reason = %reason, "account home not published; previous generation kept");
         }
         Ok::<(), anyhow::Error>(())
     });
+    if let Err(error) = result {
+        for upload in &uploads {
+            let identity = upload.dest_root.rsplit('/').next().unwrap_or("unknown");
+            let discard_argv = vec![
+                "/bin/sh".to_string(),
+                "-c".to_string(),
+                account_discard_script(&upload.stage_root),
+            ];
+            let reason = match block_on_provider(|| async {
+                match tokio::time::timeout(
+                    AGENT_CONFIG_UPLOAD_TIMEOUT,
+                    provider.run_exec(id, &discard_argv, None, &[]),
+                )
+                .await
+                {
+                    Ok(result) => result,
+                    Err(_) => Err(anyhow::anyhow!("stage cleanup timed out")),
+                }
+            }) {
+                Ok((0, _)) => error.to_string(),
+                Ok((code, output)) => format!("{error}; stage cleanup exited {code}: {output}"),
+                Err(cleanup_error) => format!("{error}; stage cleanup failed: {cleanup_error}"),
+            };
+            tracing::warn!(target: "thegn::startup", provider = %upload.provider_id, account = %identity, reason = %reason, "account home not published; previous generation kept");
+        }
+    }
 }
 
 /// The `export <HOME_ENV>="$HOME/.thegn/accounts/<provider>/<slug>"; …` prefix to
@@ -1058,6 +1230,110 @@ mod tests {
         assert!(
             pi_crit.len() <= 5,
             "pi auth-critical should be small: {pi_crit:?}"
+        );
+    }
+
+    #[test]
+    fn account_publish_script_moves_aside_before_promoting() {
+        let dest = "/root/.thegn/accounts/claude/work a";
+        let stage = "/root/.thegn/accounts/claude/.work-a.thegn-stage-0123456789abcdef";
+        let script = account_publish_script(dest, stage);
+        assert!(script.contains(&format!("d={};", thegn_core::util::sh_quote(dest))));
+        assert!(script.contains(&format!("s={};", thegn_core::util::sh_quote(stage))));
+        let aside = script.find("mv -- \"$d\" \"$o\"").unwrap();
+        let promote = script.find("mv -- \"$s\" \"$d\"").unwrap();
+        let remove_old = script.find("rm -rf -- \"$o\"").unwrap();
+        assert!(
+            aside < promote && promote < remove_old,
+            "publish script order: {script}"
+        );
+        assert!(
+            script.contains("mv -- \"$o\" \"$d\""),
+            "failed promotion restores the old home"
+        );
+        assert!(
+            !script.contains(&format!("d={dest};")),
+            "path with a space must be shell quoted"
+        );
+        assert!(
+            !script.contains(&format!("s={stage};")),
+            "stage path must be shell quoted"
+        );
+    }
+
+    #[test]
+    fn account_upload_ready_rejects_failed_or_skipped_files() {
+        assert!(account_upload_ready(2, 2, false, true));
+        assert!(!account_upload_ready(2, 1, false, true));
+        assert!(!account_upload_ready(2, 2, true, true));
+        assert!(!account_upload_ready(2, 2, false, false));
+    }
+
+    #[test]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "test drives the publish script in a real shell"
+    )]
+    fn account_publish_script_runs_in_a_real_shell() {
+        if !std::path::Path::new("/bin/sh").exists() {
+            return;
+        }
+        let root = tempfile::tempdir().unwrap();
+        let home = root.path().join("home");
+        let stage = root.path().join(".home.thegn-stage-test");
+        std::fs::create_dir(&home).unwrap();
+        std::fs::create_dir(&stage).unwrap();
+        std::fs::write(home.join("old.txt"), b"old").unwrap();
+        std::fs::write(stage.join("new.txt"), b"new").unwrap();
+
+        let home = home.to_string_lossy().into_owned();
+        let stage = stage.to_string_lossy().into_owned();
+        let script = account_publish_script(&home, &stage);
+        let status = std::process::Command::new("/bin/sh")
+            .args(["-c", &script])
+            .status()
+            .unwrap();
+        assert!(status.success());
+        assert!(std::path::Path::new(&home).join("new.txt").exists());
+        assert!(!std::path::Path::new(&home).join("old.txt").exists());
+        assert!(!std::path::Path::new(&stage).exists());
+        assert!(std::fs::read_dir(root.path()).unwrap().all(|entry| {
+            !entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .starts_with("home.thegn-old-")
+        }));
+
+        let missing_stage = root
+            .path()
+            .join(".missing-stage")
+            .to_string_lossy()
+            .into_owned();
+        std::fs::write(std::path::Path::new(&home).join("old.txt"), b"old").unwrap();
+        let missing_script = account_publish_script(&home, &missing_stage);
+        let missing_status = std::process::Command::new("/bin/sh")
+            .args(["-c", &missing_script])
+            .status()
+            .unwrap();
+        assert!(!missing_status.success());
+        assert!(std::path::Path::new(&home).join("old.txt").exists());
+    }
+
+    #[test]
+    fn account_stage_root_is_a_hidden_sibling() {
+        let parent = "/root/.thegn/accounts/claude";
+        let dest = format!("{parent}/work-a");
+        let stage = account_stage_root(parent, "work-a", "0123456789abcdef");
+        assert_eq!(
+            std::path::Path::new(&stage).parent(),
+            std::path::Path::new(&dest).parent()
+        );
+        assert!(
+            std::path::Path::new(&stage)
+                .file_name()
+                .and_then(std::ffi::OsStr::to_str)
+                .is_some_and(|name| name.starts_with(".work-a.thegn-stage-"))
         );
     }
 }
