@@ -3307,7 +3307,7 @@ pub(crate) fn build_panel(
     // would fall back to A's branch + ahead/behind).
     let (branch, ahead_behind, merge_info) =
         crate::panel_header_cache::merge_header(&cache_key, branch, ahead_behind, merge_info);
-    let lists = crate::panel_header_cache::merge_lists(&cache_key, status, log, incoming_set);
+    let lists = crate::panel_header_cache::merge_lists(&cache_key, status, log, incoming);
     let mut panel = crate::panel::PanelData {
         branch,
         ..Default::default()

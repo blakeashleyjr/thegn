@@ -571,6 +571,19 @@ mod tests {
     use crate::panel::docs::GitDocs;
     use crate::panel::{PanelUi, Section};
 
+    fn flatten(rows: &[PanelRow]) -> String {
+        rows.iter()
+            .map(|row| match &row.line {
+                Line::Blank | Line::Fill { .. } => String::new(),
+                Line::Segs(segs) => segs.iter().map(|seg| seg.text.as_str()).collect(),
+                Line::Split { l, r } | Line::SplitMinLeft { l, r, .. } => {
+                    l.iter().chain(r).map(|seg| seg.text.as_str()).collect()
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
     fn render_velocity(docs: GitDocs) -> String {
         let model = FrameModel::default();
         let mut ui = PanelUi {
@@ -585,17 +598,7 @@ mod tests {
             cols: 75,
             rows: 32,
         };
-        log_issues_velocity(&ctx)
-            .iter()
-            .map(|row| match &row.line {
-                Line::Blank | Line::Fill { .. } => String::new(),
-                Line::Segs(segs) => segs.iter().map(|seg| seg.text.as_str()).collect(),
-                Line::Split { l, r } | Line::SplitMinLeft { l, r, .. } => {
-                    l.iter().chain(r).map(|seg| seg.text.as_str()).collect()
-                }
-            })
-            .collect::<Vec<_>>()
-            .join("\n")
+        flatten(&log_issues_velocity(&ctx))
     }
 
     #[test]
@@ -624,17 +627,7 @@ mod tests {
             cols: 75,
             rows: 32,
         };
-        let rendered = log_issues_velocity(&ctx)
-            .iter()
-            .map(|row| match &row.line {
-                Line::Blank | Line::Fill { .. } => String::new(),
-                Line::Segs(segs) => segs.iter().map(|seg| seg.text.as_str()).collect(),
-                Line::Split { l, r } | Line::SplitMinLeft { l, r, .. } => {
-                    l.iter().chain(r).map(|seg| seg.text.as_str()).collect()
-                }
-            })
-            .collect::<Vec<_>>()
-            .join("\n");
+        let rendered = flatten(&log_issues_velocity(&ctx));
 
         assert!(rendered.contains("LOG"), "rendered: {rendered}");
         assert!(rendered.contains("log unavailable"), "rendered: {rendered}");
