@@ -202,7 +202,12 @@ fn promote_command(staging: &str, dir: &str) -> String {
          if [ -e \"$d\" ] || [ -L \"$d\" ] || [ -L \"$s\" ] || [ ! -d \"$s\" ]; then \
               printf '%s' 'remote destination appeared during sync; staging retained for reconciliation' >&2; exit 1; \
          fi; \
-         mv -- \"$s\" \"$d\"",
+         n=$(basename \"$s\"); \
+         mv -- \"$s\" \"$d\"; \
+         if [ -e \"$d/$n\" ] || [ -L \"$d/$n\" ]; then \
+              if mv -- \"$d/$n\" \"$s\"; then rmdir \"$d\" 2>/dev/null || :; fi; \
+              printf '%s' 'remote destination appeared during sync; staging retained for reconciliation' >&2; exit 1; \
+         fi",
         s = q(staging),
         d = q(dir),
     )
@@ -729,6 +734,39 @@ mod tests {
                 .as_slice(),
             b"keep"
         );
+        assert!(String::from_utf8_lossy(&result.stderr).contains(
+            "remote destination appeared during sync; staging retained for reconciliation"
+        ));
+        std::fs::remove_dir_all(home).unwrap();
+    }
+
+    #[test]
+    fn promote_detects_destination_created_before_move() {
+        let home = temp_home("promote-race");
+        let staging = home.join("thegn-worktrees/fresh.thegn-staging");
+        let destination = home.join("thegn-worktrees/fresh");
+        std::fs::create_dir_all(&staging).unwrap();
+        std::fs::write(staging.join("payload"), b"staged").unwrap();
+        let command = format!(
+            "mv() {{ mkdir -p {}; printf 'concurrent' > {}/concurrent; command mv \"$@\"; }}; {}",
+            destination.display(),
+            destination.display(),
+            promote_command(staging.to_str().unwrap(), destination.to_str().unwrap()),
+        );
+
+        let result = run_sh(&home, &command);
+        assert!(!result.status.success());
+        assert_eq!(
+            std::fs::read(staging.join("payload")).unwrap().as_slice(),
+            b"staged"
+        );
+        assert_eq!(
+            std::fs::read(destination.join("concurrent"))
+                .unwrap()
+                .as_slice(),
+            b"concurrent"
+        );
+        assert!(!destination.join("fresh.thegn-staging").exists());
         assert!(String::from_utf8_lossy(&result.stderr).contains(
             "remote destination appeared during sync; staging retained for reconciliation"
         ));
