@@ -175,7 +175,7 @@ SHA-256 into `~/.local/share/fonts/thegn-nerd-fonts`, and creates a writable
 `~/.config/thegn/alacritty.toml` only when absent. `thegn doctor` reports its
 terminal, font, config, and launcher components. This mode has no clean-host
 rehearsal evidence yet. The batteries scope otherwise deliberately stops here:
-distro package-manager mutation, Homebrew cask,
+there is no distro package-manager mutation, Homebrew cask,
 downloadable unsigned macOS app, Windows Terminal profile, or
 Flatpak/AppImage/nix-bundle. Each needs its relevant host, signing, or driver
 rehearsal before it becomes an install instruction.

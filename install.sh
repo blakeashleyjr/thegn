@@ -125,6 +125,9 @@ if ((batteries)); then
     batteries_terminal_source=host
     batteries_terminal="$(command -v alacritty)"
     [[ $batteries_terminal == /* ]] || batteries_terminal="$PWD/$batteries_terminal"
+    if [[ $batteries_terminal == /nix/store/* ]]; then
+      echo "install.sh: warning: host Alacritty is in /nix/store and may disappear after garbage collection: $batteries_terminal" >&2
+    fi
   else
     batteries_terminal_source=user-local
     batteries_terminal="$batteries_root/bin/alacritty"
@@ -244,6 +247,11 @@ preflight() {
     check_file_shape "$batteries_marker"
     if [[ $batteries_terminal_source == user-local ]]; then
       local missing=()
+      command -v tar >/dev/null 2>&1 || missing+=(tar)
+      command -v xz >/dev/null 2>&1 || missing+=(xz)
+      if [[ -z ${THEGN_INSTALL_BATTERIES_FONT_SRC-} ]]; then
+        command -v curl >/dev/null 2>&1 || missing+=(curl)
+      fi
       command -v cmake >/dev/null 2>&1 || missing+=(cmake)
       command -v pkg-config >/dev/null 2>&1 || missing+=(pkg-config)
       if command -v pkg-config >/dev/null 2>&1 && ! pkg-config --exists fontconfig freetype2 xkbcommon; then
@@ -266,7 +274,11 @@ if ((dry_run)); then
   echo "dry-run: preflight passed; no files will be changed"
   echo "$bindir/thegn <- copy of $release_bin"
   echo "$bindir/tg-tui wrapper -> $bindir/thegn (current terminal)"
-  echo "$bindir/tg wrapper -> $tg_tui (current terminal); tg -s|--standalone -> alacritty --config-file $alacritty_config -e $tg_tui"
+  if ((batteries)); then
+    echo "$bindir/tg wrapper -> $tg_tui (current terminal); tg -s|--standalone -> $batteries_terminal --config-file $batteries_config -e $tg_tui"
+  else
+    echo "$bindir/tg wrapper -> $tg_tui (current terminal); tg -s|--standalone -> alacritty --config-file $alacritty_config -e $tg_tui"
+  fi
   if ((batteries)); then
     echo "batteries terminal ($batteries_terminal_source): $batteries_terminal"
     if [[ $batteries_terminal_source == user-local ]]; then
@@ -518,8 +530,9 @@ if [[ \${1-} == -s || \${1-} == --standalone ]]; then
 EOF
 if ((batteries)); then
   cat >>"$tg_tmp" <<EOF
-  if [[ ! -x $resolved_alacritty ]]; then
-    echo "tg: batteries Alacritty not found at $resolved_alacritty; rerun ./install.sh --batteries." >&2
+  resolved_alacritty=$resolved_alacritty_q
+  if [[ ! -x "\$resolved_alacritty" ]]; then
+    echo "tg: batteries Alacritty not found at \$resolved_alacritty; rerun ./install.sh --batteries." >&2
     exit 127
   fi
   exec $resolved_alacritty_q --config-file $alacritty_config_q -e $tg_tui_q "\$@"
@@ -580,12 +593,14 @@ if ((batteries)); then
     echo "install.sh: verified font archive contains no regular top-level .ttf files" >&2
     exit 1
   fi
+  batteries_config_created=0
   if [[ ! -e $batteries_config && ! -L $batteries_config ]]; then
     stage_file "$batteries_config" 0644
     batteries_config_tmp="$staged_path"
     cp "$here/config/alacritty.toml" "$batteries_config_tmp"
     chmod 0644 "$batteries_config_tmp"
     commit_file "$batteries_config_tmp" "$batteries_config"
+    batteries_config_created=1
     maybe_inject_failure batteries-config
   fi
   stage_file "$batteries_marker" 0644
@@ -702,12 +717,15 @@ manifest_tmp="$staged_path"
     printf '%s\t%s\n' "$(sha256 "$artifact")" "$artifact_absolute"
   done
   if ((batteries)); then
-    for artifact in "$batteries_marker" "$batteries_config" "$batteries_font_dir"/*.ttf; do
+    for artifact in "$batteries_marker" "$batteries_font_dir"/*.ttf; do
       [[ -f $artifact ]] || continue
       artifact_absolute="$artifact"
       [[ $artifact_absolute == /* ]] || artifact_absolute="$PWD/$artifact_absolute"
       printf '%s\t%s\n' "$(sha256 "$artifact")" "$artifact_absolute"
     done
+    if ((batteries_config_created)); then
+      printf '%s\t%s\n' "$(sha256 "$batteries_config")" "$batteries_config"
+    fi
     if [[ $batteries_terminal_source == user-local && -x $batteries_terminal ]]; then
       printf '%s\t%s\n' "$(sha256 "$batteries_terminal")" "$batteries_terminal"
     fi

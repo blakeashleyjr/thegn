@@ -74,9 +74,9 @@ fn find_on_path(name: &str) -> Option<PathBuf> {
 }
 
 fn is_executable(path: &Path) -> bool {
-    // The doctor stays process-free; PATH candidates and marker paths are
-    // checked for a regular file without probing by launching them.
-    path.is_file()
+    path.metadata().is_ok_and(|metadata| {
+        path.is_file() && crate::platform::gate_path::executable_bit(&metadata) != Some(false)
+    })
 }
 
 fn inspect_with(env: &BatteriesEnv) -> BatteriesReport {
@@ -171,12 +171,28 @@ fn inspect_with(env: &BatteriesEnv) -> BatteriesReport {
         .clone()
         .or_else(|| marker.get("alacritty_config").map(PathBuf::from))
         .unwrap_or_else(|| env.config_home.join("thegn/alacritty.toml"));
-    let config = if config_path.is_file() && writable_without_writing(&config_path) {
+    let config = if config_path.is_file() {
+        if writable_without_writing(&config_path) {
+            component(
+                "alacritty_config",
+                ComponentState::Present,
+                format!("writable {}", config_path.display()),
+                None,
+            )
+        } else {
+            component(
+                "alacritty_config",
+                ComponentState::Missing,
+                format!("{} is not writable", config_path.display()),
+                remediation.clone(),
+            )
+        }
+    } else if config_path.exists() {
         component(
             "alacritty_config",
-            ComponentState::Present,
-            format!("writable {}", config_path.display()),
-            None,
+            ComponentState::Missing,
+            format!("{} is not a regular file", config_path.display()),
+            remediation.clone(),
         )
     } else {
         absent_component(
@@ -259,7 +275,7 @@ fn read_marker(path: &Path) -> (BTreeMap<String, String>, Option<String>) {
                 Some("batteries marker is malformed".to_string()),
             );
         };
-        if key.is_empty() || value.contains('\n') {
+        if key.is_empty() {
             return (
                 BTreeMap::new(),
                 Some("batteries marker is malformed".to_string()),
@@ -268,13 +284,12 @@ fn read_marker(path: &Path) -> (BTreeMap<String, String>, Option<String>) {
         if matches!(
             key,
             "version" | "alacritty" | "font_dir" | "alacritty_config"
-        ) {
-            if values.insert(key.to_string(), value.to_string()).is_some() {
-                return (
-                    BTreeMap::new(),
-                    Some("batteries marker is malformed".to_string()),
-                );
-            }
+        ) && values.insert(key.to_string(), value.to_string()).is_some()
+        {
+            return (
+                BTreeMap::new(),
+                Some("batteries marker is malformed".to_string()),
+            );
         }
     }
     if values.get("version").map(String::as_str) != Some("1")
@@ -335,7 +350,13 @@ fn absent_component(
 }
 
 pub fn print(report: &BatteriesReport) {
-    thegn_core::outln!("Batteries (terminal, font, config, launcher)");
+    for line in lines(report) {
+        thegn_core::outln!("{line}");
+    }
+}
+
+fn lines(report: &BatteriesReport) -> Vec<String> {
+    let mut lines = vec!["Batteries (terminal, font, config, launcher)".to_string()];
     for item in [
         &report.terminal,
         &report.font,
@@ -353,11 +374,12 @@ pub fn print(report: &BatteriesReport) {
         } else {
             item.name.as_str()
         };
-        thegn_core::outln!("  {label}  {state} — {}", item.detail);
+        lines.push(format!("  {label}  {state} — {}", item.detail));
         if let Some(fix) = &item.remediation {
-            thegn_core::outln!("    fix: {fix}");
+            lines.push(format!("    fix: {fix}"));
         }
     }
+    lines
 }
 
 pub fn json(report: &BatteriesReport) -> serde_json::Value {
@@ -366,7 +388,7 @@ pub fn json(report: &BatteriesReport) -> serde_json::Value {
 
 #[cfg(test)]
 mod tests {
-    use super::{BatteriesEnv, ComponentState, inspect_with};
+    use super::{BatteriesEnv, ComponentState, inspect_with, lines};
     use std::fs;
 
     fn env(root: &std::path::Path) -> BatteriesEnv {
@@ -423,8 +445,7 @@ mod tests {
     fn marker_with_missing_font_dir_reports_font_missing() {
         let root = tempfile::tempdir().expect("tempdir");
         let fixture = env(root.path());
-        let bin = root.path().join("alacritty");
-        write_executable(&bin);
+        let bin = std::env::current_exe().expect("test executable path");
         let config = root.path().join("alacritty.toml");
         fs::write(&config, "font = {}\n").expect("write config");
         marker(&fixture, &bin, &root.path().join("missing-fonts"), &config);
@@ -438,8 +459,7 @@ mod tests {
     fn marker_with_ttf_reports_font_present() {
         let root = tempfile::tempdir().expect("tempdir");
         let fixture = env(root.path());
-        let bin = root.path().join("alacritty");
-        write_executable(&bin);
+        let bin = std::env::current_exe().expect("test executable path");
         let fonts = root.path().join("fonts");
         fs::create_dir_all(&fonts).expect("create fonts");
         fs::write(fonts.join("FiraCode.ttf"), "font").expect("write font");
@@ -469,11 +489,90 @@ mod tests {
         let mut updated = fixture.clone();
         updated.alacritty_config_env = Some(config.clone());
         if super::writable_without_writing(&config) {
+            thegn_core::outln!("read-only fixture remains writable; skipping permission assertion");
             return;
         }
         let item = inspect_with(&updated).alacritty_config;
         assert_eq!(item.state, ComponentState::Missing);
+        assert_eq!(item.detail, format!("{} is not writable", config.display()));
         assert!(item.remediation.is_some());
+    }
+
+    #[test]
+    fn report_lines_include_missing_components_and_remediation_only_for_actionable_states() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let fixture = env(root.path());
+        let bin = std::env::current_exe().expect("test executable path");
+        let config = root.path().join("alacritty.toml");
+        fs::write(&config, "config").expect("write config");
+        marker(&fixture, &bin, &root.path().join("fonts"), &config);
+        let report = inspect_with(&fixture);
+        let rendered = lines(&report);
+        assert!(rendered.contains(&format!(
+            "  terminal  present — Alacritty at {}",
+            bin.display()
+        )));
+        assert!(rendered.contains("  font  MISSING — FiraCode Nerd Font files not found"));
+        assert!(rendered.contains(&format!(
+            "  alacritty config  present — writable {}",
+            config.display()
+        )));
+        assert!(rendered.contains("  launcher  MISSING — tg launcher not found on PATH"));
+        assert_eq!(
+            rendered
+                .iter()
+                .filter(|line| line.starts_with("    fix: "))
+                .count(),
+            2
+        );
+        assert!(
+            rendered
+                .iter()
+                .all(|line| !line.starts_with("  color ") && !line.starts_with("  glyphs "))
+        );
+    }
+
+    #[test]
+    fn marker_present_report_prints_every_missing_component_and_its_fix() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let fixture = env(root.path());
+        marker(
+            &fixture,
+            &root.path().join("missing-alacritty"),
+            &root.path().join("missing-fonts"),
+            &root.path().join("missing-config"),
+        );
+        let rendered = lines(&inspect_with(&fixture));
+        assert!(
+            rendered.contains(&"  terminal  MISSING — Alacritty executable not found".to_string())
+        );
+        assert!(
+            rendered.contains(&"  font  MISSING — FiraCode Nerd Font files not found".to_string())
+        );
+        assert!(rendered.contains(
+            &"  alacritty config  MISSING — writable Alacritty config not found".to_string()
+        ));
+        assert!(
+            rendered.contains(&"  launcher  MISSING — tg launcher not found on PATH".to_string())
+        );
+        assert_eq!(
+            rendered
+                .iter()
+                .filter(|line| line.starts_with("    fix: "))
+                .count(),
+            4
+        );
+        assert!(
+            rendered
+                .iter()
+                .filter(|line| line.starts_with("    fix: "))
+                .all(|line| line == &format!("    fix: {}", super::REMEDIATION))
+        );
+        assert!(
+            rendered
+                .iter()
+                .all(|line| !line.starts_with("  color ") && !line.starts_with("  glyphs "))
+        );
     }
 
     #[test]
@@ -513,10 +612,5 @@ mod tests {
         for key in ["terminal", "font", "alacritty_config", "launcher"] {
             assert!(value.get(key).is_some());
         }
-    }
-
-    fn write_executable(path: &std::path::Path) {
-        fs::copy(std::env::current_exe().expect("test executable path"), path)
-            .expect("copy executable fixture");
     }
 }
