@@ -350,7 +350,8 @@ frontmatter, and conflict rules are detailed on [[skills]]. The generated
 ```sh
 thegn config show        # the effective merged config
 thegn config get ui.language          # any dotted key; --json for real types
-thegn config set merge_queue.regenerate_paths '["Cargo.lock", "pnpm-lock.yaml"]'
+thegn config set merge_queue.regenerate_paths '["**/Cargo.lock", "pnpm-lock.yaml"]'
+                          # **/<name>: that file in any directory; a bare name: the repo root only
 thegn config explain merge_queue.gate_command   # value + which layer set it
 thegn config validate    # strict validation; reserved provider kinds are
                           # reported by name, malformed repo-overlay sandbox
