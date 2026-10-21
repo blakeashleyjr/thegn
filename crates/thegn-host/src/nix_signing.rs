@@ -16,42 +16,45 @@ pub(crate) fn ensure_install_key() -> anyhow::Result<InstallKey> {
         .parent()
         .map(|parent| parent.join("nix-signing"))
         .context("config path has no parent for Nix signing key")?;
-    load_or_create_in(&dir, || generate_key())
+    load_or_create_in(&dir, generate_key, convert_secret_to_public)
 }
 
 fn load_or_create_in(
     dir: &Path,
     mut generator: impl FnMut() -> anyhow::Result<(String, String)>,
+    converter: impl Fn(&str) -> anyhow::Result<String>,
 ) -> anyhow::Result<InstallKey> {
     thegn_core::fsperm::ensure_private_dir(dir)
         .with_context(|| format!("prepare private Nix signing directory {}", dir.display()))?;
     let secret = dir.join("secret-key");
     let public = dir.join("public-key");
-    if secret.exists() && public.exists() {
+    if secret.exists() {
+        if public.exists() {
+            return load_pair(&secret, &public);
+        }
+        let key = load_secret(&secret)?;
+        let public_line = converter(&key)?;
+        validate_pair(&key, &public_line)?;
+        thegn_core::fsperm::write_owner_only_new(&public, public_line.as_bytes())
+            .with_context(|| format!("restore Nix signing public key {}", public.display()))?;
         return load_pair(&secret, &public);
+    }
+    if public.exists() {
+        // A prior attempt may have stopped after publishing the public key.
+        // Validate it without following links, then replace it with the pair
+        // produced below. The directory is private and owner-validated above.
+        let _existing_public = load_public(&public)?;
+        std::fs::remove_file(&public).with_context(|| {
+            format!(
+                "remove incomplete Nix signing public key {}",
+                public.display()
+            )
+        })?;
     }
 
     let (secret_line, public_line) = generator()?;
-    if parse_public_key(&secret_line).is_none() {
-        return Err(anyhow!("Nix generated a malformed secret signing key"));
-    }
-    if parse_public_key(&public_line).is_none() {
-        return Err(anyhow!("Nix generated a malformed public signing key"));
-    }
-    if key_name(&secret_line) != key_name(&public_line) {
-        return Err(anyhow!("Nix generated signing keys with different names"));
-    }
+    validate_pair(&secret_line, &public_line)?;
 
-    match thegn_core::fsperm::write_owner_only_new(&secret, secret_line.as_bytes()) {
-        Ok(()) => {}
-        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-            return load_pair(&secret, &public);
-        }
-        Err(error) => {
-            return Err(error)
-                .with_context(|| format!("write Nix signing secret {}", secret.display()));
-        }
-    }
     match thegn_core::fsperm::write_owner_only_new(&public, public_line.as_bytes()) {
         Ok(()) => {}
         Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
@@ -62,10 +65,57 @@ fn load_or_create_in(
                 .with_context(|| format!("write Nix signing public key {}", public.display()));
         }
     }
+    write_secret_atomic(&secret, secret_line.as_bytes())?;
     load_pair(&secret, &public)
 }
 
-fn load_pair(secret: &Path, public: &Path) -> anyhow::Result<InstallKey> {
+fn write_secret_atomic(secret: &Path, contents: &[u8]) -> anyhow::Result<()> {
+    let mut random = [0_u8; 8];
+    getrandom::fill(&mut random).context("generate temporary Nix signing key name")?;
+    let suffix = random
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    let temporary =
+        secret.with_file_name(format!("secret-key.tmp-{}-{suffix}", std::process::id()));
+    let mut file =
+        thegn_core::fsperm::create_owner_only_exclusive(&temporary).with_context(|| {
+            format!(
+                "create temporary Nix signing secret {}",
+                temporary.display()
+            )
+        })?;
+    if let Err(error) =
+        std::io::Write::write_all(&mut file, contents).and_then(|()| file.sync_all())
+    {
+        std::fs::remove_file(&temporary).with_context(|| {
+            format!(
+                "remove incomplete temporary Nix signing secret {}",
+                temporary.display()
+            )
+        })?;
+        return Err(error).with_context(|| {
+            format!("write temporary Nix signing secret {}", temporary.display())
+        });
+    }
+    std::fs::rename(&temporary, secret)
+        .with_context(|| format!("atomically install Nix signing secret {}", secret.display()))
+}
+
+fn validate_pair(secret: &str, public: &str) -> anyhow::Result<()> {
+    if parse_public_key(secret).is_none() {
+        return Err(anyhow!("Nix generated a malformed secret signing key"));
+    }
+    if parse_public_key(public).is_none() {
+        return Err(anyhow!("Nix generated a malformed public signing key"));
+    }
+    if key_name(secret) != key_name(public) {
+        return Err(anyhow!("Nix generated signing keys with different names"));
+    }
+    Ok(())
+}
+
+fn load_secret(secret: &Path) -> anyhow::Result<String> {
     let mut file = thegn_core::fsperm::open_regular_file_nofollow(secret)
         .with_context(|| format!("open Nix signing secret {}", secret.display()))?;
     let metadata = file.metadata()?;
@@ -85,23 +135,32 @@ fn load_pair(secret: &Path, public: &Path) -> anyhow::Result<InstallKey> {
     if parse_public_key(secret_line).is_none() {
         return Err(anyhow!("Nix signing secret has an invalid key line"));
     }
+    Ok(secret_line.to_string())
+}
 
-    let mut public_file = thegn_core::fsperm::open_regular_file_nofollow(public)
+fn load_public(public: &Path) -> anyhow::Result<String> {
+    let mut file = thegn_core::fsperm::open_regular_file_nofollow(public)
         .with_context(|| format!("open Nix signing public key {}", public.display()))?;
     let mut public_line = String::new();
-    public_file.read_to_string(&mut public_line)?;
+    file.read_to_string(&mut public_line)?;
     let public_line = public_line.trim_end_matches(|character| matches!(character, '\r' | '\n'));
     if parse_public_key(public_line).is_none() {
         return Err(anyhow!("Nix signing public key has an invalid key line"));
     }
-    if key_name(secret_line) != key_name(public_line) {
+    Ok(public_line.to_string())
+}
+
+fn load_pair(secret: &Path, public: &Path) -> anyhow::Result<InstallKey> {
+    let secret_line = load_secret(secret)?;
+    let public_line = load_public(public)?;
+    if key_name(&secret_line) != key_name(&public_line) {
         return Err(anyhow!(
             "Nix signing secret and public keys do not share a key name"
         ));
     }
     Ok(InstallKey {
         secret: secret.to_path_buf(),
-        public: public_line.to_string(),
+        public: public_line,
     })
 }
 
@@ -331,7 +390,12 @@ mod tests {
         let state = thegn_core::testenv::IsolatedState::new();
         let dir = state.root().join("keys");
         write_pair(&dir);
-        let actual = load_or_create_in(&dir, || panic!("existing key must be reused")).unwrap();
+        let actual = load_or_create_in(
+            &dir,
+            || panic!("existing key must be reused"),
+            |_| panic!("existing public key must be reused"),
+        )
+        .unwrap();
         assert_eq!(actual.secret, dir.join("secret-key"));
         assert_eq!(actual.public, PUBLIC);
     }
@@ -360,7 +424,14 @@ mod tests {
                 assert!(status.success());
             }
             make_symlink(&target, &secret);
-            assert!(load_or_create_in(&dir, || Ok((SECRET.into(), PUBLIC.into()))).is_err());
+            assert!(
+                load_or_create_in(
+                    &dir,
+                    || Ok((SECRET.into(), PUBLIC.into())),
+                    |_| Ok(PUBLIC.into()),
+                )
+                .is_err()
+            );
         }
     }
 
@@ -384,7 +455,14 @@ mod tests {
                 assert!(status.success());
             }
             chmod_group_readable(&secret);
-            assert!(load_or_create_in(&dir, || Ok((SECRET.into(), PUBLIC.into()))).is_err());
+            assert!(
+                load_or_create_in(
+                    &dir,
+                    || Ok((SECRET.into(), PUBLIC.into())),
+                    |_| Ok(PUBLIC.into()),
+                )
+                .is_err()
+            );
         }
     }
 
@@ -393,18 +471,49 @@ mod tests {
         let state = thegn_core::testenv::IsolatedState::new();
         let dir = state.root().join("keys");
         let mut calls = 0;
-        let first = load_or_create_in(&dir, || {
-            calls += 1;
-            Ok((SECRET.into(), PUBLIC.into()))
-        })
+        let first = load_or_create_in(
+            &dir,
+            || {
+                calls += 1;
+                Ok((SECRET.into(), PUBLIC.into()))
+            },
+            |_| Ok(PUBLIC.into()),
+        )
         .unwrap();
-        let second = load_or_create_in(&dir, || {
-            calls += 1;
-            Ok((SECRET.into(), PUBLIC.into()))
-        })
+        let second = load_or_create_in(
+            &dir,
+            || {
+                calls += 1;
+                Ok((SECRET.into(), PUBLIC.into()))
+            },
+            |_| Ok(PUBLIC.into()),
+        )
         .unwrap();
         assert_eq!(calls, 1);
         assert_eq!(first.secret, second.secret);
         assert_eq!(first.public, second.public);
+    }
+
+    #[test]
+    fn missing_public_key_is_rederived_or_named() {
+        let state = thegn_core::testenv::IsolatedState::new();
+        let dir = state.root().join("keys");
+        private_dir(&dir);
+        thegn_core::fsperm::write_owner_only_new(&dir.join("secret-key"), SECRET.as_bytes())
+            .unwrap();
+        let actual = load_or_create_in(
+            &dir,
+            || panic!("a valid existing secret must not be regenerated"),
+            |secret| {
+                assert_eq!(secret, SECRET);
+                Ok(PUBLIC.into())
+            },
+        )
+        .unwrap();
+        assert_eq!(actual.public, PUBLIC);
+        assert_eq!(
+            std::fs::read_to_string(dir.join("public-key")).unwrap(),
+            PUBLIC
+        );
     }
 }

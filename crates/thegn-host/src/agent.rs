@@ -2662,34 +2662,17 @@ pub fn provision_provider_env_named(
                 // skip the push rather than import unsigned paths.
                 match sprite_ssh_connect(cfg, worktree) {
                     Some((key, user, _workdir)) => {
-                        let attempt = (|| -> anyhow::Result<()> {
-                            let signing_key = crate::nix_signing::ensure_install_key()?;
-                            let trust_argv = [
-                                "sh".to_string(),
-                                "-c".to_string(),
-                                crate::nix_signing::trust_script(&signing_key.public),
-                            ];
-                            match block_on_provider(|| async {
-                                provider.run_exec(&id, &trust_argv, None, &[]).await
-                            }) {
-                                Ok((0, _)) => {}
-                                Ok((code, output)) => {
-                                    return Err(anyhow::anyhow!(
-                                        "could not install the Nix signing trust key (exit {code}): {output}"
-                                    ));
-                                }
-                                Err(error) => {
-                                    return Err(anyhow::anyhow!(
-                                        "could not install the Nix signing trust key: {error}"
-                                    ));
-                                }
-                            }
-                            let exe = thegn_core::util::self_exe_str();
-                            push_home_closure_p2p(&exe, worktree, &key, &signing_key, &user, roots)
-                        })();
-                        if let Err(error) = attempt {
+                        if let Err(error) =
+                            signed_home_closure_push(&provider, &id, worktree, &key, &user, roots)
+                        {
+                            let error = format!("{error:#}");
+                            let hint = if error.starts_with("copy:") {
+                                "; ensure the sandbox was (re)created with connect=ssh"
+                            } else {
+                                ""
+                            };
                             thegn_core::msg::warn(&format!(
-                                "host-parity p2p: signed closure push skipped: {error}"
+                                "host-parity p2p: {error}; skipping the closure push{hint}"
                             ));
                         }
                         Ok(())
@@ -2955,7 +2938,6 @@ fn push_home_closure_p2p(
     thegn_exe: &str,
     worktree: &str,
     ssh_key: &Path,
-    signing_key: &crate::nix_signing::InstallKey,
     user: &str,
     roots: &[String],
 ) -> anyhow::Result<()> {
@@ -2980,20 +2962,6 @@ fn push_home_closure_p2p(
         thegn_core::util::sh_quote(&ssh_key.to_string_lossy()),
         SPRITE_SSHD_PORT,
     );
-    let sign_argv = crate::nix_signing::sign_argv(&signing_key.secret, roots);
-    let sign = std::process::Command::new(timeout_bin()?)
-        .arg("--kill-after=5")
-        .arg(HOME_CLOSURE_PUSH_TIMEOUT_SECS.to_string())
-        .arg("nix")
-        .args(&sign_argv)
-        .output()
-        .map_err(|error| anyhow::anyhow!("spawn `nix store sign` (p2p): {error}"))?;
-    if !sign.status.success() {
-        let stderr = tail_lines(&String::from_utf8_lossy(&sign.stderr), 6);
-        return Err(anyhow::anyhow!(
-            "nix store sign (p2p) failed: {stderr}; the host user must be a Nix trusted user to sign store paths, so the closure push is skipped"
-        ));
-    }
     let argv = nix_copy_p2p_argv(user, roots);
     // HARD timeout: this is a blocking host-side call on the provisioning path. If
     // the sandbox sshd isn't reachable yet (fresh sprite) or the closure is huge,
@@ -3025,6 +2993,66 @@ fn push_home_closure_p2p(
         )
     };
     Err(anyhow::anyhow!("nix copy (p2p) {why}"))
+}
+
+fn signed_home_closure_push(
+    provider: &thegn_svc::provider::Provider,
+    id: &str,
+    worktree: &str,
+    ssh_key: &Path,
+    user: &str,
+    roots: &[String],
+) -> anyhow::Result<()> {
+    let signing_key = crate::nix_signing::ensure_install_key()
+        .map_err(|error| anyhow::anyhow!("no installation signing key: {error:#}"))?;
+    let trust_argv = [
+        "sh".to_string(),
+        "-c".to_string(),
+        crate::nix_signing::trust_script(&signing_key.public),
+    ];
+    match block_on_provider(|| async { provider.run_exec(id, &trust_argv, None, &[]).await }) {
+        Ok((0, _)) => {}
+        Ok((code, output)) => {
+            return Err(anyhow::anyhow!(
+                "trust: could not install the Nix signing trust key (exit {code}): {output}"
+            ));
+        }
+        Err(error) => {
+            return Err(anyhow::anyhow!(
+                "trust: could not install the Nix signing trust key: {error}"
+            ));
+        }
+    }
+    sign_home_closure_p2p(&signing_key, roots)
+        .map_err(|error| anyhow::anyhow!("sign: {error:#}"))?;
+    let exe = thegn_core::util::self_exe_str();
+    push_home_closure_p2p(&exe, worktree, ssh_key, user, roots)
+        .map_err(|error| anyhow::anyhow!("copy: {error:#}"))
+}
+
+#[expect(
+    clippy::disallowed_methods,
+    reason = "signing must wait for nix before copying"
+)]
+fn sign_home_closure_p2p(
+    signing_key: &crate::nix_signing::InstallKey,
+    roots: &[String],
+) -> anyhow::Result<()> {
+    let sign_argv = crate::nix_signing::sign_argv(&signing_key.secret, roots);
+    let sign = std::process::Command::new(timeout_bin()?)
+        .arg("--kill-after=5")
+        .arg(HOME_CLOSURE_PUSH_TIMEOUT_SECS.to_string())
+        .arg("nix")
+        .args(&sign_argv)
+        .output()
+        .map_err(|error| anyhow::anyhow!("spawn `nix store sign` (p2p): {error}"))?;
+    if !sign.status.success() {
+        let stderr = tail_lines(&String::from_utf8_lossy(&sign.stderr), 6);
+        return Err(anyhow::anyhow!(
+            "nix store sign (p2p) failed: {stderr}; the host user must be a Nix trusted user to sign store paths, so the closure push is skipped"
+        ));
+    }
+    Ok(())
 }
 
 /// Hard ceiling for the host-side p2p closure push, in seconds. Past this the
