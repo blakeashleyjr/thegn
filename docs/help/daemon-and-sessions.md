@@ -101,8 +101,9 @@ human, or PR open) arrive as `abandoned` with a `migrated while <status>: not
 resumed` note. Every row's artifact and chunk paths are dropped, so work is
 neither resumed nor re-dispatched under the target profile. Current layout groups/tabs are moved;
 named global layouts, caches, active transports, and whole-session focus are
-not. Opaque pane commands, scrollback, dispatch reports, and notes remain
-unchanged in the target but are omitted from human and JSON audit output.
+not. Opaque pane commands, scrollback, and dispatch reports remain unchanged
+in the target; notes remain unchanged apart from the migration prefix on parked
+rows. These values are omitted from human and JSON audit output.
 Credentials, tokens, identities, config overlays, accounts, pairings, and
 secrets never cross the profile boundary.
 
