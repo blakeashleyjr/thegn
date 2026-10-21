@@ -2,6 +2,7 @@
 
 use super::*;
 use std::os::unix::process::ExitStatusExt;
+use std::time::Instant;
 
 fn proc_run(
     end: thegn_proc::End,
@@ -326,14 +327,19 @@ fn cancel_flag_kills_run() {
 }
 
 #[test]
-fn reap_error_does_not_replace_an_existing_run_failure() {
-    let mut failure = Some(RunError::Timeout);
-    set_io_failure_if_missing(&mut failure, std::io::Error::other("wait failed"));
-    assert!(matches!(failure, Some(RunError::Timeout)));
+fn terminal_run_failure_takes_precedence_over_reap_failure() {
+    use thegn_proc::{End, GroupState, Leader};
 
-    let mut failure = None;
-    set_io_failure_if_missing(&mut failure, std::io::Error::other("wait failed"));
-    assert!(matches!(failure, Some(RunError::Io(message)) if message == "wait failed"));
+    assert!(matches!(
+        map_run(proc_run(
+            End::TimedOut,
+            Leader::ReapFailed(std::io::Error::other("wait failed")),
+            capture(b"", false, false),
+            capture(b"", false, false),
+            GroupState::Unknown,
+        )),
+        Err(RunError::Timeout)
+    ));
 }
 
 #[tokio::test]

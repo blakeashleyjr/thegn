@@ -164,6 +164,7 @@ fn detach(child: Child) -> Leader {
     }
 }
 
+#[cfg(test)]
 pub(super) fn run(cmd: &mut Command, limits: &Limits, cancel: &AtomicBool) -> Run {
     run_consuming(cmd, limits, cancel, &mut |_bytes: &[u8]| {})
 }
@@ -174,6 +175,7 @@ pub(super) fn run_consuming(
     cancel: &AtomicBool,
     consume: &mut dyn FnMut(&[u8]),
 ) -> Run {
+    // Without the Unix Guard, contain consumer panics until the child is drained and reaped.
     let mut panic_payload = None;
     let mut guarded_consume = |bytes: &[u8]| {
         if panic_payload.is_none()

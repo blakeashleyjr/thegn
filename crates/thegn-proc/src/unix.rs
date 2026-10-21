@@ -51,10 +51,12 @@ struct Pipes {
     err_open: bool,
 }
 
+type Consumer<'a> = &'a mut dyn FnMut(&[u8]);
+
 struct Accumulator<'a> {
     capture: Capture,
     stream: Stream,
-    sink: Option<&'a mut dyn FnMut(&[u8])>,
+    sink: Option<Consumer<'a>>,
 }
 
 impl Accumulator<'_> {
@@ -375,6 +377,7 @@ fn detach(child: &mut Child) -> Leader {
     }
 }
 
+#[cfg(test)]
 pub(super) fn run(cmd: &mut Command, limits: &Limits, cancel: &AtomicBool) -> Run {
     run_consuming(cmd, limits, cancel, &mut |_bytes: &[u8]| {})
 }
@@ -1076,7 +1079,7 @@ mod tests {
             stderr: Stream::Null,
             ..Limits::silent(Duration::from_secs(20))
         };
-        let (mut total, mut last) = (0_u64, Vec::new());
+        let (mut total, mut last, mut first_mismatch) = (0_u64, Vec::new(), None);
         let run = run_consuming(
             &mut command(&script),
             &limits,
@@ -1084,11 +1087,13 @@ mod tests {
             &mut |bytes: &[u8]| {
                 for &byte in bytes {
                     let expected = if total < 3_000_000 {
-                        if total.is_multiple_of(2) { b'x' } else { b'\n' }
+                        Some(if total.is_multiple_of(2) { b'x' } else { b'\n' })
                     } else {
-                        b"tail\n"[(total - 3_000_000) as usize]
+                        b"tail\n".get((total - 3_000_000) as usize).copied()
                     };
-                    assert_eq!(byte, expected);
+                    if expected != Some(byte) && first_mismatch.is_none() {
+                        first_mismatch = Some(total);
+                    }
                     total += 1;
                     if last.len() == 5 {
                         last.remove(0);
@@ -1098,6 +1103,7 @@ mod tests {
             },
         );
         assert!(run.success());
+        assert_eq!(first_mismatch, None, "first mismatched byte index");
         assert_eq!(total, 3_000_005);
         assert_eq!(last, b"tail\n");
         assert!(run.stdout.bytes.is_empty());
