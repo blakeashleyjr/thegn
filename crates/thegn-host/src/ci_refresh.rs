@@ -1787,19 +1787,11 @@ mod tests {
             Box::leak(Box::new(Mutex::new(CiRefreshCoordinator::default())));
         let idle: &'static Condvar = Box::leak(Box::new(Condvar::new()));
         let guard = begin_ci_mutation_in(lock, idle).expect("mutation admitted");
-        assert_eq!(
-            lock.lock().expect("local coordinator").mutations.len(),
-            1
-        );
+        assert_eq!(lock.lock().expect("local coordinator").mutations.len(), 1);
 
         drop(guard);
 
-        assert!(
-            lock.lock()
-                .expect("local coordinator")
-                .mutations
-                .is_empty()
-        );
+        assert!(lock.lock().expect("local coordinator").mutations.is_empty());
         cancel_coordinator_for_shutdown(&mut lock.lock().expect("local coordinator"));
         assert!(begin_ci_mutation_in(lock, idle).is_none());
     }
