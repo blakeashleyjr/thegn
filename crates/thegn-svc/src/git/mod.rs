@@ -239,10 +239,7 @@ pub fn parse_log_graph(out: &str) -> Result<Vec<LogRow>> {
     for (index, line) in out.lines().enumerate() {
         let row_number = index + 1;
         let Some((graph, rest)) = line.split_once('\u{1f}') else {
-            if !line
-                .chars()
-                .all(|ch| matches!(ch, '*' | '|' | '/' | '\\' | '_' | '-' | '.' | ' '))
-            {
+            if !line.chars().all(is_graph_char) {
                 anyhow::bail!("log graph row {row_number}: unexpected connector text");
             }
             rows.push(LogRow {
@@ -253,11 +250,7 @@ pub fn parse_log_graph(out: &str) -> Result<Vec<LogRow>> {
             });
             continue;
         };
-        if !graph.contains('*')
-            || !graph
-                .chars()
-                .all(|ch| matches!(ch, '*' | '|' | '/' | '\\' | '_' | '-' | '.' | ' '))
-        {
+        if !graph.contains('*') || !graph.chars().all(is_graph_char) {
             anyhow::bail!("log graph row {row_number}: invalid graph prefix");
         }
         let mut fields = rest.splitn(3, '\u{1f}');
@@ -284,6 +277,19 @@ pub fn parse_log_graph(out: &str) -> Result<Vec<LogRow>> {
         });
     }
     Ok(rows)
+}
+
+fn is_graph_char(ch: char) -> bool {
+    matches!(ch, '*' | '|' | '/' | '\\' | '_' | '-' | '.' | ' ')
+}
+
+fn log_graph_args(n: &str, local: bool) -> Vec<&str> {
+    let mut args = vec!["log", "--graph"];
+    if local {
+        args.extend(["--no-show-signature", "--color=never"]);
+    }
+    args.extend(["--format=%x1f%h%x1f%D%x1f%s", "-n", n]);
+    args
 }
 
 /// Parse unified-diff output (`git diff -U3 -- <path>`) into hunks, capping
@@ -476,10 +482,7 @@ pub trait GitBackend: thegn_core::seam::Probe + Send + Sync {
     /// The last `n` commits as graph rows (glyph prefix + sha/subject/refs).
     fn log_graph(&self, loc: &GitLoc, n: usize) -> Result<Vec<LogRow>> {
         let n = n.to_string();
-        let out = run(
-            loc,
-            &["log", "--graph", "--format=%x1f%h%x1f%D%x1f%s", "-n", &n],
-        )?;
+        let out = run(loc, &log_graph_args(&n, !loc.is_remote()))?;
         parse_log_graph(&out)
     }
 
@@ -4169,6 +4172,26 @@ mod tests {
     }
 
     #[test]
+    fn parse_log_graph_argv_disables_signature_and_color_output() {
+        assert_eq!(
+            log_graph_args("6", true),
+            vec![
+                "log",
+                "--graph",
+                "--no-show-signature",
+                "--color=never",
+                "--format=%x1f%h%x1f%D%x1f%s",
+                "-n",
+                "6",
+            ]
+        );
+        assert_eq!(
+            log_graph_args("6", false),
+            vec!["log", "--graph", "--format=%x1f%h%x1f%D%x1f%s", "-n", "6",]
+        );
+    }
+
+    #[test]
     fn parse_log_graph_keeps_unit_separator_in_subject_and_rejects_short_rows() {
         let rows = parse_log_graph("* \u{1f}abc1234\u{1f}\u{1f}a\u{1f}b\n").unwrap();
         assert_eq!(rows.len(), 1);
@@ -4487,6 +4510,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&base); // best-effort: test tmp cleanup
         std::fs::create_dir_all(&base).unwrap();
         git_in(&base, &["init", "-q", "-b", "main"]);
+        git_in(&base, &["config", "color.ui", "always"]);
         commit_empty(&base, "c0");
         commit_empty(&base, "c1");
 

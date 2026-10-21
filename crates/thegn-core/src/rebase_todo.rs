@@ -240,8 +240,9 @@ fn push_arg(out: &mut String, word: &str, arg: &str) {
 pub fn todo_from_log(log_out: &str) -> anyhow::Result<Vec<TodoEntry>> {
     let mut entries = Vec::new();
     let mut seen = HashSet::new();
-    for (index, line) in log_out.split_terminator('\n').enumerate() {
+    for (index, raw_line) in log_out.split_terminator('\n').enumerate() {
         let line_number = index + 1;
+        let line = raw_line.strip_suffix('\r').unwrap_or(raw_line);
         if line.is_empty() {
             continue;
         }
@@ -580,6 +581,7 @@ mod tests {
     fn todo_from_log_handles_empty_input() {
         assert_eq!(todo_from_log("").unwrap(), vec![]);
         assert_eq!(todo_from_log("\n").unwrap(), vec![]);
+        assert_eq!(todo_from_log("\r\n").unwrap(), vec![]);
     }
 
     #[test]
