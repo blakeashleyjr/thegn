@@ -76,6 +76,9 @@ sha2 = "0.10"
 # chars ≠ cells on wide glyphs, and `format!("{:<n$}")` drifts. Same crate the
 # host sizes text with; was already here as a dev-dep for the glyph tables.
 unicode-width = "0.2"
+# Typed bounded Git execution (git_run.rs, THE-368): process-group supervision,
+# deadlines and capped capture. Owner-approved core -> per-OS leaf edge.
+thegn-proc.workspace = true
 
 [target.'cfg(unix)'.dependencies]
 nix.workspace = true
