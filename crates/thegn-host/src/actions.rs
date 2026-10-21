@@ -1035,7 +1035,14 @@ pub(crate) fn run_pr_view_action(
                     false,
                     false,
                 );
-                match crate::cmd::pr::merge_outcome_text(&outcome) {
+                let outcome_text = crate::cmd::pr::merge_outcome_text(&outcome);
+                let status = match &outcome_text {
+                    Ok(text) | Err(text) => text.clone(),
+                };
+                if let Err(error) = tx.send(RefreshKind::PrActionStatus(status)) {
+                    tracing::debug!(%error, "PR merge outcome status was not delivered");
+                }
+                match outcome_text {
                     Ok(text) => {
                         thegn_core::msg::info(&text);
                         Ok(())

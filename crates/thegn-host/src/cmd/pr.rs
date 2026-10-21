@@ -589,7 +589,9 @@ mod tests {
             &outcome,
             thegn_core::pr_merge_outcome::MergeOutcome::StaleHead { .. }
         ));
-        assert!(merge_outcome_text(&outcome).is_err());
+        let text = merge_outcome_text(&outcome).unwrap_err();
+        assert!(text.contains("abcdefabcdef"), "{text}");
+        assert!(text.contains("nothing was merged"), "{text}");
     }
 
     #[test]
