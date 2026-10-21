@@ -13,6 +13,13 @@ use thegn_core::config::Config;
 use thegn_core::outln;
 use thegn_svc::control::client::{ControlAddr, ControlClient};
 
+#[derive(Debug, Default, PartialEq)]
+struct Classified {
+    ours: Vec<PathBuf>,
+    unknown: Vec<PathBuf>,
+    foreign: Vec<(PathBuf, String)>,
+}
+
 #[derive(Subcommand, Clone)]
 pub enum DaemonAction {
     /// Stop every verified pane daemon for this state directory (admin).
@@ -79,6 +86,65 @@ where
     }
 }
 
+async fn classify_targets<F, Fut>(
+    targets: Vec<PathBuf>,
+    deadline: tokio::time::Instant,
+    mut probe: F,
+) -> Classified
+where
+    F: FnMut(PathBuf) -> Fut,
+    Fut: Future<Output = crate::daemon::client::StopProbe>,
+{
+    let mut classified = Classified::default();
+    let mut targets = targets.into_iter();
+    while let Some(target) = targets.next() {
+        if tokio::time::Instant::now() >= deadline {
+            classified.unknown.push(target);
+            classified.unknown.extend(targets);
+            break;
+        }
+        match tokio::time::timeout_at(deadline, probe(target.clone())).await {
+            Ok(crate::daemon::client::StopProbe::NotRunning) => {}
+            Ok(crate::daemon::client::StopProbe::Ours) => classified.ours.push(target),
+            Ok(crate::daemon::client::StopProbe::Foreign(scope)) => {
+                classified.foreign.push((target, scope));
+            }
+            Err(_) => {
+                classified.unknown.push(target);
+                classified.unknown.extend(targets);
+                break;
+            }
+        }
+    }
+    classified
+}
+
+fn stop_verdict(ours_total: usize, failures: &[String], unknown: &[String]) -> Result<()> {
+    if failures.is_empty() && unknown.is_empty() {
+        return Ok(());
+    }
+    let mut details = Vec::new();
+    if !failures.is_empty() {
+        details.push(format!(
+            "{} of {} listeners still live ({})",
+            failures.len(),
+            ours_total,
+            failures.join(", ")
+        ));
+    }
+    if !unknown.is_empty() {
+        details.push(format!(
+            "{} not checked before the deadline ({})",
+            unknown.len(),
+            unknown.join(", ")
+        ));
+    }
+    Err(anyhow!(
+        "pane daemon stop incomplete: {}",
+        details.join("; ")
+    ))
+}
+
 fn stop(cfg: &Config) -> Result<()> {
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -91,8 +157,9 @@ fn stop(cfg: &Config) -> Result<()> {
             stop_deadline,
             tokio::task::spawn_blocking({
                 let scopes = scopes.clone();
-                move || match thegn_core::db::Db::open() {
-                    Ok(db) => scopes
+                move || -> Result<Vec<PathBuf>> {
+                    let db = thegn_core::db::Db::open()?;
+                    Ok(scopes
                         .iter()
                         .filter_map(|scope| {
                             thegn_svc::control::client::discover(
@@ -105,16 +172,30 @@ fn stop(cfg: &Config) -> Result<()> {
                             ControlAddr::Unix(path) => Some(path),
                             ControlAddr::Tcp { .. } | ControlAddr::HttpOrigin { .. } => None,
                         })
-                        .collect::<Vec<_>>(),
-                    Err(_) => Vec::new(),
+                        .collect::<Vec<_>>())
                 }
             }),
         )
         .await
         {
-            Some(Ok(paths)) => paths,
-            Some(Err(_)) | None => Vec::new(),
+            Some(Ok(Ok(paths))) => (paths, None),
+            Some(Ok(Err(error))) => (Vec::new(), Some(Some(error.to_string()))),
+            Some(Err(error)) => (Vec::new(), Some(Some(error.to_string()))),
+            None => (Vec::new(), Some(None)),
         };
+        let (registry, registry_error) = registry;
+        let mut unknown = Vec::new();
+        match registry_error {
+            Some(Some(error)) => {
+                outln!("unknown: listener registry could not be read ({})", error);
+                unknown.push("listener registry".to_string());
+            }
+            Some(None) => {
+                outln!("unknown: listener registry not read before the stop deadline");
+                unknown.push("listener registry".to_string());
+            }
+            None => {}
+        }
         let configured = crate::daemon::socket_path(&cfg.daemon);
         let legacy_path = thegn_core::config_daemon::legacy_socket_path(
             &thegn_core::util::xdg_state_home().join("thegn"),
@@ -124,34 +205,36 @@ fn stop(cfg: &Config) -> Result<()> {
             .then_some(legacy_path);
         let targets = stop_targets(registry, configured, legacy);
 
-        let mut ours = Vec::new();
-        for path in targets {
-            let client = ControlClient::new(ControlAddr::Unix(path.clone()));
-            let label = crate::daemon::client::socket_label(&client);
-            let probe = probe_before_deadline(
-                stop_deadline,
-                crate::daemon::client::probe_stop_target(&client, &scopes),
-            )
-            .await;
-            match probe {
-                None => {
-                    outln!(
-                        "skipped {}: stop deadline reached while checking listener",
-                        label
-                    );
-                }
-                Some(crate::daemon::client::StopProbe::NotRunning) => {}
-                Some(crate::daemon::client::StopProbe::Ours) => ours.push(path),
-                Some(crate::daemon::client::StopProbe::Foreign(scope)) => {
-                    outln!(
-                        "skipped {}: belongs to a different state directory (scope {})",
-                        label,
-                        scope
-                    );
+        let classified = classify_targets(targets, stop_deadline, {
+            let scopes = scopes.clone();
+            move |path| {
+                let scopes = scopes.clone();
+                async move {
+                    let client = ControlClient::new(ControlAddr::Unix(path));
+                    crate::daemon::client::probe_stop_target(&client, &scopes).await
                 }
             }
+        })
+        .await;
+        let ours = classified.ours;
+        for (path, scope) in classified.foreign {
+            let client = ControlClient::new(ControlAddr::Unix(path));
+            outln!(
+                "skipped {}: belongs to a different state directory (scope {})",
+                crate::daemon::client::socket_label(&client),
+                scope
+            );
         }
-        if ours.is_empty() {
+        for path in classified.unknown {
+            let client = ControlClient::new(ControlAddr::Unix(path));
+            let label = crate::daemon::client::socket_label(&client);
+            outln!(
+                "unknown {}: stop deadline reached before it was checked",
+                label
+            );
+            unknown.push(label);
+        }
+        if ours.is_empty() && unknown.is_empty() {
             outln!("no thegn pane daemon is running");
             return Ok(());
         }
@@ -205,16 +288,7 @@ fn stop(cfg: &Config) -> Result<()> {
                 outln!("stopped {}", label);
             }
         }
-        if failures.is_empty() {
-            Ok(())
-        } else {
-            Err(anyhow!(
-                "pane daemon stop incomplete: {} of {} listeners still live ({})",
-                failures.len(),
-                ours.len(),
-                failures.join(", ")
-            ))
-        }
+        stop_verdict(ours.len(), &failures, &unknown)
     })
 }
 
@@ -227,11 +301,87 @@ async fn probe_before_deadline<F: Future>(
 
 #[cfg(test)]
 mod tests {
-    use super::{probe_before_deadline, stop_targets, wait_until_stopped};
+    use super::{
+        Classified, classify_targets, probe_before_deadline, stop_targets, stop_verdict,
+        wait_until_stopped,
+    };
     use std::collections::HashMap;
     use std::path::PathBuf;
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
+
+    #[tokio::test(start_paused = true)]
+    async fn classify_targets_reports_a_probe_that_outlasts_the_deadline_as_unknown() {
+        let a = PathBuf::from("a");
+        let b = PathBuf::from("b");
+        let c = PathBuf::from("c");
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(1);
+        let classified = classify_targets(
+            vec![a, b.clone(), c.clone()],
+            deadline,
+            move |path| async move {
+                if path == *"a" {
+                    crate::daemon::client::StopProbe::NotRunning
+                } else {
+                    tokio::time::sleep(Duration::from_secs(5)).await;
+                    crate::daemon::client::StopProbe::Ours
+                }
+            },
+        )
+        .await;
+        assert!(classified.ours.is_empty());
+        assert_eq!(classified.unknown, vec![b, c]);
+        assert_eq!(tokio::time::Instant::now(), deadline);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn classify_targets_keeps_ours_and_foreign_before_the_deadline() {
+        let ours = PathBuf::from("ours");
+        let foreign = PathBuf::from("foreign");
+        let classified = classify_targets(
+            vec![ours.clone(), foreign.clone()],
+            tokio::time::Instant::now() + Duration::from_secs(1),
+            move |path| async move {
+                if path == *"ours" {
+                    crate::daemon::client::StopProbe::Ours
+                } else {
+                    crate::daemon::client::StopProbe::Foreign("other".into())
+                }
+            },
+        )
+        .await;
+        assert_eq!(
+            classified,
+            Classified {
+                ours: vec![ours],
+                unknown: Vec::new(),
+                foreign: vec![(foreign, "other".into())],
+            }
+        );
+    }
+
+    #[test]
+    fn stop_verdict_with_only_unknown_listeners_is_an_error() {
+        let result = stop_verdict(0, &[], &["/run/x.sock".into()]);
+        match result {
+            Err(error) => assert!(error.to_string().contains("/run/x.sock")),
+            Ok(()) => panic!("unknown listener must make stop fail"),
+        }
+        assert!(stop_verdict(0, &[], &[]).is_ok());
+        let result = stop_verdict(
+            2,
+            &["/run/live-a.sock".into()],
+            &["/run/unchecked-b.sock".into()],
+        );
+        match result {
+            Err(error) => {
+                let message = error.to_string();
+                assert!(message.contains("/run/live-a.sock"));
+                assert!(message.contains("/run/unchecked-b.sock"));
+            }
+            Ok(()) => panic!("live and unknown listeners must make stop fail"),
+        }
+    }
 
     #[test]
     fn stop_targets_collapse_duplicates_and_keep_precedence() {
