@@ -4461,10 +4461,9 @@ pub(crate) fn credential_overlay_gate(
     }
     if let thegn_core::workspace_overlay::WorkspaceOverlay::Refused(refusal) =
         cfg.workspace_overlay_for_tab_slug(db, slug)
+        && thegn_core::workspace_overlay::refusal_carries_credentials(&cfg.workspace, &refusal)
     {
-        if thegn_core::workspace_overlay::refusal_carries_credentials(&cfg.workspace, &refusal) {
-            anyhow::bail!("agent launch refused: {refusal}");
-        }
+        anyhow::bail!("agent launch refused: {refusal}");
     }
     Ok(())
 }
