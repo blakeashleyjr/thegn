@@ -686,6 +686,20 @@ impl WorktreeAuxStore for Db {
     ) -> Result<MergeOutcomeWrite> {
         validate_merge_outcome(observed, outcome)?;
         let tx = Transaction::new_unchecked(self.conn(), TransactionBehavior::Immediate)?;
+        let has_claim_owner: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM pragma_table_info('merge_queue') WHERE name = 'claim_owner')",
+            [],
+            |row| row.get(0),
+        )?;
+        if has_claim_owner
+            && tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM merge_queue WHERE worktree=?1 AND claim_owner IS NOT NULL)",
+                [outcome.worktree],
+                |row| row.get(0),
+            )?
+        {
+            return Ok(MergeOutcomeWrite::Claimed);
+        }
         let current = merge_outcome_observation(&tx, outcome.worktree)?;
         if current.registry != observed.registry {
             return Ok(MergeOutcomeWrite::RegistryChanged);
@@ -714,7 +728,7 @@ impl WorktreeAuxStore for Db {
             .as_ref()
             .map(|registry| registry.location.as_deref())
             .unwrap_or(observed.queue_location.as_deref());
-        tx.execute(
+        let upsert = if has_claim_owner {
             "INSERT INTO merge_queue \
                 (worktree,branch,target_branch,status,queued_at,updated_at,\
                  result_oid,conflict_paths,error_detail,location,agent_attempts) \
@@ -723,7 +737,21 @@ impl WorktreeAuxStore for Db {
                 branch=excluded.branch,target_branch=excluded.target_branch,\
                 status=excluded.status,updated_at=excluded.updated_at,\
                 result_oid=excluded.result_oid,conflict_paths=excluded.conflict_paths,\
-                error_detail=excluded.error_detail,location=excluded.location",
+                error_detail=excluded.error_detail,location=excluded.location \
+             WHERE merge_queue.claim_owner IS NULL"
+        } else {
+            "INSERT INTO merge_queue \
+                (worktree,branch,target_branch,status,queued_at,updated_at,\
+                 result_oid,conflict_paths,error_detail,location,agent_attempts) \
+             VALUES(?1,?2,?3,?4,?5,?5,?6,?7,?8,?9,0) \
+             ON CONFLICT(worktree) DO UPDATE SET \
+                branch=excluded.branch,target_branch=excluded.target_branch,\
+                status=excluded.status,updated_at=excluded.updated_at,\
+                result_oid=excluded.result_oid,conflict_paths=excluded.conflict_paths,\
+                error_detail=excluded.error_detail,location=excluded.location"
+        };
+        let changed = tx.execute(
+            upsert,
             params![
                 outcome.worktree,
                 outcome.branch,
@@ -736,6 +764,9 @@ impl WorktreeAuxStore for Db {
                 location,
             ],
         )?;
+        if has_claim_owner && changed == 0 {
+            return Ok(MergeOutcomeWrite::Claimed);
+        }
         tx.commit()?;
         Ok(MergeOutcomeWrite::Written)
     }
