@@ -370,7 +370,8 @@ pub(crate) fn daemon_ci_cache_usable(
     ttl_secs: u64,
 ) -> bool {
     ci_cache_is_fresh(Some(fetched_at), now, ttl_secs)
-        && current_branch.is_some_and(|branch| !branch.is_empty() && cached_branch == branch)
+        && current_branch
+            .is_some_and(|branch| !branch.is_empty() && branch != "HEAD" && cached_branch == branch)
 }
 
 // --- fetch health: the panel note + failure backoff ------------------------
@@ -1510,6 +1511,7 @@ mod tests {
         assert!(!daemon_ci_cache_usable("", Some("main"), 100, 120, 30));
         assert!(!daemon_ci_cache_usable("main", None, 100, 120, 30));
         assert!(!daemon_ci_cache_usable("", Some(""), 100, 120, 30));
+        assert!(!daemon_ci_cache_usable("HEAD", Some("HEAD"), 100, 120, 30));
     }
 
     #[test]

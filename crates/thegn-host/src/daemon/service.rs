@@ -1978,7 +1978,10 @@ impl ControlApi for DaemonService {
                         use thegn_core::store::CacheStore;
                         db.put_ci_cache(
                             &key_for_write,
-                            branch_for_write.as_deref().unwrap_or(""),
+                            branch_for_write
+                                .as_deref()
+                                .filter(|branch| !branch.is_empty() && *branch != "HEAD")
+                                .unwrap_or(""),
                             &json,
                         )
                     })
