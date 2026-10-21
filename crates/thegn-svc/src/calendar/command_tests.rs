@@ -1,5 +1,6 @@
 use super::*;
 use thegn_core::calendar::admission::{AdmissionBudget, AdmissionMeter};
+use thegn_core::calendar::conformance::{FIXTURES, Verdict};
 
 fn sink() -> AdmittingSink {
     AdmittingSink {
@@ -19,6 +20,43 @@ fn sink() -> AdmittingSink {
         saw_events: false,
         saw_manifest: false,
     }
+}
+
+#[test]
+fn conformance_command_plugin_matches_every_fixture() {
+    let mut table = Vec::new();
+    for fixture in FIXTURES {
+        if let Some((json, expected)) = fixture.json {
+            let line =
+                format!(r#"{{"method":"events","params":{{"events":[{json}],"sync_token":""}}}}"#);
+            let mut sink = sink();
+            let accepted = sink.line(&line);
+            let actual = if accepted && sink.admitted.events.len() == 1 {
+                Verdict::Admit
+            } else {
+                Verdict::Reject
+            };
+            let rejection_shape = expected != Verdict::Reject
+                || (sink.admitted.events.is_empty()
+                    && (sink.admitted.invalid_event.is_some() || sink.error.is_some()));
+            table.push((
+                fixture.name,
+                "command plugin",
+                expected,
+                actual,
+                rejection_shape,
+            ));
+        }
+    }
+    eprintln!("calendar conformance command table: {table:#?}");
+    assert!(
+        table
+            .iter()
+            .all(|(_, _, expected, actual, rejection_shape)| {
+                expected == actual && *rejection_shape
+            }),
+        "calendar conformance disagreement: {table:#?}"
+    );
 }
 
 fn manifest(contributions: &str, capabilities: &str) -> String {
