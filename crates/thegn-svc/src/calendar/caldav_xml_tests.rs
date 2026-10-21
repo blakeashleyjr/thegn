@@ -53,8 +53,9 @@ fn malformed_inputs_fail_closed() {
         "<d:multistatus xmlns:d=\"DAV:\"></d:wrong>",
         "<root xmlns=\"urn:wrong\"/>",
         "<d:multistatus xmlns:d=\"DAV:\"><d:response/></d:multistatus>",
+        "<d:multistatus><d:response/></d:multistatus>",
         "<!DOCTYPE d:multistatus><d:multistatus xmlns:d=\"DAV:\"/>",
-        "<d:multistatus xmlns:d=\"DAV:\"><d:response><d:href>/secret</d:href><d:propstat><d:prop><d:a><d:b><d:c><d:d><d:e><d:f><d:g><d:h><d:i><d:j><d:k><d:l><d:m><d:n><d:o><d:p><d:q><d:r><d:s><d:t><d:u><d:v><d:w><d:x><d:y><d:z><d:aa><d:ab><d:ac><d:ad><d:ae><d:af><d:ag><d:ah><d:ai/></d:ah></d:ag></d:af></d:ae></d:ad></d:ac></d:ab></d:aa></d:z></d:y></d:x></d:w></d:v></d:u></d:t></d:s></d:r></d:q></d:p></d:o></d:n></d:m></d:l></d:k></d:j></d:i></d:h></d:g></d:f></d:e></d:d></d:c></d:b></d:a></d:prop><d:status>HTTP/1.1 200 OK</d:status></d:propstat></d:response></d:multistatus>",
+        "<d:multistatus xmlns:d=\"DAV:\" xmlns:x=\"urn:vendor\"><d:response><d:href>/secret</d:href><d:propstat><d:prop><x:a><x:b><x:c><x:d><x:e><x:f><x:g><x:h><x:i><x:j><x:k><x:l><x:m><x:n><x:o><x:p><x:q><x:r><x:s><x:t><x:u><x:v><x:w><x:x><x:y><x:z><x:aa><x:ab><x:ac><x:ad><x:ae><x:af><x:ag><x:ah><x:ai/></x:ah></x:ag></x:af></x:ae></x:ad></x:ac></x:ab></x:aa></x:z></x:y></x:x></x:w></x:v></x:u></x:t></x:s></x:r></x:q></x:p></x:o></x:n></x:m></x:l></x:k></x:j></x:i></x:h></x:g></x:f></x:e></x:d></x:c></x:b></x:a></d:prop><d:status>HTTP/1.1 200 OK</d:status></d:propstat></d:response></d:multistatus>",
         "<d:multistatus xmlns:d=\"DAV:\"><d:response><d:href>/secret</d:href><d:href>/again</d:href><d:status>HTTP/1.1 404 Gone</d:status></d:response></d:multistatus>",
         "<d:multistatus xmlns:d=\"DAV:\" xmlns:c=\"urn:ietf:params:xml:ns:caldav\"><d:response><d:href>/secret</d:href><d:propstat><d:prop><c:calendar-data>private</c:calendar-data></d:prop></d:propstat></d:response></d:multistatus>",
         "<d:multistatus xmlns:d=\"DAV:\"><d:sync-token>one</d:sync-token><d:sync-token>two</d:sync-token></d:multistatus>",
@@ -93,7 +94,15 @@ fn unrelated_namespace_with_dav_local_names_is_rejected() {
 fn numeric_and_named_entities_decode_without_expansion() {
     assert_eq!(decode_text("&#38;&#x26;&#x1F600;&lt;").unwrap(), "&&😀<");
     assert_eq!(decode_text("&amp;lt;").unwrap(), "&lt;");
-    for raw in ["&#0;", "&#xD800;", "&#x110000;", "&bogus;", "&amp"] {
+    for raw in [
+        "&#0;",
+        "&#xD800;",
+        "&#x110000;",
+        "&#x+26;",
+        "&#+38;",
+        "&bogus;",
+        "&amp",
+    ] {
         assert!(decode_text(raw).is_err(), "accepted {raw}");
     }
 }
@@ -101,16 +110,47 @@ fn numeric_and_named_entities_decode_without_expansion() {
 #[test]
 fn cdata_calendar_data_is_taken_literally() {
     let body = r#"<d:multistatus xmlns:d="DAV:" xmlns:c="urn:ietf:params:xml:ns:caldav"><d:response><d:href>/a</d:href><d:propstat><d:prop><c:calendar-data><![CDATA[SUMMARY:A & B <literal>]]></c:calendar-data></d:prop><d:status>HTTP/1.1 200 OK</d:status></d:propstat></d:response></d:multistatus>"#;
-    let raw = collect(body).unwrap().0[0].1;
-    assert_eq!(decode_text(&raw).unwrap(), "SUMMARY:A & B <literal>");
+    let (rows, _) = collect(body).unwrap();
+    let raw = &rows[0].1;
+    assert_eq!(decode_text(raw).unwrap(), "SUMMARY:A & B <literal>");
 }
 
 #[test]
 fn sync_token_is_read_only_as_a_direct_child_of_multistatus() {
     let nested = r#"<d:multistatus xmlns:d="DAV:"><d:response><d:href>/a</d:href><d:sync-token>nested</d:sync-token><d:status>HTTP/1.1 404 Gone</d:status></d:response></d:multistatus>"#;
     assert!(collect(nested).is_err());
-    let foreign = r#"<d:multistatus xmlns:d="DAV:" xmlns:x="urn:vendor"><d:response><d:href>/a</d:href><d:propstat><d:prop><x:stuff><d:sync-token>ignored</d:sync-token></x:stuff></d:prop><d:status>HTTP/1.1 404 Missing</d:status></d:propstat></d:response></d:multistatus>"#;
+    let foreign = r#"<d:multistatus xmlns:d="DAV:" xmlns:c="urn:ietf:params:xml:ns:caldav" xmlns:x="urn:vendor"><d:response><d:href>/a</d:href><d:propstat><d:prop><x:stuff><d:sync-token>ignored</d:sync-token></x:stuff><c:calendar-data>ICS</c:calendar-data></d:prop><d:status>HTTP/1.1 200 OK</d:status></d:propstat><d:propstat><d:prop><d:getetag/></d:prop><d:status>HTTP/1.1 404 Missing</d:status></d:propstat></d:response></d:multistatus>"#;
     assert_eq!(collect(foreign).unwrap().1, "");
+}
+
+#[test]
+fn foreign_root_rejects_wrapped_dav_responses_before_visiting() {
+    let body = r#"<x:foo xmlns:x="urn:example" xmlns:d="DAV:"><d:response><d:href>/a</d:href><d:status>HTTP/1.1 404 Gone</d:status></d:response></x:foo>"#;
+    let mut visits = 0;
+    let result = walk_multistatus(body, |_| {
+        visits += 1;
+        Ok(())
+    });
+    assert!(matches!(result, Err(CalendarError::Parse(_))));
+    assert_eq!(visits, 0);
+}
+
+#[test]
+fn empty_http_reason_phrase_is_accepted() {
+    let body = r#"<d:multistatus xmlns:d="DAV:"><d:response><d:href>/gone</d:href><d:status>HTTP/1.1 404 </d:status></d:response></d:multistatus>"#;
+    assert!(collect(body).unwrap().0[0].2);
+}
+
+#[test]
+fn response_after_sync_token_is_rejected() {
+    let body = r#"<d:multistatus xmlns:d="DAV:"><d:sync-token>token</d:sync-token><d:response><d:href>/gone</d:href><d:status>HTTP/1.1 404 Gone</d:status></d:response></d:multistatus>"#;
+    assert!(matches!(collect(body), Err(CalendarError::Parse(_))));
+}
+
+#[test]
+fn response_after_response_description_is_rejected() {
+    let body = r#"<d:multistatus xmlns:d="DAV:"><d:responsedescription>done</d:responsedescription><d:response><d:href>/gone</d:href><d:status>HTTP/1.1 404 Gone</d:status></d:response></d:multistatus>"#;
+    assert!(matches!(collect(body), Err(CalendarError::Parse(_))));
 }
 
 #[test]
