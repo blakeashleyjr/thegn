@@ -4,6 +4,9 @@
 //! portable-pty pane through a `PaneEmulator` grid, composited into a termwiz
 //! `Surface` that diff-flushes to the outer terminal (the "no-flash" mechanism).
 
+// doctor's JSON report is one large serde_json::json! literal.
+#![recursion_limit = "256"]
+
 mod actions;
 mod agent;
 mod agent_configs;
