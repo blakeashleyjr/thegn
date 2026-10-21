@@ -4,6 +4,7 @@ import copy
 import hashlib
 import importlib.util
 import io
+import json
 import sys
 import tarfile
 import tempfile
@@ -402,6 +403,159 @@ class ReleaseRendererTests(unittest.TestCase):
                 self.assertNotIn("REPLACE_WITH_", text)
                 self.assertNotRegex(text, r"[0-9a-f]{64}")
                 self.assertNotIn("secret", text.lower())
+
+
+class ReleaseManifestTests(unittest.TestCase):
+    make_asset = ReleaseRendererTests.make_asset
+
+    def setUp(self) -> None:
+        self.temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temporary.cleanup)
+        self.temp = Path(self.temporary.name)
+        self.assets = self.temp / "assets"
+        self.assets.mkdir()
+        self.manifest = release.load_manifest()
+        self.version = release.workspace_version()
+        self.tag = f"v{self.version}"
+        self.commit = "a" * 40
+        self.record_path = self.assets / f"thegn-{self.tag}-release.json"
+        self.expected = release.expected_release_assets(self.manifest, self.tag)
+        archive_names: list[str] = []
+        for target, config in self.manifest["targets"].items():
+            if config["enabled"]:
+                archive_name, checksum_name = release._asset_names(
+                    self.manifest, self.tag, target
+                )
+                self.make_asset(target)
+                archive_names.extend((archive_name, checksum_name))
+        completions = f"thegn-{self.tag}-completions.tar.gz"
+        completions_checksum = f"{completions}.sha256"
+        (self.assets / completions).write_bytes(b"completions fixture")
+        completions_digest = hashlib.sha256((self.assets / completions).read_bytes()).hexdigest()
+        (self.assets / completions_checksum).write_text(
+            f"{completions_digest}  {completions}\n", encoding="utf-8"
+        )
+        archive_names.extend((completions, completions_checksum))
+        for name in self.expected:
+            if name not in archive_names and name != self.record_path.name:
+                (self.assets / name).write_bytes(f"fixture:{name}".encode())
+        self.write_record(archive_names)
+
+    def write_record(self, names: list[str] | None = None, *, commit: str | None = None) -> None:
+        names = names or [
+            name
+            for name in self.expected
+            if name.endswith((".tar.gz", ".sha256"))
+        ]
+        record = {
+            "tag": self.tag,
+            "tag_object": "b" * 40,
+            "commit": commit or self.commit,
+            "workflow_sha": "c" * 40,
+            "run_id": "12345",
+            "assets": [
+                {"name": name, "sha256": release._sha256(self.assets / name)}
+                for name in names
+            ],
+        }
+        self.record_path.write_text(json.dumps(record), encoding="utf-8")
+
+    def build(self) -> dict:
+        return release.build_release_manifest(
+            self.manifest, self.tag, self.commit, self.assets, self.record_path
+        )
+
+    def test_manifest_accepts_the_exact_asset_set(self) -> None:
+        result = self.build()
+        self.assertEqual(self.expected, [asset["name"] for asset in result["assets"]])
+        for asset in result["assets"]:
+            path = self.assets / asset["name"]
+            self.assertEqual(release._sha256(path), asset["sha256"])
+            self.assertEqual(path.stat().st_size, asset["size"])
+
+    def test_manifest_rejects_a_missing_completions_archive(self) -> None:
+        (self.assets / f"thegn-{self.tag}-completions.tar.gz").unlink()
+        with self.assertRaisesRegex(release.ReleaseError, "missing:.*completions"):
+            self.build()
+
+    def test_manifest_rejects_a_missing_matrix_leg(self) -> None:
+        for name in release._asset_names(self.manifest, self.tag, "aarch64-apple-darwin"):
+            (self.assets / name).unlink()
+        with self.assertRaisesRegex(release.ReleaseError, "missing:.*aarch64-apple-darwin"):
+            self.build()
+
+    def test_manifest_rejects_an_extra_asset(self) -> None:
+        (self.assets / f"thegn-{self.tag}-stale.tar.gz").write_bytes(b"stale")
+        with self.assertRaisesRegex(release.ReleaseError, "unexpected:.*stale"):
+            self.build()
+
+    def test_manifest_ignores_a_previous_manifest_asset(self) -> None:
+        (self.assets / f"thegn-{self.tag}-manifest.json").write_text("{}", encoding="utf-8")
+        self.assertEqual(self.expected, [asset["name"] for asset in self.build()["assets"]])
+
+    def test_manifest_rejects_a_checksum_mismatch(self) -> None:
+        archive_name, checksum_name = release._asset_names(
+            self.manifest, self.tag, "x86_64-unknown-linux-gnu"
+        )
+        checksum = self.assets / checksum_name
+        checksum.write_text(f"{'0' * 64}  {archive_name}\n", encoding="utf-8")
+        with self.assertRaisesRegex(release.ReleaseError, "checksum mismatch"):
+            self.build()
+
+    def test_manifest_rejects_a_record_digest_mismatch(self) -> None:
+        record = json.loads(self.record_path.read_text(encoding="utf-8"))
+        record["assets"][0]["sha256"] = "0" * 64
+        self.record_path.write_text(json.dumps(record), encoding="utf-8")
+        with self.assertRaisesRegex(release.ReleaseError, "record digest mismatch"):
+            self.build()
+
+    def test_manifest_rejects_a_record_for_another_commit(self) -> None:
+        self.write_record(commit="d" * 40)
+        with self.assertRaisesRegex(release.ReleaseError, "commit does not match"):
+            self.build()
+
+    def test_manifest_rejects_a_record_with_extra_or_missing_entries(self) -> None:
+        record = json.loads(self.record_path.read_text(encoding="utf-8"))
+        record["assets"].pop()
+        record["assets"].append({"name": "unexpected", "sha256": "e" * 64})
+        self.record_path.write_text(json.dumps(record), encoding="utf-8")
+        with self.assertRaisesRegex(release.ReleaseError, "do not exactly match"):
+            self.build()
+
+    def test_manifest_rejects_a_symlinked_asset(self) -> None:
+        victim = self.assets / "symlink-target"
+        victim.write_bytes(b"x")
+        link = self.assets / "thegn-symlink"
+        link.symlink_to(victim)
+        with self.assertRaisesRegex(release.ReleaseError, "not a regular file"):
+            self.build()
+
+    def test_manifest_output_is_deterministic(self) -> None:
+        first = self.temp / "first.json"
+        second = self.temp / "second.json"
+        for output in (first, second):
+            release.write_release_manifest(output, self.assets, self.build())
+        self.assertEqual(first.read_bytes(), second.read_bytes())
+
+    def test_manifest_cli_exits_nonzero_on_refusal(self) -> None:
+        (self.assets / f"thegn-{self.tag}-completions.tar.gz").unlink()
+        with self.assertRaises(SystemExit) as raised:
+            release.main(
+                [
+                    "manifest",
+                    "--tag",
+                    self.tag,
+                    "--assets-dir",
+                    str(self.assets),
+                    "--record",
+                    str(self.record_path),
+                    "--commit",
+                    self.commit,
+                    "--output",
+                    str(self.temp / "manifest.json"),
+                ]
+            )
+        self.assertEqual(2, raised.exception.code)
 
 
 if __name__ == "__main__":
