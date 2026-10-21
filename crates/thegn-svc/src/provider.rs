@@ -1920,7 +1920,7 @@ pub(crate) async fn collect_exec_output(
     frames: &mut tokio::sync::mpsc::Receiver<ExecFrame>,
     cap: usize,
 ) -> ExecCollected {
-    let mut output = std::collections::VecDeque::with_capacity(cap);
+    let mut output = std::collections::VecDeque::new();
     let mut code = None;
     let mut dropped = 0_u64;
     while let Some(frame) = frames.recv().await {
@@ -4816,7 +4816,7 @@ mod tests {
 
     #[tokio::test]
     async fn collect_exec_output_keeps_the_tail_and_counts_dropped_bytes() {
-        let (mut rx, tx) = tokio::sync::mpsc::channel(8);
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
         let sender = tokio::spawn(async move {
             tx.send(ExecFrame::Stdout(b"0123".to_vec())).await.unwrap();
             tx.send(ExecFrame::Stdout(b"456789".to_vec()))
@@ -4835,7 +4835,7 @@ mod tests {
 
     #[tokio::test]
     async fn collect_exec_output_without_exit_reports_none() {
-        let (mut rx, tx) = tokio::sync::mpsc::channel(8);
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
         let sender = tokio::spawn(async move {
             tx.send(ExecFrame::Stdout(b"kept".to_vec())).await.unwrap();
         });
@@ -4849,7 +4849,7 @@ mod tests {
 
     #[tokio::test]
     async fn collect_exec_output_stops_at_exit() {
-        let (mut rx, tx) = tokio::sync::mpsc::channel(8);
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
         let sender = tokio::spawn(async move {
             tx.send(ExecFrame::Exit(0)).await.unwrap();
             tx.send(ExecFrame::Stdout(b"late".to_vec())).await.unwrap();
