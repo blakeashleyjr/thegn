@@ -38,7 +38,7 @@ fn host_label(location: &str) -> Option<String> {
 /// The hued glyph for a queue row's status string: the shared
 /// [`thegn_core::attention::MqStatus::glyph`] vocabulary (also the sidebar
 /// detail chip's), capability-degraded like the rest of the chrome. Unknown
-/// statuses render like `queued`.
+/// statuses are flagged with the attention glyph.
 pub(super) fn status_glyph(status: &str) -> Seg {
     use thegn_core::attention::MqStatus;
     let gl = crate::caps::active_glyphs();
@@ -47,7 +47,7 @@ pub(super) fn status_glyph(status: &str) -> Seg {
             let (glyph, h) = mq.glyph(gl);
             seg(hue(h), glyph)
         }
-        None => seg(g(), gl.dot_hollow), // unknown ≈ queued
+        None => seg(hue(Hue::Red), gl.attention),
     }
 }
 
@@ -107,7 +107,15 @@ pub(super) fn content(ctx: &SectionCtx) -> Vec<PanelRow> {
 }
 
 fn held_reason(r: &thegn_core::db::MergeQueueRow) -> Option<(String, Hue)> {
-    let status = MqStatus::parse(&r.status)?;
+    let Some(status) = MqStatus::parse(&r.status) else {
+        return Some((
+            format!(
+                "unrecognised queue status '{}'",
+                crate::merge_sweep::safe_display(&r.status)
+            ),
+            Hue::Red,
+        ));
+    };
     if !status.is_held() {
         return None;
     }
@@ -341,6 +349,19 @@ mod expiry_tests {
                 status.as_str()
             );
         }
-        assert_eq!(held_reason(&row("unknown-status", 1)), None);
+        assert_eq!(
+            held_reason(&row("unknown-status", 1)),
+            Some((
+                "unrecognised queue status 'unknown-status'".into(),
+                Hue::Red
+            ))
+        );
+    }
+
+    #[test]
+    fn unknown_status_is_flagged_with_its_raw_value() {
+        let (reason, tone) = held_reason(&row("future_status", 1)).unwrap();
+        assert_eq!(tone, Hue::Red);
+        assert!(reason.contains("future_status"));
     }
 }
