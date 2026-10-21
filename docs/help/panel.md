@@ -348,6 +348,9 @@ the worktree's language server is overloaded, outline and hover say
 `language server busy` on the status line and references say so in the view;
 try again. Esc out of references cancels a references lookup still in flight;
 switching worktree cancels outline, references and hover lookups.
+A language-server binary that is world-writable, or owned by a user other than
+you or root, is refused on Unix. For languages with a tree-sitter grammar, the
+outline falls back to the tree-sitter parse when the server cannot start.
 
 {{keys:symbols}}
 

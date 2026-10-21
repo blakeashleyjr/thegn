@@ -59,6 +59,11 @@ refuse with the reason; use `thegn land` to land that branch outside the queue.
   (`deferred`, `gate_failed`, `gate_error`, `agent_blocked`, or `needs_human`)
   after you've fixed something, and refuses every other state. The section's
   `r` gesture follows its own retry path.
+- A local queue row is bound to the branch tip recorded at enqueue. If the
+  branch moves or disappears before a fold, or a fixing agent leaves the
+  worktree off that branch, the row is held `agent_blocked` with an
+  `identity drift:` reason and no attempt spent. `thegn merge add` re-enqueues
+  it against the current tip.
 
 ## Land strategy, signing, drivers
 
@@ -71,6 +76,9 @@ for a branch already merged. Within that, `[merge_queue]` lets you shape it:
   (`linear`; the branch's own commits replayed one at a time, keeping
   their original author). `land_message` templates the merge/squash
   subject (`{branch}`, `{target}`, `{subjects}`).
+  With `rebase`, a branch containing merge commits is held `needs_human` before
+  replay starts; no fixing agent runs. Land it with the merge or squash
+  strategy, or linearize the branch.
 - **`sign_commits`** — sign the fold/land commits thegn creates. Signing
   is always non-interactive: a locked agent, a missing key, or anything
   that would prompt stops the drain as an _infrastructure_ error with a
@@ -221,6 +229,11 @@ The control URL handed to a remote environment comes only from a live
 the configured scheme. If live servers advertise different URLs, enqueue
 refuses until only one origin is advertised.
 
+For a branch on another host, the drain fetches its tip into a private
+per-attempt ref and removes that ref afterwards. Just before moving the target
+branch, it reads the source tip again; if it moved, the land stops with a
+`source_moved` gate error and retries on the next drain.
+
 ## The fixing agent
 
 Point the handoff at an agent either by naming one of your `[[agents]]`
@@ -324,6 +337,11 @@ one of them is about your branch:
   cancelled). The JSON `gate_verdicts` entries carry both fields.
   `thegn integrate` and `thegn land` include the same `(phase/class)` pair in
   their gate-error messages.
+
+Before each candidate, a reused gate worktree is cleaned of untracked files;
+ignored files such as build output remain as a warm cache. Its tracked files are
+hashed after setup and checked again after the gate. A changed tracked file
+makes the gate an error, not a pass.
 
 ## Driving it from an agent pane
 
