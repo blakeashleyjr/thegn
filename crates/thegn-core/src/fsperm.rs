@@ -593,6 +593,44 @@ impl PrivateDir {
         &self.path
     }
 
+    /// Create an owner-only temporary file relative to this pinned directory.
+    /// The returned name can be passed to [`Self::remove_file`] for cleanup.
+    #[cfg(unix)]
+    pub fn create_owner_only_temp(&self, bytes: &[u8]) -> std::io::Result<(String, PathBuf)> {
+        use nix::fcntl::{OFlag, openat};
+        use nix::sys::stat::Mode;
+
+        for _ in 0..8 {
+            let name = format!("prompt-{}", temp_token());
+            let fd = match openat(
+                &self.fd,
+                name.as_str(),
+                OFlag::O_CREAT
+                    | OFlag::O_EXCL
+                    | OFlag::O_NOFOLLOW
+                    | OFlag::O_WRONLY
+                    | OFlag::O_CLOEXEC,
+                Mode::from_bits_truncate(0o600),
+            ) {
+                Ok(fd) => fd,
+                Err(nix::errno::Errno::EEXIST) => continue,
+                Err(error) => return Err(nix_io_error(error)),
+            };
+            let mut file = std::fs::File::from(fd);
+            if let Err(error) = file.write_all(bytes) {
+                if let Err(cleanup_error) = self.remove_file(&name) {
+                    tracing::debug!(%cleanup_error, "unable to remove incomplete private temporary file");
+                }
+                return Err(error);
+            }
+            return Ok((name.clone(), self.path.join(name)));
+        }
+        Err(std::io::Error::new(
+            std::io::ErrorKind::AlreadyExists,
+            "could not allocate a unique private temporary file",
+        ))
+    }
+
     /// Open one regular file without following a leaf symlink, relative to
     /// this held directory handle.
     pub fn open_regular_nofollow(&self, name: &str) -> std::io::Result<std::fs::File> {

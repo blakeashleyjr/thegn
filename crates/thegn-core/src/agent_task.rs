@@ -128,8 +128,10 @@ impl fmt::Display for TaskKind {
 }
 
 /// Variables a command template may reference, for every kind. `{prompt}` is
-/// the rendered prompt; the rest identify the work.
-pub const COMMAND_VARS: &[&str] = &["prompt", "branch", "target", "worktree"];
+/// the rendered prompt, placed in the agent's argv (visible to other
+/// processes); `{prompt_file}` is the path of an owner-only file holding that
+/// prompt, removed when the run ends. The rest identify the work.
+pub const COMMAND_VARS: &[&str] = &["prompt", "prompt_file", "branch", "target", "worktree"];
 
 /// Variables a `[[pipeline.stages]] prompt` template may reference: everything
 /// [`TaskKind::Issue`] binds, plus the three facts a *stage* adds — which stage
@@ -2289,5 +2291,25 @@ mod tests {
         assert_eq!(input_max_bytes(TaskKind::PrCiFailure, "pr_title"), 512);
         assert_eq!(input_max_bytes(TaskKind::PrCiFailure, "log"), 16 * 1024);
         assert_eq!(input_max_bytes(TaskKind::PrCiFailure, "checks"), 4 * 1024);
+    }
+
+    #[test]
+    fn command_templates_accept_a_bare_prompt_file_placeholder() {
+        assert_eq!(
+            validate_template("agent --prompt-file {prompt_file}", COMMAND_VARS, true),
+            Ok(())
+        );
+        assert!(matches!(
+            validate_template(r#"agent "{prompt_file}""#, COMMAND_VARS, true),
+            Err(TemplateError::QuotedPlaceholder { .. })
+        ));
+        assert!(matches!(
+            validate_template(
+                "fix {prompt_file}",
+                TaskKind::MergeConflict.prompt_vars(),
+                false
+            ),
+            Err(TemplateError::UnknownVar { .. })
+        ));
     }
 }
