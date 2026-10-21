@@ -21,7 +21,7 @@ use thegn_core::config::{CiConfig, CiProviderKind};
 use thegn_core::remote::GitLoc;
 use thegn_core::secretref::BareAs;
 
-use std::collections::{HashSet, VecDeque};
+use std::collections::VecDeque;
 use std::io::Read;
 use std::process::{Command, Stdio};
 use std::sync::{Arc, atomic::AtomicBool};
@@ -996,7 +996,7 @@ pub fn validate_workflow_selector(value: &str) -> Result<&str, CiError> {
 /// Validate the inputs passed to a manually triggered workflow.
 /// Error messages identify keys only and never include input values.
 pub fn validate_trigger_inputs(inputs: &[(String, String)]) -> Result<(), CiError> {
-    let mut seen = HashSet::with_capacity(inputs.len());
+    let mut seen = std::collections::HashSet::with_capacity(inputs.len());
     for (key, value) in inputs {
         let mut chars = key.chars();
         let valid_key = chars
@@ -1341,7 +1341,6 @@ impl CiProvider for GithubCi {
         workflow: &str,
         inputs: &[(String, String)],
     ) -> Result<(), CiError> {
-        validate_workflow_selector(workflow)?;
         validate_trigger_inputs(inputs)?;
         let args = github_workflow_argv(workflow, inputs)?;
         let argv: Vec<&str> = args.iter().map(String::as_str).collect();
