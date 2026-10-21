@@ -682,6 +682,7 @@ fn setup_and_schedule_with_waker(
         tracing::warn!(target: "thegn::plugin", error = %problem, "native plugin refused without explicit trust");
     }
     let mut loaded: Vec<LoadedState> = Vec::new();
+    let mut registered: Vec<String> = Vec::new();
     let mut resolved_envs: BTreeMap<String, BTreeMap<String, String>> = BTreeMap::new();
     let now = Instant::now();
     for (plugin, negotiated) in discovered {
@@ -712,6 +713,7 @@ fn setup_and_schedule_with_waker(
                         session.kill();
                         None
                     } else {
+                        registered.push(id.clone());
                         Some(w)
                     }
                 }
@@ -769,8 +771,16 @@ fn setup_and_schedule_with_waker(
     }
     drop(resolved_envs);
 
-    // best-effort: the loop may already be tearing down.
-    let _ = tx.send(PluginMsg::Loaded(loaded));
+    if let Err(error) = tx.send(PluginMsg::Loaded(loaded)) {
+        tracing::warn!(target: "thegn::plugin", %error, closing = registered.len(), "plugin loop is gone before startup publish; closing the sessions this setup started");
+        let mut map = lock(&sessions);
+        for id in &registered {
+            if let Some(session) = map.remove(id) {
+                session.kill();
+            }
+        }
+        return;
+    }
     if let Some(waker) = &waker {
         let _ = waker.wake(); // best-effort: waker pulse: an input nudge must never fail the calling path
     }
@@ -926,6 +936,59 @@ mod tests {
         second.cadence = CadenceHint::Interval { millis: 300 };
         spec.manifest.contributions.push(second);
         spec
+    }
+
+    fn resident_pidfile_spec(pidfile: &std::path::Path) -> PluginSpec {
+        let mut spec = example_spec();
+        spec.mode = PluginMode::Resident;
+        spec.manifest.contributions.clear();
+        spec.command = vec![
+            "sh".into(),
+            "-c".into(),
+            "echo $$ > \"$1\"; exec sleep 30".into(),
+            "plugin".into(),
+            pidfile.display().to_string(),
+        ];
+        spec
+    }
+
+    fn wait_for_pidfile_and_exit(pidfile: &std::path::Path) {
+        let started = Instant::now();
+        let deadline = started + Duration::from_secs(10);
+        let pid = loop {
+            match std::fs::read_to_string(pidfile) {
+                Ok(contents) if contents.trim().is_empty() => return,
+                Ok(contents) => match contents.trim().parse::<i32>() {
+                    Ok(pid) => break pid,
+                    Err(_) if Instant::now() < deadline => {
+                        std::thread::sleep(Duration::from_millis(10));
+                    }
+                    Err(_) => panic!(
+                        "pid file remained unparsable after {:?}: {contents:?}",
+                        started.elapsed()
+                    ),
+                },
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => return,
+                Err(error) if Instant::now() < deadline => {
+                    tracing::debug!(%error, "retrying resident pid file read");
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                Err(error) => panic!(
+                    "could not read pid file after {:?}: {error}",
+                    started.elapsed()
+                ),
+            }
+        };
+        while !crate::platform::sound_process::test_support::pid_gone(pid)
+            && Instant::now() < deadline
+        {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let elapsed = started.elapsed();
+        assert!(
+            crate::platform::sound_process::test_support::pid_gone(pid),
+            "pid {pid} was still alive after {elapsed:?}"
+        );
     }
 
     #[test]
@@ -1311,6 +1374,244 @@ mod tests {
         assert!(lock(&sessions).is_empty());
         assert!(!marker.exists());
         assert!(rx.try_recv().is_err());
+    }
+
+    // Startup stages: admit is covered by startup_publishes_empty_set_and_does_not_run_duplicate_one_shots
+    // and startup_uses_the_admitted_set_and_spawns_nothing_on_a_negotiate_failure; env is covered by
+    // startup_refuses_unset_plugin_env_without_running_one_shot. The tests below cover spawn, register,
+    // and publish with real failures.
+    #[test]
+    fn startup_publish_failure_closes_registered_resident_sessions() {
+        if !crate::platform::sound_process::test_support::UNIX {
+            return;
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        let pidfile = tmp.path().join("plugin.pid");
+        let spec = resident_pidfile_spec(&pidfile);
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .unwrap();
+        let supervisor = ResidentSupervisor::new(runtime.handle().clone());
+        let probe = supervisor.clone();
+        let sessions: Sessions = Arc::new(Mutex::new(BTreeMap::new()));
+        let disabled: Disabled = Arc::new(Mutex::new(Default::default()));
+        let stop = Arc::new(StopSignal::default());
+        let (waker, _master, _terminal) =
+            crate::platform::sound_process::test_support::test_waker();
+        let (tx, rx) = plugin_channel();
+        drop(rx);
+
+        setup_and_schedule_with_waker(
+            supervisor,
+            vec![spec],
+            tmp.path().to_path_buf(),
+            sessions.clone(),
+            disabled,
+            stop,
+            tx,
+            Some(waker),
+            OneShotGate::default(),
+            tmp.path().join("state"),
+        );
+
+        assert!(probe.wait_for_release("hello").is_ok());
+        assert!(lock(&sessions).is_empty());
+        wait_for_pidfile_and_exit(&pidfile);
+    }
+
+    #[test]
+    fn startup_publish_failure_runs_no_initial_one_shot() {
+        let tmp = tempfile::tempdir().unwrap();
+        let marker = tmp.path().join("ran");
+        let mut spec = example_spec();
+        spec.mode = PluginMode::OneShot;
+        spec.manifest.contributions.clear();
+        spec.command = vec![
+            "sh".into(),
+            "-c".into(),
+            "touch \"$1\"".into(),
+            "plugin".into(),
+            marker.display().to_string(),
+        ];
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let supervisor = ResidentSupervisor::new(runtime.handle().clone());
+        let sessions: Sessions = Arc::new(Mutex::new(BTreeMap::new()));
+        let disabled: Disabled = Arc::new(Mutex::new(Default::default()));
+        let stop = Arc::new(StopSignal::default());
+        let (tx, rx) = plugin_channel();
+        drop(rx);
+
+        setup_and_schedule_with_waker(
+            supervisor,
+            vec![spec],
+            tmp.path().to_path_buf(),
+            sessions.clone(),
+            disabled,
+            stop,
+            tx,
+            None,
+            OneShotGate::default(),
+            tmp.path().join("state"),
+        );
+
+        assert!(lock(&sessions).is_empty());
+        assert!(!marker.exists());
+    }
+
+    #[test]
+    fn startup_publish_failure_does_not_start_the_scheduler() {
+        let tmp = tempfile::tempdir().unwrap();
+        let marker = tmp.path().join("ran");
+        let mut spec = example_spec();
+        spec.command = vec![
+            "sh".into(),
+            "-c".into(),
+            "touch \"$1\"".into(),
+            "plugin".into(),
+            marker.display().to_string(),
+        ];
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let supervisor = ResidentSupervisor::new(runtime.handle().clone());
+        let sessions: Sessions = Arc::new(Mutex::new(BTreeMap::new()));
+        let disabled: Disabled = Arc::new(Mutex::new(Default::default()));
+        let stop = Arc::new(StopSignal::default());
+        let worker_stop = stop.clone();
+        let (tx, rx) = plugin_channel();
+        drop(rx);
+        let (returned_tx, returned_rx) = std::sync::mpsc::channel();
+        let worker_sessions = sessions.clone();
+        let worker_disabled = disabled.clone();
+        let worker_tmp = tmp.path().to_path_buf();
+        let worker = std::thread::spawn(move || {
+            setup_and_schedule_with_waker(
+                supervisor,
+                vec![spec],
+                worker_tmp.clone(),
+                worker_sessions,
+                worker_disabled,
+                worker_stop,
+                tx,
+                None,
+                OneShotGate::default(),
+                worker_tmp.join("state"),
+            );
+            returned_tx.send(()).unwrap();
+        });
+
+        let returned = returned_rx.recv_timeout(Duration::from_secs(5)).is_ok();
+        stop.stop();
+        worker.join().unwrap();
+        assert!(
+            returned,
+            "startup stayed in the scheduler after publish failed"
+        );
+        assert!(lock(&sessions).is_empty());
+        assert!(!marker.exists());
+    }
+
+    #[test]
+    fn startup_resident_spawn_failure_leaves_no_session() {
+        if !crate::platform::sound_process::test_support::UNIX {
+            return;
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        let mut spec = example_spec();
+        spec.mode = PluginMode::Resident;
+        spec.manifest.contributions.clear();
+        spec.command = vec!["/nonexistent/thegn-plugin-test".into()];
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let supervisor = ResidentSupervisor::new(runtime.handle().clone());
+        let sessions: Sessions = Arc::new(Mutex::new(BTreeMap::new()));
+        let disabled: Disabled = Arc::new(Mutex::new(Default::default()));
+        let stop = Arc::new(StopSignal::default());
+        let (waker, _master, _terminal) =
+            crate::platform::sound_process::test_support::test_waker();
+        let (tx, mut rx) = plugin_channel();
+
+        setup_and_schedule_with_waker(
+            supervisor,
+            vec![spec],
+            tmp.path().to_path_buf(),
+            sessions.clone(),
+            disabled,
+            stop,
+            tx,
+            Some(waker),
+            OneShotGate::default(),
+            tmp.path().join("state"),
+        );
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let loaded = loop {
+            assert!(
+                Instant::now() < deadline,
+                "startup did not publish Loaded before timeout"
+            );
+            match rx.try_recv() {
+                Ok(PluginMsg::Loaded(loaded)) => break loaded,
+                Ok(_) => {}
+                Err(_) => {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+            }
+        };
+        // A plugin whose resident spawn failed publishes no live writer
+        // (it may be absent from Loaded entirely) and leaves no session.
+        assert!(loaded.iter().all(|state| state.writer.is_none()));
+        assert!(lock(&sessions).is_empty());
+    }
+
+    #[test]
+    fn startup_stopped_host_kills_the_resident_it_just_spawned() {
+        if !crate::platform::sound_process::test_support::UNIX {
+            return;
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        let pidfile = tmp.path().join("plugin.pid");
+        let spec = resident_pidfile_spec(&pidfile);
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .unwrap();
+        let supervisor = ResidentSupervisor::new(runtime.handle().clone());
+        let probe = supervisor.clone();
+        let sessions: Sessions = Arc::new(Mutex::new(BTreeMap::new()));
+        let disabled: Disabled = Arc::new(Mutex::new(Default::default()));
+        let stop = Arc::new(StopSignal::default());
+        stop.stop();
+        let (waker, _master, _terminal) =
+            crate::platform::sound_process::test_support::test_waker();
+        let (tx, mut rx) = plugin_channel();
+
+        setup_and_schedule_with_waker(
+            supervisor,
+            vec![spec],
+            tmp.path().to_path_buf(),
+            sessions.clone(),
+            disabled,
+            stop,
+            tx,
+            Some(waker),
+            OneShotGate::default(),
+            tmp.path().join("state"),
+        );
+
+        assert!(matches!(rx.try_recv().unwrap(), PluginMsg::Loaded(loaded) if loaded.len() == 1));
+        assert!(probe.wait_for_release("hello").is_ok());
+        assert!(lock(&sessions).is_empty());
+        wait_for_pidfile_and_exit(&pidfile);
     }
 
     #[test]
