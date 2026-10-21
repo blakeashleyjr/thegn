@@ -2764,6 +2764,8 @@ pub(crate) type HunkMsg = (u64, u64, String, Vec<thegn_svc::git::Hunk>);
 type SubmoduleScanMsg = (
     u64,
     u64,
+    PathBuf,
+    Option<crate::diff_watch::WatchPrint>,
     Option<Vec<thegn_core::submodule::SubmoduleDiff>>,
     Option<Vec<thegn_core::submodule::SubmoduleState>>,
 );
@@ -2802,6 +2804,22 @@ impl ScanCoalescer {
     }
 }
 
+/// THE-999: remember the watcher print at which the active worktree's last
+/// complete gitlink scan started, so unchanged hydration applies can skip it.
+static SUBMODULE_SEEN: crate::diff_watch::Seen = crate::diff_watch::Seen::new();
+
+/// Skip only when the same merged worktree still has the print from its last
+/// complete scan and no displayed gitlink needs its own HEAD refreshed.
+fn submodule_scan_due(
+    seen: &crate::diff_watch::Seen,
+    active: &Path,
+    print: Option<crate::diff_watch::WatchPrint>,
+    merged_for: Option<&Path>,
+    has_gitlink_rows: bool,
+) -> bool {
+    has_gitlink_rows || !(merged_for == Some(active) && seen.matches(active, print))
+}
+
 /// Enrich hydrated change rows with gitlink data without putting git reads on
 /// either hydration's ordinary-file path or the event loop. Each read remains
 /// independently degradable (`None` retains the last-known field).
@@ -2809,6 +2827,7 @@ fn spawn_submodule_scan(
     generation: u64,
     token: u64,
     session: &crate::session::Session,
+    print: Option<crate::diff_watch::WatchPrint>,
     tx: &tokio_mpsc::UnboundedSender<SubmoduleScanMsg>,
     waker: &TerminalWaker,
 ) {
@@ -2821,7 +2840,10 @@ fn spawn_submodule_scan(
         let git = thegn_svc::git::CliGit;
         let diffs = git.submodule_diffs(&loc, "HEAD").ok();
         let states = git.submodule_states(&loc).ok();
-        if tx.send((generation, token, diffs, states)).is_ok() {
+        if tx
+            .send((generation, token, wt, print, diffs, states))
+            .is_ok()
+        {
             let _ = waker.wake(); // best-effort: a closed terminal is already exiting
         }
     });
@@ -6802,6 +6824,7 @@ async fn event_loop<T: Terminal>(
         tokio_mpsc::unbounded_channel::<crate::handlers::panel_changes::SubmodulePreviewMsg>();
     let mut submodule_preview_inflight = crate::handlers::panel_changes::PreviewOwners::default();
     let mut submodule_scans = ScanCoalescer::default();
+    let mut submodule_merged_for: Option<PathBuf> = None;
     // Stale-while-revalidate switch cache: the last-known per-worktree slice
     // (panel + tab-bar chips + timeline — see `handlers::switch_cache`). On a
     // worktree switch we paint the cached slice instantly (no blank flash, no
@@ -9385,6 +9408,7 @@ async fn event_loop<T: Terminal>(
             hunk_inflight.clear();
             submodule_preview_inflight.clear();
             submodule_scans.reset();
+            submodule_merged_for = None;
             outline_key = None;
             outline_syms.clear();
             outline_inflight = None;
@@ -11257,7 +11281,7 @@ async fn event_loop<T: Terminal>(
 
         // Gitlink state/diffs and bounded drill summaries are separate reads:
         // either can fail without erasing the other or fabricating a clean row.
-        while let Ok((generation, token, diffs, states)) = submodule_scan_rx.try_recv() {
+        while let Ok((generation, token, wt, print, diffs, states)) = submodule_scan_rx.try_recv() {
             loop_perf.tick(crate::perf::WakeSource::Hunk);
             let refresh = submodule_scans.complete(token);
             if generation == hydration_gen {
@@ -11268,19 +11292,42 @@ async fn event_loop<T: Terminal>(
                     states.as_deref(),
                 );
                 dirty |= before != model.panel.changes;
+                if diffs.is_some() && states.is_some() {
+                    SUBMODULE_SEEN.mark(&wt, print);
+                    submodule_merged_for = Some(wt.clone());
+                }
             }
-            if refresh
-                && active_submodules_enabled(&session, &current_config)
-                && !model.panel.changes.is_empty()
-                && let Some(next_token) = submodule_scans.request()
-            {
-                spawn_submodule_scan(
-                    hydration_gen,
-                    next_token,
-                    &session,
-                    &submodule_scan_tx,
-                    &waker,
-                );
+            if refresh {
+                let active = active_tab_path(&session);
+                if submodule_merged_for.as_deref() != Some(active.as_path()) {
+                    submodule_merged_for = None;
+                }
+                let print = crate::diff_watch::current_print(&active);
+                let has_gitlink_rows = model
+                    .panel
+                    .changes
+                    .iter()
+                    .any(|row| row.submodule.is_some());
+                if active_submodules_enabled(&session, &current_config)
+                    && !model.panel.changes.is_empty()
+                    && submodule_scan_due(
+                        &SUBMODULE_SEEN,
+                        &active,
+                        print,
+                        submodule_merged_for.as_deref(),
+                        has_gitlink_rows,
+                    )
+                    && let Some(next_token) = submodule_scans.request()
+                {
+                    spawn_submodule_scan(
+                        hydration_gen,
+                        next_token,
+                        &session,
+                        print,
+                        &submodule_scan_tx,
+                        &waker,
+                    );
+                }
             }
         }
         while let Ok((generation, token, path, summary)) = submodule_preview_rx.try_recv() {
@@ -12093,11 +12140,35 @@ async fn event_loop<T: Terminal>(
             model.ctrl_digits_reportable = ctrl_digits_reportable;
             model.notification_delivery = notification_delivery;
             model.notification_delivery_configured = notification_delivery_configured;
+            let active = active_tab_path(&session);
+            let print = crate::diff_watch::current_print(&active);
+            if submodule_merged_for.as_deref() != Some(active.as_path()) {
+                submodule_merged_for = None;
+            }
+            let has_gitlink_rows = model
+                .panel
+                .changes
+                .iter()
+                .any(|row| row.submodule.is_some());
             if active_submodules_enabled
                 && !model.panel.changes.is_empty()
+                && submodule_scan_due(
+                    &SUBMODULE_SEEN,
+                    &active,
+                    print,
+                    submodule_merged_for.as_deref(),
+                    has_gitlink_rows,
+                )
                 && let Some(token) = submodule_scans.request()
             {
-                spawn_submodule_scan(hydration_gen, token, &session, &submodule_scan_tx, &waker);
+                spawn_submodule_scan(
+                    hydration_gen,
+                    token,
+                    &session,
+                    print,
+                    &submodule_scan_tx,
+                    &waker,
+                );
             }
             // The tab strip is LOOP-owned: `build_model` derived it from the
             // session snapshot the hydration thread was handed, which predates
