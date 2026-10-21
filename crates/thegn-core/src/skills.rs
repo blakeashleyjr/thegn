@@ -1016,6 +1016,7 @@ mod tests {
             .join(" ");
         assert!(monitor.contains("--lease \"$lease_name\" --owner \"$lease_owner\""));
         assert!(collapsed.contains("--lease \"<recorded lease name>\""));
+        assert!(collapsed.contains("--resume-work <row-id> --lease \"<recorded lease name>\""));
         assert!(collapsed.contains("thegn dispatch gate"));
         assert!(!collapsed.contains("Thegn does not yet check the lease inside `dispatch claim`, `set-status`, or `session open --stage`"));
         assert!(!collapsed.contains("The lease is not yet checked by mutations."));

@@ -100,6 +100,23 @@ pub enum Action {
         force: bool,
         #[arg(long, value_name = "REASON")]
         force_reason: Option<String>,
+        /// The Lead lease this roster mutation is made under.
+        #[arg(
+            long,
+            value_name = "NAME",
+            requires = "owner",
+            conflicts_with = "admin"
+        )]
+        lease: Option<String>,
+        /// The owner id holding `--lease`.
+        #[arg(long, value_name = "ID", requires = "lease")]
+        owner: Option<String>,
+        /// Manual roster administration: skip the lease check and record `--why`.
+        #[arg(long, requires = "why")]
+        admin: bool,
+        /// Audit reason for manual roster administration.
+        #[arg(long, value_name = "REASON", requires = "admin")]
+        why: Option<String>,
         /// Emit the created row as JSON.
         #[arg(long)]
         json: bool,
@@ -499,9 +516,14 @@ pub fn run(cfg: &Config, action: Action) -> Result<()> {
             chunk,
             force,
             force_reason,
+            lease,
+            owner,
+            admin,
+            why,
             json,
         } => {
             let db = Db::open()?;
+            let proof = lead_proof(lease.as_deref(), owner.as_deref(), admin, why.as_deref());
             if let Some(chunk_path) = chunk.as_deref() {
                 if force && force_reason.as_deref().is_none_or(|s| s.trim().is_empty()) {
                     anyhow::bail!("dispatch put --chunk --force requires --force-reason <reason>");
@@ -515,7 +537,7 @@ pub fn run(cfg: &Config, action: Action) -> Result<()> {
                 let limit = cfg.pipeline.stage(name).map(|s| s.concurrency).ok_or_else(|| {
                     anyhow::anyhow!("unknown pipeline stage {name:?}; configure it before putting a chunk dispatch")
                 })?;
-                let row = claim_chunk_put(
+                let row = match claim_chunk_put(
                     &db,
                     NewDispatch {
                         issue_id: &issue_id,
@@ -529,7 +551,22 @@ pub fn run(cfg: &Config, action: Action) -> Result<()> {
                     },
                     limit,
                     if force { force_reason.as_deref() } else { None },
-                )?;
+                    proof,
+                ) {
+                    Ok(row) => row,
+                    Err(error) => {
+                        if json
+                            && error
+                                .downcast_ref::<thegn_core::db::LeadLeaseConflict>()
+                                .is_some()
+                        {
+                            super::emit_json(
+                                &serde_json::json!({"granted": false, "reason": error.to_string(), "error": "lead_lease"}),
+                            )?;
+                        }
+                        return Err(error);
+                    }
+                };
                 if json {
                     let mut v = serde_json::to_value(&row)?;
                     if force {
@@ -556,7 +593,7 @@ pub fn run(cfg: &Config, action: Action) -> Result<()> {
                 !force,
                 "dispatch put --force only applies with --chunk (a put without a chunk has no gate to override); drop --force"
             );
-            let row = put(
+            let row = match put_led(
                 &db,
                 NewDispatch {
                     issue_id: &issue_id,
@@ -568,7 +605,22 @@ pub fn run(cfg: &Config, action: Action) -> Result<()> {
                     artifact_path: artifact.as_deref(),
                     chunk_path: chunk.as_deref(),
                 },
-            )?;
+                proof,
+            ) {
+                Ok(row) => row,
+                Err(error) => {
+                    if json
+                        && error
+                            .downcast_ref::<thegn_core::db::LeadLeaseConflict>()
+                            .is_some()
+                    {
+                        super::emit_json(
+                            &serde_json::json!({"granted": false, "reason": error.to_string(), "error": "lead_lease"}),
+                        )?;
+                    }
+                    return Err(error);
+                }
+            };
             if json {
                 return super::emit_json(&serde_json::to_value(&row)?);
             }
@@ -614,10 +666,15 @@ pub fn run(cfg: &Config, action: Action) -> Result<()> {
 /// Insert one roster row and read it back. Split from the clap arm (and taking
 /// an explicit `&Db`) so the insert is testable against an isolated database —
 /// `Db::open()` would hit the developer's live state.
-fn put(db: &Db, new: NewDispatch<'_>) -> Result<AgentDispatch> {
-    let id = db.put_dispatch_with_parent_check(new)?;
+fn put_led(db: &Db, new: NewDispatch<'_>, proof: LeadProof<'_>) -> Result<AgentDispatch> {
+    let id = db.put_dispatch_with_parent_check_led(new, proof)?;
     db.get_dispatch(id)?
         .ok_or_else(|| anyhow::anyhow!("dispatch {id} vanished after insert"))
+}
+
+#[cfg(test)]
+fn put(db: &Db, new: NewDispatch<'_>) -> Result<AgentDispatch> {
+    put_led(db, new, LeadProof::Unbound)
 }
 
 /// Test-only assertion helper for the existing `pipeline_chunk` overlap and
@@ -877,6 +934,7 @@ fn lead_proof<'a>(
     }
 }
 
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn claim_admitted_with_refresh(
     db: &Db,
@@ -955,11 +1013,12 @@ fn claim_chunk_put(
     new: NewDispatch<'_>,
     limit: u32,
     allow_scope: Option<&str>,
+    proof: LeadProof<'_>,
 ) -> Result<AgentDispatch> {
     let worktree = new.worktree_path.to_string();
     let issue_id = new.issue_id.to_string();
     let chunk_path = new.chunk_path.map(str::to_string);
-    let outcome = claim_admitted_with_refresh(
+    let outcome = claim_admitted_with_refresh_led(
         db,
         new,
         limit,
@@ -968,6 +1027,7 @@ fn claim_chunk_put(
         &issue_id,
         chunk_path.as_deref(),
         allow_scope,
+        proof,
     )?;
     match outcome {
         Ok(id) => db
@@ -4179,6 +4239,7 @@ mod tests {
             },
             3,
             None,
+            LeadProof::Unbound,
         );
         assert!(result.unwrap_err().to_string().contains("collides"));
         assert_eq!(db.list_dispatches().unwrap().len(), 1);
@@ -4941,6 +5002,10 @@ mod tests {
                     chunk: None,
                     force: false,
                     force_reason: None,
+                    lease: None,
+                    owner: None,
+                    admin: false,
+                    why: None,
                     json: false,
                 },
                 WorkerRoute::Refused("put"),
@@ -5530,5 +5595,34 @@ mod tests {
             lease: "repo:issue".into(),
         });
         assert_eq!(set_status_error_kind(&error), Some("lead_lease"));
+    }
+
+    #[test]
+    fn lead_lease_put_cli_parses_lease_owner_and_admin() {
+        use clap::Parser as _;
+        assert!(
+            crate::Cli::try_parse_from([
+                "thegn", "dispatch", "put", "linear:X", "/w", "a", "--lease", "l", "--owner", "o"
+            ])
+            .is_ok()
+        );
+        assert!(
+            crate::Cli::try_parse_from([
+                "thegn", "dispatch", "put", "linear:X", "/w", "a", "--lease", "l"
+            ])
+            .is_err()
+        );
+        assert!(
+            crate::Cli::try_parse_from([
+                "thegn", "dispatch", "put", "linear:X", "/w", "a", "--admin"
+            ])
+            .is_err()
+        );
+        assert!(
+            crate::Cli::try_parse_from([
+                "thegn", "dispatch", "put", "linear:X", "/w", "a", "--admin", "--why", "manual"
+            ])
+            .is_ok()
+        );
     }
 }
