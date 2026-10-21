@@ -269,9 +269,8 @@ fn respawn_now(plugin: LoadedPlugin, ctx: &RespawnCtx) {
                 }
                 let disabled = lock(&ctx.disabled).contains(&id);
                 if disabled {
-                    match lock(&ctx.sessions).remove(&id) {
-                        Some(session) => session.kill(),
-                        None => {}
+                    if let Some(session) = lock(&ctx.sessions).remove(&id) {
+                        session.kill();
                     }
                     return;
                 }
