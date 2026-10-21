@@ -478,7 +478,7 @@ impl Db {
                 .optional()?
                 .flatten();
             let bound = bound.into_iter().collect::<Vec<_>>();
-            let audit = lead_check(&conn, &bound, proof, util::now_ms())?;
+            let audit = lead_check(conn, &bound, proof, util::now_ms())?;
             let changed = if expected == AgentDispatchStatus::Unknown {
                 conn.execute("UPDATE agent_dispatches SET status=?1 WHERE id=?2 AND trim(status) NOT IN (?3,?4,?5,?6,?7,?8,?9,?10,?11)", rusqlite::params![to.as_str(), id, AgentDispatchStatus::Queued.as_str(), AgentDispatchStatus::Spawning.as_str(), AgentDispatchStatus::Running.as_str(), AgentDispatchStatus::WaitingHuman.as_str(), AgentDispatchStatus::PrOpen.as_str(), AgentDispatchStatus::Merged.as_str(), AgentDispatchStatus::Abandoned.as_str(), AgentDispatchStatus::Done.as_str(), AgentDispatchStatus::Failed.as_str()])?
             } else {
@@ -567,7 +567,7 @@ impl Db {
                 .optional()?
                 .flatten();
             let audit = lead_check(
-                &conn,
+                conn,
                 &bound.into_iter().collect::<Vec<_>>(),
                 proof,
                 util::now_ms(),
@@ -623,7 +623,7 @@ impl Db {
             return Err(anyhow::Error::new(MissingDispatch { id }));
         };
         let _audit_note = lead_check(
-            &conn,
+            conn,
             &bound.into_iter().collect::<Vec<_>>(),
             proof,
             util::now_ms(),
@@ -1459,7 +1459,7 @@ impl Db {
                     |row| row.get::<_, String>(0),
                 )?
                 .collect::<rusqlite::Result<Vec<_>>>()?;
-            let audit_note = lead_check(&conn, &bound, proof, util::now_ms())?;
+            let audit_note = lead_check(conn, &bound, proof, util::now_ms())?;
             let rows = self.admission_rows(new.issue_id, new.worktree_path)?;
             if let Some(parent_id) = new.parent_id {
                 self.validate_parent_edge(parent_id, new.issue_id)?;
@@ -5153,5 +5153,86 @@ mod tests {
         )
         .unwrap();
         assert_eq!(lead_status(&db, id), AgentDispatchStatus::Running);
+    }
+
+    #[test]
+    fn lead_lease_conflicts_name_the_lease_and_recovery_options() {
+        let conflicts = [
+            (
+                LeadLeaseConflict::NotHeld {
+                    lease: "lease-not-held".into(),
+                    holder: None,
+                },
+                "lease-not-held",
+            ),
+            (
+                LeadLeaseConflict::Required {
+                    lease: "lease-required".into(),
+                },
+                "lease-required",
+            ),
+            (
+                LeadLeaseConflict::Mismatch {
+                    bound: "lease-bound".into(),
+                    presented: "lease-presented".into(),
+                },
+                "lease-bound",
+            ),
+        ];
+
+        for (conflict, lease) in conflicts {
+            let message = conflict.to_string();
+            assert!(message.contains(lease), "{message}");
+            assert!(message.contains("--admin --why"), "{message}");
+        }
+    }
+
+    #[test]
+    fn lead_lease_check_reports_missing_required_and_allows_unbound_rows() {
+        let db = Db::open_memory().unwrap();
+        let missing = db.check_dispatch_lead(999, LeadProof::Unbound);
+        assert!(matches!(
+            missing,
+            Err(error) if error.downcast_ref::<MissingDispatch>().is_some()
+        ));
+
+        let unbound = lead_claim(&db, "linear:UNBOUND", "/wt/unbound", LeadProof::Unbound).unwrap();
+        db.check_dispatch_lead(unbound, LeadProof::Unbound).unwrap();
+
+        db.acquire_pipeline_lease("repo:linear:BOUND", "lead-a", 300)
+            .unwrap()
+            .unwrap();
+        let bound = lead_claim(
+            &db,
+            "linear:BOUND",
+            "/wt/bound",
+            LeadProof::Lease {
+                name: "repo:linear:BOUND",
+                owner: "lead-a",
+            },
+        )
+        .unwrap();
+        let required = db.check_dispatch_lead(bound, LeadProof::Unbound);
+        assert!(matches!(
+            required,
+            Err(error) if matches!(
+                error.downcast_ref::<LeadLeaseConflict>(),
+                Some(LeadLeaseConflict::Required { lease }) if lease == "repo:linear:BOUND"
+            )
+        ));
+        let not_held = db.check_dispatch_lead(
+            bound,
+            LeadProof::Lease {
+                name: "repo:linear:BOUND",
+                owner: "lead-b",
+            },
+        );
+        assert!(matches!(
+            not_held,
+            Err(error) if matches!(
+                error.downcast_ref::<LeadLeaseConflict>(),
+                Some(LeadLeaseConflict::NotHeld { lease, .. }) if lease == "repo:linear:BOUND"
+            )
+        ));
     }
 }
