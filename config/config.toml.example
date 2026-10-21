@@ -396,8 +396,8 @@ reminder_default_mins = [10]
 #                           Google, Outlook, Fastmail, Nextcloud and Proton all
 #                           publish these, which is why there is no OAuth here.
 #   provider = "caldav"   — a CalDAV collection. Needs `url`.
-#   provider = "command"  — a trusted program (runs as you) that prints newline-delimited JSON; see
-#                           docs/help/calendar.md for the plugin contract.
+#   provider = "command"  — a trusted program (runs as you) printing
+#                           newline-delimited JSON; see docs/help/calendar.md.
 #
 # Sources are read-only: thegn never writes back to a provider.
 # [[calendar.accounts]]
@@ -426,8 +426,8 @@ reminder_default_mins = [10]
 # command = ["thegn-cal-khal"]   # argv, not a shell string — no quoting rules
 # cwd = ""
 # timeout_secs = 20              # then the child's process group is killed
-# # What the plugin is allowed to do, as "kind:target". Anything it asks for
-# # beyond this is denied and written to the plugin audit log.
+# # Capabilities the plugin's manifest may declare, as "kind:target". A manifest
+# # declaring one not listed fails the run; this is not a sandbox (runs as you).
 # capabilities = ["run:khal"]
 # [calendar.accounts.env]
 # KHAL_CONFIG = "~/.config/khal/config"
