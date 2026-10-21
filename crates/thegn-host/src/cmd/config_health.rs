@@ -308,9 +308,11 @@ mod tests {
     }
 
     // Positive control: supported Unix platforms keep this setting silent.
-    #[cfg(unix)]
     #[test]
     fn headless_queue_settings_silent_when_supported() {
+        if !crate::platform::sound_process::test_support::UNIX {
+            return;
+        }
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("config.toml");
         std::fs::write(
