@@ -16,6 +16,8 @@
 //! - a **cover** — [`cover`], called from [`crate::layer::open_layer`], the
 //!   chokepoint every boxed popup already goes through. A new popup is therefore
 //!   accounted for the moment it renders, with nothing to maintain here.
+//! - the corner card — [`cover_corner`], recorded separately because it hides
+//!   the pane caret without being an overlay over its own kitty graphics.
 //! - a **claim** — [`claim`], recorded by [`crate::seg`] when it emits a caret
 //!   seg ([`crate::seg::caret`]). A text field that draws its own `▏` says "the
 //!   real cursor belongs *here*", and the cell falls out of the actual line
@@ -45,6 +47,8 @@ use std::cell::RefCell;
 struct FrameCaret {
     /// Boxes painted over the band this frame, in draw order.
     covers: Vec<Rect>,
+    /// The corner card hides the pane caret but is not a popup over itself.
+    corner: Option<Rect>,
     /// The topmost input field asking for the real cursor. Overlays render in
     /// z-order, so the last claim wins.
     claim: Option<(usize, usize)>,
@@ -61,6 +65,7 @@ pub fn begin_frame() {
     FRAME.with(|f| {
         let mut f = f.borrow_mut();
         f.covers.clear();
+        f.corner = None;
         f.claim = None;
     });
 }
@@ -71,6 +76,12 @@ pub fn cover(rect: Rect) {
     FRAME.with(|f| f.borrow_mut().covers.push(rect));
 }
 
+/// Record the corner card separately from popup covers. Replaces the prior
+/// card because incremental frames may compose it without beginning a frame.
+pub fn cover_corner(rect: Rect) {
+    FRAME.with(|f| f.borrow_mut().corner = Some(rect));
+}
+
 /// Record that an input field wants the real cursor at `(x, y)`.
 pub fn claim(x: usize, y: usize) {
     FRAME.with(|f| f.borrow_mut().claim = Some((x, y)));
@@ -79,6 +90,14 @@ pub fn claim(x: usize, y: usize) {
 /// True when nothing painted over the band this frame — the bit the render plan
 /// uses to decide whether a pane-only frame would corrupt an overlay.
 pub fn no_covers() -> bool {
+    FRAME.with(|f| {
+        let f = f.borrow();
+        f.covers.is_empty() && f.corner.is_none()
+    })
+}
+
+/// True when no popup cover was painted, excluding the corner card itself.
+pub(crate) fn no_popup_covers() -> bool {
     FRAME.with(|f| f.borrow().covers.is_empty())
 }
 
@@ -86,13 +105,17 @@ pub fn no_covers() -> bool {
 /// caret resolution, input occlusion ignores cursor claims: an overlay's text
 /// field must not make the pane chrome underneath it clickable.
 pub(crate) fn covered_at(x: usize, y: usize) -> bool {
-    FRAME.with(|f| f.borrow().covers.iter().any(|r| contains(r, x, y)))
+    FRAME.with(|f| {
+        let f = f.borrow();
+        f.covers.iter().any(|r| contains(r, x, y)) || f.corner.is_some_and(|r| contains(&r, x, y))
+    })
 }
 
 /// Resolve this frame's caret against a pane caret, using the recorded state.
 pub fn resolve_frame(pane: Option<(usize, usize)>) -> Option<(usize, usize)> {
     FRAME.with(|f| {
         let f = f.borrow();
+        let pane = pane.filter(|(x, y)| !f.corner.is_some_and(|r| contains(&r, *x, *y)));
         resolve(f.claim, &f.covers, pane)
     })
 }
@@ -230,5 +253,43 @@ mod tests {
         begin_frame();
         assert!(no_covers());
         assert_eq!(resolve_frame(Some((30, 12))), Some((30, 12)));
+    }
+
+    #[test]
+    fn corner_cover_hides_the_caret_but_is_not_a_popup_cover() {
+        begin_frame();
+        cover_corner(rect(10, 5, 20, 6));
+
+        assert!(no_popup_covers());
+        assert!(!no_covers());
+        assert_eq!(resolve_frame(Some((12, 6))), None);
+        assert_eq!(resolve_frame(Some((40, 20))), Some((40, 20)));
+        assert!(covered_at(12, 6));
+
+        claim(14, 6);
+        assert_eq!(resolve_frame(Some((12, 6))), Some((14, 6)));
+    }
+
+    #[test]
+    fn corner_cover_is_replaced_not_accumulated_and_cleared_by_begin_frame() {
+        begin_frame();
+        cover_corner(rect(10, 5, 20, 6));
+        cover_corner(rect(40, 15, 10, 5));
+
+        assert_eq!(resolve_frame(Some((12, 6))), Some((12, 6)));
+        assert_eq!(resolve_frame(Some((42, 16))), None);
+
+        begin_frame();
+        assert!(no_covers());
+        assert_eq!(resolve_frame(Some((42, 16))), Some((42, 16)));
+    }
+
+    #[test]
+    fn a_popup_over_the_corner_is_a_popup_cover() {
+        begin_frame();
+        cover_corner(rect(10, 5, 20, 6));
+        cover(rect(12, 6, 8, 4));
+
+        assert!(!no_popup_covers());
     }
 }
