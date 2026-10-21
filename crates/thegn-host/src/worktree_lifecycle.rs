@@ -945,8 +945,16 @@ pub(crate) fn destroy_one_checked(
         }
     } else if keep_files {
         let marker = worktree.join(".git");
-        match std::fs::remove_file(&marker) {
-            Ok(()) => match thegn_core::worktree::prune_registrations(repo_root) {
+        let marker_removed = match std::fs::remove_file(&marker) {
+            Ok(()) => true,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => true,
+            Err(error) => {
+                thegn_core::msg::warn(&format!("could not detach kept worktree: {error}"));
+                false
+            }
+        };
+        if marker_removed {
+            match thegn_core::worktree::prune_registrations(repo_root) {
                 Ok(()) => true,
                 Err(why) => {
                     return (
@@ -957,25 +965,9 @@ pub(crate) fn destroy_one_checked(
                         ),
                     );
                 }
-            },
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                match thegn_core::worktree::prune_registrations(repo_root) {
-                    Ok(()) => true,
-                    Err(why) => {
-                        return (
-                            false,
-                            format!(
-                                "could not detach kept worktree at {}: git worktree prune failed: {why}",
-                                worktree.display()
-                            ),
-                        );
-                    }
-                }
             }
-            Err(error) => {
-                thegn_core::msg::warn(&format!("could not detach kept worktree: {error}"));
-                false
-            }
+        } else {
+            false
         }
     } else {
         match thegn_core::worktree::remove_detailed(
