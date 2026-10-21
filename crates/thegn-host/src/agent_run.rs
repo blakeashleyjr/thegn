@@ -99,7 +99,7 @@ fn uses_prompt_file(template: &str) -> bool {
 fn prompt_file_dir(
     worktree: &str,
     sandbox: Option<&thegn_core::sandbox::SandboxSpec>,
-) -> Result<std::path::PathBuf, String> {
+) -> Result<thegn_core::fsperm::PrivateDir, String> {
     if sandbox.is_some_and(|spec| !spec.placement.is_local()) {
         return Err(
             "{prompt_file} needs a local sandbox: the prompt file cannot reach a remote placement"
@@ -110,30 +110,56 @@ fn prompt_file_dir(
     let git_dir = thegn_core::git_memo::git_dir(worktree).ok_or_else(|| {
         "{prompt_file}: the worktree has no git dir to hold the prompt file".to_string()
     })?;
-    let dir = git_dir.join("thegn-task");
-    thegn_core::fsperm::ensure_private_dir(&dir)
-        .map_err(|error| format!("{{prompt_file}}: {dir}: {error}"))?;
-    Ok(dir)
+    thegn_core::fsperm::ensure_private_dir_beneath(&git_dir, std::path::Path::new("thegn-task"))
+        .map_err(|error| {
+            format!(
+                "{{prompt_file}}: {}: {error}",
+                git_dir.join("thegn-task").display()
+            )
+        })
+}
+
+#[cfg(unix)]
+struct PromptFile {
+    directory: thegn_core::fsperm::PrivateDir,
+    name: String,
+    path: std::path::PathBuf,
+}
+
+#[cfg(unix)]
+impl PromptFile {
+    fn path(&self) -> &std::path::Path {
+        &self.path
+    }
+}
+
+#[cfg(unix)]
+impl Drop for PromptFile {
+    fn drop(&mut self) {
+        if let Err(error) = self.directory.remove_file(&self.name) {
+            tracing::debug!(%error, "unable to remove prompt file");
+        }
+    }
 }
 
 #[cfg(unix)]
 fn write_prompt_file(
-    dir: &std::path::Path,
+    directory: thegn_core::fsperm::PrivateDir,
     prompt: &str,
-) -> Result<tempfile::NamedTempFile, String> {
-    use std::io::Write;
-    use std::os::unix::fs::PermissionsExt;
-
-    let mut file = tempfile::Builder::new()
-        .prefix("prompt-")
-        .permissions(std::fs::Permissions::from_mode(0o600))
-        .tempfile_in(dir)
-        .map_err(|error| format!("{{prompt_file}}: create prompt file in {dir}: {error}"))?;
-    file.write_all(prompt.as_bytes())
-        .map_err(|error| format!("{{prompt_file}}: write prompt file: {error}"))?;
-    file.flush()
-        .map_err(|error| format!("{{prompt_file}}: flush prompt file: {error}"))?;
-    Ok(file)
+) -> Result<PromptFile, String> {
+    let (name, path) = directory
+        .create_owner_only_temp(prompt.as_bytes())
+        .map_err(|error| {
+            format!(
+                "{{prompt_file}}: create prompt file in {}: {error}",
+                directory.path().display()
+            )
+        })?;
+    Ok(PromptFile {
+        directory,
+        name,
+        path,
+    })
 }
 
 /// One dispatch: where to run, what to say, and how long to allow.
@@ -523,7 +549,7 @@ pub(crate) fn run_outcome(task: &AgentTaskRun<'_>) -> AgentRunVerdict {
                 return AgentRunVerdict::NotStarted(reason);
             }
         };
-        match write_prompt_file(&dir, task.prompt) {
+        match write_prompt_file(dir, task.prompt) {
             Ok(file) => Some(file),
             Err(reason) => {
                 tracing::warn!(target: "thegn::agent", kind = %task.kind, %reason, "cannot write prompt file; not dispatching");
@@ -1919,6 +1945,34 @@ mod tests {
         assert!(!env.contains(prompt));
         assert!(!env.contains("THEGN_TASK_PROMPT"));
         assert!(!env.contains("THEGN_MERGE_PROMPT"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn prompt_file_creation_stays_anchored_if_task_directory_is_swapped() {
+        use std::os::unix::fs::symlink;
+
+        let worktree = tempfile::tempdir().unwrap();
+        let git_dir = worktree.path().join(".git");
+        std::fs::create_dir(&git_dir).unwrap();
+        let directory = prompt_file_dir(worktree.path().to_str().unwrap(), None).unwrap();
+        let pinned_path = directory.path().to_path_buf();
+        let moved_path = git_dir.join("thegn-task-original");
+        let target = tempfile::tempdir().unwrap();
+
+        std::fs::rename(&pinned_path, &moved_path).unwrap();
+        symlink(target.path(), &pinned_path).unwrap();
+        let file = write_prompt_file(directory, "PINNED-PROMPT").unwrap();
+
+        assert_eq!(std::fs::read_dir(target.path()).unwrap().count(), 0);
+        assert_eq!(std::fs::read_dir(&moved_path).unwrap().count(), 1);
+        assert_eq!(
+            std::fs::read(moved_path.join(&file.name)).unwrap(),
+            b"PINNED-PROMPT"
+        );
+        drop(file);
+        assert_eq!(std::fs::read_dir(&moved_path).unwrap().count(), 0);
+        assert_eq!(std::fs::read_dir(target.path()).unwrap().count(), 0);
     }
 
     #[cfg(unix)]
