@@ -287,7 +287,7 @@ their contents mean.
 Feed the monitor the chart JSON (`thegn config get pipeline --json`), the issue
 id, and the literal lease name and owner printed at acquisition. It tracks each
 row's remaining stage timeout, initialized at dispatch and carried across waits.
-Before each wait, set `wait_ms` to the smaller of 100000 ms and the time remaining to the
+Before each wait, use the smaller of 100000 ms and `wait_ms`, the time remaining to the
 nearest stage deadline; a deadline that has elapsed is handled as that stage's
 timeout. Once it receives the literal inputs, the monitor binds them as
 `lease_name` and `lease_owner`. After each wait, renew the lease before another
@@ -296,7 +296,7 @@ reason, stop and report the failure to the Lead immediately.
 
 ```text
 until `thegn dispatch list --active --json` is empty:
-  thegn dispatch wait --any --timeout <wait_ms> --json
+  thegn dispatch wait --any --timeout 100000 --json      # or wait_ms when smaller
   thegn dispatch lease renew --name "$lease_name" --owner "$lease_owner" --ttl 300
   row = .row; report = .report                          # read the report ONLY
   thegn dispatch verify row   -> not ok: re-wait / on_blocked per chart

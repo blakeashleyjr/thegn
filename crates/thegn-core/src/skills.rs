@@ -990,7 +990,8 @@ mod tests {
             .split_whitespace()
             .collect::<Vec<_>>()
             .join(" ");
-        assert!(monitor.contains("--timeout <min(100000,"));
+        assert!(monitor.contains("--timeout 100000 --json"));
+        assert!(monitor.contains("wait_ms"));
         assert!(monitor.contains(
             "dispatch lease renew --name \"$lease_name\" --owner \"$lease_owner\" --ttl 300"
         ));
