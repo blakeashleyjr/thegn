@@ -2,6 +2,11 @@ use super::*;
 
 const WORKTREE: &str = "/private/driver-status";
 
+fn register_local(db: &Db, repo_root: &str, worktree: &str, branch: &str) {
+    db.put_worktree(branch, repo_root, worktree, branch, None, None)
+        .unwrap();
+}
+
 fn config() -> MergeQueueConfig {
     MergeQueueConfig {
         target_branch: "main".into(),
@@ -124,6 +129,7 @@ fn busy_landed_write_reports_oids_and_stops_later_rows() {
     let db = Db::open_at(&path).unwrap();
     let first = queued(&db, 0);
     let second_worktree = "/later/worktree";
+    register_local(&db, WORKTREE, second_worktree, "later");
     db.enqueue_merge(second_worktree, "later", "main").unwrap();
     let second_status = db
         .list_merge_queue()
@@ -196,6 +202,7 @@ fn agent_blocked_status_survives_db_reopen_and_decodes() {
     let path = dir.path().join("queue.sqlite");
     {
         let db = Db::open_at(&path).unwrap();
+        register_local(&db, WORKTREE, WORKTREE, "feature");
         db.enqueue_merge(WORKTREE, "feature", "main").unwrap();
         db.update_merge_status(
             WORKTREE,
@@ -293,6 +300,7 @@ fn landed_bookkeeping_failure_stops_the_remaining_items() {
     let db = Db::open_at(&path).unwrap();
     let first = queued(&db, 0);
     let second_worktree = "/later/worktree";
+    register_local(&db, WORKTREE, second_worktree, "later");
     db.enqueue_merge(second_worktree, "later", "main").unwrap();
     let second_status = db
         .list_merge_queue()
@@ -408,6 +416,7 @@ fn failed_conflict_write_falls_back_to_gate_error_and_stops_drain() {
     let path = dir.path().join("queue.sqlite");
     let db = Db::open_at(&path).unwrap();
     let item = queued(&db, 0);
+    register_local(&db, WORKTREE, "/later/worktree", "later");
     db.enqueue_merge("/later/worktree", "later", "main")
         .unwrap();
     rusqlite::Connection::open(&path)
@@ -459,6 +468,7 @@ fn failed_conflict_write_falls_back_to_gate_error_and_stops_drain() {
 }
 
 fn queued(db: &Db, attempts: u32) -> QueueItem {
+    register_local(db, WORKTREE, WORKTREE, "feature");
     db.enqueue_merge(WORKTREE, "feature", "main").unwrap();
     db.set_merge_agent_attempts(WORKTREE, attempts).unwrap();
     db.update_merge_status(
@@ -721,8 +731,30 @@ fn remote_and_unparseable_locations_hold_before_local_fixer_dispatch() {
         "not a registered host descriptor",
     ] {
         let db = Db::open_memory().unwrap();
-        let mut item = queued(&db, 0);
-        item.location = location.into();
+        db.put_worktree(
+            "feature",
+            WORKTREE,
+            WORKTREE,
+            "feature",
+            Some(location),
+            None,
+        )
+        .unwrap();
+        db.enqueue_merge(WORKTREE, "feature", "main").unwrap();
+        db.set_merge_agent_attempts(WORKTREE, 0).unwrap();
+        db.update_merge_status(
+            WORKTREE,
+            "deferred",
+            Some("old-result"),
+            Some("old-conflict"),
+            Some("old-error"),
+        )
+        .unwrap();
+        let item = QueueItem {
+            worktree: WORKTREE.into(),
+            branch: "feature".into(),
+            location: location.into(),
+        };
         let mut attempts = 0;
         let out = drive_queue_with(
             &cfg,
@@ -768,6 +800,15 @@ fn remote_identifier_collision_leaves_local_directory_untouched() {
     std::fs::write(&sentinel, "untouched").unwrap();
     let worktree = collision.to_string_lossy().into_owned();
     let db = Db::open_memory().unwrap();
+    db.put_worktree(
+        "feature",
+        dir.path().to_str().unwrap(),
+        &worktree,
+        "feature",
+        Some(r#"{"control_prefix":["provider","exec"],"path":"/repo"}"#),
+        None,
+    )
+    .unwrap();
     db.enqueue_merge(&worktree, "feature", "main").unwrap();
     let item = QueueItem {
         worktree: worktree.clone(),
@@ -778,7 +819,7 @@ fn remote_identifier_collision_leaves_local_directory_untouched() {
     cfg.conflict_handoff = ConflictHandoff::Agent;
     cfg.agent_max_attempts = 1;
     cfg.agent_command = "private-test-agent-must-never-execute".into();
-    drive_queue_with(
+    let out = drive_queue_with(
         &cfg,
         &Config::default(),
         dir.path(),
@@ -797,6 +838,7 @@ fn remote_identifier_collision_leaves_local_directory_untouched() {
             runner: unexpected_runner,
         },
     );
+    assert_eq!(out.agent_blocked, ["feature"]);
     assert_eq!(std::fs::read_to_string(sentinel).unwrap(), "untouched");
 }
 
@@ -833,6 +875,7 @@ impl AuditFixture {
             let worktree = root.path().join(branch);
             std::fs::create_dir(&worktree).unwrap();
             let worktree = worktree.to_str().unwrap();
+            register_local(&db, root.path().to_str().unwrap(), worktree, branch);
             db.enqueue_merge(worktree, branch, "main").unwrap();
             db.set_merge_agent_attempts(worktree, *attempts).unwrap();
             db.update_merge_status(

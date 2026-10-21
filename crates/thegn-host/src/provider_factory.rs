@@ -141,6 +141,23 @@ pub(crate) fn provider_for_named(
     provider_for_named_with_key(pc, name, None)
 }
 
+pub(crate) fn provider_for_named_owned(
+    pc: &thegn_core::config::EnvProviderConfig,
+    name: &str,
+    owner: Option<&str>,
+) -> Option<Provider> {
+    let provider = provider_for_named(pc, name)?;
+    Some(match (provider, owner) {
+        (Provider::Vps(provider), Some(owner)) => {
+            Provider::Vps(provider.with_owner(owner.to_owned()))
+        }
+        (Provider::Fly(provider), Some(owner)) => {
+            Provider::Fly(provider.with_owner(owner.to_owned()))
+        }
+        (provider, _) => provider,
+    })
+}
+
 /// Build a provider using an explicit managed keypair. Rotation uses this only
 /// after authorizing the replacement public key, to prove an actual connection
 /// with the replacement private key before retiring the old one.
@@ -384,29 +401,92 @@ pub(crate) fn provider_sandbox_name(
     worktree: &str,
     env_name: &str,
 ) -> Option<String> {
-    use std::path::{Path, PathBuf};
-    use thegn_core::store::{PoolStore, WorkspaceStore};
-    let loc = thegn_core::remote::GitLoc::for_worktree(Path::new(worktree));
-    let repo_root: PathBuf = thegn_core::db::Db::open()
-        .ok()
-        .and_then(|db| db.repo_root_for(worktree).ok().flatten())
-        .filter(|s| !s.is_empty())
-        .map(PathBuf::from)
-        .or_else(|| thegn_core::repo::main_worktree(Path::new(worktree)))
-        .unwrap_or_else(|| PathBuf::from(worktree));
-    let env = cfg.resolve_env(&repo_root, &loc, Path::new(worktree), Some(env_name));
+    let (env, bound) = resolve_provider_env(cfg, worktree, env_name)?;
     match env.placement {
         thegn_core::placement::Placement::Provider(p) => {
             // If this worktree CLAIMED a warm-pool spare, its sandbox is that
             // spare's name (a DB binding), which overrides the derived id — so all
             // lifecycle/exec calls target the handed-over sandbox. Else the derived
             // `effective_provider_id`.
-            let bound = thegn_core::db::Db::open()
-                .ok()
-                .and_then(|db| db.worktree_provider_sandbox(worktree).ok().flatten());
             Some(bound.unwrap_or(p.id))
         }
         _ => None,
+    }
+}
+
+pub(crate) fn provider_sandbox_owner(
+    cfg: &thegn_core::config::Config,
+    worktree: &str,
+    env_name: &str,
+) -> Option<String> {
+    let (env, bound) = resolve_provider_env(cfg, worktree, env_name)?;
+    let configured = configured_provider_id(cfg, &env.name);
+    derived_owner(configured, bound.is_some(), worktree)
+}
+
+fn configured_provider_id<'a>(cfg: &'a thegn_core::config::Config, env_name: &str) -> &'a str {
+    cfg.env
+        .get(env_name)
+        .map(|e| e.provider.id.as_str())
+        .unwrap_or("")
+}
+
+fn resolve_provider_env(
+    cfg: &thegn_core::config::Config,
+    worktree: &str,
+    env_name: &str,
+) -> Option<(thegn_core::env::Environment, Option<String>)> {
+    use std::path::{Path, PathBuf};
+    use thegn_core::store::{PoolStore, WorkspaceStore};
+    let loc = thegn_core::remote::GitLoc::for_worktree(Path::new(worktree));
+    let db = match thegn_core::db::Db::open() {
+        Ok(db) => Some(db),
+        Err(error) => {
+            tracing::debug!(target: "thegn::provider", %error, "provider sandbox database open failed");
+            None
+        }
+    };
+    let repo_root = match db.as_ref() {
+        Some(db) => match db.repo_root_for(worktree) {
+            Ok(Some(root)) if !root.is_empty() => PathBuf::from(root),
+            Ok(_) => thegn_core::repo::main_worktree(Path::new(worktree))
+                .unwrap_or_else(|| PathBuf::from(worktree)),
+            Err(error) => {
+                tracing::debug!(target: "thegn::provider", %error, "provider sandbox repository lookup failed");
+                thegn_core::repo::main_worktree(Path::new(worktree))
+                    .unwrap_or_else(|| PathBuf::from(worktree))
+            }
+        },
+        None => thegn_core::repo::main_worktree(Path::new(worktree))
+            .unwrap_or_else(|| PathBuf::from(worktree)),
+    };
+    let env = cfg.resolve_env(&repo_root, &loc, Path::new(worktree), Some(env_name));
+    if !matches!(
+        &env.placement,
+        thegn_core::placement::Placement::Provider(_)
+    ) {
+        return None;
+    }
+    let bound = match db.as_ref() {
+        Some(db) => match db.worktree_provider_sandbox(worktree) {
+            Ok(bound) => bound,
+            Err(error) => {
+                tracing::debug!(target: "thegn::provider", %error, "provider sandbox binding lookup failed");
+                None
+            }
+        },
+        None => None,
+    };
+    Some((env, bound))
+}
+
+fn derived_owner(configured_id: &str, claimed: bool, worktree: &str) -> Option<String> {
+    if claimed || (!configured_id.trim().is_empty() && !configured_id.contains('{')) {
+        None
+    } else {
+        Some(thegn_svc::vps::registry::worktree_owner(
+            worktree.as_bytes(),
+        ))
     }
 }
 
@@ -435,5 +515,34 @@ mod tests {
             ..Default::default()
         };
         assert!(provider_for_named(&pc, "x").is_none());
+    }
+
+    #[test]
+    fn derived_owner_exempts_literals_and_claimed_spares() {
+        assert!(derived_owner("", false, "/w/a").is_some());
+        assert!(derived_owner("{repo}-{worktree}", false, "/w/a").is_some());
+        assert!(derived_owner("shared-box", false, "/w/a").is_none());
+        assert!(derived_owner("", true, "/w/a").is_none());
+    }
+
+    #[test]
+    fn derived_owner_uses_unexpanded_configured_provider_id() {
+        let cfg = thegn_core::config::Config {
+            env: std::collections::BTreeMap::from([(
+                "remote".into(),
+                thegn_core::config::EnvConfig {
+                    provider: thegn_core::config::EnvProviderConfig {
+                        id: "{repo}-{worktree}-{hash}".into(),
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                },
+            )]),
+            ..Default::default()
+        };
+
+        let configured = configured_provider_id(&cfg, "remote");
+        assert_eq!(configured, "{repo}-{worktree}-{hash}");
+        assert!(derived_owner(configured, false, "/w/a").is_some());
     }
 }

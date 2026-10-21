@@ -9,7 +9,7 @@ use thegn_core::remote::GitLoc;
 
 const IMAGE: &str = "fixture.invalid/the617:inert";
 const PREFLIGHT_FAILURE: &str = "THE617_OWNED_EXEC_PREFLIGHT_FAILURE";
-const INSPECT_FORMAT: &str = "{{if .State.Running}}RUNNING{{end}}\n{{index .Config.Labels \"thegn.seal_home\"}}\n{{index .Config.Labels \"thegn.policy\"}}\n{{range .Mounts}}{{if eq .Type \"bind\"}}{{.Source}}\n{{end}}{{end}}";
+const INSPECT_FORMAT: &str = "{{if .State.Running}}RUNNING{{end}}\n{{index .Config.Labels \"thegn.seal_home\"}}\n{{index .Config.Labels \"thegn.policy\"}}\n{{range .Mounts}}{{if eq .Type \"bind\"}}{{.Source}}\n{{end}}{{end}}thegn-image:{{.Image}}\n";
 
 /// Availability caches otherwise outlive PATH restoration. Clear both sides of
 /// the private invocation while the existing environment guard is held.
@@ -137,7 +137,10 @@ elif [ "$#" -eq 3 ] && [ "$1" = image ] && [ "$2" = exists ] && [ "$3" = {image}
     printf 'image-present\n' >> "$journal"
 elif [ "$#" -eq 5 ] && [ "$1" = container ] && [ "$2" = inspect ] && [ "$3" = --format ] && [ "$4" = {inspect} ] && [ "$5" = {name} ]; then
     printf 'ensure-running\n' >> "$journal"
-    printf 'RUNNING\n0\n{policy}\n'
+    printf 'RUNNING\n0\n{policy}\nthegn-image:{image_id}\n'
+elif [ "$#" -eq 5 ] && [ "$1" = image ] && [ "$2" = inspect ] && [ "$3" = --format ] && [ "$4" = '{{{{.Id}}}}' ] && [ "$5" = {image} ]; then
+    printf 'image-id\n' >> "$journal"
+    printf '{image_id}\n'
 elif [ "$#" -eq 5 ] && [ "$1" = exec ] && [ "$2" = {name} ] && [ "$3" = /bin/sh ] && [ "$4" = -lc ] && [ "$5" = true ]; then
     printf 'preflight-failed\n' >> "$journal"
     printf '%s\n' {failure} >&2
@@ -150,6 +153,7 @@ fi
             journal = q(journal.to_str().unwrap()),
             image = q(IMAGE),
             inspect = q(INSPECT_FORMAT),
+            image_id = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
             name = q(&name),
             policy = q(&policy_fp),
             failure = q(PREFLIGHT_FAILURE),
@@ -159,7 +163,7 @@ fi
             crate::agent::prepare_sandbox_env(&cfg, root, worktree_text, &loc, None, false, None);
         assert_eq!(
             std::fs::read_to_string(&journal).unwrap(),
-            "version\nimage-present\nensure-running\npreflight-failed\n",
+            "version\nimage-present\nensure-running\nimage-id\npreflight-failed\n",
             "must resolve the stronger candidate, pass its floor and ensure, then fail only exec preflight: {backend:?}/{floor:?}/{policy:?}"
         );
         if backend == SandboxBackend::Podman {

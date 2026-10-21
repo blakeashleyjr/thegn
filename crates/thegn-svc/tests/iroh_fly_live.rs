@@ -12,6 +12,8 @@
 //!   FLY_API_TOKEN=…  FLY_ORG=tech-surfer-co  FLY_IMAGE=image:registry.fly.io/<app>:<tag> \
 //!     cargo test -p thegn-svc --test iroh_fly_live -- --ignored --nocapture
 
+// This live integration target exercises the optional iroh transport.
+#![cfg(feature = "iroh")]
 #![allow(clippy::disallowed_macros)]
 
 use std::sync::Arc;

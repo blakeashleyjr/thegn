@@ -185,6 +185,10 @@ they were silently orphaned).
 - Cloud execution providers, remote worktrees over SSH, the Observe dashboards,
   the placement engine, and non-GitHub issue trackers are **dev-channel only** in
   this release (`THEGN_CHANNEL=dev`).
+- **Docker Desktop and WSL/WSL2 sandbox binds are best-effort, not verified.**
+  The bind check and its remedies are tested on Linux (podman, docker) and macOS
+  (podman, docker via colima, Apple `container`); on Docker Desktop and WSL an
+  unshared bind falls through to the runtime's generic error.
 
 ## Distribution
 

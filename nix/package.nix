@@ -73,7 +73,7 @@ in
     # onto the PATH of anyone who ran `nix profile install`. Matches what
     # release.yml builds.
     cargoExtraArgs =
-      "-p thegn-host --bin thegn"
+      "-p thegn-host --bin thegn --features iroh"
       + lib.optionalString isDev " --features dev";
 
     nativeBuildInputs = [makeWrapper pkg-config installShellFiles];

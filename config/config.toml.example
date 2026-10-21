@@ -1094,6 +1094,13 @@ crash_sink = ""           # RESERVED: external Sentry-protocol forwarding is not
 # config.toml, layered below env/`--set`. Switch/launch with Ctrl+Alt+g (spawns a
 # new terminal window running thegn --profile=<name>); one advisory window per
 # profile (a second is warned-about, not refused — profile DBs are WAL-safe).
+# At startup, a named profile also unsets known credential environment families
+# from the thegn process (including model, cloud and package tokens); SSH_AUTH_SOCK
+# remains only when profiles/<name>/ssh/id exists, with GIT_SSH_COMMAND pinned to
+# that key. The profile git/gh/gnupg directories are mounted read-only in
+# sandboxes; a pane that must write them (for example `gh auth login` or GnuPG
+# signing) needs an explicit `[sandbox] mounts` grant. Startup refuses when the
+# profile state or credential directories cannot be created.
 #
 # CAVEAT: the firewall is only as strong as the loosest sandbox setting —
 # `[sandbox] file_access = "all"`, `network = "host"`, or SSH agent forwarding
@@ -1527,7 +1534,7 @@ command = "git diff"
 # env_bundles   = ["clientA-secrets"]           # bundles bound at the zone scope
 # network_allow = ["*.clienta.com", "github.com"]  # DNS-name rules only (not an egress boundary)
 # network_block = ["telemetry.example.com"]     # DNS-name rules only; `*` makes launches offline
-# sandbox_floor = "hardened"                     # members may only be >= this hardening
+# sandbox_floor = "standard"                     # members may only be >= this hardening
 # placement_floor = "dedicated"                  # placement-mode FLOOR for members: a
 #                                                #   member's requested mode may only be
 #                                                #   equal-or-stricter (auto < packed <
@@ -2652,18 +2659,19 @@ enabled = true
 # Selectable per level: here (global), per workspace/repo via a `.thegn.toml`
 # overlay, or the THEGN_SANDBOX_PROFILE env var.
 #   open     — no hardening; pre-preset behavior (escape hatch / back-compat).
-#   hardened — read-only root + no-new-privileges + a process (pids) cap, with
+#   standard — read-only root + no-new-privileges + a process (pids) cap, with
 #              networking and Linux capabilities left intact so interactive dev
 #              (fetch/clone/build, debuggers, ping) keeps working. The default.
+#              `hardened` is accepted as an older name.
 #   sealed   — full lockdown: network=none, read-only root, drop ALL caps,
 #              no-new-privileges, tighter pids cap. For untrusted workloads.
-# Under a read-only-root profile (hardened/sealed, the default), everything
+# Under a read-only-root profile (standard/sealed, the default), everything
 # OUTSIDE the worktree is read-only — including your $HOME — so a sandboxed
 # agent can't `cd` out and modify/delete host files. Writable: the worktree, its
 # git dir, build caches, /tmp, and a narrow set of $HOME carve-outs for shell
 # state (~/tmp, ~/.local/state, ~/.local/share, plus the legacy history files
 # ~/.zsh_history and ~/.bash_history). ~/.keychain is carved for interactive
-# (hardened) panes but NOT the sealed agent — it stores scripts your host login
+# (standard) panes but NOT the sealed agent — it stores scripts your host login
 # shells later *source*, so a writable ~/.keychain from a sealed sandbox would
 # be a persistence vector. Coding-agent config dirs (CLAUDE_CONFIG_DIR /
 # CODEX_HOME, or the ~/.claude / ~/.codex default) are also carved writable — for
@@ -2673,7 +2681,7 @@ enabled = true
 # too, for HOME-swapping profile wrappers (claude-profile / claude-multiplex).
 # `profile = "open"` restores a fully-writable $HOME (zsh history/zoxide/
 # keychain) as the escape hatch; add more writable paths under `mounts` below.
-profile = "hardened"
+profile = "standard"
 
 # ── Backend selection ────────────────────────────────────────────────────────
 # Which containment backend to use. "auto" walks backend_chain until one works.
@@ -2770,7 +2778,7 @@ network_audit = false
 #   all / host          — entire host filesystem (read-write, least isolated).
 #   none                — no filesystem access beyond the container root.
 #   custom              — only the explicit mounts list below.
-# Note: regardless of file_access, the default `hardened` profile makes
+# Note: regardless of file_access, the default `standard` profile makes
 # everything outside the worktree/caches READ-ONLY (see `profile` above). To get
 # a fully writable host filesystem use `file_access = "all"`; for the strictest
 # scoping use `"custom"`/`"none"`. Both file_access and profile are overridable
@@ -2893,11 +2901,13 @@ warm_direnv = "off"
 devenv = false
 
 # ── Nix devShell tooling ──────────────────────────────────────────────────────
-# Tier A (read-only, safe): inject an already-existing cached repo Nix flake
-# `devShell` toolchain (its PATH + safe exported vars) into worktree panes.
+# Tier A: inject an already-existing cached repo Nix flake `devShell` toolchain
+# (its PATH + safe exported vars) into worktree panes. Off by default. Opt in
+# here, per project, or per environment; a repo's `.thegn.toml` request needs
+# approval with `thegn repo trust . --approve <id>`.
 # Cold caches are a no-op; this setting never evaluates the repository on the
 # host or writes a cache. Target-side setup remains available in the sandbox.
-inject_devshell = true
+inject_devshell = false
 # Which flake devShell a sandbox/sprite enters. Empty = the flake default (same as
 # host dev — the FULL closure). Set to a leaner attr so a remote sprite builds/seeds
 # a much smaller closure. thegn's own flake ships two lean attrs: "sandbox" (rust +
@@ -3241,7 +3251,7 @@ provider = "none"
 #                  traffic is tunneled (not a containment boundary). The only
 #                  honest option for the bwrap/systemd backends.
 #   in_container — run the VPN client inside the worktree container itself
-#                  (needs NET_ADMIN + /dev/net/tun; weakens `hardened`).
+#                  (needs NET_ADMIN + /dev/net/tun; weakens `standard`).
 #   netns        — join a host-prepared named netns (host-toolchain; best-effort).
 mode = "sidecar"
 # Override the provider's default sidecar image. Empty = provider default.
@@ -3268,7 +3278,7 @@ ephemeral = true
 #
 # Tip: `sealed-tunnel` (alias `tunnel-only`) currently refuses to launch while
 # a VPN is configured; thegn cannot yet enforce an exclusive tunnel route. Use
-# `hardened` with `[sandbox.vpn]` for a non-exclusive tunnel, or `sealed` for no
+# `standard` with `[sandbox.vpn]` for a non-exclusive tunnel, or `sealed` for no
 # network. With no VPN, `sealed-tunnel` behaves like `sealed`.
 #
 # Secrets: auth keys / configs accept a secrets-ref so they never sit in plain
@@ -4029,6 +4039,8 @@ open_on_detect = false # auto-open the browser (via `browser` above) when a new 
 # prefix = "thegn"         # s3: key prefix inside the bucket
 # access_key = "env:AWS_ACCESS_KEY_ID"      # secret ref: env:VAR | keyring:<n>
 # secret_key = "env:AWS_SECRET_ACCESS_KEY"  #   | file:/path | bare env-var name
+# server_side_encryption = true              # s3: sign SSE AES256 into every upload; false only for
+#                                            #   S3-compatibles that reject it (never allows http)
 
 # ── Placement engine ─────────────────────────────────────────────────────────
 # WHERE each worktree sandbox runs: Dedicated (one sandbox, exclusive host),
@@ -4396,14 +4408,14 @@ agent_max_attempts = 2        # agent-dispatch → re-fold cycles before marking
                               # doesn't spend it again; `thegn merge retry` re-arms a row.
 agent_timeout_secs = 900      # watchdog per agent invocation; 0 = 6-hour ceiling (not unbounded), >30 days clamps
 #
-# Run the fixing agent INSIDE the resolved sandbox (default: host + the shared
-# resource slice, so it keeps host credentials/keychains). When enabled, the
-# queue floor can raise but never weaken the `[sandbox]` floor in force
-# (default: shared-kernel, refusing on a miss). Set `[sandbox].isolation_floor`
-# to `"off"` or disable `agent_sandbox` to run the agent uncontained. A
-# fail-closed floor miss — or a sandbox that can't be built — is an
-# INFRASTRUCTURE failure that HOLDS the queue entry and NEVER marks the branch
-# failed (the merge-guard "don't blame a good branch" doctrine).
+# Run the fixing agent INSIDE the resolved sandbox. The queue floor can raise
+# but never weaken the `[sandbox]` floor in force (default: shared-kernel,
+# refusing on a miss). With `agent_sandbox = false`, fail-closed floors hold,
+# explicit degrade floors label host runs, and an off floor permits them. Set
+# `[sandbox].isolation_floor` to `"off"` or disable the sandbox to permit
+# uncontained queue agents. A fail-closed floor miss or an unbuildable sandbox
+# is an INFRASTRUCTURE failure that HOLDS the queue entry and NEVER marks the
+# branch failed (the merge-guard "don't blame a good branch" doctrine).
 agent_sandbox = false
 agent_isolation_floor = ""     # "" | shared-kernel | userspace-kernel | guest-kernel
 agent_on_floor_miss = "degrade"  # degrade | fail  (recommended: fail on Linux)
@@ -4518,14 +4530,14 @@ agent_command = ""            # e.g. 'claude -p {prompt}'; overrides `agent`
 agent_max_attempts = 2        # agent-dispatch cycles per PR before it is marked "needs_human"
 agent_timeout_secs = 900      # watchdog per agent invocation; 0 = 6-hour ceiling (not unbounded), >30 days clamps
 #
-# Run the fixing agent INSIDE the resolved sandbox (default: host + the shared
-# resource slice, so it keeps host credentials/keychains — a forge token, an ssh
-# key, a signing identity). As in [merge_queue], the queue floor can raise but
-# never weaken the `[sandbox]` floor in force (default: shared-kernel, refusing
-# on a miss). Set `[sandbox].isolation_floor` to `"off"` or disable
-# `agent_sandbox` to run the agent uncontained. A fail-closed floor miss — or a
-# sandbox that can't be built — is an INFRASTRUCTURE failure that HOLDS the PR
-# and NEVER marks it failed (the "don't blame a good branch" doctrine).
+# Run the fixing agent INSIDE the resolved sandbox. As in [merge_queue], the
+# queue floor can raise but never weaken the `[sandbox]` floor in force
+# (default: shared-kernel, refusing on a miss). With `agent_sandbox = false`,
+# fail-closed floors hold, explicit degrade floors label host runs, and an off
+# floor permits them. Set `[sandbox].isolation_floor` to `"off"` or disable the
+# sandbox to permit uncontained queue agents. A fail-closed floor miss or an
+# unbuildable sandbox is an INFRASTRUCTURE failure that HOLDS the PR and NEVER
+# marks it failed (the "don't blame a good branch" doctrine).
 agent_sandbox = false
 agent_isolation_floor = ""     # "" | shared-kernel | userspace-kernel | guest-kernel
 agent_on_floor_miss = "degrade"  # degrade | fail  (recommended: fail on Linux)

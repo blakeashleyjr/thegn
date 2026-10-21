@@ -360,7 +360,7 @@ command -v cargo >/dev/null || {
 }
 
 echo "building release binary…"
-(cd "$here" && cargo build --release --workspace)
+(cd "$here" && cargo build --release --workspace --features thegn-host/iroh)
 
 if [[ ! -f $release_bin ]]; then
   echo "build reported success but $release_bin is missing — nothing to install." >&2

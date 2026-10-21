@@ -276,9 +276,10 @@ fn synth_init(req: &envplan::EnvRequirements, cfg: &Config, worktree: &str) -> O
         return None;
     }
     let dir = toolchain::synth_dir(&packages);
+    let ready = toolchain::synth_ready_test(&packages);
     // Best-effort eval: a cold/missing devshell leaves the base-image shell.
     Some(format!(
-        "if command -v nix >/dev/null 2>&1 && [ -d {dir} ]; then \
+        "if command -v nix >/dev/null 2>&1 && {ready}; then \
            eval \"$(cd {} && nix print-dev-env path:{dir} 2>/dev/null)\" || true; \
          fi",
         thegn_core::util::sh_quote(worktree),
@@ -525,6 +526,15 @@ mod tests {
         let mut mise_cfg = Config::default();
         mise_cfg.toolchain.mode = thegn_core::toolchain::ToolchainMode::Mise;
         assert!(synth_init(&synth, &mise_cfg, "/wt/x").is_none());
+    }
+
+    #[test]
+    fn synth_init_requires_the_ready_marker() {
+        let synth = envplan::detect_from_probe("LANG_PYTHON=1\n");
+        let init =
+            synth_init(&synth, &Config::default(), "/wt/x").expect("synth tier gets an entry");
+        assert!(init.contains(".thegn-ready"), "{init}");
+        assert!(!init.contains("[ -d "), "{init}");
     }
 
     #[test]

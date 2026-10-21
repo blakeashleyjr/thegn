@@ -529,6 +529,21 @@ pub fn prepare_sandbox_env(
     ) {
         return Err(anyhow::Error::new(refusal));
     }
+    let is_provider = matches!(placement, thegn_core::placement::Placement::Provider(_));
+    if let Some(refusal) = thegn_core::sandbox_floor::provider_refusal(is_provider, &sb, &env_name)
+    {
+        return Err(anyhow::Error::new(refusal));
+    }
+    if is_provider {
+        let floor = thegn_core::sandbox_floor::floor_in_force(&sb, false);
+        if floor != thegn_core::config::IsolationFloor::Off {
+            warnings.push(format!(
+                "{}: the isolation floor `{}` is not enforced by thegn on env `{env_name}`",
+                thegn_core::sandbox_floor::PROVIDER_UNVERIFIED,
+                floor.as_str()
+            ));
+        }
+    }
     let mut provisioned = None;
     // Bring the execution placement up (k8s pod / provider sandbox) BEFORE
     // resolving the backend — a no-op for the default local `in_env` env. Warm-on-
@@ -772,6 +787,14 @@ pub fn prepare_sandbox_env(
             // THE-215: a sealed launch must hide the host $HOME. Fail closed on a
             // backend/config that would expose it — same doctrine as the floor.
             if let Some(m) = thegn_core::sandbox_floor::home_gate(&spec) {
+                if explicit_choice {
+                    anyhow::bail!("{m} for {worktree}");
+                }
+                thegn_core::msg::warn(&format!("{m} for {worktree}; trying next backend"));
+                home_miss = Some(m);
+                continue;
+            }
+            if let Some(m) = thegn_core::sandbox_floor::strict_gate(&spec) {
                 if explicit_choice {
                     anyhow::bail!("{m} for {worktree}");
                 }
@@ -1858,6 +1881,17 @@ fn native_exec_for(cfg: &Config, worktree: &str, agent_cmd: Option<String>) -> O
         return None;
     };
     let pc = &cfg.env.get(&environment.name)?.provider;
+    if let Some(request) =
+        thegn_core::sandbox_floor::provider_explicit_request(&environment.sandbox)
+    {
+        tracing::warn!(
+            target: "thegn::sandbox",
+            env = %environment.name,
+            request = %request.describe(),
+            "provider pane refused: explicit isolation request"
+        );
+        return None;
+    }
     if pc.exec == ProviderExecMode::Cli || !thegn_svc::provider::exec_api_by_name(&pc.provider) {
         return None;
     }
@@ -2227,7 +2261,14 @@ pub fn provision_provider_env_named(
     };
     // Bake the resolved id so a recreate (`ensure_exists`→`create`) names the
     // sandbox correctly (the id embeds the repo/worktree tokens + a path-hash).
-    let Some(provider) = provider_for_named(pc, &id) else {
+    let owner = if name_override.is_none() {
+        crate::provider_factory::provider_sandbox_owner(cfg, worktree, env_name)
+    } else {
+        None
+    };
+    let Some(provider) =
+        crate::provider_factory::provider_for_named_owned(pc, &id, owner.as_deref())
+    else {
         return Ok((false, None));
     };
     if !provider.caps().files {
@@ -2630,11 +2671,12 @@ pub fn provision_provider_env_named(
                 // Host-executed: capture the local worktree's unpushed commits +
                 // uncommitted + untracked state and replay it over the clone.
                 // Best-effort — the failure note reflects the replay stage.
-                if let Err(e) = crate::parity::apply_local_parity(&provider, &id, wt, wd, &exec_env)
-                {
+                let result = crate::parity::apply_local_parity(&provider, &id, wt, wd, &exec_env);
+                crate::parity::record_outcome(wt, &result);
+                if let Err(e) = &result {
                     thegn_core::msg::warn(&format!(
-                        "local parity: {e}; {}.",
-                        crate::parity::failure_note(&e)
+                        "local parity: {e}; {}; autonomous agents are held on this worktree until parity succeeds.",
+                        crate::parity::failure_note(e)
                     ));
                 }
                 Ok(())
@@ -2657,18 +2699,22 @@ pub fn provision_provider_env_named(
                 .map(|cp| base_checkpoint = Some(cp))
             }
             StepKind::HomeClosurePush(roots) => {
-                // Host-executed: push the host store → sandbox store over the WSS
-                // ssh tunnel (host's `nix copy --to ssh-ng://`). Best-effort — a
-                // failure leaves the rc to source whatever the sandbox can resolve;
-                // it must not abort provisioning, so warn + continue.
+                // Host-executed: sign the host closure and push it over the WSS
+                // ssh tunnel. Best-effort: without signing or installed trust,
+                // skip the push rather than import unsigned paths.
                 match sprite_ssh_connect(cfg, worktree) {
                     Some((key, user, _workdir)) => {
-                        let exe = thegn_core::util::self_exe_str();
-                        if let Err(e) = push_home_closure_p2p(&exe, worktree, &key, &user, roots) {
+                        if let Err(error) =
+                            signed_home_closure_push(&provider, &id, worktree, &key, &user, roots)
+                        {
+                            let error = format!("{error:#}");
+                            let hint = if error.starts_with("copy:") {
+                                "; ensure the sandbox was (re)created with connect=ssh"
+                            } else {
+                                ""
+                            };
                             thegn_core::msg::warn(&format!(
-                                "host-parity p2p: pushing the home closure to the sandbox \
-                                 failed: {e}; the shell will use whatever the sandbox can \
-                                 resolve. Ensure the sandbox was (re)created with connect=ssh."
+                                "host-parity p2p: {error}; skipping the closure push{hint}"
                             ));
                         }
                         Ok(())
@@ -2826,15 +2872,14 @@ fn push_home_closure(cache_url: &str, roots: &[String]) -> anyhow::Result<()> {
 
 /// Pure: the `nix copy` argv for a **p2p** push straight into the sandbox's own
 /// store over the WSS ssh tunnel (no hosted cache — the host store is the source).
-/// `--no-check-sigs` (the host is trusted) and `--substitute-on-destination` (let
-/// the sandbox fill public paths from its own substituters in parallel). The ssh
-/// transport (key, port, ProxyCommand) is supplied via `NIX_SSHOPTS`.
+/// The closure is signed with the installation key and the destination checks
+/// signatures; `--substitute-on-destination` lets it fill public paths from its
+/// own substituters in parallel. The ssh transport is supplied via `NIX_SSHOPTS`.
 fn nix_copy_p2p_argv(user: &str, roots: &[String]) -> Vec<String> {
     let mut argv = vec![
         "copy".to_string(),
         "--to".to_string(),
         format!("ssh-ng://{user}@sprite"),
-        "--no-check-sigs".to_string(),
         "--substitute-on-destination".to_string(),
     ];
     argv.extend(roots.iter().cloned());
@@ -2925,16 +2970,16 @@ fn write_proxy_wrapper(key: &Path, proxy_cmd: &str) -> anyhow::Result<PathBuf> {
 
 /// Host-side host-parity **p2p** push: copy the closure of `roots` straight into
 /// the sandbox's store over the WSS ssh tunnel (the `sprite-proxy` ProxyCommand),
-/// using the host's `nix`. No hosted cache or signing key — the host store is the
-/// source. Best-effort; returns the error for the caller to warn on. Requires the
-/// sandbox to have been (re)created with `connect = "ssh"` (so its sshd accepts
+/// using the host's `nix`, signing with the per-installation key. No hosted cache;
+/// the host store is the source. Best-effort; returns the error for the caller to
+/// warn on. Requires the sandbox to have been (re)created with `connect = "ssh"` (so its sshd accepts
 /// the managed key) and `nix` installed in it.
 // off-loop: provisioning path — reached only via spawn_blocking / the pool thread / CLI.
 #[expect(clippy::disallowed_methods)]
 fn push_home_closure_p2p(
     thegn_exe: &str,
     worktree: &str,
-    key: &Path,
+    ssh_key: &Path,
     user: &str,
     roots: &[String],
 ) -> anyhow::Result<()> {
@@ -2943,7 +2988,7 @@ fn push_home_closure_p2p(
         thegn_core::util::sh_quote(thegn_exe),
         thegn_core::util::sh_quote(worktree),
     );
-    let proxy_script = write_proxy_wrapper(key, &proxy)?;
+    let proxy_script = write_proxy_wrapper(ssh_key, &proxy)?;
     // Host-key policy from the one chokepoint (LoopbackTunneled over the
     // authenticated sprite WSS transport). See `thegn_core::hostkey`.
     let hostkey_opts = thegn_core::hostkey::host_key_opts_str(
@@ -2956,7 +3001,7 @@ fn push_home_closure_p2p(
          -o ServerAliveCountMax=3 -i {} -p {}",
         thegn_core::util::sh_quote(&proxy_script.to_string_lossy()),
         hostkey_opts,
-        thegn_core::util::sh_quote(&key.to_string_lossy()),
+        thegn_core::util::sh_quote(&ssh_key.to_string_lossy()),
         SPRITE_SSHD_PORT,
     );
     let argv = nix_copy_p2p_argv(user, roots);
@@ -2990,6 +3035,66 @@ fn push_home_closure_p2p(
         )
     };
     Err(anyhow::anyhow!("nix copy (p2p) {why}"))
+}
+
+fn signed_home_closure_push(
+    provider: &thegn_svc::provider::Provider,
+    id: &str,
+    worktree: &str,
+    ssh_key: &Path,
+    user: &str,
+    roots: &[String],
+) -> anyhow::Result<()> {
+    let signing_key = crate::nix_signing::ensure_install_key()
+        .map_err(|error| anyhow::anyhow!("no installation signing key: {error:#}"))?;
+    let trust_argv = [
+        "sh".to_string(),
+        "-c".to_string(),
+        crate::nix_signing::trust_script(&signing_key.public),
+    ];
+    match block_on_provider(|| async { provider.run_exec(id, &trust_argv, None, &[]).await }) {
+        Ok((0, _)) => {}
+        Ok((code, output)) => {
+            return Err(anyhow::anyhow!(
+                "trust: could not install the Nix signing trust key (exit {code}): {output}"
+            ));
+        }
+        Err(error) => {
+            return Err(anyhow::anyhow!(
+                "trust: could not install the Nix signing trust key: {error}"
+            ));
+        }
+    }
+    sign_home_closure_p2p(&signing_key, roots)
+        .map_err(|error| anyhow::anyhow!("sign: {error:#}"))?;
+    let exe = thegn_core::util::self_exe_str();
+    push_home_closure_p2p(&exe, worktree, ssh_key, user, roots)
+        .map_err(|error| anyhow::anyhow!("copy: {error:#}"))
+}
+
+#[expect(
+    clippy::disallowed_methods,
+    reason = "signing must wait for nix before copying"
+)]
+fn sign_home_closure_p2p(
+    signing_key: &crate::nix_signing::InstallKey,
+    roots: &[String],
+) -> anyhow::Result<()> {
+    let sign_argv = crate::nix_signing::sign_argv(&signing_key.secret, roots);
+    let sign = std::process::Command::new(timeout_bin()?)
+        .arg("--kill-after=5")
+        .arg(HOME_CLOSURE_PUSH_TIMEOUT_SECS.to_string())
+        .arg("nix")
+        .args(&sign_argv)
+        .output()
+        .map_err(|error| anyhow::anyhow!("spawn `nix store sign` (p2p): {error}"))?;
+    if !sign.status.success() {
+        let stderr = tail_lines(&String::from_utf8_lossy(&sign.stderr), 6);
+        return Err(anyhow::anyhow!(
+            "nix store sign (p2p) failed: {stderr}; the host user must be a Nix trusted user to sign store paths, so the closure push is skipped"
+        ));
+    }
+    Ok(())
 }
 
 /// Hard ceiling for the host-side p2p closure push, in seconds. Past this the
@@ -3221,7 +3326,10 @@ fn auto_provision_sandbox(
     // token/keypair), NOT a legitimate no-op. Surface it as an error so the
     // caller's failover block (`prepare_sandbox_env`) halts or degrades-with-
     // notification instead of silently opening a host/bwrap shell.
-    let Some(provider) = provider_for_named(pc, &name) else {
+    let owner = crate::provider_factory::provider_sandbox_owner(cfg, worktree, env_name);
+    let Some(provider) =
+        crate::provider_factory::provider_for_named_owned(pc, &name, owner.as_deref())
+    else {
         anyhow::bail!(
             "env '{env_name}' provider '{}' could not be built (token or managed keypair unresolved)",
             pc.provider
@@ -4073,9 +4181,27 @@ pub fn launch_spec_full(
     // itself. Only an already-existing cache is read; a cold cache is left to
     // explicit target-side setup. Local worktrees only (remote panes run where
     // the host store isn't mounted). See [`devenv`].
-    let devshell = (cfg.sandbox.inject_devshell && !loc.is_remote() && !outcome.is_remote)
-        .then(|| devenv::cached(&repo_root))
-        .flatten();
+    let devshell = (!loc.is_remote() && !outcome.is_remote)
+        .then(|| {
+            let approvals = db
+                .as_ref()
+                .map(|db| {
+                    crate::handlers::repo_trust::approvals_for(db, &repo_root.to_string_lossy())
+                })
+                .unwrap_or_else(thegn_core::config_resolve::Approvals::deny_all);
+            crate::handlers::repo_trust::effective_environment_for_worktree(
+                cfg,
+                db.as_ref(),
+                &repo_root,
+                Path::new(worktree),
+                None,
+                &approvals,
+            )
+            .sandbox
+            .inject_devshell
+        })
+        .filter(|enabled| *enabled)
+        .and_then(|_| devenv::cached(&repo_root));
     // Toolchain activation is one shared, cache-first composition for host,
     // sandbox, provider, and daemon launches. The provider call performs no
     // child-process work here: a cold approved environment schedules a bounded

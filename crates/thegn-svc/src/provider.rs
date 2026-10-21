@@ -2487,11 +2487,25 @@ impl Provider {
     /// lifecycle. Returns `true` if it created one, `false` if it already existed.
     /// (List-then-create; a provider with a truly idempotent create can override.)
     pub async fn ensure_exists(&self, name: &str) -> Result<bool> {
+        if let Some(owner) = self.binding_owner() {
+            let name = name.to_owned();
+            let owner = owner.to_owned();
+            tokio::task::spawn_blocking(move || crate::vps::registry::check_owner(&name, &owner))
+                .await??;
+        }
         if self.list().await?.iter().any(|n| n == name) {
             return Ok(false);
         }
         self.create().await?;
         Ok(true)
+    }
+
+    fn binding_owner(&self) -> Option<&str> {
+        match self {
+            Self::Vps(provider) => provider.owner(),
+            Self::Fly(provider) => provider.owner(),
+            _ => None,
+        }
     }
 
     /// Park a scale-to-zero sandbox to stop paying for idle compute (the

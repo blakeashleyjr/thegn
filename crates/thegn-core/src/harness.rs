@@ -242,7 +242,7 @@ pub trait Harness: Send + Sync {
     /// token is at a fixed path).
     fn home(&self) -> Option<HomeSpec>;
     /// The headless (non-interactive) command template with a `{prompt}`
-    /// placeholder (`"claude -p {prompt} --permission-mode acceptEdits"`), or
+    /// placeholder (`"claude -p {prompt} --permission-mode acceptEdits --setting-sources user"`), or
     /// `None` when the harness has no headless form thegn knows.
     fn headless_template(&self) -> Option<&'static str>;
     /// How this CLI selects a model: a template with a `{model}` placeholder
@@ -325,6 +325,14 @@ pub trait Harness: Send + Sync {
     /// `permissions` list is then refused before launch, never dropped and
     /// never replaced by a skip-permissions mode.
     fn session_permission_args(&self, _allow: &[String]) -> Option<Vec<String>> {
+        None
+    }
+    /// Argv tokens (unquoted) that make an AUTONOMOUS launch load only the
+    /// operator's own settings, never the worktree's project/local settings
+    /// (whose hooks would run repository-controlled code with harness authority;
+    /// THE-434). `None` when the harness has no repository-controlled
+    /// executable settings thegn knows of.
+    fn autonomous_args(&self) -> Option<Vec<String>> {
         None
     }
     /// Fold one transcript's token counters into a host-wide rollup (`TOKENS`).
@@ -437,6 +445,8 @@ impl Harness for Codex {
 
 struct Claude;
 
+const CLAUDE_AUTONOMOUS_SETTING_SOURCES: &str = "--setting-sources user";
+
 impl Harness for Claude {
     fn id(&self) -> &'static str {
         "claude"
@@ -459,7 +469,7 @@ impl Harness for Claude {
         })
     }
     fn headless_template(&self) -> Option<&'static str> {
-        Some("claude -p {prompt} --permission-mode acceptEdits")
+        Some("claude -p {prompt} --permission-mode acceptEdits --setting-sources user")
     }
     fn model_flag(&self) -> Option<&'static str> {
         Some("--model {model}")
@@ -487,6 +497,16 @@ impl Harness for Claude {
         let settings = serde_json::json!({ "permissions": { "allow": allow } });
         Some(vec!["--settings".to_string(), settings.to_string()])
     }
+    fn autonomous_args(&self) -> Option<Vec<String>> {
+        // Claude documents `--setting-sources` values `user`, `project`, and
+        // `local`; autonomous thegn workers load only the operator's settings.
+        Some(
+            CLAUDE_AUTONOMOUS_SETTING_SOURCES
+                .split_whitespace()
+                .map(str::to_string)
+                .collect(),
+        )
+    }
     fn skill_layout(&self) -> Option<SkillLayout> {
         Some(SkillLayout {
             project_root: ".claude/skills",
@@ -513,8 +533,9 @@ impl Harness for Claude {
     }
     fn headless_resume_template(&self, session_id: &str) -> Option<String> {
         Some(format!(
-            "claude -p {{prompt}} --resume {} --permission-mode acceptEdits",
-            util::sh_quote(session_id)
+            "claude -p {{prompt}} --resume {} --permission-mode acceptEdits {}",
+            util::sh_quote(session_id),
+            CLAUDE_AUTONOMOUS_SETTING_SOURCES
         ))
     }
     fn assign_session_args(&self, native_session_id: &str) -> Option<String> {
@@ -924,6 +945,34 @@ mod tests {
         }
     }
 
+    #[test]
+    fn autonomous_args_are_claude_setting_sources_user() {
+        assert_eq!(
+            harness("claude").unwrap().autonomous_args(),
+            Some(vec!["--setting-sources".to_string(), "user".to_string()])
+        );
+        for h in HARNESSES.iter().filter(|h| h.id() != "claude") {
+            assert!(h.autonomous_args().is_none(), "{}", h.id());
+        }
+    }
+
+    #[test]
+    fn autonomous_args_ride_every_claude_headless_form() {
+        let harness = harness("claude").unwrap();
+        assert!(
+            harness
+                .headless_template()
+                .unwrap()
+                .ends_with(" --setting-sources user")
+        );
+        assert!(
+            harness
+                .headless_resume_template("abc-1")
+                .unwrap()
+                .ends_with(" --setting-sources user")
+        );
+    }
+
     /// Every RESUME impl yields a command containing its id, shell-quoted, and
     /// refuses to interpolate an id that fails the shape check upstream.
     #[test]
@@ -978,7 +1027,7 @@ mod tests {
             .expect("claude resumes headless");
         assert_eq!(
             t,
-            "claude -p {prompt} --resume abc-1 --permission-mode acceptEdits"
+            "claude -p {prompt} --resume abc-1 --permission-mode acceptEdits --setting-sources user"
         );
         assert!(
             crate::agent_task::substitute_command(&t, "go", &crate::agent_task::TaskVars::new())
@@ -1080,7 +1129,7 @@ mod tests {
     fn headless_templates_match_the_pre_seam_match_arms() {
         assert_eq!(
             harness("claude").unwrap().headless_template(),
-            Some("claude -p {prompt} --permission-mode acceptEdits")
+            Some("claude -p {prompt} --permission-mode acceptEdits --setting-sources user")
         );
         assert_eq!(
             harness("codex").unwrap().headless_template(),

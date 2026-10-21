@@ -238,6 +238,9 @@ the `host_discovery`/`tailnet` probe. This is unrelated to `[sandbox.vpn]`
 `thegn host add <target> --name <alias> --replace` takes over an alias with
 stale recorded state from a host no longer defined in configuration and clears
 that state. It refuses while the host has live placement tenants.
+Host aliases use lowercase letters, digits, and hyphens, start and end with a
+letter or digit, and are limited to 128 bytes. If a new host's default alias is
+already used by another host, thegn adds a short digest of the host authority.
 
 `thegn map` prints a **repo map**: the worktree's tree-sitter-indexed
 entities (functions, types, …) grouped by file, ranked by caller
@@ -306,6 +309,8 @@ does not run this prune.
 
 - `thegn doctor` — resolved terminal capabilities, release channel,
   environment. See [[terminal-compatibility]] and [[debugging]].
+  Its sandbox section also reports how sandboxed panes see git metadata; the
+  same exposure appears in `--json` output.
 - `thegn keys list` — every effective binding, from all three sources.
   The same set [[keybindings]] shows.
 - `thegn keys validate` — non-zero on a chord conflict, so it works in a

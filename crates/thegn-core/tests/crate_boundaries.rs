@@ -152,6 +152,8 @@ fn core_is_substrate_free() {
     );
     // The sanctioned leaf edges, so a change here is deliberate.
     assert!(core.iter().any(|d| d == "thegn-media"));
+    // Owner-approved for THE-368 (2026-10-20); the process leaf stays core-free.
+    assert!(core.iter().any(|d| d == "thegn-proc"));
 }
 
 /// `[workspace.lints]` (notably `let_underscore_future = "deny"`, the gate

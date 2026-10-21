@@ -174,6 +174,17 @@ pub fn sprite_ssh_connect(cfg: &Config, worktree: &str) -> Option<(PathBuf, Stri
         return None;
     };
     let pc = &cfg.env.get(&environment.name)?.provider;
+    if let Some(request) =
+        thegn_core::sandbox_floor::provider_explicit_request(&environment.sandbox)
+    {
+        tracing::warn!(
+            target: "thegn::sandbox",
+            env = %environment.name,
+            request = %request.describe(),
+            "provider pane refused: explicit isolation request"
+        );
+        return None;
+    }
     tracing::debug!(
         target: "thegn::sandbox",
         env = %environment.name,

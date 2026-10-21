@@ -101,6 +101,22 @@ pub(crate) fn stderr_with_timeout(argv: &[String], timeout: Duration) -> Option<
     .into_stderr()
 }
 
+/// Run an OCI command while retaining bounded stdout and stderr for fail-closed probes.
+pub(crate) fn output_and_stderr_with_timeout(
+    argv: &[String],
+    timeout: Duration,
+) -> Option<(bool, String, String)> {
+    proc::run_bounded(
+        argv,
+        timeout,
+        proc::Capture {
+            stdout: Some(256 * 1024),
+            stderr: Some(256 * 1024),
+        },
+    )
+    .into_stdout_and_stderr()
+}
+
 /// Run a control command while delivering a bounded secret payload on stdin.
 /// The feeder owns only the pipe; this function retains ownership of the child
 /// and kills and waits for it on write failure or timeout.
@@ -554,6 +570,8 @@ pub struct SandboxSpec {
     /// never mounted wholesale. A backend that cannot honor this is refused by
     /// [`crate::sandbox_floor::home_gate`] rather than silently exposing `$HOME`.
     pub seal_home: Option<String>,
+    /// Named volumes bound to a devcontainer owner id; empty for every non-devcontainer launch.
+    pub volume_owners: Vec<(String, String)>,
 }
 
 /// Why a programmatic/configured named volume was refused. The error carries
@@ -610,10 +628,14 @@ pub enum RefusalClass {
     HostnamePolicy,
     /// A local mount source could not be resolved to a stable host path.
     MountUnresolvable,
+    /// A named devcontainer volume belongs to another devcontainer identity.
+    VolumeOwner,
     /// A tunnel-only profile was requested but thegn cannot enforce that the tunnel is the only route.
     TunnelUnenforced,
     /// A mounted bind source no longer matches the identity admitted before create.
     MountDrift,
+    /// A sealed profile requested a control this backend cannot enforce.
+    StrictUnsupported,
 }
 
 impl RefusalClass {
@@ -628,8 +650,10 @@ impl RefusalClass {
             Self::ComposeServiceMissing => "compose-service-missing",
             Self::HostnamePolicy => "hostname-policy",
             Self::MountUnresolvable => "mount-unresolvable",
+            Self::VolumeOwner => "volume-owner",
             Self::TunnelUnenforced => "tunnel-unenforced",
             Self::MountDrift => "mount-drift",
+            Self::StrictUnsupported => "strict-unsupported",
         }
     }
 
@@ -640,7 +664,7 @@ impl RefusalClass {
                 "remove the protected host path from the Compose file's binds, or choose a less restrictive [sandbox] profile"
             }
             Self::SealedHome => {
-                "sealed profiles hide $HOME: move the mount or worktree out of $HOME, or use profile 'hardened'"
+                "sealed profiles hide $HOME: move the mount or worktree out of $HOME, or use profile 'standard'"
             }
             Self::UnsafeMountPath => {
                 "rename the mount path so it has no whitespace, quote, backslash or ':', or use the bwrap backend"
@@ -660,11 +684,18 @@ impl RefusalClass {
             Self::MountUnresolvable => {
                 "create the mount source or remove the mount from the config, then relaunch"
             }
+            Self::VolumeOwner => {
+                "a named volume belongs to another devcontainer: rename the volume in devcontainer.json, \
+                 or remove the other volume after checking its contents"
+            }
             Self::TunnelUnenforced => {
-                "use profile 'hardened' with [sandbox.vpn], or 'sealed' for no network"
+                "use profile 'standard' with [sandbox.vpn], or 'sealed' for no network"
             }
             Self::MountDrift => {
                 "a mount source changed during launch (check for a symlink swap), then relaunch"
+            }
+            Self::StrictUnsupported => {
+                "use a backend that enforces every sealed control (bwrap or an OCI runtime), or choose a non-sealed profile"
             }
         }
     }
@@ -729,7 +760,7 @@ impl From<VolumeAdmissionError> for EnterError {
     }
 }
 
-fn refusal(
+pub(crate) fn refusal(
     spec: &SandboxSpec,
     class: RefusalClass,
     path: Option<String>,
@@ -835,6 +866,14 @@ fn launchable(spec: &SandboxSpec) -> Result<std::borrow::Cow<'_, SandboxSpec>, E
     }
     if let Some(message) = hostname_policy_refusal_with(HOSTNAME_RULES, spec) {
         return Err(refusal(spec, RefusalClass::HostnamePolicy, None, message));
+    }
+    if let Some(message) = crate::sandbox_floor::strict_gate(spec) {
+        return Err(refusal(
+            spec,
+            RefusalClass::StrictUnsupported,
+            None,
+            message,
+        ));
     }
     tunnel_admission(spec)?;
     let mut view = if !spec.backend.is_oci() && spec.compose.is_some() {
@@ -1141,7 +1180,7 @@ pub fn build_vpn_spec(cfg: &VpnConfig, name: &str, profile: SandboxProfile) -> O
         msg::warn(&format!(
             "sandbox: profile '{profile}' forbids a VPN tunnel (network=none, all \
              capabilities dropped); ignoring [sandbox.vpn]. Use 'sealed-tunnel' for a \
-             tunnel-only worktree, or 'hardened'.",
+             tunnel-only worktree, or 'standard'.",
         ));
         return None;
     }
@@ -1180,7 +1219,7 @@ pub fn build_vpn_spec(cfg: &VpnConfig, name: &str, profile: SandboxProfile) -> O
 }
 
 /// Refusal message for a tunnel-only VPN request that cannot be enforced.
-pub const TUNNEL_ONLY_REFUSAL: &str = "sandbox profile 'sealed-tunnel' promises the VPN tunnel is the only network route, but thegn cannot enforce a tunnel-only datapath yet (direct egress would remain possible beside the sidecar or proxy); refusing to launch. Use profile 'hardened' with [sandbox.vpn] for a tunnel that is not exclusive, or 'sealed' for no network.";
+pub const TUNNEL_ONLY_REFUSAL: &str = "sandbox profile 'sealed-tunnel' promises the VPN tunnel is the only network route, but thegn cannot enforce a tunnel-only datapath yet (direct egress would remain possible beside the sidecar or proxy); refusing to launch. Use profile 'standard' with [sandbox.vpn] for a tunnel that is not exclusive, or 'sealed' for no network.";
 
 /// Refuse a tunnel-only VPN request until the runtime can enforce that no
 /// direct egress route exists beside the VPN tunnel.
@@ -1630,6 +1669,11 @@ fn resolve_placed_with(
             .volumes
             .iter()
             .map(|(k, v)| (k.clone(), v.clone()))
+            .collect(),
+        volume_owners: cfg
+            .volume_owners
+            .iter()
+            .map(|(name, owner)| (name.clone(), owner.clone()))
             .collect(),
         compose: cfg.compose.clone(),
         build: cfg.build.clone(),
@@ -2359,8 +2403,11 @@ pub(crate) fn remove_container(spec: &SandboxSpec) {
     let _ = run_control_owned(spec, &rm, PROBE_TIMEOUT);
 }
 
-/// Return `(running, reusable)` after checking the policy label and mounts.
-/// Apple retains its mount-only check because its CLI has no verified label.
+/// Return `(running, reusable)` after checking the policy label, mounts, and
+/// the runtime image id against the current local image id. Docker reports
+/// both ids as `sha256:<64 hex>`; Podman reports both as bare 64-hex ids.
+/// Apple retains its mount-only check because its CLI has no verified Go
+/// templates or image-id probe (THE-513 residual).
 fn container_status(spec: &SandboxSpec) -> (bool, bool) {
     let sealed = spec.seal_home.is_some();
     let nix_expected = emits_nix_bind(spec);
@@ -2375,7 +2422,7 @@ fn container_status(spec: &SandboxSpec) -> (bool, bool) {
     // Emit "RUNNING" if actually running (not "created"/"exited"), then one
     // bind-mount source per line. A container in "created" state passes inspect
     // but cannot accept exec sessions — we must not treat it as healthy.
-    let fmt = "{{if .State.Running}}RUNNING{{end}}\n{{index .Config.Labels \"thegn.seal_home\"}}\n{{index .Config.Labels \"thegn.policy\"}}\n{{range .Mounts}}{{if eq .Type \"bind\"}}{{.Source}}\n{{end}}{{end}}";
+    let fmt = "{{if .State.Running}}RUNNING{{end}}\n{{index .Config.Labels \"thegn.seal_home\"}}\n{{index .Config.Labels \"thegn.policy\"}}\n{{range .Mounts}}{{if eq .Type \"bind\"}}{{.Source}}\n{{end}}{{end}}thegn-image:{{.Image}}\n";
     let mut argv = oci_prefix(spec);
     // For remote worktrees the transport wraps the argv; for local we call
     // podman/docker directly. run_control_t_owned gives us the timeout but
@@ -2411,7 +2458,25 @@ fn container_status(spec: &SandboxSpec) -> (bool, bool) {
             return (false, false); // container doesn't exist
         }
         // First line must be "RUNNING" — "CREATED" / "EXITED" / missing → not usable.
-        judge_inspect(&stdout, &required, sealed, nix_expected, &expected_fp)
+        let (inspect_stdout, container_image) = split_image_line(&stdout);
+        let verdict = judge_inspect(
+            &inspect_stdout,
+            &required,
+            sealed,
+            nix_expected,
+            &expected_fp,
+        );
+        if verdict != (true, true) {
+            return verdict;
+        }
+        let image_argv = image_id_argv(spec);
+        match output_with_timeout(&image_argv, PROBE_TIMEOUT) {
+            Some((true, expected_image)) => (
+                true,
+                image_reusable(container_image.as_deref(), Some(expected_image.as_str())),
+            ),
+            Some((false, _)) | None => (true, false),
+        }
     } else {
         // Remote: run the same inspect command over SSH to verify mounts.
         let mut remote_argv = oci_prefix(spec);
@@ -2425,8 +2490,80 @@ fn container_status(spec: &SandboxSpec) -> (bool, bool) {
         let Some((_, stdout)) = output_control_owned(spec, &remote_argv, PROBE_TIMEOUT) else {
             return (false, false);
         };
-        judge_inspect(&stdout, &required, sealed, nix_expected, &expected_fp)
+        let (inspect_stdout, container_image) = split_image_line(&stdout);
+        let verdict = judge_inspect(
+            &inspect_stdout,
+            &required,
+            sealed,
+            nix_expected,
+            &expected_fp,
+        );
+        if verdict != (true, true) {
+            return verdict;
+        }
+        let image_argv = image_id_argv(spec);
+        match output_control_owned(spec, &image_argv, PROBE_TIMEOUT) {
+            Some((true, expected_image)) => (
+                true,
+                image_reusable(container_image.as_deref(), Some(expected_image.as_str())),
+            ),
+            Some((false, _)) | None => (true, false),
+        }
     }
+}
+
+/// Build the runtime probe for the local id of the spec's effective image.
+fn image_id_argv(spec: &SandboxSpec) -> Vec<String> {
+    let mut argv = oci_prefix(spec);
+    argv.extend([
+        "image".into(),
+        "inspect".into(),
+        "--format".into(),
+        "{{.Id}}".into(),
+        effective_image(spec),
+    ]);
+    argv
+}
+
+/// Docker and Podman expose image ids with and without the `sha256:` prefix.
+/// Empty, placeholder, abbreviated, and non-hex values are deliberately
+/// unparseable so an uncertain runtime identity can never authorize reuse.
+fn normalize_image_id(raw: &str) -> Option<String> {
+    let trimmed = raw.trim();
+    let id = trimmed.strip_prefix("sha256:").unwrap_or(trimmed);
+    if id.len() != 64 || !id.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return None;
+    }
+    Some(id.to_ascii_lowercase())
+}
+
+/// Reuse is allowed only when both runtime-reported ids normalize and match.
+fn image_reusable(container: Option<&str>, expected: Option<&str>) -> bool {
+    match (
+        container.and_then(normalize_image_id),
+        expected.and_then(normalize_image_id),
+    ) {
+        (Some(container), Some(expected)) => container == expected,
+        _ => false,
+    }
+}
+
+/// Remove the trailing image-id line before passing inspect output to
+/// `judge_inspect`, whose remaining lines retain their established positions.
+/// Only the final line is metadata: a bind source named `thegn-image:x` earlier
+/// in the output remains an ordinary mount source.
+fn split_image_line(stdout: &str) -> (String, Option<String>) {
+    let without_final_newline = stdout.strip_suffix('\n').unwrap_or(stdout);
+    let Some((rest, final_line)) = without_final_newline.rsplit_once('\n') else {
+        return (stdout.to_string(), None);
+    };
+    let Some(image_id) = final_line.strip_prefix("thegn-image:") else {
+        return (stdout.to_string(), None);
+    };
+    (
+        format!("{rest}\n"),
+        Some(image_id.trim_end_matches('\r').to_string()),
+    )
 }
 
 /// Ensure any persistent state exists (OCI: a keep-alive container we `exec`
@@ -2510,7 +2647,7 @@ fn ensure_noncompose(spec: &SandboxSpec) -> anyhow::Result<()> {
         }
         // Stale policy or mounts — force-remove and fall through to recreate.
         msg::warn(&format!(
-            "sandbox: container '{}' policy or mounts changed (config changed); recreating",
+            "sandbox: container '{}' policy, image or mounts changed (config changed); recreating",
             spec.name
         ));
         remove_container(spec);
@@ -2518,6 +2655,19 @@ fn ensure_noncompose(spec: &SandboxSpec) -> anyhow::Result<()> {
     // Build the image now (synchronous, correct ordering) when a Dockerfile
     // build was requested — the tag is `spec.image`, so the run below finds it.
     crate::sandbox_build::build_image(spec)?;
+    if !spec.volume_owners.is_empty() {
+        let mut runner = |argv: &[String]| {
+            let full = spec.placement.control_argv(argv);
+            let timeout = if spec.placement.is_local() {
+                PROBE_TIMEOUT
+            } else {
+                REMOTE_PROBE_TIMEOUT
+            };
+            output_and_stderr_with_timeout(&full, timeout)
+        };
+        crate::sandbox_volume_owner::claim_volumes(spec, &util::xdg_state_home(), &mut runner)
+            .map_err(anyhow::Error::new)?;
+    }
     let admitted = crate::sandbox_mountcheck::admitted_identities(spec);
     use crate::progress::{SandboxPhase, emit};
     emit(SandboxPhase::ContainerCreate {
@@ -3952,6 +4102,24 @@ fn oci_create_opts_with_remote_stdin_secrets(
         v.extend(["--label".into(), crate::sandbox_manage::owner_label_arg()]);
         v.extend([
             "--label".into(),
+            format!(
+                "{}={}",
+                crate::sandbox_manage::WORKTREE_LABEL_KEY,
+                crate::sandbox_manage::worktree_label_value(
+                    spec.worktree.as_os_str().as_encoded_bytes()
+                )
+            ),
+        ]);
+        v.extend([
+            "--label".into(),
+            format!(
+                "{}={}",
+                crate::sandbox_manage::ROLE_LABEL_KEY,
+                crate::sandbox_manage::MAIN_ROLE
+            ),
+        ]);
+        v.extend([
+            "--label".into(),
             format!("{SEAL_LABEL}={}", u8::from(spec.seal_home.is_some())),
         ]);
         v.extend([
@@ -4714,6 +4882,23 @@ pub fn run_gc_detailed(db_worktrees: &[String]) -> GcReport {
             },
             labelled.as_deref(),
         );
+        let plan = if labelled.is_some() {
+            crate::sandbox_manage::refine_gc_plan(plan, db_worktrees, &mut |name| {
+                let mut command = backend_prefix(backend);
+                command.extend(crate::sandbox_manage::gc_label_probe_argv(name));
+                output_with_timeout(&command, PROBE_TIMEOUT)
+                    .filter(|(ok, _)| *ok)
+                    .map(|(_, stdout)| {
+                        let mut lines = stdout.lines();
+                        (
+                            lines.next().unwrap_or_default().to_string(),
+                            lines.next().unwrap_or_default().to_string(),
+                        )
+                    })
+            })
+        } else {
+            plan
+        };
 
         for orphan in &plan.remove {
             removed_names.push(orphan.clone());

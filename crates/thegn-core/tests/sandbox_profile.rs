@@ -138,6 +138,7 @@ fn h3_profile_switch_teardown() {
         oci_runtime: None,
         daemon_persistent: false,
         seal_home: None,
+        volume_owners: Vec::new(),
     };
     thegn_core::sandbox::ensure(&spec_work).expect("ensure work failed");
     assert!(container_running(&name_work));

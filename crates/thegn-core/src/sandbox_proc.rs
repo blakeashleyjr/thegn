@@ -48,6 +48,21 @@ pub(crate) enum ProcOutcome {
 }
 
 impl ProcOutcome {
+    pub(crate) fn into_stdout_and_stderr(self) -> Option<(bool, String, String)> {
+        match self {
+            Self::Exited {
+                status,
+                stdout,
+                stderr,
+            } if !stdout.truncated && !stderr.truncated => Some((
+                status.success(),
+                String::from_utf8_lossy(&stdout.bytes).into_owned(),
+                String::from_utf8_lossy(&stderr.bytes).into_owned(),
+            )),
+            Self::Exited { .. } | Self::Spawn | Self::Wait | Self::Read | Self::Timeout => None,
+        }
+    }
+
     pub(crate) fn into_stdout(self) -> Option<(bool, String)> {
         match self {
             Self::Exited { status, stdout, .. } if !stdout.truncated => Some((
@@ -439,6 +454,18 @@ mod tests {
             }
             other => panic!("expected exit outcome, got {other:?}"),
         }
+        let failed = run_bounded(
+            &sh("printf out; printf err >&2; exit 7"),
+            Duration::from_secs(1),
+            Capture {
+                stdout: Some(16),
+                stderr: Some(16),
+            },
+        );
+        assert_eq!(
+            failed.into_stdout_and_stderr().unwrap(),
+            (false, "out".into(), "err".into())
+        );
         let success = run_bounded(
             &sh("printf captured; printf diagnostic >&2"),
             Duration::from_secs(1),

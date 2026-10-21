@@ -23,6 +23,14 @@ use tokio::sync::{mpsc, watch};
 
 use crate::provider::{ExecControl, ExecFrame, ExecSession, ExecSpec};
 
+/// Whether this build includes the iroh call-home transport.
+pub const BUILT: bool = true;
+
+/// Derive the stable endpoint id string from its persisted secret bytes.
+pub fn endpoint_id_for_secret(secret: &[u8; 32]) -> Result<String> {
+    Ok(iroh::SecretKey::from_bytes(secret).public().to_string())
+}
+
 /// Bound on how long an accepted-but-unauthenticated connection may take to send
 /// its [`Hello`]. A peer that completes the QUIC handshake (any holder of the
 /// home EndpointId, which is injected into every sandbox env) but then goes
@@ -65,13 +73,13 @@ impl IrohHome {
     /// restarts (the host loads it from the keyring); `None` ⇒ ephemeral (tests).
     /// Returns the home plus a receiver that fires each time a sandbox registers.
     pub async fn bind(
-        secret: Option<iroh::SecretKey>,
+        secret: Option<[u8; 32]>,
         verifier: Arc<dyn TokenVerifier>,
     ) -> Result<(Self, mpsc::UnboundedReceiver<String>)> {
         let mut builder =
             iroh::Endpoint::builder(iroh::endpoint::presets::N0).alpns(vec![ALPN.to_vec()]);
-        if let Some(sk) = secret {
-            builder = builder.secret_key(sk);
+        if let Some(bytes) = secret {
+            builder = builder.secret_key(iroh::SecretKey::from_bytes(&bytes));
         }
         let endpoint = builder.bind().await.context("bind home endpoint")?;
         Ok(Self::serve(endpoint, verifier))

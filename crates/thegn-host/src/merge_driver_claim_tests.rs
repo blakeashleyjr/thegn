@@ -277,7 +277,7 @@ fn budget_is_consumed_through_the_claim() {
 }
 
 #[test]
-fn unregistered_row_still_drains_unfenced() {
+fn unregistered_row_without_git_attribution_is_skipped() {
     let db = Db::open_memory().unwrap();
     db.enqueue_merge("/ad-hoc", "feature", "main").unwrap();
     let outcome = drive_queue_with(
@@ -297,8 +297,14 @@ fn unregistered_row_still_drains_unfenced() {
             unused_agent_runner,
         ),
     );
-    assert!(outcome.warnings.is_empty());
-    assert_eq!(outcome.ready, ["feature"]);
+    assert!(outcome.ready.is_empty());
+    assert_eq!(outcome.warnings.len(), 1);
+    assert!(outcome.warnings[0].contains("not attributable"));
+    assert_eq!(db.list_merge_queue().unwrap()[0].status, "queued");
+    assert_eq!(
+        db.observe_merge_claim("/ad-hoc").unwrap().unwrap().phase,
+        "unclaimed"
+    );
 }
 
 #[test]

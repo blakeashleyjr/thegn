@@ -116,9 +116,9 @@ pub(crate) struct AgentTaskRun<'a> {
     /// slice posture. The floor decision itself is made by [`agent_floor_gate`]
     /// before this run — a fail-closed miss never reaches here.
     pub sandbox: Option<thegn_core::sandbox::SandboxSpec>,
-    /// Run with a credential-free environment. Autopilot issue content is
-    /// untrusted, so its worker must not inherit the launcher's credentials.
-    /// Queue agents retain the historical credentialed behavior explicitly.
+    /// Run with a credential-free environment. Every autonomous handoff
+    /// (autopilot and queue agents) must not inherit the launcher's credentials.
+    /// Interactive panes do not use this runner.
     pub credential_free: bool,
 }
 
@@ -207,11 +207,14 @@ fn compose_unverified_warning(
 }
 
 /// Resolve a queue agent task's sandbox + floor into a dispatch decision. With
-/// the opt-in off this is always `Run(None)` (host + slice, unchanged). With it
-/// on, the worktree's sandbox is resolved and its honest class compared against
-/// at least the `[sandbox]` floor in force (default: shared-kernel, refusing on
-/// a miss), via the pure [`thegn_core::sandbox_floor::queue_agent_gate`]. The
-/// queue floor can raise that boundary but cannot weaken it.
+/// the opt-in off, the `[sandbox]` floor still applies: a fail-closed floor
+/// holds the queue entry, explicit degrade labels `RunDegraded(None, ..)`, and
+/// an off floor permits `Run(None)` (host + slice).
+/// With the opt-in on, the worktree's sandbox is resolved and its honest class
+/// compared against at least the `[sandbox]` floor in force (default:
+/// shared-kernel, refusing on a miss), via the pure
+/// [`thegn_core::sandbox_floor::queue_agent_gate`]. The queue floor can raise
+/// that boundary but cannot weaken it.
 /// Before returning a runnable dispatch, this gate ensures the sandbox and
 /// proves it can execute a noninteractive preflight command.
 pub(crate) fn agent_floor_gate(
@@ -222,10 +225,35 @@ pub(crate) fn agent_floor_gate(
     on_miss: thegn_core::config::OnFloorMiss,
 ) -> AgentDispatch {
     if !sandbox_on {
-        return AgentDispatch::Run(None);
+        return uncontained_agent_gate(&full.sandbox);
     }
     let effective = effective_agent_sandbox(full, worktree);
     agent_floor_gate_with_effective(full, worktree, floor, on_miss, effective)
+}
+
+fn uncontained_agent_gate(sb: &thegn_core::config::SandboxConfig) -> AgentDispatch {
+    use thegn_core::config::OnFloorMiss;
+
+    let floor = thegn_core::sandbox_floor::floor_in_force(sb, false);
+    if floor.required_rank().is_none() {
+        return AgentDispatch::Run(None);
+    }
+    match thegn_core::sandbox_floor::miss_policy_in_force(sb) {
+        OnFloorMiss::Fail => AgentDispatch::InfraHold(format!(
+            "queue agent held: agent_sandbox = false would run it on the host, but the [sandbox] \
+             isolation floor in force is `{}` and refuses a miss — set the queue's \
+             agent_sandbox = true to run it contained, or [sandbox] isolation_floor = \"off\" \
+             to allow uncontained queue agents",
+            floor.as_str()
+        )),
+        OnFloorMiss::Degrade => AgentDispatch::RunDegraded(
+            None,
+            format!(
+                "queue agent running uncontained on the host under the explicit [sandbox] isolation floor `{}` (on_floor_miss = \"degrade\")",
+                floor.as_str()
+            ),
+        ),
+    }
 }
 
 fn effective_agent_sandbox(
@@ -267,12 +295,12 @@ fn agent_floor_gate_with_effective(
     on_miss: thegn_core::config::OnFloorMiss,
     effective: Result<thegn_core::config::SandboxConfig, String>,
 ) -> AgentDispatch {
-    use thegn_core::capabilities::IsolationClass;
     use thegn_core::sandbox_floor::{AgentGate, queue_agent_gate};
     let effective = match effective {
         Ok(effective) => effective,
         Err(reason) => return AgentDispatch::InfraHold(reason),
     };
+    let effective = credential_free_sandbox(effective);
     let loc = thegn_core::remote::GitLoc::Local(std::path::PathBuf::from(worktree));
     let name = std::path::Path::new(worktree)
         .file_name()
@@ -296,18 +324,24 @@ fn agent_floor_gate_with_effective(
             profile.as_str()
         ));
     }
+    let Some(spec) = spec else {
+        return AgentDispatch::InfraHold(format!(
+            "no sandbox could be established for the queued agent in {worktree} (backend `{}`); autonomous agents never fall back to the host — start a container runtime (see `thegn doctor`), or set the queue's agent_sandbox = false with [sandbox] isolation_floor = \"off\" to run it on the host credential-free",
+            effective.backend.as_str()
+        ));
+    };
     // THE-215: a sealed launch that would expose the host `$HOME` is an
     // infrastructure failure under a demanded floor, same as a missed floor.
-    if let Some(miss) = spec.as_ref().and_then(thegn_core::sandbox_floor::home_gate) {
+    if let Some(miss) = thegn_core::sandbox_floor::home_gate(&spec) {
         return AgentDispatch::InfraHold(miss);
     }
-    let resolved = spec.as_ref().map(|s| s.capabilities().isolation);
-    let best = resolved.unwrap_or(IsolationClass::HostProcess);
+    let best = spec.capabilities().isolation;
+    let resolved = Some(best);
     let global_gate = queue_agent_gate(&full.sandbox, floor, on_miss, resolved, best);
     let effective_gate = queue_agent_gate(&effective, floor, on_miss, resolved, best);
     let dispatch = match stricter_agent_gate(global_gate, effective_gate) {
-        AgentGate::Run => AgentDispatch::Run(spec),
-        AgentGate::RunDegraded(w) => AgentDispatch::RunDegraded(spec, w),
+        AgentGate::Run => AgentDispatch::Run(Some(spec)),
+        AgentGate::RunDegraded(w) => AgentDispatch::RunDegraded(Some(spec), w),
         AgentGate::InfraHold(r) => AgentDispatch::InfraHold(r),
     };
     provision_dispatch(dispatch, &|spec| {
@@ -1043,6 +1077,13 @@ where
         .collect()
 }
 
+fn credential_free_sandbox(
+    mut sb: thegn_core::config::SandboxConfig,
+) -> thegn_core::config::SandboxConfig {
+    sb.env_passthrough.retain(|name| !credential_shaped(name));
+    sb
+}
+
 fn credential_shaped(key: &str) -> bool {
     let upper = key.to_ascii_uppercase();
     [
@@ -1060,6 +1101,7 @@ fn credential_shaped(key: &str) -> bool {
     ]
     .iter()
     .any(|suffix| upper.ends_with(suffix))
+        || upper == "GPG_AGENT_INFO"
 }
 
 /// Windows stub: the command template is composed with POSIX `sh_quote` and run
@@ -1133,6 +1175,7 @@ mod tests {
             oci_runtime: None,
             daemon_persistent: false,
             seal_home: None,
+            volume_owners: Vec::new(),
         }
     }
 
@@ -1163,7 +1206,10 @@ mod tests {
             thegn_core::config::OnFloorMiss::Degrade,
             Ok(effective),
         );
-        assert!(matches!(dispatch, AgentDispatch::Run(None)));
+        assert!(matches!(
+            dispatch,
+            AgentDispatch::InfraHold(reason) if reason.contains("never fall back to the host")
+        ));
     }
 
     #[test]
@@ -1275,6 +1321,109 @@ mod tests {
                 AgentGate::RunDegraded("effective".into())
             ),
             AgentGate::RunDegraded(reason) if reason == "global"
+        ));
+    }
+
+    #[test]
+    fn uncontained_queue_agent_is_held_under_the_default_floor() {
+        assert!(matches!(
+            uncontained_agent_gate(&thegn_core::config::SandboxConfig::default()),
+            AgentDispatch::InfraHold(reason)
+                if reason.contains("shared-kernel")
+                    && reason.contains("isolation_floor = \"off\"")
+        ));
+        assert!(matches!(
+            agent_floor_gate(
+                &thegn_core::config::Config::default(),
+                "/w/fix",
+                false,
+                thegn_core::config::IsolationFloor::Off,
+                thegn_core::config::OnFloorMiss::Degrade,
+            ),
+            AgentDispatch::InfraHold(_)
+        ));
+    }
+
+    #[test]
+    fn uncontained_queue_agent_degrades_under_an_explicit_degrade_floor() {
+        let sandbox = thegn_core::config::SandboxConfig {
+            isolation_floor: Some(thegn_core::config::IsolationFloor::SharedKernel),
+            on_floor_miss: thegn_core::config::OnFloorMiss::Degrade,
+            ..thegn_core::config::SandboxConfig::default()
+        };
+        assert!(matches!(
+            uncontained_agent_gate(&sandbox),
+            AgentDispatch::RunDegraded(None, warning) if warning.contains("uncontained")
+        ));
+        let full = thegn_core::config::Config {
+            sandbox,
+            ..thegn_core::config::Config::default()
+        };
+        assert!(matches!(
+            agent_floor_gate(
+                &full,
+                "/w/fix",
+                false,
+                thegn_core::config::IsolationFloor::Off,
+                thegn_core::config::OnFloorMiss::Fail,
+            ),
+            AgentDispatch::RunDegraded(None, warning) if warning.contains("uncontained")
+        ));
+    }
+
+    #[test]
+    fn uncontained_queue_agent_runs_when_the_floor_is_off() {
+        let explicit_off = thegn_core::config::SandboxConfig {
+            isolation_floor: Some(thegn_core::config::IsolationFloor::Off),
+            ..thegn_core::config::SandboxConfig::default()
+        };
+        assert!(matches!(
+            uncontained_agent_gate(&explicit_off),
+            AgentDispatch::Run(None)
+        ));
+        let full = thegn_core::config::Config {
+            sandbox: explicit_off,
+            ..thegn_core::config::Config::default()
+        };
+        assert!(matches!(
+            agent_floor_gate(
+                &full,
+                "/w/fix",
+                false,
+                thegn_core::config::IsolationFloor::SharedKernel,
+                thegn_core::config::OnFloorMiss::Fail,
+            ),
+            AgentDispatch::Run(None)
+        ));
+        let disabled = thegn_core::config::SandboxConfig {
+            enabled: false,
+            ..thegn_core::config::SandboxConfig::default()
+        };
+        assert!(matches!(
+            uncontained_agent_gate(&disabled),
+            AgentDispatch::Run(None)
+        ));
+        let full = thegn_core::config::Config {
+            sandbox: disabled,
+            ..thegn_core::config::Config::default()
+        };
+        assert!(matches!(
+            agent_floor_gate(
+                &full,
+                "/w/fix",
+                false,
+                thegn_core::config::IsolationFloor::SharedKernel,
+                thegn_core::config::OnFloorMiss::Fail,
+            ),
+            AgentDispatch::Run(None)
+        ));
+        let host_backend = thegn_core::config::SandboxConfig {
+            backend: thegn_core::config::SandboxBackend::None,
+            ..thegn_core::config::SandboxConfig::default()
+        };
+        assert!(matches!(
+            uncontained_agent_gate(&host_backend),
+            AgentDispatch::Run(None)
         ));
     }
 
@@ -1515,5 +1664,106 @@ mod tests {
             .map(|(production, _)| production)
             .unwrap();
         assert!(!production.contains(concat!("sandbox::", "ensure(")));
+    }
+
+    #[test]
+    fn queue_agent_without_a_sandbox_is_held_not_run_on_the_host() {
+        let repo = tempfile::tempdir().unwrap();
+        let full: thegn_core::config::Config = toml::from_str(
+            r#"
+                [sandbox]
+                enabled = true
+                backend = "none"
+                isolation_floor = "off"
+            "#,
+        )
+        .unwrap();
+        let effective = effective_agent_sandbox_at(&full, repo.path(), repo.path()).unwrap();
+        let dispatch = agent_floor_gate_with_effective(
+            &full,
+            repo.path().to_str().unwrap(),
+            thegn_core::config::IsolationFloor::Off,
+            thegn_core::config::OnFloorMiss::Degrade,
+            Ok(effective),
+        );
+        assert!(matches!(
+            dispatch,
+            AgentDispatch::InfraHold(reason) if reason.contains("never fall back to the host")
+        ));
+    }
+
+    #[test]
+    fn credential_free_sandbox_drops_credential_passthrough() {
+        let env =
+            credential_free_sandbox(thegn_core::config::SandboxConfig::default()).env_passthrough;
+        for name in [
+            "SSH_AUTH_SOCK",
+            "GH_TOKEN",
+            "GITHUB_TOKEN",
+            "ANTHROPIC_API_KEY",
+            "GPG_AGENT_INFO",
+        ] {
+            assert!(
+                !env.iter().any(|candidate| candidate == name),
+                "retained {name}"
+            );
+        }
+        for name in [
+            "TERM",
+            "COLORTERM",
+            "GNUPGHOME",
+            "GPG_TTY",
+            "GIT_CONFIG_GLOBAL",
+            "GH_CONFIG_DIR",
+        ] {
+            assert!(
+                env.iter().any(|candidate| candidate == name),
+                "dropped {name}"
+            );
+        }
+    }
+
+    #[test]
+    fn credential_free_environment_drops_the_gpg_agent_locator() {
+        let env = credential_free_env([
+            ("GPG_AGENT_INFO".into(), "/run/agent".into()),
+            ("PATH".into(), "/bin".into()),
+            ("XDG_RUNTIME_DIR".into(), "/run/user/1".into()),
+            (
+                "DBUS_SESSION_BUS_ADDRESS".into(),
+                "unix:path=/run/dbus".into(),
+            ),
+        ]);
+        assert_eq!(
+            env,
+            vec![
+                ("PATH".into(), "/bin".into()),
+                ("XDG_RUNTIME_DIR".into(), "/run/user/1".into()),
+                (
+                    "DBUS_SESSION_BUS_ADDRESS".into(),
+                    "unix:path=/run/dbus".into()
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn queue_handoffs_run_credential_free() {
+        let sources = [
+            include_str!("merge_driver.rs"),
+            include_str!("pr_driver.rs"),
+            include_str!("ci_autofix.rs"),
+            include_str!("review_handoff_headless.rs"),
+            include_str!("review_task_handoff.rs"),
+        ];
+        for source in sources {
+            let production = source
+                .split_once("\nmod tests {")
+                .or_else(|| source.split_once("\n#[cfg(test)]"))
+                .map(|(production, _)| production)
+                .unwrap_or(source);
+            assert!(production.contains("credential_free: true"));
+            assert!(!production.contains("credential_free: false"));
+        }
     }
 }

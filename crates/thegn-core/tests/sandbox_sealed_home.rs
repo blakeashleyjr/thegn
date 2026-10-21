@@ -14,7 +14,9 @@ use std::process::Command;
 
 use thegn_core::config::{FileAccess, Network, SandboxProfile};
 use thegn_core::placement::Placement;
-use thegn_core::sandbox::{Backend, Mount, SandboxLimits, SandboxSpec, enter_argv};
+use thegn_core::sandbox::{
+    Backend, EnterError, Mount, RefusalClass, SandboxLimits, SandboxSpec, enter_argv,
+};
 use thegn_core::sandbox_floor::home_gate;
 use thegn_core::sandbox_mounts::{HomeView, home_view, planned_home_view, sealed_home_allowlist};
 
@@ -83,6 +85,7 @@ fn spec(backend: Backend, home: &Path, mounts: Vec<Mount>, seal: bool) -> Sandbo
         oci_runtime: None,
         daemon_persistent: false,
         seal_home: seal.then(|| home.to_string_lossy().into_owned()),
+        volume_owners: Vec::new(),
     }
 }
 
@@ -225,15 +228,17 @@ fn bwrap_hardened_is_unchanged_no_tmpfs_home() {
 
 #[test]
 fn systemd_sealed_with_a_home_outside_protecthome_roots_is_refused() {
-    // Argv shape is covered in-crate (`sandbox_tests`, needs a /home path); here
-    // the synthetic tempdir HOME is outside /home, /root and /run/user, where
-    // `ProtectHome=tmpfs` does not reach: enter_argv must refuse.
+    // Sealed Systemd is refused at strict admission before the ProtectHome
+    // roots check. The synthetic tempdir still exercises the outside-roots case
+    // directly through `home_gate` in `home_view_and_gate_per_backend`.
     let td = fixture();
     let h = td.path();
     let mut mounts = sealed_home_allowlist(h);
     mounts.push(rw(&h.join("wt")));
-    let err = enter_argv(&spec(Backend::Systemd, h, mounts, true), "true").unwrap_err();
-    assert!(err.to_string().contains("sealed"), "{err}");
+    assert!(matches!(
+        enter_argv(&spec(Backend::Systemd, h, mounts, true), "true"),
+        Err(EnterError::Refused(refusal)) if refusal.class == RefusalClass::StrictUnsupported
+    ));
 }
 
 #[test]
