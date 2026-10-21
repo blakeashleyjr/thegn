@@ -27,12 +27,16 @@
 //! the module opts out of dead-code lints rather than shipping a half-wired UI.
 #![allow(dead_code)]
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use sha2::{Digest, Sha256};
-use std::path::PathBuf;
+use std::{
+    fmt,
+    path::{Path, PathBuf},
+};
 use thegn_core::db::Db;
 
 pub const SUBPROFILE_NAME_MAX_BYTES: usize = 128;
+pub const RESERVED_SUBPROFILE_NAMES: &[&str] = &["default"];
 
 /// Reject names that are empty, overlong, or contain control characters.
 pub fn validate_subprofile_name(name: &str) -> Result<()> {
@@ -44,6 +48,103 @@ pub fn validate_subprofile_name(name: &str) -> Result<()> {
     }
     if name.chars().any(char::is_control) {
         anyhow::bail!("subprofile name must not contain control characters");
+    }
+    if name.trim() != name {
+        anyhow::bail!("subprofile name must not start or end with whitespace");
+    }
+    if RESERVED_SUBPROFILE_NAMES
+        .iter()
+        .any(|reserved| name.eq_ignore_ascii_case(reserved))
+    {
+        anyhow::bail!("`default` is reserved for the profile-level scope");
+    }
+    Ok(())
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SubprofileStorageRefusal {
+    NotRegularFile { file: String },
+    Symlink { file: String },
+    ForeignOwner { file: String },
+    HardLinked { file: String },
+    LegacySlugDatabase { file: String },
+}
+
+impl fmt::Display for SubprofileStorageRefusal {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::NotRegularFile { file } => write!(
+                f,
+                "subprofile database `{file}` is not a regular file; move it aside and retry"
+            ),
+            Self::Symlink { file } => write!(
+                f,
+                "subprofile database `{file}` is a symlink; replace it with a regular file and retry"
+            ),
+            Self::ForeignOwner { file } => write!(
+                f,
+                "subprofile database `{file}` is not owned by the current user; move it aside and retry"
+            ),
+            Self::HardLinked { file } => write!(
+                f,
+                "subprofile database `{file}` has multiple hard links; move it aside and retry"
+            ),
+            Self::LegacySlugDatabase { file } => write!(
+                f,
+                "a pre-digest subprofile database `{file}` exists in this root; its name collided across subprofiles, so it is not opened or migrated automatically: move it aside after checking which subprofile it belongs to"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for SubprofileStorageRefusal {}
+
+fn check_db_leaf(dir: &Path, file: &str, subprofile: &str) -> Result<()> {
+    let db_path = dir.join(file);
+    match std::fs::symlink_metadata(&db_path) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(error).with_context(|| format!("checking subprofile database `{file}`"));
+        }
+        Ok(metadata) if metadata.file_type().is_symlink() => {
+            return Err(SubprofileStorageRefusal::Symlink {
+                file: file.to_string(),
+            }
+            .into());
+        }
+        Ok(metadata) if !metadata.is_file() => {
+            return Err(SubprofileStorageRefusal::NotRegularFile {
+                file: file.to_string(),
+            }
+            .into());
+        }
+        Ok(metadata) if !thegn_core::fsperm::owned_by_current_user(&metadata) => {
+            return Err(SubprofileStorageRefusal::ForeignOwner {
+                file: file.to_string(),
+            }
+            .into());
+        }
+        Ok(metadata) if thegn_core::fsperm::ensure_single_link_regular_file(&metadata).is_err() => {
+            return Err(SubprofileStorageRefusal::HardLinked {
+                file: file.to_string(),
+            }
+            .into());
+        }
+        Ok(_) => {}
+    }
+
+    let legacy = format!("{}.db", thegn_core::util::slugify(subprofile));
+    if legacy != file {
+        match std::fs::symlink_metadata(dir.join(&legacy)) {
+            Ok(_) => {
+                return Err(SubprofileStorageRefusal::LegacySlugDatabase { file: legacy }.into());
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(error)
+                    .with_context(|| format!("checking legacy subprofile database `{legacy}`"));
+            }
+        }
     }
     Ok(())
 }
@@ -209,7 +310,9 @@ impl Subsystem for StubSubsystem {
         let db = match &self.db_root {
             Some(dir) => {
                 thegn_core::fsperm::ensure_private_dir(dir)?;
-                Db::open_at(&dir.join(subprofile_db_file_name(subprofile)))?
+                let file = subprofile_db_file_name(subprofile);
+                check_db_leaf(dir, &file, subprofile)?;
+                Db::open_at(&dir.join(file))?
             }
             None => Db::open_memory()?,
         };
@@ -411,6 +514,78 @@ mod tests {
             assert_eq!(comms.pane_ids(), vec![3, 4]);
             assert!(comms.storage_is_open());
         }
+    }
+
+    #[test]
+    fn reserved_and_whitespace_alias_names_are_refused_before_teardown() {
+        let mut subs = Subsystems {
+            subsystems: vec![Box::new(StubSubsystem::in_memory("comms"))],
+        };
+        subs.switch_subprofile("comms", "work").unwrap();
+        subs.get_mut("comms").unwrap().adopt_pane(3);
+        subs.get_mut("comms").unwrap().adopt_pane(4);
+
+        assert!(validate_subprofile_name("work a").is_ok());
+        for invalid in ["default", "Default", " work", "work "] {
+            assert!(subs.switch_subprofile("comms", invalid).is_err());
+            let comms = subs.get_mut("comms").unwrap();
+            assert_eq!(comms.active_subprofile(), "work");
+            assert_eq!(comms.pane_ids(), vec![3, 4]);
+            assert!(comms.storage_is_open());
+        }
+    }
+
+    #[test]
+    fn symlinked_database_leaf_is_refused() {
+        let root = private_temp_root();
+        let db_root = root.path().join("comms");
+        std::fs::create_dir(&db_root).unwrap();
+        thegn_core::fsperm::restrict_dir_to_owner(&db_root).unwrap();
+        let target = root.path().join("target.db");
+        std::fs::write(&target, b"target remains untouched").unwrap();
+        let link = db_root.join(subprofile_db_file_name("work"));
+        if crate::platform::symlink_file_for_test(&target, &link).is_err() {
+            return;
+        }
+
+        let mut comms = StubSubsystem {
+            name: "comms".into(),
+            db_root: Some(db_root),
+            active: "default".into(),
+            db: None,
+            panes: Vec::new(),
+        };
+        let result = comms.bind("work");
+        assert!(matches!(
+            result.as_ref().err().and_then(|error| error.downcast_ref()),
+            Some(SubprofileStorageRefusal::Symlink { .. })
+        ));
+        assert_eq!(std::fs::read(target).unwrap(), b"target remains untouched");
+    }
+
+    #[test]
+    fn legacy_slug_database_is_refused() {
+        let root = private_temp_root();
+        let db_root = root.path().join("comms");
+        std::fs::create_dir(&db_root).unwrap();
+        thegn_core::fsperm::restrict_dir_to_owner(&db_root).unwrap();
+        let legacy = db_root.join("work-a.db");
+        std::fs::write(&legacy, b"legacy data").unwrap();
+        crate::platform::restrict_file_owner_only(&legacy);
+
+        let mut comms = StubSubsystem {
+            name: "comms".into(),
+            db_root: Some(db_root),
+            active: "default".into(),
+            db: None,
+            panes: Vec::new(),
+        };
+        let result = comms.bind("work/a");
+        assert!(matches!(
+            result.as_ref().err().and_then(|error| error.downcast_ref()),
+            Some(SubprofileStorageRefusal::LegacySlugDatabase { file }) if file == "work-a.db"
+        ));
+        assert!(comms.bind("other").is_ok());
     }
 
     #[test]
