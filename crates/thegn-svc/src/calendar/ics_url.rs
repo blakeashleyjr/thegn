@@ -15,7 +15,10 @@ use futures_util::future::BoxFuture;
 use thegn_core::config_calendar::CalendarAccount;
 use thegn_core::secretref::BareAs;
 
-use super::{AccountAdmission, CalendarBackend, CalendarCaps, CalendarError, EventPage, PageMode};
+use super::{
+    AccountAdmission, CalendarBackend, CalendarCaps, CalendarError, EventPage, PageDiagnostics,
+    PageMode,
+};
 use crate::http::{
     CalendarHttpClient, CalendarHttpError, ExpectedMedia, MAX_BODY_BYTES, MAX_REQUEST_BYTES,
     bounded_header_value, discard_body, map_error, read_body, validate_encoding, validate_media,
@@ -242,6 +245,7 @@ impl CalendarBackend for IcsUrlBackend {
                     "calendar document is incomplete or structurally malformed".into(),
                 ));
             }
+            let diagnostics = PageDiagnostics::from_report(&report);
             drop(body);
             EventPage::from_meter(
                 meter,
@@ -250,6 +254,7 @@ impl CalendarBackend for IcsUrlBackend {
                 Vec::new(),
                 stored_cursor(self.zone.name(), &etag),
             )
+            .map(|page| page.with_diagnostics(diagnostics))
         })
     }
 }

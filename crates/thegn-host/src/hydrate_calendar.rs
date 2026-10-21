@@ -500,6 +500,55 @@ fn contention_backoff(account: &str, now: i64) -> bool {
     }
 }
 
+type CalendarDiagnosticsMap = Mutex<BTreeMap<String, thegn_svc::calendar::PageDiagnostics>>;
+
+fn diagnostics_seen() -> &'static CalendarDiagnosticsMap {
+    static SEEN: OnceLock<CalendarDiagnosticsMap> = OnceLock::new();
+    SEEN.get_or_init(Default::default)
+}
+
+fn diagnostics_notice(
+    prev: Option<&thegn_svc::calendar::PageDiagnostics>,
+    now: &thegn_svc::calendar::PageDiagnostics,
+    account: &str,
+) -> Option<String> {
+    if now.is_empty() || prev == Some(now) {
+        return None;
+    }
+    let name = thegn_core::calendar::display::DisplayText::new(
+        account,
+        thegn_core::calendar::display::Field::Calendar,
+    );
+    let mut text = format!(
+        "Calendar \"{}\": {} problem(s) reading events; the affected events are not shown",
+        name.as_str(),
+        now.total()
+    );
+    if now.unresolved_zones > 0 {
+        text.push_str(&format!(
+            " ({} with an unknown time zone)",
+            now.unresolved_zones
+        ));
+    }
+    Some(text)
+}
+
+fn note_page_diagnostics(
+    account: &str,
+    now: thegn_svc::calendar::PageDiagnostics,
+) -> Option<String> {
+    let mut seen = diagnostics_seen()
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    let notice = diagnostics_notice(seen.get(account), &now, account);
+    if now.is_empty() {
+        seen.remove(account);
+    } else {
+        seen.insert(account.to_string(), now);
+    }
+    notice
+}
+
 /// Surface a calendar problem the user has to act on as an in-app toast.
 fn toast(
     tx: &tokio_mpsc::UnboundedSender<RefreshKind>,
@@ -651,6 +700,25 @@ fn sync_accounts_with_generation(
         }
         if apply_page_with_generation(db, &r.account, r.provider, &page, window, generation) {
             changed = true;
+        }
+        let diagnostics = page.diagnostics();
+        let current_generation = crate::hydrate_schedule::generation_is_current(generation);
+        if current_generation && !diagnostics.is_empty() {
+            tracing::warn!(
+                target: "thegn::calendar",
+                account = %r.account,
+                quarantined = diagnostics.quarantined_events,
+                zones = diagnostics.unresolved_zones,
+                other = diagnostics.other,
+                overflow = diagnostics.overflow,
+                "calendar events could not be read"
+            );
+        }
+        if current_generation
+            && !page.is_unchanged()
+            && let Some(text) = note_page_diagnostics(&r.account, diagnostics)
+        {
+            notify(text);
         }
     })) else {
         return false;
@@ -1295,3 +1363,7 @@ mod tests;
 #[cfg(test)]
 #[path = "hydrate_calendar_admission_tests.rs"]
 mod admission_tests;
+
+#[cfg(test)]
+#[path = "hydrate_calendar_diag_tests.rs"]
+mod diag_tests;
