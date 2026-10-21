@@ -1191,7 +1191,11 @@ impl SessionActor {
                     "session {} ended; recording not started",
                     self.meta.id
                 ))),
-                RecordSpec::Stop | RecordSpec::Status => Ok(self.record_status()),
+                RecordSpec::Stop => {
+                    self.finalize_recording();
+                    Ok(self.record_status())
+                }
+                RecordSpec::Status => Ok(self.record_status()),
             };
             if reply.send(result).is_err() {
                 tracing::debug!(
