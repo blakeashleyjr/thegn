@@ -145,3 +145,7 @@ A worker reports with `thegn dispatch report <row>` and text that starts with
 result is not accepted as proof. Completion of a stage with an artifact is
 refused while thegn cannot read the worktree's git status; retry when it can,
 or record an explicit forced completion.
+
+Progress notes are limited to 2,000 notes and 2 MiB of text per dispatch row.
+Further `thegn dispatch note` requests are refused with a pointer to
+`thegn dispatch report`, and status JSON marks a truncated note list.
