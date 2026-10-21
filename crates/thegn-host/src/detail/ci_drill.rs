@@ -592,13 +592,13 @@ mod tests {
                 .contains("job list incomplete")
         );
         assert!(
-            DetailRefusal::IncompleteCiJobList
+            crate::detail::DetailRefusal::IncompleteCiJobList
                 .notice()
                 .contains("job list is incomplete")
         );
         assert_eq!(
             overlay.handle_key(&KeyCode::Char('f'), Modifiers::NONE),
-            DetailOutcome::Refused(DetailRefusal::IncompleteCiJobList)
+            DetailOutcome::Refused(crate::detail::DetailRefusal::IncompleteCiJobList)
         );
     }
 
