@@ -423,12 +423,15 @@ fn add_mark(
 
 /// Record the pre-op HEAD as an undo mark. The git mutation still runs when
 /// durable provenance cannot be recorded, but its result reports the failure.
-fn record_mark(loc: &GitLoc, worktree_key: &str) -> std::result::Result<(), String> {
+fn record_mark(
+    loc: &GitLoc,
+    worktree_key: &str,
+    open_db: &impl Fn() -> Result<thegn_core::db::Db>,
+) -> std::result::Result<(), String> {
     let head = loc
         .git_out(&["rev-parse", "HEAD"])
         .ok_or_else(|| "could not read HEAD for undo mark".to_string())?;
-    let db = thegn_core::db::Db::open()
-        .map_err(|error| format!("could not open undo mark database: {error:#}"))?;
+    let db = open_db().map_err(|error| format!("could not open undo mark database: {error:#}"))?;
     add_mark(&db, worktree_key, &head)
 }
 
@@ -457,13 +460,29 @@ fn with_provenance_note(result: GitOpResult, label: &str, failure: Option<String
 
 /// Run one op to completion on the current (blocking) thread.
 pub fn execute_at(op: GitOp, loc: &GitLoc, worktree_key: &str, override_gpg: bool) -> GitOpResult {
+    execute_at_with_db(
+        op,
+        loc,
+        worktree_key,
+        override_gpg,
+        thegn_core::db::Db::open,
+    )
+}
+
+fn execute_at_with_db(
+    op: GitOp,
+    loc: &GitLoc,
+    worktree_key: &str,
+    override_gpg: bool,
+    open_db: impl Fn() -> Result<thegn_core::db::Db>,
+) -> GitOpResult {
     let label = op.label();
     let jj_note = touches_index(&op)
         && matches!(loc, GitLoc::Local(path) if thegn_core::jj::is_colocated(path));
     let opts = RebaseOpts { override_gpg };
     let provenance_failure = op
         .rewrites_history()
-        .then(|| record_mark(loc, worktree_key))
+        .then(|| record_mark(loc, worktree_key, &open_db))
         .and_then(std::result::Result::err);
     let g = CliGit;
     let done = |r: Result<()>| match r {
@@ -704,9 +723,7 @@ pub fn execute_at(op: GitOp, loc: &GitLoc, worktree_key: &str, override_gpg: boo
             stopped(g.move_patch_to_index(loc, &sha, &patch, &opts))
         }
         GitOp::UndoPlan { redo } => {
-            let marks = match marks_from(
-                thegn_core::db::Db::open().and_then(|db| db.undo_marks(worktree_key)),
-            ) {
+            let marks = match marks_from(open_db().and_then(|db| db.undo_marks(worktree_key))) {
                 Ok(marks) => marks,
                 Err(message) => return GitOpResult::Err(message),
             };
@@ -723,7 +740,7 @@ pub fn execute_at(op: GitOp, loc: &GitLoc, worktree_key: &str, override_gpg: boo
         GitOp::UndoApply { plan, autostash } => match g.undo_apply(loc, &plan, autostash) {
             Ok(mark) => {
                 let write_failure = mark.and_then(|sha| {
-                    thegn_core::db::Db::open()
+                    open_db()
                         .map_err(|error| format!("could not open undo mark database: {error:#}"))
                         .and_then(|db| add_mark(&db, worktree_key, &sha))
                         .err()
@@ -766,7 +783,7 @@ pub fn execute_at(op: GitOp, loc: &GitLoc, worktree_key: &str, override_gpg: boo
             )
         }
     };
-    let result = with_provenance_note(result, &label, provenance_failure);
+    let result = with_provenance_note(result, label, provenance_failure);
     match result {
         GitOpResult::Ok(note) if jj_note => GitOpResult::Ok(Some(format!(
             "{} — jj ignores the git index",
@@ -863,25 +880,36 @@ mod tests {
 
     #[test]
     fn undo_marks_are_keyed_by_host_worktree_not_sandbox_path() {
+        let dir = tmp_repo("undo-mark-authority");
+        let loc = GitLoc::Local(dir.clone());
+        let initial = git_out(&dir, &["rev-parse", "HEAD"]);
+        std::fs::write(dir.join("f.txt"), "two\n").unwrap();
+        git_out(&dir, &["add", "f.txt"]);
+        git_out(&dir, &["commit", "-q", "-m", "c1"]);
+        git_out(&dir, &["reset", "--hard", &initial]);
+
         let temp = tempfile::tempdir().unwrap();
-        let db = thegn_core::db::Db::open_at(&temp.path().join("t.db")).unwrap();
-        let loc_a = GitLoc::Provider {
-            control_prefix: Vec::new(),
-            path: "/workspace".into(),
-        };
-        let loc_b = GitLoc::Provider {
-            control_prefix: Vec::new(),
-            path: "/workspace".into(),
-        };
-        let key_a = GitLoc::worktree_cache_key(std::path::Path::new("/host/a"));
-        let key_b = GitLoc::worktree_cache_key(std::path::Path::new("/host/b"));
+        let db_path = temp.path().join("marks.db");
+        let db = thegn_core::db::Db::open_at(&db_path).unwrap();
+        let worktree_key = GitLoc::worktree_cache_key(std::path::Path::new("/host/worktree"));
+        assert_ne!(worktree_key, loc.path());
+        add_mark(&db, &worktree_key, &initial).unwrap();
 
-        assert_eq!(loc_a.path(), loc_b.path());
-        assert_ne!(key_a, key_b);
-        add_mark(&db, &key_a, "abc").unwrap();
+        let result = execute_at_with_db(
+            GitOp::UndoPlan { redo: false },
+            &loc,
+            &worktree_key,
+            false,
+            || thegn_core::db::Db::open_at(&db_path),
+        );
 
-        assert_eq!(db.undo_marks(&key_b).unwrap(), Vec::<String>::new());
-        assert_eq!(db.undo_marks(&key_a).unwrap(), vec!["abc".to_string()]);
+        assert!(matches!(
+            result,
+            GitOpResult::Plan {
+                plan: thegn_core::reflog::UndoPlan::Nothing,
+                redo: false
+            }
+        ));
     }
 
     #[test]
