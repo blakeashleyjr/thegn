@@ -106,7 +106,9 @@ impl Fixture {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .env("HOME", self.root.path().join("home"))
-            .env("PATH", "/usr/bin:/bin")
+            // The child resolves pipeline worktree roots with git, which is not
+            // under /usr/bin on every host (NixOS): keep the test's PATH.
+            .env("PATH", std::env::var_os("PATH").unwrap_or_default())
             .env("XDG_CONFIG_HOME", self.root.path().join("config"))
             .env("XDG_STATE_HOME", self.root.path().join("state"))
             .env("XDG_RUNTIME_DIR", self.root.path().join("runtime"))
