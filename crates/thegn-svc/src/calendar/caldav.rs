@@ -8,9 +8,9 @@
 //! - `calendar-query` otherwise — a time-bounded full fetch.
 //!
 //! The XML handling is deliberately narrow: rather than pulling in a DAV/XML
-//! stack we extract the handful of elements the two reports actually define.
-//! CalDAV bodies are machine-generated and shallow, and the alternative is a
-//! large dependency for a couple of tag lookups.
+//! dependency, an in-tree bounded reader validates the DAV/CalDAV structure
+//! and fails closed. This follows the owner decision to keep parsing
+//! dependency-free.
 
 use std::borrow::Cow;
 use std::time::Duration;
@@ -27,6 +27,9 @@ use crate::http::{
     discard_body, map_error, read_body, validate_encoding, validate_media,
 };
 use thegn_core::calendar::AdmissionMeter;
+
+#[path = "caldav_xml.rs"]
+mod xml;
 
 pub(super) fn map_transport_error(error: CalendarHttpError) -> CalendarError {
     match error {
@@ -191,38 +194,6 @@ fn write_xml_escaped(out: &mut String, s: &str) {
     }
 }
 
-/// Undo the five predefined XML entities. Borrowed when there are none, which
-/// is the common case for calendar data.
-fn xml_unescape(s: &str) -> Cow<'_, str> {
-    if !s.contains('&') {
-        return Cow::Borrowed(s);
-    }
-    // One pass into one buffer no larger than the input (every entity is
-    // longer than its character), so an unescaped copy peaks at 1× — the
-    // replace chain it supersedes held two full-size strings at once. Each
-    // entity is decoded exactly once, so `&amp;lt;` stays `&lt;`.
-    let mut out = String::with_capacity(s.len());
-    let mut rest = s;
-    while let Some(i) = rest.find('&') {
-        out.push_str(&rest[..i]);
-        rest = &rest[i..];
-        let (ch, len) = [
-            ("&lt;", '<'),
-            ("&gt;", '>'),
-            ("&quot;", '"'),
-            ("&apos;", '\''),
-            ("&amp;", '&'),
-        ]
-        .iter()
-        .find(|(e, _)| rest.starts_with(e))
-        .map_or(('&', 1), |(e, c)| (*c, e.len()));
-        out.push(ch);
-        rest = &rest[len..];
-    }
-    out.push_str(rest);
-    Cow::Owned(out)
-}
-
 /// One `<response>` from a multistatus body.
 #[cfg(test)]
 #[derive(Debug, PartialEq, Eq)]
@@ -235,94 +206,18 @@ pub(crate) struct DavResponse {
     pub deleted: bool,
 }
 
-/// One `<response>`, borrowed from the body: `ics` is still XML-escaped so the
-/// caller can account for an unescaped copy before making one.
-struct DavResponseRef<'a> {
-    href: String,
-    ics_raw: &'a str,
-    deleted: bool,
-}
-
-/// Pull the `<response>` elements and the `<sync-token>` out of a multistatus.
-///
-/// Namespace prefixes vary by server (`d:`, `D:`, none), so tags are matched on
-/// their local name.
 #[cfg(test)]
-pub(crate) fn parse_multistatus(xml: &str) -> (Vec<DavResponse>, String) {
+pub(crate) fn parse_multistatus(xml: &str) -> Result<(Vec<DavResponse>, String), CalendarError> {
     let mut out = Vec::new();
-    let token = walk_multistatus(xml, |r| {
+    let token = self::xml::walk_multistatus(xml, |r| {
         out.push(DavResponse {
             href: r.href,
-            ics: xml_unescape(r.ics_raw).into_owned(),
+            ics: self::xml::decode_text(r.ics_raw)?.into_owned(),
             deleted: r.deleted,
         });
         Ok(())
-    });
-    match token {
-        Ok(token) => (out, token),
-        Err(_) => Default::default(),
-    }
-}
-
-/// Visit each `<response>` in document order, one at a time, then return the
-/// collection-level sync token.
-///
-/// Nothing is collected here: each response is handed to `visit` straight off
-/// the body, so the caller admits (or refuses) it before the next is looked at.
-fn walk_multistatus<'a>(
-    xml: &'a str,
-    mut visit: impl FnMut(DavResponseRef<'a>) -> Result<(), CalendarError>,
-) -> Result<String, CalendarError> {
-    let mut rest = xml;
-    while let Some((block, tail)) = take_element(rest, "response") {
-        rest = tail;
-        let href = first_element(block, "href").unwrap_or_default();
-        let ics_raw = first_element(block, "calendar-data").unwrap_or_default();
-        // A per-response status of 404 is how `sync-collection` reports a
-        // deletion; a response with no calendar-data at all is one too.
-        let status = first_element(block, "status").unwrap_or_default();
-        let deleted = status.contains("404") || ics_raw.trim().is_empty();
-        if href.trim().is_empty() {
-            continue;
-        }
-        // Size the raw value before unescaping it (the unescaped form is never
-        // longer), so an enormous href costs nothing to refuse.
-        if href.trim().len() > MAX_REQUEST_BYTES {
-            return Err(CalendarError::BodyLimit(
-                "calendar resource href exceeds limit",
-            ));
-        }
-        let href = xml_unescape(href.trim());
-        if href.len() > MAX_REQUEST_BYTES {
-            return Err(CalendarError::BodyLimit(
-                "calendar resource href exceeds limit",
-            ));
-        }
-        visit(DavResponseRef {
-            href: href.into_owned(),
-            ics_raw,
-            deleted,
-        })?;
-    }
-    // The collection-level token sits outside any <response>.
-    let mut token = "";
-    let mut rest = xml;
-    while let Some((body, tail)) = take_element(rest, "sync-token") {
-        token = body;
-        rest = tail;
-    }
-    if token.trim().len() > MAX_REQUEST_BYTES {
-        return Err(CalendarError::BodyLimit(
-            "calendar sync token exceeds limit",
-        ));
-    }
-    let token = xml_unescape(token.trim());
-    if token.len() > MAX_REQUEST_BYTES {
-        return Err(CalendarError::BodyLimit(
-            "calendar sync token exceeds limit",
-        ));
-    }
-    Ok(token.trim().to_string())
+    })?;
+    Ok((out, token))
 }
 
 /// Parse a multistatus into a page, admitting each resource as it is reached.
@@ -338,7 +233,7 @@ fn page_from_multistatus(
     let mut deleted = Vec::new();
     let mut event_hrefs = Vec::new();
     let mut deleted_hrefs = Vec::new();
-    let token = walk_multistatus(text, |r| {
+    let token = xml::walk_multistatus(text, |r| {
         // `calendar_ids` restricts to named collections; a resource outside
         // them is skipped before it is admitted or parsed. Tombstones are
         // filtered the same way, so a deletion elsewhere never reaches us.
@@ -360,13 +255,23 @@ fn page_from_multistatus(
         }
         // An entity-escaped resource needs an unescaped copy; reserve it as
         // transient before it exists.
-        let copy = if r.ics_raw.contains('&') {
+        let copy = if r.ics_raw.contains('&')
+            || r.ics_raw.contains("<![CDATA[")
+            || r.ics_raw.contains("<!--")
+            || r.ics_raw.contains("<?")
+        {
             r.ics_raw.len()
         } else {
             0
         };
         meter.reserve_transient(copy)?;
-        let ics = xml_unescape(r.ics_raw);
+        let ics = match xml::decode_text(r.ics_raw) {
+            Ok(ics) => ics,
+            Err(error) => {
+                meter.release_transient(copy);
+                return Err(error);
+            }
+        };
         let before = events.len();
         let mut report = thegn_core::calendar::ics::IcsReport::default();
         let parsed = thegn_core::calendar::ics::parse_ics_window_reported(
@@ -470,48 +375,6 @@ fn percent_decode(s: &str) -> Cow<'_, str> {
         }
     }
     Cow::Owned(String::from_utf8_lossy(&out).into_owned())
-}
-
-fn first_element<'a>(xml: &'a str, name: &str) -> Option<&'a str> {
-    take_element(xml, name).map(|(body, _)| body)
-}
-
-/// Find the first `<name>` element, returning `(raw body, remainder)`, both
-/// borrowed from `xml`.
-fn take_element<'a>(xml: &'a str, name: &str) -> Option<(&'a str, &'a str)> {
-    let mut search = 0usize;
-    loop {
-        let rel = xml.get(search..)?.find('<')?;
-        let lt = search + rel;
-        let gt = xml.get(lt..)?.find('>')? + lt;
-        let tag = xml.get(lt + 1..gt)?;
-        // Skip closing tags, comments and declarations.
-        if tag.starts_with('/') || tag.starts_with('?') || tag.starts_with('!') {
-            search = gt + 1;
-            continue;
-        }
-        // `name` or `prefix:name`, then whitespace / `>` / `/>`.
-        let local = tag
-            .split([' ', '\t', '\n', '\r', '/'])
-            .next()
-            .unwrap_or(tag);
-        let matches = local == name || local.rsplit(':').next() == Some(name);
-        if !matches {
-            search = gt + 1;
-            continue;
-        }
-        // A self-closing element has an empty body.
-        if tag.ends_with('/') {
-            return Some(("", xml.get(gt + 1..)?));
-        }
-        // Find the matching close tag by local name.
-        let after = gt + 1;
-        let close_rel = xml.get(after..)?.find(&format!("</{local}>"))?;
-        let end = after + close_rel;
-        let body = xml.get(after..end)?;
-        let tail = xml.get(end + local.len() + 3..).unwrap_or("");
-        return Some((body, tail));
-    }
 }
 
 impl CalendarBackend for CalDavBackend {
@@ -823,9 +686,11 @@ mod tests {
     #[test]
     fn retained_sync_tokens_are_bounded_before_publication() {
         let oversized = "x".repeat(MAX_REQUEST_BYTES + 1);
-        let xml = format!("<multistatus><sync-token>{oversized}</sync-token></multistatus>");
+        let xml = format!(
+            "<multistatus xmlns=\"DAV:\"><sync-token>{oversized}</sync-token></multistatus>"
+        );
         assert!(matches!(
-            walk_multistatus(&xml, |_| Ok(())),
+            xml::walk_multistatus(&xml, |_| Ok(())),
             Err(CalendarError::BodyLimit(_))
         ));
     }
@@ -833,7 +698,7 @@ mod tests {
     fn multistatus() -> String {
         let one = |href: &str, uid: &str| {
             format!(
-                "<d:response><d:href>{href}</d:href><d:propstat><d:prop><c:calendar-data>BEGIN:VCALENDAR\nBEGIN:VEVENT\nUID:{uid}\nSUMMARY:{uid}\nDTSTART:20300101T100000Z\nDTEND:20300101T110000Z\nEND:VEVENT\nEND:VCALENDAR</c:calendar-data></d:prop></d:propstat></d:response>"
+                "<d:response><d:href>{href}</d:href><d:propstat><d:prop><c:calendar-data>BEGIN:VCALENDAR\nBEGIN:VEVENT\nUID:{uid}\nSUMMARY:{uid}\nDTSTART:20300101T100000Z\nDTEND:20300101T110000Z\nEND:VEVENT\nEND:VCALENDAR</c:calendar-data></d:prop><d:status>HTTP/1.1 200 OK</d:status></d:propstat></d:response>"
             )
         };
         format!(
@@ -852,7 +717,7 @@ mod tests {
 
     fn resource(href: &str, calendar_data: &str) -> String {
         format!(
-            "<d:response><d:href>{href}</d:href><d:propstat><d:prop><c:calendar-data>{calendar_data}</c:calendar-data></d:prop></d:propstat></d:response>"
+            "<d:response><d:href>{href}</d:href><d:propstat><d:prop><c:calendar-data>{calendar_data}</c:calendar-data></d:prop><d:status>HTTP/1.1 200 OK</d:status></d:propstat></d:response>"
         )
     }
 
@@ -870,7 +735,9 @@ mod tests {
             "/cal/cut.ics",
             "BEGIN:VCALENDAR\nBEGIN:VEVENT\nUID:cut\nDTSTART:20300102T100000Z\n",
         );
-        let xml = format!("<d:multistatus>{good}{truncated}</d:multistatus>");
+        let xml = format!(
+            "<d:multistatus xmlns:d=\"DAV:\" xmlns:c=\"urn:ietf:params:xml:ns:caldav\">{good}{truncated}</d:multistatus>"
+        );
 
         for mode in [PageMode::Snapshot, PageMode::Delta] {
             let error = page_from_multistatus(&xml, "UTC", &[], mode, test_meter()).unwrap_err();
@@ -882,7 +749,7 @@ mod tests {
     fn balanced_envelope_less_caldav_resource_remains_accepted() {
         let data = "BEGIN:VEVENT\nUID:bare\nDTSTART:20300101T100000Z\nEND:VEVENT";
         let xml = format!(
-            "<d:multistatus>{}</d:multistatus>",
+            "<d:multistatus xmlns:d=\"DAV:\" xmlns:c=\"urn:ietf:params:xml:ns:caldav\">{}</d:multistatus>",
             resource("/cal/bare.ics", data)
         );
         let page =
@@ -931,7 +798,7 @@ UID:meeting-b@example
 DTSTART:20300102T100000Z
 DTEND:20300102T110000Z
 END:VEVENT
-END:VCALENDAR</c:calendar-data></d:prop></d:propstat></d:response>
+END:VCALENDAR</c:calendar-data></d:prop><d:status>HTTP/1.1 200 OK</d:status></d:propstat></d:response>
         </d:multistatus>"#;
         let meter =
             AccountAdmission::isolated(Default::default(), thegn_core::calendar::Tz::UTC).meter();
@@ -1028,5 +895,52 @@ END:VCALENDAR</c:calendar-data></d:prop></d:propstat></d:response>
         assert!(!href_in_collections("/dav/My%20Cal/e.ics", &ids(&["My"])));
         assert_eq!(percent_decode("100%"), "100%");
         assert_eq!(percent_decode("%zz%4"), "%zz%4");
+    }
+
+    #[test]
+    fn a_forbidden_calendar_data_propstat_fails_the_delta_instead_of_a_tombstone() {
+        let xml = r#"<d:multistatus xmlns:d="DAV:" xmlns:c="urn:ietf:params:xml:ns:caldav"><d:response><d:href>/cal/a.ics</d:href><d:propstat><d:prop><c:calendar-data/></d:prop><d:status>HTTP/1.1 403 Forbidden</d:status></d:propstat></d:response></d:multistatus>"#;
+        assert!(matches!(
+            page_from_multistatus(xml, "UTC", &[], PageMode::Delta, test_meter()),
+            Err(CalendarError::Api(_))
+        ));
+    }
+
+    #[test]
+    fn an_empty_or_garbage_caldav_body_fails_the_page() {
+        for body in [
+            "",
+            "not xml at all",
+            "<d:multistatus xmlns:d=\"DAV:\"><d:response><d:href>/a.ics",
+        ] {
+            assert!(matches!(
+                page_from_multistatus(body, "UTC", &[], PageMode::Snapshot, test_meter()),
+                Err(CalendarError::Parse(_))
+            ));
+        }
+    }
+
+    #[test]
+    fn a_foreign_namespace_response_is_rejected() {
+        let xml = r#"<d:multistatus xmlns:d="DAV:" xmlns:c="urn:ietf:params:xml:ns:caldav"><x:response xmlns:x="urn:example"><x:href>/a.ics</x:href><x:propstat><x:prop><c:calendar-data>BEGIN:VCALENDAR
+BEGIN:VEVENT
+UID:foreign
+DTSTART:20300101T100000Z
+DTEND:20300101T110000Z
+END:VEVENT
+END:VCALENDAR</c:calendar-data></x:prop><x:status>HTTP/1.1 200 OK</x:status></x:propstat></x:response></d:multistatus>"#;
+        assert!(matches!(
+            page_from_multistatus(xml, "UTC", &[], PageMode::Snapshot, test_meter()),
+            Err(CalendarError::Parse(_))
+        ));
+    }
+
+    #[test]
+    fn a_404_propstat_on_calendar_data_is_not_a_tombstone() {
+        let xml = r#"<d:multistatus xmlns:d="DAV:" xmlns:c="urn:ietf:params:xml:ns:caldav"><d:response><d:href>/cal/a.ics</d:href><d:propstat><d:prop><c:calendar-data/></d:prop><d:status>HTTP/1.1 404 Not Found</d:status></d:propstat></d:response></d:multistatus>"#;
+        assert!(matches!(
+            page_from_multistatus(xml, "UTC", &[], PageMode::Delta, test_meter()),
+            Err(CalendarError::Api(_))
+        ));
     }
 }
