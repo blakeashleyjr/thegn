@@ -448,10 +448,10 @@ fn run_mount_bounded(
     if let Err(error) = wait_result {
         message.push_str(&format!("; could not reap child: {error}"));
     }
-    if let Err(error) = rollback() {
-        if !rollback_means_not_mounted(&error) {
-            message.push_str(&format!("; rollback unmount also failed: {error}"));
-        }
+    if let Err(error) = rollback()
+        && !rollback_means_not_mounted(&error)
+    {
+        message.push_str(&format!("; rollback unmount also failed: {error}"));
     }
     Err(anyhow::anyhow!(message))
 }
