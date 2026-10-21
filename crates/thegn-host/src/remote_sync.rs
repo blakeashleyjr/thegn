@@ -359,7 +359,7 @@ pub(crate) fn apply_remote_sync_with(
         }
         Err(e) => {
             let warning = format!(
-                "remote worktree sync failed: {e}; after saving any work in it, manual recovery on the remote host: run `rm -rf \"$HOME/thegn-worktrees/{0}\" \"$HOME/thegn-worktrees/{0}.thegn-staging\" \"$HOME/thegn-worktrees/{0}.thegn-incomplete\" \"$HOME/thegn-worktrees/{0}.thegn-synced\" \"$HOME/thegn-worktrees/{0}.bundle\"`, then retry",
+                "remote worktree sync failed: {e}; after saving any work in it, manual recovery on the remote host: run `rm -rf \"$HOME/thegn-worktrees/{0}.thegn-staging\" \"$HOME/thegn-worktrees/{0}\" \"$HOME/thegn-worktrees/{0}.thegn-incomplete\" \"$HOME/thegn-worktrees/{0}.thegn-synced\" \"$HOME/thegn-worktrees/{0}.bundle\"`, then retry",
                 spec.name
             );
             warnings.push(warning.clone());
@@ -1342,6 +1342,7 @@ mod tests {
     #[test]
     fn apply_failure_keeps_mounts_and_pushes_the_recovery_warning() {
         let mut spec = sandbox_spec(thegn_core::sandbox::Backend::Podman, true);
+        spec.name = "sandbox".into();
         let mounts = spec.mounts.clone();
         let plan = plan_spec_before_ensure(&mut spec, "/wt/x", false, &mut Vec::new())
             .expect("remote OCI spec needs a plan");
@@ -1358,6 +1359,12 @@ mod tests {
         );
         assert!(warnings.first().is_some_and(|warning| {
             warning.contains("$HOME/thegn-worktrees/sandbox.thegn-staging")
+        }));
+        assert!(warnings.first().is_some_and(|warning| {
+            warning
+                .find("$HOME/thegn-worktrees/sandbox.thegn-staging")
+                .zip(warning.find("$HOME/thegn-worktrees/sandbox\""))
+                .is_some_and(|(staging, destination)| staging < destination)
         }));
     }
 
