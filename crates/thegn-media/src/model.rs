@@ -21,6 +21,11 @@ pub const MAX_ID_BYTES: usize = 1024;
 pub const MAX_QUEUE_ITEMS: usize = 500;
 /// Maximum source rows retained by the host media panel.
 pub const MAX_SOURCES: usize = 64;
+/// Maximum playlist rows retained at backend ingress; matches the count native
+/// MPRIS requests from `GetPlaylists`.
+pub const MAX_PLAYLISTS: usize = 100;
+/// Maximum player names retained at backend ingress and in the aggregate union.
+pub const MAX_PLAYERS: usize = MAX_SOURCES;
 
 /// Transport state, normalized across backends (maps MPRIS `PlaybackStatus`,
 /// Windows SMTC `PlaybackStatus`, and mpv's `pause`/`idle` onto one axis).
