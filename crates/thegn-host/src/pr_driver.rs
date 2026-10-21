@@ -858,13 +858,13 @@ pub(crate) fn drive_queue(
                         })
                         .map(|pr| pr.head_ref_oid)
                 });
-                if let Some(own) = own {
-                    if let Some(warning) = crate::pr_agent_lease::own_head_record_warning(
+                if let Some(own) = own
+                    && let Some(warning) = crate::pr_agent_lease::own_head_record_warning(
                         item.number,
                         guard.record_own_head(db, &head, &own),
-                    ) {
-                        out.warnings.push(warning);
-                    }
+                    )
+                {
+                    out.warnings.push(warning);
                 }
 
                 match guard.finish(db, None) {
