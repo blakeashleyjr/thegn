@@ -54,11 +54,19 @@ is not the emulator pinned by the batteries package. macOS font-picker and
 alternate-emulator parity remain deferred until they have a macOS host
 rehearsal.
 
-The same evidence rule keeps broader distribution work out of this path: no
-`install.sh --batteries`, distro package-manager mutation, Homebrew cask,
-downloadable unsigned macOS app, Windows Terminal profile, or
-Flatpak/AppImage/nix-bundle is promised. Those require their relevant host,
-signing, or driver rehearsal before they become install instructions.
+The Linux standalone installer supports `./install.sh --batteries`: it reuses
+host Alacritty or builds pinned Alacritty 0.17.0 user-local, verifies the
+FiraCode Nerd Font v3.5.0 archive by SHA-256 before installing its TTF files
+under `~/.local/share/fonts/thegn-nerd-fonts`, and creates a writable
+`~/.config/thegn/alacritty.toml` only when absent. `thegn doctor` reports the
+terminal, font, config, and launcher status. The mode remains partial until a
+clean-host rehearsal is recorded.
+
+The same evidence rule keeps other broader distribution work out of this path.
+Distro package-manager mutation, Homebrew cask, downloadable unsigned macOS
+app, Windows Terminal profile, and Flatpak/AppImage/nix-bundle are not promised.
+Those require their relevant host, signing, or driver rehearsal before they
+become install instructions.
 
 ## Color
 

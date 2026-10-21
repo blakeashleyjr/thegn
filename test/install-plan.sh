@@ -106,6 +106,8 @@ cleanup() {
 trap cleanup EXIT
 
 install_out="$(PATH="$fakebin:$PATH" HOME="$tmp/home" XDG_CONFIG_HOME="$tmp/config" XDG_DATA_HOME="$tmp/data" "$install_repo/install.sh" "$tmp/bin")"
+plain_tg_before="$(<"$tmp/bin/tg")"
+plain_tui_before="$(<"$tmp/bin/tg-tui")"
 # A COPY, not a symlink: the install must survive `cargo clean` / a moved repo.
 [[ -f $tmp/bin/thegn && ! -L $tmp/bin/thegn && -x $tmp/bin/thegn ]] || {
   echo "install did not copy the release binary to bindir/thegn" >&2
@@ -586,6 +588,189 @@ chmod 0755 "$mac_test_bin/thegn"
 PATH="$mac_test_bin:$PATH" HOME="$tmp/home" "$make_app" --bin "$mac_test_bin/thegn" --dest "$tmp/mac-apps" --env THEGN_LOG=info --dry-run >"$tmp/mac-dry.out"
 [[ $(<"$tmp/mac-dry.out") == *"$tmp/mac-apps/thegn.app"* && ! -e $tmp/mac-apps ]] || {
   echo "valid make-app dry-run did not succeed without creating the bundle" >&2
+  exit 1
+}
+
+if [[ $(uname -s) == Linux ]]; then
+  # batteries: dry-run plan
+  batteries_dry_out="$(PATH="$fakebin:$PATH" HOME="$tmp/home" XDG_CONFIG_HOME="$tmp/batteries-dry-config" XDG_DATA_HOME="$tmp/batteries-dry-data" \
+    "$install_repo/install.sh" --dry-run --batteries "$tmp/batteries-dry-bin")"
+  [[ $batteries_dry_out == *"$tmp/batteries-dry-data/fonts/thegn-nerd-fonts"* &&
+    $batteries_dry_out == *"$tmp/batteries-dry-config/thegn/alacritty.toml"* &&
+    $batteries_dry_out == *"(host): $fakebin/alacritty"* &&
+    $batteries_dry_out == *"https://github.com/ryanoasis/nerd-fonts/releases/download/v3.5.0/FiraCode.tar.xz"* &&
+    $batteries_dry_out == *"32226dc81bb30ea421cdc49ba2134b93c2b43096992c829504a3004d2537420d"* ]] || {
+    echo "batteries dry-run omitted the terminal, font pin/destination, or config plan" >&2
+    echo "$batteries_dry_out" >&2
+    exit 1
+  }
+  [[ ! -e $tmp/batteries-dry-data ]] || {
+    echo "batteries dry-run created data files" >&2
+    exit 1
+  }
+
+  # Create a tiny test archive and pin only the throwaway installer copy to its
+  # digest. The production pin remains the Nerd Fonts release digest.
+  mkdir -p "$tmp/fake-fonts"
+  printf 'test font bytes\n' >"$tmp/fake-fonts/FiraCodeNerdFont-Regular.ttf"
+  tar -cJf "$tmp/FiraCode.tar.xz" -C "$tmp/fake-fonts" FiraCodeNerdFont-Regular.ttf
+  if command -v sha256sum >/dev/null 2>&1; then
+    fixture_font_sha="$(sha256sum "$tmp/FiraCode.tar.xz" | cut -d' ' -f1)"
+  else
+    fixture_font_sha="$(shasum -a 256 "$tmp/FiraCode.tar.xz" | cut -d' ' -f1)"
+  fi
+  sed -i.bak "s/^batteries_font_sha256=.*/batteries_font_sha256=\"$fixture_font_sha\"/" "$install_repo/install.sh"
+  rm -f "$install_repo/install.sh.bak"
+
+  # batteries: install with host alacritty
+  THEGN_INSTALL_BATTERIES_FONT_SRC="$tmp/FiraCode.tar.xz" TG_ALACRITTY_LOG="$tmp/batteries-alacritty.log" \
+    PATH="$fakebin:$PATH" HOME="$tmp/home" XDG_CONFIG_HOME="$tmp/config" XDG_DATA_HOME="$tmp/data" \
+    "$install_repo/install.sh" --batteries "$tmp/bin" >"$tmp/batteries-install.out"
+  [[ -f $tmp/data/fonts/thegn-nerd-fonts/FiraCodeNerdFont-Regular.ttf &&
+    $(<"$tmp/data/thegn/batteries/marker") == *"alacritty_source=host"* &&
+    -f $tmp/config/thegn/alacritty.toml ]] || {
+    echo "batteries install did not publish the verified font, host marker, and config" >&2
+    cat "$tmp/batteries-install.out" >&2
+    exit 1
+  }
+  TG_ALACRITTY_LOG="$tmp/batteries-alacritty.log" PATH="$fakebin:$PATH" "$tmp/bin/tg" --standalone
+  [[ $(<"$tmp/batteries-alacritty.log") == *"$tmp/config/thegn/alacritty.toml"* ]] || {
+    echo "batteries standalone wrapper did not pass the user-local config" >&2
+    cat "$tmp/batteries-alacritty.log" >&2
+    exit 1
+  }
+
+  # batteries: digest mismatch refuses and rolls back
+  PATH="$fakebin:$PATH" HOME="$tmp/home" XDG_CONFIG_HOME="$tmp/mismatch-config" XDG_DATA_HOME="$tmp/mismatch-data" \
+    "$install_repo/install.sh" "$tmp/mismatch-bin" >"$tmp/mismatch-plain.out"
+  prior_tg="$(<"$tmp/mismatch-bin/tg")"
+  printf 'different archive bytes\n' >"$tmp/bad-font"
+  tar -cJf "$tmp/bad-FiraCode.tar.xz" -C "$tmp" bad-font
+  bad_status=0
+  THEGN_INSTALL_BATTERIES_FONT_SRC="$tmp/bad-FiraCode.tar.xz" PATH="$fakebin:$PATH" HOME="$tmp/home" \
+    XDG_CONFIG_HOME="$tmp/mismatch-config" XDG_DATA_HOME="$tmp/mismatch-data" "$install_repo/install.sh" --batteries "$tmp/mismatch-bin" \
+    >"$tmp/batteries-bad.out" 2>&1 || bad_status=$?
+  [[ $bad_status == 1 && $(<"$tmp/batteries-bad.out") == *"digest mismatch"* &&
+  $(<"$tmp/mismatch-bin/tg") == "$prior_tg" &&
+  ! -e $tmp/mismatch-data/fonts/thegn-nerd-fonts/FiraCodeNerdFont-Regular.ttf &&
+  ! -e $tmp/mismatch-data/thegn/batteries/marker ]] || {
+    echo "batteries digest mismatch did not refuse and restore the existing install" >&2
+    cat "$tmp/batteries-bad.out" >&2
+    exit 1
+  }
+
+  # batteries: build prerequisites refused
+  mkdir -p "$tmp/no-pkg-bin"
+  cat >"$tmp/no-pkg-bin/pkg-config" <<'EOF'
+#!/usr/bin/env sh
+exit 1
+EOF
+  chmod 0755 "$tmp/no-pkg-bin/pkg-config"
+  prereq_status=0
+  THEGN_INSTALL_ASSUME_NO_HOST_ALACRITTY=1 PATH="$tmp/no-pkg-bin:$PATH" HOME="$tmp/home" \
+    XDG_CONFIG_HOME="$tmp/prereq-config" XDG_DATA_HOME="$tmp/prereq-data" \
+    "$install_repo/install.sh" --batteries "$tmp/prereq-bin" >"$tmp/prereq.out" 2>&1 || prereq_status=$?
+  [[ $prereq_status == 1 && $(<"$tmp/prereq.out") == *"pkg-config modules fontconfig freetype2 xkbcommon"* &&
+  ! -e $tmp/prereq-bin && ! -e $tmp/prereq-data ]] || {
+    echo "batteries prerequisite refusal did not name missing pkg-config modules before installing" >&2
+    cat "$tmp/prereq.out" >&2
+    exit 1
+  }
+
+  # batteries: user-local alacritty build
+  mkdir -p "$tmp/build-bin"
+  cat >"$tmp/build-bin/cmake" <<'EOF'
+#!/usr/bin/env sh
+exit 0
+EOF
+  cat >"$tmp/build-bin/pkg-config" <<'EOF'
+#!/usr/bin/env sh
+exit 0
+EOF
+  cat >"$tmp/build-bin/cargo" <<'EOF'
+#!/usr/bin/env sh
+printf '%s\n' "$*" >>"${TG_CARGO_LOG:?}"
+if [ "$1" = install ]; then
+  shift
+  root=
+  while [ "$#" -gt 0 ]; do
+    if [ "$1" = --root ]; then shift; root=$1; fi
+    shift
+  done
+  mkdir -p "$root/bin"
+  printf '#!/usr/bin/env sh\nexit 0\n' >"$root/bin/alacritty"
+  chmod 0755 "$root/bin/alacritty"
+fi
+EOF
+  chmod 0755 "$tmp/build-bin/cmake" "$tmp/build-bin/pkg-config" "$tmp/build-bin/cargo"
+  TG_CARGO_LOG="$tmp/cargo-install.log" THEGN_INSTALL_ASSUME_NO_HOST_ALACRITTY=1 \
+    THEGN_INSTALL_BATTERIES_FONT_SRC="$tmp/FiraCode.tar.xz" PATH="$tmp/build-bin:$PATH" HOME="$tmp/build-home" \
+    XDG_CONFIG_HOME="$tmp/build-config" XDG_DATA_HOME="$tmp/build-data" \
+    "$install_repo/install.sh" --batteries "$tmp/build-bindir" >"$tmp/build-install.out"
+  [[ $(<"$tmp/cargo-install.log") == *"install --locked --root $tmp/build-data/thegn/batteries alacritty --version 0.17.0"* &&
+  $(<"$tmp/build-data/thegn/batteries/marker") == *"alacritty_source=user-local"* ]] || {
+    echo "batteries did not build and record the pinned user-local Alacritty" >&2
+    cat "$tmp/cargo-install.log" "$tmp/build-install.out" >&2
+    exit 1
+  }
+
+  # batteries: user-local launcher paths containing spaces remain literal
+  space_data="$tmp/data root with spaces"
+  space_config="$tmp/config root with spaces"
+  THEGN_INSTALL_ASSUME_NO_HOST_ALACRITTY=1 TG_CARGO_LOG="$tmp/space-cargo.log" \
+    THEGN_INSTALL_BATTERIES_FONT_SRC="$tmp/FiraCode.tar.xz" PATH="$tmp/build-bin:$PATH" HOME="$tmp/build-home" \
+    XDG_CONFIG_HOME="$space_config" XDG_DATA_HOME="$space_data" \
+    "$install_repo/install.sh" --batteries "$tmp/space-bindir" >"$tmp/space-install.out"
+  cat >"$space_data/thegn/batteries/bin/alacritty" <<'EOF'
+#!/usr/bin/env sh
+printf '%s\n' "$@" >"${TG_ALACRITTY_LOG:?}"
+EOF
+  chmod 0755 "$space_data/thegn/batteries/bin/alacritty"
+  TG_ALACRITTY_LOG="$tmp/space-alacritty.log" "$tmp/space-bindir/tg" --standalone
+  [[ $(<"$tmp/space-alacritty.log") == *"$space_config/thegn/alacritty.toml"* ]] || {
+    echo "batteries standalone wrapper failed with spaces in XDG paths" >&2
+    cat "$tmp/space-install.out" >&2
+    exit 1
+  }
+
+  # batteries: existing alacritty.toml is kept
+  printf 'user-owned alacritty config\n' >"$tmp/config/thegn/alacritty.toml"
+  THEGN_INSTALL_BATTERIES_FONT_SRC="$tmp/FiraCode.tar.xz" PATH="$fakebin:$PATH" HOME="$tmp/home" \
+    XDG_CONFIG_HOME="$tmp/config" XDG_DATA_HOME="$tmp/data" "$install_repo/install.sh" --batteries "$tmp/bin" \
+    >"$tmp/batteries-kept.out"
+  [[ $(<"$tmp/config/thegn/alacritty.toml") == "user-owned alacritty config" ]] || {
+    echo "batteries install replaced an existing user Alacritty config" >&2
+    exit 1
+  }
+
+# batteries: non-Linux refusal path is present
+fi
+mkdir -p "$tmp/nonlinux-bin"
+cat >"$tmp/nonlinux-bin/uname" <<'EOF'
+#!/usr/bin/env sh
+printf 'Darwin\n'
+EOF
+chmod 0755 "$tmp/nonlinux-bin/uname"
+nonlinux_status=0
+PATH="$tmp/nonlinux-bin:$PATH" HOME="$tmp/nonlinux-home" XDG_CONFIG_HOME="$tmp/nonlinux-config" \
+  XDG_DATA_HOME="$tmp/nonlinux-data" "$install_repo/install.sh" --batteries --dry-run "$tmp/nonlinux-bindir" \
+  >"$tmp/nonlinux.out" 2>&1 || nonlinux_status=$?
+[[ $nonlinux_status == 2 && $(<"$tmp/nonlinux.out") == *"Linux-only"* && ! -e $tmp/nonlinux-bindir &&
+! -e $tmp/nonlinux-data ]] || {
+  echo "batteries mode did not refuse non-Linux before changing anything" >&2
+  cat "$tmp/nonlinux.out" >&2
+  exit 1
+}
+
+# batteries: plain install unchanged
+PATH="$fakebin:$PATH" HOME="$tmp/home" XDG_CONFIG_HOME="$tmp/config" XDG_DATA_HOME="$tmp/data" \
+  "$install_repo/install.sh" "$tmp/bin" >"$tmp/plain-after-batteries.out"
+[[ $(<"$tmp/bin/tg-tui") == *"export THEGN_ALACRITTY_CONFIG=$install_repo/config/alacritty.toml"* ]] || {
+  echo "plain install wrapper no longer points at the checkout Alacritty profile" >&2
+  exit 1
+}
+[[ $(<"$tmp/bin/tg") == "$plain_tg_before" && $(<"$tmp/bin/tg-tui") == "$plain_tui_before" ]] || {
+  echo "plain install wrappers changed after enabling the batteries mode" >&2
   exit 1
 }
 
