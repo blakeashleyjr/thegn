@@ -1527,7 +1527,7 @@ command = "git diff"
 # env_bundles   = ["clientA-secrets"]           # bundles bound at the zone scope
 # network_allow = ["*.clienta.com", "github.com"]  # DNS-name rules only (not an egress boundary)
 # network_block = ["telemetry.example.com"]     # DNS-name rules only; `*` makes launches offline
-# sandbox_floor = "hardened"                     # members may only be >= this hardening
+# sandbox_floor = "standard"                     # members may only be >= this hardening
 # placement_floor = "dedicated"                  # placement-mode FLOOR for members: a
 #                                                #   member's requested mode may only be
 #                                                #   equal-or-stricter (auto < packed <
@@ -2652,18 +2652,19 @@ enabled = true
 # Selectable per level: here (global), per workspace/repo via a `.thegn.toml`
 # overlay, or the THEGN_SANDBOX_PROFILE env var.
 #   open     — no hardening; pre-preset behavior (escape hatch / back-compat).
-#   hardened — read-only root + no-new-privileges + a process (pids) cap, with
+#   standard — read-only root + no-new-privileges + a process (pids) cap, with
 #              networking and Linux capabilities left intact so interactive dev
 #              (fetch/clone/build, debuggers, ping) keeps working. The default.
+#              `hardened` is accepted as an older name.
 #   sealed   — full lockdown: network=none, read-only root, drop ALL caps,
 #              no-new-privileges, tighter pids cap. For untrusted workloads.
-# Under a read-only-root profile (hardened/sealed, the default), everything
+# Under a read-only-root profile (standard/sealed, the default), everything
 # OUTSIDE the worktree is read-only — including your $HOME — so a sandboxed
 # agent can't `cd` out and modify/delete host files. Writable: the worktree, its
 # git dir, build caches, /tmp, and a narrow set of $HOME carve-outs for shell
 # state (~/tmp, ~/.local/state, ~/.local/share, plus the legacy history files
 # ~/.zsh_history and ~/.bash_history). ~/.keychain is carved for interactive
-# (hardened) panes but NOT the sealed agent — it stores scripts your host login
+# (standard) panes but NOT the sealed agent — it stores scripts your host login
 # shells later *source*, so a writable ~/.keychain from a sealed sandbox would
 # be a persistence vector. Coding-agent config dirs (CLAUDE_CONFIG_DIR /
 # CODEX_HOME, or the ~/.claude / ~/.codex default) are also carved writable — for
@@ -2673,7 +2674,7 @@ enabled = true
 # too, for HOME-swapping profile wrappers (claude-profile / claude-multiplex).
 # `profile = "open"` restores a fully-writable $HOME (zsh history/zoxide/
 # keychain) as the escape hatch; add more writable paths under `mounts` below.
-profile = "hardened"
+profile = "standard"
 
 # ── Backend selection ────────────────────────────────────────────────────────
 # Which containment backend to use. "auto" walks backend_chain until one works.
@@ -2770,7 +2771,7 @@ network_audit = false
 #   all / host          — entire host filesystem (read-write, least isolated).
 #   none                — no filesystem access beyond the container root.
 #   custom              — only the explicit mounts list below.
-# Note: regardless of file_access, the default `hardened` profile makes
+# Note: regardless of file_access, the default `standard` profile makes
 # everything outside the worktree/caches READ-ONLY (see `profile` above). To get
 # a fully writable host filesystem use `file_access = "all"`; for the strictest
 # scoping use `"custom"`/`"none"`. Both file_access and profile are overridable
@@ -3241,7 +3242,7 @@ provider = "none"
 #                  traffic is tunneled (not a containment boundary). The only
 #                  honest option for the bwrap/systemd backends.
 #   in_container — run the VPN client inside the worktree container itself
-#                  (needs NET_ADMIN + /dev/net/tun; weakens `hardened`).
+#                  (needs NET_ADMIN + /dev/net/tun; weakens `standard`).
 #   netns        — join a host-prepared named netns (host-toolchain; best-effort).
 mode = "sidecar"
 # Override the provider's default sidecar image. Empty = provider default.
@@ -3268,7 +3269,7 @@ ephemeral = true
 #
 # Tip: `sealed-tunnel` (alias `tunnel-only`) currently refuses to launch while
 # a VPN is configured; thegn cannot yet enforce an exclusive tunnel route. Use
-# `hardened` with `[sandbox.vpn]` for a non-exclusive tunnel, or `sealed` for no
+# `standard` with `[sandbox.vpn]` for a non-exclusive tunnel, or `sealed` for no
 # network. With no VPN, `sealed-tunnel` behaves like `sealed`.
 #
 # Secrets: auth keys / configs accept a secrets-ref so they never sit in plain
