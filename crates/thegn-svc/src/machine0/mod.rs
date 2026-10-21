@@ -40,7 +40,7 @@ use crate::provider::{
     CheckpointInfo, ExecKind, FileEntry, ProviderCheckpoints, ProviderFiles, RemoteProvider,
     SandboxHandle,
 };
-use crate::vps::ssh_shim::SshShim;
+use crate::vps::ssh_shim::{CappedExec, SshShim};
 use mcp::Mcp0Client;
 use thegn_core::remote::SshTarget;
 
@@ -76,6 +76,55 @@ pub const DEFAULT_IMAGE: &str = "nixos-25-11-loaded";
 /// The default machine0 region when unset (machine0 requires a region and has no
 /// server-side default).
 pub const DEFAULT_REGION: &str = "us-east";
+
+const PROVISION_UNIT: &str = "thegn-provision";
+/// Same 1 MiB limit as `bridge::MAX_CAPTURE_BYTES`.
+const REBUILD_OUTPUT_CAP: usize = 1024 * 1024;
+/// Same 120-second budget as the SSH readiness `AUTH_BUDGET`.
+const REBUILD_STOP_BUDGET: std::time::Duration = std::time::Duration::from_secs(120);
+const REBUILD_STILL_ACTIVE_EXIT: i32 = 75;
+const REBUILD_TOOL_MISSING_EXIT: i32 = 127;
+
+fn rebuild_script(remote_ref: &str) -> String {
+    format!(
+        "unit={PROVISION_UNIT}\n\
+if systemctl is-active --quiet \"$unit.service\"; then echo \"thegn: a previous provisioning run ($unit.service) is still active\" >&2; exit {REBUILD_STILL_ACTIVE_EXIT}; fi\n\
+sr=$(command -v systemd-run) || {{ echo \"thegn: systemd-run not found\" >&2; exit {REBUILD_TOOL_MISSING_EXIT}; }}\n\
+rb=$(command -v nixos-rebuild) || {{ echo \"thegn: nixos-rebuild not found\" >&2; exit {REBUILD_TOOL_MISSING_EXIT}; }}\n\
+exec \"$sr\" --unit=\"$unit\" --wait --collect --pipe --quiet --setenv=PATH=\"$PATH\" -- \"$rb\" switch --flake {} </dev/null",
+        thegn_core::util::sh_quote(remote_ref)
+    )
+}
+
+fn stop_script() -> String {
+    format!(
+        "systemctl stop {PROVISION_UNIT}.service; if systemctl is-active --quiet {PROVISION_UNIT}.service; then exit 1; fi; exit 0"
+    )
+}
+
+fn rebuild_outcome(remote_ref: &str, exec: &CappedExec) -> Result<()> {
+    if exec.code == 0 {
+        return Ok(());
+    }
+    let truncated = if exec.dropped > 0 {
+        format!(" (earlier output truncated: {} bytes)", exec.dropped)
+    } else {
+        String::new()
+    };
+    match exec.code {
+        REBUILD_STILL_ACTIVE_EXIT => Err(anyhow!(
+            "machine0: a previous provisioning run ({PROVISION_UNIT}.service) is still active on the VM; not starting another (it was not interrupted){truncated}"
+        )),
+        REBUILD_TOOL_MISSING_EXIT => Err(anyhow!(
+            "machine0: provisioning needs systemd-run and nixos-rebuild on the VM:\n{}{truncated}",
+            exec.output
+        )),
+        code => Err(anyhow!(
+            "machine0: nixos-rebuild --flake {remote_ref} failed (exit {code}):\n{}{truncated}",
+            exec.output
+        )),
+    }
+}
 
 /// Everything needed to drive one named machine0 VM (resolved host-side from
 /// `[env.<name>.provider]` + thegn's managed keypair).
@@ -650,29 +699,45 @@ impl Machine0Provider {
                 self.write(name, &remote_path, bytes).await?;
             }
         }
-        let script = format!(
-            "nixos-rebuild switch --flake {}",
-            thegn_core::util::sh_quote(&plan.remote_ref)
-        );
+        let script = rebuild_script(&plan.remote_ref);
         let argv = vec!["/bin/sh".to_string(), "-lc".to_string(), script];
         let shim = self.shim(name).await?;
         const BUDGET: std::time::Duration = std::time::Duration::from_secs(1800);
-        let (code, out) = tokio::time::timeout(BUDGET, shim.run_exec(&argv, None, &[]))
-            .await
-            .map_err(|_| {
-                anyhow!(
-                    "machine0: nixos-rebuild timed out after {}s",
-                    BUDGET.as_secs()
+        match tokio::time::timeout(
+            BUDGET,
+            shim.run_exec_capped(&argv, None, &[], REBUILD_OUTPUT_CAP),
+        )
+        .await
+        {
+            Ok(Ok(exec)) => rebuild_outcome(&plan.remote_ref, &exec),
+            Ok(Err(error)) => Err(error).context("machine0: nixos-rebuild over ssh"),
+            Err(_) => {
+                let stop_argv = vec!["/bin/sh".into(), "-lc".into(), stop_script()];
+                match tokio::time::timeout(
+                    REBUILD_STOP_BUDGET,
+                    shim.run_exec(&stop_argv, None, &[]),
                 )
-            })?
-            .context("machine0: nixos-rebuild over ssh")?;
-        if code != 0 {
-            return Err(anyhow!(
-                "machine0: nixos-rebuild --flake {} failed (exit {code}):\n{out}",
-                plan.remote_ref
-            ));
+                .await
+                {
+                    Ok(Ok((0, _))) => Err(anyhow!(
+                        "machine0: nixos-rebuild timed out after {}s; the remote provisioning unit was stopped",
+                        BUDGET.as_secs()
+                    )),
+                    Ok(Ok((code, output))) => Err(anyhow!(
+                        "machine0: nixos-rebuild timed out after {}s; remote state unknown: the provisioning unit could not be confirmed stopped (stop exited {code}: {output})",
+                        BUDGET.as_secs()
+                    )),
+                    Ok(Err(error)) => Err(anyhow!(
+                        "machine0: nixos-rebuild timed out after {}s; remote state unknown: the provisioning unit could not be confirmed stopped (stop command failed: {error:#})",
+                        BUDGET.as_secs()
+                    )),
+                    Err(_) => Err(anyhow!(
+                        "machine0: nixos-rebuild timed out after {}s; remote state unknown: the provisioning unit could not be confirmed stopped (stop timed out)",
+                        BUDGET.as_secs()
+                    )),
+                }
+            }
         }
-        Ok(())
     }
 
     /// One-shot exec `(exit_code, combined output)` over ssh — the pipeline's
@@ -1990,5 +2055,84 @@ mod tests {
         ));
         assert!(is_not_found("machine not found"));
         assert!(!is_not_found("machine0 mcp vm_list: HTTP 500"));
+    }
+
+    #[test]
+    fn rebuild_script_runs_nixos_rebuild_in_the_named_transient_unit() {
+        let script = rebuild_script("/root/thegn-provision/abc#host");
+        for expected in [
+            "unit=thegn-provision",
+            "--unit=\"$unit\"",
+            "--wait",
+            "--collect",
+            "--pipe",
+            "</dev/null",
+            "switch --flake '/root/thegn-provision/abc#host'",
+            "exit 75",
+        ] {
+            assert!(
+                script.contains(expected),
+                "missing {expected:?} in {script}"
+            );
+        }
+    }
+
+    #[test]
+    fn rebuild_script_quotes_a_hostile_flake_ref() {
+        let remote_ref = "x'; touch /tmp/pwned; '";
+        let quoted = thegn_core::util::sh_quote(remote_ref);
+        let script = rebuild_script(remote_ref);
+        assert!(script.contains(&quoted));
+        assert_eq!(script.matches("; touch /tmp/pwned;").count(), 1);
+        assert!(script.contains(&format!("--flake {quoted} </dev/null")));
+    }
+
+    #[test]
+    fn stop_script_stops_and_verifies_the_provisioning_unit() {
+        let script = stop_script();
+        assert!(script.contains("systemctl stop thegn-provision.service"));
+        assert!(script.contains("systemctl is-active --quiet thegn-provision.service"));
+    }
+
+    #[test]
+    fn rebuild_outcome_maps_still_active_missing_tool_and_truncation() {
+        assert!(
+            rebuild_outcome(
+                "flake#host",
+                &CappedExec {
+                    code: 0,
+                    output: String::new(),
+                    dropped: 0,
+                }
+            )
+            .is_ok()
+        );
+
+        let cases = [
+            (75, "", 0, "still active", ""),
+            (
+                127,
+                "systemd-run not found",
+                0,
+                "systemd-run",
+                "systemd-run not found",
+            ),
+            (1, "boom", 0, "exit 1", "boom"),
+            (1, "boom", 5, "truncated: 5 bytes", "boom"),
+        ];
+        for (code, output, dropped, expected_message, expected_output) in cases {
+            let error = rebuild_outcome(
+                "flake#host",
+                &CappedExec {
+                    code,
+                    output: output.to_string(),
+                    dropped,
+                },
+            )
+            .expect_err("nonzero rebuild result must fail");
+            let message = error.to_string();
+            assert!(message.contains(expected_message), "{message}");
+            assert!(message.contains(expected_output), "{message}");
+        }
     }
 }

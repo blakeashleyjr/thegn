@@ -17,12 +17,13 @@
 //!   per-instance known_hosts file ([`super::registry::known_hosts_path`]),
 //!   deleted with the instance.
 
+use std::io;
 use std::path::PathBuf;
 use std::process::Stdio;
 
 use anyhow::{Context, Result, anyhow};
 use sha2::{Digest, Sha256};
-use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 
 use super::registry;
 
@@ -33,6 +34,44 @@ pub struct SshShim {
     pub ip: String,
     pub user: String,
     pub key_path: PathBuf,
+}
+
+/// A remote command result whose output retains only the tail of each stream.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CappedExec {
+    pub code: i32,
+    pub output: String,
+    pub dropped: u64,
+}
+
+async fn read_tail_capped<R: AsyncRead + Unpin>(
+    mut reader: R,
+    cap: usize,
+) -> io::Result<(Vec<u8>, u64)> {
+    const CHUNK_BYTES: usize = 8192;
+    let mut chunk = [0_u8; CHUNK_BYTES];
+    let mut tail = Vec::with_capacity(cap);
+    let mut dropped = 0_u64;
+    loop {
+        let read = reader.read(&mut chunk).await?;
+        if read == 0 {
+            break;
+        }
+        if cap == 0 {
+            dropped = dropped.saturating_add(read as u64);
+        } else if read >= cap {
+            dropped = dropped.saturating_add(tail.len() as u64);
+            dropped = dropped.saturating_add((read - cap) as u64);
+            tail.clear();
+            tail.extend_from_slice(&chunk[read - cap..read]);
+        } else {
+            let excess = tail.len().saturating_add(read).saturating_sub(cap);
+            tail.drain(..excess);
+            dropped = dropped.saturating_add(excess as u64);
+            tail.extend_from_slice(&chunk[..read]);
+        }
+    }
+    Ok((tail, dropped))
 }
 
 /// Normalize a provider-exec argv into one shell script. The provisioning
@@ -210,6 +249,59 @@ impl SshShim {
         let script = stdin_script(&script_from_argv(argv), cwd, env)?;
         let (code, out) = self.run_raw(&script).await?;
         Ok((code, String::from_utf8_lossy(&out).into_owned()))
+    }
+
+    /// One-shot exec retaining only the last `cap` bytes of stdout and stderr.
+    /// Each stream is capped independently; output is returned as stdout tail
+    /// followed by stderr tail, with the combined number of discarded bytes.
+    pub async fn run_exec_capped(
+        &self,
+        argv: &[String],
+        cwd: Option<&str>,
+        env: &[(String, String)],
+        cap: usize,
+    ) -> Result<CappedExec> {
+        let script = stdin_script(&script_from_argv(argv), cwd, env)?;
+        self.prepare_known_hosts()?;
+        let mut ssh_argv = self.base_argv();
+        ssh_argv.push("--".into());
+        ssh_argv.push("/bin/sh".into());
+        ssh_argv.push("-s".into());
+        let mut child = tokio::process::Command::new(&ssh_argv[0])
+            .args(&ssh_argv[1..])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()
+            .context("spawn ssh")?;
+        let mut stdin = child.stdin.take().ok_or_else(|| anyhow!("ssh stdin"))?;
+        let stdout = child.stdout.take().ok_or_else(|| anyhow!("ssh stdout"))?;
+        let stderr = child.stderr.take().ok_or_else(|| anyhow!("ssh stderr"))?;
+        let payload = script.into_bytes();
+        let feeder = tokio::spawn(async move {
+            let _ = stdin.write_all(&payload).await; // best-effort: ssh may have exited early
+            let _ = stdin.shutdown().await; // best-effort: same
+        });
+        let (stdout_result, stderr_result, status_result) = tokio::join!(
+            read_tail_capped(stdout, cap),
+            read_tail_capped(stderr, cap),
+            child.wait(),
+        );
+        match feeder.await {
+            Ok(()) => {}
+            Err(error) => tracing::debug!(%error, "ssh stdin feeder task failed"),
+        }
+        let (stdout, stdout_dropped) = stdout_result.context("read ssh stdout")?;
+        let (stderr, stderr_dropped) = stderr_result.context("read ssh stderr")?;
+        let status = status_result.context("ssh wait")?;
+        let mut output = stdout;
+        output.extend_from_slice(&stderr);
+        Ok(CappedExec {
+            code: status.code().unwrap_or(-1),
+            output: String::from_utf8_lossy(&output).into_owned(),
+            dropped: stdout_dropped.saturating_add(stderr_dropped),
+        })
     }
 
     /// Read a remote file's bytes; `Err` when missing (the provision-marker
@@ -416,6 +508,21 @@ pub fn parse_find_listing(out: &str) -> Vec<crate::provider::FileEntry> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn read_tail_capped_keeps_the_last_bytes_and_counts_the_rest() {
+        let (tail, dropped) = read_tail_capped(&b"0123456789"[..], 4).await.unwrap();
+        assert_eq!(tail, b"6789");
+        assert_eq!(dropped, 6);
+
+        let (tail, dropped) = read_tail_capped(&b"0123456789"[..], 20).await.unwrap();
+        assert_eq!(tail, b"0123456789");
+        assert_eq!(dropped, 0);
+
+        let (tail, dropped) = read_tail_capped(&b"0123456789"[..], 0).await.unwrap();
+        assert!(tail.is_empty());
+        assert_eq!(dropped, 10);
+    }
 
     #[test]
     fn prepare_known_hosts_refuses_an_invalid_name() {
