@@ -164,9 +164,10 @@ Compute the owner once, record the literal name and owner printed above, and
 pass those same literal values to the background monitor and every later lease
 command. Never re-evaluate `$$` or `$(hostname)` during this run. Exit 2 with
 “held by …” means another Lead is driving this issue: stop and tell the user;
-do not start a second chain. The lease is currently honoured by Leads that
-follow this skill. Thegn does not yet check the lease inside `dispatch claim`,
-`set-status`, or `session open --stage`.
+do not start a second chain. Thegn checks the lease on claim, stage open and
+set-status. A row claimed with `--lease/--owner` is bound to that lease; further
+claims for that issue and status changes on its rows require the same live
+lease, or the audited `--admin --why` path.
 
 Have the background monitor renew the lease every 100 seconds (one third of
 the 300-second TTL):
@@ -230,7 +231,8 @@ because each carries its own session.
 
 ```bash
 thegn session open --stage <stage.name> --issue <issue-id> \
-  --worktree <path> --adopt --json
+  --worktree <path> --adopt --json \
+  --lease "<recorded lease name>" --owner "<recorded lease owner>"
 ```
 
 This is the whole dispatch: it renders the stage's prompt template (an explicit
@@ -246,7 +248,8 @@ config). `--adopt` asks a running compositor to graft the session into a pane;
 ```bash
 thegn session open --stage code --issue linear:ABC-123 \
   --worktree <path> --adopt --json \
-    --chunk .thegn/pipeline/ABC-123/code/chunk-2.md
+    --chunk .thegn/pipeline/ABC-123/code/chunk-2.md \
+    --lease "<recorded lease name>" --owner "<recorded lease owner>"
 ```
 
 The chunk file's `files:` frontmatter is the scope gate: before the row is
@@ -300,7 +303,8 @@ until `thegn dispatch list --active --json` is empty:
   thegn dispatch lease renew --name "$lease_name" --owner "$lease_owner" --ttl 300
   row = .row; report = .report                          # read the report ONLY
   thegn dispatch verify row   -> not ok: re-wait / on_blocked per chart
-                              -> ok:     thegn dispatch set-status row done
+                              -> ok:     thegn dispatch gate row
+                              then:   thegn dispatch set-status row done --lease "$lease_name" --owner "$lease_owner"
   tracker-comment per chart (the report's verdict/commits lines are the body)
   dispatch the next stage per `next` (§3), then loop
 return ONE paragraph: rows advanced, verdicts, unverified items, parked rows
@@ -317,7 +321,10 @@ timeout or blocked result follows the stage's `on_blocked`.
 
 ## 5. Verdict — exit 0 is not done
 
+Run the trusted gate on the committed HEAD first: `thegn dispatch gate <row-id>`.
+
 ```bash
+thegn dispatch gate <row-id>
 thegn dispatch verify <row-id>
 ```
 
@@ -335,12 +342,13 @@ stored on the row and shown by `dispatch list` and `dispatch status`; `--force`
 is a deliberate override:
 
 ```bash
-thegn dispatch set-status <row-id> done     # or: failed / waiting_human / abandoned
+thegn dispatch set-status <row-id> done --lease "<recorded lease name>" --owner "<recorded lease owner>"
 ```
 
 Marking `done` is gated on the artifact the same way; a forced completion is
 printed with its reason and carries `"forced": true` and `"force_reason"` in
 JSON — never invisible.
+For other outcomes, use `failed`, `waiting_human`, or `abandoned` with the same lease flags.
 Anything short of your genuine "this stage succeeded" is `waiting_human` or
 `failed`, by your judgment.
 
@@ -508,7 +516,7 @@ you dispatched them.
   active rows per stage. A bare `dispatch put` without `--chunk` is not checked.
 - **Hold the issue-scoped Lead lease.** Acquire before dispatch decisions,
   renew every third of its TTL, stop if replaced or expired, and release on
-  orderly completion or hand-off. The lease is not yet checked by mutations.
+  orderly completion or hand-off. thegn checks it on claim, stage open and set-status; `--admin --why` is the audited manual override.
 - **Keep the fan-out small.** Every worker shares the one `[sandbox.limits]`
   ceiling interactive panes live under — a pipeline cannot escape it, so a huge
   fan-out just starves itself.

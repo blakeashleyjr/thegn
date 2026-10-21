@@ -578,6 +578,18 @@ pub const CATALOG: &[Slot] = &[
         "allow_scope_overlap",
         SourceKind::Structural,
     ),
+    // Lead lease proof values required by pipeline mutations.
+    slot("dispatch claim", "lease", SourceKind::Structural),
+    slot("dispatch claim", "owner", SourceKind::Structural),
+    slot(
+        "dispatch claim",
+        "why",
+        SourceKind::Reserved(Reserved::Freeform),
+    ),
+    slot("dispatch set-status", "lease", SourceKind::Structural),
+    slot("dispatch set-status", "owner", SourceKind::Structural),
+    slot("session open", "lease", SourceKind::Structural),
+    slot("session open", "owner", SourceKind::Structural),
     // The lease verbs take an action word, an owner token, a TTL and a lease
     // name: all operator-chosen strings with no enumerable source.
     slot("dispatch lease", "action", SourceKind::Structural),

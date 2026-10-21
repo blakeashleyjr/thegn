@@ -14,6 +14,108 @@ pub const MAX_LEASE_TTL_SECS: i64 = 86_400;
 pub const FORCE_REASON_MAX_CHARS: usize = 512;
 pub const OVERRIDE_FORCE_DONE: &str = "force_done";
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LeadProof<'a> {
+    Unbound,
+    Lease { name: &'a str, owner: &'a str },
+    Admin { why: &'a str },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LeadLeaseConflict {
+    NotHeld {
+        lease: String,
+        holder: Option<String>,
+    },
+    Required {
+        lease: String,
+    },
+    Mismatch {
+        bound: String,
+        presented: String,
+    },
+}
+
+impl std::fmt::Display for LeadLeaseConflict {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NotHeld { lease, holder } => write!(
+                f,
+                "Lead lease {lease:?} is not held by the presented owner{}; acquire it with `thegn dispatch lease acquire --name <lease> --owner <you>` and pass `--lease/--owner`, or use `--admin --why '<reason>'`",
+                holder
+                    .as_ref()
+                    .map_or_else(String::new, |owner| format!(" (current holder: {owner})"))
+            ),
+            Self::Required { lease } => write!(
+                f,
+                "Lead lease {lease:?} is required; acquire it with `thegn dispatch lease acquire --name <lease> --owner <you>` and pass `--lease/--owner`, or use `--admin --why '<reason>'`"
+            ),
+            Self::Mismatch { bound, presented } => write!(
+                f,
+                "dispatch row is bound to Lead lease {bound:?}, not {presented:?}; acquire it with `thegn dispatch lease acquire --name <lease> --owner <you>` and pass `--lease/--owner`, or use `--admin --why '<reason>'`"
+            ),
+        }
+    }
+}
+impl std::error::Error for LeadLeaseConflict {}
+
+fn lead_check(
+    conn: &rusqlite::Connection,
+    bound: &[String],
+    proof: LeadProof<'_>,
+    now: i64,
+) -> Result<Option<String>> {
+    match proof {
+        LeadProof::Lease { name, owner } => {
+            validate_lease_text("name", name)?;
+            validate_lease_text("owner", owner)?;
+            if let Some(other) = bound.iter().find(|lease| lease.as_str() != name) {
+                return Err(anyhow::Error::new(LeadLeaseConflict::Mismatch {
+                    bound: other.clone(),
+                    presented: name.to_string(),
+                }));
+            }
+            let row: Option<(String, i64)> = conn
+                .query_row(
+                    "SELECT owner, expires_at_ms FROM pipeline_leases WHERE name=?1",
+                    [name],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .optional()?;
+            if !matches!(row.as_ref(), Some((held, expires)) if held.as_str() == owner && *expires > now)
+            {
+                let holder = row
+                    .filter(|(_, expires)| *expires > now)
+                    .map(|(held, _)| held);
+                return Err(anyhow::Error::new(LeadLeaseConflict::NotHeld {
+                    lease: name.to_string(),
+                    holder,
+                }));
+            }
+            Ok(None)
+        }
+        LeadProof::Unbound => match bound.first() {
+            Some(lease) => Err(anyhow::Error::new(LeadLeaseConflict::Required {
+                lease: lease.clone(),
+            })),
+            None => Ok(None),
+        },
+        LeadProof::Admin { why } => {
+            if why.trim().is_empty() {
+                anyhow::bail!("--admin requires a non-empty --why");
+            }
+            if bound.is_empty() {
+                Ok(None)
+            } else {
+                Ok(Some(format!(
+                    "lead lease {} bypassed by admin: {why}",
+                    bound.join(", ")
+                )))
+            }
+        }
+    }
+}
+
 /// Durable evidence that a dispatch gate was overridden.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct DispatchOverride {
@@ -339,6 +441,17 @@ impl Db {
         to: AgentDispatchStatus,
         note: Option<&str>,
     ) -> Result<()> {
+        self.set_dispatch_status_led(id, expected, to, note, LeadProof::Unbound)
+    }
+
+    pub fn set_dispatch_status_led(
+        &self,
+        id: i64,
+        expected: AgentDispatchStatus,
+        to: AgentDispatchStatus,
+        note: Option<&str>,
+        proof: LeadProof<'_>,
+    ) -> Result<()> {
         if self.get_dispatch(id)?.is_none() {
             return Err(anyhow::Error::new(MissingDispatch { id }));
         }
@@ -349,16 +462,58 @@ impl Db {
                 to,
             }));
         }
-        if !self.cas_dispatch_status(id, None, expected, to, note)? {
-            let actual = self
-                .get_dispatch(id)?
-                .ok_or_else(|| anyhow::Error::new(MissingDispatch { id }))?
-                .status;
-            return Err(anyhow::Error::new(DispatchTransitionConflict::Stale {
-                id,
-                expected,
-                actual,
-            }));
+        let note = note
+            .map(crate::pipeline_report::note_text)
+            .transpose()
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        let conn = self.conn();
+        conn.execute_batch("BEGIN IMMEDIATE")?;
+        let result = (|| -> Result<()> {
+            let bound: Option<String> = conn
+                .query_row(
+                    "SELECT lead_lease FROM agent_dispatches WHERE id=?1",
+                    [id],
+                    |row| row.get(0),
+                )
+                .optional()?
+                .flatten();
+            let bound = bound.into_iter().collect::<Vec<_>>();
+            let audit = lead_check(&conn, &bound, proof, util::now_ms())?;
+            let changed = if expected == AgentDispatchStatus::Unknown {
+                conn.execute("UPDATE agent_dispatches SET status=?1 WHERE id=?2 AND trim(status) NOT IN (?3,?4,?5,?6,?7,?8,?9,?10,?11)", rusqlite::params![to.as_str(), id, AgentDispatchStatus::Queued.as_str(), AgentDispatchStatus::Spawning.as_str(), AgentDispatchStatus::Running.as_str(), AgentDispatchStatus::WaitingHuman.as_str(), AgentDispatchStatus::PrOpen.as_str(), AgentDispatchStatus::Merged.as_str(), AgentDispatchStatus::Abandoned.as_str(), AgentDispatchStatus::Done.as_str(), AgentDispatchStatus::Failed.as_str()])?
+            } else {
+                conn.execute(
+                    "UPDATE agent_dispatches SET status=?1 WHERE id=?2 AND status=?3",
+                    rusqlite::params![to.as_str(), id, expected.as_str()],
+                )?
+            };
+            if changed == 0 {
+                let actual = self
+                    .get_dispatch(id)?
+                    .ok_or_else(|| anyhow::Error::new(MissingDispatch { id }))?
+                    .status;
+                return Err(anyhow::Error::new(DispatchTransitionConflict::Stale {
+                    id,
+                    expected,
+                    actual,
+                }));
+            }
+            if let Some(note) = note {
+                conn.execute("INSERT INTO agent_dispatch_notes (dispatch_id, created_at_ms, text) VALUES (?1, ?2, ?3)", rusqlite::params![id, util::now_ms(), note])?;
+            }
+            if let Some(audit) = audit {
+                let audit = crate::pipeline_report::note_text(&audit)
+                    .map_err(|e| anyhow::anyhow!("{e}"))?;
+                conn.execute("INSERT INTO agent_dispatch_notes (dispatch_id, created_at_ms, text) VALUES (?1, ?2, ?3)", rusqlite::params![id, util::now_ms(), audit])?;
+            }
+            Ok(())
+        })();
+        match result {
+            Ok(()) => conn.execute_batch("COMMIT")?,
+            Err(error) => {
+                conn.execute_batch("ROLLBACK")?;
+                return Err(error);
+            }
         }
         Ok(())
     }
@@ -370,6 +525,17 @@ impl Db {
         expected: AgentDispatchStatus,
         to: AgentDispatchStatus,
         reason: &str,
+    ) -> Result<()> {
+        self.set_dispatch_status_forced_led(id, expected, to, reason, LeadProof::Unbound)
+    }
+
+    pub fn set_dispatch_status_forced_led(
+        &self,
+        id: i64,
+        expected: AgentDispatchStatus,
+        to: AgentDispatchStatus,
+        reason: &str,
+        proof: LeadProof<'_>,
     ) -> Result<()> {
         if self.get_dispatch(id)?.is_none() {
             return Err(anyhow::Error::new(MissingDispatch { id }));
@@ -390,39 +556,78 @@ impl Db {
             anyhow::bail!("force reason exceeds {FORCE_REASON_MAX_CHARS} characters");
         }
         let conn = self.conn();
-        let tx = conn.unchecked_transaction()?;
-        let changed = tx.execute(
-            "UPDATE agent_dispatches SET status=?1, override_kind=?2, override_reason=?3, override_at_ms=?4 WHERE id=?5 AND status=?6",
-            rusqlite::params![
-                to.as_str(),
-                OVERRIDE_FORCE_DONE,
-                reason,
+        conn.execute_batch("BEGIN IMMEDIATE")?;
+        let result = (|| -> Result<()> {
+            let bound: Option<String> = conn
+                .query_row(
+                    "SELECT lead_lease FROM agent_dispatches WHERE id=?1",
+                    [id],
+                    |row| row.get(0),
+                )
+                .optional()?
+                .flatten();
+            let audit = lead_check(
+                &conn,
+                &bound.into_iter().collect::<Vec<_>>(),
+                proof,
                 util::now_ms(),
-                id,
-                expected.as_str()
-            ],
-        )?;
-        if changed == 0 {
-            tx.rollback()?;
-            let actual = self
-                .get_dispatch(id)?
-                .ok_or_else(|| anyhow::Error::new(MissingDispatch { id }))?
-                .status;
-            return Err(anyhow::Error::new(DispatchTransitionConflict::Stale {
-                id,
-                expected,
-                actual,
-            }));
+            )?;
+            let changed = conn.execute(
+                "UPDATE agent_dispatches SET status=?1, override_kind=?2, override_reason=?3, override_at_ms=?4 WHERE id=?5 AND status=?6",
+                rusqlite::params![to.as_str(), OVERRIDE_FORCE_DONE, reason, util::now_ms(), id, expected.as_str()],
+            )?;
+            if changed == 0 {
+                let actual = self
+                    .get_dispatch(id)?
+                    .ok_or_else(|| anyhow::Error::new(MissingDispatch { id }))?
+                    .status;
+                return Err(anyhow::Error::new(DispatchTransitionConflict::Stale {
+                    id,
+                    expected,
+                    actual,
+                }));
+            }
+            conn.execute(
+                "INSERT INTO agent_dispatch_notes (dispatch_id, created_at_ms, text) VALUES (?1, ?2, ?3)",
+                rusqlite::params![id, util::now_ms(), format!("set-status done (forced): {reason}")],
+            )?;
+            if let Some(audit) = audit {
+                let audit = crate::pipeline_report::note_text(&audit)
+                    .map_err(|e| anyhow::anyhow!("{e}"))?;
+                conn.execute("INSERT INTO agent_dispatch_notes (dispatch_id, created_at_ms, text) VALUES (?1, ?2, ?3)", rusqlite::params![id, util::now_ms(), audit])?;
+            }
+            Ok(())
+        })();
+        match result {
+            Ok(()) => conn.execute_batch("COMMIT")?,
+            Err(error) => {
+                conn.execute_batch("ROLLBACK")?;
+                return Err(error);
+            }
         }
-        tx.execute(
-            "INSERT INTO agent_dispatch_notes (dispatch_id, created_at_ms, text) VALUES (?1, ?2, ?3)",
-            rusqlite::params![
-                id,
-                util::now_ms(),
-                format!("set-status done (forced): {reason}")
-            ],
+        Ok(())
+    }
+
+    /// Check a caller's Lead proof before host-side evidence work. Mutations
+    /// repeat this check under their own write transaction.
+    pub fn check_dispatch_lead(&self, id: i64, proof: LeadProof<'_>) -> Result<()> {
+        let conn = self.conn();
+        let bound: Option<Option<String>> = conn
+            .query_row(
+                "SELECT lead_lease FROM agent_dispatches WHERE id=?1",
+                [id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let Some(bound) = bound else {
+            return Err(anyhow::Error::new(MissingDispatch { id }));
+        };
+        let _audit_note = lead_check(
+            &conn,
+            &bound.into_iter().collect::<Vec<_>>(),
+            proof,
+            util::now_ms(),
         )?;
-        tx.commit()?;
         Ok(())
     }
 
@@ -1197,6 +1402,25 @@ impl Db {
         prepared: Option<&crate::pipeline_chunk::PreparedChunkAdmission>,
         allow_scope: Option<&str>,
     ) -> Result<std::result::Result<i64, DispatchAdmissionDecision>> {
+        self.claim_dispatch_admitted_led(
+            new,
+            limit,
+            allow_duplicate,
+            prepared,
+            allow_scope,
+            LeadProof::Unbound,
+        )
+    }
+
+    pub fn claim_dispatch_admitted_led(
+        &self,
+        new: crate::issue::NewDispatch<'_>,
+        limit: u32,
+        allow_duplicate: Option<&str>,
+        prepared: Option<&crate::pipeline_chunk::PreparedChunkAdmission>,
+        allow_scope: Option<&str>,
+        proof: LeadProof<'_>,
+    ) -> Result<std::result::Result<i64, DispatchAdmissionDecision>> {
         use crate::pipeline_claim::{ClaimRequest, decide_allowing_duplicate};
         let allow_duplicate = allow_duplicate.map(str::trim);
         if allow_duplicate.is_some_and(str::is_empty) {
@@ -1221,6 +1445,21 @@ impl Db {
         let conn = self.conn();
         conn.execute_batch("BEGIN IMMEDIATE")?;
         let result = (|| -> Result<std::result::Result<i64, DispatchAdmissionDecision>> {
+            let mut stmt = conn.prepare("SELECT DISTINCT lead_lease FROM agent_dispatches WHERE issue_id=?1 AND lead_lease IS NOT NULL AND status IN (?2,?3,?4,?5,?6)")?;
+            let bound = stmt
+                .query_map(
+                    rusqlite::params![
+                        new.issue_id,
+                        AgentDispatchStatus::Queued.as_str(),
+                        AgentDispatchStatus::Spawning.as_str(),
+                        AgentDispatchStatus::Running.as_str(),
+                        AgentDispatchStatus::WaitingHuman.as_str(),
+                        AgentDispatchStatus::PrOpen.as_str()
+                    ],
+                    |row| row.get::<_, String>(0),
+                )?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            let audit_note = lead_check(&conn, &bound, proof, util::now_ms())?;
             let rows = self.admission_rows(new.issue_id, new.worktree_path)?;
             if let Some(parent_id) = new.parent_id {
                 self.validate_parent_edge(parent_id, new.issue_id)?;
@@ -1358,6 +1597,17 @@ impl Db {
                 return Ok(Err(DispatchAdmissionDecision::Claim(decision)));
             }
             let id = self.put_agent_dispatch(new)?;
+            if let LeadProof::Lease { name, .. } = proof {
+                conn.execute(
+                    "UPDATE agent_dispatches SET lead_lease=?1 WHERE id=?2",
+                    rusqlite::params![name, id],
+                )?;
+            }
+            if let Some(audit) = audit_note {
+                let audit = crate::pipeline_report::note_text(&audit)
+                    .map_err(|e| anyhow::anyhow!("{e}"))?;
+                self.append_dispatch_note(id, &audit)?;
+            }
             if let Some(stage) = new.stage
                 && new.artifact_path.is_none()
             {
@@ -4516,5 +4766,392 @@ mod tests {
             result.is_ok(),
             "same-stage done prerequisite should admit: {result:?}"
         );
+    }
+
+    fn lead_claim(db: &Db, issue: &str, worktree: &str, proof: LeadProof<'_>) -> Result<i64> {
+        db.claim_dispatch_admitted_led(
+            crate::issue::NewDispatch::new(issue, worktree, "coder"),
+            20,
+            None,
+            None,
+            None,
+            proof,
+        )?
+        .map_err(|decision| anyhow::anyhow!("unexpected admission refusal: {decision:?}"))
+    }
+
+    fn lead_note_count(db: &Db, id: i64) -> i64 {
+        db.conn()
+            .query_row(
+                "SELECT COUNT(*) FROM agent_dispatch_notes WHERE dispatch_id=?1",
+                [id],
+                |row| row.get(0),
+            )
+            .unwrap()
+    }
+
+    fn lead_status(db: &Db, id: i64) -> AgentDispatchStatus {
+        db.get_dispatch(id).unwrap().unwrap().status
+    }
+
+    #[test]
+    fn lead_lease_claim_binds_the_row_to_the_presented_lease() {
+        let db = Db::open_memory().unwrap();
+        db.acquire_pipeline_lease("repo:linear:X-1", "owner-a", 300)
+            .unwrap()
+            .unwrap();
+        let id = lead_claim(
+            &db,
+            "linear:X-1",
+            "/wt/a",
+            LeadProof::Lease {
+                name: "repo:linear:X-1",
+                owner: "owner-a",
+            },
+        )
+        .unwrap();
+        let bound: Option<String> = db
+            .conn()
+            .query_row(
+                "SELECT lead_lease FROM agent_dispatches WHERE id=?1",
+                [id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(bound.as_deref(), Some("repo:linear:X-1"));
+    }
+
+    #[test]
+    fn lead_lease_claim_refuses_a_lease_the_owner_does_not_hold() {
+        let db = Db::open_memory().unwrap();
+        db.acquire_pipeline_lease("held", "owner-b", 300)
+            .unwrap()
+            .unwrap();
+        for (name, owner) in [("absent", "owner-a"), ("held", "owner-a")] {
+            let before: i64 = db
+                .conn()
+                .query_row("SELECT COUNT(*) FROM agent_dispatches", [], |row| {
+                    row.get(0)
+                })
+                .unwrap();
+            let result = lead_claim(&db, "linear:X-1", "/wt/a", LeadProof::Lease { name, owner });
+            assert!(
+                matches!(result, Err(ref error) if error.downcast_ref::<LeadLeaseConflict>().is_some_and(|conflict| matches!(conflict, LeadLeaseConflict::NotHeld { .. })))
+            );
+            let after: i64 = db
+                .conn()
+                .query_row("SELECT COUNT(*) FROM agent_dispatches", [], |row| {
+                    row.get(0)
+                })
+                .unwrap();
+            assert_eq!(after, before);
+        }
+        db.acquire_pipeline_lease("expired", "owner-a", 300)
+            .unwrap()
+            .unwrap();
+        db.conn()
+            .execute(
+                "UPDATE pipeline_leases SET expires_at_ms=1 WHERE name='expired'",
+                [],
+            )
+            .unwrap();
+        let before: i64 = db
+            .conn()
+            .query_row("SELECT COUNT(*) FROM agent_dispatches", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        let result = lead_claim(
+            &db,
+            "linear:X-1",
+            "/wt/a",
+            LeadProof::Lease {
+                name: "expired",
+                owner: "owner-a",
+            },
+        );
+        assert!(
+            matches!(result, Err(ref error) if error.downcast_ref::<LeadLeaseConflict>().is_some())
+        );
+        let after: i64 = db
+            .conn()
+            .query_row("SELECT COUNT(*) FROM agent_dispatches", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(after, before);
+    }
+
+    #[test]
+    fn lead_lease_unbound_claim_refused_while_issue_has_a_bound_active_row() {
+        let db = Db::open_memory().unwrap();
+        db.acquire_pipeline_lease("repo:linear:X-1", "owner-a", 300)
+            .unwrap()
+            .unwrap();
+        lead_claim(
+            &db,
+            "linear:X-1",
+            "/wt/a",
+            LeadProof::Lease {
+                name: "repo:linear:X-1",
+                owner: "owner-a",
+            },
+        )
+        .unwrap();
+        let same = lead_claim(&db, "linear:X-1", "/wt/b", LeadProof::Unbound);
+        assert!(
+            matches!(same, Err(ref error) if matches!(error.downcast_ref::<LeadLeaseConflict>(), Some(LeadLeaseConflict::Required { .. })))
+        );
+        db.acquire_pipeline_lease("other", "owner-b", 300)
+            .unwrap()
+            .unwrap();
+        let other = lead_claim(
+            &db,
+            "linear:X-1",
+            "/wt/b",
+            LeadProof::Lease {
+                name: "other",
+                owner: "owner-b",
+            },
+        );
+        assert!(
+            matches!(other, Err(ref error) if matches!(error.downcast_ref::<LeadLeaseConflict>(), Some(LeadLeaseConflict::Mismatch { .. })))
+        );
+        assert!(lead_claim(&db, "linear:X-2", "/wt/c", LeadProof::Unbound).is_ok());
+    }
+
+    #[test]
+    fn lead_lease_set_status_refuses_other_owner_unbound_and_mismatched_lease() {
+        let db = Db::open_memory().unwrap();
+        db.acquire_pipeline_lease("lease-a", "owner-a", 300)
+            .unwrap()
+            .unwrap();
+        db.acquire_pipeline_lease("lease-b", "owner-b", 300)
+            .unwrap()
+            .unwrap();
+        let id = lead_claim(
+            &db,
+            "linear:X-1",
+            "/wt/a",
+            LeadProof::Lease {
+                name: "lease-a",
+                owner: "owner-a",
+            },
+        )
+        .unwrap();
+        let before_notes = lead_note_count(&db, id);
+        for proof in [
+            LeadProof::Unbound,
+            LeadProof::Lease {
+                name: "lease-b",
+                owner: "owner-b",
+            },
+            LeadProof::Lease {
+                name: "lease-a",
+                owner: "owner-b",
+            },
+        ] {
+            let result = db.set_dispatch_status_led(
+                id,
+                AgentDispatchStatus::Queued,
+                AgentDispatchStatus::Running,
+                None,
+                proof,
+            );
+            assert!(
+                matches!(result, Err(ref error) if error.downcast_ref::<LeadLeaseConflict>().is_some())
+            );
+            assert_eq!(lead_status(&db, id), AgentDispatchStatus::Queued);
+            assert_eq!(lead_note_count(&db, id), before_notes);
+        }
+    }
+
+    #[test]
+    fn lead_lease_takeover_after_expiry_moves_authority() {
+        let db = Db::open_memory().unwrap();
+        db.acquire_pipeline_lease("lease", "owner-a", 300)
+            .unwrap()
+            .unwrap();
+        let id = lead_claim(
+            &db,
+            "linear:X-1",
+            "/wt/a",
+            LeadProof::Lease {
+                name: "lease",
+                owner: "owner-a",
+            },
+        )
+        .unwrap();
+        db.conn()
+            .execute(
+                "UPDATE pipeline_leases SET expires_at_ms=1 WHERE name='lease'",
+                [],
+            )
+            .unwrap();
+        db.acquire_pipeline_lease("lease", "owner-b", 300)
+            .unwrap()
+            .unwrap();
+        assert!(
+            lead_claim(
+                &db,
+                "linear:X-1",
+                "/wt/b",
+                LeadProof::Lease {
+                    name: "lease",
+                    owner: "owner-b"
+                }
+            )
+            .is_ok()
+        );
+        db.set_dispatch_status_led(
+            id,
+            AgentDispatchStatus::Queued,
+            AgentDispatchStatus::Running,
+            None,
+            LeadProof::Lease {
+                name: "lease",
+                owner: "owner-b",
+            },
+        )
+        .unwrap();
+        let old = db.set_dispatch_status_led(
+            id,
+            AgentDispatchStatus::Running,
+            AgentDispatchStatus::WaitingHuman,
+            None,
+            LeadProof::Lease {
+                name: "lease",
+                owner: "owner-a",
+            },
+        );
+        assert!(
+            matches!(old, Err(ref error) if matches!(error.downcast_ref::<LeadLeaseConflict>(), Some(LeadLeaseConflict::NotHeld { holder: Some(owner), .. }) if owner == "owner-b"))
+        );
+    }
+
+    #[test]
+    fn lead_lease_forced_done_requires_the_lease_on_a_bound_row() {
+        let db = Db::open_memory().unwrap();
+        db.acquire_pipeline_lease("lease", "owner-a", 300)
+            .unwrap()
+            .unwrap();
+        let id = lead_claim(
+            &db,
+            "linear:X-1",
+            "/wt/a",
+            LeadProof::Lease {
+                name: "lease",
+                owner: "owner-a",
+            },
+        )
+        .unwrap();
+        db.set_dispatch_status_led(
+            id,
+            AgentDispatchStatus::Queued,
+            AgentDispatchStatus::Running,
+            None,
+            LeadProof::Lease {
+                name: "lease",
+                owner: "owner-a",
+            },
+        )
+        .unwrap();
+        let refused = db.set_dispatch_status_forced_led(
+            id,
+            AgentDispatchStatus::Running,
+            AgentDispatchStatus::Done,
+            "override",
+            LeadProof::Unbound,
+        );
+        assert!(
+            matches!(refused, Err(ref error) if error.downcast_ref::<LeadLeaseConflict>().is_some())
+        );
+        db.set_dispatch_status_forced_led(
+            id,
+            AgentDispatchStatus::Running,
+            AgentDispatchStatus::Done,
+            "override",
+            LeadProof::Lease {
+                name: "lease",
+                owner: "owner-a",
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            db.dispatch_override(id).unwrap().unwrap().reason,
+            "override"
+        );
+    }
+
+    #[test]
+    fn lead_lease_admin_bypass_records_the_reason() {
+        let db = Db::open_memory().unwrap();
+        db.acquire_pipeline_lease("lease", "owner-a", 300)
+            .unwrap()
+            .unwrap();
+        let id = lead_claim(
+            &db,
+            "linear:X-1",
+            "/wt/a",
+            LeadProof::Lease {
+                name: "lease",
+                owner: "owner-a",
+            },
+        )
+        .unwrap();
+        let admin_claim = lead_claim(
+            &db,
+            "linear:X-1",
+            "/wt/b",
+            LeadProof::Admin {
+                why: "operator correction",
+            },
+        )
+        .unwrap();
+        assert!(
+            db.dispatch_notes(admin_claim, None, 10)
+                .unwrap()
+                .iter()
+                .any(|note| note.text.contains("operator correction"))
+        );
+        db.set_dispatch_status_led(
+            id,
+            AgentDispatchStatus::Queued,
+            AgentDispatchStatus::Running,
+            None,
+            LeadProof::Admin {
+                why: "operator moved row",
+            },
+        )
+        .unwrap();
+        assert!(
+            db.dispatch_notes(id, None, 10)
+                .unwrap()
+                .iter()
+                .any(|note| note.text.contains("operator moved row"))
+        );
+        let empty = db.set_dispatch_status_led(
+            id,
+            AgentDispatchStatus::Running,
+            AgentDispatchStatus::WaitingHuman,
+            None,
+            LeadProof::Admin { why: "  " },
+        );
+        assert!(empty.is_err());
+    }
+
+    #[test]
+    fn lead_lease_unbound_rows_keep_legacy_behaviour() {
+        let db = Db::open_memory().unwrap();
+        let id = lead_claim(&db, "linear:X-1", "/wt/a", LeadProof::Unbound).unwrap();
+        db.set_dispatch_status_led(
+            id,
+            AgentDispatchStatus::Queued,
+            AgentDispatchStatus::Running,
+            None,
+            LeadProof::Unbound,
+        )
+        .unwrap();
+        assert_eq!(lead_status(&db, id), AgentDispatchStatus::Running);
     }
 }

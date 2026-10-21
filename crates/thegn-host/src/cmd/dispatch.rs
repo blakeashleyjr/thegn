@@ -23,7 +23,7 @@
 use anyhow::Result;
 use std::collections::HashMap;
 use thegn_core::config::Config;
-use thegn_core::db::{Db, DispatchNoteQuotaExceeded, NoteQuotaKind};
+use thegn_core::db::{Db, DispatchNoteQuotaExceeded, LeadProof, NoteQuotaKind};
 use thegn_core::issue::{AgentDispatch, AgentDispatchStatus, DispatchNote, NewDispatch};
 use thegn_core::outln;
 use thegn_core::pipeline_chunk;
@@ -158,6 +158,23 @@ pub enum Action {
         /// non-empty reason; session open never exposes this override.
         #[arg(long, value_name = "REASON")]
         allow_scope_overlap: Option<String>,
+        /// The Lead lease this mutation is made under.
+        #[arg(
+            long,
+            value_name = "NAME",
+            requires = "owner",
+            conflicts_with = "admin"
+        )]
+        lease: Option<String>,
+        /// The owner id holding `--lease`.
+        #[arg(long, value_name = "ID", requires = "lease")]
+        owner: Option<String>,
+        /// Manual roster administration: skip the lease check and record `--why` on the row.
+        #[arg(long, requires = "why")]
+        admin: bool,
+        /// Audit reason for manual roster administration.
+        #[arg(long, value_name = "REASON", requires = "admin")]
+        why: Option<String>,
         /// Emit the created row (or the refusal) as JSON.
         #[arg(long)]
         json: bool,
@@ -203,6 +220,20 @@ pub enum Action {
         /// possible (see `set_status`).
         #[arg(long)]
         why: Option<String>,
+        /// The Lead lease this mutation is made under.
+        #[arg(
+            long,
+            value_name = "NAME",
+            requires = "owner",
+            conflicts_with = "admin"
+        )]
+        lease: Option<String>,
+        /// The owner id holding `--lease`.
+        #[arg(long, value_name = "ID", requires = "lease")]
+        owner: Option<String>,
+        /// Manual roster administration: skip the lease check and record `--why` on the row.
+        #[arg(long, requires = "why", conflicts_with = "lease")]
+        admin: bool,
         #[arg(long)]
         json: bool,
     },
@@ -431,6 +462,10 @@ pub fn run(cfg: &Config, action: Action) -> Result<()> {
             chunk,
             allow_duplicate,
             allow_scope_overlap,
+            lease,
+            owner,
+            admin,
+            why,
             json,
         } => claim(
             cfg,
@@ -443,6 +478,7 @@ pub fn run(cfg: &Config, action: Action) -> Result<()> {
             chunk.as_deref(),
             allow_duplicate.as_deref(),
             allow_scope_overlap.as_deref(),
+            lead_proof(lease.as_deref(), owner.as_deref(), admin, why.as_deref()),
             json,
         ),
         Action::Lease {
@@ -544,8 +580,18 @@ pub fn run(cfg: &Config, action: Action) -> Result<()> {
             status,
             force,
             why,
+            lease,
+            owner,
+            admin,
             json,
-        } => set_status(id, &status, force, why.as_deref(), json),
+        } => set_status(
+            id,
+            &status,
+            force,
+            why.as_deref(),
+            lead_proof(lease.as_deref(), owner.as_deref(), admin, why.as_deref()),
+            json,
+        ),
         Action::Verify { id, json } => verify(id, json),
         Action::Gate { id, json } => gate::run(cfg, id, json),
         Action::Wait {
@@ -814,6 +860,23 @@ fn prepare_chunk_admission(
     })
 }
 
+fn lead_proof<'a>(
+    lease: Option<&'a str>,
+    owner: Option<&'a str>,
+    admin: bool,
+    why: Option<&'a str>,
+) -> LeadProof<'a> {
+    if admin {
+        LeadProof::Admin {
+            why: why.unwrap_or(""),
+        }
+    } else if let (Some(name), Some(owner)) = (lease, owner) {
+        LeadProof::Lease { name, owner }
+    } else {
+        LeadProof::Unbound
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn claim_admitted_with_refresh(
     db: &Db,
@@ -825,17 +888,43 @@ pub(crate) fn claim_admitted_with_refresh(
     chunk: Option<&str>,
     allow_scope: Option<&str>,
 ) -> Result<std::result::Result<i64, thegn_core::db::DispatchAdmissionDecision>> {
+    claim_admitted_with_refresh_led(
+        db,
+        new,
+        limit,
+        allow_duplicate,
+        worktree,
+        issue_id,
+        chunk,
+        allow_scope,
+        LeadProof::Unbound,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn claim_admitted_with_refresh_led(
+    db: &Db,
+    new: NewDispatch<'_>,
+    limit: u32,
+    allow_duplicate: Option<&str>,
+    worktree: &str,
+    issue_id: &str,
+    chunk: Option<&str>,
+    allow_scope: Option<&str>,
+    proof: LeadProof<'_>,
+) -> Result<std::result::Result<i64, thegn_core::db::DispatchAdmissionDecision>> {
     let mut raced_snapshot = None;
     for _ in 0..3 {
         let prepared = chunk
             .map(|p| prepare_chunk_admission(db, worktree, issue_id, p))
             .transpose()?;
-        let result = db.claim_dispatch_admitted(
+        let result = db.claim_dispatch_admitted_led(
             new,
             limit,
             allow_duplicate,
             prepared.as_ref(),
             allow_scope,
+            proof,
         )?;
         match result {
             Err(thegn_core::db::DispatchAdmissionDecision::RetryScopeSnapshot { row, path }) => {
@@ -913,6 +1002,7 @@ fn claim(
     chunk: Option<&str>,
     allow_duplicate: Option<&str>,
     allow_scope_overlap: Option<&str>,
+    proof: LeadProof<'_>,
     json: bool,
 ) -> Result<()> {
     let db = Db::open()?;
@@ -927,7 +1017,7 @@ fn claim(
     // slot, not when the worker fails to start.
     crate::cmd::session::policy_admission(cfg, agent_name, stage)?;
     let limit = stage_config.concurrency;
-    let outcome = claim_admitted_with_refresh(
+    let outcome = match claim_admitted_with_refresh_led(
         &db,
         NewDispatch {
             issue_id,
@@ -945,7 +1035,23 @@ fn claim(
         issue_id,
         chunk,
         allow_scope_overlap,
-    )?;
+        proof,
+    ) {
+        Ok(outcome) => outcome,
+        Err(error)
+            if error
+                .downcast_ref::<thegn_core::db::LeadLeaseConflict>()
+                .is_some() =>
+        {
+            if json {
+                super::emit_json(
+                    &serde_json::json!({"granted": false, "reason": error.to_string(), "error": "lead_lease"}),
+                )?;
+            }
+            return Err(error);
+        }
+        Err(error) => return Err(error),
+    };
     match outcome {
         Ok(id) => {
             let row = db.get_dispatch(id)?;
@@ -1443,7 +1549,14 @@ fn wants_a_reason(
         && !has_note
 }
 
-fn set_status(id: i64, status: &str, force: bool, why: Option<&str>, json: bool) -> Result<()> {
+fn set_status(
+    id: i64,
+    status: &str,
+    force: bool,
+    why: Option<&str>,
+    proof: LeadProof<'_>,
+    json: bool,
+) -> Result<()> {
     // Reject an unparseable status up front — writing `Unknown` back would
     // corrupt the roster the fix exists to protect. `Unknown` is a read-only
     // coercion, never a target a caller may set.
@@ -1458,7 +1571,10 @@ fn set_status(id: i64, status: &str, force: bool, why: Option<&str>, json: bool)
     let result = if db.get_dispatch(id)?.is_none() {
         Err(anyhow::Error::new(thegn_core::db::MissingDispatch { id }))
     } else {
-        set_status_on(&db, id, parsed, force, why, json)
+        match proof {
+            LeadProof::Unbound => set_status_on(&db, id, parsed, force, why, json),
+            _ => set_status_on_led(&db, id, parsed, force, why, proof, json),
+        }
     };
     if json
         && let Err(error) = &result
@@ -1480,6 +1596,12 @@ fn set_status_error_kind(err: &anyhow::Error) -> Option<&'static str> {
             thegn_core::db::DispatchTransitionConflict::Stale { .. } => "stale",
         });
     }
+    if err
+        .downcast_ref::<thegn_core::db::LeadLeaseConflict>()
+        .is_some()
+    {
+        return Some("lead_lease");
+    }
     if err.downcast_ref::<DoneGateRefused>().is_some() {
         return Some("missing_evidence");
     }
@@ -1500,6 +1622,18 @@ fn set_status_on(
     why: Option<&str>,
     json: bool,
 ) -> Result<()> {
+    set_status_on_led(db, id, parsed, force, why, LeadProof::Unbound, json)
+}
+
+fn set_status_on_led(
+    db: &Db,
+    id: i64,
+    parsed: AgentDispatchStatus,
+    force: bool,
+    why: Option<&str>,
+    proof: LeadProof<'_>,
+    json: bool,
+) -> Result<()> {
     let row = db
         .get_dispatch(id)?
         .ok_or_else(|| anyhow::anyhow!("no dispatch with id {id}"))?;
@@ -1518,8 +1652,9 @@ fn set_status_on(
             },
         ));
     }
+    db.check_dispatch_lead(id, proof)?;
     // Only `done` has artifact evidence requirements, and `--force` overrides
-    // that gate. The typed transition check below still applies when forced.
+    // that gate. The mutation repeats the lease check atomically with its write.
     if parsed == AgentDispatchStatus::Done && !force {
         done_gate_bound(db, &row)?;
     }
@@ -1532,7 +1667,13 @@ fn set_status_on(
                 "set-status done --force requires --why '<reason>' (recorded on the row)"
             )
         })?;
-        db.set_dispatch_status_forced(id, row.status, AgentDispatchStatus::Done, reason)?;
+        db.set_dispatch_status_forced_led(
+            id,
+            row.status,
+            AgentDispatchStatus::Done,
+            reason,
+            proof,
+        )?;
         Some(
             db.dispatch_override(id)?
                 .ok_or_else(|| anyhow::anyhow!("forced completion has no stored override"))?
@@ -1544,10 +1685,11 @@ fn set_status_on(
             row.status,
             parsed,
             Some(&format!("set-status {}: {w}", parsed.as_str())),
+            proof,
         )?;
         None
     } else {
-        db.set_dispatch_status_checked(id, row.status, parsed, None)?;
+        db.set_dispatch_status_led(id, row.status, parsed, None, proof)?;
         None
     };
     let unexplained = wants_a_reason(
@@ -4681,6 +4823,10 @@ mod tests {
                     chunk: None,
                     allow_duplicate: None,
                     allow_scope_overlap: None,
+                    lease: None,
+                    owner: None,
+                    admin: false,
+                    why: None,
                     json: false,
                 },
                 WorkerRoute::Refused("claim"),
@@ -4707,6 +4853,9 @@ mod tests {
                     status: "done".into(),
                     force: false,
                     why: None,
+                    lease: None,
+                    owner: None,
+                    admin: false,
                     json: false,
                 },
                 WorkerRoute::Refused("set-status"),
@@ -5077,5 +5226,98 @@ mod tests {
         poison_terminal_report(&db.file_path().unwrap(), terminal.id);
 
         assert!(list_rows(&db, false).is_err());
+    }
+
+    #[test]
+    fn lead_lease_flags_parse_for_claim_set_status_and_session_open() {
+        use clap::Parser as _;
+        for args in [
+            vec![
+                "thegn",
+                "dispatch",
+                "claim",
+                "linear:X-1",
+                "/wt",
+                "coder",
+                "--stage",
+                "code",
+                "--lease",
+                "n",
+                "--owner",
+                "o",
+            ],
+            vec![
+                "thegn",
+                "dispatch",
+                "set-status",
+                "1",
+                "done",
+                "--lease",
+                "n",
+                "--owner",
+                "o",
+            ],
+            vec![
+                "thegn",
+                "dispatch",
+                "set-status",
+                "1",
+                "failed",
+                "--admin",
+                "--why",
+                "x",
+            ],
+            vec![
+                "thegn",
+                "session",
+                "open",
+                "--stage",
+                "code",
+                "--issue",
+                "linear:X-1",
+                "--worktree",
+                "/wt",
+                "--lease",
+                "n",
+                "--owner",
+                "o",
+            ],
+        ] {
+            assert!(crate::Cli::try_parse_from(args).is_ok());
+        }
+        assert!(
+            crate::Cli::try_parse_from([
+                "thegn",
+                "dispatch",
+                "claim",
+                "linear:X-1",
+                "/wt",
+                "coder",
+                "--stage",
+                "code",
+                "--lease",
+                "n"
+            ])
+            .is_err()
+        );
+        assert!(
+            crate::Cli::try_parse_from([
+                "thegn",
+                "dispatch",
+                "set-status",
+                "1",
+                "failed",
+                "--admin"
+            ])
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn lead_lease_conflict_has_its_own_error_kind() {
+        let error = anyhow::Error::new(thegn_core::db::LeadLeaseConflict::Required {
+            lease: "repo:issue".into(),
+        });
+        assert_eq!(set_status_error_kind(&error), Some("lead_lease"));
     }
 }
