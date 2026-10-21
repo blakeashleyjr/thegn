@@ -3952,6 +3952,24 @@ fn oci_create_opts_with_remote_stdin_secrets(
         v.extend(["--label".into(), crate::sandbox_manage::owner_label_arg()]);
         v.extend([
             "--label".into(),
+            format!(
+                "{}={}",
+                crate::sandbox_manage::WORKTREE_LABEL_KEY,
+                crate::sandbox_manage::worktree_label_value(
+                    spec.worktree.as_os_str().as_encoded_bytes()
+                )
+            ),
+        ]);
+        v.extend([
+            "--label".into(),
+            format!(
+                "{}={}",
+                crate::sandbox_manage::ROLE_LABEL_KEY,
+                crate::sandbox_manage::MAIN_ROLE
+            ),
+        ]);
+        v.extend([
+            "--label".into(),
             format!("{SEAL_LABEL}={}", u8::from(spec.seal_home.is_some())),
         ]);
         v.extend([
@@ -4714,6 +4732,23 @@ pub fn run_gc_detailed(db_worktrees: &[String]) -> GcReport {
             },
             labelled.as_deref(),
         );
+        let plan = if labelled.is_some() {
+            crate::sandbox_manage::refine_gc_plan(plan, db_worktrees, &mut |name| {
+                let mut command = backend_prefix(backend);
+                command.extend(crate::sandbox_manage::gc_label_probe_argv(name));
+                output_with_timeout(&command, PROBE_TIMEOUT)
+                    .filter(|(ok, _)| *ok)
+                    .map(|(_, stdout)| {
+                        let mut lines = stdout.lines();
+                        (
+                            lines.next().unwrap_or_default().to_string(),
+                            lines.next().unwrap_or_default().to_string(),
+                        )
+                    })
+            })
+        } else {
+            plan
+        };
 
         for orphan in &plan.remove {
             removed_names.push(orphan.clone());

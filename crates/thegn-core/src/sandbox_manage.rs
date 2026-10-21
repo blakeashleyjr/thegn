@@ -166,6 +166,111 @@ pub fn plan_gc(
     GcPlan { remove, unverified }
 }
 
+/// Label key that binds a container to the worktree path that created it.
+pub const WORKTREE_LABEL_KEY: &str = "thegn.worktree";
+
+/// Label key that identifies the primary worktree container.
+pub const ROLE_LABEL_KEY: &str = "thegn.role";
+
+/// The role value for a primary worktree container.
+pub const MAIN_ROLE: &str = "main";
+
+/// Derive the versioned, path-exact worktree ownership label value.
+pub fn worktree_label_value(worktree: &[u8]) -> String {
+    let mut digest = Sha256::new();
+    digest.update(b"thegn.worktree-label.v1\0");
+    digest.update(worktree);
+    let hash = format!("{:x}", digest.finalize());
+    format!("v1-{}", &hash[..32])
+}
+
+/// How inspected labels affect a name-derived GC candidate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LabelVerdict {
+    Legacy,
+    Live,
+    Dead,
+    Ambiguous,
+}
+
+/// Classify the role and worktree labels against active worktree label values.
+pub fn label_verdict(
+    role: &str,
+    worktree: &str,
+    active: &std::collections::HashSet<String>,
+) -> LabelVerdict {
+    if role.is_empty() && worktree.is_empty() {
+        LabelVerdict::Legacy
+    } else if role == MAIN_ROLE
+        && worktree.starts_with("v1-")
+        && worktree.len() == 35
+        && worktree[3..]
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        if active.contains(worktree) {
+            LabelVerdict::Live
+        } else {
+            LabelVerdict::Dead
+        }
+    } else {
+        LabelVerdict::Ambiguous
+    }
+}
+
+/// Build the runtime inspect command for the role and worktree labels.
+pub fn gc_label_probe_argv(name: &str) -> Vec<String> {
+    vec![
+        "container".into(),
+        "inspect".into(),
+        "--format".into(),
+        format!(
+            "{{{{index .Config.Labels \"{ROLE_LABEL_KEY}\"}}}}\n{{{{index .Config.Labels \"{WORKTREE_LABEL_KEY}\"}}}}"
+        ),
+        name.to_string(),
+    ]
+}
+
+/// Refine name-derived candidates with inspected ownership labels.
+pub fn refine_gc_plan(
+    plan: GcPlan,
+    active_worktrees: &[String],
+    probe: &mut dyn FnMut(&str) -> Option<(String, String)>,
+) -> GcPlan {
+    let active: std::collections::HashSet<String> = active_worktrees
+        .iter()
+        .map(|worktree| worktree_label_value(worktree.as_bytes()))
+        .collect();
+    let mut remove = Vec::new();
+    let mut unverified = plan.unverified;
+    let mut seen_remove: std::collections::HashSet<String> = remove.iter().cloned().collect();
+    let mut seen_unverified: std::collections::HashSet<String> =
+        unverified.iter().cloned().collect();
+    for name in plan.remove {
+        match probe(&name) {
+            Some((role, worktree)) => match label_verdict(&role, &worktree, &active) {
+                LabelVerdict::Legacy | LabelVerdict::Dead => {
+                    if seen_remove.insert(name.clone()) {
+                        remove.push(name);
+                    }
+                }
+                LabelVerdict::Live => {}
+                LabelVerdict::Ambiguous => {
+                    if seen_unverified.insert(name.clone()) {
+                        unverified.push(name);
+                    }
+                }
+            },
+            None => {
+                if seen_unverified.insert(name.clone()) {
+                    unverified.push(name);
+                }
+            }
+        }
+    }
+    GcPlan { remove, unverified }
+}
+
 /// The volume label whose value names the seeded warm-volume role
 /// (`thegn-nix-store`, `thegn-cargo`, …). A role-labelled volume is a
 /// deliberately-persistent dedup cache / user-state store — see
