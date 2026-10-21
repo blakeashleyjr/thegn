@@ -899,91 +899,104 @@ class WorkflowPolicyTests(unittest.TestCase):
     def test_publisher_manifest_check_rehearsal(self) -> None:
         if shutil.which("bash") is None:
             self.skipTest("bash is required for the publisher manifest rehearsal")
-        job = read_workflow("release.yml")["jobs"]["publish-homebrew"]
-        step = next(
-            candidate
-            for candidate in job["steps"]
-            if candidate.get("name") == "Download formula from published release"
+        publishers = (
+            ("publish-homebrew", "Download formula from published release", "thegn-v1.2.3-homebrew.rb"),
+            (
+                "publish-aur",
+                "Download release PKGBUILD and compare with generated metadata",
+                "thegn-v1.2.3-PKGBUILD",
+            ),
         )
-        script = step["run"]
-        with tempfile.TemporaryDirectory() as temporary_directory:
-            root = Path(temporary_directory)
-            fixtures = root / "fixtures"
-            fixtures.mkdir()
-            formula_name = "thegn-v1.2.3-homebrew.rb"
-            manifest_name = "thegn-v1.2.3-manifest.json"
-            formula_bytes = b'formula fixture\n'
-            (fixtures / formula_name).write_bytes(formula_bytes)
-            manifest = {
-                "tag": "v1.2.3",
-                "assets": [{"name": formula_name, "sha256": hashlib.sha256(formula_bytes).hexdigest()}],
-            }
-            manifest_path = fixtures / manifest_name
-            manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
-            stub_dir = root / "bin"
-            stub_dir.mkdir()
-            (stub_dir / "gh").write_text(
-                "#!/bin/sh\n"
-                'if [ "$1" = release ] && [ "$2" = view ]; then printf false; exit 0; fi\n'
-                'if [ "$1" = release ] && [ "$2" = download ]; then\n'
-                '  shift 2; tag="$1"; shift; destination=""; pattern=""\n'
-                '  while [ "$#" -gt 0 ]; do\n'
-                '    case "$1" in --dir) destination="$2"; shift 2;; --pattern) pattern="$2"; shift 2;; *) shift;; esac\n'
-                '  done\n'
-                '  [ -f "$GH_FIXTURES/$pattern" ] || exit 1\n'
-                '  cp "$GH_FIXTURES/$pattern" "$destination/$pattern"; exit 0\n'
-                'fi\n'
-                'if [ "$1" = attestation ] && [ "$2" = verify ]; then exit "$GH_FAIL_ATTESTATION"; fi\n'
-                'exit 2\n',
-                encoding="utf-8",
-            )
-            (stub_dir / "gh").chmod(0o755)
-            env = os.environ.copy()
-            env.update(
-                {
-                    "PATH": f"{stub_dir}{os.pathsep}{env.get('PATH', '')}",
-                    "RUNNER_TEMP": str(root),
-                    "GITHUB_ENV": str(root / "github-env"),
-                    "GITHUB_TOKEN": "fixture-token",
-                    "GITHUB_REPOSITORY": "owner/repo",
-                    "TAG": "v1.2.3",
-                    "GH_FIXTURES": str(fixtures),
-                    "GH_FAIL_ATTESTATION": "0",
+        jobs = read_workflow("release.yml")["jobs"]
+        for job_name, step_name, asset_name in publishers:
+            with self.subTest(job=job_name), tempfile.TemporaryDirectory() as temporary_directory:
+                job = jobs[job_name]
+                step = next(
+                    candidate for candidate in job["steps"] if candidate.get("name") == step_name
+                )
+                script = step["run"]
+                root = Path(temporary_directory)
+                fixtures = root / "fixtures"
+                fixtures.mkdir()
+                manifest_name = "thegn-v1.2.3-manifest.json"
+                asset_bytes = f"fixture for {asset_name}\n".encode()
+                (fixtures / asset_name).write_bytes(asset_bytes)
+                manifest = {
+                    "tag": "v1.2.3",
+                    "assets": [{"name": asset_name, "sha256": hashlib.sha256(asset_bytes).hexdigest()}],
                 }
-            )
+                manifest_path = fixtures / manifest_name
+                manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+                stub_dir = root / "bin"
+                stub_dir.mkdir()
+                (stub_dir / "gh").write_text(
+                    "#!/bin/sh\n"
+                    'if [ "$1" = release ] && [ "$2" = view ]; then printf false; exit 0; fi\n'
+                    'if [ "$1" = release ] && [ "$2" = download ]; then\n'
+                    '  shift 2; tag="$1"; shift; destination=""; pattern=""\n'
+                    '  while [ "$#" -gt 0 ]; do\n'
+                    '    case "$1" in --dir) destination="$2"; shift 2;; --pattern) pattern="$2"; shift 2;; *) shift;; esac\n'
+                    '  done\n'
+                    '  [ -f "$GH_FIXTURES/$pattern" ] || exit 1\n'
+                    '  cp "$GH_FIXTURES/$pattern" "$destination/$pattern"; exit 0\n'
+                    'fi\n'
+                    'if [ "$1" = attestation ] && [ "$2" = verify ]; then exit "$GH_FAIL_ATTESTATION"; fi\n'
+                    'exit 2\n',
+                    encoding="utf-8",
+                )
+                (stub_dir / "gh").chmod(0o755)
+                env = os.environ.copy()
+                env.update(
+                    {
+                        "PATH": f"{stub_dir}{os.pathsep}{env.get('PATH', '')}",
+                        "RUNNER_TEMP": str(root),
+                        "GITHUB_ENV": str(root / "github-env"),
+                        "GITHUB_TOKEN": "fixture-token",
+                        "GITHUB_REPOSITORY": "owner/repo",
+                        "TAG": "v1.2.3",
+                        "GH_FIXTURES": str(fixtures),
+                        "GH_FAIL_ATTESTATION": "0",
+                    }
+                )
+                if job_name == "publish-aur":
+                    aur_metadata = root / "aur-metadata"
+                    aur_metadata.mkdir()
+                    (aur_metadata / "PKGBUILD").write_bytes(asset_bytes)
 
-            def run_case(*, fail_attestation: bool = False) -> subprocess.CompletedProcess[str]:
-                (root / "github-env").write_text("", encoding="utf-8")
-                env["GH_FAIL_ATTESTATION"] = "1" if fail_attestation else "0"
-                return subprocess.run(
-                    ["bash", "-c", script], env=env, check=False, capture_output=True, text=True
+                def run_case(*, fail_attestation: bool = False) -> subprocess.CompletedProcess[str]:
+                    (root / "github-env").write_text("", encoding="utf-8")
+                    env["GH_FAIL_ATTESTATION"] = "1" if fail_attestation else "0"
+                    return subprocess.run(
+                        ["bash", "-c", script], env=env, check=False, capture_output=True, text=True
+                    )
+
+                result = run_case()
+                self.assertEqual(0, result.returncode, result.stderr)
+
+                manifest_path.unlink()
+                result = run_case()
+                self.assertNotEqual(0, result.returncode)
+                self.assertIn(
+                    "release manifest missing: run the build to completion (verify-manifest) before publishing",
+                    result.stdout,
                 )
 
-            result = run_case()
-            self.assertEqual(0, result.returncode, result.stderr)
+                manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+                result = run_case(fail_attestation=True)
+                self.assertNotEqual(0, result.returncode)
+                self.assertIn("release manifest attestation did not verify", result.stdout)
 
-            manifest_path.unlink()
-            result = run_case()
-            self.assertNotEqual(0, result.returncode)
-            self.assertIn("release manifest missing: run the build to completion (verify-manifest) before publishing", result.stdout)
+                wrong_tag = dict(manifest, tag="v9.9.9")
+                manifest_path.write_text(json.dumps(wrong_tag), encoding="utf-8")
+                result = run_case()
+                self.assertNotEqual(0, result.returncode)
+                self.assertIn("release manifest tag does not match", result.stdout)
 
-            manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
-            result = run_case(fail_attestation=True)
-            self.assertNotEqual(0, result.returncode)
-            self.assertIn("release manifest attestation did not verify", result.stdout)
-
-            env["GH_FAIL_ATTESTATION"] = "0"
-            wrong_tag = dict(manifest, tag="v9.9.9")
-            manifest_path.write_text(json.dumps(wrong_tag), encoding="utf-8")
-            result = run_case()
-            self.assertNotEqual(0, result.returncode)
-            self.assertIn("release manifest tag does not match", result.stdout)
-
-            manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
-            (fixtures / formula_name).write_bytes(b"different formula\n")
-            result = run_case()
-            self.assertNotEqual(0, result.returncode)
-            self.assertIn(f"{formula_name} does not match the release manifest", result.stdout)
+                manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+                (fixtures / asset_name).write_bytes(b"different asset bytes\n")
+                result = run_case()
+                self.assertNotEqual(0, result.returncode)
+                self.assertIn(f"{asset_name} does not match the release manifest", result.stdout)
 
 
 if __name__ == "__main__":
