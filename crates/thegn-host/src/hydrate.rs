@@ -3300,6 +3300,8 @@ pub(crate) fn build_panel(
     // collides across sandboxed worktrees — see `worktree_cache_key`).
     let cache_key = thegn_core::remote::GitLoc::worktree_cache_key(cwd);
 
+    let merge_unknown = merge_info.is_err();
+
     // Retain last-known-good header on transient git-read failure (never "—").
     // Keyed by the HOST worktree path, not `loc.path()` — the in-sandbox path
     // is `/workspace` for every provider worktree of an env, so keying by it
@@ -3479,6 +3481,7 @@ pub(crate) fn build_panel(
         unresolved,
         total,
     });
+    panel.merge_unknown = merge_unknown;
     panel.stash_count = stash_count;
     panel.status_unavailable = lists.status_unavailable;
     panel.log = lists.log;
