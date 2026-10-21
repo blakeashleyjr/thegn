@@ -603,6 +603,30 @@ mod tests {
         fn snapshot(&self) -> BoxFuture<'_, Result<Option<MediaState>, MediaError>> {
             no_player()
         }
+        fn play_pause(&self) -> BoxFuture<'_, Result<(), MediaError>> {
+            no_player()
+        }
+        fn next(&self) -> BoxFuture<'_, Result<(), MediaError>> {
+            no_player()
+        }
+        fn previous(&self) -> BoxFuture<'_, Result<(), MediaError>> {
+            no_player()
+        }
+        fn set_shuffle(&self, _on: bool) -> BoxFuture<'_, Result<(), MediaError>> {
+            no_player()
+        }
+        fn set_loop(&self, _mode: crate::model::LoopMode) -> BoxFuture<'_, Result<(), MediaError>> {
+            no_player()
+        }
+        fn volume_step(&self, _delta: f64) -> BoxFuture<'_, Result<(), MediaError>> {
+            no_player()
+        }
+        fn playlists(&self) -> BoxFuture<'_, Result<Vec<crate::model::Playlist>, MediaError>> {
+            no_player()
+        }
+        fn activate_playlist<'a>(&'a self, _id: &'a str) -> BoxFuture<'a, Result<(), MediaError>> {
+            no_player()
+        }
 
         fn caps(&self) -> MediaCaps {
             NO_CAPS
