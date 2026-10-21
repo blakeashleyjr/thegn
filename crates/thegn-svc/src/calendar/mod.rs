@@ -271,9 +271,13 @@ pub struct EventPage {
 /// than one count.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct PageDiagnostics {
+    /// Invalid or incomplete events that the parser quarantined.
     pub quarantined_events: usize,
+    /// Time-zone references the parser could not resolve or map.
     pub unresolved_zones: usize,
+    /// Other malformed lines, values, or document structure.
     pub other: usize,
+    /// Diagnostics beyond the parser's bounded report capacity, counted but not retained.
     pub overflow: usize,
 }
 
@@ -418,6 +422,7 @@ impl EventPage {
             event_hrefs,
             deleted_hrefs,
             sync_token,
+            diagnostics: PageDiagnostics::default(),
             lease: meter.into_lease(),
         })
     }

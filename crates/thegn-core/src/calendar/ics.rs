@@ -737,6 +737,10 @@ pub fn parse_ics_window_reported(
                             report.record(IcsDiagnostic::InvalidEvent);
                             meter.abandon_event();
                         }
+                        Some(b) if b.start.is_none() => {
+                            report.record(IcsDiagnostic::EventWithoutStart);
+                            meter.abandon_event();
+                        }
                         Some(b) if window.is_some_and(|w| !b.may_occur_in(w, default_zone)) => {
                             meter.abandon_event();
                         }

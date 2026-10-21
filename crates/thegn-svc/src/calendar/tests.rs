@@ -3923,7 +3923,7 @@ async fn token_ref_tokenless_account_sends_no_authorization() {
 fn an_ics_file_with_a_startless_event_counts_a_quarantined_event() {
     let t = Tmp::new("ics-diagnostics-startless");
     let path = t.0.join("calendar.ics");
-    let feed = "BEGIN:VCALENDAR\nBEGIN:VEVENT\nUID:e1\nSUMMARY:Standup\nDTSTART;TZID=UTC:20260821T093000\nDTEND;TZID=UTC:20260821T094500\nEND:VEVENT\nBEGIN:VEVENT\nUID:no-start\nSUMMARY:No start\nEND:VEVENT\nEND:VCALENDAR";
+    let feed = "BEGIN:VCALENDAR\nBEGIN:VEVENT\nUID:e1\nSUMMARY:Standup\nDTSTART;TZID=UTC:20260821T093000\nDTEND;TZID=UTC:20260821T094500\nEND:VEVENT\nBEGIN:VEVENT\nUID:no-start\nSUMMARY:No start\nEND:VEVENT\nBEGIN:VEVENT\nUID:duplicate-start\nSUMMARY:Duplicate start\nDTSTART:20260821T090000Z\nDTSTART:20260821T100000Z\nEND:VEVENT\nEND:VCALENDAR";
     std::fs::write(&path, feed).unwrap();
     let (from, to) = window();
 
@@ -3961,8 +3961,9 @@ fn a_vdir_sums_diagnostics_across_files() {
     let t = Tmp::new("vdir-diagnostics");
     for uid in ["one", "two"] {
         let path = t.0.join(format!("{uid}.ics"));
-        let feed =
-            format!("BEGIN:VCALENDAR\nBEGIN:VEVENT\nUID:bad-{uid}\nEND:VEVENT\nEND:VCALENDAR");
+        let feed = format!(
+            "BEGIN:VCALENDAR\nBEGIN:VEVENT\nUID:bad-{uid}\nEND:VEVENT\nBEGIN:VEVENT\nUID:duplicate-{uid}\nDTSTART:20260821T090000Z\nDTSTART:20260821T100000Z\nEND:VEVENT\nEND:VCALENDAR"
+        );
         std::fs::write(path, feed).unwrap();
     }
     let (from, to) = window();
