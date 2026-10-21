@@ -1644,9 +1644,9 @@ SQL
   check_collision running-pin "$COLLISION_PIN_DB" pin \
     "SELECT pin_state FROM session_state WHERE session_name='default';"
 
-  # Dry-run: the target profile root exists but has no database at all. Both
-  # output modes must carry the stable warning while leaving the root byte-for-
-  # byte untouched (including no state directory, WAL, journal, or schema file).
+  # Dry-run: history is dropped by default; both output modes must say so while
+  # leaving the target root byte-for-byte untouched (including no state
+  # directory, WAL, journal, or schema file).
   DRY="$TMP/session-move-dry-run"
   init_move_case "$DRY"
   DRY_WT="$DRY/dry-worktree"
@@ -1662,13 +1662,18 @@ SQL
   # shellcheck disable=SC2034 # read by the `check` bodies below through `eval`
   dry_json="$(move_cli "$DRY" session move "$DRY_WT" --to-profile target --dry-run --json 2>&1)"
   dry_json_rc=$?
+  # shellcheck disable=SC2034 # read by the `check` body below through `eval`
+  dry_include_json="$(move_cli "$DRY" session move "$DRY_WT" --to-profile target --dry-run --include-history --json 2>&1)"
+  dry_include_json_rc=$?
   set -e
   dry_target_after="$(find "$DRY_TARGET_ROOT" -mindepth 1 -print | sort)"
   dry_source_after="$(sqlite3 "$DRY_DB" "SELECT count(*) FROM tab_groups WHERE worktree='$DRY_WT';")"
   check "session move dry-run human output warns about opaque payloads" \
-    "[[ $dry_human_rc -eq 0 ]] && grep -q 'opaque payload warning:' <<<\"\$dry_human\" && grep -q 'carried unchanged' <<<\"\$dry_human\" && ! grep -q 'SMOKE_OPAQUE_' <<<\"\$dry_human\""
+    "[[ $dry_human_rc -eq 0 ]] && grep -q 'opaque payload warning:' <<<\"\$dry_human\" && grep -q 'history is dropped by default' <<<\"\$dry_human\" && grep -q -- '--include-history' <<<\"\$dry_human\" && ! grep -q 'SMOKE_OPAQUE_' <<<\"\$dry_human\""
   check "session move dry-run JSON output is redacted and complete" \
-    "[[ $dry_json_rc -eq 0 ]] && grep -q '\"opaque_payload_warning\"' <<<\"\$dry_json\" && grep -q 'carried unchanged' <<<\"\$dry_json\" && ! grep -q 'SMOKE_OPAQUE_' <<<\"\$dry_json\""
+    "[[ $dry_json_rc -eq 0 ]] && grep -q '\"opaque_payload_warning\"' <<<\"\$dry_json\" && grep -q 'history is dropped by default' <<<\"\$dry_json\" && grep -q -- '--include-history' <<<\"\$dry_json\" && ! grep -q 'SMOKE_OPAQUE_' <<<\"\$dry_json\""
+  check "session move dry-run --include-history reports carried opaque payloads" \
+    "[[ $dry_include_json_rc -eq 0 ]] && grep -q '\"include_history\":true' <<<\"\$dry_include_json\" && grep -q 'carried unchanged' <<<\"\$dry_include_json\" && ! grep -q 'SMOKE_OPAQUE_' <<<\"\$dry_include_json\""
   check "session move dry-run does not create target DB sidecars or schema" \
     "[[ \"$dry_source_before\" == \"$dry_source_after\" ]] && [[ \"$dry_target_before\" == \"$dry_target_after\" ]] && [[ ! -e '$DRY_TARGET_ROOT/state' ]]"
 
