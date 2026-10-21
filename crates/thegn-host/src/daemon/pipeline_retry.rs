@@ -654,6 +654,30 @@ fn retry_open_spec(row: &AgentDispatch, prompt: String, resume: Option<String>) 
     }
 }
 
+fn retry_spec_for(
+    cfg: &thegn_core::config::Config,
+    row: &AgentDispatch,
+    prompt: String,
+    resume: Option<String>,
+) -> anyhow::Result<OpenSpec> {
+    let mut spec = retry_open_spec(row, prompt, resume);
+    if let Some(stage) = row
+        .stage
+        .as_deref()
+        .filter(|stage| !stage.trim().is_empty())
+    {
+        // Today digest inputs are registry fields, matching agent_open's overlay; keep sources aligned if that changes.
+        let digest =
+            thegn_core::pipeline_launch_digest::stage_launch_digest(cfg, &row.agent_name, stage)
+                .map_err(anyhow::Error::msg)?;
+        spec.env.push((
+            thegn_core::pipeline_launch_digest::STAGE_CONFIG_DIGEST_ENV.into(),
+            digest,
+        ));
+    }
+    Ok(spec)
+}
+
 /// The native session id a retry may resume exactly: present, shape-valid, and
 /// resumable by id on this agent's harness. Anything else is `None` (cold).
 fn exact_resume_id(
@@ -677,13 +701,23 @@ async fn relaunch(
     row: &AgentDispatch,
     native: Option<&str>,
 ) -> anyhow::Result<SessionInfo> {
-    crate::daemon::agent_open::harness_for_agent(&svc.config, &row.agent_name)
+    let boot = (*svc.config).clone();
+    let cfg = tokio::task::spawn_blocking(move || {
+        crate::config_source::fresh(&boot).map(|fresh| fresh.unwrap_or(boot))
+    })
+    .await
+    .context("config reload task")?
+    .map_err(|error| anyhow::anyhow!("configuration refused: {error}"))?;
+    crate::daemon::agent_open::harness_for_agent(&cfg, &row.agent_name)
         .with_context(|| format!("unknown agent `{}` — cannot relaunch", row.agent_name))?;
-    let spec = match exact_resume_id(&svc.config, &row.agent_name, native) {
-        Some(id) => retry_open_spec(row, pipeline_exit::RETRY_NUDGE.to_string(), Some(id)),
+    let spec = match exact_resume_id(&cfg, &row.agent_name, native) {
+        Some(id) => retry_spec_for(&cfg, row, pipeline_exit::RETRY_NUDGE.to_string(), Some(id))?,
         None => {
-            let prompt = format!("{}{RECOVERY_CONTEXT}", cold_stage_prompt(svc, row).await?);
-            retry_open_spec(row, prompt, None)
+            let prompt = format!(
+                "{}{RECOVERY_CONTEXT}",
+                cold_stage_prompt(svc, &cfg, row).await?
+            );
+            retry_spec_for(&cfg, row, prompt, None)?
         }
     };
     svc.open(spec)
@@ -715,14 +749,17 @@ fn retry_class(
 /// Issue facts come from the daemon's tracker door, the branch from the DB
 /// worktree registry (the same two-tier lookup the CLI dispatch uses, minus
 /// the `git rev-parse` fallback: the registry row is already there).
-async fn cold_stage_prompt(svc: &DaemonService, row: &AgentDispatch) -> anyhow::Result<String> {
+async fn cold_stage_prompt(
+    svc: &DaemonService,
+    cfg: &thegn_core::config::Config,
+    row: &AgentDispatch,
+) -> anyhow::Result<String> {
     let stage_name = row
         .stage
         .clone()
         .filter(|s| !s.trim().is_empty())
         .context("row has no stage — cannot re-render the prompt")?;
-    let stage = svc
-        .config
+    let stage = cfg
         .pipeline
         .stage(&stage_name)
         .with_context(|| format!("stage '{stage_name}' is no longer configured"))?
@@ -967,6 +1004,57 @@ mod tests {
         assert_eq!(launch.resume.as_deref(), Some("abc-123"));
         assert!(!launch.continue_last);
         assert!(!launch.fork);
+    }
+
+    #[test]
+    fn retry_spec_for_carries_the_stage_config_digest() {
+        let db = thegn_core::db::Db::open_memory().expect("db");
+        let id = db
+            .put_agent_dispatch(NewDispatch {
+                stage: Some("code"),
+                ..NewDispatch::new("linear:THE-1159", "/wt/1159", "claude")
+            })
+            .expect("row");
+        let row = db.get_dispatch(id).expect("get row").expect("dispatch");
+        let mut cfg = thegn_core::config::Config::default();
+        cfg.pipeline
+            .stages
+            .push(thegn_core::config_pipeline::PipelineStage {
+                name: "code".into(),
+                agent: "claude".into(),
+                ..Default::default()
+            });
+
+        let spec = retry_spec_for(&cfg, &row, "task".into(), None).expect("retry spec");
+        let presented = spec
+            .env
+            .iter()
+            .find(|(key, _)| key == thegn_core::pipeline_launch_digest::STAGE_CONFIG_DIGEST_ENV)
+            .map(|(_, value)| value.as_str());
+        let expected =
+            thegn_core::pipeline_launch_digest::stage_launch_digest(&cfg, "claude", "code")
+                .expect("expected digest");
+        assert_eq!(presented, Some(expected.as_str()));
+    }
+
+    #[test]
+    fn retry_spec_for_refuses_an_unconfigured_stage() {
+        let db = thegn_core::db::Db::open_memory().expect("db");
+        let id = db
+            .put_agent_dispatch(NewDispatch {
+                stage: Some("code"),
+                ..NewDispatch::new("linear:THE-1159", "/wt/1159", "claude")
+            })
+            .expect("row");
+        let row = db.get_dispatch(id).expect("get row").expect("dispatch");
+        let error = retry_spec_for(
+            &thegn_core::config::Config::default(),
+            &row,
+            "task".into(),
+            None,
+        )
+        .expect_err("missing stage refuses");
+        assert!(error.to_string().contains("unknown pipeline stage `code`"));
     }
 
     #[test]
