@@ -289,9 +289,9 @@ reported and not applied; editor-only `customizations` is ignored silently.
 This is the supported subset for this thegn version, not a promise to mirror
 every current or future containers.dev field.
 
-Named volumes declared by a devcontainer carry an owner label. Thegn refuses a
-volume labelled for another devcontainer; a legacy unlabelled volume is claimed
-on first local use, while an unlabelled volume on a remote host is refused.
+Named volumes declared by a devcontainer carry an owner label. A volume labelled
+for another devcontainer is refused; a legacy unlabelled volume is claimed on
+first local use, while an unlabelled volume on a remote host is refused.
 Volumes configured under `[sandbox] volumes` are not owner-bound.
 
 Supported native OCI behavior includes image, Dockerfile build, compose
@@ -618,10 +618,10 @@ Cleanup is always explicit — thegn never prunes on a schedule.
   for sidecars it removes, plus staging directories older than an hour whose
   sidecar is gone when at least one runtime could be listed; symlinks are
   never followed.
-  New containers carry `thegn.worktree` and `thegn.role` labels. The sweep
-  keeps a labelled container for a known worktree, removes one only when its
-  worktree is gone, and keeps one whose labels it cannot interpret. Containers
-  without those labels are judged as before.
+  Containers thegn creates carry `thegn.worktree` and `thegn.role` labels.
+  The sweep keeps a labelled container for a known worktree, removes one only
+  when its worktree is gone, and keeps one whose labels it cannot interpret.
+  Containers without those labels are judged as before.
   At startup, the sweep runs only when the effective configuration can produce
   a sandbox container (enabled globally or by the active profile, an env
   overlay, or a repo overlay for a known worktree); `thegn sandbox gc` runs it
