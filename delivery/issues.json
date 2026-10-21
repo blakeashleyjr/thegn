@@ -288,15 +288,6 @@
       ]
     },
     {
-      "issue": "THE-146",
-      "project": "Proposal Retirement & Cleanup",
-      "changes": [
-        "add-merge-queue-tui",
-        "add-terminal-presets",
-        "complete-devcontainer-support"
-      ]
-    },
-    {
       "issue": "THE-147",
       "project": "Workspace Product & Observability",
       "changes": [

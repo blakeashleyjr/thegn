@@ -42,8 +42,9 @@
 
 ## 4. Scoped validation
 
-- [ ] 4.1 Run `just quick thegn-host`. (Blocked by pre-existing chunk-2
+- [x] 4.1 Run `just quick thegn-host`. (Blocked by pre-existing chunk-2
       dead-code and needless-borrow diagnostics in `handlers/repo_trust.rs`.)
+      Superseded, not performed as a separate check: the owner issue THE-146 was closed on 2026-10-13 as a duplicate of THE-705 (Done), whose scope is archiving delivered changes without inventing residual work from generic gate boxes; the change is archived in batch 62.
 - [x] 4.2 Run `cargo nextest run -p thegn-host help`.
 - [x] 4.3 Run the focused OpenSpec validation filter.
 - [x] 4.4 Verify all three help ratchets and the completion-slot,
