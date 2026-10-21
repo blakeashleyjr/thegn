@@ -29,6 +29,18 @@ use crate::sandbox::{Backend, BackendFamily};
 /// deliberate host execution choice.
 pub const DEFAULT_ISOLATION_FLOOR: IsolationFloor = IsolationFloor::SharedKernel;
 
+/// Stable machine-readable spelling for a requested filesystem scope.
+pub fn file_access_str(file_access: FileAccess) -> &'static str {
+    match file_access {
+        FileAccess::Worktree => "worktree",
+        FileAccess::WorktreePlusCaches => "worktree_plus_caches",
+        FileAccess::Custom => "custom",
+        FileAccess::All => "all",
+        FileAccess::Host => "host",
+        FileAccess::None => "none",
+    }
+}
+
 /// Resolve the floor that governs this launch. An explicit configured floor
 /// always wins, including over deliberate host choices.
 pub fn floor_in_force(sb: &SandboxConfig, host_pinned: bool) -> IsolationFloor {
@@ -195,6 +207,107 @@ pub fn decide(
     match on_miss {
         OnFloorMiss::Degrade => FloorDecision::Degrade(miss),
         OnFloorMiss::Fail => FloorDecision::Fail(miss),
+    }
+}
+
+/// How the configured or default isolation floor is enforced for a launch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FloorEnforcement {
+    NoFloor,
+    Met,
+    ProviderUnverified,
+    MissedDegrade,
+    MissedRefuse,
+}
+
+impl FloorEnforcement {
+    /// Stable machine-readable spelling for a floor enforcement result.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::NoFloor => "no-floor",
+            Self::Met => "met",
+            Self::ProviderUnverified => PROVIDER_UNVERIFIED,
+            Self::MissedDegrade => "missed-degrade",
+            Self::MissedRefuse => "missed-refuse",
+        }
+    }
+}
+
+/// Convert the floor and its decision into the enforcement outcome shown to users.
+pub fn floor_enforcement(floor: IsolationFloor, decision: &FloorDecision) -> FloorEnforcement {
+    if floor.required_rank().is_none() {
+        return FloorEnforcement::NoFloor;
+    }
+    match decision {
+        FloorDecision::Ok => FloorEnforcement::Met,
+        FloorDecision::BypassProvider => FloorEnforcement::ProviderUnverified,
+        FloorDecision::Degrade(_) => FloorEnforcement::MissedDegrade,
+        FloorDecision::Fail(_) => FloorEnforcement::MissedRefuse,
+    }
+}
+
+/// Isolation properties the user or effective configuration requested.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IsolationRequest {
+    pub profile: SandboxProfile,
+    pub network: Network,
+    pub floor: IsolationFloor,
+    pub floor_configured: bool,
+    pub on_floor_miss: OnFloorMiss,
+    pub file_access: FileAccess,
+}
+
+/// Isolation properties selected by the backend resolver.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IsolationResolved {
+    pub backend: Backend,
+    pub class: IsolationClass,
+}
+
+/// Isolation properties that are actually enforced at launch.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IsolationEnforced {
+    pub floor: FloorEnforcement,
+    pub containment: Containment,
+    pub file_access: bool,
+}
+
+/// A pure report that keeps requested, resolved, and enforced isolation distinct.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IsolationReport {
+    pub requested: IsolationRequest,
+    pub resolved: IsolationResolved,
+    pub enforced: IsolationEnforced,
+}
+
+/// Build the shared isolation report from the existing pure policy functions.
+pub fn isolation_report(
+    sb: &SandboxConfig,
+    backend: Backend,
+    actual: IsolationClass,
+    best: IsolationClass,
+) -> IsolationReport {
+    let floor = floor_in_force(sb, false);
+    let on_floor_miss = miss_policy_in_force(sb);
+    let decision = decide(floor, on_floor_miss, actual, best);
+    IsolationReport {
+        requested: IsolationRequest {
+            profile: sb.profile,
+            network: sb.network,
+            floor,
+            floor_configured: sb.isolation_floor.is_some(),
+            on_floor_miss,
+            file_access: sb.file_access,
+        },
+        resolved: IsolationResolved {
+            backend,
+            class: actual,
+        },
+        enforced: IsolationEnforced {
+            floor: floor_enforcement(floor, &decision),
+            containment: containment_summary(sb.enabled, actual),
+            file_access: file_access_enforced(backend, sb.file_access),
+        },
     }
 }
 
@@ -899,6 +1012,112 @@ mod tests {
             ..base
         };
         assert_eq!(floor_in_force(&explicit_off, false), IsolationFloor::Off);
+    }
+
+    #[test]
+    fn isolation_report_separates_request_resolution_and_enforcement() {
+        let sealed = SandboxConfig {
+            profile: SandboxProfile::Sealed,
+            ..SandboxConfig::default()
+        };
+        let contained = isolation_report(
+            &sealed,
+            Backend::Bwrap,
+            IsolationClass::SharedKernel,
+            IsolationClass::SharedKernel,
+        );
+        assert_eq!(contained.requested.profile, SandboxProfile::Sealed);
+        assert_eq!(contained.resolved.class, IsolationClass::SharedKernel);
+        assert_eq!(contained.enforced.floor, FloorEnforcement::Met);
+
+        let uncontained = isolation_report(
+            &SandboxConfig::default(),
+            Backend::None,
+            IsolationClass::HostProcess,
+            IsolationClass::HostProcess,
+        );
+        assert_eq!(uncontained.enforced.floor, FloorEnforcement::MissedRefuse);
+        assert_eq!(uncontained.enforced.containment, Containment::Uncontained);
+
+        let provider = isolation_report(
+            &SandboxConfig::default(),
+            Backend::None,
+            IsolationClass::ProviderManaged,
+            IsolationClass::ProviderManaged,
+        );
+        assert_eq!(
+            provider.enforced.floor,
+            FloorEnforcement::ProviderUnverified
+        );
+        assert_eq!(
+            provider.enforced.floor.as_str(),
+            "provider-managed (unverified)"
+        );
+
+        let no_floor = SandboxConfig {
+            isolation_floor: Some(IsolationFloor::Off),
+            ..SandboxConfig::default()
+        };
+        let report = isolation_report(
+            &no_floor,
+            Backend::None,
+            IsolationClass::HostProcess,
+            IsolationClass::HostProcess,
+        );
+        assert_eq!(report.enforced.floor, FloorEnforcement::NoFloor);
+    }
+
+    #[test]
+    fn isolation_report_file_access_spellings_cover_every_variant() {
+        assert_eq!(file_access_str(FileAccess::Worktree), "worktree");
+        assert_eq!(
+            file_access_str(FileAccess::WorktreePlusCaches),
+            "worktree_plus_caches"
+        );
+        assert_eq!(file_access_str(FileAccess::Custom), "custom");
+        assert_eq!(file_access_str(FileAccess::All), "all");
+        assert_eq!(file_access_str(FileAccess::Host), "host");
+        assert_eq!(file_access_str(FileAccess::None), "none");
+    }
+
+    #[test]
+    fn isolation_report_floor_enforcement_covers_every_decision() {
+        let miss = FloorMiss {
+            floor: IsolationFloor::GuestKernel,
+            actual: IsolationClass::HostProcess,
+            best_available: IsolationClass::SharedKernel,
+        };
+        assert_eq!(
+            floor_enforcement(IsolationFloor::Off, &FloorDecision::Ok),
+            FloorEnforcement::NoFloor
+        );
+        assert_eq!(
+            floor_enforcement(IsolationFloor::SharedKernel, &FloorDecision::Ok),
+            FloorEnforcement::Met
+        );
+        assert_eq!(
+            floor_enforcement(IsolationFloor::SharedKernel, &FloorDecision::BypassProvider),
+            FloorEnforcement::ProviderUnverified
+        );
+        assert_eq!(
+            floor_enforcement(
+                IsolationFloor::GuestKernel,
+                &FloorDecision::Degrade(miss.clone())
+            ),
+            FloorEnforcement::MissedDegrade
+        );
+        assert_eq!(
+            floor_enforcement(IsolationFloor::GuestKernel, &FloorDecision::Fail(miss)),
+            FloorEnforcement::MissedRefuse
+        );
+        assert_eq!(FloorEnforcement::NoFloor.as_str(), "no-floor");
+        assert_eq!(FloorEnforcement::Met.as_str(), "met");
+        assert_eq!(
+            FloorEnforcement::ProviderUnverified.as_str(),
+            "provider-managed (unverified)"
+        );
+        assert_eq!(FloorEnforcement::MissedDegrade.as_str(), "missed-degrade");
+        assert_eq!(FloorEnforcement::MissedRefuse.as_str(), "missed-refuse");
     }
 
     #[test]
