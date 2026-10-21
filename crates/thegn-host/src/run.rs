@@ -13472,6 +13472,7 @@ async fn event_loop<T: Terminal>(
             media_generation.current(),
             &mut model.panel.media,
             &mut media_caps,
+            &mut panel_ui.media.health,
             media_position_visible,
             &mut last_media_full,
         );

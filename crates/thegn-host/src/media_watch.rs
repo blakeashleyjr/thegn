@@ -29,6 +29,18 @@ use termwiz::terminal::TerminalWaker;
 use thegn_core::config::MediaConfig;
 use thegn_core::media::{MediaSnapshot, MediaState};
 
+/// Freshness of the most recent watcher delivery shown by the Media panel.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) enum MediaHealth {
+    /// The last provider read succeeded, including an authoritative empty read.
+    #[default]
+    Fresh,
+    /// A read failed and the shown snapshot is last-known-good within the grace.
+    Degraded,
+    /// The grace expired and no snapshot is shown.
+    Unavailable,
+}
+
 /// A now-playing result tagged with the watcher/config/player generation that
 /// produced it. The tag is captured before a producer starts async work, so a
 /// late result cannot overwrite a newer selection.
@@ -36,6 +48,9 @@ use thegn_core::media::{MediaSnapshot, MediaState};
 pub(crate) struct MediaSnapshotDelivery {
     pub(crate) generation: u64,
     pub(crate) snapshot: Option<MediaSnapshot>,
+    /// Watcher health when present; authoritative media-control reads preserve
+    /// the watcher's health because a one-off success does not prove liveness.
+    pub(crate) health: Option<MediaHealth>,
 }
 
 pub(crate) type SnapshotSender = tokio_watch::Sender<Option<MediaSnapshotDelivery>>;
@@ -171,7 +186,52 @@ struct WatchState {
     freshness: Freshness,
     grace: std::time::Duration,
     last_sent: Option<MediaSnapshot>,
+    last_health: MediaHealth,
     last_epoch: u64,
+}
+
+fn failure_delivery(
+    state: &mut WatchState,
+    now: tokio::time::Instant,
+) -> Option<(Option<MediaSnapshot>, MediaHealth)> {
+    match state.freshness.on_failure(now, state.grace) {
+        Some(expired) => Some((expired, MediaHealth::Unavailable)),
+        None if !state.freshness.stale_cleared
+            && state.last_sent.is_some()
+            && state.last_health != MediaHealth::Degraded =>
+        {
+            Some((state.last_sent.clone(), MediaHealth::Degraded))
+        }
+        None => None,
+    }
+}
+
+fn deliver(
+    tx: &SnapshotSender,
+    waker: &TerminalWaker,
+    generation: u64,
+    state: &mut WatchState,
+    snapshot: Option<MediaSnapshot>,
+    health: MediaHealth,
+    epoch: u64,
+) -> Result<bool, ()> {
+    let accepted = offer(
+        tx,
+        MediaSnapshotDelivery {
+            generation,
+            snapshot: snapshot.clone(),
+            health: Some(health),
+        },
+    )?;
+    if accepted {
+        if let Err(error) = waker.wake() {
+            tracing::debug!(target: "thegn::media", %error, "media watcher wake failed");
+        }
+        state.last_sent = snapshot;
+        state.last_epoch = epoch;
+        state.last_health = health;
+    }
+    Ok(accepted)
 }
 
 fn interval(period: std::time::Duration) -> tokio::time::Interval {
@@ -185,8 +245,10 @@ fn should_deliver(
     last_epoch: u64,
     current_epoch: u64,
     new: &Option<MediaSnapshot>,
+    last_health: MediaHealth,
+    health: MediaHealth,
 ) -> bool {
-    last_epoch != current_epoch || last != new
+    last_epoch != current_epoch || last != new || last_health != health
 }
 
 fn backoff_after_stream(
@@ -308,18 +370,19 @@ async fn push_snapshot(
 ) -> Option<bool> {
     let read = read_snapshot(client).await;
     let read_ok = read.is_ok();
-    let mut snap = match read {
+    let (mut snap, mut health) = match read {
         Ok(snap) => {
             state.freshness.on_success();
-            snap
+            (snap, MediaHealth::Fresh)
         }
-        Err(()) => match state
-            .freshness
-            .on_failure(tokio::time::Instant::now(), state.grace)
-        {
-            Some(snap) => {
-                tracing::debug!(target: "thegn::media", "media provider unavailable; stale badge expired");
-                snap
+        Err(()) => match failure_delivery(state, tokio::time::Instant::now()) {
+            Some((snapshot, health)) => {
+                if health == MediaHealth::Unavailable {
+                    tracing::debug!(target: "thegn::media", "media provider unavailable; stale badge expired");
+                } else {
+                    tracing::debug!(target: "thegn::media", "media read failed; retaining last-known-good snapshot");
+                }
+                (snapshot, health)
             }
             None => return Some(was_showing),
         },
@@ -336,13 +399,15 @@ async fn push_snapshot(
                 }
                 snap = confirm;
             }
-            Err(()) => match state
-                .freshness
-                .on_failure(tokio::time::Instant::now(), state.grace)
-            {
-                Some(expired) => {
-                    tracing::debug!(target: "thegn::media", "media provider unavailable; stale badge expired");
-                    snap = expired;
+            Err(()) => match failure_delivery(state, tokio::time::Instant::now()) {
+                Some((snapshot, failure_health)) => {
+                    if failure_health == MediaHealth::Unavailable {
+                        tracing::debug!(target: "thegn::media", "media provider unavailable; stale badge expired");
+                    } else {
+                        tracing::debug!(target: "thegn::media", "media confirm read failed; retaining last-known-good snapshot");
+                    }
+                    snap = snapshot;
+                    health = failure_health;
                 }
                 None => return Some(was_showing),
             },
@@ -350,27 +415,19 @@ async fn push_snapshot(
     }
     let active = shows_badge(&snap);
     let epoch = crate::media_ctl::MEDIA_DELIVERY_EPOCH.load(Ordering::Acquire);
-    if !should_deliver(&state.last_sent, state.last_epoch, epoch, &snap) {
-        return Some(active);
-    }
-    let accepted = match offer(
-        tx,
-        MediaSnapshotDelivery {
-            generation,
-            snapshot: snap.clone(),
-        },
+    if !should_deliver(
+        &state.last_sent,
+        state.last_epoch,
+        epoch,
+        &snap,
+        state.last_health,
+        health,
     ) {
-        Ok(accepted) => accepted,
-        Err(()) => return None,
-    };
-    if !accepted {
         return Some(active);
     }
-    if let Err(error) = waker.wake() {
-        tracing::debug!(target: "thegn::media", %error, "media watcher wake failed");
+    if deliver(tx, waker, generation, state, snap, health, epoch).is_err() {
+        return None;
     }
-    state.last_sent = snap;
-    state.last_epoch = epoch;
     Some(active)
 }
 
@@ -394,6 +451,7 @@ async fn run(cfg: MediaConfig, generation: u64, tx: SnapshotSender, waker: Termi
         freshness: Freshness::default(),
         grace,
         last_sent: None,
+        last_health: MediaHealth::Fresh,
         last_epoch: crate::media_ctl::MEDIA_DELIVERY_EPOCH
             .load(Ordering::Acquire)
             .wrapping_sub(1),
@@ -407,30 +465,22 @@ async fn run(cfg: MediaConfig, generation: u64, tx: SnapshotSender, waker: Termi
                 // No backend yet (bus down, playerctl absent). Retry with backoff so
                 // media appears once the transport comes up, rather than never.
                 tracing::debug!(target: "thegn::media", %error, "media backend unavailable; retrying");
-                if let Some(snapshot) = state
-                    .freshness
-                    .on_failure(tokio::time::Instant::now(), state.grace)
+                if let Some((snapshot, health)) =
+                    failure_delivery(&mut state, tokio::time::Instant::now())
                 {
                     active = shows_badge(&snapshot);
                     let epoch = crate::media_ctl::MEDIA_DELIVERY_EPOCH.load(Ordering::Acquire);
-                    if should_deliver(&state.last_sent, state.last_epoch, epoch, &snapshot) {
-                        let accepted = match offer(
-                            &tx,
-                            MediaSnapshotDelivery {
-                                generation,
-                                snapshot: snapshot.clone(),
-                            },
-                        ) {
-                            Ok(accepted) => accepted,
-                            Err(()) => return,
-                        };
-                        if accepted {
-                            if let Err(error) = waker.wake() {
-                                tracing::debug!(target: "thegn::media", %error, "media watcher wake failed");
-                            }
-                            state.last_sent = snapshot;
-                            state.last_epoch = epoch;
-                        }
+                    if should_deliver(
+                        &state.last_sent,
+                        state.last_epoch,
+                        epoch,
+                        &snapshot,
+                        state.last_health,
+                        health,
+                    ) && deliver(&tx, &waker, generation, &mut state, snapshot, health, epoch)
+                        .is_err()
+                    {
+                        return;
                     }
                 }
                 let retry_after = jittered(backoff, jitter_sample());
@@ -562,6 +612,7 @@ pub(crate) fn drain_snapshots(
     generation: u64,
     media: &mut Option<MediaState>,
     caps: &mut Option<thegn_core::media::MediaCaps>,
+    health: &mut MediaHealth,
     coalesce_full: bool,
     last_full: &mut Option<std::time::Instant>,
 ) -> (bool, bool) {
@@ -577,18 +628,26 @@ pub(crate) fn drain_snapshots(
     let newest = delivery.snapshot;
     perf.tick(crate::perf::WakeSource::Refresh);
     let shown = if enabled { newest } else { None };
+    let shown_health = if enabled {
+        delivery.health.unwrap_or(*health)
+    } else {
+        MediaHealth::Fresh
+    };
     let shown_state = shown.as_ref().map(|snapshot| snapshot.state.clone());
     let shown_caps = shown.as_ref().map(|snapshot| snapshot.caps);
-    if *media == shown_state && *caps == shown_caps {
+    if *media == shown_state && *caps == shown_caps && *health == shown_health {
         return (false, false);
     }
     let badge_changed =
         media.as_ref().and_then(|m| m.badge()) != shown_state.as_ref().and_then(|m| m.badge());
     *media = shown_state;
     *caps = shown_caps;
+    let health_changed = *health != shown_health;
+    *health = shown_health;
     let (mut full, mut bars) = (false, false);
     if coalesce_full {
         if badge_changed
+            || health_changed
             || last_full
                 .map(|t| t.elapsed() >= std::time::Duration::from_millis(900))
                 .unwrap_or(true)
@@ -608,10 +667,10 @@ mod tests {
     use tokio::time::MissedTickBehavior;
 
     use super::{
-        FlapAction, Freshness, MediaSnapshotDelivery, STREAM_STABILITY, abort_and_join,
-        backoff_after_stream, drain_snapshots, flap_action, interval, jittered, join_within,
-        next_push_wake, offer, reset_probe_on_activation, should_confirm_flap, should_deliver,
-        stale_grace,
+        FlapAction, Freshness, MediaHealth, MediaSnapshotDelivery, STREAM_STABILITY, WatchState,
+        abort_and_join, backoff_after_stream, drain_snapshots, failure_delivery, flap_action,
+        interval, jittered, join_within, next_push_wake, offer, reset_probe_on_activation,
+        should_confirm_flap, should_deliver, stale_grace,
     };
     use thegn_core::media::{MediaCaps, MediaSnapshot, MediaState};
 
@@ -705,9 +764,103 @@ mod tests {
             state: MediaState::default(),
             caps: MediaCaps::default(),
         });
-        assert!(!should_deliver(&snapshot, 4, 4, &snapshot));
-        assert!(should_deliver(&snapshot, 4, 5, &snapshot));
-        assert!(should_deliver(&snapshot, 4, 4, &None));
+        assert!(!should_deliver(
+            &snapshot,
+            4,
+            4,
+            &snapshot,
+            MediaHealth::Fresh,
+            MediaHealth::Fresh
+        ));
+        assert!(should_deliver(
+            &snapshot,
+            4,
+            5,
+            &snapshot,
+            MediaHealth::Fresh,
+            MediaHealth::Fresh
+        ));
+        assert!(should_deliver(
+            &snapshot,
+            4,
+            4,
+            &None,
+            MediaHealth::Fresh,
+            MediaHealth::Fresh
+        ));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn failure_delivery_is_degraded_once_then_unavailable_after_grace() {
+        let now = tokio::time::Instant::now();
+        let grace = std::time::Duration::from_secs(10);
+        let snapshot = MediaSnapshot {
+            state: MediaState {
+                title: "track".into(),
+                ..Default::default()
+            },
+            caps: MediaCaps::default(),
+        };
+        let mut state = WatchState {
+            freshness: Freshness::default(),
+            grace,
+            last_sent: Some(snapshot.clone()),
+            last_health: MediaHealth::Fresh,
+            last_epoch: 0,
+        };
+        assert_eq!(
+            failure_delivery(&mut state, now),
+            Some((Some(snapshot.clone()), MediaHealth::Degraded))
+        );
+        state.last_health = MediaHealth::Degraded;
+        assert_eq!(failure_delivery(&mut state, now + grace / 2), None);
+        assert_eq!(
+            failure_delivery(&mut state, now + grace),
+            Some((None, MediaHealth::Unavailable))
+        );
+        assert_eq!(failure_delivery(&mut state, now + grace * 2), None);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn failure_delivery_without_a_shown_snapshot_stays_silent_until_expiry() {
+        let now = tokio::time::Instant::now();
+        let grace = std::time::Duration::from_secs(10);
+        let mut state = WatchState {
+            freshness: Freshness::default(),
+            grace,
+            last_sent: None,
+            last_health: MediaHealth::Fresh,
+            last_epoch: 0,
+        };
+        assert_eq!(failure_delivery(&mut state, now), None);
+        assert_eq!(
+            failure_delivery(&mut state, now + grace),
+            Some((None, MediaHealth::Unavailable))
+        );
+    }
+
+    #[test]
+    fn health_only_change_is_delivered() {
+        let snapshot = Some(MediaSnapshot {
+            state: MediaState::default(),
+            caps: MediaCaps::default(),
+        });
+        assert!(should_deliver(
+            &snapshot,
+            4,
+            4,
+            &snapshot,
+            MediaHealth::Degraded,
+            MediaHealth::Fresh
+        ));
+        assert!(!should_deliver(
+            &snapshot,
+            4,
+            4,
+            &snapshot,
+            MediaHealth::Fresh,
+            MediaHealth::Fresh
+        ));
     }
 
     #[tokio::test]
@@ -744,6 +897,7 @@ mod tests {
         let mut perf = crate::perf::LoopPerf::new();
         let mut media = None;
         let mut caps = None;
+        let mut health = MediaHealth::Fresh;
         let mut last_full = None;
         let current = MediaSnapshot {
             state: MediaState {
@@ -766,6 +920,7 @@ mod tests {
             MediaSnapshotDelivery {
                 generation: 1,
                 snapshot: Some(current.clone()),
+                health: Some(MediaHealth::Fresh),
             },
         )
         .unwrap();
@@ -774,6 +929,7 @@ mod tests {
             MediaSnapshotDelivery {
                 generation: 0,
                 snapshot: Some(stale),
+                health: Some(MediaHealth::Fresh),
             },
         )
         .unwrap();
@@ -785,6 +941,7 @@ mod tests {
             1,
             &mut media,
             &mut caps,
+            &mut health,
             false,
             &mut last_full,
         );
@@ -804,6 +961,7 @@ mod tests {
             ..Default::default()
         });
         let mut caps = Some(MediaCaps::default());
+        let mut health = MediaHealth::Fresh;
         let mut last_full = None;
         let first = MediaSnapshot {
             state: media.clone().unwrap(),
@@ -822,6 +980,7 @@ mod tests {
                 MediaSnapshotDelivery {
                     generation: 7,
                     snapshot: Some(snapshot),
+                    health: Some(MediaHealth::Fresh),
                 },
             )
             .unwrap();
@@ -833,11 +992,120 @@ mod tests {
             7,
             &mut media,
             &mut caps,
+            &mut health,
             false,
             &mut last_full,
         );
         assert_eq!(repaint, (false, false));
         assert_eq!(media, Some(first.state));
+    }
+
+    #[test]
+    fn drain_applies_health_and_repaints_open_panel_on_health_only_change() {
+        let snapshot = MediaSnapshot {
+            state: MediaState {
+                player: "player".into(),
+                title: "track".into(),
+                ..Default::default()
+            },
+            caps: MediaCaps::default(),
+        };
+        let (tx, mut rx) = watch::channel(None);
+        offer(
+            &tx,
+            MediaSnapshotDelivery {
+                generation: 1,
+                snapshot: Some(snapshot.clone()),
+                health: Some(MediaHealth::Degraded),
+            },
+        )
+        .unwrap();
+        let mut perf = crate::perf::LoopPerf::new();
+        let mut media = Some(snapshot.state.clone());
+        let mut caps = Some(snapshot.caps);
+        let mut health = MediaHealth::Fresh;
+        let mut last_full = Some(std::time::Instant::now());
+        let repaint = drain_snapshots(
+            &mut rx,
+            &mut perf,
+            true,
+            1,
+            &mut media,
+            &mut caps,
+            &mut health,
+            true,
+            &mut last_full,
+        );
+        assert_eq!(health, MediaHealth::Degraded);
+        assert_eq!(repaint, (true, false));
+
+        let (tx, mut rx) = watch::channel(None);
+        offer(
+            &tx,
+            MediaSnapshotDelivery {
+                generation: 1,
+                snapshot: Some(snapshot.clone()),
+                health: Some(MediaHealth::Degraded),
+            },
+        )
+        .unwrap();
+        let mut health = MediaHealth::Fresh;
+        let mut last_full = None;
+        let repaint = drain_snapshots(
+            &mut rx,
+            &mut perf,
+            true,
+            1,
+            &mut media,
+            &mut caps,
+            &mut health,
+            false,
+            &mut last_full,
+        );
+        assert_eq!(health, MediaHealth::Degraded);
+        assert_eq!(repaint, (false, false));
+    }
+
+    #[test]
+    fn drain_preserves_watcher_health_on_authoritative_read() {
+        let snapshot = MediaSnapshot {
+            state: MediaState {
+                player: "player".into(),
+                title: "track".into(),
+                ..Default::default()
+            },
+            caps: MediaCaps::default(),
+        };
+        let (tx, mut rx) = watch::channel(None);
+        offer(
+            &tx,
+            MediaSnapshotDelivery {
+                generation: 1,
+                snapshot: Some(snapshot.clone()),
+                health: None,
+            },
+        )
+        .unwrap();
+        let mut perf = crate::perf::LoopPerf::new();
+        let mut media = Some(snapshot.state.clone());
+        let mut caps = Some(snapshot.caps);
+        let mut health = MediaHealth::Degraded;
+        let mut last_full = None;
+
+        let repaint = drain_snapshots(
+            &mut rx,
+            &mut perf,
+            true,
+            1,
+            &mut media,
+            &mut caps,
+            &mut health,
+            false,
+            &mut last_full,
+        );
+
+        assert_eq!(health, MediaHealth::Degraded);
+        assert_eq!(repaint, (false, false));
     }
 
     #[test]
@@ -848,6 +1116,7 @@ mod tests {
             MediaSnapshotDelivery {
                 generation: 1,
                 snapshot: None,
+                health: Some(MediaHealth::Fresh),
             },
         )
         .unwrap();
@@ -856,7 +1125,8 @@ mod tests {
                 &tx,
                 MediaSnapshotDelivery {
                     generation: 0,
-                    snapshot: None
+                    snapshot: None,
+                    health: Some(MediaHealth::Fresh),
                 }
             )
             .unwrap()
@@ -876,7 +1146,8 @@ mod tests {
                 &tx,
                 MediaSnapshotDelivery {
                     generation: 1,
-                    snapshot: None
+                    snapshot: None,
+                    health: Some(MediaHealth::Fresh),
                 }
             )
             .is_err()
