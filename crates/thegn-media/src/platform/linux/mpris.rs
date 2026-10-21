@@ -4,6 +4,7 @@
 //! host updates on change without polling.
 
 use std::collections::HashMap;
+use std::future::Future;
 use std::time::Duration;
 
 use futures::StreamExt;
@@ -105,6 +106,17 @@ impl MprisZbus {
             .map_err(|e| MediaError::Backend(e.to_string()))
     }
 
+    /// Read player properties for a mutation, retaining owner-loss errors as stale.
+    async fn player_props_for_mutation(
+        &self,
+        bus: &str,
+    ) -> Result<HashMap<String, OwnedValue>, MediaError> {
+        let proxy = self.props_proxy(bus).await?;
+        let iface = InterfaceName::try_from(PLAYER_IFACE)
+            .map_err(|e| MediaError::Backend(e.to_string()))?;
+        proxy.get_all(iface).await.map_err(map_mutation_fdo_error)
+    }
+
     /// Resolve and read the selected player once for either snapshot API.
     async fn active_snapshot_data(
         &self,
@@ -165,13 +177,39 @@ impl MprisZbus {
         Ok(chosen)
     }
 
+    /// Resolve a well-known MPRIS name to the process that currently owns it.
+    async fn owner_of(&self, bus: &str) -> Result<String, MediaError> {
+        let name =
+            zbus::names::BusName::try_from(bus).map_err(|e| MediaError::Backend(e.to_string()))?;
+        let dbus = zbus::fdo::DBusProxy::new(&self.conn)
+            .await
+            .map_err(|e| MediaError::Unavailable(e.to_string()))?;
+        dbus.get_name_owner(name)
+            .await
+            .map(|owner| owner.as_str().to_string())
+            .map_err(|error| {
+                if is_owner_gone_fdo_error(&error) {
+                    MediaError::Stale(format!("{bus} has no current owner"))
+                } else {
+                    MediaError::Unavailable(error.to_string())
+                }
+            })
+    }
+
+    /// Select a well-known player and pin this call to its current unique owner.
+    async fn selected_owner(&self) -> Result<(String, String), MediaError> {
+        let bus = self.active_player().await?.ok_or(MediaError::NoPlayer)?;
+        let owner = self.owner_of(&bus).await?;
+        Ok((bus, owner))
+    }
+
     /// Invoke a no-argument `Player` method (PlayPause / Next / Previous).
     async fn player_call(&self, bus: &str, member: &str) -> Result<(), MediaError> {
         self.conn
             .call_method(Some(bus), MPRIS_PATH, Some(PLAYER_IFACE), member, &())
             .await
             .map(|_| ())
-            .map_err(|e| MediaError::Backend(e.to_string()))
+            .map_err(map_mutation_method_error)
     }
 
     /// Set a `Player` property.
@@ -182,7 +220,7 @@ impl MprisZbus {
         proxy
             .set(iface, prop, value)
             .await
-            .map_err(|e| MediaError::Backend(e.to_string()))
+            .map_err(map_mutation_fdo_error)
     }
 
     /// Build a push watcher over MPRIS-relevant D-Bus signals.
@@ -265,42 +303,45 @@ impl MediaBackend for MprisZbus {
 
     fn play_pause(&self) -> BoxFuture<'_, Result<(), MediaError>> {
         Box::pin(async move {
-            let bus = self.active_player().await?.ok_or(MediaError::NoPlayer)?;
-            self.player_call(&bus, "PlayPause").await
+            let (_, owner) = self.selected_owner().await?;
+            self.player_call(&owner, "PlayPause").await
         })
     }
     fn next(&self) -> BoxFuture<'_, Result<(), MediaError>> {
         Box::pin(async move {
-            let bus = self.active_player().await?.ok_or(MediaError::NoPlayer)?;
-            self.player_call(&bus, "Next").await
+            let (_, owner) = self.selected_owner().await?;
+            self.player_call(&owner, "Next").await
         })
     }
     fn previous(&self) -> BoxFuture<'_, Result<(), MediaError>> {
         Box::pin(async move {
-            let bus = self.active_player().await?.ok_or(MediaError::NoPlayer)?;
-            self.player_call(&bus, "Previous").await
+            let (_, owner) = self.selected_owner().await?;
+            self.player_call(&owner, "Previous").await
         })
     }
     fn set_shuffle(&self, on: bool) -> BoxFuture<'_, Result<(), MediaError>> {
         Box::pin(async move {
-            let bus = self.active_player().await?.ok_or(MediaError::NoPlayer)?;
-            self.player_set(&bus, "Shuffle", Value::Bool(on)).await
+            let (_, owner) = self.selected_owner().await?;
+            self.player_set(&owner, "Shuffle", Value::Bool(on)).await
         })
     }
     fn set_loop(&self, mode: LoopMode) -> BoxFuture<'_, Result<(), MediaError>> {
         Box::pin(async move {
-            let bus = self.active_player().await?.ok_or(MediaError::NoPlayer)?;
-            self.player_set(&bus, "LoopStatus", Value::from(mode.as_mpris()))
+            let (_, owner) = self.selected_owner().await?;
+            self.player_set(&owner, "LoopStatus", Value::from(mode.as_mpris()))
                 .await
         })
     }
     fn volume_step(&self, delta: f64) -> BoxFuture<'_, Result<(), MediaError>> {
         Box::pin(async move {
-            let bus = self.active_player().await?.ok_or(MediaError::NoPlayer)?;
-            let props = self.player_props(&bus).await?;
+            let (bus, owner) = self.selected_owner().await?;
+            let props = self.player_props_for_mutation(&owner).await?;
             // A missing Volume must not be replaced by a guess and written back.
             let next = stepped_volume(f64_of(&props, "Volume"), delta)?;
-            self.player_set(&bus, "Volume", Value::F64(next)).await
+            write_if_same_owner(&owner, self.owner_of(&bus).await, || async {
+                self.player_set(&owner, "Volume", Value::F64(next)).await
+            })
+            .await
         })
     }
 
@@ -335,12 +376,12 @@ impl MediaBackend for MprisZbus {
 
     fn activate_playlist<'a>(&'a self, id: &'a str) -> BoxFuture<'a, Result<(), MediaError>> {
         Box::pin(async move {
-            let bus = self.active_player().await?.ok_or(MediaError::NoPlayer)?;
+            let (_, owner) = self.selected_owner().await?;
             let path =
                 OwnedObjectPath::try_from(id).map_err(|e| MediaError::Backend(e.to_string()))?;
             self.conn
                 .call_method(
-                    Some(bus.as_str()),
+                    Some(owner.as_str()),
                     MPRIS_PATH,
                     Some(PLAYLISTS_IFACE),
                     "ActivatePlaylist",
@@ -348,19 +389,19 @@ impl MediaBackend for MprisZbus {
                 )
                 .await
                 .map(|_| ())
-                .map_err(|e| MediaError::Backend(e.to_string()))
+                .map_err(map_mutation_method_error)
         })
     }
 
     fn seek(&self, offset: Duration, forward: bool) -> BoxFuture<'_, Result<(), MediaError>> {
         Box::pin(async move {
-            let bus = self.active_player().await?.ok_or(MediaError::NoPlayer)?;
+            let (_, owner) = self.selected_owner().await?;
             let micros = offset.as_micros().min(i64::MAX as u128) as i64;
             let signed = if forward { micros } else { -micros };
             // Player.Seek(Offset: x)
             self.conn
                 .call_method(
-                    Some(bus.as_str()),
+                    Some(owner.as_str()),
                     MPRIS_PATH,
                     Some(PLAYER_IFACE),
                     "Seek",
@@ -368,7 +409,7 @@ impl MediaBackend for MprisZbus {
                 )
                 .await
                 .map(|_| ())
-                .map_err(|e| MediaError::Backend(e.to_string()))
+                .map_err(map_mutation_method_error)
         })
     }
 
@@ -378,12 +419,12 @@ impl MediaBackend for MprisZbus {
         track_id: Option<&'a str>,
     ) -> BoxFuture<'a, Result<(), MediaError>> {
         Box::pin(async move {
-            let bus = self.active_player().await?.ok_or(MediaError::NoPlayer)?;
+            let (_, owner) = self.selected_owner().await?;
             // Resolve the track id: prefer the caller's, else read it fresh.
             let tid = match track_id {
                 Some(t) => t.to_string(),
                 None => {
-                    let props = self.player_props(&bus).await?;
+                    let props = self.player_props_for_mutation(&owner).await?;
                     trackid_of(&props)
                         .ok_or_else(|| MediaError::Backend("no trackid for SetPosition".into()))?
                 }
@@ -394,7 +435,7 @@ impl MediaBackend for MprisZbus {
             // Player.SetPosition(TrackId: o, Position: x)
             self.conn
                 .call_method(
-                    Some(bus.as_str()),
+                    Some(owner.as_str()),
                     MPRIS_PATH,
                     Some(PLAYER_IFACE),
                     "SetPosition",
@@ -402,15 +443,15 @@ impl MediaBackend for MprisZbus {
                 )
                 .await
                 .map(|_| ())
-                .map_err(|e| MediaError::Backend(e.to_string()))
+                .map_err(map_mutation_method_error)
         })
     }
 
     fn set_volume(&self, level: u8) -> BoxFuture<'_, Result<(), MediaError>> {
         Box::pin(async move {
-            let bus = self.active_player().await?.ok_or(MediaError::NoPlayer)?;
+            let (_, owner) = self.selected_owner().await?;
             let v = (level.min(100) as f64) / 100.0;
-            self.player_set(&bus, "Volume", Value::F64(v)).await
+            self.player_set(&owner, "Volume", Value::F64(v)).await
         })
     }
 
@@ -484,13 +525,27 @@ impl MediaBackend for MprisZbus {
 
     fn play_queue_item<'a>(&'a self, id: &'a str) -> BoxFuture<'a, Result<(), MediaError>> {
         Box::pin(async move {
-            let bus = self.active_player().await?.ok_or(MediaError::NoPlayer)?;
+            let (_, owner) = self.selected_owner().await?;
             let path =
                 OwnedObjectPath::try_from(id).map_err(|e| MediaError::Backend(e.to_string()))?;
+            let proxy = self.props_proxy(&owner).await?;
+            let iface = InterfaceName::try_from(TRACKLIST_IFACE)
+                .map_err(|e| MediaError::Backend(e.to_string()))?;
+            let tracks_value = proxy
+                .get(iface, "Tracks")
+                .await
+                .map_err(map_mutation_fdo_error)?;
+            let tracks: Vec<OwnedObjectPath> =
+                Vec::try_from(tracks_value).map_err(|e| MediaError::Backend(e.to_string()))?;
+            if !queue_item_is_in_tracklist(&tracks, &path) {
+                return Err(MediaError::Stale(
+                    "queue item is not in the current player's track list".into(),
+                ));
+            }
             // TrackList.GoTo(TrackId: o)
             self.conn
                 .call_method(
-                    Some(bus.as_str()),
+                    Some(owner.as_str()),
                     MPRIS_PATH,
                     Some(TRACKLIST_IFACE),
                     "GoTo",
@@ -498,21 +553,24 @@ impl MediaBackend for MprisZbus {
                 )
                 .await
                 .map(|_| ())
-                .map_err(|e| MediaError::Backend(e.to_string()))
+                .map_err(map_mutation_method_error)
         })
     }
 
     fn toggle_fullscreen(&self) -> BoxFuture<'_, Result<(), MediaError>> {
         Box::pin(async move {
-            let bus = self.active_player().await?.ok_or(MediaError::NoPlayer)?;
+            let (bus, owner) = self.selected_owner().await?;
             // Root MediaPlayer2.Fullscreen (writable when CanSetFullscreen); read the
             // current value and set its inverse so the op is a self-contained toggle.
-            let proxy = self.props_proxy(&bus).await?;
+            let proxy = self.props_proxy(&owner).await?;
             let iface = InterfaceName::try_from(ROOT_IFACE)
                 .map_err(|e| MediaError::Backend(e.to_string()))?;
             // A failed or unparseable read must not be turned into `false` and
             // written back as `true`.
             let read = proxy.get(iface.clone(), "Fullscreen").await.map_err(|e| {
+                if is_owner_gone_fdo_error(&e) {
+                    return map_mutation_fdo_error(e);
+                }
                 let message = format!("read Fullscreen: {e}");
                 if is_missing_property_error(&e) {
                     MediaError::Unsupported(message)
@@ -522,10 +580,20 @@ impl MediaBackend for MprisZbus {
             })?;
             let cur = Result::ok(bool::try_from(read));
             let next = toggled_fullscreen(cur)?;
-            proxy
-                .set(iface, "Fullscreen", Value::Bool(next))
-                .await
-                .map_err(|e| MediaError::Backend(e.to_string()))
+            let proxy = &proxy;
+            write_fullscreen_if_same_owner(
+                &owner,
+                self.owner_of(&bus).await,
+                iface,
+                next,
+                |iface, value| async move {
+                    proxy
+                        .set(iface, "Fullscreen", Value::Bool(value))
+                        .await
+                        .map_err(map_mutation_fdo_error)
+                },
+            )
+            .await
         })
     }
 
@@ -606,6 +674,80 @@ fn toggled_fullscreen(current: Option<bool>) -> Result<bool, MediaError> {
     current
         .map(|c| !c)
         .ok_or_else(|| MediaError::Backend("Fullscreen state unreadable".to_string()))
+}
+
+fn queue_item_is_in_tracklist(tracks: &[OwnedObjectPath], path: &OwnedObjectPath) -> bool {
+    tracks.iter().any(|track| track == path)
+}
+
+async fn write_fullscreen_if_same_owner<W, Fut>(
+    observed: &str,
+    current: Result<String, MediaError>,
+    iface: InterfaceName<'static>,
+    value: bool,
+    write: W,
+) -> Result<(), MediaError>
+where
+    W: FnOnce(InterfaceName<'static>, bool) -> Fut,
+    Fut: Future<Output = Result<(), MediaError>>,
+{
+    write_if_same_owner(observed, current, || write(iface, value)).await
+}
+
+async fn write_if_same_owner<W, Fut>(
+    observed: &str,
+    current: Result<String, MediaError>,
+    write: W,
+) -> Result<(), MediaError>
+where
+    W: FnOnce() -> Fut,
+    Fut: Future<Output = Result<(), MediaError>>,
+{
+    let current = current?;
+    if current != observed {
+        return Err(MediaError::Stale(
+            "changed owner between read and write; nothing was written".into(),
+        ));
+    }
+    write().await
+}
+
+fn is_owner_gone_name(name: &str) -> bool {
+    matches!(
+        name,
+        "org.freedesktop.DBus.Error.ServiceUnknown" | "org.freedesktop.DBus.Error.NameHasNoOwner"
+    )
+}
+
+fn map_mutation_method_error(error: zbus::Error) -> MediaError {
+    if is_owner_gone_method_error(&error) {
+        MediaError::Stale(format!("selected player owner disappeared: {error}"))
+    } else {
+        MediaError::Backend(error.to_string())
+    }
+}
+
+fn is_owner_gone_method_error(error: &zbus::Error) -> bool {
+    match error {
+        zbus::Error::MethodError(name, _, _) => is_owner_gone_name(name.as_str()),
+        _ => false,
+    }
+}
+
+fn map_mutation_fdo_error(error: zbus::fdo::Error) -> MediaError {
+    if is_owner_gone_fdo_error(&error) {
+        MediaError::Stale(format!("selected player owner disappeared: {error}"))
+    } else {
+        MediaError::Backend(error.to_string())
+    }
+}
+
+fn is_owner_gone_fdo_error(error: &zbus::fdo::Error) -> bool {
+    match error {
+        zbus::fdo::Error::ServiceUnknown(_) | zbus::fdo::Error::NameHasNoOwner(_) => true,
+        zbus::fdo::Error::ZBus(inner) => is_owner_gone_method_error(inner),
+        _ => false,
+    }
 }
 
 fn is_missing_property_error(error: &zbus::fdo::Error) -> bool {
@@ -863,6 +1005,118 @@ fn caps_from_props(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn owner_change_between_read_and_write_refuses_without_writing() {
+        let writes = std::sync::atomic::AtomicUsize::new(0);
+        let result =
+            futures::executor::block_on(write_if_same_owner(":1.7", Ok(":1.9".into()), || async {
+                writes.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Ok(())
+            }));
+        assert!(matches!(result, Err(MediaError::Stale(_))));
+        assert_eq!(writes.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn same_owner_writes_once() {
+        let writes = std::sync::atomic::AtomicUsize::new(0);
+        let result =
+            futures::executor::block_on(write_if_same_owner(":1.7", Ok(":1.7".into()), || async {
+                writes.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Ok(())
+            }));
+        assert_eq!(result, Ok(()));
+        assert_eq!(writes.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn owner_lookup_failure_refuses_without_writing() {
+        for failure in [
+            MediaError::Stale("owner gone".into()),
+            MediaError::Unavailable("bus lookup failed".into()),
+        ] {
+            let writes = std::sync::atomic::AtomicUsize::new(0);
+            let result = futures::executor::block_on(write_if_same_owner(
+                ":1.7",
+                Err(failure.clone()),
+                || async {
+                    writes.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    Ok(())
+                },
+            ));
+            assert_eq!(result, Err(failure));
+            assert_eq!(writes.load(std::sync::atomic::Ordering::SeqCst), 0);
+        }
+    }
+
+    #[test]
+    fn owner_gone_error_names_are_stale() {
+        assert!(is_owner_gone_name(
+            "org.freedesktop.DBus.Error.ServiceUnknown"
+        ));
+        assert!(is_owner_gone_name(
+            "org.freedesktop.DBus.Error.NameHasNoOwner"
+        ));
+        assert!(!is_owner_gone_name(
+            "org.freedesktop.DBus.Error.UnknownProperty"
+        ));
+        assert!(!is_owner_gone_name(
+            "org.freedesktop.DBus.Error.AccessDenied"
+        ));
+        assert!(matches!(
+            map_mutation_fdo_error(zbus::fdo::Error::NameHasNoOwner("x".into())),
+            MediaError::Stale(_)
+        ));
+        assert!(matches!(
+            map_mutation_fdo_error(zbus::fdo::Error::ServiceUnknown("x".into())),
+            MediaError::Stale(_)
+        ));
+        assert!(matches!(
+            map_mutation_fdo_error(zbus::fdo::Error::AccessDenied("x".into())),
+            MediaError::Backend(_)
+        ));
+    }
+
+    #[test]
+    fn queue_item_membership_requires_exact_tracklist_path() {
+        let present = OwnedObjectPath::try_from("/org/mpris/MediaPlayer2/Track/1").unwrap();
+        let absent = OwnedObjectPath::try_from("/org/mpris/MediaPlayer2/Track/2").unwrap();
+        let tracks = vec![present.clone()];
+
+        for (path, expected) in [(&present, true), (&absent, false)] {
+            assert_eq!(queue_item_is_in_tracklist(&tracks, path), expected);
+        }
+        assert!(!queue_item_is_in_tracklist(&[], &present));
+    }
+
+    #[test]
+    fn fullscreen_property_uses_root_interface() {
+        let seen_iface = std::cell::RefCell::new(None);
+        let result = futures::executor::block_on(write_fullscreen_if_same_owner(
+            ":1.7",
+            Ok(":1.7".into()),
+            InterfaceName::try_from(ROOT_IFACE).unwrap(),
+            true,
+            |iface, value| {
+                *seen_iface.borrow_mut() = Some((iface.as_str().to_string(), value));
+                async { Ok(()) }
+            },
+        ));
+        assert_eq!(result, Ok(()));
+        assert_eq!(
+            seen_iface.into_inner(),
+            Some((ROOT_IFACE.to_string(), true))
+        );
+    }
+
+    #[test]
+    fn media_error_stale_display() {
+        assert_eq!(
+            MediaError::Stale("x".into()).to_string(),
+            "media player changed: x"
+        );
+    }
 
     #[test]
     fn unsigned_media_duration_cannot_wrap_negative() {
