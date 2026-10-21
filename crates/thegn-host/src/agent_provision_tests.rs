@@ -50,7 +50,7 @@ fn provision_guard_commit_never_destroys() {
 }
 
 #[test]
-fn provision_guard_destroy_failure_is_logged_not_panicking() {
+fn provision_guard_destroy_failure_does_not_panic() {
     let guard = ProvisionedSandbox::new(
         "sandbox-created-here".to_string(),
         Box::new(|_| anyhow::bail!("destroy failed")),

@@ -1179,10 +1179,11 @@ pub fn build_vpn_spec(cfg: &VpnConfig, name: &str, profile: SandboxProfile) -> O
     })
 }
 
-/// Refuse a tunnel-only VPN request until the runtime can enforce that no
-/// direct egress route exists beside the VPN tunnel.
+/// Refusal message for a tunnel-only VPN request that cannot be enforced.
 pub const TUNNEL_ONLY_REFUSAL: &str = "sandbox profile 'sealed-tunnel' promises the VPN tunnel is the only network route, but thegn cannot enforce a tunnel-only datapath yet (direct egress would remain possible beside the sidecar or proxy); refusing to launch. Use profile 'hardened' with [sandbox.vpn] for a tunnel that is not exclusive, or 'sealed' for no network.";
 
+/// Refuse a tunnel-only VPN request until the runtime can enforce that no
+/// direct egress route exists beside the VPN tunnel.
 pub fn tunnel_admission(spec: &SandboxSpec) -> Result<(), EnterError> {
     if spec.vpn.as_ref().is_some_and(|vpn| vpn.tunnel_only) {
         return Err(refusal(
