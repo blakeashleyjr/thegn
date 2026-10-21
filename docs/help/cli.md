@@ -179,8 +179,10 @@ collapse/pin state, and dispatch ledger (including notes). Active dispatch
 rows (queued, spawning, running, waiting for a human, or PR open) arrive as
 `abandoned` with a `migrated while <status>: not resumed` note; every row's
 artifact and chunk paths are dropped, so work is neither resumed nor
-re-dispatched under the target profile. Pane commands, scrollback, reports, and notes are opaque text and are
-carried unchanged, but never printed by the audit. Named global layouts,
+re-dispatched under the target profile. Pane commands, scrollback, and reports
+are opaque text and are carried unchanged; notes are carried unchanged apart
+from the migration prefix on parked rows. These values are never printed by
+the audit. Named global layouts,
 global caches, transports, git files/objects, branches, and worktree disk
 locations are not moved. Neither profile configuration nor credentials,
 tokens, identities, accounts, pairings, or secrets are read or copied.
