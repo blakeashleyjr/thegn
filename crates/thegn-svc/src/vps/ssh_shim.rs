@@ -336,12 +336,25 @@ pub fn control_socket_path_in(
     key_path: &std::path::Path,
 ) -> Option<PathBuf> {
     if let Err(error) = thegn_core::fsperm::ensure_private_dir(dir) {
-        tracing::warn!(target: "thegn::ssh", dir = %dir.display(), error = %error, "ControlMaster directory refused; connecting without multiplexing");
+        static WARN_ONCE: std::sync::Once = std::sync::Once::new();
+        WARN_ONCE.call_once(|| {
+            tracing::warn!(target: "thegn::ssh", dir = %dir.display(), error = %error, "ControlMaster directory refused; connecting without multiplexing");
+        });
         return None;
     }
+    let Some(template) = control_template(dir, key_path) else {
+        static WARN_ONCE: std::sync::Once = std::sync::Once::new();
+        WARN_ONCE.call_once(|| {
+            tracing::warn!(target: "thegn::ssh", dir = %dir.display(), "ControlMaster socket path too long; connecting without multiplexing");
+        });
+        return None;
+    };
+    Some(template)
+}
+
+fn control_template(dir: &std::path::Path, key_path: &std::path::Path) -> Option<PathBuf> {
     let template = dir.join(format!("cm-{}-%C", control_identity(key_path)));
     if template.as_os_str().len() - 2 + 40 > 100 {
-        tracing::warn!(target: "thegn::ssh", dir = %dir.display(), "ControlMaster socket path too long; connecting without multiplexing");
         return None;
     }
     Some(template)
@@ -511,8 +524,7 @@ mod tests {
             user: "root".into(),
             key_path: "/state/ssh/sprite_ed25519".into(),
         };
-        let temp = tempfile::tempdir().unwrap();
-        let control = control_socket_path_in(&temp.path().join("sock"), &shim.key_path).unwrap();
+        let control = control_template(std::path::Path::new("/r/tg-ssh"), &shim.key_path).unwrap();
         let argv = shim.base_argv_with(Some(&control));
         assert_eq!(argv[0], "ssh");
         assert!(argv.contains(&"BatchMode=yes".to_string()));
@@ -542,15 +554,14 @@ mod tests {
 
     #[test]
     fn control_master_namespace_includes_the_identity_path() {
-        let temp = tempfile::tempdir().unwrap();
-        let dir = temp.path().join("sock");
-        let old = control_socket_path_in(&dir, std::path::Path::new("/state/ssh/key")).unwrap();
+        let dir = std::path::Path::new("/r/tg-ssh");
+        let old = control_template(dir, std::path::Path::new("/state/ssh/key")).unwrap();
         let replacement =
-            control_socket_path_in(&dir, std::path::Path::new("/state/ssh/key.next-123")).unwrap();
+            control_template(dir, std::path::Path::new("/state/ssh/key.next-123")).unwrap();
         assert_ne!(old, replacement);
         assert_eq!(
             old,
-            control_socket_path_in(&dir, std::path::Path::new("/state/ssh/key")).unwrap()
+            control_template(dir, std::path::Path::new("/state/ssh/key")).unwrap()
         );
         assert!(old.to_string_lossy().ends_with("-%C"));
     }
@@ -598,12 +609,17 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let dir = temp.path().join("sock");
         let key = std::path::Path::new("/state/ssh/key");
-        let first = control_socket_path_in(&dir, key).unwrap();
-        let second = control_socket_path_in(&dir, key).unwrap();
-        let other = control_socket_path_in(&dir, std::path::Path::new("/state/ssh/other")).unwrap();
+        let first = control_template(std::path::Path::new("/r/tg-ssh"), key).unwrap();
+        let second = control_template(std::path::Path::new("/r/tg-ssh"), key).unwrap();
+        let other = control_template(
+            std::path::Path::new("/r/tg-ssh"),
+            std::path::Path::new("/state/ssh/other"),
+        )
+        .unwrap();
         assert_eq!(first, second);
         assert_ne!(first, other);
         assert!(first.to_string_lossy().ends_with("-%C"));
+        assert!(control_socket_path_in(&dir, key).is_some());
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
@@ -616,9 +632,8 @@ mod tests {
 
     #[test]
     fn overlong_socket_template_is_refused() {
-        let temp = tempfile::tempdir().unwrap();
-        let dir = temp.path().join("d".repeat(90));
-        assert!(control_socket_path_in(&dir, std::path::Path::new("/key")).is_none());
+        let dir = PathBuf::from("d".repeat(90));
+        assert!(control_template(&dir, std::path::Path::new("/key")).is_none());
     }
 
     #[test]
