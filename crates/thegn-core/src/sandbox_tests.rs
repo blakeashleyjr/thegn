@@ -4732,3 +4732,6 @@ fn sealed_systemd_enter_is_refused_strict() {
             if refusal.class == RefusalClass::StrictUnsupported
     ));
 }
+
+#[path = "sandbox_evidence_tests.rs"]
+mod evidence;
