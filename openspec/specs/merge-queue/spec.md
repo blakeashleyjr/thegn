@@ -706,3 +706,21 @@ authority; cleanup's filter policy MUST NOT be relaxed as a consequence.
 This does not claim supervision of detached operator-filter descendants,
 recursive submodule preparation or byte-for-byte immutability after authorized
 filter/setup transformations. Tracked mtimes may change on every attempt.
+
+### Requirement: One operator transition table for retry, remove and clear
+
+Merge-queue operators SHALL follow one transition table: claimed rows refuse
+every operator operation; retry re-queues only held statuses; remove and clear
+delete any unclaimed row. Clear SHALL remove every unclaimed row in the repo and
+report each claimed row it keeps.
+
+#### Scenario: Retry refuses a ready row
+
+- **WHEN** an operator retries an unclaimed row with ready status
+- **THEN** the operation is refused and the row remains unchanged
+
+#### Scenario: Clear removes unclaimed rows and reports a claimed row
+
+- **WHEN** a repo clear encounters one claimed row among unclaimed rows
+- **THEN** it removes every unclaimed row and retains the claimed row
+- **AND** it reports the removed count and the worktree it kept
