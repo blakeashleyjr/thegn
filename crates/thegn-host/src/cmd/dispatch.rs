@@ -484,20 +484,23 @@ pub fn run(cfg: &Config, action: Action) -> Result<()> {
             admin,
             why,
             json,
-        } => claim(
-            cfg,
-            &issue_id,
-            &worktree_path,
-            &agent_name,
-            &stage,
-            artifact.as_deref(),
-            parent,
-            chunk.as_deref(),
-            allow_duplicate.as_deref(),
-            allow_scope_overlap.as_deref(),
-            lead_proof(lease.as_deref(), owner.as_deref(), admin, why.as_deref()),
-            json,
-        ),
+        } => {
+            let (issue_id, worktree_path) = dispatch_identity(&issue_id, &worktree_path)?;
+            claim(
+                cfg,
+                &issue_id,
+                &worktree_path,
+                &agent_name,
+                &stage,
+                artifact.as_deref(),
+                parent,
+                chunk.as_deref(),
+                allow_duplicate.as_deref(),
+                allow_scope_overlap.as_deref(),
+                lead_proof(lease.as_deref(), owner.as_deref(), admin, why.as_deref()),
+                json,
+            )
+        }
         Action::Lease {
             action,
             owner,
@@ -522,6 +525,7 @@ pub fn run(cfg: &Config, action: Action) -> Result<()> {
             why,
             json,
         } => {
+            let (issue_id, worktree_path) = dispatch_identity(&issue_id, &worktree_path)?;
             let db = Db::open()?;
             let proof = lead_proof(lease.as_deref(), owner.as_deref(), admin, why.as_deref());
             if let Some(chunk_path) = chunk.as_deref() {
@@ -890,7 +894,10 @@ fn prepare_chunk_admission(
         .map_err(|e| anyhow::anyhow!("chunk file {chunk_path} is not a valid scope ({e})"))?;
     let mut siblings = Vec::new();
     for row in db.admission_rows(issue_id, worktree)? {
-        if row.issue_id != issue_id || row.worktree_path != worktree || !row.status.is_active() {
+        if !thegn_core::pipeline_identity::same_issue(&row.issue_id, issue_id)
+            || row.worktree_path != worktree
+            || !row.status.is_active()
+        {
             continue;
         }
         let Some(path) = row
@@ -932,6 +939,27 @@ fn lead_proof<'a>(
     } else {
         LeadProof::Unbound
     }
+}
+
+pub(crate) fn dispatch_identity(issue_id: &str, worktree: &str) -> Result<(String, String)> {
+    let issue =
+        thegn_core::pipeline_identity::canonical_issue_id(issue_id).map_err(anyhow::Error::new)?;
+    let canonical = std::fs::canonicalize(worktree).map_err(|_| {
+        anyhow::anyhow!(
+            "worktree {worktree:?} does not exist on this host; a pipeline row needs a local git worktree root"
+        )
+    })?;
+    let root = thegn_core::repo::worktree_root_for_cwd(&canonical);
+    if root.as_deref() != Some(canonical.as_path()) {
+        if let Some(root) = root {
+            anyhow::bail!(
+                "worktree {worktree:?} resolves inside git worktree root {}; a pipeline row needs the root",
+                root.display()
+            );
+        }
+        anyhow::bail!("worktree {worktree:?} is not the root of a local git worktree");
+    }
+    Ok((issue, canonical.to_string_lossy().into_owned()))
 }
 
 #[cfg(test)]
@@ -5623,6 +5651,42 @@ mod tests {
                 "thegn", "dispatch", "put", "linear:X", "/w", "a", "--admin", "--why", "manual"
             ])
             .is_ok()
+        );
+    }
+
+    #[test]
+    fn dispatch_identity_canonicalizes_redundant_worktree_spelling() {
+        let (_dir, root) = git_repo("idwt");
+        std::fs::create_dir_all(root.join("sub")).unwrap();
+        let spelling = root.join("sub").join("..");
+        let (issue, worktree) =
+            dispatch_identity(" LINEAR:THE-74", spelling.to_str().unwrap()).unwrap();
+        assert_eq!(issue, "linear:THE-74");
+        assert_eq!(
+            std::path::PathBuf::from(worktree),
+            std::fs::canonicalize(root).unwrap()
+        );
+    }
+
+    #[test]
+    fn dispatch_identity_refuses_missing_and_subdirectory_worktrees() {
+        let (_dir, root) = git_repo("idwt-refuse");
+        std::fs::create_dir_all(root.join("sub")).unwrap();
+        let missing = root.join("missing");
+        let missing_error = dispatch_identity("linear:X-1", missing.to_str().unwrap())
+            .unwrap_err()
+            .to_string();
+        assert!(
+            missing_error.contains(&missing.display().to_string()),
+            "{missing_error}"
+        );
+        let subdirectory = root.join("sub");
+        let subdirectory_error = dispatch_identity("linear:X-1", subdirectory.to_str().unwrap())
+            .unwrap_err()
+            .to_string();
+        assert!(
+            subdirectory_error.contains(&subdirectory.display().to_string()),
+            "{subdirectory_error}"
         );
     }
 }
