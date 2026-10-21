@@ -8,6 +8,7 @@ use thegn_core::theme::Hue;
 use crate::seg::{Line, seg};
 
 use super::{PanelRow, SectionCtx, d, g, g2, hue, rule, t};
+use crate::media_watch::MediaHealth;
 use crate::panel::{MediaAction, PanelHit, Section};
 
 const ART_COLS: usize = 18;
@@ -45,10 +46,14 @@ fn detail_rows(
 ) -> Vec<PanelRow> {
     let mut rows = Vec::new();
     let (glyph, tone) = marker(state.state);
-    rows.push(PanelRow::plain(Line::segs(vec![
+    let mut now_playing = vec![
         seg(hue(tone), format!("{glyph} ")),
         seg(t(), state.now_playing()),
-    ])));
+    ];
+    if ctx.ui.media.health == MediaHealth::Degraded {
+        now_playing.push(seg(d(), " stale"));
+    }
+    rows.push(PanelRow::plain(Line::segs(now_playing)));
     if !state.album.is_empty() {
         rows.push(PanelRow::plain(Line::segs(vec![seg(
             d(),
@@ -111,8 +116,13 @@ pub(super) fn content(ctx: &SectionCtx<'_>) -> Vec<PanelRow> {
         } else {
             "enable a local media player to use this panel"
         };
+        let empty_label = if ctx.ui.media.health == MediaHealth::Unavailable {
+            "provider unavailable"
+        } else {
+            "no player"
+        };
         return vec![
-            PanelRow::plain(Line::segs(vec![seg(g2(), "no player")])),
+            PanelRow::plain(Line::segs(vec![seg(g2(), empty_label)])),
             PanelRow::plain(Line::segs(vec![seg(d(), hint)])),
         ];
     };
@@ -285,6 +295,67 @@ mod tests {
             }
             Line::Blank | Line::Fill { .. } => String::new(),
         }
+    }
+
+    #[test]
+    fn degraded_health_marks_the_now_playing_row_stale() {
+        let (model, mut ui) = collection_fixture(0);
+        ui.media.health = MediaHealth::Degraded;
+        let ctx = SectionCtx {
+            model: &model,
+            ui: &ui,
+            cols: 40,
+            rows: 30,
+        };
+        let rows = content(&ctx);
+        let now_playing = rows
+            .iter()
+            .find(|row| line_text(&row.line).contains("track"))
+            .expect("now-playing row should be present");
+        assert!(matches!(
+            &now_playing.line,
+            Line::Segs(segs) if segs.iter().any(|part| part.text == " stale")
+        ));
+    }
+
+    #[test]
+    fn unavailable_health_replaces_the_no_player_row() {
+        let model = crate::chrome::FrameModel::default();
+        let mut ui = crate::panel::PanelUi::default();
+        ui.media.health = MediaHealth::Unavailable;
+        let ctx = SectionCtx {
+            model: &model,
+            ui: &ui,
+            cols: 40,
+            rows: 30,
+        };
+        let rows = content(&ctx);
+        let text = rows
+            .iter()
+            .map(|row| line_text(&row.line))
+            .collect::<Vec<_>>();
+        assert!(text.iter().any(|row| row == "provider unavailable"));
+        assert!(!text.iter().any(|row| row == "no player"));
+    }
+
+    #[test]
+    fn fresh_health_shows_no_stale_marker() {
+        let (model, ui) = collection_fixture(0);
+        let ctx = SectionCtx {
+            model: &model,
+            ui: &ui,
+            cols: 40,
+            rows: 30,
+        };
+        let rows = content(&ctx);
+        let now_playing = rows
+            .iter()
+            .find(|row| line_text(&row.line).contains("track"))
+            .expect("now-playing row should be present");
+        assert!(matches!(
+            &now_playing.line,
+            Line::Segs(segs) if !segs.iter().any(|part| part.text == " stale")
+        ));
     }
 
     #[test]
