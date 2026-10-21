@@ -4331,12 +4331,12 @@ diagnosis_timeout_secs = 3600 # aggregate diagnosis wall-time cap; 0 disables di
 # does it for a single run without editing config.
 require_enqueue = true        # fold only explicitly queued branches
 snapshot_dirty = false        # auto-commit uncommitted worktree work before folding
-regenerate_paths = ["Cargo.lock", "pnpm-lock.yaml", "package-lock.json", "yarn.lock",
-                    "bun.lockb", "poetry.lock", "uv.lock", "Pipfile.lock", "go.sum",
-                    "Gemfile.lock", "composer.lock"]
+regenerate_paths = ["**/Cargo.lock", "**/pnpm-lock.yaml", "**/package-lock.json", "**/yarn.lock",
+                    "**/bun.lockb", "**/poetry.lock", "**/uv.lock", "**/Pipfile.lock", "**/go.sum",
+                    "**/Gemfile.lock", "**/composer.lock"]
                               # conflicts confined to these are "regenerable", not handed off.
-                              # Matched by exact path OR basename. A name costs nothing in a repo
-                              # that doesn't have that file, so the default spans ecosystems.
+                              # Matched by exact repo-relative path; **/name matches that file in any
+                              # directory. A bare name matches only the repo root.
 regenerate_command = ""        # e.g. "cargo update --workspace"; rebuilds regenerate_paths to auto-land them ("" defers instead)
 conflict_handoff = "agent"    # agent | notify | manual — fate of a deferred branch
 #
