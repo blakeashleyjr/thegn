@@ -983,9 +983,6 @@ async fn open_stage(cfg: &Config, client: &ControlClient, d: StageDispatch<'_>) 
     // 6a. Permission-policy admission, BEFORE the claim: a grant the harness
     //     cannot take command-scoped leaves no row and spawns nothing.
     policy_admission(cfg, &agent_name, &stage.name)?;
-    let config_digest =
-        thegn_core::pipeline_launch_digest::stage_launch_digest(cfg, &agent_name, &stage.name)
-            .map_err(anyhow::Error::msg)?;
     // Route the insert through the atomic claim rather than a bare append.
     // This is the path a Lead actually dispatches on, so it is the one that
     // must not race: `dispatch list` -> judgment -> insert is a
@@ -1090,6 +1087,13 @@ async fn open_stage(cfg: &Config, client: &ControlClient, d: StageDispatch<'_>) 
         .map(str::to_string)
         .unwrap_or(parent_artifact);
     let opened = async {
+        // Keep the daemon's configured-agent refusal and the row-closing
+        // behavior for an unknown override. This is deliberately after claim:
+        // resolution failures belong to the named failed roster row.
+        crate::daemon::agent_open::ensure_configured_agent(cfg, &agent_name)?;
+        let config_digest =
+            thegn_core::pipeline_launch_digest::stage_launch_digest(cfg, &agent_name, &stage.name)
+                .map_err(anyhow::Error::msg)?;
         let launch = crate::daemon::stage_launch::mint_launch_id()
             .ok_or_else(|| anyhow::anyhow!("no entropy for a stage launch id"))?;
         let vars = stage_task_vars(

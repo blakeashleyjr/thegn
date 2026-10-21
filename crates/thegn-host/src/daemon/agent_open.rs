@@ -72,6 +72,7 @@ pub(crate) fn resolve(
         .map(str::trim)
         .filter(|s| !s.is_empty())
     {
+        ensure_configured_agent(cfg, launch.agent.trim())?;
         let presented = spec
             .env
             .iter()
@@ -1146,6 +1147,39 @@ mod tests {
                 .to_string()
                 .contains("changed between claim and launch"),
             "got {error}"
+        );
+    }
+
+    #[test]
+    fn stage_digest_unknown_agent_keeps_configured_agent_refusal() {
+        let db = Db::open_memory().expect("in-memory db");
+        let mut config = cfg();
+        config
+            .pipeline
+            .stages
+            .push(thegn_core::config_pipeline::PipelineStage {
+                name: "review".into(),
+                agent: "worker".into(),
+                ..Default::default()
+            });
+        let spec = OpenSpec {
+            env: vec![(
+                thegn_core::pipeline_launch_digest::STAGE_CONFIG_DIGEST_ENV.into(),
+                "0".repeat(64),
+            )],
+            ..OpenSpec::default()
+        };
+        let launch = AgentLaunch {
+            stage: Some("review".into()),
+            ..launch(
+                "pipeline-smoke-agent-that-is-not-configured",
+                "rendered prompt",
+            )
+        };
+        let error = resolve(&config, &db, &spec, &launch, None).expect_err("unknown agent refuses");
+        assert_eq!(
+            error.to_string(),
+            "unknown configured agent `pipeline-smoke-agent-that-is-not-configured`"
         );
     }
 
