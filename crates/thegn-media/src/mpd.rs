@@ -533,6 +533,90 @@ impl Mpd {
         MpdConn::dial(&self.ep).await
     }
 
+    async fn reconcile_loop(
+        &self,
+        target: (u8, &str),
+        previous: (u8, &str),
+        stage: &str,
+        cause: MediaError,
+    ) -> Result<(), MediaError> {
+        let mut conn = match self.conn().await {
+            Ok(conn) => conn,
+            Err(error) => {
+                return self
+                    .restore_loop_after_unreadable(previous, stage, error.to_string(), cause)
+                    .await;
+            }
+        };
+        let observed = match conn.command("status").await {
+            Ok(status) => parse_loop_status(&status).map_err(|error| error.to_string()),
+            Err(error) => Err(error.to_string()),
+        };
+
+        match observed {
+            Ok((repeat, single))
+                if stage != "single" && repeat == target.0 && single == target.1 =>
+            {
+                Ok(())
+            }
+            Ok((repeat, single)) if repeat == previous.0 && single == previous.1 => {
+                Err(MediaError::Backend(format!(
+                    "mpd {stage} update failed; loop mode unchanged: {cause}"
+                )))
+            }
+            Ok((repeat, single)) => {
+                if repeat != previous.0 {
+                    conn.command(&format!("repeat {}", previous.0)).await.map_err(|error| {
+                        MediaError::Backend(format!(
+                            "mpd {stage} update failed; loop mode rollback failed: {cause}; {error}"
+                        ))
+                    })?;
+                }
+                if single != previous.1 {
+                    conn.command(&format!("single {}", previous.1)).await.map_err(|error| {
+                        MediaError::Backend(format!(
+                            "mpd {stage} update failed; loop mode rollback failed: {cause}; {error}"
+                        ))
+                    })?;
+                }
+                Err(MediaError::Backend(format!(
+                    "mpd {stage} update failed; loop mode was rolled back: {cause}"
+                )))
+            }
+            Err(error) => {
+                self.restore_loop_after_unreadable(previous, stage, error, cause)
+                    .await
+            }
+        }
+    }
+
+    async fn restore_loop_after_unreadable(
+        &self,
+        previous: (u8, &str),
+        stage: &str,
+        status_error: String,
+        cause: MediaError,
+    ) -> Result<(), MediaError> {
+        let restore = match self.conn().await {
+            Ok(mut conn) => match conn.command(&format!("repeat {}", previous.0)).await {
+                Ok(_) => conn
+                    .command(&format!("single {}", previous.1))
+                    .await
+                    .map(|_| ()),
+                Err(error) => Err(error),
+            },
+            Err(error) => Err(error),
+        };
+        match restore {
+            Ok(()) => Err(MediaError::Backend(format!(
+                "mpd {stage} update failed; status could not be re-read ({status_error}); restored previous loop mode: {cause}"
+            ))),
+            Err(error) => Err(MediaError::Backend(format!(
+                "mpd {stage} update failed; status could not be re-read ({status_error}); restore failed: {cause}; {error}"
+            ))),
+        }
+    }
+
     fn caps_from_command(&self, name: &str) -> bool {
         self.commands.iter().any(|command| command == name)
     }
@@ -542,6 +626,31 @@ impl Mpd {
         let conn = self.conn().await?;
         Ok(MpdWatch { conn: Some(conn) })
     }
+}
+
+fn parse_loop_status(status: &[Pair]) -> Result<(u8, String), MediaError> {
+    let repeat = match mpd_parse::field(status, "repeat") {
+        Some("0") => 0,
+        Some("1") => 1,
+        other => {
+            return Err(MediaError::Backend(format!(
+                "mpd status has an unknown repeat flag {:?}",
+                other.map(sanitize_diag)
+            )));
+        }
+    };
+    let single = match mpd_parse::field(status, "single") {
+        Some("0") => "0",
+        Some("1") => "1",
+        Some("oneshot") => "oneshot",
+        other => {
+            return Err(MediaError::Backend(format!(
+                "mpd status has an unknown single flag {:?}",
+                other.map(sanitize_diag)
+            )));
+        }
+    };
+    Ok((repeat, single.to_string()))
 }
 
 fn caps_from_commands(commands: &[Pair]) -> MediaCaps {
@@ -646,44 +755,29 @@ impl MediaBackend for Mpd {
     fn set_loop(&self, mode: LoopMode) -> BoxFuture<'_, Result<(), MediaError>> {
         Box::pin(async move {
             let (repeat, single) = match mode {
-                LoopMode::None => (0, 0),
-                LoopMode::Playlist => (1, 0),
-                LoopMode::Track => (1, 1),
+                LoopMode::None => (0, "0"),
+                LoopMode::Playlist => (1, "0"),
+                LoopMode::Track => (1, "1"),
             };
-            let mut c = self.conn().await?;
-            let status = c.command("status").await?;
-            let previous_repeat = match mpd_parse::field(&status, "repeat") {
-                Some("0") => 0,
-                Some("1") => 1,
-                other => {
-                    return Err(MediaError::Backend(format!(
-                        "mpd status has an unknown repeat flag {:?}",
-                        other.map(sanitize_diag)
-                    )));
+            let (previous, stage, cause) = {
+                let mut c = self.conn().await?;
+                let status = c.command("status").await?;
+                let previous = parse_loop_status(&status)?;
+                if let Err(error) = c.command(&format!("repeat {repeat}")).await {
+                    (previous, "repeat", error)
+                } else if let Err(error) = c.command(&format!("single {single}")).await {
+                    (previous, "single", error)
+                } else {
+                    return Ok(());
                 }
             };
-            c.command(&format!("repeat {repeat}")).await?;
-            match c.command(&format!("single {single}")).await {
-                Ok(_) => Ok(()),
-                Err(single_error) => {
-                    let rollback = match self.conn().await {
-                        Ok(mut rollback_conn) => {
-                            rollback_conn
-                                .command(&format!("repeat {previous_repeat}"))
-                                .await
-                        }
-                        Err(rollback_error) => Err(rollback_error),
-                    };
-                    match rollback {
-                        Ok(_) => Err(MediaError::Backend(format!(
-                            "mpd single update failed; repeat was rolled back: {single_error}"
-                        ))),
-                        Err(rollback_error) => Err(MediaError::Backend(format!(
-                            "mpd single update failed and repeat rollback failed: {single_error}; {rollback_error}"
-                        ))),
-                    }
-                }
-            }
+            self.reconcile_loop(
+                (repeat, single),
+                (previous.0, previous.1.as_str()),
+                stage,
+                cause,
+            )
+            .await
         })
     }
     fn volume_step(&self, delta: f64) -> BoxFuture<'_, Result<(), MediaError>> {
@@ -1234,10 +1328,68 @@ mod tests {
                 return;
             }
             let mut r = BufReader::new(r);
-            if let Ok(Some(line)) = read_bounded_line(&mut r, 1024).await {
-                log.lock().unwrap().push(line);
-                if let Err(error) = w.write_all(b"OK\n").await {
+            while let Ok(Some(line)) = read_bounded_line(&mut r, 1024).await {
+                log.lock().unwrap().push(line.clone());
+                let reply = match line.as_str() {
+                    "status" => "repeat: 1\nsingle: 0\nOK\n",
+                    "repeat 0" => "OK\n",
+                    _ => continue,
+                };
+                if let Err(error) = w.write_all(reply.as_bytes()).await {
                     tracing::debug!(target: "thegn::media", %error, "fake MPD rollback response failed");
+                    return;
+                }
+            }
+        });
+        (
+            MpdEndpoint::resolve(&format!("127.0.0.1:{port}"), None).unwrap(),
+            seen,
+        )
+    }
+
+    /// Fake server that applies `repeat 1` but withholds its reply, then reports
+    /// that committed value to the fresh reconciliation connection.
+    async fn repeat_timeout_server() -> (MpdEndpoint, std::sync::Arc<std::sync::Mutex<Vec<String>>>)
+    {
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let log = seen.clone();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            let Ok((sock, _)) = listener.accept().await else {
+                return;
+            };
+            let (r, mut w) = tokio::io::split(sock);
+            if w.write_all(b"OK MPD 0.23.0\n").await.is_err() {
+                return;
+            }
+            let mut r = BufReader::new(r);
+            // Keep the socket open after `repeat 1`; the timeout must come from
+            // the client deadline rather than an early EOF.
+            while let Ok(Some(line)) = read_bounded_line(&mut r, 1024).await {
+                log.lock().unwrap().push(line.clone());
+                if line == "status" && w.write_all(b"repeat: 0\nsingle: 0\nOK\n").await.is_err() {
+                    return;
+                }
+            }
+
+            let Ok((sock, _)) = listener.accept().await else {
+                return;
+            };
+            let (r, mut w) = tokio::io::split(sock);
+            if w.write_all(b"OK MPD 0.23.0\n").await.is_err() {
+                return;
+            }
+            let mut r = BufReader::new(r);
+            while let Ok(Some(line)) = read_bounded_line(&mut r, 1024).await {
+                log.lock().unwrap().push(line.clone());
+                let reply = match line.as_str() {
+                    "status" => "repeat: 1\nsingle: 0\nOK\n",
+                    "repeat 0" => "OK\n",
+                    _ => continue,
+                };
+                if w.write_all(reply.as_bytes()).await.is_err() {
+                    return;
                 }
             }
         });
@@ -1363,6 +1515,7 @@ mod tests {
             "repeat: 0\nsingle: 0\nOK\n",
             "OK\n",
             "ACK [4@0] {single} denied\n",
+            "repeat: 1\nsingle: 0\nOK\n",
             "OK\n",
         ])
         .await;
@@ -1379,6 +1532,7 @@ mod tests {
                 "status".to_string(),
                 "repeat 1".to_string(),
                 "single 1".to_string(),
+                "status".to_string(),
                 "repeat 0".to_string(),
             ]
         );
@@ -1404,6 +1558,7 @@ mod tests {
                 "status".to_string(),
                 "repeat 1".to_string(),
                 "single 1".to_string(),
+                "status".to_string(),
                 "repeat 0".to_string(),
             ]
         );
@@ -1422,6 +1577,166 @@ mod tests {
             Err(MediaError::Backend(_))
         ));
         assert_eq!(seen.lock().unwrap().clone(), vec!["status".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn set_loop_repeat_ack_with_unchanged_status_reports_unchanged() {
+        let (ep, seen) = scripted_server(vec![
+            "repeat: 0\nsingle: 0\nOK\n",
+            "ACK [4@0] {repeat} denied\n",
+            "repeat: 0\nsingle: 0\nOK\n",
+        ])
+        .await;
+        let m = Mpd {
+            ep,
+            caps: MediaCaps::default(),
+            commands: vec![],
+        };
+        let error = m.set_loop(LoopMode::Track).await.unwrap_err();
+        assert!(error.to_string().contains("unchanged"), "{error}");
+        assert_eq!(
+            seen.lock().unwrap().clone(),
+            vec![
+                "status".to_string(),
+                "repeat 1".to_string(),
+                "status".to_string(),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn set_loop_repeat_timeout_that_committed_is_rolled_back() {
+        let (ep, seen) = repeat_timeout_server().await;
+        let m = Mpd {
+            ep,
+            caps: MediaCaps::default(),
+            commands: vec![],
+        };
+        let error = m.set_loop(LoopMode::Track).await.unwrap_err();
+        assert!(error.to_string().contains("timed out"), "{error}");
+        assert!(error.to_string().contains("rolled back"), "{error}");
+        assert_eq!(
+            seen.lock().unwrap().clone(),
+            vec![
+                "status".to_string(),
+                "repeat 1".to_string(),
+                "status".to_string(),
+                "repeat 0".to_string(),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn set_loop_single_ack_preserves_oneshot_and_restores_repeat() {
+        let (ep, seen) = scripted_server(vec![
+            "repeat: 0\nsingle: oneshot\nOK\n",
+            "OK\n",
+            "ACK [4@0] {single} denied\n",
+            "repeat: 1\nsingle: 0\nOK\n",
+            "OK\n",
+            "OK\n",
+        ])
+        .await;
+        let m = Mpd {
+            ep,
+            caps: MediaCaps::default(),
+            commands: vec![],
+        };
+        let error = m.set_loop(LoopMode::Playlist).await.unwrap_err();
+        assert!(error.to_string().contains("rolled back"), "{error}");
+        assert!(error.to_string().contains("single} denied"), "{error}");
+        assert_eq!(
+            seen.lock().unwrap().clone(),
+            vec![
+                "status".to_string(),
+                "repeat 1".to_string(),
+                "single 0".to_string(),
+                "status".to_string(),
+                "repeat 0".to_string(),
+                "single oneshot".to_string(),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn set_loop_unreadable_status_reports_cause_and_stops_after_failed_restore_repeat() {
+        let (ep, seen) = scripted_server(vec![
+            "repeat: 0\nsingle: 0\nOK\n",
+            "OK\n",
+            "ACK [4@0] {single} denied\n",
+            "ACK [4@0] {status} unavailable\n",
+            "ACK [4@0] {repeat} denied\n",
+        ])
+        .await;
+        let m = Mpd {
+            ep,
+            caps: MediaCaps::default(),
+            commands: vec![],
+        };
+        let error = m.set_loop(LoopMode::Track).await.unwrap_err();
+        assert!(
+            error.to_string().contains("status could not be re-read"),
+            "{error}"
+        );
+        assert!(error.to_string().contains("unavailable"), "{error}");
+        assert!(error.to_string().contains("single} denied"), "{error}");
+        assert_eq!(
+            seen.lock().unwrap().clone(),
+            vec![
+                "status".to_string(),
+                "repeat 1".to_string(),
+                "single 1".to_string(),
+                "status".to_string(),
+                "repeat 0".to_string(),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn set_loop_with_unknown_single_does_not_mutate() {
+        let (ep, seen) = scripted_server(vec!["repeat: 0\nsingle: 2\nOK\n"]).await;
+        let m = Mpd {
+            ep,
+            caps: MediaCaps::default(),
+            commands: vec![],
+        };
+        assert!(matches!(
+            m.set_loop(LoopMode::Track).await,
+            Err(MediaError::Backend(_))
+        ));
+        assert_eq!(seen.lock().unwrap().clone(), vec!["status".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn set_loop_single_failure_observing_target_restores_and_reports_cause() {
+        let (ep, seen) = scripted_server(vec![
+            "repeat: 0\nsingle: 0\nOK\n",
+            "OK\n",
+            "ACK [4@0] {single} late\n",
+            "repeat: 1\nsingle: 1\nOK\n",
+            "OK\n",
+            "OK\n",
+        ])
+        .await;
+        let m = Mpd {
+            ep,
+            caps: MediaCaps::default(),
+            commands: vec![],
+        };
+        let error = m.set_loop(LoopMode::Track).await.unwrap_err();
+        assert!(error.to_string().contains("single} late"), "{error}");
+        assert!(error.to_string().contains("rolled back"), "{error}");
+        assert_eq!(
+            seen.lock().unwrap().clone(),
+            vec![
+                "status".to_string(),
+                "repeat 1".to_string(),
+                "single 1".to_string(),
+                "status".to_string(),
+                "repeat 0".to_string(),
+                "single 0".to_string(),
+            ]
+        );
     }
 
     #[tokio::test]
