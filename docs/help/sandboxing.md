@@ -404,9 +404,11 @@ floor, available class, and how to satisfy it. The refusal names the opt-outs:
 default floor was not applied. It also prints `containment` and `file access`
 lines, including a line such as
 `requested <scope> — NOT ENFORCED on <backend>: <note>` when file access is not
-enforced. The floor also applies to standalone terminal tabs. If a terminal
-requests a backend with no runtime, it is refused under the default floor or
-an explicit `fail` floor; an explicit floor with `degrade` launches it
+enforced. It now prints separate `requested`, `resolved`, and `enforced`
+isolation lines, and `thegn doctor --json` includes the same layers in an
+`isolation` object. The floor also applies to standalone terminal tabs. If a
+terminal requests a backend with no runtime, it is refused under the default
+floor or an explicit `fail` floor; an explicit floor with `degrade` launches it
 labelled degraded. Explicit `host`/`none`/empty backend choices and ssh/mosh
 terminals are unchanged. A managed provider
 placement is out of scope (reported `provider-managed`, never counted as a
