@@ -196,6 +196,11 @@ restart. A sync that fails leaves the cache alone — you get yesterday's calend
 rather than an empty one — and a provider that returns an empty calendar when
 thegn has events cached is treated as suspect rather than believed.
 
+Accounts sync independently: up to four network accounts (subscribed links and
+CalDAV) are fetched at once, while command plugins run one at a time. Each
+account's events appear as soon as it finishes, so one slow or unreachable
+server does not hold up the others.
+
 For a recurring event, an override with its `RECURRENCE-ID` replaces the
 generated occurrence, even if it moves to another day; a cancelled override
 hides that occurrence. Events at the same time are listed in a stable order.
