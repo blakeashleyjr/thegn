@@ -14002,6 +14002,7 @@ async fn event_loop<T: Terminal>(
                     want_pr_refresh |= !skip_net;
                     want_model_refresh = true;
                 }
+                RefreshKind::PrActionStatus(status) => model.status = status,
                 RefreshKind::Issues => {
                     want_issue_refresh |= !skip_net;
                     want_model_refresh = true;
