@@ -825,7 +825,7 @@ fn map_env(pairs: &[(&str, &str)]) -> MapEnv {
 
 #[test]
 fn sandbox_profile_defaults_and_env_overlay() {
-    // Safe-by-default: the worktree shell is hardened.
+    // Safe-by-default: the worktree shell uses the standard profile.
     let c = SandboxConfig::default();
     assert_eq!(c.profile, SandboxProfile::Hardened);
 
@@ -836,6 +836,24 @@ fn sandbox_profile_defaults_and_env_overlay() {
     let mut base = SandboxConfig::default();
     o.sandbox.apply(&mut base);
     assert_eq!(base.profile, SandboxProfile::Open);
+}
+
+#[test]
+fn sandbox_profile_standard_is_canonical_and_old_names_alias() {
+    assert_eq!(SandboxProfile::Hardened.as_str(), "standard");
+    assert_eq!(SandboxProfile::default().to_string(), "standard");
+    for name in ["standard", "hardened", "guarded"] {
+        assert_eq!(
+            SandboxProfile::from_str_validated(name),
+            Ok(SandboxProfile::Hardened)
+        );
+    }
+
+    let overlay = env_overlay(&map_env(&[("THEGN_SANDBOX_PROFILE", "hardened")]));
+    assert_eq!(overlay.sandbox.profile, Some(SandboxProfile::Hardened));
+
+    let config: Config = toml::from_str("[sandbox]\nprofile = \"hardened\"\n").unwrap();
+    assert_eq!(config.sandbox.profile, SandboxProfile::Hardened);
 }
 
 #[test]
