@@ -604,8 +604,8 @@ fn sync_accounts_with_generation(
     if !router.is_configured() {
         return false;
     }
-    // Each account's page is applied and dropped inside the sink, releasing its
-    // share of the global admission budget before the next account is fetched.
+    // Results arrive in completion order under per-class caps. Each page is
+    // still applied and dropped inside the sink, releasing its admission share.
     let mut changed = false;
     let network_accounts = network_account_names(&accounts);
     let mut connectivity = ConnectivityEvidenceBatch::default();
