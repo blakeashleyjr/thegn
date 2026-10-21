@@ -56,17 +56,24 @@ impl Smtc {
     }
 
     /// The current session's source app id (SMTC's notion of "player").
-    pub async fn list_players(&self) -> Vec<String> {
+    pub async fn list_players(&self) -> Result<Vec<String>, MediaError> {
         run_blocking(|| {
-            let session = current_session()?;
-            let id = session
-                .SourceAppUserModelId()
-                .map(|h| h.to_string())
-                .unwrap_or_default();
+            let mgr = manager().map_err(win_err)?;
+            let session = match session_if_present(mgr.GetCurrentSession()) {
+                Some(session) => session,
+                None => return Ok(Vec::new()),
+            };
+            let id = session.SourceAppUserModelId().map_err(win_err)?.to_string();
             Ok(if id.is_empty() { Vec::new() } else { vec![id] })
         })
         .await
-        .unwrap_or_default()
+    }
+}
+
+fn session_if_present<T, E>(session: Result<T, E>) -> Option<T> {
+    match session {
+        Ok(session) => Some(session),
+        Err(_) => None,
     }
 }
 
@@ -206,17 +213,16 @@ impl MediaBackend for Smtc {
         })
     }
 
-    fn players(&self) -> BoxFuture<'_, Vec<String>> {
+    fn players(&self) -> BoxFuture<'_, Result<Vec<String>, MediaError>> {
         Box::pin(async move { self.list_players().await })
     }
 
     /// The SMTC session-event push watcher.
-    fn watch(&self) -> BoxFuture<'_, Option<Box<dyn MediaWatch + Send>>> {
+    fn watch(&self) -> BoxFuture<'_, Result<Option<Box<dyn MediaWatch + Send>>, MediaError>> {
         Box::pin(async move {
             Smtc::watch(self)
                 .await
-                .ok()
-                .map(|w| Box::new(w) as Box<dyn MediaWatch + Send>)
+                .map(|w| Some(Box::new(w) as Box<dyn MediaWatch + Send>))
         })
     }
 
@@ -454,5 +460,15 @@ where
     match tokio::task::spawn_blocking(f).await {
         Ok(r) => r,
         Err(e) => Err(MediaError::Backend(format!("smtc task: {e}"))),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::session_if_present;
+
+    #[test]
+    fn missing_current_session_is_a_healthy_empty_result() {
+        assert!(session_if_present::<(), _>(Err("no current session")).is_none());
     }
 }

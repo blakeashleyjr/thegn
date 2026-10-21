@@ -72,10 +72,11 @@ impl MediaRemote {
         }
     }
 
-    pub async fn list_players(&self) -> Vec<String> {
+    pub async fn list_players(&self) -> Result<Vec<String>, MediaError> {
         match self.snapshot().await {
-            Ok(Some(s)) if !s.player.is_empty() => vec![s.player],
-            _ => Vec::new(),
+            Ok(Some(s)) if !s.player.is_empty() => Ok(vec![s.player]),
+            Ok(_) => Ok(Vec::new()),
+            Err(error) => Err(error),
         }
     }
 
@@ -145,17 +146,16 @@ impl MediaBackend for MediaRemote {
         Box::pin(async move { Err(MediaError::Unsupported("playlist activation".into())) })
     }
 
-    fn players(&self) -> BoxFuture<'_, Vec<String>> {
+    fn players(&self) -> BoxFuture<'_, Result<Vec<String>, MediaError>> {
         Box::pin(async move { self.list_players().await })
     }
 
     /// The adapter's `watch` stream push watcher.
-    fn watch(&self) -> BoxFuture<'_, Option<Box<dyn MediaWatch + Send>>> {
+    fn watch(&self) -> BoxFuture<'_, Result<Option<Box<dyn MediaWatch + Send>>, MediaError>> {
         Box::pin(async move {
             MediaRemote::watch(self)
                 .await
-                .ok()
-                .map(|w| Box::new(w) as Box<dyn MediaWatch + Send>)
+                .map(|w| Some(Box::new(w) as Box<dyn MediaWatch + Send>))
         })
     }
 
