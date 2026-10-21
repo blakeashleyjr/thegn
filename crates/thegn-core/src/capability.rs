@@ -722,14 +722,14 @@ pub const CATALOG: &[HostCapability] = &[
     cap(
         "dispatches.report",
         Verb::DispatchesReport,
-        SurfaceSet::of(&[Surface::Cli]),
-        "File a worker's structured handoff summary on a roster row",
+        SurfaceSet::of(&[Surface::Http, Surface::Cli]),
+        "File a worker's structured handoff summary; the HTTP door requires the row's worker capability token",
     ),
     cap(
         "dispatches.note",
         Verb::DispatchesNote,
-        SurfaceSet::of(&[Surface::Cli]),
-        "Append a progress note to a roster row's queue",
+        SurfaceSet::of(&[Surface::Http, Surface::Cli]),
+        "Append a progress note; the HTTP door requires the row's worker capability token",
     ),
     cap(
         "dispatches.status",

@@ -274,7 +274,122 @@ pub enum Action {
     },
 }
 
+pub(crate) const DISPATCH_CAPABILITY_ENV: &str = "THEGN_DISPATCH_CAPABILITY";
+
+#[derive(PartialEq, Eq)]
+enum WorkerRoute {
+    Local,
+    ViaDaemon(String),
+    Refused(&'static str),
+}
+
+impl std::fmt::Debug for WorkerRoute {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Local => f.write_str("Local"),
+            Self::ViaDaemon(_) => f.write_str("ViaDaemon(<redacted>)"),
+            Self::Refused(verb) => f.debug_tuple("Refused").field(verb).finish(),
+        }
+    }
+}
+
+fn worker_route(action: &Action, token: Option<&str>) -> WorkerRoute {
+    let Some(token) = token else {
+        return WorkerRoute::Local;
+    };
+    match action {
+        Action::Report { .. } | Action::Note { .. } => WorkerRoute::ViaDaemon(token.to_owned()),
+        Action::Claim { .. } => WorkerRoute::Refused("claim"),
+        Action::Put { .. } => WorkerRoute::Refused("put"),
+        Action::SetStatus { .. } => WorkerRoute::Refused("set-status"),
+        Action::Lease { .. } => WorkerRoute::Refused("lease"),
+        Action::Reap { apply: true, .. } => WorkerRoute::Refused("reap --apply"),
+        Action::List { .. }
+        | Action::Reap { apply: false, .. }
+        | Action::Verify { .. }
+        | Action::Wait { .. }
+        | Action::Status { .. } => WorkerRoute::Local,
+    }
+}
+
+#[derive(Debug, thiserror::Error)]
+#[error(
+    "thegn dispatch {verb} is a supervisor verb and is refused under a worker dispatch capability"
+)]
+struct WorkerCapabilityRefusal {
+    verb: &'static str,
+}
+
 pub fn run(cfg: &Config, action: Action) -> Result<()> {
+    fn worker_write_via_daemon(cfg: &Config, action: Action, token: String) -> Result<()> {
+        let rt = tokio::runtime::Runtime::new()?;
+        rt.block_on(async {
+            let client = crate::cmd::session::connect(cfg).await?;
+            match action {
+                Action::Report { id, text, json } => {
+                    let validated = pipeline_report::report_text(&text)
+                        .map_err(|error| anyhow::anyhow!("{error}"))?;
+                    let reply = client
+                        .dispatch_report(
+                            id,
+                            &thegn_svc::control::DispatchWorkerWriteReq {
+                                text: validated.clone(),
+                                token,
+                            },
+                        )
+                        .await?;
+                    if json {
+                        let mut value = serde_json::json!({
+                            "id": reply.id,
+                            "report": validated,
+                            "bytes": reply.bytes,
+                        });
+                        if reply.pass_without_gate_evidence {
+                            value["pass_without_gate_evidence"] = serde_json::json!(true);
+                        }
+                        super::emit_json(&value)?;
+                    } else {
+                        outln!("report recorded on dispatch {} ({} chars)", id, validated.chars().count());
+                        if reply.pass_without_gate_evidence {
+                            outln!("note: this report reads as PASS but cites no gate result. A PASS means the \
+                                   queue-boundary suite is green — add a line like\n  gate: cargo nextest run \
+                                   --workspace -- <N> passed, <M> skipped\nScoped suites do not run the \
+                                   workspace-level coverage tests the fold gate rejects branches on.");
+                        }
+                    }
+                }
+                Action::Note { id, text, json } => {
+                    let validated = pipeline_report::note_text(&text)
+                        .map_err(|error| anyhow::anyhow!("{error}"))?;
+                    let reply = client
+                        .dispatch_note(
+                            id,
+                            &thegn_svc::control::DispatchWorkerWriteReq { text: validated.clone(), token },
+                        )
+                        .await?;
+                    if json {
+                        super::emit_json(&serde_json::json!({
+                            "id": id,
+                            "note": validated,
+                            "note_id": reply.note_id,
+                            "created_at_ms": reply.created_at_ms,
+                        }))?;
+                    } else {
+                        outln!("note recorded on dispatch {} ({} chars)", id, validated.chars().count());
+                    }
+                }
+                _ => unreachable!("worker route only sends report or note"),
+            }
+            Ok(())
+        })
+    }
+    let token = std::env::var_os(DISPATCH_CAPABILITY_ENV);
+    let token_text = token.as_ref().map(|value| value.to_str().unwrap_or(""));
+    match worker_route(&action, token_text) {
+        WorkerRoute::Refused(verb) => return Err(WorkerCapabilityRefusal { verb }.into()),
+        WorkerRoute::ViaDaemon(token) => return worker_write_via_daemon(cfg, action, token),
+        WorkerRoute::Local => {}
+    }
     match action {
         Action::List { active, json } => list(active, json),
         Action::Reap { apply, json } => reap(cfg, apply, json),
@@ -2004,23 +2119,9 @@ fn report(id: i64, text: &str, json: bool) -> Result<()> {
 
 /// THE-88 — the DB-bound half of `dispatch report`. Validated text → row.
 pub(crate) fn write_report(db: &Db, id: i64, text: &str, json: bool) -> Result<()> {
-    let validated = pipeline_report::report_text(text).map_err(|e| anyhow::anyhow!("{e}"))?;
-    let row = db
-        .get_dispatch(id)?
-        .ok_or_else(|| anyhow::anyhow!("roster row {id} does not exist"))?;
-    let head_oid = git_out_allow_empty(
-        std::path::Path::new(&row.worktree_path),
-        &["rev-parse", "--verify", "HEAD"],
-    )
-    .filter(|oid| !oid.is_empty());
-    if head_oid.is_none() {
-        tracing::warn!(target: "thegn::pipeline", dispatch_id = id, "could not record HEAD for dispatch report");
-    }
-    db.set_dispatch_report_bound(id, &validated, head_oid.as_deref())?;
-    // A PASS is a claim that the queue-boundary suite is green. Surfaced, never
-    // refused: a report that cannot be filed is a silent death, which is the
-    // worse failure — see the handoff contract in `[[pipeline.stages]]`.
-    let ungated = pipeline_report::pass_without_gate_evidence(&validated);
+    let recorded = record_report(db, id, text)?;
+    let validated = recorded.validated;
+    let ungated = recorded.ungated;
     if json {
         let mut v = serde_json::json!({
             "id": id,
@@ -2047,6 +2148,29 @@ pub(crate) fn write_report(db: &Db, id: i64, text: &str, json: bool) -> Result<(
         );
     }
     Ok(())
+}
+
+pub(crate) struct RecordedReport {
+    pub validated: String,
+    pub ungated: bool,
+}
+
+pub(crate) fn record_report(db: &Db, id: i64, text: &str) -> Result<RecordedReport> {
+    let validated = pipeline_report::report_text(text).map_err(|e| anyhow::anyhow!("{e}"))?;
+    let row = db
+        .get_dispatch(id)?
+        .ok_or_else(|| anyhow::anyhow!("roster row {id} does not exist"))?;
+    let head_oid = git_out_allow_empty(
+        std::path::Path::new(&row.worktree_path),
+        &["rev-parse", "--verify", "HEAD"],
+    )
+    .filter(|oid| !oid.is_empty());
+    if head_oid.is_none() {
+        tracing::warn!(target: "thegn::pipeline", dispatch_id = id, "could not record HEAD for dispatch report");
+    }
+    db.set_dispatch_report_bound(id, &validated, head_oid.as_deref())?;
+    let ungated = pipeline_report::pass_without_gate_evidence(&validated);
+    Ok(RecordedReport { validated, ungated })
 }
 
 /// `dispatch note <id> --text <text>` — append a progress note to a row's
@@ -4334,5 +4458,186 @@ mod tests {
         let report = pipeline_run::verify_report(&facts);
         let error = require_done_report(1, report).unwrap_err().to_string();
         assert!(error.contains("worktree status"), "{error}");
+    }
+
+    #[test]
+    fn worker_capability_route_table() {
+        let token = Some("token");
+        let actions = [
+            (
+                Action::Report {
+                    id: 1,
+                    text: "x".into(),
+                    json: false,
+                },
+                WorkerRoute::ViaDaemon("token".into()),
+            ),
+            (
+                Action::Note {
+                    id: 1,
+                    text: "x".into(),
+                    json: false,
+                },
+                WorkerRoute::ViaDaemon("token".into()),
+            ),
+            (
+                Action::Claim {
+                    issue_id: "i".into(),
+                    worktree_path: "/w".into(),
+                    agent_name: "a".into(),
+                    stage: "s".into(),
+                    artifact: None,
+                    parent: None,
+                    chunk: None,
+                    allow_duplicate: None,
+                    allow_scope_overlap: None,
+                    json: false,
+                },
+                WorkerRoute::Refused("claim"),
+            ),
+            (
+                Action::Put {
+                    issue_id: "i".into(),
+                    worktree_path: "/w".into(),
+                    agent_name: "a".into(),
+                    stage: None,
+                    parent: None,
+                    session: None,
+                    artifact: None,
+                    chunk: None,
+                    force: false,
+                    force_reason: None,
+                    json: false,
+                },
+                WorkerRoute::Refused("put"),
+            ),
+            (
+                Action::SetStatus {
+                    id: 1,
+                    status: "done".into(),
+                    force: false,
+                    why: None,
+                    json: false,
+                },
+                WorkerRoute::Refused("set-status"),
+            ),
+            (
+                Action::Lease {
+                    action: "show".into(),
+                    owner: None,
+                    ttl: 300,
+                    name: "lead".into(),
+                    json: false,
+                },
+                WorkerRoute::Refused("lease"),
+            ),
+            (
+                Action::Reap {
+                    apply: true,
+                    json: false,
+                },
+                WorkerRoute::Refused("reap --apply"),
+            ),
+            (
+                Action::Reap {
+                    apply: false,
+                    json: false,
+                },
+                WorkerRoute::Local,
+            ),
+            (
+                Action::List {
+                    active: false,
+                    json: false,
+                },
+                WorkerRoute::Local,
+            ),
+            (Action::Verify { id: 1, json: false }, WorkerRoute::Local),
+            (
+                Action::Wait {
+                    row: Some(1),
+                    any: false,
+                    timeout: None,
+                    json: false,
+                },
+                WorkerRoute::Local,
+            ),
+            (
+                Action::Status {
+                    row: None,
+                    since: None,
+                    all: false,
+                    json: false,
+                },
+                WorkerRoute::Local,
+            ),
+        ];
+        for (action, expected) in actions {
+            assert_eq!(worker_route(&action, token), expected);
+            assert_eq!(worker_route(&action, None), WorkerRoute::Local);
+        }
+        assert_eq!(
+            worker_route(
+                &Action::Report {
+                    id: 1,
+                    text: String::new(),
+                    json: false
+                },
+                Some("")
+            ),
+            WorkerRoute::ViaDaemon(String::new())
+        );
+    }
+
+    #[test]
+    fn worker_capability_refusal_names_the_supervisor_verb() {
+        let message = WorkerCapabilityRefusal { verb: "claim" }.to_string();
+        assert!(message.contains("dispatch claim"));
+        assert!(message.contains("supervisor verb"));
+        let token = "ab".repeat(32);
+        let route = worker_route(
+            &Action::Report {
+                id: 1,
+                text: "x".into(),
+                json: false,
+            },
+            Some(&token),
+        );
+        assert!(!format!("{route:?}").contains(&token));
+        let request = thegn_svc::control::DispatchWorkerWriteReq {
+            text: "x".into(),
+            token: token.clone(),
+        };
+        assert!(!format!("{request:?}").contains(&token));
+    }
+
+    #[test]
+    fn worker_capability_record_report_matches_write_report() {
+        let (_dir, db) = db("worker-report-record");
+        let worktree = tempfile::tempdir().unwrap();
+        let local_id = db
+            .put_agent_dispatch(NewDispatch::new(
+                "linear:THE-1037",
+                worktree.to_str().unwrap(),
+                "sh",
+            ))
+            .unwrap();
+        let daemon_id = db
+            .put_agent_dispatch(NewDispatch::new(
+                "linear:THE-1037",
+                worktree.to_str().unwrap(),
+                "sh",
+            ))
+            .unwrap();
+        write_report(&db, local_id, "findings: none\nnext: done", false).unwrap();
+        let recorded = record_report(&db, daemon_id, "findings: none\nnext: done").unwrap();
+        let local = db.get_dispatch(local_id).unwrap().unwrap();
+        let daemon = db.get_dispatch(daemon_id).unwrap().unwrap();
+        assert_eq!(local.report, daemon.report);
+        assert_eq!(daemon.report.as_deref(), Some(recorded.validated.as_str()));
+        assert_eq!(
+            recorded.ungated,
+            pipeline_report::pass_without_gate_evidence(&recorded.validated)
+        );
     }
 }
