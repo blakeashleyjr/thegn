@@ -267,6 +267,7 @@ pub(crate) fn issues_key(key: char, ctx: &mut TrackerCtx) -> bool {
                 let waker2 = ctx.waker.clone();
                 let refresh_tx2 = ctx.refresh_tx.clone();
                 let cwd2 = active_tab_path(ctx.session);
+                let number = issue.number.clone();
                 tokio::task::spawn_blocking(move || {
                     let repo_root =
                         thegn_core::repo::main_worktree(&cwd2).unwrap_or_else(|| cwd2.clone());
@@ -310,7 +311,7 @@ pub(crate) fn issues_key(key: char, ctx: &mut TrackerCtx) -> bool {
                         );
                     }
                 });
-                ctx.model.status = format!("Assigning {} to you…", issue.number);
+                ctx.model.status = format!("Assigning {} to you…", number);
             }
             true
         }
