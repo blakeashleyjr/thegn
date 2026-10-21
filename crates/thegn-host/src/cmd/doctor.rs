@@ -194,6 +194,39 @@ fn sandbox_json_with(cfg: &Config, backend: Backend, actual: IsolationClass) -> 
         "enforcement_matrix": enforcement_matrix_json(),
         "home": home_json(cfg),
         "network_rules": network_rules_line(&cfg.sandbox, backend),
+        "isolation": isolation_json(&thegn_core::sandbox_floor::isolation_report(
+            &cfg.sandbox,
+            backend,
+            actual,
+            actual,
+        )),
+    })
+}
+
+/// Serialize the shared isolation model without changing the legacy doctor keys.
+fn isolation_json(report: &thegn_core::sandbox_floor::IsolationReport) -> serde_json::Value {
+    serde_json::json!({
+        "requested": {
+            "profile": report.requested.profile.as_str(),
+            "network": report.requested.network.as_str(),
+            "isolation_floor": report.requested.floor.as_str(),
+            "isolation_floor_source": if report.requested.floor_configured {
+                "configured"
+            } else {
+                "default"
+            },
+            "on_floor_miss": report.requested.on_floor_miss.as_str(),
+            "file_access": thegn_core::sandbox_floor::file_access_str(report.requested.file_access),
+        },
+        "resolved": {
+            "backend": report.resolved.backend.label(),
+            "class": report.resolved.class.as_str(),
+        },
+        "enforced": {
+            "floor": report.enforced.floor.as_str(),
+            "containment": report.enforced.containment.as_str(),
+            "file_access": report.enforced.file_access,
+        },
     })
 }
 
@@ -4367,7 +4400,7 @@ fn floor_report(cfg: &Config) {
         "default"
     };
     let report = local_backend_report(cfg);
-    let (_, actual) = effective_first_ready(cfg, &report);
+    let (backend, actual) = effective_first_ready(cfg, &report);
     // The strongest class any usable backend could give, for a concrete remedy.
     let best = report
         .iter()
@@ -4375,6 +4408,8 @@ fn floor_report(cfg: &Config) {
         .filter_map(|r| r.isolation)
         .max_by_key(|c| c.rank().unwrap_or(0))
         .unwrap_or(actual);
+    let isolation =
+        thegn_core::sandbox_floor::isolation_report(&cfg.sandbox, backend, actual, best);
     if floor == IsolationFloor::Off && source == "default" {
         let bypass = if !cfg.sandbox.enabled {
             "sandbox disabled"
@@ -4416,10 +4451,47 @@ fn floor_report(cfg: &Config) {
             }
         }
     }
+    for line in isolation_lines(&isolation) {
+        outln!("{line}");
+    }
     outln!(
         "{}",
         containment_line(containment_summary(cfg.sandbox.enabled, actual))
     );
+}
+
+/// Format requested, resolved, and enforced isolation as three stable report lines.
+fn isolation_lines(report: &thegn_core::sandbox_floor::IsolationReport) -> [String; 3] {
+    [
+        format!(
+            "  requested     profile `{}`, network `{}`, floor `{}` ({}, on miss: {}), file access `{}`",
+            report.requested.profile.as_str(),
+            report.requested.network.as_str(),
+            report.requested.floor.as_str(),
+            if report.requested.floor_configured {
+                "configured"
+            } else {
+                "default"
+            },
+            report.requested.on_floor_miss.as_str(),
+            thegn_core::sandbox_floor::file_access_str(report.requested.file_access),
+        ),
+        format!(
+            "  resolved      `{}` at `{}`",
+            report.resolved.backend.label(),
+            report.resolved.class.as_str(),
+        ),
+        format!(
+            "  enforced      floor: {}; containment: {}; file access: {}",
+            report.enforced.floor.as_str(),
+            report.enforced.containment.as_str(),
+            if report.enforced.file_access {
+                "enforced"
+            } else {
+                "NOT ENFORCED"
+            },
+        ),
+    ]
 }
 
 /// The local support report for the shell chain (empty when the sandbox is disabled).
@@ -5758,6 +5830,68 @@ args = ["--verbose"]
         let default_report =
             sandbox_json_with(&default_cfg, Backend::Bwrap, IsolationClass::SharedKernel);
         assert!(default_report["network_rules"].is_null());
+    }
+
+    #[test]
+    fn isolation_report_json_has_requested_resolved_enforced() {
+        let cfg = Config::default();
+        let contained =
+            sandbox_json_with(&cfg, Backend::Bwrap, IsolationClass::SharedKernel)["isolation"]
+                .clone();
+        assert_eq!(contained["requested"]["isolation_floor"], "shared-kernel");
+        assert_eq!(contained["requested"]["isolation_floor_source"], "default");
+        assert_eq!(contained["resolved"]["class"], "shared-kernel");
+        assert_eq!(contained["enforced"]["floor"], "met");
+
+        let uncontained =
+            sandbox_json_with(&cfg, Backend::None, IsolationClass::HostProcess)["isolation"]
+                .clone();
+        assert_eq!(uncontained["enforced"]["floor"], "missed-refuse");
+        assert_eq!(uncontained["enforced"]["containment"], "not-contained");
+
+        let provider =
+            sandbox_json_with(&cfg, Backend::None, IsolationClass::ProviderManaged)["isolation"]
+                .clone();
+        assert_eq!(
+            provider["enforced"]["floor"],
+            "provider-managed (unverified)"
+        );
+    }
+
+    #[test]
+    fn isolation_report_lines_name_each_layer() {
+        let cfg = Config::default();
+        let report = thegn_core::sandbox_floor::isolation_report(
+            &cfg.sandbox,
+            Backend::Bwrap,
+            IsolationClass::SharedKernel,
+            IsolationClass::SharedKernel,
+        );
+        let lines = isolation_lines(&report);
+        assert!(lines[0].starts_with("  requested"));
+        assert!(lines[0].contains("floor `shared-kernel` (default, on miss: fail)"));
+        assert!(lines[1].starts_with("  resolved"));
+        assert!(lines[1].contains("`bwrap` at `shared-kernel`"));
+        assert!(lines[2].starts_with("  enforced"));
+        assert!(lines[2].contains("floor: met; containment: contained:shared-kernel"));
+
+        let uncontained = thegn_core::sandbox_floor::isolation_report(
+            &cfg.sandbox,
+            Backend::None,
+            IsolationClass::HostProcess,
+            IsolationClass::HostProcess,
+        );
+        let uncontained_lines = isolation_lines(&uncontained);
+        assert!(uncontained_lines[2].contains("floor: missed-refuse; containment: not-contained"));
+
+        let provider = thegn_core::sandbox_floor::isolation_report(
+            &cfg.sandbox,
+            Backend::None,
+            IsolationClass::ProviderManaged,
+            IsolationClass::ProviderManaged,
+        );
+        let provider_lines = isolation_lines(&provider);
+        assert!(provider_lines[2].contains("provider-managed (unverified)"));
     }
 
     #[test]
