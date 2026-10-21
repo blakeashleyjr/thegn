@@ -408,7 +408,10 @@ pub fn plan_migration(
     }
 
     let target_subset = target_subset(&bundle, &target);
-    let fingerprint = bundle.fingerprint();
+    // A matching target is compared with the form this importer writes. A raw
+    // pre-change copy of active rows or source-local paths is not an adopted
+    // import and must be resolved by the operator before migration can proceed.
+    let fingerprint = imported_bundle(&bundle).fingerprint();
     let resumed = target_subset.fingerprint() == fingerprint && has_prior_rows(&target_subset);
     if !resumed
         && (!target_subset.dispatches.is_empty()
@@ -515,8 +518,42 @@ pub fn remap_dispatches(
     out
 }
 
-/// A stable SHA-256 over sanitized rows. Database ids, daemon ids, profile
-/// names, and target-owned worktree metadata are intentionally not included.
+/// Convert a source dispatch into the safe form stored in the target profile.
+/// Active workers are parked as abandoned; every daemon id and source-local
+/// artifact/chunk locator is removed for all statuses.
+pub fn imported_dispatch(row: &MigrationDispatch) -> MigrationDispatch {
+    let mut imported = row.clone();
+    imported.session_id = None;
+    imported.artifact_path = None;
+    imported.chunk_path = None;
+    if crate::issue::AgentDispatchStatus::parse(&row.status).is_active() {
+        imported.status = crate::issue::AgentDispatchStatus::Abandoned
+            .as_str()
+            .to_string();
+        imported.note = Some(migrated_note(&row.status, row.note.as_deref()));
+    }
+    imported
+}
+
+fn migrated_note(status: &str, note: Option<&str>) -> String {
+    let prefix = format!("[migrated while {}: not resumed]", status.trim());
+    match note {
+        Some(note) if !note.is_empty() => format!("{prefix} {note}"),
+        _ => prefix,
+    }
+}
+
+/// Return a copy of a migration bundle in the exact dispatch form imported by
+/// the target, preserving row order and source ids for parent/note remapping.
+pub fn imported_bundle(bundle: &MigrationBundle) -> MigrationBundle {
+    let mut imported = bundle.clone();
+    imported.dispatches = bundle.dispatches.iter().map(imported_dispatch).collect();
+    imported
+}
+
+/// A stable SHA-256 over sanitized rows. A migration plan computes this over
+/// the imported dispatch form. Database ids, daemon ids, profile names, and
+/// target-owned worktree metadata are intentionally not included.
 pub fn fingerprint(bundle: &MigrationBundle) -> String {
     let material = FingerprintMaterial::from_bundle(bundle);
     let bytes = serde_json::to_vec(&material).expect("fingerprint carriers serialize");
@@ -949,5 +986,116 @@ mod tests {
         assert_eq!(out[0].parent_id, None);
         assert_eq!(out[1].parent_id, Some(101));
         assert!(out.iter().all(|r| r.session_id.is_none()));
+    }
+
+    #[test]
+    fn imported_dispatch_parks_active_rows_and_clears_locators() {
+        for status in ["queued", "spawning", "running", "waiting_human", "pr_open"] {
+            let row = MigrationDispatch {
+                source_id: 7,
+                issue_id: "THE-1144".into(),
+                worktree_path: "/source/wt".into(),
+                agent_name: "agent".into(),
+                dispatched_at_ms: 42,
+                status: status.into(),
+                stage: Some("review".into()),
+                parent_id: Some(2),
+                session_id: Some("source-session".into()),
+                artifact_path: Some("/source/artifact.md".into()),
+                note: Some("old note".into()),
+                chunk_path: Some("/source/chunk.md".into()),
+                report: Some("report".into()),
+                chunk_scope: Some("scope".into()),
+            };
+
+            let imported = imported_dispatch(&row);
+            assert_eq!(imported.status, "abandoned");
+            assert_eq!(imported.session_id, None);
+            assert_eq!(imported.artifact_path, None);
+            assert_eq!(imported.chunk_path, None);
+            assert!(
+                imported
+                    .note
+                    .as_deref()
+                    .unwrap()
+                    .starts_with(&format!("[migrated while {status}: not resumed]"))
+            );
+            assert!(imported.note.as_deref().unwrap().ends_with("old note"));
+            assert_eq!(imported.stage, row.stage);
+            assert_eq!(imported.report, row.report);
+            assert_eq!(imported.chunk_scope, row.chunk_scope);
+        }
+    }
+
+    #[test]
+    fn imported_dispatch_keeps_terminal_and_unknown_status_and_is_idempotent() {
+        for status in ["done", "merged", "abandoned", "failed", "future_state"] {
+            let row = MigrationDispatch {
+                source_id: 9,
+                issue_id: "THE-1144".into(),
+                worktree_path: "/source/wt".into(),
+                agent_name: "agent".into(),
+                dispatched_at_ms: 42,
+                status: status.into(),
+                stage: None,
+                parent_id: None,
+                session_id: Some("source-session".into()),
+                artifact_path: Some("/source/artifact.md".into()),
+                note: Some("keep this note".into()),
+                chunk_path: Some("/source/chunk.md".into()),
+                report: None,
+                chunk_scope: None,
+            };
+
+            let imported = imported_dispatch(&row);
+            assert_eq!(imported.status, status);
+            assert_eq!(imported.note, row.note);
+            assert_eq!(imported.session_id, None);
+            assert_eq!(imported.artifact_path, None);
+            assert_eq!(imported.chunk_path, None);
+            assert_eq!(imported_dispatch(&imported), imported);
+        }
+    }
+
+    #[test]
+    fn plan_fingerprint_covers_imported_rows_and_refuses_a_raw_prior_copy() {
+        let mut source = bundle();
+        source.dispatches.push(MigrationDispatch {
+            source_id: 11,
+            issue_id: "THE-1144".into(),
+            worktree_path: source.worktree_path.clone(),
+            agent_name: "agent".into(),
+            dispatched_at_ms: 42,
+            status: "running".into(),
+            stage: None,
+            parent_id: None,
+            session_id: Some("source-session".into()),
+            artifact_path: Some("/source/artifact.md".into()),
+            note: Some("working".into()),
+            chunk_path: Some("/source/chunk.md".into()),
+            report: None,
+            chunk_scope: None,
+        });
+        let mut imported_target = MigrationTarget {
+            groups: source.groups.clone(),
+            ui_state: source.ui_state.clone(),
+            pin_state: source.pin_state.clone(),
+            ..Default::default()
+        };
+        imported_target.dispatches = imported_bundle(&source).dispatches;
+        let plan = plan_migration(source.clone(), imported_target).unwrap();
+        assert!(plan.resumed);
+
+        let mut raw_target = MigrationTarget {
+            groups: source.groups.clone(),
+            ui_state: source.ui_state.clone(),
+            pin_state: source.pin_state.clone(),
+            ..Default::default()
+        };
+        raw_target.dispatches = source.dispatches.clone();
+        assert_eq!(
+            plan_migration(source, raw_target),
+            Err(MigrationConflict::PriorImport)
+        );
     }
 }

@@ -95,8 +95,11 @@ credential environment are never loaded into the source process. The git
 worktree directory, branch, and git objects stay where they are.
 
 The persisted worktree registration, every matching current group and tab,
-sidebar collapse/pin keys, and the dispatch ledger (including notes and
-artifact/chunk paths) are imported. Current layout groups/tabs are moved;
+sidebar collapse/pin keys, and the dispatch ledger (including notes) are
+imported. Active dispatch rows (queued, spawning, running, waiting for a
+human, or PR open) arrive as `abandoned` with a `migrated while <status>: not
+resumed` note. Every row's artifact and chunk paths are dropped, so work is
+neither resumed nor re-dispatched under the target profile. Current layout groups/tabs are moved;
 named global layouts, caches, active transports, and whole-session focus are
 not. Opaque pane commands, scrollback, dispatch reports, and notes remain
 unchanged in the target but are omitted from human and JSON audit output.
