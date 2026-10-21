@@ -464,6 +464,8 @@ pub trait WorktreeAuxStore {
     /// while the driver skips leased rows before reaching this.
     fn set_pr_agent_attempts(&self, key: &str, attempts: u32) -> Result<()>;
 
+    /// Return lease metadata only when the row has an owner and a lease deadline.
+    /// The owner token is never exposed; a missing row returns `Ok(None)`.
     fn pr_agent_lease_view(&self, key: &str) -> Result<Option<crate::pr_queue::PrAgentLeaseView>>;
 
     fn admit_pr_agent(
