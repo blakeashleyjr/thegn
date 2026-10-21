@@ -51,12 +51,13 @@ struct Pipes {
     err_open: bool,
 }
 
-struct Accumulator {
+struct Accumulator<'a> {
     capture: Capture,
     stream: Stream,
+    sink: Option<&'a mut dyn FnMut(&[u8])>,
 }
 
-impl Accumulator {
+impl Accumulator<'_> {
     fn read(&mut self, fd: libc::c_int) -> io::Result<(bool, bool)> {
         let mut buf = [0_u8; 8192];
         let mut drained = 0;
@@ -80,6 +81,9 @@ impl Accumulator {
             let bytes = &buf[..count as usize];
             drained += bytes.len();
             self.capture.total = self.capture.total.saturating_add(bytes.len() as u64);
+            if let Some(sink) = self.sink.as_mut() {
+                sink(bytes);
+            }
             match self.stream {
                 Stream::Null => {}
                 Stream::Head { cap } => {
@@ -109,6 +113,7 @@ impl Accumulator {
                         self.capture.truncated = true;
                     }
                 }
+                Stream::Consume => {}
             }
             if drained >= 1024 * 1024 {
                 return Ok((true, false));
@@ -232,8 +237,8 @@ fn poll_pipes(pipes: &Pipes, timeout: Duration) -> io::Result<bool> {
 
 fn drain(
     pipes: &mut Pipes,
-    out: &mut Accumulator,
-    err: &mut Accumulator,
+    out: &mut Accumulator<'_>,
+    err: &mut Accumulator<'_>,
 ) -> io::Result<Option<Which>> {
     let mut result = None;
     if pipes.out_open
@@ -293,8 +298,8 @@ fn wait_empty(
     pid: libc::pid_t,
     deadline: Instant,
     pipes: &mut Pipes,
-    out: &mut Accumulator,
-    err: &mut Accumulator,
+    out: &mut Accumulator<'_>,
+    err: &mut Accumulator<'_>,
     backoff: &mut Duration,
 ) -> io::Result<bool> {
     loop {
@@ -371,6 +376,15 @@ fn detach(child: &mut Child) -> Leader {
 }
 
 pub(super) fn run(cmd: &mut Command, limits: &Limits, cancel: &AtomicBool) -> Run {
+    run_consuming(cmd, limits, cancel, &mut |_bytes: &[u8]| {})
+}
+
+pub(super) fn run_consuming(
+    cmd: &mut Command,
+    limits: &Limits,
+    cancel: &AtomicBool,
+    consume: &mut dyn FnMut(&[u8]),
+) -> Run {
     cmd.stdin(Stdio::null());
     cmd.stdout(if matches!(limits.stdout, Stream::Null) {
         Stdio::null()
@@ -442,10 +456,12 @@ pub(super) fn run(cmd: &mut Command, limits: &Limits, cancel: &AtomicBool) -> Ru
     let mut out = Accumulator {
         capture: Capture::default(),
         stream: limits.stdout,
+        sink: matches!(limits.stdout, Stream::Consume).then_some(consume),
     };
     let mut err = Accumulator {
         capture: Capture::default(),
         stream: limits.stderr,
+        sink: None,
     };
     let mut backoff = POLL_INTERVAL;
     let mut leader_first = false;
@@ -1049,5 +1065,81 @@ mod tests {
         assert_eq!(configured.stdout, Stream::Null);
         assert_eq!(configured.stderr, Stream::Null);
         assert_eq!(configured.aggregate_tail_cap, None);
+    }
+
+    #[test]
+    fn consume_stream_hands_every_byte_in_order_and_retains_none() {
+        let scripts = Scripts::new();
+        let script = scripts.write("consume.sh", "yes x | head -c 3000000; printf 'tail\\n'\n");
+        let limits = Limits {
+            stdout: Stream::Consume,
+            stderr: Stream::Null,
+            ..Limits::silent(Duration::from_secs(20))
+        };
+        let (mut total, mut last) = (0_u64, Vec::new());
+        let run = run_consuming(
+            &mut command(&script),
+            &limits,
+            &AtomicBool::new(false),
+            &mut |bytes: &[u8]| {
+                for &byte in bytes {
+                    let expected = if total < 3_000_000 {
+                        if total.is_multiple_of(2) { b'x' } else { b'\n' }
+                    } else {
+                        b"tail\n"[(total - 3_000_000) as usize]
+                    };
+                    assert_eq!(byte, expected);
+                    total += 1;
+                    if last.len() == 5 {
+                        last.remove(0);
+                    }
+                    last.push(byte);
+                }
+            },
+        );
+        assert!(run.success());
+        assert_eq!(total, 3_000_005);
+        assert_eq!(last, b"tail\n");
+        assert!(run.stdout.bytes.is_empty());
+        assert_eq!(run.stdout.total, 3_000_005);
+        assert!(run.stdout.eof);
+    }
+
+    #[test]
+    fn consume_stream_keeps_the_deadline_and_kills_the_group() {
+        let scripts = Scripts::new();
+        let script = scripts.write("consume-timeout.sh", "printf x; sleep 30\n");
+        let limits = Limits {
+            stdout: Stream::Consume,
+            stderr: Stream::Null,
+            ..Limits::silent(Duration::from_millis(300))
+        };
+        let mut seen = Vec::new();
+        let started = Instant::now();
+        let run = run_consuming(
+            &mut command(&script),
+            &limits,
+            &AtomicBool::new(false),
+            &mut |bytes: &[u8]| seen.extend_from_slice(bytes),
+        );
+        assert!(matches!(run.end, End::TimedOut));
+        assert_eq!(seen, b"x");
+        assert!(matches!(run.leader, Leader::Reaped(_)));
+        assert!(started.elapsed() < Duration::from_secs(5));
+    }
+
+    #[test]
+    fn plain_run_with_consume_stream_drains_without_retention() {
+        let scripts = Scripts::new();
+        let script = scripts.write("consume-plain.sh", "head -c 100000 /dev/zero\n");
+        let limits = Limits {
+            stdout: Stream::Consume,
+            stderr: Stream::Null,
+            ..Limits::silent(Duration::from_secs(10))
+        };
+        let run = run(&mut command(&script), &limits, &AtomicBool::new(false));
+        assert!(run.success());
+        assert!(run.stdout.bytes.is_empty());
+        assert_eq!(run.stdout.total, 100_000);
     }
 }
