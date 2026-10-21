@@ -1,7 +1,7 @@
 //! CI provider adapter backed by a resident plugin's `provider.call` seam.
 
 use std::collections::VecDeque;
-use std::sync::Arc;
+use std::sync::{Arc, mpsc};
 
 use thegn_core::ci::{CiCaps, CiError, CiJob, CiLog, CiRun, CiSystem, CiWorkflow, RerunScope};
 use thegn_core::plugin_api::RpcErrorCode;
@@ -45,19 +45,25 @@ impl PluginCiProvider {
         &self.provider_id
     }
 
+    /// Callers must use a blocking thread. The future runs on the resident
+    /// runtime, while this synchronous seam waits without blocking a runtime
+    /// worker (the daemon routes invoke providers from `spawn_blocking`).
     fn call(
         &self,
         op: &'static str,
         args: serde_json::Value,
     ) -> Result<serde_json::Value, CiError> {
-        if tokio::runtime::Handle::try_current().is_ok() {
-            return Err(CiError::Other(
-                "plugin CI provider called from an async thread; run it on a blocking thread"
-                    .into(),
-            ));
-        }
-        self.runtime
-            .block_on(self.bridge.call("ci", op, args))
+        let bridge = self.bridge.clone();
+        let (sender, receiver) = mpsc::channel();
+        self.runtime.spawn(async move {
+            let result = bridge.call("ci", op, args).await;
+            if let Err(error) = sender.send(result) {
+                tracing::debug!(%error, "plugin CI caller dropped the reply receiver");
+            }
+        });
+        receiver
+            .recv()
+            .map_err(|error| CiError::Other(format!("plugin transport: {error}")))?
             .map_err(|error| match error {
                 BridgeError::Rpc(rpc) => match rpc.code {
                     RpcErrorCode::Unsupported => unsupported(op),
@@ -231,9 +237,6 @@ fn bounded_log(value: serde_json::Value) -> Result<CiLog, CiError> {
             }
         }
     }
-    if in_pem {
-        truncated = true;
-    }
     log.text = lines.into_iter().collect();
     log.truncated = truncated;
     Ok(log)
@@ -300,13 +303,14 @@ impl CiProvider for PluginCiProvider {
         Ok(rows
             .iter()
             .filter_map(|row| {
+                if !fields_fit(row) {
+                    return None;
+                }
                 let workflow = match serde_json::from_value::<CiWorkflow>(row.clone()) {
                     Ok(workflow) => workflow,
                     Err(_) => return None,
                 };
-                (workflow.id.len() <= MAX_PROVIDER_FIELD_BYTES
-                    && workflow.name.len() <= MAX_PROVIDER_FIELD_BYTES)
-                    .then_some(workflow)
+                Some(workflow)
             })
             .collect())
     }
@@ -537,6 +541,12 @@ done
         let redacted = bounded_log(serde_json::json!({"text":pem,"truncated":false})).unwrap();
         assert!(!redacted.text.contains("secret"));
         assert!(!redacted.text.contains("abc"));
+        let open_pem = bounded_log(serde_json::json!({
+            "text":"-----BEGIN PRIVATE KEY-----\nsecret\n",
+            "truncated":false
+        }))
+        .unwrap();
+        assert!(!open_pem.truncated);
         let text = (0..PROVIDER_LOG_MAX_LINES + 1)
             .map(|line| format!("line{line}"))
             .collect::<Vec<_>>()
@@ -544,6 +554,30 @@ done
         let capped = bounded_log(serde_json::json!({"text":text,"truncated":false})).unwrap();
         assert!(capped.truncated);
         assert_eq!(capped.text.lines().count(), PROVIDER_LOG_MAX_LINES);
+    }
+
+    #[test]
+    fn workflows_with_oversize_nested_fields_are_dropped() {
+        let too_long = "x".repeat(MAX_PROVIDER_FIELD_BYTES + 1);
+        let reply = serde_json::json!([
+            {"id":"valid","name":"CI","dispatchable":true},
+            {
+                "id":"oversize-input",
+                "name":"Deploy",
+                "inputs":[{"name":"environment","description":too_long}]
+            }
+        ]);
+        let script = format!(
+            "while read -r line; do id=${{line#*'\"id\":'}}; id=${{id%%,*}}; printf '{{\"id\":%s,\"result\":{}}}\\n' \"$id\"; done",
+            serde_json::to_string(&reply).unwrap()
+        );
+        let rt = runtime();
+        let (_fixture, _session, bridge) = live_ci_bridge(&script, Duration::from_secs(3));
+        let provider = adapter(bridge, &rt, CiCaps::default());
+
+        let workflows = provider.workflows(&loc()).unwrap();
+        assert_eq!(workflows.len(), 1);
+        assert_eq!(workflows[0].id, "valid");
     }
 
     #[test]
@@ -572,12 +606,18 @@ done
     }
 
     #[test]
-    fn calling_from_an_async_thread_is_refused_not_panicking() {
+    fn runs_from_a_spawn_blocking_thread_succeeds() {
         let rt = runtime();
         let (_fixture, _session, bridge) = live_ci_bridge(SUCCESS_SCRIPT, Duration::from_secs(3));
         let provider = adapter(bridge, &rt, CiCaps::default());
-        let result = rt.block_on(async { provider.runs(&loc(), None, 1) });
-        assert!(matches!(result, Err(CiError::Other(message)) if message.contains("async thread")));
+        let result = rt
+            .block_on(async move {
+                tokio::task::spawn_blocking(move || provider.runs(&loc(), None, 1))
+                    .await
+                    .unwrap()
+            })
+            .unwrap();
+        assert_eq!(result.runs.len(), 1);
     }
 
     #[test]
