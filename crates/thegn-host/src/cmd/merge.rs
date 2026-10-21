@@ -653,8 +653,15 @@ fn sweep(cfg: &Config, force: bool) -> Result<()> {
     }
     for branch in &report.held_branches {
         outln!(
-            "  • branch {} kept for explicit cleanup",
+            "  • worktree previously collected; branch {} and queue evidence retained for explicit cleanup (THE-596)",
             safe_display(branch)
+        );
+    }
+    for (branch, reason) in &report.informational {
+        outln!(
+            "  • left {} untouched — {}",
+            safe_display(branch),
+            safe_display(reason)
         );
     }
     for b in &report.kept_dirty {

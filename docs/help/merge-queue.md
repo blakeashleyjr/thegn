@@ -121,9 +121,10 @@ else. A week is how long you have to notice.
 - **Sweep merged** (palette, or `thegn merge sweep`) collects everything
   already past its grace period, now. `--force` ignores the remaining
   time and clears the lot.
-  `thegn merge sweep` exits non-zero when any worktree was refused or only partly
-  cleaned up, so scripts can tell; a worktree kept because you edited it after
-  landing is not an error.
+  `thegn merge sweep` exits non-zero when a local worktree was refused or only
+  partly cleaned up, so scripts can tell. Existing THE-596 branch holds and
+  rows that cannot be identified as belonging to this repository are reported
+  as informational and do not change the exit status.
 - The _merge_ section's **`c`** does the same for that repo after a second
   press: it clears the landed rows and sweeps their worktrees together. Under
   `expire` a landed row _is_ the grace-period clock, so clearing one without its worktree
