@@ -64,6 +64,9 @@ marked commit to clear it, or on another commit to move the mark. With a mark,
 `i` plans the commits after it up to HEAD and refuses if the mark is HEAD, is
 not an ancestor, or is gone (press `B` to
 re-mark). Without a mark, `i` plans from the selected commit.
+Interactive rebase plans, reword, amend, retag and move hold the repository
+mutation lock for the whole operation, so another thegn git action on that
+repository waits or is refused while the rewrite is in progress.
 
 ### branches
 
