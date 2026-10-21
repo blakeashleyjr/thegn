@@ -1082,6 +1082,7 @@ impl PrQueueRow {
 // `crate::db::{ShareRow, ForwardRow}` paths stay valid via this re-export.
 pub use crate::db_dispatch::DispatchAdmissionDecision;
 pub use crate::db_dispatch::ResumeDispatchConflict;
+pub use crate::db_dispatch::{DispatchNoteQuotaExceeded, NoteQuotaKind};
 pub use crate::db_dispatch::{DispatchOverride, FORCE_REASON_MAX_CHARS};
 pub use crate::db_dispatch::{
     DispatchTransitionConflict, MissingDispatch, set_status_transition_allowed,

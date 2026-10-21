@@ -1614,20 +1614,75 @@ impl Db {
         Ok(out)
     }
 
-    /// Append a progress note and return its id, preserving the original API.
+    /// Append an internal audit note and return its id, preserving the
+    /// transaction-safe, reserved lane used by dispatch admission.
     pub fn append_dispatch_note(&self, id: i64, text: &str) -> Result<i64> {
-        Ok(self.append_dispatch_note_record(id, text)?.id)
-    }
-
-    /// Append a progress note to a row's queue — INSERT into
-    /// `agent_dispatch_notes`. Returns the inserted note without rescanning
-    /// the row's history. Errors when the row does not exist.
-    pub fn append_dispatch_note_record(&self, id: i64, text: &str) -> Result<DispatchNote> {
         let text = crate::pipeline_report::note_text(text).map_err(|e| anyhow::anyhow!("{e}"))?;
         if self.get_dispatch(id)?.is_none() {
             anyhow::bail!("roster row {id} does not exist");
         }
+        Ok(self.insert_dispatch_note(id, text, util::now_ms())?.id)
+    }
+
+    /// Append a progress note to a row's queue — INSERT into
+    /// `agent_dispatch_notes`. Returns the inserted note without rescanning
+    /// the row's history. Enforces THE-243's worker/CLI per-row quota in the
+    /// same IMMEDIATE transaction as the insert.
+    pub fn append_dispatch_note_record(&self, id: i64, text: &str) -> Result<DispatchNote> {
+        let text = crate::pipeline_report::note_text(text).map_err(|e| anyhow::anyhow!("{e}"))?;
         let now = util::now_ms();
+        let conn = self.conn();
+        conn.execute_batch("BEGIN IMMEDIATE")?;
+        let result = (|| -> Result<DispatchNote> {
+            let exists: bool = conn.query_row(
+                "SELECT EXISTS(SELECT 1 FROM agent_dispatches WHERE id=?1)",
+                [id],
+                |row| row.get(0),
+            )?;
+            if !exists {
+                anyhow::bail!("roster row {id} does not exist");
+            }
+            let (count, bytes): (i64, i64) = conn.query_row(
+                "SELECT COUNT(*), COALESCE(SUM(LENGTH(CAST(text AS BLOB))), 0) \
+                 FROM agent_dispatch_notes WHERE dispatch_id=?1",
+                [id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )?;
+            let notes = usize::try_from(count).unwrap_or(usize::MAX);
+            let bytes = u64::try_from(bytes).unwrap_or(u64::MAX);
+            let new_len = u64::try_from(text.len()).unwrap_or(u64::MAX);
+            if notes >= crate::pipeline_report::NOTE_MAX_PER_ROW {
+                return Err(anyhow::Error::new(DispatchNoteQuotaExceeded {
+                    dispatch_id: id,
+                    kind: NoteQuotaKind::Count,
+                    notes,
+                    bytes,
+                }));
+            }
+            if bytes.saturating_add(new_len) > crate::pipeline_report::NOTE_MAX_BYTES_PER_ROW as u64
+            {
+                return Err(anyhow::Error::new(DispatchNoteQuotaExceeded {
+                    dispatch_id: id,
+                    kind: NoteQuotaKind::Bytes,
+                    notes,
+                    bytes,
+                }));
+            }
+            self.insert_dispatch_note(id, text, now)
+        })();
+        match result {
+            Ok(note) => {
+                conn.execute_batch("COMMIT")?;
+                Ok(note)
+            }
+            Err(error) => {
+                conn.execute_batch("ROLLBACK")?;
+                Err(error)
+            }
+        }
+    }
+
+    fn insert_dispatch_note(&self, id: i64, text: String, now: i64) -> Result<DispatchNote> {
         self.conn().execute(
             "INSERT INTO agent_dispatch_notes (dispatch_id, created_at_ms, text) VALUES (?1, ?2, ?3)",
             rusqlite::params![id, now, text],
@@ -1720,6 +1775,37 @@ fn map_note(r: &rusqlite::Row<'_>) -> rusqlite::Result<DispatchNote> {
         text: r.get(3)?,
     })
 }
+
+/// A worker/CLI dispatch row has reached one of its progress-note ceilings.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DispatchNoteQuotaExceeded {
+    pub dispatch_id: i64,
+    pub kind: NoteQuotaKind,
+    pub notes: usize,
+    pub bytes: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NoteQuotaKind {
+    Count,
+    Bytes,
+}
+
+impl std::fmt::Display for DispatchNoteQuotaExceeded {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "dispatch {} note quota reached ({} notes, {} bytes; max {} notes / {} MiB): put a summary in `thegn dispatch report` instead",
+            self.dispatch_id,
+            self.notes,
+            self.bytes,
+            crate::pipeline_report::NOTE_MAX_PER_ROW,
+            crate::pipeline_report::NOTE_MAX_BYTES_PER_ROW / (1024 * 1024),
+        )
+    }
+}
+
+impl std::error::Error for DispatchNoteQuotaExceeded {}
 
 #[cfg(test)]
 mod tests {
@@ -3631,5 +3717,103 @@ mod tests {
             None
         );
         assert_eq!(db.dispatch_retry_attempt(id).unwrap(), Some(0));
+    }
+
+    #[test]
+    fn note_quota_count_ceiling_refuses_the_next_note_and_inserts_nothing() {
+        let (db, _dir) = temp_db();
+        let id = put_row(&db, "linear:THE-243-count", "/wt/note-count");
+        for _ in 0..crate::pipeline_report::NOTE_MAX_PER_ROW {
+            db.append_dispatch_note_record(id, "x").unwrap();
+        }
+        let result = db.append_dispatch_note_record(id, "x");
+        assert!(matches!(
+            result,
+            Err(ref error)
+                if error.downcast_ref::<DispatchNoteQuotaExceeded>().is_some_and(|quota| {
+                    quota.dispatch_id == id
+                        && quota.kind == NoteQuotaKind::Count
+                        && quota.notes == crate::pipeline_report::NOTE_MAX_PER_ROW
+                })
+        ));
+        assert_eq!(
+            db.dispatch_note_count(id, None).unwrap(),
+            crate::pipeline_report::NOTE_MAX_PER_ROW,
+            "refusal must roll back without inserting a note"
+        );
+        let message = DispatchNoteQuotaExceeded {
+            dispatch_id: id,
+            kind: NoteQuotaKind::Count,
+            notes: crate::pipeline_report::NOTE_MAX_PER_ROW,
+            bytes: 2_000,
+        }
+        .to_string();
+        assert!(message.contains("thegn dispatch report"), "{message}");
+    }
+
+    #[test]
+    fn note_quota_byte_ceiling_refuses_before_two_mebibytes() {
+        let (db, _dir) = temp_db();
+        let id = put_row(&db, "linear:THE-243-bytes", "/wt/note-bytes");
+        let note = "x".repeat(crate::pipeline_report::NOTE_MAX_CHARS);
+        for _ in 0..512 {
+            db.append_dispatch_note_record(id, &note).unwrap();
+        }
+        let bytes: i64 = db
+            .conn()
+            .query_row(
+                "SELECT COALESCE(SUM(LENGTH(CAST(text AS BLOB))), 0) \
+                 FROM agent_dispatch_notes WHERE dispatch_id=?1",
+                [id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let expected = crate::pipeline_report::NOTE_MAX_BYTES_PER_ROW as i64;
+        let result = db.append_dispatch_note_record(id, &note);
+        assert!(
+            matches!(result, Err(ref error)
+            if error.downcast_ref::<DispatchNoteQuotaExceeded>().is_some_and(|quota| {
+                quota.kind == NoteQuotaKind::Bytes
+                    && quota.bytes == expected as u64
+                    && quota.notes == 512
+            })),
+            "expected byte quota refusal at {bytes} stored bytes (ceiling {expected})"
+        );
+        assert_eq!(bytes, expected, "measured byte total before refusal");
+        assert_eq!(db.dispatch_note_count(id, None).unwrap(), 512);
+    }
+
+    #[test]
+    fn note_quota_audit_lane_is_never_refused() {
+        let (db, _dir) = temp_db();
+        let id = put_row(&db, "linear:THE-243-audit", "/wt/note-audit");
+        for _ in 0..crate::pipeline_report::NOTE_MAX_PER_ROW {
+            db.append_dispatch_note(id, "x").unwrap();
+        }
+        db.append_dispatch_note(id, "audit beyond worker quota")
+            .unwrap();
+        assert_eq!(
+            db.dispatch_note_count(id, None).unwrap(),
+            crate::pipeline_report::NOTE_MAX_PER_ROW + 1
+        );
+
+        let byte_id = put_row(&db, "linear:THE-243-audit-bytes", "/wt/note-audit-bytes");
+        let note = "x".repeat(crate::pipeline_report::NOTE_MAX_CHARS);
+        for _ in 0..512 {
+            db.append_dispatch_note(byte_id, &note).unwrap();
+        }
+        db.append_dispatch_note(byte_id, "audit beyond byte quota")
+            .unwrap();
+        assert_eq!(db.dispatch_note_count(byte_id, None).unwrap(), 513);
+    }
+
+    #[test]
+    fn note_quota_missing_row_still_errors() {
+        let (db, _dir) = temp_db();
+        let result = db.append_dispatch_note_record(99, "x");
+        assert!(
+            matches!(result, Err(ref error) if error.to_string().contains("roster row 99 does not exist"))
+        );
+        assert_eq!(db.dispatch_note_count(99, None).unwrap(), 0);
     }
 }
