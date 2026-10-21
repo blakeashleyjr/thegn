@@ -3141,7 +3141,7 @@ impl ProvisionedSandbox {
     }
 
     fn commit(mut self) {
-        drop(self.destroy.take());
+        self.destroy = None;
     }
 }
 
