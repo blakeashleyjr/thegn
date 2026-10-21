@@ -169,7 +169,8 @@
     },
     {
       "change": "add-merge-queue-tui",
-      "lifecycle": "active",
+      "archive_path": "openspec/changes/archive/2026-10-21-add-merge-queue-tui/",
+      "lifecycle": "archived",
       "disposition": "residual-split",
       "owners": [
         {
@@ -342,7 +343,8 @@
     },
     {
       "change": "add-terminal-presets",
-      "lifecycle": "active",
+      "archive_path": "openspec/changes/archive/2026-10-21-add-terminal-presets/",
+      "lifecycle": "archived",
       "disposition": "residual-split",
       "owners": [
         {
@@ -646,7 +648,8 @@
     },
     {
       "change": "complete-devcontainer-support",
-      "lifecycle": "active",
+      "archive_path": "openspec/changes/archive/2026-10-21-complete-devcontainer-support/",
+      "lifecycle": "archived",
       "disposition": "verification-gated",
       "owners": [
         {

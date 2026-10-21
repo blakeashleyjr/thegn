@@ -48,6 +48,76 @@ pub struct CalendarSyncRow {
     pub horizon_to_ms: i64,
 }
 
+/// Cursor and fetched horizon committed with a calendar page.
+pub struct CalendarCursor<'a> {
+    /// Provider identifier for the cached account.
+    pub provider: &'a str,
+    /// Opaque provider cursor to persist.
+    pub sync_token: &'a str,
+    /// Start of the fetched horizon in UTC milliseconds.
+    pub horizon_from_ms: i64,
+    /// Exclusive end of the fetched horizon in UTC milliseconds.
+    pub horizon_to_ms: i64,
+}
+
+/// Policy for an empty authoritative replacement.
+pub enum EmptySnapshot {
+    /// Keep a populated cache and record the suspicious empty response.
+    KeepCachedEvents,
+    /// The provider explicitly reset the collection; accept the empty page.
+    Believe,
+}
+
+/// Tombstones in an incremental page.
+pub enum CalendarTombstones<'a> {
+    /// Delete every recurrence row for each uid.
+    Uids(&'a [String]),
+    /// Delete by resource href, falling back to legacy uid rows with NULL href.
+    Resources(&'a [(String, String)]),
+}
+
+impl CalendarTombstones<'_> {
+    /// Whether this page carries no deletion tombstones.
+    pub fn is_empty(&self) -> bool {
+        match self {
+            Self::Uids(uids) => uids.is_empty(),
+            Self::Resources(resources) => resources.is_empty(),
+        }
+    }
+}
+
+/// One complete provider page and its cache mutation semantics.
+pub enum CalendarPageWrite<'a> {
+    /// A 304-style response; only cursor freshness is updated.
+    Unchanged,
+    /// An authoritative full replacement.
+    Replace {
+        /// Complete rows returned by the provider.
+        rows: &'a [CalendarRow],
+        /// Whether an empty replacement is suspicious or authoritative.
+        empty: EmptySnapshot,
+    },
+    /// An incremental set of upserts and deletions.
+    Delta {
+        /// Rows added or updated by the provider.
+        rows: &'a [CalendarRow],
+        /// Rows removed by the provider.
+        tombstones: CalendarTombstones<'a>,
+    },
+}
+
+/// Outcome of applying one page atomically.
+#[must_use]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CalendarPageApplied {
+    /// Only sync freshness/cursor state changed.
+    FreshnessOnly,
+    /// The complete page was applied.
+    Applied { events_changed: bool },
+    /// A suspicious empty replacement was refused to preserve cached events.
+    RejectedEmpty,
+}
+
 /// Cached calendar events and their sync state.
 pub trait CalendarStore {
     /// Events overlapping `[from_ms, to_ms)`, plus every recurrence master.
@@ -101,6 +171,15 @@ pub trait CalendarStore {
     /// Whether this account has anything cached — the guard that stops an empty
     /// fetch from erasing a good calendar.
     fn has_calendar_events(&self, account: &str) -> Result<bool>;
+
+    /// Apply page mutations and cursor/horizon state in one all-or-nothing
+    /// transaction. On any storage error neither the events nor cursor advance.
+    fn apply_calendar_page(
+        &self,
+        account: &str,
+        write: &CalendarPageWrite<'_>,
+        cursor: &CalendarCursor<'_>,
+    ) -> Result<CalendarPageApplied>;
 
     /// Drop non-recurring events that ended before `before_ms`. Growth bound.
     fn prune_calendar_events(&self, before_ms: i64) -> Result<usize>;

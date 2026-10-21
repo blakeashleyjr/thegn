@@ -23,7 +23,7 @@
 use anyhow::Result;
 use std::collections::HashMap;
 use thegn_core::config::Config;
-use thegn_core::db::{Db, DispatchNoteQuotaExceeded, NoteQuotaKind};
+use thegn_core::db::{Db, DispatchNoteQuotaExceeded, LeadProof, NoteQuotaKind};
 use thegn_core::issue::{AgentDispatch, AgentDispatchStatus, DispatchNote, NewDispatch};
 use thegn_core::outln;
 use thegn_core::pipeline_chunk;
@@ -158,6 +158,23 @@ pub enum Action {
         /// non-empty reason; session open never exposes this override.
         #[arg(long, value_name = "REASON")]
         allow_scope_overlap: Option<String>,
+        /// The Lead lease this mutation is made under.
+        #[arg(
+            long,
+            value_name = "NAME",
+            requires = "owner",
+            conflicts_with = "admin"
+        )]
+        lease: Option<String>,
+        /// The owner id holding `--lease`.
+        #[arg(long, value_name = "ID", requires = "lease")]
+        owner: Option<String>,
+        /// Manual roster administration: skip the lease check and record `--why` on the row.
+        #[arg(long, requires = "why")]
+        admin: bool,
+        /// Audit reason for manual roster administration.
+        #[arg(long, value_name = "REASON", requires = "admin")]
+        why: Option<String>,
         /// Emit the created row (or the refusal) as JSON.
         #[arg(long)]
         json: bool,
@@ -203,6 +220,20 @@ pub enum Action {
         /// possible (see `set_status`).
         #[arg(long)]
         why: Option<String>,
+        /// The Lead lease this mutation is made under.
+        #[arg(
+            long,
+            value_name = "NAME",
+            requires = "owner",
+            conflicts_with = "admin"
+        )]
+        lease: Option<String>,
+        /// The owner id holding `--lease`.
+        #[arg(long, value_name = "ID", requires = "lease")]
+        owner: Option<String>,
+        /// Manual roster administration: skip the lease check and record `--why` on the row.
+        #[arg(long, requires = "why", conflicts_with = "lease")]
+        admin: bool,
         #[arg(long)]
         json: bool,
     },
@@ -431,6 +462,10 @@ pub fn run(cfg: &Config, action: Action) -> Result<()> {
             chunk,
             allow_duplicate,
             allow_scope_overlap,
+            lease,
+            owner,
+            admin,
+            why,
             json,
         } => claim(
             cfg,
@@ -443,6 +478,7 @@ pub fn run(cfg: &Config, action: Action) -> Result<()> {
             chunk.as_deref(),
             allow_duplicate.as_deref(),
             allow_scope_overlap.as_deref(),
+            lead_proof(lease.as_deref(), owner.as_deref(), admin, why.as_deref()),
             json,
         ),
         Action::Lease {
@@ -544,8 +580,18 @@ pub fn run(cfg: &Config, action: Action) -> Result<()> {
             status,
             force,
             why,
+            lease,
+            owner,
+            admin,
             json,
-        } => set_status(id, &status, force, why.as_deref(), json),
+        } => set_status(
+            id,
+            &status,
+            force,
+            why.as_deref(),
+            lead_proof(lease.as_deref(), owner.as_deref(), admin, why.as_deref()),
+            json,
+        ),
         Action::Verify { id, json } => verify(id, json),
         Action::Gate { id, json } => gate::run(cfg, id, json),
         Action::Wait {
@@ -814,6 +860,23 @@ fn prepare_chunk_admission(
     })
 }
 
+fn lead_proof<'a>(
+    lease: Option<&'a str>,
+    owner: Option<&'a str>,
+    admin: bool,
+    why: Option<&'a str>,
+) -> LeadProof<'a> {
+    if admin {
+        LeadProof::Admin {
+            why: why.unwrap_or(""),
+        }
+    } else if let (Some(name), Some(owner)) = (lease, owner) {
+        LeadProof::Lease { name, owner }
+    } else {
+        LeadProof::Unbound
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn claim_admitted_with_refresh(
     db: &Db,
@@ -825,17 +888,43 @@ pub(crate) fn claim_admitted_with_refresh(
     chunk: Option<&str>,
     allow_scope: Option<&str>,
 ) -> Result<std::result::Result<i64, thegn_core::db::DispatchAdmissionDecision>> {
+    claim_admitted_with_refresh_led(
+        db,
+        new,
+        limit,
+        allow_duplicate,
+        worktree,
+        issue_id,
+        chunk,
+        allow_scope,
+        LeadProof::Unbound,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn claim_admitted_with_refresh_led(
+    db: &Db,
+    new: NewDispatch<'_>,
+    limit: u32,
+    allow_duplicate: Option<&str>,
+    worktree: &str,
+    issue_id: &str,
+    chunk: Option<&str>,
+    allow_scope: Option<&str>,
+    proof: LeadProof<'_>,
+) -> Result<std::result::Result<i64, thegn_core::db::DispatchAdmissionDecision>> {
     let mut raced_snapshot = None;
     for _ in 0..3 {
         let prepared = chunk
             .map(|p| prepare_chunk_admission(db, worktree, issue_id, p))
             .transpose()?;
-        let result = db.claim_dispatch_admitted(
+        let result = db.claim_dispatch_admitted_led(
             new,
             limit,
             allow_duplicate,
             prepared.as_ref(),
             allow_scope,
+            proof,
         )?;
         match result {
             Err(thegn_core::db::DispatchAdmissionDecision::RetryScopeSnapshot { row, path }) => {
@@ -913,6 +1002,7 @@ fn claim(
     chunk: Option<&str>,
     allow_duplicate: Option<&str>,
     allow_scope_overlap: Option<&str>,
+    proof: LeadProof<'_>,
     json: bool,
 ) -> Result<()> {
     let db = Db::open()?;
@@ -927,7 +1017,7 @@ fn claim(
     // slot, not when the worker fails to start.
     crate::cmd::session::policy_admission(cfg, agent_name, stage)?;
     let limit = stage_config.concurrency;
-    let outcome = claim_admitted_with_refresh(
+    let outcome = match claim_admitted_with_refresh_led(
         &db,
         NewDispatch {
             issue_id,
@@ -945,7 +1035,23 @@ fn claim(
         issue_id,
         chunk,
         allow_scope_overlap,
-    )?;
+        proof,
+    ) {
+        Ok(outcome) => outcome,
+        Err(error)
+            if error
+                .downcast_ref::<thegn_core::db::LeadLeaseConflict>()
+                .is_some() =>
+        {
+            if json {
+                super::emit_json(
+                    &serde_json::json!({"granted": false, "reason": error.to_string(), "error": "lead_lease"}),
+                )?;
+            }
+            return Err(error);
+        }
+        Err(error) => return Err(error),
+    };
     match outcome {
         Ok(id) => {
             let row = db.get_dispatch(id)?;
@@ -1443,7 +1549,14 @@ fn wants_a_reason(
         && !has_note
 }
 
-fn set_status(id: i64, status: &str, force: bool, why: Option<&str>, json: bool) -> Result<()> {
+fn set_status(
+    id: i64,
+    status: &str,
+    force: bool,
+    why: Option<&str>,
+    proof: LeadProof<'_>,
+    json: bool,
+) -> Result<()> {
     // Reject an unparseable status up front — writing `Unknown` back would
     // corrupt the roster the fix exists to protect. `Unknown` is a read-only
     // coercion, never a target a caller may set.
@@ -1458,7 +1571,7 @@ fn set_status(id: i64, status: &str, force: bool, why: Option<&str>, json: bool)
     let result = if db.get_dispatch(id)?.is_none() {
         Err(anyhow::Error::new(thegn_core::db::MissingDispatch { id }))
     } else {
-        set_status_on(&db, id, parsed, force, why, json)
+        set_status_on_led(&db, id, parsed, force, why, proof, json)
     };
     if json
         && let Err(error) = &result
@@ -1480,6 +1593,12 @@ fn set_status_error_kind(err: &anyhow::Error) -> Option<&'static str> {
             thegn_core::db::DispatchTransitionConflict::Stale { .. } => "stale",
         });
     }
+    if err
+        .downcast_ref::<thegn_core::db::LeadLeaseConflict>()
+        .is_some()
+    {
+        return Some("lead_lease");
+    }
     if err.downcast_ref::<DoneGateRefused>().is_some() {
         return Some("missing_evidence");
     }
@@ -1492,12 +1611,13 @@ fn set_status_error_kind(err: &anyhow::Error) -> Option<&'static str> {
     None
 }
 
-fn set_status_on(
+fn set_status_on_led(
     db: &Db,
     id: i64,
     parsed: AgentDispatchStatus,
     force: bool,
     why: Option<&str>,
+    proof: LeadProof<'_>,
     json: bool,
 ) -> Result<()> {
     let row = db
@@ -1518,8 +1638,9 @@ fn set_status_on(
             },
         ));
     }
+    db.check_dispatch_lead(id, proof)?;
     // Only `done` has artifact evidence requirements, and `--force` overrides
-    // that gate. The typed transition check below still applies when forced.
+    // that gate. The mutation repeats the lease check atomically with its write.
     if parsed == AgentDispatchStatus::Done && !force {
         done_gate_bound(db, &row)?;
     }
@@ -1532,22 +1653,29 @@ fn set_status_on(
                 "set-status done --force requires --why '<reason>' (recorded on the row)"
             )
         })?;
-        db.set_dispatch_status_forced(id, row.status, AgentDispatchStatus::Done, reason)?;
+        db.set_dispatch_status_forced_led(
+            id,
+            row.status,
+            AgentDispatchStatus::Done,
+            reason,
+            proof,
+        )?;
         Some(
             db.dispatch_override(id)?
                 .ok_or_else(|| anyhow::anyhow!("forced completion has no stored override"))?
                 .reason,
         )
     } else if let Some(w) = why.map(str::trim).filter(|w| !w.is_empty()) {
-        db.set_dispatch_status_checked(
+        db.set_dispatch_status_led(
             id,
             row.status,
             parsed,
             Some(&format!("set-status {}: {w}", parsed.as_str())),
+            proof,
         )?;
         None
     } else {
-        db.set_dispatch_status_checked(id, row.status, parsed, None)?;
+        db.set_dispatch_status_led(id, row.status, parsed, None, proof)?;
         None
     };
     let unexplained = wants_a_reason(
@@ -1599,11 +1727,13 @@ fn set_status_on(
 /// 2. The row carries a non-empty report with an explicit PASS and successful
 ///    gate citation. When the report has a recorded HEAD, that commit must
 ///    still contain the unchanged artifact.
+/// 3. An artifact-bearing row has a trusted gate attestation for its current
+///    committed HEAD and clean worktree.
 ///
-/// `--force` is the deliberate override for BOTH rules (the refusal names
+/// `--force` is the deliberate override for all three checks (the refusal names
 /// it). Pane-exit auto-stamps (`pty_drain.rs:855-895`) bypass the gate
 /// entirely — that path writes the typed status for attribution, not as a
-/// handoff verdict, so it is not subject to either check.
+/// handoff verdict, so it is not subject to these checks.
 #[cfg(test)]
 fn done_gate(row: &AgentDispatch) -> Result<()> {
     let report = pipeline_run::verify_report(&verify_facts(row));
@@ -1613,7 +1743,23 @@ fn done_gate(row: &AgentDispatch) -> Result<()> {
 fn done_gate_bound(db: &Db, row: &AgentDispatch) -> Result<()> {
     let report_head = db.dispatch_report_head(row.id)?;
     let facts = verify_facts_with_report_head(row, report_head.as_deref());
-    require_done_report(row.id, pipeline_run::verify_report(&facts))
+    require_done_report(row.id, pipeline_run::verify_report(&facts))?;
+    if row
+        .artifact_path
+        .as_deref()
+        .is_some_and(|path| !path.trim().is_empty())
+    {
+        let latest = db.latest_gate_attestation(row.id)?;
+        let trusted = gate::trusted_gate_for(row, latest.as_ref());
+        if !trusted.is_satisfied() {
+            return Err(DoneGateRefused {
+                id: row.id,
+                reasons: vec![trusted.detail(row.id)],
+            }
+            .into());
+        }
+    }
+    Ok(())
 }
 
 #[derive(Debug)]
@@ -1870,12 +2016,29 @@ fn reap_plan_limited(
         })
         .map(|run| (run.id, run))
         .collect();
-    Ok((reap_plan_rows(&rows, live_ids), run_refs, truncated))
+    let mut attestations = HashMap::new();
+    for row in &rows {
+        match db.latest_gate_attestation(row.id) {
+            Ok(Some(attestation)) => {
+                attestations.insert(row.id, attestation);
+            }
+            Ok(None) => {}
+            Err(error) => {
+                tracing::debug!(target: "thegn::pipeline", row = row.id, %error, "reap could not read latest gate attestation")
+            }
+        }
+    }
+    Ok((
+        reap_plan_rows(&rows, live_ids, &attestations),
+        run_refs,
+        truncated,
+    ))
 }
 
 fn reap_facts(
     f: &pipeline_run::VerifyFacts,
     worker: pipeline_reap::WorkerLiveness,
+    trusted_gate_ok: bool,
 ) -> pipeline_reap::ReapFacts {
     pipeline_reap::ReapFacts {
         worker,
@@ -1885,6 +2048,7 @@ fn reap_facts(
         report_verdict: f.report_verdict,
         report_gate_valid: f.report_gate_valid,
         worktree_unknown: f.worktree_state == Some(pipeline_run::WorktreeState::Unknown),
+        trusted_gate_ok,
         artifact_ok: f.stage.is_none()
             || (matches!(
                 &f.artifact_identity,
@@ -1899,6 +2063,7 @@ fn reap_facts(
 pub(crate) fn reap_plan_rows(
     rows: &[AgentDispatch],
     live_ids: Option<&[String]>,
+    attestations: &HashMap<i64, thegn_core::StoredGateAttestation>,
 ) -> Vec<pipeline_reap::Reap> {
     pipeline_reap::plan(rows, |r| {
         let facts = verify_facts(r);
@@ -1913,7 +2078,18 @@ pub(crate) fn reap_plan_rows(
         } else {
             pipeline_reap::WorkerLiveness::Unknown
         };
-        reap_facts(&facts, worker)
+        let trusted_gate_ok = if facts.tracked
+            && facts.report_present
+            && facts.report_gate_valid
+            && facts.report_verdict == pipeline_report::Verdict::Pass
+        {
+            attestations.get(&r.id).is_some_and(|attestation| {
+                gate::trusted_gate_for(r, Some(attestation)).is_satisfied()
+            })
+        } else {
+            false
+        };
+        reap_facts(&facts, worker, trusted_gate_ok)
     })
 }
 
@@ -2110,11 +2286,19 @@ fn verify(id: i64, json: bool) -> Result<()> {
     let report_head = db.dispatch_report_head(id)?;
     let facts = verify_facts_with_report_head(&row, report_head.as_deref());
     let report = pipeline_run::verify_report(&facts);
+    let latest = db.latest_gate_attestation(id)?;
+    let trusted = gate::trusted_gate_for(&row, latest.as_ref());
     if json {
         // One flat document — the report plus the row id — so a supervisor can
         // grep `"ok":false` / `"id":12` from a single line.
         let mut v = serde_json::to_value(&report)?;
         v["id"] = serde_json::json!(id);
+        v["trusted_gate"] = serde_json::json!({
+            "state": trusted.token(),
+            "detail": trusted.detail(id),
+            "attestation_id": latest.as_ref().map(|attestation| attestation.id),
+        });
+        v["worker_gate_claim"] = serde_json::json!("non-authoritative");
         super::emit_json(&v)?;
     } else {
         let (a, warnings, reasons) = verify_human_text(
@@ -2131,6 +2315,8 @@ fn verify(id: i64, json: bool) -> Result<()> {
             yes_no(report.report_present),
             yes_no(report.ok)
         );
+        outln!("  trusted gate: {}", trusted.detail(id));
+        outln!("  worker gate claim: non-authoritative");
         for warning in &warnings {
             outln!("  warning: {warning}");
         }
@@ -2850,8 +3036,16 @@ mod tests {
         db.update_dispatch_status(id, AgentDispatchStatus::Done)
             .unwrap();
 
-        let err =
-            set_status_on(&db, id, AgentDispatchStatus::Running, false, None, true).unwrap_err();
+        let err = set_status_on_led(
+            &db,
+            id,
+            AgentDispatchStatus::Running,
+            false,
+            None,
+            LeadProof::Unbound,
+            true,
+        )
+        .unwrap_err();
         assert!(err.to_string().contains("done to running"));
         assert_eq!(
             db.get_dispatch(id).unwrap().unwrap().status,
@@ -2893,8 +3087,16 @@ mod tests {
         let id = db
             .put_agent_dispatch(NewDispatch::new("linear:THE-977", "/wt/queued", "claude"))
             .unwrap();
-        let error =
-            set_status_on(&db, id, AgentDispatchStatus::Done, false, None, true).unwrap_err();
+        let error = set_status_on_led(
+            &db,
+            id,
+            AgentDispatchStatus::Done,
+            false,
+            None,
+            LeadProof::Unbound,
+            true,
+        )
+        .unwrap_err();
         assert_eq!(set_status_error_kind(&error), Some("illegal_transition"));
         assert!(error.to_string().contains("queued to done"));
     }
@@ -2910,8 +3112,16 @@ mod tests {
             .unwrap();
         db.update_dispatch_status(id, AgentDispatchStatus::Running)
             .unwrap();
-        let error =
-            set_status_on(&db, id, AgentDispatchStatus::Done, false, None, true).unwrap_err();
+        let error = set_status_on_led(
+            &db,
+            id,
+            AgentDispatchStatus::Done,
+            false,
+            None,
+            LeadProof::Unbound,
+            true,
+        )
+        .unwrap_err();
         assert_eq!(set_status_error_kind(&error), Some("missing_evidence"));
         assert!(error.to_string().contains("not verifiably finished"));
     }
@@ -2928,7 +3138,16 @@ mod tests {
         db.update_dispatch_status(id, AgentDispatchStatus::Merged)
             .unwrap();
 
-        let err = set_status_on(&db, id, AgentDispatchStatus::Done, false, None, true).unwrap_err();
+        let err = set_status_on_led(
+            &db,
+            id,
+            AgentDispatchStatus::Done,
+            false,
+            None,
+            LeadProof::Unbound,
+            true,
+        )
+        .unwrap_err();
         assert!(matches!(
             err.downcast_ref::<thegn_core::db::DispatchTransitionConflict>(),
             Some(thegn_core::db::DispatchTransitionConflict::Illegal {
@@ -2950,7 +3169,18 @@ mod tests {
             ))
             .unwrap();
         for why in [None, Some("  ")] {
-            assert!(set_status_on(&db, id, AgentDispatchStatus::Done, true, why, true).is_err());
+            assert!(
+                set_status_on_led(
+                    &db,
+                    id,
+                    AgentDispatchStatus::Done,
+                    true,
+                    why,
+                    LeadProof::Unbound,
+                    true,
+                )
+                .is_err()
+            );
             assert_eq!(
                 db.get_dispatch(id).unwrap().unwrap().status,
                 AgentDispatchStatus::Queued
@@ -2959,7 +3189,16 @@ mod tests {
             assert_eq!(db.dispatch_note_count(id, None).unwrap(), 0);
         }
         assert!(
-            set_status_on(&db, id, AgentDispatchStatus::Running, true, Some("x"), true).is_err()
+            set_status_on_led(
+                &db,
+                id,
+                AgentDispatchStatus::Running,
+                true,
+                Some("x"),
+                LeadProof::Unbound,
+                true,
+            )
+            .is_err()
         );
         assert_eq!(
             db.get_dispatch(id).unwrap().unwrap().status,
@@ -2980,12 +3219,13 @@ mod tests {
             .unwrap();
         db.update_dispatch_status(id, AgentDispatchStatus::Running)
             .unwrap();
-        set_status_on(
+        set_status_on_led(
             &db,
             id,
             AgentDispatchStatus::Done,
             true,
             Some("reviewed"),
+            LeadProof::Unbound,
             true,
         )
         .unwrap();
@@ -4176,7 +4416,7 @@ mod tests {
             done_error.contains("verdict is fail") && done_error.contains("Lead"),
             "{done_error}"
         );
-        let plan = reap_plan_rows(&[row], Some(&[]));
+        let plan = reap_plan_rows(&[row], Some(&[]), &HashMap::new());
         assert_eq!(plan.len(), 1);
         assert!(!matches!(
             &plan[0].verdict,
@@ -4422,7 +4662,7 @@ mod tests {
         let mut row = row_in(std::path::Path::new("/unused"), None);
         row.exit_code = Some(0);
         row.exited_at_ms = Some(1);
-        let plan = reap_plan_rows(&[row], Some(&[]));
+        let plan = reap_plan_rows(&[row], Some(&[]), &HashMap::new());
         assert!(matches!(
             &plan[0].verdict,
             pipeline_reap::ReapVerdict::MarkFailed { .. }
@@ -4624,7 +4864,7 @@ mod tests {
             report_gate_valid: true,
             report_commit_binding: pipeline_run::ReportCommitBinding::Bound,
         };
-        let reap = reap_facts(&facts, pipeline_reap::WorkerLiveness::Exited);
+        let reap = reap_facts(&facts, pipeline_reap::WorkerLiveness::Exited, false);
         assert!(reap.worktree_unknown);
         assert_eq!(reap.worker, pipeline_reap::WorkerLiveness::Exited);
     }
@@ -4681,6 +4921,10 @@ mod tests {
                     chunk: None,
                     allow_duplicate: None,
                     allow_scope_overlap: None,
+                    lease: None,
+                    owner: None,
+                    admin: false,
+                    why: None,
                     json: false,
                 },
                 WorkerRoute::Refused("claim"),
@@ -4707,6 +4951,9 @@ mod tests {
                     status: "done".into(),
                     force: false,
                     why: None,
+                    lease: None,
+                    owner: None,
+                    admin: false,
                     json: false,
                 },
                 WorkerRoute::Refused("set-status"),
@@ -4914,12 +5161,125 @@ mod tests {
         let mut row = row_in(&root, Some("README.md"));
         row.report = Some("PASS\ngate: just test -- exit 0".into());
         row.exit_code = Some(0);
-        let plan = reap_plan_rows(&[row], Some(&[]));
+        let plan = reap_plan_rows(&[row], Some(&[]), &HashMap::new());
         assert_eq!(plan.len(), 1);
         assert!(
             !matches!(&plan[0].verdict, pipeline_reap::ReapVerdict::CloseDone),
             "a committed non-canonical artifact must not be reaped done"
         );
+    }
+
+    fn trusted_done_fixture(
+        name: &str,
+    ) -> (
+        tempfile::TempDir,
+        tempfile::TempDir,
+        Db,
+        AgentDispatch,
+        std::path::PathBuf,
+    ) {
+        let (repo_dir, root) = git_repo(name);
+        let (db_dir, db) = db(name);
+        let id = db
+            .put_agent_dispatch(NewDispatch {
+                stage: Some("code"),
+                artifact_path: None,
+                ..NewDispatch::new("linear:THE-1130", root.to_str().unwrap(), "coder")
+            })
+            .unwrap();
+        let artifact = pipeline_run::artifact_path("linear:THE-1130", "code", id);
+        assert_eq!(
+            db.publish_dispatch_run(id, "trusted-session", &artifact)
+                .unwrap(),
+            thegn_core::issue::DispatchRunPublishOutcome::Published
+        );
+        let path = root.join(&artifact);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, "# trusted handoff\n").unwrap();
+        assert!(git_ok(&root, &["add", "--", artifact.as_str()]));
+        assert!(git_ok(&root, &["commit", "-q", "-m", "trusted artifact"]));
+        db.set_dispatch_report(id, "PASS\ngate: just test -- exit 0")
+            .unwrap();
+        let row = db.get_dispatch(id).unwrap().unwrap();
+        (repo_dir, db_dir, db, row, root)
+    }
+
+    fn record_current_gate_attestation(
+        db: &Db,
+        row: &AgentDispatch,
+        root: &std::path::Path,
+        log_path: &std::path::Path,
+    ) {
+        std::fs::write(log_path, "passed\n").unwrap();
+        let worktree = std::fs::canonicalize(root).unwrap();
+        let common = git_out_allow_empty(
+            root,
+            &["rev-parse", "--path-format=absolute", "--git-common-dir"],
+        )
+        .unwrap();
+        let repo = std::fs::canonicalize(common.trim()).unwrap();
+        let branch_ref = git_out_allow_empty(root, &["symbolic-ref", "-q", "HEAD"]).unwrap();
+        let commit_oid =
+            git_out_allow_empty(root, &["rev-parse", "--verify", "HEAD^{commit}"]).unwrap();
+        let tree_oid =
+            git_out_allow_empty(root, &["rev-parse", "--verify", "HEAD^{tree}"]).unwrap();
+        let attestation = thegn_core::pipeline_gate_attest::GateAttestation {
+            dispatch_row: row.id,
+            repo: repo.display().to_string(),
+            worktree: worktree.display().to_string(),
+            branch_ref: branch_ref.trim().to_string(),
+            commit_oid: commit_oid.trim().to_string(),
+            tree_oid: tree_oid.trim().to_string(),
+            command: "just test".to_string(),
+            started_ms: 1,
+            ended_ms: 2,
+            exit: Some(0),
+            log_path: log_path.display().to_string(),
+            runner: thegn_core::pipeline_gate_attest::GateRunner::LeadRunner,
+        };
+        db.record_gate_attestation(
+            &attestation,
+            thegn_core::pipeline_gate_attest::GateOutcome::Passed,
+            "",
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn trusted_done_refuses_pass_without_attestation() {
+        let (_repo_dir, _db_dir, db, row, _root) = trusted_done_fixture("trusted-done-missing");
+        assert!(
+            done_gate(&row).is_ok(),
+            "the report claim is valid by itself"
+        );
+        let error = done_gate_bound(&db, &row).unwrap_err().to_string();
+        assert!(error.contains("dispatch gate"), "{error}");
+    }
+
+    #[test]
+    fn trusted_done_accepts_a_current_head_attestation() {
+        let (_repo_dir, db_dir, db, row, root) = trusted_done_fixture("trusted-done-current");
+        let log_path = db_dir.path().join("gate.log");
+        record_current_gate_attestation(&db, &row, &root, &log_path);
+        let status = git_out_allow_empty(&root, &["status", "--porcelain"]).unwrap();
+        assert!(status.is_empty(), "fixture worktree is dirty: {status}");
+        done_gate_bound(&db, &row).unwrap();
+    }
+
+    #[test]
+    fn trusted_reap_needs_decision_without_attestation() {
+        let (_repo_dir, _db_dir, _db, mut row, _root) =
+            trusted_done_fixture("trusted-reap-missing");
+        row.exit_code = Some(0);
+        let plan = reap_plan_rows(&[row], Some(&[]), &HashMap::new());
+        assert!(matches!(
+            &plan[0].verdict,
+            pipeline_reap::ReapVerdict::NeedsDecision { why } if why.contains("dispatch gate")
+        ));
+        assert!(!matches!(
+            &plan[0].verdict,
+            pipeline_reap::ReapVerdict::CloseDone
+        ));
     }
 
     fn poison_terminal_report(path: &std::path::Path, id: i64) {
@@ -5077,5 +5437,98 @@ mod tests {
         poison_terminal_report(&db.file_path().unwrap(), terminal.id);
 
         assert!(list_rows(&db, false).is_err());
+    }
+
+    #[test]
+    fn lead_lease_flags_parse_for_claim_set_status_and_session_open() {
+        use clap::Parser as _;
+        for args in [
+            vec![
+                "thegn",
+                "dispatch",
+                "claim",
+                "linear:X-1",
+                "/wt",
+                "coder",
+                "--stage",
+                "code",
+                "--lease",
+                "n",
+                "--owner",
+                "o",
+            ],
+            vec![
+                "thegn",
+                "dispatch",
+                "set-status",
+                "1",
+                "done",
+                "--lease",
+                "n",
+                "--owner",
+                "o",
+            ],
+            vec![
+                "thegn",
+                "dispatch",
+                "set-status",
+                "1",
+                "failed",
+                "--admin",
+                "--why",
+                "x",
+            ],
+            vec![
+                "thegn",
+                "session",
+                "open",
+                "--stage",
+                "code",
+                "--issue",
+                "linear:X-1",
+                "--worktree",
+                "/wt",
+                "--lease",
+                "n",
+                "--owner",
+                "o",
+            ],
+        ] {
+            assert!(crate::Cli::try_parse_from(args).is_ok());
+        }
+        assert!(
+            crate::Cli::try_parse_from([
+                "thegn",
+                "dispatch",
+                "claim",
+                "linear:X-1",
+                "/wt",
+                "coder",
+                "--stage",
+                "code",
+                "--lease",
+                "n"
+            ])
+            .is_err()
+        );
+        assert!(
+            crate::Cli::try_parse_from([
+                "thegn",
+                "dispatch",
+                "set-status",
+                "1",
+                "failed",
+                "--admin"
+            ])
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn lead_lease_conflict_has_its_own_error_kind() {
+        let error = anyhow::Error::new(thegn_core::db::LeadLeaseConflict::Required {
+            lease: "repo:issue".into(),
+        });
+        assert_eq!(set_status_error_kind(&error), Some("lead_lease"));
     }
 }

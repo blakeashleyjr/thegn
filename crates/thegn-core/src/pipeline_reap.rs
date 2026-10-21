@@ -52,6 +52,8 @@ pub struct ReapFacts {
     pub report_gate_valid: bool,
     /// The clean-worktree probe failed, so its state is unknown.
     pub worktree_unknown: bool,
+    /// The row's latest trusted gate attestation is satisfied for its current HEAD.
+    pub trusted_gate_ok: bool,
 }
 
 /// What the caller can establish about a worker from the daemon and durable
@@ -79,8 +81,8 @@ pub enum ReapVerdict {
     },
     /// The row is already terminal; nothing to reap.
     Closed,
-    /// Worker gone, artifact committed, report filed. The handoff is complete
-    /// and `set-status done` will pass its gate unforced.
+    /// Worker gone, artifact committed, report filed, and the trusted gate
+    /// attestation satisfies current HEAD. `set-status done` will pass unforced.
     CloseDone,
     /// Worker gone and the artifact was never committed. There is no handoff,
     /// so the stage did not complete. Safe to record as failed with a reason.
@@ -182,6 +184,11 @@ pub fn classify(row: &AgentDispatch, facts: &ReapFacts) -> ReapVerdict {
         (true, true, crate::pipeline_report::Verdict::Pass) if !facts.artifact_ok => {
             ReapVerdict::NeedsDecision {
                 why: "worker is gone and its committed artifact is not this row's non-empty canonical handoff — Lead must review the row and decide whether to close it",
+            }
+        }
+        (true, true, crate::pipeline_report::Verdict::Pass) if !facts.trusted_gate_ok => {
+            ReapVerdict::NeedsDecision {
+                why: "worker is gone and its report claims PASS, but no trusted gate attestation covers its HEAD — run `thegn dispatch gate <row>`, then `thegn dispatch set-status <row> done`",
             }
         }
         (true, true, crate::pipeline_report::Verdict::Pass) => ReapVerdict::CloseDone,
@@ -329,6 +336,7 @@ mod tests {
         report_verdict: crate::pipeline_report::Verdict::Pass,
         report_gate_valid: true,
         worktree_unknown: false,
+        trusted_gate_ok: true,
     };
 
     #[test]
@@ -377,7 +385,7 @@ mod tests {
 
     #[test]
     fn gone_with_a_committed_artifact_and_a_report_closes_clean() {
-        // The only case that may auto-close: the gate would pass unforced.
+        // The only case that may auto-close: report and trusted gate pass unforced.
         assert_eq!(
             classify(&row(1, S::Running), &GONE_COMMITTED_REPORTED),
             ReapVerdict::CloseDone
@@ -385,9 +393,23 @@ mod tests {
     }
 
     #[test]
+    fn pass_without_trusted_gate_needs_decision() {
+        let facts = ReapFacts {
+            trusted_gate_ok: false,
+            ..GONE_COMMITTED_REPORTED
+        };
+        let verdict = classify(&row(1, S::Running), &facts);
+        assert!(matches!(
+            verdict,
+            ReapVerdict::NeedsDecision { why } if why.contains("dispatch gate")
+        ));
+    }
+
+    #[test]
     fn an_exited_worker_with_unknown_worktree_status_is_never_closed_done() {
         let facts = ReapFacts {
             worktree_unknown: true,
+            trusted_gate_ok: true,
             artifact_ok: true,
             ..GONE_COMMITTED_REPORTED
         };
@@ -418,6 +440,7 @@ mod tests {
             report_verdict: crate::pipeline_report::Verdict::None,
             report_gate_valid: false,
             worktree_unknown: true,
+            trusted_gate_ok: true,
             artifact_ok: true,
         };
         assert!(matches!(
@@ -456,6 +479,7 @@ mod tests {
             report_verdict: crate::pipeline_report::Verdict::None,
             report_gate_valid: true,
             worktree_unknown: false,
+            trusted_gate_ok: true,
             artifact_ok: true,
             ..GONE_COMMITTED_REPORTED
         };
@@ -477,6 +501,7 @@ mod tests {
             report_verdict: crate::pipeline_report::Verdict::None,
             report_gate_valid: true,
             worktree_unknown: false,
+            trusted_gate_ok: true,
             artifact_ok: true,
         };
         match classify(&row(1, S::Running), &f) {
@@ -501,6 +526,7 @@ mod tests {
             report_verdict: crate::pipeline_report::Verdict::None,
             report_gate_valid: true,
             worktree_unknown: false,
+            trusted_gate_ok: true,
             artifact_ok: true,
         };
         match classify(&row(1, S::Running), &f) {
@@ -521,6 +547,7 @@ mod tests {
             report_verdict: crate::pipeline_report::Verdict::Pass,
             report_gate_valid: true,
             worktree_unknown: false,
+            trusted_gate_ok: true,
             artifact_ok: true,
         };
         assert!(matches!(
@@ -549,6 +576,7 @@ mod tests {
                 report_verdict: crate::pipeline_report::Verdict::None,
                 report_gate_valid: true,
                 worktree_unknown: false,
+                trusted_gate_ok: true,
                 artifact_ok: true,
                 ..GONE_COMMITTED_REPORTED
             },
@@ -560,6 +588,7 @@ mod tests {
                 report_verdict: crate::pipeline_report::Verdict::None,
                 report_gate_valid: true,
                 worktree_unknown: false,
+                trusted_gate_ok: true,
                 artifact_ok: true,
             },
         });

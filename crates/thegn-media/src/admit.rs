@@ -4,7 +4,7 @@ use std::time::Duration;
 
 use futures::future::BoxFuture;
 
-use crate::model::{self, LoopMode, MediaState, Playlist, QueueItem};
+use crate::model::{self, LoopMode, MediaState, Playlist, QueueItem, QueuePage};
 use crate::{MediaBackend, MediaCaps, MediaClient, MediaError, MediaSnapshot, MediaWatch};
 
 /// A media backend whose provider data and opaque IDs pass canonical admission.
@@ -85,10 +85,28 @@ impl MediaBackend for Admitted {
     }
     fn queue(&self) -> BoxFuture<'_, Result<Vec<QueueItem>, MediaError>> {
         Box::pin(async move {
-            self.0
-                .queue()
-                .await
-                .map(|items| items.into_iter().filter_map(QueueItem::admitted).collect())
+            self.0.queue().await.map(|items| {
+                items
+                    .into_iter()
+                    .take(model::MAX_QUEUE_ITEMS)
+                    .filter_map(QueueItem::admitted)
+                    .collect()
+            })
+        })
+    }
+    /// The total may include rows dropped during admission because their IDs are invalid.
+    fn queue_page(&self) -> BoxFuture<'_, Result<QueuePage, MediaError>> {
+        Box::pin(async move {
+            let page = self.0.queue_page().await?;
+            Ok(QueuePage {
+                total: page.total.max(page.items.len()),
+                items: page
+                    .items
+                    .into_iter()
+                    .take(model::MAX_QUEUE_ITEMS)
+                    .filter_map(QueueItem::admitted)
+                    .collect(),
+            })
         })
     }
     fn play_queue_item<'a>(&'a self, id: &'a str) -> BoxFuture<'a, Result<(), MediaError>> {
@@ -194,10 +212,9 @@ mod tests {
     fn fake_with_players(
         players: Result<Vec<String>, MediaError>,
     ) -> (Admitted, std::sync::Arc<Mutex<Vec<String>>>) {
-        let calls = std::sync::Arc::new(Mutex::new(Vec::new()));
-        let client: MediaClient = Box::new(Fake {
-            calls: calls.clone(),
-            items: Mutex::new(vec![
+        fake_with_items(
+            players,
+            vec![
                 QueueItem {
                     id: "first".into(),
                     ..Default::default()
@@ -210,7 +227,18 @@ mod tests {
                     id: "last".into(),
                     ..Default::default()
                 },
-            ]),
+            ],
+        )
+    }
+
+    fn fake_with_items(
+        players: Result<Vec<String>, MediaError>,
+        items: Vec<QueueItem>,
+    ) -> (Admitted, std::sync::Arc<Mutex<Vec<String>>>) {
+        let calls = std::sync::Arc::new(Mutex::new(Vec::new()));
+        let client: MediaClient = Box::new(Fake {
+            calls: calls.clone(),
+            items: Mutex::new(items),
             caps: MediaCaps {
                 queue: true,
                 signals: true,
@@ -249,6 +277,36 @@ mod tests {
         assert_eq!(snapshot.caps, admitted.caps());
         assert_eq!(snapshot.state.title.len(), model::MAX_FIELD_BYTES);
         assert!(snapshot.state.track_id.is_none());
+    }
+
+    #[tokio::test]
+    async fn queue_page_is_capped_at_ingress_and_keeps_the_reported_total() {
+        let rows = (0..model::MAX_QUEUE_ITEMS + 3)
+            .map(|index| QueueItem {
+                id: format!("row-{index}"),
+                ..Default::default()
+            })
+            .collect();
+        let (admitted, _) = fake_with_items(Ok(Vec::new()), rows);
+
+        let page = admitted.queue_page().await.unwrap();
+        assert_eq!(page.items.len(), model::MAX_QUEUE_ITEMS);
+        assert_eq!(page.total, model::MAX_QUEUE_ITEMS + 3);
+        assert_eq!(
+            admitted.queue().await.unwrap().len(),
+            model::MAX_QUEUE_ITEMS
+        );
+
+        let rows = (0..model::MAX_QUEUE_ITEMS + 1)
+            .map(|index| QueueItem {
+                id: format!("cap-row-{index}"),
+                ..Default::default()
+            })
+            .collect();
+        let (admitted, _) = fake_with_items(Ok(Vec::new()), rows);
+        let page = admitted.queue_page().await.unwrap();
+        assert_eq!(page.items.len(), model::MAX_QUEUE_ITEMS);
+        assert_eq!(page.total, model::MAX_QUEUE_ITEMS + 1);
     }
 
     #[tokio::test]

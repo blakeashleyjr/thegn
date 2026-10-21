@@ -981,7 +981,7 @@ mod egress_tests {
     #[test]
     fn matching_readback_admits_without_destroy() {
         let (allow, block) = policy_lists();
-        let steps = ScriptedEgress::new(Ok(()), Ok(rules_from(&allow, &block)), Ok(()));
+        let steps = ScriptedEgress::new(Ok(()), Ok(rules_from(&allow, &block).unwrap()), Ok(()));
 
         assert!(admit_egress(&steps, "sandbox-1", &allow, &block).is_ok());
         assert_eq!(steps.calls(), ["apply:sandbox-1", "read:sandbox-1"]);
@@ -1035,7 +1035,8 @@ mod egress_tests {
                 .err()
                 .map(|error| error.to_string())
                 .is_some_and(|message| {
-                    message.contains("was destroyed") && message.contains("expected 3, observed 0")
+                    message.contains("was destroyed")
+                        && message.contains("expected 3 rules, observed 0")
                 })
         );
         assert_eq!(
@@ -1047,7 +1048,7 @@ mod egress_tests {
     #[test]
     fn reordered_readback_mismatch_destroys_and_errs() {
         let (allow, block) = policy_lists();
-        let expected = rules_from(&allow, &block);
+        let expected = rules_from(&allow, &block).unwrap();
         let observed = vec![
             expected[1].clone(),
             expected[0].clone(),
@@ -1062,7 +1063,8 @@ mod egress_tests {
                 .err()
                 .map(|error| error.to_string())
                 .is_some_and(|message| {
-                    message.contains("was destroyed") && message.contains("expected 3, observed 3")
+                    message.contains("was destroyed")
+                        && message.contains("expected 3 rules, observed 3")
                 })
         );
         assert_eq!(

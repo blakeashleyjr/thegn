@@ -63,7 +63,10 @@ pub use automation::{
 };
 pub use autopilot::{AutopilotStore, ClaimOutcome};
 pub use cache::CacheStore;
-pub use calendar::{CalendarRow, CalendarStore, CalendarSyncRow};
+pub use calendar::{
+    CalendarCursor, CalendarPageApplied, CalendarPageWrite, CalendarRow, CalendarStore,
+    CalendarSyncRow, CalendarTombstones, EmptySnapshot,
+};
 pub use compute::{ComputeBudgetRow, ComputeLedgerStore, ComputeMeterRow};
 pub use control::{ControlStore, DaemonRow, LeaseRow, PairingRow};
 pub use hibernate::{HibernationRow, HibernationStore};

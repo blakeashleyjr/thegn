@@ -70,6 +70,10 @@ changes.
 Keyring operations run on one worker. While an earlier keyring call is stuck
 past its timeout, further keyring operations fail at once without starting,
 and nothing is written to a file instead.
+Remote calendar account tokens appear in `thegn secret list` and `audit` as
+`calendar.accounts[<name>].token`. `thegn secret migrate` moves a literal token
+to a 0600 file reference and rewrites only that account's token; an account
+defined in another config layer is skipped with a message to move it by hand.
 
 ### Tailing the event feed
 
@@ -175,9 +179,14 @@ thegn --profile <source> session move <worktree> --to-profile <target>
 `--profile` (or `THEGN_PROFILE`) selects the source; `<target>` must already
 exist. The exact stored worktree path is selected. The move carries its
 worktree registration, all matching current groups and tabs, sidebar
-collapse/pin state, and dispatch ledger (including notes and artifact/chunk
-paths). Pane commands, scrollback, reports, and notes are opaque text and are
-carried unchanged, but never printed by the audit. Named global layouts,
+collapse/pin state, and dispatch ledger (including notes). Active dispatch
+rows (queued, spawning, running, waiting for a human, or PR open) arrive as
+`abandoned` with a `migrated while <status>: not resumed` note; every row's
+artifact and chunk paths are dropped, so work is neither resumed nor
+re-dispatched under the target profile. Pane commands, scrollback, and reports
+are opaque text and are carried unchanged; notes are carried unchanged apart
+from the migration prefix on parked rows. These values are never printed by
+the audit. Named global layouts,
 global caches, transports, git files/objects, branches, and worktree disk
 locations are not moved. Neither profile configuration nor credentials,
 tokens, identities, accounts, pairings, or secrets are read or copied.
@@ -223,6 +232,13 @@ redacted cached job-log tail. It reads the cache first and uses the daemon's
 blocking provider lane for a miss; `ci log` remains a compatibility alias.
 With `--json`, stdout is one valid JSON value with explicit `fetched_at`,
 `truncated`, and `redacted` metadata.
+
+When a GitLab job list reaches its page or row budget, `thegn ci view` and
+`ci logs` warn that the list is incomplete and show the first jobs. Incomplete
+details are not used to ingest job logs, so their logs are not cached and CI
+autofix does not start from them. `thegn ci trigger -i KEY=VALUE` inputs are
+validated before any provider request; malformed or duplicate keys, control
+characters, and oversized keys or values are refused.
 
 `thegn ci runs --json` emits a JSON array on success. If provider fetching fails,
 or the provider returns a partial list containing malformed rows, it emits an
@@ -292,8 +308,11 @@ through the isolated fold-gate executor and records a trusted attestation bound
 to that worktree's committed HEAD. This explicit Lead-only invocation runs even
 when `[merge_queue] gate_on = false`; that switch controls automatic fold gating.
 It is refused under a worker dispatch capability, when no gate is configured,
-or when the row's worktree is missing, detached, or dirty. `dispatch verify` and
-`dispatch set-status done` do not consume this attestation yet.
+or when the row's worktree is missing, detached, or dirty. `dispatch set-status done`
+on an artifact-bearing row, `dispatch reap`, and the daemon's periodic reap require
+a satisfied attestation for the row's current HEAD; `dispatch verify` shows its
+state. The worker's own `gate:` line is a claim, not evidence. `--force --why`
+remains the recorded override.
 
 `dispatch set-status` follows a transition table: `merged` is reachable only
 from `done` or `pr_open`; `done` only from `running`, `spawning`,
@@ -302,6 +321,8 @@ only `done` → `merged` or `abandoned`, and `failed` → `done` or `abandoned`.
 With `--json`, a classified refusal prints `{"error": ..., "id": ..., "message":
 ...}` with an error kind of `illegal_transition`, `stale`, `missing_evidence` or
 `missing_row` before the command fails.
+
+`dispatch claim`, `session open --stage --issue` and `dispatch set-status` take `--lease <name> --owner <id>`. A claim binds the row to that lease; further claims for that issue and status changes on bound rows require the same live lease. `--admin --why '<reason>'` on claim or set-status is the manual override and is recorded on the row. Rows claimed without a lease behave as before.
 
 The `[pipeline.transport_retry]` budget is stored on each dispatch row and
 counted once per run. It survives daemon restarts without exceeding the

@@ -283,6 +283,7 @@ fn delivery_from_read(
         .map(|snapshot| crate::media_watch::MediaSnapshotDelivery {
             generation,
             snapshot,
+            health: None,
         })
 }
 
@@ -495,6 +496,7 @@ pub(crate) fn restart_media_watch(
             crate::media_watch::MediaSnapshotDelivery {
                 generation: generation_value,
                 snapshot: None,
+                health: Some(crate::media_watch::MediaHealth::Fresh),
             },
         ) && let Err(error) = waker.wake()
         {
@@ -784,7 +786,7 @@ pub(crate) fn spawn_media_queue(
     let handle = tokio::spawn(async move {
         let queue = within_media_budget(async {
             match crate::media_secret::client_for(&cfg).await {
-                Ok(client) => match client.queue().await {
+                Ok(client) => match client.queue_page().await {
                     Ok(queue) => Ok(queue),
                     Err(e) => {
                         tracing::debug!(target: "thegn::media", error = %e, "media queue fetch failed");

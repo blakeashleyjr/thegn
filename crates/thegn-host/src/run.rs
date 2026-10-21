@@ -13472,6 +13472,7 @@ async fn event_loop<T: Terminal>(
             media_generation.current(),
             &mut model.panel.media,
             &mut media_caps,
+            &mut panel_ui.media.health,
             media_position_visible,
             &mut last_media_full,
         );
@@ -13529,9 +13530,11 @@ async fn event_loop<T: Terminal>(
         // Docked Media section feeds: up-next queue + decoded cover art.
         if let Some(delivery) = media_queue_slot.take() {
             loop_perf.tick(crate::perf::WakeSource::Refresh);
-            panel_ui
-                .media
-                .set_queue(delivery.request, model.panel.media.as_ref(), delivery.queue);
+            panel_ui.media.set_queue_page(
+                delivery.request,
+                model.panel.media.as_ref(),
+                delivery.queue,
+            );
             dirty = true;
         }
         if let Some(delivery) = media_sources_slot.take() {
@@ -16307,7 +16310,7 @@ async fn event_loop<T: Terminal>(
                     replay.is_some(),
                 );
                 if occluded_now && !corner_occluded {
-                    pending_corner_oob.require_delete();
+                    pending_corner_oob.occlude();
                 }
                 let queued_bytes = corner_gfx.iter().map(Vec::len).sum::<usize>();
                 let (draw, truncated) = crate::kitty_relay::coalesce_gfx_within(

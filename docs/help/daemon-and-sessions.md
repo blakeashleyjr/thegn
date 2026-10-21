@@ -21,6 +21,13 @@ not a replay.
 - **Quit and kill** ends the sessions too — the explicit "I'm done"
   option.
 
+`thegn daemon stop` stops every pane daemon this state directory knows about
+(registered current and pre-upgrade daemons, the configured socket, and a live
+legacy socket), skips sockets that belong to another state directory, waits
+for each to stop answering, and exits non-zero naming any that are still
+running. With none running it prints "no thegn pane daemon is running" and
+succeeds.
+
 When the UI exits, in-flight custom git commands and CI refreshes are cancelled.
 Thegn waits up to two seconds for them before exiting; work still running after
 that is logged.
@@ -95,11 +102,15 @@ credential environment are never loaded into the source process. The git
 worktree directory, branch, and git objects stay where they are.
 
 The persisted worktree registration, every matching current group and tab,
-sidebar collapse/pin keys, and the dispatch ledger (including notes and
-artifact/chunk paths) are imported. Current layout groups/tabs are moved;
+sidebar collapse/pin keys, and the dispatch ledger (including notes) are
+imported. Active dispatch rows (queued, spawning, running, waiting for a
+human, or PR open) arrive as `abandoned` with a `migrated while <status>: not
+resumed` note. Every row's artifact and chunk paths are dropped, so work is
+neither resumed nor re-dispatched under the target profile. Current layout groups/tabs are moved;
 named global layouts, caches, active transports, and whole-session focus are
-not. Opaque pane commands, scrollback, dispatch reports, and notes remain
-unchanged in the target but are omitted from human and JSON audit output.
+not. Opaque pane commands, scrollback, and dispatch reports remain unchanged
+in the target; notes remain unchanged apart from the migration prefix on parked
+rows. These values are omitted from human and JSON audit output.
 Credentials, tokens, identities, config overlays, accounts, pairings, and
 secrets never cross the profile boundary.
 

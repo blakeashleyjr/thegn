@@ -58,6 +58,26 @@ pub struct StoredGateAttestation {
     pub reason: String,
 }
 
+impl StoredGateAttestation {
+    /// Reconstruct the pure attestation, refusing unknown runner identities.
+    pub fn attestation(&self) -> Option<GateAttestation> {
+        Some(GateAttestation {
+            dispatch_row: self.dispatch_row,
+            repo: self.repo.clone(),
+            worktree: self.worktree.clone(),
+            branch_ref: self.branch_ref.clone(),
+            commit_oid: self.commit_oid.clone(),
+            tree_oid: self.tree_oid.clone(),
+            command: self.command.clone(),
+            started_ms: self.started_ms,
+            ended_ms: self.ended_ms,
+            exit: self.exit,
+            log_path: self.log_path.clone(),
+            runner: GateRunner::parse(&self.runner)?,
+        })
+    }
+}
+
 fn valid_oid(oid: &str) -> bool {
     matches!(oid.len(), 40 | 64)
         && oid
@@ -247,6 +267,17 @@ mod tests {
         let encoded = serde_json::to_string(&rows[0]).unwrap();
         assert!(encoded.contains("\"runner\":\"lead_runner\""));
         assert!(encoded.contains("\"outcome\":\"failed\""));
+    }
+
+    #[test]
+    fn stored_attestation_converts_or_refuses_unknown_runner() {
+        let (db, row, att) = fixture();
+        db.record_gate_attestation(&att, GateOutcome::Passed, "")
+            .unwrap();
+        let mut stored = db.latest_gate_attestation(row).unwrap().unwrap();
+        assert_eq!(stored.attestation().unwrap(), att);
+        stored.runner = "future_runner".to_string();
+        assert!(stored.attestation().is_none());
     }
 
     #[test]

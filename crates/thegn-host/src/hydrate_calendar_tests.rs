@@ -1416,3 +1416,79 @@ fn transp_free_survives_the_cache_round_trip_with_overrides() {
         .unwrap();
     assert_eq!(cached_one_shot.busy, thegn_core::calendar::Busy::Free);
 }
+
+#[test]
+fn an_unchanged_page_advances_the_cursor_without_a_repaint() {
+    let t = TmpDb::new("unchanged-cursor");
+    let (from, to) = window();
+    assert!(apply_page(
+        &t.db,
+        "work",
+        "ics",
+        &page(vec![event("existing")], vec![], "t1"),
+        from,
+        to,
+    ));
+    let before =
+        t.db.get_calendar_events(0, i64::MAX, &["work".to_owned()])
+            .unwrap();
+    assert!(!apply_page(
+        &t.db,
+        "work",
+        "ics",
+        &EventPage::unchanged("tok-2"),
+        from,
+        to,
+    ));
+    let observed =
+        t.db.get_calendar_events(0, i64::MAX, &["work".to_owned()])
+            .unwrap();
+    assert_eq!(observed, before, "rows: {observed:?}");
+    let sync = t.db.get_calendar_sync("work").unwrap().unwrap();
+    assert_eq!(sync.sync_token, "tok-2", "token: {}", sync.sync_token);
+}
+
+#[test]
+fn an_empty_snapshot_records_the_suspect_error_and_keeps_the_old_cursor() {
+    let t = TmpDb::new("empty-snapshot-cursor");
+    let (from, to) = window();
+    assert!(apply_page(
+        &t.db,
+        "work",
+        "ics",
+        &page(vec![event("existing")], vec![], "t1"),
+        from,
+        to,
+    ));
+    let before =
+        t.db.get_calendar_events(0, i64::MAX, &["work".to_owned()])
+            .unwrap();
+    let empty_snapshot = page_in(PageMode::Snapshot, vec![], vec![], "x");
+    assert!(!apply_page(&t.db, "work", "ics", &empty_snapshot, from, to,));
+    let observed =
+        t.db.get_calendar_events(0, i64::MAX, &["work".to_owned()])
+            .unwrap();
+    assert_eq!(observed, before, "rows: {observed:?}");
+    let sync = t.db.get_calendar_sync("work").unwrap().unwrap();
+    assert_eq!(sync.last_error, "provider returned an empty calendar");
+    assert_eq!(sync.sync_token, "t1", "token: {}", sync.sync_token);
+}
+
+#[test]
+fn stale_calendar_cache_failure_does_not_stamp_the_account() {
+    use std::sync::{Arc, atomic::AtomicU64};
+
+    let t = TmpDb::new("stale-cache-failure");
+    let current = Arc::new(AtomicU64::new(2));
+    let stale = (Arc::clone(&current), 1);
+    record_calendar_cache_failure(&t.db, "work", Some(&stale));
+    assert!(
+        t.db.get_calendar_sync("work").unwrap().is_none(),
+        "stale cache failure must not create or stamp sync metadata"
+    );
+
+    let current_fence = (current, 2);
+    record_calendar_cache_failure(&t.db, "work", Some(&current_fence));
+    let sync = t.db.get_calendar_sync("work").unwrap().unwrap();
+    assert_eq!(sync.last_error, "calendar cache write failed");
+}

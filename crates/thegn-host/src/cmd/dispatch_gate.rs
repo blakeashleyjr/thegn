@@ -5,12 +5,101 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use thegn_core::config::Config;
 use thegn_core::db::Db;
 use thegn_core::fsperm::{PrivateDir, ensure_private_dir_beneath};
-use thegn_core::pipeline_gate_attest::{GateAttestation, GateOutcome, GateRunner};
+use thegn_core::pipeline_gate_attest::{
+    AttestationContext, AttestationRefusal, GateAttestation, GateOutcome, GateRunner, TrustedGate,
+    evaluate_latest,
+};
 use thegn_core::store::NotificationStore;
 use thegn_core::util;
 
 static GATE_LOG_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 use thegn_core::{GateAttestationRefusal, StoredGateAttestation};
+
+pub(super) fn trusted_gate_for(
+    row: &thegn_core::issue::AgentDispatch,
+    latest: Option<&StoredGateAttestation>,
+) -> TrustedGate {
+    let Some(latest) = latest else {
+        return evaluate_latest(None, Err("no attestation"));
+    };
+    let Some(attestation) = latest.attestation() else {
+        return TrustedGate::Refused {
+            attestation_id: latest.id,
+            refusal: AttestationRefusal::UntrustedRunner,
+        };
+    };
+    let context = observe_attestation_context(row, &attestation);
+    evaluate_latest(
+        Some((latest.id, &attestation, latest.outcome, &latest.reason)),
+        context.as_ref().map_err(String::as_str),
+    )
+}
+
+fn observe_attestation_context(
+    row: &thegn_core::issue::AgentDispatch,
+    attestation: &GateAttestation,
+) -> std::result::Result<AttestationContext, String> {
+    let input = PathBuf::from(&row.worktree_path);
+    let worktree = std::fs::canonicalize(&input)
+        .map_err(|error| format!("cannot canonicalize worktree {}: {error}", input.display()))?;
+    let top = util::git_out_allow_empty(&worktree, &["rev-parse", "--show-toplevel"])
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| "worktree root could not be observed".to_string())?;
+    let top = std::fs::canonicalize(top.trim())
+        .map_err(|error| format!("cannot canonicalize Git worktree root: {error}"))?;
+    if top != worktree {
+        return Err("dispatch path is not the root of its Git worktree".to_string());
+    }
+    let branch_ref = util::git_out_allow_empty(&worktree, &["symbolic-ref", "-q", "HEAD"])
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| "branch ref could not be observed (HEAD may be detached)".to_string())?;
+    let head_oid = observed_oid(
+        &worktree,
+        &["rev-parse", "--verify", "HEAD^{commit}"],
+        "commit",
+    )?;
+    let head_tree_oid = observed_oid(&worktree, &["rev-parse", "--verify", "HEAD^{tree}"], "tree")?;
+    let repo = util::git_out_allow_empty(
+        &worktree,
+        &["rev-parse", "--path-format=absolute", "--git-common-dir"],
+    )
+    .map(|value| value.trim().to_string())
+    .filter(|value| !value.is_empty())
+    .ok_or_else(|| "repository common directory could not be observed".to_string())?;
+    let repo = std::fs::canonicalize(repo)
+        .map_err(|error| format!("cannot canonicalize repository common directory: {error}"))?
+        .display()
+        .to_string();
+    let dirty = util::git_out_allow_empty(&worktree, &["status", "--porcelain"])
+        .ok_or_else(|| "worktree status could not be observed".to_string())?;
+    let log_present = std::fs::metadata(&attestation.log_path)
+        .is_ok_and(|metadata| metadata.is_file() && metadata.len() > 0);
+    Ok(AttestationContext {
+        dispatch_row: row.id,
+        repo,
+        worktree: worktree.display().to_string(),
+        branch_ref,
+        head_oid,
+        head_tree_oid,
+        tree_dirty: !dirty.is_empty(),
+        log_present,
+    })
+}
+
+fn observed_oid(
+    worktree: &Path,
+    args: &[&str],
+    label: &str,
+) -> std::result::Result<String, String> {
+    let value = util::git_out_allow_empty(worktree, args)
+        .ok_or_else(|| format!("{label} OID could not be observed"))?;
+    let value = value.strip_suffix('\n').unwrap_or(&value);
+    if !valid_oid(value) {
+        return Err(format!("Git returned malformed {label} OID"));
+    }
+    Ok(value.to_string())
+}
 
 #[derive(Debug)]
 struct GateRunRefusal {
@@ -301,7 +390,7 @@ fn valid_oid(value: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::gate_row;
+    use super::{gate_row, trusted_gate_for};
     use crate::integrate::{GateErrorClass, GatePhase, GateVerdict};
     use std::path::{Path, PathBuf};
     use thegn_core::StoredGateAttestation;
@@ -310,7 +399,8 @@ mod tests {
     use thegn_core::fsperm::ensure_private_dir_beneath;
     use thegn_core::issue::NewDispatch;
     use thegn_core::pipeline_gate_attest::{
-        AttestationContext, AttestationVerdict, GateAttestation, GateOutcome, GateRunner,
+        AttestationContext, AttestationRefusal, AttestationVerdict, GateAttestation, GateOutcome,
+        GateRunner, TrustedGate,
     };
     use thegn_core::store::NotificationStore;
     use thegn_core::util;
@@ -563,5 +653,89 @@ mod tests {
         );
         assert_refused(result, id);
         assert!(db.gate_attestations_for(id, 10).unwrap().is_empty());
+    }
+
+    #[test]
+    fn trusted_gate_for_is_satisfied_after_a_gate_run() {
+        let (_repo_dir, repo_path) = repo();
+        let (db, id, cfg, _log_dir, logs) = setup(&repo_path);
+        gate_row(
+            &db,
+            &cfg,
+            id,
+            &logs,
+            &|_, _, _| Ok(GateVerdict::Passed),
+            &|| 100,
+        )
+        .unwrap();
+        let row = db.get_dispatch(id).unwrap().unwrap();
+        let latest = db.latest_gate_attestation(id).unwrap().unwrap();
+        assert!(matches!(
+            trusted_gate_for(&row, Some(&latest)),
+            TrustedGate::Satisfied { .. }
+        ));
+    }
+
+    #[test]
+    fn trusted_gate_for_is_stale_after_a_new_commit() {
+        let (_repo_dir, repo_path) = repo();
+        let (db, id, cfg, _log_dir, logs) = setup(&repo_path);
+        gate_row(
+            &db,
+            &cfg,
+            id,
+            &logs,
+            &|_, _, _| Ok(GateVerdict::Passed),
+            &|| 100,
+        )
+        .unwrap();
+        std::fs::write(repo_path.join("new.txt"), "new commit\n").unwrap();
+        git(&repo_path, &["add", "new.txt"]);
+        git(
+            &repo_path,
+            &["-c", "commit.gpgsign=false", "commit", "-m", "new tip"],
+        );
+        let row = db.get_dispatch(id).unwrap().unwrap();
+        let latest = db.latest_gate_attestation(id).unwrap().unwrap();
+        assert!(matches!(
+            trusted_gate_for(&row, Some(&latest)),
+            TrustedGate::Refused {
+                refusal: AttestationRefusal::StaleCommit { .. },
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn trusted_gate_for_refuses_a_missing_log() {
+        let (_repo_dir, repo_path) = repo();
+        let (db, id, cfg, _log_dir, logs) = setup(&repo_path);
+        gate_row(
+            &db,
+            &cfg,
+            id,
+            &logs,
+            &|_, _, _| Ok(GateVerdict::Passed),
+            &|| 100,
+        )
+        .unwrap();
+        let row = db.get_dispatch(id).unwrap().unwrap();
+        let latest = db.latest_gate_attestation(id).unwrap().unwrap();
+        std::fs::remove_file(&latest.log_path).unwrap();
+        assert!(matches!(
+            trusted_gate_for(&row, Some(&latest)),
+            TrustedGate::Refused {
+                refusal: AttestationRefusal::MissingLog,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn trusted_gate_for_is_missing_without_an_attestation() {
+        let (_repo_dir, repo_path) = repo();
+        let (db, id, _cfg, _log_dir, _logs) = setup(&repo_path);
+        let row = db.get_dispatch(id).unwrap().unwrap();
+        assert_eq!(trusted_gate_for(&row, None), TrustedGate::Missing);
     }
 }

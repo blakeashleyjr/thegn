@@ -1,8 +1,8 @@
 //! Runner tests that drive real `sh` children (Unix process groups, signals).
 
 use super::*;
-use std::io::BufRead;
 use std::os::unix::process::ExitStatusExt;
+use std::time::Instant;
 
 fn proc_run(
     end: thegn_proc::End,
@@ -327,14 +327,19 @@ fn cancel_flag_kills_run() {
 }
 
 #[test]
-fn reap_error_does_not_replace_an_existing_run_failure() {
-    let mut failure = Some(RunError::Timeout);
-    set_io_failure_if_missing(&mut failure, std::io::Error::other("wait failed"));
-    assert!(matches!(failure, Some(RunError::Timeout)));
+fn terminal_run_failure_takes_precedence_over_reap_failure() {
+    use thegn_proc::{End, GroupState, Leader};
 
-    let mut failure = None;
-    set_io_failure_if_missing(&mut failure, std::io::Error::other("wait failed"));
-    assert!(matches!(failure, Some(RunError::Io(message)) if message == "wait failed"));
+    assert!(matches!(
+        map_run(proc_run(
+            End::TimedOut,
+            Leader::ReapFailed(std::io::Error::other("wait failed")),
+            capture(b"", false, false),
+            capture(b"", false, false),
+            GroupState::Unknown,
+        )),
+        Err(RunError::Timeout)
+    ));
 }
 
 #[tokio::test]
@@ -360,22 +365,19 @@ async fn concurrency_is_bounded() {
 #[test]
 fn streaming_stdout_uses_consumer_retention_past_stdout_limit() {
     let cancel = AtomicBool::new(false);
-    let (last, status) = run_blocking_streaming(
+    let (mut line, mut last) = (Vec::new(), String::new());
+    let status = run_blocking_streaming(
         sh("yes x | head -c 3000000; echo tail"),
         lim(10_000),
         &cancel,
-        |reader| {
-            let mut input = std::io::BufReader::new(reader);
-            let mut line = Vec::new();
-            let mut last = String::new();
-            loop {
-                line.clear();
-                match input.read_until(b'\n', &mut line) {
-                    Ok(0) | Err(_) => break,
-                    Ok(_) => last = String::from_utf8_lossy(&line).into_owned(),
+        &mut |bytes: &[u8]| {
+            for &byte in bytes {
+                line.push(byte);
+                if byte == b'\n' {
+                    last = String::from_utf8_lossy(&line).into_owned();
+                    line.clear();
                 }
             }
-            last
         },
     )
     .unwrap();
@@ -387,9 +389,7 @@ fn streaming_stdout_uses_consumer_retention_past_stdout_limit() {
 fn streaming_hung_child_times_out() {
     let cancel = AtomicBool::new(false);
     let start = Instant::now();
-    let result = run_blocking_streaming(sh("sleep 30"), lim(300), &cancel, |reader| {
-        std::io::read_to_string(reader).unwrap_or_default()
-    });
+    let result = run_blocking_streaming(sh("sleep 30"), lim(300), &cancel, &mut |_bytes: &[u8]| {});
     assert!(matches!(result, Err(RunError::Timeout)), "{result:?}");
     assert!(start.elapsed() < Duration::from_secs(5));
 }
@@ -401,9 +401,7 @@ fn streaming_kills_background_pipe_holder_on_timeout() {
     let script = format!("sleep 30 & echo $! > {}; sleep 30", pidfile.display());
     let cancel = AtomicBool::new(false);
     let start = Instant::now();
-    let result = run_blocking_streaming(sh(&script), lim(300), &cancel, |reader| {
-        std::io::read_to_string(reader).unwrap_or_default()
-    });
+    let result = run_blocking_streaming(sh(&script), lim(300), &cancel, &mut |_bytes: &[u8]| {});
     assert!(matches!(result, Err(RunError::Timeout)), "{result:?}");
     assert!(start.elapsed() < Duration::from_secs(5));
     let pid = std::fs::read_to_string(pidfile).unwrap();
@@ -413,14 +411,17 @@ fn streaming_kills_background_pipe_holder_on_timeout() {
 #[test]
 fn streaming_consumer_can_stop_early_without_sigpipe() {
     let cancel = AtomicBool::new(false);
-    let (first, status) = run_blocking_streaming(
+    let mut first = [0; 10];
+    let mut copied = 0usize;
+    let status = run_blocking_streaming(
         sh("head -c 500000 /dev/zero"),
         lim(10_000),
         &cancel,
-        |reader| {
-            let mut first = [0; 10];
-            reader.read_exact(&mut first).unwrap();
-            first
+        &mut |bytes: &[u8]| {
+            let remaining = first.len().saturating_sub(copied);
+            let count = bytes.len().min(remaining);
+            first[copied..copied + count].copy_from_slice(&bytes[..count]);
+            copied += count;
         },
     )
     .unwrap();
@@ -435,7 +436,7 @@ fn streaming_nonzero_exit_carries_capped_stderr() {
         sh("yes e | head -c 5000 >&2; exit 7"),
         lim(5000),
         &cancel,
-        |reader| std::io::read_to_string(reader).unwrap_or_default(),
+        &mut |_bytes: &[u8]| {},
     );
     match result {
         Err(RunError::Exit { code, stderr }) => {
@@ -456,9 +457,12 @@ fn streaming_cancel_flag_kills_run() {
         cancel_signal.store(true, Ordering::Relaxed);
     });
     let start = Instant::now();
-    let result = run_blocking_streaming(sh("sleep 30"), lim(20_000), &cancel, |reader| {
-        std::io::read_to_string(reader).unwrap_or_default()
-    });
+    let result = run_blocking_streaming(
+        sh("sleep 30"),
+        lim(20_000),
+        &cancel,
+        &mut |_bytes: &[u8]| {},
+    );
     assert!(matches!(result, Err(RunError::Cancelled)), "{result:?}");
     assert!(start.elapsed() < Duration::from_secs(5));
 }

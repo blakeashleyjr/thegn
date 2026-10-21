@@ -402,7 +402,7 @@ pub fn mermaid(path: &Path, cancel: &AtomicBool) -> Result<Raster, String> {
     let mut cmd = renderer_command("mmdc", &stage);
     cmd.args(mermaid_args(&staged, &tmp));
     match crate::preview_jobs::run_renderer_quiet(&mut cmd, cancel) {
-        Ok(()) => read_mermaid_output(&tmp, MAX_MERMAID_OUTPUT_BYTES),
+        Ok(()) => read_mermaid_output(stage.path(), "render.png", MAX_MERMAID_OUTPUT_BYTES),
         Err(e) => Err(format!("mmdc: {}", capture_err(&e))),
     }
 }
@@ -419,10 +419,21 @@ fn mermaid_args(input: &Path, output: &Path) -> Vec<OsString> {
     .into()
 }
 
-fn read_mermaid_output(path: &Path, cap: u64) -> Result<Raster, String> {
-    read_regular_capped(path, cap)
-        .map_err(|e| format!("mmdc output read failed: {e}"))
-        .and_then(|bytes| decode_and_fit(&bytes, PREVIEW_LIMITS))
+fn read_mermaid_output(stage_root: &Path, name: &str, cap: u64) -> Result<Raster, String> {
+    let file = crate::platform::open_beneath::open_regular_beneath(stage_root, Path::new(name))
+        .map_err(|e| format!("mmdc output read failed: {e}"))?;
+    let meta = file
+        .metadata()
+        .map_err(|e| format!("mmdc output read failed: {e}"))?;
+    thegn_core::fsperm::ensure_single_link_regular_file(&meta)
+        .map_err(|e| format!("mmdc output read failed: {e}"))?;
+    if !thegn_core::fsperm::owned_by_current_user(&meta) {
+        return Err("mmdc output read failed: not owned by the current user".to_string());
+    }
+    let bytes =
+        read_open_regular_capped(file, cap).map_err(|e| format!("mmdc output read failed: {e}"))?;
+
+    decode_and_fit(&bytes, PREVIEW_LIMITS)
 }
 
 fn capture_err(e: &crate::preview_jobs::CaptureError) -> String {
@@ -827,8 +838,64 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let output = dir.path().join("render.png");
         std::fs::write(&output, [0u8; 33]).unwrap();
-        let error = read_mermaid_output(&output, 32).err().expect("must refuse");
+        let error = read_mermaid_output(dir.path(), "render.png", 32)
+            .err()
+            .expect("must refuse");
         assert!(error.contains("mmdc output read failed: file exceeds the 32 byte preview cap"));
+    }
+
+    fn generated_test_png() -> Vec<u8> {
+        let mut buf = std::io::Cursor::new(Vec::new());
+        let img = image::RgbaImage::from_pixel(2, 3, image::Rgba([255, 0, 0, 255]));
+        image::DynamicImage::ImageRgba8(img)
+            .write_to(&mut buf, image::ImageFormat::Png)
+            .unwrap();
+        buf.into_inner()
+    }
+
+    #[test]
+    fn mermaid_output_symlink_is_refused_and_its_target_never_read() {
+        if !crate::platform::test_symlink_supported() {
+            return;
+        }
+        let stage = RenderStage::new().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let target = outside.path().join("valid.png");
+        std::fs::write(&target, generated_test_png()).unwrap();
+        let output = stage.path().join("render.png");
+        crate::platform::test_symlink(&target, &output).unwrap();
+
+        let result = read_mermaid_output(stage.path(), "render.png", MAX_MERMAID_OUTPUT_BYTES);
+        assert!(matches!(result, Err(error) if error.starts_with("mmdc output read failed")));
+    }
+
+    #[test]
+    fn mermaid_output_hardlink_is_refused_where_link_counts_exist() {
+        let stage = RenderStage::new().unwrap();
+        let real = stage.path().join("real.png");
+        let link = stage.path().join("render.png");
+        std::fs::write(&real, generated_test_png()).unwrap();
+        std::fs::hard_link(&real, &link).unwrap();
+
+        if thegn_core::fsperm::extra_hard_links(&std::fs::metadata(&link).unwrap()) > 0 {
+            let result = read_mermaid_output(stage.path(), "render.png", MAX_MERMAID_OUTPUT_BYTES);
+            assert!(matches!(result, Err(error) if error.contains("hardlink")));
+        } else {
+            assert!(
+                read_mermaid_output(stage.path(), "render.png", MAX_MERMAID_OUTPUT_BYTES).is_ok()
+            );
+        }
+    }
+
+    #[test]
+    fn mermaid_output_regular_owned_png_still_decodes() {
+        // Positive control: the ordinary owned, single-link output already worked before this fix.
+        let stage = RenderStage::new().unwrap();
+        std::fs::write(stage.path().join("render.png"), generated_test_png()).unwrap();
+
+        let raster =
+            read_mermaid_output(stage.path(), "render.png", MAX_MERMAID_OUTPUT_BYTES).unwrap();
+        assert_eq!((raster.w, raster.h), (2, 3));
     }
 
     #[test]
