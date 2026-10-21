@@ -289,6 +289,11 @@ honored; fetched `installsAfter`/`dependsOn` metadata ordering, generated
 Dockerfile feature layers, and `devcontainer.metadata` image-label merging are
 reserved.
 
+The image thegn builds for a devcontainer `build` is tagged from the build
+declaration and Dockerfile contents, so changing the Dockerfile rebuilds it on
+the next launch. If the Dockerfile cannot be read for hashing, thegn warns and
+uses the declaration alone for the tag.
+
 ### Lifecycle and provider fallback
 
 After lifecycle approval, `initializeCommand` uses the host-side one-time
@@ -537,6 +542,9 @@ the remote worktree sync plan before uploading anything. A provider sandbox's
 network policy is applied and read back before its first command; a mismatch
 stops provisioning. If an existing sandbox's policy cannot be verified, thegn
 refuses to provision it and leaves it in place.
+A provider launch using `sealed-tunnel` with a VPN configured is refused before
+provisioning; if a refused launch created its provider sandbox, thegn destroys
+that sandbox.
 
 ## Inspecting
 
