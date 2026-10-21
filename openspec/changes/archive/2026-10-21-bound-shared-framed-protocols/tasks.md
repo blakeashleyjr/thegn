@@ -7,5 +7,7 @@
 - [x] Run LSP/bridge/agent close integration tests in svc.
 - [x] Revise near-cap sliding-window append after primary review; deterministic move-count regression passes.
 - [x] Repeat focused svc validation after the primary revision (13 passed, including late concurrent LSP closure).
-- [ ] Run scoped clippy and independent adversarial review.
-- [ ] Complete coordinated landing.
+- [x] Run scoped clippy and independent adversarial review.
+      Closed by the 2026-09-14 local-main landing (candidate ea807922, receipt 407e7d77; docs/audits/local-main-landing-2026-09-14.md); THE-310 is Done.
+- [x] Complete coordinated landing.
+      Closed by the 2026-09-14 local-main landing (candidate ea807922, receipt 407e7d77; docs/audits/local-main-landing-2026-09-14.md); THE-310 is Done.
