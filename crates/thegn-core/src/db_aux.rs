@@ -295,10 +295,6 @@ impl Db {
                 |row| row.get(0),
             )?,
             ClaimIdentity::UnregisteredLocal => {
-                if !location.is_empty() {
-                    tx.commit()?;
-                    anyhow::bail!("unregistered merge claim requires a local row");
-                }
                 tx.query_row(
                     "SELECT NOT EXISTS(SELECT 1 FROM worktrees WHERE worktree=?1)",
                     [&request.worktree],

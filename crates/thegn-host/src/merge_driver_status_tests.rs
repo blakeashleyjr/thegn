@@ -731,8 +731,30 @@ fn remote_and_unparseable_locations_hold_before_local_fixer_dispatch() {
         "not a registered host descriptor",
     ] {
         let db = Db::open_memory().unwrap();
-        let mut item = queued(&db, 0);
-        item.location = location.into();
+        db.put_worktree(
+            "feature",
+            WORKTREE,
+            WORKTREE,
+            "feature",
+            Some(location),
+            None,
+        )
+        .unwrap();
+        db.enqueue_merge(WORKTREE, "feature", "main").unwrap();
+        db.set_merge_agent_attempts(WORKTREE, 0).unwrap();
+        db.update_merge_status(
+            WORKTREE,
+            "deferred",
+            Some("old-result"),
+            Some("old-conflict"),
+            Some("old-error"),
+        )
+        .unwrap();
+        let item = QueueItem {
+            worktree: WORKTREE.into(),
+            branch: "feature".into(),
+            location: location.into(),
+        };
         let mut attempts = 0;
         let out = drive_queue_with(
             &cfg,
@@ -778,6 +800,15 @@ fn remote_identifier_collision_leaves_local_directory_untouched() {
     std::fs::write(&sentinel, "untouched").unwrap();
     let worktree = collision.to_string_lossy().into_owned();
     let db = Db::open_memory().unwrap();
+    db.put_worktree(
+        "feature",
+        dir.path().to_str().unwrap(),
+        &worktree,
+        "feature",
+        Some(r#"{"control_prefix":["provider","exec"],"path":"/repo"}"#),
+        None,
+    )
+    .unwrap();
     db.enqueue_merge(&worktree, "feature", "main").unwrap();
     let item = QueueItem {
         worktree: worktree.clone(),
@@ -788,7 +819,7 @@ fn remote_identifier_collision_leaves_local_directory_untouched() {
     cfg.conflict_handoff = ConflictHandoff::Agent;
     cfg.agent_max_attempts = 1;
     cfg.agent_command = "private-test-agent-must-never-execute".into();
-    drive_queue_with(
+    let out = drive_queue_with(
         &cfg,
         &Config::default(),
         dir.path(),
@@ -807,6 +838,7 @@ fn remote_identifier_collision_leaves_local_directory_untouched() {
             runner: unexpected_runner,
         },
     );
+    assert_eq!(out.agent_blocked, ["feature"]);
     assert_eq!(std::fs::read_to_string(sentinel).unwrap(), "untouched");
 }
 
