@@ -439,14 +439,27 @@ fn resolve_provider_env(
     use std::path::{Path, PathBuf};
     use thegn_core::store::{PoolStore, WorkspaceStore};
     let loc = thegn_core::remote::GitLoc::for_worktree(Path::new(worktree));
-    let db = thegn_core::db::Db::open().ok();
-    let repo_root: PathBuf = db
-        .as_ref()
-        .and_then(|db| db.repo_root_for(worktree).ok().flatten())
-        .filter(|root| !root.is_empty())
-        .map(PathBuf::from)
-        .or_else(|| thegn_core::repo::main_worktree(Path::new(worktree)))
-        .unwrap_or_else(|| PathBuf::from(worktree));
+    let db = match thegn_core::db::Db::open() {
+        Ok(db) => Some(db),
+        Err(error) => {
+            tracing::debug!(target: "thegn::provider", %error, "provider sandbox database open failed");
+            None
+        }
+    };
+    let repo_root = match db.as_ref() {
+        Some(db) => match db.repo_root_for(worktree) {
+            Ok(Some(root)) if !root.is_empty() => PathBuf::from(root),
+            Ok(_) => thegn_core::repo::main_worktree(Path::new(worktree))
+                .unwrap_or_else(|| PathBuf::from(worktree)),
+            Err(error) => {
+                tracing::debug!(target: "thegn::provider", %error, "provider sandbox repository lookup failed");
+                thegn_core::repo::main_worktree(Path::new(worktree))
+                    .unwrap_or_else(|| PathBuf::from(worktree))
+            }
+        },
+        None => thegn_core::repo::main_worktree(Path::new(worktree))
+            .unwrap_or_else(|| PathBuf::from(worktree)),
+    };
     let env = cfg.resolve_env(&repo_root, &loc, Path::new(worktree), Some(env_name));
     if !matches!(
         &env.placement,
@@ -454,9 +467,16 @@ fn resolve_provider_env(
     ) {
         return None;
     }
-    let bound = db
-        .as_ref()
-        .and_then(|db| db.worktree_provider_sandbox(worktree).ok().flatten());
+    let bound = match db.as_ref() {
+        Some(db) => match db.worktree_provider_sandbox(worktree) {
+            Ok(bound) => bound,
+            Err(error) => {
+                tracing::debug!(target: "thegn::provider", %error, "provider sandbox binding lookup failed");
+                None
+            }
+        },
+        None => None,
+    };
     Some((env, bound))
 }
 
