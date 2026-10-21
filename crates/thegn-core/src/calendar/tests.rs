@@ -957,7 +957,8 @@ fn transp_struct_built_override_keeps_busy_through_expansion() {
     assert_eq!(replacement[0].busy, Busy::Busy);
 }
 
-// THE-470 regression lock: expected to pass on main (positive control).
+// THE-470 regression lock: expected to pass on main (duplicate positive control;
+// the omitted-busy case is also covered by `transp_command_plugin_value_is_kept_as_sent`).
 #[test]
 fn transp_absent_plugin_busy_defaults_to_busy() {
     let json = r#"{
