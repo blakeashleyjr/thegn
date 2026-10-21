@@ -674,7 +674,19 @@ fn capture_to_store(
         SnapshotManifest::new(head, &report.branch, created_at, metas).with_generation(&generation);
     store.put_manifest(key, &manifest)?;
 
-    // Retention: prune older snapshots now that this one is published.
+    if let Err(error) = verify_published(store, key, &manifest) {
+        if let Err(cleanup) = store.delete(key, &manifest.id) {
+            tracing::debug!(
+                target: "thegn::hibernate",
+                %cleanup,
+                id = %manifest.id,
+                "could not delete an unverified snapshot generation"
+            );
+        }
+        return Err(error);
+    }
+
+    // Retention: prune older snapshots only after this one reads back intact.
     if let Ok(all) = store.list(key) {
         for stale in retention_prune_keeping(&all, snap_cfg.keep_clamped(), &manifest.id) {
             if stale == manifest.id {
@@ -713,6 +725,49 @@ fn generation_hex(bytes: [u8; 8]) -> String {
         out.push(char::from(HEX[usize::from(byte & 0x0f)]));
     }
     out
+}
+
+/// Re-read a just-published generation from the store and prove it is what was captured: the
+/// manifest reads back identical and every artifact has the recorded size and SHA-256. The
+/// hibernator destroys compute only after this passes.
+fn verify_published(
+    store: &dyn SnapshotStore,
+    key: &SnapshotKey,
+    manifest: &SnapshotManifest,
+) -> anyhow::Result<()> {
+    let read = store.get_manifest(key, &manifest.id).map_err(|error| {
+        anyhow::anyhow!(
+            "snapshot {} read-back: manifest unreadable: {error:#}",
+            manifest.id
+        )
+    })?;
+    anyhow::ensure!(
+        &read == manifest,
+        "snapshot {} read-back: manifest differs from the one published",
+        manifest.id
+    );
+
+    for artifact in &manifest.artifacts {
+        let data = store
+            .get(key, &manifest.id, &artifact.name)
+            .map_err(|error| {
+                anyhow::anyhow!(
+                    "snapshot {} read-back: artifact {} unreadable: {error:#}",
+                    manifest.id,
+                    artifact.name
+                )
+            })?;
+        anyhow::ensure!(
+            data.len() as u64 == artifact.bytes
+                && hex_sha256(&data).eq_ignore_ascii_case(&artifact.sha256),
+            "snapshot {} read-back: artifact {} does not match its recorded size and sha256",
+            manifest.id,
+            artifact.name
+        );
+        drop(data);
+    }
+
+    Ok(())
 }
 
 /// Structural sanity for a downloaded bundle: `git bundle list-heads` reads
@@ -836,5 +891,188 @@ mod tests {
         std::fs::remove_file(link).unwrap();
         assert!(result.is_err());
         assert_eq!(content, b"keep this content");
+    }
+
+    #[derive(Clone, Copy)]
+    enum Tamper {
+        None,
+        FlipByte,
+        Truncate,
+        DropArtifact,
+        AlterManifest,
+    }
+
+    struct ReadbackStore {
+        objects: std::sync::Mutex<std::collections::HashMap<String, Vec<u8>>>,
+        manifests: std::sync::Mutex<std::collections::HashMap<String, SnapshotManifest>>,
+        tamper: Tamper,
+    }
+
+    impl ReadbackStore {
+        fn new(tamper: Tamper) -> Self {
+            Self {
+                objects: std::sync::Mutex::new(std::collections::HashMap::new()),
+                manifests: std::sync::Mutex::new(std::collections::HashMap::new()),
+                tamper,
+            }
+        }
+
+        fn object_key(id: &str, name: &str) -> String {
+            format!("{id}/{name}")
+        }
+    }
+
+    impl SnapshotStore for ReadbackStore {
+        fn put(&self, _key: &SnapshotKey, id: &str, name: &str, data: &[u8]) -> anyhow::Result<()> {
+            self.objects
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .insert(Self::object_key(id, name), data.to_vec());
+            Ok(())
+        }
+
+        fn get(&self, _key: &SnapshotKey, id: &str, name: &str) -> anyhow::Result<Vec<u8>> {
+            let mut data = self
+                .objects
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .get(&Self::object_key(id, name))
+                .cloned()
+                .ok_or_else(|| anyhow::anyhow!("artifact {name} is missing from the fake store"))?;
+            match self.tamper {
+                Tamper::None | Tamper::AlterManifest => {}
+                Tamper::FlipByte => {
+                    if let Some(byte) = data.first_mut() {
+                        *byte ^= 0xff;
+                    }
+                }
+                Tamper::Truncate => {
+                    data.pop();
+                }
+                Tamper::DropArtifact => {
+                    anyhow::bail!("artifact {name} is missing from the fake store");
+                }
+            }
+            Ok(data)
+        }
+
+        fn put_manifest(
+            &self,
+            _key: &SnapshotKey,
+            manifest: &SnapshotManifest,
+        ) -> anyhow::Result<()> {
+            self.manifests
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .insert(manifest.id.clone(), manifest.clone());
+            Ok(())
+        }
+
+        fn get_manifest(&self, _key: &SnapshotKey, id: &str) -> anyhow::Result<SnapshotManifest> {
+            let mut manifest = self
+                .manifests
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .get(id)
+                .cloned()
+                .ok_or_else(|| anyhow::anyhow!("manifest {id} is missing from the fake store"))?;
+            if matches!(self.tamper, Tamper::AlterManifest) {
+                manifest.branch.push_str("-altered");
+            }
+            Ok(manifest)
+        }
+
+        fn list(&self, _key: &SnapshotKey) -> anyhow::Result<Vec<SnapshotManifest>> {
+            Ok(self
+                .manifests
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .values()
+                .cloned()
+                .collect())
+        }
+
+        fn delete(&self, _key: &SnapshotKey, id: &str) -> anyhow::Result<()> {
+            self.manifests
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .remove(id);
+            self.objects
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .retain(|object, _| !object.starts_with(&format!("{id}/")));
+            Ok(())
+        }
+    }
+
+    fn readback_fixture(tamper: Tamper) -> (ReadbackStore, SnapshotKey, SnapshotManifest) {
+        let key = SnapshotKey {
+            repo_slug: "repo".into(),
+            worktree_slug: "worktree".into(),
+            env: "env".into(),
+        };
+        let store = ReadbackStore::new(tamper);
+        let artifacts = [
+            ("bundle", b"bundle-bytes".as_slice()),
+            ("patch", b"patch-bytes"),
+        ];
+        let mut metas = Vec::new();
+        for (name, data) in artifacts {
+            store
+                .put(
+                    &key,
+                    "00000000000000000001-abc-0011223344556677",
+                    name,
+                    data,
+                )
+                .unwrap();
+            metas.push(ArtifactMeta {
+                name: name.into(),
+                bytes: data.len() as u64,
+                sha256: hex_sha256(data),
+            });
+        }
+        let manifest = SnapshotManifest::new(Some("abc"), "main", 1, metas)
+            .with_generation("0011223344556677");
+        store.put_manifest(&key, &manifest).unwrap();
+        (store, key, manifest)
+    }
+
+    #[test]
+    fn published_snapshot_readback_accepts_an_intact_generation() {
+        let (store, key, manifest) = readback_fixture(Tamper::None);
+        assert!(verify_published(&store, &key, &manifest).is_ok());
+    }
+
+    #[test]
+    fn published_snapshot_readback_refuses_a_corrupted_artifact() {
+        let (store, key, manifest) = readback_fixture(Tamper::FlipByte);
+        let error = verify_published(&store, &key, &manifest).unwrap_err();
+        assert!(error.to_string().contains("bundle"));
+        assert!(error.to_string().contains("read-back"));
+    }
+
+    #[test]
+    fn published_snapshot_readback_refuses_a_truncated_artifact() {
+        let (store, key, manifest) = readback_fixture(Tamper::Truncate);
+        let error = verify_published(&store, &key, &manifest).unwrap_err();
+        assert!(error.to_string().contains("bundle"));
+        assert!(error.to_string().contains("read-back"));
+    }
+
+    #[test]
+    fn published_snapshot_readback_refuses_a_missing_artifact() {
+        let (store, key, manifest) = readback_fixture(Tamper::DropArtifact);
+        let error = verify_published(&store, &key, &manifest).unwrap_err();
+        assert!(error.to_string().contains("bundle"));
+        assert!(error.to_string().contains("missing from the fake store"));
+    }
+
+    #[test]
+    fn published_snapshot_readback_refuses_a_manifest_that_reads_back_differently() {
+        let (store, key, manifest) = readback_fixture(Tamper::AlterManifest);
+        let error = verify_published(&store, &key, &manifest).unwrap_err();
+        assert!(error.to_string().contains("manifest differs"));
+        assert!(error.to_string().contains("read-back"));
     }
 }
