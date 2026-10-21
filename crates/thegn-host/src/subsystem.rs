@@ -13,9 +13,10 @@
 //! - its **pane-id set** — it does not own `&mut Panes`; [`Subsystem::teardown`]
 //!   *returns* the pane ids for the event loop to reap, avoiding borrow fights.
 //!
-//! A subprofile switch is `teardown()` (kill panes, drop DB handle) → `bind()`
-//! (open the new subprofile's storage). It does **no polling**; any periodic
-//! work a real subsystem needs rides the existing `TerminalWaker` (0%-idle).
+//! A subprofile switch prepares and validates the new storage before committing
+//! it, then returns the old pane ids for the event loop to reap. It does **no
+//! polling**; any periodic work a real subsystem needs rides the existing
+//! `TerminalWaker` (0%-idle).
 //!
 //! Comms is the first real consumer (not built here); [`StubSubsystem`] exercises
 //! the mechanism end-to-end so Comms can adopt it without further core changes.
@@ -27,8 +28,44 @@
 #![allow(dead_code)]
 
 use anyhow::Result;
+use sha2::{Digest, Sha256};
 use std::path::PathBuf;
 use thegn_core::db::Db;
+
+pub const SUBPROFILE_NAME_MAX_BYTES: usize = 128;
+
+/// Reject names that are empty, overlong, or contain control characters.
+pub fn validate_subprofile_name(name: &str) -> Result<()> {
+    if name.trim().is_empty() {
+        anyhow::bail!("subprofile name must not be empty or whitespace-only");
+    }
+    if name.len() > SUBPROFILE_NAME_MAX_BYTES {
+        anyhow::bail!("subprofile name must be at most {SUBPROFILE_NAME_MAX_BYTES} bytes");
+    }
+    if name.chars().any(char::is_control) {
+        anyhow::bail!("subprofile name must not contain control characters");
+    }
+    Ok(())
+}
+
+fn subprofile_db_file_name(name: &str) -> String {
+    let slug = thegn_core::util::slugify(name);
+    let prefix = slug
+        .get(..slug.len().min(32))
+        .unwrap_or("")
+        .trim_end_matches('-');
+    let prefix = if prefix.is_empty() { "sub" } else { prefix };
+    let mut digest = Sha256::new();
+    digest.update(b"thegn-subprofile-v1\0");
+    digest.update(name.as_bytes());
+    let hex = format!("{:x}", digest.finalize());
+    format!("{prefix}--{hex}.db")
+}
+
+/// Storage opened and validated before a subprofile binding is committed.
+pub struct PreparedBinding {
+    db: Db,
+}
 
 /// A coherent feature area with its own storage + identity within a profile.
 pub trait Subsystem {
@@ -41,12 +78,19 @@ pub trait Subsystem {
     fn active_subprofile(&self) -> &str;
     /// Pane ids this subsystem currently owns.
     fn pane_ids(&self) -> Vec<u32>;
+    #[cfg(test)]
+    fn storage_is_open(&self) -> bool;
     /// Adopt a pane the subsystem spawned (default: ignored — `workspace` panes
     /// are owned by the event loop, not by a subsystem).
     fn adopt_pane(&mut self, _id: u32) {}
     /// Rebind to `subprofile`: (re)open its storage and reset the pane set. Must
     /// not poll. Errors if the subsystem does not support subprofiles.
     fn bind(&mut self, subprofile: &str) -> Result<()>;
+    /// Open and validate storage for a prospective binding without changing
+    /// this subsystem's current identity, storage, or panes.
+    fn prepare(&self, subprofile: &str) -> Result<PreparedBinding>;
+    /// Install a prepared binding and return the old pane ids for reaping.
+    fn commit(&mut self, subprofile: &str, prepared: PreparedBinding) -> Vec<u32>;
     /// Relinquish this subsystem's live resources: drop its storage handle and
     /// return the pane ids the caller must reap (the loop kills them). Idempotent.
     fn teardown(&mut self) -> Vec<u32>;
@@ -72,8 +116,18 @@ impl Subsystem for WorkspaceSubsystem {
     fn pane_ids(&self) -> Vec<u32> {
         Vec::new()
     }
+    #[cfg(test)]
+    fn storage_is_open(&self) -> bool {
+        false
+    }
     fn bind(&mut self, _subprofile: &str) -> Result<()> {
         anyhow::bail!("workspace does not support subprofiles")
+    }
+    fn prepare(&self, _subprofile: &str) -> Result<PreparedBinding> {
+        anyhow::bail!("workspace does not support subprofiles")
+    }
+    fn commit(&mut self, _subprofile: &str, _prepared: PreparedBinding) -> Vec<u32> {
+        Vec::new()
     }
     fn teardown(&mut self) -> Vec<u32> {
         Vec::new()
@@ -86,7 +140,7 @@ impl Subsystem for WorkspaceSubsystem {
 /// DB (tests). Exercises bind/teardown for the mechanism until Comms lands.
 pub struct StubSubsystem {
     name: String,
-    /// `None` ⇒ in-memory storage (tests); `Some(dir)` ⇒ `<dir>/<sub>.db`.
+    /// `None` ⇒ in-memory storage (tests); `Some(dir)` ⇒ `<dir>/<subprofile>.db`.
     db_root: Option<PathBuf>,
     active: String,
     db: Option<Db>,
@@ -136,28 +190,35 @@ impl Subsystem for StubSubsystem {
     fn pane_ids(&self) -> Vec<u32> {
         self.panes.clone()
     }
+    #[cfg(test)]
+    fn storage_is_open(&self) -> bool {
+        self.db.is_some()
+    }
     fn adopt_pane(&mut self, id: u32) {
         if !self.panes.contains(&id) {
             self.panes.push(id);
         }
     }
     fn bind(&mut self, subprofile: &str) -> Result<()> {
-        let sub = if subprofile.trim().is_empty() {
-            "default"
-        } else {
-            subprofile
-        };
+        let prepared = self.prepare(subprofile)?;
+        self.commit(subprofile, prepared);
+        Ok(())
+    }
+    fn prepare(&self, subprofile: &str) -> Result<PreparedBinding> {
+        validate_subprofile_name(subprofile)?;
         let db = match &self.db_root {
             Some(dir) => {
-                std::fs::create_dir_all(dir)?;
-                Db::open_at(&dir.join(format!("{}.db", thegn_core::util::slugify(sub))))?
+                thegn_core::fsperm::ensure_private_dir(dir)?;
+                Db::open_at(&dir.join(subprofile_db_file_name(subprofile)))?
             }
             None => Db::open_memory()?,
         };
-        self.db = Some(db);
-        self.active = sub.to_string();
-        self.panes.clear();
-        Ok(())
+        Ok(PreparedBinding { db })
+    }
+    fn commit(&mut self, subprofile: &str, prepared: PreparedBinding) -> Vec<u32> {
+        self.db = Some(prepared.db);
+        self.active = subprofile.to_string();
+        std::mem::take(&mut self.panes)
     }
     fn teardown(&mut self) -> Vec<u32> {
         self.db = None; // clean handle drop — never touches the shared profile DB
@@ -192,8 +253,8 @@ impl Subsystems {
         self.subsystems.iter_mut().find(|s| s.name() == name)
     }
 
-    /// Switch `name` to `subprofile`, in-process: tear it down (returning the
-    /// pane ids the caller must kill) then bind the new subprofile. Every OTHER
+    /// Switch `name` to `subprofile`, in-process: prepare its storage, then
+    /// commit (returning the old pane ids the caller must kill). Every OTHER
     /// subsystem — notably `workspace` — is untouched. Errors if the subsystem
     /// is unknown or does not support subprofiles.
     pub fn switch_subprofile(&mut self, name: &str, subprofile: &str) -> Result<Vec<u32>> {
@@ -203,8 +264,8 @@ impl Subsystems {
         if !sub.supports_subprofiles() {
             anyhow::bail!("subsystem {name:?} does not support subprofiles");
         }
-        let doomed = sub.teardown();
-        sub.bind(subprofile)?;
+        let prepared = sub.prepare(subprofile)?;
+        let doomed = sub.commit(subprofile, prepared);
         Ok(doomed)
     }
 }
@@ -218,6 +279,12 @@ impl Default for Subsystems {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn private_temp_root() -> tempfile::TempDir {
+        let root = tempfile::tempdir().unwrap();
+        thegn_core::fsperm::restrict_dir_to_owner(root.path()).unwrap();
+        root
+    }
 
     #[test]
     fn stub_bind_opens_storage_and_teardown_drops_it() {
@@ -272,5 +339,109 @@ mod tests {
         // The default registration exposes both names.
         assert!(subs.names().contains(&"workspace"));
         assert!(subs.names().contains(&"comms"));
+    }
+
+    #[test]
+    fn failed_switch_keeps_old_binding_and_panes() {
+        let root = private_temp_root();
+        let mut subs = Subsystems {
+            subsystems: vec![Box::new(StubSubsystem {
+                name: "comms".into(),
+                db_root: Some(root.path().join("comms")),
+                active: "default".into(),
+                db: None,
+                panes: Vec::new(),
+            })],
+        };
+        subs.switch_subprofile("comms", "work").unwrap();
+        subs.get_mut("comms").unwrap().adopt_pane(3);
+        subs.get_mut("comms").unwrap().adopt_pane(4);
+        let broken = root
+            .path()
+            .join("comms")
+            .join(subprofile_db_file_name("broken"));
+        std::fs::create_dir(&broken).unwrap();
+
+        assert!(subs.switch_subprofile("comms", "broken").is_err());
+        let comms = subs.get_mut("comms").unwrap();
+        assert_eq!(comms.active_subprofile(), "work");
+        assert_eq!(comms.pane_ids(), vec![3, 4]);
+        assert!(comms.storage_is_open());
+    }
+
+    #[test]
+    fn alias_subprofile_names_get_distinct_files() {
+        let names = ["work/a", "work-a", "Work-A", "work a"];
+        let files = names.map(subprofile_db_file_name);
+        let distinct: std::collections::HashSet<_> = files.iter().collect();
+        assert_eq!(distinct.len(), names.len());
+        assert!(files.iter().all(|file| file.ends_with(".db")));
+        assert!(files.iter().all(|file| file.starts_with("work-a--")));
+
+        let root = private_temp_root();
+        let db_root = root.path().join("comms");
+        let mut comms = StubSubsystem {
+            name: "comms".into(),
+            db_root: Some(db_root.clone()),
+            active: "default".into(),
+            db: None,
+            panes: Vec::new(),
+        };
+        comms.bind(names[0]).unwrap();
+        comms.bind(names[1]).unwrap();
+        assert!(db_root.join(&files[0]).is_file());
+        assert!(db_root.join(&files[1]).is_file());
+        assert_ne!(files[0], files[1]);
+    }
+
+    #[test]
+    fn invalid_subprofile_names_are_refused_before_teardown() {
+        let mut subs = Subsystems {
+            subsystems: vec![Box::new(StubSubsystem::in_memory("comms"))],
+        };
+        subs.switch_subprofile("comms", "work").unwrap();
+        subs.get_mut("comms").unwrap().adopt_pane(3);
+        subs.get_mut("comms").unwrap().adopt_pane(4);
+
+        let overlong = "a".repeat(129);
+        for invalid in ["", "   ", "a\u{7}b", overlong.as_str()] {
+            assert!(subs.switch_subprofile("comms", invalid).is_err());
+            let comms = subs.get_mut("comms").unwrap();
+            assert_eq!(comms.active_subprofile(), "work");
+            assert_eq!(comms.pane_ids(), vec![3, 4]);
+            assert!(comms.storage_is_open());
+        }
+    }
+
+    #[test]
+    fn subprofile_root_is_private() {
+        let root = private_temp_root();
+        let db_root = root.path().join("comms");
+        let mut comms = StubSubsystem {
+            name: "comms".into(),
+            db_root: Some(db_root.clone()),
+            active: "default".into(),
+            db: None,
+            panes: Vec::new(),
+        };
+        comms.bind("work").unwrap();
+        if let Some(mode) = thegn_core::fsperm::mode_bits(&db_root).unwrap() {
+            assert_eq!(mode & 0o077, 0);
+        }
+
+        let target = root.path().join("target");
+        std::fs::create_dir(&target).unwrap();
+        thegn_core::fsperm::restrict_dir_to_owner(&target).unwrap();
+        let link = root.path().join("comms-link");
+        if crate::platform::symlink_file_for_test(&target, &link).is_ok() {
+            let mut linked = StubSubsystem {
+                name: "comms".into(),
+                db_root: Some(link),
+                active: "default".into(),
+                db: None,
+                panes: Vec::new(),
+            };
+            assert!(linked.bind("work").is_err());
+        }
     }
 }
