@@ -16,6 +16,12 @@ pub const REPORT_MAX_CHARS: usize = 16_384;
 /// The hard cap on a single progress note.
 pub const NOTE_MAX_CHARS: usize = 4_096;
 
+/// THE-243: worker/CLI progress notes are limited per dispatch row; internal
+/// audit notes use a reserved lane and are not subject to these ceilings.
+pub const NOTE_MAX_PER_ROW: usize = 2_000;
+/// THE-243: maximum UTF-8 text bytes in the worker/CLI note lane for one row.
+pub const NOTE_MAX_BYTES_PER_ROW: usize = 2 * 1024 * 1024;
+
 /// Unicode format characters that can change the apparent order or shape of
 /// text without changing its stored logical order.
 pub fn is_format_control(c: char) -> bool {
