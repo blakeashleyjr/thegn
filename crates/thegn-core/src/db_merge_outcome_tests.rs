@@ -49,6 +49,23 @@ fn row(db: &Db) -> MergeQueueRow {
     rows.into_iter().next().unwrap()
 }
 
+#[test]
+fn claim_aware_persist_writes_without_claim_columns() {
+    let db = Db::open_memory().unwrap();
+    registered(&db);
+    db.conn()
+        .execute_batch("ALTER TABLE merge_queue DROP COLUMN claim_owner")
+        .unwrap();
+    let observed = db.observe_merge_outcome(WORKTREE).unwrap();
+
+    assert_eq!(
+        db.persist_merge_outcome(&observed, &outcome(MergeFinalStatus::Landed))
+            .unwrap(),
+        MergeOutcomeWrite::Written
+    );
+    assert_eq!(row(&db).status, "landed");
+}
+
 fn forbid_queued(db: &Db) {
     db.conn()
         .execute_batch(

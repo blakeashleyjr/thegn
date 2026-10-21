@@ -268,6 +268,9 @@ fn persist_landed_row(
         MergeOutcomeWrite::QueueChanged => {
             bail!("merge queue changed after Git land; landed row not recorded")
         }
+        MergeOutcomeWrite::Claimed => {
+            bail!("merge row is claimed by an active drain; landed row not recorded")
+        }
     }
 }
 

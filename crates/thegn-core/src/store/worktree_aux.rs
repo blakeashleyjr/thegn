@@ -191,6 +191,8 @@ pub enum MergeOutcomeWrite {
     Written,
     RegistryChanged,
     QueueChanged,
+    /// The row is claimed by an active drain; nothing was written.
+    Claimed,
 }
 
 /// Object-safe (`&self` + concrete args), so `&dyn WorktreeAuxStore` works for

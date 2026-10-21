@@ -495,3 +495,59 @@ fn registered_entry_still_refuses_an_unregistered_row() {
             .is_none()
     );
 }
+
+#[test]
+fn claim_aware_persist_refuses_a_claimed_row() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = fixture(&dir.path().join("claims.sqlite"));
+    assert!(db.admit_merge_claim(&request()).unwrap().is_some());
+    let observed = db.observe_merge_outcome(WT).unwrap();
+    let before = db.list_merge_queue().unwrap().remove(0);
+    let outcome = MergeFinalOutcome {
+        worktree: WT,
+        branch: "feature",
+        repo_root: "/private/repo",
+        target_branch: "main",
+        location: "",
+        status: MergeFinalStatus::Landed,
+        result_oid: Some("verified-commit"),
+        conflict_paths: None,
+        error_detail: None,
+    };
+
+    assert_eq!(
+        db.persist_merge_outcome(&observed, &outcome).unwrap(),
+        MergeOutcomeWrite::Claimed
+    );
+    let after = db.list_merge_queue().unwrap().remove(0);
+    assert_eq!(after.status, before.status);
+    assert_eq!(after.result_oid, before.result_oid);
+    assert_eq!(after.updated_at, before.updated_at);
+}
+
+#[test]
+fn claim_aware_del_worktree_keeps_a_claimed_row() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = fixture(&dir.path().join("claims.sqlite"));
+    assert!(db.admit_merge_claim(&request()).unwrap().is_some());
+
+    db.del_worktree(WT).unwrap();
+
+    assert!(!db.worktrees().unwrap().iter().any(|row| row.worktree == WT));
+    assert!(
+        db.list_merge_queue()
+            .unwrap()
+            .iter()
+            .any(|row| row.worktree == WT)
+    );
+}
+
+#[test]
+fn claim_aware_del_worktree_still_removes_an_unclaimed_row() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = fixture(&dir.path().join("claims.sqlite"));
+
+    db.del_worktree(WT).unwrap();
+
+    assert!(db.list_merge_queue().unwrap().is_empty());
+}
