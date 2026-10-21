@@ -1820,6 +1820,15 @@ mod tests {
             let (_fixture, root, feat_wt) = conflicting_repo("identity-hold");
             let sentinel = root.join("wrong-checkout-was-written");
             let db = Db::open_memory().unwrap();
+            db.put_worktree(
+                "feat",
+                root.to_str().unwrap(),
+                feat_wt.to_str().unwrap(),
+                "feat",
+                None,
+                None,
+            )
+            .unwrap();
             let queued = item(&db, &feat_wt);
             git(&feat_wt, &["switch", "-q", "-c", "other"]);
 
@@ -2092,6 +2101,15 @@ mod tests {
             let (_fixture, root, feat_wt) = conflicting_repo("deleted-branch");
             let main_before = out(&root, &["rev-parse", "main"]);
             let db = Db::open_memory().unwrap();
+            db.put_worktree(
+                "feat",
+                root.to_str().unwrap(),
+                feat_wt.to_str().unwrap(),
+                "feat",
+                None,
+                None,
+            )
+            .unwrap();
             let queued = bound_item(&db, &feat_wt);
             git(&feat_wt, &["checkout", "-q", "--detach"]);
             git(&root, &["branch", "-D", "feat"]);
@@ -2543,7 +2561,7 @@ mod tests {
                 vec![queued],
                 |_| {},
                 DriveActions {
-                    attempt: |_, _, _| {
+                    attempt: |_: &str, _: &thegn_core::remote::GitLoc, _: bool| {
                         let view = db.observe_merge_claim(&observed_worktree)?.unwrap();
                         assert_ne!(view.phase, "unclaimed");
                         assert!(
@@ -2552,8 +2570,14 @@ mod tests {
                         );
                         Ok(AttemptOutcome::Ready { tip: "tip".into() })
                     },
-                    floor: |_| panic!("notify-only"),
-                    runner: |_, _, _, _, _, _| false,
+                    floor: |_: &str| panic!("notify-only"),
+                    runner:
+                        |_: &str,
+                         _: &str,
+                         _: &str,
+                         _: &str,
+                         _: &Failure,
+                         _: Option<thegn_core::sandbox::SandboxSpec>| false,
                 },
             );
 
@@ -2582,9 +2606,17 @@ mod tests {
                 vec![queued],
                 |_| {},
                 DriveActions {
-                    attempt: |_, _, _| panic!("unattributable row must not be attempted"),
-                    floor: |_| panic!("notify-only"),
-                    runner: |_, _, _, _, _, _| false,
+                    attempt: |_: &str, _: &thegn_core::remote::GitLoc, _: bool| {
+                        panic!("unattributable row must not be attempted")
+                    },
+                    floor: |_: &str| panic!("notify-only"),
+                    runner:
+                        |_: &str,
+                         _: &str,
+                         _: &str,
+                         _: &str,
+                         _: &Failure,
+                         _: Option<thegn_core::sandbox::SandboxSpec>| false,
                 },
             );
 
