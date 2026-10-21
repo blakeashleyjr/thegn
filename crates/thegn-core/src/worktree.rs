@@ -1159,15 +1159,35 @@ pub(crate) fn reconcile_rename_intent_locked(
     let new_path = Path::new(&intent.new_path);
     let old_branch = intent.old_branch.as_bytes();
     let new_branch = intent.new_branch.as_bytes();
-    let old_registered = registered_branch(root, old_path)?;
-    let new_registered = registered_branch(root, new_path)?;
+    let old_registered = registered_branch(root, old_path).map_err(|error| {
+        format!(
+            "rename intent at {} could not be classified: {error}; journal kept",
+            path.display()
+        )
+    })?;
+    let new_registered = registered_branch(root, new_path).map_err(|error| {
+        format!(
+            "rename intent at {} could not be classified: {error}; journal kept",
+            path.display()
+        )
+    })?;
     let old_at_old = old_registered.as_deref() == Some(old_branch);
     let old_at_new = old_registered.as_deref() == Some(new_branch);
     let new_at_new = new_registered.as_deref() == Some(new_branch);
     let old_absent = old_registered.is_none();
     let new_absent = new_registered.is_none();
-    let old_branch_exists = branch_exists_checked(root, &intent.old_branch)?;
-    let new_branch_exists = branch_exists_checked(root, &intent.new_branch)?;
+    let old_branch_exists = branch_exists_checked(root, &intent.old_branch).map_err(|error| {
+        format!(
+            "rename intent at {} could not be classified: {error}; journal kept",
+            path.display()
+        )
+    })?;
+    let new_branch_exists = branch_exists_checked(root, &intent.new_branch).map_err(|error| {
+        format!(
+            "rename intent at {} could not be classified: {error}; journal kept",
+            path.display()
+        )
+    })?;
 
     if old_at_old && new_absent && !new_branch_exists {
         clear_rename_intent(root)?;
@@ -1260,8 +1280,9 @@ pub fn rename(
             root.display()
         ));
     }
-    let identity = inspect_registered(root, old_path)
-        .map_err(|_| format!("{old_path:?} is not a registered worktree on {old_branch}"))?;
+    let identity = inspect_registered(root, old_path).map_err(|error| {
+        format!("{old_path:?} is not a registered worktree on {old_branch}: {error}")
+    })?;
     if identity.branch().map(|branch| branch.raw()) != Some(old_branch.as_bytes()) {
         return Err(format!(
             "{old_path:?} is not a registered worktree on {old_branch}"
@@ -2345,10 +2366,6 @@ mod tests {
     }
 
     #[test]
-    #[expect(
-        clippy::disallowed_methods,
-        reason = "Git CLI calls simulate crash boundaries in the repository fixture"
-    )]
     fn rename_intent_split_is_rolled_back_by_reconcile() {
         let repo = temp_repo("rename-intent-split");
         let cfg = scratch_cfg(&repo);
@@ -2375,10 +2392,6 @@ mod tests {
     }
 
     #[test]
-    #[expect(
-        clippy::disallowed_methods,
-        reason = "Git CLI calls simulate crash boundaries in the repository fixture"
-    )]
     fn rename_intent_completed_move_is_cleared_by_reconcile() {
         let repo = temp_repo("rename-intent-completed");
         let cfg = scratch_cfg(&repo);
@@ -2414,10 +2427,6 @@ mod tests {
     }
 
     #[test]
-    #[expect(
-        clippy::disallowed_methods,
-        reason = "Git CLI call creates the competing ref for an ambiguous-state fixture"
-    )]
     fn rename_intent_ambiguous_state_refuses_the_next_rename() {
         let repo = temp_repo("rename-intent-ambiguous");
         let cfg = scratch_cfg(&repo);
@@ -2443,10 +2452,6 @@ mod tests {
     }
 
     #[test]
-    #[expect(
-        clippy::disallowed_methods,
-        reason = "Git CLI call locks the worktree to force the rollback path"
-    )]
     fn rename_success_and_rollback_leave_no_intent_journal() {
         let repo = temp_repo("rename-intent-cleanup");
         let cfg = scratch_cfg(&repo);
