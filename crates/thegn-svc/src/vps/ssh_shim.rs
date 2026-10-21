@@ -275,9 +275,11 @@ impl SshShim {
 /// the base dir MUST be short — a deep `$XDG_STATE_HOME` (e.g. under a profile
 /// dir) blows the limit and every ssh fails with "path too long for Unix domain
 /// socket". Prefer the short, private `$XDG_RUNTIME_DIR` (`/run/user/<uid>`),
-/// falling back to a per-user temp dir; the socket is ephemeral (ControlPersist),
-/// so location is irrelevant beyond length + privacy. The directory is checked
-/// for ownership, type and private permissions before OpenSSH can use it.
+/// then a per-user temp dir. If a nested `TMPDIR` makes that too long, use the
+/// short per-user `/tmp/tg-ssh-<uid>-<digest>` fallback. The socket is ephemeral
+/// (ControlPersist), so location is irrelevant beyond length + privacy. The
+/// directory is checked for ownership, type and private permissions before
+/// OpenSSH can use it.
 pub fn control_socket_path() -> Option<PathBuf> {
     control_socket_path_for(PathBuf::from("managed").as_path())
 }
@@ -291,6 +293,8 @@ pub fn control_socket_path_for(key_path: &std::path::Path) -> Option<PathBuf> {
         std::env::var_os("XDG_RUNTIME_DIR"),
         std::env::temp_dir(),
         std::env::var_os("HOME"),
+        crate::ipc::effective_uid(),
+        std::path::Path::new("/tmp"),
     );
     control_socket_path_in(&dir, key_path)
 }
@@ -309,26 +313,49 @@ fn control_dir_candidate(
     runtime_dir: Option<std::ffi::OsString>,
     temp_dir: PathBuf,
     home: Option<std::ffi::OsString>,
+    uid: Option<u32>,
+    short_base: &std::path::Path,
 ) -> PathBuf {
     if let Some(runtime_dir) = runtime_dir {
         let runtime_dir = PathBuf::from(runtime_dir);
         if runtime_dir.is_absolute() {
-            return runtime_dir.join("tg-ssh");
+            let candidate = runtime_dir.join("tg-ssh");
+            if control_dir_fits(&candidate) {
+                return candidate;
+            }
         }
     }
-    let home_digest = home.filter(|home| !home.is_empty()).map(|home| {
+    let digest = control_home_digest(home);
+    let temp_candidate = match &digest {
+        Some(digest) => temp_dir.join(format!("tg-ssh-{}", &digest[..12])),
+        None => temp_dir.join("tg-ssh-nohome"),
+    };
+    if control_dir_fits(&temp_candidate) {
+        return temp_candidate;
+    }
+    match uid {
+        Some(uid) => match digest {
+            Some(digest) => short_base.join(format!("tg-ssh-{uid}-{}", &digest[..8])),
+            None => short_base.join(format!("tg-ssh-{uid}-nohome")),
+        },
+        None => temp_candidate,
+    }
+}
+
+fn control_home_digest(home: Option<std::ffi::OsString>) -> Option<String> {
+    home.filter(|home| !home.is_empty()).map(|home| {
         let mut hasher = Sha256::new();
         hasher.update(b"thegn/ssh-control-home/v1\0");
         hasher.update(home.as_encoded_bytes());
-        hasher.finalize()[..6]
+        hasher.finalize()[..12]
             .iter()
             .map(|byte| format!("{byte:02x}"))
-            .collect::<String>()
-    });
-    match home_digest {
-        Some(digest) => temp_dir.join(format!("tg-ssh-{digest}")),
-        None => temp_dir.join("tg-ssh-nohome"),
-    }
+            .collect()
+    })
+}
+
+fn control_dir_fits(dir: &std::path::Path) -> bool {
+    control_template(dir, std::path::Path::new("fit-probe")).is_some()
 }
 
 pub fn control_socket_path_in(
@@ -647,26 +674,150 @@ mod tests {
     #[test]
     fn control_dir_candidate_prefers_an_absolute_runtime_dir() {
         let temp = PathBuf::from("/tmp/test-temp");
+        let short_base = std::path::Path::new("/tmp");
         assert_eq!(
-            control_dir_candidate(Some("/run/user/1000".into()), temp.clone(), None),
+            control_dir_candidate(
+                Some("/run/user/1000".into()),
+                temp.clone(),
+                None,
+                None,
+                short_base,
+            ),
             PathBuf::from("/run/user/1000/tg-ssh")
         );
         let relative = control_dir_candidate(
             Some("relative".into()),
             temp.clone(),
             Some("/home/a".into()),
+            None,
+            short_base,
         );
-        let second_home = control_dir_candidate(None, temp.clone(), Some("/home/b".into()));
+        let second_home =
+            control_dir_candidate(None, temp.clone(), Some("/home/b".into()), None, short_base);
         assert!(relative.starts_with(&temp));
         assert_ne!(relative, second_home);
         assert_eq!(
-            control_dir_candidate(None, temp.clone(), None),
+            control_dir_candidate(None, temp.clone(), None, None, short_base),
             temp.join("tg-ssh-nohome")
         );
         assert_eq!(
-            control_dir_candidate(None, temp.clone(), Some("".into())),
+            control_dir_candidate(None, temp.clone(), Some("".into()), None, short_base),
             temp.join("tg-ssh-nohome")
         );
+    }
+
+    #[test]
+    fn control_dir_candidate_uses_a_short_tmp_fallback_under_a_long_temp_dir() {
+        let temp = PathBuf::from(format!("/tmp/{}", "n".repeat(80)));
+        let candidate = control_dir_candidate(
+            None,
+            temp.clone(),
+            Some("/home/a".into()),
+            Some(1000),
+            std::path::Path::new("/tmp"),
+        );
+        assert!(candidate.to_string_lossy().starts_with("/tmp/tg-ssh-1000-"));
+        assert!(!candidate.starts_with(&temp));
+        assert!(control_template(&candidate, std::path::Path::new("/state/ssh/key")).is_some());
+    }
+
+    #[test]
+    fn control_dir_short_fallback_is_per_user_and_per_home() {
+        let temp = PathBuf::from(format!("/tmp/{}", "n".repeat(80)));
+        let short_base = std::path::Path::new("/tmp");
+        let user_a_home_a = control_dir_candidate(
+            None,
+            temp.clone(),
+            Some("/home/a".into()),
+            Some(1000),
+            short_base,
+        );
+        let user_b_home_a = control_dir_candidate(
+            None,
+            temp.clone(),
+            Some("/home/a".into()),
+            Some(1001),
+            short_base,
+        );
+        let user_a_home_b = control_dir_candidate(
+            None,
+            temp.clone(),
+            Some("/home/b".into()),
+            Some(1000),
+            short_base,
+        );
+        let user_b_home_b = control_dir_candidate(
+            None,
+            temp.clone(),
+            Some("/home/b".into()),
+            Some(1001),
+            short_base,
+        );
+        assert_ne!(user_a_home_a, user_b_home_a);
+        assert_ne!(user_a_home_a, user_a_home_b);
+        assert_ne!(user_a_home_a, user_b_home_b);
+        assert_ne!(user_b_home_a, user_a_home_b);
+        assert_ne!(user_b_home_a, user_b_home_b);
+        assert_ne!(user_a_home_b, user_b_home_b);
+        assert_eq!(
+            control_dir_candidate(None, temp, None, Some(1000), short_base),
+            PathBuf::from("/tmp/tg-ssh-1000-nohome")
+        );
+    }
+
+    #[test]
+    fn control_dir_candidate_skips_an_overlong_runtime_dir() {
+        let temp = PathBuf::from("/tmp/test-temp");
+        let runtime = format!("/{}", "r".repeat(60));
+        let fallback = control_dir_candidate(
+            Some(runtime.into()),
+            temp.clone(),
+            Some("/home/a".into()),
+            Some(1000),
+            std::path::Path::new("/tmp"),
+        );
+        assert!(fallback.to_string_lossy().starts_with("/tmp/tg-ssh-1000-"));
+        assert!(control_dir_fits(&fallback));
+
+        let runtime_candidate = control_dir_candidate(
+            Some("/run/user/1000".into()),
+            temp,
+            Some("/home/a".into()),
+            Some(1000),
+            std::path::Path::new("/tmp"),
+        );
+        assert_eq!(runtime_candidate, PathBuf::from("/run/user/1000/tg-ssh"));
+    }
+
+    #[test]
+    fn control_dir_candidate_keeps_a_short_temp_dir() {
+        // The candidate needs at most 31 bytes, including the digest suffix.
+        let temp = PathBuf::from("/t");
+        let home = Some("/home/a".into());
+        let digest = control_home_digest(home.clone()).unwrap();
+        let candidate = control_dir_candidate(
+            None,
+            temp.clone(),
+            home,
+            Some(1000),
+            std::path::Path::new("/tmp"),
+        );
+        assert_eq!(candidate, temp.join(format!("tg-ssh-{}", &digest[..12])));
+        assert!(control_dir_fits(&candidate));
+    }
+
+    #[test]
+    fn control_dir_candidate_without_uid_keeps_the_temp_dir() {
+        let temp = PathBuf::from(format!("/tmp/{}", "n".repeat(80)));
+        let candidate = control_dir_candidate(
+            None,
+            temp.clone(),
+            Some("/home/a".into()),
+            None,
+            std::path::Path::new("/tmp"),
+        );
+        assert!(candidate.starts_with(&temp));
+        assert!(!control_dir_fits(&candidate));
     }
 
     #[test]
