@@ -24,11 +24,13 @@ per repo via a `.thegn.toml` overlay, or per run with
 | Profile         | What it does                                                                                                                                                                                                |
 | --------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `open`          | no hardening — the escape hatch                                                                                                                                                                             |
-| `hardened`      | **default.** read-only root, no-new-privileges, a process cap; network and capabilities intact                                                                                                              |
+| `standard`      | **default.** read-only root, no-new-privileges, a process cap; network and capabilities intact                                                                                                              |
 | `sealed`        | full lockdown: `network=none`, drop ALL caps, tighter pids cap. For untrusted work                                                                                                                          |
 | `sealed-tunnel` | `sealed` plus a `[sandbox.vpn]` tunnel as the only route. **Refuses to launch while a VPN is configured**: thegn cannot yet enforce that the tunnel is the only route. With no VPN it behaves like `sealed` |
 
-Under `hardened`, **everything outside the worktree is read-only —
+`hardened` is accepted as an alias for `standard` in existing configuration.
+
+Under `standard`, **everything outside the worktree is read-only —
 including your `$HOME`**, so a sandboxed agent cannot `cd` out and modify
 host files. That is _integrity_ isolation only: the whole `$HOME` stays
 **readable**, credentials included (`~/.ssh`, `~/.aws`, `~/.gnupg`,
@@ -167,7 +169,7 @@ dirs (`CLAUDE_CONFIG_DIR` / `CODEX_HOME`, or the `~/.claude` / `~/.codex` defaul
 every non-sealed pane, so an agent CLI you run by hand can persist its
 state instead of dying on a read-only filesystem.
 
-> `~/.keychain` is carved writable for `hardened` panes but **not** for
+> `~/.keychain` is carved writable for `standard` panes but **not** for
 > `sealed` ones: it holds scripts your host login shells later _source_,
 > so a writable copy from a sealed sandbox would be a persistence vector.
 
@@ -442,7 +444,7 @@ plain rustc.
 
 ## Network
 
-By default a `hardened` sandbox keeps networking so fetch, clone, build,
+By default a `standard` sandbox keeps networking so fetch, clone, build,
 and debuggers work; `sealed` removes it entirely. `[sandbox]` also
 carries DNS-name allow/block rules for the middle ground. These rules are not
 an egress boundary; `network = "none"` is the only enforced deny, and `*` in

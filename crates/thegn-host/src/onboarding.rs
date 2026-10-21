@@ -213,7 +213,7 @@ fn blank_then(lines: &mut Vec<Line>, line: Line) {
     lines.push(Line::segs(vec![sp(0)]));
     lines.push(line);
 }
-const SANDBOX_PROFILES: &[&str] = &["hardened", "open", "sealed", "sealed-tunnel"];
+const SANDBOX_PROFILES: &[&str] = &["standard", "open", "sealed", "sealed-tunnel"];
 
 pub struct OnboardingWizard {
     step: Step,
@@ -1782,7 +1782,7 @@ mod tests {
         w.handle_key(&KeyCode::RightArrow, NONE); // auto → first chain entry
         let picked = w.sandbox_backend().to_string();
         w.move_focus(1);
-        w.handle_key(&KeyCode::RightArrow, NONE); // hardened → open
+        w.handle_key(&KeyCode::RightArrow, NONE); // standard → open
         match enter(&mut w) {
             Outcome::Do(e) => {
                 assert!(e.writes.contains(&WriteOp::Set {

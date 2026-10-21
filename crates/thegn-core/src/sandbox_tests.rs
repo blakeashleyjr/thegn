@@ -140,7 +140,7 @@ fn tunnel_only_profiles_refuse_only_when_vpn_is_configured() {
                     Err(EnterError::Refused(refusal)) => {
                         assert_eq!(refusal.class, RefusalClass::TunnelUnenforced);
                         assert!(refusal.message.contains("sealed-tunnel"));
-                        assert!(refusal.message.contains("hardened"));
+                        assert!(refusal.message.contains("standard"));
                     }
                     other => panic!("expected tunnel-only refusal, got {other:?}"),
                 }

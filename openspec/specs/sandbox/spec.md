@@ -103,7 +103,7 @@ The `sealed` and `sealed-tunnel` profiles SHALL NOT expose the ambient host
 containing only a reviewed read-only allowlist of non-secret single files (each
 resolved through symlinks, required to be a regular file under an approved root,
 and rejected if the target is a denied credential location or a parent of one),
-the worktree, and build caches. `hardened` (read-only `$HOME`) and `open`
+the worktree, and build caches. `standard` (read-only `$HOME`) and `open`
 (writable) are integrity profiles and are unchanged.
 
 The deny list SHALL be enforced at the single launch chokepoint
