@@ -15,6 +15,8 @@ ever checking `main` out. Enable it with `[merge_queue] enabled = true`.
 
 ## Queueing
 
+A worktree with pipeline rows is admitted only when its newest row that is not failed or abandoned is finished and has a trusted gate attestation for the enqueued commit. `thegn merge add <worktree> --admin --why <reason>` records an override on that pipeline row.
+
 Add the current worktree's branch from the [[panel]]'s _merge_ section,
 the sidebar row menu, or `thegn merge add` in the pane. The queue is
 persisted; entries survive restarts. The section shows the active

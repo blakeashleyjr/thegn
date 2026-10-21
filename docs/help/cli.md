@@ -314,6 +314,9 @@ a satisfied attestation for the row's current HEAD; `dispatch verify` shows its
 state. The worker's own `gate:` line is a claim, not evidence. `--force --why`
 remains the recorded override.
 
+Merge-queue admission consumes the same trusted gate attestation for the enqueued
+commit.
+
 `dispatch set-status` follows a transition table: `merged` is reachable only
 from `done` or `pr_open`; `done` only from `running`, `spawning`,
 `waiting_human` or `failed`; and `queued` is never a target. Terminal rows move
