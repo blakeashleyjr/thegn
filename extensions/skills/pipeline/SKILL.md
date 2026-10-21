@@ -11,11 +11,16 @@ when: create,startup,explicit
 You are the **Lead**: the agent that runs the org chart. thegn has no pipeline
 driver and no stage scheduler — `[[pipeline.stages]]` is **declarative data you
 read**. thegn validates that chart (`thegn config validate`) and displays it
-(stage labels on the roster); **nothing in thegn advances `next`, enforces
-`concurrency`, or fires `timeout_secs`.** Those are yours. Every judgement in
-this loop — is this chunk done, is this review a pass, do we retry or park — is
-yours too. After dispatching a stage, launch one background monitor to own the
-watch loop; the Lead stays available for the user and does not poll workers.
+(stage labels on the roster). **Thegn does not advance `next` or fire
+`timeout_secs`; those remain the Lead's decisions.** `dispatch claim` and
+`session open --stage` refuse when a stage is at its `concurrency` limit, and a
+chunk-bearing `dispatch put --chunk` is checked too. A bare `dispatch put`
+without `--chunk` is not capacity-checked, so do not use it to start workers.
+Count active rows to plan capacity; the command refusals are the backstop. Every
+judgement in this loop — is this chunk done, is this review a pass, do we retry
+or park — is yours too. After dispatching a stage, launch one background
+monitor to own the watch loop; the Lead stays available for the user and does
+not poll workers.
 
 Everything below is a `thegn` CLI command (already on PATH; `tg` is an alias).
 Every list-shaped read takes `--json`. The daemon must be running (supervision
@@ -138,6 +143,48 @@ A chart with a duplicate stage name, an `agent` that names no
 `[[agents]]`/`[[tools]]` entry, a `concurrency` of 0, a dangling `next`, a cycle,
 or a `{typo}` in a prompt fails there. Fix the config; do not work around it.
 
+## 1a. Hold the Lead lease
+
+Acquire the issue-scoped lease **before reading the roster to dispatch**. Use
+the main checkout's directory name, not a shared name such as `lead`, so
+separate repositories and issues can be driven independently. The name is
+`<repo>:<issue-id>` (for example, `thegn:linear:ABC-123`) and must be at most
+128 bytes. From the main checkout, prepare the values and acquire:
+
+```bash
+repo="$(basename "$(git rev-parse --show-toplevel)")"
+issue_id="linear:ABC-123"
+lease_name="${repo}:${issue_id}"
+lease_owner="lead-$(hostname)-$$"
+printf 'Lead lease name: %s\nLead lease owner: %s\n' "$lease_name" "$lease_owner"
+thegn dispatch lease acquire --name "$lease_name" --owner "$lease_owner" --ttl 300 --json
+```
+
+Compute the owner once, record the literal name and owner printed above, and
+pass those same literal values to the background monitor and every later lease
+command. Never re-evaluate `$$` or `$(hostname)` during this run. Exit 2 with
+“held by …” means another Lead is driving this issue: stop and tell the user;
+do not start a second chain. The lease is currently honoured by Leads that
+follow this skill. Thegn does not yet check the lease inside `dispatch claim`,
+`set-status`, or `session open --stage`.
+
+Have the background monitor renew the lease every 100 seconds (one third of
+the 300-second TTL):
+
+```bash
+thegn dispatch lease renew --name "<recorded lease name>" --owner "<recorded lease owner>" --ttl 300
+```
+
+If renewal reports `replaced` or `expired`, the lease was lost: stop advancing,
+re-read the roster, and reacquire before making any further decision. Release
+the lease on orderly completion or hand-off, and use `show` to inspect its
+holder:
+
+```bash
+thegn dispatch lease release --name "<recorded lease name>" --owner "<recorded lease owner>"
+thegn dispatch lease show --name "<recorded lease name>" --json
+```
+
 ## 1. Resume before you dispatch
 
 Read the durable roster first, so a restart never double-dispatches work already
@@ -152,9 +199,11 @@ A row whose status is `queued`/`spawning`/`running`/`waiting_human`/`pr_open` is
 legacy or corrupt row — surface it, don't act on it.
 
 **Active rows occupy stage slots.** For each stage, count the active rows whose
-`stage` equals that stage's `name`: that count is what `concurrency` bounds. If
-the `code` stage says `concurrency = 3` and two rows are active, you may start
-**one** more. Nothing in thegn checks this — the count is the enforcement.
+`stage` equals that stage's `name` to plan capacity. If the `code` stage says
+`concurrency = 3` and two rows are active, plan to start **one** more.
+`dispatch claim` and `session open --stage` refuse at capacity, as does a
+chunk-bearing `dispatch put --chunk`; a bare `dispatch put` without `--chunk`
+does not check capacity and must not be used to start workers.
 
 The `parent_id` edge is how a chunk finds the row it came from, and
 `artifact_path` is where the previous stage wrote its handoff. Between them the
@@ -220,9 +269,9 @@ The Lead dispatches the stage's slots (§3), then launches **one** background
 monitor — a harness background subagent (Claude Code Task tool with
 `run_in_background`; pi: background subagent). The Lead never runs
 `dispatch wait` in its own foreground again. If the harness has no background
-facility, use `Bash(run_in_background=true)` for one
-`thegn dispatch wait --any --timeout <ms> --json`; its completion notification
-wakes the Lead for exactly one advance turn.
+facility, use `Bash(run_in_background=true)` to run the monitor loop below;
+each wait is bounded and renewed as described there, and its completion
+notification wakes the Lead when the monitor reports.
 
 The monitor is orchestration-only: it is not a `thegn session open` worker, is
 never assigned a pipeline stage, does not edit a worktree, and performs no
@@ -236,11 +285,19 @@ them only as a data value to the tracker/final summary; the Lead decides what
 their contents mean.
 
 Feed the monitor the chart JSON (`thegn config get pipeline --json`), the issue
-id, and this loop:
+id, and the literal lease name and owner printed at acquisition. It tracks each
+row's remaining stage timeout, initialized at dispatch and carried across waits.
+Before each wait, use the smaller of 100000 ms and `wait_ms`, the time remaining to the
+nearest stage deadline; a deadline that has elapsed is handled as that stage's
+timeout. Once it receives the literal inputs, the monitor binds them as
+`lease_name` and `lease_owner`. After each wait, renew the lease before another
+wait. If renewal reports `replaced` or `expired`, or exits non-zero for any
+reason, stop and report the failure to the Lead immediately.
 
-```
+```text
 until `thegn dispatch list --active --json` is empty:
-  thegn dispatch wait --any --timeout 600000 --json     # ONE wait, no loops
+  thegn dispatch wait --any --timeout 100000 --json
+  thegn dispatch lease renew --name "$lease_name" --owner "$lease_owner" --ttl 300
   row = .row; report = .report                          # read the report ONLY
   thegn dispatch verify row   -> not ok: re-wait / on_blocked per chart
                               -> ok:     thegn dispatch set-status row done
@@ -254,8 +311,9 @@ calls (retry vs park) by writing `thegn dispatch note <row> --text …` and
 surfacing them in its final paragraph. It has no conversation with the Lead
 while it runs. It never uses `--force`; a refused `done` is a note — escalate.
 `timeout_secs` is seconds (validated to be at least 1 and at most 10 years) and
-`dispatch wait --timeout` is milliseconds, so pass `timeout_secs * 1000`; the
-monitor always passes a timeout. A timeout or blocked result follows the stage's `on_blocked`.
+`dispatch wait --timeout` is milliseconds. Track the remaining stage duration
+across waits and cap each wait at 100000 ms; always pass a positive timeout. A
+timeout or blocked result follows the stage's `on_blocked`.
 
 ## 5. Verdict — exit 0 is not done
 
@@ -446,8 +504,11 @@ you dispatched them.
 - **Chunk scopes are declared in the chunk file, enforced by the gate.** When
   the gate refuses, fix the frontmatter (`files:`/`overlaps:`/`after:`) — do
   not reach for `--force` before asking whether the collision is real.
-- **`concurrency` is yours to enforce.** Count active rows per stage; thegn will
-  happily let you start a fourth coder.
+- **Plan for `concurrency`; the commands enforce capacity on claim/open.** Count
+  active rows per stage. A bare `dispatch put` without `--chunk` is not checked.
+- **Hold the issue-scoped Lead lease.** Acquire before dispatch decisions,
+  renew every third of its TTL, stop if replaced or expired, and release on
+  orderly completion or hand-off. The lease is not yet checked by mutations.
 - **Keep the fan-out small.** Every worker shares the one `[sandbox.limits]`
   ceiling interactive panes live under — a pipeline cannot escape it, so a huge
   fan-out just starves itself.
