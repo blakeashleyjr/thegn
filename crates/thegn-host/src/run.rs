@@ -17635,14 +17635,14 @@ async fn event_loop<T: Terminal>(
                                 // branch/commit/stash than the highlighted one.
                                 panel_ui.sync_section_cursors();
                                 if sec == crate::panel::Section::Media {
-                                    if let Some(item) = panel_ui.media.queue_at(i) {
+                                    if let Some(lease) = panel_ui.media.queue_lease_at(i) {
                                         if current_config.media.enabled {
                                             spawn_media_op(
                                                 media_effective_cfg(
                                                     &current_config.media,
                                                     &media_player_override,
                                                 ),
-                                                MediaOp::PlayQueueItem(item.id.clone()),
+                                                MediaOp::PlayQueueItem(lease),
                                                 &media_generation,
                                                 media_tx.clone(),
                                                 waker.clone(),
@@ -22341,15 +22341,15 @@ async fn event_loop<T: Terminal>(
                                                     );
                                                     model.status =
                                                         format!("Media: selected {source}");
-                                                } else if let Some(item) =
-                                                    panel_ui.media.queue_at(panel_ui.cursor)
+                                                } else if let Some(lease) =
+                                                    panel_ui.media.queue_lease_at(panel_ui.cursor)
                                                 {
                                                     spawn_media_op(
                                                         media_effective_cfg(
                                                             &current_config.media,
                                                             &media_player_override,
                                                         ),
-                                                        MediaOp::PlayQueueItem(item.id.clone()),
+                                                        MediaOp::PlayQueueItem(lease),
                                                         &media_generation,
                                                         media_tx.clone(),
                                                         waker.clone(),
