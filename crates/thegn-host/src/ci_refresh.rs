@@ -15,7 +15,6 @@ use std::time::{Duration, Instant};
 
 use termwiz::terminal::TerminalWaker;
 use thegn_core::store::WorkspaceStore;
-use thegn_svc::git::GitBackend;
 
 const MAX_LOG_INGEST_CALLS: usize = 32;
 const MAX_LOG_INGEST_BYTES: usize = 8 * 1024 * 1024;
