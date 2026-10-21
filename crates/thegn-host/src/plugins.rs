@@ -10,7 +10,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
 use termwiz::terminal::TerminalWaker;
@@ -174,6 +174,35 @@ pub(crate) fn restart_delay(restarts: u32) -> Option<Duration> {
 type Sessions = Arc<Mutex<BTreeMap<String, ResidentSession>>>;
 type Disabled = Arc<Mutex<std::collections::BTreeSet<String>>>;
 
+#[derive(Default)]
+struct StopSignal {
+    flag: AtomicBool,
+    lock: Mutex<()>,
+    cv: Condvar,
+}
+
+impl StopSignal {
+    fn is_stopped(&self) -> bool {
+        self.flag.load(Ordering::SeqCst)
+    }
+
+    fn stop(&self) -> bool {
+        let was_stopped = self.flag.swap(true, Ordering::SeqCst);
+        let _guard = lock(&self.lock);
+        self.cv.notify_all();
+        was_stopped
+    }
+
+    fn wait_timeout(&self, duration: Duration) -> bool {
+        let guard = lock(&self.lock);
+        let (_guard, _) = self
+            .cv
+            .wait_timeout_while(guard, duration, |_| !self.is_stopped())
+            .unwrap_or_else(|error| error.into_inner());
+        self.is_stopped()
+    }
+}
+
 #[derive(Clone, Default)]
 struct OneShotGate(Arc<Mutex<BTreeSet<String>>>);
 
@@ -222,7 +251,7 @@ fn admit_unless_stopped<T>(
 /// (or calling [`PluginsHost::shutdown`]) best-effort-deactivates and kills
 /// every resident session.
 pub(crate) struct PluginsHost {
-    stop: Arc<AtomicBool>,
+    stop: Arc<StopSignal>,
     supervisor: ResidentSupervisor,
     sessions: Sessions,
     disabled: Disabled,
@@ -242,7 +271,7 @@ pub(crate) fn spawn_plugins_host(
     tx: PluginTx,
     waker: TerminalWaker,
 ) -> PluginsHost {
-    let stop = Arc::new(AtomicBool::new(false));
+    let stop = Arc::new(StopSignal::default());
     let sessions: Sessions = Arc::new(Mutex::new(BTreeMap::new()));
     let disabled: Disabled = Arc::new(Mutex::new(Default::default()));
     let one_shot_gate = OneShotGate::default();
@@ -253,7 +282,7 @@ pub(crate) fn spawn_plugins_host(
         disabled: disabled.clone(),
         tx: tx.clone(),
         waker: waker.clone(),
-        one_shot_gate,
+        one_shot_gate: one_shot_gate.clone(),
     };
     let spawn = std::thread::Builder::new()
         .name("thegn-plugins".into())
@@ -261,7 +290,15 @@ pub(crate) fn spawn_plugins_host(
             // Utility: resident plugin contributions render as visible UI content.
             crate::platform::qos::set_self(crate::platform::qos::Qos::Utility);
             setup_and_schedule(
-                supervisor, specs, config_dir, sessions, disabled, stop, tx, waker,
+                supervisor,
+                specs,
+                config_dir,
+                sessions,
+                disabled,
+                stop,
+                tx,
+                waker,
+                one_shot_gate.clone(),
             )
         });
     if let Err(e) = spawn {
@@ -285,8 +322,7 @@ impl PluginsHost {
             .spawn(move || {
                 // Utility: restores visibly-missing plugin content.
                 crate::platform::qos::set_self(crate::platform::qos::Qos::Utility);
-                std::thread::sleep(delay);
-                if stop.load(Ordering::SeqCst) {
+                if stop.wait_timeout(delay) {
                     return;
                 }
                 let writer = match thegn_svc::plugin::resolve_env(&plugin) {
@@ -295,7 +331,7 @@ impl PluginsHost {
                             Ok(session) => {
                                 let w = session.writer();
                                 if let Err(session) =
-                                    admit_unless_stopped(&sessions, &stop, id.clone(), session)
+                                    admit_unless_stopped(&sessions, &stop.flag, id.clone(), session)
                                 {
                                     session.kill();
                                     return;
@@ -385,7 +421,7 @@ impl PluginsHost {
 
     /// Best-effort `deactivate` + kill on every resident session. Idempotent.
     pub(crate) fn shutdown(&self) {
-        if self.stop.swap(true, Ordering::SeqCst) {
+        if self.stop.stop() {
             return;
         }
         let sessions = std::mem::take(&mut *lock(&self.sessions));
@@ -468,6 +504,7 @@ struct SchedEntry {
     contribution: ContributionId,
     interval: Duration,
     next: Instant,
+    skipped: u64,
 }
 
 /// Build cadence entries from negotiated contributions. Resident callbacks
@@ -504,10 +541,58 @@ fn build_schedule(loaded: &[LoadedState], now: Instant) -> Vec<SchedEntry> {
                 interval,
                 // Due immediately: the first poll doubles as the initial view.
                 next: now,
+                skipped: 0,
             });
         }
     }
     sched
+}
+
+fn run_due(
+    sched: &mut [SchedEntry],
+    now: Instant,
+    disabled: &Disabled,
+    sessions: &Sessions,
+    gate: &OneShotGate,
+    spawn_poll: &mut dyn FnMut(OneShotTicket, &SchedEntry),
+) {
+    for entry in sched {
+        if entry.next > now || lock(disabled).contains(&entry.plugin) {
+            continue;
+        }
+        entry.next = now + entry.interval;
+        match entry.mode {
+            PluginMode::Resident => {
+                // Fetch the writer at fire time so a respawned session's
+                // fresh writer is picked up; a dead/missing session skips.
+                let writer = lock(sessions)
+                    .get(&entry.plugin)
+                    .map(|session| session.writer());
+                if let Some(writer) = writer {
+                    // best-effort: a mid-exit session errors; Exit handles it.
+                    let _ = writer.notify(
+                        PluginCallback::Render,
+                        serde_json::json!({
+                            "surface": entry.surface,
+                            "contribution": entry.contribution,
+                        }),
+                    );
+                }
+            }
+            PluginMode::OneShot => match gate.try_begin(&entry.plugin) {
+                Some(ticket) => spawn_poll(ticket, entry),
+                None => {
+                    entry.skipped += 1;
+                    tracing::debug!(
+                        target: "thegn::plugin",
+                        plugin = %entry.plugin,
+                        skipped = entry.skipped,
+                        "one-shot poll skipped: previous run still in flight"
+                    );
+                }
+            },
+        }
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -517,9 +602,10 @@ fn setup_and_schedule(
     config_dir: PathBuf,
     sessions: Sessions,
     disabled: Disabled,
-    stop: Arc<AtomicBool>,
+    stop: Arc<StopSignal>,
     tx: PluginTx,
     waker: TerminalWaker,
+    gate: OneShotGate,
 ) {
     setup_and_schedule_with_waker(
         supervisor,
@@ -530,6 +616,7 @@ fn setup_and_schedule(
         stop,
         tx,
         Some(waker),
+        gate,
     );
 }
 
@@ -540,9 +627,10 @@ fn setup_and_schedule_with_waker(
     config_dir: PathBuf,
     sessions: Sessions,
     disabled: Disabled,
-    stop: Arc<AtomicBool>,
+    stop: Arc<StopSignal>,
     tx: PluginTx,
     waker: Option<TerminalWaker>,
+    gate: OneShotGate,
 ) {
     // `discover` reads `cfg.plugins` + the plugins directory; hand it the
     // owned specs on a default config rather than cloning the whole config
@@ -610,7 +698,7 @@ fn setup_and_schedule_with_waker(
                 Ok(session) => {
                     let w = session.writer();
                     if let Err(session) =
-                        admit_unless_stopped(&sessions, &stop, id.clone(), session)
+                        admit_unless_stopped(&sessions, &stop.flag, id.clone(), session)
                     {
                         session.kill();
                         None
@@ -690,7 +778,7 @@ fn setup_and_schedule_with_waker(
     }
 
     for r in initial_runs {
-        if stop.load(Ordering::SeqCst) {
+        if stop.is_stopped() {
             return;
         }
         let run = thegn_svc::plugin::spawn_ndjson(&r.command, &r.env, r.cwd.as_deref(), r.timeout);
@@ -716,50 +804,47 @@ fn setup_and_schedule_with_waker(
         .unwrap_or(Duration::from_secs(1))
         .max(Duration::from_secs(1));
     loop {
-        if stop.load(Ordering::SeqCst) {
+        if stop.is_stopped() {
             return;
         }
-        let now = Instant::now();
-        for entry in &mut sched {
-            if entry.next > now || lock(&disabled).contains(&entry.plugin) {
-                continue;
-            }
-            entry.next = now + entry.interval;
-            match entry.mode {
-                PluginMode::Resident => {
-                    // Fetch the writer at fire time so a respawned session's
-                    // fresh writer is picked up; a dead/missing session skips.
-                    let writer = lock(&sessions).get(&entry.plugin).map(|s| s.writer());
-                    if let Some(w) = writer {
-                        // best-effort: a mid-exit session errors; Exit handles it.
-                        let _ = w.notify(
-                            PluginCallback::Render,
-                            serde_json::json!({
-                                "surface": entry.surface,
-                                "contribution": entry.contribution,
-                            }),
+        run_due(
+            &mut sched,
+            Instant::now(),
+            &disabled,
+            &sessions,
+            &gate,
+            &mut |ticket, entry| {
+                let plugin = entry.plugin.clone();
+                let command = entry.command.clone();
+                let env = entry.env.clone();
+                let cwd = entry.cwd.clone();
+                let timeout = entry.timeout;
+                let tx = tx.clone();
+                let waker = waker.clone();
+                if let Err(error) =
+                    thegn_core::thread_name::try_spawn_named("thegn-plug-poll", move || {
+                        crate::platform::qos::set_self(crate::platform::qos::Qos::Utility);
+                        let run = thegn_svc::plugin::spawn_ndjson(
+                            &command,
+                            &env,
+                            cwd.as_deref(),
+                            timeout,
                         );
-                    }
+                        drop(ticket);
+                        // best-effort: send: the consumer may be gone; a closed channel is the consumer going away
+                        let _ = tx.send(PluginMsg::OneShot { plugin, run });
+                        if let Some(waker) = &waker {
+                            let _ = waker.wake(); // best-effort: an input nudge must never fail the calling path
+                        }
+                    })
+                {
+                    tracing::warn!(target: "thegn::plugin", plugin = %entry.plugin, error = %error, "scheduled one-shot thread failed to start");
                 }
-                PluginMode::OneShot => {
-                    let run = thegn_svc::plugin::spawn_ndjson(
-                        &entry.command,
-                        &entry.env,
-                        entry.cwd.as_deref(),
-                        entry.timeout,
-                    );
-                    // best-effort: send: the consumer may be gone; a closed channel is the consumer going away
-                    let _ = tx.send(PluginMsg::OneShot {
-                        plugin: entry.plugin.clone(),
-                        run,
-                    });
-                    if let Some(waker) = &waker {
-                        let _ = waker.wake(); // best-effort: waker pulse: an input nudge must never fail the calling path
-                    }
-                }
-            }
+            },
+        );
+        if stop.wait_timeout(granularity) {
+            return;
         }
-        std::thread::sleep(granularity);
     }
 }
 
@@ -896,6 +981,152 @@ mod tests {
     }
 
     #[test]
+    fn sched_busy_one_shot_tick_is_skipped_and_counted() {
+        let now = Instant::now();
+        let mut schedule = build_schedule(
+            &[loaded_state(spec_with_two_intervals(PluginMode::OneShot))],
+            now,
+        );
+        let interval = schedule[0].interval;
+        let gate = OneShotGate::default();
+        let ticket = gate.try_begin("cadenced").unwrap();
+        let disabled = Arc::new(Mutex::new(BTreeSet::new()));
+        let sessions = Arc::new(Mutex::new(BTreeMap::new()));
+        let mut spawned = 0;
+
+        run_due(
+            &mut schedule,
+            now,
+            &disabled,
+            &sessions,
+            &gate,
+            &mut |_, _| spawned += 1,
+        );
+
+        assert_eq!(spawned, 0);
+        assert_eq!(schedule[0].skipped, 1);
+        assert_eq!(schedule[0].next, now + interval);
+
+        drop(ticket);
+        run_due(
+            &mut schedule,
+            now + interval,
+            &disabled,
+            &sessions,
+            &gate,
+            &mut |_, _| spawned += 1,
+        );
+
+        assert_eq!(spawned, 1);
+        assert_eq!(schedule[0].skipped, 1);
+    }
+
+    #[test]
+    fn sched_in_flight_poll_blocks_the_next_tick() {
+        let now = Instant::now();
+        let mut schedule = build_schedule(
+            &[loaded_state(spec_with_two_intervals(PluginMode::OneShot))],
+            now,
+        );
+        let interval = schedule[0].interval;
+        let gate = OneShotGate::default();
+        let disabled = Arc::new(Mutex::new(BTreeSet::new()));
+        let sessions = Arc::new(Mutex::new(BTreeMap::new()));
+        let mut held_ticket = None;
+        let mut spawned = 0;
+
+        run_due(
+            &mut schedule,
+            now,
+            &disabled,
+            &sessions,
+            &gate,
+            &mut |ticket, _| {
+                spawned += 1;
+                held_ticket = Some(ticket);
+            },
+        );
+        run_due(
+            &mut schedule,
+            now + interval,
+            &disabled,
+            &sessions,
+            &gate,
+            &mut |ticket, _| {
+                spawned += 1;
+                drop(ticket);
+            },
+        );
+
+        assert_eq!(spawned, 1);
+        assert_eq!(schedule[0].skipped, 1);
+        drop(held_ticket.take());
+        run_due(
+            &mut schedule,
+            now + interval * 2,
+            &disabled,
+            &sessions,
+            &gate,
+            &mut |ticket, _| {
+                spawned += 1;
+                drop(ticket);
+            },
+        );
+        assert_eq!(spawned, 2);
+        assert_eq!(schedule[0].skipped, 1);
+    }
+
+    #[test]
+    fn sched_resident_entry_without_a_session_is_a_noop() {
+        let now = Instant::now();
+        let mut schedule = build_schedule(
+            &[loaded_state(spec_with_two_intervals(PluginMode::Resident))],
+            now,
+        );
+        let gate = OneShotGate::default();
+        let disabled = Arc::new(Mutex::new(BTreeSet::new()));
+        let sessions = Arc::new(Mutex::new(BTreeMap::new()));
+        let mut spawned = 0;
+
+        run_due(
+            &mut schedule,
+            now,
+            &disabled,
+            &sessions,
+            &gate,
+            &mut |_, _| spawned += 1,
+        );
+
+        assert_eq!(spawned, 0);
+        assert!(schedule.iter().all(|entry| entry.skipped == 0));
+    }
+
+    #[test]
+    fn sched_stop_signal_wakes_a_long_wait() {
+        let stop = Arc::new(StopSignal::default());
+        let worker_stop = stop.clone();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            tx.send(worker_stop.wait_timeout(Duration::from_secs(60)))
+                .unwrap();
+        });
+
+        std::thread::sleep(Duration::from_millis(50));
+        assert!(!stop.stop());
+        assert!(rx.recv_timeout(Duration::from_secs(5)).unwrap());
+        worker.join().unwrap();
+    }
+
+    #[test]
+    fn sched_stop_signal_wait_after_stop_returns_immediately() {
+        let stop = StopSignal::default();
+
+        assert!(!stop.stop());
+        assert!(stop.stop());
+        assert!(stop.wait_timeout(Duration::from_secs(60)));
+    }
+
+    #[test]
     fn palette_run_is_single_flight() {
         if !crate::platform::sound_process::test_support::UNIX {
             return;
@@ -911,7 +1142,7 @@ mod tests {
         let supervisor = ResidentSupervisor::new(runtime.handle().clone());
         let (tx, mut rx) = plugin_channel();
         let host = PluginsHost {
-            stop: Arc::new(AtomicBool::new(false)),
+            stop: Arc::new(StopSignal::default()),
             supervisor,
             sessions: Arc::new(Mutex::new(BTreeMap::new())),
             disabled: Arc::new(Mutex::new(Default::default())),
@@ -1005,7 +1236,7 @@ mod tests {
         let supervisor = ResidentSupervisor::new(runtime.handle().clone());
         let sessions: Sessions = Arc::new(Mutex::new(BTreeMap::new()));
         let disabled: Disabled = Arc::new(Mutex::new(Default::default()));
-        let stop = Arc::new(AtomicBool::new(false));
+        let stop = Arc::new(StopSignal::default());
         let (tx, mut rx) = plugin_channel();
 
         setup_and_schedule_with_waker(
@@ -1017,6 +1248,7 @@ mod tests {
             stop,
             tx,
             None,
+            OneShotGate::default(),
         );
 
         assert!(matches!(rx.try_recv().unwrap(), PluginMsg::Loaded(loaded) if loaded.is_empty()));
@@ -1048,7 +1280,7 @@ mod tests {
         let supervisor = ResidentSupervisor::new(runtime.handle().clone());
         let sessions: Sessions = Arc::new(Mutex::new(BTreeMap::new()));
         let disabled: Disabled = Arc::new(Mutex::new(Default::default()));
-        let stop = Arc::new(AtomicBool::new(false));
+        let stop = Arc::new(StopSignal::default());
         let (tx, mut rx) = plugin_channel();
 
         setup_and_schedule_with_waker(
@@ -1060,6 +1292,7 @@ mod tests {
             stop,
             tx,
             None,
+            OneShotGate::default(),
         );
 
         assert!(matches!(rx.try_recv().unwrap(), PluginMsg::Loaded(loaded) if loaded.is_empty()));
@@ -1090,7 +1323,7 @@ mod tests {
         let supervisor = ResidentSupervisor::new(runtime.handle().clone());
         let sessions: Sessions = Arc::new(Mutex::new(BTreeMap::new()));
         let disabled: Disabled = Arc::new(Mutex::new(Default::default()));
-        let stop = Arc::new(AtomicBool::new(false));
+        let stop = Arc::new(StopSignal::default());
         let (tx, mut rx) = plugin_channel();
 
         setup_and_schedule_with_waker(
@@ -1102,6 +1335,7 @@ mod tests {
             stop,
             tx,
             None,
+            OneShotGate::default(),
         );
 
         assert!(matches!(
@@ -1143,7 +1377,7 @@ mod tests {
         let supervisor = ResidentSupervisor::new(runtime.handle().clone());
         let sessions: Sessions = Arc::new(Mutex::new(BTreeMap::new()));
         let disabled: Disabled = Arc::new(Mutex::new(Default::default()));
-        let stop = Arc::new(AtomicBool::new(false));
+        let stop = Arc::new(StopSignal::default());
         let (tx, mut rx) = plugin_channel();
         setup_and_schedule_with_waker(
             supervisor,
@@ -1154,6 +1388,7 @@ mod tests {
             stop,
             tx,
             None,
+            OneShotGate::default(),
         );
 
         assert!(matches!(rx.try_recv().unwrap(), PluginMsg::Loaded(_)));
@@ -1190,7 +1425,7 @@ mod tests {
         let supervisor = ResidentSupervisor::new(runtime.handle().clone());
         let sessions: Sessions = Arc::new(Mutex::new(BTreeMap::new()));
         let disabled: Disabled = Arc::new(Mutex::new(Default::default()));
-        let stop = Arc::new(AtomicBool::new(false));
+        let stop = Arc::new(StopSignal::default());
         let (tx, mut rx) = plugin_channel();
         setup_and_schedule_with_waker(
             supervisor,
@@ -1201,6 +1436,7 @@ mod tests {
             stop,
             tx,
             None,
+            OneShotGate::default(),
         );
 
         assert!(matches!(
