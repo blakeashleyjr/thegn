@@ -16310,7 +16310,7 @@ async fn event_loop<T: Terminal>(
                     replay.is_some(),
                 );
                 if occluded_now && !corner_occluded {
-                    pending_corner_oob.require_delete();
+                    pending_corner_oob.occlude();
                 }
                 let queued_bytes = corner_gfx.iter().map(Vec::len).sum::<usize>();
                 let (draw, truncated) = crate::kitty_relay::coalesce_gfx_within(
