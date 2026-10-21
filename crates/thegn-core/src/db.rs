@@ -1088,6 +1088,7 @@ pub use crate::db_dispatch::{
 };
 pub use crate::db_dispatch::{
     LeaseInputError, MAX_LEASE_TTL_SECS, MIN_LEASE_TTL_SECS, ParentDispatchConflict,
+    ParentEdgeReason,
 };
 pub use crate::models::{ForwardRow, ShareRow};
 
