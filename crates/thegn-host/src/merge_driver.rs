@@ -1104,10 +1104,11 @@ fn drive_queue_with(
                                 ));
                                 break 'attempt;
                             }
-                            out.persistence_errors.push(format!(
-                                "{}: could not reserve agent attempt: {error}",
-                                item.worktree
-                            ));
+                            let detail = format!("could not reserve agent attempt: {error}");
+                            out.persistence_errors
+                                .push(format!("{}: {detail}", item.worktree));
+                            set(db, MqStatus::GateError, None, Some(&detail));
+                            stop_on_write_error!('attempt);
                             stop_drain.set(true);
                             break 'attempt;
                         }
