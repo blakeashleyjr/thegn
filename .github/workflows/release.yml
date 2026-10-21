@@ -611,6 +611,97 @@ jobs:
             echo
             echo "External publication enabled: \`$PUBLICATION_ENABLED\`"
           } >> "$GITHUB_STEP_SUMMARY"
+  verify-manifest:
+    if: github.event_name == 'push' || inputs.operation == 'build'
+    needs: [admit, upload, completions, package]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          ref: ${{ needs.admit.outputs.sha }}
+          persist-credentials: false
+      - name: Download every draft asset
+        env:
+          TAG: ${{ needs.admit.outputs.tag }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          root="$(mktemp -d "$RUNNER_TEMP/verify.XXXXXX")"
+          echo "VERIFY_ROOT=$root" >> "$GITHUB_ENV"
+          mkdir -p "$root/assets" "$RUNNER_TEMP/manifest"
+          gh release download "$TAG" --dir "$root/assets"
+      - name: Verify archive provenance
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ needs.admit.outputs.tag }}
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          archives=("$VERIFY_ROOT/assets/thegn-$TAG-"*.tar.gz)
+          [ "${#archives[@]}" -gt 0 ] || { echo "::error::no release archives to verify"; exit 1; }
+          for archive in "${archives[@]}"; do
+            verification="$(gh attestation verify "$archive" \
+              --repo "$GITHUB_REPOSITORY" \
+              --signer-workflow "$GITHUB_REPOSITORY/.github/workflows/release.yml" \
+              --source-digest "$GITHUB_SHA" \
+              --deny-self-hosted-runners \
+              --format json)"
+            if ! jq -e \
+              --arg run_uri_prefix "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID/" \
+              'type == "array" and length > 0 and all(.[];
+                ((.verificationResult.signature.certificate.runInvocationURI // "")
+                  | startswith($run_uri_prefix)))' \
+              <<< "$verification" >/dev/null; then
+              echo "::error::archive attestation is not bound to this workflow run"
+              exit 1
+            fi
+          done
+      - name: Build the release manifest
+        env:
+          TAG: ${{ needs.admit.outputs.tag }}
+          ADMITTED_SHA: ${{ needs.admit.outputs.sha }}
+        run: |
+          set -euo pipefail
+          python3 packaging/release.py manifest \
+            --tag "$TAG" \
+            --assets-dir "$VERIFY_ROOT/assets" \
+            --record "$VERIFY_ROOT/assets/thegn-$TAG-release.json" \
+            --commit "$ADMITTED_SHA" \
+            --output "$RUNNER_TEMP/manifest/thegn-$TAG-manifest.json"
+      - name: Verify tag still names the admitted commit
+        env:
+          TAG: ${{ needs.admit.outputs.tag }}
+          ADMITTED_SHA: ${{ needs.admit.outputs.sha }}
+          ADMITTED_TAG_OBJECT: ${{ needs.admit.outputs.tag_object }}
+        run: |
+          set -euo pipefail
+          remote="$(git ls-remote origin "refs/tags/$TAG" "refs/tags/$TAG^{}")"
+          tag_object="$(awk -v ref="refs/tags/$TAG" '$2 == ref {print $1}' <<< "$remote")"
+          peeled="$(awk -v ref="refs/tags/$TAG^{}" '$2 == ref {print $1}' <<< "$remote")"
+          [ -n "$tag_object" ] || { echo "::error::release tag disappeared"; exit 1; }
+          [ "$tag_object" = "$ADMITTED_TAG_OBJECT" ] \
+            && [ "${peeled:-$tag_object}" = "$ADMITTED_SHA" ] || {
+            echo "::error::release tag moved after admission"
+            exit 1
+          }
+      - name: Attest release manifest
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: ${{ runner.temp }}/manifest/thegn-${{ needs.admit.outputs.tag }}-manifest.json
+      - name: Upload release manifest
+        env:
+          TAG: ${{ needs.admit.outputs.tag }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          manifest="$RUNNER_TEMP/manifest/thegn-$TAG-manifest.json"
+          gh release upload "$TAG" "$manifest" --clobber
+          asset_count="$(jq '.assets | length' "$manifest")"
+          echo "Verified and attached $asset_count release assets in the manifest for $TAG." >> "$GITHUB_STEP_SUMMARY"
   # Publication is deliberately a separate manual operation. It cannot reach
   # create-release or mutate release assets. A credential-free worker renders
   # AUR metadata before isolated, separately protected publishers receive keys.
@@ -714,6 +805,7 @@ jobs:
     environment: package-publication-homebrew
     permissions:
       contents: read
+      attestations: read
     steps:
       - name: Require a main-branch dispatch
         env:
@@ -776,6 +868,31 @@ jobs:
           mkdir -p "$publish_root/metadata" "$publish_root/keys"
           gh release download "$TAG" --dir "$publish_root/metadata" \
             --pattern "thegn-$TAG-homebrew.rb"
+          manifest="$publish_root/metadata/thegn-$TAG-manifest.json"
+          if ! gh release download "$TAG" --dir "$publish_root/metadata" \
+            --pattern "thegn-$TAG-manifest.json" || [ ! -f "$manifest" ]; then
+            echo "::error::release manifest missing: run the build to completion (verify-manifest) before publishing"
+            exit 1
+          fi
+          if ! gh attestation verify "$manifest" --repo "$GITHUB_REPOSITORY" \
+            --signer-workflow "$GITHUB_REPOSITORY/.github/workflows/release.yml" \
+            --deny-self-hosted-runners; then
+            echo "::error::release manifest attestation did not verify"
+            exit 1
+          fi
+          if [ "$(jq -r '.tag' "$manifest")" != "$TAG" ]; then
+            echo "::error::release manifest tag does not match"
+            exit 1
+          fi
+          formula="thegn-$TAG-homebrew.rb"
+          manifest_sha="$(jq -r --arg n "$formula" \
+            '[.assets[] | select(.name == $n) | .sha256] | if length == 1 then .[0] else "" end' \
+            "$manifest")"
+          if [[ ! "$manifest_sha" =~ ^[a-f0-9]{64}$ ]] \
+            || [ "$(sha256sum "$publish_root/metadata/$formula" | cut -d ' ' -f 1)" != "$manifest_sha" ]; then
+            echo "::error::$formula does not match the release manifest"
+            exit 1
+          fi
       - name: Materialize Homebrew deploy key
         if: steps.publication.outputs.ready == 'true'
         env:
@@ -897,6 +1014,7 @@ jobs:
     environment: package-publication-aur
     permissions:
       contents: read
+      attestations: read
     steps:
       - name: Require a main-branch dispatch
         env:
@@ -979,6 +1097,31 @@ jobs:
           mkdir -p "$publish_root/metadata" "$publish_root/keys"
           gh release download "$TAG" --dir "$publish_root/metadata" \
             --pattern "thegn-$TAG-PKGBUILD"
+          manifest="$publish_root/metadata/thegn-$TAG-manifest.json"
+          if ! gh release download "$TAG" --dir "$publish_root/metadata" \
+            --pattern "thegn-$TAG-manifest.json" || [ ! -f "$manifest" ]; then
+            echo "::error::release manifest missing: run the build to completion (verify-manifest) before publishing"
+            exit 1
+          fi
+          if ! gh attestation verify "$manifest" --repo "$GITHUB_REPOSITORY" \
+            --signer-workflow "$GITHUB_REPOSITORY/.github/workflows/release.yml" \
+            --deny-self-hosted-runners; then
+            echo "::error::release manifest attestation did not verify"
+            exit 1
+          fi
+          if [ "$(jq -r '.tag' "$manifest")" != "$TAG" ]; then
+            echo "::error::release manifest tag does not match"
+            exit 1
+          fi
+          pkgbuild="thegn-$TAG-PKGBUILD"
+          manifest_sha="$(jq -r --arg n "$pkgbuild" \
+            '[.assets[] | select(.name == $n) | .sha256] | if length == 1 then .[0] else "" end' \
+            "$manifest")"
+          if [[ ! "$manifest_sha" =~ ^[a-f0-9]{64}$ ]] \
+            || [ "$(sha256sum "$publish_root/metadata/$pkgbuild" | cut -d ' ' -f 1)" != "$manifest_sha" ]; then
+            echo "::error::$pkgbuild does not match the release manifest"
+            exit 1
+          fi
           artifact_sha="$(sha256sum "$RUNNER_TEMP/aur-metadata/PKGBUILD" | cut -d ' ' -f 1)"
           release_sha="$(sha256sum "$publish_root/metadata/thegn-$TAG-PKGBUILD" | cut -d ' ' -f 1)"
           if [ "$artifact_sha" != "$release_sha" ]; then

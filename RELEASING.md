@@ -79,10 +79,12 @@ install github:blakeashleyjr/thegn` gives users `.#default`, bridge included,
 
    windows-msvc is still out: that CI job has never executed. Add a target only
    once its CI job is green. Check the package job's
-   summary for its exact outputs and target/checksum mapping. Only after every
-   archive, checksum, attestation, and generated package is present should the
-   install channel be advertised. Write the release notes (crib from the
-   changelog) and publish the draft.
+   summary for its exact outputs and target/checksum mapping. The
+   `verify-manifest` job is the completeness proof: it checks the exact asset
+   set, archive attestations, checksums, and upload record, then attaches the
+   deterministic `thegn-<tag>-manifest.json`. Write the release notes (crib
+   from the changelog) and publish the draft only after `verify-manifest` is
+   green and that manifest is attached.
    Pre-release tags (`-alpha.N` / `-beta.N`) are auto-marked as a prerelease
    by the workflow — no manual checkbox needed.
 
@@ -97,7 +99,10 @@ install github:blakeashleyjr/thegn` gives users `.#default`, bridge included,
 7. **Publish generated external metadata only after the draft is published.**
    In Actions, dispatch the `release` workflow from `main`, enter the already
    published tag, and choose `publish-external`. This operation is isolated
-   from `create-release`, so it cannot change any release asset. Approve the
+   from `create-release`, so it cannot change any release asset. Each
+   publisher refuses to proceed unless the release manifest is present, its
+   attestation verifies, it names the requested tag, and its formula or
+   `PKGBUILD` entry matches the downloaded file's digest. Approve the
    protected `package-publication-homebrew` and `package-publication-aur`
    environments when prompted. Each has a required reviewer and only its
    matching deploy key.
