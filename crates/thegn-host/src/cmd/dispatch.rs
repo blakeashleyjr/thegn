@@ -312,13 +312,22 @@ fn worker_route(action: &Action, token: Option<&str>) -> WorkerRoute {
     }
 }
 
-#[derive(Debug, thiserror::Error)]
-#[error(
-    "thegn dispatch {verb} is a supervisor verb and is refused under a worker dispatch capability"
-)]
+#[derive(Debug)]
 struct WorkerCapabilityRefusal {
     verb: &'static str,
 }
+
+impl std::fmt::Display for WorkerCapabilityRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "`thegn dispatch {}` is a supervisor verb and is refused under a worker dispatch capability",
+            self.verb
+        )
+    }
+}
+
+impl std::error::Error for WorkerCapabilityRefusal {}
 
 pub fn run(cfg: &Config, action: Action) -> Result<()> {
     fn worker_write_via_daemon(cfg: &Config, action: Action, token: String) -> Result<()> {
@@ -338,25 +347,12 @@ pub fn run(cfg: &Config, action: Action) -> Result<()> {
                             },
                         )
                         .await?;
-                    if json {
-                        let mut value = serde_json::json!({
-                            "id": reply.id,
-                            "report": validated,
-                            "bytes": reply.bytes,
-                        });
-                        if reply.pass_without_gate_evidence {
-                            value["pass_without_gate_evidence"] = serde_json::json!(true);
-                        }
-                        super::emit_json(&value)?;
-                    } else {
-                        outln!("report recorded on dispatch {} ({} chars)", id, validated.chars().count());
-                        if reply.pass_without_gate_evidence {
-                            outln!("note: this report reads as PASS but cites no gate result. A PASS means the \
-                                   queue-boundary suite is green — add a line like\n  gate: cargo nextest run \
-                                   --workspace -- <N> passed, <M> skipped\nScoped suites do not run the \
-                                   workspace-level coverage tests the fold gate rejects branches on.");
-                        }
-                    }
+                    print_report_outcome(
+                        reply.id,
+                        &validated,
+                        reply.pass_without_gate_evidence,
+                        json,
+                    )?;
                 }
                 Action::Note { id, text, json } => {
                     let validated = pipeline_report::note_text(&text)
@@ -364,7 +360,10 @@ pub fn run(cfg: &Config, action: Action) -> Result<()> {
                     let reply = client
                         .dispatch_note(
                             id,
-                            &thegn_svc::control::DispatchWorkerWriteReq { text: validated.clone(), token },
+                            &thegn_svc::control::DispatchWorkerWriteReq {
+                                text: validated.clone(),
+                                token,
+                            },
                         )
                         .await?;
                     if json {
@@ -375,7 +374,11 @@ pub fn run(cfg: &Config, action: Action) -> Result<()> {
                             "created_at_ms": reply.created_at_ms,
                         }))?;
                     } else {
-                        outln!("note recorded on dispatch {} ({} chars)", id, validated.chars().count());
+                        outln!(
+                            "note recorded on dispatch {} ({} chars)",
+                            id,
+                            validated.chars().count()
+                        );
                     }
                 }
                 _ => unreachable!("worker route only sends report or note"),
@@ -2120,8 +2123,10 @@ fn report(id: i64, text: &str, json: bool) -> Result<()> {
 /// THE-88 — the DB-bound half of `dispatch report`. Validated text → row.
 pub(crate) fn write_report(db: &Db, id: i64, text: &str, json: bool) -> Result<()> {
     let recorded = record_report(db, id, text)?;
-    let validated = recorded.validated;
-    let ungated = recorded.ungated;
+    print_report_outcome(id, &recorded.validated, recorded.ungated, json)
+}
+
+fn print_report_outcome(id: i64, validated: &str, ungated: bool, json: bool) -> Result<()> {
     if json {
         let mut v = serde_json::json!({
             "id": id,
@@ -4618,14 +4623,14 @@ mod tests {
         let local_id = db
             .put_agent_dispatch(NewDispatch::new(
                 "linear:THE-1037",
-                worktree.to_str().unwrap(),
+                worktree.path().to_str().unwrap(),
                 "sh",
             ))
             .unwrap();
         let daemon_id = db
             .put_agent_dispatch(NewDispatch::new(
                 "linear:THE-1037",
-                worktree.to_str().unwrap(),
+                worktree.path().to_str().unwrap(),
                 "sh",
             ))
             .unwrap();
