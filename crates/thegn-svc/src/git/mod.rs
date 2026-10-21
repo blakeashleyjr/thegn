@@ -435,6 +435,10 @@ pub trait GitBackend: thegn_core::seam::Probe + Send + Sync {
                 .map(|(_, out)| out.trim().to_string())
                 .unwrap_or_default()
         };
+        // Probe a pseudo-ref before reading rebase state files. Besides keeping
+        // merge detection first, this makes an invalid repository fail through
+        // the typed Git probe instead of a secondary `--git-path` lookup.
+        let merge_in_progress = exists("MERGE_HEAD")?;
         // A rebase in progress is marked by the `rebase-merge`/`rebase-apply`
         // state directory — NOT by `REBASE_HEAD`. git leaves `REBASE_HEAD`
         // dangling after a conflicted rebase is resolved and `--continue`d to
@@ -460,7 +464,7 @@ pub trait GitBackend: thegn_core::seam::Probe + Send + Sync {
         } else {
             remote_rebase_marker(|rel| loc.read_git_path_checked(rel))?
         };
-        let kind = if exists("MERGE_HEAD")? {
+        let kind = if merge_in_progress {
             Some((MergeKind::Merge, "MERGE_HEAD"))
         } else if rebasing {
             Some((MergeKind::Rebase, "REBASE_HEAD"))
