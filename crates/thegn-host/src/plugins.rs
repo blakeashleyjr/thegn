@@ -25,6 +25,7 @@ use thegn_svc::plugin::{
 use tokio::sync::mpsc as tokio_mpsc;
 
 pub(crate) mod inbox;
+pub(crate) mod respawn;
 use inbox::PluginInbox;
 
 #[derive(Clone)]
@@ -174,6 +175,131 @@ pub(crate) fn restart_delay(restarts: u32) -> Option<Duration> {
 type Sessions = Arc<Mutex<BTreeMap<String, ResidentSession>>>;
 type Disabled = Arc<Mutex<std::collections::BTreeSet<String>>>;
 
+const RESPAWN_IDLE_WAIT: Duration = Duration::from_secs(60);
+
+struct RespawnState<P> {
+    queue: respawn::RespawnQueue<P>,
+    worker: bool,
+    closed: bool,
+}
+
+struct RespawnTimers<P> {
+    state: Mutex<RespawnState<P>>,
+    cv: Condvar,
+}
+
+impl<P> Default for RespawnTimers<P> {
+    fn default() -> Self {
+        Self {
+            state: Mutex::new(RespawnState {
+                queue: respawn::RespawnQueue::default(),
+                worker: false,
+                closed: false,
+            }),
+            cv: Condvar::new(),
+        }
+    }
+}
+
+impl<P> RespawnTimers<P> {
+    fn cancel(&self, id: &str) {
+        lock(&self.state).queue.cancel(id);
+        self.cv.notify_all();
+    }
+
+    fn close(&self) {
+        let mut state = lock(&self.state);
+        state.closed = true;
+        state.queue.clear();
+        self.cv.notify_all();
+    }
+}
+
+fn run_respawn_worker<P>(
+    timers: &RespawnTimers<P>,
+    stop: &StopSignal,
+    mut fire: impl FnMut(String, P),
+) {
+    let mut state = lock(&timers.state);
+    loop {
+        if stop.is_stopped() || state.closed {
+            state.queue.clear();
+            state.worker = false;
+            return;
+        }
+        if let Some((id, payload)) = state.queue.pop_due(Instant::now()) {
+            drop(state);
+            fire(id, payload);
+            state = lock(&timers.state);
+            continue;
+        }
+        let wait = state
+            .queue
+            .next_wait(Instant::now())
+            .unwrap_or(RESPAWN_IDLE_WAIT);
+        state = timers
+            .cv
+            .wait_timeout(state, wait)
+            .unwrap_or_else(|error| error.into_inner())
+            .0;
+    }
+}
+
+struct RespawnCtx {
+    stop: Arc<StopSignal>,
+    sessions: Sessions,
+    supervisor: ResidentSupervisor,
+    tx: PluginTx,
+    waker: TerminalWaker,
+    state_anchor: PathBuf,
+}
+
+fn respawn_now(plugin: LoadedPlugin, ctx: &RespawnCtx) {
+    let id = plugin.spec.manifest.id.as_str().to_string();
+    let writer = match thegn_svc::plugin::resolve_launch_env(&plugin, &ctx.state_anchor) {
+        Ok(env) => match spawn_session(&ctx.supervisor, &plugin, &env, &ctx.tx, &ctx.waker) {
+            Ok(session) => {
+                let writer = session.writer();
+                if let Err(session) =
+                    admit_unless_stopped(&ctx.sessions, &ctx.stop.flag, id.clone(), session)
+                {
+                    session.kill();
+                    return;
+                }
+                Some(writer)
+            }
+            Err(error) => {
+                tracing::warn!(target: "thegn::plugin", plugin = %id, error = %error, "respawn failed");
+                None
+            }
+        },
+        Err(problem) => {
+            if let Err(error) = ctx.tx.send(PluginMsg::Refused(vec![problem])) {
+                tracing::debug!(target: "thegn::plugin", %error, "refusal message consumer is gone");
+            }
+            if let Err(error) = ctx.waker.wake() {
+                tracing::debug!(target: "thegn::plugin", %error, "refusal message waker pulse failed");
+            }
+            None
+        }
+    };
+    let admitted = writer.is_some();
+    if let Err(error) = ctx.tx.send(PluginMsg::Respawned {
+        plugin: id.clone(),
+        writer,
+    }) {
+        tracing::debug!(target: "thegn::plugin", plugin = %id, %error, "plugin loop is gone before respawn publish; closing the respawned session");
+        if admitted && let Some(session) = lock(&ctx.sessions).remove(&id) {
+            session.kill();
+        }
+        return;
+    }
+    // best-effort: the loop may be shutting down.
+    if let Err(error) = ctx.waker.wake() {
+        tracing::debug!(target: "thegn::plugin", %error, "respawn message waker pulse failed");
+    }
+}
+
 #[derive(Default)]
 struct StopSignal {
     flag: AtomicBool,
@@ -259,6 +385,7 @@ pub(crate) struct PluginsHost {
     waker: TerminalWaker,
     one_shot_gate: OneShotGate,
     state_anchor: PathBuf,
+    respawns: Arc<RespawnTimers<LoadedPlugin>>,
 }
 
 /// Start the plugin host. A SETUP thread does discovery (fs I/O) and spawns
@@ -276,6 +403,7 @@ pub(crate) fn spawn_plugins_host(
     let sessions: Sessions = Arc::new(Mutex::new(BTreeMap::new()));
     let disabled: Disabled = Arc::new(Mutex::new(Default::default()));
     let one_shot_gate = OneShotGate::default();
+    let respawns = Arc::new(RespawnTimers::default());
     let state_anchor = thegn_core::util::xdg_state_home().join("thegn");
     let host = PluginsHost {
         stop: stop.clone(),
@@ -286,6 +414,7 @@ pub(crate) fn spawn_plugins_host(
         waker: waker.clone(),
         one_shot_gate: one_shot_gate.clone(),
         state_anchor: state_anchor.clone(),
+        respawns,
     };
     let spawn = std::thread::Builder::new()
         .name("thegn-plugins".into())
@@ -312,59 +441,54 @@ pub(crate) fn spawn_plugins_host(
 }
 
 impl PluginsHost {
-    /// Schedule a resident plugin respawn after `delay` on its own thread
-    /// (never on the loop). The outcome lands as [`PluginMsg::Respawned`].
+    /// Schedule a resident plugin respawn after `delay` on the shared timer
+    /// worker (never on the loop). The outcome lands as [`PluginMsg::Respawned`].
     pub(crate) fn respawn(&self, plugin: LoadedPlugin, delay: Duration) {
         let id = plugin.spec.manifest.id.as_str().to_string();
+        if lock(&self.disabled).contains(&id) || self.stop.is_stopped() {
+            tracing::debug!(target: "thegn::plugin", plugin = %id, "ignoring respawn for disabled or stopped plugin");
+            return;
+        }
+        let mut state = lock(&self.respawns.state);
+        if state.closed || self.stop.is_stopped() || lock(&self.disabled).contains(&id) {
+            tracing::debug!(target: "thegn::plugin", plugin = %id, "ignoring respawn for disabled or stopped plugin");
+            return;
+        }
+        state
+            .queue
+            .schedule(id.clone(), Instant::now() + delay, plugin);
+        self.respawns.cv.notify_all();
+        if state.worker {
+            return;
+        }
+        state.worker = true;
+        drop(state);
+
+        let timers = self.respawns.clone();
         let stop = self.stop.clone();
-        let sessions = self.sessions.clone();
-        let supervisor = self.supervisor.clone();
-        let tx = self.tx.clone();
-        let waker = self.waker.clone();
-        let state_anchor = self.state_anchor.clone();
-        let spawn = std::thread::Builder::new()
-            .name("thegn-plugin-respawn".into())
-            .spawn(move || {
-                // Utility: restores visibly-missing plugin content.
-                crate::platform::qos::set_self(crate::platform::qos::Qos::Utility);
-                if stop.wait_timeout(delay) {
-                    return;
+        let disabled = self.disabled.clone();
+        let ctx = RespawnCtx {
+            stop: self.stop.clone(),
+            sessions: self.sessions.clone(),
+            supervisor: self.supervisor.clone(),
+            tx: self.tx.clone(),
+            waker: self.waker.clone(),
+            state_anchor: self.state_anchor.clone(),
+        };
+        if let Err(error) = thegn_core::thread_name::try_spawn_named("thegn-plug-resp", move || {
+            crate::platform::qos::set_self(crate::platform::qos::Qos::Utility);
+            run_respawn_worker(&timers, &stop, move |id, plugin| {
+                let disabled = lock(&disabled);
+                if !disabled.contains(&id) {
+                    respawn_now(plugin, &ctx);
                 }
-                let writer = match thegn_svc::plugin::resolve_launch_env(&plugin, &state_anchor) {
-                    Ok(env) => {
-                        match spawn_session(&supervisor, &plugin, &env, &tx, &waker) {
-                            Ok(session) => {
-                                let w = session.writer();
-                                if let Err(session) =
-                                    admit_unless_stopped(&sessions, &stop.flag, id.clone(), session)
-                                {
-                                    session.kill();
-                                    return;
-                                }
-                                Some(w)
-                            }
-                            Err(e) => {
-                                tracing::warn!(target: "thegn::plugin", plugin = %id, error = %e, "respawn failed");
-                                None
-                            }
-                        }
-                    },
-                    Err(problem) => {
-                        if let Err(error) = tx.send(PluginMsg::Refused(vec![problem])) {
-                            tracing::debug!(target: "thegn::plugin", %error, "refusal message consumer is gone");
-                        }
-                        if let Err(error) = waker.wake() {
-                            tracing::debug!(target: "thegn::plugin", %error, "refusal message waker pulse failed");
-                        }
-                        None
-                    }
-                };
-                // best-effort: the loop may be shutting down.
-                let _ = tx.send(PluginMsg::Respawned { plugin: id, writer });
-                let _ = waker.wake(); // best-effort: waker pulse: an input nudge must never fail the calling path
             });
-        if let Err(e) = spawn {
-            tracing::warn!(target: "thegn::plugin", error = %e, "respawn thread failed to start");
+        }) {
+            tracing::warn!(target: "thegn::plugin", error = %error, "respawn worker failed to start");
+            let mut state = lock(&self.respawns.state);
+            state.queue.cancel(&id);
+            state.worker = false;
+            self.respawns.cv.notify_all();
         }
     }
 
@@ -420,6 +544,7 @@ impl PluginsHost {
 
     pub(crate) fn set_disabled(&self, plugin: &str) {
         lock(&self.disabled).insert(plugin.to_string());
+        self.respawns.cancel(plugin);
         if let Some(session) = lock(&self.sessions).get(plugin) {
             session.kill();
         }
@@ -427,6 +552,7 @@ impl PluginsHost {
 
     /// Best-effort `deactivate` + kill on every resident session. Idempotent.
     pub(crate) fn shutdown(&self) {
+        self.respawns.close();
         if self.stop.stop() {
             return;
         }
@@ -1001,6 +1127,94 @@ mod tests {
     }
 
     #[test]
+    fn respawn_worker_shutdown_cancels_a_pending_respawn_promptly() {
+        let timers = Arc::new(RespawnTimers::<u32>::default());
+        lock(&timers.state).queue.schedule(
+            "late".into(),
+            Instant::now() + Duration::from_secs(60),
+            1,
+        );
+        let stop = Arc::new(StopSignal::default());
+        let (fired_tx, fired_rx) = std::sync::mpsc::channel();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let worker_timers = timers.clone();
+        let worker_stop = stop.clone();
+        let worker = std::thread::spawn(move || {
+            run_respawn_worker(&worker_timers, &worker_stop, move |id, payload| {
+                fired_tx.send((id, payload)).unwrap();
+            });
+            done_tx.send(()).unwrap();
+        });
+
+        timers.close();
+        stop.stop();
+        done_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        worker.join().unwrap();
+        assert!(fired_rx.try_recv().is_err());
+        assert!(lock(&timers.state).queue.is_empty());
+    }
+
+    #[test]
+    fn respawn_worker_cancelled_entry_never_fires() {
+        let timers = Arc::new(RespawnTimers::<u32>::default());
+        {
+            let mut state = lock(&timers.state);
+            state
+                .queue
+                .schedule("a".into(), Instant::now() + Duration::from_millis(200), 1);
+            assert!(state.queue.cancel("a"));
+            state.queue.schedule("b".into(), Instant::now(), 2);
+        }
+        let stop = Arc::new(StopSignal::default());
+        let (fired_tx, fired_rx) = std::sync::mpsc::channel();
+        let worker_timers = timers.clone();
+        let worker_stop = stop.clone();
+        let worker = std::thread::spawn(move || {
+            run_respawn_worker(&worker_timers, &worker_stop, move |id, payload| {
+                fired_tx.send((id, payload)).unwrap();
+            });
+        });
+
+        assert_eq!(
+            fired_rx.recv_timeout(Duration::from_secs(5)).unwrap(),
+            ("b".into(), 2)
+        );
+        assert!(fired_rx.recv_timeout(Duration::from_millis(500)).is_err());
+        timers.close();
+        stop.stop();
+        worker.join().unwrap();
+    }
+
+    #[test]
+    fn respawn_worker_fires_a_due_entry_exactly_once() {
+        let timers = Arc::new(RespawnTimers::<u32>::default());
+        {
+            let mut state = lock(&timers.state);
+            let now = Instant::now();
+            state.queue.schedule("a".into(), now, 1);
+            assert!(state.queue.schedule("a".into(), now, 2));
+        }
+        let stop = Arc::new(StopSignal::default());
+        let (fired_tx, fired_rx) = std::sync::mpsc::channel();
+        let worker_timers = timers.clone();
+        let worker_stop = stop.clone();
+        let worker = std::thread::spawn(move || {
+            run_respawn_worker(&worker_timers, &worker_stop, move |id, payload| {
+                fired_tx.send((id, payload)).unwrap();
+            });
+        });
+
+        assert_eq!(
+            fired_rx.recv_timeout(Duration::from_secs(5)).unwrap(),
+            ("a".into(), 2)
+        );
+        assert!(fired_rx.recv_timeout(Duration::from_millis(500)).is_err());
+        timers.close();
+        stop.stop();
+        worker.join().unwrap();
+    }
+
+    #[test]
     fn stopped_host_rejects_session_admission() {
         let sessions = Mutex::new(BTreeMap::new());
         let stop = AtomicBool::new(true);
@@ -1222,6 +1436,7 @@ mod tests {
             waker,
             one_shot_gate: OneShotGate::default(),
             state_anchor: tmp.path().join("state"),
+            respawns: Arc::new(RespawnTimers::default()),
         };
         let mut spec = example_spec();
         spec.manifest.id = PluginId::new("single-flight");
@@ -1418,6 +1633,52 @@ mod tests {
 
         assert!(probe.wait_for_release("hello").is_ok());
         assert!(lock(&sessions).is_empty());
+        wait_for_pidfile_and_exit(&pidfile);
+    }
+
+    #[test]
+    fn respawn_publish_failure_kills_the_respawned_session() {
+        if !crate::platform::sound_process::test_support::UNIX {
+            return;
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        let pidfile = tmp.path().join("plugin.pid");
+        let spec = resident_pidfile_spec(&pidfile);
+        let plugin = admitted_plugins(
+            &thegn_core::config::Config {
+                plugins: vec![spec],
+                ..Default::default()
+            },
+            tmp.path(),
+        )
+        .unwrap()
+        .remove(0);
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .unwrap();
+        let supervisor = ResidentSupervisor::new(runtime.handle().clone());
+        let probe = supervisor.clone();
+        let sessions: Sessions = Arc::new(Mutex::new(BTreeMap::new()));
+        let stop = Arc::new(StopSignal::default());
+        let (waker, _master, _terminal) =
+            crate::platform::sound_process::test_support::test_waker();
+        let (tx, rx) = plugin_channel();
+        drop(rx);
+        let ctx = RespawnCtx {
+            stop,
+            sessions: sessions.clone(),
+            supervisor,
+            tx,
+            waker,
+            state_anchor: tmp.path().join("state"),
+        };
+
+        respawn_now(plugin, &ctx);
+
+        assert!(lock(&sessions).is_empty());
+        assert!(probe.wait_for_release("hello").is_ok());
         wait_for_pidfile_and_exit(&pidfile);
     }
 
