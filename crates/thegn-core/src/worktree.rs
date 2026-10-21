@@ -20,6 +20,13 @@ thread_local! {
 
 #[cfg(test)]
 thread_local! {
+    static WORKTREE_NEXT_DESTRUCTIVE_TIMEOUT: std::cell::Cell<bool> = const {
+        std::cell::Cell::new(false)
+    };
+}
+
+#[cfg(test)]
+thread_local! {
     static WORKTREE_MUTATION_LOCK_WAIT_OVERRIDE: std::cell::Cell<Option<Duration>> = const {
         std::cell::Cell::new(None)
     };
@@ -42,11 +49,7 @@ fn worktree_git_deadline() -> Duration {
 }
 
 fn destructive_policy() -> crate::git_run::GitPolicy {
-    let deadline = worktree_git_deadline();
-    crate::git_run::GitPolicy {
-        deadline,
-        ..crate::git_run::GitPolicy::read(deadline)
-    }
+    crate::git_run::GitPolicy::read(worktree_git_deadline())
 }
 
 fn acquire_mutation_lock(root: &Path) -> std::io::Result<util::GitLock> {
@@ -842,6 +845,13 @@ impl std::fmt::Display for DestructiveError {
 /// Run a destructive git command, keeping stderr so a failure carries its
 /// reason, and retry within a bound only when it lost a lock race.
 fn git_destructive(root: &Path, args: &[&str]) -> Result<(), DestructiveError> {
+    #[cfg(test)]
+    if WORKTREE_NEXT_DESTRUCTIVE_TIMEOUT.replace(false) {
+        return Err(DestructiveError::Failed(
+            "Git command timed out".to_string(),
+        ));
+    }
+
     let mut delay = std::time::Duration::from_millis(40);
     let mut attempt = 1;
     loop {
@@ -1206,12 +1216,14 @@ mod tests {
             ]
         ));
 
-        WORKTREE_GIT_DEADLINE_OVERRIDE.set(Some(Duration::ZERO));
+        // Inject a one-shot timeout for the initial remove. The fallback force
+        // remove would succeed, so this deterministically checks that a
+        // supervision failure is not retried with --force.
+        WORKTREE_NEXT_DESTRUCTIVE_TIMEOUT.set(true);
         let result = remove_detailed(&repo, &path, "deadline", true);
-        WORKTREE_GIT_DEADLINE_OVERRIDE.set(None);
 
         let Err(error) = result else {
-            panic!("zero-deadline remove unexpectedly succeeded");
+            panic!("timed-out remove unexpectedly succeeded");
         };
         assert!(error.contains("timed out"), "{error}");
         assert!(path.exists(), "the worktree must remain");
@@ -1526,7 +1538,10 @@ mod tests {
         let repo = temp_repo("no-retry");
         let started = std::time::Instant::now();
         let err = git_destructive(&repo, &["branch", "-D", "nope"]).unwrap_err();
-        assert!(err.to_string().contains("nope"), "git's own reason is kept: {err}");
+        assert!(
+            err.to_string().contains("nope"),
+            "git's own reason is kept: {err}"
+        );
         assert!(started.elapsed() < std::time::Duration::from_millis(300));
         let _ = std::fs::remove_dir_all(&repo);
     }
