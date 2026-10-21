@@ -377,21 +377,42 @@ fn pin_outer_launcher(
     host_path: Option<&OsStr>,
 ) -> Result<PinnedLaunch, LauncherError> {
     let mut pinned_argv = argv.to_vec();
+    let mut start = 0;
+    let mut wrappers = Vec::new();
+    if argv.get(start).map(String::as_str) == Some("ionice")
+        && argv.get(start + 1).map(String::as_str) == Some("-c3")
+    {
+        wrappers.push((start, "ionice"));
+        start += 2;
+    }
+    if argv.get(start).map(String::as_str) == Some("nice")
+        && argv.get(start + 1).map(String::as_str) == Some("-n")
+        && argv
+            .get(start + 2)
+            .and_then(|priority| priority.parse::<i32>().ok())
+            .is_some()
+    {
+        wrappers.push((start, "nice"));
+        start += 3;
+    }
     let mut bwrap_index = None;
-    let outer_name = match argv.first().map(String::as_str) {
+    let outer_name = match argv.get(start).map(String::as_str) {
         Some("bwrap") => Some("bwrap"),
         Some("systemd-run") => Some("systemd-run"),
         _ => None,
     };
 
     if let Some(name) = outer_name {
-        pinned_argv[0] = host_launcher_path(name, host_path)?;
+        for (index, wrapper) in wrappers {
+            pinned_argv[index] = host_launcher_path(wrapper, host_path)?;
+        }
+        pinned_argv[start] = host_launcher_path(name, host_path)?;
         if name == "bwrap" {
-            bwrap_index = Some(0);
-        } else if let Some(index) = argv
+            bwrap_index = Some(start);
+        } else if let Some(index) = argv[start..]
             .windows(2)
             .position(|pair| pair[0] == "--" && pair[1] == "bwrap")
-            .map(|index| index + 1)
+            .map(|index| start + index + 1)
         {
             pinned_argv[index] = host_launcher_path("bwrap", host_path)?;
             bwrap_index = Some(index);
@@ -634,7 +655,11 @@ mod tests {
                 std::fs::write(host.join("bwrap"), b"").expect("create host bwrap");
             }
             std::fs::write(host.join("systemd-run"), b"").expect("create host systemd-run");
+            std::fs::write(host.join("nice"), b"").expect("create host nice");
+            std::fs::write(host.join("ionice"), b"").expect("create host ionice");
             std::fs::write(agent.join("bwrap"), b"").expect("create agent bwrap");
+            std::fs::write(agent.join("nice"), b"").expect("create agent nice");
+            std::fs::write(agent.join("ionice"), b"").expect("create agent ionice");
             let host_path = std::env::join_paths([&host]).expect("join host PATH");
             Self {
                 _root: root,
@@ -827,6 +852,131 @@ mod tests {
             let (result_argv, result_env) =
                 pin_outer_launcher(&argv, env.clone(), Some(fixture.host_path()))
                     .expect("unmanaged command remains unchanged");
+            assert_eq!(result_argv, argv);
+            assert_eq!(result_env, env);
+        }
+    }
+
+    #[test]
+    fn wrapper_chain_nice_pins_wrapper_and_bwrap() {
+        let fixture = LauncherFixture::new(true);
+        let argv = ["nice", "-n", "10", "bwrap", "--", "sh"]
+            .map(str::to_owned)
+            .to_vec();
+        let env = vec![
+            (
+                "PATH".to_owned(),
+                fixture.agent.to_string_lossy().into_owned(),
+            ),
+            ("LD_PRELOAD".to_owned(), "/x/evil.so".to_owned()),
+        ];
+
+        let (pinned, filtered) =
+            pin_outer_launcher(&argv, env, Some(fixture.host_path())).expect("chain resolves");
+
+        assert_eq!(
+            pinned[0],
+            fixture.host.join("nice").to_string_lossy().into_owned()
+        );
+        assert_eq!(
+            pinned[3],
+            fixture.host.join("bwrap").to_string_lossy().into_owned()
+        );
+        assert_eq!(
+            pinned[4..7].iter().map(String::as_str).collect::<Vec<_>>(),
+            vec!["--setenv", "LD_PRELOAD", "/x/evil.so"]
+        );
+        assert_eq!(
+            pinned[7..].iter().map(String::as_str).collect::<Vec<_>>(),
+            vec!["--", "sh"]
+        );
+        assert!(!filtered.iter().any(|(key, _)| is_loader_var(key)));
+        assert!(filtered.iter().any(|(key, _)| key == "PATH"));
+    }
+
+    #[test]
+    fn wrapper_chain_ionice_nice_systemd_scope_pins_every_hop() {
+        let fixture = LauncherFixture::new(true);
+        let argv = [
+            "ionice",
+            "-c3",
+            "nice",
+            "-n",
+            "10",
+            "systemd-run",
+            "--user",
+            "--scope",
+            "--",
+            "bwrap",
+            "--",
+            "sh",
+        ]
+        .map(str::to_owned)
+        .to_vec();
+        let env = vec![("LD_PRELOAD".to_owned(), "/x/evil.so".to_owned())];
+
+        let (pinned, filtered) =
+            pin_outer_launcher(&argv, env, Some(fixture.host_path())).expect("chain resolves");
+
+        for (index, name) in [(0, "ionice"), (2, "nice"), (5, "systemd-run"), (9, "bwrap")] {
+            assert_eq!(
+                pinned[index],
+                fixture.host.join(name).to_string_lossy().into_owned()
+            );
+        }
+        assert_eq!(
+            pinned[10..13]
+                .iter()
+                .map(String::as_str)
+                .collect::<Vec<_>>(),
+            vec!["--setenv", "LD_PRELOAD", "/x/evil.so"]
+        );
+        assert_eq!(
+            pinned[13..].iter().map(String::as_str).collect::<Vec<_>>(),
+            vec!["--", "sh"]
+        );
+        assert!(filtered.is_empty());
+    }
+
+    #[test]
+    fn wrapper_chain_missing_host_nice_refuses() {
+        let fixture = LauncherFixture::new(true);
+        std::fs::remove_file(fixture.host.join("nice")).expect("remove host nice");
+        let argv = ["nice", "-n", "10", "bwrap", "--", "sh"]
+            .map(str::to_owned)
+            .to_vec();
+        let result = pin_outer_launcher(&argv, Vec::new(), Some(fixture.host_path()));
+
+        assert!(matches!(result, Err(LauncherError::NotOnHostPath("nice"))));
+    }
+
+    #[test]
+    fn wrapper_chain_uncontained_host_shell_is_unchanged() {
+        let fixture = LauncherFixture::new(true);
+        let argv = ["nice", "-n", "10", "sh", "-lc", "true"]
+            .map(str::to_owned)
+            .to_vec();
+        let env = vec![("LD_PRELOAD".to_owned(), "/x/evil.so".to_owned())];
+
+        let (result_argv, result_env) =
+            pin_outer_launcher(&argv, env.clone(), Some(fixture.host_path()))
+                .expect("uncontained command is unchanged");
+
+        assert_eq!(result_argv, argv);
+        assert_eq!(result_env, env);
+    }
+
+    #[test]
+    fn wrapper_chain_unknown_wrapper_args_are_not_skipped() {
+        let fixture = LauncherFixture::new(true);
+        let env = vec![("LD_PRELOAD".to_owned(), "/x/evil.so".to_owned())];
+        for argv in [
+            ["nice", "-n", "x", "bwrap"].map(str::to_owned).to_vec(),
+            ["ionice", "-c2", "bwrap"].map(str::to_owned).to_vec(),
+        ] {
+            let (result_argv, result_env) =
+                pin_outer_launcher(&argv, env.clone(), Some(fixture.host_path()))
+                    .expect("unrecognized prefix remains unmanaged");
             assert_eq!(result_argv, argv);
             assert_eq!(result_env, env);
         }
