@@ -1095,6 +1095,13 @@ mod tests {
             self
         }
 
+        fn with_incomplete_detail(mut self, run_id: &str, sha: &str) -> Self {
+            let mut detail = ci_detail(run_id, sha);
+            detail.incomplete = Some(thegn_svc::ci::CiDetailIncomplete::PageBudget { pages: 50 });
+            self.details.insert(run_id.to_string(), detail);
+            self
+        }
+
         fn with_log_text(mut self, text: String) -> Self {
             self.log_text = text;
             self
@@ -1225,13 +1232,6 @@ mod tests {
             discarded_jobs: 0,
             incomplete: None,
         }
-    }
-
-    fn with_incomplete_detail(mut self, run_id: &str, sha: &str) -> Self {
-        let mut detail = ci_detail(run_id, sha);
-        detail.incomplete = Some(thegn_svc::ci::CiDetailIncomplete::PageBudget { pages: 50 });
-        self.details.insert(run_id.to_string(), detail);
-        self
     }
 
     fn ci_detail_with_job(run_id: &str, sha: &str, job_id: &str) -> thegn_svc::ci::CiRunDetail {

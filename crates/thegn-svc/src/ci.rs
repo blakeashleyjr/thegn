@@ -2784,15 +2784,16 @@ mod tests {
 endpoint=
 for arg in "$@"; do endpoint=$arg; done
 case "$endpoint" in
-  *"/pipelines/123/jobs?"*|*"/pipelines/124/jobs?"*|*"/pipelines/125/jobs?"*|*"/pipelines/126/jobs?"*)
-    case "$endpoint" in *pipelines/123/jobs?*) run=123 ;; *pipelines/124/jobs?*) run=124 ;; *pipelines/125/jobs?*) run=125 ;; *) run=126 ;; esac
+  *"/pipelines/123/jobs?"*|*"/pipelines/124/jobs?"*|*"/pipelines/125/jobs?"*|*"/pipelines/126/jobs?"*|*"/pipelines/127/jobs?"*)
+    case "$endpoint" in *pipelines/123/jobs?*) run=123 ;; *pipelines/124/jobs?*) run=124 ;; *pipelines/125/jobs?*) run=125 ;; *pipelines/126/jobs?*) run=126 ;; *) run=127 ;; esac
     page=${endpoint##*page=}
     if [ "$run" = 126 ]; then printf '{}\n'; exit 0; fi
     if [ "$page" = 1 ] || [ "$run" = 125 ]; then
       printf '['
       i=1
       base=$(( (page - 1) * 100 ))
-      while [ "$i" -le 100 ]; do
+      if [ "$run" = 127 ]; then page_rows=5001; else page_rows=100; fi
+      while [ "$i" -le "$page_rows" ]; do
         [ "$i" -gt 1 ] && printf ','
         id=$((base + i))
         printf '{"id":%s,"name":"job-%s","status":"success"}' "$id" "$id"
@@ -2860,6 +2861,15 @@ esac
             Some(CiDetailIncomplete::PageBudget { pages: 50 })
         );
         assert!(!partial.is_complete());
+        let row_limited = client.run_detail(&loc, "127").unwrap();
+        assert_eq!(
+            row_limited.run.jobs.len() + row_limited.discarded_jobs,
+            5_000
+        );
+        assert_eq!(
+            row_limited.incomplete,
+            Some(CiDetailIncomplete::RowBudget { rows: 5_000 })
+        );
         assert!(
             client
                 .run_detail(&loc, "126")

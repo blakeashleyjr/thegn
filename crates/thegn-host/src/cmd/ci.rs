@@ -715,30 +715,6 @@ mod tests {
     }
 
     #[test]
-    fn rerun_scope_cli_refuses_unsupported_scopes_with_guidance() {
-        let gitlab = ci::CiCaps {
-            rerun: true,
-            rerun_failed_or_canceled: true,
-            ..ci::CiCaps::default()
-        };
-        let refused_all = rerun_scope(&gitlab, false, false);
-        assert!(matches!(refused_all, Err(message) if message.contains("--failed-or-canceled")));
-        assert_eq!(
-            rerun_scope(&gitlab, false, true),
-            Ok(RerunScope::FailedOrCanceled)
-        );
-
-        let github = ci::CiCaps {
-            rerun: true,
-            rerun_all: true,
-            rerun_failed: true,
-            ..ci::CiCaps::default()
-        };
-        assert_eq!(rerun_scope(&github, false, false), Ok(RerunScope::All));
-        assert_eq!(rerun_scope(&github, true, false), Ok(RerunScope::Failed));
-    }
-
-    #[test]
     fn detail_warnings_name_an_incomplete_job_list() {
         let incomplete = thegn_svc::ci::CiRunDetail {
             run: CiRun {
@@ -768,5 +744,29 @@ mod tests {
             incomplete: None,
         };
         assert!(detail_warnings(&clean).is_empty());
+    }
+
+    #[test]
+    fn rerun_scope_cli_refuses_unsupported_scopes_with_guidance() {
+        let gitlab = ci::CiCaps {
+            rerun: true,
+            rerun_failed_or_canceled: true,
+            ..ci::CiCaps::default()
+        };
+        let refused_all = rerun_scope(&gitlab, false, false);
+        assert!(matches!(refused_all, Err(message) if message.contains("--failed-or-canceled")));
+        assert_eq!(
+            rerun_scope(&gitlab, false, true),
+            Ok(RerunScope::FailedOrCanceled)
+        );
+
+        let github = ci::CiCaps {
+            rerun: true,
+            rerun_all: true,
+            rerun_failed: true,
+            ..ci::CiCaps::default()
+        };
+        assert_eq!(rerun_scope(&github, false, false), Ok(RerunScope::All));
+        assert_eq!(rerun_scope(&github, true, false), Ok(RerunScope::Failed));
     }
 }
