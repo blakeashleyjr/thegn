@@ -4343,6 +4343,9 @@ pub struct SandboxConfig {
     /// image to `image` before create instead of pulling. See [`crate::sandbox_build`].
     #[serde(skip)]
     pub build: Option<crate::sandbox_build::SandboxBuild>,
+    /// devcontainer volume name -> owning devcontainer id; set by the overlay, never from TOML.
+    #[serde(skip)]
+    pub volume_owners: std::collections::BTreeMap<String, String>,
     pub env_passthrough: Vec<String>,
     /// Add common language build caches to `worktree_plus_caches` sandboxes.
     pub auto_caches: bool,
@@ -4455,6 +4458,7 @@ impl Default for SandboxConfig {
             volumes: std::collections::HashMap::new(),
             compose: None,
             build: None,
+            volume_owners: std::collections::BTreeMap::new(),
             env_passthrough: [
                 "SSH_AUTH_SOCK",
                 "GH_TOKEN",

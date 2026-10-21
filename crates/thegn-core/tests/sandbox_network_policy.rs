@@ -60,6 +60,7 @@ fn spec_with_network_block(name: &str, block: Vec<String>) -> SandboxSpec {
         oci_runtime: None,
         daemon_persistent: false,
         seal_home: None,
+        volume_owners: Vec::new(),
     }
 }
 

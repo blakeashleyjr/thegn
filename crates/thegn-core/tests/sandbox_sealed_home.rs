@@ -83,6 +83,7 @@ fn spec(backend: Backend, home: &Path, mounts: Vec<Mount>, seal: bool) -> Sandbo
         oci_runtime: None,
         daemon_persistent: false,
         seal_home: seal.then(|| home.to_string_lossy().into_owned()),
+        volume_owners: Vec::new(),
     }
 }
 
