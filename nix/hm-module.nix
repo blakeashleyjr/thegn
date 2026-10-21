@@ -26,35 +26,35 @@ self: {
   remoteSubmodule = lib.types.submodule {
     options = {
       host = lib.mkOption {
-        type = lib.types.str;
-        default = "";
+        type = lib.types.nullOr (lib.types.str);
+        default = null;
         example = "user@devbox";
-        description = "Remote ssh target to run worktrees on. Empty = local.";
+        description = "Remote ssh target to run worktrees on. Empty = local. Unset (null) = the binary's default.";
       };
       port = lib.mkOption {
-        type = lib.types.port;
-        default = 22;
-        description = "ssh port for the remote.";
+        type = lib.types.nullOr (lib.types.port);
+        default = null;
+        description = "ssh port for the remote. Unset (null) = the binary's default.";
       };
       transport = lib.mkOption {
-        type = lib.types.enum ["mosh" "ssh"];
-        default = "mosh";
-        description = "Interactive pane transport (control plane always uses ssh).";
+        type = lib.types.nullOr (lib.types.enum ["mosh" "ssh"]);
+        default = null;
+        description = "Interactive pane transport (control plane always uses ssh). Unset (null) = the binary's default.";
       };
       mode = lib.mkOption {
-        type = lib.types.enum ["remote" "local_exec" "sshfs"];
-        default = "remote";
-        description = "Where the remote worktree lives.";
+        type = lib.types.nullOr (lib.types.enum ["remote" "local_exec" "sshfs"]);
+        default = null;
+        description = "Where the remote worktree lives. Unset (null) = the binary's default.";
       };
       remoteDir = lib.mkOption {
-        type = lib.types.str;
-        default = "~/thegn-worktrees";
-        description = "Where remote worktrees live (mode = remote).";
+        type = lib.types.nullOr (lib.types.str);
+        default = null;
+        description = "Where remote worktrees live (mode = remote). Unset (null) = the binary's default.";
       };
       forwardAgent = lib.mkOption {
-        type = lib.types.bool;
-        default = true;
-        description = "ssh -A so remote git push reuses the host ssh-agent.";
+        type = lib.types.nullOr (lib.types.bool);
+        default = null;
+        description = "ssh -A so remote git push reuses the host ssh-agent. Unset (null) = the binary's default.";
       };
     };
   };
@@ -62,61 +62,57 @@ self: {
   sandboxSubmodule = lib.types.submodule {
     options = {
       enabled = lib.mkOption {
-        type = lib.types.bool;
-        default = true;
-        description = "Run each worktree's interactive process in a container/sandbox.";
+        type = lib.types.nullOr (lib.types.bool);
+        default = null;
+        description = "Run each worktree's interactive process in a container/sandbox. Unset (null) = the binary's default.";
       };
       backend = lib.mkOption {
-        type = lib.types.enum ["auto" "podman" "docker" "bwrap" "systemd" "apple" "wsl" "none"];
-        default = "auto";
-        description = "Sandbox backend; \"auto\" walks backendChain.";
+        type = lib.types.nullOr (lib.types.enum ["auto" "podman" "docker" "bwrap" "systemd" "apple" "wsl" "none"]);
+        default = null;
+        description = "Sandbox backend; \"auto\" walks backendChain. Unset (null) = the binary's default.";
       };
       backendChain = lib.mkOption {
-        type = lib.types.listOf lib.types.str;
-        # Keep in sync with `thegn_core::config_defaults::default_backend_chain`.
-        # This module renders every key into config.toml unconditionally, so a
-        # stale default here doesn't just document the wrong order — it OVERRIDES
-        # the binary's own default for anyone who enables the module.
+        type = lib.types.nullOr (lib.types.listOf lib.types.str);
         # "apple" is macOS's `container` CLI and is probed only on macOS; the
         # win/linux-native entries are likewise inert off their own OS.
-        default = ["podman-rootless" "podman-rootful" "docker" "apple" "bwrap" "jobobject"];
-        description = "Auto-detection order; add \"host\" only together with [sandbox] isolation_floor = \"off\" in config.toml.";
+        default = null;
+        description = "Auto-detection order; add \"host\" only together with [sandbox] isolation_floor = \"off\" in config.toml. Unset (null) = the binary's default.";
       };
       image = lib.mkOption {
-        type = lib.types.str;
-        default = "";
+        type = lib.types.nullOr (lib.types.str);
+        default = null;
         example = "ghcr.io/you/devbox:latest";
-        description = "OCI image. Empty = host-toolchain mode (bwrap/systemd).";
+        description = "OCI image. Empty = host-toolchain mode (bwrap/systemd). Unset (null) = the binary's default.";
       };
       network = lib.mkOption {
-        type = lib.types.enum ["nat" "host" "none"];
-        default = "nat";
-        description = "Sandbox network mode (agents need egress).";
+        type = lib.types.nullOr (lib.types.enum ["nat" "host" "none"]);
+        default = null;
+        description = "Sandbox network mode (agents need egress). Unset (null) = the binary's default.";
       };
       envPassthrough = lib.mkOption {
-        type = lib.types.listOf lib.types.str;
-        default = ["SSH_AUTH_SOCK" "GH_TOKEN" "GITHUB_TOKEN" "ANTHROPIC_API_KEY" "TERM" "COLORTERM"];
-        description = "Host env vars forwarded into the sandbox.";
+        type = lib.types.nullOr (lib.types.listOf lib.types.str);
+        default = null;
+        description = "Host env vars forwarded into the sandbox. Unset (null) = the binary's default.";
       };
       mounts = lib.mkOption {
-        type = lib.types.listOf lib.types.str;
-        default = ["~/.gitconfig:ro"];
-        description = "Extra bind mounts (\"host\", \"host:ro|rw|cache\", \"host:dest\", \"host:dest:ro|rw|cache\").";
+        type = lib.types.nullOr (lib.types.listOf lib.types.str);
+        default = null;
+        description = "Extra bind mounts (\"host\", \"host:ro|rw|cache\", \"host:dest\", \"host:dest:ro|rw|cache\"). Unset (null) = the binary's default.";
       };
       initScript = lib.mkOption {
-        type = lib.types.str;
-        default = "";
-        description = "Shell run inside the sandbox before the agent/shell.";
+        type = lib.types.nullOr (lib.types.str);
+        default = null;
+        description = "Shell run inside the sandbox before the agent/shell. Unset (null) = the binary's default.";
       };
       devenv = lib.mkOption {
-        type = lib.types.bool;
-        default = false;
-        description = "Wrap the inner command in `devenv shell --`.";
+        type = lib.types.nullOr (lib.types.bool);
+        default = null;
+        description = "Wrap the inner command in `devenv shell --`. Unset (null) = the binary's default.";
       };
       onMissing = lib.mkOption {
-        type = lib.types.enum ["warn" "prompt" "fail"];
-        default = "warn";
-        description = "What to do when no backend is available.";
+        type = lib.types.nullOr (lib.types.enum ["warn" "prompt" "fail"]);
+        default = null;
+        description = "What to do when no backend is available. Unset (null) = the binary's default.";
       };
       remote = lib.mkOption {
         type = remoteSubmodule;
@@ -129,34 +125,34 @@ self: {
   logSubmodule = lib.types.submodule {
     options = {
       level = lib.mkOption {
-        type = lib.types.enum ["error" "warn" "info" "debug" "trace"];
-        default = "info";
-        description = "Default log verbosity (THEGN_LOG can refine per-module).";
+        type = lib.types.nullOr (lib.types.enum ["error" "warn" "info" "debug" "trace"]);
+        default = null;
+        description = "Default log verbosity (THEGN_LOG can refine per-module). Unset (null) = the binary's default.";
       };
       file = lib.mkOption {
-        type = lib.types.bool;
-        default = false;
-        description = "Mirror diagnostics to a rotating log file under `dir`.";
+        type = lib.types.nullOr (lib.types.bool);
+        default = null;
+        description = "Mirror diagnostics to a rotating log file under `dir`. Unset (null) = the binary's default.";
       };
       dir = lib.mkOption {
-        type = lib.types.str;
-        default = "";
-        description = "Log directory (empty = $XDG_STATE_HOME/thegn/logs).";
+        type = lib.types.nullOr (lib.types.str);
+        default = null;
+        description = "Log directory (empty = $XDG_STATE_HOME/thegn/logs). Unset (null) = the binary's default.";
       };
       rotationSizeMb = lib.mkOption {
-        type = lib.types.ints.unsigned;
-        default = 5;
-        description = "Rotate the active log once it exceeds this many MiB.";
+        type = lib.types.nullOr (lib.types.ints.unsigned);
+        default = null;
+        description = "Rotate the active log once it exceeds this many MiB. Unset (null) = the binary's default.";
       };
       maxFiles = lib.mkOption {
-        type = lib.types.ints.unsigned;
-        default = 5;
-        description = "How many rotated log files to keep.";
+        type = lib.types.nullOr (lib.types.ints.unsigned);
+        default = null;
+        description = "How many rotated log files to keep. Unset (null) = the binary's default.";
       };
       format = lib.mkOption {
-        type = lib.types.enum ["text" "json"];
-        default = "text";
-        description = "Log file encoding.";
+        type = lib.types.nullOr (lib.types.enum ["text" "json"]);
+        default = null;
+        description = "Log file encoding. Unset (null) = the binary's default.";
       };
     };
   };
@@ -191,17 +187,15 @@ self: {
 
   tomlFormat = pkgs.formats.toml {};
 
-  # Rendered to ~/.config/thegn/config.toml; keys match the Rust serde struct.
-  defaultProjectsDir =
-    if cfg.projectsDir != null
-    then cfg.projectsDir
-    else if cfg.workspacesDir != null
-    then cfg.workspacesDir
-    else "${config.home.homeDirectory}/code";
+  pruneNulls = lib.filterAttrsRecursive (_: v: v != null);
 
-  configFile = tomlFormat.generate "thegn-config.toml" {
+  # Rendered to ~/.config/thegn/config.toml; keys match the Rust serde struct.
+  configFile = tomlFormat.generate "thegn-config.toml" (pruneNulls {
     worktrees_dir = cfg.worktreesDir;
-    projects_dir = defaultProjectsDir;
+    projects_dir =
+      if cfg.projectsDir != null
+      then cfg.projectsDir
+      else cfg.workspacesDir;
     repo_roots = cfg.repoRoots;
     repo_scan_depth = cfg.repoScanDepth;
     base_branch = cfg.baseBranch;
@@ -210,10 +204,19 @@ self: {
     worktree_mode = cfg.worktreeMode;
     name_scheme = cfg.nameScheme;
     auto_remove_worktree = cfg.autoRemoveWorktree;
-    agents = map (a: {inherit (a) name command;}) cfg.agents;
-    tools = map (t: {inherit (t) name command;}) cfg.tools;
+    agents =
+      if cfg.agents == null
+      then null
+      else map (a: {inherit (a) name command;}) cfg.agents;
+    tools =
+      if cfg.tools == null
+      then null
+      else map (t: {inherit (t) name command;}) cfg.tools;
     keybinds = cfg.keybinds;
-    actions = map (a: lib.filterAttrs (_: v: v != null) {inherit (a) name key run menu hint;}) cfg.actions;
+    actions =
+      if cfg.actions == null
+      then null
+      else map (a: lib.filterAttrs (_: v: v != null) {inherit (a) name key run menu hint;}) cfg.actions;
     theme.accent = cfg.themeAccent;
     monitor = {
       system = cfg.monitorSystem;
@@ -238,7 +241,7 @@ self: {
         forward_agent = cfg.sandbox.remote.forwardAgent;
       };
     };
-  };
+  });
 in {
   options.programs.thegn = {
     enable = lib.mkEnableOption "thegn terminal-native worktree IDE";
@@ -254,9 +257,9 @@ in {
     };
 
     worktreesDir = lib.mkOption {
-      type = lib.types.str;
-      default = "${config.home.homeDirectory}/.thegn/worktrees";
-      description = "Base directory for git worktrees (grouped per repo).";
+      type = lib.types.nullOr (lib.types.str);
+      default = null;
+      description = "Base directory for git worktrees (grouped per repo). Unset (null) = the binary's default.";
     };
 
     projectsDir = lib.mkOption {
@@ -264,105 +267,95 @@ in {
       default = null;
       description =
         "Where project repositories are cloned."
-        + " Canonical replacement for workspacesDir.";
+        + " Canonical replacement for workspacesDir. Unset (null) = the binary's default.";
     };
 
     workspacesDir = lib.mkOption {
       type = lib.types.nullOr lib.types.str;
       default = null;
-      description = "Deprecated compatibility alias for projectsDir; removed after three stable releases.";
+      description = "Deprecated compatibility alias for projectsDir; removed after three stable releases. Unset (null) = the binary's default.";
     };
 
     repoRoots = lib.mkOption {
-      type = lib.types.listOf lib.types.str;
-      default = [defaultProjectsDir];
-      defaultText = lib.literalExpression "[ config.programs.thegn.projectsDir ]";
+      type = lib.types.nullOr (lib.types.listOf lib.types.str);
+      default = null;
       example = lib.literalExpression ''[ "/home/you/code" "/home/you/src" ]'';
-      description = "Directories scanned by the project repo picker.";
+      description = "Directories scanned by the project repo picker. Unset (null) = the binary's default.";
     };
 
     repoScanDepth = lib.mkOption {
-      type = lib.types.ints.unsigned;
-      default = 5;
-      description = "Max directory depth when scanning repoRoots for git repos.";
+      type = lib.types.nullOr (lib.types.ints.unsigned);
+      default = null;
+      description = "Max directory depth when scanning repoRoots for git repos. Unset (null) = the binary's default.";
     };
 
     baseBranch = lib.mkOption {
-      type = lib.types.str;
-      default = "auto";
-      description = "Base ref for new worktrees. \"auto\" = current branch, else the repo default.";
+      type = lib.types.nullOr (lib.types.str);
+      default = null;
+      description = "Base ref for new worktrees. \"auto\" = current branch, else the repo default. Unset (null) = the binary's default.";
     };
 
     branchPrefix = lib.mkOption {
-      type = lib.types.str;
-      default = "tg/";
-      description = "Prefix for generated branch names.";
+      type = lib.types.nullOr (lib.types.str);
+      default = null;
+      description = "Prefix for generated branch names. Unset (null) = the binary's default.";
     };
 
     picker = lib.mkOption {
-      type = lib.types.enum ["auto" "gum" "fzf" "select"];
-      default = "auto";
-      description = "TUI used for the agent/tool picker.";
+      type = lib.types.nullOr (lib.types.enum ["auto" "gum" "fzf" "select"]);
+      default = null;
+      description = "TUI used for the agent/tool picker. Unset (null) = the binary's default.";
     };
 
     worktreeMode = lib.mkOption {
-      type = lib.types.enum ["global" "in_repo"];
-      default = "global";
-      description = "Where worktrees live: a global dir, or <repo>/.worktrees.";
+      type = lib.types.nullOr (lib.types.enum ["global" "in_repo"]);
+      default = null;
+      description = "Where worktrees live: a global dir, or <repo>/.worktrees. Unset (null) = the binary's default.";
     };
 
     nameScheme = lib.mkOption {
-      type = lib.types.enum ["words" "numbered"];
-      default = "words";
-      description = "Auto branch naming: readable words (tg/brisk-otter) or numbered (tg/pane-1).";
+      type = lib.types.nullOr (lib.types.enum ["words" "numbered"]);
+      default = null;
+      description = "Auto branch naming: readable words (tg/brisk-otter) or numbered (tg/pane-1). Unset (null) = the binary's default.";
     };
 
     autoRemoveWorktree = lib.mkOption {
-      type = lib.types.bool;
-      default = false;
-      description = "Remove the worktree automatically when its pane is closed.";
+      type = lib.types.nullOr (lib.types.bool);
+      default = null;
+      description = "Remove the worktree automatically when its pane is closed. Unset (null) = the binary's default.";
     };
 
     themeAccent = lib.mkOption {
-      type = lib.types.str;
-      default = "#76eede";
+      type = lib.types.nullOr (lib.types.str);
+      default = null;
       example = "#f083ba";
-      description = "Focus accent color (#rrggbb) for every thegn surface.";
+      description = "Focus accent color (#rrggbb) for every thegn surface. Unset (null) = the binary's default.";
     };
 
     monitorSystem = lib.mkOption {
-      type = lib.types.str;
-      default = "btm";
+      type = lib.types.nullOr (lib.types.str);
+      default = null;
       example = "htop";
       description = ''
         CPU/RAM resource monitor opened from the top-bar stats widget
         (highlight CPU or MEM with Super+Alt+Up, then Enter). Default is `btm`
-        (ClementTsang/bottom); run in an embedded tiled pane.
+        (ClementTsang/bottom); run in an embedded tiled pane. Unset (null) = the binary's default.
       '';
     };
 
     monitorGpu = lib.mkOption {
-      type = lib.types.str;
-      default = "nvtop";
+      type = lib.types.nullOr (lib.types.str);
+      default = null;
       example = "nvtop";
       description = ''
         GPU resource monitor opened from the top-bar stats widget (highlight
-        GPU with Super+Alt+Up, then Enter). Run in an embedded tiled pane.
+        GPU with Super+Alt+Up, then Enter). Run in an embedded tiled pane. Unset (null) = the binary's default.
       '';
     };
 
     agents = lib.mkOption {
-      type = lib.types.listOf agentSubmodule;
-      default = [
-        {
-          name = "claude";
-          command = "claude";
-        }
-        {
-          name = "shell";
-          command = "__shell__";
-        }
-      ];
+      type = lib.types.nullOr (lib.types.listOf agentSubmodule);
+      default = null;
       example = lib.literalExpression ''
         [
           { name = "claude"; command = "claude"; }
@@ -370,42 +363,25 @@ in {
           { name = "shell";  command = "__shell__"; }
         ]
       '';
-      description = "Coding agents offered in the new-worktree picker.";
+      description = "Coding agents offered in the new-worktree picker. Unset (null) = the binary's default.";
     };
 
     tools = lib.mkOption {
-      type = lib.types.listOf agentSubmodule;
-      default = [
-        {
-          name = "lazygit";
-          command = "lazygit";
-        }
-        {
-          name = "yazi";
-          command = "yazi";
-        }
-        {
-          name = "editor";
-          command = "\${EDITOR:-vi} .";
-        }
-        {
-          name = "diff";
-          command = "git diff";
-        }
-      ];
-      description = "Per-worktree tools (also bound to Alt-g/y/e//).";
+      type = lib.types.nullOr (lib.types.listOf agentSubmodule);
+      default = null;
+      description = "Per-worktree tools (also bound to Alt-g/y/e//). Unset (null) = the binary's default.";
     };
 
     prTtlSecs = lib.mkOption {
-      type = lib.types.ints.between 0 315360000;
-      default = 30;
-      description = "PR-status cache TTL (seconds) before a live `gh` re-fetch.";
+      type = lib.types.nullOr (lib.types.ints.between 0 315360000);
+      default = null;
+      description = "PR-status cache TTL (seconds) before a live `gh` re-fetch. Unset (null) = the binary's default.";
     };
 
     watchPrIntervalSecs = lib.mkOption {
-      type = lib.types.ints.between 0 2678400;
-      default = 20;
-      description = "PR refresh interval (seconds) for the per-session watch daemon.";
+      type = lib.types.nullOr (lib.types.ints.between 0 2678400);
+      default = null;
+      description = "PR refresh interval (seconds) for the per-session watch daemon. Unset (null) = the binary's default.";
     };
 
     log = lib.mkOption {
@@ -415,17 +391,17 @@ in {
     };
 
     keybinds = lib.mkOption {
-      type = lib.types.attrsOf lib.types.str;
-      default = {};
+      type = lib.types.nullOr (lib.types.attrsOf lib.types.str);
+      default = null;
       example = lib.literalExpression ''{ new-worktree = "Ctrl w"; }'';
-      description = "Rebind built-in actions by id (see `thegn keys list`).";
+      description = "Rebind built-in actions by id (see `thegn keys list`). Unset (null) = the binary's default.";
     };
 
     actions = lib.mkOption {
-      type = lib.types.listOf actionSubmodule;
-      default = [];
+      type = lib.types.nullOr (lib.types.listOf actionSubmodule);
+      default = null;
       example = lib.literalExpression ''[ { name = "deploy"; key = "Alt D"; run = "just deploy"; menu = true; } ]'';
-      description = "User-defined keybind actions (chord → shell command).";
+      description = "User-defined keybind actions (chord → shell command). Unset (null) = the binary's default.";
     };
 
     sandbox = lib.mkOption {
