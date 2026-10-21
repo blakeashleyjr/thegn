@@ -318,8 +318,8 @@ END:VCALENDAR";
     let override_event = &events[1];
     assert_eq!(override_event.status, EventStatus::Cancelled);
     assert_eq!(
-        Some(override_event.start.as_ref()),
-        override_event.recurrence_id.as_ref()
+        override_event.recurrence_id.as_ref(),
+        Some(&override_event.start)
     );
     assert!(
         !report

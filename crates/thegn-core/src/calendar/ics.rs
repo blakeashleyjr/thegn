@@ -857,7 +857,7 @@ pub fn parse_ics_window_reported(
     }
     let mut newest = BTreeMap::new();
     for (event, sequence) in out[first..].iter().zip(&sequences) {
-        let key = (event.uid.clone(), event.recurrence_key().to_string());
+        let key = (event.uid.clone(), event.recurrence_key());
         newest
             .entry(key)
             .and_modify(|current: &mut u32| *current = (*current).max(*sequence))
@@ -867,7 +867,7 @@ pub fn parse_ics_window_reported(
         out.split_off(first).into_iter().zip(sequences).collect();
     retained.retain(|(event, sequence)| {
         newest
-            .get(&(event.uid.clone(), event.recurrence_key().to_string()))
+            .get(&(event.uid.clone(), event.recurrence_key()))
             .is_some_and(|maximum| *sequence >= *maximum)
     });
     let mut newest_tombstones = BTreeMap::new();
@@ -877,16 +877,24 @@ pub fn parse_ics_window_reported(
             .and_modify(|current: &mut u32| *current = (*current).max(sequence))
             .or_insert(sequence);
     }
-    for (uid, sequence) in newest_tombstones {
-        if retained
-            .iter()
-            .any(|(event, event_sequence)| event.uid == uid && *event_sequence > sequence)
-        {
-            continue;
-        }
-        retained.retain(|(event, _)| event.uid != uid);
-        report.cancelled.push(uid);
+    let mut newest_surviving_by_uid = BTreeMap::new();
+    for (event, sequence) in &retained {
+        newest_surviving_by_uid
+            .entry(event.uid.clone())
+            .and_modify(|current: &mut u32| *current = (*current).max(*sequence))
+            .or_insert(*sequence);
     }
+    let cancelled: BTreeSet<_> = newest_tombstones
+        .into_iter()
+        .filter_map(|(uid, sequence)| {
+            newest_surviving_by_uid
+                .get(&uid)
+                .is_none_or(|newest| *newest <= sequence)
+                .then_some(uid)
+        })
+        .collect();
+    report.cancelled.extend(cancelled.iter().cloned());
+    retained.retain(|(event, _)| !cancelled.contains(&event.uid));
     out.extend(retained.into_iter().map(|(event, _)| event));
     // A document that ends mid-event keeps nothing of it, as before.
     meter.abandon_event();
