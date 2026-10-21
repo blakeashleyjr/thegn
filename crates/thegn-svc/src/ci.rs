@@ -31,8 +31,8 @@ use std::time::Duration;
 /// the user's cache policy.  This protects the blocking provider lane from a
 /// job that emits an unbounded log (the configured, usually smaller, bounds
 /// are applied again by the cache-facing read paths).
-const PROVIDER_LOG_MAX_LINES: usize = 2_000;
-const PROVIDER_LOG_MAX_BYTES: usize = 1024 * 1024;
+pub(crate) const PROVIDER_LOG_MAX_LINES: usize = 2_000;
+pub(crate) const PROVIDER_LOG_MAX_BYTES: usize = 1024 * 1024;
 const GITLAB_JOBS_PAGE_SIZE: usize = 100;
 const GITLAB_JOBS_MAX_PAGES: usize = 50;
 const GITLAB_JOBS_MAX_ROWS: usize = GITLAB_JOBS_PAGE_SIZE * GITLAB_JOBS_MAX_PAGES;
@@ -45,7 +45,7 @@ const PROVIDER_JSON_MAX_DEPTH: usize = 32;
 const PROVIDER_JSON_MAX_NODES: usize = 262_144;
 const PROVIDER_JSON_MAX_CONTAINER_ITEMS: usize = 10_000;
 const PROVIDER_JSON_MAX_STRING_BYTES: usize = 1024 * 1024;
-const MAX_PROVIDER_FIELD_BYTES: usize = 4096;
+pub(crate) const MAX_PROVIDER_FIELD_BYTES: usize = 4096;
 const FALLBACK_READER_GRACE: Duration = Duration::from_millis(500);
 
 /// A CI/CD backend for one provider. Read methods first; mutations are
@@ -172,7 +172,11 @@ fn client_for_system_with_config_and_cancel(
             cancel,
         })),
         CiSystem::GitlabCi => Some(Box::new(GitlabCi::from_config(cfg, cancel))),
-        CiSystem::Drone | CiSystem::Woodpecker | CiSystem::Jenkins | CiSystem::Argo => None,
+        CiSystem::Drone
+        | CiSystem::Woodpecker
+        | CiSystem::Jenkins
+        | CiSystem::Argo
+        | CiSystem::Plugin => None,
     }
 }
 
