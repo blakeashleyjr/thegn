@@ -213,7 +213,9 @@ pub enum PageMode {
     Unchanged,
     /// The provider asked for the account's cache to be discarded and replaced
     /// by this page, even when the page is empty (a snapshot that is believed
-    /// unconditionally).
+    /// unconditionally). Built-in backends also produce Reset for a complete
+    /// document whose only content is effective series cancellations (see
+    /// `ics::snapshot_mode`).
     Reset,
 }
 

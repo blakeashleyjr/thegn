@@ -237,6 +237,7 @@ fn page_from_multistatus(
     let mut event_hrefs = Vec::new();
     let mut deleted_hrefs = Vec::new();
     let mut diagnostics = PageDiagnostics::default();
+    let mut saw_series_tombstone = false;
     let token = xml::walk_multistatus(text, |r| {
         // `calendar_ids` restricts to named collections; a resource outside
         // them is skipped before it is admitted or parsed. Tombstones are
@@ -298,8 +299,11 @@ fn page_from_multistatus(
             ));
         }
         diagnostics.absorb(PageDiagnostics::from_report(&report));
-        if mode == PageMode::Delta && events.len() == before && !report.cancelled_uids().is_empty()
-        {
+        let has_tombstone = events.len() == before && !report.cancelled_uids().is_empty();
+        if mode == PageMode::Snapshot && has_tombstone {
+            saw_series_tombstone = true;
+        }
+        if mode == PageMode::Delta && has_tombstone {
             let id = uid_from_href(&href);
             meter.admit_deletion(id.len())?;
             deleted.push(id);
@@ -308,6 +312,11 @@ fn page_from_multistatus(
         Ok(())
     })?;
     let token = scope_token(calendar_ids, zone, &token);
+    let mode = if mode == PageMode::Snapshot {
+        super::ics::snapshot_mode(events.is_empty(), saw_series_tombstone)
+    } else {
+        mode
+    };
     EventPage::from_meter_with_hrefs(
         meter,
         mode,
@@ -859,9 +868,41 @@ END:VCALENDAR</c:calendar-data></d:prop><d:status>HTTP/1.1 200 OK</d:status></d:
         );
         let page =
             page_from_multistatus(&xml, "UTC", &[], PageMode::Snapshot, test_meter()).unwrap();
+        assert_eq!(page.mode, PageMode::Reset);
         assert!(page.events.is_empty());
         assert!(page.deleted_hrefs.is_empty());
         assert!(page.deleted.is_empty());
+    }
+
+    #[test]
+    fn cancel_only_empty_calendar_without_tombstones_stays_a_snapshot() {
+        let xml = format!(
+            "<d:multistatus xmlns:d=\"DAV:\" xmlns:c=\"urn:ietf:params:xml:ns:caldav\">{}</d:multistatus>",
+            resource(
+                "/cal/empty.ics",
+                "BEGIN:VCALENDAR\nVERSION:2.0\nEND:VCALENDAR\n"
+            )
+        );
+        let page =
+            page_from_multistatus(&xml, "UTC", &[], PageMode::Snapshot, test_meter()).unwrap();
+
+        assert_eq!(page.mode, PageMode::Snapshot);
+        assert!(page.events.is_empty());
+    }
+
+    #[test]
+    fn cancel_only_resource_with_live_event_stays_a_snapshot() {
+        let data = "BEGIN:VCALENDAR\nVERSION:2.0\nBEGIN:VEVENT\nUID:gone\nSTATUS:CANCELLED\nEND:VEVENT\nBEGIN:VEVENT\nUID:live\nDTSTART:20260814T090000Z\nDTEND:20260814T100000Z\nEND:VEVENT\nEND:VCALENDAR";
+        let xml = format!(
+            "<d:multistatus xmlns:d=\"DAV:\" xmlns:c=\"urn:ietf:params:xml:ns:caldav\">{}</d:multistatus>",
+            resource("/cal/mixed.ics", data)
+        );
+        let page =
+            page_from_multistatus(&xml, "UTC", &[], PageMode::Snapshot, test_meter()).unwrap();
+
+        assert_eq!(page.mode, PageMode::Snapshot);
+        assert_eq!(page.events.len(), 1);
+        assert_eq!(page.events[0].uid, "live");
     }
 
     #[test]
