@@ -161,6 +161,7 @@ mod monitor_sampler;
 mod mousefilter;
 mod naming;
 mod nav;
+mod nix_signing;
 mod nixcache;
 mod notification_delivery;
 mod notification_sound;
