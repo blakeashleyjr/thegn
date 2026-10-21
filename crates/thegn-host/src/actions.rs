@@ -422,6 +422,33 @@ pub(crate) fn open_status(result: Result<(), OpenError>, ok: impl FnOnce() -> St
 /// ops it can't perform are declined with a warning (mirrors `cmd::ci`, keeping
 /// the provider the single authority on capabilities). Non-mutation actions are
 /// ignored here — they're handled inline on the loop.
+pub(crate) fn ci_rerun_scope(
+    caps: &thegn_core::ci::CiCaps,
+    failed: bool,
+) -> Result<(thegn_core::ci::RerunScope, Option<&'static str>), &'static str> {
+    if failed {
+        if caps.supports(thegn_core::ci::RerunScope::Failed) {
+            return Ok((thegn_core::ci::RerunScope::Failed, None));
+        }
+        if caps.supports(thegn_core::ci::RerunScope::FailedOrCanceled) {
+            return Ok((
+                thegn_core::ci::RerunScope::FailedOrCanceled,
+                Some("ci: this provider retries failed and canceled jobs together"),
+            ));
+        }
+        return Err("ci: this provider can't re-run failed jobs");
+    }
+    if caps.supports(thegn_core::ci::RerunScope::All) {
+        return Ok((thegn_core::ci::RerunScope::All, None));
+    }
+    if caps.supports(thegn_core::ci::RerunScope::FailedOrCanceled) {
+        return Err(
+            "ci: this provider can't re-run every job — r retries its failed and canceled jobs",
+        );
+    }
+    Err("ci: this provider can't re-run runs")
+}
+
 pub(crate) fn spawn_ci_action(
     session: &Session,
     cfg: &thegn_core::config::CiConfig,
@@ -442,23 +469,16 @@ pub(crate) fn spawn_ci_action(
         let caps = client.caps();
         let res = match action {
             DetailAction::CiRerun { run_id, failed } => {
-                if !caps.rerun {
-                    thegn_core::msg::warn("ci: this provider can't re-run runs");
-                    return;
-                }
-                if failed && !caps.rerun_failed {
-                    // Don't silently retry everything when the user asked for
-                    // failed-only (GitLab's `retry` has no scope).
-                    thegn_core::msg::warn(
-                        "ci: this provider can't re-run only failed jobs — use r to retry all",
-                    );
-                    return;
-                }
-                let scope = if failed {
-                    thegn_core::ci::RerunScope::Failed
-                } else {
-                    thegn_core::ci::RerunScope::All
+                let (scope, note) = match ci_rerun_scope(&caps, failed) {
+                    Ok(choice) => choice,
+                    Err(message) => {
+                        thegn_core::msg::warn(message);
+                        return;
+                    }
                 };
+                if let Some(note) = note {
+                    thegn_core::msg::info(note);
+                }
                 client.rerun(&loc, &run_id, scope)
             }
             DetailAction::CiCancel { run_id } => {
@@ -2199,6 +2219,55 @@ mod tests {
             ci_key_action('R', Some("run".into())),
             Some(DetailAction::CiRerun { failed: false, .. })
         ));
+    }
+
+    #[test]
+    fn ci_rerun_scope_maps_keys_to_supported_scopes() {
+        let gitlab = thegn_core::ci::CiCaps {
+            rerun: true,
+            rerun_failed_or_canceled: true,
+            ..thegn_core::ci::CiCaps::default()
+        };
+        assert_eq!(
+            ci_rerun_scope(&gitlab, true),
+            Ok((
+                thegn_core::ci::RerunScope::FailedOrCanceled,
+                Some("ci: this provider retries failed and canceled jobs together")
+            ))
+        );
+        assert_eq!(
+            ci_rerun_scope(&gitlab, false),
+            Err(
+                "ci: this provider can't re-run every job — r retries its failed and canceled jobs"
+            )
+        );
+
+        let github = thegn_core::ci::CiCaps {
+            rerun: true,
+            rerun_all: true,
+            rerun_failed: true,
+            ..thegn_core::ci::CiCaps::default()
+        };
+        assert_eq!(
+            ci_rerun_scope(&github, true),
+            Ok((thegn_core::ci::RerunScope::Failed, None))
+        );
+        assert_eq!(
+            ci_rerun_scope(&github, false),
+            Ok((thegn_core::ci::RerunScope::All, None))
+        );
+    }
+
+    #[test]
+    fn ci_rerun_scope_refuses_when_no_scope_is_supported() {
+        assert_eq!(
+            ci_rerun_scope(&thegn_core::ci::CiCaps::default(), true),
+            Err("ci: this provider can't re-run failed jobs")
+        );
+        assert_eq!(
+            ci_rerun_scope(&thegn_core::ci::CiCaps::default(), false),
+            Err("ci: this provider can't re-run runs")
+        );
     }
 
     #[test]
