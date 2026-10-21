@@ -263,9 +263,10 @@ provider placements. Only infrastructure names such as `PATH`, `HOME`,
 replaces `[sandbox] env_passthrough`. At startup, the thegn process also unsets
 known credential environment families, keeping `SSH_AUTH_SOCK` only when the
 profile has `ssh/id`. Its git, gh and GnuPG directories are mounted read-only in
-sandboxes; a pane that needs to write them, such as `gh auth login`, needs an
-explicit `[sandbox] mounts` grant. Startup refuses if the profile state or
-credential directories cannot be created. The default profile is unchanged.
+sandboxes; a pane that needs to write them, such as `gh auth login` or GnuPG
+signing, needs an explicit `[sandbox] mounts` grant. Startup refuses if the
+profile state or credential directories cannot be created. The default profile
+is unchanged.
 `thegn doctor` lists denied and shared names, never values. The share list is
 read at startup.
 
