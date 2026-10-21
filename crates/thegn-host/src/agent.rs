@@ -2560,6 +2560,19 @@ pub fn provision_provider_env_named(
         // is dead and nix wastes minutes timing out before falling back to source.
         host_cache_url: (pc.host_cache && crate::bridge_sup::bridge_binary_path().is_some())
             .then(|| format!("http://127.0.0.1:{}", crate::nixcache::SANDBOX_PORT)),
+        host_cache_key: if pc.host_cache && crate::bridge_sup::bridge_binary_path().is_some() {
+            match crate::nix_signing::ensure_install_key() {
+                Ok(key) => Some(key.public),
+                Err(error) => {
+                    thegn_core::msg::warn(&format!(
+                        "host cache: no installation signing key ({error}); the sandbox will not trust the host cache"
+                    ));
+                    None
+                }
+            }
+        } else {
+            None
+        },
         toolchain: cfg.toolchain.clone(),
     };
     let plan = envplan::plan(&req, &opts);
