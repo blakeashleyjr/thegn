@@ -258,6 +258,11 @@ pub(super) fn persist(
             MergeOutcomeWrite::QueueChanged => {
                 anyhow::bail!("queue changed while folding; outcome bookkeeping skipped")
             }
+            MergeOutcomeWrite::Claimed => {
+                anyhow::bail!(
+                    "merge row is claimed by an active drain; outcome bookkeeping skipped"
+                )
+            }
         }
         // Only the committed final state authorizes this lifecycle event. No
         // transient Enqueued event is emitted. A later filesystem/DB reassignment
