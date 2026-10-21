@@ -31,7 +31,7 @@ impl<P> RespawnQueue<P> {
     }
 
     pub(crate) fn pop_due(&mut self, now: Instant) -> Option<(String, P)> {
-        let (earliest, at) =
+        let (earliest, (at, _)) =
             self.due
                 .iter()
                 .min_by(|(left_id, (left_at, _)), (right_id, (right_at, _))| {

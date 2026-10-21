@@ -199,13 +199,14 @@ Crashed resident plugins restart with backoff (three attempts, then disabled
 until config reload). A pending restart is cancelled when the plugin is
 disabled, on config reload and on shutdown; restarts wait on one background
 timer rather than a thread each. That crash/backoff state is process-lifetime
-supervisor state: it is not persisted across a daemon or compositor restart. After such a
-restart, the offline `plugin list` command cannot reconcile live state and
-reports an enabled plugin as `unknown` with `live_health = unavailable` until a
-future attached-snapshot surface exists. Resident-plugin stderr is drained and,
-when debug logging is enabled, written to the debug log at most 20 lines per
-second; a line is capped at 512 bytes, and excess lines are suppressed. thegn
-keeps the last 8 KiB and line counts internally; no command shows them yet.
+supervisor state: it is not persisted across a daemon or compositor restart.
+After such a restart, the offline `plugin list` command cannot reconcile live
+state and reports an enabled plugin as `unknown` with
+`live_health = unavailable` until a future attached-snapshot surface exists.
+Resident-plugin stderr is drained and, when debug logging is enabled, written
+to the debug log at most 20 lines per second; a line is capped at 512 bytes,
+and excess lines are suppressed. thegn keeps the last 8 KiB and line counts
+internally; no command shows them yet.
 Plugin processes are _not sandboxed_ — treat a plugin like any program you
 choose to run.
 

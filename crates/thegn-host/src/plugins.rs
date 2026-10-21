@@ -248,6 +248,7 @@ fn run_respawn_worker<P>(
 struct RespawnCtx {
     stop: Arc<StopSignal>,
     sessions: Sessions,
+    disabled: Disabled,
     supervisor: ResidentSupervisor,
     tx: PluginTx,
     waker: TerminalWaker,
@@ -264,6 +265,14 @@ fn respawn_now(plugin: LoadedPlugin, ctx: &RespawnCtx) {
                     admit_unless_stopped(&ctx.sessions, &ctx.stop.flag, id.clone(), session)
                 {
                     session.kill();
+                    return;
+                }
+                let disabled = lock(&ctx.disabled).contains(&id);
+                if disabled {
+                    match lock(&ctx.sessions).remove(&id) {
+                        Some(session) => session.kill(),
+                        None => {}
+                    }
                     return;
                 }
                 Some(writer)
@@ -297,6 +306,13 @@ fn respawn_now(plugin: LoadedPlugin, ctx: &RespawnCtx) {
     // best-effort: the loop may be shutting down.
     if let Err(error) = ctx.waker.wake() {
         tracing::debug!(target: "thegn::plugin", %error, "respawn message waker pulse failed");
+    }
+}
+
+fn fire_if_enabled(disabled: &Disabled, id: &str, fire: impl FnOnce()) {
+    let enabled = !lock(disabled).contains(id);
+    if enabled {
+        fire();
     }
 }
 
@@ -470,6 +486,7 @@ impl PluginsHost {
         let ctx = RespawnCtx {
             stop: self.stop.clone(),
             sessions: self.sessions.clone(),
+            disabled: disabled.clone(),
             supervisor: self.supervisor.clone(),
             tx: self.tx.clone(),
             waker: self.waker.clone(),
@@ -478,10 +495,7 @@ impl PluginsHost {
         if let Err(error) = thegn_core::thread_name::try_spawn_named("thegn-plug-resp", move || {
             crate::platform::qos::set_self(crate::platform::qos::Qos::Utility);
             run_respawn_worker(&timers, &stop, move |id, plugin| {
-                let disabled = lock(&disabled);
-                if !disabled.contains(&id) {
-                    respawn_now(plugin, &ctx);
-                }
+                fire_if_enabled(&disabled, &id, || respawn_now(plugin, &ctx));
             });
         }) {
             tracing::warn!(target: "thegn::plugin", error = %error, "respawn worker failed to start");
@@ -1129,11 +1143,13 @@ mod tests {
     #[test]
     fn respawn_worker_shutdown_cancels_a_pending_respawn_promptly() {
         let timers = Arc::new(RespawnTimers::<u32>::default());
-        lock(&timers.state).queue.schedule(
-            "late".into(),
-            Instant::now() + Duration::from_secs(60),
-            1,
-        );
+        {
+            let mut state = lock(&timers.state);
+            state.queue.schedule("ready".into(), Instant::now(), 0);
+            state
+                .queue
+                .schedule("late".into(), Instant::now() + Duration::from_secs(60), 1);
+        }
         let stop = Arc::new(StopSignal::default());
         let (fired_tx, fired_rx) = std::sync::mpsc::channel();
         let (done_tx, done_rx) = std::sync::mpsc::channel();
@@ -1146,6 +1162,10 @@ mod tests {
             done_tx.send(()).unwrap();
         });
 
+        assert_eq!(
+            fired_rx.recv_timeout(Duration::from_secs(5)).unwrap(),
+            ("ready".into(), 0)
+        );
         timers.close();
         stop.stop();
         done_rx.recv_timeout(Duration::from_secs(5)).unwrap();
@@ -1162,8 +1182,7 @@ mod tests {
             state
                 .queue
                 .schedule("a".into(), Instant::now() + Duration::from_millis(200), 1);
-            assert!(state.queue.cancel("a"));
-            state.queue.schedule("b".into(), Instant::now(), 2);
+            state.queue.schedule("ready".into(), Instant::now(), 0);
         }
         let stop = Arc::new(StopSignal::default());
         let (fired_tx, fired_rx) = std::sync::mpsc::channel();
@@ -1175,6 +1194,16 @@ mod tests {
             });
         });
 
+        assert_eq!(
+            fired_rx.recv_timeout(Duration::from_secs(5)).unwrap(),
+            ("ready".into(), 0)
+        );
+        timers.cancel("a");
+        {
+            let mut state = lock(&timers.state);
+            state.queue.schedule("b".into(), Instant::now(), 2);
+            timers.cv.notify_all();
+        }
         assert_eq!(
             fired_rx.recv_timeout(Duration::from_secs(5)).unwrap(),
             ("b".into(), 2)
@@ -1212,6 +1241,53 @@ mod tests {
         timers.close();
         stop.stop();
         worker.join().unwrap();
+    }
+
+    #[test]
+    fn set_disabled_does_not_wait_for_a_slow_respawn() {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .unwrap();
+        let disabled = Arc::new(Mutex::new(Default::default()));
+        let (waker, _master, _terminal) =
+            crate::platform::sound_process::test_support::test_waker();
+        let (tx, _rx) = plugin_channel();
+        let host = Arc::new(PluginsHost {
+            stop: Arc::new(StopSignal::default()),
+            supervisor: ResidentSupervisor::new(runtime.handle().clone()),
+            sessions: Arc::new(Mutex::new(BTreeMap::new())),
+            disabled: disabled.clone(),
+            tx,
+            waker,
+            one_shot_gate: OneShotGate::default(),
+            state_anchor: PathBuf::new(),
+            respawns: Arc::new(RespawnTimers::default()),
+        });
+
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let slow_disabled = disabled.clone();
+        let slow = std::thread::spawn(move || {
+            fire_if_enabled(&slow_disabled, "slow", || {
+                started_tx.send(()).unwrap();
+                release_rx.recv().unwrap();
+            });
+        });
+        started_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let setter_host = host.clone();
+        let setter = std::thread::spawn(move || {
+            setter_host.set_disabled("slow");
+            done_tx.send(()).unwrap();
+        });
+        let disabled_promptly = done_rx.recv_timeout(Duration::from_secs(2)).is_ok();
+        release_tx.send(()).unwrap();
+        slow.join().unwrap();
+        setter.join().unwrap();
+        assert!(disabled_promptly, "set_disabled waited for respawn work");
     }
 
     #[test]
@@ -1669,6 +1745,7 @@ mod tests {
         let ctx = RespawnCtx {
             stop,
             sessions: sessions.clone(),
+            disabled: Arc::new(Mutex::new(Default::default())),
             supervisor,
             tx,
             waker,
