@@ -271,6 +271,11 @@ In the section and in its popup, **r** reruns failed jobs, **R** reruns all
 jobs, and **c** cancels after a second press. On GitLab, **r** retries failed
 and canceled jobs together, while **R** is refused because GitLab has no full rerun.
 
+The daemon serves a cached CI run list only while it is younger than
+`[ci] ttl_secs` and recorded for the worktree's current branch; otherwise it
+asks the provider. Cached job-log tails written under an older redaction policy
+are redacted and bounded again when read.
+
 ### merge — the local merge queue
 
 The fold-actor's per-branch land/defer status. Scoped to the active
