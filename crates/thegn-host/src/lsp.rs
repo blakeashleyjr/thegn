@@ -24,7 +24,8 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Condvar, Mutex, RwLock};
 use std::time::{Duration, Instant};
 
 use crate::lsp_admission::{AdmittedClient, RootAdmission};
@@ -166,14 +167,16 @@ struct ClientState {
     /// Epoch of the applied root set. Reconcile tasks can run out of order
     /// (they queue on this lock); an older epoch is never applied over a newer.
     epoch: u64,
+    /// Epoch of the applied LSP configuration.
+    config_epoch: u64,
 }
 
 pub struct LspInner {
-    enabled: bool,
-    /// The resolved server registry (built-ins + user `[[lsp.servers]]`). Built
-    /// once at startup and immutable, so it needs no lock and is shared read-only
-    /// across every off-loop request task.
-    registry: Registry,
+    enabled: AtomicBool,
+    /// The resolved server registry (built-ins + user `[[lsp.servers]]`). It is
+    /// swappable on config reload; readers clone the Arc and release the lock
+    /// before resolving or doing any other work.
+    registry: RwLock<Arc<Registry>>,
     diag_tx: DiagnosticsSender,
     admission: RootAdmission,
     clients: Mutex<ClientState>,
@@ -185,8 +188,8 @@ impl LspSupervisor {
         let (diag_tx, raw_rx) = thegn_svc::lsp::diagnostics_channel();
         LspSupervisor {
             inner: Arc::new(LspInner {
-                enabled: cfg.lsp.enabled,
-                registry: Registry::build(&cfg.lsp.servers),
+                enabled: AtomicBool::new(cfg.lsp.enabled),
+                registry: RwLock::new(Arc::new(Registry::build(&cfg.lsp.servers))),
                 diag_tx,
                 admission: RootAdmission::new(),
                 clients: Mutex::new(ClientState::default()),
@@ -242,6 +245,13 @@ fn teardown_off_loop(clients: Vec<Arc<LspClient>>) {
 }
 
 impl LspInner {
+    fn registry(&self) -> Arc<Registry> {
+        match self.registry.read() {
+            Ok(registry) => registry.clone(),
+            Err(poisoned) => poisoned.into_inner().clone(),
+        }
+    }
+
     /// Drain live clients synchronously within one total quit budget. Startup
     /// and negative-cache slots are intentionally left alone: a handle may
     /// outlive the supervisor and remain usable for future starts.
@@ -289,7 +299,7 @@ impl LspInner {
     /// Resolve a file path to its registry key (the LSP tier), by extension.
     /// Pure; safe to call anywhere. `None` for an unregistered extension.
     pub fn resolve_key(&self, path: &str) -> Option<String> {
-        self.registry.resolve_key(path)
+        self.registry().resolve_key(path)
     }
 
     /// Get the warm client for `(root, key)`, lazily spawning+initializing it on
@@ -306,7 +316,8 @@ impl LspInner {
         cancel: Option<&CancelToken>,
     ) -> Result<AdmittedClient, LspError> {
         self.admitted_with(root, key, cancel, |root, key, diagnostics, generation| {
-            let Some(spec) = self.registry.resolve(key) else {
+            let registry = self.registry();
+            let Some(spec) = registry.resolve(key) else {
                 return Err(LspError::NotAvailable);
             };
             // Join the shared aggregate slice, like every pane and background
@@ -362,7 +373,7 @@ impl LspInner {
         key: &str,
         start: impl FnOnce(&Path, &str, DiagnosticsSender, u64) -> Result<Arc<LspClient>, LspError>,
     ) -> Result<Arc<LspClient>, LspError> {
-        if !self.enabled {
+        if !self.enabled.load(Ordering::Acquire) {
             return Err(LspError::NotAvailable);
         }
         // Bounds on the borrowed inputs, before anything is cloned.
@@ -379,6 +390,9 @@ impl LspInner {
                 .clients
                 .lock()
                 .map_err(|_| LspError::Protocol("LSP client map poisoned".into()))?;
+            if !self.enabled.load(Ordering::Acquire) {
+                return Err(LspError::NotAvailable);
+            }
             if state.live.as_ref().is_some_and(|live| !live.contains(root)) {
                 return Err(LspError::NotAvailable);
             }
@@ -676,6 +690,74 @@ impl LspInner {
         teardown_off_loop(teardown);
         released
     }
+
+    /// Applies epochs in order, retiring changed or disabled slots, including
+    /// negative-cache entries. Subprocess teardown happens off-loop.
+    /// Returns the number of released slots.
+    pub(crate) fn reconfigure(
+        &self,
+        epoch: u64,
+        enabled: bool,
+        servers: &[thegn_core::config::LspServerConfig],
+    ) -> usize {
+        let next = Registry::build(servers);
+        let mut teardown = Vec::new();
+        let mut released = 0usize;
+        let mut state = match self.clients.lock() {
+            Ok(state) => state,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        if epoch <= state.config_epoch {
+            return 0;
+        }
+        state.config_epoch = epoch;
+        let changed = changed_registry_keys(&self.registry(), &next);
+        match self.registry.write() {
+            Ok(mut registry) => *registry = Arc::new(next),
+            Err(poisoned) => *poisoned.into_inner() = Arc::new(next),
+        }
+        self.enabled.store(enabled, Ordering::Release);
+
+        let stale: Vec<(PathBuf, String)> = state
+            .map
+            .keys()
+            .filter(|(_, key)| !enabled || changed.contains(key))
+            .cloned()
+            .collect();
+        for map_key in stale {
+            let Some(slot) = state.map.remove(&map_key) else {
+                continue;
+            };
+            released += 1;
+            match slot {
+                ClientSlot::Live {
+                    client, generation, ..
+                } => {
+                    self.diag_tx.retire(&map_key.0, &map_key.1, generation);
+                    teardown.push(client);
+                }
+                ClientSlot::Starting { generation, .. } => {
+                    self.diag_tx.retire(&map_key.0, &map_key.1, generation);
+                }
+                ClientSlot::Unavailable | ClientSlot::Failed { .. } => {}
+            }
+        }
+        drop(state);
+        teardown_off_loop(teardown);
+        released
+    }
+}
+
+fn changed_registry_keys(old: &Registry, new: &Registry) -> HashSet<String> {
+    let keys: HashSet<String> = old
+        .entries()
+        .iter()
+        .chain(new.entries())
+        .map(|entry| entry.key.clone())
+        .collect();
+    keys.into_iter()
+        .filter(|key| old.entry(key) != new.entry(key))
+        .collect()
 }
 
 /// Shuts the diagnostics bus down when dropped: frees queued publications,
@@ -3261,5 +3343,157 @@ mod tests {
     fn eviction_constants_match_the_owner_decision() {
         assert_eq!(LSP_IDLE_EVICT_AFTER, Duration::from_secs(30 * 60));
         assert_eq!(LSP_EVICT_CHECK_EVERY, Duration::from_secs(60));
+    }
+
+    #[test]
+    fn reconfigure_restarts_only_the_changed_server_key() {
+        let (inner, _rx) = enabled_inner();
+        let rust = inner
+            .client_with(Path::new("/r"), "rust", live_fake_client)
+            .unwrap();
+        let python = inner
+            .client_with(Path::new("/r"), "python", live_fake_client)
+            .unwrap();
+        let python_config = thegn_core::config::LspServerConfig {
+            lang: "python".into(),
+            command: "/opt/changed/pylsp".into(),
+            args: Vec::new(),
+            extensions: Vec::new(),
+            language_id: None,
+        };
+        assert_eq!(inner.reconfigure(1, true, &[python_config]), 1);
+        let warm_rust = inner
+            .client_with(Path::new("/r"), "rust", |_, _, _, _| {
+                panic!("unchanged key must stay warm")
+            })
+            .unwrap();
+        assert!(Arc::ptr_eq(&rust, &warm_rust));
+
+        let starts = std::sync::atomic::AtomicUsize::new(0);
+        let restarted_python = inner
+            .client_with(
+                Path::new("/r"),
+                "python",
+                |root, key, diagnostics, generation| {
+                    starts.fetch_add(1, Ordering::SeqCst);
+                    live_fake_client(root, key, diagnostics, generation)
+                },
+            )
+            .unwrap();
+        assert_eq!(starts.load(Ordering::SeqCst), 1);
+        assert!(restarted_python.generation() > python.generation());
+        assert!(!Arc::ptr_eq(&python, &restarted_python));
+    }
+
+    #[test]
+    fn reconfigure_clears_a_cached_unavailable_slot() {
+        let (inner, _rx) = enabled_inner();
+        let starts = std::sync::atomic::AtomicUsize::new(0);
+        let unavailable = || {
+            starts.fetch_add(1, Ordering::SeqCst);
+            Err(LspError::NotAvailable)
+        };
+        assert!(matches!(
+            inner.client_with(Path::new("/u"), "rust", |_, _, _, _| unavailable()),
+            Err(LspError::NotAvailable)
+        ));
+        assert!(matches!(
+            inner.client_with(Path::new("/u"), "rust", |_, _, _, _| unavailable()),
+            Err(LspError::NotAvailable)
+        ));
+        assert_eq!(starts.load(Ordering::SeqCst), 1);
+
+        let rust_config = thegn_core::config::LspServerConfig {
+            lang: "rust".into(),
+            command: "/opt/rust-analyzer".into(),
+            ..Default::default()
+        };
+        assert_eq!(inner.reconfigure(1, true, &[rust_config]), 1);
+        let restarted = inner.client_with(Path::new("/u"), "rust", live_fake_client);
+        assert!(restarted.is_ok());
+    }
+
+    #[test]
+    fn reconfigure_disabled_releases_every_slot_and_refuses_starts() {
+        let (inner, _rx) = enabled_inner();
+        inner
+            .client_with(Path::new("/d"), "rust", live_fake_client)
+            .unwrap();
+        assert_eq!(
+            inner.reconfigure(1, false, &Config::default().lsp.servers),
+            1
+        );
+        assert!(matches!(
+            inner.client_with(Path::new("/d"), "rust", |_, _, _, _| {
+                panic!("disabled LSP must refuse starts")
+            }),
+            Err(LspError::NotAvailable)
+        ));
+    }
+
+    #[test]
+    fn older_reconfigure_epoch_is_ignored() {
+        let (inner, _rx) = enabled_inner();
+        assert_eq!(
+            inner.reconfigure(2, true, &Config::default().lsp.servers),
+            0
+        );
+        assert_eq!(
+            inner.reconfigure(1, false, &Config::default().lsp.servers),
+            0
+        );
+        assert!(
+            inner
+                .client_with(Path::new("/older"), "rust", live_fake_client)
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn unchanged_reconfigure_keeps_every_slot() {
+        let (inner, _rx) = enabled_inner();
+        let original = inner
+            .client_with(Path::new("/same"), "rust", live_fake_client)
+            .unwrap();
+        assert_eq!(
+            inner.reconfigure(1, true, &Config::default().lsp.servers),
+            0
+        );
+        let current = inner
+            .client_with(Path::new("/same"), "rust", |_, _, _, _| {
+                panic!("unchanged reload must keep every slot")
+            })
+            .unwrap();
+        assert!(Arc::ptr_eq(&original, &current));
+    }
+
+    #[test]
+    fn changed_registry_keys_reports_added_removed_and_modified_entries() {
+        let old = Registry::build(&[]);
+        let modified_and_added = Registry::build(&[
+            thegn_core::config::LspServerConfig {
+                lang: "rust".into(),
+                command: "/opt/rust-analyzer".into(),
+                ..Default::default()
+            },
+            thegn_core::config::LspServerConfig {
+                lang: "zig".into(),
+                command: "/opt/zls".into(),
+                extensions: vec!["zig".into()],
+                ..Default::default()
+            },
+        ]);
+        let changed = changed_registry_keys(&old, &modified_and_added);
+        assert_eq!(changed, HashSet::from(["rust".into(), "zig".into()]));
+        assert!(changed_registry_keys(&old, &Registry::build(&[])).is_empty());
+
+        let old_with_zig = Registry::build(&[thegn_core::config::LspServerConfig {
+            lang: "zig".into(),
+            command: "/opt/zls".into(),
+            extensions: vec!["zig".into()],
+            ..Default::default()
+        }]);
+        let removed = changed_registry_keys(&old_with_zig, &old);
+        assert_eq!(removed, HashSet::from(["zig".into()]));
     }
 }
