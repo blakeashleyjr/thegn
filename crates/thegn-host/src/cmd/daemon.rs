@@ -185,16 +185,16 @@ fn stop(cfg: &Config) -> Result<()> {
         };
         let (registry, registry_error) = registry;
         let mut unknown = Vec::new();
-        if let Some(error) = registry_error {
-            if let Some(error) = error {
-                outln!(
-                    "unknown: listener registry not read before the stop deadline ({})",
-                    error
-                );
-            } else {
-                outln!("unknown: listener registry not read before the stop deadline");
+        match registry_error {
+            Some(Some(error)) => {
+                outln!("unknown: listener registry could not be read ({})", error);
+                unknown.push("listener registry".to_string());
             }
-            unknown.push("listener registry".to_string());
+            Some(None) => {
+                outln!("unknown: listener registry not read before the stop deadline");
+                unknown.push("listener registry".to_string());
+            }
+            None => {}
         }
         let configured = crate::daemon::socket_path(&cfg.daemon);
         let legacy_path = thegn_core::config_daemon::legacy_socket_path(
@@ -368,12 +368,16 @@ mod tests {
             Ok(()) => panic!("unknown listener must make stop fail"),
         }
         assert!(stop_verdict(0, &[], &[]).is_ok());
-        let result = stop_verdict(2, &["a".into()], &["b".into()]);
+        let result = stop_verdict(
+            2,
+            &["/run/live-a.sock".into()],
+            &["/run/unchecked-b.sock".into()],
+        );
         match result {
             Err(error) => {
                 let message = error.to_string();
-                assert!(message.contains("a"));
-                assert!(message.contains("b"));
+                assert!(message.contains("/run/live-a.sock"));
+                assert!(message.contains("/run/unchecked-b.sock"));
             }
             Ok(()) => panic!("live and unknown listeners must make stop fail"),
         }
