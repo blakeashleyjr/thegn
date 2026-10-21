@@ -24,7 +24,7 @@ use thegn_svc::control::client::ControlClient;
 use super::session::SessionAction;
 
 const OPAQUE_PAYLOAD_WARNING: &str = "opaque pane commands, scrollback, dispatch reports, and notes are carried unchanged and are not included in this audit";
-const HISTORY_DROPPED_NOTICE: &str = "pane commands, scrollback, dispatch reports, and notes are not carried (pass --include-history to carry them unchanged); they are not included in this audit";
+const HISTORY_DROPPED_NOTICE: &str = "content history is dropped by default (pass --include-history to include it); history contents are not included in this audit";
 const KILL_CONFIRM_TIMEOUT: Duration = Duration::from_secs(5);
 const KILL_CONFIRM_POLL: Duration = Duration::from_millis(25);
 
@@ -1208,7 +1208,7 @@ mod tests {
             json["opaque_payload_warning"]
                 .as_str()
                 .unwrap()
-                .contains("not carried")
+                .contains("history is dropped by default")
         );
 
         let mut include_audit = MigrationAudit::new("source", "target", "/worktree", true);
