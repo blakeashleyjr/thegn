@@ -283,7 +283,7 @@ fn delivery_from_read(
         .map(|snapshot| crate::media_watch::MediaSnapshotDelivery {
             generation,
             snapshot,
-            health: crate::media_watch::MediaHealth::Fresh,
+            health: None,
         })
 }
 
@@ -496,7 +496,7 @@ pub(crate) fn restart_media_watch(
             crate::media_watch::MediaSnapshotDelivery {
                 generation: generation_value,
                 snapshot: None,
-                health: crate::media_watch::MediaHealth::Fresh,
+                health: Some(crate::media_watch::MediaHealth::Fresh),
             },
         ) && let Err(error) = waker.wake()
         {
