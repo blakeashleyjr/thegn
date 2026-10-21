@@ -35,6 +35,12 @@ pub enum Action {
         /// Enqueue every eligible worktree branch in this repo.
         #[arg(long)]
         all: bool,
+        /// Record an override for an unsatisfied pipeline gate.
+        #[arg(long, requires = "why", conflicts_with = "all")]
+        admin: bool,
+        /// Reason recorded on the pipeline row for the override.
+        #[arg(long, value_name = "REASON", requires = "admin")]
+        why: Option<String>,
     },
     /// Remove a worktree from the queue.
     Rm {
@@ -138,7 +144,15 @@ pub fn run(cfg: &Config, action: Action) -> Result<()> {
     }
     match action {
         Action::List { json } => list(json),
-        Action::Add { worktrees, all } => add(cfg, worktrees, all),
+        Action::Add {
+            worktrees,
+            all,
+            admin,
+            why,
+        } => {
+            let admin_why = if admin { why.as_deref() } else { None };
+            add_with(cfg, worktrees, all, false, admin_why)
+        }
         Action::Rm { target } => rm(cfg, target.get()),
         Action::Clear => clear(cfg),
         Action::Sweep { force } => sweep(cfg, force),
@@ -510,13 +524,19 @@ fn effective_remote_mode(
     )
 }
 
-fn add(cfg: &Config, worktrees: Vec<String>, all: bool) -> Result<()> {
-    add_quiet(cfg, worktrees, all, false)
-}
-
 /// `add`, with its human output suppressible so `drain --all --json` can enqueue
 /// without printing prose ahead of the single JSON document.
 fn add_quiet(cfg: &Config, worktrees: Vec<String>, all: bool, quiet: bool) -> Result<()> {
+    add_with(cfg, worktrees, all, quiet, None)
+}
+
+fn add_with(
+    cfg: &Config,
+    worktrees: Vec<String>,
+    all: bool,
+    quiet: bool,
+    admin_why: Option<&str>,
+) -> Result<()> {
     // route_to_host: a provisioned sprite (host control endpoint + token in its
     // env) sends the enqueue to the host's daemon so the host's queue owns the
     // row. `--all` enumerates local branches, so it stays on the local path.
@@ -555,12 +575,46 @@ fn add_quiet(cfg: &Config, worktrees: Vec<String>, all: bool, quiet: bool) -> Re
                 );
             }
         }
+        let mut refused = 0usize;
+        let mut refusal_details = Vec::new();
         for (branch, wt) in &cands.worktrees {
-            crate::merge_ops::enqueue_bound_local(&db, wt, branch, &target)?;
-            crate::merge_lifecycle::apply(mq, &db, &root, wt, branch, LifecycleEvent::Enqueued);
-            if !quiet {
-                outln!("  + queued {branch}");
+            match crate::merge_ops::enqueue_bound_local_with(&db, wt, branch, &target, admin_why) {
+                Ok(()) => {
+                    crate::merge_lifecycle::apply(
+                        mq,
+                        &db,
+                        &root,
+                        wt,
+                        branch,
+                        LifecycleEvent::Enqueued,
+                    );
+                    if !quiet {
+                        outln!("  + queued {branch}");
+                    }
+                }
+                Err(error)
+                    if error
+                        .downcast_ref::<thegn_core::pipeline_merge_admission::PipelineMergeRefused>(
+                        )
+                        .is_some() =>
+                {
+                    refused += 1;
+                    refusal_details.push(format!("{branch}: {error}"));
+                    if !quiet {
+                        outln!("  ! refused {branch}: {error}");
+                    }
+                }
+                Err(error) => return Err(error),
             }
+        }
+        if refused > 0 && quiet {
+            anyhow::bail!(
+                "{refused} pipeline worktree(s) refused merge admission: {}",
+                refusal_details.join("; ")
+            );
+        }
+        if refused > 0 {
+            anyhow::bail!("{refused} pipeline worktree(s) refused merge admission (see above)");
         }
         return Ok(());
     }
@@ -571,7 +625,7 @@ fn add_quiet(cfg: &Config, worktrees: Vec<String>, all: bool, quiet: bool) -> Re
         worktrees.iter().map(PathBuf::from).collect()
     };
     for wt in paths {
-        let msg = crate::merge_ops::enqueue_worktree(cfg, &db, &wt)?;
+        let msg = crate::merge_ops::enqueue_worktree_with(cfg, &db, &wt, admin_why)?;
         let mark = if msg.starts_with("skipped") {
             "•"
         } else {

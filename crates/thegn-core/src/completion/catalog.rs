@@ -311,6 +311,7 @@ pub const CATALOG: &[Slot] = &[
     slot("land", "worktree_pos", SourceKind::Worktree),
     slot("map", "worktree", SourceKind::Worktree),
     slot("merge add", "worktrees", SourceKind::Worktree),
+    slot("merge add", "why", SourceKind::Reserved(Reserved::Freeform)),
     slot("merge land", "worktree", SourceKind::Worktree),
     slot("merge land", "worktree_pos", SourceKind::Worktree),
     slot("merge retry", "worktree", SourceKind::Worktree),
