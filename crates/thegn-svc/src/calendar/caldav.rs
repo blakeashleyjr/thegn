@@ -22,7 +22,10 @@ use thegn_core::config_calendar::CalendarAccount;
 use tokio::time::Instant;
 
 use super::ics_url::{Credential, resolve_credential};
-use super::{AccountAdmission, CalendarBackend, CalendarCaps, CalendarError, EventPage, PageMode};
+use super::{
+    AccountAdmission, CalendarBackend, CalendarCaps, CalendarError, EventPage, PageDiagnostics,
+    PageMode,
+};
 use crate::http::{
     CalendarHttpClient, CalendarHttpError, ExpectedMedia, MAX_BODY_BYTES, MAX_REQUEST_BYTES,
     discard_body, map_error, read_body, validate_encoding, validate_media,
@@ -233,6 +236,7 @@ fn page_from_multistatus(
     let mut deleted = Vec::new();
     let mut event_hrefs = Vec::new();
     let mut deleted_hrefs = Vec::new();
+    let mut diagnostics = PageDiagnostics::default();
     let token = xml::walk_multistatus(text, |r| {
         // `calendar_ids` restricts to named collections; a resource outside
         // them is skipped before it is admitted or parsed. Tombstones are
@@ -292,6 +296,7 @@ fn page_from_multistatus(
                 "calendar resource is incomplete or structurally malformed".into(),
             ));
         }
+        diagnostics.absorb(PageDiagnostics::from_report(&report));
         Ok(())
     })?;
     let token = scope_token(calendar_ids, zone, &token);
@@ -304,6 +309,7 @@ fn page_from_multistatus(
         deleted_hrefs,
         token,
     )
+    .map(|page| page.with_diagnostics(diagnostics))
 }
 
 const SCOPE_PREFIX: &str = "tgf2:";
@@ -947,5 +953,28 @@ END:VCALENDAR</c:calendar-data></x:prop><x:status>HTTP/1.1 200 OK</x:status></x:
             page_from_multistatus(xml, "UTC", &[], PageMode::Delta, test_meter()),
             Err(CalendarError::Api(_))
         ));
+    }
+
+    #[test]
+    fn caldav_page_sums_diagnostics_across_resources() {
+        let resource_data = |uid: &str| {
+            format!(
+                "BEGIN:VCALENDAR\nBEGIN:VEVENT\nUID:good-{uid}\nDTSTART:20300101T100000Z\nEND:VEVENT\nBEGIN:VEVENT\nUID:bad-{uid}\nEND:VEVENT\nEND:VCALENDAR"
+            )
+        };
+        let first = resource("/cal/one.ics", &resource_data("one"));
+        let second = resource("/cal/two.ics", &resource_data("two"));
+        let xml = format!(
+            "<d:multistatus xmlns:d=\"DAV:\" xmlns:c=\"urn:ietf:params:xml:ns:caldav\">{first}{second}</d:multistatus>"
+        );
+
+        let page =
+            page_from_multistatus(&xml, "UTC", &[], PageMode::Snapshot, test_meter()).unwrap();
+
+        assert!(
+            page.diagnostics().quarantined_events >= 2,
+            "diagnostics: {:?}",
+            page.diagnostics()
+        );
     }
 }
