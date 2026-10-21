@@ -520,10 +520,7 @@ fn apply_credential_env(root: &std::path::Path) {
             }
         }
     }
-    let names = std::env::vars_os().filter_map(|(name, _)| match name.into_string() {
-        Ok(name) => Some(name),
-        Err(_) => None,
-    });
+    let names = std::env::vars_os().filter_map(|(name, _)| name.into_string().ok());
     for name in scrubbed_credential_vars(names, root.join("ssh/id").is_file()) {
         unsafe {
             std::env::remove_var(name);
