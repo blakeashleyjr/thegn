@@ -11,6 +11,28 @@ use crate::db::{Db, PoolSpare};
 use crate::store::PoolStore;
 use crate::util;
 
+fn pick_ready_spare(
+    tx: &rusqlite::Transaction<'_>,
+    repo: &str,
+    env: &str,
+) -> Option<(String, Option<String>)> {
+    let res = tx.query_row(
+        "SELECT sandbox_name, checkpoint_id FROM pool_spares
+         WHERE repo_path=?1 AND env_name=?2 AND state='ready'
+         ORDER BY created_at ASC LIMIT 1",
+        params![repo, env],
+        |r| Ok((r.get::<_, String>(0)?, r.get::<_, Option<String>>(1)?)),
+    );
+    match res {
+        Ok(row) => Some(row),
+        Err(rusqlite::Error::QueryReturnedNoRows) => None,
+        Err(error) => {
+            tracing::warn!(target: "thegn::db", error = %error, "pick_spare read failed; treating as a miss");
+            None
+        }
+    }
+}
+
 impl PoolStore for Db {
     fn set_base_snapshot(
         &self,
@@ -120,23 +142,7 @@ impl PoolStore for Db {
         worktree: &str,
     ) -> Result<Option<(String, Option<String>)>> {
         let tx = self.conn().unchecked_transaction()?;
-        let res = tx.query_row(
-            "SELECT sandbox_name, checkpoint_id FROM pool_spares
-             WHERE repo_path=?1 AND env_name=?2 AND state='ready'
-             ORDER BY created_at ASC LIMIT 1",
-            params![repo, env],
-            |r| Ok((r.get::<_, String>(0)?, r.get::<_, Option<String>>(1)?)),
-        );
-        // best-effort read: no rows is the None case; a real DB error is
-        // surfaced but still degrades to "no spare" (a fresh one provisions).
-        let picked: Option<(String, Option<String>)> = match res {
-            Ok(v) => Some(v),
-            Err(rusqlite::Error::QueryReturnedNoRows) => None,
-            Err(e) => {
-                tracing::warn!(target: "thegn::db", error = %e, "pick_spare read failed; treating as a miss");
-                None
-            }
-        };
+        let picked = pick_ready_spare(&tx, repo, env);
         if let Some((ref name, _)) = picked {
             let begun = tx.execute(
                 "UPDATE pool_spares SET state='claiming', updated_at=?2
@@ -173,21 +179,7 @@ impl PoolStore for Db {
         env: &str,
     ) -> Result<Option<(String, Option<String>)>> {
         let tx = self.conn().unchecked_transaction()?;
-        let res = tx.query_row(
-            "SELECT sandbox_name, checkpoint_id FROM pool_spares
-             WHERE repo_path=?1 AND env_name=?2 AND state='ready'
-             ORDER BY created_at ASC LIMIT 1",
-            params![repo, env],
-            |r| Ok((r.get::<_, String>(0)?, r.get::<_, Option<String>>(1)?)),
-        );
-        let picked = match res {
-            Ok(row) => Some(row),
-            Err(rusqlite::Error::QueryReturnedNoRows) => None,
-            Err(error) => {
-                tracing::warn!(target: "thegn::db", error = %error, "pick_spare read failed; treating as a miss");
-                None
-            }
-        };
+        let picked = pick_ready_spare(&tx, repo, env);
         if let Some((name, _)) = &picked {
             let changed = tx.execute(
                 "UPDATE pool_spares SET state='claiming', updated_at=?2
@@ -216,10 +208,15 @@ impl PoolStore for Db {
                 "warm pool: spare {name} was not exactly one claiming ledger row to publish"
             ));
         }
-        tx.execute(
+        let bound = tx.execute(
             "UPDATE worktrees SET provider_sandbox_id=?2 WHERE worktree=?1",
             params![worktree, name],
         )?;
+        if bound != 1 {
+            return Err(anyhow::anyhow!(
+                "warm pool: worktree {worktree} was not exactly one row to bind spare {name}"
+            ));
+        }
         tx.commit()?;
         Ok(())
     }
@@ -348,6 +345,23 @@ mod tests {
     }
 
     #[test]
+    fn ready_spare_pick_query_errors_are_misses() {
+        let db = Db::open_memory().unwrap();
+        db.conn().execute("DROP TABLE pool_spares", []).unwrap();
+
+        assert!(
+            db.begin_pool_spare_claim("/repo", "sprites")
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            db.claim_pool_spare("/repo", "sprites", "/wt/x")
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
     fn spare_ledger_insert_refuses_existing_name() {
         let db = Db::open_memory().unwrap();
         db.insert_pool_spare("x", "/repo", "sprites").unwrap();
@@ -457,6 +471,16 @@ mod tests {
         assert!(db.publish_pool_spare_claim("claiming", "/wt/x").is_err());
 
         db.begin_pool_spare_claim("/repo", "sprites").unwrap();
+        assert!(
+            db.publish_pool_spare_claim("claiming", "/wt/missing")
+                .is_err()
+        );
+        assert_eq!(
+            db.pool_spare_by_name("claiming").unwrap().unwrap().state,
+            "claiming"
+        );
+        db.put_worktree("tab", "/repo", "/wt/x", "tg/x", None, None)
+            .unwrap();
         db.publish_pool_spare_claim("claiming", "/wt/x").unwrap();
         assert_eq!(
             db.pool_spare_by_name("claiming").unwrap().unwrap().state,
