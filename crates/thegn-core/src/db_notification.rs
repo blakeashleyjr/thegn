@@ -714,6 +714,24 @@ impl Db {
         rows.truncate(limit);
         Ok((rows, truncated))
     }
+
+    /// Pipeline rows for either spelling of a worktree path, newest first.
+    /// Plain dispatch rows are excluded because they have no pipeline gate.
+    pub fn pipeline_rows_for_worktree(
+        &self,
+        raw: &str,
+        canonical: &str,
+    ) -> Result<Vec<crate::issue::AgentDispatch>> {
+        let conn = self.conn();
+        let mut stmt = conn.prepare(&format!(
+            "SELECT {DISPATCH_COLS} FROM agent_dispatches \
+             WHERE worktree_path IN (?1, ?2) AND stage IS NOT NULL AND TRIM(stage) <> '' \
+             AND artifact_path IS NOT NULL AND TRIM(artifact_path) <> '' ORDER BY id DESC"
+        ))?;
+        Ok(stmt
+            .query_map([raw, canonical], map_dispatch)?
+            .collect::<rusqlite::Result<Vec<_>>>()?)
+    }
 }
 
 impl Db {
