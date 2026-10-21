@@ -4549,6 +4549,7 @@ fn after_satisfaction_is_rechecked_with_status_inside_chunk_admission() {
     let db = Db::open_memory().unwrap();
     let sibling = db
         .put_agent_dispatch(crate::issue::NewDispatch {
+            stage: Some("code"),
             chunk_path: Some("chunk-1.md"),
             ..crate::issue::NewDispatch::new("linear:A-1", "/wt/shared", "code")
         })
