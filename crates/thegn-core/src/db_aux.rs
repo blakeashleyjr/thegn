@@ -185,6 +185,50 @@ fn valid_claim_text(value: &str, max: usize) -> bool {
     !value.is_empty() && value.len() <= max && !value.chars().any(char::is_control)
 }
 
+#[derive(Clone, Copy)]
+enum ClaimIdentity {
+    Registered,
+    UnregisteredLocal,
+}
+
+fn validate_claim_request(request: &MergeClaimRequest) -> Result<()> {
+    for value in [
+        &request.worktree,
+        &request.branch,
+        &request.repo_root,
+        &request.target_branch,
+    ] {
+        anyhow::ensure!(
+            valid_claim_text(value, 4096),
+            "invalid merge claim identity"
+        );
+    }
+    anyhow::ensure!(
+        request.location.len() <= 4096 && !request.location.chars().any(char::is_control),
+        "invalid merge claim location"
+    );
+    anyhow::ensure!(
+        matches!(
+            request.expected_status.as_str(),
+            "queued"
+                | "deferred"
+                | "gate_failed"
+                | "gate_error"
+                | "needs_human"
+                | "ready"
+                | "agent_blocked"
+        ),
+        "invalid merge claim status"
+    );
+    if let Some(hint) = request.owner_hint.as_deref() {
+        anyhow::ensure!(
+            valid_claim_text(hint, MERGE_CLAIM_OWNER_HINT_MAX),
+            "invalid merge claim owner hint"
+        );
+    }
+    Ok(())
+}
+
 fn claim_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<MergeClaim> {
     let phase: String = row.get(6)?;
     let phase = MergeClaimPhase::parse(&phase).ok_or_else(|| {
@@ -231,6 +275,7 @@ impl Db {
         &self,
         request: &MergeClaimRequest,
         token: &str,
+        identity: ClaimIdentity,
     ) -> Result<Option<MergeClaim>> {
         let tx = Transaction::new_unchecked(self.conn(), TransactionBehavior::Immediate)?;
         let now = util::now_ms();
@@ -241,18 +286,26 @@ impl Db {
             tx.commit()?;
             return Ok(None);
         }
-        let identity_matches: bool = tx.query_row(
-            "SELECT EXISTS(SELECT 1 FROM worktrees WHERE worktree=?1 AND branch=?2 \
-               AND COALESCE(repo_path,'')=?3 \
-               AND CASE WHEN COALESCE(location,'') IN ('','local') THEN '' ELSE location END=?4)",
-            params![
-                request.worktree,
-                request.branch,
-                request.repo_root,
-                location
-            ],
-            |row| row.get(0),
-        )?;
+        let identity_matches: bool = match identity {
+            ClaimIdentity::Registered => tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM worktrees WHERE worktree=?1 AND branch=?2 \
+                   AND COALESCE(repo_path,'')=?3 \
+                   AND CASE WHEN COALESCE(location,'') IN ('','local') THEN '' ELSE location END=?4)",
+                params![request.worktree, request.branch, request.repo_root, location],
+                |row| row.get(0),
+            )?,
+            ClaimIdentity::UnregisteredLocal => {
+                if !location.is_empty() {
+                    tx.commit()?;
+                    anyhow::bail!("unregistered merge claim requires a local row");
+                }
+                tx.query_row(
+                    "SELECT NOT EXISTS(SELECT 1 FROM worktrees WHERE worktree=?1)",
+                    [&request.worktree],
+                    |row| row.get(0),
+                )?
+            }
+        };
         if !identity_matches {
             tx.commit()?;
             return Ok(None);
@@ -945,42 +998,22 @@ impl WorktreeAuxStore for Db {
     }
 
     fn admit_merge_claim(&self, request: &MergeClaimRequest) -> Result<Option<MergeClaim>> {
-        for value in [
-            &request.worktree,
-            &request.branch,
-            &request.repo_root,
-            &request.target_branch,
-        ] {
-            anyhow::ensure!(
-                valid_claim_text(value, 4096),
-                "invalid merge claim identity"
-            );
-        }
-        anyhow::ensure!(
-            request.location.len() <= 4096 && !request.location.chars().any(char::is_control),
-            "invalid merge claim location"
-        );
-        anyhow::ensure!(
-            matches!(
-                request.expected_status.as_str(),
-                "queued"
-                    | "deferred"
-                    | "gate_failed"
-                    | "gate_error"
-                    | "needs_human"
-                    | "ready"
-                    | "agent_blocked"
-            ),
-            "invalid merge claim status"
-        );
-        if let Some(hint) = request.owner_hint.as_deref() {
-            anyhow::ensure!(
-                valid_claim_text(hint, MERGE_CLAIM_OWNER_HINT_MAX),
-                "invalid merge claim owner hint"
-            );
-        }
+        validate_claim_request(request)?;
         let token = mint_claim_token();
-        self.admit_merge_claim_tx(request, &token)
+        self.admit_merge_claim_tx(request, &token, ClaimIdentity::Registered)
+    }
+
+    fn admit_unregistered_local_merge_claim(
+        &self,
+        request: &MergeClaimRequest,
+    ) -> Result<Option<MergeClaim>> {
+        validate_claim_request(request)?;
+        anyhow::ensure!(
+            merge_location(Some(&request.location)).is_empty(),
+            "unregistered merge claim requires a local row"
+        );
+        let token = mint_claim_token();
+        self.admit_merge_claim_tx(request, &token, ClaimIdentity::UnregisteredLocal)
     }
 
     fn observe_merge_claim(&self, worktree: &str) -> Result<Option<MergeClaimView>> {

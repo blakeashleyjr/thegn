@@ -382,3 +382,116 @@ fn agent_blocked_rows_are_admissible() {
     expected.expected_status = "agent_blocked".into();
     assert!(db.admit_merge_claim(&expected).unwrap().is_some());
 }
+
+fn unregistered_request() -> MergeClaimRequest {
+    MergeClaimRequest {
+        worktree: "/private/adhoc".into(),
+        branch: "adhoc".into(),
+        repo_root: "/private/repo".into(),
+        target_branch: "main".into(),
+        location: String::new(),
+        expected_status: "queued".into(),
+        lease_until_ms: util::now_ms() + 60_000,
+        owner_hint: Some("worker-a".into()),
+    }
+}
+
+#[test]
+fn unregistered_local_row_is_admitted_once() {
+    let db = Db::open_memory().unwrap();
+    db.enqueue_merge("/private/adhoc", "adhoc", "main").unwrap();
+
+    assert!(
+        db.admit_unregistered_local_merge_claim(&unregistered_request())
+            .unwrap()
+            .is_some()
+    );
+    assert!(
+        db.admit_unregistered_local_merge_claim(&unregistered_request())
+            .unwrap()
+            .is_none()
+    );
+    assert_ne!(
+        db.observe_merge_claim("/private/adhoc")
+            .unwrap()
+            .unwrap()
+            .phase,
+        "unclaimed"
+    );
+}
+
+#[test]
+fn unregistered_local_admission_races_yield_one_owner() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("claims.sqlite");
+    let seed = Db::open_at(&path).unwrap();
+    seed.enqueue_merge("/private/adhoc", "adhoc", "main")
+        .unwrap();
+    drop(seed);
+    let db_a = Db::open_at(&path).unwrap();
+    let db_b = Db::open_at(&path).unwrap();
+    let barrier = Arc::new(Barrier::new(2));
+    let request_a = unregistered_request();
+    let request_b = unregistered_request();
+    let barrier_a = barrier.clone();
+    let a = std::thread::spawn(move || {
+        barrier_a.wait();
+        db_a.admit_unregistered_local_merge_claim(&request_a)
+            .unwrap()
+    });
+    let b = std::thread::spawn(move || {
+        barrier.wait();
+        db_b.admit_unregistered_local_merge_claim(&request_b)
+            .unwrap()
+    });
+
+    let results = [a.join().unwrap(), b.join().unwrap()];
+    assert_eq!(results.iter().filter(|claim| claim.is_some()).count(), 1);
+    let db = Db::open_at(&path).unwrap();
+    assert_eq!(
+        db.observe_merge_claim("/private/adhoc")
+            .unwrap()
+            .unwrap()
+            .generation,
+        1
+    );
+}
+
+#[test]
+fn unregistered_entry_refuses_a_registered_row() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = fixture(&dir.path().join("claims.sqlite"));
+
+    assert!(
+        db.admit_unregistered_local_merge_claim(&request())
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(
+        db.observe_merge_claim(WT).unwrap().unwrap().phase,
+        "unclaimed"
+    );
+}
+
+#[test]
+fn unregistered_entry_refuses_a_remote_row() {
+    let db = Db::open_memory().unwrap();
+    db.enqueue_merge("/private/adhoc", "adhoc", "main").unwrap();
+    let mut request = unregistered_request();
+    request.location = "ssh:host".into();
+
+    let result = db.admit_unregistered_local_merge_claim(&request);
+    assert!(matches!(result, Err(error) if error.to_string().contains("requires a local row")));
+}
+
+#[test]
+fn registered_entry_still_refuses_an_unregistered_row() {
+    let db = Db::open_memory().unwrap();
+    db.enqueue_merge("/private/adhoc", "adhoc", "main").unwrap();
+
+    assert!(
+        db.admit_merge_claim(&unregistered_request())
+            .unwrap()
+            .is_none()
+    );
+}
