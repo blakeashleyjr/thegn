@@ -195,11 +195,19 @@ pub fn write_at(d: &Path, rec: &VpsRecord) -> Result<()> {
     checked_name(&rec.name)?;
     ensure_owned_root(d)?;
     let mut record = rec.clone();
-    if record.owner.is_empty()
-        && let Some(existing) = read_at(d, &record.name)
-        && !existing.owner.is_empty()
-    {
-        record.owner = existing.owner;
+    if record.owner.is_empty() {
+        match read_at(d, &record.name) {
+            Some(existing) if !existing.owner.is_empty() => record.owner = existing.owner,
+            Some(_) => {}
+            None => match std::fs::symlink_metadata(record_path(d, &record.name)) {
+                Ok(_) => anyhow::bail!(
+                    "vps registry: cannot preserve owner for unreadable existing record {}",
+                    record.name
+                ),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error.into()),
+            },
+        }
     }
     let path = record_path(d, &rec.name);
     let counter = TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
@@ -1072,6 +1080,18 @@ mod tests {
         write_at(dir, &rec("tg-a-x1", "ready")).unwrap();
 
         assert_eq!(read_at(dir, "tg-a-x1").unwrap().owner, existing.owner);
+    }
+
+    #[test]
+    fn ownerless_rewrite_refuses_unreadable_existing_record() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        let path = dir.join("tg-a-x1.json");
+        let malformed = b"not json";
+        std::fs::write(&path, malformed).unwrap();
+
+        assert!(write_at(dir, &rec("tg-a-x1", "ready")).is_err());
+        assert_eq!(std::fs::read(path).unwrap(), malformed);
     }
 
     #[test]
