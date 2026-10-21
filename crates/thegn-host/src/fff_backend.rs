@@ -374,10 +374,9 @@ fn grep_collect<T>(
             continue;
         }
         let path = entry.path();
-        let Ok(relative) = path.strip_prefix(root) else {
+        let Ok(relative_path) = path.strip_prefix(root) else {
             continue;
         };
-        let relative = relative.to_string_lossy().replace('\\', "/");
         let Ok(file) = crate::platform::open_read_nonblocking_nofollow(path) else {
             continue;
         };
@@ -389,13 +388,19 @@ fn grep_collect<T>(
             continue;
         }
 
-        for (index, raw_line) in bytes.split(|byte| *byte == b'\n').enumerate() {
-            let line = raw_line.strip_suffix(b"\r").unwrap_or(raw_line);
-            let text = String::from_utf8_lossy(line).into_owned();
-            if matcher.is_match(&text) {
-                hits.push(f(relative.clone(), index as u64 + 1, text));
-                if hits.len() >= limit {
-                    return hits;
+        let mut relative = None;
+        if !bytes.is_empty() {
+            let body = bytes.strip_suffix(b"\n").unwrap_or(&bytes);
+            for (index, raw_line) in body.split(|byte| *byte == b'\n').enumerate() {
+                let line = raw_line.strip_suffix(b"\r").unwrap_or(raw_line);
+                let text = String::from_utf8_lossy(line);
+                if matcher.is_match(&text) {
+                    let relative = relative
+                        .get_or_insert_with(|| relative_path.to_string_lossy().replace('\\', "/"));
+                    hits.push(f(relative.clone(), index as u64 + 1, text.into_owned()));
+                    if hits.len() >= limit {
+                        return hits;
+                    }
                 }
             }
         }
@@ -579,6 +584,19 @@ mod tests {
 
         assert_eq!(regex_grep(root, "hit", 3).len(), 3);
         assert!(regex_grep(root, "(", 10).is_empty());
+    }
+
+    #[test]
+    fn regex_grep_does_not_emit_phantom_line_after_trailing_newline() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        std::fs::write(root.join("trailing.txt"), "needle\n").unwrap();
+
+        assert!(regex_grep(root, r"^$", 10).is_empty());
+        assert_eq!(
+            regex_grep(root, r".*", 10),
+            vec![("trailing.txt".to_string(), 1, "needle".to_string())]
+        );
     }
 
     #[test]
