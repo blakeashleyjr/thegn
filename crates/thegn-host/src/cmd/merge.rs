@@ -607,14 +607,11 @@ fn add_with(
                 Err(error) => return Err(error),
             }
         }
-        if refused > 0 && quiet {
-            anyhow::bail!(
-                "{refused} pipeline worktree(s) refused merge admission: {}",
-                refusal_details.join("; ")
-            );
-        }
         if refused > 0 {
-            anyhow::bail!("{refused} pipeline worktree(s) refused merge admission (see above)");
+            return Err(crate::merge_ops::PipelineWorktreeRefusals {
+                details: refusal_details,
+            }
+            .into());
         }
         return Ok(());
     }
@@ -624,16 +621,38 @@ fn add_with(
     } else {
         worktrees.iter().map(PathBuf::from).collect()
     };
+    let mut refusal_details = Vec::new();
     for wt in paths {
-        let msg = crate::merge_ops::enqueue_worktree_with(cfg, &db, &wt, admin_why)?;
-        let mark = if msg.starts_with("skipped") {
-            "•"
-        } else {
-            "+"
-        };
-        if !quiet {
-            outln!("  {mark} {msg}");
+        match crate::merge_ops::enqueue_worktree_with(cfg, &db, &wt, admin_why) {
+            Ok(msg) => {
+                let mark = if msg.starts_with("skipped") {
+                    "•"
+                } else {
+                    "+"
+                };
+                if !quiet {
+                    outln!("  {mark} {msg}");
+                }
+            }
+            Err(error)
+                if error
+                    .downcast_ref::<thegn_core::pipeline_merge_admission::PipelineMergeRefused>()
+                    .is_some() =>
+            {
+                let wt_name = wt.to_string_lossy();
+                refusal_details.push(format!("{wt_name}: {error}"));
+                if !quiet {
+                    outln!("  ! refused {wt_name}: {error}");
+                }
+            }
+            Err(error) => return Err(error),
         }
+    }
+    if !refusal_details.is_empty() {
+        return Err(crate::merge_ops::PipelineWorktreeRefusals {
+            details: refusal_details,
+        }
+        .into());
     }
     Ok(())
 }
@@ -787,9 +806,12 @@ fn drain(cfg: &Config, all: bool, json: bool) -> Result<()> {
     // chatter from `--all`, the banner, per-branch progress, and the push
     // footer. Previously all of those printed regardless, so `--json` emitted a
     // stream of prose with one JSON object somewhere in the middle.
+    let mut add_refusal_warning = None;
     if all {
-        add_quiet(cfg, Vec::new(), true, json)?;
+        add_refusal_warning =
+            crate::merge_ops::drain_add_result(add_quiet(cfg, Vec::new(), true, json))?;
     }
+    let had_add_refusals = add_refusal_warning.is_some();
     let target = integrate::resolve_target(mq, &root);
     let rows = match rows_for_repo(&root) {
         Ok(rows) => rows,
@@ -814,6 +836,17 @@ fn drain(cfg: &Config, all: bool, json: bool) -> Result<()> {
     if items.is_empty() {
         // The empty path is the one a cron/CI loop hits most often, so it must
         // honour `--json` like every other path rather than printing prose.
+        if let Some(warning) = add_refusal_warning {
+            if json {
+                let mut out = merge_driver::DriveOutcome::default();
+                out.warnings.push(warning);
+                super::emit_json(&drain_json(&target, &out))?;
+            } else {
+                outln!("Warning: {warning}");
+                outln!("Nothing to drain.");
+            }
+            anyhow::bail!("merge drain completed with pipeline worktree refusals");
+        }
         if json {
             return super::emit_json(&drain_json(&target, &merge_driver::DriveOutcome::default()));
         }
@@ -901,6 +934,9 @@ fn drain(cfg: &Config, all: bool, json: bool) -> Result<()> {
             .into_iter()
             .map(|branch| format!("{branch}: claimed by another drain; target update skipped")),
     );
+    if let Some(warning) = add_refusal_warning {
+        out.warnings.push(warning);
+    }
     crate::merge_notify::record_cli_drain(cfg, &db, &steps, &out);
 
     // push mode: converge by pushing the advanced target to origin. Done before
@@ -981,6 +1017,9 @@ fn drain(cfg: &Config, all: bool, json: bool) -> Result<()> {
     }
     if !out.persistence_errors.is_empty() || !out.bookkeeping_failed.is_empty() {
         anyhow::bail!("merge drain partially completed; see the structured outcome above");
+    }
+    if had_add_refusals {
+        anyhow::bail!("merge drain completed with pipeline worktree refusals");
     }
     Ok(())
 }
