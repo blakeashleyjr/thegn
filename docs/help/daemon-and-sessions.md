@@ -21,6 +21,13 @@ not a replay.
 - **Quit and kill** ends the sessions too — the explicit "I'm done"
   option.
 
+`thegn daemon stop` stops every pane daemon this state directory knows about
+(registered current and pre-upgrade daemons, the configured socket, and a live
+legacy socket), skips sockets that belong to another state directory, waits
+for each to stop answering, and exits non-zero naming any that are still
+running. With none running it prints "no thegn pane daemon is running" and
+succeeds.
+
 When the UI exits, in-flight custom git commands and CI refreshes are cancelled.
 Thegn waits up to two seconds for them before exiting; work still running after
 that is logged.
