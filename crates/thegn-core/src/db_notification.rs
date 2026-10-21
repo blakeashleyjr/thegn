@@ -681,38 +681,7 @@ impl Db {
         statuses: &[crate::issue::AgentDispatchStatus],
         limit: usize,
     ) -> Result<(Vec<crate::issue::AgentDispatch>, bool)> {
-        if statuses.is_empty() {
-            return Ok((Vec::new(), false));
-        }
-
-        let status_params = statuses
-            .iter()
-            .map(|status| status.as_str())
-            .collect::<Vec<_>>();
-        let placeholders = (1..=statuses.len())
-            .map(|index| format!("?{index}"))
-            .collect::<Vec<_>>()
-            .join(", ");
-        let limit_placeholder = statuses.len() + 1;
-        let sql = format!(
-            "SELECT {DISPATCH_COLS} FROM agent_dispatches \
-             WHERE status IN ({placeholders}) \
-             ORDER BY dispatched_at_ms ASC, id ASC LIMIT ?{limit_placeholder}"
-        );
-        let fetch_limit = i64::try_from(limit.saturating_add(1)).unwrap_or(i64::MAX);
-        let mut values = status_params
-            .iter()
-            .map(|status| status as &dyn rusqlite::ToSql)
-            .collect::<Vec<_>>();
-        values.push(&fetch_limit);
-        let conn = self.conn();
-        let mut stmt = conn.prepare(&sql)?;
-        let mut rows = stmt
-            .query_map(params_from_iter(values), map_dispatch)?
-            .collect::<rusqlite::Result<Vec<_>>>()?;
-        let truncated = rows.len() > limit;
-        rows.truncate(limit);
-        Ok((rows, truncated))
+        self.dispatches_with_status_ordered(statuses, limit, false)
     }
 
     /// List the newest rows matching the requested statuses, plus whether
@@ -725,6 +694,15 @@ impl Db {
         &self,
         statuses: &[crate::issue::AgentDispatchStatus],
         limit: usize,
+    ) -> Result<(Vec<crate::issue::AgentDispatch>, bool)> {
+        self.dispatches_with_status_ordered(statuses, limit, true)
+    }
+
+    fn dispatches_with_status_ordered(
+        &self,
+        statuses: &[crate::issue::AgentDispatchStatus],
+        limit: usize,
+        newest_first: bool,
     ) -> Result<(Vec<crate::issue::AgentDispatch>, bool)> {
         if statuses.is_empty() {
             return Ok((Vec::new(), false));
@@ -739,10 +717,15 @@ impl Db {
             .collect::<Vec<_>>()
             .join(", ");
         let limit_placeholder = statuses.len() + 1;
+        let ordering = if newest_first {
+            "dispatched_at_ms DESC, id DESC"
+        } else {
+            "dispatched_at_ms ASC, id ASC"
+        };
         let sql = format!(
             "SELECT {DISPATCH_COLS} FROM agent_dispatches \
              WHERE status IN ({placeholders}) \
-             ORDER BY dispatched_at_ms DESC, id DESC LIMIT ?{limit_placeholder}"
+             ORDER BY {ordering} LIMIT ?{limit_placeholder}"
         );
         let fetch_limit = i64::try_from(limit.saturating_add(1)).unwrap_or(i64::MAX);
         let mut values = status_params

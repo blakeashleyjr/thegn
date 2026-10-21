@@ -600,7 +600,7 @@ mod tests {
     #[test]
     fn dispatch_ids_with_validations_lists_existing_rows_newest_first() {
         use crate::issue::NewDispatch;
-        use crate::pipeline_validate::ValidationClass;
+        use crate::store::NotificationStore as _;
 
         let db = db();
         let older = db

@@ -105,6 +105,8 @@ struct Lane {
     approval: ApprovalState,
 }
 
+type GatheredRows = (Vec<AgentDispatch>, BTreeMap<i64, Vec<String>>, bool);
+
 /// Join the roster, git, and the two supervisor ledgers into the facts the
 /// planner consumes.
 ///
@@ -214,7 +216,7 @@ fn gather_rows(
     all: bool,
     active_limit: usize,
     history_limit: usize,
-) -> Result<(Vec<AgentDispatch>, BTreeMap<i64, Vec<String>>, bool)> {
+) -> Result<GatheredRows> {
     if all {
         let rows = db.list_dispatches()?;
         let mut children: BTreeMap<i64, Vec<String>> = BTreeMap::new();
@@ -642,16 +644,32 @@ mod tests {
         let running_first = insert_row(&db, "running-first", None, AgentDispatchStatus::Running);
         let running_second = insert_row(&db, "running-second", None, AgentDispatchStatus::Running);
         let done_first = insert_row(&db, "done-first", None, AgentDispatchStatus::Done);
-        let done_second = insert_row(&db, "done-second", None, AgentDispatchStatus::Done);
-        let done_third = insert_row(&db, "done-third", None, AgentDispatchStatus::Done);
+        insert_row(&db, "done-second", None, AgentDispatchStatus::Done);
+        insert_row(&db, "done-third", None, AgentDispatchStatus::Done);
         let failed = insert_row(&db, "failed", None, AgentDispatchStatus::Failed);
+
+        let all_rows = db.list_dispatches().unwrap();
+        let mut expected = all_rows
+            .iter()
+            .filter(|row| row.status == AgentDispatchStatus::Running)
+            .map(|row| (row.dispatched_at_ms, row.id))
+            .collect::<Vec<_>>();
+        let mut done = all_rows
+            .iter()
+            .filter(|row| row.status == AgentDispatchStatus::Done)
+            .map(|row| (row.dispatched_at_ms, row.id))
+            .collect::<Vec<_>>();
+        done.sort_unstable_by(|left, right| right.cmp(left));
+        expected.extend(done.into_iter().take(2));
+        expected.sort_unstable_by(|left, right| right.cmp(left));
+        let expected = expected.into_iter().map(|(_, id)| id).collect::<Vec<_>>();
 
         let (limited, children, truncated) = gather_rows(&db, false, 10, 2).unwrap();
         assert!(truncated);
         assert!(children.is_empty());
         assert_eq!(
             limited.iter().map(|row| row.id).collect::<Vec<_>>(),
-            vec![done_third, done_second, running_second, running_first]
+            expected
         );
 
         let (complete_window, children, truncated) = gather_rows(&db, false, 10, 10).unwrap();
