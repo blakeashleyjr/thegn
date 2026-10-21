@@ -821,7 +821,7 @@ pub(crate) fn drive_queue(
                     vars: &vars,
                     timeout_secs: cfg.agent_timeout_secs,
                     sandbox,
-                    credential_free: false,
+                    credential_free: true,
                 });
 
                 // The exit code decides nothing — the next refresh does, exactly
