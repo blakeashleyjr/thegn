@@ -1272,6 +1272,11 @@ mod tests {
             .db
             .update_pr_status(&row.key, PrqStatus::BlockedCi.as_str(), None, None, None)
             .unwrap();
+        // The live-lease fence blocks this refresh write.
+        assert_eq!(
+            handoff.db.list_pr_queue().unwrap()[0].status,
+            PrqStatus::AgentRunning.as_str()
+        );
 
         consider(&handoff, false);
 
