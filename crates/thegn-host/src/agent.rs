@@ -250,6 +250,8 @@ pub struct SandboxOutcome {
     /// of environment preparation so route-credential installation cannot
     /// accidentally re-resolve a different host/config after bring-up.
     pub route_ssh_target: Option<SshTarget>,
+    /// Proof that this launch passed the isolation-floor admission.
+    pub(crate) admission: crate::sandbox_admission::Admission,
 }
 
 /// Actual startup/publication/fallback decision used below, after the existing
@@ -478,6 +480,15 @@ pub fn prepare_sandbox_env(
             &mut warnings,
         )?
     {
+        // `can_honor_sandbox` only admits this provider for Off or SharedKernel
+        // floors, and devcontainers are SharedKernel.
+        let admission = crate::sandbox_admission::admit(
+            &sb,
+            thegn_core::capabilities::IsolationClass::SharedKernel,
+            worktree,
+            force_host_requested(worktree),
+            &mut warnings,
+        )?;
         return Ok(SandboxOutcome {
             spec: None,
             backend_label: "devcontainer".to_string(),
@@ -488,6 +499,7 @@ pub fn prepare_sandbox_env(
             location: None,
             degraded_from_provider: false,
             route_ssh_target: None,
+            admission,
         });
     }
     // Selection dropped: the user asked for a non-default env that isn't defined
@@ -680,7 +692,7 @@ pub fn prepare_sandbox_env(
                 if spec.placement.is_local() {
                     break;
                 }
-                crate::sandbox_admission::admit(
+                let admission = crate::sandbox_admission::admit(
                     &sb,
                     spec.capabilities().isolation,
                     worktree,
@@ -708,6 +720,7 @@ pub fn prepare_sandbox_env(
                     location,
                     degraded_from_provider,
                     route_ssh_target,
+                    admission,
                 });
             }
             if let Some(expected) = explicit_backend
@@ -755,35 +768,24 @@ pub fn prepare_sandbox_env(
             // enter (after the runtime degrade `finalize_*` just applied) against
             // the demanded floor. A fail-closed miss must abort BEFORE anything
             // spawns on the host — so this sits ahead of `attach_vpn`/`ensure`.
-            let floor = candidate_floor_in_force(&sb, worktree);
-            if floor != thegn_core::config::IsolationFloor::Off {
-                let actual = spec.capabilities().isolation;
-                match thegn_core::sandbox_floor::decide(
-                    floor,
-                    thegn_core::sandbox_floor::miss_policy_in_force(&sb),
-                    actual,
-                    actual,
-                ) {
-                    thegn_core::sandbox_floor::FloorDecision::Ok
-                    | thegn_core::sandbox_floor::FloorDecision::BypassProvider => {}
-                    thegn_core::sandbox_floor::FloorDecision::Degrade(m) => {
-                        // Fail-safe: launch, flag it, and warn (the existing
-                        // degraded-flag + warning path).
-                        thegn_core::msg::warn(&format!("{} for {worktree}", m.message()));
-                        warnings.push(m.message());
+            let admission = match crate::sandbox_admission::admit_candidate(
+                &sb,
+                candidate_floor_in_force(&sb, worktree),
+                spec.capabilities().isolation,
+                worktree,
+                &mut warnings,
+            ) {
+                crate::sandbox_admission::CandidateAdmission::Admitted(admission) => admission,
+                crate::sandbox_admission::CandidateAdmission::Miss(miss) => {
+                    // Fail-closed. On an explicit pick, refuse now; otherwise
+                    // remember the miss and try a stronger candidate.
+                    if explicit_choice {
+                        anyhow::bail!("{} for {worktree}", miss.refusal());
                     }
-                    thegn_core::sandbox_floor::FloorDecision::Fail(m) => {
-                        // Fail-closed. On an explicit pick, refuse now; otherwise
-                        // remember the miss and try a stronger candidate — only if
-                        // none meets the floor does the end-of-loop halt fire.
-                        if explicit_choice {
-                            anyhow::bail!("{} for {worktree}", m.refusal());
-                        }
-                        floor_miss = Some(m);
-                        continue;
-                    }
+                    floor_miss = Some(miss);
+                    continue;
                 }
-            }
+            };
             // THE-215: a sealed launch must hide the host $HOME. Fail closed on a
             // backend/config that would expose it — same doctrine as the floor.
             if let Some(m) = thegn_core::sandbox_floor::home_gate(&spec) {
@@ -919,6 +921,7 @@ pub fn prepare_sandbox_env(
                         location,
                         degraded_from_provider,
                         route_ssh_target,
+                        admission,
                     });
                 }
                 Err(e) => {
@@ -1097,7 +1100,7 @@ pub fn prepare_sandbox_env(
     }
     // No runnable candidate remains. Admission must compare the actual host
     // fallback even when no earlier candidate reached the floor check at all.
-    crate::sandbox_admission::admit(
+    let admission = crate::sandbox_admission::admit(
         &sb,
         thegn_core::capabilities::IsolationClass::HostProcess,
         worktree,
@@ -1156,6 +1159,7 @@ pub fn prepare_sandbox_env(
         location,
         degraded_from_provider,
         route_ssh_target,
+        admission,
     })
 }
 
@@ -3853,6 +3857,11 @@ pub fn compose_spec(
         }
         None => sb.backend_label.clone(),
     };
+    tracing::debug!(
+        class = sb.admission.class().as_str(),
+        enforcement = sb.admission.enforcement().as_str(),
+        "sandbox admission"
+    );
     Ok(LaunchSpec {
         argv,
         cwd,
