@@ -6,6 +6,7 @@
 //! smuggle machine definitions or credentials in.
 
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 use crate::config::{
     Config, EnvConfig, EnvSshConfig, PlacementMode, RemoteTransport, config_enum, config_warn,
@@ -19,6 +20,9 @@ use crate::store::HostStore;
 /// Default probe TTL: a `Ready` host older than this re-verifies (one cheap
 /// batched exec on a warm ControlMaster) before the fast path trusts it.
 pub const DEFAULT_PROBE_TTL_SECS: i64 = 900;
+
+/// Maximum encoded length for a persisted host alias.
+pub const HOST_ALIAS_MAX_BYTES: usize = 128;
 
 config_enum! {
     /// `[host.<n>] reach` — how thegn reaches this host.
@@ -111,6 +115,95 @@ pub fn same_host_authority(a: &HostConfig, b: &HostConfig) -> bool {
                 && a.cloud.api_key_env == b.cloud.api_key_env
         }
     }
+}
+
+/// Validate the single-segment name used to identify a persisted host.
+pub fn validate_host_alias(name: &str) -> Result<(), String> {
+    if name.is_empty() || name.len() > HOST_ALIAS_MAX_BYTES {
+        return Err(format!(
+            "host alias {name:?} must be 1..={HOST_ALIAS_MAX_BYTES} bytes"
+        ));
+    }
+    if name == "local" {
+        return Err("host alias \"local\" is reserved for the local host".into());
+    }
+    if !name
+        .bytes()
+        .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
+        || !name.as_bytes()[0].is_ascii_alphanumeric()
+        || !name.as_bytes()[name.len() - 1].is_ascii_alphanumeric()
+    {
+        return Err(format!(
+            "host alias {name:?} must contain only lowercase ASCII letters, digits, or hyphens and begin and end with a letter or digit"
+        ));
+    }
+    Ok(())
+}
+
+/// Stable SHA-256 digest of exactly the connection authority compared by
+/// [`same_host_authority`]. Provisioning preferences and display settings are
+/// deliberately excluded.
+pub fn host_authority_digest(hc: &HostConfig) -> String {
+    let encoded = match hc.reach {
+        HostReach::Ssh => serde_json::to_vec(&(
+            hc.reach.as_str(),
+            &hc.ssh.host,
+            hc.ssh.port,
+            &hc.ssh.transport,
+            &hc.ssh.ssh_config,
+            &hc.ssh.jump_host,
+            &hc.ssh.identity,
+            &hc.ssh.extra_args,
+        )),
+        HostReach::Iroh => serde_json::to_vec(&(
+            hc.reach.as_str(),
+            &hc.iroh.ticket,
+            &hc.iroh.user,
+            hc.iroh.ssh_port,
+        )),
+        HostReach::Cloud => serde_json::to_vec(&(
+            hc.reach.as_str(),
+            &hc.cloud.provider,
+            &hc.cloud.api_base,
+            &hc.cloud.template,
+            &hc.cloud.api_key_env,
+        )),
+        HostReach::Local => serde_json::to_vec(&(hc.reach.as_str(),)),
+    }
+    .expect("host authority serializes");
+    let mut digest = Sha256::new();
+    digest.update(b"thegn-host-authority-v1\0");
+    digest.update(encoded);
+    format!("{:x}", digest.finalize())
+}
+
+/// Select a stable, collision-resistant alias for a host authority.
+pub fn default_host_alias(
+    derived: &str,
+    hc: &HostConfig,
+    db_defs: &[(String, HostConfig)],
+    config_only: &dyn Fn(&str) -> bool,
+) -> Result<String, String> {
+    if let Some((alias, _)) = db_defs.iter().find(|(_, def)| same_host_authority(def, hc)) {
+        validate_host_alias(alias)
+            .map_err(|error| format!("{error}; pass --name to choose a valid alias"))?;
+        return Ok(alias.clone());
+    }
+    let db_taken = |name: &str| db_defs.iter().any(|(stored, _)| stored == name);
+    let alias = if !db_taken(derived) && !config_only(derived) {
+        derived.to_string()
+    } else {
+        let digest = host_authority_digest(hc);
+        format!("{derived}-{}", &digest[..12])
+    };
+    validate_host_alias(&alias)
+        .map_err(|error| format!("{error}; pass --name to choose a valid alias"))?;
+    if db_taken(&alias) || config_only(&alias) {
+        return Err(format!(
+            "host alias {alias:?} is already taken; pass --name to choose another alias"
+        ));
+    }
+    Ok(alias)
 }
 
 /// `[host.<n>.iroh]` — a NAT'd host behind a dumbpipe listener.
@@ -354,7 +447,7 @@ pub fn parse_host_target(
             },
             ..HostConfig::default()
         };
-        let name = format!("iroh-{}", crate::util::short_hash(ticket, 6));
+        let name = format!("iroh-{}", &host_authority_digest(&hc)[..32]);
         return Ok((name, hc));
     }
     // user@host[:port]
@@ -953,6 +1046,164 @@ mod tests {
     }
 
     #[test]
+    fn host_alias_validator_rejects_malformed() {
+        for invalid in ["", "-a", "a-", "A", "a_b", "a.b", "local"] {
+            assert!(
+                validate_host_alias(invalid).is_err(),
+                "accepted {invalid:?}"
+            );
+        }
+        assert!(validate_host_alias(&"a".repeat(HOST_ALIAS_MAX_BYTES + 1)).is_err());
+        assert!(validate_host_alias(&"a".repeat(HOST_ALIAS_MAX_BYTES)).is_ok());
+        for valid in ["a", "gpu-internal", "a-1b2c3d4e5f6a"] {
+            assert!(validate_host_alias(valid).is_ok(), "rejected {valid:?}");
+        }
+    }
+
+    #[test]
+    fn host_alias_default_suffixes_an_occupied_slug() {
+        let (first_name, first) = parse_host_target("me@a.b", None).unwrap();
+        let (second_name, second) = parse_host_target("me@a-b", None).unwrap();
+        assert_eq!(first_name, "a-b");
+        assert_eq!(second_name, "a-b");
+        let defs = vec![(first_name.clone(), first.clone())];
+        assert_eq!(
+            default_host_alias(&first_name, &first, &defs, &|_| false).unwrap(),
+            "a-b"
+        );
+        let resolved = default_host_alias(&second_name, &second, &defs, &|_| false).unwrap();
+        assert!(resolved.starts_with("a-b-"));
+        assert_eq!(
+            resolved,
+            format!("a-b-{}", &host_authority_digest(&second)[..12])
+        );
+        assert_eq!(resolved.len(), "a-b-".len() + 12);
+        assert!(
+            resolved["a-b-".len()..]
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+        );
+        let both_defs = vec![(first_name, first), (resolved.clone(), second.clone())];
+        assert_eq!(
+            default_host_alias(&second_name, &second, &both_defs, &|_| false).unwrap(),
+            resolved
+        );
+    }
+
+    #[test]
+    fn host_alias_default_reuses_an_existing_authority() {
+        let (_, hc) = parse_host_target("me@gpu.internal", None).unwrap();
+        let defs = vec![("gpu".to_string(), hc.clone())];
+        assert_eq!(
+            default_host_alias("gpu-internal", &hc, &defs, &|_| false).unwrap(),
+            "gpu"
+        );
+        let malformed_legacy = vec![("Bad_Name".to_string(), hc.clone())];
+        assert!(
+            default_host_alias("gpu-internal", &hc, &malformed_legacy, &|_| false)
+                .is_err_and(|error| error.contains("--name"))
+        );
+    }
+
+    #[test]
+    fn host_alias_default_uses_a_free_slug() {
+        let (_, hc) = parse_host_target("me@free.example", None).unwrap();
+        assert_eq!(
+            default_host_alias("free-example", &hc, &[], &|_| false).unwrap(),
+            "free-example"
+        );
+    }
+
+    #[test]
+    fn host_alias_config_only_name_gets_suffix() {
+        let (_, hc) = parse_host_target("me@example.test", None).unwrap();
+        let resolved =
+            default_host_alias("example-test", &hc, &[], &|name| name == "example-test").unwrap();
+        assert!(resolved.starts_with("example-test-"));
+        assert_eq!(resolved.len(), "example-test-".len() + 12);
+    }
+
+    #[test]
+    fn host_alias_suffix_collision_and_overlong_default_refuse() {
+        let (_, hc) = parse_host_target("me@example.test", None).unwrap();
+        let suffix = format!("example-test-{}", &host_authority_digest(&hc)[..12]);
+        let defs = vec![(suffix.clone(), HostConfig::default())];
+        assert!(
+            default_host_alias("example-test", &hc, &defs, &|_| false)
+                .is_err_and(|error| error.contains("--name"))
+        );
+        assert!(
+            default_host_alias("example-test", &hc, &[], &|name| name == suffix.as_str())
+                .is_err_and(|error| error.contains("--name"))
+        );
+        assert!(
+            default_host_alias(&"a".repeat(HOST_ALIAS_MAX_BYTES), &hc, &[], &|_| false)
+                .is_err_and(|error| error.contains("--name"))
+        );
+    }
+
+    #[test]
+    fn host_alias_iroh_digest_is_full_strength() {
+        let (name, first) = parse_host_target("dumbpipe:ticket-one", Some("me")).unwrap();
+        let (other_name, other) = parse_host_target("dumbpipe:ticket-two", Some("me")).unwrap();
+        assert!(name.starts_with("iroh-"));
+        assert_eq!(name.len(), "iroh-".len() + 32);
+        assert_eq!(
+            name,
+            format!("iroh-{}", &host_authority_digest(&first)[..32])
+        );
+        assert!(
+            name["iroh-".len()..]
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+        );
+        assert_ne!(name, other_name);
+        assert_eq!(host_authority_digest(&first).len(), 64);
+        let mut same_authority_with_different_preferences = first.clone();
+        same_authority_with_different_preferences.image = "updated-image".into();
+        assert!(same_host_authority(
+            &first,
+            &same_authority_with_different_preferences
+        ));
+        assert_eq!(
+            host_authority_digest(&first),
+            host_authority_digest(&same_authority_with_different_preferences)
+        );
+        let changed_port = HostConfig {
+            iroh: HostIrohConfig {
+                ssh_port: first.iroh.ssh_port + 1,
+                ..first.iroh.clone()
+            },
+            ..first.clone()
+        };
+        assert!(!same_host_authority(&first, &changed_port));
+        assert_ne!(
+            host_authority_digest(&first),
+            host_authority_digest(&changed_port)
+        );
+        let (_, ssh) = parse_host_target("me@digest.example", None).unwrap();
+        let changed_ssh_port = HostConfig {
+            ssh: crate::config::EnvSshConfig {
+                port: ssh.ssh.port + 1,
+                ..ssh.ssh.clone()
+            },
+            ..ssh.clone()
+        };
+        assert!(!same_host_authority(&ssh, &changed_ssh_port));
+        assert_ne!(
+            host_authority_digest(&ssh),
+            host_authority_digest(&changed_ssh_port)
+        );
+        let mut ssh_same_authority = ssh.clone();
+        ssh_same_authority.image = "different-image".into();
+        assert!(same_host_authority(&ssh, &ssh_same_authority));
+        assert_eq!(
+            host_authority_digest(&ssh),
+            host_authority_digest(&ssh_same_authority)
+        );
+    }
+
+    #[test]
     fn host_authority_comparison_covers_each_reach() {
         use crate::config::RemoteTransport;
 
@@ -965,6 +1216,12 @@ mod tests {
             ..HostConfig::default()
         };
         assert!(same_host_authority(&ssh, &ssh));
+        let mut ssh_same_authority = ssh.clone();
+        ssh_same_authority.image = "other-image".into();
+        assert_eq!(
+            host_authority_digest(&ssh),
+            host_authority_digest(&ssh_same_authority)
+        );
         for changed in [
             HostConfig {
                 ssh: crate::config::EnvSshConfig {
@@ -1036,6 +1293,12 @@ mod tests {
             ..HostConfig::default()
         };
         assert!(same_host_authority(&iroh, &iroh));
+        let mut iroh_same_authority = iroh.clone();
+        iroh_same_authority.image = "other-image".into();
+        assert_eq!(
+            host_authority_digest(&iroh),
+            host_authority_digest(&iroh_same_authority)
+        );
         for changed in [
             HostConfig {
                 iroh: HostIrohConfig {
@@ -1073,6 +1336,12 @@ mod tests {
             ..HostConfig::default()
         };
         assert!(same_host_authority(&cloud, &cloud));
+        let mut cloud_same_authority = cloud.clone();
+        cloud_same_authority.image = "other-image".into();
+        assert_eq!(
+            host_authority_digest(&cloud),
+            host_authority_digest(&cloud_same_authority)
+        );
         for changed in [
             HostConfig {
                 cloud: HostCloudConfig {
@@ -1111,6 +1380,12 @@ mod tests {
             ..HostConfig::default()
         };
         assert!(same_host_authority(&local, &local));
+        let mut local_same_authority = local.clone();
+        local_same_authority.image = "other-image".into();
+        assert_eq!(
+            host_authority_digest(&local),
+            host_authority_digest(&local_same_authority)
+        );
         assert!(same_host_authority(
             &local,
             &HostConfig {

@@ -199,8 +199,12 @@ fn add(
 ) -> Result<()> {
     use thegn_core::host_config::{InstallConsent, parse_host_target};
     let (derived, mut hc) = parse_host_target(target, user).map_err(|e| anyhow::anyhow!(e))?;
-    let name = name.unwrap_or(&derived);
-    if cfg.host.contains_key(name) && !is_db_host(name) {
+    let db = Db::open()?;
+    let db_defs = db.host_defs()?;
+    let name = resolve_add_name(name, &derived, &hc, replace, &db_defs, &|candidate| {
+        cfg.host.contains_key(candidate) && !db_defs.iter().any(|(stored, _)| stored == candidate)
+    })?;
+    if cfg.host.contains_key(&name) && !db_defs.iter().any(|(stored, _)| stored == &name) {
         anyhow::bail!(
             "[host.{name}] is defined in config.toml — edit it there (config shadows DB hosts)"
         );
@@ -210,19 +214,18 @@ fn add(
     if let Some(img) = image {
         hc.image = img.to_string();
     }
-    let db = Db::open()?;
     if replace {
         use thegn_core::store::PlacementStore;
         // This short guard can race with a placement admitted before the
         // replace transaction starts; the transaction still clears atomically.
-        let tenants = db.tenants_of(&thegn_core::host::HostId::named(name))?;
+        let tenants = db.tenants_of(&thegn_core::host::HostId::named(&name))?;
         if !tenants.is_empty() {
             anyhow::bail!(
                 "cannot replace host {name}: it has {} live placement tenant(s)",
                 tenants.len()
             );
         }
-        if db.put_host_def_replacing(name, &hc, now())? {
+        if db.put_host_def_replacing(&name, &hc, now())? {
             outln!(
                 "host {name} replaced ({}) — it is now a selectable env; provision with \
                  `thegn host provision {name}` or just open a worktree on it",
@@ -236,7 +239,7 @@ fn add(
             );
         }
     } else {
-        db.put_host_def(name, &hc, now())?;
+        db.put_host_def(&name, &hc, now())?;
         outln!(
             "host {name} added ({}) — it is now a selectable env; provision with \
              `thegn host provision {name}` or just open a worktree on it",
@@ -244,6 +247,27 @@ fn add(
         );
     }
     Ok(())
+}
+
+fn resolve_add_name(
+    explicit: Option<&str>,
+    derived: &str,
+    hc: &thegn_core::host_config::HostConfig,
+    replace: bool,
+    db_defs: &[(String, thegn_core::host_config::HostConfig)],
+    config_only: &dyn Fn(&str) -> bool,
+) -> Result<String> {
+    use thegn_core::host_config::{default_host_alias, validate_host_alias};
+
+    if let Some(name) = explicit {
+        validate_host_alias(name).map_err(anyhow::Error::msg)?;
+        return Ok(name.to_string());
+    }
+    if replace {
+        validate_host_alias(derived).map_err(anyhow::Error::msg)?;
+        return Ok(derived.to_string());
+    }
+    default_host_alias(derived, hc, db_defs, config_only).map_err(anyhow::Error::msg)
 }
 
 /// Whether `name` came from the DB (merge inserts it into cfg.host, so the
@@ -652,14 +676,25 @@ fn promote_candidate(
     let (derived, mut hc) = cand.to_host_config();
     hc.install_runtime =
         InstallConsent::from_str_validated(install).map_err(|e| anyhow::anyhow!(e))?;
-    let name = name_override.unwrap_or(derived.as_str());
-    if cfg.host.contains_key(name) && !is_db_host(name) {
+    let db = Db::open()?;
+    let db_defs = db.host_defs()?;
+    let name = resolve_add_name(
+        name_override,
+        &derived,
+        &hc,
+        false,
+        &db_defs,
+        &|candidate| {
+            cfg.host.contains_key(candidate)
+                && !db_defs.iter().any(|(stored, _)| stored == candidate)
+        },
+    )?;
+    if cfg.host.contains_key(&name) && !db_defs.iter().any(|(stored, _)| stored == &name) {
         anyhow::bail!(
             "[host.{name}] is defined in config.toml — edit it there (config shadows DB hosts)"
         );
     }
-    let db = Db::open()?;
-    db.put_host_def(name, &hc, now())?;
+    db.put_host_def(&name, &hc, now())?;
     let node = if cand.node_id.is_empty() {
         "unknown".to_string()
     } else {
@@ -690,6 +725,21 @@ mod tests {
     fn add_accepts_replace_flag() {
         let cli = Cli::try_parse_from(["t", "add", "me@box", "--replace"]).unwrap();
         assert!(matches!(cli.action, Action::Add { replace: true, .. }));
+    }
+
+    #[test]
+    fn host_add_alias_explicit_name_is_validated() {
+        let (_, hc) = thegn_core::host_config::parse_host_target("me@box", None).unwrap();
+        assert!(resolve_add_name(Some("Bad_Name"), "box", &hc, false, &[], &|_| false).is_err());
+        assert_eq!(
+            resolve_add_name(Some("gpu-internal"), "box", &hc, false, &[], &|_| false).unwrap(),
+            "gpu-internal"
+        );
+        let occupied = vec![("box".to_string(), hc.clone())];
+        assert_eq!(
+            resolve_add_name(None, "box", &hc, true, &occupied, &|_| false).unwrap(),
+            "box"
+        );
     }
 
     #[test]
