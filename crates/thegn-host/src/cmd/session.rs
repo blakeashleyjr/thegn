@@ -951,6 +951,30 @@ fn resolve_branch(wt: &str) -> String {
     crate::worktree_snapshot::current_branch(Path::new(wt)).unwrap_or_default()
 }
 
+fn stage_dispatch_env(
+    cfg: &Config,
+    agent_name: &str,
+    stage_name: &str,
+    row_id: i64,
+) -> Result<Vec<(String, String)>> {
+    let config_digest =
+        thegn_core::pipeline_launch_digest::stage_launch_digest(cfg, agent_name, stage_name)
+            .map_err(anyhow::Error::msg)?;
+    let launch = crate::daemon::stage_launch::mint_launch_id()
+        .ok_or_else(|| anyhow::anyhow!("no entropy for a stage launch id"))?;
+    Ok(vec![
+        (
+            thegn_core::issue::DISPATCH_ROW_ENV.into(),
+            row_id.to_string(),
+        ),
+        (crate::daemon::stage_launch::STAGE_LAUNCH_ENV.into(), launch),
+        (
+            thegn_core::pipeline_launch_digest::STAGE_CONFIG_DIGEST_ENV.into(),
+            config_digest,
+        ),
+    ])
+}
+
 /// The `--stage` dispatch: the Lead's hand-rolled loop, performed in one call
 /// (design §3 item 3). The order of operations is deliberate — the roster row
 /// goes in **before** the session opens (D5: a crash between the two leaves a
@@ -1108,11 +1132,7 @@ async fn open_stage(cfg: &Config, client: &ControlClient, d: StageDispatch<'_>) 
         // behavior for an unknown override. This is deliberately after claim:
         // resolution failures belong to the named failed roster row.
         crate::daemon::agent_open::ensure_configured_agent(cfg, &agent_name)?;
-        let config_digest =
-            thegn_core::pipeline_launch_digest::stage_launch_digest(cfg, &agent_name, &stage.name)
-                .map_err(anyhow::Error::msg)?;
-        let launch = crate::daemon::stage_launch::mint_launch_id()
-            .ok_or_else(|| anyhow::anyhow!("no entropy for a stage launch id"))?;
+        let env = stage_dispatch_env(cfg, &agent_name, &stage.name, row_id)?;
         let vars = stage_task_vars(
             &facts,
             &branch,
@@ -1127,17 +1147,7 @@ async fn open_stage(cfg: &Config, client: &ControlClient, d: StageDispatch<'_>) 
             automation_origin: None,
             argv: Vec::new(),
             cwd: None,
-            env: vec![
-                (
-                    thegn_core::issue::DISPATCH_ROW_ENV.into(),
-                    row_id.to_string(),
-                ),
-                (crate::daemon::stage_launch::STAGE_LAUNCH_ENV.into(), launch),
-                (
-                    thegn_core::pipeline_launch_digest::STAGE_CONFIG_DIGEST_ENV.into(),
-                    config_digest,
-                ),
-            ],
+            env,
             rows: 24,
             cols: 80,
             worktree: Some(wt.clone()),
@@ -1608,19 +1618,12 @@ async fn resume_work(
     // 7. Open — the same headless, stage-layered launch a fresh dispatch
     //    builds, seeded with the finisher prompt instead of the bare task.
     let opened = async {
-        let launch = crate::daemon::stage_launch::mint_launch_id()
-            .ok_or_else(|| anyhow::anyhow!("no entropy for a stage launch id"))?;
+        let env = stage_dispatch_env(cfg, &agent_name, &stage.name, new_row)?;
         let spec = OpenSpec {
             automation_origin: None,
             argv: Vec::new(),
             cwd: None,
-            env: vec![
-                (
-                    thegn_core::issue::DISPATCH_ROW_ENV.into(),
-                    new_row.to_string(),
-                ),
-                (crate::daemon::stage_launch::STAGE_LAUNCH_ENV.into(), launch),
-            ],
+            env,
             rows: 24,
             cols: 80,
             worktree: Some(wt.clone()),
@@ -1939,6 +1942,45 @@ mod open_stage_tests {
         assert_eq!(
             out,
             "work THE-76: the query is { issues { nodes { name } } } and {literal} too"
+        );
+    }
+
+    #[test]
+    fn stage_dispatch_env_carries_row_launch_id_and_digest() {
+        let cfg = cfg_with_stage();
+        let env = super::stage_dispatch_env(&cfg, "claude", "code", 42).expect("dispatch env");
+        assert_eq!(env.len(), 3);
+        assert!(
+            env.iter().any(|(key, value)| {
+                key == thegn_core::issue::DISPATCH_ROW_ENV && value == "42"
+            })
+        );
+        let spec = thegn_svc::control::OpenSpec {
+            env: env.clone(),
+            ..Default::default()
+        };
+        assert!(matches!(
+            crate::daemon::stage_launch::launch_id_of(&spec),
+            Some(Ok(_))
+        ));
+        let digest = env
+            .iter()
+            .find(|(key, _)| key == thegn_core::pipeline_launch_digest::STAGE_CONFIG_DIGEST_ENV)
+            .map(|(_, value)| value.as_str());
+        let expected =
+            thegn_core::pipeline_launch_digest::stage_launch_digest(&cfg, "claude", "code")
+                .expect("expected digest");
+        assert_eq!(digest, Some(expected.as_str()));
+    }
+
+    #[test]
+    fn stage_dispatch_env_refuses_an_unknown_stage() {
+        let error = super::stage_dispatch_env(&cfg_with_stage(), "claude", "missing", 42)
+            .expect_err("unknown stage refuses");
+        assert!(
+            error
+                .to_string()
+                .contains("unknown pipeline stage `missing`")
         );
     }
 }
