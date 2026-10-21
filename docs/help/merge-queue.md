@@ -206,9 +206,9 @@ drain time the branch's tip is bundle-fetched into the target store
 before it folds. A branch whose host is unreachable is **deferred** (with
 the reason), never silently dropped, and retried on the next drain.
 
-The tip is streamed into private local storage in a bundle capped at 4 GiB and
-bounded by the drain's subprocess deadline. A size, timeout, producer, storage,
-or validation failure defers the row with the reason.
+A tip from another host is streamed into private local storage in a bundle
+capped at 4 GiB and bounded by the drain's subprocess deadline. A size,
+timeout, producer, storage, or validation failure defers the row with the reason.
 
 Run the drain **where the target repo lives**. If you invoke it from a
 machine other than the target's host, thegn tells you which host to run
