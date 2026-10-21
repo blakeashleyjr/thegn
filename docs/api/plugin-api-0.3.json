@@ -239,6 +239,13 @@
           "type": "string"
         },
         {
+          "description": "Reserved vocabulary: a plugin-backed debugger adapter (DAP) provider. Accepted by the wire, negotiated unsupported until the host's debug seam can bridge plugin adapters.",
+          "enum": [
+            "DebugAdapter"
+          ],
+          "type": "string"
+        },
+        {
           "additionalProperties": false,
           "properties": {
             "Unknown": {
@@ -914,6 +921,16 @@
       "owner": "no dynamic forge provider selector",
       "required_capability": "surface:provider",
       "since": "0.2.0",
+      "state": "reserved"
+    },
+    {
+      "cadences": [],
+      "callbacks": [],
+      "extension_point": "DebugAdapter",
+      "modes": [],
+      "owner": "THE-102",
+      "required_capability": "surface:debug",
+      "since": "0.3.0",
       "state": "reserved"
     }
   ],
