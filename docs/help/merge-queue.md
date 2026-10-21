@@ -72,6 +72,10 @@ refuse with the reason; use `thegn land` to land that branch outside the queue.
   drain finishes.
 - An unrecognised stored queue status is shown as such and has no land or
   retry key.
+- `thegn land` and `thegn integrate` can finish a land while an active drain
+  claims the row, but they do not record the landed row and report that it was
+  not recorded.
+- Deleting a worktree keeps its queue row while an active drain has claimed it.
 
 ## Land strategy, signing, drivers
 

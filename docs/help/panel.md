@@ -133,8 +133,9 @@ those workflows.
 ### changes — the working diff
 
 The working diff, hunk by hunk, for the focused worktree. Binary and
-mode-only changes say so instead of showing hunks. `↵` on a file opens
-line-level **staging** at every width; at Normal width it widens to Half,
+mode-only changes say so instead of showing hunks. If git cannot produce a
+file's diff, the preview says `diff unavailable (git failed)`. `↵` on a file
+opens line-level **staging** at every width; at Normal width it widens to Half,
 and Esc retracts that drill. At Half, the inline preview follows the cursor.
 `space` stages, and `e` cycles panel width. Untracked files preview as all
 additions and are intent-added (`add -N`) only on the first stage. In staging,
