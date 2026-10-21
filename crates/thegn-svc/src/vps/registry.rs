@@ -10,8 +10,8 @@
 //! the host (attach bridge, reaper) read it — and every create/destroy flows
 //! through the provider, so no call site can forget the bookkeeping.
 //! Count-and-reserve is serialised by a lock file, and unreadable records count as occupied.
+//! Reads, listing and the lock are resolved through the held registry root.
 
-use std::fs::OpenOptions;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 
@@ -171,10 +171,6 @@ fn valid_dns_label(label: &str) -> bool {
             .all(|byte| byte.is_ascii_alphanumeric() || *byte == b'-')
 }
 
-fn record_path(d: &Path, name: &str) -> PathBuf {
-    d.join(format!("{name}.json"))
-}
-
 fn open_root(d: &Path, create: bool) -> Result<Option<thegn_core::fsperm::PrivateDir>> {
     if create {
         thegn_core::fsperm::ensure_private_dir(d)
@@ -224,16 +220,15 @@ pub fn write_at(d: &Path, rec: &VpsRecord) -> Result<()> {
     })?;
     let mut record = rec.clone();
     if record.owner.is_empty() {
-        match read_at(d, &record.name) {
+        match read_in(&root, &record.name) {
             Some(existing) if !existing.owner.is_empty() => record.owner = existing.owner,
             Some(_) => {}
-            None => match std::fs::symlink_metadata(record_path(d, &record.name)) {
-                Ok(_) => anyhow::bail!(
+            None => match record_exists_in(&root, &record.name)? {
+                true => anyhow::bail!(
                     "vps registry: cannot preserve owner for unreadable existing record {}",
                     record.name
                 ),
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                Err(error) => return Err(error.into()),
+                false => {}
             },
         }
     }
@@ -247,16 +242,15 @@ pub fn write(rec: &VpsRecord) -> Result<()> {
     write_at(&dir(), rec)
 }
 
-fn occupied_at(d: &Path, scope: ReserveScope) -> Result<usize> {
-    let entries = match std::fs::read_dir(d) {
-        Ok(entries) => entries,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(0),
-        Err(error) => return Err(error.into()),
-    };
+fn record_exists_in(root: &thegn_core::fsperm::PrivateDir, name: &str) -> Result<bool> {
+    root.entry_exists_nofollow(&format!("{name}.json"))
+        .map_err(Into::into)
+}
+
+fn occupied_at(root: &thegn_core::fsperm::PrivateDir, scope: ReserveScope) -> Result<usize> {
+    let entries = root.file_names()?;
     let mut occupied = 0;
-    for entry in entries {
-        let entry = entry?;
-        let file_name = entry.file_name();
+    for file_name in entries {
         if Path::new(&file_name)
             .extension()
             .is_none_or(|extension| extension != "json")
@@ -268,15 +262,9 @@ fn occupied_at(d: &Path, scope: ReserveScope) -> Result<usize> {
             .and_then(|stem| stem.to_str());
         let other_provider = match scope {
             ReserveScope::All => false,
-            ReserveScope::Provider(provider) => {
-                let parsed = thegn_core::fsperm::open_regular_file_nofollow(&entry.path())
-                    .and_then(|mut file| {
-                        let mut bytes = Vec::new();
-                        file.read_to_end(&mut bytes)?;
-                        Ok(serde_json::from_slice::<VpsRecord>(&bytes))
-                    });
-                matches!(parsed, Ok(Ok(record)) if stem.is_some_and(|name| checked_name(name).is_ok()) && Some(record.name.as_str()) == stem && record.provider != provider)
-            }
+            ReserveScope::Provider(provider) => stem
+                .and_then(|name| read_in(root, name))
+                .is_some_and(|record| record.provider != provider),
         };
         if !other_provider {
             occupied += 1;
@@ -292,59 +280,41 @@ pub fn reserve_at(
     scope: ReserveScope,
 ) -> std::result::Result<(), ReserveError> {
     checked_name(&rec.name).map_err(ReserveError::Store)?;
-    open_root(d, true)
+    let root = open_root(d, true)
         .map_err(ReserveError::Store)?
         .ok_or_else(|| {
             ReserveError::Store(anyhow::anyhow!(
                 "vps registry: registry root was not opened after creation"
             ))
         })?;
-    let lock_path = d.join(RESERVE_LOCK);
-    match std::fs::symlink_metadata(&lock_path) {
-        Ok(metadata) if !metadata.file_type().is_file() => {
-            return Err(ReserveError::Store(anyhow::anyhow!(
-                "vps registry: reservation lock is not a regular file"
-            )));
-        }
-        Ok(_) => {}
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-        Err(error) => return Err(ReserveError::Store(error.into())),
-    }
-    // The metadata check rejects an existing symlink; open can still follow a
-    // symlink swapped in between this check and the open. The owned registry
-    // root limits that race to an actor able to mutate this private directory.
-    let lock = OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create(true)
-        .truncate(false)
-        .open(&lock_path)
+    let lock = root
+        .open_or_create_regular_nofollow(RESERVE_LOCK)
         .map_err(anyhow::Error::from)
         .map_err(ReserveError::Store)?;
     lock.lock()
         .map_err(anyhow::Error::from)
         .map_err(ReserveError::Store)?;
     if !rec.owner.is_empty() {
-        match read_at(d, &rec.name) {
+        match read_in(&root, &rec.name) {
             Some(existing) if !existing.owner.is_empty() && existing.owner != rec.owner => {
                 return Err(ReserveError::OwnedByOther {
                     name: rec.name.clone(),
                 });
             }
             Some(_) => {}
-            None => match std::fs::symlink_metadata(record_path(d, &rec.name)) {
-                Ok(_) => {
+            None => match record_exists_in(&root, &rec.name) {
+                Ok(true) => {
                     return Err(ReserveError::Store(anyhow::anyhow!(
                         "vps registry: cannot verify owner for existing record {}",
                         rec.name
                     )));
                 }
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                Err(error) => return Err(ReserveError::Store(error.into())),
+                Ok(false) => {}
+                Err(error) => return Err(ReserveError::Store(error)),
             },
         }
     }
-    let occupied = occupied_at(d, scope).map_err(ReserveError::Store)?;
+    let occupied = occupied_at(&root, scope).map_err(ReserveError::Store)?;
     if occupied >= cap {
         return Err(ReserveError::AtCap { occupied, cap });
     }
@@ -366,7 +336,10 @@ pub fn worktree_owner(worktree: &[u8]) -> String {
 
 pub fn check_owner_at(d: &Path, name: &str, owner: &str) -> Result<()> {
     checked_name(name)?;
-    let record = read_at(d, name);
+    let Some(root) = open_root(d, false)? else {
+        return Ok(());
+    };
+    let record = read_in(&root, name);
     if let Some(record) = record.as_ref()
         && !record.owner.is_empty()
         && record.owner != owner
@@ -378,22 +351,8 @@ pub fn check_owner_at(d: &Path, name: &str, owner: &str) -> Result<()> {
     if record.is_some() {
         return Ok(());
     }
-    match std::fs::symlink_metadata(d) {
-        Ok(metadata)
-            if metadata.file_type().is_symlink()
-                || !metadata.is_dir()
-                || !thegn_core::fsperm::owned_by_current_user(&metadata) =>
-        {
-            anyhow::bail!("vps registry: registry root is not an owned real directory")
-        }
-        Ok(_) => {}
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-        Err(error) => return Err(error.into()),
-    }
-    match std::fs::symlink_metadata(record_path(d, name)) {
-        Ok(_) => anyhow::bail!("vps registry: cannot verify owner for existing record {name}"),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-        Err(error) => return Err(error.into()),
+    if record_exists_in(&root, name)? {
+        anyhow::bail!("vps registry: cannot verify owner for existing record {name}");
     }
     Ok(())
 }
@@ -412,11 +371,13 @@ pub fn reserve(
 
 pub fn read_at(d: &Path, name: &str) -> Option<VpsRecord> {
     checked_name(name).ok()?;
-    let root = std::fs::symlink_metadata(d).ok()?;
-    if root.file_type().is_symlink() || !root.is_dir() {
-        return None;
-    }
-    let mut file = thegn_core::fsperm::open_regular_file_nofollow(&record_path(d, name)).ok()?;
+    let root = open_root(d, false).ok()??;
+    read_in(&root, name)
+}
+
+fn read_in(root: &thegn_core::fsperm::PrivateDir, name: &str) -> Option<VpsRecord> {
+    checked_name(name).ok()?;
+    let mut file = root.open_regular_nofollow(&format!("{name}.json")).ok()?;
     let mut bytes = Vec::new();
     file.read_to_end(&mut bytes).ok()?;
     let rec: VpsRecord = serde_json::from_slice(&bytes).ok()?;
@@ -467,70 +428,54 @@ pub fn remove(name: &str) {
 
 /// Lenient view for display; reapers use `list_checked`.
 pub fn list_at(d: &Path) -> Vec<VpsRecord> {
-    let Ok(entries) = std::fs::read_dir(d) else {
+    let Ok(Some(root)) = open_root(d, false) else {
         return Vec::new();
     };
-    entries
-        .flatten()
-        .filter(|e| e.path().extension().is_some_and(|x| x == "json"))
-        .filter_map(|e| {
-            let path = e.path();
-            let stem = path.file_stem()?.to_str()?;
-            checked_name(stem).ok()?;
-            let mut file = thegn_core::fsperm::open_regular_file_nofollow(&path).ok()?;
-            let mut bytes = Vec::new();
-            file.read_to_end(&mut bytes).ok()?;
-            let rec: VpsRecord = serde_json::from_slice(&bytes).ok()?;
-            (rec.name == stem && checked_name(&rec.name).is_ok()).then_some(rec)
-        })
-        .collect()
+    records_in(&root).map_or_else(|_| Vec::new(), |(records, _)| records)
 }
 
-/// Strict ledger view for lifecycle decisions. A root or directory traversal
-/// error invalidates the complete view; individual malformed records are named.
-pub fn list_checked_at(d: &Path) -> Result<LedgerView> {
-    let metadata = match std::fs::symlink_metadata(d) {
-        Ok(metadata) => metadata,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            return Ok(LedgerView::default());
-        }
-        Err(error) => return Err(error).context("vps registry: could not inspect registry root"),
-    };
-    anyhow::ensure!(
-        !metadata.file_type().is_symlink()
-            && metadata.is_dir()
-            && thegn_core::fsperm::owned_by_current_user(&metadata),
-        "vps registry: registry root is not an owned real directory; refusing to list the ledger"
-    );
-
-    let entries =
-        std::fs::read_dir(d).context("vps registry: could not read registry directory")?;
-    let mut view = LedgerView::default();
-    for entry in entries {
-        let entry = entry.context("vps registry: could not read registry directory entry")?;
-        let path = entry.path();
-        if path.extension().is_none_or(|extension| extension != "json") {
+fn records_in(root: &thegn_core::fsperm::PrivateDir) -> Result<(Vec<VpsRecord>, Vec<String>)> {
+    let mut records = Vec::new();
+    let mut unreadable = Vec::new();
+    for file_name in root.file_names()? {
+        if Path::new(&file_name)
+            .extension()
+            .is_none_or(|extension| extension != "json")
+        {
             continue;
         }
-        let Some(stem) = path.file_stem().and_then(|stem| stem.to_str()) else {
+        let Some(stem) = Path::new(&file_name)
+            .file_stem()
+            .and_then(|stem| stem.to_str())
+        else {
             continue;
         };
         if checked_name(stem).is_err() {
             continue;
         }
-        let record = (|| -> Option<VpsRecord> {
-            let mut file = thegn_core::fsperm::open_regular_file_nofollow(&path).ok()?;
-            let mut bytes = Vec::new();
-            file.read_to_end(&mut bytes).ok()?;
-            let record: VpsRecord = serde_json::from_slice(&bytes).ok()?;
-            (record.name == stem).then_some(record)
-        })();
-        match record {
-            Some(record) => view.records.push(record),
-            None => view.unreadable.push(stem.to_owned()),
+        match read_in(root, stem) {
+            Some(record) => records.push(record),
+            None => unreadable.push(stem.to_owned()),
         }
     }
-    Ok(view)
+    Ok((records, unreadable))
+}
+
+/// Strict ledger view for lifecycle decisions. A root or directory traversal
+/// error invalidates the complete view; individual malformed records are named.
+pub fn list_checked_at(d: &Path) -> Result<LedgerView> {
+    let Some(root) = open_root(d, false).context(
+        "vps registry: registry root is not an owned real directory; refusing to list the ledger",
+    )?
+    else {
+        return Ok(LedgerView::default());
+    };
+    let (records, unreadable) =
+        records_in(&root).context("vps registry: could not read registry directory")?;
+    Ok(LedgerView {
+        records,
+        unreadable,
+    })
 }
 
 pub fn list_checked() -> Result<LedgerView> {
@@ -1201,5 +1146,52 @@ mod tests {
 
         assert!(!d.join("a.json").exists());
         assert!(!known_hosts.join("a").exists());
+    }
+
+    #[test]
+    fn reads_and_listing_stay_on_the_held_root_after_a_swap() {
+        let tmp = tempfile::tempdir().unwrap();
+        let d = tmp.path().join("vps");
+        write_at(&d, &rec("a", "ready")).unwrap();
+        let root = open_root(&d, false).unwrap().unwrap();
+        let moved = tmp.path().join("moved");
+        std::fs::rename(&d, &moved).unwrap();
+        write_at(&d, &rec("b", "ready")).unwrap();
+
+        assert_eq!(read_in(&root, "a"), Some(rec("a", "ready")));
+        assert!(read_in(&root, "b").is_none());
+        let (records, unreadable) = records_in(&root).unwrap();
+        assert_eq!(records, vec![rec("a", "ready")]);
+        assert!(unreadable.is_empty());
+    }
+
+    #[test]
+    fn reserve_lock_is_created_owner_only_beneath_the_registry_root() {
+        let tmp = tempfile::tempdir().unwrap();
+        let d = tmp.path().join("vps");
+
+        reserve_at(&d, &rec("a", "creating"), 1, ReserveScope::All).unwrap();
+
+        assert!(
+            thegn_core::fsperm::mode_bits(&d.join(RESERVE_LOCK))
+                .unwrap()
+                .is_none_or(|mode| mode & 0o777 == 0o600)
+        );
+    }
+
+    #[test]
+    fn occupied_count_skips_the_lock_and_counts_unreadable_records() {
+        let tmp = tempfile::tempdir().unwrap();
+        let d = tmp.path().join("vps");
+        write_at(&d, &rec("ready", "ready")).unwrap();
+        std::fs::write(d.join("bad.json"), b"not json").unwrap();
+
+        assert!(matches!(
+            reserve_at(&d, &rec("new", "creating"), 2, ReserveScope::All),
+            Err(ReserveError::AtCap {
+                occupied: 2,
+                cap: 2
+            })
+        ));
     }
 }
