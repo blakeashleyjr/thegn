@@ -76,6 +76,56 @@ fn one_event(properties: &str) -> String {
 }
 
 #[test]
+fn transp_transparent_parses_as_free() {
+    let input = one_event("UID:x\nDTSTART;VALUE=DATE:20261012\nTRANSP:TRANSPARENT");
+    let (events, report) = parse_report(&input);
+    assert_eq!(events[0].busy, Busy::Free);
+    assert!(report.diagnostics().is_empty());
+    assert_legacy_matches(&input, &events);
+}
+
+#[test]
+fn transp_lowercase_and_padded_values_are_accepted() {
+    let input = one_event("UID:x\nDTSTART;VALUE=DATE:20261012\nTRANSP: transparent ");
+    let (events, report) = parse_report(&input);
+    assert_eq!(events[0].busy, Busy::Free);
+    assert!(report.diagnostics().is_empty());
+}
+
+#[test]
+fn transp_invalid_value_is_diagnosed_and_stays_busy() {
+    let input = one_event("UID:x\nDTSTART;VALUE=DATE:20261012\nTRANSP:MAYBE");
+    let (events, report) = parse_report(&input);
+    assert_eq!(events[0].busy, Busy::Busy);
+    assert!(report.diagnostics().contains(&IcsDiagnostic::InvalidEvent));
+}
+
+// Positive control: RFC 5545's absent default and explicit OPAQUE are busy.
+#[test]
+fn transp_opaque_and_absent_are_busy() {
+    for properties in [
+        "UID:opaque\nDTSTART;VALUE=DATE:20261012\nTRANSP:OPAQUE",
+        "UID:absent\nDTSTART;VALUE=DATE:20261012",
+    ] {
+        let (events, report) = parse_report(&one_event(properties));
+        assert_eq!(events[0].busy, Busy::Busy);
+        assert!(report.diagnostics().is_empty());
+    }
+}
+
+#[test]
+fn transp_duplicate_is_reported_as_a_duplicate_property() {
+    let input = one_event("UID:x\nDTSTART;VALUE=DATE:20261012\nTRANSP:TRANSPARENT\nTRANSP:OPAQUE");
+    let (events, report) = parse_report(&input);
+    assert_eq!(events[0].busy, Busy::Busy);
+    assert!(
+        report
+            .diagnostics()
+            .contains(&IcsDiagnostic::DuplicateProperty("TRANSP"))
+    );
+}
+
+#[test]
 fn clean_calendar_has_no_diagnostics_and_preserves_legacy_events() {
     let input = one_event("UID:x\nDTSTART;VALUE=DATE:20261012\nSUMMARY:feed");
     let (events, report) = parse_report(&input);
