@@ -2412,6 +2412,7 @@ fn doctor_json_with_health_and_overrides_and_legacy(
             "path": path.display().to_string(),
             "reason": reason,
         })).collect::<Vec<_>>(),
+        "host_execution": thegn_core::gate::host_execution_json(),
         "managed_tools": managed_tools_json(cfg),
         "mcp_servers": mcp_servers_json(cfg),
         "network": network_json(cfg),
@@ -2877,6 +2878,10 @@ pub fn run(
     sandbox_report(cfg);
     outln!("");
     compiler_cache_report(cfg, &config_path, cli_overrides);
+    outln!("");
+    for line in thegn_core::gate::host_execution_lines() {
+        outln!("{line}");
+    }
 
     outln!("");
     devcontainer_report(cfg);
