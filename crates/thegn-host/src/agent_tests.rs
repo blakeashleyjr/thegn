@@ -1230,6 +1230,9 @@ fn compose_spec_propagates_volume_refusal_without_host_fallback() {
         location: None,
         degraded_from_provider: false,
         route_ssh_target: None,
+        admission: crate::sandbox_admission::Admission::for_test(
+            thegn_core::capabilities::IsolationClass::SharedKernel,
+        ),
     };
     let error = compose_spec(
         &cfg,
@@ -1671,6 +1674,9 @@ fn compose_spec_host_fallback_is_login_shell() {
         location: None,
         degraded_from_provider: false,
         route_ssh_target: None,
+        admission: crate::sandbox_admission::Admission::for_test(
+            thegn_core::capabilities::IsolationClass::HostProcess,
+        ),
     };
     let spec = compose_spec(
         &cfg,
@@ -1750,6 +1756,9 @@ fn invalidated_devcontainer_exec_refuses_before_invoking_a_host_shell() {
             location: None,
             degraded_from_provider: false,
             route_ssh_target: None,
+            admission: crate::sandbox_admission::Admission::for_test(
+                thegn_core::capabilities::IsolationClass::SharedKernel,
+            ),
         };
         let error = compose_spec(
             &cfg,
@@ -1919,6 +1928,9 @@ fn compose_spec_clean_shell_choice_uses_rc_free_shell() {
         location: None,
         degraded_from_provider: false,
         route_ssh_target: None,
+        admission: crate::sandbox_admission::Admission::for_test(
+            thegn_core::capabilities::IsolationClass::HostProcess,
+        ),
     };
     let spec = compose_spec(
         &cfg,
