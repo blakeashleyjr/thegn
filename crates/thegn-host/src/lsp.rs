@@ -691,6 +691,9 @@ impl LspInner {
         released
     }
 
+    /// Applies epochs in order, retiring changed or disabled slots, including
+    /// negative-cache entries. Subprocess teardown happens off-loop.
+    /// Returns the number of released slots.
     pub(crate) fn reconfigure(
         &self,
         epoch: u64,
@@ -3348,7 +3351,7 @@ mod tests {
         let rust = inner
             .client_with(Path::new("/r"), "rust", live_fake_client)
             .unwrap();
-        inner
+        let python = inner
             .client_with(Path::new("/r"), "python", live_fake_client)
             .unwrap();
         let python_config = thegn_core::config::LspServerConfig {
@@ -3378,7 +3381,8 @@ mod tests {
             )
             .unwrap();
         assert_eq!(starts.load(Ordering::SeqCst), 1);
-        assert!(restarted_python.generation() > 1);
+        assert!(restarted_python.generation() > python.generation());
+        assert!(!Arc::ptr_eq(&python, &restarted_python));
     }
 
     #[test]
