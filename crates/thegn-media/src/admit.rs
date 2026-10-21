@@ -55,10 +55,13 @@ impl MediaBackend for Admitted {
     }
     fn playlists(&self) -> BoxFuture<'_, Result<Vec<Playlist>, MediaError>> {
         Box::pin(async move {
-            self.0
-                .playlists()
-                .await
-                .map(|items| items.into_iter().filter_map(Playlist::admitted).collect())
+            self.0.playlists().await.map(|items| {
+                items
+                    .into_iter()
+                    .take(model::MAX_PLAYLISTS)
+                    .filter_map(Playlist::admitted)
+                    .collect()
+            })
         })
     }
     fn activate_playlist<'a>(&'a self, id: &'a str) -> BoxFuture<'a, Result<(), MediaError>> {
@@ -135,6 +138,7 @@ impl MediaBackend for Admitted {
             let names = self.0.players().await?;
             Ok(names
                 .into_iter()
+                .take(model::MAX_PLAYERS)
                 .filter(|name| model::is_valid_opaque_id(name))
                 .collect())
         })
@@ -150,6 +154,7 @@ mod tests {
     struct Fake {
         calls: std::sync::Arc<Mutex<Vec<String>>>,
         items: Mutex<Vec<QueueItem>>,
+        playlists: Vec<Playlist>,
         caps: MediaCaps,
         players: Result<Vec<String>, MediaError>,
     }
@@ -183,7 +188,7 @@ mod tests {
             Box::pin(async { Ok(()) })
         }
         fn playlists(&self) -> BoxFuture<'_, Result<Vec<Playlist>, MediaError>> {
-            Box::pin(async { Ok(Vec::new()) })
+            Box::pin(async move { Ok(self.playlists.clone()) })
         }
         fn activate_playlist<'a>(&'a self, id: &'a str) -> BoxFuture<'a, Result<(), MediaError>> {
             self.calls.lock().unwrap().push(id.to_owned());
@@ -239,6 +244,7 @@ mod tests {
         let client: MediaClient = Box::new(Fake {
             calls: calls.clone(),
             items: Mutex::new(items),
+            playlists: Vec::new(),
             caps: MediaCaps {
                 queue: true,
                 signals: true,
@@ -307,6 +313,40 @@ mod tests {
         let page = admitted.queue_page().await.unwrap();
         assert_eq!(page.items.len(), model::MAX_QUEUE_ITEMS);
         assert_eq!(page.total, model::MAX_QUEUE_ITEMS + 1);
+    }
+
+    #[tokio::test]
+    async fn playlists_and_players_are_capped_at_ingress() {
+        let playlists = (0..model::MAX_PLAYLISTS + 3)
+            .map(|index| Playlist {
+                id: format!("pl-{index}"),
+                name: format!("Playlist {index}"),
+            })
+            .collect();
+        let players = Ok((0..model::MAX_PLAYERS + 3)
+            .map(|index| format!("player-{index}"))
+            .collect());
+        let calls = std::sync::Arc::new(Mutex::new(Vec::new()));
+        let client: MediaClient = Box::new(Fake {
+            calls: calls.clone(),
+            items: Mutex::new(Vec::new()),
+            playlists,
+            caps: MediaCaps::default(),
+            players,
+        });
+        let admitted = Admitted(client);
+
+        let playlists = admitted.playlists().await.unwrap();
+        assert_eq!(playlists.len(), model::MAX_PLAYLISTS);
+        assert_eq!(
+            playlists.first().map(|playlist| playlist.id.as_str()),
+            Some("pl-0")
+        );
+        assert_eq!(
+            playlists.last().map(|playlist| playlist.id.clone()),
+            Some(format!("pl-{}", model::MAX_PLAYLISTS - 1))
+        );
+        assert_eq!(admitted.players().await.unwrap().len(), model::MAX_PLAYERS);
     }
 
     #[tokio::test]
