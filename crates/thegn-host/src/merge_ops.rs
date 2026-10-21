@@ -23,6 +23,34 @@ use thegn_svc::git::{CliGit, GitBackend, PlumbingOps};
 
 use crate::{integrate, merge_driver};
 
+#[derive(Debug)]
+pub(crate) struct PipelineWorktreeRefusals {
+    pub(crate) details: Vec<String>,
+}
+
+impl fmt::Display for PipelineWorktreeRefusals {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "{} pipeline worktree(s) refused merge admission: {}",
+            self.details.len(),
+            self.details.join("; ")
+        )
+    }
+}
+
+impl std::error::Error for PipelineWorktreeRefusals {}
+
+pub(crate) fn drain_add_result(result: Result<()>) -> Result<Option<String>> {
+    match result {
+        Ok(()) => Ok(None),
+        Err(error) if error.downcast_ref::<PipelineWorktreeRefusals>().is_some() => {
+            Ok(Some(error.to_string()))
+        }
+        Err(error) => Err(error),
+    }
+}
+
 /// The branch a worktree is currently on (`None` when detached).
 pub fn branch_of(worktree: &Path) -> Option<String> {
     util::git_out(worktree, &["symbolic-ref", "--quiet", "--short", "HEAD"])
@@ -540,6 +568,20 @@ pub fn clear_repo(cfg: &Config, db: &Db, root: &Path) -> Result<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn drain_add_continues_after_pipeline_refusals_but_propagates_other_errors() {
+        let refusal: Result<()> = Err(PipelineWorktreeRefusals {
+            details: vec!["branch-a: pipeline row 12 refused".to_string()],
+        }
+        .into());
+        let warning = drain_add_result(refusal).unwrap().unwrap();
+        assert!(warning.contains("branch-a"));
+
+        let other_error = anyhow::anyhow!("database unavailable");
+        let result = drain_add_result(Err(other_error));
+        assert!(matches!(result, Err(error) if error.to_string().contains("database unavailable")));
+    }
 
     fn land_row(
         status: &str,

@@ -858,19 +858,20 @@ mod tests {
     fn merge_admission_refuses_a_failed_gate_attestation() {
         let (_repo_dir, repo_path) = repo();
         let (db, id, cfg, _log_dir, logs) = pipeline_setup(&repo_path);
-        assert!(matches!(
-            gate_row(
-                &db,
-                &cfg,
-                id,
-                &logs,
-                &|_, _, _| Ok(GateVerdict::Failed {
+        let failed = gate_row(
+            &db,
+            &cfg,
+            id,
+            &logs,
+            &|_, _, _| {
+                Ok(GateVerdict::Failed {
                     log: "fixture failure".to_string(),
-                }),
-                &|| 100,
-            ),
-            Err(_)
-        ));
+                })
+            },
+            &|| 100,
+        )
+        .unwrap();
+        assert_eq!(failed.outcome, GateOutcome::Failed);
         finish_pipeline_row(&db, id);
         let candidate = git(&repo_path, &["rev-parse", "HEAD"]);
         let result =

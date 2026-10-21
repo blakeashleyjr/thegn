@@ -48,11 +48,19 @@ pub struct PipelineMergeRefused {
 
 impl fmt::Display for PipelineMergeRefused {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(
-            f,
-            "merge admission refused for {}: pipeline row {} {}; run `thegn dispatch gate {}` on the committed HEAD, or `thegn merge add <worktree> --admin --why '<reason>'`",
-            self.worktree, self.row, self.reason, self.row
-        )
+        if self.reason.contains("thegn dispatch gate") {
+            write!(
+                f,
+                "merge admission refused for {}: pipeline row {} {}; or override with `thegn merge add <worktree> --admin --why '<reason>'`",
+                self.worktree, self.row, self.reason
+            )
+        } else {
+            write!(
+                f,
+                "merge admission refused for {}: pipeline row {} {}; run `thegn dispatch gate {}` on the committed HEAD, or `thegn merge add <worktree> --admin --why '<reason>'`",
+                self.worktree, self.row, self.reason, self.row
+            )
+        }
     }
 }
 
@@ -153,6 +161,18 @@ mod tests {
         };
         let text = refusal.to_string();
         assert!(text.contains("thegn dispatch gate 42"));
+        assert!(text.contains("--admin --why"));
+    }
+
+    #[test]
+    fn pipeline_merge_refusal_prints_gate_hint_once() {
+        let refusal = super::PipelineMergeRefused {
+            worktree: "/wt/a".to_string(),
+            row: 42,
+            reason: "latest gate attestation did not pass (failed); run `thegn dispatch gate 42` on the committed HEAD".to_string(),
+        };
+        let text = refusal.to_string();
+        assert_eq!(text.matches("thegn dispatch gate 42").count(), 1);
         assert!(text.contains("--admin --why"));
     }
 }
