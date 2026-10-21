@@ -975,7 +975,7 @@ fn git_worktree_registration(root: &Path, path: &Path) -> Option<bool> {
     let cancel = std::sync::atomic::AtomicBool::new(false);
     let outcome = crate::git_run::git_run(
         root,
-        util::WORKTREE_LIST_Z,
+        &util::WORKTREE_LIST_Z,
         &crate::git_run::GitPolicy::read(worktree_git_deadline()),
         &cancel,
     );
@@ -1526,7 +1526,7 @@ mod tests {
         let repo = temp_repo("no-retry");
         let started = std::time::Instant::now();
         let err = git_destructive(&repo, &["branch", "-D", "nope"]).unwrap_err();
-        assert!(err.contains("nope"), "git's own reason is kept: {err}");
+        assert!(err.to_string().contains("nope"), "git's own reason is kept: {err}");
         assert!(started.elapsed() < std::time::Duration::from_millis(300));
         let _ = std::fs::remove_dir_all(&repo);
     }
