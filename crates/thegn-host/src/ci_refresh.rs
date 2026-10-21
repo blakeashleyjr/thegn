@@ -432,8 +432,24 @@ pub(crate) fn daemon_ci_cache_usable(
     ttl_secs: u64,
 ) -> bool {
     ci_cache_is_fresh(Some(fetched_at), now, ttl_secs)
-        && current_branch
-            .is_some_and(|branch| !branch.is_empty() && branch != "HEAD" && cached_branch == branch)
+        && thegn_core::ci::cache_branch_matches(cached_branch, current_branch)
+}
+
+/// Whether a cached row can suppress the local refresh for the current
+/// branch. An unverifiable branch keeps the historical age-only behavior.
+pub(crate) fn cache_row_current(
+    fetched_at: Option<i64>,
+    cached_branch: Option<&str>,
+    current_branch: Option<&str>,
+    now: i64,
+    ttl_secs: u64,
+) -> bool {
+    ci_cache_is_fresh(fetched_at, now, ttl_secs)
+        && match current_branch.filter(|branch| !branch.is_empty() && *branch != "HEAD") {
+            None => true,
+            Some(branch) => cached_branch
+                .is_some_and(|cached| thegn_core::ci::cache_branch_matches(cached, Some(branch))),
+        }
 }
 
 // --- fetch health: the panel note + failure backoff ------------------------
@@ -744,8 +760,25 @@ fn refresh_ci_cache_for(
     let key = thegn_core::remote::GitLoc::worktree_cache_key(host_path);
     let now = thegn_core::util::now();
     if !force {
-        let fetched_at = db.get_ci_cache(&key).ok().flatten().map(|(_, at)| at);
-        if ci_cache_is_fresh(fetched_at, now, cfg.ttl_secs) || backoff_active(&key, now) {
+        let cached = db.get_ci_cache_entry(&key).ok().flatten();
+        let current_branch = if cached.as_ref().is_some_and(|(_, _, fetched_at)| {
+            ci_cache_is_fresh(Some(*fetched_at), now, cfg.ttl_secs)
+        }) && !loc.is_remote()
+        {
+            crate::git_handle::get().current_branch(loc).ok()
+        } else {
+            None
+        };
+        let row_is_current = cached.as_ref().is_some_and(|(_, branch, fetched_at)| {
+            cache_row_current(
+                Some(*fetched_at),
+                Some(branch),
+                current_branch.as_deref(),
+                now,
+                cfg.ttl_secs,
+            )
+        });
+        if row_is_current || backoff_active(&key, now) {
             return false;
         }
     }
@@ -1598,6 +1631,27 @@ mod tests {
         assert!(!daemon_ci_cache_usable("main", None, 100, 120, 30));
         assert!(!daemon_ci_cache_usable("", Some(""), 100, 120, 30));
         assert!(!daemon_ci_cache_usable("HEAD", Some("HEAD"), 100, 120, 30));
+    }
+
+    #[test]
+    fn branch_switch_makes_a_fresh_row_stale() {
+        assert!(!cache_row_current(Some(100), Some("b"), Some("a"), 120, 30));
+        assert!(cache_row_current(Some(100), Some("a"), Some("a"), 120, 30));
+        assert!(!cache_row_current(Some(100), Some(""), Some("a"), 120, 30));
+    }
+
+    #[test]
+    fn unknown_or_detached_branch_keeps_age_only_freshness() {
+        for current_branch in [None, Some("HEAD"), Some("")] {
+            assert_eq!(
+                cache_row_current(Some(100), Some("b"), current_branch, 120, 30),
+                ci_cache_is_fresh(Some(100), 120, 30)
+            );
+            assert_eq!(
+                cache_row_current(Some(100), Some("b"), current_branch, 131, 30),
+                ci_cache_is_fresh(Some(100), 131, 30)
+            );
+        }
     }
 
     #[test]

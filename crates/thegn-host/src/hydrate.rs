@@ -3361,24 +3361,31 @@ pub(crate) fn build_panel(
     // The CI run-history cache feeds the `Ci` section rollup (AV group), with
     // its fetch age (the summary's "Ns ago" stamp) and any fetch-health note.
     let mut discarded_cached_ci_rows = 0;
-    if let Ok(Some((json, fetched_at))) = db.get_ci_cache(&cache_key)
-        && let Some(mut cache) = thegn_core::ci::decode_run_cache(&json)
-    {
-        cache.runs.retain(|run| {
-            let valid = thegn_svc::ci::validate_ci_id(&run.id).is_ok();
-            if !valid {
-                discarded_cached_ci_rows += 1;
-            }
-            valid
-        });
-        discarded_cached_ci_rows += cache.discarded_rows;
-        panel.ci_runs = cache.runs;
-        panel.ci_fetched_at = Some(fetched_at);
+    let mut foreign_ci_note = None;
+    if let Ok(Some((json, cached_branch, fetched_at))) = db.get_ci_cache_entry(&cache_key) {
+        foreign_ci_note = thegn_core::ci::foreign_cache_note(&cached_branch, &panel.branch);
+        if foreign_ci_note.is_none()
+            && let Some(mut cache) = thegn_core::ci::decode_run_cache(&json)
+        {
+            cache.runs.retain(|run| {
+                let valid = thegn_svc::ci::validate_ci_id(&run.id).is_ok();
+                if !valid {
+                    discarded_cached_ci_rows += 1;
+                }
+                valid
+            });
+            discarded_cached_ci_rows += cache.discarded_rows;
+            panel.ci_runs = cache.runs;
+            panel.ci_fetched_at = Some(fetched_at);
+        }
     }
-    panel.ci_note = crate::ci_refresh::note_for(&cache_key).or_else(|| {
-        (discarded_cached_ci_rows > 0)
-            .then(|| format!("omitted {discarded_cached_ci_rows} malformed cached CI run row(s)"))
-    });
+    panel.ci_note = crate::ci_refresh::note_for(&cache_key)
+        .or_else(|| {
+            (discarded_cached_ci_rows > 0).then(|| {
+                format!("omitted {discarded_cached_ci_rows} malformed cached CI run row(s)")
+            })
+        })
+        .or(foreign_ci_note);
     // A cache row fetched for a *different* branch (the fetcher queries the
     // branch that was checked out at fetch time) must not read as current
     // right after a branch switch — say so until the next refresh lands.

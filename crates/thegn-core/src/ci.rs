@@ -142,6 +142,27 @@ pub fn decode_run_cache(json: &str) -> Option<CiRunCache> {
     serde_json::from_value(value).ok()
 }
 
+/// Whether a cached CI run row belongs to the current, known branch.
+/// Empty legacy values and detached or unknown branch identities never match.
+pub fn cache_branch_matches(cached_branch: &str, current_branch: Option<&str>) -> bool {
+    current_branch
+        .is_some_and(|branch| !branch.is_empty() && branch != "HEAD" && cached_branch == branch)
+}
+
+/// A panel note for a cache row known to belong to a different branch.
+/// Unknown current branches remain unverifiable, so callers keep their current
+/// display behavior in that case.
+pub fn foreign_cache_note(cached_branch: &str, current_branch: &str) -> Option<String> {
+    if current_branch.is_empty() || current_branch == "HEAD" || cached_branch == current_branch {
+        return None;
+    }
+    Some(if cached_branch.is_empty() {
+        "CI cache branch is unknown; refresh pending (g)".into()
+    } else {
+        format!("CI cache is for branch '{cached_branch}'; refresh pending (g)")
+    })
+}
+
 impl CiRun {
     /// Seconds the run took (finished) or has been running (started only),
     /// measured against `now` epoch seconds. Mirrors [`crate::forge::model::CheckRun::duration_secs`].
@@ -638,6 +659,32 @@ mod tests {
         let legacy = decode_run_cache("[]").unwrap();
         assert!(legacy.runs.is_empty());
         assert_eq!(legacy.discarded_rows, 0);
+    }
+
+    #[test]
+    fn cache_branch_matches_requires_a_known_equal_branch() {
+        assert!(cache_branch_matches("main", Some("main")));
+        assert!(!cache_branch_matches("other", Some("main")));
+        assert!(!cache_branch_matches("", Some("main")));
+        assert!(!cache_branch_matches("main", None));
+        assert!(!cache_branch_matches("", Some("")));
+        assert!(!cache_branch_matches("HEAD", Some("HEAD")));
+        assert!(!cache_branch_matches("Main", Some("main")));
+    }
+
+    #[test]
+    fn foreign_cache_note_names_the_cached_branch() {
+        assert_eq!(
+            foreign_cache_note("b", "a").as_deref(),
+            Some("CI cache is for branch 'b'; refresh pending (g)")
+        );
+        assert_eq!(
+            foreign_cache_note("", "a").as_deref(),
+            Some("CI cache branch is unknown; refresh pending (g)")
+        );
+        assert_eq!(foreign_cache_note("a", "a"), None);
+        assert_eq!(foreign_cache_note("b", ""), None);
+        assert_eq!(foreign_cache_note("b", "HEAD"), None);
     }
 
     #[test]
