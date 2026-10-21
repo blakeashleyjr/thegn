@@ -395,8 +395,6 @@ fn broader_policy_bounds_hostile_review_payload_before_launch() {
 
 #[test]
 fn launch_verdicts_map_to_typed_handoff_results() {
-    use crate::agent_run::AgentRunVerdict;
-
     let fixture = Fixture::new();
     let queue = PrQueueConfig {
         own_prs_only: false,
@@ -423,7 +421,12 @@ fn launch_verdicts_map_to_typed_handoff_results() {
         let result = execute(&queue, &request, None, || Ok(None), |_| verdict.clone());
         match expected {
             Ok(_) => assert!(result.is_ok()),
-            Err(fragment) => assert!(matches!(result, Err(error) if error.contains(fragment))),
+            Err(fragment) => {
+                assert!(
+                    matches!(&result, Err(error) if error.contains(fragment)),
+                    "{result:?}"
+                )
+            }
         }
         if matches!(verdict, AgentRunVerdict::Exited(Some(2))) {
             assert_eq!(result, Err("PR review agent handoff failed".into()));
