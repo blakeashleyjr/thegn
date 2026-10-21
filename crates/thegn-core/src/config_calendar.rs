@@ -376,8 +376,10 @@ pub struct CalendarAccount {
     pub cwd: String,
     /// `command`: extra environment for the child.
     pub env: BTreeMap<String, String>,
-    /// `command`: capabilities granted to this plugin (`"network:example.com"`,
-    /// `"run:khal"`). A plugin requesting more than this is denied and audited.
+    /// `command`: capabilities this plugin may declare in its manifest
+    /// (`"run:khal"`, `"network:example.com"`). A manifest that declares one
+    /// not listed here fails the run. This is a declaration check, not a
+    /// sandbox: the command runs with your user's authority.
     pub capabilities: Vec<String>,
     /// Seconds before a fetch is abandoned and the child's process group killed.
     #[schemars(range(max = "crate::time_policy::MAX_DURATION_SECS"))]
