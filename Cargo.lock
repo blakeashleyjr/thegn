@@ -7844,7 +7844,6 @@ dependencies = [
  "gtui-embed",
  "ignore",
  "image",
- "iroh",
  "keyring",
  "libc",
  "neo_frizbee 0.10.4",

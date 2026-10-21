@@ -145,7 +145,7 @@
         version = cargoVersion;
         nativeBuildInputs = [pkgs.pkg-config];
         buildInputs = [pkgs.zlib];
-        cargoExtraArgs = "-p thegn-host --bin thegn";
+        cargoExtraArgs = "-p thegn-host --bin thegn --features iroh";
         doCheck = false;
       };
       cargoArtifacts = craneLib.buildDepsOnly cargoCommonArgs;
