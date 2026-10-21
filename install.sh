@@ -9,11 +9,18 @@
 # Plus a `.desktop` app-launcher entry (Exec=tg --standalone) with the owl icon.
 set -euo pipefail
 
+# Pins match the flake's batteries package (Alacritty version and Nerd Fonts
+# v3.5.0 fixed-output derivation).
+batteries_font_url="https://github.com/ryanoasis/nerd-fonts/releases/download/v3.5.0/FiraCode.tar.xz"
+batteries_font_sha256="32226dc81bb30ea421cdc49ba2134b93c2b43096992c829504a3004d2537420d"
+batteries_alacritty_version="0.17.0"
+
 usage() {
   cat >&2 <<'EOF'
 usage: ./install.sh [--dry-run] [bindir]
 
   --dry-run  print the install plan without building or changing files
+  --batteries install Linux user-local Alacritty/font batteries
 
 bindir defaults to ~/.local/bin.
 EOF
@@ -25,12 +32,16 @@ shell_quote() {
 
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 dry_run=0
+batteries=0
 bindir=""
 
 while (($#)); do
   case "$1" in
   --dry-run)
     dry_run=1
+    ;;
+  --batteries)
+    batteries=1
     ;;
   -h | --help)
     usage
@@ -97,6 +108,31 @@ Darwin)
   ;;
 MINGW* | MSYS* | CYGWIN*) desktop_integration=0 ;;
 esac
+
+if ((batteries)) && [[ $(uname -s) != Linux ]]; then
+  echo "install.sh: --batteries is Linux-only (macOS batteries is deferred; use nix run github:blakeashleyjr/thegn#batteries)" >&2
+  exit 2
+fi
+
+batteries_terminal_source=""
+batteries_terminal=""
+batteries_root="$XDG_DATA_HOME/thegn/batteries"
+batteries_config="$XDG_CONFIG_HOME/thegn/alacritty.toml"
+batteries_font_dir="$XDG_DATA_HOME/fonts/thegn-nerd-fonts"
+batteries_marker="$batteries_root/marker"
+if ((batteries)); then
+  if [[ ${THEGN_INSTALL_ASSUME_NO_HOST_ALACRITTY-} != 1 ]] && command -v alacritty >/dev/null 2>&1; then
+    batteries_terminal_source=host
+    batteries_terminal="$(command -v alacritty)"
+    [[ $batteries_terminal == /* ]] || batteries_terminal="$PWD/$batteries_terminal"
+    if [[ $batteries_terminal == /nix/store/* ]]; then
+      echo "install.sh: warning: host Alacritty is in /nix/store and may disappear after garbage collection: $batteries_terminal" >&2
+    fi
+  else
+    batteries_terminal_source=user-local
+    batteries_terminal="$batteries_root/bin/alacritty"
+  fi
+fi
 
 preflight_conflict=0
 report_conflict() {
@@ -198,6 +234,35 @@ preflight() {
   fi
 
   check_file_shape "$config_file"
+
+  if [[ $batteries == 1 ]]; then
+    for dir in "$XDG_DATA_HOME/fonts" "$batteries_font_dir" "$batteries_root"; do
+      if [[ -L $dir ]]; then
+        report_conflict "$dir" "is a symlink"
+      elif [[ -e $dir && ! -d $dir ]]; then
+        report_conflict "$dir" "is not a directory"
+      fi
+    done
+    check_file_shape "$batteries_config"
+    check_file_shape "$batteries_marker"
+    if [[ $batteries_terminal_source == user-local ]]; then
+      local missing=()
+      command -v tar >/dev/null 2>&1 || missing+=(tar)
+      command -v xz >/dev/null 2>&1 || missing+=(xz)
+      if [[ -z ${THEGN_INSTALL_BATTERIES_FONT_SRC-} ]]; then
+        command -v curl >/dev/null 2>&1 || missing+=(curl)
+      fi
+      command -v cmake >/dev/null 2>&1 || missing+=(cmake)
+      command -v pkg-config >/dev/null 2>&1 || missing+=(pkg-config)
+      if command -v pkg-config >/dev/null 2>&1 && ! pkg-config --exists fontconfig freetype2 xkbcommon; then
+        missing+=("pkg-config modules fontconfig freetype2 xkbcommon")
+      fi
+      if ((${#missing[@]})); then
+        echo "install.sh: --batteries Alacritty build prerequisites missing: ${missing[*]}" >&2
+        preflight_conflict=1
+      fi
+    fi
+  fi
 }
 
 preflight
@@ -209,7 +274,24 @@ if ((dry_run)); then
   echo "dry-run: preflight passed; no files will be changed"
   echo "$bindir/thegn <- copy of $release_bin"
   echo "$bindir/tg-tui wrapper -> $bindir/thegn (current terminal)"
-  echo "$bindir/tg wrapper -> $tg_tui (current terminal); tg -s|--standalone -> alacritty --config-file $alacritty_config -e $tg_tui"
+  if ((batteries)); then
+    echo "$bindir/tg wrapper -> $tg_tui (current terminal); tg -s|--standalone -> $batteries_terminal --config-file $batteries_config -e $tg_tui"
+  else
+    echo "$bindir/tg wrapper -> $tg_tui (current terminal); tg -s|--standalone -> alacritty --config-file $alacritty_config -e $tg_tui"
+  fi
+  if ((batteries)); then
+    echo "batteries terminal ($batteries_terminal_source): $batteries_terminal"
+    if [[ $batteries_terminal_source == user-local ]]; then
+      echo "batteries Alacritty build: cargo install --locked --root $batteries_root alacritty --version $batteries_alacritty_version"
+    fi
+    echo "batteries font: $batteries_font_url sha256=$batteries_font_sha256 -> $batteries_font_dir"
+    if [[ -e $batteries_config ]]; then
+      echo "batteries config: kept existing $batteries_config"
+    else
+      echo "batteries config: copy $here/config/alacritty.toml -> $batteries_config"
+    fi
+    echo "batteries marker: $batteries_marker"
+  fi
   if ((desktop_integration)); then
     echo "$icon_file -> $icon_src (owl app icon)"
     echo "$desktop_file -> app-launcher entry (Exec=$bindir/tg --standalone, Icon=thegn)"
@@ -301,6 +383,9 @@ cleanup_install() {
   if [[ -n $backup_dir ]]; then
     rm -rf -- "$backup_dir"
   fi
+  if [[ -n ${batteries_staging-} ]]; then
+    rm -rf -- "$batteries_staging"
+  fi
   if ((${#staged_files[@]} > 0)); then
     rm -f -- "${staged_files[@]}"
   fi
@@ -317,6 +402,14 @@ assert_destination_dirs() {
       return 1
     fi
   done
+  if ((batteries)); then
+    for dir in "$XDG_DATA_HOME/fonts" "$batteries_font_dir" "$batteries_root"; do
+      if [[ -L $dir || (-e $dir && ! -d $dir) ]]; then
+        echo "install.sh: refusing $dir: destination directory changed" >&2
+        return 1
+      fi
+    done
+  fi
   if ((desktop_integration)); then
     for dir in "$apps_dir" "$icon_dir"; do
       if [[ -L $dir || (-e $dir && ! -d $dir) ]]; then
@@ -367,6 +460,14 @@ if [[ ! -f $release_bin ]]; then
   exit 1
 fi
 
+if ((batteries)) && [[ $batteries_terminal_source == user-local ]]; then
+  assert_destination_dirs
+  mkdir -p "$batteries_root"
+  # The user-local Alacritty build is intentionally outside the file rollback
+  # journal, like the generated macOS app bundle.
+  cargo install --locked --root "$batteries_root" alacritty --version "$batteries_alacritty_version"
+fi
+
 # COPY, don't symlink into target/. A symlink to $here/target/release/thegn
 # breaks the moment you `cargo clean`, prune the worktree, or move the repo —
 # silently, and only when you next try to launch. An installed binary should
@@ -387,7 +488,13 @@ maybe_inject_failure thegn
 installed_bin="$bindir/thegn"
 
 installed_bin_q="$(shell_quote "$installed_bin")"
-alacritty_config_q="$(shell_quote "$alacritty_config")"
+batteries_config_selected="$alacritty_config"
+if ((batteries)); then
+  batteries_config_selected="$batteries_config"
+  resolved_alacritty="$batteries_terminal"
+  resolved_alacritty_q="$(shell_quote "$resolved_alacritty")"
+fi
+alacritty_config_q="$(shell_quote "$batteries_config_selected")"
 tg_tui_q="$(shell_quote "$tg_tui")"
 
 # tg-tui: always the current terminal. THEGN_ALACRITTY_CONFIG points the in-app
@@ -420,11 +527,26 @@ set -euo pipefail
 
 if [[ \${1-} == -s || \${1-} == --standalone ]]; then
   shift
+EOF
+if ((batteries)); then
+  cat >>"$tg_tmp" <<EOF
+  resolved_alacritty=$resolved_alacritty_q
+  if [[ ! -x "\$resolved_alacritty" ]]; then
+    echo "tg: batteries Alacritty not found at \$resolved_alacritty; rerun ./install.sh --batteries." >&2
+    exit 127
+  fi
+  exec $resolved_alacritty_q --config-file $alacritty_config_q -e $tg_tui_q "\$@"
+EOF
+else
+  cat >>"$tg_tmp" <<EOF
   if ! command -v alacritty >/dev/null 2>&1; then
     echo "tg: alacritty not found; install alacritty or run 'tg' to open thegn in the current terminal." >&2
     exit 127
   fi
   exec alacritty --config-file $alacritty_config_q -e $tg_tui_q "\$@"
+EOF
+fi
+cat >>"$tg_tmp" <<EOF
 fi
 
 exec $tg_tui_q "\$@"
@@ -432,6 +554,76 @@ EOF
 chmod 0755 "$tg_tmp"
 commit_file "$tg_tmp" "$bindir/tg"
 maybe_inject_failure tg
+
+if ((batteries)); then
+  # The staging tree lives under the user data root and is private because it
+  # contains an untrusted downloaded archive before verification/extraction.
+  mkdir -p "$manifest_dir"
+  batteries_staging="$(mktemp -d "$manifest_dir/.batteries-stage.XXXXXXXX")"
+  chmod 0700 "$batteries_staging"
+  mkdir "$batteries_staging/extracted"
+  if [[ -n ${THEGN_INSTALL_BATTERIES_FONT_SRC-} ]]; then
+    cp "$THEGN_INSTALL_BATTERIES_FONT_SRC" "$batteries_staging/FiraCode.tar.xz"
+  else
+    curl --proto '=https' --tlsv1.2 -fsSL -o "$batteries_staging/FiraCode.tar.xz" "$batteries_font_url"
+  fi
+  actual_font_sha256="$(sha256 "$batteries_staging/FiraCode.tar.xz")"
+  if [[ $actual_font_sha256 != "$batteries_font_sha256" ]]; then
+    echo "install.sh: font archive digest mismatch: expected $batteries_font_sha256, got $actual_font_sha256" >&2
+    exit 1
+  fi
+  tar -xJf "$batteries_staging/FiraCode.tar.xz" -C "$batteries_staging/extracted" --no-same-owner --no-same-permissions
+  shopt -s nullglob
+  font_files=("$batteries_staging/extracted"/*.ttf)
+  shopt -u nullglob
+  mkdir -p "$batteries_font_dir"
+  published_font=0
+  for font_file in "${font_files[@]}"; do
+    [[ -f $font_file && ! -L $font_file ]] || continue
+    font_name="${font_file##*/}"
+    stage_file "$batteries_font_dir/$font_name" 0644
+    font_tmp="$staged_path"
+    cp "$font_file" "$font_tmp"
+    chmod 0644 "$font_tmp"
+    commit_file "$font_tmp" "$batteries_font_dir/$font_name"
+    published_font=1
+    maybe_inject_failure font
+  done
+  if ((!published_font)); then
+    echo "install.sh: verified font archive contains no regular top-level .ttf files" >&2
+    exit 1
+  fi
+  batteries_config_created=0
+  if [[ ! -e $batteries_config && ! -L $batteries_config ]]; then
+    stage_file "$batteries_config" 0644
+    batteries_config_tmp="$staged_path"
+    cp "$here/config/alacritty.toml" "$batteries_config_tmp"
+    chmod 0644 "$batteries_config_tmp"
+    commit_file "$batteries_config_tmp" "$batteries_config"
+    batteries_config_created=1
+    maybe_inject_failure batteries-config
+  fi
+  stage_file "$batteries_marker" 0644
+  batteries_marker_tmp="$staged_path"
+  cat >"$batteries_marker_tmp" <<EOF
+version=1
+alacritty_source=$batteries_terminal_source
+alacritty=$batteries_terminal
+font_family=FiraCode Nerd Font
+font_version=3.5.0
+font_sha256=$batteries_font_sha256
+font_dir=$batteries_font_dir
+alacritty_config=$batteries_config
+EOF
+  chmod 0644 "$batteries_marker_tmp"
+  commit_file "$batteries_marker_tmp" "$batteries_marker"
+  maybe_inject_failure batteries-marker
+  if command -v fc-cache >/dev/null 2>&1; then
+    if ! fc-cache -f "$batteries_font_dir" >/dev/null 2>&1; then
+      echo "install.sh: fc-cache failed for $batteries_font_dir" >&2
+    fi
+  fi
+fi
 
 if ((desktop_integration)); then
   # Owl app icon: the same perched-sentinel mascot the loading splash draws
@@ -524,6 +716,20 @@ manifest_tmp="$staged_path"
     [[ $artifact_absolute == /* ]] || artifact_absolute="$PWD/$artifact_absolute"
     printf '%s\t%s\n' "$(sha256 "$artifact")" "$artifact_absolute"
   done
+  if ((batteries)); then
+    for artifact in "$batteries_marker" "$batteries_font_dir"/*.ttf; do
+      [[ -f $artifact ]] || continue
+      artifact_absolute="$artifact"
+      [[ $artifact_absolute == /* ]] || artifact_absolute="$PWD/$artifact_absolute"
+      printf '%s\t%s\n' "$(sha256 "$artifact")" "$artifact_absolute"
+    done
+    if ((batteries_config_created)); then
+      printf '%s\t%s\n' "$(sha256 "$batteries_config")" "$batteries_config"
+    fi
+    if [[ $batteries_terminal_source == user-local && -x $batteries_terminal ]]; then
+      printf '%s\t%s\n' "$(sha256 "$batteries_terminal")" "$batteries_terminal"
+    fi
+  fi
   if ((desktop_integration)); then
     if [[ -f $icon_file ]]; then
       artifact_absolute="$icon_file"
@@ -547,7 +753,11 @@ fi
 # Warn about missing runtime deps (delta is used for diff output; alacritty backs
 # the `tg --standalone` dedicated-window launcher).
 command -v delta >/dev/null || echo "warning: 'delta' not found — diff output will lack syntax highlighting (install: https://github.com/dandavison/delta)" >&2
-command -v alacritty >/dev/null || echo "warning: 'alacritty' not found — 'tg --standalone' opens a dedicated alacritty window; plain 'tg' opens thegn in the current terminal" >&2
+if ((batteries)); then
+  echo "batteries installed: terminal ($batteries_terminal_source) $batteries_terminal; FiraCode Nerd Font in $batteries_font_dir; config $batteries_config"
+else
+  command -v alacritty >/dev/null || echo "warning: 'alacritty' not found — 'tg --standalone' opens a dedicated alacritty window; plain 'tg' opens thegn in the current terminal" >&2
+fi
 
 echo "installed:"
 echo "  $bindir/tg              -> current terminal ($bindir/thegn)"
