@@ -469,7 +469,7 @@ config_enum! {
     /// workspace/repo via the `.thegn.toml` overlay, or `THEGN_SANDBOX_PROFILE`.
     ///
     /// - `open`     — no hardening; reproduces pre-preset behavior (back-compat).
-    /// - `hardened` — read-only root + no-new-privileges + pids cap; networking
+    /// - `standard` — read-only root + no-new-privileges + pids cap; networking
     ///                and capabilities left intact so interactive dev (fetch,
     ///                debuggers, ping) keeps working. The default.
     /// - `sealed`   — full lockdown: `network=none`, read-only root, drop ALL
@@ -479,7 +479,8 @@ config_enum! {
     ///                no VPN configured it behaves exactly like `sealed`.
     pub enum SandboxProfile: "sandbox profile" {
         Open = "open" | "off" | "none",
-        Hardened = "hardened" | "guarded",
+        // Spelled `standard` (THE-419); `hardened`/`guarded` are accepted aliases.
+        Hardened = "standard" | "hardened" | "guarded",
         Sealed = "sealed" | "locked" | "isolated",
         SealedTunnel = "sealed-tunnel" | "tunnel-only" | "vpn-only",
     } default = Hardened;
@@ -582,7 +583,7 @@ impl SandboxProfile {
         }
     }
     /// Linux capabilities to drop. `sealed`/`sealed-tunnel` drop everything;
-    /// `hardened` leaves the runtime's defaults so debuggers (ptrace), `ping`
+    /// `standard` leaves the runtime's defaults so debuggers (ptrace), `ping`
     /// (NET_RAW), and low-port binds keep working. Under `sealed-tunnel` the
     /// worktree still drops ALL caps — the tunnel's NET_ADMIN/TUN live in the
     /// VPN sidecar, never in the worktree container.
@@ -618,12 +619,12 @@ impl SandboxProfile {
     /// all, have no route to the session bus / Secret Service). A "sealed" pane
     /// that also carried the user's agent socket would contradict the tier's
     /// promise. Explicit `env_passthrough` re-adds it; `thegn doctor` flags it.
-    /// `hardened`/`open` keep whatever `env_passthrough` names.
+    /// `standard`/`open` keep whatever `env_passthrough` names.
     pub fn seals_agent_socket(self) -> bool {
         matches!(self, SandboxProfile::Sealed | SandboxProfile::SealedTunnel)
     }
     /// Whether this profile hides the host `$HOME` (THE-215): sealed tiers get a
-    /// private tmpfs `$HOME` holding only an allowlist; `hardened` keeps the
+    /// private tmpfs `$HOME` holding only an allowlist; `standard` keeps the
     /// read-only ambient view (integrity, not confidentiality); `open` is
     /// writable. Confidentiality is a property of the sealed tiers alone.
     pub fn hides_home(self) -> bool {

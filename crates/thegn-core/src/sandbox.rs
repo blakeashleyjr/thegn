@@ -643,7 +643,7 @@ impl RefusalClass {
                 "remove the protected host path from the Compose file's binds, or choose a less restrictive [sandbox] profile"
             }
             Self::SealedHome => {
-                "sealed profiles hide $HOME: move the mount or worktree out of $HOME, or use profile 'hardened'"
+                "sealed profiles hide $HOME: move the mount or worktree out of $HOME, or use profile 'standard'"
             }
             Self::UnsafeMountPath => {
                 "rename the mount path so it has no whitespace, quote, backslash or ':', or use the bwrap backend"
@@ -664,7 +664,7 @@ impl RefusalClass {
                 "create the mount source or remove the mount from the config, then relaunch"
             }
             Self::TunnelUnenforced => {
-                "use profile 'hardened' with [sandbox.vpn], or 'sealed' for no network"
+                "use profile 'standard' with [sandbox.vpn], or 'sealed' for no network"
             }
             Self::MountDrift => {
                 "a mount source changed during launch (check for a symlink swap), then relaunch"
@@ -1155,7 +1155,7 @@ pub fn build_vpn_spec(cfg: &VpnConfig, name: &str, profile: SandboxProfile) -> O
         msg::warn(&format!(
             "sandbox: profile '{profile}' forbids a VPN tunnel (network=none, all \
              capabilities dropped); ignoring [sandbox.vpn]. Use 'sealed-tunnel' for a \
-             tunnel-only worktree, or 'hardened'.",
+             tunnel-only worktree, or 'standard'.",
         ));
         return None;
     }
@@ -1194,7 +1194,7 @@ pub fn build_vpn_spec(cfg: &VpnConfig, name: &str, profile: SandboxProfile) -> O
 }
 
 /// Refusal message for a tunnel-only VPN request that cannot be enforced.
-pub const TUNNEL_ONLY_REFUSAL: &str = "sandbox profile 'sealed-tunnel' promises the VPN tunnel is the only network route, but thegn cannot enforce a tunnel-only datapath yet (direct egress would remain possible beside the sidecar or proxy); refusing to launch. Use profile 'hardened' with [sandbox.vpn] for a tunnel that is not exclusive, or 'sealed' for no network.";
+pub const TUNNEL_ONLY_REFUSAL: &str = "sandbox profile 'sealed-tunnel' promises the VPN tunnel is the only network route, but thegn cannot enforce a tunnel-only datapath yet (direct egress would remain possible beside the sidecar or proxy); refusing to launch. Use profile 'standard' with [sandbox.vpn] for a tunnel that is not exclusive, or 'sealed' for no network.";
 
 /// Refuse a tunnel-only VPN request until the runtime can enforce that no
 /// direct egress route exists beside the VPN tunnel.
