@@ -873,7 +873,8 @@
     },
     {
       "change": "monitor-overview",
-      "lifecycle": "active",
+      "archive_path": "openspec/changes/archive/2026-10-21-monitor-overview/",
+      "lifecycle": "archived",
       "disposition": "alpha-delivery",
       "owners": [
         {
