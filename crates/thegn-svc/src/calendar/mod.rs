@@ -1005,5 +1005,9 @@ async fn fetch_account(
 }
 
 #[cfg(test)]
+#[path = "conformance_tests.rs"]
+mod conformance_tests;
+
+#[cfg(test)]
 #[path = "tests.rs"]
 mod tests;
