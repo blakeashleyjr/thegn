@@ -1837,6 +1837,11 @@ fn reap_facts(
         report_verdict: f.report_verdict,
         report_gate_valid: f.report_gate_valid,
         worktree_unknown: f.worktree_state == Some(pipeline_run::WorktreeState::Unknown),
+        artifact_ok: f.stage.is_none()
+            || (matches!(
+                &f.artifact_identity,
+                pipeline_run::ArtifactIdentity::Canonical
+            ) && !f.artifact_empty),
     }
 }
 
@@ -2954,7 +2959,7 @@ mod tests {
         let (_dir, db) = db("wake-missing-artifact");
         let (_worktree_dir, worktree) = git_repo("wake-worktree");
         let id = db
-            .put_agent_dispatch(thegn_core::issue::NewDispatch {
+            .put_dispatch_with_parent_check(thegn_core::issue::NewDispatch {
                 stage: Some("code"),
                 artifact_path: None,
                 ..thegn_core::issue::NewDispatch::new(
@@ -3044,7 +3049,7 @@ mod tests {
         let (_dir, db) = db("wake-verified-artifact");
         let (_worktree_dir, worktree) = git_repo("wake-verified-worktree");
         let id = db
-            .put_agent_dispatch(thegn_core::issue::NewDispatch {
+            .put_dispatch_with_parent_check(thegn_core::issue::NewDispatch {
                 stage: Some("code"),
                 artifact_path: None,
                 ..thegn_core::issue::NewDispatch::new(
@@ -3094,7 +3099,7 @@ mod tests {
         let (_dir, db) = db("wake-stale-report-commit");
         let (_worktree_dir, worktree) = git_repo("wake-stale-report-worktree");
         let id = db
-            .put_agent_dispatch(thegn_core::issue::NewDispatch {
+            .put_dispatch_with_parent_check(thegn_core::issue::NewDispatch {
                 stage: Some("code"),
                 artifact_path: None,
                 ..thegn_core::issue::NewDispatch::new(
@@ -4838,5 +4843,20 @@ mod tests {
         let mut row = row_in(&root, Some(ARTIFACT));
         row.report = Some("PASS\ngate: just test -- exit 0".into());
         done_gate(&row).unwrap();
+    }
+
+    #[test]
+    fn reap_plan_does_not_close_a_committed_readme_as_a_handoff() {
+        let (_dir, root) = git_repo("reap-readme");
+        commit_test_file(&root, "README.md", "# unrelated\n");
+        let mut row = row_in(&root, Some("README.md"));
+        row.report = Some("PASS\ngate: just test -- exit 0".into());
+        row.exit_code = Some(0);
+        let plan = reap_plan_rows(&[row], Some(&[]));
+        assert_eq!(plan.len(), 1);
+        assert!(
+            !matches!(&plan[0].verdict, pipeline_reap::ReapVerdict::CloseDone),
+            "a committed non-canonical artifact must not be reaped done"
+        );
     }
 }
