@@ -3650,7 +3650,7 @@ mod tests {
             ))),
             native_ids: Mutex::new(HashMap::new()),
             spawning_relaunches: Arc::new(Mutex::new(std::collections::HashSet::new())),
-            launches: Mutex::new(super::stage_launch::LaunchRegistry::default()),
+            launches: Mutex::new(crate::daemon::stage_launch::LaunchRegistry::default()),
             events,
             db: Arc::new(Mutex::new(Db::open_memory().expect("in-memory db"))),
             grace_ms,
