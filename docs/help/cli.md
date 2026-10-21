@@ -337,6 +337,12 @@ is a pipeline stage: it stops and refuses a stage row or a vanished row even if
 the client did not mark the launch as a stage. `dispatch set-status --force` on
 a missing row reports `missing_row`, including with `--json`.
 
+`session open --resume-work` and the daemon's transport retry carry the same
+stage configuration digest as a fresh stage dispatch. If the stage or agent was
+edited after the prompt was rendered, the launch is refused as changed between
+claim and launch. A launch-id-bound pipeline stage launch without a digest is
+refused. Restart the daemon after upgrading; the digest format changed.
+
 Finished rows (not review tasks) older than 90 days are pruned during
 background maintenance unless their worktree is still registered, an active
 autopilot run uses them, or a retained child points to them. `thegn db vacuum`

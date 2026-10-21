@@ -78,13 +78,26 @@ pub(crate) fn resolve(
             .iter()
             .find(|(key, _)| key == thegn_core::pipeline_launch_digest::STAGE_CONFIG_DIGEST_ENV)
             .map(|(_, value)| value.as_str());
-        thegn_core::pipeline_launch_digest::check_stage_launch(
-            cfg,
-            launch.agent.trim(),
-            stage,
-            presented,
-        )
-        .map_err(anyhow::Error::new)?;
+        let launch_bound = spec
+            .env
+            .iter()
+            .any(|(key, _)| key == super::stage_launch::STAGE_LAUNCH_ENV);
+        let checked = if launch_bound {
+            thegn_core::pipeline_launch_digest::check_stage_launch_required(
+                cfg,
+                launch.agent.trim(),
+                stage,
+                presented,
+            )
+        } else {
+            thegn_core::pipeline_launch_digest::check_stage_launch(
+                cfg,
+                launch.agent.trim(),
+                stage,
+                presented,
+            )
+        };
+        checked.map_err(anyhow::Error::new)?;
     }
     resolve_inner(cfg, db, spec, launch, None, branch)
 }
@@ -1216,6 +1229,76 @@ mod tests {
                     .to_string()
                     .contains("changed between claim and launch"),
                 "matching config was treated as drift: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn stage_digest_launch_bound_open_without_digest_is_refused() {
+        let worktree = tempfile::tempdir().expect("isolated worktree");
+        let _state = crate::testenv::IsolatedState::new();
+        let db = Db::open_memory().expect("in-memory db");
+        let mut config = cfg();
+        config.sandbox.enabled = false;
+        config.agents.push(named("worker", "claude"));
+        config
+            .pipeline
+            .stages
+            .push(thegn_core::config_pipeline::PipelineStage {
+                name: "review".into(),
+                agent: "worker".into(),
+                ..Default::default()
+            });
+        let spec = OpenSpec {
+            worktree: Some(worktree.path().to_string_lossy().into_owned()),
+            env: vec![(
+                super::super::stage_launch::STAGE_LAUNCH_ENV.into(),
+                "a".repeat(32),
+            )],
+            ..OpenSpec::default()
+        };
+        let launch = AgentLaunch {
+            stage: Some("review".into()),
+            ..launch("worker", "rendered prompt")
+        };
+        let error = resolve(&config, &db, &spec, &launch, None).expect_err("digest is required");
+        assert!(
+            error.to_string().contains("no stage configuration digest"),
+            "got {error}"
+        );
+    }
+
+    #[test]
+    fn stage_digest_plain_layered_open_without_launch_id_still_resolves() {
+        let worktree = tempfile::tempdir().expect("isolated worktree");
+        let _state = crate::testenv::IsolatedState::new();
+        let db = Db::open_memory().expect("in-memory db");
+        let mut config = cfg();
+        config.sandbox.enabled = false;
+        config.agents.push(named("worker", "claude"));
+        config
+            .pipeline
+            .stages
+            .push(thegn_core::config_pipeline::PipelineStage {
+                name: "review".into(),
+                agent: "worker".into(),
+                ..Default::default()
+            });
+        let launch = AgentLaunch {
+            stage: Some("review".into()),
+            ..launch("worker", "rendered prompt")
+        };
+        let spec = OpenSpec {
+            worktree: Some(worktree.path().to_string_lossy().into_owned()),
+            ..OpenSpec::default()
+        };
+        if let Err(error) = resolve(&config, &db, &spec, &launch, None) {
+            assert!(
+                !error.to_string().contains("no stage configuration digest")
+                    && !error
+                        .to_string()
+                        .contains("changed between claim and launch"),
+                "{error}"
             );
         }
     }
