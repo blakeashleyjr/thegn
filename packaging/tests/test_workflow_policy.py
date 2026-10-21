@@ -8,7 +8,6 @@ import re
 import shutil
 import subprocess
 import tempfile
-import tomllib
 import unittest
 from pathlib import Path
 
@@ -1007,6 +1006,8 @@ class WorkflowPolicyTests(unittest.TestCase):
         self.assertIn('echo "asset_digests=$asset_digests" >> "$GITHUB_OUTPUT"', step["run"])
         self.assertIn('sha256sum "$asset"', step["run"])
         self.assertIn('thegn-$TAG-release.json', step["run"])
+        self.assertIn("::error::expected release asset file is missing", step["run"])
+        self.assertIn('[ -f "$asset" ] || {', step["run"])
 
     def test_package_checks_producer_digests_first(self) -> None:
         job = read_workflow("release.yml")["jobs"]["package"]
@@ -1032,6 +1033,8 @@ class WorkflowPolicyTests(unittest.TestCase):
             if item.get("name") == "Upload packages and rendered metadata"
         )
         self.assertEqual("packages", packages["id"])
+        self.assertIn("::error::expected package asset file is missing", packages["run"])
+        self.assertIn('[ -f "$asset" ] || {', packages["run"])
         self.assertLess(
             packages["run"].index('echo "package_digests='),
             packages["run"].index('gh release upload'),
@@ -1053,6 +1056,8 @@ class WorkflowPolicyTests(unittest.TestCase):
         self.assertNotIn("$VERIFY_ROOT/assets/manifest-input", step["run"])
 
     def test_trusted_digest_step_rehearsal(self) -> None:
+        import tomllib
+
         if shutil.which("bash") is None:
             self.skipTest("bash is required for the trusted digest rehearsal")
         job = read_workflow("release.yml")["jobs"]["package"]
