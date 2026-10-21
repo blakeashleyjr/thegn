@@ -11,10 +11,13 @@ use futures::StreamExt;
 use futures::future::BoxFuture;
 use zbus::message::Type as MsgType;
 use zbus::names::InterfaceName;
-use zbus::zvariant::{Array, OwnedObjectPath, OwnedValue, Value};
+use zbus::zvariant::{OwnedObjectPath, OwnedValue, Value};
 use zbus::{Connection, MatchRule, MessageStream};
 
-use crate::model::{LoopMode, MediaKind, MediaState, PlaybackState, Playlist, QueueItem};
+use crate::model::{
+    LoopMode, MAX_FIELD_BYTES, MAX_QUEUE_ITEMS, MediaKind, MediaState, PlaybackState, Playlist,
+    QueueItem, QueuePage,
+};
 use crate::{MediaBackend, MediaCaps, MediaError, MediaSnapshot, MediaWatch};
 
 const MPRIS_PREFIX: &str = "org.mpris.MediaPlayer2.";
@@ -456,9 +459,13 @@ impl MediaBackend for MprisZbus {
     }
 
     fn queue(&self) -> BoxFuture<'_, Result<Vec<QueueItem>, MediaError>> {
+        Box::pin(async move { self.queue_page().await.map(|page| page.items) })
+    }
+
+    fn queue_page(&self) -> BoxFuture<'_, Result<QueuePage, MediaError>> {
         Box::pin(async move {
             let Some(bus) = self.active_player().await? else {
-                return Ok(Vec::new());
+                return Ok(QueuePage::default());
             };
             // TrackList.Tracks is `ao`; read it via Properties.Get. Players without
             // the TrackList interface error here → treat as an empty queue.
@@ -466,15 +473,16 @@ impl MediaBackend for MprisZbus {
             let iface = InterfaceName::try_from(TRACKLIST_IFACE)
                 .map_err(|e| MediaError::Backend(e.to_string()))?;
             let Ok(tracks_val) = proxy.get(iface, "Tracks").await else {
-                return Ok(Vec::new());
+                return Ok(QueuePage::default());
             };
             let paths: Vec<OwnedObjectPath> = match Vec::try_from(tracks_val) {
                 Ok(p) => p,
-                Err(_) => return Ok(Vec::new()),
+                Err(_) => return Ok(QueuePage::default()),
             };
             if paths.is_empty() {
-                return Ok(Vec::new());
+                return Ok(QueuePage::default());
             }
+            let total = paths.len();
             // GetTracksMetadata(ao) -> aa{sv}
             let reply = match self
                 .conn
@@ -483,16 +491,16 @@ impl MediaBackend for MprisZbus {
                     MPRIS_PATH,
                     Some(TRACKLIST_IFACE),
                     "GetTracksMetadata",
-                    &(paths.clone(),),
+                    &(queue_metadata_window(&paths).to_vec(),),
                 )
                 .await
             {
                 Ok(r) => r,
-                Err(_) => return Ok(Vec::new()),
+                Err(_) => return Ok(QueuePage::default()),
             };
             let metas: Vec<HashMap<String, OwnedValue>> = match reply.body().deserialize() {
                 Ok(m) => m,
-                Err(_) => return Ok(Vec::new()),
+                Err(_) => return Ok(QueuePage::default()),
             };
             // The current track, so we can mark it in the list.
             let current = self
@@ -500,7 +508,7 @@ impl MediaBackend for MprisZbus {
                 .await
                 .ok()
                 .and_then(|p| trackid_of(&p));
-            Ok(metas
+            let items = metas
                 .into_iter()
                 .map(|meta| {
                     let id = str_of(&meta, "mpris:trackid")
@@ -519,7 +527,8 @@ impl MediaBackend for MprisZbus {
                         is_current,
                     }
                 })
-                .collect())
+                .collect();
+            Ok(QueuePage { items, total })
         })
     }
 
@@ -885,19 +894,33 @@ fn artists_of(meta: &HashMap<String, OwnedValue>) -> String {
         return String::new();
     };
     match peel(v) {
-        Value::Array(arr) => collect_strs(arr).join(", "),
+        Value::Array(arr) => {
+            join_artists_bounded(arr.iter().filter_map(|element| match peel(element) {
+                Value::Str(name) => Some(name.as_str()),
+                _ => None,
+            }))
+        }
         Value::Str(s) => s.as_str().to_string(),
         _ => String::new(),
     }
 }
 
-fn collect_strs(arr: &Array<'_>) -> Vec<String> {
-    arr.iter()
-        .filter_map(|e| match peel(e) {
-            Value::Str(s) => Some(s.as_str().to_string()),
-            _ => None,
-        })
-        .collect()
+fn queue_metadata_window(paths: &[OwnedObjectPath]) -> &[OwnedObjectPath] {
+    &paths[..paths.len().min(MAX_QUEUE_ITEMS)]
+}
+
+fn join_artists_bounded<'a>(names: impl IntoIterator<Item = &'a str>) -> String {
+    let mut out = String::new();
+    for name in names {
+        if !out.is_empty() {
+            out.push_str(", ");
+        }
+        out.push_str(name);
+        if out.len() >= MAX_FIELD_BYTES {
+            break;
+        }
+    }
+    out
 }
 
 fn playback_state(props: &HashMap<String, OwnedValue>) -> PlaybackState {
@@ -1005,6 +1028,28 @@ fn caps_from_props(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn queue_metadata_window_caps_at_max_queue_items() {
+        let paths = (0..600)
+            .map(|index| {
+                OwnedObjectPath::try_from(format!("/org/mpris/MediaPlayer2/Track/{index}")).unwrap()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(queue_metadata_window(&paths).len(), MAX_QUEUE_ITEMS);
+
+        let paths = paths[..3].to_vec();
+        assert_eq!(queue_metadata_window(&paths).len(), 3);
+    }
+
+    #[test]
+    fn artist_join_stops_at_the_field_budget() {
+        let names = vec!["abcdefghij"; 10_000];
+        let joined = join_artists_bounded(names.iter().copied());
+        assert!(joined.len() < MAX_FIELD_BYTES + 12);
+        assert!(joined.starts_with("abcdefghij, abcdefghij"));
+        assert_eq!(join_artists_bounded(["a", "b"]), "a, b");
+    }
 
     #[test]
     fn owner_change_between_read_and_write_refuses_without_writing() {
