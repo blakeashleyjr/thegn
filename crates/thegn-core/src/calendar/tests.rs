@@ -861,6 +861,38 @@ fn a_minimal_plugin_event_deserializes_and_unknown_fields_are_ignored() {
 }
 
 #[test]
+fn transp_free_survives_recurrence_expansion() {
+    let input = "BEGIN:VCALENDAR\nBEGIN:VEVENT\nUID:weekly-free\nSUMMARY:Travel\nDTSTART;TZID=UTC:20260803T090000\nDTEND;TZID=UTC:20260803T093000\nRRULE:FREQ=WEEKLY;COUNT=3\nTRANSP:TRANSPARENT\nEND:VEVENT\nEND:VCALENDAR";
+    let events = parse_ics(input, "UTC");
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0].busy, Busy::Free);
+    let by_date = expand_by_date(&events, d(2026, 8, 1), d(2026, 8, 31), Tz::UTC).unwrap();
+    assert_eq!(by_date.len(), 3);
+    assert!(
+        by_date
+            .values()
+            .flatten()
+            .all(|event| event.busy == Busy::Free)
+    );
+}
+
+// Positive control: command-plugin JSON preserves a caller-supplied value.
+#[test]
+fn transp_free_round_trips_through_plugin_json() {
+    let json = r#"{
+        "uid":"plugin-free",
+        "title":"Travel",
+        "start":{"kind":"date","date":"2026-08-21"},
+        "end":{"kind":"date","date":"2026-08-22"},
+        "busy":"free"
+    }"#;
+    let event: CalEvent = serde_json::from_str(json).unwrap();
+    assert_eq!(event.busy, Busy::Free);
+    let encoded = serde_json::to_value(event).unwrap();
+    assert_eq!(encoded["busy"], serde_json::json!("free"));
+}
+
+#[test]
 fn recurrence_id_is_optional_on_the_plugin_wire() {
     let json = r#"{
         "uid": "1",
