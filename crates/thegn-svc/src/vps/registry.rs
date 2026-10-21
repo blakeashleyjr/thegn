@@ -408,7 +408,7 @@ pub fn remove_at(d: &Path, name: &str) {
     match root.entry_exists_nofollow("known_hosts.d") {
         Ok(true) => match thegn_core::fsperm::open_private_dir(&d.join("known_hosts.d")) {
             Ok(known_hosts) => {
-                if let Err(error) = known_hosts.remove_file(name) {
+                if let Err(error) = remove_pin_from_held_dir(&known_hosts, name) {
                     tracing::debug!(target: "thegn::vps", %error, name, "unable to remove VPS known_hosts pin");
                 }
             }
@@ -425,6 +425,39 @@ pub fn remove_at(d: &Path, name: &str) {
 
 pub fn remove(name: &str) {
     remove_at(&dir(), name)
+}
+
+fn remove_pin_from_held_dir(
+    known_hosts: &thegn_core::fsperm::PrivateDir,
+    name: &str,
+) -> Result<()> {
+    known_hosts
+        .remove_file(name)
+        .context("vps registry: cannot remove the known_hosts pin")?;
+    Ok(())
+}
+
+fn remove_pin_in(root: &thegn_core::fsperm::PrivateDir, d: &Path, name: &str) -> Result<()> {
+    if root.entry_exists_nofollow("known_hosts.d")? {
+        let known_hosts = thegn_core::fsperm::open_private_dir(&d.join("known_hosts.d"))
+            .context("vps registry: known_hosts.d is not an owned private directory")?;
+        remove_pin_from_held_dir(&known_hosts, name)?;
+    }
+    Ok(())
+}
+
+/// Remove one known_hosts pin without touching the same-name VPS record.
+pub fn remove_known_hosts_pin_at(d: &Path, name: &str) -> Result<()> {
+    checked_name(name)?;
+    let Some(root) = open_root(d, false)? else {
+        return Ok(());
+    };
+    remove_pin_in(&root, d, name)
+}
+
+/// Remove one known_hosts pin from the active VPS registry without touching its record.
+pub fn remove_known_hosts_pin(name: &str) -> Result<()> {
+    remove_known_hosts_pin_at(&dir(), name)
 }
 
 /// Lenient view for display; reapers use `list_checked`.
@@ -1147,6 +1180,61 @@ mod tests {
 
         assert!(!d.join("a.json").exists());
         assert!(!known_hosts.join("a").exists());
+    }
+
+    #[test]
+    fn remove_known_hosts_pin_removes_only_the_named_pin() {
+        let tmp = tempfile::tempdir().unwrap();
+        let d = tmp.path().join("vps");
+        write_at(&d, &rec("a", "ready")).unwrap();
+        let known_hosts = ensure_known_hosts_dir_at(&d).unwrap();
+        std::fs::write(known_hosts.join("a"), b"key a").unwrap();
+        std::fs::write(known_hosts.join("b"), b"key b").unwrap();
+
+        remove_known_hosts_pin_at(&d, "a").unwrap();
+
+        assert!(!known_hosts.join("a").exists());
+        assert!(known_hosts.join("b").exists());
+        assert!(read_at(&d, "a").is_some());
+    }
+
+    #[test]
+    fn remove_known_hosts_pin_is_ok_when_absent() {
+        let tmp = tempfile::tempdir().unwrap();
+        let d = tmp.path().join("vps");
+        assert!(remove_known_hosts_pin_at(&d, "a").is_ok());
+
+        write_at(&d, &rec("a", "ready")).unwrap();
+        assert!(remove_known_hosts_pin_at(&d, "a").is_ok());
+
+        let known_hosts = ensure_known_hosts_dir_at(&d).unwrap();
+        assert!(remove_known_hosts_pin_at(&d, "a").is_ok());
+        assert!(remove_known_hosts_pin_at(&d, "../x").is_err());
+        assert!(known_hosts.exists());
+    }
+
+    #[test]
+    fn remove_known_hosts_pin_refuses_a_symlinked_known_hosts_dir() {
+        let tmp = tempfile::tempdir().unwrap();
+        let d = tmp.path().join("registry");
+        let victim = tmp.path().join("victim");
+        std::fs::create_dir(&d).unwrap();
+        std::fs::create_dir(&victim).unwrap();
+        std::fs::write(victim.join("a"), b"keep").unwrap();
+        if let Err(error) =
+            thegn_core::fsperm::create_symlink(&victim, &d.join("known_hosts.d"), true)
+        {
+            if matches!(
+                error.kind(),
+                std::io::ErrorKind::Unsupported | std::io::ErrorKind::PermissionDenied
+            ) {
+                return;
+            }
+            panic!("could not create test symlink: {error}");
+        }
+
+        assert!(remove_known_hosts_pin_at(&d, "a").is_err());
+        assert!(victim.join("a").exists());
     }
 
     #[test]
