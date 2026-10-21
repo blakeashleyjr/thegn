@@ -2494,7 +2494,7 @@ mod tests {
             let db = Db::open_memory().unwrap();
             let out_ = drive_queue(
                 &mq,
-                &Config::default(),
+                &uncontained_config(),
                 &root,
                 &db,
                 vec![item(&db, &feat_wt)],

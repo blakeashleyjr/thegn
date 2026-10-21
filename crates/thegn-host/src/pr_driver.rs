@@ -2680,7 +2680,7 @@ mod tests {
         let forge = FakeForge::new(Some(failing_ci_pr("abc"))).with_rerun_count(0);
         let out = drive_queue(
             &config,
-            &Config::default(),
+            &uncontained_config(),
             &forge,
             &checkout,
             &db,
