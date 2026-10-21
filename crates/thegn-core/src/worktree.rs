@@ -1044,16 +1044,170 @@ pub fn clean_target(path: &Path) -> std::io::Result<u64> {
     Ok(before)
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+struct RenameIntent {
+    version: u32,
+    old_branch: String,
+    new_branch: String,
+    old_path: String,
+    new_path: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RenameRecovery {
+    NotStarted,
+    Completed,
+    RolledBack,
+}
+
+fn rename_intent_path(root: &Path) -> PathBuf {
+    util::git_common_dir(root).join("thegn-rename-intent.json")
+}
+
+fn write_rename_intent(root: &Path, intent: &RenameIntent) -> Result<(), String> {
+    let path = rename_intent_path(root);
+    let bytes = serde_json::to_vec(intent).map_err(|error| {
+        format!(
+            "could not encode rename intent at {}: {error}",
+            path.display()
+        )
+    })?;
+    crate::fsperm::write_owner_only_atomic(&path, &bytes).map_err(|error| {
+        format!(
+            "could not write rename intent at {}: {error}",
+            path.display()
+        )
+    })
+}
+
+fn clear_rename_intent(root: &Path) -> Result<(), String> {
+    let path = rename_intent_path(root);
+    match std::fs::remove_file(&path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(format!(
+            "could not remove rename intent at {}: {error}",
+            path.display()
+        )),
+    }
+}
+
+fn registered_branch(root: &Path, path: &Path) -> Result<Option<Vec<u8>>, String> {
+    match std::fs::symlink_metadata(path) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(format!(
+                "could not inspect worktree path {}: {error}",
+                path.display()
+            ));
+        }
+        Ok(_) => {}
+    }
+    let identity = inspect_registered(root, path).map_err(|error| error.to_string())?;
+    Ok(Some(
+        identity
+            .branch()
+            .map_or_else(Vec::new, |branch| branch.raw().to_vec()),
+    ))
+}
+
+/// Reconcile an interrupted rename while holding the repository mutation lock.
+pub fn reconcile_rename_intent(root: &Path) -> Result<Option<RenameRecovery>, String> {
+    let _lock = acquire_mutation_lock(root).map_err(|error| {
+        format!(
+            "could not take the repository mutation lock at {}: {error}; retry",
+            util::git_common_dir(root).join("thegn-git.lock").display()
+        )
+    })?;
+    reconcile_rename_intent_locked(root)
+}
+
+pub(crate) fn reconcile_rename_intent_locked(
+    root: &Path,
+) -> Result<Option<RenameRecovery>, String> {
+    let path = rename_intent_path(root);
+    let bytes = match std::fs::read(&path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(format!(
+                "could not read rename intent at {}: {error}",
+                path.display()
+            ));
+        }
+    };
+    let intent: RenameIntent = serde_json::from_slice(&bytes)
+        .map_err(|error| format!("malformed rename intent at {}: {error}", path.display()))?;
+    if intent.version != 1 {
+        return Err(format!(
+            "unsupported rename intent at {} (version {})",
+            path.display(),
+            intent.version
+        ));
+    }
+    if intent.old_branch == intent.new_branch
+        || !crate::project::is_valid_branch_name(&intent.old_branch)
+        || !crate::project::is_valid_branch_name(&intent.new_branch)
+    {
+        return Err(format!(
+            "invalid branch names in rename intent at {}; journal kept",
+            path.display()
+        ));
+    }
+
+    let old_path = Path::new(&intent.old_path);
+    let new_path = Path::new(&intent.new_path);
+    let old_branch = intent.old_branch.as_bytes();
+    let new_branch = intent.new_branch.as_bytes();
+    let old_registered = registered_branch(root, old_path)?;
+    let new_registered = registered_branch(root, new_path)?;
+    let old_at_old = old_registered.as_deref() == Some(old_branch);
+    let old_at_new = old_registered.as_deref() == Some(new_branch);
+    let new_at_new = new_registered.as_deref() == Some(new_branch);
+    let old_absent = old_registered.is_none();
+    let new_absent = new_registered.is_none();
+    let old_branch_exists = branch_exists_checked(root, &intent.old_branch)?;
+    let new_branch_exists = branch_exists_checked(root, &intent.new_branch)?;
+
+    if old_at_old && new_absent && !new_branch_exists {
+        clear_rename_intent(root)?;
+        return Ok(Some(RenameRecovery::NotStarted));
+    }
+    if new_at_new && old_absent && !old_branch_exists {
+        clear_rename_intent(root)?;
+        return Ok(Some(RenameRecovery::Completed));
+    }
+    if old_at_new && new_absent && !old_branch_exists {
+        if util::git_ok(
+            root,
+            &["branch", "-m", &intent.new_branch, &intent.old_branch],
+        ) {
+            clear_rename_intent(root)?;
+            return Ok(Some(RenameRecovery::RolledBack));
+        }
+        return Err(format!(
+            "SPLIT STATE: branch is now {} but the checkout is still at {}; restore with: git -C {} branch -m {} {}; an intent journal at {} lets the next rename finish the rollback",
+            intent.new_branch,
+            old_path.display(),
+            shell_quote(&root.to_string_lossy()),
+            shell_quote(&intent.new_branch),
+            shell_quote(&intent.old_branch),
+            path.display()
+        ));
+    }
+    Err(format!(
+        "an interrupted rename of {} → {} left an ambiguous state; journal kept at {}; inspect `git worktree list` and remove the journal after repairing",
+        intent.old_branch,
+        intent.new_branch,
+        path.display()
+    ))
+}
+
 /// Rename a worktree's branch (`git branch -m`) and move its checkout to the
 /// collision-resistant path allocated for the new branch (`git worktree
-/// move`). Returns the new on-disk path on success, or the reason it failed.
-///
-/// The two Git mutations run under the repository mutation lock after a
-/// preflight that refuses an existing destination. If the move fails the
-/// branch rename is rolled back, so the caller sees the old, consistent state.
-/// Only when that rollback ALSO fails is the split reported — explicitly, with
-/// the exact recovery command — never as success. A crash between the two
-/// steps is not journaled (THE-516 chunk 6 remains open for that).
+/// move`). An owner-only intent journal records both exact paths before Git is
+/// mutated. A later call to [`reconcile_rename_intent`] classifies a leftover
+/// journal and rolls back the branch if a crash split the two Git steps.
 ///
 /// Shared by the new-worktree wizard's finalize-name step and the sidebar's
 /// post-creation "rename worktree" action.
@@ -1092,6 +1246,11 @@ pub fn rename(
             util::git_common_dir(root).join("thegn-git.lock").display()
         )
     })?;
+    if let Err(reason) = reconcile_rename_intent_locked(root) {
+        return Err(format!(
+            "refusing to rename {old_branch} → {new_branch}: {reason}"
+        ));
+    }
     if std::fs::symlink_metadata(&new_path).is_ok() {
         return Err(format!(
             "refusing to rename {old_branch} → {new_branch}: destination {} already exists. \
@@ -1101,22 +1260,55 @@ pub fn rename(
             root.display()
         ));
     }
+    let identity = inspect_registered(root, old_path)
+        .map_err(|_| format!("{old_path:?} is not a registered worktree on {old_branch}"))?;
+    if identity.branch().map(|branch| branch.raw()) != Some(old_branch.as_bytes()) {
+        return Err(format!(
+            "{old_path:?} is not a registered worktree on {old_branch}"
+        ));
+    }
+    let registered_old_path = identity.registered_path().as_path().to_path_buf();
+    let Some(old_path_exact) = registered_old_path.to_str() else {
+        return Err("cannot journal a non-UTF-8 path; rename refused before any change".into());
+    };
+    let Some(new_path_exact) = new_path.to_str() else {
+        return Err("cannot journal a non-UTF-8 path; rename refused before any change".into());
+    };
+    let intent = RenameIntent {
+        version: 1,
+        old_branch: old_branch.to_owned(),
+        new_branch: new_branch.to_owned(),
+        old_path: old_path_exact.to_owned(),
+        new_path: new_path_exact.to_owned(),
+    };
+    write_rename_intent(root, &intent)?;
     if !util::git_ok(root, &["branch", "-m", old_branch, new_branch]) {
+        if let Err(error) = clear_rename_intent(root) {
+            return Err(format!(
+                "could not rename branch {old_branch} → {new_branch}; {error}"
+            ));
+        }
         return Err(format!(
             "could not rename branch {old_branch} → {new_branch}"
         ));
     }
     let moved = util::git_cmd(root)
         .args(["worktree", "move"])
-        .arg(old_path)
+        .arg(&registered_old_path)
         .arg(&new_path)
         .output()
         .map(|o| o.status.success())
         .unwrap_or(false);
     if moved {
+        if let Err(error) = clear_rename_intent(root) {
+            tracing::warn!(target: "thegn::worktree", %error, path = %rename_intent_path(root).display(), "could not clear completed rename intent");
+        }
         return Ok(new_path);
     }
     if util::git_ok(root, &["branch", "-m", new_branch, old_branch]) {
+        if let Err(error) = clear_rename_intent(root) {
+            tracing::warn!(target: "thegn::worktree", %error, path = %rename_intent_path(root).display(), "could not clear rolled-back rename intent");
+        }
         return Err(format!(
             "moving the worktree to {} failed; the branch rename was rolled back to {old_branch}",
             new_path.display()
@@ -1124,11 +1316,12 @@ pub fn rename(
     }
     Err(format!(
         "SPLIT STATE: branch is now {new_branch} but the checkout is still at {}; \
-         restore with: git -C {} branch -m {} {}",
+         restore with: git -C {} branch -m {} {}; an intent journal at {} lets the next rename finish the rollback",
         old_path.display(),
         shell_quote(&root.to_string_lossy()),
         shell_quote(new_branch),
-        shell_quote(old_branch)
+        shell_quote(old_branch),
+        rename_intent_path(root).display()
     ))
 }
 
@@ -2112,5 +2305,186 @@ mod tests {
             .arg(&path)
             .status();
         let _ = std::fs::remove_dir_all(&repo);
+    }
+
+    fn rename_intent_for(repo: &Path, old_path: &Path, cfg: &Config) -> RenameIntent {
+        let identity = inspect_registered(repo, old_path).unwrap();
+        RenameIntent {
+            version: 1,
+            old_branch: "old".into(),
+            new_branch: "new".into(),
+            old_path: identity
+                .registered_path()
+                .as_path()
+                .to_str()
+                .unwrap()
+                .to_owned(),
+            new_path: allocate_worktree_path(repo, "new", cfg)
+                .unwrap()
+                .to_str()
+                .unwrap()
+                .to_owned(),
+        }
+    }
+
+    #[test]
+    fn rename_intent_not_started_is_cleared_by_reconcile() {
+        let repo = temp_repo("rename-intent-not-started");
+        let cfg = scratch_cfg(&repo);
+        let old_path = allocate_worktree_path(&repo, "old", &cfg).unwrap();
+        add_checked(&repo, "old", "main", &old_path, &cfg).unwrap();
+        write_rename_intent(&repo, &rename_intent_for(&repo, &old_path, &cfg)).unwrap();
+
+        assert_eq!(
+            reconcile_rename_intent(&repo).unwrap(),
+            Some(RenameRecovery::NotStarted)
+        );
+        assert!(!rename_intent_path(&repo).exists());
+        assert!(branch_exists(&repo, "old"));
+        std::fs::remove_dir_all(&repo).unwrap();
+    }
+
+    #[test]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "Git CLI calls simulate crash boundaries in the repository fixture"
+    )]
+    fn rename_intent_split_is_rolled_back_by_reconcile() {
+        let repo = temp_repo("rename-intent-split");
+        let cfg = scratch_cfg(&repo);
+        let old_path = allocate_worktree_path(&repo, "old", &cfg).unwrap();
+        add_checked(&repo, "old", "main", &old_path, &cfg).unwrap();
+        let intent = rename_intent_for(&repo, &old_path, &cfg);
+        write_rename_intent(&repo, &intent).unwrap();
+        assert!(
+            util::git_cmd(&repo)
+                .args(["branch", "-m", "old", "new"])
+                .status()
+                .unwrap()
+                .success()
+        );
+
+        assert_eq!(
+            reconcile_rename_intent(&repo).unwrap(),
+            Some(RenameRecovery::RolledBack)
+        );
+        assert!(branch_exists(&repo, "old"));
+        assert!(!branch_exists(&repo, "new"));
+        assert!(!rename_intent_path(&repo).exists());
+        std::fs::remove_dir_all(&repo).unwrap();
+    }
+
+    #[test]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "Git CLI calls simulate crash boundaries in the repository fixture"
+    )]
+    fn rename_intent_completed_move_is_cleared_by_reconcile() {
+        let repo = temp_repo("rename-intent-completed");
+        let cfg = scratch_cfg(&repo);
+        let old_path = allocate_worktree_path(&repo, "old", &cfg).unwrap();
+        add_checked(&repo, "old", "main", &old_path, &cfg).unwrap();
+        let intent = rename_intent_for(&repo, &old_path, &cfg);
+        let new_path = PathBuf::from(&intent.new_path);
+        write_rename_intent(&repo, &intent).unwrap();
+        assert!(
+            util::git_cmd(&repo)
+                .args(["branch", "-m", "old", "new"])
+                .status()
+                .unwrap()
+                .success()
+        );
+        assert!(
+            util::git_cmd(&repo)
+                .args(["worktree", "move"])
+                .arg(&old_path)
+                .arg(&new_path)
+                .status()
+                .unwrap()
+                .success()
+        );
+
+        assert_eq!(
+            reconcile_rename_intent(&repo).unwrap(),
+            Some(RenameRecovery::Completed)
+        );
+        assert!(!rename_intent_path(&repo).exists());
+        assert!(branch_exists(&repo, "new"));
+        std::fs::remove_dir_all(&repo).unwrap();
+    }
+
+    #[test]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "Git CLI call creates the competing ref for an ambiguous-state fixture"
+    )]
+    fn rename_intent_ambiguous_state_refuses_the_next_rename() {
+        let repo = temp_repo("rename-intent-ambiguous");
+        let cfg = scratch_cfg(&repo);
+        let old_path = allocate_worktree_path(&repo, "old", &cfg).unwrap();
+        add_checked(&repo, "old", "main", &old_path, &cfg).unwrap();
+        write_rename_intent(&repo, &rename_intent_for(&repo, &old_path, &cfg)).unwrap();
+        assert!(
+            util::git_cmd(&repo)
+                .args(["branch", "new", "main"])
+                .status()
+                .unwrap()
+                .success()
+        );
+
+        let error = rename(&repo, &old_path, "old", "other", &cfg).unwrap_err();
+        assert!(
+            error.contains("ambiguous") || error.contains("rename intent"),
+            "{error}"
+        );
+        assert!(rename_intent_path(&repo).exists());
+        assert!(branch_exists(&repo, "old"));
+        std::fs::remove_dir_all(&repo).unwrap();
+    }
+
+    #[test]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "Git CLI call locks the worktree to force the rollback path"
+    )]
+    fn rename_success_and_rollback_leave_no_intent_journal() {
+        let repo = temp_repo("rename-intent-cleanup");
+        let cfg = scratch_cfg(&repo);
+        let old_path = allocate_worktree_path(&repo, "old", &cfg).unwrap();
+        add_checked(&repo, "old", "main", &old_path, &cfg).unwrap();
+
+        let new_path = rename(&repo, &old_path, "old", "new", &cfg).unwrap();
+        assert!(new_path.is_dir());
+        assert!(!rename_intent_path(&repo).exists());
+
+        let rollback_path = allocate_worktree_path(&repo, "rollback", &cfg).unwrap();
+        add_checked(&repo, "rollback", "main", &rollback_path, &cfg).unwrap();
+        assert!(
+            util::git_cmd(&repo)
+                .args(["worktree", "lock"])
+                .arg(&rollback_path)
+                .status()
+                .unwrap()
+                .success()
+        );
+        let error = rename(&repo, &rollback_path, "rollback", "rollback-new", &cfg).unwrap_err();
+        assert!(error.contains("rolled back"), "{error}");
+        assert!(!rename_intent_path(&repo).exists());
+        util::git_cmd(&repo)
+            .args(["worktree", "unlock"])
+            .arg(&rollback_path)
+            .status()
+            .unwrap();
+        std::fs::remove_dir_all(&repo).unwrap();
+    }
+
+    #[test]
+    fn rename_refuses_an_unregistered_old_path() {
+        let repo = temp_repo("rename-unregistered");
+        let cfg = scratch_cfg(&repo);
+        let error = rename(&repo, &repo.join("not-a-worktree"), "main", "x", &cfg).unwrap_err();
+        assert!(error.contains("registered"), "{error}");
+        assert!(branch_exists(&repo, "main"));
+        std::fs::remove_dir_all(&repo).unwrap();
     }
 }
