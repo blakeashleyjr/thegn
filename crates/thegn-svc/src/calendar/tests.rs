@@ -54,6 +54,77 @@ fn account(name: &str, provider: CalendarProviderKind) -> CalendarAccount {
     }
 }
 
+#[derive(Default)]
+struct ActiveFetches {
+    active: std::sync::atomic::AtomicUsize,
+    max: std::sync::atomic::AtomicUsize,
+}
+
+impl ActiveFetches {
+    fn enter(&self) {
+        let active = self
+            .active
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+            + 1;
+        self.max
+            .fetch_max(active, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    fn leave(&self) {
+        self.active
+            .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+struct TimedFake {
+    provider: &'static str,
+    delay: std::time::Duration,
+    fail: bool,
+    active: std::sync::Arc<ActiveFetches>,
+}
+
+impl CalendarBackend for TimedFake {
+    fn provider_id(&self) -> &'static str {
+        self.provider
+    }
+
+    fn caps(&self) -> CalendarCaps {
+        CalendarCaps::default()
+    }
+
+    fn list_events<'a>(
+        &'a self,
+        _from: chrono::NaiveDate,
+        _to: chrono::NaiveDate,
+        _sync_token: &'a str,
+    ) -> futures_util::future::BoxFuture<'a, Result<EventPage, CalendarError>> {
+        Box::pin(async move {
+            self.active.enter();
+            tokio::time::sleep(self.delay).await;
+            self.active.leave();
+            if self.fail {
+                Err(CalendarError::Network("timed out".into()))
+            } else {
+                EventPage::try_new(PageMode::Snapshot, vec![], vec![], "", &adm())
+            }
+        })
+    }
+}
+
+fn timed_fake(
+    provider: &'static str,
+    delay: std::time::Duration,
+    fail: bool,
+    active: std::sync::Arc<ActiveFetches>,
+) -> Box<dyn CalendarBackend> {
+    Box::new(TimedFake {
+        provider,
+        delay,
+        fail,
+        active,
+    })
+}
+
 const ONE_EVENT: &str = "\
 BEGIN:VCALENDAR
 BEGIN:VEVENT
@@ -1892,6 +1963,180 @@ fn the_ics_backend_advertises_no_write_capabilities() {
 
 // --- the router -------------------------------------------------------------
 
+fn timed_router(
+    accounts: Vec<(
+        String,
+        FetchClass,
+        &'static str,
+        std::time::Duration,
+        bool,
+        std::sync::Arc<ActiveFetches>,
+    )>,
+) -> CalendarRouter {
+    CalendarRouter::from_test_backends(
+        accounts
+            .into_iter()
+            .map(|(name, class, provider, delay, fail, active)| {
+                (name, class, timed_fake(provider, delay, fail, active))
+            })
+            .collect(),
+    )
+}
+
+fn calendar_window() -> thegn_core::calendar::CalendarWindow {
+    let (from, to) = window();
+    thegn_core::calendar::CalendarWindow::new(from, to, thegn_core::calendar::Tz::UTC).unwrap()
+}
+
+#[tokio::test(start_paused = true)]
+async fn parallel_fast_account_applies_before_slow_sibling() {
+    let active = std::sync::Arc::new(ActiveFetches::default());
+    let router = timed_router(vec![
+        (
+            "slow".into(),
+            FetchClass::Network,
+            "slow-provider",
+            std::time::Duration::from_secs(120),
+            true,
+            active.clone(),
+        ),
+        (
+            "fast".into(),
+            FetchClass::Network,
+            "fast-provider",
+            std::time::Duration::ZERO,
+            false,
+            active,
+        ),
+    ]);
+    let start = tokio::time::Instant::now();
+    let mut completed = Vec::new();
+    router
+        .list_events_each(calendar_window(), &BTreeMap::new(), |result| {
+            completed.push((result.account, tokio::time::Instant::now()));
+        })
+        .await;
+    assert_eq!(completed[0].0, "fast");
+    assert_eq!(completed[0].1, start);
+    assert_eq!(completed[1].0, "slow");
+    assert_eq!(
+        completed[1].1.duration_since(start),
+        std::time::Duration::from_secs(120)
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn parallel_network_cap_is_never_exceeded() {
+    let active = std::sync::Arc::new(ActiveFetches::default());
+    let router = timed_router(
+        (0..8)
+            .map(|index| {
+                (
+                    format!("network-{index}"),
+                    FetchClass::Network,
+                    "ics-url",
+                    std::time::Duration::from_secs(1),
+                    false,
+                    active.clone(),
+                )
+            })
+            .collect(),
+    );
+    let mut completed = 0;
+    router
+        .list_events_each(calendar_window(), &BTreeMap::new(), |result| {
+            assert!(result.result.is_ok());
+            completed += 1;
+        })
+        .await;
+    assert_eq!(active.max.load(std::sync::atomic::Ordering::SeqCst), 4);
+    assert_eq!(completed, 8);
+}
+
+#[tokio::test(start_paused = true)]
+async fn parallel_results_keep_per_account_identity() {
+    // Positive control: this pins the existing per-account provider and name stamping.
+    let active = std::sync::Arc::new(ActiveFetches::default());
+    let router = timed_router(vec![
+        (
+            "one".into(),
+            FetchClass::Network,
+            "ics-url",
+            std::time::Duration::from_secs(3),
+            false,
+            active.clone(),
+        ),
+        (
+            "two".into(),
+            FetchClass::Command,
+            "command",
+            std::time::Duration::from_secs(1),
+            false,
+            active.clone(),
+        ),
+        (
+            "three".into(),
+            FetchClass::Local,
+            "ics",
+            std::time::Duration::from_secs(2),
+            false,
+            active,
+        ),
+    ]);
+    let mut identities = Vec::new();
+    router
+        .list_events_each(calendar_window(), &BTreeMap::new(), |result| {
+            identities.push((result.account, result.provider));
+        })
+        .await;
+    identities.sort_unstable();
+    assert_eq!(
+        identities,
+        vec![
+            ("one".into(), "ics-url"),
+            ("three".into(), "ics"),
+            ("two".into(), "command")
+        ]
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn parallel_command_accounts_run_one_at_a_time() {
+    // Positive control: command and local accounts were already serialized on main.
+    let commands = std::sync::Arc::new(ActiveFetches::default());
+    let locals = std::sync::Arc::new(ActiveFetches::default());
+    let mut accounts = (0..3)
+        .map(|index| {
+            (
+                format!("command-{index}"),
+                FetchClass::Command,
+                "command",
+                std::time::Duration::from_secs(1),
+                false,
+                commands.clone(),
+            )
+        })
+        .collect::<Vec<_>>();
+    accounts.extend((0..2).map(|index| {
+        (
+            format!("local-{index}"),
+            FetchClass::Local,
+            "ics",
+            std::time::Duration::from_secs(1),
+            false,
+            locals.clone(),
+        )
+    }));
+    let router = timed_router(accounts);
+    let mut completed = 0;
+    router
+        .list_events_each(calendar_window(), &BTreeMap::new(), |_| completed += 1)
+        .await;
+    assert_eq!(commands.max.load(std::sync::atomic::Ordering::SeqCst), 1);
+    assert_eq!(locals.max.load(std::sync::atomic::Ordering::SeqCst), 1);
+    assert_eq!(completed, 5);
+}
+
 #[test]
 fn an_empty_config_builds_an_unconfigured_router() {
     let r = router(&CalendarConfig::default());
@@ -2092,10 +2337,13 @@ fn one_failing_account_does_not_affect_another() {
     let (from, to) = window();
     let out = block_on(router(&cfg).list_events(from, to, &BTreeMap::new()));
     assert_eq!(out.len(), 2);
-    assert_eq!(out[0].account, "broken");
-    assert!(out[0].result.is_err());
-    assert_eq!(out[1].account, "good");
-    assert_eq!(out[1].result.as_ref().unwrap().events().len(), 1);
+    let broken = out
+        .iter()
+        .find(|result| result.account == "broken")
+        .unwrap();
+    assert!(broken.result.is_err());
+    let good = out.iter().find(|result| result.account == "good").unwrap();
+    assert_eq!(good.result.as_ref().unwrap().events().len(), 1);
 }
 
 // --- the command (plugin) backend -------------------------------------------
