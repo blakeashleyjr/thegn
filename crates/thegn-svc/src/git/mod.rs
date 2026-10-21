@@ -980,7 +980,7 @@ pub(super) fn output_bounded_with_input(
 ) -> Result<std::process::Output> {
     use std::io::Read;
     use std::process::Stdio;
-    use std::time::{Duration, Instant};
+    use std::time::Duration;
 
     GIT_SPAWNS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let Some(timeout) = timeout else {
@@ -1002,6 +1002,55 @@ pub(super) fn output_bounded_with_input(
         }
         return Ok(cmd.output()?);
     };
+    if input.is_none() {
+        let cancel = std::sync::atomic::AtomicBool::new(false);
+        let limits = thegn_proc::Limits {
+            quiesce_after_leader: Some(Duration::ZERO),
+            term_grace: Duration::from_millis(200),
+            reader_grace: Duration::from_millis(100),
+            stdout: thegn_proc::Stream::Head { cap: usize::MAX },
+            stderr: thegn_proc::Stream::Head { cap: usize::MAX },
+            ..thegn_proc::Limits::silent(timeout)
+        };
+        let run = thegn_proc::run(&mut cmd, &limits, &cancel);
+        return match run.end {
+            thegn_proc::End::Spawn(error) => Err(error.into()),
+            thegn_proc::End::TimedOut => anyhow::bail!(
+                "git {} timed out after {}s (killed)",
+                args.join(" "),
+                timeout.as_secs()
+            ),
+            thegn_proc::End::Supervise(error) => {
+                anyhow::bail!("git {} could not be supervised: {error}", args.join(" "))
+            }
+            thegn_proc::End::Cancelled => {
+                anyhow::bail!("git {} was unexpectedly cancelled", args.join(" "))
+            }
+            thegn_proc::End::OutputLimit(which) => {
+                anyhow::bail!(
+                    "git {} unexpectedly hit output limit {which:?}",
+                    args.join(" ")
+                )
+            }
+            thegn_proc::End::LeaderExited => {
+                if run.group == thegn_proc::GroupState::Survivors {
+                    anyhow::bail!(
+                        "git {} left processes that survived termination",
+                        args.join(" ")
+                    );
+                }
+                match run.leader {
+                    thegn_proc::Leader::Reaped(status) => Ok(std::process::Output {
+                        status,
+                        stdout: run.stdout.bytes,
+                        stderr: run.stderr.bytes,
+                    }),
+                    leader => anyhow::bail!("git {} was not reaped: {leader:?}", args.join(" ")),
+                }
+            }
+        };
+    }
+    // The stdin-fed ref-transaction path remains on the legacy runner (THE-368b work).
     let mut child = cmd
         .stdin(if input.is_some() {
             Stdio::piped()
@@ -1033,13 +1082,13 @@ pub(super) fn output_bounded_with_input(
         let _ = se.read_to_end(&mut b); // best-effort: read error just truncates captured output
         b
     });
-    let deadline = Instant::now() + timeout;
+    let deadline = std::time::Instant::now() + timeout;
     let mut backoff = Duration::from_millis(1);
     let status = loop {
         if let Some(status) = child.try_wait()? {
             break status;
         }
-        let remaining = deadline.saturating_duration_since(Instant::now());
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
         if remaining.is_zero() {
             let _ = child.kill(); // best-effort: child may already have exited
             let _ = child.wait(); // best-effort: reap-or-not is terminal here
@@ -3251,6 +3300,30 @@ mod tests {
         c.arg("ok");
         let out = output_bounded_with(c, &["printf", "ok"], None).unwrap();
         assert_eq!(String::from_utf8_lossy(&out.stdout), "ok");
+    }
+
+    #[test]
+    fn output_bounded_does_not_wait_for_a_pipe_holding_descendant() {
+        let mut c = std::process::Command::new("sh");
+        c.args(["-c", "sleep 30 & echo ok"]);
+        let start = std::time::Instant::now();
+        let out =
+            output_bounded_with(c, &["sh"], Some(std::time::Duration::from_secs(20))).unwrap();
+        assert_eq!(out.stdout, b"ok\n");
+        assert!(
+            start.elapsed() < std::time::Duration::from_secs(10),
+            "returned after {:?}, despite git's leader exiting promptly",
+            start.elapsed()
+        );
+    }
+
+    #[test]
+    fn output_bounded_keeps_large_output_whole() {
+        let mut c = std::process::Command::new("sh");
+        c.args(["-c", "head -c 200000 /dev/zero"]);
+        let out =
+            output_bounded_with(c, &["sh"], Some(std::time::Duration::from_secs(20))).unwrap();
+        assert_eq!(out.stdout.len(), 200000);
     }
 
     #[test]
