@@ -359,7 +359,7 @@ impl MediaWatch for SmtcWatch {
 }
 
 /// A [`std::time::Duration`] as WinRT 100-nanosecond ticks (inverse of
-/// [`duration_from_ticks`]).
+/// [`crate::smtc_decode::duration_from_ticks`]).
 fn ticks_from_duration(d: std::time::Duration) -> i64 {
     (d.as_nanos() / 100).min(i64::MAX as u128) as i64
 }
