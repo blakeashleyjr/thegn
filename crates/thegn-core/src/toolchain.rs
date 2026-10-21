@@ -300,6 +300,14 @@ pub fn synth_dir_script(packages: &[String]) -> String {
          [ ! -L \"$HOME/.thegn\" ] && [ ! -L \"$HOME/.thegn/synth\" ] && [ ! -L \"$d\" ] || fail 'thegn-synth: symlinked cache path'; \
          mkdir -p \"$d\" || fail 'thegn-synth: mkdir failed'; \
          [ ! -L \"$HOME/.thegn\" ] && [ ! -L \"$HOME/.thegn/synth\" ] && [ ! -L \"$d\" ] || fail 'thegn-synth: cache path changed'; \
+         lk=\"$HOME/.thegn/synth/.{digest}.lock\"; \
+         if command -v flock >/dev/null 2>&1; then \
+           [ ! -L \"$lk\" ] || fail 'thegn-synth: symlinked lock'; \
+           exec 9>>\"$lk\" || fail 'thegn-synth: lock open failed'; \
+           [ ! -L \"$lk\" ] && [ \"$lk\" -ef /dev/fd/9 ] || fail 'thegn-synth: lock path changed'; \
+           flock -w 900 9 || fail 'thegn-synth: lock busy'; \
+         else echo 'thegn-synth: flock unavailable; running unserialized' >&2; fi; \
+         ready=\"$d/.thegn-ready\"; \
          manifest=\"$d/thegn-synth.digest\"; \
          if [ -e \"$manifest\" ] || [ -L \"$manifest\" ]; then \
            [ ! -L \"$manifest\" ] && [ -f \"$manifest\" ] && [ \"$(cat \"$manifest\")\" = \"$digest\" ] || fail 'thegn-synth: manifest mismatch'; \
@@ -309,16 +317,31 @@ pub fn synth_dir_script(packages: &[String]) -> String {
          if [ -f \"$d/flake.nix\" ] && cmp -s \"$tmp\" \"$d/flake.nix\"; then \
            rm -f \"$tmp\" || fail 'thegn-synth: staging cleanup failed'; \
          else \
+           rm -f \"$ready\" || fail 'thegn-synth: ready reset failed'; \
            mv \"$tmp\" \"$d/flake.nix\" || fail 'thegn-synth: flake publish failed'; \
            rm -f \"$d/flake.lock\" || fail 'thegn-synth: stale lock removal failed'; \
          fi; \
-         [ -f \"$d/flake.lock\" ] || nix flake lock \"$d\" 2>/dev/null || fail 'thegn-synth: lock failed'; \
+         [ -f \"$d/flake.lock\" ] || {{ rm -f \"$ready\" || fail 'thegn-synth: ready reset failed'; nix flake lock \"$d\" 2>/dev/null || fail 'thegn-synth: lock failed'; }}; \
          manifest_tmp=$(mktemp \"$d/.thegn-synth.digest.XXXXXX\") || fail 'thegn-synth: manifest staging failed'; \
          printf '%s' \"$digest\" > \"$manifest_tmp\" || fail 'thegn-synth: manifest write failed'; \
          mv \"$manifest_tmp\" \"$manifest\" || fail 'thegn-synth: manifest publish failed'; \
-         nix develop \"path:$d\" --command true 2>/dev/null || fail 'thegn-synth: warm failed'",
+         nix develop \"path:$d\" --command true 2>/dev/null || fail 'thegn-synth: warm failed'; \
+         ready_tmp=$(mktemp \"$d/.thegn-ready.XXXXXX\") || fail 'thegn-synth: ready staging failed'; \
+         printf '%s' \"$digest\" > \"$ready_tmp\" || fail 'thegn-synth: ready write failed'; \
+         mv \"$ready_tmp\" \"$ready\" || fail 'thegn-synth: ready publish failed'",
         digest = digest,
         prelude = crate::envplan::nix_runtime_prelude(),
+    )
+}
+
+/// Shell condition used by pane entry to accept only a completed generation.
+/// No marker (or a different digest) means cold.
+pub fn synth_ready_test(packages: &[String]) -> String {
+    let admitted = admit_synth_packages(packages);
+    let dir = synth_dir(&admitted);
+    let digest = synth_hash(&admitted);
+    format!(
+        "[ -f {dir}/.thegn-ready ] && [ ! -L {dir}/.thegn-ready ] && [ \"$(cat {dir}/.thegn-ready)\" = \"{digest}\" ]"
     )
 }
 
@@ -635,7 +658,7 @@ mod tests {
         assert!(s.contains("rm -f \"$d/flake.lock\""), "{s}");
         // Lock only when needed, then warm the devShell; failures are visible.
         assert!(
-            s.contains("[ -f \"$d/flake.lock\" ] || nix flake lock"),
+            s.contains("[ -f \"$d/flake.lock\" ] || { rm -f \"$ready\""),
             "{s}"
         );
         assert!(s.contains("nix develop \"path:$d\" --command true"), "{s}");
@@ -673,5 +696,52 @@ mod tests {
             s.contains("NIX_CONFIG") && s.contains("/homeless-shelter"),
             "{s}"
         );
+    }
+
+    #[test]
+    fn synth_dir_script_serializes_and_marks_ready_last() {
+        let s = synth_dir_script(&v(&["nodejs_22"]));
+        let mkdir = s.find("mkdir -p \"$d\"").expect("cache mkdir");
+        let lock_open = s.find("exec 9>>\"$lk\"").expect("lock open");
+        let flake_stage = s.find("mktemp \"$d/.flake.nix").expect("flake staging");
+        let ready_reset = s.find("rm -f \"$ready\"").expect("ready reset");
+        let flake_publish = s
+            .find("mv \"$tmp\" \"$d/flake.nix\"")
+            .expect("flake publish");
+        let warm = s
+            .find("nix develop \"path:$d\" --command true")
+            .expect("devshell warm");
+        let ready_publish = s
+            .find("mv \"$ready_tmp\" \"$ready\"")
+            .expect("ready publish");
+        assert!(s.contains("flock -w 900 9"), "{s}");
+        assert!(mkdir < lock_open && lock_open < flake_stage, "{s}");
+        assert!(ready_reset < flake_publish, "{s}");
+        assert!(warm < ready_publish, "{s}");
+        assert!(s.contains("thegn-synth: flock unavailable"), "{s}");
+    }
+
+    #[test]
+    fn synth_ready_test_requires_the_exact_digest() {
+        let first = v(&["nodejs_22"]);
+        let second = v(&["python312"]);
+        let first_test = synth_ready_test(&first);
+        let second_test = synth_ready_test(&second);
+        assert_ne!(first_test, second_test);
+        for (packages, condition) in [(&first, &first_test), (&second, &second_test)] {
+            let dir = synth_dir(packages);
+            let script = synth_dir_script(packages);
+            let digest = script
+                .split_once("digest=\"")
+                .and_then(|(_, tail)| tail.split_once('"'))
+                .map(|(digest, _)| digest)
+                .expect("script digest assignment");
+            assert!(condition.contains(".thegn-ready"), "{condition}");
+            assert!(condition.contains(&dir), "{condition}");
+            assert!(
+                condition.contains(&format!("= \"{digest}\"")),
+                "{condition}"
+            );
+        }
     }
 }
